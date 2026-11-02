@@ -56,6 +56,11 @@ impl EngramStorage {
 
 
 impl OfficialV41Config {
+    /// The planner's canonical family for this validated configuration.
+    pub fn family_id(&self) -> &'static str {
+        crate::plan::Family::id(&crate::plan::families::deepseek::DEEPSEEK_V41)
+    }
+
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         ensure!(
             bytes.len() as u64 <= MAX_CONFIG_BYTES,

@@ -1450,6 +1450,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     check_options(args)?;
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = GlmNextConfig::read(&args.snapshot)?;
+    cuteafd_bench::context::set_family(cfg.family_id());
     header::check_kda_inputs(&checkpoint, &cfg, args.layers.unwrap_or(cfg.layers))?;
     precision::check_projection_inputs(&checkpoint, &cfg,
         args.layers.unwrap_or(cfg.layers))?;

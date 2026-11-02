@@ -199,6 +199,11 @@ fn window(v: &Value) -> Result<usize> {
 }
 
 impl MimoV2Config {
+    /// The planner's canonical family for this validated configuration.
+    pub fn family_id(&self) -> &'static str {
+        crate::plan::Family::id(&crate::plan::families::mimo::MIMO_V2)
+    }
+
     pub fn read(snapshot: &Path) -> Result<Self> {
         Self::from_hf(&read_json(&snapshot.join("config.json"))?)
     }

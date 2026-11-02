@@ -102,6 +102,9 @@ mod checkpoint_tests {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerInfo {
     pub model: String,
+    /// The serve command, distinct from the checkpoint's canonical family.
+    #[serde(default)]
+    pub executor: Option<String>,
     #[serde(default)]
     pub family: Option<String>,
     #[serde(default)]

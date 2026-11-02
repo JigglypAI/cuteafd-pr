@@ -579,6 +579,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         let mut ready = Some(ready_tx);
         let result = (|| -> Result<()> {
             let header = cuteafd_loader::families::qwen3_5::Qwen35Checkpoint::read(&engine_args.snapshot)?;
+            cuteafd_bench::context::set_family(header.config.family_id());
             let checkpoint = cuteafd_loader::plan::checkpoint::Checkpoint::open(&engine_args.snapshot)?;
             // SAFETY: library remains loaded until programs, executor and prefix-copy owners drop.
             let library = unsafe { NativeLibrary::load(&engine_args.native_lib)? };

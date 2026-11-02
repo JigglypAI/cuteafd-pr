@@ -18,6 +18,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
+pub(crate) fn probe_server(model: &str, context: &crate::context::ServerContext) -> Value {
+    json!({"model": model, "family": context.family, "executor": context.command,
+        "snapshot": context.snapshot, "settings": context.settings, "build": crate::server::build_info()})
+}
+
 /// What a client asks to run.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RunRequest {
@@ -488,8 +493,7 @@ impl Bench {
         let chat = client.chat(body, Some(spec))?;
         let mut value = serde_json::to_value(chat)?;
         let context = crate::context::get();
-        value["server"] = json!({"model": model, "family": context.family,
-            "snapshot": context.snapshot, "settings": context.settings, "build": crate::server::build_info()});
+        value["server"] = probe_server(&model, &context);
         Ok(value)
     }
 
