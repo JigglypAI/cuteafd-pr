@@ -1538,7 +1538,6 @@ mod tests {
         let fixture = tempfile::tempdir()?;
         testing::write_step5_exl3_snapshot(fixture.path());
         let manifest = testing::step5_native_manifest(fixture.path());
-        testing::install_step5_exl3_rtx_package(&manifest);
         let checkpoint = Checkpoint::inventory(fixture.path())?;
         let cfg = Config::parse(&checkpoint)?;
         let catalog = cuteafd_loader::read_expert_catalog(fixture.path())?;
@@ -1553,6 +1552,8 @@ mod tests {
                 layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                     rtx_bytes: vec![96 << 30; gpus], workspace_manifest: Some(manifest.clone()),
                     pool_tokens: pool, context_tokens: pool.unwrap_or(1 << 20),
+                    prefill_unit_rows: (gpus == 2).then_some(2752),
+                    prefill_waves: if gpus == 2 { 3 } else { 1 },
                     ..Default::default() }), ..Default::default()
             })?;
             assert!(report.wip_launchable(), "{:?}", report.hints);
