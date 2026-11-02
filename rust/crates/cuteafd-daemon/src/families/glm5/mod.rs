@@ -710,7 +710,8 @@ pub(crate) struct Opened {
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
-    catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
+    let draft_ownership = catalog.bundled_dspark_ownership(args.dspark)?;
+    catalog.select_draft(draft_ownership)?;
     cuteafd_core::set_expert_geometry(catalog.routed_experts().geometry()?)
         .map_err(|g| anyhow::anyhow!("geometry already {g:?}"))?;
     let cfg = GlmDsaConfig::read(&args.snapshot)?;
@@ -724,7 +725,6 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
             "EXLR8 options require a native EXLR8 checkpoint");
     }
     if args.dspark {
-        ensure!(cfg.variant.ml4().is_some(), "--dspark drafts with Mistral Large 4's bundled mtp_dspark");
         dflash::check_snapshot_target_head(&args.snapshot, cfg.head(), cfg.hidden, cfg.vocab_size, false)?;
     }
     if let Some(snapshot) = &args.draft {

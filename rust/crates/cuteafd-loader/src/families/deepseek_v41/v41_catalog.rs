@@ -23,6 +23,10 @@ pub(crate) fn projection_read(file: &impl crate::expert_reader::PositionedRead, 
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("--dspark requires bundled dSpark tensors in the checkpoint")]
+pub struct MissingBundledDspark;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum V41TensorPlacement {
     CoordinatorRtx,
@@ -149,6 +153,20 @@ impl OfficialV41Catalog {
     pub fn finish_expert_reads(&self) {
         self.reader.clear();
         if let Some(fp8) = &self.fp8 { fp8.finish_reads(); }
+    }
+
+    /// Resolve bundled dSpark from the checkpoint's own spec and catalog, not its family name.
+    pub fn bundled_dspark_ownership(&self, requested: bool) -> Result<crate::plan::spec::DraftOwnership> {
+        use crate::plan::{spec::{DraftOwnership, SpeculatorSpec}, Component};
+        if !requested { return Ok(DraftOwnership::None); }
+        let checkpoint = crate::plan::Checkpoint::inventory(&self.snapshot)?;
+        let family = crate::plan::family::detect(&checkpoint).context("catalog family")?;
+        let model = family.open(&checkpoint)?;
+        let bundled = !matches!(model.spec().speculator, Some(SpeculatorSpec::NativeMtp { .. }))
+            && self.tensors.iter().any(|tensor| family.classify(model.spec(), &tensor.metadata.name)
+                .is_some_and(|role| role.component == Component::Speculator));
+        if !bundled { return Err(MissingBundledDspark.into()); }
+        Ok(DraftOwnership::BundledDspark)
     }
 
     /// Restrict the coordinator catalog to the selected checkpoint drafter.
@@ -1718,6 +1736,29 @@ mod tests {
     }
 
     #[test]
+    fn bundled_dspark_selection_keeps_all_published_ml4_names_only_when_requested() -> Result<()> {
+        use crate::plan::{spec::DraftOwnership, testing};
+        let dir = tempfile::tempdir()?;
+        testing::write_mistral_large4_snapshot(dir.path(), Some(&[1]), true);
+        let published: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/ml4-published-native-headers.json"))?;
+        let names = published["headers"].as_object().unwrap().keys()
+            .filter(|name| name.starts_with("mtp_dspark.")).collect::<Vec<_>>();
+        assert_eq!(names.len(), 38);
+        for requested in [false, true] {
+            let mut selected = read_expert_catalog(dir.path())?;
+            let ownership = selected.bundled_dspark_ownership(requested)?;
+            assert_eq!(ownership, if requested { DraftOwnership::BundledDspark } else { DraftOwnership::None });
+            selected.select_draft(ownership)?;
+            for name in &names { assert_eq!(selected.tensor(name).is_ok(), requested, "{name}"); }
+        }
+        let mut missing = read_expert_catalog(dir.path())?;
+        missing.tensors.retain(|tensor| !names.iter().any(|name| **name == tensor.metadata.name));
+        assert!(missing.bundled_dspark_ownership(true).unwrap_err().is::<MissingBundledDspark>());
+        Ok(())
+    }
+
+    #[test]
     fn glm_fp8_catalog_keeps_coordinator_tensors_before_and_after_draft_selection() {
         use crate::plan::testing::{fp8, glm5_config, t, write_snapshot};
         let dir = tempfile::tempdir().unwrap();
@@ -1738,7 +1779,10 @@ mod tests {
         assert_glm_coordinator_tensors(&catalog);
         assert!(catalog.tensor("model.layers.1.mlp.experts.0.gate_proj.weight").is_err());
         assert!(catalog.tensor("model.layers.2.enorm.weight").is_ok());
-        catalog.select_draft(crate::plan::spec::DraftOwnership::None).unwrap();
+        assert_eq!(catalog.bundled_dspark_ownership(false).unwrap(), crate::plan::spec::DraftOwnership::None,
+            "external DFlash2 does not claim target checkpoint drafter tensors");
+        assert!(catalog.bundled_dspark_ownership(true).unwrap_err().is::<MissingBundledDspark>());
+        catalog.select_draft(catalog.bundled_dspark_ownership(false).unwrap()).unwrap();
         assert_glm_coordinator_tensors(&catalog);
         assert!(catalog.tensor("model.layers.2.enorm.weight").is_err());
         assert!(catalog.fp8().unwrap().has_layer(1));
