@@ -156,22 +156,8 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
         let images = job.media.iter().map(|image| image.as_ref().clone()).collect::<Vec<_>>();
         if job.probe.as_ref().is_some_and(|p| p.spec.prompt_ids.is_some() && !images.is_empty()) {
             let probe = job.probe.as_ref().unwrap();
-            probe.spec.validate_media()?;
-            anyhow::ensure!(probe.spec.media.len() == images.len() && tokens.len() <= max_context,
-                "expanded probe media count/context differs");
-            anyhow::ensure!(tokens.iter().all(|&id| id < expander.vocabulary), "probe token outside vocabulary");
-            let mut spans = Vec::with_capacity(images.len());
-            for (span, image) in probe.spec.media.iter().zip(&images) {
-                let end = span.start.checked_add(span.len).context("probe media extent")?;
-                anyhow::ensure!(span.len == image.tokens && span.grid == [image.grid.t, image.grid.h, image.grid.w]
-                    && span.key == key_hex(image.key), "probe prepared image identity differs");
-                anyhow::ensure!(span.start > 0 && end < tokens.len() && tokens[span.start - 1] == expander.start
-                    && tokens[end] == expander.end && tokens[span.start..end].iter().all(|&id| id == expander.placeholder),
-                    "probe image rows/marker boundaries differ");
-                spans.push(cuteafd_loader::media::MediaSpan { start: span.start, len: span.len, key: image.key.into() });
-            }
-            anyhow::ensure!(tokens.iter().filter(|&&id| id == expander.placeholder).count()
-                == spans.iter().map(|span| span.len).sum::<usize>(), "unbound probe image placeholders");
+            let spans = crate::shared::probe::image_spans(&probe.spec, &tokens, &images,
+                crate::shared::probe::ImageMarkers::Bounded(expander), max_context)?;
             (tokens, spans)
         } else {
             let expanded = expander.expand(&tokens, &images, max_context)?;
@@ -181,15 +167,7 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
         anyhow::ensure!(job.media.is_empty(), "checkpoint has no vision tower");
         (tokens, Vec::new())
     };
-    if let Some(probe) = &job.probe {
-        anyhow::ensure!(spans.len() == job.media.len(), "probe image count differs");
-        let echo = spans.iter().zip(&job.media).enumerate().map(|(i, (span, image))| {
-            cuteafd_api::openai::probe::ProbeMedia { start: span.start, len: span.len, kind: "image".into(),
-                key: key_hex(span.key), grid: [image.grid.t, image.grid.h, image.grid.w],
-                fixture: probe.spec.media.get(i).and_then(|s| s.fixture.clone()), image_url: None }
-        }).collect();
-        probe.media(echo);
-    }
+    crate::shared::probe::image_echo(&job, &spans)?;
     let media = RequestMedia::new(spans.clone(), hidden, tokens.len())?;
     let keys = MediaKeys::new(&tokens, vocabulary as u32, &spans)?;
     let jobs = job.media.iter().map(|image| EncodeJob::image(image.key, [image.grid.t, image.grid.h, image.grid.w], image.rgb8.clone(), image.tokens, hidden)).collect();

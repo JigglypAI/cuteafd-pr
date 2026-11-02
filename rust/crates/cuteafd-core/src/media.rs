@@ -66,6 +66,25 @@ impl<'de> Deserialize<'de> for MediaKey {
     }
 }
 
+/// Merge-2 image rows shared by processors, encoders and probe admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageTokenGeometry {
+    pub merge: u32,
+    pub row_markers: u32,
+}
+impl ImageTokenGeometry {
+    pub const MERGED: Self = Self { merge: 2, row_markers: 0 };
+    pub const ROW_MARKERS: Self = Self { merge: 2, row_markers: 1 };
+
+    pub fn extent(self, grid: [u32; 3]) -> Option<(usize, usize, usize)> {
+        let [t, h, w] = grid;
+        if t != 1 || self.merge == 0 || self.row_markers > 1 || h == 0 || w == 0
+            || h % self.merge != 0 || w % self.merge != 0 { return None; }
+        let (h, w) = ((h / self.merge) as usize, (w / self.merge) as usize);
+        Some((h, w, h.checked_mul(w.checked_add(self.row_markers as usize)?)?))
+    }
+}
+
 /// The encoder's PCM-to-feature geometry, independent of request batching.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AudioTokenGeometry {
@@ -108,6 +127,22 @@ impl MediaSpan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_geometry_preserves_merged_families_and_row_markers() {
+        for h in (2..=110).step_by(2) {
+            for w in (2..=110).step_by(2) {
+                assert_eq!(ImageTokenGeometry::MERGED.extent([1, h, w]),
+                    Some(((h / 2) as usize, (w / 2) as usize, (h * w / 4) as usize)));
+                assert_eq!(ImageTokenGeometry::ROW_MARKERS.extent([1, h, w]),
+                    Some(((h / 2) as usize, (w / 2) as usize, (h / 2 * (w / 2 + 1)) as usize)));
+            }
+        }
+        for grid in [[0, 4, 4], [2, 4, 4], [1, 0, 4], [1, 3, 4], [1, 4, 3]] {
+            assert_eq!(ImageTokenGeometry::MERGED.extent(grid), None);
+            assert_eq!(ImageTokenGeometry::ROW_MARKERS.extent(grid), None);
+        }
+    }
 
     #[test]
     fn audio_patch_geometry_matches_all_stage_stride_boundaries() {

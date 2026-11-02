@@ -131,6 +131,26 @@ def span():
             "grid": [1, 4, 4], "fixture": {"path": "code.png", "sha256": "b" * 64}}
 
 
+def test_processor_geometry_preserves_merged_counts_and_checks_row_markers():
+    from fidelity_media import image_extent
+    for h in range(2, 112, 2):
+        for w in range(2, 112, 2):
+            assert image_extent([1, h, w]) == (h // 2, w // 2, h * w // 4)
+            assert image_extent([1, h, w], {"merge": 2, "row_markers": 1}) == (
+                h // 2, w // 2, h // 2 * (w // 2 + 1))
+    contract = {"merge": 2, "row_markers": 1, "image_token_id": 9, "row_break_token_id": 8, "end_token_id": 7}
+    s = {**span(), "len": 6}
+    tokens = [1, 9, 9, 8, 9, 9, 7, 2]
+    assert validate_media([s], tokens, ["ctx"] * 7 + ["gen"], 7, processor=contract) == [s]
+    for i in range(1, 7):
+        wrong = tokens.copy()
+        wrong[i] = 3
+        with pytest.raises(ValueError, match="row markers"):
+            validate_media([s], wrong, ["ctx"] * 7 + ["gen"], 7, processor=contract)
+    with pytest.raises(ValueError, match="merged token extent"):
+        validate_media([s], tokens, ["ctx"] * 7 + ["gen"], 7)
+
+
 def test_media_contract():
     s = span()
     validate_media([s], [1, 9, 9, 9, 9, 2], ["ctx"] * 5 + ["gen"], 5)
