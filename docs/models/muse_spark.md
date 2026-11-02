@@ -112,15 +112,20 @@ per-sequence ring of the window plus one rollback step.
 
 ## Speculation
 
-Two DFlash2 drafters; the default is the one that delivers the most tokens
-per second (to be measured on the first hardware window).
+The launcher and planner default to NVIDIA DFlash2, pinned to
+`22e2669e4c60689f9bff0749a34d9d8e59ce7cd6`. It is chosen on C4 emitted
+throughput; baseline C1 ties RadixArk. Both pass the lossless set and exact
+prefix-cache checks on the qualified 1 RTX + 4 Spark layout. Set
+`SPECULATOR=off` to disable drafting; an explicit model/revision overrides
+the default.
 
 | Drafter | Geometry | Drafter attention |
 |---|---|---|
 | `RadixArk/Muse-Spark-Open-DFlash2` (46c90f41) | 5 layers, 64 query / 8 KV heads of 128, taps 1, 16, 30, 44, 59 | shared d128 |
 | `nvidia/Muse-Spark-Open-816B-A42B-DFlash2` (22e2669e) | 5 layers, 128 query / 16 KV heads of 64, taps 3, 19, 31, 47, 59 | native `_d64` |
 
-`--draft SNAPSHOT` opts in. The drafter runs on the last coordinator GPU,
+Direct `serve-muse` calls select a drafter with `--draft SNAPSHOT`.
+The drafter runs on the last coordinator GPU,
 beside the target head. Neither carries a head: both read the target's exact
 head path (K6 head, trim, softcap with the target's output multiplier) on
 their own charged scratch, and a drafter trained against another softcap or

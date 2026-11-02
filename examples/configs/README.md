@@ -75,6 +75,7 @@ outside a matching WIP slot.
 | Kimi K3 · EXL3 K2 + K6 core (#273) | [max](kimi-k3-exl3-k6-max.config) | 2 RTX (TP2 attention) + 6 Spark (TP6 experts), 12 routed layers on the RTX, full 1M context, DFlash2 |
 | Step-5-Preview · FP8 (#274) | [max](step5-fp8-max.config) | 2 RTX + 6 Spark |
 | Step-5-Preview · NVFP4 (#274) | [min](step5-nvfp4-min.config) | 1 RTX + 4 Spark |
+| Muse Spark · EXL3 K4 + Core K6 (#923) | [min](muse-spark-exl3-min.config) · [max](muse-spark-exl3-max.config) | 1 RTX + 4 Spark text qualified / 2 RTX + 6 Spark planned; pinned NVIDIA DFlash2, pool-first; media off |
 
 ## TP x EP layout examples (DeepSeek V4.1)
 

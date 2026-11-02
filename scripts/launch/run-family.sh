@@ -1907,6 +1907,7 @@ if [[ $family == deepseek_v4 ]]; then
 fi
 speculator="$(get SPECULATOR)"
 default_drafter=""
+[[ "$family" != muse_spark ]] || default_drafter=nvidia/Muse-Spark-Open-816B-A42B-DFlash2
 if [[ -z "$speculator" ]]; then
   speculator=off
   if [[ $speculator == off && $family == glm5 && -z ${cfg[SPECULATOR]+set} ]]; then
@@ -1934,6 +1935,10 @@ if [[ -z "$speculator" ]]; then
   if [[ $speculator == off && $family == qwen3_5 ]] &&
       python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); sys.exit(c.get("text_config",c).get("hidden_size") != 5120)' "$root/snapshots/$revision/config.json"; then
     speculator=dspark default_drafter=RadixArk/Qwen3.8-27B-DSpark
+  fi
+  if [[ $speculator == off && $family == muse_spark ]]; then
+    speculator=dflash2
+    echo "note: Muse Spark drafts with DFlash2 ($default_drafter); SPECULATOR=off disables it" >&2
   fi
   if [[ $speculator == off && $family == step5 ]]; then
     speculator=mtp
@@ -2055,6 +2060,9 @@ case "$speculator" in
       dspark_args=(--dspark)
     elif [[ -n "$drafter" ]]; then
       draft_revision="$(get SPECULATOR_MODEL_REVISION)"
+      if [[ -z "$draft_revision" && $family == muse_spark && $drafter == nvidia/Muse-Spark-Open-816B-A42B-DFlash2 ]]; then
+        draft_revision=22e2669e4c60689f9bff0749a34d9d8e59ce7cd6
+      fi
       if [[ -z "$draft_revision" && $family:$speculator == qwen3_5:dspark && $drafter == RadixArk/Qwen3.8-27B-DSpark ]]; then
         draft_revision=85ef153be924f17ce4bf62726954eeaa4a73e854
       fi
