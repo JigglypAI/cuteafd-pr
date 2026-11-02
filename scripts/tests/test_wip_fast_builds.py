@@ -126,13 +126,15 @@ def test_finalize_records_key_and_phases(tmp_path):
     (incoming / 'workspace/.cuteafd-wip').mkdir(parents=True)
     (incoming / 'workspace/.cuteafd-wip/V41_EXPERT_TP_AOT.json').write_text('{"schema":1,"spark_tp_roles":[]}')
     values = dict(wip_instance='i', wip_root='', wip_build_key=KEY, slot='s', role='coordinator', image='img',
-                  image_id='id', source_manifest_sha256='s', artifact_sha256='a', sparkinfer_revision='r',
+                  image_id='id', image_layers='["sha256:l1","sha256:l2"]',
+                  source_manifest_sha256='s', artifact_sha256='a', sparkinfer_revision='r',
                   transformers_revision='t', transformers_source_digest='d', build_output=str(output),
                   incoming=str(incoming))
     prefix = ''.join(f'{k}={v!r}\n' for k, v in values.items())
     subprocess.run(['bash', '-c', 'set -euo pipefail\n' + prefix + block], check=True)
     meta = json.loads((incoming / 'META.json').read_text())
     assert meta['build_key'] == KEY
+    assert meta['base_image_layers'] == ['sha256:l1', 'sha256:l2']
     assert [(p['phase'], p['seconds']) for p in meta['build_phases']] == [('rust', 12), ('native', 3)]
 
 
