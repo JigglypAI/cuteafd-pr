@@ -12,7 +12,8 @@ on raptor's RTX GPUs, optionally against real expert workers on Sparks.
 
 Each arm runs its slot's `cuteafd`, `libcuteafd_native.so`, `PROGRAMS.json` and expert
 packages, mounted read-only as /opt/cuteafd/{bin,lib,share} in the slot's own dev image
-(META base_image_id), with CDI `--device nvidia.com/gpu=N`, `--ipc host`, memlock
+(its sealed layer list, on whichever Docker store the host uses), with CDI
+`--device nvidia.com/gpu=N`, `--ipc host`, memlock
 unlimited, the host uid (release_serving_docker_args), the full namespace read-only at /mnt/sparknest
 (HF_HOME=/mnt/sparknest/hf-home). What runs:
 
@@ -39,7 +40,8 @@ Sparks) and exported as CUTEAFD_GOLDEN_FIXTURES.
 
 Real experts (--spark-hosts, ranks in the given order): before every run the arm's
 sealed spark-expert slot is checked on each host (seal, artifact checksums, SparkInfer
-lock, the same source manifest as the coordinator slot, dev image, CDI, a free
+lock, the same source manifest as the coordinator slot, the dev image's RootFS layer
+list (its identity on either Docker store), CDI, a free
 --expert-port, no leftover container, the checkpoint visible), then each host runs the
 serving path's `cuteafd expertd-native --rank R --world N` from that slot (read-only
 mounts, no staging copy), bounded by an in-container timeout. The coordinator waits for
@@ -377,8 +379,33 @@ for rel in ('docker/release-entrypoint.sh','third_party/sparkinfer','scripts/lib
 v=subprocess.run([sys.executable,str(ws/'scripts/build/verify-sparkinfer-source.py'),'--source',str(ws/'third_party/sparkinfer'),'--lock',str(ws/'third_party/sparkinfer.lock.json')],capture_output=True,text=True)
 if v.returncode: fail('SparkInfer source does not match its lock: '+(v.stderr.strip().splitlines() or ['?'])[-1])
 if m.get('base_image_id')!=image and image!='-': fail(f'slot dev image {m.get("base_image_id")} differs from the expected {image}')
-i=subprocess.run(['docker','image','inspect','-f','{{.Id}}',m.get('base_image_id','')],capture_output=True,text=True)
-if i.returncode or i.stdout.strip()!=m.get('base_image_id'): fail(f'dev image {m.get("base_image_id")} is missing')
+def image_layers(ref):
+    if not ref: return None
+    r=subprocess.run(['docker','image','inspect','-f','{{json .RootFS.Layers}}',ref],capture_output=True,text=True)
+    if r.returncode or not r.stdout.strip(): return None
+    try: value=json.loads(r.stdout)
+    except ValueError: return None
+    return value if isinstance(value,list) and value else None
+def local_images():
+    r=subprocess.run(['docker','image','ls','-q','--no-trunc'],capture_output=True,text=True)
+    return r.stdout.split() if r.returncode==0 else []
+# Sparks mix Docker's classic and containerd image stores: the same image has a
+# different .Id in each (save|load), so match the sealed RootFS layer list.
+expected=m.get('base_image_layers')
+if expected is None:  # older slot: the seed's store-local ID still carries its layers where it resolves
+    expected=image_layers(m.get('base_image_id'))
+matched=None
+if expected is not None:  # the sealed name first, then any local copy with exactly those layers
+    if m.get('base_image') and image_layers(m['base_image'])==expected:
+        matched=m['base_image']
+    else:
+        matched=next((ref for ref in local_images() if image_layers(ref)==expected),None)
+if matched is None:
+    if expected is None:  # neither the sealed layers nor the seed's ID are available here
+        fail(f'dev image {m.get("base_image_id")} is missing')
+    fail(f'dev image {m.get("base_image") or m.get("base_image_id")} does not match the sealed spark-expert image layers')
+image_id=subprocess.run(['docker','image','inspect','-f','{{.Id}}',matched],capture_output=True,text=True).stdout.strip()
+if not image_id: image_id=matched
 if os.environ.get('CUTEAFD_CDI_CHECK')!='off':  # off: script tests only
     cdi=any(re.search(r'^\s*-?\s*name:\s*\W?all\W?\s*$',pathlib.Path(s).read_text(),re.M) for s in ('/var/run/cdi/nvidia.yaml','/etc/cdi/nvidia.yaml') if os.access(s,os.R_OK))
     if not cdi: fail('CDI device nvidia.com/gpu=all is not in /var/run/cdi/nvidia.yaml')
@@ -400,7 +427,8 @@ for kind in ('fp8','exl3'):
         if (d/'manifest.json').is_file(): packages[f'{kind}/{d.name}']=(d/'manifest.json').read_text()
 variants={k:sorted(x.name for x in (art/k).iterdir() if x.is_dir()) for k in ('bin-variants','lib-variants') if (art/k).is_dir()}
 print(json.dumps({'root':str(p),'seal_sha256':hashlib.sha256(meta).hexdigest(),'source_manifest_sha256':m['source_manifest_sha256'],
-  'artifact_manifest_sha256':m['artifact_manifest_sha256'],'artifacts':listed,'image_id':m['base_image_id'],'image':m.get('base_image'),
+  'artifact_manifest_sha256':m['artifact_manifest_sha256'],'artifacts':listed,'image_id':image_id,'sealed_image_id':m['base_image_id'],
+  'image':m.get('base_image'),
   'hub':hub,'snapshot':snapshot,'serving_args':sv.stdout.decode().rstrip('\0').split('\0'),'packages':packages,'variants':variants}))
 '''
 

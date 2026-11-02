@@ -35,10 +35,28 @@ def save():
 host = os.environ.get('STUB_HOST', 'raptor')
 def find(name):
     return next((i for i, n in names.items() if n['name'] == name or i == name), None)
+def images():
+    path = os.environ.get('STUB_DOCKER_IMAGES')
+    return json.loads(Path(path).read_text()) if path and Path(path).exists() else {}
+def image(ref):
+    table = images().get(host) or images().get('*')
+    if table is None:  # no per-host table: every image exists with one common identity
+        return {'id': ref, 'layers': ['sha256:default']}
+    return table.get(ref) or next((entry for entry in table.values() if entry.get('id') == ref), None)
 if args[:2] == ['image', 'inspect']:
     if args[2] == '-f':
-        print(args[4]); sys.exit(0)
+        ref = args[4]
+        if '.RootFS.Layers' in args[3]:
+            entry = image(ref)
+            if not entry:
+                sys.exit(1)
+            print(json.dumps(entry.get('layers', []))); sys.exit(0)
+        entry = image(ref)
+        print(entry['id'] if entry else ref); sys.exit(0)
     print(json.dumps([{'Id': args[2], 'RepoTags': ['cuteafd-coordinator-dev:test']}])); sys.exit(0)
+if args[:2] == ['image', 'ls']:
+    table = images().get(host) or images().get('*') or {}
+    print('\n'.join(entry['id'] for entry in table.values())); sys.exit(0)
 if args[:2] == ['container', 'inspect']:
     sys.exit(0 if find(args[2]) else 1)
 if args[:1] == ['logs']:
@@ -555,6 +573,41 @@ def ssh_calls(env):
     return [json.loads(line) for line in env['ssh'].read_text().splitlines()] if env['ssh'].exists() else []
 
 
+SEALED_LAYERS = ['sha256:' + '11' * 32, 'sha256:' + '22' * 32]
+SEALED_ID = 'sha256:' + 'cd' * 32
+
+
+def local_id(host):
+    return 'sha256:' + hashlib.sha256(host.encode()).hexdigest()
+
+
+def seal_spark_layers(home, layers, instance='i1', slot='s1'):
+    """Reseal the spark-expert slot's META with its store-independent layer list."""
+    root = home / '.cache/cuteafd/builds' / f'wip-{instance}' / 'slots' / slot / 'spark-expert'
+    meta = json.loads((root / 'META.json').read_text())
+    meta['base_image_layers'] = layers
+    data = json.dumps(meta).encode()
+    (root / 'META.json').write_bytes(data)
+    (root / 'FINGERPRINT').write_text(hashlib.sha256(data).hexdigest() + '\n')
+
+
+def stub_images(env, monkeypatch, per_host):
+    """The docker stub's per-host images: {host: {ref: {'id': ..., 'layers': [...]}}}."""
+    path = env['tmp'] / 'spark-images.json'
+    path.write_text(json.dumps(per_host))
+    monkeypatch.setenv('STUB_DOCKER_IMAGES', str(path))
+
+
+def worker_images(env):
+    images = []
+    for host, command in ssh_calls(env):
+        if 'expertd-native' not in command:
+            continue
+        argv = shlex.split(command)
+        images.append((host, argv[argv.index('--entrypoint') + 2]))
+    return images
+
+
 def spark_argv(env, *extra, hosts='dodo,emu,rhea,moa'):
     test = env['tmp'] / 'chain-test'
     if not test.exists():
@@ -682,6 +735,57 @@ def test_real_experts_start_before_and_stop_before_locks_release(spark_env, monk
     assert 'test result: ok. 1 passed' in summary and 'dodo: ready; 0 error lines' in summary
 
 
+def test_spark_dev_image_is_matched_by_layers_not_store_ids(spark_env, monkeypatch):
+    """The seed's store-local .Id differs from each target's: only layers identify the image."""
+    env = spark_env
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    seal_spark_layers(env['home'], SEALED_LAYERS)
+    stub_images(env, monkeypatch, {host: {'spark:tc': {'id': local_id(host), 'layers': SEALED_LAYERS}}
+                                    for host in SPARKS})
+    assert golden.main(spark_argv(env)) == 0
+    assert worker_images(env) == [(host, local_id(host)) for host in SPARKS]
+
+
+def test_spark_dev_image_with_different_layers_is_refused(spark_env, monkeypatch, capsys):
+    env = spark_env
+    seal_spark_layers(env['home'], SEALED_LAYERS)
+    table = {host: {'spark:tc': {'id': local_id(host), 'layers': SEALED_LAYERS}} for host in SPARKS}
+    table['emu']['spark:tc']['layers'] = ['sha256:' + 'ff' * 32]
+    stub_images(env, monkeypatch, table)
+    assert golden.main(spark_argv(env)) == 2
+    assert 'emu: dev image spark:tc does not match the sealed spark-expert image layers' in capsys.readouterr().err
+    assert not runs(env)
+
+
+def test_spark_dev_image_accepts_an_identical_local_copy_under_another_name(spark_env, monkeypatch):
+    env = spark_env
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    seal_spark_layers(env['home'], SEALED_LAYERS)
+    stub_images(env, monkeypatch, {host: {'loaded-' + host: {'id': local_id(host), 'layers': SEALED_LAYERS}}
+                                    for host in SPARKS})
+    assert golden.main(spark_argv(env)) == 0
+    assert worker_images(env) == [(host, local_id(host)) for host in SPARKS]
+
+
+def test_older_slot_without_layers_falls_back_to_the_seed_image_id(spark_env, monkeypatch):
+    """A slot sealed before base_image_layers: the sealed ID still carries the layers where it resolves."""
+    env = spark_env
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    stub_images(env, monkeypatch, {host: {SEALED_ID: {'id': SEALED_ID, 'layers': SEALED_LAYERS},
+                                          'spark:tc': {'id': local_id(host), 'layers': SEALED_LAYERS}}
+                                    for host in SPARKS})
+    assert golden.main(spark_argv(env)) == 0
+    assert worker_images(env) == [(host, local_id(host)) for host in SPARKS]
+
+
+def test_older_slot_without_layers_and_no_seed_image_is_refused(spark_env, monkeypatch, capsys):
+    env = spark_env
+    stub_images(env, monkeypatch, {host: {'spark:tc': {'id': local_id(host), 'layers': SEALED_LAYERS}}
+                                    for host in SPARKS})
+    assert golden.main(spark_argv(env)) == 2
+    assert f'dodo: dev image {SEALED_ID} is missing' in capsys.readouterr().err
+
+
 @pytest.mark.parametrize('output,problem', [
     ('running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1272 filtered out', 'no test ran'),
     ('test result: FAILED. 0 passed; 1 failed; 0 ignored', 'tests failed'),
@@ -728,7 +832,7 @@ def test_run_timeout_tears_down_workers(spark_env, monkeypatch):
     # The workers bound themselves too: in-container timeout beyond the run's budget.
     command = next(c[1] for c in ssh_calls(spark_env) if 'expertd-native' in c[1])
     argv = shlex.split(command)
-    image = argv.index('sha256:' + 'cd' * 32)
+    image = argv.index('spark:tc')
     assert argv[argv.index('--entrypoint') + 1] == 'timeout' and argv[image + 1:image + 3] == ['--kill-after=30', str(1 + 1500 + 120)]
 
 

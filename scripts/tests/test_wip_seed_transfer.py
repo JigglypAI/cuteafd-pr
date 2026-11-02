@@ -1,5 +1,6 @@
 """LAN-only build seeds off the RoCE fabric (kakapo, cassowary): seed choice, lock order, transfer selection."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -480,3 +481,25 @@ esac'''
     result, trace = _bash(script, tmp_path, {'ssh': ssh})
     assert result.returncode == 0, result.stderr
     assert trace.splitlines() == ['send ostrich -> kiwi']
+
+
+def test_seal_records_the_store_independent_dev_image_identity(tmp_path):
+    """META keeps the dev image's RootFS layers beside its store-local ID, so a
+    remote Spark on the other Docker store can identify the same image."""
+    seal = (ROOT / 'scripts/build/finalize-wip-slot.sh').read_text()
+    block = seal[seal.index('python3 - "$incoming/META.json"'):seal.index('sha256sum "$incoming/META.json"')]
+    incoming = tmp_path / 'incoming'
+    (incoming / 'workspace/.cuteafd-wip').mkdir(parents=True)
+    (incoming / 'workspace/.cuteafd-wip/V41_EXPERT_TP_AOT.json').write_text('{"schema":1,"spark_tp_roles":[]}')
+    output = tmp_path / 'output'
+    output.mkdir()
+    values = dict(wip_instance='i', wip_root='', wip_build_key='', slot='s', role='spark-expert', image='img',
+                  image_id='sha256:seed', image_layers='["sha256:l1","sha256:l2"]',
+                  source_manifest_sha256='s', artifact_sha256='a', sparkinfer_revision='r',
+                  transformers_revision='t', transformers_source_digest='d', build_output=str(output),
+                  incoming=str(incoming))
+    prefix = ''.join(f'{k}={v!r}\n' for k, v in values.items())
+    subprocess.run(['bash', '-c', 'set -euo pipefail\n' + prefix + block], check=True)
+    meta = json.loads((incoming / 'META.json').read_text())
+    assert meta['base_image_id'] == 'sha256:seed'
+    assert meta['base_image_layers'] == ['sha256:l1', 'sha256:l2']
