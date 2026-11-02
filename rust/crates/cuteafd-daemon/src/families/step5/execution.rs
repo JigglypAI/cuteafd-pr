@@ -1623,6 +1623,11 @@ mod tests {
                         assert!(reused.immutable > 0 && reused.workspace > 0);
                     }
                 }
+                for stage in 0..3 {
+                    let predictor = RankWeightLayout::for_mtp_stage(&checkpoint, stage)?;
+                    assert!(predictor.resident_bytes > 0);
+                    assert_eq!(plan.contract.rope_tables.extent, 1 << 20);
+                }
                 assert!(plan.layer(ranks, 0).is_err());
                 assert!(plan.layer(0, 92).is_err());
                 Ok(())
@@ -1640,6 +1645,12 @@ mod tests {
             assert!(!body.contains("CoordinatorContract::from_checkpoint"));
             assert!(body.contains("layout.clone()"));
         }
+        let swa = include_str!("swa.rs");
+        let start = swa.find("pub(super) fn for_mtp_stage(").context("MTP constructor")?;
+        let end = start + swa[start..].find("\n    }").context("MTP constructor end")?;
+        assert!(swa[start..end].contains("Some(contract)"));
+        let mtp = include_str!("mtp.rs");
+        assert!(mtp.contains("cache.layout().kv_format, execution.predictor_contract())?"));
         Ok(())
     }
 
