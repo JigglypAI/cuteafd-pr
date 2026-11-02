@@ -210,9 +210,14 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         pool: options.pool_tokens.map_or(planner::Pin::Auto, planner::Pin::Exact), onboard,
         prefill: planner::Pin::Exact(planner::PrefillShape { rows: prefill.unit_rows, waves: prefill.waves }),
         operation: if options.full_prefill_logits { planner::Operation::Scoring } else { planner::Operation::Serving } };
+    let record_bytes = options.dense_qwen_kv.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
+    let serving = placement::families::qwen3_5::ServingFacts::new(cfg, &buffers, record_bytes,
+        placement::families::qwen3_5::ServingRequest {
+            concurrency: options.resolved_concurrency("qwen3_5"), prefix_entries: options.prefix_entries("qwen3_5"),
+            host_cache_bytes: options.host_cache_bytes, host_headroom: 8 << 30, device_sampling: options.device_sampling,
+        }, host.0)?;
     let result = placement::families::qwen3_5::admit(request, budgets, DenseFacts { cfg,
-        weights: &weights, buffers: &buffers, slots, drafter,
-        record_bytes: options.dense_qwen_kv.record_bytes(cfg.kv_heads, cfg.head_dim) as u64 })?;
+        weights: &weights, buffers: &buffers, slots, drafter, serving: Some(serving), record_bytes })?;
     let mut items = result.items(planner::Location::coordinator(0))?;
     for reservation in &result.facts.deferred {
         items.push(Item::new(reservation.category, &reservation.group, "", reservation.bytes, Basis::Formula));

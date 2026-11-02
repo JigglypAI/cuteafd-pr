@@ -509,7 +509,7 @@ pub(crate) struct TokenSelector<'a> {
     /// per row), and their pinned landing.
     out: DeviceAllocation<'a>,
     landing: HostAllocation<'a>,
-    /// The GPU sampler, allocated by the first sampled or masked selection.
+    /// The GPU sampler; migrated serving paths reserve it before Ready.
     wave: Option<TargetSamplingWave<'a>>,
     /// Per CUDA device: an ordering event recorded behind a selection's
     /// landing copies, so the host waits for those and not for whatever is
@@ -605,10 +605,23 @@ impl<'a> TokenSelector<'a> {
     /// Allocates the GPU sampler now (eager start-up); otherwise the first sampled or masked
     /// selection does.
     pub fn reserve_sampler(&mut self) -> Result<()> {
+        self.landed.reserve_current_device()?;
         if self.wave.is_none() && self.placement != SelectPlacement::Host {
             self.wave = Some(TargetSamplingWave::new(self.library, self.capacity.min(128), self.vocab)?);
         }
         Ok(())
+    }
+
+    pub(crate) fn allocation_buffers(&self) -> (Vec<(String, CuteafdDeviceBuffer)>,
+        Vec<(String, cuteafd_ffi::CuteafdHostBuffer)>) {
+        let mut device = vec![("selector.output".into(), self.out.buffer)];
+        let mut pinned = vec![("selector.landing".into(), self.landing.buffer)];
+        if let Some(wave) = &self.wave {
+            let (gpu, host) = wave.allocation_buffers();
+            device.extend(gpu.into_iter().map(|(id, buffer)| (format!("selector.sampler.{id}"), buffer)));
+            pinned.extend(host.into_iter().map(|(id, buffer)| (format!("selector.sampler.{id}"), buffer)));
+        }
+        (device, pinned)
     }
 
     /// Selects `batch.rows[i]` from logits row `i`.
@@ -932,6 +945,44 @@ fn chi_square_critical(dof: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn eager_selector_owners_are_complete_and_reservation_is_idempotent() -> Result<()> {
+        use cuteafd_ffi::memory_ledger::AllocationAudit;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let library = fixture.load()?;
+        for placement in [SelectPlacement::Device, SelectPlacement::Host] {
+            let audit = AllocationAudit::start();
+            let mut selector = TokenSelector::new(&library, placement, 33, 64)?;
+            selector.reserve_sampler()?;
+            let census = |selector: &TokenSelector<'_>| {
+                let (device, pinned) = selector.allocation_buffers();
+                device.into_iter().map(|(id, b)| (id, (b.ptr as usize, b.bytes, false)))
+                    .chain(pinned.into_iter().map(|(id, b)| (id, (b.ptr as usize, b.bytes, true))))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let owners = census(&selector);
+            let mut expected = std::collections::BTreeMap::from([
+                ("selector.output".to_owned(), (64 * 12, false)),
+                ("selector.landing".to_owned(), (64 * 12, true)),
+            ]);
+            if placement == SelectPlacement::Device {
+                expected.extend(cuteafd_core::target_sampler_allocations(64, 33).unwrap().into_iter()
+                    .map(|a| (format!("selector.sampler.{}", a.id), (a.bytes, a.pinned))));
+            }
+            assert_eq!(owners.iter().map(|(id, &(_, bytes, pinned))| (id.clone(), (bytes, pinned)))
+                .collect::<std::collections::BTreeMap<_, _>>(), expected);
+            let allocations = audit.events().len();
+            assert_eq!(allocations, owners.len());
+            let events = fixture.events()?;
+            selector.reserve_sampler()?;
+            assert_eq!(census(&selector), owners);
+            assert_eq!(audit.events().len(), allocations);
+            assert_eq!(fixture.events()?, events, "repeat reservation must not create another CUDA event");
+        }
+        Ok(())
+    }
 
     #[test]
     fn routes_follow_the_device_sampler_limits() {

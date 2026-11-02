@@ -39,6 +39,8 @@ pub struct LayoutOptions {
     pub vision_replicas: usize,
     /// One mapped pinned token embedding instead of a device allocation.
     pub host_embedding: bool,
+    /// Device sampler owners for migrated allocation plans; false selects host token selection.
+    pub device_sampling: bool,
     /// Explicit device placement disables the memory-constrained auto profile.
     pub force_gpu_embedding: bool,
     /// Usable bytes of one Spark rank (unified memory).
@@ -241,6 +243,7 @@ impl Default for LayoutOptions {
             rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES],
             vision_replicas: 1,
             host_embedding: false,
+            device_sampling: true,
             force_gpu_embedding: false,
             spark_bytes: DEFAULT_SPARK_DEVICE_BYTES,
             spark_allocation_budget_bytes: None,
@@ -1482,6 +1485,37 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
     use anyhow::{Context, ensure};
     use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
     use cuteafd_core::memory_layout::{HostLayout, ItemLifetime, host_logits_bytes};
+    if let Some(plan) = &report.allocation_plan {
+        use crate::placement::planner::{Baseline, Location, Phase};
+        let budget = plan.budgets.iter().find(|b| b.id == "host").context("shared plan has no host budget")?;
+        let available = match &budget.baseline {
+            Baseline::Sampled { free, .. } => *free,
+            Baseline::Forecast { occupied, .. } => budget.physical_bytes.checked_sub(*occupied)
+                .context("host baseline exceeds physical RAM")?,
+        };
+        let ready = plan.phases.iter().find(|p| p.budget == budget.id && p.phase == Phase::Ready)
+            .context("shared plan has no Ready host phase")?;
+        let peak = plan.phases.iter().filter(|p| p.budget == budget.id)
+            .map(|p| p.owned + p.opaque).max().unwrap_or(0);
+        let mut items = plan.items(Location::HOST)?;
+        items.extend(plan.items(Location::PINNED)?);
+        let cache = plan.facts.allocations.iter().filter(|a| a.group == "retained host prefix chunk")
+            .map(|a| a.bytes).sum();
+        for allowance in &plan.facts.allowances {
+            if budget.locations.contains(&allowance.location) && allowance.lifetime.contains(Phase::Ready) {
+                items.push(Item::new(Category::Workspace, &allowance.source, "ordinary heap allowance",
+                    allowance.bytes, Basis::Estimated).with_lifetime(ItemLifetime::PostReadyReserve));
+            }
+        }
+        report.host_budget_bytes = cache;
+        report.host_ledger = Some(HostLayout {
+            total_bytes: budget.physical_bytes, available_bytes: available, reserve_bytes: budget.headroom,
+            host_budget_bytes: cache, resident_bytes: ready.owned, deferred_bytes: ready.opaque,
+            headroom_bytes: budget.available()?.checked_sub(peak).context("shared host peak exceeds budget")?,
+            shortfall_bytes: 0, items,
+        });
+        return Ok(());
+    }
     let Some(spec) = report.spec.as_ref() else { return Ok(()) };
     let family = report.family.as_deref().unwrap_or("");
     let (total, available) = match options.host_memory {

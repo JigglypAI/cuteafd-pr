@@ -201,6 +201,17 @@ pub(crate) struct BlockingWait<'a> {
 impl<'a> BlockingWait<'a> {
     pub(crate) fn new(library: &'a NativeLibrary) -> Self { Self { library, events: Vec::new() } }
 
+    pub(crate) fn reserve_current_device(&mut self) -> Result<()> {
+        if cuteafd_transport::wait_policy::wait_policy().wait == cuteafd_transport::wait_policy::HostWait::Spin {
+            return Ok(());
+        }
+        let device = self.library.cuda_get_device()?;
+        if !self.events.iter().any(|(owner, _)| *owner == device) {
+            self.events.push((device, self.library.cuda_event_create_blocking()?));
+        }
+        Ok(())
+    }
+
     /// Waits until everything queued on `stream` so far has completed.
     ///
     /// # Safety

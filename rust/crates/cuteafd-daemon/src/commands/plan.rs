@@ -73,6 +73,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 qwen_attention_plan_rows: args.attention_plan_rows,
                 vision_replicas: args.vision_replicas as usize,
                 host_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Host),
+                device_sampling: args.token_select == crate::shared::token_io::SelectPlacement::Device,
                 force_gpu_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Gpu),
                 local_expert_layers: args.local_expert_layers,
                 onboard: args.rtx_expert_layers,
@@ -875,6 +876,7 @@ mod tests {
             chat_template_from: None,
             model: model.display().to_string(),
             embedding_placement: Some(crate::shared::token_io::EmbedPlacement::Gpu),
+            token_select: crate::shared::token_io::SelectPlacement::Device,
             revision: None,
             hf_home: None,
             spark_ranks: Some(spark_ranks),
@@ -1581,6 +1583,23 @@ mod tests {
             let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
             assert_eq!(options(&args).unwrap().layout.unwrap().dense_qwen_kv, expected);
         }
+    }
+
+    #[test]
+    fn token_selection_defaults_to_device_and_reaches_the_layout() {
+        use clap::Parser;
+        use crate::shared::token_io::SelectPlacement;
+        let parse = |extra: &[&str]| crate::cli::Cli::try_parse_from(
+            ["cuteafd", "plan", "/not-read", "--layout"].into_iter().chain(extra.iter().copied()));
+        for (extra, placement) in [(&[][..], SelectPlacement::Device),
+            (&["--token-select", "device"][..], SelectPlacement::Device),
+            (&["--token-select", "host"][..], SelectPlacement::Host)] {
+            let crate::cli::Commands::Plan(args) = parse(extra).unwrap().command else { panic!("plan") };
+            assert_eq!(args.token_select, placement);
+            assert_eq!(options(&args).unwrap().layout.unwrap().device_sampling,
+                placement == SelectPlacement::Device);
+        }
+        assert!(parse(&["--token-select", "automatic"]).is_err());
     }
 
     #[test]

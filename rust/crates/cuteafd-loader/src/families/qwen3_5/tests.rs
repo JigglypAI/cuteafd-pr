@@ -249,6 +249,59 @@ fn dense_default_prefix_geometry_releases_retention_with_host() {
 }
 
 #[test]
+fn native_host_report_uses_the_shared_phase_ledger_without_duplicate_cache_or_router() {
+    use crate::placement::planner::{Location, Phase};
+    let (dir, mut options, _, _) = native_planner_fixture();
+    options.layout.as_mut().unwrap().host_cache_bytes = Some(2 * (256 << 20) + 17);
+    let report = plan::plan(dir.path(), &options).unwrap();
+    assert!(report.fits, "{:?}", report.hints);
+    let plan = report.allocation_plan.as_ref().unwrap();
+    let host = report.host_ledger.as_ref().unwrap();
+    let ready = plan.phases.iter().find(|p| p.budget == "host" && p.phase == Phase::Ready).unwrap();
+    let peak = plan.phases.iter().filter(|p| p.budget == "host").map(|p| p.owned + p.opaque).max().unwrap();
+    let budget = plan.budgets.iter().find(|b| b.id == "host").unwrap();
+    assert_eq!(host.host_budget_bytes, 2 * (256 << 20));
+    assert_eq!(report.host_budget_bytes, host.host_budget_bytes);
+    assert_eq!((host.resident_bytes, host.deferred_bytes), (ready.owned, ready.opaque));
+    assert_eq!(host.headroom_bytes, budget.available().unwrap() - peak);
+    assert_eq!(host.items.iter().map(|i| i.bytes).sum::<u64>(), ready.owned + ready.opaque);
+    assert_eq!(host.items.iter().filter(|i| i.group == "retained host prefix chunk").count(), 1);
+    assert!(!host.items.iter().any(|i| i.group.contains("router") || i.group.contains("Spark")));
+    let expected: u64 = plan.facts.allocations.iter().filter(|a| a.location == Location::PINNED
+        && a.view.is_none() && a.lifetime.contains(Phase::Ready)).map(|a| a.bytes).sum();
+    assert_eq!(host.resident_bytes, expected);
+}
+
+#[test]
+fn native_token_selection_charges_only_the_selected_sampler_owners() {
+    use crate::placement::planner::{Location, Phase};
+    let (dir, mut options, _, _) = native_planner_fixture();
+    options.layout.as_mut().unwrap().host_cache_bytes = Some(2 * (256 << 20) + 17);
+    let mut inventories = Vec::new();
+    for device_sampling in [true, false] {
+        options.layout.as_mut().unwrap().device_sampling = device_sampling;
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert!(report.fits, "{:?}", report.hints);
+        let plan = report.allocation_plan.as_ref().unwrap();
+        let owners = &plan.facts.allocations;
+        let sampler = owners.iter().filter(|a| a.id.starts_with("selector.sampler.")).count();
+        assert_eq!(sampler, if device_sampling { 22 } else { 0 });
+        for (id, location) in [("selector.output", Location::coordinator(0)),
+            ("selector.landing", Location::PINNED)] {
+            let owner = owners.iter().find(|a| a.id == id).unwrap();
+            assert_eq!((owner.location, owner.bytes), (location, 64 * 12));
+            assert!(owner.lifetime.contains(Phase::Ready));
+        }
+        assert!(plan.facts.allowances.iter().any(|a| a.location == Location::HOST
+            && a.bytes > 0 && a.lifetime.contains(Phase::Ready)));
+        assert_eq!(report.host_budget_bytes, 2 * (256 << 20));
+        inventories.push(owners.iter().filter(|a| !a.id.starts_with("selector.sampler."))
+            .cloned().collect::<Vec<_>>());
+    }
+    assert_eq!(inventories[0], inventories[1]);
+}
+
+#[test]
 fn native_planner_prefix_marks_follow_shared_host_rule() {
     use cuteafd_core::{memory_layout::Category, prefix::mark_slots_with_host};
     let (dir, mut options, buffers, _) = native_planner_fixture();

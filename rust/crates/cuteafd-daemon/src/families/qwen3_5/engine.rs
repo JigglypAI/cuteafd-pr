@@ -54,6 +54,8 @@ pub(crate) struct DenseEngine<'a> {
     prefix_marks: usize,
     healthy: bool,
     verification: verify::Verification<'a>,
+    startup: Option<allocation::Startup>,
+    serving: Option<placement::families::qwen3_5::ServingFacts>,
 }
 
 #[cfg(test)]
@@ -85,7 +87,7 @@ mod hook_borrow_tests {
         // Startup compares independently loaded allocation owners to offline
         // native admission, including multislot marks and retained prefixes.
         let mut engine = DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg, None, None, 4,
-            Some(crate::shared::prefix::MarkRule { lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }), std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "bf16".into()).parse()?, false)?;
+            Some(crate::shared::prefix::MarkRule { lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }), std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "bf16".into()).parse()?, false, None)?;
         assert!(engine.pool_tokens >= 262144);
         let tokens = (1..=9).collect::<Vec<_>>();
         engine.verify_check(&tokens)?;
@@ -133,7 +135,8 @@ impl<'a> DenseEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_prefix(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
-        prefix: Option<crate::shared::prefix::MarkRule>, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, full_prefill_logits: bool) -> Result<Self> {
+        prefix: Option<crate::shared::prefix::MarkRule>, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, full_prefill_logits: bool,
+        serving: Option<placement::families::qwen3_5::ServingRequest>) -> Result<Self> {
         ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots), "dense state storage must be in 1..=64 slots");
         let reader = WeightReader { library, checkpoint };
         let format = super::weights::DenseFormat::detect(&reader)?;
@@ -153,18 +156,23 @@ impl<'a> DenseEngine<'a> {
             "dense native prefix admission differs from state layout");
         let sizes = buffers.planes;
         let logit_bytes = buffers.logits;
-        let (free, total) = library.cuda_memory_info()?;
+        let (free, total) = library.cuda_physical_memory_info()?;
+        let device_info = library.cuda_device_info(device.id)?;
+        ensure!(device_info.integrated == 0 && device_info.compute_capability_major == 12 && device_info.compute_capability_minor == 0,
+            "dense target requires a discrete SM120 device");
+        ensure!(cuteafd_ffi::memory_ledger::current_bytes(cuteafd_ffi::memory_ledger::Space::Managed, device.id) == 0,
+            "dense physical baseline cannot omit pre-existing managed owners");
         let host = cuteafd_ffi::host_memory()?;
-        let physical = *placement::ArchContext::for_device("sm_120", total as u64);
-        let mut budgets = placement::families::qwen3_5::forecast_budgets(&physical, total as u64, 0, host)?;
-        budgets[0].physical_bytes = total as u64;
-        budgets[0].baseline = planner::Baseline::Sampled { free: free as u64, phase: planner::Phase::Load,
-            source: "CUDA after modules, before target weights".into() };
+        let record_bytes = kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
+        let serving = serving.map(|request| placement::families::qwen3_5::ServingFacts::new(
+            &cfg, &buffers, record_bytes, request, host.0)).transpose()?;
+        let budgets = placement::families::qwen3_5::sampled_budgets(free as u64, total as u64,
+            cuteafd_ffi::coordinator_gpu_budget().map(|budget| budget.0), host)?;
         let request = planner::Request { context: cfg.max_context as u64,
             pool: requested_pool.map_or(planner::Pin::Auto, planner::Pin::Exact), onboard: planner::Pin::Auto,
             prefill: planner::Pin::Auto, operation: if full_prefill_logits { planner::Operation::Scoring } else { planner::Operation::Serving } };
         let plan = placement::families::qwen3_5::admit(request, budgets, DenseFacts { cfg: &cfg,
-            weights: &weight_bytes, buffers: &buffers, slots, record_bytes: kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64, drafter })?;
+            weights: &weight_bytes, buffers: &buffers, slots, record_bytes, drafter, serving })?;
         let pool_tokens = usize::try_from(plan.pool_tokens)?;
         tracing::info!(pool_tokens, kv_format = %kv_format, slots, prefix_marks, full_prefill_logits,
             head_rows = buffers.head_rows, deferred_owners = plan.facts.deferred.len(), "dense Qwen admitted before weight/state allocation");
@@ -206,13 +214,27 @@ impl<'a> DenseEngine<'a> {
             Some(std::rc::Rc::new(Allocation::new(device, prefix_bytes)?))
         };
         stream.drain()?;
-        allocation::reconcile_target(&plan, library, device, stream.raw, &audit, loaded_events, &embedding, &weights, &allocated,
+        let receipts = allocation::reconcile_target(&plan, library, device, stream.raw, &audit, loaded_events, &embedding, &weights, &allocated,
             &ids, &logits, &head_workspace, &bank, &kv, &verification, prefix_arena.as_deref())?;
-        tracing::info!(ready = plan.facts.deferred.is_empty(), "dense target allocation IDs reconciled; deferred drafter owners are not ready receipts");
+        tracing::info!("dense target allocation IDs reconciled at PostTargetKv; scheduler owners still pending");
+        let target_events = audit.events().len();
+        let startup = serving.map(|_| allocation::Startup { plan, audit, loaded_events, target_events, receipts });
         Ok(Self { stream, cfg, kv_format, programs, admitted, embedding, weights, homes, bank, kv, planes,
             _planes: std::mem::take(&mut allocated), ids, logits, head, head_rows: buffers.head_rows, _head_workspace: head_workspace,
             pool_tokens, position: 0, slots: vec![rows::Slot { position: 0, pages: Vec::new() }; slots],
-            prefix_arena, prefix_marks, healthy: true, verification })
+            prefix_arena, prefix_marks, healthy: true, verification, startup, serving })
+    }
+
+    pub(crate) fn serving_facts(&self) -> Option<placement::families::qwen3_5::ServingFacts> { self.serving }
+
+    pub(crate) fn reconcile_ready(&mut self, selector: &crate::shared::token_io::TokenSelector<'_>,
+        cache: &mut cuteafd_engine::prefix::PrefixCache<crate::shared::prefix::CudaCopyEngine<'_>>) -> Result<()> {
+        self.stream.drain()?;
+        let startup = self.startup.as_mut().context("dense serving was not admitted before target allocation")?;
+        startup.ready(self.stream.device.library, self.stream.device, selector, cache)?;
+        // Drop the startup-only event log only after the complete serving census.
+        self.startup = None;
+        Ok(())
     }
 
     pub(crate) fn slot_count(&self) -> usize { self.slots.len() }

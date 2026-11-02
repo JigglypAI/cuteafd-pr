@@ -343,6 +343,9 @@ pub(crate) struct PlanArgs {
     /// Full-attention KV format for --layout (family default when omitted).
     #[arg(long = "kv-cache")]
     pub(crate) kv_format: Option<cuteafd_core::MlaCacheFormat>,
+    /// Token selection placement for migrated allocation plans (matches serve).
+    #[arg(long, value_enum, default_value = "device")]
+    pub(crate) token_select: crate::shared::token_io::SelectPlacement,
     /// Qwen projection residency for --layout.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub(crate) fp8_decode: bool,

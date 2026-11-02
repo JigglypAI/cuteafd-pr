@@ -380,6 +380,35 @@ impl<'a> TargetSamplingWave<'a> {
         Self::allocate(library, SamplerStages::native(), capacity, vocab)
     }
 
+    pub(crate) fn allocation_buffers(&self) -> (Vec<(&'static str, CuteafdDeviceBuffer)>,
+        Vec<(&'static str, cuteafd_ffi::CuteafdHostBuffer)>) {
+        (vec![
+            ("param_device", self.param_device.buffer),
+            ("mask_device", self.mask_device.buffer),
+            ("scratch", self.scratch.buffer),
+            ("bitmap", self.bitmap.buffer),
+            ("histogram", self.histogram.buffer),
+            ("ids_device", self.ids_device.buffer),
+            ("status_device", self.status_device.buffer),
+            ("detail_device", self.detail_device.buffer),
+            ("scores_device", self.scores_device.buffer),
+            ("total_device", self.total_device.buffer),
+            ("nucleus_device", self.nucleus_device.buffer),
+            ("rank_order_ids", self.rank_order_ids.buffer),
+            ("rank_order_scratch", self.rank_order_scratch.buffer),
+            ("retained_count_device", self.retained_count_device.buffer),
+            ("pivot_passes_device", self.pivot_passes_device.buffer),
+        ], vec![
+            ("param_pinned", self.param_pinned.buffer),
+            ("mask_pinned", self.mask_pinned.buffer),
+            ("ids_pinned", self.ids_pinned.buffer),
+            ("status_pinned", self.status_pinned.buffer),
+            ("detail_pinned", self.detail_pinned.buffer),
+            ("scores_pinned", self.scores_pinned.buffer),
+            ("retained_count_staging", self.retained_count_staging.buffer),
+        ])
+    }
+
     fn mask_arena_bytes(capacity: usize, vocab: usize) -> usize {
         capacity * vocab.div_ceil(32) * 4
     }
@@ -407,47 +436,36 @@ impl<'a> TargetSamplingWave<'a> {
             (1..=SAMPLING_MAX_MASK_ROWS).contains(&capacity),
             "sampling capacity must be 1..{SAMPLING_MAX_MASK_ROWS}"
         );
-        let retained = SAMPLING_MAX_RETAINED as usize;
+        let layout = cuteafd_core::target_sampler_allocations(capacity, vocab).map_err(anyhow::Error::msg)?;
+        let bytes = |id| layout.iter().find(|a| a.id == id).expect("sampler owner in shared recipe").bytes;
         Ok(Self {
             library,
             stages,
             capacity,
             vocab,
             mask_words: vocab.div_ceil(32),
-            param_device: DeviceAllocation::new(
-                library,
-                capacity * cuteafd_ffi::CUTEAFD_V41_SAMPLER_PARAM_BYTES,
-            )?,
-            param_pinned: HostAllocation::new(
-                library,
-                capacity * cuteafd_ffi::CUTEAFD_V41_SAMPLER_PARAM_BYTES,
-            )?,
-            mask_device: DeviceAllocation::new(library, Self::mask_arena_bytes(capacity, vocab))?,
-            mask_pinned: HostAllocation::new(library, Self::mask_arena_bytes(capacity, vocab))?,
-            scratch: DeviceAllocation::new(
-                library,
-                capacity * cuteafd_ffi::CUTEAFD_V41_SAMPLER_SCRATCH_BYTES,
-            )?,
-            bitmap: DeviceAllocation::new(library, Self::mask_arena_bytes(capacity, vocab))?,
-            histogram: DeviceAllocation::new(
-                library,
-                capacity * SAMPLING_HISTOGRAM_BUCKETS * 4,
-            )?,
-            ids_device: DeviceAllocation::new(library, capacity * 4)?,
-            status_device: DeviceAllocation::new(library, capacity * 4)?,
-            detail_device: DeviceAllocation::new(library, capacity * 4)?,
-            scores_device: DeviceAllocation::new(library, capacity * 4)?,
-            total_device: DeviceAllocation::new(library, capacity * 4)?,
-            nucleus_device: DeviceAllocation::new(library, capacity * 4)?,
-            rank_order_ids: DeviceAllocation::new(library, capacity * retained * 4)?,
-            rank_order_scratch: DeviceAllocation::new(library, capacity * retained * 8)?,
-            retained_count_device: DeviceAllocation::new(library, capacity * 4)?,
-            pivot_passes_device: DeviceAllocation::new(library, capacity * 4)?,
-            ids_pinned: HostAllocation::new(library, capacity * 4)?,
-            status_pinned: HostAllocation::new(library, capacity * 4)?,
-            detail_pinned: HostAllocation::new(library, capacity * 4)?,
-            scores_pinned: HostAllocation::new(library, capacity * 4)?,
-            retained_count_staging: HostAllocation::new(library, capacity * 4)?,
+            param_device: DeviceAllocation::new(library, bytes("param_device"))?,
+            param_pinned: HostAllocation::new(library, bytes("param_pinned"))?,
+            mask_device: DeviceAllocation::new(library, bytes("mask_device"))?,
+            mask_pinned: HostAllocation::new(library, bytes("mask_pinned"))?,
+            scratch: DeviceAllocation::new(library, bytes("scratch"))?,
+            bitmap: DeviceAllocation::new(library, bytes("bitmap"))?,
+            histogram: DeviceAllocation::new(library, bytes("histogram"))?,
+            ids_device: DeviceAllocation::new(library, bytes("ids_device"))?,
+            status_device: DeviceAllocation::new(library, bytes("status_device"))?,
+            detail_device: DeviceAllocation::new(library, bytes("detail_device"))?,
+            scores_device: DeviceAllocation::new(library, bytes("scores_device"))?,
+            total_device: DeviceAllocation::new(library, bytes("total_device"))?,
+            nucleus_device: DeviceAllocation::new(library, bytes("nucleus_device"))?,
+            rank_order_ids: DeviceAllocation::new(library, bytes("rank_order_ids"))?,
+            rank_order_scratch: DeviceAllocation::new(library, bytes("rank_order_scratch"))?,
+            retained_count_device: DeviceAllocation::new(library, bytes("retained_count_device"))?,
+            pivot_passes_device: DeviceAllocation::new(library, bytes("pivot_passes_device"))?,
+            ids_pinned: HostAllocation::new(library, bytes("ids_pinned"))?,
+            status_pinned: HostAllocation::new(library, bytes("status_pinned"))?,
+            detail_pinned: HostAllocation::new(library, bytes("detail_pinned"))?,
+            scores_pinned: HostAllocation::new(library, bytes("scores_pinned"))?,
+            retained_count_staging: HostAllocation::new(library, bytes("retained_count_staging"))?,
             params: Vec::new(),
             param_rows: 0,
             mask_rows: 0,
@@ -775,6 +793,22 @@ pub(crate) fn bytemuck_slice<T: Copy>(values: &[T]) -> &[u8] {
 #[cfg(test)]
 mod allocation_accounting_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn actual_sampler_owners_match_shared_recipe() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let library = fixture.load()?;
+        let wave = TargetSamplingWave::new(&library, 64, 33)?;
+        let (device, pinned) = wave.allocation_buffers();
+        let actual = device.into_iter().map(|(id, buffer)| (id, (buffer.bytes, false)))
+            .chain(pinned.into_iter().map(|(id, buffer)| (id, (buffer.bytes, true))))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let expected = cuteafd_core::target_sampler_allocations(64, 33).unwrap().into_iter()
+            .map(|a| (a.id, (a.bytes, a.pinned))).collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(actual, expected);
+        Ok(())
+    }
 
     #[test]
     fn shared_device_bytes_match_every_sampler_arena() {

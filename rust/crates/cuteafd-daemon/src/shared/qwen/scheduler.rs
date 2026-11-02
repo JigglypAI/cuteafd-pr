@@ -115,6 +115,9 @@ pub(crate) trait Backend<'a> {
     fn message_starts(&self) -> &[&str] { &MESSAGE_STARTS }
     fn library(&self) -> &'a NativeLibrary;
     fn profile(&self) -> &RefCell<[f64; 2]>;
+    fn prepare_selector(&self, _selector: &mut TokenSelector<'a>) -> Result<()> { Ok(()) }
+    fn reconcile_ready(&self, _selector: &TokenSelector<'a>,
+        _cache: &mut PrefixCache<CudaCopyEngine<'a>, Self::Meta>) -> Result<()> { Ok(()) }
     fn prefix_cache(&self, args: &PrefixArgs, lanes: usize)
         -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>, Self::Meta>)>;
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(Prompt, RequestMedia, Vec<EncodeJob>)>;
@@ -599,6 +602,19 @@ mod readiness_tests {
     }
 
     #[test]
+    fn scheduler_reconciles_all_serving_owners_before_readiness() {
+        let source = include_str!("scheduler.rs").split_once("\npub(crate) fn schedule").unwrap().1;
+        let selector = source.find("TokenSelector::new(").unwrap();
+        let eager = source.find("engine.prepare_selector(").unwrap();
+        let reconcile = source.find("engine.reconcile_ready(").unwrap();
+        let ready = source.find("}, initialized)?").unwrap();
+        assert!(selector < eager && eager < reconcile && reconcile < ready);
+        assert!(source.find("engine.prefix_cache(").unwrap() < reconcile);
+        assert!(source.find("prefix.reserve.config(").unwrap() < reconcile);
+        assert!(source.find("tokio::runtime::Builder").unwrap() < reconcile);
+    }
+
+    #[test]
     fn scheduler_prefix_cache_is_initialized_before_readiness() {
         let source = include_str!("scheduler.rs");
         let schedule = source.split_once("\npub(crate) fn schedule").unwrap().1;
@@ -757,14 +773,15 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         && max_sequences <= geometry.slots, "scheduler lanes exceed target decode/state capacity");
     let width = match drafts { Drafts::Neural { depth, .. } => depth, Drafts::None => 0 };
     // Publish readiness only after all fallible scheduler-owned startup work.
-    let (family, mut cache, markers, mut grammars, tokenizer, mut selector, mut shared, mut trace, mut prefills) = initialize(|| {
-        let (family, cache) = engine.prefix_cache(prefix, max_sequences)?;
+    let (family, mut cache, markers, mut grammars, tokenizer, mut selector, mut shared, mut trace, mut prefills,
+        mut reserve, runtime) = initialize(|| {
+        let (family, mut cache) = engine.prefix_cache(prefix, max_sequences)?;
         let markers = crate::shared::prefix::marker_ids(snapshot, engine.message_starts())?;
         let grammars = crate::shared::constraints::Compiler::with_vocab(
             engine.library(), snapshot.join("tokenizer.json"), geometry.vocab_size, eos);
-        let cache = cache;
         let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
-        let selector = TokenSelector::new(engine.library(), select, geometry.vocab_size, geometry.decode_rows)?;
+        let mut selector = TokenSelector::new(engine.library(), select, geometry.vocab_size, geometry.decode_rows)?;
+        engine.prepare_selector(&mut selector)?;
         let shared = if width > 0 {
             let geometry = engine.draft_geometry(snapshot, width)?;
             engine.arm_draft_probe()?;
@@ -774,19 +791,20 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         } else { None };
         let trace = Trace::open()?;
         let prefills = decode_share.queue::<Prefill<'_, B::Placement, B::Draft>>()?;
-        Ok((family, cache, markers, grammars, tokenizer, selector, shared, trace, prefills))
+        let reserve = Reserve::new(prefix.reserve.config(geometry.max_context)?, cache.pool().page_rows());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        engine.reconcile_ready(&selector, &mut cache)?;
+        Ok((family, cache, markers, grammars, tokenizer, selector, shared, trace, prefills, reserve, runtime))
     }, initialized)?;
     let mut free_slots: Vec<i32> = (0..geometry.slots as i32).rev().collect();
     let mut active: Vec<Active<'_, B::Placement, B::Draft>> = Vec::new();
     // Decoding requests waiting for KV pages: they keep their slot and units, skip rounds.
     let mut stalled: Vec<Active<'_, B::Placement, B::Draft>> = Vec::new();
-    let mut reserve = Reserve::new(prefix.reserve.config(geometry.max_context)?, cache.pool().page_rows());
     let (mut requests, mut generated_total, mut admissions) = (0u64, 0u64, 0u64);
     let mut lane = DecodeLane { steps: 0, verify_s: 0.0, timing: DraftTiming::default(),
         stats: VerifyStats::new(geometry.decode_rows) };
     // This family's only decode lane (`LaneSupport::One`), polled on this thread.
     let lanes = LaneSet::default();
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let neural = matches!(drafts, Drafts::Neural { .. });
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<MediaReady<Prompt>>::default();
     loop {

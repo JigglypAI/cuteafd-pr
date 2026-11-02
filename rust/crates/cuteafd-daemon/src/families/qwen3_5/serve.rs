@@ -142,6 +142,13 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     }
     fn library(&self) -> &'a NativeLibrary { self.library }
     fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
+    fn prepare_selector(&self, selector: &mut crate::shared::token_io::TokenSelector<'a>) -> Result<()> {
+        selector.reserve_sampler()
+    }
+    fn reconcile_ready(&self, selector: &crate::shared::token_io::TokenSelector<'a>,
+        cache: &mut PrefixCache<CudaCopyEngine<'a>>) -> Result<()> {
+        self.engine.borrow_mut().reconcile_ready(selector, cache)
+    }
     fn prefix_cache(&self, args: &PrefixArgs, lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>>)> {
         ensure!(args.prefix_partial == Toggle::Off, "dense Qwen supports exact prefix frontiers only");
         let family = if let Some(mtp) = &self.mtp { DensePrefix::with_mtp(self.engine, mtp.clone())? }
@@ -150,7 +157,14 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         let shape = self.geometry();
         let args = &args.with_scoring(if shape.full_prefill_logits { shape.prefill_rows } else { shape.decode_rows },
             shape.prefill_rows, shape.vocab_size)?;
-        let host = args.host_config(layout, shape.max_context, lanes)?.map(|config|
+        let mut frozen_args = args.clone();
+        let serving = self.engine.borrow().serving_facts();
+        let host_config = if let Some(facts) = serving {
+            frozen_args.host_cache_bytes = crate::shared::prefix::HostBudget::Bytes(facts.host_quota);
+            // The shared allocation plan already admitted all future host owners.
+            frozen_args.resolve_host_config(layout, shape.max_context, lanes)?
+        } else { args.host_config(layout, shape.max_context, lanes)? };
+        let host = host_config.map(|config|
             CudaCopyEngine::registered_retained(self.library, family.snapshot_owners(),
                 self.drafter.iter().cloned().map(|draft| draft as Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner + 'a>)
                     .chain(self.mtp.iter().cloned().map(|mtp| mtp as Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner + 'a>))
@@ -598,7 +612,16 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
             let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint,
                 header.config, engine_args.pool_tokens,
                 draft_config.or_else(|| mtp_admission.as_ref().map(|admission| admission.bytes)), slots,
-                Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits)?);
+                Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits,
+                Some(cuteafd_loader::placement::families::qwen3_5::ServingRequest {
+                    concurrency: lanes as u64, prefix_entries: engine_args.prefix.mark_rule(lanes).entries as u64,
+                    host_cache_bytes: match engine_args.prefix.host_cache_bytes {
+                        crate::shared::prefix::HostBudget::Auto => None,
+                        crate::shared::prefix::HostBudget::Bytes(bytes) => Some(bytes),
+                    },
+                    host_headroom: engine_args.prefix.host_cache_headroom_bytes,
+                    device_sampling: engine_args.token_io.token_select != crate::shared::token_io::SelectPlacement::Host,
+                }))?);
             let mut backend = DenseBackend::new(&engine, &library);
             backend.packing = engine_args.prefill_packing;
             let drafts = if let Some(snapshot) = &engine_args.draft {
@@ -711,7 +734,7 @@ mod tests {
         let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg,
             Some(262144), Some(bytes), 4, Some(crate::shared::prefix::MarkRule {
                 lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }),
-            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false)?);
+            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None)?);
         let draft = {
             let target = engine.borrow();
             let cfg = block_dspark::DsparkConfig::read(&draft_snapshot)?;
@@ -748,7 +771,7 @@ mod tests {
         let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg,
             Some(262144), Some(admission.bytes), 4, Some(crate::shared::prefix::MarkRule {
                 lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }),
-            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false)?);
+            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None)?);
         let mtp = Rc::new(MtpCache::load(&engine.borrow(), &reader, admission)?);
         let family = DensePrefix::with_mtp(&engine, mtp.clone())?;
         let mut backend = DenseBackend::new(&engine, &library);

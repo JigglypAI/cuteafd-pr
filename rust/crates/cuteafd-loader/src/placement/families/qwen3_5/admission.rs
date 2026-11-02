@@ -6,6 +6,78 @@ use crate::families::qwen::HybridAttention;
 use crate::placement::{planner::*, ArchContext};
 use cuteafd_core::memory_layout::Category;
 
+#[derive(Debug, Clone, Copy)]
+pub struct ServingRequest {
+    pub concurrency: u64,
+    pub prefix_entries: u64,
+    /// None is automatic; Some(0) disables the host tier.
+    pub host_cache_bytes: Option<u64>,
+    pub host_headroom: u64,
+    pub device_sampling: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ServingFacts {
+    pub device_sampling: bool,
+    pub host_quota: u64,
+    pub host_chunk: u64,
+    pub host_runtime: u64,
+    pub host_headroom: u64,
+}
+
+impl ServingFacts {
+    pub fn new(cfg: &Qwen35Config, buffers: &NativeBuffers, record_bytes: u64,
+        request: ServingRequest, host_total: u64) -> Result<Self, Refusal> {
+        if request.concurrency == 0 || request.concurrency > super::VERIFY_ROWS as u64 {
+            return Err(Refusal::InvalidFact("dense scheduler concurrency exceeds decode rows".into()));
+        }
+        let geometry = cuteafd_core::prefix::HostCacheGeometry {
+            unit_rows: PAGE_ROWS,
+            page_bytes: record_bytes.checked_mul(PAGE_ROWS)
+                .and_then(|n| n.checked_mul(cfg.attention.iter().filter(|&&a| a == HybridAttention::Full).count() as u64))
+                .ok_or(Refusal::Overflow("host prefix page"))?,
+            mark_bytes: buffers.mark_bytes as u64, draft_bytes: 0,
+        };
+        let quota = if request.prefix_entries == 0 { 0 } else {
+            geometry.resolve(request.host_cache_bytes, cfg.max_context as u64, request.concurrency,
+                host_total, geometry.chunk_bytes()).ok_or(Refusal::Overflow("host prefix quota"))?
+        };
+        if quota == 0 && request.prefix_entries > 0 && request.host_cache_bytes != Some(0) {
+            return Err(Refusal::InvalidFact("host prefix quota resolves to zero".into()));
+        }
+        Ok(Self { device_sampling: request.device_sampling, host_quota: quota, host_headroom: request.host_headroom,
+            host_chunk: geometry.chunk_bytes().min(quota),
+            host_runtime: cuteafd_core::memory_layout::host_logits_bytes(buffers.head_rows as u64,
+                PREFILL_ROWS as u64, cfg.vocab as u64).ok_or(Refusal::Overflow("host logits"))? })
+    }
+
+    fn allocations(self, vocab: usize) -> Result<Vec<Allocation>, Refusal> {
+        let lifetime = Lifetime { first: Phase::Warmup, last: Phase::Growth };
+        let mut owners = vec![Allocation::buffer("selector.output", Location::coordinator(0),
+            super::VERIFY_ROWS as u64 * 12, lifetime, Category::Workspace, "token selector"),
+            Allocation::buffer("selector.landing", Location::PINNED, super::VERIFY_ROWS as u64 * 12,
+                lifetime, Category::Staging, "token selector")];
+        if self.device_sampling {
+            for owner in cuteafd_core::target_sampler_allocations(super::VERIFY_ROWS, vocab)
+                .map_err(|e| Refusal::InvalidFact(e.into()))? {
+                owners.push(Allocation::buffer(format!("selector.sampler.{}", owner.id),
+                    if owner.pinned { Location::PINNED } else { Location::coordinator(0) },
+                    owner.bytes as u64, lifetime, Category::Workspace, "target sampler"));
+            }
+        }
+        if self.host_quota > 0 {
+            if self.host_chunk == 0 || self.host_chunk > self.host_quota {
+                return Err(Refusal::InvalidFact("invalid host prefix chunk".into()));
+            }
+            for index in 0..self.host_quota / self.host_chunk {
+                owners.push(Allocation::buffer(format!("host.prefix.{index}"), Location::PINNED,
+                    self.host_chunk, lifetime, Category::Prefix, "retained host prefix chunk"));
+            }
+        }
+        Ok(owners)
+    }
+}
+
 pub struct DenseFacts<'a> {
     pub cfg: &'a Qwen35Config,
     pub weights: &'a NativeWeights,
@@ -15,6 +87,7 @@ pub struct DenseFacts<'a> {
     /// Slice 0b supplies exact drafter owners; these reservations are explicitly
     /// deferred and cannot satisfy a Ready reconciliation in the meantime.
     pub drafter: Option<DrafterBytes>,
+    pub serving: Option<ServingFacts>,
 }
 
 pub fn forecast_budgets(
@@ -66,9 +139,28 @@ pub fn forecast_budgets(
     ])
 }
 
+/// A live sample is physical; a logical cap changes only the ceiling.
+pub fn sampled_budgets(
+    free: u64,
+    total: u64,
+    logical: Option<u64>,
+    host: (u64, u64),
+) -> Result<Vec<Budget>, Refusal> {
+    let physical = ArchContext::for_device("sm_120", total);
+    let mut budgets = forecast_budgets(physical, logical.unwrap_or(total), 0, host)?;
+    budgets[0].physical_bytes = total;
+    budgets[0].baseline = Baseline::Sampled {
+        free,
+        phase: Phase::Load,
+        source: format!("CUDA physical sample after modules, before target weights; {}", physical.source),
+    };
+    budgets[0].available()?;
+    Ok(budgets)
+}
+
 pub fn admit(
     request: Request,
-    budgets: Vec<Budget>,
+    mut budgets: Vec<Budget>,
     facts: DenseFacts<'_>,
 ) -> Result<ResolvedPlan, Refusal> {
     if facts.weights.layers.len() != facts.cfg.attention.len()
@@ -101,6 +193,11 @@ pub fn admit(
                 "dense layer {layer} inventory differs from physical operands"
             )));
         }
+    }
+    if let Some(serving) = facts.serving {
+        let host = budgets.iter_mut().find(|budget| budget.id == "host")
+            .ok_or_else(|| Refusal::InvalidFact("dense serving has no host budget".into()))?;
+        host.headroom = host.headroom.max(serving.host_headroom);
     }
     solve(request, budgets, &facts)
 }
@@ -387,6 +484,9 @@ impl Recipe for DenseFacts<'_> {
                 1,
             );
         }
+        if let Some(serving) = self.serving {
+            allocations.extend(serving.allocations(self.cfg.vocab)?);
+        }
         let mut deferred = Vec::new();
         if let Some(draft) = self.drafter {
             let bytes = draft
@@ -410,12 +510,18 @@ impl Recipe for DenseFacts<'_> {
         }
         // This was an ownerless Exact demand. It remains an explicit unmeasured
         // growth allowance, never a receipt or a physical-card measurement.
-        let allowances = vec![Allowance { location: gpu, bytes: 512 << 20, lifetime: Lifetime::TARGET,
+        let mut allowances = vec![Allowance { location: gpu, bytes: 512 << 20, lifetime: Lifetime::TARGET,
             source: "dense head/runtime growth: unqualified pre-existing allowance".into(), assumed: true },
             Allowance { location: Location::HOST, bytes: self.weights.loading_host_bytes,
                 lifetime: Lifetime { first: Phase::Load, last: Phase::Load },
                 source: "checkpoint headers: one tensor/operand read plus packed Vec capacity; read_exact_at, no shard buffer".into(),
                 assumed: true }];
+        if let Some(serving) = self.serving {
+            allowances.push(Allowance { location: Location::HOST, bytes: serving.host_runtime,
+                lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth },
+                source: "bounded host logit download/gather allowance; ordinary Rust heap, not exact receipts".into(),
+                assumed: true });
+        }
         Ok(Facts {
             allocations,
             deferred,

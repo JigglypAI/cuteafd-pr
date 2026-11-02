@@ -1,4 +1,4 @@
-//! Actual-owner receipts for the no-drafter target, including pinned owners.
+//! Actual-owner receipts for no-drafter target and serving startup, including pinned owners.
 use super::*;
 use cuteafd_core::memory_layout::Category;
 use cuteafd_ffi::memory_ledger::{self, AllocationAudit, AllocationEvent, Space};
@@ -45,7 +45,7 @@ pub(super) fn reconcile_target(
     kv: &[Option<std::rc::Rc<Allocation<'_>>>],
     verification: &verify::Verification<'_>,
     prefix: Option<&Allocation<'_>>,
-) -> Result<()> {
+) -> Result<Vec<Receipt>> {
     let mut receipts = Vec::new();
     for (layer, weights) in weights.layers.iter().enumerate() {
         for (name, buffer) in weights.allocation_buffers() {
@@ -293,19 +293,62 @@ pub(super) fn reconcile_target(
         }
     }
     receipts.extend(view_receipts);
-    let phase = if plan.facts.deferred.is_empty() {
-        Phase::Ready
-    } else {
-        Phase::PostTargetKv
-    };
-    planner::reconcile(plan, phase, &receipts)?;
+    reconcile_startup(plan, library, device, Phase::PostTargetKv, audit, loaded_events,
+        audit.events().len(), &receipts)?;
+    Ok(receipts)
+}
+
+pub(super) struct Startup {
+    pub plan: ResolvedPlan,
+    pub audit: AllocationAudit,
+    pub loaded_events: usize,
+    pub target_events: usize,
+    pub receipts: Vec<Receipt>,
+}
+
+impl Startup {
+    pub fn ready(&mut self, library: &NativeLibrary, device: Device<'_>,
+        selector: &crate::shared::token_io::TokenSelector<'_>,
+        cache: &mut cuteafd_engine::prefix::PrefixCache<crate::shared::prefix::CudaCopyEngine<'_>>) -> Result<()> {
+        let lifetime = Lifetime { first: Phase::Warmup, last: Phase::Growth };
+        let (gpu, pinned) = selector.allocation_buffers();
+        let mut receipts = self.receipts.clone();
+        for (id, buffer) in gpu {
+            let group = if id.starts_with("selector.sampler.") { "target sampler" } else { "token selector" };
+            receipts.push(receipt(id, buffer, Category::Workspace, group, lifetime));
+        }
+        for (id, buffer) in pinned {
+            let (category, group) = if id.starts_with("selector.sampler.") {
+                (Category::Workspace, "target sampler")
+            } else { (Category::Staging, "token selector") };
+            receipts.push(Receipt { allocation: Spec::buffer(id, Location::PINNED, buffer.bytes as u64,
+                lifetime, category, group), address: buffer.ptr as u64 });
+        }
+        if let Some(copy) = cache.host_engine_mut() {
+            for (index, buffer) in copy.allocation_buffers() {
+                receipts.push(Receipt { allocation: Spec::buffer(format!("host.prefix.{index}"), Location::PINNED,
+                    buffer.bytes as u64, lifetime, Category::Prefix, "retained host prefix chunk"),
+                    address: buffer.ptr as u64 });
+            }
+        }
+        reconcile_startup(&self.plan, library, device, Phase::Ready, &self.audit,
+            self.loaded_events, self.target_events, &receipts)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_startup(plan: &ResolvedPlan, library: &NativeLibrary, device: Device<'_>, phase: Phase,
+    audit: &AllocationAudit, loaded_events: usize, target_events: usize, receipts: &[Receipt]) -> Result<()> {
+    planner::reconcile(plan, phase, receipts)?;
     let mut live = BTreeMap::new();
     let mut observations = Vec::new();
     for (index, event) in audit.events().into_iter().enumerate() {
         let at = if index < loaded_events {
             Phase::Load
-        } else {
+        } else if index < target_events {
             Phase::PostTargetKv
+        } else {
+            Phase::Warmup
         };
         match event {
             AllocationEvent::Allocated(a) => {
@@ -349,7 +392,7 @@ pub(super) fn reconcile_target(
         .into_iter()
         .map(|a| (a.address, a))
         .collect::<BTreeMap<_, _>>();
-    for receipt in &receipts {
+    for receipt in receipts {
         if receipt.allocation.view.is_some() {
             observations.push(Observation {
                 receipt: receipt.clone(),
@@ -399,7 +442,7 @@ pub(super) fn reconcile_target(
         planner::Baseline::Sampled { free, .. } => free,
         _ => anyhow::bail!("live reconciliation requires a before-weights sample"),
     };
-    let (free, _) = library.cuda_memory_info()?;
+    let (free, _) = library.cuda_physical_memory_info()?;
     planner::reconcile_usage(
         plan,
         "coordinator.0",
@@ -407,4 +450,86 @@ pub(super) fn reconcile_target(
         before.saturating_sub(free as u64),
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::{memory::device::Allocation, prefix::CudaCopyEngine,
+        token_io::{SelectPlacement, TokenSelector}};
+    use cuteafd_engine::prefix::{FamilyLayout, MarkStore, PageOwners, PrefixCache, PrefixConfig};
+    use planner::{Baseline, Budget, Decisions, Facts, Operation, Pin, PrefillShape, Request};
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn actual_ready_census_reconciles_scheduler_owners_and_rejects_individual_mismatches() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let library = fixture.load()?;
+        let total = 1 << 30;
+        fixture.configure_memory(&library, 0, total)?;
+        let device = Device { library: &library, id: 0 };
+        for placement in [SelectPlacement::Device, SelectPlacement::Host] {
+            let audit = AllocationAudit::start();
+            let target = Allocation::new(device, 256)?;
+            let target_events = audit.events().len();
+            let target_receipt = receipt("fixture.target".into(), target.buffer,
+                Category::Workspace, "fixture target", Lifetime::TARGET);
+            let lifetime = Lifetime { first: Phase::Warmup, last: Phase::Growth };
+            let mut owners = vec![target_receipt.allocation.clone(),
+                Spec::buffer("selector.output", Location::coordinator(0), 64 * 12,
+                    lifetime, Category::Workspace, "token selector"),
+                Spec::buffer("selector.landing", Location::PINNED, 64 * 12,
+                    lifetime, Category::Staging, "token selector")];
+            if placement == SelectPlacement::Device {
+                owners.extend(cuteafd_core::target_sampler_allocations(64, 33).unwrap().into_iter().map(|a|
+                    Spec::buffer(format!("selector.sampler.{}", a.id),
+                        if a.pinned { Location::PINNED } else { Location::coordinator(0) },
+                        a.bytes as u64, lifetime, Category::Workspace, "target sampler")));
+            }
+            for index in 0..2 {
+                owners.push(Spec::buffer(format!("host.prefix.{index}"), Location::PINNED, 4096,
+                    lifetime, Category::Prefix, "retained host prefix chunk"));
+            }
+            let budgets = vec![Budget { id: "coordinator.0".into(), locations: vec![Location::coordinator(0)],
+                physical_bytes: total as u64, logical_bytes: total as u64,
+                baseline: Baseline::Sampled { free: total as u64, phase: Phase::Load, source: "CPU fixture".into() },
+                headroom: 0 }, Budget { id: "host".into(), locations: vec![Location::HOST, Location::PINNED],
+                physical_bytes: total as u64, logical_bytes: total as u64,
+                baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false }, headroom: 0 }];
+            let facts = Facts { allocations: owners, deferred: vec![], allowances: vec![] };
+            let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
+                prefill: Pin::Auto, operation: Operation::Serving }, decisions: Decisions {
+                attention: vec![], onboard_layers: vec![vec![]], prefill: PrefillShape { rows: 4096, waves: 1 } },
+                pool_tokens: 64, phases: planner::evaluate(&facts, &budgets)?, budgets, facts };
+            let mut startup = Startup { plan, audit, loaded_events: 0, target_events,
+                receipts: vec![target_receipt] };
+            let mut selector = TokenSelector::new(&library, placement, 33, 64)?;
+            selector.reserve_sampler()?;
+            let copy = CudaCopyEngine::registered(&library, &[target.buffer])?;
+            let layout = FamilyLayout { page_rows: 64, pages: 1, page_bytes: 256, mark_bytes: 0,
+                draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT,
+                mark_store: MarkStore::Arena, page_owners: PageOwners::Uniform };
+            let mut cache = PrefixCache::new(layout, PrefixConfig { entries: 1, mark_slots: 0,
+                keep_logits: false, min_tokens: 1 }, Some((cuteafd_hostcache::config::Config {
+                bytes: 2 * 4096 + 17, chunk_bytes: 4096, min_tokens: 1, ..Default::default() }, copy)))?;
+            startup.ready(&library, device, &selector, &mut cache)?;
+            let expected = startup.plan.clone();
+            for mismatch in 0..4 {
+                startup.plan = expected.clone();
+                let owner = startup.plan.facts.allocations.iter_mut().find(|a| a.id == "selector.output").unwrap();
+                match mismatch {
+                    0 => owner.bytes += 4,
+                    1 => owner.location = Location::PINNED,
+                    2 => owner.lifetime.first = Phase::Load,
+                    _ => { startup.plan.facts.allocations.retain(|a| a.id != "selector.output"); }
+                }
+                assert!(startup.ready(&library, device, &selector, &mut cache).is_err(), "mismatch {mismatch}");
+            }
+            startup.plan = expected;
+            let extra = Allocation::new(device, 256)?;
+            assert!(startup.ready(&library, device, &selector, &mut cache).is_err(), "unreceipted owner");
+            drop(extra);
+        }
+        Ok(())
+    }
 }

@@ -8,7 +8,7 @@ use cuteafd_core::memory_layout::{Basis, Category};
 
 pub mod weights;
 mod admission;
-pub use admission::{DenseFacts, admit, forecast_budgets};
+pub use admission::{DenseFacts, ServingFacts, ServingRequest, admit, forecast_budgets, sampled_budgets};
 
 pub const PAGE_ROWS: u64 = 64;
 const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };

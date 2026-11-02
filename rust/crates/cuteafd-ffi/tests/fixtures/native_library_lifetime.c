@@ -352,6 +352,9 @@ int cuteafd_cuda_event_create_ordering(void **out) {
 int cuteafd_cuda_event_create(void **out) {
     return cuteafd_cuda_event_create_ordering(out);
 }
+int cuteafd_cuda_event_create_blocking(void **out) {
+    return cuteafd_cuda_event_create_ordering(out);
+}
 
 int cuteafd_cuda_stream_wait_event(void *stream, void *handle) {
     (void)stream; (void)handle;

@@ -120,6 +120,10 @@ pub(crate) struct CudaCopyEngine<'a> {
 }
 
 impl<'a> CudaCopyEngine<'a> {
+    pub(crate) fn allocation_buffers(&self) -> Vec<(usize, CuteafdHostBuffer)> {
+        self.chunks.iter().enumerate().filter_map(|(index, chunk)| chunk.map(|b| (index, b))).collect()
+    }
+
     /// Legacy single-stream-device mode. Peer-addressed ranges retain their
     /// existing behavior; registered families select the allocation owner.
     pub fn new(library: &'a NativeLibrary, template: CuteafdDeviceBuffer) -> Result<Self> {
@@ -365,6 +369,35 @@ mod cuda_tests {
     use cuteafd_hostcache::snapshot::{DevicePageId, SnapshotMeta};
     use cuteafd_hostcache::COMPRESSORS;
     use crate::shared::memory::device::{Allocation, Device};
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn retained_host_chunks_match_upfront_quota_and_never_grow() -> Result<()> {
+        use cuteafd_ffi::memory_ledger::{AllocationAudit, AllocationEvent, Space};
+        use cuteafd_hostcache::pool::{Class, SlabPool};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let library = fixture.load()?;
+        let owner = Allocation::new(Device { library: &library, id: 0 }, 256)?;
+        let mut engine = CudaCopyEngine::registered(&library, &[owner.buffer])?;
+        let audit = AllocationAudit::start();
+        let mut pool = SlabPool::new(2 * 4096 + 17, 4096, Layout::family(256, 64, 0), &mut engine)?;
+        let chunks = engine.allocation_buffers();
+        assert_eq!(chunks.iter().map(|(id, b)| (*id, b.bytes)).collect::<Vec<_>>(), vec![(0, 4096), (1, 4096)]);
+        let events = audit.events();
+        assert_eq!(events.len(), chunks.len());
+        for event in &events {
+            let AllocationEvent::Allocated(record) = event else { panic!("chunk freed before Ready") };
+            assert_eq!(record.key.space, Space::Pinned);
+            assert_eq!(record.bytes, 4096);
+            assert!(chunks.iter().any(|(_, buffer)| buffer.ptr as usize == record.address));
+        }
+        for _ in 0..32 { pool.take(Class::Page)?; }
+        assert!(pool.take(Class::Page).is_err());
+        assert_eq!(audit.events().len(), events.len(), "slab carving must not allocate pinned storage");
+        assert_eq!(engine.allocation_buffers().iter().map(|(id, b)| (*id, b.ptr as usize, b.bytes))
+            .collect::<Vec<_>>(), chunks.iter().map(|(id, b)| (*id, b.ptr as usize, b.bytes)).collect::<Vec<_>>());
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
