@@ -164,8 +164,12 @@ if tool == "docker":
                 speculator=value("--speculator"),
                 admission={"kv_pool_size": value("--kv-pool-size"), "memory_reservation": value("--memory-reservation")},
                 peers=value("--deployment-peers", "").split(",")[:int(ranks)],
+                # DeviceLayout.worker_budget_bytes excludes host reserve and the report's weight ceiling.
                 memory_layout={"devices": [{"kind": "rtx", "index": i, "items": [{"category": "weights", "bytes": 8 << 30}]}
-                                           for i in range(int(value("--rtx", "1")))]})
+                                           for i in range(int(value("--rtx", "1")))] +
+                                          [{"kind": "spark", "index": i, "capacity_bytes": int(float(value("--spark-budget-gib", "108")) * 2**30),
+                                            "worker_budget_bytes": int(float(value("--spark-budget-gib", "108")) * 2**30),
+                                            "items": [], "kv_tokens": 0} for i in range(int(ranks))]})
         print(json.dumps(response))
         sys.exit(0)
     if args and args[0] == "run" and "--entrypoint" in args and "python3" in args:

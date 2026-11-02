@@ -478,7 +478,7 @@ mod selected_spark_io_tests {
             let io = working.rank_io(0, geometry, 4096, false, rings).unwrap();
             assert_eq!(io.mapped_rings, expected);
             let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0,
-                capacity_bytes: 121 * GIB, items: vec![], kv_tokens: 0 };
+                capacity_bytes: 121 * GIB, worker_budget_bytes: 108 * GIB, items: vec![], kv_tokens: 0 };
             charge_spark_io(&mut device, &working, geometry, 4096, false, rings, GIB).unwrap();
             assert_eq!(device.items.iter().find(|item| item.group == "rdma rings").unwrap().bytes, expected);
             let residual = device.items.iter().find(|item|
@@ -559,7 +559,7 @@ mod selected_spark_io_tests {
             let expected = reserve + io.intake + io.host_exchange + io.row_indices
                 + io.endpoint_staging + io.mapped_rings;
             let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0,
-                capacity_bytes: 121 * GIB, items: vec![], kv_tokens: 0 };
+                capacity_bytes: 121 * GIB, worker_budget_bytes: 108 * GIB, items: vec![], kv_tokens: 0 };
             for _ in 0..2 {
                 charge_spark_io(&mut device, &working, ExpertGeometry::KIMI_K3, unit as u32,
                     false, rings, 0).unwrap();
@@ -593,7 +593,7 @@ mod selected_spark_io_tests {
                 prefill_lanes: lanes, ..Default::default() };
             let rings = spark_ring_geometry(spark_endpoints(family, lanes));
             let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 5,
-                capacity_bytes: 121 * GIB, items: vec![], kv_tokens: 0 };
+                capacity_bytes: 121 * GIB, worker_budget_bytes: 108 * GIB, items: vec![], kv_tokens: 0 };
             let wave = GIB;
             charge_spark_io(&mut device, &working, geometry, 4096, false, rings, wave).unwrap();
             let wire = device.items.iter().find(|item| item.group == "expert intake").unwrap().bytes;
@@ -1001,7 +1001,7 @@ pub(crate) fn spark_devices(report: &mut PlanReport, model: &dyn super::FamilyMo
         .map(|c| c.formats.keys().cloned().collect::<Vec<_>>().join("+")).unwrap_or_default();
     let (slices, padded) = spark_slices(report, model, ranks, routed);
     let mut devices = slices.into_iter().enumerate().map(|(rank, stored)| {
-        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: options.spark_bytes,
+        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: options.spark_bytes, worker_budget_bytes: options.spark_bytes,
             items: Vec::new(), kv_tokens: 0 };
         if let Some(host) = charges.host_bytes {
             device.capacity_bytes += 13 * GIB;

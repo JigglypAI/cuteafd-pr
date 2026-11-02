@@ -243,7 +243,7 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
     report.prefill_span_rows = Some(4096);
     report.prefill_transports = Some(3);
     report.memory_layout = Some(MemoryLayout { devices: vec![DeviceLayout {
-        kind: DeviceKind::Rtx, index: 0, capacity_bytes: 96 << 30, items: vec![], kv_tokens: 0,
+        kind: DeviceKind::Rtx, index: 0, capacity_bytes: 96 << 30, worker_budget_bytes: 0, items: vec![], kv_tokens: 0,
     }], pool_tokens: 0, waste: vec![], notes: vec![] });
     let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
         host_cache_bytes: Some(0), prefill_unit_rows: Some(4096), ..Default::default() };

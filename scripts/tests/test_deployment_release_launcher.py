@@ -134,6 +134,15 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
             before["options"] = sorted([option for option in before["options"] if not option.startswith("--device nvidia.com/gpu=")]
                                        + [f"--device nvidia.com/gpu={uuid}" for uuid in uuids])
             before["env"]["CUDA_VISIBLE_DEVICES"] = ",".join(uuids)
+        if old["host"] != "coordinator" and "--device-budget-bytes" in before["command"]:
+            # Historical captures used the 100GiB weight budget as a device cap.
+            # The stub planner now admits 108GiB unless the config overrides it.
+            config = dict(line.split("=", 1) for line in (ROOT / selected["config"]).read_text().splitlines()
+                          if line and not line.startswith("#"))
+            config.update(selected["set"])
+            expected = str(config.get("SPARK_DEVICE_BUDGET_BYTES", 108 << 30))
+            assert after["command"][after["command"].index("--device-budget-bytes") + 1] == expected
+            before["command"][before["command"].index("--device-budget-bytes") + 1] = expected
         fingerprint = "CUTEAFD_RELEASE_CONFIG_SHA256"
         if entry["family"] == "deepseek_v41" and fingerprint in before["env"]:
             assert after["env"][fingerprint] != before["env"][fingerprint], (entry["name"], old["host"])

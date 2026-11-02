@@ -216,6 +216,11 @@ mod tests {
                 ..Default::default() };
             let deployment = DeploymentSpec::from_report(&report, &options).unwrap();
             assert_eq!(deployment.roles.len(), ranks);
+            for device in deployment.memory_layout.devices.iter()
+                .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark) {
+                assert_eq!(device.worker_budget_bytes, 108 << 30);
+                assert_eq!(device.capacity_bytes, 121 << 30);
+            }
             assert_eq!(deployment.topology, Topology { tp: ranks, ep: 1, wire: if ranks != 4 { SparkWire::NativeOwnership } else { SparkWire::Canonical } });
             assert_eq!(deployment.spark_admission, SparkAdmission::CoordinatorAuthoritative);
             assert!(deployment.estimated_placement.is_some());

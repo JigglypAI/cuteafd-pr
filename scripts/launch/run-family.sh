@@ -2839,10 +2839,10 @@ audio_encoder_hash=""
   fi
   if ((ranks > 0)); then
     budget="$(jq -er --argjson ranks "$ranks" '
-      [.memory_layout.devices[] | select(.kind == "spark") | .capacity_bytes] |
+      [.memory_layout.devices[] | select(.kind == "spark") | .worker_budget_bytes] |
       select(length == $ranks and all(.[]; type == "number" and . > 0)) |
       unique | select(length == 1) | .[0]' <<<"$deployment_json")" ||
-      release_die "the deployment plan names no uniform complete-device Spark capacity"
+      release_die "the deployment plan names no uniform Spark worker allocation ceiling"
   fi
 # Check the admitted count's images before --restart or weight loading. The worker's
 # resident admission validates the sibling for its full 4096-row workspace even

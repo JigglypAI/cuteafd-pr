@@ -246,7 +246,7 @@ pub(super) fn layout(
         memory.devices.push(DeviceLayout {
             kind: DeviceKind::Rtx,
             index: rank as u32,
-            capacity_bytes: opts.rtx_bytes[rank],
+            capacity_bytes: opts.rtx_bytes[rank], worker_budget_bytes: 0,
             items,
             kv_tokens: memory.pool_tokens,
         });
@@ -303,7 +303,7 @@ pub(super) fn layout(
         let mut device = DeviceLayout {
             kind: DeviceKind::Spark,
             index: rank as u32,
-            capacity_bytes: opts.spark_bytes,
+            capacity_bytes: opts.spark_bytes, worker_budget_bytes: opts.spark_bytes,
             kv_tokens: 0,
             items: vec![
                 Item::new(

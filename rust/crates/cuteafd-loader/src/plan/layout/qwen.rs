@@ -49,7 +49,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     let gpus = options.rtx_bytes.len().clamp(1, 2);
     let mut devices: Vec<DeviceLayout> = options.rtx_bytes.iter().take(gpus).enumerate()
         .map(|(index, &bytes)| DeviceLayout { kind: DeviceKind::Rtx, index: index as u32,
-            capacity_bytes: bytes.saturating_sub(options.headroom_bytes.max(3 * GIB)), items: Vec::new(), kv_tokens: 0 })
+            capacity_bytes: bytes.saturating_sub(options.headroom_bytes.max(3 * GIB)), worker_budget_bytes: 0, items: Vec::new(), kv_tokens: 0 })
         .collect();
     let mut waste = Vec::new();
     let mut notes = vec![format!("resolved context {} tokens (checkpoint {})", shape.context_tokens, shape.checkpoint_context),
@@ -286,7 +286,7 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
             .unwrap_or_else(|| crate::placement::ProgramSet::from_names(&["qwen4"], []));
         let allowance = crate::placement::inventory::loaded_code_allowance("qwen4", local_package(report),
             true, rank as u8, arch, Some(&programs));
-        DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: capacity,
+        DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: capacity, worker_budget_bytes: 0,
             items: vec![Item::new(Category::Runtime, "context+modules", "SM120",
                 arch.context_bytes + allowance.bytes, allowance.basis)], kv_tokens: 0 }
     }).collect::<Vec<_>>();
