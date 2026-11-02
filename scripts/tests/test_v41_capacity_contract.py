@@ -1,4 +1,8 @@
 """Target verifier exports and flattened drafter covers are independent."""
+import ast
+import hashlib
+import json
+import sys
 import importlib.util
 from pathlib import Path
 import re
@@ -36,6 +40,35 @@ def test_v41_export_capacity_contract():
 def test_spark_width_maps_follow_reconfigured_capacities(tmp_path, seed_legacy_cache, override):
     source, build = tmp_path / "source", tmp_path / "build"
     source.mkdir()
+    # Exercise the real CMake commands with CPU stand-ins only for GPU compilation.
+    for name in ("python", "scripts"):
+        (tmp_path / name).symlink_to(ROOT / name, target_is_directory=True)
+    for name in ("families", "shared"):
+        (source / name).symlink_to(ROOT / "native" / name, target_is_directory=True)
+    shim = tmp_path / "cpu-export"
+    shim.write_text(f"#!{sys.executable}\n" + r'''import ast, hashlib, json, pathlib, sys
+exporter = pathlib.Path(sys.argv[1])
+tree = ast.parse(exporter.read_text())
+helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "write_manifest")
+namespace = {"hashlib": hashlib, "json": json}
+exec(compile(ast.Module(body=[helper], type_ignores=[]), str(exporter), "exec"), namespace)
+args = sys.argv[2:]
+def arg(name, default=None):
+    return args[args.index(name) + 1] if name in args else default
+out = pathlib.Path(arg("--output-dir"))
+out.mkdir(exist_ok=True)
+family, role = arg("--geometry", "v41"), arg("--role")
+rows = [int(v) for v in arg("--rows").split(",")]
+artifacts = ["v41_expert_variants.h"]
+(out / artifacts[0]).write_text(arg("--rows") + " " + arg("--width"))
+for row in rows:
+    for suffix in ("h", "o"):
+        name = f"{family}_{role}_m{row}.{suffix}"
+        (out / name).write_text(str(row))
+        artifacts.append(name)
+namespace["write_manifest"](out, {"role": role, "family": family, "experimental": False}, artifacts)
+''')
+    shim.chmod(0o755)
     spark = ROOT / "native/cmake/families/deepseek_v41/v41_spark_tp_experts.cmake"
     adjacent = ROOT / "native/cmake/shared/mxfp4_widths.cmake"
     (source / "CMakeLists.txt").write_text(f'''cmake_minimum_required(VERSION 3.24)
@@ -52,7 +85,7 @@ set(CUTEAFD_NATIVE_ARTIFACTS_dsv4p_5 spark_w448)
 set(CUTEAFD_EXPERT_FAMILIES dsv4f:spark_tp5 dsv4p:spark_tp5)
 set(CUTEAFD_V41_TARGET_ROWS 1 16 ${{CUTEAFD_V41_VERIFY_ROWS}} 256 1024 4096)
 list(JOIN CUTEAFD_V41_TARGET_ROWS "," CUTEAFD_V41_TARGET_ROWS_ARG)
-set(Python3_EXECUTABLE python3)
+set(Python3_EXECUTABLE "{shim.as_posix()}")
 add_custom_target(cuteafd_verify_sparkinfer_source)
 include("{spark.as_posix()}")
 include("{adjacent.as_posix()}")
@@ -64,14 +97,42 @@ include("{adjacent.as_posix()}")
                                 capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stdout + result.stderr
 
+    targets = [f"cuteafd_v41_spark_tp{world}_experts_export" for world in (2, 3, 6, 8)]
+    targets += [f"cuteafd_{family}_spark_w448_experts_export" for family in ("v41", "dsv4f", "dsv4p")]
+
+    def build_and_verify():
+        result = subprocess.run(["cmake", "--build", str(build), "--target", *targets, "--parallel", "2"],
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        manifests = list(build.glob("*_experts/v41_experts.json"))
+        assert len(manifests) == 7
+        for path in manifests:
+            payload = json.loads(path.read_text())
+            hashes = payload["artifact_sha256"]
+            family, role = payload["family"], payload["role"]
+            alias = f"{family}_{role}_expert_variants.h"
+            assert alias in hashes
+            assert "retired.h" not in hashes
+            assert "retired.o" not in hashes
+            for name, expected_digest in hashes.items():
+                assert hashlib.sha256((path.parent / name).read_bytes()).hexdigest() == expected_digest
+            assert (path.parent / alias).read_bytes() == (path.parent / "v41_expert_variants.h").read_bytes()
+            if family == "v41" and "64" in (path.parent / alias).read_text():
+                assert not any("_m80." in name for name in hashes)
+
     legacy = "1:192,16:192,80:192,256:192,1024:192,4096:192"
     seed = ([f"-DCUTEAFD_V41_SPARK_TP{world}_SLICE_WIDTH:STRING={legacy}"
              for world in (2, 3, 6, 8)] if seed_legacy_cache else [])
     configure(80, *seed)
+    build_and_verify()
+    for folder in build.glob("*_experts"):
+        (folder / "retired.h").write_text("stale header")
+        (folder / "retired.o").write_text("stale object")
     for world in (2, 3, 6, 8):
         assert f"width={legacy}\n" in (build / f"v41_spark_tp{world}_width.stamp").read_text()
     settings = [] if override is None else [f"-DCUTEAFD_V41_SPARK_TP6_SLICE_WIDTH_OVERRIDE={override}"]
     configure(64, *settings)
+    build_and_verify()
     expected = legacy.replace("80:192", "64:192")
     for world in (2, 3, 6, 8):
         width = override if world == 6 and override is not None else expected
@@ -93,6 +154,52 @@ include("{adjacent.as_posix()}")
             assert f"CUTEAFD_V41_SPARK_TP{world}_SLICE_WIDTH:STRING={legacy}" in cache
     else:
         assert not re.search(r"^CUTEAFD_V41_SPARK_TP\d_SLICE_WIDTH:", cache, re.MULTILINE)
+
+
+@pytest.mark.parametrize("family,role,alias", [
+    ("v41", "rtx_tp2", "v41_tp2_expert_variants.h"),
+    ("v41", "rtx_backbone", "v41_local_expert_variants.h"),
+    ("v41", "spark_tp6", "v41_spark_tp6_expert_variants.h"),
+    ("v41", "spark_w448", "v41_spark_w448_expert_variants.h"),
+    ("dsv4f", "spark_w448", "dsv4f_spark_w448_expert_variants.h"),
+    ("v41", "spark", None),
+    ("v41", "coordinator", None),
+    ("v41", "dspark_tp2", "v41_dspark_tp2_expert_variants.h"),
+    ("dsv4f", "spark", "dsv4f_spark_expert_variants.h"),
+    ("dsv4f", "rtx_tp2", "dsv4f_rtx_tp2_expert_variants.h"),
+    ("dsv4p", "rtx_backbone", "dsv4p_rtx_backbone_expert_variants.h"),
+])
+def test_slice_manifest_finalizes_only_current_outputs(tmp_path, family, role, alias):
+    path = ROOT / "python/tools/aot/export_b12x_slices_aot.py"
+    tree = ast.parse(path.read_text())
+    helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "write_manifest")
+    namespace = {"hashlib": hashlib, "json": json}
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), str(path), "exec"), namespace)
+    (tmp_path / "v41_expert_variants.h").write_text("new dispatch")
+    (tmp_path / "current.o").write_bytes(b"current object")
+    (tmp_path / "retired.h").write_text("old dispatch")
+    if alias:
+        (tmp_path / alias).write_text("old alias")
+    payload = {"role": role, "family": family, "experimental": False}
+    namespace["write_manifest"](tmp_path, payload, ["v41_expert_variants.h", "current.o"])
+    hashes = json.loads((tmp_path / "v41_experts.json").read_text())["artifact_sha256"]
+    expected = {"v41_expert_variants.h", "current.o"} | ({alias} if alias else set())
+    assert set(hashes) == expected
+    for name, digest in hashes.items():
+        assert hashlib.sha256((tmp_path / name).read_bytes()).hexdigest() == digest
+    if alias:
+        assert (tmp_path / alias).read_text() == "new dispatch"
+    export = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "export")
+    assert not any(isinstance(n, ast.Attribute) and n.attr == "iterdir" for n in ast.walk(export))
+    assert 'artifacts.extend((f"{label}.h", f"{label}.o"))' in ast.get_source_segment(path.read_text(), export)
+    assert '"v41_expert_input_quant.o"' in ast.get_source_segment(path.read_text(), export)
+
+
+def test_slice_export_consumers_do_not_mutate_finalized_headers():
+    for path in (ROOT / "native/cmake").rglob("*.cmake"):
+        text = path.read_text()
+        if "export_b12x_slices_aot.py" in text:
+            assert not re.search(r"(?:^|\s)-E\s+(?:copy(?:_if_different|_directory)?|rename)\b", text), path
 
 
 def test_native_manifest_decode_contract_matches_shared_planner_recipe():

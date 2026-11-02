@@ -110,8 +110,6 @@ ${device_handles}${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41
       --output-dir "${dir}" --geometry "${family}" --role "${role}"
       --rows "${rows_arg}" --width "${CUTEAFD_EXPERT_FAMILY_WIDTH}"
       ${atomic_args} --standard-names
-    COMMAND "${CMAKE_COMMAND}" -E copy
-      "${dir}/v41_expert_variants.h" "${dir}/${variant_header}"
     DEPENDS
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc"
