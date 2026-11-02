@@ -79,21 +79,79 @@ const KIND_POINTER: u8 = 1;
 /// Stable launch geometry for the index-selection graph bank. Volatile device
 /// pointers and per-request capacities are deliberately excluded; they are
 /// updated in the captured graph instead. Pure so the key can be unit-tested.
+///
+/// `group_rows` is the ordered split of requests into score launches: each
+/// group is one score kernel whose `gridDim.y` is `group.rows`. Two request
+/// layouts with identical lengths but different bindings split differently
+/// (e.g. `[2,2,2]` with bindings `[A,A,B]` -> `[4,2]` vs `[A,B,B]` -> `[2,4]`)
+/// and must not share a graph.
 fn selection_fingerprint(
     layer: usize,
     rows: usize,
     request_lengths: &[usize],
+    group_rows: &[usize],
     max_length: u64,
 ) -> Vec<usize> {
     let width = tile_width(max_length as usize, DECODE_WIDTH_BUCKET);
     let use_candidates = layer > 20 && max_length > WIDTH as u64;
     let tiles = (max_length as usize).div_ceil(width).max(1);
-    let mut fingerprint = Vec::with_capacity(4 + request_lengths.len());
+    // Follower layers (layer > 20) run one candidate-expansion pass, not
+    // `tiles` score passes, so their launch geometry does not grow with
+    // context. Hashing `tiles` here would recapture every follower layer at
+    // 16K for no geometry change.
+    let passes = if layer > 20 { 1 } else { tiles };
+    let mut fingerprint = Vec::with_capacity(6 + request_lengths.len() + group_rows.len());
     fingerprint.push(layer);
     fingerprint.push(rows);
     fingerprint.extend(request_lengths.iter().copied());
-    fingerprint.extend([width, usize::from(use_candidates), tiles, request_lengths.len()]);
+    fingerprint.extend(group_rows.iter().copied());
+    fingerprint.extend([width, usize::from(use_candidates), passes,
+        request_lengths.len(), group_rows.len()]);
     fingerprint
+}
+
+/// 4-byte launch extents that are also kernel parameters. The native update
+/// copies `gridDim` from the captured node and never rewrites it, so a changing
+/// scalar that collides with one of these must force a recapture: rewriting the
+/// parameter while the captured extent stays at the old size would replay the
+/// wrong launch geometry. Pure so the collision check can be unit-tested.
+///
+/// The candidate-tile `begin` argument is also an extent-derived value but is
+/// 8 bytes wide, so a 4-byte changing scalar can never collide with it; it is
+/// added to the identity probe separately.
+fn launch_extent_values(groups: &[ScoreGroup], rows: usize, width: usize) -> Vec<u64> {
+    let mut extents = Vec::with_capacity(groups.len() + 8);
+    // score kernel: queries = group.rows (gridDim.y), candidates = width (gridDim.x)
+    for group in groups { extents.push(group.rows as u64); }
+    extents.extend([rows as u64, width as u64, (width / 8) as u64]);
+    // top-k tiles: blocks = (candidates + 2*512 - 1) / (2*512) (gridDim.x)
+    let topk_blocks = (width + 1023) / 1024;
+    extents.push(topk_blocks as u64);
+    // top-k merge: in_blocks = current, out_blocks = next (gridDim.x)
+    let mut current = topk_blocks;
+    while current > 1 {
+        let next = (current + 1) / 2;
+        extents.push(current as u64);
+        extents.push(next as u64);
+        current = next;
+    }
+    extents
+}
+
+/// Refuse an update that would rewrite a launch extent. The native update
+/// matches on the old value, so a changing scalar whose old value equals an
+/// extent would rewrite the extent parameter while the captured `gridDim`
+/// stays at the old size. The caller recaptures instead.
+fn ensure_no_extent_rewrite(old_values: &[u64], new_values: &[u64], widths: &[u8],
+    kinds: &[u8], extents: &[u64]) -> Result<()> {
+    for (i, ((&old, &new), (&width, &kind))) in old_values.iter().zip(new_values)
+        .zip(widths.iter().zip(kinds)).enumerate() {
+        ensure!(
+            old == new || kind != KIND_SCALAR || width != 4 || !extents.contains(&old),
+            "graph update value {i} would rewrite a launch extent"
+        );
+    }
+    Ok(())
 }
 
 /// Reject a graph update that did not substitute every non-identity value.
@@ -406,17 +464,17 @@ impl<'a> IndexSelectionWave<'a> {
         Ok(())
     }
     fn select_graph(&mut self, fingerprint: &[usize], values: &[u64], widths: &[u8],
-        kinds: &[u8]) -> Result<bool> {
+        kinds: &[u8], extents: &[u64]) -> Result<bool> {
         // Eight indexed layers share this owner; source identities remain exact.
         let policy = super::graph_policy::fixed_binding_limit().map(|limit| (
             super::graph_policy::captures_shape(fingerprint[1] as u32), limit * 8));
-        self.select_graph_with_policy(fingerprint, values, widths, kinds, policy)
+        self.select_graph_with_policy(fingerprint, values, widths, kinds, extents, policy)
     }
     fn select_graph_with_policy(&mut self, fingerprint: &[usize], values: &[u64], widths: &[u8],
-        kinds: &[u8], policy: Option<(bool, usize)>) -> Result<bool> {
+        kinds: &[u8], extents: &[u64], policy: Option<(bool, usize)>) -> Result<bool> {
         let key = fingerprint.to_vec();
         if self.graph.as_ref().is_some_and(|active| active.as_slice() == fingerprint) {
-            if let Err(error) = self.update_graph_values(&key, values, widths, kinds) {
+            if let Err(error) = self.update_graph_values(&key, values, widths, kinds, extents) {
                 self.record_update_fallback(&error, &key);
                 self.storage.stream.require_complete()?;
                 self.graphs.retire(&key);
@@ -448,7 +506,7 @@ impl<'a> IndexSelectionWave<'a> {
         }
         if cached {
             self.graphs.launch(&key);
-            if let Err(error) = self.update_graph_values(&key, values, widths, kinds) {
+            if let Err(error) = self.update_graph_values(&key, values, widths, kinds, extents) {
                 self.record_update_fallback(&error, &key);
                 self.storage.stream.require_complete()?;
                 self.graphs.retire(&key);
@@ -475,17 +533,31 @@ impl<'a> IndexSelectionWave<'a> {
             "index selection graph update refused; recapturing");
     }
     fn update_graph_values(&mut self, key: &Vec<usize>, values: &[u64], widths: &[u8],
-        kinds: &[u8]) -> Result<()> {
+        kinds: &[u8], extents: &[u64]) -> Result<()> {
         let library = self.storage.stream.library;
         let owner = self.graphs.get_mut(key).context("index selection graph owner missing")?;
         let graph = owner.graph.context("index selection retained graph missing")?;
         if owner.pins.0.as_slice() == values && owner.pins.1.as_slice() == widths
             && owner.pins.2.as_slice() == kinds { return Ok(()); }
+        // A changing scalar whose old value equals a launch extent would rewrite
+        // the extent parameter while the captured gridDim stays at the old size.
+        // Refuse before the native call so the caller recaptures.
+        ensure_no_extent_rewrite(&owner.pins.0, values, widths, kinds, extents)?;
         let mut found = vec![0u8; values.len()];
+        let started = std::time::Instant::now();
+        // SAFETY: the executable and retained graph belong to this device, the
+        // stream is drained, and the value arrays describe captured kernel
+        // arguments (see `cuda_graph_exec_update_pointers`).
         unsafe {
             library.cuda_graph_exec_update_pointers(
                 owner.raw, graph, &owner.pins.0, values, widths, kinds, &mut found)?;
         }
+        // Recapture-cost telemetry: the in-place update is the alternative to a
+        // full graph recapture, so its duration is the number that justifies
+        // the native path. Reported per update; aggregate in the metrics layer.
+        tracing::debug!(target: "cuteafd::graph_capture", site="index_selection",
+            micros = started.elapsed().as_micros() as u64, values = values.len(),
+            "index selection graph update");
         // A missed substitution would leave the graph on stale arguments while
         // the pins below record the new set, so refuse before updating them.
         verify_substitutions(&owner.pins.0, values, &found)?;
@@ -799,7 +871,10 @@ impl<'a> IndexSelectionWave<'a> {
         let width = tile_width(max_length as usize, DECODE_WIDTH_BUCKET);
         let use_candidates = query.layer > 20 && max_length > WIDTH as u64;
         let tiles = (max_length as usize).div_ceil(width).max(1);
-        let fingerprint = selection_fingerprint(query.layer, rows, &request_lengths, max_length);
+        let group_rows: Vec<usize> = groups.iter().map(|group| group.rows).collect();
+        let fingerprint = selection_fingerprint(
+            query.layer, rows, &request_lengths, &group_rows, max_length);
+        let extents = launch_extent_values(&groups, rows, width);
         // Kernel arguments that change between rounds with the same geometry:
         // the query/cache/proposal device pointers and the capacity/stride
         // scalars. Stable workspace pointers and launch extents are left as
@@ -843,15 +918,26 @@ impl<'a> IndexSelectionWave<'a> {
         // Stable scalar arguments are included as identity mappings. If a
         // changing scalar happens to equal one of them, the native update sees
         // an ambiguous substitution and refuses, so the caller recaptures
-        // instead of silently corrupting the launch geometry.
+        // instead of silently corrupting the launch geometry. Launch extents
+        // are kernel parameters too (top-k `blocks`/`in_blocks`, candidate
+        // `blocks`, the score kernel's `queries`), so every extent is in the
+        // probe and `ensure_no_extent_rewrite` refuses a collision before the
+        // native call.
         for group in &groups {
             values.push(group.rows as u64);
             widths.push(4);
             kinds.push(KIND_SCALAR);
         }
-        values.extend([rows as u64, width as u64, (width / 8) as u64, 1]);
-        widths.extend([4, 4, 4, 4]);
-        kinds.extend([KIND_SCALAR; 4]);
+        // `1` and `0` are the top-k finish `reset` argument; the rest are the
+        // top-k tiles/merge extents. `group.rows`, `rows`, `width` and
+        // `width / 8` are already covered above.
+        values.extend([rows as u64, width as u64, (width / 8) as u64, 1, 0]);
+        widths.extend([4, 4, 4, 4, 4]);
+        kinds.extend([KIND_SCALAR; 5]);
+        let extra_extents = launch_extent_values(&[], rows, width);
+        values.extend(extra_extents.iter().copied());
+        widths.extend(std::iter::repeat(4).take(extra_extents.len()));
+        kinds.extend(std::iter::repeat(KIND_SCALAR).take(extra_extents.len()));
         if !use_candidates {
             for tile in 0..tiles {
                 values.push((tile * width) as u64);
@@ -864,7 +950,7 @@ impl<'a> IndexSelectionWave<'a> {
         // Prefill tails (and any other uncached large shape) bind eagerly.
         let forced_eager = self.window.is_windowed() || crate::shared::decode_graph::census::eager("index")
             || !super::graph_policy::captures_shape(rows as u32);
-        let capture = if forced_eager { false } else { self.select_graph(&fingerprint, &values, &widths, &kinds)? };
+        let capture = if forced_eager { false } else { self.select_graph(&fingerprint, &values, &widths, &kinds, &extents)? };
         if defer {
             self.in_flight = true;
             if let Some(busy) = &self.shared_scratch_busy { busy.set(true); }
@@ -1304,6 +1390,73 @@ mod graph_tests {
     }
 
     #[test]
+    fn fingerprint_distinguishes_group_split() {
+        // Same request lengths, different bindings. `[A,A,B]` merges requests
+        // 0+1 into one score launch (rows 4) then request 2 (rows 2);
+        // `[A,B,B]` launches request 0 (rows 2) then merges 1+2 (rows 4). The
+        // score kernel's gridDim.y is group.rows, so the two layouts need
+        // different graphs even though every request is two rows long.
+        let lengths = [2, 2, 2];
+        let left = selection_fingerprint(2, 6, &lengths, &[4, 2], 2);
+        let right = selection_fingerprint(2, 6, &lengths, &[2, 4], 2);
+        assert_ne!(left, right);
+        // The same split fingerprints identically.
+        assert_eq!(left, selection_fingerprint(2, 6, &lengths, &[4, 2], 2));
+        // The split is derived from the bindings, not the request order alone.
+        let mut groups = Vec::new();
+        let a = [1usize; 10];
+        let mut b = a;
+        b[0] = 2;
+        extend_score_groups(&mut groups, 0, 2, a);
+        extend_score_groups(&mut groups, 1, 2, a);
+        extend_score_groups(&mut groups, 2, 2, b);
+        let split_a: Vec<usize> = groups.iter().map(|g| g.rows).collect();
+        assert_eq!(split_a, vec![4, 2]);
+        let mut groups = Vec::new();
+        extend_score_groups(&mut groups, 0, 2, a);
+        extend_score_groups(&mut groups, 1, 2, b);
+        extend_score_groups(&mut groups, 2, 2, b);
+        let split_b: Vec<usize> = groups.iter().map(|g| g.rows).collect();
+        assert_eq!(split_b, vec![2, 4]);
+        assert_ne!(selection_fingerprint(2, 6, &lengths, &split_a, 2),
+            selection_fingerprint(2, 6, &lengths, &split_b, 2));
+    }
+
+    #[test]
+    fn follower_fingerprint_ignores_context_tiles() {
+        // Follower layers (layer > 20) run one candidate-expansion pass, so
+        // their launch geometry does not grow with context. Two contexts in
+        // the same width bucket must share a graph; producer layers still key
+        // on the tile count.
+        let lengths = [1];
+        assert_eq!(selection_fingerprint(24, 1, &lengths, &[1], 20_000),
+            selection_fingerprint(24, 1, &lengths, &[1], 40_000));
+        assert_ne!(selection_fingerprint(2, 1, &lengths, &[1], 20_000),
+            selection_fingerprint(2, 1, &lengths, &[1], 40_000));
+    }
+
+    #[test]
+    fn extent_collision_forces_recapture() {
+        // width 15872 -> top-k blocks = (15872 + 1023) / 1024 = 16, which is
+        // also the captured gridDim.x. A slots/stride update 16 -> 8 would
+        // rewrite the `blocks` parameter while gridDim.x stays 16, so the
+        // update must refuse and the caller recaptures.
+        let width = 15_872;
+        assert_eq!((width + 1023) / 1024, 16);
+        let extents = launch_extent_values(&[], 1, width);
+        assert!(extents.contains(&16));
+        let widths = [4u8];
+        let kinds = [KIND_SCALAR];
+        assert!(ensure_no_extent_rewrite(&[16], &[8], &widths, &kinds, &extents).is_err());
+        // A value that is not an extent updates normally.
+        assert!(ensure_no_extent_rewrite(&[7], &[8], &widths, &kinds, &extents).is_ok());
+        // An identity mapping of an extent is not a rewrite.
+        assert!(ensure_no_extent_rewrite(&[16], &[16], &widths, &kinds, &extents).is_ok());
+        // A pointer-kind value is never treated as a scalar extent.
+        assert!(ensure_no_extent_rewrite(&[16], &[8], &[8], &[KIND_POINTER], &extents).is_ok());
+    }
+
+    #[test]
     fn peer_selection_preserves_query_snapshot_validation() -> Result<()> {
         let origin=QueryBinding::new(2)?;
         // Only metadata is inspected; these pointers are never dereferenced.
@@ -1341,7 +1494,7 @@ mod graph_tests {
             .into_iter().enumerate() {
             wave.restart()?;
             let fingerprint = vec![layer, rows, input.ptr as usize, output.ptr as usize];
-            assert!(wave.select_graph_with_policy(&fingerprint, &[], &[], &[], None)?);
+            assert!(wave.select_graph_with_policy(&fingerprint, &[], &[], &[], &[], None)?);
             if wave.graph.is_none() {
                 unsafe {
                     library.cuda_graph_begin_capture(wave.storage.stream.raw)?;
@@ -1373,7 +1526,7 @@ mod graph_tests {
         for key in 0..MAX_RETAINED_DECODE_GRAPHS + 3 {
             wave.restart()?;
             let fingerprint = vec![2, 4, input.ptr as usize, output.ptr as usize, key];
-            assert!(wave.select_graph_with_policy(&fingerprint, &[], &[], &[], None)?);
+            assert!(wave.select_graph_with_policy(&fingerprint, &[], &[], &[], &[], None)?);
             assert!(wave.graph.is_none());
             unsafe {
                 library.cuda_graph_begin_capture(wave.storage.stream.raw)?;
@@ -1404,7 +1557,7 @@ mod graph_tests {
                 .into_iter().enumerate() {
             wave.restart()?;
             let fingerprint = vec![2, rows, input.ptr as usize, output.ptr as usize, key];
-            let capture = wave.select_graph_with_policy(&fingerprint, &[], &[], &[], Some((allowed, 2)))?;
+            let capture = wave.select_graph_with_policy(&fingerprint, &[], &[], &[], &[], Some((allowed, 2)))?;
             assert_eq!(capture, key < 2);
             if capture && wave.graph.is_none() {
                 // SAFETY: both allocations outlive the bank and the stream is drained.

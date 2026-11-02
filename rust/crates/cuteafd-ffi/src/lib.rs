@@ -7467,6 +7467,57 @@ mod tests {
         Ok(())
     }
 
+    /// Exercises the graph-update FFI binding with real (non-empty) value
+    /// slices against a captured graph. Skips without a CUDA device. The
+    /// substitution itself is covered by the native selftest; this pins the
+    /// binding's argument plumbing and the not-found / non-kernel-node paths.
+    #[test]
+    fn graph_update_pointers_reports_not_found_and_refuses_non_kernel_nodes() -> Result<()> {
+        let Some(library) = load_test_library()? else {
+            return Ok(());
+        };
+        if library.cuda_set_device(0).is_err() {
+            eprintln!("skipping graph update FFI test: no CUDA device");
+            return Ok(());
+        }
+        let mut source = library.alloc_device_buffer(64)?;
+        let mut destination = library.alloc_device_buffer(64)?;
+        let stream = library.cuda_stream_create()?;
+        let result = (|| -> Result<()> {
+            unsafe { library.cuda_graph_begin_capture(stream)?; }
+            unsafe { library.copy_d2d_async(destination, source, 64, stream)?; }
+            let info = unsafe { library.cuda_graph_end_capture_retained(stream)? };
+            assert_eq!(info.memcpy_node_count, 1);
+            // A value that is not in the graph is reported not-found, not an error.
+            let mut found = [1u8; 1];
+            unsafe {
+                library.cuda_graph_exec_update_pointers(
+                    info.graph_exec, info.graph,
+                    &[source.ptr as u64 + 4096], &[destination.ptr as u64 + 4096],
+                    &[8], &[1], &mut found)?;
+            }
+            assert_eq!(found, [0]);
+            // A memcpy node that references an old value refuses the whole update.
+            let mut found = [0u8; 1];
+            let refused = unsafe {
+                library.cuda_graph_exec_update_pointers(
+                    info.graph_exec, info.graph,
+                    &[source.ptr as u64], &[destination.ptr as u64],
+                    &[8], &[1], &mut found)
+            };
+            assert!(refused.is_err());
+            unsafe {
+                library.cuda_graph_exec_destroy(info.graph_exec)?;
+                library.cuda_graph_destroy(info.graph)?;
+            }
+            Ok(())
+        })();
+        unsafe { library.cuda_stream_destroy(stream)?; }
+        library.free_device_buffer(&mut source)?;
+        library.free_device_buffer(&mut destination)?;
+        result
+    }
+
     #[test]
     fn managed_device_buffer_copy_free_roundtrip() -> Result<()> {
         let Some(library) = load_test_library()? else {

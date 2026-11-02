@@ -277,9 +277,28 @@ int main() {
     CHECK(equal);
   }
 
+  // 3b. An ambiguous substitution (one old value mapped to two new values) is
+  //     refused before any node is touched. This is the shape a launch-extent
+  //     collision takes: the identity probe (extent -> extent) and a changing
+  //     scalar (extent -> new) share the old value.
+  {
+    const uint64_t old_values[] = {n, n};
+    const uint64_t new_values[] = {n, 500};
+    const uint8_t widths[] = {4, 4};
+    const uint8_t kinds[] = {0, 0};
+    uint8_t found[] = {0, 0};
+    CHECK(cuteafd_cuda_graph_exec_update_pointers(info.graph_exec, info.graph, old_values,
+                                                     new_values, widths, kinds, found, 2)
+          == CUTEAFD_STATUS_INVALID_ARGUMENT);
+    CHECK(last_error().find("ambiguous") != std::string::npos);
+    CHECK(cudaGetLastError() == cudaSuccess);
+  }
+
   // 4. Forced failure at each driver stage: status INTERNAL_ERROR, message
   //    names the driver call, and the CUDA last-error is clear afterwards; the
   //    next runtime launch's status check sees success (the p8 crash shape).
+  //    Needs the test-only fault-injection hook.
+#if defined(CUTEAFD_NATIVE_TEST_HOOKS)
   const char* stage_names[] = {"", "cuGraphKernelNodeGetParams", "cuGraphKernelNodeSetParams",
                                "cuGraphExecKernelNodeSetParams"};
   for (int stage = 1; stage <= 3; ++stage) {
@@ -300,6 +319,7 @@ int main() {
     CHECK(cudaStreamSynchronize(stream) == cudaSuccess);
   }
   cuteafd_cuda_graph_update_pointers_inject_fault(0);
+#endif
 
   // 5. A value that is not in the graph is reported not-found, not an error.
   {
