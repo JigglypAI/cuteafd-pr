@@ -9,6 +9,8 @@ use cuteafd_api::openai::probe::Probe;
 use cuteafd_ffi::NativeLibrary;
 use std::sync::Arc;
 
+pub(crate) mod features;
+
 pub(crate) type ProbeRef = Option<Arc<Probe>>;
 
 pub(crate) fn image_echo(job: &cuteafd_api::openai::NativeRequest, spans: &[cuteafd_core::MediaSpan]) -> Result<()> {
