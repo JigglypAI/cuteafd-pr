@@ -360,7 +360,34 @@ def removal_exports(tmp_path):
         if directory == left:
             table["programs"].insert(0, {"name": "removed", "scratch_bytes_at_capacity": 0})
         path.write_text(json.dumps(table))
+        names = [row["name"] for row in table["programs"]]
+        (directory / "dsv4_programs.h").write_text("\n".join([
+            "#pragma once", *(f'#include "{name}.h"' for name in names),
+            "#define CUTEAFD_DSV4_CC_MINOR 0",
+            "#define CUTEAFD_DSV4_PROGRAMS " + ", ".join(
+                f'{{"{name}", init_{name}, load_{name}, call_{name}, 5, "iii", 0}}' for name in names), ""]))
     return left, right
+
+
+@pytest.mark.parametrize("mutation", ["table_abi", "table_order", "macro", "include", "missing_record"])
+def test_expected_removals_aggregate_survivor_changes_fail(tmp_path, mutation):
+    left, right = removal_exports(tmp_path)
+    path = right / "dsv4_programs.h"
+    text = path.read_text()
+    if mutation == "table_abi":
+        text = text.replace('5, "iii", 0', '6, "iii", 0')
+    elif mutation == "table_order":
+        text = text.replace("init_test, load_test", "load_test, init_test")
+    elif mutation == "macro":
+        text = text.replace("CC_MINOR 0", "CC_MINOR 1")
+    elif mutation == "include":
+        text = text.replace('#include "test.h"', '#include "other.h"')
+    else:
+        baseline = left / "dsv4_programs.h"
+        baseline.write_text(baseline.read_text().replace('"removed",', '"not_removed",'))
+    path.write_text(text)
+    with pytest.raises(ValueError, match="changed survivors|aggregate header"):
+        compare_sm.compare(left, right, source_comparison=True, expected_removals={"removed"})
 
 
 def test_expected_removals_exact_set_preserves_survivors(tmp_path):

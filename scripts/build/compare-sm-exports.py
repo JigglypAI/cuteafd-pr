@@ -17,6 +17,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import re
 import runpy
 import struct
 import subprocess
@@ -657,6 +658,30 @@ def differing_fields(left, right, prefix=""):
     return [] if left == right else [prefix.lstrip(".")]
 
 
+def aggregate_header_after_removals(header, removed):
+    """Edit only generated includes and initializer records for deleted objects."""
+    text = header.decode("utf-8")
+    for name in sorted(removed):
+        include = f'#include "{name}.h"\n'
+        if text.count(include) != 1:
+            raise ValueError(f"aggregate header missing unique removed include: {name}")
+        text = text.replace(include, "", 1)
+    prefix = "#define CUTEAFD_DSV4_PROGRAMS "
+    lines = text.splitlines(keepends=True)
+    tables = [i for i, line in enumerate(lines) if line.startswith(prefix)]
+    if len(tables) != 1:
+        raise ValueError("aggregate header missing unique program table")
+    index = tables[0]
+    table = lines[index][len(prefix):].removesuffix("\n")
+    entries = re.findall(r'\{"([^"\n]+)", [^{}\n]*\}', table)
+    records = re.findall(r'\{"[^"\n]+", [^{}\n]*\}', table)
+    if ", ".join(records) != table or any(entries.count(name) != 1 for name in removed):
+        raise ValueError("aggregate header has invalid or missing removed program records")
+    lines[index] = prefix + ", ".join(record for name, record in zip(entries, records)
+                                    if name not in removed) + "\n"
+    return "".join(lines).encode("utf-8")
+
+
 def compare(left, right, *, source_comparison=False, expected_removals=None):
     inspector = load_file("cuteafd_cuda_images", ROOT / "scripts/qualify/deepseek_v41/inspect-cute-object.py")
     left_names = {path.relative_to(left).as_posix() for path in left.rglob("*") if path.suffix in (".o", ".cubin")}
@@ -747,6 +772,15 @@ def compare(left, right, *, source_comparison=False, expected_removals=None):
         changed = differing_fields(*filtered)
         allowed_headers = {str(Path(name).with_suffix(".h")) for name in removed if name.endswith(".o")}
         changed_headers = set(headers_changed) - allowed_headers
+        for name in sorted(changed_headers):
+            path = Path(name)
+            local_removals = {Path(artifact).stem for artifact in removed
+                              if artifact.endswith(".o") and Path(artifact).parent == path.parent}
+            if path.name == "dsv4_programs.h" and local_removals:
+                if all((directory / name).is_file() for directory in (left, right)):
+                    expected = aggregate_header_after_removals((left / name).read_bytes(), local_removals)
+                    if expected == (right / name).read_bytes():
+                        changed_headers.remove(name)
         survivors = [row["program"] for row in records if not all((row["object_identical"],
                      row["cubins_identical"], row["header_identical"], row["sass_identical"] is not False))
                      or row["metadata_changed_fields"]]
