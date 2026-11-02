@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 mod ownership;
 pub use ownership::{DenseAxis, DenseExecution, DenseOwnership, KvBGeometry, KvBLayout};
 
+/// One bounded native absorption step, shared by admission and loading.
+pub const DENSE_STEP_BYTES: usize = 32 << 20;
+
 type Result<T> = std::result::Result<T, DenseError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -825,8 +828,7 @@ impl DensePlan {
                 }
                 if slice.absorbed.is_some() {
                     // The existing loader stages whole heads with the complete scale grid.
-                    read_staging_bytes = read_staging_bytes.max(record.components.iter()
-                        .map(|c| c.source.bytes).sum::<usize>().min(32 * 1024 * 1024));
+                    read_staging_bytes = read_staging_bytes.max(sum(record.components.iter().map(|c| c.source.bytes))?.min(DENSE_STEP_BYTES));
                 }
                 tensors.push(slice);
             }
@@ -1413,6 +1415,32 @@ mod tests {
             .unwrap().execution, DenseExecution::Replicated);
     }
 
+    #[test]
+    #[ignore = "requires the EXLR8 GLM 5.3 Flash checkpoint"]
+    fn real_flash_native_splits_respect_scale_blocks() {
+        let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_EXLR8_FLASH_SNAPSHOT").expect("snapshot"));
+        let records = DenseRecord::inventory(&snapshot).unwrap();
+        for world in [1, 2] {
+            for rank in 0..world {
+                let plan = DensePlan::for_rank(&records, world, rank).unwrap();
+                let mut beta = 0;
+                for slice in &plan.tensors {
+                    let record = records.iter().find(|r| r.tensor == slice.tensor).unwrap();
+                    if record.encoding == DenseEncoding::Mxfp8 && slice.axis == DenseAxis::Input {
+                        assert_eq!((slice.first_channel % 32, slice.channels % 32), (0, 0), "{}", slice.tensor);
+                    }
+                    if slice.tensor.ends_with(".self_attn.b_proj.weight") {
+                        assert_eq!(slice.channels, 64 / world);
+                        beta += 1;
+                    }
+                }
+                assert_eq!(beta, 34);
+                eprintln!("Flash TP{world} rank{rank}: {} native slices, 34 beta slices N{}, bytes {}",
+                    plan.tensors.len(), 64 / world, plan.resident_bytes);
+            }
+        }
+    }
+
     /// The real checkpoint's native coordinator residency: TP2 ranks sum to the
     /// census plus the kv_b split's scales (embedding/head on rank 0 only).
     /// Set CUTEAFD_EXLR8_SNAPSHOT to the EXLR8 GLM 5.3 snapshot.
@@ -1421,6 +1449,45 @@ mod tests {
     fn real_checkpoint_native_residency() {
         let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_EXLR8_SNAPSHOT").expect("snapshot"));
         let records = DenseRecord::inventory(&snapshot).unwrap();
+        for world in [1, 2] {
+            for rank in 0..world {
+                let plan = DensePlan::for_rank(&records, world, rank).unwrap();
+                let mut previous_resident = 0usize;
+                for record in &records {
+                    let rank0 = matches!(record.tensor.as_str(), "model.embed_tokens.weight" | "lm_head.weight" | "model.norm.weight")
+                        || record.tensor.ends_with(".mlp.gate.weight") || record.tensor.ends_with(".mlp.gate.e_score_correction_bias");
+                    if rank0 && rank != 0 {
+                        assert!(!plan.tensors.iter().any(|s| s.tensor == record.tensor));
+                        continue;
+                    }
+                    let slice = plan.tensors.iter().find(|s| s.tensor == record.tensor).unwrap();
+                    if record.tensor.ends_with(".self_attn.kv_b_proj.weight") {
+                        // Previous public resident_native already charged the absorbed operands.
+                        previous_resident += [(64 / world * 512 * 192),
+                            (64 / world * 512 * 3) * 4,
+                            (64 / world * 256 * 512),
+                            (64 / world * 256 * 8) * 4].into_iter().map(|b| b.max(256)).sum::<usize>();
+                        continue;
+                    }
+                    let split = world > 1 && record.side != ShardSide::Replicated && !rank0
+                        && !record.tensor.contains(".self_attn.indexer.");
+                    let channels = record.channels().unwrap() / if split { world } else { 1 };
+                    assert_eq!((slice.first_channel, slice.channels), (if split { rank * channels } else { 0 }, channels), "{}", record.tensor);
+                    let previous = if record.native_blocks == 0 { record.components.clone() }
+                        else { record.slice(slice.first_channel, channels).unwrap().components };
+                    for (actual, expected) in slice.components.iter().zip(&previous) {
+                        assert!(actual.window.is_none(), "{}", record.tensor);
+                        assert_eq!((&actual.shape, actual.source.offset, actual.source.bytes),
+                            (&expected.shape, expected.source.offset, expected.source.bytes), "{}", record.tensor);
+                        previous_resident += expected.source.bytes.max(256);
+                    }
+                }
+                let current = resident_native(&records, world, rank, 78, 64, 192, 256, 512).unwrap()
+                    .iter().map(|entry| entry.2 as usize).sum::<usize>();
+                assert_eq!(current, previous_resident, "GLM public plan bytes changed TP{world} rank{rank}");
+                eprintln!("GLM TP{world} rank{rank}: ownership identical; public bytes {previous_resident} -> {current}");
+            }
+        }
         let total = |groups: &[(String, String, u64)]| groups.iter().map(|g| g.2).sum::<u64>();
         let one = super::resident_native(&records, 1, 0, 78, 64, 192, 256, 512).unwrap();
         let ranks: Vec<_> = (0..2).map(|r| super::resident_native(&records, 2, r, 78, 64, 192, 256, 512).unwrap()).collect();

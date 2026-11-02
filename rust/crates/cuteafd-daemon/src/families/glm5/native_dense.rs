@@ -172,6 +172,8 @@ pub(crate) fn load_layer<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, r
     let [uk_bytes, uk_scale_bytes, uv_bytes, uv_scale_bytes] = layout.allocations;
     let (uk, uk_scale) = (alloc(uk_bytes)?, alloc(uk_scale_bytes)?);
     let (uv, uv_scale) = (alloc(uv_bytes)?, alloc(uv_scale_bytes)?);
+    ensure!(STEP_BYTES == cuteafd_loader::plan::exlr8::dense::DENSE_STEP_BYTES,
+        "native dense plan/load staging bound mismatch");
     let per = ((STEP_BYTES - grid.bytes) / ((nope + v) * lat)).max(1);
     let device = library.cuda_get_device()?;
     let at = |buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize| CuteafdDeviceBuffer {
