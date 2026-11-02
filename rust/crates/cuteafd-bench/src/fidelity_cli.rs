@@ -234,6 +234,21 @@ fn run_output(args: &RunArgs, runs: &[Run]) -> Value {
     output
 }
 
+pub(crate) fn discovered_prefill_logits(status: &Value) -> Result<bool> {
+    use cuteafd_loader::plan::{checkpoint::{read_json, Checkpoint}, family};
+    let snapshot = status["snapshot"].as_str().map(PathBuf::from)
+        .context("fidelity family discovery: server did not advertise a snapshot")?;
+    let path = snapshot.join("config.json");
+    let config = read_json(&path)
+        .with_context(|| format!("fidelity family discovery: cannot read {}", path.display()))?;
+    let checkpoint = Checkpoint { snapshot, config, quantize_config: None,
+        weight_map: Default::default(), tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
+    let detected = family::registry().iter().find(|f| f.detect(&checkpoint))
+        .context("fidelity family discovery: snapshot has no registered family")?;
+    Ok(crate::fidelity_dataset::full_prefill_logits(Some(detected.id()),
+        status["full_prefill_logits"] == true))
+}
+
 pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
     let key = api_key(args)?;
     // Validate the whole sweep before discovery or the first probe.
@@ -249,7 +264,7 @@ pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
     let status = get(&agent, &format!("{base}/v1/bench/status"), &key)?;
     let model = status["checkpoint"].as_str().unwrap_or(served);
     let mut model_record = models["data"][0].clone();
-    model_record["full_prefill_logits"] = status["full_prefill_logits"].clone();
+    model_record["full_prefill_logits"] = json!(discovered_prefill_logits(&status)?);
     model_record["snapshot"] = status["snapshot"].clone();
     model_record["settings"] = status["settings"].clone();
     let runs = run_series(args, model_record["full_prefill_logits"] == true, |one| {
@@ -525,6 +540,24 @@ mod tests {
     #[test]
     fn discovery_sends_file_api_key() { discovery_authentication(true); }
 
+    #[test]
+    fn family_discovery_fails_closed_even_when_status_admits_prefill() {
+        assert!(discovered_prefill_logits(&json!({"full_prefill_logits": true}))
+            .unwrap_err().to_string().contains("did not advertise a snapshot"));
+        let snapshot = tempfile::tempdir().unwrap();
+        let status = json!({"snapshot": snapshot.path(), "full_prefill_logits": true});
+        assert!(discovered_prefill_logits(&status).unwrap_err().to_string().contains("cannot read"));
+        std::fs::write(snapshot.path().join("config.json"), "not json").unwrap();
+        assert!(discovered_prefill_logits(&status).unwrap_err().to_string().contains("cannot read"));
+        std::fs::write(snapshot.path().join("config.json"), r#"{"architectures":["Unregistered"]}"#).unwrap();
+        assert!(discovered_prefill_logits(&status).unwrap_err().to_string().contains("no registered family"));
+        std::fs::write(snapshot.path().join("config.json"), r#"{"architectures":["DeepseekV4ForCausalLM"]}"#).unwrap();
+        assert!(discovered_prefill_logits(&status).unwrap());
+        let mut denied = status;
+        denied["full_prefill_logits"] = json!(false);
+        assert!(!discovered_prefill_logits(&denied).unwrap());
+    }
+
     fn fixture_run(args: &RunArgs) -> Run {
         let report = crate::sample::full_report();
         let panel = report.panel("fidelity").unwrap().latest().unwrap();
@@ -673,7 +706,7 @@ mod tests {
             else { parse(&["--url", &url, "--api-key", "unit-test-key"]) };
         let error = run(&args).unwrap_err();
         server.join().unwrap();
-        assert!(error.to_string().contains("no verified published fidelity config for test/model"), "{error:#}");
+        assert!(error.to_string().contains("fidelity family discovery: server did not advertise a snapshot"), "{error:#}");
     }
 
     #[test]
