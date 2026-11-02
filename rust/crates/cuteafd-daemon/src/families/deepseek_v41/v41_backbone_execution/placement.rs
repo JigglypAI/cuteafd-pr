@@ -32,7 +32,7 @@ impl<'a> PlacedProducerStorage<'a> {
 pub(crate) struct PlacedProducerWaves<'w, 'a> {
     pub windows: Vec<DeviceOwner<'a, WindowWave<'w, 'a>>>,
     pub sources: Vec<DeviceOwner<'a, CompressorWave<'w, 'a>>>,
-    pending_commit: Option<(u64, [u32; cuteafd_core::V41_MAX_LANE_MEMBERS], usize)>,
+    pending_commit: Option<(u64, [u32; cuteafd_core::V41_MAX_REQUESTS], usize)>,
 }
 /// Borrows only this lane. The caller retains the query and admitted bank
 /// storage until completion; cancellation drains only this layer's producers.
@@ -427,10 +427,10 @@ impl<'w, 'a> PlacedProducerWaves<'w, 'a> {
     }
     fn stage_cache_commit(&mut self, identity: u64, accepted: &[u32]) -> Result<()> {
         ensure!(
-            self.pending_commit.is_none() && accepted.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS,
+            self.pending_commit.is_none() && accepted.len() <= cuteafd_core::V41_MAX_REQUESTS,
             "placed commit already pending or too many requests"
         );
-        let mut counts = [0; cuteafd_core::V41_MAX_LANE_MEMBERS];
+        let mut counts = [0; cuteafd_core::V41_MAX_REQUESTS];
         counts[..accepted.len()].copy_from_slice(accepted);
         self.pending_commit = Some((identity, counts, accepted.len()));
         Ok(())
@@ -635,7 +635,7 @@ mod tests {
             assert_eq!(&counts[..len], accepted);
             assert!(waves.stage_cache_commit(43, &accepted).is_err());
             waves.pending_commit = None;
-            assert!(waves.stage_cache_commit(43, &[1; cuteafd_core::V41_MAX_LANE_MEMBERS + 1]).is_err());
+            assert!(waves.stage_cache_commit(43, &[1; cuteafd_core::V41_MAX_REQUESTS + 1]).is_err());
             for width in [5, 7] {
                 let live = members * width;
                 let head = DistributedVocabularyWave::device_bytes(live, 64640)?;
@@ -648,6 +648,62 @@ mod tests {
         }
         assert!(DistributedVocabularyWave::device_bytes(cuteafd_core::V41_VOCAB_ROWS, 64640).is_ok());
         assert!(DistributedVocabularyWave::device_bytes(cuteafd_core::V41_VOCAB_ROWS + 1, 64640).is_err());
+        Ok(())
+    }
+    #[test]
+    fn packed_prefill_commit_host_path_covers_all_requests() -> Result<()> {
+        use crate::families::deepseek_v41::{
+            v41_backbone_router::ExpertRow,
+            v41_experts::dspark::DsparkMainContext,
+        };
+        use crate::shared::prefill_packing::{plan, Limits};
+        use cuteafd_transport::ExpertV2SourceKind;
+
+        for members in [33usize, 51, 64, 65] {
+            let chunks = (0..members).map(|i| (i * 3, 32)).collect::<Vec<_>>();
+            let segments = plan(&chunks, &Limits {
+                rows: 2752, chunk_rows: 2752, max_context: 1048576, taps: Some(2752),
+            })?;
+            let rows = segments.iter().enumerate().flat_map(|(i, segment)| {
+                (0..segment.rows).map(move |offset| ExpertRow {
+                    request_id: 1000 + i as u64 * 7,
+                    position: (segment.start + offset) as u64,
+                    kind: ExpertV2SourceKind::Prefill,
+                })
+            }).collect::<Vec<_>>();
+            for partial in [false, true] {
+                let accepted = segments.iter().enumerate().map(|(i, segment)| {
+                    if partial { (i % (segment.rows + 1)) as u32 } else { segment.rows as u32 }
+                }).collect::<Vec<_>>();
+                let mut waves = PlacedProducerWaves {
+                    windows: vec![], sources: vec![], pending_commit: None,
+                };
+                // These are the production host planners; CUDA leases are validated later.
+                if members > cuteafd_core::V41_MAX_REQUESTS {
+                    assert!(waves.stage_cache_commit(42, &accepted).is_err());
+                    assert!(waves.pending_commit.is_none());
+                    assert!(DsparkMainContext::prepare_commit_plan(&rows, [members; 3], &accepted).is_err());
+                    continue;
+                }
+                waves.stage_cache_commit(42, &accepted)?;
+                let (identity, counts, len) = waves.pending_commit.unwrap();
+                let publication = DsparkMainContext::prepare_commit_plan(&rows, [len; 3], &counts[..len])?;
+                assert_eq!((identity, len, publication.len()), (42, members, members));
+                assert_eq!(&counts[..len], accepted);
+                assert!(counts[len..].iter().all(|&n| n == 0));
+                for (i, group) in publication.iter().enumerate() {
+                    assert_eq!(group.request, 1000 + i as u64 * 7);
+                    assert_eq!(group.position, segments[i].start as u64);
+                    assert_eq!(group.source, segments[i].first as u32);
+                    assert_eq!(group.tokens, accepted[i]);
+                }
+                assert!(waves.stage_cache_commit(43, &accepted).is_err());
+                assert_eq!(waves.pending_commit, Some((identity, counts, len)));
+                waves.pending_commit = None;
+                waves.stage_cache_commit(43, &accepted)?;
+                assert_eq!(waves.pending_commit.unwrap().0, 43);
+            }
+        }
         Ok(())
     }
     #[test]
