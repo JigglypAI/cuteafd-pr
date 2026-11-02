@@ -710,11 +710,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                             reject(&job, format!("scoring: {error:#}"));
                             continue;
                         }
-                        if !job.media.is_empty() && probe::scoring(&job.probe).is_some() {
-                            reject(&job, "teacher-forced scoring takes text prompts".into());
-                            continue;
-                        }
-                        if !job.media.is_empty() && !media.encoder().available() {
+                        if !job.media.is_empty() && !media.encoder().available()
+                            && !probe::features::reference_probe(&job.probe) {
                             let _ = job.events.send(Err(NativeFailure::Unavailable("vision encoder unavailable".into())));
                             continue;
                         }
@@ -723,7 +720,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                             Err(error) => { reject(&job, format!("{error:#}")); continue; }
                         };
                         let events = job.events.clone();
-                        let (prompt, request_media, jobs) = match ml4_media::prepare(job, tokens, expander,
+                        let (prompt, mut request_media, jobs) = match ml4_media::prepare(job, tokens, expander,
                             engine.cfg.vocab_size, engine.cfg.hidden, engine.max_context) {
                             Ok(prepared) => prepared,
                             Err(error) => {
@@ -731,6 +728,11 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                                 continue;
                             }
                         };
+                        if let Err(error) = ml4_media::probe_features(&prompt, &mut request_media,
+                            &mut media.cache, &opened.snapshot, expander) {
+                            let _ = events.send(Err(NativeFailure::BadRequest(format!("{error:#}"))));
+                            continue;
+                        }
                         if jobs.is_empty() {
                             Admit { prompt, media: request_media, constraint: None }
                         } else {
@@ -825,14 +827,14 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     |(placement, transport), chunk, rows| {
                         let experts = transport.as_deref_mut().map(|t| (t, runtime));
                         if rows > 1 {
-                            Ok(engine.prefill_rows_logits(placement, chunk, experts, None, rows)?
+                            Ok(engine.prefill_scoring_media(placement, chunk, experts, rows, &request_media)?
                                 .map(|values| probe::ScoreLogits::Host { values, vocab: engine.cfg.vocab_size }))
                         } else {
-                            Ok(engine.prefill_device(placement, chunk, experts, 1)?.map(probe::ScoreLogits::Device))
+                            Ok(engine.prefill_media_device(placement, chunk, experts, 1, Some(&request_media))?.map(probe::ScoreLogits::Device))
                         }
                     },
-                    |(placement, transport), chunk| engine.verify_device(&mut [(&mut **placement, chunk.len())], chunk,
-                        transport.as_deref_mut().map(|t| (t, runtime)))?.context("scoring needs every layer"));
+                    |(placement, transport), chunk| engine.verify_scoring_media(placement, chunk,
+                        transport.as_deref_mut().map(|t| (t, runtime)), &request_media)?.context("scoring needs every layer"));
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }

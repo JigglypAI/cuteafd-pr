@@ -288,8 +288,26 @@ fn unit_media(chunk: &cuteafd_engine::media::MediaChunk, begin: usize, t: usize,
     (indices, features)
 }
 
+fn decode_graph_eligible(decode: bool, logit_rows: usize, hooked: bool,
+    complete: bool, pending_media: bool) -> bool {
+    decode && logit_rows > 0 && !hooked && complete && !pending_media
+}
+
 #[cfg(test)]
 mod media_unit_tests {
+    #[test]
+    fn image_chunks_inject_eagerly_but_following_text_uses_graphs() {
+        let route = |pending| super::decode_graph_eligible(true, 1, false, true, pending);
+        assert!(route(false), "text decode retains its captured gather");
+        assert!(!route(true), "pending image rows must use the injecting path");
+        assert!(route(false), "the next text-only call resumes graphs");
+        for (decode, rows, hooked, complete) in [
+            (false, 1, false, true), (true, 0, false, true),
+            (true, 1, true, true), (true, 1, false, false),
+        ] {
+            assert!(!super::decode_graph_eligible(decode, rows, hooked, complete, false));
+        }
+    }
     /// A call's media rows split across its units exactly once each, rebased to each unit.
     #[test]
     fn units_partition_the_call_media_rows() {
@@ -1139,17 +1157,39 @@ impl<'a> GlmEngine<'a> {
     pub fn prefill_media_device(&self, placement: &mut GlmPlacement, tokens: &[u32],
         experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, logit_rows: usize,
         media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
-        let start = placement.len;
+        self.with_media(placement.len, tokens.len(), media,
+            || self.prefill_device(placement, tokens, experts, logit_rows))
+    }
+
+    /// Multirow scoring preserves prefill's host/device routing while injecting image rows.
+    pub fn prefill_scoring_media(&self, placement: &mut GlmPlacement, tokens: &[u32],
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, logit_rows: usize,
+        media: &cuteafd_engine::media::RequestMedia) -> Result<Option<Vec<f32>>> {
+        self.with_media(placement.len, tokens.len(), Some(media),
+            || self.prefill_rows_logits(placement, tokens, experts, None, logit_rows))
+    }
+
+    /// Teacher-forced decode chunks may cross an image span too, not just prefill chunks.
+    pub fn verify_scoring_media(&self, placement: &mut GlmPlacement, tokens: &[u32],
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
+        media: &cuteafd_engine::media::RequestMedia) -> Result<Option<DeviceLogits>> {
+        self.with_media(placement.len, tokens.len(), Some(media),
+            || self.verify_device(&mut [(placement, tokens.len())], tokens, experts))
+    }
+
+    fn with_media<T>(&self, start: usize, rows: usize,
+        media: Option<&cuteafd_engine::media::RequestMedia>, run: impl FnOnce() -> Result<T>) -> Result<T> {
+        let end = start.checked_add(rows).context("media call extent")?;
         let chunk = match media.filter(|m| !m.spans().is_empty()) {
             Some(media) => {
                 let mut chunk = cuteafd_engine::media::MediaChunk::default();
-                media.write_chunk(start, start + tokens.len(), &mut chunk)?;
+                media.write_chunk(start, end, &mut chunk)?;
                 (!chunk.indices.is_empty()).then_some(chunk)
             }
             None => None,
         };
         *self.pending_media.borrow_mut() = chunk.map(|chunk| (start, chunk));
-        let result = self.prefill_device(placement, tokens, experts, logit_rows);
+        let result = run();
         *self.pending_media.borrow_mut() = None;
         result
     }
@@ -1432,7 +1472,9 @@ impl<'a> GlmEngine<'a> {
             return self.layer_step(scope, w, w1.context("owned attention peer")?, &ranked[0],
                 t, logit_rows, &mut experts, on_layer);
         }
-        if tables.decode && logit_rows > 0 && on_layer.is_none() && layers.len() == self.cfg.layers {
+        // Captured gathers overwrite embeddings; only calls with actual image rows inject eagerly.
+        if decode_graph_eligible(tables.decode, logit_rows, on_layer.is_some(),
+            layers.len() == self.cfg.layers, self.pending_media.borrow().is_some()) {
             // The first captured segment gathers the rows from the staged ids;
             // the last runs the head and the greedy selection.
             let gather = self.embedding.device_gather();
