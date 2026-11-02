@@ -14,9 +14,8 @@ pub static FULL: FidelityPanel = FidelityPanel { full: true };
 pub struct FidelityPanel { full: bool }
 
 pub fn prefill_unavailable(info: &ServerInfo) -> Option<String> {
-    // V4.1's native sparse scorer admits selected prefill rows without an all-row workspace switch.
-    let admitted = info.family.as_deref() == Some("deepseek_v41")
-        || crate::fidelity_dataset::prefill_admitted(&info.configuration.settings);
+    let admitted = crate::fidelity_dataset::full_prefill_logits(info.family.as_deref(),
+        crate::fidelity_dataset::prefill_admitted(&info.configuration.settings));
     (!admitted).then(|| "Prefill scoring not admitted at launch; restart with FULL_PREFILL_LOGITS=on (--full-prefill-logits).".into())
 }
 
