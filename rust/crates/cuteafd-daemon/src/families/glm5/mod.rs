@@ -725,11 +725,11 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     }
     if args.dspark {
         ensure!(cfg.variant.ml4().is_some(), "--dspark drafts with Mistral Large 4's bundled mtp_dspark");
-        dflash::check_snapshot_target_head(&args.snapshot, cfg.hidden, cfg.vocab_size, false)?;
+        dflash::check_snapshot_target_head(&args.snapshot, cfg.head(), cfg.hidden, cfg.vocab_size, false)?;
     }
     if let Some(snapshot) = &args.draft {
         // A native EXLR8 target lends its row-FP8 head through a launcher.
-        if !native { dflash::check_snapshot_target_head(&args.snapshot, cfg.hidden, cfg.vocab_size, false)?; }
+        if !native { dflash::check_snapshot_target_head(&args.snapshot, cfg.head(), cfg.hidden, cfg.vocab_size, false)?; }
         dflash::check_checkpoint(snapshot, args.draft_fp8, args.draft_context_slots, args.draft_sequences)?;
     }
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);

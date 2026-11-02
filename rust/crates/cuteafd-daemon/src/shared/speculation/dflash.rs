@@ -1029,28 +1029,31 @@ pub(crate) fn check_checkpoint(snapshot: &Path, fp8: Option<bool>, context_slots
 }
 
 /// Admit the target's single resident BF16 head or native K6 launcher before allocation.
-pub(crate) fn check_snapshot_target_head(snapshot: &Path, hidden: usize, vocab: usize,
+pub(crate) fn check_snapshot_target_head(snapshot: &Path, head_stem: &str, hidden: usize, vocab: usize,
     explicit_fp8_head: bool) -> Result<()> {
     use cuteafd_loader::formats::trellis_core::{read_projections, CoreContract, CoreSplit};
     use std::collections::BTreeMap;
 
     // Routed-expert catalogs need not contain coordinator tensors. Resolve the
     // head through its own index/header contract without reading weight data.
+    ensure!(!head_stem.is_empty(), "DFlash target head stem must be explicit");
+    let prefix = format!("{head_stem}.");
+    let weight = format!("{prefix}weight");
     let checkpoint = cuteafd_loader::plan::Checkpoint::open_for_role(snapshot, "DFlash target head",
-        |name| name.starts_with("lm_head."))?;
-    let expected = BTreeMap::from([("lm_head.weight".into(), vec![vocab, hidden])]);
-    let native = read_projections(&checkpoint, &expected, |name| name.starts_with("lm_head."),
-        |stem| (stem == "lm_head").then_some(CoreContract {
+        |name| name.starts_with(&prefix))?;
+    let expected = BTreeMap::from([(weight.clone(), vec![vocab, hidden])]);
+    let native = read_projections(&checkpoint, &expected, |name| name.starts_with(&prefix),
+        |stem| (stem == head_stem).then_some(CoreContract {
             split: CoreSplit::Whole, bits: 6, padded_outputs: false,
         }))?;
-    if native.contains_key("lm_head") {
-        ensure!(!explicit_fp8_head, "lm_head: --fp8-head cannot replace the shared native K6 target head");
+    if native.contains_key(head_stem) {
+        ensure!(!explicit_fp8_head, "{head_stem}: --fp8-head cannot replace the shared native K6 target head");
         return Ok(());
     }
-    ensure!(!checkpoint.tensor_names().any(|name| name.starts_with("lm_head.") && name != "lm_head.weight"),
-        "DFlash target lm_head has incomplete or unsupported native storage");
-    let head = checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
-        .context("DFlash target checkpoint has no supported lm_head")?;
+    ensure!(!checkpoint.tensor_names().any(|name| name.starts_with(&prefix) && name != weight),
+        "DFlash target {head_stem} has incomplete or unsupported native storage");
+    let head = checkpoint.tensors.iter().find(|t| t.meta.name == weight)
+        .with_context(|| format!("DFlash target checkpoint has no supported {head_stem}"))?;
     check_target_bf16_head(&head.meta, hidden, vocab, explicit_fp8_head)
 }
 
@@ -2750,14 +2753,14 @@ mod checkpoint_header_tests {
         assert!(catalog.fp8().is_some());
         assert_eq!(catalog.tensors().len(), 1);
         assert_eq!(catalog.tensor("lm_head.weight").unwrap().metadata.dtype, DType::Bf16);
-        check_snapshot_target_head(&fixture.0, 128, 16, false).unwrap();
-        assert!(check_snapshot_target_head(&fixture.0, 128, 16, true).is_err());
-        assert!(check_snapshot_target_head(&fixture.0, 128, 32, false).is_err());
+        check_snapshot_target_head(&fixture.0, "lm_head", 128, 16, false).unwrap();
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 16, true).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 32, false).is_err());
         let index_path = fixture.0.join("model.safetensors.index.json");
         let mut index = cuteafd_loader::plan::checkpoint::read_json(&index_path).unwrap();
         index["weight_map"]["lm_head.weight"] = "missing.safetensors".into();
         std::fs::write(index_path, serde_json::to_vec(&index).unwrap()).unwrap();
-        assert!(check_snapshot_target_head(&fixture.0, 128, 16, false).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 16, false).is_err());
     }
 
     fn native_head_snapshot(bits: usize) -> HeaderSnapshot {
@@ -2795,10 +2798,42 @@ mod checkpoint_header_tests {
     #[test]
     fn dflash_target_resolves_indexed_native_k6_head_without_bf16_or_side_metadata() {
         let fixture = native_head_snapshot(6);
-        check_snapshot_target_head(&fixture.0, 128, 256, false).unwrap();
-        assert!(check_snapshot_target_head(&fixture.0, 128, 256, true).is_err());
-        assert!(check_snapshot_target_head(&fixture.0, 128, 128, false).is_err());
-        assert!(check_snapshot_target_head(&fixture.0, 256, 256, false).is_err());
+        check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).unwrap();
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, true).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 128, false).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 256, 256, false).is_err());
+    }
+
+    #[test]
+    fn ml4_target_resolves_real_consolidated_output_k6_headers() {
+        use std::io::Write;
+        let fixture = expert_only_snapshot();
+        let publication: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/tests/fixtures/ml4-published-native-headers.json")).unwrap();
+        let headers = publication["headers"].as_object().unwrap().iter()
+            .filter(|(name, _)| name.starts_with("output.")).map(|(name, header)| (name.clone(), header.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        assert_eq!(headers.len(), 4);
+        let extent = headers.values().map(|h| h["data_offsets"][1].as_u64().unwrap()).max().unwrap();
+        let bytes = serde_json::to_vec(&headers).unwrap();
+        let mut shard = std::fs::File::create(fixture.0.join("model-00073-of-00073.safetensors")).unwrap();
+        shard.write_all(&(bytes.len() as u64).to_le_bytes()).unwrap();
+        shard.write_all(&bytes).unwrap();
+        // Sparse extent only: the guard reads the real headers, never the head payload.
+        shard.set_len(8 + bytes.len() as u64 + extent).unwrap();
+        let map = headers.keys().map(|name| (name.clone(), serde_json::json!("model-00073-of-00073.safetensors")))
+            .collect::<serde_json::Map<_, _>>();
+        let mut config = cuteafd_loader::plan::testing::mistral_large4_config();
+        config["quantization_config"] = serde_json::json!({"quant_method":"exl3"});
+        std::fs::write(fixture.0.join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+        std::fs::remove_file(fixture.0.join("model.safetensors.index.json")).unwrap();
+        std::fs::write(fixture.0.join("consolidated.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({"weight_map":map})).unwrap()).unwrap();
+        let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::from_hf(&config).unwrap();
+        check_snapshot_target_head(&fixture.0, cfg.head(), cfg.hidden, cfg.vocab_size, false).unwrap();
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", cfg.hidden, cfg.vocab_size, false).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, "", cfg.hidden, cfg.vocab_size, false).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, cfg.head(), cfg.hidden, cfg.vocab_size, true).is_err());
     }
 
     #[test]
@@ -2809,16 +2844,16 @@ mod checkpoint_header_tests {
             let mut index = cuteafd_loader::plan::checkpoint::read_json(&path).unwrap();
             index["weight_map"].as_object_mut().unwrap().remove(&format!("lm_head.{suffix}"));
             std::fs::write(path, serde_json::to_vec(&index).unwrap()).unwrap();
-            assert!(check_snapshot_target_head(&fixture.0, 128, 256, false).is_err(), "missing {suffix}");
+            assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).is_err(), "missing {suffix}");
         }
         let fixture = native_head_snapshot(6);
         let path = fixture.0.join("model.safetensors.index.json");
         let mut index = cuteafd_loader::plan::checkpoint::read_json(&path).unwrap();
         index["weight_map"]["lm_head.weight"] = "weights.safetensors".into();
         std::fs::write(path, serde_json::to_vec(&index).unwrap()).unwrap();
-        assert!(check_snapshot_target_head(&fixture.0, 128, 256, false).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).is_err());
         let fixture = native_head_snapshot(4);
-        let error = check_snapshot_target_head(&fixture.0, 128, 256, false).unwrap_err().to_string();
+        let error = check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).unwrap_err().to_string();
         assert!(error.contains("requires K6") && error.contains("found K4"), "{error}");
     }
 
@@ -2844,11 +2879,11 @@ mod checkpoint_header_tests {
             file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
             file.write_all(&header).unwrap();
             file.set_len((8 + header.len() + 772) as u64).unwrap();
-            assert!(check_snapshot_target_head(&fixture.0, 128, 256, false).is_err(), "{member} {field}");
+            assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).is_err(), "{member} {field}");
         }
         let fixture = native_head_snapshot(6);
         std::fs::remove_file(fixture.0.join("head-vectors.safetensors")).unwrap();
-        assert!(check_snapshot_target_head(&fixture.0, 128, 256, false).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).is_err());
     }
 
     #[test]
@@ -2864,7 +2899,7 @@ mod checkpoint_header_tests {
         let index = cuteafd_loader::plan::checkpoint::read_json(&snapshot.join("model.safetensors.index.json")).unwrap();
         assert!(index["weight_map"].get("lm_head.weight").is_none());
         assert!(index["weight_map"].get("lm_head.trellis").is_some());
-        check_snapshot_target_head(&snapshot, 6144, 154880, false).unwrap();
+        check_snapshot_target_head(&snapshot, "lm_head", 6144, 154880, false).unwrap();
     }
 
     fn fixture(dtype: DType) -> Checkpoint {
