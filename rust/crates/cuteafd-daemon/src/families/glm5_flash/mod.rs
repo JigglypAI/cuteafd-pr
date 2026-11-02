@@ -2382,7 +2382,8 @@ impl Opened {
         let (started, before) = (Instant::now(), rings());
         let warm_stream = crate::shared::spark_intake::WarmStream::new(self.library.as_ref())?;
         let exchange = transport.exchange()?;
-        let wave = exchange.send_request(warm)?;
+        let payload_bytes = exchange.compact_payload(warm.header.row_count as usize);
+        let wave = exchange.send_request(warm, payload_bytes)?;
         exchange.land_drained(wave, warm_stream.raw())
             .with_context(|| format!("warming Spark expert transport with {warm_rows} rows"))?;
         warm_stream.finish()?;

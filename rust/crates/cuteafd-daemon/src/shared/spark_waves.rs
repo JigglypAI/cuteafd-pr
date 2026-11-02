@@ -103,6 +103,13 @@ use std::time::{Duration, Instant};
 pub(crate) type BuildRequest = Box<dyn FnOnce(Vec<ExpertProtocolV2RouteEntry>, bytes::Bytes)
     -> Result<ExpertProtocolV2Request> + Send>;
 
+/// Reply extent is independent of the reserved slot stride (mixed-format planes).
+fn validate_payload(payload_bytes: usize, capacity: usize) -> Result<()> {
+    ensure!(payload_bytes > 0 && payload_bytes <= capacity,
+        "Spark wave payload {payload_bytes} exceeds its {capacity}-byte return slot or is empty");
+    Ok(())
+}
+
 /// A wave handed to the worker; land it with [`Waves::land`], oldest first.
 #[derive(Debug)]
 #[must_use = "every sent wave must be landed in dispatch order"]
@@ -110,6 +117,7 @@ pub(crate) struct WaveTicket {
     sequence: u32,
     slot: usize,
     rows: usize,
+    payload_bytes: usize,
 }
 
 impl WaveTicket {
@@ -219,6 +227,7 @@ pub(crate) struct Job {
     sequence: u32,
     slot: usize,
     rows: usize,
+    payload_bytes: usize,
     source: Source,
     /// The use counts the worker waits for before posting (planes free): the
     /// slot's own last use.
@@ -239,6 +248,7 @@ pub(crate) struct WaveInfo {
     pub sequence: u32,
     pub slot: usize,
     pub rows: usize,
+    pub payload_bytes: usize,
     /// Byte offset and extent of the wave's return slot in each rank's range.
     pub slice: (usize, usize),
     pub release: u32,
@@ -410,7 +420,7 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                     // post finds their receives (counters only grow).
                     backend.release_consumed();
                     let job = queued.pop_front().expect("front job");
-                    let info = WaveInfo { sequence: job.sequence, slot: job.slot, rows: job.rows, slice: job.slice,
+                    let info = WaveInfo { sequence: job.sequence, slot: job.slot, rows: job.rows, payload_bytes: job.payload_bytes, slice: job.slice,
                         release: job.release };
                     let mut times = WaveTimes { staged: job.sent.elapsed().as_secs_f64(), ..Default::default() };
                     Pace::add(&mut pace.staging, job.sent.max(last_landed).elapsed().as_secs_f64());
@@ -702,20 +712,25 @@ impl<T: Transport> Backend for Native<T> {
                 build(routes, wire)?
             }
         };
+        validate_payload(job.payload_bytes, job.slice.1)?;
+        ensure!(request.header.row_count as usize == job.rows, "wave request rows differ from admission");
         let slices = (self.placed && self.landing != 0).then(|| vec![cuteafd_transport::LandingSlice {
-            offset: job.slice.0, bytes: job.slice.1 }; self.ranks]);
+            offset: job.slice.0, bytes: job.payload_bytes }; self.ranks]);
         self.transport.dispatch(&request, slices.as_deref())
     }
 
     fn poll(&mut self, wave: &mut Self::Wave, info: &WaveInfo) -> Result<bool> {
         let (ranks, row_bytes, landing, words, pulls) = (self.ranks, self.row_bytes, self.landing, self.words, self.pulls);
-        let plane_bytes = info.rows * row_bytes;
-        ensure!(plane_bytes <= info.slice.1, "wave of {} rows exceeds its return slot", info.rows);
+        let plane_bytes = info.payload_bytes;
+        validate_payload(plane_bytes, info.slice.1)?;
         let receiving = &mut self.receiving;
         let done = self.transport.poll(wave, &mut |rank, first, frame| {
             ensure!(rank < ranks && landing & (1 << rank) == 0,
                 "rank {rank} arrived in host memory but its link lands it in device memory");
             let bytes = frame.len();
+            if plane_bytes != info.rows * row_bytes {
+                ensure!(first == 0 && bytes == plane_bytes, "variable reply plane must arrive whole at offset zero");
+            }
             let offset = upload_offset(ranks, rank, first, row_bytes, bytes, plane_bytes)?;
             let source = frame.device_address()
                 .with_context(|| format!("rank {rank}'s reply frame is not in mapped pinned memory"))?;
@@ -947,11 +962,15 @@ impl<'a> Waves<'a> {
     /// Whether each slot's request staging holds `bytes`.
     pub(crate) fn fits(&self, bytes: usize) -> bool { self.arenas.iter().all(|arena| arena.bytes() >= bytes) }
 
-    fn submit(&mut self, rows: usize, source: Source, stage: Option<(*mut c_void, RouteStaging,
+    /// Exact per-rank reply extent for compact rows at this exchange's admitted width.
+    pub(crate) fn compact_payload(&self, rows: usize) -> usize { rows * self.row_bytes }
+
+    fn submit(&mut self, rows: usize, payload_bytes: usize, source: Source, stage: Option<(*mut c_void, RouteStaging,
         [CuteafdDeviceBuffer; 3])>) -> Result<WaveTicket> {
         let cut = self.geometry.cut();
         ensure!(self.outstanding.len() < cut.waves, WaveError::Admission(self.outstanding.len()));
         ensure!(rows > 0 && rows <= cut.rows, WaveError::Rows { rows, capacity: cut.rows });
+        validate_payload(payload_bytes, self.geometry.slice(self.next_slot, self.row_bytes).1)?;
         healthy()?;
         let slot = self.next_slot;
         ensure!(!self.unread[slot], WaveError::Unconsumed(slot));
@@ -995,16 +1014,16 @@ impl<'a> Waves<'a> {
         let consumed = vec![(slot, self.uses[slot])];
         let slice = self.geometry.slice(slot, self.row_bytes);
         let release = self.uses[slot].wrapping_add(1);
-        let job = Job { sequence, slot, rows, source, consumed, slice, release, sent: Instant::now() };
+        let job = Job { sequence, slot, rows, payload_bytes, source, consumed, slice, release, sent: Instant::now() };
         self.jobs.as_ref().context("Spark exchange stopped")?.send(Command::Wave(job))
             .map_err(|_| WaveError::Lost(sequence))?;
         self.sequence = sequence;
         self.outstanding.push_back((sequence, slot, 0));
         self.next_slot = (slot + 1) % cut.waves;
-        Ok(WaveTicket { sequence, slot, rows })
+        Ok(WaveTicket { sequence, slot, rows, payload_bytes })
     }
 
-    /// Queues a `rows`-row wave into the next return slot: its route ids, gate
+    /// Queues a `rows`-row wave with exactly `payload_bytes` per rank into the next return slot: its route ids, gate
     /// weights and expert input rows (`sources`, in that order) copy into the
     /// slot's staging on `stream`, which then publishes `staged`; the worker
     /// builds, posts and lands it. The engine thread does not wait.
@@ -1013,16 +1032,16 @@ impl<'a> Waves<'a> {
     /// `sources` are live device buffers of `layout`'s extents on `stream`'s
     /// device, written in `stream` order before this call (the copies read
     /// them in stream order, so later stream work may rewrite them).
-    pub(crate) unsafe fn send(&mut self, rows: usize, layout: RouteStaging, sources: [CuteafdDeviceBuffer; 3],
+    pub(crate) unsafe fn send(&mut self, rows: usize, payload_bytes: usize, layout: RouteStaging, sources: [CuteafdDeviceBuffer; 3],
         stream: *mut c_void, build: BuildRequest) -> Result<WaveTicket> {
-        self.submit(rows, Source::Staged { layout, build }, Some((stream, layout, sources)))
+        self.submit(rows, payload_bytes, Source::Staged { layout, build }, Some((stream, layout, sources)))
     }
 
     /// Queues a wave whose request the host already built (warm-ups, gates):
     /// the worker posts it once its slot's planes are free.
-    pub(crate) fn send_request(&mut self, request: ExpertProtocolV2Request) -> Result<WaveTicket> {
+    pub(crate) fn send_request(&mut self, request: ExpertProtocolV2Request, payload_bytes: usize) -> Result<WaveTicket> {
         let rows = request.header.row_count as usize;
-        self.submit(rows, Source::Built(request), None)
+        self.submit(rows, payload_bytes, Source::Built(request), None)
     }
 
     /// Orders `stream` after `ticket`'s wave (the oldest) has landed in its
@@ -1041,26 +1060,26 @@ impl<'a> Waves<'a> {
         let cut = self.geometry.cut();
         ensure!(ticket.rows <= cut.rows, "Spark wave of {} rows lands past its {}-row planes", ticket.rows, cut.rows);
         let rest = self.pinned & !pulled;
-        if rest != 0 && self.wide(ticket.rows, rest) {
+        if rest != 0 && self.wide(ticket.payload_bytes, rest) {
             for rank in (0..self.ranks).filter(|rank| rest & (1 << rank) != 0) {
                 // SAFETY: as `pull`'s contract; the wait precedes the pull.
-                unsafe { self.pull(ticket.sequence, slot, ticket.rows, 1 << rank, true, stream)? };
+                unsafe { self.pull(ticket.sequence, slot, ticket.payload_bytes, 1 << rank, true, stream)? };
             }
         }
         self.outstanding.pop_front();
         // SAFETY: as `submit`'s waits.
         unsafe { self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Landed), ticket.sequence)? };
-        if rest != 0 && !self.wide(ticket.rows, rest) {
+        if rest != 0 && !self.wide(ticket.payload_bytes, rest) {
             // SAFETY: as `pull`'s contract; behind the `landed` wait.
-            unsafe { self.pull(ticket.sequence, slot, ticket.rows, rest, false, stream)? };
+            unsafe { self.pull(ticket.sequence, slot, ticket.payload_bytes, rest, false, stream)? };
         }
         self.unread[slot] = true;
         Ok(())
     }
 
-    /// Whether `ranks` of a `rows`-row wave carry enough to pull rank by rank.
-    fn wide(&self, rows: usize, ranks: u8) -> bool {
-        rows * self.row_bytes * ranks.count_ones() as usize > PULL_PER_RANK_BYTES
+    /// Whether `ranks` of a `payload_bytes`-byte plane carry enough to pull rank by rank.
+    fn wide(&self, payload_bytes: usize, ranks: u8) -> bool {
+        payload_bytes.saturating_mul(ranks.count_ones() as usize) > PULL_PER_RANK_BYTES
     }
 
     /// For a host-ordered owner waiting on the host for `ticket`'s wave (the
@@ -1069,7 +1088,7 @@ impl<'a> Waves<'a> {
     /// the rest are on the wire; [`Self::land`] then queues only what is
     /// left. Never waits. `stream` is the one the wave lands and reduces on.
     pub(crate) fn pull_arrived(&mut self, ticket: &WaveTicket, stream: *mut c_void) -> Result<()> {
-        if !self.wide(ticket.rows, self.pinned) { return Ok(()); }
+        if !self.wide(ticket.payload_bytes, self.pinned) { return Ok(()); }
         let Some(front) = self.outstanding.front_mut() else { return Err(WaveError::Lost(ticket.sequence).into()) };
         ensure!(front.0 == ticket.sequence && front.1 == ticket.slot,
             WaveError::Order { expected: front.0, found: ticket.sequence });
@@ -1081,17 +1100,17 @@ impl<'a> Waves<'a> {
         front.2 |= arrived;
         // SAFETY: as `pull`'s contract; every rank's arrival is already
         // published (the wait it queues is satisfied).
-        unsafe { self.pull(ticket.sequence, ticket.slot, ticket.rows, arrived, true, stream) }
+        unsafe { self.pull(ticket.sequence, ticket.slot, ticket.payload_bytes, arrived, true, stream) }
     }
 
     /// Queues on `stream` the pull of `ranks`' published frames of wave
-    /// `sequence` (in `slot`, `rows` rows) into their planes, each behind its
+    /// `sequence` (in `slot`, exactly `payload_bytes` per rank) into their planes, each behind its
     /// own arrival wait when `wait`.
     ///
     /// # Safety
     /// `stream` is a live stream of the link's device, ordered after the
     /// slot's previous reduce; a pull without its waits sits behind `landed`.
-    unsafe fn pull(&self, sequence: u32, slot: usize, rows: usize, ranks: u8, wait: bool, stream: *mut c_void)
+    unsafe fn pull(&self, sequence: u32, slot: usize, payload_bytes: usize, ranks: u8, wait: bool, stream: *mut c_void)
         -> Result<()> {
         let pulls = self.pulls.context("no pinned ranks to pull")?;
         let planes: Vec<CuteafdDeviceBuffer> = self.slot_planes(slot).collect();
@@ -1104,7 +1123,8 @@ impl<'a> Waves<'a> {
                 unsafe { self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Arrived(rank)), sequence)? };
             }
             replies.push(pulls.at(slot, rank).cast_const());
-            targets.push((planes[rank].ptr, (rows * self.row_bytes) as u64));
+            validate_payload(payload_bytes, planes[rank].bytes)?;
+            targets.push((planes[rank].ptr, payload_bytes as u64));
         }
         // SAFETY: the kernel runs after the arrival (or `landed`) wait, when
         // the worker has published the rank's frames, which it keeps in their

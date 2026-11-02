@@ -1012,7 +1012,7 @@ mod host_order_tests {
         let dispatch = coordinator.split("unsafe fn send_on<'a>(").nth(1).unwrap()
             .split("\n}\n").next().unwrap();
         assert!(dispatch.contains("crate::shared::memory::chain::join(library, stage)?;")
-            && dispatch.contains("exchange.send(routed.rows as usize, layout, sources, stage, build)"));
+            && dispatch.contains("exchange.send(routed.rows as usize, exchange.compact_payload(routed.rows as usize), layout, sources, stage, build)"));
         let collect = coordinator.split("async unsafe fn finish_values(").nth(1).unwrap().split("\n    }\n").next().unwrap();
         let landed = collect.find("while !exchange.landed(&self.ticket)").expect("host-ordered collect waits for the reply");
         let land = collect.find("exchange.land(self.ticket, self.stream.raw)").unwrap();

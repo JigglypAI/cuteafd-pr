@@ -1061,7 +1061,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                             let [ids, weights, input] = ffn.wave_inputs();
                             // SAFETY: the routed front end wrote these rows on
                             // this lane stream; the copies read them in order.
-                            unsafe { exchange.send(rows, layout, [ids, weights, input], meta.stream.raw,
+                            unsafe { exchange.send(rows, exchange.compact_payload(rows), layout, [ids, weights, input], meta.stream.raw,
                                 Box::new(move |routes, wire| expert_request(identity, placement_version, layer,
                                     dtype, descriptors, routes, wire))) }
                         }))?;
