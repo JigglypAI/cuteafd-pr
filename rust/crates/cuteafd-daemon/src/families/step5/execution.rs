@@ -1596,8 +1596,10 @@ mod tests {
             let counts = Constructions::default();
             let subscriber = tracing_subscriber::registry().with(counts.clone());
             tracing::subscriber::with_default(subscriber, || -> Result<()> {
-                let modes = (0..92).map(|layer| LayerMode::Whole {
-                    gpu: (layer % ranks) as u8, ffn: FfnMode::Owner }).collect::<Vec<_>>();
+                let modes = (0..92).map(|layer| {
+                    if ranks == 2 && !cfg.full[layer] { LayerMode::HeadSplit }
+                    else { LayerMode::Whole { gpu: ((layer / 4) % ranks) as u8, ffn: FfnMode::Owner } }
+                }).collect::<Vec<_>>();
                 let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: (H * 4) as u64,
                     rows: 64, lanes: 1, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
                 let placement = Placement { pool_tokens: 0, pool_limits: PoolLimits(vec![]),
