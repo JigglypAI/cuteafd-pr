@@ -488,10 +488,36 @@ impl MlaDraftCacheState {
     fn check_append(&self, slot: usize, start: usize, rows: usize) -> Result<()> {
         let (_, end) = self.frontier(slot)?;
         let finish = start.checked_add(rows).ok_or_else(|| unsupported("MLA draft context overflow"))?;
-        if start != end || rows == 0 || finish > self.layout.layers[0].context {
+        // A tail-only producer may omit only records no layer can ever read again.
+        // Keep the immutable storage origin so its physical rows equal a full append.
+        let discarded_gap = start > end && self.layout.layers.iter()
+            .all(|layer| layer.window.is_some_and(|window| rows >= window));
+        if (start != end && !discarded_gap) || rows == 0 || finish > self.layout.layers[0].context {
             return Err(unsupported("MLA draft context append differs from committed frontier"));
         }
         Ok(())
+    }
+
+    /// Physical rows outside the committed window, including private proposal slack.
+    /// Zero these at commit/rollback boundaries so whole-owner snapshots are canonical.
+    pub fn window_slack(&self, layer: usize, slot: usize) -> Result<Vec<std::ops::Range<usize>>> {
+        let (origin, end) = self.frontier(slot)?;
+        let layer = self.layout.layers.get(layer).ok_or_else(|| unsupported("MLA draft unknown cache layer"))?;
+        let Some(window) = layer.window else { return Ok(Vec::new()); };
+        let capacity = layer.rows_per_slot;
+        let base = slot * capacity;
+        let retained = (end - origin).min(window);
+        if retained == 0 { return Ok(vec![base..base + capacity]); }
+        let first = (end - origin - retained) % capacity;
+        let finish = first + retained;
+        let mut slack = Vec::new();
+        if finish <= capacity {
+            if first > 0 { slack.push(base..base + first); }
+            if finish < capacity { slack.push(base + finish..base + capacity); }
+        } else {
+            slack.push(base + finish - capacity..base + first);
+        }
+        Ok(slack)
     }
 
     pub fn commit_context(&mut self, slot: usize, start: usize, rows: usize) -> Result<()> {

@@ -801,8 +801,11 @@ impl MlaContextUpdate {
             for row in rows { grouped.entry(row.slot).or_default().push(row); }
             for (slot, mut group) in grouped {
                 group.sort_unstable_by_key(|r| r.position);
-                let reservation = state.reserve(slot, group[0].position, group.len())?;
+                let start = state.rings.frontier(slot)?.1;
+                let finish = group[0].position + group.len();
+                let reservation = state.reserve(slot, start, finish - start)?;
                 reservations.push(reservation);
+                if layout.paged_cache().full_layers == 0 { continue; }
                 let physical = state.pool.destinations(reservation)?;
                 for (layer, destinations) in plan.slots.iter_mut().enumerate() {
                     if layout.cache().layers[layer].window().is_some() { continue; }
@@ -1740,6 +1743,23 @@ impl<'a> DflashDrafter<'a> {
             // SAFETY: rebind retires the old request before its pooled destinations are released.
             unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
             context.state.borrow_mut().reset(slot, origin)?;
+            self.canonicalize_mla_windows(context, &[slot], &context.state.borrow().rings)?;
+        }
+        Ok(())
+    }
+
+    fn canonicalize_mla_windows(&self, context: &MlaContext<'_>, slots: &[usize],
+        rings: &cuteafd_loader::formats::dflash::MlaDraftCacheState) -> Result<()> {
+        let record = context.layout.paged_cache().record_bytes;
+        for &slot in slots {
+            for (index, layer) in self.layers.iter().enumerate() {
+                let DraftAttention::Mla(layer) = &layer.attention else { anyhow::bail!("MLA draft layer mismatch"); };
+                for rows in rings.window_slack(index, slot)? {
+                    let view = draft_view(layer.cache.buffer, rows.start * record, rows.len() * record)?;
+                    // SAFETY: slack excludes retained rows; the owned stream retires prior readers first.
+                    unsafe { self.library.cuda_zero_bytes_async(view, view.bytes, self.stream)?; }
+                }
+            }
         }
         Ok(())
     }
@@ -2013,6 +2033,9 @@ impl<'a> DflashDrafter<'a> {
             for batch in chunks { layer.program.produce(layer.weights(), batch, self.stream)?; }
         }
         self.timing.end(span, self.stream)?;
+        let slots = rows.iter().map(|row| row.slot).collect::<std::collections::BTreeSet<_>>()
+            .into_iter().collect::<Vec<_>>();
+        self.canonicalize_mla_windows(context, &slots, &plan.next)?;
         lease.commit()?;
         context.state.borrow_mut().rings = plan.next;
         Ok(())
@@ -2470,6 +2493,8 @@ impl<'a> DflashDrafter<'a> {
                 state.pool.commit(reservation, 0)?;
                 lease.reservations.pop();
             }
+            let slots = sequences.iter().map(|seq| seq.slot).collect::<Vec<_>>();
+            self.canonicalize_mla_windows(lease.context, &slots, &state.rings)?;
         }
         self.timing.publish_completed()?;
         self.timing.dump_head_input(w.n.buffer, rows, h)?;
@@ -3126,7 +3151,7 @@ mod checkpoint_header_tests {
     }
 
     #[test]
-    fn mla_long_prefill_tail_reproduces_frontier_gap_without_window_wrap_failure() {
+    fn mla_long_prefill_tail_matches_contiguous_canonical_owners_and_frontiers() {
         use cuteafd_loader::formats::dflash::{MlaDraftCacheRequest, MlaDraftCacheState};
         let mut cfg = mla_config();
         cfg.block = 3;
@@ -3146,6 +3171,9 @@ mod checkpoint_header_tests {
                     }
                 }
                 contiguous = plan.next;
+                for (layer, owner) in records.iter_mut().enumerate() {
+                    for slack in contiguous.window_slack(layer, 0).unwrap() { owner[slack].fill(0); }
+                }
                 assert_eq!(contiguous.frontier(0).unwrap(), (0, start + rows.len()));
             }
             let tail_start = length - TAP_ROWS;
@@ -3153,15 +3181,26 @@ mod checkpoint_header_tests {
                 tap_row, slot: 0, position: tail_start + tap_row }).collect::<Vec<_>>();
             let mut cold = MlaDraftCacheState::new(layout.clone()).unwrap();
             cold.reset(0, 0).unwrap();
-            let error = MlaContextUpdate::checked(&cold, 3, &tail).err().unwrap();
-            assert!(error.to_string().contains("append differs from committed frontier"));
-            assert_eq!(cold.frontier(0).unwrap(), (0, 0), "refusal is transactional");
+            let plan = MlaContextUpdate::checked(&cold, 3, &tail).unwrap();
+            let mut tail_records: Vec<_> = layout.layers.iter().map(|layer| vec![u64::MAX; layer.rows_per_slot()]).collect();
+            for (layer, owner) in tail_records.iter_mut().enumerate() {
+                for (&position, &row) in plan.positions.iter().zip(&plan.slots[layer]) {
+                    owner[row as usize] = position as u64 + 1;
+                }
+                for slack in plan.next.window_slack(layer, 0).unwrap() { owner[slack].fill(0); }
+            }
+            assert_eq!(records, tail_records, "entire owners, including private/padding rows");
+            assert_eq!(contiguous, plan.next);
+            assert_eq!(plan.positions, (tail_start..length).map(|p| p as i64).collect::<Vec<_>>());
+            assert_eq!(cold.frontier(0).unwrap(), (0, 0), "preflight is transactional");
+            cold = plan.next;
             let request = [MlaDraftCacheRequest { slot: 0, position: length, valid_from: 0 }];
             for (index, layer) in layout.layers.iter().enumerate() {
                 let bound = layer.bind(0, 0).unwrap();
                 for position in tail_start..length {
                     assert_eq!(records[index][bound.row(position).unwrap()], position as u64 + 1);
                 }
+                assert_eq!(contiguous.block_batches(index, &request).unwrap(), cold.block_batches(index, &request).unwrap());
                 assert_eq!(contiguous.block_batches(index, &request).unwrap()[0].positions,
                     (length..length + cfg.block).map(|p| p as i64).collect::<Vec<_>>());
             }
@@ -3171,7 +3210,44 @@ mod checkpoint_header_tests {
             for position in 0..length { full_gqa[position % RING] = position as u64 + 1; }
             for position in tail_start..length { tail_gqa[position % RING] = position as u64 + 1; }
             assert_eq!(full_gqa, tail_gqa);
-            println!("prefill {length}: contiguous frontier (0,{length}), retained ring wrap exact; tail {tail_start}..{length} refused at frontier0; GQA full/tail equal");
+            println!("prefill {length}: full/tail entire canonical owners, frontier (0,{length}) and proposal metadata identical; GQA full/tail equal");
+        }
+    }
+
+    #[test]
+    fn mla_tail_gap_preserves_pooled_frontier_and_rejects_live_missing_rows() {
+        use cuteafd_loader::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        for windows in [vec![Some(RING); 3], vec![Some(RING), Some(RING + 1)], vec![Some(RING), None]] {
+            let mut cfg = mla_config();
+            cfg.block = 3;
+            cfg.windows = windows.clone();
+            let layout = cfg.runtime_layout(GlmDraftRepresentation::Fp8Only,
+                GlmDraftCapacity::new(2, 2, 3).unwrap(), 262144, 16384, 188, 2,
+                cuteafd_core::MlaCacheFormat::Fp8).unwrap();
+            let mut state = MlaPagedState::new(&layout).unwrap();
+            state.reset(0, 0).unwrap();
+            state.reset(1, 513).unwrap();
+            let tail = (0..TAP_ROWS).map(|tap_row| ContextRow {
+                tap_row, slot: 0, position: 8332 - TAP_ROWS + tap_row }).collect::<Vec<_>>();
+            let valid = windows.iter().all(|&window| window == Some(RING));
+            let planned = MlaContextUpdate::checked_paged(&mut state, &layout, &tail);
+            if valid {
+                let (plan, reservations) = planned.unwrap();
+                assert_eq!(reservations.len(), 1);
+                assert_eq!((reservations[0].start(), reservations[0].end()), (0, 8332));
+                state.pool.commit(reservations[0], 8332).unwrap();
+                state.rings = plan.next;
+                assert_eq!(state.rings.frontier(0).unwrap(), (0, 8332));
+                assert_eq!(state.pool.frontier(state.bindings[0].unwrap()).unwrap(), (0, 8332));
+                assert_eq!(state.rings.frontier(1).unwrap(), (513, 513));
+                assert!(state.rings.context_rows(0, 0, 8333, RING - 1).is_err());
+                assert!(state.rings.context_rows(0, 0, 8331, RING).is_err());
+            } else {
+                assert!(planned.is_err(), "a missing live row or full-context layer must fail");
+                assert_eq!(state.rings.frontier(0).unwrap(), (0, 0));
+                assert_eq!(state.pool.frontier(state.bindings[0].unwrap()).unwrap(), (0, 0));
+                assert_eq!(state.pool.free(), state.pool.capacity());
+            }
         }
     }
 
