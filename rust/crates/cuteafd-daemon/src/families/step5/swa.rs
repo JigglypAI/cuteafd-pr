@@ -226,11 +226,12 @@ impl<'a> SwaLayer<'a> {
         device: Device<'a>, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         stage: usize, rows: usize, rope: std::rc::Rc<TargetTables<'a>>,
         available: u64, reservations: &[u64], arena: &Arena<'a>, kv_format: Qwen4KvCache,
+        contract: &CoordinatorContract,
     ) -> Result<Self> {
         let layout = RankWeightLayout::for_mtp_stage(checkpoint, stage)?;
         let cfg = Config::parse(checkpoint)?;
         Self::load_layout(device, programs, checkpoint, cfg.layers + stage, rows,
-            Some(rope), available, reservations, layout, 64, true, Some((arena, 0)), kv_format, None, None)
+            Some(rope), available, reservations, layout, 64, true, Some((arena, 0)), kv_format, None, Some(contract))
     }
 
     fn load_layout(

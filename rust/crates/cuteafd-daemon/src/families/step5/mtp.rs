@@ -234,7 +234,8 @@ impl<'a> StageOwner<'a> {
     pub(super) fn load(device: Device<'a>, programs: &'a Programs<'a>,
         checkpoint: &'a Checkpoint, stage: usize, rows: usize,
         rope: Rc<super::rope::TargetTables<'a>>, available: u64, reservations: &[u64],
-        arena: &Arena<'a>, stream: Rc<Stream<'a>>, kv_format: Qwen4KvCache) -> Result<Self> {
+        arena: &Arena<'a>, stream: Rc<Stream<'a>>, kv_format: Qwen4KvCache,
+        contract: &cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract) -> Result<Self> {
         let input = InputPlan::prepare(programs, checkpoint, stage, rows)?;
         // A stage proposes at most depth + 1 rows: its head holds the verify width only.
         let head = super::head::HeadPlan::for_mtp_stage(programs, checkpoint, stage,
@@ -246,7 +247,7 @@ impl<'a> StageOwner<'a> {
             "Step-5 predictor owner and reservations exceed admission");
         let input = InputOwner::load(device, programs, checkpoint, input, stream.clone(), available, &[], arena)?;
         let attention = super::swa::SwaLayer::for_mtp_stage(device, programs, checkpoint,
-            stage, rows, rope, available, &[], arena, kv_format)?;
+            stage, rows, rope, available, &[], arena, kv_format, contract)?;
         let head = super::head::TargetHeadOwner::load_in(device, programs, checkpoint,
             head, available, &[], Some((arena, 0)))?;
         let sizes = native::mtp_metadata_planes(rows)?;
@@ -638,7 +639,7 @@ impl<'a> Runtime<'a> {
         for stage in 0..depth {
             let owner = StageOwner::load(cache.stream.device, programs, checkpoint, stage,
                 rows, execution.predictor_rope(), available, &[], execution.predictor_arena(),
-                execution.predictor_stream(), cache.layout().kv_format)?;
+                execution.predictor_stream(), cache.layout().kv_format, execution.predictor_contract())?;
             owner.bind_cache(cache)?;
             stages.push(owner);
         }
@@ -861,7 +862,7 @@ mod tests {
         let mut stages = Vec::new();
         for stage in 0..3 {
             let owner = StageOwner::load(device, &programs, &checkpoint, stage, 64,
-                rope.clone(), u64::MAX, &[], &arena, stream.clone(), kv_format)?;
+                rope.clone(), u64::MAX, &[], &arena, stream.clone(), kv_format, &contract)?;
             owner.bind_cache(&cache)?;
             stages.push(owner);
         }
@@ -1012,7 +1013,7 @@ mod tests {
                 let hidden = Allocation::new(device, 64 * H * 4)?;
                 let arena = Arena::new(device, usize::try_from(native::mtp_forecast_workspace(64, 3, kv_format)?)?)?;
                 let mut owner = StageOwner::load(device, &programs, &checkpoint, stage, 64,
-                    rope.clone(), u64::MAX, &[], &arena, Rc::new(Stream::new(device)?), kv_format)?;
+                    rope.clone(), u64::MAX, &[], &arena, Rc::new(Stream::new(device)?), kv_format, &contract)?;
                 owner.bind_cache(&cache)?;
                 let mut boundaries: Vec<(&str, usize, Vec<u8>)> = [
                     ("enorm", H), ("hnorm", H), ("concat", 2 * H), ("eh", H),

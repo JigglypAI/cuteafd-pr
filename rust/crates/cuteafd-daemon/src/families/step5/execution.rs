@@ -842,6 +842,9 @@ impl<'e, 'a> Execution<'e, 'a> {
             resource::worker_group_rows_for_input(&reports, layer, rows, ffn.wire_dtype() == ExpertV2Dtype::Bf16)
         })
     }
+    pub(super) fn predictor_contract(&self) -> &CoordinatorContract {
+        &self.main.native.contract
+    }
     pub(super) fn predictor_rope(&self) -> Rc<TargetTables<'a>> {
         self.main.native.rope[self.ownership().execution().spec().head_gpu as usize].clone()
     }
