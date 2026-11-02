@@ -68,7 +68,7 @@ impl Backend for Fake {
 }
 
 fn job(sequence: u32, slot: usize, consumed: u32) -> Job {
-    Job { sequence, slot, rows: 1, consumed: vec![(slot, consumed)], slice: (slot * 64, 64),
+    Job { sequence, slot, rows: 1, payload_bytes: 64, consumed: vec![(slot, consumed)], slice: (slot * 64, 64),
         release: consumed + 1, sent: Instant::now(),
         source: Source::Staged { layout: RouteStaging::new(1, 8, 16).unwrap(),
             build: Box::new(|_, _| anyhow::bail!("the fake posts without building")) } }
@@ -581,7 +581,7 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
                 }
                 let (h, l) = (hidden, layer);
                 // SAFETY: ids, weights and the layer's input are live device buffers of the layout's extents.
-                let ticket = unsafe { exchange.send(rows, layout, [ids.buffer, weights.buffer, inputs[layer].buffer],
+                let ticket = unsafe { exchange.send(rows, rows * row_bytes, layout, [ids.buffer, weights.buffer, inputs[layer].buffer],
                     stream.raw(), Box::new(move |routes, wire| ExpertProtocolV2Request::new_bytes(l as u64 + 1, 1, l as u32,
                         h as u32, cuteafd_transport::ExpertV2Dtype::Bf16, (0..rows as u32).map(|row|
                             cuteafd_transport::ExpertProtocolV2RowDescriptor { row_id: row.into(),
@@ -655,7 +655,7 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
     for layer in 0..waves {
         let h = hidden;
         // SAFETY: ids, weights and input are live device buffers of the layout's extents.
-        tickets.push(unsafe { exchange.send(rows, layout, [ids.buffer, weights.buffer, input.buffer], stream.raw(),
+        tickets.push(unsafe { exchange.send(rows, rows * row_bytes, layout, [ids.buffer, weights.buffer, input.buffer], stream.raw(),
             Box::new(move |routes, wire| ExpertProtocolV2Request::new_bytes(layer as u64 + 1, 1, layer as u32,
                 h as u32, cuteafd_transport::ExpertV2Dtype::Bf16, (0..rows as u32).map(|row|
                     cuteafd_transport::ExpertProtocolV2RowDescriptor { row_id: row.into(),
@@ -738,6 +738,9 @@ struct Ring {
     fail_poll_after: Option<usize>,
     /// Polls before a wave's replies start arriving (a slow wire).
     hold_polls: usize,
+    payload_bytes: Option<usize>,
+    request_bytes: Option<Vec<u8>>,
+    landing_slices: Vec<(usize, usize)>,
     /// Waves given up after a failure / for a deliberate reset.
     abandoned: Arc<AtomicUsize>,
     cancelled: Arc<AtomicUsize>,
@@ -765,7 +768,7 @@ impl Ring {
             Arc::new(Mutex::new(slots))
         }).collect();
         Self { ranks, depth, rows, row_bytes, free, posted: Arc::new(AtomicUsize::new(0)), _buffers: buffers,
-            fail_poll_after: None, hold_polls: 0, abandoned: Arc::new(AtomicUsize::new(0)),
+            fail_poll_after: None, hold_polls: 0, payload_bytes: None, request_bytes: None, landing_slices: Vec::new(), abandoned: Arc::new(AtomicUsize::new(0)),
             cancelled: Arc::new(AtomicUsize::new(0)) }
     }
 }
@@ -773,7 +776,7 @@ impl Ring {
 impl Transport for Ring {
     type Wave = RingWave;
     type Frame = RingFrame;
-    fn dispatch(&mut self, request: &ExpertProtocolV2Request, _landing: Option<&[cuteafd_transport::LandingSlice]>)
+    fn dispatch(&mut self, request: &ExpertProtocolV2Request, landing: Option<&[cuteafd_transport::LandingSlice]>)
         -> Result<RingWave> {
         // A wave needs a free receive on every rank (an RC SEND into an empty
         // receive queue stalls the link).
@@ -781,7 +784,9 @@ impl Transport for Ring {
             ensure!(!free.lock().unwrap().is_empty(), "rank {rank}'s receive ring is dry at post");
         }
         self.posted.fetch_add(1, Ordering::SeqCst);
-        Ok(RingWave { passes: 0, sent: 0, bytes: request.header.row_count as usize * self.row_bytes })
+        self.request_bytes = request.encode().ok();
+        self.landing_slices = landing.unwrap_or_default().iter().map(|s| (s.offset, s.bytes)).collect();
+        Ok(RingWave { passes: 0, sent: 0, bytes: self.payload_bytes.unwrap_or(request.header.row_count as usize * self.row_bytes) })
     }
     fn poll(&mut self, wave: &mut RingWave, sink: &mut dyn FnMut(usize, u32, RingFrame) -> Result<()>)
         -> Result<Option<u8>> {
@@ -822,7 +827,7 @@ fn built_job(sequence: u32, slot: usize, rows: usize, uses: &[u32], fences: Vec<
         Vec::new(), Vec::new(), bytes::Bytes::new()).unwrap();
     // The fake ring sizes each reply by the request's rows.
     request.header.row_count = rows as u32;
-    Job { sequence, slot, rows, source: Source::Built(request), consumed: fences, slice: (0, rows * 16),
+    Job { sequence, slot, rows, payload_bytes: rows * 16, source: Source::Built(request), consumed: fences, slice: (0, rows * 16),
         release: uses[slot] + 1, sent: Instant::now() }
 }
 
@@ -909,7 +914,7 @@ fn one_receive_fewer_than_the_admitted_slots_runs_the_ring_dry() {
     for sequence in 1..=slots as u32 {
         let slot = sequence as usize - 1;
         let job = built_job(sequence, slot, if sequence % 2 == 1 { 1 } else { rows }, &uses, vec![(slot, 0)]);
-        let info = WaveInfo { sequence, slot, rows: job.rows, slice: job.slice, release: 1 };
+        let info = WaveInfo { sequence, slot, rows: job.rows, payload_bytes: job.payload_bytes, slice: job.slice, release: 1 };
         match backend.post(job) {
             Ok(mut wave) => {
                 while backend.poll(&mut wave, &info).unwrap() == false {}
@@ -946,7 +951,7 @@ fn each_pinned_rank_publishes_its_frames_before_the_wave_lands() {
     let ring = Ring::new(ranks, 1, rows, row_bytes);
     let (mut backend, _control, _pulls) = ring_backend(ring, 1);
     let job = built_job(1, 0, rows, &[0], vec![(0, 0)]);
-    let info = WaveInfo { sequence: 1, slot: 0, rows, slice: (0, rows * row_bytes), release: 1 };
+    let info = WaveInfo { sequence: 1, slot: 0, rows, payload_bytes: rows * row_bytes, slice: (0, rows * row_bytes), release: 1 };
     let mut wave = backend.post(job).unwrap();
     // Pass 1: rank 0 only.
     assert!(backend.poll(&mut wave, &info).unwrap() == false);
@@ -1067,7 +1072,7 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
             if layer == 1 { stagger.store(300_000, Ordering::SeqCst); }
             let h = hidden;
             // SAFETY: ids, weights and the layer's input are live device buffers of the layout's extents.
-            let ticket = unsafe { exchange.send(rows, layout, [ids.buffer, weights.buffer, inputs[layer].buffer],
+            let ticket = unsafe { exchange.send(rows, rows * row_bytes, layout, [ids.buffer, weights.buffer, inputs[layer].buffer],
                 stream.raw(), Box::new(move |routes, wire| ExpertProtocolV2Request::new_bytes(layer as u64 + 1, 1,
                     layer as u32, h as u32, cuteafd_transport::ExpertV2Dtype::Bf16, (0..rows as u32).map(|row|
                         cuteafd_transport::ExpertProtocolV2RowDescriptor { row_id: row.into(),
@@ -1226,4 +1231,56 @@ fn fail_without_a_descriptor_block_writes_no_descriptor() {
     for rank in 0..2 {
         assert!(reached(native.words.load(Counter::Arrived(rank)), 7), "rank {rank} not released");
     }
+}
+
+/// A mixed-format reply uses its exact extent, not the padded worst-mix stride.
+/// The same backend covers compact replies without changing their request bytes.
+#[test]
+fn wave_payload_is_independent_of_reserved_slot_stride() -> Result<()> {
+    for (rows, row_bytes, payload_bytes) in [(16, 16, 16 * 16), (1700, 34864, 1700 * 18432)] {
+        let ring = Ring::new(1, 1, 1, 16);
+        let (mut backend, _control, _pulls) = ring_backend(ring, 1);
+        backend.row_bytes = row_bytes;
+        backend.transport.payload_bytes = Some(payload_bytes);
+        // The fake frame points at a small host buffer; this CPU test never
+        // reads its bytes, only the descriptor published by the real backend.
+        backend.transport.free[0].lock().unwrap()[0].1 = payload_bytes;
+        let mut job = built_job(1, 0, rows, &[0], vec![(0, 0)]);
+        job.payload_bytes = payload_bytes;
+        job.slice = (123456, 2752 * row_bytes);
+        let info = WaveInfo { sequence: 1, slot: 0, rows, payload_bytes, slice: job.slice, release: 1 };
+        let mut wave = backend.post(job)?;
+        assert!(backend.poll(&mut wave, &info)?);
+        // SAFETY: ring_backend owns this mapped descriptor for the test's life.
+        let descriptor = unsafe { *backend.pulls.at(0, 0) };
+        assert_eq!((descriptor.frame[0].offset, descriptor.frame[0].bytes), (0, payload_bytes as u64));
+        assert!(reached(backend.words.load(Counter::Arrived(0)), 1));
+        assert_eq!(backend.retained[0].frames[0].bytes, payload_bytes);
+        assert!(validate_payload(payload_bytes, payload_bytes - 1).is_err());
+    }
+    assert!(validate_payload(0, 1234).is_err());
+    Ok(())
+}
+
+#[test]
+fn compact_wave_keeps_wire_bytes_and_reserved_landing_offsets() -> Result<()> {
+    for rows in [1, 16] {
+        let request = ExpertProtocolV2Request::new_bytes(1, 1, 0, 8, cuteafd_transport::ExpertV2Dtype::Bf16,
+            (0..rows as u32).map(|row| cuteafd_transport::ExpertProtocolV2RowDescriptor {
+                row_id: row.into(), source_kind: cuteafd_transport::ExpertV2SourceKind::Decode,
+                source_request_id: 1, token_position: row.into(), route_offset: row, route_count: 1 }).collect(),
+            (0..rows as u32).map(|row| ExpertProtocolV2RouteEntry { row_index: row, expert_id: 0, gate_weight: 1.0 }).collect(),
+            bytes::Bytes::from(vec![0; rows * 16]))?;
+        let before = request.encode()?;
+        let ring = Ring::new(1, 1, rows, 16);
+        let (mut backend, _control, _pulls) = ring_backend(ring, 1);
+        backend.landing = 1;
+        let mut job = built_job(1, 0, rows, &[0], vec![(0, 0)]);
+        job.source = Source::Built(request);
+        job.slice = (8192, 4096);
+        backend.post(job)?;
+        assert_eq!(backend.transport.request_bytes.as_deref(), Some(before.as_slice()));
+        assert_eq!(backend.transport.landing_slices, vec![(8192, rows * 16)]);
+    }
+    Ok(())
 }

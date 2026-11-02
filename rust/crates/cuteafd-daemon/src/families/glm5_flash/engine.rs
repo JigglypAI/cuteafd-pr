@@ -5246,7 +5246,7 @@ impl<'a> GlmfEngine<'a> {
         // SAFETY: ids, weights and wire rows hold this layer's `t` rows in
         // stream order; the copies read them before later stream work.
         let ticket = unsafe {
-            exchange.send(t, layout, [w.route_ids.buffer, w.route_weights.buffer,
+            exchange.send(t, t * h * 2, layout, [w.route_ids.buffer, w.route_weights.buffer,
                 if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream, Box::new(move |routes, wire| {
                     let request = spark_request_bytes(h, topk, index, t, routes, wire, kind, bf16)?;
                     if audit {
