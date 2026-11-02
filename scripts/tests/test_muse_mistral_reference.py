@@ -273,7 +273,7 @@ def synthetic_panel(tmp_path, family, snapshot, vocab, lengths):
     return path
 
 
-def run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel):
+def run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel, media_adapter=None):
     import layer_major
     import types
     monkeypatch.setattr(layer_major, "DEVICE", "cpu")
@@ -281,7 +281,9 @@ def run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel):
     out = tmp_path / "golden"
     args = types.SimpleNamespace(snapshot=snapshot, windows=panel, out=out, layers=None, prefix_only=False,
                                  wait_shards=0, routes=tmp_path / "routes")
-    layer_major.run(args, family, extras_root=getattr(args, "routes", None) if family.name == "muse_spark" else None)
+    args.media = media_adapter is not None
+    layer_major.run(args, family, extras_root=getattr(args, "routes", None) if family.name == "muse_spark" else None,
+                    media_adapter=media_adapter)
     return out
 
 
@@ -327,7 +329,8 @@ def test_muse_golden_qualifies_scores_resumes_and_writes_routes(tmp_path, monkey
     assert (out / "windows" / "w0" / "logits.bin").read_bytes() == first
 
 
-def test_mistral_golden_threads_shared_kv_and_topk_across_layers(tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_media", [False, True])
+def test_mistral_golden_threads_shared_kv_and_topk_across_layers(tmp_path, monkeypatch, with_media):
     from families.mistral_large4 import golden
     from transformers.models.mistral_large4 import modeling_mistral_large4 as reference
     config = tiny_mistral_config()
@@ -346,7 +349,23 @@ def test_mistral_golden_threads_shared_kv_and_topk_across_layers(tmp_path, monke
     family.stores = set(family.source.values())
     family.last_reader = {s: max(i for i, x in family.source.items() if x == s) for s in family.stores}
     panel = synthetic_panel(tmp_path, "mistral_large4", snapshot, config.vocab_size, [700, 260])
-    out = run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel)
+    adapter, features = None, None
+    if with_media:
+        import types
+        from fidelity_windows import set_hash
+        manifest = json.loads(panel.read_text())
+        features = {"ab" * 32: torch.randn(6, config.hidden_size).bfloat16()}
+        for window in manifest["windows"]:
+            window["tokens"][1:7] = [5, 5, 6, 5, 5, 7]
+            window["media"] = [{"kind": "image", "start": 1, "len": 6, "grid": [1, 4, 4],
+                "key": "ab" * 32, "fixture": {"path": "image.png", "sha256": "cd" * 32}}]
+        manifest["image_processor"] = {"merge": 2, "row_markers": 1,
+            "image_token_id": 5, "row_break_token_id": 6, "end_token_id": 7}
+        manifest["set_sha256"] = set_hash(manifest)
+        panel.write_text(json.dumps(manifest))
+        adapter = types.SimpleNamespace(validate_spans=lambda m, s: None,
+            window_features=lambda a, m: (features, {"fixture": True}))
+    out = run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel, media_adapter=adapter)
     meta = json.loads((out / "meta.json").read_text())
     assert meta["prefix_qualification"]["passed"] and meta["official_forward"]["passed"]
     # Layer-major logits equal the official full model run on the same window (stable top-k).
@@ -358,6 +377,8 @@ def test_mistral_golden_threads_shared_kv_and_topk_across_layers(tmp_path, monke
         checkpoint = mistral.Checkpoint(snapshot)
         outer = mistral.load_outer(checkpoint, config, device="cpu", dtype=torch.float32)
         hidden = torch.nn.functional.embedding(ids, outer["embed"])
+        if with_media:
+            hidden[0, 1:7] = features["ab" * 32].float()
         shared, topk = {}, None
         for index in range(config.num_hidden_layers):
             layer = mistral.load_layer(checkpoint, config, index, device="cpu", dtype=torch.float32)
