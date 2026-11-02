@@ -15,7 +15,7 @@ import urllib.request
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python/reference"))
-from fidelity_media import read_fixture
+from fidelity_media import has_media_adapter, media_families, read_fixture
 from fidelity_windows import canonical, load_set, validate_qualification
 
 CRITERION = ("the paired difference against the golden decides (\u22640.005 nat KL increase, "
@@ -38,7 +38,7 @@ def http(url, token, body=None, timeout=240):
         return json.load(response)
 
 
-FAMILIES = ("mimo_v2", "qwen4", "glm5_flash")
+FAMILIES = media_families()
 GLM_TRANSFORMERS_REVISION = "62d7ebd7de4938e072b7aaeb881593b79dc56835"
 GLM_MODELING_SHA256 = "f6dfea36d663a5257cd10ad61924c4f90c29c38f14f40b2af1e446714168b05d"
 GLM_IMAGE_PROCESSING_SHA256 = "c3065c32ece0cd46adf74a1aef5707da48a0596578503dabf47f874da0716663"
@@ -46,7 +46,7 @@ GLM_IMAGE_PROCESSING_SHA256 = "c3065c32ece0cd46adf74a1aef5707da48a0596578503dabf
 
 def load_panel(a):
     family = getattr(a, "family", "mimo_v2")
-    if family not in FAMILIES:
+    if not has_media_adapter(family):
         raise ValueError("unsupported paired media family")
     return load_set(a.windows, family)
 

@@ -40,7 +40,9 @@ mod packing;
 mod layers;
 #[path = "engine/native_dense.rs"]
 pub(crate) mod native_dense;
-pub(crate) mod exlr8;
+#[cfg(test)]
+#[path = "engine/exlr8/golden.rs"]
+mod exlr8_golden;
 pub(crate) use cuteafd_loader::placement::families::glm5::GlmContext;
 
 type Dev<'a> = DeviceAllocation<'a>;
@@ -398,12 +400,13 @@ pub(crate) struct GlmEngine<'a> {
     /// Per rank: bound native dense programs and the prefill unpack staging
     /// (EXLR8 checkpoint dense operands); empty on the official path.
     pub(crate) native_dense: Vec<Option<native_dense::NativePrograms<'a>>>,
+    pub(crate) native_scratch: Vec<[cuteafd_loader::families::glm5::native::ScratchLayout; 2]>,
     core_programs: Vec<Option<super::core_runtime::CorePrograms<'a>>>,
     core_admission: Option<cuteafd_loader::families::glm5::core::CoreCharges>,
     /// Target decode/prefill share one arena; CoreHead enforces same-stream FIFO.
     target_core_head: Option<Rc<super::core_runtime::CoreHead<'a>>>,
     pub(crate) exlr8_prefill_activations: super::Exlr8PrefillActivations,
-    pub(crate) native_experts: Vec<exlr8::NativeExperts<'a>>,
+    pub(crate) native_experts: Vec<crate::shared::experts::exlr8::NativeExperts<'a>>,
     quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
     pub programs: &'a Programs<'a>,
@@ -557,7 +560,7 @@ impl<'a> GlmEngine<'a> {
         let local = if context_mode.is_some() { pages / 2 } else { pages };
         let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context)?;
         let device = library.cuda_get_device()?;
-        Ok(Self { max_pool_tokens_no_onboard: None, packed_row_cap: Cell::new(None), packed_fallback_reason: RefCell::new(String::new()), quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), core_programs: Vec::new(), core_admission: None, peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
+        Ok(Self { max_pool_tokens_no_onboard: None, packed_row_cap: Cell::new(None), packed_fallback_reason: RefCell::new(String::new()), quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), native_scratch: Vec::new(), core_programs: Vec::new(), core_admission: None, peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), prefill_slots: RefCell::new(Vec::new()),
             prefill_lanes, depth,
@@ -871,10 +874,8 @@ impl<'a> GlmEngine<'a> {
             native_shared: self.native_experts.get(rank)
                 .map(|native| native.execution(self.library, self.programs).map(Rc::new)).transpose()?,
             native_dense: if self.weights.layers.iter().any(|l| l.is_native()) {
-                let split = self.weights.layers.first().is_some_and(|l| l.split);
-                let attention_split = self.weights.layers.first().is_some_and(|l| l.attention_split);
-                Some(Rc::new(native_dense::NativeScratch::new(self, self.cfg.heads / if attention_split { 2 } else { 1 },
-                    self.cfg.dense_intermediate / if split { 2 } else { 1 }, t)?))
+                let layout = &self.native_scratch.get(rank).context("admitted native scratch rank")?[usize::from(!decode)];
+                Some(Rc::new(native_dense::NativeScratch::new(self, layout)?))
             } else { None },
             router_host: Rc::new(RefCell::new(None)),
             // SAFETY: the head workspace lives in every workspace holding the head, which drops first.
@@ -1852,7 +1853,9 @@ impl<'a> GlmEngine<'a> {
         rows: Scalar, cap: &str) -> Result<()> {
         if let Some(native) = self.native_experts.get(rank) {
             let Scalar::I32(rows) = rows else { anyhow::bail!("EXLR8 shared rows must be I32"); };
-            self.on(rank, || native.shared(self.library, index, w, rows as usize, self.stream_of(rank)))
+            let execution = w.native_shared.as_ref().context("EXLR8 lane shared workspace")?;
+            self.on(rank, || native.shared(self.library, index, execution, w.x.buffer,
+                w.shared.buffer, rows as usize, self.stream_of(rank)))
         } else {
             self.ffn_on(rank, w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows)?;
             self.meet_shared_core(rank, index, w, layer, scalar_rows(rows)?)

@@ -9,7 +9,7 @@
 # same libcuteafd_native.so.
 #
 # The exporter runs on the target SM121 device and pre-compiles capacities
-# 1/16/80/256/1024/4096 ahead of runtime. The TP degree is a plan-time role
+# from CUTEAFD_V41_TARGET_ROWS ahead of runtime. The TP degree is a plan-time role
 # property; live row counts are never part of the AOT compile key. TP6 is pure
 # tensor parallelism over the official intermediate 2304: six 384-wide ranks
 # with no storage padding (kernel_intermediate == intermediate == 384).
@@ -39,24 +39,22 @@ set(CUTEAFD_V41_SPARK_TP_EXPERT_TARGETS)
 set(CUTEAFD_V41_SPARK_TP_EXPERT_INCLUDE_DIRS)
 set(CUTEAFD_V41_SPARK_TP_EXPERT_ROWS ${CUTEAFD_V41_TARGET_ROWS})
 set(CUTEAFD_V41_SPARK_TP_EXPERT_ROWS_ARG "${CUTEAFD_V41_TARGET_ROWS_ARG}")
-# All capacities share width-192 arithmetic and ordered slice-to-route reduction.
-# Per-role cache strings so a build can select a width map for TP2, TP3 and TP6
-# independently (for example a capacity-80 candidate) without patching this file.
-# Each value is either a
-# scalar 64/128/192 or a full `capacity:width` map; the exporter validates that a
-# map covers every precompiled capacity exactly once and that widths are
-# 64/128/192, so an invalid override fails the export instead of being silently
-# accepted here. For TP6 the extra `slices * width <= kernel_intermediate`
-# relation (384 % 32 == 0, so 384/64, 384/128 and 384/192 all tile exactly) is
-# checked by the exporter's slice kernel too; an untileable width fails there.
-set(CUTEAFD_V41_SPARK_TP2_SLICE_WIDTH "1:192,16:192,${CUTEAFD_V41_VERIFY_ROWS}:192,256:192,1024:192,4096:192" CACHE STRING
-  "Spark TP2 expert slice width: scalar 64/128/192 or capacity:width map")
-set(CUTEAFD_V41_SPARK_TP3_SLICE_WIDTH "1:192,16:192,${CUTEAFD_V41_VERIFY_ROWS}:192,256:192,1024:192,4096:192" CACHE STRING
-  "Spark TP3 expert slice width: scalar 64/128/192 or capacity:width map")
-set(CUTEAFD_V41_SPARK_TP8_SLICE_WIDTH "1:192,16:192,${CUTEAFD_V41_VERIFY_ROWS}:192,256:192,1024:192,4096:192" CACHE STRING
-  "Spark TP8 expert slice width: scalar 64/128/192 or capacity:width map")
-set(CUTEAFD_V41_SPARK_TP6_SLICE_WIDTH "1:192,16:192,${CUTEAFD_V41_VERIFY_ROWS}:192,256:192,1024:192,4096:192" CACHE STRING
-  "Spark TP6 expert slice width: scalar 64/128/192 or capacity:width map")
+# Derive defaults on every configure; cached maps can retain retired capacities.
+# Explicit CUTEAFD_V41_SPARK_TP{2,3,6,8}_SLICE_WIDTH_OVERRIDE values select a
+# scalar 64/128/192 or full capacity:width map. The exporter validates coverage
+# and tiling, so invalid explicit overrides still fail rather than being repaired.
+set(default_width_map)
+foreach(rows IN LISTS CUTEAFD_V41_TARGET_ROWS)
+  list(APPEND default_width_map "${rows}:192")
+endforeach()
+list(JOIN default_width_map "," default_width_map)
+foreach(world 2 3 6 8)
+  set(width_var "CUTEAFD_V41_SPARK_TP${world}_SLICE_WIDTH")
+  set(${width_var} "${default_width_map}")
+  if(DEFINED ${width_var}_OVERRIDE)
+    set(${width_var} "${${width_var}_OVERRIDE}")
+  endif()
+endforeach()
 
 foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)
   if(tp STREQUAL "tp2")
@@ -110,8 +108,6 @@ foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)
       --rows "${CUTEAFD_V41_SPARK_TP_EXPERT_ROWS_ARG}"
       --width "${width_map}"
       --standard-names
-    COMMAND "${CMAKE_COMMAND}" -E copy
-      "${dir}/v41_expert_variants.h" "${dir}/${variant_header}"
     DEPENDS "${CUTEAFD_V41_CAPACITY_SOURCE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_capacities.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"

@@ -20,9 +20,6 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
     --output-dir "${CUTEAFD_V41_DSPARK_TP2_EXPERT_DIR}" --role dspark_tp2
     --rows "${CUTEAFD_V41_DRAFT_ROWS_ARG}" --width 192 --standard-names
-  COMMAND "${CMAKE_COMMAND}" -E copy
-    "${CUTEAFD_V41_DSPARK_TP2_EXPERT_DIR}/v41_expert_variants.h"
-    "${CUTEAFD_V41_DSPARK_TP2_EXPERT_DIR}/v41_dspark_tp2_expert_variants.h"
   DEPENDS "${CUTEAFD_V41_CAPACITY_SOURCE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_capacities.py" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_spark_tp3_launch_geometry.py"

@@ -417,19 +417,26 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         .ok_or_else(|| anyhow::anyhow!("EXLR8 requires GLM context programs in PROGRAMS.json"))?) }
         else { None };
     let native = crate::plan::exlr8::recognizes(&checkpoint.snapshot)?;
+    let mut dense_scratch = Vec::new();
     let resident = if native {
         let records = crate::plan::exlr8::dense::DenseRecord::inventory(&checkpoint.snapshot)?;
-        (0..gpu_count).map(|rank| crate::plan::exlr8::dense::resident_native(&records,
-            gpu_count, rank, cfg.layers, cfg.heads, cfg.qk_nope_head_dim, cfg.v_head_dim,
-            cfg.kv_lora_rank).map_err(anyhow::Error::from)).collect::<anyhow::Result<Vec<_>>>()?
+        use crate::plan::exlr8::dense::{DensePlan, DenseRole, DenseSelection, resident_native};
+        let selection = DenseSelection::from_hf(&checkpoint.config)?;
+        let selected = records.into_iter().filter_map(|record| match selection.role(&record.tensor, cfg.layers) {
+            Ok(DenseRole::Excluded) => None, Ok(_) => Some(Ok(record)), Err(error) => Some(Err(error)),
+        }).collect::<anyhow::Result<Vec<_>>>()?;
+        let backbone = selection.backbone(&selected, cfg.layers)?;
+        (0..gpu_count).map(|rank| -> anyhow::Result<_> {
+            let plan = DensePlan::for_rank(&selected, gpu_count, rank)?;
+            let scratch_plan = DensePlan::for_rank(&backbone, gpu_count, rank)?;
+            let layouts = crate::families::glm5::native::scratch_layouts(&cfg, &backbone, &scratch_plan,
+                glm::DECODE_ROWS as usize, rows as usize,
+                options.exlr8_prefill_activations == crate::plan::exlr8::PrefillActivations::A8)?;
+            dense_scratch.push(crate::families::glm5::native::scratch_bytes(&layouts)?);
+            Ok(resident_native(&selection, cfg.layers, &plan)?)
+        }).collect::<anyhow::Result<Vec<_>>>()?
     } else { resident_owned(checkpoint, gpu_count, cfg.layers, None)? };
     let lanes = options.prefill_waves;
-    let dense_scratch = if native {
-        let a8 = options.exlr8_prefill_activations == crate::plan::exlr8::PrefillActivations::A8;
-        let bytes = crate::plan::exlr8::dense::lane_charge_bytes(&cfg, gpu_count, glm::DECODE_ROWS as usize,
-            rows as usize, a8);
-        vec![bytes as u64; gpu_count]
-    } else { Vec::new() };
     let mut devices = Vec::new();
     for (rank, groups) in resident.into_iter().enumerate() {
         let mut items: Vec<_> = groups.into_iter().filter(|(group, _, _)| group != "shared_expert")
@@ -667,14 +674,19 @@ mod tests {
                     &vec![256; gpus], 256, sparks, &manifest, None).unwrap();
                 let (a16, a16_placement) = plan(PrefillActivations::A16);
                 let (a8, a8_placement) = plan(PrefillActivations::A8);
-                let (heads, inter) = (cfg.heads / gpus, cfg.dense_intermediate / gpus);
-                let records = dense::a8_scratch_bytes(&cfg, heads, inter, rows as usize) as u64;
+                let inventory = dense::DenseRecord::inventory(dir.path()).unwrap();
+                let owned = dense::DensePlan::for_rank(&inventory, gpus, 0).unwrap();
+                let layouts = crate::families::glm5::native::scratch_layouts(&cfg, &inventory, &owned,
+                    glm::DECODE_ROWS as usize, rows as usize, true).unwrap();
+                let records = layouts[1].linear.records.unwrap() as u64;
                 assert!(records > 0);
                 let context = format!("{gpus} RTX/{sparks} Sparks/{rows} rows/{lanes} lanes");
                 for gpu in 0..gpus {
                     // Every slot shares one prefill scratch and its records (#762).
-                    assert_eq!(scratch(&a16, gpu), (dense::scratch_bytes(&cfg, heads, inter, glm::DECODE_ROWS as usize)
-                        + dense::scratch_bytes(&cfg, heads, inter, rows as usize)) as u64, "{context}");
+                    let owned = dense::DensePlan::for_rank(&inventory, gpus, gpu).unwrap();
+                    let layouts = crate::families::glm5::native::scratch_layouts(&cfg, &inventory, &owned,
+                        glm::DECODE_ROWS as usize, rows as usize, false).unwrap();
+                    assert_eq!(scratch(&a16, gpu), crate::families::glm5::native::scratch_bytes(&layouts).unwrap(), "{context}");
                     assert_eq!(scratch(&a8, gpu), scratch(&a16, gpu) + records, "{context} gpu {gpu}");
                 }
                 // The automatic pool takes what is left, so it absorbs the records (never grows) ...

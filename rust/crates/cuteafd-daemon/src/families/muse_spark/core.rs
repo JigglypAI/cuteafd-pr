@@ -73,7 +73,7 @@ impl<'a> CorePrograms<'a> {
     fn projection(&self, weights: &CoreWeights<'_>, output: ProjectionOutput) -> Result<&Projection<'a>> {
         let key = projection_key(&cuteafd_loader::formats::trellis_core::CoreWeightLayout {
             stem: String::new(), side: weights.side, rank: 0, ranks: 1, shape: weights.shape, bytes: 0,
-            codebook: weights.codebook });
+            bits: weights.bits, codebook: weights.codebook });
         self.projections.get(&(key, output)).with_context(|| format!("Muse K6 program {key:?} {output:?} not admitted"))
     }
 

@@ -13,7 +13,7 @@ use crate::shared::{
     spark_intake::SparkLink,
 };
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
+use cuteafd_core::{ExpertGeometry, SparkEndpoint};
 use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use cuteafd_hostcache::copy::StubCopyEngine;
 use cuteafd_loader::{
@@ -33,6 +33,8 @@ use std::{cell::RefCell, net::SocketAddr, os::unix::fs::FileExt, path::PathBuf};
 const H: usize = 4096;
 const FP8_REVISION: &str = "364b3b03fed2477aa0953fe855a2c4c8c48ee3cc";
 const NVFP4_REVISION: &str = "bc246cc2848e17b37f377eda8fd825c5b3018d1f";
+/// wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6, immutable published revision.
+const EXL3_REVISION: &str = "83d47a384eabc07ea6fcfaac4779b0e5f013ce89";
 const BF16_REVISION: &str = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1";
 
 #[derive(Debug, Clone, clap::Args)]
@@ -177,7 +179,7 @@ fn save_diagnostics(
 
 fn selection(last: usize, peers: usize, hosted: &[usize], nll: bool) -> Result<()> {
     ensure!((3..=91).contains(&last), "Step-5 golden supports target layers 3..91");
-    ensure!(cuteafd_core::tp_units::spark_package_worlds("step5", "fp8").contains(&peers), "Step-5 golden needs a shared width-class Spark recipe");
+    ensure!(peers > 0, "Step-5 golden needs real Spark experts");
     let final_routed = last.min(90);
     ensure!(hosted == (3..=final_routed).collect::<Vec<_>>(),
         "Step-5 golden hosted experts must exactly cover layers 3..{final_routed}");
@@ -452,25 +454,30 @@ pub(super) fn request(
     Ok(request)
 }
 
-fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<(SparkWorld, TcpTransportConfig)> {
+fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
+    -> Result<(SparkWorld, TcpTransportConfig, super::experts::StepExperts)> {
     let world = SparkWorld::canonical(args.peers.len())?;
     let packages = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SPARK_PACKAGES")?);
     let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
-    let format = catalog.fp8().context("Step-5 golden requires native expert headers")?.format();
+    let format = super::experts::StepExperts::from_catalog(&catalog)?;
     let metadata: Value = serde_json::from_slice(&std::fs::read(
-        packages.join("fp8").join(format.package_name("step5")).join("manifest.json"),
-    )?)?;
-    let layout = &metadata["layouts"][format!("tp{}", args.peers.len())];
-    ensure!(
-        layout["hidden"] == H
-            && layout["experts"] == 352
-            && layout["top_k"] == 8
-            && layout["intermediate"] == 1536
-            && layout["slice"] == 1536 / args.peers.len()
-            && layout["tp"] == args.peers.len(),
-        "sealed Step-5 FP8 TP geometry"
-    );
-    let exports = super::serve::package_exports(&serde_json::json!({"layouts": {"tp": layout.clone()}}))?;
+        format.package_manifest(&packages.join("lib"))?)?)?;
+    let exports = match &format {
+        super::experts::StepExperts::Native(_) => {
+            let layout = &metadata["layouts"][format!("tp{}", args.peers.len())];
+            ensure!(
+                layout["hidden"] == H
+                    && layout["experts"] == 352
+                    && layout["top_k"] == 8
+                    && layout["intermediate"] == 1536
+                    && layout["slice"] == 1536 / args.peers.len()
+                    && layout["tp"] == args.peers.len(),
+                "sealed Step-5 FP8 TP geometry"
+            );
+            super::serve::package_exports(&serde_json::json!({"layouts": {"tp": layout.clone()}}))?
+        }
+        super::experts::StepExperts::Exl3(_) => format.exports(&metadata)?,
+    };
     let unit = args.prefill_units.unwrap_or(rows);
     let config = TcpTransportConfig::default();
     SparkAdmission::plan(
@@ -486,30 +493,18 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<
         args.peers.len(),
         None,
         super::serve::spark_model(&exports,
-            SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: if format.bf16_input() { SparkIngress::Bf16 } else { SparkIngress::Native }, partial_reply_bytes: None },
+            SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: format.ingress(), partial_reply_bytes: None },
             u64::from(args.prefill_waves), 1, config.max_frame_bytes)?,
     )?
     .select(&args.peers)?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers,
-        SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: if format.bf16_input() { SparkIngress::Bf16 } else { SparkIngress::Native }, partial_reply_bytes: None }, 1)?;
-    Ok((world, config))
+        SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: format.ingress(), partial_reply_bytes: None }, 1)?;
+    Ok((world, config, format))
 }
 
 fn link<'a>(device: Device<'a>, args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<RefCell<SparkLink<'a>>> {
-    let (world, config) = expert_admission(args, rows, layers)?;
-    let warm = request(
-        3,
-        rows,
-        ExpertV2Dtype::Bf16,
-        (0..rows * 8)
-            .map(|i| ExpertProtocolV2RouteEntry {
-                row_index: (i / 8) as u32,
-                expert_id: (i % 352) as u32,
-                gate_weight: 0.,
-            })
-            .collect(),
-        vec![0; rows * H * 2].into(),
-    )?;
+    let (world, config, format) = expert_admission(args, rows, layers)?;
+    let warm = super::execution::bootstrap_request(rows, 17, &format, layers)?;
     // The widest wave sizes every rank's rings and the exchange staging.
     let mut link = SparkLink::new(device.library, world, &args.peers, u32::try_from(rows)?, config, H * 2)?;
     link.bootstrap(&warm)?;
@@ -587,7 +582,7 @@ fn check_prefix_state<'a>(
     kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     input: &Allocation<'a>, link: &RefCell<SparkLink<'a>>, available: usize,
 ) -> Result<()> {
-    let shape = Step5CacheLayout::new(cfg, 1, tokens.len() as u64, 0, tokens.len() as u64, kv_format)?;
+    let shape = Step5CacheLayout::new(cfg, 1, tokens.len() as u64, 0, tokens.len() as u64, tokens.len() as u64, kv_format)?;
     prefix_state_bytes(&shape, tokens.len())?;
     let pages = tokens.len().div_ceil(64) * 4 + 4;
     for frontier in PREFIX_FRONTIERS {
@@ -707,7 +702,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
     if let Some(peer) = args.split_device {
         let devices = [args.device, peer].map(|id| Device { library: &library, id });
         let ownership = split_ownership(cfg, rows)?;
-        let layout = Step5CacheLayout::for_execution(cfg, &ownership, rows as u64, 0, rows as u64, args.kv_cache)?;
+        let layout = Step5CacheLayout::for_execution(cfg, &ownership, rows as u64, 0, rows as u64, rows as u64, args.kv_cache)?;
         let mut available = [0; 2];
         let mut reservations = [0; 2];
         let mut cache_bytes = [0; 2];
@@ -745,7 +740,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
     } else {
         let device = Device { library: &library, id: args.device };
         let available = library.cuda_memory_info()?.0 as u64;
-        let layout = Step5CacheLayout::new(cfg, 1, rows as u64, 0, rows as u64, args.kv_cache)?;
+        let layout = Step5CacheLayout::new(cfg, 1, rows as u64, 0, rows as u64, rows as u64, args.kv_cache)?;
         let cache_bytes = layout.ranks[0].bytes + layout.geometry.ranks[0].persistent_unit_bytes * pages;
         let staging_bytes = Staging::bytes(&layout, 0)? as u64;
         let reserved = cache_bytes + staging_bytes + (rows * H * 4) as u64 + (4u64 << 30);
@@ -782,7 +777,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
 }
 
 fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
-    reference: Reference, layers: &[usize]) -> Result<()> {
+    reference: Reference, layers: &[usize], format: &super::experts::StepExperts) -> Result<()> {
     use super::execution::Execution;
     use crate::shared::spark_intake::SparkLink;
     use std::sync::Arc;
@@ -809,7 +804,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         && reference.hidden.is_empty()),
         "Step-5 golden prefill units compare logits, not retained per-layer hidden states");
     let ownership = split_ownership_lanes(cfg, unit, waves as u64)?;
-    let layout = Step5CacheLayout::for_execution(cfg, &ownership, rows as u64, 0, rows as u64, args.kv_cache)?;
+    let layout = Step5CacheLayout::for_execution(cfg, &ownership, rows as u64, 0, rows as u64, rows as u64, args.kv_cache)?;
     if args.check_headers { println!("Step-5 shared headers/reference validated: rows={rows} ranks=2; no CUDA or numerical qualification"); return Ok(()); }
     cuteafd_core::set_expert_geometry(ExpertGeometry::STEP5)
         .map_err(|_| anyhow::anyhow!("Step-5 golden requires an isolated process"))?;
@@ -835,7 +830,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
                 .and_then(|pages| active.checked_add(pages)))
             .context("Step-5 shared cache overflow")?;
         staging_bytes[rank] = Staging::bytes(&layout, rank)? as u64;
-        let pending = crate::shared::inventory::pending_code(&library, devices[rank].id, rank, true, "step5", "fp8", &selected)?;
+        let pending = crate::shared::inventory::pending_code(&library, devices[rank].id, rank, true, "step5", &format.package_name(), &selected)?;
         let hops = cuteafd_loader::placement::hop_buffer_bytes(ownership.execution().hops(), &ownership.execution().spec(), 2)
             .context("Step-5 shared hop charge")?;
         // Eight peer receive slots, hop buffers/control, intake construction,
@@ -856,13 +851,13 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         RefCell::new(CacheRank::new(devices[1], layout, 1, 1, 0, pages, cache_bytes[1] as usize)?)];
     let stages = [Staging::new_for_units(devices[0], &programs, &caches[0].borrow(), staging_bytes[0] as usize, 1, unit)?,
         Staging::new_for_units(devices[1], &programs, &caches[1].borrow(), staging_bytes[1] as usize, 1, unit)?];
-    let (world, config) = expert_admission(args, rows, layers)?;
+    let (world, config, format) = expert_admission(args, rows, layers)?;
     let transport = devices[0].own(|| {
         let mut link = if waves > 1 {
             SparkLink::new_waves(&library, world, &args.peers, unit as u32, config, H * 2, waves, unit as u32)?
         } else { SparkLink::new(&library, world, &args.peers, unit as u32, config, H * 2)? };
         link.enable_terminal_ownership(library.clone())?;
-        link.bootstrap(&super::execution::bootstrap_request(unit, 17)?)?;
+        link.bootstrap(&super::execution::bootstrap_request(unit, 17, &format, layers)?)?;
         Ok(link)
     })?;
     let family = Step5Prefix::new(vec![&caches[0], &caches[1]])?;
@@ -926,15 +921,19 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     Ok(())
 }
 
-fn checkpoint_identity(revision: Option<&str>, format: cuteafd_loader::formats::fp8_experts::ExpertFormat,
+fn checkpoint_identity(revision: Option<&str>, format: &super::experts::StepExperts,
     fp8_diagnostic: bool) -> Result<()> {
+    use super::experts::StepExperts;
     use cuteafd_loader::formats::fp8_experts::ExpertFormat;
-    ensure!(matches!((revision, format),
-        (Some(FP8_REVISION), ExpertFormat::Fp8Block128)
-        | (Some(NVFP4_REVISION), ExpertFormat::Nvfp4)),
-        "Step-5 golden requires matching pinned native FP8 or NVFP4 revision and expert headers");
-    ensure!(!fp8_diagnostic || format == ExpertFormat::Fp8Block128,
-        "native-FP8 diagnostic reference cannot qualify an NVFP4 checkpoint; use the BF16 root");
+    let pinned = match format {
+        StepExperts::Native(ExpertFormat::Fp8Block128) => revision == Some(FP8_REVISION),
+        StepExperts::Native(ExpertFormat::Nvfp4) => revision == Some(NVFP4_REVISION),
+        StepExperts::Exl3(tiers) => tiers == &[4, 6] && revision == Some(EXL3_REVISION),
+        StepExperts::Native(_) => false,
+    };
+    ensure!(pinned, "Step-5 golden requires a matching pinned FP8, NVFP4 or EXL3 K4/K6 revision and expert headers");
+    ensure!(!fp8_diagnostic || format == &StepExperts::Native(ExpertFormat::Fp8Block128),
+        "native-FP8 diagnostic reference cannot qualify an NVFP4 or EXL3 checkpoint; use the BF16 root");
     Ok(())
 }
 
@@ -950,22 +949,26 @@ async fn on_engine_thread(work: impl FnOnce() -> Result<()> + Send + 'static) ->
 fn run(args: GoldenArgs) -> Result<()> {
     diagnostic_selection(&args)?;
     let layers = if args.dump_layer0.is_some() { vec![] } else { selected_layers()? };
-    if args.dump_layer0.is_none() { selection(args.last_layer, args.peers.len(), &layers, args.nll)?; }
+    if args.dump_layer0.is_none() {
+        selection(args.last_layer, args.peers.len(), &layers, args.nll)?;
+        // The world comes from the planner's fit for this checkpoint, not a fixed list.
+        cuteafd_loader::plan::families::step5::spark_world_admitted(&args.snapshot, &args.manifest, args.peers.len())?;
+    }
     let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
-    let format = catalog.fp8().context("Step-5 golden requires native expert headers")?.format();
-    checkpoint_identity(args.snapshot.file_name().and_then(|s| s.to_str()), format,
+    let format = super::experts::StepExperts::from_catalog(&catalog)?;
+    checkpoint_identity(args.snapshot.file_name().and_then(|s| s.to_str()), &format,
         args.fp8_diagnostic_reference)?;
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = Config::parse(&checkpoint)?;
     let reference = reference(&args, cfg.vocab)?;
     if args.dump_layer0.is_some() { return layer0_run(&args, &checkpoint, &cfg, reference); }
-    if args.split_device.is_some() { return split_run(&args, &checkpoint, &cfg, reference, &layers); }
+    if args.split_device.is_some() { return split_run(&args, &checkpoint, &cfg, reference, &layers, &format); }
     let Reference { tokens, expected, positions, hidden, final_norm } = reference;
     let reference_kind = if args.fp8_diagnostic_reference { "native-FP8 diagnostic" } else { "BF16-root diagnostic" };
     let rows = tokens.len();
     ensure!(!args.prefix_state || (args.nll && args.last_layer == 91),
         "Step-5 prefix state check requires the complete target");
-    let layout = Step5CacheLayout::new(&cfg, 1, rows as u64, 0, rows as u64, args.kv_cache)?;
+    let layout = Step5CacheLayout::new(&cfg, 1, rows as u64, 0, rows as u64, rows as u64, args.kv_cache)?;
     if args.check_headers {
         println!("Step-5 headers/reference validated: rows={rows} layers=0..{} TP{}; no CUDA or numerical qualification", args.last_layer, args.peers.len());
         return Ok(());
@@ -991,7 +994,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         0,
         false,
         "step5",
-        &format.package_name("step5"),
+        &format.package_name(),
         &selected,
     )?;
     let (free, _) = library.cuda_memory_info()?;
@@ -1368,7 +1371,7 @@ mod tests {
         assert!(selection(3, 6, &[3], false).is_ok());
         assert!(selection(3, 6, &[3, 4], false).is_err());
         assert!(selection(4, 6, &[4, 3], false).is_err());
-        assert!(selection(3, 2, &[3], false).is_err());
+        assert!(selection(3, 0, &[3], false).is_err());
         assert!(selection(3, 6, &[3], true).is_err());
     }
     fn reference_meta() -> Value {
@@ -1578,19 +1581,27 @@ mod tests {
 
     #[test]
     fn golden_checkpoint_revision_and_native_format_must_agree() -> Result<()> {
+        use super::super::experts::StepExperts;
         use cuteafd_loader::formats::fp8_experts::ExpertFormat;
-        checkpoint_identity(Some(FP8_REVISION), ExpertFormat::Fp8Block128, false)?;
-        checkpoint_identity(Some(FP8_REVISION), ExpertFormat::Fp8Block128, true)?;
-        checkpoint_identity(Some(NVFP4_REVISION), ExpertFormat::Nvfp4, false)?;
+        let native = |format| StepExperts::Native(format);
+        checkpoint_identity(Some(FP8_REVISION), &native(ExpertFormat::Fp8Block128), false)?;
+        checkpoint_identity(Some(FP8_REVISION), &native(ExpertFormat::Fp8Block128), true)?;
+        checkpoint_identity(Some(NVFP4_REVISION), &native(ExpertFormat::Nvfp4), false)?;
+        checkpoint_identity(Some(EXL3_REVISION), &StepExperts::Exl3(vec![4, 6]), false)?;
         for (revision, format, diagnostic) in [
-            (Some(FP8_REVISION), ExpertFormat::Nvfp4, false),
-            (Some(NVFP4_REVISION), ExpertFormat::Fp8Block128, false),
-            (Some(NVFP4_REVISION), ExpertFormat::Nvfp4, true),
-            (Some(BF16_REVISION), ExpertFormat::Bf16, false),
-            (Some("unpinned"), ExpertFormat::Nvfp4, false),
-            (None, ExpertFormat::Fp8Block128, false),
+            (Some(FP8_REVISION), native(ExpertFormat::Nvfp4), false),
+            (Some(NVFP4_REVISION), native(ExpertFormat::Fp8Block128), false),
+            (Some(NVFP4_REVISION), native(ExpertFormat::Nvfp4), true),
+            (Some(BF16_REVISION), native(ExpertFormat::Bf16), false),
+            (Some("unpinned"), native(ExpertFormat::Nvfp4), false),
+            (None, native(ExpertFormat::Fp8Block128), false),
+            // Only the published revision and matching expert tiers qualify.
+            (Some("0123456789abcdef0123456789abcdef01234567"), StepExperts::Exl3(vec![4, 6]), false),
+            (Some(EXL3_REVISION), StepExperts::Exl3(vec![4, 6]), true),
+            (Some(EXL3_REVISION), StepExperts::Exl3(vec![3, 4]), false),
+            (None, StepExperts::Exl3(vec![4, 6]), false),
         ] {
-            assert!(checkpoint_identity(revision, format, diagnostic).is_err());
+            assert!(checkpoint_identity(revision, &format, diagnostic).is_err());
         }
         Ok(())
     }

@@ -48,9 +48,11 @@ ${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc\"
 ")
   set(objects)
   set(headers)
-  set(width_rows 1 16 80 256 1024 4096)
   if(family STREQUAL "v41")
     set(width_rows ${CUTEAFD_V41_TARGET_ROWS})
+  else()
+    # V4 Flash/Pro retain their independent m80 verifier capacity.
+    set(width_rows 1 16 80 256 1024 4096)
   endif()
   list(JOIN width_rows "," width_rows_arg)
   foreach(rows IN LISTS width_rows)
@@ -73,8 +75,6 @@ ${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc\"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
       --geometry "${family}" --role "${role}" --output-dir "${dir}"
       --rows "${width_rows_arg}" --width "${slice}" --standard-names
-    COMMAND "${CMAKE_COMMAND}" -E copy
-      "${dir}/v41_expert_variants.h" "${dir}/${variant_header}"
     DEPENDS "${CUTEAFD_V41_CAPACITY_SOURCE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_capacities.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"

@@ -67,6 +67,8 @@ pub struct LayoutOptions {
     pub decode_lanes: u8,
     /// Native EXLR8 trellis prefill activations: A8 also charges every prefill lane's MX8 records.
     pub exlr8_prefill_activations: crate::plan::exlr8::PrefillActivations,
+    /// Preserve explicit selection separately from the family's automatic rule.
+    pub exlr8_prefill_pin: Option<crate::plan::exlr8::PrefillActivations>,
     /// Rows of a GLM 5.3 Flash decode or verify step (`--decode-rows`): 64, or 128 with the wide
     /// `_m128` programs (one GPU). The decode workspace, the token selector and the speculative
     /// replay records hold this many rows.
@@ -174,13 +176,10 @@ pub struct LayoutOptions {
     pub qwen_representation: crate::families::qwen4::resident::Qwen4Representation,
     /// Qwen immutable attention scratch override.
     pub qwen_attention_plan_rows: Option<usize>,
-    /// Whole routed backbone layers resident on the coordinator.
-    pub local_expert_layers: Option<usize>,
     /// Families on the shared solver (V4): the `--rtx-expert-layers`
     /// spelling (`auto|all|N`), resolved against the checkpoint's routed-expert
     /// layer count by each family. A fixed onboard makes the KV pool the
-    /// output. `None` takes the family default; `local_expert_layers` maps onto
-    /// `Layers(n)` when unset.
+    /// output. `None` takes the family default.
     pub onboard: Option<crate::placement::OnboardSetting>,
     /// V4: force FP32 FFN exchange payloads for prefill as well as TP2 decode.
     pub exchange_f32: bool,
@@ -226,17 +225,11 @@ impl LayoutOptions {
         self.draft_sequences.unwrap_or(crate::families::mimo_v2::draft_representation::DEFAULT_DRAFT_SEQUENCES as u64)
     }
 
-    /// The unresolved onboard request: `--rtx-expert-layers` wins over the
-    /// `--local-expert-layers N` alias.
-    pub fn requested_onboard(&self) -> Option<crate::placement::OnboardSetting> {
-        self.onboard.or(self.local_expert_layers.map(crate::placement::OnboardSetting::Layers))
-    }
-
     /// The requested onboard resolved against the target's routed-expert
     /// layer count (`all` becomes exactly that count); `None` leaves the
     /// family default in charge.
     pub fn resolve_onboard(&self, routed: usize) -> Option<crate::placement::Onboard> {
-        self.requested_onboard().map(|setting| setting.resolve(routed))
+        self.onboard.map(|setting| setting.resolve(routed))
     }
 }
 
@@ -262,6 +255,7 @@ impl Default for LayoutOptions {
             prefill_reserve_rows: None,
             decode_lanes: 1,
             exlr8_prefill_activations: Default::default(),
+            exlr8_prefill_pin: None,
             glmf_decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS,
             glmf_representation: Default::default(),
             glmf_kda_state: Default::default(),
@@ -317,7 +311,6 @@ impl Default for LayoutOptions {
             qwen_representation: crate::families::qwen4::resident::Qwen4Representation {
                 fp8_projections: false, fp8_head: true },
             qwen_attention_plan_rows: None,
-            local_expert_layers: None,
             onboard: None,
             exchange_f32: false,
             glmf_kda_fp32_partials: false,
@@ -427,6 +420,10 @@ pub fn spark_slot_bytes(family: &str, unit_rows: u64) -> u64 {
         // Qwen K4.5 TP1: eight retained capacity manifests plus wire/routes,
         // 674,287,636 bytes; every TP2/3/4 rank is smaller (see census test).
         "qwen4" => 644 * MIB,
+        // Step-5 EXL3 K4/K6 SM121/48, widest slice (TP2 width 768): eight
+        // retained capacity manifests plus 4096 rows of K32 wire/routes.
+        // All TP3..6 and compact companions are smaller (see census test).
+        "step5" => 585_378_624,
         _ => 0,
     };
     at_4096.saturating_mul(unit_rows.max(4096)).div_ceil(4096)
@@ -544,6 +541,34 @@ mod selected_spark_io_tests {
         assert_eq!(retained + wire_routes, 674_287_636);
         for rows in [64, 2048, 2752, 4096] {
             assert!(spark_slot_bytes("qwen4", rows) >= retained + wire_routes);
+        }
+    }
+
+    #[test]
+    fn step5_exl3_slot_matches_sm121_retained_capacity_census() {
+        use serde_json::json;
+        // exl3-step5-k46/tp2-rank0, SM121/48, fork 8501694d (2026-11-01).
+        let arenas = [("rotation_gate", 268_435_456), ("rotation_up", 5_242_880),
+            ("fc1", 100_663_296), ("activated", 50_331_648), ("output", 33_554_432),
+            ("packed_route_indices", 219_776), ("block_expert_ids", 3_436),
+            ("packed_route_count", 16), ("expert_offsets", 1_412), ("expert_counts", 1_408),
+            ("fc1_scratch", 12_582_912), ("fc2_scratch", 12_582_912)];
+        let manifests = cuteafd_core::EXL3_CAPACITIES.into_iter().map(|rows| {
+            let mut buffers = serde_json::Map::new();
+            for (name, bytes) in arenas {
+                buffers.insert(name.into(), json!({"allocation": name, "bytes": bytes,
+                    "dtype": "census", "zero_on_create": false}));
+            }
+            buffers.insert("workspace".into(), json!({"allocation": "workspace", "bytes": 776,
+                "dtype": "i32", "zero_on_create": true}));
+            json!({"capacity": rows, "hidden": 4096, "trellis_lut": {"bytes": 4096}, "buffers": buffers})
+        }).collect::<Vec<_>>();
+        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true).unwrap();
+        assert_eq!(retained, 567_814_976);
+        let slot = retained + 4096 * (4096 + 4096 / 32 + 8 * 8);
+        assert_eq!(slot, 585_378_624);
+        for rows in [64, 2048, 2752, 4096] {
+            assert_eq!(spark_slot_bytes("step5", rows), slot);
         }
     }
 

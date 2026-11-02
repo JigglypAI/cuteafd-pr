@@ -115,7 +115,7 @@ pub fn staging_bytes(layout: &Step5CacheLayout, rank: usize, sequences: usize) -
         .context("Step-5 staging rank")?
         .regions
         .len();
-    let step = usize::try_from(layout.ring.step)?;
+    let step = usize::try_from(layout.step_rows)?;
     let rows = retained_wave_rows(step, sequences)?;
     let regions = (step + 7) / 8;
     let metadata = regions
@@ -181,6 +181,98 @@ pub struct RuntimeInputs {
     pub peer_diagnostics: bool,
     pub pending_code: Vec<u64>,
     pub startup: Vec<Demand>,
+    /// RTX expert onboarding (every routed format; pool-first `Auto` by
+    /// default); `None` only when onboarding is explicitly off.
+    pub onboard: Option<OnboardInputs>,
+}
+
+/// The Step TP2 exchange a routed format runs: EXL3 halves take FP8 K32 wire
+/// rows and exchange F32 partials (one rounding, as a Spark reply); fp8moe
+/// halves take BF16 rows and exchange BF16 partials (as GLM Flash FP8 ships:
+/// each half rounds to BF16 before the rank-order sum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tp2Exchange { Exl3, Fp8 }
+
+impl Tp2Exchange {
+    pub fn of(catalog: &crate::OfficialV41Catalog) -> Self {
+        if catalog.exl3().is_some() { Self::Exl3 } else { Self::Fp8 }
+    }
+    /// Bytes of one exchanged partial element.
+    pub fn partial_bytes(self) -> usize { match self { Self::Exl3 => 4, Self::Fp8 => 2 } }
+    /// Input bytes per row a whole layer's owner broadcasts.
+    pub fn input_row_bytes(self, hidden: usize) -> usize {
+        match self { Self::Exl3 => hidden + hidden / 32, Self::Fp8 => hidden * 2 }
+    }
+}
+
+/// One rank's Step TP2 onboarding exchange planes beside the package arena:
+/// per prefill lane a routed partial, the peer's partial as received (one
+/// plane for head-split layers, one for a whole layer's owner, so the two
+/// exchanges never share storage) and the route broadcast scratch (packed
+/// top-8 routes plus the input rows). The daemon allocates exactly these.
+pub fn tp2_exchange_bytes(unit_rows: usize, lanes: usize, exchange: Tp2Exchange) -> Result<u64> {
+    const H: usize = 4096;
+    ensure!((1..=4096).contains(&unit_rows) && (1..=4).contains(&lanes), "Step-5 TP2 exchange geometry");
+    let plane = |bytes: usize| bytes.max(256) as u64;
+    let section = unit_rows * 8 * 4;
+    let routes = (section.next_multiple_of(16) + section).next_multiple_of(16);
+    let per_lane = 3 * plane(unit_rows * H * exchange.partial_bytes())
+        + plane(routes + unit_rows * exchange.input_row_bytes(H));
+    (lanes as u64).checked_mul(per_lane).context("Step-5 TP2 exchange overflow")
+}
+
+/// Why NVFP4 Step plans onboard nothing (and refuse an explicit layer count).
+pub const NVFP4_ONBOARDING_DEPRECATED: &str = "Step-5 NVFP4 is deprecated (its cards retire this release): \
+    RTX expert onboarding is not built for it; its routed experts stay on the Sparks";
+/// FP8 Step is qualified only on two RTX (2 RTX + 6 Sparks); there its
+/// onboarded layers split TP2. No whole-layer fp8moe executor exists.
+pub const FP8_ONBOARDING_TWO_RTX: &str = "Step-5 FP8 onboards TP2 on two RTX only (its qualified card): \
+    its routed experts stay on the Sparks";
+
+/// The named reason a routed format does not onboard here, or None.
+pub fn onboarding_unavailable(catalog: &crate::OfficialV41Catalog, gpus: usize) -> Option<&'static str> {
+    use crate::formats::fp8_experts::ExpertFormat;
+    match catalog.fp8().map(|fp8| fp8.format()) {
+        Some(ExpertFormat::Nvfp4) => Some(NVFP4_ONBOARDING_DEPRECATED),
+        Some(_) if gpus != 2 => Some(FP8_ONBOARDING_TWO_RTX),
+        _ => None,
+    }
+}
+
+/// Header-exact costs of the routed layers in order (whole, and TP2 halves on
+/// two GPUs) and the installed package arenas; the shared solver chooses how
+/// many layers the RTX keeps (pool first).
+#[derive(Debug, Clone)]
+pub struct OnboardInputs {
+    pub costs: Vec<ExpertCost>,
+    /// One GPU: the whole-layer (TP1) arena.
+    pub workspace: u64,
+    /// Two GPUs: each rank's TP2 arena.
+    pub tp2_workspace: [u64; 2],
+    pub mode: Onboard,
+}
+
+impl OnboardInputs {
+    /// The shared RTX onboarding inputs for any routed format: whole layers on
+    /// one GPU, TP2 halves over two, at the admitted unit rows.
+    pub fn new(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, unit_rows: usize,
+        gpus: usize, lanes: usize, mode: Onboard) -> Result<Option<Self>> {
+        use crate::placement::rtx_onboard::{expert_costs, expert_workspace};
+        ensure!(matches!(gpus, 1 | 2), "Step-5 RTX onboarding needs one or two GPUs");
+        if mode == Onboard::Layers(0) { return Ok(None); }
+        if let Some(reason) = onboarding_unavailable(catalog, gpus) {
+            ensure!(mode == Onboard::Auto, "{reason}");
+            return Ok(None);
+        }
+        let rows = unit_rows as u64;
+        let (workspace, tp2_workspace) = if gpus == 2 {
+            let half = expert_workspace(catalog, manifest, rows, 2, "step5")?
+                .checked_add(tp2_exchange_bytes(unit_rows, lanes, Tp2Exchange::of(catalog))?)
+                .context("Step-5 TP2 workspace overflow")?;
+            (0, [half; 2])
+        } else { (expert_workspace(catalog, manifest, rows, 1, "step5")?, [0; 2]) };
+        Ok(Some(Self { costs: expert_costs(catalog, gpus == 2)?, workspace, tp2_workspace, mode }))
+    }
 }
 
 pub struct Admission {
@@ -333,9 +425,10 @@ impl RuntimeInputs {
 
 pub fn admit(checkpoint: &Checkpoint, inputs: &RuntimeInputs) -> Result<Admission> {
     let cfg = Config::parse(checkpoint)?;
+    let contract = super::coordinator::CoordinatorContract::from_checkpoint(checkpoint)?;
     admit_with(&cfg, inputs, |ownership| {
         (0..ownership.ranks())
-            .map(|rank| super::native::rank_admission(checkpoint, ownership, rank, inputs.unit_rows(),
+            .map(|rank| super::native::rank_admission_from_contract(&contract, &cfg, ownership, rank, inputs.unit_rows(),
                 inputs.rows, inputs.logit_rows()))
             .collect()
     })
@@ -350,15 +443,29 @@ pub fn forecast_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usiz
 /// Includes native stage weights, private workspace, independent histories and
 /// the actual host-aware staging mark count before any live allocation.
 pub fn admit_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize) -> Result<Admission> {
-    if depth == 0 { return admit(checkpoint, inputs); }
+    let contract = super::coordinator::CoordinatorContract::from_checkpoint(checkpoint)?;
+    admit_mtp_with_contract(checkpoint, inputs, depth, &contract)
+}
+
+/// Reuses launch-scoped immutable headers; every candidate keeps its own rank layout.
+pub fn admit_mtp_with_contract(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize,
+    contract: &super::coordinator::CoordinatorContract) -> Result<Admission> {
     let cfg = Config::parse(checkpoint)?;
+    if depth == 0 {
+        return admit_with(&cfg, inputs, |ownership| (0..ownership.ranks()).map(|rank|
+            super::native::rank_admission_from_contract(contract, &cfg, ownership, rank,
+                inputs.unit_rows(), inputs.rows, inputs.logit_rows())).collect());
+    }
     ensure!((1..=cfg.mtp).contains(&depth) && inputs.unit_rows() > depth,
         "Step-5 predictor depth must fit checkpoint and row capacity");
-    let weights = super::coordinator::RankWeightLayout::for_mtp(checkpoint, depth)?.resident_bytes;
+    // Native K4 predictor owners keep their own projection scratch beside their weights.
+    let weights = super::coordinator::RankWeightLayout::mtp_from_contract(checkpoint, contract, depth)?.resident_bytes
+        .checked_add(super::native::mtp_native_scratch_from_contract(checkpoint, contract, depth, inputs.unit_rows())?)
+        .context("Step-5 predictor native forecast overflow")?;
     let workspace = super::native::mtp_forecast_workspace(inputs.unit_rows(), depth, inputs.kv_format)?;
     admit_depth_with(&cfg, inputs, depth, |ownership| {
         (0..ownership.ranks()).map(|rank| {
-            let mut native = super::native::rank_admission(checkpoint, ownership, rank, inputs.unit_rows(),
+            let mut native = super::native::rank_admission_from_contract(&contract, &cfg, ownership, rank, inputs.unit_rows(),
                 inputs.rows, inputs.logit_rows())?;
             if rank == usize::from(ownership.execution().spec().head_gpu) {
                 native.immutable = native.immutable.checked_add(weights)
@@ -427,7 +534,8 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
         (initial, inputs.context.min(initial)),
         |tokens, &context| {
             let cache =
-                Step5CacheLayout::for_execution(cfg, &ownership, context, depth, inputs.rows as u64, inputs.kv_format)?;
+                Step5CacheLayout::for_execution(cfg, &ownership, context, depth, inputs.unit_rows() as u64,
+                    inputs.rows as u64, inputs.kv_format)?;
             let mark_bytes = usize::try_from(checked_sum(cache.ranks.iter().map(|r| r.bytes))?)?;
             let marks = inputs.marks.slots(mark_bytes);
             let mut fixed = Vec::new();
@@ -551,12 +659,14 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                     extra: vec![],
                     context_indexer: false,
                     colocate: None,
-                    experts: cfg.moe[layer].then_some(ExpertCost {
-                        whole: Bytes2::default(),
-                        half: [Bytes2::default(); 2],
-                        tp2: false,
-                        spark_ok: true,
-                    }),
+                    experts: cfg.moe[layer].then(|| inputs.onboard.as_ref()
+                        .and_then(|onboard| onboard.costs.get(layer - 3).copied())
+                        .unwrap_or(ExpertCost {
+                            whole: Bytes2::default(),
+                            half: [Bytes2::default(); 2],
+                            tp2: false,
+                            spark_ok: true,
+                        })),
                     modes: vec![mode],
                 })
                 .collect();
@@ -581,10 +691,12 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                 fixed: fixed.clone(),
                 startup: inputs.startup.clone(),
                 movables: vec![],
-                expert_workspace: 0,
-                tp2_workspace: [0; 2],
-                onboard: Onboard::Auto,
-                expert_gpus: 0,
+                expert_workspace: inputs.onboard.as_ref().map_or(0, |o| o.workspace),
+                tp2_workspace: inputs.onboard.as_ref().map_or([0; 2], |o| o.tp2_workspace),
+                onboard: inputs.onboard.as_ref().map_or(Onboard::Auto, |o| o.mode),
+                // One GPU holds whole layers; two split every onboarded layer
+                // TP2 (the solver's TP2 prefix takes its cap from GPU 0's).
+                expert_gpus: usize::from(inputs.onboard.is_some()),
                 minimum_expert_layers: 0,
                 policy: LayerPolicy {
                     attention: if ranks == 2 {
@@ -634,6 +746,15 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                 ranks,
                 LayerExecutionPlan::new(&placement, inputs.hops())?,
             )?;
+            let onboarded = placement.layers.iter().enumerate()
+                .filter(|(_, l)| matches!(l.experts, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2))
+                .map(|(layer, l)| {
+                    ensure!(l.experts == if ranks == 2 { ExpertHome::RtxTp2 }
+                        else { ExpertHome::RtxWhole { gpu: inputs.hops().entry_gpu } },
+                        "Step-5 onboarded layer {layer}: whole on one GPU, TP2 over two");
+                    Ok(layer)
+                }).collect::<Result<Vec<_>>>()?;
+            let checked_ownership = checked_ownership.with_onboarded(onboarded)?;
             let next_context = context.min(placement.pool_tokens);
             let pages = placement.pool_tokens / 64;
             ensure!(
@@ -728,7 +849,7 @@ mod tests {
             },
             peer_diagnostics: false,
             pending_code: vec![1 << 20; ranks],
-            startup: vec![],
+            startup: vec![], onboard: None,
         }
     }
     fn run(inputs: &RuntimeInputs) -> Result<Admission> {
@@ -741,6 +862,60 @@ mod tests {
                 o.ranks()
             ])
         })
+    }
+
+    #[test]
+    fn reused_header_contract_preserves_every_candidate_and_resolved_plan() -> Result<()> {
+        use super::super::{coordinator::{CoordinatorContract, RankWeightLayout}, native};
+        let fixture = super::super::tests::exl3_snapshot();
+        let checkpoint = Checkpoint::open(fixture.path())?;
+        let cfg = Config::parse(&checkpoint)?;
+        let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
+        let mut inputs = inputs(2);
+        inputs.requested_pool = None;
+        inputs.context = EXTENT;
+        inputs.inventory.spark_ranks = 6;
+        inputs.kv_format = crate::families::qwen4::Qwen4KvCache::Fp8;
+        let groups = cfg.full[..cfg.layers].iter().map(|&full| (full, None)).collect::<Vec<_>>();
+        let mut recipes = Vec::new();
+        for boundary in attention::owner_boundaries(&groups, false) {
+            let owners = (0..cfg.layers).map(|layer| u8::from(layer >= boundary)).collect::<Vec<_>>();
+            let ownership = inputs.ownership_for(&cfg, &owners)?;
+            let mut legacy = Vec::new();
+            let mut reused = Vec::new();
+            for rank in 0..2 {
+                // Reproduce the old independent header builds, not the optimized wrapper.
+                let old_contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
+                let old_layout = RankWeightLayout::for_execution(&checkpoint, rank, &ownership)?;
+                legacy.push(native::rank_admission_for_layout(&old_contract, &cfg, &old_layout,
+                    &ownership, rank, inputs.unit_rows(), inputs.rows, inputs.logit_rows())?);
+                reused.push(native::rank_admission_from_contract(&contract, &cfg, &ownership, rank,
+                    inputs.unit_rows(), inputs.rows, inputs.logit_rows())?);
+            }
+            assert_eq!(legacy, reused, "CSA boundary {boundary}");
+            recipes.push((ownership.execution().modes().to_vec(), legacy, reused));
+        }
+        assert_eq!(recipes.len(), 24);
+        // Replay attested old/new bytes so neither resolved-plan comparison repeats header I/O.
+        let resolve = |old: bool| -> Result<Admission> {
+            let started = std::time::Instant::now();
+            let result = admit_with(&cfg, &inputs, |ownership| {
+                let (_, legacy, reused) = recipes.iter().find(|(modes, _, _)|
+                    modes == ownership.execution().modes()).context("missing CSA candidate")?;
+                Ok(if old { legacy.clone() } else { reused.clone() })
+            })?;
+            assert!(started.elapsed() < std::time::Duration::from_secs(30));
+            Ok(result)
+        };
+        let old = resolve(true)?;
+        let new = resolve(false)?;
+        assert_eq!(serde_json::to_vec(&old.placement)?, serde_json::to_vec(&new.placement)?);
+        assert_eq!(old.ownership.execution().modes(), new.ownership.execution().modes());
+        assert_eq!(old.cache, new.cache);
+        assert_eq!(old.marks, new.marks);
+        assert_eq!(old.reservations, new.reservations);
+        assert_eq!(old.fixed, new.fixed);
+        Ok(())
     }
 
     #[test]
@@ -851,7 +1026,7 @@ mod tests {
             assert_eq!(candidate.cache.ranks[0].mtp_lengths.len(), 3);
             assert!(candidate.cache.ranks[1].mtp_lengths.is_empty());
             let expected = Step5CacheLayout::for_execution(&cfg, &candidate.ownership,
-                candidate.cache.context, 3, inputs.rows as u64, format)?;
+                candidate.cache.context, 3, inputs.unit_rows() as u64, inputs.rows as u64, format)?;
             assert_eq!(candidate.cache, expected);
             for rank in 0..2 {
                 let reservation = Reservation::new(&expected, rank, inputs.sequences as u64,
@@ -1027,7 +1202,7 @@ mod tests {
         assert_eq!(admission.cache.context, admission.placement.pool_tokens);
         assert_eq!(config().max_context, EXTENT);
         let initial =
-            Step5CacheLayout::for_execution(&config(), &admission.ownership, EXTENT, 0, 64, crate::families::qwen4::Qwen4KvCache::Bf16)?;
+            Step5CacheLayout::for_execution(&config(), &admission.ownership, EXTENT, 0, 64, 64, crate::families::qwen4::Qwen4KvCache::Bf16)?;
         assert!(initial.ranks[0].bytes > admission.cache.ranks[0].bytes);
         Ok(())
     }

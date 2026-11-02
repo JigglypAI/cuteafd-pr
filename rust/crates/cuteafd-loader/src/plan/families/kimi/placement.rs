@@ -150,7 +150,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 demands.extend(core::CoreCharges::from_package(cfg, &model.core, rows, unit, manifest)?.demands()?
                     .into_iter().filter(|d| d.group != "Kimi K6 peer receive"));
             }
-            if opts.requested_onboard() != Some(OnboardSetting::Layers(0)) {
+            if opts.onboard != Some(OnboardSetting::Layers(0)) {
                 let package = allocation::expert_package(path)?;
                 tp2_workspace = [allocation::expert_workspace(&package, unit)?; 2];
             }
