@@ -740,6 +740,7 @@ mod tests {
         use crate::shared::qwen::scheduler::DraftState as _;
         use cuteafd_engine::prefix::{After, PrefixFamily, SnapshotKind};
         use super::super::prefix::Placement;
+        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
         let mut args = live_mtp_args();
         args.kv_cache = std::env::var("CUTEAFD_STEP5_KV_CACHE")
             .unwrap_or_else(|_| "bf16".into()).parse()?;
