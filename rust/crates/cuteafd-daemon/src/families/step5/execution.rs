@@ -1538,23 +1538,36 @@ mod tests {
         let fixture = tempfile::tempdir()?;
         testing::write_step5_exl3_snapshot(fixture.path());
         let manifest = testing::step5_native_manifest(fixture.path());
+        testing::install_step5_exl3_rtx_package(&manifest);
         let checkpoint = Checkpoint::inventory(fixture.path())?;
         let cfg = Config::parse(&checkpoint)?;
         let catalog = cuteafd_loader::read_expert_catalog(fixture.path())?;
-        for (gpus, sparks) in [(1, 3), (2, 6)] {
+        for (gpus, sparks, pool, native_mtp) in [
+            (1, 3, None, true), (1, 3, None, false),
+            (1, 3, Some(262_144), false), (2, 6, None, false),
+        ] {
             let report = testing::plan(fixture.path(), &PlanOptions {
                 placement: ExpertPlacement::from_spark_ranks(sparks),
-                draft_ownership: Some(plan::spec::DraftOwnership::None),
+                draft_ownership: Some(if native_mtp { plan::spec::DraftOwnership::NativeMtp }
+                    else { plan::spec::DraftOwnership::None }),
                 layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                     rtx_bytes: vec![96 << 30; gpus], workspace_manifest: Some(manifest.clone()),
-                    ..Default::default() }), ..Default::default()
+                    pool_tokens: pool, ..Default::default() }), ..Default::default()
             })?;
             assert!(report.wip_launchable(), "{:?}", report.hints);
+            let memory = report.memory_layout.as_ref().context("Step fixture memory layout")?;
+            let rtx_free = memory.devices.iter().filter(|device|
+                device.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
+                .map(|device| device.free_bytes()).collect::<Vec<_>>();
+            eprintln!("Step draft {gpus}+{sparks} MTP={native_mtp} requested pool {pool:?}: pool {}, RTX free bytes {rtx_free:?}, notes {:?}, hints {:?}",
+                memory.pool_tokens, memory.notes, report.hints);
             let placement = report.solver_placement.as_ref().context("Step fixture placement")?;
             let onboarded = placement.layers.iter().enumerate().filter_map(|(layer, assignment)|
                 matches!(assignment.experts, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2).then_some(layer))
                 .collect::<Vec<_>>();
-            assert!(!onboarded.is_empty(), "fixture must exercise RTX onboarding");
+            if gpus == 2 || pool.is_some() {
+                assert!(!onboarded.is_empty(), "roomy fixture must exercise RTX onboarding");
+            }
             let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: (H * 4) as u64,
                 rows: 64, lanes: 1, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
             let ownership = ExecutionOwnership::new(&cfg, gpus, LayerExecutionPlan::new(placement, spec)?)?
