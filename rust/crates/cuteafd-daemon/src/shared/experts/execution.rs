@@ -568,8 +568,14 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         }
         let variants = kernels.into_iter().map(|kernel| InstalledExpertVariant::from_queries(
             kernel.info().capacity_rows as usize, |rows| kernel.group_rows_for(rows))).collect::<Result<Vec<_>>>()?;
+        let role = self._weights.layer.role();
+        let exports = if self._weights.is_nvfp4() {
+            self.library.nvfp4_expert_exports(role)?
+        } else {
+            self.library.native_expert_exports(role)?
+        };
         let report = InstalledExpertGrouping::new(loaded, rank, self.live_capacity as usize,
-            ExpertGroupingSelector::Native, variants)?;
+            ExpertGroupingSelector::Native { exports }, variants)?;
         for rows in 0..=self.live_capacity as usize {
             ensure!(report.group_rows(rows)? == self.group_rows(rows)?,
                 "native installed grouping differs from actual selector at rows {rows}");

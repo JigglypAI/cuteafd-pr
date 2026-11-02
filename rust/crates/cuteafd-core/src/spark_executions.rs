@@ -343,7 +343,8 @@ mod segment_input_tests {
 
 /// Capacity contract declared by the installed expert artifact. No family or
 /// canonical row ladder participates in native decode-state admission.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExpertExportCapacities {
     pub capacities: Vec<u32>,
     pub decode: Vec<u32>,
@@ -361,12 +362,21 @@ impl ExpertExportCapacities {
                 .ok_or("invalid expert decode capacity")).collect::<Result<Vec<_>, _>>()?;
         let mut capacities = capacities;
         capacities.sort_unstable();
-        if capacities.is_empty() || capacities.windows(2).any(|p| p[0] == p[1])
-            || decode.first() != Some(&1) || !decode.windows(2).all(|p| p[0] < p[1])
-            || decode.iter().any(|n| !capacities.contains(n)) {
+        let exports = Self { capacities, decode };
+        exports.validate()?;
+        Ok(exports)
+    }
+
+    /// Revalidate contracts received through the installed worker report.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.capacities.is_empty()
+            || self.capacities.iter().any(|&n| n == 0 || n > 4096)
+            || !self.capacities.windows(2).all(|p| p[0] < p[1])
+            || self.decode.first() != Some(&1) || !self.decode.windows(2).all(|p| p[0] < p[1])
+            || self.decode.iter().any(|n| !self.capacities.contains(n)) {
             return Err("expert decode capacities must be ordered, unique compiled exports starting at m1".into());
         }
-        Ok(Self { capacities, decode })
+        Ok(())
     }
 
     pub fn covering(&self, rows: usize) -> Result<Vec<u32>, String> {
@@ -396,6 +406,23 @@ mod expert_capacity_tests {
                 let expected = if family == "v41" && !matches!(role, "coordinator" | "dspark_tp2") { crate::V41_VERIFY_ROWS as u32 } else { 80 };
                 assert_eq!(recipe.grouped_decode(4096).unwrap(), expected);
             }
+        }
+    }
+
+    #[test]
+    fn received_capacity_contracts_require_ordered_declared_exports() {
+        let exports = ExpertExportCapacities { capacities: vec![1,16,64,4096], decode: vec![1,16,64] };
+        let encoded = serde_json::to_value(&exports).unwrap();
+        let restored: ExpertExportCapacities = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(restored, exports);
+        restored.validate().unwrap();
+        for capacities in [vec![], vec![0,1,64], vec![1,64,16], vec![1,16,16,64], vec![1,4097]] {
+            let invalid = ExpertExportCapacities { capacities, ..exports.clone() };
+            assert!(invalid.validate().is_err());
+        }
+        for decode in [vec![], vec![16,64], vec![1,64,16], vec![1,16,16], vec![1,80]] {
+            let invalid = ExpertExportCapacities { decode, ..exports.clone() };
+            assert!(invalid.validate().is_err());
         }
     }
 

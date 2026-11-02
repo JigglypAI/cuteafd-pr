@@ -9,7 +9,7 @@ role export has been validated against the build that produced it:
 * its geometry matches the official checkpoint (experts 384, hidden 5120,
   intermediate 1152 for tp2 / 768 for tp3 / 384 for tp6 / 288 for tp8, topk 6);
   tp8 stores 384 columns, while other roles need no kernel padding;
-* its non-empty ``variants`` cover capacities 1/16/80/256/1024/4096;
+* its non-empty ``variants`` cover the authoritative V4.1 target capacities;
 * every file named in ``artifact_sha256`` exists in the role export directory
   and hashes to the declared value, so a stale or partial JSON cannot be
   advertised; and

@@ -179,8 +179,13 @@ impl SparkExecutionInventory {
         }
         let mut expected = vec![compiled];
         if compiled > 1 { expected.push(1); }
-        if compiled > 80 { expected.push(80); }
-        if retained != expected { return Err(invalid("native retained state must be main, m1, m80 in owner order")); }
+        let exports = cuteafd_core::spark_executions::ExpertExportCapacities::from_manifest(manifest)
+            .map_err(invalid)?;
+        let grouped = exports.grouped_decode(compiled).map_err(invalid)?;
+        if compiled > grouped && grouped > 1 { expected.push(grouped); }
+        if retained != expected {
+            return Err(invalid("native retained state must match manifest main, m1 and grouped-decode owners"));
+        }
         let input = match manifest["input_format"].as_str() {
             Some("bf16") => 5120 * 2, Some("fp8_k32") => 5120 + 5120 / 32,
             _ => return Err(invalid("unsupported native Spark ingress")),
@@ -534,7 +539,7 @@ mod tests {
     }
     fn native() -> Value {
         json!({"schema":1,"role":"spark_tp3","spark_tp_degree":3,"capability":[12,1],
-            "physical_sms":48,"sparkinfer_revision":"test","input_format":"fp8_k32",
+            "physical_sms":48,"sparkinfer_revision":"test","input_format":"fp8_k32","decode_capacities":[1,80],
             "geometry":{"experts":384,"hidden":5120,"intermediate":768,"kernel_intermediate":768,"topk":6},
             "variants":[{"capacity_rows":1,"core_scratch_nbytes":11},
                 {"capacity_rows":80,"core_scratch_nbytes":80},
@@ -734,6 +739,29 @@ mod tests {
         assert!(!result.device.iter().any(|i| i.group == "intake"));
         assert_eq!(result.device.iter().chain(&result.pinned).chain(&result.host).map(|i| i.bytes).sum::<u64>(), result.serve_peak);
     }
+    #[test]
+    fn native_tp3_tp6_census_uses_manifest_decode_capacity() {
+        let verify = cuteafd_core::V41_VERIFY_ROWS as u32;
+        for tp in [3, 6] {
+            let mut manifest = native();
+            manifest["role"] = json!(format!("spark_tp{tp}"));
+            manifest["spark_tp_degree"] = json!(tp);
+            manifest["geometry"]["intermediate"] = json!(2304 / tp);
+            manifest["geometry"]["kernel_intermediate"] = json!(2304 / tp);
+            manifest["decode_capacities"] = json!([1,16,verify]);
+            manifest["variants"] = json!([
+                {"capacity_rows":1,"core_scratch_nbytes":11},
+                {"capacity_rows":16,"core_scratch_nbytes":16},
+                {"capacity_rows":verify,"core_scratch_nbytes":verify},
+                {"capacity_rows":4096,"core_scratch_nbytes":4096}]);
+            let inventory = SparkExecutionInventory::native(&manifest,48,4096,2752,
+                &[4096,1,verify],load()).unwrap();
+            assert_eq!(inventory.retained_capacities(), &[4096,1,verify]);
+            assert!(SparkExecutionInventory::native(&manifest,48,4096,2752,
+                &[4096,1,80],load()).is_err());
+        }
+    }
+
     #[test]
     fn native_tp8_checks_role_degree_and_padded_geometry() {
         let mut manifest = native();
