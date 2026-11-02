@@ -1808,8 +1808,14 @@ static CUresult kernel_param_sizes(CUfunction func, std::vector<size_t>* sizes) 
 // A non-kernel node (memcpy/memset) cannot be rewritten by this API. If it
 // references an old value, refuse the whole update so the caller recaptures
 // instead of leaving that node on a stale pointer while reporting success.
-static bool non_kernel_node_references(const CUgraphNode node, CUgraphNodeType type,
-    const uint64_t* old_values, size_t count) {
+// Driver errors are propagated: a node whose parameters cannot be read cannot
+// be proven safe, so the update must fail rather than assume it is clean.
+// Interior references (base + offset) are not detected because the update API
+// matches exact values only; a memcpy that points inside an updated allocation
+// is not rewritten by this API either, so it is left as captured.
+static CUresult non_kernel_node_references(const CUgraphNode node, CUgraphNodeType type,
+    const uint64_t* old_values, size_t count, bool* references) {
+  *references = false;
   auto matches = [&](uint64_t value) {
     for (size_t j = 0; j < count; ++j) {
       if (old_values[j] == value) { return true; }
@@ -1818,18 +1824,22 @@ static bool non_kernel_node_references(const CUgraphNode node, CUgraphNodeType t
   };
   if (type == CU_GRAPH_NODE_TYPE_MEMCPY) {
     CUDA_MEMCPY3D params = {};
-    if (cuGraphMemcpyNodeGetParams(node, &params) != CUDA_SUCCESS) { return false; }
-    return matches(static_cast<uint64_t>(params.srcDevice))
-           || matches(static_cast<uint64_t>(params.dstDevice))
-           || matches(reinterpret_cast<uint64_t>(params.srcHost))
-           || matches(reinterpret_cast<uint64_t>(params.dstHost));
+    const CUresult result = cuGraphMemcpyNodeGetParams(node, &params);
+    if (result != CUDA_SUCCESS) { return result; }
+    *references = matches(static_cast<uint64_t>(params.srcDevice))
+                  || matches(static_cast<uint64_t>(params.dstDevice))
+                  || matches(reinterpret_cast<uint64_t>(params.srcHost))
+                  || matches(reinterpret_cast<uint64_t>(params.dstHost));
+    return CUDA_SUCCESS;
   }
   if (type == CU_GRAPH_NODE_TYPE_MEMSET) {
     CUDA_MEMSET_NODE_PARAMS params = {};
-    if (cuGraphMemsetNodeGetParams(node, &params) != CUDA_SUCCESS) { return false; }
-    return matches(static_cast<uint64_t>(params.dst));
+    const CUresult result = cuGraphMemsetNodeGetParams(node, &params);
+    if (result != CUDA_SUCCESS) { return result; }
+    *references = matches(static_cast<uint64_t>(params.dst));
+    return CUDA_SUCCESS;
   }
-  return false;
+  return CUDA_SUCCESS;
 }
 
 static cuteafd_status_t graph_exec_update_pointers_impl(
@@ -1911,7 +1921,13 @@ static cuteafd_status_t graph_exec_update_pointers_impl(
       return fail_cu(CUTEAFD_STATUS_INTERNAL_ERROR, "cuGraphNodeGetType failed", result);
     }
     if (type != CU_GRAPH_NODE_TYPE_KERNEL) {
-      if (non_kernel_node_references(node, type, old_values, count)) {
+      bool references = false;
+      result = non_kernel_node_references(node, type, old_values, count, &references);
+      if (result != CUDA_SUCCESS) {
+        return fail_cu(CUTEAFD_STATUS_INTERNAL_ERROR,
+                       "cuGraphMemcpyNodeGetParams/cuGraphMemsetNodeGetParams failed", result);
+      }
+      if (references) {
         return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
                     "CUDA graph non-kernel node references an updated value");
       }
@@ -2021,39 +2037,49 @@ static cuteafd_status_t graph_exec_update_pointers_impl(
 }
 #endif
 
+// Clear the per-thread CUDA last-error. A no-op when CUDA is not compiled in.
+static void clear_cuda_last_error() {
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  (void)cudaGetLastError();
+#endif
+}
+
 extern "C" cuteafd_status_t cuteafd_cuda_graph_exec_update_pointers(
     void* cuda_graph_exec, void* cuda_graph, const uint64_t* old_values,
     const uint64_t* new_values, const uint8_t* widths, const uint8_t* kinds,
     uint8_t* found, size_t count) {
-  if (cuda_graph_exec == nullptr) {
-    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph exec update target is null");
-  }
-  if (cuda_graph == nullptr) {
-    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph update graph is null");
-  }
-  if (count != 0 && (old_values == nullptr || new_values == nullptr || widths == nullptr
-                     || kinds == nullptr || found == nullptr)) {
-    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph update value array is null");
-  }
-  // Bound the count so a corrupt caller cannot drive an unbounded loop.
-  if (count > (size_t{1} << 20)) {
-    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph update value count is too large");
-  }
+  const cuteafd_status_t status = [&]() -> cuteafd_status_t {
+    if (cuda_graph_exec == nullptr) {
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph exec update target is null");
+    }
+    if (cuda_graph == nullptr) {
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph update graph is null");
+    }
+    if (count != 0 && (old_values == nullptr || new_values == nullptr || widths == nullptr
+                       || kinds == nullptr || found == nullptr)) {
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph update value array is null");
+    }
+    // Bound the count so a corrupt caller cannot drive an unbounded loop.
+    if (count > (size_t{1} << 20)) {
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph update value count is too large");
+    }
 #if CUTEAFD_NATIVE_ENABLE_CUDA
-  const cuteafd_status_t status = graph_exec_update_pointers_impl(
-      cuda_graph_exec, cuda_graph, old_values, new_values, widths, kinds, found, count);
+    return graph_exec_update_pointers_impl(
+        cuda_graph_exec, cuda_graph, old_values, new_values, widths, kinds, found, count);
+#else
+    return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
+                "CUDA graph exec pointer update is unavailable in this build");
+#endif
+  }();
   if (status != CUTEAFD_STATUS_OK) {
-    // ONE chokepoint for the p9 rule: every failure is reported through the
-    // returned status and the per-thread CUDA last-error is cleared, so a
-    // recovered failure (the caller retires and recaptures) can never leak
-    // into the next kernel's launch-status check (p8 crash 2026-10-28).
-    (void)cudaGetLastError();
+    // ONE chokepoint for the p9 rule: every failure (including the early
+    // argument-validation returns above) is reported through the returned
+    // status and the per-thread CUDA last-error is cleared, so a recovered
+    // failure (the caller retires and recaptures) can never leak into the next
+    // kernel's launch-status check (p8 crash 2026-10-28).
+    clear_cuda_last_error();
   }
   return status;
-#else
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-              "CUDA graph exec pointer update is unavailable in this build");
-#endif
 }
 
 #if defined(CUTEAFD_NATIVE_TEST_HOOKS)
