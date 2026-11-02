@@ -350,6 +350,10 @@ mod tests {
         let cutoff: usize = std::env::var("CUTEAFD_ACTIVATION_TRACE_BF16_MAX_ROWS")
             .unwrap_or_else(|_| "4096".into()).parse()?;
         ensure!(matches!(cutoff, 64 | 4096), "activation trace partial cutoff must be 64 or 4096");
+        let scored_split: bool = std::env::var("CUTEAFD_ACTIVATION_TRACE_SCORED_SPLIT")
+            .unwrap_or_else(|_| "false".into()).parse()?;
+        ensure!(!scored_split || (count == 513 && (1..count - 1).contains(&position)),
+            "scored split trace needs legacy513 and a position in its scored continuation");
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
             std::path::Path::new(&std::env::var("CUTEAFD_GOLDEN_FIXTURES")?).join("windows.json"))?)?;
         ensure!(manifest["family"] == "muse_spark", "activation trace requires Muse's published text set");
@@ -362,6 +366,7 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         ensure!(args.peers.len() == 4, "short Muse trace uses the smallest four-Spark layout");
         args.max_sequences = 1;
+        args.full_prefill_logits = scored_split;
         args.expert_partial_bf16_max_rows = cutoff;
         args.prefix.resolve_entries(1);
         args.validate()?;
@@ -369,7 +374,20 @@ mod tests {
             let (family, mut pool) = backend.prefix_cache(&args.prefix, 1)?;
             let mut request = pool.admit_cold(&family, count, count + 1,
                 |pages| super::super::prefix::Placement { pages, slot: 0, len: 0 })?.placement;
-            backend.prefill_device(&mut request, &tokens, 0, pool.pool())?;
+            if scored_split {
+                // Match score_plan: the final token is a target, not a prefill input.
+                backend.prefill_device(&mut request, &tokens[..1], 1, pool.pool())?;
+                let logits = backend.prefill_device(&mut request, &tokens[1..count - 1], count - 2, pool.pool())?
+                    .context("scored split trace returned no logits")?;
+                let row = logits.row_host(backend.library(), position - 1)?;
+                ensure!(row.iter().all(|value| value.is_finite()), "scored split trace logits are nonfinite");
+                let bytes: Vec<_> = row.iter().flat_map(|value| value.to_le_bytes()).collect();
+                let directory = std::path::PathBuf::from(std::env::var("CUTEAFD_ACTIVATION_TRACE_DIR")?)
+                    .join(format!("position{position}-prefill"));
+                crate::shared::activation_trace::write_bytes(&directory, 61, "native_logits.f32", &bytes)?;
+            } else {
+                backend.prefill_device(&mut request, &tokens, 0, pool.pool())?;
+            }
             backend.library().cuda_device_synchronize()?;
             Ok(())
         })
