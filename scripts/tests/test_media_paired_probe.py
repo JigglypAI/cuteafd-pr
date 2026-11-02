@@ -182,8 +182,9 @@ def test_log_probs_validate_shape_and_normalize(tmp_path):
         module.normalize([0, float("nan")])
 
 
+@pytest.mark.parametrize("geometry", ["tiled", "official-full"])
 @pytest.mark.parametrize("family", module.FAMILIES)
-def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, family):
+def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, family, geometry):
     import hashlib
     from types import SimpleNamespace
     from safetensors.numpy import save_file
@@ -218,6 +219,27 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, fam
         np.asarray(window["tokens"], dtype="<i4").tofile(folder / "tokens.bin")
         meta["windows"].append({"id": window["id"], "path": window["id"], "positions": list(range(65, 577)),
                                 "vocab": 2, "media": [span]})
+    if geometry == "official-full":
+        import copy
+        from fidelity_windows import validate_reference
+        meta.pop("prefix_qualification")
+        meta.update(geometry=geometry, attention="eager", use_cache=False, mtp=False,
+                    source_pin={"official": "pinned"})
+        meta["official_full"] = {"schema": "cuteafd.reference.official-full/1", "family": panel["family"],
+            "set_sha256": panel["set_sha256"], "snapshot_identity": identity,
+            "layers": 72, "completed_layers": 72, "tiling": False, "head": "full-length",
+            "windows": {w["id"]: {"tokens": len(w["tokens"]),
+                "tokens_sha256": hashlib.sha256(canonical(w["tokens"])).hexdigest()} for w in panel["windows"]}}
+        assert validate_reference(meta, panel) == 2
+        for change in ({"tiling": True}, {"completed_layers": 71}, {"head": "fixed-M128"}, {"windows": {}}):
+            bad = copy.deepcopy(meta)
+            bad["official_full"].update(change)
+            with pytest.raises(ValueError, match="incomplete or mismatched"):
+                validate_reference(bad, panel)
+        bad = copy.deepcopy(meta)
+        bad["prefix_qualification"] = {}
+        with pytest.raises(ValueError, match="must not claim"):
+            validate_reference(bad, panel)
     (golden / "meta.json").write_bytes(canonical(meta))
     (golden / "windows.json").write_bytes(canonical(panel))
     seal = tmp_path / "golden-seal.json"

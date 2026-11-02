@@ -142,6 +142,9 @@ class Family:
         return model.logits(self.outer["norm"](hidden), self.outer["head"], self.config,
                             linear=shape_invariant.linear)
 
+    def official_final(self, hidden):
+        return model.logits(self.outer["norm"](hidden), self.outer["head"], self.config)
+
     def release_final(self):
         self.outer = None
         self.checkpoint.close()
@@ -162,6 +165,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("snapshot", "windows", "out"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--geometry", choices=("auto", "tiled", "official-full"), default="auto",
+                        help="auto uses official-full for media windows longer than index_topk")
+    parser.add_argument("--official-state", type=Path,
+                        help="require byte-identical final hidden against saved qualification latest.json")
     parser.add_argument("--routes", type=Path, help="router sidecar directory (full panel only)")
     parser.add_argument("--prefix-only", action="store_true", help="qualify the prefix and official arm, then stop")
     parser.add_argument("--wait-shards", type=float, default=0,
