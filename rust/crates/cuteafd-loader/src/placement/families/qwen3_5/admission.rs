@@ -698,6 +698,7 @@ impl DenseFacts<'_> {
                 source: "bounded host logit download/gather allowance; ordinary Rust heap, not exact receipts".into(),
                 assumed: true });
         }
+        allowances.retain(|allowance| allowance.bytes > 0);
         Ok(Facts {
             allocations,
             deferred: vec![],

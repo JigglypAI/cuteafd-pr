@@ -299,6 +299,35 @@ fn loading_heap_allowance_is_host_only_and_cannot_shrink_the_pool() {
 }
 
 #[test]
+fn block_loading_heap_allowance_matches_curves_at_zero_and_nonzero_bytes() {
+    let (cfg, mut weights, buffers) = fixture();
+    weights.loading_host_bytes = 0;
+    for bytes in [0, 1, 512 << 20] {
+        let mut layout = block_layout(true);
+        layout.loading_host_bytes = bytes;
+        let mut recipe = facts(&cfg, &weights, &buffers);
+        recipe.drafter = Some(DenseDraft::Block(&layout));
+        let contract = recipe.prepare(&request()).unwrap();
+        let selected = vec![0; contract.variables.len()];
+        for pages in [1, 4096, contract.maximum_pages] {
+            let exact = recipe.owner_templates(pages * PAGE_ROWS).unwrap();
+            let actual = contract.facts(&selected, pages).unwrap();
+            assert_eq!(actual, exact, "pages {pages}, heap {bytes}");
+            assert!(exact.allowances.iter().all(|allowance| allowance.bytes > 0));
+            let heap: Vec<_> = exact.allowances.iter().filter(|allowance|
+                allowance.lifetime.first == Phase::DraftLoad).collect();
+            assert_eq!(heap.len(), usize::from(bytes > 0));
+            if bytes > 0 {
+                assert_eq!(heap[0].location, Location::HOST);
+                assert_eq!(heap[0].bytes, bytes);
+                assert_eq!(heap[0].lifetime.last, Phase::DraftLoad);
+                assert!(heap[0].assumed && heap[0].source.starts_with("block dSpark headers:"));
+            }
+        }
+    }
+}
+
+#[test]
 fn native_scratch_prefix_and_pinned_staging_are_individual_owners() {
     let (cfg, weights, buffers) = fixture();
     let plan = admit(request(), budgets(), facts(&cfg, &weights, &buffers)).unwrap();
