@@ -354,9 +354,23 @@ pub fn native_scratch_bytes(layout: &RankWeightLayout, unit: usize) -> Result<u6
     Ok(merged.map(|layout| layout.bytes()).transpose()?.map_or(0, |bytes| bytes as u64))
 }
 
-/// Each predictor stage's native owners (attention, dense FFN, eh_proj and its
-/// vocabulary head) hold private projection scratch; bounded at `rows`.
-pub fn mtp_native_scratch_bytes(checkpoint: &Checkpoint, depth: usize, rows: usize) -> Result<u64> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MtpRows {
+    pub layer: usize,
+    pub head: usize,
+}
+
+/// Predictor input, attention and dense owners use one prefill unit; the
+/// vocabulary head retains only its decode/verify width, never the wave span.
+pub fn mtp_rows(unit: usize) -> Result<MtpRows> {
+    ensure!((1..=4096).contains(&unit), "Step-5 MTP allocation unit must be 1..=4096 rows");
+    Ok(MtpRows { layer: unit, head: head_rows(unit, false) })
+}
+
+/// Each predictor stage's native owners hold private projection scratch at
+/// exactly the row capacities used by StageOwner::load.
+pub fn mtp_native_scratch_bytes(checkpoint: &Checkpoint, depth: usize, unit: usize) -> Result<u64> {
+    let rows = mtp_rows(unit)?;
     use crate::formats::trellis_core::ProjectionScratchLayout;
     let mut total = 0u64;
     for stage in 0..depth {
@@ -366,7 +380,7 @@ pub fn mtp_native_scratch_bytes(checkpoint: &Checkpoint, depth: usize, rows: usi
             let owner = if name.contains(".self_attn.") { "attention" } else if name.contains(".mlp.") { "dense" }
                 else if name.ends_with(".eh_proj.weight") { "eh" } else { "head" };
             let [n, k] = core.shape;
-            let next = ProjectionScratchLayout::new(k, n, rows.min(4096))?;
+            let next = ProjectionScratchLayout::new(k, n, if owner == "head" { rows.head } else { rows.layer })?;
             match owners.get_mut(owner) { Some(layout) => layout.merge(&next)?, None => { owners.insert(owner, next); } }
         }
         for layout in owners.values() {
@@ -395,6 +409,42 @@ mod tests {
 
     fn end(layout: &[(usize, usize)]) -> usize {
         layout.iter().map(|&(offset, bytes)| offset + bytes).max().unwrap()
+    }
+
+    #[test]
+    fn mtp_private_scratch_matches_runtime_owner_rows() -> Result<()> {
+        use crate::formats::trellis_core::ProjectionScratchLayout;
+        let fixture = super::super::tests::exl3_snapshot();
+        let checkpoint = Checkpoint::open(fixture.path())?;
+        for unit in [16, 64, 2752, 4096] {
+            let rows = mtp_rows(unit)?;
+            assert_eq!(rows.layer, unit);
+            assert_eq!(rows.head, unit.min(64));
+            let mut expected = 0u64;
+            for stage in 0..3 {
+                let layout = RankWeightLayout::for_mtp_stage(&checkpoint, stage)?;
+                let mut layer_owners = std::collections::BTreeMap::<&str, ProjectionScratchLayout>::new();
+                for (name, core) in &layout.core {
+                    let [n, k] = core.shape;
+                    if name.contains(".transformer.shared_head.") {
+                        expected += crate::formats::head::native_private_scratch(core.shape, rows.head)?.bytes()? as u64;
+                        continue;
+                    }
+                    let owner = if name.contains(".self_attn.") { "attention" }
+                        else if name.contains(".mlp.") { "dense" } else { "eh" };
+                    let scratch = ProjectionScratchLayout::new(k, n, rows.layer)?;
+                    match layer_owners.get_mut(owner) {
+                        Some(layout) => layout.merge(&scratch)?,
+                        None => { layer_owners.insert(owner, scratch); }
+                    }
+                }
+                for layout in layer_owners.values() { expected += layout.bytes()? as u64; }
+            }
+            assert_eq!(mtp_native_scratch_bytes(&checkpoint, 3, unit)?, expected);
+        }
+        assert!(mtp_rows(0).is_err());
+        assert!(mtp_rows(8256).is_err(), "a multi-wave span is not an allocation unit");
+        Ok(())
     }
 
     #[test]

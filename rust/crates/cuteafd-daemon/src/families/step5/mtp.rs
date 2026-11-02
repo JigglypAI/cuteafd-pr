@@ -236,10 +236,11 @@ impl<'a> StageOwner<'a> {
         rope: Rc<super::rope::TargetTables<'a>>, available: u64, reservations: &[u64],
         arena: &Arena<'a>, stream: Rc<Stream<'a>>, kv_format: Qwen4KvCache,
         contract: &cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract) -> Result<Self> {
+        let capacities = native::mtp_rows(rows)?;
+        let rows = capacities.layer;
         let input = InputPlan::prepare(programs, checkpoint, stage, rows)?;
-        // A stage proposes at most depth + 1 rows: its head holds the verify width only.
         let head = super::head::HeadPlan::for_mtp_stage(programs, checkpoint, stage,
-            native::head_rows(rows, false))?;
+            capacities.head)?;
         let immutable = RankWeightLayout::for_mtp_stage(checkpoint, stage)?.resident_bytes;
         let total = reservations.iter().try_fold(immutable, |n, bytes| n.checked_add(*bytes))
             .context("Step-5 predictor owner admission overflow")?;
