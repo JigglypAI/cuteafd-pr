@@ -201,10 +201,9 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         }
     };
     let budgets = placement::families::qwen3_5::forecast_budgets(&physical, capacity, set.module_bytes(), host)?;
-    let onboard = match options.onboard {
-        None | Some(placement::Onboard::Auto) => planner::Pin::Auto,
-        Some(placement::Onboard::Layers(layers)) => planner::Pin::Exact(layers as u64),
-        Some(_) => return Err(planner::Refusal::InvalidPin("dense Qwen requires an exact layer pin, not a fraction or policy").into()),
+    let onboard = match options.onboard.unwrap_or_default().resolve(0) {
+        placement::Onboard::Auto => planner::Pin::Auto,
+        placement::Onboard::Layers(layers) => planner::Pin::Exact(layers as u64),
     };
     let request = planner::Request { context: cfg.max_context as u64,
         pool: options.pool_tokens.map_or(planner::Pin::Auto, planner::Pin::Exact), onboard,
