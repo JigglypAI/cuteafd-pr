@@ -323,10 +323,11 @@ def test_step5_dispatches_to_serve_step5(tmp_path: Path, model: str, gpus: int, 
     assert lines[probe].endswith("serve-step5 --help ") and probe < lines.index(plan)
 
 
-def test_step5_fixed_rtx_expert_layers_reach_serve(tmp_path: Path) -> None:
-    keys = "SPARK_COUNT=6\nRTX_GPUS=2\nRTX_EXPERT_LAYERS=10\n" + _hosts(6)
+@pytest.mark.parametrize("value", ["auto", "all", "0", "10", "88"])
+def test_step5_fixed_rtx_expert_layers_reach_serve(tmp_path: Path, value: str) -> None:
+    keys = f"SPARK_COUNT=6\nRTX_GPUS=2\nRTX_EXPERT_LAYERS={value}\n" + _hosts(6)
     serve = _line(_step5(tmp_path / "fixed", keys), "cuteafd serve-step5 --snapshot")
-    assert _flag(serve, "--rtx-expert-layers") == "10"
+    assert _flag(serve, "--rtx-expert-layers") == (None if value == "auto" else value)
     result = _step5(tmp_path / "invalid", "SPARK_COUNT=6\nRTX_GPUS=2\nRTX_EXPERT_LAYERS=half\n" + _hosts(6))
     assert result.returncode != 0
 

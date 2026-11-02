@@ -2200,8 +2200,8 @@ if [[ "$family" == step5 ]]; then
   # EXL3 checkpoints onboard whole routed layers on the entry RTX (auto: the
   # planner's pool-first choice); the official FP8/NVFP4 releases onboard none.
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
-  [[ "$local_layers" == auto || "$local_layers" =~ ^[0-9]+$ ]] ||
-    release_die "Step-5 RTX_EXPERT_LAYERS is auto or a fixed routed-layer count, not $local_layers"
+  [[ "$local_layers" == auto || "$local_layers" == all || "$local_layers" =~ ^[0-9]+$ ]] ||
+    release_die "Step-5 RTX_EXPERT_LAYERS is auto, all or a fixed routed-layer count, not $local_layers"
   [[ "$local_layers" == auto ]] || family_args+=(--rtx-expert-layers "$local_layers")
 fi
 if ((text_family)); then
