@@ -346,6 +346,111 @@ def test_source_comparison_still_rejects_empty_inventory(tmp_path):
         compare_sm.compare(left, right, source_comparison=True)
 
 
+def removal_exports(tmp_path):
+    left, right = exports(tmp_path)
+    path = right / "comparison-context.json"
+    context = json.loads(path.read_text())
+    context["sms"] = 188
+    path.write_text(json.dumps(context))
+    (left / "removed.o").write_bytes(cuda_elf(b"old-route"))
+    (left / "removed.h").write_text("old ABI\n")
+    for directory in (left, right):
+        path = directory / "table.json"
+        table = json.loads(path.read_text())
+        if directory == left:
+            table["programs"].insert(0, {"name": "removed", "scratch_bytes_at_capacity": 0})
+        path.write_text(json.dumps(table))
+    return left, right
+
+
+def test_expected_removals_exact_set_preserves_survivors(tmp_path):
+    report = compare_sm.compare(*removal_exports(tmp_path), source_comparison=True,
+                                expected_removals={"removed"})
+    compare_sm.validate_expected_removals([report], {"removed"})
+    assert report["removed_programs"] == ["removed.o"]
+    assert report["programs"][0]["object_identical"]
+
+
+@pytest.mark.parametrize("expected", [set(), {"removed", "missing"}])
+def test_expected_removals_extra_or_missing_fails(tmp_path, expected):
+    report = compare_sm.compare(*removal_exports(tmp_path), source_comparison=True,
+                                expected_removals=expected)
+    with pytest.raises(ValueError, match="expected removals mismatch"):
+        compare_sm.validate_expected_removals([report], expected)
+
+
+@pytest.mark.parametrize("mutation", ["object", "header", "metadata", "table", "orphan_header"])
+def test_expected_removals_changed_survivor_fails(tmp_path, mutation):
+    left, right = removal_exports(tmp_path)
+    if mutation == "object":
+        (right / "test.o").write_bytes(cuda_elf(b"changed-route"))
+    elif mutation == "header":
+        (right / "test.h").write_text("changed ABI\n")
+    elif mutation == "orphan_header":
+        (right / "orphan.h").write_text("unrelated ABI\n")
+    else:
+        path = right / "table.json"
+        table = json.loads(path.read_text())
+        if mutation == "metadata":
+            table["programs"][0]["scratch_bytes_at_capacity"] += 1
+        else:
+            table["schema"] = 99
+        path.write_text(json.dumps(table))
+    with pytest.raises(ValueError, match="changed survivors"):
+        compare_sm.compare(left, right, source_comparison=True, expected_removals={"removed"})
+
+
+def test_expected_removals_added_program_fails(tmp_path):
+    left, right = removal_exports(tmp_path)
+    (right / "added.cubin").write_bytes(cuda_elf())
+    report = compare_sm.compare(left, right, source_comparison=True, expected_removals={"removed"})
+    with pytest.raises(ValueError, match="added=.*added.cubin"):
+        compare_sm.validate_expected_removals([report], {"removed"})
+
+
+def test_expected_removals_partial_artifact_deletion_fails(tmp_path):
+    left, right = removal_exports(tmp_path)
+    for directory in (left, right):
+        (directory / "removed.cubin").write_bytes(cuda_elf(b"old-route"))
+    with pytest.raises(ValueError, match="partially removed"):
+        compare_sm.compare(left, right, source_comparison=True, expected_removals={"removed"})
+
+
+@pytest.mark.parametrize("contents", ["", "same\nsame\n", "bad.o\n", "../bad\n", "/bad\n", " bad\n"])
+def test_expected_removals_file_rejects_invalid_names(tmp_path, contents):
+    path = tmp_path / "removals.txt"
+    path.write_text(contents)
+    with pytest.raises(ValueError, match="expected removal"):
+        compare_sm.read_expected_removals(path)
+
+
+def test_expected_removals_main_gates_exact_aggregate_and_baseline(tmp_path, monkeypatch):
+    left, right = removal_exports(tmp_path)
+    group = tmp_path / "group"
+    group.mkdir()
+    left.rename(group / "baseline")
+    right.rename(group / "candidate")
+    baseline = tmp_path / "source"
+    (baseline / "third_party").mkdir(parents=True)
+    (baseline / "third_party/sparkinfer.lock.json").write_text("{}")
+    expected = tmp_path / "removals.txt"
+    expected.write_text("removed\n")
+    monkeypatch.setattr(compare_sm, "jobs", lambda _: [("group", "export.py", [])])
+    real_load = compare_sm.load_file
+    monkeypatch.setattr(compare_sm, "load_file", lambda name, path:
+        SimpleNamespace(check_path=lambda _: None) if name == "cuteafd_build_filesystem" else real_load(name, path))
+    argv = ["compare-sm-exports.py", "--compare-only", "--require-identical", "--output-dir", str(tmp_path),
+            "--expected-removals", str(expected), "--baseline-source", str(baseline)]
+    monkeypatch.setattr(compare_sm.sys, "argv", argv)
+    assert compare_sm.main() == 0
+    expected.write_text("removed\nmissing\n")
+    assert compare_sm.main() == 1
+    monkeypatch.setattr(compare_sm.sys, "argv", argv[:-2])
+    with pytest.raises(SystemExit) as error:
+        compare_sm.main()
+    assert error.value.code == 2
+
+
 def test_missing_cubins_fail_closed(tmp_path):
     left, right = exports(tmp_path)
     (left / "test.o").write_bytes(b"no CUDA image")
