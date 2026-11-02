@@ -2,11 +2,15 @@
 
 `mistralai/Mistral-Large-4-1T-A52B` (official FP8 block-128) is served as an
 EXL3 quant, `wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6`: K4 routed experts
-on six Sparks (with RTX onboarding) and a native K6 dense core (attention,
-dense and shared FFN, vocabulary head) on the RTX cards. The quant is in
-progress, so this family has no release card or starting config yet. Gate
-cards: `ml4-exl3-min` (1× RTX + 6 Sparks) and `ml4-exl3-max` (2× RTX + 6
-Sparks) in `scripts/bench/kits/gate/matrix-ml4.json`.
+on five or six Sparks (with RTX onboarding) and a native K6 dense core
+(attention, dense and shared FFN, vocabulary head) on the RTX cards. The
+published revision is `03c80aebaa483d55760703ae5bc0c9734c9d67d6`;
+qualification continues, with no release card yet. WIP examples:
+[min, 1 RTX + 5 Sparks](../../examples/configs/mistral-large4-exl3-k4-core-k6-min.config)
+and [max, 2 RTX + 6 Sparks](../../examples/configs/mistral-large4-exl3-k4-core-k6-max.config).
+Gate cards `ml4-exl3-min` and `ml4-exl3-max` in
+`scripts/bench/kits/gate/matrix-ml4.json` use these recipes; TP2 qualification
+and the attention-placement decision are still pending.
 
 ## How it runs
 
@@ -52,9 +56,10 @@ names.
 - **Drafter:** `SPECULATOR=dspark` serves the bundled `mtp_dspark` drafter
   through the shared MLA block-draft path. It has three BF16 non-causal MLA
   layers with block-anchored 2048-record windows, taps target layers 1, 18,
-  36, 54 and 71, and uses an RNN Markov head. It stays opt-in
-  (`SPECULATOR=off` is the default) until the lossless and delivered-tok/s
-  gates pass on hardware.
+  36, 54 and 71, and uses an RNN Markov head. It defaults on at its native
+  depth of three draft tokens after the lossless, exact-restore and
+  delivered-tok/s gates passed on hardware. `SPECULATOR=off` disables it;
+  there is no separate drafter checkpoint or width override.
 - **Prefix cache:** snapshots carry each layer's records at their own size,
   and none for latent readers, whose pages belong to their source layer.
 - **Not yet:** the vision encoder.

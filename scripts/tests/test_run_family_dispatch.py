@@ -1724,7 +1724,7 @@ def test_mistral_large4_launch_places_its_pixtral_encoder_where_the_plan_does(tm
 
 
 @pytest.mark.parametrize("gpus", [1, 2])
-def test_mistral_large4_serves_on_the_glm_engine_with_an_opt_in_bundled_drafter(tmp_path, gpus):
+def test_mistral_large4_defaults_to_its_bundled_drafter_and_honors_explicit_off(tmp_path, gpus):
     config = {"architectures": ["MistralLarge4ForConditionalGeneration"], "model_type": "mistral_large4",
               "text_config": {"model_type": "mistral_large4_text", "num_hidden_layers": 4, "first_k_dense_replace": 1}}
     result = _family_launch_result(tmp_path, config, "test/ml4",
@@ -1735,7 +1735,9 @@ def test_mistral_large4_serves_on_the_glm_engine_with_an_opt_in_bundled_drafter(
     assert plan[plan.index("--attention-placement") + 1] == "auto"
     serve = next(shlex.split(line) for line in result.stderr.splitlines()
                  if "docker run -d" in line and "serve-glm" in line)
-    assert "--draft" not in serve and "--dspark" not in serve and "dflash2" not in " ".join(serve)
+    assert "--dspark" in serve and "--draft" not in serve and "dflash2" not in " ".join(serve)
+    assert plan[plan.index("--speculator") + 1] == "dspark"
+    assert "--draft-block" not in serve  # The bundled checkpoint supplies its native depth.
     assert ("--split-device" in serve) == (gpus == 2)
     for flag in ("--prefill-rows", "--prefill-waves", "--prefill-span-rows"):
         assert serve.count(flag) == 1
@@ -1749,6 +1751,15 @@ def test_mistral_large4_serves_on_the_glm_engine_with_an_opt_in_bundled_drafter(
     plan = next(shlex.split(line) for line in drafted.stderr.splitlines()
                 if "cuteafd plan" in line and "--deployment" in line)
     assert plan[plan.index("--speculator") + 1] == "dspark"
+    disabled = _family_launch_result(tmp_path / "off", config, "test/ml4",
+                                    f"RTX_GPUS={gpus}\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    assert disabled.returncode == 0, disabled.stderr
+    serve = next(shlex.split(line) for line in disabled.stderr.splitlines()
+                 if "docker run -d" in line and "serve-glm" in line)
+    assert "--dspark" not in serve and "--draft" not in serve
+    plan = next(shlex.split(line) for line in disabled.stderr.splitlines()
+                if "cuteafd plan" in line and "--deployment" in line)
+    assert plan[plan.index("--speculator") + 1] == "off"
     refused = _family_launch_result(tmp_path / "spec", config, "test/ml4", "SPECULATOR=dflash2\nVISION=off\nAUDIO=off\n")
     assert refused.returncode != 0 and "bundled mtp_dspark" in refused.stderr
     # Its ml42 head split runs heads and context on two GPUs as explicit requests.

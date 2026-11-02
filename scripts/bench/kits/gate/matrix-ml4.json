@@ -9,7 +9,7 @@
   {
    "name": "ml4-exl3-min",
    "family": "mistral_large4",
-   "config": "cfg/ml4-exl3-k4core6.config",
+   "config": "examples/configs/mistral-large4-exl3-k4-core-k6-min.config",
    "gpus": [
     1
    ],
@@ -18,27 +18,30 @@
     "dodo",
     "emu",
     "kiwi",
-    "rhea",
-    "moa"
+    "rhea"
    ],
    "set": {
     "ADDR": "0.0.0.0:8750",
     "EXPERT_PORT": "19850",
     "COORDINATOR_GPUS": "1",
     "RTX_GPUS": "1",
-    "SPARK_COUNT": "6",
+    "SPARK_COUNT": "5",
     "SPARK_0_HOST": "ostrich",
     "SPARK_1_HOST": "dodo",
     "SPARK_2_HOST": "emu",
     "SPARK_3_HOST": "kiwi",
     "SPARK_4_HOST": "rhea",
-    "SPARK_5_HOST": "moa"
+    "SPARK_0_LANE_A": "10.55.0.1",
+    "SPARK_1_LANE_A": "10.55.0.2",
+    "SPARK_2_LANE_A": "10.55.0.3",
+    "SPARK_3_LANE_A": "10.55.0.4",
+    "SPARK_4_LANE_A": "10.55.0.5"
    }
   },
   {
    "name": "ml4-exl3-max",
    "family": "mistral_large4",
-   "config": "cfg/ml4-exl3-k4core6.config",
+   "config": "examples/configs/mistral-large4-exl3-k4-core-k6-max.config",
    "gpus": [
     0,
     1
@@ -62,7 +65,13 @@
     "SPARK_2_HOST": "emu",
     "SPARK_3_HOST": "kiwi",
     "SPARK_4_HOST": "rhea",
-    "SPARK_5_HOST": "moa"
+    "SPARK_5_HOST": "moa",
+    "SPARK_0_LANE_A": "10.55.0.1",
+    "SPARK_1_LANE_A": "10.55.0.2",
+    "SPARK_2_LANE_A": "10.55.0.3",
+    "SPARK_3_LANE_A": "10.55.0.4",
+    "SPARK_4_LANE_A": "10.55.0.5",
+    "SPARK_5_LANE_A": "10.55.0.6"
    }
   }
  ]

@@ -1672,13 +1672,13 @@ family="$detected"
 # The checkpoint's own family names its deployment plan; Mistral Large 4 runs
 # the GLM 5.3 engine (serve-glm, its keys and lanes) as the engine's ml4 variant. Two GPUs:
 # auto resolves to whole-layer owners (plan and server) until context measures faster; heads
-# and context (its ml42 head split) are explicit requests. SPECULATOR=dspark serves its bundled mtp_dspark drafter; it
-# stays opt-in (default off) until its lossless gate passes on hardware.
+# and context (its ml42 head split) are explicit requests. The bundled mtp_dspark
+# defaults on at its checkpoint-native depth; SPECULATOR=off disables it.
 checkpoint_family="$family"
 if [[ "$family" == mistral_large4 ]]; then
   family=glm5
-  [[ -n "${cfg[SPECULATOR]+set}" ]] || cfg[SPECULATOR]=off
-  case "$(get SPECULATOR off)" in
+  [[ -n "${cfg[SPECULATOR]+set}" ]] || cfg[SPECULATOR]=dspark
+  case "$(get SPECULATOR dspark)" in
     off|dspark) ;;
     *) release_die "Mistral Large 4 drafts only with its bundled mtp_dspark (SPECULATOR=dspark or off)" ;;
   esac
