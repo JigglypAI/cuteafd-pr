@@ -30,14 +30,29 @@ impl KernelKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KernelGeometry {
+    pub hidden: usize,
+    pub units: usize,
+    pub top_k: usize,
+    pub experts: usize,
+    pub swiglu_limit: f64,
+}
+
 impl KernelFamily {
+    pub const fn geometry(self) -> KernelGeometry {
+        match self {
+            Self::Glm => KernelGeometry { hidden: 6144, units: 16, top_k: 8, experts: 256, swiglu_limit: 0.0 },
+            Self::GlmFlash => KernelGeometry { hidden: 4096, units: 16, top_k: 8, experts: 288, swiglu_limit: 10.0 },
+        }
+    }
+
     pub fn from_geometry(hidden: usize, units: usize, top_k: usize, experts: usize)
         -> Result<Self, ManifestError> {
-        match (hidden, units, top_k, experts) {
-            (6144, 16, 8, 256) => Ok(Self::Glm),
-            (4096, 16, 8, 288) => Ok(Self::GlmFlash),
-            _ => Err(invalid("unsupported EXLR8 family geometry")),
-        }
+        [Self::Glm, Self::GlmFlash].into_iter().find(|family| {
+            let g = family.geometry();
+            (hidden, units, top_k, experts) == (g.hidden, g.units, g.top_k, g.experts)
+        }).ok_or_else(|| invalid("unsupported EXLR8 family geometry"))
     }
 
     pub fn program(self, kind: KernelKind) -> &'static str {
@@ -86,16 +101,17 @@ impl KernelFamily {
     }
 
     fn validate_compute(self, spec: &ProgramSpec, shared: bool) -> Result<(), ManifestError> {
+        let g = self.geometry();
         let clamp = spec.geometry.get("swiglu_limit");
-        if self == Self::GlmFlash {
-            if spec.geometry["hidden"].as_u64() != Some(4096)
-                || spec.geometry["units"].as_u64() != Some(16)
-                || spec.geometry["top_k"].as_u64() != Some(if shared { 1 } else { 8 })
-                || clamp.and_then(|v| v.as_f64()) != Some(10.0) {
-                return Err(invalid("Flash compute requires hidden4096/units16/top8 (shared top1)/clamp10"));
-            }
-        } else if clamp.is_some_and(|v| v.as_f64() != Some(0.0)) {
-            return Err(invalid("unclipped GLM compute cannot carry a SwiGLU clamp"));
+        let clamp_ok = match clamp {
+            None => g.swiglu_limit == 0.0,
+            Some(value) => value.as_f64() == Some(g.swiglu_limit),
+        };
+        if spec.geometry["hidden"].as_u64() != Some(g.hidden as u64)
+            || spec.geometry["units"].as_u64() != Some(g.units as u64)
+            || spec.geometry["top_k"].as_u64() != Some(if shared { 1 } else { g.top_k as u64 })
+            || !clamp_ok {
+            return Err(invalid("compute geometry or SwiGLU clamp disagrees with compiled family"));
         }
         Ok(())
     }
@@ -360,9 +376,10 @@ fn validate_glue(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(), Ma
             let h = field("hidden")?;
             let shared = kind == KernelKind::SharedGroup;
             let grouped = kind == KernelKind::GroupedGroup;
+            let expected = family.geometry();
             if family == KernelFamily::GlmFlash
-                && (h != 4096 || e != if shared { 1 } else { 288 }
-                    || t != if shared { 1 } else { 8 }) {
+                && (h != expected.hidden as u64 || e != if shared { 1 } else { expected.experts as u64 }
+                    || t != if shared { 1 } else { expected.top_k as u64 }) {
                 return Err(invalid("Flash grouping family geometry mismatch"));
             }
             let r = group_rows(spec)? as u64;
@@ -639,6 +656,24 @@ mod tests {
         }
         assert_eq!(KernelFamily::from_geometry(4096, 16, 8, 288).unwrap(), KernelFamily::GlmFlash);
         assert!(KernelFamily::from_geometry(4096, 16, 8, 256).is_err());
+    }
+
+    #[test]
+    fn legacy_compute_allows_only_absent_or_zero_clamp() {
+        let mut s = spec();
+        validate(&s).unwrap();
+        s.geometry["swiglu_limit"] = serde_json::json!(0.0);
+        validate(&s).unwrap();
+        for clamp in [serde_json::json!(10.0), serde_json::json!(-1.0),
+            serde_json::json!("0"), serde_json::Value::Null] {
+            s.geometry["swiglu_limit"] = clamp;
+            assert!(validate(&s).is_err());
+        }
+        for family in [KernelFamily::Glm, KernelFamily::GlmFlash] {
+            let g = family.geometry();
+            assert_eq!(KernelFamily::from_geometry(g.hidden, g.units, g.top_k, g.experts).unwrap(), family);
+            assert!(KernelFamily::from_geometry(g.hidden, g.units, 1, g.experts).is_err());
+        }
     }
 
     #[test]
