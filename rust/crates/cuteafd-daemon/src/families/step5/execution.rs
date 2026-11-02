@@ -1573,7 +1573,7 @@ mod tests {
     }
     #[test]
     fn whole_model_native_context_constructs_headers_once() -> Result<()> {
-        use cuteafd_loader::{placement::*, plan::testing};
+        use cuteafd_loader::{placement::*, plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions}};
         use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
         use tracing_subscriber::{layer::Context, prelude::*, registry::LookupSpan, Layer};
         #[derive(Clone, Default)]
@@ -1592,23 +1592,30 @@ mod tests {
         testing::write_step5_exl3_snapshot(fixture.path());
         let checkpoint = Checkpoint::coordinator(fixture.path(), false, true)?;
         let cfg = Config::parse(&checkpoint)?;
-        for ranks in [1, 2] {
+        let manifest = testing::step5_native_manifest(fixture.path());
+        for (ranks, sparks) in [(1, 3), (2, 6)] {
+            let report = testing::plan(fixture.path(), &PlanOptions {
+                placement: ExpertPlacement::from_spark_ranks(sparks),
+                draft_ownership: Some(plan::spec::DraftOwnership::NativeMtp),
+                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                    rtx_bytes: vec![96 << 30; ranks], workspace_manifest: Some(manifest.clone()),
+                    context_tokens: 1 << 20, ..Default::default() }), ..Default::default()
+            })?;
+            assert!(report.wip_launchable(), "{:?}", report.hints);
+            let placement = report.solver_placement.as_ref().context("construction-test placement")?;
+            let onboarded = placement.layers.iter().enumerate().filter_map(|(layer, assignment)|
+                matches!(assignment.experts, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2).then_some(layer))
+                .collect::<Vec<_>>();
+            if ranks == 2 { assert!(!onboarded.is_empty(), "max launch must exercise TP2 onboarding"); }
+            let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: (H * 4) as u64,
+                rows: 64, lanes: 1, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
+            let ownership = ExecutionOwnership::new(&cfg, ranks, LayerExecutionPlan::new(placement, spec)?)?
+                .with_onboarded(onboarded)?;
+            eprintln!("Step construction real-plan ranks={ranks} sparks={sparks} pool={} onboarded={} modes={:?}",
+                placement.pool_tokens, ownership.onboarded_layers().len(), ownership.execution().modes());
             let counts = Constructions::default();
             let subscriber = tracing_subscriber::registry().with(counts.clone());
             tracing::subscriber::with_default(subscriber, || -> Result<()> {
-                let modes = (0..92).map(|layer| {
-                    if ranks == 2 && !cfg.full[layer] { LayerMode::HeadSplit }
-                    else { LayerMode::Whole { gpu: ((layer / 4) % ranks) as u8, ffn: FfnMode::Owner } }
-                }).collect::<Vec<_>>();
-                let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: (H * 4) as u64,
-                    rows: 64, lanes: 1, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
-                let placement = Placement { pool_tokens: 0, pool_limits: PoolLimits(vec![]),
-                    attention_placement: AttentionPlacement::Layers, attention_by_kind: vec![], peer_row_bytes: 0,
-                    onboard_layers: 0, max_pool_tokens_no_onboard: 0,
-                    layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Spark }).collect(),
-                    movables: vec![], expert_ranges: vec![], residual: residual_homes(&modes, &spec)?,
-                    hops: plan_hops(&modes, &spec)?, tp2: None, items: vec![] };
-                let ownership = ExecutionOwnership::new(&cfg, ranks, LayerExecutionPlan::new(&placement, spec)?)?;
                 let plan = NativePlan::new(&checkpoint, &ownership,
                     Rc::new(CoordinatorContract::from_checkpoint(&checkpoint)?))?;
                 // Admission and native allocation traverse the same immutable owners.
