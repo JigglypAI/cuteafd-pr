@@ -425,9 +425,10 @@ impl RuntimeInputs {
 
 pub fn admit(checkpoint: &Checkpoint, inputs: &RuntimeInputs) -> Result<Admission> {
     let cfg = Config::parse(checkpoint)?;
+    let contract = super::coordinator::CoordinatorContract::from_checkpoint(checkpoint)?;
     admit_with(&cfg, inputs, |ownership| {
         (0..ownership.ranks())
-            .map(|rank| super::native::rank_admission(checkpoint, ownership, rank, inputs.unit_rows(),
+            .map(|rank| super::native::rank_admission_from_contract(&contract, &cfg, ownership, rank, inputs.unit_rows(),
                 inputs.rows, inputs.logit_rows()))
             .collect()
     })
@@ -451,9 +452,10 @@ pub fn admit_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize) 
         .checked_add(super::native::mtp_native_scratch_bytes(checkpoint, depth, inputs.rows)?)
         .context("Step-5 predictor native forecast overflow")?;
     let workspace = super::native::mtp_forecast_workspace(inputs.unit_rows(), depth, inputs.kv_format)?;
+    let contract = super::coordinator::CoordinatorContract::from_checkpoint(checkpoint)?;
     admit_depth_with(&cfg, inputs, depth, |ownership| {
         (0..ownership.ranks()).map(|rank| {
-            let mut native = super::native::rank_admission(checkpoint, ownership, rank, inputs.unit_rows(),
+            let mut native = super::native::rank_admission_from_contract(&contract, &cfg, ownership, rank, inputs.unit_rows(),
                 inputs.rows, inputs.logit_rows())?;
             if rank == usize::from(ownership.execution().spec().head_gpu) {
                 native.immutable = native.immutable.checked_add(weights)
@@ -850,6 +852,60 @@ mod tests {
                 o.ranks()
             ])
         })
+    }
+
+    #[test]
+    fn reused_header_contract_preserves_every_candidate_and_resolved_plan() -> Result<()> {
+        use super::super::{coordinator::{CoordinatorContract, RankWeightLayout}, native};
+        let fixture = super::super::tests::exl3_snapshot();
+        let checkpoint = Checkpoint::open(fixture.path())?;
+        let cfg = Config::parse(&checkpoint)?;
+        let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
+        let mut inputs = inputs(2);
+        inputs.requested_pool = None;
+        inputs.context = EXTENT;
+        inputs.inventory.spark_ranks = 6;
+        inputs.kv_format = crate::families::qwen4::Qwen4KvCache::Fp8;
+        let groups = cfg.full[..cfg.layers].iter().map(|&full| (full, None)).collect::<Vec<_>>();
+        let mut recipes = Vec::new();
+        for boundary in attention::owner_boundaries(&groups, false) {
+            let owners = (0..cfg.layers).map(|layer| u8::from(layer >= boundary)).collect::<Vec<_>>();
+            let ownership = inputs.ownership_for(&cfg, &owners)?;
+            let mut legacy = Vec::new();
+            let mut reused = Vec::new();
+            for rank in 0..2 {
+                // Reproduce the old independent header builds, not the optimized wrapper.
+                let old_contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
+                let old_layout = RankWeightLayout::for_execution(&checkpoint, rank, &ownership)?;
+                legacy.push(native::rank_admission_for_layout(&old_contract, &cfg, &old_layout,
+                    &ownership, rank, inputs.unit_rows(), inputs.rows, inputs.logit_rows())?);
+                reused.push(native::rank_admission_from_contract(&contract, &cfg, &ownership, rank,
+                    inputs.unit_rows(), inputs.rows, inputs.logit_rows())?);
+            }
+            assert_eq!(legacy, reused, "CSA boundary {boundary}");
+            recipes.push((ownership.execution().modes().to_vec(), legacy, reused));
+        }
+        assert_eq!(recipes.len(), 24);
+        // Replay attested old/new bytes so neither resolved-plan comparison repeats header I/O.
+        let resolve = |old: bool| -> Result<Admission> {
+            let started = std::time::Instant::now();
+            let result = admit_with(&cfg, &inputs, |ownership| {
+                let (_, legacy, reused) = recipes.iter().find(|(modes, _, _)|
+                    modes == ownership.execution().modes()).context("missing CSA candidate")?;
+                Ok(if old { legacy.clone() } else { reused.clone() })
+            })?;
+            assert!(started.elapsed() < std::time::Duration::from_secs(30));
+            Ok(result)
+        };
+        let old = resolve(true)?;
+        let new = resolve(false)?;
+        assert_eq!(serde_json::to_vec(&old.placement)?, serde_json::to_vec(&new.placement)?);
+        assert_eq!(old.ownership.execution().modes(), new.ownership.execution().modes());
+        assert_eq!(old.cache, new.cache);
+        assert_eq!(old.marks, new.marks);
+        assert_eq!(old.reservations, new.reservations);
+        assert_eq!(serde_json::to_vec(&old.fixed)?, serde_json::to_vec(&new.fixed)?);
+        Ok(())
     }
 
     #[test]

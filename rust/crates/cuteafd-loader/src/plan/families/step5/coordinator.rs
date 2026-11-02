@@ -225,8 +225,14 @@ impl RankWeightLayout {
         ownership: Option<&super::ownership::ExecutionOwnership>) -> Result<Self> {
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         let cfg = Config::parse(checkpoint)?;
+        Self::from_contract(&contract, &cfg, rank, ranks, ownership)
+    }
+
+    pub(super) fn from_contract(contract: &CoordinatorContract, cfg: &Config,
+        rank: usize, ranks: usize, ownership: Option<&super::ownership::ExecutionOwnership>) -> Result<Self> {
+        if let Some(ownership) = ownership { ownership.validate_config(cfg)?; }
         let mut layout = Self::from_native(&contract.weights, rank, ranks, ownership)?;
-        layout.attach_core(&cfg, &contract.core, ownership, |layer| layer < cfg.layers)?;
+        layout.attach_core(cfg, &contract.core, ownership, |layer| layer < cfg.layers)?;
         Ok(layout)
     }
 
