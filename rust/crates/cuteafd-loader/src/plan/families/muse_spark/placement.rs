@@ -86,7 +86,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 loaded_bytes: 0 } }).collect(),
         spark_ranks: ranks, prefill, full_prefill_logits: opts.full_prefill_logits, slots, context,
         automatic_context: opts.context_tokens == 0,
-        requested_pool: opts.pool_tokens.filter(|n| *n > 0), onboard: opts.onboard.unwrap_or(Onboard::Auto),
+        requested_pool: opts.pool_tokens.filter(|n| *n > 0),
+        onboard: opts.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto),
         spark_budget_bytes: opts.spark_allocation_budget_bytes.unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES),
         partial_bf16_max_rows: opts.muse_partial_bf16_max_rows,
         partial_wide_format: opts.muse_partial_wide_format,
@@ -158,7 +159,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         layers; sliding rings {} B/sequence over {} layers", placed.onboard_layers, placed.pool_tokens,
         cfg.kv_record_bytes() * cfg.full_layers(), cfg.full_layers(), rings, cfg.sliding_layers()));
     for gpu in 0..gpus {
-        let mut device = DeviceLayout { kind: DeviceKind::Rtx, index: gpu as u32, capacity_bytes: opts.rtx_bytes[gpu],
+        let mut device = DeviceLayout { kind: DeviceKind::Rtx, index: gpu as u32, capacity_bytes: opts.rtx_bytes[gpu], worker_budget_bytes: 0,
             items: placed.items[gpu].clone(), kv_tokens: placed.pool_tokens };
         device.items.push(Item::new(Category::Reserved, "coordinator headroom", "", opts.headroom_bytes, Basis::Formula)
             .with_lifetime(cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve));
@@ -182,7 +183,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     for rank in 0..ranks {
         let resident = spark_budget.resident[rank][onboarded..].iter().sum::<u64>();
         widest = widest.max(resident);
-        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_bytes,
+        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_bytes, worker_budget_bytes: opts.spark_bytes,
             kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed experts (intermediate slices)",
                 model.expert_formats.join("+"), resident, Basis::Exact)] };
         if let Err(error) = usize::try_from(slots).map_err(anyhow::Error::from)

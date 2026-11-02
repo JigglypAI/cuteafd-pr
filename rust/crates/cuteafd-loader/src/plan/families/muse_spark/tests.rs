@@ -327,13 +327,20 @@ fn onboarding_follows_the_installed_package() {
     assert!(refused.solver_placement.is_none(), "a missing package must refuse, not degrade");
     assert!(refused.hints.iter().any(|h| h.what.contains("image lacks exl3-muse-k45/rtx-tp2; rebuild with the Muse \
         coordinator scope")), "{:?}", refused.hints);
+    let mut all = missing.clone();
+    all.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::All);
+    let routed = input.expert_catalog().unwrap().routed_experts().routed_layers();
+    assert_eq!(routed, all_layers().len());
+    assert_eq!(all.layout.as_ref().unwrap().resolve_onboard(routed), Some(crate::placement::Onboard::Layers(routed)));
+    let refused = input.plan(&all).unwrap();
+    assert!(refused.hints.iter().any(|h| h.what.contains("image lacks exl3-muse-k45/rtx-tp2")), "{:?}", refused.hints);
     let mut explicit = missing.clone();
-    explicit.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(2));
+    explicit.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(2));
     let refused = input.plan(&explicit).unwrap();
     assert!(refused.hints.iter().any(|h| h.what.contains("image lacks exl3-muse-k45/rtx-tp2")), "{:?}", refused.hints);
     // Explicit 0 is a labelled measurement arm; it needs no package.
     let mut zero = missing.clone();
-    zero.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(0));
+    zero.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
     assert_eq!(input.plan(&zero).unwrap().onboard_layers, Some(0));
     // Without any image (a bare plan) onboarding is planned as the default.
     let report = input.plan(&auto).unwrap();

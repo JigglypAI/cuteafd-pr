@@ -131,7 +131,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     // automatic placement Spark-only (`check_package` refuses it once memory
     // places a layer); an explicit layer count without it is refused here.
     if let LocalPackage::Missing(package) = &local {
-        let explicit = matches!(onboard, Onboard::Layers(n) if n > 0) || matches!(onboard, Onboard::Fraction(f) if f > 0.0);
+        let explicit = matches!(onboard, Onboard::Layers(n) if n > 0);
         ensure!(!explicit, "{}", LocalPackage::refusal(package));
     }
     let local_workspace = local.workspace();
