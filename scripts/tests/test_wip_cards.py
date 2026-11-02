@@ -920,6 +920,43 @@ def test_arm_overrides_only_selected_arm_and_card(entry, tmp_path, monkeypatch, 
     assert '"GLM5_FLASH_PREFILL_BATCH": "on"' in capsys.readouterr().out
 
 
+def test_arm_config_edits_apply_after_generation(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+        '--matrix', '--arm', 'old=b:s', '--arm', 'new=c:s', '--state', str(state),
+        '--arm-set', 'old:COORDINATOR_GPU=0', '--arm-unset', 'old:COORDINATOR_GPUS',
+        '--arm-set', 'new:COORDINATOR_GPUS=1', '--arm-set', 'old:EMPTY=', '--dry-run'])
+    assert cards.main() == 0
+    for job in json.loads((state / 'plan.json').read_text())['jobs']:
+        dest = Path(job['state'])
+        settings = job['entry']['set']
+        assert cards.config(dest / 'base.config') == settings
+        assert json.loads((dest / 'matrix.json').read_text())['entries'][0]['set'] == settings
+        assert json.loads((dest / 'job.json').read_text())['entry']['set'] == settings
+        if job['arm'] == 'old':
+            assert settings['COORDINATOR_GPU'] == '0' and settings['EMPTY'] == ''
+            assert 'COORDINATOR_GPUS' not in settings
+        else:
+            assert settings['COORDINATOR_GPUS'] == '1' and 'COORDINATOR_GPU' not in settings
+
+
+@pytest.mark.parametrize('extra,match', [
+    (['--arm-set', 'foreign:MODEL_ID=x'], 'unknown override arm'),
+    (['--arm-unset', 'foreign:MODEL_ID'], 'unknown override arm'),
+    (['--arm-unset', 'base:API_KEY_FILE'], 'driver owns'),
+    (['--arm-set', 'base:API_KEY_FILE=x'], 'driver owns'),
+    (['--arm-unset', 'base:bad-key'], 'invalid override'),
+    (['--arm-set', 'base:MODEL_ID=x', '--arm-unset', 'base:MODEL_ID'], 'both set and unset'),
+])
+def test_arm_config_edit_validation(entry, tmp_path, monkeypatch, extra, match):
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(_kit(tmp_path, entry)),
+        '--cards', 'v41-min', '--matrix', '--arm', 'base=b:s', '--state', str(tmp_path / 'state'),
+        '--dry-run', *extra])
+    with pytest.raises(ValueError, match=match):
+        cards.main()
+
+
 @pytest.mark.parametrize('override,match', [('foreign:v41-min:MODEL_ID=x', 'unknown override arm'),
     ('base:foreign:MODEL_ID=x', 'selected cards'), ('base:v41-min:API_KEY_FILE=x', 'driver owns')])
 def test_arm_override_validation(entry, tmp_path, monkeypatch, override, match):
