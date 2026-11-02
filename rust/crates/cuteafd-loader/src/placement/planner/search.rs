@@ -686,6 +686,7 @@ pub fn solve(
         &Facts {
             allocations: vec![],
             deferred: vec![],
+            sequential: vec![],
             allowances: vec![],
         },
         &budgets,

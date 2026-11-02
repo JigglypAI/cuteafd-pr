@@ -212,11 +212,54 @@ impl Decisions {
             .len() as u64
     }
 }
+/// Exact short-lived owners that never coexist. The phase peak is their
+/// maximum, but reconciliation still requires every allocation/free edge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sequential {
+    pub id: String,
+    pub members: Vec<Allocation>,
+}
+impl Sequential {
+    pub fn peak(&self) -> u64 {
+        self.members.iter().map(|a| a.bytes).max().unwrap_or(0)
+    }
+
+    fn validate(&self) -> Result<(), Refusal> {
+        let Some(first) = self.members.first() else {
+            return Err(Refusal::InvalidFact(
+                "empty sequential allocation group".into(),
+            ));
+        };
+        let mut ids = BTreeSet::new();
+        if self.id.is_empty()
+            || first.lifetime.first != first.lifetime.last
+            || first.lifetime.last >= Phase::Ready
+            || self.members.iter().any(|a| {
+                a.id.is_empty()
+                    || !ids.insert(a.id.as_str())
+                    || a.bytes == 0
+                    || a.alignment == 0
+                    || !a.alignment.is_power_of_two()
+                    || a.location != first.location
+                    || a.lifetime != first.lifetime
+                    || a.view.is_some()
+            })
+        {
+            return Err(Refusal::InvalidFact(format!(
+                "invalid sequential group {}",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts {
     pub allocations: Vec<Allocation>,
     /// Reserved by a later owner port; never evidence that it was allocated.
     pub deferred: Vec<Allocation>,
+    pub sequential: Vec<Sequential>,
     pub allowances: Vec<Allowance>,
 }
 
@@ -345,8 +388,23 @@ fn validate(facts: &Facts, budgets: &[Budget]) -> Result<(), Refusal> {
             }
         }
     }
+    let mut groups = BTreeSet::new();
+    for group in &facts.sequential {
+        group.validate()?;
+        if !groups.insert(group.id.as_str()) {
+            return Err(Refusal::InvalidFact(format!(
+                "duplicate sequential group {}",
+                group.id
+            )));
+        }
+    }
     let mut ids = BTreeMap::new();
-    for allocation in facts.allocations.iter().chain(&facts.deferred) {
+    for allocation in facts
+        .allocations
+        .iter()
+        .chain(&facts.deferred)
+        .chain(facts.sequential.iter().flat_map(|g| &g.members))
+    {
         if allocation.id.is_empty()
             || ids.insert(allocation.id.clone(), allocation).is_some()
             || allocation.bytes == 0
@@ -366,7 +424,12 @@ fn validate(facts: &Facts, budgets: &[Budget]) -> Result<(), Refusal> {
             let backing = ids
                 .get(&view.backing)
                 .ok_or_else(|| Refusal::InvalidFact(format!("missing backing {}", view.backing)))?;
-            if backing.view.is_some()
+            if facts
+                .sequential
+                .iter()
+                .flat_map(|g| &g.members)
+                .any(|a| a.id == view.backing)
+                || backing.view.is_some()
                 || backing.location != allocation.location
                 || view
                     .offset
@@ -409,10 +472,18 @@ pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, R
                         && budget.locations.contains(&a.location)
                 })
                 .collect();
-            let owned = owners.iter().try_fold(0u64, |n, a| {
+            let mut owned = owners.iter().try_fold(0u64, |n, a| {
                 n.checked_add(a.bytes)
                     .ok_or(Refusal::Overflow("phase owners"))
             })?;
+            for group in &facts.sequential {
+                let member = &group.members[0];
+                if member.lifetime.contains(phase) && budget.locations.contains(&member.location) {
+                    owned = owned
+                        .checked_add(group.peak())
+                        .ok_or(Refusal::Overflow("sequential phase peak"))?;
+                }
+            }
             let opaque = facts
                 .allowances
                 .iter()
@@ -430,7 +501,20 @@ pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, R
                     phase,
                     required,
                     available,
-                    owners: owners.iter().map(|a| a.id.clone()).collect(),
+                    owners: owners
+                        .iter()
+                        .map(|a| a.id.clone())
+                        .chain(
+                            facts
+                                .sequential
+                                .iter()
+                                .filter(|g| {
+                                    g.members[0].lifetime.contains(phase)
+                                        && budget.locations.contains(&g.members[0].location)
+                                })
+                                .map(|g| g.id.clone()),
+                        )
+                        .collect(),
                 });
             }
             rows.push(PhaseBudget {
@@ -466,12 +550,161 @@ pub struct Observation {
     pub freed: Option<Phase>,
 }
 
+#[derive(Debug, Clone)]
+pub enum OwnerEvent {
+    Allocated { receipt: Receipt, phase: Phase },
+    Freed { receipt: Receipt, phase: Phase },
+}
+
 /// Startup observations carry actual creation/free phases, not merely the
-/// planned lifetime copied onto a live owner's receipt.
+/// planned lifetime copied onto a live owner's receipt. Sequential sources
+/// require the ordered physical event stream instead.
 pub fn reconcile_history(
     plan: &ResolvedPlan,
     phase: Phase,
     observations: &[Observation],
+) -> Result<(), Refusal> {
+    reconcile_observations(plan, phase, observations, false)
+}
+
+/// Replay every physical owner in allocation order, including freed packing
+/// sources. Views are not allocations and are supplied separately.
+pub fn reconcile_events(
+    plan: &ResolvedPlan,
+    phase: Phase,
+    events: &[OwnerEvent],
+    views: &[Observation],
+) -> Result<(), Refusal> {
+    validate(&plan.facts, &plan.budgets)?;
+    let mut expected = plan
+        .facts
+        .allocations
+        .iter()
+        .filter(|a| a.view.is_none())
+        .map(|a| (a.id.as_str(), (None, a)))
+        .collect::<BTreeMap<_, _>>();
+    expected.extend(
+        plan.facts
+            .sequential
+            .iter()
+            .enumerate()
+            .flat_map(|(group, g)| {
+                g.members
+                    .iter()
+                    .map(move |a| (a.id.as_str(), (Some(group), a)))
+            }),
+    );
+    let mut errors = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut active = BTreeMap::<&str, &Receipt>::new();
+    let mut groups = BTreeMap::<usize, &str>::new();
+    let mut observations = BTreeMap::<&str, Observation>::new();
+    let mut previous = Phase::Load;
+    for event in events {
+        let (receipt, at, allocate) = match event {
+            OwnerEvent::Allocated { receipt, phase } => (receipt, *phase, true),
+            OwnerEvent::Freed { receipt, phase } => (receipt, *phase, false),
+        };
+        let id = receipt.allocation.id.as_str();
+        if at < previous || at > phase {
+            errors.push(Mismatch::Lifetime(id.into()));
+        }
+        previous = at;
+        let Some(&(group, spec)) = expected.get(id) else {
+            errors.push(Mismatch::Extra(id.into()));
+            continue;
+        };
+        if receipt.allocation != *spec {
+            errors.push(Mismatch::Contract(id.into()));
+        }
+        if at
+            != if allocate {
+                spec.lifetime.first
+            } else {
+                spec.lifetime.last
+            }
+        {
+            errors.push(Mismatch::Lifetime(id.into()));
+        }
+        if allocate {
+            if !seen.insert(id) {
+                errors.push(Mismatch::Duplicate(id.into()));
+            }
+            let end = receipt.address.checked_add(receipt.allocation.bytes);
+            if receipt.address == 0 || receipt.address % spec.alignment != 0 || end.is_none() {
+                errors.push(Mismatch::Address(id.into()));
+            }
+            for live in active.values() {
+                if live.allocation.location == receipt.allocation.location
+                    && end
+                        .zip(live.address.checked_add(live.allocation.bytes))
+                        .is_none_or(|(end, live_end)| {
+                            live.address < end && receipt.address < live_end
+                        })
+                {
+                    errors.push(Mismatch::Address(format!("{} / {id}", live.allocation.id)));
+                }
+            }
+            if let Some(group) = group {
+                if groups.insert(group, id).is_some() {
+                    errors.push(Mismatch::Lifetime(plan.facts.sequential[group].id.clone()));
+                }
+            } else {
+                observations.entry(id).or_insert_with(|| Observation {
+                    receipt: receipt.clone(),
+                    created: at,
+                    freed: None,
+                });
+            }
+            if active.insert(id, receipt).is_some() {
+                errors.push(Mismatch::Duplicate(id.into()));
+            }
+        } else {
+            match active.remove(id) {
+                Some(live)
+                    if live.allocation == receipt.allocation && live.address == receipt.address => {
+                }
+                _ => errors.push(Mismatch::Lifetime(id.into())),
+            }
+            if let Some(group) = group {
+                if groups.remove(&group) != Some(id) {
+                    errors.push(Mismatch::Lifetime(id.into()));
+                }
+            } else if let Some(observation) = observations.get_mut(id) {
+                observation.freed = Some(at);
+            }
+        }
+    }
+    for group in &plan.facts.sequential {
+        for spec in &group.members {
+            if spec.lifetime.first <= phase && !seen.contains(spec.id.as_str()) {
+                errors.push(Mismatch::Missing(spec.id.clone()));
+            }
+            if active.contains_key(spec.id.as_str()) {
+                errors.push(Mismatch::Lifetime(spec.id.clone()));
+            }
+        }
+    }
+    for view in views {
+        if view.receipt.allocation.view.is_none() {
+            errors.push(Mismatch::Contract(view.receipt.allocation.id.clone()));
+        }
+    }
+    if !errors.is_empty() {
+        return Err(Refusal::Reconciliation(errors));
+    }
+    let observations = observations
+        .into_values()
+        .chain(views.iter().cloned())
+        .collect::<Vec<_>>();
+    reconcile_observations(plan, phase, &observations, true)
+}
+
+fn reconcile_observations(
+    plan: &ResolvedPlan,
+    phase: Phase,
+    observations: &[Observation],
+    ordered_proved: bool,
 ) -> Result<(), Refusal> {
     validate(&plan.facts, &plan.budgets)?;
     let mut seen = BTreeSet::new();
@@ -504,6 +737,15 @@ pub fn reconcile_history(
             errors.push(Mismatch::Missing(spec.id.clone()));
         }
     }
+    if !ordered_proved {
+        for group in &plan.facts.sequential {
+            for spec in &group.members {
+                if spec.lifetime.first <= phase {
+                    errors.push(Mismatch::Missing(spec.id.clone()));
+                }
+            }
+        }
+    }
     if !errors.is_empty() {
         return Err(Refusal::Reconciliation(errors));
     }
@@ -513,7 +755,7 @@ pub fn reconcile_history(
             .filter(|o| o.created <= at && o.freed.is_none_or(|freed| at <= freed))
             .map(|o| o.receipt.clone())
             .collect::<Vec<_>>();
-        reconcile(plan, at, &receipts)?;
+        reconcile_snapshot(plan, at, &receipts, ordered_proved)?;
     }
     Ok(())
 }
@@ -550,6 +792,15 @@ pub fn reconcile_usage(
 /// Receipts describe actual owners. A view address must equal backing+offset;
 /// overlapping physical owners and overlapping independent slot views fail.
 pub fn reconcile(plan: &ResolvedPlan, phase: Phase, receipts: &[Receipt]) -> Result<(), Refusal> {
+    reconcile_snapshot(plan, phase, receipts, false)
+}
+
+fn reconcile_snapshot(
+    plan: &ResolvedPlan,
+    phase: Phase,
+    receipts: &[Receipt],
+    ordered_proved: bool,
+) -> Result<(), Refusal> {
     validate(&plan.facts, &plan.budgets)?;
     let expected: BTreeMap<_, _> = plan
         .facts
@@ -565,6 +816,16 @@ pub fn reconcile(plan: &ResolvedPlan, phase: Phase, receipts: &[Receipt]) -> Res
             plan.facts
                 .deferred
                 .iter()
+                .map(|a| Mismatch::Missing(a.id.clone())),
+        );
+    }
+    if !ordered_proved {
+        errors.extend(
+            plan.facts
+                .sequential
+                .iter()
+                .flat_map(|g| &g.members)
+                .filter(|a| a.lifetime.first <= phase)
                 .map(|a| Mismatch::Missing(a.id.clone())),
         );
     }
@@ -618,6 +879,8 @@ pub fn reconcile(plan: &ResolvedPlan, phase: Phase, receipts: &[Receipt]) -> Res
                 .checked_add(left.bytes)
                 .zip(b.address.checked_add(right.bytes))
                 .is_none_or(|(end_a, end_b)| a.address < end_b && b.address < end_a);
+            // Ordered replay already proves physical overlap at each edge;
+            // inclusive phase snapshots cannot distinguish same-phase reuse.
             let distinct_backings = left.view.is_none() && right.view.is_none();
             let distinct_slots =
                 left.view
@@ -629,7 +892,7 @@ pub fn reconcile(plan: &ResolvedPlan, phase: Phase, receipts: &[Receipt]) -> Res
                             && left.slot.is_some()
                             && right.slot.is_some()
                     });
-            if overlap && (distinct_backings || distinct_slots) {
+            if overlap && ((distinct_backings && !ordered_proved) || distinct_slots) {
                 errors.push(Mismatch::Address(format!("{} / {}", left.id, right.id)));
             }
         }

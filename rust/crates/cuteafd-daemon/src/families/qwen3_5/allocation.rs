@@ -3,7 +3,8 @@ use super::*;
 use cuteafd_core::memory_layout::Category;
 use cuteafd_ffi::memory_ledger::{self, AllocationAudit, AllocationEvent, Space};
 use cuteafd_loader::placement::planner::{
-    self, Allocation as Spec, Domain, Lifetime, Location, Observation, Phase, Receipt, ResolvedPlan,
+    self, Allocation as Spec, Domain, Lifetime, Location, Observation, OwnerEvent, Phase, Receipt,
+    ResolvedPlan,
 };
 use std::collections::BTreeMap;
 
@@ -293,8 +294,16 @@ pub(super) fn reconcile_target(
         }
     }
     receipts.extend(view_receipts);
-    reconcile_startup(plan, library, device, Phase::PostTargetKv, audit, loaded_events,
-        audit.events().len(), &receipts)?;
+    reconcile_startup(
+        plan,
+        library,
+        device,
+        Phase::PostTargetKv,
+        audit,
+        loaded_events,
+        audit.events().len(),
+        &receipts,
+    )?;
     Ok(receipts)
 }
 
@@ -307,137 +316,94 @@ pub(super) struct Startup {
 }
 
 impl Startup {
-    pub fn ready(&mut self, library: &NativeLibrary, device: Device<'_>,
+    pub fn ready(
+        &mut self,
+        library: &NativeLibrary,
+        device: Device<'_>,
         selector: &crate::shared::token_io::TokenSelector<'_>,
-        cache: &mut cuteafd_engine::prefix::PrefixCache<crate::shared::prefix::CudaCopyEngine<'_>>) -> Result<()> {
-        let lifetime = Lifetime { first: Phase::Warmup, last: Phase::Growth };
+        cache: &mut cuteafd_engine::prefix::PrefixCache<crate::shared::prefix::CudaCopyEngine<'_>>,
+    ) -> Result<()> {
+        let lifetime = Lifetime {
+            first: Phase::Warmup,
+            last: Phase::Growth,
+        };
         let (gpu, pinned) = selector.allocation_buffers();
         let mut receipts = self.receipts.clone();
         for (id, buffer) in gpu {
-            let group = if id.starts_with("selector.sampler.") { "target sampler" } else { "token selector" };
+            let group = if id.starts_with("selector.sampler.") {
+                "target sampler"
+            } else {
+                "token selector"
+            };
             receipts.push(receipt(id, buffer, Category::Workspace, group, lifetime));
         }
         for (id, buffer) in pinned {
             let (category, group) = if id.starts_with("selector.sampler.") {
                 (Category::Workspace, "target sampler")
-            } else { (Category::Staging, "token selector") };
-            receipts.push(Receipt { allocation: Spec::buffer(id, Location::PINNED, buffer.bytes as u64,
-                lifetime, category, group), address: buffer.ptr as u64 });
+            } else {
+                (Category::Staging, "token selector")
+            };
+            receipts.push(Receipt {
+                allocation: Spec::buffer(
+                    id,
+                    Location::PINNED,
+                    buffer.bytes as u64,
+                    lifetime,
+                    category,
+                    group,
+                ),
+                address: buffer.ptr as u64,
+            });
         }
         if let Some(copy) = cache.host_engine_mut() {
             for (index, buffer) in copy.allocation_buffers() {
-                receipts.push(Receipt { allocation: Spec::buffer(format!("host.prefix.{index}"), Location::PINNED,
-                    buffer.bytes as u64, lifetime, Category::Prefix, "retained host prefix chunk"),
-                    address: buffer.ptr as u64 });
+                receipts.push(Receipt {
+                    allocation: Spec::buffer(
+                        format!("host.prefix.{index}"),
+                        Location::PINNED,
+                        buffer.bytes as u64,
+                        lifetime,
+                        Category::Prefix,
+                        "retained host prefix chunk",
+                    ),
+                    address: buffer.ptr as u64,
+                });
             }
         }
-        reconcile_startup(&self.plan, library, device, Phase::Ready, &self.audit,
-            self.loaded_events, self.target_events, &receipts)
+        reconcile_startup(
+            &self.plan,
+            library,
+            device,
+            Phase::Ready,
+            &self.audit,
+            self.loaded_events,
+            self.target_events,
+            &receipts,
+        )
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn reconcile_startup(plan: &ResolvedPlan, library: &NativeLibrary, device: Device<'_>, phase: Phase,
-    audit: &AllocationAudit, loaded_events: usize, target_events: usize, receipts: &[Receipt]) -> Result<()> {
-    planner::reconcile(plan, phase, receipts)?;
-    let mut live = BTreeMap::new();
-    let mut observations = Vec::new();
-    for (index, event) in audit.events().into_iter().enumerate() {
-        let at = if index < loaded_events {
-            Phase::Load
-        } else if index < target_events {
-            Phase::PostTargetKv
-        } else {
-            Phase::Warmup
-        };
-        match event {
-            AllocationEvent::Allocated(a) => {
-                ensure!(
-                    live.insert(a.address, (a, at)).is_none(),
-                    "startup allocation reused a live pointer"
-                );
-            }
-            AllocationEvent::Freed(a) => {
-                let (allocated, created) = live
-                    .remove(&a.address)
-                    .context("free without audited allocation")?;
-                ensure!(
-                    allocated.key.space == Space::Pinned && allocated.key.scope == "embedding",
-                    "unplanned startup transient: {allocated:?}"
-                );
-                observations.push(Observation {
-                    receipt: Receipt {
-                        allocation: Spec::buffer(
-                            "embedding.upload",
-                            Location::PINNED,
-                            allocated.bytes as u64,
-                            Lifetime {
-                                first: Phase::Load,
-                                last: Phase::Load,
-                            },
-                            Category::Staging,
-                            "embedding upload staging",
-                        ),
-                        address: allocated.address as u64,
-                    },
-                    created,
-                    freed: Some(at),
-                });
-            }
-        }
-    }
-    // Match each actual object to an independently recorded FFI owner, including
-    // domain, physical device and bytes. Unknown owners cannot cancel totals.
-    let census = memory_ledger::allocations()
-        .into_iter()
-        .map(|a| (a.address, a))
-        .collect::<BTreeMap<_, _>>();
-    for receipt in receipts {
-        if receipt.allocation.view.is_some() {
-            observations.push(Observation {
-                receipt: receipt.clone(),
-                created: Phase::PostTargetKv,
-                freed: None,
-            });
-            continue;
-        }
-        let (owner, created) = live
-            .remove(&(receipt.address as usize))
-            .context("receipt absent from startup allocation audit")?;
-        let domain = match owner.key.space {
-            Space::Device => Domain::Device,
-            Space::Pinned => Domain::Pinned,
-            Space::Managed => Domain::Managed,
-        };
-        ensure!(
-            domain == receipt.allocation.location.domain
-                && owner.bytes as u64 == receipt.allocation.bytes,
-            "allocation census differs from object receipt {}",
-            receipt.allocation.id
-        );
-        if domain == Domain::Device {
-            ensure!(
-                owner.key.device == device.id,
-                "dense allocation on wrong physical device"
-            );
-        }
-        ensure!(
-            census
-                .get(&owner.address)
-                .is_some_and(|a| a.key == owner.key && a.bytes == owner.bytes),
-            "retained target owner absent from live census"
-        );
-        observations.push(Observation {
-            receipt: receipt.clone(),
-            created,
-            freed: None,
-        });
-    }
-    ensure!(
-        live.is_empty(),
-        "dense allocations without receipts: {live:?}"
-    );
-    planner::reconcile_history(plan, phase, &observations)?;
+fn reconcile_startup(
+    plan: &ResolvedPlan,
+    library: &NativeLibrary,
+    device: Device<'_>,
+    phase: Phase,
+    audit: &AllocationAudit,
+    loaded_events: usize,
+    target_events: usize,
+    receipts: &[Receipt],
+) -> Result<()> {
+    let (events, views) = startup_history(
+        &audit.events(),
+        loaded_events,
+        target_events,
+        None,
+        receipts,
+        device.id,
+        &memory_ledger::allocations(),
+    )?;
+    planner::reconcile_events(plan, phase, &events, &views)?;
     let before = match plan.budgets[0].baseline {
         planner::Baseline::Sampled { free, .. } => free,
         _ => anyhow::bail!("live reconciliation requires a before-weights sample"),
@@ -452,82 +418,514 @@ fn reconcile_startup(plan: &ResolvedPlan, library: &NativeLibrary, device: Devic
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn startup_history(
+    audit: &[AllocationEvent],
+    loaded_events: usize,
+    target_events: usize,
+    draft_events: Option<usize>,
+    receipts: &[Receipt],
+    device: i32,
+    census: &[memory_ledger::AllocationRecord],
+) -> Result<(Vec<OwnerEvent>, Vec<Observation>)> {
+    ensure!(
+        loaded_events <= target_events
+            && target_events <= audit.len()
+            && draft_events.is_none_or(|end| end >= target_events && end <= audit.len()),
+        "invalid startup audit boundaries"
+    );
+    let key = |a: &memory_ledger::AllocationRecord| (a.key.space, a.key.device, a.address);
+    let mut live = BTreeMap::new();
+    let mut events = Vec::new();
+    for (index, event) in audit.iter().enumerate() {
+        let at = if index < loaded_events {
+            Phase::Load
+        } else if index < target_events {
+            Phase::PostTargetKv
+        } else if draft_events.is_some_and(|end| index < end) {
+            Phase::DraftLoad
+        } else {
+            Phase::Warmup
+        };
+        match event {
+            AllocationEvent::Allocated(a) => {
+                let domain = match a.key.space {
+                    Space::Device => Domain::Device,
+                    Space::Pinned => Domain::Pinned,
+                    Space::Managed => Domain::Managed,
+                };
+                if domain != Domain::Pinned {
+                    ensure!(
+                        a.key.device == device,
+                        "dense allocation on wrong physical device"
+                    );
+                }
+                let receipt = if a.key.space == Space::Pinned && a.key.scope == "embedding" {
+                    Receipt {
+                        allocation: Spec::buffer(
+                            "embedding.upload",
+                            Location::PINNED,
+                            a.bytes as u64,
+                            Lifetime {
+                                first: Phase::Load,
+                                last: Phase::Load,
+                            },
+                            Category::Staging,
+                            "embedding upload staging",
+                        ),
+                        address: a.address as u64,
+                    }
+                } else if a.key.scope == "draft.pack.source" {
+                    ensure!(
+                        domain == Domain::Device,
+                        "packing source is not device memory"
+                    );
+                    Receipt {
+                        allocation: Spec::buffer(
+                            a.key.owner.context("packing source without owner ID")?,
+                            Location::coordinator(0),
+                            a.bytes as u64,
+                            Lifetime {
+                                first: Phase::DraftLoad,
+                                last: Phase::DraftLoad,
+                            },
+                            Category::Drafter,
+                            "BF16 packing source",
+                        ),
+                        address: a.address as u64,
+                    }
+                } else {
+                    receipts
+                        .iter()
+                        .find(|r| {
+                            r.allocation.view.is_none()
+                                && r.address == a.address as u64
+                                && r.allocation.location.domain == domain
+                        })
+                        .context("audited allocation absent from independent owner receipts")?
+                        .clone()
+                };
+                ensure!(
+                    receipt.allocation.bytes == a.bytes as u64,
+                    "allocation census differs from object receipt {}",
+                    receipt.allocation.id
+                );
+                events.push(OwnerEvent::Allocated {
+                    receipt: receipt.clone(),
+                    phase: at,
+                });
+                ensure!(
+                    live.insert(key(a), (*a, receipt)).is_none(),
+                    "startup allocation reused a live pointer"
+                );
+            }
+            AllocationEvent::Freed(a) => {
+                let (allocated, receipt) = live
+                    .remove(&key(a))
+                    .context("free without audited allocation")?;
+                ensure!(
+                    allocated.key == a.key && allocated.bytes == a.bytes,
+                    "free differs from audited owner"
+                );
+                events.push(OwnerEvent::Freed { receipt, phase: at });
+            }
+        }
+    }
+    let current = census
+        .iter()
+        .map(|a| (key(a), a))
+        .collect::<BTreeMap<_, _>>();
+    for (k, (owner, _)) in &live {
+        ensure!(
+            current
+                .get(k)
+                .is_some_and(|a| a.key == owner.key && a.bytes == owner.bytes),
+            "retained owner absent from live census"
+        );
+    }
+    let views = receipts
+        .iter()
+        .filter(|r| r.allocation.view.is_some())
+        .map(|r| Observation {
+            receipt: r.clone(),
+            created: r.allocation.lifetime.first,
+            freed: None,
+        })
+        .collect();
+    Ok((events, views))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::{memory::device::Allocation, prefix::CudaCopyEngine,
-        token_io::{SelectPlacement, TokenSelector}};
+    use crate::shared::{
+        memory::device::Allocation,
+        prefix::CudaCopyEngine,
+        token_io::{SelectPlacement, TokenSelector},
+    };
     use cuteafd_engine::prefix::{FamilyLayout, MarkStore, PageOwners, PrefixCache, PrefixConfig};
     use planner::{Baseline, Budget, Decisions, Facts, Operation, Pin, PrefillShape, Request};
 
     #[test]
+    fn ordered_audit_preserves_each_packing_source_and_same_phase_reuse() -> Result<()> {
+        use memory_ledger::{AllocationRecord, Key};
+        let target_life = Lifetime::TARGET;
+        let draft_life = Lifetime {
+            first: Phase::DraftLoad,
+            last: Phase::Growth,
+        };
+        let transient = Lifetime {
+            first: Phase::DraftLoad,
+            last: Phase::DraftLoad,
+        };
+        let spec = |id, bytes, lifetime, group| {
+            Spec::buffer(
+                id,
+                Location::coordinator(0),
+                bytes,
+                lifetime,
+                Category::Drafter,
+                group,
+            )
+        };
+        let target = Receipt {
+            allocation: spec("target", 100, target_life, "target"),
+            address: 256,
+        };
+        let draft = Receipt {
+            allocation: spec("draft.weight", 64, draft_life, "draft weights"),
+            address: 4096,
+        };
+        let facts = Facts {
+            allocations: vec![target.allocation.clone(), draft.allocation.clone()],
+            deferred: vec![],
+            sequential: vec![planner::Sequential {
+                id: "packing".into(),
+                members: vec![
+                    spec("draft.pack.a", 300, transient, "BF16 packing source"),
+                    spec("draft.pack.b", 200, transient, "BF16 packing source"),
+                ],
+            }],
+            allowances: vec![],
+        };
+        let budgets = vec![Budget {
+            id: "coordinator.0".into(),
+            locations: vec![Location::coordinator(0)],
+            physical_bytes: 10000,
+            logical_bytes: 10000,
+            baseline: Baseline::Forecast {
+                occupied: 0,
+                source: "ordered audit fixture".into(),
+                assumed: false,
+            },
+            headroom: 0,
+        }];
+        let plan = ResolvedPlan {
+            request: Request {
+                context: 64,
+                pool: Pin::Exact(64),
+                onboard: Pin::Auto,
+                prefill: Pin::Auto,
+                operation: Operation::Serving,
+            },
+            decisions: Decisions {
+                attention: vec![],
+                onboard_layers: vec![vec![]],
+                prefill: PrefillShape {
+                    rows: 4096,
+                    waves: 1,
+                },
+                lanes: 1,
+            },
+            pool_tokens: 64,
+            phases: planner::evaluate(&facts, &budgets)?,
+            budgets,
+            facts,
+        };
+        let record = |address, bytes, scope, owner| AllocationRecord {
+            address,
+            bytes,
+            key: Key {
+                space: Space::Device,
+                device: 0,
+                scope,
+                owner,
+                tensor: None,
+                format: None,
+            },
+        };
+        let target_record = record(256, 100, "workspace", None);
+        let first = record(4096, 300, "draft.pack.source", Some("draft.pack.a"));
+        let second = record(8192, 200, "draft.pack.source", Some("draft.pack.b"));
+        let draft_record = record(4096, 64, "drafter", None);
+        let audit = vec![
+            AllocationEvent::Allocated(target_record),
+            AllocationEvent::Allocated(first),
+            AllocationEvent::Freed(first),
+            AllocationEvent::Allocated(draft_record),
+            AllocationEvent::Allocated(second),
+            AllocationEvent::Freed(second),
+        ];
+        let receipts = [target, draft];
+        let census = [target_record, draft_record];
+        let (events, views) =
+            startup_history(&audit, 0, 1, Some(audit.len()), &receipts, 0, &census)?;
+        assert_eq!(events.len(), audit.len());
+        planner::reconcile_events(&plan, Phase::Ready, &events, &views)?;
+        let mut overlap = audit.clone();
+        overlap.swap(2, 3);
+        assert!(
+            startup_history(&overlap, 0, 1, Some(overlap.len()), &receipts, 0, &census).is_err()
+        );
+        let mut missing_free = audit.clone();
+        missing_free.pop();
+        let (events, views) = startup_history(
+            &missing_free,
+            0,
+            1,
+            Some(missing_free.len()),
+            &receipts,
+            0,
+            &[target_record, draft_record, second],
+        )?;
+        assert!(planner::reconcile_events(&plan, Phase::Ready, &events, &views).is_err());
+        for mutation in 0..4 {
+            let mut bad = audit.clone();
+            if let AllocationEvent::Allocated(a) = &mut bad[1] {
+                match mutation {
+                    0 => a.bytes += 1,
+                    1 => a.key.device = 1,
+                    2 => a.key.owner = None,
+                    3 => a.key.owner = Some("unexpected.source"),
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                startup_history(&bad, 0, 1, Some(bad.len()), &receipts, 0, &census)
+                    .and_then(|(events, views)| planner::reconcile_events(
+                        &plan,
+                        Phase::Ready,
+                        &events,
+                        &views
+                    )
+                    .map_err(anyhow::Error::from))
+                    .is_err(),
+                "mutation {mutation}"
+            );
+        }
+        assert!(
+            startup_history(&audit, 0, 1, Some(audit.len()), &receipts, 0, &census[..1]).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
-    fn actual_ready_census_reconciles_scheduler_owners_and_rejects_individual_mismatches() -> Result<()> {
+    fn actual_ready_census_reconciles_scheduler_owners_and_rejects_individual_mismatches(
+    ) -> Result<()> {
         let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
         let library = fixture.load()?;
         let total = 1 << 30;
         fixture.configure_memory(&library, 0, total)?;
-        let device = Device { library: &library, id: 0 };
+        let device = Device {
+            library: &library,
+            id: 0,
+        };
         for placement in [SelectPlacement::Device, SelectPlacement::Host] {
             let audit = AllocationAudit::start();
             let target = Allocation::new(device, 256)?;
             let target_events = audit.events().len();
-            let target_receipt = receipt("fixture.target".into(), target.buffer,
-                Category::Workspace, "fixture target", Lifetime::TARGET);
-            let lifetime = Lifetime { first: Phase::Warmup, last: Phase::Growth };
-            let mut owners = vec![target_receipt.allocation.clone(),
-                Spec::buffer("selector.output", Location::coordinator(0), 64 * 12,
-                    lifetime, Category::Workspace, "token selector"),
-                Spec::buffer("selector.landing", Location::PINNED, 64 * 12,
-                    lifetime, Category::Staging, "token selector")];
+            let target_receipt = receipt(
+                "fixture.target".into(),
+                target.buffer,
+                Category::Workspace,
+                "fixture target",
+                Lifetime::TARGET,
+            );
+            let lifetime = Lifetime {
+                first: Phase::Warmup,
+                last: Phase::Growth,
+            };
+            let mut owners = vec![
+                target_receipt.allocation.clone(),
+                Spec::buffer(
+                    "selector.output",
+                    Location::coordinator(0),
+                    64 * 12,
+                    lifetime,
+                    Category::Workspace,
+                    "token selector",
+                ),
+                Spec::buffer(
+                    "selector.landing",
+                    Location::PINNED,
+                    64 * 12,
+                    lifetime,
+                    Category::Staging,
+                    "token selector",
+                ),
+            ];
             if placement == SelectPlacement::Device {
-                owners.extend(cuteafd_core::target_sampler_allocations(64, 33).unwrap().into_iter().map(|a|
-                    Spec::buffer(format!("selector.sampler.{}", a.id),
-                        if a.pinned { Location::PINNED } else { Location::coordinator(0) },
-                        a.bytes as u64, lifetime, Category::Workspace, "target sampler")));
+                owners.extend(
+                    cuteafd_core::target_sampler_allocations(64, 33)
+                        .unwrap()
+                        .into_iter()
+                        .map(|a| {
+                            Spec::buffer(
+                                format!("selector.sampler.{}", a.id),
+                                if a.pinned {
+                                    Location::PINNED
+                                } else {
+                                    Location::coordinator(0)
+                                },
+                                a.bytes as u64,
+                                lifetime,
+                                Category::Workspace,
+                                "target sampler",
+                            )
+                        }),
+                );
             }
             for index in 0..2 {
-                owners.push(Spec::buffer(format!("host.prefix.{index}"), Location::PINNED, 4096,
-                    lifetime, Category::Prefix, "retained host prefix chunk"));
+                owners.push(Spec::buffer(
+                    format!("host.prefix.{index}"),
+                    Location::PINNED,
+                    4096,
+                    lifetime,
+                    Category::Prefix,
+                    "retained host prefix chunk",
+                ));
             }
-            let budgets = vec![Budget { id: "coordinator.0".into(), locations: vec![Location::coordinator(0)],
-                physical_bytes: total as u64, logical_bytes: total as u64,
-                baseline: Baseline::Sampled { free: total as u64, phase: Phase::Load, source: "CPU fixture".into() },
-                headroom: 0 }, Budget { id: "host".into(), locations: vec![Location::HOST, Location::PINNED],
-                physical_bytes: total as u64, logical_bytes: total as u64,
-                baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false }, headroom: 0 }];
-            let facts = Facts { allocations: owners, deferred: vec![], allowances: vec![] };
-            let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
-                prefill: Pin::Auto, operation: Operation::Serving }, decisions: Decisions {
-                attention: vec![], onboard_layers: vec![vec![]], prefill: PrefillShape { rows: 4096, waves: 1 }, lanes: 1 },
-                pool_tokens: 64, phases: planner::evaluate(&facts, &budgets)?, budgets, facts };
-            let mut startup = Startup { plan, audit, loaded_events: 0, target_events,
-                receipts: vec![target_receipt] };
+            let budgets = vec![
+                Budget {
+                    id: "coordinator.0".into(),
+                    locations: vec![Location::coordinator(0)],
+                    physical_bytes: total as u64,
+                    logical_bytes: total as u64,
+                    baseline: Baseline::Sampled {
+                        free: total as u64,
+                        phase: Phase::Load,
+                        source: "CPU fixture".into(),
+                    },
+                    headroom: 0,
+                },
+                Budget {
+                    id: "host".into(),
+                    locations: vec![Location::HOST, Location::PINNED],
+                    physical_bytes: total as u64,
+                    logical_bytes: total as u64,
+                    baseline: Baseline::Forecast {
+                        occupied: 0,
+                        source: "CPU fixture".into(),
+                        assumed: false,
+                    },
+                    headroom: 0,
+                },
+            ];
+            let facts = Facts {
+                allocations: owners,
+                deferred: vec![],
+                sequential: vec![],
+                allowances: vec![],
+            };
+            let plan = ResolvedPlan {
+                request: Request {
+                    context: 64,
+                    pool: Pin::Exact(64),
+                    onboard: Pin::Auto,
+                    prefill: Pin::Auto,
+                    operation: Operation::Serving,
+                },
+                decisions: Decisions {
+                    attention: vec![],
+                    onboard_layers: vec![vec![]],
+                    prefill: PrefillShape {
+                        rows: 4096,
+                        waves: 1,
+                    },
+                    lanes: 1,
+                },
+                pool_tokens: 64,
+                phases: planner::evaluate(&facts, &budgets)?,
+                budgets,
+                facts,
+            };
+            let mut startup = Startup {
+                plan,
+                audit,
+                loaded_events: 0,
+                target_events,
+                receipts: vec![target_receipt],
+            };
             let mut selector = TokenSelector::new(&library, placement, 33, 64)?;
             selector.reserve_sampler()?;
             let copy = CudaCopyEngine::registered(&library, &[target.buffer])?;
-            let layout = FamilyLayout { page_rows: 64, pages: 1, page_bytes: 256, mark_bytes: 0,
-                draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT,
-                mark_store: MarkStore::Arena, page_owners: PageOwners::Uniform };
-            let mut cache = PrefixCache::new(layout, PrefixConfig { entries: 1, mark_slots: 0,
-                keep_logits: false, min_tokens: 1 }, Some((cuteafd_hostcache::config::Config {
-                bytes: 2 * 4096 + 17, chunk_bytes: 4096, min_tokens: 1, ..Default::default() }, copy)))?;
+            let layout = FamilyLayout {
+                page_rows: 64,
+                pages: 1,
+                page_bytes: 256,
+                mark_bytes: 0,
+                draft_bytes: 0,
+                rule: cuteafd_core::prefix::ReuseRule::EXACT,
+                mark_store: MarkStore::Arena,
+                page_owners: PageOwners::Uniform,
+            };
+            let mut cache = PrefixCache::new(
+                layout,
+                PrefixConfig {
+                    entries: 1,
+                    mark_slots: 0,
+                    keep_logits: false,
+                    min_tokens: 1,
+                },
+                Some((
+                    cuteafd_hostcache::config::Config {
+                        bytes: 2 * 4096 + 17,
+                        chunk_bytes: 4096,
+                        min_tokens: 1,
+                        ..Default::default()
+                    },
+                    copy,
+                )),
+            )?;
             startup.ready(&library, device, &selector, &mut cache)?;
             let expected = startup.plan.clone();
             for mismatch in 0..4 {
                 startup.plan = expected.clone();
-                let owner = startup.plan.facts.allocations.iter_mut().find(|a| a.id == "selector.output").unwrap();
+                let owner = startup
+                    .plan
+                    .facts
+                    .allocations
+                    .iter_mut()
+                    .find(|a| a.id == "selector.output")
+                    .unwrap();
                 match mismatch {
                     0 => owner.bytes += 4,
                     1 => owner.location = Location::PINNED,
                     2 => owner.lifetime.first = Phase::Load,
-                    _ => { startup.plan.facts.allocations.retain(|a| a.id != "selector.output"); }
+                    _ => {
+                        startup
+                            .plan
+                            .facts
+                            .allocations
+                            .retain(|a| a.id != "selector.output");
+                    }
                 }
-                assert!(startup.ready(&library, device, &selector, &mut cache).is_err(), "mismatch {mismatch}");
+                assert!(
+                    startup
+                        .ready(&library, device, &selector, &mut cache)
+                        .is_err(),
+                    "mismatch {mismatch}"
+                );
             }
             startup.plan = expected;
             let extra = Allocation::new(device, 256)?;
-            assert!(startup.ready(&library, device, &selector, &mut cache).is_err(), "unreceipted owner");
+            assert!(
+                startup
+                    .ready(&library, device, &selector, &mut cache)
+                    .is_err(),
+                "unreceipted owner"
+            );
             drop(extra);
         }
         Ok(())

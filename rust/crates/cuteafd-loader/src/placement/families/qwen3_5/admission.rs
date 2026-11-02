@@ -632,6 +632,7 @@ impl DenseFacts<'_> {
         Ok(Facts {
             allocations,
             deferred,
+            sequential: vec![],
             allowances,
         })
     }

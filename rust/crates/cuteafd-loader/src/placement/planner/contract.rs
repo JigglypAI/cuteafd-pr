@@ -159,6 +159,7 @@ pub enum ComponentKind {
         offset: Option<ByteCurve>,
         deferred: bool,
     },
+    Sequential(Sequential),
     Allowance(Allowance),
 }
 #[derive(Debug, Clone)]
@@ -217,6 +218,10 @@ impl Component {
                 Some((template.location, template.lifetime, false))
             }
             ComponentKind::Allocation { .. } => None,
+            ComponentKind::Sequential(group) => group
+                .members
+                .first()
+                .map(|a| (a.location, a.lifetime, false)),
             ComponentKind::Allowance(a) => Some((a.location, a.lifetime, true)),
         }
     }
@@ -253,6 +258,11 @@ impl Contract {
                 )
             }))
             .collect();
+        components.extend(facts.sequential.into_iter().map(|group| Component {
+            activation: Activation::always(),
+            bytes: ByteCurve::fixed(group.peak(), maximum_pages),
+            kind: ComponentKind::Sequential(group),
+        }));
         components.extend(facts.allowances.into_iter().map(|a| Component {
             activation: Activation::always(),
             bytes: ByteCurve::fixed(a.bytes, maximum_pages),
@@ -283,6 +293,7 @@ impl Contract {
         let mut result = Facts {
             allocations: vec![],
             deferred: vec![],
+            sequential: vec![],
             allowances: vec![],
         };
         for component in &self.components {
@@ -314,6 +325,14 @@ impl Contract {
                     } else {
                         result.allocations.push(allocation);
                     }
+                }
+                ComponentKind::Sequential(group) => {
+                    if bytes != group.peak() {
+                        return Err(Refusal::InvalidFact(
+                            "sequential peak differs from members".into(),
+                        ));
+                    }
+                    result.sequential.push(group.clone());
                 }
                 ComponentKind::Allowance(template) => {
                     let mut allowance = template.clone();
@@ -461,6 +480,12 @@ impl Contract {
                 return Err(Refusal::InvalidFact("invalid component activation".into()));
             }
             component.bytes.validate(self.maximum_pages)?;
+            if let ComponentKind::Sequential(group) = &component.kind {
+                group.validate()?;
+                if component.bytes != ByteCurve::fixed(group.peak(), self.maximum_pages) {
+                    return Err(Refusal::InvalidFact("invalid sequential peak curve".into()));
+                }
+            }
             if let ComponentKind::Allocation { shape, offset, .. } = &component.kind {
                 for curve in shape.iter().chain(offset) {
                     curve.validate(self.maximum_pages)?;

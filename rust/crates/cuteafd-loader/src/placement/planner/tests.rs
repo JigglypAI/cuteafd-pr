@@ -29,6 +29,7 @@ fn facts(allocations: Vec<Allocation>) -> Facts {
     Facts {
         allocations,
         deferred: vec![],
+        sequential: vec![],
         allowances: vec![],
     }
 }
@@ -1311,6 +1312,250 @@ fn observed_lifetimes_require_loading_owner_release_before_ready() {
     history[1].created = Phase::Load;
     assert!(errors(reconcile_history(&p, Phase::Ready, &history))
         .contains(&Mismatch::Lifetime("target".into())));
+}
+
+fn packing_plan() -> ResolvedPlan {
+    let mut p = plan(vec![allocation("target", 100)]);
+    let mut a = allocation("pack.a", 300);
+    a.lifetime = Lifetime {
+        first: Phase::DraftLoad,
+        last: Phase::DraftLoad,
+    };
+    let mut b = a.clone();
+    b.id = "pack.b".into();
+    b.bytes = 200;
+    b.shape = vec![200];
+    p.facts.sequential.push(Sequential {
+        id: "packing".into(),
+        members: vec![a, b],
+    });
+    p.phases = evaluate(&p.facts, &p.budgets).unwrap();
+    p
+}
+
+fn packing_history(p: &ResolvedPlan) -> (Vec<Observation>, Vec<OwnerEvent>) {
+    let ordinary = vec![Observation {
+        receipt: receipts(p)[0].clone(),
+        created: Phase::PostTargetKv,
+        freed: None,
+    }];
+    let mut edges = vec![OwnerEvent::Allocated {
+        receipt: ordinary[0].receipt.clone(),
+        phase: Phase::PostTargetKv,
+    }];
+    for member in &p.facts.sequential[0].members {
+        let receipt = Receipt {
+            allocation: member.clone(),
+            address: 32768,
+        };
+        edges.push(OwnerEvent::Allocated {
+            receipt: receipt.clone(),
+            phase: Phase::DraftLoad,
+        });
+        edges.push(OwnerEvent::Freed {
+            receipt,
+            phase: Phase::DraftLoad,
+        });
+    }
+    (ordinary, edges)
+}
+
+#[test]
+fn sequential_sources_charge_maximum_but_require_every_actual_pair() {
+    let p = packing_plan();
+    let at = |phase| p.phases.iter().find(|r| r.phase == phase).unwrap().owned;
+    assert_eq!(at(Phase::DraftLoad), 400);
+    assert_eq!(at(Phase::Ready), 100);
+    let (ordinary, edges) = packing_history(&p);
+    reconcile_events(&p, Phase::Ready, &edges, &[]).unwrap();
+    assert!(errors(reconcile_history(&p, Phase::Ready, &ordinary))
+        .contains(&Mismatch::Missing("pack.a".into())));
+    let mut missing = edges.clone();
+    missing.truncate(3);
+    assert!(errors(reconcile_events(&p, Phase::Ready, &missing, &[]))
+        .contains(&Mismatch::Missing("pack.b".into())));
+    let mut retained = edges.clone();
+    retained.pop();
+    assert!(errors(reconcile_events(&p, Phase::Ready, &retained, &[]))
+        .contains(&Mismatch::Lifetime("pack.b".into())));
+    let overlap = [
+        edges[0].clone(),
+        edges[1].clone(),
+        edges[3].clone(),
+        edges[2].clone(),
+        edges[4].clone(),
+    ];
+    assert!(errors(reconcile_events(&p, Phase::Ready, &overlap, &[]))
+        .contains(&Mismatch::Lifetime("packing".into())));
+    let wrong = edges
+        .iter()
+        .cloned()
+        .map(|mut event| {
+            let receipt = match &mut event {
+                OwnerEvent::Allocated { receipt, .. } | OwnerEvent::Freed { receipt, .. } => {
+                    receipt
+                }
+            };
+            receipt.allocation.bytes += 1;
+            event
+        })
+        .collect::<Vec<_>>();
+    let errors = errors(reconcile_events(&p, Phase::Ready, &wrong, &[]));
+    assert!(errors.contains(&Mismatch::Contract("pack.a".into())));
+    assert!(errors.contains(&Mismatch::Contract("pack.b".into())));
+}
+
+#[test]
+fn sequential_sources_reject_duplicate_extra_wrong_device_address_and_phase() {
+    let p = packing_plan();
+    let (_, edges) = packing_history(&p);
+    for mutation in 0..8 {
+        let mut bad = edges.clone();
+        match mutation {
+            0 => bad.extend_from_slice(&edges[1..3]),
+            1 => {
+                if let OwnerEvent::Allocated { receipt, .. } = &mut bad[1] {
+                    receipt.allocation.id = "unplanned".into();
+                }
+            }
+            2 => {
+                if let OwnerEvent::Allocated { receipt, .. } = &mut bad[1] {
+                    receipt.allocation.location = Location::coordinator(1);
+                }
+            }
+            3 => {
+                if let OwnerEvent::Allocated { receipt, .. } = &mut bad[1] {
+                    receipt.address = u64::MAX;
+                }
+            }
+            4 => {
+                if let OwnerEvent::Freed { phase, .. } = &mut bad[2] {
+                    *phase = Phase::Warmup;
+                }
+            }
+            5 => {
+                if let OwnerEvent::Freed { receipt, .. } = &mut bad[2] {
+                    receipt.address += 1;
+                }
+            }
+            6 => bad.insert(3, edges[2].clone()),
+            7 => {
+                bad.remove(0);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            reconcile_events(&p, Phase::Ready, &bad, &[]).is_err(),
+            "mutation {mutation}"
+        );
+    }
+}
+
+#[test]
+fn sequential_history_proves_same_phase_owner_order_and_address_reuse() {
+    let mut p = packing_plan();
+    p.facts.allocations[0].lifetime.first = Phase::DraftLoad;
+    p.phases = evaluate(&p.facts, &p.budgets).unwrap();
+    let (_, mut events) = packing_history(&p);
+    let mut owner = events.remove(0);
+    if let OwnerEvent::Allocated { receipt, phase } = &mut owner {
+        *phase = Phase::DraftLoad;
+        receipt.address = 32768;
+    }
+    // A retained destination can reuse the source address only after its free.
+    events.push(owner.clone());
+    reconcile_events(&p, Phase::Ready, &events, &[]).unwrap();
+    events.pop();
+    events.insert(1, owner);
+    assert!(errors(reconcile_events(&p, Phase::Ready, &events, &[]))
+        .iter()
+        .any(|e| matches!(e, Mismatch::Address(_))));
+    let (ordinary, _) = packing_history(&p);
+    assert!(
+        errors(reconcile(&p, Phase::Ready, &[ordinary[0].receipt.clone()]))
+            .contains(&Mismatch::Missing("pack.a".into()))
+    );
+}
+
+#[test]
+fn sequential_groups_may_coexist_but_their_live_addresses_cannot_overlap() {
+    let mut p = packing_plan();
+    let mut other = p.facts.sequential[0].members[0].clone();
+    other.id = "other.source".into();
+    p.facts.sequential.push(Sequential {
+        id: "other.packing".into(),
+        members: vec![other.clone()],
+    });
+    p.phases = evaluate(&p.facts, &p.budgets).unwrap();
+    let (_, original) = packing_history(&p);
+    for address in [65536, 32768] {
+        let r = Receipt {
+            allocation: other.clone(),
+            address,
+        };
+        let events = [
+            original[0].clone(),
+            original[1].clone(),
+            OwnerEvent::Allocated {
+                receipt: r.clone(),
+                phase: Phase::DraftLoad,
+            },
+            OwnerEvent::Freed {
+                receipt: r,
+                phase: Phase::DraftLoad,
+            },
+            original[2].clone(),
+            original[3].clone(),
+            original[4].clone(),
+        ];
+        let result = reconcile_events(&p, Phase::Ready, &events, &[]);
+        if address == 65536 {
+            result.unwrap();
+        } else {
+            assert!(errors(result)
+                .iter()
+                .any(|e| matches!(e, Mismatch::Address(_))));
+        }
+    }
+}
+
+#[test]
+fn sequential_contract_costs_match_exact_evaluator_and_capacity() {
+    let p = packing_plan();
+    let mut contract = Contract::fixed(64, 1, 1, p.facts.clone());
+    contract.variables = vec![
+        Variable::Prefill(vec![decisions(0).prefill]),
+        Variable::Lanes(vec![1]),
+    ];
+    let mut req = request();
+    req.pool = Pin::Exact(64);
+    let mut b = budget(400);
+    let solved = solve(req.clone(), vec![b.clone()], &Prepared(contract.clone())).unwrap();
+    assert_eq!(solved.facts, p.facts);
+    assert_eq!(solved.phases, evaluate(&p.facts, &[b.clone()]).unwrap());
+    b.physical_bytes = 399;
+    b.logical_bytes = 399;
+    assert!(matches!(
+        solve(req, vec![b], &Prepared(contract)),
+        Err(Refusal::Capacity {
+            phase: Phase::DraftLoad,
+            ..
+        })
+    ));
+    for malformed in 0..4 {
+        let mut bad = p.facts.clone();
+        match malformed {
+            0 => bad.sequential[0].members.clear(),
+            1 => bad.sequential[0].members[1].location = Location::PINNED,
+            2 => bad.sequential[0].members[1].lifetime.last = Phase::Ready,
+            3 => bad.sequential[0].members[1].id = "target".into(),
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            evaluate(&bad, &p.budgets),
+            Err(Refusal::InvalidFact(_))
+        ));
+    }
 }
 
 #[test]
