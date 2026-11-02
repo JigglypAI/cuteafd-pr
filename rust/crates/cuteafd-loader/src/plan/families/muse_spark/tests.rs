@@ -88,24 +88,31 @@ fn check_coordinator_startup_inventory(snapshot: &std::path::Path) -> anyhow::Re
 fn published_native_norms_belong_to_coordinator_not_sparks() -> anyhow::Result<()> {
     let fixture: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../../tests/fixtures/muse-89998fb1.json"))?;
-    // Preserve the real publication's geometry and tensor classes; repeat its
-    // two real text layers over the release's 62 layers using sparse payloads.
+    // Expand the miniature's layer pattern and router extents to the release
+    // geometry required by Model::open; other projection/native classes stay as-is.
+    let config = testing::muse_spark_config();
+    let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(&config)?;
+    let miniature = crate::families::muse_spark::MuseSparkConfig::from_hf(&fixture["config"])?;
     let mut tensors = Vec::new();
     for (name, header) in fixture["headers"].as_object().unwrap() {
         let dtype = match header["dtype"].as_str().unwrap() {
             "BF16" => "BF16", "F16" => "F16", "F32" => "F32", "I16" => "I16", "I32" => "I32",
             other => anyhow::bail!("unexpected published dtype {other}"),
         };
-        let shape: Vec<usize> = serde_json::from_value(header["shape"].clone())?;
+        let mut shape: Vec<usize> = serde_json::from_value(header["shape"].clone())?;
         if let Some(rest) = name.strip_prefix("model.language_model.layers.") {
             let (source, leaf) = rest.split_once('.').unwrap();
-            for layer in (source.parse::<usize>()?..62).step_by(2) {
+            if matches!(leaf, "mlp.gate.weight" | "mlp.gate.e_score_correction_bias") {
+                assert_eq!(shape[0], miniature.experts);
+                shape[0] = cfg.experts;
+            }
+            for layer in (source.parse::<usize>()?..cfg.layers).step_by(miniature.layers) {
                 tensors.push(testing::t(format!("model.language_model.layers.{layer}.{leaf}"), dtype, &shape));
             }
         } else { tensors.push(testing::t(name, dtype, &shape)); }
     }
     let dir = tempfile::tempdir()?;
-    testing::write_snapshot(dir.path(), &fixture["config"], &tensors, None);
+    testing::write_snapshot(dir.path(), &config, &tensors, None);
     let coordinator = check_coordinator_startup_inventory(dir.path())?;
     let inventory = Checkpoint::inventory(dir.path())?;
     let spark = plan::files::required_tensors(&inventory, plan::files::ReadRole::Spark { rank: 0, world: 4 })?;

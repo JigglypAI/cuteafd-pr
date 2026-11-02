@@ -499,7 +499,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         let bytes = include_bytes!("../../../tests/fixtures/muse-89998fb1.json");
         assert_eq!(format!("{:x}", Sha256::digest(bytes)),
-            "0d6bde113718c730eab1cead9625f89265eebf3b1ad2a8577702005506682565");
+            "caa8a76058b998e39b70da07c17be8428c4d6344d61eea55f77c964fa0e16715");
         let fixture: Value = serde_json::from_slice(bytes)?;
         assert_eq!(fixture["source"]["revision"], "89998fb177acd9a862ac8bd4fb79bfd50e940c97");
         assert_eq!(fixture["source"]["manifest_sha256"],
@@ -521,10 +521,18 @@ mod tests {
         }).collect::<Vec<_>>();
         assert_eq!(headers.len(), 161);
         let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(&fixture["config"])?;
-        // Two layers/two experts retain real tensor geometry, including padded K6
-        // vocabulary, MCG markers, audio/vision classes and BF16/F32 natives.
-        let shape = crate::RoutedExpertShape { layers: 2, first_layer: 0, experts: 2, topk: 2,
+        // Miniature routing matches its config; projection geometry, padded K6
+        // vocabulary, MCG markers and audio/vision classes retain source shapes.
+        assert_eq!((cfg.layers, cfg.experts, cfg.topk), (2, 2, 2));
+        let shape = crate::RoutedExpertShape { layers: cfg.layers, first_layer: 0, experts: cfg.experts, topk: cfg.topk,
             hidden: cfg.expert_hidden, intermediate: cfg.moe_intermediate, draft_stages: 0, draft_experts: 0 };
+        for layer in 0..cfg.layers {
+            for (leaf, wanted) in [("weight", vec![cfg.experts, cfg.hidden]),
+                ("e_score_correction_bias", vec![cfg.experts])] {
+                let name = format!("model.language_model.layers.{layer}.mlp.gate.{leaf}");
+                assert_eq!(headers.iter().find(|h| h.name == name).unwrap().shape, wanted);
+            }
+        }
         let parsed = read_publication(&fixture["config"], &[("quantize_config.json", manifest)], shape, &headers, &[4,5])?;
         assert_eq!(parsed.storage, Exl3StorageSource::GptqModel);
         assert_eq!(parsed.projections.len(), 12);
@@ -560,6 +568,42 @@ mod tests {
         wrong_storage["tensor_storage"]["lm_head"]["stored_tensors"]["lm_head.svh"]["shape"] = serde_json::json!([202048]);
         assert!(format!("{:#}", read_publication(&fixture["config"], &[("quantize_config.json", &wrong_storage)],
             shape, &headers, &[4,5]).unwrap_err()).contains("lm_head"));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires the mounted pinned Muse publication index"]
+    fn pinned_muse_publication_index_has_all_routed_modules() -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let revision = "89998fb177acd9a862ac8bd4fb79bfd50e940c97";
+        let snapshot = std::env::var_os("CUTEAFD_MUSE_PUBLICATION_SNAPSHOT").map(std::path::PathBuf::from)
+            .context("set CUTEAFD_MUSE_PUBLICATION_SNAPSHOT to the pinned Muse snapshot")?;
+        ensure!(snapshot.file_name().and_then(|n| n.to_str()) == Some(revision),
+            "Muse publication snapshot must be pinned to {revision}");
+        let config_bytes = std::fs::read(snapshot.join("config.json"))?;
+        assert_eq!(format!("{:x}", Sha256::digest(&config_bytes)),
+            "7cd07bfb249688d1af42216fdf4a934e5e5c50d45d1f655ec9f7eda491666d8a");
+        let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(&serde_json::from_slice(&config_bytes)?)?;
+        cfg.release_geometry()?;
+        assert_eq!((cfg.layers, cfg.experts), (62, 256));
+        let index_bytes = std::fs::read(snapshot.join("model.safetensors.index.json"))?;
+        assert_eq!(format!("{:x}", Sha256::digest(&index_bytes)),
+            "bb8683b0966c2fcb2a0ff7264bf4c306e227dfd06f2bbce356110c793132183c");
+        let index: Value = serde_json::from_slice(&index_bytes)?;
+        let weights = index["weight_map"].as_object().context("pinned Muse index lacks weight_map")?;
+        let actual = weights.keys().filter(|name| name.contains(".experts.") && name.ends_with(".trellis"))
+            .cloned().collect::<BTreeSet<_>>();
+        let mut expected = BTreeSet::new();
+        for layer in 0..cfg.layers {
+            for expert in 0..cfg.experts {
+                for projection in ["gate_proj", "up_proj", "down_proj"] {
+                    expected.insert(format!("model.language_model.layers.{layer}.mlp.experts.{expert}.{projection}.trellis"));
+                }
+            }
+        }
+        assert_eq!(expected.len(), 47_616);
+        assert_eq!(actual.len(), cfg.layers * cfg.experts * 3);
+        assert!(actual == expected, "pinned Muse index routed layer/expert/projection set disagrees with config");
         Ok(())
     }
 
