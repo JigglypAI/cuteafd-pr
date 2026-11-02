@@ -928,6 +928,7 @@ pub(crate) struct DflashDrafter<'a> {
     pub slots: usize,
     max_sequences: usize,
     fc: DraftWeight<'a>,
+    context_fc: Option<cuteafd_ffi::mla_draft::Ml4ContextProjection<'a>>,
     hidden_norm: Dev<'a>,
     norm: Dev<'a>,
     head_ops: DraftHeadOps<'a>,
@@ -1246,7 +1247,7 @@ impl<'a> DflashDrafter<'a> {
             stream,
             slots,
             max_sequences,
-            fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps)?,
+            fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps)?, context_fc: None,
             hidden_norm: tensor("hidden_norm.weight", &[h])?,
             norm: tensor("norm.weight", &[h])?,
             head_ops: DraftHeadOps::Selector {
@@ -1364,7 +1365,7 @@ impl<'a> DflashDrafter<'a> {
             native.rotary.inv_freq.len() * 4)?, bytes_of(&native.rotary.inv_freq))?;
         let result = Self { kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, library, stream, slots: layout.capacity().context_slots,
             max_sequences: layout.capacity().max_batch_sequences,
-            fc: matrix(tensor("fc.weight", &[h, cfg.taps.len() * h])?, h, cfg.taps.len() * h)?,
+            fc: matrix(tensor("fc.weight", &[h, cfg.taps.len() * h])?, h, cfg.taps.len() * h)?, context_fc: None,
             hidden_norm: tensor("hidden_norm.weight", &[h])?, norm: tensor("norm.weight", &[h])?,
             head_ops: DraftHeadOps::Selector {
                 projection: matrix(tensor("candidate_selector.hidden_projection.weight", &[cfg.rank, h])?, cfg.rank, h)?,
@@ -1406,6 +1407,7 @@ impl<'a> DflashDrafter<'a> {
             layout.paged_cache().target_tokens, library.sm_count()?, 0, layout.cache_format())? == layout,
             "mtp_dspark checkpoint/runtime differs from admitted immutable layout");
         let cfg = DflashConfig::mla(&native);
+        let context_fc = cuteafd_ffi::mla_draft::Ml4ContextProjection::load(programs)?;
         let mut owners = MlaDraftStorage::allocate(library, layout.clone())?.into_owners()?;
         // Destination owners and packing both come from the admitted recipe.
         for weight in layout.weight_destinations() {
@@ -1467,6 +1469,7 @@ impl<'a> DflashDrafter<'a> {
         let result = Self { kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, library, stream,
             slots: layout.capacity().context_slots, max_sequences: layout.capacity().max_batch_sequences,
             fc: DraftWeight::Bf16(tensor(&mut owners, "backbone.target_projection.weight", &[h, cfg.taps.len() * h])?),
+            context_fc: Some(context_fc),
             hidden_norm: tensor(&mut owners, "backbone.target_norm.weight", &[h])?,
             norm: tensor(&mut owners, "backbone.final_norm.weight", &[h])?,
             head_ops: DraftHeadOps::RnnMarkov { softcap,
@@ -1536,6 +1539,22 @@ impl<'a> DflashDrafter<'a> {
                     self.fp8_rows.get()) }
             }
         }
+    }
+
+    fn project_context(&self, first: usize, rows: usize) -> Result<()> {
+        ensure!(rows > 0 && first.checked_add(rows).is_some_and(|end| end <= TAP_ROWS),
+            "draft context projection tap extent");
+        let (h, width) = (self.cfg.hidden, self.cfg.taps.len() * self.cfg.hidden);
+        let x = draft_view(self.taps.buffer, first * width * 2, rows * width * 2)?;
+        let out = draft_view(self.fused.buffer, 0, rows * h * 2)?;
+        if let Some(program) = &self.context_fc {
+            let DraftWeight::Bf16(weight) = &self.fc else { anyhow::bail!("ML4 context FC requires BF16 weights") };
+            program.launch(x, weight.buffer, out, rows, self.stream)?;
+        } else {
+            // SAFETY: checked tap/output views and the immutable loaded FC shape.
+            unsafe { self.linear(x.ptr, &self.fc, 0, out.ptr, rows, width, h)?; }
+        }
+        Ok(())
     }
 
     /// Index of `layer` among the tapped target layers.
@@ -1699,8 +1718,7 @@ impl<'a> DflashDrafter<'a> {
         let h = self.cfg.hidden;
         // SAFETY: the fixed tap span and both output arenas are admitted for TAP_ROWS.
         unsafe {
-            self.linear(at(&self.taps, first * self.cfg.taps.len() * h * 2), &self.fc, 0,
-                self.fused.buffer.ptr, rows, self.cfg.taps.len() * h, h)?;
+            self.project_context(first, rows)?;
             self.library.glm_dflash_rmsnorm(self.fused.buffer.ptr, self.hidden_norm.buffer.ptr,
                 self.fused_norm.buffer.ptr, rows, h, self.cfg.eps, self.stream)?;
             self.library.cuda_stream_synchronize(self.stream)?;
@@ -2049,8 +2067,7 @@ impl<'a> DflashDrafter<'a> {
         let span = self.timing.begin("context", None, n, self.stream)?;
         // SAFETY: checked tap span and admitted full-sized common arenas; one ordered stream.
         unsafe {
-            self.linear(at(&self.taps, plan.first * self.cfg.taps.len() * h * 2), &self.fc, 0,
-                self.fused.buffer.ptr, n, self.cfg.taps.len() * h, h)?;
+            self.project_context(plan.first, n)?;
             self.library.glm_dflash_rmsnorm(self.fused.buffer.ptr, self.hidden_norm.buffer.ptr,
                 self.fused_norm.buffer.ptr, n, h, self.cfg.eps, self.stream)?;
         }

@@ -77,6 +77,8 @@ def jobs(scope):
                   for mode, rows in (("decode", 64), ("verify", 64), ("extend", 4096))]
         result.append((f"kimi-mla-h{heads}", "export_b12x_dsv4_aot.py",
                        ["--geometry", "kimik3", "--only", ",".join(names)]))
+    result.append(("ml4-draft-context-fc", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "ml4", "--only", "draft_context_fc"]))
     result.append(("mla-draft-h64", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join([
                        "mla_draft_producer_m64", "mla_draft_producer_fp8_m64", "mla_draft_output_m64",

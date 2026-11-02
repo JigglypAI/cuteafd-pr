@@ -29,6 +29,60 @@ pub enum MlaDraftError {
 }
 type Result<T> = std::result::Result<T, MlaDraftError>;
 
+/// ML4's five-tap context FC always uses canonical K16 TMA arithmetic.
+/// cuBLAS default-algorithm GEMMs are not invariant to restore chunk sizes.
+pub struct Ml4ContextProjection<'a> { program: Program<'a> }
+
+impl<'a> Ml4ContextProjection<'a> {
+    const NAME: &'static str = "ml4_draft_context_fc";
+    const WIDTH: usize = 5 * 6144;
+    const OUTPUTS: usize = 6144;
+    const ROWS: usize = 2048;
+
+    pub fn validate(programs: &Programs<'_>) -> Result<()> {
+        validate_ml4_context_projection(programs.spec(Self::NAME)?)
+    }
+
+    pub fn load(programs: &'a Programs<'a>) -> Result<Self> {
+        Self::validate(programs)?;
+        Ok(Self { program: programs.program(Self::NAME, &["x", "w", "out"])? })
+    }
+
+    pub fn launch(&self, x: Buffer, weight: Buffer, out: Buffer, rows: usize,
+        stream: *mut c_void) -> Result<()> {
+        validate_ml4_context_buffers(x, weight, out, rows)?;
+        // SAFETY: checked, nonoverlapping BF16 buffers stay owned on the caller's stream.
+        unsafe { self.program.launch(&[x.ptr, weight.ptr, out.ptr], &[Scalar::I32(rows as i32)], stream)?; }
+        Ok(())
+    }
+}
+
+fn validate_ml4_context_projection(spec: &ProgramSpec) -> Result<()> {
+    let g = &spec.geometry;
+    if spec.name != Ml4ContextProjection::NAME
+        || spec.capacity_rows as usize != Ml4ContextProjection::ROWS
+        || spec.scalar_kinds != b"i" || !spec.scratch.is_empty()
+        || !spec.pointers.iter().map(String::as_str).eq(["x", "w", "out"])
+        || g["width"].as_u64() != Some(Ml4ContextProjection::WIDTH as u64)
+        || g["outputs"].as_u64() != Some(Ml4ContextProjection::OUTPUTS as u64)
+        || g["output_dtype"].as_str() != Some("torch.bfloat16")
+        || g["skinny_rows"].as_u64() != Some(0)
+        || g["exact_row_cap"].as_u64() != Some(i32::MAX as u64)
+        || !g["compensated"].is_null() || !g["tiles_by_rows"].is_null() {
+        return Err(MlaDraftError::Invalid("ML4 context FC canonical geometry/ABI/capacity"));
+    }
+    Ok(())
+}
+
+fn validate_ml4_context_buffers(x: Buffer, weight: Buffer, out: Buffer, rows: usize) -> Result<()> {
+    if !(1..=Ml4ContextProjection::ROWS).contains(&rows) {
+        return Err(MlaDraftError::Invalid("ML4 context FC rows"));
+    }
+    validate_buffers(&[(x, rows * Ml4ContextProjection::WIDTH * 2),
+        (weight, Ml4ContextProjection::WIDTH * Ml4ContextProjection::OUTPUTS * 2),
+        (out, rows * Ml4ContextProjection::OUTPUTS * 2)], x.device_id)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MlaDraftWindow { Full, Sliding4096, BlockAnchored2048 }
 impl MlaDraftWindow {
@@ -346,6 +400,57 @@ fn validate_buffers(requirements: &[(Buffer, usize)], device: i32) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ml4_context_fc_rejects_noncanonical_routes_geometry_and_abi() {
+        let good = ProgramSpec { name: "ml4_draft_context_fc".into(),
+            pointers: ["x", "w", "out"].map(String::from).to_vec(), scalar_kinds: b"i".to_vec(),
+            capacity_rows: 2048, scratch: Default::default(),
+            geometry: serde_json::json!({"width": 30720, "outputs": 6144,
+                "output_dtype": "torch.bfloat16", "skinny_rows": 0, "exact_row_cap": i32::MAX}) };
+        validate_ml4_context_projection(&good).unwrap();
+        for (key, value) in [("width", 6144.into()), ("outputs", 7168.into()),
+            ("output_dtype", "torch.float32".into()), ("skinny_rows", 16.into()),
+            ("exact_row_cap", 2048.into()), ("compensated", true.into()),
+            ("tiles_by_rows", serde_json::json!([]))] {
+            let mut bad = good.clone(); bad.geometry[key] = value;
+            assert!(validate_ml4_context_projection(&bad).is_err(), "{key}");
+        }
+        for key in ["width", "outputs", "output_dtype", "skinny_rows", "exact_row_cap"] {
+            let mut bad = good.clone(); bad.geometry.as_object_mut().unwrap().remove(key);
+            assert!(validate_ml4_context_projection(&bad).is_err(), "missing {key}");
+        }
+        for defect in 0..5 {
+            let mut bad = good.clone();
+            match defect {
+                0 => bad.name = "ml4_index_kw".into(), 1 => bad.capacity_rows = 4096,
+                2 => bad.scalar_kinds = b"l".to_vec(), 3 => bad.pointers.swap(0, 1),
+                _ => { bad.scratch.insert("scratch".into(), 256); }
+            }
+            assert!(validate_ml4_context_projection(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn ml4_context_fc_checks_live_extents_devices_and_aliases() {
+        let x = Buffer { ptr: 0x10000000usize as *mut c_void, bytes: 2048 * 30720 * 2, device_id: 1, flags: 0 };
+        let weight = Buffer { ptr: 0x30000000usize as *mut c_void, bytes: 30720 * 6144 * 2, ..x };
+        let out = Buffer { ptr: 0x50000000usize as *mut c_void, bytes: 2048 * 6144 * 2, ..x };
+        for rows in [1, 16, 64, 140, 2048] { validate_ml4_context_buffers(x, weight, out, rows).unwrap(); }
+        for rows in [0, 2049, usize::MAX] { assert!(validate_ml4_context_buffers(x, weight, out, rows).is_err()); }
+        for index in 0..3 {
+            for defect in 0..4 {
+                let mut buffers = [x, weight, out];
+                match defect {
+                    0 => buffers[index].bytes -= 1, 1 => buffers[index].device_id = 0,
+                    2 => buffers[index].ptr = 1usize as *mut c_void,
+                    _ => buffers[index].ptr = std::ptr::null_mut(),
+                }
+                assert!(validate_ml4_context_buffers(buffers[0], buffers[1], buffers[2], 2048).is_err());
+            }
+        }
+        assert!(validate_ml4_context_buffers(x, weight, x, 1).is_err());
+    }
 
     fn specs(window: MlaDraftWindow, context: usize) -> [ProgramSpec; 3] {
         let splits = context.div_ceil(PAGE).min(16);

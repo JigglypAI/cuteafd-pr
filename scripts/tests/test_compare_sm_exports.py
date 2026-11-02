@@ -162,6 +162,13 @@ def test_kimi_w8_cross_sm_groups(group, names):
                    ["--geometry", "kimik3", "--only", ",".join(names)])
 
 
+def test_ml4_context_fc_has_a_scoped_cross_sm_gate():
+    for scope in ("suspects", "all"):
+        job = next(job for job in compare_sm.jobs(scope) if job[0] == "ml4-draft-context-fc")
+        assert job == ("ml4-draft-context-fc", "export_b12x_dsv4_aot.py",
+                       ["--geometry", "ml4", "--only", "draft_context_fc"])
+
+
 def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
     names = ["mla_draft_producer_m64", "mla_draft_producer_fp8_m64", "mla_draft_output_m64",
              "mla_draft_attention_full_m64", "mla_draft_attention_w4096_m64",

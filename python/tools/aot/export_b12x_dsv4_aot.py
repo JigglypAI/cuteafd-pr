@@ -602,6 +602,9 @@ def ml4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     # The bundled mtp_dspark drafter on the shared MLA block-draft path (64-row chunks).
     draft = ml4.ML4_DRAFT
     out += [
+        # Restore chunking must not change the context FC's reduction order.
+        ("draft_context_fc", "bf16_projection", {"width": 5 * g.hidden, "outputs": g.hidden, "max_rows": 2048},
+         lambda: compile_bf16_projection_aot(width=5 * g.hidden, outputs=g.hidden)),
         ("draft_producer_m64", "mla_draft_producer", {"max_rows": 64, "kv_cache": draft.kv_cache},
          lambda: ml4.compile_draft_producer_aot(draft, max_rows=64)),
         ("draft_attention_m64", "mla_draft_attention",

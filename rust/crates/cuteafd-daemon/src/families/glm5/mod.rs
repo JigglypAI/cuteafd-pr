@@ -782,6 +782,9 @@ impl Opened {
         let ml4_draft = args.dspark.then(|| cuteafd_loader::placement::families::glm5::ml4_draft_layout(&args.snapshot,
             args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences, args.max_context,
             self.library.sm_count()? as usize)).transpose()?;
+        if ml4_draft.is_some() {
+            cuteafd_ffi::mla_draft::Ml4ContextProjection::validate(&programs)?;
+        }
         let draft_width = provisional_drafter.as_ref().map(|cfg| cfg.drafts())
             .or(ml4_draft.as_ref().map(|layout| layout.capacity().block_rows / layout.capacity().max_batch_sequences));
         let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
