@@ -148,7 +148,22 @@ def window_tokens(window):
     return len(window["tokens"])
 
 
-def run(a, family, *, extras_root=None):
+def embed_window(family, window, features=None):
+    """Replace only native image span rows before any decoder layer runs."""
+    hidden = family.embed(window["tokens"])
+    for span in window.get("media", []):
+        if features is None or span["key"] not in features:
+            raise ValueError("missing official image features")
+        value = features[span["key"]]
+        start, stop = span["start"], span["start"] + span["len"]
+        if (start < 0 or stop > hidden.shape[1]
+                or tuple(value.shape) != (span["len"], hidden.shape[-1])):
+            raise ValueError("official image features differ from native span extent")
+        hidden[0, start:stop].copy_(value.to(device=hidden.device, dtype=hidden.dtype))
+    return hidden
+
+
+def run(a, family, *, extras_root=None, media_adapter=None):
     """Full layer-major panel (or a nested prefix probe) for one family."""
     import numpy as np
     import torch
@@ -162,8 +177,13 @@ def run(a, family, *, extras_root=None):
     arithmetic = family.configure()
     torch.manual_seed(0)
     manifest = load_set(a.windows)
-    if manifest["family"] != family.name or any(w.get("media") for w in manifest["windows"]):
-        raise ValueError(f"{family.name} golden supports only its own text panel")
+    if manifest["family"] != family.name:
+        raise ValueError(f"{family.name} golden supports only its own panel")
+    media_present = any(w.get("media") for w in manifest["windows"])
+    if media_present and (media_adapter is None or not getattr(a, "media", False)):
+        raise ValueError(f"{family.name} media requires an official adapter and explicit --media")
+    if media_present:
+        media_adapter.validate_spans(manifest, a.snapshot)
     snapshot = verify_snapshot(manifest, a.snapshot)
     # Header-only preflight for every layer already downloaded; the rest are
     # checked right after their shards complete, before any of their bytes load.
@@ -172,6 +192,8 @@ def run(a, family, *, extras_root=None):
         family.check_layer(index)
     print(f"native shape preflight passed for {len(present)}/{family.layers} downloaded layers", flush=True)
     pins = family.provenance()
+    if media_present:
+        pins = {**pins, "media": media_adapter.provenance(a, manifest)}
     marker = a.out / "qualified-gate.json"
     if not checking and marker.exists():
         # Resume: the prefix proof and official arm already passed for this exact binding.
@@ -182,7 +204,7 @@ def run(a, family, *, extras_root=None):
             raise ValueError("stale prefix qualification; remove the output directory to requalify")
         print(f"reusing prefix qualification {gate['gate']}", flush=True)
     else:
-        proof = qualify(a, manifest, lambda probe: run(probe, family, extras_root=None))
+        proof = qualify(a, manifest, lambda probe: run(probe, family, extras_root=None, media_adapter=media_adapter))
         if not checking:
             gates = [g for g in a.out.glob("prefix-gate-*") if g.is_dir()
                      and (g / "qualification.json").exists()
@@ -198,7 +220,8 @@ def run(a, family, *, extras_root=None):
     if checking:
         # Independent unmodified-geometry arm on a short official window.
         source = copy.deepcopy(windows[0])
-        length = min(len(source["tokens"]), getattr(a, "official_tokens", 512))
+        media_end = max([0] + [s["start"] + s["len"] for s in source.get("media", [])])
+        length = min(len(source["tokens"]), max(getattr(a, "official_tokens", 512), media_end + 1))
         for name in ("official_short", "adapted_short"):
             short = copy.deepcopy(source)
             short.update(id=name, tokens=source["tokens"][:length], score_from=1, roles=["ctx"] * length)
@@ -215,9 +238,15 @@ def run(a, family, *, extras_root=None):
     with torch.inference_mode():
         if state.latest is None:
             wait_for_tensors(family, family.outer_tensors("embed"), getattr(a, "wait_shards", 0))
+            features = None
+            if media_present:
+                # Export/release the tower before loading the LM embedding table.
+                features, media_identity = media_adapter.window_features(a, manifest)
+                atomic_json(a.out / "media-reference.json", media_identity)
             pending = state.begin(-1)
             for window in windows:
-                state.save(pending, window["id"], {"hidden": family.embed(window["tokens"])})
+                state.save(pending, window["id"], {"hidden": embed_window(family, window, features)})
+            del features
             family.release_outer()
             state.commit(pending)
         print(f"resume after layer {state.latest['layer']}; {len(windows)} windows", flush=True)
