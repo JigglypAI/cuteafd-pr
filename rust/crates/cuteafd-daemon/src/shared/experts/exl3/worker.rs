@@ -691,6 +691,7 @@ impl<'a> Exl3Worker<'a> {
     where
         F: FnMut(ExpertProtocolV2ResponseRef<'_>) -> Result<()>,
     {
+        ensure!(request.partial_plan()?.is_none(), "EXL3 per-expert partial replies require a mapped whole-plane response; host/debug-checksum fallback is unsupported");
         let chunk_rows = request.response_chunk_rows(max_frame_bytes)?;
         ensure!(
             row_indices.len() >= chunk_rows as usize,
