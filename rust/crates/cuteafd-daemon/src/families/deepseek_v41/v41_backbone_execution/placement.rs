@@ -32,7 +32,7 @@ impl<'a> PlacedProducerStorage<'a> {
 pub(crate) struct PlacedProducerWaves<'w, 'a> {
     pub windows: Vec<DeviceOwner<'a, WindowWave<'w, 'a>>>,
     pub sources: Vec<DeviceOwner<'a, CompressorWave<'w, 'a>>>,
-    pending_commit: Option<(u64, [u32; 16], usize)>,
+    pending_commit: Option<(u64, [u32; cuteafd_core::V41_MAX_LANE_MEMBERS], usize)>,
 }
 /// Borrows only this lane. The caller retains the query and admitted bank
 /// storage until completion; cancellation drains only this layer's producers.
@@ -422,14 +422,18 @@ impl<'w, 'a> PlacedProducerWaves<'w, 'a> {
         batch: &CacheBatch,
         accepted: &[u32],
     ) -> Result<()> {
+        self.stage_cache_commit(batch.identity(), accepted)?;
+        unsafe { bank.enqueue_cache_commit(batch, &mut self.windows, &mut self.sources, accepted) }
+    }
+    fn stage_cache_commit(&mut self, identity: u64, accepted: &[u32]) -> Result<()> {
         ensure!(
-            self.pending_commit.is_none() && accepted.len() <= 16,
+            self.pending_commit.is_none() && accepted.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS,
             "placed commit already pending or too many requests"
         );
-        let mut counts = [0; 16];
+        let mut counts = [0; cuteafd_core::V41_MAX_LANE_MEMBERS];
         counts[..accepted.len()].copy_from_slice(accepted);
-        self.pending_commit = Some((batch.identity(), counts, accepted.len()));
-        unsafe { bank.enqueue_cache_commit(batch, &mut self.windows, &mut self.sources, accepted) }
+        self.pending_commit = Some((identity, counts, accepted.len()));
+        Ok(())
     }
     pub fn poll_cache_commit(&self) -> Result<bool> {
         ensure!(self.pending_commit.is_some(), "placed commit not enqueued");
@@ -614,6 +618,38 @@ impl<'a> CacheProducerWeights<'a> {
 mod tests {
     use super::*;
     use crate::families::deepseek_v41::v41_window::{WindowChunk, WindowState};
+
+    #[test]
+    fn wide_lane_commit_vocabulary_and_drafter_admission() -> Result<()> {
+        use crate::families::deepseek_v41::{
+            v41_experts::dspark::{DsparkTerminal, DistributedDsparkTerminal},
+            v41_target_head::distributed::DistributedVocabularyWave,
+        };
+        for concurrency in [33usize, 64] {
+            let members = concurrency.div_ceil(2);
+            let accepted = (0..members).map(|i| (i % 8 + 1) as u32).collect::<Vec<_>>();
+            let mut waves = PlacedProducerWaves { windows: vec![], sources: vec![], pending_commit: None };
+            waves.stage_cache_commit(42, &accepted)?;
+            let (identity, counts, len) = waves.pending_commit.unwrap();
+            assert_eq!((identity, len), (42, members));
+            assert_eq!(&counts[..len], accepted);
+            assert!(waves.stage_cache_commit(43, &accepted).is_err());
+            waves.pending_commit = None;
+            assert!(waves.stage_cache_commit(43, &[1; cuteafd_core::V41_MAX_LANE_MEMBERS + 1]).is_err());
+            for width in [5, 7] {
+                let live = members * width;
+                let head = DistributedVocabularyWave::device_bytes(live, 64640)?;
+                let local = DsparkTerminal::device_bytes_with_width(members, width)?;
+                let distributed = DistributedDsparkTerminal::device_bytes_with_width(members, 64640, width)?;
+                assert_eq!(distributed[0], head[0]);
+                assert_eq!(distributed[1], head[1] + local - cuteafd_ffi::V41VocabularyProjection::WORKSPACE_BYTES);
+                assert!(local > members * width * 129280 * 8);
+            }
+        }
+        assert!(DistributedVocabularyWave::device_bytes(cuteafd_core::V41_VOCAB_ROWS, 64640).is_ok());
+        assert!(DistributedVocabularyWave::device_bytes(cuteafd_core::V41_VOCAB_ROWS + 1, 64640).is_err());
+        Ok(())
+    }
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, and two CUDA GPUs"]
     fn placed_query_production_poll_cancel_and_reuse() -> Result<()> {

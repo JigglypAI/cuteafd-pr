@@ -1210,6 +1210,11 @@ mod admission_tests {
             args.concurrency = concurrency;
             assert!(resolve(&args, &memory, vec![], 0, &[0], 0, None).is_err());
         }
+        for concurrency in [17, 32, 33, 64] {
+            args.concurrency = concurrency;
+            let admitted = resolve(&args, &memory, vec![], 0, &[0], 0, None)?;
+            assert!(admitted.placement.pool_tokens >= args.max_context_tokens as u64);
+        }
         args.concurrency = 16;
         args.prefix_cache_entries = 129;
         assert!(resolve(&args, &memory, vec![], 0, &[0], 0, None).is_err());
@@ -1262,7 +1267,7 @@ mod plan_runtime_breakdown {
         let lib = unsafe { cuteafd_ffi::NativeLibrary::load(&path)? };
         let manifest = super::families::deepseek_v41::owners::native_manifest(&path, "V41_FP8_AOT.json")?;
         let programs = super::families::deepseek_v41::owners::NativePrograms::new(&manifest, 188)?;
-        let rows = 80u32;
+        let rows = cuteafd_core::V41_VERIFY_ROWS as u32;
         let plan = programs.decode_lanes(rows as u64, 1, super::families::deepseek_v41::resident::Fp8Head::Off, true)?;
         for d in plan.iter().filter(|d| d.group.starts_with("lane 0 ")) { eprintln!("PLAN {} {}", d.group, d.bytes); }
         let r = rows as usize;

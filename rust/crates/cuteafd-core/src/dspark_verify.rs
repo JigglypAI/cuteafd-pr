@@ -16,6 +16,8 @@ pub const V41_TARGET_CAPACITIES: [u64; 6] = [1, 16, V41_VERIFY_ROWS as u64, 256,
 /// Persistent request identities are shared by the two decode lanes.
 pub const V41_MAX_REQUESTS: usize = crate::concurrency::MAX_CONCURRENCY as usize;
 pub const V41_MAX_LANE_MEMBERS: usize = V41_MAX_REQUESTS.div_ceil(2);
+/// Vocabulary heads cover every lane member's anchor and maximum draft suffix.
+pub const V41_VOCAB_ROWS: usize = V41_MAX_LANE_MEMBERS * (MAX_DSPARK_PROPOSALS + 1);
 pub const V41_WRITE_DESCRIPTOR_BYTES: usize = V41_MAX_REQUESTS * 24;
 pub const V41_READ_DESCRIPTOR_BYTES: usize = V41_MAX_REQUESTS * 8;
 

@@ -98,7 +98,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         let resident = resident_weights(checkpoint, ranks, true).context("unsupported V4.1 dSpark resident format")?;
         let bytes = resident.iter().flatten().filter(|i| i.category == Category::Drafter).map(|i| i.bytes).sum();
         let staging = catalog.expert_staging(crate::V41ExpertSelection::Dspark { stage: 0, expert: 0 })?.staging_bytes() as u64;
-        Some(DraftInventory { resident: bytes, runtime: programs.dspark(&manifest, rows, shape.concurrency, 5, ranks,
+        ensure!((1..=cuteafd_core::MAX_DSPARK_PROPOSALS as u8).contains(&options.dspark_draft_limit), "invalid V4.1 dSpark draft limit");
+        let width = if options.dspark_draft_limit > 5 { 7 } else { 5 };
+        Some(DraftInventory { resident: bytes, runtime: programs.dspark(&manifest, rows, shape.concurrency, width, ranks,
             mode)?, marks: marks * 3 * 128 * 528,
             staging: [staging, 0], loading_experts: [3 * native_expert_bytes(128, 5120, 2304), 0],
             loader_peak: [bytes, 0], ..Default::default() })

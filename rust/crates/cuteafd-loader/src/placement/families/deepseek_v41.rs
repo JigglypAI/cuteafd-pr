@@ -397,7 +397,7 @@ pub fn cache_demands(request: &mut PlacementRequest, config: &serde_json::Value,
     use cuteafd_core::memory_layout::{Basis, Category};
     let ranks = request.inventory.gpus.len();
     let geometry = crate::serving_capacity::deepseek_v41_cache_geometry(config, ranks)?;
-    ensure!((1..=16).contains(&slots) && retained_turns <= 128 && (!replicated || ranks == 2),
+    ensure!((1..=cuteafd_core::V41_MAX_REQUESTS as u64).contains(&slots) && retained_turns <= 128 && (!replicated || ranks == 2),
         "invalid V4.1 cache admission shape");
     let tails = slots + 2 * retained_turns;
     let mut units = geometry.ranks.iter().map(|r| r.persistent_unit_bytes).collect::<Vec<_>>();
@@ -756,7 +756,7 @@ mod tests {
     fn exact_cache_demands_match_allocator_across_table_caps_and_replicas() {
         use cuteafd_core::memory_layout::Category;
         for (ranks, replicated) in [(1, false), (2, false), (2, true)] {
-            for (slots, turns) in [(1, 0), (16, 20), (3, 128)] {
+            for (slots, turns) in [(1, 0), (16, 20), (17, 20), (32, 20), (64, 80), (3, 128), (64, 128)] {
                 let tails = slots + 2 * turns;
                 for physical in [tails + slots, 2047, 2048, 2049, 4095, 4096, 4097, 131072] {
                     let logical = physical - tails;
@@ -775,6 +775,13 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn exact_cache_rejects_slots_outside_compiled_request_bank() {
+        for slots in [0, cuteafd_core::V41_MAX_REQUESTS as u64 + 1] {
+            assert!(crate::serving_capacity::deepseek_v41_cache_bytes(&config(), 1, slots, 2048, false).is_err());
         }
     }
 

@@ -255,7 +255,8 @@ impl<'a> NativeTp2<'a> {
             "NVFP4 W4A4 requires BF16 route planes and explicit FirstCapacity selection"
         );
         let layer = ExpertLayer::BackboneTp2 { layer: 0, rank: 0 };
-        let infos = kernel_capacities(max_rows, &library.native_expert_exports(3)?.capacities)?
+        let infos = kernel_capacities(max_rows, &if nvfp4 { library.nvfp4_expert_exports(3)? }
+            else { library.native_expert_exports(3)? }.capacities)?
             .into_iter()
             .map(|capacity| layer.select_info(library, capacity, nvfp4))
             .collect::<Result<Vec<_>>>()?;
@@ -649,7 +650,8 @@ impl<'a> NativeTp2<'a> {
             "NVFP4 W4A4 requires BF16 route planes and explicit FirstCapacity selection"
         );
         let kernels = device.run(|| {
-            kernel_capacities(max_rows, &device.library.native_expert_exports(3)?.capacities)?
+            kernel_capacities(max_rows, &if nvfp4 { device.library.nvfp4_expert_exports(3)? }
+                else { device.library.native_expert_exports(3)? }.capacities)?
                 .into_iter()
                 .map(|c| {
                     ExpertLayer::BackboneTp2 {

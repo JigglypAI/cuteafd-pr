@@ -426,6 +426,9 @@ pub(crate) struct PlanArgs {
     /// Concurrent sequences for --layout (0: family serving default; otherwise 8 at <=32 GiB, 16 above).
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=64))]
     pub(crate) concurrency: u64,
+    /// V4.1 proposal limit for --layout (otherwise DSPARK_DRAFT_LIMIT or five).
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=7))]
+    pub(crate) dspark_draft_limit: Option<u8>,
     /// Diagnostic recurrent-state slots for --layout; automatic serving storage equals concurrency.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) state_slots: Option<u64>,
