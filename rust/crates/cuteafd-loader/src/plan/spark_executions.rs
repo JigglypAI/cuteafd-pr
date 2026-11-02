@@ -55,8 +55,8 @@ impl SparkBackend {
     /// selection order (EXLR8 format, then EXL3, then FP8-family, then native).
     pub fn for_catalog(catalog: &crate::OfficialV41Catalog) -> anyhow::Result<Self> {
         let geometry = catalog.routed_experts().geometry()?;
-        Ok(if geometry.same_shape(&cuteafd_core::ExpertGeometry::DEEPSEEK_V41) && catalog.exl3().is_none() { Self::V41 }
-            else if catalog.format() == crate::plan::checkpoint::CheckpointFormat::Exlr8 { Self::Exlr8 }
+        Ok(if catalog.format() == crate::plan::checkpoint::CheckpointFormat::Exlr8 { Self::Exlr8 }
+            else if geometry.same_shape(&cuteafd_core::ExpertGeometry::DEEPSEEK_V41) && catalog.exl3().is_none() { Self::V41 }
             else if catalog.exl3().is_some() { Self::Exl3(cuteafd_core::Exl3RowPolicy::for_geometry(geometry)) }
             else if catalog.fp8().is_some() { Self::Fp8 } else { Self::Native })
     }

@@ -788,6 +788,29 @@ impl NativeLibrary {
         }
     }
 
+    /// Installed capacity metadata is resolved once during startup, before any
+    /// expert execution arena is allocated; the launch path never reads files.
+    pub fn native_expert_exports(&self, role: u32) -> Result<cuteafd_core::spark_executions::ExpertExportCapacities> {
+        let family = cuteafd_core::expert_geometry().family().context("unknown native expert family")?;
+        let role = match role {
+            0 => "coordinator".to_owned(), 1 => "spark".to_owned(),
+            2 => "rtx_backbone".to_owned(), 3 => "rtx_tp2".to_owned(),
+            4 => "dspark_tp2".to_owned(), 5 => "spark_tp2".to_owned(),
+            6 => "spark_tp3".to_owned(), 7 => "spark_tp6".to_owned(),
+            8 => "spark_tp8".to_owned(),
+            other => format!("spark_w{}", cuteafd_core::tp_units::native_role_width(other)
+                .context("unknown native expert role")?),
+        };
+        let path = [self.artifact_root.join("V41_EXPERT_TP_AOT.json"),
+            self.artifact_root.join("../share/V41_EXPERT_TP_AOT.json")].into_iter()
+            .find(|path| path.is_file()).context("missing installed native expert capacity manifest")?;
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let key = format!("{family}:{role}");
+        let package = &manifest["native_packages"][&key];
+        cuteafd_core::spark_executions::ExpertExportCapacities::from_manifest(package)
+            .map_err(anyhow::Error::msg).with_context(|| format!("native expert package {key} in {}", path.display()))
+    }
+
     /// Query immutable native MXFP4 numerical metadata before allocation/readiness.
     pub fn native_expert_reduction(&self, info: &V41ExpertInfo) -> Result<V41ExpertReduction> {
         type Query = unsafe extern "C" fn(i32, *mut V41ExpertReduction) -> i32;

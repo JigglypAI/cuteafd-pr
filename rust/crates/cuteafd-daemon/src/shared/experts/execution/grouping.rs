@@ -92,7 +92,10 @@ impl InstalledExpertGrouping {
             variants: Vec<NativeVariant>,
         }
         let package = directory.join("v41_experts.json");
-        let manifest: Manifest = Self::read(&package)?;
+        let value: serde_json::Value = Self::read(&package)?;
+        let exports = cuteafd_core::spark_executions::ExpertExportCapacities::from_manifest(&value)
+            .map_err(|e| Self::error(&package, e))?;
+        let manifest: Manifest = serde_json::from_value(value).map_err(|e| Self::error(&package, e))?;
         if manifest.schema != 1
             || !matches!(
                 manifest.role.as_str(),
@@ -132,9 +135,8 @@ impl InstalledExpertGrouping {
         if capacity > 1 {
             variants.push(selected(1)?);
         }
-        if capacity > cuteafd_core::native_decode_rows() {
-            variants.push(selected(cuteafd_core::native_decode_rows())?);
-        }
+        let grouped = exports.grouped_decode(capacity as u32).map_err(|e| Self::error(&package, e))? as usize;
+        if capacity > grouped && grouped > 1 { variants.push(selected(grouped)?); }
         variants.sort_by_key(|v| v.capacity_rows);
         Ok(Self {
             package,
@@ -241,7 +243,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join("v41_experts.json"),
-            json!({"schema":1,"role":"spark","variants":variants}).to_string(),
+            json!({"schema":1,"role":"spark","decode_capacities": variants.as_array().unwrap().iter().filter_map(|v| v["capacity_rows"].as_u64()).filter(|&n| n <= 80).collect::<Vec<_>>(),"variants":variants}).to_string(),
         )
         .unwrap();
         root

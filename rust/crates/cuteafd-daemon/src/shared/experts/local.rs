@@ -121,7 +121,7 @@ impl<'a> LocalExpertWave<'a> {
         geometry: ExpertGeometry,
     ) -> Result<usize> {
         Self::require_geometry(geometry)?;
-        let infos = Self::capacities(capacity)?
+        let infos = if nvfp4 { Self::capacities(capacity)? } else { library.native_expert_exports(2)?.covering(capacity as usize).map_err(anyhow::Error::msg)? }
             .into_iter()
             .map(|c| {
                 if nvfp4 {
@@ -182,7 +182,7 @@ impl<'a> LocalExpertWave<'a> {
         } else {
             Some(ExpertReductionPlan::native(
                 library,
-                Self::capacities(capacity)?
+                library.native_expert_exports(2)?.covering(capacity as usize).map_err(anyhow::Error::msg)?
                     .into_iter()
                     .map(|c| library.v41_local_expert_info(c))
                     .collect::<Result<Vec<_>>>()?,
@@ -197,7 +197,7 @@ impl<'a> LocalExpertWave<'a> {
             workspace - capacity as usize * geometry.row_bytes() as usize,
         )?;
         let mut states = Vec::new();
-        for c in Self::capacities(capacity)? {
+        for c in if nvfp4 { Self::capacities(capacity)? } else { library.native_expert_exports(2)?.covering(capacity as usize).map_err(anyhow::Error::msg)? } {
             let kernel = if nvfp4 {
                 library.v41_nvfp4_local_expert_kernel(c)?
             } else {

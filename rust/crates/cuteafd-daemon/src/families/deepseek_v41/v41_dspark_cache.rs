@@ -48,8 +48,11 @@ pub(crate) struct WindowRead {
 // Reservations outlive the short host borrow while a chain reads ring slots.
 // Other request slots may be committed, but a live read slot cannot be rewritten
 // or recycled until the chain has drained its GPU work.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct SlotAccess(Rc<Cell<[u32; cuteafd_core::V41_MAX_REQUESTS]>>);
+impl Default for SlotAccess {
+    fn default() -> Self { Self(Rc::new(Cell::new([0; cuteafd_core::V41_MAX_REQUESTS]))) }
+}
 struct ReadReservation { slots: SlotAccess, used: [bool; cuteafd_core::V41_MAX_REQUESTS] }
 const WRITE_RESERVED: u32 = u32::MAX;
 struct WriteReservation { slots: SlotAccess, used: [bool; cuteafd_core::V41_MAX_REQUESTS] }

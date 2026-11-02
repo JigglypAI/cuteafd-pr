@@ -19,14 +19,6 @@ pub const V41_MAX_LANE_MEMBERS: usize = V41_MAX_REQUESTS.div_ceil(2);
 pub const V41_WRITE_DESCRIPTOR_BYTES: usize = V41_MAX_REQUESTS * 24;
 pub const V41_READ_DESCRIPTOR_BYTES: usize = V41_MAX_REQUESTS * 8;
 
-/// Canonical native grouped cover for the installed expert geometry.
-pub fn native_decode_rows() -> u32 {
-    if crate::expert_geometry().same_shape(&crate::ExpertGeometry::DEEPSEEK_V41) {
-        V41_VERIFY_ROWS as u32
-    } else { 80 }
-}
-
-
 #[derive(Debug, PartialEq, Eq)]
 pub struct GreedyVerification {
     /// Input rows to publish, including the anchor. A correction/bonus token

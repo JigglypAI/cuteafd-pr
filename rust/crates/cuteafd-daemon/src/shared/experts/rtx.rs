@@ -225,7 +225,7 @@ mod selection_tests {
     #[test]
     fn canonical_selection_remains_distinct_from_nearest_capacity() -> Result<()> {
         let variants = [(1, 64), (16, 192), (80, 64), (256, 192)];
-        let plan = crate::shared::experts::ExpertReductionPlan::new(&variants)?;
+        let plan = crate::shared::experts::ExpertReductionPlan::new(&variants, 80)?;
         for rows in 1..=256 {
             let expected = plan.execution_index(rows, rows, variants.iter().map(|v| v.0))?;
             assert_eq!(

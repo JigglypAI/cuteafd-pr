@@ -340,3 +340,63 @@ mod segment_input_tests {
         }
     }
 }
+
+/// Capacity contract declared by the installed expert artifact. No family or
+/// canonical row ladder participates in native decode-state admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpertExportCapacities {
+    pub capacities: Vec<u32>,
+    pub decode: Vec<u32>,
+}
+impl ExpertExportCapacities {
+    pub fn from_manifest(manifest: &serde_json::Value) -> Result<Self, String> {
+        let variants = manifest["variants"].as_array().ok_or("missing expert variants")?;
+        let capacities = variants.iter().map(|variant| {
+            variant.get("requested_rows").unwrap_or(&variant["capacity_rows"])
+                .as_u64().and_then(|n| u32::try_from(n).ok())
+                .filter(|&n| n > 0 && n <= 4096).ok_or("invalid expert export capacity")
+        }).collect::<Result<Vec<_>, _>>()?;
+        let decode = manifest["decode_capacities"].as_array().ok_or("missing expert decode_capacities")?
+            .iter().map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok())
+                .ok_or("invalid expert decode capacity")).collect::<Result<Vec<_>, _>>()?;
+        let mut capacities = capacities;
+        capacities.sort_unstable();
+        if capacities.is_empty() || capacities.windows(2).any(|p| p[0] == p[1])
+            || decode.first() != Some(&1) || !decode.windows(2).all(|p| p[0] < p[1])
+            || decode.iter().any(|n| !capacities.contains(n)) {
+            return Err("expert decode capacities must be ordered, unique compiled exports starting at m1".into());
+        }
+        Ok(Self { capacities, decode })
+    }
+
+    pub fn covering(&self, rows: usize) -> Result<Vec<u32>, String> {
+        let compiled = self.capacities.iter().copied().find(|&n| n as usize >= rows && rows > 0)
+            .ok_or_else(|| format!("expert package does not cover {rows} rows"))?;
+        Ok(self.capacities.iter().copied().filter(|&n| n <= compiled).collect())
+    }
+
+    pub fn grouped_decode(&self, compiled: u32) -> Result<u32, String> {
+        if !self.capacities.contains(&compiled) { return Err(format!("missing compiled expert m{compiled}")); }
+        self.decode.iter().copied().filter(|&n| n <= compiled).next_back()
+            .ok_or_else(|| "expert package lacks admitted decode cover".into())
+    }
+}
+
+#[cfg(test)]
+mod expert_capacity_tests {
+    use super::ExpertExportCapacities;
+    #[test]
+    fn manifests_admit_their_own_decode_ladders() {
+        for ceiling in [64, 80] {
+            let value = serde_json::json!({"decode_capacities":[1,16,ceiling],
+                "variants":[{"capacity_rows":1},{"capacity_rows":16},
+                    {"capacity_rows":ceiling},{"capacity_rows":4096}]});
+            let exports = ExpertExportCapacities::from_manifest(&value).unwrap();
+            assert_eq!(exports.grouped_decode(4096).unwrap(), ceiling);
+            assert_eq!(exports.covering(17).unwrap(), [1,16,ceiling]);
+            let mut invalid = value;
+            invalid["decode_capacities"] = serde_json::json!([1,16,128]);
+            assert!(ExpertExportCapacities::from_manifest(&invalid).is_err());
+        }
+    }
+}

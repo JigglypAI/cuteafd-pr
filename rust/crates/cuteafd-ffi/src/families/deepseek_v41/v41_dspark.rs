@@ -334,7 +334,7 @@ impl V41DraftStep<'_> {
         position: usize,
         stream: *mut c_void,
     ) -> Result<()> {
-        ensure!((1..=cuteafd_core::V41_MAX_LANE_MEMBERS as u32).contains(&rows), "invalid draft sampling rows");
+        ensure!((1..=cuteafd_core::V41_MAX_LANE_MEMBERS).contains(&rows), "invalid draft sampling rows");
         ensure!(position < 7, "invalid draft position");
         for (buffer, bytes) in [
             (shared, rows * 129280 * 4),

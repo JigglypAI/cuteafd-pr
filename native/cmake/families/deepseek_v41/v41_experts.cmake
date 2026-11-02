@@ -82,7 +82,8 @@ add_custom_command(
     "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/${CUTEAFD_V41_EXPERT_EXPORT_SCRIPT}"
     --output-dir "${CUTEAFD_V41_EXPERT_DIR}" ${CUTEAFD_V41_EXPERT_EXPORT_ARGS}
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/${CUTEAFD_V41_EXPERT_EXPORT_SCRIPT}"
+  DEPENDS "${CUTEAFD_V41_CAPACITY_SOURCE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_capacities.py" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/${CUTEAFD_V41_EXPERT_EXPORT_SCRIPT}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_experts_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_spark_tp3_launch_geometry.py"

@@ -376,7 +376,7 @@ impl<'a> Exl3Worker<'a> {
         let variants = self.executions.iter().map(|execution| InstalledExpertVariant::from_queries(
             execution.capacity(), |_| Ok(execution.group_rows()))).collect::<Result<Vec<_>>>()?;
         let selector = match self.row_policy {
-            Exl3RowPolicy::Nearest => ExpertGroupingSelector::Exl3Nearest,
+            Exl3RowPolicy::Nearest | Exl3RowPolicy::V41 => ExpertGroupingSelector::Exl3Nearest,
             Exl3RowPolicy::GlmFlashK64 => ExpertGroupingSelector::Exl3GlmFlashK64,
         };
         let report = InstalledExpertGrouping::new(loaded, rank, self.capacity, selector, variants)?;

@@ -147,7 +147,7 @@ mod tests {
                 && catalog.nvfp4().is_none()
                 && lib
                     .v41_tp2_expert_info(
-                        crate::shared::experts::rtx::native::kernel_capacities(rows as usize)?
+                        crate::shared::experts::rtx::native::kernel_capacities(rows as usize, &lib.native_expert_exports(3)?.capacities)?
                             .last()
                             .copied()
                             .unwrap(),

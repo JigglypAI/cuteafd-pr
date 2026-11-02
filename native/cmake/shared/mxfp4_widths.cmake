@@ -75,7 +75,8 @@ ${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc\"
       --rows "${width_rows_arg}" --width "${slice}" --standard-names
     COMMAND "${CMAKE_COMMAND}" -E copy
       "${dir}/v41_expert_variants.h" "${dir}/${variant_header}"
-    DEPENDS
+    DEPENDS "${CUTEAFD_V41_CAPACITY_SOURCE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_capacities.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/spark_packages.py"

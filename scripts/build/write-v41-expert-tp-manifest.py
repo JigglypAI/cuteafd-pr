@@ -58,7 +58,11 @@ EXPECTED_EXPERTS = 384
 EXPECTED_HIDDEN = 5120
 EXPECTED_TOPK = 6
 EXPECTED_CAPABILITY = [12, 1]
-EXPECTED_CAPACITIES = (1, 16, 80, 256, 1024, 4096)
+_capacity_spec = importlib.util.spec_from_file_location(
+    "manifest_v41_capacities", Path(__file__).resolve().parents[2] / "python/tools/lib/v41_capacities.py")
+_capacity_module = importlib.util.module_from_spec(_capacity_spec)
+_capacity_spec.loader.exec_module(_capacity_module)
+EXPECTED_CAPACITIES = _capacity_module.TARGET_CAPACITIES
 
 
 def sha256_file(path: Path) -> str:
@@ -247,7 +251,16 @@ def main() -> int:
                 if missing:
                     fail(f"{args.native_library} is missing NVFP4 {role} symbols {missing}")
 
+    native_packages = {}
+    for path in sorted(args.native_build_dir.glob("*/v41_experts.json")):
+        package = json.loads(path.read_text())
+        if "decode_capacities" in package:
+            key = f"{package.get('family', 'v41')}:{package['role']}"
+            if key in native_packages:
+                fail(f"duplicate native expert package {key}")
+            native_packages[key] = package
     document = {
+        "native_packages": native_packages,
         "schema": 1,
         "role": args.role,
         "requested": args.requested,

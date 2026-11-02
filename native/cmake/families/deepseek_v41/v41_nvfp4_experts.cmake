@@ -58,7 +58,8 @@ foreach(role IN LISTS CUTEAFD_V41_NVFP4_ROLES)
     COMMAND "${CMAKE_COMMAND}" -E copy
       "${nvfp4_dir}/v41_expert_variants.h"
       "${nvfp4_dir}/v41_nvfp4_${role}_variants.h"
-    DEPENDS
+    DEPENDS "${CUTEAFD_V41_CAPACITY_SOURCE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_capacities.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_nvfp4_aot.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/expert_grouping.py"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}

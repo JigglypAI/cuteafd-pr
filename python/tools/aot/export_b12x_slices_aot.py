@@ -112,6 +112,9 @@ def fc2_n_splits(role: str, capacity: int, width: int, hidden: int) -> int:
     return 2 if role in ("spark", "rtx_tp2") and capacity == 1 and width == 128 and hidden % 256 == 0 else 1
 
 
+from v41_capacities import VERIFY_ROWS
+
+
 def export(output, capacities, width, atomic_min_capacity=None, role="spark", *, standard_names=False, compact_max_capacity=None, compact_live_rows=None, family="v41"):
     import torch
     import cutlass
@@ -177,6 +180,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         compact_live_rows=compact_live_rows,
         geometry=dict(experts=experts, hidden=hidden, intermediate=intermediate,
                       kernel_intermediate=kernel_intermediate, topk=topk),
+        decode_capacities=[n for n in capacities if n <= (VERIFY_ROWS if family == "v41" and role not in ("coordinator", "dspark_tp2") else 80)],
         variants=[],
     )
     includes, entries, reductions = [], [], []

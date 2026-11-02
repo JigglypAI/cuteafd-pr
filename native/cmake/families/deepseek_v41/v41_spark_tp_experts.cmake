@@ -112,7 +112,8 @@ foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)
       --standard-names
     COMMAND "${CMAKE_COMMAND}" -E copy
       "${dir}/v41_expert_variants.h" "${dir}/${variant_header}"
-    DEPENDS
+    DEPENDS "${CUTEAFD_V41_CAPACITY_SOURCE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_capacities.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_spark_tp3_launch_geometry.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_experts_aot.py"
