@@ -183,8 +183,12 @@ print(json.dumps(dict(report, version=1, family=family, executable=True, report=
     spark_admission="coordinator_authoritative", decode_lanes=1,
     peers=value("--deployment-peers", "").split(",")[:report["spark_ranks"]],
     speculator=value("--speculator", "off"), prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
+    # Match DeviceLayout's allocation ceiling, independently of host-inclusive capacity.
     memory_layout=dict(devices=[dict(kind="rtx", index=i, items=[dict(category="weights", bytes=8 << 30)])
-                                for i in range(int(value("--rtx", "1")))]))))
+                                for i in range(int(value("--rtx", "1")))] +
+                               [dict(kind="spark", index=i, capacity_bytes=int(float(value("--spark-budget-gib", "108")) * 2**30),
+                                     worker_budget_bytes=int(float(value("--spark-budget-gib", "108")) * 2**30),
+                                     items=[], kv_tokens=0) for i in range(report["spark_ranks"])]))))
 """.replace("REPORT", repr(json.dumps(plan))).replace("FAMILY", repr(family))
             .replace("FIRST", first).replace("LAST", "None" if last == "-1" else last))
         docker.write_text(docker.read_text() + f'case "$*" in *"cuteafd plan"*) exec python3 "{stub}" "$@" ;; esac\n')
@@ -579,15 +583,25 @@ def test_qualification_configs_exist_and_are_listed() -> None:
     ({"model_type": "mimo_v2", "num_hidden_layers": 5, "moe_layer_freq": [0, 1, 0, 1, 1]}, 3),
     ({"model_type": "mimo_v2_flash", "num_hidden_layers": 48}, 47),
 ])
-@pytest.mark.parametrize("value", ["auto", "max", "all", "50%", "100%", "0"])
-def test_checkpoint_onboarding_count_and_rounding(tmp_path, config, count, value):
+@pytest.mark.parametrize("value", ["auto", "all", "0"])
+def test_checkpoint_onboarding_accepts_auto_all_and_counts(tmp_path, config, count, value):
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config))
     result = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"),
                              "--onboard", value, str(path)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    expected = {"all": str(count), "100%": str(count), "50%": str(int(count * 0.5 + 0.5))}.get(value, value)
-    assert result.stdout.strip() == expected
+    # `all` stays unresolved; the engine resolves it from the checkpoint itself.
+    assert result.stdout.strip() == value
+    # The checkpoint's own routed-layer count is a valid exact pin; one more is
+    # refused with that count.
+    exact = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"),
+                            "--onboard", str(count), str(path)], capture_output=True, text=True)
+    assert exact.returncode == 0, exact.stderr
+    assert exact.stdout.strip() == str(count)
+    over = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"),
+                           "--onboard", str(count + 1), str(path)], capture_output=True, text=True)
+    assert over.returncode != 0
+    assert f"checkpoint has {count} routed layers" in over.stderr
     bounded = subprocess.run(["bash", "-c", 'source "$1"; release_onboard "$2" test/model pinned',
                               "test", str(ROOT / "scripts/lib/release-common.sh"), value],
                              env={**os.environ, "HF_HOME": str(tmp_path / "hf")},
@@ -597,7 +611,7 @@ def test_checkpoint_onboarding_count_and_rounding(tmp_path, config, count, value
     assert bounded.stdout.strip() == value
 
 
-@pytest.mark.parametrize("value", ["-1", "101%", "NaN%", "inf%", "half", "5x", ""])
+@pytest.mark.parametrize("value", ["-1", "max", "50%", "101%", "NaN%", "inf%", "half", "5x", ""])
 def test_checkpoint_onboarding_rejects_invalid_grammar(value):
     result = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"),
                              "--onboard", value], capture_output=True, text=True)

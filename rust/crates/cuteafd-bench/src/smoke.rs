@@ -139,6 +139,9 @@ pub struct Entry {
     /// Output tokens per sweep decode request (default `crate::sweep::TOKENS`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sweep_tokens: Option<u64>,
+    /// Cold C1 prose cells with explicit contexts and corpus seeds (default seed 4242).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_c1: Option<crate::sweep::C1Options>,
     /// `false` runs explicit panels without the server's baseline (basic card
     /// + quick quality); default true. Needs a server build that honours it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -477,6 +480,7 @@ impl Entry {
             prefill_repeat: self.prefill_repeat.or(defaults.prefill_repeat),
             prefill_purge: self.prefill_purge.clone().or_else(|| defaults.prefill_purge.clone()),
             sweep_tokens: self.sweep_tokens.or(defaults.sweep_tokens),
+            sweep_c1: self.sweep_c1.clone().or_else(|| defaults.sweep_c1.clone()),
             baseline: self.baseline.or(defaults.baseline),
             window: self.window.clone().or_else(|| defaults.window.clone()),
             lossless_set: self.lossless_set.clone().or_else(|| defaults.lossless_set.clone()),
@@ -904,6 +908,11 @@ fn save_state(path: &Path, state: &BTreeMap<String, Outcome>) -> Result<()> {
 
 /// `post_load_c1` runs after the widest level; `post_load_repeat` replays the levels C1.
 fn check_post_load(entry: &Entry) -> Result<()> {
+    if let Some(options) = &entry.sweep_c1 {
+        options.validate()?;
+        anyhow::ensure!(entry.levels.as_deref() == Some(&[1]) && entry.prefill_lengths.is_none()
+            && entry.post_load_c1 != Some(true), "C1 corpus sweep needs levels=[1], no prefill lengths or post-load C1");
+    }
     if entry.post_load_c1 == Some(true) && entry.levels.is_none() {
         bail!("{}: post_load_c1 needs levels (it runs after the widest one)", entry.name);
     }
@@ -1394,9 +1403,14 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                 .map(|hook| move || window_hook("prefill-purge", hook, purge_url, purge_config));
             let prefill = crate::sweep::PrefillOptions { repeat: entry.prefill_repeat.unwrap_or(false),
                 purge: purge.as_ref().map(|purge| purge as &dyn Fn() -> Result<()>) };
-            let sweep = crate::sweep::run_windowed(&url, api_key.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
-                entry.post_load_c1.unwrap_or(false), entry.post_load_repeat.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]),
-                &prefill, entry.fabric.unwrap_or(true), entry.sweep_tokens.unwrap_or(crate::sweep::TOKENS), open);
+            let sweep = if let Some(options) = &entry.sweep_c1 {
+                crate::sweep::run_c1_windowed(&url, api_key.as_deref(), options,
+                    entry.fabric.unwrap_or(true), entry.sweep_tokens.unwrap_or(crate::sweep::TOKENS), open)
+            } else {
+                crate::sweep::run_windowed(&url, api_key.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
+                    entry.post_load_c1.unwrap_or(false), entry.post_load_repeat.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]),
+                    &prefill, entry.fabric.unwrap_or(true), entry.sweep_tokens.unwrap_or(crate::sweep::TOKENS), open)
+            };
             let closed = close_window(&url, &config_path);
             let sweep = sweep?;
             closed?;
@@ -1607,6 +1621,20 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn c1_corpus_options_merge_and_require_c1_only() {
+        let options = crate::sweep::C1Options { contexts: vec![256, 42000], seeds: vec![4244, 4247] };
+        let defaults = Entry { sweep_c1: Some(options.clone()), ..Entry::default() };
+        let mut entry = Entry { name: "c1".into(), levels: Some(vec![1]), ..Entry::default() }.merged(&defaults);
+        assert_eq!(entry.sweep_c1, Some(options));
+        check_post_load(&entry).unwrap();
+        entry.levels = Some(vec![1, 4]);
+        assert!(check_post_load(&entry).is_err());
+        entry.levels = Some(vec![1]);
+        entry.prefill_lengths = Some(vec![8192]);
+        assert!(check_post_load(&entry).is_err());
     }
 
     #[test]

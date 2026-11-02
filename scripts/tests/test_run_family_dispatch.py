@@ -114,6 +114,45 @@ def test_exlr8_onboarding_reaches_shared_admission_without_zero_override(tmp_pat
         assert argv[argv.index("--pool-tokens") + 1] == "0"
 
 
+@pytest.mark.parametrize("model_type", ["glm_moe_dsa", "deepseek_v4"])
+@pytest.mark.parametrize("explicit", [None, 104 << 30])
+def test_spark_budget_default_is_planner_owned_and_explicit_ceiling_wins(tmp_path, model_type, explicit):
+    config = {"model_type": model_type, "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    keys = "SPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    if explicit is not None:
+        keys += f"SPARK_DEVICE_BUDGET_BYTES={explicit}\n"
+    device_budget = explicit or (108 << 30)
+    result = _family_launch_result(tmp_path, config, "test/budget", keys,
+                                  encoder_plan={"placement_supported": True, "fits": True,
+                                                "spark_budget_bytes": 100 << 30})
+    assert result.returncode == 0, result.stderr
+    plans = [line.split() for line in result.stderr.splitlines() if "cuteafd plan" in line]
+    assert plans
+    for plan in plans:
+        if explicit is None:
+            assert "--spark-budget-gib" not in plan
+        else:
+            assert float(plan[plan.index("--spark-budget-gib") + 1]) == explicit / 2**30
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert len(workers) == 4
+    assert all(f"--device-budget-bytes {device_budget} " in worker for worker in workers)
+
+
+@pytest.mark.parametrize("devices", [[], [{"kind": "spark", "index": 0, "capacity_bytes": 121 << 30}],
+    [{"kind": "spark", "index": 0, "worker_budget_bytes": 0}],
+    [{"kind": "spark", "index": i, "worker_budget_bytes": (108 - i) << 30} for i in range(4)]])
+def test_spark_workers_reject_missing_zero_or_nonuniform_planner_budgets(tmp_path, devices):
+    result = _family_launch_result(tmp_path,
+        {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "test/budget",
+        "SPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        deployment_overrides={"memory_layout": {"devices": [
+            {"kind": "rtx", "index": 0, "capacity_bytes": 96 << 30, "worker_budget_bytes": 0,
+             "items": [], "kv_tokens": 0}, *devices]}})
+    assert result.returncode != 0
+    assert "no uniform Spark worker allocation ceiling" in result.stderr
+    assert "cuteafd expertd-native" not in result.stderr
+
+
 def test_exlr8_onboarded_halves_require_the_shared_committed_push():
     source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/mod.rs").read_text()
     planning = source.split("// Native dense operands and onboarded EXLR8 halves", 1)[1].split(
@@ -850,13 +889,10 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                        cuda_total_bytes if cuda_total_bytes is not None else gpu_total_mib * 2**20)
     copy_input(ROOT / "scripts" / "lib" / "cdi-gpus.sh", repo / "scripts" / "lib")
     copy_input(ROOT / "scripts" / "lib" / "coordinator-gpus.py", repo / "scripts" / "lib")
-    capacity = Path("rust/crates/cuteafd-core/src/serving_capacity.rs")
-    (repo / capacity.parent).mkdir(parents=True)
-    copy_input(ROOT / capacity, repo / capacity)
+    # release-common.sh stages serving_capacity.rs through shared_inputs.
     native_v41 = family_config.get("model_type") == "deepseek_v41"
     if native_v41:
         programs = Path("rust/crates/cuteafd-core/src/coordinator_programs.rs")
-        (repo / programs.parent).mkdir(parents=True, exist_ok=True)
         copy_input(ROOT / programs, repo / programs)
         (repo / "scripts" / "build").mkdir(exist_ok=True)
         (repo / "scripts" / "build" / "verify-sparkinfer-source.py").write_text("print('test-pin')\n")
@@ -977,6 +1013,8 @@ report.update(spark_ranks=ranks)
 if family == "mimo_v2":
     report["prefill_lanes"] = 3
 gpus = int(value("--rtx", "1"))
+spark_capacity = int(float(value("--spark-budget-gib")) * 2**30) if value("--spark-budget-gib") else (
+    report.get("spark_budget_bytes", 108 << 30) if family in {"kimi_k3", "step5"} else 108 << 30)
 placement_ready = report.get("placement_supported", True) and report.get("fits", True)
 shared = family in {"step5", "kimi_k3", "glm5", "glm5_flash", "deepseek_v4", "qwen4"}
 # The planner's fixed depth (prefill_waves::depth): three units with Sparks.
@@ -1001,7 +1039,8 @@ deployment = dict(version=1, family=family, executable=family != "qwen3_5" and p
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
     artifact_requirements=dict(spark_tp_role=f"tp{tp}" if family == "deepseek_v41" and explicit and tp != 4 else None), report=report,
     memory_layout=dict(devices=[dict(kind="rtx", index=i, items=[dict(category="weights", bytes=int(os.environ["STUB_PLAN_RTX_BYTES"])),
-                                                                 dict(category="kv", bytes=64 << 30)]) for i in range(gpus)]))
+                                                                 dict(category="kv", bytes=64 << 30)]) for i in range(gpus)] +
+                               [dict(kind="spark", index=i, capacity_bytes=spark_capacity, worker_budget_bytes=spark_capacity, items=[]) for i in range(ranks)]))
 deployment.update(json.loads(os.environ["STUB_DEPLOYMENT_OVERRIDES"]))
 if deployment.get("wip_launchable") == "absent":
     deployment.pop("wip_launchable")
@@ -1082,6 +1121,9 @@ def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, tempor
         for rank, worker in enumerate(sorted(workers, key=lambda w: int(w[w.index("--rank") + 1]))):
             assert worker[worker.index("--rank") + 1] == str(rank)
             assert worker[worker.index("--world") + 1] == "8"
+            device = next(device for device in deployment["memory_layout"]["devices"]
+                          if device["kind"] == "spark" and device["index"] == rank)
+            assert int(worker[worker.index("--device-budget-bytes") + 1]) == device["worker_budget_bytes"]
     layer_bytes = None
     if family == "deepseek_v41":
         arithmetic = subprocess.run(["bash", "-euc", 'source "$1"; release_spark_layer_bytes 8',
@@ -1597,7 +1639,7 @@ def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: 
     return _family_launch_result(tmp_path, family_config, model, keys).stderr
 
 
-@pytest.mark.parametrize("value", [None, "auto", "0", "5", "50%", "all", "max"])
+@pytest.mark.parametrize("value", [None, "auto", "0", "5", "all"])
 def test_deepseek_v4_honors_explicit_local_expert_limit(tmp_path, value):
     keys = "" if value is None else f"RTX_EXPERT_LAYERS={value}\n"
     result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4", "num_hidden_layers": 61}, "test/dsv4", keys)
@@ -1605,15 +1647,14 @@ def test_deepseek_v4_honors_explicit_local_expert_limit(tmp_path, value):
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-dsv4" in line)
     if value is None:
         assert "--local-expert-layers" not in launch and "--rtx-expert-layers" not in launch
-    elif value not in ("auto", "max"):
-        value = {"all": "61", "50%": "31"}.get(value, value)
+    elif value in ("auto", "all"):
+        assert f"--rtx-expert-layers {value}" in launch
+    else:
         # Whole layer counts keep the flag older images accept.
         assert f"--local-expert-layers {value}" in launch
-    else:
-        assert f"--rtx-expert-layers {value}" in launch
 
 
-@pytest.mark.parametrize("value", [None, "auto", "0", "5", "50%", "all", "max"])
+@pytest.mark.parametrize("value", [None, "auto", "0", "5", "all"])
 def test_glm53_honors_explicit_tp2_expert_limit(tmp_path, value):
     keys = "" if value is None else f"RTX_EXPERT_LAYERS={value}\n"
     result = _family_launch_result(tmp_path, {
@@ -1625,8 +1666,7 @@ def test_glm53_honors_explicit_tp2_expert_limit(tmp_path, value):
     if value is None:
         assert "--rtx-expert-layers" not in launch
     else:
-        expected = {"all": "6", "50%": "3"}.get(value, value)
-        assert f"--rtx-expert-layers {expected}" in launch
+        assert f"--rtx-expert-layers {value}" in launch
 
 
 @pytest.mark.parametrize("explicit", [False, True])
@@ -1661,7 +1701,7 @@ def test_glm53_all_local_two_rtx_launch_has_no_spark_peers(tmp_path):
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glm " in line)
     assert "--split-device 1" in launch
-    assert "--rtx-expert-layers 1" in launch
+    assert "--rtx-expert-layers all" in launch
     assert "--peers" not in launch
     assert "cuteafd expertd-native" not in result.stderr
     assert "--local-experts" not in launch
@@ -1669,7 +1709,7 @@ def test_glm53_all_local_two_rtx_launch_has_no_spark_peers(tmp_path):
     assert "--rdma-endpoints" not in result.stderr
 
 
-@pytest.mark.parametrize("value", [None, "auto", "0", "2", "50%", "all", "max"])
+@pytest.mark.parametrize("value", [None, "auto", "0", "2", "all"])
 def test_glm_flash_forwards_explicit_rtx_expert_onboarding(tmp_path, value):
     keys = "SPECULATOR=off\n"
     if value is not None:
@@ -1684,11 +1724,10 @@ def test_glm_flash_forwards_explicit_rtx_expert_onboarding(tmp_path, value):
     if value is None:
         assert "--rtx-expert-layers" not in launch
     else:
-        expected = {"all": "2", "50%": "1"}.get(value, value)
-        assert f"--rtx-expert-layers {expected}" in launch
+        assert f"--rtx-expert-layers {value}" in launch
 
 
-@pytest.mark.parametrize("value", ["-1", "101%", "half", "5x"])
+@pytest.mark.parametrize("value", ["-1", "max", "50%", "101%", "half", "5x"])
 def test_glm53_rejects_invalid_tp2_expert_limit_before_launch(tmp_path, value):
     result = _family_launch_result(tmp_path, {
         "model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3,
@@ -1727,7 +1766,7 @@ def test_deepseek_v4_rejects_retired_peer_expert_ranges(tmp_path, value):
         assert "--peer-expert-ranges" not in launch
 
 
-@pytest.mark.parametrize("value", ["-1", "101%", "half", "5x"])
+@pytest.mark.parametrize("value", ["-1", "max", "50%", "101%", "half", "5x"])
 def test_deepseek_v4_rejects_invalid_local_limit_before_launch(tmp_path, value):
     result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/dsv4",
                                   f"RTX_EXPERT_LAYERS={value}\n")
@@ -2805,14 +2844,13 @@ def test_qwen_explicit_spark_free_dual_passes_both_owners(tmp_path: Path, keys: 
 
 
 
-@pytest.mark.parametrize("onboard", ["auto", "all", "max", "100%"])
+@pytest.mark.parametrize("onboard", ["auto", "all", "0"])
 def test_qwen_dual_forwards_shared_onboard_policy(tmp_path: Path, onboard: str) -> None:
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
                                   f"RTX_GPUS=2\nSPARK_COUNT=0\nEXPERT_BACKEND=local\nSPECULATOR=off\nRTX_EXPERT_LAYERS={onboard}\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
-    expected = {"all": "2", "100%": "2"}.get(onboard, onboard)
-    assert f"--rtx-expert-layers {expected}" in launch
+    assert f"--rtx-expert-layers {onboard}" in launch
     assert "CUTEAFD_ATTENTION_PLACEMENT=layers" in launch
 
 
@@ -3317,7 +3355,7 @@ def test_mimo_media_plan_keeps_ingress_onboarding_and_graph_contract(tmp_path, i
     plan = {"placement_supported": True, "fits": True, "spark_ranks": 2,
             "encoder_plan_hash": "ab" * 32,
             "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
-    keys = (f"EXPERT_INPUT={ingress}\nRTX_EXPERT_LAYERS=25%\nSPARK_COUNT=2\n"
+    keys = (f"EXPERT_INPUT={ingress}\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\n"
             "VISION=rtx\nAUDIO=off\nRTX_GPUS=1\nSPECULATOR=off\n"
             "MAX_CONTEXT_TOKENS=262144\nDECODE_GRAPHS=on\nFULL_PREFILL_LOGITS=on\n")
     result = _family_launch_result(tmp_path, config, "test/mimo", keys, encoder_plan=plan)
@@ -3963,8 +4001,8 @@ def test_v41_rejects_noncanonical_speculator(tmp_path: Path, keys: str, error: s
     assert "docker run -d" not in result.stderr
 
 
-@pytest.mark.parametrize("value,expected", [("48", "48"), ("all", "60"), ("50%", "30")])
-def test_expert_onboarding_uses_checkpoint_count_above_forty(tmp_path, value, expected):
+@pytest.mark.parametrize("value,expected", [("48", "48"), ("60", "60"), ("all", "all")])
+def test_expert_onboarding_forwards_exact_pins_above_forty(tmp_path, value, expected):
     result = _family_launch_result(tmp_path, {
         "model_type": "glm_moe_dsa", "num_hidden_layers": 63, "first_k_dense_replace": 3,
     }, "test/glm", f"RTX_EXPERT_LAYERS={value}\nSPECULATOR=off\n")

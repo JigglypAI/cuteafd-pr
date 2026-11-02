@@ -150,7 +150,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 demands.extend(core::CoreCharges::from_package(cfg, &model.core, rows, unit, manifest)?.demands()?
                     .into_iter().filter(|d| d.group != "Kimi K6 peer receive"));
             }
-            if opts.onboard != Some(Onboard::Layers(0)) {
+            if opts.requested_onboard() != Some(OnboardSetting::Layers(0)) {
                 let package = allocation::expert_package(path)?;
                 tp2_workspace = [allocation::expert_workspace(&package, unit)?; 2];
             }
@@ -264,7 +264,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         refusal(report, format!("Kimi packed layer inventory refused: {error:#}"), "Check checkpoint layer geometry."); return memory;
     }};
     // Reuse pool-first TP2 onboarding, constrained by the Spark suffix budget.
-    let onboard = opts.onboard.unwrap_or(Onboard::Auto);
+    let onboard = opts.resolve_onboard(cfg.dense.iter().filter(|dense| !**dense).count()).unwrap_or(Onboard::Auto);
     let mut request = PlacementRequest {
         inventory: Inventory { gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, bytes)| GpuBudget { capacity_bytes: *bytes,
             headroom_bytes: opts.headroom_bytes, baseline: baseline[rank] }).collect(),
@@ -291,7 +291,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         (layer.kind == AttentionClass::Mla && request.attention_placement != Some(AttentionPlacement::Heads), layer.colocate))
         .collect::<Vec<_>>();
     let selected = attention::solve_owners(&groups, LayerOwnership::Ranges, request.layers_first_gpu,
-        request.onboard, |owners| -> anyhow::Result<_> {
+        |owners| -> anyhow::Result<_> {
             let mut candidate = request.clone();
             for (layer, (&owner, &(selected, _))) in candidate.layers.iter_mut().zip(owners.iter().zip(&groups)) {
                 if selected { layer.modes = vec![LayerMode::Whole { gpu: owner, ffn: FfnMode::Split }]; }
@@ -322,7 +322,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             memory.pool_tokens = placed.pool_tokens;
             report.attention_placement = placed.attention_placement;
             for gpu in 0..2 {
-                let mut device = DeviceLayout { kind: DeviceKind::Rtx, index: gpu as u32, capacity_bytes: opts.rtx_bytes[gpu],
+                let mut device = DeviceLayout { kind: DeviceKind::Rtx, index: gpu as u32, capacity_bytes: opts.rtx_bytes[gpu], worker_budget_bytes: 0,
                     items: placed.items[gpu].clone(), kv_tokens: placed.pool_tokens };
                 // The solver subtracts this guard from availability, not from its item ledger.
                 device.items.push(Item::new(Category::Reserved, "coordinator headroom", "", opts.headroom_bytes, Basis::Formula)
@@ -356,7 +356,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);
     for rank in 0..ranks {
         let resident = spark_budget.resident[rank][onboarded..].iter().sum::<u64>();
-        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_bytes,
+        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_bytes, worker_budget_bytes: opts.spark_bytes,
             kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed experts (balanced H128, replicated 3584 rotations)",
                 model.expert_formats.join("+"), resident, Basis::Exact)] };
         if let Err(error) = crate::plan::layout::charge_spark_io(&mut device, &working, cuteafd_core::ExpertGeometry::KIMI_K3,

@@ -6,6 +6,8 @@ use cuteafd_ffi::programs::{Program, ProgramSpec, Programs, Scalar};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::plan::exlr8::residency::ExpertSet;
 use std::ffi::c_void;
+use cuteafd_ffi::exlr8::KernelFamily;
+use cuteafd_loader::plan::exlr8::ExecutionVariant;
 
 const DECODE_CAPACITY: usize = cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS;
 
@@ -53,27 +55,20 @@ impl Variant {
 }
 
 fn program_names(
+    family: KernelFamily,
     set: ExpertSet,
     variant: Variant,
     activations: Exlr8PrefillActivations,
 ) -> (&'static str, &'static str) {
-    match set {
-        ExpertSet::Shared => ("exlr8_shared_a16_serving", "exlr8_shared_group"),
-        ExpertSet::Routed => match variant {
-            Variant::Prefill => (
-                match activations {
-                    Exlr8PrefillActivations::A16 => "exlr8_a16_grouped",
-                    Exlr8PrefillActivations::A8 => "exlr8_a8_grouped",
-                },
-                "exlr8_grouped_group",
-            ),
-            Variant::DecodeGrouped => ("exlr8_a16_grouped64", "exlr8_group"),
-            Variant::DecodeCompact => ("exlr8_a16_serving", "exlr8_group"),
-            // `Workspace::plan` refuses a shared variant on the routed set
-            // before this name reaches a program lookup.
-            Variant::SharedDecode => ("exlr8_shared_a16_serving", "exlr8_shared_group"),
-        },
-    }
+    let variant = if set == ExpertSet::Shared { ExecutionVariant::SharedDecode } else {
+        match variant {
+            Variant::SharedDecode => ExecutionVariant::SharedDecode,
+            Variant::DecodeCompact => ExecutionVariant::DecodeCompact,
+            Variant::DecodeGrouped => ExecutionVariant::DecodeGrouped,
+            Variant::Prefill => ExecutionVariant::Prefill,
+        }
+    };
+    (variant.program(family, activations), variant.group(family))
 }
 
 const K1_POINTERS: &[&str] = &[
@@ -183,53 +178,66 @@ pub(crate) struct Exlr8Execution<'a> {
     set: ExpertSet,
 }
 impl<'a> Exlr8Execution<'a> {
+    pub(crate) fn routed_hidden(programs: &'a Programs<'a>, family: KernelFamily) -> Result<usize> {
+        let core = programs.program(family.program(cuteafd_ffi::exlr8::KernelKind::Routed),
+            &pointers(ExpertSet::Routed, Variant::DecodeCompact))?;
+        cuteafd_ffi::exlr8::validate(core.spec())?;
+        usize::try_from(core.spec().geometry["hidden"].as_u64().context("EXLR8 hidden missing")?)
+            .context("EXLR8 hidden exceeds address space")
+    }
+
     pub(crate) fn shared_workspace_bytes(
         programs: &'a Programs<'a>,
+        family: KernelFamily,
         rows: usize,
     ) -> Result<usize> {
-        Self::workspace_bytes_for(programs, rows, ExpertSet::Shared, Variant::SharedDecode, 16,
+        Self::workspace_bytes_for(programs, family, rows, ExpertSet::Shared, Variant::SharedDecode, 16,
             Exlr8PrefillActivations::A16)
     }
 
     /// Routed decode arena: the compact-unit serving core over owned units.
     pub(crate) fn decode_compact_workspace_bytes(
         programs: &'a Programs<'a>,
+        family: KernelFamily,
         rows: usize,
         unit_limit: usize,
     ) -> Result<usize> {
-        Self::workspace_bytes_for(programs, rows, ExpertSet::Routed, Variant::DecodeCompact,
+        Self::workspace_bytes_for(programs, family, rows, ExpertSet::Routed, Variant::DecodeCompact,
             unit_limit, Exlr8PrefillActivations::A16)
     }
 
     pub(crate) fn workspace_bytes_with_limit(
         programs: &'a Programs<'a>,
+        family: KernelFamily,
         rows: usize,
         set: ExpertSet,
         unit_limit: usize,
         activations: Exlr8PrefillActivations,
     ) -> Result<usize> {
-        Self::workspace_bytes_for(programs, rows, set, Variant::Prefill, unit_limit, activations)
+        Self::workspace_bytes_for(programs, family, rows, set, Variant::Prefill, unit_limit, activations)
     }
 
     /// 64-row grouped decode arena; F32 FC2 partials keep it bit-identical to K1.
     pub(crate) fn decode_grouped_workspace_bytes(
         programs: &'a Programs<'a>,
+        family: KernelFamily,
         rows: usize,
         unit_limit: usize,
     ) -> Result<usize> {
-        Self::workspace_bytes_for(programs, rows, ExpertSet::Routed, Variant::DecodeGrouped,
+        Self::workspace_bytes_for(programs, family, rows, ExpertSet::Routed, Variant::DecodeGrouped,
             unit_limit, Exlr8PrefillActivations::A16)
     }
 
     fn workspace_bytes_for(
         programs: &'a Programs<'a>,
+        family: KernelFamily,
         rows: usize,
         set: ExpertSet,
         variant: Variant,
         unit_limit: usize,
         activations: Exlr8PrefillActivations,
     ) -> Result<usize> {
-        let core = programs.program(program_names(set, variant, activations).0,
+        let core = programs.program(program_names(family, set, variant, activations).0,
             &pointers(set, variant))?;
         Ok(Workspace::plan(core.spec(), rows, set, variant, unit_limit, activations)?.bytes)
     }
@@ -237,50 +245,55 @@ impl<'a> Exlr8Execution<'a> {
     pub(crate) fn new_shared(
         library: &'a NativeLibrary,
         programs: &'a Programs<'a>,
+        family: KernelFamily,
         rows: usize,
         available: usize,
     ) -> Result<Self> {
-        Self::new_for(library, programs, rows, available, ExpertSet::Shared, Variant::SharedDecode,
+        Self::new_for(library, programs, family, rows, available, ExpertSet::Shared, Variant::SharedDecode,
             16, Exlr8PrefillActivations::A16)
     }
 
     pub(crate) fn new_decode_compact(
         library: &'a NativeLibrary,
         programs: &'a Programs<'a>,
+        family: KernelFamily,
         rows: usize,
         available: usize,
         unit_limit: usize,
     ) -> Result<Self> {
-        Self::new_for(library, programs, rows, available, ExpertSet::Routed,
+        Self::new_for(library, programs, family, rows, available, ExpertSet::Routed,
             Variant::DecodeCompact, unit_limit, Exlr8PrefillActivations::A16)
     }
 
     pub(crate) fn new_with_limit(
         library: &'a NativeLibrary,
         programs: &'a Programs<'a>,
+        family: KernelFamily,
         rows: usize,
         available: usize,
         set: ExpertSet,
         unit_limit: usize,
         activations: Exlr8PrefillActivations,
     ) -> Result<Self> {
-        Self::new_for(library, programs, rows, available, set, Variant::Prefill, unit_limit, activations)
+        Self::new_for(library, programs, family, rows, available, set, Variant::Prefill, unit_limit, activations)
     }
 
     pub(crate) fn new_decode_grouped(
         library: &'a NativeLibrary,
         programs: &'a Programs<'a>,
+        family: KernelFamily,
         rows: usize,
         available: usize,
         unit_limit: usize,
     ) -> Result<Self> {
-        Self::new_for(library, programs, rows, available, ExpertSet::Routed, Variant::DecodeGrouped,
+        Self::new_for(library, programs, family, rows, available, ExpertSet::Routed, Variant::DecodeGrouped,
             unit_limit, Exlr8PrefillActivations::A16)
     }
 
     fn new_for(
         library: &'a NativeLibrary,
         programs: &'a Programs<'a>,
+        family: KernelFamily,
         rows: usize,
         available: usize,
         set: ExpertSet,
@@ -288,7 +301,7 @@ impl<'a> Exlr8Execution<'a> {
         unit_limit: usize,
         activations: Exlr8PrefillActivations,
     ) -> Result<Self> {
-        let (k1_name, group_name) = program_names(set, variant, activations);
+        let (k1_name, group_name) = program_names(family, set, variant, activations);
         let k1 = programs.program(k1_name, &pointers(set, variant))?;
         let group = programs.program(
             group_name,
@@ -461,7 +474,7 @@ mod tests {
 
     fn shared_spec() -> ProgramSpec {
         ProgramSpec {
-            name: program_names(ExpertSet::Shared, Variant::SharedDecode,
+            name: program_names(KernelFamily::Glm, ExpertSet::Shared, Variant::SharedDecode,
                 Exlr8PrefillActivations::A16).0.into(),
             pointers: K1_POINTERS.iter().map(|name| (*name).into()).collect(),
             scalar_kinds: b"ii".to_vec(),
@@ -481,7 +494,7 @@ mod tests {
     /// The routed decode core: the plain serving ABI over owned-unit scratch.
     fn compact_spec() -> ProgramSpec {
         let mut spec = shared_spec();
-        spec.name = program_names(ExpertSet::Routed, Variant::DecodeCompact,
+        spec.name = program_names(KernelFamily::Glm, ExpertSet::Routed, Variant::DecodeCompact,
             Exlr8PrefillActivations::A16).0.into();
         spec.pointers = pointers(ExpertSet::Routed, Variant::DecodeCompact)
             .into_iter().map(String::from).collect();
@@ -502,7 +515,7 @@ mod tests {
     /// The shipped 64-row grouped instance: 16-row groups, F32 FC2 partials.
     fn grouped64_spec() -> ProgramSpec {
         let mut spec = compact_spec();
-        spec.name = program_names(ExpertSet::Routed, Variant::DecodeGrouped,
+        spec.name = program_names(KernelFamily::Glm, ExpertSet::Routed, Variant::DecodeGrouped,
             Exlr8PrefillActivations::A16).0.into();
         spec.pointers = pointers(ExpertSet::Routed, Variant::DecodeGrouped)
             .into_iter().map(String::from).collect();
@@ -530,10 +543,10 @@ mod tests {
             assert!(rows < grouped_decode_from_row(8, (12, 0)));
         }
         for variant in [Variant::DecodeCompact, Variant::DecodeGrouped] {
-            assert_eq!(program_names(ExpertSet::Routed, variant,
+            assert_eq!(program_names(KernelFamily::Glm, ExpertSet::Routed, variant,
                 Exlr8PrefillActivations::A16).1, "exlr8_group");
         }
-        assert_eq!(program_names(ExpertSet::Routed, Variant::DecodeCompact,
+        assert_eq!(program_names(KernelFamily::Glm, ExpertSet::Routed, Variant::DecodeCompact,
             Exlr8PrefillActivations::A16).0, "exlr8_a16_serving");
         assert!(!Variant::DecodeCompact.unit_tables() && Variant::DecodeCompact.owned_units());
         assert!(Variant::DecodeGrouped.unit_tables() && Variant::Prefill.unit_tables());
@@ -682,7 +695,7 @@ mod tests {
     #[test]
     fn grouped_workspace_uses_wide_route_slots_without_changing_decode() {
         let mut grouped = compact_spec();
-        grouped.name = program_names(ExpertSet::Routed, Variant::Prefill,
+        grouped.name = program_names(KernelFamily::Glm, ExpertSet::Routed, Variant::Prefill,
             Exlr8PrefillActivations::A16).0.into();
         grouped.capacity_rows = 4096;
         grouped.pointers = pointers(ExpertSet::Routed, Variant::Prefill)
@@ -707,7 +720,7 @@ mod tests {
             assert!(Workspace::plan(&grouped, rows, ExpertSet::Routed, Variant::Prefill, 16,
                 Exlr8PrefillActivations::A8).is_err());
             let mut grouped_a8 = grouped.clone();
-            grouped_a8.name = program_names(ExpertSet::Routed, Variant::Prefill,
+            grouped_a8.name = program_names(KernelFamily::Glm, ExpertSet::Routed, Variant::Prefill,
                 Exlr8PrefillActivations::A8).0.into();
             grouped_a8.geometry["activations"] = serde_json::json!("a8");
             let workspace_a8 = Workspace::plan(&grouped_a8, rows, ExpertSet::Routed,
@@ -727,20 +740,20 @@ mod tests {
         assert!(Workspace::plan(&grouped, 4096, ExpertSet::Shared, Variant::Prefill, 16,
             Exlr8PrefillActivations::A16).is_err());
         for activations in [Exlr8PrefillActivations::A16, Exlr8PrefillActivations::A8] {
-                assert_eq!(program_names(ExpertSet::Routed, Variant::DecodeCompact, activations).0,
+                assert_eq!(program_names(KernelFamily::Glm, ExpertSet::Routed, Variant::DecodeCompact, activations).0,
                 "exlr8_a16_serving");
-            assert_eq!(program_names(ExpertSet::Shared, Variant::SharedDecode, activations).0,
+            assert_eq!(program_names(KernelFamily::Glm, ExpertSet::Shared, Variant::SharedDecode, activations).0,
                 "exlr8_shared_a16_serving");
-            assert_eq!(program_names(ExpertSet::Routed, Variant::DecodeGrouped, activations).0,
+            assert_eq!(program_names(KernelFamily::Glm, ExpertSet::Routed, Variant::DecodeGrouped, activations).0,
                 "exlr8_a16_grouped64");
         }
-        assert_eq!(program_names(ExpertSet::Routed, Variant::Prefill,
+        assert_eq!(program_names(KernelFamily::Glm, ExpertSet::Routed, Variant::Prefill,
             Exlr8PrefillActivations::A16).0, "exlr8_a16_grouped");
-        assert_eq!(program_names(ExpertSet::Routed, Variant::Prefill,
+        assert_eq!(program_names(KernelFamily::Glm, ExpertSet::Routed, Variant::Prefill,
             Exlr8PrefillActivations::A8).0, "exlr8_a8_grouped");
-        assert_eq!(program_names(ExpertSet::Routed, Variant::DecodeGrouped,
+        assert_eq!(program_names(KernelFamily::Glm, ExpertSet::Routed, Variant::DecodeGrouped,
             Exlr8PrefillActivations::A16).1, "exlr8_group");
-        assert_eq!(program_names(ExpertSet::Routed, Variant::Prefill,
+        assert_eq!(program_names(KernelFamily::Glm, ExpertSet::Routed, Variant::Prefill,
             Exlr8PrefillActivations::A16).1, "exlr8_grouped_group");
     }
 

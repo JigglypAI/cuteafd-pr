@@ -16,7 +16,7 @@ pub(crate) struct Options<'a> {
     pub devices: [i32; 2],
     pub native_lib: &'a Path,
     pub peers: Vec<SocketAddr>,
-    pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
+    pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
     pub spark_budget_gib: Option<f64>,
     /// Lane rows: `waves` prefill units of `rows / waves` each.
     pub rows: usize,
@@ -86,6 +86,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         "Kimi --spark-budget-gib must be finite, positive and representable");
     let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
     let routed = cfg.dense.iter().filter(|dense| !**dense).count();
+    let onboard = options.rtx_expert_layers.resolve(routed);
     let model = crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?;
     let working = cuteafd_loader::placement::SparkWorkingSet { rtx_layers: vec![],
         spark_layers: cfg.dense.iter().enumerate().filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(),
@@ -94,12 +95,12 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
         model, (spark_budget_gib * (1u64 << 30) as f64) as u64,
         cuteafd_loader::families::kimi_k3::spark_reserve_bytes(options.waves as u64, unit as u64)?)?;
-    let rtx = if options.rtx_expert_layers.layers(routed) == Some(0) { None } else {
+    let rtx = if onboard.layers(routed) == Some(0) { None } else {
         let tiers = catalog.exl3().context("Kimi TP2 experts require EXL3 checkpoint")?.decoder_tiers();
         let package = crate::shared::experts::exl3::aot_layout_directory(
             options.native_lib, tiers, "rtx-tp2");
         let mut inventory = admission::plan_rtx(cfg, &catalog, package, unit, routed)?;
-        inventory.layers = options.rtx_expert_layers;
+        inventory.layers = onboard;
         Some(inventory)
     };
     let expert_modules = if let Some(inventory) = &rtx {

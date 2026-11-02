@@ -58,7 +58,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let weights = resident_weights(checkpoint, ranks, false)
         .context("unsupported V4.1 native backbone residency: check non-expert tensor formats and geometry")?;
     let mut devices = options.rtx_bytes.iter().enumerate().map(|(rank, &bytes)| DeviceLayout {
-        kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: bytes,
+        kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: bytes, worker_budget_bytes: 0,
         items: weights[rank].clone(), kv_tokens: 0,
     }).collect::<Vec<_>>();
     let mut waste = Vec::new();
@@ -127,8 +127,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         devices[gpu].items.push(Item::new(Category::Runtime, "native LoadedCode estimate", "unqualified native code/ready graph residency", NATIVE_CODE_ESTIMATE, Basis::Estimated));
         fixed.extend(v41::growth_demands(total, ranks, automatic, gpu as u8));
     }
-    let onboard = if spark_ranks == 0 { Onboard::Layers(40) } else {
-        options.onboard.or(options.local_expert_layers.map(Onboard::Layers)).unwrap_or(Onboard::Auto)
+    let onboard = if spark_ranks == 0 { Onboard::Layers(catalog.routed_experts().routed_layers()) } else {
+        options.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto)
     };
     let mut request = v41::request(inventory, pool, vec![0; ranks], experts, workspace, onboard);
     request.fixed = fixed;
@@ -188,6 +188,20 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     notes.push(format!("attention placement {}", placement.attention_placement));
     notes.push(format!("placement: {}", placement.summary()));
     notes.push(format!("{} routed backbone layers resident on RTX", placement.onboard_layers));
+    if catalog.exl3().is_none() && catalog.nvfp4().is_none() {
+        let e = catalog.routed_experts();
+        let capacity = [1, 16, 80, 256, 1024, 4096].into_iter().find(|&c| u64::from(c) >= rows)
+            .context("native expert prefill capacity exceeds 4096")?;
+        if !working.rtx_layers.is_empty() {
+            notes.push(cuteafd_core::mxfp4_layouts::native_prefill_note(e.hidden,
+                [e.intermediate / ranks], 120, capacity, e.experts, e.topk));
+        }
+        if spark_ranks > 0 && !working.spark_layers.is_empty() {
+            let widths = cuteafd_core::tp_units::package_width_keys(e.intermediate, 32, spark_ranks, false, true, false);
+            notes.push(cuteafd_core::mxfp4_layouts::native_prefill_note(e.hidden,
+                widths.into_iter().map(|(_, width)| width), 121, capacity, e.experts, e.topk));
+        }
+    }
     let pool_tokens = placement.pool_tokens;
     report.solver_placement = Some(placement);
     devices.extend(sparks);
@@ -272,16 +286,13 @@ mod tests {
             vec![512 * 1024], vec![expert; 40], 16 * GIB, Onboard::Auto);
         request.fixed.push(Demand::new(0, Category::Weights, "backbone", 2 * GIB, Basis::Exact));
         let unconstrained = placement::solve(&request)?;
-        for policy in [Onboard::Auto, Onboard::ExpertsFirst { pool_floor: 262_144 }] {
-            request.onboard = policy;
-            let placed = solve_with_weight_limit(&request, None, 10 * GIB)?;
-            assert_eq!(placed.onboard_layers, 2);
-            assert_eq!(retained_weight_bytes(&request, &placed, None)?, vec![10 * GIB]);
-            assert!(placed.items[0].iter().filter(|i| i.category == Category::Experts)
-                .map(|i| i.bytes).sum::<u64>() > 10 * GIB);
-            assert!(placed.pool_tokens >= 262_144);
-            if matches!(policy, Onboard::Auto) { assert_eq!(placed.pool_tokens, unconstrained.pool_tokens); }
-        }
+        let placed = solve_with_weight_limit(&request, None, 10 * GIB)?;
+        assert_eq!(placed.onboard_layers, 2);
+        assert_eq!(retained_weight_bytes(&request, &placed, None)?, vec![10 * GIB]);
+        assert!(placed.items[0].iter().filter(|i| i.category == Category::Experts)
+            .map(|i| i.bytes).sum::<u64>() > 10 * GIB);
+        assert!(placed.pool_tokens >= 262_144);
+        assert_eq!(placed.pool_tokens, unconstrained.pool_tokens);
         request.onboard = Onboard::Layers(3);
         assert!(solve_with_weight_limit(&request, None, 10 * GIB).is_err());
         request.onboard = Onboard::Auto;

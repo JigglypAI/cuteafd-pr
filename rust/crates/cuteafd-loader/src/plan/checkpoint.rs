@@ -438,11 +438,25 @@ impl Checkpoint {
             "{name}: host embedding is ineligible: tie_word_embeddings=true");
         let embedding = self.tensors.iter().find(|t| t.meta.name == name)
             .with_context(|| format!("host embedding tensor {name} is missing"))?;
-        let heads: Vec<_> = self.tensors.iter().filter(|t|
-            t.meta.name == "head.weight" || t.meta.name == "lm_head.weight"
-                || t.meta.name.ends_with(".lm_head.weight")).collect();
-        ensure!(!heads.is_empty(), "{name}: host embedding is ineligible: no separate LM head tensor");
-        for head in heads {
+        let family = super::family::detect(self)
+            .context("host embedding requires a recognized model family")?;
+        let model = family.open(self)?;
+        // Use the loader's component inventory and operand validation: a trellis
+        // head has no .weight, and every companion must remain disjoint too.
+        let heads = super::format::group_tensor_refs(self.tensors.iter().filter(|tensor| {
+            let stem = super::format::split_stem(&tensor.meta.name).0;
+            family.classify(model.spec(), &format!("{stem}.weight"))
+                .is_some_and(|role| role.component == super::spec::Component::LmHead)
+        }));
+        let mut separate_head = false;
+        for members in heads.values() {
+            let operand = super::format::detect(members)
+                .with_context(|| format!("{name}: host embedding is ineligible: malformed LM head"))?;
+            separate_head |= operand.matrix().is_some() && (members.contains_key("weight")
+                || matches!(operand.encoding, super::format::Encoding::Exl3 { .. }));
+        }
+        ensure!(separate_head, "{name}: host embedding is ineligible: no separate LM head tensor");
+        for head in heads.values().flat_map(|members| members.values()) {
             let same_file = head.shard == embedding.shard
                 || std::fs::canonicalize(self.snapshot.join(&head.shard)).ok().zip(
                     std::fs::canonicalize(self.snapshot.join(&embedding.shard)).ok())
@@ -721,9 +735,95 @@ mod embedding_tests {
         let t = |name: &str, offset| CheckpointTensor { shard: "model.safetensors".into(),
             meta: SafetensorsTensorMetadata { name: name.into(), dtype: DType::Bf16,
                 shape: vec![64, 128], byte_offset: offset, byte_length: 16384 } };
-        Checkpoint { snapshot: Default::default(), config: serde_json::json!({"tie_word_embeddings":false}),
+        Checkpoint { snapshot: Default::default(), config: super::super::testing::glm5_config(),
             quantize_config: None, weight_map: Default::default(), missing_shards: vec![], shard_bytes: 0,
             tensors: vec![t("model.embed_tokens.weight", 0), t("lm_head.weight", 16384)] }
+    }
+
+    const GLMF_EMBEDDING: &str = "model.language_model.embed_tokens.weight";
+
+    fn published_quantized_head() -> Checkpoint {
+        let source: Value = serde_json::from_str(include_str!(
+            "checkpoint/glm53f-k4-core-k6-head.json")).unwrap();
+        let mut checkpoint = fixture();
+        checkpoint.config = source["config"].clone();
+        checkpoint.tensors = source["header"].as_object().unwrap().iter().map(|(name, header)| {
+            let offsets = header["data_offsets"].as_array().unwrap();
+            CheckpointTensor { shard: source["shard"].as_str().unwrap().into(),
+                meta: SafetensorsTensorMetadata { name: name.clone(),
+                    dtype: DType::from_safetensors(header["dtype"].as_str().unwrap()),
+                    shape: header["shape"].as_array().unwrap().iter()
+                        .map(|dim| dim.as_u64().unwrap() as usize).collect(),
+                    byte_offset: offsets[0].as_u64().unwrap(),
+                    byte_length: offsets[1].as_u64().unwrap() - offsets[0].as_u64().unwrap(),
+                } }
+        }).collect();
+        checkpoint
+    }
+
+    #[test]
+    fn host_embedding_accepts_published_glmf_k6_head_headers() {
+        let checkpoint = published_quantized_head();
+        assert_eq!(checkpoint.text_config()["tie_word_embeddings"], false);
+        assert!(!checkpoint.tensors.iter().any(|t| t.meta.name == "lm_head.weight"));
+        checkpoint.require_untied_embedding(GLMF_EMBEDDING).unwrap();
+    }
+
+    #[test]
+    fn host_embedding_refuses_tied_quantized_head() {
+        for root in [true, false] {
+            let mut checkpoint = published_quantized_head();
+            if root { checkpoint.config["tie_word_embeddings"] = Value::Bool(true); }
+            else { checkpoint.config["text_config"]["tie_word_embeddings"] = Value::Bool(true); }
+            assert!(checkpoint.require_untied_embedding(GLMF_EMBEDDING).unwrap_err()
+                .to_string().contains("tie_word_embeddings=true"));
+        }
+    }
+
+    #[test]
+    fn host_embedding_refuses_missing_or_incomplete_quantized_head() {
+        let checkpoint = published_quantized_head();
+        for member in checkpoint.tensors.iter().filter(|t| t.meta.name.starts_with("lm_head.")) {
+            let mut incomplete = published_quantized_head();
+            incomplete.tensors.retain(|t| t.meta.name != member.meta.name);
+            assert!(incomplete.require_untied_embedding(GLMF_EMBEDDING).is_err(), "{}", member.meta.name);
+        }
+        let mut missing = published_quantized_head();
+        missing.tensors.retain(|t| t.meta.name == GLMF_EMBEDDING);
+        assert!(missing.require_untied_embedding(GLMF_EMBEDDING).unwrap_err()
+            .to_string().contains("no separate LM head"));
+    }
+
+    #[test]
+    fn host_embedding_refuses_every_overlapping_quantized_head_member() {
+        for member in published_quantized_head().tensors.iter().filter(|t| t.meta.name.starts_with("lm_head.")) {
+            let mut checkpoint = published_quantized_head();
+            let offset = checkpoint.tensors.iter().find(|t| t.meta.name == GLMF_EMBEDDING).unwrap().meta.byte_offset;
+            checkpoint.tensors.iter_mut().find(|t| t.meta.name == member.meta.name).unwrap().meta.byte_offset = offset;
+            let error = checkpoint.require_untied_embedding(GLMF_EMBEDDING).unwrap_err().to_string();
+            assert!(error.contains("aliases") && error.contains(&member.meta.name), "{error}");
+        }
+    }
+
+    #[test]
+    fn host_embedding_rejects_a_lone_head_companion() {
+        let mut checkpoint = published_quantized_head();
+        checkpoint.tensors.retain(|t| t.meta.name == GLMF_EMBEDDING || t.meta.name == "lm_head.mcg");
+        assert!(checkpoint.require_untied_embedding(GLMF_EMBEDDING).is_err());
+    }
+
+    #[test]
+    fn host_embedding_checks_fp8_head_scales_too() {
+        let mut checkpoint = fixture();
+        checkpoint.tensors[1].meta.dtype = DType::F8E4M3;
+        let mut scale = checkpoint.tensors[1].clone();
+        scale.meta = SafetensorsTensorMetadata { name: "lm_head.weight_scale_inv".into(),
+            dtype: DType::F32, shape: vec![1, 1], byte_offset: 32768, byte_length: 4 };
+        checkpoint.tensors.push(scale);
+        checkpoint.require_untied_embedding("model.embed_tokens.weight").unwrap();
+        checkpoint.tensors[2].meta.byte_offset = 0;
+        assert!(checkpoint.require_untied_embedding("model.embed_tokens.weight").unwrap_err()
+            .to_string().contains("lm_head.weight_scale_inv aliases"));
     }
 
     #[test]
@@ -734,7 +834,7 @@ mod embedding_tests {
         assert!(c.require_untied_embedding("model.embed_tokens.weight").unwrap_err().to_string().contains("tie_word_embeddings"));
         c.config = serde_json::json!({"text_config":{"tie_word_embeddings":true}});
         assert!(c.require_untied_embedding("model.embed_tokens.weight").is_err());
-        c.config = serde_json::json!({});
+        c.config = fixture().config;
         c.tensors[1].meta.byte_offset = 8192;
         assert!(c.require_untied_embedding("model.embed_tokens.weight").unwrap_err().to_string().contains("aliases"));
         c.tensors.pop();

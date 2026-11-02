@@ -170,9 +170,10 @@ pub(crate) struct EngineArgs {
     /// for the experts (the official FP8 one with EXL3 coordinator weights).
     #[arg(long)]
     pub local_experts: bool,
-    /// Routed layer onboarding: auto (pool first), max, N, N%, or all.
+    /// Routed layer onboarding: auto (pool first), all (every routed-expert
+    /// layer of the target model), or an exact N.
     #[arg(long, env = "RTX_EXPERT_LAYERS", value_parser = parse_onboard)]
-    pub rtx_expert_layers: Option<cuteafd_loader::placement::Onboard>,
+    pub rtx_expert_layers: Option<cuteafd_loader::placement::OnboardSetting>,
     #[arg(long)]
     pub experts_snapshot: Option<PathBuf>,
     /// TP1 FP8 package directory (default `<libdir>/fp8/fp8-glmf/tp1`).
@@ -874,8 +875,11 @@ mod draft_cli_tests {
             cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes);
         assert_eq!(parse(&["--headroom-gib", "1"]).headroom_bytes().unwrap(), 1 << 30);
         assert!(parse(&["--headroom-gib=-1"]).headroom_bytes().is_err());
-        for (option, expected) in [("auto", "auto"), ("all", "100%"), ("3", "3"), ("50%", "50%")] {
+        for (option, expected) in [("auto", "auto"), ("all", "all"), ("3", "3")] {
             assert_eq!(parse(&["--rtx-expert-layers", option]).rtx_expert_layers.unwrap().to_string(), expected);
+        }
+        for option in ["max", "50%", "x"] {
+            assert!(option.parse::<cuteafd_loader::placement::OnboardSetting>().is_err(), "{option}");
         }
     }
 
@@ -1375,7 +1379,7 @@ pub(crate) fn glmf_startup_program(name: &str, split: bool, wide: bool) -> bool 
     (name.starts_with("glmf_") && (wide || !name.ends_with("_m128"))) || (split && name.starts_with("glmf2_"))
 }
 
-fn parse_onboard(text: &str) -> std::result::Result<cuteafd_loader::placement::Onboard, String> {
+fn parse_onboard(text: &str) -> std::result::Result<cuteafd_loader::placement::OnboardSetting, String> {
     text.parse()
 }
 
@@ -1653,8 +1657,10 @@ impl Opened {
             admission::startup_graphs(&self.cfg, layers, args.max_context, pool,
                 sequences, speculation, devices.len(), args.decode_rows, sms)
         } else { placement::GraphSet::budget(&vec![args.graph_budget_mib.map_or(1536 << 20, |mib| mib << 20); devices.len()]) };
-        let onboard = args.rtx_expert_layers.unwrap_or_else(|| if args.local_experts {
-            placement::Onboard::Layers(experts.len()) } else { admission::default_onboard() });
+        let routed = self.cfg.dense.iter().filter(|dense| !**dense).count();
+        let onboard = args.rtx_expert_layers.map(|setting| setting.resolve(routed))
+            .unwrap_or_else(|| if args.local_experts {
+                placement::Onboard::Layers(experts.len()) } else { admission::default_onboard() });
         let inputs = admission::GlmfInputs { automatic_context: automatic_context, attention, cfg: &self.cfg, layers, local_tp2_exl3: local_tp2_exl3 && core_charge.is_none(),
             gpus: inventory.gpus.iter().map(|gpu| (gpu.total_bytes, placement::Baseline::Measured {
                 free_bytes: gpu.free_bytes + prepared_draft.map_or(0, crate::shared::draft::remote::Prepared::sampled_bytes) })).collect(),

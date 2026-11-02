@@ -424,21 +424,22 @@ impl<'a> MlaDraftStorage<'a> {
             }
             ensure!(bytes == expected("fp8_scratch")?, "MLA draft FP8 workspace disagrees with admission");
         }
-        let buffers = layout.allocate_with(|b| DeviceAllocation::named(library, b.bytes, "drafter/mla"))?;
+        let buffers = layout.allocate_device_with(|b| DeviceAllocation::named(library, b.bytes, "drafter/mla"))?;
         Ok(Self { layout, buffers })
     }
 
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
-        let index = self.layout.buffers().iter().position(|b| b.name == name)
+        let index = self.layout.device_buffers().iter().position(|b| b.name == name)
             .with_context(|| format!("MLA draft unknown admitted buffer {name}"))?;
         Ok(self.buffers[index].buffer)
     }
 
     fn into_owners(self) -> Result<AdmittedBuffers<Dev<'a>>> {
-        for (recipe, owner) in self.layout.buffers().iter().zip(&self.buffers) {
+        let recipes = self.layout.device_buffers();
+        for (recipe, owner) in recipes.iter().zip(&self.buffers) {
             ensure!(owner.buffer.bytes == recipe.bytes, "MLA draft {} extent differs from admission", recipe.name);
         }
-        AdmittedBuffers::new(self.layout.buffers(), self.buffers)
+        AdmittedBuffers::new(&recipes, self.buffers)
     }
 }
 
@@ -689,6 +690,12 @@ impl<'a> Workspace<'a> {
     }
 }
 
+fn bind_draft_view(buffer: CuteafdDeviceBuffer, view: &cuteafd_loader::formats::dflash::MlaDraftView)
+    -> Result<CuteafdDeviceBuffer> {
+    draft_view(buffer, view.offset, view.bytes)
+        .with_context(|| format!("MLA draft view {} backing {}", view.id, view.backing))
+}
+
 fn draft_view(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
     ensure!(offset.checked_add(bytes).is_some_and(|end| end <= buffer.bytes),
         "MLA draft view exceeds admitted owner");
@@ -739,8 +746,11 @@ impl MlaContextUpdate {
             for row in rows { grouped.entry(row.slot).or_default().push(row); }
             for (slot, mut group) in grouped {
                 group.sort_unstable_by_key(|r| r.position);
-                let reservation = state.reserve(slot, group[0].position, group.len())?;
+                let start = state.rings.frontier(slot)?.1;
+                let finish = group[0].position + group.len();
+                let reservation = state.reserve(slot, start, finish - start)?;
                 reservations.push(reservation);
+                if layout.paged_cache().full_layers == 0 { continue; }
                 let physical = state.pool.destinations(reservation)?;
                 for (layer, destinations) in plan.slots.iter_mut().enumerate() {
                     if layout.cache().layers[layer].window().is_some() { continue; }
@@ -996,28 +1006,31 @@ pub(crate) fn check_checkpoint(snapshot: &Path, fp8: Option<bool>, context_slots
 }
 
 /// Admit the target's single resident BF16 head or native K6 launcher before allocation.
-pub(crate) fn check_snapshot_target_head(snapshot: &Path, hidden: usize, vocab: usize,
+pub(crate) fn check_snapshot_target_head(snapshot: &Path, head_stem: &str, hidden: usize, vocab: usize,
     explicit_fp8_head: bool) -> Result<()> {
     use cuteafd_loader::formats::trellis_core::{read_projections, CoreContract, CoreSplit};
     use std::collections::BTreeMap;
 
     // Routed-expert catalogs need not contain coordinator tensors. Resolve the
     // head through its own index/header contract without reading weight data.
+    ensure!(!head_stem.is_empty(), "DFlash target head stem must be explicit");
+    let prefix = format!("{head_stem}.");
+    let weight = format!("{prefix}weight");
     let checkpoint = cuteafd_loader::plan::Checkpoint::open_for_role(snapshot, "DFlash target head",
-        |name| name.starts_with("lm_head."))?;
-    let expected = BTreeMap::from([("lm_head.weight".into(), vec![vocab, hidden])]);
-    let native = read_projections(&checkpoint, &expected, |name| name.starts_with("lm_head."),
-        |stem| (stem == "lm_head").then_some(CoreContract {
+        |name| name.starts_with(&prefix))?;
+    let expected = BTreeMap::from([(weight.clone(), vec![vocab, hidden])]);
+    let native = read_projections(&checkpoint, &expected, |name| name.starts_with(&prefix),
+        |stem| (stem == head_stem).then_some(CoreContract {
             split: CoreSplit::Whole, bits: 6, padded_outputs: false,
         }))?;
-    if native.contains_key("lm_head") {
-        ensure!(!explicit_fp8_head, "lm_head: --fp8-head cannot replace the shared native K6 target head");
+    if native.contains_key(head_stem) {
+        ensure!(!explicit_fp8_head, "{head_stem}: --fp8-head cannot replace the shared native K6 target head");
         return Ok(());
     }
-    ensure!(!checkpoint.tensor_names().any(|name| name.starts_with("lm_head.") && name != "lm_head.weight"),
-        "DFlash target lm_head has incomplete or unsupported native storage");
-    let head = checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
-        .context("DFlash target checkpoint has no supported lm_head")?;
+    ensure!(!checkpoint.tensor_names().any(|name| name.starts_with(&prefix) && name != weight),
+        "DFlash target {head_stem} has incomplete or unsupported native storage");
+    let head = checkpoint.tensors.iter().find(|t| t.meta.name == weight)
+        .with_context(|| format!("DFlash target checkpoint has no supported {head_stem}"))?;
     check_target_bf16_head(&head.meta, hidden, vocab, explicit_fp8_head)
 }
 
@@ -1544,6 +1557,23 @@ impl<'a> DflashDrafter<'a> {
             // SAFETY: rebind retires the old request before its pooled destinations are released.
             unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
             context.state.borrow_mut().reset(slot, origin)?;
+            self.canonicalize_mla_windows(context, &[slot], &context.state.borrow().rings)?;
+        }
+        Ok(())
+    }
+
+    fn canonicalize_mla_windows(&self, context: &MlaContext<'_>, slots: &[usize],
+        rings: &cuteafd_loader::formats::dflash::MlaDraftCacheState) -> Result<()> {
+        let record = context.layout.paged_cache().record_bytes;
+        for &slot in slots {
+            for (index, layer) in self.layers.iter().enumerate() {
+                let DraftAttention::Mla(layer) = &layer.attention else { anyhow::bail!("MLA draft layer mismatch"); };
+                for rows in rings.window_slack(index, slot)? {
+                    let view = draft_view(layer.cache.buffer, rows.start * record, rows.len() * record)?;
+                    // SAFETY: slack excludes retained rows; the owned stream retires prior readers first.
+                    unsafe { self.library.cuda_zero_bytes_async(view, view.bytes, self.stream)?; }
+                }
+            }
         }
         Ok(())
     }
@@ -1769,10 +1799,11 @@ impl<'a> DflashDrafter<'a> {
             let mut chunks = Vec::new();
             for offset in (0..n).step_by(64) {
                 let rows = (n - offset).min(64);
+                let views = context.layout.context_views(offset, rows)?;
                 let b = attention.batch(context, layer, rows, 0, 0,
-                    draft_view(self.fused_norm.buffer, offset * h * 2, rows * h * 2)?, w.delta.buffer,
-                    draft_view(context.slots.buffer, offset * 8, rows * 8)?,
-                    draft_view(self.context_positions.buffer, offset * 8, rows * 8)?);
+                    bind_draft_view(self.fused_norm.buffer, &views[0])?, w.delta.buffer,
+                    bind_draft_view(context.slots.buffer, &views[1])?,
+                    bind_draft_view(self.context_positions.buffer, &views[2])?);
                 layer.program.check_produce(layer.weights(), b)?;
                 chunks.push(b);
             }
@@ -1798,6 +1829,9 @@ impl<'a> DflashDrafter<'a> {
             for batch in chunks { layer.program.produce(layer.weights(), batch, self.stream)?; }
         }
         self.timing.end(span, self.stream)?;
+        let slots = rows.iter().map(|row| row.slot).collect::<std::collections::BTreeSet<_>>()
+            .into_iter().collect::<Vec<_>>();
+        self.canonicalize_mla_windows(context, &slots, &plan.next)?;
         lease.commit()?;
         context.state.borrow_mut().rings = plan.next;
         Ok(())
@@ -2047,10 +2081,10 @@ impl<'a> DflashDrafter<'a> {
                         context.layout.cache().layers[index].window().is_none())?;
                     for chunk in &chunks {
                         let chunk_rows = chunk.positions.len();
-                        let offset = chunk.first_sequence * block * h * 2;
+                        let views = context.layout.block_views(chunk.first_sequence, chunk_rows)?;
                         let batch = attention.batch(context, layer, chunk_rows, chunk.lengths.len(), chunk.page_table_width,
-                            draft_view(w.conv.buffer, offset, chunk_rows * h * 2)?,
-                            draft_view(w.delta.buffer, offset, chunk_rows * h * 2)?, attention.slots.buffer, attention.positions.buffer);
+                            bind_draft_view(w.conv.buffer, &views[0])?,
+                            bind_draft_view(w.delta.buffer, &views[1])?, attention.slots.buffer, attention.positions.buffer);
                         layer.program.check_launch(layer.weights(), batch)?;
                     }
                     all.push(chunks);
@@ -2133,10 +2167,10 @@ impl<'a> DflashDrafter<'a> {
                             self.put(&attention.query_offsets, bytes_of(&chunk.query_offsets))?;
                             self.put(&a.page_table, bytes_of(&chunk.page_table))?;
                             let chunk_rows = chunk.positions.len();
-                            let offset = chunk.first_sequence * block * h * 2;
+                            let views = context.layout.block_views(chunk.first_sequence, chunk_rows)?;
                             let batch = attention.batch(context, a, chunk_rows, chunk.lengths.len(), chunk.page_table_width,
-                                draft_view(w.conv.buffer, offset, chunk_rows * h * 2)?,
-                                draft_view(w.delta.buffer, offset, chunk_rows * h * 2)?, attention.slots.buffer, attention.positions.buffer);
+                                bind_draft_view(w.conv.buffer, &views[0])?,
+                                bind_draft_view(w.delta.buffer, &views[1])?, attention.slots.buffer, attention.positions.buffer);
                             a.program.launch(a.weights(), batch, s)?;
                         }
                     }
@@ -2196,6 +2230,8 @@ impl<'a> DflashDrafter<'a> {
                 state.pool.commit(reservation, 0)?;
                 lease.reservations.pop();
             }
+            let slots = sequences.iter().map(|seq| seq.slot).collect::<Vec<_>>();
+            self.canonicalize_mla_windows(lease.context, &slots, &state.rings)?;
         }
         self.timing.publish_completed()?;
         self.timing.dump_head_input(w.n.buffer, rows, h)?;
@@ -2515,17 +2551,21 @@ mod checkpoint_header_tests {
         assert!(catalog.fp8().is_some());
         assert_eq!(catalog.tensors().len(), 1);
         assert_eq!(catalog.tensor("lm_head.weight").unwrap().metadata.dtype, DType::Bf16);
-        check_snapshot_target_head(&fixture.0, 128, 16, false).unwrap();
-        assert!(check_snapshot_target_head(&fixture.0, 128, 16, true).is_err());
-        assert!(check_snapshot_target_head(&fixture.0, 128, 32, false).is_err());
+        check_snapshot_target_head(&fixture.0, "lm_head", 128, 16, false).unwrap();
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 16, true).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 32, false).is_err());
         let index_path = fixture.0.join("model.safetensors.index.json");
         let mut index = cuteafd_loader::plan::checkpoint::read_json(&index_path).unwrap();
         index["weight_map"]["lm_head.weight"] = "missing.safetensors".into();
         std::fs::write(index_path, serde_json::to_vec(&index).unwrap()).unwrap();
-        assert!(check_snapshot_target_head(&fixture.0, 128, 16, false).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 16, false).is_err());
     }
 
     fn native_head_snapshot(bits: usize) -> HeaderSnapshot {
+        native_head_snapshot_named(bits, "lm_head")
+    }
+
+    fn native_head_snapshot_named(bits: usize, stem: &str) -> HeaderSnapshot {
         use std::io::Write;
         let fixture = expert_only_snapshot();
         let index_path = fixture.0.join("model.safetensors.index.json");
@@ -2541,7 +2581,7 @@ mod checkpoint_header_tests {
             let mut headers = serde_json::Map::new();
             let mut offset = 0;
             for (suffix, dtype, shape, bytes) in tensors {
-                let name = format!("lm_head.{suffix}");
+                let name = format!("{stem}.{suffix}");
                 headers.insert(name.clone(), serde_json::json!({"dtype": dtype, "shape": shape,
                     "data_offsets": [offset, offset + bytes]}));
                 map.insert(name, shard.into());
@@ -2560,10 +2600,19 @@ mod checkpoint_header_tests {
     #[test]
     fn dflash_target_resolves_indexed_native_k6_head_without_bf16_or_side_metadata() {
         let fixture = native_head_snapshot(6);
-        check_snapshot_target_head(&fixture.0, 128, 256, false).unwrap();
-        assert!(check_snapshot_target_head(&fixture.0, 128, 256, true).is_err());
-        assert!(check_snapshot_target_head(&fixture.0, 128, 128, false).is_err());
-        assert!(check_snapshot_target_head(&fixture.0, 256, 256, false).is_err());
+        check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).unwrap();
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, true).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 128, false).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 256, 256, false).is_err());
+    }
+
+    #[test]
+    fn target_head_guard_requires_the_explicit_output_stem() {
+        let fixture = native_head_snapshot_named(6, "output");
+        check_snapshot_target_head(&fixture.0, "output", 128, 256, false).unwrap();
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, "", 128, 256, false).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, "output", 128, 256, true).is_err());
     }
 
     #[test]
@@ -2574,16 +2623,16 @@ mod checkpoint_header_tests {
             let mut index = cuteafd_loader::plan::checkpoint::read_json(&path).unwrap();
             index["weight_map"].as_object_mut().unwrap().remove(&format!("lm_head.{suffix}"));
             std::fs::write(path, serde_json::to_vec(&index).unwrap()).unwrap();
-            assert!(check_snapshot_target_head(&fixture.0, 128, 256, false).is_err(), "missing {suffix}");
+            assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).is_err(), "missing {suffix}");
         }
         let fixture = native_head_snapshot(6);
         let path = fixture.0.join("model.safetensors.index.json");
         let mut index = cuteafd_loader::plan::checkpoint::read_json(&path).unwrap();
         index["weight_map"]["lm_head.weight"] = "weights.safetensors".into();
         std::fs::write(path, serde_json::to_vec(&index).unwrap()).unwrap();
-        assert!(check_snapshot_target_head(&fixture.0, 128, 256, false).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).is_err());
         let fixture = native_head_snapshot(4);
-        let error = check_snapshot_target_head(&fixture.0, 128, 256, false).unwrap_err().to_string();
+        let error = check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).unwrap_err().to_string();
         assert!(error.contains("requires K6") && error.contains("found K4"), "{error}");
     }
 
@@ -2609,11 +2658,11 @@ mod checkpoint_header_tests {
             file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
             file.write_all(&header).unwrap();
             file.set_len((8 + header.len() + 772) as u64).unwrap();
-            assert!(check_snapshot_target_head(&fixture.0, 128, 256, false).is_err(), "{member} {field}");
+            assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).is_err(), "{member} {field}");
         }
         let fixture = native_head_snapshot(6);
         std::fs::remove_file(fixture.0.join("head-vectors.safetensors")).unwrap();
-        assert!(check_snapshot_target_head(&fixture.0, 128, 256, false).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).is_err());
     }
 
     #[test]
@@ -2629,7 +2678,7 @@ mod checkpoint_header_tests {
         let index = cuteafd_loader::plan::checkpoint::read_json(&snapshot.join("model.safetensors.index.json")).unwrap();
         assert!(index["weight_map"].get("lm_head.weight").is_none());
         assert!(index["weight_map"].get("lm_head.trellis").is_some());
-        check_snapshot_target_head(&snapshot, 6144, 154880, false).unwrap();
+        check_snapshot_target_head(&snapshot, "lm_head", 6144, 154880, false).unwrap();
     }
 
     fn fixture(dtype: DType) -> Checkpoint {
@@ -2709,6 +2758,70 @@ mod checkpoint_header_tests {
     fn mla_cache_state() -> cuteafd_loader::formats::dflash::MlaDraftCacheState {
         cuteafd_loader::formats::dflash::MlaDraftCacheState::new(
             mla_config().cache_layout(2, 262144, cuteafd_core::MlaCacheFormat::Bf16).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn mla_long_prefill_tail_matches_contiguous_canonical_owners_and_frontiers() {
+        use cuteafd_loader::formats::dflash::{MlaDraftCacheRequest, MlaDraftCacheState};
+        let mut cfg = mla_config();
+        cfg.block = 3;
+        cfg.windows = vec![Some(RING); 3];
+        let layout = cfg.cache_layout(1, 1 << 20, cuteafd_core::MlaCacheFormat::Fp8).unwrap();
+        for length in [8192usize, 8332] {
+            let mut contiguous = MlaDraftCacheState::new(layout.clone()).unwrap();
+            contiguous.reset(0, 0).unwrap();
+            let mut records: Vec<_> = layout.layers.iter().map(|layer| vec![0u64; layer.rows_per_slot()]).collect();
+            for start in (0..length).step_by(256) {
+                let rows = (0..(length - start).min(256)).map(|tap_row| ContextRow {
+                    tap_row, slot: 0, position: start + tap_row }).collect::<Vec<_>>();
+                let plan = MlaContextUpdate::checked(&contiguous, 3, &rows).unwrap();
+                for (layer, physical) in plan.slots.iter().enumerate() {
+                    for (&position, &row) in plan.positions.iter().zip(physical) {
+                        records[layer][row as usize] = position as u64 + 1;
+                    }
+                }
+                contiguous = plan.next;
+                for (layer, owner) in records.iter_mut().enumerate() {
+                    for slack in contiguous.window_slack(layer, 0).unwrap() { owner[slack].fill(0); }
+                }
+                assert_eq!(contiguous.frontier(0).unwrap(), (0, start + rows.len()));
+            }
+            let tail_start = length - TAP_ROWS;
+            let tail = (0..TAP_ROWS).map(|tap_row| ContextRow {
+                tap_row, slot: 0, position: tail_start + tap_row }).collect::<Vec<_>>();
+            let mut cold = MlaDraftCacheState::new(layout.clone()).unwrap();
+            cold.reset(0, 0).unwrap();
+            let plan = MlaContextUpdate::checked(&cold, 3, &tail).unwrap();
+            let mut tail_records: Vec<_> = layout.layers.iter().map(|layer| vec![u64::MAX; layer.rows_per_slot()]).collect();
+            for (layer, owner) in tail_records.iter_mut().enumerate() {
+                for (&position, &row) in plan.positions.iter().zip(&plan.slots[layer]) {
+                    owner[row as usize] = position as u64 + 1;
+                }
+                for slack in plan.next.window_slack(layer, 0).unwrap() { owner[slack].fill(0); }
+            }
+            assert_eq!(records, tail_records, "entire owners, including private/padding rows");
+            assert_eq!(contiguous, plan.next);
+            assert_eq!(plan.positions, (tail_start..length).map(|p| p as i64).collect::<Vec<_>>());
+            assert_eq!(cold.frontier(0).unwrap(), (0, 0), "preflight is transactional");
+            cold = plan.next;
+            let request = [MlaDraftCacheRequest { slot: 0, position: length, valid_from: 0 }];
+            for (index, layer) in layout.layers.iter().enumerate() {
+                let bound = layer.bind(0, 0).unwrap();
+                for position in tail_start..length {
+                    assert_eq!(records[index][bound.row(position).unwrap()], position as u64 + 1);
+                }
+                assert_eq!(contiguous.block_batches(index, &request).unwrap(), cold.block_batches(index, &request).unwrap());
+                assert_eq!(contiguous.block_batches(index, &request).unwrap()[0].positions,
+                    (length..length + cfg.block).map(|p| p as i64).collect::<Vec<_>>());
+            }
+            // GQA's absolute modulo ring already accepts the shared caller's tail-only update.
+            let mut full_gqa = vec![0u64; RING];
+            let mut tail_gqa = full_gqa.clone();
+            for position in 0..length { full_gqa[position % RING] = position as u64 + 1; }
+            for position in tail_start..length { tail_gqa[position % RING] = position as u64 + 1; }
+            assert_eq!(full_gqa, tail_gqa);
+            println!("prefill {length}: full/tail entire canonical owners, frontier (0,{length}) and proposal metadata identical; GQA full/tail equal");
+        }
     }
 
     #[test]
@@ -2854,6 +2967,10 @@ mod checkpoint_header_tests {
         let view = draft_view(buffer, 128, 256).unwrap();
         assert_eq!(view.ptr as usize, 0x1080);
         assert_eq!((view.bytes, view.device_id), (256, 1));
+        let recipe = cuteafd_loader::formats::dflash::MlaDraftView {
+            id: "test".into(), backing: "owner".into(), offset: 128, bytes: 256 };
+        let bound = bind_draft_view(buffer, &recipe).unwrap();
+        assert_eq!((bound.ptr, bound.bytes, bound.device_id), (view.ptr, view.bytes, view.device_id));
         assert!(draft_view(buffer, 256, 257).is_err());
         assert!(draft_view(buffer, usize::MAX, 2).is_err());
     }

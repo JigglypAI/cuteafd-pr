@@ -215,7 +215,11 @@ resolved_decode_lanes=2
         """The former --tp2-* flags are configuration keys: run.sh --set reaches the
         loader as the file would, and the loader rejects a bad value."""
         source=(ROOT/'scripts/launch/run-family.sh').read_text()
-        block=source[source.index('# The release loader validates every key'):source.index('release_validate_tp2_options\n')]
+        loader=source[source.index('# The release loader validates every key'):]
+        # Test the loader and TP2 validator, not intervening family launch setup
+        # (which also uses the shared config reader for optional Spark budgets).
+        block=loader[:loader.index('release_load_config "$config"\n') + len('release_load_config "$config"\n')]
+        block+='release_validate_tp2_options\n'
         finish='\nprintf "%s\\n" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS"\n'
         with tempfile.TemporaryDirectory() as directory:
             config=Path(directory)/'recipe.config'

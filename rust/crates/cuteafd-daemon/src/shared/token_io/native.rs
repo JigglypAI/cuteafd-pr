@@ -15,6 +15,7 @@ const HEAD: &str = "lm_head.weight";
 /// Admitted rank-0 payload/scales only; no BF16 table, logits, or per-lane storage.
 pub(crate) struct VocabularyPlan {
     dense: DensePlan,
+    staging_bytes: usize,
     hidden: usize,
     vocabulary: usize,
 }
@@ -92,8 +93,15 @@ impl VocabularyPlan {
             record.slice(0, vocabulary)?;
             selected.push(record.clone());
         }
+        let dense = DensePlan::for_rank(&selected, world, rank)?;
+        // Vocabulary streams native units, not Mount's component batches and row cache.
+        let staging_bytes = dense.tensors.iter().flat_map(|slice| &slice.units)
+            .try_fold(0usize, |peak, unit| -> Result<usize> {
+                Ok(peak.max(unit.staging_bytes()?))
+            })?;
         Ok(Self {
-            dense: DensePlan::for_rank(&selected, world, rank)?,
+            dense,
+            staging_bytes,
             hidden,
             vocabulary,
         })
@@ -103,7 +111,7 @@ impl VocabularyPlan {
         self.dense.resident_bytes
     }
     pub(crate) fn staging_bytes(&self) -> usize {
-        self.dense.read_staging_bytes
+        self.staging_bytes
     }
 
     pub(crate) fn admit(
@@ -121,7 +129,10 @@ impl VocabularyPlan {
             device <= device_available,
             "native vocabulary device admission needs {device}, available {device_available}"
         );
-        self.dense.admit_host(host_available, host_reserved)?;
+        let host = self.staging_bytes().checked_add(host_reserved)
+            .context("native vocabulary host admission overflow")?;
+        ensure!(host <= host_available,
+            "native vocabulary host admission needs {host}, available {host_available}");
         Ok(())
     }
 }
@@ -337,6 +348,8 @@ mod tests {
         std::fs::write(&path, [&payload[..], &scales[..]].concat()).unwrap();
         DenseRecord {
             tensor: name.into(),
+            ownership: cuteafd_loader::plan::exlr8::dense::DenseOwnership::new(
+                cuteafd_loader::plan::exlr8::dense::DenseExecution::RankZero),
             encoding: DenseEncoding::RowFp8,
             shape: vec![n, k],
             side: ShardSide::Output,
@@ -347,6 +360,7 @@ mod tests {
             native_blocks: n.div_ceil(128),
             components: vec![
                 DenseComponent {
+                    window: None,
                     suffix: "fp8".into(),
                     dtype: "U8".into(),
                     shape: vec![n, k],
@@ -357,6 +371,7 @@ mod tests {
                     },
                 },
                 DenseComponent {
+                    window: None,
                     suffix: "scale".into(),
                     dtype: "F32".into(),
                     shape: vec![n],
@@ -377,10 +392,15 @@ mod tests {
         let plan = VocabularyPlan::new(&records, 2, 0, 8, 256)?;
         assert_eq!(plan.resident_bytes(), 6144);
         assert_eq!(plan.staging_bytes(), 1536);
+        let max_unit_read = plan.dense.tensors.iter().flat_map(|slice| &slice.units)
+            .map(|unit| unit.staging_bytes().unwrap()).max().unwrap();
+        assert_eq!(plan.staging_bytes(), max_unit_read);
+        assert!(plan.staging_bytes() < plan.dense.read_staging_bytes);
         assert!(plan.admit(6143, 1536, 0, 0).is_err());
         assert!(plan.admit(6144, 1535, 0, 0).is_err());
         assert!(plan.admit(6144, 1536, 1, 0).is_err());
         assert!(plan.admit(6144, 1536, 0, 1).is_err());
+        assert!(plan.admit(6144, usize::MAX, 0, usize::MAX).is_err());
         plan.admit(6144, 1536, 0, 0)?;
         let non_owner = VocabularyPlan::new(&records, 2, 1, 8, 256)?;
         assert_eq!(

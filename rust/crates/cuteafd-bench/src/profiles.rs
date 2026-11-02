@@ -21,7 +21,7 @@ fn planned(ids: &[&str]) -> Vec<PlannedPanel> {
     ids.iter().map(|id| PlannedPanel { id: id.to_string(), passes: 1 }).collect()
 }
 
-const SPEED: [&str; 8] = ["decode_content", "concurrency", "prefill", "retained", "prefix_cache", "context_load", "startup", "agentic"];
+const SPEED: [&str; 9] = ["decode_content", "concurrency", "prefill", "retained", "prefix_cache", "context_load", "shared_prefix", "startup", "agentic"];
 const QUALITY: [&str; 7] = ["tool_eval", "structured", "ifeval", "code", "math", "needle", "fidelity"];
 
 /// The built-in profiles, in dialog order.
@@ -31,7 +31,7 @@ pub fn builtin() -> Vec<Profile> {
     vec![
         p("share", "Share card", "The baseline only: basic card and quick quality, exported as the share card.", &[]),
         p("smoke", "Release smoke",
-            "Basic card + quick quality on a fresh server; with load, under five minutes per configuration.", &[]),
+            "Basic card + quick quality and shared-prefix concurrency/follow-up guards on a fresh server.", &["shared_prefix"]),
         p("speed", "Speed", "Decode by content, concurrency, prefill, retained context, prefix cache, startup.",
             &["decode_content", "concurrency", "prefill", "retained", "prefix_cache", "startup"]),
         p("daily", "Daily driver", "What a coding agent feels: decode, concurrency to C8, agentic session, tool eval, \
@@ -125,6 +125,9 @@ mod tests {
         let (plan, _) = resolve(&profiles[0].panels, &[]);
         assert_eq!(plan.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["hardware", "configuration"]);
         assert_eq!(title_of("smoke"), "Release smoke");
+        let smoke = profiles.iter().find(|p| p.name == "smoke").unwrap();
+        assert_eq!(smoke.panels, planned(&["shared_prefix"]));
+        assert!(crate::panels::find("shared_prefix").is_some());
     }
 
     #[test]

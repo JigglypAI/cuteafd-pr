@@ -46,7 +46,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let ranks = if split { 2 } else { 1 };
     let mut devices: Vec<DeviceLayout> = options.rtx_bytes.iter().take(gpus).enumerate()
         .map(|(index, &bytes)| DeviceLayout { kind: DeviceKind::Rtx, index: index as u32,
-            capacity_bytes: bytes, items: Vec::new(), kv_tokens: 0 }).collect();
+            capacity_bytes: bytes, worker_budget_bytes: 0, items: Vec::new(), kv_tokens: 0 }).collect();
     let mut waste = Vec::new();
     let mut notes = vec![format!("resolved context {} tokens (checkpoint {})", shape.context_tokens, shape.checkpoint_context),
         format!("attention placement {}", report.attention_placement)];
@@ -158,6 +158,24 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         resolve_encoder(report, &towers, &mut devices, &mut sparks, &vec![0; gpus], options, &mut notes);
     }
     if local_layers > 0 { notes.push(format!("{local_layers} routed backbone layers resident on RTX")); }
+    if let Ok(catalog) = input.expert_catalog() {
+        if catalog.exl3().is_none() && catalog.nvfp4().is_none() {
+            let e = catalog.routed_experts();
+            if let Some(capacity) = [1, 16, 80, 256, 1024, 4096].into_iter()
+                .find(|&c| u64::from(c) >= shape.prefill_rows) {
+                if !spark_working.rtx_layers.is_empty() {
+                    notes.push(cuteafd_core::mxfp4_layouts::native_prefill_note(e.hidden,
+                        [e.intermediate / ranks], 120, capacity, e.experts, e.topk));
+                }
+                let spark_ranks = spark_working.spark_ranks;
+                if spark_ranks > 0 && !spark_working.spark_layers.is_empty() {
+                    let widths = cuteafd_core::tp_units::package_width_keys(e.intermediate, 32, spark_ranks, false, true, false);
+                    notes.push(cuteafd_core::mxfp4_layouts::native_prefill_note(e.hidden,
+                        widths.into_iter().map(|(_, width)| width), 121, capacity, e.experts, e.topk));
+                }
+            }
+        }
+    }
     // Reapply after admission: rank-local I/O never belongs to the coordinator KV budget.
     charge_spark_devices(report, model, input, options, SPARK, &spark_working, endpoints, &mut sparks,
         &mut notes, |device| format!("{} I/O admission", device.name()));
@@ -192,8 +210,8 @@ fn solve(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutO
     let mark_slots = if let Some(slots) = options.prefix_slots { slots }
         else { v4::mark_slots(&cfg, devices.len(), shape.prefill_rows,
             shape.native_layers, shape.concurrency, options.prefix_entries("deepseek_v4"), options.mimo_prefix_mark_bytes, host_marks)? };
-    let onboard = match (options.onboard, options.local_expert_layers) {
-        (Some(onboard), _) => onboard,
+    let onboard = match (options.requested_onboard(), options.local_expert_layers) {
+        (Some(setting), _) => setting.resolve(routed.routed_layers()),
         (None, Some(n)) => Onboard::Layers(n.saturating_sub(routed.first_layer)),
         (None, None) => v4::default_onboard(),
     };

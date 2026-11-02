@@ -310,6 +310,13 @@ if(CUTEAFD_BUILD_SPARKINFER_AOT)
   list(APPEND CUTEAFD_SPARKINFER_EXPORT_INPUTS
     "${CUTEAFD_SPARKINFER_SOURCE_DIR}/pyproject.toml"
   )
+  set(CUTEAFD_MXFP4_POLICY_INPUTS
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/mxfp4-layouts.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../rust/crates/cuteafd-core/src/serving_capacity.rs"
+  )
+  list(APPEND CUTEAFD_SPARKINFER_EXPORT_INPUTS ${CUTEAFD_MXFP4_POLICY_INPUTS})
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CUTEAFD_MXFP4_POLICY_INPUTS})
   add_custom_target(cuteafd_verify_sparkinfer_source
     COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
     COMMENT "Verifying pinned SparkInfer source"

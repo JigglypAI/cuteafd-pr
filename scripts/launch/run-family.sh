@@ -445,6 +445,14 @@ release_validate_deployment() {
     release_die "invalid deployment specification"
   fi
 }
+release_spark_worker_budget() {
+  local deployment="$1" ranks="$2"
+  jq -er --argjson ranks "$ranks" '
+    [.memory_layout.devices[] | select(.kind == "spark") | .worker_budget_bytes] |
+    select(length == $ranks and all(.[]; type == "number" and . > 0)) |
+    unique | select(length == 1) | .[0]' <<<"$deployment" ||
+    release_die "the deployment plan names no uniform Spark worker allocation ceiling"
+}
 # DeepSeek V4.1 reads shell variables after release_load_config, not get().
 _v41_allowed_keys() {
   cat <<'EOF'
@@ -899,6 +907,9 @@ case "$gateway" in on|off) api_args+=(--gateway "$gateway") ;; "") ;; *) echo "G
 launch_deepseek_v41() {
 # The release loader validates every key (run.sh --set overrides are in $config).
 release_load_config "$config"
+v41_requested_budget="$(get SPARK_DEVICE_BUDGET_BYTES)"
+v41_budget_args=()
+[[ -z "$v41_requested_budget" ]] || v41_budget_args=(--spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$v41_requested_budget")")
 # V4.1 serves its established ranges until its runtime consumes solver placement.
 attention_placement="${ATTENTION_PLACEMENT:-auto}"
 case "$attention_placement" in
@@ -979,8 +990,10 @@ v41_l2_prefetch="$(get L2_PREFETCH)"
 v41_engram_warm="$(get ENGRAM_WARM off)"
 case "$v41_engram_warm" in on|off) ;; *) release_die "ENGRAM_WARM must be on or off" ;; esac
 case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
-[[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
-  release_die "DeepSeek V4.1 RTX_EXPERT_LAYERS must be auto, all, N or N% with a readable checkpoint; max needs experts-first admission"
+[[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" == all || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
+  release_die "DeepSeek V4.1 RTX_EXPERT_LAYERS must be auto, all or a non-negative layer count"
+# V4.1 has 40 routed-expert layers, so `all` is exactly 40 here.
+[[ "$RTX_EXPERT_LAYERS" != all ]] || RTX_EXPERT_LAYERS=40
 ((!RELEASE_CONCURRENCY_EXPLICIT)) || [[ "$CONCURRENCY" =~ ^([1-9]|[1-5][0-9]|6[0-4])$ ]] || release_die "CONCURRENCY must be in 1..64"
 [[ "$PREFIX_CACHE_ENTRIES" == auto || "$PREFIX_CACHE_ENTRIES" =~ ^[0-9]+$ ]] || release_die "PREFIX_CACHE_ENTRIES must be auto or non-negative"
 [[ "$MAX_CONTEXT_TOKENS" =~ ^[1-9][0-9]*$ ]] && ((MAX_CONTEXT_TOKENS <= 1048576)) || release_die "MAX_CONTEXT_TOKENS must be in 1..1048576"
@@ -991,7 +1004,7 @@ case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2"
 ((restart == 0 || dry_run == 0)) || release_die "--restart and --dry-run are mutually exclusive"
 if ((SPARK_COUNT == 0)); then
   [[ "$RTX_EXPERT_LAYERS" == 40 && "$RTX_GPUS" != 1 ]] ||
-    release_die "SPARK_COUNT=0 requires two RTX GPUs and RTX_EXPERT_LAYERS=40"
+    release_die "SPARK_COUNT=0 requires two RTX GPUs and RTX_EXPERT_LAYERS=40 (or all)"
 fi
 
 # Resolve the one SSH option set used by every remote step below: preflight reads,
@@ -1047,8 +1060,8 @@ fi
 # weights cannot fit the device budget. The floor is derived from the actual
 # budget and the resolved TP degree, not a hardcoded 20.
 # These tensor-window constants describe native weights, not compressed shards.
-if ((topology_explicit)) && [[ "$RTX_EXPERT_LAYERS" == auto ]]; then
-  remote_capacity=$((SPARK_DEVICE_BUDGET_BYTES / $(release_spark_layer_bytes "$spark_tp" "$expert_format")))
+if ((topology_explicit)) && [[ "$RTX_EXPERT_LAYERS" == auto && -n "$v41_requested_budget" ]]; then
+  remote_capacity=$((v41_requested_budget / $(release_spark_layer_bytes "$spark_tp" "$expert_format")))
   ((remote_capacity > 40)) && remote_capacity=40
   topology_min_layers=$((40 - remote_capacity))
   ((topology_min_layers < 1)) && topology_min_layers=1
@@ -1151,7 +1164,7 @@ count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_
   --coordinator-gpu-budget-gib "$profile_gib" --coordinator-weight-budget-gib "$profile_gib" \
   --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --context-tokens "$MAX_CONTEXT_TOKENS" \
   --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --host-cache-bytes "$HOST_CACHE_BYTES" \
-  --spark-budget-gib "$(python3 -c "print($SPARK_DEVICE_BUDGET_BYTES / 2**30)")")"
+  "${v41_budget_args[@]}")"
 release_validate_deployment "$count_plan" deepseek_v41
 release_admit_coordinator_gpus "$gpu_uuid_csv" "$count_plan" ${RELEASE_RECLAIM_ARGS[@]+"${RELEASE_RECLAIM_ARGS[@]}"}
 resolved_decode_lanes="$(jq -er ' .decode_lanes | select(. == 2)' <<<"$count_plan")" ||
@@ -1161,6 +1174,9 @@ if ((RELEASE_SPARK_COUNT_EXPLICIT)); then
   [[ "$selected_count" == "$SPARK_COUNT" ]] || release_die "planner changed exact Spark count $SPARK_COUNT to $selected_count"
 fi
 SPARK_COUNT="$selected_count"
+if ((SPARK_COUNT > 0)); then
+  SPARK_DEVICE_BUDGET_BYTES="$(release_spark_worker_budget "$count_plan" "$SPARK_COUNT")" || exit 1
+fi
 release_prefill_shape "$count_plan" deepseek_v41
 PREFILL_BATCH_TOKENS="$PREFILL_ROWS"
 V41_PREFILL_WAVES="$PREFILL_WAVES"
@@ -2215,8 +2231,8 @@ if [[ $family == kimi_k3 ]]; then
   case "$kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   family_args+=(--kv-cache "$kv_cache")
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
-  [[ "$local_layers" == auto || "$local_layers" =~ ^[0-9]+$ ]] ||
-    release_die "Kimi K3 RTX_EXPERT_LAYERS is auto or a fixed routed-layer count, not $local_layers"
+  [[ "$local_layers" == auto || "$local_layers" == all || "$local_layers" =~ ^[0-9]+$ ]] ||
+    release_die "Kimi K3 RTX_EXPERT_LAYERS is auto, all or a fixed routed-layer count, not $local_layers"
   family_args+=(--rtx-expert-layers "$local_layers")
   # Header-native EXL3 K6 core tensors are served natively (Kimi slots always
   # package the K6 programs).
@@ -2226,11 +2242,11 @@ fi
 # step). Keys left unset pass nothing (images older than the options run).
 [[ -z "$(get DECODE_SHARE)" ]] || family_args+=(--decode-share "$(get DECODE_SHARE)")
 # RTX_EXPERT_LAYERS (DeepSeek V4, GLM 5.3 and MiMo): unset is uniformly pool-first
-# auto; max is the explicit experts-first policy leaving at least a 262K pool.
-# N, N% or all fix the RTX-resident routed layers, then the KV pool fills the
-# remaining budget up to its target (refused below its floor). 0 leaves the
-# backbone experts on the Sparks. With two RTX every onboard mode uses TP2
-# halves; GPU1 whole-layer expert ranges are no longer supported.
+# auto; all pins every routed-expert layer of the target model and refuses (naming
+# the count) when it does not fit. N fixes exactly N RTX-resident routed layers,
+# then the KV pool fills the remaining budget up to its target (refused below its
+# floor). 0 leaves the backbone experts on the Sparks. With two RTX every onboard
+# mode uses TP2 halves; GPU1 whole-layer expert ranges are no longer supported.
 if [[ $serve == serve-dsv4 || $serve == serve-glm || $serve == serve-mimo ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS)"
   onboard_flag=--rtx-expert-layers
@@ -2247,7 +2263,7 @@ if [[ $serve == serve-dsv4 || $serve == serve-glm || $serve == serve-mimo ]]; th
   esac
   case "$local_layers" in
     "") ;;
-    auto|max) family_args+=("$onboard_flag" "$local_layers") ;;
+    auto|all) family_args+=("$onboard_flag" "$local_layers") ;;
     *) family_args+=("$fixed_onboard_flag" "$local_layers") ;;
   esac
 fi
@@ -2311,11 +2327,9 @@ spark_image="$(get SPARK_EXPERT_DOCKER_INFERENCE)"
 [[ -z "$wip_slot" ]] || spark_image="$(get SPARK_EXPERT_DOCKER_DEV cuteafd-spark-expert-dev)"
 port="$(get EXPERT_PORT 19441)"
 addr="$(get ADDR 0.0.0.0:8000)"
-# Kimi K3 and Step-5 leave an unset budget to the planner, which takes the
-# family's own (the plan's spark_budget_bytes then reaches every worker).
-budget_default=107374182400
-((text_family == 0)) || budget_default=""
-budget="$(get SPARK_DEVICE_BUDGET_BYTES "$budget_default")"
+# Leave automatic weight/device budgets to the planner; an explicit ceiling
+# still applies to the full device layout and is forwarded to every worker.
+budget="$(get SPARK_DEVICE_BUDGET_BYTES)"
 spark_budget_args=()
 [[ -z "$budget" ]] || spark_budget_args=(--spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")")
 # Two coordinator GPUs (resolved above, primary first): families with a head
@@ -2875,8 +2889,9 @@ audio_encoder_hash=""
   if [[ "$(family_prefill_mode "$family")" == units-span ]]; then
     family_args+=(--prefill-span-rows "$PREFILL_SPAN_ROWS")
   fi
-  [[ -n "$budget" ]] || budget="$(jq -er '.spark_budget_bytes | select(type == "number" and . > 0)' <<<"$plan_json")" ||
-    release_die "the deployment plan names no Spark budget"
+  if ((ranks > 0)); then
+    budget="$(release_spark_worker_budget "$deployment_json" "$ranks")" || exit 1
+  fi
 # Check the admitted count's images before --restart or weight loading. The worker's
 # resident admission validates the sibling for its full 4096-row workspace even
 # when only decode requests use BF16, so this preflight requires the same coverage.

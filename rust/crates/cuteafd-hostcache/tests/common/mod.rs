@@ -272,18 +272,35 @@ impl Model {
         (evicted, freed)
     }
 
+    /// Independent pairwise oracle: unlike production's sorted-path scan, compare every
+    /// resident against every other path, including the not-yet-admitted store.
+    pub fn eviction_candidates(&self, incoming: Option<&SnapshotMeta>) -> Vec<Key> {
+        match self.order {
+            EvictionOrder::LeastRecent => {
+                let mut candidates: Vec<_> = self.snapshots.iter()
+                    .filter(|(_, snapshot)| snapshot.pins == 0).collect();
+                candidates.sort_unstable_by_key(|(_, snapshot)| {
+                    let extends = |tokens: &[u32]| tokens.len() > snapshot.tokens.len()
+                        && tokens.starts_with(&snapshot.tokens);
+                    let ancestor = self.snapshots.values().any(|other| extends(&other.tokens))
+                        || incoming.is_some_and(|meta| extends(&meta.tokens));
+                    (ancestor, snapshot.last_use)
+                });
+                candidates.into_iter().map(|(&key, _)| key).collect()
+            }
+            EvictionOrder::Banks => [SnapshotKind::Prompt, SnapshotKind::Turn].into_iter()
+                .flat_map(|kind| self.retention.bank(kind).eviction_order().into_iter().copied())
+                .filter(|key| self.snapshots.get(key).is_some_and(|s| s.pins == 0)).collect(),
+        }
+    }
+
     /// Evict the next unpinned snapshot in the model's order; `None` when only pinned
     /// snapshots remain. Mirrors `Snapshots::evict_one`.
     pub fn evict_one(&mut self) -> Option<(Key, u64)> {
         let before = self.bytes;
         let key = match self.order {
             EvictionOrder::LeastRecent => {
-                let key = self
-                    .snapshots
-                    .iter()
-                    .filter(|(_, snapshot)| snapshot.pins == 0)
-                    .min_by_key(|(_, snapshot)| snapshot.last_use)
-                    .map(|(&key, _)| key)?;
+                let key = self.eviction_candidates(None).into_iter().next()?;
                 self.remove(key);
                 key
             }
@@ -540,12 +557,21 @@ pub fn apply(
     }
 }
 
-/// Mirror the cache's eviction-on-exhaustion: while planning a store the cache may evict
-/// unpinned snapshots, so bring the model's resident set down to the cache's.
-pub fn reconcile<P>(cache: &HostCache<StubCopyEngine, P>, model: &mut Model) {
-    while model.snapshots.len() > cache.metrics().resident_snapshots as usize {
-        if model.evict_one().is_none() {
-            break;
-        }
+/// Admission's slab fragmentation determines how many entries leave, but the independent
+/// oracle determines exactly which ones. Freeze its ranking for the same bulk admission pass.
+pub fn reconcile<P>(cache: &HostCache<StubCopyEngine, P>, model: &mut Model,
+    incoming: &SnapshotMeta) {
+    let resident = cache.metrics().resident_snapshots as usize;
+    let count = model.snapshots.len().checked_sub(resident).expect("unexpected resident growth");
+    let candidates = model.eviction_candidates(Some(incoming));
+    assert!(count <= candidates.len(), "admission evicted pinned entries");
+    for key in candidates.into_iter().take(count) {
+        assert!(cache.snapshot_tokens(key).is_none(), "wrong admission victim: expected {key}");
+        assert!(model.remove(key));
+    }
+    assert_eq!(model.snapshots.len(), resident, "admission resident count");
+    for (&key, snapshot) in &model.snapshots {
+        assert_eq!(cache.snapshot_tokens(key), Some(snapshot.tokens.as_slice()),
+            "unexpected admission victim {key}");
     }
 }

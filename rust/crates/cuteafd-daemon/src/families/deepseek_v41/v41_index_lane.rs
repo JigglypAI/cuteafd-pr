@@ -39,8 +39,8 @@ impl<'a> IndexLaneWeights<'a> {
     }
 }
 
-/// One per GPU: only source-20 candidate blocks span the reserve (later hooks
-/// reindex them). Query outputs and selected IDs are guarded unit-cap scratch.
+/// One per GPU: selected IDs and source-20 candidate blocks span the reserve
+/// because later hooks reuse them. Query outputs are guarded unit-cap scratch.
 /// Source/reindex share a selection stream and guard; stream order protects
 /// their plain scratch within a unit, release/acquire protects fork readers
 /// across units. Bindings, phases and pinned metadata stay per slot.
@@ -96,7 +96,7 @@ impl<'w, 'a> IndexLane<'w, 'a> {
     pub fn storage_bytes(library: &NativeLibrary, rows: u32, unit: u32) -> Result<[usize; 3]> {
         Ok([IndexQueryWave::storage_bytes(library, rows, unit)?,
             IndexSelectionWave::storage_bytes(rows as usize, unit as usize)?,
-            IndexSelectionWave::shared_device_bytes(unit as usize)?])
+            IndexSelectionWave::follower_storage_bytes(rows as usize, unit as usize)?])
     }
     pub fn storage(weights: &'w IndexLaneWeights<'a>, rows: u32, unit: u32, readers: &[i32]) -> Result<Rc<IndexLaneStorage<'a>>> {
         ensure!(weights.placement.is_none(), "unplaced index storage requires unplaced weights");

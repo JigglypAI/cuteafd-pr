@@ -547,7 +547,7 @@ mod tests {
                 let report = cuteafd_loader::plan::plan(dir.path(), &PlanOptions {
                     placement: ExpertPlacement::Sparks { ranks },
                     layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), pool_tokens: Some(32768), concurrency: 4, mimo_expert_input: input,
-                        onboard: Some(cuteafd_loader::placement::Onboard::Layers(0)), ..Default::default() }),
+                        onboard: Some(cuteafd_loader::placement::OnboardSetting::Layers(0)), ..Default::default() }),
                     ..Default::default() }).unwrap();
                 let capacity = u32::try_from(report.prefill_unit_rows.unwrap()).unwrap();
                 let layout = report.memory_layout.unwrap();

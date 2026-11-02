@@ -67,12 +67,12 @@ pub(crate) struct EngineArgs {
     #[arg(long, default_value_t = 0)]
     pub pool_tokens: usize,
     /// Routed-expert layers to keep on the coordinator GPUs (from layer 0):
-    /// `max` places the most layers that still leave a 262K pool;
-    /// `auto` (the default on every layout) reserves the target KV pool first and
-    /// fills what is left; `N`, `N%` or `all` fix the RTX layers and the KV pool
-    /// takes every remaining byte. 0 sends every layer to the Sparks.
+    /// `auto` (the default) reserves the target KV pool first and fills what is
+    /// left; `all` fixes every routed-expert layer of the target model, and `N`
+    /// fixes exactly N; a fixed onboard leaves the KV pool every remaining byte.
+    /// 0 sends every layer to the Sparks.
     #[arg(long, value_parser = parse_onboard, conflicts_with = "local_expert_layers")]
-    pub rtx_expert_layers: Option<cuteafd_loader::placement::Onboard>,
+    pub rtx_expert_layers: Option<cuteafd_loader::placement::OnboardSetting>,
     /// Alias of `--rtx-expert-layers N`.
     #[arg(long)]
     pub local_expert_layers: Option<usize>,
@@ -191,7 +191,7 @@ pub(crate) struct GoldenArgs {
     pub resume_lanes: bool,
 }
 
-fn parse_onboard(text: &str) -> std::result::Result<cuteafd_loader::placement::Onboard, String> {
+fn parse_onboard(text: &str) -> std::result::Result<cuteafd_loader::placement::OnboardSetting, String> {
     text.parse()
 }
 
@@ -279,15 +279,16 @@ impl EngineArgs {
                 reserve_rows: None })
     }
 
-    /// The resolved `--rtx-expert-layers` / `--local-expert-layers`.
-    /// Pool first uniformly unless an explicit onboard policy is selected.
-    pub(crate) fn onboard(&self) -> Result<cuteafd_loader::placement::Onboard> {
+    /// The resolved `--rtx-expert-layers` / `--local-expert-layers`. Pool
+    /// first uniformly unless an explicit onboard is selected; `all` resolves
+    /// to `routed`, the target's routed-expert layer count.
+    pub(crate) fn onboard(&self, routed: usize) -> cuteafd_loader::placement::Onboard {
         use cuteafd_loader::placement::Onboard;
-        Ok(match (self.rtx_expert_layers, self.local_expert_layers) {
-            (Some(onboard), _) => onboard,
+        match (self.rtx_expert_layers, self.local_expert_layers) {
+            (Some(onboard), _) => onboard.resolve(routed),
             (None, Some(layers)) => Onboard::Layers(layers),
             (None, None) => cuteafd_loader::placement::families::deepseek_v4::default_onboard(),
-        })
+        }
     }
 
     pub(crate) fn fixed_onboard(&self) -> bool {
@@ -478,7 +479,7 @@ pub(crate) fn with_engine<T>(
         }).collect::<Result<Vec<_>>>()?;
         let cache_stages = if args.dspark && loaded.cfg.dspark_block_size > 0
             && loaded.catalog.tensor("mtp.0.main_proj.weight").is_ok() { 3 } else { 0 };
-        let onboard = args.onboard()?;
+        let onboard = args.onboard(loaded.catalog.routed_experts().routed_layers());
         let stages = if args.dspark && !args.skip_routed_experts { cache_stages } else { 0 };
         let max_rows = prefill_rows.max(decode_rows);
         let expert_workspace = if args.skip_routed_experts

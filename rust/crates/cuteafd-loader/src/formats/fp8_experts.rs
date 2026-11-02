@@ -1694,13 +1694,13 @@ mod tests {
     }
 
     #[test]
-    fn mxfp4_held_storage_preserves_logical_ownership_and_projection_pitch() -> Result<()> {
+    fn mxfp4_compact_storage_preserves_logical_ownership_and_scale_pitch() -> Result<()> {
         let tensors = catalog(ExpertFormat::Mxfp4, 2048);
         let slicing = Slicing::Blocks(32);
         assert_eq!(tensors.rank_range_with(6, 0, slicing)?, (0, 352));
-        assert_eq!(tensors.rank_width(6, 0, slicing)?, 384);
+        assert_eq!(tensors.rank_width(6, 0, slicing)?, 352);
         let [weight, scale] = tensors.projection_slices(Fp8Projection::Down, 6, 0, slicing)?;
-        assert_eq!((weight.width, weight.destination_pitch), (176, 192));
+        assert_eq!((weight.width, weight.destination_pitch), (176, 176));
         assert_eq!((scale.width, scale.destination_pitch), (11, 12));
         let coordinator = tensors.for_coordinator();
         assert_eq!(coordinator.rank_width(6, 0, slicing)?, 352);

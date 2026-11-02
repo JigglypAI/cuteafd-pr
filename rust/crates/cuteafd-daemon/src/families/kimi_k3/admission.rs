@@ -569,7 +569,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
         (layer.kind == AttentionClass::Mla && request.attention_placement != Some(AttentionPlacement::Heads), layer.colocate))
         .collect::<Vec<_>>();
     let (placement, (mark_selection, graph_set, draft)) = attention::solve_owners(&groups,
-        LayerOwnership::Ranges, request.layers_first_gpu, request.onboard, |owners| -> Result<_> {
+        LayerOwnership::Ranges, request.layers_first_gpu, |owners| -> Result<_> {
             let mut candidate = request.clone();
             for (layer, (&owner, &(selected, _))) in candidate.layers.iter_mut().zip(owners.iter().zip(&groups)) {
                 if selected { layer.modes = vec![LayerMode::Whole { gpu: owner, ffn: FfnMode::Split }]; }
@@ -1213,7 +1213,7 @@ pub(super) mod tests {
                     concurrency: slots, state_slots: Some(slots), prefix_slots,
                     mimo_prefix_entries: entries as u64, mimo_prefix_mark_bytes: rule.budget_bytes,
                     context_tokens: context as u64, pool_tokens: requested_pool, host_cache_bytes, mla_kv: format,
-                    workspace_manifest: Some(manifest_path.clone()), onboard: Some(Onboard::Auto),
+                    workspace_manifest: Some(manifest_path.clone()), onboard: Some(OnboardSetting::Auto),
                     spark_allocation_budget_bytes: Some(spark_bytes), ..Default::default() }), ..Default::default() };
             let report = plan_input.plan(&options)?;
             assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
@@ -1349,7 +1349,7 @@ pub(super) mod tests {
                 let mut options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
                     layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
                         mla_kv: format, context_tokens: context, pool_tokens: Some(context), prefix_slots: Some(2),
-                        host_cache_bytes: Some(0), onboard: Some(Onboard::Auto), ..Default::default() }),
+                        host_cache_bytes: Some(0), onboard: Some(OnboardSetting::Auto), ..Default::default() }),
                     ..Default::default() };
                 let report = plan_input.plan(&options)?;
                 ensure!(report.fits && report.placement_supported, "{:?}", report.hints);
@@ -1403,7 +1403,7 @@ pub(super) mod tests {
                 placement: ExpertPlacement::Sparks { ranks: 6 },
                 layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
                     mla_kv: format, prefix_slots: Some(2), host_cache_bytes: Some(0),
-                    onboard: Some(Onboard::Auto), ..Default::default() }),
+                    onboard: Some(OnboardSetting::Auto), ..Default::default() }),
                 ..Default::default()
             })?;
             ensure!(report.fits && report.placement_supported, "{:?}", report.hints);

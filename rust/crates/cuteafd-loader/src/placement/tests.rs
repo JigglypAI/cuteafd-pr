@@ -43,9 +43,8 @@ const V4_HEADS: ExecutorModes = ExecutorModes { modes: &[LayerMode::HeadSplit, L
     attention: AttentionPlacement::Heads, ..families::DEEPSEEK_V4 };
 
 #[test]
-fn v4_defaults_to_pool_first_and_retains_explicit_max() {
+fn v4_defaults_to_pool_first() {
     assert_eq!(families::deepseek_v4::default_onboard(), Onboard::Auto);
-    assert_eq!("max".parse::<Onboard>(), Ok(Onboard::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR }));
 }
 
 #[test]
@@ -129,8 +128,6 @@ fn fixed_onboard_makes_the_pool_the_output() {
     assert_eq!(placement.expert_ranges.iter().map(|r| r.layers).collect::<Vec<_>>(), [5, 5]);
     assert_eq!(placement.pool_tokens, (44 * GIB - (5 * GIB + GIB / 2)) / UNIT * 256);
     assert!(placement.pool_tokens > 2 << 20);
-    // Fraction rounds to the nearest layer; 0 keeps every expert on the Sparks.
-    assert_eq!(solve(&request(2, 44 * GIB, 60, 4, Onboard::Fraction(0.25))).unwrap().onboard_layers, 15);
     let none = solve(&request(2, 44 * GIB, 60, 4, Onboard::Layers(0))).unwrap();
     assert_eq!((none.onboard_layers, none.expert_ranges[0].peak_bytes), (0, 0));
     // More than fits beside the fixed demands is a refusal that names how many fit.
@@ -143,7 +140,7 @@ fn fixed_onboard_makes_the_pool_the_output() {
 
 #[test]
 fn max_pool_without_onboard_is_one_extra_solve_and_never_below_the_admitted_pool() {
-    for onboard in [Onboard::Layers(10), Onboard::Fraction(0.25), Onboard::Auto] {
+    for onboard in [Onboard::Layers(10), Onboard::Auto] {
         let req = request(2, 44 * GIB, 60, 4, onboard);
         let placement = solve(&req).unwrap();
         assert!(placement.max_pool_tokens_no_onboard >= placement.pool_tokens, "{onboard:?}");
@@ -213,43 +210,6 @@ fn experts_stay_on_gpu0_when_the_peer_cannot_run_them() {
 }
 
 #[test]
-fn experts_first_fills_layers_above_the_pool_floor() {
-    let req = request(2, 44 * GIB, 60, 4, Onboard::ExpertsFirst { pool_floor: 262_144 });
-    let placement = solve(&req).unwrap();
-    // 262K tokens = 1024 units x 4 MiB = 4 GiB; 40 GiB of arena -> 39 layers per GPU (0.25 + 39 + 0.25 <= 40).
-    assert_eq!(placement.onboard_layers, 60);
-    assert!(placement.pool_tokens >= 262_144 && placement.pool_tokens <= 2 << 20);
-    let mut one = request(1, 44 * GIB, 60, 4, Onboard::ExpertsFirst { pool_floor: 262_144 });
-    one.expert_gpus = 1;
-    let single = solve(&one).unwrap();
-    assert_eq!(single.onboard_layers, 39);
-    assert!(single.pool_tokens >= 262_144);
-    let auto = solve(&request(1, 44 * GIB, 60, 4, Onboard::Auto)).unwrap();
-    assert!(auto.onboard_layers < single.onboard_layers && auto.pool_tokens > single.pool_tokens);
-    // An explicit pool is exact: the most layers that still leave it.
-    one.pool.requested = Some(1 << 20);
-    let explicit = solve(&one).unwrap();
-    assert_eq!(explicit.pool_tokens, 1 << 20);
-    assert_eq!(explicit.onboard_layers, 27);
-}
-
-#[test]
-fn experts_first_keeps_a_mandatory_prefix() {
-    let mut req = request(2, 12 * GIB, 40, 4,
-        Onboard::ExpertsFirst { pool_floor: 262_144 });
-    req.minimum_expert_layers = 1;
-    let placed = solve(&req).unwrap();
-    assert!(placed.onboard_layers >= 1);
-    assert!(placed.pool_tokens >= 262_144);
-    req.minimum_expert_layers = 41;
-    assert!(matches!(solve(&req), Err(PlacementError::Inventory("invalid mandatory expert prefix"))));
-    req.minimum_expert_layers = 1;
-    req.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: GIB };
-    req.expert_gpus = 1;
-    assert!(solve(&req).is_err());
-}
-
-#[test]
 fn startup_phases_are_independent_and_not_retained_with_the_pool() {
     use cuteafd_core::memory_layout::{Basis, Category};
     let mut req = request(1, 12 * GIB, 40, 4, Onboard::Layers(0));
@@ -289,16 +249,21 @@ fn startup_peak_uses_the_same_baseline_for_planned_and_measured_inventory() {
 }
 
 #[test]
-fn onboard_parses_the_launcher_spellings() {
+fn onboard_parses_auto_and_exact_counts() {
     assert_eq!("auto".parse::<Onboard>(), Ok(Onboard::Auto));
     assert_eq!("12".parse::<Onboard>(), Ok(Onboard::Layers(12)));
-    assert_eq!("50%".parse::<Onboard>(), Ok(Onboard::Fraction(0.5)));
-    assert_eq!("all".parse::<Onboard>(), Ok(Onboard::Fraction(1.0)));
-    assert_eq!("max".parse::<Onboard>(), Ok(Onboard::ExpertsFirst { pool_floor: 262_144 }));
-    assert!("150%".parse::<Onboard>().is_err() && "x".parse::<Onboard>().is_err());
-    assert_eq!(Onboard::Fraction(0.5).layers(43), Some(22));
+    assert!("all".parse::<Onboard>().is_err() && "max".parse::<Onboard>().is_err());
+    assert!("50%".parse::<Onboard>().is_err() && "x".parse::<Onboard>().is_err());
     assert_eq!(Onboard::Layers(99).layers(43), Some(43));
     assert_eq!(Onboard::Layers(12).to_string(), "12");
+    // The unresolved setting keeps `all` and turns it into the exact count.
+    assert_eq!("auto".parse::<OnboardSetting>(), Ok(OnboardSetting::Auto));
+    assert_eq!("all".parse::<OnboardSetting>(), Ok(OnboardSetting::All));
+    assert_eq!("12".parse::<OnboardSetting>(), Ok(OnboardSetting::Layers(12)));
+    assert!("max".parse::<OnboardSetting>().is_err() && "50%".parse::<OnboardSetting>().is_err());
+    assert_eq!(OnboardSetting::All.resolve(43), Onboard::Layers(43));
+    assert_eq!(OnboardSetting::Auto.resolve(43), Onboard::Auto);
+    assert_eq!(OnboardSetting::Layers(12).resolve(43), Onboard::Layers(12));
 }
 
 const W0: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
@@ -451,10 +416,9 @@ fn tp2_request(free: [u64; 2], onboard: Onboard) -> PlacementRequest {
 }
 
 #[test]
-fn tp2_auto_fixed_max_use_the_tighter_rank() {
+fn tp2_auto_and_fixed_use_the_tighter_rank() {
     for free in [[44 * GIB; 2], [48 * GIB, 44 * GIB], [44 * GIB, 48 * GIB]] {
-        for onboard in [Onboard::Auto, Onboard::Layers(10), Onboard::Fraction(1.0 / 6.0),
-            Onboard::ExpertsFirst { pool_floor: 262_144 }] {
+        for onboard in [Onboard::Auto, Onboard::Layers(10)] {
             let req = tp2_request(free, onboard);
             let placement = solve(&req).unwrap();
             assert!(placement.expert_ranges.iter().all(|r| r.layers == 0 && r.peak_bytes == 0));
@@ -467,11 +431,11 @@ fn tp2_auto_fixed_max_use_the_tighter_rank() {
             if onboard == Onboard::Auto {
                 assert_eq!(placement.pool_tokens, 2 << 20);
                 assert_eq!(t.layers, if free[0] == 44 * GIB { 22 } else { 23 });
-            } else if onboard.layers(60).is_some() {
+            } else {
                 assert_eq!(t.layers, 10);
                 let fit = (0..2).map(|g| (free[g] - t.peak_bytes[g]) / UNIT * 256).min().unwrap();
                 assert_eq!(placement.pool_tokens, fit);
-            } else { assert_eq!(t.layers, 60); }
+            }
         }
     }
     let mut req = tp2_request([12 * GIB, 48 * GIB], Onboard::Auto);
@@ -528,8 +492,7 @@ fn tp2_keeps_dspark_tp1_arena_separate() {
 
 #[test]
 fn one_gpu_placements_ignore_tp2_costs_byte_for_byte() {
-    for onboard in [Onboard::Auto, Onboard::Layers(10), Onboard::Fraction(0.25),
-        Onboard::ExpertsFirst { pool_floor: 262_144 }] {
+    for onboard in [Onboard::Auto, Onboard::Layers(10)] {
         let req = request(1, 44 * GIB, 60, 4, onboard);
         let expected = solve(&req).unwrap();
         let mut half = req;
@@ -549,25 +512,6 @@ fn tp2_staging_peak_is_reserved_beside_every_half() {
     let t = solve(&req).unwrap().tp2.unwrap();
     assert_eq!(t.peak_bytes[0], GIB / 2 + GIB + 3 * GIB);
 }
-
-#[test]
-fn experts_first_falls_back_to_a_spark_pool_below_the_context() {
-    // A card that cannot hold the 1M context's pool even without RTX layers: v2 served it with no
-    // RTX layers and the largest pool above 262K (the context clamped to it).
-    let mut small = request(1, 8 * GIB, 60, 2, Onboard::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR });
-    small.pool = PoolPolicy::resolve(&[32 * GIB], 1 << 20, None, 256, false);
-    let placement = solve(&small).unwrap();
-    assert_eq!(placement.onboard_layers, 0);
-    assert!((EXPERTS_FIRST_POOL_FLOOR..1 << 20).contains(&placement.pool_tokens), "{}", placement.pool_tokens);
-    // Below v2's floor it is still a refusal.
-    small.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: 3 * GIB };
-    assert!(solve(&small).is_err());
-    // Spark-free layouts never fall back.
-    let mut spark_free = request(1, 8 * GIB, 60, 0, Onboard::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR });
-    spark_free.pool = PoolPolicy::resolve(&[32 * GIB], 1 << 20, None, 256, true);
-    assert!(solve(&spark_free).is_err());
-}
-
 
 #[test]
 fn attention_selectors_follow_declared_executor_capabilities() {
@@ -1346,8 +1290,6 @@ fn layer_switch_balances_mandatory_unequal_tp2_not_optional_residency() {
     assert_eq!(owner_cut(&req), 2);
     req.onboard = Onboard::Layers(4);
     assert_eq!(owner_cut(&req), 1);
-    req.onboard = Onboard::Fraction(1.0);
-    assert_eq!(owner_cut(&req), 1);
     req.onboard = Onboard::Auto;
     req.inventory.spark_ranks = 0;
     assert_eq!(owner_cut(&req), 1);
@@ -1650,6 +1592,19 @@ fn compulsory_prefix_fails_when_even_the_weights_do_not_fit() {
 }
 
 #[test]
+fn onboard_all_pin_refuses_with_the_routed_layer_count_instead_of_shrinking() {
+    use crate::placement::OnboardSetting;
+    // `all` is an exact pin: when every routed-expert layer does not fit, the
+    // refusal names the count rather than placing fewer layers.
+    let mut req = request(2, 44 * GIB, 60, 4, Onboard::Auto);
+    req.expert_gpus = 1;
+    req.onboard = OnboardSetting::All.resolve(50);
+    assert!(matches!(solve(&req), Err(PlacementError::ExpertLayers { requested: 50, placed: 43 })));
+    req.onboard = Onboard::Layers(50);
+    assert!(matches!(solve(&req), Err(PlacementError::ExpertLayers { requested: 50, placed: 43 })));
+}
+
+#[test]
 fn pool_ceiling_is_strict_for_automatic_and_explicit_pools() {
     let mut req = request(1, 32 * GIB, 0, 4, Onboard::Auto);
     req.pool.floor = 0;
@@ -1869,7 +1824,7 @@ fn owner_solver_charges_pooled_draft_inventory_without_slot_context_replication(
         page_table_bytes: 532736, layer_bytes: vec![windows / 4; 4].into_iter()
             .chain(std::iter::once(full)).collect() };
     let groups = req.layers.iter().map(|_| (true, None)).collect::<Vec<_>>();
-    let (placed, inventory) = attention::solve_owners(&groups, LayerOwnership::Ranges, 0, req.onboard,
+    let (placed, inventory) = attention::solve_owners(&groups, LayerOwnership::Ranges, 0,
         |owners| -> Result<_, PlacementError> {
             let mut candidate = req.clone();
             for (layer, &owner) in candidate.layers.iter_mut().zip(owners) {
@@ -1889,7 +1844,7 @@ fn owner_solver_charges_pooled_draft_inventory_without_slot_context_replication(
 fn owner_specific_inventory_callback_matches_frozen_admission() {
     let req = owner_balance_request();
     let groups = req.layers.iter().map(|_| (true, None)).collect::<Vec<_>>();
-    let (placed, inventory) = attention::solve_owners(&groups, LayerOwnership::Ranges, 0, req.onboard,
+    let (placed, inventory) = attention::solve_owners(&groups, LayerOwnership::Ranges, 0,
         |owners| -> Result<_, PlacementError> {
             let mut candidate = req.clone();
             // Header/native inventory may depend on the owners; its payload must
@@ -1907,7 +1862,7 @@ fn owner_specific_inventory_callback_matches_frozen_admission() {
     assert_eq!(group_bytes(&placed, 1, "native predictor"), 8 * GIB);
 
     let mut attempted = 0;
-    let (valid, ()) = attention::solve_owners(&groups, LayerOwnership::Ranges, 0, req.onboard,
+    let (valid, ()) = attention::solve_owners(&groups, LayerOwnership::Ranges, 0,
         |_| -> Result<_, PlacementError> {
             attempted += 1;
             if attempted == 1 { Err(PlacementError::Overflow("refused boundary")) }
@@ -1918,15 +1873,13 @@ fn owner_specific_inventory_callback_matches_frozen_admission() {
     let mut smaller = placed.clone();
     smaller.onboard_layers = placed.onboard_layers + 1;
     smaller.pool_tokens /= 2;
-    assert!(attention::owner_score(Onboard::Auto, &placed) > attention::owner_score(Onboard::Auto, &smaller));
-    let experts_first = Onboard::ExpertsFirst { pool_floor: 1 };
-    assert!(attention::owner_score(experts_first, &smaller) > attention::owner_score(experts_first, &placed));
+    assert!(attention::owner_score(&placed) > attention::owner_score(&smaller));
 
     let refused: Result<(Placement, ()), PlacementError> = attention::solve_owners(&groups,
-        LayerOwnership::Ranges, 0, Onboard::Auto, |_| Err(PlacementError::Overflow("candidate")));
+        LayerOwnership::Ranges, 0, |_| Err(PlacementError::Overflow("candidate")));
     assert_eq!(refused, Err(PlacementError::Overflow("candidate")));
     let invalid: Result<(Placement, ()), PlacementError> = attention::solve_owners(&groups,
-        LayerOwnership::Ranges, 2, Onboard::Auto, |_| unreachable!());
+        LayerOwnership::Ranges, 2, |_| unreachable!());
     assert!(matches!(invalid, Err(PlacementError::Inventory(_))));
 }
 
@@ -1958,7 +1911,7 @@ fn owner_refusal_reports_largest_pool_and_selected_split_through_marks_and_conte
     let groups = [(false, None), (true, None), (false, None), (true, None)];
     let mut attempted = 0;
     let refused: anyhow::Result<(Placement, ())> = attention::solve_owners(&groups,
-        LayerOwnership::Ranges, 0, Onboard::Auto, |_| {
+        LayerOwnership::Ranges, 0, |_| {
             let fit = [100, 300, 200][attempted];
             attempted += 1;
             Err(anyhow::Error::new(PlacementError::PrefixMarks { minimum: 1,
@@ -1973,7 +1926,7 @@ fn owner_refusal_reports_largest_pool_and_selected_split_through_marks_and_conte
     assert!(error.to_string().contains("rtx0=1, rtx1=1"));
     // Equal failures retain the first legal candidate, as successful ties do.
     let refused: Result<(Placement, ()), PlacementError> = attention::solve_owners(&groups,
-        LayerOwnership::Ranges, 1, Onboard::Auto, |_| Err(PlacementError::BelowFloor {
+        LayerOwnership::Ranges, 1, |_| Err(PlacementError::BelowFloor {
             pool: 100, floor: 400, layers: 0, short: 300, limits: PoolLimits(vec![]) }));
     assert!(matches!(refused, Err(PlacementError::OwnerCandidates { fit: 100, rank0: 2, rank1: 0, .. })));
 }
@@ -1993,7 +1946,7 @@ fn owner_search_matches_exhaustive_frozen_pool_with_bounded_draft_storage() {
             layer.mode = if index < boundary { S0 } else { S1 };
         }
         solve_frozen(&req, &frozen).ok()
-    }).map(|p| attention::owner_score(req.onboard, &p)).max().unwrap();
-    assert_eq!(attention::owner_score(req.onboard, &accepted), best);
+    }).map(|p| attention::owner_score(&p)).max().unwrap();
+    assert_eq!(attention::owner_score(&accepted), best);
     assert_eq!(solve_frozen(&req, &accepted).unwrap(), accepted);
 }

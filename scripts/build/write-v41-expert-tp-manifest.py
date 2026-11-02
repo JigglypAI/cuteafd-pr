@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import shutil
@@ -77,10 +78,19 @@ def parse_roles(value: str) -> list[str]:
     roles = [entry for entry in value.split(";") if entry]
     if len(set(roles)) != len(roles):
         fail(f"duplicate Spark TP role in {value!r}")
+    spec = importlib.util.spec_from_file_location(
+        "manifest_spark_packages", Path(__file__).resolve().parents[2] / "python/tools/lib/spark_packages.py")
+    packages = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(packages)
+    artifacts = packages.native_spark_artifacts("v41")
+    allowed = {f"tp{world}" for world in artifacts if world != 4}
     for role in roles:
-        if role not in ROLE_TP_DEGREE:
-            fail(f"unsupported Spark TP role {role!r}; expected tp2, tp3, tp6 or tp8")
-    return roles
+        if role not in allowed:
+            fail(f"unsupported Spark TP role {role!r}; expected {', '.join(sorted(allowed))}")
+    # Match CMake's v41_spark_tp_experts.cmake selection from the same
+    # native_spark_artifacts inventory; adjacent-width packages have own manifests.
+    return [role for role in roles if any(
+        artifact.name == f"spark_{role}" for artifact in artifacts[int(role.removeprefix("tp"))])]
 
 
 def dynamic_symbols(library: Path) -> tuple[set[str], str]:

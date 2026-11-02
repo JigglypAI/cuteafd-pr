@@ -108,9 +108,10 @@ pub(crate) struct EngineArgs {
     /// resident layers' experts must fit: 6.4 GiB each).
     #[arg(long)]
     pub local_experts: bool,
-    /// RTX expert prefix: auto reserves the KV pool first; max prioritizes experts.
+    /// RTX expert prefix: auto reserves the KV pool first; all pins every
+    /// routed-expert layer of the target model; N pins exactly N.
     #[arg(long, default_value = "auto")]
-    pub onboard: cuteafd_loader::placement::Onboard,
+    pub onboard: cuteafd_loader::placement::OnboardSetting,
     /// DFlash drafter: a directory with dflash_draft_model.safetensors, or a
     /// snapshot with one under dflash/ (MiMo V2.6 Pro); taps the target
     /// layers and drafts on this GPU.

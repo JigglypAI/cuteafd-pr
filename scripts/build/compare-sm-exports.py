@@ -216,6 +216,7 @@ def jobs(scope):
         ("glmf-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glmf_stage"]),
         ("glmf2-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glmf2_stage"]),
         ("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8"]),
+        ("exlr8-glmf", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8", "--exlr8-family", "glmf"]),
         ("glm-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glm_stage"]),
         ("glm2-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glm2_stage"]),
         ("exlr8-dense-trellis", "export_b12x_dsv4_aot.py",

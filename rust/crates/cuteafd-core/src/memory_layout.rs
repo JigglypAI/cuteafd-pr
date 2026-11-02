@@ -169,6 +169,9 @@ pub struct DeviceLayout {
     pub kind: DeviceKind,
     pub index: u32,
     pub capacity_bytes: u64,
+    /// CUDA allocation ceiling for a Spark worker, before host-inclusive ledger
+    /// capacity adjustments. Zero on RTX devices, which do not launch workers.
+    pub worker_budget_bytes: u64,
     pub items: Vec<Item>,
     /// KV tokens this device holds records for (its share of the pool).
     pub kv_tokens: u64,
@@ -434,6 +437,19 @@ mod tests {
         assert_eq!(Category::of_scope("v41/kv"), Category::Kv);
         assert_eq!(Category::of_scope("v41/draft weights"), Category::Drafter);
         assert_eq!(Category::of_scope("v41/allocated KV cache"), Category::Kv);
+    }
+
+    #[test]
+    fn spark_worker_budget_is_required_and_independent_of_host_capacity() {
+        let device = DeviceLayout { kind: DeviceKind::Spark, index: 0,
+            capacity_bytes: 121 << 30, worker_budget_bytes: 108 << 30,
+            items: vec![], kv_tokens: 0 };
+        let encoded = serde_json::to_value(&device).unwrap();
+        assert_eq!(encoded["worker_budget_bytes"], 108u64 << 30);
+        assert_eq!(serde_json::from_value::<DeviceLayout>(encoded.clone()).unwrap(), device);
+        let mut missing = encoded;
+        missing.as_object_mut().unwrap().remove("worker_budget_bytes");
+        assert!(serde_json::from_value::<DeviceLayout>(missing).is_err());
     }
 
     #[test]

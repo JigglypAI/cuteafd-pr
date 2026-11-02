@@ -134,12 +134,38 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
             before["options"] = sorted([option for option in before["options"] if not option.startswith("--device nvidia.com/gpu=")]
                                        + [f"--device nvidia.com/gpu={uuid}" for uuid in uuids])
             before["env"]["CUDA_VISIBLE_DEVICES"] = ",".join(uuids)
+        if old["host"] != "coordinator" and "--device-budget-bytes" in before["command"]:
+            # Historical captures used the 100GiB weight budget as a device cap.
+            # The stub planner now admits 108GiB unless the config overrides it.
+            config = dict(line.split("=", 1) for line in (ROOT / selected["config"]).read_text().splitlines()
+                          if line and not line.startswith("#"))
+            config.update(selected["set"])
+            expected = str(config.get("SPARK_DEVICE_BUDGET_BYTES", 108 << 30))
+            assert after["command"][after["command"].index("--device-budget-bytes") + 1] == expected
+            before["command"][before["command"].index("--device-budget-bytes") + 1] = expected
         fingerprint = "CUTEAFD_RELEASE_CONFIG_SHA256"
         if entry["family"] == "deepseek_v41" and fingerprint in before["env"]:
             assert after["env"][fingerprint] != before["env"][fingerprint], (entry["name"], old["host"])
             before["env"][fingerprint] = after["env"][fingerprint]
         assert after == before, (entry["name"], old["host"])
     assert all("--deployment" in plan for plan in current["plans"])
+
+
+@pytest.mark.parametrize("explicit", [None, 104 << 30])
+def test_v41_worker_budget_comes_from_typed_deployment(explicit: int | None) -> None:
+    entry = release_entry(next(e for e in ENTRIES if e["name"] == "v41-flash-min"))
+    if explicit is not None:
+        entry["set"]["SPARK_DEVICE_BUDGET_BYTES"] = str(explicit)
+    result = capture(ROOT, entry["name"], release_entry=entry)
+    for plan in result["plans"]:
+        if explicit is None:
+            assert "--spark-budget-gib" not in plan
+        else:
+            assert float(plan[plan.index("--spark-budget-gib") + 1]) == explicit / 2**30
+    workers = [parse_run(run["argv"])["command"] for run in result["containers"] if run["host"] != "coordinator"]
+    assert len(workers) == int(entry["set"]["SPARK_COUNT"])
+    for worker in workers:
+        assert worker[worker.index("--device-budget-bytes") + 1] == str(explicit or (108 << 30))
 
 
 @pytest.mark.parametrize("entry", [e for e in ENTRIES if e["family"] != "deepseek_v41"], ids=lambda e: e["name"])
