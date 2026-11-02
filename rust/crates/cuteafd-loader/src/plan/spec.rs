@@ -64,6 +64,8 @@ pub struct MoeSpec {
 pub enum SpeculatorSpec {
     /// Native multi-token prediction layers shipped in the checkpoint.
     NativeMtp { layers: usize },
+    /// Dense bundled dSpark described by the checkpoint's native config.
+    BundledDspark { layers: usize },
     /// DeepSeek V4.x dSpark drafter stages shipped in the checkpoint.
     Dspark { stages: usize, experts: usize, top_k: usize, target_layers: Vec<usize> },
 }

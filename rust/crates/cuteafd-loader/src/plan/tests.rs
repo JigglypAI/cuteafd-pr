@@ -4942,6 +4942,7 @@ fn release_smoke_prefix_working_set_geometry_ceilings() -> anyhow::Result<()> {
         let stages = match &model.spec().speculator {
             Some(spec::SpeculatorSpec::NativeMtp { layers }) => *layers,
             Some(spec::SpeculatorSpec::Dspark { stages, .. }) => *stages,
+            Some(spec::SpeculatorSpec::BundledDspark { .. }) => 0,
             None => 0,
         };
         let attention = settings.get("ATTENTION_PLACEMENT").filter(|v| v.as_str() != "auto")

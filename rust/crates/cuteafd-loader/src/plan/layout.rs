@@ -832,6 +832,8 @@ impl Shape {
         let discovered = match model.spec().speculator.as_ref() {
             Some(super::spec::SpeculatorSpec::Dspark { stages, .. }) => *stages,
             Some(super::spec::SpeculatorSpec::NativeMtp { layers }) => *layers,
+            // Dense bundled dSpark has its own admission, not native MTP cache stages.
+            Some(super::spec::SpeculatorSpec::BundledDspark { .. }) => 0,
             None => 0,
         };
         let native_layers = if policy.all_native_stages && options.native_mtp_layers > 0 { discovered }

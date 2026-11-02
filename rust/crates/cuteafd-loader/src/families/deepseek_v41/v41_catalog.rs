@@ -162,7 +162,7 @@ impl OfficialV41Catalog {
         let checkpoint = crate::plan::Checkpoint::inventory(&self.snapshot)?;
         let family = crate::plan::family::detect(&checkpoint).context("catalog family")?;
         let model = family.open(&checkpoint)?;
-        let bundled = !matches!(model.spec().speculator, Some(SpeculatorSpec::NativeMtp { .. }))
+        let bundled = matches!(model.spec().speculator, Some(SpeculatorSpec::BundledDspark { .. }))
             && self.tensors.iter().any(|tensor| family.classify(model.spec(), &tensor.metadata.name)
                 .is_some_and(|role| role.component == Component::Speculator));
         if !bundled { return Err(MissingBundledDspark.into()); }
@@ -1739,12 +1739,17 @@ mod tests {
     fn bundled_dspark_selection_keeps_all_published_ml4_names_only_when_requested() -> Result<()> {
         use crate::plan::{spec::DraftOwnership, testing};
         let dir = tempfile::tempdir()?;
-        testing::write_mistral_large4_snapshot(dir.path(), Some(&[1]), true);
+        testing::write_mistral_large4_snapshot(dir.path(), None, true);
         let published: serde_json::Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/ml4-published-native-headers.json"))?;
         let names = published["headers"].as_object().unwrap().keys()
             .filter(|name| name.starts_with("mtp_dspark.")).collect::<Vec<_>>();
         assert_eq!(names.len(), 38);
+        let checkpoint = crate::plan::Checkpoint::inventory(dir.path())?;
+        let family = crate::plan::family::detect(&checkpoint).unwrap();
+        let model = family.open(&checkpoint)?;
+        assert!(matches!(model.spec().speculator,
+            Some(crate::plan::spec::SpeculatorSpec::BundledDspark { layers: 3 })));
         for requested in [false, true] {
             let mut selected = read_expert_catalog(dir.path())?;
             let ownership = selected.bundled_dspark_ownership(requested)?;
@@ -1774,7 +1779,9 @@ mod tests {
                 tensors.extend(fp8(&format!("model.layers.{layer}.mlp.experts.0.{projection}"), rows, cols, None));
             }
         }
-        write_snapshot(dir.path(), &glm5_config(), &tensors, None);
+        let mut config = glm5_config();
+        config["num_nextn_predict_layers"] = serde_json::json!(1);
+        write_snapshot(dir.path(), &config, &tensors, None);
         let mut catalog = read_expert_catalog(dir.path()).unwrap();
         assert_glm_coordinator_tensors(&catalog);
         assert!(catalog.tensor("model.layers.1.mlp.experts.0.gate_proj.weight").is_err());

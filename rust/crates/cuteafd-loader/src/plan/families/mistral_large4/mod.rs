@@ -282,7 +282,7 @@ impl Model {
                 ensure!(checkpoint.contains_tensor(&format!("{stem}.bias")), "Mistral Large 4 checkpoint lacks {stem}.bias");
             }
         }
-        let spec = spec(&cfg, checkpoint);
+        let spec = spec(&cfg, checkpoint)?;
         Ok(Self { cfg, spec, expected })
     }
 
@@ -296,7 +296,15 @@ impl Model {
     }
 }
 
-fn spec(cfg: &Ml4Config, checkpoint: &Checkpoint) -> ModelSpec {
+fn spec(cfg: &Ml4Config, checkpoint: &Checkpoint) -> Result<ModelSpec> {
+    let params_path = checkpoint.snapshot.join("params.json");
+    let speculator = if params_path.is_file() {
+        let params = crate::read_json_file(&params_path)?;
+        if params.get("mtp").and_then(|mtp| mtp.get("dspark")).is_some() {
+            let draft = crate::families::mistral_large4::dspark::Ml4DsparkConfig::from_params(&params, cfg.layers)?;
+            Some(SpeculatorSpec::BundledDspark { layers: draft.layers })
+        } else { None }
+    } else { None };
     let layers = (0..cfg.layers).map(|layer| LayerSpec {
         attention: AttentionKind::MlaDsa { indexer: cfg.indexers[layer] == Ml4Indexer::Full },
         ffn: if layer < cfg.first_moe_layer { FfnKind::Dense { intermediate: cfg.dense_intermediate } } else { FfnKind::Moe },
@@ -305,7 +313,7 @@ fn spec(cfg: &Ml4Config, checkpoint: &Checkpoint) -> ModelSpec {
     let nope = (0..cfg.layers).filter(|&l| !cfg.rope[l]).count();
     let readers: Vec<String> = (0..cfg.layers).filter(|&l| !cfg.owns_kv(l))
         .map(|l| format!("{l}<-{}", cfg.kv_sources[l])).collect();
-    ModelSpec {
+    Ok(ModelSpec {
         family: "mistral_large4",
         architecture: checkpoint.architectures().first().cloned().unwrap_or_default(),
         hidden: cfg.hidden,
@@ -321,9 +329,8 @@ fn spec(cfg: &Ml4Config, checkpoint: &Checkpoint) -> ModelSpec {
             routed_scaling: Some(cfg.routed_scale),
             groups: None,
         }),
-        // The bundled mtp_dspark drafter (SPECULATOR=dspark, BundledDspark ownership) is charged by
-        // the GLM layout's drafter admission from params.json mtp, not as native MTP stages.
-        speculator: None,
+        // The GLM layout charges this dense drafter separately, not as native MTP stages.
+        speculator,
         tables: Vec::new(),
         vision: checkpoint.config.get("vision_config").is_some(),
         notes: vec![
@@ -344,7 +351,7 @@ fn spec(cfg: &Ml4Config, checkpoint: &Checkpoint) -> ModelSpec {
             format!("softmax top-{} router (FP32 logits, renormalized, scale {}); one shared expert; logits \
                 tanh soft-capped at {}", cfg.topk, cfg.routed_scale, cfg.logit_softcap),
         ],
-    }
+    })
 }
 
 impl FamilyModel for Model {
