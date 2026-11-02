@@ -20,6 +20,15 @@ use std::{cell::{Cell, RefCell}, ffi::c_void, rc::Rc};
 
 const H: usize = 4096;
 
+fn draft_homes(ownership: &ExecutionOwnership, catalog: &cuteafd_loader::OfficialV41Catalog,
+    reports: &[cuteafd_transport::worker_selection::InstalledExpertGrouping],
+    read_bytes: impl Fn(usize) -> Result<usize>) -> Result<Vec<crate::shared::draft::resource::LayerHome>> {
+    crate::shared::draft::resource::layer_homes(ownership.execution().modes().iter().enumerate().map(|(layer, _)| {
+        let local = ownership.onboarded(layer);
+        (layer < 3 || layer == 91, local, if local { ownership.ranks() } else { reports.len() })
+    }), catalog.exl3(), read_bytes)
+}
+
 /// Exact native allocation bytes, excluding caller-owned cache/transport/code reserves.
 /// The final head contributes weights once and shares the sequential scratch arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -766,16 +775,29 @@ impl<'e, 'a> Execution<'e, 'a> {
         }).collect::<Result<Vec<_>>>()?;
         Ok(packed_route_cap(rows, &reports, &inputs))
     }
-    pub(super) fn draft_geometry(&self, width: usize, rows: usize) -> Result<cuteafd_core::PolicyGeometry> {
-        use crate::shared::draft::resource::{self, LayerHome};
+    pub(super) fn draft_geometry(&self, snapshot: &std::path::Path, width: usize, rows: usize)
+        -> Result<cuteafd_core::PolicyGeometry> {
+        use crate::shared::{draft::resource, experts::rtx::RtxExpertLayer};
+        let catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
         let transport = self.main.transport.borrow();
         let reports = transport.as_ref().context("Step-5 main transport missing")?.installed_grouping()?;
-        let homes = (0..92).map(|layer| {
-            if layer < 3 || layer == 91 { Ok(LayerHome::Dense) }
-            else { Ok(LayerHome::Remote { slice_bytes: resource::worker_weight_read_bytes(&reports, layer)? as f64 }) }
-        }).collect::<Result<Vec<_>>>()?;
-        resource::geometry_with_grouping(&homes, 352, 8, rows, width, 0,
-            |layer, rows| resource::worker_group_rows_for_input(&reports, layer, rows, true))
+        let homes = draft_homes(&self.main.ownership, &catalog, &reports, |layer| {
+            if self.main.ownership.onboarded(layer) {
+                self.main.tp2.as_ref().context("Step-5 installed native TP2 experts missing")?.pair.weight_read_bytes()
+            } else { resource::worker_weight_read_bytes(&reports, layer) }
+        })?;
+        resource::geometry_with_grouping(&homes, 352, 8, rows, width, 0, |layer, rows| {
+            if self.main.ownership.onboarded(layer) {
+                if let Some(tp2) = &self.main.tp2 { return tp2.pair.group_rows(rows); }
+                return self.main.native.onboarded.as_ref().context("Step-5 installed local EXL3 experts missing")?
+                    .borrow().group_rows(rows);
+            }
+            let owner = owner_of(&self.main, layer)?.unwrap_or(0);
+            let Ffn::Routed(ffn) = &self.main.layer(owner, layer)?.ffn else {
+                anyhow::bail!("Step-5 routed layer missing from draft admission");
+            };
+            resource::worker_group_rows_for_input(&reports, layer, rows, ffn.wire_dtype() == ExpertV2Dtype::Bf16)
+        })
     }
     pub(super) fn predictor_rope(&self) -> Rc<TargetTables<'a>> {
         self.main.native.rope[self.ownership().execution().spec().head_gpu as usize].clone()
@@ -1507,6 +1529,67 @@ mod tests {
             theta: vec![], rotary: vec![], rope_scaling: None, scale_full: false,
             scale_sliding: false, activation: vec![], shared_activation: vec![] }
     }
+    #[test]
+    fn exl3_draft_prices_cover_every_min_rank_and_actual_onboarding_home() -> Result<()> {
+        use cuteafd_loader::{placement::*, plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions}};
+        use cuteafd_transport::worker_selection::{ExpertGroupingSelector, ExpertTrafficContract,
+            InstalledExpertGrouping, InstalledExpertVariant, WorkerIdentity, WorkerSelection};
+        use crate::shared::draft::resource::{self, LayerHome};
+        let fixture = tempfile::tempdir()?;
+        testing::write_step5_exl3_snapshot(fixture.path());
+        let manifest = testing::step5_native_manifest(fixture.path());
+        let checkpoint = Checkpoint::inventory(fixture.path())?;
+        let cfg = Config::parse(&checkpoint)?;
+        let catalog = cuteafd_loader::read_expert_catalog(fixture.path())?;
+        for (gpus, sparks) in [(1, 3), (2, 6)] {
+            let report = testing::plan(fixture.path(), &PlanOptions {
+                placement: ExpertPlacement::from_spark_ranks(sparks),
+                draft_ownership: Some(plan::spec::DraftOwnership::None),
+                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                    rtx_bytes: vec![96 << 30; gpus], workspace_manifest: Some(manifest.clone()),
+                    ..Default::default() }), ..Default::default()
+            })?;
+            assert!(report.wip_launchable(), "{:?}", report.hints);
+            let placement = report.solver_placement.as_ref().context("Step fixture placement")?;
+            let onboarded = placement.layers.iter().enumerate().filter_map(|(layer, assignment)|
+                matches!(assignment.experts, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2).then_some(layer))
+                .collect::<Vec<_>>();
+            assert!(!onboarded.is_empty(), "fixture must exercise RTX onboarding");
+            let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: (H * 4) as u64,
+                rows: 64, lanes: 1, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
+            let ownership = ExecutionOwnership::new(&cfg, gpus, LayerExecutionPlan::new(placement, spec)?)?
+                .with_onboarded(onboarded.clone())?;
+            let remote = (3..91).filter(|&layer| !ownership.onboarded(layer)).collect::<Vec<_>>();
+            let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
+                "checkpoint": "0".repeat(64), "geometry": [4096, 352, 8, 1536, 91],
+                "world": sparks, "topology": [sparks, 1], "ownership_wire": false,
+            }))?;
+            let loaded = WorkerSelection::new(identity.clone(), &remote)?;
+            let variant = InstalledExpertVariant::from_piecewise_queries(80,
+                ExpertTrafficContract::ExactGrouping, |_| Ok(48))?;
+            let reports = (0..sparks).map(|rank| InstalledExpertGrouping::new(loaded.clone(), rank, 64,
+                ExpertGroupingSelector::Exl3Nearest, vec![variant.clone()])).collect::<Result<Vec<_>>>()?;
+            for (rank, installed) in reports.iter().enumerate() {
+                for &layer in &remote { installed.validate_for(&identity, rank, 64, layer..layer + 1)?; }
+                assert!(installed.weight_read_bytes().is_err(), "EXL3 must not fabricate FP8 descriptors");
+            }
+            let homes = draft_homes(&ownership, &catalog, &reports,
+                |_| panic!("EXL3 must price checkpoint headers, not FP8 descriptors"))?;
+            for (layer, home) in homes.iter().enumerate() {
+                if !(3..91).contains(&layer) { assert_eq!(*home, LayerHome::Dense); continue; }
+                let local = ownership.onboarded(layer);
+                let bytes = resource::exl3_slice_bytes(catalog.exl3().unwrap(), layer,
+                    if local { gpus } else { sparks })?;
+                assert_eq!(*home, if local { LayerHome::Local { slice_bytes: bytes } }
+                    else { LayerHome::Remote { slice_bytes: bytes } });
+                if !local { assert_eq!(resource::worker_group_rows_for_input(&reports, layer, 64, false)?, 48); }
+            }
+            assert_eq!(homes.iter().filter(|home| matches!(home, LayerHome::Local { .. })).count(), onboarded.len());
+            eprintln!("Step draft {gpus} RTX + {sparks} Sparks: {} Local, {} Remote; all ranks covered", onboarded.len(), remote.len());
+        }
+        Ok(())
+    }
+
     #[test]
     fn routed_request_preserves_admitted_version_and_owned_row_metadata() -> Result<()> {
         let rows = vec![ExpertProtocolV2RowDescriptor { row_id: 0,

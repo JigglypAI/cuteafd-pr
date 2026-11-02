@@ -2,39 +2,7 @@ use super::*;
 use crate::plan::{self, checkpoint::Checkpoint, testing::{self, Tensor as FixtureTensor}, format, *};
 use serde_json::Value;
 
-fn fixture(kind: &str) -> (Value, Vec<FixtureTensor>) {
-    let source: Value = serde_json::from_str(include_str!("fixtures/official-fp8.json")).unwrap();
-    let mut config = source["config"].clone();
-    if kind == "nvfp4" {
-        config = serde_json::from_str(include_str!("fixtures/official-nvfp4-config.json")).unwrap();
-    } else if kind == "bf16" {
-        config.as_object_mut().unwrap().remove("quantization_config");
-    }
-    let mut tensors = Vec::new();
-    for (name, value) in source["tensors"].as_object().unwrap() {
-        let dtype = value[0].as_str().unwrap();
-        let shape: Vec<usize> = value[1].as_array().unwrap().iter().map(|n| n.as_u64().unwrap() as usize).collect();
-        let dtype = match dtype { "BF16" => "BF16", "F32" => "F32", "F8_E4M3" => "F8_E4M3", _ => panic!("{dtype}") };
-        if kind == "bf16" && name.ends_with("weight_scale_inv") { continue; }
-        if kind == "nvfp4" && name.ends_with("weight_scale_inv") { continue; }
-        if dtype == "F8_E4M3" && kind == "nvfp4" {
-            let stem = name.strip_suffix(".weight").unwrap();
-            let [e,n,k]: [usize;3] = shape.try_into().unwrap();
-            tensors.push(testing::t(name, "U8", &[e,n,k/2]));
-            tensors.push(testing::t(format!("{stem}.weight_scale"), "F8_E4M3", &[e,n,k/16]));
-            tensors.push(testing::t(format!("{stem}.weight_scale_2"), "F32", &[e]));
-            tensors.push(testing::t(format!("{stem}.input_scale"), "F32", &[e]));
-        } else { tensors.push((name.clone(), if kind == "bf16" { "BF16" } else { dtype }, shape)); }
-    }
-    // Only originally quantized expert matrices widen in the BF16 root;
-    // all release FP32 norms/router/index weights stay FP32.
-    if kind == "bf16" {
-        for (name,dtype,_) in &mut tensors {
-            if source["tensors"][name.as_str()][0] == "F32" { *dtype = "F32"; }
-        }
-    }
-    (config,tensors)
-}
+fn fixture(kind: &str) -> (Value, Vec<FixtureTensor>) { testing::step5_fixture(kind) }
 
 pub(crate) fn snapshot(kind: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -43,35 +11,7 @@ pub(crate) fn snapshot(kind: &str) -> tempfile::TempDir {
     dir
 }
 
-fn native_manifest(dir: &std::path::Path) -> std::path::PathBuf {
-    let ops = ["hidden_norm", "final_norm", "residual_bf16", "residual_f32", "swa_attention",
-        "csa_attention", "region_compress", "region_scores", "region_selection", "region_commit",
-        "sliding_commit", "attn_q", "attn_kv", "attn_gate", "attn_out", "router",
-        "dense_gate_up", "dense_down", "shared_gate_up", "shared_down"];
-    let programs = ["step5", "step52"].iter().flat_map(|prefix| ops.iter().map(move |op|
-        serde_json::json!({"name": format!("{prefix}_{op}"), "capacity_rows": 4096}))).collect::<Vec<_>>();
-    let path = dir.join("PROGRAMS.json");
-    std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"programs": programs,
-        "capacities": {"max_context": 1048576}})).unwrap()).unwrap();
-    install_rtx_expert_packages(&path);
-    path
-}
-
-/// The coordinator RTX expert packages every Step format onboards through:
-/// fp8moe (FP8, NVFP4 W4A4, BF16 tails) TP1/TP2 scratch tables and the EXL3
-/// rtx-tp1/rtx-tp2 trees, beside the program manifest as a WIP share holds them.
-fn install_rtx_expert_packages(manifest: &std::path::Path) {
-    let root = manifest.parent().unwrap();
-    for name in ["fp8-step5", "fp8-step5-nvfp4a4", "fp8-step5-bf16-weights"] {
-        let package = root.join("fp8").join(name);
-        for tp in ["tp1", "tp2"] { std::fs::create_dir_all(package.join(tp)).unwrap(); }
-        let capacities = |scale: u64| [1u64, 16, 80, 256, 1024, 4096].map(|capacity|
-            serde_json::json!({"capacity": capacity, "scratch_bytes": capacity * scale}));
-        std::fs::write(package.join("manifest.json"), serde_json::to_vec(&serde_json::json!({"layouts": {
-            "tp1": {"capacities": capacities(65536)}, "tp2": {"capacities": capacities(32768)}}})).unwrap()).unwrap();
-    }
-    install_exl3_rtx_package(manifest);
-}
+fn native_manifest(dir: &std::path::Path) -> std::path::PathBuf { testing::step5_native_manifest(dir) }
 
 fn report(dir: &std::path::Path, gpus: usize, gib: u64, ranks: usize, pool: Option<u64>) -> PlanReport {
     report_context(dir, gpus, gib, ranks, pool, 0)
@@ -1366,74 +1306,7 @@ fn prefill_selection_preserves_overrides_and_never_retries_on_capacity() {
 /// heads K4, native tensors otherwise. One shard per layer, sparse payloads.
 pub(crate) fn exl3_snapshot() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let (mut config, tensors) = fixture("bf16");
-    let declaration = serde_json::json!({"quant_method": "exl3", "format": "exl3", "checkpoint_format": "exl3",
-        "bits": 4.0, "core_bits": 6.0, "mtp_bits": 4.0, "head_bits": 6.0, "codebook": "mcg",
-        "mcg_multiplier": 0xCBAC1FEDu64, "out_scales": "auto", "expert_bits": 4.0,
-        "expert_bits_by_layer": {"88": 6.0, "89": 6.0, "90": 6.0},
-        "per_module_metadata": "quantize_config.json:tensor_storage"});
-    config["quantization_config"] = declaration.clone();
-    let core = |name: &str| -> Option<usize> {
-        if name == "lm_head.weight" { return Some(6); }
-        let rest = name.strip_prefix("model.layers.")?;
-        let (layer, leaf) = rest.split_once('.')?;
-        let layer: usize = layer.parse().ok()?;
-        let quantized = matches!(leaf, "self_attn.q_proj.weight" | "self_attn.k_proj.weight"
-            | "self_attn.v_proj.weight" | "self_attn.o_proj.weight")
-            || leaf.starts_with("share_expert.") || leaf.starts_with("mlp.")
-            || leaf == "eh_proj.weight" || leaf == "transformer.shared_head.output.weight";
-        quantized.then_some(if layer >= 92 { 4 } else { 6 })
-    };
-    let mut out: Vec<FixtureTensor> = Vec::new();
-    let mut storage = serde_json::Map::new();
-    let mut module = |out: &mut Vec<FixtureTensor>, stem: &str, n: usize, k: usize, bits: usize| {
-        out.extend(testing::exl3(stem, n, k, bits));
-        storage.insert(stem.to_owned(), serde_json::json!({"quant_format": "exl3", "bits_per_weight": bits,
-            "mcg_multiplier": 0xCBAC1FEDu64, "in_features": k, "out_features": n, "stored_out_features": n,
-            "stored_tensors": {
-                format!("{stem}.trellis"): {"shape": [k / 16, n / 16, 16 * bits], "torch_dtype": "int16"},
-                format!("{stem}.suh"): {"shape": [k], "torch_dtype": "float16"},
-                format!("{stem}.svh"): {"shape": [n], "torch_dtype": "float16"},
-                format!("{stem}.mcg"): {"shape": [], "torch_dtype": "int32"}}}));
-    };
-    for (name, dtype, shape) in tensors {
-        if let Some(stem) = name.strip_suffix(".weight").filter(|_| shape.len() == 3 && name.contains(".moe.")) {
-            let layer: usize = stem.split('.').nth(2).unwrap().parse().unwrap();
-            let bits = if layer >= 88 { 6 } else { 4 };
-            let (base, proj) = stem.rsplit_once('.').unwrap();
-            for expert in 0..shape[0] {
-                module(&mut out, &format!("{base}.experts.{expert}.{proj}"), shape[1], shape[2], bits);
-            }
-        } else if let Some(bits) = core(&name) {
-            module(&mut out, name.strip_suffix(".weight").unwrap(), shape[0], shape[1], bits);
-        } else {
-            out.push((name, dtype, shape));
-        }
-    }
-    let mut shards = std::collections::BTreeMap::<usize, Vec<FixtureTensor>>::new();
-    for tensor in out {
-        let shard = tensor.0.strip_prefix("model.layers.").and_then(|r| r.split('.').next())
-            .and_then(|l| l.parse::<usize>().ok()).map_or(96, |l| l + 1);
-        shards.entry(shard).or_default().push(tensor);
-    }
-    let mut weight_map = serde_json::Map::new();
-    for (index, tensors) in shards {
-        let file = format!("model-{index:05}-of-00096.safetensors");
-        testing::write_safetensors(&dir.path().join(&file), &tensors);
-        for (name, ..) in tensors { weight_map.insert(name, Value::String(file.clone())); }
-    }
-    std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
-    std::fs::write(dir.path().join("model.safetensors.index.json"),
-        serde_json::to_vec(&serde_json::json!({"weight_map": weight_map})).unwrap()).unwrap();
-    let mut manifest = declaration.as_object().unwrap().clone();
-    for (key, value) in [("method", Value::from("exl3")), ("group_size", Value::from(-1)),
-        ("desc_act", Value::from(false)), ("sym", Value::from(true)), ("lm_head", Value::from(true)),
-        ("tensor_storage", Value::Object(storage)), ("kept_tensors", serde_json::json!({})),
-        ("module_include", serde_json::json!([])), ("calibration", serde_json::json!({})),
-        ("meta", serde_json::json!({}))] {
-        manifest.insert(key.into(), value);
-    }
-    std::fs::write(dir.path().join("quantize_config.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+    testing::write_step5_exl3_snapshot(dir.path());
     dir
 }
 
@@ -1575,21 +1448,7 @@ fn exl3_rank_layouts_own_native_core_with_head_split_sides() -> anyhow::Result<(
 }
 
 /// The installed `exl3-step5-k46/rtx-tp1` package metadata beside PROGRAMS.json.
-fn install_exl3_rtx_package(manifest: &std::path::Path) {
-    for (tp, intermediate) in [(1, 1536), (2, 768)] {
-    let root = manifest.parent().unwrap().join(format!("exl3/exl3-step5-k46/rtx-tp{tp}"));
-    for capacity in crate::placement::inventory::exl3_capacities(4096) {
-        let path = root.join(format!("m{capacity}"));
-        std::fs::create_dir_all(&path).unwrap();
-        std::fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
-            "capacity": capacity, "hidden": 4096, "experts": 352, "intermediate": intermediate, "top_k": 8,
-            "bits": [4, 6], "activation": "silu_post_clamp", "swiglu_limit": 7.0,
-            "input_format": "e4m3_k32", "trellis_lut": {"bytes": 32}, "buffers": {
-                "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": capacity * 64, "zero_on_create": false}}
-        })).unwrap()).unwrap();
-    }
-    }
-}
+fn install_exl3_rtx_package(manifest: &std::path::Path) { testing::install_step5_exl3_rtx_package(manifest); }
 
 #[test]
 fn exl3_two_rtx_onboards_tp2_halves_and_sparks_keep_the_rest() {

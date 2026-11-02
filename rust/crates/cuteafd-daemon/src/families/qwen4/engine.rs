@@ -1711,32 +1711,25 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     pub(crate) fn draft_homes(&self, snapshot: &std::path::Path) -> Result<Vec<crate::shared::draft::resource::LayerHome>> {
-        use crate::shared::draft::resource::{self, LayerHome};
+        use crate::shared::draft::resource;
         let catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
         let (tp, remote) = match &self.experts {
             Some(Experts::Spark { transport, .. }) => (transport.borrow().world_size(), true),
             Some(Experts::Tp2 { .. }) => (2, false),
             _ => (1, false),
         };
-        (0..self.cfg.layers).map(|index| {
-            let bytes = match (catalog.fp8(), catalog.exl3()) {
-                (Some(_), _) => {
-                    let bytes = match &self.experts {
-                        Some(Experts::Local(local)) => local.experts.borrow().weight_read_bytes(),
-                        Some(Experts::Tp2 { routed, .. }) => routed.borrow().experts.iter()
-                            .map(|rank| rank.weight_read_bytes()).collect::<Result<Vec<_>>>()?
-                            .into_iter().max().context("Qwen installed TP2 ranks missing")?,
-                        Some(Experts::Spark { transport, .. }) => resource::worker_weight_read_bytes(
-                            &transport.borrow().installed_grouping()?, index)?,
-                        _ => anyhow::bail!("Qwen layer {index} has no installed FP8-family byte descriptor"),
-                    };
-                    bytes as f64
-                }
-                (_, Some(manifest)) => resource::exl3_slice_bytes(manifest, index, tp)?,
-                _ => anyhow::bail!("Qwen routed expert format cannot be priced"),
-            };
-            Ok(if remote { LayerHome::Remote { slice_bytes: bytes } } else { LayerHome::Local { slice_bytes: bytes } })
-        }).collect()
+        resource::layer_homes((0..self.cfg.layers).map(|_| (false, !remote, tp)), catalog.exl3(), |index| {
+            ensure!(catalog.fp8().is_some(), "Qwen routed expert format cannot be priced");
+            match &self.experts {
+                Some(Experts::Local(local)) => Ok(local.experts.borrow().weight_read_bytes()),
+                Some(Experts::Tp2 { routed, .. }) => routed.borrow().experts.iter()
+                    .map(|rank| rank.weight_read_bytes()).collect::<Result<Vec<_>>>()?
+                    .into_iter().max().context("Qwen installed TP2 ranks missing"),
+                Some(Experts::Spark { transport, .. }) => resource::worker_weight_read_bytes(
+                    &transport.borrow().installed_grouping()?, index),
+                _ => anyhow::bail!("Qwen layer {index} has no installed FP8-family byte descriptor"),
+            }
+        })
     }
 
     pub(crate) fn draft_geometry(&self, snapshot: &std::path::Path, width: usize)

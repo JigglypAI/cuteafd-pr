@@ -362,9 +362,12 @@ impl InstalledExpertVariant {
 pub enum ExpertGroupingSelector { Native, Exl3Nearest, Exl3GlmFlashK64, Fp8Nearest }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("installed expert read-byte descriptor missing for rank {rank}; rebuild coordinator and workers together")]
+#[error("installed expert weight_read_bytes missing for rank {rank}, selector {selector:?}, checkpoint {checkpoint}, manifest {manifest:?}; EXL3 pricing requires its checkpoint manifest")]
 pub struct MissingWeightReadBytes {
     pub rank: usize,
+    pub selector: ExpertGroupingSelector,
+    pub checkpoint: String,
+    pub manifest: Option<String>,
 }
 
 /// The exact loaded worker, its resident layers and its immutable launch selector.
@@ -406,7 +409,10 @@ impl InstalledExpertGrouping {
     }
 
     pub fn weight_read_bytes(&self) -> Result<usize> {
-        self.weight_read_bytes.ok_or_else(|| MissingWeightReadBytes { rank: self.rank }.into())
+        self.weight_read_bytes.ok_or_else(|| MissingWeightReadBytes {
+            rank: self.rank, selector: self.selector, checkpoint: self.loaded.identity.checkpoint.clone(),
+            manifest: self.loaded.identity.manifest.as_ref().map(|manifest| manifest.name.clone()),
+        }.into())
     }
 
     pub fn layers(&self) -> &[LayerRange] { self.loaded.ranges() }
