@@ -15,16 +15,19 @@ use cuteafd_core::DType;
 #[derive(Debug, Clone)]
 pub struct CoordinatorContract {
     pub weights: NativeDenseLayout,
+    /// Header-native EXL3 dense projections (empty for FP8/NVFP4 releases).
+    pub core: super::exl3::CoreInventory,
     pub norm_weight: NormWeight,
     pub norms: TargetNormEps,
     pub rope_tables: crate::plan::rope::Tables,
     pub router: SigmoidRouter,
     pub layers: Vec<LayerContract>,
+    mtp_declarations: Vec<(String, Vec<usize>, DType)>,
 }
 
 /// Official target norms all receive config.rms_norm_eps, including the
 /// indexer LayerNorm (whose fused kernel's default is not the model value).
-/// Extra MTP enorm/hnorm/shared-head norms remain unqualified and unbound.
+/// MTP enorm/hnorm and each private head norm use the same checkpoint epsilon.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TargetNormEps {
     pub input: f32,
@@ -95,16 +98,17 @@ impl CoordinatorContract {
     /// Full tensors are conservatively replicated; no unimplemented TP packing
     /// or BF16-to-FP8 conversion is credited as a memory saving.
     pub fn from_checkpoint(checkpoint: &Checkpoint) -> Result<Self> {
+        let _construction = tracing::debug_span!("step5_coordinator_contract_construction").entered();
         let model = Model::open(checkpoint)?;
         let cfg: &Config = &model.cfg;
         let declarations = model
             .tensors
             .iter()
-            .filter(|(_, t)| {
+            .filter(|(name, t)| {
                 !matches!(
                     t.role.component,
                     Component::RoutedExpert | Component::Vision | Component::Speculator
-                )
+                ) && !is_exl3_member(name)
             })
             .map(|(name, t)| (name.clone(), t.shape.clone(), t.dtype.clone()));
         let weights = NativeDenseLayout::from_headers(checkpoint, declarations)?;
@@ -115,8 +119,13 @@ impl CoordinatorContract {
             layers.len() == 92,
             "target coordinator must exclude MTP stages"
         );
+        let mtp_declarations = model.tensors.iter().filter(|(name, tensor)|
+            !is_exl3_member(name) && tensor.role.component == Component::Speculator)
+            .map(|(name, tensor)| (name.clone(), tensor.shape.clone(), tensor.dtype.clone())).collect();
         Ok(Self {
             weights,
+            mtp_declarations,
+            core: model.core.clone(),
             norm_weight: NormWeight::ZeroCentered,
             norms: TargetNormEps::from_config(cfg),
             rope_tables: cfg.rope_tables()?,
@@ -155,7 +164,14 @@ pub struct RankWeightLayout {
     pub rank: usize,
     pub ranks: usize,
     pub operands: Vec<WeightOperand>,
+    /// Compressed native trellis owners by `.weight` operand name; gate and up
+    /// stay separate, independently calibrated projections.
+    pub core: std::collections::BTreeMap<String, crate::formats::trellis_core::CoreWeightLayout>,
     pub resident_bytes: u64,
+}
+
+fn is_exl3_member(name: &str) -> bool {
+    matches!(crate::plan::format::split_stem(name).1, "trellis" | "suh" | "svh" | "mcg")
 }
 
 impl RankWeightLayout {
@@ -174,42 +190,111 @@ impl RankWeightLayout {
     /// MTP stages stay whole on their admitted owner. Matching head shapes
     /// do not establish tied checkpoint storage or identical weights.
     pub fn for_mtp(checkpoint: &Checkpoint, depth: usize) -> Result<Self> {
-        let model = Model::open(checkpoint)?;
-        ensure!(depth <= model.cfg.mtp, "Step-5 MTP depth exceeds checkpoint stages");
+        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+        Self::mtp_from_contract(checkpoint, &contract, depth)
+    }
+
+    pub fn mtp_from_contract(checkpoint: &Checkpoint, contract: &CoordinatorContract,
+        depth: usize) -> Result<Self> {
+        let cfg = Config::parse(checkpoint)?;
+        ensure!(depth <= cfg.mtp, "Step-5 MTP depth exceeds checkpoint stages");
         if depth == 0 {
-            return Ok(Self { rank: 0, ranks: 1, operands: vec![], resident_bytes: 0 });
+            return Ok(Self { rank: 0, ranks: 1, operands: vec![], core: Default::default(), resident_bytes: 0 });
         }
-        let end = model.cfg.layers + depth;
-        let declarations = model.tensors.iter().filter(|(_, tensor)| {
-            tensor.role.component == Component::Speculator
-                && tensor.role.layer.is_some_and(|layer| layer < end)
-        }).map(|(name, tensor)| (name.clone(), tensor.shape.clone(), tensor.dtype.clone()));
+        let declarations = contract.mtp_declarations.iter().filter(|(name, _, _)|
+            (0..depth).any(|stage| name.starts_with(&format!("model.layers.{}.", cfg.layers + stage))))
+            .cloned();
         let weights = NativeDenseLayout::from_headers(checkpoint, declarations)?;
         let mut layout = Self::from_native(&weights, 0, 1, None)?;
-        for operand in &mut layout.operands {
-            operand.slice = WeightSlice::Replicated;
-        }
+        for operand in &mut layout.operands { operand.slice = WeightSlice::Replicated; }
+        layout.attach_core(&cfg, &contract.core, None, |layer| layer >= cfg.layers && layer < cfg.layers + depth)?;
         Ok(layout)
     }
 
     /// One whole predictor owner, with no target or earlier-stage operands.
     pub fn for_mtp_stage(checkpoint: &Checkpoint, stage: usize) -> Result<Self> {
+        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+        Self::mtp_stage_from_contract(checkpoint, &contract, stage)
+    }
+
+    pub fn mtp_stage_from_contract(checkpoint: &Checkpoint, contract: &CoordinatorContract,
+        stage: usize) -> Result<Self> {
         let cfg = Config::parse(checkpoint)?;
         ensure!(stage < cfg.mtp, "Step-5 predictor stage outside checkpoint");
         let prefix = format!("model.layers.{}.", cfg.layers + stage);
-        let mut layout = Self::for_mtp(checkpoint, stage + 1)?;
+        let mut layout = Self::mtp_from_contract(checkpoint, contract, stage + 1)?;
         layout.operands.retain(|operand| operand.name.starts_with(&prefix));
-        layout.resident_bytes = layout.operands.iter().try_fold(0u64, |sum, operand|
-            sum.checked_add(operand.allocation_bytes))
+        layout.core.retain(|name, _| name.starts_with(&prefix));
+        layout.resident_bytes = layout.operands.iter().map(|operand| operand.allocation_bytes)
+            .chain(layout.core.values().map(|core| core.bytes as u64))
+            .try_fold(0u64, |sum, bytes| sum.checked_add(bytes))
             .ok_or_else(|| anyhow::anyhow!("Step-5 stage weight size overflow"))?;
-        ensure!(layout.operands.len() == 16, "Step-5 predictor operand inventory");
+        // 16 operands, with BF16 gate/up packed as one; native gate and up stay separate.
+        let native = layout.core.len() - usize::from(layout.core.keys().any(|n| n.ends_with(".mlp.up_proj.weight")));
+        ensure!(layout.operands.len() + native == 16, "Step-5 predictor operand inventory");
         Ok(layout)
     }
 
     fn build(checkpoint: &Checkpoint, rank: usize, ranks: usize,
         ownership: Option<&super::ownership::ExecutionOwnership>) -> Result<Self> {
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-        Self::from_native(&contract.weights, rank, ranks, ownership)
+        let cfg = Config::parse(checkpoint)?;
+        Self::from_contract(&contract, &cfg, rank, ranks, ownership)
+    }
+
+    pub fn from_contract(contract: &CoordinatorContract, cfg: &Config,
+        rank: usize, ranks: usize, ownership: Option<&super::ownership::ExecutionOwnership>) -> Result<Self> {
+        let _construction = tracing::debug_span!("step5_rank_layout_construction", rank).entered();
+        if let Some(ownership) = ownership { ownership.validate_config(cfg)?; }
+        let mut layout = Self::from_native(&contract.weights, rank, ranks, ownership)?;
+        layout.attach_core(cfg, &contract.core, ownership, |layer| layer < cfg.layers)?;
+        Ok(layout)
+    }
+
+    /// Native trellis owners follow the same ownership as their BF16 operands:
+    /// head-split ranks slice q/k/v by output rows and o_proj by input columns;
+    /// FFNs and heads stay whole on their owner. Admission counts their bytes.
+    fn attach_core(&mut self, cfg: &Config, core: &super::exl3::CoreInventory,
+        ownership: Option<&super::ownership::ExecutionOwnership>, layers: impl Fn(usize) -> bool) -> Result<()> {
+        use crate::formats::{dense_trellis::TrellisSide, trellis_core::CoreWeightLayout};
+        for (stem, projection) in &core.projections {
+            let name = format!("{stem}.weight");
+            let (layer, leaf) = match stem.strip_prefix("model.layers.").and_then(|r| r.split_once('.')) {
+                Some((layer, leaf)) => (Some(layer.parse::<usize>()?), leaf),
+                None => (None, stem.as_str()),
+            };
+            let (world, side) = match (layer, ownership) {
+                (Some(layer), _) if !layers(layer) => continue,
+                (None, _) if layers(cfg.layers) => continue,
+                (None, Some(ownership)) => {
+                    if self.rank != usize::from(ownership.execution().spec().head_gpu) { continue; }
+                    (1, TrellisSide::Output)
+                }
+                (None, None) if self.rank != 0 => continue,
+                (None, None) => (1, TrellisSide::Output),
+                (Some(layer), Some(ownership)) => {
+                    let local = ownership.layer(layer, self.rank)?;
+                    let attention = leaf.starts_with("self_attn.");
+                    if (attention && local.query_heads == 0) || (!attention && !local.ffn) { continue; }
+                    match (attention && local.query_heads == 32, leaf) {
+                        (true, "self_attn.o_proj") => (2, TrellisSide::Input),
+                        (true, _) => (2, TrellisSide::Output),
+                        _ => (1, TrellisSide::Output),
+                    }
+                }
+                (Some(_), None) if self.ranks == 1 => (1, TrellisSide::Output),
+                (Some(_), None) => match leaf {
+                    "self_attn.q_proj" | "self_attn.k_proj" | "self_attn.v_proj" => (2, TrellisSide::Output),
+                    "self_attn.o_proj" => (2, TrellisSide::Input),
+                    _ => (1, TrellisSide::Output),
+                },
+            };
+            let layout = CoreWeightLayout::new(projection, side, if world == 1 { 0 } else { self.rank }, world)?;
+            self.resident_bytes = self.resident_bytes.checked_add(layout.bytes as u64)
+                .ok_or_else(|| anyhow::anyhow!("Step-5 native core size overflow"))?;
+            self.core.insert(name, layout);
+        }
+        Ok(())
     }
 
     fn from_native(weights: &NativeDenseLayout, rank: usize, ranks: usize,
@@ -330,6 +415,7 @@ impl RankWeightLayout {
             rank,
             ranks,
             operands,
+            core: Default::default(),
             resident_bytes,
         })
     }

@@ -332,8 +332,8 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
             let cache = self.ranks[head_rank].borrow();
             if let Some(history) = cache.layout().ranks[head_rank].mtp_hidden {
                 let ring = cuteafd_core::prefix::AppendRing {
-                    window: cache.layout().mtp_hidden_rows - cache.layout().ring.step,
-                    step: cache.layout().ring.step, rows: cache.layout().mtp_hidden_rows,
+                    window: cache.layout().mtp_hidden_rows - cache.layout().step_rows,
+                    step: cache.layout().step_rows, rows: cache.layout().mtp_hidden_rows,
                 };
                 for sequence in &descriptors {
                     let target = cache.request_component(history, sequence.sequence)?;
@@ -540,9 +540,9 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         serde_json::json!({"kind":"step5_swa512_csa64", "rows":rows, "contexts":contexts,
             "attention":"eager_per_sequence", "arithmetic":"eager"})
     }
-    fn draft_geometry(&self, _snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
+    fn draft_geometry(&self, snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
         ensure!(self.mtp.is_some(), "Step-5 MTP runtime is not admitted");
-        self.execution.draft_geometry(width, self.geometry().decode_rows)
+        self.execution.draft_geometry(snapshot, width, self.geometry().decode_rows)
     }
     fn arm_draft_probe(&self) -> Result<()> {
         ensure!(self.mtp.is_some(), "Step-5 MTP runtime is not admitted");

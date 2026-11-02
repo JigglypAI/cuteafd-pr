@@ -60,7 +60,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     let exl3 = report.experts.as_ref().is_some_and(|e| e.package.contains("exl3"));
     let package = report.experts.as_ref().map(|e| e.package.as_str());
     let reference = gpus == 1 && (94 * GIB..=96 * GIB).contains(&options.rtx_bytes[0])
-        && mtp && options.local_expert_layers.is_none() && local && package == Some("qwen4:exl3-k45")
+        && mtp && options.onboard.is_none_or(|mode| mode == crate::placement::OnboardSetting::Auto) && local && package == Some("qwen4:exl3-k45")
         && model.spec().hidden == 2560 && model.spec().layers.len() == 48
         && shape.prefill_rows == 4096 && shape.concurrency == 8 && matches!(options.prefix_slots, None | Some(18))
         && matches!(shape.context_tokens, 0 | 32768);
