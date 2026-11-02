@@ -193,6 +193,9 @@ def run_trace(a, family, manifest):
             del module
             if DEVICE == "cuda":
                 torch.cuda.empty_cache()
+        if hasattr(family, "finish_trace"):
+            wait_for_tensors(family, family.outer_tensors("final"), getattr(a, "wait_shards", 0))
+            family.finish_trace(hidden, position, a.out)
     return {"diagnostic": True, "window": window["id"], "tokens": len(window["tokens"])}
 
 

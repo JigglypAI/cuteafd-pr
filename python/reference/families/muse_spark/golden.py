@@ -75,12 +75,18 @@ def activation_trace(module, index, hidden):
 class Family:
     name = "muse_spark"
 
-    def __init__(self, snapshot):
+    def __init__(self, snapshot, *, trace_dtype="f32", trace_common_hidden=()):
         import torch
+        if trace_dtype not in ("f32", "bf16"):
+            raise ValueError("trace dtype must be f32 or bf16")
+        if (trace_dtype != "f32" or trace_common_hidden) and os.environ.get("CUTEAFD_ACTIVATION_TRACE_POSITION") is None:
+            raise ValueError("trace arithmetic and common-head inputs require activation trace mode")
+        self.trace_common_hidden = tuple(trace_common_hidden)
         self.reference, self.config = model.load_official(snapshot)
         self.checkpoint = model.Checkpoint(snapshot)
         self.layers = self.config.num_hidden_layers
-        self.dtype = torch.float32
+        # None preserves native BF16 parameters and the official F32 router/gates.
+        self.dtype = torch.float32 if trace_dtype == "f32" else None
         self.outer = None
         with torch.device(layer_major.DEVICE):
             self.rotary = self.reference.MuseSparkTextRotaryEmbedding(self.config)
@@ -195,6 +201,39 @@ class Family:
         self.outer = None
         self.checkpoint.close()
 
+    def finish_trace(self, hidden, position, directory):
+        import numpy as np
+        import torch
+
+        folder = directory / f"position{position}-prefill"
+        selected = hidden[:, position:position + 1]
+        self.load_final()
+        try:
+            self.final(selected).float().cpu().numpy().astype("<f4").tofile(folder / "final-logits.f32.bin")
+        finally:
+            self.release_final()
+        original_dtype = self.dtype
+        self.dtype = torch.float32
+        try:
+            self.load_final()
+            inputs = [("self", selected.float())]
+            for name, path in getattr(self, "trace_common_hidden", ()):
+                if not name or name == "self" or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for c in name):
+                    raise ValueError("invalid common-head trace input name")
+                path = Path(path)
+                if path.name.endswith(".f32.bin"):
+                    values = np.fromfile(path, dtype="<f4")
+                else:
+                    values = (np.fromfile(path, dtype="<u2").astype(np.uint32) << 16).view(np.float32)
+                if values.shape != (self.config.hidden_size,) or not np.isfinite(values).all():
+                    raise ValueError("common-head trace input must be one finite hidden row")
+                inputs.append((name, torch.from_numpy(values.copy()).to(layer_major.DEVICE).reshape(1, 1, -1)))
+            for name, value in inputs:
+                self.final(value).float().cpu().numpy().astype("<f4").tofile(folder / f"common-head-{name}-logits.f32.bin")
+        finally:
+            self.release_final()
+            self.dtype = original_dtype
+
     def golden_meta(self):
         return {"reference": "official transformers 5.22.1 MuseSparkTextDecoderLayer; fixed-M128 linears; "
                              "128-row causal (sliding 2048 / NoPE full) eager tiles",
@@ -216,10 +255,14 @@ def main():
     parser.add_argument("--wait-shards", type=float, default=0,
                         help="seconds to wait for a layer's shards to finish downloading")
     parser.add_argument("--layers", type=int, default=None)
+    parser.add_argument("--trace-dtype", choices=("f32", "bf16"), default="f32",
+                        help="activation trace only: native BF16 or the default F32 reference")
+    parser.add_argument("--trace-common-hidden", action="append", nargs=2, default=[], metavar=("NAME", "PATH"),
+                        help="activation trace only: saved hidden row evaluated by the official F32 common head")
     args = parser.parse_args()
     if args.layers is not None:
         raise ValueError("partial layers cannot qualify a reference")
-    family = Family(args.snapshot)
+    family = Family(args.snapshot, trace_dtype=args.trace_dtype, trace_common_hidden=args.trace_common_hidden)
     layer_major.run(args, family, extras_root=args.routes)
 
 

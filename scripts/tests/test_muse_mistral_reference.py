@@ -300,7 +300,7 @@ def test_muse_golden_qualifies_scores_resumes_and_writes_routes(tmp_path, monkey
     randomize(official)
     tensors = {muse.PREFIX + k: v.detach().bfloat16() for k, v in official.state_dict().items() if "rotary" not in k}
     for key in list(tensors):
-        if key.endswith(("mlp.gate.weight", "e_score_correction_bias")):
+        if key.endswith(("mlp.gate.weight", "e_score_correction_bias", "residual_gate.gate")):
             tensors[key] = tensors[key].float()
     tensors[muse.HEAD] = (torch.randn(config.vocab_size, config.hidden_size) * 0.3).bfloat16()
     snapshot = fixture_snapshot(tmp_path, tensors, "model.safetensors.index.json")
@@ -353,9 +353,35 @@ def test_muse_golden_qualifies_scores_resumes_and_writes_routes(tmp_path, monkey
     result = layer_major.run(args, family)
     assert result == {"diagnostic": True, "window": "w1", "tokens": 7}
     files = list(trace_out.rglob("*"))
-    assert len([p for p in files if p.is_file()]) == config.num_hidden_layers * 9
-    assert all(p.name.startswith("layer") and p.suffix == ".bin" for p in files if p.is_file())
+    assert len([p for p in files if p.is_file()]) == config.num_hidden_layers * 9 + 2
+    assert all(p.suffix == ".bin" for p in files if p.is_file())
     assert {p.name for p in trace_out.iterdir()} == {"position3-prefill"}
+    folder = trace_out / "position3-prefill"
+    np = __import__("numpy")
+    assert np.fromfile(folder / "final-logits.f32.bin", dtype="<f4").shape == (config.vocab_size,)
+    assert (folder / "final-logits.f32.bin").read_bytes() == (folder / "common-head-self-logits.f32.bin").read_bytes()
+
+    # Native BF16 keeps router/gates F32 and reuses the same official common head.
+    family = golden.Family(snapshot, trace_dtype="bf16", trace_common_hidden=[
+        ("f32", folder / f"layer{config.num_hidden_layers - 1}-hidden.f32.bin")])
+    assert family.dtype is None
+    module = family.load_layer(0)
+    assert module.mlp.gate.weight.dtype == torch.float32
+    assert module.post_attention_residual_gate.gate.dtype == torch.float32
+    assert module.self_attn.q_proj.weight.dtype == torch.bfloat16
+    del module
+    bf16_out = tmp_path / "trace-bf16"
+    monkeypatch.setenv("CUTEAFD_ACTIVATION_TRACE_DIR", str(bf16_out))
+    args.out = bf16_out
+    assert layer_major.run(args, family) == result
+    bf16_folder = bf16_out / "position3-prefill"
+    assert (bf16_folder / "common-head-f32-logits.f32.bin").read_bytes() == (folder / "common-head-self-logits.f32.bin").read_bytes()
+    assert np.isfinite(np.fromfile(bf16_folder / "final-logits.f32.bin", dtype="<f4")).all()
+    monkeypatch.delenv("CUTEAFD_ACTIVATION_TRACE_POSITION")
+    with pytest.raises(ValueError, match="require activation trace"):
+        golden.Family(snapshot, trace_dtype="bf16")
+    with pytest.raises(ValueError, match="require activation trace"):
+        golden.Family(snapshot, trace_common_hidden=[("f32", folder / "layer0-hidden.f32.bin")])
 
 
 def test_mistral_golden_threads_shared_kv_and_topk_across_layers(tmp_path, monkeypatch):
