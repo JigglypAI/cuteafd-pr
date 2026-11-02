@@ -213,15 +213,11 @@ def fixture(name):
 def reference(config, tensors, dtype, device="cuda"):
     """Official modules, loaded from consolidated names (HF's converter mapping)."""
     import torch
-    from transformers.models.pixtral.configuration_pixtral import PixtralVisionConfig
-    from transformers.models.pixtral.modeling_pixtral import PixtralVisionModel
-    from transformers.models.mistral_large4 import modeling_mistral_large4 as ml4
-    from transformers.models.mistral_large4.configuration_mistral_large4 import MistralLarge4Config
-    vision_config = PixtralVisionConfig(**config["vision_config"])
-    vision_config._attn_implementation = "sdpa"
-    tower = PixtralVisionModel(vision_config)
-    full = MistralLarge4Config(**{k: v for k, v in config.items() if k not in ("quantization_config",)})
-    projector = ml4.MistralLarge4MultiModalProjector(full)
+    path = Path(__file__).resolve().parents[3] / "reference/families/mistral_large4/model.py"
+    spec = importlib.util.spec_from_file_location("_mistral_large4_reference", path)
+    model = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(model)
+    tower, projector = model.load_vision_official(config)
     t = lambda name: torch.from_numpy((tensors[name].astype(np.uint32) << 16).view(np.float32))
     state = {"patch_conv.weight": t("vision_encoder.patch_conv.weight"), "ln_pre.weight": t("vision_encoder.ln_pre.weight")}
     rename = {"attention.wq": "attention.q_proj", "attention.wk": "attention.k_proj", "attention.wv": "attention.v_proj",
@@ -238,7 +234,16 @@ def reference(config, tensors, dtype, device="cuda"):
         "linear_2.weight": t("vision_language_adapter.w_out.weight")}, strict=True)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    return tower.to(device, dtype).eval(), projector.to(device, dtype).eval(), [Path(ml4.__file__)]
+    # Move buffers without rounding Pixtral's nonpersistent axial RoPE frequencies.
+    for module in (tower, projector):
+        module.to(device=device)
+        for parameter in module.parameters():
+            parameter.data = parameter.data.to(dtype=dtype)
+        module.eval()
+    import transformers
+    root = Path(transformers.__file__).resolve().parent
+    sources = [Path(model.__file__), *(root / name for name in model.SOURCE_PINS)]
+    return tower, projector, sources
 
 
 def safe(name):
