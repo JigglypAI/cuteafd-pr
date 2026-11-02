@@ -18,6 +18,8 @@ pub enum DenseError {
     Invalid(#[from] anyhow::Error),
     #[error("EXLR8 dense: {tensor}: MXFP8 input slice {first}..{end} cuts a K32 scale block")]
     Mxfp8ScaleBoundary { tensor: String, first: usize, end: usize },
+    #[error("EXLR8 dense: {tensor}: physical {storage:?} storage contradicts {execution:?} execution axis")]
+    StorageExecutionAxis { tensor: String, storage: ShardSide, execution: DenseAxis },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -655,6 +657,9 @@ impl DenseRecord {
 impl DenseRecord {
     /// Select execution channels without changing checkpoint quantization or resident layout.
     pub fn slice_axis(&self, axis: DenseAxis, first: usize, channels: usize) -> Result<DenseSlice> {
+        if matches!((self.side, axis), (ShardSide::Output, DenseAxis::Input) | (ShardSide::Input, DenseAxis::Output)) {
+            return Err(DenseError::StorageExecutionAxis { tensor: self.tensor.clone(), storage: self.side, execution: axis });
+        }
         let end = first.checked_add(channels).ok_or_else(|| anyhow::anyhow!("dense channel overflow"))?;
         if self.encoding == DenseEncoding::Mxfp8 && axis == DenseAxis::Input
             && (first % 32 != 0 || end % 32 != 0) {
@@ -755,6 +760,17 @@ impl DensePlan {
     /// `whole_mla` is a planner decision; records only expose eligibility and split facts.
     pub fn for_rank_owned(records: &[DenseRecord], world: usize, rank: usize,
         whole_mla: &std::collections::BTreeMap<usize, usize>) -> Result<Self> {
+        for record in records {
+            if let DenseExecution::Split(axis) = record.ownership.execution {
+                if matches!((record.side, axis), (ShardSide::Output, DenseAxis::Input) | (ShardSide::Input, DenseAxis::Output)) {
+                    return Err(DenseError::StorageExecutionAxis { tensor: record.tensor.clone(), storage: record.side, execution: axis });
+                }
+                if record.encoding == DenseEncoding::Mxfp8 && axis == DenseAxis::Input
+                    && world > 0 && record.shape.get(1).is_some_and(|k| k % world == 0 && (k / world) % 32 != 0) {
+                    return Err(DenseError::Mxfp8ScaleBoundary { tensor: record.tensor.clone(), first: 0, end: record.shape[1] / world });
+                }
+            }
+        }
         (|| -> anyhow::Result<Self> {
             ensure!(
                 (1..=2).contains(&world) && rank < world,
@@ -1332,6 +1348,17 @@ mod tests {
             Err(DenseError::Mxfp8ScaleBoundary { first: 16, end: 80, .. })));
         assert!(matches!(record.slice_axis(DenseAxis::Input, 32, 48),
             Err(DenseError::Mxfp8ScaleBoundary { first: 32, end: 80, .. })));
+    }
+
+    #[test]
+    fn contradictory_projection_storage_has_typed_refusal() {
+        let root = tempfile::tempdir().unwrap();
+        trellis(root.path(), 2, 128, 0);
+        let mut record = DenseRecord::inventory(root.path()).unwrap().remove(0);
+        record.tensor = "model.layers.0.mlp.gate_proj.weight".into();
+        record.ownership = DenseOwnership::new(DenseExecution::Split(DenseAxis::Output));
+        assert!(matches!(DensePlan::for_rank(&[record], 2, 0),
+            Err(DenseError::StorageExecutionAxis { storage: ShardSide::Input, execution: DenseAxis::Output, .. })));
     }
 
     #[test]
