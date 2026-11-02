@@ -121,10 +121,10 @@ def test_spark_budget_default_is_planner_owned_and_explicit_ceiling_wins(tmp_pat
     keys = "SPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
     if explicit is not None:
         keys += f"SPARK_DEVICE_BUDGET_BYTES={explicit}\n"
-    budget = explicit or (100 << 30)
+    device_budget = explicit or (108 << 30)
     result = _family_launch_result(tmp_path, config, "test/budget", keys,
                                   encoder_plan={"placement_supported": True, "fits": True,
-                                                "spark_budget_bytes": budget})
+                                                "spark_budget_bytes": 100 << 30})
     assert result.returncode == 0, result.stderr
     plans = [line.split() for line in result.stderr.splitlines() if "cuteafd plan" in line]
     assert plans
@@ -135,7 +135,7 @@ def test_spark_budget_default_is_planner_owned_and_explicit_ceiling_wins(tmp_pat
             assert plan[plan.index("--spark-budget-gib") + 1] == "108.0"
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
     assert len(workers) == 4
-    assert all(f"--device-budget-bytes {budget} " in worker for worker in workers)
+    assert all(f"--device-budget-bytes {device_budget} " in worker for worker in workers)
 
 
 def test_exlr8_onboarded_halves_require_the_shared_committed_push():
@@ -1001,6 +1001,8 @@ report.update(spark_ranks=ranks)
 if family == "mimo_v2":
     report["prefill_lanes"] = 3
 gpus = int(value("--rtx", "1"))
+spark_capacity = int(float(value("--spark-budget-gib")) * 2**30) if value("--spark-budget-gib") else (
+    report.get("spark_budget_bytes", 108 << 30) if family in {"kimi_k3", "step5"} else 108 << 30)
 placement_ready = report.get("placement_supported", True) and report.get("fits", True)
 shared = family in {"step5", "kimi_k3", "glm5", "glm5_flash", "deepseek_v4", "qwen4"}
 # The planner's fixed depth (prefill_waves::depth): three units with Sparks.
@@ -1025,7 +1027,8 @@ deployment = dict(version=1, family=family, executable=family != "qwen3_5" and p
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
     artifact_requirements=dict(spark_tp_role=f"tp{tp}" if family == "deepseek_v41" and explicit and tp != 4 else None), report=report,
     memory_layout=dict(devices=[dict(kind="rtx", index=i, items=[dict(category="weights", bytes=int(os.environ["STUB_PLAN_RTX_BYTES"])),
-                                                                 dict(category="kv", bytes=64 << 30)]) for i in range(gpus)]))
+                                                                 dict(category="kv", bytes=64 << 30)]) for i in range(gpus)] +
+                               [dict(kind="spark", index=i, capacity_bytes=spark_capacity, items=[]) for i in range(ranks)]))
 deployment.update(json.loads(os.environ["STUB_DEPLOYMENT_OVERRIDES"]))
 if deployment.get("wip_launchable") == "absent":
     deployment.pop("wip_launchable")

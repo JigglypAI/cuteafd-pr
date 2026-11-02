@@ -2837,8 +2837,13 @@ audio_encoder_hash=""
   if [[ "$(family_prefill_mode "$family")" == units-span ]]; then
     family_args+=(--prefill-span-rows "$PREFILL_SPAN_ROWS")
   fi
-  [[ -n "$budget" ]] || budget="$(jq -er '.spark_budget_bytes | select(type == "number" and . > 0)' <<<"$plan_json")" ||
-    release_die "the deployment plan names no Spark budget"
+  if ((ranks > 0)); then
+    budget="$(jq -er --argjson ranks "$ranks" '
+      [.memory_layout.devices[] | select(.kind == "spark") | .capacity_bytes] |
+      select(length == $ranks and all(.[]; type == "number" and . > 0)) |
+      unique | select(length == 1) | .[0]' <<<"$deployment_json")" ||
+      release_die "the deployment plan names no uniform complete-device Spark capacity"
+  fi
 # Check the admitted count's images before --restart or weight loading. The worker's
 # resident admission validates the sibling for its full 4096-row workspace even
 # when only decode requests use BF16, so this preflight requires the same coverage.
