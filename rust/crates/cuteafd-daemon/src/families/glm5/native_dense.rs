@@ -212,6 +212,37 @@ mod tests {
     use cuteafd_loader::plan::exlr8::dense::{DenseExecution, DenseOwnership, KvBGeometry};
 
     #[test]
+    fn replicated_k_slice_admits_actual_reader_batch_and_cache_only_at_load() {
+        use cuteafd_loader::plan::exlr8::dense::{DenseAxis, DenseRange};
+        use cuteafd_loader::shared::dense_read::{ReadBatch, STEP_BYTES};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native.bin");
+        std::fs::write(&path, vec![17u8; 8192]).unwrap();
+        let record = DenseRecord { tensor: "model.layers.0.self_attn.o_proj.weight".into(),
+            encoding: DenseEncoding::Mxfp8, shape: vec![64, 128], side: ShardSide::Replicated,
+            ownership: DenseOwnership::new(DenseExecution::Split(DenseAxis::Input)), channels_per_shard: 0,
+            rotation_id: 0, rotation: None, hessian_solved: false, native_blocks: 1,
+            components: vec![DenseComponent { suffix: "fp8".into(), dtype: "U8".into(), shape: vec![64,128],
+                source: DenseRange { path, offset: 0, bytes: 8192 }, window: None }] };
+        let plan = DensePlan::for_rank(&[record], 2, 1).unwrap();
+        let component = &plan.tensors[0].components[0];
+        let w = component.window.as_ref().unwrap();
+        let rect = Rect { name: "native".into(), path: component.source.path.clone(), base: 0,
+            row_bytes: w.row_bytes, rows: w.rows.clone(), cols: w.cols.clone() };
+        let batch = ReadBatch::new(rect.rows.len(), rect.row_bytes, rect.width(), STEP_BYTES).unwrap();
+        let part = rect.sub(0..batch.rows);
+        let mut packed = vec![0; part.bytes()];
+        let mut cache = None;
+        part.read_cached(&mut packed, &mut cache).unwrap();
+        let cached_bytes = cache.as_ref().unwrap().1.len();
+        assert_eq!(cached_bytes, 8192);
+        assert_eq!(batch.cached_bytes, cached_bytes);
+        assert!(plan.admit_host(plan.read_staging_bytes, 0).unwrap() >= batch.pinned_bytes() + cached_bytes);
+        assert_eq!(plan.resident_bytes, 4096);
+        assert_eq!(plan.admit(plan.resident_bytes + 256, 1, 1, 0).unwrap(), 4352);
+    }
+
+    #[test]
     fn tp2_kv_b_plan_equals_actual_allocation_requests() {
         let geometry = KvBGeometry { heads: 64, nope: 192, values: 256, latent: 512 };
         let record = DenseRecord { tensor: "model.layers.0.self_attn.kv_b_proj.weight".into(),

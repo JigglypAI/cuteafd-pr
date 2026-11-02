@@ -11,7 +11,7 @@ mod ownership;
 pub use ownership::{DenseAxis, DenseExecution, DenseOwnership, KvBGeometry, KvBLayout};
 
 /// One bounded native absorption step, shared by admission and loading.
-pub const DENSE_STEP_BYTES: usize = 32 << 20;
+pub use crate::shared::dense_read::STEP_BYTES as DENSE_STEP_BYTES;
 
 type Result<T> = std::result::Result<T, DenseError>;
 
@@ -194,7 +194,8 @@ pub struct DensePlan {
     pub tensors: Vec<DenseSlice>,
     /// Sum of separately 256-byte-aligned component allocations.
     pub resident_bytes: usize,
-    /// One staging unit, including replicated trellis scale vectors.
+    /// Loading-only peak: reusable pinned batch plus retained full-row cache.
+    /// Never part of resident_bytes or steady-state device admission.
     pub read_staging_bytes: usize,
 }
 
@@ -804,7 +805,8 @@ impl DensePlan {
             ensure!(!records.is_empty(), "empty dense coordinator plan");
             let mut tensors = Vec::new();
             let mut resident_bytes = 0usize;
-            let mut read_staging_bytes = 0usize;
+            let mut pinned_staging_bytes = 0usize;
+            let mut cached_rows_bytes = 0usize;
             for record in records {
                 record.validate_ownership()?;
                 let owner = record.ownership.whole_mla.and_then(|layer| whole_mla.get(&layer)).copied();
@@ -840,17 +842,20 @@ impl DensePlan {
                     }
                 }
                 for unit in &slice.units {
-                    read_staging_bytes = read_staging_bytes.max(unit.staging_bytes()?);
+                    pinned_staging_bytes = pinned_staging_bytes.max(unit.staging_bytes()?);
                 }
-                for component in slice.components.iter().filter(|_| slice.units.is_empty()) {
-                    read_staging_bytes = read_staging_bytes.max(match &component.window {
-                        Some(window) => window.row_bytes,
-                        None => component.source.bytes,
-                    });
+                for component in &slice.components {
+                    let (rows, row_bytes, width) = match &component.window {
+                        Some(window) => (window.rows.len(), window.row_bytes, window.cols.len()),
+                        None => (1, component.source.bytes, component.source.bytes),
+                    };
+                    let batch = crate::shared::dense_read::ReadBatch::new(rows, row_bytes, width, DENSE_STEP_BYTES)?;
+                    pinned_staging_bytes = pinned_staging_bytes.max(batch.pinned_bytes());
+                    cached_rows_bytes = cached_rows_bytes.max(batch.cached_bytes);
                 }
                 if slice.absorbed.is_some() {
-                    // The existing loader stages whole heads with the complete scale grid.
-                    read_staging_bytes = read_staging_bytes.max(sum(record.components.iter().map(|c| c.source.bytes))?.min(DENSE_STEP_BYTES));
+                    let staged = sum(record.components.iter().map(|c| c.source.bytes))?.min(DENSE_STEP_BYTES);
+                    pinned_staging_bytes = pinned_staging_bytes.max(staged.max(crate::shared::dense_read::PINNED_FLOOR_BYTES));
                 }
                 tensors.push(slice);
             }
@@ -859,7 +864,7 @@ impl DensePlan {
                 world,
                 tensors,
                 resident_bytes,
-                read_staging_bytes,
+                read_staging_bytes: sum([pinned_staging_bytes, cached_rows_bytes])?,
             })
         })()
         .map_err(Into::into)
@@ -909,7 +914,7 @@ pub fn resident_native(records: &[DenseRecord], world: usize, rank: usize, layer
             let Some(rest) = slice.tensor.strip_prefix("model.layers.") else {
                 let group = match slice.tensor.as_str() {
                     "model.embed_tokens.weight" => "embedding", "lm_head.weight" => "lm_head", _ => "norm" };
-                for c in &slice.components { put(group, &c.dtype.to_lowercase(), c.source.bytes)?; }
+                for c in &slice.components { put(group, &c.dtype.to_lowercase(), c.resident_bytes()?)?; }
                 continue;
             };
             let layer: usize = rest.split('.').next().context("layer index")?.parse()?;
@@ -924,7 +929,7 @@ pub fn resident_native(records: &[DenseRecord], world: usize, rank: usize, layer
                 else if slice.tensor.contains(".self_attn.") { "attention" }
                 else if slice.tensor.ends_with(".mlp.gate.weight") || slice.tensor.ends_with(".mlp.gate.e_score_correction_bias") { "router" }
                 else if slice.tensor.contains(".mlp.") { "dense" } else { "norm" };
-            for c in &slice.components { put(group, &c.dtype.to_lowercase(), c.source.bytes)?; }
+            for c in &slice.components { put(group, &c.dtype.to_lowercase(), c.resident_bytes()?)?; }
         }
         for record in records {
             if let DenseExecution::AbsorbHeads(geometry) = record.ownership.execution {
@@ -1030,7 +1035,7 @@ mod tests {
             let plan = DensePlan::for_rank(&records, 2, rank).unwrap();
             assert_eq!(plan.tensors[0].first_channel, rank * 128);
             assert_eq!(plan.resident_bytes, 8192 + 256 + 256);
-            assert_eq!(plan.read_staging_bytes, 8192 + 256 + 256);
+            assert_eq!(plan.read_staging_bytes, crate::shared::dense_read::PINNED_FLOOR_BYTES);
             let unit = &plan.tensors[0].units[0];
             unit.read(&mut vec![0; unit.staging_bytes().unwrap()])
                 .unwrap();

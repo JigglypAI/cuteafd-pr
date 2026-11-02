@@ -1304,14 +1304,17 @@ impl Opened {
         self.library.cuda_set_device(devices[0])?;
         let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
         let available = usize::try_from(available)?;
+        let per_rank = (0..world).map(|rank| native_dense::NativeDenseRecords::new(&self.snapshot, layers, world, rank))
+            .collect::<Result<Vec<_>>>()?;
+        let load_peak = per_rank.iter().try_fold(0usize, |total, rank|
+            total.checked_add(rank.plan.read_staging_bytes).context("native dense load peak overflow"))?;
+        ensure!(load_peak <= available, "native dense load peak {load_peak} exceeds available host bytes {available}");
         let vocabulary = NativeVocabulary::load(&self.library, programs,
             VocabularyPlan::new(records, world, 0, self.cfg.hidden, self.cfg.vocab_size)?, available, 0, 0)?
             .context("rank 0 owns the native vocabulary")?;
         let vocabulary = std::rc::Rc::new(vocabulary);
         let source = self.native_embed_source()?;
         let embedding = crate::shared::token_io::TokenEmbedding::row_fp8(&self.library, source, vocabulary.clone())?;
-        let per_rank = (0..world).map(|rank| native_dense::NativeDenseRecords::new(&self.snapshot, layers, world, rank))
-            .collect::<Result<Vec<_>>>()?;
         let rank_stream = |device: i32| if device == args.device { stream } else { peer_stream.map_or(stream, |(_, s)| s) };
         let ((model, shares), pushed) = match push {
             Some((push, sparks)) => {
