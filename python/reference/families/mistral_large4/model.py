@@ -370,70 +370,22 @@ def fixed_index_topk(scores, width):
     return shape_invariant.fixed_index_topk(scores, width)
 
 
-def tiled_indexer(official):
-    """The official DSA indexer arithmetic on fixed 128-row query tiles.
+def full_indexer(reference, official, linear, layer_norm):
+    """Keep official full-window DSA score geometry outside fixed-row compute.
 
-    Every line mirrors MistralLarge4TextIndexer.forward. Keys come from all rows;
-    each query tile scores only keys [0, start + 128) (later keys are causally
-    masked for every row in the tile), so a row's scores and the [T, H, T]
-    temporaries do not depend on the window length. A tile whose key extent fits
-    in top-k selects all of it, exactly what official top-k does when causally
-    valid keys number <= index_topk; wider tiles select by score with ties broken
-    toward lower key ids (``shape_invariant.fixed_index_topk``). Selections
-    are padded with masked (future) key ids to the official width min(topk, T).
+    Sparse cutoff decisions amplify small score differences. Only stabilize exact
+    top-k ties; run the pinned official projections, scores and selection intact.
     """
-    def forward(self, hidden_states, position_embeddings, attention_mask, position_ids, past_key_values=None):
+    def forward(self, *args, **kwargs):
         import torch
         import torch.nn.functional as F
-        reference = __import__(official.__module__, fromlist=["apply_rotary_pos_emb_interleave"])
-        if past_key_values is not None or hidden_states.shape[0] != 1:
-            raise ValueError("tiled indexer supports cache-free single-window inference")
-        batch_size, seq_len, _ = hidden_states.shape
-        cos, sin = position_embeddings
-        k = self.k_norm(self.wk(hidden_states)).unsqueeze(2)
-        if self.use_rope:
-            k_rot, k_pass = torch.split(k, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
-            k_rot, _ = reference.apply_rotary_pos_emb_interleave(k_rot, None, cos, sin, unsqueeze_dim=2)
-            k = torch.cat([k_rot, k_pass], dim=-1)
-        k = k.squeeze(2)
-        width = min(self.index_topk, seq_len)
-        weights_all = self.weights_proj(hidden_states.to(self.weights_proj.weight.dtype)).float() * (self.n_heads ** -0.5)
-        result = torch.empty((batch_size, seq_len, width), dtype=torch.int32, device=hidden_states.device)
-        for start in range(0, seq_len, ROWS):
-            stop = min(start + ROWS, seq_len)
-            extent = start + ROWS
-            if stop <= width:
-                # Every row has <= width causally valid keys: official top-k keeps all of
-                # them (plus masked keys that the causal mask already excludes).
-                result[:, start:stop] = torch.arange(width, dtype=torch.int32, device=result.device)
-                continue
-            rows = hidden_states[:, start:stop]
-            q = self.q_input_norm(rows)
-            q = self.wq_b(q)
-            q = q.view(batch_size, stop - start, self.n_heads, self.head_dim)
-            q = self.softmax_scaling(q, position_ids[:, start:stop], head_dim_first=False)
-            if self.use_rope:
-                q_rot, q_pass = torch.split(q, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
-                q_rot, _ = reference.apply_rotary_pos_emb_interleave(
-                    q_rot, None, cos[:, start:stop], sin[:, start:stop], unsqueeze_dim=2)
-                q = torch.cat([q_rot, q_pass], dim=-1)
-            keys = F.pad(k[:, :extent], (0, 0, 0, max(0, extent - seq_len)))
-            scores = torch.matmul(q.float(), keys.transpose(-1, -2).float().unsqueeze(1)) * self.softmax_scale
-            scores = F.relu(scores)
-            index_scores = torch.matmul(weights_all[:, start:stop].unsqueeze(-2), scores).squeeze(-2)
-            mask = F.pad(attention_mask[:, start:stop, :extent], (0, max(0, extent - seq_len)),
-                         value=torch.finfo(attention_mask.dtype).min)
-            index_scores = index_scores + mask
-            # Official ``topk`` leaves tie order undefined (relu makes exact 0.0 ties
-            # common); the stable rule picks the same set at every key extent.
-            selected = fixed_index_topk(index_scores, width).indices.to(torch.int32)
-            result[:, start:stop] = selected
-            del q, keys, scores, index_scores, mask
-        # Padded key ids >= seq_len cannot reach the official scatter: they are future
-        # keys for every row in their tile, so they never beat a causally valid score.
-        if (result >= seq_len).any():
-            raise ValueError("indexer selected a padded key")
-        return result
+        previous = F.linear, torch.nn.LayerNorm.forward
+        F.linear, torch.nn.LayerNorm.forward = linear, layer_norm
+        try:
+            with stable_ties(reference):
+                return official(self, *args, **kwargs)
+        finally:
+            F.linear, torch.nn.LayerNorm.forward = previous
     return forward
 
 
@@ -545,7 +497,7 @@ def fixed_rows(forward):
 
 @contextmanager
 def geometry(reference):
-    """Fixed-M128 linears and norms, tiled attention and indexer, ordered expert sums."""
+    """Fixed-M128 compute, full-window official indexer, ordered expert sums."""
     import torch
     import torch.nn.functional as F
     import shape_invariant
@@ -555,7 +507,7 @@ def geometry(reference):
     F.linear = shape_invariant.linear
     torch.einsum = shape_invariant.einsum
     reference.eager_attention_forward = causal_tiles(previous[2])
-    reference.MistralLarge4TextIndexer.forward = tiled_indexer(previous[3])
+    reference.MistralLarge4TextIndexer.forward = full_indexer(reference, previous[3], previous[0], previous[6])
     reference.MistralLarge4TextExperts.forward = ordered_experts
     reference.MistralLarge4RMSNorm.forward = fixed_rows(previous[5])
     torch.nn.LayerNorm.forward = fixed_rows(previous[6])

@@ -160,7 +160,7 @@ class Family:
 
     def golden_meta(self):
         return {"reference": "official transformers 5.22.1 MistralLarge4TextDecoderLayer; fixed-M128 linears; "
-                             "128-row causal eager tiles; DSA indexer on 128-row tiles with stable lower-id ties",
+                             "128-row causal eager tiles; official full-window DSA indexer with stable lower-id ties",
                 "expert_storage": "FP8 bytes + qscale resident; one F32 expert matrix per official F.linear call",
                 "index_topk_ties": "relu scores tie at 0.0; selection by score, ties to lower key id "
                                    "(official topk tie order is unspecified)",

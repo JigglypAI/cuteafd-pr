@@ -248,6 +248,42 @@ def test_mistral_fixed_geometry_prefix_is_bit_exact_and_matches_untiled():
     assert ((long - untiled).norm() / untiled.norm()).item() < 1e-5
 
 
+@pytest.mark.parametrize("layer_index", [0, 3])
+def test_mistral_sparse_selection_uses_official_full_window_geometry(monkeypatch, layer_index):
+    from transformers.models.mistral_large4 import modeling_mistral_large4 as reference
+    import torch.nn.functional as functional
+    import shape_invariant
+    config = tiny_mistral_config()
+    indexer = reference.MistralLarge4TextIndexer(config, layer_index).eval()
+    randomize(indexer)
+    hidden = torch.randn(1, 385, config.hidden_size)
+    positions = torch.arange(hidden.shape[1])[None]
+    rotary = reference.MistralLarge4TextRotaryEmbedding(config)
+    embeddings = rotary(hidden, positions)
+    mask = mistral.causal_mask(hidden.shape[1], device="cpu", dtype=hidden.dtype)[:, 0]
+    original = reference.MistralLarge4TextIndexer.forward
+    linear, layer_norm = functional.linear, torch.nn.LayerNorm.forward
+    calls = []
+
+    def observed(self, states, *args, **kwargs):
+        calls.append(states.shape[1])
+        assert functional.linear is linear
+        assert torch.nn.LayerNorm.forward is layer_norm
+        return original(self, states, *args, **kwargs)
+
+    with torch.inference_mode(), mistral.stable_ties(reference):
+        expected = indexer(hidden, embeddings, mask, positions)
+    monkeypatch.setattr(reference.MistralLarge4TextIndexer, "forward", observed)
+    with torch.inference_mode(), mistral.geometry(reference):
+        actual = indexer(hidden, embeddings, mask, positions)
+        assert functional.linear is shape_invariant.linear
+        assert torch.nn.LayerNorm.forward is not layer_norm
+    assert calls == [385]
+    assert torch.equal(actual, expected)
+    assert functional.linear is linear
+    assert torch.nn.LayerNorm.forward is layer_norm
+
+
 def stable_topk(reference):
     return mistral.stable_ties(reference)
 
