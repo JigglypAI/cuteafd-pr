@@ -228,6 +228,17 @@ mod draft_cli_tests {
     use clap::Parser;
 
     #[test]
+    fn embedding_lookup_and_host_admission_use_the_variant_name() {
+        // Pair the real-header naming sweep with a guard on the two runtime consumers.
+        let source = include_str!("mod.rs");
+        let lookup = source.rsplit("fn embed_source(&self)").next().unwrap().split("\n    }").next().unwrap();
+        assert!(lookup.contains("catalog.tensor(self.cfg.embedding())?"));
+        let admission = source.rsplit("let host_embedding = args.token_io.embed_placement").next().unwrap()
+            .split("let mut reserved_weights").next().unwrap();
+        assert!(admission.contains("checkpoint.require_untied_embedding(self.cfg.embedding())?"));
+    }
+
+    #[test]
     fn width_diagnostics_fail_closed_and_detect_live_route_changes() {
         let tap = || engine::WidthTap { layer: 3, x: vec![0; 4], routes: vec![0; 16], delta: vec![0; 4] };
         assert!(validate_width_taps(&[], &[3], 2, 1, 1).is_err());
@@ -838,7 +849,7 @@ impl Opened {
         ensure!(!native || !host_embedding, "the EXLR8 row-FP8 embedding is device-resident (its owner holds the head too)");
         let groups = match (&checkpoint, &native_records) {
             (Some(checkpoint), _) => {
-                if host_embedding { checkpoint.require_untied_embedding("model.embed_tokens.weight")?; }
+                if host_embedding { checkpoint.require_untied_embedding(self.cfg.embedding())?; }
                 cuteafd_loader::plan::layout::glm5::resident_owned(checkpoint, devices.len(), layers, owners.as_deref())?
             }
             (None, Some(records)) => (0..devices.len()).map(|rank| cuteafd_loader::plan::exlr8::dense::resident_native(
@@ -1416,10 +1427,10 @@ impl Opened {
             vocab: record.shape[0], hidden: record.shape[1], snapshot: None, tensor_name: record.tensor.clone() })
     }
 
-    /// The checkpoint's `model.embed_tokens.weight` (BF16 [vocab, hidden]).
+    /// The checkpoint's own embedding tensor (BF16 [vocab, hidden]).
     fn embed_source(&self) -> Result<crate::shared::token_io::EmbedSource> {
         let catalog = &self.catalog;
-        let tensor = catalog.tensor("model.embed_tokens.weight")?;
+        let tensor = catalog.tensor(self.cfg.embedding())?;
         crate::shared::token_io::EmbedSource::new(catalog.snapshot(), &tensor.shard, &tensor.metadata,
             self.cfg.hidden)
     }

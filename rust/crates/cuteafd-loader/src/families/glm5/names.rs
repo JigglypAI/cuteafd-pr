@@ -162,6 +162,58 @@ mod tests {
     }
 
     #[test]
+    fn mistral_large4_coordinator_names_resolve_published_headers() -> anyhow::Result<()> {
+        use Operand::*;
+        let cfg = GlmDsaConfig::from_hf(&crate::families::mistral_large4::config::tests::official())?;
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/ml4-published-native-headers.json"))?;
+        let headers = fixture["headers"].as_object().unwrap();
+        let mut required = std::collections::BTreeSet::from([
+            cfg.embedding().to_owned(), cfg.final_norm().to_owned(), format!("{}.weight", cfg.head()),
+            "lerope.alpha".to_owned()]);
+        for layer in 0..cfg.layers {
+            for op in [InputNorm, PostAttentionNorm, QA, QANorm, QB, KvA, KvANorm, KvB, O,
+                QueryScaleS, QueryScaleB, Router, RouterBias, Gate, Up, Down] {
+                if let Some(name) = cfg.weight(layer, op) { required.insert(name); }
+            }
+            if cfg.indexers[layer] == super::super::GlmIndexer::Full {
+                for op in [IndexQ, IndexK, IndexWeights, IndexQueryScaleS, IndexQueryScaleB] {
+                    if let Some(name) = cfg.weight(layer, op) { required.insert(name); }
+                }
+                for op in [IndexKNorm, IndexQNorm] {
+                    if let Some(stem) = cfg.stem(layer, op) {
+                        required.extend([format!("{stem}.weight"), format!("{stem}.bias")]);
+                    }
+                }
+            }
+        }
+        assert!(required.len() > 1_000, "all 72 coordinator layers must be covered");
+        let mut resolved = std::collections::BTreeSet::new();
+        for name in required {
+            if let Some(header) = headers.get(&name) {
+                resolved.insert(name.clone());
+                if header["dtype"] == "F8_E4M3" {
+                    let scale = format!("{}.qscale_weight", name.strip_suffix(".weight").unwrap());
+                    assert_eq!(headers.get(&scale).map(|h| &h["dtype"]), Some(&serde_json::json!("F32")), "{scale}");
+                    resolved.insert(scale);
+                }
+            } else {
+                let stem = name.strip_suffix(".weight").unwrap_or(&name);
+                for suffix in ["trellis", "suh", "svh", "mcg"] {
+                    let component = format!("{stem}.{suffix}");
+                    assert!(headers.contains_key(&component), "missing coordinator tensor {name}: {component}");
+                    resolved.insert(component);
+                }
+            }
+        }
+        let published = headers.keys().filter(|name| name.starts_with("layers.")
+            || name.starts_with("output.") || matches!(name.as_str(), "norm.weight" | "tok_embeddings.weight" | "lerope.alpha"))
+            .cloned().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(resolved, published, "every published coordinator operand must be exercised");
+        Ok(())
+    }
+
+    #[test]
     fn glm_names_are_unchanged() -> anyhow::Result<()> {
         let mut types: Vec<&str> = vec!["full"; 3];
         types.extend((3..78).map(|layer| if (layer - 2) % 4 == 0 { "full" } else { "shared" }));
