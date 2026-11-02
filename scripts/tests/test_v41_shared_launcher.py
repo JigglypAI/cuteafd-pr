@@ -151,7 +151,7 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         explicit_topology = any(line.startswith(("SPARK_TP=", "SPARK_EP="))
                                 for line in config.read_text().splitlines()) or any(
                                     key in overrides for key in ("SPARK_TP", "SPARK_EP"))
-        for flag in ("--spark-tp", "--spark-ep", "--kv-pool-size", "--memory-reservation"):
+        for flag in ("--spark-tp", "--spark-ep", "--kv-pool-size", "--memory-reservation", "--dspark-draft-limit"):
             if flag in command and (flag not in ("--spark-tp", "--spark-ep") or explicit_topology):
                 additions += [flag, command[command.index(flag) + 1]]
         cache = command[command.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in command else "0"
@@ -183,6 +183,29 @@ def test_scale_preload_cap_reaches_plan_and_native_serve(tmp_root, monkeypatch, 
     for args in [command, *result["plans"]]:
         assert args.count("--mapped-scale-preload-gib") == 1
         assert args[args.index("--mapped-scale-preload-gib") + 1] == cap
+
+
+@pytest.mark.parametrize("limit", [None, "7"])
+def test_dspark_draft_limit_reaches_plan_and_serve(tmp_root, monkeypatch, limit) -> None:
+    import v41_launch_capture as capture_module
+    original = capture_module.example_config
+
+    def with_limit(name, directory):
+        config = original(name, directory)
+        text = "\n".join(line for line in config.read_text().splitlines()
+                         if not line.startswith("DSPARK_DRAFT_LIMIT=")) + "\n"
+        if limit is not None:
+            text += f"DSPARK_DRAFT_LIMIT={limit}\n"
+        config.write_text(text)
+        return config
+
+    monkeypatch.setattr(capture_module, "example_config", with_limit)
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    command = parse_run(result["containers"][0]["argv"])["command"]
+    for args in [command, *result["plans"]]:
+        assert args.count("--dspark-draft-limit") == (limit is not None)
+        resolved = args[args.index("--dspark-draft-limit") + 1] if limit is not None else "5"
+        assert resolved == (limit or "5")
 
 
 def test_goldens_cover_every_v41_example_and_gate_card() -> None:
