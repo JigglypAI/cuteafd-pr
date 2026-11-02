@@ -27,7 +27,7 @@ pub struct CoordinatorContract {
 
 /// Official target norms all receive config.rms_norm_eps, including the
 /// indexer LayerNorm (whose fused kernel's default is not the model value).
-/// Extra MTP enorm/hnorm/shared-head norms remain unqualified and unbound.
+/// MTP enorm/hnorm and each private head norm use the same checkpoint epsilon.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TargetNormEps {
     pub input: f32,

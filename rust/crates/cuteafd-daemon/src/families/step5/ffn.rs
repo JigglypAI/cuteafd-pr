@@ -1,4 +1,4 @@
-//! Admitted post-attention dense FFN. This is not a serving executor.
+//! Admitted post-attention dense FFN owner used by target and MTP serving blocks.
 use super::scratch::{self, Arena, Plane};
 use super::weights::load_operand;
 use crate::shared::memory::device::{Allocation, Device, Stream};

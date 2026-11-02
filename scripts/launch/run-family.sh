@@ -2197,8 +2197,8 @@ fi
 # or a fixed count, which admission must then fit.
 if [[ "$family" == step5 ]]; then
   family_args+=(--kv-cache "$step5_kv_cache")
-  # EXL3 checkpoints onboard whole routed layers on the entry RTX (auto: the
-  # planner's pool-first choice); the official FP8/NVFP4 releases onboard none.
+  # Pool-first EXL3 onboarding uses whole layers on one RTX or TP2 halves on
+  # two. FP8 supports TP2 onboarding; NVFP4 is deprecated. Select auto, all or N.
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
   [[ "$local_layers" == auto || "$local_layers" == all || "$local_layers" =~ ^[0-9]+$ ]] ||
     release_die "Step-5 RTX_EXPERT_LAYERS is auto, all or a fixed routed-layer count, not $local_layers"
