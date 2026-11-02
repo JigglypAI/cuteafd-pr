@@ -291,9 +291,12 @@ impl DeepseekOutputParser {
     /// case JSON validity alone cannot see: a malformed parameter envelope is
     /// skipped into a perfectly valid `{}`), or when the arguments assembled
     /// are not valid JSON.
-    fn close(&mut self, out: &mut Vec<OutputChunk>) {
+    ///
+    /// Returns whether the call was readable and released; `false` when there
+    /// was no open call or the call was lost.
+    fn close(&mut self, out: &mut Vec<OutputChunk>) -> bool {
         if !self.open {
-            return;
+            return false;
         }
         self.flush_skip_run();
         self.flush_param_name();
@@ -324,7 +327,7 @@ impl DeepseekOutputParser {
                 self.pending.clear();
                 self.open_name.clear();
                 self.streamed = false;
-                return;
+                return false;
             }
             // The envelope is not complete yet: the machine still consumes the
             // ` invoke>` tail as skipped bytes, and they belong to the returned
@@ -336,7 +339,7 @@ impl DeepseekOutputParser {
             self.malformed = false;
             self.skip_run.clear();
             self.pending_name = None;
-            return;
+            return false;
         }
         if self.streamed {
             // The deltas were emitted as they arrived; only the count is owed.
@@ -353,6 +356,7 @@ impl DeepseekOutputParser {
         self.pending.clear();
         self.open_name.clear();
         self.streamed = false;
+        true
     }
 
     /// The opened call's bytes, back to the last `<｜DSML｜` in `pending` (which
@@ -539,17 +543,24 @@ impl DeepseekOutputParser {
             }
             OutputAction::ToolCallArgumentsEnd { output } => {
                 let mut closed = Vec::new();
-                if last_pop_action != action.action {
+                let fresh = last_pop_action != action.action;
+                if fresh {
                     if let Some(output) = output {
                         self.held.push(OutputChunk::ToolArgumentsDelta { content: output.to_string() });
-                        if self.streamed {
-                            self.stream_args.delta(output, &mut closed);
-                        }
                     }
                 }
                 // Every `ToolCallArgumentsEnd` closes the call, including the
                 // repeated segments the guard above suppresses from the output.
-                self.close(&mut closed);
+                // The closing bytes are streamed only once the call is known to
+                // be readable: a malformed envelope must not reach the client
+                // as a complete, valid-looking arguments object.
+                let was_streamed = self.streamed;
+                let readable = self.close(&mut closed);
+                if fresh && was_streamed && readable {
+                    if let Some(output) = output {
+                        self.stream_args.delta(output, &mut closed);
+                    }
+                }
                 closed
             }
             OutputAction::Label(label) => {
@@ -1150,5 +1161,22 @@ mod tests {
         let (chunks, calls) = parse_streaming(text, true);
         assert_eq!(calls, 1);
         assert!(!content(&chunks).contains("search"), "the call was streamed, not returned as content");
+    }
+
+    /// A malformed envelope whose skipped parameter still assembles valid JSON
+    /// (`{}`) must not be streamed as a complete, valid-looking call: the
+    /// closing bytes are withheld, so the assembled arguments are invalid and
+    /// the validator rejects them, exactly as the hold path returns the
+    /// envelope as content.
+    #[test]
+    fn a_malformed_envelope_is_not_streamed_as_a_valid_call() {
+        let (chunks, calls) = parse_streaming(MALFORMED_ENVELOPE, true);
+        assert_eq!(calls, 1, "the streamed call is counted so the finish is tool_calls");
+        let arguments = deltas(&chunks);
+        assert!(serde_json::from_str::<serde_json::Value>(&arguments).is_err(),
+            "the streamed arguments must not be valid JSON: {arguments:?}");
+        let (hold, hold_calls) = parse_streaming(MALFORMED_ENVELOPE, false);
+        assert_eq!(hold_calls, 0);
+        assert_eq!(content(&hold), MALFORMED_ENVELOPE);
     }
 }

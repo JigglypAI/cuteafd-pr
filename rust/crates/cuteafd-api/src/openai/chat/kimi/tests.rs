@@ -360,3 +360,132 @@ fn stop_ids_are_loaded_and_the_xtml_contract_is_required() {
     std::fs::write(dir.path().join("tokenizer_config.json"), "{}").unwrap();
     assert!(KimiEncoding::from_snapshot(dir.path()).is_err());
 }
+
+// ------------------------------------------------------- streamed args
+
+mod streamed_args {
+    use super::*;
+
+    /// The assembled arguments of a parse: the `ToolCall` opener's bytes plus
+    /// every `ToolArgumentsDelta`, exactly as a client concatenates them.
+    fn assembled(chunks: &[OutputChunk]) -> String {
+        let mut text = String::new();
+        for chunk in chunks {
+            match chunk {
+                OutputChunk::ToolCall { arguments, .. } => text.push_str(arguments),
+                OutputChunk::ToolArgumentsDelta { content } => text.push_str(content),
+                _ => {}
+            }
+        }
+        text
+    }
+
+    fn lookup() -> deepseek_recipe_core::tools::ToolDefinition {
+        deepseek_recipe_core::tools::ToolDefinition { name: "lookup".into(), description: None,
+            parameters: serde_json::json!({"type": "object"}), strict: None }
+    }
+
+    fn parse_streaming(wire: &str, streaming: bool) -> (Vec<OutputChunk>, usize) {
+        let mut parser = KimiOutputParser::with_stream_args(KimiParserOptions {
+            thinking: false, tools: Some(vec![lookup()]), stop_sequences: Vec::new() }, streaming);
+        let mut chunks = Vec::new();
+        for character in wire.chars() {
+            chunks.extend(parser.push(&character.to_string()));
+        }
+        chunks.extend(parser.finish());
+        (chunks, parser.tool_calls())
+    }
+
+    fn assert_streamed_matches_hold(shape: &str, wire: &str) {
+        let (hold, hold_calls) = parse_streaming(wire, false);
+        let (streamed, streamed_calls) = parse_streaming(wire, true);
+        assert_eq!((hold_calls, streamed_calls), (1, 1), "{shape}");
+        assert_eq!(assembled(&streamed), assembled(&hold), "{shape}: streamed == held, byte for byte");
+        for split in wire.char_indices().map(|(index, _)| index).chain([wire.len()]) {
+            let mut parser = KimiOutputParser::with_stream_args(KimiParserOptions {
+                thinking: false, tools: Some(vec![lookup()]), stop_sequences: Vec::new() }, true);
+            let mut chunks = parser.push(&wire[..split]);
+            chunks.extend(parser.push(&wire[split..]));
+            chunks.extend(parser.finish());
+            assert_eq!(assembled(&chunks), assembled(&hold), "{shape}: split at {split}");
+        }
+    }
+
+    fn call(body: &str) -> String {
+        format!("{}{}{}{}{}{}{}", close("response"), open("tools", &[]),
+            open("call", &[("tool", "lookup".into()), ("index", "1".into())]), body,
+            close("call"), close("tools"), close("message"))
+    }
+
+    fn argument(key: &str, kind: &str, value: &str) -> String {
+        format!("{}{}{}{}", open("argument", &[("key", key.into()), ("type", kind.into())]),
+            value, close("argument"), "")
+    }
+
+    #[test]
+    fn multiple_string_parameters_stream_byte_for_byte() {
+        let wire = call(&format!("{}{}", argument("q", "string", "A & B"), argument("n", "string", "hello")));
+        assert_streamed_matches_hold("two strings", &wire);
+    }
+
+    #[test]
+    fn a_chunk_boundary_inside_the_close_tag_does_not_leak() {
+        let wire = call(&argument("q", "string", "cats"));
+        assert_streamed_matches_hold("split close tag", &wire);
+    }
+
+    #[test]
+    fn object_arguments_stream_byte_for_byte() {
+        let wire = call(&format!("{}{}{}", open("json", &[("type", "object".into())]),
+            "{\"q\": \"A & B\", \"n\": 1}", close("json")));
+        assert_streamed_matches_hold("object", &wire);
+    }
+
+    /// A malformed call that is lost before any argument byte is streamed (a
+    /// call head without an index) comes back as content in both modes, so the
+    /// streamed deltas are empty exactly as the hold path's are.
+    #[test]
+    fn a_malformed_envelope_streams_no_arguments() {
+        let wire = format!("{}{}{}{}{}{}", close("response"), open("tools", &[]),
+            open("call", &[("tool", "lookup".into())]), argument("q", "string", "cats"),
+            close("call"), close("tools"));
+        let (hold, hold_calls) = parse_streaming(&wire, false);
+        let (streamed, streamed_calls) = parse_streaming(&wire, true);
+        assert_eq!((hold_calls, streamed_calls), (0, 0));
+        assert_eq!(assembled(&streamed), assembled(&hold));
+        assert_eq!(assembled(&streamed), "");
+    }
+}
+
+/// A lost call's `</call>` close is matched even when a chunk boundary falls
+/// inside it, so the call after it still parses instead of being swallowed.
+#[test]
+fn a_lost_call_does_not_swallow_the_next_call_when_its_close_is_split() {
+    let malformed = format!("{}{}{}{}",
+        open("call", &[("tool", "lookup".into()), ("index", "1".into())]),
+        open("json", &[("type", "array".into())]), "{}", close("json"));
+    let valid = format!("{}{}{}",
+        open("call", &[("tool", "lookup".into()), ("index", "2".into())]),
+        format!("{}cats{}", open("argument", &[("key", "q".into()), ("type", "string".into())]),
+            close("argument")),
+        close("call"));
+    let wire = format!("{}{}{}{}{}{}", close("response"), open("tools", &[]), malformed,
+        close("call"), valid, close("tools"));
+    let close_at = wire.find(&close("call")).expect("the lost call closes");
+    for split in close_at..close_at + close("call").len() {
+        let (parsed, count) = parse(&[&wire[..split], &wire[split..]], false);
+        assert_eq!(count, 1, "split at {split}");
+        assert_eq!(parsed.calls, vec![json!({"name": "lookup", "arguments": {"q": "cats"}})], "split at {split}");
+    }
+}
+
+/// A malformed call head (an unquoted attribute) is returned as content, never
+/// dropped.
+#[test]
+fn a_malformed_head_is_returned_as_content() {
+    let wire = format!("{}{}{}{}", close("response"), open("tools", &[]),
+        "<|open|>call tool=lookup<|sep|>", close("tools"));
+    let (parsed, count) = parse(&[&wire], false);
+    assert_eq!(count, 0);
+    assert!(parsed.content.contains("call tool=lookup"), "{:?}", parsed.content);
+}

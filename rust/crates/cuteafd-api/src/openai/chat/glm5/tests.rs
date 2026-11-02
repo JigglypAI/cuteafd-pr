@@ -660,18 +660,109 @@ fn a_stray_closing_tag_after_a_declared_name_is_recovered() {
     assert_eq!((projection.content.as_str(), projection.calls), (undeclared.as_str(), vec![]));
 }
 
-/// A repeated key keeps its last value, in the place of its first, so the
-/// arguments stay a JSON object without duplicate keys.
+/// A repeated key keeps its first value, in the place of its first, so the
+/// arguments stay a JSON object without duplicate keys. First-wins is the one
+/// rule both the hold and the streaming path can produce byte for byte: a
+/// streamed value cannot be retracted once it has reached the client.
 #[test]
-fn a_repeated_argument_keeps_its_last_value() {
+fn a_repeated_argument_keeps_its_first_value() {
     let text = concat!("<tool_call>search<arg_key>query</arg_key><arg_value>first</arg_value>",
         "<arg_key>limit</arg_key><arg_value>1</arg_value><arg_key>query</arg_key><arg_value>second</arg_value>",
         "<arg_key>limit</arg_key><arg_value>2</arg_value></tool_call>");
-    let expected = vec![("search".to_owned(), r#"{"query":"second","limit":2}"#.to_owned())];
+    let expected = vec![("search".to_owned(), r#"{"query":"first","limit":1}"#.to_owned())];
     let parser = options(false, Some(tools()));
     let characters: Vec<String> = text.chars().map(String::from).collect();
     assert_eq!(call_texts(&parser, &[text]), expected);
     assert_eq!(call_texts(&parser, &characters.iter().map(String::as_str).collect::<Vec<_>>()), expected);
+}
+
+// ------------------------------------------------------- streamed args
+
+mod streamed_args {
+    use super::*;
+
+    /// The assembled arguments of a parse: the `ToolCall` opener's bytes plus
+    /// every `ToolArgumentsDelta`, exactly as a client concatenates them.
+    fn assembled(chunks: &[OutputChunk]) -> String {
+        let mut text = String::new();
+        for chunk in chunks {
+            match chunk {
+                OutputChunk::ToolCall { arguments, .. } => text.push_str(arguments),
+                OutputChunk::ToolArgumentsDelta { content } => text.push_str(content),
+                _ => {}
+            }
+        }
+        text
+    }
+
+    fn parse_streaming(parser_options: &GlmParserOptions, text: &str, streaming: bool) -> (Vec<OutputChunk>, usize) {
+        let mut parser = GlmOutputParser::with_stream_args(parser_options.clone(), streaming);
+        let mut chunks = Vec::new();
+        for character in text.chars() {
+            chunks.extend(parser.push(&character.to_string()));
+        }
+        chunks.extend(parser.finish());
+        (chunks, parser.tool_calls())
+    }
+
+    /// Every two-way split, including one inside a close tag, must stream the
+    /// same bytes the hold path assembles.
+    fn assert_streamed_matches_hold(shape: &str, text: &str) {
+        let parser_options = options(false, Some(tools()));
+        let (hold, hold_calls) = parse_streaming(&parser_options, text, false);
+        let (streamed, streamed_calls) = parse_streaming(&parser_options, text, true);
+        assert_eq!((hold_calls, streamed_calls), (1, 1), "{shape}");
+        assert_eq!(assembled(&streamed), assembled(&hold), "{shape}: streamed == held, byte for byte");
+        for split in text.char_indices().map(|(index, _)| index).chain([text.len()]) {
+            let mut parser = GlmOutputParser::with_stream_args(parser_options.clone(), true);
+            let mut chunks = parser.push(&text[..split]);
+            chunks.extend(parser.push(&text[split..]));
+            chunks.extend(parser.finish());
+            assert_eq!(assembled(&chunks), assembled(&hold), "{shape}: split at {split}");
+        }
+    }
+
+    #[test]
+    fn multiple_string_parameters_stream_byte_for_byte() {
+        assert_streamed_matches_hold("two strings", concat!("<tool_call>lookup",
+            "<arg_key>city</arg_key><arg_value>Taipei</arg_value>",
+            "<arg_key>units</arg_key><arg_value>metric</arg_value></tool_call>"));
+    }
+
+    #[test]
+    fn a_chunk_boundary_inside_the_close_tag_does_not_leak() {
+        assert_streamed_matches_hold("split close tag", concat!("<tool_call>search",
+            "<arg_key>query</arg_key><arg_value>cats</arg_value></tool_call>"));
+    }
+
+    #[test]
+    fn object_arguments_stream_byte_for_byte() {
+        assert_streamed_matches_hold("object", concat!("<tool_call>search",
+            "<arg_key>filters</arg_key><arg_value>{\"lang\": \"zh\", \"n\": [1, 2.5]}</arg_value></tool_call>"));
+    }
+
+    #[test]
+    fn repeated_keys_stream_byte_for_byte() {
+        assert_streamed_matches_hold("repeated", concat!("<tool_call>search",
+            "<arg_key>query</arg_key><arg_value>first</arg_value>",
+            "<arg_key>limit</arg_key><arg_value>1</arg_value>",
+            "<arg_key>query</arg_key><arg_value>second</arg_value>",
+            "<arg_key>limit</arg_key><arg_value>2</arg_value></tool_call>"));
+    }
+
+    /// A malformed call that is lost before any argument byte is streamed (a
+    /// markup name) comes back as content in both modes, so the streamed
+    /// deltas are empty exactly as the hold path's are.
+    #[test]
+    fn a_malformed_envelope_streams_no_arguments() {
+        let text = "<tool_call>se<arch><arg_key>query</arg_key><arg_value>cats</arg_value></tool_call>";
+        let parser_options = options(false, Some(tools()));
+        let (hold, hold_calls) = parse_streaming(&parser_options, text, false);
+        let (streamed, streamed_calls) = parse_streaming(&parser_options, text, true);
+        assert_eq!((hold_calls, streamed_calls), (0, 0));
+        assert_eq!(assembled(&streamed), assembled(&hold));
+        assert_eq!(assembled(&streamed), "");
+    }
 }
 
 /// Stray text between arguments is dropped; the call and its other arguments

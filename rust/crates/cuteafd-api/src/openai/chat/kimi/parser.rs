@@ -51,6 +51,12 @@ struct Call {
     values: Map<String, Value>,
     /// The call's raw wire text, from its opener (content again if lost).
     text: String,
+    /// The call carries one `<|open|>json` object instead of arguments: it is
+    /// buffered and emitted whole, so the streamed bytes are the same compact
+    /// JSON the hold path sends.
+    object_call: bool,
+    /// The streamed arguments object has been opened with `{`.
+    args_open: bool,
 }
 
 /// The result of reading one `<|open|>tag …<|sep|>` from the front of `pending`.
@@ -274,7 +280,6 @@ impl KimiOutputParser {
                     if self.stream_args.enabled() && name_is_readable(&name, self.options.tools.as_deref()) {
                         self.stream_args.begin(out);
                         self.stream_args.call(&name, out);
-                        self.stream_args.delta("{", out);
                         self.streamed = true;
                     }
                     self.call = Some(Call { name, text: head, ..Call::default() });
@@ -295,10 +300,13 @@ impl KimiOutputParser {
                         }
                         Tag::Ok(attrs, head) => {
                             if attrs != [("type".into(), "object".into())] {
+                                self.call.as_mut().expect("a call is open").text.push_str(&head);
                                 self.mode = Mode::Lost;
                                 return true;
                             }
-                            self.call.as_mut().expect("a call is open").text.push_str(&head);
+                            let call = self.call.as_mut().expect("a call is open");
+                            call.text.push_str(&head);
+                            call.object_call = true;
                             self.mode = Mode::CallJson;
                             true
                         }
@@ -314,10 +322,12 @@ impl KimiOutputParser {
                             let key = attrs.iter().find(|(key, _)| key == "key").map(|(_, value)| value.clone());
                             let kind = attrs.iter().find(|(key, _)| key == "type").map(|(_, value)| value.clone());
                             let (Some(key), Some(kind)) = (key, kind) else {
+                                self.call.as_mut().expect("a call is open").text.push_str(&head);
                                 self.mode = Mode::Lost;
                                 return true;
                             };
                             if attrs.len() != 2 {
+                                self.call.as_mut().expect("a call is open").text.push_str(&head);
                                 self.mode = Mode::Lost;
                                 return true;
                             }
@@ -326,6 +336,10 @@ impl KimiOutputParser {
                             call.key = Some(key.clone());
                             call.kind = kind.clone();
                             call.value.clear();
+                            if self.streamed && !call.args_open {
+                                self.stream_args.delta("{", out);
+                                call.args_open = true;
+                            }
                             if self.streamed && kind == "string" {
                                 let index = call.values.len();
                                 if index > 0 { self.stream_args.delta(",", out); }
@@ -360,7 +374,6 @@ impl KimiOutputParser {
                     let call = self.call.as_mut().expect("a call is open");
                     call.text.push_str(&text);
                     call.value.push_str(&text);
-                    if self.streamed { self.stream_args.delta(&text, out); }
                     return true;
                 };
                 let raw: String = self.pending.drain(..at).collect();
@@ -369,7 +382,6 @@ impl KimiOutputParser {
                 call.text.push_str(&raw);
                 call.text.push_str(&end);
                 call.value.push_str(&raw);
-                if self.streamed { self.stream_args.delta(&raw, out); }
                 let Some(values) = crate::openai::tools::unique_json(&call.value).ok()
                     .and_then(|value| value.as_object().cloned()) else {
                     self.mode = Mode::Lost;
@@ -450,9 +462,18 @@ impl KimiOutputParser {
             Mode::Lost => {
                 let end = close("call");
                 let Some(at) = self.pending.find(&end) else {
-                    let text: String = self.pending.drain(..).collect();
-                    if let Some(call) = self.call.as_mut() { call.text.push_str(&text); }
-                    return !text.is_empty();
+                    // Hold a suffix that may be the start of the close tag, so
+                    // a chunk boundary inside it does not swallow the close.
+                    let emit = self.pending.len() - held_prefix(&self.pending, &end);
+                    if emit == 0 { return false; }
+                    let text: String = self.pending.drain(..emit).collect();
+                    match self.call.as_mut() {
+                        Some(call) => call.text.push_str(&text),
+                        // A malformed head with no call open: its bytes are
+                        // content, never dropped.
+                        None => out.push(OutputChunk::Raw { content: text }),
+                    }
+                    return true;
                 };
                 let rest: String = self.pending.drain(..at + end.len()).collect();
                 let text = match self.call.take() {
@@ -501,8 +522,16 @@ impl KimiOutputParser {
     fn release(&mut self, out: &mut Vec<OutputChunk>) {
         let call = self.call.take().expect("a call is open");
         if self.streamed {
-            // The deltas were emitted as they arrived; only the close is owed.
-            self.stream_args.delta("}", out);
+            if call.object_call {
+                // An object call is buffered: emit the same compact JSON the
+                // hold path sends, never the raw wire bytes.
+                self.stream_args.delta(&Value::Object(call.values).to_string(), out);
+            } else if call.args_open {
+                // The deltas were emitted as they arrived; only the close is owed.
+                self.stream_args.delta("}", out);
+            } else {
+                self.stream_args.delta("{}", out);
+            }
             self.streamed = false;
         } else {
             out.push(OutputChunk::ToolCall {

@@ -19,7 +19,7 @@
 //!   loses its whole call: the argument cannot be named or has no value, and
 //!   the call that would be released with it silently missing is not the one
 //!   the model meant. Stray text between arguments is still dropped, and a
-//!   repeated key keeps its last value, in the place of its first.
+//!   repeated key keeps its first value, in the place of its first.
 //!
 //! Each case is logged. Results are independent of how the text is chunked.
 //!
@@ -86,6 +86,9 @@ struct Call {
     /// The pieces of the argument being read.
     value: Vec<String>,
     string_open: bool,
+    /// The current value repeats a key already read: it is consumed but not
+    /// emitted, so the first value is kept (streaming only).
+    skip_value: bool,
     /// The call's text from its opening tag, content again if the call is lost.
     text: String,
     /// Whitespace held before the opening tag, kept with a lost call's text.
@@ -327,7 +330,9 @@ impl GlmOutputParser {
             self.mode = Mode::Lost("unreadable argument key");
             return true;
         }
-        self.call.as_mut().expect("a call is open").key = Some(key);
+        let call = self.call.as_mut().expect("a call is open");
+        call.key = Some(key);
+        call.skip_value = false;
         self.mode = Mode::ValueStart;
         true
     }
@@ -336,19 +341,23 @@ impl GlmOutputParser {
         self.take_whitespace();
         if self.pending.starts_with(ARG_VALUE) {
             self.take(ARG_VALUE.len());
-            let label = {
+            let (label, duplicate) = {
                 let call = self.call.as_mut().expect("a call is open");
                 let key = call.key.as_deref().expect("a key precedes its value");
+                let duplicate = call.arguments.iter().any(|argument| argument.0 == key);
+                if duplicate {
+                    call.skip_value = true;
+                }
                 if accepts_string(&call.name, key, self.options.tools.as_deref().unwrap_or_default()) {
                     let label = format!("{}:\"", serde_json::to_string(key).expect("string key"));
                     call.value.push(label.clone());
                     call.string_open = true;
-                    Some(label)
+                    (Some(label), duplicate)
                 } else {
-                    None
+                    (None, duplicate)
                 }
             };
-            if let Some(label) = label {
+            if let Some(label) = label.filter(|_| !duplicate) {
                 self.stream_label(&label, out);
             }
             self.mode = Mode::Value;
@@ -363,6 +372,7 @@ impl GlmOutputParser {
 
     fn step_value(&mut self, out: &mut Vec<OutputChunk>) -> bool {
         let string_open = self.call.as_ref().expect("a call is open").string_open;
+        let skip = self.call.as_ref().expect("a call is open").skip_value;
         let Some(end) = self.pending.find(ARG_VALUE_END) else {
             if !string_open { return false; }
             let emit = self.pending.len() - held_prefix(&self.pending, ARG_VALUE_END);
@@ -370,7 +380,7 @@ impl GlmOutputParser {
             let fragment = self.take(emit);
             let escaped = json_string_contents(&fragment);
             self.call.as_mut().expect("a call is open").value.push(escaped.clone());
-            if self.streamed { self.stream_args.delta(&escaped, out); }
+            if self.streamed && !skip { self.stream_args.delta(&escaped, out); }
             return true;
         };
         let raw = self.take(end);
@@ -388,7 +398,7 @@ impl GlmOutputParser {
                 serde_json::to_string(&value).expect("JSON value"))
         };
         call.value.push(last.clone());
-        if self.streamed {
+        if self.streamed && !skip {
             if string_open {
                 // The label and earlier fragments were emitted as they arrived;
                 // this is the last fragment plus the closing quote.
@@ -403,13 +413,11 @@ impl GlmOutputParser {
             }
         }
         let value = std::mem::take(&mut call.value);
-        match call.arguments.iter_mut().find(|argument| argument.0 == key) {
-            Some(argument) => {
-                tracing::warn!(id = %self.options.id, tool = %call.name, key = %key,
-                    "GLM tool call argument repeated; the last value is kept");
-                argument.1 = value;
-            }
-            None => call.arguments.push((key, value)),
+        if skip {
+            tracing::warn!(id = %self.options.id, tool = %call.name, key = %key,
+                "GLM tool call argument repeated; the first value is kept");
+        } else {
+            call.arguments.push((key, value));
         }
         self.mode = Mode::KeyOrEnd;
         true

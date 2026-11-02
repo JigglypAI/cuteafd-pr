@@ -104,6 +104,9 @@ struct Call {
     before: String,
     /// The value's leading newline has been consumed (streaming only).
     value_leading: bool,
+    /// The current value repeats a key already read: it is consumed but not
+    /// emitted, so the first value is kept (streaming only).
+    skip_value: bool,
 }
 
 #[derive(Debug)]
@@ -365,7 +368,10 @@ impl QwenOutputParser {
             self.mode = Mode::Lost("unreadable argument key");
             return true;
         }
-        self.call.as_mut().expect("a call is open").key = Some(key);
+        let call = self.call.as_mut().expect("a call is open");
+        call.key = Some(key);
+        call.value_leading = false;
+        call.skip_value = false;
         self.mode = Mode::Value;
         true
     }
@@ -385,42 +391,58 @@ impl QwenOutputParser {
         if self.streamed && string {
             if self.pending.is_empty() { return false; }
             if !self.call.as_ref().expect("a call is open").value_leading {
-                let index = self.call.as_ref().expect("a call is open").arguments.len();
-                if index > 0 { self.stream_args.delta(",", out); }
-                let label = format!("{}:\"", serde_json::to_string(&key).expect("string key"));
-                self.stream_args.delta(&label, out);
+                // A repeated key keeps its first value: the duplicate is
+                // consumed but never emitted, so the streamed bytes stay a
+                // JSON object without duplicate keys.
+                let duplicate = self.call.as_ref().expect("a call is open")
+                    .arguments.iter().any(|(existing, _)| *existing == key);
+                if duplicate {
+                    self.call.as_mut().expect("a call is open").skip_value = true;
+                } else {
+                    let index = self.call.as_ref().expect("a call is open").arguments.len();
+                    if index > 0 { self.stream_args.delta(",", out); }
+                    let label = format!("{}:\"", serde_json::to_string(&key).expect("string key"));
+                    self.stream_args.delta(&label, out);
+                }
                 if self.pending.starts_with('\n') { self.take(1); }
                 self.call.as_mut().expect("a call is open").value_leading = true;
             }
+            let skip = self.call.as_ref().expect("a call is open").skip_value;
             if let Some(end) = self.pending.find(PARAMETER_END) {
                 let raw: String = self.pending[..end].to_owned();
                 self.take(end + PARAMETER_END.len());
                 let raw = raw.strip_suffix('\n').unwrap_or(&raw);
-                let escaped = json_string_contents(raw);
-                self.stream_args.delta(&escaped, out);
-                self.stream_args.delta("\"", out);
+                if !skip {
+                    let escaped = json_string_contents(raw);
+                    self.stream_args.delta(&escaped, out);
+                    self.stream_args.delta("\"", out);
+                }
                 let text = format!("{}:{}", serde_json::to_string(&key).expect("string key"),
                     serde_json::to_string(&Value::String(raw.to_owned())).expect("JSON value"));
                 let call = self.call.as_mut().expect("a call is open");
-                match call.arguments.iter_mut().find(|(existing, _)| *existing == key) {
-                    Some(argument) => {
-                        tracing::warn!(tool = %call.name, key = %key,
-                            "Qwen tool call argument repeated; the last value is kept");
-                        argument.1 = text;
-                    }
-                    None => call.arguments.push((key, text)),
+                if skip {
+                    tracing::warn!(tool = %call.name, key = %key,
+                        "Qwen tool call argument repeated; the first value is kept");
+                } else {
+                    call.arguments.push((key, text));
                 }
                 self.mode = Mode::Arguments;
                 return true;
             }
-            // Emit all but the last character: it may be the stripped trailing
-            // newline, which is only known at the close.
-            let hold = self.pending.chars().last().map_or(0, |character| character.len_utf8());
+            // Emit all but a suffix that may be the stripped trailing newline
+            // or the start of the close tag: a chunk boundary inside
+            // `</parameter>` must not leak the tag prefix into the value, and a
+            // trailing newline must wait for the close that decides whether it
+            // is stripped.
+            let hold = held_prefix(&self.pending, PARAMETER_END)
+                .max(held_prefix(&self.pending, "\n</parameter>"));
             let emit = self.pending.len() - hold;
             if emit == 0 { return false; }
             let fragment = self.take(emit);
-            let escaped = json_string_contents(&fragment);
-            self.stream_args.delta(&escaped, out);
+            if !skip {
+                let escaped = json_string_contents(&fragment);
+                self.stream_args.delta(&escaped, out);
+            }
             return true;
         }
         let Some(end) = self.pending.find(PARAMETER_END) else { return false; };
@@ -431,19 +453,19 @@ impl QwenOutputParser {
         let value = if string { Value::String(raw.to_owned()) } else { typed_value(raw) };
         let text = format!("{}:{}", serde_json::to_string(&key).expect("string key"),
             serde_json::to_string(&value).expect("JSON value"));
-        if self.streamed {
+        let duplicate = self.call.as_ref().expect("a call is open")
+            .arguments.iter().any(|(existing, _)| *existing == key);
+        if self.streamed && !duplicate {
             let index = self.call.as_ref().expect("a call is open").arguments.len();
             if index > 0 { self.stream_args.delta(",", out); }
             self.stream_args.delta(&text, out);
         }
         let call = self.call.as_mut().expect("a call is open");
-        match call.arguments.iter_mut().find(|(existing, _)| *existing == key) {
-            Some(argument) => {
-                tracing::warn!(tool = %call.name, key = %key,
-                    "Qwen tool call argument repeated; the last value is kept");
-                argument.1 = text;
-            }
-            None => call.arguments.push((key, text)),
+        if duplicate {
+            tracing::warn!(tool = %call.name, key = %key,
+                "Qwen tool call argument repeated; the first value is kept");
+        } else {
+            call.arguments.push((key, text));
         }
         self.mode = Mode::Arguments;
         true

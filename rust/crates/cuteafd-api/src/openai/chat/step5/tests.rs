@@ -92,6 +92,95 @@ fn native_xml_parser_preserves_reasoning_and_structured_arguments_at_every_split
     }
 }
 
+// ------------------------------------------------------- streamed args
+
+mod streamed_args {
+    use super::*;
+
+    fn inspect() -> ToolDefinition {
+        ToolDefinition { name: "inspect".into(), description: None, strict: None,
+            parameters: json!({"type": "object", "properties": {"name": {"type": "string"},
+                "items": {"type": "array"}, "detail": {"type": "object"}}}) }
+    }
+
+    /// The assembled arguments of a parse: the `ToolCall` opener's bytes plus
+    /// every `ToolArgumentsDelta`, exactly as a client concatenates them.
+    fn assembled(chunks: &[OutputChunk]) -> String {
+        let mut text = String::new();
+        for chunk in chunks {
+            match chunk {
+                OutputChunk::ToolCall { arguments, .. } => text.push_str(arguments),
+                OutputChunk::ToolArgumentsDelta { content } => text.push_str(content),
+                _ => {}
+            }
+        }
+        text
+    }
+
+    fn parse_streaming(text: &str, streaming: bool) -> (Vec<OutputChunk>, usize) {
+        let mut parser = Step5OutputParser::with_stream_args(Step5ParserOptions {
+            tools: Some(vec![inspect()]), stop_sequences: Vec::new() }, streaming);
+        let mut chunks = Vec::new();
+        for character in text.chars() {
+            chunks.extend(parser.push(&character.to_string()));
+        }
+        chunks.extend(parser.finish());
+        (chunks, parser.tool_calls())
+    }
+
+    fn assert_streamed_matches_hold(shape: &str, text: &str) {
+        let (hold, hold_calls) = parse_streaming(text, false);
+        let (streamed, streamed_calls) = parse_streaming(text, true);
+        assert_eq!((hold_calls, streamed_calls), (1, 1), "{shape}");
+        assert_eq!(assembled(&streamed), assembled(&hold), "{shape}: streamed == held, byte for byte");
+        for split in text.char_indices().map(|(index, _)| index).chain([text.len()]) {
+            let mut parser = Step5OutputParser::with_stream_args(Step5ParserOptions {
+                tools: Some(vec![inspect()]), stop_sequences: Vec::new() }, true);
+            let mut chunks = parser.push(&text[..split]);
+            chunks.extend(parser.push(&text[split..]));
+            chunks.extend(parser.finish());
+            assert_eq!(assembled(&chunks), assembled(&hold), "{shape}: split at {split}");
+        }
+    }
+
+    #[test]
+    fn multiple_string_parameters_stream_byte_for_byte() {
+        assert_streamed_matches_hold("two strings", concat!("</think><tool_call>\n<function=inspect>\n",
+            "<parameter=name>\ncats\n</parameter>\n<parameter=items>\n[1, 2]\n</parameter>\n",
+            "</function>\n</tool_call>"));
+    }
+
+    #[test]
+    fn a_chunk_boundary_inside_the_close_tag_does_not_leak() {
+        assert_streamed_matches_hold("split close tag", concat!("</think><tool_call>\n<function=inspect>\n",
+            "<parameter=name>\ncats\n</parameter>\n</function>\n</tool_call>"));
+    }
+
+    #[test]
+    fn object_arguments_stream_byte_for_byte() {
+        assert_streamed_matches_hold("object", concat!("</think><tool_call>\n<function=inspect>\n",
+            "<parameter=detail>\n{\"a\": 1, \"b\": [2, 3]}\n</parameter>\n</function>\n</tool_call>"));
+    }
+
+    #[test]
+    fn repeated_keys_stream_byte_for_byte() {
+        assert_streamed_matches_hold("repeated", concat!("</think><tool_call>\n<function=inspect>\n",
+            "<parameter=name>\nfirst\n</parameter>\n<parameter=items>\n[1]\n</parameter>\n",
+            "<parameter=name>\nsecond\n</parameter>\n<parameter=items>\n[2]\n</parameter>\n",
+            "</function>\n</tool_call>"));
+    }
+
+    #[test]
+    fn a_malformed_envelope_streams_no_arguments() {
+        let text = "</think><tool_call>\n<function=in<spect>\n<parameter=name>\ncats\n</parameter>\n</function>\n</tool_call>";
+        let (hold, hold_calls) = parse_streaming(text, false);
+        let (streamed, streamed_calls) = parse_streaming(text, true);
+        assert_eq!((hold_calls, streamed_calls), (0, 0));
+        assert_eq!(assembled(&streamed), assembled(&hold));
+        assert_eq!(assembled(&streamed), "");
+    }
+}
+
 #[test]
 fn step5_has_own_turn_stops() {
     let mut parser = Step5OutputParser::new(Step5ParserOptions::default());
