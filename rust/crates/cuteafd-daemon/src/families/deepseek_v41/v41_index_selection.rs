@@ -226,12 +226,12 @@ impl<'a> IndexSelectionWave<'a> {
         Ok(Self::sizes(capacity)?.iter().sum())
     }
     pub fn storage_bytes(rows: usize, unit: usize) -> Result<usize> {
-        ensure!(unit > 0 && unit <= rows, "index selection unit outside reserve");
-        Ok(Self::device_bytes(unit)? + (rows - unit) * (2048 + 8192))
+        Ok(cuteafd_loader::placement::families::deepseek_v41::owners::index_selection_storage_bytes(
+            rows as u64, unit as u64)?[0] as usize)
     }
     pub fn follower_storage_bytes(rows: usize, unit: usize) -> Result<usize> {
-        ensure!(unit > 0 && unit <= rows, "index selection unit outside reserve");
-        Ok(Self::shared_device_bytes(unit)? + (rows - unit) * 2048)
+        Ok(cuteafd_loader::placement::families::deepseek_v41::owners::index_selection_storage_bytes(
+            rows as u64, unit as u64)?[1] as usize)
     }
     pub fn storage(library: &'a NativeLibrary, rows: usize, unit: usize, readers: &[i32]) -> Result<Rc<IndexSelectionStorage<'a>>> {
         Self::storage_bytes(rows, unit)?;
@@ -1008,6 +1008,24 @@ mod graph_tests {
         assert!(IndexSelectionWave::storage_bytes(16, 0).is_err());
         assert!(IndexSelectionWave::storage_bytes(16, 17).is_err());
         assert!(IndexSelectionWave::storage_bytes(8256, 4097).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn planner_selection_bytes_match_runtime_allocations() -> Result<()> {
+        use cuteafd_loader::placement::families::deepseek_v41::owners::index_selection_storage_bytes;
+        for (rows, unit) in [(1, 1), (80, 80), (6144, 2048), (8192, 2048), (8256, 2752), (8256, 4096)] {
+            let planned = index_selection_storage_bytes(rows as u64, unit as u64)?;
+            // Independently sum the actual allocation sizes, including FFI top-k
+            // workspaces; do not just compare two calls of the shared formula.
+            let mut source = IndexSelectionWave::sizes(unit)?;
+            source[9] = rows * 2048;
+            source[12] = rows * 8192;
+            assert_eq!(planned[0] as usize, source.into_iter().sum::<usize>());
+            assert_eq!(planned[1] as usize, rows * 2048 + unit * 8192);
+            assert_eq!(planned[0] as usize, IndexSelectionWave::storage_bytes(rows, unit)?);
+            assert_eq!(planned[1] as usize, IndexSelectionWave::follower_storage_bytes(rows, unit)?);
+        }
         Ok(())
     }
 
