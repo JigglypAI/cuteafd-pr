@@ -160,7 +160,8 @@ impl<'a> DenseEngine<'a> {
         let device_info = library.cuda_device_info(device.id)?;
         ensure!(device_info.integrated == 0 && device_info.compute_capability_major == 12 && device_info.compute_capability_minor == 0,
             "dense target requires a discrete SM120 device");
-        ensure!(cuteafd_ffi::memory_ledger::current_bytes(cuteafd_ffi::memory_ledger::Space::Managed, device.id) == 0,
+        ensure!(!cuteafd_ffi::memory_ledger::allocations().iter().any(|owner|
+            owner.key.space == cuteafd_ffi::memory_ledger::Space::Managed && owner.key.device == device.id),
             "dense physical baseline cannot omit pre-existing managed owners");
         let host = cuteafd_ffi::host_memory()?;
         let record_bytes = kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
