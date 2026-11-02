@@ -122,6 +122,35 @@ impl FromStr for LocalLayers {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("coordinator host memory cannot admit host cache {cache} plus deferred consumers {deferred} and reserve {reserve}: available {available}, total {total}, resident {resident}, shortfall {shortfall} bytes")]
+pub(crate) struct HostCapacityError {
+    pub cache: u64,
+    pub deferred: u64,
+    pub reserve: u64,
+    pub available: u64,
+    pub total: u64,
+    pub resident: u64,
+    pub shortfall: u64,
+}
+
+/// The reusable store frees its old allocation before growing. The host sample
+/// already excludes that resident owner, so admit only the additional bytes.
+pub(crate) fn reserve_sync_h2d(library: &cuteafd_ffi::NativeLibrary, required: usize)
+    -> Result<cuteafd_ffi::CuteafdHostBuffer> {
+    reserve_sync_h2d_with(library.sync_h2d_staging_buffer()?.bytes, required,
+        |growth| admit_host_memory(0, &[("staging/sync-h2d-growth", growth)], 0, 0).map(|_| ()),
+        |bytes| library.reserve_sync_h2d_staging(bytes))
+}
+
+fn reserve_sync_h2d_with<T>(existing: usize, required: usize,
+    admit: impl FnOnce(u64) -> Result<()>, allocate: impl FnOnce(usize) -> Result<T>) -> Result<T> {
+    let bytes = existing.max(required);
+    let growth = u64::try_from(bytes - existing)?;
+    if growth > 0 { admit(growth)?; }
+    allocate(bytes)
+}
+
 /// Admit the complete future host working set once, before any allocation.
 /// Families supply table byte formulas summed across every local GPU, together
 /// with the full prefix-cache quota (zero when disabled) and deferred logits.
@@ -183,10 +212,11 @@ fn host_admission((total, available): (u64, u64),
         .with_lifetime(ItemLifetime::PostReadyReserve));
     let ledger = HostLayout::new(total, available, headroom.max(total / 10), cache, resident)
         .context("host admission byte count overflow")?;
-    ensure!(ledger.shortfall_bytes == 0,
-        "coordinator host memory cannot admit host cache {} plus deferred consumers {} and reserve {}: available {}, total {}, resident {}, shortfall {} bytes",
-        cache, ledger.deferred_bytes, ledger.reserve_bytes, available, total,
-        ledger.resident_bytes, ledger.shortfall_bytes);
+    if ledger.shortfall_bytes > 0 {
+        return Err(HostCapacityError { cache, deferred: ledger.deferred_bytes,
+            reserve: ledger.reserve_bytes, available, total, resident: ledger.resident_bytes,
+            shortfall: ledger.shortfall_bytes }.into());
+    }
     Ok(ledger)
 }
 
@@ -263,6 +293,38 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    fn sync_store_growth_admits_startup_peak_once_and_refuses_before_allocation() -> Result<()> {
+        use std::cell::Cell;
+        let allocations = Cell::new(0);
+        for (existing, required, growth) in [(200usize, 500usize, 300u64), (500, 200, 0), (500, 500, 0)] {
+            let admissions = Cell::new(0);
+            let bytes = reserve_sync_h2d_with(existing, required, |actual| {
+                admissions.set(admissions.get() + 1);
+                assert_eq!(actual, growth);
+                let resident = vec![Item::new(Category::Staging, "staging/sync-h2d", "pinned",
+                    existing as u64, Basis::Exact)];
+                let ledger = host_admission((1000, 100 + growth), resident, 0,
+                    &[("staging/sync-h2d-growth", actual)], 0, 0)?;
+                assert_eq!((ledger.resident_bytes, ledger.deferred_bytes), (existing as u64, growth));
+                assert_eq!(ledger.resident_bytes + ledger.deferred_bytes, required.max(existing) as u64);
+                Ok(())
+            }, |bytes| { allocations.set(allocations.get() + 1); Ok(bytes) })?;
+            assert_eq!(bytes, existing.max(required));
+            assert_eq!(admissions.get(), usize::from(growth > 0));
+        }
+        let before = allocations.get();
+        let error = reserve_sync_h2d_with(200, 500, |growth| {
+            host_admission((1000, 399), vec![Item::new(Category::Staging,
+                "staging/sync-h2d", "pinned", 200, Basis::Exact)], 0,
+                &[("staging/sync-h2d-growth", growth)], 0, 0).map(|_| ())
+        }, |_| { allocations.set(allocations.get() + 1); Ok(()) }).unwrap_err();
+        let capacity = error.downcast_ref::<HostCapacityError>().expect("typed host capacity refusal");
+        assert_eq!((capacity.deferred, capacity.resident, capacity.shortfall), (300, 200, 1));
+        assert_eq!(allocations.get(), before);
+        Ok(())
+    }
+
     #[test]
     fn named_pinned_tables_are_admitted_without_a_prefix_cache() -> Result<()> {
         let memory = (1000, 800);

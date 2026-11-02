@@ -1240,8 +1240,7 @@ impl<'a> DflashDrafter<'a> {
                 "MLA draft program differs from admitted scratch/context");
             Ok(program)
         }).collect::<Result<Vec<_>>>()?;
-        let sync_bytes = layout.sync_upload_bytes().max(library.sync_h2d_staging_buffer()?.bytes);
-        library.reserve_sync_h2d_staging(sync_bytes)?;
+        crate::shared::memory::budget::reserve_sync_h2d(library, layout.sync_upload_bytes())?;
         let mut owners = MlaDraftStorage::allocate(library, layout.clone())?.into_owners()?;
         let allocation = |id: &str, bytes, matrix| -> Result<Dev<'a>> {
             let packing = matrix && representation == GlmDraftRepresentation::Fp8Only;
