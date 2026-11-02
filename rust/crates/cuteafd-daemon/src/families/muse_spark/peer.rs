@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn channel_slots_sized_by_their_payload() -> Result<()> {
-        let (core, half) = (2752 * 8192 * 2, 2752 * 4096);
+        let (core, half) = (2752 * 8192 * 4, 2752 * 4096);
         let sizes = slot_sizes(8192, 4096, 8, 2752, false)?;
         assert_eq!(sizes, [core, core, half, 16, half, core, core]);
         crate::shared::peer_split::validate_slot_sizes([0, 1], &sizes)?;

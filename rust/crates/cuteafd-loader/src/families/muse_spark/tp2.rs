@@ -11,12 +11,12 @@
 //!
 //! | channel | when | direction | payload per row |
 //! |---|---|---|---|
-//! | `Attention` | every layer | swap | o_proj BF16 core, H |
+//! | `Attention` | every layer | swap | o_proj F32 core, H |
 //! | `ExpertInput` | Spark layer | GPU 1 to GPU 0 | pre_expert half, E/2 |
 //! | `ExpertInput` | onboarded layer | swap | pre_expert half, E/2 (both need all of E) |
 //! | `Partials` | onboarded layer | swap | expert partials, top-k x E |
 //! | `Combined` | Spark layer | GPU 0 to GPU 1 | combined half, E/2 (GPU 0 holds the link and combines) |
-//! | `Moe` | every layer | swap | post_expert_proj BF16 core, H |
+//! | `Moe` | every layer | swap | post_expert_proj F32 core, H |
 //!
 //! The token embedding lives on GPU 0 only (single residency); GPU 1 gathers its
 //! step's rows from it over peer access, so no exchange channel carries them (a
@@ -45,7 +45,7 @@ impl Channel {
     /// The widest payload of one row on this channel.
     pub fn row_bytes(self, hidden: usize, expert: usize, topk: usize) -> usize {
         match self {
-            Channel::Attention | Channel::Moe => hidden * 2,
+            Channel::Attention | Channel::Moe => hidden * 4,
             Channel::ExpertInput | Channel::Combined => expert,
             Channel::Partials => topk * expert * 2,
         }
@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn slots_hold_each_channels_widest_payload() -> Result<()> {
-        assert_eq!(slot_bytes(Channel::Attention, 8192, 4096, 8, 2752)?, 2752 * 8192 * 2);
+        assert_eq!(slot_bytes(Channel::Attention, 8192, 4096, 8, 2752)?, 2752 * 8192 * 4);
         assert_eq!(slot_bytes(Channel::Combined, 8192, 4096, 8, 2752)?, 2752 * 4096);
         assert_eq!(slot_bytes(Channel::Partials, 8192, 4096, 8, 2752)?, 2752 * 8 * 4096 * 2);
         assert!(slot_bytes(Channel::Moe, 8192, 4096, 8, 0).is_err());

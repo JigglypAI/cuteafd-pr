@@ -4,7 +4,7 @@
 //! `block::forward_layer` on the rank's lane stream.
 //!
 //! Head-split TP2: attention runs on this rank's heads; o_proj's F32 core is
-//! narrowed to BF16 (`o_core`), exchanged with the peer ([`PeerExchange`]),
+//! retained as F32 (`o_core`), exchanged with the peer ([`PeerExchange`]),
 //! and the two cores are added in rank order in F32 (`o_reduced`) before the
 //! one egress (the shared K-split rule); everything else is whole on each
 //! rank. The routed experts go through [`SparkExperts`] on rank 0 (the Spark
@@ -38,8 +38,7 @@ pub(crate) trait PeerExchange {
 
 /// The shared TP2 helpers a rank's o_proj reduction launches.
 pub(crate) struct Tp2Ops<'a> {
-    pub add: cuteafd_ffi::Bf16F32Add<'a>,
-    pub narrow: cuteafd_ffi::F32Bf16Narrow<'a>,
+    pub add: cuteafd_ffi::F32Add<'a>,
 }
 
 /// A rank's view of one layer's KV storage.
@@ -248,17 +247,17 @@ impl RankDevice<'_, '_> {
         unsafe { self.programs.launch("residual_gate", &[residual, x, alpha, beta, out], &[rows_i32(rows)?], self.stream) }
     }
 
-    /// The shared K-split rule on a TP2 pair: this rank's F32 core narrowed to
-    /// BF16 (`o_core`), swapped with the peer's on `channel`, both widened and
+    /// The K-split rule on a TP2 pair: this rank's F32 core retained in
+    /// `o_core`, swapped with the peer's on `channel`, both retained and
     /// added in rank order in F32 (`o_reduced`), then the one egress into
     /// `output`. Identical bits on both ranks.
     fn k_split(&self, channel: Channel, rows: usize, input: Buffer, core: &crate::shared::dense_trellis::CoreWeights<'_>,
         output: Buffer, peer: &mut dyn PeerExchange) -> Result<()> {
-        let ops = self.tp2.context("Muse TP2 needs the shared add/narrow helpers")?;
+        let ops = self.tp2.context("Muse TP2 needs the shared F32 add helper")?;
         let accumulator = self.core.core(rows, input, core, self.stream)?;
         let local = self.lane.rows("o_core", rows)?;
-        crate::shared::dense_trellis::retain_partial(&ops.narrow, accumulator, local, rows * self.cfg.hidden,
-            self.stream)?;
+        let row_bytes = self.cfg.hidden * 4;
+        self.copy_rows(local, row_bytes, accumulator, row_bytes, row_bytes, rows)?;
         let received = peer.swap(channel, local)?;
         let (rank0, rank1) = if self.rank == 0 { (local, received) } else { (received, local) };
         self.core.reduced(&ops.add, rows, rank0, rank1, self.lane.rows("o_reduced", rows)?, core, output, self.stream)
@@ -608,7 +607,7 @@ mod tests {
                 assert!(row(plane) >= needed, "rank layout {ranks}: plane {plane} {} < {needed}", row(plane));
             }
             if ranks == 2 {
-                for (plane, needed) in [("o_core", h * 2), ("o_reduced", h * 4), ("expert_half", e)] {
+                for (plane, needed) in [("o_core", h * 4), ("o_reduced", h * 4), ("expert_half", e)] {
                     assert!(row(plane) >= needed, "TP2 plane {plane} {} < {needed}", row(plane));
                 }
             }

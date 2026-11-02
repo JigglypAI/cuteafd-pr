@@ -102,15 +102,15 @@ impl<'a> CorePrograms<'a> {
     /// The F32 core result before a K-split projection's peer reduction.
     pub(crate) fn core(&self, rows: usize, input: Buffer, weights: &CoreWeights<'_>, stream: *mut c_void)
         -> Result<Buffer> {
-        self.projection(weights, ProjectionOutput::F32)?.core(rows, input, weights, self.scratch()?, stream)
+        self.projection(weights, ProjectionOutput::Bf16)?.core(rows, input, weights, self.scratch()?, stream)
     }
 
-    /// The K-split egress (shared rule): `rank0 + rank1` BF16 cores widened and
-    /// added in rank order in F32 (`reduced`), then the one H128/svh egress.
+    /// The K-split egress (shared rule): `rank0 + rank1` F32 cores
+    /// added in rank order (`reduced`), then the one H128/svh egress.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn reduced(&self, add: &cuteafd_ffi::Bf16F32Add<'_>, rows: usize, rank0: Buffer, rank1: Buffer,
+    pub(crate) fn reduced(&self, add: &cuteafd_ffi::F32Add<'_>, rows: usize, rank0: Buffer, rank1: Buffer,
         reduced: Buffer, weights: &CoreWeights<'_>, output: Buffer, stream: *mut c_void) -> Result<()> {
-        self.projection(weights, ProjectionOutput::F32)?.reduced(add, rows, rank0, rank1, reduced, weights, output, stream)
+        self.projection(weights, ProjectionOutput::Bf16)?.reduced_f32(add, rows, rank0, rank1, reduced, weights, output, stream)
     }
 
     pub(crate) fn program_count(&self) -> usize { self.projections.len() }
@@ -119,6 +119,46 @@ impl<'a> CorePrograms<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tp2_plan_preserves_f32_partials_and_uses_bf16_body_egress() -> Result<()> {
+        use cuteafd_ffi::dense_trellis::{validate_output_buffers, DenseTrellisError};
+        use cuteafd_loader::families::muse_spark::{core::CoreInventory, lane::LanePlanes, tp2::{slot_bytes, Channel},
+            weight_layout::projections, MuseSparkConfig};
+        let snapshot = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_muse_spark_snapshot(snapshot.path(), &[]);
+        let checkpoint = cuteafd_loader::plan::Checkpoint::inventory(snapshot.path())?;
+        let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
+        let inventory = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        let admitted = projections(&cfg, &inventory, 2, 2752)?;
+        let planes = LanePlanes::new(&cfg, 2, 2752)?;
+        for (rank, programs) in admitted.iter().enumerate() {
+            let base = Buffer { ptr: (0x1000_0000usize + rank * 0x1_0000_0000) as *mut c_void,
+                bytes: planes.bytes()?, device_id: rank as i32, flags: 0 };
+            let lane = super::super::lane::LaneViews::carve(&planes, base)?;
+            for rows in [1, 8, 16, 64, 129, 130, 2752] {
+                let reduced = lane.rows("o_reduced", rows)?;
+                let svh = Buffer { ptr: 0x10_0000_0000usize as *mut c_void, bytes: cfg.hidden * 2, ..base };
+                for (k, channel, plane) in [(4096, Channel::Attention, "attended"), (2048, Channel::Moe, "moe")] {
+                    assert!(programs.programs.contains_key(&((k, cfg.hidden, 2, "mcg"), ProjectionOutput::Bf16)));
+                    assert_eq!(lane.rows("o_core", rows)?.bytes, rows * cfg.hidden * 4);
+                    assert_eq!(slot_bytes(channel, cfg.hidden, cfg.expert_hidden, cfg.topk, rows)?, rows * cfg.hidden * 4);
+                    let output = lane.rows(plane, rows)?;
+                    // Reproduce the original rejected operand using the real TP2 lane layout.
+                    let error = validate_output_buffers(rows, cfg.hidden, TrellisDType::F32, reduced, svh, output).unwrap_err();
+                    assert!(matches!(error, DenseTrellisError::Buffer { stage: "output", operand: "output",
+                        reason: "short extent", actual, required, device, .. }
+                        if actual == rows * cfg.hidden * 2 && required == rows * cfg.hidden * 4 && device == rank as i32));
+                    validate_output_buffers(rows, cfg.hidden, TrellisDType::Bf16, reduced, svh, output)?;
+                }
+            }
+        }
+        let device = include_str!("device.rs").split("#[cfg(test)]").next().unwrap();
+        let split = device.split("fn k_split(").nth(1).unwrap().split("fn copy_rows(").next().unwrap();
+        assert!(split.contains("self.copy_rows(local") && split.contains("self.core.reduced("));
+        assert!(!split.contains("retain_partial") && !split.contains("narrow"));
+        Ok(())
+    }
 
     #[test]
     fn f32_head_chunks_cover_target_and_drafter_rows_without_reusing_output() -> Result<()> {
