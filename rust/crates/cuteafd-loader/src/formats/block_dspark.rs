@@ -13,6 +13,8 @@ pub const fn supports_sequences(sequences: usize) -> bool {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DsparkConfigError {
+    #[error(transparent)]
+    Topk(#[from] super::dflash::DflashTopkVocabError),
     #[error("reading dSpark config: {0}")]
     Io(#[from] std::io::Error),
     #[error("parsing dSpark config: {0}")]

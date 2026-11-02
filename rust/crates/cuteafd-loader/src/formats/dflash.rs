@@ -6,6 +6,17 @@ use std::path::Path;
 
 type Result<T> = std::result::Result<T, DsparkConfigError>;
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("DFlash2 top-k vocabulary {vocab} outside native int32 range 16..=2147483647")]
+pub struct DflashTopkVocabError { pub vocab: u64 }
+
+/// The shared CUDA selector emits 16 distinct int32 token indices. Chunk
+/// coverage is unbounded; only the output count and signed-index ABI remain.
+pub fn validate_topk_vocab(vocab: u64) -> std::result::Result<(), DflashTopkVocabError> {
+    if !(16..=i32::MAX as u64).contains(&vocab) { return Err(DflashTopkVocabError { vocab }); }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MlaDflashConfig {
     pub mla: MlaGeometry,
@@ -684,6 +695,7 @@ impl MlaDflashConfig {
 
     pub fn from_json(value: &serde_json::Value) -> Result<Self> {
         let raw: Raw = serde_json::from_value(value.clone())?;
+        validate_topk_vocab(raw.vocab_size as u64)?;
         let d = raw.dflash_config;
         if !raw.architectures.iter().any(|a| a == "DFlash2DraftModel")
             || d.attention_mode != "mla" || raw.is_causal || raw.mla_use_output_gate
@@ -882,6 +894,7 @@ impl MlaDflashConfig {
         use crate::families::glm5::draft_representation::{draft_fp8_scratch_bytes,
             GlmDraftCapacity, GlmDraftFp8ScratchLayout, GlmDraftLinearShape, GlmDraftRepresentation};
         use cuteafd_core::coordinator_programs::MlaDraftProgramLayout;
+        validate_topk_vocab(self.vocab as u64)?;
         let invalid = || unsupported("MLA draft runtime geometry/capacity outside native limits");
         if self.is_ml4() {
             return self.ml4_runtime_layout(capacity, compiled_context, target_pool_tokens, sm_count, cache_format);
@@ -1200,6 +1213,16 @@ impl MlaDflashConfig {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn topk_vocab_checks_only_native_index_and_output_limits() {
+        for vocab in [154880, 163840, 196608, 196609, 202048, 248320, i32::MAX as u64] {
+            assert_eq!(validate_topk_vocab(vocab), Ok(()));
+        }
+        for vocab in [0, 15, i32::MAX as u64 + 1, u64::MAX] {
+            assert_eq!(validate_topk_vocab(vocab), Err(DflashTopkVocabError { vocab }));
+        }
+    }
 
     fn config() -> serde_json::Value {
         json!({"architectures":["DFlash2DraftModel"], "hidden_size":7168,
