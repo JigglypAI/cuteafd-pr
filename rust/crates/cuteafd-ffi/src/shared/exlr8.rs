@@ -920,10 +920,13 @@ mod tests {
                 ("intermediate".into(), g * u * 16 * 128 * 2),
                 ("fc2".into(), g * 16 * h * 4),
             ]);
-            assert!(
-                validate(&s).unwrap_err().to_string().contains("int32"),
-                "{key}"
-            );
+            let refusal = if key == "max_groups" {
+                "task or route indexing exceeds signed int32"
+            } else {
+                "compute geometry or SwiGLU clamp disagrees with compiled family"
+            };
+            assert_eq!(validate(&s).unwrap_err().to_string(),
+                format!("invalid EXLR8 program manifest: {refusal}"), "{key}");
         }
     }
     #[test]
