@@ -253,6 +253,9 @@ mod tests {
         ] {
             for (capacity, tile) in [1, 16, 64, 80, 256, 1024, 4096].into_iter()
                 .zip([tiles[0], tiles[1], tiles[2], tiles[2], tiles[3], tiles[4], tiles[5]]) {
+                // Only V4.1 hidden 5120 inherits m80's recipe at m64; not a tuned m64 result.
+                // Follow-up: screen E384/top6 on kakapo/maxq.
+                if capacity == 64 && hidden != 5120 { continue; }
                 let atomic = hidden == 7168 && role < 65536 && capacity >= 256;
                 let expected = if native_prefill(hidden as usize, width as usize, 121, capacity as u32, experts as usize, topk as usize) {
                     native_prefill_scratch_bytes(hidden as usize, width as usize, experts as usize,

@@ -45,7 +45,8 @@ def test_native_manifest_decode_contract_matches_shared_planner_recipe():
                                       "capacities": capacities, "family": family, "role": role})
             assert actual == list(decode)
             assert decode[-1] == (64 if family == "v41" and role not in ("coordinator", "dspark_tp2") else 80)
-    # m64 keeps m80's measured arithmetic, including the TP6 split-K recipe.
+    # V4.1 hidden 5120 inherits m80's tile/split recipe at m64 (not measured/tuned).
+    # Follow-up: screen E384/top6 on kakapo/maxq.
     for row in recipe.layouts()["native_slices"]:
         if row["hidden"] == 5120 and 80 in row["capacities"]:
             assert recipe.native_slice_width(5120, row["width"], row["sm"], 64, 192) == recipe.native_slice_width(5120, row["width"], row["sm"], 80, 192)
