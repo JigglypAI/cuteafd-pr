@@ -225,6 +225,16 @@ def test_shared_scope_knob_keeps_k6_default_and_native_family_fallback():
             scope(families, "glm")
 
 
+def test_native_dense_scope_preserves_existing_table_metadata():
+    path = ROOT / "python/tools/aot/export_b12x_dsv4_aot.py"
+    tree = ast.parse(path.read_text())
+    branch = next(node for node in ast.walk(tree)
+                  if isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+                  and ast.unparse(node.test) == "name == 'exlr8_dense'")
+    assignment = next(node for node in branch.body if isinstance(node, ast.Assign))
+    assert ast.literal_eval(assignment.value) == {"abi_version": 1}
+
+
 def test_native_host_admission_uses_shared_working_set_budget():
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/shared/experts/exlr8/shared.rs").read_text()
     family = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/mod.rs").read_text()

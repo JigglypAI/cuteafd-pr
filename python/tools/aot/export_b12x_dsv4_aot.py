@@ -973,7 +973,7 @@ def main() -> None:
             from export_b12x_exlr8_dense_aot import programs as dense_programs
             if not native_families:
                 raise SystemExit("exlr8_dense requires glm and/or glmf in --dense-trellis-families")
-            manifest["families"][name] = {"abi_version": 1, "architectures": native_families}
+            manifest["families"][name] = {"abi_version": 1}
             work += [(name, *item) for item in dense_programs(families=native_families)]
             continue
         if name == "exlr8":
