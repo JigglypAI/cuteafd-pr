@@ -11,6 +11,74 @@ use std::sync::Arc;
 
 pub(crate) type ProbeRef = Option<Arc<Probe>>;
 
+pub(crate) fn image_echo(job: &cuteafd_api::openai::NativeRequest, spans: &[cuteafd_core::MediaSpan]) -> Result<()> {
+    if let Some(probe) = &job.probe {
+        anyhow::ensure!(spans.len() == job.media.len(), "probe image count differs");
+        probe.media(spans.iter().zip(&job.media).enumerate().map(|(i, (span, image))| {
+            cuteafd_api::openai::probe::ProbeMedia { start: span.start, len: span.len, kind: "image".into(),
+                key: image.key.0.iter().map(|b| format!("{b:02x}")).collect(),
+                grid: [image.grid.t, image.grid.h, image.grid.w],
+                fixture: probe.spec.media.get(i).and_then(|s| s.fixture.clone()), image_url: None }
+        }).collect());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ImageMarkers {
+    Bounded(cuteafd_loader::media::SpanExpander),
+    Rows(cuteafd_loader::media::MistralSpanExpander),
+}
+
+/// Bind explicit probe ids to prepared image identities and checkpoint marker positions.
+pub(crate) fn image_spans(spec: &cuteafd_api::openai::probe::ProbeSpec, tokens: &[u32],
+    images: &[cuteafd_loader::media::PreparedImage], markers: ImageMarkers, max_context: usize)
+    -> Result<Vec<cuteafd_core::MediaSpan>> {
+    use cuteafd_core::media::ImageTokenGeometry;
+    let (vocabulary, placeholder, reserved, geometry) = match markers {
+        ImageMarkers::Bounded(m) => (m.vocabulary, m.placeholder, [m.placeholder, m.start, m.end], ImageTokenGeometry::MERGED),
+        ImageMarkers::Rows(m) => (m.vocabulary, m.image, [m.image, m.row_break, m.end],
+            ImageTokenGeometry { merge: m.merge, row_markers: 1 }),
+    };
+    spec.validate_media_geometry(geometry)?;
+    anyhow::ensure!(spec.prompt_ids.as_deref() == Some(tokens) && spec.media.len() == images.len()
+        && tokens.len() <= max_context, "expanded probe media count/context differs");
+    anyhow::ensure!(vocabulary > 0 && vocabulary < 1 << 31 && tokens.iter().all(|&id| id < vocabulary)
+        && reserved.iter().all(|&id| id < vocabulary)
+        && reserved[0] != reserved[1] && reserved[0] != reserved[2] && reserved[1] != reserved[2],
+        "probe image markers/token outside vocabulary");
+    let mut spans = Vec::with_capacity(images.len());
+    let mut covered = std::collections::BTreeSet::new();
+    for (span, image) in spec.media.iter().zip(images) {
+        let end = span.start.checked_add(span.len).ok_or_else(|| anyhow::anyhow!("probe media extent"))?;
+        let key = image.key.0.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        anyhow::ensure!(span.len == image.tokens && span.grid == [image.grid.t, image.grid.h, image.grid.w]
+            && span.key == key, "probe prepared image identity differs");
+        match markers {
+            ImageMarkers::Bounded(m) => {
+                anyhow::ensure!(span.start > 0 && end < tokens.len() && tokens[span.start - 1] == m.start
+                    && tokens[end] == m.end && tokens[span.start..end].iter().all(|&id| id == placeholder),
+                    "probe image rows/marker boundaries differ");
+                covered.extend(span.start - 1..=end);
+            }
+            ImageMarkers::Rows(m) => {
+                let (h, w, _) = geometry.extent(span.grid).ok_or_else(|| anyhow::anyhow!("probe image grid"))?;
+                for row in 0..h {
+                    let start = span.start + row * (w + 1);
+                    anyhow::ensure!(tokens[start..start + w].iter().all(|&id| id == placeholder)
+                        && tokens[start + w] == if row + 1 == h { m.end } else { m.row_break },
+                        "probe image rows/marker boundaries differ");
+                }
+                covered.extend(span.start..end);
+            }
+        }
+        spans.push(cuteafd_core::MediaSpan { start: span.start, len: span.len, key: image.key.into() });
+    }
+    anyhow::ensure!(tokens.iter().enumerate().all(|(i, id)| !reserved.contains(id) || covered.contains(&i)),
+        "unbound probe image placeholders/markers");
+    Ok(spans)
+}
+
 /// Adds cumulative capture counts and site deltas since the last stats publication.
 /// Gate clients subtract the cumulative fields across their own warmed interval.
 pub(crate) fn graph_capture_stats(stats: &mut serde_json::Value) {
@@ -33,6 +101,38 @@ fn record_graph_captures(stats: &mut serde_json::Value, total: u64, sites: Vec<(
     stats["graph_capture_sites"] = serde_json::json!(sites);
     stats["graph_capture_site_deltas"] = serde_json::json!(deltas);
     *previous = sites;
+}
+
+#[cfg(test)]
+mod image_span_tests {
+    use super::*;
+    use cuteafd_api::openai::probe::{ProbeImageUrl, ProbeMedia, ProbeSpec};
+    use cuteafd_loader::media::{ImageGrid, ImageKey, MistralSpanExpander, PreparedImage, SpanExpander};
+
+    #[test]
+    fn bounded_and_row_marker_probes_bind_exactly_once() {
+        let rows = ImageMarkers::Rows(MistralSpanExpander { image: 5, row_break: 4, end: 6, merge: 2, vocabulary: 32 });
+        let bounded = ImageMarkers::Bounded(SpanExpander { placeholder: 5, start: 4, end: 6, vocabulary: 32 });
+        for (markers, tokens, start, len) in [(bounded, vec![1, 4, 5, 5, 5, 5, 6, 2], 2, 4),
+            (rows, vec![1, 5, 5, 4, 5, 5, 6, 2], 1, 6)] {
+            let image = PreparedImage { key: ImageKey([7; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
+                rgb8: Arc::from([]), tokens: len };
+            let mut spec = ProbeSpec { prompt_ids: Some(tokens.clone()), media: vec![ProbeMedia { start, len,
+                kind: "image".into(), key: "07".repeat(32), grid: [1, 4, 4], fixture: None,
+                image_url: Some(ProbeImageUrl { url: "fixture".into(), detail: None }) }], ..Default::default() };
+            let images = [image];
+            let spans = image_spans(&spec, &tokens, &images, markers, 16).unwrap();
+            assert_eq!((spans[0].start, spans[0].len), (start, len));
+            for i in start..start + len {
+                let mut wrong = tokens.clone(); wrong[i] = 3; spec.prompt_ids = Some(wrong.clone());
+                assert!(image_spans(&spec, &wrong, &images, markers, 16).is_err());
+            }
+            let mut wrong = tokens.clone(); wrong[0] = 5; spec.prompt_ids = Some(wrong.clone());
+            assert!(image_spans(&spec, &wrong, &images, markers, 16).is_err());
+            spec.prompt_ids = Some(tokens.clone()); spec.media[0].key = "08".repeat(32);
+            assert!(image_spans(&spec, &tokens, &images, markers, 16).is_err());
+        }
+    }
 }
 
 #[cfg(test)]

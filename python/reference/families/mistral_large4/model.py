@@ -21,12 +21,16 @@ import struct
 CHECKPOINT = "mistralai/Mistral-Large-4-1T-A52B"
 REVISION = "f12dabdc0c1e99e7f7924461a6f308859b05af4d"
 TRANSFORMERS_VERSION = "5.22.1"
-# transformers 5.22.1 wheel files; modeling identical to main 66f51e76 (PR #50121).
+# Official transformers v5.22.1 (446a570e); shared text and Pixtral provenance.
 SOURCE_PINS = {
     "models/mistral_large4/modeling_mistral_large4.py": "a83fc96564410fcfea5cedb3310b5a28f3c7967caddd3ee955d9131f5b974e84",
     "models/mistral_large4/configuration_mistral_large4.py": "51646a3d32314e91e73aecd28355dddda454863b7c6ada7755560592df9b07e4",
     "modeling_rope_utils.py": "ddec71d6c9343af437f656812177fe5c98f6057fd5240c5cbf208520c2872745",
     "masking_utils.py": "931b92cf0deeb7a4925259a30c905bbf4d645fda88c6eebbc9e61770f5abaa89",
+    "models/pixtral/modeling_pixtral.py": "503e23525215ae1e59e32e1132159502b431003218874d185da9ee6842775099",
+    "models/pixtral/configuration_pixtral.py": "254fc400b064716d3c25b9cefec0b9872f947bf7ccf408c15275a385a2827fdd",
+    "models/pixtral/image_processing_pil_pixtral.py": "d0271e55872a2524538bc7bef05faf9fa7c395da9bb411d10c97c0d5c123bac4",
+    "models/pixtral/processing_pixtral.py": "298b140eb8b8459a96cb2bff929971088d72d83aa5d4ec15010fc25fda06b911",
 }
 BLOCK = 128
 ROWS = 128
@@ -74,6 +78,20 @@ def source_identity():
     return {"transformers": transformers.__version__,
             **{Path(name).stem + "_sha256": value for name, value in actual.items()},
             "reference_adapter_sha256": _sha(__file__)}
+
+
+def load_vision_official(raw):
+    """Construct the bundled tower/projector from the same verified official source."""
+    source_identity()
+    from transformers.models.pixtral.configuration_pixtral import PixtralVisionConfig
+    from transformers.models.pixtral.modeling_pixtral import PixtralVisionModel
+    from transformers.models.mistral_large4.configuration_mistral_large4 import MistralLarge4Config
+    from transformers.models.mistral_large4 import modeling_mistral_large4 as reference
+
+    vision = PixtralVisionConfig(**raw["vision_config"])
+    vision._attn_implementation = "sdpa"
+    full = MistralLarge4Config(**{k: v for k, v in raw.items() if k != "quantization_config"})
+    return PixtralVisionModel(vision), reference.MistralLarge4MultiModalProjector(full)
 
 
 def load_official(snapshot):

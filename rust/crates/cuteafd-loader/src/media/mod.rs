@@ -117,6 +117,11 @@ const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 pub use resize::Resample;
 
 impl ProcessorConfig {
+    pub fn token_geometry(&self) -> cuteafd_core::media::ImageTokenGeometry {
+        cuteafd_core::media::ImageTokenGeometry { merge: self.merge,
+            row_markers: u32::from(self.family == ImageFamily::Mistral) }
+    }
+
     pub fn for_family(family: ImageFamily) -> Self {
         let (patch, min_pixels, max_pixels, mean, std) = match family {
             ImageFamily::Mimo => (16, 3136, 12_845_056, CLIP_MEAN, CLIP_STD),
@@ -357,8 +362,8 @@ fn mistral_resize(height: u32, width: u32, factor: u32, longest: u64) -> (u32, u
 
 /// Mistral's merged grid `(rows, columns)` and LM span length `rows * (columns + 1)`.
 pub fn mistral_span(grid: ImageGrid, merge: u32) -> (usize, usize, usize) {
-    let (h, w) = ((grid.h / merge) as usize, (grid.w / merge) as usize);
-    (h, w, h * (w + 1))
+    cuteafd_core::media::ImageTokenGeometry { merge, row_markers: 1 }
+        .extent([grid.t, grid.h, grid.w]).unwrap_or((0, 0, 0))
 }
 
 fn glm_resize(height: u32, width: u32, factor: u32, min: u64, max: u64) -> Result<(u32, u32)> {
@@ -406,12 +411,8 @@ impl ImageProcessor for ProcessorConfig {
         if image.data.len() != image.width as usize * image.height as usize * 3 {
             return Err(invalid("RGB byte extent differs from dimensions"));
         }
-        let cells = (height / (self.patch * self.merge)) as usize
-            * (width / (self.patch * self.merge)) as usize;
-        // Mistral's span also carries one [IMG_BREAK]/[IMG_END] per merged row.
-        let tokens = if self.family == ImageFamily::Mistral {
-            cells + (height / (self.patch * self.merge)) as usize
-        } else { cells };
+        let (_, _, tokens) = self.token_geometry().extent([1, height / self.patch, width / self.patch])
+            .ok_or_else(|| invalid("image grid differs from processor merge geometry"))?;
         if tokens == 0 || tokens > self.max_image_tokens {
             return Err(invalid("official resize exceeds the image token cap"));
         }

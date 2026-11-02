@@ -712,7 +712,9 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     images::guard_content(&body, profile.capabilities).map_err(Rejection::bad)?;
     let probe = headers.get(probe::HEADER).and_then(|v| v.to_str().ok()).and_then(|id| probe::registry().claim(id));
     if let Some(p) = &probe {
-        if let Err(message) = p.spec.validate_media() {
+        let geometry = profile.media_preparer.as_ref().map(|p| p.config().token_geometry())
+            .unwrap_or(cuteafd_core::media::ImageTokenGeometry::MERGED);
+        if let Err(message) = p.spec.validate_media_geometry(geometry) {
             p.fail(format!("{message:#}"));
             return Err(Rejection::bad(message));
         }

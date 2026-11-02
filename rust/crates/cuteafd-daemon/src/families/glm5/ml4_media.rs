@@ -109,17 +109,22 @@ pub(crate) fn prepare(job: NativeRequest, tokens: Vec<u32>, expander: Option<&Mi
     vocabulary: usize, hidden: usize, max_context: usize) -> Result<(Prompt, RequestMedia, Vec<EncodeJob>)> {
     let (tokens, spans) = match expander {
         Some(expander) => {
-            anyhow::ensure!(job.probe.as_ref().is_none_or(|p| p.spec.prompt_ids.is_none() || job.media.is_empty()),
-                "Mistral Large 4 probes with explicit prompt ids do not carry images");
             let images = job.media.iter().map(|image| image.as_ref().clone()).collect::<Vec<_>>();
-            let expanded = expander.expand(&tokens, &images, max_context)?;
-            (expanded.tokens, expanded.media)
+            if let Some(probe) = job.probe.as_ref().filter(|p| p.spec.prompt_ids.is_some() && !images.is_empty()) {
+                let spans = crate::shared::probe::image_spans(&probe.spec, &tokens, &images,
+                    crate::shared::probe::ImageMarkers::Rows(*expander), max_context)?;
+                (tokens, spans)
+            } else {
+                let expanded = expander.expand(&tokens, &images, max_context)?;
+                (expanded.tokens, expanded.media)
+            }
         }
         None => {
             anyhow::ensure!(job.media.is_empty(), "this deployment serves no images (vision off or no tower)");
             (tokens, Vec::new())
         }
     };
+    crate::shared::probe::image_echo(&job, &spans)?;
     let media = RequestMedia::new(spans.clone(), hidden, tokens.len())?;
     let keys = MediaKeys::new(&tokens, vocabulary as u32, &spans)?;
     let jobs = job.media.iter().map(|image| EncodeJob::image(image.key, [image.grid.t, image.grid.h, image.grid.w],
