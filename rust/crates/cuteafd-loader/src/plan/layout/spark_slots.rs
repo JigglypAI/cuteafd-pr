@@ -426,7 +426,7 @@ mod tests {
                 let prefill = ml4_owner_bytes(world, executions.owners().last().unwrap())?;
                 for residual in [0, prefill.scratch + prefill.io + 1] {
                     let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32,
-                        capacity_bytes: 121 * GIB, kv_tokens: 0,
+                        capacity_bytes: 121 * GIB, worker_budget_bytes: 108 * GIB, kv_tokens: 0,
                         items: vec![Item::new(Category::Workspace, "expert waves", "", residual, Basis::Calibrated)] };
                     // Recharging replaces the owner entries, never doubles them.
                     for _ in 0..2 {
