@@ -604,6 +604,140 @@ pub(crate) fn resume_check(engine: &GlmEngine<'_>, tokens: &[u32],
 mod ownership_tests {
     use super::*;
 
+    #[test]
+    #[ignore = "sealed ML4 native library, published checkpoint and five real Spark workers"]
+    fn native_ml4_window_restore_matches_fresh_warm_and_cold() -> Result<()> {
+        use super::super::{dflash, EngineArgs};
+        use anyhow::{Context, ensure};
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Parse { #[command(flatten)] engine: EngineArgs }
+        let env = |key| std::env::var(key).with_context(|| format!("ML4 native proof needs {key}"));
+        let mut args = Parse::try_parse_from(["test", "--snapshot", &env("CUTEAFD_GOLDEN_SNAPSHOT")?,
+            "--native-lib", &env("CUTEAFD_NATIVE_LIB")?, "--manifest", &env("CUTEAFD_PROGRAM_MANIFEST")?,
+            "--peers", &env("CUTEAFD_GOLDEN_PEERS")?, "--dspark", "--pool-tokens", "0",
+            "--max-context", "1048576", "--rtx-expert-layers", "0", "--draft-window-marks", "2"] )?.engine;
+        super::super::resolve_prefill(&mut args)?;
+        let opened = super::super::open(&args)?;
+        ensure!(opened.cfg.variant.ml4().is_some(), "native proof requires ML4");
+        opened.with_engine(&args, |engine, mut transport, runtime| {
+            let error = |e: BoxError| anyhow::anyhow!("{e}");
+            let family = GlmPrefix::new(engine, false, 2)?;
+            let drafter = engine.drafter.as_ref().context("native proof needs bundled drafter")?;
+            ensure!(drafter.mla_windows_only() && family.mark_bytes() > DRAFT_MARK_HEADER,
+                "native proof requires retained MLA window marks");
+            let params = cuteafd_loader::plan::checkpoint::read_json(&opened.snapshot.join("params.json"))?;
+            let cfg = cuteafd_loader::families::mistral_large4::dspark::Ml4DsparkConfig::from_params(
+                &params, engine.cfg.layers)?;
+            // Cross the page-rounded (window + block) ring and retain a partial target page.
+            let prefix_len = (cfg.window + cfg.depth).div_ceil(PAGE_ROWS) * PAGE_ROWS + 3;
+            let tokens = (0..prefix_len).map(|i| 1000 + (i * 37 % 4096) as u32).collect::<Vec<_>>();
+            let suffix = [2201, 2202, 2203];
+            let capacity = tokens.len() + suffix.len() + drafter.cfg.drafts() + 2;
+            let mut allocator = super::super::engine::PageAllocator::new(engine);
+            let argmax = |values: &[f32]| values.iter().enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+            let mut prefill = |placement: &mut GlmPlacement, ids: &[u32]| -> Result<u32> {
+                let mut next = None;
+                for chunk in ids.chunks(256) {
+                    let start = placement.len;
+                    let logits = engine.prefill(placement, chunk,
+                        transport.as_deref_mut().map(|t| (t, runtime)), None)?.context("prefill logits")?;
+                    drafter.update(&(0..chunk.len()).map(|r| dflash::ContextRow {
+                        tap_row: r, slot: 0, position: start + r }).collect::<Vec<_>>())?;
+                    next = Some(argmax(&logits));
+                }
+                next.context("empty native prefill")
+            };
+            let mut saved = allocator.admit(capacity)?;
+            saved.draft_slot = Some(0);
+            family.bind(&mut saved).map_err(error)?;
+            prefill(&mut saved, &tokens)?;
+            assert_eq!(drafter.mla_frontier(0)?, (0, prefix_len));
+            family.capture(MarkSlot(0), &saved, prefix_len).map_err(error)?;
+            family.drain().map_err(error)?;
+            let saved_draft = drafter.mla_readback(0, 0)?;
+            let saved_target = paged_rows(&family, &saved, prefix_len)?;
+            family.discard(&mut saved).map_err(error)?;
+            drop(prefill);
+            let mut states = Vec::new();
+            let mut proposals = Vec::new();
+            let mut verifies = Vec::new();
+            let mut common_verify = Vec::new();
+            for arm in 0..4 {
+                let restored = arm == 0 || arm == 3;
+                let cold = arm < 2;
+                let mut placement = if restored {
+                    let (placement, tail) = allocator.fork(&saved, prefix_len, capacity)?;
+                    if let Some(copy) = tail { family.copy_rows(copy).map_err(error)?; }
+                    placement
+                } else { allocator.admit(capacity)? };
+                placement.draft_slot = Some(0);
+                family.bind(&mut placement).map_err(error)?;
+                if restored {
+                    family.restore((!cold).then_some(MarkSlot(0)), &mut placement, prefix_len).map_err(error)?;
+                    assert_eq!(paged_rows(&family, &placement, prefix_len)?, saved_target,
+                        "restored target pages at the exact frontier");
+                    if !cold { assert_eq!(drafter.mla_readback(0, 0)?, saved_draft, "warm window bytes"); }
+                } else {
+                    for chunk in tokens.chunks(256) {
+                        let start = placement.len;
+                        engine.prefill(&mut placement, chunk,
+                            transport.as_deref_mut().map(|t| (t, runtime)), None)?;
+                        drafter.update(&(0..chunk.len()).map(|r| dflash::ContextRow {
+                            tap_row: r, slot: 0, position: start + r }).collect::<Vec<_>>())?;
+                    }
+                    if cold { drafter.reset_context(0, prefix_len)?; }
+                }
+                assert_eq!(drafter.mla_frontier(0)?, (if cold { prefix_len } else { 0 }, prefix_len));
+                if cold {
+                    let readback = drafter.mla_readback(0, 0)?;
+                    assert!(readback.layers.iter().all(Vec::is_empty));
+                    // A noncanonical captured frontier must restore cold, never reuse old windows.
+                    family.capture(MarkSlot(1), &placement, prefix_len).map_err(error)?;
+                    family.restore(Some(MarkSlot(1)), &mut placement, prefix_len).map_err(error)?;
+                    assert_eq!(drafter.mla_frontier(0)?, (prefix_len, prefix_len));
+                }
+                let start = placement.len;
+                let logits = engine.prefill(&mut placement, &suffix,
+                    transport.as_deref_mut().map(|t| (t, runtime)), None)?.context("suffix logits")?;
+                let anchor = argmax(&logits);
+                drafter.update(&(0..suffix.len()).map(|r| dflash::ContextRow {
+                    tap_row: r, slot: 0, position: start + r }).collect::<Vec<_>>())?;
+                states.push(drafter.mla_readback(0, suffix.len())?);
+                let proposed = drafter.draft_device_diagnostic(&[dflash::DraftSeq { slot: 0, anchor,
+                    position: placement.len, valid_from: if cold { prefix_len } else { 0 } }],
+                    &engine.embedding, engine.draft_target_head()?)?.remove(0).tokens;
+                assert_eq!(proposed.len(), drafter.cfg.drafts());
+                if arm == 0 { common_verify = std::iter::once(anchor).chain(proposed.iter().copied()).collect(); }
+                else { assert_eq!(common_verify[0], anchor); }
+                proposals.push(proposed);
+                let start = placement.len;
+                let logits = engine.verify(&mut [(&mut placement, common_verify.len())], &common_verify,
+                    transport.as_deref_mut().map(|t| (t, runtime)), None)?.context("verify logits")?;
+                verifies.push(logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+                // Only the anchor is committed; rejected provisional rows must stay unreachable.
+                placement.len = start + 1;
+                drafter.update(&[dflash::ContextRow { tap_row: 0, slot: 0, position: start }])?;
+                assert_eq!(drafter.mla_frontier(0)?, (if cold { prefix_len } else { 0 }, start + 1));
+                states.push(drafter.mla_readback(0, 1)?);
+                family.drain().map_err(error)?;
+                family.discard(&mut placement).map_err(error)?;
+                allocator.release(placement);
+            }
+            assert_eq!(states[0], states[2], "restored/fresh cold suffix bytes and taps");
+            assert_eq!(states[1], states[3], "restored/fresh cold accepted-only bytes and taps");
+            assert_eq!(states[4], states[6], "fresh/restored warm suffix bytes and taps");
+            assert_eq!(states[5], states[7], "fresh/restored warm accepted-only bytes and taps");
+            assert_eq!(proposals[0], proposals[1], "restored/fresh cold proposals");
+            assert_eq!(proposals[2], proposals[3], "fresh/restored warm proposals");
+            assert!(verifies.iter().all(|v| *v == verifies[0]), "all four target verify logits must match bitwise");
+            allocator.release(saved);
+            println!("ML4 native window restore: warm/cold frontiers, window bytes, proposals and target verify PASS");
+            Ok(())
+        })
+    }
+
     struct MockDevice {
         layout: FamilyLayout,
         frontiers: std::cell::RefCell<[usize; 3]>,
