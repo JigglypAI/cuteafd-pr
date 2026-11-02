@@ -294,7 +294,7 @@ mod tests {
         assert_eq!(recipe.slicing, crate::formats::fp8_experts::Slicing::Blocks(32));
         assert_eq!(recipe.rule, UnitRule::LayerRotation);
         assert_eq!(recipe.widths, [352, 352, 352, 352, 320, 320]);
-        assert_eq!(recipe.stored_widths, [384, 384, 384, 384, 320, 320]);
+        assert_eq!(recipe.stored_widths, recipe.widths);
         assert_eq!(recipe.required_layouts, ["tp6-w352", "tp6-w320"]);
         for layer in [0, 3, 40, 77] {
             let widths = (0..6).map(|rank| recipe.width_for_layer(rank, layer).unwrap()).collect::<Vec<_>>();

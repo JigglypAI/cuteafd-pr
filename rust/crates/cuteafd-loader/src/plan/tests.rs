@@ -3598,7 +3598,7 @@ fn formats_count_logical_weights() {
 }
 
 #[test]
-fn layout_places_every_device_and_names_padded_spark_slices() {
+fn layout_places_every_device_and_names_compact_spark_slices() {
     use crate::plan::testing::{mimo_pro_config, mimo_pro_tensors, write_snapshot};
     use cuteafd_core::memory_layout::{Category, DeviceKind};
     let dir = tempfile::tempdir().unwrap();
@@ -3620,12 +3620,12 @@ fn layout_places_every_device_and_names_padded_spark_slices() {
     assert!(layout.pool_tokens > 0 && layout.pool_tokens <= cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
     assert_eq!(layout.pool_tokens % 64, 0);
     assert!(layout.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).all(|d| d.free_bytes() >= 0));
-    // Logical K32 ranges rotate; Pro's 352-column owner retains 384 physical columns.
+    // Logical K32 ranges rotate; Pro stores each owner at its exact width.
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let model = families::mimo::MIMO_V2.open(&checkpoint).unwrap();
-    assert_eq!(report.spark_rank_share, 384. / 2048.);
+    assert_eq!(report.spark_rank_share, 352. / 2048.);
     let (projected, _) = layout::spark_slices(&report, model.as_ref(), 6, 2048 * 1024);
-    assert_eq!(projected, [384, 384, 384, 384, 320, 320].map(|width| width * 1024));
+    assert_eq!(projected, [352, 352, 352, 352, 320, 320].map(|width| width * 1024));
     let experts = |i: usize| layout.devices[2 + i].by_category()[&Category::Experts];
     let recipe = experts::spark_recipe("mimop:fp8", 2048, 6).unwrap();
     for rank in 0..6 {

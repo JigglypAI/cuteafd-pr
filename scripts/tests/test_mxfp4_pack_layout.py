@@ -148,7 +148,8 @@ def test_only_qualified_hardware_recipes_override_matching_arithmetic():
     assert LAYOUTS.native_slice_width(5120, 576, 121, 256, 192) == 192
     assert LAYOUTS.ownership_unit(2304, 5) == 64
     assert LAYOUTS.ownership_unit(2304, 7) == 32
-    assert LAYOUTS.generic_stored_width(6144, 352) == 384
+    for width in (320, 352, 1024, 2048):
+        assert LAYOUTS.generic_stored_width(6144, width) == width
     assert LAYOUTS.generic_stored_width(4096, 352) == 352
 
 

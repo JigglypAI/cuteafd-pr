@@ -443,12 +443,5 @@
       "source": "#928 GB10 composed barrier blend: 1.013/0.999/1.000 at C1/16/80; K32 C80 loses"
     }
   ],
-  "generic_storage_holds": [
-    {
-      "hidden": 6144,
-      "width": 352,
-      "stored": 384,
-      "reason": "#928 MiMo Pro C80 matching loss exceeds control spread"
-    }
-  ]
+  "generic_storage_holds": []
 }
