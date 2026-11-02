@@ -811,13 +811,13 @@ impl<'e, 'a> Execution<'e, 'a> {
     pub(super) fn packed_row_cap(&self, rows: usize) -> Result<usize> {
         let transport = self.main.transport.borrow();
         let reports = transport.as_ref().context("Step-5 main transport missing")?.installed_grouping()?;
-        let inputs = (3..91).map(|layer| -> Result<_> {
+        let inputs = spark_packing_inputs(&self.main.ownership, |layer| -> Result<_> {
             let owner = owner_of(&self.main, layer)?.unwrap_or(0);
             let Ffn::Routed(ffn) = &self.main.layer(owner, layer)?.ffn else {
                 anyhow::bail!("Step-5 routed layer missing from packing admission");
             };
-            Ok((layer, ffn.wire_dtype() == ExpertV2Dtype::Bf16))
-        }).collect::<Result<Vec<_>>>()?;
+            Ok(ffn.wire_dtype() == ExpertV2Dtype::Bf16)
+        })?;
         Ok(packed_route_cap(rows, &reports, &inputs))
     }
     pub(super) fn draft_geometry(&self, snapshot: &std::path::Path, width: usize, rows: usize)
@@ -1041,6 +1041,12 @@ impl<E: CopyEngine> crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<
         // KV, rings and summaries were staged per unit; the step publishes once.
         Ok(())
     }
+}
+
+fn spark_packing_inputs(ownership: &ExecutionOwnership,
+    mut bf16: impl FnMut(usize) -> Result<bool>) -> Result<Vec<(usize, bool)>> {
+    (3..91).filter(|&layer| !ownership.onboarded(layer))
+        .map(|layer| Ok((layer, bf16(layer)?))).collect()
 }
 
 pub(super) fn packed_route_cap(rows: usize,
@@ -1739,6 +1745,18 @@ mod tests {
             for (rank, installed) in reports.iter().enumerate() {
                 for &layer in &remote { installed.validate_for(&identity, rank, 64, layer..layer + 1)?; }
                 assert!(installed.weight_read_bytes().is_err(), "EXL3 must not fabricate FP8 descriptors");
+            }
+            let inputs = spark_packing_inputs(&ownership, |layer| {
+                assert!(!ownership.onboarded(layer), "RTX layers must never query Spark packing reports");
+                Ok(false)
+            })?;
+            assert_eq!(inputs.iter().map(|&(layer, _)| layer).collect::<Vec<_>>(), remote);
+            assert_eq!(packed_route_cap(64, &reports, &inputs), 64);
+            if let Some(&layer) = onboarded.first() {
+                let mut invalid = inputs.clone();
+                invalid.push((layer, false));
+                assert_eq!(packed_route_cap(64, &reports, &invalid), 0,
+                    "an onboarded layer has no Spark report; filter it before computing the cap");
             }
             let homes = draft_homes(&ownership, &catalog, &reports,
                 |_| panic!("EXL3 must price checkpoint headers, not FP8 descriptors"))?;
