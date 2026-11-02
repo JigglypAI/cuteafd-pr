@@ -1,11 +1,63 @@
 // CPU stand-ins for load-only native kernels, linked into the fake native DSO:
 // the same shared rule the CUDA kernels run, executed sequentially.
 #include <stdint.h>
+#include <algorithm>
 
 #include "../../../../../native/shared/cuda/fp8_load_quant.h"
 
 // A synthetic device count keeps owner construction CPU-only.
 extern "C" int32_t cuteafd_sm_count() { return 1; }
+
+// Metadata-only drafter queries and its one load-time derived array. These
+// stand-ins exercise owner construction, not attention or draft numerics.
+extern "C" uint64_t cuteafd_block_dspark_attention_workspace(int32_t sequences, int32_t heads,
+    int32_t kv_heads, int32_t block, int32_t keys, int32_t dim) {
+  if (sequences < 1 || heads < 1 || kv_heads < 1 || heads % kv_heads || block < 1 || keys < block ||
+      (dim != 64 && dim != 128)) return 0;
+  const int64_t slices = (int64_t(heads / kv_heads) * block + 31) / 32;
+  const int64_t base = kv_heads * slices;
+  const int64_t partitions = std::min<int64_t>((keys + 31) / 32, (2 + base - 1) / base);
+  const int64_t scalar = (std::min(keys, 1040) + 127) / 128 * (dim == 64 ? 32 : 16);
+  return uint64_t(sequences) * kv_heads * std::max(slices * partitions * 32, scalar) * (dim + 2) * 4;
+}
+
+extern "C" uint64_t cuteafd_glmf_dspark_markov_workspace(int32_t sequences, int32_t block) {
+  return uint64_t(sequences) * 296 * 8 + uint64_t(sequences) * block * 4;
+}
+
+extern "C" int32_t cuteafd_glmf_dspark_markov_norms(const void* w2, void* norms, int32_t vocab,
+    int32_t rank, void* stream) {
+  (void)stream;
+  if (!w2 || !norms || vocab < 1 || rank != 256) return 1;
+  for (int row = 0; row < vocab; ++row) {
+    float sum = 0;
+    for (int col = 0; col < rank; ++col) {
+      const uint32_t bits = uint32_t(static_cast<const uint16_t*>(w2)[row * rank + col]) << 16;
+      float value;
+      memcpy(&value, &bits, sizeof(value));
+      sum += value * value;
+    }
+    static_cast<float*>(norms)[row] = sum;
+  }
+  return 0;
+}
+
+extern "C" size_t cuteafd_fp8_linear_workspace(int32_t rows, int32_t k, int32_t n, int32_t mode) {
+  if (rows < 1 || k < 128 || n < 16 || mode < 0 || mode > 2) return 0;
+  const auto align = [](size_t bytes) { return (bytes + 255) / 256 * 256; };
+  const int blocks = k / 128;
+  const int wanted = std::min(blocks, std::max(1, (16 + n / 16 - 1) / (n / 16)));
+  const int span = (blocks + wanted - 1) / wanted;
+  const int splits = (blocks + span - 1) / span;
+  const int cap = mode == 0 ? 64 : 128;
+  return align(2 * cap * 4) + align((k + 255) / 256 * cap * 4) + align(size_t(k) * cap * 2) +
+      (mode == 2 ? align(size_t(k / 128) * cap * 4) : 0) +
+      (splits > 1 ? align(size_t(splits) * std::min(rows, cap) * n * 4) : 0);
+}
+
+extern "C" size_t cuteafd_fp8_w8a16_workspace(int32_t rows, int32_t k, int32_t n) {
+  return cuteafd_fp8_linear_workspace(rows, k, n, 0);
+}
 
 extern "C" int32_t cuteafd_fp8_load_quant(const void* jobs, int32_t count, void* stream) {
   (void)stream;

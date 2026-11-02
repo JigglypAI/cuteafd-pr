@@ -1303,6 +1303,144 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn actual_block_owners_and_fresh_sources_match_admission() -> Result<()> {
+        use cuteafd_ffi::memory_ledger::{AllocationAudit, AllocationEvent, Space};
+        use cuteafd_loader::formats::block_dspark::BlockDraftLayout;
+        use cuteafd_loader::placement::planner::{self, Allocation, Baseline, Budget, Decisions,
+            Facts, Lifetime, Location, Operation, OwnerEvent, Phase, Pin, PrefillShape, Receipt,
+            Request, ResolvedPlan, Sequential};
+        use cuteafd_core::memory_layout::Category;
+        use std::io::Write;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        for dim in [64, 128] {
+            for window in [None, Some(2048usize)] {
+                let snapshot = fixture.directory().join(format!("block-{dim}-{window:?}"));
+                std::fs::create_dir(&snapshot)?;
+                let config = serde_json::json!({"architectures":["DSparkDraftModel"],
+                    "hidden_size":256,"intermediate_size":512,"num_hidden_layers":2,
+                    "num_attention_heads":4,"num_key_value_heads":2,"head_dim":dim,
+                    "rms_norm_eps":1e-6,"rope_parameters":{"rope_type":"default","rope_theta":10000.0},
+                    "vocab_size":512,"hidden_act":"silu","layer_types":vec![if window.is_some() {
+                        "sliding_attention" } else { "full_attention" };2],"sliding_window":window,
+                    "block_size":8,"markov_rank":256,"markov_head_type":"vanilla",
+                    "enable_confidence_head":true,"confidence_head_with_markov":true,"num_target_layers":2,
+                    "dflash_config":{"projector_type":"dspark","mask_token_id":0,"target_layer_ids":[0,1]}});
+                std::fs::write(snapshot.join("config.json"), serde_json::to_vec(&config)?)?;
+                let cfg = DsparkConfig::read(&snapshot)?;
+                let (h, kv, inter) = (cfg.hidden, cfg.kv_width(), cfg.intermediate);
+                let mut shapes = vec![("fc.weight".into(), vec![h, cfg.taps.len() * h]),
+                    ("hidden_norm.weight".into(), vec![h]), ("norm.weight".into(), vec![h]),
+                    ("markov_head.markov_w1.weight".into(), vec![cfg.vocab, cfg.rank]),
+                    ("markov_head.markov_w2.weight".into(), vec![cfg.vocab, cfg.rank]),
+                    ("confidence_head.proj.weight".into(), vec![1, h + cfg.rank]),
+                    ("confidence_head.proj.bias".into(), vec![1])];
+                for layer in 0..cfg.layers {
+                    let p = format!("layers.{layer}");
+                    for (leaf, shape) in [("input_layernorm", vec![h]), ("post_attention_layernorm", vec![h]),
+                        ("self_attn.q_proj", vec![cfg.q_width(), h]), ("self_attn.k_proj", vec![kv, h]),
+                        ("self_attn.v_proj", vec![kv, h]), ("self_attn.o_proj", vec![h, cfg.q_width()]),
+                        ("self_attn.q_norm", vec![dim]), ("self_attn.k_norm", vec![dim]),
+                        ("mlp.gate_proj", vec![inter, h]), ("mlp.up_proj", vec![inter, h]),
+                        ("mlp.down_proj", vec![h, inter])] {
+                        shapes.push((format!("{p}.{leaf}.weight"), shape));
+                    }
+                }
+                let mut header = serde_json::Map::new();
+                let mut offset = 0;
+                for (name, shape) in shapes {
+                    let bytes = shape.iter().product::<usize>() * 2;
+                    header.insert(name, serde_json::json!({"dtype":"BF16","shape":shape,
+                        "data_offsets":[offset, offset + bytes]}));
+                    offset += bytes;
+                }
+                let header = serde_json::to_vec(&header)?;
+                let mut file = std::fs::File::create(snapshot.join("model.safetensors"))?;
+                file.write_all(&(header.len() as u64).to_le_bytes())?;
+                file.write_all(&header)?;
+                file.write_all(&vec![0; offset])?;
+                drop(file);
+                for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
+                    let library = fixture.load()?;
+                    fixture.immediate_copies(&library)?;
+                    fixture.configure_memory(&library, 0, 1 << 30)?;
+                    let kv_cache = if representation == GlmDraftRepresentation::Bf16Only {
+                        cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16
+                    } else { cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 };
+                    let context = window.unwrap_or(256);
+                    let layout = BlockDraftLayout::read(&snapshot, 2, 2, context, 512, 1,
+                        representation, 2, kv_cache)?;
+                    library.reserve_sync_h2d_staging(layout.sync_upload_bytes)?;
+                    let audit = AllocationAudit::start();
+                    let draft = DsparkDrafter::load_paged(&library, &snapshot,
+                        prefetch(&snapshot).join().map_err(|_| anyhow::anyhow!("fixture prefetch panicked"))??,
+                        std::ptr::null_mut(), 2, 2, vec![0; h * 2], representation,
+                        fp8_linear::Fp8Scales::Amax, fp8_linear::Fp8Rows::W8a8, context, 512, kv_cache)?;
+                    draft.prepare_workspace()?;
+                    let receipts = draft.allocation_receipts(0)?;
+                    let life = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
+                    let mut facts = Facts { allocations: layout.owners.iter().filter(|o| !o.on_use)
+                        .map(|o| o.allocation(format!("draft.block.{}", o.id), 0, life, "block dSpark owner"))
+                        .collect(), deferred: vec![], sequential: vec![], allowances: vec![] };
+                    if !layout.packing_sources.is_empty() {
+                        facts.sequential.push(Sequential { id: "draft.block.packing".into(),
+                            members: layout.packing_sources.iter().map(|o| o.allocation(format!("draft.block.{}", o.id),
+                                0, Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad }, "BF16 packing source")).collect() });
+                    }
+                    let budgets = [Location::coordinator(0), Location::PINNED].into_iter().enumerate()
+                        .map(|(index, location)| Budget { id: format!("fixture.{index}"), locations: vec![location],
+                            physical_bytes: 1 << 30, logical_bytes: 1 << 30, headroom: 0,
+                            baseline: Baseline::Forecast { occupied: 0, source: "CPU fake DSO".into(), assumed: false } })
+                        .collect::<Vec<_>>();
+                    let plan = ResolvedPlan { request: Request { context: 256, pool: Pin::Exact(512),
+                        onboard: Pin::Auto, prefill: Pin::Auto, operation: Operation::Serving },
+                        decisions: Decisions { attention: vec![], onboard_layers: vec![vec![]],
+                            prefill: PrefillShape { rows: 4096, waves: 1 }, lanes: 1 }, pool_tokens: 512,
+                        phases: planner::evaluate(&facts, &budgets)?, facts, budgets };
+                    let mut live = std::collections::BTreeMap::new();
+                    let mut events = Vec::new();
+                    for event in audit.events() {
+                        match event {
+                            AllocationEvent::Allocated(a) => {
+                                let receipt = if a.key.scope == "draft.pack.source" {
+                                    Receipt { allocation: Allocation::buffer(a.key.owner.context("source tag")?,
+                                        Location::coordinator(0), a.bytes as u64,
+                                        Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad },
+                                        Category::Drafter, "BF16 packing source"), address: a.address as u64 }
+                                } else { receipts.iter().find(|r| r.address == a.address as u64 &&
+                                    (r.allocation.location == Location::PINNED) == (a.key.space == Space::Pinned))
+                                    .context("actual allocation missing from independent census")?.clone() };
+                                assert_eq!(receipt.allocation.bytes, a.bytes as u64);
+                                assert!(live.insert(a.address, receipt.clone()).is_none());
+                                events.push(OwnerEvent::Allocated { receipt, phase: Phase::DraftLoad });
+                            }
+                            AllocationEvent::Freed(a) => events.push(OwnerEvent::Freed {
+                                receipt: live.remove(&a.address).context("free without allocation")?, phase: Phase::DraftLoad }),
+                        }
+                    }
+                    planner::reconcile_events(&plan, Phase::Ready, &events, &[])?;
+                    let mut wrong = events.clone();
+                    if let OwnerEvent::Allocated { receipt, .. } = &mut wrong[0] { receipt.allocation.bytes += 1; }
+                    assert!(planner::reconcile_events(&plan, Phase::Ready, &wrong, &[]).is_err());
+                    assert!(planner::reconcile_events(&plan, Phase::Ready, &events[1..], &[]).is_err());
+                    if let Some(index) = events.iter().position(|e| matches!(e,
+                        OwnerEvent::Allocated { receipt, .. } if receipt.allocation.id.ends_with(".source"))) {
+                        let mut missing = events.clone();
+                        missing.drain(index..index + 2);
+                        assert!(planner::reconcile_events(&plan, Phase::Ready, &missing, &[]).is_err());
+                    }
+                    // SAFETY: the fixture has no queued consumers after eager preparation.
+                    unsafe { library.cuda_stream_synchronize(std::ptr::null_mut())?; }
+                    drop(audit);
+                    drop(draft);
+                    library.release_ordered_h2d_staging()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn full_context_destinations_never_wrap() {
         let cfg = geometry(None);
         assert_eq!(cfg.context_row(0, 8191, 2, 8192).unwrap(), 8191);
