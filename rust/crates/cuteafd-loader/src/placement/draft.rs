@@ -175,6 +175,33 @@ impl crate::formats::dflash::MlaDraftOwner {
     }
 }
 
+impl crate::families::glm5::draft_representation::GlmDraftRuntimeLayout {
+    /// GQA owners join the family's resolved contract; this is not a separate
+    /// capacity admission or a Ready-authorizing legacy bridge.
+    pub fn gqa_facts(&self, gpu: u8, sms: u64, mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache)
+        -> Result<super::planner::Facts, crate::families::glm5::draft_representation::GlmDraftStorageError> {
+        use super::planner::{Facts, Lifetime, Phase, Sequential};
+        let mut allocations = self.device_owners(sms, mode, kv_cache)?.iter().map(|owner| {
+            let load = owner.id.starts_with("weight.") || owner.id.starts_with("layer.")
+                || ["taps", "fused", "fused_norm", "context_positions", "context_slots", "context_kv", "fp8_scratch"]
+                    .contains(&owner.id.as_str());
+            owner.allocation(format!("draft.gqa.{}", owner.id), gpu,
+                Lifetime { first: if load { Phase::Load } else { Phase::Warmup }, last: Phase::Growth },
+                "GQA DFlash owner")
+        }).collect::<Vec<_>>();
+        allocations.extend(self.pinned_owners().iter().filter(|owner| !owner.on_use).map(|owner|
+            owner.allocation(format!("draft.gqa.{}", owner.id), gpu,
+                Lifetime { first: Phase::Warmup, last: Phase::Growth }, "GQA DFlash owner")));
+        let members: Vec<_> = self.packing_sources().iter().map(|owner| owner.allocation(
+            format!("draft.gqa.{}", owner.id), gpu,
+            Lifetime { first: Phase::Load, last: Phase::Load }, "BF16 packing source")).collect();
+        Ok(Facts { allocations, deferred: vec![], allowances: vec![],
+            sequential: if members.is_empty() { vec![] } else {
+                vec![Sequential { id: "draft.gqa.packing".into(), members }]
+            } })
+    }
+}
+
 impl crate::formats::dflash::MlaDraftRuntimeLayout {
     /// Temporary forecast for the legacy Kimi owner-only bridge. The family
     /// admits the shared synchronous upload store and diagnostic on-use stores;

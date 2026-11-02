@@ -905,11 +905,12 @@ pub(crate) struct DflashDrafter<'a> {
     confidence_scales: fp8_linear::Fp8Scales,
 }
 
-fn legacy_mla_owner_events(
+fn draft_owner_events(
     audit: &[cuteafd_ffi::memory_ledger::AllocationEvent],
     receipts: &[cuteafd_loader::placement::planner::Receipt],
     device: i32,
     phase: cuteafd_loader::placement::planner::Phase,
+    namespace: &str,
 ) -> Result<Vec<cuteafd_loader::placement::planner::OwnerEvent>> {
     use cuteafd_core::memory_layout::Category;
     use cuteafd_ffi::memory_ledger::{AllocationEvent, Space};
@@ -922,30 +923,30 @@ fn legacy_mla_owner_events(
         };
         let location = match record.key.space {
             Space::Device => {
-                ensure!(record.key.device == device, "MLA owner allocated on wrong physical device");
+                ensure!(record.key.device == device, "draft owner allocated on wrong physical device");
                 Location::coordinator(u8::try_from(device)?)
             }
             Space::Pinned => Location::PINNED,
-            Space::Managed => anyhow::bail!("unexpected managed MLA owner"),
+            Space::Managed => anyhow::bail!("unexpected managed draft owner"),
         };
         let key = (location, record.address);
         if allocated {
             let receipt = if record.key.scope == "draft.pack.source" {
-                ensure!(record.key.space == Space::Device, "MLA packing source is not device memory");
+                ensure!(record.key.space == Space::Device, "draft packing source is not device memory");
                 Receipt { allocation: Allocation::buffer(
-                    format!("draft.mla.{}", record.key.owner.context("MLA packing source missing ID")?),
+                    format!("{namespace}.{}", record.key.owner.context("draft packing source missing ID")?),
                     location, record.bytes as u64, Lifetime { first: phase, last: phase },
                     Category::Drafter, "BF16 packing source"), address: record.address as u64 }
             } else {
                 receipts.iter().find(|r| r.address == record.address as u64 && r.allocation.location == location)
-                    .context("audited MLA owner absent from independent retained fields")?.clone()
+                    .context("audited draft owner absent from independent retained fields")?.clone()
             };
-            ensure!(receipt.allocation.bytes == record.bytes as u64, "MLA census size differs from retained owner");
-            ensure!(live.insert(key, (record, receipt.clone())).is_none(), "MLA pointer reused before free");
+            ensure!(receipt.allocation.bytes == record.bytes as u64, "draft census size differs from retained owner");
+            ensure!(live.insert(key, (record, receipt.clone())).is_none(), "draft pointer reused before free");
             events.push(OwnerEvent::Allocated { receipt, phase });
         } else {
-            let (allocation, receipt) = live.remove(&key).context("MLA free without audited allocation")?;
-            ensure!(allocation.key == record.key && allocation.bytes == record.bytes, "MLA free differs from owner");
+            let (allocation, receipt) = live.remove(&key).context("draft free without audited allocation")?;
+            ensure!(allocation.key == record.key && allocation.bytes == record.bytes, "draft free differs from owner");
             events.push(OwnerEvent::Freed { receipt, phase });
         }
     }
@@ -1165,13 +1166,18 @@ impl<'a> DflashDrafter<'a> {
         };
         checkpoint.validate(&cfg)?;
         crate::shared::memory::budget::reserve_sync_h2d(library, layout.sync_upload_bytes())?;
-        let upload = |bytes: &[u8]| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, bytes.len().max(256))?;
+        let allocation = |id: &str, bytes: usize, matrix: bool| {
+            let packing = matrix && representation == GlmDraftRepresentation::Fp8Only;
+            let _owner = cuteafd_ffi::memory_ledger::owner(&if packing { format!("{id}.source") } else { id.into() });
+            DeviceAllocation::named(library, bytes, if packing { "draft.pack.source" } else { "drafter" })
+        };
+        let upload = |id: &str, bytes: &[u8], matrix| -> Result<Dev<'a>> {
+            let allocation = allocation(id, bytes.len().max(256), matrix)?;
             library.copy_h2d(allocation.buffer, bytes)?;
             Ok(allocation)
         };
-        let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+        let zeroed = |id: &str, bytes: usize| -> Result<Dev<'a>> {
+            let allocation = allocation(id, bytes.max(256), false)?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -1179,12 +1185,19 @@ impl<'a> DflashDrafter<'a> {
         let fp8_workspace = layout.fp8_scratch.as_ref().map(|scratch| {
             let shapes: Vec<_> = scratch.shapes.iter().map(|shape|
                 Ok((usize::try_from(shape.k)?, usize::try_from(shape.n)?))).collect::<Result<_>>()?;
-            fp8_linear::scratch_rows(library, scratch.rows, &shapes, fp8_rows)
+            let _owner = cuteafd_ffi::memory_ledger::owner("fp8_scratch");
+            let value = fp8_linear::scratch_rows(library, scratch.rows, &shapes, fp8_rows)?;
+            let expected = layout.device_owners(library.sm_count()? as u64, fp8_rows.code() as u8, kv_cache)?
+                .into_iter().find(|owner| owner.id == "fp8_scratch").context("missing GQA FP8 scratch recipe")?;
+            ensure!(value.buffer.bytes == expected.bytes, "GQA FP8 native scratch differs from recipe");
+            Ok::<_, anyhow::Error>(value)
         }).transpose()?;
-        let tensor = |name: &str, shape: &[usize]| checkpoint.bytes(name, shape).and_then(upload);
-        let concat = |parts: &[(&str, usize)], cols: usize| -> Result<Dev<'a>> {
+        let tensor = |id: &str, name: &str, shape: &[usize], matrix| {
+            checkpoint.bytes(name, shape).and_then(|bytes| upload(id, bytes, matrix))
+        };
+        let concat = |id: &str, parts: &[(&str, usize)], cols: usize| -> Result<Dev<'a>> {
             let total: usize = parts.iter().map(|(_, rows)| rows * cols * 2).sum();
-            let allocation = DeviceAllocation::new(library, total)?;
+            let allocation = allocation(id, total, true)?;
             let mut offset = 0;
             for (name, rows) in parts {
                 let bytes = checkpoint.bytes(name, &[*rows, cols])?;
@@ -1194,32 +1207,39 @@ impl<'a> DflashDrafter<'a> {
             }
             Ok(allocation)
         };
-        let matrix = |source, n, k| pack_draft_weight(library, source, n, k, representation, scales, stream);
+        let matrix = |id: &str, source, n, k| {
+            let _owner = cuteafd_ffi::memory_ledger::owner(id);
+            pack_draft_weight(library, source, n, k, representation, scales, stream)
+        };
         let layers = (0..cfg.layers).map(|l| -> Result<DraftLayer<'a>> {
             let p = format!("layers.{l}");
             let a = format!("{p}.self_attn");
+            let prefix = format!("weight.layer.{l}");
+            let linear = |leaf: &str, name: &str, n, k| -> Result<_> {
+                let id = format!("{prefix}.{leaf}");
+                matrix(&id, tensor(&id, name, &[n, k], true)?, n, k)
+            };
             Ok(DraftLayer {
-                input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
-                post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
-                attn_conv: matrix(tensor(&format!("{p}.attention_conv.kernel_projection.weight"), &[cfg.conv_width(), h])?,
-                    cfg.conv_width(), h)?,
-                attn_base: tensor(&format!("{p}.attention_conv.base_kernel"), &[2, 2, h])?,
-                mlp_conv: matrix(tensor(&format!("{p}.mlp_conv.kernel_projection.weight"), &[cfg.conv_width(), h])?,
-                    cfg.conv_width(), h)?,
-                mlp_base: tensor(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
+                input_norm: tensor(&format!("{prefix}.input_norm"), &format!("{p}.input_layernorm.weight"), &[h], false)?,
+                post_norm: tensor(&format!("{prefix}.post_norm"), &format!("{p}.post_attention_layernorm.weight"), &[h], false)?,
+                attn_conv: linear("attn_conv", &format!("{p}.attention_conv.kernel_projection.weight"), cfg.conv_width(), h)?,
+                attn_base: tensor(&format!("{prefix}.attn_base"), &format!("{p}.attention_conv.base_kernel"), &[2, 2, h], false)?,
+                mlp_conv: linear("mlp_conv", &format!("{p}.mlp_conv.kernel_projection.weight"), cfg.conv_width(), h)?,
+                mlp_base: tensor(&format!("{prefix}.mlp_base"), &format!("{p}.mlp_conv.base_kernel"), &[2, 2, h], false)?,
                 attention: DraftAttention::Gqa(GqaAttention {
-                    qkv: matrix(concat(&[(&format!("{a}.q_proj.weight"), cfg.heads * cfg.head_dim),
+                    qkv: matrix(&format!("{prefix}.attention.qkv"), concat(&format!("{prefix}.attention.qkv"),
+                        &[(&format!("{a}.q_proj.weight"), cfg.heads * cfg.head_dim),
                         (&format!("{a}.k_proj.weight"), kv), (&format!("{a}.v_proj.weight"), kv)], h)?, cfg.qkv_width(), h)?,
-                    q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
-                    k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
-                    o: matrix(tensor(&format!("{a}.o_proj.weight"), &[h, cfg.heads * cfg.head_dim])?,
-                        h, cfg.heads * cfg.head_dim)?,
-                    k_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
-                    v_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
+                    q_norm: tensor(&format!("{prefix}.attention.q_norm"), &format!("{a}.q_norm.weight"), &[cfg.head_dim], false)?,
+                    k_norm: tensor(&format!("{prefix}.attention.k_norm"), &format!("{a}.k_norm.weight"), &[cfg.head_dim], false)?,
+                    o: linear("attention.o", &format!("{a}.o_proj.weight"), h, cfg.heads * cfg.head_dim)?,
+                    k_ring: zeroed(&format!("layer.{l}.k_ring"), slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
+                    v_ring: zeroed(&format!("layer.{l}.v_ring"), slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
                 }),
-                gate_up: matrix(concat(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
+                gate_up: matrix(&format!("{prefix}.gate_up"), concat(&format!("{prefix}.gate_up"),
+                    &[(&format!("{p}.mlp.gate_proj.weight"), inter),
                     (&format!("{p}.mlp.up_proj.weight"), inter)], h)?, 2 * inter, h)?,
-                down: matrix(tensor(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?, h, inter)?,
+                down: linear("down", &format!("{p}.mlp.down_proj.weight"), h, inter)?,
             })
         }).collect::<Result<Vec<_>>>()?;
         let taps = cfg.taps.len() * h;
@@ -1232,19 +1252,20 @@ impl<'a> DflashDrafter<'a> {
             stream,
             slots,
             max_sequences,
-            fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps)?,
-            hidden_norm: tensor("hidden_norm.weight", &[h])?,
-            norm: tensor("norm.weight", &[h])?,
-            projection: matrix(tensor("candidate_selector.hidden_projection.weight", &[cfg.rank, h])?, cfg.rank, h)?,
-            predecessor: tensor("candidate_selector.predecessor_codebook", &[cfg.vocab, cfg.rank])?,
-            successor: tensor("candidate_selector.successor_codebook", &[cfg.vocab, cfg.rank])?,
+            fc: matrix("weight.fc", tensor("weight.fc", "fc.weight", &[h, taps], true)?, h, taps)?,
+            hidden_norm: tensor("weight.hidden_norm", "hidden_norm.weight", &[h], false)?,
+            norm: tensor("weight.norm", "norm.weight", &[h], false)?,
+            projection: matrix("weight.projection", tensor("weight.projection",
+                "candidate_selector.hidden_projection.weight", &[cfg.rank, h], true)?, cfg.rank, h)?,
+            predecessor: tensor("weight.predecessor", "candidate_selector.predecessor_codebook", &[cfg.vocab, cfg.rank], false)?,
+            successor: tensor("weight.successor", "candidate_selector.successor_codebook", &[cfg.vocab, cfg.rank], false)?,
             layers,
-            taps: zeroed(TAP_ROWS * taps * 2)?,
-            fused: zeroed(TAP_ROWS * h * 2)?,
-            fused_norm: zeroed(TAP_ROWS * h * 2)?,
-            context_positions: zeroed(TAP_ROWS * 8)?,
+            taps: zeroed("taps", TAP_ROWS * taps * 2)?,
+            fused: zeroed("fused", TAP_ROWS * h * 2)?,
+            fused_norm: zeroed("fused_norm", TAP_ROWS * h * 2)?,
+            context_positions: zeroed("context_positions", TAP_ROWS * 8)?,
             context: DraftContext::Gqa(GqaContext {
-                kv: zeroed(TAP_ROWS * 2 * kv * 2)?, slots: zeroed(TAP_ROWS * 4)?,
+                kv: zeroed("context_kv", TAP_ROWS * 2 * kv * 2)?, slots: zeroed("context_slots", TAP_ROWS * 4)?,
             }),
             mask_row,
             workspace: RefCell::new(None),
@@ -1475,6 +1496,123 @@ impl<'a> DflashDrafter<'a> {
         }
     }
 
+    /// The family appends these physical edges to its resolved-plan history;
+    /// a drafter subrecipe alone never authorizes family capacity or Ready.
+    pub(crate) fn gqa_allocation_events(&self, audit: &[cuteafd_ffi::memory_ledger::AllocationEvent],
+        phase: cuteafd_loader::placement::planner::Phase)
+        -> Result<Vec<cuteafd_loader::placement::planner::OwnerEvent>> {
+        use cuteafd_loader::placement::planner::Phase;
+        let device = self.library.cuda_get_device()?;
+        let receipts = self.gqa_allocation_receipts(u8::try_from(device)?, phase >= Phase::Warmup)?;
+        draft_owner_events(audit, &receipts, device, phase, "draft.gqa")
+    }
+
+    /// Independent GQA census: read retained fields and native buffers, never
+    /// manufacture physical receipts from the forecast descriptor inventory.
+    pub(crate) fn gqa_allocation_receipts(&self, gpu: u8, metadata: bool)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location, Phase, Receipt};
+        let DraftContext::Gqa(context) = &self.context else { anyhow::bail!("not a GQA drafter") };
+        let c = &self.cfg;
+        let (h, kv, attention) = (c.hidden, c.kv_width(), c.heads * c.head_dim);
+        let mut receipts = Vec::new();
+        let mut uploads = Vec::new();
+        let mut add = |id: String, buffer: CuteafdDeviceBuffer, dtype: &str, shape: Vec<usize>, first| {
+            if ["context_positions", "context_slots", "positions", "anchors", "ids", "tables"].contains(&id.as_str()) {
+                uploads.push((id.clone(), buffer));
+            }
+            let mut allocation = Allocation::buffer(format!("draft.gqa.{id}"), Location::coordinator(gpu),
+                buffer.bytes as u64, Lifetime { first, last: Phase::Growth }, Category::Drafter, "GQA DFlash owner");
+            allocation.dtype = dtype.into();
+            allocation.shape = shape.into_iter().map(|n| n as u64).collect();
+            receipts.push(Receipt { allocation, address: buffer.ptr as u64 });
+        };
+        let mut weight = |id: String, value: &DraftWeight<'_>, n: usize, k: usize| {
+            match value {
+                DraftWeight::Bf16(value) => add(id, value.buffer, "bf16", vec![n, k], Phase::Load),
+                DraftWeight::Fp8(value) => {
+                    let (values, scales) = value.buffers();
+                    add(format!("{id}.values"), values, "bytes", vec![value.n * value.k], Phase::Load);
+                    add(format!("{id}.scales"), scales, "f32", vec![value.n, value.k / 128], Phase::Load);
+                }
+            }
+        };
+        weight("weight.fc".into(), &self.fc, h, c.taps.len() * h);
+        weight("weight.projection".into(), &self.projection, c.rank, h);
+        for (index, layer) in self.layers.iter().enumerate() {
+            let a = layer.attention.gqa()?;
+            for (leaf, value, n, k) in [("attn_conv", &layer.attn_conv, c.conv_width(), h),
+                ("mlp_conv", &layer.mlp_conv, c.conv_width(), h), ("attention.qkv", &a.qkv, c.qkv_width(), h),
+                ("attention.o", &a.o, h, attention), ("gate_up", &layer.gate_up, 2 * c.intermediate, h),
+                ("down", &layer.down, h, c.intermediate)] {
+                weight(format!("weight.layer.{index}.{leaf}"), value, n, k);
+            }
+        }
+        for (id, value, shape) in [("weight.hidden_norm", &self.hidden_norm, vec![h]),
+            ("weight.norm", &self.norm, vec![h]), ("weight.predecessor", &self.predecessor, vec![c.vocab, c.rank]),
+            ("weight.successor", &self.successor, vec![c.vocab, c.rank]),
+            ("taps", &self.taps, vec![TAP_ROWS, c.taps.len(), h]), ("fused", &self.fused, vec![TAP_ROWS, h]),
+            ("fused_norm", &self.fused_norm, vec![TAP_ROWS, h]), ("context_kv", &context.kv, vec![TAP_ROWS, 2 * kv])] {
+            add(id.into(), value.buffer, "bf16", shape, Phase::Load);
+        }
+        add("context_positions".into(), self.context_positions.buffer, "i64", vec![TAP_ROWS], Phase::Load);
+        add("context_slots".into(), context.slots.buffer, "i32", vec![TAP_ROWS], Phase::Load);
+        for (index, layer) in self.layers.iter().enumerate() {
+            let a = layer.attention.gqa()?;
+            for (leaf, value, shape) in [("input_norm", &layer.input_norm, vec![h]),
+                ("post_norm", &layer.post_norm, vec![h]), ("attn_base", &layer.attn_base, vec![2, 2, h]),
+                ("mlp_base", &layer.mlp_base, vec![2, 2, h]),
+                ("attention.q_norm", &a.q_norm, vec![c.head_dim]), ("attention.k_norm", &a.k_norm, vec![c.head_dim])] {
+                add(format!("weight.layer.{index}.{leaf}"), value.buffer, "bf16", shape, Phase::Load);
+            }
+            for (leaf, value) in [("k_ring", &a.k_ring), ("v_ring", &a.v_ring)] {
+                add(format!("layer.{index}.{leaf}"), value.buffer, "bytes", vec![value.buffer.bytes], Phase::Load);
+            }
+        }
+        if let Some(scratch) = &self.fp8_workspace {
+            add("fp8_scratch".into(), scratch.buffer, "bytes", vec![scratch.buffer.bytes], Phase::Load);
+        }
+        let workspace = self.workspace.borrow();
+        if let Some(w) = workspace.as_ref() {
+            let (seq, rows, drafted) = (w.sequences, w.sequences * c.block, w.sequences * c.drafts());
+            for (id, value, width) in [("h", &w.h, h), ("n", &w.n, h), ("conv", &w.conv, h),
+                ("dynamic", &w.dynamic, c.conv_width()), ("delta", &w.delta, h),
+                ("gate_up", &w.gate_up, 2 * c.intermediate), ("act", &w.act, c.intermediate),
+                ("projected", &w.projected, c.rank)] {
+                add(id.into(), value.buffer, "bf16", vec![rows, width], Phase::Warmup);
+            }
+            for (id, value, dtype, shape) in [("logits", &w.logits, "f32", vec![rows, c.vocab]),
+                ("unary", &w.unary, "f32", vec![drafted, 16]), ("candidates", &w.candidates, "u32", vec![drafted, 16]),
+                ("anchors", &w.anchors, "u32", vec![seq]), ("ids", &w.ids, "u32", vec![rows]),
+                ("tokens", &w.tokens, "u32", vec![drafted]), ("features", &w.features, "bytes", vec![drafted, 16]),
+                ("positions", &w.positions, "i64", vec![rows]),
+                ("topk_workspace", &w.topk_workspace, "bytes", vec![w.topk_workspace.buffer.bytes]),
+                ("head_workspace", &w._head_workspace, "bytes", vec![w._head_workspace.buffer.bytes])] {
+                add(id.into(), value.buffer, dtype, shape, Phase::Warmup);
+            }
+            let a = w.attention.gqa()?;
+            for (id, value, width) in [("qkv", &a.qkv, c.qkv_width()), ("q", &a.q, attention),
+                ("k", &a.k, kv), ("v", &a.v, kv), ("attn", &a.attn, attention)] {
+                add(id.into(), value.buffer, "bf16", vec![rows, width], Phase::Warmup);
+            }
+            add("tables".into(), a.tables.buffer, "i32", vec![3, seq], Phase::Warmup);
+            add("attention_scratch".into(), a.scratch.buffer, "bytes", vec![a.scratch.buffer.bytes], Phase::Warmup);
+            receipts.push(Receipt { allocation: Allocation::buffer("draft.gqa.landing", Location::PINNED,
+                w.landing.buffer.bytes as u64, Lifetime { first: Phase::Warmup, last: Phase::Growth },
+                Category::Drafter, "GQA DFlash owner"), address: w.landing.buffer.ptr as u64 });
+        }
+        if metadata {
+            for (id, value) in uploads {
+                let buffer = self.library.ordered_h2d_staging_buffer(value, self.stream)?;
+                receipts.push(Receipt { allocation: Allocation::buffer(format!("draft.gqa.{id}.upload"), Location::PINNED,
+                    buffer.bytes as u64, Lifetime { first: Phase::Warmup, last: Phase::Growth },
+                    Category::Drafter, "GQA DFlash owner"), address: buffer.ptr as u64 });
+            }
+        }
+        Ok(receipts)
+    }
+
     /// Independent typed census of retained fields, never the forecast owner list.
     fn mla_allocation_receipts(&self, gpu: u8, metadata: bool)
         -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
@@ -1608,7 +1746,7 @@ impl<'a> DflashDrafter<'a> {
         let gpu = u8::try_from(device)?;
         let receipts = self.mla_allocation_receipts(gpu, phase >= Phase::Warmup)?;
         let mut events = self.legacy_mla_events.borrow().clone();
-        events.extend(legacy_mla_owner_events(audit, &receipts, device, phase)?);
+        events.extend(draft_owner_events(audit, &receipts, device, phase, "draft.mla")?);
         planner::reconcile_legacy_mla_events(&context.layout.legacy_mla_facts(gpu), phase, &events)?;
         let mut retained = std::collections::BTreeMap::new();
         for event in &events {
@@ -2186,12 +2324,19 @@ impl<'a> DflashDrafter<'a> {
             };
             Ok((owner.id.as_str(), existing, owner.bytes))
         }).collect::<Result<Vec<_>>>()?;
+        let owners = layout.device_owners(self.library.sm_count()? as u64, self.fp8_admitted.code() as u8, self.kv_cache)?;
+        let expected = |id: &str| owners.iter().find(|owner| owner.id == id).map(|owner| owner.bytes)
+            .with_context(|| format!("GQA workspace missing {id} recipe"));
+        let attention_bytes = self.library.glm_dflash_attention_workspace(sequences, c.kv_heads, RING + c.block)?.max(256);
+        let topk_bytes = self.library.glm_dflash_topk_workspace(drafted)?.max(256);
+        ensure!(attention_bytes == expected("attention_scratch")? && topk_bytes == expected("topk_workspace")?,
+            "GQA native workspace queries differ from named recipe");
         crate::shared::memory::budget::with_pinned_growth(&pending, || {
             let alloc = |bytes: usize| DeviceAllocation::new(self.library, bytes.max(256));
             let head_workspace = alloc(VOCABULARY_HEAD_WORKSPACE)?;
             let attention_workspace = {
                 let _scope = cuteafd_ffi::memory_ledger::scope("workspace/draft-attention");
-                alloc(self.library.glm_dflash_attention_workspace(sequences, c.kv_heads, RING + c.block)?)?
+                alloc(attention_bytes)?
             };
             let workspace = Workspace {
                 sequences,
@@ -2221,7 +2366,7 @@ impl<'a> DflashDrafter<'a> {
                 features: alloc(drafted * 16)?,
                 landing: crate::shared::memory::HostAllocation::new(self.library, drafted * 20)?,
                 positions: alloc(rows * 8)?,
-                topk_workspace: alloc(self.library.glm_dflash_topk_workspace(drafted)?)?,
+                topk_workspace: alloc(topk_bytes)?,
                 // SAFETY: the workspace buffer lives in the same struct and drops after the head.
                 head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
                     rows as u32, c.vocab as u32)? },
@@ -3108,7 +3253,7 @@ mod checkpoint_header_tests {
                 draft.prime_metadata()?;
                 let receipts = draft.mla_allocation_receipts(0, true)?;
                 let mut events = load;
-                events.extend(legacy_mla_owner_events(&audit.events(), &receipts, 0, Phase::Warmup)?);
+                events.extend(draft_owner_events(&audit.events(), &receipts, 0, Phase::Warmup, "draft.mla")?);
                 planner::reconcile_legacy_mla_events(&facts, Phase::Warmup, &events)?;
                 assert!(planner::reconcile_legacy_mla_events(&facts, Phase::Ready, &events).is_err());
                 let mut wrong = events.clone();
@@ -3133,6 +3278,104 @@ mod checkpoint_header_tests {
                 assert!(draft.legacy_mla_events.borrow().is_empty());
                 drop(audit); drop(draft);
                 fixture.finish_ordered_uploads(&library)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn actual_gqa_owners_and_fresh_sources_match_resolved_contract() -> Result<()> {
+        use cuteafd_ffi::memory_ledger::AllocationAudit;
+        use cuteafd_loader::placement::planner::{self, Baseline, Budget, Decisions, Location,
+            Operation, OwnerEvent, Phase, Pin, PrefillShape, Request, ResolvedPlan};
+        use std::io::Write;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let snapshot = fixture.directory().join("gqa");
+        std::fs::create_dir(&snapshot)?;
+        let config = serde_json::json!({"hidden_size":128,"intermediate_size":128,"num_hidden_layers":2,
+            "num_attention_heads":1,"num_key_value_heads":1,"head_dim":128,"rms_norm_eps":1e-5,
+            "sliding_window":2048,"vocab_size":16,"rope_parameters":{"rope_theta":10000.0},
+            "dflash_config":{"block_size":8,"conv_kernel_size":2,"conv_group_size":16,
+                "selector_rank":256,"selector_top_k":16,"target_layer_ids":[0],"mask_token_id":0}});
+        std::fs::write(snapshot.join("config.json"), serde_json::to_vec(&config)?)?;
+        let cfg = DflashConfig::read(&snapshot)?;
+        let mut header = serde_json::Map::new();
+        let mut offset = 0;
+        for (name, shape) in cfg.tensor_shapes() {
+            let bytes = shape.iter().product::<usize>() * 2;
+            header.insert(name, serde_json::json!({"dtype":"BF16","shape":shape,"data_offsets":[offset, offset + bytes]}));
+            offset += bytes;
+        }
+        let header = serde_json::to_vec(&header)?;
+        let mut file = std::fs::File::create(snapshot.join("model.safetensors"))?;
+        file.write_all(&(header.len() as u64).to_le_bytes())?;
+        file.write_all(&header)?;
+        file.set_len((8 + header.len() + offset) as u64)?;
+        drop(file);
+        for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
+            for cache in [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+                cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8] {
+                for arithmetic in [fp8_linear::Fp8Rows::W8a16, fp8_linear::Fp8Rows::W8a8] {
+                    let library = fixture.load()?;
+                    fixture.quiet_events(&library, true)?;
+                    fixture.immediate_copies(&library)?;
+                    fixture.configure_memory(&library, 0, 8 << 30)?;
+                    let layout = cfg.runtime_layout(representation, GlmDraftCapacity::new(2, 2, 8)?)?;
+                    // Shared library store has its own admission, not another private drafter owner.
+                    crate::shared::memory::budget::reserve_sync_h2d(&library, layout.sync_upload_bytes())?;
+                    let facts = layout.gqa_facts(0, 1, arithmetic.code() as u8, cache)?;
+                    let budgets = vec![Budget { id: "synthetic CPU device".into(), locations: vec![Location::coordinator(0)],
+                        physical_bytes: 8 << 30, logical_bytes: 8 << 30, headroom: 0,
+                        baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } },
+                        Budget { id: "synthetic CPU host".into(), locations: vec![Location::PINNED],
+                            physical_bytes: 8 << 30, logical_bytes: 8 << 30, headroom: 0,
+                            baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
+                    let prefill = PrefillShape { rows: 1, waves: 1 };
+                    let plan = ResolvedPlan { request: Request { context: 1, pool: Pin::Exact(64), onboard: Pin::Exact(0),
+                            prefill: Pin::Exact(prefill), operation: Operation::Serving },
+                        decisions: Decisions { attention: vec![], onboard_layers: vec![vec![]], prefill, lanes: 1 },
+                        pool_tokens: 64, phases: planner::evaluate(&facts, &budgets)?, facts, budgets };
+                    let audit = AllocationAudit::start();
+                    let draft = DflashDrafter::load(&library, &snapshot, std::fs::read(snapshot.join("model.safetensors"))?,
+                        std::ptr::null_mut(), 2, 2, vec![0; 256], false, representation,
+                        fp8_linear::Fp8Scales::Amax, arithmetic, cache)?;
+                    let mut events = draft.gqa_allocation_events(&audit.events(), Phase::Load)?;
+                    planner::reconcile_events(&plan, Phase::Load, &events, &[])?;
+                    assert!(planner::reconcile_events(&plan, Phase::Warmup, &events, &[]).is_err());
+                    let source_ids = events.iter().filter_map(|event| match event {
+                        OwnerEvent::Allocated { receipt, .. } if receipt.allocation.id.ends_with(".source") =>
+                            Some(receipt.allocation.id.clone()), _ => None,
+                    }).collect::<Vec<_>>();
+                    assert_eq!(source_ids, layout.packing_sources().iter().map(|s| format!("draft.gqa.{}", s.id)).collect::<Vec<_>>());
+                    drop(audit);
+                    let warmup = AllocationAudit::start();
+                    *draft.workspace.borrow_mut() = Some(draft.workspace(2)?);
+                    events.extend(draft.gqa_allocation_events(&warmup.events(), Phase::Warmup)?);
+                    planner::reconcile_events(&plan, Phase::Warmup, &events, &[])?;
+                    let receipts = draft.gqa_allocation_receipts(0, true)?;
+                    assert_eq!(receipts.len(), plan.facts.allocations.len());
+                    assert!(receipts.iter().all(|r| !r.allocation.id.ends_with("taps.upload") && !r.allocation.id.ends_with("h.upload")));
+                    let metadata = AllocationAudit::start();
+                    draft.prime_metadata()?;
+                    assert!(metadata.events().is_empty(), "priming must reuse all six eagerly admitted stores");
+                    drop(metadata);
+                    let mut wrong = events.clone();
+                    if let OwnerEvent::Allocated { receipt, .. } = &mut wrong[0] { receipt.allocation.bytes += 1; }
+                    assert!(planner::reconcile_events(&plan, Phase::Warmup, &wrong, &[]).is_err());
+                    for source in &plan.facts.sequential {
+                        for member in &source.members {
+                            let missing = events.iter().filter(|event| match event {
+                                OwnerEvent::Allocated { receipt, .. } | OwnerEvent::Freed { receipt, .. } =>
+                                    receipt.allocation.id != member.id,
+                            }).cloned().collect::<Vec<_>>();
+                            assert_eq!(events.len() - missing.len(), 2);
+                            assert!(planner::reconcile_events(&plan, Phase::Warmup, &missing, &[]).is_err());
+                        }
+                    }
+                    drop(warmup); drop(draft);
+                    fixture.finish_ordered_uploads(&library)?;
+                }
             }
         }
         Ok(())
