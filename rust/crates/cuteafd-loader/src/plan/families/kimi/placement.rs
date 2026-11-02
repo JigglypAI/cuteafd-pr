@@ -322,7 +322,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             memory.pool_tokens = placed.pool_tokens;
             report.attention_placement = placed.attention_placement;
             for gpu in 0..2 {
-                let mut device = DeviceLayout { kind: DeviceKind::Rtx, index: gpu as u32, capacity_bytes: opts.rtx_bytes[gpu],
+                let mut device = DeviceLayout { kind: DeviceKind::Rtx, index: gpu as u32, capacity_bytes: opts.rtx_bytes[gpu], worker_budget_bytes: 0,
                     items: placed.items[gpu].clone(), kv_tokens: placed.pool_tokens };
                 // The solver subtracts this guard from availability, not from its item ledger.
                 device.items.push(Item::new(Category::Reserved, "coordinator headroom", "", opts.headroom_bytes, Basis::Formula)
@@ -356,7 +356,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);
     for rank in 0..ranks {
         let resident = spark_budget.resident[rank][onboarded..].iter().sum::<u64>();
-        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_bytes,
+        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_bytes, worker_budget_bytes: opts.spark_bytes,
             kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed experts (balanced H128, replicated 3584 rotations)",
                 model.expert_formats.join("+"), resident, Basis::Exact)] };
         if let Err(error) = crate::plan::layout::charge_spark_io(&mut device, &working, cuteafd_core::ExpertGeometry::KIMI_K3,

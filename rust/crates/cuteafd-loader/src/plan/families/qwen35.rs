@@ -199,6 +199,6 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
             crate::formats::block_dspark::MAX_SEQUENCES));
     }
     Ok(MemoryLayout { devices: vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
-        capacity_bytes: capacity - (1 << 30), items, kv_tokens: result.pool_tokens }],
+        capacity_bytes: capacity - (1 << 30), worker_budget_bytes: 0, items, kv_tokens: result.pool_tokens }],
         pool_tokens: result.pool_tokens, waste: vec![], notes })
 }

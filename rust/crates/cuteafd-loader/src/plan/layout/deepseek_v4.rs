@@ -46,7 +46,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let ranks = if split { 2 } else { 1 };
     let mut devices: Vec<DeviceLayout> = options.rtx_bytes.iter().take(gpus).enumerate()
         .map(|(index, &bytes)| DeviceLayout { kind: DeviceKind::Rtx, index: index as u32,
-            capacity_bytes: bytes, items: Vec::new(), kv_tokens: 0 }).collect();
+            capacity_bytes: bytes, worker_budget_bytes: 0, items: Vec::new(), kv_tokens: 0 }).collect();
     let mut waste = Vec::new();
     let mut notes = vec![format!("resolved context {} tokens (checkpoint {})", shape.context_tokens, shape.checkpoint_context),
         format!("attention placement {}", report.attention_placement)];

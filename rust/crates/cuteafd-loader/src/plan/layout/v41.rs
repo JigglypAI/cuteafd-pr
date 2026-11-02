@@ -58,7 +58,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let weights = resident_weights(checkpoint, ranks, false)
         .context("unsupported V4.1 native backbone residency: check non-expert tensor formats and geometry")?;
     let mut devices = options.rtx_bytes.iter().enumerate().map(|(rank, &bytes)| DeviceLayout {
-        kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: bytes,
+        kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: bytes, worker_budget_bytes: 0,
         items: weights[rank].clone(), kv_tokens: 0,
     }).collect::<Vec<_>>();
     let mut waste = Vec::new();

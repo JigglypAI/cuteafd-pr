@@ -35,11 +35,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let base = cfg.as_ref().and_then(|cfg| cfg.program_family().ok()).unwrap_or("mimo");
         let families = std::iter::once(base.to_string()).chain((ranks == 2).then(|| format!("{base}2"))).collect::<Vec<_>>();
         let runtime = runtime_item(manifest, &families, "*", ranks == 2, rank, total);
-        DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: total,
+        DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: total, worker_budget_bytes: 0,
             items: vec![runtime], kv_tokens: 0 }
     }).collect::<Vec<_>>();
     let mut sparks = (0..spark_ranks).map(|rank| DeviceLayout { kind: DeviceKind::Spark,
-        index: rank as u32, capacity_bytes: options.spark_bytes, kv_tokens: 0,
+        index: rank as u32, capacity_bytes: options.spark_bytes, worker_budget_bytes: options.spark_bytes, kv_tokens: 0,
         items: vec![cuteafd_core::memory_layout::spark_runtime_residual(),
             Item::new(Category::Runtime, "context+modules", "", 512 * MIB, Basis::Calibrated)] }).collect::<Vec<_>>();
     // Media sees fixed target/pool demands and mandatory experts, not the
@@ -506,7 +506,7 @@ mod tests {
                         }, &MimoCapacityOptions { checkpoint_max_context_tokens: 1 << 20, max_context_tokens: 32768,
                             rings: opts.mimo_rings(), mark_slots: slots, kv_cache: kv, ranks: runtime, host_prefix_bytes: 0 }).unwrap();
                         let mut devices: Vec<_> = (0..ranks).map(|rank| DeviceLayout {
-                            kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: 95 * GIB,
+                            kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: 95 * GIB, worker_budget_bytes: 0,
                             items: vec![], kv_tokens: 0,
                         }).collect();
                         let placement = apply(&input, &opts, &mut devices, 4, 4096, 4, 32768, None).unwrap();
@@ -547,7 +547,7 @@ mod tests {
                 prefill_rows: rows, prefill_unit_rows: Some(rows), prefill_waves: 3, prefill_lanes: 3,
                 concurrency: 4, ..Default::default() };
             let initial = vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
-                capacity_bytes: 95 * GIB, items: vec![], kv_tokens: 0 }];
+                capacity_bytes: 95 * GIB, worker_budget_bytes: 0, items: vec![], kv_tokens: 0 }];
             let mut expected = initial.clone();
             let (placement, working) = apply_selected(&input, &options, &mut expected,
                 4, rows, 4, 32768, None).unwrap();
@@ -585,7 +585,7 @@ mod tests {
             let admitted = resolve_capacity_with_startup_peaks(policy, &profile.steady,
                 &[DeviceMemory { device: 0, total_bytes: total, baseline_free_bytes: total - baseline }],
                 &[(0, 64 << 20)]).unwrap();
-            let mut devices = vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0, capacity_bytes: total,
+            let mut devices = vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0, capacity_bytes: total, worker_budget_bytes: 0,
                 items: vec![Item::new(Category::Runtime, "context+modules", "", baseline + cublas, Basis::Exact)], kv_tokens: 0 }];
             let pool = apply(&input, &opts, &mut devices, 2, 4096, 4, 1 << 20, None).unwrap().pool_tokens;
             assert_eq!(pool, admitted.allocated_gpu_kv_tokens, "recorded total {total}");
@@ -723,7 +723,7 @@ mod tests {
                     }
                     let capacity = resolved_capacity(&selected, runtime_request, runtime, 16, 16).unwrap();
                     let mut devices = totals.iter().enumerate().map(|(rank, &total)| DeviceLayout {
-                        kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: total, kv_tokens: 0,
+                        kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: total, worker_budget_bytes: 0, kv_tokens: 0,
                         items: vec![Item::new(Category::Runtime, "context+modules", "measured post-module",
                             baseline[rank], Basis::Calibrated)],
                     }).collect::<Vec<_>>();
@@ -787,7 +787,7 @@ mod tests {
         assert_eq!(recipe.widths, [352, 352, 352, 352, 320, 320]);
         assert_eq!(recipe.required_layouts, ["tp6-w352", "tp6-w320"]);
         let mut sparks = (0..6).map(|rank| DeviceLayout {
-            kind: DeviceKind::Spark, index: rank, capacity_bytes: 108 * GIB,
+            kind: DeviceKind::Spark, index: rank, capacity_bytes: 108 * GIB, worker_budget_bytes: 108 * GIB,
             items: vec![], kv_tokens: 0,
         }).collect::<Vec<_>>();
         spark_experts(&input, &options, &mut sparks, 0).unwrap();
@@ -831,7 +831,7 @@ mod tests {
                     head_split: ranks == 2, concurrency: 4,
                     mimo_expert_manifest: Some(manifest.clone()), ..Default::default() };
                 let devices = || (0..ranks).map(|rank| DeviceLayout {
-                    kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: 32 * GIB,
+                    kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: 32 * GIB, worker_budget_bytes: 0,
                     items: vec![], kv_tokens: 0,
                 }).collect::<Vec<_>>();
                 assert!(apply(&input, &options, &mut devices(), 0, 4096, 4, 256 << 10, None).is_err(),
