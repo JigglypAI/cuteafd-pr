@@ -917,7 +917,7 @@ pub(super) mod tests {
                         if enabled {
                             let layout = draft.with_pool_tokens(pool_cap.map_or(tokens as usize, |cap| cap.min(tokens as usize)))?;
                             let (mut demand, peak) = layout.demands(1)?;
-                            if drop_workspace { demand.owned.retain(|d| d.group == "MLA DFlash owned weights"
+                            if drop_workspace { demand.owned.retain(|d| d.group.starts_with("MLA DFlash weight.")
                                 || d.group.starts_with("MLA DFlash layer.")); }
                             trial.movables = vec![demand.movable(2)?]; trial.startup = vec![peak];
                         }
@@ -1072,7 +1072,7 @@ pub(super) mod tests {
         admitted.placement.movables[0].1 = 0;
         assert!(admitted.check_draft(1).is_err());
         admitted.placement.movables[0].1 = 1;
-        let charge = admitted.placement.items[1].iter_mut().find(|item| item.group == "MLA DFlash owned weights").unwrap();
+        let charge = admitted.placement.items[1].iter_mut().find(|item| item.group == "MLA DFlash weight.fc.values").unwrap();
         charge.bytes -= 1;
         assert!(admitted.check_draft(1).is_err());
         assert!(admit(inputs(&cfg))?.check_draft(1).is_err());

@@ -54,6 +54,20 @@ pub struct MlaDraftOwner {
     /// Diagnostic host-row/tap inputs create staging lazily; normal device input does not.
     pub on_use: bool,
 }
+impl MlaDraftOwner {
+    pub fn new(id: impl Into<String>, domain: MlaDraftDomain, dtype: MlaDraftDtype,
+        shape: Vec<usize>, minimum_bytes: usize) -> Result<Self> {
+        let width = match dtype { MlaDraftDtype::Bytes => 1, MlaDraftDtype::Bf16 => 2,
+            MlaDraftDtype::F32 | MlaDraftDtype::I32 | MlaDraftDtype::U32 => 4,
+            MlaDraftDtype::I64 => 8 };
+        if shape.is_empty() || shape.contains(&0) { return Err(unsupported("draft owner has an empty shape")); }
+        let bytes = shape.iter().try_fold(width, |n: usize, &d| n.checked_mul(d))
+            .ok_or_else(|| unsupported("draft owner byte extent overflow"))?.max(minimum_bytes);
+        Ok(Self { id: id.into(), domain, dtype, shape, bytes, alignment: 1,
+            lifetime: MlaDraftLifetime::Runtime, shared_key: None, staging_for: None, on_use: false })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlaDraftView {
     pub id: String,
@@ -77,6 +91,8 @@ pub struct MlaDraftRuntimeLayout {
     fp8_mode: u8,
     buffers: Vec<MlaDraftBuffer>,
     owners: Vec<MlaDraftOwner>,
+    packing_sources: Vec<MlaDraftOwner>,
+    sync_upload_bytes: usize,
 }
 
 impl MlaDraftRuntimeLayout {
@@ -88,11 +104,18 @@ impl MlaDraftRuntimeLayout {
     pub fn target_taps(&self) -> &[usize] { &self.target_taps }
     pub fn buffers(&self) -> &[MlaDraftBuffer] { &self.buffers }
     pub fn owners(&self) -> &[MlaDraftOwner] { &self.owners }
-    pub fn device_buffers(&self) -> Vec<MlaDraftBuffer> {
-        if self.owners.is_empty() { return self.buffers.clone(); }
-        self.owners.iter().filter(|o| o.domain == MlaDraftDomain::Device)
-            .map(|o| MlaDraftBuffer { name: o.id.clone(), bytes: o.bytes }).collect()
+    pub fn packing_sources(&self) -> &[MlaDraftOwner] { &self.packing_sources }
+    pub fn sync_upload_bytes(&self) -> usize { self.sync_upload_bytes }
+    /// The loader retains the whole safetensors file. Native MLA reordering also
+    /// materializes a source and an output; Vec growth is a labelled heap allowance.
+    pub fn loading_host_bytes(&self, checkpoint_file_bytes: u64) -> Result<u64> {
+        let upload = (self.sync_upload_bytes as u64).checked_mul(4)
+            .ok_or_else(|| unsupported("MLA draft loading heap overflow"))?;
+        checkpoint_file_bytes.checked_add(upload)
+            .ok_or_else(|| unsupported("MLA draft loading heap overflow"))
     }
+    /// Uploaded weights have their own loaders; only arenas use this allocator.
+    pub fn device_buffers(&self) -> Vec<MlaDraftBuffer> { self.buffers.clone() }
     pub fn allocate_device_with<T, E>(&self, mut allocate: impl FnMut(&MlaDraftBuffer) -> std::result::Result<T, E>)
         -> std::result::Result<Vec<T>, E> {
         self.device_buffers().iter().map(&mut allocate).collect()
@@ -175,6 +198,10 @@ impl MlaDraftRuntimeLayout {
                 let name = format!("layer.{index}.cache");
                 next.buffers.iter_mut().find(|buffer| buffer.name == name)
                     .ok_or_else(|| unsupported("draft pool allocation recipe missing layer"))?.bytes = bytes.max(256);
+                let owner = next.owners.iter_mut().find(|owner| owner.id == name)
+                    .ok_or_else(|| unsupported("draft pool owner recipe missing layer"))?;
+                owner.bytes = bytes.max(256);
+                owner.shape = vec![owner.bytes];
             }
         }
         next.resident_bytes()?;
@@ -192,9 +219,9 @@ impl MlaDraftRuntimeLayout {
     }
 
     pub fn resident_bytes(&self) -> Result<u64> {
-        self.buffer_bytes()?.checked_add(self.weights.resident_bytes()
-            .map_err(|_| unsupported("MLA draft weight total overflow"))?)
-            .ok_or_else(|| unsupported("MLA draft runtime total overflow"))
+        self.owners.iter().filter(|owner| owner.domain == MlaDraftDomain::Device && !owner.on_use)
+            .try_fold(0u64, |sum, owner| sum.checked_add(owner.bytes as u64)
+                .ok_or_else(|| unsupported("MLA draft runtime total overflow")))
     }
 
     /// Allocation never derives another size or silently rounds beyond admission.
@@ -209,11 +236,12 @@ impl MlaDraftRuntimeLayout {
     pub fn demands(&self, gpu: u8) -> Result<(crate::placement::draft::DrafterDemand, crate::placement::Demand)> {
         use crate::placement::{draft::DrafterDemand, Demand};
         use cuteafd_core::memory_layout::{Basis, Category};
-        let mut owned = vec![Demand::new(gpu, Category::Drafter, "MLA DFlash owned weights",
-            self.weights.resident_bytes().map_err(|_| unsupported("MLA draft weights overflow"))?, Basis::Formula)];
-        owned.extend(self.buffers.iter().map(|b| Demand::new(gpu, Category::Drafter,
-            format!("MLA DFlash {}", b.name), b.bytes as u64, Basis::Formula)));
-        let peak = self.resident_bytes()?.checked_add(self.weights.max_load_staging)
+        let owned = self.owners.iter()
+            .filter(|owner| owner.domain == MlaDraftDomain::Device && !owner.on_use)
+            .map(|owner| Demand::new(gpu, Category::Drafter,
+                format!("MLA DFlash {}", owner.id), owner.bytes as u64, Basis::Formula)).collect();
+        let staging = self.packing_sources.iter().map(|owner| owner.bytes as u64).max().unwrap_or(0);
+        let peak = self.resident_bytes()?.checked_add(staging)
             .ok_or_else(|| unsupported("MLA draft startup peak overflow"))?;
         Ok((DrafterDemand::itemized(owned, gpu), Demand::new(gpu, Category::Drafter,
             "MLA DFlash load peak including transient packing", peak, Basis::Formula)))
@@ -694,34 +722,77 @@ impl MlaDflashConfig {
     pub fn weight_layout(&self,
         mode: crate::families::glm5::draft_representation::GlmDraftRepresentation)
         -> Result<crate::families::glm5::draft_representation::GlmDraftWeightLayout> {
-        use crate::families::glm5::draft_representation::{GlmDraftRepresentation, GlmDraftWeightLayout};
+        use crate::families::glm5::draft_representation::GlmDraftWeightLayout;
         let overflow = || unsupported("MLA draft weight admission overflow");
+        let (owners, sources, _) = self.weight_owners(mode)?;
         let mut layout = GlmDraftWeightLayout { bf16_values: 0, fp8_values: 0, fp8_scales: 0,
             bf16_auxiliary: 0, bf16_codebooks: 0, max_load_staging: 0 };
-        for (name, shape) in self.tensor_shapes() {
-            let values = shape.iter().try_fold(1u64, |n, &d| n.checked_mul(d as u64))
-                .ok_or_else(overflow)?;
-            let bytes = values.checked_mul(2).ok_or_else(overflow)?;
-            let codebook = name.ends_with("_codebook");
-            let matrix = name == "fc.weight" || name == "candidate_selector.hidden_projection.weight"
-                || name.contains(".kernel_projection.") || name.contains(".mlp.");
-            let fp8 = matrix && mode == GlmDraftRepresentation::Fp8Only;
-            let destination = if fp8 {
+        for owner in owners {
+            let destination = if owner.id.ends_with(".scales") { &mut layout.fp8_scales }
+                else if owner.id.ends_with(".values") { &mut layout.fp8_values }
+                else if owner.id == "weight.predecessor" || owner.id == "weight.successor" { &mut layout.bf16_codebooks }
+                else if owner.shape.len() == 1 || owner.id.ends_with("_base") { &mut layout.bf16_auxiliary }
+                else { &mut layout.bf16_values };
+            *destination = destination.checked_add(owner.bytes as u64).ok_or_else(overflow)?;
+        }
+        layout.max_load_staging = sources.iter().map(|o| o.bytes as u64).max().unwrap_or(0);
+        layout.loading_peak_bytes().map_err(|_| overflow())?;
+        Ok(layout)
+    }
+
+    fn weight_owners(&self, mode: crate::families::glm5::draft_representation::GlmDraftRepresentation)
+        -> Result<(Vec<MlaDraftOwner>, Vec<MlaDraftOwner>, usize)> {
+        use crate::families::glm5::draft_representation::GlmDraftRepresentation;
+        use MlaDraftDtype::{Bf16, Bytes, F32};
+        let mut owners = Vec::new();
+        let mut sources = Vec::new();
+        let mut sync = 0usize;
+        let mut add = |id: String, shape: Vec<usize>, matrix: bool, upload: Option<usize>| -> Result<()> {
+            let source = MlaDraftOwner::new(format!("{id}.source"), MlaDraftDomain::Device, Bf16, shape.clone(), 256)?;
+            sync = sync.max(upload.unwrap_or(source.bytes));
+            if matrix && mode == GlmDraftRepresentation::Fp8Only {
                 if shape.len() != 2 || shape[0] % 16 != 0 || shape[1] % 128 != 0 {
                     return Err(unsupported("MLA draft FP8 GEMMs require N multiples of 16 and K multiples of 128"));
                 }
-                layout.fp8_scales = layout.fp8_scales.checked_add(values / 128 * 4)
-                    .ok_or_else(overflow)?;
-                layout.max_load_staging = layout.max_load_staging.max(bytes);
-                &mut layout.fp8_values
-            } else if codebook { &mut layout.bf16_codebooks }
-            else if shape.len() == 1 || name.ends_with(".base_kernel") { &mut layout.bf16_auxiliary }
-            else { &mut layout.bf16_values };
-            *destination = destination.checked_add(if fp8 { values } else { bytes })
-                .ok_or_else(overflow)?;
+                let values = source.bytes / 2;
+                owners.push(MlaDraftOwner::new(format!("{id}.values"), MlaDraftDomain::Device, Bytes, vec![values], 0)?);
+                owners.push(MlaDraftOwner::new(format!("{id}.scales"), MlaDraftDomain::Device, F32,
+                    vec![shape[0], shape[1] / 128], 0)?);
+                sources.push(MlaDraftOwner { dtype: Bytes, shape: vec![source.bytes], ..source });
+            } else {
+                owners.push(MlaDraftOwner { id, ..source });
+            }
+            Ok(())
+        };
+        let (h, inter, mla) = (self.mla.hidden, self.intermediate, &self.mla);
+        // Match the executor's fresh-per-matrix packing order, including concatenations.
+        for layer in 0..self.windows.len() {
+            let p = format!("weight.layer.{layer}");
+            for leaf in ["input_norm", "post_norm"] { add(format!("{p}.{leaf}"), vec![h], false, None)?; }
+            for conv in ["attn", "mlp"] {
+                add(format!("{p}.{conv}_conv"), vec![4 * h / self.group, h], true, None)?;
+                add(format!("{p}.{conv}_base"), vec![2, 2, h], false, None)?;
+            }
+            for (leaf, shape) in [
+                ("qkv_a", vec![mla.q_rank + mla.kv_rank + mla.rope, h]),
+                ("q_norm", vec![mla.q_rank]), ("kv_norm", vec![mla.kv_rank]),
+                ("q_b", vec![mla.heads * (mla.nope + mla.rope), mla.q_rank]),
+                ("uk", vec![mla.heads, mla.kv_rank, mla.nope]),
+                ("uv", vec![mla.heads, mla.value, mla.kv_rank]),
+                ("output", vec![h, mla.heads * mla.value]),
+            ] { add(format!("{p}.attention.{leaf}"), shape, false, None)?; }
+            let half = inter.checked_mul(h).and_then(|n| n.checked_mul(2))
+                .ok_or_else(|| unsupported("MLA draft gate/up extent overflow"))?;
+            add(format!("{p}.gate_up"), vec![2 * inter, h], true, Some(half))?;
+            add(format!("{p}.down"), vec![h, inter], true, None)?;
         }
-        layout.loading_peak_bytes().map_err(|_| overflow())?;
-        Ok(layout)
+        add("weight.fc".into(), vec![h, self.taps.len() * h], true, None)?;
+        for leaf in ["hidden_norm", "norm"] { add(format!("weight.{leaf}"), vec![h], false, None)?; }
+        add("weight.projection".into(), vec![self.selector_rank, h], true, None)?;
+        for leaf in ["predecessor", "successor"] {
+            add(format!("weight.{leaf}"), vec![self.vocab, self.selector_rank], false, None)?;
+        }
+        Ok((owners, sources, sync))
     }
 
     /// One checked inventory for the shared executor's common buffers and the
@@ -751,48 +822,49 @@ impl MlaDflashConfig {
         let program = self.program_layout(compiled_context)?;
         let cache = self.cache_layout(capacity.context_slots, compiled_context, cache_format)?;
         let paged_cache = self.paged_cache_layout(capacity.context_slots, compiled_context, target_pool_tokens, cache_format)?;
-        let mut weights = self.weight_layout(mode)?;
+        let weights = self.weight_layout(mode)?;
         let fp8 = mode == GlmDraftRepresentation::Fp8Only;
         let (h, inter, rows, seq) = (self.mla.hidden, self.intermediate,
             capacity.block_rows, capacity.max_batch_sequences);
         let drafted = seq * (self.block - 1);
         let tap_rows = MlaDraftRuntimeLayout::TAP_ROWS;
         let native_rows = MlaDraftProgramLayout::ROWS;
+        use MlaDraftDtype::{Bf16, Bytes, F32, I32, I64, U32};
         let mut buffers = Vec::new();
-        let mut add = |name: String, dimensions: &[usize]| -> Result<()> {
-            let bytes = dimensions.iter().try_fold(1usize, |n, &d| n.checked_mul(d))
-                .ok_or_else(|| unsupported("MLA draft arena multiplication overflow"))?.max(256);
-            buffers.push(MlaDraftBuffer { name, bytes });
+        let mut owners = Vec::new();
+        let mut add = |name: String, dtype, shape: Vec<usize>| -> Result<()> {
+            let owner = MlaDraftOwner::new(name.clone(), MlaDraftDomain::Device, dtype, shape, 256)?;
+            buffers.push(MlaDraftBuffer { name, bytes: owner.bytes });
+            owners.push(owner);
             Ok(())
         };
         for (index, layer) in cache.layers.iter().enumerate() {
-            add(format!("layer.{index}.cache"), &[paged_cache.layer_bytes[index]])?;
-            add(format!("layer.{index}.page_table"), &[layer.table_width, layer.slots, 4])?;
+            add(format!("layer.{index}.cache"), Bytes, vec![paged_cache.layer_bytes[index]])?;
+            add(format!("layer.{index}.page_table"), I32, vec![layer.slots, layer.table_width])?;
         }
-        // Absolute RoPE inputs and origin-relative cache destinations are I64.
-        for (name, dims) in [
-            ("taps", vec![tap_rows, self.taps.len(), h, 2]),
-            ("fused", vec![tap_rows, h, 2]), ("fused_norm", vec![tap_rows, h, 2]),
-            ("context_positions", vec![tap_rows, 8]), ("context_slots", vec![tap_rows, 8]),
-            ("inverse_frequencies", vec![self.mla.rope / 2, 4]),
-            ("query", vec![native_rows, 64, 576, 2]),
-            ("q_residual", vec![native_rows, 1536, 2]),
-            ("attention", vec![native_rows, 64, 512, 2]),
-            ("lse", vec![native_rows, 64, 4]),
-            ("native_scratch", vec![program.scratch_bytes()]),
-            ("lengths", vec![seq, 4]), ("query_offsets", vec![seq + 1, 4]),
-            ("native_slots", vec![native_rows, 8]), ("native_positions", vec![native_rows, 8]),
-            ("head_workspace", vec![4 << 20]),
-            ("h", vec![rows, h, 2]), ("n", vec![rows, h, 2]),
-            ("conv", vec![rows, h, 2]), ("dynamic", vec![rows, 4 * h / self.group, 2]),
-            ("delta", vec![rows, h, 2]), ("gate_up", vec![rows, 2 * inter, 2]),
-            ("act", vec![rows, inter, 2]), ("logits", vec![rows, self.vocab, 4]),
-            ("unary", vec![drafted, 16, 4]), ("candidates", vec![drafted, 16, 4]),
-            ("projected", vec![rows, self.selector_rank, 2]), ("anchors", vec![seq, 4]),
-            ("ids", vec![rows, 4]), ("tokens", vec![drafted, 4]),
-            ("features", vec![drafted, 16]), ("positions", vec![rows, 8]),
-            ("topk_workspace", vec![drafted, 64, 16, 8]),
-        ] { add(name.into(), &dims)?; }
+        for (name, dtype, dims) in [
+            ("taps", Bf16, vec![tap_rows, self.taps.len(), h]),
+            ("fused", Bf16, vec![tap_rows, h]), ("fused_norm", Bf16, vec![tap_rows, h]),
+            ("context_positions", I64, vec![tap_rows]), ("context_slots", I64, vec![tap_rows]),
+            ("inverse_frequencies", F32, vec![self.mla.rope / 2]),
+            ("query", Bf16, vec![native_rows, 64, 576]),
+            ("q_residual", Bf16, vec![native_rows, 1536]),
+            ("attention", Bf16, vec![native_rows, 64, 512]),
+            ("lse", F32, vec![native_rows, 64]),
+            ("native_scratch", Bytes, vec![program.scratch_bytes()]),
+            ("lengths", I32, vec![seq]), ("query_offsets", I32, vec![seq + 1]),
+            ("native_slots", I64, vec![native_rows]), ("native_positions", I64, vec![native_rows]),
+            ("head_workspace", Bytes, vec![4 << 20]),
+            ("h", Bf16, vec![rows, h]), ("n", Bf16, vec![rows, h]),
+            ("conv", Bf16, vec![rows, h]), ("dynamic", Bf16, vec![rows, 4 * h / self.group]),
+            ("delta", Bf16, vec![rows, h]), ("gate_up", Bf16, vec![rows, 2 * inter]),
+            ("act", Bf16, vec![rows, inter]), ("logits", F32, vec![rows, self.vocab]),
+            ("unary", F32, vec![drafted, 16]), ("candidates", U32, vec![drafted, 16]),
+            ("projected", Bf16, vec![rows, self.selector_rank]), ("anchors", U32, vec![seq]),
+            ("ids", U32, vec![rows]), ("tokens", U32, vec![drafted]),
+            ("features", Bytes, vec![drafted, 16]), ("positions", I64, vec![rows]),
+            ("topk_workspace", Bytes, vec![drafted * 64 * 16 * 8]),
+        ] { add(name.into(), dtype, dims)?; }
         let fp8_scratch = if fp8 {
             let shapes = vec![
                 GlmDraftLinearShape { k: (self.taps.len() * h) as u64, n: h as u64 },
@@ -802,20 +874,32 @@ impl MlaDflashConfig {
                 GlmDraftLinearShape { k: inter as u64, n: h as u64 },
             ];
             if shapes.iter().any(|s| s.k % 128 != 0 || s.n % 16 != 0) { return Err(invalid()); }
-            // The executor concatenates gate/up before packing; source headers
-            // alone undercount this transient when the MLP exceeds FC size.
-            weights.max_load_staging = shapes.iter().map(|s| s.k * s.n * 2)
-                .max().unwrap_or(0).max(weights.max_load_staging);
             let scratch_rows = tap_rows.max(rows);
             let bytes = shapes.iter().flat_map(|s| (0..=fp8_mode).map(move |m|
                 draft_fp8_scratch_bytes(scratch_rows as u64, s.k, s.n, sm_count as u64, m)))
                 .max().unwrap_or(0).max(256);
-            add("fp8_scratch".into(), &[usize::try_from(bytes).map_err(|_| invalid())?])?;
+            add("fp8_scratch".into(), Bytes, vec![usize::try_from(bytes).map_err(|_| invalid())?])?;
             Some(GlmDraftFp8ScratchLayout { rows: scratch_rows, shapes })
         } else { None };
+        let (weight_owners, packing_sources, sync_upload_bytes) = self.weight_owners(mode)?;
+        owners.extend(weight_owners);
+        owners.push(MlaDraftOwner::new("landing", MlaDraftDomain::HostPinned, Bytes, vec![drafted * 20], 0)?);
+        let metadata = ["context_positions", "context_slots", "positions", "anchors", "ids",
+            "native_positions", "native_slots", "lengths", "query_offsets"];
+        for buffer in &buffers {
+            let diagnostic = buffer.name == "taps";
+            if diagnostic || metadata.contains(&buffer.name.as_str()) || buffer.name.ends_with(".page_table") {
+                let mut owner = MlaDraftOwner::new(format!("{}.upload", buffer.name),
+                    MlaDraftDomain::HostPinned, Bytes, vec![buffer.bytes], 0)?;
+                owner.lifetime = MlaDraftLifetime::Library;
+                owner.staging_for = Some(buffer.name.clone());
+                owner.on_use = diagnostic;
+                owners.push(owner);
+            }
+        }
         let layout = MlaDraftRuntimeLayout { cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
-            fp8_scratch, sm_count, fp8_mode, buffers, owners: Vec::new() };
+            fp8_scratch, sm_count, fp8_mode, buffers, owners, packing_sources, sync_upload_bytes };
         layout.resident_bytes()?;
         Ok(layout)
     }
@@ -1017,6 +1101,71 @@ mod tests {
     }
 
     #[test]
+    fn named_owners_keep_arenas_weights_pinned_and_exact_packing_sources_separate() {
+        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation::*};
+        let mut cfg = MlaDflashConfig::from_json(&config()).unwrap();
+        cfg.intermediate = 32768;
+        for mode in [Bf16Only, Fp8Only] {
+            for sequences in [1, 8, 32] {
+                let layout = cfg.runtime_layout(mode, GlmDraftCapacity::new(40, sequences, 8).unwrap(),
+                    262144, 128, 170, 2, MlaCacheFormat::Fp8).unwrap();
+                let owners = layout.owners();
+                assert_eq!(owners.iter().map(|o| &o.id).collect::<std::collections::BTreeSet<_>>().len(), owners.len());
+                let owner = |id: &str| owners.iter().find(|o| o.id == id).unwrap();
+                for buffer in layout.device_buffers() {
+                    assert_eq!(owner(&buffer.name).bytes, buffer.bytes);
+                    assert_eq!(owner(&buffer.name).domain, MlaDraftDomain::Device);
+                    assert!(!buffer.name.starts_with("weight."));
+                }
+                assert_eq!(owner("query_offsets").shape, [sequences + 1]);
+                assert_eq!(owner("query_offsets").bytes, ((sequences + 1) * 4).max(256));
+                assert_eq!(owner("landing").bytes, sequences * 7 * 20);
+                assert_eq!(owner("landing").domain, MlaDraftDomain::HostPinned);
+                assert_eq!(owner("weight.layer.0.attention.uk").shape, [64, 512, 128]);
+                assert_eq!(owner("weight.layer.0.attention.uv").shape, [64, 128, 512]);
+                let uploads = owners.iter().filter(|o| o.staging_for.is_some() && !o.on_use).collect::<Vec<_>>();
+                assert_eq!(uploads.len(), 9 + cfg.windows.len());
+                for upload in uploads {
+                    let destination = owner(upload.staging_for.as_deref().unwrap());
+                    assert_eq!(upload.bytes, destination.bytes);
+                    assert_eq!(upload.lifetime, MlaDraftLifetime::Library);
+                    assert_eq!(upload.domain, MlaDraftDomain::HostPinned);
+                }
+                assert!(owner("taps.upload").on_use);
+                assert!(!owners.iter().any(|o| o.id == "h.upload" || o.id.contains("embed") || o.id.contains("head_weights")));
+                let sources = layout.packing_sources();
+                if mode == Fp8Only {
+                    assert_eq!(sources.len(), 4 * cfg.windows.len() + 2);
+                    assert_eq!(sources[0].id, "weight.layer.0.attn_conv.source");
+                    assert_eq!(sources[2].id, "weight.layer.0.gate_up.source");
+                    assert_eq!(sources[2].bytes, 2 * 32768 * 7168 * 2);
+                    assert_eq!(sources.last().unwrap().id, "weight.projection.source");
+                    assert!(sources.iter().all(|source| source.dtype == MlaDraftDtype::Bytes
+                        && source.shape == [source.bytes] && !owners.iter().any(|o| o.id == source.id)));
+                    assert_eq!(layout.weights.max_load_staging, sources.iter().map(|s| s.bytes as u64).max().unwrap());
+                    assert_eq!(owner("weight.layer.0.gate_up.values").bytes, 2 * 32768 * 7168);
+                    assert_eq!(owner("weight.layer.0.gate_up.scales").shape, [65536, 56]);
+                    assert!(!owners.iter().any(|o| o.id == "weight.layer.0.gate_up"));
+                } else {
+                    assert!(sources.is_empty());
+                    assert_eq!(owner("weight.layer.0.gate_up").shape, [65536, 7168]);
+                }
+                assert_eq!(layout.sync_upload_bytes(), 5 * 7168 * 7168 * 2);
+                assert_eq!(layout.loading_host_bytes(123).unwrap(), 123 + 4 * layout.sync_upload_bytes() as u64);
+                assert!(layout.loading_host_bytes(u64::MAX).is_err());
+                let resized = layout.with_pool_tokens(256).unwrap();
+                for source in layout.owners() {
+                    let next = resized.owners().iter().find(|next| next.id == source.id).unwrap();
+                    if source.id == "layer.4.cache" {
+                        assert_eq!(next.bytes, 256 * MlaCacheFormat::Fp8.record_bytes());
+                        assert_eq!(next.shape, [next.bytes]);
+                    } else { assert_eq!(next, source); }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn bounded_tail_gap_refusals_are_transactional_and_slack_is_exact() {
         let mut cfg = MlaDflashConfig::from_json(&config()).unwrap();
         for windows in [vec![Some(2048); 3], vec![Some(2048), Some(2049)], vec![Some(2048), None]] {
@@ -1062,7 +1211,9 @@ mod tests {
                 for mode in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
                     let layout = cfg.runtime_layout(mode, GlmDraftCapacity::new(sequences, sequences, 8).unwrap(),
                         262144, 262144, sms, 2, MlaCacheFormat::Fp8).unwrap();
-                    assert!(layout.owners().is_empty(), "DFlash2 owner population belongs to planner adapters");
+                    assert!(!layout.owners().is_empty());
+                    assert!(layout.owners().iter().any(|owner| owner.id == "weight.fc" || owner.id == "weight.fc.values"));
+                    assert_eq!(layout.resident_bytes().unwrap(), layout.buffer_bytes().unwrap() + layout.weights().resident_bytes().unwrap());
                     assert_eq!(layout.device_buffers(), layout.buffers());
                     assert_eq!(layout.allocate_device_with(|b| Ok::<_, ()>(b.clone())).unwrap(),
                         layout.allocate_with(|b| Ok::<_, ()>(b.clone())).unwrap());
