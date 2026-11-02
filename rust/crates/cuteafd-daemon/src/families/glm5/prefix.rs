@@ -629,6 +629,23 @@ mod ownership_tests {
             // Hold target taps fixed: full contiguous and tail-only histories must leave
             // every raw ring byte identical, independently of target prefill row ordering.
             let tap_width = drafter.cfg.taps.len() * drafter.cfg.hidden;
+            let taps = (6284usize..8332).flat_map(|position| (0..tap_width).flat_map(move |column| {
+                (0x3d00u16 + ((position * 37 + column) % 256) as u16).to_le_bytes()
+            })).collect::<Vec<_>>();
+            drafter.put_taps(&taps)?;
+            let wide = drafter.mla_context_projection_readback(0, 2048)?;
+            let tail = drafter.mla_context_projection_readback(1908, 140)?;
+            let mut projection_identical = true;
+            for (index, label) in ["fc", "rmsnorm"].iter().enumerate() {
+                let expected = &wide[index][1908 * drafter.cfg.hidden * 2..];
+                let differing = expected.iter().zip(&tail[index]).enumerate()
+                    .filter(|(_, (a, b))| a != b).map(|(offset, (a, b))| (offset, *a, *b))
+                    .collect::<Vec<_>>();
+                println!("ML4 context {label} n2048/tail140: differing_bytes={} first={:?}",
+                    differing.len(), differing.first());
+                projection_identical &= differing.is_empty();
+            }
+            ensure!(projection_identical, "MLA context FC/norm arithmetic is not row-invariant");
             for length in [8192usize, 8332] {
                 let mut states = Vec::new();
                 let mut proposals = Vec::new();

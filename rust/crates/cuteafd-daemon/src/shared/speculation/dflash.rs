@@ -1692,6 +1692,27 @@ impl<'a> DflashDrafter<'a> {
         Ok(())
     }
 
+    /// Isolate context FC/norm arithmetic from cache placement and the m64 KV producer.
+    #[cfg(test)]
+    pub(crate) fn mla_context_projection_readback(&self, first: usize, rows: usize) -> Result<[Vec<u8>; 2]> {
+        ensure!(first + rows <= TAP_ROWS && rows > 0, "MLA projection diagnostic tap extent");
+        let h = self.cfg.hidden;
+        // SAFETY: the fixed tap span and both output arenas are admitted for TAP_ROWS.
+        unsafe {
+            self.linear(at(&self.taps, first * self.cfg.taps.len() * h * 2), &self.fc, 0,
+                self.fused.buffer.ptr, rows, self.cfg.taps.len() * h, h)?;
+            self.library.glm_dflash_rmsnorm(self.fused.buffer.ptr, self.hidden_norm.buffer.ptr,
+                self.fused_norm.buffer.ptr, rows, h, self.cfg.eps, self.stream)?;
+            self.library.cuda_stream_synchronize(self.stream)?;
+        }
+        let read = |buffer| -> Result<Vec<u8>> {
+            let mut bytes = vec![0; rows * h * 2];
+            self.library.copy_d2h(&mut bytes, draft_view(buffer, 0, rows * h * 2)?)?;
+            Ok(bytes)
+        };
+        Ok([read(self.fused.buffer)?, read(self.fused_norm.buffer)?])
+    }
+
     /// Read only reachable committed records and explicitly initialized tap rows.
     #[cfg(test)]
     pub(crate) fn mla_readback(&self, slot: usize, tap_rows: usize) -> Result<MlaReadback> {
