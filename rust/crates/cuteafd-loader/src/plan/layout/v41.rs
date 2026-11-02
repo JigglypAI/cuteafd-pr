@@ -192,9 +192,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         let e = catalog.routed_experts();
         let capacity = [1, 16, 80, 256, 1024, 4096].into_iter().find(|&c| u64::from(c) >= rows)
             .context("native expert prefill capacity exceeds 4096")?;
-        notes.push(cuteafd_core::mxfp4_layouts::native_prefill_note(e.hidden,
-            [e.intermediate / ranks], 120, capacity, e.experts, e.topk));
-        if spark_ranks > 0 {
+        if !working.rtx_layers.is_empty() {
+            notes.push(cuteafd_core::mxfp4_layouts::native_prefill_note(e.hidden,
+                [e.intermediate / ranks], 120, capacity, e.experts, e.topk));
+        }
+        if spark_ranks > 0 && !working.spark_layers.is_empty() {
             let widths = cuteafd_core::tp_units::package_width_keys(e.intermediate, 32, spark_ranks, false, true, false);
             notes.push(cuteafd_core::mxfp4_layouts::native_prefill_note(e.hidden,
                 widths.into_iter().map(|(_, width)| width), 121, capacity, e.experts, e.topk));

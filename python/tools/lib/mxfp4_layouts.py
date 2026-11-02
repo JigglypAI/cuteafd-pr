@@ -19,6 +19,21 @@ def layouts() -> dict:
 
 
 def validate(data: dict) -> None:
+    sms = set()
+    for row in data["stream_prefill"]:
+        cutoff = row["min_work"]
+        if (row["sm"] not in (120, 121) or row["sm"] in sms
+                or cutoff is not None and (type(cutoff) is not int or cutoff <= 0)):
+            raise ValueError("invalid native MXFP4 STREAM policy")
+        sms.add(row["sm"])
+    if sms != {120, 121}:
+        raise ValueError("native MXFP4 STREAM policy must name both hardware classes")
+    hidden = set()
+    for row in data["atomic_slices"]:
+        if (row["hidden"] <= 0 or row["hidden"] % 256 or row["hidden"] in hidden
+                or row["min_capacity"] not in (256, 1024, 4096)):
+            raise ValueError("invalid native MXFP4 atomic policy")
+        hidden.add(row["hidden"])
     keys = set()
     for row in data["native_slices"]:
         key = (row["hidden"], row["width"], row["sm"])
@@ -76,15 +91,25 @@ def native_slice_width(hidden: int, width: int, sm: int, capacity: int,
     return matching_width
 
 
+def _default_prefill_unit_rows(source: str) -> int:
+    def constant(name):
+        match = re.search(rf"^pub const {name}: u64 = ([0-9][0-9_]*);$", source, re.MULTILINE)
+        if match is None:
+            raise ValueError(f"cannot parse Rust literal {name} for native MXFP4 prefill policy")
+        return int(match[1].replace("_", ""))
+    reserve, depth, page, max_waves = (constant("PREFILL_" + name) for name in
+                                      ("RESERVE_ROWS", "DEPTH", "ROW_PAGE", "MAX_WAVES"))
+    if reserve <= 0 or page <= 0 or max_waves < 2:
+        raise ValueError("invalid Rust prefill capacity constants")
+    waves = min(max(depth, 2), max_waves)
+    return ((reserve + waves - 1) // waves + page - 1) // page * page
+
+
 @lru_cache(maxsize=1)
 def default_prefill_unit_rows() -> int:
-    """Use the planner's literal shared contract, not an independent 2752 pin."""
+    """Use the planner's literal shared contract, including its wave clamp."""
     source = (LAYOUTS_PATH.parents[2] / "rust/crates/cuteafd-core/src/serving_capacity.rs").read_text()
-    def constant(name):
-        return int(re.search(rf"pub const {name}: u64 = ([0-9]+);", source)[1])
-    reserve, depth, page = (constant("PREFILL_" + name) for name in
-                            ("RESERVE_ROWS", "DEPTH", "ROW_PAGE"))
-    return ((reserve + depth - 1) // depth + page - 1) // page * page
+    return _default_prefill_unit_rows(source)
 
 
 def native_prefill_work(sm: int, rows: int, width: int, experts: int, topk: int) -> bool:

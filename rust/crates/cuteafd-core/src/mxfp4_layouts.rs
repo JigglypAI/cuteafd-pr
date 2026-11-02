@@ -19,6 +19,20 @@ struct Layouts { schema: u32, stream_prefill: Vec<StreamPrefill>, atomic_slices:
 
 fn validate(data: &Layouts) -> Result<(), &'static str> {
     if data.schema != 1 { return Err("unsupported MXFP4 layout schema"); }
+    let mut sms = std::collections::HashSet::new();
+    for row in &data.stream_prefill {
+        if ![120, 121].contains(&row.sm) || !sms.insert(row.sm) || row.min_work == Some(0) {
+            return Err("invalid native MXFP4 STREAM policy");
+        }
+    }
+    if sms.len() != 2 { return Err("native MXFP4 STREAM policy must name both hardware classes"); }
+    let mut hidden = std::collections::HashSet::new();
+    for row in &data.atomic_slices {
+        if row.hidden == 0 || row.hidden % 256 != 0 || !hidden.insert(row.hidden)
+            || ![256, 1024, 4096].contains(&row.min_capacity) {
+            return Err("invalid native MXFP4 atomic policy");
+        }
+    }
     let mut keys = std::collections::HashSet::new();
     for row in &data.native_slices {
         if !keys.insert((row.hidden, row.width, row.sm))
@@ -101,9 +115,14 @@ pub fn native_prefill(hidden: usize, width: usize, sm: u32, capacity: u32,
 pub fn native_prefill_note(hidden: usize, widths: impl IntoIterator<Item = usize>,
     sm: u32, capacity: u32, experts: usize, topk: usize) -> String {
     let rows = u64::from(capacity).min(crate::serving_capacity::default_prefill_unit_rows());
-    let routes = widths.into_iter().map(|width| format!("I{width}:{}",
-        if native_prefill(hidden, width, sm, capacity, experts, topk) { "STREAM" } else { "slices" }))
-        .collect::<Vec<_>>().join(", ");
+    let routes = widths.into_iter().map(|width| {
+        let route = if !native_prefill_work(sm, rows, width, experts, topk) {
+            "slices (work gate/hold)"
+        } else if !native_prefill(hidden, width, sm, capacity, experts, topk) {
+            "slices (shape table)"
+        } else { "STREAM" };
+        format!("I{width}:{route}")
+    }).collect::<Vec<_>>().join(", ");
     format!("native MXFP4 SM{sm} prefill C{capacity}, default-admitted {rows} rows: {routes}; custom waves retain this export-time route")
 }
 
@@ -247,6 +266,44 @@ mod tests {
         }
         assert!(native_prefill_note(5120, [384], 121, 4096, 384, 6).contains("I384:slices"));
         assert!(native_prefill_note(4096, [512], 121, 4096, 256, 6).contains("I512:STREAM"));
+        for (width, stream) in [(384, false), (576, true), (768, false), (1152, true)] {
+            assert_eq!(native_prefill(5120, width, 121, 4096, 384, 6), stream);
+        }
+        assert!(native_prefill_note(5120, [384], 121, 4096, 384, 6).contains("slices (work gate/hold)"));
+        assert!(native_prefill_note(5120, [768], 121, 4096, 384, 6).contains("slices (shape table)"));
+    }
+
+    #[test]
+    fn every_prefill_row_is_selected_by_a_shipped_artifact() {
+        for row in layouts().native_slices.iter().filter(|row| !row.prefill.is_empty()) {
+            let experts = match row.hidden { 4096 => 256, 5120 | 7168 => 384, _ => panic!("unshipped geometry") };
+            let intermediate = match row.hidden { 4096 => 2048, 5120 => 2304, _ => 3072 };
+            assert!((1..=8).any(|world| crate::tp_units::package_width_keys(
+                intermediate, 32, world, false, true, false).iter().any(|&(_, width)| width == row.width)),
+                "unshipped width H{}/I{}", row.hidden, row.width);
+            assert!(row.prefill.iter().any(|&capacity| native_prefill(
+                row.hidden, row.width, row.sm, capacity, experts, 6)),
+                "dead prefill row H{}/I{}/SM{}", row.hidden, row.width, row.sm);
+        }
+    }
+
+    #[test]
+    fn policy_rejects_invalid_stream_and_atomic_sections() {
+        let bundled = include_str!("../../../../scripts/build/mxfp4-layouts.json");
+        for failure in 0..8 {
+            let mut data: Layouts = serde_json::from_str(bundled).unwrap();
+            match failure {
+                0 => data.stream_prefill[1].sm = 120,
+                1 => data.stream_prefill[1].sm = 119,
+                2 => data.stream_prefill[1].min_work = Some(0),
+                3 => { data.stream_prefill.pop(); }
+                4 => data.atomic_slices.push(AtomicSlices { hidden: 7168, min_capacity: 256 }),
+                5 => data.atomic_slices[0].hidden = 0,
+                6 => data.atomic_slices[0].hidden = 7169,
+                _ => data.atomic_slices[0].min_capacity = 80,
+            }
+            assert!(validate(&data).is_err());
+        }
     }
 
     #[test]

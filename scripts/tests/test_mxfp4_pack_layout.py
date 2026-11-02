@@ -347,7 +347,8 @@ def test_native_gpu_selftest_forward_oracle_matches_tensor_permutation(
 def test_native_prefill_inventory_is_hardware_and_capacity_qualified(hidden, sm, widths, experts):
     for width in widths:
         for capacity in (256, 1024, 4096):
-            expected = sm == 121 and min(capacity, 2752) * 6 * width >= 24576 * experts
+            expected = (sm == 121 and min(capacity, 2752) * 6 * width >= 24576 * experts
+                        and (hidden, width) != (5120, 768))
             assert LAYOUTS.native_prefill(hidden, width, sm, capacity, experts, 6) == expected
         for capacity in (1, 16, 80, 128, 512):
             assert not LAYOUTS.native_prefill(hidden, width, sm, capacity, experts, 6)
@@ -430,6 +431,64 @@ def test_native_prefill_scratch_matches_pinned_seven_plane_contract():
             assert actual[-2]["name"] == "grouped_route"
             assert actual[-2]["nbytes"] == capacity * 6 * 4
             assert all(plane["offset"] % 16 == 0 for plane in actual)
+
+
+def test_native_prefill_default_matches_rust_and_clamps_waves(tmp_path):
+    compiler = shutil.which("rustc")
+    if not compiler:
+        pytest.skip("Rust compiler unavailable")
+    source = (ROOT / "rust/crates/cuteafd-core/src/serving_capacity.rs").read_text()
+    contract = source[source.index("pub const PREFILL_RESERVE_ROWS"):source.index("/// Common logical GPU pool")]
+    program = tmp_path / "prefill.rs"
+    binary = tmp_path / "prefill"
+    program.write_text(contract + '\nfn main() { println!("{}", default_prefill_unit_rows()); }\n')
+    subprocess.run([compiler, str(program), "-o", str(binary)], check=True, capture_output=True)
+    rust_default = int(subprocess.check_output([str(binary)], text=True))
+    assert LAYOUTS.default_prefill_unit_rows() == rust_default == 2752
+    assert LAYOUTS._default_prefill_unit_rows(source.replace("= 8192;", "= 8_192;")) == rust_default
+    for depth, expected in ((0, 4096), (1, 4096), (3, 2752), (4, 2048), (8, 2048)):
+        assert LAYOUTS._default_prefill_unit_rows(
+            source.replace("PREFILL_DEPTH: u64 = 3;", f"PREFILL_DEPTH: u64 = {depth};")) == expected
+    for name in ("RESERVE_ROWS", "DEPTH", "ROW_PAGE", "MAX_WAVES"):
+        with pytest.raises(ValueError, match=f"cannot parse Rust literal PREFILL_{name}"):
+            LAYOUTS._default_prefill_unit_rows(source.replace(f"pub const PREFILL_{name}", "pub const MISSING"))
+
+
+def test_every_prefill_row_is_selected_by_a_shipped_artifact():
+    shipped = {(shape[0], artifact.logical) for family, shape in
+               (("dsv4f", (4096, 256)), ("v41", (5120, 384)), ("dsv4p", (7168, 384)))
+               for artifacts in PACKAGES.native_spark_artifacts(family).values()
+               for artifact in artifacts}
+    for row in LAYOUTS.layouts()["native_slices"]:
+        if not row.get("prefill"):
+            continue
+        hidden, width, sm = row["hidden"], row["width"], row["sm"]
+        assert (hidden, width) in shipped
+        experts = 256 if hidden == 4096 else 384
+        assert any(LAYOUTS.native_prefill(hidden, width, sm, capacity, experts, 6)
+                   for capacity in row["prefill"]), row
+
+
+@pytest.mark.parametrize("failure", ["duplicate_sm", "invalid_sm", "zero_work", "missing_sm",
+                                     "duplicate_hidden", "invalid_hidden", "invalid_atomic_capacity"])
+def test_native_prefill_policy_rejects_invalid_sections(failure):
+    data = LAYOUTS.layouts()
+    if failure == "duplicate_sm":
+        data["stream_prefill"][1]["sm"] = 120
+    elif failure == "invalid_sm":
+        data["stream_prefill"][1]["sm"] = 119
+    elif failure == "zero_work":
+        data["stream_prefill"][1]["min_work"] = 0
+    elif failure == "missing_sm":
+        data["stream_prefill"].pop()
+    elif failure == "duplicate_hidden":
+        data["atomic_slices"].append(dict(data["atomic_slices"][0]))
+    elif failure == "invalid_hidden":
+        data["atomic_slices"][0]["hidden"] = 7169
+    else:
+        data["atomic_slices"][0]["min_capacity"] = 80
+    with pytest.raises(ValueError):
+        LAYOUTS.validate(data)
 
 
 @pytest.mark.parametrize("failure", ["duplicate", "capacity", "empty"])
