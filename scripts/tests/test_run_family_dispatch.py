@@ -114,6 +114,30 @@ def test_exlr8_onboarding_reaches_shared_admission_without_zero_override(tmp_pat
         assert argv[argv.index("--pool-tokens") + 1] == "0"
 
 
+@pytest.mark.parametrize("model_type", ["glm_moe_dsa", "deepseek_v4"])
+@pytest.mark.parametrize("explicit", [None, 108 << 30])
+def test_spark_budget_default_is_planner_owned_and_explicit_ceiling_wins(tmp_path, model_type, explicit):
+    config = {"model_type": model_type, "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    keys = "SPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    if explicit is not None:
+        keys += f"SPARK_DEVICE_BUDGET_BYTES={explicit}\n"
+    budget = explicit or (100 << 30)
+    result = _family_launch_result(tmp_path, config, "test/budget", keys,
+                                  encoder_plan={"placement_supported": True, "fits": True,
+                                                "spark_budget_bytes": budget})
+    assert result.returncode == 0, result.stderr
+    plans = [line.split() for line in result.stderr.splitlines() if "cuteafd plan" in line]
+    assert plans
+    for plan in plans:
+        if explicit is None:
+            assert "--spark-budget-gib" not in plan
+        else:
+            assert plan[plan.index("--spark-budget-gib") + 1] == "108.0"
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert len(workers) == 4
+    assert all(f"--device-budget-bytes {budget} " in worker for worker in workers)
+
+
 def test_exlr8_onboarded_halves_require_the_shared_committed_push():
     source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/mod.rs").read_text()
     planning = source.split("// Native dense operands and onboarded EXLR8 halves", 1)[1].split(

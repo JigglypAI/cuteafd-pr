@@ -2286,11 +2286,9 @@ spark_image="$(get SPARK_EXPERT_DOCKER_INFERENCE)"
 [[ -z "$wip_slot" ]] || spark_image="$(get SPARK_EXPERT_DOCKER_DEV cuteafd-spark-expert-dev)"
 port="$(get EXPERT_PORT 19441)"
 addr="$(get ADDR 0.0.0.0:8000)"
-# Kimi K3 and Step-5 leave an unset budget to the planner, which takes the
-# family's own (the plan's spark_budget_bytes then reaches every worker).
-budget_default=107374182400
-((text_family == 0)) || budget_default=""
-budget="$(get SPARK_DEVICE_BUDGET_BYTES "$budget_default")"
+# Leave automatic weight/device budgets to the planner; an explicit ceiling
+# still applies to the full device layout and is forwarded to every worker.
+budget="$(get SPARK_DEVICE_BUDGET_BYTES)"
 spark_budget_args=()
 [[ -z "$budget" ]] || spark_budget_args=(--spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")")
 # Two coordinator GPUs (resolved above, primary first): families with a head
