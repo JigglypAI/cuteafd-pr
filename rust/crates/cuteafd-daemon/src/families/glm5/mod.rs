@@ -777,17 +777,15 @@ impl Opened {
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream (load kernels, then the engine's).
         // A head split needs its share's programs (`glm2`) in this build.
-        let split_device = match args.split_device {
-            Some(device) if programs.spec("glm2_o_m64").is_ok() => Some(device),
-            Some(device) => {
-                tracing::info!(device, "no head-split programs (glm2) in this build; serving from --device alone");
-                None
-            }
-            None => None,
-        };
-        let split_device = crate::shared::peer_split::probed_device(&self.library, args.device, split_device)?;
-        ensure!(!native || args.split_device.is_none() || split_device.is_some(),
-            "EXLR8 two-coordinator execution cannot fall back to one GPU");
+        if args.split_device.is_some() && programs.spec("glm2_o_m64").is_err() {
+            return Err(cuteafd_loader::placement::planner::Refusal::MissingExport {
+                export: "glm2_o_m64".into(), geometry: "GLM two-coordinator output, 64 execution rows".into(),
+                context: args.max_context as u64, detail: "selected GPU pair requires head-split programs".into(),
+            }.into());
+        }
+        let split_device = crate::shared::peer_split::probed_device(&self.library, args.device, args.split_device)?;
+        ensure!(args.split_device.is_none() || split_device.is_some(),
+            "GLM selected two-coordinator execution requires P2P; refusing instead of dropping a GPU");
         let peer_stream = match split_device {
             Some(device) => {
                 ensure!(device != args.device, "--split-device must differ from --device");
@@ -925,23 +923,24 @@ impl Opened {
             args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
             args.draft_fp8 == Some(false))).transpose()?.unwrap_or(0);
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
-        // Token-split attention: the build's programs (GPU0's table; both GPUs load the same).
-        let names: Vec<&str> = programs.names().collect();
-        let mut context = (devices.len() == 2).then(|| glm::context_programs(names.iter().copied(),
-            |name| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0)))).flatten();
-        if let Some(context) = &mut context {
-            let selected_scratch = devices.iter().map(|&device| -> Result<u64> {
+        // Both tables and each card's selected partial recipe must support the
+        // requested executor before admission. Missing exports retain geometry.
+        let context = if devices.len() == 2 && requested.unwrap_or(
+            cuteafd_loader::placement::AttentionPlacement::Context)
+            == cuteafd_loader::placement::AttentionPlacement::Context {
+            let selected = devices.iter().map(|&device| -> Result<_> {
                 self.library.cuda_set_device(device)?;
-                let sms = self.library.sm_count()?;
-                [0, self.cfg.heads / 2].into_iter().map(|begin| {
-                    let name = cuteafd_core::coordinator_programs::attention_partial_program(
-                        &manifest, "glm", begin, engine::DECODE_ROWS, sms, &attention_plan)?;
-                    Ok(programs.spec(&name)?.scratch.get("scratch").copied().unwrap_or(0))
-                }).collect::<Result<Vec<_>>>().map(|sizes| sizes.into_iter().max().unwrap_or(0))
+                Ok(glm::selected_context(Some(&manifest), self.library.sm_count()?, &attention_plan,
+                    args.max_context as u64, |name| programs.spec(name).ok()
+                        .map(|spec| spec.scratch.get("scratch").copied().unwrap_or(0)))?)
             }).collect::<Result<Vec<_>>>();
             self.library.cuda_set_device(args.device)?;
-            context.partial_scratch = selected_scratch?.into_iter().max().unwrap_or(0);
-        }
+            Some(selected?.into_iter().fold(glm::GlmContext::default(), |mut largest, next| {
+                largest.topk_scratch = largest.topk_scratch.max(next.topk_scratch);
+                largest.partial_scratch = largest.partial_scratch.max(next.partial_scratch);
+                largest
+            }))
+        } else { None };
         // Every per-slot owner covers the waves in flight.
         let prefill_lanes = usize::from(args.prefill_waves);
         ensure!(owners.is_none() || prefill_lanes <= cuteafd_loader::placement::LAYER_PIPELINE_MAX_LANES as usize,

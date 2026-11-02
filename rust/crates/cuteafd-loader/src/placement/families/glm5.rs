@@ -107,20 +107,38 @@ pub fn context_buffers(cfg: &GlmDsaConfig, extent: u64, prefill_rows: u64, lanes
         lanes: 1, workspace_bytes: context_workspace_bytes(cfg, extent, prefill_rows, lanes, context) }
 }
 
-/// The `context` programs a manifest carries (PROGRAMS.json), as [`context_programs`].
-pub fn manifest_context(manifest: &serde_json::Value, sms: usize,
-    plan: &cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Option<GlmContext> {
-    let programs = manifest["programs"].as_array()?;
-    let lookup = |name: &str| programs.iter().find(|p| p["name"].as_str() == Some(name))
-        .map(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0));
-    let names = programs.iter().filter_map(|p| p["name"].as_str());
-    let mut context = context_programs(names, lookup)?;
-    context.partial_scratch = [0, 32].into_iter().map(|begin| {
+/// Validate the selected executor, rather than treating a missing export as a
+/// capability probe. Plan and live admission use the same selected names.
+pub fn selected_context(manifest: Option<&serde_json::Value>, sms: usize,
+    plan: &cuteafd_core::coordinator_programs::AttentionReductionPlan, context: u64,
+    lookup: impl Fn(&str) -> Option<u64>) -> Result<GlmContext, planner::Refusal> {
+    let geometry = format!("GLM context-split programs, 64 heads, {DECODE_ROWS} execution rows, {} reduction rows, {sms} SMs",
+        plan.rows());
+    let missing = |export: String, detail: String| planner::Refusal::MissingExport {
+        export, geometry: geometry.clone(), context, detail,
+    };
+    let manifest = manifest.ok_or_else(|| missing("PROGRAMS.json".into(),
+        "selected context executor requires the actual program manifest".into()))?;
+    let scratch = |name: &str| lookup(name).ok_or_else(|| missing(name.into(),
+        "required program is absent from the selected table".into()));
+    for name in CONTEXT_PROGRAMS { scratch(name)?; }
+    let mut partial_scratch = 0;
+    for begin in [0, 32] {
         let name = cuteafd_core::coordinator_programs::attention_partial_program(
-            manifest, "glm", begin, DECODE_ROWS as usize, sms, plan).ok()?;
-        lookup(&name)
-    }).collect::<Option<Vec<_>>>()?.into_iter().max()?;
-    Some(context)
+            manifest, "glm", begin, DECODE_ROWS as usize, sms, plan).map_err(|error| missing(
+                format!("glm_sparse_mla_partial_h{begin}_s*_m{DECODE_ROWS}"), error.to_string()))?;
+        partial_scratch = partial_scratch.max(scratch(&name)?);
+    }
+    Ok(GlmContext { topk_scratch: scratch(CONTEXT_PROGRAMS[0])?, partial_scratch })
+}
+
+/// CPU admission reads the same selected export scratch from PROGRAMS.json.
+pub fn manifest_context(manifest: Option<&serde_json::Value>, sms: usize,
+    plan: &cuteafd_core::coordinator_programs::AttentionReductionPlan, context: u64)
+    -> Result<GlmContext, planner::Refusal> {
+    selected_context(manifest, sms, plan, context, |name| manifest?["programs"].as_array()?
+        .iter().find(|entry| entry["name"].as_str() == Some(name))
+        .map(|entry| entry["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0)))
 }
 
 /// [`context_workspace`]'s bytes with the engine's allocation floor.
@@ -2291,7 +2309,7 @@ mod tests {
         for sms in [170, 188] {
             for rows in 1..=64 {
                 let plan = AttentionReductionPlan::new(64, None, Some(rows)).unwrap();
-                let selected = manifest_context(&manifest, sms, &plan).unwrap();
+                let selected = manifest_context(Some(&manifest), sms, &plan, 1 << 20).unwrap();
                 let runtime_scratch = [0, 32].into_iter().map(|begin| {
                     let name = attention_partial_program(&manifest, "glm", begin, 64, sms, &plan).unwrap();
                     manifest["programs"].as_array().unwrap().iter().find(|p| p["name"] == name).unwrap()
@@ -2302,6 +2320,56 @@ mod tests {
                     else if rows <= 8 { 1800 } else { 100 });
             }
         }
+    }
+
+    #[test]
+    fn selected_context_exports_refuse_with_required_geometry_without_fallback() {
+        use cuteafd_core::coordinator_programs::AttentionReductionPlan;
+        use planner::Refusal;
+        let plan = AttentionReductionPlan::new(64, None, Some(8)).unwrap();
+        let mut entries: Vec<_> = CONTEXT_PROGRAMS.iter().map(|name|
+            serde_json::json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 70}})).collect();
+        for begin in [0, 32] {
+            for (splits, caps, bytes) in [(2, vec![64], 100), (4, vec![1, 8], 900)] {
+                entries.push(serde_json::json!({
+                    "name": format!("glm_sparse_mla_partial_h{begin}_s{splits}_m64"),
+                    "params": {"device_sm_counts": [188], "row_caps": {"188": caps}},
+                    "scratch_bytes_at_capacity": {"scratch": bytes}}));
+            }
+        }
+        let complete = serde_json::json!({"programs": entries});
+        let expected = GlmContext { topk_scratch: 70, partial_scratch: 900 };
+        assert_eq!(manifest_context(Some(&complete), 188, &plan, 1 << 20).unwrap(), expected);
+        // The loaded table supplies scratch independently, but selects the same names.
+        assert_eq!(selected_context(Some(&complete), 188, &plan, 1 << 20, |name|
+            complete["programs"].as_array()?.iter().find(|entry| entry["name"] == name)
+                .map(|entry| entry["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap())).unwrap(), expected);
+        for missing in CONTEXT_PROGRAMS.into_iter().chain(["glm_sparse_mla_partial_h32_s4_m64"]) {
+            let mut manifest = complete.clone();
+            manifest["programs"].as_array_mut().unwrap().retain(|entry| entry["name"] != missing);
+            let result = if missing.contains("partial") {
+                // The manifest selects s4, but the independently loaded table lacks it.
+                selected_context(Some(&complete), 188, &plan, 1 << 20, |name|
+                    manifest["programs"].as_array()?.iter().find(|entry| entry["name"] == name).map(|_| 70))
+            } else { manifest_context(Some(&manifest), 188, &plan, 1 << 20) };
+            let Refusal::MissingExport { export, geometry, context, .. } = result.unwrap_err()
+                else { panic!("selected export must have a typed refusal") };
+            assert_eq!(export, missing);
+            assert_eq!(context, 1 << 20);
+            for required in ["64 heads", "64 execution rows", "8 reduction rows", "188 SMs"] {
+                assert!(geometry.contains(required), "{geometry}");
+            }
+        }
+        let mut manifest = complete.clone();
+        manifest["programs"].as_array_mut().unwrap().retain(|entry|
+            !entry["name"].as_str().unwrap().starts_with("glm_sparse_mla_partial_h32_"));
+        assert!(matches!(manifest_context(Some(&manifest), 188, &plan, 1 << 20),
+            Err(Refusal::MissingExport { export, context: 1_048_576, .. })
+                if export == "glm_sparse_mla_partial_h32_s*_m64"));
+        assert!(matches!(manifest_context(Some(&complete), 170, &plan, 1 << 20),
+            Err(Refusal::MissingExport { geometry, .. }) if geometry.contains("170 SMs")));
+        assert!(matches!(manifest_context(None, 188, &plan, 1 << 20),
+            Err(Refusal::MissingExport { export, .. }) if export == "PROGRAMS.json"));
     }
 
     #[test]

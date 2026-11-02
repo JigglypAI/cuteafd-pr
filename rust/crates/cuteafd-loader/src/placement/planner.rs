@@ -338,6 +338,13 @@ pub enum Refusal {
     PinConflict,
     #[error("no supported candidate")]
     Unsupported,
+    #[error("missing selected export {export} for {geometry} at context {context}: {detail}")]
+    MissingExport {
+        export: String,
+        geometry: String,
+        context: u64,
+        detail: String,
+    },
     #[error("{budget} at {phase:?} needs {required} bytes, has {available}; owners {owners:?}")]
     Capacity {
         budget: String,

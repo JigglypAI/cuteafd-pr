@@ -348,6 +348,12 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
             |name| family.contains(name))?;
         Ok(selected)
     }).transpose()?;
+    let context_programs = if devices.len() == 2
+        && attempted_attention(report.requested_attention, devices.len()) == crate::placement::AttentionPlacement::Context {
+        Some(glm::manifest_context(selected_manifest.as_ref(),
+            options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
+                "sm_120", options.rtx_bytes[0]).sms) as usize, &attention_plan, context)?)
+    } else { None };
     let scratch = selected_manifest.as_ref().map(|m| -> anyhow::Result<_> {
         let mut scratch = glm::manifest_scratch(&cfg, devices.len() == 2, m)?;
         if report.requested_attention == Some(crate::placement::AttentionPlacement::Layers) {
@@ -375,9 +381,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         experts: local.as_ref().map_or_else(Vec::new, |l| l.experts.clone()), expert_workspace: 0,
         tp2_workspace, requested_pool: options.pool_tokens,
         onboard, full_prefill_logits: options.full_prefill_logits,
-        context: selected_manifest.as_ref().and_then(|m| glm::manifest_context(m,
-            options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
-                "sm_120", options.rtx_bytes[0]).sms) as usize, &attention_plan)) };
+        context: context_programs };
     // Auto resolves in the solver (context where the build carries its programs), as at runtime.
     Ok(glm::solve_working_set(&inputs, serial_workspace, report.requested_attention)?)
 }
@@ -410,12 +414,11 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     cuteafd_core::coordinator_programs::select_attention_plans(&mut manifest, plan,
         |name| cuteafd_core::coordinator_programs::CoordinatorPrograms {
             family: "glm", split_family: Some("glm2") }.contains(name))?;
-    let scratch = glm::manifest_scratch(&cfg, split, &manifest)?;
-    let context_programs = if split { Some(glm::manifest_context(&manifest,
+    let context_programs = if split { Some(glm::manifest_context(Some(&manifest),
         options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
-            "sm_120", options.rtx_bytes[0]).sms) as usize, &plan)
-        .ok_or_else(|| anyhow::anyhow!("EXLR8 requires GLM context programs in PROGRAMS.json"))?) }
+            "sm_120", options.rtx_bytes[0]).sms) as usize, &plan, context)?) }
         else { None };
+    let scratch = glm::manifest_scratch(&cfg, split, &manifest)?;
     let native = crate::plan::exlr8::recognizes(&checkpoint.snapshot)?;
     let mut dense_scratch = Vec::new();
     let resident = if native {
