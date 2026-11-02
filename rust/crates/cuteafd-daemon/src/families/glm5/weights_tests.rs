@@ -180,7 +180,7 @@ fn exlr8_prefetch_enumerates_each_resident_encoding_in_read_order() {
                 .collect::<Vec<Range>>();
             // Reverse insertion cannot change read order, unlike HashMap iteration.
             let resident = components.iter().zip(&expected).rev().map(|(component, &range)|
-                (crate::families::glm5::native_dense::key("q_a", component), range)).collect::<HashMap<_, _>>();
+                (crate::shared::experts::exlr8::dense_weights::key("q_a", component), range)).collect::<HashMap<_, _>>();
             let actual = native_projection_ranges("q_a", |key| resident.get(key).copied());
             assert_eq!(actual, expected);
             assert_eq!(crate::shared::l2_prefetch::prefix(&actual, 1 << 19),

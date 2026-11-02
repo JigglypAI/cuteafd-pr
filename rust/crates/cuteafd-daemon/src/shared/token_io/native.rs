@@ -6,7 +6,7 @@ use cuteafd_ffi::native_dense::{DenseEmbedding, DenseLinear};
 use cuteafd_ffi::programs::Programs;
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_loader::plan::exlr8::dense::{
-    DenseEncoding, DensePlan, DenseRecord, DenseSlice, ShardSide,
+    DenseEncoding, DensePlan, DenseRecord, DenseSelection, DenseSlice, ShardSide,
 };
 
 const EMBEDDING: &str = "model.embed_tokens.weight";
@@ -23,6 +23,7 @@ pub(crate) struct VocabularyPlan {
 impl VocabularyPlan {
     pub(crate) fn new(
         records: &[DenseRecord],
+        selection: &DenseSelection,
         world: usize,
         rank: usize,
         hidden: usize,
@@ -33,7 +34,7 @@ impl VocabularyPlan {
             "native vocabulary has empty dimensions"
         );
         let mut selected = Vec::new();
-        for name in [EMBEDDING, HEAD] {
+        for name in selection.vocabulary_names() {
             let mut matches = records.iter().filter(|r| r.tensor == name);
             let record = matches
                 .next()
@@ -105,6 +106,11 @@ impl VocabularyPlan {
             hidden,
             vocabulary,
         })
+    }
+
+    pub(crate) fn resident_groups(&self, selection: &DenseSelection, layers: usize)
+        -> Result<Vec<(String, String, u64)>> {
+        Ok(cuteafd_loader::plan::exlr8::dense::resident_native(selection, layers, &self.dense)?)
     }
 
     pub(crate) fn resident_bytes(&self) -> usize {
@@ -182,8 +188,19 @@ impl<'a> NativeVocabulary<'a> {
             );
             return Ok(None);
         }
-        let gather = DenseEmbedding::bind(programs, "exlr8_dense_fp8_row_embedding")?;
-        let linear = DenseLinear::bind(programs, "exlr8_dense_fp8_row_lm_head")?;
+        let resolve = |encoding| -> Result<String> {
+            let mut matches = programs.names().filter(|name| name.starts_with("exlr8_dense_"))
+                .filter_map(|name| cuteafd_ffi::native_dense::validate_spec(programs.spec(name).ok()?).ok()
+                    .filter(|geometry| geometry.encoding == encoding
+                        && geometry.input_features == plan.hidden as u64
+                        && geometry.output_features == plan.vocabulary as u64)
+                    .map(|_| name.to_owned()));
+            let name = matches.next().context("native vocabulary has no compiled geometry")?;
+            ensure!(matches.next().is_none(), "duplicate native vocabulary kernel geometry");
+            Ok(name)
+        };
+        let gather = DenseEmbedding::bind(programs, &resolve(cuteafd_ffi::native_dense::Encoding::Embedding)?)?;
+        let linear = DenseLinear::bind(programs, &resolve(cuteafd_ffi::native_dense::Encoding::RowFp8)?)?;
         for geometry in [gather.geometry(), linear.geometry()] {
             ensure!(
                 geometry.input_features == plan.hidden as u64
@@ -340,6 +357,12 @@ mod tests {
     use super::*;
     use cuteafd_loader::plan::exlr8::dense::{DenseComponent, DenseRange};
 
+    fn selection(flash: bool) -> DenseSelection {
+        let configs: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/tests/fixtures/exlr8-dense-configs.json")).unwrap();
+        DenseSelection::from_hf(&configs[if flash { "flash" } else { "glm" }]).unwrap()
+    }
+
     fn record(root: &std::path::Path, name: &str) -> DenseRecord {
         let (n, k) = (256, 8);
         let payload: Vec<_> = (0..n * k).map(|i| (i % 251) as u8).collect();
@@ -389,7 +412,7 @@ mod tests {
     fn native_vocabulary_rank0_admission_and_exact_streaming() -> Result<()> {
         let root = tempfile::tempdir()?;
         let records = [record(root.path(), EMBEDDING), record(root.path(), HEAD)];
-        let plan = VocabularyPlan::new(&records, 2, 0, 8, 256)?;
+        let plan = VocabularyPlan::new(&records, &selection(false), 2, 0, 8, 256)?;
         assert_eq!(plan.resident_bytes(), 6144);
         assert_eq!(plan.staging_bytes(), 1536);
         let max_unit_read = plan.dense.tensors.iter().flat_map(|slice| &slice.units)
@@ -402,13 +425,13 @@ mod tests {
         assert!(plan.admit(6144, 1536, 0, 1).is_err());
         assert!(plan.admit(6144, usize::MAX, 0, usize::MAX).is_err());
         plan.admit(6144, 1536, 0, 0)?;
-        let non_owner = VocabularyPlan::new(&records, 2, 1, 8, 256)?;
+        let non_owner = VocabularyPlan::new(&records, &selection(false), 2, 1, 8, 256)?;
         assert_eq!(
             (non_owner.resident_bytes(), non_owner.staging_bytes()),
             (0, 0)
         );
         assert!(non_owner.dense.tensors.is_empty());
-        let single = VocabularyPlan::new(&records, 1, 0, 8, 256)?;
+        let single = VocabularyPlan::new(&records, &selection(false), 1, 0, 8, 256)?;
         assert_eq!(single.resident_bytes(), plan.resident_bytes());
         for slice in &plan.dense.tensors {
             let mut output = [vec![0; 2048], vec![0; 1024]];
@@ -421,6 +444,66 @@ mod tests {
                 std::fs::read(&slice.components[0].source.path)?
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn flash_vocabulary_selects_only_target_tables_with_native_mtp_present() -> Result<()> {
+        const EMBED: &str = "model.language_model.embed_tokens.weight";
+        const N: usize = 154880;
+        const K: usize = 4096;
+        let root = tempfile::tempdir()?;
+        let native = |name: &str| {
+            let mut item = record(root.path(), name);
+            item.tensor = name.into();
+            item.shape = vec![N, K];
+            item.native_blocks = N / 128;
+            item.components[0].shape = vec![N, K];
+            item.components[0].source.bytes = N * K;
+            item.components[1].shape = vec![N];
+            item.components[1].source.offset = (N * K) as u64;
+            item.components[1].source.bytes = N * 4;
+            item
+        };
+        let records = vec![native(EMBED), native(HEAD)];
+        let mut with_mtp = records.clone();
+        let mut eh = native("model.language_model.layers.45.eh_proj.weight");
+        eh.encoding = DenseEncoding::Mxfp8;
+        eh.shape = vec![K, 2 * K];
+        eh.side = ShardSide::Replicated;
+        eh.channels_per_shard = 0;
+        eh.native_blocks = K / 128;
+        eh.components[0].shape = vec![K, 2 * K];
+        eh.components[0].source.bytes = 2 * K * K;
+        eh.components[1].suffix = "e8m0".into();
+        eh.components[1].dtype = "U8".into();
+        eh.components[1].shape = vec![K, 2 * K / 32];
+        eh.components[1].source.bytes = 2 * K * K / 32;
+        with_mtp.push(eh);
+        with_mtp.push(native("model.language_model.layers.45.shared_head.head.weight"));
+        // A second family prefix cannot substitute for the selected target embedding.
+        with_mtp.push(native(EMBEDDING));
+        for world in [1, 2] {
+            for rank in 0..world {
+                let before = VocabularyPlan::new(&records, &selection(true), world, rank, K, N)?;
+                let after = VocabularyPlan::new(&with_mtp, &selection(true), world, rank, K, N)?;
+                let groups = after.resident_groups(&selection(true), 45)?;
+                assert_eq!(groups.iter().map(|v| v.2 as usize).sum::<usize>(), after.resident_bytes());
+                assert!(groups.iter().all(|(group, _, _)| group == "embedding" || group == "lm_head"));
+                assert_eq!((before.resident_bytes(), before.staging_bytes()),
+                    (after.resident_bytes(), after.staging_bytes()));
+                let names: Vec<_> = after.dense.tensors.iter().map(|slice| slice.tensor.as_str()).collect();
+                assert_eq!(names, if rank == 0 { vec![EMBED, HEAD] } else { vec![] });
+                for slice in &after.dense.tensors {
+                    let target = records.iter().find(|record| record.tensor == slice.tensor).unwrap();
+                    assert!(slice.units.iter().all(|unit| unit.source.iter().all(|source|
+                        source.path == target.components[0].source.path)));
+                }
+            }
+        }
+        let mtp_only = vec![with_mtp[3].clone(), records[1].clone()];
+        assert!(VocabularyPlan::new(&mtp_only, &selection(true), 1, 0, K, N).is_err());
+        assert!(VocabularyPlan::new(&with_mtp[1..], &selection(true), 1, 0, K, N).is_err());
         Ok(())
     }
 
@@ -495,14 +578,14 @@ mod tests {
         let programs = library.programs()?.with_manifest(std::path::Path::new(
             &std::env::var_os("CUTEAFD_PROGRAM_MANIFEST").context("native manifest")?,
         ))?;
-        let plan = VocabularyPlan::new(&records, 2, 0, K, N)?;
+        let plan = VocabularyPlan::new(&records, &selection(false), 2, 0, K, N)?;
         let owner = NativeVocabulary::load(&library, &programs, plan, 32 << 20, 0, 0)?
             .context("rank0 vocabulary owner")?;
         assert!(
             NativeVocabulary::load(
                 &library,
                 &programs,
-                VocabularyPlan::new(&records, 2, 1, K, N)?,
+                VocabularyPlan::new(&records, &selection(false), 2, 1, K, N)?,
                 0,
                 0,
                 0
@@ -586,14 +669,15 @@ mod tests {
                 _ => bad[0].components.swap(0, 1),
             }
             assert!(
-                VocabularyPlan::new(&bad, 2, 0, 8, 256).is_err(),
+                VocabularyPlan::new(&bad, &selection(false), 2, 0, 8, 256).is_err(),
                 "case {change}"
             );
         }
-        assert!(VocabularyPlan::new(&records[..1], 2, 0, 8, 256).is_err());
+        assert!(VocabularyPlan::new(&records[..1], &selection(false), 2, 0, 8, 256).is_err());
         assert!(
             VocabularyPlan::new(
                 &[records[0].clone(), records[0].clone(), records[1].clone()],
+                &selection(false),
                 2,
                 0,
                 8,
@@ -601,8 +685,8 @@ mod tests {
             )
             .is_err()
         );
-        assert!(VocabularyPlan::new(&records, 2, 2, 8, 256).is_err());
-        assert!(VocabularyPlan::new(&records, 3, 0, 8, 256).is_err());
+        assert!(VocabularyPlan::new(&records, &selection(false), 2, 2, 8, 256).is_err());
+        assert!(VocabularyPlan::new(&records, &selection(false), 3, 0, 8, 256).is_err());
         Ok(())
     }
 }

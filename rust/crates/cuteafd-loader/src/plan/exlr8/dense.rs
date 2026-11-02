@@ -8,7 +8,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 mod ownership;
-pub use ownership::{DenseAxis, DenseExecution, DenseOwnership, KvBGeometry, KvBLayout};
+pub mod programs;
+pub mod scratch;
+pub use ownership::{DenseAxis, DenseExecution, DenseOwnership, DenseRole, DenseSelection, DenseTransform, VocabularyRole, KvBGeometry, KvBLayout};
 
 /// One bounded native absorption step, shared by admission and loading.
 pub use crate::shared::dense_read::STEP_BYTES as DENSE_STEP_BYTES;
@@ -179,6 +181,7 @@ impl DenseUnit {
 pub struct DenseSlice {
     pub tensor: String,
     pub absorbed: Option<KvBLayout>,
+    pub transform: DenseTransform,
     pub axis: DenseAxis,
     pub first_channel: usize,
     pub channels: usize,
@@ -192,7 +195,7 @@ pub struct DensePlan {
     pub rank: usize,
     pub world: usize,
     pub tensors: Vec<DenseSlice>,
-    /// Sum of separately 256-byte-aligned component allocations.
+    /// Sum of exact native operand allocation requests (each at least 256 bytes).
     pub resident_bytes: usize,
     /// Loading-only peak: reusable pinned batch plus retained full-row cache.
     /// Never part of resident_bytes or steady-state device admission.
@@ -211,9 +214,12 @@ fn product(values: &[usize]) -> anyhow::Result<usize> {
     })
 }
 
-fn allocation(bytes: usize) -> anyhow::Result<usize> {
-    bytes
-        .max(256)
+/// Native operands retain the loader's minimum size, without padding to pointer
+/// alignment: cuteafd_alloc_device_buffer forwards and reports the exact request.
+pub fn allocation(bytes: usize) -> usize { bytes.max(256) }
+
+fn lane_allocation(bytes: usize) -> anyhow::Result<usize> {
+    allocation(bytes)
         .checked_add(255)
         .map(|v| v / 256 * 256)
         .context("dense allocation overflow")
@@ -258,36 +264,6 @@ fn component(
             bytes,
         },
     })
-}
-
-/// One native dense lane: BF16 rotations/intermediates and decode-sized split-K scratch.
-pub fn scratch_bytes(cfg: &crate::families::glm5::GlmDsaConfig, heads: usize, inter: usize, rows: usize) -> usize {
-    let (h, q, ih) = (cfg.hidden, cfg.q_lora_rank, cfg.index_heads);
-    let max_k = [h, q, heads * cfg.v_head_dim, inter].into_iter().max().unwrap_or(0);
-    let max_n = [heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), h, inter, ih * 128].into_iter().max().unwrap_or(0);
-    let splits = max_k.div_ceil(1024);
-    [rows * max_k * 2, 64, max_k / 128 * 2, rows.min(64) * splits * max_n * 4, rows * max_n * 4,
-        rows * (q + cfg.kv_lora_rank + cfg.qk_rope_head_dim) * 2, rows * heads * 256 * 2, rows * inter * 2,
-        rows * inter * 2, rows * inter * 2, rows * (128 + ih) * 2, rows * ih * 128 * 2, rows * heads * cfg.v_head_dim * 2]
-        .into_iter().map(|b| b.max(256).next_multiple_of(256)).sum()
-}
-
-/// Opt-in MX8 records are per prefill lane, never retained by decode lanes.
-pub fn a8_scratch_bytes(cfg: &crate::families::glm5::GlmDsaConfig, heads: usize, inter: usize, rows: usize) -> usize {
-    if rows <= 64 { return 0; }
-    let max_k = [cfg.hidden, cfg.q_lora_rank, heads * cfg.v_head_dim, inter].into_iter().max().unwrap_or(0);
-    (rows.div_ceil(16) * (max_k / 32) * 528).next_multiple_of(256)
-}
-
-/// One coordinator's native dense charge: decode scratch, plus the prefill scratch every slot
-/// shares (hook-local: each native projection reads and writes it within one unit's hook, on the
-/// GPU's one stream; #762) and, with opt-in A8 prefill, its MX8 records. `cuteafd plan` and
-/// runtime admission both charge this.
-pub fn lane_charge_bytes(cfg: &crate::families::glm5::GlmDsaConfig, gpus: usize, decode_rows: usize,
-    prefill_rows: usize, a8: bool) -> usize {
-    let (heads, inter) = (cfg.heads / gpus, cfg.dense_intermediate / gpus);
-    let a8 = if a8 { a8_scratch_bytes(cfg, heads, inter, prefill_rows) } else { 0 };
-    scratch_bytes(cfg, heads, inter, decode_rows) + scratch_bytes(cfg, heads, inter, prefill_rows) + a8
 }
 
 fn inventory_candidates(snapshot: &Path) -> Result<Vec<(PathBuf, Header)>> {
@@ -667,6 +643,7 @@ impl DenseRecord {
                 .collect::<anyhow::Result<Vec<_>>>()?;
             Ok(DenseSlice {
                 absorbed: None,
+                transform: self.ownership.transform,
                 axis: if self.side == ShardSide::Input { DenseAxis::Input } else { DenseAxis::Output },
                 tensor: self.tensor.clone(),
                 first_channel: first,
@@ -759,7 +736,8 @@ impl DenseRecord {
                 }
                 components.push(c);
             }
-            Ok(DenseSlice { tensor: self.tensor.clone(), absorbed: None, axis, first_channel: first,
+            Ok(DenseSlice { tensor: self.tensor.clone(), absorbed: None, transform: self.ownership.transform,
+                axis, first_channel: first,
                 channels, side: self.side, components, units: vec![] })
         })().map_err(Into::into)
     }
@@ -818,7 +796,8 @@ impl DensePlan {
                     DenseExecution::AbsorbHeads(geometry) => {
                         let layout = geometry.layout(parts, part)?;
                         DenseSlice { tensor: record.tensor.clone(), first_channel: layout.first_head,
-                            channels: layout.heads, absorbed: Some(layout), axis: DenseAxis::Output,
+                            channels: layout.heads, absorbed: Some(layout), transform: DenseTransform::Identity,
+                            axis: DenseAxis::Output,
                             side: record.side, components: vec![], units: vec![] }
                     }
                     DenseExecution::Split(axis) => {
@@ -830,26 +809,25 @@ impl DensePlan {
                     DenseExecution::RankZero | DenseExecution::Replicated => {
                         if record.native_blocks > 0 { record.slice(0, record.channels()?)? }
                         else { DenseSlice { tensor: record.tensor.clone(), first_channel: 0,
-                            channels: record.channels()?, absorbed: None, axis: DenseAxis::Output,
+                            channels: record.channels()?, absorbed: None, transform: record.ownership.transform,
+                            axis: DenseAxis::Output,
                             side: record.side, components: record.components.clone(), units: vec![] } }
                     }
                 };
                 if let Some(layout) = &slice.absorbed {
-                    for bytes in layout.allocations { resident_bytes = sum([resident_bytes, allocation(bytes)?])?; }
+                    for bytes in layout.allocations { resident_bytes = sum([resident_bytes, allocation(bytes)])?; }
                 } else {
                     for component in &slice.components {
-                        resident_bytes = sum([resident_bytes, allocation(component.resident_bytes()?)?])?;
+                        resident_bytes = sum([resident_bytes, slice.transform.allocation_bytes(component)?])?;
                     }
                 }
                 for unit in &slice.units {
                     pinned_staging_bytes = pinned_staging_bytes.max(unit.staging_bytes()?);
                 }
                 for component in &slice.components {
-                    let (rows, row_bytes, width) = match &component.window {
-                        Some(window) => (window.rows.len(), window.row_bytes, window.cols.len()),
-                        None => (1, component.source.bytes, component.source.bytes),
-                    };
-                    let batch = crate::shared::dense_read::ReadBatch::new(rows, row_bytes, width, DENSE_STEP_BYTES)?;
+                    let window = slice.transform.read_window(component)?;
+                    let batch = crate::shared::dense_read::ReadBatch::new(
+                        window.rows.len(), window.row_bytes, window.cols.len(), DENSE_STEP_BYTES)?;
                     pinned_staging_bytes = pinned_staging_bytes.max(batch.pinned_bytes());
                     cached_rows_bytes = cached_rows_bytes.max(batch.cached_bytes);
                 }
@@ -880,7 +858,7 @@ impl DensePlan {
     ) -> Result<usize> {
         (|| -> anyhow::Result<_> {
             ensure!(lanes > 0, "native dense needs at least one execution lane");
-            let workspace = allocation(lane_workspace)?
+            let workspace = lane_allocation(lane_workspace)?
                 .checked_mul(lanes)
                 .context("dense lane workspace overflow")?;
             let total = sum([self.resident_bytes, workspace, reserved])?;
@@ -894,49 +872,37 @@ impl DensePlan {
     }
 }
 
-/// Coordinator resident bytes of a native GLM rank, grouped as the official
-/// `layout::glm5::resident_owned` groups them (group, format, bytes): every
-/// component its own allocation of at least 256 bytes (the loader's sizes), `kv_b` split per head into
-/// E4M3 `w_uk`/`w_uv` with one F32 scale per row and 64-wide tile, router on
-/// rank 0, vocabulary (embedding + head, one row-FP8 owner) on rank 0.
-pub fn resident_native(records: &[DenseRecord], world: usize, rank: usize, layers: usize, heads: usize,
-    nope: usize, v: usize, lat: usize) -> Result<Vec<(String, String, u64)>> {
+/// Exact resident allocation groups of an already-owned native EXLR8 plan.
+/// The same path admits either family's backbone or separately owned vocabulary;
+/// selection rejects MTP, while transformed bytes describe the loaded operand.
+/// Source staging belongs only to the plan's loading peak.
+pub fn resident_native(selection: &DenseSelection, layers: usize, plan: &DensePlan)
+    -> Result<Vec<(String, String, u64)>> {
     (|| -> anyhow::Result<_> {
-        ensure!(heads % world == 0, "GLM heads do not split over {world} coordinators");
-        let plan = DensePlan::for_rank(records, world, rank)?;
         let mut groups = std::collections::BTreeMap::<(String, String), u64>::new();
         let mut put = |group: &str, format: &str, bytes: usize| -> anyhow::Result<()> {
             ensure!(bytes > 0, "empty native dense allocation in {group}");
-            *groups.entry((group.into(), format.into())).or_default() += bytes.max(256) as u64;
+            let total = groups.entry((group.into(), format.into())).or_default();
+            *total = total.checked_add(u64::try_from(bytes)?).context("native resident group overflow")?;
             Ok(())
         };
         for slice in &plan.tensors {
-            let Some(rest) = slice.tensor.strip_prefix("model.layers.") else {
-                let group = match slice.tensor.as_str() {
-                    "model.embed_tokens.weight" => "embedding", "lm_head.weight" => "lm_head", _ => "norm" };
-                for c in &slice.components { put(group, &c.dtype.to_lowercase(), c.resident_bytes()?)?; }
-                continue;
-            };
-            let layer: usize = rest.split('.').next().context("layer index")?.parse()?;
-            if layer >= layers { continue; }
+            let group = selection.resident_group(&slice.tensor, layers)?;
             if let Some(layout) = &slice.absorbed {
                 for (format, bytes) in ["fp8", "fp8-scale", "fp8", "fp8-scale"].into_iter().zip(layout.allocations) {
-                    put("attention", format, bytes)?;
+                    put(group, format, allocation(bytes))?;
                 }
-                continue;
-            }
-            let group = if slice.tensor.contains(".self_attn.indexer.") { "indexer" }
-                else if slice.tensor.contains(".self_attn.") { "attention" }
-                else if slice.tensor.ends_with(".mlp.gate.weight") || slice.tensor.ends_with(".mlp.gate.e_score_correction_bias") { "router" }
-                else if slice.tensor.contains(".mlp.") { "dense" } else { "norm" };
-            for c in &slice.components { put(group, &c.dtype.to_lowercase(), c.resident_bytes()?)?; }
-        }
-        for record in records {
-            if let DenseExecution::AbsorbHeads(geometry) = record.ownership.execution {
-                ensure!(geometry == KvBGeometry { heads, nope, values: v, latent: lat },
-                    "kv_b resident geometry disagrees with model");
+            } else {
+                for component in &slice.components {
+                    let format = if slice.transform == DenseTransform::WidenBf16 { "f32".into() }
+                        else { component.dtype.to_lowercase() };
+                    put(group, &format, slice.transform.allocation_bytes(component)?)?;
+                }
             }
         }
+        let total = groups.values().try_fold(0u64, |total, &bytes|
+            total.checked_add(bytes).context("native resident total overflow"))?;
+        ensure!(total == u64::try_from(plan.resident_bytes)?, "native resident groups differ from owned plan");
         Ok(groups.into_iter().map(|((g, f), b)| (g, f, b)).collect())
     })().map_err(Into::into)
 }
@@ -1121,7 +1087,8 @@ mod tests {
             assert!(DenseRecord::inventory(root.path()).is_err());
         }
         assert!(product(&[usize::MAX, 2]).is_err());
-        assert!(allocation(usize::MAX).is_err());
+        assert_eq!(allocation(usize::MAX), usize::MAX);
+        assert!(lane_allocation(usize::MAX).is_err());
         assert!(DensePlan::for_rank(&[], 3, 0).is_err());
     }
 
@@ -1163,30 +1130,6 @@ mod tests {
         f.write_all(&(bytes.len() as u64).to_le_bytes()).unwrap();
         f.write_all(&bytes).unwrap();
         f.write_all(&payload).unwrap();
-    }
-
-    #[test]
-    fn a8_lane_records_scale_with_rows_and_vanish_at_decode_width() {
-        let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap();
-        // TP2: widest K is o_proj's 32 heads x 256 = 8192; one MX8 record row is K/32 x 528 B per 16 rows.
-        let (heads, inter) = (cfg.heads / 2, cfg.dense_intermediate / 2);
-        let full = a8_scratch_bytes(&cfg, heads, inter, 4096);
-        assert_eq!(full, 256 * (8192 / 32) * 528);
-        assert_eq!(a8_scratch_bytes(&cfg, heads, inter, 2048) * 2, full);
-        assert_eq!(a8_scratch_bytes(&cfg, heads, inter, 65), 5 * (8192 / 32) * 528);
-        for rows in [0, 1, 63, 64] {
-            assert_eq!(a8_scratch_bytes(&cfg, heads, inter, rows), 0, "{rows} rows");
-        }
-        // Full width: K 16384.
-        assert_eq!(a8_scratch_bytes(&cfg, cfg.heads, cfg.dense_intermediate, 4096), 256 * (16384 / 32) * 528);
-        // The charge is decode plus one prefill scratch [+ records] every slot shares (#762).
-        for gpus in [1, 2] {
-            let (heads, inter) = (cfg.heads / gpus, cfg.dense_intermediate / gpus);
-            let (decode, prefill) = (scratch_bytes(&cfg, heads, inter, 64), scratch_bytes(&cfg, heads, inter, 4096));
-            let a8 = a8_scratch_bytes(&cfg, heads, inter, 4096);
-            assert_eq!(lane_charge_bytes(&cfg, gpus, 64, 4096, false), decode + prefill);
-            assert_eq!(lane_charge_bytes(&cfg, gpus, 64, 4096, true), decode + prefill + a8);
-        }
     }
 
     #[test]
@@ -1409,7 +1352,7 @@ mod tests {
             assert_eq!(plan.resident_bytes, 7_798_784);
             assert_eq!(plan.resident_bytes, layout.allocations.iter().sum::<usize>());
             assert!(plan.tensors[0].components.is_empty());
-            assert_eq!(resident_native(&[record.clone()], 2, rank, 1, 64, 192, 256, 512)
+            assert_eq!(resident_native(&DenseSelection::from_hf(&crate::plan::testing::glm5_config()).unwrap(), 1, &plan)
                 .unwrap().iter().map(|v| v.2 as usize).sum::<usize>(), plan.resident_bytes);
         }
     }
@@ -1433,13 +1376,170 @@ mod tests {
         record.ownership = flash.ownership(&record.tensor).unwrap();
         assert_eq!(record.ownership.whole_mla, Some(1));
         let owners = std::collections::BTreeMap::from([(1, 1)]);
-        assert!(DensePlan::for_rank_owned(&[record.clone()], 2, 0, &owners).unwrap().tensors.is_empty());
+        let selection = DenseSelection::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        let empty = DensePlan::for_rank_owned(&[record.clone()], 2, 0, &owners).unwrap();
+        assert!(empty.tensors.is_empty());
+        assert!(resident_native(&selection, 2, &empty).unwrap().is_empty());
         let plan = DensePlan::for_rank_owned(&[record], 2, 1, &owners).unwrap();
         assert_eq!(plan.tensors[0].channels, 128);
+        assert_eq!(resident_native(&selection, 2, &plan).unwrap().iter()
+            .map(|v| v.2 as usize).sum::<usize>(), plan.resident_bytes);
         assert_eq!(flash.ownership("model.language_model.layers.1.self_attn.indexer.wq_b.weight")
             .unwrap().execution, DenseExecution::Replicated);
         assert_eq!(flash.ownership("model.language_model.layers.1.mlp.gate.weight")
             .unwrap().execution, DenseExecution::Replicated);
+    }
+
+    #[test]
+    fn flash_kernel_required_widening_is_lossless_load_only_and_glm_is_unchanged() {
+        let configs: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/exlr8-dense-configs.json")).unwrap();
+        let flash = ownership::DenseFamily::from_hf(&configs["flash"]).unwrap();
+        let glm = ownership::DenseFamily::from_hf(&configs["glm"]).unwrap();
+        let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&configs["flash"]).unwrap();
+        let conv = configs["flash"]["text_config"]["linear_attn_config"]["short_conv_kernel_size"].as_u64().unwrap() as usize;
+        let width = cfg.kda_heads * cfg.kda_head_dim;
+        for (leaf, shape, execution) in [
+            ("hc_attn_fn", vec![2 * cfg.hc_mult + cfg.hc_mult * cfg.hc_mult, cfg.hc_mult * cfg.hidden], DenseExecution::Replicated),
+            ("hc_ffn_fn", vec![2 * cfg.hc_mult + cfg.hc_mult * cfg.hc_mult, cfg.hc_mult * cfg.hidden], DenseExecution::Replicated),
+            ("self_attn.q_conv1d.weight", vec![width, 1, conv], DenseExecution::Split(DenseAxis::Output)),
+            ("self_attn.k_conv1d.weight", vec![width, 1, conv], DenseExecution::Split(DenseAxis::Output)),
+            ("self_attn.v_conv1d.weight", vec![width, 1, conv], DenseExecution::Split(DenseAxis::Output)),
+        ] {
+            let tensor = format!("model.language_model.layers.0.{leaf}");
+            let ownership = flash.ownership(&tensor).unwrap();
+            assert_eq!(ownership.transform, DenseTransform::WidenBf16);
+            assert_eq!(ownership.execution, execution);
+            let source_bytes = shape.iter().product::<usize>() * 2;
+            let record = DenseRecord { tensor, encoding: DenseEncoding::Bf16, shape: shape.clone(), side: ShardSide::Replicated,
+                ownership, channels_per_shard: 0, rotation_id: 0, rotation: None, hessian_solved: false, native_blocks: 0,
+                components: vec![DenseComponent { suffix: "plain".into(), dtype: "BF16".into(), shape,
+                    source: DenseRange { path: "not-read".into(), offset: 0, bytes: source_bytes }, window: None }] };
+            for world in [1, 2] { for rank in 0..world {
+                let plan = DensePlan::for_rank(&[record.clone()], world, rank).unwrap();
+                let slice = &plan.tensors[0];
+                let component = &slice.components[0];
+                assert_eq!(plan.resident_bytes, (component.resident_bytes().unwrap() * 2).max(256));
+                let selection = DenseSelection::from_hf(&configs["flash"]).unwrap();
+                let groups = resident_native(&selection, cfg.layers, &plan).unwrap();
+                assert_eq!(groups.iter().map(|v| v.2 as usize).sum::<usize>(), plan.resident_bytes);
+                assert!(groups.iter().all(|(_, format, _)| format == "f32"));
+                let mut invalid_plan = plan.clone();
+                invalid_plan.resident_bytes += 1;
+                assert!(resident_native(&selection, cfg.layers, &invalid_plan).is_err());
+                invalid_plan = plan.clone();
+                invalid_plan.tensors[0].tensor = format!("model.language_model.layers.{}.{}", cfg.layers, leaf);
+                assert!(resident_native(&selection, cfg.layers, &invalid_plan).is_err());
+                assert!(plan.read_staging_bytes > 0);
+                assert!(plan.read_staging_bytes <= DENSE_STEP_BYTES);
+            } }
+            let mut invalid = record;
+            invalid.components[0].dtype = "F32".into();
+            assert!(DensePlan::for_rank(&[invalid], 1, 0).is_err());
+        }
+        for leaf in ["input_layernorm.weight", "self_attn.q_a_layernorm.weight", "self_attn.indexer.k_norm.weight"] {
+            assert_eq!(glm.ownership(&format!("model.layers.0.{leaf}")).unwrap().transform, DenseTransform::Identity);
+        }
+        for leaf in ["hc_attn_scale", "hc_ffn_base", "self_attn.A_log", "self_attn.dt_bias", "self_attn.o_norm.weight"] {
+            assert_eq!(flash.ownership(&format!("model.language_model.layers.0.{leaf}")).unwrap().transform, DenseTransform::Identity);
+        }
+        let mut component = DenseComponent { suffix: "plain".into(), dtype: "BF16".into(), shape: vec![1],
+            source: DenseRange { path: "not-read".into(), offset: 0, bytes: usize::MAX - 1 }, window: None };
+        assert!(DenseTransform::WidenBf16.resident_bytes(&component).is_err());
+        component.source.bytes = 3;
+        assert!(DenseTransform::WidenBf16.resident_bytes(&component).is_err());
+    }
+
+    #[test]
+    fn external_drafter_backbone_selection_never_admits_native_mtp() {
+        let root = tempfile::tempdir().unwrap();
+        trellis(root.path(), 0, 0, 0);
+        let template = DenseRecord::inventory(root.path()).unwrap().remove(0);
+        let mxfp8 = |tensor: String, n: usize, k: usize| {
+            let mut record = template.clone();
+            record.tensor = tensor;
+            record.encoding = DenseEncoding::Mxfp8;
+            record.shape = vec![n, k];
+            record.native_blocks = n.div_ceil(128);
+            record.rotation = None;
+            record.rotation_id = 0;
+            record.components = [("fp8", vec![n, k], n * k),
+                ("e8m0", vec![n, k / 32], n * k / 32)].into_iter().map(|(suffix, shape, bytes)|
+                DenseComponent { suffix: suffix.into(), dtype: "U8".into(), shape,
+                    source: DenseRange { path: root.path().join("must-not-read-payload"), offset: 0, bytes },
+                    window: None }).collect();
+            record
+        };
+        let mut glm = crate::plan::testing::glm5_config();
+        glm["num_hidden_layers"] = json!(78);
+        glm["indexer_types"] = json!(vec!["full"; 78]);
+        glm["mlp_layer_types"] = json!((0..78).map(|l| if l == 0 { "dense" } else { "sparse" }).collect::<Vec<_>>());
+        for (config, prefix, layers, hidden, q) in [
+            (glm, "model.", 78, 6144, 2048),
+            (crate::plan::testing::glm5_flash_config(45), "model.language_model.", 45, 4096, 1536),
+        ] {
+            let selection = DenseSelection::from_hf(&config).unwrap();
+            let backbone = vec![mxfp8(format!("{prefix}layers.0.self_attn.q_a_proj.weight"), q, hidden)];
+            let mut with_mtp = backbone.clone();
+            for (leaf, n, k) in [("eh_proj.weight", hidden, 2 * hidden),
+                ("self_attn.q_a_proj.weight", q, hidden), ("shared_head.norm.weight", hidden, 128),
+                ("shared_head.head.weight", 154880, hidden)] {
+                with_mtp.push(mxfp8(format!("{prefix}layers.{layers}.{leaf}"), n, k));
+            }
+            let names = selection.vocabulary_names();
+            assert_eq!(names, [format!("{prefix}embed_tokens.weight"), "lm_head.weight".into()]);
+            for (name, role) in names.iter().zip([VocabularyRole::Embedding, VocabularyRole::Head]) {
+                assert_eq!(selection.role(name, layers).unwrap(), DenseRole::Vocabulary(role));
+            }
+            assert_eq!(selection.role(&with_mtp[1].tensor, layers).unwrap(), DenseRole::Excluded);
+            // A backbone operand can have exactly the head's shape and encoding.
+            let mut row_backbone = backbone[0].clone();
+            row_backbone.encoding = DenseEncoding::RowFp8;
+            row_backbone.shape = vec![154880, hidden];
+            let mut row_head = row_backbone.clone();
+            row_head.tensor = names[1].clone();
+            let rows = selection.backbone(&[row_backbone.clone(), row_head], layers).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].tensor, row_backbone.tensor);
+            let selected = selection.backbone(&with_mtp, layers).unwrap();
+            assert_eq!(selected.iter().map(|r| &r.tensor).collect::<Vec<_>>(),
+                backbone.iter().map(|r| &r.tensor).collect::<Vec<_>>());
+            for world in [1, 2] {
+                for rank in 0..world {
+                    let before = DensePlan::for_rank(&backbone, world, rank).unwrap();
+                    let after = DensePlan::for_rank(&selected, world, rank).unwrap();
+                    assert_eq!((before.resident_bytes, before.read_staging_bytes),
+                        (after.resident_bytes, after.read_staging_bytes));
+                    assert!(!after.tensors.iter().any(|slice| slice.tensor.contains(&format!("layers.{layers}."))));
+                }
+            }
+            assert!(selection.backbone(&with_mtp, layers + 1).is_err());
+            assert!(selection.backbone(&with_mtp[1..], layers).is_err());
+        }
+    }
+
+    #[test]
+    fn native_inventory_excludes_shipped_glm_mtp_metadata_layer() {
+        let root = tempfile::tempdir().unwrap();
+        let path = trellis(root.path(), 0, 0, 0);
+        let records = DenseRecord::inventory(root.path()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let size = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        let mut header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + size]).unwrap();
+        header["__metadata__"]["layer"] = json!("78");
+        let header = serde_json::to_vec(&header).unwrap();
+        let mut file = File::create(root.path().join("dense/exlr8-dense-078.safetensors")).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(&bytes.split_off(8 + size)).unwrap();
+        let after = DenseRecord::inventory(root.path()).unwrap();
+        assert_eq!(after.len(), records.len());
+        for rank in 0..2 {
+            let before = DensePlan::for_rank(&records, 2, rank).unwrap();
+            let after = DensePlan::for_rank(&after, 2, rank).unwrap();
+            assert_eq!((before.resident_bytes, before.read_staging_bytes),
+                (after.resident_bytes, after.read_staging_bytes));
+        }
     }
 
     #[test]
@@ -1512,6 +1612,7 @@ mod tests {
     fn real_checkpoint_native_residency() {
         let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_EXLR8_SNAPSHOT").expect("snapshot"));
         let records = DenseRecord::inventory(&snapshot).unwrap();
+        let selection = DenseSelection::from_hf(&crate::plan::checkpoint::read_json(&snapshot.join("config.json")).unwrap()).unwrap();
         for world in [1, 2] {
             for rank in 0..world {
                 let plan = DensePlan::for_rank(&records, world, rank).unwrap();
@@ -1545,15 +1646,15 @@ mod tests {
                         previous_resident += expected.source.bytes.max(256);
                     }
                 }
-                let current = resident_native(&records, world, rank, 78, 64, 192, 256, 512).unwrap()
+                let current = resident_native(&selection, 78, &plan).unwrap()
                     .iter().map(|entry| entry.2 as usize).sum::<usize>();
                 assert_eq!(current, previous_resident, "GLM public plan bytes changed TP{world} rank{rank}");
                 eprintln!("GLM TP{world} rank{rank}: ownership identical; public bytes {previous_resident} -> {current}");
             }
         }
         let total = |groups: &[(String, String, u64)]| groups.iter().map(|g| g.2).sum::<u64>();
-        let one = super::resident_native(&records, 1, 0, 78, 64, 192, 256, 512).unwrap();
-        let ranks: Vec<_> = (0..2).map(|r| super::resident_native(&records, 2, r, 78, 64, 192, 256, 512).unwrap()).collect();
+        let one = super::resident_native(&selection, 78, &DensePlan::for_rank(&records, 1, 0).unwrap()).unwrap();
+        let ranks: Vec<_> = (0..2).map(|r| super::resident_native(&selection, 78, &DensePlan::for_rank(&records, 2, r).unwrap()).unwrap()).collect();
         assert!(ranks[1].iter().all(|(g, _, _)| g != "embedding" && g != "lm_head" && g != "router"));
         let (whole, r0, r1) = (total(&one), total(&ranks[0]), total(&ranks[1]));
         eprintln!("native resident bytes: TP1 {whole}, TP2 {r0} + {r1}");

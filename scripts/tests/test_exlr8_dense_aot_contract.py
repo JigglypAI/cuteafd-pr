@@ -9,7 +9,7 @@ import types
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def catalog(monkeypatch):
+def catalog(monkeypatch, families=("glm", "glmf")):
     path = ROOT / "python/tools/aot/export_b12x_exlr8_dense_aot.py"
     tree = ast.parse(path.read_text())
     namespace = {"partial": partial}
@@ -20,9 +20,8 @@ def catalog(monkeypatch):
         ("scaled_linear", ("compile_scaled_linear_aot",)),
         ("dense_mxfp8", ("compile_dense_mxfp8_aot", "compile_dense_mxfp8_quant_aot")),
         ("fp8_row_embedding", ("compile_fp8_row_embedding_aot",)),
-        ("trellis_unpack", ("compile_trellis_unpack_e4m3_aot",)),
         ("trellis_transform", ("compile_trellis_input_aot", "compile_trellis_output_aot")),
-        ("native_dense", ("compile_trellis_fp8_prefill_aot", "compile_swiglu_split_aot",
+        ("native_dense", ("compile_swiglu_split_aot",
                           "compile_f32_narrow_pack_aot")),
         ("pointwise", ("compile_bf16_projection_aot",)),
     ):
@@ -31,7 +30,7 @@ def catalog(monkeypatch):
             setattr(fake, compiler, lambda **kwargs: kwargs)
         monkeypatch.setitem(sys.modules, fake.__name__, fake)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
-    return namespace["programs"]()
+    return namespace["programs"](families=families)
 
 
 def test_dense_trellis_catalog_has_native_full_shapes(monkeypatch):
@@ -50,8 +49,10 @@ def test_dense_trellis_catalog_has_native_full_shapes(monkeypatch):
 
 
 def test_dense_a8_catalog_is_additive_and_quantizes_each_width_once(monkeypatch):
-    entries = catalog(monkeypatch)
-    assert all(not name.endswith("_a8") for name, *_ in entries[:63])
+    entries = catalog(monkeypatch, ("glm",))
+    first_a8 = next(i for i, (_, op, _, _) in enumerate(entries) if op == "dense_mxfp8")
+    assert all(not name.endswith("_a8") for name, *_ in entries[:first_a8])
+    assert all(op in ("dense_mxfp8", "dense_mxfp8_quant") for _, op, _, _ in entries[first_a8:])
     cores = [(name, p, thunk) for name, op, p, thunk in entries if op == "dense_mxfp8"]
     assert len(cores) == 8
     assert {p["input_features"] for _, p, _ in cores} == {2048, 6144, 8192, 12288, 16384}
@@ -67,8 +68,8 @@ def test_dense_a8_catalog_is_additive_and_quantizes_each_width_once(monkeypatch)
 
 def test_dense_tp2_catalog_halves_only_the_owned_axis(monkeypatch):
     entries = {name: (op, params, thunk)
-               for name, op, params, thunk in catalog(monkeypatch)}
-    assert len(entries) == 76
+               for name, op, params, thunk in catalog(monkeypatch, ("glm",))}
+    assert len(entries) == 60
     for name in ("trellis_q_b", "trellis_o", "trellis_gate_up", "trellis_down",
                  "int4_q_b", "int4_o"):
         op, full, _ = entries[name]
@@ -91,26 +92,17 @@ def test_dense_has_opt_in_sm_comparison_group(monkeypatch):
     assert exporter == "export_b12x_dsv4_aot.py"
     assert args[:2] == ["--geometry", "exlr8_dense"]
     assert args[3].split(",") == [name for name, _, _, _ in catalog(monkeypatch)[:4]]
-    groups = [j for j in module.jobs("all") if j[0].startswith("exlr8-dense-")]
+    groups = [j for j in module.jobs("all") if j[0].startswith("exlr8-dense-")
+              and not j[0].startswith("exlr8-dense-scope-")]
+    for group, _, args in groups:
+        assert args[-2:] == ["--dense-trellis-families",
+                             "glm,glmf" if "-geometry-" in group else "glm"]
+    scopes = [j for j in module.jobs("all") if j[0].startswith("exlr8-dense-scope-")]
+    assert [args for _, _, args in scopes] == [
+        ["--geometry", "exlr8_dense", "--dense-trellis-families", family] for family in ("glm", "glmf")]
     selected = [name for _, _, args in groups for name in args[3].split(",")]
     assert sorted(selected) == sorted(name for name, _, _, _ in catalog(monkeypatch))
     assert "exlr8_dense" not in module.GEOMETRIES
-
-def test_unpacked_prefill_only_covers_native_trellis(monkeypatch):
-    entries = {name: (op, params) for name, op, params, _ in catalog(monkeypatch)}
-    unpacked = [name.removeprefix("unpack_") for name in entries if name.startswith("unpack_")]
-    assert len(unpacked) == 8
-    for name in unpacked:
-        _, core = entries["trellis_" + name]
-        op, unpack = entries["unpack_" + name]
-        assert op == "trellis_unpack_e4m3"
-        assert unpack == {k: core[k] for k in ("input_features", "output_features", "sharded_side")}
-        op, prefill = entries["prefill_" + name]
-        assert op == "trellis_fp8_prefill"
-        assert prefill == {k: core[k] for k in ("input_features", "output_features", "max_rows")}
-    assert not any(name.startswith(("unpack_int4", "unpack_mxfp8")) for name in entries)
-    assert entries["bf16_index_weights"][1] == dict(width=6144, outputs=32, output_dtype="torch.float32")
-
 
 def test_exlr8_coordinator_enables_dense_and_both_stage_geometries(tmp_path):
     import subprocess
@@ -152,14 +144,115 @@ def test_bf16_core_is_static_and_matches_f16_geometry(monkeypatch):
             assert params == dict(base, input_dtype="bf16")
             assert thunk() == params
     assert sum(op == "trellis_linear" and p.get("input_dtype") == "bf16"
-               for op, p, _ in entries.values()) == 8
+               for op, p, _ in entries.values()) == 17
+
+
+def test_geometry_catalog_is_deduplicated_and_a16_only(monkeypatch):
+    import hashlib
+    import json
+
+    entries = catalog(monkeypatch)
+    legacy = [(name, op, params) for name, op, params, _ in entries[:60]]
+    assert hashlib.sha256(json.dumps(legacy, sort_keys=True).encode()).hexdigest() == (
+        "a35a432bf52b58c0611ae59aa05bddcc27eadbacc83e0d199077cd53fef6addd")
+    assert len(entries) == 99
+    assert len({name for name, *_ in entries}) == len(entries)
+    geometries = []
+    for name, op, params, thunk in entries:
+        if op in ("trellis_linear", "scaled_linear", "fp8_row_embedding"):
+            geometries.append((op, tuple(sorted(params.items()))))
+        assert thunk() == params
+    assert len(geometries) == len(set(geometries))
+    new = entries[60:]
+    assert len([1 for _, op, _, _ in new if op == "trellis_linear"]) == 18
+    assert len([1 for _, op, p, _ in new if op == "scaled_linear" and p["encoding"] == "mxfp8"]) == 10
+    assert not any("glmf" in name or name.endswith("_a8") for name, *_ in new)
+    assert not any(op in ("dense_mxfp8", "dense_mxfp8_quant") for _, op, _, _ in new)
+    shapes = {(p["input_features"], p["output_features"], p["sharded_side"])
+              for _, op, p, _ in new if op == "scaled_linear"}
+    assert (4096, 32, 1) in shapes and (128, 8192, 1) in shapes
+    assert sum(name == "trellis_k8192_n4096_s2" for name, *_ in new) == 1
+
+
+def test_dense_family_scope_preserves_legacy_and_unions_shared_geometry(monkeypatch):
+    import hashlib
+    import json
+    import pytest
+
+    glm = catalog(monkeypatch, ("glm",))
+    flash = catalog(monkeypatch, ("glmf",))
+    union = catalog(monkeypatch, ("glm", "glmf"))
+    triples = lambda entries: [(name, op, params) for name, op, params, _ in entries]
+    assert len(glm) == 60
+    assert hashlib.sha256(json.dumps(triples(glm), sort_keys=True).encode()).hexdigest() == (
+        "a35a432bf52b58c0611ae59aa05bddcc27eadbacc83e0d199077cd53fef6addd")
+    assert triples(union[:len(glm)]) == triples(glm)
+    assert len(flash) == 55
+    assert len(union) == 99
+    glm_names = {name for name, *_ in glm}
+    flash_names = {name for name, *_ in flash}
+    assert glm_names | flash_names == {name for name, *_ in union}
+    reused = glm_names & flash_names
+    assert len(reused) == 16
+    assert {"swiglu_split_i6144", "swiglu_split_i12288",
+            "f32_narrow_pack_n128_p160", "f32_narrow_pack_n32_p160"} <= reused
+    assert not any(op in ("dense_mxfp8", "dense_mxfp8_quant") for _, op, _, _ in flash)
+    assert triples(catalog(monkeypatch, ("glmf", "glm", "glmf"))) == triples(union)
+    for families in ((), ("kimik3",), ("glm", "unknown")):
+        with pytest.raises(ValueError, match="families"):
+            catalog(monkeypatch, families)
+
+
+def test_shared_scope_knob_keeps_k6_default_and_native_family_fallback():
+    import pytest
+
+    path = ROOT / "python/tools/aot/export_b12x_dsv4_aot.py"
+    node = next(node for node in ast.parse(path.read_text()).body
+                if isinstance(node, ast.FunctionDef) and node.name == "dense_family_scopes")
+    namespace = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+    scope = namespace["dense_family_scopes"]
+    assert scope(None, "glm") == (("kimik3",), ("glm",))
+    assert scope(None, "glmf") == (("kimik3",), ("glmf",))
+    assert scope("glm", "glmf") == (("glm",), ("glm",))
+    assert scope("glmf", "glm") == (("glmf",), ("glmf",))
+    assert scope("glmf,kimik3,glm,glm", "glm") == (("kimik3", "glm", "glmf"), ("glm", "glmf"))
+    assert scope("kimik3", "glm") == (("kimik3",), ())
+    assert scope("step5", "glm") == (("step5",), ())
+    assert scope("step5,glmf,glm", "glm") == (("glm", "glmf", "step5"), ("glm", "glmf"))
+    for families in ("", "glm,", "other"):
+        with pytest.raises(ValueError, match="dense-trellis-families"):
+            scope(families, "glm")
+
+
+def test_native_dense_scope_preserves_existing_table_metadata():
+    path = ROOT / "python/tools/aot/export_b12x_dsv4_aot.py"
+    tree = ast.parse(path.read_text())
+    branch = next(node for node in ast.walk(tree)
+                  if isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+                  and ast.unparse(node.test) == "name == 'exlr8_dense'")
+    assignment = next(node for node in branch.body if isinstance(node, ast.Assign))
+    assert ast.literal_eval(assignment.value) == {"abi_version": 1}
 
 
 def test_native_host_admission_uses_shared_working_set_budget():
-    engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/engine/exlr8.rs").read_text()
+    engine = (ROOT / "rust/crates/cuteafd-daemon/src/shared/experts/exlr8/shared.rs").read_text()
     family = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/mod.rs").read_text()
     shared = "cuteafd_loader::formats::mapped_preload::host_memory()?"
     assert shared in engine.split("fn admit_host(", 1)[1].split("pub(crate) struct NativeExperts", 1)[0]
     assert shared in family.split("fn load_native<", 1)[1]
     assert "fn host_available(" not in engine
     assert 'read_to_string("/proc/meminfo")' not in engine
+
+
+def test_native_shared_owner_is_family_neutral_and_glm_keeps_its_buffers():
+    shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/experts/exlr8/shared.rs").read_text()
+    engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/engine.rs").read_text()
+    family = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/mod.rs").read_text()
+    assert "family: KernelFamily" in shared
+    assert "shared_workspace_bytes(programs, family, ROWS)" in shared
+    assert "programs, self.family, ROWS, self.workspace" in shared
+    assert "Workspace" not in shared and "KernelFamily::Glm" not in shared
+    assert "execution.seal_graph_storage()?" in shared
+    assert "w.x.buffer,\n                w.shared.buffer" in engine
+    assert "cuteafd_ffi::exlr8::KernelFamily::Glm,\n                devices.len(), rank" in family
