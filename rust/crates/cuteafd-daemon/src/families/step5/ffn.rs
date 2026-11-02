@@ -13,6 +13,23 @@ use cuteafd_loader::plan::{
 const HIDDEN: usize = 4096;
 const DENSE: usize = 13824;
 
+fn native_stage_pointers(
+    stage: usize,
+    planes: &[*mut std::ffi::c_void],
+    weights: &[*mut std::ffi::c_void],
+    gate: *mut std::ffi::c_void,
+    up: *mut std::ffi::c_void,
+) -> Vec<*mut std::ffi::c_void> {
+    // Native gate/up/down live outside the legacy weight list, which holds only norm.
+    match stage {
+        0 => vec![planes[0], weights[0], weights[0], weights[0], weights[0], weights[0], planes[1]],
+        1 | 3 => Vec::new(),
+        2 => vec![gate, up, planes[3]],
+        4 => vec![planes[0], planes[4], planes[5]],
+        _ => unreachable!("validated dense stage"),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Admission {
     rows: usize,
@@ -536,13 +553,6 @@ impl<'a> DenseFfn<'a> {
             .iter()
             .map(|a| a.buffer.ptr)
             .collect::<Vec<_>>();
-        let pointers = [
-            vec![p[0], w[0], w[0], w[0], w[0], w[0], p[1]],
-            vec![p[1], w[1], p[2]],
-            vec![p[2], p[3]],
-            vec![p[3], w[2], p[4]],
-            vec![p[0], p[4], p[5]],
-        ];
         if let Some(native) = &self.immutable.native {
             // Stages: norm, gate|up (native, two row blocks of GATE_UP), split
             // activation, down (native), residual. Planes and strides are unchanged.
@@ -556,25 +566,33 @@ impl<'a> DenseFfn<'a> {
             let up = cuteafd_ffi::CuteafdDeviceBuffer { ptr: gate.ptr.wrapping_byte_add(rows * DENSE * 2),
                 bytes: rows * DENSE * 2, ..gate };
             let gate = cuteafd_ffi::CuteafdDeviceBuffer { bytes: rows * DENSE * 2, ..gate };
+            let pointers = native_stage_pointers(stage, &p, &w, gate.ptr, up.ptr);
             return self.stream.device.run(|| {
                 let scalars = [Scalar::I32(rows as i32)];
                 match stage {
                     0 => unsafe {
                         // SAFETY: admitted same-device planes retained beyond the drain.
-                        self.immutable.programs[0].launch(&pointers[0], &[scalars[0], Scalar::F32(self.immutable.epsilon)], stream.raw)
+                        self.immutable.programs[0].launch(&pointers, &[scalars[0], Scalar::F32(self.immutable.epsilon)], stream.raw)
                     },
                     1 => {
                         native[0].launch(rows, plane(1, HIDDEN * 2), gate, scratch, stream.raw)?;
                         native[1].launch(rows, plane(1, HIDDEN * 2), up, scratch, stream.raw)
                     }
                     // SAFETY: as above; gate/up are disjoint row blocks of the GATE_UP plane.
-                    2 => unsafe { self.immutable.programs[1].launch(&[gate.ptr, up.ptr, p[3]], &scalars, stream.raw) },
+                    2 => unsafe { self.immutable.programs[1].launch(&pointers, &scalars, stream.raw) },
                     3 => native[2].launch(rows, plane(3, DENSE * 2), plane(4, HIDDEN * 2), scratch, stream.raw),
                     // SAFETY: as above.
-                    _ => unsafe { self.immutable.programs[2].launch(&pointers[4], &scalars, stream.raw) },
+                    _ => unsafe { self.immutable.programs[2].launch(&pointers, &scalars, stream.raw) },
                 }
             });
         }
+        let pointers = [
+            vec![p[0], w[0], w[0], w[0], w[0], w[0], p[1]],
+            vec![p[1], w[1], p[2]],
+            vec![p[2], p[3]],
+            vec![p[3], w[2], p[4]],
+            vec![p[0], p[4], p[5]],
+        ];
         self.stream.device.run(|| {
             let mut scalars = vec![Scalar::I32(rows as i32)];
             if stage == 0 {
@@ -593,6 +611,28 @@ impl<'a> DenseFfn<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_dense_stage_selection_needs_only_norm_weight() {
+        let mut storage = [0u8; 9];
+        let p = (0..6).map(|i| storage.as_mut_ptr().wrapping_add(i).cast())
+            .collect::<Vec<_>>();
+        let norm = storage.as_mut_ptr().wrapping_add(6).cast();
+        let gate = storage.as_mut_ptr().wrapping_add(7).cast();
+        let up = storage.as_mut_ptr().wrapping_add(8).cast();
+        // EXL3 keeps norm here; gate/up/down are owned by NativeLinear instead.
+        let weights = [norm];
+        let expected = [
+            vec![p[0], norm, norm, norm, norm, norm, p[1]],
+            vec![],
+            vec![gate, up, p[3]],
+            vec![],
+            vec![p[0], p[4], p[5]],
+        ];
+        for (stage, expected) in expected.iter().enumerate() {
+            assert_eq!(&native_stage_pointers(stage, &p, &weights, gate, up), expected);
+        }
+    }
 
     #[test]
     fn dense_admission_charges_capacity_and_allocator_floors() -> Result<()> {
