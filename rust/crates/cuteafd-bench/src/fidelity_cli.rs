@@ -235,12 +235,27 @@ fn run_output(args: &RunArgs, runs: &[Run]) -> Value {
 }
 
 pub(crate) fn discovered_prefill_logits(status: &Value) -> Result<bool> {
+    discovered_prefill_logits_at(status, &cuteafd_loader::default_hf_home())
+}
+
+fn discovered_prefill_logits_at(status: &Value, hf_home: &std::path::Path) -> Result<bool> {
     use cuteafd_loader::plan::{checkpoint::{read_json, Checkpoint}, family};
-    let snapshot = status["snapshot"].as_str().map(PathBuf::from)
+    let advertised = status["snapshot"].as_str().map(PathBuf::from)
         .context("fidelity family discovery: server did not advertise a snapshot")?;
+    // run.sh mounts the host's HF hub at /hf/hub inside the server container.
+    let snapshot = if advertised.join("config.json").exists() {
+        advertised.clone()
+    } else if let Ok(relative) = advertised.strip_prefix("/hf/hub") {
+        ensure!(relative.components().all(|part| matches!(part, std::path::Component::Normal(_))),
+            "fidelity family discovery: invalid container snapshot path {}", advertised.display());
+        hf_home.join("hub").join(relative)
+    } else {
+        advertised.clone()
+    };
     let path = snapshot.join("config.json");
     let config = read_json(&path)
-        .with_context(|| format!("fidelity family discovery: cannot read {}", path.display()))?;
+        .with_context(|| format!("fidelity family discovery: cannot read {} (server advertised {})",
+            path.display(), advertised.display()))?;
     let checkpoint = Checkpoint { snapshot, config, quantize_config: None,
         weight_map: Default::default(), tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
     let detected = family::registry().iter().find(|f| f.detect(&checkpoint))
@@ -556,6 +571,28 @@ mod tests {
         let mut denied = status;
         denied["full_prefill_logits"] = json!(false);
         assert!(!discovered_prefill_logits(&denied).unwrap());
+    }
+
+    #[test]
+    fn family_discovery_maps_container_hub_and_still_fails_closed() {
+        let home = tempfile::tempdir().unwrap();
+        let relative = "models--unit--model/snapshots/pinned";
+        let snapshot = home.path().join("hub").join(relative);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        let status = json!({"snapshot": format!("/hf/hub/{relative}"), "full_prefill_logits": false});
+        assert!(discovered_prefill_logits_at(&status, home.path()).unwrap_err().to_string().contains("cannot read"));
+        std::fs::write(snapshot.join("config.json"), "not json").unwrap();
+        assert!(discovered_prefill_logits_at(&status, home.path()).unwrap_err().to_string().contains("cannot read"));
+        std::fs::write(snapshot.join("config.json"), r#"{"architectures":["Unregistered"]}"#).unwrap();
+        assert!(discovered_prefill_logits_at(&status, home.path()).unwrap_err().to_string().contains("no registered family"));
+        std::fs::write(snapshot.join("config.json"), r#"{"architectures":["DeepseekV41ForCausalLM"]}"#).unwrap();
+        assert!(discovered_prefill_logits_at(&status, home.path()).unwrap());
+        let local = json!({"snapshot": snapshot, "full_prefill_logits": false});
+        assert!(discovered_prefill_logits_at(&local, &home.path().join("unused")).unwrap());
+        let traversal = json!({"snapshot": "/hf/hub/../escape", "full_prefill_logits": true});
+        assert!(discovered_prefill_logits_at(&traversal, home.path()).unwrap_err().to_string().contains("invalid container snapshot path"));
+        let unrelated = json!({"snapshot": "/other/hub/models--unit--model/snapshots/pinned", "full_prefill_logits": true});
+        assert!(discovered_prefill_logits_at(&unrelated, home.path()).unwrap_err().to_string().contains("cannot read"));
     }
 
     fn fixture_run(args: &RunArgs) -> Run {
