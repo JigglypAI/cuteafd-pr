@@ -1,4 +1,4 @@
-//! Actual-owner receipts for no-drafter target and serving startup, including pinned owners.
+//! Actual-owner receipts for target, drafter and serving startup, including pinned owners.
 use super::*;
 use cuteafd_core::memory_layout::Category;
 use cuteafd_ffi::memory_ledger::{self, AllocationAudit, AllocationEvent, Space};
@@ -302,6 +302,7 @@ pub(super) fn reconcile_target(
         audit,
         loaded_events,
         audit.events().len(),
+        None,
         &receipts,
     )?;
     Ok(receipts)
@@ -312,10 +313,36 @@ pub(super) struct Startup {
     pub audit: AllocationAudit,
     pub loaded_events: usize,
     pub target_events: usize,
+    pub draft_events: Option<usize>,
     pub receipts: Vec<Receipt>,
 }
 
 impl Startup {
+    pub fn draft_loaded(
+        &mut self,
+        library: &NativeLibrary,
+        device: Device<'_>,
+        owners: Vec<Receipt>,
+    ) -> Result<()> {
+        ensure!(
+            self.draft_events.is_none(),
+            "drafter startup boundary already recorded"
+        );
+        self.receipts.extend(owners);
+        self.draft_events = Some(self.audit.events().len());
+        reconcile_startup(
+            &self.plan,
+            library,
+            device,
+            Phase::DraftLoad,
+            &self.audit,
+            self.loaded_events,
+            self.target_events,
+            self.draft_events,
+            &self.receipts,
+        )
+    }
+
     pub fn ready(
         &mut self,
         library: &NativeLibrary,
@@ -378,6 +405,7 @@ impl Startup {
             &self.audit,
             self.loaded_events,
             self.target_events,
+            self.draft_events,
             &receipts,
         )
     }
@@ -392,13 +420,14 @@ fn reconcile_startup(
     audit: &AllocationAudit,
     loaded_events: usize,
     target_events: usize,
+    draft_events: Option<usize>,
     receipts: &[Receipt],
 ) -> Result<()> {
     let (events, views) = startup_history(
         &audit.events(),
         loaded_events,
         target_events,
-        None,
+        draft_events,
         receipts,
         device.id,
         &memory_ledger::allocations(),
@@ -855,6 +884,7 @@ mod tests {
                 audit,
                 loaded_events: 0,
                 target_events,
+                draft_events: None,
                 receipts: vec![target_receipt],
             };
             let mut selector = TokenSelector::new(&library, placement, 33, 64)?;

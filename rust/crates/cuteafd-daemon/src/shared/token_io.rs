@@ -602,6 +602,11 @@ impl<'a> TokenSelector<'a> {
         crate::shared::spark_waves::healthy()
     }
 
+    /// Reserve only the landing fence for greedy draft selection, without a sampler.
+    pub(crate) fn reserve_greedy(&mut self) -> Result<()> {
+        self.landed.reserve_current_device()
+    }
+
     /// Allocates the GPU sampler now (eager start-up); otherwise the first sampled or masked
     /// selection does.
     pub fn reserve_sampler(&mut self) -> Result<()> {
@@ -955,6 +960,16 @@ mod tests {
         for placement in [SelectPlacement::Device, SelectPlacement::Host] {
             let audit = AllocationAudit::start();
             let mut selector = TokenSelector::new(&library, placement, 33, 64)?;
+            selector.reserve_greedy()?;
+            let greedy_events = fixture.events()?;
+            selector.reserve_greedy()?;
+            assert_eq!(fixture.events()?, greedy_events, "greedy fence reservation is idempotent");
+            assert_eq!(audit.events().len(), 2, "greedy selection must not allocate a sampler");
+            let (device, pinned) = selector.allocation_buffers();
+            assert_eq!(device.len(), 1);
+            assert_eq!(pinned.len(), 1);
+            assert_eq!((&*device[0].0, device[0].1.bytes), ("selector.output", 64 * 12));
+            assert_eq!((&*pinned[0].0, pinned[0].1.bytes), ("selector.landing", 64 * 12));
             selector.reserve_sampler()?;
             let census = |selector: &TokenSelector<'_>| {
                 let (device, pinned) = selector.allocation_buffers();

@@ -58,7 +58,7 @@ pub(crate) fn resolve_bytes(layout: FamilyLayout, explicit: Option<u64>, concurr
     max_context: usize, chunk: u64, memory: HostMemory) -> Result<u64> {
     cuteafd_core::prefix::HostCacheGeometry { unit_rows: layout.page_rows as u64,
         page_bytes: layout.page_bytes as u64, mark_bytes: layout.mark_bytes as u64,
-        draft_bytes: layout.draft_bytes as u64 }
+        draft_bytes: layout.draft_bytes as u64, draft_page_bytes: 0 }
         .resolve(explicit, max_context as u64, concurrency as u64, memory.total, chunk)
         .context("invalid geometry or overflow for automatic host prefix budget")
 }
@@ -66,7 +66,7 @@ pub(crate) fn resolve_bytes(layout: FamilyLayout, explicit: Option<u64>, concurr
 pub(crate) fn eviction_headroom(layout: FamilyLayout, tokens: u64) -> Result<[u64; 4]> {
     let [pages, marks, draft] = cuteafd_core::prefix::HostCacheGeometry {
         unit_rows: layout.page_rows as u64, page_bytes: layout.page_bytes as u64,
-        mark_bytes: layout.mark_bytes as u64, draft_bytes: layout.draft_bytes as u64,
+        mark_bytes: layout.mark_bytes as u64, draft_bytes: layout.draft_bytes as u64, draft_page_bytes: 0,
     }.eviction_headroom_bytes(tokens).context("host eviction headroom overflow")?;
     Ok([pages, marks, draft, 0])
 }

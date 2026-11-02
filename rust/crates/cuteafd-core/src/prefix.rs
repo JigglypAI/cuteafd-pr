@@ -43,6 +43,8 @@ pub struct HostCacheGeometry {
     pub page_bytes: u64,
     pub mark_bytes: u64,
     pub draft_bytes: u64,
+    /// Separate full-context drafter pages, not a per-snapshot ring/mark.
+    pub draft_page_bytes: u64,
 }
 
 /// Extra KV kept free after a pressure eviction, independently of the quota.
@@ -58,7 +60,7 @@ impl HostCacheGeometry {
     }
 
     pub fn chunk_bytes(self) -> u64 {
-        (256u64 << 20).max(self.page_bytes).max(self.mark_bytes).max(self.draft_bytes)
+        (256u64 << 20).max(self.page_bytes).max(self.mark_bytes).max(self.draft_bytes).max(self.draft_page_bytes)
     }
 
     /// Whole conversations (shared prompt/turn KV extent, two independent positional marks).
@@ -70,7 +72,7 @@ impl HostCacheGeometry {
                 .and_then(|rows| rows.checked_div(self.unit_rows)).and_then(|pages| pages.checked_mul(n)) else { return false };
             let Some(marks) = n.checked_mul(2) else { return false };
             let mut chunks = 0u64;
-            for (count, size) in [(pages, self.page_bytes), (marks, self.mark_bytes.max(1)), (n, self.draft_bytes)] {
+            for (count, size) in [(pages, self.page_bytes), (marks, self.mark_bytes.max(1)), (n, self.draft_bytes), (pages, self.draft_page_bytes)] {
                 if size == 0 { continue; }
                 let per = chunk / size;
                 if per == 0 { return false; }
@@ -87,12 +89,25 @@ impl HostCacheGeometry {
         low
     }
 
+    /// Independent classes need independent chunks, even when their byte totals
+    /// could fit together. Drafter pages retain one row page per target row page.
+    pub fn required_bytes(self, context: u64, concurrency: u64, chunk: u64) -> Option<u64> {
+        let mut required = host_cache_required_bytes(context, concurrency, self.unit_rows,
+            self.page_bytes, self.mark_bytes.max(1), self.draft_bytes, chunk)?;
+        if self.draft_page_bytes > 0 {
+            let per = chunk.checked_div(self.draft_page_bytes)?;
+            if per == 0 { return None; }
+            let pages = context.div_ceil(self.unit_rows).checked_mul(concurrency.checked_add(4)?)?;
+            required = required.checked_add(pages.div_ceil(per).checked_mul(chunk)?)?;
+        }
+        Some(required)
+    }
+
     /// Explicit quotas bypass geometry and caps; automatic quotas hold whole chunks.
     pub fn resolve(self, explicit: Option<u64>, context: u64, concurrency: u64,
         host_total: u64, chunk: u64) -> Option<u64> {
         if let Some(bytes) = explicit { return Some(bytes); }
-        let required = host_cache_required_bytes(context, concurrency, self.unit_rows,
-            self.page_bytes, self.mark_bytes.max(1), self.draft_bytes, chunk)?;
+        let required = self.required_bytes(context, concurrency, chunk)?;
         Some(required.min(default_host_cache_bytes(host_total)) / chunk * chunk)
     }
 }
@@ -103,7 +118,7 @@ mod host_budget_tests {
     #[test]
     fn eviction_headroom_uses_the_resolved_family_classes() {
         let geometry = HostCacheGeometry { unit_rows: 512, page_bytes: 455_680,
-            mark_bytes: 2_922_816, draft_bytes: 12_288 };
+            mark_bytes: 2_922_816, draft_bytes: 12_288, draft_page_bytes: 0 };
         assert_eq!(geometry.eviction_headroom_bytes(DEFAULT_HOST_CACHE_EVICT_TOKENS),
             Some([32 * 455_680, 2_922_816, 12_288]));
         assert_eq!(geometry.eviction_headroom_bytes(0), Some([0; 3]));
@@ -113,12 +128,31 @@ mod host_budget_tests {
     #[test]
     fn shared_resolver_preserves_explicit_overrides_and_whole_chunk_caps() {
         let geometry = HostCacheGeometry { unit_rows: 64, page_bytes: 512,
-            mark_bytes: 140, draft_bytes: 0 };
+            mark_bytes: 140, draft_bytes: 0, draft_page_bytes: 0 };
         assert_eq!(geometry.resolve(None, 65, 2, 32768, 1024), Some(8 * 1024));
         assert_eq!(geometry.resolve(None, 4096, 16, 32768, 1024), Some(8 * 1024));
         assert_eq!(geometry.resolve(Some(40001), 0, u64::MAX, 1, 0), Some(40001));
         assert_eq!(geometry.resolve(Some(0), 0, 0, 0, 0), Some(0));
         assert_eq!(geometry.resolve(None, 0, 1, 32768, 1024), None);
+    }
+
+    #[test]
+    fn paged_drafter_retention_is_a_separate_full_context_size_class() {
+        let mut geometry = HostCacheGeometry { unit_rows: 64, page_bytes: 512,
+            mark_bytes: 140, draft_bytes: 0, draft_page_bytes: 0 };
+        assert_eq!(geometry.required_bytes(65, 2, 1024), Some(8 * 1024));
+        geometry.draft_page_bytes = 384;
+        assert_eq!(geometry.required_bytes(65, 2, 1024), Some(14 * 1024));
+        assert_eq!(geometry.resolve(None, 65, 2, 1 << 30, 1024), Some(14 * 1024));
+        assert_eq!(geometry.conversations(14 * 1024, 65, 1024), 6);
+        assert_eq!(geometry.conversations(13 * 1024, 65, 1024), 5);
+        geometry.draft_bytes = 256;
+        assert_eq!(geometry.required_bytes(65, 2, 1024), Some(16 * 1024));
+        geometry.draft_page_bytes = 1025;
+        assert_eq!(geometry.required_bytes(65, 2, 1024), None);
+        geometry.draft_page_bytes = 512 << 20;
+        assert_eq!(geometry.chunk_bytes(), 512 << 20);
+        assert_eq!(geometry.resolve(Some(0), 0, 0, 0, 0), Some(0));
     }
 
     #[test]
@@ -916,7 +950,7 @@ mod staging_tests {
     }
     #[test]
     fn host_budget_charges_two_marks_per_conversation_and_capacity_uses_size_classes() {
-        let g = HostCacheGeometry { unit_rows: 64, page_bytes: 512, mark_bytes: 140, draft_bytes: 0 };
+        let g = HostCacheGeometry { unit_rows: 64, page_bytes: 512, mark_bytes: 140, draft_bytes: 0, draft_page_bytes: 0 };
         assert_eq!(host_cache_required_bytes(65, 2, 64, 512, 140, 0, 1024), Some(8 * 1024));
         assert_eq!(g.conversations(8 * 1024, 65, 1024), 6);
         assert_eq!(g.conversations(7 * 1024, 65, 1024), 5);

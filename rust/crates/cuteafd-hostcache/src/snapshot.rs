@@ -1361,7 +1361,7 @@ mod tests {
         let chunk = 256u64 << 20;
         let layout = Layout::family(455680, 2720064, 0);
         let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: 512,
-            page_bytes: layout.page as u64, mark_bytes: layout.tail as u64, draft_bytes: 0 };
+            page_bytes: layout.page as u64, mark_bytes: layout.tail as u64, draft_bytes: 0, draft_page_bytes: 0 };
         let [page, tail, draft] = geometry.eviction_headroom_bytes(
             cuteafd_core::prefix::DEFAULT_HOST_CACHE_EVICT_TOKENS).unwrap();
         let headroom = [page, tail, draft, 0];

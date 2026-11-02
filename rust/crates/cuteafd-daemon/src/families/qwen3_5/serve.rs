@@ -162,7 +162,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         let host_config = if let Some(facts) = serving {
             frozen_args.host_cache_bytes = crate::shared::prefix::HostBudget::Bytes(facts.host_quota);
             // The shared allocation plan already admitted all future host owners.
-            frozen_args.resolve_host_config(layout, shape.max_context, lanes)?
+            frozen_args.resolve_host_config_with_draft_pages(layout, shape.max_context, lanes, family.draft_page_bytes())?
         } else { args.host_config(layout, shape.max_context, lanes)? };
         let host = host_config.map(|config|
             CudaCopyEngine::registered_retained(self.library, family.snapshot_owners(),
@@ -611,7 +611,8 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
             ensure!(engine_args.draft_fixed.is_none() || engine_args.draft.is_some(), "--draft-fixed requires --draft");
             let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint,
                 header.config, engine_args.pool_tokens,
-                draft_config.or_else(|| mtp_admission.as_ref().map(|admission| admission.bytes)), slots,
+                draft_config.map(super::engine::DenseDraft::Deferred).or_else(|| mtp_admission.as_ref()
+                    .map(|admission| super::engine::DenseDraft::NativeMtp(&admission.layout))), slots,
                 Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits,
                 Some(cuteafd_loader::placement::families::qwen3_5::ServingRequest {
                     concurrency: lanes as u64, prefix_entries: engine_args.prefix.mark_rule(lanes).entries as u64,
@@ -640,8 +641,22 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                 scheduler::Drafts::Neural { depth, fixed: engine_args.draft_fixed.is_some() }
             } else if let Some(admission) = mtp_admission {
                 backend.mtp = Some(Rc::new(super::engine::mtp::MtpCache::load(&engine.borrow(), &reader, admission)?));
-                backend.selector = RefCell::new(Some(crate::shared::token_io::TokenSelector::new(&library,
-                    crate::shared::token_io::SelectPlacement::Device, engine.borrow().cfg.vocab, 1)?));
+                let mut selector = crate::shared::token_io::TokenSelector::new(&library,
+                    crate::shared::token_io::SelectPlacement::Device, engine.borrow().cfg.vocab, 1)?;
+                selector.reserve_greedy()?;
+                let mut owners = backend.mtp.as_ref().context("MTP was not loaded")?.allocation_receipts();
+                let (device, pinned) = selector.allocation_buffers();
+                let life = cuteafd_loader::placement::planner::Lifetime { first: cuteafd_loader::placement::planner::Phase::DraftLoad,
+                    last: cuteafd_loader::placement::planner::Phase::Growth };
+                for (id, bytes, address, location) in device.into_iter().map(|(id, b)| (id, b.bytes, b.ptr as u64,
+                    cuteafd_loader::placement::planner::Location::coordinator(0))).chain(pinned.into_iter().map(|(id, b)|
+                        (id, b.bytes, b.ptr as u64, cuteafd_loader::placement::planner::Location::PINNED))) {
+                    owners.push(cuteafd_loader::placement::planner::Receipt {
+                        allocation: cuteafd_loader::placement::planner::Allocation::buffer(format!("draft.mtp.{id}"),
+                            location, bytes as u64, life, cuteafd_core::memory_layout::Category::Drafter, "native MTP owner"), address });
+                }
+                backend.selector = RefCell::new(Some(selector));
+                engine.borrow_mut().reconcile_draft(owners)?;
                 scheduler::Drafts::Neural { depth: usize::from(engine_args.mtp), fixed: false }
             } else { scheduler::Drafts::None };
             scheduler::schedule(&backend, &engine_args.snapshot, &mut receive, &worker_stats, lanes,
@@ -732,7 +747,7 @@ mod tests {
         let bytes = super::super::engine::DrafterBytes::block_dspark(&config, 4,
             library.sm_count()? as u64, cfg.max_context)?;
         let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg,
-            Some(262144), Some(bytes), 4, Some(crate::shared::prefix::MarkRule {
+            Some(262144), Some(super::super::engine::DenseDraft::Deferred(bytes)), 4, Some(crate::shared::prefix::MarkRule {
                 lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }),
             std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None)?);
         let draft = {
@@ -769,7 +784,7 @@ mod tests {
         let reader = crate::shared::qwen::weights::WeightReader { library: &library, checkpoint: &checkpoint };
         let admission = Admission::new(&reader, &cfg, &programs)?;
         let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg,
-            Some(262144), Some(admission.bytes), 4, Some(crate::shared::prefix::MarkRule {
+            Some(262144), Some(super::super::engine::DenseDraft::NativeMtp(&admission.layout)), 4, Some(crate::shared::prefix::MarkRule {
                 lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }),
             std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None)?);
         let mtp = Rc::new(MtpCache::load(&engine.borrow(), &reader, admission)?);

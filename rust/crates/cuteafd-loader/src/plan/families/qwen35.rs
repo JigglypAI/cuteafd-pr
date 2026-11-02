@@ -188,9 +188,10 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         placement::families::qwen3_5::DrafterBytes::block_dspark(&config, slots,
             physical.sms as u64, cfg.max_context)
     }).transpose()?;
-    let drafter = if options.dense_qwen_mtp {
-        Some(placement::families::qwen3_5::DrafterBytes::native_mtp(input.checkpoint(), cfg)?)
-    } else { drafter };
+    use placement::families::qwen3_5::{DenseDraft, NativeMtpLayout, NativeMtpUsage};
+    let native_mtp = options.dense_qwen_mtp.then(|| NativeMtpLayout::new(input.checkpoint(), cfg,
+        64, NativeMtpUsage::SERVING)).transpose()?;
+    let drafter = native_mtp.as_ref().map(DenseDraft::NativeMtp).or_else(|| drafter.map(DenseDraft::Deferred));
     let host = match options.host_memory {
         Some(host) => host,
         None => {
@@ -211,6 +212,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         operation: if options.full_prefill_logits { planner::Operation::Scoring } else { planner::Operation::Serving } };
     let record_bytes = options.dense_qwen_kv.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
     let serving = placement::families::qwen3_5::ServingFacts::new(cfg, &buffers, record_bytes,
+        drafter.map(DenseDraft::page_bytes).transpose()?.unwrap_or(0),
         placement::families::qwen3_5::ServingRequest {
             concurrency: options.resolved_concurrency("qwen3_5"), prefix_entries: options.prefix_entries("qwen3_5"),
             host_cache_bytes: options.host_cache_bytes, host_headroom: 8 << 30, device_sampling: options.device_sampling,

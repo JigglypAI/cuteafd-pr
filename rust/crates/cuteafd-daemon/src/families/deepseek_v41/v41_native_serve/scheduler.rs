@@ -213,7 +213,7 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
     }
     let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: layout.page_rows as u64,
         page_bytes: layout.page_bytes as u64, mark_bytes: layout.mark_bytes as u64,
-        draft_bytes: layout.draft_bytes as u64 };
+        draft_bytes: layout.draft_bytes as u64, draft_page_bytes: 0 };
     let max_conversations = geometry.conversations(config.bytes, args.max_context_tokens as u64, config.chunk_bytes);
     let conversations_50k = geometry.conversations(config.bytes, 50_000, config.chunk_bytes);
     tracing::info!(mark_bytes = layout.mark_bytes, host_bytes = config.bytes,

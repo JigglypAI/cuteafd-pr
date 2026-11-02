@@ -1458,7 +1458,7 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         }
     }
     Ok((cuteafd_core::prefix::HostCacheGeometry { unit_rows: cache.logical_unit_rows,
-        page_bytes, mark_bytes, draft_bytes: 0 }, context, shape.concurrency))
+        page_bytes, mark_bytes, draft_bytes: 0, draft_page_bytes: 0 }, context, shape.concurrency))
 }
 
 /// Offline host owners are future allocations, unlike the runtime's live pinned

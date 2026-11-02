@@ -816,7 +816,7 @@ mod tests {
             assert_eq!(runtime.host_layout().tail, marks[0]);
             assert_eq!(marks[0] - marks[1], stages * WINDOW_MARK_BYTES);
             let host = HostCacheGeometry { unit_rows: runtime.page_rows as u64,
-                page_bytes: runtime.page_bytes as u64, mark_bytes: runtime.mark_bytes as u64, draft_bytes: 0 };
+                page_bytes: runtime.page_bytes as u64, mark_bytes: runtime.mark_bytes as u64, draft_bytes: 0, draft_page_bytes: 0 };
             for concurrency in [16, 64] {
                 let options = LayoutOptions { rtx_bytes: vec![96 << 30; 2], context_tokens: 4096,
                     pool_tokens: Some(8192), concurrency, native_mtp_layers: stages,

@@ -1,6 +1,6 @@
 //! Dense single-device allocation facts, independent of planner policy.
 use super::{
-    DrafterBytes, NativeBuffers, NativeWeights, Qwen35Config, PAGE_ROWS, PREFILL_ROWS, WHOLE,
+    DenseDraft, NativeBuffers, NativeWeights, Qwen35Config, PAGE_ROWS, PREFILL_ROWS, WHOLE,
 };
 use crate::families::qwen::HybridAttention;
 use crate::placement::{planner::*, ArchContext};
@@ -30,6 +30,7 @@ impl ServingFacts {
         cfg: &Qwen35Config,
         buffers: &NativeBuffers,
         record_bytes: u64,
+        draft_page_bytes: u64,
         request: ServingRequest,
         host_total: u64,
     ) -> Result<Self, Refusal> {
@@ -53,6 +54,7 @@ impl ServingFacts {
                 .ok_or(Refusal::Overflow("host prefix page"))?,
             mark_bytes: buffers.mark_bytes as u64,
             draft_bytes: 0,
+            draft_page_bytes,
         };
         let quota = if request.prefix_entries == 0 {
             0
@@ -162,9 +164,7 @@ pub struct DenseFacts<'a> {
     pub buffers: &'a NativeBuffers,
     pub slots: usize,
     pub record_bytes: u64,
-    /// Slice 0b supplies exact drafter owners; these reservations are explicitly
-    /// deferred and cannot satisfy a Ready reconciliation in the meantime.
-    pub drafter: Option<DrafterBytes>,
+    pub drafter: Option<DenseDraft<'a>>,
     pub serving: Option<ServingFacts>,
 }
 
@@ -244,6 +244,9 @@ pub fn admit(
     mut budgets: Vec<Budget>,
     facts: DenseFacts<'_>,
 ) -> Result<ResolvedPlan, Refusal> {
+    if matches!(request.onboard, Pin::Exact(layers) if layers > 0) {
+        return Err(Refusal::InvalidPin("model has 0 routed-expert layers"));
+    }
     if facts.weights.layers.len() != facts.cfg.attention.len()
         || facts.record_bytes == 0
         || facts.slots == 0
@@ -313,16 +316,44 @@ impl Recipe for DenseFacts<'_> {
                 )?;
             }
         }
-        if let Some(draft) = self.drafter {
-            let first = draft
-                .owned
-                .checked_add(draft.scratch)
-                .and_then(|n| n.checked_add(draft.pool_unit))
-                .ok_or(Refusal::Overflow("draft first page"))?;
-            contract.set_byte_extent(
-                "deferred.drafter",
-                ByteCurve::linear(first, draft.pool_unit, maximum),
-            )?;
+        match self.drafter {
+            Some(DenseDraft::NativeMtp(layout)) => {
+                let page = layout
+                    .pool_unit_bytes()
+                    .map_err(|e| Refusal::InvalidFact(e.to_string()))?;
+                let one_page = layout
+                    .with_pool_tokens(PAGE_ROWS as usize)
+                    .map_err(|e| Refusal::InvalidFact(e.to_string()))?;
+                let sidecar = one_page
+                    .owners
+                    .iter()
+                    .find(|o| o.id == "draft.mtp.sidecars")
+                    .ok_or_else(|| Refusal::InvalidFact("MTP sidecar owner missing".into()))?;
+                let kv = page
+                    .checked_sub(sidecar.bytes as u64)
+                    .ok_or(Refusal::Overflow("MTP KV page"))?;
+                contract.set_byte_extent("draft.mtp.kv", ByteCurve::linear(kv, kv, maximum))?;
+                let component = contract.components.iter_mut().find(|c| matches!(&c.kind,
+                    ComponentKind::Allocation { template, .. } if template.id == "draft.mtp.sidecars"))
+                    .ok_or_else(|| Refusal::InvalidFact("MTP sidecar component missing".into()))?;
+                component.bytes =
+                    ByteCurve::linear(sidecar.bytes as u64, sidecar.bytes as u64, maximum);
+                if let ComponentKind::Allocation { shape, .. } = &mut component.kind {
+                    shape[0] = ByteCurve::linear(1, 1, maximum);
+                }
+            }
+            Some(DenseDraft::Deferred(draft)) => {
+                let first = draft
+                    .owned
+                    .checked_add(draft.scratch)
+                    .and_then(|n| n.checked_add(draft.pool_unit))
+                    .ok_or(Refusal::Overflow("draft first page"))?;
+                contract.set_byte_extent(
+                    "deferred.drafter",
+                    ByteCurve::linear(first, draft.pool_unit, maximum),
+                )?;
+            }
+            None => {}
         }
         Ok(contract)
     }
@@ -377,7 +408,8 @@ impl DenseFacts<'_> {
             .iter()
             .map(|a| a.upload_bytes)
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(self.drafter.map_or(0, DenseDraft::sync_upload_bytes));
         add(
             "upload.sync".into(),
             Location::PINNED,
@@ -595,7 +627,41 @@ impl DenseFacts<'_> {
             allocations.extend(serving.allocations(self.cfg.vocab)?);
         }
         let mut deferred = Vec::new();
-        if let Some(draft) = self.drafter {
+        if let Some(DenseDraft::NativeMtp(layout)) = self.drafter {
+            use crate::formats::dflash::{MlaDraftDomain, MlaDraftDtype};
+            let layout = layout
+                .with_pool_tokens(usize::try_from(pool).map_err(|_| Refusal::Overflow("MTP pool"))?)
+                .map_err(|e| Refusal::InvalidFact(e.to_string()))?;
+            for owner in layout.owners {
+                let mut allocation = Allocation::buffer(
+                    owner.id,
+                    match owner.domain {
+                        MlaDraftDomain::Device => gpu,
+                        MlaDraftDomain::HostPinned => Location::PINNED,
+                    },
+                    owner.bytes as u64,
+                    Lifetime {
+                        first: Phase::DraftLoad,
+                        last: Phase::Growth,
+                    },
+                    Category::Drafter,
+                    "native MTP owner",
+                );
+                allocation.alignment = owner.alignment as u64;
+                allocation.dtype = match owner.dtype {
+                    MlaDraftDtype::Bytes => "bytes",
+                    MlaDraftDtype::Bf16 => "bf16",
+                    MlaDraftDtype::F32 => "f32",
+                    MlaDraftDtype::I32 => "i32",
+                    MlaDraftDtype::U32 => "u32",
+                    MlaDraftDtype::I64 => "i64",
+                }
+                .into();
+                allocation.shape = owner.shape.into_iter().map(|n| n as u64).collect();
+                allocations.push(allocation);
+            }
+        }
+        if let Some(DenseDraft::Deferred(draft)) = self.drafter {
             let bytes = draft
                 .owned
                 .checked_add(draft.scratch)
@@ -623,6 +689,11 @@ impl DenseFacts<'_> {
                 lifetime: Lifetime { first: Phase::Load, last: Phase::Load },
                 source: "checkpoint headers: one tensor/operand read plus packed Vec capacity; read_exact_at, no shard buffer".into(),
                 assumed: true }];
+        if let Some(DenseDraft::NativeMtp(layout)) = self.drafter {
+            allowances.push(Allowance { location: Location::HOST, bytes: layout.loading_host_bytes,
+                lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad },
+                source: "native MTP headers: serialized read plus packed Vec capacity; ordinary Rust heap".into(), assumed: true });
+        }
         if let Some(serving) = self.serving {
             allowances.push(Allowance { location: Location::HOST, bytes: serving.host_runtime,
                 lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth },

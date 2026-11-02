@@ -1,5 +1,5 @@
 //! Dense-target binding of the shared block drafter and online draft policy.
-use super::{engine::{DenseEngine, DrafterBytes}, GoldenArgs};
+use super::{engine::{DenseDraft, DenseEngine, DrafterBytes}, GoldenArgs};
 use crate::shared::speculation::dflash::{ContextRow, DraftSeq, TargetHead, TAP_ROWS};
 use crate::shared::{draft::{binding, clock::RoundTimes, evidence::{Censor, DraftSource, Evidence}, routes::RoundRoutes},
     fp8_linear::{Fp8Rows, Fp8Scales}, speculation::{block_dspark::{self, DsparkConfig, DsparkDrafter},
@@ -128,7 +128,7 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
         GlmDraftRepresentation::Bf16Only, Fp8Rows::W8a16.code() as u8, cfg.max_context,
         cfg.max_context, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(DrafterBytes { owned, scratch, ..Default::default() }), 1, None, args.kv_cache, false, None)?;
+        Some(DenseDraft::Deferred(DrafterBytes { owned, scratch, ..Default::default() })), 1, None, args.kv_cache, false, None)?;
     ensure!(required <= engine.pool_tokens, "spec decode exceeds admitted target pool");
     if args.verify_check { engine.verify_check(prompt)?; }
     let plain = (|| -> Result<(Vec<u32>, Duration, Vec<(f32, Vec<u32>)>)> {
@@ -150,7 +150,7 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     // than reconstructing the recurrent state or reusing a stale mark.
     drop(engine);
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(DrafterBytes { owned, scratch, ..Default::default() }), 1, None, args.kv_cache, false, None)?;
+        Some(DenseDraft::Deferred(DrafterBytes { owned, scratch, ..Default::default() })), 1, None, args.kv_cache, false, None)?;
     let stream = engine.target_stream().raw;
     let weights = block_dspark::prefetch(snapshot);
     let mask = engine.token_embedding().host_rows(&[draft_cfg.mask_token])?;

@@ -1,5 +1,6 @@
 use super::*;
 use crate::families::qwen3_5::tests::native_planner_fixture;
+use crate::placement::families::qwen3_5::DrafterBytes;
 use crate::plan::checkpoint::Checkpoint;
 
 fn request() -> Request {
@@ -44,6 +45,54 @@ fn facts<'a>(
 }
 
 #[test]
+fn dense_onboarding_all_is_exact_zero_and_positive_pins_are_refused() {
+    use crate::placement::{Onboard, OnboardSetting};
+
+    let (cfg, weights, buffers) = fixture();
+    for setting in [
+        OnboardSetting::Auto,
+        OnboardSetting::All,
+        OnboardSetting::Layers(0),
+    ] {
+        let onboard = match setting.resolve(0) {
+            Onboard::Auto => Pin::Auto,
+            Onboard::Layers(n) => Pin::Exact(n as u64),
+        };
+        let plan = admit(
+            Request {
+                onboard,
+                ..request()
+            },
+            budgets(),
+            facts(&cfg, &weights, &buffers),
+        )
+        .unwrap();
+        assert!(plan.decisions.onboard_layers.iter().all(Vec::is_empty));
+        if setting == OnboardSetting::All {
+            assert_eq!(plan.request.onboard, Pin::Exact(0));
+        }
+    }
+    for layers in [1, 2, usize::MAX] {
+        let Onboard::Layers(layers) = OnboardSetting::Layers(layers).resolve(0) else {
+            panic!("explicit pin lost");
+        };
+        let refusal = admit(
+            Request {
+                onboard: Pin::Exact(layers as u64),
+                ..request()
+            },
+            budgets(),
+            facts(&cfg, &weights, &buffers),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            refusal,
+            Refusal::InvalidPin("model has 0 routed-expert layers")
+        ));
+    }
+}
+
+#[test]
 fn dense_curves_match_independent_exact_inventory_and_monotone_page_neighbors() {
     let (cfg, weights, buffers) = fixture();
     for record_bytes in [2048, 4096, 8192] {
@@ -58,12 +107,13 @@ fn dense_curves_match_independent_exact_inventory_and_monotone_page_neighbors() 
             for sampling in [false, true] {
                 let mut recipe = facts(&cfg, &weights, &buffers);
                 recipe.record_bytes = record_bytes;
-                recipe.drafter = draft;
+                recipe.drafter = draft.map(DenseDraft::Deferred);
                 recipe.serving = Some(
                     ServingFacts::new(
                         &cfg,
                         &buffers,
                         record_bytes,
+                        0,
                         ServingRequest {
                             concurrency: 4,
                             prefix_entries: 8,
@@ -305,11 +355,11 @@ fn native_scratch_prefix_and_pinned_staging_are_individual_owners() {
 fn deferred_drafter_pool_demand_is_once_per_page_and_never_ready() {
     let (cfg, weights, buffers) = fixture();
     let mut recipe = facts(&cfg, &weights, &buffers);
-    recipe.drafter = Some(DrafterBytes {
+    recipe.drafter = Some(DenseDraft::Deferred(DrafterBytes {
         owned: 1024,
         scratch: 2048,
         pool_unit: 64,
-    });
+    }));
     let contract = recipe.prepare(&request()).unwrap();
     let selected = vec![0; contract.variables.len()];
     let small = contract.facts(&selected, 262144 / PAGE_ROWS).unwrap();
@@ -346,6 +396,46 @@ fn malformed_native_inventory_and_operation_fail_before_admission() {
 }
 
 #[test]
+fn serving_host_quota_charges_full_context_draft_pages_before_admission() {
+    let (cfg, _, buffers) = fixture();
+    let request = ServingRequest {
+        concurrency: 4,
+        prefix_entries: 8,
+        host_cache_bytes: None,
+        host_headroom: 8 << 30,
+        device_sampling: false,
+    };
+    let plain = ServingFacts::new(&cfg, &buffers, 4096, 0, request, 128 << 30).unwrap();
+    let draft =
+        ServingFacts::new(&cfg, &buffers, 4096, 64 * 4096 + 8192, request, 128 << 30).unwrap();
+    let full_layers = cfg
+        .attention
+        .iter()
+        .filter(|&&a| a == HybridAttention::Full)
+        .count() as u64;
+    let geometry = cuteafd_core::prefix::HostCacheGeometry {
+        unit_rows: PAGE_ROWS,
+        page_bytes: PAGE_ROWS * 4096 * full_layers,
+        mark_bytes: buffers.mark_bytes as u64,
+        draft_bytes: 0,
+        draft_page_bytes: 64 * 4096 + 8192,
+    };
+    assert_eq!(
+        draft.host_quota,
+        geometry
+            .resolve(
+                None,
+                cfg.max_context as u64,
+                4,
+                128 << 30,
+                geometry.chunk_bytes()
+            )
+            .unwrap()
+    );
+    assert!(draft.host_quota > plain.host_quota);
+}
+
+#[test]
 fn serving_ready_requires_exact_scheduler_sampler_and_whole_host_chunks() {
     let (cfg, weights, buffers) = fixture();
     let chunk = 256 << 20;
@@ -353,6 +443,7 @@ fn serving_ready_requires_exact_scheduler_sampler_and_whole_host_chunks() {
         &cfg,
         &buffers,
         4096,
+        0,
         ServingRequest {
             concurrency: 4,
             prefix_entries: 8,
@@ -483,6 +574,7 @@ fn host_selector_and_disabled_prefix_have_no_sampler_or_chunk_owners() {
             &cfg,
             &buffers,
             4096,
+            0,
             ServingRequest {
                 concurrency: 4,
                 prefix_entries: entries,

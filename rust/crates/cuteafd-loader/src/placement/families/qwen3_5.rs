@@ -26,51 +26,6 @@ pub struct DrafterBytes {
 }
 
 impl DrafterBytes {
-    /// Native MTP owns one dense block, bounded hidden/logit planes and pooled KV sidecars.
-    pub fn native_mtp(checkpoint: &crate::plan::checkpoint::Checkpoint, cfg: &Qwen35Config) -> anyhow::Result<Self> {
-        use anyhow::Context;
-        ensure!(cfg.mtp_layers == 1, "dense MTP requires one checkpoint-native layer");
-        let tensor = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
-            .with_context(|| format!("dense MTP tensor missing: {name}"));
-        let fp8 = tensor("mtp.layers.0.mlp.gate_proj.weight")?.meta.dtype == DType::F8E4M3;
-        let mut groups = vec![vec!["input_layernorm.weight"], vec!["post_attention_layernorm.weight"],
-            vec!["mlp.down_proj.weight"], vec!["mlp.gate_proj.weight", "mlp.up_proj.weight"],
-            vec!["self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"],
-            vec!["self_attn.q_norm.weight"], vec!["self_attn.k_norm.weight"], vec!["self_attn.o_proj.weight"]];
-        let mut owned = 0u64;
-        for group in groups.drain(..) {
-            let projection = group[0].starts_with("mlp.") || matches!(group[0], "self_attn.q_proj.weight" | "self_attn.o_proj.weight");
-            let mut bytes = 0;
-            let mut scales = 0;
-            for name in group {
-                let full = format!("mtp.layers.0.{name}");
-                let value = &tensor(&full)?.meta;
-                ensure!(value.dtype == if fp8 && projection { DType::F8E4M3 } else { DType::Bf16 },
-                    "{full}: unsupported native MTP dtype");
-                bytes += value.byte_length;
-                if fp8 && projection {
-                    let scale = &tensor(&format!("{full}_scale_inv"))?.meta;
-                    ensure!(matches!(scale.dtype, DType::Bf16 | DType::F32), "{full}: unsupported scale dtype");
-                    scales += scale.byte_length * if scale.dtype == DType::Bf16 { 2 } else { 1 };
-                }
-            }
-            owned += bytes.max(256);
-            if fp8 && projection { owned += scales.max(256); }
-        }
-        for (name, shape) in [("fc", vec![cfg.hidden, 2 * cfg.hidden]), ("norm", vec![cfg.hidden]),
-            ("pre_fc_norm_hidden", vec![cfg.hidden]), ("pre_fc_norm_embedding", vec![cfg.hidden])] {
-            let full = format!("mtp.{name}.weight");
-            let value = &tensor(&full)?.meta;
-            ensure!(value.dtype == DType::Bf16 && value.shape == shape, "{full}: native MTP shape/dtype differs");
-            owned += value.byte_length.max(256);
-        }
-        owned += ((64 * 2 + 4096) * cfg.hidden * 2 + 64 * cfg.vocab * 4) as u64;
-        // The independent greedy selector owns one ID/status/log-probability row.
-        owned += 12;
-        let record = crate::families::qwen4::Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim);
-        Ok(Self { owned, scratch: 0, pool_unit: (64 * record + cfg.hidden * 2) as u64 })
-    }
-
     pub fn block_dspark(config: &serde_json::Value, slots: usize, sms: u64, context: usize)
         -> anyhow::Result<Self> {
         use crate::families::glm5::draft_representation::{block_dspark_paged_resident_bytes, GlmDraftRepresentation};
@@ -89,6 +44,150 @@ impl DrafterBytes {
 pub const PREFILL_ROWS: usize = 4096;
 pub const VERIFY_ROWS: usize = 64;
 pub const HEAD_WORKSPACE: usize = 4 << 20;
+
+/// Diagnostic inputs and greedy selection are independent usage restrictions;
+/// normal serving owns its selector but never the diagnostic input plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeMtpUsage {
+    pub selector: bool,
+    pub diagnostic_input: bool,
+}
+
+impl NativeMtpUsage {
+    pub const SERVING: Self = Self { selector: true, diagnostic_input: false };
+    pub const DIAGNOSTIC: Self = Self { selector: false, diagnostic_input: true };
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeMtpLayout {
+    pub owners: Vec<crate::formats::dflash::MlaDraftOwner>,
+    pub sync_upload_bytes: u64,
+    pub loading_host_bytes: u64,
+    record_bytes: usize,
+    hidden_bytes: usize,
+}
+
+impl NativeMtpLayout {
+    pub fn new(checkpoint: &crate::plan::checkpoint::Checkpoint, cfg: &Qwen35Config,
+        pool_tokens: usize, usage: NativeMtpUsage) -> Result<Self> {
+        use crate::formats::dflash::{MlaDraftDomain as Domain, MlaDraftDtype as Dtype,
+            MlaDraftLifetime as Life, MlaDraftOwner};
+        use anyhow::Context;
+        ensure!(cfg.mtp_layers == 1, "dense MTP requires one checkpoint-native layer");
+        ensure!(pool_tokens > 0 && pool_tokens % PAGE_ROWS as usize == 0, "native MTP pool must contain complete pages");
+        let tensor = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
+            .with_context(|| format!("dense MTP tensor missing: {name}"));
+        let fp8 = tensor("mtp.layers.0.mlp.gate_proj.weight")?.meta.dtype == DType::F8E4M3;
+        let inventory = weights::native_inventory(checkpoint, "mtp.layers.0", HybridAttention::Full, fp8, DType::Bf16)?;
+        let mut loading_host_bytes = inventory.loading_host_bytes;
+        let mut sync_upload_bytes = inventory.allocations.iter().map(|a| a.upload_bytes).max().unwrap_or(0);
+        let mut owners = Vec::new();
+        let mut add = |id: String, domain, dtype, shape: Vec<usize>, bytes| {
+            owners.push(MlaDraftOwner { id, domain, dtype, shape, bytes, alignment: 1,
+                lifetime: Life::Runtime, shared_key: None, staging_for: None, on_use: false });
+        };
+        for operand in inventory.allocations {
+            let bytes = usize::try_from(operand.bytes)?;
+            add(format!("draft.mtp.layer.{}", operand.id), Domain::Device, Dtype::Bytes, vec![bytes], bytes);
+        }
+        for (id, name, shape) in [
+            ("fc", "fc", vec![cfg.hidden, cfg.hidden.checked_mul(2).context("MTP FC shape overflow")?]),
+            ("norm", "norm", vec![cfg.hidden]),
+            ("norm_hidden", "pre_fc_norm_hidden", vec![cfg.hidden]),
+            ("norm_embedding", "pre_fc_norm_embedding", vec![cfg.hidden]),
+        ] {
+            let full = format!("mtp.{name}.weight");
+            let value = &tensor(&full)?.meta;
+            ensure!(value.dtype == DType::Bf16 && value.shape == shape, "{full}: native MTP shape/dtype differs");
+            sync_upload_bytes = sync_upload_bytes.max(value.byte_length);
+            loading_host_bytes = loading_host_bytes.max(value.byte_length);
+            let bytes = usize::try_from(value.byte_length.max(256))?;
+            add(format!("draft.mtp.{id}"), Domain::Device, Dtype::Bytes, vec![bytes], bytes);
+        }
+        let record_bytes = crate::families::qwen4::Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim);
+        let hidden_bytes = cfg.hidden.checked_mul(2).context("MTP hidden extent overflow")?;
+        let kv_bytes = pool_tokens.checked_mul(record_bytes).context("MTP KV extent overflow")?;
+        let sidecar_bytes = (pool_tokens / PAGE_ROWS as usize).checked_mul(hidden_bytes).context("MTP sidecar extent overflow")?;
+        for (id, dtype, shape, width) in [
+            ("concat", Dtype::Bf16, vec![VERIFY_ROWS, 2, cfg.hidden], 2usize),
+            ("hidden", Dtype::Bf16, vec![PREFILL_ROWS, cfg.hidden], 2),
+            ("logits", Dtype::F32, vec![VERIFY_ROWS, cfg.vocab], 4),
+        ] {
+            let bytes = shape.iter().try_fold(width, |bytes, &n| bytes.checked_mul(n)).context("MTP plane extent overflow")?;
+            add(format!("draft.mtp.{id}"), Domain::Device, dtype, shape, bytes);
+        }
+        add("draft.mtp.kv".into(), Domain::Device, Dtype::Bytes, vec![kv_bytes], kv_bytes);
+        add("draft.mtp.sidecars".into(), Domain::Device, Dtype::Bf16,
+            vec![pool_tokens / PAGE_ROWS as usize, cfg.hidden], sidecar_bytes);
+        if usage.selector {
+            add("draft.mtp.selector.output".into(), Domain::Device, Dtype::Bytes, vec![12], 12);
+            add("draft.mtp.selector.landing".into(), Domain::HostPinned, Dtype::Bytes, vec![12], 12);
+        }
+        if usage.diagnostic_input {
+            let bytes = VERIFY_ROWS.checked_mul(hidden_bytes).context("MTP diagnostic extent overflow")?;
+            add("draft.mtp.diagnostic.input".into(), Domain::Device, Dtype::Bf16, vec![VERIFY_ROWS, cfg.hidden], bytes);
+        }
+        Ok(Self { owners, sync_upload_bytes, loading_host_bytes, record_bytes, hidden_bytes })
+    }
+
+    pub fn with_pool_tokens(&self, pool_tokens: usize) -> Result<Self> {
+        use anyhow::Context;
+        ensure!(pool_tokens > 0 && pool_tokens % PAGE_ROWS as usize == 0, "native MTP pool must contain complete pages");
+        let mut layout = self.clone();
+        for owner in &mut layout.owners {
+            match owner.id.as_str() {
+                "draft.mtp.kv" => {
+                    owner.bytes = pool_tokens.checked_mul(self.record_bytes).context("MTP KV extent overflow")?;
+                    owner.shape = vec![owner.bytes];
+                }
+                "draft.mtp.sidecars" => {
+                    let pages = pool_tokens / PAGE_ROWS as usize;
+                    owner.bytes = pages.checked_mul(self.hidden_bytes).context("MTP sidecar extent overflow")?;
+                    owner.shape[0] = pages;
+                }
+                _ => {}
+            }
+        }
+        Ok(layout)
+    }
+
+    pub fn device_bytes(&self) -> Result<u64> {
+        use crate::formats::dflash::MlaDraftDomain;
+        self.owners.iter().filter(|o| o.domain == MlaDraftDomain::Device)
+            .try_fold(0u64, |sum, o| sum.checked_add(o.bytes as u64).ok_or_else(|| anyhow::anyhow!("MTP owner total overflow")))
+    }
+
+    /// Body allocations checked by Mtp::load, excluding pooled state and the
+    /// independent serving selector or diagnostic input allocation.
+    pub fn body_bytes(&self) -> Result<u64> {
+        self.owners.iter().filter(|o| !matches!(o.id.as_str(), "draft.mtp.kv" | "draft.mtp.sidecars"
+            | "draft.mtp.selector.output" | "draft.mtp.selector.landing" | "draft.mtp.diagnostic.input"))
+            .try_fold(0u64, |sum, o| sum.checked_add(o.bytes as u64).ok_or_else(|| anyhow::anyhow!("MTP body total overflow")))
+    }
+
+    pub fn pool_unit_bytes(&self) -> Result<u64> {
+        (self.record_bytes as u64).checked_mul(PAGE_ROWS).and_then(|n| n.checked_add(self.hidden_bytes as u64))
+            .ok_or_else(|| anyhow::anyhow!("MTP page extent overflow"))
+    }
+}
+
+/// Unported block recipes remain explicit deferred demands; native MTP uses
+/// named owners and can only reach Ready after its live field census agrees.
+#[derive(Debug, Clone, Copy)]
+pub enum DenseDraft<'a> {
+    NativeMtp(&'a NativeMtpLayout),
+    Deferred(DrafterBytes),
+}
+
+impl DenseDraft<'_> {
+    pub fn sync_upload_bytes(self) -> u64 {
+        match self { Self::NativeMtp(layout) => layout.sync_upload_bytes, Self::Deferred(_) => 0 }
+    }
+
+    pub fn page_bytes(self) -> Result<u64> {
+        match self { Self::NativeMtp(layout) => layout.pool_unit_bytes(), Self::Deferred(bytes) => Ok(bytes.pool_unit) }
+    }
+}
 
 /// Exact allocation recipe, excluding checkpoint weights and the KV pool.
 /// Dense execution currently launches directly; it captures no CUDA graphs.
@@ -171,7 +270,7 @@ impl NativeWeights {
         use cuteafd_core::DType;
         ensure!(matches!(norm_dtype, DType::Bf16 | DType::F32), "invalid native GDN norm dtype");
         use anyhow::Context;
-        use weights::{native_operands, Storage};
+        use weights::native_inventory;
         let tensor = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
             .with_context(|| format!("checkpoint lacks {name}"));
         let fp8 = tensor("model.language_model.layers.0.mlp.gate_proj.weight")?.meta.dtype == DType::F8E4M3;
@@ -179,51 +278,13 @@ impl NativeWeights {
         let mut layers = Vec::new();
         let mut loading_host_bytes = 0;
         for (index, &kind) in cfg.attention.iter().enumerate() {
-            let mut total = 0u64;
-            for operand in native_operands(&format!("model.language_model.layers.{index}"), kind, fp8) {
-                let mut bytes = 0u64;
-                let mut raw_bytes = 0u64;
-                let mut largest_upload = 0u64;
-                let mut columns = None;
-                for name in &operand.tensors {
-                    let value = &tensor(name)?.meta;
-                    let expected = match operand.storage {
-                        Storage::Bf16 => value.dtype == DType::Bf16,
-                        Storage::NativeNorm => value.dtype == norm_dtype,
-                        Storage::F32 | Storage::Scales => matches!(value.dtype, DType::Bf16 | DType::F32),
-                        Storage::Fp8 => value.dtype == DType::F8E4M3,
-                    };
-                    ensure!(expected, "{name}: native operand dtype differs");
-                    if matches!(operand.storage, Storage::Fp8 | Storage::Scales) {
-                        if operand.storage == Storage::Fp8 {
-                            ensure!(value.shape.len() == 2 && value.shape.iter().all(|n| *n > 0 && n % 128 == 0),
-                                "{name}: expected whole 128x128 E4M3 blocks");
-                            ensure!(columns.is_none_or(|n| n == value.shape[1]), "{name}: packed columns differ");
-                            columns = Some(value.shape[1]);
-                        } else {
-                            let weight = &tensor(name.strip_suffix("_scale_inv").context("invalid scale operand")?)?.meta;
-                            ensure!(weight.shape.len() == 2 && value.shape == weight.shape.iter().map(|n| n / 128).collect::<Vec<_>>(),
-                                "{name}: invalid native FP8 block scale grid");
-                        }
-                    }
-                    let widen = matches!(operand.storage, Storage::F32 | Storage::Scales) && value.dtype == DType::Bf16;
-                    raw_bytes = raw_bytes.checked_add(value.byte_length).context("dense host read overflow")?;
-                    largest_upload = largest_upload.max(value.byte_length);
-                    bytes = bytes.checked_add(value.byte_length.checked_mul(if widen { 2 } else { 1 })
-                        .context("dense operand size overflow")?).context("dense packed size overflow")?;
-                }
-                // rows() uploads each source; FP8 packing and f32() keep the
-                // raw tensors beside an owned output Vec. Vec growth can double
-                // that output capacity. Reads are serialized, not shard-wide.
-                let packed = matches!(operand.storage, Storage::Fp8 | Storage::Scales | Storage::F32);
-                let host = raw_bytes.checked_add(if packed { bytes.checked_mul(2).context("dense host pack overflow")? } else { 0 })
-                    .context("dense loading host overflow")?;
-                loading_host_bytes = loading_host_bytes.max(host);
-                let upload_bytes = if packed { bytes } else { largest_upload };
-                total = total.checked_add(bytes.max(256)).context("dense layer size overflow")?;
-                allocations.push(NativeOperand { id: format!("layer.{index}.{}", operand.name), bytes: bytes.max(256), upload_bytes });
-            }
-            layers.push(total);
+            let inventory = native_inventory(checkpoint, &format!("model.language_model.layers.{index}"), kind, fp8, norm_dtype.clone())?;
+            layers.push(inventory.bytes()?);
+            loading_host_bytes = loading_host_bytes.max(inventory.loading_host_bytes);
+            allocations.extend(inventory.allocations.into_iter().map(|mut operand| {
+                operand.id = format!("layer.{index}.{}", operand.id);
+                operand
+            }));
         }
         let mut one = |id: &str, name: &str| -> Result<u64> {
             let value = &tensor(name)?.meta;
@@ -499,6 +560,114 @@ mod tests {
         checkpoint.tensors[gate].meta.dtype = DType::Bf16;
         checkpoint.tensors.remove(scale);
         assert!(NativeWeights::native(&checkpoint, &cfg, DType::Bf16).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_mtp_named_owners_follow_packing_pages_and_diagnostic_usage() -> Result<()> {
+        use crate::formats::dflash::MlaDraftDomain;
+        use crate::plan::checkpoint::{Checkpoint, CheckpointTensor};
+        let mut cfg = cfg();
+        cfg.mtp_layers = 1;
+        for fp8 in [false, true] {
+            let mut checkpoint = Checkpoint { snapshot: Default::default(), config: serde_json::json!({}),
+                quantize_config: None, weight_map: Default::default(), tensors: vec![], missing_shards: vec![], shard_bytes: 0 };
+            let mut add = |name: String, dtype, shape: Vec<usize>| {
+                let width = if dtype == DType::F8E4M3 { 1 } else { 2 };
+                let byte_length = shape.iter().product::<usize>() as u64 * width;
+                checkpoint.tensors.push(CheckpointTensor { shard: "model.safetensors".into(),
+                    meta: crate::SafetensorsTensorMetadata { name, dtype, shape, byte_offset: 0, byte_length } });
+            };
+            for leaf in ["input_layernorm.weight", "post_attention_layernorm.weight", "self_attn.q_norm.weight", "self_attn.k_norm.weight"] {
+                add(format!("mtp.layers.0.{leaf}"), DType::Bf16, vec![128]);
+            }
+            for leaf in ["mlp.down_proj", "mlp.gate_proj", "mlp.up_proj", "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"] {
+                add(format!("mtp.layers.0.{leaf}.weight"), if fp8 { DType::F8E4M3 } else { DType::Bf16 }, vec![128, 128]);
+                if fp8 { add(format!("mtp.layers.0.{leaf}.weight_scale_inv"), DType::Bf16, vec![1, 1]); }
+            }
+            add("mtp.fc.weight".into(), DType::Bf16, vec![cfg.hidden, 2 * cfg.hidden]);
+            for name in ["norm", "pre_fc_norm_hidden", "pre_fc_norm_embedding"] {
+                add(format!("mtp.{name}.weight"), DType::Bf16, vec![cfg.hidden]);
+            }
+            let serving = NativeMtpLayout::new(&checkpoint, &cfg, 64, NativeMtpUsage::SERVING)?;
+            let bytes = |id: &str| serving.owners.iter().find(|o| o.id == id).unwrap().bytes as u64;
+            assert_eq!(serving.owners.iter().filter(|o| o.id.starts_with("draft.mtp.layer.")).map(|o| o.bytes as u64).sum::<u64>(),
+                7 * 16384 * if fp8 { 1 } else { 2 } + 4 * 256 + if fp8 { 4 * 256 } else { 0 });
+            assert_eq!(bytes("draft.mtp.concat"), (64 * 2 * cfg.hidden * 2) as u64);
+            assert_eq!(bytes("draft.mtp.hidden"), (4096 * cfg.hidden * 2) as u64);
+            assert_eq!(bytes("draft.mtp.logits"), (64 * cfg.vocab * 4) as u64);
+            assert_eq!(bytes("draft.mtp.kv"), (64 * 4096) as u64);
+            assert_eq!(bytes("draft.mtp.sidecars"), (cfg.hidden * 2) as u64);
+            assert_eq!(serving.sync_upload_bytes, (cfg.hidden * 2 * cfg.hidden * 2) as u64);
+            assert!(serving.loading_host_bytes >= serving.sync_upload_bytes);
+            assert!(serving.owners.iter().all(|o| !o.id.contains("diagnostic") && !o.id.contains("embedding.weight") && !o.id.contains("head.weight")));
+            assert_eq!(serving.owners.iter().filter(|o| o.domain == MlaDraftDomain::HostPinned).map(|o| o.bytes).sum::<usize>(), 12);
+            let larger = NativeMtpLayout::new(&checkpoint, &cfg, 128, NativeMtpUsage::SERVING)?;
+            assert_eq!(larger.device_bytes()? - serving.device_bytes()?, serving.pool_unit_bytes()?);
+            for (one, two) in serving.owners.iter().zip(&larger.owners) {
+                if matches!(one.id.as_str(), "draft.mtp.kv" | "draft.mtp.sidecars") { assert_eq!(two.bytes, one.bytes * 2); }
+                else { assert_eq!(one, two); }
+            }
+            let diagnostic = NativeMtpLayout::new(&checkpoint, &cfg, 64, NativeMtpUsage::DIAGNOSTIC)?;
+            assert!(!diagnostic.owners.iter().any(|o| o.id.contains("selector")));
+            assert_eq!(diagnostic.device_bytes()? + 12 - serving.device_bytes()?, (64 * cfg.hidden * 2) as u64);
+            assert_eq!(diagnostic.body_bytes()?, serving.body_bytes()?);
+            let combined = NativeMtpLayout::new(&checkpoint, &cfg, 64, NativeMtpUsage { selector: true, diagnostic_input: true })?;
+            assert_eq!(combined.device_bytes()? - serving.device_bytes()?, (64 * cfg.hidden * 2) as u64);
+            assert_eq!(serving.with_pool_tokens(128)?, larger);
+            {
+                use crate::placement::planner::*;
+                let weights = NativeWeights { allocations: (0..cfg.attention.len()).map(|layer| NativeOperand {
+                    id: format!("layer.{layer}.fixture"), bytes: 256, upload_bytes: 256 }).collect(),
+                    layers: vec![256; cfg.attention.len()], norm: 0, head: 0, embedding: 256, loading_host_bytes: 256 };
+                let buffers = NativeBuffers::new(&cfg, 256, 4, 0, false)?;
+                let budgets = forecast_budgets(&ARCH_CONTEXTS[1], 96 << 30, 0, (128 << 30, 128 << 30))?;
+                let recipe = DenseFacts { cfg: &cfg, weights: &weights, buffers: &buffers, slots: 4,
+                    record_bytes: 4096, drafter: Some(DenseDraft::NativeMtp(&larger)), serving: None };
+                let request = Request { context: cfg.max_context as u64, pool: Pin::Exact(cfg.max_context as u64),
+                    onboard: Pin::Auto, prefill: Pin::Auto, operation: Operation::Serving };
+                let contract = recipe.prepare(&request)?;
+                let selected = vec![0; contract.variables.len()];
+                for pages in [1, 2, 4096, contract.maximum_pages] {
+                    let facts = contract.facts(&selected, pages)?;
+                    let exact = serving.with_pool_tokens(usize::try_from(pages * PAGE_ROWS)?)?;
+                    for owner in &exact.owners {
+                        let actual = facts.allocations.iter().find(|a| a.id == owner.id).unwrap();
+                        assert_eq!(actual.bytes, owner.bytes as u64);
+                        assert_eq!(actual.shape, owner.shape.iter().map(|&n| n as u64).collect::<Vec<_>>());
+                        assert_eq!(actual.lifetime.first, Phase::DraftLoad);
+                    }
+                    assert!(facts.deferred.is_empty());
+                }
+                let plan = admit(request, budgets, recipe)?;
+                let upload = plan.facts.allocations.iter().find(|a| a.id == "upload.sync").unwrap();
+                assert_eq!(upload.bytes, serving.sync_upload_bytes);
+                assert!(plan.facts.allocations.iter().all(|a| !a.id.contains("diagnostic")));
+                let mut receipts: Vec<_> = plan.facts.allocations.iter().filter(|a| a.view.is_none()).enumerate().map(|(i, allocation)| Receipt {
+                    allocation: allocation.clone(), address: (i as u64 + 1) * (1 << 40) }).collect();
+                for allocation in plan.facts.allocations.iter().filter(|a| a.view.is_some()) {
+                    let view = allocation.view.as_ref().unwrap();
+                    let backing = receipts.iter().find(|r| r.allocation.id == view.backing).unwrap();
+                    receipts.push(Receipt { allocation: allocation.clone(), address: backing.address + view.offset });
+                }
+                receipts.retain(|r| r.allocation.lifetime.contains(Phase::Ready));
+                reconcile(&plan, Phase::Ready, &receipts)?;
+                let sidecar = receipts.iter().position(|r| r.allocation.id == "draft.mtp.sidecars").unwrap();
+                receipts[sidecar].allocation.shape[0] += 1;
+                assert!(reconcile(&plan, Phase::Ready, &receipts).is_err());
+                receipts[sidecar].allocation.shape[0] -= 1;
+                let landing = receipts.iter().position(|r| r.allocation.id == "draft.mtp.selector.landing").unwrap();
+                receipts.remove(landing);
+                assert!(reconcile(&plan, Phase::Ready, &receipts).is_err());
+            }
+            assert!(NativeMtpLayout::new(&checkpoint, &cfg, 0, NativeMtpUsage::SERVING).is_err());
+            assert!(NativeMtpLayout::new(&checkpoint, &cfg, 65, NativeMtpUsage::SERVING).is_err());
+            if fp8 {
+                let index = checkpoint.tensors.iter().position(|t| t.meta.name.ends_with("weight_scale_inv")).unwrap();
+                checkpoint.tensors[index].meta.shape = vec![2, 1];
+                assert!(NativeMtpLayout::new(&checkpoint, &cfg, 64, NativeMtpUsage::SERVING).is_err());
+            }
+        }
         Ok(())
     }
 

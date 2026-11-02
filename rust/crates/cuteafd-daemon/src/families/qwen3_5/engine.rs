@@ -26,7 +26,7 @@ pub(crate) mod mtp;
 #[path = "prefix.rs"]
 pub(crate) mod prefix;
 pub(crate) use verify::DenseMark;
-pub(crate) use placement::families::qwen3_5::DrafterBytes;
+pub(crate) use placement::families::qwen3_5::{DenseDraft, DrafterBytes};
 
 pub(crate) struct DenseEngine<'a> {
     // Drain queued work before fields retaining buffers/weights begin dropping.
@@ -134,7 +134,7 @@ impl<'a> DenseEngine<'a> {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_prefix(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
+        cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DenseDraft<'_>>, slots: usize,
         prefix: Option<crate::shared::prefix::MarkRule>, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, full_prefill_logits: bool,
         serving: Option<placement::families::qwen3_5::ServingRequest>) -> Result<Self> {
         ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots), "dense state storage must be in 1..=64 slots");
@@ -166,7 +166,7 @@ impl<'a> DenseEngine<'a> {
         let host = cuteafd_ffi::host_memory()?;
         let record_bytes = kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
         let serving = serving.map(|request| placement::families::qwen3_5::ServingFacts::new(
-            &cfg, &buffers, record_bytes, request, host.0)).transpose()?;
+            &cfg, &buffers, record_bytes, drafter.map(DenseDraft::page_bytes).transpose()?.unwrap_or(0), request, host.0)).transpose()?;
         let budgets = placement::families::qwen3_5::sampled_budgets(free as u64, total as u64,
             cuteafd_ffi::coordinator_gpu_budget().map(|budget| budget.0), host)?;
         let request = planner::Request { context: cfg.max_context as u64,
@@ -178,7 +178,8 @@ impl<'a> DenseEngine<'a> {
         tracing::info!(pool_tokens, kv_format = %kv_format, slots, prefix_marks, full_prefill_logits,
             head_rows = buffers.head_rows, deferred_owners = plan.facts.deferred.len(), "dense Qwen admitted before weight/state allocation");
         let audit = cuteafd_ffi::memory_ledger::AllocationAudit::start();
-        let upload = weight_bytes.allocations.iter().map(|a| a.upload_bytes).max().unwrap_or(0);
+        let upload = weight_bytes.allocations.iter().map(|a| a.upload_bytes).max().unwrap_or(0)
+            .max(drafter.map_or(0, DenseDraft::sync_upload_bytes));
         library.reserve_sync_h2d_staging(usize::try_from(upload)?)?;
         let tensor = reader.tensor(&format!("{PREFIX}embed_tokens.weight"))?;
         let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
@@ -219,7 +220,7 @@ impl<'a> DenseEngine<'a> {
             &ids, &logits, &head_workspace, &bank, &kv, &verification, prefix_arena.as_deref())?;
         tracing::info!("dense target allocation IDs reconciled at PostTargetKv; scheduler owners still pending");
         let target_events = audit.events().len();
-        let startup = serving.map(|_| allocation::Startup { plan, audit, loaded_events, target_events, receipts });
+        let startup = serving.map(|_| allocation::Startup { plan, audit, loaded_events, target_events, draft_events: None, receipts });
         Ok(Self { stream, cfg, kv_format, programs, admitted, embedding, weights, homes, bank, kv, planes,
             _planes: std::mem::take(&mut allocated), ids, logits, head, head_rows: buffers.head_rows, _head_workspace: head_workspace,
             pool_tokens, position: 0, slots: vec![rows::Slot { position: 0, pages: Vec::new() }; slots],
@@ -227,6 +228,14 @@ impl<'a> DenseEngine<'a> {
     }
 
     pub(crate) fn serving_facts(&self) -> Option<placement::families::qwen3_5::ServingFacts> { self.serving }
+
+    pub(crate) fn reconcile_draft(&mut self, owners: Vec<planner::Receipt>) -> Result<()> {
+        self.stream.drain()?;
+        if let Some(startup) = self.startup.as_mut() {
+            startup.draft_loaded(self.stream.device.library, self.stream.device, owners)?;
+        }
+        Ok(())
+    }
 
     pub(crate) fn reconcile_ready(&mut self, selector: &crate::shared::token_io::TokenSelector<'_>,
         cache: &mut cuteafd_engine::prefix::PrefixCache<crate::shared::prefix::CudaCopyEngine<'_>>) -> Result<()> {

@@ -5,6 +5,7 @@ use cuteafd_engine::prefix::{DraftBinding, DraftPageAttachment, DraftPageId, Dra
 use cuteafd_hostcache::copy::DeviceRange;
 use cuteafd_loader::families::qwen4::Qwen4KvCache;
 use std::path::Path;
+use cuteafd_loader::placement::families::qwen3_5::{NativeMtpLayout, NativeMtpUsage};
 
 /// A page retains 64 native KV rows and just the frontier's last target hidden.
 /// Earlier pages' hidden sidecars are stale, so attachment order selects the tail.
@@ -71,20 +72,6 @@ fn format(reader: &WeightReader<'_>) -> Result<DenseFormat> {
         cuteafd_core::DType::F8E4M3 => Ok(DenseFormat::Fp8),
         ref dtype => anyhow::bail!("unsupported dense MTP projection format {dtype:?}"),
     }
-}
-
-fn fixed_bytes(reader: &WeightReader<'_>, cfg: &Qwen35Config, format: DenseFormat) -> Result<u64> {
-    ensure!(cfg.mtp_layers == 1, "dense MTP requires one checkpoint-native layer");
-    let mut bytes = reader.dense_layer_bytes("mtp.layers.0", HybridAttention::Full, format)?;
-    for (name, shape) in [("fc", vec![cfg.hidden, 2 * cfg.hidden]), ("norm", vec![cfg.hidden]),
-        ("pre_fc_norm_hidden", vec![cfg.hidden]), ("pre_fc_norm_embedding", vec![cfg.hidden])] {
-        let tensor = &reader.tensor(&format!("mtp.{name}.weight"))?.meta;
-        ensure!(tensor.dtype == cuteafd_core::DType::Bf16 && tensor.shape == shape,
-            "mtp.{name}: expected native BF16 {shape:?}");
-        bytes = bytes.checked_add(tensor.byte_length.max(256)).context("dense MTP inventory overflow")?;
-    }
-    // Preserve target hidden rows and keep draft logits separate from target prefill logits.
-    Ok(bytes + ((HEAD_ROWS * 2 + ROWS) * cfg.hidden * 2 + HEAD_ROWS * cfg.vocab * 4) as u64)
 }
 
 impl<'a> Mtp<'a> {
@@ -280,20 +267,16 @@ pub(crate) struct Admission {
     format: DenseFormat,
     programs: DensePrograms,
     fixed: u64,
-    pub(crate) bytes: DrafterBytes,
+    pub(crate) layout: NativeMtpLayout,
 }
 
 impl Admission {
     pub(crate) fn new(reader: &WeightReader<'_>, cfg: &Qwen35Config, programs: &Programs<'_>) -> Result<Self> {
         let format = format(reader)?;
         let programs = DensePrograms::new(cfg, programs, Qwen4KvCache::Bf16, format)?;
-        let fixed = fixed_bytes(reader, cfg, format)?;
-        let layout = PageLayout { record_bytes: Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim),
-            hidden_bytes: cfg.hidden * 2 };
-        let bytes = DrafterBytes::native_mtp(reader.checkpoint, cfg)?;
-        ensure!(bytes.owned == fixed + 12 && bytes.pool_unit == layout.bytes() as u64,
-            "native MTP planner and runtime inventory differ");
-        Ok(Self { format, programs, fixed, bytes })
+        let layout = NativeMtpLayout::new(reader.checkpoint, cfg, 64, NativeMtpUsage::SERVING)?;
+        let fixed = layout.body_bytes()?;
+        Ok(Self { format, programs, fixed, layout })
     }
 }
 
@@ -496,6 +479,34 @@ impl MtpCache<'_> {
         mtp.pool.unpin_snapshot(saved.snapshot)?;
         result
     }
+    pub(crate) fn allocation_receipts(&self) -> Vec<planner::Receipt> {
+        use cuteafd_core::memory_layout::Category;
+        use planner::{Allocation as Spec, Lifetime, Location, Phase, Receipt};
+        let mtp = self.0.borrow();
+        let mut owners = Vec::new();
+        let mut add = |id: String, buffer: CuteafdDeviceBuffer, dtype: &str, shape: Vec<u64>| {
+            let mut allocation = Spec::buffer(id, Location::coordinator(0), buffer.bytes as u64,
+                Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, Category::Drafter, "native MTP owner");
+            allocation.dtype = dtype.into();
+            allocation.shape = shape;
+            owners.push(Receipt { allocation, address: buffer.ptr as u64 });
+        };
+        for (name, buffer) in mtp.layer.allocation_buffers() {
+            add(format!("draft.mtp.layer.{name}"), buffer, "bytes", vec![buffer.bytes as u64]);
+        }
+        for (name, buffer) in [("fc", mtp.fc.buffer), ("norm", mtp.norm.buffer),
+            ("norm_hidden", mtp.norm_hidden.buffer), ("norm_embedding", mtp.norm_embedding.buffer), ("kv", mtp.kv.buffer)] {
+            add(format!("draft.mtp.{name}"), buffer, "bytes", vec![buffer.bytes as u64]);
+        }
+        let h = mtp.cfg.hidden as u64;
+        let v = mtp.cfg.vocab as u64;
+        add("draft.mtp.concat".into(), mtp.concat.buffer, "bf16", vec![mtp.concat.buffer.bytes as u64 / (4 * h), 2, h]);
+        add("draft.mtp.hidden".into(), mtp.hidden.buffer, "bf16", vec![mtp.hidden.buffer.bytes as u64 / (2 * h), h]);
+        add("draft.mtp.logits".into(), mtp.logits.buffer, "f32", vec![mtp.logits.buffer.bytes as u64 / (4 * v), v]);
+        add("draft.mtp.sidecars".into(), mtp.sidecars.buffer, "bf16", vec![mtp.sidecars.buffer.bytes as u64 / (2 * h), h]);
+        owners
+    }
+
     pub(crate) fn page_bytes(&self) -> usize { self.0.borrow().layout.bytes() }
     pub(crate) fn page_segments(&self, page: DraftPageId) -> Result<Vec<DeviceRange>> {
         let mtp = self.0.borrow();
@@ -574,13 +585,10 @@ pub(crate) fn oracle<'a>(args: &super::super::GoldenArgs, library: &'a NativeLib
     let reader = WeightReader { library, checkpoint };
     let format = format(&reader)?;
     let admitted = DensePrograms::new(cfg, programs, Qwen4KvCache::Bf16, format)?;
-    let fixed = fixed_bytes(&reader, cfg, format)?;
-    // Target planes/scratch/head stay shared; each pooled page adds just one hidden sidecar.
-    let layout = PageLayout { record_bytes: Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim), hidden_bytes: width };
-    let demand = DrafterBytes { owned: fixed + (HEAD_ROWS * width) as u64, scratch: 0,
-        pool_unit: layout.bytes() as u64 };
+    let recipe = NativeMtpLayout::new(checkpoint, cfg, 64, NativeMtpUsage::DIAGNOSTIC)?;
+    let fixed = recipe.body_bytes()?;
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(demand), 1, None, args.kv_cache, false, None)?;
+        Some(DenseDraft::NativeMtp(&recipe)), 1, None, args.kv_cache, false, None)?;
     ensure!(engine.planes.scratch.bytes >= admitted.scratch_bytes, "MTP scratch exceeds shared target admission");
     let input = Allocation::new(engine.stream.device, HEAD_ROWS * width)?;
     let mut mtp = Mtp::load(&engine, &reader, format, admitted, fixed)?;
@@ -690,12 +698,13 @@ mod tests {
         let reader = WeightReader { library: &library, checkpoint: &checkpoint };
         let format = format(&reader)?;
         let admitted = DensePrograms::new(&cfg, &programs, Qwen4KvCache::Bf16, format)?;
-        let fixed = fixed_bytes(&reader, &cfg, format)?;
+        let recipe = NativeMtpLayout::new(&checkpoint, &cfg, 64,
+            NativeMtpUsage { selector: true, diagnostic_input: true })?;
+        let fixed = recipe.body_bytes()?;
         let layout = PageLayout { record_bytes: Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim),
             hidden_bytes: cfg.hidden * 2 };
         let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(),
-            Some(262144), Some(DrafterBytes { owned: fixed + (HEAD_ROWS * layout.hidden_bytes) as u64,
-                scratch: 0, pool_unit: layout.bytes() as u64 }), 2,
+            Some(262144), Some(DenseDraft::NativeMtp(&recipe)), 2,
             Some(crate::shared::prefix::MarkRule { lanes: 2, entries: 2, budget_bytes: 1 << 30, host: false }),
             std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None)?);
         let mut mtp = Mtp::load(&engine.borrow(), &reader, format, admitted, fixed)?;

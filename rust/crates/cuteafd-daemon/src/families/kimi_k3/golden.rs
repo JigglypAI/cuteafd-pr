@@ -815,7 +815,7 @@ mod tests {
         assert_eq!(admitted.working_set().spark_layers, (onboard + 1..93).collect::<Vec<_>>());
         let page_bytes = cfg.mla_layers() as u64 * 64 * cuteafd_ffi::MLA_RECORD_BYTES as u64;
         let host = cuteafd_core::prefix::HostCacheGeometry { unit_rows: 64, page_bytes,
-            mark_bytes: mark_bytes as u64, draft_bytes: 0 };
+            mark_bytes: mark_bytes as u64, draft_bytes: 0, draft_page_bytes: 0 };
         let chunk = host.chunk_bytes();
         let required = cuteafd_core::prefix::host_cache_required_bytes(1 << 20, slots as u64,
             64, page_bytes, mark_bytes as u64, 0, chunk).context("host required quota")?;

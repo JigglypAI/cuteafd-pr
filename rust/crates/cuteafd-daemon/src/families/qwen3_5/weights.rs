@@ -94,23 +94,6 @@ impl<'a> WeightReader<'a> {
         Ok(DenseWeights { layers, norm: self.bf16(&norm_name)?, head: self.bf16(&head_name)? })
     }
 
-    pub(crate) fn dense_layer_bytes(&self, prefix: &str, attention: HybridAttention, format: DenseFormat) -> Result<u64> {
-        native_operands(prefix, attention, format.fp8()).into_iter().try_fold(0u64, |total, spec| {
-            let bytes = spec.tensors.iter().try_fold(0u64, |bytes, name| {
-                let tensor = &self.tensor(name)?.meta;
-                ensure!(match spec.storage {
-                    Storage::Bf16 => tensor.dtype == DType::Bf16,
-                    Storage::F32 | Storage::Scales => matches!(tensor.dtype, DType::Bf16 | DType::F32),
-                    Storage::Fp8 => tensor.dtype == DType::F8E4M3,
-                    Storage::NativeNorm => matches!(tensor.dtype, DType::Bf16 | DType::F32),
-                }, "{name}: native dense operand dtype differs from admitted projection format");
-                let widen = matches!(spec.storage, Storage::F32 | Storage::Scales) && tensor.dtype == DType::Bf16;
-                Ok::<_, anyhow::Error>(bytes + tensor.byte_length * if widen { 2 } else { 1 })
-            })?;
-            Ok(total + bytes.max(256))
-        })
-    }
-
     /// MTP and target blocks share the checkpoint-native projection packing.
     pub(crate) fn dense_layer(&self, prefix: &str, attention: HybridAttention, format: DenseFormat) -> Result<DenseLayer<'a>> {
         let operands = native_operands(prefix, attention, format.fp8()).into_iter().map(|spec| {

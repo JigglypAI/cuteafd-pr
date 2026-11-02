@@ -5029,7 +5029,7 @@ fn release_smoke_prefix_working_set_geometry_ceilings() -> anyhow::Result<()> {
             .min().unwrap_or(0) * geometry.logical_unit_rows;
         let host_mark = if id == "deepseek_v4" { geometry.ranks[0].retained_mark_bytes } else { mark };
         let host = HostCacheGeometry { unit_rows: geometry.logical_unit_rows,
-            page_bytes: host_page_bytes, mark_bytes: host_mark, draft_bytes: 0 };
+            page_bytes: host_page_bytes, mark_bytes: host_mark, draft_bytes: 0, draft_page_bytes: 0 };
         let chunk = host.chunk_bytes();
         let packed = |n: u64, context: u64, marks: u64| -> u64 {
             let pages = context.div_ceil(host.unit_rows) * n;

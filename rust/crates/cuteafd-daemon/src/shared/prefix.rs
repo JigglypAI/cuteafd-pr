@@ -1,6 +1,6 @@
 //! The prefix cache's serving knobs and host tier setup, shared by every generic family
 //! (`cuteafd_engine::prefix` does the work; each family implements `PrefixFamily`).
-use anyhow::Result;
+use anyhow::{Context, Result};
 use cuteafd_engine::prefix::{FamilyLayout, PointPolicy};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 
@@ -151,17 +151,26 @@ impl PrefixArgs {
     /// `memory::budget::admit_host_memory` call, then retain this exact config.
     pub fn resolve_host_config(&self, layout: FamilyLayout, max_context: usize, concurrency: usize)
         -> Result<Option<cuteafd_hostcache::config::Config>> {
+        self.resolve_host_config_with_draft_pages(layout, max_context, concurrency, 0)
+    }
+
+    pub fn resolve_host_config_with_draft_pages(&self, layout: FamilyLayout, max_context: usize,
+        concurrency: usize, draft_page_bytes: usize) -> Result<Option<cuteafd_hostcache::config::Config>> {
         if self.prefix_cache_entries == 0 || !self.host_cache_bytes.enabled() {
             return Ok(None);
         }
-        let chunk = (256u64 << 20).max(layout.page_bytes as u64)
-            .max(layout.mark_bytes as u64).max(layout.draft_bytes as u64);
+        let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: layout.page_rows as u64,
+            page_bytes: layout.page_bytes as u64, mark_bytes: layout.mark_bytes as u64,
+            draft_bytes: layout.draft_bytes as u64, draft_page_bytes: draft_page_bytes as u64 };
+        let chunk = geometry.chunk_bytes();
         let bytes = match self.host_cache_bytes {
             HostBudget::Bytes(bytes) => bytes,
             HostBudget::Auto => {
                 let memory = budget::host_memory()?;
-                let required = budget::retained_bytes(layout, concurrency, max_context, chunk)?;
-                let bytes = budget::resolve_bytes(layout, None, concurrency, max_context, chunk, memory)?;
+                let required = geometry.required_bytes(max_context as u64, concurrency as u64, chunk)
+                    .context("host prefix geometry overflow")?;
+                let bytes = geometry.resolve(None, max_context as u64, concurrency as u64, memory.total, chunk)
+                    .context("host prefix quota overflow")?;
                 tracing::info!(required_bytes = required, resolved_bytes = bytes, available_bytes = memory.available,
                     total_bytes = memory.total, headroom_bytes = self.host_cache_headroom_bytes,
                     "automatic retained-prefix host budget (does not add active KV capacity)");
@@ -179,9 +188,6 @@ impl PrefixArgs {
             ..Default::default()
         };
         config.validate()?;
-        let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: layout.page_rows as u64,
-            page_bytes: layout.page_bytes as u64, mark_bytes: layout.mark_bytes as u64,
-            draft_bytes: layout.draft_bytes as u64 };
         let conversations_max_context = geometry.conversations(bytes, max_context as u64, config.chunk_bytes);
         let conversations_50k = geometry.conversations(bytes, 50_000, config.chunk_bytes);
         tracing::info!(mark_bytes = layout.mark_bytes, host_bytes = bytes, conversations_max_context,
