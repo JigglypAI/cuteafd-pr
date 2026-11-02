@@ -46,8 +46,9 @@ pub(super) fn compact_output_role(role: u32) -> bool {
 
 pub(super) fn grouped_decode_rows(layer: ExpertLayer, library: &NativeLibrary, capacity: u32,
     nvfp4: bool) -> Result<u32> {
-    if nvfp4 { return Ok(80); }
-    library.native_expert_exports(layer.role())?.grouped_decode(capacity).map_err(anyhow::Error::msg)
+    let exports = if nvfp4 { library.nvfp4_expert_exports(layer.role())? }
+        else { library.native_expert_exports(layer.role())? };
+    exports.grouped_decode(capacity).map_err(anyhow::Error::msg)
 }
 
 /// Admit the exact states owned by this wave before allocating their scratch.

@@ -259,7 +259,16 @@ def main() -> int:
             if key in native_packages:
                 fail(f"duplicate native expert package {key}")
             native_packages[key] = package
+    nvfp4_packages = {}
+    for path in sorted(args.native_build_dir.glob("*/v41_nvfp4_experts.json")):
+        package = json.loads(path.read_text())
+        if "decode_capacities" in package:
+            key = f"{package.get('family', 'v41')}:{package['role']}"
+            if key in nvfp4_packages:
+                fail(f"duplicate NVFP4 expert package {key}")
+            nvfp4_packages[key] = package
     document = {
+        "nvfp4_packages": nvfp4_packages,
         "native_packages": native_packages,
         "schema": 1,
         "role": args.role,

@@ -380,12 +380,10 @@ pub const EXL3_CAPACITIES: [u32; 8] = [1, 16, 80, 256, 1024, 2048, 2752, 4096];
 pub enum Exl3RowPolicy {
     Nearest,
     GlmFlashK64,
-    V41,
 }
 
 impl Exl3RowPolicy {
     pub fn for_geometry(geometry: ExpertGeometry) -> Self {
-        if geometry.same_shape(&ExpertGeometry::DEEPSEEK_V41) { return Self::V41; }
         if geometry.same_shape(&ExpertGeometry::GLM5_FLASH)
             || geometry.same_shape(&ExpertGeometry::KIMI_K3)
         { Self::GlmFlashK64 } else { Self::Nearest }
@@ -399,12 +397,12 @@ impl Exl3RowPolicy {
 
     /// Shared by loader admission, artifact preload and runtime dispatch.
     pub fn capacities(self, max_live_rows: usize) -> Result<Vec<u32>, crate::serving_capacity::CapacityError> {
-        let capacities = if self == Self::V41 { [1, 16, crate::V41_VERIFY_ROWS as u32, 256, 1024, 2048, 2752, 4096] } else { EXL3_CAPACITIES };
+        let capacities = EXL3_CAPACITIES;
         if !(1..=4096).contains(&max_live_rows) {
             return Err(crate::serving_capacity::CapacityError::Invalid("EXL3 live capacity must be 1..4096"));
         }
         // Keep a canonical-reduction decode export available even at narrow admission.
-        let required = max_live_rows.max(if max_live_rows > 1 { if self == Self::V41 { crate::V41_VERIFY_ROWS } else { 80 } } else { 1 });
+        let required = max_live_rows.max(if max_live_rows > 1 { 80 } else { 1 });
         let maximum = capacities.into_iter().find(|&c| c as usize >= required).unwrap();
         Ok(capacities.into_iter().filter(|&c| c <= maximum
             && (self != Self::GlmFlashK64 || c != 16)).collect())

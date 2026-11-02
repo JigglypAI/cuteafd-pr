@@ -26,3 +26,27 @@ def test_v41_export_capacity_contract():
         text = (ROOT / f"native/cmake/families/deepseek_v41/{name}.cmake").read_text()
         assert "CUTEAFD_V41_TARGET_ROWS" in text
         assert "1,16,80,256" not in text
+
+
+def test_native_manifest_decode_contract_matches_shared_planner_recipe():
+    import ast
+    path = ROOT / "python/tools/lib/mxfp4_layouts.py"
+    spec = importlib.util.spec_from_file_location("capacity_recipe", path)
+    recipe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(recipe)
+    source = ast.parse((ROOT / "python/tools/aot/export_b12x_slices_aot.py").read_text())
+    export = next(n for n in source.body if isinstance(n, ast.FunctionDef) and n.name == "export")
+    record = next(n for n in ast.walk(export) if isinstance(n, ast.keyword) and n.arg == "decode_capacities")
+    expression = compile(ast.Expression(record.value), "manifest-decode-capacities", "eval")
+    for family in ("v41", "dsv4f", "dsv4p"):
+        for role in ("spark", "spark_tp2", "spark_tp3", "spark_tp6", "spark_tp8", "spark_w320", "rtx_backbone", "rtx_tp2", "coordinator", "dspark_tp2"):
+            capacities, decode = recipe.native_export_capacities(family, role)
+            actual = eval(expression, {"native_export_capacities": recipe.native_export_capacities,
+                                      "capacities": capacities, "family": family, "role": role})
+            assert actual == list(decode)
+            assert decode[-1] == (64 if family == "v41" and role not in ("coordinator", "dspark_tp2") else 80)
+    # m64 keeps m80's measured arithmetic, including the TP6 split-K recipe.
+    for row in recipe.layouts()["native_slices"]:
+        if row["hidden"] == 5120 and 80 in row["capacities"]:
+            assert recipe.native_slice_width(5120, row["width"], row["sm"], 64, 192) == recipe.native_slice_width(5120, row["width"], row["sm"], 80, 192)
+            assert recipe.native_fc1_k_splits(5120, row["width"], row["sm"], 64) == recipe.native_fc1_k_splits(5120, row["width"], row["sm"], 80)

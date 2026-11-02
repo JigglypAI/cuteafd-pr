@@ -791,6 +791,14 @@ impl NativeLibrary {
     /// Installed capacity metadata is resolved once during startup, before any
     /// expert execution arena is allocated; the launch path never reads files.
     pub fn native_expert_exports(&self, role: u32) -> Result<cuteafd_core::spark_executions::ExpertExportCapacities> {
+        self.expert_exports(role, false)
+    }
+
+    pub fn nvfp4_expert_exports(&self, role: u32) -> Result<cuteafd_core::spark_executions::ExpertExportCapacities> {
+        self.expert_exports(role, true)
+    }
+
+    fn expert_exports(&self, role: u32, nvfp4: bool) -> Result<cuteafd_core::spark_executions::ExpertExportCapacities> {
         let family = cuteafd_core::expert_geometry().family().context("unknown native expert family")?;
         let role = match role {
             0 => "coordinator".to_owned(), 1 => "spark".to_owned(),
@@ -806,7 +814,7 @@ impl NativeLibrary {
             .find(|path| path.is_file()).context("missing installed native expert capacity manifest")?;
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         let key = format!("{family}:{role}");
-        let package = &manifest["native_packages"][&key];
+        let package = &manifest[if nvfp4 { "nvfp4_packages" } else { "native_packages" }][&key];
         cuteafd_core::spark_executions::ExpertExportCapacities::from_manifest(package)
             .map_err(anyhow::Error::msg).with_context(|| format!("native expert package {key} in {}", path.display()))
     }

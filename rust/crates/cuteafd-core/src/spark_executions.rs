@@ -386,6 +386,20 @@ impl ExpertExportCapacities {
 mod expert_capacity_tests {
     use super::ExpertExportCapacities;
     #[test]
+    fn shared_recipe_matches_target_and_draft_export_contracts() {
+        for family in ["v41", "dsv4f", "dsv4p"] {
+            for role in ["spark", "spark_tp2", "spark_tp3", "spark_tp6", "spark_tp8", "spark_w320", "rtx_backbone", "rtx_tp2", "coordinator", "dspark_tp2"] {
+                let recipe = crate::mxfp4_layouts::native_export_capacities(family, role);
+                let value = serde_json::json!({"decode_capacities":recipe.decode,
+                    "variants":recipe.capacities.iter().map(|n| serde_json::json!({"capacity_rows":n})).collect::<Vec<_>>()});
+                assert_eq!(ExpertExportCapacities::from_manifest(&value).unwrap(), recipe);
+                let expected = if family == "v41" && !matches!(role, "coordinator" | "dspark_tp2") { crate::V41_VERIFY_ROWS as u32 } else { 80 };
+                assert_eq!(recipe.grouped_decode(4096).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
     fn manifests_admit_their_own_decode_ladders() {
         for ceiling in [64, 80] {
             let value = serde_json::json!({"decode_capacities":[1,16,ceiling],

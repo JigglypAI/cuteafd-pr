@@ -14,11 +14,17 @@ struct StreamPrefill { sm: u32, min_work: Option<u64> }
 #[derive(Deserialize)]
 struct AtomicSlices { hidden: usize, min_capacity: u32 }
 #[derive(Deserialize)]
-struct Layouts { schema: u32, stream_prefill: Vec<StreamPrefill>, atomic_slices: Vec<AtomicSlices>, storage_holds: Vec<StorageHold>, native_slices: Vec<SliceRecipe>,
+struct Layouts { schema: u32, decode_capacities: Vec<u32>, prefill_capacities: Vec<u32>, stream_prefill: Vec<StreamPrefill>, atomic_slices: Vec<AtomicSlices>, storage_holds: Vec<StorageHold>, native_slices: Vec<SliceRecipe>,
     ownership: Vec<Ownership>, generic_storage_holds: Vec<StorageHold> }
 
 fn validate(data: &Layouts) -> Result<(), &'static str> {
     if data.schema != 1 { return Err("unsupported MXFP4 layout schema"); }
+    if data.decode_capacities.first() != Some(&1)
+        || !data.decode_capacities.windows(2).all(|p| p[0] < p[1])
+        || data.decode_capacities.iter().any(|&n| n > 80)
+        || data.prefill_capacities != [256, 1024, 4096] {
+        return Err("invalid native MXFP4 capacity recipe");
+    }
     let mut sms = std::collections::HashSet::new();
     for row in &data.stream_prefill {
         if ![120, 121].contains(&row.sm) || !sms.insert(row.sm) || row.min_work == Some(0) {
@@ -70,6 +76,21 @@ fn layouts() -> &'static Layouts {
         validate(&data).expect("checked MXFP4 layout policy");
         data
     })
+}
+
+/// Build-recipe fallback where coordinator images do not carry Spark manifests.
+/// Exporters declare this same contract; runtime reads the installed declaration.
+pub fn native_export_capacities(family: &str, role: &str) -> crate::spark_executions::ExpertExportCapacities {
+    let decode = if family == "v41" && !matches!(role, "coordinator" | "dspark_tp2") {
+        crate::V41_DECODE_CAPACITIES.map(|n| n as u32).to_vec()
+    } else { layouts().decode_capacities.clone() };
+    let mut capacities = decode.clone();
+    if family == "v41" && matches!(role, "coordinator" | "dspark_tp2") {
+        capacities.push(40);
+    }
+    capacities.extend(&layouts().prefill_capacities);
+    capacities.sort_unstable();
+    crate::spark_executions::ExpertExportCapacities { capacities, decode }
 }
 
 /// Measured adjacent ownership; K32 remains the default scale-aligned unit.
@@ -162,7 +183,7 @@ pub fn native_scratch_bytes(hidden: usize, experts: usize, topk: usize,
 pub fn native_scratch_bytes_for_sm(hidden: usize, experts: usize, topk: usize,
     width: usize, role: u32, capacity: u32, coded: bool, sm: u32) -> Option<u64> {
     stored_width(hidden, width)?;
-    if experts == 0 || topk == 0 || ![1, 16, 80, 256, 1024, 4096].contains(&capacity) { return None; }
+    if experts == 0 || topk == 0 || ![1, 16, crate::V41_VERIFY_ROWS as u32, 80, 256, 1024, 4096].contains(&capacity) { return None; }
     if native_prefill(hidden, width, sm, capacity, experts, topk) {
         return native_prefill_scratch_bytes(hidden, width, experts, topk, capacity);
     }
