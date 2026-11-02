@@ -626,6 +626,37 @@ mod ownership_tests {
             let drafter = engine.drafter.as_ref().context("native proof needs bundled drafter")?;
             ensure!(drafter.mla_windows_only() && family.mark_bytes() > DRAFT_MARK_HEADER,
                 "native proof requires retained MLA window marks");
+            // Hold target taps fixed: full contiguous and tail-only histories must leave
+            // every raw ring byte identical, independently of target prefill row ordering.
+            let tap_width = drafter.cfg.taps.len() * drafter.cfg.hidden;
+            for length in [8192usize, 8332] {
+                let mut states = Vec::new();
+                let mut proposals = Vec::new();
+                for tail_only in [false, true] {
+                    drafter.reset_context(0, 0)?;
+                    let first = if tail_only { length - dflash::TAP_ROWS } else { 0 };
+                    for start in (first..length).step_by(dflash::TAP_ROWS) {
+                        let rows = (length - start).min(dflash::TAP_ROWS);
+                        let taps = (start..start + rows).flat_map(|position| (0..tap_width).flat_map(move |column| {
+                            (0x3d00u16 + ((position * 37 + column) % 256) as u16).to_le_bytes()
+                        })).collect::<Vec<_>>();
+                        drafter.put_taps(&taps)?;
+                        drafter.update(&(0..rows).map(|tap_row| dflash::ContextRow {
+                            tap_row, slot: 0, position: start + tap_row }).collect::<Vec<_>>())?;
+                    }
+                    let state = drafter.mla_readback(0, 0)?;
+                    assert_eq!(state.frontier, (0, length));
+                    let proposal = drafter.draft_device_diagnostic(&[dflash::DraftSeq {
+                        slot: 0, anchor: 2201, position: length, valid_from: 0 }],
+                        &engine.embedding, engine.draft_target_head()?)?.remove(0).tokens;
+                    assert_eq!(drafter.mla_readback(0, 0)?, state, "proposal rollback canonicalizes slack");
+                    states.push(state);
+                    proposals.push(proposal);
+                }
+                assert_eq!(states[0], states[1], "full/tail entire raw owners and frontier at {length}");
+                assert_eq!(proposals[0], proposals[1], "full/tail native proposals at {length}");
+                println!("ML4 native full/tail {length}: raw owner bytes, frontier and proposals identical");
+            }
             let params = cuteafd_loader::plan::checkpoint::read_json(&opened.snapshot.join("params.json"))?;
             let cfg = cuteafd_loader::families::mistral_large4::dspark::Ml4DsparkConfig::from_params(
                 &params, engine.cfg.layers)?;

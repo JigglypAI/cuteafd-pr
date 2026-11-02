@@ -912,6 +912,7 @@ enum DraftInput<'r, 'e> {
 pub(crate) struct MlaReadback {
     pub frontier: (usize, usize),
     pub layers: Vec<Vec<u8>>,
+    pub window_owners: Vec<Vec<u8>>,
     pub taps: Vec<u8>,
 }
 
@@ -1733,8 +1734,16 @@ impl<'a> DflashDrafter<'a> {
         if count > 0 {
             self.library.copy_d2h(&mut taps, crate::shared::prefix::view(self.taps.buffer, 0, count)?)?;
         }
+        let window_owners = self.layers.iter().zip(&cache.layers).enumerate()
+            .filter(|(_, (_, layout))| layout.window().is_some()).map(|(index, (layer, _))| {
+                let DraftAttention::Mla(layer) = &layer.attention else { anyhow::bail!("MLA draft layer mismatch"); };
+                let view = bind_draft_view(layer.cache.buffer, &context.layout.window_view(index, slot)?)?;
+                let mut bytes = vec![0; view.bytes];
+                self.library.copy_d2h(&mut bytes, view)?;
+                Ok(bytes)
+            }).collect::<Result<Vec<_>>>()?;
         context.state.borrow_mut().pool.release_snapshot(snapshot)?;
-        Ok(MlaReadback { frontier, layers, taps })
+        Ok(MlaReadback { frontier, layers, window_owners, taps })
     }
 
     pub(crate) fn reset_context(&self, slot: usize, origin: usize) -> Result<()> {
@@ -3219,10 +3228,9 @@ mod checkpoint_header_tests {
         use cuteafd_loader::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
         for windows in [vec![Some(RING); 3], vec![Some(RING), Some(RING + 1)], vec![Some(RING), None]] {
             let mut cfg = mla_config();
-            cfg.block = 3;
             cfg.windows = windows.clone();
             let layout = cfg.runtime_layout(GlmDraftRepresentation::Fp8Only,
-                GlmDraftCapacity::new(2, 2, 3).unwrap(), 262144, 16384, 188, 2,
+                GlmDraftCapacity::new(2, 2, cfg.block).unwrap(), 262144, 16384, 188, 2,
                 cuteafd_core::MlaCacheFormat::Fp8).unwrap();
             let mut state = MlaPagedState::new(&layout).unwrap();
             state.reset(0, 0).unwrap();
