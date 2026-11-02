@@ -147,22 +147,22 @@ mod tests {
         let layout = cfg.runtime_layout(GlmDraftRepresentation::Bf16Only, capacity, 1 << 20, 1 << 21, 188, 0,
             cuteafd_core::MlaCacheFormat::Fp8)?;
         assert_eq!(layout.capacity().block_rows, layout.capacity().max_batch_sequences * cfg.block);
-        assert_eq!(layout.selector_workspace_bytes()?, 256);
-        assert_eq!(layout.buffers().iter().find(|b| b.name == "topk_workspace").unwrap().bytes,
-            layout.selector_workspace_bytes()?);
+        assert_eq!(layout.selector_workspace_bytes()?, 0);
+        assert!(!layout.buffers().iter().any(|b| b.name == "topk_workspace"));
         // Every draft layer is windowed: per-slot rings (window + block, page-rounded), no pooled layers.
         assert_eq!(layout.paged_cache().full_layers, 0);
         for layer in &layout.cache().layers {
             assert_eq!((layer.window(), layer.rows_per_slot()), (Some(2048), 2112));
         }
         let names: Vec<&str> = layout.buffers().iter().map(|b| b.name.as_str()).collect();
-        for name in ["inverse_frequencies", "unit_scale", "markov_norms", "markov_workspace", "logits"] {
+        for name in ["inverse_frequencies", "markov_norms", "markov_workspace", "logits"] {
             assert!(names.contains(&name), "{name}");
         }
-        // DFlash2-only planes of the shared step workspace sit at the allocation floor.
-        for unused in ["conv", "dynamic", "candidates", "projected", "q_residual", "topk_workspace"] {
-            assert_eq!(layout.buffers().iter().find(|b| b.name == unused).unwrap().bytes, 256, "{unused}");
+        for unused in ["conv", "dynamic", "unary", "candidates", "projected", "features", "q_residual", "topk_workspace", "unit_scale"] {
+            assert!(!layout.buffers().iter().any(|b| b.name == unused), "{unused}");
         }
+        assert_eq!(layout.weight_destinations().len(), 41);
+        assert_eq!(layout.owners().iter().filter(|o| o.id.ends_with(".unit_scale")).count(), 3);
         let cos_sin = layout.buffers().iter().find(|b| b.name == "inverse_frequencies").unwrap();
         assert_eq!(cos_sin.bytes, (1 << 20) * 64 * 4);
         assert!(cfg.runtime_layout(GlmDraftRepresentation::Bf16Only, capacity, 1 << 20, 1 << 21, 188, 0,
