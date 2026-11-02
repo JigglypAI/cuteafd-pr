@@ -89,7 +89,8 @@ fn attention_residency_matches_installed_variant_checkpoint_headers() -> Result<
                 headers.insert(shard.to_owned(), cuteafd_loader::read_safetensors_metadata(&snapshot.join(shard))?);
             }
             let tensor = headers[shard].iter().find(|t| t.name == name).with_context(|| format!("missing header {name}"))?;
-            assert_eq!(tensor.shape, vec![cfg.heads * (cfg.qk_nope_head_dim + cfg.v_head_dim), cfg.kv_lora_rank]);
+            assert_eq!(tensor.shape, vec![cfg.heads * (cfg.nope_dim(layer) + cfg.v_head_dim), cfg.kv_lora_rank],
+                "{model} layer {layer}: {name}");
         }
     }
     Ok(())
