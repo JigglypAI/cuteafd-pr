@@ -75,8 +75,8 @@ pub(crate) struct ServeArgs {
 }
 
 impl ServeArgs {
-    fn endpoint(&self, bf16: bool) -> SparkEndpoint {
-        SparkEndpoint { ring_depth: None, capacity: self.prefill_rows, ingress: if bf16 { SparkIngress::Bf16 } else { SparkIngress::Native } }
+    fn endpoint(&self, ingress: SparkIngress) -> SparkEndpoint {
+        SparkEndpoint { ring_depth: None, capacity: self.prefill_rows, ingress }
     }
 
     fn shape(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
@@ -268,7 +268,7 @@ fn with_backend<T>(args: &ServeArgs,
     }).collect::<Result<Vec<_>>>()?;
     let admission = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(args.mtp))?;
     measured.record("step5", &measured.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
-    let endpoint = args.endpoint(format.bf16_endpoint());
+    let endpoint = args.endpoint(format.ingress());
     let clients = admission.ownership.routed_endpoints()?;
     let config = TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() };
     // Spark admission is planned (headers only) here and started below, once the
@@ -648,7 +648,7 @@ mod tests {
                     "Step-5 retained loading peak", items.iter().map(|item| item.bytes).sum(),
                     cuteafd_core::memory_layout::Basis::Exact)).collect();
             let admitted = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(depth))?;
-            let endpoint = args.endpoint(format.bf16_endpoint());
+            let endpoint = args.endpoint(format.ingress());
             let clients = admitted.ownership.routed_endpoints()?;
             SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
                 rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: 6, prefill_lanes: 1 },
@@ -1092,7 +1092,7 @@ mod tests {
             assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (unit, waves, span));
             args.prefill_rows = unit as u32;
             let exports = [1, 16, 80, 256, 1024, 4096];
-            let model = spark_model(&exports, args.endpoint(false), waves, 2, TcpTransportConfig::default().max_frame_bytes)?;
+            let model = spark_model(&exports, args.endpoint(SparkIngress::Native), waves, 2, TcpTransportConfig::default().max_frame_bytes)?;
             // One prefill owner at the selected unit's covering export; the k units only buffer I/O.
             assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: unit as u32,
                 compiled_capacity: 4096, unit_rows: unit as u32, buffered_units: waves as u8 });

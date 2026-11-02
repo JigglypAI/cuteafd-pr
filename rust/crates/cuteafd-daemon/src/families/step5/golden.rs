@@ -13,7 +13,7 @@ use crate::shared::{
     spark_intake::SparkLink,
 };
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
+use cuteafd_core::{ExpertGeometry, SparkEndpoint};
 use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use cuteafd_hostcache::copy::StubCopyEngine;
 use cuteafd_loader::{
@@ -492,12 +492,12 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<
         args.peers.len(),
         None,
         super::serve::spark_model(&exports,
-            SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: if format.bf16_endpoint() { SparkIngress::Bf16 } else { SparkIngress::Native } },
+            SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: format.ingress() },
             u64::from(args.prefill_waves), 1, config.max_frame_bytes)?,
     )?
     .select(&args.peers)?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers,
-        SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: if format.bf16_endpoint() { SparkIngress::Bf16 } else { SparkIngress::Native } }, 1)?;
+        SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: format.ingress() }, 1)?;
     Ok((world, config))
 }
 

@@ -46,10 +46,14 @@ impl StepExperts {
         }
     }
 
-    /// Whether every routed request sends BF16 rows (NVFP4 W4A4 and BF16
-    /// tails); FP8 and EXL3 take the shared E4M3 K32 wire.
-    pub(super) fn bf16_endpoint(&self) -> bool {
-        matches!(self, Self::Native(format) if format.bf16_input())
+    /// Native FP8 mixes K32 layers with BF16 tails; EXL3 uses K32 throughout.
+    pub(super) fn ingress(&self) -> cuteafd_core::SparkIngress {
+        use cuteafd_core::SparkIngress;
+        match self {
+            Self::Exl3(_) => SparkIngress::Fp8K32,
+            Self::Native(format) if format.bf16_input() => SparkIngress::Bf16,
+            Self::Native(_) => SparkIngress::Native,
+        }
     }
 
     /// The wire one routed layer's request uses.
@@ -88,13 +92,19 @@ mod tests {
         assert_eq!(exl3.package_name(), "exl3-step5-k46");
         assert_eq!(exl3.package_manifest(Path::new("/opt/cuteafd/lib/libcuteafd.so")).unwrap(),
             Path::new("/opt/cuteafd/lib/exl3/exl3-step5-k46/manifest.json"));
-        assert!(!exl3.bf16_endpoint());
+        assert_eq!(exl3.ingress(), cuteafd_core::SparkIngress::Fp8K32);
         let manifest = serde_json::json!({"geometry": "step5", "variants": [
             {"capacity": 80}, {"capacity": 1}, {"capacity": 80}, {"capacity": 4096}]});
         assert_eq!(exl3.exports(&manifest).unwrap(), [1, 80, 4096]);
         assert!(exl3.exports(&serde_json::json!({"geometry": "glmf", "variants": [{"capacity": 1}]})).is_err());
         let nvfp4 = StepExperts::Native(ExpertFormat::Nvfp4);
-        assert!(nvfp4.bf16_endpoint());
+        assert_eq!(nvfp4.ingress(), cuteafd_core::SparkIngress::Bf16);
         assert_eq!(nvfp4.package_name(), "fp8-step5-nvfp4a4");
+    }
+
+    #[test]
+    fn native_fp8_endpoint_accepts_k32_layers_and_bf16_tails() {
+        let fp8 = StepExperts::Native(ExpertFormat::Fp8Block128);
+        assert_eq!(fp8.ingress(), cuteafd_core::SparkIngress::Native);
     }
 }
