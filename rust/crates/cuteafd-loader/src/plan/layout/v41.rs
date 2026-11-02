@@ -188,6 +188,20 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     notes.push(format!("attention placement {}", placement.attention_placement));
     notes.push(format!("placement: {}", placement.summary()));
     notes.push(format!("{} routed backbone layers resident on RTX", placement.onboard_layers));
+    if catalog.exl3().is_none() && catalog.nvfp4().is_none() {
+        let e = catalog.routed_experts();
+        let capacity = [1, 16, 80, 256, 1024, 4096].into_iter().find(|&c| u64::from(c) >= rows)
+            .context("native expert prefill capacity exceeds 4096")?;
+        if !working.rtx_layers.is_empty() {
+            notes.push(cuteafd_core::mxfp4_layouts::native_prefill_note(e.hidden,
+                [e.intermediate / ranks], 120, capacity, e.experts, e.topk));
+        }
+        if spark_ranks > 0 && !working.spark_layers.is_empty() {
+            let widths = cuteafd_core::tp_units::package_width_keys(e.intermediate, 32, spark_ranks, false, true, false);
+            notes.push(cuteafd_core::mxfp4_layouts::native_prefill_note(e.hidden,
+                widths.into_iter().map(|(_, width)| width), 121, capacity, e.experts, e.topk));
+        }
+    }
     let pool_tokens = placement.pool_tokens;
     report.solver_placement = Some(placement);
     devices.extend(sparks);

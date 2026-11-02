@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+from functools import lru_cache
 from pathlib import Path
 
 LAYOUTS_PATH = Path(__file__).resolve().parents[3] / "scripts/build/mxfp4-layouts.json"
@@ -17,6 +19,21 @@ def layouts() -> dict:
 
 
 def validate(data: dict) -> None:
+    sms = set()
+    for row in data["stream_prefill"]:
+        cutoff = row["min_work"]
+        if (row["sm"] not in (120, 121) or row["sm"] in sms
+                or cutoff is not None and (type(cutoff) is not int or cutoff <= 0)):
+            raise ValueError("invalid native MXFP4 STREAM policy")
+        sms.add(row["sm"])
+    if sms != {120, 121}:
+        raise ValueError("native MXFP4 STREAM policy must name both hardware classes")
+    hidden = set()
+    for row in data["atomic_slices"]:
+        if (row["hidden"] <= 0 or row["hidden"] % 256 or row["hidden"] in hidden
+                or row["min_capacity"] not in (256, 1024, 4096)):
+            raise ValueError("invalid native MXFP4 atomic policy")
+        hidden.add(row["hidden"])
     keys = set()
     for row in data["native_slices"]:
         key = (row["hidden"], row["width"], row["sm"])
@@ -74,10 +91,44 @@ def native_slice_width(hidden: int, width: int, sm: int, capacity: int,
     return matching_width
 
 
-def native_prefill(hidden: int, width: int, sm: int, capacity: int) -> bool:
-    """Qualified native STREAM recipe, independent of role names and live rows."""
-    return any((row["hidden"], row["width"], row["sm"]) == (hidden, width, sm)
-               and capacity in row.get("prefill", []) for row in layouts()["native_slices"])
+def _default_prefill_unit_rows(source: str) -> int:
+    def constant(name):
+        match = re.search(rf"^pub const {name}: u64 = ([0-9][0-9_]*);$", source, re.MULTILINE)
+        if match is None:
+            raise ValueError(f"cannot parse Rust literal {name} for native MXFP4 prefill policy")
+        return int(match[1].replace("_", ""))
+    reserve, depth, page, max_waves = (constant("PREFILL_" + name) for name in
+                                      ("RESERVE_ROWS", "DEPTH", "ROW_PAGE", "MAX_WAVES"))
+    if reserve <= 0 or page <= 0 or max_waves < 2:
+        raise ValueError("invalid Rust prefill capacity constants")
+    waves = min(max(depth, 2), max_waves)
+    return ((reserve + waves - 1) // waves + page - 1) // page * page
+
+
+@lru_cache(maxsize=1)
+def default_prefill_unit_rows() -> int:
+    """Use the planner's literal shared contract, including its wave clamp."""
+    source = (LAYOUTS_PATH.parents[2] / "rust/crates/cuteafd-core/src/serving_capacity.rs").read_text()
+    return _default_prefill_unit_rows(source)
+
+
+def native_prefill_work(sm: int, rows: int, width: int, experts: int, topk: int) -> bool:
+    cutoff = next((row["min_work"] for row in layouts()["stream_prefill"] if row["sm"] == sm), None)
+    return (cutoff is not None and rows > 0 and width > 0 and experts > 0 and topk > 0
+            and rows * topk * width >= cutoff * experts)
+
+
+def native_prefill(hidden: int, width: int, sm: int, capacity: int,
+                   experts: int, topk: int) -> bool:
+    """Static export route tuned to the default admitted wave, not compiled padding.
+
+    Larger custom waves retain this correct, default-tuned route. Hot-only screens
+    cannot qualify one: the crossover uses the checkpoint expert population.
+    """
+    rows = min(capacity, default_prefill_unit_rows())
+    return native_prefill_work(sm, rows, width, experts, topk) and any(
+        (row["hidden"], row["width"], row["sm"]) == (hidden, width, sm)
+        and capacity in row.get("prefill", []) for row in layouts()["native_slices"])
 
 
 def native_prefill_scratch(capacity: int, hidden: int, width: int,
@@ -102,6 +153,48 @@ def native_prefill_scratch(capacity: int, hidden: int, width: int,
         planes.append(dict(name=name, dtype=dtype, shape=shape, offset=offset, nbytes=size))
         offset += size
     return planes, offset
+
+
+def native_atomic_slices(hidden: int, role: str, capacity: int) -> bool:
+    return (role in ("spark", "spark_tp2", "spark_tp3", "spark_tp4", "spark_tp6", "spark_tp8",
+                     "rtx_backbone", "rtx_tp2") and any(
+        row["hidden"] == hidden and capacity >= row["min_capacity"]
+        for row in layouts()["atomic_slices"]))
+
+
+def native_scratch_bytes(hidden: int, width: int, experts: int, topk: int,
+                         capacity: int, sm: int, role: str, coded: bool) -> int:
+    """Exact standard export census, excluding the owner's shared I/O planes."""
+    stored_width(hidden, width)
+    if experts <= 0 or topk <= 0 or capacity not in (1, 16, 80, 256, 1024, 4096):
+        raise ValueError("invalid native scratch geometry")
+    if native_prefill(hidden, width, sm, capacity, experts, topk):
+        end = native_prefill_scratch(capacity, hidden, width, experts, topk)[1]
+        for _ in range(2):
+            end = -(-end // 16) * 16 + 4 * experts
+        return end
+    matching = 192 if coded and (not role.startswith("spark_w") or width % 192 == 0) else 128
+    tile = native_slice_width(hidden, width, sm, capacity, matching) if sm == 121 else matching
+    atomic = native_atomic_slices(hidden, role, capacity)
+    pairs = capacity * topk
+    partial = 4 if atomic else -(-width // tile) * pairs * (tile + tile // 8)
+    end = 0
+    for size in (4, experts * pairs * 4, experts * 4, experts * 8,
+                 pairs * 76, pairs * 4, pairs * 4, partial,
+                 (capacity if atomic else pairs) * hidden * 4, experts * 4, experts * 4):
+        end = -(-end // 16) * 16 + size
+    return end
+
+
+def assert_native_scratch_variant(variant: dict, hidden: int, width: int, experts: int,
+                                  topk: int, sm: int, role: str, coded: bool) -> None:
+    capacity = variant["capacity_rows"]
+    stream = native_prefill(hidden, width, sm, capacity, experts, topk)
+    atomic = not stream and native_atomic_slices(hidden, role, capacity)
+    expected = native_scratch_bytes(hidden, width, experts, topk, capacity, sm, role, coded)
+    if (variant["core_scratch_nbytes"] != expected
+            or variant["output_kind"] != ("fp32_tokens" if atomic else "fp32_routes")):
+        raise ValueError("native exporter scratch/output differs from planner census")
 
 
 def native_fc1_k_splits(hidden: int, width: int, sm: int, capacity: int) -> int:

@@ -10,11 +10,29 @@ struct SliceRecipe { hidden: usize, width: usize, sm: u32, capacities: Vec<u32>,
 #[derive(Deserialize)]
 struct Ownership { intermediate: usize, world: usize, unit: usize }
 #[derive(Deserialize)]
-struct Layouts { schema: u32, storage_holds: Vec<StorageHold>, native_slices: Vec<SliceRecipe>,
+struct StreamPrefill { sm: u32, min_work: Option<u64> }
+#[derive(Deserialize)]
+struct AtomicSlices { hidden: usize, min_capacity: u32 }
+#[derive(Deserialize)]
+struct Layouts { schema: u32, stream_prefill: Vec<StreamPrefill>, atomic_slices: Vec<AtomicSlices>, storage_holds: Vec<StorageHold>, native_slices: Vec<SliceRecipe>,
     ownership: Vec<Ownership>, generic_storage_holds: Vec<StorageHold> }
 
 fn validate(data: &Layouts) -> Result<(), &'static str> {
     if data.schema != 1 { return Err("unsupported MXFP4 layout schema"); }
+    let mut sms = std::collections::HashSet::new();
+    for row in &data.stream_prefill {
+        if ![120, 121].contains(&row.sm) || !sms.insert(row.sm) || row.min_work == Some(0) {
+            return Err("invalid native MXFP4 STREAM policy");
+        }
+    }
+    if sms.len() != 2 { return Err("native MXFP4 STREAM policy must name both hardware classes"); }
+    let mut hidden = std::collections::HashSet::new();
+    for row in &data.atomic_slices {
+        if row.hidden == 0 || row.hidden % 256 != 0 || !hidden.insert(row.hidden)
+            || ![256, 1024, 4096].contains(&row.min_capacity) {
+            return Err("invalid native MXFP4 atomic policy");
+        }
+    }
     let mut keys = std::collections::HashSet::new();
     for row in &data.native_slices {
         if !keys.insert((row.hidden, row.width, row.sm))
@@ -75,10 +93,37 @@ pub fn native_slice_width(hidden: usize, width: usize, sm: u32, capacity: u32,
         .unwrap_or(matching)
 }
 
-/// Hardware-qualified prefill backend from the same table as native decode.
-pub fn native_prefill(hidden: usize, width: usize, sm: u32, capacity: u32) -> bool {
-    layouts().native_slices.iter().any(|row| row.hidden == hidden && row.width == width
-        && row.sm == sm && row.prefill.contains(&capacity))
+/// Measured work per checkpoint expert, with a separate explicit hardware hold.
+pub fn native_prefill_work(sm: u32, rows: u64, width: usize, experts: usize, topk: usize) -> bool {
+    let Some(cutoff) = layouts().stream_prefill.iter().find(|row| row.sm == sm)
+        .and_then(|row| row.min_work) else { return false };
+    rows > 0 && width > 0 && experts > 0 && topk > 0
+        && u128::from(rows) * topk as u128 * width as u128 >= u128::from(cutoff) * experts as u128
+}
+
+/// Static export route at the default admitted wave, not its padded capacity.
+/// Custom larger waves retain the same correct, default-tuned implementation.
+pub fn native_prefill(hidden: usize, width: usize, sm: u32, capacity: u32,
+    experts: usize, topk: usize) -> bool {
+    let rows = u64::from(capacity).min(crate::serving_capacity::default_prefill_unit_rows());
+    native_prefill_work(sm, rows, width, experts, topk)
+        && layouts().native_slices.iter().any(|row| row.hidden == hidden && row.width == width
+            && row.sm == sm && row.prefill.contains(&capacity))
+}
+
+/// Describe the exact export-time route selection in planner output.
+pub fn native_prefill_note(hidden: usize, widths: impl IntoIterator<Item = usize>,
+    sm: u32, capacity: u32, experts: usize, topk: usize) -> String {
+    let rows = u64::from(capacity).min(crate::serving_capacity::default_prefill_unit_rows());
+    let routes = widths.into_iter().map(|width| {
+        let route = if !native_prefill_work(sm, rows, width, experts, topk) {
+            "slices (work gate/hold)"
+        } else if !native_prefill(hidden, width, sm, capacity, experts, topk) {
+            "slices (shape table)"
+        } else { "STREAM" };
+        format!("I{width}:{route}")
+    }).collect::<Vec<_>>().join(", ");
+    format!("native MXFP4 SM{sm} prefill C{capacity}, default-admitted {rows} rows: {routes}; custom waves retain this export-time route")
 }
 
 /// The seven STREAM planes and two native ABI per-expert trailing planes.
@@ -98,23 +143,36 @@ pub fn native_prefill_scratch_bytes(hidden: usize, width: usize, experts: usize,
             .checked_div(16)?.checked_mul(16)?.checked_add(size))
 }
 
+/// Standard equal-role slice exports with atomic token output; adjacent widths
+/// and all other geometries retain ordered routes. STREAM always stays ordered.
+pub fn native_atomic_slices(hidden: usize, role: u32, capacity: u32) -> bool {
+    matches!(role, 1 | 2 | 3 | 5 | 6 | 7 | 8) && layouts().atomic_slices.iter()
+        .any(|row| row.hidden == hidden && capacity >= row.min_capacity)
+}
+
 /// `export_b12x_slices_aot.py`'s 16-byte-aligned scratch planes, excluding
 /// shared owner I/O. Qualified prefill uses original-route STREAM planes;
 /// unqualified geometries retain their existing native slice recipe.
 pub fn native_scratch_bytes(hidden: usize, experts: usize, topk: usize,
     width: usize, role: u32, capacity: u32, coded: bool) -> Option<u64> {
+    native_scratch_bytes_for_sm(hidden, experts, topk, width, role, capacity, coded, 121)
+}
+
+/// Exact static export census for either native hardware class, excluding I/O.
+pub fn native_scratch_bytes_for_sm(hidden: usize, experts: usize, topk: usize,
+    width: usize, role: u32, capacity: u32, coded: bool, sm: u32) -> Option<u64> {
     stored_width(hidden, width)?;
     if experts == 0 || topk == 0 || ![1, 16, 80, 256, 1024, 4096].contains(&capacity) { return None; }
-    if native_prefill(hidden, width, 121, capacity) {
+    if native_prefill(hidden, width, sm, capacity, experts, topk) {
         return native_prefill_scratch_bytes(hidden, width, experts, topk, capacity);
     }
     let matching = if coded && (crate::tp_units::native_role_width(role).is_none() || width % 192 == 0) {
         192
     } else { 128 };
-    let slice = native_slice_width(hidden, width, 121, capacity, matching) as u64;
+    let slice = if sm == 121 { native_slice_width(hidden, width, sm, capacity, matching) } else { matching } as u64;
+    let atomic = native_atomic_slices(hidden, role, capacity);
     let (hidden, experts, routes) = (hidden as u64, experts as u64,
         u64::from(capacity).checked_mul(topk as u64)?);
-    let atomic = !coded && crate::tp_units::native_role_width(role).is_none() && capacity >= 256;
     // FC1 activation storage is independent of the weights' scale encoding.
     let partial_cols = slice / 4 + slice / 32;
     let partial = if atomic { 4 } else {
@@ -163,7 +221,7 @@ mod tests {
         for (hidden, experts, topk, width, role, coded, tiles) in [
             (5120, 384, 6, 576, 1, true, [128, 128, 128, 192, 192, 192]),
             (4096, 256, 6, 352, 65888, false, [32, 32, 32, 128, 128, 128]),
-            (5120, 384, 6, 288, 8, true, [128, 128, 128, 64, 64, 64]),
+            (5120, 384, 6, 288, 8, true, [128, 128, 128, 192, 192, 192]),
             (5120, 384, 6, 512, 66048, true, [128; 6]),
             (5120, 384, 6, 448, 65984, true, [128; 6]),
             (5120, 384, 6, 352, 65888, true, [128; 6]),
@@ -172,8 +230,8 @@ mod tests {
             (7168, 384, 6, 608, 66144, false, [128; 6]),
         ] {
             for (capacity, tile) in [1, 16, 80, 256, 1024, 4096].into_iter().zip(tiles) {
-                let atomic = !coded && role < 65536 && capacity >= 256;
-                let expected = if native_prefill(hidden as usize, width as usize, 121, capacity as u32) {
+                let atomic = hidden == 7168 && role < 65536 && capacity >= 256;
+                let expected = if native_prefill(hidden as usize, width as usize, 121, capacity as u32, experts as usize, topk as usize) {
                     native_prefill_scratch_bytes(hidden as usize, width as usize, experts as usize,
                         topk as usize, capacity as u32).unwrap()
                 } else { planes(hidden, experts, topk, width, tile, capacity, atomic) };
@@ -191,11 +249,69 @@ mod tests {
     }
 
     #[test]
+    fn prefill_route_uses_checkpoint_work_and_default_live_wave() {
+        assert_eq!(crate::serving_capacity::default_prefill_unit_rows(), 2752);
+        for (rows, width, experts) in [(4096, 384, 384), (3072, 512, 384), (2048, 512, 256)] {
+            assert!(!native_prefill_work(121, rows - 1, width, experts, 6));
+            assert!(native_prefill_work(121, rows, width, experts, 6));
+            assert!(native_prefill_work(121, rows + 1, width, experts, 6));
+            assert!(!native_prefill_work(120, rows + 1, width, experts, 6));
+        }
+        for (hidden, experts, width, stream) in [(5120, 384, 384, false),
+            (4096, 256, 512, true), (7168, 384, 768, true), (7168, 384, 608, false)] {
+            for capacity in [256, 1024, 4096] {
+                assert_eq!(native_prefill(hidden, width, 121, capacity, experts, 6), stream && capacity == 4096);
+                assert!(!native_prefill(hidden, width, 120, capacity, experts, 6));
+            }
+        }
+        assert!(native_prefill_note(5120, [384], 121, 4096, 384, 6).contains("I384:slices"));
+        assert!(native_prefill_note(4096, [512], 121, 4096, 256, 6).contains("I512:STREAM"));
+        for (width, stream) in [(384, false), (576, true), (768, false), (1152, true)] {
+            assert_eq!(native_prefill(5120, width, 121, 4096, 384, 6), stream);
+        }
+        assert!(native_prefill_note(5120, [384], 121, 4096, 384, 6).contains("slices (work gate/hold)"));
+        assert!(native_prefill_note(5120, [768], 121, 4096, 384, 6).contains("slices (shape table)"));
+    }
+
+    #[test]
+    fn every_prefill_row_is_selected_by_a_shipped_artifact() {
+        for row in layouts().native_slices.iter().filter(|row| !row.prefill.is_empty()) {
+            let experts = match row.hidden { 4096 => 256, 5120 | 7168 => 384, _ => panic!("unshipped geometry") };
+            let intermediate = match row.hidden { 4096 => 2048, 5120 => 2304, _ => 3072 };
+            assert!((1..=8).any(|world| crate::tp_units::package_width_keys(
+                intermediate, 32, world, false, true, false).iter().any(|&(_, width)| width == row.width)),
+                "unshipped width H{}/I{}", row.hidden, row.width);
+            assert!(row.prefill.iter().any(|&capacity| native_prefill(
+                row.hidden, row.width, row.sm, capacity, experts, 6)),
+                "dead prefill row H{}/I{}/SM{}", row.hidden, row.width, row.sm);
+        }
+    }
+
+    #[test]
+    fn policy_rejects_invalid_stream_and_atomic_sections() {
+        let bundled = include_str!("../../../../scripts/build/mxfp4-layouts.json");
+        for failure in 0..8 {
+            let mut data: Layouts = serde_json::from_str(bundled).unwrap();
+            match failure {
+                0 => data.stream_prefill[1].sm = 120,
+                1 => data.stream_prefill[1].sm = 119,
+                2 => data.stream_prefill[1].min_work = Some(0),
+                3 => { data.stream_prefill.pop(); }
+                4 => data.atomic_slices.push(AtomicSlices { hidden: 7168, min_capacity: 256 }),
+                5 => data.atomic_slices[0].hidden = 0,
+                6 => data.atomic_slices[0].hidden = 7169,
+                _ => data.atomic_slices[0].min_capacity = 80,
+            }
+            assert!(validate(&data).is_err());
+        }
+    }
+
+    #[test]
     fn stream_scratch_matches_independent_plane_census() {
         for row in &layouts().native_slices {
             for &capacity in &row.prefill {
                 let (h, w, e, pairs) = (row.hidden as u64, row.width as u64,
-                    if row.hidden == 5120 { 384u64 } else { 256u64 }, u64::from(capacity) * 6);
+                    if row.hidden == 4096 { 256u64 } else { 384u64 }, u64::from(capacity) * 6);
                 let chunks = pairs.div_ceil(128) + e.min(pairs);
                 let mut expected = 0u64;
                 for size in [(4 + 3 * e + chunks) * 4, pairs * 4, pairs * 4,
@@ -203,13 +319,12 @@ mod tests {
                     pairs * h * 4, e * 4, e * 4] {
                     expected = expected.div_ceil(16) * 16 + size;
                 }
-                assert!(native_prefill(row.hidden, row.width, row.sm, capacity));
                 assert_eq!(native_prefill_scratch_bytes(row.hidden, row.width, e as usize, 6, capacity), Some(expected));
-                for decode in [1, 16, 80] { assert!(!native_prefill(row.hidden, row.width, row.sm, decode)); }
+                for decode in [1, 16, 80] { assert!(!native_prefill(row.hidden, row.width, row.sm, decode, e as usize, 6)); }
             }
         }
-        assert!(!native_prefill(7168, 768, 121, 256));
-        assert!(!native_prefill(5120, 288, 120, 256));
+        assert!(!native_prefill(7168, 768, 121, 256, 384, 6));
+        assert!(!native_prefill(5120, 288, 120, 256, 384, 6));
     }
 
     #[test]
@@ -228,7 +343,7 @@ mod tests {
         assert_eq!(native_slice_width(5120, 288, 120, 1, 192), 192);
         assert_eq!(native_slice_width(5120, 288, 121, 1, 192), 128);
         assert_eq!(native_slice_width(5120, 288, 121, 256, 192), 192);
-        assert!(native_prefill(5120, 288, 121, 256));
+        assert!(!native_prefill(5120, 288, 121, 256, 384, 6));
     }
 
     #[test]
