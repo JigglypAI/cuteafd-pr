@@ -48,9 +48,11 @@ ${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc\"
 ")
   set(objects)
   set(headers)
-  set(width_rows 1 16 80 256 1024 4096)
   if(family STREQUAL "v41")
     set(width_rows ${CUTEAFD_V41_TARGET_ROWS})
+  else()
+    # V4 Flash/Pro retain their independent m80 verifier capacity.
+    set(width_rows 1 16 80 256 1024 4096)
   endif()
   list(JOIN width_rows "," width_rows_arg)
   foreach(rows IN LISTS width_rows)
