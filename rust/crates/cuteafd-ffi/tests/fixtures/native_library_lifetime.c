@@ -97,10 +97,28 @@ static const char *mla_programs[] = {
     "fixture_mla_draft_attention_w4096_fp8_m64",
     "fixture_mla_draft_output_m64"
 };
-uint32_t cuteafd_dsv4_program_count(void) { return 7; }
+/* Opt-in allocation-only target metadata; the MLA table stays unchanged unless
+ * a GLM ownership fixture explicitly enables this extension before querying it. */
+static int glm_target_programs;
+void fixture_configure_glm_target_programs(void) { glm_target_programs = 1; }
+static const char *glm_target_bases[] = {
+    "glm_index_producer", "glm2_producer", "glm2_sparse_mla_decode", "glm2_o",
+    "glm2_ffn_i1024", "glm2_ffn_i6144", "glm_index_topk_decode",
+    "glm_index_producer", "glm2_producer", "glm2_sparse_mla_prefill", "glm2_o",
+    "glm2_ffn_i1024", "glm2_ffn_i6144", "glm_index_topk_prefill",
+    "glm_producer", "glm_sparse_mla_decode", "glm_o", "glm_ffn_i2048", "glm_ffn_i12288",
+    "glm_producer", "glm_sparse_mla_prefill", "glm_o", "glm_ffn_i2048", "glm_ffn_i12288"
+};
+uint32_t cuteafd_dsv4_program_count(void) { return glm_target_programs ? 31 : 7; }
 int cuteafd_dsv4_program_info(uint32_t index, struct fixture_program_info *info) {
-    if (index >= 7 || !info) return 1;
+    if (index >= cuteafd_dsv4_program_count() || !info) return 1;
     memset(info, 0, sizeof(*info));
+    if (index >= 7) {
+        uint32_t target = index - 7;
+        int prefill = (target >= 7 && target < 14) || target >= 19;
+        snprintf(info->name, sizeof(info->name), "%s_m%d", glm_target_bases[target], prefill ? 4096 : 64);
+        return 0;
+    }
     strcpy(info->name, mla_programs[index]);
     const int kind = index == 6 ? 2 : (index % 3 == 0 ? 0 : 1);
     info->pointers = kind == 0 ? 13 : (kind == 1 ? 8 : 5);
@@ -109,7 +127,7 @@ int cuteafd_dsv4_program_info(uint32_t index, struct fixture_program_info *info)
     memcpy(info->scalar_kinds, scalars, info->scalars);
     return 0;
 }
-int cuteafd_dsv4_program_load(uint32_t index) { return index < 7 ? 0 : 1; }
+int cuteafd_dsv4_program_load(uint32_t index) { return index < cuteafd_dsv4_program_count() ? 0 : 1; }
 int cuteafd_dsv4_program_launch(uint32_t index, void **pointers,
         const uint64_t *scalars, void *stream) {
     (void)index; (void)pointers; (void)scalars; (void)stream;

@@ -38,6 +38,7 @@ mod context;
 mod tp2;
 mod packing;
 mod layers;
+mod allocation;
 #[path = "engine/native_dense.rs"]
 pub(crate) mod native_dense;
 #[cfg(test)]

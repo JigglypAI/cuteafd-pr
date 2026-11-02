@@ -105,7 +105,25 @@ fn native_projection_ranges(name: &str, range: impl Fn(&str) -> Option<crate::sh
         .into_iter().filter_map(|component| range(&crate::shared::experts::exlr8::dense_weights::key(name, component))).collect()
 }
 
-impl GlmLayer<'_> {
+impl<'a> GlmLayer<'a> {
+    /// No numerical operands: exercises the real cache/workspace constructors only.
+    #[cfg(test)]
+    pub(super) fn allocation_fixture(library: &'a NativeLibrary, cfg: &GlmDsaConfig,
+        rank: u8, owners: Option<&[u8]>) -> Result<Vec<Self>> {
+        cfg.indexers.iter().enumerate().map(|(layer, &indexer)| {
+            let owner = owners.map(|owners| owners[layer]);
+            let mut operands = HashMap::new();
+            if owner.is_none_or(|owner| owner == rank) {
+                operands.insert("q_a_norm", DeviceAllocation::new(library, 256)?);
+            }
+            Ok(Self { dense: layer < cfg.first_moe_layer, full_indexer: indexer == GlmIndexer::Full,
+                mlp_numerics: cuteafd_loader::plan::checkpoint::ModuleNumerics::W8CheckpointActivations,
+                split: true, attention_split: owner.is_none(), attention_owner: owner,
+                operands, native: HashMap::new(), native_projections: HashMap::new(),
+                core: std::collections::BTreeMap::new() })
+        }).collect()
+    }
+
     /// The device range of `operand`, when the layer has it.
     pub fn range(&self, operand: &str) -> Option<crate::shared::l2_prefetch::Range> {
         self.operands.get(operand).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))

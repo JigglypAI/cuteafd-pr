@@ -10,6 +10,8 @@ use crate::placement::*;
 use crate::serving_capacity::{glm_cache_geometry, glm_decode_graph_allowance};
 use cuteafd_core::memory_layout::{Basis, Category};
 
+pub mod buffers;
+
 pub const PAGE_ROWS: u64 = 64;
 pub const DECODE_ROWS: u64 = 64;
 pub const DEFAULT_PREFILL_LANES: u64 = 3;

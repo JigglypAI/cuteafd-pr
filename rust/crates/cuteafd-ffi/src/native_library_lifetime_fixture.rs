@@ -118,6 +118,17 @@ impl Fixture {
         })
     }
 
+    /// Opt-in allocation-only target program metadata; launches still refuse.
+    pub fn glm_target_programs(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: this export belongs only to the CPU fixture built above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn()> =
+                library.lib.get(b"fixture_configure_glm_target_programs")?;
+            configure();
+        }
+        Ok(())
+    }
+
     /// Configure static package ABI before loading a CPU expert module.
     pub fn configure_fp8(&self, library: &NativeLibrary, words: &[u32; 16], scratch: &[u64; 6]) -> Result<()> {
         // SAFETY: the CPU-only export copies the two fixed-size arrays synchronously.
