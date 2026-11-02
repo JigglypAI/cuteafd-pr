@@ -332,7 +332,7 @@ fn range(
     );
     let element = match dtype {
         "I8" | "U8" => 1,
-        "F16" => 2,
+        "F16" | "I16" => 2,
         "I64" | "U64" => 8,
         _ => unreachable!(),
     };
