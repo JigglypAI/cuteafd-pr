@@ -767,21 +767,26 @@ def test_spark_dev_image_accepts_an_identical_local_copy_under_another_name(spar
     assert worker_images(env) == [(host, local_id(host)) for host in SPARKS]
 
 
-def test_older_slot_without_layers_falls_back_to_the_seed_image_id(spark_env, monkeypatch):
-    """A slot sealed before base_image_layers: the sealed ID still carries the layers where it resolves."""
+def test_older_slot_without_layers_uses_the_seed_image_layers(spark_env, monkeypatch):
+    """A slot sealed before base_image_layers: the coordinator looks the sealed ID's
+    layers up on the build seed (kakapo); the targets carry them under other IDs."""
     env = spark_env
     monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
-    stub_images(env, monkeypatch, {host: {SEALED_ID: {'id': SEALED_ID, 'layers': SEALED_LAYERS},
-                                          'spark:tc': {'id': local_id(host), 'layers': SEALED_LAYERS}}
-                                    for host in SPARKS})
+    table = {'kakapo': {SEALED_ID: {'id': SEALED_ID, 'layers': SEALED_LAYERS}}}
+    for host in SPARKS:
+        table[host] = {'spark:tc': {'id': local_id(host), 'layers': SEALED_LAYERS}}
+    stub_images(env, monkeypatch, table)
     assert golden.main(spark_argv(env)) == 0
+    assert any(host == 'kakapo' for host, _ in ssh_calls(env))
     assert worker_images(env) == [(host, local_id(host)) for host in SPARKS]
 
 
 def test_older_slot_without_layers_and_no_seed_image_is_refused(spark_env, monkeypatch, capsys):
     env = spark_env
-    stub_images(env, monkeypatch, {host: {'spark:tc': {'id': local_id(host), 'layers': SEALED_LAYERS}}
-                                    for host in SPARKS})
+    table = {'kakapo': {'other:tag': {'id': 'sha256:' + 'ee' * 32, 'layers': ['sha256:other']}}}
+    for host in SPARKS:
+        table[host] = {'spark:tc': {'id': local_id(host), 'layers': SEALED_LAYERS}}
+    stub_images(env, monkeypatch, table)
     assert golden.main(spark_argv(env)) == 2
     assert f'dodo: dev image {SEALED_ID} is missing' in capsys.readouterr().err
 
