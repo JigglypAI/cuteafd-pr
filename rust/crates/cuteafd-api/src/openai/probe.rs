@@ -202,6 +202,10 @@ impl ProbeSpec {
     }
 
     pub fn validate_media(&self) -> anyhow::Result<()> {
+        self.validate_media_geometry(cuteafd_core::media::ImageTokenGeometry::MERGED)
+    }
+
+    pub fn validate_media_geometry(&self, geometry: cuteafd_core::media::ImageTokenGeometry) -> anyhow::Result<()> {
         self.validate_audio()?;
         if self.media.is_empty() { return Ok(()); }
         let tokens = self.prompt_ids.as_ref().ok_or_else(|| anyhow::anyhow!("probe media requires prompt_ids"))?;
@@ -209,11 +213,10 @@ impl ProbeSpec {
         let mut previous = 0;
         for span in &self.media {
             let end = span.start.checked_add(span.len).ok_or_else(|| anyhow::anyhow!("probe media extent overflow"))?;
-            let [t, h, w] = span.grid;
             anyhow::ensure!(span.kind == "image" && span.len > 0 && span.start >= previous && end <= tokens.len(),
                 "probe media spans must be sorted, disjoint and inside prompt_ids");
-            anyhow::ensure!(sha256_hex(&span.key) && t == 1 && h > 0 && w > 0 && h % 2 == 0 && w % 2 == 0
-                && u64::from(h) * u64::from(w) / 4 == span.len as u64, "invalid probe media identity/grid");
+            anyhow::ensure!(sha256_hex(&span.key) && geometry.extent(span.grid)
+                .is_some_and(|(_, _, rows)| rows == span.len), "invalid probe media identity/grid");
             let source = span.image_url.as_ref().ok_or_else(|| anyhow::anyhow!("probe media image_url required"))?;
             anyhow::ensure!(!source.url.is_empty() && source.detail.as_deref().is_none_or(|v| matches!(v, "auto" | "high" | "low")),
                 "invalid probe image source/detail");

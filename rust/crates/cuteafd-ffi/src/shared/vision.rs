@@ -11,7 +11,9 @@ pub const MISTRAL_RESERVED: u32 = 4;
 /// row per merged row for a span-writing tower.
 pub fn output_rows(grid: [usize; 2], span_markers: bool) -> usize {
     let [h, w] = grid;
-    (h / 2) * (w / 2 + usize::from(span_markers))
+    let (Ok(h), Ok(w)) = (u32::try_from(h), u32::try_from(w)) else { return 0; };
+    cuteafd_core::media::ImageTokenGeometry { merge: 2, row_markers: u32::from(span_markers) }
+        .extent([1, h, w]).map_or(0, |(_, _, rows)| rows)
 }
 
 #[repr(C)]

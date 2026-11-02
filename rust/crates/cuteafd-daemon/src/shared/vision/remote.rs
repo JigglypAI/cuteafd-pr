@@ -87,7 +87,8 @@ impl EncoderHandshake {
     }
     fn tokens(&self, h: u32, w: u32) -> u64 {
         if self.merge_size == 3 { u64::from(h.div_ceil(3)) * (u64::from(w.div_ceil(3)) + 1) + 2 }
-        else { cuteafd_ffi::vision::output_rows([h as usize, w as usize], self.row_markers == 1) as u64 }
+        else { cuteafd_core::media::ImageTokenGeometry { merge: self.merge_size, row_markers: self.row_markers }
+            .extent([1, h, w]).map_or(0, |(_, _, rows)| rows as u64) }
     }
     fn input_bytes(&self, patches: u64) -> u64 {
         patches.saturating_mul(u64::from(self.patch_size).pow(2)).saturating_mul(3)
