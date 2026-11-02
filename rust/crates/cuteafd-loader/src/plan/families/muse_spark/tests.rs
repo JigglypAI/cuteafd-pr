@@ -43,7 +43,7 @@ fn detects_the_checkpoint_and_classifies_every_text_tensor() {
     assert_eq!(spec.layers[0].rope.unwrap().theta, 500000.0);
     for (name, component) in [
         ("model.language_model.layers.3.mlp.experts.17.down_proj.trellis", Component::RoutedExpert),
-        ("model.language_model.layers.3.mlp.experts.post_expert_norm.weight", Component::RoutedExpert),
+        ("model.language_model.layers.3.mlp.experts.post_expert_norm.weight", Component::Norm),
         ("model.language_model.layers.3.mlp.pre_expert_proj.trellis", Component::LatentProjection),
         ("model.language_model.layers.3.mlp.gate.e_score_correction_bias", Component::Router),
         ("model.language_model.layers.3.self_attn.gate_proj.weight", Component::Attention),
@@ -57,6 +57,78 @@ fn detects_the_checkpoint_and_classifies_every_text_tensor() {
     }
     let expert = family.classify(spec, "model.language_model.layers.3.mlp.experts.17.down_proj.trellis").unwrap();
     assert_eq!((expert.layer, expert.expert), (Some(3), Some(17)));
+}
+
+/// Check the coordinator's header view, not index membership: the latter also
+/// contains the Spark-only payload and cannot catch ownership mistakes.
+fn check_coordinator_startup_inventory(snapshot: &std::path::Path) -> anyhow::Result<Checkpoint> {
+    let inventory = Checkpoint::inventory(snapshot)?;
+    let model = super::Model::open(&inventory)?;
+    let coordinator = Checkpoint::coordinator(snapshot, false, false)?;
+    let headers = coordinator.tensors.iter().map(|t| t.meta.name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for name in model.tensors.keys() {
+        if let Some(core) = model.core.get_weight(name) {
+            for suffix in ["trellis", "suh", "svh", "mcg"] {
+                let member = format!("{}.{suffix}", core.stem);
+                anyhow::ensure!(headers.contains(member.as_str()), "coordinator startup lacks {member}");
+            }
+        } else {
+            anyhow::ensure!(headers.contains(name.as_str()), "coordinator startup lacks {name}");
+        }
+    }
+    for layer in 0..model.cfg.layers {
+        let name = format!("model.language_model.layers.{layer}.mlp.experts.post_expert_norm.weight");
+        anyhow::ensure!(headers.contains(name.as_str()), "coordinator combine lacks {name}");
+    }
+    Ok(coordinator)
+}
+
+#[test]
+fn published_native_norms_belong_to_coordinator_not_sparks() -> anyhow::Result<()> {
+    let fixture: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../../tests/fixtures/muse-89998fb1.json"))?;
+    // Preserve the real publication's geometry and tensor classes; repeat its
+    // two real text layers over the release's 62 layers using sparse payloads.
+    let mut tensors = Vec::new();
+    for (name, header) in fixture["headers"].as_object().unwrap() {
+        let dtype = match header["dtype"].as_str().unwrap() {
+            "BF16" => "BF16", "F16" => "F16", "F32" => "F32", "I16" => "I16", "I32" => "I32",
+            other => anyhow::bail!("unexpected published dtype {other}"),
+        };
+        let shape: Vec<usize> = serde_json::from_value(header["shape"].clone())?;
+        if let Some(rest) = name.strip_prefix("model.language_model.layers.") {
+            let (source, leaf) = rest.split_once('.').unwrap();
+            for layer in (source.parse::<usize>()?..62).step_by(2) {
+                tensors.push(testing::t(format!("model.language_model.layers.{layer}.{leaf}"), dtype, &shape));
+            }
+        } else { tensors.push(testing::t(name, dtype, &shape)); }
+    }
+    let dir = tempfile::tempdir()?;
+    testing::write_snapshot(dir.path(), &fixture["config"], &tensors, None);
+    let coordinator = check_coordinator_startup_inventory(dir.path())?;
+    let inventory = Checkpoint::inventory(dir.path())?;
+    let spark = plan::files::required_tensors(&inventory, plan::files::ReadRole::Spark { rank: 0, world: 4 })?;
+    for layer in 0..62 {
+        let norm = format!("model.language_model.layers.{layer}.mlp.experts.post_expert_norm.weight");
+        assert!(coordinator.tensors.iter().any(|t| t.meta.name == norm));
+        assert!(!spark.contains(&norm), "Spark must not own coordinator combine norm {norm}");
+        assert!(spark.contains(&format!("model.language_model.layers.{layer}.mlp.experts.0.down_proj.trellis")));
+    }
+    assert!(!coordinator.tensors.iter().any(|t| t.meta.name.contains(".experts.0.")));
+    Ok(())
+}
+
+#[test]
+fn mounted_published_coordinator_contains_every_startup_tensor() -> anyhow::Result<()> {
+    let Some(snapshot) = std::env::var_os("CUTEAFD_MUSE_PUBLICATION_SNAPSHOT") else {
+        eprintln!("skip full publication receipt: set CUTEAFD_MUSE_PUBLICATION_SNAPSHOT");
+        return Ok(());
+    };
+    let coordinator = check_coordinator_startup_inventory(std::path::Path::new(&snapshot))?;
+    eprintln!("Muse full publication coordinator: {} selected headers, {} indexed tensors; all startup tensors present",
+        coordinator.tensors.len(), coordinator.weight_map.len());
+    Ok(())
 }
 
 #[test]

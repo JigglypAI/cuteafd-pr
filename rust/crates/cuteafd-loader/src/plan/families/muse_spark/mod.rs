@@ -194,9 +194,14 @@ impl Family for MuseSpark {
         if rest.starts_with("norm.") { return Some(TensorRole::new(Component::Norm)); }
         let (layer, rest) = indexed(rest, "layers.")?;
         if layer >= spec.layers.len() { return None; }
+        // The combine runs on the coordinator after summing Spark partials;
+        // this retained-native norm is not routed expert payload.
+        if rest == "mlp.experts.post_expert_norm.weight" {
+            return Some(TensorRole::layer(Component::Norm, layer));
+        }
         if let Some(tail) = rest.strip_prefix("mlp.experts.") {
-            // Split EXL3 experts carry their id; the fused BF16 stacks and the
-            // per-expert output norm belong to every expert of the layer.
+            // Split EXL3 experts carry their id; fused BF16 stacks belong
+            // to every expert of the layer.
             return Some(match tail.split_once('.').and_then(|(e, _)| e.parse().ok()) {
                 Some(expert) => TensorRole::expert(Component::RoutedExpert, layer, expert),
                 None => TensorRole::layer(Component::RoutedExpert, layer),
