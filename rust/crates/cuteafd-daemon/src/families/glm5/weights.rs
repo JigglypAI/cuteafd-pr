@@ -41,6 +41,8 @@ pub(crate) struct GlmLayer<'a> {
     pub attention_split: bool,
     /// Whole attention and its cache exist only on this rank when present.
     pub attention_owner: Option<u8>,
+    /// Set only after this rank's attention operands have loaded successfully.
+    attention_resident: bool,
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
     /// The EXLR8 checkpoint's own dense operands (`native_dense::key`), when
     /// the layer runs natively; empty on the official path.
@@ -106,17 +108,12 @@ fn native_projection_ranges(name: &str, range: impl Fn(&str) -> Option<crate::sh
 }
 
 impl GlmLayer<'_> {
-    /// The device range of `operand`, when the layer has it.
-    /// Whether this rank holds the layer's attention, and with it the layer's paged KV: every
-    /// rank under a head split, the owner under whole-layer owners (it carries the layer's
-    /// attention operands: GLM's q-LoRA norm, or W_UK on direct-query variants). The cache
-    /// allocation and the prefix snapshot select layers by this one rule.
+    /// The loader's attention residency controls cache and prefix-snapshot ownership.
     pub fn holds_attention(&self) -> bool {
-        self.attention_owner.is_none_or(|owner| {
-            (self.range("q_a_norm").is_some() || self.range("w_uk").is_some()) && owner < 2
-        })
+        self.attention_resident
     }
 
+    /// The device range of `operand`, when the layer has it.
     pub fn range(&self, operand: &str) -> Option<crate::shared::l2_prefetch::Range> {
         self.operands.get(operand).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
     }
@@ -1009,17 +1006,26 @@ impl<'a> GlmLoader<'a> {
         // The first core projection of the variant (q_a, or the direct query).
         let first = cfg.stem(layer, Op::QA).or_else(|| cfg.stem(layer, Op::QB)).context("query projection")?;
         let core_attention = core.get_weight(&first).is_some();
+        let mut attention_resident = vec![false; ranks];
         let attention = if let Some(owner) = owner {
             let (device, stream) = if owner == 0 { (self.device, self.stream) }
                 else { let peer = self.peers.get(usize::from(owner) - 1).context("attention owner")?; (peer.device, peer.stream) };
             let local = GlmLoader { library: self.library, catalog: self.catalog, device, stream, peers: Vec::new(),
                 push: self.push.clone() };
             let mut maps = self.on_rank(usize::from(owner), |_| local.attention_operands(cfg, layer, core_attention))?;
-            ops[usize::from(owner)].extend(maps.pop().context("whole attention operands")?);
+            let attention = maps.pop().context("whole attention operands")?;
+            ensure!(!attention.is_empty() && maps.is_empty(), "whole attention operands per owner");
+            ops[usize::from(owner)].extend(attention);
+            attention_resident[usize::from(owner)] = true;
             None
         } else { Some(self.attention_operands(cfg, layer, core_attention)?) };
         if let Some(attention) = attention {
-            for (ops, attention) in ops.iter_mut().zip(attention) { ops.extend(attention); }
+            ensure!(attention.len() == ranks, "attention operands per rank");
+            for ((ops, resident), attention) in ops.iter_mut().zip(&mut attention_resident).zip(attention) {
+                ensure!(!attention.is_empty(), "resident attention operands");
+                ops.extend(attention);
+                *resident = true;
+            }
         }
         let [gate, up, down_stem] = [Op::Gate, Op::Up, Op::Down].map(|op| cfg.stem(layer, op));
         let (gate, up, down_stem) = (gate.context("ffn gate")?, up.context("ffn up")?, down_stem.context("ffn down")?);
@@ -1065,7 +1071,8 @@ impl<'a> GlmLoader<'a> {
             let core = layouts.into_iter().map(|(name, layout)| Ok((name, self.core_weights(layout, rank)?)))
                 .collect::<Result<_>>()?;
             Ok(GlmLayer { dense, full_indexer, mlp_numerics, split: ranks > 1,
-                attention_split: ranks > 1 && owner.is_none(), attention_owner: owner, operands,
+                attention_split: ranks > 1 && owner.is_none(), attention_owner: owner,
+                attention_resident: attention_resident[rank], operands,
                 native: HashMap::new(), core })
         }).collect()
     }
@@ -1152,7 +1159,8 @@ impl<'a> GlmLoader<'a> {
                         "{p}: native layer operands incomplete on rank {rank}");
                     Ok(GlmLayer { dense, full_indexer: cfg.indexers[layer] == GlmIndexer::Full,
                         mlp_numerics: cuteafd_loader::plan::checkpoint::ModuleNumerics::CheckpointPrecision,
-                        split: ranks > 1, attention_split: ranks > 1, attention_owner: None, operands, native,
+                        split: ranks > 1, attention_split: ranks > 1, attention_owner: None,
+                        attention_resident: true, operands, native,
                         core: Default::default() })
                 })?;
                 share.push(part);

@@ -651,6 +651,10 @@ pub(crate) fn paged_layers(cfg: &GlmDsaConfig, holds: &[bool]) -> Vec<(usize, Op
         .map(|(layer, _)| (layer, cfg.owns_kv(layer).then(|| cfg.record_bytes(layer)))).collect()
 }
 
+fn latent_cache<'b, T>(cfg: &GlmDsaConfig, index: usize, caches: &'b [T]) -> &'b T {
+    &caches[cfg.kv_source(index)]
+}
+
 impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmDsaConfig,
@@ -2800,10 +2804,12 @@ impl<'a> GlmEngine<'a> {
     /// Rank `rank`'s latent and (full-indexer layers) index-key pools of layer `index`, and its RoPE table.
     /// A latent-sharing layer (`kv_source(index) != index`) reads its source layer's latent pool.
     fn rank_caches(&self, rank: usize, index: usize) -> (&Dev<'a>, Option<&Dev<'a>>, &Dev<'a>) {
-        let latent = self.cfg.kv_source(index);
-        let (kv, index_pool, cos_sin) = self.rank_caches_of(rank, index);
-        if latent == index { return (kv, index_pool, cos_sin); }
-        (self.rank_caches_of(rank, latent).0, index_pool, cos_sin)
+        let (_, index_pool, cos_sin) = self.rank_caches_of(rank, index);
+        let caches = match (rank, &self.peer) {
+            (1, Some(peer)) => &peer.kv,
+            _ => &self.kv,
+        };
+        (latent_cache(&self.cfg, index, caches), index_pool, cos_sin)
     }
 
     fn rank_caches_of(&self, rank: usize, index: usize) -> (&Dev<'a>, Option<&Dev<'a>>, &Dev<'a>) {
