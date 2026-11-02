@@ -605,13 +605,17 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                 &reader, &header.config, &programs)).transpose()?;
             let draft_config = engine_args.draft.as_ref().map(|snapshot| {
                 block_dspark::check_checkpoint(snapshot, header.config.hidden, header.config.vocab, header.config.attention.len())?;
-                let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
-                super::engine::DrafterBytes::block_dspark(&config, lanes, library.sm_count()? as u64, header.config.max_context)
+                let config = cuteafd_loader::formats::block_dspark::BlockDsparkConfig::read(snapshot)?;
+                ensure!(config.window.is_none(), "dense dSpark requires full-context cache");
+                Ok::<_, anyhow::Error>(cuteafd_loader::formats::block_dspark::BlockDraftLayout::read(snapshot, lanes, lanes,
+                    header.config.max_context, 64, library.sm_count()? as usize,
+                    cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only, 0,
+                    cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?)
             }).transpose()?;
             ensure!(engine_args.draft_fixed.is_none() || engine_args.draft.is_some(), "--draft-fixed requires --draft");
             let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint,
                 header.config, engine_args.pool_tokens,
-                draft_config.map(super::engine::DenseDraft::Deferred).or_else(|| mtp_admission.as_ref()
+                draft_config.as_ref().map(super::engine::DenseDraft::Block).or_else(|| mtp_admission.as_ref()
                     .map(|admission| super::engine::DenseDraft::NativeMtp(&admission.layout))), slots,
                 Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits,
                 Some(cuteafd_loader::placement::families::qwen3_5::ServingRequest {
@@ -637,6 +641,9 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                 draft.prepare_workspace()?;
                 let depth = engine_args.draft_fixed.unwrap_or(config.drafts());
                 ensure!(depth <= config.drafts(), "--draft-fixed exceeds checkpoint draft block");
+                let owners = draft.allocation_receipts(0)?;
+                drop(target);
+                engine.borrow_mut().reconcile_draft(owners)?;
                 backend.drafter = Some(draft);
                 scheduler::Drafts::Neural { depth, fixed: engine_args.draft_fixed.is_some() }
             } else if let Some(admission) = mtp_admission {
@@ -743,11 +750,12 @@ mod tests {
         let programs = library.programs()?.with_manifest(&manifest)?;
         let cfg = Qwen35Config::read(&snapshot)?;
         let checkpoint = Checkpoint::open(&snapshot)?;
-        let config = serde_json::from_slice(&std::fs::read(draft_snapshot.join("config.json"))?)?;
-        let bytes = super::super::engine::DrafterBytes::block_dspark(&config, 4,
-            library.sm_count()? as u64, cfg.max_context)?;
+        let layout = cuteafd_loader::formats::block_dspark::BlockDraftLayout::read(&draft_snapshot,
+            4, 4, cfg.max_context, 64, library.sm_count()? as usize,
+            cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only, 0,
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
         let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg,
-            Some(262144), Some(super::super::engine::DenseDraft::Deferred(bytes)), 4, Some(crate::shared::prefix::MarkRule {
+            Some(262144), Some(super::super::engine::DenseDraft::Block(&layout)), 4, Some(crate::shared::prefix::MarkRule {
                 lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }),
             std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None)?);
         let draft = {

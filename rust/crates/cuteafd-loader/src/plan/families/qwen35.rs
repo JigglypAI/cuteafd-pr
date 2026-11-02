@@ -178,20 +178,24 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     let physical = *placement::ARCH_CONTEXTS.iter().find(|card| card.arch == "sm_120"
         && card.sms == options.physical_sms.unwrap_or(188)).context("unknown dense coordinator physical class")?;
     let context = physical.context_bytes + set.module_bytes();
+    let draft_sequences = usize::try_from(options.resolved_concurrency("qwen3_5"))?;
     let draft_anchor_only = options.dense_qwen_drafter_snapshot.is_some()
-        && !crate::formats::block_dspark::supports_sequences(slots);
+        && !crate::formats::block_dspark::supports_sequences(draft_sequences);
     let drafter = options.dense_qwen_drafter_snapshot.as_ref().filter(|_| !draft_anchor_only).map(|snapshot| {
         let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
         let draft = crate::formats::block_dspark::BlockDsparkConfig::from_json(&config)?;
         ensure!(draft.hidden == cfg.hidden && draft.vocab == cfg.vocab && draft.taps.iter().all(|&layer| layer < cfg.attention.len()),
             "dense dSpark checkpoint differs from target geometry");
-        placement::families::qwen3_5::DrafterBytes::block_dspark(&config, slots,
-            physical.sms as u64, cfg.max_context)
+        ensure!(draft.window.is_none(), "dense dSpark requires full-context cache");
+        Ok::<_, anyhow::Error>(crate::formats::block_dspark::BlockDraftLayout::read(snapshot, draft_sequences, draft_sequences,
+            cfg.max_context, 64, physical.sms as usize,
+            crate::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only, 0,
+            crate::families::qwen4::Qwen4KvCache::Bf16)?)
     }).transpose()?;
     use placement::families::qwen3_5::{DenseDraft, NativeMtpLayout, NativeMtpUsage};
     let native_mtp = options.dense_qwen_mtp.then(|| NativeMtpLayout::new(input.checkpoint(), cfg,
         64, NativeMtpUsage::SERVING)).transpose()?;
-    let drafter = native_mtp.as_ref().map(DenseDraft::NativeMtp).or_else(|| drafter.map(DenseDraft::Deferred));
+    let drafter = native_mtp.as_ref().map(DenseDraft::NativeMtp).or_else(|| drafter.as_ref().map(DenseDraft::Block));
     let host = match options.host_memory {
         Some(host) => host,
         None => {

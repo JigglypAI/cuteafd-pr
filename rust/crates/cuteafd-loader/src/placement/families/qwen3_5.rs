@@ -16,31 +16,6 @@ const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
 pub const SINGLE: ExecutorModes = ExecutorModes { family: "qwen3_5", modes: &[WHOLE],
     hops: false, attention: AttentionPlacement::Heads };
 
-/// Drafter-owned allocations, excluding the target embedding and vocabulary head.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DrafterBytes {
-    pub owned: u64,
-    pub scratch: u64,
-    /// Full-context draft K/V per target pool page, not per sequence/context.
-    pub pool_unit: u64,
-}
-
-impl DrafterBytes {
-    pub fn block_dspark(config: &serde_json::Value, slots: usize, sms: u64, context: usize)
-        -> anyhow::Result<Self> {
-        use crate::families::glm5::draft_representation::{block_dspark_paged_resident_bytes, GlmDraftRepresentation};
-        use crate::families::qwen4::Qwen4KvCache;
-        let cfg = crate::formats::block_dspark::BlockDsparkConfig::from_json(config)?;
-        ensure!(cfg.window.is_none(), "dense dSpark requires full-context cache");
-        let layout = cfg.paged_cache_layout(slots, context, PAGE_ROWS as usize, Qwen4KvCache::Bf16)?;
-        let (owned, scratch) = block_dspark_paged_resident_bytes(config, slots, slots, sms,
-            GlmDraftRepresentation::Bf16Only, 0, context, PAGE_ROWS as usize, Qwen4KvCache::Bf16)?;
-        Ok(Self { owned: owned.checked_sub(layout.full_bytes).ok_or_else(|| anyhow::anyhow!("draft inventory underflow"))?,
-            scratch, pool_unit: layout.full_bytes })
-    }
-
-}
-
 pub const PREFILL_ROWS: usize = 4096;
 pub const VERIFY_ROWS: usize = 64;
 pub const HEAD_WORKSPACE: usize = 4 << 20;
@@ -171,21 +146,21 @@ impl NativeMtpLayout {
     }
 }
 
-/// Unported block recipes remain explicit deferred demands; native MTP uses
-/// named owners and can only reach Ready after its live field census agrees.
+/// Native MTP and block dSpark both require named actual owners before Ready.
 #[derive(Debug, Clone, Copy)]
 pub enum DenseDraft<'a> {
     NativeMtp(&'a NativeMtpLayout),
-    Deferred(DrafterBytes),
+    Block(&'a crate::formats::block_dspark::BlockDraftLayout),
 }
 
 impl DenseDraft<'_> {
     pub fn sync_upload_bytes(self) -> u64 {
-        match self { Self::NativeMtp(layout) => layout.sync_upload_bytes, Self::Deferred(_) => 0 }
+        match self { Self::NativeMtp(layout) => layout.sync_upload_bytes,
+            Self::Block(layout) => layout.sync_upload_bytes as u64 }
     }
 
     pub fn page_bytes(self) -> Result<u64> {
-        match self { Self::NativeMtp(layout) => layout.pool_unit_bytes(), Self::Deferred(bytes) => Ok(bytes.pool_unit) }
+        match self { Self::NativeMtp(layout) => layout.pool_unit_bytes(), Self::Block(layout) => Ok(layout.page_bytes()?) }
     }
 }
 

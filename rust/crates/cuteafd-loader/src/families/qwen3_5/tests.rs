@@ -122,6 +122,8 @@ fn native_dspark_high_concurrency_admits_and_matches_anchor_only_inventory() {
         "enable_confidence_head":true,"confidence_head_with_markov":true,
         "dflash_config":{"projector_type":"dspark","mask_token_id":63,"target_layer_ids":[0]}});
     std::fs::write(draft.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    crate::plan::testing::write_safetensors(&draft.path().join("model.safetensors"),
+        &[t("fc.weight", "BF16", &[4096, 4096])]);
     for c in [17, 32, 33, 64] {
         let layout = options.layout.as_mut().unwrap();
         layout.concurrency = c;

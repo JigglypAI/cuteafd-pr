@@ -153,6 +153,28 @@ impl crate::formats::dflash::MlaDraftCacheLayout {
     }
 }
 
+impl crate::formats::dflash::MlaDraftOwner {
+    /// Translate a shared drafter descriptor once; live receipts still require
+    /// an independent retained-field census rather than projecting this list.
+    pub fn allocation(&self, id: String, gpu: u8, lifetime: super::planner::Lifetime,
+        group: &str) -> super::planner::Allocation {
+        use crate::formats::dflash::{MlaDraftDomain, MlaDraftDtype};
+        use cuteafd_core::memory_layout::Category;
+        use super::planner::{Allocation, Location};
+        let mut allocation = Allocation::buffer(id, match self.domain {
+            MlaDraftDomain::Device => Location::coordinator(gpu),
+            MlaDraftDomain::HostPinned => Location::PINNED,
+        }, self.bytes as u64, lifetime, Category::Drafter, group);
+        allocation.alignment = self.alignment as u64;
+        allocation.dtype = match self.dtype {
+            MlaDraftDtype::Bytes => "bytes", MlaDraftDtype::Bf16 => "bf16", MlaDraftDtype::F32 => "f32",
+            MlaDraftDtype::I32 => "i32", MlaDraftDtype::U32 => "u32", MlaDraftDtype::I64 => "i64",
+        }.into();
+        allocation.shape = self.shape.iter().map(|&n| n as u64).collect();
+        allocation
+    }
+}
+
 /// Test oracle: the same request with every movable charged as fixed demands
 /// on its first allowed GPU (how families charged drafters before #65).
 #[cfg(test)]

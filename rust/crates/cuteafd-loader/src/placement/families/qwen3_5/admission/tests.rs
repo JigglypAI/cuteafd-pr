@@ -1,6 +1,15 @@
 use super::*;
 use crate::families::qwen3_5::tests::native_planner_fixture;
-use crate::placement::families::qwen3_5::DrafterBytes;
+use crate::formats::block_dspark::{BlockDraftLayout, BlockDsparkConfig};
+
+fn block_layout(fp8: bool) -> BlockDraftLayout {
+    use crate::families::{glm5::draft_representation::GlmDraftRepresentation, qwen4::Qwen4KvCache};
+    BlockDsparkConfig { hidden: 256, intermediate: 512, layers: 2, heads: 4, kv_heads: 2, head_dim: 64,
+        eps: 1e-6, rope: crate::formats::block_dspark::DsparkRope::Default { rope_theta: 10000. },
+        block: 8, mask_token: 0, rank: 256, taps: vec![0, 1], vocab: 512, window: None, causal: false }
+        .runtime_layout(4, 4, 262144, 64, 188, if fp8 { GlmDraftRepresentation::Fp8Only }
+            else { GlmDraftRepresentation::Bf16Only }, 2, Qwen4KvCache::Bf16).unwrap()
+}
 use crate::plan::checkpoint::Checkpoint;
 
 fn request() -> Request {
@@ -95,19 +104,14 @@ fn dense_onboarding_all_is_exact_zero_and_positive_pins_are_refused() {
 #[test]
 fn dense_curves_match_independent_exact_inventory_and_monotone_page_neighbors() {
     let (cfg, weights, buffers) = fixture();
+    let bf16 = block_layout(false);
+    let fp8 = block_layout(true);
     for record_bytes in [2048, 4096, 8192] {
-        for draft in [
-            None,
-            Some(DrafterBytes {
-                owned: 1024,
-                scratch: 2048,
-                pool_unit: 4096,
-            }),
-        ] {
+        for draft in [None, Some(&bf16), Some(&fp8)] {
             for sampling in [false, true] {
                 let mut recipe = facts(&cfg, &weights, &buffers);
                 recipe.record_bytes = record_bytes;
-                recipe.drafter = draft.map(DenseDraft::Deferred);
+                recipe.drafter = draft.map(DenseDraft::Block);
                 recipe.serving = Some(
                     ServingFacts::new(
                         &cfg,
@@ -352,26 +356,28 @@ fn native_scratch_prefix_and_pinned_staging_are_individual_owners() {
 }
 
 #[test]
-fn deferred_drafter_pool_demand_is_once_per_page_and_never_ready() {
+fn block_drafter_pages_sources_and_ready_owners_are_exact() {
     let (cfg, weights, buffers) = fixture();
+    let layout = block_layout(true);
     let mut recipe = facts(&cfg, &weights, &buffers);
-    recipe.drafter = Some(DenseDraft::Deferred(DrafterBytes {
-        owned: 1024,
-        scratch: 2048,
-        pool_unit: 64,
-    }));
+    recipe.drafter = Some(DenseDraft::Block(&layout));
     let contract = recipe.prepare(&request()).unwrap();
     let selected = vec![0; contract.variables.len()];
     let small = contract.facts(&selected, 262144 / PAGE_ROWS).unwrap();
     let larger = contract.facts(&selected, 524288 / PAGE_ROWS).unwrap();
-    assert_eq!(small.deferred.len(), 1);
-    assert_eq!(small.deferred[0].bytes, 1024 + 2048 + 262144);
-    assert_eq!(larger.deferred[0].bytes - small.deferred[0].bytes, 262144);
+    assert!(small.deferred.is_empty());
+    assert_eq!(small.sequential.len(), 1);
+    assert_eq!(small.sequential[0].members.len(), 9);
+    for (a, b) in small.allocations.iter().zip(&larger.allocations) {
+        let delta = if a.id.ends_with(".k_ring") || a.id.ends_with(".v_ring") {
+            262144 * layout.cache.record_bytes as u64 / 2
+        } else { 0 };
+        assert_eq!(b.bytes - a.bytes, delta, "{}", a.id);
+    }
+    assert!(!small.allocations.iter().any(|o| o.id.ends_with("taps.upload") || o.id.ends_with("h.upload")));
     let plan = admit(request(), budgets(), recipe).unwrap();
-    assert!(
-        matches!(reconcile(&plan, Phase::Ready, &[]), Err(Refusal::Reconciliation(errors))
-        if errors.contains(&Mismatch::Missing("deferred.drafter".into())))
-    );
+    assert!(matches!(reconcile(&plan, Phase::Ready, &[]), Err(Refusal::Reconciliation(errors))
+        if errors.contains(&Mismatch::Missing("draft.block.weight.fc.values".into()))));
 }
 
 #[test]

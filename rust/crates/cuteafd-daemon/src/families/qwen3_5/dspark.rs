@@ -1,5 +1,5 @@
 //! Dense-target binding of the shared block drafter and online draft policy.
-use super::{engine::{DenseDraft, DenseEngine, DrafterBytes}, GoldenArgs};
+use super::{engine::{DenseDraft, DenseEngine}, GoldenArgs};
 use crate::shared::speculation::dflash::{ContextRow, DraftSeq, TargetHead, TAP_ROWS};
 use crate::shared::{draft::{binding, clock::RoundTimes, evidence::{Censor, DraftSource, Evidence}, routes::RoundRoutes},
     fp8_linear::{Fp8Rows, Fp8Scales}, speculation::{block_dspark::{self, DsparkConfig, DsparkDrafter},
@@ -8,7 +8,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::{verify_dspark_greedy_vocab, DraftCandidate, DraftPolicy, LayerResource, PolicyGeometry,
     PolicySeed, ResourceClass};
 use cuteafd_ffi::{programs::Programs, CuteafdDeviceBuffer, NativeLibrary};
-use cuteafd_loader::{families::{glm5::draft_representation::{block_dspark_paged_resident_bytes, GlmDraftRepresentation},
+use cuteafd_loader::{families::{glm5::draft_representation::GlmDraftRepresentation,
     qwen3_5::Qwen35Config}, plan::checkpoint::Checkpoint};
 use std::time::{Duration, Instant};
 
@@ -121,14 +121,11 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     let required = prompt.len().checked_add(count).and_then(|n| n.checked_add(draft_cfg.block))
         .context("dense draft context size overflow")?;
     ensure!(required <= cfg.max_context, "spec decode exceeds target checkpoint context");
-    let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
-    // Full checkpoint context is charged before target pool selection; no
-    // diagnostic-sized truncation is allowed to masquerade as serving admission.
-    let (owned, scratch) = block_dspark_paged_resident_bytes(&config, 1, 1, library.sm_count()? as u64,
-        GlmDraftRepresentation::Bf16Only, Fp8Rows::W8a16.code() as u8, cfg.max_context,
-        cfg.max_context, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
+    let draft_layout = cuteafd_loader::formats::block_dspark::BlockDraftLayout::read(snapshot,
+        1, 1, cfg.max_context, 64, library.sm_count()? as usize, GlmDraftRepresentation::Bf16Only,
+        Fp8Rows::W8a16.code() as u8, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(DenseDraft::Deferred(DrafterBytes { owned, scratch, ..Default::default() })), 1, None, args.kv_cache, false, None)?;
+        Some(DenseDraft::Block(&draft_layout)), 1, None, args.kv_cache, false, None)?;
     ensure!(required <= engine.pool_tokens, "spec decode exceeds admitted target pool");
     if args.verify_check { engine.verify_check(prompt)?; }
     let plain = (|| -> Result<(Vec<u32>, Duration, Vec<(f32, Vec<u32>)>)> {
@@ -150,7 +147,7 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     // than reconstructing the recurrent state or reusing a stale mark.
     drop(engine);
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(DenseDraft::Deferred(DrafterBytes { owned, scratch, ..Default::default() })), 1, None, args.kv_cache, false, None)?;
+        Some(DenseDraft::Block(&draft_layout)), 1, None, args.kv_cache, false, None)?;
     let stream = engine.target_stream().raw;
     let weights = block_dspark::prefetch(snapshot);
     let mask = engine.token_embedding().host_rows(&[draft_cfg.mask_token])?;

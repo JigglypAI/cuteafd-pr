@@ -305,66 +305,12 @@ pub fn draft_resident_bytes_with_mode(config: &serde_json::Value, slots: usize, 
 
 fn dspark_resident_bytes(config: &serde_json::Value, slots: usize, sequences: usize, sms: u64,
     representation: GlmDraftRepresentation, mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<(u64, u64), GlmDraftStorageError> {
-    block_dspark_resident_bytes(config, slots, sequences, sms, representation, mode, 2048, kv_cache)
+    let tokens = slots.checked_mul(2048).ok_or(GlmDraftStorageError::Overflow)?;
+    block_dspark_paged_resident_bytes(config, slots, sequences, sms, representation, mode, 2048, tokens, kv_cache)
 }
 
-/// Shared dSpark inventory for an explicitly admitted context capacity. The
-/// target embedding/head remain borrowed, never charged as owned draft weights.
-#[allow(clippy::too_many_arguments)]
-pub fn block_dspark_resident_bytes(config: &serde_json::Value, slots: usize, sequences: usize, sms: u64,
-    representation: GlmDraftRepresentation, mode: u8, capacity: usize, kv_cache: crate::families::qwen4::Qwen4KvCache)
-    -> Result<(u64, u64), GlmDraftStorageError> {
-    if mode > 2 || sms == 0 || sms > 4096 {
-        return Err(GlmDraftStorageError::Unsupported("invalid draft scratch mode or SM count"));
-    }
-    let cfg = crate::formats::block_dspark::BlockDsparkConfig::from_json(config)
-        .map_err(|_| GlmDraftStorageError::Unsupported("invalid dSpark checkpoint"))?;
-    if capacity == 0 || cfg.window.is_some_and(|window| capacity != window)
-        || capacity.checked_add(cfg.block).is_none_or(|keys| keys > i32::MAX as usize)
-        || slots.checked_mul(capacity).is_none_or(|rows| rows > i32::MAX as usize) {
-        return Err(GlmDraftStorageError::Unsupported("invalid dSpark context admission"));
-    }
-    let (h, inter, layers, heads, kvh, dim, vocab) = (cfg.hidden as u64, cfg.intermediate as u64,
-        cfg.layers as u64, cfg.heads as u64, cfg.kv_heads as u64, cfg.head_dim as u64, cfg.vocab as u64);
-    let (taps, block, capacity) = (cfg.taps.len() as u64, cfg.block as u64, capacity as u64);
-    if [h,inter,layers,heads,kvh,vocab,block,taps].iter().any(|&n| n > 1_000_000)
-        || layers > 1024 || heads > 4096 || kvh > 4096 || taps > 1024 || block > 128
-        || !matches!(dim, 64 | 128) || heads % kvh != 0 || taps == 0
-        || cfg.rank != 256 || !crate::formats::block_dspark::supports_sequences(sequences) || sequences > slots {
-        return Err(GlmDraftStorageError::Unsupported("invalid dSpark geometry or capacity"));
-    }
-    let q = mul(heads, dim)?;
-    let kv = mul(kvh, dim)?;
-    let shapes = [(mul(taps,h)?, h), (h, add(q,mul(2,kv)?)?), (q,h), (h,mul(2,inter)?), (inter,h)];
-    let values = add(mul(shapes[0].0, shapes[0].1)?, mul(layers,
-        sum(shapes[1..].iter().map(|&(k,n)| mul(k,n)).collect::<Result<Vec<_>,_>>()?)?)?)?;
-    let fp8 = representation == GlmDraftRepresentation::Fp8Only;
-    if fp8 && shapes.iter().any(|&(k,n)| k % 128 != 0 || n % 16 != 0) {
-        return Err(GlmDraftStorageError::Unsupported("dSpark FP8 matrix alignment"));
-    }
-    let weights = sum([mul(values, if fp8 { 1 } else { 2 })?, if fp8 { mul(values / 128,4)? } else { 0 },
-        mul(2,add(mul(2,h)?,mul(layers,add(mul(2,h)?,mul(2,dim)?)?)?)?)?,
-        mul(4,mul(vocab,256)?)?, mul(vocab,4)?, mul(add(h,256)?,2)?.max(256),256, if dim == 128 { dim * 2 } else { 0 }])?;
-    let rows = mul(sequences as u64,block)?;
-    let owned = sum([mul(mul(mul(2,layers)?,slots as u64)?,mul(capacity, kv_cache.plane_record_bytes(kvh as usize, dim as usize) as u64)?)?,
-        mul(2048,sum([mul(mul(taps,h)?,2)?,mul(h,4)?,mul(kv,4)?,12])?)?])?;
-    let terms = [(rows,h,2),(rows,h,2),(rows,add(q,mul(2,kv)?)?,2),(rows,q,2),(rows,kv,2),
-        (rows,kv,2),(rows,q,2),(rows,h,2),(rows,mul(2,inter)?,2),(rows,inter,2),(rows,vocab,4),
-        (sequences as u64,1,4),(rows,1,4),(rows,1,4),(rows,1,4),(rows,1,8),(sequences as u64,3,4)];
-    let mut workspace = 4 << 20;
-    for (a,b,c) in terms { workspace = add(workspace,mul(mul(a,b)?,c)?.max(256))?; }
-    let attention_scratch = crate::serving_capacity::draft_attention_workspace_bytes(
-        sequences as u64, kvh, (heads / kvh * block).div_ceil(32), add(capacity,block)?, dim, sms)
-        .map_err(|_| GlmDraftStorageError::Overflow)?.max(256);
-    workspace = add(workspace,add(mul(sequences as u64,296*8)?,mul(rows,4)?)?.max(256))?;
-    let mut scratch_shapes = shapes.to_vec(); scratch_shapes.push((h,mul(2,kv)?));
-    let scratch = if fp8 { scratch_shapes.iter().map(|&(k,n)|
-        draft_fp8_scratch_bytes(rows.max(2048),k,n,sms,mode)).max().unwrap_or(256) } else { 0 };
-    Ok((sum([weights,owned,workspace])?,add(scratch,attention_scratch)?))
-}
-
-/// Shared-pool inventory: replace the legacy slot-local full-context planes
-/// with the target-token-sized cache and its immutable page-table allocation.
+/// Compatibility-free projection of the shared named recipe into the aggregate
+/// consumed by unported family admission. Borrowed target tables are excluded.
 #[allow(clippy::too_many_arguments)]
 pub fn block_dspark_paged_resident_bytes(config: &serde_json::Value, slots: usize, sequences: usize,
     sms: u64, representation: GlmDraftRepresentation, mode: u8, context: usize,
@@ -372,16 +318,12 @@ pub fn block_dspark_paged_resident_bytes(config: &serde_json::Value, slots: usiz
     -> Result<(u64, u64), GlmDraftStorageError> {
     let cfg = crate::formats::block_dspark::BlockDsparkConfig::from_json(config)
         .map_err(|_| GlmDraftStorageError::Unsupported("invalid dSpark checkpoint"))?;
-    let layout = cfg.paged_cache_layout(slots, context, target_tokens, kv)
-        .map_err(|_| GlmDraftStorageError::Unsupported("invalid dSpark paged admission"))?;
-    let (owned, scratch) = block_dspark_resident_bytes(config, slots, sequences, sms,
-        representation, mode, context, kv)?;
-    if cfg.window.is_some() { return Ok((owned, scratch)); }
-    let old = mul(mul(mul(slots as u64, context as u64)?, cfg.layers as u64)?,
-        mul(2, kv.plane_record_bytes(cfg.kv_heads, cfg.head_dim) as u64)?)?;
-    let tables = layout.page_table_bytes.max(256);
-    Ok((add(owned.checked_sub(old).ok_or(GlmDraftStorageError::Overflow)?,
-        add(layout.full_bytes, tables)?)?, scratch))
+    let layout = cfg.runtime_layout(slots, sequences, context, target_tokens,
+        usize::try_from(sms).map_err(|_| GlmDraftStorageError::Overflow)?, representation, mode, kv)
+        .map_err(|_| GlmDraftStorageError::Unsupported("invalid dSpark runtime admission"))?;
+    let scratch = layout.scratch_bytes().map_err(|_| GlmDraftStorageError::Overflow)?;
+    let total = layout.device_bytes().map_err(|_| GlmDraftStorageError::Overflow)?;
+    Ok((total.checked_sub(scratch).ok_or(GlmDraftStorageError::Overflow)?, scratch))
 }
 
 #[cfg(test)]
@@ -468,15 +410,15 @@ mod tests {
                 "target_layer_ids":[4,16,28,40,52]}});
         use crate::families::qwen4::Qwen4KvCache;
         for (format, plane) in [(Qwen4KvCache::Bf16, 8 * 128 * 2), (Qwen4KvCache::Fp8, 1056)] {
-            let bytes = |capacity| block_dspark_resident_bytes(&config, 1, 1, 188,
-                GlmDraftRepresentation::Bf16Only, 0, capacity, format).unwrap();
+            let bytes = |capacity| block_dspark_paged_resident_bytes(&config, 1, 1, 188,
+                GlmDraftRepresentation::Bf16Only, 0, capacity, capacity, format).unwrap();
             let (small, _) = bytes(2048);
             let (large, _) = bytes(8192);
             assert_eq!(large - small, (8192 - 2048) * 5 * 2 * plane);
-            assert!(block_dspark_resident_bytes(&config, 1, 1, 188,
-                GlmDraftRepresentation::Bf16Only, 0, 0, format).is_err());
-            assert!(block_dspark_resident_bytes(&config, usize::MAX, 1, 188,
-                GlmDraftRepresentation::Bf16Only, 0, 8192, format).is_err());
+            assert!(block_dspark_paged_resident_bytes(&config, 1, 1, 188,
+                GlmDraftRepresentation::Bf16Only, 0, 0, 64, format).is_err());
+            assert!(block_dspark_paged_resident_bytes(&config, usize::MAX, 1, 188,
+                GlmDraftRepresentation::Bf16Only, 0, 8192, 8192, format).is_err());
         }
     }
 

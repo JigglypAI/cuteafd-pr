@@ -177,6 +177,76 @@ pub struct BlockDsparkConfig {
     pub causal: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockDraftLayout {
+    pub owners: Vec<super::dflash::MlaDraftOwner>,
+    pub packing_sources: Vec<super::dflash::MlaDraftOwner>,
+    pub cache: super::dflash::DraftCacheLayout,
+    pub sync_upload_bytes: usize,
+    pub loading_host_bytes: u64,
+}
+
+impl BlockDraftLayout {
+    #[allow(clippy::too_many_arguments)]
+    pub fn read(snapshot: &Path, slots: usize, sequences: usize, context: usize, tokens: usize,
+        sms: usize, representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
+        mode: u8, kv: crate::families::qwen4::Qwen4KvCache) -> Result<Self, DsparkConfigError> {
+        let cfg = BlockDsparkConfig::read(snapshot)?;
+        let mut layout = cfg.runtime_layout(slots, sequences, context, tokens, sms, representation, mode, kv)?;
+        let headers = crate::read_safetensors_metadata(&snapshot.join("model.safetensors"))
+            .map_err(|error| DsparkConfigError::Unsupported(format!("dSpark headers: {error}")))?;
+        layout.loading_host_bytes = Self::loading_host_bytes(&headers, cfg.hidden * 2)?;
+        Ok(layout)
+    }
+
+    pub fn device_bytes(&self) -> Result<u64, DsparkConfigError> {
+        self.owners.iter().filter(|o| o.domain == super::dflash::MlaDraftDomain::Device && !o.on_use)
+            .try_fold(0u64, |sum, o| sum.checked_add(o.bytes as u64)
+                .ok_or_else(|| DsparkConfigError::Unsupported("dSpark owner sum overflow".into())))
+    }
+
+    pub fn scratch_bytes(&self) -> Result<u64, DsparkConfigError> {
+        self.owners.iter().filter(|o| matches!(o.id.as_str(), "fp8_scratch" | "attention_workspace"))
+            .try_fold(0u64, |sum, o| sum.checked_add(o.bytes as u64)
+                .ok_or_else(|| DsparkConfigError::Unsupported("dSpark scratch sum overflow".into())))
+    }
+
+    pub fn page_bytes(&self) -> Result<u64, DsparkConfigError> {
+        (self.cache.record_bytes as u64).checked_mul(self.cache.page_rows as u64)
+            .and_then(|n| n.checked_mul(self.cache.full_layers as u64))
+            .ok_or_else(|| DsparkConfigError::Unsupported("dSpark page extent overflow".into()))
+    }
+
+    pub fn with_pool_tokens(&self, tokens: usize) -> Result<Self, DsparkConfigError> {
+        let invalid = || DsparkConfigError::Unsupported("invalid dSpark pool extent".into());
+        let rows = tokens.div_ceil(64).checked_mul(64).ok_or_else(invalid)?;
+        if tokens == 0 || rows > i32::MAX as usize { return Err(invalid()); }
+        let mut next = self.clone();
+        next.cache.target_tokens = tokens;
+        next.cache.pages = rows / 64;
+        if next.cache.full_layers > 0 {
+            let bytes = rows.checked_mul(next.cache.record_bytes).ok_or_else(invalid)?;
+            next.cache.full_bytes = (bytes as u64).checked_mul(next.cache.full_layers as u64).ok_or_else(invalid)?;
+            next.cache.layer_bytes.fill(bytes);
+            for owner in &mut next.owners {
+                if owner.id.ends_with(".k_ring") || owner.id.ends_with(".v_ring") {
+                    owner.bytes = (bytes / 2).max(256);
+                    owner.shape = vec![owner.bytes];
+                }
+            }
+        }
+        Ok(next)
+    }
+
+    /// Prefetch retains every payload except the two borrowed target tables.
+    pub fn loading_host_bytes(headers: &[crate::SafetensorsTensorMetadata], mask_bytes: usize)
+        -> Result<u64, DsparkConfigError> {
+        headers.iter().filter(|t| !matches!(t.name.as_str(), "embed_tokens.weight" | "lm_head.weight"))
+            .try_fold(mask_bytes as u64, |sum, t| sum.checked_add(t.byte_length)
+                .ok_or_else(|| DsparkConfigError::Unsupported("dSpark prefetch heap overflow".into())))
+    }
+}
+
 #[derive(Deserialize)]
 struct Layers {
     hidden_size: usize,
@@ -217,6 +287,116 @@ impl BlockDsparkConfig {
             full_layers: if full { self.layers } else { 0 },
             window_bytes: if full { 0 } else { total }, full_bytes: if full { total } else { 0 },
             page_table_bytes, layer_bytes: vec![layer_bytes; self.layers] })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn runtime_layout(&self, slots: usize, sequences: usize, context: usize, tokens: usize,
+        sms: usize, representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
+        mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<BlockDraftLayout, DsparkConfigError> {
+        use super::dflash::{MlaDraftDomain as Domain, MlaDraftDtype as Dtype, MlaDraftLifetime, MlaDraftOwner};
+        use crate::families::glm5::draft_representation::{draft_fp8_scratch_bytes, GlmDraftRepresentation};
+        let invalid = || DsparkConfigError::Unsupported("invalid dSpark runtime geometry/capacity".into());
+        if !supports_sequences(sequences) || sequences > slots || sms == 0 || sms > 4096 || mode > 2
+            || [self.hidden, self.intermediate, self.vocab, self.block, self.taps.len()].iter().any(|&n| n == 0 || n > 1_000_000)
+            || self.layers == 0 || self.layers > 1024 || self.heads == 0 || self.heads > 4096
+            || self.kv_heads == 0 || self.kv_heads > 4096 || self.heads % self.kv_heads != 0
+            || !matches!(self.head_dim, 64 | 128) || self.rank != 256 || self.block > 128
+            || self.taps.len() > 1024 || slots.checked_mul(context).is_none_or(|n| n > i32::MAX as usize) {
+            return Err(invalid());
+        }
+        if self.head_dim == 64 && !matches!(self.rope, DsparkRope::Default { .. }) {
+            return Err(DsparkConfigError::Unsupported("64-wide dSpark requires default RoPE".into()));
+        }
+        self.rope.plan(self.head_dim)?;
+        let cache = self.paged_cache_layout(slots, context, tokens, kv_cache)?;
+        let (h, inter, q, kv) = (self.hidden, self.intermediate, self.heads * self.head_dim, self.kv_heads * self.head_dim);
+        let rows = sequences * self.block;
+        let fp8 = representation == GlmDraftRepresentation::Fp8Only;
+        let mut owners = Vec::new();
+        let mut packing_sources = Vec::new();
+        let mut sync_upload_bytes = 0usize;
+        let mut add_weight = |id: String, shape: Vec<usize>, matrix: bool, upload: Option<usize>| -> Result<(), DsparkConfigError> {
+            let source = MlaDraftOwner::new(format!("{id}.source"), Domain::Device, Dtype::Bf16, shape.clone(), 256)?;
+            let payload = shape.iter().product::<usize>() * 2;
+            sync_upload_bytes = sync_upload_bytes.max(upload.unwrap_or(payload));
+            if matrix && fp8 {
+                if shape.len() != 2 || shape[0] % 16 != 0 || shape[1] % 128 != 0 { return Err(invalid()); }
+                owners.push(MlaDraftOwner::new(format!("{id}.values"), Domain::Device, Dtype::Bytes, vec![payload / 2], 0)?);
+                owners.push(MlaDraftOwner::new(format!("{id}.scales"), Domain::Device, Dtype::F32, vec![shape[0], shape[1] / 128], 0)?);
+                packing_sources.push(MlaDraftOwner { dtype: Dtype::Bytes, shape: vec![source.bytes], ..source });
+            } else { owners.push(MlaDraftOwner { id, ..source }); }
+            Ok(())
+        };
+        for layer in 0..self.layers {
+            let p = format!("weight.layer.{layer}");
+            for leaf in ["input_norm", "post_norm"] { add_weight(format!("{p}.{leaf}"), vec![h], false, None)?; }
+            add_weight(format!("{p}.qkv"), vec![q + 2 * kv, h], true, Some(q.max(kv) * h * 2))?;
+            for leaf in ["q_norm", "k_norm"] { add_weight(format!("{p}.{leaf}"), vec![self.head_dim], false, None)?; }
+            add_weight(format!("{p}.o"), vec![h, q], true, None)?;
+            add_weight(format!("{p}.gate_up"), vec![2 * inter, h], true, Some(inter * h * 2))?;
+            add_weight(format!("{p}.down"), vec![h, inter], true, None)?;
+        }
+        add_weight("weight.markov_w2".into(), vec![self.vocab, self.rank], false, None)?;
+        add_weight("weight.fc".into(), vec![h, self.taps.len() * h], true, None)?;
+        for leaf in ["hidden_norm", "norm"] { add_weight(format!("weight.{leaf}"), vec![h], false, None)?; }
+        add_weight("weight.markov_w1".into(), vec![self.vocab, self.rank], false, None)?;
+        add_weight("weight.confidence_w".into(), vec![1, h + self.rank], false, None)?;
+        add_weight("weight.confidence_b".into(), vec![1], false, None)?;
+        let mut add = |id: String, dtype, shape: Vec<usize>, minimum| -> Result<(), DsparkConfigError> {
+            owners.push(MlaDraftOwner::new(id, Domain::Device, dtype, shape, minimum)?); Ok(())
+        };
+        for layer in 0..self.layers {
+            for leaf in ["k_ring", "v_ring"] {
+                add(format!("layer.{layer}.{leaf}"), Dtype::Bytes, vec![cache.layer_bytes[layer] / 2], 256)?;
+            }
+        }
+        add("markov_norms".into(), Dtype::F32, vec![self.vocab], 0)?;
+        if self.head_dim == 128 {
+            add("inverse_frequencies".into(), Dtype::F32, vec![self.head_dim / 2], 256)?;
+            sync_upload_bytes = sync_upload_bytes.max(self.head_dim * 2);
+        }
+        if self.window.is_none() {
+            add("page_table".into(), Dtype::I32, vec![slots, context.div_ceil(64)], 256)?;
+        }
+        for (id, dtype, shape) in [
+            ("taps", Dtype::Bf16, vec![2048, self.taps.len(), h]),
+            ("fused", Dtype::Bf16, vec![2048, h]), ("fused_norm", Dtype::Bf16, vec![2048, h]),
+            ("context_kv", Dtype::Bf16, vec![2048, 2 * kv]),
+            ("context_positions", Dtype::I64, vec![2048]), ("context_slots", Dtype::I32, vec![2048]),
+            ("head_workspace", Dtype::Bytes, vec![4 << 20]),
+            ("h", Dtype::Bf16, vec![rows, h]), ("n", Dtype::Bf16, vec![rows, h]),
+            ("qkv", Dtype::Bf16, vec![rows, q + 2 * kv]), ("q", Dtype::Bf16, vec![rows, q]),
+            ("k", Dtype::Bf16, vec![rows, kv]), ("v", Dtype::Bf16, vec![rows, kv]),
+            ("attn", Dtype::Bf16, vec![rows, q]), ("delta", Dtype::Bf16, vec![rows, h]),
+            ("gate_up", Dtype::Bf16, vec![rows, 2 * inter]), ("act", Dtype::Bf16, vec![rows, inter]),
+            ("logits", Dtype::F32, vec![rows, self.vocab]), ("anchors", Dtype::U32, vec![sequences]),
+            ("ids", Dtype::U32, vec![rows]), ("tokens", Dtype::U32, vec![rows]),
+            ("confidence", Dtype::F32, vec![rows]), ("positions", Dtype::I64, vec![rows]),
+            ("tables", Dtype::I32, vec![3, sequences]),
+        ] { add(id.into(), dtype, shape, 256)?; }
+        let attention = crate::serving_capacity::draft_attention_workspace_bytes(sequences as u64, self.kv_heads as u64,
+            (self.heads / self.kv_heads * self.block).div_ceil(32) as u64, (context + self.block) as u64,
+            self.head_dim as u64, sms as u64).map_err(|_| invalid())?;
+        add("attention_workspace".into(), Dtype::Bytes, vec![usize::try_from(attention).map_err(|_| invalid())?.max(256)], 256)?;
+        add("markov_workspace".into(), Dtype::Bytes, vec![(sequences * 296 * 8 + rows * 4).max(256)], 256)?;
+        if fp8 {
+            let scratch = [(self.taps.len() * h, h), (h, q + 2 * kv), (h, 2 * kv), (q, h), (h, 2 * inter), (inter, h)]
+                .iter().map(|&(k, n)| draft_fp8_scratch_bytes(rows.max(2048) as u64, k as u64, n as u64, sms as u64, mode))
+                .max().unwrap_or(256).max(256);
+            add("fp8_scratch".into(), Dtype::Bytes, vec![usize::try_from(scratch).map_err(|_| invalid())?], 256)?;
+        }
+        owners.push(MlaDraftOwner::new("landing", Domain::HostPinned, Dtype::Bytes, vec![rows * 8], 0)?);
+        for destination in owners.iter().filter(|o| o.domain == Domain::Device &&
+            matches!(o.id.as_str(), "context_positions" | "context_slots" | "page_table" | "positions" | "tables" | "anchors" | "taps" | "h"))
+            .cloned().collect::<Vec<_>>() {
+            let mut upload = MlaDraftOwner::new(format!("{}.upload", destination.id), Domain::HostPinned,
+                Dtype::Bytes, vec![destination.bytes], 0)?;
+            upload.lifetime = MlaDraftLifetime::Library;
+            upload.staging_for = Some(destination.id.clone());
+            upload.on_use = matches!(destination.id.as_str(), "taps" | "h");
+            owners.push(upload);
+        }
+        Ok(BlockDraftLayout { owners, packing_sources, cache, sync_upload_bytes, loading_host_bytes: 0 })
     }
 
     pub fn read(snapshot: &Path) -> Result<Self, DsparkConfigError> {
@@ -390,6 +570,55 @@ mod tests {
                 "num_key_value_heads":64,"rms_norm_eps":1e-5,
                 "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"},
                 "sliding_window":2048,"use_sliding_window":true,"vocab_size":154880}})
+    }
+
+    #[test]
+    fn named_block_owners_preserve_frozen_totals_and_exact_sources() {
+        use crate::families::{glm5::draft_representation::GlmDraftRepresentation as Rep, qwen4::Qwen4KvCache as Kv};
+        for (raw, old_bf16, old_fp8, old_bf16_compact, old_fp8_compact, scratch, fp8_scratch, delta) in [
+            (glm_flash_speculators(), 6_168_387_072u64, 5_014_429_184, 4_595_523_072, 3_441_565_184,
+                77_856_768u64, 109_462_528, 1280u64),
+            (qwen(), 3_843_803_264, 2_650_228_864, 3_437_480_064, 2_243_905_664,
+                102_236_160, 135_158_784, 0),
+        ] {
+            let cfg = BlockDsparkConfig::from_json(&raw).unwrap();
+            for (rep, kv, before, scratch) in [
+                (Rep::Bf16Only, Kv::Bf16, old_bf16, scratch),
+                (Rep::Fp8Only, Kv::Bf16, old_fp8, fp8_scratch),
+                (Rep::Bf16Only, Kv::Fp8, old_bf16_compact, scratch),
+                (Rep::Fp8Only, Kv::Fp8, old_fp8_compact, fp8_scratch),
+            ] {
+                let layout = cfg.runtime_layout(20, 16, 2048, 20 * 2048, 188, rep, 2, kv).unwrap();
+                assert_eq!(layout.scratch_bytes().unwrap(), scratch);
+                // The old 64-wide norm aggregate missed actual min-256 padding:
+                // two 128-byte norm payloads per layer, five layers, +1280 B.
+                assert_eq!(layout.device_bytes().unwrap() - scratch, before + delta);
+                let ids: std::collections::BTreeSet<_> = layout.owners.iter().map(|o| &o.id).collect();
+                assert_eq!(ids.len(), layout.owners.len());
+                assert!(!layout.owners.iter().any(|o| o.id.contains("embed_tokens") || o.id.contains("lm_head")));
+                assert_eq!(layout.owners.iter().find(|o| o.id == "landing").unwrap().bytes, 16 * cfg.block * 8);
+                assert_eq!(layout.owners.iter().filter(|o| o.staging_for.is_some() && !o.on_use).count(),
+                    if cfg.window.is_none() { 6 } else { 5 });
+                for id in ["taps.upload", "h.upload"] {
+                    assert!(layout.owners.iter().find(|o| o.id == id).unwrap().on_use);
+                }
+                if rep == Rep::Fp8Only {
+                    assert_eq!(layout.packing_sources.len(), cfg.layers * 4 + 1);
+                    assert_eq!(layout.packing_sources[0].id, "weight.layer.0.qkv.source");
+                    assert_eq!(layout.packing_sources[2].id, "weight.layer.0.gate_up.source");
+                    assert_eq!(layout.packing_sources.last().unwrap().id, "weight.fc.source");
+                    assert_eq!(layout.packing_sources[2].bytes, 2 * cfg.intermediate * cfg.hidden * 2);
+                    assert!(layout.packing_sources.iter().all(|o| o.shape == [o.bytes]));
+                } else { assert!(layout.packing_sources.is_empty()); }
+                let larger = layout.with_pool_tokens(80 * 2048).unwrap();
+                for (a, b) in layout.owners.iter().zip(&larger.owners) {
+                    if cfg.window.is_none() && (a.id.ends_with(".k_ring") || a.id.ends_with(".v_ring")) {
+                        assert_eq!(b.bytes, a.bytes * 4);
+                        assert_eq!(b.shape, [b.bytes]);
+                    } else { assert_eq!(a, b); }
+                }
+            }
+        }
     }
 
     #[test]

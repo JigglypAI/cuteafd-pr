@@ -26,7 +26,7 @@ pub(crate) mod mtp;
 #[path = "prefix.rs"]
 pub(crate) mod prefix;
 pub(crate) use verify::DenseMark;
-pub(crate) use placement::families::qwen3_5::{DenseDraft, DrafterBytes};
+pub(crate) use placement::families::qwen3_5::DenseDraft;
 
 pub(crate) struct DenseEngine<'a> {
     // Drain queued work before fields retaining buffers/weights begin dropping.

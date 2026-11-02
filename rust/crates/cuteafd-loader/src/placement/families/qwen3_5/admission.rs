@@ -342,16 +342,15 @@ impl Recipe for DenseFacts<'_> {
                     shape[0] = ByteCurve::linear(1, 1, maximum);
                 }
             }
-            Some(DenseDraft::Deferred(draft)) => {
-                let first = draft
-                    .owned
-                    .checked_add(draft.scratch)
-                    .and_then(|n| n.checked_add(draft.pool_unit))
-                    .ok_or(Refusal::Overflow("draft first page"))?;
-                contract.set_byte_extent(
-                    "deferred.drafter",
-                    ByteCurve::linear(first, draft.pool_unit, maximum),
-                )?;
+            Some(DenseDraft::Block(layout)) => {
+                let one_page = layout.with_pool_tokens(PAGE_ROWS as usize)
+                    .map_err(|e| Refusal::InvalidFact(e.to_string()))?;
+                if layout.cache.full_layers > 0 {
+                    for owner in one_page.owners.iter().filter(|o| o.id.ends_with(".k_ring") || o.id.ends_with(".v_ring")) {
+                        contract.set_byte_extent(&format!("draft.block.{}", owner.id),
+                            ByteCurve::linear(owner.bytes as u64, owner.bytes as u64, maximum))?;
+                    }
+                }
             }
             None => {}
         }
@@ -626,7 +625,7 @@ impl DenseFacts<'_> {
         if let Some(serving) = self.serving {
             allocations.extend(serving.allocations(self.cfg.vocab)?);
         }
-        let mut deferred = Vec::new();
+        let mut sequential = Vec::new();
         if let Some(DenseDraft::NativeMtp(layout)) = self.drafter {
             use crate::formats::dflash::{MlaDraftDomain, MlaDraftDtype};
             let layout = layout
@@ -661,25 +660,18 @@ impl DenseFacts<'_> {
                 allocations.push(allocation);
             }
         }
-        if let Some(DenseDraft::Deferred(draft)) = self.drafter {
-            let bytes = draft
-                .owned
-                .checked_add(draft.scratch)
-                .and_then(|n| {
-                    draft
-                        .pool_unit
-                        .checked_mul(pool / PAGE_ROWS)
-                        .and_then(|kv| n.checked_add(kv))
-                })
-                .ok_or(Refusal::Overflow("deferred drafter"))?;
-            deferred.push(Allocation::buffer(
-                "deferred.drafter",
-                gpu,
-                bytes,
-                Lifetime::TARGET,
-                Category::Drafter,
-                "drafter reserved; exact owners pending Slice 0b",
-            ));
+        if let Some(DenseDraft::Block(layout)) = self.drafter {
+            let layout = layout.with_pool_tokens(usize::try_from(pool).map_err(|_| Refusal::Overflow("block pool"))?)
+                .map_err(|e| Refusal::InvalidFact(e.to_string()))?;
+            let life = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
+            allocations.extend(layout.owners.iter().filter(|o| !o.on_use).map(|owner|
+                owner.allocation(format!("draft.block.{}", owner.id), 0, life, "block dSpark owner")));
+            if !layout.packing_sources.is_empty() {
+                sequential.push(Sequential { id: "draft.block.packing".into(),
+                    members: layout.packing_sources.iter().map(|owner| owner.allocation(
+                        format!("draft.block.{}", owner.id), 0,
+                        Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad }, "BF16 packing source")).collect() });
+            }
         }
         // This was an ownerless Exact demand. It remains an explicit unmeasured
         // growth allowance, never a receipt or a physical-card measurement.
@@ -694,6 +686,12 @@ impl DenseFacts<'_> {
                 lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad },
                 source: "native MTP headers: serialized read plus packed Vec capacity; ordinary Rust heap".into(), assumed: true });
         }
+        if let Some(DenseDraft::Block(layout)) = self.drafter {
+            allowances.push(Allowance { location: Location::HOST, bytes: layout.loading_host_bytes,
+                lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad },
+                source: "block dSpark headers: all prefetched tensor payloads plus retained mask; ordinary Rust heap".into(),
+                assumed: true });
+        }
         if let Some(serving) = self.serving {
             allowances.push(Allowance { location: Location::HOST, bytes: serving.host_runtime,
                 lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth },
@@ -702,8 +700,8 @@ impl DenseFacts<'_> {
         }
         Ok(Facts {
             allocations,
-            deferred,
-            sequential: vec![],
+            deferred: vec![],
+            sequential,
             allowances,
         })
     }
