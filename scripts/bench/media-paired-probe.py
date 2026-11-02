@@ -6,6 +6,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -27,6 +28,23 @@ def write_new(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb") as output:
         output.write(canonical(value) + b"\n")
+
+
+def probe_token(token=None, token_file=None):
+    if token_file is not None:
+        if token is not None:
+            raise ValueError("choose one bench token source")
+        try:
+            token = Path(token_file).read_text().strip()
+        except (OSError, UnicodeError):
+            raise ValueError("cannot read bench token file") from None
+        if not token:
+            raise ValueError("bench token file is empty")
+    elif token is None:
+        token = os.environ.get("CUTEAFD_API_KEY")
+    if token and (not token.isascii() or any(ord(c) < 33 or ord(c) == 127 for c in token)):
+        raise ValueError("invalid bench token")
+    return token
 
 
 def http(url, token, body=None, timeout=240):
@@ -60,7 +78,7 @@ def check_record(window, response, checkpoint, mode, features_root=None, family=
             or family is not None and response.get("server", {}).get("family") != family):
         raise ValueError("media scoring identity/cold/path contract not honored")
     fields = ("start", "len", "kind", "key", "grid")
-    expected = [{k: span[k] for k in fields} for span in window["media"]]
+    expected = [{k: span[k] for k in fields} for span in window.get("media", [])]
     actual = [{k: span.get(k) for k in fields} for span in record.get("media", [])]
     if actual != expected:
         raise ValueError("prepared media echo differs")
@@ -74,7 +92,7 @@ def check_record(window, response, checkpoint, mode, features_root=None, family=
         if provenance is not None:
             raise ValueError("native arm unexpectedly reports feature override provenance")
     else:
-        metadata = [json.loads((features_root / (s["key"] + ".json")).read_text()) for s in window["media"]]
+        metadata = [json.loads((features_root / (s["key"] + ".json")).read_text()) for s in window.get("media", [])]
         expected_provenance = {"mode": "reference_features", "probe_only": True,
                                "encoder_bypassed": True, "features": metadata}
         if family == "glm5_flash":
@@ -92,6 +110,7 @@ def check_record(window, response, checkpoint, mode, features_root=None, family=
 
 
 def capture(a):
+    a.bench_token = probe_token(a.bench_token, getattr(a, "bench_token_file", None))
     panel = load_panel(a)
     if a.out.exists():
         raise ValueError("capture output must be new")
@@ -107,7 +126,7 @@ def capture(a):
     started = time.monotonic()
     for window in selected:
         media = []
-        for span in window["media"]:
+        for span in window.get("media", []):
             data = read_fixture(a.media_root, span)
             media.append({**span, "image_url": {"url": "data:image/png;base64," + base64.b64encode(data).decode()}})
         leaf = window["id"]
@@ -214,7 +233,31 @@ def golden_seal(root, panel):
             "checkpoint": panel["checkpoint"], "files": files}
 
 
+def fidelity_bar(expert_bpw):
+    if (isinstance(expert_bpw, bool) or not isinstance(expert_bpw, (float, int))
+            or not np.isfinite(expert_bpw) or expert_bpw <= 0):
+        raise ValueError("native-only compare requires finite positive --expert-bpw")
+    kl, top1 = (.03, .95) if expert_bpw >= 6 else ((.05, .93) if expert_bpw >= 3 else (.07, .90))
+    return {"expert_bpw": expert_bpw, "max_kl": kl, "min_top1": top1,
+            "source": "checkpoint routed-expert bits per weight; excludes dense/core/head precision"}
+
+
+def native_metrics(summaries, bar):
+    if not summaries:
+        return None
+    rows = sum(s["rows"] for s in summaries)
+    kl = sum(s["native_golden_kl"] * s["rows"] for s in summaries) / rows
+    top1 = sum(s["native_top1"] * s["rows"] for s in summaries) / rows
+    return {"rows": rows, "native_golden_kl": kl, "native_top1": top1,
+            "pass": kl <= bar["max_kl"] and top1 >= bar["min_top1"]}
+
+
 def compare(a):
+    paired = a.reference is not None
+    if paired != (a.features is not None):
+        raise ValueError("--reference and --features must be supplied together")
+    bar = None if paired else fidelity_bar(getattr(a, "expert_bpw", None))
+    roots = (a.native, a.reference) if paired else (a.native,)
     panel = load_panel(a)
     seal = json.loads(a.golden_seal.read_text())
     if seal != golden_seal(a.golden, panel):
@@ -223,7 +266,7 @@ def compare(a):
     validate_qualification(meta.get("prefix_qualification"), panel, meta.get("snapshot_identity"))
     if meta["set_sha256"] != panel["set_sha256"] or meta["checkpoint"] != panel["checkpoint"]:
         raise ValueError("golden provenance differs")
-    captures = [json.loads((root / "capture.json").read_text()) for root in (a.native, a.reference)]
+    captures = [json.loads((root / "capture.json").read_text()) for root in roots]
     for capture_record, mode in zip(captures, ("native", "reference")):
         if (capture_record["schema"] != "cuteafd.media.paired.capture/1" or capture_record["mode"] != mode
                 or capture_record["set_sha256"] != panel["set_sha256"]
@@ -233,15 +276,17 @@ def compare(a):
     servers = json.loads(json.dumps([c["server"] for c in captures]))
     for server in servers:
         server.get("build", {}).pop("image", None)
-    if servers[0] != servers[1]:
+    if paired and servers[0] != servers[1]:
         raise ValueError("arms have different builds or non-encoder settings")
     arm_maps = [{w["id"]: w for w in c["windows"]} for c in captures]
     expected = {w["id"] for w in panel["windows"]}
-    if captures[0]["quick"] or captures[1]["quick"]:
+    if any(c["quick"] for c in captures):
+        if not paired:
+            raise ValueError("native-only gate requires the complete panel, not quick windows")
         expected = set(panel["quick_windows"])
-    if (captures[0]["quick"] != captures[1]["quick"] or set(arm_maps[0]) != expected
-            or set(arm_maps[1]) != expected
-            or any(len(arm) != len(c["windows"]) for arm, c in zip(arm_maps, captures))):
+    if (any(c["quick"] != captures[0]["quick"] for c in captures)
+            or any(set(arm) != expected or len(arm) != len(c["windows"])
+                   for arm, c in zip(arm_maps, captures))):
         raise ValueError("arms score different/incomplete windows")
     gold = {w["id"]: w for w in meta["windows"]}
     if set(gold) != {w["id"] for w in panel["windows"]} or len(gold) != len(meta["windows"]):
@@ -252,7 +297,7 @@ def compare(a):
             continue
         entry = gold[window["id"]]
         positions = list(range(window["score_from"], len(window["tokens"])))
-        if entry["positions"] != positions or entry.get("media") != window["media"]:
+        if entry["positions"] != positions or entry.get("media", []) != window.get("media", []):
             raise ValueError("golden media/position identity differs")
         vocab = entry["vocab"]
         if vocab != meta["prefix_qualification"]["vocab"]:
@@ -267,7 +312,7 @@ def compare(a):
             raise ValueError("golden tokens differ")
         logits = np.memmap(path, dtype="<f4", mode="r", shape=(len(positions), vocab))
         arms = []
-        for arm, capture_root, mode in zip(arm_maps, (a.native, a.reference), ("native", "reference")):
+        for arm, capture_root, mode in zip(arm_maps, roots, ("native", "reference")):
             sealed = arm[window["id"]]
             response_path = capture_root / (window["id"] + ".json")
             if hashlib.sha256(response_path.read_bytes()).hexdigest() != sealed["response_sha256"]:
@@ -291,19 +336,47 @@ def compare(a):
         for i, pos in enumerate(positions):
             if window["roles"][pos] != "gen":
                 raise ValueError("paired gate must score assistant-generated rows")
-            g, n, r = normalize(logits[i]), log_probs(arms[0][pos], vocab), log_probs(arms[1][pos], vocab)
+            g, n = normalize(logits[i]), log_probs(arms[0][pos], vocab)
             argmax = int(np.argmax(g))
+            if not paired:
+                values.append([float(np.dot(np.exp(g), g - n)), float(np.argmax(n) == argmax)])
+                continue
+            r = log_probs(arms[1][pos], vocab)
             values.append([float(np.dot(np.exp(g), g - n)), float(np.dot(np.exp(g), g - r)),
                            float(np.argmax(n) == argmax), float(np.argmax(r) == argmax),
                            float(np.dot(np.exp(r), r - n)), float(np.dot(np.exp(n), n - r))])
         values = np.asarray(values)
         means = values.mean(axis=0)
+        if not paired:
+            summary = {"id": window["id"], "rows": len(values),
+                       "kind": "media" if window.get("media", []) else "control",
+                       "native_golden_kl": float(means[0]), "native_top1": float(means[1])}
+            summary["pass"] = native_metrics([summary], bar)["pass"]
+            summaries.append(summary)
+            continue
         statistics.append([float((values[:, 0] - values[:, 1]).sum()),
                            float((values[:, 3] - values[:, 2]).sum())])
         counts.append(len(values))
         summaries.append({"id": window["id"], "rows": len(values), "native_golden_kl": float(means[0]),
             "reference_golden_kl": float(means[1]), "native_top1": float(means[2]), "reference_top1": float(means[3]),
             "direct_reference_native_kl": float(means[4]), "direct_native_reference_kl": float(means[5])})
+    if not paired:
+        image_ids = {w["id"] for w in panel["windows"]
+                     if any(span["kind"] == "image" for span in w.get("media", []))}
+        groups = {"pooled": summaries,
+                  "image": [s for s in summaries if s["id"] in image_ids],
+                  "media": [s for s in summaries if s["kind"] == "media"],
+                  "control": [s for s in summaries if s["kind"] == "control"]}
+        metrics = {name: native_metrics(group, bar) for name, group in groups.items()}
+        result = {"schema": "cuteafd.media.g4.native/1", "set_sha256": panel["set_sha256"],
+                  "checkpoint": panel["checkpoint"], "golden_seal_sha256": file_hash(a.golden_seal),
+                  "path": "decode-shaped", "bar": bar, "windows": summaries, **metrics,
+                  "criterion": "native vs official golden; pooled and each nonempty media/image/control group meet expert bit-tier bar",
+                  "pass": all(m["pass"] for m in metrics.values() if m is not None),
+                  "scope": "following-text decode fidelity only; no prefill qualification or precision-default promotion"}
+        write_new(a.out, result)
+        print(json.dumps(result, indent=2))
+        return result["pass"]
     bounds = paired_bounds(statistics, counts, a.bootstrap, a.seed)
     result = {"schema": "cuteafd.media.g4/1", "criterion": CRITERION, "set_sha256": panel["set_sha256"],
               "checkpoint": panel["checkpoint"], "golden_seal_sha256": file_hash(a.golden_seal),
@@ -324,15 +397,21 @@ def main():
     capture_parser.add_argument("--mode", choices=("native", "reference"), required=True)
     capture_parser.add_argument("--features", type=Path)
     capture_parser.add_argument("--url", required=True)
-    capture_parser.add_argument("--bench-token")
+    auth = capture_parser.add_mutually_exclusive_group()
+    auth.add_argument("--bench-token")
+    auth.add_argument("--bench-token-file", type=Path)
     capture_parser.add_argument("--timeout", type=float, default=240)
     capture_parser.add_argument("--quick", action="store_true")
     seal_parser = actions.add_parser("seal")
     for flag in ("windows", "golden", "out"):
         seal_parser.add_argument("--" + flag, type=Path, required=True)
     compare_parser = actions.add_parser("compare")
-    for flag in ("windows", "golden", "golden-seal", "native", "reference", "features", "out"):
+    for flag in ("windows", "golden", "golden-seal", "native", "out"):
         compare_parser.add_argument("--" + flag, type=Path, required=True)
+    compare_parser.add_argument("--reference", type=Path, help="optional reference-feature diagnostic arm")
+    compare_parser.add_argument("--features", type=Path, help="sealed features for the reference arm")
+    compare_parser.add_argument("--expert-bpw", type=float,
+                                help="checkpoint routed-expert bpw; required for native-only fidelity gate")
     compare_parser.add_argument("--bootstrap", type=int, default=5000)
     compare_parser.add_argument("--seed", type=int, default=20260829)
     for command in (capture_parser, seal_parser, compare_parser):

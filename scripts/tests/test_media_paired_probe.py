@@ -182,8 +182,7 @@ def test_log_probs_validate_shape_and_normalize(tmp_path):
         module.normalize([0, float("nan")])
 
 
-@pytest.mark.parametrize("family", module.FAMILIES)
-def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, family):
+def compare_case(tmp_path, monkeypatch, family, control=False, native_row=(0., -5.)):
     import hashlib
     from types import SimpleNamespace
     from safetensors.numpy import save_file
@@ -196,6 +195,8 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, fam
         panel["windows"].append({"id": name, "block": "vision", "bucket": "0-2K",
                                 "tokens": [9] * 577, "roles": ["ctx"] * 65 + ["gen"] * 512,
                                 "score_from": 65, "media": [span]})
+    if control:
+        panel["windows"][1].pop("media")
     panel["set_sha256"] = set_hash(panel)
     windows = tmp_path / "windows.json"
     windows.write_bytes(canonical(panel))
@@ -217,7 +218,7 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, fam
         np.zeros((512, 2), dtype="<f4").tofile(folder / "logits.bin")
         np.asarray(window["tokens"], dtype="<i4").tofile(folder / "tokens.bin")
         meta["windows"].append({"id": window["id"], "path": window["id"], "positions": list(range(65, 577)),
-                                "vocab": 2, "media": [span]})
+                                "vocab": 2, "media": window.get("media", [])})
     (golden / "meta.json").write_bytes(canonical(meta))
     (golden / "windows.json").write_bytes(canonical(panel))
     seal = tmp_path / "golden-seal.json"
@@ -229,7 +230,7 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, fam
     features.mkdir()
     metadata = feature_metadata(span["key"], family)
     (features / (span["key"] + ".json")).write_text(json.dumps(metadata))
-    for mode, row in [("native", [0., -5.]), ("reference", [-5., 0.])]:
+    for mode, row in [("native", native_row), ("reference", [-5., 0.])]:
         root = tmp_path / mode
         root.mkdir()
         capture = {"schema": "cuteafd.media.paired.capture/1", "mode": mode, "set_sha256": panel["set_sha256"],
@@ -249,7 +250,7 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, fam
             (dump / "manifest.jsonl").write_text("\n".join(json.dumps(row) for row in manifest))
             response = {"server": capture["server"], "probe": {"engine": "mimo", "cold": True,
                 "no_speculation": True, "cached_tokens": 0, "score_path": "decode",
-                "prompt_ids": window["tokens"], "media": [span], "scored": 512,
+                "prompt_ids": window["tokens"], "media": window.get("media", []), "scored": 512,
                 "rows": [{"position": pos, "finite": True} for pos in range(65, 577)]}}
             if mode == "reference":
                 response["probe"]["provenance"] = reference_provenance(metadata, family)
@@ -262,16 +263,40 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, fam
     out = tmp_path / "g4.json"
     args = SimpleNamespace(windows=windows, golden=golden, golden_seal=seal, native=tmp_path / "native",
                            reference=tmp_path / "reference", features=features, out=out, bootstrap=100, seed=7)
+    return args, panel
+
+
+@pytest.mark.parametrize("family", module.FAMILIES)
+def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, family):
+    from fidelity_windows import canonical
+    args, panel = compare_case(tmp_path, monkeypatch, family)
     if family != "mimo_v2":
         with pytest.raises(ValueError, match="set family"):
             module.compare(args)
         args.family = family
     assert module.compare(args)
-    result = json.loads(out.read_text())
+    result = json.loads(args.out.read_text())
     assert result["kl_increase_upper95"] == pytest.approx(0)
     assert result["top1_loss_upper95"] == pytest.approx(-1)
     assert result["windows"][0]["direct_reference_native_kl"] > 4
     assert result["criterion"] == module.CRITERION
+    # Freeze the old two-arm serialized result, including its floating-point math.
+    g, n, r = (module.normalize(v) for v in ([0., 0.], [0., -5.], [-5., 0.]))
+    values = np.asarray([[float(np.dot(np.exp(g), g - n)), float(np.dot(np.exp(g), g - r)),
+                          1., 0., float(np.dot(np.exp(r), r - n)),
+                          float(np.dot(np.exp(n), n - r))]] * 512)
+    means = values.mean(axis=0)
+    stats = [float((values[:, 0] - values[:, 1]).sum()), float((values[:, 3] - values[:, 2]).sum())]
+    expected = {"schema": "cuteafd.media.g4/1", "criterion": module.CRITERION,
+        "set_sha256": panel["set_sha256"], "checkpoint": "model",
+        "golden_seal_sha256": module.file_hash(args.golden_seal), "path": "decode-shaped",
+        "windows": [{"id": name, "rows": 512, "native_golden_kl": float(means[0]),
+            "reference_golden_kl": float(means[1]), "native_top1": float(means[2]),
+            "reference_top1": float(means[3]), "direct_reference_native_kl": float(means[4]),
+            "direct_native_reference_kl": float(means[5])} for name in ["w0", "w1"]],
+        **module.paired_bounds([stats, stats], [512, 512], 100, 7), "pass": True,
+        "scope": "encoder-swap gate only; no prefill qualification or precision-default promotion"}
+    assert args.out.read_bytes() == canonical(expected) + b"\n"
     capture_path = tmp_path / "reference/capture.json"
     sealed = json.loads(capture_path.read_text())
     sealed["windows"].pop()
@@ -279,7 +304,131 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, fam
     args.out = tmp_path / "incomplete.json"
     with pytest.raises(ValueError, match="incomplete windows"):
         module.compare(args)
-    with (golden / "w0/logits.bin").open("r+b") as changed:
+    with (args.golden / "w0/logits.bin").open("r+b") as changed:
         changed.write(np.asarray([1.], dtype="<f4").tobytes())
     with pytest.raises(ValueError, match="immutable seal"):
         module.compare(args)
+
+
+@pytest.mark.parametrize("bpw,kl,top1", [(2.99, .07, .90), (3., .05, .93), (4., .05, .93), (6., .03, .95)])
+def test_native_expert_bit_tiers(bpw, kl, top1):
+    bar = module.fidelity_bar(bpw)
+    assert (bar["max_kl"], bar["min_top1"]) == (kl, top1)
+
+
+@pytest.mark.parametrize("bpw", [None, True, "4", 0, -1, float("nan"), float("inf")])
+def test_native_expert_bits_fail_closed(bpw):
+    with pytest.raises(ValueError, match="expert-bpw"):
+        module.fidelity_bar(bpw)
+
+
+def test_native_metrics_weight_rows_not_windows():
+    metrics = module.native_metrics([
+        {"rows": 1, "native_golden_kl": .08, "native_top1": 0},
+        {"rows": 9, "native_golden_kl": 0., "native_top1": 1}], module.fidelity_bar(4))
+    assert metrics["native_golden_kl"] == pytest.approx(.008)
+    assert metrics["native_top1"] == pytest.approx(.9)
+    assert not metrics["pass"]
+    assert module.native_metrics([], module.fidelity_bar(4)) is None
+
+
+@pytest.mark.parametrize("row,passed", [((0., 0.), True), ((0., -5.), False)])
+def test_native_only_official_golden_and_text_control(tmp_path, monkeypatch, row, passed):
+    from fidelity_windows import canonical
+    args, panel = compare_case(tmp_path, monkeypatch, "mimo_v2", control=True, native_row=row)
+    args.reference = args.features = None
+    args.expert_bpw = 4.
+    assert module.compare(args) is passed
+    result = json.loads(args.out.read_text())
+    assert result["schema"] == "cuteafd.media.g4.native/1"
+    assert result["pass"] is passed
+    assert result["pooled"]["rows"] == 1024
+    assert result["image"]["rows"] == result["control"]["rows"] == 512
+    assert result["image"]["pass"] is result["control"]["pass"] is passed
+    assert result["bar"]["expert_bpw"] == 4.
+    assert [w["kind"] for w in result["windows"]] == ["media", "control"]
+    assert result["pooled"]["native_top1"] == 1.
+    assert result["pooled"]["native_golden_kl"] == pytest.approx(0 if passed else 1.8135681679291724)
+    args.out = tmp_path / "rejected.json"
+    args.features = tmp_path / "features"
+    with pytest.raises(ValueError, match="supplied together"):
+        module.compare(args)
+    args.features = None
+    capture_path = args.native / "capture.json"
+    capture = json.loads(capture_path.read_text())
+    capture["quick"] = True
+    capture_path.write_bytes(canonical(capture))
+    with pytest.raises(ValueError, match="complete panel"):
+        module.compare(args)
+    capture["quick"] = False
+    capture["windows"].pop()
+    capture_path.write_bytes(canonical(capture))
+    with pytest.raises(ValueError, match="incomplete windows"):
+        module.compare(args)
+    with (args.golden / "w0/logits.bin").open("r+b") as changed:
+        changed.write(np.asarray([1.], dtype="<f4").tobytes())
+    with pytest.raises(ValueError, match="immutable seal"):
+        module.compare(args)
+
+
+def test_capture_text_control_without_media(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    window = {"id": "control", "tokens": [9, 2], "score_from": 1}
+    panel = {"family": "mimo_v2", "checkpoint": "model", "set_sha256": "a" * 64,
+             "quick_windows": ["control"], "windows": [window]}
+    monkeypatch.setattr(module, "load_panel", lambda a: panel)
+    monkeypatch.setattr(module, "read_fixture", lambda *a: pytest.fail("text control read image"))
+    monkeypatch.setattr(module, "dump_rows", lambda *a: {})
+    dump = tmp_path / "host/control"
+    dump.parent.mkdir(parents=True)
+    monkeypatch.setenv("CUTEAFD_API_KEY", "synthetic-env-token")
+    def http(url, token, body=None, timeout=240):
+        assert token == "synthetic-env-token"
+        if body is None:
+            return {"data": [{"id": "model", "capabilities": {"vision": True}}]}
+        assert body["spec"]["media"] == []
+        dump.mkdir()
+        (dump / "manifest.jsonl").write_text("")
+        return {"server": {"model": "model", "family": "mimo_v2"}, "probe": {
+            "engine": "mimo", "cold": True, "no_speculation": True, "cached_tokens": 0,
+            "score_path": "decode", "prompt_ids": [9, 2], "scored": 1,
+            "rows": [{"position": 1, "finite": True}]}}
+    monkeypatch.setattr(module, "http", http)
+    args = SimpleNamespace(out=tmp_path / "out", url="http://localhost", bench_token=None,
+        mode="native", features=None, quick=False, media_root=tmp_path,
+        host_dump=tmp_path / "host", server_dump=tmp_path / "server", timeout=10)
+    module.capture(args)
+    assert json.loads((args.out / "capture.json").read_text())["windows"][0]["id"] == "control"
+    assert "synthetic-env-token" not in (args.out / "capture.json").read_text()
+
+
+def test_bench_token_sources_are_private_and_fail_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("CUTEAFD_API_KEY", "synthetic-env-token")
+    assert module.probe_token() == "synthetic-env-token"
+    assert module.probe_token("synthetic-explicit") == "synthetic-explicit"
+    key = tmp_path / "synthetic-token"
+    with pytest.raises(ValueError, match="cannot read bench token file"):
+        module.probe_token(token_file=key)
+    key.write_text(" synthetic-file-token\n")
+    assert module.probe_token(token_file=key) == "synthetic-file-token"
+    with pytest.raises(ValueError, match="choose one"):
+        module.probe_token("synthetic-explicit", key)
+    for value in ["", "synthetic secret", "synthetic\nsecret", "synthetic\x7fsecret", "synthetic-é"]:
+        key.write_text(value)
+        with pytest.raises(ValueError) as error:
+            module.probe_token(token_file=key)
+        assert "synthetic" not in str(error.value)
+    key.write_bytes(b"\xff")
+    with pytest.raises(ValueError, match="cannot read bench token file"):
+        module.probe_token(token_file=key)
+
+
+def test_capture_cli_accepts_token_file_without_argv_secret(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["media-paired-probe.py", "capture", "--windows", "w",
+        "--media-root", "m", "--out", "o", "--host-dump", "h", "--server-dump", "s",
+        "--mode", "native", "--url", "http://localhost", "--bench-token-file", str(tmp_path / "key")])
+    seen = []
+    monkeypatch.setattr(module, "capture", seen.append)
+    module.main()
+    assert seen[0].bench_token is None
+    assert seen[0].bench_token_file == tmp_path / "key"
