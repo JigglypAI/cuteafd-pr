@@ -3229,7 +3229,26 @@ mod checkpoint_header_tests {
         for windows in [vec![Some(RING); 3], vec![Some(RING), Some(RING + 1)], vec![Some(RING), None]] {
             let mut cfg = mla_config();
             cfg.windows = windows.clone();
-            let layout = cfg.runtime_layout(GlmDraftRepresentation::Fp8Only,
+            if windows.iter().any(|&window| window != Some(RING)) {
+                let mut rings = cuteafd_loader::formats::dflash::MlaDraftCacheState::new(
+                    cfg.cache_layout(2, 262144, cuteafd_core::MlaCacheFormat::Fp8).unwrap()).unwrap();
+                rings.reset(0, 0).unwrap();
+                assert!(rings.context_rows(0, 0, 8332 - RING, RING).is_err());
+                assert_eq!(rings.frontier(0).unwrap(), (0, 0));
+                continue;
+            }
+            cfg.kind = cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark;
+            cfg.mla = cuteafd_loader::formats::mla::MlaGeometry { hidden: 6144, heads: 64,
+                q_rank: 0, kv_rank: 512, nope: 64, rope: 64, value: 128 };
+            cfg.block = 3;
+            cfg.intermediate = 24576;
+            cfg.group = 0;
+            cfg.selector_rank = 512;
+            cfg.selector_top_k = 0;
+            cfg.markov_rank = 512;
+            cfg.vocab = 204800;
+            cfg.taps = vec![1,18,36,54,71];
+            let layout = cfg.runtime_layout(GlmDraftRepresentation::Bf16Only,
                 GlmDraftCapacity::new(2, 2, cfg.block).unwrap(), 262144, 16384, 188, 2,
                 cuteafd_core::MlaCacheFormat::Fp8).unwrap();
             let mut state = MlaPagedState::new(&layout).unwrap();
