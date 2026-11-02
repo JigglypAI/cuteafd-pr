@@ -329,6 +329,12 @@ def spark_lanes(config_path, hosts):
     return [lanes[h] for h in hosts]
 
 
+def build_seed(config_path):
+    """The WIP build seed (wip.sh's seed_host): the configured WIP_BUILD_SEED,
+    defaulting to kakapo as release-common.sh does."""
+    return cards.config(config_path).get('WIP_BUILD_SEED') or 'kakapo'
+
+
 def locks_for(gpus, hosts=()):
     names = {f'gpu{g}' for g in gpus} | {HOST_LOCKS[h] for h in hosts}
     return hwlock.canonical(sorted(names))
@@ -339,12 +345,40 @@ def ssh(host, command, timeout=120, check=True):
                           check=check, text=True, capture_output=True, timeout=timeout)
 
 
+# Runs on the build seed (python3 -c, argv: root slot instance): the sealed
+# spark-expert slot's store-independent image layer list, from its META or, for
+# an older slot, from the sealed ID's layers on the seed itself (the seed's
+# store-local ID does not resolve on a Spark with another image store).
+SEED_LAYERS = r'''import json,pathlib,subprocess,sys
+root,slot,instance=sys.argv[1:4]
+home=pathlib.Path.home()
+if root=='-':
+    found=subprocess.run(['docker','inspect','-f','{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}','cuteafd-spark-expert-wip-'+instance],capture_output=True,text=True)
+    root=found.stdout.strip() if found.returncode==0 and found.stdout.strip() else str(home/'.cache/cuteafd/builds'/('wip-'+instance))
+p=pathlib.Path(root)/'slots'/slot/'spark-expert'
+try:
+    m=json.loads((p/'META.json').read_text())
+except (OSError, ValueError):
+    sys.exit(0)
+layers=m.get('base_image_layers')
+if not layers:
+    r=subprocess.run(['docker','image','inspect','-f','{{json .RootFS.Layers}}',m.get('base_image_id') or ''],capture_output=True,text=True)
+    try:
+        layers=json.loads(r.stdout) if r.returncode==0 else None
+    except ValueError:
+        layers=None
+if isinstance(layers,list) and layers: print(json.dumps(layers))
+'''
+
+
 # Runs on each Spark (python3 -c, argv: root slot role instance image port worker_names_json
-# snapshot_rel snapshot_abs): the sealed spark-expert slot, its artifacts, SparkInfer lock,
-# dev image, CDI, a free port, no leftover worker, the checkpoint, the workers' serving
-# identity and package manifests, as JSON.
+# snapshot_rel snapshot_abs seed_layers): the sealed spark-expert slot, its artifacts,
+# SparkInfer lock, dev image, CDI, a free port, no leftover worker, the checkpoint, the
+# workers' serving identity and package manifests, as JSON. SEED_LAYERS is the sealed
+# image's layer list looked up on the build seed, used when the slot predates
+# base_image_layers.
 REMOTE_CHECK = r'''import hashlib,json,os,pathlib,re,subprocess,sys
-root,slot,instance,image,port,names,snap_rel,snap_abs=sys.argv[1:9]
+root,slot,instance,image,port,names,snap_rel,snap_abs,seed_layers=sys.argv[1:10]
 home=pathlib.Path.home()
 if root=='-':
     found=subprocess.run(['docker','inspect','-f','{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}','cuteafd-spark-expert-wip-'+instance],capture_output=True,text=True)
@@ -392,7 +426,11 @@ def local_images():
 # Sparks mix Docker's classic and containerd image stores: the same image has a
 # different .Id in each (save|load), so match the sealed RootFS layer list.
 expected=m.get('base_image_layers')
-if expected is None:  # older slot: the seed's store-local ID still carries its layers where it resolves
+if expected is None and seed_layers!='-':  # older slot: the seed resolved the sealed ID's layers
+    try: value=json.loads(seed_layers)
+    except ValueError: value=None
+    expected=value if isinstance(value,list) and value else None
+if expected is None:  # no layers anywhere: the store-local ID, where it resolves at all
     expected=image_layers(m.get('base_image_id'))
 matched=None
 if expected is not None:  # the sealed name first, then any local copy with exactly those layers
@@ -433,7 +471,26 @@ print(json.dumps({'root':str(p),'seal_sha256':hashlib.sha256(meta).hexdigest(),'
 '''
 
 
-def check_spark(host, arm, state, coordinator, at_grant=True):
+def spark_seed_layers(state, coordinator):
+    """The spark-expert image's sealed layer list, looked up once per slot on the
+    build seed: older slots carry no base_image_layers, and their store-local ID
+    does not resolve on a Spark with another image store. '-' when the seed
+    cannot resolve it either; the host check then refuses an old slot."""
+    cache = state['sparks'].setdefault('seed_layers', {})
+    root = coordinator.get('wip_root') or '-'
+    key = f"{coordinator['instance']}:{coordinator['slot']}:{root}"
+    if key not in cache:
+        seed = state['sparks']['seed']
+        query = shlex.join(['python3', '-c', SEED_LAYERS, root, coordinator['slot'], coordinator['instance']])
+        try:
+            out = ssh(seed, query, timeout=120).stdout.strip()
+        except subprocess.SubprocessError:
+            out = ''
+        cache[key] = out.splitlines()[-1] if out else '-'
+    return cache[key]
+
+
+def check_spark(host, arm, state, coordinator, at_grant=True, seed_layers='-'):
     """The arm's spark-expert slot on HOST (raises ValueError with the host named).
     The worker port is checked only at grant: before enqueue the run ahead of us
     in the fair queue may legitimately hold it."""
@@ -442,7 +499,8 @@ def check_spark(host, arm, state, coordinator, at_grant=True):
     snap_rel = '-'
     names = json.dumps([worker_name(state['task'], arm, r) for r in range(len(state['sparks']['hosts']))])
     argv = ['python3', '-c', REMOTE_CHECK, root, coordinator['slot'], coordinator['instance'], '-',
-            str(state['sparks']['port']) if at_grant else '-', names, snap_rel, snap if snap_rel == '-' else '-']
+            str(state['sparks']['port']) if at_grant else '-', names, snap_rel, snap if snap_rel == '-' else '-',
+            seed_layers]
     try:
         out = ssh(host, shlex.join(argv), timeout=600).stdout
         record = json.loads(out.strip().splitlines()[-1])
@@ -458,7 +516,9 @@ def check_spark(host, arm, state, coordinator, at_grant=True):
 
 
 def check_sparks(state, arm, coordinator, at_grant=True):
-    records = {host: check_spark(host, arm, state, coordinator, at_grant) for host in state['sparks']['hosts']}
+    seed_layers = spark_seed_layers(state, coordinator)
+    records = {host: check_spark(host, arm, state, coordinator, at_grant, seed_layers)
+               for host in state['sparks']['hosts']}
     first = next(iter(records.values()))
     for host, record in records.items():
         if record['packages'] != first['packages'] or record['artifact_manifest_sha256'] != first['artifact_manifest_sha256']:
@@ -1215,6 +1275,7 @@ def build_state(args, arms):
             key, val = parse_env(setting)
             arm_worker_env[name][key] = val
         sparks = dict(hosts=hosts, lanes=lanes, port=args.expert_port,
+                      seed=build_seed(args.config),
                       peers_csv=','.join(f'{lane}:{args.expert_port}' for lane in lanes),
                       layers=parse_layers(args.expert_layers) if args.expert_layers else [],
                       env=worker_env, arm_env=arm_worker_env, args=list(args.worker_arg), budget=args.worker_budget_bytes,
