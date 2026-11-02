@@ -86,6 +86,15 @@ impl ServingFacts {
         })
     }
 
+    fn apply_budgets(self, budgets: &mut [Budget]) -> Result<(), Refusal> {
+        let host = budgets
+            .iter_mut()
+            .find(|budget| budget.id == "host")
+            .ok_or_else(|| Refusal::InvalidFact("dense serving has no host budget".into()))?;
+        host.headroom = host.headroom.max(self.host_headroom);
+        Ok(())
+    }
+
     fn allocations(self, vocab: usize) -> Result<Vec<Allocation>, Refusal> {
         let lifetime = Lifetime {
             first: Phase::Warmup,
@@ -267,11 +276,7 @@ pub fn admit(
         }
     }
     if let Some(serving) = facts.serving {
-        let host = budgets
-            .iter_mut()
-            .find(|budget| budget.id == "host")
-            .ok_or_else(|| Refusal::InvalidFact("dense serving has no host budget".into()))?;
-        host.headroom = host.headroom.max(serving.host_headroom);
+        serving.apply_budgets(&mut budgets)?;
     }
     solve(request, budgets, &facts)
 }

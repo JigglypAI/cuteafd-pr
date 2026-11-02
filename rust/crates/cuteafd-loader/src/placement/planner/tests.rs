@@ -87,21 +87,27 @@ impl Recipe for Linear {
             Variable::Prefill(vec![decisions(0).prefill]),
             Variable::Lanes(vec![1]),
         ];
-        for layer in 0..self.onboard as usize {
+        if self.onboard != 0 {
             let variable = contract.variables.len();
             contract.variables.push(Variable::Onboard {
-                layers: vec![layer],
-                destinations: vec![vec![], vec![0]],
-                mandatory: false,
+                layers: (0..self.onboard as usize).collect(),
+                destination: vec![0],
+                counts: (0..=self.onboard as usize).collect(),
             });
-            let mut component = Component::allocation(
-                allocation(&format!("expert.{layer}"), 64),
-                ByteCurve::fixed(64, maximum),
-                false,
-                maximum,
-            );
-            component.activation = Activation::choice(variable, 1);
-            contract.components.push(component);
+            for layer in 0..self.onboard as usize {
+                let mut component = Component::allocation(
+                    allocation(&format!("expert.{layer}"), 64),
+                    ByteCurve::fixed(64, maximum),
+                    false,
+                    maximum,
+                );
+                component.activation = Activation {
+                    clauses: (layer + 1..=self.onboard as usize)
+                        .map(|option| vec![Choice { variable, option }])
+                        .collect(),
+                };
+                contract.components.push(component);
+            }
         }
         Ok(contract)
     }
@@ -443,9 +449,14 @@ fn analytical_solve_prepares_once_and_matches_exact_small_domain_oracle() {
     assert_eq!(count.get(), 540);
 }
 
-#[test]
-fn shared_onboarding_balances_whole_and_tp2_units_and_charges_workspace_once() {
-    let mut contract = Contract::fixed(64, 4, 2, facts(vec![]));
+fn two_gpus(first: u64, second: u64) -> Vec<Budget> {
+    let mut peer = budget(second);
+    peer.id = "peer".into();
+    peer.locations = vec![Location::coordinator(1)];
+    vec![budget(first), peer]
+}
+fn profile_contract(maximum: u64) -> Contract {
+    let mut contract = Contract::fixed(64, maximum, 2, facts(vec![]));
     contract.variables = vec![
         Variable::Attention {
             layer: 0,
@@ -454,58 +465,68 @@ fn shared_onboarding_balances_whole_and_tp2_units_and_charges_workspace_once() {
         Variable::Prefill(vec![decisions(0).prefill]),
         Variable::Lanes(vec![1]),
     ];
-    for layer in 0..4 {
-        let variable = contract.variables.len();
-        contract.variables.push(Variable::Onboard {
-            layers: vec![layer],
-            destinations: vec![vec![], vec![0], vec![1]],
-            mandatory: false,
-        });
-        for gpu in 0..2 {
-            let mut owner = allocation(&format!("layer.{layer}"), 32);
+    contract
+}
+fn add_profile(
+    contract: &mut Contract,
+    layers: Vec<usize>,
+    destination: Vec<u8>,
+    counts: Vec<usize>,
+    bytes: &[u64],
+) -> usize {
+    assert_eq!(counts.len(), bytes.len());
+    let variable = contract.variables.len();
+    for &gpu in &destination {
+        for (option, &bytes) in bytes.iter().enumerate().filter(|(_, bytes)| **bytes != 0) {
+            let mut owner = allocation(&format!("profile.{variable}.{option}.{gpu}"), bytes);
             owner.location = Location::coordinator(gpu);
-            let mut term = Component::allocation(owner, ByteCurve::fixed(32, 4), false, 4);
-            term.activation = Activation::choice(variable, gpu as usize + 1);
-            contract.components.push(term);
+            let mut component = Component::allocation(
+                owner,
+                ByteCurve::fixed(bytes, contract.maximum_pages),
+                false,
+                contract.maximum_pages,
+            );
+            component.activation = Activation::choice(variable, option);
+            contract.components.push(component);
         }
     }
-    for gpu in 0..2 {
+    contract.variables.push(Variable::Onboard {
+        layers,
+        destination,
+        counts,
+    });
+    variable
+}
+
+#[test]
+fn shared_onboarding_balances_ordered_profiles_and_charges_workspace_once() {
+    let mut contract = profile_contract(4);
+    for (gpu, layers) in [(0, vec![0, 1, 2, 3]), (1, vec![3, 2, 1, 0])] {
+        let variable = add_profile(
+            &mut contract,
+            layers,
+            vec![gpu],
+            (0..=4).collect(),
+            &[0, 32, 64, 96, 128],
+        );
         let mut owner = allocation(&format!("workspace.{gpu}"), 16);
         owner.location = Location::coordinator(gpu);
         let mut term = Component::allocation(owner, ByteCurve::fixed(16, 4), false, 4);
         term.activation = Activation {
-            clauses: (3..7)
-                .map(|variable| {
-                    vec![Choice {
-                        variable,
-                        option: gpu as usize + 1,
-                    }]
-                })
+            clauses: (1..=4)
+                .map(|option| vec![Choice { variable, option }])
                 .collect(),
         };
         contract.components.push(term);
     }
-    let mut peer = budget(128);
-    peer.id = "peer".into();
-    peer.locations = vec![Location::coordinator(1)];
     let req = Request {
         pool: Pin::Exact(256),
         ..request()
     };
-    let result = solve(
-        req.clone(),
-        vec![budget(128), peer.clone()],
-        &Prepared(contract.clone()),
-    )
-    .unwrap();
+    let result = solve(req.clone(), two_gpus(128, 128), &Prepared(contract.clone())).unwrap();
     assert_eq!(
-        result
-            .decisions
-            .onboard_layers
-            .iter()
-            .map(Vec::len)
-            .collect::<Vec<_>>(),
-        vec![2, 2]
+        result.decisions.onboard_layers,
+        vec![vec![0, 1], vec![2, 3]]
     );
     assert_eq!(result.decisions.onboard(), 4);
     assert_eq!(
@@ -517,25 +538,13 @@ fn shared_onboarding_balances_whole_and_tp2_units_and_charges_workspace_once() {
             .count(),
         2
     );
-    let variables = contract.variables.len();
-    contract.variables.push(Variable::Onboard {
-        layers: vec![4],
-        destinations: vec![vec![0, 1]],
-        mandatory: true,
-    });
-    for gpu in 0..2 {
-        let mut owner = allocation(&format!("tp2.{gpu}"), 32);
-        owner.location = Location::coordinator(gpu);
-        let mut term = Component::allocation(owner, ByteCurve::fixed(32, 4), false, 4);
-        term.activation = Activation::choice(variables, 0);
-        contract.components.push(term);
-    }
+    add_profile(&mut contract, vec![4], vec![0, 1], vec![1], &[32]);
     let result = solve(
         Request {
             onboard: Pin::Exact(3),
             ..req
         },
-        vec![budget(128), peer],
+        two_gpus(128, 128),
         &Prepared(contract),
     )
     .unwrap();
@@ -545,6 +554,348 @@ fn shared_onboarding_balances_whole_and_tp2_units_and_charges_workspace_once() {
         .onboard_layers
         .iter()
         .all(|layers| layers.contains(&4)));
+}
+
+#[test]
+fn required_onboarding_domains_survive_target_propagation() {
+    let mut contract = profile_contract(8);
+    let variable = add_profile(&mut contract, vec![7], vec![1], vec![0, 1], &[0, 32]);
+    let mut remote = allocation("remote.experts", 300);
+    remote.location = Location {
+        device: Device::Spark(0),
+        domain: Domain::Device,
+    };
+    let mut remote = Component::allocation(remote, ByteCurve::fixed(300, 8), false, 8);
+    remote.activation = Activation::choice(variable, 0);
+    contract.components.push(remote);
+    contract.requires.push(Requires {
+        when: Choice {
+            variable: 0,
+            option: 0,
+        },
+        any_of: vec![Choice {
+            variable,
+            option: 1,
+        }],
+    });
+    let mut spark = budget(128);
+    spark.id = "spark".into();
+    spark.locations = vec![Location {
+        device: Device::Spark(0),
+        domain: Domain::Device,
+    }];
+    let mut budgets = two_gpus(128, 128);
+    budgets.push(spark);
+    let result = solve(request(), budgets, &Prepared(contract)).unwrap();
+    assert_eq!(result.pool_tokens, 8 * 64);
+    assert_eq!(result.decisions.onboard_layers, vec![vec![], vec![7]]);
+    assert!(!result
+        .facts
+        .allocations
+        .iter()
+        .any(|a| a.id == "remote.experts"));
+}
+
+#[test]
+fn below_target_onboards_on_nonbinding_device_without_spending_one_page() {
+    let mut contract = profile_contract(8);
+    let mut kv =
+        Component::allocation(allocation("kv", 64), ByteCurve::linear(64, 64, 8), false, 8);
+    kv.byte_extent(ByteCurve::linear(64, 64, 8)).unwrap();
+    contract.components.push(kv);
+    add_profile(
+        &mut contract,
+        vec![0, 1],
+        vec![0],
+        vec![0, 1, 2],
+        &[0, 1, 2],
+    );
+    add_profile(
+        &mut contract,
+        vec![2, 3],
+        vec![1],
+        vec![0, 1, 2],
+        &[0, 17, 49],
+    );
+    let budgets = two_gpus(256, 50);
+    let automatic = solve(request(), budgets.clone(), &Prepared(contract.clone())).unwrap();
+    let pinned = solve(
+        Request {
+            pool: Pin::Exact(256),
+            ..request()
+        },
+        budgets,
+        &Prepared(contract),
+    )
+    .unwrap();
+    assert_eq!(automatic.pool_tokens, 256);
+    assert_eq!(automatic.decisions.onboard_layers, vec![vec![], vec![2, 3]]);
+    assert_eq!(automatic.decisions, pinned.decisions);
+}
+
+#[test]
+fn exact_completion_prefers_two_whole_layers_over_one_tp2_layer() {
+    let mut contract = profile_contract(4);
+    add_profile(&mut contract, vec![0], vec![0, 1], vec![0, 1], &[0, 50]);
+    add_profile(&mut contract, vec![0], vec![0], vec![0, 1], &[0, 60]);
+    add_profile(&mut contract, vec![1], vec![1], vec![0, 1], &[0, 60]);
+    let result = solve(request(), two_gpus(100, 100), &Prepared(contract)).unwrap();
+    assert_eq!(result.decisions.onboard_layers, vec![vec![0], vec![1]]);
+    assert_eq!(result.decisions.onboard(), 2);
+}
+
+#[test]
+fn active_gpu_balance_is_not_masked_by_host_or_load_slack() {
+    let mut contract = profile_contract(4);
+    add_profile(
+        &mut contract,
+        vec![0, 1, 2, 3],
+        vec![0],
+        (0..=4).collect(),
+        &[0, 32, 64, 96, 128],
+    );
+    add_profile(
+        &mut contract,
+        vec![3, 2, 1, 0],
+        vec![1],
+        (0..=4).collect(),
+        &[0, 32, 64, 96, 128],
+    );
+    for gpu in 0..2 {
+        let mut load = allocation(&format!("load.{gpu}"), 128);
+        load.location = Location::coordinator(gpu);
+        load.lifetime = Lifetime {
+            first: Phase::Load,
+            last: Phase::Load,
+        };
+        contract.components.push(Component::allocation(
+            load,
+            ByteCurve::fixed(128, 4),
+            false,
+            4,
+        ));
+    }
+    let mut budgets = two_gpus(128, 128);
+    let mut host = budget(1);
+    host.id = "host".into();
+    host.locations = vec![Location::HOST, Location::PINNED];
+    budgets.push(host);
+    let first = solve(request(), budgets.clone(), &Prepared(contract.clone())).unwrap();
+    assert_eq!(first.decisions.onboard_layers, vec![vec![0, 1], vec![2, 3]]);
+    for _ in 0..3 {
+        assert_eq!(
+            solve(request(), budgets.clone(), &Prepared(contract.clone())).unwrap(),
+            first
+        );
+    }
+}
+
+#[test]
+fn capacity_shaving_keeps_resource_failure_distinct_from_pin_conflict() {
+    let mut contract = profile_contract(1);
+    contract.variables[2] = Variable::Lanes(vec![1, 2]);
+    for gpu in 0..2 {
+        let mut owner = allocation(&format!("choice.{gpu}"), 65);
+        owner.location = Location::coordinator(gpu);
+        let mut component = Component::allocation(owner, ByteCurve::fixed(65, 1), false, 1);
+        component.activation = Activation::choice(2, gpu as usize);
+        contract.components.push(component);
+    }
+    assert!(matches!(
+        solve(request(), two_gpus(64, 64), &Prepared(contract.clone())),
+        Err(Refusal::Capacity { .. })
+    ));
+    assert_eq!(
+        solve(
+            Request {
+                onboard: Pin::Exact(1),
+                ..request()
+            },
+            two_gpus(64, 64),
+            &Prepared(contract)
+        )
+        .unwrap_err(),
+        Refusal::PinConflict
+    );
+}
+
+#[test]
+fn correlated_count_profiles_match_exhaustive_full_score_oracle() {
+    let mut contract = profile_contract(6);
+    contract.variables[0] = Variable::Attention {
+        layer: 0,
+        values: vec![
+            LayerMode::Whole {
+                gpu: 0,
+                ffn: FfnMode::Owner,
+            },
+            LayerMode::Whole {
+                gpu: 1,
+                ffn: FfnMode::Owner,
+            },
+        ],
+    };
+    let left = add_profile(
+        &mut contract,
+        vec![0, 1],
+        vec![0],
+        vec![0, 1, 2],
+        &[0, 31, 79],
+    );
+    let right = add_profile(
+        &mut contract,
+        vec![1, 0],
+        vec![1],
+        vec![0, 1, 2],
+        &[0, 23, 63],
+    );
+    let tp2 = add_profile(&mut contract, vec![2], vec![0, 1], vec![0, 1], &[0, 17]);
+    contract.requires.push(Requires {
+        when: Choice {
+            variable: 0,
+            option: 1,
+        },
+        any_of: vec![
+            Choice {
+                variable: right,
+                option: 1,
+            },
+            Choice {
+                variable: right,
+                option: 2,
+            },
+        ],
+    });
+    let curve = ByteCurve(vec![
+        BytePiece {
+            first: 1,
+            last: 3,
+            bytes_at_first: 20,
+            bytes_per_page: 19,
+        },
+        BytePiece {
+            first: 4,
+            last: 6,
+            bytes_at_first: 12,
+            bytes_per_page: 13,
+        },
+    ]);
+    for gpu in 0..2 {
+        let mut owner = allocation("kv", 20);
+        owner.location = Location::coordinator(gpu);
+        let mut component = Component::allocation(owner, curve.clone(), false, 6);
+        component.byte_extent(curve.clone()).unwrap();
+        component.activation = Activation::choice(0, gpu as usize);
+        contract.components.push(component);
+    }
+    let mut joint = Component::allocation(
+        allocation("joint.scratch", 27),
+        ByteCurve::fixed(27, 6),
+        false,
+        6,
+    );
+    joint.activation = Activation {
+        clauses: vec![vec![
+            Choice {
+                variable: left,
+                option: 1,
+            },
+            Choice {
+                variable: tp2,
+                option: 1,
+            },
+        ]],
+    };
+    contract.components.push(joint);
+    for a in [40, 70, 100] {
+        for b in [35, 65, 95] {
+            for onboard in [Pin::Auto, Pin::Exact(0), Pin::Exact(2), Pin::Exact(3)] {
+                for pool in [Pin::Auto, Pin::Exact(128), Pin::Exact(384)] {
+                    let budgets = two_gpus(a, b);
+                    let req = Request {
+                        pool,
+                        onboard,
+                        ..request()
+                    };
+                    let mut oracle = None;
+                    for attention in 0..2 {
+                        for left_count in 0..3 {
+                            for right_count in 0..3 {
+                                for tp_count in 0..2 {
+                                    let assignment =
+                                        vec![attention, 0, 0, left_count, right_count, tp_count];
+                                    if contract.requires.iter().any(|r| {
+                                        assignment[r.when.variable] == r.when.option
+                                            && !r
+                                                .any_of
+                                                .iter()
+                                                .any(|c| assignment[c.variable] == c.option)
+                                    }) {
+                                        continue;
+                                    }
+                                    let Ok(decisions) = contract.decisions(&assignment) else {
+                                        continue;
+                                    };
+                                    if matches!(onboard, Pin::Exact(n) if decisions.onboard() != n)
+                                    {
+                                        continue;
+                                    }
+                                    for pages in 1..=6 {
+                                        if matches!(pool, Pin::Exact(n) if pages * 64 != n) {
+                                            continue;
+                                        }
+                                        let Ok(phases) = evaluate(
+                                            &contract.facts(&assignment, pages).unwrap(),
+                                            &budgets,
+                                        ) else {
+                                            continue;
+                                        };
+                                        let active = phases
+                                            .iter()
+                                            .filter(|p| p.phase >= Phase::Warmup)
+                                            .map(|p| p.available - p.owned - p.opaque)
+                                            .min()
+                                            .unwrap();
+                                        let global = phases
+                                            .iter()
+                                            .map(|p| p.available - p.owned - p.opaque)
+                                            .min()
+                                            .unwrap();
+                                        let score = (pages, decisions.onboard(), active, global);
+                                        if oracle.as_ref().is_none_or(
+                                            |(old, choices): &(
+                                                (u64, u64, u64, u64),
+                                                Vec<usize>,
+                                            )| {
+                                                score > *old
+                                                    || (score == *old && assignment < *choices)
+                                            },
+                                        ) {
+                                            oracle = Some((score, assignment.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let result = solve(req.clone(), budgets, &Prepared(contract.clone()));
+                    match oracle {
+                        Some((score, assignment)) => {
+                            let result =
+                                result.unwrap_or_else(|e| panic!("{a}/{b} {req:?}: {e:?}"));
+                            assert_eq!(result.pool_tokens / 64, score.0, "{a}/{b} {req:?}");
+                            assert_eq!(
+                                result.decisions,
+                                contract.decisions(&assignment).unwrap(),
+                                "{a}/{b} {req:?}"
+                            );
+                        }
+                        None => assert!(result.is_err(), "{a}/{b} {req:?}"),
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -758,14 +1109,14 @@ fn pool_first_then_onboarding_and_exact_constraints() {
 }
 
 #[test]
-fn compiled_ceiling_is_not_a_lower_automatic_onboarding_target() {
+fn compiled_ceiling_uses_spare_memory_for_onboarding() {
     let recipe = Linear {
         maximum: 256,
         onboard: 1,
         fixed: 0,
     };
     let result = solve(request(), vec![budget(4096)], &recipe).unwrap();
-    assert_eq!((result.pool_tokens, result.decisions.onboard()), (256, 0));
+    assert_eq!((result.pool_tokens, result.decisions.onboard()), (256, 1));
 }
 
 #[test]

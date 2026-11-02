@@ -51,12 +51,13 @@ pub enum Variable {
     },
     Prefill(Vec<PrefillShape>),
     Lanes(Vec<u64>),
-    /// One unit may be coupled across GPUs (TP2); its layers count only once.
-    /// An empty destination is the absent option, legal only for optional units.
+    /// One ordered count profile per destination. Count k owns layers[..k];
+    /// the order and its exact costs are family facts, not a subset search.
+    /// TP2 destinations name both GPUs but count each layer only once.
     Onboard {
         layers: Vec<usize>,
-        destinations: Vec<Vec<u8>>,
-        mandatory: bool,
+        destination: Vec<u8>,
+        counts: Vec<usize>,
     },
 }
 impl Variable {
@@ -65,27 +66,20 @@ impl Variable {
             Self::Attention { values, .. } => values.len(),
             Self::Prefill(values) => values.len(),
             Self::Lanes(values) => values.len(),
-            Self::Onboard { destinations, .. } => destinations.len(),
+            Self::Onboard { counts, .. } => counts.len(),
         }
     }
     pub(super) fn onboard(&self, option: usize) -> u64 {
         match self {
-            Self::Onboard {
-                layers,
-                destinations,
-                ..
-            } if !destinations[option].is_empty() => layers.len() as u64,
+            Self::Onboard { counts, .. } => counts[option] as u64,
             _ => 0,
         }
     }
-    pub(super) fn optional_onboard(&self) -> bool {
-        matches!(
-            self,
-            Self::Onboard {
-                mandatory: false,
-                ..
-            }
-        )
+    pub(super) fn onboard_layers(&self, option: usize) -> &[usize] {
+        match self {
+            Self::Onboard { layers, counts, .. } => &layers[..counts[option]],
+            _ => &[],
+        }
     }
 }
 
@@ -343,6 +337,7 @@ impl Contract {
         let mut prefill = None;
         let mut lanes = None;
         let mut onboard_layers = vec![vec![]; self.gpus];
+        let mut homes = BTreeSet::new();
         for (variable, &option) in self.variables.iter().zip(selected) {
             match variable {
                 Variable::Attention { layer, values } => {
@@ -354,12 +349,12 @@ impl Contract {
                 Variable::Lanes(values) => {
                     lanes = Some(values[option]);
                 }
-                Variable::Onboard {
-                    layers,
-                    destinations,
-                    ..
-                } => {
-                    for &gpu in &destinations[option] {
+                Variable::Onboard { destination, .. } => {
+                    let layers = variable.onboard_layers(option);
+                    if layers.iter().any(|&layer| !homes.insert(layer)) {
+                        return Err(Refusal::PinConflict);
+                    }
+                    for &gpu in destination {
                         onboard_layers[gpu as usize].extend(layers);
                     }
                 }
@@ -392,7 +387,6 @@ impl Contract {
             ));
         }
         let mut attention = BTreeSet::new();
-        let mut onboard = BTreeSet::new();
         let (mut prefill, mut lanes) = (0, 0);
         for variable in &self.variables {
             if variable.len() == 0 {
@@ -423,18 +417,18 @@ impl Contract {
                 }
                 Variable::Onboard {
                     layers,
-                    destinations,
-                    mandatory,
+                    destination,
+                    counts,
                 } => {
                     if layers.is_empty()
-                        || layers.iter().any(|l| !onboard.insert(*l))
-                        || destinations.iter().any(|gpus| {
-                            (*mandatory && gpus.is_empty())
-                                || gpus.iter().any(|&g| usize::from(g) >= self.gpus)
-                                || gpus.iter().collect::<BTreeSet<_>>().len() != gpus.len()
-                        })
+                        || layers.iter().collect::<BTreeSet<_>>().len() != layers.len()
+                        || destination.is_empty()
+                        || destination.iter().any(|&g| usize::from(g) >= self.gpus)
+                        || destination.iter().collect::<BTreeSet<_>>().len() != destination.len()
+                        || counts.iter().any(|&k| k > layers.len())
+                        || counts.windows(2).any(|pair| pair[0] >= pair[1])
                     {
-                        return Err(Refusal::InvalidFact("invalid onboard unit".into()));
+                        return Err(Refusal::InvalidFact("invalid onboard count profile".into()));
                     }
                 }
             }

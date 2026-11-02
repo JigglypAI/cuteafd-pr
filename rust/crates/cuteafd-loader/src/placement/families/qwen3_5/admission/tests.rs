@@ -114,6 +114,11 @@ fn dense_curves_match_independent_exact_inventory_and_monotone_page_neighbors() 
                     };
                     budget.headroom = 0;
                 }
+                recipe
+                    .serving
+                    .unwrap()
+                    .apply_budgets(&mut generous)
+                    .unwrap();
                 for pages in pages {
                     let actual = contract.facts(&selected, pages).unwrap();
                     let expected = recipe.owner_templates(pages * PAGE_ROWS).unwrap();

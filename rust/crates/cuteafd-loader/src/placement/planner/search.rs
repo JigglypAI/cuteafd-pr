@@ -189,6 +189,81 @@ impl Compiled {
         }
         Ok(answer)
     }
+    /// Independent intercept/slope minima underprice every surviving assignment.
+    /// Their closed-form limit is therefore a true upper bound, even when the
+    /// cheapest intercept and slope come from different options.
+    fn upper_bound(
+        &self,
+        budgets: &[Budget],
+        domains: &[Vec<usize>],
+        lower: u64,
+        upper: u64,
+    ) -> Result<Option<u64>, Refusal> {
+        let mut answer = None;
+        for piece in 0..self.starts.len() - 1 {
+            let first = self.starts[piece].max(lower);
+            let mut last = (self.starts[piece + 1] - 1).min(upper);
+            if first > last {
+                continue;
+            }
+            let mut result = vec![Cost::default(); self.rows];
+            let mut local = BTreeMap::<usize, Vec<Vec<Cost>>>::new();
+            for group in &self.groups {
+                if group.activation.guaranteed(domains) {
+                    for (sum, &cost) in result.iter_mut().zip(&group.costs[piece]) {
+                        sum.add(cost.at(first - self.starts[piece])?)?;
+                    }
+                } else if let Some(variable) = group.activation.local_variable() {
+                    let values = local.entry(variable).or_insert_with(|| {
+                        vec![vec![Cost::default(); self.rows]; domains[variable].len()]
+                    });
+                    for (&option, costs) in domains[variable].iter().zip(values) {
+                        if group
+                            .activation
+                            .clauses
+                            .iter()
+                            .any(|c| c[0].option == option)
+                        {
+                            for (sum, &cost) in costs.iter_mut().zip(&group.costs[piece]) {
+                                sum.add(cost.at(first - self.starts[piece])?)?;
+                            }
+                        }
+                    }
+                }
+            }
+            for values in local.into_values() {
+                for (row, sum) in result.iter_mut().enumerate() {
+                    let mut bytes = u64::MAX;
+                    let mut slope = u64::MAX;
+                    for option in &values {
+                        bytes = bytes.min(option[row].required()?);
+                        slope = slope.min(option[row].slope()?);
+                    }
+                    sum.add(Cost {
+                        owned: bytes,
+                        owned_slope: slope,
+                        ..Cost::default()
+                    })?;
+                }
+            }
+            for (row, cost) in result.into_iter().enumerate() {
+                let available = budgets[row / PHASES.len()].available()?;
+                let required = cost.required()?;
+                if required > available {
+                    last = 0;
+                    break;
+                }
+                let slope = cost.slope()?;
+                if slope != 0 {
+                    last = last.min(first.saturating_add((available - required) / slope));
+                }
+            }
+            if first <= last {
+                answer = Some(last);
+            }
+        }
+        Ok(answer)
+    }
     fn group_minimum(&self, group: &Group, lower: u64, upper: u64) -> Result<Vec<u64>, Refusal> {
         let mut result = vec![u64::MAX; self.rows];
         for piece in 0..self.starts.len() - 1 {
@@ -292,6 +367,32 @@ fn logical(contract: &Contract, domains: &mut [Vec<usize>], exact: Option<u64>) 
         if domains.iter().any(Vec::is_empty) {
             return false;
         }
+        // Different destination profiles may describe the same routed layers;
+        // only their selected prefixes must be disjoint. Retain an option only
+        // when every other profile still has a non-overlapping support.
+        for variable in 0..domains.len() {
+            let retained: Vec<_> = domains[variable]
+                .iter()
+                .copied()
+                .filter(|&option| {
+                    let layers = contract.variables[variable].onboard_layers(option);
+                    layers.is_empty()
+                        || domains.iter().enumerate().all(|(other, domain)| {
+                            variable == other
+                                || domain.iter().any(|&candidate| {
+                                    contract.variables[other]
+                                        .onboard_layers(candidate)
+                                        .iter()
+                                        .all(|layer| !layers.contains(layer))
+                                })
+                        })
+                })
+                .collect();
+            domains[variable] = retained;
+        }
+        if domains.iter().any(Vec::is_empty) {
+            return false;
+        }
         if let Some(exact) = exact {
             let ranges: Vec<_> = contract
                 .variables
@@ -340,49 +441,29 @@ fn propagate(
         let before = domains.to_vec();
         for variable in 0..domains.len() {
             let mut retained = Vec::new();
+            let mut capacity_failure = None;
             for &option in &domains[variable] {
                 let mut forced = domains.to_vec();
                 forced[variable] = vec![option];
                 if logical(contract, &mut forced, exact) {
                     match capacity(&costs.lower_bound(&forced, lower, upper)?, budgets) {
                         Ok(()) => retained.push(option),
-                        Err(Refusal::Capacity { .. }) => {}
+                        Err(error @ Refusal::Capacity { .. }) => {
+                            capacity_failure.get_or_insert(error);
+                        }
                         Err(error) => return Err(error),
                     }
                 }
             }
             domains[variable] = retained;
             if domains[variable].is_empty() {
-                return Err(Refusal::PinConflict);
+                return Err(capacity_failure.unwrap_or(Refusal::PinConflict));
             }
         }
         if before == domains {
             return Ok(());
         }
     }
-}
-fn enumerate(
-    contract: &Contract,
-    domains: &[Vec<usize>],
-    index: usize,
-    selected: &mut Vec<usize>,
-    visit: &mut impl FnMut(&[usize]) -> Result<(), Refusal>,
-) -> Result<(), Refusal> {
-    if index == domains.len() {
-        if contract.requires.iter().all(|r| {
-            selected[r.when.variable] != r.when.option
-                || r.any_of.iter().any(|c| selected[c.variable] == c.option)
-        }) {
-            visit(selected)?;
-        }
-        return Ok(());
-    }
-    for &option in &domains[index] {
-        selected.push(option);
-        enumerate(contract, domains, index + 1, selected, visit)?;
-        selected.pop();
-    }
-    Ok(())
 }
 fn remaining(phases: &[PhaseBudget]) -> u64 {
     phases
@@ -392,51 +473,203 @@ fn remaining(phases: &[PhaseBudget]) -> u64 {
         .unwrap_or(0)
 }
 
-/// The one optional-onboarding pass: fit whole units without spending the pool,
-/// maximizing admitted unique layers per step, then the tightest-device slack.
-fn onboard(
-    contract: &Contract,
-    costs: &Compiled,
-    budgets: &[Budget],
-    domains: &[Vec<usize>],
-    selected: &mut Vec<usize>,
-    pages: u64,
-) -> Result<(), Refusal> {
-    loop {
-        let mut best: Option<(u64, u64, Vec<usize>)> = None;
-        for (variable, definition) in contract.variables.iter().enumerate() {
-            if !definition.optional_onboard() || definition.onboard(selected[variable]) != 0 {
-                continue;
+fn coordinator_slack(phases: &[PhaseBudget], budgets: &[Budget]) -> u64 {
+    phases
+        .iter()
+        .enumerate()
+        .filter(|(row, phase)| {
+            phase.phase >= Phase::Warmup
+                && budgets[row / PHASES.len()]
+                    .locations
+                    .iter()
+                    .any(|l| matches!(l.device, Device::Coordinator(_)))
+        })
+        .map(|(_, p)| p.available - p.owned - p.opaque)
+        .min()
+        .unwrap_or(0)
+}
+
+fn branch(contract: &Contract, domains: &[Vec<usize>]) -> Option<usize> {
+    // Executor choices precede the small destination-count tuple. No ordinary
+    // optional layer becomes an independent binary decision.
+    (0..domains.len())
+        .filter(|&i| domains[i].len() > 1)
+        .min_by_key(|&i| {
+            (
+                matches!(contract.variables[i], Variable::Onboard { .. }),
+                domains[i].len(),
+                i,
+            )
+        })
+}
+fn selected(domains: &[Vec<usize>]) -> Vec<usize> {
+    domains.iter().map(|d| d[0]).collect()
+}
+fn infeasible(error: &Refusal) -> bool {
+    matches!(error, Refusal::Capacity { .. } | Refusal::PinConflict)
+}
+
+struct Search<'a> {
+    contract: &'a Contract,
+    costs: &'a Compiled,
+    budgets: &'a [Budget],
+    exact: Option<u64>,
+    assignments: u64,
+    last: Refusal,
+}
+impl Search<'_> {
+    fn restrict(
+        &mut self,
+        domains: &mut [Vec<usize>],
+        lower: u64,
+        upper: u64,
+    ) -> Result<bool, Refusal> {
+        match propagate(
+            self.contract,
+            self.costs,
+            self.budgets,
+            domains,
+            lower,
+            upper,
+            self.exact,
+        ) {
+            Ok(()) => Ok(true),
+            Err(error) if infeasible(&error) => {
+                // Never replace an observed capacity cause with a later logical
+                // dead end; all-auto resource failures must remain Capacity.
+                if matches!(error, Refusal::Capacity { .. })
+                    || !matches!(self.last, Refusal::Capacity { .. })
+                {
+                    self.last = error;
+                }
+                Ok(false)
             }
-            for &option in &domains[variable] {
-                if definition.onboard(option) == 0 {
-                    continue;
-                }
-                let mut trial = selected.clone();
-                trial[variable] = option;
-                let singleton: Vec<_> = trial.iter().map(|&o| vec![o]).collect();
-                if !compatible(contract, &singleton) {
-                    continue;
-                }
-                let phases = costs.phases(budgets, &trial, pages)?;
-                if phases.iter().any(|p| {
-                    p.owned
-                        .checked_add(p.opaque)
-                        .is_none_or(|n| n > p.available)
-                }) {
-                    continue;
-                }
-                let layers = contract.decisions(&trial)?.onboard();
-                let slack = remaining(&phases);
-                if best.as_ref().is_none_or(|b| (layers, slack) > (b.0, b.1)) {
-                    best = Some((layers, slack, trial));
-                }
+            Err(error) => Err(error),
+        }
+    }
+    fn count_assignment(&mut self) -> Result<(), Refusal> {
+        self.assignments = self
+            .assignments
+            .checked_add(1)
+            .ok_or(Refusal::Overflow("assignment count"))?;
+        Ok(())
+    }
+    fn feasible(&mut self, mut domains: Vec<Vec<usize>>, pages: u64) -> Result<bool, Refusal> {
+        if !self.restrict(&mut domains, pages, pages)? {
+            return Ok(false);
+        }
+        let Some(variable) = branch(self.contract, &domains) else {
+            self.count_assignment()?;
+            return Ok(true);
+        };
+        for option in domains[variable].clone() {
+            let mut child = domains.clone();
+            child[variable] = vec![option];
+            if self.feasible(child, pages)? {
+                return Ok(true);
             }
         }
-        let Some((_, _, chosen)) = best else {
+        Ok(false)
+    }
+    fn maximum(
+        &mut self,
+        mut domains: Vec<Vec<usize>>,
+        lower: u64,
+        upper: u64,
+        best: &mut Option<u64>,
+    ) -> Result<(), Refusal> {
+        if best.is_some_and(|p| p >= upper) || !self.restrict(&mut domains, lower, upper)? {
+            return Ok(());
+        }
+        let Some(bound) = self
+            .costs
+            .upper_bound(self.budgets, &domains, lower, upper)?
+        else {
             return Ok(());
         };
-        *selected = chosen;
+        if best.is_some_and(|p| p >= bound) {
+            return Ok(());
+        }
+        // Bind the analytical upper bound first. If correlations make it
+        // unattainable, refine finite assignments, never decrement pool pages.
+        if self.feasible(domains.clone(), bound)? {
+            *best = Some(bound);
+            return Ok(());
+        }
+        let Some(variable) = branch(self.contract, &domains) else {
+            let assignment = selected(&domains);
+            if let Some(pages) = self.costs.limit(self.budgets, &assignment, lower, bound)? {
+                if best.is_none_or(|old| pages > old) {
+                    *best = Some(pages);
+                }
+            }
+            return Ok(());
+        };
+        for option in domains[variable].clone() {
+            let mut child = domains.clone();
+            child[variable] = vec![option];
+            self.maximum(child, lower, bound, best)?;
+        }
+        Ok(())
+    }
+    fn complete(
+        &mut self,
+        mut domains: Vec<Vec<usize>>,
+        pages: u64,
+        best: &mut Option<((u64, u64, u64), Vec<usize>)>,
+    ) -> Result<(), Refusal> {
+        if !self.restrict(&mut domains, pages, pages)? {
+            return Ok(());
+        }
+        let maximum: u64 = self
+            .contract
+            .variables
+            .iter()
+            .zip(&domains)
+            .map(|(v, d)| d.iter().map(|&o| v.onboard(o)).max().unwrap())
+            .sum();
+        if best.as_ref().is_some_and(|(score, _)| maximum < score.0) {
+            return Ok(());
+        }
+        if let Some(variable) = branch(self.contract, &domains) {
+            // High counts find a useful incumbent early; canonical final ties
+            // are explicit and independent of this exploration order.
+            let mut options = domains[variable].clone();
+            options.sort_by_key(|&o| {
+                (
+                    std::cmp::Reverse(self.contract.variables[variable].onboard(o)),
+                    o,
+                )
+            });
+            for option in options {
+                let mut child = domains.clone();
+                child[variable] = vec![option];
+                self.complete(child, pages, best)?;
+            }
+            return Ok(());
+        }
+        self.count_assignment()?;
+        let assignment = selected(&domains);
+        let layers = self
+            .contract
+            .variables
+            .iter()
+            .zip(&assignment)
+            .map(|(v, &o)| v.onboard(o))
+            .sum();
+        let phases = self.costs.phases(self.budgets, &assignment, pages)?;
+        let score = (
+            layers,
+            coordinator_slack(&phases, self.budgets),
+            remaining(&phases),
+        );
+        if best
+            .as_ref()
+            .is_none_or(|(old, choices)| score > *old || (score == *old && assignment < *choices))
+        {
+            *best = Some((score, assignment));
+        }
+        Ok(())
     }
 }
 
@@ -495,11 +728,6 @@ pub fn solve(
     if wanted < minimum || wanted > contract.maximum_pages {
         return Err(Refusal::InvalidPin("pool exceeds compiled extent"));
     }
-    let lower = if matches!(request.pool, Pin::Exact(_)) {
-        wanted
-    } else {
-        minimum
-    };
     let exact = match request.onboard {
         Pin::Auto => None,
         Pin::Exact(n) => Some(n),
@@ -517,82 +745,35 @@ pub fn solve(
     if domains.iter().any(Vec::is_empty) {
         return Err(Refusal::PinConflict);
     }
-    let costs = Compiled::new(&contract, &budgets)?;
-    propagate(
-        &contract,
-        &costs,
-        &budgets,
-        &mut domains,
-        lower,
-        wanted,
-        exact,
-    )?;
-    let mut base = domains.clone();
-    if exact.is_none() {
-        for (variable, domain) in contract.variables.iter().zip(&mut base) {
-            if variable.optional_onboard() && domain.iter().any(|&o| variable.onboard(o) == 0) {
-                domain.retain(|&o| variable.onboard(o) == 0);
-            }
-        }
+    // Logical pins do not depend on the pool. Target-specific capacity pruning
+    // must not escape into the automatic below-target search.
+    if !logical(&contract, &mut domains, exact) {
+        return Err(Refusal::PinConflict);
     }
-    let mut best: Option<(u64, u64, u64, Vec<usize>)> = None;
-    let mut assignments = 0u64;
-    let mut last = Refusal::Unsupported;
-    enumerate(&contract, &base, 0, &mut Vec::new(), &mut |selected| {
-        if let Some(exact) = exact {
-            if contract
-                .variables
-                .iter()
-                .zip(selected)
-                .map(|(v, &o)| v.onboard(o))
-                .sum::<u64>()
-                != exact
-            {
-                return Ok(());
-            }
-        }
-        assignments = assignments
-            .checked_add(1)
-            .ok_or(Refusal::Overflow("assignment count"))?;
-        let Some(pages) = costs.limit(&budgets, selected, lower, wanted)? else {
-            let rows = costs.phases(&budgets, selected, lower)?;
-            let totals: Vec<_> = rows
-                .iter()
-                .map(|r| {
-                    r.owned
-                        .checked_add(r.opaque)
-                        .ok_or(Refusal::Overflow("refused cost"))
-                })
-                .collect::<Result<_, _>>()?;
-            last = capacity(&totals, &budgets)
-                .err()
-                .unwrap_or(Refusal::Unsupported);
-            return Ok(());
-        };
-        let mut selected = selected.to_vec();
-        let onboarding_target = if matches!(request.pool, Pin::Exact(_)) {
-            wanted
-        } else {
-            target
-        };
-        if exact.is_none() && pages >= onboarding_target {
-            onboard(&contract, &costs, &budgets, &domains, &mut selected, pages)?;
-        }
-        let decisions = contract.decisions(&selected)?;
-        let slack = remaining(&costs.phases(&budgets, &selected, pages)?);
-        let score = (pages, decisions.onboard(), slack);
-        if best
-            .as_ref()
-            .is_none_or(|old| score > (old.0, old.1, old.2))
-        {
-            best = Some((score.0, score.1, score.2, selected));
-        }
-        Ok(())
-    })?;
-    tracing::trace!(target: "cuteafd::planner", surviving_assignments = assignments,
+    let costs = Compiled::new(&contract, &budgets)?;
+    let mut search = Search {
+        contract: &contract,
+        costs: &costs,
+        budgets: &budgets,
+        exact,
+        assignments: 0,
+        last: Refusal::Unsupported,
+    };
+    let pages = if search.feasible(domains.clone(), wanted)? {
+        wanted
+    } else if matches!(request.pool, Pin::Exact(_)) || minimum == wanted {
+        return Err(search.last);
+    } else {
+        let mut maximum = None;
+        search.maximum(domains.clone(), minimum, wanted - 1, &mut maximum)?;
+        maximum.ok_or_else(|| search.last.clone())?
+    };
+    let mut best = None;
+    search.complete(domains, pages, &mut best)?;
+    tracing::trace!(target: "cuteafd::planner", surviving_assignments = search.assignments,
         components = contract.components.len(), preparation_search_us = started.elapsed().as_micros() as u64,
         "priced propagated contract assignments");
-    let (pages, _, _, selected) = best.ok_or(last)?;
+    let (_, selected) = best.ok_or(search.last)?;
     let decisions = contract.decisions(&selected)?;
     let facts = contract.facts(&selected, pages)?;
     let phases = evaluate(&facts, &budgets)?;
