@@ -121,8 +121,9 @@ def write_manifest(output, manifest, artifacts):
     role, family = manifest["role"], manifest["family"]
     if not manifest["experimental"]:
         alias = {"rtx_tp2": "v41_tp2_expert_variants.h",
-                 "rtx_backbone": "v41_local_expert_variants.h"}.get(role)
-        if role.startswith(("spark_tp", "spark_w")):
+                 "rtx_backbone": "v41_local_expert_variants.h",
+                 "dspark_tp2": "v41_dspark_tp2_expert_variants.h"}.get(role)
+        if family != "v41" or role.startswith(("spark_tp", "spark_w")):
             alias = f"{family}_{role}_expert_variants.h"
         if alias is not None:
             (output / alias).write_bytes((output / "v41_expert_variants.h").read_bytes())
