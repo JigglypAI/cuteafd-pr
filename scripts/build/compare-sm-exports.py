@@ -57,6 +57,36 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def dense_geometry_jobs():
+    # Read literal geometry requests without importing CUDA or the exporter.
+    path = ROOT / "python/tools/aot/export_b12x_exlr8_dense_aot.py"
+    wanted = {"NATIVE_TRELLIS_GEOMETRIES", "NATIVE_MXFP8_GEOMETRIES", "TRELLIS_SHAPES", "SCALED_SHAPES"}
+    shapes = {node.targets[0].id: ast.literal_eval(node.value)
+              for node in ast.parse(path.read_text()).body
+              if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+              and node.targets[0].id in wanted}
+    trellis = sorted(set(shapes["NATIVE_TRELLIS_GEOMETRIES"])
+                     - {shape[1:] for shape in shapes["TRELLIS_SHAPES"]})
+    scaled = sorted(set(shapes["NATIVE_MXFP8_GEOMETRIES"])
+                    - {(k, n, side) for _, k, n, encoding, side in shapes["SCALED_SHAPES"]
+                       if encoding == "mxfp8"})
+    cores = [f"trellis_k{k}_n{n}_s{s}{dtype}" for k, n, s in trellis for dtype in ("", "_bf16")]
+    scaled = [f"mxfp8_k{k}_n{n}_s{s}" for k, n, s in scaled]
+    glue = [f"trellis_input_k{k}_{dtype}"
+            for k in sorted({k for k, _, _ in trellis} - {shape[1] for shape in shapes["TRELLIS_SHAPES"]})
+            for dtype in ("f16", "bf16")]
+    glue += [f"trellis_output_n{n}"
+             for n in sorted({n for _, n, _ in trellis} - {shape[2] for shape in shapes["TRELLIS_SHAPES"]})]
+    glue += ["fp8_row_k4096_n154880_s1", "fp8_row_embedding_k4096_n154880",
+             "f32_narrow_pack_n1536_p2048", "f32_narrow_pack_n512_p2048",
+             "bf16_projection_k4096_n32", "bf16_projection_k4096_n288"]
+    return [(f"exlr8-dense-geometry-{label}", "export_b12x_dsv4_aot.py",
+             ["--geometry", "exlr8_dense", "--only", ",".join(names),
+              "--dense-trellis-families", "glm,glmf"])
+            for label, names in (("trellis", cores),
+                                 ("mxfp8", scaled), ("glue", glue))]
+
+
 def jobs(scope):
     result = []
     # Small-row top-k deliberately exercises the fused persistent route, which
@@ -242,14 +272,6 @@ def jobs(scope):
          ["--geometry", "exlr8_dense", "--only", "int4_q_b_tp2,int4_o_tp2"]),
         ("exlr8-dense-fp8-row", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only", "fp8_row_lm_head,fp8_row_embedding"]),
-        ("exlr8-dense-unpack", "export_b12x_dsv4_aot.py",
-         ["--geometry", "exlr8_dense", "--only", ",".join(
-             f"unpack_{name}{tp}" for tp in ("", "_tp2")
-             for name in ("q_b", "o", "gate_up", "down"))]),
-        ("exlr8-dense-prefill", "export_b12x_dsv4_aot.py",
-         ["--geometry", "exlr8_dense", "--only", ",".join(
-             f"prefill_{name}{tp}" for tp in ("", "_tp2")
-             for name in ("q_b", "o", "gate_up", "down"))]),
         ("exlr8-dense-transforms", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only", ",".join(
              [f"trellis_input_k{k}_{dt}" for k in (2048, 6144, 8192, 12288, 16384)
@@ -270,6 +292,13 @@ def jobs(scope):
         ("vision-d128-attention", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "attention", "--head-dim", "128"]),
         ("audio-pcm", "export_b12x_audio_aot.py", ["--capability", "120", "--group", "pcm"]),
     ])
+    for name, _, args in result:
+        if name.startswith("exlr8-dense-"):
+            args.extend(["--dense-trellis-families", "glm"])
+    result.extend(dense_geometry_jobs())
+    result.extend((f"exlr8-dense-scope-{family}", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "exlr8_dense", "--dense-trellis-families", family])
+                  for family in ("glm", "glmf"))
     return result
 
 

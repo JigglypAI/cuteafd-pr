@@ -847,6 +847,16 @@ def context_split_programs(g, decode_rows: int, max_context: int):
     return out
 
 
+def dense_family_scopes(families, exlr8_family):
+    requested = set((families if families is not None else "kimik3").split(","))
+    if not requested or requested - {"kimik3", "glm", "glmf", "step5"}:
+        raise ValueError("--dense-trellis-families takes kimik3, glm, glmf and/or step5")
+    k6 = tuple(name for name in ("kimik3", "glm", "glmf", "step5") if name in requested)
+    native = tuple(name for name in k6 if name in ("glm", "glmf")) \
+        if families is not None else (exlr8_family,)
+    return k6, native
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -863,8 +873,9 @@ def main() -> None:
                              "glm_stage/glm2_stage (full/TP2 GLM primitive boundaries), "
                              "glmf_stage/glmf2_stage (full/TP2 GLM Flash primitive boundaries), "
                              "dense_trellis_k6 (native K6 core projections)")
-    parser.add_argument("--dense-trellis-families", default="kimik3",
-                        help="architecture tables for dense_trellis_k6: kimik3,glm,glmf,step5 (no checkpoint reads)")
+    parser.add_argument("--dense-trellis-families",
+                        help="architecture tables for dense_trellis_k6 and exlr8_dense: kimik3,glm,glmf,step5 "
+                             "(defaults: K6 kimik3; EXLR8 --exlr8-family; no checkpoint reads)")
     parser.add_argument("--exlr8-role", choices=("all", "coordinator", "spark"), default="all",
                         help="with exlr8: coordinator = shared-expert K1/grouping and rotated glue (beside the "
                              "family programs), spark = routed K1 serving and grouping, all = every program")
@@ -894,10 +905,10 @@ def main() -> None:
     )
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
-    requested_dense = set(args.dense_trellis_families.split(","))
-    if not requested_dense or requested_dense - {"kimik3", "glm", "glmf", "step5"}:
-        raise SystemExit("--dense-trellis-families takes kimik3, glm, glmf and/or step5")
-    dense_families = tuple(name for name in ("kimik3", "glm", "glmf", "step5") if name in requested_dense)
+    try:
+        dense_families, native_families = dense_family_scopes(args.dense_trellis_families, args.exlr8_family)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
                                           "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
@@ -960,8 +971,10 @@ def main() -> None:
             continue
         if name == "exlr8_dense":
             from export_b12x_exlr8_dense_aot import programs as dense_programs
-            manifest["families"][name] = {"abi_version": 1}
-            work += [(name, *item) for item in dense_programs()]
+            if not native_families:
+                raise SystemExit("exlr8_dense requires glm and/or glmf in --dense-trellis-families")
+            manifest["families"][name] = {"abi_version": 1, "architectures": native_families}
+            work += [(name, *item) for item in dense_programs(families=native_families)]
             continue
         if name == "exlr8":
             continue  # appended after every other family, below

@@ -743,9 +743,7 @@ def test_native_trellis_first_arithmetic_routes():
     ("trellis_linear.py", {"compile_trellis_linear_aot"}),
     ("scaled_linear.py", {"compile_scaled_linear_aot"}),
     ("trellis_transform.py", {"compile_trellis_input_aot", "compile_trellis_output_aot"}),
-    ("trellis_unpack.py", {"compile_trellis_unpack_e4m3_aot"}),
-    ("native_dense.py", {"compile_swiglu_split_aot", "compile_f32_narrow_pack_aot",
-                         "compile_trellis_fp8_prefill_aot"}),
+    ("native_dense.py", {"compile_swiglu_split_aot", "compile_f32_narrow_pack_aot"}),
     ("dense_mxfp8.py", {"compile_dense_mxfp8_quant_aot", "compile_dense_mxfp8_aot"}),
     ("pointwise.py", {"compile_bf16_projection_aot"}),
 ])
