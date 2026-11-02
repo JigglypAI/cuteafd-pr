@@ -439,6 +439,15 @@ impl<'a> Exl3Worker<'a> {
         Ok(())
     }
 
+    fn validate_output_capacity(bytes: usize, host_bytes: usize, destination_bytes: Option<usize>) -> Result<()> {
+        match destination_bytes {
+            // Mapped entrypoints reserve the response header before exposing this payload.
+            Some(capacity) => ensure!(capacity >= bytes, "EXL3 mapped response payload is too small"),
+            None => ensure!(host_bytes >= bytes, "EXL3 host exchange is too small"),
+        }
+        Ok(())
+    }
+
     fn execute(
         &mut self,
         request: &BackboneRequest<'_>,
@@ -458,10 +467,7 @@ impl<'a> Exl3Worker<'a> {
         );
         request.require_input_dtype(ExpertV2Dtype::Fp8E4m3Ue8m0K32 as u32)?;
         let bytes = request.plane_bytes()?;
-        ensure!(
-            exchange.partials.len() >= bytes,
-            "EXL3 host exchange is too small"
-        );
+        Self::validate_output_capacity(bytes, exchange.partials.len(), destination.map(|output| output.bytes))?;
         let started = self.timing.as_ref().map(|_| std::time::Instant::now());
         let slot = self.pending.next_slot()?;
         let routes = request.rows() as usize * Self::topk();
