@@ -101,6 +101,17 @@ static const char *mla_programs[] = {
  * a GLM ownership fixture explicitly enables this extension before querying it. */
 static int glm_target_programs;
 void fixture_configure_glm_target_programs(void) { glm_target_programs = 1; }
+/* Real peer construction probes this ABI; no peer work runs in the ownership fixture. */
+int cuteafd_peer_abort_initialize(void) { return glm_target_programs ? 0 : 1; }
+int cuteafd_peer_wait_abortable(const uint32_t *flag, uint32_t *state,
+        const uint32_t *aborted, void *stream) {
+    (void)flag; (void)state; (void)aborted; (void)stream;
+    return 1;
+}
+int cuteafd_peer_abort_publish(uint32_t *aborted, void *stream) {
+    (void)aborted; (void)stream;
+    return 1;
+}
 static const char *glm_target_bases[] = {
     "glm_index_producer", "glm2_producer", "glm2_sparse_mla_decode", "glm2_o",
     "glm2_ffn_i1024", "glm2_ffn_i6144", "glm_index_topk_decode",

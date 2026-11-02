@@ -47,7 +47,7 @@ fn facts(target: &TargetBuffers, pages: u64) -> Facts {
         },
     );
     contract.variables = vec![
-        Variable::Prefill(vec![PrefillShape { rows: 64, waves: 3 }]),
+        Variable::Prefill(vec![target.prefill.as_ref().unwrap().0]),
         Variable::Lanes(vec![1]),
     ];
     contract.components = target.components(&cfg()).unwrap();
