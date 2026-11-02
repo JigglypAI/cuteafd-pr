@@ -1242,7 +1242,7 @@ impl Opened {
             // Sparks' first-use costs), landed and drained on the stream.
             let rows = link.capacity() as usize;
             let exchange = link.exchange()?;
-            let ticket = exchange.send_request(warm(rows, decode)?, rows * cuteafd_core::expert_geometry().hidden as usize * 2)?;
+            let ticket = exchange.send_request(warm(rows, decode)?, exchange.compact_payload(rows))?;
             exchange.land_drained(ticket, stream)?;
         }
         if transport.is_some() {

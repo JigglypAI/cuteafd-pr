@@ -962,6 +962,9 @@ impl<'a> Waves<'a> {
     /// Whether each slot's request staging holds `bytes`.
     pub(crate) fn fits(&self, bytes: usize) -> bool { self.arenas.iter().all(|arena| arena.bytes() >= bytes) }
 
+    /// Exact per-rank reply extent for compact rows at this exchange's admitted width.
+    pub(crate) fn compact_payload(&self, rows: usize) -> usize { rows * self.row_bytes }
+
     fn submit(&mut self, rows: usize, payload_bytes: usize, source: Source, stage: Option<(*mut c_void, RouteStaging,
         [CuteafdDeviceBuffer; 3])>) -> Result<WaveTicket> {
         let cut = self.geometry.cut();
