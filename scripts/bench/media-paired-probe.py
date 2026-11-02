@@ -17,7 +17,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python/reference"))
 from fidelity_media import has_media_adapter, media_families, media_server_family, read_fixture
-from fidelity_windows import canonical, load_set, validate_qualification
+from fidelity_windows import canonical, load_set, validate_reference
 
 CRITERION = ("the paired difference against the golden decides (\u22640.005 nat KL increase, "
              "\u22640.5 point top-1 loss, one-sided 95% window bootstrap). "
@@ -218,7 +218,7 @@ def file_hash(path):
 
 def golden_seal(root, panel):
     meta = json.loads((root / "meta.json").read_text())
-    validate_qualification(meta.get("prefix_qualification"), panel, meta.get("snapshot_identity"))
+    validate_reference(meta, panel)
     if meta["set_sha256"] != panel["set_sha256"] or meta["checkpoint"] != panel["checkpoint"]:
         raise ValueError("golden seal provenance differs")
     files = {"meta.json": file_hash(root / "meta.json"), "windows.json": file_hash(root / "windows.json")}
@@ -263,7 +263,7 @@ def compare(a):
     if seal != golden_seal(a.golden, panel):
         raise ValueError("golden files differ from immutable seal")
     meta = json.loads((a.golden / "meta.json").read_text())
-    validate_qualification(meta.get("prefix_qualification"), panel, meta.get("snapshot_identity"))
+    validate_reference(meta, panel)
     if meta["set_sha256"] != panel["set_sha256"] or meta["checkpoint"] != panel["checkpoint"]:
         raise ValueError("golden provenance differs")
     captures = [json.loads((root / "capture.json").read_text()) for root in roots]
@@ -288,6 +288,7 @@ def compare(a):
             or any(set(arm) != expected or len(arm) != len(c["windows"])
                    for arm, c in zip(arm_maps, captures))):
         raise ValueError("arms score different/incomplete windows")
+    qualified_vocab = validate_reference(meta, panel)
     gold = {w["id"]: w for w in meta["windows"]}
     if set(gold) != {w["id"] for w in panel["windows"]} or len(gold) != len(meta["windows"]):
         raise ValueError("golden panel coverage differs")
@@ -300,8 +301,8 @@ def compare(a):
         if entry["positions"] != positions or entry.get("media", []) != window.get("media", []):
             raise ValueError("golden media/position identity differs")
         vocab = entry["vocab"]
-        if vocab != meta["prefix_qualification"]["vocab"]:
-            raise ValueError("golden vocabulary differs from prefix gate")
+        if vocab != qualified_vocab:
+            raise ValueError("golden vocabulary differs from qualified reference")
         folder = (a.golden / entry["path"]).resolve()
         if not folder.is_relative_to(a.golden.resolve()):
             raise ValueError("golden path escapes root")

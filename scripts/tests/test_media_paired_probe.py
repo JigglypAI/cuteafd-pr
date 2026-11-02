@@ -318,6 +318,37 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, fam
         module.compare(args)
 
 
+def test_official_full_golden_seals_and_compares_without_prefix(tmp_path, monkeypatch):
+    import copy
+    import hashlib
+    from fidelity_windows import canonical, validate_reference
+    args, panel = compare_case(tmp_path, monkeypatch, "mimo_v2", control=True, native_row=(0., 0.))
+    meta = json.loads((args.golden / "meta.json").read_text())
+    meta.pop("prefix_qualification")
+    meta.update(geometry="official-full", attention="eager", use_cache=False, mtp=False, source_pin={"official": "pinned"})
+    meta["official_full"] = {"schema": "cuteafd.reference.official-full/1", "family": panel["family"],
+        "set_sha256": panel["set_sha256"], "snapshot_identity": meta["snapshot_identity"],
+        "layers": 72, "completed_layers": 72, "tiling": False, "head": "full-length",
+        "windows": {w["id"]: {"tokens": len(w["tokens"]),
+            "tokens_sha256": hashlib.sha256(canonical(w["tokens"])).hexdigest()} for w in panel["windows"]}}
+    assert validate_reference(meta, panel) == 2
+    for change in ({"tiling": True}, {"completed_layers": 71}, {"head": "fixed-M128"}, {"windows": {}}):
+        bad = copy.deepcopy(meta)
+        bad["official_full"].update(change)
+        with pytest.raises(ValueError, match="incomplete or mismatched"):
+            validate_reference(bad, panel)
+    bad = copy.deepcopy(meta)
+    bad["prefix_qualification"] = {}
+    with pytest.raises(ValueError, match="must not claim"):
+        validate_reference(bad, panel)
+    (args.golden / "meta.json").write_bytes(canonical(meta))
+    args.golden_seal = tmp_path / "official-full-seal.json"
+    module.write_new(args.golden_seal, module.golden_seal(args.golden, panel))
+    args.reference = args.features = None
+    args.expert_bpw = 4.
+    assert module.compare(args)
+
+
 @pytest.mark.parametrize("bpw,kl,top1", [(2.99, .07, .90), (3., .05, .93), (4., .05, .93), (6., .03, .95)])
 def test_native_expert_bit_tiers(bpw, kl, top1):
     bar = module.fidelity_bar(bpw)

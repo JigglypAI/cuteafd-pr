@@ -309,14 +309,15 @@ def synthetic_panel(tmp_path, family, snapshot, vocab, lengths):
     return path
 
 
-def run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel, media_adapter=None):
+def run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel, media_adapter=None, geometry="tiled", official_state=None):
     import layer_major
     import types
     monkeypatch.setattr(layer_major, "DEVICE", "cpu")
     monkeypatch.setattr(layer_major.shutil, "disk_usage", lambda path: types.SimpleNamespace(free=2 ** 41))
     out = tmp_path / "golden"
     args = types.SimpleNamespace(snapshot=snapshot, windows=panel, out=out, layers=None, prefix_only=False,
-                                 wait_shards=0, routes=tmp_path / "routes")
+                                 wait_shards=0, routes=tmp_path / "routes", geometry=geometry,
+                                 official_state=official_state)
     args.media = media_adapter is not None
     args.official_tokens = 4 if args.media else 512
     layer_major.run(args, family, extras_root=getattr(args, "routes", None) if family.name == "muse_spark" else None,
@@ -401,8 +402,9 @@ def test_muse_golden_qualifies_scores_resumes_and_writes_routes(tmp_path, monkey
     assert (out / "windows" / "w0" / "logits.bin").read_bytes() == first
 
 
+@pytest.mark.parametrize("geometry", ["tiled", "official-full"])
 @pytest.mark.parametrize("with_media", [False, True])
-def test_mistral_golden_threads_shared_kv_and_topk_across_layers(tmp_path, monkeypatch, with_media):
+def test_mistral_golden_threads_shared_kv_and_topk_across_layers(tmp_path, monkeypatch, with_media, geometry):
     from families.mistral_large4 import golden
     from transformers.models.mistral_large4 import modeling_mistral_large4 as reference
     config = tiny_mistral_config()
@@ -422,9 +424,22 @@ def test_mistral_golden_threads_shared_kv_and_topk_across_layers(tmp_path, monke
     family.last_reader = {s: max(i for i, x in family.source.items() if x == s) for s in family.stores}
     panel = synthetic_panel(tmp_path, "mistral_large4", snapshot, config.vocab_size, [700, 260])
     adapter, features = synthetic_media(panel, config.hidden_size) if with_media else (None, None)
-    out = run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel, media_adapter=adapter)
+    if geometry == "official-full":
+        import shape_invariant
+        def forbidden(*args, **kwargs):
+            raise AssertionError("official-full used tiled arithmetic")
+        monkeypatch.setattr(family, "geometry", forbidden)
+        monkeypatch.setattr(shape_invariant, "linear", forbidden)
+    out = run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel, media_adapter=adapter, geometry=geometry)
     meta = json.loads((out / "meta.json").read_text())
-    assert meta["prefix_qualification"]["passed"] and meta["official_forward"]["passed"]
+    if geometry == "tiled":
+        assert meta["prefix_qualification"]["passed"] and meta["official_forward"]["passed"]
+    else:
+        from fidelity_windows import validate_reference
+        assert validate_reference(meta, json.loads(panel.read_text())) == config.vocab_size
+        assert not {"prefix_qualification", "fixed_rows", "official_forward"}.intersection(meta)
+        assert meta["official_full"]["completed_layers"] == config.num_hidden_layers
+        assert not list(out.glob("prefix-gate-*"))
     # Layer-major logits equal the official full model run on the same window (stable top-k).
     window = json.loads(panel.read_text())["windows"][1]
     ids = torch.tensor([window["tokens"]])
@@ -440,10 +455,61 @@ def test_mistral_golden_threads_shared_kv_and_topk_across_layers(tmp_path, monke
         for index in range(config.num_hidden_layers):
             layer = mistral.load_layer(checkpoint, config, index, device="cpu", dtype=torch.float32)
             hidden, topk = mistral.layer_forward(layer, config, hidden, outer["rotary"], shared, topk)
-        expected = mistral.logits(outer["norm"](hidden[0, window["score_from"] - 1:-1]), outer["head"], config).numpy()
+        head_input = hidden[0] if geometry == "official-full" else hidden[0, window["score_from"] - 1:-1]
+        expected = mistral.logits(outer["norm"](head_input), outer["head"], config).numpy()
+        if geometry == "official-full":
+            expected = expected[window["score_from"] - 1:-1]
     import numpy as np
     actual = np.fromfile(out / "windows" / "w1" / "logits.bin", dtype="<f4").reshape(expected.shape)
     assert np.abs(actual - expected).max() / np.abs(expected).max() < 1e-5
+
+
+def test_official_full_geometry_selection_and_equality(tmp_path, monkeypatch):
+    import copy
+    import hashlib
+    import types
+    import numpy as np
+    import layer_major
+    from fidelity_windows import canonical
+    family = types.SimpleNamespace(config=types.SimpleNamespace(index_topk=8))
+    panel = {"windows": [{"id": "w", "tokens": list(range(9)), "media": [{"kind": "image"}]}]}
+    args = types.SimpleNamespace(geometry="auto")
+    assert layer_major.reference_geometry(args, family, panel) == "official-full"
+    panel["windows"][0]["media"] = []
+    assert layer_major.reference_geometry(args, family, panel) == "tiled"
+    args.geometry, args.prefix_only = "official-full", True
+    with pytest.raises(ValueError, match="does not use"):
+        layer_major.reference_geometry(args, family, panel)
+    args.prefix_only = False
+    monkeypatch.setattr(layer_major.shutil, "disk_usage", lambda p: types.SimpleNamespace(free=2 ** 41))
+    snapshot = {"snapshot_revision": "pin"}
+    binding = {"state_bytes_per_layer": 1024, "snapshot_identity": snapshot,
+               "windows": {"official_short": hashlib.sha256(canonical(list(range(9)))).hexdigest()}}
+    old = layer_major.LayerState(tmp_path / "old", binding)
+    pending = old.begin(3)
+    hidden = torch.arange(18).reshape(1, 9, 2).float()
+    old.save(pending, "official_short", {"hidden": hidden})
+    old.commit(pending)
+    new = layer_major.LayerState(tmp_path / "new", binding)
+    pending = new.begin(3)
+    new.save(pending, "w", {"hidden": hidden})
+    new.commit(pending)
+    saved = old.root / "latest.json"
+    proof = layer_major.official_state_equality(saved, new, panel, snapshot)
+    assert proof["passed"] and proof["shape"] == [1, 9, 2]
+    pending = new.begin(4)
+    new.save(pending, "w", {"hidden": hidden + 1})
+    new.commit(pending)
+    old.latest["layer"] = 4
+    layer_major.atomic_json(saved, old.latest)
+    proof = layer_major.official_state_equality(saved, new, panel, snapshot)
+    assert not proof["passed"] and proof["different_values"] == 18
+    changed = copy.deepcopy(panel)
+    changed["windows"][0]["tokens"][0] = 99
+    with pytest.raises(ValueError, match="tokens differ"):
+        layer_major.official_state_equality(saved, new, changed, snapshot)
+    metrics = layer_major.logit_comparison(np.ones((37, 5)), np.ones((37, 5)))
+    assert metrics == {"kl": 0., "max_kl": 0., "top1": 1., "relative_logit_l2": 0., "max_abs_logit_difference": 0.}
 
 
 def test_muse_centered_norm_weights_keep_the_official_bf16_add(tmp_path):

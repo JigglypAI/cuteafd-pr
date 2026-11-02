@@ -142,6 +142,9 @@ class Family:
         return model.logits(self.outer["norm"](hidden), self.outer["head"], self.config,
                             linear=shape_invariant.linear)
 
+    def official_final(self, hidden):
+        return model.logits(self.outer["norm"](hidden), self.outer["head"], self.config)
+
     def release_final(self):
         self.outer = None
         self.checkpoint.close()

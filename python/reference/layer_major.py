@@ -148,6 +148,48 @@ def window_tokens(window):
     return len(window["tokens"])
 
 
+def reference_geometry(a, family, manifest):
+    geometry = getattr(a, "geometry", "tiled")
+    if geometry == "auto":
+        topk = getattr(family.config, "index_topk", None)
+        geometry = ("official-full" if topk is not None and any(
+            w.get("media") and window_tokens(w) > topk for w in manifest["windows"]) else "tiled")
+    if geometry not in ("tiled", "official-full"):
+        raise ValueError("unsupported reference geometry")
+    if geometry == "official-full" and (getattr(a, "prefix_only", False) or getattr(a, "_prefix_probe", False)):
+        raise ValueError("official-full does not use a tiled prefix qualification")
+    if geometry != "official-full" and getattr(a, "official_state", None):
+        raise ValueError("official state equality requires official-full")
+    return geometry
+
+
+def official_state_equality(path, state, manifest, snapshot):
+    """Compare against the retained ground-truth stream, not a reconstructed state."""
+    import numpy as np
+    saved = json.loads(Path(path).read_bytes())
+    if (saved["binding"]["snapshot_identity"] != snapshot or saved["layer"] != state.latest["layer"]
+            or len(manifest["windows"]) != 1):
+        raise ValueError("official equality snapshot, layer or window count differs")
+    window = manifest["windows"][0]
+    if saved["binding"]["windows"].get("official_short") != hashlib.sha256(canonical(window["tokens"])).hexdigest():
+        raise ValueError("official equality tokens differ")
+    old = saved["windows"]["official_short"]["hidden"]
+    root = Path(path).parent.resolve()
+    blob = (root / old["path"]).resolve()
+    if not blob.is_relative_to(root) or blob.stat().st_size != old["bytes"] or digest(blob) != old["sha256"]:
+        raise ValueError("saved official hidden state differs")
+    new = state.latest["windows"][window["id"]]["hidden"]
+    passed = all(new[k] == old[k] for k in ("bytes", "sha256", "dtype", "shape"))
+    proof = {"schema": "cuteafd.reference.official-equality/1", "passed": passed,
+             "saved_state_sha256": digest(path), "saved_hidden_sha256": old["sha256"],
+             "actual_hidden_sha256": new["sha256"], "shape": new["shape"],
+             "snapshot_identity": snapshot, "tokens": len(window["tokens"])}
+    if not passed:
+        proof["different_values"] = int(np.count_nonzero(
+            np.fromfile(blob, dtype=old["dtype"]) != np.fromfile(state.contained(new["path"]), dtype=new["dtype"])))
+    return proof
+
+
 def embed_window(family, window, features=None):
     """Replace only native image span rows before any decoder layer runs."""
     hidden = family.embed(window["tokens"])
@@ -177,6 +219,8 @@ def run(a, family, *, extras_root=None, media_adapter=None):
     arithmetic = family.configure()
     torch.manual_seed(0)
     manifest = load_set(a.windows)
+    geometry = reference_geometry(a, family, manifest)
+    official_full = geometry == "official-full"
     if manifest["family"] != family.name:
         raise ValueError(f"{family.name} golden supports only its own panel")
     media_present = any(w.get("media") for w in manifest["windows"])
@@ -195,7 +239,9 @@ def run(a, family, *, extras_root=None, media_adapter=None):
     if media_present:
         pins = {**pins, "media": media_adapter.provenance(a, manifest)}
     marker = a.out / "qualified-gate.json"
-    if not checking and marker.exists():
+    if official_full:
+        proof = None
+    elif not checking and marker.exists():
         # Resume: the prefix proof and official arm already passed for this exact binding.
         gate = json.loads(marker.read_bytes())
         proof = json.loads((a.out / "prefix-qualification.json").read_bytes())
@@ -232,6 +278,7 @@ def run(a, family, *, extras_root=None, media_adapter=None):
                "compute_capability": list(torch.cuda.get_device_capability()) if DEVICE == "cuda" else [],
                "image_sha256": os.environ.get("CUTEAFD_REFERENCE_IMAGE_SHA256", ""),
                "arithmetic": arithmetic, "state_dtype": "float32",
+               **({"geometry": geometry} if official_full else {}),
                "state_bytes_per_layer": sum(family.state_bytes(window_tokens(w)) for w in windows),
                "windows": {w["id"]: hashlib.sha256(canonical(w["tokens"])).hexdigest() for w in windows}}
     state = LayerState(state_root, binding)
@@ -256,8 +303,14 @@ def run(a, family, *, extras_root=None, media_adapter=None):
             wait_for_shards(family, index, getattr(a, "wait_shards", 0))
             family.check_layer(index)
             if DEVICE == "cuda":
-                admit_reference_memory(torch.cuda, family.layer_bytes(index) + family.work_bytes(
-                    max(window_tokens(w) for w in windows)))
+                tokens = max(window_tokens(w) for w in windows)
+                work = family.work_bytes(tokens)
+                if official_full:
+                    # Conservative live bound: eager attention and DSA score buffers.
+                    heads = family.config.num_attention_heads
+                    index_heads = getattr(family.config, "index_n_heads", 0)
+                    work += tokens * tokens * 4 * (3 * heads + 2 * index_heads)
+                admit_reference_memory(torch.cuda, family.layer_bytes(index) + work)
             module = family.load_layer(index)
             load_seconds = time.monotonic() - tick
             pending = state.begin(index)
@@ -267,7 +320,7 @@ def run(a, family, *, extras_root=None, media_adapter=None):
                 wid = window["id"]
                 values = state.load(wid)
                 hidden = values.pop("hidden")
-                official = wid == "official_short"
+                official = official_full or wid == "official_short"
                 context = family.official_geometry() if official else family.geometry()
                 with context, family.observe(module, index) as observed:
                     hidden, carry, reuse = family.forward(module, index, hidden, values)
@@ -301,6 +354,12 @@ def run(a, family, *, extras_root=None, media_adapter=None):
             print(f"layer {index + 1}/{family.layers} committed; {seconds:.1f}s (load {load_seconds:.1f}s); "
                   f"read {(family.checkpoint.read_bytes - read_before) / 1e9:.2f} GB", flush=True)
         wait_for_tensors(family, family.outer_tensors("final"), getattr(a, "wait_shards", 0))
+        equality = None
+        if official_full and getattr(a, "official_state", None):
+            equality = official_state_equality(a.official_state, state, manifest, snapshot)
+            atomic_json(a.out / "official-equality.json", equality)
+            if not equality["passed"]:
+                raise ValueError("official-full hidden state is not byte-identical to saved official arm")
         family.load_final()
         entries, short_logits = [], {}
         total_nll, total_rows = 0.0, 0
@@ -309,7 +368,18 @@ def run(a, family, *, extras_root=None, media_adapter=None):
             hidden = state.load(wid)["hidden"]
             start = window["score_from"]
             selected = hidden[0, start - 1:len(window["tokens"]) - 1]
-            logits = family.final(selected).float().cpu().numpy()
+            if official_full:
+                full_logits = family.official_final(hidden[0]).float().cpu().numpy()
+                logits = full_logits[start - 1:len(window["tokens"]) - 1].copy()
+                if equality is not None:
+                    tiled_logits = family.final(hidden[0, :-1]).float().cpu().numpy()
+                    equality["head_comparison"] = {"rows": len(tiled_logits),
+                        **logit_comparison(full_logits[:-1], tiled_logits)}
+                    atomic_json(a.out / "official-equality.json", equality)
+                    del tiled_logits
+                del full_logits
+            else:
+                logits = family.final(selected).float().cpu().numpy()
             if not np.isfinite(logits).all():
                 raise ValueError("non-finite reference logits")
             if wid in ("official_short", "adapted_short"):
@@ -322,7 +392,9 @@ def run(a, family, *, extras_root=None, media_adapter=None):
                 total_rows += entry["scored_tokens"]
             del hidden, selected, logits
         family.release_final()
-    if checking:
+    if official_full:
+        comparison = None
+    elif checking:
         comparison = official_check(a.out, short_logits, state.latest["checks"])
     else:
         evidence = a.out / json.loads(marker.read_bytes())["gate"] / "official-forward.json"
@@ -330,12 +402,25 @@ def run(a, family, *, extras_root=None, media_adapter=None):
             raise ValueError("missing independent official-geometry evidence")
         comparison = json.loads(evidence.read_bytes())
         shutil.copyfile(evidence, a.out / "official-forward.json")
+    geometry_meta = ({"geometry": geometry, "official_full": {
+        "schema": "cuteafd.reference.official-full/1", "family": family.name,
+        "set_sha256": manifest["set_sha256"], "snapshot_identity": snapshot,
+        "layers": family.layers, "completed_layers": state.latest["layer"] + 1,
+        "tiling": False, "head": "full-length",
+        "windows": {w["id"]: {"tokens": window_tokens(w),
+            "tokens_sha256": hashlib.sha256(canonical(w["tokens"])).hexdigest()} for w in windows}}}
+        if official_full else {"prefix_qualification": proof, "fixed_rows": 128, "official_forward": comparison})
+    golden_meta = family.golden_meta()
+    if official_full:
+        golden_meta["reference"] = "official-full: unchanged official decoder layers and full-length head; layer-streamed weights"
+        golden_meta["root_arithmetic"] = {**golden_meta["root_arithmetic"], "geometry": "official-full",
+            "arithmetic": arithmetic, "tiling": False}
     finish_golden(a.out, manifest, entries, snapshot_identity=snapshot, source_pin=pins,
                   nll=total_nll / total_rows, scored_tokens=total_rows, seconds=time.monotonic() - started,
                   seconds_per_layer=state.latest["seconds_per_layer"],
                   torch=torch.__version__, transformers=transformers.__version__, tokenizers=tokenizers.__version__,
-                  attention="eager", mtp=False, use_cache=False, prefix_qualification=proof, fixed_rows=128,
-                  official_forward=comparison, arithmetic=arithmetic, **family.golden_meta(),
+                  attention="eager", mtp=False, use_cache=False, **geometry_meta,
+                  arithmetic=arithmetic, **golden_meta,
                   harness_commit=os.environ.get("CUTEAFD_REFERENCE_HARNESS_COMMIT", ""),
                   platform={"capability": list(torch.cuda.get_device_capability()),
                             "gpu": torch.cuda.get_device_name(), "cuda": torch.version.cuda}
@@ -389,6 +474,28 @@ def wait_for_shards(family, index, timeout):
             print(f"layer {index} waiting for {len(pending)} shard(s): {pending[:4]}", flush=True)
             announced = True
         time.sleep(120)
+
+
+def logit_comparison(native, adapted):
+    """Bound host workspaces while comparing full-vocabulary head outputs."""
+    import numpy as np
+    kl, max_kl, disagreements, square_error, square_norm, maximum = 0.0, 0.0, 0, 0.0, 0.0, 0.0
+    for start in range(0, len(native), 32):
+        left = native[start:start + 32].astype(np.float64)
+        right = adapted[start:start + 32].astype(np.float64)
+        difference = left - right
+        maximum = max(maximum, float(np.abs(difference).max()))
+        square_error += float(np.square(difference).sum())
+        square_norm += float(np.square(left).sum())
+        disagreements += int(np.count_nonzero(left.argmax(-1) != right.argmax(-1)))
+        left -= np.logaddexp.reduce(left, axis=-1, keepdims=True)
+        right -= np.logaddexp.reduce(right, axis=-1, keepdims=True)
+        rows = (np.exp(left) * (left - right)).sum(-1)
+        kl += float(rows.sum())
+        max_kl = max(max_kl, float(rows.max()))
+    return {"kl": kl / len(native), "max_kl": max_kl, "top1": 1 - disagreements / len(native),
+            "relative_logit_l2": (square_error / max(square_norm, 1e-60)) ** .5,
+            "max_abs_logit_difference": maximum}
 
 
 def official_check(out, logits, per_layer):
