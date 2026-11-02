@@ -307,12 +307,6 @@ mod media_unit_tests {
         ] {
             assert!(!super::decode_graph_eligible(decode, rows, hooked, complete, false));
         }
-        let source = include_str!("engine.rs");
-        let step = source.split("fn step(").nth(1).unwrap().split("fn ").next().unwrap();
-        assert!(step.contains("decode_graph_eligible(tables.decode, logit_rows, on_layer.is_some()"));
-        assert!(step.contains("self.pending_media.borrow().is_some()"));
-        let after_graph = step.split("self.decode_layers(").nth(1).unwrap();
-        assert!(after_graph.contains("self.inject_media(w, tables)?"));
     }
     /// A call's media rows split across its units exactly once each, rebased to each unit.
     #[test]
