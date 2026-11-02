@@ -364,6 +364,7 @@ def test_mistral_golden_threads_shared_kv_and_topk_across_layers(tmp_path, monke
         manifest["set_sha256"] = set_hash(manifest)
         panel.write_text(json.dumps(manifest))
         adapter = types.SimpleNamespace(validate_spans=lambda m, s: None,
+            provenance=lambda a, m: {"synthetic_test_adapter": True},
             window_features=lambda a, m: (features, {"fixture": True}))
     out = run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel, media_adapter=adapter)
     meta = json.loads((out / "meta.json").read_text())

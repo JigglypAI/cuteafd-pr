@@ -192,6 +192,8 @@ def run(a, family, *, extras_root=None, media_adapter=None):
         family.check_layer(index)
     print(f"native shape preflight passed for {len(present)}/{family.layers} downloaded layers", flush=True)
     pins = family.provenance()
+    if media_present:
+        pins = {**pins, "media": media_adapter.provenance(a, manifest)}
     marker = a.out / "qualified-gate.json"
     if not checking and marker.exists():
         # Resume: the prefix proof and official arm already passed for this exact binding.

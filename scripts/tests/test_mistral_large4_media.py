@@ -65,6 +65,22 @@ def test_checkpoint_contract_is_authoritative_and_reserved_tokens_bound(snapshot
         media.processor_contract(snapshot)
 
 
+def test_media_resume_provenance_revalidates_pinned_bytes(snapshot, tmp_path, monkeypatch):
+    manifest = panel(snapshot)
+    image = tmp_path / "image.png"
+    image.write_bytes(b"pinned image bytes")
+    manifest["windows"][0]["media"][0]["fixture"]["sha256"] = hashlib.sha256(image.read_bytes()).hexdigest()
+    monkeypatch.setattr(media, "snapshot_identity", lambda p: {"snapshot": "verified"})
+    args = types.SimpleNamespace(snapshot=snapshot, media_root=tmp_path, windows=tmp_path / "set.json", tower_dtype="bf16")
+    first = media.provenance(args, manifest)
+    args.tower_dtype = "fp32"
+    assert media.provenance(args, manifest) != first
+    assert all(len(digest) == 64 for digest in first["sources"].values())
+    image.write_bytes(b"mutated")
+    with pytest.raises(ValueError, match="pinned media identity"):
+        media.provenance(args, manifest)
+
+
 def test_shared_layer_major_injects_only_span_rows():
     torch = pytest.importorskip("torch")
     import layer_major

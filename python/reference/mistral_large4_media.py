@@ -40,6 +40,21 @@ def processor_contract(snapshot):
             "row_break_token_id": ids[1], "end_token_id": ids[2]}
 
 
+def provenance(args, manifest):
+    """Revalidate fixture bytes and bind media arithmetic before any resume."""
+    root = args.media_root or args.windows.parent
+    fixtures = {}
+    for window in manifest["windows"]:
+        for span in window.get("media", []):
+            read_fixture(root, span)
+            fixtures[span["fixture"]["path"]] = span["fixture"]["sha256"]
+    return {"snapshot": snapshot_identity(args.snapshot), "tower_dtype": args.tower_dtype,
+        "fixtures": fixtures, "sources": {
+            "adapter": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "qualifier": hashlib.sha256(Path(qualifier().__file__).read_bytes()).hexdigest(),
+            "runner": hashlib.sha256(Path(__file__).with_name("layer_major.py").read_bytes()).hexdigest()}}
+
+
 def snapshot_identity(snapshot):
     """Exactly the serving probe's identity, after verifying official imports."""
     model.source_identity()
