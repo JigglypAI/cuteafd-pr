@@ -16,7 +16,7 @@ import urllib.request
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python/reference"))
-from fidelity_media import has_media_adapter, media_families, read_fixture
+from fidelity_media import has_media_adapter, media_families, media_server_family, read_fixture
 from fidelity_windows import canonical, load_set, validate_qualification
 
 CRITERION = ("the paired difference against the golden decides (\u22640.005 nat KL increase, "
@@ -75,7 +75,7 @@ def check_record(window, response, checkpoint, mode, features_root=None, family=
             or not record.get("no_speculation") or record.get("cached_tokens") != 0
             or record.get("score_path") != "decode" or record.get("prompt_ids") != window["tokens"]
             or response.get("server", {}).get("model") != checkpoint
-            or family is not None and response.get("server", {}).get("family") != family):
+            or family is not None and response.get("server", {}).get("family") != media_server_family(family)):
         raise ValueError("media scoring identity/cold/path contract not honored")
     fields = ("start", "len", "kind", "key", "grid")
     expected = [{k: span[k] for k in fields} for span in window.get("media", [])]

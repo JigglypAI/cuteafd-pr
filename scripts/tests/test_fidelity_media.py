@@ -175,7 +175,9 @@ def real_vision_input(tmp_path):
     return manifest, snapshot, tmp_path / "fixtures"
 
 
-def test_real_vision_manifest_pins_resizes_and_scores_following_text(real_vision_input):
+@pytest.mark.parametrize("server_family,checkpoint", [("glm5", "model"), ("mimo_v2", "model"),
+                                                        (None, "model"), ("glm5", "other")])
+def test_real_vision_manifest_pins_resizes_and_scores_following_text(real_vision_input, server_family, checkpoint):
     from fidelity_media import processor_contract
     manifest, snapshot, destination = real_vision_input
     builder = load_script("fidelity-set")
@@ -190,12 +192,18 @@ def test_real_vision_manifest_pins_resizes_and_scores_following_text(real_vision
         return {"probe": {"engine": "fake", "prompt_ids": [1, 9, 9, 8, 9, 9, 7, 2] if image else [1, 2],
             "generated": [3] * 600, "media": [{"start": 1, "len": 6, "grid": [1, 4, 4],
                 "key": "a" * 64, "kind": "image"}] if image else []},
-            "server": {"model": "model", "family": "mistral_large4"}}
+            "server": {"model": checkpoint, "family": server_family}}
     arm = {"checkpoint": "model", "head": "bf16", "activations": "bf16", "kv": "bf16",
         "state": "bf16", "speculation": False, "prefix_cache": False}
-    result = builder.build_vision_set(family="mistral_large4", model="model", checkpoint="model",
+    kwargs = dict(family="mistral_large4", model="model", checkpoint="model",
         version="real1", arm=arm, probe=probe, fixtures=destination, tokenizer_sha256="c" * 64,
         vision_manifest=manifest, snapshot=snapshot)
+    if server_family != "glm5" or checkpoint != "model":
+        with pytest.raises(ValueError, match="server identity"):
+            builder.build_vision_set(**kwargs)
+        return
+    result = builder.build_vision_set(**kwargs)
+    assert result["family"] == "mistral_large4"
     assert [w["id"] for w in result["windows"]] == ["real_00", "resize_00", "text_control"]
     for window in result["windows"]:
         assert set(window["roles"][window["score_from"]:]) == {"gen"}
@@ -897,6 +905,11 @@ def test_official_media_registry_discovers_only_present_adapters(tmp_path, monke
     monkeypatch.setattr(registry, "__file__", str(tmp_path / "fidelity_media.py"))
     assert registry.media_families() == ()
     assert not registry.has_media_adapter("new_family")
+    assert registry.media_server_family("mistral_large4") == "mistral_large4"
+    (tmp_path / "mistral_large4_media.py").touch()
+    assert registry.media_server_family("mistral_large4") == "glm5"
+    assert registry.media_server_family("mimo_v2") == "mimo_v2"
+    (tmp_path / "mistral_large4_media.py").unlink()
     for name in ("fidelity_media", "golden_media", "new_family_media"):
         (tmp_path / (name + ".py")).touch()
     assert registry.media_families() == ("new_family",)

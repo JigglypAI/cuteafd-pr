@@ -98,6 +98,14 @@ def test_record_requires_native_identity_and_override_metadata(tmp_path):
     module.check_record(window, response, "model", "native", family="mimo_v2")
     with pytest.raises(ValueError, match="identity"):
         module.check_record(window, response, "model", "native", family="qwen4")
+    response["server"]["family"] = "glm5"
+    module.check_record(window, response, "model", "native", family="mistral_large4")
+    with pytest.raises(ValueError, match="identity"):
+        module.check_record(window, response, "other", "native", family="mistral_large4")
+    response["server"]["family"] = "qwen4"
+    with pytest.raises(ValueError, match="identity"):
+        module.check_record(window, response, "model", "native", family="mistral_large4")
+    response["server"]["family"] = "mimo_v2"
     record["media"] = []
     with pytest.raises(ValueError, match="echo"):
         module.check_record(window, response, "model", "native")
@@ -122,7 +130,7 @@ def test_reference_provenance_keeps_family_contract_exact(tmp_path, family):
     metadata = feature_metadata(span["key"], family)
     (tmp_path / (span["key"] + ".json")).write_text(json.dumps(metadata))
     provenance = reference_provenance(metadata, family)
-    response = {"server": {"model": "model", "family": family}, "probe": {
+    response = {"server": {"model": "model", "family": module.media_server_family(family)}, "probe": {
         "engine": family, "cold": True, "no_speculation": True, "cached_tokens": 0,
         "score_path": "decode", "prompt_ids": window["tokens"], "media": [span],
         "rows": [{"position": 1, "finite": True}], "scored": 1, "provenance": provenance}}
@@ -235,7 +243,7 @@ def compare_case(tmp_path, monkeypatch, family, control=False, native_row=(0., -
         root.mkdir()
         capture = {"schema": "cuteafd.media.paired.capture/1", "mode": mode, "set_sha256": panel["set_sha256"],
                    "checkpoint": "model", "quick": False,
-                   "server": {"model": "model", "family": family,
+                   "server": {"model": "model", "family": module.media_server_family(family),
                               "build": {"commit": "same", "image": mode}}, "windows": []}
         for window in panel["windows"]:
             dump = root / window["id"]

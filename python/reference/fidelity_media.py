@@ -35,6 +35,14 @@ def media_families():
         if path.stem not in ("fidelity_media", "golden_media")}))
 
 
+def media_server_family(family):
+    # TODO(#924): delete with the Rust commands/bench.rs checkpoint-family fix.
+    # The sealed GLM executor advertises glm5 even for the discovered ML4 adapter.
+    if has_media_adapter(family) and media_adapter_name(family) == "mistral_large4_media":
+        return "glm5"
+    return family
+
+
 def official_media_adapter(family):
     import importlib
     if not has_media_adapter(family):

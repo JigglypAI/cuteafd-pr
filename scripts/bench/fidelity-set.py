@@ -635,7 +635,7 @@ def real_vision_fixtures(path, destination, snapshot):
 def build_real_vision_set(*, family, model, checkpoint, version, arm, probe, fixtures,
                           tokenizer_sha256, vision_manifest, snapshot):
     import base64
-    from fidelity_media import validate_media
+    from fidelity_media import media_server_family, validate_media
     arm_policy(arm, checkpoint)
     records, contract = real_vision_fixtures(vision_manifest, fixtures, snapshot)
     windows, servers = [], []
@@ -654,7 +654,7 @@ def build_real_vision_set(*, family, model, checkpoint, version, arm, probe, fix
             "max_tokens": 2048, "temperature": 0, "seed": 0, "reasoning_effort": "high", "stream": False}
         chat = probe(body)
         record, server = chat["probe"], chat.get("server", {})
-        if server.get("model") != checkpoint or server.get("family") != family:
+        if server.get("model") != checkpoint or server.get("family") != media_server_family(family):
             raise ValueError("media generation server identity differs from manifest")
         spans = record.get("media", [])
         expected = int("fixture" in item)
