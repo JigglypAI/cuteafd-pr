@@ -1,6 +1,34 @@
 cmake_minimum_required(VERSION 3.24)
 project(cuteafd_native LANGUAGES C CXX)
 
+# Read target and drafter row budgets from the same source used by Rust.
+set(CUTEAFD_V41_CAPACITY_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../rust/crates/cuteafd-core/src/dspark_verify.rs")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CUTEAFD_V41_CAPACITY_SOURCE}")
+file(READ "${CUTEAFD_V41_CAPACITY_SOURCE}" v41_capacity_source)
+foreach(name VERIFY_ROWS DRAFT_LEGACY_ROWS DRAFT_WIDE_ROWS)
+  string(REGEX MATCH "pub const V41_${name}: usize = ([0-9]+);" matched "${v41_capacity_source}")
+  if(NOT matched)
+    message(FATAL_ERROR "Missing V41_${name} in Rust capacity contract")
+  endif()
+  set(CUTEAFD_V41_${name} "${CMAKE_MATCH_1}")
+endforeach()
+set(CUTEAFD_V41_TARGET_ROWS 1 16 ${CUTEAFD_V41_VERIFY_ROWS} 256 1024 4096)
+list(JOIN CUTEAFD_V41_TARGET_ROWS "," CUTEAFD_V41_TARGET_ROWS_ARG)
+set(CUTEAFD_V41_DRAFT_ROWS 1 16 40 ${CUTEAFD_V41_DRAFT_LEGACY_ROWS} ${CUTEAFD_V41_DRAFT_WIDE_ROWS} 1024 4096)
+list(JOIN CUTEAFD_V41_DRAFT_ROWS "," CUTEAFD_V41_DRAFT_ROWS_ARG)
+set(CUTEAFD_V41_PROJECTION_ROWS 1 16 ${CUTEAFD_V41_VERIFY_ROWS} ${CUTEAFD_V41_DRAFT_LEGACY_ROWS} 256 1024 4096)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../rust/crates/cuteafd-core/src/concurrency.rs" v41_concurrency_source)
+string(REGEX MATCH "pub const MAX_CONCURRENCY: u64 = ([0-9]+);" matched "${v41_concurrency_source}")
+if(NOT matched)
+  message(FATAL_ERROR "Missing compiled concurrency ceiling")
+endif()
+set(CUTEAFD_V41_MAX_REQUESTS "${CMAKE_MATCH_1}")
+math(EXPR CUTEAFD_V41_MAX_LANE_MEMBERS "(${CUTEAFD_V41_MAX_REQUESTS} + 1) / 2")
+math(EXPR CUTEAFD_V41_WRITE_DESCRIPTOR_BYTES "${CUTEAFD_V41_MAX_REQUESTS} * 24")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/v41_capacity.h"
+  "#pragma once\n#define CUTEAFD_V41_VERIFY_ROWS ${CUTEAFD_V41_VERIFY_ROWS}\n#define CUTEAFD_V41_MAX_REQUESTS ${CUTEAFD_V41_MAX_REQUESTS}\n#define CUTEAFD_V41_MAX_LANE_MEMBERS ${CUTEAFD_V41_MAX_LANE_MEMBERS}\n#define CUTEAFD_V41_WRITE_DESCRIPTOR_BYTES ${CUTEAFD_V41_WRITE_DESCRIPTOR_BYTES}\n")
+
+
 # Single-config serving builds should optimize the native host path too.
 # Respect an explicitly selected Debug/RelWithDebInfo or multi-config generator.
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)

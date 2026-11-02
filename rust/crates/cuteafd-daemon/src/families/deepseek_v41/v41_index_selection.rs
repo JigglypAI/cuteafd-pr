@@ -583,7 +583,7 @@ impl<'a> IndexSelectionWave<'a> {
             "invalid selection producer layer"
         );
         ensure!(
-            !requests.is_empty() && requests.len() <= 16,
+            !requests.is_empty() && requests.len() <= cuteafd_core::V41_MAX_REQUESTS,
             "invalid selection request count"
         );
         let rows: usize = requests.iter().map(|r| r.positions.len()).sum();

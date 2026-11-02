@@ -30,7 +30,7 @@ pub use target_sampling::{
     TargetSamplingError, TargetSamplingParams, GREEDY_TEMPERATURE_EPS, MAX_TARGET_TEMPERATURE,
 };
 mod dspark_verify;
-pub use dspark_verify::{verify_dspark_greedy, verify_dspark_greedy_vocab, GreedyVerification, MAX_DSPARK_PROPOSALS, V41_VERIFY_ROWS};
+pub use dspark_verify::{native_decode_rows, verify_dspark_greedy, verify_dspark_greedy_vocab, GreedyVerification, MAX_DSPARK_PROPOSALS, V41_VERIFY_ROWS, V41_DECODE_CAPACITIES, V41_TARGET_CAPACITIES, V41_DRAFT_LEGACY_ROWS, V41_DRAFT_WIDE_ROWS, V41_MAX_REQUESTS, V41_MAX_LANE_MEMBERS, V41_WRITE_DESCRIPTOR_BYTES, V41_READ_DESCRIPTOR_BYTES};
 mod engram;
 pub mod prefix;
 pub mod serving_capacity;

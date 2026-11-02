@@ -14,7 +14,7 @@ use std::{ffi::c_void, rc::Rc};
 
 pub(crate) fn kernel_capacities(max_rows: usize) -> Result<Vec<u32>> {
     ensure!((1..=4096).contains(&max_rows), "invalid TP2 rank capacity");
-    let capacities = [1, 16, 80, 256, 1024, 4096];
+    let capacities = [1, 16, cuteafd_core::native_decode_rows(), 256, 1024, 4096];
     let compiled = capacities
         .into_iter()
         .find(|&c| c as usize >= max_rows)

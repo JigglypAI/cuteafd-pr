@@ -236,7 +236,7 @@ impl<'library> DsparkWeights<'library> {
         use cuteafd_core::memory_layout::{Basis, Category};
         let (resident, runtime, staging) = Self::serving_bytes(library, catalog, context_capacity, requests, width)?;
         // `load_serving_with_width` plans at the full request batch; its check is weights-only.
-        let capacity = DsparkAttentionWave::projection_capacity_with_width(requests, width)?;
+        let capacity = DsparkAttentionWave::projection_capacity_with_width(requests.div_ceil(if requests == 1 { 1 } else { 2 }), width)?;
         let budget = Self::plan_with_width(library, catalog, capacity, width)?;
         let peak = budget.load_bound()?;
         Ok(cuteafd_loader::placement::families::deepseek_v41::DraftInventory {
@@ -259,10 +259,10 @@ impl<'library> DsparkWeights<'library> {
         -> Result<cuteafd_loader::placement::families::deepseek_v41::DraftInventory> {
         use cuteafd_core::memory_layout::{Basis, Category};
         use cuteafd_loader::placement::Demand;
-        ensure!((1..=16).contains(&requests), "invalid draft request limit");
+        ensure!((1..=cuteafd_core::V41_MAX_REQUESTS as u32).contains(&requests), "invalid draft request limit");
         let lanes = if requests == 1 { 1 } else { 2 };
         let lane_requests = requests.div_ceil(lanes);
-        let capacity = DsparkAttentionWave::projection_capacity_with_width(requests, width)?;
+        let capacity = DsparkAttentionWave::projection_capacity_with_width(requests.div_ceil(if requests == 1 { 1 } else { 2 }), width)?;
         let experts = if tp2_experts { DraftExpertKind::Tp2 } else { DraftExpertKind::Full };
         let shape = DsparkShape { library, width, experts };
         let budget = Self::plan_with_width(library, catalog, capacity, width)?;
@@ -293,7 +293,7 @@ impl<'library> DsparkWeights<'library> {
         lane[0] = lane[0].checked_add(shape.peer_chain_bytes(lane_requests)?).context("draft peer lane overflow")?;
         lane[1] = lane[1].checked_add(shape.chain_bytes(lane_requests)?).context("draft lane overflow")?;
         let mut main = DsparkMainContext::device_bytes(library, context_capacity)?;
-        if lanes > 1 { main = main.checked_add(DsparkMainContext::device_bytes(library, 80)?).context("draft main overflow")?; }
+        if lanes > 1 { main = main.checked_add(DsparkMainContext::device_bytes(library, cuteafd_core::V41_VERIFY_ROWS as u32)?).context("draft main overflow")?; }
         let windows = DsparkWindow::device_bytes(requests as usize, context_capacity)?.checked_mul(3)
             .context("draft windows overflow")?;
         let demand = |gpu, group, bytes: usize| Demand::new(gpu, Category::Drafter, group, bytes as u64, Basis::Exact);
@@ -309,7 +309,7 @@ impl<'library> DsparkWeights<'library> {
     /// Exact single-coordinator serving owners, before reading any payload.
     pub fn serving_bytes(library: &NativeLibrary, catalog: &OfficialV41Catalog,
         context_capacity: u32, requests: u32, width: usize) -> Result<(usize, usize, usize)> {
-        ensure!((1..=16).contains(&requests), "invalid draft request limit");
+        ensure!((1..=cuteafd_core::V41_MAX_REQUESTS as u32).contains(&requests), "invalid draft request limit");
         let lanes = if requests == 1 { 1 } else { 2 };
         let members = requests.div_ceil(lanes);
         let capacity = DsparkAttentionWave::projection_capacity_with_width(members, width)?;
@@ -327,7 +327,7 @@ impl<'library> DsparkWeights<'library> {
         };
         let mut runtime = chain.checked_add(head_scratch).and_then(|n| n.checked_mul(lanes as usize)).context("draft lanes overflow")?
             .checked_add(DsparkMainContext::device_bytes(library, context_capacity)?).context("draft main overflow")?;
-        if lanes > 1 { runtime = runtime.checked_add(DsparkMainContext::device_bytes(library, 80)?).context("draft second main overflow")?; }
+        if lanes > 1 { runtime = runtime.checked_add(DsparkMainContext::device_bytes(library, cuteafd_core::V41_VERIFY_ROWS as u32)?).context("draft second main overflow")?; }
         runtime = runtime.checked_add(DsparkWindow::device_bytes(requests as usize, context_capacity)? * 3)
             .context("draft windows overflow")?;
         Ok((budget.resident_bytes()?, runtime, budget.load_staging_bytes))
@@ -353,14 +353,14 @@ impl<'library> DsparkWeights<'library> {
         pinned_staging_bytes: usize, width: usize) -> Result<Self> {
         // The main context is a draft-runtime owner, allocated later from its own budget.
         let _ = context_capacity;
-        let draft_capacity = DsparkAttentionWave::projection_capacity_with_width(requests, width)?;
+        let draft_capacity = DsparkAttentionWave::projection_capacity_with_width(requests.div_ceil(if requests == 1 { 1 } else { 2 }), width)?;
         Self::load_with_width(library, catalog, draft_capacity, 1, device_budget, pinned_staging_bytes, width)
     }
 
     pub fn load_serving_tp2(library:&'library NativeLibrary,catalog:&OfficialV41Catalog,
         context_capacity:u32,requests:u32,budgets:[usize;2],pinned_staging_bytes:usize,width:usize)->Result<Self> {
         let _ = context_capacity;
-        let capacity=DsparkAttentionWave::projection_capacity_with_width(requests,width)?;
+        let capacity=DsparkAttentionWave::projection_capacity_with_width(requests.div_ceil(if requests == 1 { 1 } else { 2 }),width)?;
         Self::load_tp2_with_width(library,catalog,capacity,2,budgets,pinned_staging_bytes,width)
     }
 

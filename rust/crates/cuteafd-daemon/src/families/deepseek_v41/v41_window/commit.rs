@@ -2,8 +2,8 @@
 use super::*;
 
 pub(super) struct WriteReservation {
-    flags: std::rc::Rc<std::cell::Cell<u16>>,
-    mask: u16,
+    flags: std::rc::Rc<std::cell::Cell<u64>>,
+    mask: u64,
 }
 impl Drop for WriteReservation {
     fn drop(&mut self) { self.flags.set(self.flags.get() & !self.mask); }
@@ -96,7 +96,7 @@ impl<'a> WindowWave<'_, 'a> {
             staging[p.rows * 8 + i * 8..p.rows * 8 + i * 8 + 8].copy_from_slice(&end.to_ne_bytes());
         }
 
-        let mask = p.chunks.iter().fold(0u16, |mask, c| mask | (1 << c.lease.slot));
+        let mask = p.chunks.iter().fold(0u64, |mask, c| mask | (1 << c.lease.slot));
         ensure!(state.writing.get() & mask == 0, "window slot is being committed");
         state.writing.set(state.writing.get() | mask);
         let batched = external.map(|_| {

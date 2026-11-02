@@ -12,6 +12,7 @@ import os
 import re
 from pathlib import Path
 import _pinned_sparkinfer  # noqa: F401
+from v41_capacities import PROJECTION_CAPACITIES
 
 
 PROJECTIONS = (
@@ -208,12 +209,12 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output-dir', type=Path, required=True)
-    parser.add_argument('--rows', default='1,16,80,256,1024,4096')
+    parser.add_argument('--rows', default=','.join(map(str, PROJECTION_CAPACITIES)))
     parser.add_argument('--projections', help='Comma-separated projection names; default exports all')
     args = parser.parse_args()
     rows = tuple(int(value) for value in args.rows.split(','))
-    if not rows or len(set(rows)) != len(rows) or any(value not in (1,16,80,256,1024,4096) for value in rows):
-        parser.error('rows must be distinct native capacities: 1,16,80,256,1024,4096')
+    if not rows or len(set(rows)) != len(rows) or any(value not in PROJECTION_CAPACITIES for value in rows):
+        parser.error(f'rows must be distinct native capacities: {PROJECTION_CAPACITIES}')
     selected = args.projections.split(',') if args.projections else [p[0] for p in PROJECTIONS]
     if len(selected) != len(set(selected)) or set(selected) - {p[0] for p in PROJECTIONS}:
         parser.error('projections must be distinct supported names')

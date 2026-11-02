@@ -132,8 +132,8 @@ impl InstalledExpertGrouping {
         if capacity > 1 {
             variants.push(selected(1)?);
         }
-        if capacity > 80 {
-            variants.push(selected(80)?);
+        if capacity > cuteafd_core::native_decode_rows() {
+            variants.push(selected(cuteafd_core::native_decode_rows())?);
         }
         variants.sort_by_key(|v| v.capacity_rows);
         Ok(Self {

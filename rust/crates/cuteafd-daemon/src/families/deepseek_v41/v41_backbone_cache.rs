@@ -137,9 +137,9 @@ pub(crate) struct CacheAttention<'a> {
     positions: Vec<Vec<u64>>,
 }
 impl CacheAttention<'_> {
-    pub fn attention_requests_fixed(&self)->Result<([AttentionRequest<'_>;16],usize)> {
+    pub fn attention_requests_fixed(&self)->Result<([AttentionRequest<'_>; cuteafd_core::V41_MAX_REQUESTS],usize)> {
         let count=self.windows.len();
-        ensure!((1..=16).contains(&count) && self.positions.len()==count,
+        ensure!((1..=cuteafd_core::V41_MAX_REQUESTS).contains(&count) && self.positions.len()==count,
             "invalid fixed attention request count");
         Ok((std::array::from_fn(|i| {
             let i=if i<count {i} else {0};
@@ -509,7 +509,7 @@ impl<'a> BackboneCache<'a> {
     fn plan_stage(&self, work: &[CacheWork], replay: bool, reserve: bool) -> Result<CacheBatch> {
         self.healthy()?;
         ensure!(
-            !work.is_empty() && work.len() <= 16,
+            !work.is_empty() && work.len() <= cuteafd_core::V41_MAX_REQUESTS,
             "invalid cache batch request count"
         );
         let mut stage = None;
@@ -978,7 +978,7 @@ mod tests {
             assert!(bank.release(&[leases[0], leases[0]]).is_err());
             bank.validate_batch(&batch)?;
             // Commit preflight rejects missing producers without consuming history.
-            assert!(bank.commit::<WindowWave<'_, '_>, CompressorWave<'_, '_>>(&batch, &mut [], &mut [], &[0; 16]).is_err());
+            assert!(bank.commit::<WindowWave<'_, '_>, CompressorWave<'_, '_>>(&batch, &mut [], &mut [], &[0; cuteafd_core::V41_MAX_REQUESTS]).is_err());
             bank.validate_batch(&batch)?;
             bank.release(&leases[..1])?;
             assert!(bank.validate_batch(&batch).is_err());

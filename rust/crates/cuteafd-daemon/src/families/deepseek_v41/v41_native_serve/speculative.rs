@@ -81,15 +81,15 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
         table: &'w NativeRtxTensors<'a>, head: &'w VocabularyHead<'a>,
         capacity: u32, requests: u32,
     ) -> Result<Self> {
-        ensure!((1..=16).contains(&requests), "invalid draft request limit");
+        ensure!((1..=cuteafd_core::V41_MAX_REQUESTS as u32).contains(&requests), "invalid draft request limit");
         let window = || DsparkWindow::new(lib, requests as usize, capacity,
             DsparkWindow::device_bytes(requests as usize, capacity)?);
         let lane_count = if requests == 1 { 1 } else { 2 };
         let lane_requests = requests.div_ceil(lane_count as u32);
-        let shared_bytes = weights.draft_bytes(requests)?;
+        let shared_bytes = weights.draft_bytes(lane_requests)?;
         let lane_bytes = weights.draft_bytes(lane_requests)?;
         let mut mains = vec![weights.main_context(capacity, DsparkMainContext::device_bytes(lib, capacity)?)?];
-        if lane_count > 1 { mains.push(weights.main_context(80, DsparkMainContext::device_bytes(lib, 80)?)?); }
+        if lane_count > 1 { mains.push(weights.main_context(cuteafd_core::V41_VERIFY_ROWS as u32, DsparkMainContext::device_bytes(lib, cuteafd_core::V41_VERIFY_ROWS as u32)?)?); }
         let chains = (0..lane_count).map(|_| weights.draft(table, head, lane_requests, lane_bytes))
             .collect::<Result<Vec<_>>>()?;
         tracing::info!(lanes=lane_count, lane_requests, draft_width=weights.draft_width(), shared_workspace_bytes=shared_bytes,

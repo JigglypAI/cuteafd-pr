@@ -40,6 +40,8 @@ pub enum SparkBackend {
     Fp8,
     /// Native V4.1 packages: main export plus m1/m80.
     Native,
+    /// V4.1 target native and FP8 packages share the verifier cover.
+    V41,
     /// Native EXLR8: one 64-row decode arena and one 4096-row prefill arena.
     Exlr8,
 }
@@ -53,7 +55,8 @@ impl SparkBackend {
     /// selection order (EXLR8 format, then EXL3, then FP8-family, then native).
     pub fn for_catalog(catalog: &crate::OfficialV41Catalog) -> anyhow::Result<Self> {
         let geometry = catalog.routed_experts().geometry()?;
-        Ok(if catalog.format() == crate::plan::checkpoint::CheckpointFormat::Exlr8 { Self::Exlr8 }
+        Ok(if geometry.same_shape(&cuteafd_core::ExpertGeometry::DEEPSEEK_V41) && catalog.exl3().is_none() { Self::V41 }
+            else if catalog.format() == crate::plan::checkpoint::CheckpointFormat::Exlr8 { Self::Exlr8 }
             else if catalog.exl3().is_some() { Self::Exl3(cuteafd_core::Exl3RowPolicy::for_geometry(geometry)) }
             else if catalog.fp8().is_some() { Self::Fp8 } else { Self::Native })
     }
@@ -64,6 +67,7 @@ impl SparkBackend {
             Self::Exl3(policy) => policy.capacities(4096).expect("4096 is a valid EXL3 extent"),
             Self::Fp8 => FP8_EXPORTS.to_vec(),
             Self::Native => NATIVE_EXPORTS.to_vec(),
+            Self::V41 => cuteafd_core::V41_TARGET_CAPACITIES.map(|n| n as u32).to_vec(),
             Self::Exlr8 => vec![cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS as u32, 4096],
         }
     }
@@ -151,9 +155,9 @@ mod tests {
             assert_eq!(plan.decode, [DecodeExecution { capacity: rows, compiled_capacity: compiled }], "{backend:?}");
         }
         // V4.1's unit selects its covering native main.
-        let v41 = admit(&crate::plan::families::deepseek::DEEPSEEK_V41, &SparkBackend::Native.exports(), None,
+        let v41 = admit(&crate::plan::families::deepseek::DEEPSEEK_V41, &SparkBackend::V41.exports(), None,
             PrefillUnits { unit_rows: 256, waves: 2 }).unwrap();
-        assert_eq!(v41.decode, [DecodeExecution { capacity: 64, compiled_capacity: 80 }; 2]);
+        assert_eq!(v41.decode, [DecodeExecution { capacity: 64, compiled_capacity: 64 }; 2]);
         assert_eq!(v41.prefill, PrefillExecution { capacity: 256, compiled_capacity: 256, unit_rows: 256, buffered_units: 2 });
     }
 

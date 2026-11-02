@@ -43,9 +43,9 @@ pub(crate) struct SourceCache<'a> {
     staging: HostAllocation<'a>,
     stride: usize,
     /// Physical pages bound to each slot, in row order; rows below `rows` are initialized.
-    pages: [Vec<u32>; 16],
-    rows: [usize; 16],
-    writing: Rc<std::cell::Cell<u16>>,
+    pages: [Vec<u32>; cuteafd_core::V41_MAX_REQUESTS],
+    rows: [usize; cuteafd_core::V41_MAX_REQUESTS],
+    writing: Rc<std::cell::Cell<u64>>,
     pub(super) replica: Option<replica::SourceCacheReplica<'a>>,
 }
 /// An append transaction over bound pages: the new committed length of each participating
@@ -55,8 +55,8 @@ pub(super) struct IndexPlan {
     guard: Option<WriteGuard>,
 }
 struct WriteGuard {
-    flags: Rc<std::cell::Cell<u16>>,
-    mask: u16,
+    flags: Rc<std::cell::Cell<u64>>,
+    mask: u64,
 }
 impl Drop for WriteGuard {
     fn drop(&mut self) {
@@ -95,7 +95,7 @@ impl<'a> SourceCache<'a> {
             (1..=262144).contains(&pages),
             "invalid index pool page count"
         );
-        ensure!((1..=16).contains(&slots), "invalid index slot count");
+        ensure!((1..=cuteafd_core::V41_MAX_REQUESTS).contains(&slots), "invalid index slot count");
         Ok(pages * PAGE_ROWS * SOURCE_ROW_BYTES + slots * (pages.min(4096) * 4 + 8))
     }
     pub fn new(library: &'a NativeLibrary, pages: usize, slots: usize) -> Result<Self> {
@@ -113,7 +113,7 @@ impl<'a> SourceCache<'a> {
             kv_scales: DeviceAllocation::attention_plane(library, pages * PAGE_ROWS, KV_SCALES, "compressed cache scales")?,
             capacity: pages * PAGE_ROWS,
             pages: std::array::from_fn(|_| vec![]),
-            rows: [0; 16],
+            rows: [0; cuteafd_core::V41_MAX_REQUESTS],
             writing: Default::default(),
             replica: None,
         })
@@ -265,7 +265,7 @@ impl<'a> SourceCache<'a> {
     pub fn reserve(&self, appends: &[(usize, usize, usize)]) -> Result<IndexPlan> {
         let slots = self.slots();
         let mut plan = plan_appends(&self.pages[..slots], &self.rows[..slots], self.writing.get(), appends)?;
-        let mask = appends.iter().fold(0u16, |mask, &(slot, _, _)| mask | 1 << slot);
+        let mask = appends.iter().fold(0u64, |mask, &(slot, _, _)| mask | 1 << slot);
         self.writing.set(self.writing.get() | mask);
         plan.guard = Some(WriteGuard { flags: self.writing.clone(), mask });
         Ok(plan)
@@ -290,10 +290,10 @@ impl<'a> SourceCache<'a> {
 
 /// Validate `appends` (`(slot, old rows, new rows)`) against the bound `tables`: an append
 /// writes only rows past the slot's committed length and inside its bound pages.
-fn plan_appends(tables: &[Vec<u32>], rows: &[usize], writing: u16, appends: &[(usize, usize, usize)])
+fn plan_appends(tables: &[Vec<u32>], rows: &[usize], writing: u64, appends: &[(usize, usize, usize)])
     -> Result<IndexPlan> {
     let mut plan = IndexPlan { lengths: vec![], guard: None };
-    let mut seen = [false; 16];
+    let mut seen = [false; cuteafd_core::V41_MAX_REQUESTS];
     for (position, &(slot, old, new)) in appends.iter().enumerate() {
         ensure!(
             slot < tables.len() && !seen[slot],
@@ -444,4 +444,13 @@ mod tests {
         assert_eq!(cache.binding(1), (&[][..], 0));
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn source_append_reservation_covers_slot_63() {
+    let tables = vec![vec![0]; cuteafd_core::V41_MAX_REQUESTS];
+    let rows = vec![0; cuteafd_core::V41_MAX_REQUESTS];
+    assert!(plan_appends(&tables, &rows, 0, &[(63, 0, 1)]).is_ok());
+    assert!(plan_appends(&tables, &rows, 1u64 << 63, &[(63, 0, 1)]).is_err());
 }

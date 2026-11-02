@@ -123,13 +123,13 @@ mod spark_tests {
                 assert_eq!((model.capacity(), model.compiled_capacity()), (live, compiled));
                 // Two decode lanes, one prefill owner holding the two units in flight.
                 assert_eq!(model.executions.decode, [cuteafd_core::DecodeExecution {
-                    capacity: cuteafd_core::V41_VERIFY_ROWS as u32, compiled_capacity: 80 }; 2]);
+                    capacity: cuteafd_core::V41_VERIFY_ROWS as u32, compiled_capacity: cuteafd_core::V41_VERIFY_ROWS as u32 }; 2]);
                 assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: live,
                     compiled_capacity: compiled, unit_rows: live, buffered_units: 2 });
                 // The decode lanes' links at the decode width (P3), the prefill link at the unit.
                 let ingress = if bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 };
                 assert_eq!(model.endpoints.iter().map(|e| (e.capacity, e.ingress)).collect::<Vec<_>>(),
-                    [(80.min(live), ingress), (80.min(live), ingress), (live, ingress)]);
+                    [((cuteafd_core::V41_VERIFY_ROWS as u32).min(live), ingress), ((cuteafd_core::V41_VERIFY_ROWS as u32).min(live), ingress), (live, ingress)]);
             }
         }
         Ok(())
@@ -1205,7 +1205,7 @@ mod admission_tests {
             assert!(resolve(&args, &memory, vec![], 0, &[0], 0, None).is_err());
         }
         args.max_context_tokens = 262_144;
-        for concurrency in [0, 17, u32::MAX] {
+        for concurrency in [0, 65, u32::MAX] {
             args.concurrency = concurrency;
             assert!(resolve(&args, &memory, vec![], 0, &[0], 0, None).is_err());
         }

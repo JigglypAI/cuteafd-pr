@@ -9,7 +9,7 @@ set(CUTEAFD_V41_TP2_COMPACT_ARGS)
 if(CUTEAFD_V41_TP2_COMPACT_EXPERIMENT)
   list(APPEND CUTEAFD_V41_TP2_COMPACT_ARGS --compact-max-capacity 16 --compact-live-rows 8)
 endif()
-foreach(rows IN ITEMS 1 16 80 256 1024 4096)
+foreach(rows IN LISTS CUTEAFD_V41_TARGET_ROWS)
   set(stem "${CUTEAFD_V41_TP2_EXPERT_DIR}/v41_rtx_tp2_m${rows}")
   list(APPEND CUTEAFD_V41_TP2_EXPERT_OBJECTS "${stem}.o")
   list(APPEND CUTEAFD_V41_TP2_EXPERT_HEADERS "${stem}.h")
@@ -23,7 +23,7 @@ add_custom_command(
     "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
     --output-dir "${CUTEAFD_V41_TP2_EXPERT_DIR}" --role rtx_tp2
-    --rows 1,16,80,256,1024,4096 --width 192 --standard-names
+    --rows ${CUTEAFD_V41_TARGET_ROWS_ARG} --width 192 --standard-names
     ${CUTEAFD_V41_TP2_COMPACT_ARGS}
   COMMAND "${CMAKE_COMMAND}" -E copy
     "${CUTEAFD_V41_TP2_EXPERT_DIR}/v41_expert_variants.h"

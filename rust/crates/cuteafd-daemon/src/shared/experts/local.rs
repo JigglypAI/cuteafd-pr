@@ -94,16 +94,16 @@ impl<'a> LocalExpertWave<'a> {
     }
     fn capacities(capacity: u32) -> Result<Vec<u32>> {
         ensure!(
-            matches!(capacity, 1 | 16 | 80 | 256 | 1024 | 4096),
+            cuteafd_core::V41_TARGET_CAPACITIES.contains(&u64::from(capacity)),
             "invalid local expert capacity"
         );
-        let mut capacities: Vec<_> = [1, 16, 80].into_iter().filter(|&c| c < capacity).collect();
+        let mut capacities: Vec<_> = cuteafd_core::V41_DECODE_CAPACITIES.map(|n| n as u32).into_iter().filter(|&c| c < capacity).collect();
         capacities.push(capacity);
         Ok(capacities)
     }
     fn exl3_capacities(capacity: u32) -> Result<Vec<u64>> {
         // Retain the local owner's exact prefill set and canonical wide decode.
-        let capacity = if capacity > 1 && capacity < 80 { 80 } else { capacity };
+        let capacity = if capacity > 1 && capacity < cuteafd_core::V41_VERIFY_ROWS as u32 { cuteafd_core::V41_VERIFY_ROWS as u32 } else { capacity };
         Ok(Self::capacities(capacity)?.into_iter().map(u64::from).collect())
     }
     pub fn device_bytes(

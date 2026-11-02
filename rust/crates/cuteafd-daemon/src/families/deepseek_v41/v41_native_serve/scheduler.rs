@@ -2056,7 +2056,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
 ) -> Result<()> {
     let _capture_watch = crate::shared::decode_graph::CaptureWatch::round();
     let started = Instant::now();
-    ensure!(!members.is_empty() && members.len() <= 8, "invalid single decode lane");
+    ensure!(!members.is_empty() && members.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS, "invalid single decode lane");
     let speculative = draft.is_some();
     let capture = draft.as_deref().map(DraftRuntime::capture).unwrap_or_default();
     // Speculative rows vary every round: keep each decode shape's graphs,
@@ -2600,10 +2600,10 @@ fn publish_commit_lane<'a>(active: &mut [Option<Active<'a>>],
 #[allow(clippy::too_many_arguments)]
 /// Whether each member decoded under an active grammar mask this round.
 fn masked_members(round: Option<&SamplingRound>, active: &[Option<Active<'_>>], members: &[usize],
-    inputs: &[Vec<u32>]) -> [bool; 8] {
-    let mut masked = [false; 8];
+    inputs: &[Vec<u32>]) -> Vec<bool> {
+    let mut masked = vec![false; members.len()];
     let mut row = 0;
-    for (index, (&slot, input)) in members.iter().zip(inputs).enumerate().take(8) {
+    for (index, (&slot, input)) in members.iter().zip(inputs).enumerate() {
         masked[index] = match round {
             Some(round) => round.plan.mask.get(row..row + input.len())
                 .is_some_and(|rows| rows.iter().any(Option::is_some)),

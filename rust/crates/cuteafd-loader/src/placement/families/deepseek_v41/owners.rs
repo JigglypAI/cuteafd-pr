@@ -44,8 +44,8 @@ pub fn encoder_suffix_bytes(unit: u64, concurrency: u64) -> u64 {
 
 /// Rows of a decode lane's private owners: the compiled cover of the widest
 /// decode/verify step (`V41_VERIFY_ROWS`).
-pub const DECODE_LANE_ROWS: u64 = 80;
-const _: () = assert!(cuteafd_core::V41_VERIFY_ROWS as u64 <= DECODE_LANE_ROWS);
+pub const DECODE_LANE_ROWS: u64 = cuteafd_core::V41_VERIFY_ROWS as u64;
+const _: () = assert!(cuteafd_core::V41_VERIFY_ROWS as u64 == DECODE_LANE_ROWS);
 
 /// The attention GPU of `layer` on two RTX (the encoder/decoder map: layers
 /// 0..20 on GPU0, 20..40 on GPU1).
@@ -80,7 +80,7 @@ pub fn index_selection_storage_bytes(reserve: u64, unit: u64) -> Result<[u64; 2]
 /// Placed two-RTX producers use their own publication storage instead.
 pub fn window_batch_bytes(rows: u64) -> Result<u64> {
     ensure!((1..=4096).contains(&rows), "invalid V4.1 window batch rows");
-    Ok(40 * (64 + rows * 8 + 16 * 16))
+    Ok(40 * (64 + rows * 8 + cuteafd_core::V41_MAX_REQUESTS as u64 * 16))
 }
 
 /// Coordinator-owned Spark wave planes. Pinned intake belongs to its own domain.
@@ -208,7 +208,7 @@ impl<'a> NativePrograms<'a> {
     }
 
     fn main_context(&self, rows: u64) -> Result<u64> {
-        Ok(self.projection(rows, 15360, 5120)? + 1152
+        Ok(self.projection(rows, 15360, 5120)? + 3 * cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES as u64
             + rows * (10240 + 256 + 8 + 3 * 1024)
             + 3 * (self.projection(rows, 5120, 512)? - rows * 10240))
     }
@@ -404,7 +404,7 @@ impl<'a> NativePrograms<'a> {
     /// `experts` is the published coordinator (not RTX backbone) manifest.
     pub fn dspark(&self, experts: &Value, rows: u64, requests: u64, width: u64,
         ranks: usize, head_mode: Fp8Head) -> Result<Vec<Demand>> {
-        ensure!((1..=4096).contains(&rows) && (1..=16).contains(&requests)
+        ensure!((1..=4096).contains(&rows) && (1..=cuteafd_core::V41_MAX_REQUESTS as u64).contains(&requests)
             && matches!(width, 5 | 7) && matches!(ranks, 1 | 2), "invalid V4.1 draft owners");
         ensure!(experts["role"].as_str() == Some("coordinator"), "dSpark expert manifest role mismatch");
         ensure!(experts["input_format"].as_str() == Some("bf16"),
@@ -416,7 +416,7 @@ impl<'a> NativePrograms<'a> {
         let lanes = if requests == 1 { 1 } else { 2 };
         let members = requests.div_ceil(lanes);
         let live = members * width;
-        let capacity = if live <= 16 { 16 } else if live <= 40 { 40 } else if live <= 80 { 80 } else { 256 };
+        let capacity = if live <= 16 { 16 } else if live <= 40 { 40 } else if live <= cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 { cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 } else { cuteafd_core::V41_DRAFT_WIDE_ROWS as u64 };
         let variants = experts["variants"].as_array().context("missing dSpark expert variants")?;
         let matching: Vec<_> = variants.iter().filter(|v|
             v.get("requested_rows").unwrap_or(&v["capacity_rows"]).as_u64() == Some(capacity)).collect();
@@ -425,7 +425,7 @@ impl<'a> NativePrograms<'a> {
             + capacity * (10240 + 3 * 8 + 2 * 10240);
         let output = self.projection(capacity, 8192, 5120)?
             + self.scratch(capacity, 32768, 8192)? + 4 + capacity * (65536 + 256);
-        let attention = live * (1024 + 8) + 128 + output
+        let attention = live * (1024 + 8) + cuteafd_core::V41_READ_DESCRIPTOR_BYTES as u64 + output
             + self.projection(capacity, 5120, 1280)?
             + self.projection(capacity, 1280, 32768)?
             + self.projection(capacity, 5120, 512)?;
@@ -449,8 +449,8 @@ impl<'a> NativePrograms<'a> {
                 + if head_mode.draft() { self.head_scratch(head_mode, live, VOCAB / ranks as u64)? } else { 0 }));
         }
         add(decoder, "dSpark main context", self.main_context(rows)?
-            + if lanes > 1 { self.main_context(80)? } else { 0 });
-        add(decoder, "dSpark windows", 3 * (requests * 128 * 528 + rows * 1024 + 384));
+            + if lanes > 1 { self.main_context(DECODE_LANE_ROWS)? } else { 0 });
+        add(decoder, "dSpark windows", 3 * (requests * 128 * 528 + rows * 1024 + cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES as u64));
         Ok(out)
     }
 }
@@ -465,7 +465,7 @@ mod tests {
             (5120, 2304), (2304, 5120), (5120, 512), (1280, 4096),
             (6144, 25600), (15360, 5120)];
         let variants = matrices.into_iter().flat_map(|(k, n)| {
-            [1, 16, 80, 256, 1024, 4096].map(move |rows| json!({
+            [1, 16, 64, 80, 256, 1024, 4096].map(move |rows| json!({
                 "capacity": rows, "input_dim": k, "output_dim": n,
                 "label": format!("matrix_{k}_{n}_{rows}"), "scratch_bytes": rows + 1,
                 "expected_m": if rows <= 80 { 16 } else { rows },
@@ -645,7 +645,7 @@ mod tests {
         assert_eq!(on.iter().map(|d| d.bytes).sum::<u64>() - off.iter().map(|d| d.bytes).sum::<u64>(),
             2 * window_batch_bytes(80)? + 4 * window_batch_bytes(4096)?);
         for rows in [1, 80, 256, 1024, 4096] {
-            assert_eq!(window_batch_bytes(rows)?, 40 * (320 + 8 * rows));
+            assert_eq!(window_batch_bytes(rows)?, 40 * (64 + cuteafd_core::V41_MAX_REQUESTS as u64 * 16 + 8 * rows));
         }
         assert!(window_batch_bytes(0).is_err());
         assert!(window_batch_bytes(4097).is_err());
@@ -666,7 +666,7 @@ mod tests {
                     2 * owner(&one, rank, "dSpark request lanes"));
             }
             assert_eq!(owner(&two, decoder, "dSpark main context")
-                - owner(&one, decoder, "dSpark main context"), programs.main_context(80)?);
+                - owner(&one, decoder, "dSpark main context"), programs.main_context(DECODE_LANE_ROWS)?);
             assert_eq!(owner(&two, decoder, "dSpark windows")
                 - owner(&one, decoder, "dSpark windows"), 3 * 128 * 528);
             let lanes_packed = programs.dspark(&experts, 1024, 2, 5, ranks, Fp8Head::Packed)?;
@@ -674,12 +674,12 @@ mod tests {
                 assert_eq!(owner(&lanes_packed, rank, "dSpark request lanes") - owner(&two, rank, "dSpark request lanes"),
                     2 * programs.packed_vocabulary_scratch(5, VOCAB / ranks as u64)?);
             }
-            for requests in 1..=16 {
+            for requests in [1, 4, 16, 17, 32, 64] {
                 for width in [5, 7] {
                     let demands = programs.dspark(&experts, 1024, requests, width, ranks, Fp8Head::All)?;
                     assert!(demands.iter().all(|d| d.category == Category::Drafter));
                     assert_eq!(owner(&demands, decoder, "dSpark windows"),
-                        3 * (requests * 128 * 528 + 1024 * 1024 + 384));
+                        3 * (requests * 128 * 528 + 1024 * 1024 + cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES as u64));
                 }
             }
         }

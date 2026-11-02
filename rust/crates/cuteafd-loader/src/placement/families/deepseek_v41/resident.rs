@@ -208,7 +208,7 @@ pub fn prefix_arena_bytes(slots: u64, dspark: bool, ranks: usize) -> Vec<u64> {
 /// Persistent dSpark windows and their prefill source staging, shared across
 /// lane workspaces. All three stages reside on the decoder GPU.
 pub fn dspark_cache_bytes(slots: u64, prefill_rows: u64) -> u64 {
-    3 * (slots * 128 * 528 + prefill_rows * 1024 + 384)
+    3 * (slots * 128 * 528 + prefill_rows * 1024 + cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES as u64)
 }
 
 /// Engram tables themselves remain host-mapped. Each lane retains one device
@@ -298,7 +298,7 @@ mod tests {
         assert_eq!(one[0], two.iter().sum::<u64>());
         assert_eq!(two[1], 42 * 3 * 128 * 528);
         assert_eq!(prefix_bytes(0, true, 2), vec![0, 0]);
-        assert_eq!(dspark_cache_bytes(16, 4096), 15_828_096);
+        assert_eq!(dspark_cache_bytes(16, 4096), 15_831_552);
     }
 
     #[test]

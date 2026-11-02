@@ -372,7 +372,7 @@ struct WindowBatch<'a> {
 }
 impl<'a> WindowBatch<'a> {
     const LAYERS: usize = 40;
-    const CHUNKS: usize = 16;
+    const CHUNKS: usize = cuteafd_core::V41_MAX_REQUESTS;
     fn bytes(capacity: usize) -> usize {
         Self::LAYERS * (std::mem::size_of::<cuteafd_ffi::V41KvStoreLayer>() + capacity * 8 + Self::CHUNKS * 16)
     }

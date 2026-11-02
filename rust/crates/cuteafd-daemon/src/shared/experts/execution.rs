@@ -51,7 +51,7 @@ fn native_reduction_plan(layer: ExpertLayer, library: &NativeLibrary, capacity: 
     if nvfp4 || !compact_output_role(layer.role()) { return Ok(None); }
     let mut capacities = vec![capacity]; // execution_state index 0: main
     if capacity > 1 { capacities.push(1); } // index 1: serial
-    if capacity > 80 { capacities.push(80); } // index 2: grouped decode
+    if capacity > cuteafd_core::native_decode_rows() { capacities.push(cuteafd_core::native_decode_rows()); } // index 2: grouped decode
     let infos = capacities.into_iter().map(|rows| layer.select_info(library, rows, false))
         .collect::<Result<Vec<_>>>()?;
     Ok(Some(super::ExpertReductionPlan::native(library, infos)?))
@@ -171,8 +171,8 @@ impl<'library> ExpertWeights<'library> {
         let decode = if compact_output_role(info.role) && compiled > 1 {
             usize::try_from(layer.select_info(library, 1, nvfp4)?.scratch_bytes)?
         } else { 0 };
-        let small = if compact_output_role(info.role) && compiled > 80 {
-            usize::try_from(layer.select_info(library, 80, nvfp4)?.scratch_bytes)?
+        let small = if compact_output_role(info.role) && compiled > cuteafd_core::native_decode_rows() {
+            usize::try_from(layer.select_info(library, cuteafd_core::native_decode_rows(), nvfp4)?.scratch_bytes)?
         } else { 0 };
         ExpertExecutionBudget::from_info(info, live, decode, small)
     }
@@ -332,7 +332,7 @@ impl<'library> ExpertWeights<'library> {
             }))
         };
         let decode = prepare_small(1, budget.decode_scratch_bytes)?;
-        let small = prepare_small(80, budget.small_scratch_bytes)?;
+        let small = prepare_small(cuteafd_core::native_decode_rows(), budget.small_scratch_bytes)?;
         let route_staging = (0..1).map(|_| crate::shared::memory::HostAllocation::named(library,
             budget.routing_bytes, "experts/workspace/route_staging" )).collect::<Result<Vec<_>>>()?;
         Ok(ExpertExecution {
@@ -416,7 +416,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         let reduction_plan = native_reduction_plan(weights.layer, self.library, compiled, weights.is_nvfp4())?;
         let main = prepare(compiled, "experts/workspace/alternate_main_scratch")?;
         let decode = if compiled > 1 { Some(prepare(1, "experts/workspace/alternate_serial_scratch")?) } else { None };
-        let small = if compiled > 80 { Some(prepare(80, "experts/workspace/alternate_grouped_scratch")?) } else { None };
+        let small = if compiled > cuteafd_core::native_decode_rows() { Some(prepare(cuteafd_core::native_decode_rows(), "experts/workspace/alternate_grouped_scratch")?) } else { None };
         self.alternate_widths.push(NativeWidthState { kernel: main.kernel, scratch: main.scratch,
             slots: main.slots, decode, small, reduction_plan });
         Ok(())

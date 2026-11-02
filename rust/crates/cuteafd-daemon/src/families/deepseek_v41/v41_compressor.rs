@@ -60,7 +60,7 @@ struct Slot {
 pub(crate) struct CompressorState<'a> {
     index: SourceCache<'a>,
     pending: Option<[DeviceAllocation<'a>; 2]>,
-    slots: [Slot; 16],
+    slots: [Slot; cuteafd_core::V41_MAX_REQUESTS],
     slot_count: usize,
     layer: usize,
     owner: u64,
@@ -82,7 +82,7 @@ impl<'a> CompressorState<'a> {
     }
     /// Fully provision every admitted slot, rounding each slot to physical pages.
     pub fn pages_for_context(layer: usize, slots: usize, context: usize) -> Result<usize> {
-        ensure!((1..=16).contains(&slots), "invalid compressor slot count");
+        ensure!((1..=cuteafd_core::V41_MAX_REQUESTS).contains(&slots), "invalid compressor slot count");
         ensure!((1..=1048576).contains(&context), "invalid compressor context");
         let pages = context.div_ceil(ratio(layer)?).div_ceil(source_cache::PAGE_ROWS) * slots;
         SourceCache::device_bytes(pages, slots)?;
@@ -90,7 +90,7 @@ impl<'a> CompressorState<'a> {
     }
 
     pub fn device_bytes(layer: usize, slots: usize, index_pages: usize) -> Result<usize> {
-        ensure!((1..=16).contains(&slots), "invalid compressor slot count");
+        ensure!((1..=cuteafd_core::V41_MAX_REQUESTS).contains(&slots), "invalid compressor slot count");
         Ok(SourceCache::device_bytes(index_pages, slots)?
             + if ratio(layer)? == 2 { slots * 4096 } else { 0 })
     }
@@ -118,7 +118,7 @@ impl<'a> CompressorState<'a> {
             } else {
                 None
             },
-            slots: [Slot::default(); 16],
+            slots: [Slot::default(); cuteafd_core::V41_MAX_REQUESTS],
             slot_count: slots,
             layer,
             owner,
@@ -747,7 +747,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             completed: vec![],
             rows: 0,
         };
-        let mut seen = [false; 16];
+        let mut seen = [false; cuteafd_core::V41_MAX_REQUESTS];
         for chunk in chunks {
             let slot = state.validate(chunk.lease)?;
             ensure!(
