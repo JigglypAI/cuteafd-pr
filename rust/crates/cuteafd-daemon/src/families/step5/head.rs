@@ -85,17 +85,22 @@ impl HeadPlan {
             && g["width"] == H && g["heads"] == 1 && g["zero_centered"] == true
             && g["subtract_mean"] == false && g["bias"] == false && g["rotary"] == 0
             && g["epsilon"] == "runtime_float32", "Step-5 final norm ABI/geometry mismatch");
-        let native_bytes = match &native {
-            Some(name) => (layout.core[name].bytes as u64).checked_add(
-                cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new(H, V, kernel_rows)?.bytes()? as u64)
-                .context("Step-5 native head overflow")?,
-            None => 0,
-        };
-        let bytes = weights.iter().map(|w| w.allocation_bytes)
-            .chain(planes.iter().map(|&n| n as u64)).chain([native_bytes])
-            .try_fold(0u64, |n, v| n.checked_add(v)).context("Step-5 head byte overflow")?;
+        let bytes = Self::owner_bytes(&weights, native.as_ref().map(|name| &layout.core[name]),
+            &planes, kernel_rows)?;
         Ok(Self { layout, weights, native, planes, rows, epsilon: cfg.norm_eps, bytes,
             predictor: stage.is_some(), kernel_rows })
+    }
+
+    fn owner_bytes(weights: &[WeightOperand], native: Option<&cuteafd_loader::formats::trellis_core::CoreWeightLayout>,
+        planes: &[usize; 4], kernel_rows: usize) -> Result<u64> {
+        let native_bytes = native.map(|core| -> Result<u64> {
+            (core.bytes as u64).checked_add(
+                cuteafd_loader::formats::head::native_private_scratch(core.shape, kernel_rows)?.bytes()? as u64)
+                .context("Step-5 native head overflow")
+        }).transpose()?.unwrap_or(0);
+        weights.iter().map(|w| w.allocation_bytes)
+            .chain(planes.iter().map(|&n| n as u64)).chain([native_bytes])
+            .try_fold(0u64, |n, v| n.checked_add(v)).context("Step-5 head byte overflow")
     }
 
     pub fn bytes(&self) -> u64 { self.bytes }
@@ -149,7 +154,8 @@ impl<'a> TargetHeadOwner<'a> {
             let native = plan.native.as_ref().map(|name| -> Result<_> {
                 let mut layer = super::native::NativeLayer::load(device, programs, checkpoint, &plan.layout,
                     plan.kernel_rows, |n| n == name)?;
-                let layout = layer.scratch_layout(plan.kernel_rows)?.context("native head scratch")?;
+                let layout = cuteafd_loader::formats::head::native_private_scratch(
+                    plan.layout.core[name].shape, plan.kernel_rows)?;
                 let linear = std::rc::Rc::try_unwrap(layer.linears.remove(name).context("native head")?)
                     .map_err(|_| anyhow::anyhow!("native head aliased"))?;
                 Ok((linear, super::native::NativeScratch::allocate(device, &layout)?))
@@ -287,6 +293,43 @@ pub(super) mod tests {
         drop(lane);
         ensure!(std::rc::Rc::strong_count(&immutable) == 1,
             "Step-5 lane must release its immutable reference after drainage");
+        Ok(())
+    }
+
+    #[test]
+    fn native_k6_head_plan_matches_private_owner_and_reusable_planes() -> Result<()> {
+        use cuteafd_loader::formats::{dense_trellis::TrellisSide, exl3_storage::Exl3Codebook,
+            trellis_core::CoreWeightLayout};
+        use cuteafd_loader::plan::families::step5::coordinator::WeightSlice;
+        let core_bytes = V * H * 6 / 8 + 2 * (V + H);
+        let native = CoreWeightLayout { stem: "lm_head".into(), side: TrellisSide::Output,
+            rank: 0, ranks: 1, shape: [V, H], bytes: core_bytes, bits: 6,
+            codebook: Exl3Codebook::Mcg };
+        let norm = WeightOperand { name: "model.norm.weight".into(), sources: vec![], dtype: DType::F32,
+            shape: vec![H], slice: WeightSlice::Replicated, allocation_bytes: (H * 4) as u64 };
+        for (unit, logits, private_scratch) in [(64, 64, 165511240), (256, 64, 400128072),
+            (256, 256, 400128072)] {
+            let planes = HeadPlan::plane_bytes(logits)?;
+            let weights = vec![norm.clone()];
+            let bytes = HeadPlan::owner_bytes(&weights, Some(&native), &planes, unit)?;
+            let plan = HeadPlan { layout: RankWeightLayout { rank: 0, ranks: 1, operands: vec![],
+                core: [("lm_head.weight".into(), native.clone())].into(), resident_bytes: 0 },
+                weights, native: Some("lm_head.weight".into()), planes, rows: logits,
+                epsilon: 1e-5, bytes, predictor: false, kernel_rows: unit };
+            let owner_layout = cuteafd_loader::formats::head::native_private_scratch(native.shape, unit)?;
+            assert_eq!(owner_layout.rows, unit);
+            assert_eq!(owner_layout.bytes()? as u64, private_scratch);
+            assert_eq!(plan.immutable_bytes(), (H * 4 + core_bytes) as u64 + private_scratch);
+            assert_eq!(plan.workspace_bytes(), (logits * (H * 4 + V * 4) + (4 << 20)) as u64);
+            assert_eq!(plan.bytes(), plan.immutable_bytes() + plan.workspace_bytes());
+            // The private owner survives while only the logit planes alias this larger arena.
+            let arena = plan.workspace_bytes() + 1024;
+            let admitted = super::super::execution::RankAdmission { immutable: 1000, workspace: arena }
+                .with_head(&plan)?;
+            assert_eq!(admitted.immutable, 1000 + plan.immutable_bytes());
+            assert_eq!(admitted.workspace, arena);
+            assert_eq!(admitted.bytes()?, 1000 + plan.immutable_bytes() + arena);
+        }
         Ok(())
     }
 

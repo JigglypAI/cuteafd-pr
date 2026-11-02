@@ -307,7 +307,7 @@ pub fn rank_admission(
             n.checked_add(w.allocation_bytes)
         })
         .context("Step-5 native rank immutable overflow")?;
-    let immutable = layout.core.values().try_fold(immutable, |n, core| n.checked_add(core.bytes as u64))
+    let mut immutable = layout.core.values().try_fold(immutable, |n, core| n.checked_add(core.bytes as u64))
         .context("Step-5 native core immutable overflow")?;
     let owns = (0..cfg.layers).any(|layer| ownership.layer(layer, rank).is_ok_and(|l| l.query_heads > 0));
     let mut workspace = if owns {
@@ -316,13 +316,12 @@ pub fn rank_admission(
             .context("Step-5 rank workspace overflow")?
     } else { 0 };
     if rank == ownership.execution().spec().head_gpu as usize {
-        // The head reuses the arena after every layer drained; a native head adds its own scratch.
-        let head_scratch = layout.core.get("lm_head.weight").map(|core| {
-            let [n, k] = core.shape;
-            crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, logits)?.bytes()
-        }).transpose()?.unwrap_or(0) as u64;
-        workspace = workspace.max(plane_bytes(&head_planes(logits)?)?.checked_add(head_scratch)
-            .context("Step-5 head workspace overflow")?);
+        // Only logit planes reuse the arena; native scratch lives with the head's private owners.
+        let head_scratch = layout.core.get("lm_head.weight").map(|core|
+            crate::formats::head::native_private_scratch(core.shape, unit)?.bytes())
+            .transpose()?.unwrap_or(0) as u64;
+        immutable = immutable.checked_add(head_scratch).context("Step-5 private head scratch overflow")?;
+        workspace = workspace.max(plane_bytes(&head_planes(logits)?)?);
     }
     Ok(RankAdmission {
         immutable,
@@ -383,6 +382,31 @@ mod tests {
 
     fn end(layout: &[(usize, usize)]) -> usize {
         layout.iter().map(|&(offset, bytes)| offset + bytes).max().unwrap()
+    }
+
+    #[test]
+    fn native_k6_head_private_owner_is_not_reusable_plane_workspace() -> Result<()> {
+        use crate::placement::{FfnMode, LayerMode};
+        use super::super::ownership;
+        let fixture = super::super::tests::exl3_snapshot();
+        let checkpoint = Checkpoint::open(fixture.path())?;
+        let cfg = Config::parse(&checkpoint)?;
+        let modes = vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }; cfg.layers];
+        let ownership = ExecutionOwnership::new(&cfg, 1, ownership::plan(&modes, 0, 0))?;
+        let layout = RankWeightLayout::for_execution(&checkpoint, 0, &ownership)?;
+        assert_eq!(layout.core["lm_head.weight"].bits, 6);
+        let weights = layout.operands.iter().filter(|w| w.name != "model.embed_tokens.weight")
+            .map(|w| w.allocation_bytes).sum::<u64>()
+            + layout.core.values().map(|core| core.bytes as u64).sum::<u64>()
+            + CoordinatorContract::from_checkpoint(&checkpoint)?.rope_tables.allocation_bytes;
+        for logits in [16, 64] {
+            let admitted = rank_admission(&checkpoint, &ownership, 0, 64, 64, logits)?;
+            assert_eq!(admitted.immutable, weights + 165511240);
+            let reusable = rank_attention_bytes(&cfg, &ownership, 0, 64)?
+                + ffn_region_bytes(64, 64)? + native_scratch_bytes(&layout, 64)?;
+            assert_eq!(admitted.workspace, reusable.max(plane_bytes(&head_planes(logits)?)?));
+        }
+        Ok(())
     }
 
     #[test]

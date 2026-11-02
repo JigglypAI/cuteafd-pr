@@ -28,7 +28,7 @@ pub(super) struct RankAdmission {
     pub(super) workspace: u64,
 }
 impl RankAdmission {
-    fn bytes(self) -> Result<u64> {
+    pub(super) fn bytes(self) -> Result<u64> {
         self.workspace.checked_add(self.immutable).context("Step-5 native admission overflow")
     }
 
@@ -40,7 +40,7 @@ impl RankAdmission {
         Ok(bytes)
     }
 
-    fn with_head(self, head: &super::head::HeadPlan) -> Result<Self> {
+    pub(super) fn with_head(self, head: &super::head::HeadPlan) -> Result<Self> {
         Ok(Self {
             immutable: self.immutable.checked_add(head.immutable_bytes())
                 .context("Step-5 native head weight overflow")?,
