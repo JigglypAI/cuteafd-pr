@@ -51,6 +51,16 @@ fn index_selection(unit: u64) -> Result<u64> {
         + topk(WIDTH, 512) + 2048 + 16384 + topk(BLOCKS, 2048) + 8192))
 }
 
+/// Source and follower index-selection owners. Selected IDs survive later
+/// attention hooks in both owners; only source candidate blocks span the reserve.
+/// Shared with the runtime so admission and allocation use one retention formula.
+pub fn index_selection_storage_bytes(reserve: u64, unit: u64) -> Result<[u64; 2]> {
+    ensure!((1..=4096).contains(&unit) && unit <= reserve && reserve <= 8256,
+        "invalid V4.1 index selection geometry");
+    Ok([index_selection(unit)? + (reserve - unit) * (2048 + 8192),
+        reserve * 2048 + unit * 8192])
+}
+
 /// Single-RTX cache execution retains a per-layer descriptor/destination table.
 /// Placed two-RTX producers use their own publication storage instead.
 pub fn window_batch_bytes(rows: u64) -> Result<u64> {
@@ -265,8 +275,8 @@ impl<'a> NativePrograms<'a> {
             let owns_index = !placed || [2usize, 8, 14, 20, 24, 28, 32, 36].iter().any(|&l| v41_attention_gpu(l) == rank);
             if owns_index {
                 let index_query = COMPRESSOR_WORKSPACE + self.scratch(u, 1280, 4096)? + 4 + u * 23560;
-                let selection = index_selection(u)? + (r - u) * 8192;
-                let follower = if !placed || v41_attention_gpu(20) == rank { u * (2048 + 8192) } else { 0 };
+                let [selection, retained_follower] = index_selection_storage_bytes(r, u)?;
+                let follower = if !placed || v41_attention_gpu(20) == rank { retained_follower } else { 0 };
                 add(&mut out, "index", index_query + selection + follower);
             }
             if !placed || rank == 0 {
