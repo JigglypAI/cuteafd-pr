@@ -132,8 +132,96 @@ pub(crate) fn prepare(job: NativeRequest, tokens: Vec<u32>, expander: Option<&Mi
     Ok((Prompt { job, tokens, keys }, media, jobs))
 }
 
+/// The official wheel is hash-checked by the Python reference, never loaded by serving.
+fn snapshot_identity(snapshot: &std::path::Path) -> Result<serde_json::Value> {
+    use sha2::{Digest, Sha256};
+    let mut identity = serde_json::json!({
+        "snapshot_revision": snapshot.file_name().and_then(|s| s.to_str()).context("snapshot revision")?,
+        "transformers": "5.22.1",
+        "modeling_sha256": "a83fc96564410fcfea5cedb3310b5a28f3c7967caddd3ee955d9131f5b974e84",
+        "vision_modeling_sha256": "503e23525215ae1e59e32e1132159502b431003218874d185da9ee6842775099",
+        "image_processing_sha256": "d0271e55872a2524538bc7bef05faf9fa7c395da9bb411d10c97c0d5c123bac4",
+    });
+    for (key, file) in [("config", "config.json"), ("tokenizer", "tokenizer.json"),
+        ("preprocessor", "processor_config.json"), ("index", "consolidated.safetensors.index.json")] {
+        identity[format!("{key}_sha256")] = format!("{:x}", Sha256::digest(std::fs::read(snapshot.join(file))?)).into();
+    }
+    Ok(identity)
+}
+
+pub(crate) fn probe_features(prompt: &Prompt, media: &mut RequestMedia,
+    cache: &mut cuteafd_engine::media::EmbeddingCache, snapshot: &std::path::Path,
+    expander: Option<&MistralSpanExpander>) -> Result<()> {
+    let Some(probe) = prompt.job.probe.as_ref().filter(|p| p.spec.score_from.is_some() && !p.spec.media.is_empty()) else {
+        return Ok(());
+    };
+    let Some(root) = std::env::var_os("CUTEAFD_MEDIA_FEATURES_DIR") else { return Ok(()); };
+    let expander = expander.context("reference image features require the bundled vision tower")?;
+    anyhow::ensure!(probe.spec.cold && probe.spec.no_speculation, "feature probes require explicit cold/no_speculation");
+    probe.spec.validate_media_geometry(cuteafd_core::media::ImageTokenGeometry {
+        merge: expander.merge, row_markers: 1 })?;
+    crate::shared::probe::features::apply_probe_features(&prompt.job, media, cache,
+        &std::path::PathBuf::from(root), &snapshot_identity(snapshot)?,
+        "446a570e62b04a89ea001604ada7366baac2ea67")
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn row_marker_features_bind_native_spans_and_chunk_boundaries() {
+        use cuteafd_api::openai::probe::{Probe, ProbeSpec, ProbeMedia, ProbeFixture, ProbeImageUrl};
+        use cuteafd_loader::media::{ImageGrid, ImageKey, PreparedImage};
+        use sha2::{Digest, Sha256};
+        let tokens = vec![1, 5, 5, 6, 5, 5, 7, 2];
+        let image = Arc::new(PreparedImage { key: ImageKey([7; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
+            rgb8: Arc::from(vec![0; 4 * 4 * 14 * 14 * 3]), tokens: 6 });
+        let probe = Probe::new(ProbeSpec { cold: true, no_speculation: true, score_from: Some(7),
+            prompt_ids: Some(tokens.clone()), media: vec![ProbeMedia { start: 1, len: 6, kind: "image".into(),
+                key: "07".repeat(32), grid: [1,4,4], fixture: Some(ProbeFixture { path: "chart.png".into(),
+                    sha256: "ab".repeat(32) }), image_url: Some(ProbeImageUrl { url: "fixture".into(), detail: None }) }],
+            ..Default::default() });
+        let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(),
+            prompt: String::new(), constraint: None, images: Vec::new(), media: vec![image.clone()], audio: Vec::new(),
+            max_tokens: 8, sampling: cuteafd_core::TargetSamplingParams::default(), stop_token_ids: Vec::new(),
+            events: tokio::sync::mpsc::unbounded_channel().0, usage: None, probe: Some(probe.clone()) };
+        let expander = MistralSpanExpander { image: 5, row_break: 6, end: 7, merge: 2, vocabulary: 32 };
+        let (prompt, mut media, jobs) = prepare(job, tokens.clone(), Some(&expander), 32, 2, 16).unwrap();
+        assert_eq!(prompt.tokens, tokens);
+        assert_eq!(jobs[0].feature_bytes().unwrap(), 24);
+        let root = tempfile::tempdir().unwrap();
+        for file in ["config.json", "tokenizer.json", "processor_config.json", "consolidated.safetensors.index.json"] {
+            std::fs::write(root.path().join(file), file).unwrap();
+        }
+        let identity = snapshot_identity(root.path()).unwrap();
+        let payload: Vec<u8> = (0..12u16).flat_map(u16::to_le_bytes).collect();
+        let metadata = serde_json::json!({"schema":"cuteafd.media.features/1", "key":"07".repeat(32),
+            "grid":[1,4,4], "shape":[6,2], "dtype":"bf16-le", "tower_dtype":"bf16",
+            "sha256":format!("{:x}", Sha256::digest(&payload)), "fixture_sha256":"ab".repeat(32),
+            "snapshot_identity":identity});
+        std::fs::write(root.path().join(format!("{}.json", "07".repeat(32))), serde_json::to_vec(&metadata).unwrap()).unwrap();
+        std::fs::write(root.path().join(format!("{}.bf16", "07".repeat(32))), &payload).unwrap();
+        let mut cache = cuteafd_engine::media::EmbeddingCache::new(24);
+        crate::shared::probe::features::apply_probe_features(&prompt.job, &mut media, &mut cache,
+            root.path(), &identity, "446a570e62b04a89ea001604ada7366baac2ea67").unwrap();
+        assert!(!cache.contains(image.key));
+        let mut chunk = cuteafd_engine::media::MediaChunk::default();
+        media.write_chunk(0, 4, &mut chunk).unwrap();
+        assert_eq!(chunk.indices, [1, 2, 3]);
+        assert_eq!(chunk.features, payload[..12]);
+        media.write_chunk(4, 8, &mut chunk).unwrap();
+        assert_eq!(chunk.indices, [0, 1, 2]);
+        assert_eq!(chunk.features, payload[12..]);
+        media.write_chunk(8, 10, &mut chunk).unwrap();
+        assert!(chunk.indices.is_empty());
+        assert_eq!(probe.record().provenance.unwrap()["modeling_source_revision"],
+            "446a570e62b04a89ea001604ada7366baac2ea67");
+        std::fs::write(root.path().join("processor_config.json"), "changed").unwrap();
+        assert!(crate::shared::probe::features::apply_probe_features(&prompt.job, &mut media, &mut cache,
+            root.path(), &snapshot_identity(root.path()).unwrap(), "446a570e").is_err());
+    }
+
     #[test]
     fn text_prompts_key_identically_to_their_tokens() {
         let tokens = vec![1u32, 5, 9, 2];

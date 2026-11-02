@@ -1139,17 +1139,39 @@ impl<'a> GlmEngine<'a> {
     pub fn prefill_media_device(&self, placement: &mut GlmPlacement, tokens: &[u32],
         experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, logit_rows: usize,
         media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
-        let start = placement.len;
+        self.with_media(placement.len, tokens.len(), media,
+            || self.prefill_device(placement, tokens, experts, logit_rows))
+    }
+
+    /// Multirow scoring preserves prefill's host/device routing while injecting image rows.
+    pub fn prefill_scoring_media(&self, placement: &mut GlmPlacement, tokens: &[u32],
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, logit_rows: usize,
+        media: &cuteafd_engine::media::RequestMedia) -> Result<Option<Vec<f32>>> {
+        self.with_media(placement.len, tokens.len(), Some(media),
+            || self.prefill_rows_logits(placement, tokens, experts, None, logit_rows))
+    }
+
+    /// Teacher-forced decode chunks may cross an image span too, not just prefill chunks.
+    pub fn verify_scoring_media(&self, placement: &mut GlmPlacement, tokens: &[u32],
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
+        media: &cuteafd_engine::media::RequestMedia) -> Result<Option<DeviceLogits>> {
+        self.with_media(placement.len, tokens.len(), Some(media),
+            || self.verify_device(&mut [(placement, tokens.len())], tokens, experts))
+    }
+
+    fn with_media<T>(&self, start: usize, rows: usize,
+        media: Option<&cuteafd_engine::media::RequestMedia>, run: impl FnOnce() -> Result<T>) -> Result<T> {
+        let end = start.checked_add(rows).context("media call extent")?;
         let chunk = match media.filter(|m| !m.spans().is_empty()) {
             Some(media) => {
                 let mut chunk = cuteafd_engine::media::MediaChunk::default();
-                media.write_chunk(start, start + tokens.len(), &mut chunk)?;
+                media.write_chunk(start, end, &mut chunk)?;
                 (!chunk.indices.is_empty()).then_some(chunk)
             }
             None => None,
         };
         *self.pending_media.borrow_mut() = chunk.map(|chunk| (start, chunk));
-        let result = self.prefill_device(placement, tokens, experts, logit_rows);
+        let result = run();
         *self.pending_media.borrow_mut() = None;
         result
     }
