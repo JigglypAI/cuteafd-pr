@@ -414,7 +414,9 @@ mod tests {
                 GlmDraftRepresentation::Bf16Only, 0, capacity, capacity, format).unwrap();
             let (small, _) = bytes(2048);
             let (large, _) = bytes(8192);
-            assert_eq!(large - small, (8192 - 2048) * 5 * 2 * plane);
+            let page_tables = |capacity: u64| (capacity.div_ceil(64) * 4).max(256);
+            assert_eq!(large - small, (8192 - 2048) * 5 * 2 * plane
+                + page_tables(8192) - page_tables(2048));
             assert!(block_dspark_paged_resident_bytes(&config, 1, 1, 188,
                 GlmDraftRepresentation::Bf16Only, 0, 0, 64, format).is_err());
             assert!(block_dspark_paged_resident_bytes(&config, usize::MAX, 1, 188,

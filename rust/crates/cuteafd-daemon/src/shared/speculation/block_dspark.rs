@@ -427,7 +427,8 @@ impl<'a> DsparkDrafter<'a> {
             let fact = if packing { &layout.packing_sources } else { &layout.owners };
             ensure!(fact.iter().any(|o| o.id == canonical && o.bytes == n.max(256)),
                 "dSpark allocation {canonical} differs from shared recipe");
-            let _owner = cuteafd_ffi::memory_ledger::owner(if packing { format!("draft.block.{id}.source") } else { id.into() });
+            let owner = if packing { format!("draft.block.{id}.source") } else { id.into() };
+            let _owner = cuteafd_ffi::memory_ledger::owner(&owner);
             DeviceAllocation::named(library, n.max(256), if packing { "draft.pack.source" } else { "drafter" })
         };
         let upload = |id: &str, data: &[u8], matrix: bool| -> Result<Dev<'a>> {
