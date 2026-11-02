@@ -373,7 +373,8 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
         layer_weights: &resident.layer_bytes, layer_experts: &costs, layer_extra: &extra, fixed,
         tp2_workspace: workspace, pending_code_bytes: [0; 2], mark_slots: marks, max_context: context,
         requested_pool: options.pool_tokens.filter(|&n| n > 0), spark_ranks: 0,
-        onboard: options.onboard.unwrap_or(Onboard::Auto), startup_graph_modes: Some((concurrency.min(16) as usize, true)),
+        onboard: options.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto),
+        startup_graph_modes: Some((concurrency.min(16) as usize, true)),
     };
     let placement = qwen4::dual_placement(&inputs).context("solving Qwen owner ranges")?;
     for (rank, device) in devices.iter_mut().enumerate() {

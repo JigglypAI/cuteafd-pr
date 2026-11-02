@@ -47,10 +47,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     if report.encoder.is_none() {
         let towers = mimo_towers(report, checkpoint, model.spec().hidden as u64);
         let mut media_options = options.clone();
-        if spark_ranks > 0 && options.onboard.unwrap_or_else(|| options.local_expert_layers
-            .map(crate::placement::Onboard::Layers).unwrap_or(crate::placement::Onboard::Auto))
-            == crate::placement::Onboard::Auto {
-            media_options.onboard = Some(crate::placement::Onboard::Layers(0));
+        if spark_ranks > 0 && options.requested_onboard().unwrap_or_default()
+            == crate::placement::OnboardSetting::Auto {
+            media_options.onboard = Some(crate::placement::OnboardSetting::Layers(0));
         }
         // Fixed zero onboarding must not grow an automatic pool to all free
         // memory: cap it at the target, but let it shrink to fit like the main
@@ -311,16 +310,15 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
     use crate::placement::{Bytes2, ExpertCost, Onboard};
     use crate::placement::families::mimo_v2::{expert_layer_bytes, exact_package, package_directory, package_manifest};
     use crate::formats::fp8_experts::Slicing;
-    let onboard = options.onboard.unwrap_or_else(|| options.local_expert_layers
-        .map(Onboard::Layers).unwrap_or(Onboard::Auto));
     let catalog = input.expert_catalog()?;
+    let routed = cfg.dense.iter().filter(|&&dense| !dense).count();
+    let onboard = options.resolve_onboard(routed).unwrap_or(Onboard::Auto);
     let tensors = catalog.fp8().context("MiMo needs native FP8/MXFP4/NVFP4 expert headers")?;
     let lib = crate::placement::inventory::image_lib(options.workspace_manifest.as_deref());
     let directory = package_directory(&lib, cfg, tensors.format(), ranks)?;
     let explicit = options.mimo_expert_manifest.as_deref();
     let path = explicit.map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| directory.parent().expect("package parent").join("manifest.json"));
-    let routed = cfg.dense.iter().filter(|&&dense| !dense).count();
     let metadata = if onboard.layers(routed) == Some(0) { None }
         else { package_manifest(&directory, explicit)? };
     let mut half = [Bytes2::default(); 2];

@@ -456,7 +456,7 @@ mod tests {
         let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options {
             cache_format,
             devices: [0, 1], native_lib: &native, peers,
-            rtx_expert_layers: cuteafd_loader::placement::Onboard::Layers(local_layers), spark_budget_gib: None,
+            rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(local_layers), spark_budget_gib: None,
             rows: TARGET_TAP_ROWS, waves: 2, prefill_rows: None, slots: 1, marks: 1, max_context: 524_288,
             pool_tokens: Some(524_288), graphs: true, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
             hosted_layers: Some(hosted_layers),

@@ -518,7 +518,8 @@ pub(super) fn resolve_with_owners(
         (1..=1_048_576).contains(&args.max_context_tokens),
         "invalid V4.1 context limit"
     );
-    if let LocalLayers::Count(count) = args.rtx_expert_layers {
+    let onboard = args.rtx_expert_layers.onboard(experts.len());
+    if let cuteafd_loader::placement::Onboard::Layers(count) = onboard {
         ensure!(
             count <= experts.len(),
             "explicit V4.1 prefix exceeds available expert inventory"
@@ -585,7 +586,6 @@ pub(super) fn resolve_with_owners(
         pool.target = pool.target.max(pool.floor);
     }
     pool.ceiling = pool.requested.unwrap_or(pool.target).div_ceil(512) * 512;
-    let onboard = args.rtx_expert_layers.onboard();
     let mut fixed = owners.to_vec();
     for gpu in 0..ranks {
         fixed.extend(families::deepseek_v41::growth_demands(memory[gpu].1 as u64, ranks,
@@ -943,7 +943,7 @@ mod admission_tests {
     }
 
     #[test]
-    fn max_admits_experts_first_through_the_shared_solver() -> Result<()> {
+    fn all_pins_every_routed_expert_layer_and_refuses_when_short() -> Result<()> {
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("config.json"), include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -953,25 +953,21 @@ mod admission_tests {
             let mut args = args(dir.path());
             args.rtx_gpus = ranks as u32;
             args.max_context_tokens = 262144;
-            args.rtx_expert_layers = "max".parse()?;
+            args.rtx_expert_layers = "all".parse()?;
             let experts = vec![ExpertCost {
                 whole: Bytes2 { resident: 1 << 30, staging: 64 << 20 },
                 half: [Bytes2 { resident: 1 << 30, staging: 64 << 20 }; 2],
                 tp2: ranks == 2,
                 spark_ok: true,
             }; 40];
-            let memory = vec![(40usize << 30, 96usize << 30); ranks];
-            let max = resolve(&args, &memory, experts.clone(), 64 << 20,
+            let roomy = vec![(80usize << 30, 96usize << 30); ranks];
+            let all = resolve(&args, &roomy, experts.clone(), 64 << 20,
                 &vec![0; ranks], usize::from(ranks == 2), None)?;
-            assert!(max.placement.onboard_layers >= 1);
-            assert!(max.placement.pool_tokens >= EXPERTS_FIRST_POOL_FLOOR);
-            args.rtx_expert_layers = LocalLayers::Auto;
-            let auto = resolve(&args, &memory, experts, 64 << 20,
-                &vec![0; ranks], usize::from(ranks == 2), None)?;
-            assert!(max.placement.onboard_layers > auto.placement.onboard_layers);
-            assert!(max.placement.pool_tokens < auto.placement.pool_tokens);
-            assert_eq!(max.placement.attention_placement,
-                if ranks == 2 { AttentionPlacement::Layers } else { AttentionPlacement::Heads });
+            assert_eq!(all.placement.onboard_layers, 40);
+            let short = vec![(8usize << 30, 96usize << 30); ranks];
+            let refused = resolve(&args, &short, experts, 64 << 20,
+                &vec![0; ranks], usize::from(ranks == 2), None).map(|_| ()).unwrap_err();
+            assert!(refused.to_string().contains("40"), "{refused}");
         }
         Ok(())
     }

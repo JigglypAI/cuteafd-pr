@@ -18,7 +18,6 @@ both implementations are checked against.
 from __future__ import annotations
 
 import json
-import math
 import re
 import sys
 
@@ -171,21 +170,15 @@ def routed_layers(config: dict) -> int | None:
 
 
 def onboard(value: str, config: dict | None = None) -> str:
-    accepted = "RTX_EXPERT_LAYERS must be auto, max, all, N or N% (0..100%)"
+    accepted = "RTX_EXPERT_LAYERS must be auto, all or N"
     count = routed_layers(config) if config is not None else None
-    if value in ("auto", "max"):
+    if value in ("auto", "all"):
         return value
-    if value == "all":
-        return str(count) if count is not None else value
     if re.fullmatch(r"[0-9]+", value):
         number = int(value)
         if count is not None and number > count:
             raise SystemExit(f"{accepted}; checkpoint has {count} routed layers")
         return str(number)
-    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?%", value):
-        percent = float(value[:-1])
-        if math.isfinite(percent) and percent <= 100:
-            return str(math.floor(count * percent / 100 + 0.5)) if count is not None else value
     raise SystemExit(accepted)
 
 
