@@ -47,7 +47,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     if report.encoder.is_none() {
         let towers = mimo_towers(report, checkpoint, model.spec().hidden as u64);
         let mut media_options = options.clone();
-        if spark_ranks > 0 && options.requested_onboard().unwrap_or_default()
+        if spark_ranks > 0 && options.onboard.unwrap_or_default()
             == crate::placement::OnboardSetting::Auto {
             media_options.onboard = Some(crate::placement::OnboardSetting::Layers(0));
         }

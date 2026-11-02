@@ -48,10 +48,10 @@ pub(crate) struct ServeArgs {
     /// Pack queued short prompts, optionally preserving singleton arithmetic routes.
     #[arg(long, value_enum, default_value = "unrestricted")]
     prefill_packing: crate::shared::prefill_packing::PackingMode,
-    /// Routed layers whose EXL3 experts run whole on the entry RTX: auto lets the
-    /// planner keep as many as fit beside the pool; FP8/NVFP4 releases onboard none.
+    /// RTX expert layers: auto fills beside the pool, all fixes every routed
+    /// target layer, or N fixes exactly N. Two RTX split onboarded layers TP2.
     #[arg(long, default_value = "auto")]
-    rtx_expert_layers: cuteafd_loader::placement::Onboard,
+    rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
     /// Native predictor depth; 0 disables speculation.
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=3))]
     mtp: u8,
@@ -258,7 +258,7 @@ fn with_backend<T>(args: &ServeArgs,
         peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code, startup: vec![],
         onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
             Some(&args.manifest), args.prefill_rows as usize, ids.len(), usize::from(args.prefill_waves),
-            args.rtx_expert_layers)? };
+            args.rtx_expert_layers.resolve(catalog.routed_experts().routed_layers()))? };
     let contract = std::rc::Rc::new(cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?);
     tracing::info!(elapsed_s = startup.elapsed().as_secs_f64(), "Step-5 startup inventory complete");
     let planning = std::time::Instant::now();
@@ -566,6 +566,25 @@ mod tests {
     }
 
     #[test]
+    fn onboarding_uses_shared_target_layer_grammar() -> Result<()> {
+        use cuteafd_loader::placement::{Onboard, OnboardSetting};
+        for (text, setting, resolved) in [
+            ("auto", OnboardSetting::Auto, Onboard::Auto),
+            ("all", OnboardSetting::All, Onboard::Layers(88)),
+            ("0", OnboardSetting::Layers(0), Onboard::Layers(0)),
+            ("2", OnboardSetting::Layers(2), Onboard::Layers(2)),
+        ] {
+            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-step5", "--snapshot", "/m",
+                "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2",
+                "--rtx-expert-layers", text])?;
+            let crate::cli::Commands::ServeStep5(args) = cli.command else { panic!("Step-5 dispatch") };
+            assert_eq!(args.rtx_expert_layers, setting);
+            assert_eq!(args.rtx_expert_layers.resolve(88), resolved);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn spark_count_admission_matches_shared_width_coverage() {
         // Any Step format's shared width-class coverage; the checkpoint's own
         // format decides the exact world in admission.
@@ -656,7 +675,7 @@ mod tests {
                 "step5", &format.package_name(), true, rank, &arch, Some(&selected)).bytes).collect(),
             startup: vec![],
             onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
-                Some(&args.manifest), 256, 2, 1, args.rtx_expert_layers)?,
+                Some(&args.manifest), 256, 2, 1, args.rtx_expert_layers.resolve(catalog.routed_experts().routed_layers()))?,
         };
         for depth in 1..=3 {
             args.mtp = depth;

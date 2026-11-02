@@ -70,9 +70,6 @@ pub(super) fn layout(
             && report.audio == MediaMode::Off,
         Unqualified("host embedding, draft or media owners")
     );
-    // Every format onboards through the shared RTX expert path (pool first by
-    // default); only all-local routed experts are unqualified.
-    ensure!(opts.local_expert_layers.is_none_or(|n| n == 0), Unqualified("coordinator-local routed experts"));
     let shape = crate::plan::layout::resolve_prefill(report, opts, spark_ranks,
         crate::plan::Family::prefill_limits(&super::STEP5))?;
     let checked_rows = usize::try_from(shape.unit_rows)?;
@@ -203,7 +200,7 @@ pub(super) fn layout(
         pending_code: code,
         startup: vec![],
         onboard: super::admission::OnboardInputs::new(input.expert_catalog()?, opts.workspace_manifest.as_deref(),
-            checked_rows, coordinators, waves, opts.onboard.unwrap_or(Onboard::Auto))?,
+            checked_rows, coordinators, waves, opts.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto))?,
     };
     let admitted = admission::forecast_mtp(input.checkpoint(), &inputs, opts.native_mtp_layers)?;
     report.attention_placement = admitted.placement.attention_placement;

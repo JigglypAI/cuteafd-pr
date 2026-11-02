@@ -1452,10 +1452,10 @@ fn install_exl3_rtx_package(manifest: &std::path::Path) { testing::install_step5
 
 #[test]
 fn exl3_two_rtx_onboards_tp2_halves_and_sparks_keep_the_rest() {
-    use crate::placement::{ExpertHome, Onboard};
+    use crate::placement::{ExpertHome, OnboardSetting};
     let fixture = exl3_snapshot();
     let manifest = native_manifest(fixture.path());
-    let plan_with = |onboard: Option<Onboard>| plan::plan(fixture.path(), &PlanOptions {
+    let plan_with = |onboard: Option<OnboardSetting>| plan::plan(fixture.path(), &PlanOptions {
         placement: ExpertPlacement::from_spark_ranks(6), draft_ownership: Some(spec::DraftOwnership::None),
         layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2],
             workspace_manifest: Some(manifest.clone()), onboard, ..Default::default() }),
@@ -1476,10 +1476,17 @@ fn exl3_two_rtx_onboards_tp2_halves_and_sparks_keep_the_rest() {
     assert!(tp2.peak_bytes.iter().all(|&peak| peak > exchange));
     assert_eq!(auto.onboard_layers, Some(onboarded));
     assert!(auto.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("split TP2 over both RTX")));
-    let none = plan_with(Some(Onboard::Layers(0)));
+    let none = plan_with(Some(OnboardSetting::Layers(0)));
     assert_eq!(none.onboard_layers, Some(0));
     assert!(none.solver_placement.unwrap().layers.iter().all(|l| l.experts == ExpertHome::Spark
         || l.experts == ExpertHome::Dense));
+    let explicit = plan_with(Some(OnboardSetting::Layers(2)));
+    assert!(explicit.placement_supported, "{:#?}", explicit.hints);
+    assert_eq!(explicit.onboard_layers, Some(2));
+    let fixed = explicit.solver_placement.as_ref().unwrap();
+    assert_eq!(fixed.layers.iter().filter(|l| l.experts == ExpertHome::RtxTp2).count(), 2);
+    assert!(fixed.layers.iter().all(|l| !matches!(l.experts, ExpertHome::RtxWhole { .. })));
+    assert_eq!((fixed.tp2.as_ref().unwrap().first, fixed.tp2.as_ref().unwrap().layers), (3, 2));
     assert!(solved.pool_tokens >= 2 << 20, "pool target first: {}", solved.pool_tokens);
     eprintln!("Step-5 EXL3 2 RTX + 6 Sparks: onboard {onboarded} layers TP2, pool {}", solved.pool_tokens);
 }
@@ -1490,7 +1497,7 @@ fn exl3_two_rtx_onboards_tp2_halves_and_sparks_keep_the_rest() {
 fn nvfp4_onboarding_is_refused_with_its_deprecation() {
     let dir = snapshot("nvfp4");
     let manifest = native_manifest(dir.path());
-    let plan_with = |onboard: Option<crate::placement::Onboard>| plan::plan(dir.path(), &PlanOptions {
+    let plan_with = |onboard: Option<crate::placement::OnboardSetting>| plan::plan(dir.path(), &PlanOptions {
         placement: ExpertPlacement::from_spark_ranks(4), draft_ownership: Some(spec::DraftOwnership::None),
         layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30],
             workspace_manifest: Some(manifest.clone()), onboard, ..Default::default() }),
@@ -1499,7 +1506,7 @@ fn nvfp4_onboarding_is_refused_with_its_deprecation() {
     assert_eq!(auto.onboard_layers, Some(0), "{:#?}", auto.hints);
     assert!(auto.memory_layout.as_ref().unwrap().notes.iter()
         .any(|n| n == super::admission::NVFP4_ONBOARDING_DEPRECATED));
-    let explicit = plan_with(Some(crate::placement::Onboard::Layers(2)));
+    let explicit = plan_with(Some(crate::placement::OnboardSetting::Layers(2)));
     assert!(explicit.hints.iter().any(|h| h.what.contains("Step-5 NVFP4 is deprecated")), "{:#?}", explicit.hints);
 }
 

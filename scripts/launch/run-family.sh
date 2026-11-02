@@ -2231,11 +2231,8 @@ fi
 if [[ $serve == serve-dsv4 || $serve == serve-glm || $serve == serve-mimo ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS)"
   onboard_flag=--rtx-expert-layers
-  fixed_onboard_flag=--local-expert-layers
-  [[ $serve != serve-glm ]] || fixed_onboard_flag=--rtx-expert-layers
   if [[ $serve == serve-mimo ]]; then
     onboard_flag=--onboard
-    fixed_onboard_flag=--onboard
   fi
   case "$(get RTX_EXPERT_PEER off)" in
     on) echo "GPU1 whole-layer expert ranges were replaced by TP2 halves (v3 P4); remove RTX_EXPERT_PEER" >&2; exit 2 ;;
@@ -2244,8 +2241,7 @@ if [[ $serve == serve-dsv4 || $serve == serve-glm || $serve == serve-mimo ]]; th
   esac
   case "$local_layers" in
     "") ;;
-    auto|all) family_args+=("$onboard_flag" "$local_layers") ;;
-    *) family_args+=("$fixed_onboard_flag" "$local_layers") ;;
+    *) family_args+=("$onboard_flag" "$local_layers") ;;
   esac
 fi
 if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 ]]; then

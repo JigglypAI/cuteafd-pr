@@ -166,13 +166,10 @@ pub struct LayoutOptions {
     pub qwen_representation: crate::families::qwen4::resident::Qwen4Representation,
     /// Qwen immutable attention scratch override.
     pub qwen_attention_plan_rows: Option<usize>,
-    /// Whole routed backbone layers resident on the coordinator.
-    pub local_expert_layers: Option<usize>,
     /// Families on the shared solver (V4): the `--rtx-expert-layers`
     /// spelling (`auto|all|N`), resolved against the checkpoint's routed-expert
     /// layer count by each family. A fixed onboard makes the KV pool the
-    /// output. `None` takes the family default; `local_expert_layers` maps onto
-    /// `Layers(n)` when unset.
+    /// output. `None` takes the family default.
     pub onboard: Option<crate::placement::OnboardSetting>,
     /// V4: force FP32 FFN exchange payloads for prefill as well as TP2 decode.
     pub exchange_f32: bool,
@@ -218,17 +215,11 @@ impl LayoutOptions {
         self.draft_sequences.unwrap_or(crate::families::mimo_v2::draft_representation::DEFAULT_DRAFT_SEQUENCES as u64)
     }
 
-    /// The unresolved onboard request: `--rtx-expert-layers` wins over the
-    /// `--local-expert-layers N` alias.
-    pub fn requested_onboard(&self) -> Option<crate::placement::OnboardSetting> {
-        self.onboard.or(self.local_expert_layers.map(crate::placement::OnboardSetting::Layers))
-    }
-
     /// The requested onboard resolved against the target's routed-expert
     /// layer count (`all` becomes exactly that count); `None` leaves the
     /// family default in charge.
     pub fn resolve_onboard(&self, routed: usize) -> Option<crate::placement::Onboard> {
-        self.requested_onboard().map(|setting| setting.resolve(routed))
+        self.onboard.map(|setting| setting.resolve(routed))
     }
 }
 
@@ -305,7 +296,6 @@ impl Default for LayoutOptions {
             qwen_representation: crate::families::qwen4::resident::Qwen4Representation {
                 fp8_projections: false, fp8_head: true },
             qwen_attention_plan_rows: None,
-            local_expert_layers: None,
             onboard: None,
             exchange_f32: false,
             glmf_kda_fp32_partials: false,

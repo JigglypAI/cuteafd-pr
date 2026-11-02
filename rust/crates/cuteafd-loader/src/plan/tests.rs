@@ -1313,7 +1313,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
         let catalog = crate::read_expert_catalog(dir.path()).unwrap();
         for (ranks, gpus) in [(3, 1), (4, 1), (6, 2)] {
             let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-                rtx_bytes: vec![96 << 30; gpus], local_expert_layers: Some(1),
+                rtx_bytes: vec![96 << 30; gpus], onboard: Some(crate::placement::OnboardSetting::Layers(1)),
                 workspace_manifest: v41_workspace(dir.path()),
                 pool_tokens: Some(2_097_152), ..Default::default()
             }), ..sparks(ranks) };
@@ -2412,7 +2412,7 @@ fn native_display_suffix_does_not_skip_v41_or_v4_resident_census() {
         let dir = if v41 { strict_v41_snapshot(false) } else { v4_snapshot() };
         let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
             host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
-            rtx_bytes: vec![96 << 30], local_expert_layers: Some(1),
+            rtx_bytes: vec![96 << 30], onboard: Some(crate::placement::OnboardSetting::Layers(1)),
             workspace_manifest: v41.then(|| dir.path().join("share/PROGRAMS.json")),
             pool_tokens: Some(262_144), prefill_rows: 256, ..Default::default()
         }), ..sparks(4) }).unwrap();
@@ -2580,9 +2580,9 @@ fn v4_missing_workspace_manifest_keeps_conservative_small_card_reserve() {
 #[test]
 fn v4_pool_first_defaults_and_explicit_layer_failure() {
     let dir = v4_snapshot();
-    let solve = |bytes, pool_tokens, local_expert_layers| plan(dir.path(), &PlanOptions {
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![bytes], pool_tokens, local_expert_layers,
-            onboard: local_expert_layers.is_none().then_some(crate::placement::OnboardSetting::Auto), ..Default::default() }),
+    let solve = |bytes, pool_tokens, layers: Option<usize>| plan(dir.path(), &PlanOptions {
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![bytes], pool_tokens,
+            onboard: Some(layers.map_or(crate::placement::OnboardSetting::Auto, crate::placement::OnboardSetting::Layers)), ..Default::default() }),
         ..sparks(2)
     }).unwrap();
     let large = solve(96 << 30, None, None);
@@ -3889,7 +3889,7 @@ fn v41_small_card_graph_envelope_preserves_pro_allowance() {
     let dir = strict_v41_snapshot(false);
     for (gib, expected) in [(32, 2u64 << 30), (96, 3264u64 << 20)] {
         let options = PlanOptions {
-            layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![gib << 30], prefill_rows: 256, local_expert_layers: Some(0),
+            layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![gib << 30], prefill_rows: 256, onboard: Some(crate::placement::OnboardSetting::Layers(0)),
                 pool_tokens: Some(262_144), workspace_manifest: v41_workspace(dir.path()), ..Default::default() }),
             ..sparks(4)
         };
@@ -3928,7 +3928,7 @@ fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
     let mut options = sparks(4);
     options.vision = MediaMode::Auto;
     options.layout = Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![32 << 30], pool_tokens: Some(512),
-        local_expert_layers: Some(0), native_mtp_layers: 0, prefill_rows: 256,
+        onboard: Some(crate::placement::OnboardSetting::Layers(0)), native_mtp_layers: 0, prefill_rows: 256,
         workspace_manifest: v41_workspace(dir.path()), ..Default::default() });
     use super::encoder::EncoderKind;
     let auto_report = plan(dir.path(), &options).unwrap();
@@ -4355,7 +4355,7 @@ fn v41_encoder_preserves_experts_and_falls_back_at_runtime_budget() {
     use cuteafd_core::memory_layout::{Category, DeviceKind};
     let dir = strict_v41_snapshot(false);
     let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-        rtx_bytes: vec![96 << 30], local_expert_layers: Some(0), pool_tokens: Some(32768),
+        rtx_bytes: vec![96 << 30], onboard: Some(crate::placement::OnboardSetting::Layers(0)), pool_tokens: Some(32768),
         prefill_rows: 256, workspace_manifest: v41_workspace(dir.path()),
         spark_allocation_budget_bytes: Some(100 << 30), ..Default::default()
     }), ..Default::default() };
