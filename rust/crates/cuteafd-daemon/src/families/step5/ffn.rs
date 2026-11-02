@@ -158,9 +158,9 @@ impl DensePlan {
 
     pub(super) fn for_mtp_stage(
         programs: &Programs<'_>, checkpoint: &Checkpoint, stage: usize, rows: usize,
-        available: u64, reservations: &[u64],
+        available: u64, reservations: &[u64], contract: &cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract,
     ) -> Result<Self> {
-        let layout = RankWeightLayout::for_mtp_stage(checkpoint, stage)?;
+        let layout = RankWeightLayout::mtp_stage_from_contract(checkpoint, contract, stage)?;
         let cfg = Config::parse(checkpoint)?;
         Self::prepare_layout(programs, checkpoint, cfg.layers + stage, rows, available,
             reservations, layout)

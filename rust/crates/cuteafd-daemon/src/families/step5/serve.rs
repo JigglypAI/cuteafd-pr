@@ -315,8 +315,8 @@ fn with_backend<T>(args: &ServeArgs,
             .map(|range| usize::try_from(range.peak_bytes)).transpose()?.map(OnboardBudget::Whole),
     };
     let predictor_budget = if args.mtp > 0 {
-        let own = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::for_mtp(
-            &checkpoint, usize::from(args.mtp))?.resident_bytes;
+        let own = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::mtp_from_contract(
+            &checkpoint, &native_plan.contract, usize::from(args.mtp))?.resident_bytes;
         let total = admission.placement.items[head_rank].iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
             .context("Step-5 solved predictor allocation overflow")?;
         Some((available[head_rank], total.checked_sub(own).context("Step-5 predictor absent from ledger")?))
@@ -717,12 +717,13 @@ mod tests {
             ensure!(predictor <= total
                 && admitted.cache.ranks[head_rank].mtp_lengths.len() == usize::from(depth),
                 "predictor runtime exceeds admitted owners/cache");
+            let contract = plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?;
             for stage in 0..usize::from(depth) {
-                super::super::mtp::InputPlan::prepare(&programs, &checkpoint, stage, inputs.unit_rows())?;
+                super::super::mtp::InputPlan::prepare(&programs, &checkpoint, stage, inputs.unit_rows(), &contract)?;
                 super::super::head::HeadPlan::for_mtp_stage(&programs, &checkpoint, stage,
-                    plan::families::step5::native::head_rows(inputs.rows, false))?;
+                    plan::families::step5::native::head_rows(inputs.rows, false), &contract)?;
                 super::super::ffn::DensePlan::for_mtp_stage(&programs, &checkpoint,
-                    stage, inputs.rows, u64::MAX, &[])?;
+                    stage, inputs.rows, u64::MAX, &[], &contract)?;
             }
             let planned = plan::plan(&args.snapshot, &plan::PlanOptions {
                 placement: plan::ExpertPlacement::from_spark_ranks(6),

@@ -46,8 +46,8 @@ pub(super) struct InputPlan {
 }
 impl InputPlan {
     pub(super) fn prepare(programs: &Programs<'_>, checkpoint: &Checkpoint,
-        stage: usize, rows: usize) -> Result<Self> {
-        let layout = RankWeightLayout::for_mtp_stage(checkpoint, stage)?;
+        stage: usize, rows: usize, contract: &cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract) -> Result<Self> {
+        let layout = RankWeightLayout::mtp_stage_from_contract(checkpoint, contract, stage)?;
         let cfg = Config::parse(checkpoint)?;
         let prefix = format!("model.layers.{}.", cfg.layers + stage);
         let eh_name = format!("{prefix}eh_proj.weight");
@@ -238,10 +238,10 @@ impl<'a> StageOwner<'a> {
         contract: &cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract) -> Result<Self> {
         let capacities = native::mtp_rows(rows)?;
         let rows = capacities.layer;
-        let input = InputPlan::prepare(programs, checkpoint, stage, rows)?;
+        let input = InputPlan::prepare(programs, checkpoint, stage, rows, contract)?;
         let head = super::head::HeadPlan::for_mtp_stage(programs, checkpoint, stage,
-            capacities.head)?;
-        let immutable = RankWeightLayout::for_mtp_stage(checkpoint, stage)?.resident_bytes;
+            capacities.head, contract)?;
+        let immutable = RankWeightLayout::mtp_stage_from_contract(checkpoint, contract, stage)?.resident_bytes;
         let total = reservations.iter().try_fold(immutable, |n, bytes| n.checked_add(*bytes))
             .context("Step-5 predictor owner admission overflow")?;
         ensure!(total <= available && stream.device.id == device.id,
@@ -631,7 +631,7 @@ impl<'a> Runtime<'a> {
         available: u64, reservations: &[u64]) -> Result<Self> {
         ensure!((1..=3).contains(&depth) && rows > depth,
             "Step-5 predictor runtime depth/row capacity");
-        let immutable = RankWeightLayout::for_mtp(checkpoint, depth)?.resident_bytes;
+        let immutable = RankWeightLayout::mtp_from_contract(checkpoint, execution.predictor_contract(), depth)?.resident_bytes;
         let total = reservations.iter().try_fold(immutable, |n, bytes| n.checked_add(*bytes))
             .context("Step-5 predictor runtime reservation overflow")?;
         ensure!(total <= available && cache.layout().ranks[cache.rank()].mtp_lengths.len() == depth,

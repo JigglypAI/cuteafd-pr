@@ -370,11 +370,17 @@ pub fn mtp_rows(unit: usize) -> Result<MtpRows> {
 /// Each predictor stage's native owners hold private projection scratch at
 /// exactly the row capacities used by StageOwner::load.
 pub fn mtp_native_scratch_bytes(checkpoint: &Checkpoint, depth: usize, unit: usize) -> Result<u64> {
+    let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+    mtp_native_scratch_from_contract(checkpoint, &contract, depth, unit)
+}
+
+pub fn mtp_native_scratch_from_contract(checkpoint: &Checkpoint, contract: &CoordinatorContract,
+    depth: usize, unit: usize) -> Result<u64> {
     let rows = mtp_rows(unit)?;
     use crate::formats::trellis_core::ProjectionScratchLayout;
     let mut total = 0u64;
     for stage in 0..depth {
-        let layout = RankWeightLayout::for_mtp_stage(checkpoint, stage)?;
+        let layout = RankWeightLayout::mtp_stage_from_contract(checkpoint, contract, stage)?;
         let mut owners = std::collections::BTreeMap::<&str, ProjectionScratchLayout>::new();
         for (name, core) in &layout.core {
             let owner = if name.contains(".self_attn.") { "attention" } else if name.contains(".mlp.") { "dense" }

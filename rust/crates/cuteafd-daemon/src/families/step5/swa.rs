@@ -228,7 +228,7 @@ impl<'a> SwaLayer<'a> {
         available: u64, reservations: &[u64], arena: &Arena<'a>, kv_format: Qwen4KvCache,
         contract: &CoordinatorContract,
     ) -> Result<Self> {
-        let layout = RankWeightLayout::for_mtp_stage(checkpoint, stage)?;
+        let layout = RankWeightLayout::mtp_stage_from_contract(checkpoint, contract, stage)?;
         let cfg = Config::parse(checkpoint)?;
         Self::load_layout(device, programs, checkpoint, cfg.layers + stage, rows,
             Some(rope), available, reservations, layout, 64, true, Some((arena, 0)), kv_format, None, Some(contract))
@@ -337,7 +337,7 @@ impl<'a> SwaLayer<'a> {
                     DensePlan::prepare(programs, checkpoint, layer_id, rows, u64::MAX, &[])
                 } else {
                     DensePlan::for_mtp_stage(programs, checkpoint, layer_id - cfg.layers,
-                        rows, u64::MAX, &[])
+                        rows, u64::MAX, &[], contract)
                 }
             }).transpose()?;
         let admission = Admission::for_heads(

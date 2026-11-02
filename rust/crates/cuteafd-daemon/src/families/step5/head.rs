@@ -49,9 +49,9 @@ impl HeadPlan {
     }
 
     pub(super) fn for_mtp_stage(programs: &Programs<'_>, checkpoint: &Checkpoint,
-        stage: usize, rows: usize) -> Result<Self> {
+        stage: usize, rows: usize, contract: &cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract) -> Result<Self> {
         Self::prepare_layout(programs, checkpoint, rows,
-            RankWeightLayout::for_mtp_stage(checkpoint, stage)?, Some(stage), rows)
+            RankWeightLayout::mtp_stage_from_contract(checkpoint, contract, stage)?, Some(stage), rows)
     }
 
     fn prepare_layout(programs: &Programs<'_>, checkpoint: &Checkpoint, rows: usize,

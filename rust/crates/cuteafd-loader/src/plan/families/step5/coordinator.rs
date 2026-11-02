@@ -22,6 +22,7 @@ pub struct CoordinatorContract {
     pub rope_tables: crate::plan::rope::Tables,
     pub router: SigmoidRouter,
     pub layers: Vec<LayerContract>,
+    mtp_declarations: Vec<(String, Vec<usize>, DType)>,
 }
 
 /// Official target norms all receive config.rms_norm_eps, including the
@@ -118,8 +119,12 @@ impl CoordinatorContract {
             layers.len() == 92,
             "target coordinator must exclude MTP stages"
         );
+        let mtp_declarations = model.tensors.iter().filter(|(name, tensor)|
+            !is_exl3_member(name) && tensor.role.component == Component::Speculator)
+            .map(|(name, tensor)| (name.clone(), tensor.shape.clone(), tensor.dtype.clone())).collect();
         Ok(Self {
             weights,
+            mtp_declarations,
             core: model.core.clone(),
             norm_weight: NormWeight::ZeroCentered,
             norms: TargetNormEps::from_config(cfg),
@@ -185,31 +190,39 @@ impl RankWeightLayout {
     /// MTP stages stay whole on their admitted owner. Matching head shapes
     /// do not establish tied checkpoint storage or identical weights.
     pub fn for_mtp(checkpoint: &Checkpoint, depth: usize) -> Result<Self> {
-        let model = Model::open(checkpoint)?;
-        ensure!(depth <= model.cfg.mtp, "Step-5 MTP depth exceeds checkpoint stages");
+        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+        Self::mtp_from_contract(checkpoint, &contract, depth)
+    }
+
+    pub fn mtp_from_contract(checkpoint: &Checkpoint, contract: &CoordinatorContract,
+        depth: usize) -> Result<Self> {
+        let cfg = Config::parse(checkpoint)?;
+        ensure!(depth <= cfg.mtp, "Step-5 MTP depth exceeds checkpoint stages");
         if depth == 0 {
             return Ok(Self { rank: 0, ranks: 1, operands: vec![], core: Default::default(), resident_bytes: 0 });
         }
-        let end = model.cfg.layers + depth;
-        let declarations = model.tensors.iter().filter(|(name, tensor)| {
-            !is_exl3_member(name) && tensor.role.component == Component::Speculator
-                && tensor.role.layer.is_some_and(|layer| layer < end)
-        }).map(|(name, tensor)| (name.clone(), tensor.shape.clone(), tensor.dtype.clone()));
+        let declarations = contract.mtp_declarations.iter().filter(|(name, _, _)|
+            (0..depth).any(|stage| name.starts_with(&format!("model.layers.{}.", cfg.layers + stage))))
+            .cloned();
         let weights = NativeDenseLayout::from_headers(checkpoint, declarations)?;
         let mut layout = Self::from_native(&weights, 0, 1, None)?;
-        for operand in &mut layout.operands {
-            operand.slice = WeightSlice::Replicated;
-        }
-        layout.attach_core(&model.cfg, &model.core, None, |layer| layer >= model.cfg.layers && layer < end)?;
+        for operand in &mut layout.operands { operand.slice = WeightSlice::Replicated; }
+        layout.attach_core(&cfg, &contract.core, None, |layer| layer >= cfg.layers && layer < cfg.layers + depth)?;
         Ok(layout)
     }
 
     /// One whole predictor owner, with no target or earlier-stage operands.
     pub fn for_mtp_stage(checkpoint: &Checkpoint, stage: usize) -> Result<Self> {
+        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+        Self::mtp_stage_from_contract(checkpoint, &contract, stage)
+    }
+
+    pub fn mtp_stage_from_contract(checkpoint: &Checkpoint, contract: &CoordinatorContract,
+        stage: usize) -> Result<Self> {
         let cfg = Config::parse(checkpoint)?;
         ensure!(stage < cfg.mtp, "Step-5 predictor stage outside checkpoint");
         let prefix = format!("model.layers.{}.", cfg.layers + stage);
-        let mut layout = Self::for_mtp(checkpoint, stage + 1)?;
+        let mut layout = Self::mtp_from_contract(checkpoint, contract, stage + 1)?;
         layout.operands.retain(|operand| operand.name.starts_with(&prefix));
         layout.core.retain(|name, _| name.starts_with(&prefix));
         layout.resident_bytes = layout.operands.iter().map(|operand| operand.allocation_bytes)

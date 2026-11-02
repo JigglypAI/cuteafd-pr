@@ -1602,12 +1602,13 @@ mod tests {
         use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
         use tracing_subscriber::{layer::Context, prelude::*, registry::LookupSpan, Layer};
         #[derive(Clone, Default)]
-        struct Constructions { contract: Arc<AtomicUsize>, layout: Arc<AtomicUsize> }
+        struct Constructions { contract: Arc<AtomicUsize>, layout: Arc<AtomicUsize>, opens: Arc<AtomicUsize> }
         impl<S: tracing::Subscriber + for<'s> LookupSpan<'s>> Layer<S> for Constructions {
             fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, _: &tracing::Id, _: Context<'_, S>) {
                 let counter = match attrs.metadata().name() {
                     "step5_coordinator_contract_construction" => &self.contract,
                     "step5_rank_layout_construction" => &self.layout,
+                    "step5_model_open" => &self.opens,
                     _ => return,
                 };
                 counter.fetch_add(1, Ordering::Relaxed);
@@ -1658,7 +1659,11 @@ mod tests {
                     }
                 }
                 for stage in 0..3 {
-                    let predictor = RankWeightLayout::for_mtp_stage(&checkpoint, stage)?;
+                    let predictor = RankWeightLayout::mtp_stage_from_contract(&checkpoint, &plan.contract, stage)?;
+                    let total = RankWeightLayout::mtp_from_contract(&checkpoint, &plan.contract, stage + 1)?;
+                    assert!(total.resident_bytes >= predictor.resident_bytes);
+                    cuteafd_loader::plan::families::step5::native::mtp_native_scratch_from_contract(
+                        &checkpoint, &plan.contract, stage + 1, 64)?;
                     assert!(predictor.resident_bytes > 0);
                     assert_eq!(plan.contract.rope_tables.extent, 1 << 20);
                 }
@@ -1668,6 +1673,15 @@ mod tests {
             })?;
             assert_eq!(counts.contract.load(Ordering::Relaxed), 1, "one launch contract shared by all ranks");
             assert_eq!(counts.layout.load(Ordering::Relaxed), ranks, "one selected layout per rank");
+            assert_eq!(counts.opens.load(Ordering::Relaxed), 1, "MTP constructors must not reopen the model");
+            let subscriber = tracing_subscriber::registry().with(counts.clone());
+            tracing::subscriber::with_default(subscriber, || -> Result<()> {
+                RankWeightLayout::for_mtp(&checkpoint, 1)?;
+                RankWeightLayout::for_mtp_stage(&checkpoint, 0)?;
+                Ok(())
+            })?;
+            assert_eq!(counts.opens.load(Ordering::Relaxed), 3,
+                "the counter must detect standalone MTP constructors, not just target contracts");
         }
         // Per-layer constructors must not escape the launch-scoped context.
         for source in [include_str!("routed.rs"), include_str!("ffn.rs"), include_str!("head.rs"),

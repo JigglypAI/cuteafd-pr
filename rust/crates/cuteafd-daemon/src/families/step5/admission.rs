@@ -36,7 +36,7 @@ pub(super) fn admit_mtp_with_contract<'a>(programs: &'a Programs<'a>, checkpoint
     let plan = super::execution::NativePlan::new(checkpoint, &admitted.ownership, contract)?;
     if depth > 0 {
         for stage in 0..depth {
-            super::mtp::InputPlan::prepare(programs, checkpoint, stage, inputs.unit_rows())?;
+            super::mtp::InputPlan::prepare(programs, checkpoint, stage, inputs.unit_rows(), &plan.contract)?;
         }
     }
     let ownership = &admitted.ownership;

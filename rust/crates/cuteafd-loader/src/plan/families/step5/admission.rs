@@ -459,8 +459,8 @@ pub fn admit_mtp_with_contract(checkpoint: &Checkpoint, inputs: &RuntimeInputs, 
     ensure!((1..=cfg.mtp).contains(&depth) && inputs.unit_rows() > depth,
         "Step-5 predictor depth must fit checkpoint and row capacity");
     // Native K4 predictor owners keep their own projection scratch beside their weights.
-    let weights = super::coordinator::RankWeightLayout::for_mtp(checkpoint, depth)?.resident_bytes
-        .checked_add(super::native::mtp_native_scratch_bytes(checkpoint, depth, inputs.unit_rows())?)
+    let weights = super::coordinator::RankWeightLayout::mtp_from_contract(checkpoint, contract, depth)?.resident_bytes
+        .checked_add(super::native::mtp_native_scratch_from_contract(checkpoint, contract, depth, inputs.unit_rows())?)
         .context("Step-5 predictor native forecast overflow")?;
     let workspace = super::native::mtp_forecast_workspace(inputs.unit_rows(), depth, inputs.kv_format)?;
     admit_depth_with(&cfg, inputs, depth, |ownership| {
