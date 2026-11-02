@@ -1025,10 +1025,10 @@ pub fn step5_fixture(kind: &str) -> (Value, Vec<Tensor>) {
         if dtype == "F8_E4M3" && kind == "nvfp4" {
             let stem = name.strip_suffix(".weight").unwrap();
             let [e,n,k]: [usize;3] = shape.try_into().unwrap();
-            tensors.push(testing::t(name, "U8", &[e,n,k/2]));
-            tensors.push(testing::t(format!("{stem}.weight_scale"), "F8_E4M3", &[e,n,k/16]));
-            tensors.push(testing::t(format!("{stem}.weight_scale_2"), "F32", &[e]));
-            tensors.push(testing::t(format!("{stem}.input_scale"), "F32", &[e]));
+            tensors.push(t(name, "U8", &[e,n,k/2]));
+            tensors.push(t(format!("{stem}.weight_scale"), "F8_E4M3", &[e,n,k/16]));
+            tensors.push(t(format!("{stem}.weight_scale_2"), "F32", &[e]));
+            tensors.push(t(format!("{stem}.input_scale"), "F32", &[e]));
         } else { tensors.push((name.clone(), if kind == "bf16" { "BF16" } else { dtype }, shape)); }
     }
     // Only originally quantized expert matrices widen in the BF16 root;

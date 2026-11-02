@@ -1532,7 +1532,7 @@ mod tests {
     #[test]
     fn exl3_draft_prices_cover_every_min_rank_and_actual_onboarding_home() -> Result<()> {
         use cuteafd_loader::{placement::*, plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions}};
-        use cuteafd_transport::worker_selection::{ExpertGroupingSelector, ExpertTrafficContract,
+        use cuteafd_transport::worker_selection::{ExpertGroupingSelector,
             InstalledExpertGrouping, InstalledExpertVariant, WorkerIdentity, WorkerSelection};
         use crate::shared::draft::resource::{self, LayerHome};
         let fixture = tempfile::tempdir()?;
@@ -1565,10 +1565,11 @@ mod tests {
                 "world": sparks, "topology": [sparks, 1], "ownership_wire": false,
             }))?;
             let loaded = WorkerSelection::new(identity.clone(), &remote)?;
-            let variant = InstalledExpertVariant::from_piecewise_queries(80,
-                ExpertTrafficContract::ExactGrouping, |_| Ok(48))?;
+            let variants = cuteafd_core::Exl3RowPolicy::Nearest.capacities(64)?.into_iter()
+                .map(|capacity| InstalledExpertVariant::from_queries(capacity as usize, |_| Ok(16)))
+                .collect::<Result<Vec<_>>>()?;
             let reports = (0..sparks).map(|rank| InstalledExpertGrouping::new(loaded.clone(), rank, 64,
-                ExpertGroupingSelector::Exl3Nearest, vec![variant.clone()])).collect::<Result<Vec<_>>>()?;
+                ExpertGroupingSelector::Exl3Nearest, variants.clone())).collect::<Result<Vec<_>>>()?;
             for (rank, installed) in reports.iter().enumerate() {
                 for &layer in &remote { installed.validate_for(&identity, rank, 64, layer..layer + 1)?; }
                 assert!(installed.weight_read_bytes().is_err(), "EXL3 must not fabricate FP8 descriptors");
@@ -1582,7 +1583,7 @@ mod tests {
                     if local { gpus } else { sparks })?;
                 assert_eq!(*home, if local { LayerHome::Local { slice_bytes: bytes } }
                     else { LayerHome::Remote { slice_bytes: bytes } });
-                if !local { assert_eq!(resource::worker_group_rows_for_input(&reports, layer, 64, false)?, 48); }
+                if !local { assert_eq!(resource::worker_group_rows_for_input(&reports, layer, 64, false)?, 16); }
             }
             assert_eq!(homes.iter().filter(|home| matches!(home, LayerHome::Local { .. })).count(), onboarded.len());
             eprintln!("Step draft {gpus} RTX + {sparks} Sparks: {} Local, {} Remote; all ranks covered", onboarded.len(), remote.len());
