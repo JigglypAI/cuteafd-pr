@@ -235,7 +235,9 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
         served_context, pages, local, draft, pricing)?;
     // Engine teardown may block while joining exchange workers; preserve the
     // original scheduler error before any backend or native owners unwind.
-    run(&backend, sequences).inspect_err(log_worker_error)
+    // Scheduler-owned selection, cache copies and timing live beside the target head.
+    ranks.last().context("Muse scheduler head rank")?.device
+        .run(|| run(&backend, sequences)).inspect_err(log_worker_error)
 }
 
 fn log_worker_error(error: &anyhow::Error) {
@@ -379,6 +381,56 @@ mod tests {
             assert!(trace_tokens(&set, id, count).is_err());
         }
         Ok(())
+    }
+
+    #[test]
+    fn scheduler_and_embedding_keep_their_rank_device_scopes() {
+        let serve = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(serve.contains("ranks.last().context(\"Muse scheduler head rank\")?.device\n        .run(|| run(&backend, sequences))"));
+        let forward = include_str!("forward.rs").split("pub(crate) fn head(").next().unwrap();
+        let body = forward.split("rank.device.run(|| {").nth(1).unwrap();
+        assert!(body.find("table.embed(").unwrap() < body.find(".norm(0, \"embed_norm\"").unwrap());
+        assert!(body.split("/// The head").next().unwrap().trim_end().ends_with("})\n}"));
+    }
+
+    #[test]
+    #[ignore = "requires sealed Muse exports, two RTX GPUs and four real Spark workers"]
+    fn live_tp2_one_token_forward_and_selection() -> Result<()> {
+        use crate::shared::{qwen::scheduler::Backend as _, token_io::{RowSelect, SelectBatch, SelectPlacement, TokenSelector}};
+        let mut args = args(&["--split-device", "1", "--rtx-expert-layers", "0",
+            "--pool-tokens", "16384", "--max-context", "8192", "--max-sequences", "1"])?;
+        args.snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?.into();
+        args.native_lib = std::env::var("CUTEAFD_NATIVE_LIB")?.into();
+        args.manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?.into();
+        args.peers = std::env::var("CUTEAFD_GOLDEN_PEERS")?.split(',').map(str::parse)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ensure!(args.peers.len() == 4, "TP2 forward check uses four Spark workers");
+        args.prefix.resolve_entries(1);
+        args.validate()?;
+        with_backend(&args, |backend, _| {
+            let library = backend.library();
+            ensure!(library.cuda_get_device()? == 1, "Muse scheduler must enter head device 1");
+            let (family, mut pool) = backend.prefix_cache(&args.prefix, 1)?;
+            let mut request = pool.admit_cold(&family, 1, 2,
+                |pages| super::super::prefix::Placement { pages, slot: 0, len: 0 })?.placement;
+            let logits = backend.prefill_device(&mut request, &[1], 1, pool.pool())?
+                .context("TP2 one-token forward returned no logits")?;
+            // Deliberately select and download from the other device. The shared
+            // token I/O must follow the logits stream, not this ambient ordinal.
+            crate::shared::memory::device::Device { library, id: 0 }.run(|| {
+                let mut selector = TokenSelector::new(library, SelectPlacement::Device, logits.vocab, 1)?;
+                let batch = SelectBatch { rows: vec![RowSelect { sampling: cuteafd_core::TargetSamplingParams::greedy(),
+                    position: 0, mask: None, logprob: false }] };
+                let selected = selector.select(&logits, &batch)?.remove(0)?;
+                let row = logits.row_host(library, 0)?;
+                ensure!(row.iter().all(|v| v.is_finite()), "TP2 forward logits are nonfinite");
+                ensure!(selected.token as usize == cuteafd_core::TargetSamplingParams::greedy()
+                    .select_token(&row, None, 0)?, "TP2 device/host selection disagrees");
+                ensure!(library.cuda_get_device()? == 0, "shared token I/O did not restore caller device");
+                println!("TP2 k_split attention/MoE forward + head1 selection from ambient0 passed; token={}", selected.token);
+                Ok(())
+            })
+        })
     }
 
     #[test]

@@ -26,8 +26,10 @@ pub(crate) fn embed(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &supe
     table: &crate::shared::token_io::TokenEmbedding<'_>, tokens: &[u32], stream: *mut c_void) -> Result<()> {
     let rows = tokens.len();
     let (ids, gathered) = (lane.plane("token_ids")?, lane.rows("residual", rows)?);
-    rank.device.run(|| table.embed(tokens, ids, 1, gathered, stream))?;
-    rank.device_with(cfg, stream, lane).norm(0, "embed_norm", None, rows, gathered, lane.rows("hidden", rows)?)
+    rank.device.run(|| {
+        table.embed(tokens, ids, 1, gathered, stream)?;
+        rank.device_with(cfg, stream, lane).norm(0, "embed_norm", None, rows, gathered, lane.rows("hidden", rows)?)
+    })
 }
 
 /// The head over `rows` (a contiguous range of the step's rows) on the head rank.
