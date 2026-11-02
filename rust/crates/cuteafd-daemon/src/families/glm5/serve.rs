@@ -130,13 +130,8 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         engine_args.draft_context_slots = Some(cuteafd_loader::families::glm5::draft_representation::serving_draft_context_slots(
             engine_args.draft_sequences, args.max_sequences, None));
     }
-    // A window-ring drafter's prefix marks: one per arena slot, sized like the planner's.
-    if engine_args.dspark && args.prefix.prefix_cache_entries > 0 {
-        let layout = cuteafd_loader::placement::families::glm5::ml4_draft_layout(&engine_args.snapshot,
-            engine_args.draft_context_slots.unwrap_or(20), engine_args.draft_sequences, engine_args.max_context, 1)?;
-        engine_args.draft_window_marks = args.prefix.mark_rule(args.max_sequences)
-            .slots(cuteafd_loader::placement::families::glm5::draft_window_mark_bytes(&layout)?);
-    }
+    let mut engine_args = super::ResolvedEngineArgs::new(&engine_args)?;
+    size_draft_window_marks(&mut engine_args, &args.prefix, args.max_sequences)?;
     let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
     let policy = Policy { fixed: args.draft_fixed,
         decode_share: args.decode_share };
@@ -168,6 +163,19 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         served = axum::serve(listener, api.app(router, hub)
             .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
         _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
+    }
+    Ok(())
+}
+
+fn size_draft_window_marks(resolved: &mut super::ResolvedEngineArgs, prefix: &PrefixArgs,
+    max_sequences: usize) -> Result<()> {
+    let args = &mut resolved.args;
+    // Marks and engine admission consume the same concrete context, never the auto sentinel.
+    if args.dspark && prefix.prefix_cache_entries > 0 {
+        let layout = cuteafd_loader::placement::families::glm5::ml4_draft_layout(&args.snapshot,
+            args.draft_context_slots.unwrap_or(20), args.draft_sequences, args.max_context, 1)?;
+        args.draft_window_marks = prefix.mark_rule(max_sequences)
+            .slots(cuteafd_loader::placement::families::glm5::draft_window_mark_bytes(&layout)?);
     }
     Ok(())
 }
@@ -208,11 +216,12 @@ struct Policy {
 type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Option<Arc<std::sync::atomic::AtomicBool>>)>;
 
 #[allow(clippy::too_many_arguments)]
-fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
+fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>,
     remote: Option<crate::families::glm5_flash::media::RemoteVision>) -> Result<()> {
-    let opened = match open(&args) {
+    let args = &resolved.args;
+    let opened = match open(args) {
         Ok(opened) => opened,
         Err(error) => {
             let _ = ready.send(Err(anyhow::anyhow!("{error:#}")));
@@ -220,7 +229,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         }
     };
     // The tower loads before the LM so its admitted bytes are in the LM's live baseline.
-    let (vision, prefix) = match ml4_media::ReadyVision::load(&args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
+    let (vision, prefix) = match ml4_media::ReadyVision::load(args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
         Ok(vision) => vision,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };
@@ -230,7 +239,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
     let health = encoder.health_handle();
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
-    let result = opened.with_engine(&args, |engine, transport, runtime| {
+    let result = opened.with_resolved_engine(&resolved, |engine, transport, runtime| {
         anyhow::ensure!(transport.is_some() || engine.skip_routed() || engine.has_tp2(), "serve-glm needs Spark peers, local TP2 or --skip-routed-experts");
         let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
         let spark = transport.is_some();
@@ -1433,6 +1442,46 @@ mod lane_tests {
 #[cfg(test)]
 mod draft_tests {
     use super::*;
+
+    #[test]
+    fn auto_context_is_resolved_once_before_window_marks_and_engine() -> Result<()> {
+        #[derive(clap::Parser)]
+        struct Cli { #[command(flatten)] args: ServeArgs }
+        use clap::Parser;
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("config.json"), include_str!(
+            "../../../../cuteafd-loader/src/families/mistral_large4/official-config.json"))?;
+        std::fs::write(dir.path().join("params.json"), serde_json::json!({"mtp": {
+            "n_layers": 3, "depth": 3, "ragged_attention": "2048,2048,2048",
+            "target_activation_layers": "1,18,36,54,71", "norm_strategy": "eagle",
+            "dspark": {"markov_rank": 512, "head_type": "rnn", "draft_input": "position_specific"}
+        }}).to_string())?;
+        let manifest = dir.path().join("PROGRAMS.json");
+        std::fs::write(&manifest, r#"{"capacities":{"max_context":1048576}}"#)?;
+        let mut census = Vec::new();
+        for context in [0usize, 1_048_576] {
+            let mut args = Cli::try_parse_from(["test", "--snapshot", dir.path().to_str().unwrap(),
+                "--native-lib", "/unused", "--manifest", manifest.to_str().unwrap(),
+                "--max-context", &context.to_string(), "--dspark", "--max-sequences", "16"])?.args;
+            args.prefix.resolve_entries(args.max_sequences);
+            let mut resolved = super::super::ResolvedEngineArgs::new(&args.engine)?;
+            assert_eq!(resolved.args.max_context, 1_048_576);
+            assert_eq!(resolved.automatic_context, context == 0);
+            assert_eq!(args.engine.max_context, context, "CLI auto policy must remain intact");
+            // Removing the manifest after resolution proves sizing does not resolve it again.
+            std::fs::remove_file(&manifest)?;
+            size_draft_window_marks(&mut resolved, &args.prefix, args.max_sequences)?;
+            assert!(resolved.args.draft_window_marks > 0);
+            census.push((resolved.args.max_context, resolved.args.draft_window_marks));
+            let pool_context = crate::shared::context::pool_context("glm5", resolved.args.max_context,
+                resolved.automatic_context, 524_288, 256);
+            if context == 0 { assert_eq!(pool_context?, 524_032); }
+            else { assert!(pool_context.is_err()); }
+            std::fs::write(&manifest, r#"{"capacities":{"max_context":1048576}}"#)?;
+        }
+        assert_eq!(census[0], census[1]);
+        Ok(())
+    }
 
     #[test]
     fn boot_concurrency_resolves_retention_and_names_native_refusals() {

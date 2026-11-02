@@ -737,18 +737,36 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     Ok(Opened { snapshot: args.snapshot.clone(), catalog, native, cfg, library })
 }
 
+struct ResolvedEngineArgs {
+    args: EngineArgs,
+    automatic_context: bool,
+}
+
+impl ResolvedEngineArgs {
+    fn new(args: &EngineArgs) -> Result<Self> {
+        let automatic_context = args.max_context == 0;
+        let mut resolved = args.clone();
+        resolve_prefill(&mut resolved)?;
+        resolved.max_context = crate::shared::context::checkpoint_context(
+            &args.snapshot, &args.manifest, "glm5", args.max_context)?;
+        Ok(Self { args: resolved, automatic_context })
+    }
+}
+
 impl Opened {
     /// Builds the engine (and the Spark transport when peers are given) and
     /// hands them to `body`.
     pub fn with_engine<T>(&self, args: &EngineArgs,
         body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut SparkLink<'_>>, &tokio::runtime::Runtime) -> Result<T>)
         -> Result<T> {
-        let automatic_context = args.max_context == 0;
-        let mut context_args = args.clone();
-        resolve_prefill(&mut context_args)?;
-        context_args.max_context = crate::shared::context::checkpoint_context(
-            &args.snapshot, &args.manifest, "glm5", args.max_context)?;
-        let args = &context_args;
+        self.with_resolved_engine(&ResolvedEngineArgs::new(args)?, body)
+    }
+
+    fn with_resolved_engine<T>(&self, resolved: &ResolvedEngineArgs,
+        body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut SparkLink<'_>>, &tokio::runtime::Runtime) -> Result<T>)
+        -> Result<T> {
+        let ResolvedEngineArgs { args, automatic_context } = resolved;
+        let automatic_context = *automatic_context;
         let native = self.native;
         let dense_catalog = &self.catalog;
         ensure!(!args.skip_routed_experts || args.peers.is_none(),
