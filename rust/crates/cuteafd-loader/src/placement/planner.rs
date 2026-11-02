@@ -497,7 +497,7 @@ pub fn solve(
     let mut best: Option<ResolvedPlan> = None;
     let mut last = Refusal::Unsupported;
     let mut matched = false;
-    for decisions in recipe.candidates() {
+    for (candidate_index, decisions) in recipe.candidates().into_iter().enumerate() {
         if matches!(request.prefill, Pin::Exact(shape) if shape != decisions.prefill)
             || matches!(request.onboard, Pin::Exact(n) if n != decisions.onboard())
         {
@@ -534,7 +534,12 @@ pub fn solve(
             let pool = pages
                 .checked_mul(page)
                 .ok_or(Refusal::Overflow("pool tokens"))?;
-            let facts = match recipe.evaluate(&request, &decisions, pool) {
+            let started = std::time::Instant::now();
+            let facts = recipe.evaluate(&request, &decisions, pool);
+            tracing::trace!(target: "cuteafd::planner", candidate_index, pool,
+                recipe_us = started.elapsed().as_micros() as u64,
+                "constructed pool candidate");
+            let facts = match facts {
                 Ok(facts) => facts,
                 Err(error @ Refusal::Capacity { .. }) => {
                     last = error;
@@ -543,7 +548,12 @@ pub fn solve(
                 Err(Refusal::Unsupported) => continue,
                 Err(error) => return Err(error),
             };
-            match evaluate(&facts, &budgets) {
+            let started = std::time::Instant::now();
+            let evaluated = evaluate(&facts, &budgets);
+            tracing::trace!(target: "cuteafd::planner", candidate_index, pool,
+                allocations = facts.allocations.len(), evaluation_us = started.elapsed().as_micros() as u64,
+                fits = evaluated.is_ok(), "evaluated pool candidate");
+            match evaluated {
                 Ok(phases) => {
                     let candidate = ResolvedPlan {
                         request: request.clone(),
