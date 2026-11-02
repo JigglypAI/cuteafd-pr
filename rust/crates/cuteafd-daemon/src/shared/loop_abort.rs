@@ -1,14 +1,16 @@
 //! Loop abort: the shared serving-path wiring for [`RepeatGuard`].
 //!
 //! Every family's serve loop builds one [`LoopAbort`] per admitted request from
-//! the live [`LoopAbortConfig`], feeds it each generated token id, and treats a
-//! `true` from [`LoopAbort::push`] exactly like the `max_tokens` finish: flush
-//! the decoder, send `Finish { Length }`, and retire the row in the same round.
-//! The abort also sets `usage.finish_detail = "repetition"` and bumps the
+//! the boot-time [`LoopAbortConfig`], feeds it each generated token id, and
+//! treats a `true` from [`LoopAbort::push`] exactly like the `max_tokens` finish:
+//! flush the decoder, send `Finish { Length }`, and retire the row in the same
+//! round. The abort also sets `usage.finish_detail = "repetition"` and bumps the
 //! `loop_aborts` console total.
 //!
 //! The knobs are generic (`--loop-abort-run`, `CUTEAFD_LOOP_ABORT_RUN`, ...) so
 //! every family shares them; the rule itself lives in [`super::repeat_guard`].
+//! They are boot-time configuration only: the values are read once at startup
+//! and there is no runtime setter or admin endpoint.
 
 use clap::Args;
 use cuteafd_api::openai::FinishDetail;
@@ -33,7 +35,7 @@ pub(crate) struct LoopAbortArgs {
 
     /// Loop abort: the fast short-cycle rule (F) fires once the copies after the
     /// first span at least this many tokens. 0 = off.
-    #[arg(long, default_value_t = 384, env = "CUTEAFD_LOOP_FAST_SPAN",
+    #[arg(long, default_value_t = 1024, env = "CUTEAFD_LOOP_FAST_SPAN",
         value_parser = clap::value_parser!(u32).range(0..=65536))]
     pub loop_fast_span: u32,
 
@@ -46,7 +48,7 @@ pub(crate) struct LoopAbortArgs {
 
 impl Default for LoopAbortArgs {
     fn default() -> Self {
-        Self { loop_abort_run: 512, loop_abort_copies: 8, loop_fast_span: 384, loop_fast_copies: 8 }
+        Self { loop_abort_run: 512, loop_abort_copies: 8, loop_fast_span: 1024, loop_fast_copies: 8 }
     }
 }
 

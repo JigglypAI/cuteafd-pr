@@ -1,7 +1,7 @@
 //! Exact-repeat loop detection over generated token ids.
 //!
 //! Design: the loop-detection design §3 (rule R), §9 (rule F) and §10
-//! (patience: 8 copies, span 384). Pure and family-agnostic: no engine types,
+//! (patience: 8 copies, span 1024). Pure and family-agnostic: no engine types,
 //! no tokenizer, no allocation beyond the shingle map.
 //!
 //! Rule R: slide a 32-token shingle over the generated tokens one token at a
@@ -15,6 +15,10 @@
 //! span at least `max((copies - 1) * period, fast_span)` tokens. Equivalent
 //! streaming form: `run[P]` counts consecutive positions with `t[i] == t[i - P]`
 //! and fires when `run[P] >= max((copies - 1) * P, fast_span)`.
+//!
+//! The shipped span is 1,024 tokens, so a legitimate 400-token identical run
+//! (a zero array, a table row) does not abort; rule R still catches a real loop
+//! with a short period.
 //!
 //! Both rules are off when their knob is zero (`run == 0`, `fast_span == 0`).
 
@@ -51,9 +55,8 @@ struct Shingle {
     last: usize,
 }
 
-/// The per-request loop detector. Construct one at admission from the live
-/// knobs; a knob change applies to new requests only (same semantics as
-/// `concurrency`).
+/// The per-request loop detector. Construct one at admission from the boot-time
+/// knobs; the knobs are read once at startup and never change at runtime.
 pub(crate) struct RepeatGuard {
     run: u32,
     copies: u16,
@@ -72,7 +75,7 @@ pub(crate) struct RepeatGuard {
 }
 
 impl RepeatGuard {
-    /// A guard with the four live knobs. `run == 0` disables rule R and
+    /// A guard with the four boot-time knobs. `run == 0` disables rule R and
     /// `fast_span == 0` disables rule F. `copies` and `fast_copies` are clamped
     /// into `2..=64` (design §10: the shipped default is 8).
     pub(crate) fn new(run: u32, copies: u32, fast_span: u32, fast_copies: u32) -> Self {
@@ -251,7 +254,7 @@ mod tests {
     }
 
     fn shipped() -> RepeatGuard {
-        RepeatGuard::new(512, 8, 384, 8)
+        RepeatGuard::new(512, 8, 1024, 8)
     }
 
     fn feed(guard: &mut RepeatGuard, ids: &[u32]) -> Option<(usize, LoopHit)> {
@@ -364,10 +367,12 @@ mod tests {
     #[test]
     fn fast_eight_copies_fire_at_span() {
         let unit = block(30, 5);
-        let mut guard = shipped();
-        let (at, hit) = feed(&mut guard, &repeat(&unit, 20)).expect("rule F fires");
+        // Rule R is off so this exercises rule F alone (rule R would fire first
+        // at 754 for a period-30 unit).
+        let mut guard = RepeatGuard::new(0, 8, 1024, 8);
+        let (at, hit) = feed(&mut guard, &repeat(&unit, 40)).expect("rule F fires");
         assert_eq!(hit, LoopHit::Fast { period: 30 });
-        assert_eq!(at, 30 + 384);
+        assert_eq!(at, 30 + 1024);
     }
 
     #[test]
@@ -376,19 +381,23 @@ mod tests {
         let mut guard = shipped();
         assert!(feed(&mut guard, &repeat(&unit, 7)).is_none());
         let mut guard = shipped();
-        let (at, hit) = feed(&mut guard, &repeat(&unit, 9)).expect("rule F fires");
+        let (at, hit) = feed(&mut guard, &repeat(&unit, 12)).expect("rule F fires");
         assert_eq!(hit, LoopHit::Fast { period: 100 });
-        assert_eq!(at, 100 + 700);
+        assert_eq!(at, 100 + 1024);
     }
 
     #[test]
-    fn fast_same_token_385_fires_384_not() {
+    fn legitimate_400_token_identical_run_does_not_abort() {
+        // A zero array / table row: 400 identical tokens is legitimate output.
         let mut guard = shipped();
-        assert!(feed(&mut guard, &[7u32; 384]).is_none());
+        assert!(feed(&mut guard, &[0u32; 400]).is_none());
+    }
+
+    #[test]
+    fn legitimate_400_token_table_row_does_not_abort() {
+        // A table row repeated 50 times (period 8) is legitimate output.
         let mut guard = shipped();
-        let (at, hit) = feed(&mut guard, &[7u32; 385]).expect("rule F fires");
-        assert_eq!(hit, LoopHit::Fast { period: 1 });
-        assert_eq!(at, 385);
+        assert!(feed(&mut guard, &repeat(&block(8, 11), 50)).is_none());
     }
 
     #[test]
@@ -407,7 +416,7 @@ mod tests {
 
     #[test]
     fn fast_loop_fixture_fires_after_the_ld05b_point() {
-        let mut guard = RepeatGuard::new(0, 8, 384, 8);
+        let mut guard = RepeatGuard::new(0, 8, 1024, 8);
         let (at, hit) = feed(&mut guard, &fixture().fast_loop).expect("the fast fixture fires");
         assert!(matches!(hit, LoopHit::Fast { .. }), "rule F fires, got {hit:?}");
         // LD-05b (K = 4, span 192) fired at 294; patience moves it later.

@@ -191,11 +191,11 @@ def run_fixture(fixture_path: pathlib.Path) -> int:
         f"at={got[0] if got else None} hit={got[1] if got else None}",
     )
 
-    g = RepeatGuard(512, 8, 384, 8)
+    g = RepeatGuard(512, 8, 1024, 8)
     got = feed(g, data["draft_then_write"])
     check("draft_then_write never fires", got is None, f"got={got}")
 
-    g = RepeatGuard(0, 8, 384, 8)
+    g = RepeatGuard(0, 8, 1024, 8)
     got = feed(g, data["fast_loop"])
     check(
         "fast_loop fires Fast",
@@ -204,26 +204,21 @@ def run_fixture(fixture_path: pathlib.Path) -> int:
     )
 
     # Rule-level checks copied from the Rust unit tests.
-    g = RepeatGuard(512, 8, 384, 8)
-    got = feed(g, repeat(block(30, 5), 20))
+    g = RepeatGuard(0, 8, 1024, 8)
+    got = feed(g, repeat(block(30, 5), 40))
     check(
         "fast eight copies fire at span",
-        got is not None and got[1] == ("Fast", 30) and got[0] == 30 + 384,
+        got is not None and got[1] == ("Fast", 30) and got[0] == 30 + 1024,
         f"got={got}",
     )
 
-    g = RepeatGuard(512, 8, 384, 8)
-    got = feed(g, [7] * 384)
-    check("fast 384 same tokens does not fire", got is None, f"got={got}")
-    g = RepeatGuard(512, 8, 384, 8)
-    got = feed(g, [7] * 385)
-    check(
-        "fast 385 same tokens fires period 1",
-        got is not None and got[1] == ("Fast", 1) and got[0] == 385,
-        f"got={got}",
-    )
+    # A legitimate 400-token identical run (a zero array / table row) must not
+    # abort at the shipped defaults.
+    g = RepeatGuard(512, 8, 1024, 8)
+    got = feed(g, [0] * 400)
+    check("legitimate 400 identical tokens do not fire", got is None, f"got={got}")
 
-    g = RepeatGuard(512, 8, 384, 8)
+    g = RepeatGuard(512, 8, 1024, 8)
     got = feed(g, repeat(block(600, 3), 9))
     check(
         "eighth copy fires Repeat at run",
@@ -281,7 +276,7 @@ def run_dataset(root: pathlib.Path, tokens_field: str, text_field: str, tokenize
             if ids is None:
                 continue
             transcripts += 1
-            guard = RepeatGuard(512, 8, 384, 8)
+            guard = RepeatGuard(512, 8, 1024, 8)
             got = feed(guard, ids)
             if got is not None:
                 fires += 1
@@ -335,7 +330,7 @@ def run_fidelity(root: pathlib.Path, config: str, all_roles: bool) -> int:
         can_fire = len(ids) >= WINDOW + 512
         if can_fire:
             eligible += 1
-        guard = RepeatGuard(512, 8, 384, 8)
+        guard = RepeatGuard(512, 8, 1024, 8)
         got = None
         for i, token in enumerate(ids):
             hit = guard.push(token)

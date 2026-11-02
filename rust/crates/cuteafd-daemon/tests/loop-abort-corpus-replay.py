@@ -1,30 +1,33 @@
 #!/usr/bin/env python3
 """Replay the shipped loop detector (rules R and F) over the local opencode
-corpus: every assistant step replica-d served since 2026-10-22 22:00Z.
+corpus: every assistant step the production replica served since 2026-10-22 22:00Z.
 
 This is the long-generation control the review asked for: the fidelity windows
 are capped at 1,024 generated tokens, so rule R can only fire on periods <= ~170
-there and rule F (>= 385 identical tokens) cannot fire at all. The opencode
+there and rule F (>= 1,025 identical tokens) cannot fire at all. The opencode
 corpus has real 32k-token generations, so both rules are exercised.
 
 Read-only on the opencode DB (`mode=ro`). Reuses the DB reader from
-`v2/cuteafd/loop-replay-2026-10-30.py` and the detector port from
-`loop-abort-fidelity-harness.py`.
+`loop-replay.py` and the detector port from `loop-abort-fidelity-harness.py`.
+The harness is beside this file; the replay module is not in this repo, so point
+`LOOP_REPLAY` at it (default: `loop-replay.py` beside this file).
 
-Run (allied):
-  /home/jsimon/ocr-agent/venv/bin/python -I \
-    rust/crates/cuteafd-daemon/tests/loop-abort-corpus-replay.py
+Run:
+  LOOP_REPLAY=/path/to/loop-replay.py \
+    python3 -I rust/crates/cuteafd-daemon/tests/loop-abort-corpus-replay.py
 """
 import collections
 import importlib.util
+import os
 import statistics
 import sys
 import time
 
 from tokenizers import Tokenizer
 
-REPLAY = "/home/jsimon/dgxraid/v2/cuteafd/loop-replay-2026-10-30.py"
-HARNESS = "/home/jsimon/dgxraid/build-queue/cuteafd/loop-abort-fidelity-harness.py"
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPLAY = os.environ.get("LOOP_REPLAY", os.path.join(HERE, "loop-replay.py"))
+HARNESS = os.environ.get("LOOP_HARNESS", os.path.join(HERE, "loop-abort-fidelity-harness.py"))
 CONTROL_SAMPLE = 500
 
 
@@ -40,10 +43,13 @@ def main() -> int:
     harness = load(HARNESS, "loop_harness")
     db = replay.sqlite3.connect(replay.DB, uri=True)
     tk = Tokenizer.from_file(replay.TOK)
+    provider = getattr(replay, "PROVIDER", None)
     q = ("select m.id, json_extract(m.data,'$.modelID'), json_extract(m.data,'$.agent') from message m "
          "where m.time_created>=? and json_extract(m.data,'$.role')='assistant' "
-         "and json_extract(m.data,'$.providerID')='llmgw' and json_extract(m.data,'$.modelID') in (?,?)")
-    msgs = db.execute(q, (replay.T0, *replay.MODELS)).fetchall()
+         + ("and json_extract(m.data,'$.providerID')=? " if provider else "")
+         + "and json_extract(m.data,'$.modelID') in (?,?)")
+    args = (replay.T0, *((provider,) if provider else ()), *replay.MODELS)
+    msgs = db.execute(q, args).fetchall()
     rows = []
     for mid, model, agent in msgs:
         for si, s in enumerate(replay.steps_of(db, mid)):
@@ -64,7 +70,7 @@ def main() -> int:
         ids[(r["mid"], r["step"])] = [t for _, tx in r["pieces"] for t in tk.encode(tx, add_special_tokens=False).ids]
     print(f"tokenized {len(ids)} steps in {time.time() - t0:.0f}s")
 
-    def fire_at(step_ids, fast_span=384):
+    def fire_at(step_ids, fast_span=1024):
         guard = harness.RepeatGuard(512, 8, fast_span, 8)
         return harness.feed(guard, step_ids)
 
@@ -85,7 +91,7 @@ def main() -> int:
     lf = [(r, f) for r in looped for f in [fire_at(ids[(r["mid"], r["step"])])] if f]
     cf = [(r, f) for r in sample for f in [fire_at(ids[(r["mid"], r["step"])])] if f]
     ft = sorted(f[0] for _, f in lf)
-    print(f"R+F(W=32,run=512,copies=8; F span=384,copies=8): capped fires {len(lf)}/{len(looped)} "
+    print(f"R+F(W=32,run=512,copies=8; F span=1024,copies=8): capped fires {len(lf)}/{len(looped)} "
           f"at token p50 {ft[len(ft)//2]} p90 {ft[int(.9 * len(ft))]} max {ft[-1]} "
           f"(mean saved {statistics.mean(1 - t / 32000 for t in ft):.0%} of 32000) | "
           f"control fires {len(cf)}/{len(sample)} (longest {CONTROL_SAMPLE}): "
