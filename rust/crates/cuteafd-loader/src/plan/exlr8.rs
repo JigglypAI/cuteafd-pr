@@ -1284,9 +1284,9 @@ mod tests {
             assert!(!error(&options,"up1","off").contains("serial"));
         }
         options.layout.as_mut().unwrap().prefill_lanes = 1;
-        options.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(1));
+        options.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(1));
         assert!(!error(&options,"up1","off").contains("onboard"), "TP2 onboarding must reach native inventory admission");
-        options.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(0));
+        options.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
         options.attention_placement = Some(crate::placement::AttentionPlacement::Heads);
         assert!(error(&options,"up1","off").contains("context"));
     }

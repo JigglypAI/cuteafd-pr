@@ -8,7 +8,7 @@
 use super::{admission, EngineArgs};
 use clap::Parser;
 use cuteafd_core::memory_layout::{Category, MemoryLayout};
-use cuteafd_loader::placement::{solve, Baseline, Onboard, Placement};
+use cuteafd_loader::placement::{solve, Baseline, Onboard, OnboardSetting, Placement};
 use cuteafd_loader::plan::{layout::LayoutOptions, ExpertPlacement, PlanInput, PlanOptions};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -29,7 +29,7 @@ struct Case<'a> {
     context: u64,
     budget: u64,
     /// `None`: the family default (no flag on either side).
-    onboard: Option<Onboard>,
+    onboard: Option<OnboardSetting>,
     dspark: bool,
     exchange_f32: bool,
     peer_budget: Option<u64>,
@@ -263,7 +263,7 @@ fn planner_equals_runtime_topology_selected_live_units() {
     let shared = Shared::open(dir.path()).unwrap();
     for rtx in [1, 2] {
         let mut case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks: 2,
-            context: 1_048_576, budget: 24 << 30, onboard: Some(Onboard::Layers(2)),
+            context: 1_048_576, budget: 24 << 30, onboard: Some(OnboardSetting::Layers(2)),
             dspark: false, exchange_f32: false, peer_budget: None, attention: None };
         let columns = shared.input.spark_ranges(&plan_options(&case, false)).unwrap();
         let column = columns.iter().find(|column| column.rtx_gpus == rtx).unwrap();
@@ -372,7 +372,7 @@ fn preload_equals_frozen_measured_admission_after_native_uploads() {
         for rtx in [1, 2] {
             for attention in [AttentionPlacement::Heads, AttentionPlacement::Context] {
                 if rtx == 1 && attention == AttentionPlacement::Context { continue; }
-                for onboard in [Onboard::Auto, Onboard::Layers(2)] {
+                for onboard in [OnboardSetting::Auto, OnboardSetting::Layers(2)] {
                     let case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks: 2,
                         context: 1_048_576, budget: 32 << 30, onboard: Some(onboard), dspark,
                         exchange_f32: true, peer_budget: Some(30 << 30), attention: Some(attention) };
@@ -399,21 +399,24 @@ fn planner_equals_runtime_deepseek_v4_fixture() {
     let shared = Shared::open(dir.path()).unwrap();
     for (rtx, budget) in [(1, 24u64 << 30), (2, 24 << 30)] {
         for context in [131_072, 1_048_576] {
-            for onboard in [None, Some(Onboard::Auto), Some(Onboard::Layers(2)), Some(Onboard::Layers(0)), Some(Onboard::Fraction(0.5)),
-                Some(Onboard::ExpertsFirst { pool_floor: 262_144 })] {
+            for onboard in [None, Some(OnboardSetting::Auto), Some(OnboardSetting::Layers(2)),
+                Some(OnboardSetting::Layers(0)), Some(OnboardSetting::All)] {
                 let case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks: 2, context, budget,
                     onboard, dspark: false, exchange_f32: false, peer_budget: None, attention: None };
                 let placement = assert_equal(&shared, &case, &format!("fixture rtx{rtx} {context} {onboard:?}"));
                 // The default: pool first for Flash on one or two RTX (`default_onboard`).
-                let effective = onboard.unwrap_or(cuteafd_loader::placement::families::deepseek_v4::default_onboard());
+                let routed = shared.catalog(false).unwrap().routed_experts().routed_layers();
+                let effective = onboard.map(|setting| setting.resolve(routed))
+                    .unwrap_or_else(cuteafd_loader::placement::families::deepseek_v4::default_onboard);
                 match effective {
-                    Onboard::ExpertsFirst { .. } => assert!(placement.pool_tokens >= 262_144, "experts first keeps a 262K pool"),
                     Onboard::Auto => assert_eq!(placement.pool_tokens, 1 << 20, "24 GiB cards target 1M"),
                     Onboard::Layers(n) => {
                         assert_eq!(placement.onboard_layers, n);
                         assert!(placement.pool_tokens >= 1 << 20, "a fixed onboard fills the pool past the target");
                     }
-                    Onboard::Fraction(_) => assert_eq!(placement.onboard_layers, 2),
+                }
+                if onboard == Some(OnboardSetting::All) {
+                    assert_eq!(placement.onboard_layers, routed, "all pins every routed layer");
                 }
             }
         }
@@ -426,8 +429,7 @@ fn planner_equals_runtime_deepseek_v4_fixture_tp2_asym_dspark_f32() {
     let manifest = synthetic(dir.path());
     cuteafd_loader::plan::testing::write_v4_snapshot_with_dspark(dir.path(), 3);
     let shared = Shared::open(dir.path()).unwrap();
-    for onboard in [None, Some(Onboard::Auto), Some(Onboard::Layers(2)), Some(Onboard::Fraction(0.5)),
-        Some(Onboard::ExpertsFirst { pool_floor: 262_144 })] {
+    for onboard in [None, Some(OnboardSetting::Auto), Some(OnboardSetting::Layers(2)), Some(OnboardSetting::All)] {
         for exchange_f32 in [false, true] {
             let case = Case { snapshot: dir.path(), manifest: &manifest, rtx: 2, sparks: 2,
                 context: 1_048_576, budget: 32 << 30, peer_budget: Some(30 << 30),
@@ -450,7 +452,7 @@ fn planner_equals_runtime_v4_bundled_draft_off() {
     for rtx in [1, 2] {
         let case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks: 2,
             context: 1_048_576, budget: 32 << 30, peer_budget: None,
-            onboard: Some(Onboard::Layers(0)), dspark: false, exchange_f32: false, attention: None };
+            onboard: Some(OnboardSetting::Layers(0)), dspark: false, exchange_f32: false, attention: None };
         let p = assert_equal(&shared, &case, &format!("bundled draft off rtx{rtx}"));
         assert!(p.expert_ranges.iter().all(|range| range.peak_bytes == 0));
         let (layout, _, _) = planned(&shared, &case);
@@ -464,8 +466,8 @@ fn tp2_backbone_admission_does_not_require_tp1_kernels() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = synthetic(dir.path());
     let shared = Shared::open(dir.path()).unwrap();
-    for onboard in [None, Some(Onboard::Auto), Some(Onboard::Layers(0)), Some(Onboard::Layers(2)),
-        Some(Onboard::ExpertsFirst { pool_floor: 262_144 })] {
+    for onboard in [None, Some(OnboardSetting::Auto), Some(OnboardSetting::Layers(0)), Some(OnboardSetting::Layers(2)),
+        Some(OnboardSetting::All)] {
         let case = Case { snapshot: dir.path(), manifest: &manifest, rtx: 2, sparks: 2,
             context: 1_048_576, budget: 24 << 30, peer_budget: None, onboard, dspark: false, exchange_f32: false,
             attention: None };
@@ -588,8 +590,8 @@ fn planner_equals_runtime_deepseek_v4() {
             ("pro", &pro, 1, 4), ("pro", &pro, 2, 6)] {
             let snapshot: &Path = &shared.input.checkpoint().snapshot;
             let manifest = inputs.join(format!("{model}-{rtx}-{context}/PROGRAMS.json"));
-            for onboard in [None, Some(Onboard::Auto), Some(Onboard::ExpertsFirst { pool_floor: 262_144 }),
-                Some(Onboard::Layers(2)), Some(Onboard::Fraction(0.03))] {
+            for onboard in [None, Some(OnboardSetting::Auto), Some(OnboardSetting::Layers(0)),
+                Some(OnboardSetting::Layers(1)), Some(OnboardSetting::Layers(2))] {
                 for asymmetric in [false, true] {
                     let case = Case { snapshot, manifest: &manifest, rtx, sparks, context, budget,
                         onboard, dspark: true, exchange_f32: asymmetric,
@@ -603,7 +605,7 @@ fn planner_equals_runtime_deepseek_v4() {
                         assert_eq!(placement.tp2.unwrap().layers, placement.onboard_layers);
                         assert!(placement.expert_ranges[0].peak_bytes > 0);
                         assert_eq!(placement.expert_ranges[1].peak_bytes, 0);
-                        if onboard.is_none() || onboard == Some(Onboard::Auto) { assert_eq!(placement.pool_tokens, 2 << 20); }
+                        if onboard.is_none() || onboard == Some(OnboardSetting::Auto) { assert_eq!(placement.pool_tokens, 2 << 20); }
                     } else { assert!(placement.tp2.is_none()); }
                 }
             }
@@ -627,7 +629,7 @@ fn planner_equals_runtime_deepseek_v4_missing_tp2_package() {
     std::fs::create_dir_all(&package).unwrap();
     std::os::unix::fs::symlink(source.join("exl3/exl3-dsv4p-k23/rtx-tp1"), package.join("rtx-tp1")).unwrap();
     let shared = Shared::open(&pro).unwrap();
-    for onboard in [None, Some(Onboard::Auto), Some(Onboard::Layers(0))] {
+    for onboard in [None, Some(OnboardSetting::Auto), Some(OnboardSetting::Layers(0))] {
         let case = Case { snapshot: &pro, manifest: &manifest, rtx: 2, sparks: 6,
             context: 1_048_576, budget: (95.5 * (1u64 << 30) as f64) as u64,
             peer_budget: None, onboard, dspark: false, exchange_f32: false, attention: None };
@@ -727,7 +729,7 @@ fn planner_equals_runtime_deepseek_v4_measured() {
         let shared = Shared::open(&snapshot).unwrap();
         let budget = fixture.gpus[0].total_bytes;
         assert!(fixture.gpus.iter().all(|g| g.total_bytes.abs_diff(budget) < 8 * MIB), "{label}: unequal GPUs");
-        let onboard = fixture.onboard.as_deref().map(|o| o.parse::<Onboard>().unwrap());
+        let onboard = fixture.onboard.as_deref().map(|o| o.parse::<OnboardSetting>().unwrap());
         let case = Case { snapshot: &snapshot, manifest: &manifest, rtx: fixture.rtx, sparks: fixture.sparks,
             context: fixture.context, budget, onboard, dspark: true, exchange_f32: false,
             peer_budget: fixture.gpus.get(1).map(|g| g.total_bytes), attention: None };
@@ -768,9 +770,8 @@ fn planner_equals_runtime_deepseek_v4_measured() {
             assert_eq!(runtime.tp2.unwrap().layers, fixture.onboard_layers);
             // Re-solve the same measured pre-allocation inventory for every
             // retained onboard policy; no deleted two-RTX TP1 placement.
-            for onboard in [None, Some(Onboard::Auto),
-                Some(Onboard::ExpertsFirst { pool_floor: 262_144 }),
-                Some(Onboard::Layers(2)), Some(Onboard::Fraction(0.03))] {
+            for onboard in [None, Some(OnboardSetting::Auto), Some(OnboardSetting::Layers(0)),
+                Some(OnboardSetting::Layers(1)), Some(OnboardSetting::Layers(2))] {
                 let variant = Case { onboard, ..case };
                 let (layout, supported, hints) = planned(&shared, &variant);
                 assert!(supported, "{label} {onboard:?}: {hints:?}");
@@ -783,10 +784,10 @@ fn planner_equals_runtime_deepseek_v4_measured() {
                 assert!(layout.pool_tokens.abs_diff(runtime.pool_tokens) <= slack,
                     "{label} {onboard:?}: pool {} planned vs {} measured",
                     layout.pool_tokens, runtime.pool_tokens);
-                if onboard.is_none() || onboard == Some(Onboard::Auto) {
+                if onboard.is_none() || onboard == Some(OnboardSetting::Auto) {
                     assert_eq!(runtime.pool_tokens, 2 << 20);
                 }
-                if let Some(Onboard::Layers(n)) = onboard {
+                if let Some(OnboardSetting::Layers(n)) = onboard {
                     assert_eq!(runtime.onboard_layers, n);
                 }
                 eprintln!("{label} {onboard:?}: TP2 {} layers pool {}", tp2.layers, runtime.pool_tokens);

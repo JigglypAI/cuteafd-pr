@@ -79,7 +79,10 @@ impl Opened {
             layer_weights: &weights.resident.layer_bytes, layer_experts: &experts.costs,
             layer_extra: &weights.layer_extra, fixed, tp2_workspace: experts.workspace, pending_code_bytes: pending,
             max_context: args.max_context as u64, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
-            spark_ranks: 0, onboard: args.onboard.unwrap_or(Onboard::Auto), startup_graph_modes: args.planner_graph_modes.filter(|_| enabled),
+            spark_ranks: 0,
+            onboard: args.onboard.map(|setting| setting.resolve(catalog.routed_experts().routed_layers()))
+                .unwrap_or(Onboard::Auto),
+            startup_graph_modes: args.planner_graph_modes.filter(|_| enabled),
         })?;
         inventory.record("qwen4", &inventory.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
         cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);

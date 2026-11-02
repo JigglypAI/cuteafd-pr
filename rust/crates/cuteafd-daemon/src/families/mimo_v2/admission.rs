@@ -43,10 +43,11 @@ fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize,
     }
     let whole = Bytes2 { resident: expert_layer_bytes(tensors, 1, 0, Slicing::Padded)?, staging: 0 };
     let routed = opened.cfg.dense.iter().take(layers).filter(|&&dense| !dense).count();
-    let zero_local = args.onboard.layers(routed) == Some(0);
+    let onboard = args.onboard.resolve(routed);
+    let zero_local = onboard.layers(routed) == Some(0);
     let metadata = if zero_local { None } else { package_manifest(&directory, None)? };
     if zero_local || (metadata.is_none()
-        && args.onboard == cuteafd_loader::placement::Onboard::Auto && args.fp8_package.is_none()) {
+        && onboard == cuteafd_loader::placement::Onboard::Auto && args.fp8_package.is_none()) {
         ensure!(args.peers.is_some(), "MiMo zero local experts requires Spark peers");
         let costs = opened.cfg.dense.iter().take(layers).map(|&dense| (!dense).then_some(ExpertCost {
             whole, half: [Bytes2::default(); 2], tp2: ranks == 2, spark_ok: true,
@@ -493,7 +494,8 @@ fn preflight_shape(
         gpus: memory.iter().map(|m| (m.total_bytes, Baseline::Measured { free_bytes: m.baseline_free_bytes })).collect(),
         headroom_floor: 0, spark_ranks, startup_probe_bytes: intake_probe_bytes,
         context: args.max_context as u64, requested_pool: policy.pool_tokens, pool_ceiling_at_target: false,
-        onboard: args.onboard, experts: expert_costs, expert_workspace, tp2_workspace,
+        onboard: args.onboard.resolve(cfg.dense.iter().take(layers).filter(|&&dense| !dense).count()),
+        experts: expert_costs, expert_workspace, tp2_workspace,
         rows: args.prefill_rows.max(64) as u64, lanes: transport_lanes as u64,
     };
     let solution = solve_working_set(&inputs, &no_spark_profiles.steady)

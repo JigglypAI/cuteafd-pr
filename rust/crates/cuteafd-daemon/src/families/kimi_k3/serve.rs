@@ -21,7 +21,9 @@ pub(crate) struct ServeArgs {
     /// Native allocation extent and API ceiling; unset takes the checkpoint core's
     /// default (the compiled 1M for a K6 core, 512K for a BF16 core).
     #[arg(long)] pub max_context: Option<usize>,
-    #[arg(long, default_value = "auto")] pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
+    /// RTX expert layers: auto, all (every routed-expert layer of the target
+    /// model), or an exact N.
+    #[arg(long, default_value = "auto")] pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
     /// Complete per-rank allocation ceiling, estimated until the first worker census.
     #[arg(long)] pub spark_budget_gib: Option<f64>,
     #[arg(long, default_value = "0.0.0.0:8000")] pub listen: String,
@@ -298,7 +300,7 @@ mod tests {
         assert_eq!(args(&["--peers", peers, "--kv-cache", "bf16"])?.kv_cache, cuteafd_core::MlaCacheFormat::Bf16);
         assert_eq!(args(&["--peers", peers, "--kv-cache", "fp8"])?.kv_cache, cuteafd_core::MlaCacheFormat::Fp8);
         assert!(args(&["--peers", peers, "--kv-cache", "int8"]).is_err());
-        assert_eq!(defaults.rtx_expert_layers, cuteafd_loader::placement::Onboard::Auto);
+        assert_eq!(defaults.rtx_expert_layers, cuteafd_loader::placement::OnboardSetting::Auto);
         assert_eq!(defaults.max_sequences, 16);
         assert!(args(&["--peers", peers, "--native-k6"]).is_err());
         assert_eq!(defaults.pool_tokens, None);
@@ -313,7 +315,9 @@ mod tests {
         assert_eq!(limits.output_for_prompt(262143, 32768)?, 1);
         assert!(limits.output_for_prompt(262144, 1).is_err());
         assert_eq!(args(&["--peers", peers, "--rtx-expert-layers", "3"])?.rtx_expert_layers,
-            cuteafd_loader::placement::Onboard::Layers(3));
+            cuteafd_loader::placement::OnboardSetting::Layers(3));
+        assert_eq!(args(&["--peers", peers, "--rtx-expert-layers", "all"])?.rtx_expert_layers,
+            cuteafd_loader::placement::OnboardSetting::All);
         args(&["--peers", peers, "--rtx-expert-layers", "auto", "--spark-budget-gib", "108"])?.validate()?;
         for budget in ["0", "NaN", "inf"] {
             assert!(args(&["--peers", peers, "--spark-budget-gib", budget])?.validate().is_err());

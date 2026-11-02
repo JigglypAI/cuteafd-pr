@@ -373,12 +373,12 @@ pub(crate) struct PlanArgs {
     /// Routed backbone expert layers resident on RTX (DeepSeek).
     #[arg(long)]
     pub(crate) local_expert_layers: Option<usize>,
-    /// Families on the shared placement solver (V4): RTX-resident routed
-    /// layers, `auto` (pool first), `max` (experts first above a 262K pool),
-    /// `N`, `N%` or `all` (the KV pool is then the output). Overrides
+    /// Families on the shared placement solver (V4): `auto` (pool first),
+    /// `all` (every routed-expert layer of the target model) or an exact
+    /// layer count `N` (the KV pool is then the output). Overrides
     /// --local-expert-layers.
-    #[arg(long, value_parser = |text: &str| text.parse::<cuteafd_loader::placement::Onboard>())]
-    pub(crate) rtx_expert_layers: Option<cuteafd_loader::placement::Onboard>,
+    #[arg(long, value_parser = |text: &str| text.parse::<cuteafd_loader::placement::OnboardSetting>())]
+    pub(crate) rtx_expert_layers: Option<cuteafd_loader::placement::OnboardSetting>,
     /// Removed whole-layer GPU1 placement flag.
     #[arg(long = "peer-expert-ranges", hide = true, value_parser = reject_peer_expert_ranges)]
     pub(crate) deprecated_peer_expert_ranges: bool,

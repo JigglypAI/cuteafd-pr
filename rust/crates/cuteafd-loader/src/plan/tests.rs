@@ -373,6 +373,53 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
 }
 
 #[test]
+fn onboard_all_resolves_to_each_target_models_routed_layer_count() {
+    use crate::placement::{Onboard, OnboardSetting};
+    // Each fixture's checkpoint declares its routed-expert layer count; the
+    // drafter's and MTP's own experts are not part of it. Plan and serve
+    // resolve `all` against these same counts.
+    let glm5 = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let glm5_routed = {
+        let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&glm5_config()).unwrap();
+        let declared = cfg.layers - cfg.first_moe_layer;
+        assert_eq!(declared, 1, "GLM 5.3 fixture: one layer follows first_k_dense_replace");
+        assert_eq!(crate::read_expert_catalog(glm5.path()).unwrap().routed_experts().routed_layers(),
+            declared, "GLM 5.3 serve resolves the same routed extent as the planner");
+        declared
+    };
+    let flash_config = glm5_flash_config(3);
+    let flash = snapshot(flash_config.clone(), &glm5_flash_tensors(&flash_config));
+    let flash_routed = crate::read_expert_catalog(flash.path()).unwrap().routed_experts().routed_layers();
+    assert_eq!(flash_routed, 2, "GLM Flash fixture: three layers, the first dense");
+    let mimo_config = mimo_flash_config();
+    let mimo = snapshot(mimo_config.clone(), &mimo_flash_tensors());
+    let mimo_routed = crate::families::mimo_v2::MimoV2Config::from_hf(&mimo_config).unwrap()
+        .dense.iter().filter(|dense| !**dense).count();
+    assert_eq!(mimo_routed, 1, "MiMo fixture: moe_layer_freq marks one routed layer");
+    let v41 = strict_v41_snapshot(false);
+    let v41_routed = crate::read_expert_catalog(v41.path()).unwrap().routed_experts().routed_layers();
+    assert_eq!(v41_routed, 40, "V4.1 fixture: every layer is routed");
+    for (family, dir, routed) in [
+        ("glm5", glm5, glm5_routed),
+        ("glm5_flash", flash, flash_routed),
+        ("mimo_v2", mimo, mimo_routed),
+        ("deepseek_v41", v41, v41_routed),
+    ] {
+        assert_eq!(OnboardSetting::All.resolve(routed), Onboard::Layers(routed), "{family}");
+        let planned = |onboard: OnboardSetting| {
+            let mut options = wave_plan_options(dir.path(), 2);
+            options.layout.as_mut().unwrap().onboard = Some(onboard);
+            match plan(dir.path(), &options) {
+                Ok(report) => Ok((report.onboard_layers, report.memory_layout, report.placement, report.fits)),
+                Err(error) => Err(error.to_string()),
+            }
+        };
+        assert_eq!(planned(OnboardSetting::All), planned(OnboardSetting::Layers(routed)),
+            "{family}: `all` must plan identically to {routed} routed-expert layers");
+    }
+}
+
+#[test]
 fn boot_concurrency_full_plan_matrix() {
     let mut fixtures = shared_wave_snapshots();
     fixtures.push(("deepseek_v41", strict_v41_snapshot(false)));
@@ -2534,7 +2581,7 @@ fn v4_pool_first_defaults_and_explicit_layer_failure() {
     let dir = v4_snapshot();
     let solve = |bytes, pool_tokens, local_expert_layers| plan(dir.path(), &PlanOptions {
         layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![bytes], pool_tokens, local_expert_layers,
-            onboard: local_expert_layers.is_none().then_some(crate::placement::Onboard::Auto), ..Default::default() }),
+            onboard: local_expert_layers.is_none().then_some(crate::placement::OnboardSetting::Auto), ..Default::default() }),
         ..sparks(2)
     }).unwrap();
     let large = solve(96 << 30, None, None);
@@ -2553,7 +2600,7 @@ fn v4_pool_first_defaults_and_explicit_layer_failure() {
         "{:?}", rejected.memory_layout.as_ref().unwrap().notes);
     // A fixed onboard alone makes the pool the output: above the 1M target here.
     let fixed = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![24 << 30],
-        onboard: Some(crate::placement::Onboard::Layers(1)), ..Default::default() }), ..sparks(2) }).unwrap();
+        onboard: Some(crate::placement::OnboardSetting::Layers(1)), ..Default::default() }), ..sparks(2) }).unwrap();
     assert!(fixed.placement_supported);
     assert!(fixed.memory_layout.unwrap().pool_tokens > 1 << 20);
 }
@@ -2946,12 +2993,14 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
     // Configured peers with all RTX, mixed, all Spark, then the serial zero-peer deployment.
     // Heads is requested: a two-GPU build whose manifest lacks the context programs refuses
     // `context` (the default there, #202), and this fixture plans heads' working set.
-    for (peers, onboard, expected_rtx) in [(4, Onboard::Auto, 3), (4, Onboard::Layers(1), 1),
-        (4, Onboard::Layers(0), 0), (0, Onboard::Auto, 3)] {
+    for (peers, setting, expected_rtx) in [(4, crate::placement::OnboardSetting::Auto, 3),
+        (4, crate::placement::OnboardSetting::Layers(1), 1), (4, crate::placement::OnboardSetting::Layers(0), 0),
+        (0, crate::placement::OnboardSetting::Auto, 3)] {
         let lanes = if expected_rtx == 3 { 1 } else { 2 };
+        let onboard = setting.resolve(cfg.dense.iter().filter(|dense| !**dense).count());
         let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
             rtx_bytes: vec![placement::inventory::PRO_TOTAL_BYTES; 2], head_split: true,
-            context_tokens: 262144, pool_tokens: Some(2 << 20), onboard: Some(onboard),
+            context_tokens: 262144, pool_tokens: Some(2 << 20), onboard: Some(setting),
             prefill_rows: 4096, prefill_lanes: lanes, state_slots: Some(8), prefix_slots: Some(8),
             glmf_drafter_disabled: true, glmf_prefill_expanded: false,
             glmf_representation: resident::GlmfRepresentation { kda_fp8: false, fp8_head: false, output_shard: false },
@@ -4010,7 +4059,7 @@ fn v41_32gib_counts_share_pool_and_local_layer_admission() {
     assert_eq!(all.spark_ranks, 6);
     assert!(all.spark_count_warning.is_none());
     let fixed = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-        onboard: Some(crate::placement::Onboard::Layers(1)),
+        onboard: Some(crate::placement::OnboardSetting::Layers(1)),
         ..options.layout.as_ref().unwrap().clone()
     }), ..options.clone() };
     let local = plan_spark_count(dir.path(), &fixed, 6, Some(4)).unwrap();
@@ -4451,7 +4500,7 @@ fn mimo_spark_tower_sees_rank_io_under_a_tight_spark_budget() {
     let options = |budget: u64| PlanOptions { vision: super::MediaMode::Spark(None), spark_budget_bytes: Some(budget),
         layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), pool_tokens: Some(32768), concurrency: 4,
             spark_allocation_budget_bytes: Some(budget),
-            onboard: Some(crate::placement::Onboard::Layers(0)), ..Default::default() }), ..sparks(4) };
+            onboard: Some(crate::placement::OnboardSetting::Layers(0)), ..Default::default() }), ..sparks(4) };
     let roomy = plan(dir.path(), &options(100 << 30)).unwrap();
     assert!(roomy.executable(), "{}", render(&roomy));
     let EncoderKind::Spark { rank } = roomy.encoder.as_ref().unwrap().kind else { panic!("{}", render(&roomy)) };

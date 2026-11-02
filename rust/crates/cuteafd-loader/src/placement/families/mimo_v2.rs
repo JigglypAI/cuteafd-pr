@@ -84,23 +84,11 @@ pub fn solve_working_set(inputs: &MimoInputs<'_>, no_spark: &CapacityProfile)
         let result = (|| {
             let mut request = request(&selected)?;
             request.onboard = Onboard::Layers(n);
-            match inputs.onboard {
-                Onboard::Auto if inputs.spark_ranks > 0 => {
-                    request.pool.ceiling = request.pool.target;
-                    // Spark Auto may clamp serving context to a smaller pool;
-                    // fixed candidates must not introduce a new context floor.
-                    if remote && request.pool.requested.is_none() { request.pool.floor = 0; }
-                }
-                Onboard::ExpertsFirst { pool_floor } => {
-                    request.pool.floor = request.pool.floor.max(request.pool.requested.unwrap_or(pool_floor));
-                    request.pool.ceiling = request.pool.target;
-                    // Preserve the shared solver's remote zero-prefix fallback
-                    // when context is larger than the experts-first floor.
-                    if remote && n == 0 && request.pool.requested.is_none() {
-                        request.pool.floor = pool_floor;
-                    }
-                }
-                _ => {}
+            if inputs.onboard == Onboard::Auto && inputs.spark_ranks > 0 {
+                request.pool.ceiling = request.pool.target;
+                // Spark Auto may clamp serving context to a smaller pool;
+                // fixed candidates must not introduce a new context floor.
+                if remote && request.pool.requested.is_none() { request.pool.floor = 0; }
             }
             if inputs.pool_ceiling_at_target && request.pool.requested.is_none() {
                 request.pool.ceiling = request.pool.target;
@@ -119,12 +107,9 @@ pub fn solve_working_set(inputs: &MimoInputs<'_>, no_spark: &CapacityProfile)
         })();
         match result {
             Ok(candidate) => {
-                let score = |solution: &MimoSolution| match inputs.onboard {
-                    Onboard::ExpertsFirst { .. } => (solution.placement.onboard_layers as u64,
-                        solution.placement.pool_tokens),
-                    _ => (solution.placement.pool_tokens.min(solution.request.pool.target),
-                        solution.placement.onboard_layers as u64),
-                };
+                let score = |solution: &MimoSolution| (
+                    solution.placement.pool_tokens.min(solution.request.pool.target),
+                    solution.placement.onboard_layers as u64);
                 if best.as_ref().is_none_or(|current| score(&candidate) > score(current)) {
                     best = Some(candidate);
                 }
@@ -262,7 +247,7 @@ mod tests {
             assert!(std::ptr::eq(configured_only.profile, &local));
             assert_eq!(resolved_capacity(&selected, &all.request, &all.placement, 16, 16).unwrap().devices[0]
                 .reservations[0].name, "workspace.local");
-            for onboard in [Onboard::Layers(2), Onboard::Fraction(2.0 / 3.0)] {
+            for onboard in [Onboard::Layers(2)] {
                 let partial = solve_working_set(&MimoInputs { onboard, ..inputs.clone() }, &local).unwrap();
                 assert_eq!(partial.working_set.rtx_layers, vec![1, 2]);
                 assert_eq!(partial.working_set.spark_layers, vec![3]);
@@ -274,7 +259,7 @@ mod tests {
                 assert_eq!(partial.request.inventory.gpus[0].headroom_bytes, (96u64 << 30)
                     - (96u64 << 30) * 97 / 100 + (64 << 20));
             }
-            for onboard in [Onboard::Layers(3), Onboard::Fraction(1.0), Onboard::ExpertsFirst { pool_floor: 262144 }] {
+            for onboard in [Onboard::Layers(3)] {
                 let result = solve_working_set(&MimoInputs { onboard, ..inputs.clone() }, &local).unwrap();
                 assert_eq!(result.placement.onboard_layers, 3);
                 assert_eq!(result.working_set.spark_ranks, 0);
