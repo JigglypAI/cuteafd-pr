@@ -251,7 +251,8 @@ mod tests {
             (4096, 256, 6, 704, 66240, false, [128; 6]),
             (7168, 384, 6, 608, 66144, false, [128; 6]),
         ] {
-            for (capacity, tile) in [1, 16, 80, 256, 1024, 4096].into_iter().zip(tiles) {
+            for (capacity, tile) in [1, 16, 64, 80, 256, 1024, 4096].into_iter()
+                .zip([tiles[0], tiles[1], tiles[2], tiles[2], tiles[3], tiles[4], tiles[5]]) {
                 let atomic = hidden == 7168 && role < 65536 && capacity >= 256;
                 let expected = if native_prefill(hidden as usize, width as usize, 121, capacity as u32, experts as usize, topk as usize) {
                     native_prefill_scratch_bytes(hidden as usize, width as usize, experts as usize,
@@ -263,7 +264,7 @@ mod tests {
         }
         for (hidden, experts, topk, width, capacity) in [
             (255, 384, 6, 288, 1), (5120, 0, 6, 288, 1),
-            (5120, 384, 0, 288, 1), (5120, 384, 6, 31, 1), (5120, 384, 6, 288, 64),
+            (5120, 384, 0, 288, 1), (5120, 384, 6, 31, 1), (5120, 384, 6, 288, 65),
         ] {
             assert_eq!(native_scratch_bytes(hidden, experts, topk, width, 8, capacity, true), None);
         }

@@ -40,7 +40,7 @@ pub enum SparkBackend {
     Fp8,
     /// Native V4.1 packages: main export plus m1/m80.
     Native,
-    /// V4.1 target native and FP8 packages share the verifier cover.
+    /// V4.1 target native packages use the verifier cover.
     V41,
     /// Native EXLR8: one 64-row decode arena and one 4096-row prefill arena.
     Exlr8,
@@ -52,13 +52,20 @@ const NATIVE_EXPORTS: [u32; 5] = [1, 80, 256, 1024, 4096];
 
 impl SparkBackend {
     /// The backend a Spark worker loads for `catalog`, in the worker's own
-    /// selection order (EXLR8 format, then EXL3, then FP8-family, then native).
+    /// selection order (EXLR8 format, then FP8-family, then EXL3, then native).
     pub fn for_catalog(catalog: &crate::OfficialV41Catalog) -> anyhow::Result<Self> {
         let geometry = catalog.routed_experts().geometry()?;
-        Ok(if catalog.format() == crate::plan::checkpoint::CheckpointFormat::Exlr8 { Self::Exlr8 }
-            else if geometry.same_shape(&cuteafd_core::ExpertGeometry::DEEPSEEK_V41) && catalog.exl3().is_none() { Self::V41 }
-            else if catalog.exl3().is_some() { Self::Exl3(cuteafd_core::Exl3RowPolicy::for_geometry(geometry)) }
-            else if catalog.fp8().is_some() { Self::Fp8 } else { Self::Native })
+        Ok(Self::for_formats(geometry,
+            catalog.format() == crate::plan::checkpoint::CheckpointFormat::Exlr8,
+            catalog.fp8().is_some(), catalog.exl3().is_some()))
+    }
+
+    fn for_formats(geometry: cuteafd_core::ExpertGeometry, exlr8: bool, fp8: bool, exl3: bool) -> Self {
+        if exlr8 { Self::Exlr8 }
+        else if fp8 { Self::Fp8 }
+        else if exl3 { Self::Exl3(cuteafd_core::Exl3RowPolicy::for_geometry(geometry)) }
+        else if geometry.same_shape(&cuteafd_core::ExpertGeometry::DEEPSEEK_V41) { Self::V41 }
+        else { Self::Native }
     }
 
     /// Compiled exports this backend can load for live capacities up to 4096.
@@ -104,6 +111,16 @@ pub fn admit_family(family: &str, exports: &[u32], decode_rows: Option<u32>,
 mod tests {
     use super::*;
     use cuteafd_core::{DecodeExecution, PrefillExecution};
+
+    #[test]
+    fn artifact_format_precedes_v41_native_geometry() {
+        let geometry = cuteafd_core::ExpertGeometry::DEEPSEEK_V41;
+        assert_eq!(SparkBackend::for_formats(geometry, false, true, false), SparkBackend::Fp8);
+        assert_eq!(SparkBackend::for_formats(geometry, false, false, true),
+            SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::for_geometry(geometry)));
+        assert_eq!(SparkBackend::for_formats(geometry, true, true, true), SparkBackend::Exlr8);
+        assert_eq!(SparkBackend::for_formats(geometry, false, false, false), SparkBackend::V41);
+    }
 
     #[test]
     fn every_descriptor_admits_one_prefill_owner_at_the_selected_unit_export() {

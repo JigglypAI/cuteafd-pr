@@ -1015,7 +1015,11 @@ mod context_geometry_tests {
         assert_eq!(BackboneCache::pages_for_context(3, 513).unwrap(), [6, 6, 6, 9]);
         assert_eq!(BackboneCache::pages_for_context(16, 1048576).unwrap(), [32768, 32768, 32768, 65536]);
         assert!(BackboneCache::pages_for_context(0, 32768).is_err());
-        assert!(BackboneCache::pages_for_context(17, 32768).is_err());
+        for concurrency in [1, 4, 16, 17, 32, 64] {
+            assert_eq!(BackboneCache::pages_for_context(concurrency, 32768).unwrap(),
+                [concurrency * 64, concurrency * 64, concurrency * 64, concurrency * 128]);
+        }
+        assert!(BackboneCache::pages_for_context(65, 32768).is_err());
         assert!(BackboneCache::pages_for_context(1, 0).is_err());
         assert!(BackboneCache::pages_for_context(1, 1048577).is_err());
     }

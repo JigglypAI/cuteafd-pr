@@ -367,7 +367,10 @@ impl ExpertReductionPlan {
     ) -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
         let infos = infos.into_iter().collect::<Vec<_>>();
-        let exports = library.native_expert_exports(infos.first().context("empty native expert package")?.role)?;
+        let role = infos.first().context("empty native expert package")?.role;
+        let exports = library.native_expert_exports(role)?;
+        ensure!(infos.iter().all(|info| info.role == role && exports.capacities.contains(&info.capacity_rows)),
+            "loaded native expert roles/capacities differ from the installed package contract");
         let decode_rows = *exports.decode.last().context("empty native decode capacities")? as usize;
         let variants = infos.into_iter().map(|info| {
             let recipe = library.native_expert_reduction(&info).with_context(|| {

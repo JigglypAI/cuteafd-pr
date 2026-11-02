@@ -371,6 +371,7 @@ fn local_vision_owner(enabled: bool, remote: bool) -> bool {
 
 #[cfg(test)]
 mod startup_tests {
+    use super::families::deepseek_v41::owners;
     /// The planner's own target list (decode lanes + prefill slot set) passes
     /// the Engram check at every pinned depth, and the check still refuses a
     /// missing, mis-sized or misplaced owner.
@@ -384,15 +385,15 @@ mod startup_tests {
         for k in 2..=4u64 {
             let unit = cuteafd_loader::serving_capacity::prefill_waves::unit_rows(k);
             let reserve = (k * unit) as usize;
-            let target = programs.target(80, reserve as u64, unit, 1, k as usize, 16,
+            let target = programs.target(owners::DECODE_LANE_ROWS, reserve as u64, unit, 1, k as usize, 16,
                 super::families::deepseek_v41::resident::Fp8Head::Off, true)?;
-            super::validate_engram_rows(&target, reserve, 80)?;
-            assert!(super::validate_engram_rows(&target, reserve - 64, 80).is_err(), "reserve mismatch");
+            super::validate_engram_rows(&target, reserve, owners::DECODE_LANE_ROWS as usize)?;
+            assert!(super::validate_engram_rows(&target, reserve - 64, owners::DECODE_LANE_ROWS as usize).is_err(), "reserve mismatch");
             let missing: Vec<_> = target.iter().filter(|d| d.group != "lane 1 engram rows").cloned().collect();
-            assert!(super::validate_engram_rows(&missing, reserve, 80).is_err(), "missing decode lane");
+            assert!(super::validate_engram_rows(&missing, reserve, owners::DECODE_LANE_ROWS as usize).is_err(), "missing decode lane");
             let mut moved = target.clone();
             moved.iter_mut().find(|d| d.group == "prefill slots engram rows").unwrap().gpu = 1;
-            assert!(super::validate_engram_rows(&moved, reserve, 80).is_err(), "off the gate GPU");
+            assert!(super::validate_engram_rows(&moved, reserve, owners::DECODE_LANE_ROWS as usize).is_err(), "off the gate GPU");
         }
         Ok(())
     }
@@ -879,13 +880,13 @@ mod admission_tests {
                 let weights = weights.into_iter().enumerate().flat_map(|(gpu, items)|
                     items.into_iter().map(move |item| Demand::new(gpu as u8, item.category,
                         item.group, item.bytes, item.basis))).collect::<Vec<_>>();
-                let target = programs.target(80, 512, 256, ranks, 2, 16, resident::Fp8Head::All, ranks == 1)?;
+                let target = programs.target(owners::DECODE_LANE_ROWS, 512, 256, ranks, 2, 16, resident::Fp8Head::All, ranks == 1)?;
                 // The startup validators accept the planner's own target list.
-                if ranks == 1 { validate_engram_rows(&target, 512, 80)?; }
+                if ranks == 1 { validate_engram_rows(&target, 512, owners::DECODE_LANE_ROWS as usize)?; }
                 let fixed = owners::TargetOwners::new(weights, target, ranks,
                     2 * owners::transport_bytes(256, 4)?, 42)?.fixed;
                 let (experts, workspace) = families::deepseek_v41::expert_inventory(
-                    &catalog, &manifest, 256, ranks, 188, 2, 512, 80)?;
+                    &catalog, &manifest, 256, ranks, 188, 2, 512, owners::DECODE_LANE_ROWS)?;
                 // Deliberately synthetic pre-weight inventory, independent of
                 // planner output. This is not a CUDA sample or ready-parity gate.
                 let memory = vec![(80usize << 30, 96usize << 30); ranks];

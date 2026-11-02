@@ -11,7 +11,7 @@ fn local_activation_contract_selects_bf16_only_for_nvfp4() -> Result<()> {
         };
         let fp8 = CuteafdDeviceBuffer {
             ptr: 0x2000usize as *mut c_void,
-            bytes: rows as usize * 5264,
+            bytes: rows as usize * LocalInputFormat::Fp8K32.row_bytes(ExpertGeometry::DEEPSEEK_V41),
             device_id: 0,
             flags: 0,
         };
