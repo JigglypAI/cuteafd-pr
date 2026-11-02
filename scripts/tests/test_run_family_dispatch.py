@@ -1089,6 +1089,30 @@ print(json.dumps(deployment))
     return subprocess.CompletedProcess(completed.args, completed.returncode, read(stdout_path), text)
 
 
+def capture_native_exlr8_launch(snapshot: Path, deployment_path: Path, temporary: Path) -> None:
+    """Pass the real native plan through the launcher; stub only hardware and payloads."""
+    deployment = json.loads(deployment_path.read_text())
+    config = json.loads((snapshot / "config.json").read_text())
+    ranks, gpus = deployment["spark_ranks"], deployment["rtx_gpus"]
+    keys = (f"SPARK_COUNT={ranks}\nRTX_GPUS={gpus}\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+            f"EXLR8_MANIFEST={deployment['exlr8']['manifest']}\n"
+            f"ATTENTION_PLACEMENT={'context' if gpus == 2 else 'heads'}\n")
+    keys += "".join(f"SPARK_{rank}_HOST=worker-{rank}\nSPARK_{rank}_LANE_A=192.0.2.{rank + 1}\n"
+                    for rank in range(ranks))
+    result = _family_launch_result(temporary, config, "test/glm53-exlr8", keys,
+        physical_gpus=tuple(range(gpus)), root_launcher=True, extra_args=("--wip", "native-budget-test"),
+        extra_env={"STUB_REAL_DEPLOYMENT": str(deployment_path), "CUTEAFD_CDI_CHECK": "off"})
+    assert result.returncode == 0, result.stderr
+    workers = [shlex.split(line) for line in result.stderr.splitlines()
+               if "cuteafd expertd-native" in line]
+    assert len(workers) == ranks, result.stderr
+    devices = {device["index"]: device for device in deployment["memory_layout"]["devices"]
+               if device["kind"] == "spark"}
+    for rank, worker in enumerate(sorted(workers, key=lambda w: int(w[w.index("--rank") + 1]))):
+        assert worker[worker.index("--world") + 1] == str(ranks)
+        assert int(worker[worker.index("--device-budget-bytes") + 1]) == devices[rank]["worker_budget_bytes"]
+
+
 def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, temporary: Path) -> dict:
     """Rust contract supplies actual headers/deployment; only hardware is stubbed."""
     deployment = json.loads(deployment_path.read_text())

@@ -259,6 +259,71 @@ fn installed_example_programs_discovery_preserves_overrides_and_planner_errors()
 }
 
 #[test]
+fn installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget() {
+    let Some(hf_home) = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME") else { return; };
+    let hf_home = std::path::PathBuf::from(hf_home);
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let programs = installed_example_programs(
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into),
+        &std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME")),
+        std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
+    for (name, gpus, ranks) in [("min", "1", 4), ("max", "2", 6)] {
+        let example = root.join(format!("examples/configs/glm53-exlr8-{name}.config"));
+        let raw = std::fs::read_to_string(&example).unwrap();
+        let config = raw.lines().filter_map(|line| line.split_once('='))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let Some(snapshot) = installed_example_snapshot(config["MODEL_ID"],
+            Some(config["MODEL_REVISION"]), &hf_home) else {
+            eprintln!("{name}: SKIP GLM EXLR8 checkpoint not installed");
+            continue;
+        };
+        for explicit in [None, Some("104")] {
+            let mut command = Command::new("timeout");
+            command.args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
+                .arg(&snapshot).args(["--deployment", "--config"]).arg(&example)
+                .args(["--rtx", gpus, "--spark-ranks", &ranks.to_string(),
+                    "--vision", "off", "--audio", "off", "--speculator", "off",
+                    "--exlr8-manifest", config["EXLR8_MANIFEST"]])
+                .env_remove("COORDINATOR_GPU_BUDGET_GIB");
+            if let Some(programs) = &programs { command.arg("--workspace-manifest").arg(programs); }
+            if let Some(budget) = explicit { command.args(["--spark-budget-gib", budget]); }
+            let output = command.output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if missing_programs_input(programs.as_deref()
+                .unwrap_or(std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json")), &stderr) {
+                eprintln!("{name}: SKIP native PROGRAMS not installed");
+                continue;
+            }
+            assert!(output.status.success(), "{name}, budget={explicit:?}: {stderr}");
+            let deployment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(deployment["spark_ranks"], ranks);
+            let devices = deployment["memory_layout"]["devices"].as_array().unwrap().iter()
+                .filter(|device| device["kind"] == "spark").collect::<Vec<_>>();
+            assert_eq!(devices.len(), ranks as usize);
+            let expected = explicit.map_or(108u64, |_| 104) << 30;
+            for (rank, device) in devices.iter().enumerate() {
+                assert_eq!(device["index"], rank);
+                assert_eq!(device["worker_budget_bytes"], expected);
+                assert_eq!(device["capacity_bytes"], expected);
+                assert_eq!(device["items"][0]["bytes"],
+                    deployment["spark_requirements"]["resident_bytes_per_rank"][rank]);
+            }
+            let temporary = tempfile::tempdir().unwrap();
+            let path = temporary.path().join("deployment.json");
+            std::fs::write(&path, &output.stdout).unwrap();
+            let python = Command::new("python3").args(["-I", "-c", r#"
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
+from test_run_family_dispatch import capture_native_exlr8_launch
+capture_native_exlr8_launch(*map(Path, sys.argv[2:]))
+"#]).arg(&root).arg(&snapshot).arg(&path).arg(temporary.path()).output().unwrap();
+            assert!(python.status.success(), "{name}: {}", String::from_utf8_lossy(&python.stderr));
+        }
+    }
+}
+
+#[test]
 fn installed_example_deployments_publish_executable_prefill_shapes() {
     // cpu-gate --full enables the installed inventory; sparse fixtures always run.
     let Some(hf_home) = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME") else { return; };

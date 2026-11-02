@@ -244,6 +244,8 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
         ("rtx".into(), memory.devices.iter().flat_map(|d| &d.items)
             .filter(|i| matches!(i.category, cuteafd_core::memory_layout::Category::Weights
                 | cuteafd_core::memory_layout::Category::Embedding | cuteafd_core::memory_layout::Category::Experts)).map(|i| i.bytes).sum())]);
+    let mut memory = memory;
+    append_spark_devices(&mut memory, layout, &residents);
     report.memory_layout = Some(memory);
     report.solver_placement = Some(placement);
     {
@@ -252,6 +254,17 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     }
     Ok(NativePlan { report, selection: NativeSelection { manifest: selected.into(), set_id }, sparks: SparkRequirements { resident_bytes_per_rank: residents,
         k1_workspace: "checked_by_worker_live_admission" } })
+}
+
+fn append_spark_devices(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
+    layout: &super::layout::LayoutOptions, residents: &[u64]) {
+    use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item};
+    memory.devices.extend(residents.iter().enumerate().map(|(rank, &bytes)| DeviceLayout {
+        kind: DeviceKind::Spark, index: rank as u32,
+        capacity_bytes: layout.spark_bytes, worker_budget_bytes: layout.spark_bytes,
+        items: vec![Item::new(Category::Experts, "routed_expert", "exlr8", bytes, Basis::Exact)],
+        kv_tokens: 0,
+    }));
 }
 
 /// Physical native residency for precisely the admitted Spark suffix.
@@ -1172,6 +1185,38 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Write;
+
+    #[test]
+    fn native_min_max_worker_devices_preserve_residents_and_rtx_layout() {
+        use cuteafd_core::memory_layout::{DeviceKind, DeviceLayout, MemoryLayout};
+        for (gpus, ranks) in [(1, 4), (2, 6)] {
+            for budget in [108u64 << 30, 104u64 << 30] {
+                let layout = super::super::layout::LayoutOptions { spark_bytes: budget, ..Default::default() };
+                let mut memory = MemoryLayout { devices: (0..gpus).map(|index| DeviceLayout {
+                    kind: DeviceKind::Rtx, index, capacity_bytes: 96 << 30, worker_budget_bytes: 0,
+                    items: Vec::new(), kv_tokens: 262144,
+                }).collect(), pool_tokens: 262144, waste: Vec::new(), notes: Vec::new() };
+                let rtx = memory.devices.clone();
+                let residents = (0..ranks).map(|rank| (80 << 30) + rank as u64).collect::<Vec<_>>();
+                append_spark_devices(&mut memory, &layout, &residents);
+                assert_eq!(&memory.devices[..gpus as usize], rtx.as_slice());
+                assert_eq!(memory.pool_tokens, 262144);
+                for (rank, device) in memory.devices[gpus as usize..].iter().enumerate() {
+                    assert_eq!(device.index, rank as u32);
+                    assert_eq!(device.worker_budget_bytes, budget);
+                    assert_eq!(device.capacity_bytes, budget);
+                    assert_eq!(device.items.len(), 1);
+                    assert_eq!(device.items[0].bytes, residents[rank]);
+                }
+                let with_sparks = memory.clone();
+                append_spark_devices(&mut memory, &layout, &[]);
+                assert_eq!(memory, with_sparks);
+            }
+        }
+        let body = include_str!("exlr8.rs").split("pub(super) fn native_plan_of(").nth(1).unwrap()
+            .split("fn append_spark_devices(").next().unwrap();
+        assert!(body.contains("append_spark_devices(&mut memory, layout, &residents)"));
+    }
 
     #[test]
     fn native_prefill_uses_the_serving_family_limits() {
