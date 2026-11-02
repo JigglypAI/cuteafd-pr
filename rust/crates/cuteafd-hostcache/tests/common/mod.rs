@@ -548,9 +548,9 @@ pub fn apply(
 /// Mirror the cache's eviction-on-exhaustion: while planning a store the cache may evict
 /// unpinned snapshots, so bring the model's resident set down to the cache's.
 pub fn reconcile<P>(cache: &HostCache<StubCopyEngine, P>, model: &mut Model) {
-    while model.snapshots.len() > cache.metrics().resident_snapshots as usize {
-        if model.evict_one().is_none() {
-            break;
-        }
-    }
+    // Admission also protects ancestors of the incoming (not yet modelled) store.
+    // A resident count alone cannot identify those victims; mirror their identities.
+    let removed: Vec<_> = model.snapshots.keys().copied()
+        .filter(|&key| cache.snapshot_tokens(key).is_none()).collect();
+    for key in removed { model.remove(key); }
 }
