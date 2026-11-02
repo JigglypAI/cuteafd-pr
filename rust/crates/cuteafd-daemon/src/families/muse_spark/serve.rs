@@ -319,6 +319,59 @@ mod tests {
         Ok(args)
     }
 
+    fn trace_tokens(manifest: &serde_json::Value, id: &str, count: usize) -> Result<Vec<u32>> {
+        let windows = manifest["windows"].as_array().context("activation trace windows")?;
+        let selected = windows.iter().filter(|window| window["id"].as_str() == Some(id)).collect::<Vec<_>>();
+        ensure!(selected.len() == 1, "activation trace needs one matching window id: {id}");
+        let tokens = selected[0]["tokens"].as_array().context("activation trace tokens")?;
+        ensure!(count > 0 && count <= tokens.len(), "activation trace token count exceeds the selected window");
+        tokens[..count].iter().map(|value| Ok(u32::try_from(value.as_u64().context("activation trace token id")?)?))
+            .collect()
+    }
+
+    #[test]
+    fn trace_window_selection_is_an_exact_prefix() -> Result<()> {
+        let set = serde_json::json!({"windows": [{"id": "a", "tokens": [1,2,3]}, {"id": "b", "tokens": [9,8,7]}]});
+        assert_eq!(trace_tokens(&set, "b", 2)?, [9,8]);
+        for (id, count) in [("a", 0), ("a", 4), ("missing", 1)] {
+            assert!(trace_tokens(&set, id, count).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires sealed Muse exports, full checkpoint and four real Spark workers"]
+    fn live_short_prompt_activation_trace() -> Result<()> {
+        use crate::shared::qwen::scheduler::Backend as _;
+        let window = std::env::var("CUTEAFD_ACTIVATION_TRACE_WINDOW")?;
+        let count: usize = std::env::var("CUTEAFD_ACTIVATION_TRACE_TOKENS")?.parse()?;
+        let position: usize = std::env::var("CUTEAFD_ACTIVATION_TRACE_POSITION")?.parse()?;
+        ensure!(count <= 64 && position < count, "short activation trace needs at most 64 tokens and an in-prefix position");
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            std::path::Path::new(&std::env::var("CUTEAFD_GOLDEN_FIXTURES")?).join("windows.json"))?)?;
+        ensure!(manifest["family"] == "muse_spark", "activation trace requires Muse's published text set");
+        let tokens = trace_tokens(&manifest, &window, count)?;
+        let mut args = args(&[])?;
+        args.snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?.into();
+        args.native_lib = std::env::var("CUTEAFD_NATIVE_LIB")?.into();
+        args.manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?.into();
+        args.peers = std::env::var("CUTEAFD_GOLDEN_PEERS")?.split(',').map(str::parse)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ensure!(args.peers.len() == 4, "short Muse trace uses the smallest four-Spark layout");
+        args.max_sequences = 1;
+        args.expert_partial_bf16_max_rows = 4096;
+        args.prefix.resolve_entries(1);
+        args.validate()?;
+        with_backend(&args, |backend, _| {
+            let (family, mut pool) = backend.prefix_cache(&args.prefix, 1)?;
+            let mut request = pool.admit_cold(&family, count, count + 1,
+                |pages| super::super::prefix::Placement { pages, slot: 0, len: 0 })?.placement;
+            backend.prefill_device(&mut request, &tokens, 0, pool.pool())?;
+            backend.library().cuda_device_synchronize()?;
+            Ok(())
+        })
+    }
+
     #[test]
     fn defaults_are_one_entry_gpu_with_automatic_context_and_onboarding() -> Result<()> {
         let defaults = args(&["--peers", PEERS])?;

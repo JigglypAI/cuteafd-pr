@@ -325,6 +325,37 @@ def test_muse_golden_qualifies_scores_resumes_and_writes_routes(tmp_path, monkey
     family.outer = None
     run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel)
     assert (out / "windows" / "w0" / "logits.bin").read_bytes() == first
+    # An unset diagnostic hook must preserve the complete serialized score outputs.
+    monkeypatch.delenv("CUTEAFD_ACTIVATION_TRACE_POSITION", raising=False)
+    monkeypatch.delenv("CUTEAFD_ACTIVATION_TRACE_WINDOW", raising=False)
+    monkeypatch.delenv("CUTEAFD_ACTIVATION_TRACE_TOKENS", raising=False)
+    observed = {str(p.relative_to(out)): p.read_bytes() for p in (out / "windows").rglob("*.bin")}
+    plain_root = tmp_path / "plain-run"
+    plain_root.mkdir()
+    with monkeypatch.context() as plain:
+        plain.setattr(golden, "activation_trace", lambda *args: contextlib.nullcontext())
+        family.outer = None
+        plain_out = run_golden(plain_root, monkeypatch, golden, family, snapshot, panel)
+    assert {str(p.relative_to(plain_out)): p.read_bytes() for p in (plain_out / "windows").rglob("*.bin")} == observed
+
+    # The diagnostic entry point never invokes qualification or publishes a golden/state.
+    import layer_major
+    trace_out = tmp_path / "trace-only"
+    monkeypatch.setenv("CUTEAFD_ACTIVATION_TRACE_WINDOW", "w1")
+    monkeypatch.setenv("CUTEAFD_ACTIVATION_TRACE_TOKENS", "7")
+    monkeypatch.setenv("CUTEAFD_ACTIVATION_TRACE_POSITION", "3")
+    monkeypatch.setenv("CUTEAFD_ACTIVATION_TRACE_DIR", str(trace_out))
+    monkeypatch.delenv("CUTEAFD_TRACE_LAYER", raising=False)
+    monkeypatch.setattr("shape_invariant.qualify", lambda *args: pytest.fail("diagnostic qualified a prefix"))
+    args = __import__("types").SimpleNamespace(snapshot=snapshot, windows=panel, out=trace_out,
+                                             prefix_only=False, wait_shards=0)
+    family.outer = None
+    result = layer_major.run(args, family)
+    assert result == {"diagnostic": True, "window": "w1", "tokens": 7}
+    files = list(trace_out.rglob("*"))
+    assert len([p for p in files if p.is_file()]) == config.num_hidden_layers * 9
+    assert all(p.name.startswith("layer") and p.suffix == ".bin" for p in files if p.is_file())
+    assert {p.name for p in trace_out.iterdir()} == {"position3-prefill"}
 
 
 def test_mistral_golden_threads_shared_kv_and_topk_across_layers(tmp_path, monkeypatch):
@@ -404,3 +435,54 @@ def test_mistral_ordered_experts_equal_the_official_cpu_accumulation():
     _, weights, index = moe.gate(hidden)
     with torch.inference_mode():
         assert torch.equal(moe.experts(hidden, index, weights), mistral.ordered_experts(moe.experts, hidden, index, weights))
+
+
+def test_muse_activation_trace_is_opt_in_and_preserves_outputs(tmp_path, monkeypatch):
+    from families.muse_spark.golden import activation_trace
+    from transformers.models.muse_spark import modeling_muse_spark as reference
+    import numpy as np
+    config = tiny_muse_config()
+    layer = reference.MuseSparkTextDecoderLayer(config, 0).eval()
+    randomize(layer)
+    rotary = reference.MuseSparkTextRotaryEmbedding(config)
+    hidden = torch.randn(1, 7, config.hidden_size)
+    monkeypatch.delenv("CUTEAFD_ACTIVATION_TRACE_POSITION", raising=False)
+    monkeypatch.setenv("CUTEAFD_ACTIVATION_TRACE_DIR", str(tmp_path))
+    with torch.inference_mode():
+        expected = muse.layer_forward(layer, config, 0, hidden, rotary)
+        with activation_trace(layer, 0, hidden):
+            untraced = muse.layer_forward(layer, config, 0, hidden, rotary)
+    assert torch.equal(expected, untraced)
+    assert not list(tmp_path.iterdir())
+    monkeypatch.setenv("CUTEAFD_ACTIVATION_TRACE_POSITION", "3")
+    monkeypatch.setenv("CUTEAFD_TRACE_LAYER", "0")
+    with torch.inference_mode(), activation_trace(layer, 0, hidden):
+        actual = muse.layer_forward(layer, config, 0, hidden, rotary)
+    assert torch.equal(expected, actual)
+    folder = tmp_path / "position3-prefill"
+    assert {p.name for p in folder.iterdir()} == {
+        f"layer0-{name}{suffix}.bin" for name in ("hidden", "residual", "combined", "route_weights")
+        for suffix in ("", ".f32")
+    } | {"layer0-route_ids.bin"}
+    np.testing.assert_array_equal(np.fromfile(folder / "layer0-hidden.f32.bin", dtype="<f4"),
+                                  expected[0, 3].numpy())
+    assert (folder / "layer0-hidden.bin").read_bytes() == expected[0, 3].bfloat16().view(torch.int16).numpy().tobytes()
+    assert (folder / "layer0-route_ids.bin").stat().st_size == config.num_experts_per_tok * 4
+    assert (folder / "layer0-route_weights.bin").stat().st_size == config.num_experts_per_tok * 2
+    assert (folder / "layer0-combined.bin").stat().st_size == config.moe_hidden_size * 2
+    assert all(not m._forward_hooks for m in layer.modules())
+    monkeypatch.setenv("CUTEAFD_TRACE_LAYER", "1")
+    with torch.inference_mode(), activation_trace(layer, 0, hidden):
+        assert torch.equal(expected, muse.layer_forward(layer, config, 0, hidden, rotary))
+
+
+def test_muse_activation_trace_removes_hooks_after_failure(tmp_path, monkeypatch):
+    from families.muse_spark.golden import activation_trace
+    from transformers.models.muse_spark import modeling_muse_spark as reference
+    layer = reference.MuseSparkTextDecoderLayer(tiny_muse_config(), 0).eval()
+    monkeypatch.setenv("CUTEAFD_ACTIVATION_TRACE_POSITION", "0")
+    monkeypatch.setenv("CUTEAFD_ACTIVATION_TRACE_DIR", str(tmp_path))
+    monkeypatch.delenv("CUTEAFD_TRACE_LAYER", raising=False)
+    with pytest.raises(RuntimeError, match="injected"), activation_trace(layer, 0, torch.zeros(1, 1, 64)):
+        raise RuntimeError("injected")
+    assert all(not m._forward_hooks for m in layer.modules())

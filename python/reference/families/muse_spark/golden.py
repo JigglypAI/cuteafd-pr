@@ -24,6 +24,54 @@ import layer_major
 from families.muse_spark import model
 
 
+@contextmanager
+def activation_trace(module, index, hidden):
+    """Retain one position only when explicitly requested; observe, never replace outputs."""
+    position = os.environ.get("CUTEAFD_ACTIVATION_TRACE_POSITION")
+    if position is None:
+        yield
+        return
+    position = int(position)
+    layer = os.environ.get("CUTEAFD_TRACE_LAYER")
+    if position < 0:
+        raise ValueError("activation trace position must be nonnegative")
+    if position >= hidden.shape[-2] or (layer is not None and index != int(layer)):
+        yield
+        return
+    directory = Path(os.environ["CUTEAFD_ACTIVATION_TRACE_DIR"]) / f"position{position}-prefill"
+    directory.mkdir(parents=True, exist_ok=True)
+    handles = []
+
+    def save(name, tensor, *, integer=False):
+        import torch
+        row = tensor.detach().reshape(-1, tensor.shape[-1])[position].cpu().contiguous()
+        path = directory / f"layer{index}-{name}.bin"
+        if integer:
+            data = row.to(torch.int32).numpy().astype("<i4").tobytes()
+        else:
+            data = row.to(torch.bfloat16).view(torch.int16).numpy().astype("<i2").tobytes()
+            with path.with_suffix(".f32.bin").open("xb") as stream:
+                stream.write(row.float().numpy().astype("<f4").tobytes())
+        with path.open("xb") as stream:
+            stream.write(data)
+
+    def route_hook(_module, _args, output):
+        _, weights, ids = output
+        save("route_ids", ids, integer=True)
+        save("route_weights", weights)
+
+    # All taps are producer outputs, not retained views of overwritten scratch.
+    try:
+        handles.append(module.mlp.gate.register_forward_hook(route_hook))
+        for target, name in ((module.post_attention_residual_gate, "residual"),
+                             (module.mlp.experts, "combined"), (module, "hidden")):
+            handles.append(target.register_forward_hook(lambda _m, _a, output, name=name: save(name, output)))
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
 class Family:
     name = "muse_spark"
 
@@ -110,7 +158,8 @@ class Family:
                 box["weights"] = weights.to("cpu").float().numpy()
 
     def forward(self, module, index, hidden, carry):
-        hidden = model.layer_forward(module, self.config, index, hidden, self.rotary)
+        with activation_trace(module, index, hidden):
+            hidden = model.layer_forward(module, self.config, index, hidden, self.rotary)
         return hidden, {}, ()
 
     def write_extras(self, root, index, extras, windows):

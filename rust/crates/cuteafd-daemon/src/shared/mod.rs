@@ -1,5 +1,6 @@
 //! Code every family uses.
 
+pub(crate) mod activation_trace;
 pub(crate) mod api;
 pub(crate) mod console;
 pub(crate) mod malloc_tune;

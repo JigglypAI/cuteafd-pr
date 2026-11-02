@@ -185,10 +185,9 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
     }
 
     fn land_experts(&mut self, layer: usize, unit: &Unit, _: ()) -> Result<()> {
-        let rows = unit.rows.len();
-        self.each_rank(unit, |index, device, _, peer, experts, wave| {
+        self.each_rank(unit, |index, device, planes, peer, experts, wave| {
             let landed = if index == 0 { wave.take() } else { None };
-            device.layer_back(layer, rows, landed, experts, peer)
+            device.layer_back(layer, planes, landed, experts, peer)
         })?;
         self.tap(layer, unit)
     }

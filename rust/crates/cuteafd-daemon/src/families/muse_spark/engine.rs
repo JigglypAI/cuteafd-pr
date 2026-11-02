@@ -104,7 +104,8 @@ impl<'a> StepStorage<'a> {
         let step = StepPlanes { rows, positions: rows_of("positions", 8), ring_slots: rows_of("ring_slots", 8),
             seq_first: rows_of("seq_first", 4), page_slots: rows_of("page_slots", 8), step_slots: rows_of("step_slots", 8),
             page_table: Buffer { bytes: meta.page_table.len() * 4, ..planes["page_table"] },
-            table_stride: meta.table_stride, prefill, wave };
+            table_stride: meta.table_stride, prefill, wave,
+            trace: crate::shared::activation_trace::RowTrace::select(&meta.positions, prefill)? };
         step.check(meta)?;
         Ok(step)
     }

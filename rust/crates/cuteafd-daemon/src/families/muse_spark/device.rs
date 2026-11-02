@@ -116,6 +116,7 @@ pub(crate) struct StepPlanes {
     pub prefill: bool,
     /// The step's requests and kind (each Spark wave's reply regions).
     pub wave: super::experts::WaveStep,
+    pub trace: Option<crate::shared::activation_trace::RowTrace>,
 }
 
 impl StepPlanes {
@@ -132,6 +133,24 @@ impl StepPlanes {
 fn rows_i32(rows: usize) -> Result<Scalar> { Ok(Scalar::I32(i32::try_from(rows)?)) }
 
 impl RankDevice<'_, '_> {
+    /// Diagnostic readback at the producer, before another unit can reuse scratch.
+    fn trace(&self, step: &StepPlanes, layer: usize, components: &[(&str, usize)]) -> Result<()> {
+        let Some(trace) = &step.trace else { return Ok(()) };
+        ensure!(self.ranks == 1, "Muse activation readback requires the single-RTX diagnostic layout");
+        if self.rank != 0 || !trace.includes(layer) { return Ok(()) }
+        // SAFETY: this rank owns the live stream; readbacks occur only after its producers drain.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+        for &(name, stride) in components {
+            let row = trace.row(self.lane.rows(name, step.rows)?, stride)?;
+            if name == "route_weights" {
+                crate::shared::activation_trace::write_f32(self.library, &trace.directory, layer, name, row)?;
+            } else {
+                crate::shared::activation_trace::write_device(self.library, &trace.directory, layer, name, row)?;
+            }
+        }
+        Ok(())
+    }
+
     fn weights(&self, layer: usize) -> Result<&LayerWeights<'_>> {
         self.layers.get(layer).with_context(|| format!("Muse rank holds no layer {layer}"))
     }
@@ -402,7 +421,7 @@ impl RankDevice<'_, '_> {
         mut peer: Option<&mut (dyn PeerExchange + '_)>) -> Result<()> {
         let wave = self.layer_front(layer, step, experts.as_mut().map(|e| &mut **e as &mut dyn SparkExperts),
             peer.as_mut().map(|p| &mut **p as &mut dyn PeerExchange))?;
-        self.layer_back(layer, step.rows, wave, experts, peer)
+        self.layer_back(layer, step, wave, experts, peer)
     }
 
     /// The layer up to the Spark wave: input norm, attention, the gated
@@ -419,10 +438,12 @@ impl RankDevice<'_, '_> {
         let attended = lane.rows("attended", rows)?;
         self.norm(layer, "post_attn_norm", None, rows, attended, normed)?;
         self.residual_gate(layer, "attention", rows, hidden, normed, residual)?;
+        self.trace(step, layer, &[("residual", self.cfg.hidden * 2)])?;
         self.norm(layer, "pre_ffn_norm", Some("norm.pre_ffn"), rows, residual, normed)?;
         match (self.ranks, self.rank, experts) {
             (1, 0, Some(experts)) => {
                 self.moe_frontend(layer, rows)?;
+                self.trace(step, layer, &[("route_ids", self.cfg.topk * 4), ("route_weights", self.cfg.topk * 4)])?;
                 self.expert_wire(rows)?;
                 Ok(Some(experts.send(layer, &step.wave, self.wave_sources(rows)?)?))
             }
@@ -430,6 +451,7 @@ impl RankDevice<'_, '_> {
                 self.moe_frontend_split(layer, rows, peer.context("Muse TP2 needs the peer exchange")?)?;
                 match experts {
                     Some(experts) => {
+                        self.trace(step, layer, &[("route_ids", self.cfg.topk * 4), ("route_weights", self.cfg.topk * 4)])?;
                         self.expert_wire(rows)?;
                         Ok(Some(experts.send(layer, &step.wave, self.wave_sources(rows)?)?))
                     }
@@ -455,11 +477,13 @@ impl RankDevice<'_, '_> {
         let attended = lane.rows("attended", rows)?;
         self.norm(layer, "post_attn_norm", None, rows, attended, normed)?;
         self.residual_gate(layer, "attention", rows, hidden, normed, residual)?;
+        self.trace(step, layer, &[("residual", self.cfg.hidden * 2)])?;
         self.norm(layer, "pre_ffn_norm", Some("norm.pre_ffn"), rows, residual, normed)?;
         match peer.as_mut() {
             Some(peer) => self.moe_frontend_halves(layer, rows, &mut **peer, true)?,
             None => self.moe_frontend(layer, rows)?,
         }
+        self.trace(step, layer, &[("route_ids", self.cfg.topk * 4), ("route_weights", self.cfg.topk * 4)])?;
         self.expert_wire(rows)?;
         let [ids, weights, wire] = self.wave_sources(rows)?;
         // All rows BF16: the epilogue's BF16 row map is the identity prefix 0..rows, so its
@@ -487,13 +511,15 @@ impl RankDevice<'_, '_> {
         let reply = cuteafd_loader::families::muse_spark::replies::ReplyPlan { bf16_rows: (0..rows as u32).collect(),
             wide_rows: Vec::new(), wide: cuteafd_loader::families::muse_spark::replies::PartialFormat::Nvfp4 };
         self.combine(layer, rows, planes.len(), onboarded.tables.buffer, onboarded.layout, &reply)?;
+        self.trace(step, layer, &[("combined", self.cfg.expert_hidden * 2)])?;
         match peer {
             Some(peer) => self.moe_backend_halves(layer, rows, peer, true)?,
             None => self.moe_backend(layer, rows)?,
         }
         let moe = lane.rows("moe", rows)?;
         self.norm(layer, "post_ffn_norm", Some("norm.post_ffn"), rows, moe, normed)?;
-        self.residual_gate(layer, "ffn", rows, residual, normed, hidden)
+        self.residual_gate(layer, "ffn", rows, residual, normed, hidden)?;
+        self.trace(step, layer, &[("hidden", self.cfg.hidden * 2)])
     }
 
     /// The wave's staging sources from this lane (the unit's slot views): route
@@ -505,9 +531,9 @@ impl RankDevice<'_, '_> {
     /// The layer after the Spark wave: land and combine (rank 0), the MoE
     /// backend (K-split on a pair), the post-feedforward norm and the gated
     /// residual back into `hidden`.
-    pub(crate) fn layer_back(&self, layer: usize, rows: usize, wave: Option<super::experts::Wave>,
+    pub(crate) fn layer_back(&self, layer: usize, step: &StepPlanes, wave: Option<super::experts::Wave>,
         experts: Option<&mut (dyn SparkExperts + '_)>, peer: Option<&mut (dyn PeerExchange + '_)>) -> Result<()> {
-        let lane = self.lane;
+        let (rows, lane) = (step.rows, self.lane);
         if let (Some(wave), Some(experts)) = (wave, experts) {
             let landed = experts.land(wave)?;
             self.combine(layer, rows, landed.ranks, landed.tables, landed.layout, &landed.plan)?;
@@ -515,12 +541,14 @@ impl RankDevice<'_, '_> {
         } else {
             ensure!(self.rank == 1 && wave.is_none(), "Muse rank {} lands without its wave", self.rank);
         }
+        self.trace(step, layer, &[("combined", self.cfg.expert_hidden * 2)])?;
         if self.ranks == 1 { self.moe_backend(layer, rows)?; }
         else { self.moe_backend_split(layer, rows, peer.context("Muse TP2 needs the peer exchange")?)?; }
         let (moe, normed) = (lane.rows("moe", rows)?, lane.rows("normed", rows)?);
         let (residual, hidden) = (lane.rows("residual", rows)?, lane.rows("hidden", rows)?);
         self.norm(layer, "post_ffn_norm", Some("norm.post_ffn"), rows, moe, normed)?;
-        self.residual_gate(layer, "ffn", rows, residual, normed, hidden)
+        self.residual_gate(layer, "ffn", rows, residual, normed, hidden)?;
+        self.trace(step, layer, &[("hidden", self.cfg.hidden * 2)])
     }
 }
 
