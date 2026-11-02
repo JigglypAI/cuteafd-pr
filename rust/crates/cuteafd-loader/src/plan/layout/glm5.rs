@@ -340,9 +340,7 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
         let bytes = if t.dtype == DType::F8E4M3 && t.shape.len() == 2 { t.shape.iter().product::<usize>() as u64 * 2 } else { t.byte_length };
         put(0, group, "bf16", bytes);
     }
-    if let Some(alpha) = cfg.variant.ml4().map(|_| "lerope.alpha") {
-        put(0, "norm", "bf16", tensor(alpha)?.byte_length);
-    }
+    // LeRoPE alpha stays on the host; only its generated RoPE table owns device storage.
     Ok(groups.into_iter().map(|g| g.into_iter().map(|((group, format), bytes)| (group, format, bytes)).collect()).collect())
 }
 

@@ -386,6 +386,43 @@ fn native_fixture_check(dir: &std::path::Path, config: &serde_json::Value,
 }
 
 #[test]
+fn published_resident_owners_exclude_host_lerope_alpha() {
+    use crate::plan::checkpoint::{Checkpoint, CheckpointTensor};
+    let (dir, config, headers) = published_native_fixture();
+    let mut checkpoint = Checkpoint {
+        snapshot: dir.path().into(), config, quantize_config: None,
+        weight_map: headers.iter().map(|h| (h.name.clone(), "published.safetensors".into())).collect(),
+        tensors: headers.into_iter().map(|meta| CheckpointTensor {
+            shard: "published.safetensors".into(), meta,
+        }).collect(), missing_shards: vec![], shard_bytes: 0,
+    };
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+    let owners = crate::placement::families::glm5::attention_owners(&cfg, cfg.layers).unwrap();
+    let layouts = [(1, None), (2, None), (2, Some(owners.as_slice()))];
+    let baseline: Vec<_> = layouts.iter().map(|&(ranks, owners)|
+        crate::plan::layout::glm5::resident_owned(&checkpoint, ranks, cfg.layers, owners).unwrap()).collect();
+
+    // Independent runtime census from the published checkpoint's GPU1 load
+    // (no onboarding): embedding, ordinary operands, native K6 payload/vectors.
+    // GlmLayer::bytes + final norm + GlmHead::bytes + embedding, not planner groups.
+    let device_owners = [2_516_582_400u64, 2_290_224_128, 12_940_943_872];
+    assert_eq!(baseline[0][0].iter().map(|(_, _, bytes)| bytes).sum::<u64>(),
+        device_owners.into_iter().sum::<u64>());
+
+    let alpha = checkpoint.tensors.iter().position(|t| t.meta.name == "lerope.alpha").unwrap();
+    assert_eq!(checkpoint.tensors[alpha].meta.byte_length, 64);
+    for bytes in [2, 256, 4096] {
+        // Only the header changes: no alpha payload or generated table is loaded.
+        checkpoint.tensors[alpha].meta.byte_length = bytes;
+        checkpoint.tensors[alpha].meta.shape = vec![bytes as usize / 2];
+        for (layout, &(ranks, owners)) in layouts.iter().enumerate() {
+            assert_eq!(crate::plan::layout::glm5::resident_owned(&checkpoint, ranks, cfg.layers, owners).unwrap(),
+                baseline[layout], "host alpha bytes={bytes}, ranks={ranks}, owners={owners:?}");
+        }
+    }
+}
+
+#[test]
 fn published_native_fp8_headers_keep_source_numerics() {
     let (dir, config, headers) = published_native_fixture();
     native_fixture_check(dir.path(), &config, &headers).unwrap();
