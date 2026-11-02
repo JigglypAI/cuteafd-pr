@@ -139,7 +139,7 @@ pub(crate) struct DistributedVocabularyWave<'w, 'a> {
 }
 impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
     pub fn device_bytes(capacity: usize, split: usize) -> Result<[usize; 2]> {
-        ensure!((1..=128).contains(&capacity) && (1..129280).contains(&split), "invalid distributed vocabulary geometry");
+        ensure!((1..=cuteafd_core::V41_VOCAB_ROWS).contains(&capacity) && (1..129280).contains(&split), "invalid distributed vocabulary geometry");
         Ok([V41VocabularyProjection::WORKSPACE_BYTES + capacity * (10240 + split * 4 + 8),
             V41VocabularyProjection::WORKSPACE_BYTES + capacity * (10240 + (129280 - split) * 4 + 24)])
     }

@@ -27,6 +27,12 @@ ROOT = Path(os.environ.get("CUTEAFD_SOURCE_ROOT", Path(__file__).resolve().paren
 GEOMETRIES = ("flash", "pro", "flash2", "pro2", "glm", "glm2", "glmf", "glmf2",
               "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "step5", "step52")
 CAPACITIES = "1,16,80,256,1024,4096"
+_spec = importlib.util.spec_from_file_location("v41_capacities", ROOT / "python/tools/lib/v41_capacities.py")
+_v41 = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_v41)
+V41_CAPACITIES = ",".join(map(str, _v41.TARGET_CAPACITIES))
+V41_DRAFT_CAPACITIES = ",".join(map(str, _v41.DRAFT_CAPACITIES))
+V41_PROJECTION_CAPACITIES = ",".join(map(str, _v41.PROJECTION_CAPACITIES))
 # EXL3 packages also carry the prefill wave units (#762): 2048 and 2752 rows.
 EXL3_CAPACITIES = "1,16,80,256,1024,2048,2752,4096"
 # Kimi K3 merges up to three 2752-row wave units, so its packed extents reach
@@ -122,14 +128,14 @@ def jobs(scope):
             width = 192 if family == "v41" and (
                 not role.startswith("spark_w") or artifact.logical % 192 == 0) else 128
             result.append((f"{family}-{role}", "export_b12x_slices_aot.py",
-                           ["--geometry", family, "--role", role, "--rows", CAPACITIES,
-                            "--width", ",".join(f"{capacity}:{width}" for capacity in CAPACITIES.split(",")),
+                           ["--geometry", family, "--role", role, "--rows", V41_CAPACITIES if family == "v41" else CAPACITIES,
+                            "--width", ",".join(f"{capacity}:{width}" for capacity in (V41_CAPACITIES if family == "v41" else CAPACITIES).split(",")),
                             *(["--atomic-min-capacity", "256"] if family == "dsv4p" and not role.startswith("spark_w") else []),
                             "--standard-names"]))
     result.extend([
-        ("v41-fp8", "export_b12x_v41_fp8_aot.py", ["--rows", CAPACITIES]),
+        ("v41-fp8", "export_b12x_v41_fp8_aot.py", ["--rows", V41_PROJECTION_CAPACITIES]),
         ("v41-experts", "export_b12x_v41_experts_aot.py",
-         ["--role", "coordinator", "--input-format", "bf16", "--rows", "1,2,40,16,80,256,1024,4096"]),
+         ["--role", "coordinator", "--input-format", "bf16", "--rows", V41_DRAFT_CAPACITIES]),
         ("v41-index", "export_b12x_v41_index_aot.py", []),
         ("v41-router", "export_b12x_v41_router_aot.py", []),
         ("v41-attention", "export_b12x_v41_attention_aot.py", []),
@@ -154,7 +160,7 @@ def jobs(scope):
     result.append(("muse-k6-dense", "export_b12x_dsv4_aot.py",
                    ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "muse"]))
     for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2"):
-        args = ["--role", role, "--rows", CAPACITIES, "--width", "192", "--standard-names"]
+        args = ["--role", role, "--rows", V41_DRAFT_CAPACITIES if role == "dspark_tp2" else V41_CAPACITIES, "--width", "192", "--standard-names"]
         result.append((f"v41-slices-{role}", "export_b12x_slices_aot.py", args))
     result.append(("v41-slices-rtx_tp2-hybrid", "export_b12x_slices_aot.py",
                    ["--role", "rtx_tp2", "--rows", "1,2,16,80", "--width", "192",
@@ -162,7 +168,7 @@ def jobs(scope):
                     "--standard-names"]))
     for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2"):
         result.append((f"v41-nvfp4-{role}", "export_b12x_v41_nvfp4_aot.py",
-                       ["--role", role, "--rows", CAPACITIES, "--tile-m", "16", "--output-shards", "0"]))
+                       ["--role", role, "--rows", V41_CAPACITIES, "--tile-m", "16", "--output-shards", "0"]))
     result.extend((f"routed-{geometry}", "package_fp8_moe_aot.py",
                    ["--geometry", geometry, "--capacities", CAPACITIES])
                   for geometry in ROUTED_GEOMETRIES)

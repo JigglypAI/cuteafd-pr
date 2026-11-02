@@ -1777,6 +1777,7 @@ native_symbols! {
 }
 
 pub struct NativeLibrary {
+    artifact_root: std::path::PathBuf,
     lib: ManuallyDrop<Arc<Library>>,
     symbols: NativeSymbols,
     quarantine_after_failed_drain: AtomicBool,
@@ -2290,6 +2291,7 @@ fn sync_expert_hidden(lib: &Library) -> Result<()> {
 
 impl NativeLibrary {
     pub unsafe fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let artifact_root = path.as_ref().parent().context("native library has no parent")?.to_owned();
         // The host-ISA variant beside `path` when one is installed (host_isa.rs).
         let path = host_isa::native_library(path.as_ref());
         let lib = unsafe { Library::new(&path) }
@@ -2298,6 +2300,7 @@ impl NativeLibrary {
             unsafe { *lib.get::<RdmaRcEndpointTryPollFn>(b"cuteafd_rdma_rc_endpoint_try_poll")? };
         sync_expert_hidden(&lib)?;
         Ok(Self {
+            artifact_root,
             lib: ManuallyDrop::new(Arc::new(lib)),
             symbols: NativeSymbols::default(),
             quarantine_after_failed_drain: AtomicBool::new(false),

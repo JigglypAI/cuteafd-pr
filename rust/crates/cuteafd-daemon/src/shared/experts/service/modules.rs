@@ -132,7 +132,8 @@ impl<'a> WarmModules<'a> {
             let mut capacities = vec![compiled];
             if crate::shared::experts::execution::compact_output_role(info.role) {
                 if compiled > 1 { capacities.push(1); }
-                if compiled > 80 { capacities.push(80); }
+                let grouped = crate::shared::experts::execution::grouped_decode_rows(layer, library, compiled, nvfp4)?;
+                if compiled > grouped { capacities.push(grouped); }
             }
             for rows in capacities { kernels.push(layer.select_kernel(library, rows, nvfp4)?); }
         }

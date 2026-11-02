@@ -13,7 +13,53 @@ import secrets
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 
 
-def validate_media(media, tokens, roles, score_from):
+def processor_contract(snapshot):
+    """The shared image-span layout, derived from the checkpoint processor."""
+    snapshot = Path(snapshot)
+    config = json.loads((snapshot / "config.json").read_bytes())
+    path = snapshot / "processor_config.json"
+    document = json.loads(path.read_bytes()) if path.exists() else {}
+    processor = document.get("image_processor")
+    if processor is None:
+        processor = json.loads((snapshot / "preprocessor_config.json").read_bytes())
+    kind = processor.get("image_processor_type", "")
+    if kind in ("PixtralImageProcessor", "PixtralImageProcessorPil"):
+        merge = document.get("spatial_merge_size")
+        vision = json.loads((snapshot / "params.json").read_bytes())["vision_encoder"]
+        ids = [vision.get(k) for k in ("image_token_id", "image_break_token_id", "image_end_token_id")]
+        vocab = config.get("text_config", config)["vocab_size"]
+        if (processor.get("patch_size") != config["vision_config"]["patch_size"]
+                or merge != config.get("spatial_merge_size")
+                or config.get("image_token_index") != ids[0]
+                or any(type(n) is not int or not 0 <= n < vocab for n in ids) or len(set(ids)) != 3):
+            raise ValueError("checkpoint processor geometry or image markers disagree")
+        contract = {"merge": merge, "row_markers": 1, "image_token_id": ids[0],
+            "row_break_token_id": ids[1], "end_token_id": ids[2]}
+    elif kind in ("Qwen2VLImageProcessor", "Qwen2VLImageProcessorPil", "Qwen2VLImageProcessorFast",
+                  "Glm5NextImageProcessor", "Glm5NextImageProcessorPil", "Glm5NextImageProcessorFast"):
+        contract = {"merge": processor.get("merge_size", 2), "row_markers": 0}
+    else:
+        raise ValueError(f"unsupported shared image processor: {kind}")
+    merge = contract["merge"]
+    if type(merge) is not int or not 1 <= merge <= 8:
+        raise ValueError("invalid checkpoint image merge")
+    return contract
+
+
+def image_extent(grid, contract=None):
+    """Same patch-grid/merge/row-marker contract as the serving processor."""
+    contract = contract or {"merge": 2, "row_markers": 0}
+    merge, markers = contract.get("merge"), contract.get("row_markers")
+    if (type(merge) is not int or merge <= 0 or type(markers) is not int or markers not in (0, 1)
+            or not isinstance(grid, list) or len(grid) != 3
+            or any(type(n) is not int or n <= 0 for n in grid)
+            or grid[0] != 1 or grid[1] % merge or grid[2] % merge):
+        raise ValueError("image grid does not match merged token extent")
+    h, w = grid[1] // merge, grid[2] // merge
+    return h, w, h * (w + markers)
+
+
+def validate_media(media, tokens, roles, score_from, *, processor=None):
     if not isinstance(media, list):
         raise ValueError("media must be an ordered list")
     previous = 0
@@ -25,10 +71,8 @@ def validate_media(media, tokens, roles, score_from):
                 or start < previous or start + length > score_from):
             raise ValueError("media spans must be sorted, disjoint and before scoring")
         grid = span.get("grid")
-        if (not isinstance(grid, list) or len(grid) != 3
-                or any(type(n) is not int or n <= 0 for n in grid)
-                or grid[0] != 1 or grid[1] % 2 or grid[2] % 2
-                or grid[0] * grid[1] * grid[2] // 4 != length):
+        h, w, expected = image_extent(grid, processor)
+        if expected != length:
             raise ValueError("image grid does not match merged token extent")
         if not isinstance(span.get("key"), str) or not HEX.fullmatch(span["key"]):
             raise ValueError("media key must be lowercase SHA256 hex")
@@ -44,7 +88,17 @@ def validate_media(media, tokens, roles, score_from):
             raise ValueError("fixture lacks a SHA256")
         if any(r != "ctx" for r in roles[start:start + length]):
             raise ValueError("image placeholders cannot be generated positions")
-        if len(set(tokens[start:start + length])) != 1:
+        if processor and processor.get("row_markers") == 1:
+            ids = [processor.get(key) for key in ("image_token_id", "row_break_token_id", "end_token_id")]
+            if any(type(n) is not int or n < 0 for n in ids) or len(set(ids)) != 3:
+                raise ValueError("processor image marker ids are absent or invalid")
+            image, row_break, end = ids
+            for row in range(h):
+                offset = start + row * (w + 1)
+                if (tokens[offset:offset + w] != [image] * w
+                        or tokens[offset + w] != (end if row + 1 == h else row_break)):
+                    raise ValueError("image span differs from processor row markers")
+        elif len(set(tokens[start:start + length])) != 1:
             raise ValueError("image span must contain one repeated placeholder id")
         previous = start + length
     return media

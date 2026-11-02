@@ -1,5 +1,12 @@
 //! Bind reserved prompt rows to a private Engram preparation frontier.
 use super::*;
+
+fn validate_encoder_count(requests: usize, slots: usize) -> Result<()> {
+    ensure!((1..=cuteafd_core::V41_MAX_REQUESTS).contains(&slots)
+        && requests > 0 && requests <= slots, "invalid encoder request count");
+    Ok(())
+}
+
 impl Requests<'_> {
     /// # Safety
     /// Retain query, cache and producer owners; abort queued writes on cancellation.
@@ -66,7 +73,7 @@ impl Requests<'_> {
     }
 
     pub fn reserve_encoder(&mut self, requests: &[RequestTokens<'_>]) -> Result<RequestBatch> {
-        ensure!(!requests.is_empty() && requests.len() <= 16, "invalid encoder request count");
+        validate_encoder_count(requests.len(), self.slots.len())?;
         let masks = self.resolved_masks(requests, true)?;
         let mut prepared = Vec::with_capacity(requests.len());
         let mut work = Vec::with_capacity(requests.len());
@@ -126,3 +133,20 @@ impl Requests<'_> {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn encoder_count_uses_boot_slots_through_c64() -> Result<()> {
+        for slots in [16, 33, 64] {
+            for count in [1, slots] { validate_encoder_count(count, slots)?; }
+            assert!(validate_encoder_count(0, slots).is_err());
+            assert!(validate_encoder_count(slots + 1, slots).is_err());
+        }
+        assert!(validate_encoder_count(33, 16).is_err());
+        assert!(validate_encoder_count(64, 33).is_err());
+        assert!(validate_encoder_count(1, 65).is_err());
+        Ok(())
+    }
+}

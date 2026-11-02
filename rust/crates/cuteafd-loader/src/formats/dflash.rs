@@ -17,7 +17,6 @@ pub fn validate_topk_vocab(vocab: u64) -> std::result::Result<(), DflashTopkVoca
     Ok(())
 }
 
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct MlaDflashConfig {
     pub mla: MlaGeometry,

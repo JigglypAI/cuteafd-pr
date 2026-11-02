@@ -152,13 +152,15 @@ impl Exl3ReductionPlan {
         };
         let variants = manifests.iter().enumerate().map(|(index, meta)| {
             let capacity = meta["capacity"].as_u64().context("EXL3 export lacks capacity")? as usize;
-            let signature = if capacity <= 80 {
+            let signature = if meta["decode_capacity"].as_bool().context("EXL3 export lacks decode capacity contract")? {
                 Some(signature(meta)
                     .with_context(|| format!("EXL3 reduction export {}", directories[index].display()))?)
             } else { None };
             Ok((capacity, signature))
         }).collect::<Result<Vec<_>>>()?;
-        let plan = crate::shared::experts::ExpertReductionPlan::new(&variants)
+        let decode_rows = manifests.iter().filter(|meta| meta["decode_capacity"] == true)
+            .filter_map(|meta| meta["capacity"].as_u64()).max().context("EXL3 package lacks decode exports")? as usize;
+        let plan = crate::shared::experts::ExpertReductionPlan::new(&variants, decode_rows)
             .with_context(|| format!("EXL3 package {} canonical m1 K tile, CTA threads and route reduction", package.display()))?;
         Ok(Self { plan })
     }
@@ -1013,7 +1015,7 @@ mod tests {
             std::fs::create_dir(&directory)?;
             let tile = if capacity == 16 { [128, 128, 128, 128] } else { [64, 128, 64, 128] };
             std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
-                "capacity": capacity, "tile": tile, "direct": false
+                "capacity": capacity,"decode_capacity":capacity <= 80, "tile": tile, "direct": false
             }))?)?;
             paths.push(directory);
         }
@@ -1031,7 +1033,7 @@ mod tests {
         assert!(error.contains(root.path().to_str().unwrap()));
         assert!(error.contains("canonical m1 K tile, CTA threads"));
         std::fs::write(paths[2].join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
-            "capacity": 80, "tile": [64, 128, 64, 128], "direct": false, "route_block": 16
+            "capacity": 80,"decode_capacity":true, "tile": [64, 128, 64, 128], "direct": false, "route_block": 16
         }))?)?;
         assert!(Exl3ReductionPlan::new(&paths).is_err());
         for (field, value) in [
@@ -1040,7 +1042,7 @@ mod tests {
             ("input_format", serde_json::json!("e4m3_k32")),
             ("warp_specialized", serde_json::json!(true)),
         ] {
-            let mut meta = serde_json::json!({"capacity": 80, "tile": [64, 128, 64, 128], "direct": false});
+            let mut meta = serde_json::json!({"capacity": 80,"decode_capacity":true, "tile": [64, 128, 64, 128], "direct": false});
             meta[field] = value;
             std::fs::write(paths[2].join("v41_exl3.json"), serde_json::to_vec(&meta)?)?;
             assert!(Exl3ReductionPlan::new(&paths).is_err(), "must reject {field}");
@@ -1054,29 +1056,29 @@ mod tests {
         use cuteafd_loader::placement::families::deepseek_v41::expert_capacities;
         for (local, tile) in [(true, [64, 256, 64, 256]), (false, [64, 128, 64, 128])] {
             let root = tempfile::tempdir()?;
-            for capacity in [1, 16, 80, 256] {
+            for capacity in [1, 16, 64, 256] {
                 let directory = root.path().join(format!("m{capacity}"));
                 std::fs::create_dir(&directory)?;
                 let recipe = if capacity == 16 { [128, 128, 128, 128] } else { tile };
                 std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
-                    "capacity": capacity, "tile": recipe, "bits": [3, 4],
+                    "capacity": capacity,"decode_capacity":capacity <= 64, "tile": recipe, "bits": [3, 4],
                     "output_dtype": "fp32", "direct": false
                 }))?)?;
             }
-            for maximum in [1, 16, 80, 256] {
-                let capacities = expert_capacities(if maximum > 1 && maximum < 80 { 80 } else { maximum }, local)?;
+            for maximum in [1, 16, 64, 256] {
+                let capacities = expert_capacities(if maximum > 1 && maximum < 64 { 64 } else { maximum }, local)?;
                 let paths: Vec<_> = capacities.iter().map(|c| root.path().join(format!("m{c}"))).collect();
                 let plan = Exl3ReductionPlan::new(&paths)?;
-                for rows in 1..=maximum.min(80) as usize {
+                for rows in 1..=maximum.min(64) as usize {
                     let index = plan.execution_index(rows, rows, capacities.iter().map(|&c| c as usize))?;
-                    assert_eq!(capacities[index], if rows == 1 { 1 } else { 80 });
+                    assert_eq!(capacities[index], if rows == 1 { 1 } else { 64 });
                     let tp2_index = RtxSelectionPolicy::CanonicalDecode.execution_index(
                         rows, rows, capacities.iter().map(|&c| c as usize),
                         || plan.execution_index(rows, rows, capacities.iter().map(|&c| c as usize)))?;
                     assert_eq!(tp2_index, index);
                 }
-                if maximum > 80 {
-                    assert_eq!(capacities[plan.execution_index(81, 81,
+                if maximum > 64 {
+                    assert_eq!(capacities[plan.execution_index(65, 65,
                         capacities.iter().map(|&c| c as usize))?], 256);
                 }
             }
@@ -1126,7 +1128,7 @@ mod tests {
             let metadata = serde_json::json!({
                 "schema":"cuteafd.v41-exl3-aot.v1", "output_dtype":"bf16",
                 "sparkinfer_revision":"test", "hidden":16,"intermediate":16,
-                "experts":8,"capacity":capacity,"top_k":2,"bits":[3],
+                "experts":8,"capacity":capacity,"decode_capacity":capacity <= 80,"top_k":2,"bits":[3],
                 "direct":false,"sms":1,"blocks_per_sm":1,
                 "buffers":{
                     "scratch":{"bytes":capacity*64,"dtype":"float32","allocation":"scratch","zero_on_create":false},
@@ -1157,7 +1159,7 @@ mod tests {
     fn grouping_retains_legacy_route_block_and_refuses_unknown_tiles() {
         let original = serde_json::json!({
             "schema":"cuteafd.v41-exl3-aot.v1", "output_dtype":"bf16", "sparkinfer_revision":"test",
-            "hidden":5120,"intermediate":640,"experts":384,"capacity":80,"top_k":6,
+            "hidden":5120,"intermediate":640,"experts":384,"capacity":80,"decode_capacity":true,"top_k":6,
             "bits":[3,4],"swiglu_limit":10.0,"direct":false,"sms":48,"blocks_per_sm":1,
             "buffers":{},"objects":[],"trellis_lut":{"file":"lut","bytes":16,"sha256":"test"}
         });

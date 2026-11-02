@@ -120,10 +120,10 @@ def topk_check(lib, args):
     results = []
     # GLM/Flash, Kimi, MiMo, Muse, then enough entries/thread to exercise
     # discarding local candidates beyond the register top-16.
-    for vocab in (154880, 163840, 152576, 202048, 1000000):
+    for vocab in (154880, 163840, 152576, 196608, 196609, 202048, 1000000, 16, 17):
         logits = torch.randint(-128, 129, (16, vocab), device="cuda").float() / 16
         logits[:, -1] = 32
-        logits[:, -257] = 32
+        logits[:, max(0, vocab - 257)] = 32
         if vocab == 1000000:
             # More than 16 winners owned by one thread in one chunk.
             logits[:, torch.arange(31, device="cuda") * 256] = 40
@@ -151,10 +151,10 @@ def topk_check(lib, args):
                     "old/new value bytes", vocab, rows)
                 entry["old_byte_identical"] = True
             if vocab in (154880, 202048):
-                entry["generic_ms"] = timed(launch, 20)
+                entry["candidate_ms"] = timed(launch, 20)
                 if baseline is not None and vocab <= 196608:
                     entry["old_ms"] = timed(old_launch, 20)
-                    entry["generic_over_old"] = entry["generic_ms"] / entry["old_ms"]
+                    entry["candidate_over_old"] = entry["candidate_ms"] / entry["old_ms"]
             results.append(entry)
             print("topk:", json.dumps(entry, sort_keys=True), flush=True)
     print("topk-summary:", json.dumps(results, sort_keys=True), flush=True)

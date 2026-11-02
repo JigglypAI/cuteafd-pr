@@ -762,9 +762,9 @@ pub fn write_v41_workspaces(dir: &Path) -> std::path::PathBuf {
     for ranks in [1, 2] {
         let role = if ranks == 1 { "rtx_backbone" } else { "rtx_tp2" };
         for format in ["mxfp4", "nvfp4"] {
-            let manifest = json!({"role":role, "geometry":{"hidden":5120,
+            let manifest = json!({"role":role, "decode_capacities":[1,16,64], "geometry":{"hidden":5120,
                 "intermediate":2304/ranks,"kernel_intermediate":2304/ranks,
-                "experts":384,"topk":6}, "variants":([1,16,80,256,1024,4096].map(|c|
+                "experts":384,"topk":6}, "variants":([1,16,64,256,1024,4096].map(|c|
                     json!({"capacity_rows":c,"core_scratch_nbytes":if c==16 {99999}else{c*7}})))});
             fs::write(share.join("V41_EXPERT_WORKSPACES").join(format!("{format}_{role}.json")),
                 serde_json::to_vec(&manifest).unwrap()).unwrap();
@@ -774,7 +774,7 @@ pub fn write_v41_workspaces(dir: &Path) -> std::path::PathBuf {
         (32768,8192),(8192,5120),(5120,2304),(2304,5120),(5120,512),
         (1280,4096),(6144,25600),(15360,5120)];
     let variants = matrices.into_iter().flat_map(|(k,n)|
-        [1,16,80,256,1024,4096].map(move |c| json!({"capacity":c,"input_dim":k,
+        [1,16,64,80,256,1024,4096].map(move |c| json!({"capacity":c,"input_dim":k,
             "output_dim":n,"label":format!("matrix_{k}_{n}_m{c}"),"scratch_bytes":c+1,
             "expected_m":if c<=80 {16}else{c},"split_k_slices":1,"all_rows":c<=80}))).collect::<Vec<_>>();
     fs::write(share.join("V41_FP8_AOT.json"), serde_json::to_vec(&json!({"variants":variants})).unwrap()).unwrap();

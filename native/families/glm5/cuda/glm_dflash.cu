@@ -221,6 +221,40 @@ __device__ void block_argmax(float& v, int& i) {
   __syncthreads();
 }
 
+// The original 12-register specialization wins at supported small vocabularies.
+// Drafted row n is block row 1 + n % drafts of sequence n / drafts.
+__global__ void topk_partial_small_kernel(const float* logits, float* values, int* indices, int vocab, int block_rows,
+                                    int drafts) {
+  const int chunk = blockIdx.x, n = blockIdx.y;
+  const uint64_t row = uint64_t(n / drafts) * block_rows + 1 + n % drafts;
+  const int per = (vocab + kTopChunks - 1) / kTopChunks, first = chunk * per, last = min(vocab, first + per);
+  constexpr int kLocal = 12;
+  float local[kLocal];
+  const float* in = logits + row * vocab;
+  for (int j = 0; j < kLocal; ++j) {
+    const int idx = first + threadIdx.x + j * kTopThreads;
+    local[j] = idx < last ? r(in[idx]) : -CUDART_INF_F;
+  }
+  for (int k = 0; k < kTopK; ++k) {
+    float bv = -CUDART_INF_F;
+    int bi = INT32_MAX;
+    for (int j = 0; j < kLocal; ++j) {
+      const int idx = first + threadIdx.x + j * kTopThreads;
+      if (idx < last && better(local[j], idx, bv, bi)) {
+        bv = local[j];
+        bi = idx;
+      }
+    }
+    block_argmax(bv, bi);
+    if (threadIdx.x == 0) {
+      values[(uint64_t(n) * kTopChunks + chunk) * kTopK + k] = bv;
+      indices[(uint64_t(n) * kTopChunks + chunk) * kTopK + k] = bi;
+    }
+    const int owner = bi - first;
+    if (owner >= 0 && owner % kTopThreads == int(threadIdx.x)) local[owner / kTopThreads] = -CUDART_INF_F;
+  }
+}
+
 // Drafted row n is block row 1 + n % drafts of sequence n / drafts.
 __global__ void topk_partial_kernel(const float* logits, float* values, int* indices, int vocab, int block_rows,
                                     int drafts) {
@@ -480,8 +514,13 @@ extern "C" int32_t cuteafd_glm_dflash_topk(const void* logits, void* unary, void
   auto* values = static_cast<float*>(workspace);
   auto* indices = reinterpret_cast<int*>(values + uint64_t(rows) * kTopChunks * kTopK);
   auto s = static_cast<cudaStream_t>(stream);
-  topk_partial_kernel<<<dim3(kTopChunks, rows), kTopThreads, 0, s>>>(static_cast<const float*>(logits), values,
-                                                                     indices, vocab, block_rows, drafts);
+  if (vocab <= 12 * kTopThreads * kTopChunks) {
+    topk_partial_small_kernel<<<dim3(kTopChunks, rows), kTopThreads, 0, s>>>(
+        static_cast<const float*>(logits), values, indices, vocab, block_rows, drafts);
+  } else {
+    topk_partial_kernel<<<dim3(kTopChunks, rows), kTopThreads, 0, s>>>(
+        static_cast<const float*>(logits), values, indices, vocab, block_rows, drafts);
+  }
   topk_merge_kernel<<<rows, kTopThreads, 0, s>>>(values, indices, static_cast<float*>(unary),
                                                  static_cast<int*>(candidates));
   return cudaGetLastError();

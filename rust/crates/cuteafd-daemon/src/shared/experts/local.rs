@@ -94,16 +94,16 @@ impl<'a> LocalExpertWave<'a> {
     }
     fn capacities(capacity: u32) -> Result<Vec<u32>> {
         ensure!(
-            matches!(capacity, 1 | 16 | 80 | 256 | 1024 | 4096),
+            cuteafd_core::V41_TARGET_CAPACITIES.contains(&u64::from(capacity)),
             "invalid local expert capacity"
         );
-        let mut capacities: Vec<_> = [1, 16, 80].into_iter().filter(|&c| c < capacity).collect();
+        let mut capacities: Vec<_> = cuteafd_core::V41_DECODE_CAPACITIES.map(|n| n as u32).into_iter().filter(|&c| c < capacity).collect();
         capacities.push(capacity);
         Ok(capacities)
     }
     fn exl3_capacities(capacity: u32) -> Result<Vec<u64>> {
         // Retain the local owner's exact prefill set and canonical wide decode.
-        let capacity = if capacity > 1 && capacity < 80 { 80 } else { capacity };
+        let capacity = if capacity > 1 && capacity < cuteafd_core::V41_VERIFY_ROWS as u32 { cuteafd_core::V41_VERIFY_ROWS as u32 } else { capacity };
         Ok(Self::capacities(capacity)?.into_iter().map(u64::from).collect())
     }
     pub fn device_bytes(
@@ -121,7 +121,8 @@ impl<'a> LocalExpertWave<'a> {
         geometry: ExpertGeometry,
     ) -> Result<usize> {
         Self::require_geometry(geometry)?;
-        let infos = Self::capacities(capacity)?
+        let infos = if nvfp4 { library.nvfp4_expert_exports(2)? } else { library.native_expert_exports(2)? }
+            .covering(capacity as usize).map_err(anyhow::Error::msg)?
             .into_iter()
             .map(|c| {
                 if nvfp4 {
@@ -182,7 +183,7 @@ impl<'a> LocalExpertWave<'a> {
         } else {
             Some(ExpertReductionPlan::native(
                 library,
-                Self::capacities(capacity)?
+                library.native_expert_exports(2)?.covering(capacity as usize).map_err(anyhow::Error::msg)?
                     .into_iter()
                     .map(|c| library.v41_local_expert_info(c))
                     .collect::<Result<Vec<_>>>()?,
@@ -197,7 +198,8 @@ impl<'a> LocalExpertWave<'a> {
             workspace - capacity as usize * geometry.row_bytes() as usize,
         )?;
         let mut states = Vec::new();
-        for c in Self::capacities(capacity)? {
+        for c in if nvfp4 { library.nvfp4_expert_exports(2)? } else { library.native_expert_exports(2)? }
+            .covering(capacity as usize).map_err(anyhow::Error::msg)? {
             let kernel = if nvfp4 {
                 library.v41_nvfp4_local_expert_kernel(c)?
             } else {

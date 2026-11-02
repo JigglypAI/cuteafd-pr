@@ -123,13 +123,13 @@ mod spark_tests {
                 assert_eq!((model.capacity(), model.compiled_capacity()), (live, compiled));
                 // Two decode lanes, one prefill owner holding the two units in flight.
                 assert_eq!(model.executions.decode, [cuteafd_core::DecodeExecution {
-                    capacity: cuteafd_core::V41_VERIFY_ROWS as u32, compiled_capacity: 80 }; 2]);
+                    capacity: cuteafd_core::V41_VERIFY_ROWS as u32, compiled_capacity: cuteafd_core::V41_VERIFY_ROWS as u32 }; 2]);
                 assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: live,
                     compiled_capacity: compiled, unit_rows: live, buffered_units: 2 });
                 // The decode lanes' links at the decode width (P3), the prefill link at the unit.
                 let ingress = if bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 };
                 assert_eq!(model.endpoints.iter().map(|e| (e.capacity, e.ingress)).collect::<Vec<_>>(),
-                    [(80.min(live), ingress), (80.min(live), ingress), (live, ingress)]);
+                    [((cuteafd_core::V41_VERIFY_ROWS as u32).min(live), ingress), ((cuteafd_core::V41_VERIFY_ROWS as u32).min(live), ingress), (live, ingress)]);
             }
         }
         Ok(())
@@ -371,6 +371,7 @@ fn local_vision_owner(enabled: bool, remote: bool) -> bool {
 
 #[cfg(test)]
 mod startup_tests {
+    use super::families::deepseek_v41::owners;
     /// The planner's own target list (decode lanes + prefill slot set) passes
     /// the Engram check at every pinned depth, and the check still refuses a
     /// missing, mis-sized or misplaced owner.
@@ -384,15 +385,15 @@ mod startup_tests {
         for k in 2..=4u64 {
             let unit = cuteafd_loader::serving_capacity::prefill_waves::unit_rows(k);
             let reserve = (k * unit) as usize;
-            let target = programs.target(80, reserve as u64, unit, 1, k as usize, 16,
+            let target = programs.target(owners::DECODE_LANE_ROWS, reserve as u64, unit, 1, k as usize, 16,
                 super::families::deepseek_v41::resident::Fp8Head::Off, true)?;
-            super::validate_engram_rows(&target, reserve, 80)?;
-            assert!(super::validate_engram_rows(&target, reserve - 64, 80).is_err(), "reserve mismatch");
+            super::validate_engram_rows(&target, reserve, owners::DECODE_LANE_ROWS as usize)?;
+            assert!(super::validate_engram_rows(&target, reserve - 64, owners::DECODE_LANE_ROWS as usize).is_err(), "reserve mismatch");
             let missing: Vec<_> = target.iter().filter(|d| d.group != "lane 1 engram rows").cloned().collect();
-            assert!(super::validate_engram_rows(&missing, reserve, 80).is_err(), "missing decode lane");
+            assert!(super::validate_engram_rows(&missing, reserve, owners::DECODE_LANE_ROWS as usize).is_err(), "missing decode lane");
             let mut moved = target.clone();
             moved.iter_mut().find(|d| d.group == "prefill slots engram rows").unwrap().gpu = 1;
-            assert!(super::validate_engram_rows(&moved, reserve, 80).is_err(), "off the gate GPU");
+            assert!(super::validate_engram_rows(&moved, reserve, owners::DECODE_LANE_ROWS as usize).is_err(), "off the gate GPU");
         }
         Ok(())
     }
@@ -879,13 +880,13 @@ mod admission_tests {
                 let weights = weights.into_iter().enumerate().flat_map(|(gpu, items)|
                     items.into_iter().map(move |item| Demand::new(gpu as u8, item.category,
                         item.group, item.bytes, item.basis))).collect::<Vec<_>>();
-                let target = programs.target(80, 512, 256, ranks, 2, 16, resident::Fp8Head::All, ranks == 1)?;
+                let target = programs.target(owners::DECODE_LANE_ROWS, 512, 256, ranks, 2, 16, resident::Fp8Head::All, ranks == 1)?;
                 // The startup validators accept the planner's own target list.
-                if ranks == 1 { validate_engram_rows(&target, 512, 80)?; }
+                if ranks == 1 { validate_engram_rows(&target, 512, owners::DECODE_LANE_ROWS as usize)?; }
                 let fixed = owners::TargetOwners::new(weights, target, ranks,
                     2 * owners::transport_bytes(256, 4)?, 42)?.fixed;
                 let (experts, workspace) = families::deepseek_v41::expert_inventory(
-                    &catalog, &manifest, 256, ranks, 188, 2, 512, 80)?;
+                    &catalog, &manifest, 256, ranks, 188, 2, 512, owners::DECODE_LANE_ROWS)?;
                 // Deliberately synthetic pre-weight inventory, independent of
                 // planner output. This is not a CUDA sample or ready-parity gate.
                 let memory = vec![(80usize << 30, 96usize << 30); ranks];
@@ -1201,9 +1202,14 @@ mod admission_tests {
             assert!(resolve(&args, &memory, vec![], 0, &[0], 0, None).is_err());
         }
         args.max_context_tokens = 262_144;
-        for concurrency in [0, 17, u32::MAX] {
+        for concurrency in [0, 65, u32::MAX] {
             args.concurrency = concurrency;
             assert!(resolve(&args, &memory, vec![], 0, &[0], 0, None).is_err());
+        }
+        for concurrency in [17, 32, 33, 64] {
+            args.concurrency = concurrency;
+            let admitted = resolve(&args, &memory, vec![], 0, &[0], 0, None)?;
+            assert!(admitted.placement.pool_tokens >= args.max_context_tokens as u64);
         }
         args.concurrency = 16;
         args.prefix_cache_entries = 129;
@@ -1257,7 +1263,7 @@ mod plan_runtime_breakdown {
         let lib = unsafe { cuteafd_ffi::NativeLibrary::load(&path)? };
         let manifest = super::families::deepseek_v41::owners::native_manifest(&path, "V41_FP8_AOT.json")?;
         let programs = super::families::deepseek_v41::owners::NativePrograms::new(&manifest, 188)?;
-        let rows = 80u32;
+        let rows = cuteafd_core::V41_VERIFY_ROWS as u32;
         let plan = programs.decode_lanes(rows as u64, 1, super::families::deepseek_v41::resident::Fp8Head::Off, true)?;
         for d in plan.iter().filter(|d| d.group.starts_with("lane 0 ")) { eprintln!("PLAN {} {}", d.group, d.bytes); }
         let r = rows as usize;
