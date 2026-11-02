@@ -3825,7 +3825,7 @@ impl<'a> Qwen4Engine<'a> {
         // SAFETY: ids, weights and input rows hold this wave's `t` rows in
         // stream order; the copies read them before later stream work.
         let ticket = unsafe {
-            exchange.send(t, layout, [sized(w.route_ids.buffer, layout.route_bytes),
+            exchange.send(t, t * h * 2, layout, [sized(w.route_ids.buffer, layout.route_bytes),
                 sized(w.route_weights.buffer, layout.route_bytes), sized(input, layout.wire_bytes)],
                 self.execution_stream(), Box::new(move |routes, wire| {
                     let mut request = ExpertProtocolV2Request::new_bytes(request_id, 17, index as u32, h as u32,
