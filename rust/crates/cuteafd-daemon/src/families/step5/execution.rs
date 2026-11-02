@@ -517,6 +517,7 @@ struct Tp2Onboard<'a> {
     incoming: [Allocation<'a>; 2],
     owner_incoming: [Allocation<'a>; 2],
     scratch: [Allocation<'a>; 2],
+    broadcast_logged: Vec<Cell<bool>>,
 }
 
 impl<'e, 'a> MainExecution<'e, 'a> {
@@ -626,6 +627,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                     incoming: [plane(0, partial)?, plane(1, partial)?],
                     owner_incoming: [plane(0, partial)?, plane(1, partial)?],
                     scratch: [plane(0, lanes * scratch)?, plane(1, lanes * scratch)?],
+                    broadcast_logged: (0..count).map(|_| Cell::new(false)).collect(),
                 };
                 let charged = tp2_exchange_bytes(unit, lanes, kind)?;
                 for rank in 0..2 {
@@ -1222,8 +1224,14 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
                     match source {
                         None => onboard.pair.enqueue(rank, layer, lane, rows, input, routes, scratch,
                             std::ptr::null(), partial.ptr, &mut abort),
-                        Some(owner) => onboard.pair.enqueue_from(rank, owner, layer, lane, rows, input, routes,
-                            scratch, std::ptr::null(), partial.ptr, &mut abort),
+                        Some(owner) => {
+                            onboard.pair.enqueue_from(rank, owner, layer, lane, rows, input, routes,
+                                scratch, std::ptr::null(), partial.ptr, &mut abort)?;
+                            if rank == owner && !onboard.broadcast_logged[layer].replace(true) {
+                                tracing::info!(layer, owner, rows, source = "Broadcast", "Step-5 TP2 route source executed");
+                            }
+                            Ok(())
+                        },
                     }
                 }
             })?;
