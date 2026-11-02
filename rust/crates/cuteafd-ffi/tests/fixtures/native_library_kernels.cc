@@ -25,6 +25,10 @@ extern "C" uint64_t cuteafd_glmf_dspark_markov_workspace(int32_t sequences, int3
   return uint64_t(sequences) * 296 * 8 + uint64_t(sequences) * block * 4;
 }
 
+extern "C" uint64_t cuteafd_glm_dflash_topk_workspace(int32_t rows) {
+  return uint64_t(rows) * 64 * 16 * 8;
+}
+
 extern "C" int32_t cuteafd_glmf_dspark_markov_norms(const void* w2, void* norms, int32_t vocab,
     int32_t rank, void* stream) {
   (void)stream;
