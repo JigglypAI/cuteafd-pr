@@ -372,3 +372,60 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
     }
     target.and(speculative.map(|_| ())).and(state)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::admission::Wake;
+    use crate::shared::serve::lanes::{LaneLease, LaneSet};
+    use std::cell::{Cell, RefCell};
+
+    async fn model_lane(lease: LaneLease<'_>, active: &RefCell<Vec<Option<u32>>>,
+        epoch: &Cell<u64>, rounds: &[Cell<u32>; 2], wake: Wake<'_>) -> anyhow::Result<()> {
+        loop {
+            if lease.stopping() { return Ok(()); }
+            let mut active = active.borrow_mut();
+            if wake.ready(active.iter().flatten().count(), active.len(), false, epoch.get()) {
+                lease.stop(); return Ok(());
+            }
+            let Some(left) = active[lease.index()].as_mut() else { return Ok(()); };
+            if *left == 0 { return Ok(()); }
+            *left -= 1;
+            rounds[lease.index()].set(rounds[lease.index()].get() + 1);
+            drop(active);
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[test]
+    fn a_deferred_prefix_waiter_is_admitted_at_the_donor_prefill_boundary() {
+        // The donor published its prompt snapshot but still has a long generation.
+        // The HTTP queue is empty: only the host-side waiter can wake admission.
+        let active = RefCell::new(vec![Some(1000), None]);
+        let epoch = Cell::new(7);
+        let mut waiters = std::collections::VecDeque::from([20]);
+        let wake = Wake { host_pending: !waiters.is_empty(), ..Wake::default() };
+        let rounds = [Cell::new(0u32), Cell::new(0u32)];
+        let set = LaneSet::default();
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        runtime.block_on(set.run(
+            |lease| model_lane(lease, &active, &epoch, &rounds, wake),
+            |lease| model_lane(lease, &active, &epoch, &rounds, wake))).unwrap();
+        assert_eq!([rounds[0].get(), rounds[1].get()], [0, 0], "admission wakes before donor generation");
+        assert_eq!(epoch.get(), 7, "no retirement or KV-release event is needed");
+        let slot = active.borrow().iter().position(Option::is_none).unwrap();
+        active.borrow_mut()[slot] = waiters.pop_front();
+        assert!(waiters.is_empty() && active.borrow()[slot].is_some());
+        assert_eq!(active.borrow()[0], Some(1000));
+
+        // Tie the model to the real wake and dequeue sites, not a second scheduler.
+        let lane_source = include_str!("independent.rs");
+        let lane_source = &lane_source[..lane_source.find("#[cfg(test)]").unwrap()];
+        assert!(lane_source.contains("wake.ready(active.iter().flatten().count(), active.len(), !receive.is_empty(),"));
+        let source = include_str!("../scheduler.rs");
+        let serve = &source[source.find("pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>").unwrap()..];
+        let serve = &serve[..serve.find("\n/// Process-wide device-terminal instrumentation.").unwrap()];
+        assert!(serve.contains("host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),"));
+        assert!(serve.contains("AdmissionPoll::Empty if !prefix_waiters.is_empty() => prefix_waiters.pop_front().unwrap(),"));
+        assert!(serve.contains("let mut intake = receive.len().max(1);"), "an empty HTTP queue must still run admission");
+    }
+}

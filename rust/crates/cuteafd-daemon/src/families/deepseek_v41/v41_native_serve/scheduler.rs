@@ -836,7 +836,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             draft.as_deref_mut(), &mut prefixes, receive,
             admission::Wake { media_pending: media.len() > 0,
                 media_slots: media.len(),
-                host_pending: !media.full() && !media.backlog.is_empty(),
+                host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),
                 retry: kv_waiter.pending().map(|prepared| (&prepared.job, requests.release_epoch())) }));
         if let Some(started) = census_started {
             tracing::info!(target: "cuteafd::graph_capture", arm=crate::shared::decode_graph::census::arm(),
