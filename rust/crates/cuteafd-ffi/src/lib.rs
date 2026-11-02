@@ -2881,6 +2881,13 @@ impl NativeLibrary {
         Ok(self.sync_h2d_staging.lock().map_err(|_| anyhow::anyhow!("synchronous H2D staging lock poisoned"))?.buffer)
     }
 
+    /// Existing capacity without creating a store; startup admission charges only absent owners.
+    pub fn ordered_h2d_staging_bytes(&self, dst: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<usize> {
+        let entries = self.ordered_h2d_staging.lock().map_err(|_| anyhow::anyhow!("ordered H2D staging lock poisoned"))?;
+        Ok(entries.get(&(dst.device_id, stream as usize, dst.ptr as usize))
+            .map_or(0, |entry| entry.staging.buffer.bytes))
+    }
+
     /// Actual pinned owner paired with one ordered-upload destination.
     pub fn ordered_h2d_staging_buffer(&self, dst: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<CuteafdHostBuffer> {
         let entries = self.ordered_h2d_staging.lock().map_err(|_| anyhow::anyhow!("ordered H2D staging lock poisoned"))?;

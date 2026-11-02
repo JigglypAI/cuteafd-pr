@@ -151,6 +151,44 @@ fn reserve_sync_h2d_with<T>(existing: usize, required: usize,
     allocate(bytes)
 }
 
+/// Existing pinned owners already reduce live availability. Admit all future
+/// growth together, including when no prefix-cache quota is enabled.
+pub(crate) fn with_pinned_growth<T>(owners: &[(&str, usize, usize)], allocate: impl FnOnce() -> Result<T>) -> Result<T> {
+    pinned_allocation_with(owners, |pending| admit_host_memory(0, pending, 0, 0).map(|_| ()), allocate)
+}
+
+fn pinned_allocation_with<T>(owners: &[(&str, usize, usize)],
+    admit: impl FnOnce(&[(&str, u64)]) -> Result<()>, allocate: impl FnOnce() -> Result<T>) -> Result<T> {
+    let pending = pinned_growth(owners)?;
+    if !pending.is_empty() { admit(&pending)?; }
+    allocate()
+}
+
+fn pinned_growth<'a>(owners: &[(&'a str, usize, usize)]) -> Result<Vec<(&'a str, u64)>> {
+    owners.iter().filter_map(|&(id, existing, required)| {
+        let growth = required.saturating_sub(existing);
+        (growth > 0).then(|| u64::try_from(growth).map(|bytes| (id, bytes)).map_err(Into::into))
+    }).collect()
+}
+
+/// Reserve retained ordered-upload stores only after joint host admission.
+/// Existing entries cannot grow while their stream may have queued readers.
+pub(crate) fn reserve_ordered_h2d(library: &cuteafd_ffi::NativeLibrary,
+    destinations: &[(&str, cuteafd_ffi::CuteafdDeviceBuffer)], stream: *mut std::ffi::c_void) -> Result<()> {
+    let owners = destinations.iter().map(|&(id, dst)| {
+        let existing = library.ordered_h2d_staging_bytes(dst, stream)?;
+        ensure!(existing == 0 || existing >= dst.bytes, "{id}: existing ordered upload store is too small");
+        Ok((id, existing, dst.bytes))
+    }).collect::<Result<Vec<_>>>()?;
+    with_pinned_growth(&owners, || {
+        for &(_, dst) in destinations {
+            // SAFETY: callers own these destinations and their stream through startup retirement.
+            unsafe { library.reserve_h2d_ordered(dst, stream)?; }
+        }
+        Ok(())
+    })
+}
+
 /// Admit the complete future host working set once, before any allocation.
 /// Families supply table byte formulas summed across every local GPU, together
 /// with the full prefix-cache quota (zero when disabled) and deferred logits.
@@ -323,6 +361,39 @@ mod tests {
         assert_eq!((capacity.deferred, capacity.resident, capacity.shortfall), (300, 200, 1));
         assert_eq!(allocations.get(), before);
         Ok(())
+    }
+
+    #[test]
+    fn pinned_growth_is_joint_and_refuses_before_allocating_without_a_prefix_cache() -> Result<()> {
+        use std::cell::Cell;
+        let allocated = Cell::new(false);
+        let owners = [("draft.gqa.landing", 0, 20), ("draft.gqa.positions.upload", 0, 200),
+            ("draft.gqa.context_slots.upload", 100, 100)];
+        let resident = vec![Item::new(Category::Staging, "draft.gqa.context_slots.upload", "pinned", 100, Basis::Exact)];
+        let error = pinned_allocation_with(&owners, |pending| {
+            assert_eq!(pending, &[("draft.gqa.landing", 20), ("draft.gqa.positions.upload", 200)]);
+            // Either future owner fits alone. The combined growth is one byte over budget.
+            for owner in pending { assert!(host_admission((1000, 319), resident.clone(), 0, &[*owner], 0, 0).is_ok()); }
+            host_admission((1000, 319), resident.clone(), 0, pending, 0, 0).map(|_| ())
+        }, || { allocated.set(true); Ok(()) }).unwrap_err();
+        let capacity = error.downcast_ref::<HostCapacityError>().expect("typed host refusal");
+        assert_eq!((capacity.cache, capacity.resident, capacity.deferred, capacity.shortfall), (0, 100, 220, 1));
+        assert!(!allocated.get());
+        pinned_allocation_with(&owners, |pending| {
+            let ledger = host_admission((1000, 320), resident, 0, pending, 0, 0)?;
+            assert_eq!((ledger.resident_bytes, ledger.deferred_bytes), (100, 220));
+            Ok(())
+        }, || { allocated.set(true); Ok(()) })?;
+        assert!(allocated.get());
+        Ok(())
+    }
+
+    #[test]
+    fn already_reserved_pinned_owners_do_not_readmit_or_double_charge() -> Result<()> {
+        assert_eq!(pinned_growth(&[("same", 256, 256), ("larger", 512, 256),
+            ("growth", 128, 256)])?, vec![("growth", 128)]);
+        pinned_allocation_with(&[("same", 256, 256), ("larger", 512, 256)],
+            |_| anyhow::bail!("resident owners must not be admitted twice"), || Ok(()))
     }
 
     #[test]

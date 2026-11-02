@@ -112,6 +112,8 @@ pub struct GlmDraftRuntimeLayout {
     pub capacity: GlmDraftCapacity,
     pub weights: GlmDraftWeightLayout,
     pub fp8_scratch: Option<GlmDraftFp8ScratchLayout>,
+    pinned_owners: Vec<crate::formats::dflash::MlaDraftOwner>,
+    sync_upload_bytes: usize,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -184,10 +186,47 @@ impl GlmDraftRuntimeLayout {
             fp8_scales: if uses_fp8 { mul(values / 128, 4)? } else { 0 },
             bf16_auxiliary, bf16_codebooks, max_load_staging,
         };
+        use crate::formats::dflash::{MlaDraftDomain, MlaDraftDtype, MlaDraftLifetime, MlaDraftOwner};
+        let sequences = capacity.max_batch_sequences as u64;
+        let rows = capacity.block_rows as u64;
+        if sequences == 0 || rows % sequences != 0 || rows / sequences < 2
+            || capacity.context_slots < capacity.max_batch_sequences {
+            return Err(GlmDraftStorageError::Unsupported("invalid drafter batch capacity"));
+        }
+        let host = |id: &str, bytes: u64| -> Result<MlaDraftOwner, GlmDraftStorageError> {
+            MlaDraftOwner::new(id, MlaDraftDomain::HostPinned, MlaDraftDtype::Bytes,
+                vec![usize::try_from(bytes).map_err(|_| GlmDraftStorageError::Overflow)?], 0)
+                .map_err(|_| GlmDraftStorageError::Overflow)
+        };
+        let mut pinned_owners = vec![host("landing", mul(rows - sequences, 20)?)?];
+        for (id, bytes, diagnostic) in [
+            ("context_positions", mul(tap_rows as u64, 8)?, false),
+            ("context_slots", mul(tap_rows as u64, 4)?, false),
+            ("positions", mul(rows, 8)?, false), ("anchors", mul(sequences, 4)?, false),
+            ("ids", mul(rows, 4)?, false), ("tables", mul(sequences, 12)?, false),
+            ("taps", mul(mul(tap_rows as u64, g.taps)?, mul(h, 2)?)?, true),
+            ("h", mul(rows, mul(h, 2)?)?, true),
+        ] {
+            let mut owner = host(&format!("{id}.upload"), bytes.max(256))?;
+            owner.lifetime = MlaDraftLifetime::Library;
+            owner.staging_for = Some(id.into());
+            owner.on_use = diagnostic;
+            pinned_owners.push(owner);
+        }
+        // Concatenated QKV and gate/up sources upload one checkpoint tensor at a time.
+        let sync_values = [mul(fc.k, fc.n)?, mul(projection.k, projection.n)?,
+            mul(conv, h)?, mul(attention, h)?, mul(kv, h)?, mul(g.intermediate, h)?,
+            mul(g.vocab, g.selector_rank)?, mul(4, h)?, h, g.head_dim]
+            .into_iter().max().unwrap_or(0);
+        let sync_upload_bytes = usize::try_from(mul(sync_values, 2)?)
+            .map_err(|_| GlmDraftStorageError::Overflow)?;
         Ok(Self { capacity, weights, fp8_scratch: uses_fp8.then_some(GlmDraftFp8ScratchLayout {
             rows: tap_rows.max(capacity.block_rows), shapes,
-        }) })
+        }), pinned_owners, sync_upload_bytes })
     }
+
+    pub fn pinned_owners(&self) -> &[crate::formats::dflash::MlaDraftOwner] { &self.pinned_owners }
+    pub fn sync_upload_bytes(&self) -> usize { self.sync_upload_bytes }
 }
 
 /// Native fp8_gemv.cu scratch contract; SM count affects the split partial arena.
@@ -474,6 +513,33 @@ mod tests {
                     assert_eq!(bf16 - fp8, 2 * g.layers * 20 * 2048 * (2048 - 1056));
                     assert_eq!(bf16_scratch, fp8_scratch);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn gqa_pinned_owners_are_host_only_and_diagnostics_are_not_serving_reservations() {
+        use crate::formats::dflash::{MlaDraftDomain, MlaDraftLifetime};
+        for flash in [false, true] {
+            for mode in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
+                let g = geometry(flash);
+                let capacity = GlmDraftCapacity::new(20, 16, 8).unwrap();
+                let layout = GlmDraftRuntimeLayout::new(g, mode, capacity, 2048).unwrap();
+                assert!(layout.pinned_owners().iter().all(|o| o.domain == MlaDraftDomain::HostPinned));
+                let serving: Vec<_> = layout.pinned_owners().iter().filter(|o| !o.on_use).collect();
+                assert_eq!(serving.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(), ["landing",
+                    "context_positions.upload", "context_slots.upload", "positions.upload",
+                    "anchors.upload", "ids.upload", "tables.upload"]);
+                assert_eq!(serving.iter().map(|o| o.bytes).sum::<usize>(),
+                    16 * 7 * 20 + 2048 * 8 + 2048 * 4 + 128 * 8 + 256 + 128 * 4 + 256);
+                assert_eq!(serving[0].lifetime, MlaDraftLifetime::Runtime);
+                assert!(serving[1..].iter().all(|o| o.lifetime == MlaDraftLifetime::Library && o.staging_for.is_some()));
+                assert_eq!(layout.pinned_owners().iter().filter(|o| o.on_use).map(|o| o.id.as_str())
+                    .collect::<Vec<_>>(), ["taps.upload", "h.upload"]);
+                // Gate/up uploads its halves, not its combined source extent.
+                assert_eq!(layout.sync_upload_bytes() as u64, (g.taps * g.hidden * g.hidden)
+                    .max(g.vocab * g.selector_rank).max(g.heads * g.head_dim * g.hidden)
+                    .max(g.hidden * g.intermediate) * 2);
             }
         }
     }

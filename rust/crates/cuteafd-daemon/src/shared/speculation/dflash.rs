@@ -1164,6 +1164,7 @@ impl<'a> DflashDrafter<'a> {
             tensors: read_safetensors_metadata(&path)?.into_iter().map(|t| (t.name.clone(), t)).collect(),
         };
         checkpoint.validate(&cfg)?;
+        crate::shared::memory::budget::reserve_sync_h2d(library, layout.sync_upload_bytes())?;
         let upload = |bytes: &[u8]| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.len().max(256))?;
             library.copy_h2d(allocation.buffer, bytes)?;
@@ -2063,6 +2064,11 @@ impl<'a> DflashDrafter<'a> {
 
     fn put(&self, dev: &Dev<'_>, bytes: &[u8]) -> Result<()> {
         ensure!(bytes.len() <= dev.buffer.bytes, "table exceeds its buffer");
+        if !bytes.is_empty() && matches!(self.context, DraftContext::Gqa(_))
+            && self.library.ordered_h2d_staging_bytes(dev.buffer, self.stream)? == 0 {
+            crate::shared::memory::budget::reserve_ordered_h2d(self.library,
+                &[("draft.gqa.ordered-upload", dev.buffer)], self.stream)?;
+        }
         // SAFETY: metadata consumers and overwrites share the owned drafter
         // stream; pinned staging survives through the upload completion event.
         unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, self.stream) }
@@ -2168,45 +2174,67 @@ impl<'a> DflashDrafter<'a> {
         let c = &self.cfg;
         let rows = sequences * c.block;
         let drafted = sequences * c.drafts();
-        let alloc = |bytes: usize| DeviceAllocation::new(self.library, bytes.max(256));
-        let head_workspace = alloc(VOCABULARY_HEAD_WORKSPACE)?;
-        let attention_workspace = {
-            let _scope = cuteafd_ffi::memory_ledger::scope("workspace/draft-attention");
-            alloc(self.library.glm_dflash_attention_workspace(sequences, c.kv_heads, RING + c.block)?)?
-        };
-        Ok(Workspace {
-            sequences,
-            h: alloc(rows * c.hidden * 2)?,
-            n: alloc(rows * c.hidden * 2)?,
-            conv: alloc(rows * c.hidden * 2)?,
-            dynamic: alloc(rows * c.conv_width() * 2)?,
-            attention: AttentionWorkspace::Gqa(GqaWorkspace {
-                qkv: alloc(rows * c.qkv_width() * 2)?,
-                q: alloc(rows * c.heads * c.head_dim * 2)?,
-                k: alloc(rows * c.kv_width() * 2)?,
-                v: alloc(rows * c.kv_width() * 2)?,
-                attn: alloc(rows * c.heads * c.head_dim * 2)?,
-                tables: alloc(3 * sequences * 4)?,
-                scratch: attention_workspace,
-            }),
-            delta: alloc(rows * c.hidden * 2)?,
-            gate_up: alloc(rows * 2 * c.intermediate * 2)?,
-            act: alloc(rows * c.intermediate * 2)?,
-            logits: alloc(rows * c.vocab * 4)?,
-            unary: alloc(drafted * 16 * 4)?,
-            candidates: alloc(drafted * 16 * 4)?,
-            projected: alloc(rows * c.rank * 2)?,
-            anchors: alloc(sequences * 4)?,
-            ids: alloc(rows * 4)?,
-            tokens: alloc(drafted * 4)?,
-            features: alloc(drafted * 16)?,
-            landing: crate::shared::memory::HostAllocation::new(self.library, drafted * 20)?,
-            positions: alloc(rows * 8)?,
-            topk_workspace: alloc(self.library.glm_dflash_topk_workspace(drafted)?)?,
-            // SAFETY: the workspace buffer lives in the same struct and drops after the head.
-            head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
-                rows as u32, c.vocab as u32)? },
-            _head_workspace: head_workspace,
+        let layout = c.runtime_layout(self.representation, GlmDraftCapacity::new(self.slots, sequences, c.block)?)?;
+        let pending = layout.pinned_owners().iter().filter(|owner| !owner.on_use).map(|owner| {
+            let existing = match owner.staging_for.as_deref() {
+                Some("context_positions") => self.library.ordered_h2d_staging_bytes(self.context_positions.buffer, self.stream)?,
+                Some("context_slots") => {
+                    let DraftContext::Gqa(context) = &self.context else { anyhow::bail!("GQA workspace requires GQA context") };
+                    self.library.ordered_h2d_staging_bytes(context.slots.buffer, self.stream)?
+                }
+                _ => 0,
+            };
+            Ok((owner.id.as_str(), existing, owner.bytes))
+        }).collect::<Result<Vec<_>>>()?;
+        crate::shared::memory::budget::with_pinned_growth(&pending, || {
+            let alloc = |bytes: usize| DeviceAllocation::new(self.library, bytes.max(256));
+            let head_workspace = alloc(VOCABULARY_HEAD_WORKSPACE)?;
+            let attention_workspace = {
+                let _scope = cuteafd_ffi::memory_ledger::scope("workspace/draft-attention");
+                alloc(self.library.glm_dflash_attention_workspace(sequences, c.kv_heads, RING + c.block)?)?
+            };
+            let workspace = Workspace {
+                sequences,
+                h: alloc(rows * c.hidden * 2)?,
+                n: alloc(rows * c.hidden * 2)?,
+                conv: alloc(rows * c.hidden * 2)?,
+                dynamic: alloc(rows * c.conv_width() * 2)?,
+                attention: AttentionWorkspace::Gqa(GqaWorkspace {
+                    qkv: alloc(rows * c.qkv_width() * 2)?,
+                    q: alloc(rows * c.heads * c.head_dim * 2)?,
+                    k: alloc(rows * c.kv_width() * 2)?,
+                    v: alloc(rows * c.kv_width() * 2)?,
+                    attn: alloc(rows * c.heads * c.head_dim * 2)?,
+                    tables: alloc(3 * sequences * 4)?,
+                    scratch: attention_workspace,
+                }),
+                delta: alloc(rows * c.hidden * 2)?,
+                gate_up: alloc(rows * 2 * c.intermediate * 2)?,
+                act: alloc(rows * c.intermediate * 2)?,
+                logits: alloc(rows * c.vocab * 4)?,
+                unary: alloc(drafted * 16 * 4)?,
+                candidates: alloc(drafted * 16 * 4)?,
+                projected: alloc(rows * c.rank * 2)?,
+                anchors: alloc(sequences * 4)?,
+                ids: alloc(rows * 4)?,
+                tokens: alloc(drafted * 4)?,
+                features: alloc(drafted * 16)?,
+                landing: crate::shared::memory::HostAllocation::new(self.library, drafted * 20)?,
+                positions: alloc(rows * 8)?,
+                topk_workspace: alloc(self.library.glm_dflash_topk_workspace(drafted)?)?,
+                // SAFETY: the workspace buffer lives in the same struct and drops after the head.
+                head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
+                    rows as u32, c.vocab as u32)? },
+                _head_workspace: head_workspace,
+            };
+            let DraftContext::Gqa(context) = &self.context else { anyhow::bail!("GQA workspace requires GQA context") };
+            let AttentionWorkspace::Gqa(attention) = &workspace.attention else { unreachable!() };
+            for buffer in [&self.context_positions, &context.slots, &workspace.positions, &workspace.anchors,
+                &workspace.ids, &attention.tables] {
+                // SAFETY: these retained owners and the drafter stream survive every metadata upload.
+                unsafe { self.library.reserve_h2d_ordered(buffer.buffer, self.stream)?; }
+            }
+            Ok(workspace)
         })
     }
 
