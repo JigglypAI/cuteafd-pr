@@ -104,6 +104,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         engine_args.draft_context_slots = Some(cuteafd_loader::families::glm5::draft_representation::serving_draft_context_slots(
             engine_args.draft_sequences, args.max_sequences, None));
     }
+    let engine_args = super::ResolvedEngineArgs::new(&engine_args)?;
     let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
     let policy = Policy { fixed: args.draft_fixed,
         decode_share: args.decode_share };
@@ -163,10 +164,11 @@ struct Policy {
     decode_share: DecodeShareArgs,
 }
 
-fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
+fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<usize>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, prefix: PrefixArgs) -> Result<()> {
-    let opened = match open(&args) {
+    let args = &resolved.args;
+    let opened = match open(args) {
         Ok(opened) => opened,
         Err(error) => {
             let _ = ready.send(Err(anyhow::anyhow!("{error:#}")));
@@ -174,7 +176,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         }
     };
     let mut ready = Some(ready);
-    let result = opened.with_engine(&args, |engine, transport, runtime| {
+    let result = opened.with_resolved_engine(&resolved, |engine, transport, runtime| {
         anyhow::ensure!(transport.is_some() || engine.skip_routed() || engine.has_tp2(), "serve-glm needs Spark peers, local TP2 or --skip-routed-experts");
         let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
         let spark = transport.is_some();
@@ -1241,6 +1243,34 @@ mod lane_tests {
 #[cfg(test)]
 mod draft_tests {
     use super::*;
+
+    #[test]
+    fn auto_context_is_resolved_once_before_serving_engine() -> Result<()> {
+        #[derive(clap::Parser)]
+        struct Cli { #[command(flatten)] args: ServeArgs }
+        use clap::Parser;
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("config.json"),
+            r#"{"model_type":"glm_moe_dsa","max_position_embeddings":1048576}"#)?;
+        let manifest = dir.path().join("PROGRAMS.json");
+        for context in [0usize, 1_048_576] {
+            std::fs::write(&manifest, r#"{"capacities":{"max_context":1048576}}"#)?;
+            let args = Cli::try_parse_from(["test", "--snapshot", dir.path().to_str().unwrap(),
+                "--native-lib", "/unused", "--manifest", manifest.to_str().unwrap(),
+                "--max-context", &context.to_string()])?.args;
+            let resolved = super::super::ResolvedEngineArgs::new(&args.engine)?;
+            assert_eq!(resolved.args.max_context, 1_048_576);
+            assert_eq!(resolved.automatic_context, context == 0);
+            assert_eq!(args.engine.max_context, context);
+            std::fs::remove_file(&manifest)?;
+            // Admission keeps the original auto policy after the context is concrete.
+            let pool = crate::shared::context::pool_context("glm5", resolved.args.max_context,
+                resolved.automatic_context, 524_288, 256);
+            if context == 0 { assert_eq!(pool?, 524_032); }
+            else { assert!(pool.is_err()); }
+        }
+        Ok(())
+    }
     use crate::shared::draft::{resource, runtime::SharedPolicy};
     use cuteafd_transport::worker_selection::{ExpertGroupingSelector, ExpertTrafficContract,
         InstalledExpertGrouping, InstalledExpertVariant, WorkerIdentity, WorkerSelection};
