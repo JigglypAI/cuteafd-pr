@@ -1752,7 +1752,8 @@ mod tests {
             }))?;
             let loaded = WorkerSelection::new(identity.clone(), &remote)?;
             let variants = cuteafd_core::Exl3RowPolicy::Nearest.capacities(64)?.into_iter()
-                .map(|capacity| InstalledExpertVariant::from_queries(capacity as usize, |_| Ok(16)))
+                .map(|capacity| InstalledExpertVariant::from_queries(capacity as usize, |_| Ok(16))?
+                    .with_arithmetic_routes(|_| Ok(Some((1, capacity as usize)))))
                 .collect::<Result<Vec<_>>>()?;
             let reports = (0..sparks).map(|rank| InstalledExpertGrouping::new(loaded.clone(), rank, 64,
                 ExpertGroupingSelector::Exl3Nearest, variants.clone())).collect::<Result<Vec<_>>>()?;
@@ -1765,7 +1766,9 @@ mod tests {
                 Ok(false)
             })?;
             assert_eq!(inputs.iter().map(|&(layer, _)| layer).collect::<Vec<_>>(), remote);
-            assert_eq!(packed_route_cap(64, &reports, &inputs), 64);
+            let known_cap = variants.iter().map(|variant| variant.capacity).min().unwrap();
+            assert_eq!(packed_route_cap(64, &reports, &inputs), known_cap);
+            assert!(known_cap > 0, "known arithmetic routes must permit packing");
             if let Some(&layer) = onboarded.first() {
                 let mut invalid = inputs.clone();
                 invalid.push((layer, false));
