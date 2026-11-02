@@ -124,7 +124,7 @@ impl<'a> RankResources<'a> {
         let kv = RankKv::allocate(device, cfg, &MuseCacheLayout::new(cfg, ranks)?, placement, rank, slots)?;
         let plan = shared::rope_tables(cfg, context)?;
         let recipe = *plan.recipes.first().context("Muse rotary plan has no recipe")?;
-        let rotary = RotaryTables::load(device, programs, plan, "", u64::MAX, &[])?;
+        let rotary = RotaryTables::load(device, programs, plan, "muse_", u64::MAX, &[])?;
         let rope = rotary.get(recipe)?;
         let lane = Lane::allocate(device, &LanePlanes::with_waves(cfg, ranks, unit_rows, waves)?)?;
         let tp2 = (ranks == 2).then(|| -> Result<Tp2Ops<'a>> {

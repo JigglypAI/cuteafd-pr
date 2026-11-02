@@ -10,7 +10,7 @@ use cuteafd_ffi::programs::{Program, Programs};
 
 /// The shared rotary-table builder the sliding layers' tables come from
 /// (`rope_tables_bf16` at span 64; `shared/rope.rs`).
-pub(crate) const ROPE_TABLES: &str = "rope_s64_plain";
+pub(crate) const ROPE_TABLES: &str = "muse_rope_s64_plain";
 
 /// (stem without prefix, pointer order). Head-dependent programs exist per prefix.
 pub(crate) const POINTWISE: &[(&str, &[&str])] = &[

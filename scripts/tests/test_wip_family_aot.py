@@ -1,4 +1,5 @@
 """Direct WIP builds derive the same family scopes as single gate cards."""
+import ast
 import importlib.util
 import json
 import os
@@ -443,6 +444,67 @@ def test_glm_context_only_passes_only_supported_base_geometries(tmp_path, mode, 
         if exlr8:
             expected += ['exlr8', 'exlr8_dense']
         assert geometries == expected
+
+
+@pytest.mark.parametrize('ranks', [1, 2])
+def test_muse_scoped_exports_cover_every_startup_program(ranks, monkeypatch):
+    from functools import partial
+    from types import ModuleType
+
+    # Run the real program-list builders on CPU; only GPU compiler entrypoints
+    # are stubbed. No static list duplicates the exporter's scope decisions.
+    source = ROOT / 'python/tools/aot/export_b12x_muse_aot.py'
+    module = ast.parse(source.read_text())
+    body = [node for node in module.body if isinstance(node, ast.FunctionDef)]
+    scope = {'partial': partial, 'EXPERT_WIDTH': 4096, 'WINDOW': 2048, 'SWA_RING_STEP': 64}
+    exec(compile(ast.Module(body=body, type_ignores=[]), str(source), 'exec'), scope)
+
+    muse_source = (ROOT / 'third_party/sparkinfer/b12x/integration/cuteafd/muse.py').read_text()
+    norms = next(node.value for node in ast.parse(muse_source).body if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == 'NORMS' for target in node.targets))
+    compiler_calls = []
+
+    def compiler(**kwargs):
+        compiler_calls.append(kwargs)
+
+    packages = {}
+    for name in ('b12x', 'b12x.integration', 'b12x.integration.cuteafd',
+                 'b12x.integration.cuteafd.muse', 'b12x.integration.cuteafd.rope',
+                 'b12x.integration.cuteafd.muse_tp', 'b12x.integration.cuteafd.pointwise',
+                 'b12x.integration.cuteafd._muse_attention'):
+        packages[name] = ModuleType(name)
+        monkeypatch.setitem(sys.modules, name, packages[name])
+        if '.' in name:
+            parent, child = name.rsplit('.', 1)
+            monkeypatch.setattr(packages[parent], child, packages[name], raising=False)
+    packages['b12x.integration.cuteafd.muse'].NORMS = ast.literal_eval(norms)
+    for name, functions in {
+        'muse': ('compile_norm_aot', 'compile_residual_gate_aot', 'compile_route_select_aot',
+                 'compile_softcap_aot', 'compile_qk_norm_rope_aot', 'compile_attention_output_aot',
+                 'compile_router_aot'),
+        'rope': ('compile_rope_tables_aot',), 'muse_tp': ('compile_tp_combine_aot',),
+        'pointwise': ('compile_bf16_projection_aot',),
+        '_muse_attention': ('compile_attention_aot', 'compile_swa_commit_aot'),
+    }.items():
+        for function in functions:
+            setattr(packages[f'b12x.integration.cuteafd.{name}'], function, compiler)
+
+    exported = {f'{prefix}_{name}' for heads, prefix in ((128, 'muse'), (64, 'muse2'))
+                for name, _, _, _ in scope['programs'](heads)}
+    rust = ROOT / 'rust/crates/cuteafd-daemon/src/families/muse_spark'
+    bindings = (rust / 'programs.rs').read_text()
+    required = set()
+    for section, prefix in (('POINTWISE', 'muse'), ('PER_HEADS', 'muse' if ranks == 1 else 'muse2')):
+        table = bindings.split(f'const {section}:', 1)[1].split('\n];', 1)[0]
+        required.update(f'{prefix}_{name}' for name in re.findall(r'\("([a-z0-9_]+)",', table))
+    rope = re.search(r'const ROPE_TABLES: &str = "([^"]+)";', bindings).group(1)
+    required.add(rope)
+    assert len(required) == 25
+    assert required <= exported, sorted(required - exported)
+    assert 'required.push(programs::ROPE_TABLES.into())' in (rust / 'startup.rs').read_text()
+    assert 'RotaryTables::load(device, programs, plan, "muse_",' in (rust / 'engine.rs').read_text()
+    scope['builders']()['rope_s64_plain']()
+    assert compiler_calls == [{'rotary_span': 64, 'llama3': False}]
 
 
 def test_kimi_builds_always_package_k6_programs(tmp_path):

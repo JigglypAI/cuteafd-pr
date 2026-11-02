@@ -44,7 +44,9 @@ def builders(heads=128, group="pointwise", max_rows=4096):
         raise ValueError("Muse requires heads64/128 and max_rows in 1..4096")
     from b12x.integration.cuteafd import muse as m
     if group == "pointwise":
+        from b12x.integration.cuteafd.rope import compile_rope_tables_aot
         result = {op: partial(m.compile_norm_aot, op=op) for op in m.NORMS}
+        result["rope_s64_plain"] = partial(compile_rope_tables_aot, rotary_span=64, llama3=False)
         result.update(residual_gate=m.compile_residual_gate_aot,
                       route_select=m.compile_route_select_aot,
                       softcap=m.compile_softcap_aot,
