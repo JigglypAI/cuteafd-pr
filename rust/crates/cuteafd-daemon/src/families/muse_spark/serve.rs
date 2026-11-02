@@ -233,7 +233,13 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
     let backend = super::backend::MuseBackend::new(&cfg, &ranks, streams, &embedding, &mut engine.link,
         engine.peer.as_ref(), usize::try_from(prefill.unit_rows)?, usize::try_from(prefill.waves)?, sequences,
         served_context, pages, local, draft, pricing)?;
-    run(&backend, sequences)
+    // Engine teardown may block while joining exchange workers; preserve the
+    // original scheduler error before any backend or native owners unwind.
+    run(&backend, sequences).inspect_err(log_worker_error)
+}
+
+fn log_worker_error(error: &anyhow::Error) {
+    tracing::error!(error = %format_args!("{error:#}"), "Muse Spark worker failed before teardown");
 }
 
 fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_api::openai::NativeRequest>,
@@ -310,6 +316,42 @@ mod tests {
     use clap::Parser;
 
     const PEERS: &str = "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4,127.0.0.1:5,127.0.0.1:6";
+
+    #[test]
+    fn worker_error_logs_full_chain_before_owner_teardown() {
+        use std::sync::Mutex;
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        struct Owner(Capture);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let log = String::from_utf8(self.0.0.lock().unwrap().clone()).unwrap();
+                assert!(log.contains("ERROR"), "{log}");
+                assert!(log.contains("Muse Spark worker failed before teardown"), "{log}");
+                assert!(log.contains("draft round: native launch failed"), "{log}");
+            }
+        }
+        let capture = Capture(Arc::new(Mutex::new(Vec::new())));
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let _owner = Owner(capture);
+            let original = anyhow::anyhow!("native launch failed").context("draft round");
+            let address = (&*original) as *const _;
+            let result: Result<()> = Err(original);
+            let error = result.inspect_err(log_worker_error).unwrap_err();
+            assert!(std::ptr::eq(address, &*error));
+            assert_eq!(Ok::<_, anyhow::Error>(17).inspect_err(log_worker_error).unwrap(), 17);
+        });
+    }
 
     fn args(extra: &[&str]) -> Result<ServeArgs, clap::Error> {
         let mut argv = vec!["cuteafd", "serve-muse", "--snapshot", "/checkpoint", "--native-lib", "/native.so"];
