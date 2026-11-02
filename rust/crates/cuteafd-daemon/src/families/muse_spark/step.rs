@@ -39,8 +39,9 @@ pub(crate) struct StepMetadata {
     /// Full layers' K|V record index per row in the paged cache
     /// (`page * 64 + p % 64`), the `kv_slots` of `muse_qk_norm_nope_full`.
     pub page_slots: Vec<i64>,
-    /// `[rows, stride]` page ids (prefill: one sequence, a single shared row).
+    /// Page ids: one shared row for prefill, one per query for decode/verify.
     pub page_table: Vec<i32>,
+    /// Query-row stride in page ids; zero makes every prefill query share row 0.
     pub table_stride: usize,
 }
 
@@ -60,7 +61,7 @@ impl StepMetadata {
         let mut seen = std::collections::HashSet::new();
         let mut out = Self { positions: Vec::with_capacity(rows), ring_slots: Vec::with_capacity(rows),
             seq_first: Vec::with_capacity(rows), page_slots: Vec::with_capacity(rows), page_table: Vec::new(),
-            table_stride: stride };
+            table_stride: if shared_table { 0 } else { stride } };
         for sequence in sequences {
             ensure!(sequence.rows > 0 && sequence.slot < slots && seen.insert(sequence.slot),
                 "Muse step sequence slot {} invalid or repeated", sequence.slot);
@@ -124,6 +125,29 @@ mod tests {
                         assert!(!step && at == (5 * ring) as i64 + k % ring as i64);
                     } else {
                         assert!(step && meta.positions[at as usize] == k);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn full_attention_query_stride_matches_uploaded_shared_and_per_query_tables() -> Result<()> {
+        let pages: Vec<u32> = (0..256).map(|page| 1000 + page * 7).collect();
+        for (start, rows) in [(0, 1), (1, 511), (0, 513), (63, 64), (63, 65), (11840, 4), (11840, 512)] {
+            for shared in [true, false] {
+                if !shared && rows > 64 { continue; }
+                let meta = StepMetadata::build(&[StepSequence { slot: 3, start, rows, pages: &pages }],
+                    2112, 16, 4096, shared)?;
+                assert_eq!(meta.table_stride, if shared { 0 } else { pages.len() });
+                assert_eq!(meta.page_table.len(), if shared { pages.len() } else { rows * pages.len() });
+                for row in 0..rows {
+                    // Match the inherited attention kernel's row * stride + key / 64 addressing.
+                    for key in 0..=start + row {
+                        let index = row * meta.table_stride + key / PAGE_ROWS;
+                        assert_eq!(meta.page_table.get(index).copied(), Some(pages[key / PAGE_ROWS] as i32),
+                            "shared={shared}, start={start}, row={row}, key={key}");
                     }
                 }
             }
