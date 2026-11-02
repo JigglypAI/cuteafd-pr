@@ -415,7 +415,7 @@ impl InstalledExpertGrouping {
 
     pub fn weight_read_bytes(&self) -> Result<usize> {
         self.weight_read_bytes.ok_or_else(|| MissingWeightReadBytes {
-            rank: self.rank, selector: self.selector, checkpoint: self.loaded.identity.checkpoint.clone(),
+            rank: self.rank, selector: self.selector.clone(), checkpoint: self.loaded.identity.checkpoint.clone(),
             manifest: self.loaded.identity.manifest.as_ref().map(|manifest| manifest.name.clone()),
         }.into())
     }
