@@ -58,10 +58,10 @@ impl<'a> Exlr8Tp2Weights<'a> {
     pub(crate) fn workspace_bytes(programs: &'a Programs<'a>, max_rows: usize,
         activations: Exlr8PrefillActivations) -> Result<usize> {
         ensure!((DECODE_ROWS..=4096).contains(&max_rows), "EXLR8 RTX row capacity");
-        let compact = Exlr8Execution::decode_compact_workspace_bytes(programs, DECODE_ROWS, TP2_UNITS)?;
-        let grouped = Exlr8Execution::decode_grouped_workspace_bytes(programs, DECODE_ROWS, TP2_UNITS)?;
+        let compact = Exlr8Execution::decode_compact_workspace_bytes(programs, cuteafd_ffi::exlr8::KernelFamily::Glm, DECODE_ROWS, TP2_UNITS)?;
+        let grouped = Exlr8Execution::decode_grouped_workspace_bytes(programs, cuteafd_ffi::exlr8::KernelFamily::Glm, DECODE_ROWS, TP2_UNITS)?;
         let prefill = if max_rows > DECODE_ROWS {
-            Exlr8Execution::workspace_bytes_with_limit(programs, max_rows, ExpertSet::Routed, TP2_UNITS, activations)?
+            Exlr8Execution::workspace_bytes_with_limit(programs, cuteafd_ffi::exlr8::KernelFamily::Glm, max_rows, ExpertSet::Routed, TP2_UNITS, activations)?
         } else { 0 };
         compact.checked_add(grouped).and_then(|bytes| bytes.checked_add(prefill))
             .and_then(|bytes| bytes.checked_add(max_rows * 6144 * 2))
@@ -99,13 +99,13 @@ impl<'a> Exlr8Tp2Weights<'a> {
         let device = self.device;
         let executions = device.own(|| {
             let mut executions = vec![
-                Exlr8Execution::new_decode_compact(device.library, self.programs, DECODE_ROWS,
+                Exlr8Execution::new_decode_compact(device.library, self.programs, cuteafd_ffi::exlr8::KernelFamily::Glm, DECODE_ROWS,
                     self.workspace_bytes, TP2_UNITS)?,
-                Exlr8Execution::new_decode_grouped(device.library, self.programs, DECODE_ROWS,
+                Exlr8Execution::new_decode_grouped(device.library, self.programs, cuteafd_ffi::exlr8::KernelFamily::Glm, DECODE_ROWS,
                     self.workspace_bytes, TP2_UNITS)?,
             ];
             if self.max_rows > DECODE_ROWS {
-                executions.push(Exlr8Execution::new_with_limit(device.library, self.programs,
+                executions.push(Exlr8Execution::new_with_limit(device.library, self.programs, cuteafd_ffi::exlr8::KernelFamily::Glm,
                     self.max_rows, self.workspace_bytes, ExpertSet::Routed, TP2_UNITS, self.activations)?);
             }
             for execution in &mut executions { execution.seal_graph_storage()?; }

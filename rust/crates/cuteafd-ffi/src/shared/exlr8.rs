@@ -10,18 +10,109 @@ fn invalid(message: impl Into<String>) -> ManifestError {
     ManifestError(message.into())
 }
 
+/// Checkpoint-calibrated expert kernel namespace and numerical contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelFamily { Glm, GlmFlash }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelKind {
+    Decode, Routed, Shared, GroupedDecode, GroupedA16, GroupedA8,
+    Group, SharedGroup, GroupedGroup,
+}
+
+impl KernelKind {
+    pub fn is_grouped(self) -> bool {
+        matches!(self, Self::GroupedDecode | Self::GroupedA16 | Self::GroupedA8)
+    }
+
+    pub fn is_glue(self) -> bool {
+        matches!(self, Self::Group | Self::SharedGroup | Self::GroupedGroup)
+    }
+}
+
+impl KernelFamily {
+    pub fn from_geometry(hidden: usize, units: usize, top_k: usize, experts: usize)
+        -> Result<Self, ManifestError> {
+        match (hidden, units, top_k, experts) {
+            (6144, 16, 8, 256) => Ok(Self::Glm),
+            (4096, 16, 8, 288) => Ok(Self::GlmFlash),
+            _ => Err(invalid("unsupported EXLR8 family geometry")),
+        }
+    }
+
+    pub fn program(self, kind: KernelKind) -> &'static str {
+        match (self, kind) {
+            (Self::Glm, KernelKind::Decode) => "exlr8_a16_decode",
+            (Self::Glm, KernelKind::Routed) => "exlr8_a16_serving",
+            (Self::Glm, KernelKind::Shared) => "exlr8_shared_a16_serving",
+            (Self::Glm, KernelKind::GroupedDecode) => "exlr8_a16_grouped64",
+            (Self::Glm, KernelKind::GroupedA16) => "exlr8_a16_grouped",
+            (Self::Glm, KernelKind::GroupedA8) => "exlr8_a8_grouped",
+            (Self::Glm, KernelKind::Group) => "exlr8_group",
+            (Self::Glm, KernelKind::SharedGroup) => "exlr8_shared_group",
+            (Self::Glm, KernelKind::GroupedGroup) => "exlr8_grouped_group",
+            (Self::GlmFlash, KernelKind::Decode) => "exlr8_glmf_a16_decode",
+            (Self::GlmFlash, KernelKind::Routed) => "exlr8_glmf_a16_serving",
+            (Self::GlmFlash, KernelKind::Shared) => "exlr8_glmf_shared_a16_serving",
+            (Self::GlmFlash, KernelKind::GroupedDecode) => "exlr8_glmf_a16_grouped64",
+            (Self::GlmFlash, KernelKind::GroupedA16) => "exlr8_glmf_a16_grouped",
+            (Self::GlmFlash, KernelKind::GroupedA8) => "exlr8_glmf_a8_grouped",
+            (Self::GlmFlash, KernelKind::Group) => "exlr8_glmf_group",
+            (Self::GlmFlash, KernelKind::SharedGroup) => "exlr8_glmf_shared_group",
+            (Self::GlmFlash, KernelKind::GroupedGroup) => "exlr8_glmf_grouped_group",
+        }
+    }
+
+    /// Names identify the numerical contract; shape and clamp never select a fallback.
+    pub fn of(spec: &ProgramSpec) -> Result<(Self, KernelKind), ManifestError> {
+        let (family, suffix) = if let Some(suffix) = spec.name.strip_prefix("exlr8_glmf_") {
+            (Self::GlmFlash, suffix)
+        } else if let Some(suffix) = spec.name.strip_prefix("exlr8_") {
+            (Self::Glm, suffix)
+        } else { return Err(invalid("unknown EXLR8 family")); };
+        let kind = match suffix {
+            "a16_decode" => KernelKind::Decode,
+            "a16_serving" => KernelKind::Routed,
+            "shared_a16_serving" => KernelKind::Shared,
+            "a16_grouped64" => KernelKind::GroupedDecode,
+            "a16_grouped" => KernelKind::GroupedA16,
+            "a8_grouped" => KernelKind::GroupedA8,
+            "group" => KernelKind::Group,
+            "shared_group" => KernelKind::SharedGroup,
+            "grouped_group" => KernelKind::GroupedGroup,
+            _ => return Err(invalid("unknown EXLR8 program kind")),
+        };
+        Ok((family, kind))
+    }
+
+    fn validate_compute(self, spec: &ProgramSpec, shared: bool) -> Result<(), ManifestError> {
+        let clamp = spec.geometry.get("swiglu_limit");
+        if self == Self::GlmFlash {
+            if spec.geometry["hidden"].as_u64() != Some(4096)
+                || spec.geometry["units"].as_u64() != Some(16)
+                || spec.geometry["top_k"].as_u64() != Some(if shared { 1 } else { 8 })
+                || clamp.and_then(|v| v.as_f64()) != Some(10.0) {
+                return Err(invalid("Flash compute requires hidden4096/units16/top8 (shared top1)/clamp10"));
+            }
+        } else if clamp.is_some_and(|v| v.as_f64() != Some(0.0)) {
+            return Err(invalid("unclipped GLM compute cannot carry a SwiGLU clamp"));
+        }
+        Ok(())
+    }
+}
+
 /// Compact compute and ingress ABIs have a fixed route-slot stride.
 pub const COMPACT_GROUP_ROWS: usize = 16;
 
 /// Read the route-slot stride from the named export ABI, never a missing-field default.
 pub fn group_rows(spec: &ProgramSpec) -> Result<usize, ManifestError> {
-    let (abi, capacity, grouped) = match spec.name.as_str() {
-        "exlr8_a16_decode" | "exlr8_a16_serving" | "exlr8_shared_a16_serving" => (3, 64, false),
-        "exlr8_a16_grouped64" => (3, 64, true),
-        "exlr8_a16_grouped" | "exlr8_a8_grouped" => (3, 4096, true),
-        "exlr8_group" | "exlr8_shared_group" => (2, 64, false),
-        "exlr8_grouped_group" => (2, 4096, true),
-        _ => return Err(invalid("unknown grouping ABI kind")),
+    let (_, kind) = KernelFamily::of(spec)?;
+    let (abi, capacity, grouped) = match kind {
+        KernelKind::Decode | KernelKind::Routed | KernelKind::Shared => (3, 64, false),
+        KernelKind::GroupedDecode => (3, 64, true),
+        KernelKind::GroupedA16 | KernelKind::GroupedA8 => (3, 4096, true),
+        KernelKind::Group | KernelKind::SharedGroup => (2, 64, false),
+        KernelKind::GroupedGroup => (2, 4096, true),
     };
     if spec.geometry["abi_version"].as_u64() != Some(abi)
         || spec.geometry["max_rows"].as_u64() != Some(capacity)
@@ -50,13 +141,15 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
             .filter(|&v| v > 0 && v <= i32::MAX as u64)
             .ok_or_else(|| invalid(format!("missing or invalid geometry.{name}")))
     };
-    let shared = spec.name == "exlr8_shared_a16_serving";
-    let grouped_a8 = spec.name == "exlr8_a8_grouped";
+    let (family, kind) = KernelFamily::of(spec)?;
+    let shared = kind == KernelKind::Shared;
+    family.validate_compute(spec, shared)?;
+    let grouped_a8 = kind == KernelKind::GroupedA8;
     // The 64-row grouped instance reuses the grouped ABI below the K1
     // threshold; its F32 FC2 partials must match the K1 serving kernel.
-    let grouped_decode = spec.name == "exlr8_a16_grouped64";
-    let grouped = spec.name == "exlr8_a16_grouped" || grouped_a8 || grouped_decode;
-    let serving = shared || grouped || spec.name == "exlr8_a16_serving";
+    let grouped_decode = kind == KernelKind::GroupedDecode;
+    let grouped = kind.is_grouped();
+    let serving = shared || grouped || kind == KernelKind::Routed;
     let activations = spec.geometry.get("activations").and_then(|v| v.as_str());
     if (grouped_a8 && activations != Some("a8"))
         || (grouped_decode && activations.is_some())
@@ -72,7 +165,7 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
     // The routed serving core is a compact-unit instance selected by name and
     // variant; its geometry must declare which served variant it is, and only
     // the compact-unit routed variants are accepted here.
-    if spec.name == "exlr8_a16_serving" {
+    if kind == KernelKind::Routed {
         let variant = spec.geometry.get("serving_variant").and_then(|v| v.as_str());
         if !matches!(variant, Some("k1_k23_coalesced"))
         {
@@ -83,7 +176,7 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
     }
     let max_rows = if grouped && !grouped_decode { 4096 } else { 64 };
     let group_rows = group_rows(spec)? as u64;
-    if (!serving && spec.name != "exlr8_a16_decode")
+    if (!serving && kind != KernelKind::Decode)
         || field("abi_version")? != 3
         || field("max_rows")? != max_rows
         || u64::from(spec.capacity_rows) != max_rows
@@ -165,10 +258,8 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
 }
 
 pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(), ManifestError> {
-    if matches!(
-        spec.name.as_str(),
-        "exlr8_group" | "exlr8_shared_group" | "exlr8_grouped_group"
-    ) {
+    let (_, kind) = KernelFamily::of(spec)?;
+    if kind.is_glue() {
         return validate_glue(spec, entry);
     }
     validate(spec)?;
@@ -201,21 +292,11 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(
         "float16", "int64", "int32", "int32", "int32", "int32", "float32", "float32", "float16",
         "float32", "int8", "bfloat16",
     ];
-    if matches!(
-        spec.name.as_str(),
-        "exlr8_a16_serving"
-            | "exlr8_shared_a16_serving"
-            | "exlr8_a16_grouped"
-            | "exlr8_a8_grouped"
-            | "exlr8_a16_grouped64"
-    ) {
+    if kind != KernelKind::Decode {
         shapes.push("[1]".into());
         dtypes.push("int32");
     }
-    if matches!(
-        spec.name.as_str(),
-        "exlr8_a16_grouped" | "exlr8_a8_grouped" | "exlr8_a16_grouped64"
-    ) {
+    if kind.is_grouped() {
         shapes.extend(["[E]".into(), format!("[E,{u}]")]);
         dtypes.extend(["int32", "int32"]);
     }
@@ -271,26 +352,32 @@ fn validate_glue(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(), Ma
     {
         return Err(invalid("glue ABI, capacity, scratch or card plan"));
     }
+    let (family, kind) = KernelFamily::of(spec)?;
     let descriptors: Vec<(&str, &str, String, &str)> = {
             let e = field("experts")?;
             let t = field("top_k")?;
             let g = field("max_groups")?;
             let h = field("hidden")?;
-            let shared = spec.name == "exlr8_shared_group";
-            let grouped = spec.name == "exlr8_grouped_group";
+            let shared = kind == KernelKind::SharedGroup;
+            let grouped = kind == KernelKind::GroupedGroup;
+            if family == KernelFamily::GlmFlash
+                && (h != 4096 || e != if shared { 1 } else { 288 }
+                    || t != if shared { 1 } else { 8 }) {
+                return Err(invalid("Flash grouping family geometry mismatch"));
+            }
             let r = group_rows(spec)? as u64;
             let (format, dtype, row, row_bytes) = if shared {
                 ("bf16", "bfloat16", h, h * 2)
             } else {
                 ("fp8_k32", "uint8", h + h / 32, h + h / 32)
             };
-            if spec.name == "exlr8_shared_group" && (e != 1 || t != 1 || g != 4) {
+            if shared && (e != 1 || t != 1 || g != 4) {
                 return Err(invalid(
                     "shared grouping requires experts=1, top_k=1, max_groups=4",
                 ));
             }
             if rows != if grouped { 4096 } else { 64 }
-                || e > 256
+                || e > 512
                 || t > 32
                 || g > i32::MAX as u64 / r
                 || spec.scalar_kinds != b"ii"

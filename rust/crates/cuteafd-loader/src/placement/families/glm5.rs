@@ -960,7 +960,7 @@ pub(crate) fn exlr8_inventory_with_metadata(snapshot: &std::path::Path, manifest
         && cfg.topk == 8 && (cfg.first_moe_layer..=cfg.layers).contains(&selected_layers)
         && (1..=4).contains(&lanes), "GLM EXLR8 TP2 geometry/layer extent");
     let programs = crate::plan::checkpoint::read_json(manifest)?;
-    let backend_workspace = crate::plan::exlr8::routed_workspace(&programs, rows, 8, activations)?;
+    let backend_workspace = crate::plan::exlr8::routed_workspace(&programs, cuteafd_ffi::exlr8::KernelFamily::Glm, rows, 8, activations)?;
     let records = crate::plan::exlr8::dense::DenseRecord::inventory(snapshot)?;
     for layer in cfg.first_moe_layer..selected_layers {
         for suffix in ["weight", "e_score_correction_bias"] {
