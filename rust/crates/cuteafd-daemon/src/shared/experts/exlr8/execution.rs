@@ -178,6 +178,14 @@ pub(crate) struct Exlr8Execution<'a> {
     set: ExpertSet,
 }
 impl<'a> Exlr8Execution<'a> {
+    pub(crate) fn routed_hidden(programs: &'a Programs<'a>, family: KernelFamily) -> Result<usize> {
+        let core = programs.program(family.program(cuteafd_ffi::exlr8::KernelKind::Routed),
+            &pointers(ExpertSet::Routed, Variant::DecodeCompact))?;
+        cuteafd_ffi::exlr8::validate(core.spec())?;
+        usize::try_from(core.spec().geometry["hidden"].as_u64().context("EXLR8 hidden missing")?)
+            .context("EXLR8 hidden exceeds address space")
+    }
+
     pub(crate) fn shared_workspace_bytes(
         programs: &'a Programs<'a>,
         family: KernelFamily,

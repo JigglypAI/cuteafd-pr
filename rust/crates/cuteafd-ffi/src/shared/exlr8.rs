@@ -556,6 +556,28 @@ mod tests {
             s.geometry["abi_version"] = serde_json::json!(2);
             if grouped { s.geometry["group_rows"] = serde_json::json!(tile); }
             validate_entry(&s, &e).unwrap();
+            for experts in [1, 256, 288, 512] {
+                let mut wide = s.clone();
+                wide.geometry["experts"] = serde_json::json!(experts);
+                validate_entry(&wide, &e).unwrap();
+            }
+            let mut too_wide = s.clone();
+            too_wide.geometry["experts"] = serde_json::json!(513);
+            assert!(validate_entry(&too_wide, &e).is_err());
+            let mut flash = s.clone();
+            flash.name = KernelFamily::GlmFlash.program(if grouped { KernelKind::GroupedGroup } else { KernelKind::Group }).into();
+            flash.geometry["experts"] = serde_json::json!(288);
+            flash.geometry["hidden"] = serde_json::json!(4096);
+            flash.geometry["input_row_bytes"] = serde_json::json!(4224);
+            let mut flash_entry = e.clone();
+            for pointer in flash_entry["pointers"].as_array_mut().unwrap() {
+                if let Some(shape) = pointer["shape"].as_str() {
+                    pointer["shape"] = serde_json::json!(shape.replace("6336", "4224").replace("6144", "4096"));
+                }
+            }
+            validate_entry(&flash, &flash_entry).unwrap();
+            flash.geometry["experts"] = serde_json::json!(256);
+            assert!(validate_entry(&flash, &flash_entry).is_err());
             for key in ["name", "dtype", "shape", "role"] {
                 let mut bad = e.clone();
                 bad["pointers"][0][key] = serde_json::json!("wrong");
@@ -570,6 +592,55 @@ mod tests {
         }
     }
     }
+    #[test]
+    fn flash_compute_requires_calibrated_geometry_and_clamp() {
+        for kind in [KernelKind::Decode, KernelKind::Routed, KernelKind::Shared,
+            KernelKind::GroupedDecode, KernelKind::GroupedA16, KernelKind::GroupedA8] {
+            let mut s = spec();
+            s.name = KernelFamily::GlmFlash.program(kind).into();
+            let grouped = kind.is_grouped();
+            let shared = kind == KernelKind::Shared;
+            let rows = if matches!(kind, KernelKind::GroupedA16 | KernelKind::GroupedA8) { 4096 } else { 64 };
+            let tile = if rows == 4096 { 64u64 } else { 16 };
+            let groups = if shared { 4u64 } else if rows == 4096 { 800 } else { 512 };
+            s.capacity_rows = rows;
+            s.geometry["max_rows"] = serde_json::json!(rows);
+            s.geometry["hidden"] = serde_json::json!(4096);
+            s.geometry["fc1_splits"] = serde_json::json!(4);
+            s.geometry["top_k"] = serde_json::json!(if shared { 1 } else { 8 });
+            s.geometry["max_groups"] = serde_json::json!(groups);
+            s.geometry["swiglu_limit"] = serde_json::json!(10.0);
+            if kind != KernelKind::Decode {
+                s.pointers.push("group_count".into());
+                s.scalar_kinds = b"ii".to_vec();
+            }
+            if kind == KernelKind::Routed { s.geometry["serving_variant"] = serde_json::json!("k1_k23_coalesced"); }
+            if grouped {
+                s.geometry["group_rows"] = serde_json::json!(tile);
+                s.pointers.extend(["unit_count", "unit_map"].map(String::from));
+                s.scalar_kinds = b"iiii".to_vec();
+            }
+            if kind == KernelKind::GroupedDecode { s.geometry["fc2_partials"] = serde_json::json!("f32"); }
+            if kind == KernelKind::GroupedA8 { s.geometry["activations"] = serde_json::json!("a8"); }
+            s.scratch = HashMap::from([("fc1".into(), groups * 16 * 2 * 4 * tile * 128 * 4),
+                ("intermediate".into(), groups * 16 * tile * 128 * 2),
+                ("fc2".into(), groups * tile * 4096 * 4)]);
+            validate(&s).unwrap();
+            for (key, value) in [("hidden", 6144), ("units", 8), ("top_k", 6), ("swiglu_limit", 0)] {
+                let mut bad = s.clone();
+                bad.geometry[key] = serde_json::json!(value);
+                assert!(validate(&bad).is_err(), "{kind:?}:{key}");
+                bad.geometry.as_object_mut().unwrap().remove(key);
+                assert!(validate(&bad).is_err(), "{kind:?}:missing {key}");
+            }
+            let mut wrong_family = s.clone();
+            wrong_family.name = KernelFamily::Glm.program(kind).into();
+            assert!(validate(&wrong_family).is_err());
+        }
+        assert_eq!(KernelFamily::from_geometry(4096, 16, 8, 288).unwrap(), KernelFamily::GlmFlash);
+        assert!(KernelFamily::from_geometry(4096, 16, 8, 256).is_err());
+    }
+
     #[test]
     fn accepts_decode_v3() {
         validate(&spec()).unwrap();

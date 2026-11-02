@@ -906,7 +906,7 @@ impl Opened {
                     "GLM EXL3 planner/runtime backend workspace mismatch"),
                 glm::GlmLocalFormat::Exlr8 => ensure!(
                     crate::shared::experts::rtx::exlr8::Exlr8Tp2Weights::workspace_bytes(
-                        &programs, max_rows, args.exlr8_prefill_activations)? as u64 == local.backend_workspace,
+                        &programs, cuteafd_ffi::exlr8::KernelFamily::Glm, max_rows, args.exlr8_prefill_activations)? as u64 == local.backend_workspace,
                     "GLM EXLR8 planner/runtime backend workspace mismatch"),
                 glm::GlmLocalFormat::Nvfp4 { .. } => {
                     let tensors = self.catalog.fp8().context("NVFP4 tensors")?;
@@ -957,7 +957,7 @@ impl Opened {
         let native_push_experts = || -> Result<_> {
             tp2_range.as_ref().map(|range| -> Result<_> {
                 let workspace = crate::shared::experts::rtx::exlr8::Exlr8Tp2Weights::workspace_bytes(
-                    &programs, max_rows, args.exlr8_prefill_activations)?;
+                    &programs, cuteafd_ffi::exlr8::KernelFamily::Glm, max_rows, args.exlr8_prefill_activations)?;
                 let budgets = tp2_budgets()?.map(|b| b.saturating_sub(workspace));
                 Ok(crate::shared::experts::rtx::push::CoordinatorExperts::Exlr8Tp2 {
                     manifest: args.exlr8_manifest.clone().context("EXLR8 manifest")?,

@@ -188,6 +188,43 @@ mod tests {
     }
 
     #[test]
+    fn flash_arenas_derive_every_byte_from_the_validated_program_geometry() {
+        for activations in [PrefillActivations::A16, PrefillActivations::A8] {
+            let family = KernelFamily::GlmFlash;
+            let entries = [ExecutionVariant::DecodeCompact, ExecutionVariant::DecodeGrouped, ExecutionVariant::Prefill]
+                .map(|variant| {
+                    let mut e = entry(variant, activations);
+                    e["name"] = json!(variant.program(family, activations));
+                    let g = if variant == ExecutionVariant::Prefill { 800u64 } else { 512 };
+                    let r = if variant == ExecutionVariant::Prefill { 64u64 } else { 16 };
+                    e["geometry"]["hidden"] = json!(4096);
+                    e["geometry"]["fc1_splits"] = json!(4);
+                    e["geometry"]["max_groups"] = json!(g);
+                    e["geometry"]["swiglu_limit"] = json!(10.0);
+                    if variant != ExecutionVariant::DecodeCompact { e["geometry"]["group_rows"] = json!(r); }
+                    e["scratch_bytes_at_capacity"] = json!({"fc1":g*16*2*4*r*128*4,
+                        "intermediate":g*16*r*128*2,"fc2":g*r*4096*4});
+                    e
+                });
+            let programs = json!({"programs":entries});
+            for rows in [1usize, 64, 65, 2752, 4096] {
+                let mut expected = rows.max(64) * 4096 * 2;
+                for variant in [ExecutionVariant::DecodeCompact, ExecutionVariant::DecodeGrouped, ExecutionVariant::Prefill] {
+                    if variant == ExecutionVariant::Prefill && rows <= 64 { continue; }
+                    let spec = program_spec(&programs, variant.program(family, activations)).unwrap();
+                    let live = if variant == ExecutionVariant::Prefill { rows } else { 64 };
+                    let arena = execution_workspace(&spec, live, ExpertSet::Routed, variant, 8, activations).unwrap();
+                    assert_eq!(arena.hidden, 4096);
+                    assert_eq!(arena.ranges[0].1, live * (4096 + 4096 / 32));
+                    expected += arena.bytes;
+                }
+                assert_eq!(routed_workspace(&programs, family, rows as u64, 8, activations).unwrap(), expected as u64);
+                assert!(routed_workspace(&programs, KernelFamily::Glm, rows as u64, 8, activations).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn routed_backend_charges_both_decode_arenas_prefill_and_stable_output() {
         for activations in [PrefillActivations::A16, PrefillActivations::A8] {
             let programs = json!({"programs":[entry(ExecutionVariant::DecodeCompact, activations),
