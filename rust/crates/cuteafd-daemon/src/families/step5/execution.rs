@@ -1590,7 +1590,7 @@ mod tests {
         }
         let fixture = tempfile::tempdir()?;
         testing::write_step5_exl3_snapshot(fixture.path());
-        let checkpoint = Checkpoint::inventory(fixture.path())?;
+        let checkpoint = Checkpoint::coordinator(fixture.path(), false, true)?;
         let cfg = Config::parse(&checkpoint)?;
         for ranks in [1, 2] {
             let counts = Constructions::default();
