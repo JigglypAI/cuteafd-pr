@@ -467,11 +467,11 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         anyhow::ensure!(args.drafter_snapshot.is_none() && args.role.as_deref() != Some("drafter"), "--no-speculator conflicts with drafter inputs/role");
         args.speculator = "off".into();
     } else if (args.include_speculator || args.drafter_snapshot.is_some()) && args.speculator == "off" {
-        args.speculator = if family == "kimi_k3" && args.drafter_snapshot.is_some() { "dflash2".into() } else { default.into() };
+        args.speculator = if matches!(family, "kimi_k3" | "muse_spark") && args.drafter_snapshot.is_some() { "dflash2".into() } else { default.into() };
         anyhow::ensure!(args.speculator != "off", "this family has no default speculator");
     }
     let enabled = match (family, args.speculator.as_str()) {
-        (_, "off") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
+        (_, "off") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3" | "muse_spark", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
         | ("mimo_v2", "dflash2" | "mtp") | ("qwen4" | "step5", "mtp")
         | ("deepseek_v4" | "deepseek_v41", "dspark") => true,
         _ => false,
@@ -968,6 +968,78 @@ mod tests {
         attach_snapshots(&mut manifest, &[coordinator], &args).unwrap();
         assert_eq!(manifest.additional_snapshots.len(), 1);
         assert!(manifest.additional_snapshots[0].files.iter().any(|f| f.path == "model-00001-of-00001.safetensors"));
+    }
+
+    #[test]
+    fn muse_speculator_policy_requires_an_explicit_drafter() {
+        let target = tempfile::tempdir().unwrap();
+        let draft = tempfile::tempdir().unwrap();
+        let cfg = std::collections::BTreeMap::new();
+        let mut automatic = args(target.path(), 4, false);
+        resolve_speculator(&mut automatic, target.path(), "muse_spark", &cfg).unwrap();
+        assert_eq!(automatic.speculator, "off");
+        automatic = args(target.path(), 4, false);
+        automatic.drafter_snapshot = Some(draft.path().into());
+        resolve_speculator(&mut automatic, target.path(), "muse_spark", &cfg).unwrap();
+        assert_eq!(automatic.speculator, "dflash2");
+        for mode in ["off", "dflash2", "mtp", "dspark"] {
+            let mut explicit = args(target.path(), 4, false);
+            explicit.speculator = mode.into();
+            let resolved = resolve_speculator(&mut explicit, target.path(), "muse_spark", &cfg);
+            assert_eq!(resolved.is_ok(), matches!(mode, "off" | "dflash2"), "{mode}");
+        }
+        let mut disabled = automatic.clone();
+        disabled.no_speculator = true;
+        assert!(resolve_speculator(&mut disabled, target.path(), "muse_spark", &cfg).is_err());
+        disabled.drafter_snapshot = None;
+        resolve_speculator(&mut disabled, target.path(), "muse_spark", &cfg).unwrap();
+        assert_eq!(disabled.speculator, "off");
+    }
+
+    #[test]
+    fn muse_launch_config_resolves_both_pinned_drafters() {
+        use cuteafd_loader::plan::testing::*;
+        let target = tempfile::tempdir().unwrap();
+        write_snapshot(target.path(), &muse_spark_config(), &[t("unused.weight", "BF16", &[2])], None);
+        let home = tempfile::tempdir().unwrap();
+        for (model, revision) in [
+            ("RadixArk/Muse-Spark-Open-DFlash2", "46c90f412549c472941a68382d91a99e5e6372a0"),
+            ("nvidia/Muse-Spark-Open-816B-A42B-DFlash2", "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6"),
+        ] {
+            let draft = cuteafd_loader::model_cache_dir(home.path(), model).join("snapshots").join(revision);
+            std::fs::create_dir_all(&draft).unwrap();
+            std::fs::write(draft.join("config.json"), "{}").unwrap();
+            let config = target.path().join("pair.config");
+            std::fs::write(&config, format!("SPECULATOR=dflash2\nSPECULATOR_MODEL_ID={model}\nSPECULATOR_MODEL_REVISION={revision}\nVISION=off\nAUDIO=off\n")).unwrap();
+            let mut input = args(target.path(), 4, false);
+            input.config = Some(config);
+            input.hf_home = Some(home.path().into());
+            let resolved = file_args(input, target.path()).unwrap();
+            assert_eq!(resolved.speculator, "dflash2");
+            assert_eq!(resolved.drafter_snapshot.as_deref(), Some(draft.as_path()));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the exact hardware pair configs and downloaded snapshots"]
+    fn muse_exact_pair_configs_use_the_real_snapshot_resolver() {
+        let configs = std::env::var_os("CUTEAFD_MUSE_PAIR_CONFIGS")
+            .expect("set CUTEAFD_MUSE_PAIR_CONFIGS to the two exact config paths separated by colon");
+        let configs = std::env::split_paths(&configs).collect::<Vec<_>>();
+        assert_eq!(configs.len(), 2);
+        for config in configs {
+            let cfg = launch_config(Some(&config)).unwrap();
+            let home = default_hf_home();
+            let target = resolve_snapshot_at_revision(&cfg["MODEL_ID"], Some(&home), Some(&cfg["MODEL_REVISION"]))
+                .unwrap().snapshot_path.unwrap();
+            let mut input = args(&target, 4, false);
+            input.config = Some(config.clone());
+            let resolved = file_args(input, &target).unwrap();
+            assert_eq!(resolved.speculator, "dflash2", "{}", config.display());
+            let draft = resolve_snapshot_at_revision(&cfg["SPECULATOR_MODEL_ID"], Some(&home),
+                Some(&cfg["SPECULATOR_MODEL_REVISION"])).unwrap().snapshot_path.unwrap();
+            assert_eq!(resolved.drafter_snapshot.as_deref(), Some(draft.as_path()), "{}", config.display());
+        }
     }
 
     #[test]
