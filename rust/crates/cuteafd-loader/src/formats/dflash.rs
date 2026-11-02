@@ -32,6 +32,35 @@ pub struct MlaDraftBuffer {
     pub bytes: usize,
 }
 
+/// Placement-independent owner facts. Device ordinals are bound by the caller;
+/// library-scoped pinned stores use a sharing key, not another private charge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlaDraftDomain { Device, HostPinned }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlaDraftLifetime { Runtime, Library }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlaDraftDtype { Bytes, Bf16, F32, I32, U32, I64 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlaDraftOwner {
+    pub id: String,
+    pub domain: MlaDraftDomain,
+    pub bytes: usize,
+    pub alignment: usize,
+    pub dtype: MlaDraftDtype,
+    pub shape: Vec<usize>,
+    pub lifetime: MlaDraftLifetime,
+    pub shared_key: Option<String>,
+    pub staging_for: Option<String>,
+    /// Diagnostic host-row/tap inputs create staging lazily; normal device input does not.
+    pub on_use: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlaDraftView {
+    pub id: String,
+    pub backing: String,
+    pub offset: usize,
+    pub bytes: usize,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlaDraftRuntimeLayout {
     cache_format: MlaCacheFormat,
@@ -47,6 +76,7 @@ pub struct MlaDraftRuntimeLayout {
     sm_count: usize,
     fp8_mode: u8,
     buffers: Vec<MlaDraftBuffer>,
+    owners: Vec<MlaDraftOwner>,
 }
 
 impl MlaDraftRuntimeLayout {
@@ -57,6 +87,63 @@ impl MlaDraftRuntimeLayout {
     pub fn target_vocab(&self) -> usize { self.target_vocab }
     pub fn target_taps(&self) -> &[usize] { &self.target_taps }
     pub fn buffers(&self) -> &[MlaDraftBuffer] { &self.buffers }
+    pub fn owners(&self) -> &[MlaDraftOwner] { &self.owners }
+    pub fn device_buffers(&self) -> Vec<MlaDraftBuffer> {
+        if self.owners.is_empty() { return self.buffers.clone(); }
+        self.owners.iter().filter(|o| o.domain == MlaDraftDomain::Device)
+            .map(|o| MlaDraftBuffer { name: o.id.clone(), bytes: o.bytes }).collect()
+    }
+    pub fn allocate_device_with<T, E>(&self, mut allocate: impl FnMut(&MlaDraftBuffer) -> std::result::Result<T, E>)
+        -> std::result::Result<Vec<T>, E> {
+        self.device_buffers().iter().map(&mut allocate).collect()
+    }
+    pub fn host_owner(&self, id: &str) -> Result<&MlaDraftOwner> {
+        self.owners.iter().find(|o| o.id == id && o.domain == MlaDraftDomain::HostPinned)
+            .ok_or_else(|| unsupported("MLA draft unknown host owner"))
+    }
+    pub fn view(&self, id: impl Into<String>, backing: &str, offset: usize, bytes: usize) -> Result<MlaDraftView> {
+        let extent = self.owners.iter().find(|o| o.id == backing).map(|o| o.bytes)
+            .or_else(|| self.buffers.iter().find(|o| o.name == backing).map(|o| o.bytes))
+            .ok_or_else(|| unsupported("MLA draft view backing missing"))?;
+        if !offset.checked_add(bytes).is_some_and(|end| end <= extent) {
+            return Err(unsupported("MLA draft view exceeds owner recipe"));
+        }
+        Ok(MlaDraftView { id: id.into(), backing: backing.into(), offset, bytes })
+    }
+    /// Preflight and launch consume this same body-selected input/output pair.
+    pub fn block_views(&self, first_sequence: usize, rows: usize) -> Result<[MlaDraftView; 2]> {
+        let row = self.target_hidden.checked_mul(2).ok_or_else(|| unsupported("draft row overflow"))?;
+        let block = self.capacity.block_rows / self.capacity.max_batch_sequences;
+        let offset = first_sequence.checked_mul(block).and_then(|n| n.checked_mul(row))
+            .ok_or_else(|| unsupported("draft block offset overflow"))?;
+        let bytes = rows.checked_mul(row).ok_or_else(|| unsupported("draft block extent overflow"))?;
+        let input = "conv";
+        Ok([self.view("block.input", input, offset, bytes)?, self.view("block.output", "delta", offset, bytes)?])
+    }
+    pub fn mask_view(&self, sequence: usize) -> Result<MlaDraftView> {
+        let block = self.capacity.block_rows / self.capacity.max_batch_sequences;
+        let row = self.target_hidden * 2;
+        self.view("block.mask", "h", (sequence * block + 1) * row, (block - 1) * row)
+    }
+    pub fn window_view(&self, layer: usize, slot: usize) -> Result<MlaDraftView> {
+        let cache = self.cache.layers.get(layer).ok_or_else(|| unsupported("draft window layer missing"))?;
+        if cache.window.is_none() || slot >= self.capacity.context_slots {
+            return Err(unsupported("draft window slot outside capacity"));
+        }
+        let bytes = cache.rows_per_slot * self.paged_cache.record_bytes;
+        self.view("cache.window", &format!("layer.{layer}.cache"), slot * bytes, bytes)
+    }
+    pub fn context_views(&self, first_row: usize, rows: usize) -> Result<[MlaDraftView; 3]> {
+        if rows == 0 || rows > 64 { return Err(unsupported("draft context chunk outside m64")); }
+        let bytes = rows.checked_mul(self.target_hidden).and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| unsupported("draft context extent overflow"))?;
+        let offset = first_row.checked_mul(self.target_hidden).and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| unsupported("draft context offset overflow"))?;
+        let metadata = first_row.checked_mul(8).ok_or_else(|| unsupported("draft metadata offset overflow"))?;
+        Ok([self.view("context.input", "fused_norm", offset, bytes)?,
+            self.view("context.slots", "context_slots", metadata, rows * 8)?,
+            self.view("context.positions", "context_positions", metadata, rows * 8)?])
+    }
     pub fn capacity(&self) -> crate::families::glm5::draft_representation::GlmDraftCapacity { self.capacity }
     pub fn weights(&self) -> crate::families::glm5::draft_representation::GlmDraftWeightLayout { self.weights }
     pub fn cache(&self) -> &MlaDraftCacheLayout { &self.cache }
@@ -298,10 +385,36 @@ impl MlaDraftCacheState {
     fn check_append(&self, slot: usize, start: usize, rows: usize) -> Result<()> {
         let (_, end) = self.frontier(slot)?;
         let finish = start.checked_add(rows).ok_or_else(|| unsupported("MLA draft context overflow"))?;
-        if start != end || rows == 0 || finish > self.layout.layers[0].context {
+        // A tail-only producer may omit only records no layer can ever read again.
+        // Keep the immutable storage origin so its physical rows equal a full append.
+        let discarded_gap = start > end && self.layout.layers.iter()
+            .all(|layer| layer.window.is_some_and(|window| rows >= window));
+        if (start != end && !discarded_gap) || rows == 0 || finish > self.layout.layers[0].context {
             return Err(unsupported("MLA draft context append differs from committed frontier"));
         }
         Ok(())
+    }
+
+    /// Physical rows outside the committed window, including private proposal slack.
+    /// Zero these at commit/rollback boundaries so whole-owner snapshots are canonical.
+    pub fn window_slack(&self, layer: usize, slot: usize) -> Result<Vec<std::ops::Range<usize>>> {
+        let (origin, end) = self.frontier(slot)?;
+        let layer = self.layout.layers.get(layer).ok_or_else(|| unsupported("MLA draft unknown cache layer"))?;
+        let Some(window) = layer.window else { return Ok(Vec::new()); };
+        let capacity = layer.rows_per_slot;
+        let base = slot * capacity;
+        let retained = (end - origin).min(window);
+        if retained == 0 { return Ok(vec![base..base + capacity]); }
+        let first = (end - origin - retained) % capacity;
+        let finish = first + retained;
+        let mut slack = Vec::new();
+        if finish <= capacity {
+            if first > 0 { slack.push(base..base + first); }
+            if finish < capacity { slack.push(base + finish..base + capacity); }
+        } else {
+            slack.push(base + finish - capacity..base + first);
+        }
+        Ok(slack)
     }
 
     pub fn commit_context(&mut self, slot: usize, start: usize, rows: usize) -> Result<()> {
@@ -702,7 +815,7 @@ impl MlaDflashConfig {
         } else { None };
         let layout = MlaDraftRuntimeLayout { cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
-            fp8_scratch, sm_count, fp8_mode, buffers };
+            fp8_scratch, sm_count, fp8_mode, buffers, owners: Vec::new() };
         layout.resident_bytes()?;
         Ok(layout)
     }
@@ -898,6 +1011,81 @@ mod tests {
                     let cache_sum = allocated.iter().filter(|(n, _)| n.ends_with(".cache"))
                         .map(|(_, n)| *n as u64).sum::<u64>();
                     assert_eq!(cache_sum, layout.paged_cache.cache_bytes().unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_tail_gap_refusals_are_transactional_and_slack_is_exact() {
+        let mut cfg = MlaDflashConfig::from_json(&config()).unwrap();
+        for windows in [vec![Some(2048); 3], vec![Some(2048), Some(2049)], vec![Some(2048), None]] {
+            cfg.windows = windows.clone();
+            let mut state = MlaDraftCacheState::new(cfg.cache_layout(2, 262144, MlaCacheFormat::Fp8).unwrap()).unwrap();
+            state.reset(0, 0).unwrap();
+            state.reset(1, 513).unwrap();
+            let before = state.clone();
+            if windows.iter().all(|window| *window == Some(2048)) {
+                state.commit_context(0, 6284, 2048).unwrap();
+                assert_eq!(state.frontier(0).unwrap(), (0, 8332));
+                assert_eq!(state.frontier(1).unwrap(), (513, 513));
+                for (layer, layout) in state.layout.layers.iter().enumerate() {
+                    let bound = layout.bind(0, 0).unwrap();
+                    let retained = (6284..8332).map(|position| bound.row(position).unwrap())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let slack = state.window_slack(layer, 0).unwrap().into_iter().flatten()
+                        .collect::<std::collections::BTreeSet<_>>();
+                    assert_eq!(retained.len(), 2048);
+                    assert!(retained.is_disjoint(&slack));
+                    assert_eq!(retained.len() + slack.len(), layout.rows_per_slot());
+                    let other_slack = state.window_slack(layer, 1).unwrap();
+                    assert_eq!(other_slack, [layout.rows_per_slot()..2 * layout.rows_per_slot()]);
+                }
+                let committed = state.clone();
+                for (start, rows) in [(8333, 2047), (8331, 2048), (8332, 0), (usize::MAX, 1), (262144, 2048)] {
+                    assert!(state.commit_context(0, start, rows).is_err());
+                    assert_eq!(state, committed);
+                }
+            } else {
+                assert!(state.commit_context(0, 6284, 2048).is_err());
+                assert_eq!(state, before);
+            }
+        }
+    }
+
+    #[test]
+    fn generic_views_preserve_dflash_buffers_and_offsets_without_new_owners() {
+        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        let cfg = MlaDflashConfig::from_json(&config()).unwrap();
+        for sequences in [1usize, 8, 16, 32] {
+            for sms in [170, 188] {
+                for mode in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
+                    let layout = cfg.runtime_layout(mode, GlmDraftCapacity::new(sequences, sequences, 8).unwrap(),
+                        262144, 262144, sms, 2, MlaCacheFormat::Fp8).unwrap();
+                    assert!(layout.owners().is_empty(), "DFlash2 owner population belongs to planner adapters");
+                    assert_eq!(layout.device_buffers(), layout.buffers());
+                    assert_eq!(layout.allocate_device_with(|b| Ok::<_, ()>(b.clone())).unwrap(),
+                        layout.allocate_with(|b| Ok::<_, ()>(b.clone())).unwrap());
+                    for sequence in 0..sequences {
+                        let [input, output] = layout.block_views(sequence, 8).unwrap();
+                        assert_eq!((input.backing.as_str(), input.offset, input.bytes),
+                            ("conv", sequence * 8 * 7168 * 2, 8 * 7168 * 2));
+                        assert_eq!((output.backing.as_str(), output.offset, output.bytes),
+                            ("delta", sequence * 8 * 7168 * 2, 8 * 7168 * 2));
+                        let mask = layout.mask_view(sequence).unwrap();
+                        assert_eq!((mask.backing.as_str(), mask.offset, mask.bytes),
+                            ("h", (sequence * 8 + 1) * 7168 * 2, 7 * 7168 * 2));
+                    }
+                    for first in (0..2048).step_by(64) {
+                        let [input, slots, positions] = layout.context_views(first, 64).unwrap();
+                        assert_eq!((input.offset, input.bytes), (first * 7168 * 2, 64 * 7168 * 2));
+                        assert_eq!((slots.offset, slots.bytes), (first * 8, 64 * 8));
+                        assert_eq!((positions.offset, positions.bytes), (first * 8, 64 * 8));
+                    }
+                    assert!(layout.block_views(sequences, 8).is_err());
+                    assert!(layout.context_views(2048, 1).is_err());
+                    assert!(layout.view("bad", "missing", 0, 1).is_err());
+                    assert!(layout.view("overflow", "h", usize::MAX, 1).is_err());
                 }
             }
         }
