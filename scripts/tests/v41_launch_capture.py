@@ -24,7 +24,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from launcher_sandbox import copy_tree, copy_launcher_shared_inputs
+from inspect import getsource
+from launcher_sandbox import copy_tree, copy_launcher_shared_inputs, fake_deployment_memory_layout
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "scripts" / "tests" / "fixtures" / "v41-launch"
@@ -165,11 +166,7 @@ if tool == "docker":
                 admission={"kv_pool_size": value("--kv-pool-size"), "memory_reservation": value("--memory-reservation")},
                 peers=value("--deployment-peers", "").split(",")[:int(ranks)],
                 # DeviceLayout.worker_budget_bytes excludes host reserve and the report's weight ceiling.
-                memory_layout={"devices": [{"kind": "rtx", "index": i, "items": [{"category": "weights", "bytes": 8 << 30}]}
-                                           for i in range(int(value("--rtx", "1")))] +
-                                          [{"kind": "spark", "index": i, "capacity_bytes": int(float(value("--spark-budget-gib", "108")) * 2**30),
-                                            "worker_budget_bytes": int(float(value("--spark-budget-gib", "108")) * 2**30),
-                                            "items": [], "kv_tokens": 0} for i in range(int(ranks))]})
+                memory_layout=fake_deployment_memory_layout(value("--rtx", "1"), ranks, value("--spark-budget-gib", "108")))
         print(json.dumps(response))
         sys.exit(0)
     if args and args[0] == "run" and "--entrypoint" in args and "python3" in args:
@@ -242,7 +239,7 @@ sys.exit(0)
 
 
 def stub_text() -> str:
-    return STUB.replace("UUIDS[i]", f"{list(GPU_UUIDS)!r}[i]").replace("PCI[i]", f"{list(GPU_PCI)!r}[i]") \
+    return STUB.replace("import json, os, sys, subprocess", getsource(fake_deployment_memory_layout) + "\nimport json, os, sys, subprocess").replace("UUIDS[i]", f"{list(GPU_UUIDS)!r}[i]").replace("PCI[i]", f"{list(GPU_PCI)!r}[i]") \
         .replace("PCI.index(selector) if selector in PCI", f"{list(GPU_PCI)!r}.index(selector) if selector in {list(GPU_PCI)!r}")
 
 
