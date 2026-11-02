@@ -282,7 +282,12 @@ impl Model {
                     .snapshots
                     .iter()
                     .filter(|(_, snapshot)| snapshot.pins == 0)
-                    .min_by_key(|(_, snapshot)| snapshot.last_use)
+                    .min_by_key(|(_, snapshot)| {
+                        let ancestor = self.snapshots.values().any(|other|
+                            other.tokens.len() > snapshot.tokens.len()
+                                && other.tokens.starts_with(&snapshot.tokens));
+                        (ancestor, snapshot.last_use)
+                    })
                     .map(|(&key, _)| key)?;
                 self.remove(key);
                 key
