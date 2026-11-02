@@ -443,19 +443,20 @@ impl Checkpoint {
         let model = family.open(self)?;
         // Use the loader's component inventory and operand validation: a trellis
         // head has no .weight, and every companion must remain disjoint too.
-        let heads: Vec<_> = super::format::group_by_stem(&self.tensors).into_iter()
-            .filter(|(stem, _)| family.classify(model.spec(), &format!("{stem}.weight"))
-                .is_some_and(|role| role.component == super::spec::Component::LmHead))
-            .map(|(_, members)| members).collect();
+        let heads = super::format::group_tensor_refs(self.tensors.iter().filter(|tensor| {
+            let stem = super::format::split_stem(&tensor.meta.name).0;
+            family.classify(model.spec(), &format!("{stem}.weight"))
+                .is_some_and(|role| role.component == super::spec::Component::LmHead)
+        }));
         let mut separate_head = false;
-        for members in &heads {
+        for members in heads.values() {
             let operand = super::format::detect(members)
                 .with_context(|| format!("{name}: host embedding is ineligible: malformed LM head"))?;
             separate_head |= operand.matrix().is_some() && (members.contains_key("weight")
                 || matches!(operand.encoding, super::format::Encoding::Exl3 { .. }));
         }
         ensure!(separate_head, "{name}: host embedding is ineligible: no separate LM head tensor");
-        for head in heads.iter().flat_map(|members| members.values()) {
+        for head in heads.values().flat_map(|members| members.values()) {
             let same_file = head.shard == embedding.shard
                 || std::fs::canonicalize(self.snapshot.join(&head.shard)).ok().zip(
                     std::fs::canonicalize(self.snapshot.join(&embedding.shard)).ok())
