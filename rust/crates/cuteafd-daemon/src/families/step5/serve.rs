@@ -158,9 +158,11 @@ const PACKED_PROGRAM_ROLES: &[(&str, crate::shared::prefill_packing::ProgramRows
         ("index_weight", PackedRows),
         ("dense_gate_up", PackedRows), ("dense_down", PackedRows),
         ("post_silu_w13824_c7", PackedRows), ("post_silu_w13824_c10", PackedRows),
+        ("post_silu_split_w13824_c7", PackedRows), ("post_silu_split_w13824_c10", PackedRows),
         ("router", PackedRows), ("route_weights", PackedRows),
         ("shared_gate_up", PackedRows), ("shared_down", PackedRows),
         ("post_silu_w1536_c7", PackedRows), ("post_silu_w1536_c10", PackedRows),
+        ("post_silu_split_w1536_c7", PackedRows), ("post_silu_split_w1536_c10", PackedRows),
         ("residual_bf16", PackedRows), ("residual_f32", PackedRows),
         ("expert_input_quant", PackedRows), ("pack_fp8_kv_plane", PackedRows),
         ("sliding_positions", SequenceLocal), ("sliding_commit", SequenceLocal),
@@ -1011,8 +1013,8 @@ mod tests {
         for split in [false, true] {
             let owned = packed_program_inventory(split);
             let inventory = owned.iter().map(|(name, role)| (name.as_str(), *role)).collect::<Vec<_>>();
-            assert_eq!(inventory.len(), if split { 96 } else { 48 });
-            validate_program_inventory(inventory.iter().map(|(name, _)| *name), &inventory)?;
+            // Exporter namespace equality is exercised independently by test_step5_reference.py.
+            assert_eq!(inventory.len(), if split { 104 } else { 52 });
             let mut required = inventory.iter().map(|(name, _)| *name).collect::<Vec<_>>();
             required.push("step5_new_projection");
             assert!(validate_program_inventory(required, &inventory).is_err());
@@ -1020,7 +1022,9 @@ mod tests {
             for prefix in std::iter::once("step5").chain(split.then_some("step52")) {
                 let role = |suffix| inventory.iter().find(|(name, _)| *name == format!("{prefix}_{suffix}"))
                     .map(|(_, role)| *role).unwrap();
-                for suffix in ["router", "attn_q", "index_weight", "pack_fp8_kv_plane", "shared_gate_up"] {
+                for suffix in ["router", "attn_q", "index_weight", "pack_fp8_kv_plane", "shared_gate_up",
+                    "post_silu_split_w13824_c7", "post_silu_split_w13824_c10",
+                    "post_silu_split_w1536_c7", "post_silu_split_w1536_c10"] {
                     assert_eq!(role(suffix), PackedRows);
                 }
                 for suffix in ["swa_attention", "csa_attention_fp8", "region_compress", "mtp_eh", "final_norm"] {

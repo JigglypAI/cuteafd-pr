@@ -69,6 +69,46 @@ def test_expert_wire_quant_export_uses_shared_k32_compiler(monkeypatch):
     assert calls == [{"hidden": 4096}, {"hidden": 4096}]
 
 
+@pytest.mark.parametrize("heads", [32, 64])
+def test_serving_packed_inventory_matches_actual_exporter_namespace(monkeypatch, heads):
+    import re
+    import sys
+    import types
+
+    path = ROOT / "python/tools/aot/export_b12x_step5_aot.py"
+    tree = ast.parse(path.read_text())
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                 and node.name in {"builders", "programs"}]
+    namespace = {}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"), namespace)
+    # Only compiler imports are stubbed; execute the exporter's real name construction.
+    package = types.ModuleType("b12x.integration.cuteafd")
+    for name in ("pointwise", "region_attention", "cache_transactions", "region_selection", "dsv4_ffn"):
+        module = types.ModuleType(f"{package.__name__}.{name}")
+        if name == "region_attention":
+            module.compile_region_compress_aot = lambda: None
+        if name == "region_selection":
+            module.compile_sliding_positions_aot = lambda: None
+        if name == "dsv4_ffn":
+            module.compile_dsv4_expert_input_quant_aot = lambda _: None
+        setattr(package, name, module)
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    torch = types.ModuleType("torch")
+    torch.bfloat16, torch.float32 = "bfloat16", "float32"
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    exported = [name for name, _, _, _ in namespace["programs"](heads, 4096, 1 << 20)]
+    serve = (ROOT / "rust/crates/cuteafd-daemon/src/families/step5/serve.rs").read_text()
+    roles_source = serve.split("const PACKED_PROGRAM_ROLES:", 1)[1].split("\n};", 1)[0]
+    roles = re.findall(r'\("([^"]+)", (PackedRows|SequenceLocal)\)', roles_source)
+    assert len(roles) == len(dict(roles))
+    assert len(exported) == len(set(exported))
+    assert set(exported) == dict(roles).keys()
+    for width in (1536, 13824):
+        for clamp in (7, 10):
+            assert dict(roles)[f"post_silu_split_w{width}_c{clamp}"] == "PackedRows"
+
+
 def test_step5_source_pin_fails_closed(tmp_path):
     snapshot = tmp_path / golden.REVISION
     folder = snapshot / "inference"
