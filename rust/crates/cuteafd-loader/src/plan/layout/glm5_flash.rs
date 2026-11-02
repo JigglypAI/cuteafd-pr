@@ -25,7 +25,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let mut notes = vec![format!("resolved context {context} tokens")];
     let ranks = if options.head_split && options.rtx_bytes.len() >= 2 { 2 } else { 1 };
     let mut devices: Vec<_> = options.rtx_bytes.iter().take(ranks).enumerate().map(|(rank, &bytes)| DeviceLayout {
-        kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: bytes.saturating_sub(options.headroom_bytes),
+        kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: bytes.saturating_sub(options.headroom_bytes), worker_budget_bytes: 0,
         items: vec![], kv_tokens: 0 }).collect();
     // Serving loads RTX media before sampling admission memory. Reserve the
     // same tower first so embedding-home selection sees that occupied memory.
@@ -325,7 +325,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let routed = model.spec().moe_layers().max(1);
         let remaining = total.saturating_sub(total / routed as u64 * working.rtx_layers.len() as u64);
         for rank in 0..working.spark_ranks {
-            let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: options.spark_bytes,
+            let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: options.spark_bytes, worker_budget_bytes: options.spark_bytes,
                 kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed_expert", "", (remaining as f64 * report.spark_rank_share) as u64, Basis::Exact),
                     Item::new(Category::Runtime, "context+modules", "", 512 * MIB, Basis::Calibrated)] };
             let io = model.spec().moe.as_ref()

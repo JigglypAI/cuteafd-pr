@@ -185,8 +185,12 @@ print(json.dumps(dict(report, version=1, family=family, executable=True, report=
     spark_admission="coordinator_authoritative", decode_lanes=1,
     peers=value("--deployment-peers", "").split(",")[:report["spark_ranks"]],
     speculator=value("--speculator", "off"), prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
+    # Match DeviceLayout's allocation ceiling, independently of host-inclusive capacity.
     memory_layout=dict(devices=[dict(kind="rtx", index=i, items=[dict(category="weights", bytes=8 << 30)])
-                                for i in range(int(value("--rtx", "1")))]))))
+                                for i in range(int(value("--rtx", "1")))] +
+                               [dict(kind="spark", index=i, capacity_bytes=int(float(value("--spark-budget-gib", "108")) * 2**30),
+                                     worker_budget_bytes=int(float(value("--spark-budget-gib", "108")) * 2**30),
+                                     items=[], kv_tokens=0) for i in range(report["spark_ranks"])]))))
 """.replace("REPORT", repr(json.dumps(plan))).replace("FAMILY", repr(family))
             .replace("FIRST", first).replace("LAST", "None" if last == "-1" else last))
         docker.write_text(docker.read_text() + f'case "$*" in *"cuteafd plan"*) exec python3 "{stub}" "$@" ;; esac\n')

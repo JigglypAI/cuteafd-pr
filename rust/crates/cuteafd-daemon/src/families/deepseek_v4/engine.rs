@@ -1770,7 +1770,8 @@ impl<'a> Engine<'a> {
     pub fn warm_transport(&self, transport: &mut SparkLink<'_>, rows: usize, kind: ExpertV2SourceKind) -> Result<()> {
         let request = self.warm_request(rows, kind)?;
         let exchange = transport.exchange()?;
-        let ticket = exchange.send_request(request)?;
+        let payload_bytes = exchange.compact_payload(request.header.row_count as usize);
+        let ticket = exchange.send_request(request, payload_bytes)?;
         exchange.land_drained(ticket, self.stream)?;
         self.sync()
     }
@@ -1923,7 +1924,7 @@ impl<'a> Engine<'a> {
         // SAFETY: ids, weights and wire rows hold this unit's `t` rows in
         // stream order; the copies read them before later stream work.
         let ticket = unsafe {
-            transport.send(t, layout, [w.route_ids.buffer, w.route_weights.buffer, w.wire.buffer], self.stream,
+            transport.send(t, transport.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer, w.wire.buffer], self.stream,
                 Box::new(move |routes, wire| {
                     let mut request = spark_request(h, topk, layer, t, routes, wire, ExpertV2SourceKind::Prefill)?;
                     for row in &mut request.rows { row.token_position += first; }
@@ -1990,7 +1991,7 @@ impl<'a> Engine<'a> {
         // stream order (the segment's router ran before); the copies read
         // them before later stream work rewrites them.
         let ticket = unsafe {
-            exchange.send(t, layout, [w.route_ids.buffer, w.route_weights.buffer, w.wire.buffer], self.stream,
+            exchange.send(t, exchange.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer, w.wire.buffer], self.stream,
                 Box::new(move |routes, wire| spark_request(h, topk, layer, t, routes, wire, ExpertV2SourceKind::Decode)))?
         };
         self.profile.borrow_mut().add(Phase::Routing, timer);

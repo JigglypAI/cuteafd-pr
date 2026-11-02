@@ -170,6 +170,11 @@ pub fn prefill_admitted(settings: &[crate::report::Setting]) -> bool {
         && s.value.as_deref().is_some_and(|v| matches!(v, "true" | "on" | "1")))
 }
 
+/// V4.1 scores selected prefill rows without the all-row workspace switch.
+pub fn full_prefill_logits(family: Option<&str>, admitted: bool) -> bool {
+    family == Some("deepseek_v41") || admitted
+}
+
 /// Fail closed unless the set's windows are exactly its declared block counts under
 /// the sealed split rule; then check per-half rows and bucket balance.
 pub fn standard_windows(reference: &Reference, path: &str, admitted: bool) -> Result<Vec<Window>> {
@@ -854,6 +859,13 @@ mod tests {
         assert_eq!(decode.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), split().decode);
         assert_eq!(prefill.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), split().prefill);
         assert_eq!((decode.len(),prefill.len()),(32,32));
+        let snapshot = tempfile::tempdir().unwrap();
+        std::fs::write(snapshot.path().join("config.json"),
+            r#"{"architectures":["DeepseekV41ForCausalLM"]}"#).unwrap();
+        let status = json!({"snapshot": snapshot.path(), "full_prefill_logits": false});
+        let admitted = crate::fidelity_cli::discovered_prefill_logits(&status).unwrap();
+        assert_eq!((standard_windows(&reference, "decode", admitted).unwrap().len(),
+            standard_windows(&reference, "prefill", admitted).unwrap().len()), (32, 32));
         let ids: BTreeSet<_> = decode.iter().chain(&prefill).map(|w| &w.id).collect();
         assert_eq!(ids.len(),64);
         for half in [&decode,&prefill] {

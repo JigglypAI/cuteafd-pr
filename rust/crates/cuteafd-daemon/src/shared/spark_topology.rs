@@ -218,6 +218,14 @@ mod tests {
                 speculator: "off".into(), ..Default::default() };
             let deployment = DeploymentSpec::from_report(&report, &deployment_options)?;
             assert!(deployment.executable, "{key}: {:?}", report.hints);
+            let spark_devices = deployment.memory_layout.devices.iter()
+                .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark).collect::<Vec<_>>();
+            assert_eq!(spark_devices.len(), 8, "{key}");
+            for device in spark_devices {
+                assert_eq!(device.worker_budget_bytes, 108 << 30, "{key}");
+                assert!(device.worker_budget_bytes <= device.capacity_bytes && device.worker_budget_bytes <= 121 << 30,
+                    "{key}: worker ceiling exceeds device capacity");
+            }
             let deployment_path = root.path().join("deployment.json");
             std::fs::write(&deployment_path, serde_json::to_vec(&deployment)?)?;
             let temporary = root.path().join("launch");

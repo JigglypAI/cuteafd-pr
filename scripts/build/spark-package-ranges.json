@@ -4,6 +4,7 @@
     "python/tools/lib/spark_packages.py",
     "python/tools/lib/mxfp4_layouts.py",
     "scripts/build/mxfp4-layouts.json",
+    "rust/crates/cuteafd-core/src/serving_capacity.rs",
     "scripts/build/spark-package-ranges.json",
     "scripts/lib/wip_aot_scopes.py",
     "scripts/lib/checkpoint-family.py"

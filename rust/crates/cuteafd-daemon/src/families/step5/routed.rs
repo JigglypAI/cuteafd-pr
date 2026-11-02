@@ -515,7 +515,7 @@ impl<'a> RoutedFfn<'a> {
             // SAFETY: the diagnostic owner retains normalized rows and routes
             // through drainage; the copies read them in stream order.
             unsafe {
-                exchange.send(rows, layout, self.wave_inputs(), stream.raw,
+                exchange.send(rows, exchange.compact_payload(rows), layout, self.wave_inputs(), stream.raw,
                     Box::new(move |routes, wire| request(layer, rows, dtype, routes, wire)))
             }
         })?;

@@ -366,7 +366,7 @@ mod tests {
         report.role_readiness.clear();
         report.components.clear();
         report.memory_layout = Some(MemoryLayout {
-            devices: vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0, capacity_bytes: 1024,
+            devices: vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0, capacity_bytes: 1024, worker_budget_bytes: 0,
                 items: vec![Item::new(Category::Experts, "routed", "", 512, Basis::Estimated)], kv_tokens: 0 }],
             pool_tokens: 0, waste: vec![], notes: vec![],
         });

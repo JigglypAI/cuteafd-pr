@@ -47,6 +47,20 @@ def copy_launcher_shared_inputs(source_root, destination_root):
             copy_input(source, target)
 
 
+def fake_deployment_memory_layout(rtx, ranks, spark_budget_gib=108):
+    """Typed device records shared by process-boundary planner stubs."""
+    budget = int(float(spark_budget_gib) * 2**30)
+    return {"devices": [
+        {"kind": "rtx", "index": i, "capacity_bytes": 96 << 30,
+         "worker_budget_bytes": 0, "items": [{"category": "weights", "bytes": 8 << 30}],
+         "kv_tokens": 0} for i in range(int(rtx))
+    ] + [
+        {"kind": "spark", "index": i, "capacity_bytes": budget,
+         "worker_budget_bytes": budget, "items": [], "kv_tokens": 0}
+        for i in range(int(ranks))
+    ]}
+
+
 def stub_cuda_capacity(common, total_bytes):
     """Launcher captures fake the host; driver/UUID behavior has its own unit tests."""
     common = Path(common)

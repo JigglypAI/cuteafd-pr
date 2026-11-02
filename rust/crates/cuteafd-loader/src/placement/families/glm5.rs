@@ -960,7 +960,7 @@ pub(crate) fn exlr8_inventory_with_metadata(snapshot: &std::path::Path, manifest
         && cfg.topk == 8 && (cfg.first_moe_layer..=cfg.layers).contains(&selected_layers)
         && (1..=4).contains(&lanes), "GLM EXLR8 TP2 geometry/layer extent");
     let programs = crate::plan::checkpoint::read_json(manifest)?;
-    let backend_workspace = crate::plan::exlr8::routed_workspace(&programs, rows, 8, activations)?;
+    let backend_workspace = crate::plan::exlr8::routed_workspace(&programs, cuteafd_ffi::exlr8::KernelFamily::Glm, rows, 8, activations)?;
     let records = crate::plan::exlr8::dense::DenseRecord::inventory(snapshot)?;
     for layer in cfg.first_moe_layer..selected_layers {
         for suffix in ["weight", "e_score_correction_bias"] {
@@ -1059,10 +1059,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fixture(root.path(), false);
         let records = ["weight", "e_score_correction_bias"].into_iter().zip([768usize, 8]).map(|(suffix, bytes)| DenseRecord {
+            ownership: crate::plan::exlr8::dense::DenseOwnership::new(crate::plan::exlr8::dense::DenseExecution::RankZero),
             tensor: format!("model.layers.3.mlp.gate.{suffix}"), encoding: DenseEncoding::Bf16,
             shape: vec![bytes / 2], side: ShardSide::Replicated, channels_per_shard: 0,
             rotation_id: 0, rotation: None, hessian_solved: false, native_blocks: 0,
-            components: vec![DenseComponent { suffix: suffix.into(), dtype: "BF16".into(), shape: vec![bytes / 2],
+            components: vec![DenseComponent { window: None, suffix: suffix.into(), dtype: "BF16".into(), shape: vec![bytes / 2],
                 source: DenseRange { path: root.path().join("router"), offset: 0, bytes } }],
         }).collect::<Vec<_>>();
         let original = std::fs::read(root.path().join("manifests/exlr8-manifest-mixed.json")).unwrap();

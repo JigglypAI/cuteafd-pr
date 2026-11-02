@@ -700,7 +700,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     }
     if let Some(snapshot) = &args.draft {
         // A native EXLR8 target lends its row-FP8 head through a launcher.
-        if !native { dflash::check_snapshot_target_head(&args.snapshot, cfg.hidden, cfg.vocab_size, false)?; }
+        if !native { dflash::check_snapshot_target_head(&args.snapshot, "lm_head", cfg.hidden, cfg.vocab_size, false)?; }
         dflash::check_checkpoint(snapshot, args.draft_fp8, args.draft_context_slots, args.draft_sequences)?;
     }
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
@@ -906,7 +906,7 @@ impl Opened {
                     "GLM EXL3 planner/runtime backend workspace mismatch"),
                 glm::GlmLocalFormat::Exlr8 => ensure!(
                     crate::shared::experts::rtx::exlr8::Exlr8Tp2Weights::workspace_bytes(
-                        &programs, max_rows, args.exlr8_prefill_activations)? as u64 == local.backend_workspace,
+                        &programs, cuteafd_ffi::exlr8::KernelFamily::Glm, max_rows, args.exlr8_prefill_activations)? as u64 == local.backend_workspace,
                     "GLM EXLR8 planner/runtime backend workspace mismatch"),
                 glm::GlmLocalFormat::Nvfp4 { .. } => {
                     let tensors = self.catalog.fp8().context("NVFP4 tensors")?;
@@ -957,7 +957,7 @@ impl Opened {
         let native_push_experts = || -> Result<_> {
             tp2_range.as_ref().map(|range| -> Result<_> {
                 let workspace = crate::shared::experts::rtx::exlr8::Exlr8Tp2Weights::workspace_bytes(
-                    &programs, max_rows, args.exlr8_prefill_activations)?;
+                    &programs, cuteafd_ffi::exlr8::KernelFamily::Glm, max_rows, args.exlr8_prefill_activations)?;
                 let budgets = tp2_budgets()?.map(|b| b.saturating_sub(workspace));
                 Ok(crate::shared::experts::rtx::push::CoordinatorExperts::Exlr8Tp2 {
                     manifest: args.exlr8_manifest.clone().context("EXLR8 manifest")?,
@@ -1242,7 +1242,7 @@ impl Opened {
             // Sparks' first-use costs), landed and drained on the stream.
             let rows = link.capacity() as usize;
             let exchange = link.exchange()?;
-            let ticket = exchange.send_request(warm(rows, decode)?)?;
+            let ticket = exchange.send_request(warm(rows, decode)?, exchange.compact_payload(rows))?;
             exchange.land_drained(ticket, stream)?;
         }
         if transport.is_some() {
@@ -1304,14 +1304,17 @@ impl Opened {
         self.library.cuda_set_device(devices[0])?;
         let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
         let available = usize::try_from(available)?;
+        let per_rank = (0..world).map(|rank| native_dense::NativeDenseRecords::new(&self.snapshot, layers, world, rank))
+            .collect::<Result<Vec<_>>>()?;
+        let load_peak = per_rank.iter().try_fold(0usize, |total, rank|
+            total.checked_add(rank.plan.read_staging_bytes).context("native dense load peak overflow"))?;
+        ensure!(load_peak <= available, "native dense load peak {load_peak} exceeds available host bytes {available}");
         let vocabulary = NativeVocabulary::load(&self.library, programs,
             VocabularyPlan::new(records, world, 0, self.cfg.hidden, self.cfg.vocab_size)?, available, 0, 0)?
             .context("rank 0 owns the native vocabulary")?;
         let vocabulary = std::rc::Rc::new(vocabulary);
         let source = self.native_embed_source()?;
         let embedding = crate::shared::token_io::TokenEmbedding::row_fp8(&self.library, source, vocabulary.clone())?;
-        let per_rank = (0..world).map(|rank| native_dense::NativeDenseRecords::new(&self.snapshot, layers, world, rank))
-            .collect::<Result<Vec<_>>>()?;
         let rank_stream = |device: i32| if device == args.device { stream } else { peer_stream.map_or(stream, |(_, s)| s) };
         let ((model, shares), pushed) = match push {
             Some((push, sparks)) => {

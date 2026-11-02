@@ -32,7 +32,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let ranks = if split { 2 } else { 1 };
     let mut devices: Vec<DeviceLayout> = options.rtx_bytes.iter().take(gpus).enumerate()
         .map(|(index, &bytes)| DeviceLayout { kind: DeviceKind::Rtx, index: index as u32,
-            capacity_bytes: bytes.saturating_sub(options.headroom_bytes), items: Vec::new(), kv_tokens: 0 }).collect();
+            capacity_bytes: bytes.saturating_sub(options.headroom_bytes), worker_budget_bytes: 0, items: Vec::new(), kv_tokens: 0 }).collect();
     let mut waste = Vec::new();
     let mut notes = vec![format!("resolved context {} tokens (checkpoint {})", shape.context_tokens, shape.checkpoint_context),
         format!("attention placement {}", report.attention_placement)];
@@ -445,7 +445,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         runtime.group = "EXLR8 context+modules".into();
         items.push(runtime);
         devices.push(DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32,
-            capacity_bytes: options.rtx_bytes[rank].saturating_sub(options.headroom_bytes), items, kv_tokens: 0 });
+            capacity_bytes: options.rtx_bytes[rank].saturating_sub(options.headroom_bytes), worker_budget_bytes: 0, items, kv_tokens: 0 });
     }
     let onboard = options.onboard.or(options.local_expert_layers.map(Onboard::Layers)).unwrap_or_else(glm::default_onboard);
     let local = if let Some(selected) = selected {

@@ -1,5 +1,7 @@
 """Exercise the real launcher without contacting Docker, SSH or a GPU."""
 import json
+from inspect import getsource
+from launcher_sandbox import fake_deployment_memory_layout
 import os
 from pathlib import Path
 import subprocess
@@ -8,7 +10,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-MOCK = r'''
+MOCK = getsource(fake_deployment_memory_layout) + r'''
 import json, os, subprocess, sys
 from pathlib import Path
 tool = Path(sys.argv[0]).name
@@ -48,8 +50,7 @@ if tool == 'docker':
             admission=dict(kv_pool_size=value('--kv-pool-size'), memory_reservation=value('--memory-reservation')),
             peers=value('--deployment-peers', '').split(',')[:ranks],
             spark_admission='coordinator_authoritative',
-            memory_layout=dict(devices=[dict(kind='rtx', index=i, items=[dict(category='weights', bytes=8 << 30)])
-                                        for i in range(gpus)]))))
+            memory_layout=fake_deployment_memory_layout(gpus, ranks, value('--spark-budget-gib', '108')))))
         sys.exit(0)
 raise SystemExit('Unexpected external action: ' + tool + ' ' + repr(args))
 '''

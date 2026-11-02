@@ -1,23 +1,31 @@
 //! Metadata-only EXLR8 execution arenas, shared by admission and the runtime.
 use super::{residency::{execution_workspace_layout, ExpertSet}, PrefillActivations};
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::programs::ProgramSpec;
+use cuteafd_ffi::{exlr8::{KernelFamily, KernelKind}, programs::ProgramSpec};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionVariant { SharedDecode, DecodeCompact, DecodeGrouped, Prefill }
 
 impl ExecutionVariant {
-    pub fn program(self, activations: PrefillActivations) -> &'static str {
-        match self {
-            Self::SharedDecode => "exlr8_shared_a16_serving",
-            Self::DecodeCompact => "exlr8_a16_serving",
-            Self::DecodeGrouped => "exlr8_a16_grouped64",
+    pub fn program(self, family: KernelFamily, activations: PrefillActivations) -> &'static str {
+        family.program(match self {
+            Self::SharedDecode => KernelKind::Shared,
+            Self::DecodeCompact => KernelKind::Routed,
+            Self::DecodeGrouped => KernelKind::GroupedDecode,
             Self::Prefill => match activations {
-                PrefillActivations::A16 => "exlr8_a16_grouped",
-                PrefillActivations::A8 => "exlr8_a8_grouped",
+                PrefillActivations::A16 => KernelKind::GroupedA16,
+                PrefillActivations::A8 => KernelKind::GroupedA8,
             },
-        }
+        })
+    }
+
+    pub fn group(self, family: KernelFamily) -> &'static str {
+        family.program(match self {
+            Self::SharedDecode => KernelKind::SharedGroup,
+            Self::DecodeCompact | Self::DecodeGrouped => KernelKind::Group,
+            Self::Prefill => KernelKind::GroupedGroup,
+        })
     }
 }
 
@@ -45,7 +53,8 @@ pub fn execution_workspace(spec: &ProgramSpec, rows: usize, set: ExpertSet,
     cuteafd_ffi::exlr8::validate(spec)?;
     ensure!((set == ExpertSet::Shared) == (variant == ExecutionVariant::SharedDecode),
         "EXLR8 shared decode requires the shared expert set");
-    ensure!(spec.name == variant.program(activations) && spec.geometry["abi_version"] == 3,
+    let (family, _) = KernelFamily::of(spec)?;
+    ensure!(spec.name == variant.program(family, activations) && spec.geometry["abi_version"] == 3,
         "EXLR8 execution requires fused rotation ABI v3");
     ensure!(rows > 0 && rows <= spec.capacity_rows as usize, "EXLR8 rows outside admitted K1 capacity");
     ensure!(variant != ExecutionVariant::Prefill || rows > cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS,
@@ -103,7 +112,7 @@ fn program_spec(programs: &Value, name: &str) -> Result<ProgramSpec> {
 
 /// The stream-serialized TP2 backend owns both decode variants, one prefill
 /// execution and a stable BF16 output. Pair's per-lane payloads are separate.
-pub fn routed_workspace(programs: &Value, rows: u64, unit_limit: usize,
+pub fn routed_workspace(programs: &Value, family: KernelFamily, rows: u64, unit_limit: usize,
     activations: PrefillActivations) -> Result<u64> {
     ensure!((1..=4096).contains(&rows), "EXLR8 routed lane geometry");
     let rows = usize::try_from(rows)?;
@@ -114,10 +123,8 @@ pub fn routed_workspace(programs: &Value, rows: u64, unit_limit: usize,
         (ExecutionVariant::DecodeGrouped, decode_rows, 1),
         (ExecutionVariant::Prefill, rows, if rows > decode_rows { 1 } else { 0 })] {
         if count == 0 { continue; }
-        let spec = program_spec(programs, variant.program(activations))?;
+        let spec = program_spec(programs, variant.program(family, activations))?;
         let workspace = execution_workspace(&spec, rows, ExpertSet::Routed, variant, unit_limit, activations)?;
-        ensure!(workspace.hidden == 6144 && workspace.units == 16 && workspace.top_k == 8,
-            "EXLR8 routed TP2 workspace requires hidden6144/units16/top8");
         ensure!(hidden.is_none_or(|h| h == workspace.hidden), "EXLR8 routed workspace hidden mismatch");
         hidden = Some(workspace.hidden);
         total = total.checked_add(workspace.bytes.checked_mul(usize::try_from(count)?)
@@ -140,7 +147,7 @@ mod tests {
         let mut pointers = vec!["x", "pointers", "bits", "group_expert", "route_slots", "route_group_lane",
             "route_weights", "fc1", "intermediate", "fc2", "signs_out", "output", "group_count"];
         if grouped { pointers.extend(["unit_count", "unit_map"]); }
-        let mut value = json!({"name":variant.program(activations), "capacity_rows":rows,
+        let mut value = json!({"name":variant.program(KernelFamily::Glm, activations), "capacity_rows":rows,
             "pointers":pointers.iter().map(|name| json!({"name":name})).collect::<Vec<_>>(),
             "scalars":(0..if grouped {4} else {2}).map(|_| json!({"type":"int32"})).collect::<Vec<_>>(),
             "geometry":{"abi_version":3,"hidden":6144,"units":16,"top_k":8,
@@ -161,7 +168,7 @@ mod tests {
     fn adaptive_units_size_row_planes_without_shrinking_exported_scratch() {
         for activations in [PrefillActivations::A16, PrefillActivations::A8] {
             let programs = json!({"programs":[entry(ExecutionVariant::Prefill, activations)]});
-            let spec = program_spec(&programs, ExecutionVariant::Prefill.program(activations)).unwrap();
+            let spec = program_spec(&programs, ExecutionVariant::Prefill.program(KernelFamily::Glm, activations)).unwrap();
             let full = execution_workspace(&spec, 4096, ExpertSet::Routed,
                 ExecutionVariant::Prefill, 8, activations).unwrap();
             for rows in [2048, 2752] {
@@ -181,6 +188,43 @@ mod tests {
     }
 
     #[test]
+    fn flash_arenas_derive_every_byte_from_the_validated_program_geometry() {
+        for activations in [PrefillActivations::A16, PrefillActivations::A8] {
+            let family = KernelFamily::GlmFlash;
+            let entries = [ExecutionVariant::DecodeCompact, ExecutionVariant::DecodeGrouped, ExecutionVariant::Prefill]
+                .map(|variant| {
+                    let mut e = entry(variant, activations);
+                    e["name"] = json!(variant.program(family, activations));
+                    let g = if variant == ExecutionVariant::Prefill { 800u64 } else { 512 };
+                    let r = if variant == ExecutionVariant::Prefill { 64u64 } else { 16 };
+                    e["geometry"]["hidden"] = json!(4096);
+                    e["geometry"]["fc1_splits"] = json!(4);
+                    e["geometry"]["max_groups"] = json!(g);
+                    e["geometry"]["swiglu_limit"] = json!(10.0);
+                    if variant != ExecutionVariant::DecodeCompact { e["geometry"]["group_rows"] = json!(r); }
+                    e["scratch_bytes_at_capacity"] = json!({"fc1":g*16*2*4*r*128*4,
+                        "intermediate":g*16*r*128*2,"fc2":g*r*4096*4});
+                    e
+                });
+            let programs = json!({"programs":entries});
+            for rows in [1usize, 64, 65, 2752, 4096] {
+                let mut expected = rows.max(64) * 4096 * 2;
+                for variant in [ExecutionVariant::DecodeCompact, ExecutionVariant::DecodeGrouped, ExecutionVariant::Prefill] {
+                    if variant == ExecutionVariant::Prefill && rows <= 64 { continue; }
+                    let spec = program_spec(&programs, variant.program(family, activations)).unwrap();
+                    let live = if variant == ExecutionVariant::Prefill { rows } else { 64 };
+                    let arena = execution_workspace(&spec, live, ExpertSet::Routed, variant, 8, activations).unwrap();
+                    assert_eq!(arena.hidden, 4096);
+                    assert_eq!(arena.ranges[0].1, live * (4096 + 4096 / 32));
+                    expected += arena.bytes;
+                }
+                assert_eq!(routed_workspace(&programs, family, rows as u64, 8, activations).unwrap(), expected as u64);
+                assert!(routed_workspace(&programs, KernelFamily::Glm, rows as u64, 8, activations).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn routed_backend_charges_both_decode_arenas_prefill_and_stable_output() {
         for activations in [PrefillActivations::A16, PrefillActivations::A8] {
             let programs = json!({"programs":[entry(ExecutionVariant::DecodeCompact, activations),
@@ -189,7 +233,7 @@ mod tests {
                 let mut expected = rows.max(64) * 6144 * 2;
                 for variant in [ExecutionVariant::DecodeCompact, ExecutionVariant::DecodeGrouped, ExecutionVariant::Prefill] {
                     if variant == ExecutionVariant::Prefill && rows <= 64 { continue; }
-                    let spec = program_spec(&programs, variant.program(activations)).unwrap();
+                    let spec = program_spec(&programs, variant.program(KernelFamily::Glm, activations)).unwrap();
                     let live = if variant == ExecutionVariant::Prefill { rows as usize } else { 64 };
                     let owned = execution_workspace(&spec, live, ExpertSet::Routed, variant, 8, activations).unwrap();
                     expected += owned.bytes as u64;
@@ -199,16 +243,16 @@ mod tests {
                     let full = execution_workspace(&spec, live, ExpertSet::Routed, variant, 16, activations).unwrap();
                     assert!(full.bytes > owned.bytes);
                 }
-                assert_eq!(routed_workspace(&programs, rows, 8, activations).unwrap(), expected);
+                assert_eq!(routed_workspace(&programs, KernelFamily::Glm, rows, 8, activations).unwrap(), expected);
             }
-            for units in [0, 17, usize::MAX] { assert!(routed_workspace(&programs, 4096, units, activations).is_err()); }
-            assert!(routed_workspace(&programs, 4097, 8, activations).is_err());
+            for units in [0, 17, usize::MAX] { assert!(routed_workspace(&programs, KernelFamily::Glm, 4096, units, activations).is_err()); }
+            assert!(routed_workspace(&programs, KernelFamily::Glm, 4097, 8, activations).is_err());
             let mut invalid = programs.clone();
             invalid["programs"][1]["scratch_bytes_at_capacity"]["fc2"] = json!(1);
-            assert!(routed_workspace(&invalid, 4096, 8, activations).is_err());
+            assert!(routed_workspace(&invalid, KernelFamily::Glm, 4096, 8, activations).is_err());
             invalid = programs.clone();
             invalid["programs"].as_array_mut().unwrap().remove(1);
-            assert!(routed_workspace(&invalid, 4096, 8, activations).is_err());
+            assert!(routed_workspace(&invalid, KernelFamily::Glm, 4096, 8, activations).is_err());
         }
     }
 }

@@ -125,6 +125,10 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # With Sparks, serve's unit is the planner's third of the reserve (fixed depth 3).
         if role == "coordinator" and value("--prefill-waves") == "3" and "--prefill-batch-tokens" in expected_command:
             expected_command[expected_command.index("--prefill-batch-tokens") + 1] = "2752"
+        if role == "worker":
+            # Old captures confused the weight ceiling (100 GiB) with the
+            # planner's automatic CUDA allocation ceiling (108 GiB).
+            expected_command[expected_command.index("--device-budget-bytes") + 1] = str(108 << 30)
         assert flag_values(after["command"]) == flag_values(expected_command), where
     # S5 replaces report JSON with the planner-owned deployment. Only the
     # preflight argv changes; all serving commands and fingerprint env above
@@ -132,6 +136,9 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
     expected_plans = []
     for old in golden["plans"]:
         expected = [value for value in old if value not in ("--json", "--layout")]
+        # These captures pin no device override: auto stays with the planner.
+        budget_index = expected.index("--spark-budget-gib")
+        del expected[budget_index:budget_index + 2]
         expected.insert(expected.index("--require-ready"), "--deployment")
         if case in KIT_CARDS:
             expected.remove("--require-ready")
