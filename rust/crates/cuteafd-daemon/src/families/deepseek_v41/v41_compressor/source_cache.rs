@@ -310,14 +310,27 @@ fn plan_appends(tables: &[Vec<u32>], rows: &[usize], writing: u64, appends: &[(u
     Ok(plan)
 }
 
+pub(super) fn commit_staging_bytes(unit: usize) -> usize {
+    unit * 4 + cuteafd_core::V41_MAX_REQUESTS * 8
+}
+
+fn stage_lengths(plan: &IndexPlan, staging: &mut [u8]) -> Result<()> {
+    ensure!(plan.lengths.len() <= cuteafd_core::V41_MAX_REQUESTS
+        && plan.lengths.iter().all(|&(slot, _)| slot < cuteafd_core::V41_MAX_REQUESTS),
+        "invalid source metadata request count");
+    ensure!(staging.len() >= plan.lengths.len() * 8, "source metadata staging too small");
+    for (dst, &(_, rows)) in staging.chunks_exact_mut(8).zip(&plan.lengths) {
+        dst.copy_from_slice(&rows.to_ne_bytes());
+    }
+    Ok(())
+}
+
 unsafe fn upload_lengths(library: &NativeLibrary, lengths: CuteafdDeviceBuffer, plan: &IndexPlan,
     staging: &mut [u8], stream: *mut c_void) -> Result<()> {
-    ensure!(staging.len() >= plan.lengths.len() * 8, "source metadata staging too small");
-    for (i, &(slot, rows)) in plan.lengths.iter().enumerate() {
-        let staging = &mut staging[i * 8..i * 8 + 8];
-        staging.copy_from_slice(&rows.to_ne_bytes());
+    stage_lengths(plan, staging)?;
+    for (i, &(slot, _)) in plan.lengths.iter().enumerate() {
         unsafe {
-            library.copy_h2d_async(slice(lengths, slot * 8, 8), staging, stream)?;
+            library.copy_h2d_async(slice(lengths, slot * 8, 8), &staging[i * 8..i * 8 + 8], stream)?;
         }
     }
     Ok(())
@@ -391,6 +404,29 @@ mod tests {
         Ok(bytes)
     }
 
+    #[test]
+    fn source_metadata_staging_covers_c64_and_short_units() -> Result<()> {
+        for count in [1, 16, 33, 64] {
+            let tables = vec![vec![0]; count];
+            let rows = vec![0; count];
+            let appends: Vec<_> = (0..count).map(|slot| (slot, 0, slot + 1)).collect();
+            let plan = plan_appends(&tables, &rows, 0, &appends)?;
+            for unit in [count, 2752] {
+                let capacity = commit_staging_bytes(unit);
+                let mut bytes = vec![0xa5; capacity + 16];
+                stage_lengths(&plan, &mut bytes[..capacity])?;
+                let expected: Vec<_> = (1..=count as u64).flat_map(u64::to_ne_bytes).collect();
+                assert_eq!(&bytes[..count * 8], &expected);
+                assert!(bytes[count * 8..].iter().all(|&b| b == 0xa5));
+            }
+            let mut short = vec![0xa5; count * 8 - 1];
+            assert!(stage_lengths(&plan, &mut short).is_err());
+            assert!(short.iter().all(|&b| b == 0xa5));
+        }
+        let invalid = IndexPlan { lengths: vec![(64, 1)], guard: None };
+        assert!(stage_lengths(&invalid, &mut [0; 512]).is_err());
+        Ok(())
+    }
     #[test]
     fn appends_stay_inside_bound_pages_and_never_overlap() {
         let tables = [vec![3, 7], vec![3, 9]];

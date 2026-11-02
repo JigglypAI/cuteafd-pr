@@ -360,7 +360,7 @@ impl<'a> CompressorWeights<'a> {
             pending_commit: None,
             unsettled: Vec::new(),
             replica: None,
-            commit_staging: HostAllocation::new(self.library, unit * 4 + 256)?,
+            commit_staging: HostAllocation::new(self.library, source_cache::commit_staging_bytes(unit))?,
             commit_destinations: HostAllocation::new(self.library, unit * 8)?,
         })
     }

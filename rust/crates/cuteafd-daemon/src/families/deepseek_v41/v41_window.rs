@@ -321,7 +321,7 @@ impl<'a> WindowWeights<'a> {
             kv: self.library.v41_kv()?,
             weights: self,
             staging: HostAllocation::new(self.library, unit * 8)?,
-            commit_staging: HostAllocation::new(self.library, unit * 8 + 128)?,
+            commit_staging: HostAllocation::new(self.library, commit::staging_bytes(unit))?,
             capacity: unit,
             graph: None,
             graphs: GraphBank::new(None),
