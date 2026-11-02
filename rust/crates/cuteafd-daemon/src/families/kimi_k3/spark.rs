@@ -240,7 +240,8 @@ mod tests {
         assert!(source.contains("Arc::clone(library_owner)"));
         assert!(!source.contains("SparkLane"));
         assert!(!source.contains("submit_lane"));
-        assert!(source.contains("link.exchange()?.send("));
+        assert!(source.contains("let exchange = link.exchange()?;"));
+        assert!(source.contains("exchange.send(rows, exchange.compact_payload(rows),"));
         assert!(source.contains("exchange.land(wave, stream)"));
         assert!(!source.contains("block_on"));
         assert!(source.find("link.enable_terminal_ownership").unwrap() < source.find("link.bootstrap").unwrap());
