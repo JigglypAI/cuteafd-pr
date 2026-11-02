@@ -1544,9 +1544,9 @@ mod tests {
                 world: u32::from(tp), topology: [tp, 1], ..identity()
             };
             let model = ModelAdmission::new(vec![
-                SparkEndpoint { capacity: verify, ingress: SparkIngress::Bf16, ring_depth: None },
-                SparkEndpoint { capacity: verify, ingress: SparkIngress::Bf16, ring_depth: None },
-                SparkEndpoint { capacity: 2752, ingress: SparkIngress::Bf16, ring_depth: None },
+                SparkEndpoint { capacity: verify, ingress: SparkIngress::Bf16, ring_depth: None, partial_reply_bytes: None },
+                SparkEndpoint { capacity: verify, ingress: SparkIngress::Bf16, ring_depth: None, partial_reply_bytes: None },
+                SparkEndpoint { capacity: 2752, ingress: SparkIngress::Bf16, ring_depth: None, partial_reply_bytes: None },
             ], SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
                 SparkExecutions::admit(&[verify, verify], 2752, 2752, 3, &exports.capacities)?)?;
             let loaded = WorkerSelection::new(identity.clone(), &[13])?.with_model(model)?;
