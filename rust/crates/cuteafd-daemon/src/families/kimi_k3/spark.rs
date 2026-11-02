@@ -159,7 +159,8 @@ impl<'a> RoutedLane<'a> {
         let wave = self.stream.device.run(|| {
             // SAFETY: LocalLane retains these operands through whole-submission
             // teardown; the copies read them in stream order.
-            unsafe { link.exchange()?.send(rows, rows * LATENT * 2, layout, [routes.ids, routes.weights, wire], stream,
+            let exchange = link.exchange()?;
+            unsafe { exchange.send(rows, exchange.compact_payload(rows), layout, [routes.ids, routes.weights, wire], stream,
                 Box::new(move |routes, wire| request_parts(layer, rows, sequence, kind, routes, wire))) }
         })?;
         self.sequence.set(sequence);

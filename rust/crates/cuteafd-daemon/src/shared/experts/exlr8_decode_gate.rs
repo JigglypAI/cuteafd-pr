@@ -123,7 +123,7 @@ fn native_exlr8_decode_widths_finite_and_row_invariant() -> Result<()> {
                 id += 1;
                 let request = request(geometry, layer, seed, first, rows, id)?;
                 let exchange = link.exchange()?;
-                let payload_bytes = request.header.row_count as usize * cuteafd_core::expert_geometry().hidden as usize * 2;
+                let payload_bytes = exchange.compact_payload(request.header.row_count as usize);
                 let ticket = exchange.send_request(request, payload_bytes)?;
                 let slot = ticket.slot();
                 exchange.land(ticket, stream.raw)?;

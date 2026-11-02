@@ -1395,7 +1395,7 @@ impl Opened {
         let warm_stream = crate::shared::spark_intake::WarmStream::new(&*self.library)?;
         for (transport, request) in [(&mut decode, &decode_warm), (&mut prefill, &prefill_warm)] {
             let exchange = transport.exchange()?;
-            let payload_bytes = request.header.row_count as usize * cuteafd_core::expert_geometry().hidden as usize * 2;
+            let payload_bytes = exchange.compact_payload(request.header.row_count as usize);
             let wave = exchange.send_request(request.clone(), payload_bytes)?;
             exchange.land_drained(wave, warm_stream.raw())?;
         }
