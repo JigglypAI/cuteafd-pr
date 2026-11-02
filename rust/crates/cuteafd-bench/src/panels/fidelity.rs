@@ -32,7 +32,7 @@ pub fn score(client: &Client, info: &ServerInfo, tier: &str, path: &str, progres
         media_root: std::env::var_os("CUTEAFD_FIDELITY_MEDIA_ROOT").map(PathBuf::from),
         dataset: None, dataset_revision: None, dataset_config: None, dataset_cache: None,
         rows: None, dump_dir: Some(scratch.path().to_path_buf()), score_path: path.into(),
-        verify_rows: None, api_key: None };
+        verify_rows: Vec::new(), api_key: None, api_key_file: None };
     let mut model_record = client.model_record()?;
     model_record["max_context"] = json!(max_context);
     model_record["full_prefill_logits"] = json!(prefill_unavailable(info).is_none());
