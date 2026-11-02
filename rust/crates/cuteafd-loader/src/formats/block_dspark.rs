@@ -187,6 +187,9 @@ pub struct BlockDraftLayout {
 }
 
 impl BlockDraftLayout {
+    /// Cache row indices are signed 32-bit; capacity contains complete 64-row pages.
+    pub const MAX_POOL_TOKENS: usize = i32::MAX as usize / 64 * 64;
+
     #[allow(clippy::too_many_arguments)]
     pub fn read(snapshot: &Path, slots: usize, sequences: usize, context: usize, tokens: usize,
         sms: usize, representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
@@ -220,7 +223,7 @@ impl BlockDraftLayout {
     pub fn with_pool_tokens(&self, tokens: usize) -> Result<Self, DsparkConfigError> {
         let invalid = || DsparkConfigError::Unsupported("invalid dSpark pool extent".into());
         let rows = tokens.div_ceil(64).checked_mul(64).ok_or_else(invalid)?;
-        if tokens == 0 || rows > i32::MAX as usize { return Err(invalid()); }
+        if tokens == 0 || rows > Self::MAX_POOL_TOKENS { return Err(invalid()); }
         let mut next = self.clone();
         next.cache.target_tokens = tokens;
         next.cache.pages = rows / 64;
@@ -274,7 +277,7 @@ impl BlockDsparkConfig {
             || self.window.is_some_and(|window| window != context) { return Err(invalid()); }
         let pages = target_tokens.div_ceil(64);
         let rows = pages.checked_mul(64).ok_or_else(invalid)?;
-        if rows > i32::MAX as usize { return Err(invalid()); }
+        if rows > BlockDraftLayout::MAX_POOL_TOKENS { return Err(invalid()); }
         let plane = kv.plane_record_bytes(self.kv_heads, self.head_dim);
         let record_bytes = plane.checked_mul(2).ok_or_else(invalid)?;
         let full = self.window.is_none();
@@ -610,6 +613,8 @@ mod tests {
                     assert_eq!(layout.packing_sources[2].bytes, 2 * cfg.intermediate * cfg.hidden * 2);
                     assert!(layout.packing_sources.iter().all(|o| o.shape == [o.bytes]));
                 } else { assert!(layout.packing_sources.is_empty()); }
+                assert!(layout.with_pool_tokens(BlockDraftLayout::MAX_POOL_TOKENS).is_ok());
+                assert!(layout.with_pool_tokens(BlockDraftLayout::MAX_POOL_TOKENS + 1).is_err());
                 let larger = layout.with_pool_tokens(80 * 2048).unwrap();
                 for (a, b) in layout.owners.iter().zip(&larger.owners) {
                     if cfg.window.is_none() && (a.id.ends_with(".k_ring") || a.id.ends_with(".v_ring")) {

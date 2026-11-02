@@ -286,7 +286,11 @@ pub fn admit(
 
 impl Recipe for DenseFacts<'_> {
     fn prepare(&self, _request: &Request) -> Result<Contract, Refusal> {
-        let maximum = u32::MAX as u64 / PAGE_ROWS;
+        let token_capacity = match self.drafter {
+            Some(DenseDraft::Block(_)) => crate::formats::block_dspark::BlockDraftLayout::MAX_POOL_TOKENS as u64,
+            _ => u32::MAX as u64,
+        };
+        let maximum = token_capacity / PAGE_ROWS;
         let mut contract = Contract::fixed(PAGE_ROWS, maximum, 1, self.owner_templates(PAGE_ROWS)?);
         contract.variables = self
             .cfg

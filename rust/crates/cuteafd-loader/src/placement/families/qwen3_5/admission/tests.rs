@@ -328,6 +328,34 @@ fn block_loading_heap_allowance_matches_curves_at_zero_and_nonzero_bytes() {
 }
 
 #[test]
+fn block_drafter_signed_row_ceiling_bounds_contract_and_refuses_larger_exact_pins() {
+    let (cfg, weights, buffers) = fixture();
+    let no_draft = facts(&cfg, &weights, &buffers).prepare(&request()).unwrap();
+    assert_eq!(no_draft.maximum_pages, u32::MAX as u64 / PAGE_ROWS);
+    let capacity = BlockDraftLayout::MAX_POOL_TOKENS as u64;
+    for fp8 in [false, true] {
+        let layout = block_layout(fp8);
+        let mut recipe = facts(&cfg, &weights, &buffers);
+        recipe.drafter = Some(DenseDraft::Block(&layout));
+        let contract = recipe.prepare(&request()).unwrap();
+        assert_eq!(contract.maximum_pages * PAGE_ROWS, capacity);
+        assert_eq!(contract.facts(&vec![0; contract.variables.len()], contract.maximum_pages).unwrap(),
+            recipe.owner_templates(capacity).unwrap());
+        let mut generous = budgets();
+        for budget in &mut generous {
+            budget.physical_bytes = 1 << 60;
+            budget.logical_bytes = 1 << 60;
+        }
+        let plan = admit(Request { pool: Pin::Exact(capacity), ..request() },
+            generous.clone(), recipe).unwrap();
+        assert_eq!(plan.pool_tokens, capacity);
+        let refusal = admit(Request { pool: Pin::Exact(capacity + PAGE_ROWS), ..request() },
+            generous, recipe).unwrap_err();
+        assert!(matches!(refusal, Refusal::InvalidPin("pool exceeds compiled extent")));
+    }
+}
+
+#[test]
 fn native_scratch_prefix_and_pinned_staging_are_individual_owners() {
     let (cfg, weights, buffers) = fixture();
     let plan = admit(request(), budgets(), facts(&cfg, &weights, &buffers)).unwrap();
