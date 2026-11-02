@@ -18,7 +18,8 @@ from pathlib import Path
 
 from v41_spark_tp3_launch_geometry import launch_geometry
 from expert_grouping import native_group_macros, slice_group_rows
-from mxfp4_layouts import stored_width, native_slice_width, native_fc1_k_splits, native_prefill, native_prefill_scratch
+from mxfp4_layouts import (stored_width, native_slice_width, native_fc1_k_splits,
+                          native_prefill, native_prefill_scratch, assert_native_scratch_variant)
 from spark_packages import native_spark_artifacts, native_width_role
 
 os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
@@ -451,6 +452,9 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
                    if recorded_geometry is not None else {}),
             )
         )
+        if standard_names and not compact and role not in ("coordinator", "dspark_tp2"):
+            assert_native_scratch_variant(manifest["variants"][-1], hidden, intermediate,
+                experts, topk, props.major * 10 + props.minor, role, family == "v41")
     (output / "v41_expert_variants.h").write_text(
         "\n".join(
             [

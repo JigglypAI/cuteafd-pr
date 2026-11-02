@@ -354,6 +354,48 @@ def test_native_prefill_inventory_is_hardware_and_capacity_qualified(hidden, sm,
     assert not LAYOUTS.native_prefill(7168, 608, 121, 4096, 384, 6)
 
 
+@pytest.mark.parametrize("hidden,experts,width,role,sm,coded,sizes", [
+    (4096, 256, 2048, "rtx_backbone", 120, False, [123936, 1905552, 9507216, 30411792, 121631760, 486511632]),
+    (4096, 256, 1024, "rtx_tp2", 120, False, [117024, 1794960, 8954256, 28642320, 114553872, 458200080]),
+    (4096, 256, 512, "spark", 121, False, [113568, 1739664, 8677776, 27757584, 111014928, 433330960]),
+    (7168, 384, 768, "spark", 121, False, [194656, 2998672, 14962576, 9836064, 39321120, 764028688]),
+])
+def test_native_scratch_matches_independent_exported_manifest_census(
+        hidden, experts, width, role, sm, coded, sizes):
+    # Recorded from CPU-only real exports; do not derive expected sizes from policy.
+    for capacity, size in zip((1, 16, 80, 256, 1024, 4096), sizes, strict=True):
+        assert LAYOUTS.native_scratch_bytes(hidden, width, experts, 6, capacity, sm, role, coded) == size
+        stream = LAYOUTS.native_prefill(hidden, width, sm, capacity, experts, 6)
+        atomic = hidden == 7168 and capacity >= 256 and not stream
+        variant = dict(capacity_rows=capacity, core_scratch_nbytes=size,
+                       output_kind="fp32_tokens" if atomic else "fp32_routes")
+        LAYOUTS.assert_native_scratch_variant(variant, hidden, width, experts, 6, sm, role, coded)
+        with pytest.raises(ValueError, match="differs from planner census"):
+            LAYOUTS.assert_native_scratch_variant({**variant, "core_scratch_nbytes": size - 1},
+                hidden, width, experts, 6, sm, role, coded)
+        with pytest.raises(ValueError, match="differs from planner census"):
+            LAYOUTS.assert_native_scratch_variant({**variant, "output_kind": "wrong"},
+                hidden, width, experts, 6, sm, role, coded)
+
+
+def test_native_aot_policy_dependencies_include_shared_prefill_contract():
+    source = (ROOT / "native/CMakeLists.txt").read_text()
+    dependency = source[source.index("set(CUTEAFD_MXFP4_POLICY_INPUTS"):]
+    dependency = dependency[:dependency.index("\n  )")]
+    for path in ("python/tools/lib/mxfp4_layouts.py", "scripts/build/mxfp4-layouts.json",
+                 "rust/crates/cuteafd-core/src/serving_capacity.rs"):
+        assert path in dependency
+    assert "CUTEAFD_SPARKINFER_EXPORT_INPUTS ${CUTEAFD_MXFP4_POLICY_INPUTS}" in source
+    assert "CMAKE_CONFIGURE_DEPENDS ${CUTEAFD_MXFP4_POLICY_INPUTS}" in source
+    for relative in ("shared/expert_families.cmake", "shared/mxfp4_widths.cmake",
+                     "families/deepseek_v41/v41_experts.cmake",
+                     "families/deepseek_v41/v41_spark_tp_experts.cmake",
+                     "families/deepseek_v41/v41_local_experts.cmake",
+                     "families/deepseek_v41/v41_tp2_experts.cmake"):
+        cmake = (ROOT / "native/cmake" / relative).read_text()
+        assert "${CUTEAFD_SPARKINFER_EXPORT_INPUTS}" in cmake[cmake.index("DEPENDS"):]
+
+
 def test_native_prefill_work_boundary_and_default_admitted_rows():
     assert LAYOUTS.default_prefill_unit_rows() == 2752
     for rows, width, experts in [(4096, 384, 384), (3072, 512, 384), (2048, 512, 256)]:

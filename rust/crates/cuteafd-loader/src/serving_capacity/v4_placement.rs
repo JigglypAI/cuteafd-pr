@@ -41,27 +41,10 @@ pub fn deepseek_v4_native_workspace(hidden: u64, intermediate: u64, experts: u64
     let mut scratch = 0;
     for capacity in capacities.into_iter().filter(|&n| n <= maximum)
         .chain(capacities.into_iter().find(|&n| n >= maximum)) {
-        let stream = cuteafd_core::mxfp4_layouts::native_prefill(hidden as usize,
-            intermediate as usize, 120, capacity as u32, experts as usize, topk as usize);
-        let bytes = if stream {
-            cuteafd_core::mxfp4_layouts::native_prefill_scratch_bytes(hidden as usize,
-                intermediate as usize, experts as usize, topk as usize, capacity as u32)
-                .ok_or(CacheGeometryError::Overflow("V4 native STREAM scratch"))?
-        } else {
-            let routes = product("V4 expert routes", &[capacity, topk])?;
-            let atomic = capacity >= 256;
-            let planes = intermediate.div_ceil(128);
-            // FC1 stores FP8 words and one u32 scale word per K32 activation block.
-            let partial = if atomic { 4 } else { product("V4 ordered partials", &[4, planes, routes, 128 / 4 + 128 / 32])? };
-            let output = product("V4 routed output", &[4, if atomic { capacity } else { routes }, hidden])?;
-            let slots = [4, product("V4 packed routes", &[4, experts, routes])?, experts * 4, experts * 8,
-                routes * 19 * 4, routes * 4, routes * 4, partial, output, experts * 4, experts * 4];
-            let mut bytes = 0_u64;
-            for slot in slots {
-                bytes = sum("V4 aligned expert scratch", &[bytes.div_ceil(16) * 16, slot])?;
-            }
-            bytes
-        };
+        let bytes = cuteafd_core::mxfp4_layouts::native_scratch_bytes_for_sm(
+            hidden as usize, experts as usize, topk as usize, intermediate as usize,
+            2, capacity as u32, false, 120)
+            .ok_or(CacheGeometryError::Overflow("V4 native scratch"))?;
         scratch = scratch.max(bytes);
     }
     sum("V4 native expert workspace", &[scratch, product("V4 local output/routes", &[maximum, hidden * 2 + topk * 8])?])
@@ -130,22 +113,21 @@ mod tp2_tests {
     use super::*;
     #[test]
     fn native_tp2_workspace_matches_export_slots() {
-        // SM120 retains atomic slices: realistic STREAM screens lost.
-        for (h, i, e, k, expected) in [(4096, 2048, 256, 6, 161453088), (7168, 3072, 384, 6, 274701856)] {
+        // SM120 retains ordered Flash and atomic Pro slices after STREAM removal.
+        for (h, i, e, k, expected) in [(4096, 2048, 256, 6, 525308944), (7168, 3072, 384, 6, 274701856)] {
             assert_eq!(deepseek_v4_tp2_native_workspace(h, i, e, k, 4096).unwrap(), expected);
         }
         assert!(deepseek_v4_tp2_native_workspace(4096, 2048, 256, 6, 4097).is_err());
     }
     #[test]
     fn ordered_workspace_uses_compact_activation_storage() {
-        // At the small capacities all native roles have ordered route outputs.
-        // Compare TP1/TP2 planner arenas with the shared Spark exporter census.
+        // Compare TP1/TP2 arenas at every capacity with the hardware-specific census.
         for (h, i, experts) in [(4096, 2048, 256), (7168, 3072, 384)] {
-            for capacity in [1, 16, 80] {
+            for capacity in [1, 16, 80, 256, 1024, 4096] {
                 for tp in [1, 2] {
-                    let scratch = cuteafd_core::mxfp4_layouts::native_scratch_bytes(
+                    let scratch = cuteafd_core::mxfp4_layouts::native_scratch_bytes_for_sm(
                         h as usize, experts as usize, 6, (i / tp) as usize,
-                        if tp == 1 { 0 } else { 2 }, capacity, false).unwrap();
+                        if tp == 1 { 2 } else { 3 }, capacity, false, 120).unwrap();
                     let rows = u64::from(capacity);
                     let (actual, tail) = if tp == 1 {
                         (deepseek_v4_native_workspace(h, i, experts, 6, rows).unwrap(), rows * (h * 2 + 48))
@@ -180,8 +162,9 @@ mod tp2_tests {
                     let pairs = 4096 * k;
                     let mut arena = 0_u64;
                     for plane in [4, e * pairs * 4, e * 4, e * 8,
-                        pairs * 19 * 4, pairs * 4, pairs * 4, 4,
-                        4096 * h * 4, e * 4, e * 4] {
+                        pairs * 19 * 4, pairs * 4, pairs * 4,
+                        (shape.intermediate as u64 / 2).div_ceil(128) * pairs * (128 + 128 / 8),
+                        pairs * h * 4, e * 4, e * 4] {
                         arena = arena.div_ceil(16) * 16 + plane;
                     }
                     arena + 4096 * h * 4

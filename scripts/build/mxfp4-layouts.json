@@ -1,6 +1,7 @@
 {
   "schema": 1,
   "stream_prefill": [{"sm": 120, "min_work": null}, {"sm": 121, "min_work": 24576}],
+  "atomic_slices": [{"hidden": 7168, "min_capacity": 256}],
   "storage_holds": [],
   "native_slices": [
     {

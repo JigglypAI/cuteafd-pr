@@ -12,7 +12,9 @@ struct Ownership { intermediate: usize, world: usize, unit: usize }
 #[derive(Deserialize)]
 struct StreamPrefill { sm: u32, min_work: Option<u64> }
 #[derive(Deserialize)]
-struct Layouts { schema: u32, stream_prefill: Vec<StreamPrefill>, storage_holds: Vec<StorageHold>, native_slices: Vec<SliceRecipe>,
+struct AtomicSlices { hidden: usize, min_capacity: u32 }
+#[derive(Deserialize)]
+struct Layouts { schema: u32, stream_prefill: Vec<StreamPrefill>, atomic_slices: Vec<AtomicSlices>, storage_holds: Vec<StorageHold>, native_slices: Vec<SliceRecipe>,
     ownership: Vec<Ownership>, generic_storage_holds: Vec<StorageHold> }
 
 fn validate(data: &Layouts) -> Result<(), &'static str> {
@@ -122,23 +124,36 @@ pub fn native_prefill_scratch_bytes(hidden: usize, width: usize, experts: usize,
             .checked_div(16)?.checked_mul(16)?.checked_add(size))
 }
 
+/// Standard equal-role slice exports with atomic token output; adjacent widths
+/// and all other geometries retain ordered routes. STREAM always stays ordered.
+pub fn native_atomic_slices(hidden: usize, role: u32, capacity: u32) -> bool {
+    matches!(role, 1 | 2 | 3 | 5 | 6 | 7 | 8) && layouts().atomic_slices.iter()
+        .any(|row| row.hidden == hidden && capacity >= row.min_capacity)
+}
+
 /// `export_b12x_slices_aot.py`'s 16-byte-aligned scratch planes, excluding
 /// shared owner I/O. Qualified prefill uses original-route STREAM planes;
 /// unqualified geometries retain their existing native slice recipe.
 pub fn native_scratch_bytes(hidden: usize, experts: usize, topk: usize,
     width: usize, role: u32, capacity: u32, coded: bool) -> Option<u64> {
+    native_scratch_bytes_for_sm(hidden, experts, topk, width, role, capacity, coded, 121)
+}
+
+/// Exact static export census for either native hardware class, excluding I/O.
+pub fn native_scratch_bytes_for_sm(hidden: usize, experts: usize, topk: usize,
+    width: usize, role: u32, capacity: u32, coded: bool, sm: u32) -> Option<u64> {
     stored_width(hidden, width)?;
     if experts == 0 || topk == 0 || ![1, 16, 80, 256, 1024, 4096].contains(&capacity) { return None; }
-    if native_prefill(hidden, width, 121, capacity, experts, topk) {
+    if native_prefill(hidden, width, sm, capacity, experts, topk) {
         return native_prefill_scratch_bytes(hidden, width, experts, topk, capacity);
     }
     let matching = if coded && (crate::tp_units::native_role_width(role).is_none() || width % 192 == 0) {
         192
     } else { 128 };
-    let slice = native_slice_width(hidden, width, 121, capacity, matching) as u64;
+    let slice = if sm == 121 { native_slice_width(hidden, width, sm, capacity, matching) } else { matching } as u64;
+    let atomic = native_atomic_slices(hidden, role, capacity);
     let (hidden, experts, routes) = (hidden as u64, experts as u64,
         u64::from(capacity).checked_mul(topk as u64)?);
-    let atomic = !coded && crate::tp_units::native_role_width(role).is_none() && capacity >= 256;
     // FC1 activation storage is independent of the weights' scale encoding.
     let partial_cols = slice / 4 + slice / 32;
     let partial = if atomic { 4 } else {
@@ -187,7 +202,7 @@ mod tests {
         for (hidden, experts, topk, width, role, coded, tiles) in [
             (5120, 384, 6, 576, 1, true, [128, 128, 128, 192, 192, 192]),
             (4096, 256, 6, 352, 65888, false, [32, 32, 32, 128, 128, 128]),
-            (5120, 384, 6, 288, 8, true, [128, 128, 128, 64, 64, 64]),
+            (5120, 384, 6, 288, 8, true, [128, 128, 128, 192, 192, 192]),
             (5120, 384, 6, 512, 66048, true, [128; 6]),
             (5120, 384, 6, 448, 65984, true, [128; 6]),
             (5120, 384, 6, 352, 65888, true, [128; 6]),
@@ -196,7 +211,7 @@ mod tests {
             (7168, 384, 6, 608, 66144, false, [128; 6]),
         ] {
             for (capacity, tile) in [1, 16, 80, 256, 1024, 4096].into_iter().zip(tiles) {
-                let atomic = !coded && role < 65536 && capacity >= 256;
+                let atomic = hidden == 7168 && role < 65536 && capacity >= 256;
                 let expected = if native_prefill(hidden as usize, width as usize, 121, capacity as u32, experts as usize, topk as usize) {
                     native_prefill_scratch_bytes(hidden as usize, width as usize, experts as usize,
                         topk as usize, capacity as u32).unwrap()
