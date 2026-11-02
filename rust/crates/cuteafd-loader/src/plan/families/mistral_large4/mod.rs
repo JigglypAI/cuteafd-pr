@@ -299,7 +299,7 @@ impl Model {
 fn spec(cfg: &Ml4Config, checkpoint: &Checkpoint) -> Result<ModelSpec> {
     let params_path = checkpoint.snapshot.join("params.json");
     let speculator = if params_path.is_file() {
-        let params = crate::read_json_file(&params_path)?;
+        let params: serde_json::Value = crate::read_json_file(&params_path)?;
         if params.get("mtp").and_then(|mtp| mtp.get("dspark")).is_some() {
             let draft = crate::families::mistral_large4::dspark::Ml4DsparkConfig::from_params(&params, cfg.layers)?;
             Some(SpeculatorSpec::BundledDspark { layers: draft.layers })
