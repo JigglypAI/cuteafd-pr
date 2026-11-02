@@ -1351,7 +1351,7 @@ mod tests {
             assert_eq!(layout.allocations, [32 * 512 * 192, 32 * 512 * 3 * 4,
                 32 * 256 * 512, 32 * 256 * 8 * 4]);
             assert_eq!(plan.resident_bytes, 7_798_784);
-            assert_eq!(plan.resident_bytes, layout.allocations.iter().sum());
+            assert_eq!(plan.resident_bytes, layout.allocations.iter().sum::<usize>());
             assert!(plan.tensors[0].components.is_empty());
             assert_eq!(resident_native(&[record.clone()], 2, rank, 1, 64, 192, 256, 512)
                 .unwrap().iter().map(|v| v.2 as usize).sum::<usize>(), plan.resident_bytes);
