@@ -1544,7 +1544,7 @@ mod tests {
         let catalog = cuteafd_loader::read_expert_catalog(fixture.path())?;
         for (gpus, sparks, pool, native_mtp) in [
             (1, 3, None, true), (1, 3, None, false),
-            (1, 3, Some(262_144), false), (2, 6, None, false),
+            (1, 3, Some(262_144), false), (2, 6, None, true),
         ] {
             let report = testing::plan(fixture.path(), &PlanOptions {
                 placement: ExpertPlacement::from_spark_ranks(sparks),
@@ -1552,7 +1552,8 @@ mod tests {
                     else { plan::spec::DraftOwnership::None }),
                 layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                     rtx_bytes: vec![96 << 30; gpus], workspace_manifest: Some(manifest.clone()),
-                    pool_tokens: pool, ..Default::default() }), ..Default::default()
+                    pool_tokens: pool, context_tokens: pool.unwrap_or(1 << 20),
+                    ..Default::default() }), ..Default::default()
             })?;
             assert!(report.wip_launchable(), "{:?}", report.hints);
             let memory = report.memory_layout.as_ref().context("Step fixture memory layout")?;
