@@ -1423,17 +1423,23 @@ mod tests {
                     if let OwnerEvent::Allocated { receipt, .. } = &mut wrong[0] { receipt.allocation.bytes += 1; }
                     assert!(planner::reconcile_events(&plan, Phase::Ready, &wrong, &[]).is_err());
                     assert!(planner::reconcile_events(&plan, Phase::Ready, &events[1..], &[]).is_err());
-                    if let Some(index) = events.iter().position(|e| matches!(e,
-                        OwnerEvent::Allocated { receipt, .. } if receipt.allocation.id.ends_with(".source"))) {
-                        let mut missing = events.clone();
-                        missing.drain(index..index + 2);
+                    if let Some(source) = events.iter().find_map(|event| match event {
+                        OwnerEvent::Allocated { receipt, .. } if receipt.allocation.id.ends_with(".source") =>
+                            Some(receipt.allocation.id.clone()),
+                        _ => None,
+                    }) {
+                        let missing = events.iter().filter(|event| match event {
+                            OwnerEvent::Allocated { receipt, .. } | OwnerEvent::Freed { receipt, .. } =>
+                                receipt.allocation.id != source,
+                        }).cloned().collect::<Vec<_>>();
+                        assert_eq!(events.len() - missing.len(), 2);
                         assert!(planner::reconcile_events(&plan, Phase::Ready, &missing, &[]).is_err());
                     }
                     // SAFETY: the fixture has no queued consumers after eager preparation.
                     unsafe { library.cuda_stream_synchronize(std::ptr::null_mut())?; }
                     drop(audit);
                     drop(draft);
-                    library.release_ordered_h2d_staging()?;
+                    fixture.finish_ordered_uploads(&library)?;
                 }
             }
         }
