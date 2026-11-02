@@ -165,8 +165,9 @@ impl<'a> DenseEngine<'a> {
             "dense physical baseline cannot omit pre-existing managed owners");
         let host = cuteafd_ffi::host_memory()?;
         let record_bytes = kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
+        let draft_page_bytes = drafter.map(DenseDraft::page_bytes).transpose()?.unwrap_or(0);
         let serving = serving.map(|request| placement::families::qwen3_5::ServingFacts::new(
-            &cfg, &buffers, record_bytes, drafter.map(DenseDraft::page_bytes).transpose()?.unwrap_or(0), request, host.0)).transpose()?;
+            &cfg, &buffers, record_bytes, draft_page_bytes, request, host.0)).transpose()?;
         let budgets = placement::families::qwen3_5::sampled_budgets(free as u64, total as u64,
             cuteafd_ffi::coordinator_gpu_budget().map(|budget| budget.0), host)?;
         let request = planner::Request { context: cfg.max_context as u64,
