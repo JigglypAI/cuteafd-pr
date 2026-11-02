@@ -238,17 +238,21 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
     out
 }
 
+fn peer_router_names(cfg: &GlmDsaConfig, layer: usize) -> impl Iterator<Item = (&'static str, String)> + '_ {
+    [("gate", Op::Router), ("gate.bias", Op::RouterBias)].into_iter()
+        .filter_map(move |(operand, role)| cfg.weight(layer, role).map(|name| (operand, name)))
+}
+
 impl<'a> GlmLoader<'a> {
     /// Replicate only admitted local routers; their bytes are charged to the TP2 expert arena.
-    pub(crate) fn peer_routers(&self, layers: &mut [GlmLayer<'a>], range: std::ops::Range<usize>) -> Result<()> {
+    pub(crate) fn peer_routers(&self, cfg: &GlmDsaConfig, layers: &mut [GlmLayer<'a>], range: std::ops::Range<usize>) -> Result<()> {
         let peer = *self.peers.first().context("TP2 router replica needs peer")?;
         let native = (self.catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8)
             .then(|| cuteafd_loader::plan::exlr8::dense::DenseRecord::inventory(self.catalog.snapshot())).transpose()?;
         for index in range {
-            for (operand, suffix) in [("gate", "weight"), ("gate.bias", "e_score_correction_bias")] {
+            for (operand, name) in peer_router_names(cfg, index) {
                 let allocation = crate::shared::peer_split::on_device(self.library, peer.device, || {
                     let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 router replica");
-                    let name = format!("model.layers.{index}.mlp.gate.{suffix}");
                     if let Some(records) = &native {
                         let record = records.iter().find(|record| record.tensor == name)
                             .with_context(|| format!("EXLR8 local router missing {name}"))?;

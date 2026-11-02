@@ -1246,7 +1246,7 @@ impl Opened {
         }
         if let Some((device, stream)) = peer_stream {
             let mut peer_layers = shares.pop().context("head-split shares")?;
-            if let Some(range) = &tp2_range { loader.peer_routers(&mut peer_layers, range.clone())?; }
+            if let Some(range) = &tp2_range { loader.peer_routers(&self.cfg, &mut peer_layers, range.clone())?; }
             engine.attach_peer(device, stream, peer_layers)?;
         }
         if owners.is_some() { engine.bind_layer_execution(&placement)?; }
