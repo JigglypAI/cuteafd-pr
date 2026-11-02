@@ -179,6 +179,80 @@ def test_64_window_recipe_is_deterministic_and_hashed(fake_server):
         builder.validate_set(changed)
 
 
+@pytest.mark.parametrize("source", ["file", "env", "explicit"])
+@pytest.mark.parametrize("mode", ["success", "http", "probe", "transport"])
+def test_probe_secret_sources_reach_headers_without_echo(tmp_path, monkeypatch, capsys, source, mode):
+    import io
+    import traceback
+    import urllib.error
+
+    secret = "synthetic-private-probe-token"
+    monkeypatch.setenv("CUTEAFD_API_KEY", secret if source == "env" else "unused-env-token")
+    if source == "file":
+        key = tmp_path / "credential"
+        key.write_text(secret + "\n")
+        token = builder.probe_token(token_file=key)
+    else:
+        token = secret if source == "explicit" else None
+    client = builder.ProbeClient("http://127.0.0.1:1", token, 1)
+    seen = []
+
+    def respond(request, **_):
+        seen.append(dict(request.header_items()))
+        assert secret.encode() not in request.data
+        if mode == "http":
+            raise urllib.error.HTTPError(request.full_url, 401, secret, {}, io.BytesIO(secret.encode()))
+        if mode == "transport":
+            raise urllib.error.URLError(secret)
+        record = {"engine": "test", "cold": True, "no_speculation": True,
+                  "prompt_ids": [1], "generated": [2]}
+        if mode == "probe":
+            record["error"] = secret
+        return io.BytesIO(json.dumps({"probe": record}).encode())
+
+    monkeypatch.setattr(builder.urllib.request, "urlopen", respond)
+    if mode == "success":
+        assert client({"model": "test"})["probe"]["generated"] == [2]
+    else:
+        with pytest.raises(ValueError) as error:
+            client({"model": "test"})
+        assert secret not in str(error.value)
+        assert secret not in "".join(traceback.format_exception(error.value))
+    assert seen[0]["X-cuteafd-bench"] == secret
+    assert seen[0]["Authorization"] == "Bearer " + secret
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err
+
+
+def test_probe_token_file_is_required_private_source_not_env_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("CUTEAFD_API_KEY", "synthetic-env-token")
+    key = tmp_path / "credential"
+    with pytest.raises(ValueError, match="cannot read bench token file"):
+        builder.probe_token(token_file=key)
+    for value in ["", "\n", "bad\nsecret", "bad\rsecret", "bad secret", "bad\x7fsecret"]:
+        key.write_text(value)
+        with pytest.raises(ValueError) as error:
+            builder.probe_token(token_file=key)
+        if value:
+            assert value not in str(error.value)
+    key.write_text("synthetic-file-token\n")
+    assert builder.probe_token(token_file=key) == "synthetic-file-token"
+    assert builder.probe_token("synthetic-explicit") == "synthetic-explicit"
+    with pytest.raises(ValueError, match="choose one"):
+        builder.probe_token("synthetic-explicit", key)
+
+
+def test_probe_cli_token_flags_are_mutually_exclusive(capsys):
+    with pytest.raises(SystemExit) as error:
+        builder.main(["--family", "qwen4", "--version", "test", "--model", "test",
+                      "--checkpoint", "test", "--tokenizer", "unused", "--arm-manifest", "unused",
+                      "--bench-token", "synthetic-secret", "--bench-token-file", "unused"])
+    assert error.value.code == 2
+    text = capsys.readouterr().err
+    assert "not allowed with argument" in text
+    assert "synthetic-secret" not in text
+
+
 def test_text_recipe_requires_explicit_sealed_anchor(capsys):
     with pytest.raises(SystemExit) as error:
         builder.main(["--family", "qwen4", "--version", "test", "--model", "test",
