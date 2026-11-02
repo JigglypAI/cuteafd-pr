@@ -221,9 +221,15 @@ impl Panel for ContextLoad {
             + rates.seconds(1200.0, 2.0)
     }
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
+        self.run_with_output(ctx, 256)
+    }
+}
+
+impl ContextLoad {
+    pub(crate) fn run_with_output(&self, ctx: &Ctx<'_>, output: u64) -> Result<Value> {
         let options = ctx.context_load;
         options.validate().map_err(anyhow::Error::msg)?;
-        let output = 256.min(ctx.max_output);
+        let output = output.min(ctx.max_output);
         let suffix = 128 + options.suffix_tokens;
         let room = output + suffix + 256;
         let capacity = ctx
@@ -392,6 +398,8 @@ impl Panel for ContextLoad {
                 point["aggregate_tok_s"] = json!(aggregate(&ok));
                 point["per_request_tok_s"] = json!(median(&mut per));
                 point["ttft_s"] = json!(median(&mut ttft));
+                let mut total: Vec<_> = ok.iter().map(|r| r.chat.timing.total_s).collect();
+                point["end_to_end_s"] = json!(median(&mut total));
                 point["cached_tokens"] = json!(median(&mut cached));
                 point["prompt_tokens"] = json!(median(&mut prompts));
                 let mut uncached: Vec<_> = ok.iter().map(|r|
