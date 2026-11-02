@@ -1639,7 +1639,7 @@ def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: 
     return _family_launch_result(tmp_path, family_config, model, keys).stderr
 
 
-@pytest.mark.parametrize("value", [None, "auto", "0", "5", "50%", "all", "max"])
+@pytest.mark.parametrize("value", [None, "auto", "0", "5", "all"])
 def test_deepseek_v4_honors_explicit_local_expert_limit(tmp_path, value):
     keys = "" if value is None else f"RTX_EXPERT_LAYERS={value}\n"
     result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4", "num_hidden_layers": 61}, "test/dsv4", keys)
@@ -1647,15 +1647,14 @@ def test_deepseek_v4_honors_explicit_local_expert_limit(tmp_path, value):
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-dsv4" in line)
     if value is None:
         assert "--local-expert-layers" not in launch and "--rtx-expert-layers" not in launch
-    elif value not in ("auto", "max"):
-        value = {"all": "61", "50%": "31"}.get(value, value)
+    elif value in ("auto", "all"):
+        assert f"--rtx-expert-layers {value}" in launch
+    else:
         # Whole layer counts keep the flag older images accept.
         assert f"--local-expert-layers {value}" in launch
-    else:
-        assert f"--rtx-expert-layers {value}" in launch
 
 
-@pytest.mark.parametrize("value", [None, "auto", "0", "5", "50%", "all", "max"])
+@pytest.mark.parametrize("value", [None, "auto", "0", "5", "all"])
 def test_glm53_honors_explicit_tp2_expert_limit(tmp_path, value):
     keys = "" if value is None else f"RTX_EXPERT_LAYERS={value}\n"
     result = _family_launch_result(tmp_path, {
@@ -1667,8 +1666,7 @@ def test_glm53_honors_explicit_tp2_expert_limit(tmp_path, value):
     if value is None:
         assert "--rtx-expert-layers" not in launch
     else:
-        expected = {"all": "6", "50%": "3"}.get(value, value)
-        assert f"--rtx-expert-layers {expected}" in launch
+        assert f"--rtx-expert-layers {value}" in launch
 
 
 @pytest.mark.parametrize("explicit", [False, True])
@@ -1781,7 +1779,7 @@ def test_glm53_all_local_two_rtx_launch_has_no_spark_peers(tmp_path):
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glm " in line)
     assert "--split-device 1" in launch
-    assert "--rtx-expert-layers 1" in launch
+    assert "--rtx-expert-layers all" in launch
     assert "--peers" not in launch
     assert "cuteafd expertd-native" not in result.stderr
     assert "--local-experts" not in launch
@@ -1789,7 +1787,7 @@ def test_glm53_all_local_two_rtx_launch_has_no_spark_peers(tmp_path):
     assert "--rdma-endpoints" not in result.stderr
 
 
-@pytest.mark.parametrize("value", [None, "auto", "0", "2", "50%", "all", "max"])
+@pytest.mark.parametrize("value", [None, "auto", "0", "2", "all"])
 def test_glm_flash_forwards_explicit_rtx_expert_onboarding(tmp_path, value):
     keys = "SPECULATOR=off\n"
     if value is not None:
@@ -1804,11 +1802,10 @@ def test_glm_flash_forwards_explicit_rtx_expert_onboarding(tmp_path, value):
     if value is None:
         assert "--rtx-expert-layers" not in launch
     else:
-        expected = {"all": "2", "50%": "1"}.get(value, value)
-        assert f"--rtx-expert-layers {expected}" in launch
+        assert f"--rtx-expert-layers {value}" in launch
 
 
-@pytest.mark.parametrize("value", ["-1", "101%", "half", "5x"])
+@pytest.mark.parametrize("value", ["-1", "max", "50%", "101%", "half", "5x"])
 def test_glm53_rejects_invalid_tp2_expert_limit_before_launch(tmp_path, value):
     result = _family_launch_result(tmp_path, {
         "model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3,
@@ -1847,7 +1844,7 @@ def test_deepseek_v4_rejects_retired_peer_expert_ranges(tmp_path, value):
         assert "--peer-expert-ranges" not in launch
 
 
-@pytest.mark.parametrize("value", ["-1", "101%", "half", "5x"])
+@pytest.mark.parametrize("value", ["-1", "max", "50%", "101%", "half", "5x"])
 def test_deepseek_v4_rejects_invalid_local_limit_before_launch(tmp_path, value):
     result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/dsv4",
                                   f"RTX_EXPERT_LAYERS={value}\n")
@@ -2925,14 +2922,13 @@ def test_qwen_explicit_spark_free_dual_passes_both_owners(tmp_path: Path, keys: 
 
 
 
-@pytest.mark.parametrize("onboard", ["auto", "all", "max", "100%"])
+@pytest.mark.parametrize("onboard", ["auto", "all", "0"])
 def test_qwen_dual_forwards_shared_onboard_policy(tmp_path: Path, onboard: str) -> None:
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
                                   f"RTX_GPUS=2\nSPARK_COUNT=0\nEXPERT_BACKEND=local\nSPECULATOR=off\nRTX_EXPERT_LAYERS={onboard}\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
-    expected = {"all": "2", "100%": "2"}.get(onboard, onboard)
-    assert f"--rtx-expert-layers {expected}" in launch
+    assert f"--rtx-expert-layers {onboard}" in launch
     assert "CUTEAFD_ATTENTION_PLACEMENT=layers" in launch
 
 
@@ -3437,7 +3433,7 @@ def test_mimo_media_plan_keeps_ingress_onboarding_and_graph_contract(tmp_path, i
     plan = {"placement_supported": True, "fits": True, "spark_ranks": 2,
             "encoder_plan_hash": "ab" * 32,
             "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
-    keys = (f"EXPERT_INPUT={ingress}\nRTX_EXPERT_LAYERS=25%\nSPARK_COUNT=2\n"
+    keys = (f"EXPERT_INPUT={ingress}\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\n"
             "VISION=rtx\nAUDIO=off\nRTX_GPUS=1\nSPECULATOR=off\n"
             "MAX_CONTEXT_TOKENS=262144\nDECODE_GRAPHS=on\nFULL_PREFILL_LOGITS=on\n")
     result = _family_launch_result(tmp_path, config, "test/mimo", keys, encoder_plan=plan)
@@ -4083,8 +4079,8 @@ def test_v41_rejects_noncanonical_speculator(tmp_path: Path, keys: str, error: s
     assert "docker run -d" not in result.stderr
 
 
-@pytest.mark.parametrize("value,expected", [("48", "48"), ("all", "60"), ("50%", "30")])
-def test_expert_onboarding_uses_checkpoint_count_above_forty(tmp_path, value, expected):
+@pytest.mark.parametrize("value,expected", [("48", "48"), ("60", "60"), ("all", "all")])
+def test_expert_onboarding_forwards_exact_pins_above_forty(tmp_path, value, expected):
     result = _family_launch_result(tmp_path, {
         "model_type": "glm_moe_dsa", "num_hidden_layers": 63, "first_k_dense_replace": 3,
     }, "test/glm", f"RTX_EXPERT_LAYERS={value}\nSPECULATOR=off\n")

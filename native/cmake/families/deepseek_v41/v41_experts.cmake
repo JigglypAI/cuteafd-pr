@@ -24,7 +24,7 @@ if(NOT CUTEAFD_V41_EXPERT_SLICE_WIDTH STREQUAL "")
   endif()
   set(CUTEAFD_V41_EXPERT_EXPORT_SCRIPT export_b12x_slices_aot.py)
   set(CUTEAFD_V41_EXPERT_EXPORT_ARGS --width "${CUTEAFD_V41_EXPERT_SLICE_WIDTH}"
-    --rows "1,16,80,256,1024,4096" --role "${CUTEAFD_V41_EXPERT_ROLE}")
+    --rows "${CUTEAFD_V41_TARGET_ROWS_ARG}" --role "${CUTEAFD_V41_EXPERT_ROLE}")
 endif()
 if(NOT CUTEAFD_V41_EXPERT_ATOMIC_MIN_CAPACITY STREQUAL "")
   if(NOT CUTEAFD_V41_EXPERT_ROLE STREQUAL "spark" OR
@@ -44,10 +44,10 @@ if(CUTEAFD_V41_SPARK_COMPACT_EXPERIMENT)
     list(APPEND CUTEAFD_V41_EXPERT_EXPORT_ARGS --compact-max-capacity 16)
   endif()
 endif()
-set(CUTEAFD_V41_EXPERT_ROWS 1 16 80 256 1024 4096)
+set(CUTEAFD_V41_EXPERT_ROWS ${CUTEAFD_V41_TARGET_ROWS})
 if(CUTEAFD_V41_EXPERT_ROLE STREQUAL "coordinator" AND CUTEAFD_V41_EXPERT_SLICE_WIDTH STREQUAL "")
-  # Eight independent-lane requests produce at most forty draft rows.
-  list(INSERT CUTEAFD_V41_EXPERT_ROWS 2 40)
+  # Draft flattened rows have independent legacy and wide covers.
+  set(CUTEAFD_V41_EXPERT_ROWS ${CUTEAFD_V41_DRAFT_ROWS})
   list(JOIN CUTEAFD_V41_EXPERT_ROWS "," CUTEAFD_V41_EXPERT_ROWS_ARG)
   list(APPEND CUTEAFD_V41_EXPERT_EXPORT_ARGS --rows "${CUTEAFD_V41_EXPERT_ROWS_ARG}")
 endif()
@@ -82,7 +82,8 @@ add_custom_command(
     "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/${CUTEAFD_V41_EXPERT_EXPORT_SCRIPT}"
     --output-dir "${CUTEAFD_V41_EXPERT_DIR}" ${CUTEAFD_V41_EXPERT_EXPORT_ARGS}
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/${CUTEAFD_V41_EXPERT_EXPORT_SCRIPT}"
+  DEPENDS "${CUTEAFD_V41_CAPACITY_SOURCE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_capacities.py" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/${CUTEAFD_V41_EXPERT_EXPORT_SCRIPT}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_experts_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_spark_tp3_launch_geometry.py"

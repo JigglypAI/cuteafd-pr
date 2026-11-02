@@ -150,7 +150,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 demands.extend(core::CoreCharges::from_package(cfg, &model.core, rows, unit, manifest)?.demands()?
                     .into_iter().filter(|d| d.group != "Kimi K6 peer receive"));
             }
-            if opts.onboard != Some(Onboard::Layers(0)) {
+            if opts.requested_onboard() != Some(OnboardSetting::Layers(0)) {
                 let package = allocation::expert_package(path)?;
                 tp2_workspace = [allocation::expert_workspace(&package, unit)?; 2];
             }
@@ -264,7 +264,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         refusal(report, format!("Kimi packed layer inventory refused: {error:#}"), "Check checkpoint layer geometry."); return memory;
     }};
     // Reuse pool-first TP2 onboarding, constrained by the Spark suffix budget.
-    let onboard = opts.onboard.unwrap_or(Onboard::Auto);
+    let onboard = opts.resolve_onboard(cfg.dense.iter().filter(|dense| !**dense).count()).unwrap_or(Onboard::Auto);
     let mut request = PlacementRequest {
         inventory: Inventory { gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, bytes)| GpuBudget { capacity_bytes: *bytes,
             headroom_bytes: opts.headroom_bytes, baseline: baseline[rank] }).collect(),
@@ -291,7 +291,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         (layer.kind == AttentionClass::Mla && request.attention_placement != Some(AttentionPlacement::Heads), layer.colocate))
         .collect::<Vec<_>>();
     let selected = attention::solve_owners(&groups, LayerOwnership::Ranges, request.layers_first_gpu,
-        request.onboard, |owners| -> anyhow::Result<_> {
+        |owners| -> anyhow::Result<_> {
             let mut candidate = request.clone();
             for (layer, (&owner, &(selected, _))) in candidate.layers.iter_mut().zip(owners.iter().zip(&groups)) {
                 if selected { layer.modes = vec![LayerMode::Whole { gpu: owner, ffn: FfnMode::Split }]; }

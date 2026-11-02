@@ -77,9 +77,11 @@ pub(crate) struct EngineArgs {
     /// Pack queued short prompts; exact preserves loaded expert arithmetic routes.
     #[arg(long, value_enum)]
     pub prefill_packing: Option<crate::shared::prefill_packing::PackingMode>,
-    /// Pool-first by default; local requests require an exported RTX backend.
+    /// Pool-first by default; `all` pins every routed-expert layer of the
+    /// target model and `N` pins exactly N. Local requests require an
+    /// exported RTX backend.
     #[arg(long, env = "RTX_EXPERT_LAYERS", default_value = "auto")]
-    pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
+    pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
     /// Spark expert ranks in TP order (HOST:PORT,...), for MoE layers.
     #[arg(long)]
     pub peers: Option<String>,
@@ -472,7 +474,7 @@ mod draft_cli_tests {
                         rtx_bytes: vec![96 << 30; gpus], prefill_rows: engine.prefill_rows as u64,
                         prefill_lanes: u64::from(engine.prefill_waves), prefill_waves: u64::from(engine.prefill_waves),
                         exlr8_prefill_activations: activations.parse::<PrefillActivations>().unwrap(), context_tokens: 65536,
-                        onboard: Some(cuteafd_loader::placement::Onboard::Layers(0)), glm5_drafter_disabled: true,
+                        onboard: Some(cuteafd_loader::placement::OnboardSetting::Layers(0)), glm5_drafter_disabled: true,
                         host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0), ..Default::default() };
                     let (memory, _) = cuteafd_loader::plan::layout::glm5::native_layout(&checkpoint, &layout,
                         &vec![256; gpus], 256, peers.split(',').count(), &manifest, None).unwrap();
@@ -530,7 +532,7 @@ mod draft_cli_tests {
         drafting.draft = Some("/draft".into());
         assert!(native_activation(&drafting, 3, 78, true).is_ok());
         let mut onboard = args.clone();
-        onboard.rtx_expert_layers = cuteafd_loader::placement::Onboard::Layers(1);
+        onboard.rtx_expert_layers = cuteafd_loader::placement::OnboardSetting::Layers(1);
         assert!(native_activation(&onboard, 3, 78, true).is_ok());
         for bad in 0..8 {
             let mut candidate = args.clone();
@@ -968,8 +970,9 @@ impl Opened {
             crate::shared::inventory::pending_code(&self.library, device, rank, devices.len() == 2,
                 &if core.is_some() { format!("{}-k6", self.cfg.program_family()) } else { self.cfg.program_family().to_owned() }, "*", &code_set)).collect::<Result<Vec<_>>>()?;
         let exchange_f32 = glm::local_exchange_f32()?;
+        let onboard = args.rtx_expert_layers.resolve(self.catalog.routed_experts().routed_layers());
         let local = glm::select_local_inventory(&self.cfg, &self.catalog, manifest_path, layers, devices.len(),
-            args.prefill_rows as u64, prefill_lanes as u64, exchange_f32, args.rtx_expert_layers,
+            args.prefill_rows as u64, prefill_lanes as u64, exchange_f32, onboard,
             args.skip_routed_experts, args.exlr8_manifest.as_deref()
                 .map(|selected| (selected, args.exlr8_prefill_activations)))?;
         if let Some(local) = &local {
@@ -980,7 +983,7 @@ impl Opened {
                     "GLM EXL3 planner/runtime backend workspace mismatch"),
                 glm::GlmLocalFormat::Exlr8 => ensure!(
                     crate::shared::experts::rtx::exlr8::Exlr8Tp2Weights::workspace_bytes(
-                        &programs, max_rows, args.exlr8_prefill_activations)? as u64 == local.backend_workspace,
+                        &programs, cuteafd_ffi::exlr8::KernelFamily::Glm, max_rows, args.exlr8_prefill_activations)? as u64 == local.backend_workspace,
                     "GLM EXLR8 planner/runtime backend workspace mismatch"),
                 glm::GlmLocalFormat::Nvfp4 { .. } => {
                     let tensors = self.catalog.fp8().context("NVFP4 tensors")?;
@@ -1004,7 +1007,7 @@ impl Opened {
             experts: local.as_ref().map_or_else(Vec::new, |l| l.experts.clone()),
             expert_workspace: 0, tp2_workspace, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
             onboard: if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) }
-                else { args.rtx_expert_layers }, full_prefill_logits: args.full_prefill_logits, context };
+                else { onboard }, full_prefill_logits: args.full_prefill_logits, context };
         let (placement, working) = glm::solve_working_set(&inputs, serial_workspace, requested)?;
         ensure!(!native || devices.len() != 2
             || placement.attention_placement == cuteafd_loader::placement::AttentionPlacement::Context,
@@ -1031,7 +1034,7 @@ impl Opened {
         let native_push_experts = || -> Result<_> {
             tp2_range.as_ref().map(|range| -> Result<_> {
                 let workspace = crate::shared::experts::rtx::exlr8::Exlr8Tp2Weights::workspace_bytes(
-                    &programs, max_rows, args.exlr8_prefill_activations)?;
+                    &programs, cuteafd_ffi::exlr8::KernelFamily::Glm, max_rows, args.exlr8_prefill_activations)?;
                 let budgets = tp2_budgets()?.map(|b| b.saturating_sub(workspace));
                 Ok(crate::shared::experts::rtx::push::CoordinatorExperts::Exlr8Tp2 {
                     manifest: args.exlr8_manifest.clone().context("EXLR8 manifest")?,
@@ -1340,7 +1343,7 @@ impl Opened {
             // Sparks' first-use costs), landed and drained on the stream.
             let rows = link.capacity() as usize;
             let exchange = link.exchange()?;
-            let ticket = exchange.send_request(warm(rows, decode)?)?;
+            let ticket = exchange.send_request(warm(rows, decode)?, exchange.compact_payload(rows))?;
             exchange.land_drained(ticket, stream)?;
         }
         if transport.is_some() {
@@ -1402,14 +1405,17 @@ impl Opened {
         self.library.cuda_set_device(devices[0])?;
         let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
         let available = usize::try_from(available)?;
+        let per_rank = (0..world).map(|rank| native_dense::NativeDenseRecords::new(&self.snapshot, layers, world, rank))
+            .collect::<Result<Vec<_>>>()?;
+        let load_peak = per_rank.iter().try_fold(0usize, |total, rank|
+            total.checked_add(rank.plan.read_staging_bytes).context("native dense load peak overflow"))?;
+        ensure!(load_peak <= available, "native dense load peak {load_peak} exceeds available host bytes {available}");
         let vocabulary = NativeVocabulary::load(&self.library, programs,
             VocabularyPlan::new(records, world, 0, self.cfg.hidden, self.cfg.vocab_size)?, available, 0, 0)?
             .context("rank 0 owns the native vocabulary")?;
         let vocabulary = std::rc::Rc::new(vocabulary);
         let source = self.native_embed_source()?;
         let embedding = crate::shared::token_io::TokenEmbedding::row_fp8(&self.library, source, vocabulary.clone())?;
-        let per_rank = (0..world).map(|rank| native_dense::NativeDenseRecords::new(&self.snapshot, layers, world, rank))
-            .collect::<Result<Vec<_>>>()?;
         let rank_stream = |device: i32| if device == args.device { stream } else { peer_stream.map_or(stream, |(_, s)| s) };
         let ((model, shares), pushed) = match push {
             Some((push, sparks)) => {

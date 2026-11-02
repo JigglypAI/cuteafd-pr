@@ -1272,8 +1272,9 @@ build_coordinator() {
   echo "== incrementally building coordinator slot $slot =="
   local phase="${1:-all}"
   [[ "$phase" == native ]] || sync_local_source
-  local image_id
+  local image_id image_layers
   image_id="$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"
+  image_layers="$(docker image inspect -f '{{json .RootFS.Layers}}' "$COORDINATOR_DOCKER_DEV")"
   local -a cache_env=(-e CUTEAFD_KACHE= -e CUTEAFD_SCCACHE_CUDA=0 -e "CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}")
   if [[ "${CUTEAFD_SCCACHE_CUDA:-0}" == 1 ]]; then
     if docker exec "$coordinator_container" test -d /opt/cuteafd-sccache-cache; then
@@ -1378,7 +1379,7 @@ build_coordinator() {
     -e "CUTEAFD_WIP_PROGRAM_FAMILY=${wip_program_family:-}" "$coordinator_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source coordinator "$slot" /wip/output/coordinator \
-    "$COORDINATOR_DOCKER_DEV" "$image_id"
+    "$COORDINATOR_DOCKER_DEV" "$image_id" "$image_layers"
 }
 
 # wip_seed_export_turn: this build's exclusive GPU-export turn on the seed, held
@@ -1400,8 +1401,9 @@ wip_seed_export_turn() {
 build_expert() (
   echo "== incrementally building Spark expert slot $slot on $seed_host =="
   sync_seed_source
-  local image_id
+  local image_id image_layers
   image_id="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
+  image_layers="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{json .RootFS.Layers}}' '$SPARK_EXPERT_DOCKER_DEV'")"
   local cache_wrapper= cuda_cache=0
   if [[ "${CUTEAFD_SCCACHE_CUDA:-0}" == 1 ]]; then
     if ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" test -d /opt/cuteafd-sccache-cache; then
@@ -1457,7 +1459,7 @@ build_expert() (
   timeout --kill-after=30 300 ssh -o BatchMode=yes "$seed_host" docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_expert_key:-}" ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} "$spark_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \
-    "$SPARK_EXPERT_DOCKER_DEV" "$image_id"
+    "$SPARK_EXPERT_DOCKER_DEV" "$image_id" "$(printf '%q' "$image_layers")"
 )
 
 # Role builders end here.

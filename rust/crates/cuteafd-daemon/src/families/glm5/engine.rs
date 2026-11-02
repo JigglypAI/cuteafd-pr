@@ -2136,7 +2136,7 @@ impl<'a> GlmEngine<'a> {
         // SAFETY: ids, weights and wire rows hold this layer's `t` rows in
         // stream order; the copies read them before later stream work.
         let ticket = unsafe {
-            transport.send(t, layout, [w.route_ids.buffer, w.route_weights.buffer,
+            transport.send(t, transport.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer,
                 if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream,
                 Box::new(move |routes, wire| expert_request_parts(routes, wire, index, t, h, topk, decode, bf16)))?
         };
@@ -2258,7 +2258,7 @@ impl<'a> GlmEngine<'a> {
         // SAFETY: ids, weights and wire rows hold this unit's `t` rows in
         // stream order; the copies read them before later stream work.
         let ticket = unsafe {
-            transport.send(t, layout, [w.route_ids.buffer, w.route_weights.buffer,
+            transport.send(t, transport.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer,
                 if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream,
                 Box::new(move |routes, wire| expert_request_parts(routes, wire, index, t, h, topk, false, bf16)))?
         };

@@ -463,7 +463,7 @@ pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
     type PrefillLink;
     fn take_link(transport: &mut Self::Transport) -> Result<Self::PrefillLink>;
     fn restore_link(transport: &mut Self::Transport, link: Self::PrefillLink) -> Result<()>;
-    fn new_packed_storage(&self, lib: &'a NativeLibrary, unit: usize) -> Result<Self::Suffix>;
+    fn new_packed_storage(&self, lib: &'a NativeLibrary, unit: usize, concurrency: usize) -> Result<Self::Suffix>;
     fn new_packed_suffix(storage: &Self::Suffix,
         segments: &[crate::shared::prefill_packing::Segment]) -> Result<Self::Suffix>;
     /// # Safety
@@ -511,8 +511,8 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
     fn restore_link(transport: &mut Self::Transport, link: Self::PrefillLink) -> Result<()> {
         transport.restore_link(link)
     }
-    fn new_packed_storage(&self, lib: &'a NativeLibrary, unit: usize) -> Result<Self::Suffix> {
-        EncoderSuffix::packed_storage(lib, unit)
+    fn new_packed_storage(&self, lib: &'a NativeLibrary, unit: usize, concurrency: usize) -> Result<Self::Suffix> {
+        EncoderSuffix::packed_storage(lib, unit, concurrency)
     }
     fn new_packed_suffix(storage: &Self::Suffix,
         segments: &[crate::shared::prefill_packing::Segment]) -> Result<Self::Suffix> {
@@ -578,8 +578,8 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
         ensure!(link.device.id == device.id, "prefill link device differs from slot 0's");
         device.run(|| transport.get_mut().restore_link(link.into_inner()))
     }
-    fn new_packed_storage(&self, lib: &'a NativeLibrary, unit: usize) -> Result<Self::Suffix> {
-        self.encoder_device()?.own(|| EncoderSuffix::packed_storage(lib, unit))
+    fn new_packed_storage(&self, lib: &'a NativeLibrary, unit: usize, concurrency: usize) -> Result<Self::Suffix> {
+        self.encoder_device()?.own(|| EncoderSuffix::packed_storage(lib, unit, concurrency))
     }
     fn new_packed_suffix(storage: &Self::Suffix,
         segments: &[crate::shared::prefill_packing::Segment]) -> Result<Self::Suffix> {

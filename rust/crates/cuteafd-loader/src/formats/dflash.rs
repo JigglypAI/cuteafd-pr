@@ -1420,6 +1420,81 @@ mod tests {
     }
 
     #[test]
+    fn bounded_tail_gap_refusals_are_transactional_and_slack_is_exact() {
+        let mut cfg = MlaDflashConfig::from_json(&config()).unwrap();
+        for windows in [vec![Some(2048); 3], vec![Some(2048), Some(2049)], vec![Some(2048), None]] {
+            cfg.windows = windows.clone();
+            let mut state = MlaDraftCacheState::new(cfg.cache_layout(2, 262144, MlaCacheFormat::Fp8).unwrap()).unwrap();
+            state.reset(0, 0).unwrap();
+            state.reset(1, 513).unwrap();
+            let before = state.clone();
+            if windows.iter().all(|window| *window == Some(2048)) {
+                state.commit_context(0, 6284, 2048).unwrap();
+                assert_eq!(state.frontier(0).unwrap(), (0, 8332));
+                assert_eq!(state.frontier(1).unwrap(), (513, 513));
+                for (layer, layout) in state.layout.layers.iter().enumerate() {
+                    let bound = layout.bind(0, 0).unwrap();
+                    let retained = (6284..8332).map(|position| bound.row(position).unwrap())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let slack = state.window_slack(layer, 0).unwrap().into_iter().flatten()
+                        .collect::<std::collections::BTreeSet<_>>();
+                    assert_eq!(retained.len(), 2048);
+                    assert!(retained.is_disjoint(&slack));
+                    assert_eq!(retained.len() + slack.len(), layout.rows_per_slot());
+                    let other_slack = state.window_slack(layer, 1).unwrap();
+                    assert_eq!(other_slack, [layout.rows_per_slot()..2 * layout.rows_per_slot()]);
+                }
+                let committed = state.clone();
+                for (start, rows) in [(8333, 2047), (8331, 2048), (8332, 0), (usize::MAX, 1), (262144, 2048)] {
+                    assert!(state.commit_context(0, start, rows).is_err());
+                    assert_eq!(state, committed);
+                }
+            } else {
+                assert!(state.commit_context(0, 6284, 2048).is_err());
+                assert_eq!(state, before);
+            }
+        }
+    }
+
+    #[test]
+    fn generic_views_preserve_dflash_buffers_and_offsets_without_new_owners() {
+        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        let cfg = MlaDflashConfig::from_json(&config()).unwrap();
+        for sequences in [1usize, 8, 16, 32] {
+            for sms in [170, 188] {
+                for mode in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
+                    let layout = cfg.runtime_layout(mode, GlmDraftCapacity::new(sequences, sequences, 8).unwrap(),
+                        262144, 262144, sms, 2, MlaCacheFormat::Fp8).unwrap();
+                    assert!(layout.owners().is_empty(), "DFlash2 owner population belongs to planner adapters");
+                    assert_eq!(layout.device_buffers(), layout.buffers());
+                    assert_eq!(layout.allocate_device_with(|b| Ok::<_, ()>(b.clone())).unwrap(),
+                        layout.allocate_with(|b| Ok::<_, ()>(b.clone())).unwrap());
+                    for sequence in 0..sequences {
+                        let [input, output] = layout.block_views(sequence, 8).unwrap();
+                        assert_eq!((input.backing.as_str(), input.offset, input.bytes),
+                            ("conv", sequence * 8 * 7168 * 2, 8 * 7168 * 2));
+                        assert_eq!((output.backing.as_str(), output.offset, output.bytes),
+                            ("delta", sequence * 8 * 7168 * 2, 8 * 7168 * 2));
+                        let mask = layout.mask_view(sequence).unwrap();
+                        assert_eq!((mask.backing.as_str(), mask.offset, mask.bytes),
+                            ("h", (sequence * 8 + 1) * 7168 * 2, 7 * 7168 * 2));
+                    }
+                    for first in (0..2048).step_by(64) {
+                        let [input, slots, positions] = layout.context_views(first, 64).unwrap();
+                        assert_eq!((input.offset, input.bytes), (first * 7168 * 2, 64 * 7168 * 2));
+                        assert_eq!((slots.offset, slots.bytes), (first * 8, 64 * 8));
+                        assert_eq!((positions.offset, positions.bytes), (first * 8, 64 * 8));
+                    }
+                    assert!(layout.block_views(sequences, 8).is_err());
+                    assert!(layout.context_views(2048, 1).is_err());
+                    assert!(layout.view("bad", "missing", 0, 1).is_err());
+                    assert!(layout.view("overflow", "h", usize::MAX, 1).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn runtime_layout_chunks_native_arenas_and_preserves_per_slot_cache() {
         use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation::Fp8Only};
         let cfg = MlaDflashConfig::from_json(&config()).unwrap();

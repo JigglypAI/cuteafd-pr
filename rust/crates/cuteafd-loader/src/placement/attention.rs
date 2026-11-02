@@ -56,12 +56,9 @@ pub fn owner_boundaries(groups: &[(bool, Option<u16>)], nonempty: bool) -> Vec<u
 
 /// Compare accepted admissions, not a partial estimate of their allocations.
 /// The physical capacity breaks ties once a target or explicit pool is met.
-pub fn owner_score(onboard: Onboard, placed: &Placement) -> (u64, u64, u64) {
+pub fn owner_score(placed: &Placement) -> (u64, u64, u64) {
     let capacity = placed.pool_limits.0.iter().map(|r| r.max_units).min().unwrap_or(0);
-    match onboard {
-        Onboard::ExpertsFirst { .. } => (placed.onboard_layers as u64, placed.pool_tokens, capacity),
-        _ => (placed.pool_tokens, placed.onboard_layers as u64, capacity),
-    }
+    (placed.pool_tokens, placed.onboard_layers as u64, capacity)
 }
 
 /// Typed pool evidence survives mark-selection and contextual error wrappers.
@@ -93,7 +90,7 @@ fn attainable_pool(error: &PlacementError) -> Option<u64> {
 /// not mask another valid placement. If all fail, report the greatest attainable
 /// pool and its selected-layer owner split; without pool evidence keep the first error.
 pub fn solve_owners<T, E: From<PlacementError> + OwnerAdmissionError>(groups: &[(bool, Option<u16>)],
-    ownership: LayerOwnership, first: u8, onboard: Onboard,
+    ownership: LayerOwnership, first: u8,
     mut admit: impl FnMut(&[u8]) -> Result<(Placement, T), E>) -> Result<(Placement, T), E> {
     if first > 1 { return Err(PlacementError::Inventory("layers first GPU must be 0 or 1").into()); }
     if ownership == LayerOwnership::Alternating {
@@ -106,7 +103,7 @@ pub fn solve_owners<T, E: From<PlacementError> + OwnerAdmissionError>(groups: &[
         let owners = (0..groups.len()).map(|i| if i < boundary { first } else { 1 - first }).collect::<Vec<_>>();
         match admit(&owners) {
             Ok(candidate) => {
-                let score = owner_score(onboard, &candidate.0);
+                let score = owner_score(&candidate.0);
                 if best.as_ref().is_none_or(|(old, _)| score > *old) { best = Some((score, candidate)); }
             }
             Err(error) => {

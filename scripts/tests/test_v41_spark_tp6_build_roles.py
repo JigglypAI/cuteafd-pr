@@ -204,7 +204,7 @@ def _role_geometry(role: str) -> tuple:
     return module.ROLE_GEOMETRY[role]
 
 
-CAPACITIES = (1, 16, 80, 256, 1024, 4096)
+CAPACITIES = (1, 16, 64, 256, 1024, 4096)
 
 
 def _write_export(directory: Path, role: str) -> Path:

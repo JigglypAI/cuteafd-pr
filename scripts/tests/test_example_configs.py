@@ -630,15 +630,25 @@ def test_qualification_configs_exist_and_are_listed() -> None:
     ({"model_type": "mimo_v2", "num_hidden_layers": 5, "moe_layer_freq": [0, 1, 0, 1, 1]}, 3),
     ({"model_type": "mimo_v2_flash", "num_hidden_layers": 48}, 47),
 ])
-@pytest.mark.parametrize("value", ["auto", "max", "all", "50%", "100%", "0"])
-def test_checkpoint_onboarding_count_and_rounding(tmp_path, config, count, value):
+@pytest.mark.parametrize("value", ["auto", "all", "0"])
+def test_checkpoint_onboarding_accepts_auto_all_and_counts(tmp_path, config, count, value):
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config))
     result = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"),
                              "--onboard", value, str(path)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    expected = {"all": str(count), "100%": str(count), "50%": str(int(count * 0.5 + 0.5))}.get(value, value)
-    assert result.stdout.strip() == expected
+    # `all` stays unresolved; the engine resolves it from the checkpoint itself.
+    assert result.stdout.strip() == value
+    # The checkpoint's own routed-layer count is a valid exact pin; one more is
+    # refused with that count.
+    exact = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"),
+                            "--onboard", str(count), str(path)], capture_output=True, text=True)
+    assert exact.returncode == 0, exact.stderr
+    assert exact.stdout.strip() == str(count)
+    over = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"),
+                           "--onboard", str(count + 1), str(path)], capture_output=True, text=True)
+    assert over.returncode != 0
+    assert f"checkpoint has {count} routed layers" in over.stderr
     bounded = subprocess.run(["bash", "-c", 'source "$1"; release_onboard "$2" test/model pinned',
                               "test", str(ROOT / "scripts/lib/release-common.sh"), value],
                              env={**os.environ, "HF_HOME": str(tmp_path / "hf")},
@@ -648,7 +658,7 @@ def test_checkpoint_onboarding_count_and_rounding(tmp_path, config, count, value
     assert bounded.stdout.strip() == value
 
 
-@pytest.mark.parametrize("value", ["-1", "101%", "NaN%", "inf%", "half", "5x", ""])
+@pytest.mark.parametrize("value", ["-1", "max", "50%", "101%", "NaN%", "inf%", "half", "5x", ""])
 def test_checkpoint_onboarding_rejects_invalid_grammar(value):
     result = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"),
                              "--onboard", value], capture_output=True, text=True)

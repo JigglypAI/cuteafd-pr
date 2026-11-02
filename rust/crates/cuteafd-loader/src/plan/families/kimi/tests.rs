@@ -398,7 +398,7 @@ fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
     }
     assert_eq!(category(rtx[0], Category::Experts), category(rtx[1], Category::Experts));
     // Numeric overrides are strict, never silently increased to satisfy the workers.
-    options.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(0));
+    options.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
     let refused = input.plan(&options).unwrap();
     assert!(!refused.fits);
     assert!(refused.hints.iter().any(|hint| hint.what.contains("explicit --rtx-expert-layers 0")));
@@ -436,7 +436,7 @@ fn mounted_release_plan_is_manifest_independent_and_serving() -> anyhow::Result<
     options.audio = MediaMode::Off;
     options.draft_ownership = Some(spec::DraftOwnership::None);
     let layout = options.layout.as_mut().unwrap();
-    layout.onboard = Some(crate::placement::Onboard::Layers(5));
+    layout.onboard = Some(crate::placement::OnboardSetting::Layers(5));
     // Match the serving card's automatic pool, not a forced 2M allocation.
     layout.pool_tokens = None;
     let report = testing::plan(std::path::Path::new(&snapshot), &options)?;

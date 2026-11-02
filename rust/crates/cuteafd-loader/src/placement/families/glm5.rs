@@ -688,8 +688,6 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
             branch.tp2_workspace = serial_tp2_workspace;
         }
         let floor = match inputs.onboard {
-            Onboard::ExpertsFirst { pool_floor } => Some(requested.unwrap_or(pool_floor
-                .max(request(&branch)?.pool.floor))),
             // Automatic Spark layouts can clamp serving context to the admitted pool.
             Onboard::Auto if requested.is_none() && branch.spark_ranks > 0 => Some(PAGE_ROWS),
             _ => None,
@@ -700,10 +698,7 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
                 if working.spark.spark_layers != expected || placed.onboard_layers != n {
                     return Err(PlacementError::Inventory("GLM selected Spark set disagrees with solved homes"));
                 }
-                let score = match inputs.onboard {
-                    Onboard::ExpertsFirst { .. } => (n as u64, placed.pool_tokens),
-                    _ => (placed.pool_tokens, n as u64),
-                };
+                let score = (placed.pool_tokens, n as u64);
                 if best.as_ref().is_none_or(|(previous, ..)| score > *previous) {
                     best = Some((score, placed, working));
                 }
@@ -712,13 +707,6 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
         }
     }
     if let Some((_, placed, working)) = best { return Ok((placed, working)); }
-    if let Onboard::ExpertsFirst { pool_floor } = inputs.onboard {
-        if requested.is_none() && pool_floor < inputs.max_context {
-            let mut branch = inputs.clone();
-            branch.onboard = Onboard::Layers(0);
-            return run(&branch, cap, Some(pool_floor));
-        }
-    }
     Err(refusal.unwrap_or(PlacementError::Inventory("GLM has no executable Spark working set")))
 }
 
@@ -1093,7 +1081,7 @@ pub(crate) fn exlr8_inventory_with_metadata(snapshot: &std::path::Path, manifest
         && cfg.topk == 8 && (cfg.first_moe_layer..=cfg.layers).contains(&selected_layers)
         && (1..=4).contains(&lanes), "GLM EXLR8 TP2 geometry/layer extent");
     let programs = crate::plan::checkpoint::read_json(manifest)?;
-    let backend_workspace = crate::plan::exlr8::routed_workspace(&programs, rows, 8, activations)?;
+    let backend_workspace = crate::plan::exlr8::routed_workspace(&programs, cuteafd_ffi::exlr8::KernelFamily::Glm, rows, 8, activations)?;
     let records = crate::plan::exlr8::dense::DenseRecord::inventory(snapshot)?;
     for layer in cfg.first_moe_layer..selected_layers {
         for suffix in ["weight", "e_score_correction_bias"] {
@@ -1119,7 +1107,7 @@ pub fn select_local_inventory(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41Ca
     if skip || onboard.layers(layers.saturating_sub(catalog.routed_experts().first_layer)) == Some(0)
         || layers <= catalog.routed_experts().first_layer { return Ok(None); }
     if gpus != 2 {
-        anyhow::ensure!(matches!(onboard, Onboard::Auto | Onboard::ExpertsFirst { .. }),
+        anyhow::ensure!(onboard == Onboard::Auto,
             "GLM local experts require a two-GPU TP2 executor");
         return Ok(None);
     }
@@ -1128,7 +1116,7 @@ pub fn select_local_inventory(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41Ca
         return exlr8_inventory(catalog.snapshot(), selected, manifest, layers, rows, lanes, exchange_f32, activations).map(Some);
     }
     anyhow::ensure!(exlr8.is_none(), "EXLR8 manifest supplied for non-native checkpoint");
-    let automatic = matches!(onboard, Onboard::Auto | Onboard::ExpertsFirst { .. });
+    let automatic = onboard == Onboard::Auto;
     let supported = catalog.exl3().is_some() || catalog.fp8().is_some_and(|t|
         t.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4);
     if automatic && !supported { return Ok(None); }
@@ -1192,10 +1180,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fixture(root.path(), false);
         let records = ["weight", "e_score_correction_bias"].into_iter().zip([768usize, 8]).map(|(suffix, bytes)| DenseRecord {
+            ownership: crate::plan::exlr8::dense::DenseOwnership::new(crate::plan::exlr8::dense::DenseExecution::RankZero),
             tensor: format!("model.layers.3.mlp.gate.{suffix}"), encoding: DenseEncoding::Bf16,
             shape: vec![bytes / 2], side: ShardSide::Replicated, channels_per_shard: 0,
             rotation_id: 0, rotation: None, hessian_solved: false, native_blocks: 0,
-            components: vec![DenseComponent { suffix: suffix.into(), dtype: "BF16".into(), shape: vec![bytes / 2],
+            components: vec![DenseComponent { window: None, suffix: suffix.into(), dtype: "BF16".into(), shape: vec![bytes / 2],
                 source: DenseRange { path: root.path().join("router"), offset: 0, bytes } }],
         }).collect::<Vec<_>>();
         let original = std::fs::read(root.path().join("manifests/exlr8-manifest-mixed.json")).unwrap();
@@ -1429,7 +1418,7 @@ mod tests {
     fn planner_equals_runtime_glm5() {
         let cfg = config();
         for cards in [vec![96 * GIB], vec![96 * GIB; 2], vec![96 * GIB, 80 * GIB]] {
-            for onboard in [Onboard::Auto, Onboard::Layers(2), Onboard::ExpertsFirst { pool_floor: 262144 }] {
+            for onboard in [Onboard::Auto, Onboard::Layers(2)] {
                 let planned = inputs(&cfg, &cards);
                 let planned = GlmInputs { onboard, ..planned };
                 let mut runtime = planned.clone();
@@ -1503,8 +1492,7 @@ mod tests {
     fn selected_spark_working_set_matches_planned_and_measured_admission() {
         let cfg = config();
         let routed = cfg.layers - cfg.first_moe_layer;
-        for onboard in [Onboard::Auto, Onboard::Layers(routed), Onboard::Fraction(1.0),
-            Onboard::ExpertsFirst { pool_floor: 262144 }] {
+        for onboard in [Onboard::Auto, Onboard::Layers(routed)] {
             let mut planned = inputs(&cfg, &[96 * GIB; 2]);
             planned.onboard = onboard;
             planned.prefill_lanes = 1;
@@ -1534,7 +1522,7 @@ mod tests {
         let mut input = inputs(&cfg, &[96 * GIB; 2]);
         input.max_context = 65536;
         input.requested_pool = Some(65536);
-        for onboard in [Onboard::Layers(0), Onboard::Fraction(0.0), Onboard::Layers(2)] {
+        for onboard in [Onboard::Layers(0), Onboard::Layers(2)] {
             input.onboard = onboard;
             let (p, working) = solve_working_set(&input, [64 << 20; 2], HEADS).unwrap();
             let n = onboard.layers(routed).unwrap();
@@ -1630,81 +1618,42 @@ mod tests {
         cfg.layers = 6;
         cfg.indexers.truncate(cfg.layers);
         let routed = cfg.layers - cfg.first_moe_layer;
-        for onboard in [Onboard::Auto, Onboard::ExpertsFirst { pool_floor: 262144 }] {
-            for waves in [2, 3, 4] {
-                let mut input = inputs(&cfg, &[96 * GIB; 2]);
-                input.onboard = onboard;
-                input.prefill_lanes = waves;
-                input.prefill_rows = crate::serving_capacity::prefill_waves::unit_rows(waves);
-                input.max_context = 65536;
-                input.requested_pool = Some(65536);
-                for cost in &mut input.experts {
-                    cost.half = [Bytes2 { resident: 1 << 20, staging: 0 }; 2];
-                }
-                let serial = [64 << 20; 2];
-                let (placed, working) = solve_working_set(&input, serial, HEADS).unwrap();
-                assert!(placed.onboard_layers < routed, "{onboard:?}: all-local needs a new deployment shape");
-                assert!(!working.spark.spark_layers.is_empty());
-                assert_eq!((working.spark.spark_ranks, working.spark.prefill_lanes), (4, waves));
-                assert_eq!(input.prefill_lanes, waves);
-                // Auto must still select the best executable Spark candidate.
-                let explicit = (0..routed).map(|n| {
-                    let branch = GlmInputs { onboard: Onboard::Layers(n), ..input.clone() };
-                    solve_working_set(&branch, serial, HEADS).unwrap().0
-                });
-                let score = |p: &Placement| match onboard {
-                    Onboard::ExpertsFirst { .. } => (p.onboard_layers as u64, p.pool_tokens),
-                    _ => (p.pool_tokens, p.onboard_layers as u64),
-                };
-                assert_eq!(score(&placed), explicit.map(|p| score(&p)).max().unwrap());
-                input.onboard = Onboard::Layers(routed);
-                let error = solve_working_set(&input, serial, HEADS).unwrap_err();
-                assert!(error.to_string().contains("#776"), "{error}");
-                input.spark_ranks = 0;
-                assert!(solve_working_set(&input, serial, HEADS).is_err(), "no-Spark input must not clamp waves");
-                input.prefill_lanes = 1;
-                assert_eq!(solve_working_set(&input, serial, HEADS).unwrap().0.onboard_layers, routed);
+        let onboard = Onboard::Auto;
+        for waves in [2, 3, 4] {
+            let mut input = inputs(&cfg, &[96 * GIB; 2]);
+            input.onboard = onboard;
+            input.prefill_lanes = waves;
+            input.prefill_rows = crate::serving_capacity::prefill_waves::unit_rows(waves);
+            input.max_context = 65536;
+            input.requested_pool = Some(65536);
+            for cost in &mut input.experts {
+                cost.half = [Bytes2 { resident: 1 << 20, staging: 0 }; 2];
             }
+            let serial = [64 << 20; 2];
+            let (placed, working) = solve_working_set(&input, serial, HEADS).unwrap();
+            assert!(placed.onboard_layers < routed, "{onboard:?}: all-local needs a new deployment shape");
+            assert!(!working.spark.spark_layers.is_empty());
+            assert_eq!((working.spark.spark_ranks, working.spark.prefill_lanes), (4, waves));
+            assert_eq!(input.prefill_lanes, waves);
+            // Auto must still select the best executable Spark candidate.
+            let explicit = (0..routed).map(|n| {
+                let branch = GlmInputs { onboard: Onboard::Layers(n), ..input.clone() };
+                solve_working_set(&branch, serial, HEADS).unwrap().0
+            });
+            let score = |p: &Placement| (p.pool_tokens, p.onboard_layers as u64);
+            assert_eq!(score(&placed), explicit.map(|p| score(&p)).max().unwrap());
+            input.onboard = Onboard::Layers(routed);
+            let error = solve_working_set(&input, serial, HEADS).unwrap_err();
+            assert!(error.to_string().contains("#776"), "{error}");
+            input.spark_ranks = 0;
+            assert!(solve_working_set(&input, serial, HEADS).is_err(), "no-Spark input must not clamp waves");
+            input.prefill_lanes = 1;
+            assert_eq!(solve_working_set(&input, serial, HEADS).unwrap().0.onboard_layers, routed);
         }
     }
 
     #[test]
-    fn selected_spark_free_max_retains_agentic_floor() {
-        let cfg = config();
-        let routed = cfg.layers - cfg.first_moe_layer;
-        let mut input = inputs(&cfg, &[96 * GIB; 2]);
-        input.max_context = 65536;
-        input.drafter_bytes = 0;
-        input.expert_workspace = 0;
-        input.onboard = Onboard::ExpertsFirst { pool_floor: 65536 };
-        for cost in &mut input.experts { cost.half = [Bytes2 { resident: 1 << 20, staging: 0 }; 2]; }
-        let serial = [64 << 20; 2];
-        let local = GlmInputs { spark_ranks: 0, prefill_lanes: 1, tp2_workspace: serial,
-            onboard: Onboard::Layers(routed), ..input.clone() };
-        let request = request(&local).unwrap();
-        for (rank, budget) in input.gpus.iter_mut().enumerate() {
-            let unit = request.layers.iter().map(|layer| layer.kv_unit.unit_bytes_split[rank]).sum::<u64>()
-                + request.pool_overhead[rank];
-            let fixed = request.fixed.iter().filter(|row| usize::from(row.gpu) == rank).map(|row| row.bytes).sum::<u64>();
-            let capacity = input.headroom_bytes + fixed + unit * (131072 / PAGE_ROWS)
-                + serial[rank] + (routed as u64 + 16) * (1 << 20);
-            *budget = (capacity, Baseline::Measured { free_bytes: capacity });
-        }
-        let (placed, working) = solve_working_set(&input, serial, HEADS).unwrap();
-        assert!(placed.onboard_layers < routed, "max must not select an all-local branch below 256K");
-        assert_eq!(working.spark.spark_ranks, 4);
-        assert!(placed.pool_tokens >= 65536);
-        input.spark_ranks = 0;
-        input.prefill_lanes = 1;
-        input.onboard = Onboard::Layers(routed);
-        assert!(matches!(solve_working_set(&input, serial, HEADS), Err(PlacementError::BelowFloor { .. })));
-        input.requested_pool = Some(131072);
-        assert_eq!(solve_working_set(&input, serial, HEADS).unwrap().0.onboard_layers, routed,
-            "an explicit smaller pool remains its own floor");
-    }
-
-    #[test]
-    fn working_set_preserves_pool_first_max_and_explicit_refusals() {
+    fn working_set_preserves_pool_first_and_explicit_refusals() {
         let cfg = config();
         let mut input = inputs(&cfg, &[96 * GIB; 2]);
         let serial = [64 << 20; 2];
@@ -1712,10 +1661,6 @@ mod tests {
         assert_eq!(heads.onboard_layers, 0);
         assert_eq!(working.spark.spark_ranks, 4);
         assert_eq!(heads.pool_tokens, solve(&request(&input).unwrap()).unwrap().pool_tokens);
-        input.onboard = Onboard::ExpertsFirst { pool_floor: 262144 };
-        let (max, _) = solve_working_set(&input, serial, HEADS).unwrap();
-        assert_eq!(max.onboard_layers, solve(&request(&input).unwrap()).unwrap().onboard_layers);
-        assert!(max.onboard_layers > heads.onboard_layers);
         input.onboard = Onboard::Layers(cfg.layers - cfg.first_moe_layer);
         assert!(solve_working_set(&input, serial, HEADS).is_err());
         input.onboard = Onboard::Auto;
@@ -1787,7 +1732,7 @@ mod tests {
     fn activation_policy_uses_exports_and_refuses_malformed_packages() {
         let (dir, catalog, manifest) = local_fixture();
         let cfg = glm_cfg();
-        for onboard in [Onboard::Auto, Onboard::ExpertsFirst { pool_floor: 65536 }, Onboard::Layers(1)] {
+        for onboard in [Onboard::Auto, Onboard::Layers(1)] {
             assert!(select_local_inventory(&cfg, &catalog, &manifest, 2, 2, 64, 3, false, onboard, false, None)
                 .unwrap().is_some());
         }
@@ -2138,7 +2083,7 @@ mod tests {
             for rows in [1, 63, 4096] {
                 let local = local_inventory_selected(&cfg, &catalog, &manifest, 2, rows, 3, false, a4).unwrap();
                 let serial = local.workspace_for(&cfg, rows, 1, false);
-                for onboard in [Onboard::Auto, Onboard::Layers(0), Onboard::Layers(1), Onboard::Fraction(1.0)] {
+                for onboard in [Onboard::Auto, Onboard::Layers(0), Onboard::Layers(1)] {
                     let lanes = if onboard == Onboard::Layers(0) { 3 } else { 1 };
                     let planned = GlmInputs { prefill_rows: rows, prefill_lanes: lanes, experts: local.experts.clone(),
                         expert_workspace: 0, tp2_workspace: local.workspace(),

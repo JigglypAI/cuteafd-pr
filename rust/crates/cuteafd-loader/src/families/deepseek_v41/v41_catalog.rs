@@ -73,6 +73,12 @@ pub struct RoutedExpertShape {
 }
 
 impl RoutedExpertShape {
+    /// Routed-expert layers of the target model (`RTX_EXPERT_LAYERS=all`).
+    /// Drafter and MTP stages are not part of this extent.
+    pub fn routed_layers(&self) -> usize {
+        self.layers.saturating_sub(self.first_layer)
+    }
+
     pub(crate) fn of_v41(config: &OfficialV41Config) -> Self {
         let text = config.text();
         Self {

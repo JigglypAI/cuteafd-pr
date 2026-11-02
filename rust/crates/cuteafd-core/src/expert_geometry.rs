@@ -402,14 +402,14 @@ impl Exl3RowPolicy {
 
     /// Shared by loader admission, artifact preload and runtime dispatch.
     pub fn capacities(self, max_live_rows: usize) -> Result<Vec<u32>, crate::serving_capacity::CapacityError> {
-        const CAPACITIES: [u32; 8] = EXL3_CAPACITIES;
+        let capacities = EXL3_CAPACITIES;
         if !(1..=4096).contains(&max_live_rows) {
             return Err(crate::serving_capacity::CapacityError::Invalid("EXL3 live capacity must be 1..4096"));
         }
         // Keep a canonical-reduction decode export available even at narrow admission.
         let required = max_live_rows.max(if max_live_rows > 1 { 80 } else { 1 });
-        let maximum = CAPACITIES.into_iter().find(|&c| c as usize >= required).unwrap();
-        Ok(CAPACITIES.into_iter().filter(|&c| c <= maximum
+        let maximum = capacities.into_iter().find(|&c| c as usize >= required).unwrap();
+        Ok(capacities.into_iter().filter(|&c| c <= maximum
             && (self != Self::GlmFlashK64 || c != 16)).collect())
     }
 }

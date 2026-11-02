@@ -783,7 +783,7 @@ proptest! {
                     let outcome = cache.store(&snapshot, generation as u64);
                     // The cache may evict unpinned snapshots while planning under class
                     // exhaustion; mirror that before planning the model's copy.
-                    reconcile(&cache, &mut model);
+                    reconcile(&cache, &mut model, &snapshot.meta);
                     stored.retain(|key, _| model.snapshots.contains_key(key));
                     if let StoreOutcome::Issued(ticket) | StoreOutcome::Deferred(ticket) = outcome {
                         let key = model.plan(&snapshot.meta, &device_pages(&snapshot));

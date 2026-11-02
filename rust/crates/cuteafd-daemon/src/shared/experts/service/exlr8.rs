@@ -2,7 +2,7 @@
 use super::*;
 use crate::shared::experts::exlr8::{grouped_decode_from_row, Exlr8Execution, Exlr8Weights};
 use crate::shared::memory::LoadStream;
-use cuteafd_ffi::{CuteafdDeviceBuffer, programs::Programs};
+use cuteafd_ffi::{exlr8::KernelFamily, CuteafdDeviceBuffer, programs::Programs};
 use cuteafd_loader::plan::exlr8::residency::{ExpertSet, Residency};
 use cuteafd_transport::{ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef,
     ExpertV2Dtype, ProtocolV2RequestDevicePayload};
@@ -16,7 +16,7 @@ fn chunks(rows: usize) -> impl Iterator<Item = (usize, usize)> {
     (0..rows).step_by(capacity).map(move |first| (first, (rows - first).min(capacity)))
 }
 
-fn execution_bytes(programs: &Programs<'_>, capacity: usize, unit_limit: usize,
+fn execution_bytes(programs: &Programs<'_>, family: KernelFamily, capacity: usize, unit_limit: usize,
     capability: (i32, i32),
     activations: crate::shared::experts::exlr8::Exlr8PrefillActivations) -> Result<usize> {
     ensure!((1..=PREFILL_ROWS).contains(&capacity), "EXLR8 capacity must be 1..4096");
@@ -24,14 +24,14 @@ fn execution_bytes(programs: &Programs<'_>, capacity: usize, unit_limit: usize,
     // Decode admits the routed serving core below the measured grouped
     // threshold and the 64-row grouped instance above it.
     let mut decode =
-        Exlr8Execution::decode_compact_workspace_bytes(programs, decode_rows, unit_limit)?;
+        Exlr8Execution::decode_compact_workspace_bytes(programs, family, decode_rows, unit_limit)?;
     if grouped_decode_from_row(unit_limit, capability) <= decode_rows {
         decode = decode.checked_add(
-            Exlr8Execution::decode_grouped_workspace_bytes(programs, decode_rows, unit_limit)?)
+            Exlr8Execution::decode_grouped_workspace_bytes(programs, family, decode_rows, unit_limit)?)
             .context("EXLR8 decode workspace overflow")?;
     }
     let prefill = if capacity > K1_ROWS {
-        Exlr8Execution::workspace_bytes_with_limit(programs, capacity, ExpertSet::Routed, unit_limit, activations)?
+        Exlr8Execution::workspace_bytes_with_limit(programs, family, capacity, ExpertSet::Routed, unit_limit, activations)?
     } else { 0 };
     decode.checked_add(prefill).context("EXLR8 retained execution workspace overflow")
 }
@@ -76,6 +76,9 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     ensure!(model.endpoints.iter().all(|endpoint|
         endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32),
         "EXLR8 worker requires standard FP8 K32 ingress and BF16 partials");
+    let geometry = catalog.routed_experts().geometry()?;
+    let family = KernelFamily::from_geometry(geometry.hidden as usize,
+        geometry.intermediate as usize / 128, geometry.topk as usize, geometry.experts as usize)?;
     let rows = config.capacity as usize;
     let fallback_staging = rows.checked_mul({ let h = catalog.routed_experts().geometry()?.hidden as usize; h + h / 32 }).context("EXLR8 fallback staging overflow")?;
     let layers = config.resident_layers(catalog.routed_experts().layers)?;
@@ -87,7 +90,7 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     let info = library.cuda_device_info(library.cuda_get_device()?)?;
     let capability = (info.compute_capability_major, info.compute_capability_minor);
     let owners = spark_execution_workspace(config, |capacity, _, staging_rows, _| {
-        Ok((execution_bytes(programs, capacity as usize, unit_limit, capability,
+        Ok((execution_bytes(programs, family, capacity as usize, unit_limit, capability,
             config.exlr8_prefill_activations)?, 0,
             staging_rows as usize * catalog.routed_experts().geometry()?.topk as usize * 8))
     })?;
@@ -136,12 +139,14 @@ impl<'w, 'a> Worker<'w, 'a> {
         weights: &'w [Exlr8Weights<'a>], config: &NativeExpertServiceConfig,
         remaining: usize) -> Result<Self> {
         ensure!(!weights.is_empty(), "EXLR8 worker has no resident layers");
+        let first = &weights[0].layout;
+        let family = KernelFamily::from_geometry(first.hidden, first.units, 8, first.experts)?;
         let capacity = config.capacity as usize;
         let unit_limit = weights.iter().map(|weight| weight.layout.compact_unit_limit()).max()
             .context("EXLR8 has no resident layers")?;
         let info = library.cuda_device_info(library.cuda_get_device()?)?;
         let capability = (info.compute_capability_major, info.compute_capability_minor);
-        let workspace = execution_bytes(programs, capacity, unit_limit, capability, config.exlr8_prefill_activations)?;
+        let workspace = execution_bytes(programs, family, capacity, unit_limit, capability, config.exlr8_prefill_activations)?;
         ensure!(workspace <= remaining, "EXLR8 retained arenas exceed admitted bytes");
         let decode_rows = capacity.min(K1_ROWS);
         let grouped_from_row = grouped_decode_from_row(unit_limit, capability);
@@ -149,19 +154,19 @@ impl<'w, 'a> Worker<'w, 'a> {
         // Admission above charged exactly the instances built here, before any
         // device storage is allocated.
         let decode_bytes =
-            Exlr8Execution::decode_compact_workspace_bytes(programs, decode_rows, unit_limit)?;
-        let execution = Exlr8Execution::new_decode_compact(library, programs, decode_rows,
+            Exlr8Execution::decode_compact_workspace_bytes(programs, family, decode_rows, unit_limit)?;
+        let execution = Exlr8Execution::new_decode_compact(library, programs, family, decode_rows,
             decode_bytes, unit_limit)?;
         let mut retained = decode_bytes;
         let grouped_decode = if grouped_decode {
             let bytes = Exlr8Execution::decode_grouped_workspace_bytes(
-                programs, decode_rows, unit_limit)?;
+                programs, family, decode_rows, unit_limit)?;
             retained = retained.checked_add(bytes).context("EXLR8 decode workspace overflow")?;
-            Some(Exlr8Execution::new_decode_grouped(library, programs, decode_rows, bytes, unit_limit)?)
+            Some(Exlr8Execution::new_decode_grouped(library, programs, family, decode_rows, bytes, unit_limit)?)
         } else { None };
         ensure!(retained <= workspace, "EXLR8 decode arenas exceed admitted workspace");
         let prefill = if capacity > K1_ROWS {
-            Some(Exlr8Execution::new_with_limit(library, programs, capacity,
+            Some(Exlr8Execution::new_with_limit(library, programs, family, capacity,
                 workspace - retained, ExpertSet::Routed, unit_limit, config.exlr8_prefill_activations)?)
         } else { None };
         let stream = LoadStream { library, raw: library.cuda_stream_create()? };

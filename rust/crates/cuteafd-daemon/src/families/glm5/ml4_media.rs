@@ -112,7 +112,10 @@ pub(crate) fn prepare(job: NativeRequest, tokens: Vec<u32>, expander: Option<&Mi
             let images = job.media.iter().map(|image| image.as_ref().clone()).collect::<Vec<_>>();
             if let Some(probe) = job.probe.as_ref().filter(|p| p.spec.prompt_ids.is_some() && !images.is_empty()) {
                 let spans = crate::shared::probe::image_spans(&probe.spec, &tokens, &images,
-                    crate::shared::probe::ImageMarkers::Rows(*expander), max_context)?;
+                    crate::shared::probe::ImageMarkers::Rows(crate::shared::probe::RowMarkers {
+                        image: expander.image, row_break: expander.row_break, end: expander.end,
+                        merge: expander.merge, vocabulary: expander.vocabulary,
+                    }), max_context)?;
                 (tokens, spans)
             } else {
                 let expanded = expander.expand(&tokens, &images, max_context)?;

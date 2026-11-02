@@ -210,8 +210,8 @@ fn solve(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutO
     let mark_slots = if let Some(slots) = options.prefix_slots { slots }
         else { v4::mark_slots(&cfg, devices.len(), shape.prefill_rows,
             shape.native_layers, shape.concurrency, options.prefix_entries("deepseek_v4"), options.mimo_prefix_mark_bytes, host_marks)? };
-    let onboard = match (options.onboard, options.local_expert_layers) {
-        (Some(onboard), _) => onboard,
+    let onboard = match (options.requested_onboard(), options.local_expert_layers) {
+        (Some(setting), _) => setting.resolve(routed.routed_layers()),
         (None, Some(n)) => Onboard::Layers(n.saturating_sub(routed.first_layer)),
         (None, None) => v4::default_onboard(),
     };

@@ -86,11 +86,11 @@ def test_pro_native_tp3_has_equal_k32_geometry_without_v41_identity():
 ])
 def test_v41_slice_gate_matches_ordered_serving_recipe(role, cmake):
     job = next(job for job in compare_sm.jobs("all") if job[0] == f"v41-slices-{role}")
-    assert job[2] == ["--role", role, "--rows", compare_sm.CAPACITIES,
+    assert job[2] == ["--role", role, "--rows", compare_sm.V41_CAPACITIES,
                       "--width", "192", "--standard-names"]
     recipe = (ROOT / "native/cmake/families/deepseek_v41" / cmake).read_text()
     assert f"--role {role}" in recipe
-    assert "--rows 1,16,80,256,1024,4096 --width 192 --standard-names" in recipe
+    assert "--rows ${CUTEAFD_V41_TARGET_ROWS_ARG} --width 192 --standard-names" in recipe
     assert "--atomic-min-capacity" not in recipe
 
 
@@ -105,7 +105,7 @@ def test_native_artifact_gate_uses_the_serving_tile_and_output_recipe(family):
         width = 192 if family == "v41" and (
             not role.startswith("spark_w") or artifact.logical % 192 == 0) else 128
         assert args[args.index("--width") + 1] == ",".join(
-            f"{capacity}:{width}" for capacity in compare_sm.CAPACITIES.split(","))
+            f"{capacity}:{width}" for capacity in (compare_sm.V41_CAPACITIES if family == "v41" else compare_sm.CAPACITIES).split(","))
         assert ("--atomic-min-capacity" in args) == (
             family == "dsv4p" and not role.startswith("spark_w"))
 

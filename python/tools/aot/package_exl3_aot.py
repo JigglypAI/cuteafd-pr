@@ -1182,6 +1182,7 @@ def build(args: argparse.Namespace) -> None:
         files = {str(p.relative_to(stage)): {'bytes': p.stat().st_size, 'sha256': digest(p)}
                  for p in sorted(stage.rglob('*')) if p.is_file()}
         manifest = {'schema': 'cuteafd.exl3-package.v1', 'role': args.role,
+                    'decode_capacities': [n for n in capacities if n <= 80],
                     'sparkinfer_revision': _pinned_sparkinfer.REVISION,
                     'compute': [props.major, props.minor], 'sms': props.multi_processor_count,
                     'variants': variants, 'files': files,

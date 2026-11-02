@@ -32,7 +32,7 @@ mod tests {
             .unwrap_or_else(|_| "16".into())
             .parse()?;
         ensure!(
-            [1, 16, 80, 256, 1024, 4096].contains(&capacity),
+            cuteafd_core::V41_TARGET_CAPACITIES.contains(&u64::from(capacity)),
             "invalid fixture capacity"
         );
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
@@ -147,7 +147,7 @@ mod tests {
                 && catalog.nvfp4().is_none()
                 && lib
                     .v41_tp2_expert_info(
-                        crate::shared::experts::rtx::native::kernel_capacities(rows as usize)?
+                        crate::shared::experts::rtx::native::kernel_capacities(rows as usize, &lib.native_expert_exports(3)?.capacities)?
                             .last()
                             .copied()
                             .unwrap(),

@@ -293,7 +293,8 @@ fn native_tp_rank_sum() -> Result<()> {
             for rows in [1, 16] {
                 let request = requests.build(geometry, layer, rows, dtype)?;
                 let exchange = link.exchange()?;
-                let wave = exchange.send_request(request)?;
+                let payload_bytes = exchange.compact_payload(request.header.row_count as usize);
+                let wave = exchange.send_request(request, payload_bytes)?;
                 let slot = wave.slot();
                 exchange.land(wave, stream.raw)?;
                 // SAFETY: full-width buffers and rank planes stay owned until

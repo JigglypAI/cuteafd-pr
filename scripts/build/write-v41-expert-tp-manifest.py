@@ -9,7 +9,7 @@ role export has been validated against the build that produced it:
 * its geometry matches the official checkpoint (experts 384, hidden 5120,
   intermediate 1152 for tp2 / 768 for tp3 / 384 for tp6 / 288 for tp8, topk 6);
   tp8 stores 384 columns, while other roles need no kernel padding;
-* its non-empty ``variants`` cover capacities 1/16/80/256/1024/4096;
+* its non-empty ``variants`` cover the authoritative V4.1 target capacities;
 * every file named in ``artifact_sha256`` exists in the role export directory
   and hashes to the declared value, so a stale or partial JSON cannot be
   advertised; and
@@ -58,7 +58,11 @@ EXPECTED_EXPERTS = 384
 EXPECTED_HIDDEN = 5120
 EXPECTED_TOPK = 6
 EXPECTED_CAPABILITY = [12, 1]
-EXPECTED_CAPACITIES = (1, 16, 80, 256, 1024, 4096)
+_capacity_spec = importlib.util.spec_from_file_location(
+    "manifest_v41_capacities", Path(__file__).resolve().parents[2] / "python/tools/lib/v41_capacities.py")
+_capacity_module = importlib.util.module_from_spec(_capacity_spec)
+_capacity_spec.loader.exec_module(_capacity_module)
+EXPECTED_CAPACITIES = _capacity_module.TARGET_CAPACITIES
 
 
 def sha256_file(path: Path) -> str:
@@ -247,7 +251,25 @@ def main() -> int:
                 if missing:
                     fail(f"{args.native_library} is missing NVFP4 {role} symbols {missing}")
 
+    native_packages = {}
+    for path in sorted(args.native_build_dir.glob("*/v41_experts.json")):
+        package = json.loads(path.read_text())
+        if "decode_capacities" in package:
+            key = f"{package.get('family', 'v41')}:{package['role']}"
+            if key in native_packages:
+                fail(f"duplicate native expert package {key}")
+            native_packages[key] = package
+    nvfp4_packages = {}
+    for path in sorted(args.native_build_dir.glob("*/v41_nvfp4_experts.json")):
+        package = json.loads(path.read_text())
+        if "decode_capacities" in package:
+            key = f"{package.get('family', 'v41')}:{package['role']}"
+            if key in nvfp4_packages:
+                fail(f"duplicate NVFP4 expert package {key}")
+            nvfp4_packages[key] = package
     document = {
+        "nvfp4_packages": nvfp4_packages,
+        "native_packages": native_packages,
         "schema": 1,
         "role": args.role,
         "requested": args.requested,

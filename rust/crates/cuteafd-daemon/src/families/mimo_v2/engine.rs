@@ -3070,7 +3070,7 @@ impl<'a> MimoEngine<'a> {
         // SAFETY: ids, weights and input rows hold this wave's `t` rows in
         // stream order; the copies read them before later stream work.
         unsafe {
-            exchange.send(t, layout, [w.route_ids.buffer, w.route_weights.buffer, input.buffer], self.stream,
+            exchange.send(t, exchange.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer, input.buffer], self.stream,
                 Box::new(move |routes, wire| mimo_request(routes, wire, index, t, h, topk, kind, bf16_input)))
         }
     }

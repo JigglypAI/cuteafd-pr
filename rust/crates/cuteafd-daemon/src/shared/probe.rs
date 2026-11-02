@@ -27,9 +27,18 @@ pub(crate) fn image_echo(job: &cuteafd_api::openai::NativeRequest, spans: &[cute
 }
 
 #[derive(Clone, Copy)]
+pub(crate) struct RowMarkers {
+    pub image: u32,
+    pub row_break: u32,
+    pub end: u32,
+    pub merge: u32,
+    pub vocabulary: u32,
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum ImageMarkers {
     Bounded(cuteafd_loader::media::SpanExpander),
-    Rows(cuteafd_loader::media::MistralSpanExpander),
+    Rows(RowMarkers),
 }
 
 /// Bind explicit probe ids to prepared image identities and checkpoint marker positions.
@@ -109,11 +118,11 @@ fn record_graph_captures(stats: &mut serde_json::Value, total: u64, sites: Vec<(
 mod image_span_tests {
     use super::*;
     use cuteafd_api::openai::probe::{ProbeImageUrl, ProbeMedia, ProbeSpec};
-    use cuteafd_loader::media::{ImageGrid, ImageKey, MistralSpanExpander, PreparedImage, SpanExpander};
+    use cuteafd_loader::media::{ImageGrid, ImageKey, PreparedImage, SpanExpander};
 
     #[test]
     fn bounded_and_row_marker_probes_bind_exactly_once() {
-        let rows = ImageMarkers::Rows(MistralSpanExpander { image: 5, row_break: 4, end: 6, merge: 2, vocabulary: 32 });
+        let rows = ImageMarkers::Rows(RowMarkers { image: 5, row_break: 4, end: 6, merge: 2, vocabulary: 32 });
         let bounded = ImageMarkers::Bounded(SpanExpander { placeholder: 5, start: 4, end: 6, vocabulary: 32 });
         for (markers, tokens, start, len) in [(bounded, vec![1, 4, 5, 5, 5, 5, 6, 2], 2, 4),
             (rows, vec![1, 5, 5, 4, 5, 5, 6, 2], 1, 6)] {

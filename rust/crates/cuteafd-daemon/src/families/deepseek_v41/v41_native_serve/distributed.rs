@@ -13,8 +13,10 @@ use std::rc::Rc;
 pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>) -> Result<()> {
+    // `all` becomes the expert inventory's exact count inside admission; this
+    // load-time floor only asserts that one routed layer stays resident.
     let minimum_expert_layers = match args.rtx_expert_layers {
-        admission::LocalLayers::Auto | admission::LocalLayers::ExpertsFirst => 1,
+        admission::LocalLayers::Auto | admission::LocalLayers::All => 1,
         admission::LocalLayers::Count(count) => {
             ensure!((1..=40).contains(&count), "dual RTX expert layers must be 1..=40");
             count as usize
@@ -313,7 +315,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     drop((lane_storage, index_storage, producer_storage, embedding_storage, engram_storage, tap_storage,
         query_storage, output_storage, dual_storage));
     let packed_suffix = admission::scoped(p, "encoder suffix", ||
-        slot_passes[0].new_packed_storage(&lib, capacity as usize))?;
+        slot_passes[0].new_packed_storage(&lib, capacity as usize, args.concurrency as usize))?;
     let prompt_suffixes = admission::scoped(p, "encoder suffix", || (0..args.concurrency)
         .map(|_| slot_passes[0].new_prompt_storage(&lib)).collect::<Result<Vec<_>>>())?;
     // Plan == runtime (WP6), unless the experimental TP2 attention/projections

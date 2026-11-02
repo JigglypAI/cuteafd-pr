@@ -988,8 +988,10 @@ v41_l2_prefetch="$(get L2_PREFETCH)"
 v41_engram_warm="$(get ENGRAM_WARM off)"
 case "$v41_engram_warm" in on|off) ;; *) release_die "ENGRAM_WARM must be on or off" ;; esac
 case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
-[[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
-  release_die "DeepSeek V4.1 RTX_EXPERT_LAYERS must be auto, all, N or N% with a readable checkpoint; max needs experts-first admission"
+[[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" == all || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
+  release_die "DeepSeek V4.1 RTX_EXPERT_LAYERS must be auto, all or a non-negative layer count"
+# V4.1 has 40 routed-expert layers, so `all` is exactly 40 here.
+[[ "$RTX_EXPERT_LAYERS" != all ]] || RTX_EXPERT_LAYERS=40
 ((!RELEASE_CONCURRENCY_EXPLICIT)) || [[ "$CONCURRENCY" =~ ^([1-9]|[1-5][0-9]|6[0-4])$ ]] || release_die "CONCURRENCY must be in 1..64"
 [[ "$PREFIX_CACHE_ENTRIES" == auto || "$PREFIX_CACHE_ENTRIES" =~ ^[0-9]+$ ]] || release_die "PREFIX_CACHE_ENTRIES must be auto or non-negative"
 [[ "$MAX_CONTEXT_TOKENS" =~ ^[1-9][0-9]*$ ]] && ((MAX_CONTEXT_TOKENS <= 1048576)) || release_die "MAX_CONTEXT_TOKENS must be in 1..1048576"
@@ -1000,7 +1002,7 @@ case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2"
 ((restart == 0 || dry_run == 0)) || release_die "--restart and --dry-run are mutually exclusive"
 if ((SPARK_COUNT == 0)); then
   [[ "$RTX_EXPERT_LAYERS" == 40 && "$RTX_GPUS" != 1 ]] ||
-    release_die "SPARK_COUNT=0 requires two RTX GPUs and RTX_EXPERT_LAYERS=40"
+    release_die "SPARK_COUNT=0 requires two RTX GPUs and RTX_EXPERT_LAYERS=40 (or all)"
 fi
 
 # Resolve the one SSH option set used by every remote step below: preflight reads,
@@ -1145,6 +1147,7 @@ v41_prefill_waves="$(get PREFILL_WAVES)"
 [[ -z "$KV_POOL_SIZE" ]] || count_args+=(--kv-pool-size "$KV_POOL_SIZE")
 [[ -z "$MEMORY_RESERVATION" ]] || count_args+=(--memory-reservation "$MEMORY_RESERVATION")
 count_args+=(--speculator "$SPECULATOR")
+[[ -z "$dspark_draft_limit" ]] || count_args+=(--dspark-draft-limit "$dspark_draft_limit")
 deployment_peers=()
 for ((rank = 0; rank < RELEASE_AVAILABLE_SPARKS; rank++)); do
   lane_key="SPARK_${rank}_LANE_A"
@@ -2224,8 +2227,8 @@ if [[ $family == kimi_k3 ]]; then
   case "$kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   family_args+=(--kv-cache "$kv_cache")
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
-  [[ "$local_layers" == auto || "$local_layers" =~ ^[0-9]+$ ]] ||
-    release_die "Kimi K3 RTX_EXPERT_LAYERS is auto or a fixed routed-layer count, not $local_layers"
+  [[ "$local_layers" == auto || "$local_layers" == all || "$local_layers" =~ ^[0-9]+$ ]] ||
+    release_die "Kimi K3 RTX_EXPERT_LAYERS is auto, all or a fixed routed-layer count, not $local_layers"
   family_args+=(--rtx-expert-layers "$local_layers")
   # Header-native EXL3 K6 core tensors are served natively (Kimi slots always
   # package the K6 programs).
@@ -2235,11 +2238,11 @@ fi
 # step). Keys left unset pass nothing (images older than the options run).
 [[ -z "$(get DECODE_SHARE)" ]] || family_args+=(--decode-share "$(get DECODE_SHARE)")
 # RTX_EXPERT_LAYERS (DeepSeek V4, GLM 5.3 and MiMo): unset is uniformly pool-first
-# auto; max is the explicit experts-first policy leaving at least a 262K pool.
-# N, N% or all fix the RTX-resident routed layers, then the KV pool fills the
-# remaining budget up to its target (refused below its floor). 0 leaves the
-# backbone experts on the Sparks. With two RTX every onboard mode uses TP2
-# halves; GPU1 whole-layer expert ranges are no longer supported.
+# auto; all pins every routed-expert layer of the target model and refuses (naming
+# the count) when it does not fit. N fixes exactly N RTX-resident routed layers,
+# then the KV pool fills the remaining budget up to its target (refused below its
+# floor). 0 leaves the backbone experts on the Sparks. With two RTX every onboard
+# mode uses TP2 halves; GPU1 whole-layer expert ranges are no longer supported.
 if [[ $serve == serve-dsv4 || $serve == serve-glm || $serve == serve-mimo ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS)"
   onboard_flag=--rtx-expert-layers
@@ -2256,7 +2259,7 @@ if [[ $serve == serve-dsv4 || $serve == serve-glm || $serve == serve-mimo ]]; th
   esac
   case "$local_layers" in
     "") ;;
-    auto|max) family_args+=("$onboard_flag" "$local_layers") ;;
+    auto|all) family_args+=("$onboard_flag" "$local_layers") ;;
     *) family_args+=("$fixed_onboard_flag" "$local_layers") ;;
   esac
 fi

@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn exl3_worker_checks_the_selected_response_destination() -> Result<()> {
+    let host_bytes = 2752 * 4096 * 2;
+    // Muse returns eight per-expert BF16 rows rather than a compact reduced row.
+    let partial_bytes = 512 * 8 * 4096 * 2;
+    assert!(partial_bytes > host_bytes);
+    let slot_bytes = EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN + partial_bytes;
+    let payload_bytes = slot_bytes - EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
+    Exl3Worker::validate_output_capacity(partial_bytes, host_bytes, Some(payload_bytes))?;
+    assert!(Exl3Worker::validate_output_capacity(partial_bytes, host_bytes, Some(payload_bytes - 1)).is_err());
+    assert!(Exl3Worker::validate_output_capacity(partial_bytes, host_bytes, None).is_err());
+    // A large host fallback cannot make an undersized mapped destination safe.
+    assert!(Exl3Worker::validate_output_capacity(partial_bytes, partial_bytes, Some(payload_bytes - 1)).is_err());
+    Exl3Worker::validate_output_capacity(host_bytes, host_bytes, None)?;
+    Exl3Worker::validate_output_capacity(host_bytes, 0, Some(host_bytes))?;
+    Ok(())
+}
+
+#[test]
 fn exl3_worker_rank_bounds_include_tp1() -> Result<()> {
     for world in 1..=8 {
         for rank in 0..world {

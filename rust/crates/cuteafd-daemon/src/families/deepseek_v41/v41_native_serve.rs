@@ -494,7 +494,7 @@ fn worker(
     // The slots hold their components' storage; the set itself is no owner.
     drop(slot_storage);
     let packed_suffix = admission::scoped(p, "encoder suffix", ||
-        slot_passes[0].new_packed_storage(&lib, capacity as usize))?;
+        slot_passes[0].new_packed_storage(&lib, capacity as usize, args.concurrency as usize))?;
     let prompt_suffixes = admission::scoped(p, "encoder suffix", || (0..args.concurrency)
         .map(|_| slot_passes[0].new_prompt_storage(&lib)).collect::<Result<Vec<_>>>())?;
     // Plan == runtime (WP6): the slot set and decode lanes are exactly the
