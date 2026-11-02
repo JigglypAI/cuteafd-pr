@@ -506,8 +506,12 @@ def test_muse_default_drafter_is_pinned_and_off_is_explicit(tmp_path: Path, mode
     drafter = "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"
     revision = "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6"
     _snapshot(tmp_path / "hf", drafter, {}, revision=revision)
-    # A moving main must not replace the measured revision.
-    _snapshot(tmp_path / "hf", drafter, {}, revision="unqualified-main")
+    # The shared fixture creates a repository once; add a second cached revision.
+    root = tmp_path / "hf/hub" / f"models--{drafter.replace('/', '--')}"
+    moving = root / "snapshots/unqualified-main"
+    moving.mkdir()
+    (moving / "config.json").write_text("{}")
+    (root / "refs/main").write_text("unqualified-main")
     keys = "SPARK_COUNT=6\nRTX_GPUS=2\n" + _hosts(6)
     if mode is not None:
         keys += f"SPECULATOR={mode}\n"
