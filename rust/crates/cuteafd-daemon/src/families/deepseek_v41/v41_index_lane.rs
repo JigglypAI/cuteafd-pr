@@ -96,7 +96,7 @@ impl<'w, 'a> IndexLane<'w, 'a> {
     pub fn storage_bytes(library: &NativeLibrary, rows: u32, unit: u32) -> Result<[usize; 3]> {
         Ok([IndexQueryWave::storage_bytes(library, rows, unit)?,
             IndexSelectionWave::storage_bytes(rows as usize, unit as usize)?,
-            IndexSelectionWave::shared_device_bytes(unit as usize)?])
+            IndexSelectionWave::follower_storage_bytes(rows as usize, unit as usize)?])
     }
     pub fn storage(weights: &'w IndexLaneWeights<'a>, rows: u32, unit: u32, readers: &[i32]) -> Result<Rc<IndexLaneStorage<'a>>> {
         ensure!(weights.placement.is_none(), "unplaced index storage requires unplaced weights");
