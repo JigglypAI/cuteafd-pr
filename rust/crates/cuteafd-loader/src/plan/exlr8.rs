@@ -541,18 +541,20 @@ impl Exlr8Plan {
     }
 }
 
-#[derive(Debug)]
-struct ExpertGeometry {
-    hidden: usize,
-    intermediate: usize,
-    experts: usize,
-    layers: usize,
-    first: usize,
-    mtp_layers: usize,
+/// Expert geometry from the family's typed HF configuration reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpertGeometry {
+    pub hidden: usize,
+    pub intermediate: usize,
+    pub experts: usize,
+    /// Served backbone extent; MTP is validated separately, not charged to DFlash2.
+    pub layers: usize,
+    pub first: usize,
+    pub mtp_layers: usize,
 }
 
 impl ExpertGeometry {
-    fn from_hf(config: &Value) -> Result<Self> {
+    pub fn from_hf(config: &Value) -> Result<Self> {
         match architecture(config)? {
             "glm5" => {
                 let cfg = crate::families::glm5::GlmDsaConfig::from_hf(config)?;
@@ -795,7 +797,8 @@ struct Layer {
     widths: BTreeSet<usize>,
     shared_widths: BTreeSet<usize>,
 }
-fn manifest_names(snapshot: &Path) -> Result<Vec<String>> {
+/// Discover published manifest names; widths and TP1..8 byte inventory come from `inspect`.
+pub fn manifest_names(snapshot: &Path) -> Result<Vec<String>> {
     let mut names = Vec::new();
     for entry in std::fs::read_dir(snapshot.join("manifests"))? {
         let entry = entry?;
@@ -1088,6 +1091,8 @@ pub fn inspect(
         count.checked_add(cfg.mtp_layers).context("EXLR8 layer extent overflow")?,
         first,
     )?;
+    // Validate checkpoint MTP records, but retain backbone-only serving fit bytes.
+    let layers = layers.into_iter().filter(|layer| layer.id < count).collect::<Vec<_>>();
     let dense = dense_operands(snapshot, count)?;
     let dense_source = "checkpoint native EXLR8 records (no BF16 conversion)".to_owned();
     let names = manifest_names(snapshot)?;

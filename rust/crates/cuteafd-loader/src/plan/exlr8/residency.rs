@@ -12,6 +12,11 @@ use std::sync::Arc;
 
 type Result<T> = std::result::Result<T, ResidencyError>;
 
+fn number_string(metadata: &serde_json::Value, key: &str) -> anyhow::Result<usize> {
+    metadata[key].as_str().with_context(|| format!("EXLR8 slice {key} missing"))?
+        .parse().with_context(|| format!("EXLR8 slice {key} invalid"))
+}
+
 #[derive(serde::Deserialize)]
 struct SelectedManifest {
     format: String,
@@ -59,6 +64,103 @@ impl MetadataInput {
 
     pub fn plan(&self, layer: usize, world: usize, rank: usize, set: ExpertSet) -> Result<Residency> {
         Residency::plan_inner(self, layer, world, rank, set).map_err(Into::into)
+    }
+
+    /// Cross-check optional published rank slices against canonical residency.
+    /// Slices never supply runtime ownership or become a loading prerequisite.
+    pub fn cross_check_index_slices(&self) -> anyhow::Result<usize> {
+        let mut checked = 0;
+        for world in 1..=8 {
+            let directory = self.snapshot.join(format!("index-slices/tp{world}/{}", self.selected));
+            if !directory.exists() { continue; }
+            for rank in 0..world {
+                let path = directory.join(format!("rank{rank}.safetensors"));
+                if !path.exists() { continue; }
+                self.cross_check_index_slice(&path, world, rank)?;
+                checked += 1;
+            }
+        }
+        Ok(checked)
+    }
+
+    fn cross_check_index_slice(&self, path: &Path, world: usize, rank: usize) -> anyhow::Result<()> {
+        use sha2::{Digest, Sha256};
+        let slice = Header::open(path)?;
+        let metadata = &slice.value["__metadata__"];
+        ensure!(metadata["format"] == "exlr8-v2-index-slice" && metadata["version"] == "1"
+            && number_string(metadata, "tp")? == world && number_string(metadata, "rank")? == rank
+            && metadata["set_id"] == self.manifest.set_id, "EXLR8 slice identity mismatch");
+        let bits = number_string(metadata, "k")?;
+        ensure!((2..=4).contains(&bits), "EXLR8 slice width unsupported");
+        let config = self.config.get("text_config").unwrap_or(&self.config);
+        let hidden = number(config, "hidden_size")?;
+        let experts = number(config, "n_routed_experts")?;
+        let units = number(config, "moe_intermediate_size")? / 128;
+        ensure!(number_string(metadata, "hidden_size")? == hidden
+            && number_string(metadata, "n_routed_experts")? == experts
+            && number_string(metadata, "half_bytes")? == hidden * 16 * bits,
+            "EXLR8 slice geometry mismatch");
+        let layers = metadata["layers"].as_str().context("EXLR8 slice layers missing")?
+            .split(',').map(|layer| layer.parse::<usize>().context("EXLR8 slice layer invalid"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let first = number(config, "first_k_dense_replace")?;
+        let end = number(config, "num_hidden_layers")?.checked_add(config.get("num_nextn_predict_layers")
+            .map(|_| number(config, "num_nextn_predict_layers")).transpose()?.unwrap_or(0))
+            .context("EXLR8 slice layer overflow")?;
+        ensure!(layers.iter().copied().eq(first..end), "EXLR8 slice layer extent mismatch");
+        let hashes: BTreeMap<String, String> = serde_json::from_str(metadata["index_sha256"]
+            .as_str().context("EXLR8 slice index hashes missing")?)?;
+        ensure!(hashes.len() == layers.len(), "EXLR8 slice index hash extent mismatch");
+        for layer in layers {
+            let canonical_path = self.snapshot.join(format!("experts/exlr8-layer-{layer:03}.index.safetensors"));
+            let canonical = Header::open(&canonical_path)?;
+            let hash = format!("{:x}", Sha256::digest(std::fs::read(&canonical_path)?));
+            ensure!(hashes.get(&layer.to_string()) == Some(&hash), "EXLR8 slice index hash mismatch");
+            let count = (0..=experts).map(|expert| (0..units)
+                .filter(|&unit| owner(units, expert, unit, layer, world) == rank).count()).sum::<usize>();
+            let root = format!("L{layer:03}");
+            let read = |suffix: &str, dtype: &str, shape: &[usize], bytes: usize| -> anyhow::Result<Vec<u8>> {
+                let source = range(&slice, path, &format!("{root}.{suffix}"), dtype, shape, 0, bytes)?;
+                let mut out = vec![0; bytes]; source.read(&mut out)?; Ok(out)
+            };
+            let owned = read("units", "I16", &[count, 2], count * 4)?;
+            let offsets = read("offset", "I64", &[count, 3], count * 24)?;
+            let checksums = read("checksum", "U64", &[count, 3], count * 24)?;
+            let channels = read("chan", "F16", &[count, 3, 128], count * 3 * 256)?;
+            let blocks = read("block", "F16", &[experts + 1, 3, hidden / 128], (experts + 1) * 3 * hidden / 128 * 2)?;
+            let signs = read("signs", "I8", &[2, hidden], hidden * 2)?;
+            let mut ordinal = 0;
+            for set in [ExpertSet::Routed, ExpertSet::Shared] {
+                let plan = self.plan(layer, world, rank, set)?;
+                let prefix = if set == ExpertSet::Shared { "shared." } else { "" };
+                let expected_checksums = canonical.read(&canonical_path, &format!("{prefix}k{bits}.checksum"))?;
+                ensure!(signs == plan.signs.concat(), "EXLR8 slice signs mismatch");
+                for group in plan.loads.chunks_exact(3) {
+                    let expert = if set == ExpertSet::Shared { experts } else { group[0].expert };
+                    ensure!(owned[ordinal * 4..ordinal * 4 + 2] == (expert as i16).to_le_bytes()
+                        && owned[ordinal * 4 + 2..ordinal * 4 + 4] == (group[0].unit as i16).to_le_bytes(),
+                        "EXLR8 slice ownership mismatch");
+                    for load in group {
+                        ensure!(load.bits == bits as i32, "EXLR8 slice disagrees with selected manifest width");
+                        let slot = ordinal * 3 + load.projection;
+                        ensure!(offsets[slot * 8..slot * 8 + 8] == load.source[0].offset.to_le_bytes(),
+                            "EXLR8 slice payload offset mismatch");
+                        let at = ((load.expert * 3 + load.projection) * units + load.unit) * 8;
+                        ensure!(checksums[slot * 8..slot * 8 + 8] == expected_checksums[at..at + 8],
+                            "EXLR8 slice checksum mismatch");
+                        for (source, bytes, label) in [(&load.source[1], &channels[slot * 256..slot * 256 + 256], "channel"),
+                            (&load.source[2], &blocks[(expert * 3 + load.projection) * hidden / 64..
+                                (expert * 3 + load.projection + 1) * hidden / 64], "block")] {
+                            let mut expected = vec![0; source.bytes]; source.read(&mut expected)?;
+                            ensure!(bytes == expected, "EXLR8 slice {label} mismatch");
+                        }
+                    }
+                    ordinal += 1;
+                }
+            }
+            ensure!(ordinal == count, "EXLR8 slice owned unit count mismatch");
+        }
+        Ok(())
     }
 
     fn layer(&self, layer: &Layer, units: usize, experts: usize) -> anyhow::Result<&SelectedLayer> {
@@ -718,6 +820,99 @@ mod tests {
     }
 
     use crate::plan::testing::exlr8::fixture;
+
+    #[test]
+    fn optional_rank_slices_cross_check_canonical_residency_and_reject_corruption() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), false);
+        let manifest_path = root.path().join("manifests/exlr8-manifest-mixed.json");
+        let mut manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["name"] = json!("k3");
+        manifest["layers"]["3"] = json!({"gate":vec![vec![3;3];2], "up":vec![vec![3;3];2], "down":vec![3;2],
+            "shared":{"gate":vec![3;3],"up":vec![3;3],"down":3}});
+        std::fs::write(root.path().join("manifests/exlr8-manifest-k3.json"), manifest.to_string()).unwrap();
+        let input = MetadataInput::open(root.path(), "k3").unwrap();
+        assert_eq!(input.cross_check_index_slices().unwrap(), 0);
+        let index_hash = format!("{:x}", Sha256::digest(std::fs::read(root.path()
+            .join("experts/exlr8-layer-003.index.safetensors")).unwrap()));
+        let mut last = None;
+        for world in 1..=4 {
+            for rank in 0..world {
+                let mut owned = Vec::new();
+                let mut offsets = Vec::new();
+                let mut channels = Vec::new();
+                let mut blocks = vec![0; 3 * 3 * 2];
+                let mut signs = Vec::new();
+                for set in [ExpertSet::Routed, ExpertSet::Shared] {
+                    let plan = input.plan(3, world, rank, set).unwrap();
+                    signs = plan.signs.concat();
+                    for group in plan.loads.chunks_exact(3) {
+                        let expert = if set == ExpertSet::Shared { 2 } else { group[0].expert };
+                        owned.extend_from_slice(&(expert as i16).to_le_bytes());
+                        owned.extend_from_slice(&(group[0].unit as i16).to_le_bytes());
+                        for unit in group {
+                            offsets.extend_from_slice(&unit.source[0].offset.to_le_bytes());
+                            let mut bytes = vec![0; 256]; unit.source[1].read(&mut bytes).unwrap();
+                            channels.extend(bytes);
+                            unit.source[2].read(&mut blocks[(expert * 3 + unit.projection) * 2..
+                                (expert * 3 + unit.projection + 1) * 2]).unwrap();
+                        }
+                    }
+                }
+                let count = owned.len() / 4;
+                let tensors = vec![("units", "I16", vec![count,2], owned),
+                    ("offset", "I64", vec![count,3], offsets),
+                    ("checksum", "U64", vec![count,3], vec![0;count*24]),
+                    ("chan", "F16", vec![count,3,128], channels),
+                    ("block", "F16", vec![3,3,1], blocks),
+                    ("signs", "I8", vec![2,128], signs)];
+                let metadata = json!({"format":"exlr8-v2-index-slice","version":"1",
+                    "tp":world.to_string(),"rank":rank.to_string(),"k":"3","set_id":"b".repeat(64),
+                    "hidden_size":"128","n_routed_experts":"2","half_bytes":"6144","layers":"3",
+                    "index_sha256":json!({"3":index_hash}).to_string()});
+                let mut header = serde_json::Map::from_iter([("__metadata__".into(),metadata)]);
+                let mut payload = Vec::new();
+                for (name,dtype,shape,bytes) in tensors {
+                    header.insert(format!("L003.{name}"), json!({"dtype":dtype,"shape":shape,
+                        "data_offsets":[payload.len(),payload.len()+bytes.len()]}));
+                    payload.extend(bytes);
+                }
+                let header_bytes = serde_json::to_vec(&header).unwrap();
+                let mut bytes = (header_bytes.len() as u64).to_le_bytes().to_vec();
+                bytes.extend(&header_bytes); bytes.extend(payload);
+                let directory = root.path().join(format!("index-slices/tp{world}/k3"));
+                std::fs::create_dir_all(&directory).unwrap();
+                let path = directory.join(format!("rank{rank}.safetensors"));
+                std::fs::write(&path, &bytes).unwrap();
+                last = Some((path, bytes, header, 8 + header_bytes.len()));
+            }
+        }
+        assert_eq!(input.cross_check_index_slices().unwrap(), 10);
+        let (path, original, header, base) = last.unwrap();
+        for tensor in ["units", "offset", "checksum", "chan", "block", "signs"] {
+            let mut corrupt = original.clone();
+            let offset = header[&format!("L003.{tensor}")]["data_offsets"][0].as_u64().unwrap() as usize;
+            corrupt[base + offset] ^= 1;
+            std::fs::write(&path, corrupt).unwrap();
+            assert!(input.cross_check_index_slices().is_err(), "{tensor}");
+        }
+        std::fs::write(&path, original).unwrap();
+        let index_path = root.path().join("experts/exlr8-layer-003.index.safetensors");
+        std::fs::OpenOptions::new().append(true).open(index_path).unwrap().write_all(&[0]).unwrap();
+        assert!(input.cross_check_index_slices().unwrap_err().to_string().contains("hash mismatch"));
+    }
+
+    #[test]
+    fn published_index_slices_when_explicitly_supplied() {
+        let Some(root) = std::env::var_os("CUTEAFD_EXLR8_SLICE_SNAPSHOT") else { return; };
+        for manifest in super::super::manifest_names(Path::new(&root)).unwrap() {
+            let input = MetadataInput::open(Path::new(&root), &manifest).unwrap();
+            let count = input.cross_check_index_slices().unwrap();
+            assert!(count > 0, "expected published slices for {manifest}");
+            println!("{manifest}: {count} published rank slices agree with canonical residency");
+        }
+    }
 
     #[test]
     fn metadata_input_reuses_selection_but_rechecks_payload_headers() {
