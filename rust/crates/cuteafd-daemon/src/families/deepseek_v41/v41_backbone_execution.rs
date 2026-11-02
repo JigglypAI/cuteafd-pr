@@ -372,7 +372,7 @@ struct WindowBatch<'a> {
 }
 impl<'a> WindowBatch<'a> {
     const LAYERS: usize = 40;
-    const CHUNKS: usize = 16;
+    const CHUNKS: usize = cuteafd_core::V41_MAX_REQUESTS;
     fn bytes(capacity: usize) -> usize {
         Self::LAYERS * (std::mem::size_of::<cuteafd_ffi::V41KvStoreLayer>() + capacity * 8 + Self::CHUNKS * 16)
     }
@@ -393,15 +393,27 @@ impl<'a> WindowBatch<'a> {
     unsafe fn enqueue(&mut self, layers: &[crate::families::deepseek_v41::v41_window::BatchedWindowCommit]) -> Result<()> {
         let rows = layers.first().context("empty window batch")?.destinations.len();
         let chunks = layers[0].ends.len();
-        ensure!(layers.len() <= Self::LAYERS && rows <= self.capacity && (1..=Self::CHUNKS).contains(&chunks)
+        let offset = Self::stage(self.staging.bytes_mut(), self.table.buffer.ptr as u64,
+            self.table.buffer.device_id, self.capacity, layers)?;
+        let mut host = self.staging.buffer; host.bytes = offset;
+        unsafe {
+            self.library.copy_host_buffer_h2d_async(self.table.buffer, host, offset, self.stream.raw)?;
+            self.kernel.launch(self.table.buffer, layers.len(), rows, chunks, self.stream.raw)
+        }
+    }
+    fn stage(staging: &mut [u8], base: u64, device: i32, capacity: usize,
+        layers: &[crate::families::deepseek_v41::v41_window::BatchedWindowCommit]) -> Result<usize> {
+        let rows = layers.first().context("empty window batch")?.destinations.len();
+        let chunks = layers[0].ends.len();
+        ensure!(layers.len() <= Self::LAYERS && rows <= capacity && chunks <= rows
+            && (1..=Self::CHUNKS).contains(&chunks)
             && layers.iter().all(|l| l.destinations.len() == rows && l.ends.len() == chunks
-                && l.device == self.table.buffer.device_id),
-            "window batch shape differs");
+                && l.device == device), "window batch shape differs");
         let entry = std::mem::size_of::<cuteafd_ffi::V41KvStoreLayer>();
-        let base = self.table.buffer.ptr as u64;
+        let bytes = layers.len() * (entry + rows * 8 + chunks * 16);
+        ensure!(staging.len() >= bytes, "window batch staging too small");
         let mut offset = layers.len() * entry;
         let mut entries = Vec::with_capacity(layers.len());
-        let staging = self.staging.bytes_mut();
         for layer in layers {
             let mut value = layer.layer;
             value.destinations = base + offset as u64;
@@ -421,11 +433,7 @@ impl<'a> WindowBatch<'a> {
             let bytes = unsafe { std::slice::from_raw_parts((value as *const cuteafd_ffi::V41KvStoreLayer).cast::<u8>(), entry) };
             staging[i * entry..(i + 1) * entry].copy_from_slice(bytes);
         }
-        let mut host = self.staging.buffer; host.bytes = offset;
-        unsafe {
-            self.library.copy_host_buffer_h2d_async(self.table.buffer, host, offset, self.stream.raw)?;
-            self.kernel.launch(self.table.buffer, layers.len(), rows, chunks, self.stream.raw)
-        }
+        Ok(offset)
     }
     fn synchronize(&self) -> Result<()> {
         unsafe { self.library.cuda_stream_synchronize(self.stream.raw) }
@@ -915,6 +923,43 @@ mod tests {
         }
         for capacity in [0, 4097, u32::MAX] {
             assert!(BackboneExecution::workspace_bytes(&library, capacity).is_err());
+        }
+        Ok(())
+    }
+    #[test]
+    fn window_batch_staging_covers_c64_and_short_rows() -> Result<()> {
+        use crate::families::deepseek_v41::v41_window::BatchedWindowCommit;
+        for count in [1, 16, 33, 64] {
+            for rows in [count, 2752] {
+                let layers: Vec<_> = (0..40).map(|layer| BatchedWindowCommit {
+                    destinations: (0..rows as u64).map(|row| row + layer * 10000).collect(),
+                    ends: (0..count as u64).map(|slot| (slot, 1000 + slot)).collect(),
+                    layer: cuteafd_ffi::V41KvStoreLayer { values: layer, scales: 2, cache: 3,
+                        cache_scales: 4, ends: 5, capacity: 8192, destinations: 0, end_pairs: 0 },
+                    device: 0,
+                }).collect();
+                let capacity = WindowBatch::bytes(rows);
+                let mut bytes = vec![0xa5; capacity + 16];
+                let used = WindowBatch::stage(&mut bytes[..capacity], 4096, 0, rows, &layers)?;
+                let entry = std::mem::size_of::<cuteafd_ffi::V41KvStoreLayer>();
+                let mut offset = layers.len() * entry;
+                for (i, layer) in layers.iter().enumerate() {
+                    let actual: Vec<_> = bytes[i * entry..(i + 1) * entry].chunks_exact(8)
+                        .map(|b| u64::from_ne_bytes(b.try_into().unwrap())).collect();
+                    assert_eq!(actual, [i as u64, 2, 3, 4, 5, 8192,
+                        4096 + offset as u64, 4096 + (offset + rows * 8) as u64]);
+                    let payload: Vec<_> = layer.destinations.iter().copied()
+                        .chain(layer.ends.iter().flat_map(|&(slot, end)| [slot, end]))
+                        .flat_map(u64::to_ne_bytes).collect();
+                    assert_eq!(&bytes[offset..offset + payload.len()], &payload);
+                    offset += payload.len();
+                }
+                assert_eq!(used, offset);
+                assert!(bytes[used..].iter().all(|&b| b == 0xa5));
+                let mut short = vec![0xa5; used - 1];
+                assert!(WindowBatch::stage(&mut short, 4096, 0, rows, &layers).is_err());
+                assert!(short.iter().all(|&b| b == 0xa5));
+            }
         }
         Ok(())
     }

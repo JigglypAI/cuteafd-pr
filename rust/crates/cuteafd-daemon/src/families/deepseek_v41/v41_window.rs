@@ -63,8 +63,8 @@ pub(crate) struct WindowState<'a> {
     values: DeviceAllocation<'a>,
     scales: DeviceAllocation<'a>,
     ends: DeviceAllocation<'a>,
-    slots: [Slot; 16],
-    writing: std::rc::Rc<std::cell::Cell<u16>>,
+    slots: [Slot; cuteafd_core::V41_MAX_REQUESTS],
+    writing: std::rc::Rc<std::cell::Cell<u64>>,
     slot_count: usize,
     layer: usize,
     owner: u64,
@@ -73,7 +73,7 @@ pub(crate) struct WindowState<'a> {
 impl<'a> WindowState<'a> {
     pub fn device_bytes(layer: usize, slots: usize) -> Result<usize> {
         ensure!(
-            layer < 40 && (1..=16).contains(&slots),
+            layer < 40 && (1..=cuteafd_core::V41_MAX_REQUESTS).contains(&slots),
             "invalid backbone window state shape"
         );
         Ok(slots * (128 * 528 + 8))
@@ -92,7 +92,7 @@ impl<'a> WindowState<'a> {
             values: DeviceAllocation::attention_plane(library, slots * 128, 512, "window cache values")?,
             scales: DeviceAllocation::attention_plane(library, slots * 128, 16, "window cache scales")?,
             ends: DeviceAllocation::new(library, slots * 8)?,
-            slots: [Slot::default(); 16],
+            slots: [Slot::default(); cuteafd_core::V41_MAX_REQUESTS],
             writing: Default::default(),
             slot_count: slots,
             layer,
@@ -321,7 +321,7 @@ impl<'a> WindowWeights<'a> {
             kv: self.library.v41_kv()?,
             weights: self,
             staging: HostAllocation::new(self.library, unit * 8)?,
-            commit_staging: HostAllocation::new(self.library, unit * 8 + 128)?,
+            commit_staging: HostAllocation::new(self.library, commit::staging_bytes(unit))?,
             capacity: unit,
             graph: None,
             graphs: GraphBank::new(None),
@@ -590,7 +590,7 @@ impl WindowWave<'_, '_> {
             versions: vec![],
             rows: 0,
         };
-        let mut seen = [false; 16];
+        let mut seen = [false; cuteafd_core::V41_MAX_REQUESTS];
         for c in chunks {
             let slot = state.validate(c.lease)?;
             ensure!(

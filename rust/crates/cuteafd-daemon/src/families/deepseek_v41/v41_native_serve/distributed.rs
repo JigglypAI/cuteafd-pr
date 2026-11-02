@@ -315,7 +315,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     drop((lane_storage, index_storage, producer_storage, embedding_storage, engram_storage, tap_storage,
         query_storage, output_storage, dual_storage));
     let packed_suffix = admission::scoped(p, "encoder suffix", ||
-        slot_passes[0].new_packed_storage(&lib, capacity as usize))?;
+        slot_passes[0].new_packed_storage(&lib, capacity as usize, args.concurrency as usize))?;
     let prompt_suffixes = admission::scoped(p, "encoder suffix", || (0..args.concurrency)
         .map(|_| slot_passes[0].new_prompt_storage(&lib)).collect::<Result<Vec<_>>>())?;
     // Plan == runtime (WP6), unless the experimental TP2 attention/projections

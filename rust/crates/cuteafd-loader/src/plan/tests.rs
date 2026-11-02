@@ -435,11 +435,16 @@ fn boot_concurrency_full_plan_matrix() {
         for gpus in [1, 2] {
             for c in [1, 4, 16, 17, 32, 64, 65, 128] {
                 let mut options = if family == "qwen3_5" { dense_options.clone() }
-                    else { wave_plan_options(dir.path(), 4) };
+                    else { wave_plan_options(dir.path(), if family == "deepseek_v41" { gpus * 3 } else { 4 }) };
                 let layout = options.layout.as_mut().unwrap();
                 layout.state_slots = None;
                 layout.rtx_bytes = vec![96 << 30; gpus];
                 layout.concurrency = c;
+                if family == "deepseek_v41" {
+                    layout.workspace_manifest = v41_workspace(dir.path());
+                    layout.native_mtp_layers = 3;
+                    layout.pool_tokens = Some(262_144);
+                }
                 let (report, phases) = input.plan_with_timings(&options);
                 assert!(phases.total() < std::time::Duration::from_secs(10),
                     "{family} C{c} GPUs={gpus}: {phases:?}");
@@ -453,6 +458,10 @@ fn boot_concurrency_full_plan_matrix() {
                     let cache = report.cache_requirements.as_ref().unwrap();
                     assert_eq!(u64::from(cache.concurrency), c);
                     assert_eq!(u64::from(cache.state_slots), cuteafd_core::concurrency::state_slots(c));
+                    if family == "deepseek_v41" {
+                        assert!(report.fits && report.placement_supported && report.executable(),
+                            "V4.1 C{c} GPUs={gpus}: {}", render(&report));
+                    }
                     if !report.fits || !report.placement_supported {
                         let memory = report.memory_layout.as_ref().unwrap();
                         assert!(!report.hints.is_empty() || !memory.notes.is_empty()
@@ -461,6 +470,38 @@ fn boot_concurrency_full_plan_matrix() {
                     }
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn v41_full_concurrency_launcher_admission_and_configured_draft_width() {
+    use cuteafd_core::memory_layout::Category;
+    let dir = strict_v41_snapshot(false);
+    let input = PlanInput::open(dir.path()).unwrap();
+    for (gpus, ranks) in [(1, 3), (2, 6)] {
+        for concurrency in [17, 32, 33, 64] {
+            let mut draft_bytes = Vec::new();
+            for limit in [5, 7] {
+                let mut options = wave_plan_options(dir.path(), ranks);
+                let layout = options.layout.as_mut().unwrap();
+                layout.rtx_bytes = vec![96 << 30; gpus];
+                layout.concurrency = concurrency;
+                layout.context_tokens = 262_144;
+                layout.pool_tokens = Some(0);
+                layout.workspace_manifest = v41_workspace(dir.path());
+                layout.native_mtp_layers = 3;
+                layout.dspark_draft_limit = limit;
+                let start = std::time::Instant::now();
+                let report = input.plan_spark_count(&options, 6, Some(ranks)).unwrap();
+                assert!(start.elapsed() < std::time::Duration::from_secs(10));
+                assert!(report.fits && report.placement_supported && report.executable(),
+                    "C{concurrency} GPUs={gpus} width={limit}: {}", render(&report));
+                let memory = report.memory_layout.as_ref().unwrap();
+                draft_bytes.push(memory.devices.iter().flat_map(|d| &d.items)
+                    .filter(|i| i.category == Category::Drafter).map(|i| i.bytes).sum::<u64>());
+            }
+            assert!(draft_bytes[1] > draft_bytes[0], "configured width must charge larger terminal/head owners");
         }
     }
 }

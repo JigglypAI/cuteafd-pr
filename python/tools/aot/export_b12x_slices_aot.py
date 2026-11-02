@@ -112,6 +112,9 @@ def fc2_n_splits(role: str, capacity: int, width: int, hidden: int) -> int:
     return 2 if role in ("spark", "rtx_tp2") and capacity == 1 and width == 128 and hidden % 256 == 0 else 1
 
 
+from mxfp4_layouts import native_export_capacities
+
+
 def export(output, capacities, width, atomic_min_capacity=None, role="spark", *, standard_names=False, compact_max_capacity=None, compact_live_rows=None, family="v41"):
     import torch
     import cutlass
@@ -177,6 +180,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         compact_live_rows=compact_live_rows,
         geometry=dict(experts=experts, hidden=hidden, intermediate=intermediate,
                       kernel_intermediate=kernel_intermediate, topk=topk),
+        decode_capacities=[n for n in capacities if n <= max(native_export_capacities(family, role)[1])],
         variants=[],
     )
     includes, entries, reductions = [], [], []

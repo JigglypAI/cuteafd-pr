@@ -326,10 +326,11 @@ mod load_order_tests {
 #[derive(Debug)]
 pub(crate) struct ExpertReductionPlan {
     decode: Vec<(usize, usize)>,
+    decode_rows: usize,
 }
 
 impl ExpertReductionPlan {
-    pub(crate) fn new<S: Eq + std::fmt::Debug>(variants: &[(usize, S)]) -> anyhow::Result<Self> {
+    pub(crate) fn new<S: Eq + std::fmt::Debug>(variants: &[(usize, S)], decode_rows: usize) -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
         let canonical = &variants
             .iter()
@@ -348,14 +349,15 @@ impl ExpertReductionPlan {
         let mut decode: Vec<_> = variants
             .iter()
             .enumerate()
-            .filter(|(_, (capacity, signature))| *capacity <= 80 && signature == canonical)
+            .filter(|(_, (capacity, signature))| *capacity <= decode_rows && signature == canonical)
             .map(|(index, (capacity, _))| (*capacity, index))
             .collect();
         decode.sort_unstable();
-        ensure!(decode.last().is_some_and(|&(capacity, _)| capacity >= maximum.min(80)),
+        ensure!(decode.last().is_some_and(|&(capacity, _)| capacity >= maximum.min(decode_rows)),
             "expert package has no export covering {} decode rows with canonical m1 reduction {canonical:?}; admitted capacity/recipes: {variants:?}; export a matching capacity",
-            maximum.min(80));
-        Ok(Self { decode })
+            maximum.min(decode_rows));
+        let decode_rows = decode.last().unwrap().0;
+        Ok(Self { decode, decode_rows })
     }
 
     /// One compiled-recipe check for all native families and routed-expert owners.
@@ -364,28 +366,34 @@ impl ExpertReductionPlan {
         infos: impl IntoIterator<Item = cuteafd_ffi::V41ExpertInfo>,
     ) -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
+        let infos = infos.into_iter().collect::<Vec<_>>();
+        let role = infos.first().context("empty native expert package")?.role;
+        let exports = library.native_expert_exports(role)?;
+        ensure!(infos.iter().all(|info| info.role == role && exports.capacities.contains(&info.capacity_rows)),
+            "loaded native expert roles/capacities differ from the installed package contract");
+        let decode_rows = *exports.decode.last().context("empty native decode capacities")? as usize;
         let variants = infos.into_iter().map(|info| {
             let recipe = library.native_expert_reduction(&info).with_context(|| {
                 format!("native MXFP4 role {} m{} reduction export", info.role, info.capacity_rows)
             })?;
-            if info.capacity_rows <= 80 {
+            if info.capacity_rows as usize <= decode_rows {
                 ensure!(recipe.plane_fold == 1 && recipe.implementation == 1,
                     "native MXFP4 role {} m{} decode requires ordered FP32 slice planes, got {recipe:?}",
                     info.role, info.capacity_rows);
             }
             Ok((info.capacity_rows as usize, recipe))
         }).collect::<anyhow::Result<Vec<_>>>()?;
-        Self::native_recipes(&variants)
+        Self::native_recipes(&variants, decode_rows)
             .context("native MXFP4 decode differs from canonical m1 slice/fold recipe")
     }
 
-    fn native_recipes(variants: &[(usize, cuteafd_ffi::V41ExpertReduction)]) -> anyhow::Result<Self> {
+    fn native_recipes(variants: &[(usize, cuteafd_ffi::V41ExpertReduction)], decode_rows: usize) -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
         let canonical = &variants.iter().find(|(capacity, _)| *capacity == 1)
             .context("native package needs canonical m1 reduction")?.1;
-        ensure!(variants.iter().all(|(capacity, recipe)| *capacity > 80 || recipe == canonical),
+        ensure!(variants.iter().all(|(capacity, recipe)| *capacity > decode_rows || recipe == canonical),
             "native decode capacities must share one slice/fold recipe");
-        Self::new(variants)
+        Self::new(variants, decode_rows)
     }
 
     pub(crate) fn execution_index(
@@ -396,7 +404,7 @@ impl ExpertReductionPlan {
     ) -> anyhow::Result<usize> {
         use anyhow::{ensure, Context};
         ensure!(rows > 0, "expert live rows must be positive");
-        if rows <= 80 {
+        if rows <= self.decode_rows {
             return self
                 .decode
                 .iter()
@@ -417,6 +425,17 @@ mod reduction_tests {
     use super::ExpertReductionPlan;
 
     #[test]
+    fn packages_with_distinct_decode_ceilings_both_admit() {
+        for ceiling in [64, 80] {
+            let variants = [(4096, 192), (1, 64), (ceiling, 64)];
+            let plan = ExpertReductionPlan::new(&variants, ceiling).unwrap();
+            assert_eq!(plan.execution_index(ceiling, ceiling, variants.iter().map(|v| v.0)).unwrap(), 2);
+            let bad = [(4096, 192), (1, 64), (ceiling, 192)];
+            assert!(ExpertReductionPlan::new(&bad, ceiling).is_err());
+        }
+    }
+
+    #[test]
     fn native_plan_rejects_mixed_decode_tilings_below_80() {
         use cuteafd_ffi::V41ExpertReduction;
         let recipe = V41ExpertReduction { version: 1, slice_width: 128, fc2_k_steps: 4,
@@ -424,12 +443,12 @@ mod reduction_tests {
             block_threads: 128, fc1_k_stage: 128 };
         let variants = [(1, recipe), (16, recipe), (80, recipe),
             (4096, V41ExpertReduction { slice_width: 64, fc2_k_steps: 2, plane_count: 5, ..recipe })];
-        ExpertReductionPlan::native_recipes(&variants).unwrap();
+        ExpertReductionPlan::native_recipes(&variants, 80).unwrap();
         for index in 0..3 {
             let mut bad = variants;
             bad[index].1 = V41ExpertReduction { slice_width: 64, fc2_k_steps: 2,
                 plane_count: 5, ..recipe };
-            assert!(ExpertReductionPlan::native_recipes(&bad).is_err(), "capacity {}", bad[index].0);
+            assert!(ExpertReductionPlan::native_recipes(&bad, 80).is_err(), "capacity {}", bad[index].0);
         }
     }
 
@@ -437,7 +456,7 @@ mod reduction_tests {
     fn native_owned_state_order_freezes_serial_and_grouped_decode() {
         // Execution owns main, m1, then m80 (not ascending capacities).
         let variants = [(4096, 192), (1, 64), (80, 64)];
-        let plan = ExpertReductionPlan::new(&variants).unwrap();
+        let plan = ExpertReductionPlan::new(&variants, 80).unwrap();
         for rows in 1..=80 {
             assert_eq!(
                 plan.execution_index(rows, rows, variants.iter().map(|v| v.0))
@@ -451,7 +470,7 @@ mod reduction_tests {
             0
         );
         let small = [(16, 64), (1, 64)];
-        let plan = ExpertReductionPlan::new(&small).unwrap();
+        let plan = ExpertReductionPlan::new(&small, 80).unwrap();
         for rows in 1..=16 {
             assert_eq!(
                 plan.execution_index(rows, rows, small.iter().map(|v| v.0))
@@ -462,14 +481,14 @@ mod reduction_tests {
         assert!(plan
             .execution_index(17, 17, small.iter().map(|v| v.0))
             .is_err());
-        let serial = ExpertReductionPlan::new(&[(1, 64)]).unwrap();
+        let serial = ExpertReductionPlan::new(&[(1, 64)], 80).unwrap();
         assert_eq!(serial.execution_index(1, 1, [1].into_iter()).unwrap(), 0);
     }
 
     #[test]
     fn shared_decode_selector_is_width_invariant_and_ignores_prefill_numerics() {
         let variants = [(1, 64), (16, 192), (80, 64), (4096, 192)];
-        let plan = ExpertReductionPlan::new(&variants).unwrap();
+        let plan = ExpertReductionPlan::new(&variants, 80).unwrap();
         for rows in 1..=80 {
             let index = plan
                 .execution_index(rows, rows, variants.iter().map(|v| v.0))
@@ -484,8 +503,8 @@ mod reduction_tests {
         assert!(plan
             .execution_index(0, 1, variants.iter().map(|v| v.0))
             .is_err());
-        assert!(ExpertReductionPlan::new(&[(1, 64), (80, 192), (4096, 192)]).is_err());
-        assert!(ExpertReductionPlan::new(&[(80, 64)]).is_err());
+        assert!(ExpertReductionPlan::new(&[(1, 64), (80, 192), (4096, 192)], 80).is_err());
+        assert!(ExpertReductionPlan::new(&[(80, 64)], 80).is_err());
         // Metadata changes after admission cannot mutate the owned compatibility set.
         let mut changed = variants;
         changed[2].1 = 192;
@@ -494,6 +513,6 @@ mod reduction_tests {
                 .unwrap(),
             2
         );
-        assert!(ExpertReductionPlan::new(&changed).is_err());
+        assert!(ExpertReductionPlan::new(&changed, 80).is_err());
     }
 }

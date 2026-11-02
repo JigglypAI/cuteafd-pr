@@ -441,8 +441,10 @@ fn packing_probe_allowed(probe: &crate::shared::probe::ProbeRef) -> bool {
         && probe.as_ref().is_none_or(|p| p.spec.cold_steps.is_empty())
 }
 
-fn packing_group_fits(chunks: &[(usize, usize)], limits: &crate::shared::prefill_packing::Limits) -> bool {
-    chunks.len() <= 16 && crate::shared::prefill_packing::plan(chunks, limits).is_ok()
+fn packing_group_fits(chunks: &[(usize, usize)], limits: &crate::shared::prefill_packing::Limits,
+    concurrency: usize) -> bool {
+    (1..=cuteafd_core::V41_MAX_REQUESTS).contains(&concurrency)
+        && chunks.len() <= concurrency && crate::shared::prefill_packing::plan(chunks, limits).is_ok()
 }
 
 fn pending_prefix_hit(prompt: &[u32], earlier: &[u32]) -> bool {
@@ -474,7 +476,7 @@ fn prefill_packed_admissions<'w, 'a, P: ServingTarget<'w, 'a>>(
     }).collect();
     let chunks: Vec<_> = eligible.iter().map(|&i| (0, admitted[i].0.prompt.len())).collect();
     for range in prefill_packing::groups(eligible.len(), |range|
-        packing_group_fits(&chunks[range], &limits)) {
+        packing_group_fits(&chunks[range], &limits, prefill.prompt_suffixes.len())) {
         if range.len() == 1 { continue; }
         let indices = &eligible[range.clone()];
         stall::tick();
@@ -2056,7 +2058,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
 ) -> Result<()> {
     let _capture_watch = crate::shared::decode_graph::CaptureWatch::round();
     let started = Instant::now();
-    ensure!(!members.is_empty() && members.len() <= 8, "invalid single decode lane");
+    ensure!(!members.is_empty() && members.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS, "invalid single decode lane");
     let speculative = draft.is_some();
     let capture = draft.as_deref().map(DraftRuntime::capture).unwrap_or_default();
     // Speculative rows vary every round: keep each decode shape's graphs,
@@ -2600,10 +2602,10 @@ fn publish_commit_lane<'a>(active: &mut [Option<Active<'a>>],
 #[allow(clippy::too_many_arguments)]
 /// Whether each member decoded under an active grammar mask this round.
 fn masked_members(round: Option<&SamplingRound>, active: &[Option<Active<'_>>], members: &[usize],
-    inputs: &[Vec<u32>]) -> [bool; 8] {
-    let mut masked = [false; 8];
+    inputs: &[Vec<u32>]) -> Vec<bool> {
+    let mut masked = vec![false; members.len()];
     let mut row = 0;
-    for (index, (&slot, input)) in members.iter().zip(inputs).enumerate().take(8) {
+    for (index, (&slot, input)) in members.iter().zip(inputs).enumerate() {
         masked[index] = match round {
             Some(round) => round.plan.mask.get(row..row + input.len())
                 .is_some_and(|rows| rows.iter().any(Option::is_some)),
@@ -2742,18 +2744,33 @@ mod sampling_tests {
     use crate::families::deepseek_v41::v41_native_serve::scores::{ROW_BYTES, VOCAB};
 
     #[test]
-    fn packing_group_never_exceeds_the_sixteen_member_suffix_arena() {
+    fn packing_group_matches_boot_sized_suffix_arena_through_c64() {
+        use cuteafd_loader::placement::families::deepseek_v41::owners::packed_suffix_rows;
+        for concurrency in [16, 33, 64] {
+            let limits = packing_limits(crate::shared::prefill_packing::PackingMode::Unrestricted,
+                4096, 1048576, None, NATIVE_COORDINATOR_EXACT_CAP);
+            let chunks = vec![(0, 32); concurrency + 1];
+            assert!(packing_group_fits(&chunks[..concurrency], &limits, concurrency));
+            assert!(!packing_group_fits(&chunks, &limits, concurrency));
+            let groups = crate::shared::prefill_packing::groups(chunks.len(), |range|
+                packing_group_fits(&chunks[range], &limits, concurrency));
+            assert_eq!(groups, [0..concurrency, concurrency..concurrency + 1]);
+            for range in groups {
+                let rows: usize = chunks[range.clone()].iter().map(|(_, rows)| rows.min(&128)).sum();
+                assert!(range.len() <= concurrency);
+                assert!(rows <= packed_suffix_rows(limits.chunk_rows as u64, concurrency as u64) as usize);
+            }
+            let long = vec![(0, 129); concurrency];
+            for range in crate::shared::prefill_packing::groups(long.len(), |range|
+                packing_group_fits(&long[range], &limits, concurrency)) {
+                let rows = range.len() * 128;
+                assert!(rows <= packed_suffix_rows(limits.chunk_rows as u64, concurrency as u64) as usize);
+            }
+        }
         let limits = packing_limits(crate::shared::prefill_packing::PackingMode::Unrestricted,
             4096, 1048576, None, NATIVE_COORDINATOR_EXACT_CAP);
-        let chunks = [(0, 129); 17];
-        assert!(!packing_group_fits(&chunks, &limits));
-        let groups = crate::shared::prefill_packing::groups(chunks.len(), |range|
-            packing_group_fits(&chunks[range], &limits));
-        assert_eq!(groups, [0..16, 16..17]);
-        for range in groups {
-            let rows: usize = chunks[range.clone()].iter().map(|(_, rows)| rows.min(&128)).sum();
-            assert!(range.len() <= 16 && rows <= limits.chunk_rows.min(16 * 128));
-        }
+        assert!(!packing_group_fits(&[(0, 1)], &limits, 65));
+        assert!(!packing_group_fits(&[(0, 1)], &limits, 0));
     }
 
     /// The serve loop's decode-share contract, at its source (#953):

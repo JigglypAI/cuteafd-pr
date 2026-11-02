@@ -324,7 +324,7 @@ impl V41SparseAttention<'_> {
         bounds: CuteafdDeviceBuffer, scratch: CuteafdDeviceBuffer,
         plan: Option<cuteafd_core::coordinator_programs::AttentionReductionPlan>,
     ) -> Result<V41SparseBatch> {
-        ensure!(!requests.is_empty() && requests.len() <= 16, "invalid sparse batch requests");
+        ensure!(!requests.is_empty() && requests.len() <= cuteafd_core::V41_MAX_REQUESTS, "invalid sparse batch requests");
         let limit = if plan.is_some() { cuteafd_core::V41_VERIFY_ROWS } else { 16 };
         ensure!(requests.iter().all(|(_, _, n)| (1..=limit).contains(n)), "sparse batch requires split rows");
         let rows: usize = requests.iter().map(|(_, _, n)| n).sum();

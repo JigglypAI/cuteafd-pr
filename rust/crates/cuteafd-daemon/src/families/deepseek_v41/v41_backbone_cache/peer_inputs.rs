@@ -10,7 +10,7 @@ pub(crate) struct PeerAttentionInputs<'a> {
     device:Device<'a>,
     window:ProposalReplica<'a>,
     sources:[ProposalReplica<'a>;4],
-    source_bindings:[std::cell::Cell<[Option<IndexBinding>;16]>;4],
+    source_bindings:[std::cell::Cell<[Option<IndexBinding>; cuteafd_core::V41_MAX_REQUESTS]>;4],
     selected:Allocation<'a>,
     copy:V41PeerCopy<'a>,
     capacity:usize,
@@ -158,13 +158,13 @@ mod tests {
     }
 }
 pub(crate) struct PeerCacheAttention<'s> {
-    windows:[Option<WindowProposal<'s>>;16],
-    sources:[Option<IndexProposal<'s>>;16],
+    windows:[Option<WindowProposal<'s>>; cuteafd_core::V41_MAX_REQUESTS],
+    sources:[Option<IndexProposal<'s>>; cuteafd_core::V41_MAX_REQUESTS],
     positions:&'s [Vec<u64>],
 }
 impl PeerCacheAttention<'_> {
     /// Fixed stack storage; callers pass only the first returned count entries.
-    pub fn attention_requests(&self)->([AttentionRequest<'_>;16],usize) {
+    pub fn attention_requests(&self)->([AttentionRequest<'_>; cuteafd_core::V41_MAX_REQUESTS],usize) {
         let n=self.positions.len();
         (std::array::from_fn(|i| {
             let i=if i<n {i} else {0};
@@ -183,7 +183,7 @@ impl<'a> PeerAttentionInputs<'a> {
         let source_buffer=||ProposalReplica::new(source,peer,capacity,ProposalFormat::CompressedFp4);
         Ok(Self { device:peer,window:ProposalReplica::new(source,peer,capacity,ProposalFormat::WindowFp8)?,
             sources:[source_buffer()?,source_buffer()?,source_buffer()?,source_buffer()?],
-            source_bindings:std::array::from_fn(|_|std::cell::Cell::new([None;16])),selected:Allocation::new(peer,capacity*2048)?,
+            source_bindings:std::array::from_fn(|_|std::cell::Cell::new([None; cuteafd_core::V41_MAX_REQUESTS])),selected:Allocation::new(peer,capacity*2048)?,
             copy:peer.run(||peer.library.v41_peer_copy())?,capacity })
     }
     /// # Safety
@@ -194,7 +194,7 @@ impl<'a> PeerAttentionInputs<'a> {
     pub unsafe fn enqueue<'s>(&'s self,bank:&'s BackboneCache<'_>,original:&'s CacheAttention<'_>,
         stream:*mut c_void)->Result<PeerCacheAttention<'s>> {
         let n=original.windows.len();
-        ensure!(n>0 && n<=16 && original.positions.len()==n
+        ensure!(n>0 && n<=cuteafd_core::V41_MAX_REQUESTS && original.positions.len()==n
             && (original.sources.is_empty() || original.sources.len()==n),"invalid peer attention requests");
         ensure!(original.positions.iter().map(Vec::len).sum::<usize>()<=self.capacity,
             "peer attention rows exceed capacity");
@@ -214,7 +214,7 @@ impl<'a> PeerAttentionInputs<'a> {
             let bindings=std::array::from_fn(|i|original.sources.get(i).map(IndexProposal::binding));
             let changed=self.source_bindings[index].get()!=bindings;
             // Recopy after any partially failed submission; publish the key last.
-            if changed { self.source_bindings[index].set([None;16]); }
+            if changed { self.source_bindings[index].set([None; cuteafd_core::V41_MAX_REQUESTS]); }
             let state=&bank.sources[index];
             let replica=state.replica_ref().context("peer source cache absent")?;
             ensure!(replica.device().id==self.device.id,"peer source device differs");

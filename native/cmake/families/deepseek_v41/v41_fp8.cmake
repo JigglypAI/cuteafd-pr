@@ -7,7 +7,7 @@ set(CUTEAFD_V41_FP8_DIR "${CMAKE_CURRENT_BINARY_DIR}/v41_fp8")
 set(CUTEAFD_V41_FP8_OBJECTS)
 set(CUTEAFD_V41_FP8_HEADERS)
 foreach(projection IN ITEMS engram ffn_up ffn_down main q_a q_b kv o_b o_a index_q q_b_tp2 o_b_tp2 ffn_tp2_up ffn_tp2_down)
-foreach(rows IN ITEMS 1 16 80 256 1024 4096)
+foreach(rows IN LISTS CUTEAFD_V41_PROJECTION_ROWS)
   set(kinds quant gemm)
   if(projection STREQUAL "o_a")
     list(APPEND kinds quant_rope)
@@ -49,7 +49,8 @@ add_custom_command(
     "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_fp8_aot.py"
     --output-dir "${CUTEAFD_V41_FP8_DIR}"
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_fp8_aot.py"
+  DEPENDS "${CUTEAFD_V41_CAPACITY_SOURCE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_capacities.py" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_fp8_aot.py"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
   COMMENT "Exporting native V4.1 K32 quantization and FP8 projections"
   VERBATIM

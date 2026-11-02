@@ -754,7 +754,7 @@ class ManifestWriterTest(unittest.TestCase):
     """The built-role manifest must be derived from validated build outputs."""
 
     def role_export(self, root: Path, role: str, *, intermediate: int = 1152, schema: int = 1,
-                    capability=(12, 1), capacities=(1, 16, 80, 256, 1024, 4096),
+                    capability=(12, 1), capacities=(1, 16, 64, 256, 1024, 4096),
                     object_bytes: bytes = b"object-bytes",
                     declared_bytes: bytes | None = None) -> None:
         export = root / f"v41_spark_{role}_experts"

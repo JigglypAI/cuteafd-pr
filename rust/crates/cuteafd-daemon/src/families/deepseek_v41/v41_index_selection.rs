@@ -23,6 +23,20 @@ const DECODE_WIDTH_BUCKET: usize = 512;
 const AUDIT_WIDTH: usize = 2048;
 const AUDIT_SOURCE_BYTES: usize = 2048 * 68;
 
+fn metadata_staging_bytes(rows: usize) -> usize { rows * 56 }
+
+fn stage_metadata(staging: &mut [u8], metadata: &[[u64; 6]]) -> Result<()> {
+    let rows = metadata.len();
+    ensure!(staging.len() >= metadata_staging_bytes(rows), "index metadata staging too small");
+    for (i, m) in metadata.iter().enumerate() {
+        for (j, value) in m.iter().enumerate() {
+            staging[i * 48 + j * 8..i * 48 + j * 8 + 8].copy_from_slice(&value.to_ne_bytes());
+        }
+        staging[rows * 48 + i * 8..rows * 48 + i * 8 + 8].copy_from_slice(&m[1].to_ne_bytes());
+    }
+    Ok(())
+}
+
 struct AsyncAuditRow<'a> {
     host: HostAllocation<'a>,
     pending: Option<(usize, usize, usize, String)>,
@@ -257,7 +271,7 @@ impl<'a> IndexSelectionWave<'a> {
             "index selection storage device differs");
         Ok(Self {
             storage, window: RowWindow::NONE, shared_scratch_busy: None,
-            staging: LayerStaging::new(library, capacity * 56, 40)?, capacity,
+            staging: LayerStaging::new(library, metadata_staging_bytes(capacity), 40)?, capacity,
             graph: None, graphs: crate::shared::decode_graph::GraphBank::new(None),
             retain_decode_graphs: false, fixed_captures: BTreeSet::new(), fixed_recaptures: 0,
             ready: None, pending: None, in_flight: false,
@@ -583,7 +597,7 @@ impl<'a> IndexSelectionWave<'a> {
             "invalid selection producer layer"
         );
         ensure!(
-            !requests.is_empty() && requests.len() <= 16,
+            !requests.is_empty() && requests.len() <= cuteafd_core::V41_MAX_REQUESTS,
             "invalid selection request count"
         );
         let rows: usize = requests.iter().map(|r| r.positions.len()).sum();
@@ -695,12 +709,7 @@ impl<'a> IndexSelectionWave<'a> {
         fingerprint.extend([width, usize::from(use_candidates)]);
         fingerprint.push(if query.layer > 20 { 1 } else { tiles });
         let (host, staging) = self.staging.region(query.layer);
-        for (i, m) in metadata.iter().enumerate() {
-            for (j, value) in m.iter().enumerate() {
-                staging[i * 48 + j * 8..i * 48 + j * 8 + 8].copy_from_slice(&value.to_ne_bytes());
-            }
-            staging[rows * 48 + i * 8..rows * 48 + i * 8 + 8].copy_from_slice(&m[1].to_ne_bytes());
-        }
+        stage_metadata(staging, &metadata)?;
         // Prefill tails (and any other uncached large shape) bind eagerly.
         let forced_eager = self.window.is_windowed() || crate::shared::decode_graph::census::eager("index")
             || !super::graph_policy::captures_shape(rows as u32);
@@ -1074,6 +1083,26 @@ mod graph_tests {
         Ok(())
     }
 
+    #[test]
+    fn index_metadata_staging_covers_c64_and_short_rows() -> Result<()> {
+        for count in [1, 16, 33, 64] {
+            for rows in [count, count * 7] {
+                let metadata: Vec<_> = (0..rows).map(|row|
+                    [row as u64 % count as u64, 1000 + row as u64, 2, 3, 4, 5]).collect();
+                let capacity = metadata_staging_bytes(4096);
+                let mut bytes = vec![0xa5; capacity + 16];
+                stage_metadata(&mut bytes[..capacity], &metadata)?;
+                let expected: Vec<_> = metadata.iter().flat_map(|m| m.iter().copied())
+                    .chain(metadata.iter().map(|m| m[1])).flat_map(u64::to_ne_bytes).collect();
+                assert_eq!(&bytes[..expected.len()], &expected);
+                assert!(bytes[expected.len()..].iter().all(|&b| b == 0xa5));
+                let mut short = vec![0xa5; expected.len() - 1];
+                assert!(stage_metadata(&mut short, &metadata).is_err());
+                assert!(short.iter().all(|&b| b == 0xa5));
+            }
+        }
+        Ok(())
+    }
     #[test]
     fn score_groups_ignore_request_partition_but_preserve_launch_bindings() {
         let binding = [17; 10];

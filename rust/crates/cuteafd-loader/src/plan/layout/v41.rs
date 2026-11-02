@@ -98,7 +98,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         let resident = resident_weights(checkpoint, ranks, true).context("unsupported V4.1 dSpark resident format")?;
         let bytes = resident.iter().flatten().filter(|i| i.category == Category::Drafter).map(|i| i.bytes).sum();
         let staging = catalog.expert_staging(crate::V41ExpertSelection::Dspark { stage: 0, expert: 0 })?.staging_bytes() as u64;
-        Some(DraftInventory { resident: bytes, runtime: programs.dspark(&manifest, rows, shape.concurrency, 5, ranks,
+        ensure!((1..=cuteafd_core::MAX_DSPARK_PROPOSALS as u8).contains(&options.dspark_draft_limit), "invalid V4.1 dSpark draft limit");
+        let width = if options.dspark_draft_limit > 5 { 7 } else { 5 };
+        Some(DraftInventory { resident: bytes, runtime: programs.dspark(&manifest, rows, shape.concurrency, width, ranks,
             mode)?, marks: marks * 3 * 128 * 528,
             staging: [staging, 0], loading_experts: [3 * native_expert_bytes(128, 5120, 2304), 0],
             loader_peak: [bytes, 0], ..Default::default() })
@@ -190,16 +192,16 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     notes.push(format!("{} routed backbone layers resident on RTX", placement.onboard_layers));
     if catalog.exl3().is_none() && catalog.nvfp4().is_none() {
         let e = catalog.routed_experts();
-        let capacity = [1, 16, 80, 256, 1024, 4096].into_iter().find(|&c| u64::from(c) >= rows)
+        let capacity = cuteafd_core::V41_TARGET_CAPACITIES.into_iter().find(|&c| c >= rows)
             .context("native expert prefill capacity exceeds 4096")?;
         if !working.rtx_layers.is_empty() {
             notes.push(cuteafd_core::mxfp4_layouts::native_prefill_note(e.hidden,
-                [e.intermediate / ranks], 120, capacity, e.experts, e.topk));
+                [e.intermediate / ranks], 120, capacity as u32, e.experts, e.topk));
         }
         if spark_ranks > 0 && !working.spark_layers.is_empty() {
             let widths = cuteafd_core::tp_units::package_width_keys(e.intermediate, 32, spark_ranks, false, true, false);
             notes.push(cuteafd_core::mxfp4_layouts::native_prefill_note(e.hidden,
-                widths.into_iter().map(|(_, width)| width), 121, capacity, e.experts, e.topk));
+                widths.into_iter().map(|(_, width)| width), 121, capacity as u32, e.experts, e.topk));
         }
     }
     let pool_tokens = placement.pool_tokens;

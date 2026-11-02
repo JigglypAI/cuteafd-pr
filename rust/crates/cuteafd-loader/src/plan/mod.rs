@@ -573,7 +573,7 @@ impl PlanInput {
         -> anyhow::Result<Option<u64>> {
         use anyhow::Context;
         let catalog = self.expert_catalog()?;
-        if spark_executions::SparkBackend::for_catalog(catalog)? != spark_executions::SparkBackend::Native
+        if !spark_executions::SparkBackend::for_catalog(catalog)?.is_native_census()
             || catalog.nvfp4().is_some() { return Ok(None); }
         if !working.selected_ranks().contains(&rank) { return Ok(Some(0)); }
         anyhow::ensure!(working.spark_layers.windows(2).all(|pair| pair[0] < pair[1]),

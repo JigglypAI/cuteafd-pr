@@ -141,6 +141,36 @@ pub struct EngramPipeline {
     /// Prompt rows read into the row caches ahead of the gathers.
     lookahead: crate::EngramLookahead,
 }
+fn validate_wave(requests: &[EngramRequestTokens<'_>], capacity: usize) -> Result<()> {
+    ensure!(
+        !requests.is_empty() && requests.len() <= cuteafd_core::V41_MAX_REQUESTS,
+        "engram wave requires 1..={} requests", cuteafd_core::V41_MAX_REQUESTS
+    );
+    let total = requests.iter().try_fold(0usize, |sum, request| {
+        ensure!(
+            !request.token_ids.is_empty(),
+            "engram request batch is empty"
+        );
+        sum.checked_add(request.token_ids.len())
+            .context("engram wave row overflow")
+    })?;
+    ensure!(
+        total <= capacity,
+        "engram wave exceeds pipeline capacity"
+    );
+    // Reject repeated histories before any work is admitted; one request owns
+    // exactly one contiguous batch in a physical wave.
+    for (index, request) in requests.iter().enumerate() {
+        ensure!(
+            !requests[..index]
+                .iter()
+                .any(|prior| std::ptr::eq(prior.history, request.history)),
+            "engram wave repeats a request history"
+        );
+    }
+    Ok(())
+}
+
 impl EngramPipeline {
     /// # Safety
     /// Official checkpoint files must stay immutable while any mapping/job is alive.
@@ -267,32 +297,7 @@ impl EngramPipeline {
     }
     fn prepare_on(&self, requests: &[EngramRequestTokens<'_>], decode: bool) -> Result<EngramWave> {
         self.reclaim_copies()?;
-        ensure!(
-            !requests.is_empty() && requests.len() <= 16,
-            "engram wave requires 1..16 requests"
-        );
-        let total = requests.iter().try_fold(0usize, |sum, request| {
-            ensure!(
-                !request.token_ids.is_empty(),
-                "engram request batch is empty"
-            );
-            sum.checked_add(request.token_ids.len())
-                .context("engram wave row overflow")
-        })?;
-        ensure!(
-            total <= if decode { self.shape.decode_rows() } else { self.capacity },
-            "engram wave exceeds pipeline capacity"
-        );
-        // Reject repeated histories before any work is admitted; one request owns
-        // exactly one contiguous batch in a physical wave.
-        for (index, request) in requests.iter().enumerate() {
-            ensure!(
-                !requests[..index]
-                    .iter()
-                    .any(|prior| std::ptr::eq(prior.history, request.history)),
-                "engram wave repeats a request history"
-            );
-        }
+        validate_wave(requests, if decode { self.shape.decode_rows() } else { self.capacity })?;
         let batches: Result<Vec<_>> = requests
             .iter()
             .map(|request| {
@@ -431,6 +436,31 @@ fn record_layer_wait(table: &EngramTable, elapsed: std::time::Duration, decode: 
 mod wait_tests {
     use super::*;
     use std::{future::Future, task::{Context as TaskContext, Poll, Wake, Waker}, time::{Duration, Instant}};
+
+    #[test]
+    fn wave_request_count_is_independent_of_token_row_capacity() -> Result<()> {
+        let histories = (0..65).map(|_| EngramHistory::new(2)).collect::<Result<Vec<_>, _>>()?;
+        let one = [7];
+        let two = [7, 8];
+        for count in [16, 33, 64] {
+            let mut requests: Vec<_> = histories[..count].iter().map(|history| EngramRequestTokens {
+                history, token_ids: &one, image_mask: None, l14_gate: None,
+            }).collect();
+            validate_wave(&requests, count)?;
+            assert!(validate_wave(&requests, count - 1).is_err());
+            requests[0].token_ids = &two;
+            assert!(validate_wave(&requests, count).is_err());
+            validate_wave(&requests, count + 1)?;
+            requests[0].history = requests[1].history;
+            assert!(validate_wave(&requests, count + 1).is_err());
+        }
+        let requests: Vec<_> = histories.iter().map(|history| EngramRequestTokens {
+            history, token_ids: &one, image_mask: None, l14_gate: None,
+        }).collect();
+        assert!(validate_wave(&requests, 256).is_err());
+        assert!(validate_wave(&[], 256).is_err());
+        Ok(())
+    }
 
     #[test]
     fn strided_multipart_preload_preserves_weight_and_scale_rows() -> Result<()> {
