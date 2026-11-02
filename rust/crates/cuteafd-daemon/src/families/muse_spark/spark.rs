@@ -13,7 +13,7 @@
 //!   tables on the same stream (addresses fixed, contents per wave), so the
 //!   combine reads every rank's regions in place: no gather.
 //! - `consumed`: after `RankDevice::combine`, the slot's planes are released.
-use super::experts::{wave_request, CombineTables, LandedWave, ReplyPlanView, SparkExperts, Wave, WaveSegment, WaveStep,
+use super::experts::{wave_request, wire_plan, CombineTables, LandedWave, ReplyPlanView, SparkExperts, Wave, WaveSegment, WaveStep,
     MAX_RANKS, TOPK, WIDTH, WIRE_ROW_BYTES};
 use crate::shared::{experts::staging::RouteStaging, memory::device::{Allocation, Stream}, spark_intake::SparkLink,
     spark_waves::WaveTicket};
@@ -156,6 +156,7 @@ impl SparkExperts for MuseSparkPath<'_> {
         let sequence = self.sequence.checked_add(1).context("Muse Spark request sequence overflow")?;
         let (segments, kind, cutoff) = (step.segments.clone(), step.kind, self.cutoff);
         let plan = ReplyPlan::new(cutoff, &segments.iter().map(|s| s.rows).collect::<Vec<_>>());
+        let payload = wire_plan(&plan)?.payload(TOPK, WIDTH)?.3;
         let layout = RouteStaging::new(rows, TOPK, WIRE_ROW_BYTES)?;
         let stream = self.stream.raw;
         let device = self.stream.device;
@@ -163,7 +164,7 @@ impl SparkExperts for MuseSparkPath<'_> {
         let ticket = device.run(|| {
             // SAFETY: the lane retains these planes through teardown; the routes and
             // wire were written on this stream before this call (`RankDevice::layer_front`).
-            unsafe { link.exchange()?.send(rows, layout, sources, stream, Box::new(move |routes, wire|
+            unsafe { link.exchange()?.send(rows, payload, layout, sources, stream, Box::new(move |routes, wire|
                 wave_request(layer, sequence, kind, &segments, cutoff, routes, wire))) }
         })?;
         self.sequence = sequence;
@@ -189,8 +190,7 @@ impl SparkExperts for MuseSparkPath<'_> {
             let planes: Vec<u64> = exchange.planes(slot)[..ranks].iter().map(|p| *p as u64).collect();
             // The wire layout (`PartialReplyPlan::payload`): the BF16 region, then the
             // wide region at the next region-aligned offset.
-            let wide_at = (plan.bf16_rows.len() * TOPK * WIDTH * 2)
-                .next_multiple_of(cuteafd_transport::EXPERT_PROTOCOL_V2_PARTIAL_REGION_ALIGN);
+            let wide_at = wire_plan(&plan)?.payload(TOPK, WIDTH)?.1;
             let image = layout.image(&planes, &ReplyPlanView { bf16_rows: &plan.bf16_rows,
                 wide_rows: &plan.wide_rows, wide_at })?;
             // SAFETY: the slot's fixed tables on this stream's device; the ordered
@@ -233,6 +233,39 @@ mod tests {
         // At or below the cutoff the one segment replies BF16 (still a valid widest wave).
         assert!(bootstrap_request(3, 64, cutoff)?.partial.unwrap().regions.iter().all(|&r| r == 0));
         assert!(bootstrap_request(62, 64, cutoff).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn wave_payload_matches_the_declared_partial_plan_not_padded_intake_rows() -> Result<()> {
+        use cuteafd_loader::families::muse_spark::replies::{intake_row_bytes, WideFormat};
+        let cutoff = Cutoff::new(64, 8)?;
+        let stride = intake_row_bytes(cutoff, 2752, 16, TOPK, WIDTH);
+        assert_eq!(stride, 34_864);
+        for (cutoff, lengths) in [(cutoff, vec![1]), (cutoff, vec![16]), (cutoff, vec![1700]),
+            (cutoff, [vec![64; 15], vec![740]].concat()),
+            (Cutoff::new(4096, 8)?, vec![1700]),
+            (Cutoff::with_wide(64, 8, WideFormat::Fp8)?, vec![1, 1699])] {
+            let rows = lengths.iter().sum::<usize>();
+            let segments = lengths.iter().enumerate().map(|(i, &rows)| WaveSegment { request: i as u64 + 1, rows })
+                .collect::<Vec<_>>();
+            let plan = ReplyPlan::new(cutoff, &lengths);
+            let expected = wire_plan(&plan)?.payload(TOPK, WIDTH)?;
+            let layout = RouteStaging::new(rows, TOPK, WIRE_ROW_BYTES)?;
+            let bytes = vec![0; layout.bytes];
+            let request = wave_request(3, 1, ExpertV2SourceKind::Prefill, &segments, cutoff,
+                layout.routes(&bytes)?, bytes::Bytes::copy_from_slice(layout.wire(&bytes)?))?;
+            assert_eq!(request.partial.as_ref().unwrap().payload(TOPK, WIDTH)?, expected);
+            if lengths == [1700] && cutoff.rows() == 64 {
+                assert_eq!(expected.3, 31_334_400);
+                assert_eq!(rows * stride, 59_268_800);
+                assert_ne!(expected.3, rows * stride);
+            }
+            assert!(expected.3 <= 2752 * intake_row_bytes(cutoff, 2752, 16, TOPK, WIDTH));
+        }
+        let source = include_str!("spark.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("let payload = wire_plan(&plan)?.payload(TOPK, WIDTH)?.3"));
+        assert!(source.contains("send(rows, payload, layout"));
         Ok(())
     }
 
