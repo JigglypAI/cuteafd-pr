@@ -1,5 +1,6 @@
 {
   "schema": 1,
+  "stream_prefill": [{"sm": 120, "min_work": null}, {"sm": 121, "min_work": 24576}],
   "storage_holds": [],
   "native_slices": [
     {
@@ -383,56 +384,69 @@
       ]
     },
     {
-      "hidden": 4096,
+      "hidden": 7168,
+      "width": 384,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "prefill": [
+        256,
+        1024,
+        4096
+      ],
+      "source": "#994 equal widths; realistic GB10 per-expert work crossover from #1000"
+    },
+    {
+      "hidden": 7168,
+      "width": 512,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "prefill": [
+        256,
+        1024,
+        4096
+      ],
+      "source": "#994 equal widths; realistic GB10 per-expert work crossover from #1000"
+    },
+    {
+      "hidden": 7168,
+      "width": 768,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "prefill": [
+        256,
+        1024,
+        4096
+      ],
+      "source": "#994 equal widths; realistic GB10 per-expert work crossover from #1000"
+    },
+    {
+      "hidden": 7168,
       "width": 1024,
-      "sm": 120,
+      "sm": 121,
       "capacities": [],
       "slices": [],
-      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
       "prefill": [
         256,
         1024,
         4096
-      ]
+      ],
+      "source": "#994 equal widths; realistic GB10 per-expert work crossover from #1000"
     },
     {
-      "hidden": 4096,
-      "width": 2048,
-      "sm": 120,
+      "hidden": 7168,
+      "width": 1536,
+      "sm": 121,
       "capacities": [],
       "slices": [],
-      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
       "prefill": [
         256,
         1024,
         4096
-      ]
-    },
-    {
-      "hidden": 5120,
-      "width": 1152,
-      "sm": 120,
-      "capacities": [],
-      "slices": [],
-      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
-      "prefill": [
-        256,
-        1024,
-        4096
-      ]
-    },
-    {
-      "hidden": 5120,
-      "width": 2304,
-      "sm": 120,
-      "capacities": [],
-      "slices": [],
-      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
-      "prefill": [
-        256,
-        1024,
-        4096
-      ]
+      ],
+      "source": "#994 equal widths; realistic GB10 per-expert work crossover from #1000"
     }
   ],
   "ownership": [

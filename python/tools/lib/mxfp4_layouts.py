@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+from functools import lru_cache
 from pathlib import Path
 
 LAYOUTS_PATH = Path(__file__).resolve().parents[3] / "scripts/build/mxfp4-layouts.json"
@@ -74,10 +76,34 @@ def native_slice_width(hidden: int, width: int, sm: int, capacity: int,
     return matching_width
 
 
-def native_prefill(hidden: int, width: int, sm: int, capacity: int) -> bool:
-    """Qualified native STREAM recipe, independent of role names and live rows."""
-    return any((row["hidden"], row["width"], row["sm"]) == (hidden, width, sm)
-               and capacity in row.get("prefill", []) for row in layouts()["native_slices"])
+@lru_cache(maxsize=1)
+def default_prefill_unit_rows() -> int:
+    """Use the planner's literal shared contract, not an independent 2752 pin."""
+    source = (LAYOUTS_PATH.parents[2] / "rust/crates/cuteafd-core/src/serving_capacity.rs").read_text()
+    def constant(name):
+        return int(re.search(rf"pub const {name}: u64 = ([0-9]+);", source)[1])
+    reserve, depth, page = (constant("PREFILL_" + name) for name in
+                            ("RESERVE_ROWS", "DEPTH", "ROW_PAGE"))
+    return ((reserve + depth - 1) // depth + page - 1) // page * page
+
+
+def native_prefill_work(sm: int, rows: int, width: int, experts: int, topk: int) -> bool:
+    cutoff = next((row["min_work"] for row in layouts()["stream_prefill"] if row["sm"] == sm), None)
+    return (cutoff is not None and rows > 0 and width > 0 and experts > 0 and topk > 0
+            and rows * topk * width >= cutoff * experts)
+
+
+def native_prefill(hidden: int, width: int, sm: int, capacity: int,
+                   experts: int, topk: int) -> bool:
+    """Static export route tuned to the default admitted wave, not compiled padding.
+
+    Larger custom waves retain this correct, default-tuned route. Hot-only screens
+    cannot qualify one: the crossover uses the checkpoint expert population.
+    """
+    rows = min(capacity, default_prefill_unit_rows())
+    return native_prefill_work(sm, rows, width, experts, topk) and any(
+        (row["hidden"], row["width"], row["sm"]) == (hidden, width, sm)
+        and capacity in row.get("prefill", []) for row in layouts()["native_slices"])
 
 
 def native_prefill_scratch(capacity: int, hidden: int, width: int,

@@ -42,7 +42,7 @@ pub fn deepseek_v4_native_workspace(hidden: u64, intermediate: u64, experts: u64
     for capacity in capacities.into_iter().filter(|&n| n <= maximum)
         .chain(capacities.into_iter().find(|&n| n >= maximum)) {
         let stream = cuteafd_core::mxfp4_layouts::native_prefill(hidden as usize,
-            intermediate as usize, 120, capacity as u32);
+            intermediate as usize, 120, capacity as u32, experts as usize, topk as usize);
         let bytes = if stream {
             cuteafd_core::mxfp4_layouts::native_prefill_scratch_bytes(hidden as usize,
                 intermediate as usize, experts as usize, topk as usize, capacity as u32)
@@ -130,8 +130,8 @@ mod tp2_tests {
     use super::*;
     #[test]
     fn native_tp2_workspace_matches_export_slots() {
-        // Flash uses original-route STREAM; Pro retains its existing atomic recipe.
-        for (h, i, e, k, expected) in [(4096, 2048, 256, 6, 530717456), (7168, 3072, 384, 6, 274701856)] {
+        // SM120 retains atomic slices: realistic STREAM screens lost.
+        for (h, i, e, k, expected) in [(4096, 2048, 256, 6, 161453088), (7168, 3072, 384, 6, 274701856)] {
             assert_eq!(deepseek_v4_tp2_native_workspace(h, i, e, k, 4096).unwrap(), expected);
         }
         assert!(deepseek_v4_tp2_native_workspace(4096, 2048, 256, 6, 4097).is_err());
@@ -176,17 +176,15 @@ mod tp2_tests {
                 let workspace = deepseek_v4_tp2_workspace(&catalog, Some(&manifest), 4096).unwrap();
                 let expected = if family == "flash" {
                     let shape = catalog.routed_experts();
-                    let (h, w, e, k) = (shape.hidden as u64, shape.intermediate as u64 / 2,
-                        shape.experts as u64, shape.topk as u64);
+                    let (h, e, k) = (shape.hidden as u64, shape.experts as u64, shape.topk as u64);
                     let pairs = 4096 * k;
-                    let tiles = pairs.div_ceil(128) + e.min(pairs);
                     let mut arena = 0_u64;
-                    for plane in [(4 + 3 * e + tiles) * 4, pairs * 4, pairs * 4,
-                        tiles * 128 * (w + w / 32).div_ceil(16) * 16,
-                        pairs * 4, pairs * 4, pairs * h * 4, e * 4, e * 4] {
+                    for plane in [4, e * pairs * 4, e * 4, e * 8,
+                        pairs * 19 * 4, pairs * 4, pairs * 4, 4,
+                        4096 * h * 4, e * 4, e * 4] {
                         arena = arena.div_ceil(16) * 16 + plane;
                     }
-                    arena + 4096 * h * 4 // TP2 FP32 token output, outside the kernel arena.
+                    arena + 4096 * h * 4
                 } else { 1343287468 };
                 assert_eq!(workspace, expected);
                 eprintln!("TP2 {family} rank{rank}: resident={} staging={} workspace={workspace}", cost.resident_bytes, cost.staging_bytes);

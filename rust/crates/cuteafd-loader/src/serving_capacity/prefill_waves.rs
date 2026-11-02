@@ -7,21 +7,10 @@
 //! for measurement arms. A family may cap the depth below three where its
 //! executor holds fewer units (hard capacity, not a preference).
 
-/// The standard prefill reserve.
-pub const RESERVE_ROWS: u64 = 8192;
-pub const MAX_WAVES: u64 = 4;
-/// The fixed prefill depth.
-pub const DEPTH: u64 = 3;
+pub use cuteafd_core::serving_capacity::{PREFILL_RESERVE_ROWS as RESERVE_ROWS,
+    PREFILL_MAX_WAVES as MAX_WAVES, PREFILL_DEPTH as DEPTH, PREFILL_ROW_PAGE as ROW_PAGE,
+    prefill_unit_rows_in as unit_rows_in};
 pub const MIN_FILL: f64 = 0.5;
-/// Prefill rows are 64-row pages.
-pub const ROW_PAGE: u64 = 64;
-
-/// The unit of a `waves`-way split of `reserve` rows: reserve / k rounded up
-/// to a 64-row page (one and two waves both run reserve / 2). It runs as live
-/// rows on the smallest compiled capacity at least that wide.
-pub fn unit_rows_in(waves: u64, reserve: u64) -> u64 {
-    reserve.div_ceil(waves.clamp(2, MAX_WAVES)).div_ceil(ROW_PAGE) * ROW_PAGE
-}
 
 /// The standard reserve's units: 4096 / 2752 / 2048 at two, three and four waves.
 pub fn unit_rows(waves: u64) -> u64 { unit_rows_in(waves, RESERVE_ROWS) }

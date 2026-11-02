@@ -182,7 +182,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
     group_rows = slice_group_rows(_pinned_sparkinfer.SOURCE)
     for capacity in capacities:
         stream_prefill = (standard_names and role not in ("coordinator", "dspark_tp2")
-                          and native_prefill(hidden, intermediate, props.major * 10 + props.minor, capacity))
+                          and native_prefill(hidden, intermediate, props.major * 10 + props.minor, capacity, experts, topk))
         compact = compact_max_capacity is not None and capacity <= compact_max_capacity
         atomic = not stream_prefill and not compact and atomic_min_capacity is not None and capacity >= atomic_min_capacity
         selected_width = width[capacity] if isinstance(width, dict) else width
