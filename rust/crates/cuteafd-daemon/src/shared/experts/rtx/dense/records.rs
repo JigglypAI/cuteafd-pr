@@ -11,7 +11,8 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use std::{ffi::c_void, ops::Range, os::unix::fs::FileExt, path::PathBuf};
 
 /// The most bytes one step stages (one or more whole scale units).
-pub(crate) const STEP_BYTES: usize = 32 << 20;
+pub(crate) use cuteafd_loader::shared::dense_read::STEP_BYTES;
+use cuteafd_loader::shared::dense_read::{ReadBatch, PINNED_FLOOR_BYTES};
 
 /// Rows `rows` of a checkpoint tensor (rows of `row_bytes` at `base` in `path`),
 /// bytes `cols` of each, packed row by row.
@@ -47,7 +48,10 @@ impl Rect {
         let hit = cache.as_ref().is_some_and(|(rows, _)| rows.path == whole.path && rows.base == whole.base
             && rows.row_bytes == whole.row_bytes && rows.rows == whole.rows);
         if !hit {
-            let mut source = vec![0u8; self.rows.len() * self.row_bytes];
+            // Release the previous window before allocating its replacement.
+            *cache = None;
+            let batch = ReadBatch::new(self.rows.len(), self.row_bytes, self.width(), usize::MAX)?;
+            let mut source = vec![0u8; batch.cached_bytes];
             load_timing::read(source.len(), || file.read_exact_at(&mut source, start))
                 .with_context(|| format!("reading {}", self.name))?;
             *cache = Some((whole, source));
@@ -636,7 +640,7 @@ impl<'a> Mount<'a> {
     /// pinned staging of at most [`STEP_BYTES`] (row windows of larger ones).
     pub fn operand(&mut self, operand: &Operand) -> Result<()> {
         for (rect, at) in &operand.lands {
-            let per = (STEP_BYTES / rect.width()).max(1);
+            let per = ReadBatch::new(rect.rows.len(), rect.row_bytes, rect.width(), STEP_BYTES)?.rows;
             let mut first = 0;
             while first < rect.rows.len() {
                 let part = rect.sub(first..(first + per).min(rect.rows.len()));
@@ -658,7 +662,7 @@ impl<'a> Mount<'a> {
     fn grow(&mut self, bytes: usize) -> Result<()> {
         if self.staging.as_ref().is_none_or(|s| s.buffer.bytes < bytes) {
             drop(self.staging.take());
-            self.staging = Some(HostAllocation::named(self.library, bytes.max(1 << 20), "staging/coordinator-dense")?);
+            self.staging = Some(HostAllocation::named(self.library, bytes.max(PINNED_FLOOR_BYTES), "staging/coordinator-dense")?);
         }
         Ok(())
     }

@@ -18,6 +18,18 @@ pub struct KdaGeometry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KdaRole { Q, K, V, Fa, Fb, Ga, Gb, G, Beta, ConvQ, ConvK, ConvV, ALog, DtBias, ONorm, O }
 
+impl KdaRole {
+    /// Execution ownership, independent of the checkpoint's physical encoding.
+    pub fn split(self) -> crate::formats::trellis_core::CoreSplit {
+        use crate::formats::trellis_core::CoreSplit;
+        match self {
+            Self::Fa | Self::Ga | Self::ONorm => CoreSplit::Whole,
+            Self::O => CoreSplit::Input,
+            _ => CoreSplit::Output,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KdaOperand { WIn, WFg, ConvW, ALog, DtBias, ONorm, WO }
 
@@ -153,10 +165,10 @@ impl KdaGeometry {
                 return Err(tensor_error(role, format!("expected {dtype:?}, found {source:?}")));
             }
             for rank in 0..ranks {
-                let (window_rows, window) = match role {
-                    R::Fa | R::Ga | R::ONorm => (0..rows, 0..cols),
-                    R::O => (0..rows, rank * cols / ranks..(rank + 1) * cols / ranks),
-                    _ => (rank * rows / ranks..(rank + 1) * rows / ranks, 0..cols),
+                let (window_rows, window) = match role.split() {
+                    crate::formats::trellis_core::CoreSplit::Whole => (0..rows, 0..cols),
+                    crate::formats::trellis_core::CoreSplit::Input => (0..rows, rank * cols / ranks..(rank + 1) * cols / ranks),
+                    crate::formats::trellis_core::CoreSplit::Output => (rank * rows / ranks..(rank + 1) * rows / ranks, 0..cols),
                 };
                 let piece = KdaPiece { role, source: source.clone(), rows: window_rows, cols, window, at: at[rank] };
                 at[rank] += piece.elements();
