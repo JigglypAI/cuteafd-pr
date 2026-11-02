@@ -7,14 +7,14 @@
 //! the duplicate in favour of a reference. Lookups use the engine's own `Retention` radix
 //! (`cuteafd-core::prefix`), so a host hit is exactly a snapshot the device tier would have
 //! chosen. Eviction is configurable: Banks uses prompts before turns, oldest access first;
-//! LeastRecent (used by V4.1 and the generic engine) takes the oldest store/lookup across
-//! banks, with prompts first only at equal use. Neither order touches a pinned snapshot.
+//! LeastRecent (used by V4.1 and the generic engine) evicts leaves before reusable ancestors,
+//! then takes the oldest store/lookup across banks. Neither order touches a pinned snapshot.
 use crate::pool::{Class, HostRange, PoolExhausted, Slab, SlabPool};
 use crate::SnapshotKind;
 use crate::PAGE_BANKS;
 use cuteafd_core::prefix::{ReuseRule, Retention};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Identity of a device page while it is allocated: the engine's page index in its compressor
 /// pool and the generation that increments on every free, so a reused index is a new identity.
@@ -36,7 +36,7 @@ pub type Key = u64;
 pub enum EvictionOrder {
     /// Legacy order: every prompt snapshot (oldest first) before any turn snapshot (`Retention` order).
     Banks,
-    /// Least recently used: the smallest use count (`HostSnapshot::last_use`), whichever bank.
+    /// Leaves before reusable ancestors; then the smallest use count, whichever bank.
     /// A prompt snapshot shares its pages with its turn snapshot, so bank order deleted fresh
     /// prompts before stale turns and made retries prefill from cold. A conversation stores its
     /// prompt snapshot before its turn snapshot, so a stale pair still goes prompt first. The
@@ -367,6 +367,28 @@ impl Snapshots {
         }
     }
 
+    /// Leaves first, then reusable ancestors; LRU within each class. Sorting token paths
+    /// makes every ancestor adjacent to a descendant without comparing every pair.
+    fn least_recent_candidates(&self, incoming: Option<&SnapshotMeta>) -> Vec<Key> {
+        let mut paths: Vec<_> = self.snapshots.values()
+            .map(|s| (s.meta.tokens.as_slice(), Some(s.key))).collect();
+        if let Some(meta) = incoming { paths.push((meta.tokens.as_slice(), None)); }
+        paths.sort_unstable_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1)));
+        let mut ancestors = HashSet::new();
+        let mut start = 0;
+        while start < paths.len() {
+            let tokens = paths[start].0;
+            let end = start + paths[start..].iter().take_while(|p| p.0 == tokens).count();
+            if paths.get(end).is_some_and(|next| next.0.starts_with(tokens)) {
+                ancestors.extend(paths[start..end].iter().filter_map(|p| p.1));
+            }
+            start = end;
+        }
+        let mut candidates: Vec<_> = self.snapshots.values().filter(|s| s.pins == 0).collect();
+        candidates.sort_unstable_by_key(|s| (ancestors.contains(&s.key), s.last_use));
+        candidates.into_iter().map(|s| s.key).collect()
+    }
+
     /// Make room in one eviction-order pass, then let the caller plan exactly once.
     /// Slab occupancy, not snapshot footprints, accounts for shared pages and class fragmentation.
     pub(crate) fn make_room(&mut self, meta: &SnapshotMeta,
@@ -386,11 +408,7 @@ impl Snapshots {
         }
         if self.pool.can_take(demand) { return (Vec::new(), 0); }
         let mut candidates: Vec<_> = match self.order {
-            EvictionOrder::LeastRecent => {
-                let mut snapshots: Vec<_> = self.snapshots.values().filter(|s| s.pins == 0).collect();
-                snapshots.sort_unstable_by_key(|s| s.last_use);
-                snapshots.into_iter().map(|s| s.key).collect()
-            }
+            EvictionOrder::LeastRecent => self.least_recent_candidates(Some(meta)),
             EvictionOrder::Banks => [SnapshotKind::Prompt, SnapshotKind::Turn].into_iter()
                 .flat_map(|kind| self.retention.bank(kind).eviction_order().into_iter().copied())
                 .filter(|key| self.snapshots.get(key).is_some_and(|s| s.pins == 0)).collect(),
@@ -420,12 +438,7 @@ impl Snapshots {
     /// never evicted.
     pub fn evict_one(&mut self) -> Option<(Key, u64)> {
         if self.order == EvictionOrder::LeastRecent {
-            let key = self
-                .snapshots
-                .values()
-                .filter(|snapshot| snapshot.pins == 0)
-                .min_by_key(|snapshot| snapshot.last_use)
-                .map(|snapshot| snapshot.key)?;
+            let key = self.least_recent_candidates(None).into_iter().next()?;
             let before = self.pool.bytes_used();
             self.remove(key);
             return Some((key, before - self.pool.bytes_used()));
@@ -871,7 +884,7 @@ mod tests {
         let old_turn = commit(&mut store, SnapshotKind::Turn, &[1, 2, 3], 1, 1);
         let fresh_prompt = commit(&mut store, SnapshotKind::Prompt, &[4, 5], 2, 9);
         let same_poll_turn = commit(&mut store, SnapshotKind::Turn, &[6, 7, 8], 3, 5);
-        let same_poll_prompt = commit(&mut store, SnapshotKind::Prompt, &[6, 7], 4, 5);
+        let same_poll_prompt = commit(&mut store, SnapshotKind::Prompt, &[9, 10], 4, 5);
         // Exact-frontier rule: a partial match is no hit, an exact ancestor is.
         assert!(store.lookup(&[1, 2, 9], 10).is_none());
         assert_eq!(store.lookup(&[4, 5, 6], 3).map(|hit| hit.key), Some(fresh_prompt));
@@ -883,6 +896,67 @@ mod tests {
         // count keeps their commit order.
         assert_eq!(order, vec![old_turn, same_poll_turn, same_poll_prompt, fresh_prompt]);
         assert!(store.is_empty() && store.retention().bank(SnapshotKind::Prompt).is_empty());
+    }
+
+    #[test]
+    fn tight_quota_keeps_base_through_sixteen_way_fanout() {
+        // Large positional marks dominate, as in Step; KV pages are shared.
+        let mut store = snapshots_with_layout(8 * 1024, Layout::family(64, 1024, 0));
+        let common = pages(&[id(0)]);
+        let plan = store.plan_store(meta(SnapshotKind::Prompt, &[1, 2], false), &common).unwrap();
+        let base = store.commit_store(plan, 0);
+        let mut evicted = Vec::new();
+        for branch in 0..16 {
+            let tokens = [1, 2, 100 + branch];
+            assert_eq!(store.peek(&tokens).unwrap().key, base);
+            for kind in [SnapshotKind::Prompt, SnapshotKind::Turn] {
+                let mut tokens = tokens.to_vec();
+                if kind == SnapshotKind::Turn { tokens.push(200); }
+                let metadata = meta(kind, &tokens, false);
+                let device = pages(&[id(0), id(1 + branch)]);
+                evicted.extend(store.make_room(&metadata, &device, [0; 4]).0);
+                let plan = store.plan_store(metadata, &device).expect("leaf store fits after eviction");
+                store.commit_store(plan, branch as u64);
+                assert!(store.get(base).is_some(), "fanout branch {branch} lost common base");
+                assert!(store.bytes_used() <= 8 * 1024);
+            }
+        }
+        assert!(!evicted.is_empty());
+        assert!(!evicted.contains(&base));
+        assert_eq!(store.peek(&[1, 2, 999]).unwrap().key, base);
+    }
+
+    #[test]
+    fn ancestor_priority_crosses_banks_and_skips_pins() {
+        let mut store = snapshots(1 << 30);
+        let mut keys = Vec::new();
+        for (kind, tokens) in [(SnapshotKind::Prompt, vec![1, 2]),
+            (SnapshotKind::Turn, vec![1, 2]), (SnapshotKind::Turn, vec![1, 2, 3])] {
+            let plan = store.plan_store(meta(kind, &tokens, false), &pages(&[])).unwrap();
+            keys.push(store.commit_store(plan, 0));
+        }
+        assert_eq!(store.evict_one().unwrap().0, keys[2]);
+        // With the descendant gone, the equal token paths are ordinary LRU peers.
+        store.pin(keys[0]);
+        assert_eq!(store.evict_one().unwrap().0, keys[1]);
+        assert!(store.evict_one().is_none());
+        store.unpin(keys[0]);
+        assert_eq!(store.evict_one().unwrap().0, keys[0]);
+    }
+
+    #[test]
+    fn incoming_descendant_protects_oldest_base_during_admission() {
+        let mut store = snapshots_with_layout(4 * 1024, Layout::family(0, 1024, 0));
+        let mut keys = Vec::new();
+        for tokens in [vec![1, 2], vec![3], vec![4], vec![5]] {
+            let plan = store.plan_store(meta(SnapshotKind::Prompt, &tokens, false), &pages(&[])).unwrap();
+            keys.push(store.commit_store(plan, 0));
+        }
+        let incoming = meta(SnapshotKind::Turn, &[1, 2, 3], false);
+        let (evicted, _) = store.make_room(&incoming, &pages(&[]), [0; 4]);
+        assert_eq!(evicted, vec![keys[1]]);
+        assert!(store.get(keys[0]).is_some());
+        assert!(store.plan_store(incoming, &pages(&[])).is_ok());
     }
 
     #[test]
