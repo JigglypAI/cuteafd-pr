@@ -890,6 +890,8 @@ pub(crate) struct DflashDrafter<'a> {
     mask_row: Vec<u8>,
     workspace: RefCell<Option<Workspace<'a>>>,
     startup_primed: Cell<bool>,
+    // Temporary ordered Load proof until Kimi supplies a complete resolved plan.
+    legacy_mla_events: RefCell<Vec<cuteafd_loader::placement::planner::OwnerEvent>>,
     representation: GlmDraftRepresentation,
     fp8_workspace: Option<Dev<'a>>,
     /// How the borrowed BF16 head runs past one draft block ([`DraftHead`]; GLM 5.3
@@ -901,6 +903,53 @@ pub(crate) struct DflashDrafter<'a> {
     fp8_admitted: fp8_linear::Fp8Rows,
     confidence_directory: std::path::PathBuf,
     confidence_scales: fp8_linear::Fp8Scales,
+}
+
+fn legacy_mla_owner_events(
+    audit: &[cuteafd_ffi::memory_ledger::AllocationEvent],
+    receipts: &[cuteafd_loader::placement::planner::Receipt],
+    device: i32,
+    phase: cuteafd_loader::placement::planner::Phase,
+) -> Result<Vec<cuteafd_loader::placement::planner::OwnerEvent>> {
+    use cuteafd_core::memory_layout::Category;
+    use cuteafd_ffi::memory_ledger::{AllocationEvent, Space};
+    use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location, OwnerEvent, Receipt};
+    let mut live = std::collections::BTreeMap::new();
+    let mut events = Vec::new();
+    for event in audit {
+        let (record, allocated) = match event {
+            AllocationEvent::Allocated(a) => (a, true), AllocationEvent::Freed(a) => (a, false),
+        };
+        let location = match record.key.space {
+            Space::Device => {
+                ensure!(record.key.device == device, "MLA owner allocated on wrong physical device");
+                Location::coordinator(u8::try_from(device)?)
+            }
+            Space::Pinned => Location::PINNED,
+            Space::Managed => anyhow::bail!("unexpected managed MLA owner"),
+        };
+        let key = (location, record.address);
+        if allocated {
+            let receipt = if record.key.scope == "draft.pack.source" {
+                ensure!(record.key.space == Space::Device, "MLA packing source is not device memory");
+                Receipt { allocation: Allocation::buffer(
+                    format!("draft.mla.{}", record.key.owner.context("MLA packing source missing ID")?),
+                    location, record.bytes as u64, Lifetime { first: phase, last: phase },
+                    Category::Drafter, "BF16 packing source"), address: record.address as u64 }
+            } else {
+                receipts.iter().find(|r| r.address == record.address as u64 && r.allocation.location == location)
+                    .context("audited MLA owner absent from independent retained fields")?.clone()
+            };
+            ensure!(receipt.allocation.bytes == record.bytes as u64, "MLA census size differs from retained owner");
+            ensure!(live.insert(key, (record, receipt.clone())).is_none(), "MLA pointer reused before free");
+            events.push(OwnerEvent::Allocated { receipt, phase });
+        } else {
+            let (allocation, receipt) = live.remove(&key).context("MLA free without audited allocation")?;
+            ensure!(allocation.key == record.key && allocation.bytes == record.bytes, "MLA free differs from owner");
+            events.push(OwnerEvent::Freed { receipt, phase });
+        }
+    }
+    Ok(events)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1199,6 +1248,7 @@ impl<'a> DflashDrafter<'a> {
             mask_row,
             workspace: RefCell::new(None),
             startup_primed: Cell::new(false),
+            legacy_mla_events: RefCell::new(Vec::new()),
             representation,
             confidence_directory: snapshot.into(),
             confidence_scales: scales,
@@ -1241,6 +1291,7 @@ impl<'a> DflashDrafter<'a> {
             Ok(program)
         }).collect::<Result<Vec<_>>>()?;
         crate::shared::memory::budget::reserve_sync_h2d(library, layout.sync_upload_bytes())?;
+        let audit = cuteafd_ffi::memory_ledger::AllocationAudit::start();
         let mut owners = MlaDraftStorage::allocate(library, layout.clone())?.into_owners()?;
         let allocation = |id: &str, bytes, matrix| -> Result<Dev<'a>> {
             let packing = matrix && representation == GlmDraftRepresentation::Fp8Only;
@@ -1322,7 +1373,8 @@ impl<'a> DflashDrafter<'a> {
             context_positions: owners.take("context_positions")?,
             context: DraftContext::Mla(MlaContext { cfg: native, state: RefCell::new(MlaPagedState::new(&layout)?),
                 layout, slots: owners.take("context_slots")? }),
-            mask_row: Vec::new(), workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), representation,
+            mask_row: Vec::new(), workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false),
+            legacy_mla_events: RefCell::new(Vec::new()), representation,
             fp8_workspace: if representation == GlmDraftRepresentation::Fp8Only { Some(owners.take("fp8_scratch")?) } else { None },
             head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_rows), fp8_admitted: fp8_rows,
             confidence_directory: snapshot.into(), confidence_scales: scales,
@@ -1330,6 +1382,8 @@ impl<'a> DflashDrafter<'a> {
             round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
         };
         owners.finish()?;
+        result.reconcile_legacy_mla_allocations(cuteafd_loader::placement::planner::Phase::Load,
+            &audit.events())?;
         Ok(result)
     }
 
@@ -1420,77 +1474,155 @@ impl<'a> DflashDrafter<'a> {
         }
     }
 
-    /// Physical owners read from retained fields, not from the admission recipe.
-    pub(crate) fn mla_allocation_buffers(&self) -> Result<(Vec<(String, CuteafdDeviceBuffer)>,
-        Vec<(String, cuteafd_ffi::CuteafdHostBuffer)>)> {
-        ensure!(matches!(self.context, DraftContext::Mla(_)), "not an MLA drafter");
-        let mut device = Vec::new();
-        let mut weight = |id: String, weight: &DraftWeight<'_>| {
-            match weight {
-                DraftWeight::Bf16(value) => device.push((id, value.buffer)),
+    /// Independent typed census of retained fields, never the forecast owner list.
+    fn mla_allocation_receipts(&self, gpu: u8, metadata: bool)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location, Phase, Receipt};
+        let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
+        let c = &self.cfg;
+        let m = &context.cfg.mla;
+        let life = Lifetime { first: Phase::Load, last: Phase::Growth };
+        let mut receipts = Vec::new();
+        let mut uploads = Vec::new();
+        let mut add = |id: String, buffer: CuteafdDeviceBuffer, dtype: &str, shape: Vec<usize>| {
+            if ["context_positions", "context_slots", "positions", "anchors", "ids", "native_positions",
+                "native_slots", "lengths", "query_offsets"].contains(&id.as_str()) || id.ends_with(".page_table") {
+                uploads.push((id.clone(), buffer));
+            }
+            let mut allocation = Allocation::buffer(format!("draft.mla.{id}"), Location::coordinator(gpu),
+                buffer.bytes as u64, life, Category::Drafter, "MLA DFlash owner");
+            allocation.dtype = dtype.into();
+            allocation.shape = shape.into_iter().map(|n| n as u64).collect();
+            receipts.push(Receipt { allocation, address: buffer.ptr as u64 });
+        };
+        let mut weight = |id: String, value: &DraftWeight<'_>, n: usize, k: usize| {
+            match value {
+                DraftWeight::Bf16(value) => add(id, value.buffer, "bf16", vec![n, k]),
                 DraftWeight::Fp8(value) => {
                     let (values, scales) = value.buffers();
-                    device.push((format!("{id}.values"), values));
-                    device.push((format!("{id}.scales"), scales));
+                    add(format!("{id}.values"), values, "bytes", vec![value.n * value.k]);
+                    add(format!("{id}.scales"), scales, "f32", vec![value.n, value.k / 128]);
                 }
             }
         };
-        weight("weight.fc".into(), &self.fc);
-        weight("weight.projection".into(), &self.projection);
+        weight("weight.fc".into(), &self.fc, c.hidden, c.taps.len() * c.hidden);
+        weight("weight.projection".into(), &self.projection, c.rank, c.hidden);
         for (index, layer) in self.layers.iter().enumerate() {
-            for (leaf, value) in [("attn_conv", &layer.attn_conv), ("mlp_conv", &layer.mlp_conv),
-                ("gate_up", &layer.gate_up), ("down", &layer.down)] {
-                weight(format!("weight.layer.{index}.{leaf}"), value);
+            for (leaf, value, n, k) in [("attn_conv", &layer.attn_conv, c.conv_width(), c.hidden),
+                ("mlp_conv", &layer.mlp_conv, c.conv_width(), c.hidden),
+                ("gate_up", &layer.gate_up, 2 * c.intermediate, c.hidden),
+                ("down", &layer.down, c.hidden, c.intermediate)] {
+                weight(format!("weight.layer.{index}.{leaf}"), value, n, k);
             }
         }
-        for (id, value) in [("weight.hidden_norm", &self.hidden_norm), ("weight.norm", &self.norm),
-            ("weight.predecessor", &self.predecessor), ("weight.successor", &self.successor),
-            ("taps", &self.taps), ("fused", &self.fused), ("fused_norm", &self.fused_norm),
-            ("context_positions", &self.context_positions)] {
-            device.push((id.into(), value.buffer));
+        for (id, value, shape) in [("weight.hidden_norm", &self.hidden_norm, vec![c.hidden]),
+            ("weight.norm", &self.norm, vec![c.hidden]),
+            ("weight.predecessor", &self.predecessor, vec![c.vocab, c.rank]),
+            ("weight.successor", &self.successor, vec![c.vocab, c.rank]),
+            ("taps", &self.taps, vec![TAP_ROWS, c.taps.len(), c.hidden]),
+            ("fused", &self.fused, vec![TAP_ROWS, c.hidden]),
+            ("fused_norm", &self.fused_norm, vec![TAP_ROWS, c.hidden])] {
+            add(id.into(), value.buffer, "bf16", shape);
         }
-        let DraftContext::Mla(context) = &self.context else { unreachable!() };
-        device.push(("context_slots".into(), context.slots.buffer));
+        add("context_positions".into(), self.context_positions.buffer, "i64", vec![TAP_ROWS]);
+        add("context_slots".into(), context.slots.buffer, "i64", vec![TAP_ROWS]);
+        let state = context.state.borrow();
         for (index, layer) in self.layers.iter().enumerate() {
             let prefix = format!("weight.layer.{index}");
-            for (leaf, value) in [("input_norm", &layer.input_norm), ("post_norm", &layer.post_norm),
-                ("attn_base", &layer.attn_base), ("mlp_base", &layer.mlp_base)] {
-                device.push((format!("{prefix}.{leaf}"), value.buffer));
+            for (leaf, value, shape) in [("input_norm", &layer.input_norm, vec![c.hidden]),
+                ("post_norm", &layer.post_norm, vec![c.hidden]),
+                ("attn_base", &layer.attn_base, vec![2, 2, c.hidden]),
+                ("mlp_base", &layer.mlp_base, vec![2, 2, c.hidden])] {
+                add(format!("{prefix}.{leaf}"), value.buffer, "bf16", shape);
             }
-            let DraftAttention::Mla(attention) = &layer.attention else { anyhow::bail!("MLA draft layer mismatch") };
-            for (leaf, value) in [("qkv_a", &attention.qkv_a), ("q_norm", &attention.q_norm),
-                ("kv_norm", &attention.kv_norm), ("q_b", &attention.q_b), ("uk", &attention.uk),
-                ("uv", &attention.uv), ("output", &attention.output)] {
-                device.push((format!("{prefix}.attention.{leaf}"), value.buffer));
+            let DraftAttention::Mla(a) = &layer.attention else { anyhow::bail!("MLA draft layer mismatch") };
+            for (leaf, value, shape) in [
+                ("qkv_a", &a.qkv_a, vec![m.q_rank + m.kv_rank + m.rope, m.hidden]),
+                ("q_norm", &a.q_norm, vec![m.q_rank]), ("kv_norm", &a.kv_norm, vec![m.kv_rank]),
+                ("q_b", &a.q_b, vec![m.heads * (m.nope + m.rope), m.q_rank]),
+                ("uk", &a.uk, vec![m.heads, m.kv_rank, m.nope]),
+                ("uv", &a.uv, vec![m.heads, m.value, m.kv_rank]),
+                ("output", &a.output, vec![m.hidden, m.heads * m.value])] {
+                add(format!("{prefix}.attention.{leaf}"), value.buffer, "bf16", shape);
             }
-            device.push((format!("layer.{index}.cache"), attention.cache.buffer));
-            device.push((format!("layer.{index}.page_table"), attention.page_table.buffer));
+            add(format!("layer.{index}.cache"), a.cache.buffer, "bytes", vec![a.cache.buffer.bytes]);
+            let cache = state.rings.layer(index)?;
+            add(format!("layer.{index}.page_table"), a.page_table.buffer, "i32", vec![cache.slots(), cache.table_width()]);
         }
-        if let Some(scratch) = &self.fp8_workspace { device.push(("fp8_scratch".into(), scratch.buffer)); }
+        if let Some(scratch) = &self.fp8_workspace {
+            add("fp8_scratch".into(), scratch.buffer, "bytes", vec![scratch.buffer.bytes]);
+        }
         let workspace = self.workspace.borrow();
         let w = workspace.as_ref().context("MLA draft lost its admitted workspace")?;
-        for (id, value) in [("h", &w.h), ("n", &w.n), ("conv", &w.conv), ("dynamic", &w.dynamic),
-            ("delta", &w.delta), ("gate_up", &w.gate_up), ("act", &w.act), ("logits", &w.logits),
-            ("unary", &w.unary), ("candidates", &w.candidates), ("projected", &w.projected),
-            ("anchors", &w.anchors), ("ids", &w.ids), ("tokens", &w.tokens), ("features", &w.features),
-            ("positions", &w.positions), ("topk_workspace", &w.topk_workspace), ("head_workspace", &w._head_workspace)] {
-            device.push((id.into(), value.buffer));
+        let seq = w.sequences;
+        let rows = seq * c.block;
+        let drafted = seq * c.drafts();
+        for (id, value, width) in [("h", &w.h, c.hidden), ("n", &w.n, c.hidden),
+            ("conv", &w.conv, c.hidden), ("dynamic", &w.dynamic, c.conv_width()),
+            ("delta", &w.delta, c.hidden), ("gate_up", &w.gate_up, 2 * c.intermediate),
+            ("act", &w.act, c.intermediate), ("projected", &w.projected, c.rank)] {
+            add(id.into(), value.buffer, "bf16", vec![rows, width]);
+        }
+        for (id, value, dtype, shape) in [("logits", &w.logits, "f32", vec![rows, c.vocab]),
+            ("unary", &w.unary, "f32", vec![drafted, 16]), ("candidates", &w.candidates, "u32", vec![drafted, 16]),
+            ("anchors", &w.anchors, "u32", vec![seq]), ("ids", &w.ids, "u32", vec![rows]),
+            ("tokens", &w.tokens, "u32", vec![drafted]), ("features", &w.features, "bytes", vec![drafted, 16]),
+            ("positions", &w.positions, "i64", vec![rows]),
+            ("topk_workspace", &w.topk_workspace, "bytes", vec![w.topk_workspace.buffer.bytes]),
+            ("head_workspace", &w._head_workspace, "bytes", vec![w._head_workspace.buffer.bytes])] {
+            add(id.into(), value.buffer, dtype, shape);
         }
         let AttentionWorkspace::Mla(a) = &w.attention else { anyhow::bail!("MLA draft workspace mismatch") };
-        for (id, value) in [("query", &a.query), ("q_residual", &a.q_residual), ("attention", &a.attention),
-            ("lse", &a.lse), ("native_scratch", &a.scratch), ("lengths", &a.lengths),
-            ("query_offsets", &a.query_offsets), ("native_slots", &a.slots),
-            ("native_positions", &a.positions), ("inverse_frequencies", &a.inverse_frequencies)] {
-            device.push((id.into(), value.buffer));
+        for (id, value, dtype, shape) in [("query", &a.query, "bf16", vec![64, m.heads, m.kv_rank + m.rope]),
+            ("q_residual", &a.q_residual, "bf16", vec![64, m.q_rank]),
+            ("attention", &a.attention, "bf16", vec![64, m.heads, m.kv_rank]),
+            ("lse", &a.lse, "f32", vec![64, m.heads]),
+            ("native_scratch", &a.scratch, "bytes", vec![a.scratch.buffer.bytes]),
+            ("lengths", &a.lengths, "i32", vec![seq]), ("query_offsets", &a.query_offsets, "i32", vec![seq + 1]),
+            ("native_slots", &a.slots, "i64", vec![64]), ("native_positions", &a.positions, "i64", vec![64]),
+            ("inverse_frequencies", &a.inverse_frequencies, "f32", vec![m.rope / 2])] {
+            add(id.into(), value.buffer, dtype, shape);
         }
-        let mut pinned = vec![("landing".into(), w.landing.buffer)];
-        for (id, value) in &device {
-            if ["context_positions", "context_slots", "positions", "anchors", "ids", "native_positions",
-                "native_slots", "lengths", "query_offsets"].contains(&id.as_str()) || id.ends_with(".page_table") {
-                pinned.push((format!("{id}.upload"), self.library.ordered_h2d_staging_buffer(*value, self.stream)?));
+        receipts.push(Receipt { allocation: Allocation::buffer("draft.mla.landing", Location::PINNED,
+            w.landing.buffer.bytes as u64, life, Category::Drafter, "MLA DFlash owner"),
+            address: w.landing.buffer.ptr as u64 });
+        if metadata {
+            for (id, value) in uploads {
+                let buffer = self.library.ordered_h2d_staging_buffer(value, self.stream)?;
+                receipts.push(Receipt { allocation: Allocation::buffer(format!("draft.mla.{id}.upload"),
+                    Location::PINNED, buffer.bytes as u64,
+                    Lifetime { first: Phase::Warmup, last: Phase::Growth }, Category::Drafter, "MLA DFlash owner"),
+                    address: buffer.ptr as u64 });
             }
         }
-        Ok((device, pinned))
+        Ok(receipts)
+    }
+
+    fn reconcile_legacy_mla_allocations(&self, phase: cuteafd_loader::placement::planner::Phase,
+        audit: &[cuteafd_ffi::memory_ledger::AllocationEvent]) -> Result<()> {
+        use cuteafd_loader::placement::planner::{self, Phase};
+        let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
+        let device = self.library.cuda_get_device()?;
+        let gpu = u8::try_from(device)?;
+        let receipts = self.mla_allocation_receipts(gpu, phase >= Phase::Warmup)?;
+        let mut events = self.legacy_mla_events.borrow().clone();
+        events.extend(legacy_mla_owner_events(audit, &receipts, device, phase)?);
+        planner::reconcile_legacy_mla_events(&context.layout.legacy_mla_facts(gpu), phase, &events)?;
+        let mut retained = std::collections::BTreeMap::new();
+        for event in &events {
+            match event {
+                planner::OwnerEvent::Allocated { receipt, .. } => { retained.insert(&receipt.allocation.id, receipt); }
+                planner::OwnerEvent::Freed { receipt, .. } => { retained.remove(&receipt.allocation.id); }
+            }
+        }
+        ensure!(retained.len() == receipts.len() && receipts.iter().all(|receipt|
+            retained.get(&receipt.allocation.id).is_some_and(|previous|
+                previous.allocation == receipt.allocation && previous.address == receipt.address)),
+            "MLA retained fields differ from audited owners");
+        if phase == Phase::Load { *self.legacy_mla_events.borrow_mut() = events; }
+        else { self.legacy_mla_events.borrow_mut().clear(); }
+        Ok(())
     }
 
     /// Mutable owners for the opt-in GLM Flash replay alias diagnostic.
@@ -1962,7 +2094,13 @@ impl<'a> DflashDrafter<'a> {
             *self.workspace.borrow_mut() = Some(self.workspace(self.max_sequences)?);
         }
         self.round.borrow_mut().reserve_current_device()?;
+        let audit = matches!(self.context, DraftContext::Mla(_))
+            .then(cuteafd_ffi::memory_ledger::AllocationAudit::start);
         self.prime_metadata()?;
+        if let Some(audit) = audit {
+            self.reconcile_legacy_mla_allocations(cuteafd_loader::placement::planner::Phase::Warmup,
+                &audit.events())?;
+        }
         if matches!(self.context, DraftContext::Mla(_)) { self.reset_context(0, 0)?; }
         self.library.cuda_zero_bytes(self.taps.buffer, self.taps.buffer.bytes)?;
         self.update(&(0..TAP_ROWS).map(|tap_row| ContextRow { tap_row, slot: 0,
@@ -2846,6 +2984,130 @@ mod checkpoint_header_tests {
             mask_token: 163592, max_context: 1048576, windows: vec![Some(4096), None],
             rotary: DsparkRotaryPlan { inv_freq: vec![1.; 32], attention_factor: 1., softmax_factor: 1. } };
         cfg
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn actual_mla_owners_and_fresh_sources_match_legacy_binding() -> Result<()> {
+        use cuteafd_core::{coordinator_programs::MlaDraftProgramLayout, MlaCacheFormat};
+        use cuteafd_ffi::memory_ledger::AllocationAudit;
+        use cuteafd_loader::placement::planner::{self, OwnerEvent, Phase};
+        use std::io::Write;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let snapshot = fixture.directory().join("mla");
+        std::fs::create_dir(&snapshot)?;
+        // Keep native H/head geometry while minimizing FFN/vocabulary/file size.
+        let config = serde_json::json!({"architectures":["DFlash2DraftModel"],
+            "hidden_size":7168,"intermediate_size":128,"num_hidden_layers":2,
+            "num_attention_heads":64,"num_key_value_heads":64,"q_lora_rank":1536,
+            "kv_lora_rank":512,"qk_nope_head_dim":128,"qk_rope_head_dim":64,"v_head_dim":128,
+            "rms_norm_eps":1e-5,"vocab_size":16,"draft_vocab_size":16,"max_position_embeddings":8192,
+            "num_target_layers":2,"layer_types":["sliding_attention","full_attention"],
+            "sliding_window":4096,"use_sliding_window":true,"is_causal":false,"mla_use_output_gate":false,
+            "attention_bias":false,"hidden_act":"silu","fc_norm":false,
+            "rope_parameters":{"rope_type":"default","rope_theta":10000.0},
+            "dflash_config":{"attention_mode":"mla","block_size":8,"conv_kernel_size":2,
+                "conv_group_size":16,"selector_rank":256,"selector_top_k":16,
+                "target_layer_ids":[0],"mask_token_id":0}});
+        std::fs::write(snapshot.join("config.json"), serde_json::to_vec(&config)?)?;
+        let native = cuteafd_loader::formats::dflash::MlaDflashConfig::read(&snapshot)?;
+        let mut header = serde_json::Map::new();
+        let mut offset = 0;
+        for (name, shape) in native.tensor_shapes() {
+            let bytes = shape.iter().product::<usize>() * 2;
+            header.insert(name, serde_json::json!({"dtype":"BF16","shape":shape,
+                "data_offsets":[offset, offset + bytes]}));
+            offset += bytes;
+        }
+        let header = serde_json::to_vec(&header)?;
+        let mut file = std::fs::File::create(snapshot.join("model.safetensors"))?;
+        file.write_all(&(header.len() as u64).to_le_bytes())?;
+        file.write_all(&header)?;
+        file.set_len((8 + header.len() + offset) as u64)?;
+        drop(file);
+        let program = MlaDraftProgramLayout::new(8192)?;
+        let pointers: [&[&str]; 3] = [
+            &["x","kv_slots","positions","inv_freq","w_qkv_a","q_a_norm","kv_a_norm","w_q_b","w_uk","kv_cache","query","q_resid","scratch"],
+            &["query","kv_cache","page_table","cache_seqlens","cu_seqlens_q","attn","lse","scratch"],
+            &["attn","w_uv","w_o","out","scratch"]];
+        let mut entries = Vec::new();
+        for (cache, suffix) in [("bf16", ""), ("fp8", "_fp8")] {
+            for (kind, leaf, window) in [(0, "producer", None), (1, "attention_full", None),
+                (1, "attention_w4096", Some(4096))] {
+                let mut geometry = serde_json::json!({"name":"mla_block_draft","heads":64,"hidden":7168,
+                    "q_lora_rank":1536,"kv_lora_rank":512,"qk_nope_dim":128,"qk_rope_dim":64,
+                    "v_head_dim":128,"page_rows":64,"norm_eps":1e-5,"window_size":null,"kv_cache":cache});
+                if kind == 0 {
+                    geometry["rotary_style"] = "interleaved".into(); geometry["rotary_dim"] = 64.into();
+                } else {
+                    for (key, value) in [("max_context", program.context), ("num_splits", program.splits),
+                        ("chunks_per_split", program.chunks_per_split), ("partial_output_bytes", program.partial_output_bytes),
+                        ("partial_lse_bytes", program.partial_lse_bytes), ("scratch_bytes", program.scratch[1])] {
+                        geometry[key] = value.into();
+                    }
+                    geometry["noncausal_block"] = true.into(); geometry["window_size"] = window.into();
+                }
+                entries.push(serde_json::json!({"name":format!("fixture_mla_draft_{leaf}{suffix}_m64"),
+                    "capacity_rows":64,"geometry":geometry,"scratch_bytes_at_capacity":{"scratch":program.scratch[kind]},
+                    "pointers":pointers[kind].iter().map(|p| serde_json::json!({"name":p})).collect::<Vec<_>>()}));
+            }
+        }
+        let mut geometry = entries[0]["geometry"].clone();
+        geometry["output_gate"] = false.into();
+        entries.push(serde_json::json!({"name":"fixture_mla_draft_output_m64","capacity_rows":64,
+            "geometry":geometry,"scratch_bytes_at_capacity":{"scratch":program.scratch[2]},
+            "pointers":pointers[2].iter().map(|p| serde_json::json!({"name":p})).collect::<Vec<_>>()}));
+        let manifest = snapshot.join("PROGRAMS.json");
+        std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries}))?)?;
+        for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
+            for cache in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+                let library = fixture.load()?;
+                fixture.quiet_events(&library, true)?;
+                fixture.immediate_copies(&library)?;
+                fixture.configure_memory(&library, 0, 8 << 30)?;
+                let programs = library.programs()?.with_manifest(&manifest)?;
+                let layout = native.runtime_layout(representation, GlmDraftCapacity::new(2, 2, 8)?,
+                    8192, 16384, 1, 2, cache)?;
+                let facts = layout.legacy_mla_facts(0);
+                assert!(facts.allocations.iter().all(|a| !a.id.ends_with("taps.upload") && !a.id.contains("sync-h2d")));
+                let draft = DflashDrafter::load_mla(&library, &programs, "fixture", &snapshot,
+                    std::fs::read(snapshot.join("model.safetensors"))?, std::ptr::null_mut(), layout,
+                    representation, fp8_linear::Fp8Scales::Amax, fp8_linear::Fp8Rows::W8a8)?;
+                let load = draft.legacy_mla_events.borrow().clone();
+                planner::reconcile_legacy_mla_events(&facts, Phase::Load, &load)?;
+                assert!(planner::reconcile_legacy_mla_events(&facts, Phase::Warmup, &load).is_err());
+                let audit = AllocationAudit::start();
+                draft.prime_metadata()?;
+                let receipts = draft.mla_allocation_receipts(0, true)?;
+                let mut events = load;
+                events.extend(legacy_mla_owner_events(&audit.events(), &receipts, 0, Phase::Warmup)?);
+                planner::reconcile_legacy_mla_events(&facts, Phase::Warmup, &events)?;
+                assert!(planner::reconcile_legacy_mla_events(&facts, Phase::Ready, &events).is_err());
+                let mut wrong = events.clone();
+                if let OwnerEvent::Allocated { receipt, .. } = &mut wrong[0] { receipt.allocation.bytes += 1; }
+                assert!(planner::reconcile_legacy_mla_events(&facts, Phase::Warmup, &wrong).is_err());
+                assert!(planner::reconcile_legacy_mla_events(&facts, Phase::Warmup, &events[1..]).is_err());
+                let mut extra = events.clone();
+                let mut added = receipts[0].clone(); added.allocation.id = "unplanned".into();
+                extra.push(OwnerEvent::Allocated { receipt: added, phase: Phase::Warmup });
+                assert!(planner::reconcile_legacy_mla_events(&facts, Phase::Warmup, &extra).is_err());
+                for source in &facts.sequential {
+                    for member in &source.members {
+                        let missing = events.iter().filter(|event| match event {
+                            OwnerEvent::Allocated { receipt, .. } | OwnerEvent::Freed { receipt, .. } =>
+                                receipt.allocation.id != member.id,
+                        }).cloned().collect::<Vec<_>>();
+                        assert_eq!(events.len() - missing.len(), 2);
+                        assert!(planner::reconcile_legacy_mla_events(&facts, Phase::Warmup, &missing).is_err());
+                    }
+                }
+                draft.reconcile_legacy_mla_allocations(Phase::Warmup, &audit.events())?;
+                assert!(draft.legacy_mla_events.borrow().is_empty());
+                drop(audit); drop(draft);
+                fixture.finish_ordered_uploads(&library)?;
+            }
+        }
+        Ok(())
     }
 
     fn mla_cache_state() -> cuteafd_loader::formats::dflash::MlaDraftCacheState {

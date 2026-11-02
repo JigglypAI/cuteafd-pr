@@ -1574,6 +1574,47 @@ fn deferred_reservations_cannot_authorize_readiness_and_headroom_is_not_opaque()
 }
 
 #[test]
+fn legacy_mla_bridge_only_proves_startup_owners_and_keeps_plan_budget_validation() {
+    let mut a = allocation("draft.mla.owner", 100);
+    a.lifetime = Lifetime {
+        first: Phase::Load,
+        last: Phase::Growth,
+    };
+    let f = facts(vec![a.clone()]);
+    let event = OwnerEvent::Allocated {
+        receipt: Receipt {
+            allocation: a,
+            address: 4096,
+        },
+        phase: Phase::Load,
+    };
+    reconcile_legacy_mla_events(&f, Phase::Load, &[event.clone()]).unwrap();
+    reconcile_legacy_mla_events(&f, Phase::Warmup, &[event.clone()]).unwrap();
+    assert!(matches!(
+        reconcile_legacy_mla_events(&f, Phase::Ready, &[event.clone()]),
+        Err(Refusal::InvalidFact(_))
+    ));
+    assert!(reconcile_legacy_mla_events(&f, Phase::Load, &[]).is_err());
+    let mut wrong = event.clone();
+    if let OwnerEvent::Allocated { receipt, .. } = &mut wrong {
+        receipt.allocation.bytes += 1;
+    }
+    assert!(reconcile_legacy_mla_events(&f, Phase::Load, &[wrong]).is_err());
+    let mut invalid = f.clone();
+    invalid.deferred.push(allocation("pending", 1));
+    assert!(matches!(
+        reconcile_legacy_mla_events(&invalid, Phase::Load, &[event.clone()]),
+        Err(Refusal::InvalidFact(_))
+    ));
+    let mut p = plan(f.allocations);
+    p.budgets.clear();
+    assert!(matches!(
+        reconcile_events(&p, Phase::Load, &[event], &[]),
+        Err(Refusal::InvalidFact(_))
+    ));
+}
+
+#[test]
 fn invalid_inputs_return_typed_errors() {
     let p = plan(vec![allocation("a", 100)]);
     let mut budgets = p.budgets.clone();

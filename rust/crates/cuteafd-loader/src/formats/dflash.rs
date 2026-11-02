@@ -360,6 +360,10 @@ struct MlaDraftFrontier {
 }
 
 impl MlaDraftCacheState {
+    pub fn layer(&self, index: usize) -> Result<&MlaDraftCacheLayer> {
+        self.layout.layers.get(index).ok_or_else(|| unsupported("MLA draft unknown cache layer"))
+    }
+
     pub fn new(layout: MlaDraftCacheLayout) -> Result<Self> {
         let first = layout.layers.first().ok_or_else(|| unsupported("MLA draft has no cache layers"))?;
         if layout.layers.iter().any(|layer| layer.slots != first.slots || layer.context != first.context) {

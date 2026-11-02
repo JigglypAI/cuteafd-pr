@@ -175,6 +175,31 @@ impl crate::formats::dflash::MlaDraftOwner {
     }
 }
 
+impl crate::formats::dflash::MlaDraftRuntimeLayout {
+    /// Temporary forecast for the legacy Kimi owner-only bridge. The family
+    /// admits the shared synchronous upload store and diagnostic on-use stores;
+    /// neither is a private drafter owner. Full Kimi migration deletes this API.
+    pub fn legacy_mla_facts(&self, gpu: u8) -> super::planner::Facts {
+        use crate::formats::dflash::MlaDraftLifetime;
+        use super::planner::{Facts, Lifetime, Phase, Sequential};
+        let allocations = self.owners().iter().filter(|o| !o.on_use).map(|owner| {
+            let first = match owner.lifetime {
+                MlaDraftLifetime::Runtime => Phase::Load,
+                MlaDraftLifetime::Library => Phase::Warmup,
+            };
+            owner.allocation(format!("draft.mla.{}", owner.id), gpu,
+                Lifetime { first, last: Phase::Growth }, "MLA DFlash owner")
+        }).collect();
+        let members: Vec<_> = self.packing_sources().iter().map(|owner| owner.allocation(
+            format!("draft.mla.{}", owner.id), gpu,
+            Lifetime { first: Phase::Load, last: Phase::Load }, "BF16 packing source")).collect();
+        Facts { allocations, deferred: vec![], allowances: vec![],
+            sequential: if members.is_empty() { vec![] } else {
+                vec![Sequential { id: "draft.mla.packing".into(), members }]
+            } }
+    }
+}
+
 /// Test oracle: the same request with every movable charged as fixed demands
 /// on its first allowed GPU (how families charged drafters before #65).
 #[cfg(test)]

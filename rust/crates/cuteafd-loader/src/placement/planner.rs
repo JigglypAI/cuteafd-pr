@@ -388,6 +388,26 @@ fn validate(facts: &Facts, budgets: &[Budget]) -> Result<(), Refusal> {
             }
         }
     }
+    validate_owners(facts)?;
+    if facts
+        .allocations
+        .iter()
+        .chain(&facts.deferred)
+        .chain(facts.sequential.iter().flat_map(|g| &g.members))
+        .any(|a| !locations.contains(&a.location))
+        || facts
+            .allowances
+            .iter()
+            .any(|a| !locations.contains(&a.location))
+    {
+        return Err(Refusal::InvalidFact(
+            "allocation outside memory budgets".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_owners(facts: &Facts) -> Result<(), Refusal> {
     let mut groups = BTreeSet::new();
     for group in &facts.sequential {
         group.validate()?;
@@ -411,7 +431,6 @@ fn validate(facts: &Facts, budgets: &[Budget]) -> Result<(), Refusal> {
             || allocation.alignment == 0
             || !allocation.alignment.is_power_of_two()
             || allocation.lifetime.first > allocation.lifetime.last
-            || !locations.contains(&allocation.location)
         {
             return Err(Refusal::InvalidFact(format!(
                 "invalid allocation {}",
@@ -446,10 +465,7 @@ fn validate(facts: &Facts, budgets: &[Budget]) -> Result<(), Refusal> {
         }
     }
     for allowance in &facts.allowances {
-        if !locations.contains(&allowance.location)
-            || allowance.source.is_empty()
-            || allowance.lifetime.first > allowance.lifetime.last
-        {
+        if allowance.source.is_empty() || allowance.lifetime.first > allowance.lifetime.last {
             return Err(Refusal::InvalidFact("invalid opaque allowance".into()));
         }
     }
@@ -564,7 +580,8 @@ pub fn reconcile_history(
     phase: Phase,
     observations: &[Observation],
 ) -> Result<(), Refusal> {
-    reconcile_observations(plan, phase, observations, false)
+    validate(&plan.facts, &plan.budgets)?;
+    reconcile_observations(&plan.facts, phase, observations, false)
 }
 
 /// Replay every physical owner in allocation order, including freed packing
@@ -576,24 +593,43 @@ pub fn reconcile_events(
     views: &[Observation],
 ) -> Result<(), Refusal> {
     validate(&plan.facts, &plan.budgets)?;
-    let mut expected = plan
-        .facts
+    reconcile_owner_events(&plan.facts, phase, events, views)
+}
+
+/// Temporary owner-only bridge for the legacy Kimi MLA drafter. This proves
+/// ownership/history, not capacity or Ready admission. Full Kimi migration
+/// deletes this entry point and uses `reconcile_events` on its resolved plan.
+pub fn reconcile_legacy_mla_events(
+    facts: &Facts,
+    phase: Phase,
+    events: &[OwnerEvent],
+) -> Result<(), Refusal> {
+    if phase > Phase::Warmup || !facts.deferred.is_empty() || !facts.allowances.is_empty() {
+        return Err(Refusal::InvalidFact(
+            "legacy MLA bridge only checks startup owners".into(),
+        ));
+    }
+    reconcile_owner_events(facts, phase, events, &[])
+}
+
+fn reconcile_owner_events(
+    facts: &Facts,
+    phase: Phase,
+    events: &[OwnerEvent],
+    views: &[Observation],
+) -> Result<(), Refusal> {
+    validate_owners(facts)?;
+    let mut expected = facts
         .allocations
         .iter()
         .filter(|a| a.view.is_none())
         .map(|a| (a.id.as_str(), (None, a)))
         .collect::<BTreeMap<_, _>>();
-    expected.extend(
-        plan.facts
-            .sequential
+    expected.extend(facts.sequential.iter().enumerate().flat_map(|(group, g)| {
+        g.members
             .iter()
-            .enumerate()
-            .flat_map(|(group, g)| {
-                g.members
-                    .iter()
-                    .map(move |a| (a.id.as_str(), (Some(group), a)))
-            }),
-    );
+            .map(move |a| (a.id.as_str(), (Some(group), a)))
+    }));
     let mut errors = Vec::new();
     let mut seen = BTreeSet::new();
     let mut active = BTreeMap::<&str, &Receipt>::new();
@@ -647,7 +683,7 @@ pub fn reconcile_events(
             }
             if let Some(group) = group {
                 if groups.insert(group, id).is_some() {
-                    errors.push(Mismatch::Lifetime(plan.facts.sequential[group].id.clone()));
+                    errors.push(Mismatch::Lifetime(facts.sequential[group].id.clone()));
                 }
             } else {
                 observations.entry(id).or_insert_with(|| Observation {
@@ -675,7 +711,7 @@ pub fn reconcile_events(
             }
         }
     }
-    for group in &plan.facts.sequential {
+    for group in &facts.sequential {
         for spec in &group.members {
             if spec.lifetime.first <= phase && !seen.contains(spec.id.as_str()) {
                 errors.push(Mismatch::Missing(spec.id.clone()));
@@ -697,16 +733,16 @@ pub fn reconcile_events(
         .into_values()
         .chain(views.iter().cloned())
         .collect::<Vec<_>>();
-    reconcile_observations(plan, phase, &observations, true)
+    reconcile_observations(facts, phase, &observations, true)
 }
 
 fn reconcile_observations(
-    plan: &ResolvedPlan,
+    facts: &Facts,
     phase: Phase,
     observations: &[Observation],
     ordered_proved: bool,
 ) -> Result<(), Refusal> {
-    validate(&plan.facts, &plan.budgets)?;
+    validate_owners(facts)?;
     let mut seen = BTreeSet::new();
     let mut errors = Vec::new();
     for observation in observations {
@@ -714,7 +750,7 @@ fn reconcile_observations(
         if !seen.insert(id.as_str()) {
             errors.push(Mismatch::Duplicate(id.clone()));
         }
-        match plan.facts.allocations.iter().find(|a| &a.id == id) {
+        match facts.allocations.iter().find(|a| &a.id == id) {
             None => errors.push(Mismatch::Extra(id.clone())),
             Some(spec) => {
                 if *spec != observation.receipt.allocation {
@@ -732,13 +768,13 @@ fn reconcile_observations(
             }
         }
     }
-    for spec in &plan.facts.allocations {
+    for spec in &facts.allocations {
         if spec.lifetime.first <= phase && !seen.contains(spec.id.as_str()) {
             errors.push(Mismatch::Missing(spec.id.clone()));
         }
     }
     if !ordered_proved {
-        for group in &plan.facts.sequential {
+        for group in &facts.sequential {
             for spec in &group.members {
                 if spec.lifetime.first <= phase {
                     errors.push(Mismatch::Missing(spec.id.clone()));
@@ -755,7 +791,7 @@ fn reconcile_observations(
             .filter(|o| o.created <= at && o.freed.is_none_or(|freed| at <= freed))
             .map(|o| o.receipt.clone())
             .collect::<Vec<_>>();
-        reconcile_snapshot(plan, at, &receipts, ordered_proved)?;
+        reconcile_snapshot(facts, at, &receipts, ordered_proved)?;
     }
     Ok(())
 }
@@ -792,18 +828,18 @@ pub fn reconcile_usage(
 /// Receipts describe actual owners. A view address must equal backing+offset;
 /// overlapping physical owners and overlapping independent slot views fail.
 pub fn reconcile(plan: &ResolvedPlan, phase: Phase, receipts: &[Receipt]) -> Result<(), Refusal> {
-    reconcile_snapshot(plan, phase, receipts, false)
+    validate(&plan.facts, &plan.budgets)?;
+    reconcile_snapshot(&plan.facts, phase, receipts, false)
 }
 
 fn reconcile_snapshot(
-    plan: &ResolvedPlan,
+    facts: &Facts,
     phase: Phase,
     receipts: &[Receipt],
     ordered_proved: bool,
 ) -> Result<(), Refusal> {
-    validate(&plan.facts, &plan.budgets)?;
-    let expected: BTreeMap<_, _> = plan
-        .facts
+    validate_owners(facts)?;
+    let expected: BTreeMap<_, _> = facts
         .allocations
         .iter()
         .filter(|a| a.lifetime.contains(phase))
@@ -813,7 +849,7 @@ fn reconcile_snapshot(
     let mut errors = Vec::new();
     if phase >= Phase::Ready {
         errors.extend(
-            plan.facts
+            facts
                 .deferred
                 .iter()
                 .map(|a| Mismatch::Missing(a.id.clone())),
@@ -821,7 +857,7 @@ fn reconcile_snapshot(
     }
     if !ordered_proved {
         errors.extend(
-            plan.facts
+            facts
                 .sequential
                 .iter()
                 .flat_map(|g| &g.members)

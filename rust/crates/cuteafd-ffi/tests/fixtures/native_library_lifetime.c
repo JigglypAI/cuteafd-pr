@@ -83,6 +83,39 @@ int cuteafd_cuda_enable_peer(int peer) { (void)peer; return 0; }
 int cuteafd_tp2_native_initialize(void) { return 0; }
 int cuteafd_peer_exchange_initialize(void) { return 0; }
 
+/* Ownership-only MLA programs: real Rust manifest/ABI validation still runs.
+ * Numerical launches are deliberately unsupported by this CPU fixture. */
+struct fixture_program_info {
+    char name[64]; uint32_t pointers, scalars; uint8_t scalar_kinds[16];
+};
+static const char *mla_programs[] = {
+    "fixture_mla_draft_producer_m64",
+    "fixture_mla_draft_attention_full_m64",
+    "fixture_mla_draft_attention_w4096_m64",
+    "fixture_mla_draft_producer_fp8_m64",
+    "fixture_mla_draft_attention_full_fp8_m64",
+    "fixture_mla_draft_attention_w4096_fp8_m64",
+    "fixture_mla_draft_output_m64"
+};
+uint32_t cuteafd_dsv4_program_count(void) { return 7; }
+int cuteafd_dsv4_program_info(uint32_t index, struct fixture_program_info *info) {
+    if (index >= 7 || !info) return 1;
+    memset(info, 0, sizeof(*info));
+    strcpy(info->name, mla_programs[index]);
+    const int kind = index == 6 ? 2 : (index % 3 == 0 ? 0 : 1);
+    info->pointers = kind == 0 ? 13 : (kind == 1 ? 8 : 5);
+    const char *scalars = kind == 0 ? "fi" : (kind == 1 ? "iilif" : "i");
+    info->scalars = (uint32_t)strlen(scalars);
+    memcpy(info->scalar_kinds, scalars, info->scalars);
+    return 0;
+}
+int cuteafd_dsv4_program_load(uint32_t index) { return index < 7 ? 0 : 1; }
+int cuteafd_dsv4_program_launch(uint32_t index, void **pointers,
+        const uint64_t *scalars, void *stream) {
+    (void)index; (void)pointers; (void)scalars; (void)stream;
+    return 1;
+}
+
 
 /* Head fixture records the scratch selected by the real Rust handle binding. */
 struct fixture_head { void *workspace; int width, rows, vocab; };
