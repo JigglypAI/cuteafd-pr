@@ -136,6 +136,13 @@ fn landed<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, name: &str, comp
     Ok(allocation)
 }
 
+fn allocate_absorbed<T>(layout: &cuteafd_loader::plan::exlr8::dense::KvBLayout,
+    mut allocate: impl FnMut(usize) -> Result<T>) -> Result<[T; 4]> {
+    let [uk, uk_scale, uv, uv_scale] = layout.allocations;
+    Ok([allocate(uk.max(256))?, allocate(uk_scale.max(256))?,
+        allocate(uv.max(256))?, allocate(uv_scale.max(256))?])
+}
+
 /// Operand key of a native projection component.
 pub(crate) fn key(projection: &str, component: &str) -> String { format!("n.{projection}.{component}") }
 
@@ -168,10 +175,7 @@ pub(crate) fn load_layer<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, r
     ensure!(layout.first_head == h0 && layout.heads == heads
         && layout.geometry == cuteafd_loader::plan::exlr8::dense::KvBGeometry {
             heads: heads_total, nope, values: v, latent: lat }, "native kv_b plan/load geometry mismatch");
-    let alloc = |bytes: usize| DeviceAllocation::new(library, bytes.max(256));
-    let [uk_bytes, uk_scale_bytes, uv_bytes, uv_scale_bytes] = layout.allocations;
-    let (uk, uk_scale) = (alloc(uk_bytes)?, alloc(uk_scale_bytes)?);
-    let (uv, uv_scale) = (alloc(uv_bytes)?, alloc(uv_scale_bytes)?);
+    let [uk, uk_scale, uv, uv_scale] = allocate_absorbed(layout, |bytes| DeviceAllocation::new(library, bytes))?;
     ensure!(STEP_BYTES == cuteafd_loader::plan::exlr8::dense::DENSE_STEP_BYTES,
         "native dense plan/load staging bound mismatch");
     let per = ((STEP_BYTES - grid.bytes) / ((nope + v) * lat)).max(1);
@@ -200,4 +204,29 @@ pub(crate) fn load_layer<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, r
     out.insert("w_uv_fp8".into(), uv);
     out.insert("w_uv_scale".into(), uv_scale);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cuteafd_loader::plan::exlr8::dense::{DenseExecution, DenseOwnership, KvBGeometry};
+
+    #[test]
+    fn tp2_kv_b_plan_equals_actual_allocation_requests() {
+        let geometry = KvBGeometry { heads: 64, nope: 192, values: 256, latent: 512 };
+        let record = DenseRecord { tensor: "model.layers.0.self_attn.kv_b_proj.weight".into(),
+            encoding: DenseEncoding::BlockFp8, shape: vec![64 * 448, 512], side: ShardSide::Output,
+            ownership: DenseOwnership::new(DenseExecution::AbsorbHeads(geometry)),
+            channels_per_shard: 128, rotation_id: 0, rotation: None, hessian_solved: false,
+            components: vec![], native_blocks: 224 };
+        for rank in 0..2 {
+            let plan = DensePlan::for_rank(&[record.clone()], 2, rank).unwrap();
+            let layout = plan.tensors[0].absorbed.as_ref().unwrap();
+            let mut requests = Vec::new();
+            let allocations = allocate_absorbed(layout, |bytes| { requests.push(bytes); Ok(bytes) }).unwrap();
+            assert_eq!(requests, [3_145_728, 196_608, 4_194_304, 262_144]);
+            assert_eq!(allocations, layout.allocations);
+            assert_eq!(requests.iter().sum::<usize>(), plan.resident_bytes);
+        }
+    }
 }

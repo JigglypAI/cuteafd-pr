@@ -23,6 +23,8 @@ pub enum DenseError {
     Mxfp8ScaleBoundary { tensor: String, first: usize, end: usize },
     #[error("EXLR8 dense: {tensor}: physical {storage:?} storage contradicts {execution:?} execution axis")]
     StorageExecutionAxis { tensor: String, storage: ShardSide, execution: DenseAxis },
+    #[error("EXLR8 dense: {path}: native metadata required: {reason}")]
+    NativeMetadata { path: PathBuf, reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -287,22 +289,42 @@ pub fn lane_charge_bytes(cfg: &crate::families::glm5::GlmDsaConfig, gpus: usize,
     scratch_bytes(cfg, heads, inter, decode_rows) + scratch_bytes(cfg, heads, inter, prefill_rows) + a8
 }
 
+fn inventory_candidates(snapshot: &Path) -> Result<Vec<(PathBuf, Header)>> {
+    use crate::plan::{checkpoint::Checkpoint, family, Component};
+    // Construct only the configuration view: opening the checkpoint inventory here recurses.
+    let checkpoint = Checkpoint { snapshot: snapshot.into(), config: super::read_json(&snapshot.join("config.json"))?,
+        quantize_config: None, weight_map: Default::default(), tensors: vec![], missing_shards: vec![], shard_bytes: 0 };
+    let family = family::detect(&checkpoint).context("unsupported EXLR8 dense family")?;
+    let model = family.open(&checkpoint).map_err(anyhow::Error::new)?;
+    let mut paths = Vec::new();
+    for path in files(snapshot, "dense")? {
+        let header = Header::open(&path)?;
+        let entries = header.value.as_object().context("dense header must be an object")?;
+        let names: Vec<_> = entries.keys().filter(|name| *name != "__metadata__").collect();
+        let vision = model.spec().vision && !names.is_empty() && names.iter().all(|name|
+            family.classify(model.spec(), name).is_some_and(|role| role.component == Component::Vision));
+        if vision { continue; }
+        header.validate().map_err(|error| DenseError::NativeMetadata { path: path.clone(), reason: format!("{error:#}") })?;
+        paths.push((path, header));
+    }
+    Ok(paths)
+}
+
 /// Read headers and tiny record tables only. The official checkpoint is not an input.
 impl DenseRecord {
     pub fn inventory(snapshot: &Path) -> Result<Vec<Self>> {
-        Self::inventory_inner(snapshot).map_err(Into::into)
+        let paths = inventory_candidates(snapshot)?;
+        Self::inventory_inner(snapshot, paths).map_err(Into::into)
     }
 
-    fn inventory_inner(snapshot: &Path) -> anyhow::Result<Vec<Self>> {
+    fn inventory_inner(snapshot: &Path, paths: Vec<(PathBuf, Header)>) -> anyhow::Result<Vec<Self>> {
         let config = super::read_json(&snapshot.join("config.json"))?;
         let family = ownership::DenseFamily::from_hf(&config)?;
         let config = config.get("text_config").unwrap_or(&config);
         let layers = number(config, "num_hidden_layers")?;
         let mut records = Vec::new();
         let mut names = BTreeSet::new();
-        for path in files(snapshot, "dense")? {
-            let header = Header::open(&path)?;
-            header.validate()?;
+        for (path, header) in paths {
             let metadata = &header.value["__metadata__"];
             let layer = metadata["layer"]
                 .as_str()
@@ -1416,9 +1438,45 @@ mod tests {
     }
 
     #[test]
+    fn vision_shards_require_family_spec_and_mixed_shards_are_refused() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("dense")).unwrap();
+        let mut config = crate::plan::testing::glm5_flash_config(2);
+        config["vision_config"] = json!({"hidden_size": 1024});
+        let path = root.path().join("dense/auxiliary.safetensors");
+        let write = |names: &[&str]| {
+            let mut header = serde_json::Map::from_iter([("__metadata__".into(), json!({"format":"pt"}))]);
+            for (i, name) in names.iter().enumerate() {
+                header.insert((*name).into(), json!({"dtype":"BF16","shape":[1],"data_offsets":[i*2,i*2+2]}));
+            }
+            let bytes = serde_json::to_vec(&header).unwrap();
+            let mut file = File::create(&path).unwrap();
+            file.write_all(&(bytes.len() as u64).to_le_bytes()).unwrap();
+            file.write_all(&bytes).unwrap();
+            file.write_all(&vec![0; names.len()*2]).unwrap();
+        };
+        std::fs::write(root.path().join("config.json"), config.to_string()).unwrap();
+        write(&["model.visual.patch_embed.proj.weight"]);
+        assert!(inventory_candidates(root.path()).unwrap().is_empty());
+        write(&["model.visual.patch_embed.proj.weight", "model.language_model.norm.weight"]);
+        assert!(matches!(DenseRecord::inventory(root.path()), Err(DenseError::NativeMetadata { path: p, .. }) if p == path));
+        write(&["model.visual.patch_embed.proj.weight"]);
+        config.as_object_mut().unwrap().remove("vision_config");
+        std::fs::write(root.path().join("config.json"), config.to_string()).unwrap();
+        assert!(matches!(DenseRecord::inventory(root.path()), Err(DenseError::NativeMetadata { path: p, .. }) if p == path));
+    }
+
+    #[test]
     #[ignore = "requires the EXLR8 GLM 5.3 Flash checkpoint"]
     fn real_flash_native_splits_respect_scale_blocks() {
         let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_EXLR8_FLASH_SNAPSHOT").expect("snapshot"));
+        let vision_path = snapshot.join("dense/vision-bf16.safetensors");
+        let vision = Header::open(&vision_path).unwrap();
+        let tensors = vision.value.as_object().unwrap().iter().filter(|(name, _)| *name != "__metadata__").collect::<Vec<_>>();
+        assert_eq!(tensors.len(), 347);
+        assert!(tensors.iter().all(|(_, meta)| meta["dtype"] == "BF16"));
+        let candidates = inventory_candidates(&snapshot).unwrap();
+        assert!(!candidates.iter().any(|(path, _)| *path == vision_path));
         let records = DenseRecord::inventory(&snapshot).unwrap();
         for world in [1, 2] {
             for rank in 0..world {
