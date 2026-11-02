@@ -1766,7 +1766,7 @@ mod tests {
                 Ok(false)
             })?;
             assert_eq!(inputs.iter().map(|&(layer, _)| layer).collect::<Vec<_>>(), remote);
-            let known_cap = variants.iter().map(|variant| variant.capacity).min().unwrap();
+            let known_cap = cuteafd_core::Exl3RowPolicy::Nearest.capacities(64)?[0] as usize;
             assert_eq!(packed_route_cap(64, &reports, &inputs), known_cap);
             assert!(known_cap > 0, "known arithmetic routes must permit packing");
             if let Some(&layer) = onboarded.first() {
