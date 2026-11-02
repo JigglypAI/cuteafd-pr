@@ -2,6 +2,9 @@
 import importlib.util
 from pathlib import Path
 import re
+import subprocess
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -26,6 +29,70 @@ def test_v41_export_capacity_contract():
         text = (ROOT / f"native/cmake/families/deepseek_v41/{name}.cmake").read_text()
         assert "CUTEAFD_V41_TARGET_ROWS" in text
         assert "1,16,80,256" not in text
+
+
+@pytest.mark.parametrize("seed_legacy_cache", [False, True])
+@pytest.mark.parametrize("override", [None, "128", "1:128,16:192,64:128,256:192,1024:192,4096:192"])
+def test_spark_width_maps_follow_reconfigured_capacities(tmp_path, seed_legacy_cache, override):
+    source, build = tmp_path / "source", tmp_path / "build"
+    source.mkdir()
+    spark = ROOT / "native/cmake/families/deepseek_v41/v41_spark_tp_experts.cmake"
+    adjacent = ROOT / "native/cmake/shared/mxfp4_widths.cmake"
+    (source / "CMakeLists.txt").write_text(f'''cmake_minimum_required(VERSION 3.24)
+project(capacity_reconfigure NONE)
+set(CUTEAFD_ENABLE_V41_EXPERT_AOT ON)
+set(CUTEAFD_V41_EXPERT_ROLE spark)
+set(CUTEAFD_SPARK_TP_ROLES tp2 tp3 tp5 tp6 tp8)
+foreach(world 2 3 6 8)
+  set(CUTEAFD_NATIVE_ARTIFACTS_v41_${{world}} spark_tp${{world}})
+endforeach()
+set(CUTEAFD_NATIVE_ARTIFACTS_v41_5 spark_w448)
+set(CUTEAFD_NATIVE_ARTIFACTS_dsv4f_5 spark_w448)
+set(CUTEAFD_NATIVE_ARTIFACTS_dsv4p_5 spark_w448)
+set(CUTEAFD_EXPERT_FAMILIES dsv4f:spark_tp5 dsv4p:spark_tp5)
+set(CUTEAFD_V41_TARGET_ROWS 1 16 ${{CUTEAFD_V41_VERIFY_ROWS}} 256 1024 4096)
+list(JOIN CUTEAFD_V41_TARGET_ROWS "," CUTEAFD_V41_TARGET_ROWS_ARG)
+set(Python3_EXECUTABLE python3)
+add_custom_target(cuteafd_verify_sparkinfer_source)
+include("{spark.as_posix()}")
+include("{adjacent.as_posix()}")
+''')
+
+    def configure(rows, *settings):
+        result = subprocess.run(["cmake", "-G", "Unix Makefiles", "-S", str(source), "-B", str(build),
+                                 f"-DCUTEAFD_V41_VERIFY_ROWS={rows}", *settings],
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    legacy = "1:192,16:192,80:192,256:192,1024:192,4096:192"
+    seed = ([f"-DCUTEAFD_V41_SPARK_TP{world}_SLICE_WIDTH:STRING={legacy}"
+             for world in (2, 3, 6, 8)] if seed_legacy_cache else [])
+    configure(80, *seed)
+    for world in (2, 3, 6, 8):
+        assert f"width={legacy}\n" in (build / f"v41_spark_tp{world}_width.stamp").read_text()
+    settings = [] if override is None else [f"-DCUTEAFD_V41_SPARK_TP6_SLICE_WIDTH_OVERRIDE={override}"]
+    configure(64, *settings)
+    expected = legacy.replace("80:192", "64:192")
+    for world in (2, 3, 6, 8):
+        width = override if world == 6 and override is not None else expected
+        assert f"width={width}\n" in (build / f"v41_spark_tp{world}_width.stamp").read_text()
+    commands = [line for makefile in build.glob("CMakeFiles/*.dir/build.make")
+                for line in makefile.read_text().splitlines()
+                if line.startswith("\t") and "export_b12x_slices_aot.py" in line]
+    assert len(commands) == 7
+    for command in commands:
+        rows = "1,16,80,256,1024,4096" if "--geometry dsv4" in command else "1,16,64,256,1024,4096"
+        assert f"--rows {rows} " in command
+        if "--role spark_tp" in command:
+            width = override if "--role spark_tp6 " in command and override is not None else expected
+            assert f"--width {width} " in command
+    cache = (build / "CMakeCache.txt").read_text()
+    if seed_legacy_cache:
+        # The effective normal variable must shadow old defaults, not rewrite the cache.
+        for world in (2, 3, 6, 8):
+            assert f"CUTEAFD_V41_SPARK_TP{world}_SLICE_WIDTH:STRING={legacy}" in cache
+    else:
+        assert not re.search(r"^CUTEAFD_V41_SPARK_TP\d_SLICE_WIDTH:", cache, re.MULTILINE)
 
 
 def test_native_manifest_decode_contract_matches_shared_planner_recipe():
