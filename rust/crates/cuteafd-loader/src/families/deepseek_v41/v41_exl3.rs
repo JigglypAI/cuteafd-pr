@@ -322,8 +322,14 @@ pub(crate) fn read_deepseek_v4_exl3_manifest<'a>(
     tiers: &[usize],
 ) -> Result<V41Exl3Manifest> {
     let config = read_json(&snapshot.join("config.json"), 1024 * 1024)?;
-    let derived = derive_storage_map(headers)?;
+    let headers: Vec<_> = headers.into_iter().collect();
+    let derived = derive_storage_map(headers.iter().copied())?;
     let source = check_storage_maps(snapshot, &config, &derived, backbone.layers)?;
+    let compact = &config["quantization_config"];
+    crate::formats::exl3_contract::check_native_quantization_config(compact)?;
+    if compact.get("native_quantization_config").is_some() {
+        crate::plan::families::mistral_large4::check_native_headers(snapshot, &config, &derived, &headers)?;
+    }
     build_deepseek_v4_manifest(source, &derived, backbone, tiers)
 }
 

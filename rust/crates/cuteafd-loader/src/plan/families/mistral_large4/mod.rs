@@ -93,6 +93,81 @@ fn expected(cfg: &Ml4Config) -> BTreeMap<String, Expected> {
     out
 }
 
+/// Cross-check retained source numerics without materializing or converting weights.
+pub(crate) fn check_native_headers(
+    snapshot: &std::path::Path, config: &serde_json::Value,
+    derived: &crate::formats::exl3_storage::Exl3StorageMap,
+    headers: &[&crate::SafetensorsTensorMetadata],
+) -> Result<()> {
+    use anyhow::Context;
+    use cuteafd_core::DType;
+    use crate::families::mistral_large4::{dspark::Ml4DsparkConfig, vision::tower_tensors};
+    let cfg = Ml4Config::from_hf(config)?;
+    let native = &config["quantization_config"]["native_quantization_config"];
+    // These HF exclusions describe the source layout; `expected` owns their
+    // consolidated equivalents and the native/EXL3 publication's tensor roles.
+    let official: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../families/mistral_large4/official-config.json"))?;
+    let source = official["quantization_config"]["modules_to_not_convert"].as_array().unwrap();
+    let exclusions = native["modules_to_not_convert"].as_array().context("missing native FP8 exclusions")?;
+    for name in exclusions.iter().chain(source) {
+        ensure!(exclusions.contains(name) && source.contains(name),
+            "EXL3 native_quantization_config unsupported modules_to_not_convert entry {name}");
+    }
+    let mut known = BTreeMap::new();
+    for (stem, expected) in expected(&cfg) {
+        if derived.contains_key(&stem) { continue; }
+        let name = if stem.contains("ssmax_scaling.") || stem == "lerope.alpha" { stem.clone() }
+            else { format!("{stem}.weight") };
+        let dtype = if expected.form == Form::CoreOrFp8 { DType::F8E4M3 } else { DType::Bf16 };
+        if dtype == DType::F8E4M3 {
+            known.insert(format!("{stem}.qscale_weight"), (DType::F32,
+                expected.shape.iter().map(|&dim| dim.div_ceil(128)).collect()));
+        }
+        if expected.form == Form::LayerNorm {
+            known.insert(format!("{stem}.bias"), (DType::Bf16, expected.shape.clone()));
+        }
+        known.insert(name, (dtype, expected.shape));
+    }
+    for (name, shape) in tower_tensors() { known.insert(name, (DType::Bf16, shape)); }
+    if headers.iter().any(|h| h.name.starts_with("mtp_dspark.")) {
+        let params = crate::read_json_file(&snapshot.join("params.json"))?;
+        let draft = Ml4DsparkConfig::from_params(&params, cfg.layers)?;
+        for (name, shape) in draft.tensors(cfg.hidden, cfg.heads, cfg.qk_head_dim(), cfg.kv_lora_rank,
+            cfg.qk_rope_head_dim, cfg.qk_nope_head_dim, cfg.v_head_dim, cfg.dense_intermediate, cfg.vocab_size) {
+            known.insert(name, (DType::Bf16, shape));
+        }
+    }
+    let mut actual = BTreeMap::new();
+    for &header in headers {
+        ensure!(actual.insert(header.name.as_str(), header).is_none(),
+            "EXL3 native_quantization_config duplicate header {}", header.name);
+    }
+    for &header in headers {
+        let exl3 = header.name.rsplit_once('.').is_some_and(|(stem, suffix)|
+            derived.get(stem).is_some_and(|module| module.tensors.contains_key(suffix)));
+        if exl3 { continue; }
+        let (dtype, shape) = known.get(&header.name).with_context(||
+            format!("EXL3 native_quantization_config unrecognized native tensor {}", header.name))?;
+        ensure!(header.dtype == *dtype && header.shape == *shape,
+            "EXL3 native_quantization_config {} expected {dtype:?} {shape:?}, found {:?} {:?}",
+            header.name, header.dtype, header.shape);
+        let width = match dtype { DType::Bf16 => 2u64, DType::F32 => 4, _ => 1 };
+        let bytes = shape.iter().try_fold(width, |n, &d| n.checked_mul(d as u64))
+            .context("native tensor byte extent overflow")?;
+        ensure!(header.byte_length == bytes,
+            "EXL3 native_quantization_config {} byte extent disagrees with dtype/shape", header.name);
+        if *dtype == DType::F8E4M3 || header.name.ends_with(".qscale_weight") {
+            let mate = if *dtype == DType::F8E4M3 {
+                format!("{}.qscale_weight", header.name.strip_suffix(".weight").unwrap())
+            } else { format!("{}.weight", header.name.strip_suffix(".qscale_weight").unwrap()) };
+            ensure!(actual.contains_key(mate.as_str()),
+                "EXL3 native_quantization_config {} missing companion {mate}", header.name);
+        }
+    }
+    Ok(())
+}
+
 /// The routed projection of `stem` (`w1`/`w3` gate/up, `w2` down) and its `[out, in]`.
 fn routed_shape(cfg: &Ml4Config, stem: &str) -> Option<[usize; 2]> {
     match stem.rsplit('.').next()? {

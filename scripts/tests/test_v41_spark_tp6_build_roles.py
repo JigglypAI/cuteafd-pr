@@ -319,10 +319,28 @@ def test_manifest_writer_rejects_an_unknown_role_before_touching_files(
 ) -> None:
     output = tmp_path / "V41_EXPERT_TP_AOT.json"
     result = subprocess.run(
-        [sys.executable, str(MANIFEST), "--role", "expert", "--requested", "tp5",
+        [sys.executable, str(MANIFEST), "--role", "expert", "--requested", "tp9",
          "--native-build-dir", str(tmp_path), "--output", str(output)],
         capture_output=True, text=True, timeout=120, check=False,
     )
     assert result.returncode == 2
-    assert "expected tp2, tp3, tp6 or tp8" in result.stderr
+    assert "unsupported Spark TP role" in result.stderr
     assert not output.exists()
+
+
+@pytest.mark.parametrize("requested", ["tp5", "tp7", "tp5;tp7"])
+def test_ml4_adjacent_width_roles_do_not_claim_v41_degree_objects(tmp_path: Path, requested: str) -> None:
+    output = tmp_path / "V41_EXPERT_TP_AOT.json"
+    library = tmp_path / "libcuteafd_native.so"
+    library.write_bytes(b"ml4 native library")
+    result = subprocess.run(
+        [sys.executable, str(MANIFEST), "--role", "expert", "--requested", requested,
+         "--native-build-dir", str(tmp_path), "--native-library", str(library), "--output", str(output)],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    document = json.loads(output.read_text())
+    assert document["requested"] == requested
+    assert document["spark_tp_roles"] == []
+    assert document["manifests"] == {}
+    assert document["symbols_verified"] is False

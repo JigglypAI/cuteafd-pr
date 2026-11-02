@@ -1150,7 +1150,8 @@ pub fn mistral_large4_tensors(expert_layers: Option<&[usize]>, quantized: bool) 
 /// publication (GLM 5.3 K4-Core-K6 contract).
 pub fn mistral_large4_exl3_config(tensors: &[Tensor]) -> (Value, Value) {
     let compact = json!({"bits": 4.0, "checkpoint_format": "exl3", "core_bits": 6.0, "format": "exl3",
-        "head_bits": 6.0, "per_module_metadata": "quantize_config.json:tensor_storage", "quant_method": "exl3"});
+        "head_bits": 6.0, "per_module_metadata": "quantize_config.json:tensor_storage", "quant_method": "exl3",
+        "native_quantization_config": mistral_large4_config()["quantization_config"]});
     let mut full = compact.clone();
     full.as_object_mut().unwrap().extend(json!({"codebook": "mcg", "desc_act": false, "group_size": -1,
         "lm_head": true, "method": "exl3", "out_scales": "auto", "sym": true}).as_object().unwrap().clone());

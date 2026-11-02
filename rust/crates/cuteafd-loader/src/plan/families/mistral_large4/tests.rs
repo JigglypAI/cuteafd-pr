@@ -348,3 +348,85 @@ fn vision_on_two_rtx_reserves_the_tower_before_the_solve() {
         }
     }
 }
+
+fn published_native_fixture() -> (tempfile::TempDir, serde_json::Value, Vec<crate::SafetensorsTensorMetadata>) {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/ml4-published-native-headers.json")).unwrap();
+    let headers = fixture["headers"].as_object().unwrap().iter().map(|(name, value)| {
+        let offsets = value["data_offsets"].as_array().unwrap();
+        crate::SafetensorsTensorMetadata {
+            name: name.clone(), dtype: cuteafd_core::DType::from_safetensors(value["dtype"].as_str().unwrap()),
+            shape: value["shape"].as_array().unwrap().iter().map(|d| d.as_u64().unwrap() as usize).collect(),
+            byte_offset: offsets[0].as_u64().unwrap(),
+            byte_length: offsets[1].as_u64().unwrap() - offsets[0].as_u64().unwrap(),
+        }
+    }).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = testing::mistral_large4_config();
+    config["quantization_config"] = serde_json::json!({"quant_method":"exl3",
+        "native_quantization_config":config["quantization_config"].clone()});
+    std::fs::write(dir.path().join("params.json"), serde_json::json!({"mtp":{"n_layers":3,"depth":3,
+        "ragged_attention":"2048,2048,2048","target_activation_layers":"1,18,36,54,71","norm_strategy":"eagle",
+        "dspark":{"markov_rank":512,"head_type":"rnn","draft_input":"position_specific"}}}).to_string()).unwrap();
+    (dir, config, headers)
+}
+
+fn native_fixture_check(dir: &std::path::Path, config: &serde_json::Value,
+    headers: &[crate::SafetensorsTensorMetadata]) -> anyhow::Result<()> {
+    let derived = crate::formats::exl3_storage::derive_storage_map(headers)?;
+    crate::formats::exl3_contract::check_native_quantization_config(&config["quantization_config"])?;
+    check_native_headers(dir, config, &derived, &headers.iter().collect::<Vec<_>>())
+}
+
+#[test]
+fn published_native_fp8_headers_keep_source_numerics() {
+    let (dir, config, headers) = published_native_fixture();
+    native_fixture_check(dir.path(), &config, &headers).unwrap();
+    for (name, dtype, shape) in [
+        ("layers.0.attention.indexer.wq_b.weight", Some(cuteafd_core::DType::Bf16), None),
+        ("layers.0.attention.indexer.wq_b.qscale_weight", Some(cuteafd_core::DType::Bf16), None),
+        ("layers.0.attention.indexer.wq_b.qscale_weight", None, Some(vec![31, 48])),
+        ("layers.0.attention.wkv_b.weight", Some(cuteafd_core::DType::F8E4M3), None),
+        ("norm.weight", Some(cuteafd_core::DType::F32), None),
+        ("mtp_dspark.backbone.target_norm.weight", Some(cuteafd_core::DType::F8E4M3), None),
+        ("vision_encoder.ln_pre.weight", Some(cuteafd_core::DType::F32), None),
+    ] {
+        let mut bad = headers.clone();
+        let h = bad.iter_mut().find(|h| h.name == name).unwrap();
+        if let Some(dtype) = dtype { h.dtype = dtype; }
+        if let Some(shape) = shape { h.shape = shape; }
+        let error = native_fixture_check(dir.path(), &config, &bad).unwrap_err().to_string();
+        assert!(error.contains(name), "{error}");
+    }
+    for name in ["layers.0.attention.indexer.wq_b.weight", "layers.0.attention.indexer.wq_b.qscale_weight"] {
+        let bad: Vec<_> = headers.iter().filter(|h| h.name != name).cloned().collect();
+        let error = native_fixture_check(dir.path(), &config, &bad).unwrap_err().to_string();
+        assert!(error.contains(name), "{error}");
+    }
+    for name in ["layers.0.attention.unknown.weight", "layers.0.attention.wq.weight"] {
+        let mut bad = headers.clone();
+        let mut tensor = headers.iter().find(|h| h.name == "norm.weight").unwrap().clone();
+        tensor.name = name.into();
+        bad.push(tensor);
+        assert!(native_fixture_check(dir.path(), &config, &bad).unwrap_err().to_string().contains(name));
+    }
+    let mut bad = headers.clone();
+    bad[0].byte_length += 1;
+    assert!(native_fixture_check(dir.path(), &config, &bad).unwrap_err().to_string().contains(&bad[0].name));
+}
+
+#[test]
+fn retained_fp8_schema_rejects_unsupported_source_claims() {
+    let (dir, config, headers) = published_native_fixture();
+    for (key, value) in [("quant_method", serde_json::json!("mxfp4")),
+        ("weight_block_size", serde_json::json!([64,128])),
+        ("activation_scheme", serde_json::json!("static")),
+        ("modules_to_not_convert", serde_json::json!([1])),
+        ("unknown", serde_json::json!(true)),
+        ("modules_to_not_convert", serde_json::json!(["layers.0.attention.wq.trellis"]))] {
+        let mut bad = config.clone();
+        bad["quantization_config"]["native_quantization_config"][key] = value;
+        let error = native_fixture_check(dir.path(), &bad, &headers).unwrap_err().to_string();
+        assert!(error.contains(key), "{error}");
+    }
+}
