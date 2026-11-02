@@ -779,6 +779,66 @@ fn step_exact_fifteen_inventory_replay_preserves_feasible_two_million_target() {
 }
 
 #[test]
+fn flash_spark_free_auto_all_inventory_replay_stops_at_target_and_retains_slack() {
+    // Real requested-zero-Spark plan from #776 comment 6589996421, a2a6de7d0:
+    // Flash EXLR8 k4 revision 867580abd28d142bb4c56218bb81a752b7dea988,
+    // two PROs, spec/media off, context 1M, prefill 4096x1. Preserve this
+    // inventory, not the legacy policy that fills past the automatic target.
+    const TARGET: u64 = 2 << 20;
+    const LEGACY_POOL: u64 = 2_761_216;
+    const SLOPE: u64 = 789_892;
+    const EXPERTS: u64 = 79_800_852_992;
+    const CAPACITY: u64 = 99_826_008_064;
+    const TOTALS: [u64; 2] = [99_825_322_576, 99_489_193_600];
+    let maximum = (4 << 20) / 256;
+    let mut contract = Contract::fixed(256, maximum, 2, facts(vec![]));
+    for layer in 0..45 {
+        contract.variables.push(Variable::Attention { layer, values: vec![
+            if layer >= 3 && (layer - 3) % 4 == 0 { LayerMode::ContextSplit }
+            else { LayerMode::HeadSplit },
+        ] });
+    }
+    contract.variables.push(Variable::Prefill(vec![PrefillShape { rows: 4096, waves: 1 }]));
+    contract.variables.push(Variable::Lanes(vec![1]));
+    // Spark-free removes the remote home from the domain; Auto is still the
+    // same pool-first objective, with the only legal profile owning all 42.
+    add_profile(&mut contract, (3..45).collect(), vec![0, 1], vec![42], &[EXPERTS]);
+    for (gpu, total) in TOTALS.into_iter().enumerate() {
+        let fixed = total - LEGACY_POOL / 256 * SLOPE - EXPERTS;
+        let curve = ByteCurve::linear(fixed + SLOPE, SLOPE, maximum);
+        let mut owner = allocation(&format!("flash.frozen.{gpu}"), fixed + SLOPE);
+        owner.location = Location::coordinator(gpu as u8);
+        let mut component = Component::allocation(owner, curve.clone(), false, maximum);
+        component.byte_extent(curve).unwrap();
+        contract.components.push(component);
+    }
+    let mut budgets = two_gpus(CAPACITY, CAPACITY);
+    for budget in &mut budgets { budget.physical_bytes = 96 << 30; }
+    let selected = vec![0; contract.variables.len()];
+    let legacy = evaluate(&contract.facts(&selected, LEGACY_POOL / 256).unwrap(), &budgets).unwrap();
+    assert_eq!(legacy.iter().filter(|p| p.phase == Phase::Ready).map(|p| p.owned)
+        .collect::<Vec<_>>(), TOTALS);
+    assert!(matches!(evaluate(&contract.facts(&selected, LEGACY_POOL / 256 + 1).unwrap(), &budgets),
+        Err(Refusal::Capacity { .. })));
+    let recipe = Prepared(contract);
+    let req = Request { context: 1 << 20, ..request() };
+    let automatic = solve(req.clone(), budgets.clone(), &recipe).unwrap();
+    let pinned = solve(Request { onboard: Pin::Exact(42), ..req.clone() }, budgets.clone(), &recipe).unwrap();
+    let explicit = solve(Request { pool: Pin::Exact(TARGET), ..req.clone() }, budgets.clone(), &recipe).unwrap();
+    assert_eq!(automatic.pool_tokens, TARGET);
+    assert_eq!(automatic.decisions.onboard(), 42);
+    assert_eq!(automatic.decisions.onboard_layers, vec![(3..45).collect::<Vec<_>>(); 2]);
+    assert_eq!(automatic.decisions, pinned.decisions);
+    assert_eq!(automatic.decisions, explicit.decisions);
+    assert_eq!(pinned.pool_tokens, TARGET);
+    for (gpu, slack) in [2_049_665_336, 2_385_794_312].into_iter().enumerate() {
+        assert_eq!(automatic.remaining(&budgets[gpu].id, Phase::Ready), Some(slack));
+    }
+    assert_eq!(solve(Request { pool: Pin::Exact(LEGACY_POOL), ..req }, budgets, &recipe)
+        .unwrap().pool_tokens, LEGACY_POOL);
+}
+
+#[test]
 fn exact_completion_prefers_two_whole_layers_over_one_tp2_layer() {
     let mut contract = profile_contract(4);
     add_profile(&mut contract, vec![0], vec![0, 1], vec![0, 1], &[0, 50]);
