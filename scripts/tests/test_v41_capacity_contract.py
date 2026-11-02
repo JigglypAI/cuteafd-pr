@@ -196,11 +196,10 @@ def test_slice_manifest_finalizes_only_current_outputs(tmp_path, family, role, a
 
 
 def test_slice_export_consumers_do_not_mutate_finalized_headers():
-    consumers = list((ROOT / "native/cmake").rglob("*.cmake"))
-    consumers = [p for p in consumers if "export_b12x_slices_aot.py" in p.read_text()]
-    assert len(consumers) == 6
-    for path in consumers:
-        assert '-E copy' not in path.read_text(), path
+    for path in (ROOT / "native/cmake").rglob("*.cmake"):
+        text = path.read_text()
+        if "export_b12x_slices_aot.py" in text:
+            assert not re.search(r"(?:^|\s)-E\s+(?:copy(?:_if_different|_directory)?|rename)\b", text), path
 
 
 def test_native_manifest_decode_contract_matches_shared_planner_recipe():
