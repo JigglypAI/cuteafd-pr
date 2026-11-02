@@ -45,6 +45,7 @@ pub(crate) struct LayerRecords {
     pub projections: HashMap<&'static str, (NativeProjection, DenseSlice)>,
     /// `kv_b` (block FP8, whole tensor; split per head at load).
     pub kv_b: DenseRecord,
+    pub kv_b_layout: cuteafd_loader::plan::exlr8::dense::KvBLayout,
     /// Plain tensors (norms, router bias) by logical tensor name.
     pub plain: HashMap<String, DenseComponent>,
 }
@@ -79,8 +80,8 @@ impl NativeDenseRecords {
                     continue;
                 };
                 let channels = slice.channels;
-                let shape = match full.side {
-                    ShardSide::Input => [full.shape[0], channels],
+                let shape = match slice.axis {
+                    cuteafd_loader::plan::exlr8::dense::DenseAxis::Input => [full.shape[0], channels],
                     _ => [channels, full.shape[1]],
                 };
                 projections.insert(stem, (NativeProjection { encoding: full.encoding, shape, side: full.side,
@@ -89,9 +90,12 @@ impl NativeDenseRecords {
             let kv_b_name = format!("{prefix}.self_attn.kv_b_proj.weight");
             let kv_b = record(&kv_b_name).with_context(|| format!("{kv_b_name}: missing"))?.clone();
             ensure!(kv_b.encoding == DenseEncoding::BlockFp8, "{kv_b_name}: native GLM kv_b is block FP8");
+            let kv_b_layout = by_name.get(kv_b_name.as_str()).and_then(|slice| slice.absorbed.clone())
+                .context("native kv_b has no planned absorption layout")?;
             let plain = plan.tensors.iter().filter(|s| s.tensor.starts_with(&format!("{prefix}."))
-                && s.units.is_empty()).map(|s| (s.tensor.clone(), s.components[0].clone())).collect();
-            out.push(LayerRecords { layer, projections, kv_b, plain });
+                && s.absorbed.is_none() && record(&s.tensor).is_some_and(|r| r.native_blocks == 0))
+                .map(|s| (s.tensor.clone(), s.components[0].clone())).collect();
+            out.push(LayerRecords { layer, projections, kv_b, kv_b_layout, plain });
         }
         let norm = plan.tensors.iter().find(|s| s.tensor == "model.norm.weight")
             .map(|s| s.components[0].clone());
@@ -120,10 +124,15 @@ fn rect(name: &str, range: &cuteafd_loader::plan::exlr8::dense::DenseRange) -> R
 /// through the mount or recorded for the push group.
 fn landed<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, name: &str, component: &DenseComponent)
     -> Result<DeviceAllocation<'a>> {
-    let bytes = component.source.bytes;
+    let bytes = component.resident_bytes()?;
     let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+    let source = match &component.window {
+        Some(window) => Rect { name: name.into(), path: component.source.path.clone(), base: component.source.offset,
+            row_bytes: window.row_bytes, rows: window.rows.clone(), cols: window.cols.clone() },
+        None => rect(name, &component.source),
+    };
     load.operand(Operand { device: library.cuda_get_device()?, buffer: allocation.buffer,
-        lands: vec![(rect(name, &component.source), 0)], bytes })?;
+        lands: vec![(source, 0)], bytes })?;
     Ok(allocation)
 }
 
@@ -155,9 +164,14 @@ pub(crate) fn load_layer<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, r
         && kv_b.components.len() == 2 && kv_b.components[0].suffix == "fp8" && kv_b.components[1].suffix == "scale",
         "{}: native kv_b layout", kv_b.tensor);
     let (values, grid) = (&kv_b.components[0].source, &kv_b.components[1].source);
+    let layout = &records.kv_b_layout;
+    ensure!(layout.first_head == h0 && layout.heads == heads
+        && layout.geometry == cuteafd_loader::plan::exlr8::dense::KvBGeometry {
+            heads: heads_total, nope, values: v, latent: lat }, "native kv_b plan/load geometry mismatch");
     let alloc = |bytes: usize| DeviceAllocation::new(library, bytes.max(256));
-    let (uk, uk_scale) = (alloc(heads * lat * nope)?, alloc(heads * lat * (nope / 64) * 4)?);
-    let (uv, uv_scale) = (alloc(heads * v * lat)?, alloc(heads * v * (lat / 64) * 4)?);
+    let [uk_bytes, uk_scale_bytes, uv_bytes, uv_scale_bytes] = layout.allocations;
+    let (uk, uk_scale) = (alloc(uk_bytes)?, alloc(uk_scale_bytes)?);
+    let (uv, uv_scale) = (alloc(uv_bytes)?, alloc(uv_scale_bytes)?);
     let per = ((STEP_BYTES - grid.bytes) / ((nope + v) * lat)).max(1);
     let device = library.cuda_get_device()?;
     let at = |buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize| CuteafdDeviceBuffer {

@@ -337,6 +337,8 @@ mod tests {
         std::fs::write(&path, [&payload[..], &scales[..]].concat()).unwrap();
         DenseRecord {
             tensor: name.into(),
+            ownership: cuteafd_loader::plan::exlr8::dense::DenseOwnership::new(
+                cuteafd_loader::plan::exlr8::dense::DenseExecution::RankZero),
             encoding: DenseEncoding::RowFp8,
             shape: vec![n, k],
             side: ShardSide::Output,
@@ -347,6 +349,7 @@ mod tests {
             native_blocks: n.div_ceil(128),
             components: vec![
                 DenseComponent {
+                    window: None,
                     suffix: "fp8".into(),
                     dtype: "U8".into(),
                     shape: vec![n, k],
@@ -357,6 +360,7 @@ mod tests {
                     },
                 },
                 DenseComponent {
+                    window: None,
                     suffix: "scale".into(),
                     dtype: "F32".into(),
                     shape: vec![n],
