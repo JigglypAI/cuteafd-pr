@@ -16,6 +16,8 @@ def family_features(family):
         from mimo_media import window_features
     elif family == "glm5_flash":
         from glm_flash_media import window_features
+    elif family == "mistral_large4":
+        from mistral_large4_media import window_features
     else:
         raise ValueError(f"{family} official media exporter is not implemented")
     return window_features
@@ -23,7 +25,7 @@ def family_features(family):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--family", choices=("mimo_v2", "glm5_flash"), default="mimo_v2")
+    p.add_argument("--family", choices=("mimo_v2", "glm5_flash", "mistral_large4"), default="mimo_v2")
     p.add_argument("--snapshot", required=True, type=Path)
     p.add_argument("--windows", required=True, type=Path)
     p.add_argument("--media-root", type=Path)
@@ -32,7 +34,7 @@ def main():
     p.add_argument("--device", type=int, default=0)
     a = p.parse_args()
     manifest = load_set(a.windows, a.family)
-    require_media_flag(manifest, True, a.family, implemented_families=("glm5_flash",))
+    require_media_flag(manifest, True, a.family, implemented_families=("glm5_flash", "mistral_large4"))
     identity = verify_snapshot(manifest, a.snapshot)
     window_features = family_features(a.family)
     import torch
