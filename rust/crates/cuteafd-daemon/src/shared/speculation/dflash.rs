@@ -3126,6 +3126,56 @@ mod checkpoint_header_tests {
     }
 
     #[test]
+    fn mla_long_prefill_tail_reproduces_frontier_gap_without_window_wrap_failure() {
+        use cuteafd_loader::formats::dflash::{MlaDraftCacheRequest, MlaDraftCacheState};
+        let mut cfg = mla_config();
+        cfg.block = 3;
+        cfg.windows = vec![Some(RING); 3];
+        let layout = cfg.cache_layout(1, 1 << 20, cuteafd_core::MlaCacheFormat::Fp8).unwrap();
+        for length in [8192usize, 8332] {
+            let mut contiguous = MlaDraftCacheState::new(layout.clone()).unwrap();
+            contiguous.reset(0, 0).unwrap();
+            let mut records: Vec<_> = layout.layers.iter().map(|layer| vec![0u64; layer.rows_per_slot()]).collect();
+            for start in (0..length).step_by(256) {
+                let rows = (0..(length - start).min(256)).map(|tap_row| ContextRow {
+                    tap_row, slot: 0, position: start + tap_row }).collect::<Vec<_>>();
+                let plan = MlaContextUpdate::checked(&contiguous, 3, &rows).unwrap();
+                for (layer, physical) in plan.slots.iter().enumerate() {
+                    for (&position, &row) in plan.positions.iter().zip(physical) {
+                        records[layer][row as usize] = position as u64 + 1;
+                    }
+                }
+                contiguous = plan.next;
+                assert_eq!(contiguous.frontier(0).unwrap(), (0, start + rows.len()));
+            }
+            let tail_start = length - TAP_ROWS;
+            let tail = (0..TAP_ROWS).map(|tap_row| ContextRow {
+                tap_row, slot: 0, position: tail_start + tap_row }).collect::<Vec<_>>();
+            let mut cold = MlaDraftCacheState::new(layout.clone()).unwrap();
+            cold.reset(0, 0).unwrap();
+            let error = MlaContextUpdate::checked(&cold, 3, &tail).err().unwrap();
+            assert!(error.to_string().contains("append differs from committed frontier"));
+            assert_eq!(cold.frontier(0).unwrap(), (0, 0), "refusal is transactional");
+            let request = [MlaDraftCacheRequest { slot: 0, position: length, valid_from: 0 }];
+            for (index, layer) in layout.layers.iter().enumerate() {
+                let bound = layer.bind(0, 0).unwrap();
+                for position in tail_start..length {
+                    assert_eq!(records[index][bound.row(position).unwrap()], position as u64 + 1);
+                }
+                assert_eq!(contiguous.block_batches(index, &request).unwrap()[0].positions,
+                    (length..length + cfg.block).map(|p| p as i64).collect::<Vec<_>>());
+            }
+            // GQA's absolute modulo ring already accepts the shared caller's tail-only update.
+            let mut full_gqa = vec![0u64; RING];
+            let mut tail_gqa = full_gqa.clone();
+            for position in 0..length { full_gqa[position % RING] = position as u64 + 1; }
+            for position in tail_start..length { tail_gqa[position % RING] = position as u64 + 1; }
+            assert_eq!(full_gqa, tail_gqa);
+            println!("prefill {length}: contiguous frontier (0,{length}), retained ring wrap exact; tail {tail_start}..{length} refused at frontier0; GQA full/tail equal");
+        }
+    }
+
+    #[test]
     fn glm_gqa_cold_restore_excludes_old_ring_rows_until_canonical_producers_replace_them() {
         for frontier in [63usize, 64, 65, 2047, 2048, 2049, 4097] {
             let mut reused = vec![u64::MAX; 2 * RING];
