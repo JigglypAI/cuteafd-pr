@@ -1627,7 +1627,7 @@ mod tests {
     fn c1_corpus_options_merge_and_require_c1_only() {
         let options = crate::sweep::C1Options { contexts: vec![256, 42000], seeds: vec![4244, 4247] };
         let defaults = Entry { sweep_c1: Some(options.clone()), ..Entry::default() };
-        let mut entry = Entry { levels: Some(vec![1]), ..named("c1") }.merged(&defaults);
+        let mut entry = Entry { name: "c1".into(), levels: Some(vec![1]), ..Entry::default() }.merged(&defaults);
         assert_eq!(entry.sweep_c1, Some(options));
         check_post_load(&entry).unwrap();
         entry.levels = Some(vec![1, 4]);
