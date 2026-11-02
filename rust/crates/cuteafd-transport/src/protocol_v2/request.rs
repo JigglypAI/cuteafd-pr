@@ -480,26 +480,31 @@ impl ExpertProtocolV2Request {
         anyhow::ensure!(bytes[routes_end..payload_start].iter().all(|&byte| byte == 0),
             "request alignment padding must be zero");
 
-        let rows = (0..rows_len)
-            .map(|idx| {
-                let offset = rows_start + idx * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN;
-                decode_row_descriptor(bytes, offset)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let regions = (0..rows_len).map(|idx| decode_row_region(bytes,
-            rows_start + idx * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN)).collect::<Result<Vec<_>>>()?;
-        // The flag, the wide format and the region bits agree, or the frame is refused.
-        let partial = if flags & EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES != 0 {
-            let regions = regions.into_iter().map(|r| u8::try_from(r)
-                .map_err(|_| anyhow::anyhow!("ExpertProtocolV2 partial region bit {r} is neither 0 nor 1")))
-                .collect::<Result<Vec<_>>>()?;
-            Some(PartialReplyPlan { wide: PartialWire::from_u16(partial_wide)?, regions })
+        let mut partial = if flags & EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES != 0 {
+            Some(PartialReplyPlan { wide: PartialWire::from_u16(partial_wide)?,
+                regions: Vec::with_capacity(rows_len) })
         } else {
-            if partial_wide != 0 || regions.iter().any(|&r| r != 0) {
+            if partial_wide != 0 {
                 bail!("ExpertProtocolV2 request without partial replies carries partial region data");
             }
             None
         };
+        let rows = (0..rows_len)
+            .map(|idx| {
+                let offset = rows_start + idx * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN;
+                let row = decode_row_descriptor(bytes, offset)?;
+                let region = decode_row_region(bytes, offset)?;
+                if let Some(plan) = &mut partial {
+                    if region > 1 {
+                        bail!("ExpertProtocolV2 partial region bit {region} is neither 0 nor 1");
+                    }
+                    plan.regions.push(region as u8);
+                } else if region != 0 {
+                    bail!("ExpertProtocolV2 request without partial replies carries partial region data");
+                }
+                Ok(row)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let routes = (0..routes_len)
             .map(|idx| {
                 let offset = routes_start + idx * EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN;

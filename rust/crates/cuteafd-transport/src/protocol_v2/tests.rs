@@ -1856,6 +1856,25 @@ fn malformed_partial_region_data_is_refused() -> Result<()> {
 }
 
 #[test]
+fn compact_reserved_regions_are_checked_in_every_descriptor() -> Result<()> {
+    let plain = request(16, ExpertV2SourceKind::Decode)?;
+    let bytes = plain.encode()?;
+    assert!(ExpertProtocolV2Request::decode(&bytes)?.partial.is_none());
+    assert!(ExpertProtocolV2RequestView::parse(&bytes)?.partial_plan()?.is_none());
+    for row in 0..16 {
+        for reserved in [1u16, 2, 256, u16::MAX] {
+            let mut corrupt = bytes.clone();
+            let offset = EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN
+                + row * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN + 10;
+            corrupt[offset..offset + 2].copy_from_slice(&reserved.to_le_bytes());
+            assert!(ExpertProtocolV2Request::decode(&corrupt).is_err(), "row {row}: {reserved}");
+            assert!(ExpertProtocolV2RequestView::parse(&corrupt).is_err(), "row {row}: {reserved}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn partial_reply_payload_is_two_aligned_regions_with_stride_zero() -> Result<()> {
     let plan = PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0, 1, 1] };
     let (bf16, wide_at, wide, total) = plan.payload(8, 4096)?;

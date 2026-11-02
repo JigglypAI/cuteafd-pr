@@ -144,20 +144,6 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
             },
         };
         view.validate()?;
-        // Partial-reply data: the flag, the header's wide format and every row's
-        // region bit agree, or the frame is refused (the worker never guesses).
-        let wide = read_u16(bytes, 46, "partial_wide")?;
-        if view.partial_replies() {
-            super::PartialWire::from_u16(wide)?;
-            for row in 0..rows_len {
-                let region = view.row_region(row)?;
-                if region > 1 {
-                    bail!("ExpertProtocolV2 partial region bit {region} is neither 0 nor 1");
-                }
-            }
-        } else if wide != 0 || (0..rows_len).any(|row| view.row_region(row).map_or(true, |r| r != 0)) {
-            bail!("ExpertProtocolV2 request without partial replies carries partial region data");
-        }
         Ok(view)
     }
 
@@ -425,8 +411,23 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
         } else {
             self.header.route_count as usize
         };
+        let partial = self.partial_replies();
+        let wide = read_u16(self.frame_bytes, 46, "partial_wide")?;
+        if partial {
+            super::PartialWire::from_u16(wide)?;
+        } else if wide != 0 {
+            bail!("ExpertProtocolV2 request without partial replies carries partial region data");
+        }
         for row_index in 0..descriptor_rows {
             let row = self.row(row_index)?;
+            let region = self.row_region(row_index)?;
+            if partial {
+                if region > 1 {
+                    bail!("ExpertProtocolV2 partial region bit {region} is neither 0 nor 1");
+                }
+            } else if region != 0 {
+                bail!("ExpertProtocolV2 request without partial replies carries partial region data");
+            }
             let end =
                 row.route_offset
                     .checked_add(row.route_count)
