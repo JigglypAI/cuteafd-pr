@@ -59,9 +59,10 @@ include("{adjacent.as_posix()}")
 ''')
 
     def configure(rows, *settings):
-        subprocess.run(["cmake", "-G", "Ninja", "-S", str(source), "-B", str(build),
-                        f"-DCUTEAFD_V41_VERIFY_ROWS={rows}", *settings],
-                       check=True, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(["cmake", "-G", "Unix Makefiles", "-S", str(source), "-B", str(build),
+                                 f"-DCUTEAFD_V41_VERIFY_ROWS={rows}", *settings],
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
 
     legacy = "1:192,16:192,80:192,256:192,1024:192,4096:192"
     seed = ([f"-DCUTEAFD_V41_SPARK_TP{world}_SLICE_WIDTH:STRING={legacy}"
@@ -75,8 +76,9 @@ include("{adjacent.as_posix()}")
     for world in (2, 3, 6, 8):
         width = override if world == 6 and override is not None else expected
         assert f"width={width}\n" in (build / f"v41_spark_tp{world}_width.stamp").read_text()
-    ninja = (build / "build.ninja").read_text()
-    commands = [line for line in ninja.splitlines() if "COMMAND =" in line and "export_b12x_slices_aot.py" in line]
+    commands = [line for makefile in build.glob("CMakeFiles/*.dir/build.make")
+                for line in makefile.read_text().splitlines()
+                if line.startswith("\t") and "export_b12x_slices_aot.py" in line]
     assert len(commands) == 7
     for command in commands:
         rows = "1,16,80,256,1024,4096" if "--geometry dsv4" in command else "1,16,64,256,1024,4096"
