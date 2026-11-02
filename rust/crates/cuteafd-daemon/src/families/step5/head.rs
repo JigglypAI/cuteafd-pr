@@ -43,9 +43,9 @@ impl HeadPlan {
     }
 
     pub fn for_execution(programs: &Programs<'_>, checkpoint: &Checkpoint, rows: usize,
-        ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership) -> Result<Self> {
-        Self::prepare_layout(programs, checkpoint, rows, RankWeightLayout::for_execution(checkpoint,
-            ownership.execution().spec().head_gpu as usize, ownership)?, None, ownership.execution().spec().rows as usize)
+        ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
+        layout: &RankWeightLayout) -> Result<Self> {
+        Self::prepare_layout(programs, checkpoint, rows, layout.clone(), None, ownership.execution().spec().rows as usize)
     }
 
     pub(super) fn for_mtp_stage(programs: &Programs<'_>, checkpoint: &Checkpoint,

@@ -196,7 +196,7 @@ impl<'a> SwaLayer<'a> {
         kv_format: Qwen4KvCache,
     ) -> Result<Self> {
         Self::load_layout(device, programs, checkpoint, layer_id, rows, rope, available,
-            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, 64, true, None, kv_format, None)
+            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, 64, true, None, kv_format, None, None)
     }
 
     pub fn for_execution(
@@ -213,12 +213,13 @@ impl<'a> SwaLayer<'a> {
         ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
         kv_format: Qwen4KvCache,
         native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
+        contract: &CoordinatorContract, layout: &RankWeightLayout,
     ) -> Result<Self> {
         let heads = ownership.layer(layer, rank)?.query_heads;
         ensure!(heads > 0, "Step-5 SWA is not owned by rank {rank}");
         Self::load_layout(device, programs, checkpoint, layer, rows, rope, available,
-            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, heads, false, Some((arena, 0)),
-            kv_format, native_scratch)
+            reservations, layout.clone(), heads, false, Some((arena, 0)),
+            kv_format, native_scratch, Some(contract))
     }
 
     pub(super) fn for_mtp_stage(
@@ -229,7 +230,7 @@ impl<'a> SwaLayer<'a> {
         let layout = RankWeightLayout::for_mtp_stage(checkpoint, stage)?;
         let cfg = Config::parse(checkpoint)?;
         Self::load_layout(device, programs, checkpoint, cfg.layers + stage, rows,
-            Some(rope), available, reservations, layout, 64, true, Some((arena, 0)), kv_format, None)
+            Some(rope), available, reservations, layout, 64, true, Some((arena, 0)), kv_format, None, None)
     }
 
     fn load_layout(
@@ -247,6 +248,7 @@ impl<'a> SwaLayer<'a> {
         arena: Option<(&Arena<'a>, usize)>,
         kv_format: Qwen4KvCache,
         native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
+        contract: Option<&CoordinatorContract>,
     ) -> Result<Self> {
         let name = |full: &str| {
             let name = if heads == 32 { full.replacen("step5_", "step52_", 1) }
@@ -256,7 +258,10 @@ impl<'a> SwaLayer<'a> {
             } else { name }
         };
         let output = if heads == 32 { "step52_attn_out_partial" } else { "step5_attn_out" };
-        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+        let owned;
+        let contract = match contract { Some(contract) => contract, None => {
+            owned = CoordinatorContract::from_checkpoint(checkpoint)?; &owned
+        }};
         let cfg = Config::parse(checkpoint)?;
         let layer = LayerContract::from_config(&cfg, layer_id)?;
         if let Some(rope) = &rope {

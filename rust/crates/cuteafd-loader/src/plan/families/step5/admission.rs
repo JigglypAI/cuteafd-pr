@@ -443,8 +443,19 @@ pub fn forecast_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usiz
 /// Includes native stage weights, private workspace, independent histories and
 /// the actual host-aware staging mark count before any live allocation.
 pub fn admit_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize) -> Result<Admission> {
-    if depth == 0 { return admit(checkpoint, inputs); }
+    let contract = super::coordinator::CoordinatorContract::from_checkpoint(checkpoint)?;
+    admit_mtp_with_contract(checkpoint, inputs, depth, &contract)
+}
+
+/// Reuses launch-scoped immutable headers; every candidate keeps its own rank layout.
+pub fn admit_mtp_with_contract(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize,
+    contract: &super::coordinator::CoordinatorContract) -> Result<Admission> {
     let cfg = Config::parse(checkpoint)?;
+    if depth == 0 {
+        return admit_with(&cfg, inputs, |ownership| (0..ownership.ranks()).map(|rank|
+            super::native::rank_admission_from_contract(contract, &cfg, ownership, rank,
+                inputs.unit_rows(), inputs.rows, inputs.logit_rows())).collect());
+    }
     ensure!((1..=cfg.mtp).contains(&depth) && inputs.unit_rows() > depth,
         "Step-5 predictor depth must fit checkpoint and row capacity");
     // Native K4 predictor owners keep their own projection scratch beside their weights.
@@ -452,7 +463,6 @@ pub fn admit_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize) 
         .checked_add(super::native::mtp_native_scratch_bytes(checkpoint, depth, inputs.rows)?)
         .context("Step-5 predictor native forecast overflow")?;
     let workspace = super::native::mtp_forecast_workspace(inputs.unit_rows(), depth, inputs.kv_format)?;
-    let contract = super::coordinator::CoordinatorContract::from_checkpoint(checkpoint)?;
     admit_depth_with(&cfg, inputs, depth, |ownership| {
         (0..ownership.ranks()).map(|rank| {
             let mut native = super::native::rank_admission_from_contract(&contract, &cfg, ownership, rank, inputs.unit_rows(),

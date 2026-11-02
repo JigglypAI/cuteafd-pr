@@ -97,6 +97,7 @@ impl CoordinatorContract {
     /// Full tensors are conservatively replicated; no unimplemented TP packing
     /// or BF16-to-FP8 conversion is credited as a memory saving.
     pub fn from_checkpoint(checkpoint: &Checkpoint) -> Result<Self> {
+        let _construction = tracing::debug_span!("step5_coordinator_contract_construction").entered();
         let model = Model::open(checkpoint)?;
         let cfg: &Config = &model.cfg;
         let declarations = model
@@ -228,8 +229,9 @@ impl RankWeightLayout {
         Self::from_contract(&contract, &cfg, rank, ranks, ownership)
     }
 
-    pub(super) fn from_contract(contract: &CoordinatorContract, cfg: &Config,
+    pub fn from_contract(contract: &CoordinatorContract, cfg: &Config,
         rank: usize, ranks: usize, ownership: Option<&super::ownership::ExecutionOwnership>) -> Result<Self> {
+        let _construction = tracing::debug_span!("step5_rank_layout_construction", rank).entered();
         if let Some(ownership) = ownership { ownership.validate_config(cfg)?; }
         let mut layout = Self::from_native(&contract.weights, rank, ranks, ownership)?;
         layout.attach_core(cfg, &contract.core, ownership, |layer| layer < cfg.layers)?;

@@ -29,6 +29,28 @@ fn draft_homes(ownership: &ExecutionOwnership, catalog: &cuteafd_loader::Officia
     }), catalog.exl3(), read_bytes)
 }
 
+/// Immutable headers are shared across every native plan and allocation in a launch.
+pub(super) struct NativePlan {
+    pub(super) contract: Rc<CoordinatorContract>,
+    pub(super) layouts: Vec<RankWeightLayout>,
+}
+impl NativePlan {
+    pub(super) fn new(checkpoint: &Checkpoint, ownership: &ExecutionOwnership,
+        contract: Rc<CoordinatorContract>) -> Result<Self> {
+        let cfg = cuteafd_loader::plan::families::step5::Config::parse(checkpoint)?;
+        let layouts = (0..ownership.ranks()).map(|rank|
+            RankWeightLayout::from_contract(&contract, &cfg, rank, ownership.ranks(), Some(ownership)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { contract, layouts })
+    }
+
+    fn layer(&self, rank: usize, layer: usize) -> Result<(&CoordinatorContract, &RankWeightLayout)> {
+        ensure!(layer < self.contract.layers.len(), "Step-5 native layer outside contract");
+        let layout = self.layouts.get(rank).context("Step-5 native rank outside launch plan")?;
+        Ok((&self.contract, layout))
+    }
+}
+
 /// Exact native allocation bytes, excluding caller-owned cache/transport/code reserves.
 /// The final head contributes weights once and shares the sequential scratch arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +100,7 @@ impl<'a> Layer<'a> {
 
 /// The native owner retains component operands and one sequential arena per rank.
 struct NativeOwners<'a> {
+    contract: Rc<CoordinatorContract>,
     ranks: Vec<Vec<Option<Layer<'a>>>>,
     head: Option<super::head::TargetHeadOwner<'a>>,
     arenas: Vec<Arena<'a>>,
@@ -91,25 +114,26 @@ struct NativeOwners<'a> {
 impl<'a> NativeOwners<'a> {
     fn load(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: &ExecutionOwnership, devices: &[Device<'a>], rows: usize, span: usize, logits: usize,
-        count: usize, available: &[u64], reservations: &[u64], depth: usize, kv_format: Qwen4KvCache) -> Result<Self> {
+        count: usize, available: &[u64], reservations: &[u64], depth: usize, kv_format: Qwen4KvCache,
+        plan: &NativePlan) -> Result<Self> {
         validate_rank_inventory(ownership.ranks(), &[devices.len(), available.len(), reservations.len()])?;
         ensure!(matches!(count, 1 | 92), "Step-5 native layer inventory");
         let head_rank = ownership.execution().spec().head_gpu as usize;
         ensure!(head_rank < ownership.ranks(), "Step-5 final head rank");
         let head_plan = (count == 92).then(||
-            super::head::HeadPlan::for_execution(programs, checkpoint, logits, ownership)).transpose()?;
+            super::head::HeadPlan::for_execution(programs, checkpoint, logits, ownership, &plan.layouts[head_rank])).transpose()?;
         let mut admission = vec![RankAdmission { immutable: 0, workspace: 0 }; ownership.ranks()];
-        for (rank, plan) in admission.iter_mut().enumerate() {
-            *plan = Execution::rank_admission(programs, checkpoint, ownership, rank, rows, span, count)?;
+        for (rank, admitted) in admission.iter_mut().enumerate() {
+            *admitted = Execution::rank_admission(programs, checkpoint, ownership, rank, rows, span, count, plan)?;
             if rank == head_rank {
-                if let Some(head) = &head_plan { *plan = plan.with_head(head)?; }
-                plan.workspace = plan.workspace.max(
+                if let Some(head) = &head_plan { *admitted = admitted.with_head(head)?; }
+                admitted.workspace = admitted.workspace.max(
                     cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(rows, depth, kv_format)?);
             }
         }
         let catalog = (count > 3).then(|| cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)).transpose()?;
         admit_native(&admission, available, reservations, || {
-            let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+            let contract = &plan.contract;
             let mut ranks: Vec<Vec<Option<Layer<'a>>>> = (0..ownership.ranks()).map(|_| Vec::new()).collect();
             let mut arenas = Vec::with_capacity(ownership.ranks());
             let mut tables = Vec::with_capacity(ownership.ranks());
@@ -117,8 +141,8 @@ impl<'a> NativeOwners<'a> {
                 .collect::<Result<Vec<_>>>()?;
             for rank in 0..ownership.ranks() {
                 let device = devices[rank];
-                let rank_layout = RankWeightLayout::for_execution(checkpoint, rank, ownership)?;
-                let native_layout = native_scratch_layout(&rank_layout, rows, count)?;
+                let (_, rank_layout) = plan.layer(rank, 0)?;
+                let native_layout = native_scratch_layout(rank_layout, rows, count)?;
                 let native_bytes = native_layout.as_ref().map(|l| l.bytes()).transpose()?.unwrap_or(0);
                 // The arena holds attention and FFN regions; the native scratch is its own admitted owner.
                 let arena = Arena::new(device, usize::try_from(admission[rank].workspace)? - native_bytes)?;
@@ -131,23 +155,23 @@ impl<'a> NativeOwners<'a> {
                     let attention = if contract.layers[layer].sliding.is_some() {
                         Attention::Sliding(SwaLayer::for_execution(device, programs, checkpoint, layer,
                             rows, Some(rope.clone()), available[rank], &[], rank, &arena, ownership, kv_format,
-                            native_scratch.clone())?)
+                            native_scratch.clone(), contract, rank_layout)?)
                     } else {
                         Attention::Sparse(CsaLayer::for_execution(device, programs, checkpoint, layer,
                             rows, Some(rope.clone()), available[rank], &[], rank, &arena, ownership, kv_format,
-                            native_scratch.clone())?)
+                            native_scratch.clone(), contract, rank_layout)?)
                     };
                     // Every FFN kind lives in one region after this rank's largest
                     // attention region: no attention or other FFN kind overwrites a
                     // pending FFN's live rows (native::routed_layout/dense_layout).
                     let offset = usize::try_from(ffn_offset[rank])?;
                     let ffn = if contract.layers[layer].dense_activation.is_some() {
-                        let plan = DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?
+                        let plan = DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership, contract, rank_layout)?
                             .with_span(span)?;
                         Ffn::Dense(DenseFfn::load_plan_shared(device, programs, checkpoint, plan, Some((&arena, offset)),
                             native_scratch.clone())?)
                     } else {
-                        let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?
+                        let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership, contract, rank_layout)?
                             .with_span(span)?
                             .with_bf16_input({
                                 let catalog = catalog.as_ref().context("Step-5 routed expert headers missing")?;
@@ -162,7 +186,7 @@ impl<'a> NativeOwners<'a> {
             }
             let head = head_plan.map(|plan| super::head::TargetHeadOwner::load_in(devices[head_rank],
                 programs, checkpoint, plan, available[head_rank], &[], Some((&arenas[head_rank], 0)))).transpose()?;
-            Ok(Self { ranks, head, arenas, rope: tables, onboarded: None, onboarded_tp2: None })
+            Ok(Self { contract: plan.contract.clone(), ranks, head, arenas, rope: tables, onboarded: None, onboarded_tp2: None })
         })
     }
 }
@@ -296,7 +320,8 @@ impl<'e, 'a> Execution<'e, 'a> {
         ownership: &ExecutionOwnership, rank: usize, rows: usize, count: usize) -> Result<u64> {
         ensure!(matches!(count, 1 | 92), "Step-5 diagnostic layer count");
         ensure!(matches!(ownership.ranks(), 1 | 2), "Step-5 shared execution rank count");
-        Self::rank_admission(programs, checkpoint, ownership, rank, rows, rows, count)?
+        let plan = NativePlan::new(checkpoint, ownership, Rc::new(CoordinatorContract::from_checkpoint(checkpoint)?))?;
+        Self::rank_admission(programs, checkpoint, ownership, rank, rows, rows, count, &plan)?
             .bytes()
     }
 
@@ -305,19 +330,27 @@ impl<'e, 'a> Execution<'e, 'a> {
     /// `logits` is the head's row capacity (`native::head_rows`), not the chunk rows.
     pub(super) fn serving_admission(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: &ExecutionOwnership, rank: usize, rows: usize, span: usize, logits: usize) -> Result<RankAdmission> {
+        let plan = NativePlan::new(checkpoint, ownership, Rc::new(CoordinatorContract::from_checkpoint(checkpoint)?))?;
+        Self::serving_admission_with_plan(programs, checkpoint, ownership, rank, rows, span, logits, &plan)
+    }
+
+    pub(super) fn serving_admission_with_plan(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        ownership: &ExecutionOwnership, rank: usize, rows: usize, span: usize, logits: usize,
+        plan: &NativePlan) -> Result<RankAdmission> {
         ensure!((1..=span).contains(&logits), "Step-5 head rows outside the span");
-        let admission = Self::rank_admission(programs, checkpoint, ownership, rank, rows, span, 92)?;
+        let admission = Self::rank_admission(programs, checkpoint, ownership, rank, rows, span, 92, plan)?;
         if rank == ownership.execution().spec().head_gpu as usize {
-            admission.with_head(&super::head::HeadPlan::for_execution(programs, checkpoint, logits, ownership)?)
+            admission.with_head(&super::head::HeadPlan::for_execution(programs, checkpoint, logits, ownership,
+                &plan.layouts[rank])?)
         } else { Ok(admission) }
     }
 
     fn rank_admission(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        ownership: &ExecutionOwnership, rank: usize, rows: usize, span: usize, count: usize) -> Result<RankAdmission> {
+        ownership: &ExecutionOwnership, rank: usize, rows: usize, span: usize, count: usize,
+        plan: &NativePlan) -> Result<RankAdmission> {
         ensure!(matches!(count, 1 | 92) && rank < ownership.ranks(), "Step-5 native rank/layer admission");
         ensure!(rows as u64 <= ownership.execution().spec().rows, "Step-5 native row admission");
-        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-        let layout = RankWeightLayout::for_execution(checkpoint, rank, ownership)?;
+        let (contract, layout) = plan.layer(rank, 0)?;
         let in_count = |name: &str| (0..count).any(|layer| name.starts_with(&format!("model.layers.{layer}.")));
         let immutable = layout.operands.iter().filter(|w| in_count(&w.name))
             .try_fold(contract.rope_tables.allocation_bytes, |n, w| n.checked_add(w.allocation_bytes))
@@ -331,11 +364,11 @@ impl<'e, 'a> Execution<'e, 'a> {
             if ownership.layer(layer, rank)?.query_heads == 0 { continue; }
             owned = true;
             let (planes, ffn) = if contract.layers[layer].dense_activation.is_some() {
-                let plan = DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?
+                let plan = DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership, contract, layout)?
                     .with_span(span)?;
                 (plan.workspace_bytes(), "dense")
             } else {
-                let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?
+                let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership, contract, layout)?
                     .with_span(span)?;
                 (plan.workspace_bytes(), "routed")
             };
@@ -391,6 +424,16 @@ impl<'e, 'a> Execution<'e, 'a> {
     pub(super) fn load_native(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: &ExecutionOwnership, caches: &[&'e RefCell<CacheRank<'a>>], stages: &[&'e Staging<'a>],
         rows: usize, span: usize, logits: usize, available: &[u64], reservations: &[u64], count: usize) -> Result<LoadedNative<'a>> {
+        let plan = NativePlan::new(checkpoint, ownership, Rc::new(CoordinatorContract::from_checkpoint(checkpoint)?))?;
+        Self::load_native_with_plan(programs, checkpoint, ownership, caches, stages, rows, span,
+            logits, available, reservations, count, &plan)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn load_native_with_plan(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        ownership: &ExecutionOwnership, caches: &[&'e RefCell<CacheRank<'a>>], stages: &[&'e Staging<'a>],
+        rows: usize, span: usize, logits: usize, available: &[u64], reservations: &[u64], count: usize,
+        plan: &NativePlan) -> Result<LoadedNative<'a>> {
         ensure!(matches!(count, 1 | 92), "Step-5 execution count must be layer-zero diagnostic or full target");
         ensure!(rows <= span && (1..=span).contains(&logits), "Step-5 unit or head rows outside the span");
         validate_rank_inventory(ownership.ranks(), &[caches.len(), stages.len(), available.len(), reservations.len()])?;
@@ -409,7 +452,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         let depth = caches[ownership.execution().spec().head_gpu as usize].borrow()
             .layout().ranks[ownership.execution().spec().head_gpu as usize].mtp_lengths.len();
         Ok(LoadedNative(NativeOwners::load(programs, checkpoint, ownership, &devices, rows, span, logits, count, available,
-            reservations, depth, kv_format)?))
+            reservations, depth, kv_format, plan)?))
     }
 
     /// Binds loaded native owners to the caches and the (now connected) transport.
@@ -482,7 +525,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
         caches: Vec<&'e RefCell<CacheRank<'a>>>, stages: Vec<&'e Staging<'a>>, rows: usize,
         transport: Option<DeviceOwner<'a, SparkLink<'a>>>, count: usize,
         placement_version: u64) -> Result<Self> {
-        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+        let contract = &native.contract;
         let devices: Vec<_> = caches.iter().map(|cache| cache.borrow().stream.device).collect();
         let exchange = if ownership.ranks() == 2 {
             let native_ranks = std::array::from_fn(|rank| RankDevice { device: devices[rank].id,
@@ -890,10 +933,6 @@ impl<'e, 'a> Execution<'e, 'a> {
             step.compose(entry, input, |_, _| Ok(()))?;
             // Routed waves build, post and land on the main link's exchange
             // worker while this thread queues GPU work.
-            if let Some(link) = main.transport.borrow_mut().as_mut() {
-                let staging = RouteStaging::new(units.iter().map(|unit| unit.rows.len()).max().unwrap_or(1), 8, H * 2)?.bytes;
-                ensure!(link.get_mut().exchange()?.fits(staging), "Step-5 main link staging is narrower than a unit");
-            }
             let binding = Bindings { execution: main, step, scope, current: vec![None; main.ownership.ranks()],
                 input: input.buffer, kind, layer: 0, diagnostic: None, units: true, lane: 0 };
             let mut hooks = UnitHooks { binding, span: input.buffer,
@@ -1529,6 +1568,78 @@ mod tests {
             theta: vec![], rotary: vec![], rope_scaling: None, scale_full: false,
             scale_sliding: false, activation: vec![], shared_activation: vec![] }
     }
+    #[test]
+    fn whole_model_native_context_constructs_headers_once() -> Result<()> {
+        use cuteafd_loader::{placement::*, plan::testing};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use tracing_subscriber::{layer::Context, prelude::*, registry::LookupSpan, Layer};
+        #[derive(Clone, Default)]
+        struct Constructions { contract: Arc<AtomicUsize>, layout: Arc<AtomicUsize> }
+        impl<S: tracing::Subscriber + for<'s> LookupSpan<'s>> Layer<S> for Constructions {
+            fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, _: &tracing::Id, _: Context<'_, S>) {
+                let counter = match attrs.metadata().name() {
+                    "step5_coordinator_contract_construction" => &self.contract,
+                    "step5_rank_layout_construction" => &self.layout,
+                    _ => return,
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let fixture = tempfile::tempdir()?;
+        testing::write_step5_exl3_snapshot(fixture.path());
+        let checkpoint = Checkpoint::inventory(fixture.path())?;
+        let cfg = Config::parse(&checkpoint)?;
+        for ranks in [1, 2] {
+            let counts = Constructions::default();
+            let subscriber = tracing_subscriber::registry().with(counts.clone());
+            tracing::subscriber::with_default(subscriber, || -> Result<()> {
+                let modes = (0..92).map(|layer| LayerMode::Whole {
+                    gpu: (layer % ranks) as u8, ffn: FfnMode::Owner }).collect::<Vec<_>>();
+                let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: (H * 4) as u64,
+                    rows: 64, lanes: 1, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
+                let placement = Placement { pool_tokens: 0, pool_limits: PoolLimits(vec![]),
+                    attention_placement: AttentionPlacement::Layers, attention_by_kind: vec![], peer_row_bytes: 0,
+                    onboard_layers: 0, max_pool_tokens_no_onboard: 0,
+                    layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Spark }).collect(),
+                    movables: vec![], expert_ranges: vec![], residual: residual_homes(&modes, &spec)?,
+                    hops: plan_hops(&modes, &spec)?, tp2: None, items: vec![] };
+                let ownership = ExecutionOwnership::new(&cfg, ranks, LayerExecutionPlan::new(&placement, spec)?)?;
+                let plan = NativePlan::new(&checkpoint, &ownership,
+                    Rc::new(CoordinatorContract::from_checkpoint(&checkpoint)?))?;
+                // Admission and native allocation traverse the same immutable owners.
+                for _phase in 0..3 {
+                    for rank in 0..ranks {
+                        for layer in 0..92 {
+                            let (contract, layout) = plan.layer(rank, layer)?;
+                            assert!(std::ptr::eq(contract, plan.contract.as_ref()));
+                            assert!(std::ptr::eq(layout, &plan.layouts[rank]));
+                            assert_eq!(contract.layers[layer].layer, layer);
+                        }
+                        let reused = cuteafd_loader::plan::families::step5::native::rank_admission_for_layout(
+                            &plan.contract, &cfg, &plan.layouts[rank], &ownership, rank, 64, 64, 1)?;
+                        assert!(reused.immutable > 0 && reused.workspace > 0);
+                    }
+                }
+                assert!(plan.layer(ranks, 0).is_err());
+                assert!(plan.layer(0, 92).is_err());
+                Ok(())
+            })?;
+            assert_eq!(counts.contract.load(Ordering::Relaxed), 1, "one launch contract shared by all ranks");
+            assert_eq!(counts.layout.load(Ordering::Relaxed), ranks, "one selected layout per rank");
+        }
+        // Per-layer constructors must not escape the launch-scoped context.
+        for source in [include_str!("routed.rs"), include_str!("ffn.rs"), include_str!("head.rs"),
+            include_str!("swa.rs"), include_str!("csa.rs")] {
+            let start = source.find("pub fn for_execution(").context("native constructor")?;
+            let end = source[start..].find("\n    }").context("constructor end")? + start;
+            let body = &source[start..end];
+            assert!(!body.contains("RankWeightLayout::for_execution"));
+            assert!(!body.contains("CoordinatorContract::from_checkpoint"));
+            assert!(body.contains("layout.clone()"));
+        }
+        Ok(())
+    }
+
     #[test]
     fn exl3_draft_prices_cover_every_min_rank_and_actual_onboarding_home() -> Result<()> {
         use cuteafd_loader::{placement::*, plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions}};

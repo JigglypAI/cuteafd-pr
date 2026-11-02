@@ -23,9 +23,17 @@ pub(super) fn admit_mtp<'a>(
     programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
     inputs: &RuntimeInputs, depth: usize,
 ) -> Result<admission::Admission> {
+    let contract = std::rc::Rc::new(cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(checkpoint)?);
+    Ok(admit_mtp_with_contract(programs, checkpoint, inputs, depth, contract)?.0)
+}
+
+pub(super) fn admit_mtp_with_contract<'a>(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+    inputs: &RuntimeInputs, depth: usize,
+    contract: std::rc::Rc<cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract>,
+) -> Result<(admission::Admission, super::execution::NativePlan)> {
     measured(inputs)?;
-    let admitted = if depth == 0 { checkpoint_admission(checkpoint, inputs)? }
-        else { admission::admit_mtp(checkpoint, inputs, depth)? };
+    let admitted = admission::admit_mtp_with_contract(checkpoint, inputs, depth, &contract)?;
+    let plan = super::execution::NativePlan::new(checkpoint, &admitted.ownership, contract)?;
     if depth > 0 {
         for stage in 0..depth {
             super::mtp::InputPlan::prepare(programs, checkpoint, stage, inputs.unit_rows())?;
@@ -34,10 +42,10 @@ pub(super) fn admit_mtp<'a>(
     let ownership = &admitted.ownership;
     for rank in 0..ownership.ranks() {
         let native =
-            Execution::serving_admission(programs, checkpoint, ownership, rank, inputs.unit_rows(), inputs.rows,
-                inputs.logit_rows())?;
-        let shared = cuteafd_loader::plan::families::step5::native::rank_admission(
-            checkpoint,
+            Execution::serving_admission_with_plan(programs, checkpoint, ownership, rank, inputs.unit_rows(), inputs.rows,
+                inputs.logit_rows(), &plan)?;
+        let shared = cuteafd_loader::plan::families::step5::native::rank_admission_for_layout(
+            &plan.contract, &cuteafd_loader::plan::families::step5::Config::parse(checkpoint)?, &plan.layouts[rank],
             ownership,
             rank,
             inputs.unit_rows(),
@@ -49,7 +57,7 @@ pub(super) fn admit_mtp<'a>(
             "Step-5 native allocation owners differ from shared admission"
         );
     }
-    Ok(admitted)
+    Ok((admitted, plan))
 }
 
 fn measured(inputs: &RuntimeInputs) -> Result<()> {

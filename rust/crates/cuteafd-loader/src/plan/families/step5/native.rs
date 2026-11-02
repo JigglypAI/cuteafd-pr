@@ -309,7 +309,7 @@ pub(super) fn rank_admission_from_contract(
     rank_admission_for_layout(contract, cfg, &layout, ownership, rank, unit, span, logits)
 }
 
-pub(super) fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, layout: &RankWeightLayout,
+pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, layout: &RankWeightLayout,
     ownership: &ExecutionOwnership, rank: usize, unit: usize, span: usize, logits: usize,
 ) -> Result<RankAdmission> {
     let immutable = layout

@@ -208,6 +208,7 @@ fn with_backend<T>(args: &ServeArgs,
     resolved.prefill_waves = u8::try_from(shape.waves)?;
     let args = &resolved;
     args.validate()?;
+    let startup = std::time::Instant::now();
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, args.mtp > 0)?;
     let cfg = Config::parse(&checkpoint)?;
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
@@ -258,7 +259,13 @@ fn with_backend<T>(args: &ServeArgs,
         onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
             Some(&args.manifest), args.prefill_rows as usize, ids.len(), usize::from(args.prefill_waves),
             args.rtx_expert_layers)? };
-    let admission = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(args.mtp))?;
+    let contract = std::rc::Rc::new(cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?);
+    tracing::info!(elapsed_s = startup.elapsed().as_secs_f64(), "Step-5 startup inventory complete");
+    let planning = std::time::Instant::now();
+    // The first solve only prices retained startup owners. Validate native ABIs
+    // once, after the final solve selects the ownership used for allocation.
+    let admission = cuteafd_loader::plan::families::step5::admission::admit_mtp_with_contract(
+        &checkpoint, &inputs, usize::from(args.mtp), &contract)?;
     cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
     // Uploads convert on the host and copy synchronously. No transient device
     // conversion arena exists: each loading phase is bounded by retained owners.
@@ -268,7 +275,9 @@ fn with_backend<T>(args: &ServeArgs,
         Ok(Demand::new(rank as u8, cuteafd_core::memory_layout::Category::Workspace,
             "Step-5 retained loading peak", bytes, cuteafd_core::memory_layout::Basis::Exact))
     }).collect::<Result<Vec<_>>>()?;
-    let admission = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(args.mtp))?;
+    let (admission, native_plan) = admission::admit_mtp_with_contract(&programs, &checkpoint, &inputs, usize::from(args.mtp), contract)?;
+    tracing::info!(elapsed_s = planning.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
+        "Step-5 startup planning complete");
     measured.record("step5", &measured.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
     let endpoint = args.endpoint(format.ingress());
     let clients = admission.ownership.routed_endpoints()?;
@@ -283,8 +292,8 @@ fn with_backend<T>(args: &ServeArgs,
         spark_model(&exports, endpoint, u64::from(args.prefill_waves), clients, config.max_frame_bytes)?)?;
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
     let reserves = (0..ids.len()).map(|rank| {
-        let native = Execution::serving_admission(&programs, &checkpoint, &admission.ownership, rank, inputs.unit_rows(),
-            inputs.rows, inputs.logit_rows())?;
+        let native = Execution::serving_admission_with_plan(&programs, &checkpoint, &admission.ownership, rank, inputs.unit_rows(),
+            inputs.rows, inputs.logit_rows(), &native_plan)?;
         let mut native = native;
         if rank == usize::from(admission.ownership.execution().spec().head_gpu) {
             native.workspace = native.workspace.max(
@@ -333,14 +342,15 @@ fn with_backend<T>(args: &ServeArgs,
     // planning error offers no coordinator ranks: the Sparks still push and the
     // coordinator fills through the mount); otherwise they load through the
     // mount while the Sparks load.
+    let native_start = std::time::Instant::now();
     let push = spark_admission.coordinator_pushes();
     let mut native = None;
     let mut coordinator = None;
     let mut ranks = None;
     if push {
         let recorder = crate::shared::experts::rtx::dense::Recorder::start(true)?.context("dense recorder")?;
-        let loaded = Execution::load_native(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
-            inputs.unit_rows(), inputs.rows, inputs.logit_rows(), &available, &reserves, 92);
+        let loaded = Execution::load_native_with_plan(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
+            inputs.unit_rows(), inputs.rows, inputs.logit_rows(), &available, &reserves, 92, &native_plan);
         let records = recorder.finish();
         native = Some(loaded?);
         let planned = (|| -> Result<_> {
@@ -365,6 +375,9 @@ fn with_backend<T>(args: &ServeArgs,
             }
         }
     }
+    tracing::info!(elapsed_s = native_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
+        "Step-5 startup native preparation complete");
+    let push_start = std::time::Instant::now();
     let pending = spark_admission.start_with(&args.peers, ranks)?;
     let (embedding, native) = crate::shared::placement::load_while_admitting(Some(pending), || {
         TokenEmbedding::load(&library, source, EmbedPlacement::Gpu, || -> Result<super::execution::LoadedNative<'_>> {
@@ -381,9 +394,9 @@ fn with_backend<T>(args: &ServeArgs,
             }
             let native = match native {
                 Some(native) => native,
-                None => Execution::load_native(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
+                None => Execution::load_native_with_plan(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
                     inputs.unit_rows(), inputs.rows, inputs.logit_rows(),
-                    &available, &reserves, 92)?,
+                    &available, &reserves, 92, &native_plan)?,
             };
             // Onboarded EXL3 routed layers inside their solved expert arenas:
             // TP2 halves over two GPUs, else whole on the entry GPU.
@@ -409,6 +422,9 @@ fn with_backend<T>(args: &ServeArgs,
             }
         })
     })?;
+    tracing::info!(elapsed_s = push_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
+        "Step-5 startup weight delivery complete");
+    let bind_start = std::time::Instant::now();
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;
     let world = SparkWorld::canonical(args.peers.len())?;
     let transport = devices[0].own(|| {
@@ -433,6 +449,8 @@ fn with_backend<T>(args: &ServeArgs,
         .configure_packing(args.prefill_packing, coordinator_cap)?;
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
     library.cuda_set_device(args.device)?;
+    tracing::info!(elapsed_s = bind_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
+        "Step-5 startup native binding complete");
     tracing::info!(rows=inputs.rows, sequences=inputs.sequences, mtp=args.mtp,
         context=backend.geometry().max_context, pool_tokens=admission.placement.pool_tokens,
         "Step-5 admitted eager target and native predictor depth");
@@ -1179,9 +1197,9 @@ mod load_order_tests {
         let start = source.find("fn with_backend<T>").unwrap();
         let body = &source[start..start + source[start..].find("\nfn worker(").unwrap()];
         let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
-        assert!(at("admission::admit_mtp(") < at("let spark_admission = SparkAdmission::plan("));
-        assert!(at("let spark_admission = SparkAdmission::plan(") < at("Execution::load_native("));
-        assert!(at("Execution::load_native(") < at("spark_admission.start_with("));
+        assert!(at("admission::admit_mtp_with_contract(") < at("let spark_admission = SparkAdmission::plan("));
+        assert!(at("let spark_admission = SparkAdmission::plan(") < at("Execution::load_native_with_plan("));
+        assert!(at("Execution::load_native_with_plan(") < at("spark_admission.start_with("));
         assert!(at("spark_admission.start_with(") < at("load_while_admitting(Some(pending)"));
         assert!(at("load_while_admitting(Some(pending)") < at("require_peer_clients("));
         assert!(at("require_peer_clients(") < at("SparkLink::new_waves("));

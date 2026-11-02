@@ -216,7 +216,7 @@ impl<'a> CsaLayer<'a> {
         kv_format: Qwen4KvCache,
     ) -> Result<Self> {
         Self::load_layout(device, programs, checkpoint, layer_id, rows, rope, available,
-            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, true, None, kv_format, None)
+            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, true, None, kv_format, None, None)
     }
 
     pub fn for_execution(
@@ -233,13 +233,14 @@ impl<'a> CsaLayer<'a> {
         ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
         kv_format: Qwen4KvCache,
         native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
+        contract: &CoordinatorContract, layout: &RankWeightLayout,
     ) -> Result<Self> {
         let local = ownership.layer(layer, rank)?;
         ensure!(local.query_heads == 64 && local.kv_heads == 4,
             "Step-5 CSA needs a whole native attention owner");
         Self::load_layout(device, programs, checkpoint, layer, rows, rope, available,
-            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, false, Some((arena, 0)),
-            kv_format, native_scratch)
+            reservations, layout.clone(), false, Some((arena, 0)),
+            kv_format, native_scratch, Some(contract))
     }
 
     fn load_layout(
@@ -256,8 +257,12 @@ impl<'a> CsaLayer<'a> {
         arena: Option<(&Arena<'a>, usize)>,
         kv_format: Qwen4KvCache,
         native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
+        contract: Option<&CoordinatorContract>,
     ) -> Result<Self> {
-        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+        let owned;
+        let contract = match contract { Some(contract) => contract, None => {
+            owned = CoordinatorContract::from_checkpoint(checkpoint)?; &owned
+        }};
         let layer = contract
             .layers
             .get(layer_id)

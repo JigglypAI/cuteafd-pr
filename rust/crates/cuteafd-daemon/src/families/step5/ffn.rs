@@ -149,10 +149,11 @@ impl DensePlan {
         reservations: &[u64],
         rank: usize,
         ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
+        _contract: &cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract, layout: &RankWeightLayout,
     ) -> Result<Self> {
         ensure!(ownership.layer(layer, rank)?.ffn, "Step-5 dense FFN is not owned by rank {rank}");
         Self::prepare_layout(programs, checkpoint, layer, rows, available, reservations,
-            RankWeightLayout::for_execution(checkpoint, rank, ownership)?)
+            layout.clone())
     }
 
     pub(super) fn for_mtp_stage(

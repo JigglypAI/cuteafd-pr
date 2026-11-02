@@ -137,7 +137,7 @@ impl RoutedPlan {
         reservations: &[u64],
     ) -> Result<Self> {
         Self::prepare_layout(programs, checkpoint, layer, rows, available, reservations,
-            RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?)
+            RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, None)
     }
 
     pub fn for_execution(
@@ -149,10 +149,11 @@ impl RoutedPlan {
         reservations: &[u64],
         rank: usize,
         ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
+        contract: &CoordinatorContract, layout: &RankWeightLayout,
     ) -> Result<Self> {
         ensure!(ownership.layer(layer, rank)?.ffn, "Step-5 routed FFN is not owned by rank {rank}");
         Self::prepare_layout(programs, checkpoint, layer, rows, available, reservations,
-            RankWeightLayout::for_execution(checkpoint, rank, ownership)?)
+            layout.clone(), Some(contract))
     }
 
     fn prepare_layout(
@@ -163,8 +164,12 @@ impl RoutedPlan {
         available: u64,
         reservations: &[u64],
         layout: RankWeightLayout,
+        contract: Option<&CoordinatorContract>,
     ) -> Result<Self> {
-        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+        let owned;
+        let contract = match contract { Some(contract) => contract, None => {
+            owned = CoordinatorContract::from_checkpoint(checkpoint)?; &owned
+        }};
         ensure!(
             contract
                 .layers
