@@ -751,10 +751,7 @@ mod embedding_tests {
             let offsets = header["data_offsets"].as_array().unwrap();
             CheckpointTensor { shard: source["shard"].as_str().unwrap().into(),
                 meta: SafetensorsTensorMetadata { name: name.clone(),
-                    dtype: match header["dtype"].as_str().unwrap() {
-                        "BF16" => DType::Bf16, "F16" => DType::F16,
-                        "I16" => DType::I16, "I32" => DType::I32, other => panic!("{other}"),
-                    },
+                    dtype: DType::from_safetensors(header["dtype"].as_str().unwrap()),
                     shape: header["shape"].as_array().unwrap().iter()
                         .map(|dim| dim.as_u64().unwrap() as usize).collect(),
                     byte_offset: offsets[0].as_u64().unwrap(),
@@ -806,6 +803,13 @@ mod embedding_tests {
             let error = checkpoint.require_untied_embedding(GLMF_EMBEDDING).unwrap_err().to_string();
             assert!(error.contains("aliases") && error.contains(&member.meta.name), "{error}");
         }
+    }
+
+    #[test]
+    fn host_embedding_rejects_a_lone_head_companion() {
+        let mut checkpoint = published_quantized_head();
+        checkpoint.tensors.retain(|t| t.meta.name == GLMF_EMBEDDING || t.meta.name == "lm_head.mcg");
+        assert!(checkpoint.require_untied_embedding(GLMF_EMBEDDING).is_err());
     }
 
     #[test]
