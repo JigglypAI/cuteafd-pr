@@ -850,13 +850,10 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                        cuda_total_bytes if cuda_total_bytes is not None else gpu_total_mib * 2**20)
     copy_input(ROOT / "scripts" / "lib" / "cdi-gpus.sh", repo / "scripts" / "lib")
     copy_input(ROOT / "scripts" / "lib" / "coordinator-gpus.py", repo / "scripts" / "lib")
-    capacity = Path("rust/crates/cuteafd-core/src/serving_capacity.rs")
-    (repo / capacity.parent).mkdir(parents=True)
-    copy_input(ROOT / capacity, repo / capacity)
+    # release-common.sh stages serving_capacity.rs through shared_inputs.
     native_v41 = family_config.get("model_type") == "deepseek_v41"
     if native_v41:
         programs = Path("rust/crates/cuteafd-core/src/coordinator_programs.rs")
-        (repo / programs.parent).mkdir(parents=True, exist_ok=True)
         copy_input(ROOT / programs, repo / programs)
         (repo / "scripts" / "build").mkdir(exist_ok=True)
         (repo / "scripts" / "build" / "verify-sparkinfer-source.py").write_text("print('test-pin')\n")

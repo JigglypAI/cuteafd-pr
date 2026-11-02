@@ -125,9 +125,13 @@ mod tp2_tests {
         for (h, i, experts) in [(4096, 2048, 256), (7168, 3072, 384)] {
             for capacity in [1, 16, 80, 256, 1024, 4096] {
                 for tp in [1, 2] {
-                    let scratch = cuteafd_core::mxfp4_layouts::native_scratch_bytes_for_sm(
-                        h as usize, experts as usize, 6, (i / tp) as usize,
-                        if tp == 1 { 2 } else { 3 }, capacity, false, 120).unwrap();
+                    // Ordered decode can need more scratch than a wider atomic export.
+                    let scratch = [1, 16, 80, 256, 1024, 4096].into_iter()
+                        .filter(|&compiled| compiled <= capacity)
+                        .map(|compiled| cuteafd_core::mxfp4_layouts::native_scratch_bytes_for_sm(
+                            h as usize, experts as usize, 6, (i / tp) as usize,
+                            if tp == 1 { 2 } else { 3 }, compiled, false, 120).unwrap())
+                        .max().unwrap();
                     let rows = u64::from(capacity);
                     let (actual, tail) = if tp == 1 {
                         (deepseek_v4_native_workspace(h, i, experts, 6, rows).unwrap(), rows * (h * 2 + 48))
