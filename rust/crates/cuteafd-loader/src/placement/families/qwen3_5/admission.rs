@@ -26,43 +26,105 @@ pub struct ServingFacts {
 }
 
 impl ServingFacts {
-    pub fn new(cfg: &Qwen35Config, buffers: &NativeBuffers, record_bytes: u64,
-        request: ServingRequest, host_total: u64) -> Result<Self, Refusal> {
+    pub fn new(
+        cfg: &Qwen35Config,
+        buffers: &NativeBuffers,
+        record_bytes: u64,
+        request: ServingRequest,
+        host_total: u64,
+    ) -> Result<Self, Refusal> {
         if request.concurrency == 0 || request.concurrency > super::VERIFY_ROWS as u64 {
-            return Err(Refusal::InvalidFact("dense scheduler concurrency exceeds decode rows".into()));
+            return Err(Refusal::InvalidFact(
+                "dense scheduler concurrency exceeds decode rows".into(),
+            ));
         }
         let geometry = cuteafd_core::prefix::HostCacheGeometry {
             unit_rows: PAGE_ROWS,
-            page_bytes: record_bytes.checked_mul(PAGE_ROWS)
-                .and_then(|n| n.checked_mul(cfg.attention.iter().filter(|&&a| a == HybridAttention::Full).count() as u64))
+            page_bytes: record_bytes
+                .checked_mul(PAGE_ROWS)
+                .and_then(|n| {
+                    n.checked_mul(
+                        cfg.attention
+                            .iter()
+                            .filter(|&&a| a == HybridAttention::Full)
+                            .count() as u64,
+                    )
+                })
                 .ok_or(Refusal::Overflow("host prefix page"))?,
-            mark_bytes: buffers.mark_bytes as u64, draft_bytes: 0,
+            mark_bytes: buffers.mark_bytes as u64,
+            draft_bytes: 0,
         };
-        let quota = if request.prefix_entries == 0 { 0 } else {
-            geometry.resolve(request.host_cache_bytes, cfg.max_context as u64, request.concurrency,
-                host_total, geometry.chunk_bytes()).ok_or(Refusal::Overflow("host prefix quota"))?
+        let quota = if request.prefix_entries == 0 {
+            0
+        } else {
+            geometry
+                .resolve(
+                    request.host_cache_bytes,
+                    cfg.max_context as u64,
+                    request.concurrency,
+                    host_total,
+                    geometry.chunk_bytes(),
+                )
+                .ok_or(Refusal::Overflow("host prefix quota"))?
         };
         if quota == 0 && request.prefix_entries > 0 && request.host_cache_bytes != Some(0) {
-            return Err(Refusal::InvalidFact("host prefix quota resolves to zero".into()));
+            return Err(Refusal::InvalidFact(
+                "host prefix quota resolves to zero".into(),
+            ));
         }
-        Ok(Self { device_sampling: request.device_sampling, host_quota: quota, host_headroom: request.host_headroom,
+        Ok(Self {
+            device_sampling: request.device_sampling,
+            host_quota: quota,
+            host_headroom: request.host_headroom,
             host_chunk: geometry.chunk_bytes().min(quota),
-            host_runtime: cuteafd_core::memory_layout::host_logits_bytes(buffers.head_rows as u64,
-                PREFILL_ROWS as u64, cfg.vocab as u64).ok_or(Refusal::Overflow("host logits"))? })
+            host_runtime: cuteafd_core::memory_layout::host_logits_bytes(
+                buffers.head_rows as u64,
+                PREFILL_ROWS as u64,
+                cfg.vocab as u64,
+            )
+            .ok_or(Refusal::Overflow("host logits"))?,
+        })
     }
 
     fn allocations(self, vocab: usize) -> Result<Vec<Allocation>, Refusal> {
-        let lifetime = Lifetime { first: Phase::Warmup, last: Phase::Growth };
-        let mut owners = vec![Allocation::buffer("selector.output", Location::coordinator(0),
-            super::VERIFY_ROWS as u64 * 12, lifetime, Category::Workspace, "token selector"),
-            Allocation::buffer("selector.landing", Location::PINNED, super::VERIFY_ROWS as u64 * 12,
-                lifetime, Category::Staging, "token selector")];
+        let lifetime = Lifetime {
+            first: Phase::Warmup,
+            last: Phase::Growth,
+        };
+        let mut owners = vec![
+            Allocation::buffer(
+                "selector.output",
+                Location::coordinator(0),
+                super::VERIFY_ROWS as u64 * 12,
+                lifetime,
+                Category::Workspace,
+                "token selector",
+            ),
+            Allocation::buffer(
+                "selector.landing",
+                Location::PINNED,
+                super::VERIFY_ROWS as u64 * 12,
+                lifetime,
+                Category::Staging,
+                "token selector",
+            ),
+        ];
         if self.device_sampling {
             for owner in cuteafd_core::target_sampler_allocations(super::VERIFY_ROWS, vocab)
-                .map_err(|e| Refusal::InvalidFact(e.into()))? {
-                owners.push(Allocation::buffer(format!("selector.sampler.{}", owner.id),
-                    if owner.pinned { Location::PINNED } else { Location::coordinator(0) },
-                    owner.bytes as u64, lifetime, Category::Workspace, "target sampler"));
+                .map_err(|e| Refusal::InvalidFact(e.into()))?
+            {
+                owners.push(Allocation::buffer(
+                    format!("selector.sampler.{}", owner.id),
+                    if owner.pinned {
+                        Location::PINNED
+                    } else {
+                        Location::coordinator(0)
+                    },
+                    owner.bytes as u64,
+                    lifetime,
+                    Category::Workspace,
+                    "target sampler",
+                ));
             }
         }
         if self.host_quota > 0 {
@@ -70,14 +132,21 @@ impl ServingFacts {
                 return Err(Refusal::InvalidFact("invalid host prefix chunk".into()));
             }
             for index in 0..self.host_quota / self.host_chunk {
-                owners.push(Allocation::buffer(format!("host.prefix.{index}"), Location::PINNED,
-                    self.host_chunk, lifetime, Category::Prefix, "retained host prefix chunk"));
+                owners.push(Allocation::buffer(
+                    format!("host.prefix.{index}"),
+                    Location::PINNED,
+                    self.host_chunk,
+                    lifetime,
+                    Category::Prefix,
+                    "retained host prefix chunk",
+                ));
             }
         }
         Ok(owners)
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct DenseFacts<'a> {
     pub cfg: &'a Qwen35Config,
     pub weights: &'a NativeWeights,
@@ -152,7 +221,10 @@ pub fn sampled_budgets(
     budgets[0].baseline = Baseline::Sampled {
         free,
         phase: Phase::Load,
-        source: format!("CUDA physical sample after modules, before target weights; {}", physical.source),
+        source: format!(
+            "CUDA physical sample after modules, before target weights; {}",
+            physical.source
+        ),
     };
     budgets[0].available()?;
     Ok(budgets)
@@ -195,7 +267,9 @@ pub fn admit(
         }
     }
     if let Some(serving) = facts.serving {
-        let host = budgets.iter_mut().find(|budget| budget.id == "host")
+        let host = budgets
+            .iter_mut()
+            .find(|budget| budget.id == "host")
             .ok_or_else(|| Refusal::InvalidFact("dense serving has no host budget".into()))?;
         host.headroom = host.headroom.max(serving.host_headroom);
     }
@@ -203,28 +277,56 @@ pub fn admit(
 }
 
 impl Recipe for DenseFacts<'_> {
-    fn page_rows(&self) -> u64 {
-        PAGE_ROWS
-    }
-    fn maximum_pool(&self) -> u64 {
-        (u32::MAX as u64 / PAGE_ROWS) * PAGE_ROWS
-    }
-    fn candidates(&self) -> Vec<Decisions> {
-        vec![Decisions {
-            attention: vec![WHOLE; self.cfg.attention.len()],
-            onboard_layers: vec![vec![]],
-            prefill: PrefillShape {
+    fn prepare(&self, _request: &Request) -> Result<Contract, Refusal> {
+        let maximum = u32::MAX as u64 / PAGE_ROWS;
+        let mut contract = Contract::fixed(PAGE_ROWS, maximum, 1, self.owner_templates(PAGE_ROWS)?);
+        contract.variables = self
+            .cfg
+            .attention
+            .iter()
+            .enumerate()
+            .map(|(layer, _)| Variable::Attention {
+                layer,
+                values: vec![WHOLE],
+            })
+            .collect();
+        contract
+            .variables
+            .push(Variable::Prefill(vec![PrefillShape {
                 rows: PREFILL_ROWS as u64,
                 waves: 1,
-            },
-        }]
+            }]));
+        contract.variables.push(Variable::Lanes(vec![1]));
+        let kv_page = PAGE_ROWS
+            .checked_mul(self.record_bytes)
+            .ok_or(Refusal::Overflow("dense KV page"))?;
+        for (layer, kind) in self.cfg.attention.iter().enumerate() {
+            if *kind == HybridAttention::Full {
+                contract.set_byte_extent(
+                    &format!("kv.{layer}"),
+                    ByteCurve::linear(kv_page, kv_page, maximum),
+                )?;
+            }
+        }
+        if let Some(draft) = self.drafter {
+            let first = draft
+                .owned
+                .checked_add(draft.scratch)
+                .and_then(|n| n.checked_add(draft.pool_unit))
+                .ok_or(Refusal::Overflow("draft first page"))?;
+            contract.set_byte_extent(
+                "deferred.drafter",
+                ByteCurve::linear(first, draft.pool_unit, maximum),
+            )?;
+        }
+        Ok(contract)
     }
-    fn evaluate(
-        &self,
-        _request: &Request,
-        _decisions: &Decisions,
-        pool: u64,
-    ) -> Result<Facts, Refusal> {
+}
+
+impl DenseFacts<'_> {
+    /// Construct physical owners and typed views once; only their declared
+    /// page-dependent extents are changed when the winning plan is materialized.
+    fn owner_templates(&self, pool: u64) -> Result<Facts, Refusal> {
         let mut allocations = Vec::new();
         let mut add = |id: String, location, bytes, lifetime, category, group: &str| {
             if bytes > 0 {

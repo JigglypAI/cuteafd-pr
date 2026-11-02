@@ -201,6 +201,7 @@ pub struct Decisions {
     pub attention: Vec<LayerMode>,
     pub onboard_layers: Vec<Vec<usize>>,
     pub prefill: PrefillShape,
+    pub lanes: u64,
 }
 impl Decisions {
     fn onboard(&self) -> u64 {
@@ -219,18 +220,18 @@ pub struct Facts {
     pub allowances: Vec<Allowance>,
 }
 
-/// Implementations supply exact costs at the selected mode, rows and pool.
-/// They must not change decisions or apply private fit/fallback policy.
+mod contract;
+mod search;
+pub use contract::{
+    Activation, ByteCurve, BytePiece, Choice, Component, ComponentKind, Contract, Requires,
+    Variable,
+};
+pub use search::solve;
+
+/// Prepare immutable geometry/cost terms once. A family unable to describe its
+/// demand with finite piecewise curves refuses preparation, never searches it.
 pub trait Recipe {
-    fn page_rows(&self) -> u64;
-    fn maximum_pool(&self) -> u64;
-    fn candidates(&self) -> Vec<Decisions>;
-    fn evaluate(
-        &self,
-        request: &Request,
-        decisions: &Decisions,
-        pool: u64,
-    ) -> Result<Facts, Refusal>;
+    fn prepare(&self, request: &Request) -> Result<Contract, Refusal>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,152 +443,6 @@ pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, R
         }
     }
     Ok(rows)
-}
-
-pub fn solve(
-    request: Request,
-    budgets: Vec<Budget>,
-    recipe: &impl Recipe,
-) -> Result<ResolvedPlan, Refusal> {
-    let page = recipe.page_rows();
-    if page == 0 || request.context == 0 {
-        return Err(Refusal::InvalidFact("zero page/context".into()));
-    }
-    if let Pin::Exact(tokens) = request.pool {
-        if tokens % page != 0 {
-            return Err(Refusal::MisalignedPool {
-                tokens,
-                page_rows: page,
-            });
-        }
-        if tokens < request.context {
-            return Err(Refusal::PoolBelowContext {
-                tokens,
-                context: request.context,
-            });
-        }
-    }
-    let minimum = request.context.div_ceil(page);
-    let ceiling = recipe.maximum_pool() / page;
-    if matches!(request.prefill, Pin::Exact(shape) if shape.rows == 0 || shape.waves == 0) {
-        return Err(Refusal::InvalidPin("zero prefill shape"));
-    }
-    let small = budgets
-        .iter()
-        .filter(|b| {
-            b.locations
-                .iter()
-                .any(|l| matches!(l.device, Device::Coordinator(_)))
-        })
-        .any(|b| b.physical_bytes <= 34 << 30);
-    let target = (if small { 1u64 << 20 } else { 2u64 << 20 })
-        .max(request.context)
-        .div_ceil(page);
-    let wanted = match request.pool {
-        Pin::Auto => target.min(ceiling),
-        Pin::Exact(tokens) => tokens / page,
-    };
-    let onboarding_target = match request.pool {
-        Pin::Auto => target,
-        Pin::Exact(_) => wanted,
-    };
-    if wanted < minimum || wanted > ceiling {
-        return Err(Refusal::InvalidPin("pool exceeds compiled extent"));
-    }
-    let mut best: Option<ResolvedPlan> = None;
-    let mut last = Refusal::Unsupported;
-    let mut matched = false;
-    for (candidate_index, decisions) in recipe.candidates().into_iter().enumerate() {
-        if matches!(request.prefill, Pin::Exact(shape) if shape != decisions.prefill)
-            || matches!(request.onboard, Pin::Exact(n) if n != decisions.onboard())
-        {
-            continue;
-        }
-        matched = true;
-        if decisions.prefill.rows == 0 || decisions.prefill.waves == 0 {
-            return Err(Refusal::InvalidFact("zero prefill shape".into()));
-        }
-        if decisions.onboard_layers.iter().any(|layers| {
-            let mut onboarded = BTreeSet::new();
-            layers.iter().any(|layer| !onboarded.insert(*layer))
-        }) {
-            return Err(Refusal::InvalidFact("duplicate onboarded layer".into()));
-        }
-        if matches!(request.onboard, Pin::Auto)
-            && decisions.onboard() != 0
-            && wanted < onboarding_target
-        {
-            continue;
-        }
-        let lower = if matches!(request.pool, Pin::Exact(_)) {
-            wanted
-        } else {
-            minimum
-        };
-        for pages in (lower..=wanted).rev() {
-            if matches!(request.onboard, Pin::Auto)
-                && decisions.onboard() != 0
-                && pages < onboarding_target
-            {
-                break;
-            }
-            let pool = pages
-                .checked_mul(page)
-                .ok_or(Refusal::Overflow("pool tokens"))?;
-            let started = std::time::Instant::now();
-            let facts = recipe.evaluate(&request, &decisions, pool);
-            tracing::trace!(target: "cuteafd::planner", candidate_index, pool,
-                recipe_us = started.elapsed().as_micros() as u64,
-                "constructed pool candidate");
-            let facts = match facts {
-                Ok(facts) => facts,
-                Err(error @ Refusal::Capacity { .. }) => {
-                    last = error;
-                    continue;
-                }
-                Err(Refusal::Unsupported) => continue,
-                Err(error) => return Err(error),
-            };
-            let started = std::time::Instant::now();
-            let evaluated = evaluate(&facts, &budgets);
-            tracing::trace!(target: "cuteafd::planner", candidate_index, pool,
-                allocations = facts.allocations.len(), evaluation_us = started.elapsed().as_micros() as u64,
-                fits = evaluated.is_ok(), "evaluated pool candidate");
-            match evaluated {
-                Ok(phases) => {
-                    let candidate = ResolvedPlan {
-                        request: request.clone(),
-                        decisions: decisions.clone(),
-                        pool_tokens: pool,
-                        budgets: budgets.clone(),
-                        facts,
-                        phases,
-                    };
-                    let score = |p: &ResolvedPlan| {
-                        (
-                            p.pool_tokens,
-                            p.decisions.onboard(),
-                            p.phases
-                                .iter()
-                                .map(|row| row.available - row.owned - row.opaque)
-                                .min()
-                                .unwrap_or(0),
-                        )
-                    };
-                    if best
-                        .as_ref()
-                        .is_none_or(|old| score(&candidate) > score(old))
-                    {
-                        best = Some(candidate);
-                    }
-                    break;
-                }
-                Err(error @ Refusal::Capacity { .. }) => last = error,
-                Err(error) => return Err(error),
-            }
-        }
-    }
-    best.ok_or(if matched { last } else { Refusal::PinConflict })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

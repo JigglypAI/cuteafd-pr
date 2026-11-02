@@ -499,7 +499,7 @@ mod tests {
             let facts = Facts { allocations: owners, deferred: vec![], allowances: vec![] };
             let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
                 prefill: Pin::Auto, operation: Operation::Serving }, decisions: Decisions {
-                attention: vec![], onboard_layers: vec![vec![]], prefill: PrefillShape { rows: 4096, waves: 1 } },
+                attention: vec![], onboard_layers: vec![vec![]], prefill: PrefillShape { rows: 4096, waves: 1 }, lanes: 1 },
                 pool_tokens: 64, phases: planner::evaluate(&facts, &budgets)?, budgets, facts };
             let mut startup = Startup { plan, audit, loaded_events: 0, target_events,
                 receipts: vec![target_receipt] };

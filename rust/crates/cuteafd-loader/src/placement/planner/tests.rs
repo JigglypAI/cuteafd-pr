@@ -52,37 +52,58 @@ fn decisions(onboard: u64) -> Decisions {
             rows: 4096,
             waves: 1,
         },
+        lanes: 1,
     }
 }
 struct Linear {
-    candidates: Vec<Decisions>,
+    onboard: u64,
     maximum: u64,
     fixed: u64,
 }
 impl Linear {
     fn new() -> Self {
         Self {
-            candidates: vec![decisions(0)],
+            onboard: 0,
             maximum: 2 << 20,
             fixed: 0,
         }
     }
 }
 impl Recipe for Linear {
-    fn page_rows(&self) -> u64 {
-        64
-    }
-    fn maximum_pool(&self) -> u64 {
-        self.maximum
-    }
-    fn candidates(&self) -> Vec<Decisions> {
-        self.candidates.clone()
-    }
-    fn evaluate(&self, _: &Request, candidate: &Decisions, pool: u64) -> Result<Facts, Refusal> {
-        Ok(facts(vec![allocation(
-            "kv",
-            pool + self.fixed + candidate.onboard() * 64,
-        )]))
+    fn prepare(&self, _: &Request) -> Result<Contract, Refusal> {
+        let maximum = self.maximum / 64;
+        let mut contract = Contract::fixed(
+            64,
+            maximum,
+            1,
+            facts(vec![allocation("kv", 64 + self.fixed)]),
+        );
+        contract.set_byte_extent("kv", ByteCurve::linear(64 + self.fixed, 64, maximum))?;
+        contract.variables = vec![
+            Variable::Attention {
+                layer: 0,
+                values: decisions(0).attention,
+            },
+            Variable::Prefill(vec![decisions(0).prefill]),
+            Variable::Lanes(vec![1]),
+        ];
+        for layer in 0..self.onboard as usize {
+            let variable = contract.variables.len();
+            contract.variables.push(Variable::Onboard {
+                layers: vec![layer],
+                destinations: vec![vec![], vec![0]],
+                mandatory: false,
+            });
+            let mut component = Component::allocation(
+                allocation(&format!("expert.{layer}"), 64),
+                ByteCurve::fixed(64, maximum),
+                false,
+                maximum,
+            );
+            component.activation = Activation::choice(variable, 1);
+            contract.components.push(component);
+        }
+        Ok(contract)
     }
 }
 fn plan(allocations: Vec<Allocation>) -> ResolvedPlan {
@@ -114,6 +135,451 @@ fn errors(result: Result<(), Refusal>) -> Vec<Mismatch> {
         Err(Refusal::Reconciliation(errors)) => errors,
         other => panic!("expected reconciliation refusal: {other:?}"),
     }
+}
+
+struct Prepared(Contract);
+impl Recipe for Prepared {
+    fn prepare(&self, _: &Request) -> Result<Contract, Refusal> {
+        Ok(self.0.clone())
+    }
+}
+
+fn assert_curve_census(contract: &Contract, budgets: &[Budget], selected: &[usize]) {
+    contract.validate().unwrap();
+    let costs = search::Compiled::new(contract, budgets).unwrap();
+    let mut pages = BTreeSet::from([1, contract.maximum_pages]);
+    for component in &contract.components {
+        for piece in &component.bytes.0 {
+            for boundary in [piece.first, piece.last] {
+                for page in boundary.saturating_sub(1)..=boundary.saturating_add(1) {
+                    if page >= 1 && page <= contract.maximum_pages {
+                        pages.insert(page);
+                    }
+                }
+            }
+        }
+    }
+    for pages in pages {
+        let exact = evaluate(&contract.facts(selected, pages).unwrap(), budgets).unwrap();
+        assert_eq!(
+            costs.phases(budgets, selected, pages).unwrap(),
+            exact,
+            "page {pages}"
+        );
+    }
+}
+
+#[test]
+fn piecewise_cost_vectors_match_exact_owners_at_every_breakpoint_neighbor() {
+    let mut contract = Linear {
+        maximum: 64 * 20,
+        fixed: 37,
+        ..Linear::new()
+    }
+    .prepare(&request())
+    .unwrap();
+    let curve = ByteCurve(vec![
+        BytePiece {
+            first: 1,
+            last: 4,
+            bytes_at_first: 0,
+            bytes_per_page: 16,
+        },
+        BytePiece {
+            first: 5,
+            last: 8,
+            bytes_at_first: 96,
+            bytes_per_page: 0,
+        },
+        BytePiece {
+            first: 9,
+            last: 20,
+            bytes_at_first: 128,
+            bytes_per_page: 3,
+        },
+    ]);
+    let mut bounded = Component::allocation(allocation("index", 16), curve.clone(), false, 20);
+    bounded.byte_extent(curve).unwrap();
+    contract.components.push(bounded);
+    let mut backing = allocation("backing", 512);
+    backing.lifetime = Lifetime::RESIDENT;
+    contract.components.push(Component::allocation(
+        backing,
+        ByteCurve::fixed(512, 20),
+        false,
+        20,
+    ));
+    let mut view = allocation("view", 64);
+    view.view = Some(View {
+        backing: "backing".into(),
+        offset: 0,
+    });
+    contract.components.push(Component::allocation(
+        view,
+        ByteCurve::fixed(64, 20),
+        false,
+        20,
+    ));
+    let mut staging = allocation("load.staging", 65);
+    staging.location = Location::PINNED;
+    staging.lifetime = Lifetime {
+        first: Phase::Load,
+        last: Phase::Load,
+    };
+    contract.components.push(Component::allocation(
+        staging,
+        ByteCurve::fixed(65, 20),
+        false,
+        20,
+    ));
+    contract.components.push(Component {
+        activation: Activation::always(),
+        bytes: ByteCurve::linear(2, 1, 20),
+        kind: ComponentKind::Allowance(Allowance {
+            location: Location::HOST,
+            bytes: 2,
+            lifetime: Lifetime::TARGET,
+            source: "test allowance".into(),
+            assumed: true,
+        }),
+    });
+    let mut host = budget(1 << 30);
+    host.id = "host".into();
+    host.locations = vec![Location::HOST, Location::PINNED];
+    assert_curve_census(&contract, &[budget(1 << 30), host], &[0, 0, 0]);
+}
+
+#[test]
+fn analytic_pool_solves_discontinuous_nonmonotone_and_zero_slope_pieces() {
+    let mut contract = Linear {
+        maximum: 64 * 12,
+        ..Linear::new()
+    }
+    .prepare(&request())
+    .unwrap();
+    contract
+        .set_byte_extent(
+            "kv",
+            ByteCurve(vec![
+                BytePiece {
+                    first: 1,
+                    last: 3,
+                    bytes_at_first: 100,
+                    bytes_per_page: 10,
+                },
+                BytePiece {
+                    first: 4,
+                    last: 6,
+                    bytes_at_first: 1000,
+                    bytes_per_page: 0,
+                },
+                BytePiece {
+                    first: 7,
+                    last: 12,
+                    bytes_at_first: 50,
+                    bytes_per_page: 10,
+                },
+            ]),
+        )
+        .unwrap();
+    assert_curve_census(&contract, &[budget(1 << 30)], &[0, 0, 0]);
+    let result = solve(request(), vec![budget(75)], &Prepared(contract.clone())).unwrap();
+    assert_eq!(result.pool_tokens, 9 * 64);
+    assert!(matches!(
+        solve(
+            Request {
+                pool: Pin::Exact(10 * 64),
+                ..request()
+            },
+            vec![budget(75)],
+            &Prepared(contract)
+        ),
+        Err(Refusal::Capacity { .. })
+    ));
+    let mut fixed = Linear {
+        maximum: 1024,
+        ..Linear::new()
+    }
+    .prepare(&request())
+    .unwrap();
+    fixed
+        .set_byte_extent("kv", ByteCurve::fixed(75, 16))
+        .unwrap();
+    assert_eq!(
+        solve(request(), vec![budget(75)], &Prepared(fixed))
+            .unwrap()
+            .pool_tokens,
+        1024
+    );
+}
+
+#[test]
+fn exact_pins_propagate_compatibility_and_fixed_capacity_before_branching() {
+    let mut contract = Linear {
+        maximum: 256,
+        ..Linear::new()
+    }
+    .prepare(&request())
+    .unwrap();
+    contract.variables[0] = Variable::Attention {
+        layer: 0,
+        values: vec![
+            LayerMode::Whole {
+                gpu: 0,
+                ffn: FfnMode::Owner,
+            },
+            LayerMode::Whole {
+                gpu: 0,
+                ffn: FfnMode::Split,
+            },
+        ],
+    };
+    contract.variables[1] = Variable::Prefill(vec![
+        decisions(0).prefill,
+        PrefillShape {
+            rows: 2048,
+            waves: 2,
+        },
+    ]);
+    contract.variables[2] = Variable::Lanes(vec![1, 2]);
+    contract.requires = vec![
+        Requires {
+            when: Choice {
+                variable: 1,
+                option: 1,
+            },
+            any_of: vec![Choice {
+                variable: 2,
+                option: 1,
+            }],
+        },
+        Requires {
+            when: Choice {
+                variable: 2,
+                option: 1,
+            },
+            any_of: vec![Choice {
+                variable: 0,
+                option: 1,
+            }],
+        },
+    ];
+    let mut impossible = Component::allocation(
+        allocation("impossible", 4096),
+        ByteCurve::fixed(4096, 4),
+        false,
+        4,
+    );
+    impossible.activation = Activation::choice(0, 0);
+    contract.components.push(impossible);
+    let result = solve(
+        Request {
+            prefill: Pin::Exact(PrefillShape {
+                rows: 2048,
+                waves: 2,
+            }),
+            ..request()
+        },
+        vec![budget(1024)],
+        &Prepared(contract),
+    )
+    .unwrap();
+    assert_eq!(
+        (result.decisions.prefill.rows, result.decisions.lanes),
+        (2048, 2)
+    );
+    assert!(matches!(
+        result.decisions.attention[0],
+        LayerMode::Whole {
+            ffn: FfnMode::Split,
+            ..
+        }
+    ));
+    assert!(!result
+        .facts
+        .allocations
+        .iter()
+        .any(|a| a.id == "impossible"));
+}
+
+#[test]
+fn analytical_solve_prepares_once_and_matches_exact_small_domain_oracle() {
+    struct Counted<'a>(&'a std::cell::Cell<u64>, Contract);
+    impl Recipe for Counted<'_> {
+        fn prepare(&self, _: &Request) -> Result<Contract, Refusal> {
+            self.0.set(self.0.get() + 1);
+            Ok(self.1.clone())
+        }
+    }
+    let count = std::cell::Cell::new(0);
+    let contract = Linear {
+        maximum: 64 * 8,
+        fixed: 3,
+        ..Linear::new()
+    }
+    .prepare(&request())
+    .unwrap();
+    for available in 60..600 {
+        let result = solve(
+            request(),
+            vec![budget(available)],
+            &Counted(&count, contract.clone()),
+        );
+        let oracle = (1..=8)
+            .filter(|&p| {
+                evaluate(
+                    &contract.facts(&[0, 0, 0], p).unwrap(),
+                    &[budget(available)],
+                )
+                .is_ok()
+            })
+            .max();
+        assert_eq!(
+            result.ok().map(|p| p.pool_tokens / 64),
+            oracle,
+            "budget {available}"
+        );
+    }
+    assert_eq!(count.get(), 540);
+}
+
+#[test]
+fn shared_onboarding_balances_whole_and_tp2_units_and_charges_workspace_once() {
+    let mut contract = Contract::fixed(64, 4, 2, facts(vec![]));
+    contract.variables = vec![
+        Variable::Attention {
+            layer: 0,
+            values: decisions(0).attention,
+        },
+        Variable::Prefill(vec![decisions(0).prefill]),
+        Variable::Lanes(vec![1]),
+    ];
+    for layer in 0..4 {
+        let variable = contract.variables.len();
+        contract.variables.push(Variable::Onboard {
+            layers: vec![layer],
+            destinations: vec![vec![], vec![0], vec![1]],
+            mandatory: false,
+        });
+        for gpu in 0..2 {
+            let mut owner = allocation(&format!("layer.{layer}"), 32);
+            owner.location = Location::coordinator(gpu);
+            let mut term = Component::allocation(owner, ByteCurve::fixed(32, 4), false, 4);
+            term.activation = Activation::choice(variable, gpu as usize + 1);
+            contract.components.push(term);
+        }
+    }
+    for gpu in 0..2 {
+        let mut owner = allocation(&format!("workspace.{gpu}"), 16);
+        owner.location = Location::coordinator(gpu);
+        let mut term = Component::allocation(owner, ByteCurve::fixed(16, 4), false, 4);
+        term.activation = Activation {
+            clauses: (3..7)
+                .map(|variable| {
+                    vec![Choice {
+                        variable,
+                        option: gpu as usize + 1,
+                    }]
+                })
+                .collect(),
+        };
+        contract.components.push(term);
+    }
+    let mut peer = budget(128);
+    peer.id = "peer".into();
+    peer.locations = vec![Location::coordinator(1)];
+    let req = Request {
+        pool: Pin::Exact(256),
+        ..request()
+    };
+    let result = solve(
+        req.clone(),
+        vec![budget(128), peer.clone()],
+        &Prepared(contract.clone()),
+    )
+    .unwrap();
+    assert_eq!(
+        result
+            .decisions
+            .onboard_layers
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>(),
+        vec![2, 2]
+    );
+    assert_eq!(result.decisions.onboard(), 4);
+    assert_eq!(
+        result
+            .facts
+            .allocations
+            .iter()
+            .filter(|a| a.id.starts_with("workspace"))
+            .count(),
+        2
+    );
+    let variables = contract.variables.len();
+    contract.variables.push(Variable::Onboard {
+        layers: vec![4],
+        destinations: vec![vec![0, 1]],
+        mandatory: true,
+    });
+    for gpu in 0..2 {
+        let mut owner = allocation(&format!("tp2.{gpu}"), 32);
+        owner.location = Location::coordinator(gpu);
+        let mut term = Component::allocation(owner, ByteCurve::fixed(32, 4), false, 4);
+        term.activation = Activation::choice(variables, 0);
+        contract.components.push(term);
+    }
+    let result = solve(
+        Request {
+            onboard: Pin::Exact(3),
+            ..req
+        },
+        vec![budget(128), peer],
+        &Prepared(contract),
+    )
+    .unwrap();
+    assert_eq!(result.decisions.onboard(), 3);
+    assert!(result
+        .decisions
+        .onboard_layers
+        .iter()
+        .all(|layers| layers.contains(&4)));
+}
+
+#[test]
+fn malformed_curves_and_unrepresentable_recipes_are_typed_refusals() {
+    let mut contract = Linear {
+        maximum: 256,
+        ..Linear::new()
+    }
+    .prepare(&request())
+    .unwrap();
+    contract
+        .set_byte_extent(
+            "kv",
+            ByteCurve(vec![BytePiece {
+                first: 2,
+                last: 4,
+                bytes_at_first: 1,
+                bytes_per_page: 1,
+            }]),
+        )
+        .unwrap();
+    assert!(matches!(
+        solve(request(), vec![budget(4096)], &Prepared(contract)),
+        Err(Refusal::InvalidFact(_))
+    ));
+    struct Unsupported;
+    impl Recipe for Unsupported {
+        fn prepare(&self, _: &Request) -> Result<Contract, Refusal> {
+            Err(Refusal::Unsupported)
+        }
+    }
+    assert_eq!(
+        solve(request(), vec![budget(4096)], &Unsupported).unwrap_err(),
+        Refusal::Unsupported
+    );
 }
 
 #[test]
@@ -234,7 +700,7 @@ fn automatic_target_uses_physical_card_not_logical_cap() {
 fn pool_first_then_onboarding_and_exact_constraints() {
     let target = 1 << 20;
     let recipe = Linear {
-        candidates: vec![decisions(2), decisions(0), decisions(1)],
+        onboard: 2,
         ..Linear::new()
     };
     let result = solve(request(), vec![budget(target + 64)], &recipe).unwrap();
@@ -295,7 +761,7 @@ fn pool_first_then_onboarding_and_exact_constraints() {
 fn compiled_ceiling_is_not_a_lower_automatic_onboarding_target() {
     let recipe = Linear {
         maximum: 256,
-        candidates: vec![decisions(1), decisions(0)],
+        onboard: 1,
         fixed: 0,
     };
     let result = solve(request(), vec![budget(4096)], &recipe).unwrap();
@@ -306,35 +772,31 @@ fn compiled_ceiling_is_not_a_lower_automatic_onboarding_target() {
 fn per_device_balance_uses_the_tightest_complete_cost() {
     struct Balanced;
     impl Recipe for Balanced {
-        fn page_rows(&self) -> u64 {
-            64
-        }
-        fn maximum_pool(&self) -> u64 {
-            256
-        }
-        fn candidates(&self) -> Vec<Decisions> {
-            [0, 1]
-                .map(|gpu| Decisions {
-                    attention: vec![LayerMode::Whole {
-                        gpu,
-                        ffn: FfnMode::Split,
-                    }],
-                    onboard_layers: vec![vec![], vec![]],
-                    prefill: PrefillShape {
-                        rows: 4096,
-                        waves: 1,
-                    },
-                })
-                .to_vec()
-        }
-        fn evaluate(&self, _: &Request, d: &Decisions, pool: u64) -> Result<Facts, Refusal> {
-            let owner = match d.attention[0] {
-                LayerMode::Whole { gpu, .. } => gpu,
-                _ => unreachable!(),
-            };
-            let mut a = allocation("attention+kv", pool + 192);
-            a.location = Location::coordinator(owner);
-            Ok(facts(vec![a]))
+        fn prepare(&self, _: &Request) -> Result<Contract, Refusal> {
+            let mut contract = Contract::fixed(64, 4, 2, facts(vec![]));
+            contract.variables = vec![
+                Variable::Attention {
+                    layer: 0,
+                    values: [0, 1]
+                        .map(|gpu| LayerMode::Whole {
+                            gpu,
+                            ffn: FfnMode::Split,
+                        })
+                        .to_vec(),
+                },
+                Variable::Prefill(vec![decisions(0).prefill]),
+                Variable::Lanes(vec![1]),
+            ];
+            for gpu in 0..2 {
+                let mut a = allocation("attention+kv", 256);
+                a.location = Location::coordinator(gpu);
+                let mut component =
+                    Component::allocation(a, ByteCurve::linear(256, 64, 4), false, 4);
+                component.byte_extent(ByteCurve::linear(256, 64, 4))?;
+                component.activation = Activation::choice(0, gpu as usize);
+                contract.components.push(component);
+            }
+            Ok(contract)
         }
     }
     let mut peer = budget(512);
