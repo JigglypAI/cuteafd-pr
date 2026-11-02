@@ -2212,14 +2212,12 @@ if ((text_family)); then
   pool="$(get POOL_TOKENS auto)"
   [[ "$pool" == auto ]] || family_args+=(--pool-tokens "$pool")
 fi
-# Muse Spark: RTX expert onboarding (auto or a fixed count; an image without its
+# Muse Spark: RTX expert onboarding (normalized above; an image without its
 # coordinator EXL3 package refuses rather than serving them from the Sparks),
 # the partial-reply cutoff and wide format (the prefill unit shape comes from the
 # deployment plan, as for every units family).
 if [[ $family == muse_spark ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
-  [[ "$local_layers" == auto || "$local_layers" =~ ^[0-9]+$ ]] ||
-    release_die "Muse Spark RTX_EXPERT_LAYERS is auto or a fixed routed-layer count, not $local_layers"
   family_args+=(--rtx-expert-layers "$local_layers")
   [[ -z "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)" ]] || family_args+=(--expert-partial-bf16-max-rows "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)")
   [[ -z "$(get EXPERT_PARTIAL_WIDE_FORMAT)" ]] || family_args+=(--expert-partial-wide-format "$(get EXPERT_PARTIAL_WIDE_FORMAT)")

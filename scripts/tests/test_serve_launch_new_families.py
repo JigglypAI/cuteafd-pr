@@ -566,7 +566,6 @@ def test_muse_dflash2_resolves_one_snapshot_for_plan_and_serve(tmp_path: Path, d
     ("VISION=rtx\n", "bundled media execution is not qualified"),
     ("SPECULATOR=mtp\n", "SPECULATOR=mtp does not apply to muse_spark"),
     ("PREFILL_PACKING=unrestricted\n", "Muse Spark has no packed prefill yet (#923)"),
-    ("RTX_EXPERT_LAYERS=max\n", "Muse Spark RTX_EXPERT_LAYERS is auto or a fixed routed-layer count"),
     ("SPECULATOR=dflash2\nSPECULATOR_MODEL_ID=RadixArk/Muse-Spark-Open-DFlash2\nDRAFT_KV_CACHE=fp16\n",
      "DRAFT_KV_CACHE must be bf16 or fp8"),
 ])
