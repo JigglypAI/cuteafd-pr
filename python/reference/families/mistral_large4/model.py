@@ -370,7 +370,7 @@ def fixed_index_topk(scores, width):
     return shape_invariant.fixed_index_topk(scores, width)
 
 
-def full_indexer(reference, official, linear, layer_norm):
+def full_indexer(official, linear, layer_norm):
     """Keep official full-window DSA score geometry outside fixed-row compute.
 
     Sparse cutoff decisions amplify small score differences. Only stabilize exact
@@ -382,7 +382,7 @@ def full_indexer(reference, official, linear, layer_norm):
         previous = F.linear, torch.nn.LayerNorm.forward
         F.linear, torch.nn.LayerNorm.forward = linear, layer_norm
         try:
-            with stable_ties(reference):
+            with stable_index_selection():
                 return official(self, *args, **kwargs)
         finally:
             F.linear, torch.nn.LayerNorm.forward = previous
@@ -415,6 +415,23 @@ def causal_tiles(official):
 
 
 @contextmanager
+def stable_index_selection():
+    import torch
+    previous = torch.Tensor.topk
+
+    def topk(self, k, dim=-1, largest=True, sorted=True):
+        if dim in (-1, self.ndim - 1) and largest and self.dtype == torch.float32:
+            return fixed_index_topk(self, k)
+        return previous(self, k, dim=dim, largest=largest, sorted=sorted)
+
+    torch.Tensor.topk = topk
+    try:
+        yield
+    finally:
+        torch.Tensor.topk = previous
+
+
+@contextmanager
 def stable_ties(reference):
     """Untiled official indexer and attention; only top-k tie order is fixed.
 
@@ -423,19 +440,11 @@ def stable_ties(reference):
     leaves tie order to the kernel and tensor width).
     """
     import torch
-    original, previous = reference.MistralLarge4TextIndexer.forward, torch.Tensor.topk
-
-    def topk(self, k, dim=-1, largest=True, sorted=True):
-        if dim in (-1, self.ndim - 1) and largest and self.dtype == torch.float32:
-            return fixed_index_topk(self, k)
-        return previous(self, k, dim=dim, largest=largest, sorted=sorted)
+    original = reference.MistralLarge4TextIndexer.forward
 
     def forward(self, *args, **kwargs):
-        torch.Tensor.topk = topk
-        try:
+        with stable_index_selection():
             return original(self, *args, **kwargs)
-        finally:
-            torch.Tensor.topk = previous
     reference.MistralLarge4TextIndexer.forward = forward
     try:
         yield
@@ -507,7 +516,7 @@ def geometry(reference):
     F.linear = shape_invariant.linear
     torch.einsum = shape_invariant.einsum
     reference.eager_attention_forward = causal_tiles(previous[2])
-    reference.MistralLarge4TextIndexer.forward = full_indexer(reference, previous[3], previous[0], previous[6])
+    reference.MistralLarge4TextIndexer.forward = full_indexer(previous[3], previous[0], previous[6])
     reference.MistralLarge4TextExperts.forward = ordered_experts
     reference.MistralLarge4RMSNorm.forward = fixed_rows(previous[5])
     torch.nn.LayerNorm.forward = fixed_rows(previous[6])
