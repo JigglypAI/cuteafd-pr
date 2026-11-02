@@ -188,6 +188,7 @@ constexpr int kMarkovBlocks = 296;
 constexpr int kMarkovThreads = 256;
 constexpr int kMarkovRank = 256;
 constexpr int kMaxSequences = 32;
+constexpr int kSequenceCapacity = 64;
 
 // Lane's share of w2[v] . e (elements 8 * lane .. 8 * lane + 7), warp-summed.
 __device__ __forceinline__ float markov_dot(const bf16* w2, uint32_t v, const float* e, int lane) {
@@ -490,17 +491,23 @@ extern "C" int32_t cuteafd_glmf_dspark_markov_norms(const void* w2, void* norms,
 extern "C" int32_t cuteafd_glmf_dspark_markov(const void* logits, const void* w1, const void* w2, const void* norms,
                                               const void* anchors, void* drafts, void* workspace, int32_t sequences,
                                               int32_t block, int32_t vocab, int32_t rank, void* stream) {
-  if (sequences < 1 || sequences > kMaxSequences || block < 1 || rank != kMarkovRank) return cudaErrorInvalidValue;
+  if (sequences < 1 || sequences > kSequenceCapacity || block < 1 || rank != kMarkovRank) return cudaErrorInvalidValue;
   auto s = static_cast<cudaStream_t>(stream);
   auto* values = static_cast<float*>(workspace);
   auto* indices = reinterpret_cast<uint32_t*>(values + uint64_t(sequences) * kMarkovBlocks);
   auto* top = indices + uint64_t(sequences) * kMarkovBlocks;
   row_argmax_kernel<<<sequences * block, 1024, 0, s>>>(static_cast<const float*>(logits), top, vocab);
   for (int step = 0; step < block; ++step) {
-    markov_partial_kernel<<<kMarkovBlocks, kMarkovThreads, 0, s>>>(
-        static_cast<const float*>(logits), static_cast<const bf16*>(w1), static_cast<const bf16*>(w2),
-        static_cast<const float*>(norms), top, static_cast<const uint32_t*>(anchors),
-        static_cast<const uint32_t*>(drafts), values, indices, sequences, vocab, block, step);
+    // Sequences are independent; preserve the 32-wide kernel's shared/register footprint.
+    for (int first = 0; first < sequences; first += kMaxSequences) {
+      const int count = sequences - first < kMaxSequences ? sequences - first : kMaxSequences;
+      markov_partial_kernel<<<kMarkovBlocks, kMarkovThreads, 0, s>>>(
+          static_cast<const float*>(logits) + uint64_t(first) * block * vocab,
+          static_cast<const bf16*>(w1), static_cast<const bf16*>(w2),
+          static_cast<const float*>(norms), top + first * block, static_cast<const uint32_t*>(anchors) + first,
+          static_cast<const uint32_t*>(drafts) + first * block, values + first * kMarkovBlocks,
+          indices + first * kMarkovBlocks, count, vocab, block, step);
+    }
     markov_final_kernel<<<sequences, 32, 0, s>>>(values, indices, static_cast<uint32_t*>(drafts), kMarkovBlocks,
                                                  block, step);
   }

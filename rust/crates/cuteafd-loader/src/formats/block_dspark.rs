@@ -4,9 +4,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::path::Path;
 
-/// The native Markov kernel owns fixed 32-sequence shared/local arrays.
-/// Larger target concurrency is admitted without allocating or running this drafter.
-pub const MAX_SEQUENCES: usize = 32;
+/// The native Markov kernel tiles independent sequences over fixed 32-sequence arrays.
+pub const MAX_SEQUENCES: usize = cuteafd_core::concurrency::MAX_CONCURRENCY as usize;
 pub const fn supports_sequences(sequences: usize) -> bool {
     sequences > 0 && sequences <= MAX_SEQUENCES
 }
