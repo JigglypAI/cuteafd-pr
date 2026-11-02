@@ -102,10 +102,14 @@ pub struct RunArgs {
     /// Kernel shape to score; Quick uses decode, Standard automatically scores both admitted paths.
     #[arg(long, value_parser = ["decode", "prefill"], default_value = "decode")]
     pub score_path: String,
-    #[arg(long)]
-    pub verify_rows: Option<usize>,
-    #[arg(long, env = "CUTEAFD_API_KEY", hide_env_values = true)]
+    /// Decode scoring widths, in order (for example 1,2,4,8,16).
+    #[arg(long, value_delimiter = ',', value_parser = clap::value_parser!(usize))]
+    pub verify_rows: Vec<usize>,
+    #[arg(long, env = "CUTEAFD_API_KEY", hide_env_values = true, conflicts_with = "api_key_file")]
     pub api_key: Option<String>,
+    /// Read the bearer key from this file, without putting it in argv.
+    #[arg(long, conflicts_with = "api_key")]
+    pub api_key_file: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -162,33 +166,63 @@ fn prepare_dump_dir(args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
-    prepare_dump_dir(args)?;
-    ensure!(matches!(args.tier.as_str(), "quick" | "standard" | "full"), "unknown tier");
-    ensure!(args.tier == "full" || args.score_path == "decode", "Quick and automatic Standard start with decode");
-    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(900)).build();
-    let base = args.url.trim_end_matches('/');
-    let models = get(&agent, &format!("{base}/v1/models"), &args.api_key)?;
-    let served = models["data"][0]["id"].as_str().context("served checkpoint id")?;
-    let status = get(&agent, &format!("{base}/v1/bench/status"), &args.api_key)?;
-    let model = status["checkpoint"].as_str().unwrap_or(served);
-    let mut model_record = models["data"][0].clone();
-    model_record["full_prefill_logits"] = status["full_prefill_logits"].clone();
-    model_record["snapshot"] = status["snapshot"].clone();
-    model_record["settings"] = status["settings"].clone();
-    let mut runs = vec![run_with(args, model, &model_record, |body| {
-        request(&agent, &format!("{base}/v1/bench/probe"), &args.api_key, &body)
-    }, |_, _, _| {})?];
-    if args.tier == "standard" && model_record["full_prefill_logits"] == true {
-        let mut prefill_args = args.clone();
-        prefill_args.score_path = "prefill".into();
-        runs.push(run_with(&prefill_args, model, &model_record, |body| {
-            request(&agent, &format!("{base}/v1/bench/probe"), &args.api_key, &body)
-        }, |_, _, _| {})?);
-        ensure!(runs[0].engine == runs[1].engine && runs[0].settings == runs[1].settings
-            && runs[0].dataset == runs[1].dataset && runs[0].reference_sha256 == runs[1].reference_sha256,
-            "Standard scoring paths use different references or server settings");
+fn api_key(args: &RunArgs) -> Result<Option<String>> {
+    ensure!(args.api_key.is_none() || args.api_key_file.is_none(),
+        "--api-key-file conflicts with --api-key and CUTEAFD_API_KEY");
+    let key = match &args.api_key_file {
+        Some(path) => Some(std::fs::read_to_string(path).context("cannot read --api-key-file")?
+            .trim().to_owned()),
+        None => args.api_key.clone(),
+    };
+    if let Some(key) = &key {
+        ensure!(!key.is_empty() && !key.chars().any(char::is_whitespace)
+            && !key.chars().any(char::is_control), "API key must be non-empty without whitespace or control characters");
+    }
+    Ok(key)
+}
+
+fn validate_widths(args: &RunArgs) -> Result<()> {
+    ensure!(args.verify_rows.iter().all(|&width| width > 0), "--verify-rows widths must be positive");
+    let unique: std::collections::HashSet<_> = args.verify_rows.iter().collect();
+    ensure!(unique.len() == args.verify_rows.len(), "--verify-rows widths must be distinct");
+    ensure!(args.verify_rows.is_empty() || args.score_path == "decode", "--verify-rows requires decode scoring");
+    Ok(())
+}
+
+fn run_series(args: &RunArgs, full_prefill: bool,
+    mut score: impl FnMut(&RunArgs) -> Result<Run>) -> Result<Vec<Run>> {
+    validate_widths(args)?;
+    let widths = if args.verify_rows.is_empty() { vec![None] }
+        else { args.verify_rows.iter().copied().map(Some).collect() };
+    let mut runs = Vec::new();
+    for width in widths {
+        let mut one = args.clone();
+        one.verify_rows = width.into_iter().collect();
+        if args.verify_rows.len() > 1 {
+            if let (Some(root), Some(width)) = (&args.dump_dir, width) {
+                one.dump_dir = Some(root.join(format!("verify-rows-{width}")));
+            }
+        }
+        runs.push(score(&one)?);
+    }
+    if args.tier == "standard" && full_prefill {
+        let mut prefill = args.clone();
+        prefill.score_path = "prefill".into();
+        prefill.verify_rows.clear();
+        runs.push(score(&prefill)?);
+    }
+    for candidate in runs.iter().skip(1) {
+        ensure!(runs[0].engine == candidate.engine && runs[0].settings == candidate.settings
+            && runs[0].dataset == candidate.dataset && runs[0].reference_sha256 == candidate.reference_sha256,
+            "Scoring paths or widths use different references or server settings");
+    }
+    Ok(runs)
+}
+
+fn run_output(args: &RunArgs, runs: &[Run]) -> Value {
+    if args.verify_rows.len() > 1 {
+        return json!({"schema": "cuteafd.fidelity.width-sweep/1", "verify_rows": args.verify_rows,
+            "runs": runs});
     }
     let mut output = if args.tier == "standard" { crate::panels::fidelity::record(&runs[0], None) }
         else { json!(runs[0]) };
@@ -197,7 +231,33 @@ pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
             if key.starts_with("prefill") { output[key] = value.clone(); }
         }
     }
-    std::fs::write(&args.out, serde_json::to_vec_pretty(&output)?)?;
+    output
+}
+
+pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
+    let key = api_key(args)?;
+    // Validate the whole sweep before discovery or the first probe.
+    validate_widths(args)?;
+    prepare_dump_dir(args)?;
+    ensure!(matches!(args.tier.as_str(), "quick" | "standard" | "full"), "unknown tier");
+    ensure!(args.tier == "full" || args.score_path == "decode", "Quick and automatic Standard start with decode");
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(900)).build();
+    let base = args.url.trim_end_matches('/');
+    let models = get(&agent, &format!("{base}/v1/models"), &key)?;
+    let served = models["data"][0]["id"].as_str().context("served checkpoint id")?;
+    let status = get(&agent, &format!("{base}/v1/bench/status"), &key)?;
+    let model = status["checkpoint"].as_str().unwrap_or(served);
+    let mut model_record = models["data"][0].clone();
+    model_record["full_prefill_logits"] = status["full_prefill_logits"].clone();
+    model_record["snapshot"] = status["snapshot"].clone();
+    model_record["settings"] = status["settings"].clone();
+    let runs = run_series(args, model_record["full_prefill_logits"] == true, |one| {
+        run_with(one, model, &model_record, |body| {
+            request(&agent, &format!("{base}/v1/bench/probe"), &key, &body)
+        }, |_, _, _| {})
+    })?;
+    std::fs::write(&args.out, serde_json::to_vec_pretty(&run_output(args, &runs))?)?;
     Ok(runs)
 }
 
@@ -205,6 +265,8 @@ pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
 pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
     mut probe_request: impl FnMut(Value) -> Result<Value>,
     mut progress: impl FnMut(usize, usize, &Run)) -> Result<Run> {
+    validate_widths(args)?;
+    ensure!(args.verify_rows.len() <= 1, "run_with scores one width; use run for a width sweep");
     prepare_dump_dir(args)?;
     ensure!(matches!(args.tier.as_str(), "quick" | "standard" | "full"), "unknown tier");
     ensure!(args.tier != "quick" || args.score_path == "decode", "Quick must be decode-shaped");
@@ -311,7 +373,7 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
                 "reference-only-top1024-plus-tail"
             } else if dataset_identity.is_some() { "qualified-top1024-plus-tail" }
                 else if rows.is_some() { "full-vocabulary" } else { "top32-plus-tail" }.into(),
-            dataset: dataset_identity.clone(), reference_selection: selection.clone(), standard_balance: standard_balance.clone(), verify_rows: args.verify_rows, engine, settings,
+            dataset: dataset_identity.clone(), reference_selection: selection.clone(), standard_balance: standard_balance.clone(), verify_rows: args.verify_rows.first().copied(), engine, settings,
             seconds: started.elapsed().as_secs_f64(), score, floor_top1: reference.expect.top1_min,
             floor_kl: reference.expect.kl_max, precision: Some(precision.clone()), tripwire_expect: reference.expect.tripwires.clone() }
     };
@@ -325,7 +387,7 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
             "score_path": args.score_path});
         if !media_payloads[i].is_empty() { spec["media"] = json!(media_payloads[i]); }
         if args.tier != "quick" || dataset_identity.is_some() { spec["dump_rows"] = json!(dump); }
-        if let Some(width) = args.verify_rows { spec["verify_rows"] = json!(width); }
+        if let Some(width) = args.verify_rows.first() { spec["verify_rows"] = json!(width); }
         let response = probe_request(json!({"body": {"messages": [{"role": "user", "content": "fidelity probe"}], "max_tokens": 1,
                 "temperature": 0}, "spec": spec}))?;
         crate::reference::verify_media_echo(window, &response["probe"])?;
@@ -458,7 +520,118 @@ mod tests {
     }
 
     #[test]
-    fn discovery_sends_api_key_on_models_and_bench_status() {
+    fn discovery_sends_inline_api_key() { discovery_authentication(false); }
+
+    #[test]
+    fn discovery_sends_file_api_key() { discovery_authentication(true); }
+
+    fn fixture_run(args: &RunArgs) -> Run {
+        let report = crate::sample::full_report();
+        let panel = report.panel("fidelity").unwrap().latest().unwrap();
+        let mut run: Run = serde_json::from_value(panel["decode"].clone()).unwrap();
+        run.verify_rows = args.verify_rows.first().copied();
+        run.path_shape = format!("{}-shaped", args.score_path);
+        run.tier = args.tier.clone();
+        run
+    }
+
+    #[test]
+    fn verify_widths_parse_and_validate_before_network() {
+        assert!(parse(&[]).verify_rows.is_empty());
+        assert_eq!(parse(&["--verify-rows", "16"]).verify_rows, [16]);
+        assert_eq!(parse(&["--verify-rows", "1,2,4,8,16"]).verify_rows, [1,2,4,8,16]);
+        for (widths, message) in [("0,1", "positive"), ("1,2,1", "distinct")] {
+            let args = parse(&["--verify-rows", widths, "--url", "http://127.0.0.1:1"]);
+            assert!(run(&args).unwrap_err().to_string().contains(message));
+        }
+        let args = parse(&["--tier", "full", "--score-path", "prefill", "--verify-rows", "1"]);
+        assert!(run(&args).unwrap_err().to_string().contains("requires decode"));
+        for widths in ["", "1,,2", "no", "-1"] {
+            assert!(Cli::try_parse_from(["fidelity", "run", "--arm", "a", "--out", "r", "--verify-rows", widths]).is_err());
+        }
+    }
+
+    #[test]
+    fn sweep_runs_ordered_widths_and_prefill_once_with_disjoint_dumps() {
+        let args = parse(&["--tier", "standard", "--verify-rows", "4,1,16", "--dump-dir", "dumps"]);
+        let mut seen = Vec::new();
+        let runs = run_series(&args, true, |one| {
+            seen.push((one.verify_rows.clone(), one.score_path.clone(), one.dump_dir.clone()));
+            Ok(fixture_run(one))
+        }).unwrap();
+        assert_eq!(seen, vec![
+            (vec![4], "decode".into(), Some(PathBuf::from("dumps/verify-rows-4"))),
+            (vec![1], "decode".into(), Some(PathBuf::from("dumps/verify-rows-1"))),
+            (vec![16], "decode".into(), Some(PathBuf::from("dumps/verify-rows-16"))),
+            (vec![], "prefill".into(), Some(PathBuf::from("dumps"))),
+        ]);
+        let output = run_output(&args, &runs);
+        assert_eq!(output["schema"], "cuteafd.fidelity.width-sweep/1");
+        assert_eq!(output["verify_rows"], json!([4,1,16]));
+        assert_eq!(output["runs"].as_array().unwrap().len(), 4);
+        assert!(output["runs"][3]["verify_rows"].is_null());
+    }
+
+    #[test]
+    fn sweep_stops_on_error_and_rejects_changed_settings() {
+        let args = parse(&["--verify-rows", "1,2,4"]);
+        let mut seen = Vec::new();
+        assert!(run_series(&args, false, |one| {
+            seen.push(one.verify_rows[0]);
+            if one.verify_rows == [2] { bail!("probe failed"); }
+            Ok(fixture_run(one))
+        }).unwrap_err().to_string().contains("probe failed"));
+        assert_eq!(seen, [1,2]);
+        assert!(run_series(&args, false, |one| {
+            let mut run = fixture_run(one);
+            run.settings = json!({"changed": one.verify_rows});
+            Ok(run)
+        }).unwrap_err().to_string().contains("different references or server settings"));
+    }
+
+    #[test]
+    fn legacy_single_width_keeps_output_and_dump_shape() {
+        for widths in [vec![], vec!["--verify-rows", "16"]] {
+            let mut args = parse(&widths);
+            args.dump_dir = Some(PathBuf::from("dumps"));
+            let runs = run_series(&args, false, |one| {
+                assert_eq!(one.dump_dir, args.dump_dir);
+                Ok(fixture_run(one))
+            }).unwrap();
+            assert_eq!(runs.len(), 1);
+            assert_eq!(run_output(&args, &runs), json!(runs[0]));
+            args.tier = "standard".into();
+            let runs = run_series(&args, true, |one| Ok(fixture_run(one))).unwrap();
+            let output = run_output(&args, &runs);
+            assert!(output["decode"].is_object());
+            assert!(output["prefill"].is_object());
+            assert!(output["schema"].is_null());
+        }
+    }
+
+    #[test]
+    fn api_key_file_validates_without_disclosing_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("key");
+        let args = parse(&["--api-key-file", path.to_str().unwrap(), "--url", "http://127.0.0.1:1"]);
+        assert!(run(&args).unwrap_err().to_string().contains("cannot read --api-key-file"));
+        std::fs::write(&path, "  unit-test-key\n").unwrap();
+        assert_eq!(api_key(&args).unwrap().as_deref(), Some("unit-test-key"));
+        for invalid in ["", " \n", "secret key", "secret\0key"] {
+            std::fs::write(&path, invalid).unwrap();
+            let error = run(&args).unwrap_err().to_string();
+            assert!(error.contains("API key must be non-empty"));
+            assert!(!error.contains("secret"));
+        }
+        let mut ambiguous = args.clone();
+        ambiguous.api_key = Some("inline-secret".into());
+        assert!(api_key(&ambiguous).unwrap_err().to_string().contains("conflicts"));
+        assert!(Cli::try_parse_from(["fidelity", "run", "--arm", "a", "--out", "r",
+            "--api-key", "inline-secret", "--api-key-file", "key"]).is_err());
+        assert_eq!(api_key(&parse(&[])).unwrap(), None);
+    }
+
+    fn discovery_authentication(file: bool) {
         use std::io::{BufRead, BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -493,7 +666,11 @@ mod tests {
                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         });
-        let args = parse(&["--url", &url, "--api-key", "unit-test-key"]);
+        let temp = tempfile::tempdir().unwrap();
+        let key_file = temp.path().join("key");
+        std::fs::write(&key_file, "unit-test-key\n").unwrap();
+        let args = if file { parse(&["--url", &url, "--api-key-file", key_file.to_str().unwrap()]) }
+            else { parse(&["--url", &url, "--api-key", "unit-test-key"]) };
         let error = run(&args).unwrap_err();
         server.join().unwrap();
         assert!(error.to_string().contains("no verified published fidelity config for test/model"), "{error:#}");
