@@ -519,10 +519,12 @@ mod tests {
         };
         put("tp6", "libcuteafd_fp8moe.so");
         put("tp6-w352", "libcuteafd_fp8moe.so");
-        assert!(matches!(recipe.validate_installed(root.path(), 0, Slicing::Blocks(32), 384),
+        assert!(matches!(recipe.validate_installed(root.path(), 0, Slicing::Blocks(32), 352),
             Err(InstalledSparkRecipeRefusal::MissingArtifact(_))));
         put("tp6-w320", "libcuteafd_fp8moe.so");
-        assert!(recipe.validate_installed(root.path(), 0, Slicing::Blocks(32), 384).is_ok());
+        assert!(recipe.validate_installed(root.path(), 0, Slicing::Blocks(32), 352).is_ok());
+        assert!(matches!(recipe.validate_installed(root.path(), 0, Slicing::Blocks(32), 384),
+            Err(InstalledSparkRecipeRefusal::WidthMismatch { .. })));
         assert!(recipe.validate_installed(root.path(), 4, Slicing::Blocks(32), 320).is_ok());
         assert!(matches!(recipe.validate_installed(root.path(), 4, Slicing::Blocks(32), 352),
             Err(InstalledSparkRecipeRefusal::WidthMismatch { .. })));
