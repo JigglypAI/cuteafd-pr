@@ -39,8 +39,8 @@ impl<'a> IndexLaneWeights<'a> {
     }
 }
 
-/// One per GPU: only source-20 candidate blocks span the reserve (later hooks
-/// reindex them). Query outputs and selected IDs are guarded unit-cap scratch.
+/// One per GPU: selected IDs and source-20 candidate blocks span the reserve
+/// because later hooks reuse them. Query outputs are guarded unit-cap scratch.
 /// Source/reindex share a selection stream and guard; stream order protects
 /// their plain scratch within a unit, release/acquire protects fork readers
 /// across units. Bindings, phases and pinned metadata stay per slot.
