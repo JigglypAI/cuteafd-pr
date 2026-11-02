@@ -298,21 +298,23 @@ impl Residency {
         let snapshot = &input.snapshot;
         let selected = &input.selected;
         let config = &input.config;
-        ensure!(
-            config["architectures"] == serde_json::json!(["GlmMoeDsaForCausalLM"]),
-            "unsupported architecture"
-        );
-        let hidden = number(&config, "hidden_size")?;
-        let intermediate = number(&config, "moe_intermediate_size")?;
-        let routed = number(&config, "n_routed_experts")?;
+        super::architecture(config)?;
+        let config = config.get("text_config").unwrap_or(config);
+        let hidden = number(config, "hidden_size")?;
+        let intermediate = number(config, "moe_intermediate_size")?;
+        let routed = number(config, "n_routed_experts")?;
+        let layers = number(config, "num_hidden_layers")?
+            .checked_add(config.get("num_nextn_predict_layers")
+                .map(|_| number(config, "num_nextn_predict_layers")).transpose()?.unwrap_or(0))
+            .context("EXLR8 layer extent overflow")?;
         ensure!(
             hidden > 0
                 && hidden % 128 == 0
                 && intermediate > 0
                 && intermediate % 128 == 0
                 && routed > 0
-                && layer >= number(&config, "first_k_dense_replace")?
-                && layer < number(&config, "num_hidden_layers")?,
+                && layer >= number(config, "first_k_dense_replace")?
+                && layer < layers,
             "invalid EXLR8 layer or geometry"
         );
         let units = intermediate / 128;

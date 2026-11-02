@@ -239,7 +239,8 @@ impl DenseRecord {
 
     fn inventory_inner(snapshot: &Path) -> anyhow::Result<Vec<Self>> {
         let config = super::read_json(&snapshot.join("config.json"))?;
-        let layers = number(&config, "num_hidden_layers")?;
+        let config = config.get("text_config").unwrap_or(&config);
+        let layers = number(config, "num_hidden_layers")?;
         let mut records = Vec::new();
         let mut names = BTreeSet::new();
         for path in files(snapshot, "dense")? {
@@ -281,29 +282,9 @@ impl DenseRecord {
                     && rotations.iter().collect::<BTreeSet<_>>().len() == rotations.len(),
                 "invalid dense rotation names"
             );
+            let sources = super::source_names(metadata)?;
             let logical = |stem: &str, weight: bool| {
-                let tail = if weight {
-                    format!("{stem}.weight")
-                } else {
-                    stem.into()
-                };
-                layer.map_or_else(
-                    || {
-                        if stem == "lm_head" {
-                            tail.clone()
-                        } else {
-                            format!("model.{tail}")
-                        }
-                    },
-                    |l| {
-                        format!(
-                            "{}{l}.{tail}",
-                            metadata["tensor_prefix"]
-                                .as_str()
-                                .unwrap_or("model.layers.")
-                        )
-                    },
-                )
+                super::logical_name(metadata, sources.as_ref(), layer, stem, weight)
             };
             let mut claimed = BTreeSet::new();
             for name in entries.keys().filter(|n| n.ends_with(".record")) {
@@ -450,7 +431,7 @@ impl DenseRecord {
                     &[extent.div_ceil(128)],
                 )?;
                 claimed.extend([name.clone(), checksum]);
-                let tensor = logical(stem, true);
+                let tensor = logical(stem, true)?;
                 ensure!(
                     names.insert(tensor.clone()),
                     "duplicate native dense tensor {tensor}"
@@ -484,7 +465,7 @@ impl DenseRecord {
                     !shape.is_empty() && shape.iter().all(|&v| v > 0),
                     "invalid dense plain tensor {name}"
                 );
-                let tensor = logical(name, false);
+                let tensor = logical(name, false)?;
                 ensure!(
                     names.insert(tensor.clone()),
                     "duplicate native dense tensor {tensor}"
