@@ -51,6 +51,14 @@ pub enum Variable {
     },
     Prefill(Vec<PrefillShape>),
     Lanes(Vec<u64>),
+    Embedding(Vec<EmbeddingHome>),
+    /// Fallback rank set for this routed group, after the selected ordered
+    /// onboarding prefixes have claimed their local layers. No per-layer
+    /// optional local home is introduced.
+    ExpertHome {
+        layers: Vec<usize>,
+        rank_sets: Vec<Vec<u8>>,
+    },
     /// One ordered count profile per destination. Count k owns layers[..k];
     /// the order and its exact costs are family facts, not a subset search.
     /// TP2 destinations name both GPUs but count each layer only once.
@@ -66,6 +74,8 @@ impl Variable {
             Self::Attention { values, .. } => values.len(),
             Self::Prefill(values) => values.len(),
             Self::Lanes(values) => values.len(),
+            Self::Embedding(values) => values.len(),
+            Self::ExpertHome { rank_sets, .. } => rank_sets.len(),
             Self::Onboard { counts, .. } => counts.len(),
         }
     }
@@ -356,7 +366,9 @@ impl Contract {
         let mut prefill = None;
         let mut lanes = None;
         let mut onboard_layers = vec![vec![]; self.gpus];
-        let mut homes = BTreeSet::new();
+        let mut expert_homes = BTreeMap::new();
+        let mut remote_homes = BTreeMap::new();
+        let mut embedding = None;
         for (variable, &option) in self.variables.iter().zip(selected) {
             match variable {
                 Variable::Attention { layer, values } => {
@@ -368,10 +380,28 @@ impl Contract {
                 Variable::Lanes(values) => {
                     lanes = Some(values[option]);
                 }
+                Variable::Embedding(values) => {
+                    if embedding.replace(values[option]).is_some() {
+                        return Err(Refusal::InvalidFact("duplicate embedding domain".into()));
+                    }
+                }
+                Variable::ExpertHome { layers, rank_sets } => {
+                    for &layer in layers {
+                        if remote_homes.insert(layer, ExpertDestination::Sparks {
+                            ranks: rank_sets[option].clone(),
+                        }).is_some() {
+                            return Err(Refusal::InvalidFact("overlapping remote expert groups".into()));
+                        }
+                    }
+                }
                 Variable::Onboard { destination, .. } => {
                     let layers = variable.onboard_layers(option);
-                    if layers.iter().any(|&layer| !homes.insert(layer)) {
-                        return Err(Refusal::PinConflict);
+                    for &layer in layers {
+                        if expert_homes.insert(layer, ExpertDestination::Coordinator {
+                            gpus: destination.clone(),
+                        }).is_some() {
+                            return Err(Refusal::PinConflict);
+                        }
                     }
                     for &gpu in destination {
                         onboard_layers[gpu as usize].extend(layers);
@@ -387,13 +417,45 @@ impl Contract {
         for layers in &mut onboard_layers {
             layers.sort_unstable();
         }
+        for (layer, home) in remote_homes {
+            expert_homes.entry(layer).or_insert(home);
+        }
         Ok(Decisions {
             attention: attention.into_values().collect(),
             onboard_layers,
+            expert_homes,
+            embedding,
             prefill: prefill
                 .ok_or_else(|| Refusal::InvalidFact("missing prefill domain".into()))?,
             lanes: lanes.ok_or_else(|| Refusal::InvalidFact("missing lane domain".into()))?,
         })
+    }
+    pub(super) fn validate_home_budgets(&self, budgets: &[Budget]) -> Result<(), Refusal> {
+        let covered = |location| budgets.iter().any(|budget| budget.locations.contains(&location));
+        for variable in &self.variables {
+            match variable {
+                Variable::Embedding(values) => {
+                    if values.iter().any(|home| !covered(home.location())) {
+                        return Err(Refusal::InvalidFact("embedding home has no physical budget".into()));
+                    }
+                }
+                Variable::ExpertHome { rank_sets, .. } => {
+                    if rank_sets.iter().flatten().any(|&rank| !budgets.iter().any(|budget| {
+                        budget.locations.iter().any(|location| location.device == Device::Spark(rank)
+                            && matches!(location.domain, Domain::Device | Domain::Managed))
+                    })) {
+                        return Err(Refusal::InvalidFact("expert rank has no physical budget".into()));
+                    }
+                }
+                Variable::Onboard { destination, .. } => {
+                    if destination.iter().any(|&gpu| !covered(Location::coordinator(gpu))) {
+                        return Err(Refusal::InvalidFact("local expert home has no physical budget".into()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
     pub(super) fn validate(&self) -> Result<(), Refusal> {
         if self.page_rows == 0
@@ -406,7 +468,8 @@ impl Contract {
             ));
         }
         let mut attention = BTreeSet::new();
-        let (mut prefill, mut lanes) = (0, 0);
+        let mut remote_layers = BTreeSet::new();
+        let (mut prefill, mut lanes, mut embedding) = (0, 0, 0);
         for variable in &self.variables {
             if variable.len() == 0 {
                 return Err(Refusal::Unsupported);
@@ -434,6 +497,26 @@ impl Contract {
                         return Err(Refusal::InvalidFact("zero lanes".into()));
                     }
                 }
+                Variable::Embedding(values) => {
+                    embedding += 1;
+                    if values.iter().enumerate().any(|(index, home)| {
+                        values[..index].contains(home)
+                            || matches!(home, EmbeddingHome::Device(gpu) if usize::from(*gpu) >= self.gpus)
+                    }) {
+                        return Err(Refusal::InvalidFact("invalid embedding domain".into()));
+                    }
+                }
+                Variable::ExpertHome { layers, rank_sets } => {
+                    if layers.is_empty()
+                        || layers.iter().any(|&layer| !remote_layers.insert(layer))
+                        || rank_sets.iter().enumerate().any(|(index, ranks)| {
+                            ranks.is_empty() || ranks.windows(2).any(|pair| pair[0] >= pair[1])
+                                || rank_sets[..index].contains(ranks)
+                        })
+                    {
+                        return Err(Refusal::InvalidFact("invalid remote expert domain".into()));
+                    }
+                }
                 Variable::Onboard {
                     layers,
                     destination,
@@ -443,7 +526,7 @@ impl Contract {
                         || layers.iter().collect::<BTreeSet<_>>().len() != layers.len()
                         || destination.is_empty()
                         || destination.iter().any(|&g| usize::from(g) >= self.gpus)
-                        || destination.iter().collect::<BTreeSet<_>>().len() != destination.len()
+                        || destination.windows(2).any(|pair| pair[0] >= pair[1])
                         || counts.iter().any(|&k| k > layers.len())
                         || counts.windows(2).any(|pair| pair[0] >= pair[1])
                     {
@@ -452,9 +535,9 @@ impl Contract {
                 }
             }
         }
-        if prefill != 1 || lanes != 1 {
+        if prefill != 1 || lanes != 1 || embedding > 1 {
             return Err(Refusal::InvalidFact(
-                "prefill/lane domains must be unique".into(),
+                "prefill/lane/embedding domains must be unique".into(),
             ));
         }
         let choice_valid = |c: &Choice| {

@@ -196,10 +196,34 @@ pub struct Allowance {
     pub source: String,
     pub assumed: bool,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EmbeddingHome {
+    Device(u8),
+    HostPinned,
+}
+impl EmbeddingHome {
+    pub fn location(self) -> Location {
+        match self {
+            Self::Device(gpu) => Location::coordinator(gpu),
+            Self::HostPinned => Location::PINNED,
+        }
+    }
+}
+
+/// Routed layers only. Local homes follow an ordered onboarding profile;
+/// remote homes name the actual worker ranks, not an unspecified Spark pool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExpertDestination {
+    Coordinator { gpus: Vec<u8> },
+    Sparks { ranks: Vec<u8> },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Decisions {
     pub attention: Vec<LayerMode>,
     pub onboard_layers: Vec<Vec<usize>>,
+    pub expert_homes: BTreeMap<usize, ExpertDestination>,
+    pub embedding: Option<EmbeddingHome>,
     pub prefill: PrefillShape,
     pub lanes: u64,
 }

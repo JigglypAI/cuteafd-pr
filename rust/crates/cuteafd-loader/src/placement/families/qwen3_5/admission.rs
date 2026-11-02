@@ -309,6 +309,7 @@ impl Recipe for DenseFacts<'_> {
                 waves: 1,
             }]));
         contract.variables.push(Variable::Lanes(vec![1]));
+        contract.variables.push(Variable::Embedding(vec![EmbeddingHome::Device(0)]));
         let kv_page = PAGE_ROWS
             .checked_mul(self.record_bytes)
             .ok_or(Refusal::Overflow("dense KV page"))?;

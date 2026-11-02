@@ -681,6 +681,7 @@ pub fn solve(
     let started = std::time::Instant::now();
     let contract = recipe.prepare(&request)?;
     contract.validate()?;
+    contract.validate_home_budgets(&budgets)?;
     // Validate physical budgets independently of conditional allocation choices.
     validate(
         &Facts {

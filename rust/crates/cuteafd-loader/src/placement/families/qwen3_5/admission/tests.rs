@@ -77,6 +77,8 @@ fn dense_onboarding_all_is_exact_zero_and_positive_pins_are_refused() {
         )
         .unwrap();
         assert!(plan.decisions.onboard_layers.iter().all(Vec::is_empty));
+        assert!(plan.decisions.expert_homes.is_empty());
+        assert_eq!(plan.decisions.embedding, Some(EmbeddingHome::Device(0)));
         if setting == OnboardSetting::All {
             assert_eq!(plan.request.onboard, Pin::Exact(0));
         }

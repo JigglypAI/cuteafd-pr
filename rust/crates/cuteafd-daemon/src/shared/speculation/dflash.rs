@@ -3334,7 +3334,8 @@ mod checkpoint_header_tests {
                     let prefill = PrefillShape { rows: 1, waves: 1 };
                     let plan = ResolvedPlan { request: Request { context: 1, pool: Pin::Exact(64), onboard: Pin::Exact(0),
                             prefill: Pin::Exact(prefill), operation: Operation::Serving },
-                        decisions: Decisions { attention: vec![], onboard_layers: vec![vec![]], prefill, lanes: 1 },
+                        decisions: Decisions { attention: vec![], onboard_layers: vec![vec![]],
+                            expert_homes: Default::default(), embedding: None, prefill, lanes: 1 },
                         pool_tokens: 64, phases: planner::evaluate(&facts, &budgets)?, facts, budgets };
                     let audit = AllocationAudit::start();
                     let draft = DflashDrafter::load(&library, &snapshot, std::fs::read(snapshot.join("model.safetensors"))?,

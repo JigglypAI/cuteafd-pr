@@ -660,6 +660,8 @@ mod tests {
             decisions: Decisions {
                 attention: vec![],
                 onboard_layers: vec![vec![]],
+                expert_homes: Default::default(),
+                embedding: None,
                 prefill: PrefillShape {
                     rows: 4096,
                     waves: 1,
@@ -868,6 +870,8 @@ mod tests {
                 decisions: Decisions {
                     attention: vec![],
                     onboard_layers: vec![vec![]],
+                    expert_homes: Default::default(),
+                    embedding: None,
                     prefill: PrefillShape {
                         rows: 4096,
                         waves: 1,

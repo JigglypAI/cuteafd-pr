@@ -49,6 +49,9 @@ fn decisions(onboard: u64) -> Decisions {
             ffn: FfnMode::Owner,
         }],
         onboard_layers: vec![(0..onboard as usize).collect()],
+        expert_homes: (0..onboard as usize).map(|layer|
+            (layer, ExpertDestination::Coordinator { gpus: vec![0] })).collect(),
+        embedding: None,
         prefill: PrefillShape {
             rows: 4096,
             waves: 1,
@@ -497,6 +500,130 @@ fn add_profile(
         counts,
     });
     variable
+}
+
+fn home_contract() -> (Contract, Vec<Budget>) {
+    let mut contract = profile_contract(4);
+    let remote = contract.variables.len();
+    contract.variables.push(Variable::ExpertHome {
+        layers: vec![3, 4, 5, 6],
+        rank_sets: vec![vec![0, 1], vec![2, 3]],
+    });
+    let local = add_profile(&mut contract, vec![3, 4, 5], vec![0, 1],
+        vec![0, 1, 2, 3], &[0, 32, 64, 96]);
+    for gpu in 0..2 {
+        let mut owner = allocation(&format!("kv.{gpu}"), 16);
+        owner.location = Location::coordinator(gpu);
+        let curve = ByteCurve::linear(16, 16, 4);
+        let mut component = Component::allocation(owner, curve.clone(), false, 4);
+        component.byte_extent(curve).unwrap();
+        contract.components.push(component);
+    }
+    for (option, ranks) in [vec![0, 1], vec![2, 3]].into_iter().enumerate() {
+        for count in 0..=3 {
+            for &rank in &ranks {
+                let mut owner = allocation(&format!("remote.{option}.{count}.{rank}"), (4 - count) * 32);
+                owner.location = Location { device: Device::Spark(rank), domain: Domain::Device };
+                let mut component = Component::allocation(owner.clone(), ByteCurve::fixed(owner.bytes, 4), false, 4);
+                component.activation = Activation { clauses: vec![vec![
+                    Choice { variable: remote, option },
+                    Choice { variable: local, option: count as usize },
+                ]] };
+                contract.components.push(component);
+            }
+        }
+    }
+    let embedding = contract.variables.len();
+    contract.variables.push(Variable::Embedding(vec![EmbeddingHome::Device(0), EmbeddingHome::HostPinned]));
+    for (option, home) in [EmbeddingHome::Device(0), EmbeddingHome::HostPinned].into_iter().enumerate() {
+        let mut owner = allocation(&format!("embedding.{option}"), 64);
+        owner.location = home.location();
+        owner.lifetime = Lifetime::RESIDENT;
+        let mut component = Component::allocation(owner, ByteCurve::fixed(64, 4), false, 4);
+        component.activation = Activation::choice(embedding, option);
+        contract.components.push(component);
+    }
+    let mut budgets = two_gpus(160, 160);
+    for budget in &mut budgets { budget.physical_bytes = 96 << 30; }
+    for rank in 0..4 {
+        let mut b = budget(if rank < 2 { 50 } else { 100 });
+        b.id = format!("spark.{rank}");
+        b.locations = vec![Location { device: Device::Spark(rank), domain: Domain::Device }];
+        budgets.push(b);
+    }
+    let mut host = budget(100);
+    host.id = "host".into();
+    host.locations = vec![Location::PINNED];
+    budgets.push(host);
+    (contract, budgets)
+}
+
+#[test]
+fn embedding_and_remote_rank_domains_share_pool_first_constraints_and_exact_profiles() {
+    let (contract, budgets) = home_contract();
+    let recipe = Prepared(contract.clone());
+    let req = Request { onboard: Pin::Exact(2), ..request() };
+    let resolved = solve(req.clone(), budgets.clone(), &recipe).unwrap();
+    assert_eq!(resolved.pool_tokens, 256);
+    assert_eq!(resolved.decisions.embedding, Some(EmbeddingHome::HostPinned));
+    assert_eq!(resolved.decisions.onboard_layers, vec![vec![3, 4]; 2]);
+    assert_eq!(resolved.decisions.expert_homes, BTreeMap::from([
+        (3, ExpertDestination::Coordinator { gpus: vec![0, 1] }),
+        (4, ExpertDestination::Coordinator { gpus: vec![0, 1] }),
+        (5, ExpertDestination::Sparks { ranks: vec![2, 3] }),
+        (6, ExpertDestination::Sparks { ranks: vec![2, 3] }),
+    ]));
+    assert_eq!(resolved.decisions.onboard(), 2);
+    assert_eq!(resolved.remaining("spark.2", Phase::Ready), Some(36));
+    let automatic = solve(request(), budgets.clone(), &recipe).unwrap();
+    assert_eq!((automatic.pool_tokens, automatic.decisions.onboard()), (256, 3));
+    // Fixing a home is an initial compatibility restriction. An exact pool
+    // refuses rather than silently changing the home or dropping a pool page.
+    let mut restricted = contract.clone();
+    restricted.requires.push(Requires { when: Choice { variable: 5, option: 1 }, any_of: vec![] });
+    assert!(matches!(solve(Request { pool: Pin::Exact(256), ..req.clone() },
+        budgets.clone(), &Prepared(restricted.clone())), Err(Refusal::Capacity { .. })));
+    let smaller = solve(req.clone(), budgets.clone(), &Prepared(restricted)).unwrap();
+    assert_eq!((smaller.pool_tokens, smaller.decisions.onboard()), (128, 2));
+    let mut restricted = contract.clone();
+    restricted.requires.push(Requires { when: Choice { variable: 3, option: 1 }, any_of: vec![] });
+    assert!(matches!(solve(req, budgets.clone(), &Prepared(restricted)), Err(Refusal::Capacity { .. })));
+    // Resolved local homes override remote fallback independent of variable order.
+    let mut reversed = contract.clone();
+    reversed.variables.swap(3, 4);
+    let selected = [0, 0, 0, 1, 2, 1];
+    let reordered = [0, 0, 0, 2, 1, 1];
+    assert_eq!(contract.decisions(&selected).unwrap(), reversed.decisions(&reordered).unwrap());
+    let encoded = serde_json::to_string(&resolved.decisions).unwrap();
+    assert_eq!(serde_json::from_str::<Decisions>(&encoded).unwrap(), resolved.decisions);
+}
+
+#[test]
+fn home_domains_refuse_duplicate_destinations_and_unbudgeted_physical_locations() {
+    let (contract, budgets) = home_contract();
+    for malformed in 0..11 {
+        let mut bad = contract.clone();
+        match malformed {
+            0 => bad.variables[3] = Variable::ExpertHome { layers: vec![3, 3], rank_sets: vec![vec![0]] },
+            1 => bad.variables[3] = Variable::ExpertHome { layers: vec![3], rank_sets: vec![vec![]] },
+            2 => bad.variables[3] = Variable::ExpertHome { layers: vec![3], rank_sets: vec![vec![1, 0]] },
+            3 => bad.variables[3] = Variable::ExpertHome { layers: vec![3], rank_sets: vec![vec![0], vec![0]] },
+            4 => bad.variables[5] = Variable::Embedding(vec![EmbeddingHome::Device(2)]),
+            5 => bad.variables[5] = Variable::Embedding(vec![EmbeddingHome::HostPinned, EmbeddingHome::HostPinned]),
+            6 => bad.variables.push(Variable::Embedding(vec![EmbeddingHome::Device(0)])),
+            7 => bad.variables.push(Variable::ExpertHome { layers: vec![6], rank_sets: vec![vec![0]] }),
+            8 => bad.variables[4] = Variable::Onboard { layers: vec![3], destination: vec![1, 0], counts: vec![1] },
+            9 => bad.variables[3] = Variable::ExpertHome { layers: vec![3], rank_sets: vec![vec![0, 0]] },
+            10 => bad.variables[4] = Variable::Onboard { layers: vec![3], destination: vec![0, 0], counts: vec![1] },
+            _ => unreachable!(),
+        }
+        assert!(matches!(bad.validate(), Err(Refusal::InvalidFact(_))), "case {malformed}");
+    }
+    for missing in ["host", "spark.3", "peer"] {
+        let mut bad = budgets.clone();
+        bad.retain(|b| b.id != missing);
+        assert!(matches!(solve(request(), bad, &Prepared(contract.clone())), Err(Refusal::InvalidFact(_))));
+    }
 }
 
 #[test]

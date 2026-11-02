@@ -1395,6 +1395,7 @@ mod tests {
                     let plan = ResolvedPlan { request: Request { context: 256, pool: Pin::Exact(512),
                         onboard: Pin::Auto, prefill: Pin::Auto, operation: Operation::Serving },
                         decisions: Decisions { attention: vec![], onboard_layers: vec![vec![]],
+                            expert_homes: Default::default(), embedding: None,
                             prefill: PrefillShape { rows: 4096, waves: 1 }, lanes: 1 }, pool_tokens: 512,
                         phases: planner::evaluate(&facts, &budgets)?, facts, budgets };
                     let mut live = std::collections::BTreeMap::new();
