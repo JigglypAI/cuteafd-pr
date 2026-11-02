@@ -25,6 +25,8 @@ extern "C" uint64_t cuteafd_glmf_dspark_markov_workspace(int32_t sequences, int3
   return uint64_t(sequences) * 296 * 8 + uint64_t(sequences) * block * 4;
 }
 
+// Mirrors native/families/glm5/cuda/glm_dflash.cu:429-430 and :176-177;
+// the CUDA-linked library is not loaded by this CPU-only ownership fixture.
 extern "C" uint64_t cuteafd_glm_dflash_topk_workspace(int32_t rows) {
   return uint64_t(rows) * 64 * 16 * 8;
 }
