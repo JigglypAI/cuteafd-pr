@@ -163,6 +163,8 @@ impl MimoDraftRuntimeLayout {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MimoDraftStorageError {
+    #[error(transparent)]
+    Topk(#[from] crate::formats::dflash::DflashTopkVocabError),
     #[error("unsupported MiMo DFlash storage: {0}")]
     Unsupported(&'static str),
     #[error("MiMo DFlash storage byte count overflow")]
@@ -184,6 +186,7 @@ impl MimoDraftWeightLayout {
         g: MimoDraftGeometry,
         mode: MimoDraftRepresentation,
     ) -> Result<Self, MimoDraftStorageError> {
+        crate::formats::dflash::validate_topk_vocab(g.vocab)?;
         if [
             g.hidden,
             g.intermediate,
@@ -394,6 +397,12 @@ mod tests {
     }
     #[test]
     fn reject_overflow_and_fp8_alignment_but_preserve_bf16_geometry() {
+        for vocab in [15, i32::MAX as u64 + 1] {
+            let mut g = pro();
+            g.vocab = vocab;
+            assert!(matches!(MimoDraftWeightLayout::new(g, MimoDraftRepresentation::Bf16Only),
+                Err(MimoDraftStorageError::Topk(_))));
+        }
         let mut g = pro();
         g.hidden = 6145;
         assert!(MimoDraftWeightLayout::new(g, MimoDraftRepresentation::Fp8Only).is_err());

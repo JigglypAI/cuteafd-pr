@@ -239,7 +239,7 @@ PROFILE_SPARK_NCU_SKIP
 PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
     [[ "$1" != kimi_k3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING
-    [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE PREFILL_BATCH_TOKENS PREFILL_WAVES FULL_PREFILL_LOGITS PREFILL_PACKING
+    [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE RTX_EXPERT_LAYERS PREFILL_BATCH_TOKENS PREFILL_WAVES FULL_PREFILL_LOGITS PREFILL_PACKING
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -1147,6 +1147,7 @@ v41_prefill_waves="$(get PREFILL_WAVES)"
 [[ -z "$KV_POOL_SIZE" ]] || count_args+=(--kv-pool-size "$KV_POOL_SIZE")
 [[ -z "$MEMORY_RESERVATION" ]] || count_args+=(--memory-reservation "$MEMORY_RESERVATION")
 count_args+=(--speculator "$SPECULATOR")
+[[ -z "$dspark_draft_limit" ]] || count_args+=(--dspark-draft-limit "$dspark_draft_limit")
 deployment_peers=()
 for ((rank = 0; rank < RELEASE_AVAILABLE_SPARKS; rank++)); do
   lane_key="SPARK_${rank}_LANE_A"
@@ -2198,6 +2199,12 @@ fi
 # or a fixed count, which admission must then fit.
 if [[ "$family" == step5 ]]; then
   family_args+=(--kv-cache "$step5_kv_cache")
+  # Pool-first EXL3 onboarding uses whole layers on one RTX or TP2 halves on
+  # two. FP8 supports TP2 onboarding; NVFP4 is deprecated. Select auto, all or N.
+  local_layers="$(get RTX_EXPERT_LAYERS auto)"
+  [[ "$local_layers" == auto || "$local_layers" == all || "$local_layers" =~ ^[0-9]+$ ]] ||
+    release_die "Step-5 RTX_EXPERT_LAYERS is auto, all or a fixed routed-layer count, not $local_layers"
+  [[ "$local_layers" == auto ]] || family_args+=(--rtx-expert-layers "$local_layers")
 fi
 if ((text_family)); then
   pool="$(get POOL_TOKENS auto)"
@@ -2227,11 +2234,8 @@ fi
 if [[ $serve == serve-dsv4 || $serve == serve-glm || $serve == serve-mimo ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS)"
   onboard_flag=--rtx-expert-layers
-  fixed_onboard_flag=--local-expert-layers
-  [[ $serve != serve-glm ]] || fixed_onboard_flag=--rtx-expert-layers
   if [[ $serve == serve-mimo ]]; then
     onboard_flag=--onboard
-    fixed_onboard_flag=--onboard
   fi
   case "$(get RTX_EXPERT_PEER off)" in
     on) echo "GPU1 whole-layer expert ranges were replaced by TP2 halves (v3 P4); remove RTX_EXPERT_PEER" >&2; exit 2 ;;
@@ -2240,8 +2244,7 @@ if [[ $serve == serve-dsv4 || $serve == serve-glm || $serve == serve-mimo ]]; th
   esac
   case "$local_layers" in
     "") ;;
-    auto|all) family_args+=("$onboard_flag" "$local_layers") ;;
-    *) family_args+=("$fixed_onboard_flag" "$local_layers") ;;
+    *) family_args+=("$onboard_flag" "$local_layers") ;;
   esac
 fi
 if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 ]]; then

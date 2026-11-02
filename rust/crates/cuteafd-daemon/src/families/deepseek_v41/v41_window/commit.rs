@@ -1,9 +1,24 @@
 //! Queued accepted SWA writes retain their lane's producer and upload storage.
 use super::*;
 
+pub(super) fn staging_bytes(rows: usize) -> usize {
+    (rows + cuteafd_core::V41_MAX_REQUESTS) * 8
+}
+
+fn stage_commit(staging: &mut [u8], destinations: &[u64], ends: &[u64]) -> Result<()> {
+    ensure!(!ends.is_empty() && ends.len() <= cuteafd_core::V41_MAX_REQUESTS
+        && ends.len() <= destinations.len(), "invalid window commit request count");
+    let bytes = (destinations.len() + ends.len()) * 8;
+    ensure!(staging.len() >= bytes, "window commit staging too small");
+    for (dst, value) in staging[..bytes].chunks_exact_mut(8).zip(destinations.iter().chain(ends)) {
+        dst.copy_from_slice(&value.to_ne_bytes());
+    }
+    Ok(())
+}
+
 pub(super) struct WriteReservation {
-    flags: std::rc::Rc<std::cell::Cell<u16>>,
-    mask: u16,
+    flags: std::rc::Rc<std::cell::Cell<u64>>,
+    mask: u64,
 }
 impl Drop for WriteReservation {
     fn drop(&mut self) { self.flags.set(self.flags.get() & !self.mask); }
@@ -88,15 +103,9 @@ impl<'a> WindowWave<'_, 'a> {
             }
             ends.push(c.position + n as u64);
         }
-        let staging = self.commit_host().bytes_mut();
-        for (i, d) in destinations.iter().enumerate() {
-            staging[i * 8..i * 8 + 8].copy_from_slice(&d.to_ne_bytes());
-        }
-        for (i, end) in ends.iter().enumerate() {
-            staging[p.rows * 8 + i * 8..p.rows * 8 + i * 8 + 8].copy_from_slice(&end.to_ne_bytes());
-        }
+        stage_commit(self.commit_host().bytes_mut(), &destinations, &ends)?;
 
-        let mask = p.chunks.iter().fold(0u16, |mask, c| mask | (1 << c.lease.slot));
+        let mask = p.chunks.iter().fold(0u64, |mask, c| mask | (1 << c.lease.slot));
         ensure!(state.writing.get() & mask == 0, "window slot is being committed");
         state.writing.set(state.writing.get() | mask);
         let batched = external.map(|_| {
@@ -244,6 +253,30 @@ impl<'a> WindowWave<'_, 'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn commit_staging_covers_c64_and_refuses_old_arena() -> Result<()> {
+        for count in [1, 16, 33, 64] {
+            for rows in [count, 2752] {
+                let destinations: Vec<_> = (0..rows as u64).collect();
+                let ends: Vec<_> = (0..count).map(|slot| 1000 + slot as u64).collect();
+                let capacity = staging_bytes(rows);
+                let mut bytes = vec![0xa5; capacity + 16];
+                stage_commit(&mut bytes[..capacity], &destinations, &ends)?;
+                let expected: Vec<_> = destinations.iter().chain(&ends).flat_map(|n| n.to_ne_bytes()).collect();
+                assert_eq!(&bytes[..expected.len()], &expected);
+                assert!(bytes[expected.len()..].iter().all(|&b| b == 0xa5));
+                let mut short = vec![0xa5; expected.len() - 1];
+                assert!(stage_commit(&mut short, &destinations, &ends).is_err());
+                assert!(short.iter().all(|&b| b == 0xa5));
+            }
+        }
+        assert_eq!(staging_bytes(2752), 22528);
+        let mut old = vec![0xa5; 22144];
+        assert!(stage_commit(&mut old, &vec![0; 2752], &vec![0; 17]).is_err());
+        assert!(old.iter().all(|&b| b == 0xa5));
+        assert!(stage_commit(&mut vec![0; staging_bytes(65)], &vec![0; 65], &vec![0; 65]).is_err());
+        Ok(())
+    }
     #[test]
     fn write_reservations_release_only_their_slots() {
         let flags = std::rc::Rc::new(std::cell::Cell::new(0b1010));

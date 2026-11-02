@@ -112,6 +112,29 @@ def fc2_n_splits(role: str, capacity: int, width: int, hidden: int) -> int:
     return 2 if role in ("spark", "rtx_tp2") and capacity == 1 and width == 128 and hidden % 256 == 0 else 1
 
 
+from mxfp4_layouts import native_export_capacities
+
+
+def write_manifest(output, manifest, artifacts):
+    """Finalize owned headers before attesting only this export's outputs."""
+    artifacts = list(artifacts)
+    role, family = manifest["role"], manifest["family"]
+    if not manifest["experimental"]:
+        alias = {"rtx_tp2": "v41_tp2_expert_variants.h",
+                 "rtx_backbone": "v41_local_expert_variants.h",
+                 "dspark_tp2": "v41_dspark_tp2_expert_variants.h"}.get(role)
+        if family != "v41" or role.startswith(("spark_tp", "spark_w")):
+            alias = f"{family}_{role}_expert_variants.h"
+        if alias is not None:
+            (output / alias).write_bytes((output / "v41_expert_variants.h").read_bytes())
+            artifacts.append(alias)
+    manifest["artifact_sha256"] = {
+        name: hashlib.sha256((output / name).read_bytes()).hexdigest()
+        for name in sorted(artifacts)
+    }
+    (output / "v41_experts.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+
 def export(output, capacities, width, atomic_min_capacity=None, role="spark", *, standard_names=False, compact_max_capacity=None, compact_live_rows=None, family="v41"):
     import torch
     import cutlass
@@ -177,9 +200,11 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         compact_live_rows=compact_live_rows,
         geometry=dict(experts=experts, hidden=hidden, intermediate=intermediate,
                       kernel_intermediate=kernel_intermediate, topk=topk),
+        decode_capacities=[n for n in capacities if n <= max(native_export_capacities(family, role)[1])],
         variants=[],
     )
     includes, entries, reductions = [], [], []
+    artifacts = ["v41_expert_variants.h"]
     group_rows = slice_group_rows(_pinned_sparkinfer.SOURCE)
     for capacity in capacities:
         stream_prefill = (standard_names and role not in ("coordinator", "dspark_tp2")
@@ -278,6 +303,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             current_cuda_stream(),
         )
         compiled.export_to_c(str(output), label, "cuteafd_" + label)
+        artifacts.extend((f"{label}.h", f"{label}.o"))
         header = (output / f"{label}.h").read_text()
         symbol = re.findall(
             r"void (_mlir_\w+)\(void \*\*args, int32_t num_args\);", header
@@ -475,14 +501,9 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
     if family == "v41":
         # Other families receive rows the coordinator already quantized.
         export_input_quantizer(output, manifest)
-    # Sorted: directory order is filesystem-specific and made two hosts'
-    # otherwise identical manifests differ (#127).
-    manifest["artifact_sha256"] = {
-        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in sorted(output.iterdir())
-        if path.suffix in (".h", ".o")
-    }
-    (output / "v41_experts.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        artifacts.extend(("v41_expert_input_quant.h", "v41_expert_input_quant.o",
+                          "v41_input_quant_dispatch.h"))
+    write_manifest(output, manifest, artifacts)
 
 
 if __name__ == "__main__":

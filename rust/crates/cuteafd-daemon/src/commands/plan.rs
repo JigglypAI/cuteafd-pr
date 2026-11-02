@@ -75,7 +75,6 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 host_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Host),
                 device_sampling: args.token_select == crate::shared::token_io::SelectPlacement::Device,
                 force_gpu_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Gpu),
-                local_expert_layers: args.local_expert_layers,
                 onboard: args.rtx_expert_layers,
                 exchange_f32: args.exchange_f32,
                 context_tokens: args.context_tokens,
@@ -85,6 +84,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 prefill_lanes: args.prefill_waves,
                 prefill_waves: args.prefill_waves.max(1),
                 exlr8_prefill_activations: args.exlr8_prefill_activations.unwrap_or_default(),
+                exlr8_prefill_pin: args.exlr8_prefill_activations,
                 prefill_span_rows: (args.prefill_span_rows > 0).then_some(args.prefill_span_rows),
                 glmf_decode_rows: args.decode_rows,
                 glmf_representation: cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation {
@@ -97,6 +97,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glmf_pool_marks: args.prefix_marks == crate::families::glm5_flash::prefix::PrefixMarks::Pool,
                 glmf_shared_replay: args.replay_records == crate::families::glm5_flash::engine::ReplayRecords::Shared,
                 concurrency: args.concurrency,
+                dspark_draft_limit: args.dspark_draft_limit.unwrap_or(5),
                 state_slots: args.state_slots,
                 glmf_mark_lanes: args.mark_lanes,
                 prefix_slots: args.prefix_slots,
@@ -142,6 +143,16 @@ fn v41_layout(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, args: &P
         else if args.prefill_rows <= 256 { 256 }
         else if args.prefill_rows <= 1024 { 1024 }
         else { 4096 };
+}
+
+fn v41_draft_limit(args: &PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<u8> {
+    let limit = args.dspark_draft_limit.map(Ok).unwrap_or_else(|| {
+        cfg.get("DSPARK_DRAFT_LIMIT").filter(|limit| !limit.is_empty())
+            .map(|limit| limit.parse::<u8>().context("DSPARK_DRAFT_LIMIT must be in 1..7"))
+            .unwrap_or(Ok(5))
+    })?;
+    anyhow::ensure!((1..=7).contains(&limit), "DSPARK_DRAFT_LIMIT must be in 1..7");
+    Ok(limit)
 }
 
 fn validate_glmf_precision(args: &PlanArgs, family: &str) -> Result<(), PlanError> {
@@ -281,6 +292,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             || config.get("architectures").and_then(serde_json::Value::as_array)
                 .is_some_and(|arches| arches.iter().any(|arch| arch == "DeepseekV41ForCausalLM"));
         if v41 { v41_layout(layout, &args); }
+        if v41 { layout.dspark_draft_limit = v41_draft_limit(&args, &cfg)?; }
     }
     if args.files || args.fetch || args.role.is_some() {
         use cuteafd_loader::plan::files::{manifest_roles, ReadRole};
@@ -789,8 +801,11 @@ mod tests {
             let mut argv = vec!["cuteafd", "plan", "model", "--layout"];
             argv.extend_from_slice(extra);
             crate::cli::Cli::try_parse_from(argv).map(|cli| match cli.command {
-                crate::cli::Commands::Plan(args) => options(&args).map(|o| (args.exlr8_prefill_activations,
-                    o.layout.unwrap().exlr8_prefill_activations)),
+                crate::cli::Commands::Plan(args) => options(&args).map(|o| {
+                    let layout = o.layout.unwrap();
+                    assert_eq!(layout.exlr8_prefill_pin, args.exlr8_prefill_activations);
+                    (layout.exlr8_prefill_pin, layout.exlr8_prefill_activations)
+                }),
                 _ => panic!("expected plan command"),
             })
         };
@@ -864,6 +879,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn v41_configured_draft_limit_matches_serving_width() {
+        let mut request = args(std::path::Path::new("/not-read"), 3, false);
+        for (configured, expected) in [(None, 5), (Some(""), 5), (Some("5"), 5), (Some("6"), 6), (Some("7"), 7)] {
+            let cfg = configured.map(|value| [("DSPARK_DRAFT_LIMIT".into(), value.into())].into()).unwrap_or_default();
+            assert_eq!(v41_draft_limit(&request, &cfg).unwrap(), expected);
+        }
+        for value in ["0", "8", "invalid"] {
+            let cfg = [("DSPARK_DRAFT_LIMIT".into(), value.into())].into();
+            assert!(v41_draft_limit(&request, &cfg).is_err());
+            request.dspark_draft_limit = Some(7);
+            assert_eq!(v41_draft_limit(&request, &cfg).unwrap(), 7);
+            request.dspark_draft_limit = None;
+        }
+        request.dspark_draft_limit = Some(7);
+        assert_eq!(options(&request).unwrap().layout.unwrap().dspark_draft_limit, 7);
+    }
+
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
             draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
@@ -902,7 +935,6 @@ mod tests {
             kda_state: crate::families::glm5_flash::engine::KdaState::F32,
             fp8_head: true, target_head: None, draft_head: crate::shared::speculation::dflash::DraftHead::Exact,
             drafter_gib: 0.0,
-            local_expert_layers: None,
             rtx_expert_layers: None,
             deprecated_peer_expert_ranges: false,
             exchange_f32: false,
@@ -917,6 +949,7 @@ mod tests {
             graph_budget_mib: None,
             replay_records: crate::families::glm5_flash::engine::ReplayRecords::Own,
             concurrency: 8,
+            dspark_draft_limit: None,
             state_slots: None,
             mark_lanes: None,
             prefix_slots: None,

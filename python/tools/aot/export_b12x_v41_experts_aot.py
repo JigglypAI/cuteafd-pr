@@ -12,6 +12,7 @@ import hashlib
 from pathlib import Path
 
 import _pinned_sparkinfer
+from v41_capacities import TARGET_CAPACITIES, DRAFT_CAPACITIES
 
 
 def export_input_quantizer(output_dir: Path, manifest: dict) -> None:
@@ -79,11 +80,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--role", choices=("spark", "spark_tp2", "spark_tp3", "spark_tp6", "spark_tp8", "coordinator"), required=True)
-    parser.add_argument("--rows", default="1,16,80,256,1024,4096")
+    parser.add_argument("--rows", default=None)
     parser.add_argument("--input-format", choices=("bf16", "fp8_k32"))
     parser.add_argument("--compact-live-rows", type=int, help="Experimental Spark live-row compact cutoff")
     args = parser.parse_args()
-    rows = tuple(int(value) for value in args.rows.split(","))
+    rows = tuple(int(value) for value in args.rows.split(",")) if args.rows else (DRAFT_CAPACITIES if args.role == "coordinator" else TARGET_CAPACITIES)
     if (
         not rows
         or len(set(rows)) != len(rows)

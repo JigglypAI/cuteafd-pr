@@ -142,8 +142,8 @@ impl EngramBatchStaging {
         priority: ReadPriority) -> Result<PreparedEngram> {
         self.ready = None;
         ensure!(
-            !batches.is_empty() && batches.len() <= 16,
-            "engram wave requires 1..16 request batches"
+            !batches.is_empty() && batches.len() <= cuteafd_core::V41_MAX_REQUESTS,
+            "engram wave requires 1..={} request batches", cuteafd_core::V41_MAX_REQUESTS
         );
         let expected_rows = *ENGRAM_ROWS
             .get(layer_index)
@@ -318,6 +318,62 @@ impl EngramBatchStaging {
 mod tests {
     use super::*;
     use std::os::unix::fs::FileExt;
+
+    #[test]
+    fn staging_and_gather_jobs_cover_c33_c64_without_relaxing_row_capacity() -> Result<()> {
+        use std::sync::Arc;
+        let history = cuteafd_core::EngramHistory::new(0)?;
+        // Repeated text and image rows check member order as well as duplicate lookup reuse.
+        let batches: Vec<_> = (0..65).map(|i| history.prepare(0,
+            &[if i % 3 == 0 { None } else { Some((i % 7) as u32) }], 1).map(Arc::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        let weights = tempfile::NamedTempFile::new()?;
+        let scales = tempfile::NamedTempFile::new()?;
+        weights.as_file().set_len(ENGRAM_ROWS[0] * 256)?;
+        scales.as_file().set_len(ENGRAM_ROWS[0] * 8)?;
+        for batch in &batches {
+            for hashes in batch.hashes() {
+                for &address in &hashes[0] {
+                    weights.as_file().write_all_at(&vec![(address % 251) as u8; 256], address * 256)?;
+                    scales.as_file().write_all_at(&vec![(address % 127) as u8; 8], address * 8)?;
+                }
+            }
+        }
+        let map = |file: &tempfile::NamedTempFile, width| {
+            // SAFETY: the test retains immutable sparse files for every gather.
+            unsafe { crate::MappedTable::single(file.path(), 0, ENGRAM_ROWS[0],
+                crate::RowFormat::of(cuteafd_core::DType::U8, width)?) }
+        };
+        let table = Arc::new(EngramTable::new(map(&weights, 256)?, map(&scales, 8)?)?);
+        let mut packed = EngramBatchStaging::new(64)?;
+        let mut singleton = EngramBatchStaging::new(1)?;
+        for count in [33, 64] {
+            let refs: Vec<_> = batches[..count].iter().map(Arc::as_ref).collect();
+            let view = packed.gather(&table, &refs, 0)?;
+            assert_eq!(view.rows, count);
+            for (i, batch) in refs.iter().enumerate() {
+                let expected = singleton.gather(&table, &[*batch], 0)?;
+                assert_eq!(&view.weights[i * 24 * 256..(i + 1) * 24 * 256], expected.weights);
+                assert_eq!(&view.scales[i * 24 * 8..(i + 1) * 24 * 8], expected.scales);
+                assert_eq!(view.text_mask[i], expected.text_mask[0]);
+            }
+            // Exercise the gatherer's own synchronous validation before worker admission.
+            let gatherer = crate::EngramGatherer::new(1, 64, EngramBatchStaging::storage_bytes(64)?)?;
+            let mut ticket = gatherer.try_submit(table.clone(), &batches[..count], 0)?.expect("free staging slot");
+            ticket.cancel();
+        }
+        let gatherer = crate::EngramGatherer::new(1, 64, EngramBatchStaging::storage_bytes(64)?)?;
+        let refs: Vec<_> = batches.iter().map(Arc::as_ref).collect();
+        assert!(packed.gather(&table, &refs, 0).is_err());
+        assert!(gatherer.try_submit(table.clone(), &batches, 0).is_err());
+        // A legal member count still cannot overflow the separately admitted row count.
+        let two = Arc::new(history.prepare(0, &[Some(7), Some(8)], 2)?);
+        let wide = vec![two; 33];
+        let refs: Vec<_> = wide.iter().map(Arc::as_ref).collect();
+        assert!(packed.gather(&table, &refs, 0).is_err());
+        assert!(gatherer.try_submit(table, &wide, 0).is_err());
+        Ok(())
+    }
 
     #[test]
     fn engram_worker_bound_covers_row_scaled_and_fixed_backend_scratch() -> Result<()> {

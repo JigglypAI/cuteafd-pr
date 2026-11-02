@@ -1,5 +1,7 @@
 {
   "schema": 1,
+  "decode_capacities": [1, 16, 80],
+  "prefill_capacities": [256, 1024, 4096],
   "stream_prefill": [
     {
       "sm": 120,
@@ -23,9 +25,24 @@
       "hidden": 5120,
       "width": 384,
       "sm": 121,
-      "capacities": [1, 16, 80],
-      "slices": [128, 128, 128],
-      "fc1_k_splits": [2, 2, 2],
+      "capacities": [
+        1,
+        16,
+        64,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128,
+        128
+      ],
+      "fc1_k_splits": [
+        2,
+        2,
+        2,
+        2
+      ],
       "source": "PR217 GB10 legacy192/split1 to legacy128/split2: 1.36/1.29/1.28x; TP6 standard-v2 fidelity passed; PR219 ordered STREAM prefill"
     },
     {
@@ -35,9 +52,11 @@
       "capacities": [
         1,
         16,
+        64,
         80
       ],
       "slices": [
+        128,
         128,
         128,
         128
@@ -51,9 +70,11 @@
       "capacities": [
         1,
         16,
+        64,
         80
       ],
       "slices": [
+        128,
         128,
         128,
         128
@@ -67,9 +88,11 @@
       "capacities": [
         1,
         16,
+        64,
         80
       ],
       "slices": [
+        128,
         128,
         128,
         128
@@ -83,9 +106,11 @@
       "capacities": [
         1,
         16,
+        64,
         80
       ],
       "slices": [
+        128,
         128,
         128,
         128
@@ -99,9 +124,11 @@
       "capacities": [
         1,
         16,
+        64,
         80
       ],
       "slices": [
+        128,
         128,
         128,
         128

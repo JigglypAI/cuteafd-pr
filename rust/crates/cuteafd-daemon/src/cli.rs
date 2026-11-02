@@ -373,13 +373,9 @@ pub(crate) struct PlanArgs {
     /// External drafter GiB on the last GPU for --layout (DFlash).
     #[arg(long, default_value_t = 0.0)]
     pub(crate) drafter_gib: f64,
-    /// Routed backbone expert layers resident on RTX (DeepSeek).
-    #[arg(long)]
-    pub(crate) local_expert_layers: Option<usize>,
     /// Families on the shared placement solver (V4): `auto` (pool first),
     /// `all` (every routed-expert layer of the target model) or an exact
-    /// layer count `N` (the KV pool is then the output). Overrides
-    /// --local-expert-layers.
+    /// layer count `N` (the KV pool is then the output).
     #[arg(long, value_parser = |text: &str| text.parse::<cuteafd_loader::placement::OnboardSetting>())]
     pub(crate) rtx_expert_layers: Option<cuteafd_loader::placement::OnboardSetting>,
     /// Removed whole-layer GPU1 placement flag.
@@ -429,6 +425,9 @@ pub(crate) struct PlanArgs {
     /// Concurrent sequences for --layout (0: family serving default; otherwise 8 at <=32 GiB, 16 above).
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=64))]
     pub(crate) concurrency: u64,
+    /// V4.1 proposal limit for --layout (otherwise DSPARK_DRAFT_LIMIT or five).
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=7))]
+    pub(crate) dspark_draft_limit: Option<u8>,
     /// Diagnostic recurrent-state slots for --layout; automatic serving storage equals concurrency.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) state_slots: Option<u64>,

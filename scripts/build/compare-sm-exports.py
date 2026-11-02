@@ -17,6 +17,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import re
 import runpy
 import struct
 import subprocess
@@ -27,6 +28,12 @@ ROOT = Path(os.environ.get("CUTEAFD_SOURCE_ROOT", Path(__file__).resolve().paren
 GEOMETRIES = ("flash", "pro", "flash2", "pro2", "glm", "glm2", "glmf", "glmf2",
               "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "step5", "step52")
 CAPACITIES = "1,16,80,256,1024,4096"
+_spec = importlib.util.spec_from_file_location("v41_capacities", ROOT / "python/tools/lib/v41_capacities.py")
+_v41 = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_v41)
+V41_CAPACITIES = ",".join(map(str, _v41.TARGET_CAPACITIES))
+V41_DRAFT_CAPACITIES = ",".join(map(str, _v41.DRAFT_CAPACITIES))
+V41_PROJECTION_CAPACITIES = ",".join(map(str, _v41.PROJECTION_CAPACITIES))
 # EXL3 packages also carry the prefill wave units (#762): 2048 and 2752 rows.
 EXL3_CAPACITIES = "1,16,80,256,1024,2048,2752,4096"
 # Kimi K3 merges up to three 2752-row wave units, so its packed extents reach
@@ -34,7 +41,8 @@ EXL3_CAPACITIES = "1,16,80,256,1024,2048,2752,4096"
 EXL3_CAPACITIES_KIMIK3 = EXL3_CAPACITIES + ",5504,8256"
 ROUTED_GEOMETRIES = ("mimo", "mimop", "mimof", "glm", "glmf", "qwen4",
                      "glm_nvfp4", "glmf_nvfp4", "qwen4_nvfp4", "glmfdense_nvfp4",
-                     "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4", "glmfdense_nvfp4a4")
+                     "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4", "glmfdense_nvfp4a4",
+                     "step5", "step5_nvfp4", "step5_bf16")
 EXL3_GEOMETRIES = ("dsv4p", "glm", "glmf", "qwen4", "kimik3")
 
 
@@ -47,6 +55,36 @@ def load_file(name, path):
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def dense_geometry_jobs():
+    # Read literal geometry requests without importing CUDA or the exporter.
+    path = ROOT / "python/tools/aot/export_b12x_exlr8_dense_aot.py"
+    wanted = {"NATIVE_TRELLIS_GEOMETRIES", "NATIVE_MXFP8_GEOMETRIES", "TRELLIS_SHAPES", "SCALED_SHAPES"}
+    shapes = {node.targets[0].id: ast.literal_eval(node.value)
+              for node in ast.parse(path.read_text()).body
+              if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+              and node.targets[0].id in wanted}
+    trellis = sorted(set(shapes["NATIVE_TRELLIS_GEOMETRIES"])
+                     - {shape[1:] for shape in shapes["TRELLIS_SHAPES"]})
+    scaled = sorted(set(shapes["NATIVE_MXFP8_GEOMETRIES"])
+                    - {(k, n, side) for _, k, n, encoding, side in shapes["SCALED_SHAPES"]
+                       if encoding == "mxfp8"})
+    cores = [f"trellis_k{k}_n{n}_s{s}{dtype}" for k, n, s in trellis for dtype in ("", "_bf16")]
+    scaled = [f"mxfp8_k{k}_n{n}_s{s}" for k, n, s in scaled]
+    glue = [f"trellis_input_k{k}_{dtype}"
+            for k in sorted({k for k, _, _ in trellis} - {shape[1] for shape in shapes["TRELLIS_SHAPES"]})
+            for dtype in ("f16", "bf16")]
+    glue += [f"trellis_output_n{n}"
+             for n in sorted({n for _, n, _ in trellis} - {shape[2] for shape in shapes["TRELLIS_SHAPES"]})]
+    glue += ["fp8_row_k4096_n154880_s1", "fp8_row_embedding_k4096_n154880",
+             "f32_narrow_pack_n1536_p2048", "f32_narrow_pack_n512_p2048",
+             "bf16_projection_k4096_n32", "bf16_projection_k4096_n288"]
+    return [(f"exlr8-dense-geometry-{label}", "export_b12x_dsv4_aot.py",
+             ["--geometry", "exlr8_dense", "--only", ",".join(names),
+              "--dense-trellis-families", "glm,glmf"])
+            for label, names in (("trellis", cores),
+                                 ("mxfp8", scaled), ("glue", glue))]
 
 
 def jobs(scope):
@@ -122,14 +160,14 @@ def jobs(scope):
             width = 192 if family == "v41" and (
                 not role.startswith("spark_w") or artifact.logical % 192 == 0) else 128
             result.append((f"{family}-{role}", "export_b12x_slices_aot.py",
-                           ["--geometry", family, "--role", role, "--rows", CAPACITIES,
-                            "--width", ",".join(f"{capacity}:{width}" for capacity in CAPACITIES.split(",")),
+                           ["--geometry", family, "--role", role, "--rows", V41_CAPACITIES if family == "v41" else CAPACITIES,
+                            "--width", ",".join(f"{capacity}:{width}" for capacity in (V41_CAPACITIES if family == "v41" else CAPACITIES).split(",")),
                             *(["--atomic-min-capacity", "256"] if family == "dsv4p" and not role.startswith("spark_w") else []),
                             "--standard-names"]))
     result.extend([
-        ("v41-fp8", "export_b12x_v41_fp8_aot.py", ["--rows", CAPACITIES]),
+        ("v41-fp8", "export_b12x_v41_fp8_aot.py", ["--rows", V41_PROJECTION_CAPACITIES]),
         ("v41-experts", "export_b12x_v41_experts_aot.py",
-         ["--role", "coordinator", "--input-format", "bf16", "--rows", "1,2,40,16,80,256,1024,4096"]),
+         ["--role", "coordinator", "--input-format", "bf16", "--rows", V41_DRAFT_CAPACITIES]),
         ("v41-index", "export_b12x_v41_index_aot.py", []),
         ("v41-router", "export_b12x_v41_router_aot.py", []),
         ("v41-attention", "export_b12x_v41_attention_aot.py", []),
@@ -146,7 +184,7 @@ def jobs(scope):
         ("step5-metadata-tp2", "export_b12x_step5_aot.py", ["--heads", "32", "--group", "metadata"]),
     ])
     for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2"):
-        args = ["--role", role, "--rows", CAPACITIES, "--width", "192", "--standard-names"]
+        args = ["--role", role, "--rows", V41_DRAFT_CAPACITIES if role == "dspark_tp2" else V41_CAPACITIES, "--width", "192", "--standard-names"]
         result.append((f"v41-slices-{role}", "export_b12x_slices_aot.py", args))
     result.append(("v41-slices-rtx_tp2-hybrid", "export_b12x_slices_aot.py",
                    ["--role", "rtx_tp2", "--rows", "1,2,16,80", "--width", "192",
@@ -154,7 +192,7 @@ def jobs(scope):
                     "--standard-names"]))
     for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2"):
         result.append((f"v41-nvfp4-{role}", "export_b12x_v41_nvfp4_aot.py",
-                       ["--role", role, "--rows", CAPACITIES, "--tile-m", "16", "--output-shards", "0"]))
+                       ["--role", role, "--rows", V41_CAPACITIES, "--tile-m", "16", "--output-shards", "0"]))
     result.extend((f"routed-{geometry}", "package_fp8_moe_aot.py",
                    ["--geometry", geometry, "--capacities", CAPACITIES])
                   for geometry in ROUTED_GEOMETRIES)
@@ -187,7 +225,7 @@ def jobs(scope):
                    ["--geometry", geometry, "--capacities", exl3_capacity_args[geometry],
                     "--bits", "2,3"])
                   for geometry in EXL3_GEOMETRIES)
-    for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5")):
+    for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5"), ("step5", "4,6")):
         result.append((f"exl3-{geometry}-k" + bits.replace(",", ""), "package_exl3_aot.py",
                        ["--geometry", geometry, "--capacities", EXL3_CAPACITIES, "--bits", bits]))
     result.extend((f"context-split-{geometry}", "export_b12x_dsv4_aot.py",
@@ -202,6 +240,8 @@ def jobs(scope):
          ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "glm"]),
         ("glmf-k6-dense", "export_b12x_dsv4_aot.py",
          ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "glmf"]),
+        ("step5-dense-trellis", "export_b12x_dsv4_aot.py",
+         ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "step5"]),
         ("glmf-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glmf_stage"]),
         ("glmf2-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glmf2_stage"]),
         ("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8"]),
@@ -232,14 +272,6 @@ def jobs(scope):
          ["--geometry", "exlr8_dense", "--only", "int4_q_b_tp2,int4_o_tp2"]),
         ("exlr8-dense-fp8-row", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only", "fp8_row_lm_head,fp8_row_embedding"]),
-        ("exlr8-dense-unpack", "export_b12x_dsv4_aot.py",
-         ["--geometry", "exlr8_dense", "--only", ",".join(
-             f"unpack_{name}{tp}" for tp in ("", "_tp2")
-             for name in ("q_b", "o", "gate_up", "down"))]),
-        ("exlr8-dense-prefill", "export_b12x_dsv4_aot.py",
-         ["--geometry", "exlr8_dense", "--only", ",".join(
-             f"prefill_{name}{tp}" for tp in ("", "_tp2")
-             for name in ("q_b", "o", "gate_up", "down"))]),
         ("exlr8-dense-transforms", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only", ",".join(
              [f"trellis_input_k{k}_{dt}" for k in (2048, 6144, 8192, 12288, 16384)
@@ -260,6 +292,13 @@ def jobs(scope):
         ("vision-d128-attention", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "attention", "--head-dim", "128"]),
         ("audio-pcm", "export_b12x_audio_aot.py", ["--capability", "120", "--group", "pcm"]),
     ])
+    for name, _, args in result:
+        if name.startswith("exlr8-dense-"):
+            args.extend(["--dense-trellis-families", "glm"])
+    result.extend(dense_geometry_jobs())
+    result.extend((f"exlr8-dense-scope-{family}", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "exlr8_dense", "--dense-trellis-families", family])
+                  for family in ("glm", "glmf"))
     return result
 
 
@@ -606,7 +645,7 @@ def clean_metadata(value):
     return value
 
 
-def metadata(directory):
+def metadata(directory, excluded=()):
     records = {}
     for path in sorted(directory.rglob("*.json")):
         if path.name == "comparison-context.json":
@@ -616,8 +655,17 @@ def metadata(directory):
         prefix = "" if prefix == "." else prefix + "/"
         if path.name == "comparison-plans.json":
             for name, record in value.items():
-                records[name] = {**records.get(name, {}), **clean_metadata(record)}
+                if name not in excluded:
+                    records[name] = {**records.get(name, {}), **clean_metadata(record)}
             continue
+        # Drop only named deleted records, preserving every surviving contract
+        # and table-level field while avoiding list-index shifts after deletion.
+        value = dict(value)
+        for field in ("programs", "variants", "objects"):
+            if field in value:
+                value[field] = [record for record in value[field]
+                                if prefix + record.get("label", record.get("name", record.get("stage", "")))
+                                not in excluded]
         for record in value.get("programs", value.get("variants", value.get("objects", []))):
             name = record.get("label", record.get("name", record.get("stage")))
             if name:
@@ -639,7 +687,31 @@ def differing_fields(left, right, prefix=""):
     return [] if left == right else [prefix.lstrip(".")]
 
 
-def compare(left, right, *, source_comparison=False):
+def aggregate_header_after_removals(header, removed):
+    """Edit only generated includes and initializer records for deleted objects."""
+    text = header.decode("utf-8")
+    for name in sorted(removed):
+        include = f'#include "{name}.h"\n'
+        if text.count(include) != 1:
+            raise ValueError(f"aggregate header missing unique removed include: {name}")
+        text = text.replace(include, "", 1)
+    prefix = "#define CUTEAFD_DSV4_PROGRAMS "
+    lines = text.splitlines(keepends=True)
+    tables = [i for i, line in enumerate(lines) if line.startswith(prefix)]
+    if len(tables) != 1:
+        raise ValueError("aggregate header missing unique program table")
+    index = tables[0]
+    table = lines[index][len(prefix):].removesuffix("\n")
+    entries = re.findall(r'\{"([^"\n]+)", [^{}\n]*\}', table)
+    records = re.findall(r'\{"[^"\n]+", [^{}\n]*\}', table)
+    if ", ".join(records) != table or any(entries.count(name) != 1 for name in removed):
+        raise ValueError("aggregate header has invalid or missing removed program records")
+    lines[index] = prefix + ", ".join(record for name, record in zip(entries, records)
+                                    if name not in removed) + "\n"
+    return "".join(lines).encode("utf-8")
+
+
+def compare(left, right, *, source_comparison=False, expected_removals=None):
     inspector = load_file("cuteafd_cuda_images", ROOT / "scripts/qualify/deepseek_v41/inspect-cute-object.py")
     left_names = {path.relative_to(left).as_posix() for path in left.rglob("*") if path.suffix in (".o", ".cubin")}
     right_names = {path.relative_to(right).as_posix() for path in right.rglob("*") if path.suffix in (".o", ".cubin")}
@@ -715,9 +787,53 @@ def compare(left, right, *, source_comparison=False):
     headers_changed = [name for name in sorted(header_names)
                        if not all((directory / name).exists() for directory in (left, right))
                        or (left / name).read_bytes() != (right / name).read_bytes()]
-    return {"contexts": contexts, "programs": records,
-            "added_programs": added, "removed_programs": removed,
-            "manifest_changed_fields": differing_fields(*metas), "headers_changed": headers_changed}
+    report = {"contexts": contexts, "programs": records,
+              "added_programs": added, "removed_programs": removed,
+              "manifest_changed_fields": differing_fields(*metas), "headers_changed": headers_changed}
+    if expected_removals is not None:
+        if not source_comparison:
+            raise ValueError("expected removals require a baseline source comparison")
+        removed_stems = {str(Path(name).with_suffix("")) for name in removed}
+        common_stems = {row["program"] for row in records}
+        if removed_stems & common_stems:
+            raise ValueError(f"partially removed program artifacts: {sorted(removed_stems & common_stems)}")
+        filtered = [metadata(directory, removed_stems) for directory in (left, right)]
+        changed = differing_fields(*filtered)
+        allowed_headers = {str(Path(name).with_suffix(".h")) for name in removed if name.endswith(".o")}
+        changed_headers = set(headers_changed) - allowed_headers
+        for name in sorted(changed_headers):
+            path = Path(name)
+            local_removals = {Path(artifact).stem for artifact in removed
+                              if artifact.endswith(".o") and Path(artifact).parent == path.parent}
+            if path.name == "dsv4_programs.h" and local_removals:
+                if all((directory / name).is_file() for directory in (left, right)):
+                    expected = aggregate_header_after_removals((left / name).read_bytes(), local_removals)
+                    if expected == (right / name).read_bytes():
+                        changed_headers.remove(name)
+        survivors = [row["program"] for row in records if not all((row["object_identical"],
+                     row["cubins_identical"], row["header_identical"], row["sass_identical"] is not False))
+                     or row["metadata_changed_fields"]]
+        if survivors or changed_headers or changed:
+            raise ValueError(f"changed survivors: {survivors}; headers={sorted(changed_headers)}; metadata={changed}")
+    return report
+
+
+def read_expected_removals(path):
+    names = path.read_text().splitlines()
+    if not names or any(not name or name != name.strip() or Path(name).is_absolute()
+                        or ".." in Path(name).parts or Path(name).suffix for name in names):
+        raise ValueError("expected removals must list relative program stems, one per line without suffixes")
+    if len(names) != len(set(names)):
+        raise ValueError("duplicate expected removal")
+    return set(names)
+
+
+def validate_expected_removals(reports, expected):
+    added = {name for report in reports for name in report["added_programs"]}
+    removed = {str(Path(name).with_suffix("")) for report in reports for name in report["removed_programs"]}
+    if added or removed != expected:
+        raise ValueError(f"expected removals mismatch: extra={sorted(removed - expected)}, "
+                         f"missing={sorted(expected - removed)}, added={sorted(added)}")
 
 
 def parse_sms(value):
@@ -742,6 +858,8 @@ def main():
     parser.add_argument("--compare-only", action="store_true")
     parser.add_argument("--baseline-source", type=Path,
                         help="baseline engine checkout with pinned fork; compare sources at the first --sms count")
+    parser.add_argument("--expected-removals", type=Path,
+                        help="exact removed program stems, one per line; requires --baseline-source")
     parser.add_argument("--require-identical", action="store_true")
     parser.add_argument("--timeout", type=int, default=7200, help="seconds per export context")
     parser.add_argument("--workers", type=int, default=1, help="independent CPU export groups in parallel")
@@ -750,6 +868,12 @@ def main():
     if args._worker:
         worker(json.loads(args._worker))
         return 0
+    if args.expected_removals and not args.baseline_source:
+        parser.error("--expected-removals requires --baseline-source")
+    try:
+        expected_removals = read_expected_removals(args.expected_removals) if args.expected_removals else None
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     selected_jobs = jobs(args.scope)
     if args.list:
         print("\n".join(name for name, _, _ in selected_jobs))
@@ -808,10 +932,11 @@ def main():
                     print(f"{name} SMs={sms} failed; {(directory / 'export.log').read_text()[-12000:]}",
                           file=sys.stderr, flush=True)
                     raise
-        report = compare(*directories, source_comparison=True) if baseline_source else compare(*directories)
+        options = {"expected_removals": expected_removals} if expected_removals is not None else {}
+        report = compare(*directories, source_comparison=True, **options) if baseline_source else compare(*directories)
         report["comparison_axis"] = "source" if baseline_source else "sm_count"
         report["group"] = name
-        if baseline_source and report["removed_programs"]:
+        if baseline_source and expected_removals is None and report["removed_programs"]:
             raise ValueError(f"shipped programs removed: {report['removed_programs']}")
         (output / name / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
         for label in ("added", "removed"):
@@ -837,6 +962,12 @@ def main():
     if failures:
         print(f"Failed export groups: {', '.join(row['group'] for row in failures)}", file=sys.stderr)
         return 1
+    if expected_removals is not None:
+        try:
+            validate_expected_removals(reports, expected_removals)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     different = sum(not row["object_identical"] for report in reports for row in report["programs"])
     total = sum(len(report["programs"]) for report in reports)
     inventory_delta = sum(len(report[key]) for report in reports
@@ -844,7 +975,7 @@ def main():
                                       else ("added_programs", "removed_programs")))
     print(f"Compared {total} common programs: {total - different} identical objects, {different} different, "
           f"{inventory_delta} added/removed. Report: {output / 'comparison.json'}")
-    return int(args.require_identical and (different > 0 or inventory_delta > 0))
+    return int(args.require_identical and (different > 0 or (inventory_delta > 0 and expected_removals is None)))
 
 
 if __name__ == "__main__":

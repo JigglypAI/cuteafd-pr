@@ -99,6 +99,9 @@ def test_fixture_bytes_reproduce_and_vision_recipe(tmp_path):
     result = builder.build_vision_set(family="mimo_v2", model="model", checkpoint="model", version="media1",
         arm=arm, probe=probe, fixtures=tmp_path / "one", tokenizer_sha256="c" * 64)
     assert len(result["windows"]) == 8 and len(result["quick_windows"]) == 2
+    assert builder.canonical(result) == builder.canonical(builder.build_vision_set(
+        family="mimo_v2", model="model", checkpoint="model", version="media1", arm=arm,
+        probe=probe, fixtures=tmp_path / "one", tokenizer_sha256="c" * 64, vision_manifest=None))
     assert all(w["block"] == "vision" and set(w["roles"][w["score_from"]:]) == {"gen"} for w in result["windows"])
     tasks = [body["messages"][1]["content"][1]["text"] for body in requests]
     assert "visible line of code" in tasks[0] and "Python parser" in tasks[2]
@@ -126,9 +129,143 @@ def test_fixture_bytes_reproduce_and_vision_recipe(tmp_path):
             arm=arm, probe=missing, fixtures=tmp_path / "one", tokenizer_sha256="c" * 64)
 
 
+def test_legacy_vision_canonical_bytes_match_pre_manifest_builder(tmp_path):
+    import json
+    data = b"legacy fixture identity"
+    records = [{"id": f"image_{i}", "path": f"image_{i}.png",
+        "sha256": hashlib.sha256(data).hexdigest(), "kind": kind, "question": "Pinned question"}
+        for i, kind in enumerate(["code", "code", "terminal", "terminal", "chart", "chart", "diagram", "diagram"])]
+    for item in records:
+        (tmp_path / item["path"]).write_bytes(data)
+    (tmp_path / "fixtures.json").write_text(json.dumps({"schema": "cuteafd.media.fixtures/1",
+        "fixtures": records, "quick_windows": ["image_0", "image_1"]}, sort_keys=True))
+    def probe(body):
+        return {"probe": {"engine": "fake", "prompt_ids": [1] + [9] * 4 + [2],
+            "generated": [3] * 600, "media": [{"start": 1, "len": 4, "kind": "image",
+                "key": "a" * 64, "grid": [1, 4, 4]}]}, "server": {"model": "model", "family": "mimo_v2"}}
+    arm = {"checkpoint": "model", "head": "bf16", "activations": "bf16", "kv": "bf16",
+        "state": "bf16", "speculation": False, "prefix_cache": False}
+    builder = load_script("fidelity-set")
+    result = builder.build_vision_set(family="mimo_v2", model="model", checkpoint="model",
+        version="legacy-contract", arm=arm, probe=probe, fixtures=tmp_path, tokenizer_sha256="c" * 64)
+    # Captured from c30634ea9's original eight-fixture builder on these exact inputs.
+    assert hashlib.sha256(builder.canonical(result)).hexdigest() == (
+        "ebd3ebeac6d05602032865e0c06a9f9e1cd6c4eb8391a719c8d45d11460ca854")
+
+
+@pytest.fixture
+def real_vision_input(tmp_path):
+    import json
+    from PIL import Image
+    root = tmp_path / "sources"
+    snapshot = tmp_path / "snapshot"
+    root.mkdir()
+    snapshot.mkdir()
+    Image.new("RGB", (56, 56), (80, 120, 160)).save(root / "photo.png")
+    digest = hashlib.sha256((root / "photo.png").read_bytes()).hexdigest()
+    manifest = root / "manifest.json"
+    manifest.write_text(json.dumps({"images": [{"file": "photo.png", "sha256": digest}],
+        "resize": ["photo.png@4x4"]}))
+    (snapshot / "config.json").write_text(json.dumps({"text_config": {"vocab_size": 32},
+        "vision_config": {"patch_size": 14}, "spatial_merge_size": 2, "image_token_index": 9}))
+    (snapshot / "processor_config.json").write_text(json.dumps({"spatial_merge_size": 2,
+        "image_processor": {"image_processor_type": "PixtralImageProcessor", "patch_size": 14}}))
+    (snapshot / "params.json").write_text(json.dumps({"vision_encoder": {
+        "image_token_id": 9, "image_break_token_id": 8, "image_end_token_id": 7}}))
+    return manifest, snapshot, tmp_path / "fixtures"
+
+
+def test_real_vision_manifest_pins_resizes_and_scores_following_text(real_vision_input):
+    from fidelity_media import processor_contract
+    manifest, snapshot, destination = real_vision_input
+    builder = load_script("fidelity-set")
+    records, contract = builder.real_vision_fixtures(manifest, destination, snapshot)
+    assert contract == processor_contract(snapshot)
+    assert len(records) == 2 and records[1]["provenance"]["grid"] == [1, 4, 4]
+    assert records[1]["provenance"]["derived_sha256"] == records[1]["fixture"]["sha256"]
+    calls = []
+    def probe(body):
+        calls.append(body)
+        image = body["messages"][0]["content"][0]["type"] == "image_url"
+        return {"probe": {"engine": "fake", "prompt_ids": [1, 9, 9, 8, 9, 9, 7, 2] if image else [1, 2],
+            "generated": [3] * 600, "media": [{"start": 1, "len": 6, "grid": [1, 4, 4],
+                "key": "a" * 64, "kind": "image"}] if image else []},
+            "server": {"model": "model", "family": "mistral_large4"}}
+    arm = {"checkpoint": "model", "head": "bf16", "activations": "bf16", "kv": "bf16",
+        "state": "bf16", "speculation": False, "prefix_cache": False}
+    result = builder.build_vision_set(family="mistral_large4", model="model", checkpoint="model",
+        version="real1", arm=arm, probe=probe, fixtures=destination, tokenizer_sha256="c" * 64,
+        vision_manifest=manifest, snapshot=snapshot)
+    assert [w["id"] for w in result["windows"]] == ["real_00", "resize_00", "text_control"]
+    for window in result["windows"]:
+        assert set(window["roles"][window["score_from"]:]) == {"gen"}
+        for image in window.get("media", []):
+            assert image["start"] + image["len"] <= window["score_from"]
+    assert not result["windows"][-1].get("media") and len(calls) == 3
+    assert result["windows"][0]["media"][0]["fixture"] == records[0]["fixture"]
+
+
+@pytest.mark.parametrize("mutation,match", [
+    ("hash", "pinned media identity"), ("path", "relative path"),
+    ("resize", "pinned FILE"), ("pixels", "geometry"), ("merge", "image merge"),
+])
+def test_real_vision_manifest_rejects_unbound_inputs(real_vision_input, mutation, match):
+    import json
+    manifest, snapshot, destination = real_vision_input
+    document = json.loads(manifest.read_text())
+    if mutation == "hash":
+        document["images"][0]["sha256"] = "0" * 64
+    elif mutation == "path":
+        document["images"][0]["file"] = "../photo.png"
+    elif mutation == "resize":
+        document["resize"] = ["unbound.png@4x4"]
+    elif mutation == "pixels":
+        document["resize"] = ["photo.png@2048x2048"]
+    else:
+        processor = json.loads((snapshot / "processor_config.json").read_text())
+        processor["spatial_merge_size"] = True
+        (snapshot / "processor_config.json").write_text(json.dumps(processor))
+        config = json.loads((snapshot / "config.json").read_text())
+        config["spatial_merge_size"] = True
+        (snapshot / "config.json").write_text(json.dumps(config))
+    manifest.write_text(json.dumps(document))
+    with pytest.raises(ValueError, match=match):
+        load_script("fidelity-set").real_vision_fixtures(manifest, destination, snapshot)
+
+
+def test_shared_processor_contract_supports_legacy_processor_not_family_name(tmp_path):
+    import json
+    from fidelity_media import processor_contract
+    (tmp_path / "config.json").write_text("{}")
+    for kind in ("Qwen2VLImageProcessor", "Glm5NextImageProcessor"):
+        (tmp_path / "preprocessor_config.json").write_text(json.dumps({
+            "image_processor_type": kind, "patch_size": 16, "merge_size": 2}))
+        assert processor_contract(tmp_path) == {"merge": 2, "row_markers": 0}
+
+
 def span():
     return {"start": 1, "len": 4, "kind": "image", "key": "a" * 64,
             "grid": [1, 4, 4], "fixture": {"path": "code.png", "sha256": "b" * 64}}
+
+
+def test_processor_geometry_preserves_merged_counts_and_checks_row_markers():
+    from fidelity_media import image_extent
+    for h in range(2, 112, 2):
+        for w in range(2, 112, 2):
+            assert image_extent([1, h, w]) == (h // 2, w // 2, h * w // 4)
+            assert image_extent([1, h, w], {"merge": 2, "row_markers": 1}) == (
+                h // 2, w // 2, h // 2 * (w // 2 + 1))
+    contract = {"merge": 2, "row_markers": 1, "image_token_id": 9, "row_break_token_id": 8, "end_token_id": 7}
+    s = {**span(), "len": 6}
+    tokens = [1, 9, 9, 8, 9, 9, 7, 2]
+    assert validate_media([s], tokens, ["ctx"] * 7 + ["gen"], 7, processor=contract) == [s]
+    for i in range(1, 7):
+        wrong = tokens.copy()
+        wrong[i] = 3
+        with pytest.raises(ValueError, match="row markers"):
+            validate_media([s], wrong, ["ctx"] * 7 + ["gen"], 7, processor=contract)
+    with pytest.raises(ValueError, match="merged token extent"):
+        validate_media([s], tokens, ["ctx"] * 7 + ["gen"], 7)
 
 
 def test_media_contract():

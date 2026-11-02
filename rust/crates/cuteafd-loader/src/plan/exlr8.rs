@@ -18,7 +18,7 @@ use super::format::{
 pub mod residency;
 pub mod dense;
 mod workspace;
-pub use workspace::{execution_workspace, routed_workspace, ExecutionVariant, ExecutionWorkspace};
+pub use workspace::{execution_workspace, routed_workspace, shared_workspace, ExecutionVariant, ExecutionWorkspace};
 
 /// Native selection is distinct from the ordinary GLM launch description.
 #[derive(Debug, Clone, Serialize)]
@@ -63,41 +63,6 @@ impl std::str::FromStr for PrefillActivations {
 pub struct SparkRequirements {
     pub resident_bytes_per_rank: Vec<u64>,
     pub k1_workspace: &'static str,
-}
-
-/// Metadata-only execution arena; allocation uses the same checked layout helper.
-pub fn shared_workspace(manifest: &Value) -> Result<u64> {
-    let programs = manifest["programs"].as_array().context("PROGRAMS.json programs must be an array")?;
-    let entry = |name: &str| -> Result<&Value> {
-        let matches = programs.iter().filter(|p| p["name"] == name).collect::<Vec<_>>();
-        ensure!(matches.len() == 1, "PROGRAMS.json requires one {name}");
-        Ok(matches[0])
-    };
-    let group = entry("exlr8_shared_group")?;
-    ensure!(group["geometry"]["abi_version"] == 2 && group["capacity_rows"] == 64
-        && group["geometry"]["experts"] == 1 && group["geometry"]["top_k"] == 1
-        && group["geometry"]["max_groups"] == 4
-        && group["geometry"]["hidden"] == 6144
-        && group["geometry"]["input_format"] == "bf16"
-        && group["geometry"]["input_row_bytes"] == 12288
-        && group["geometry"]["ctas_per_sm"] == 4
-        && group["geometry"]["ingress_warps"] == 8, "EXLR8 shared grouping geometry differs");
-    let spec = entry("exlr8_shared_a16_serving")?;
-    ensure!(spec["geometry"]["abi_version"] == 3 && spec["capacity_rows"].as_u64() == Some(64),
-        "EXLR8 shared workspace requires ABI v3 and 64-row capacity");
-    let n = |group: &str, key: &str| -> Result<usize> {
-        usize::try_from(spec[group][key].as_u64().with_context(|| format!("EXLR8 missing {group}.{key}"))?)
-            .context("EXLR8 metadata exceeds address space")
-    };
-    ensure!(n("geometry", "hidden")? == 6144 && n("geometry", "top_k")? == 1
-        && n("geometry", "units")? == 16 && n("geometry", "max_groups")? == 4,
-        "EXLR8 shared geometry must be hidden6144/top1/units16/groups4");
-    let scratch = [n("scratch_bytes_at_capacity", "fc1")?,
-        n("scratch_bytes_at_capacity", "intermediate")?, n("scratch_bytes_at_capacity", "fc2")?];
-    ensure!(scratch == [6_291_456, 262_144, 1_572_864],
-        "EXLR8 shared scratch capacities differ from the native ABI");
-    Ok(residency::execution_workspace_layout(64, 64, 16, n("geometry", "hidden")?, n("geometry", "top_k")?,
-        n("geometry", "max_groups")?, scratch[0], scratch[1], scratch[2], residency::ExpertSet::Shared)?.1 as u64)
 }
 
 pub struct NativePlan {
@@ -156,16 +121,19 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let catalog_timer = super::PhaseTimer::new(&input.phases.catalog, &[]);
     let metadata = residency::MetadataInput::open(snapshot, selected)?;
     let set_id = metadata.identity.clone();
-    let mut shared = vec![0u64; gpu_count];
-    for layer in cfg.first_moe_layer..cfg.layers {
-        for (rank, resident) in shared.iter_mut().enumerate() {
-            let plan = metadata.plan(layer, gpu_count, rank, residency::ExpertSet::Shared)?;
-            *resident = resident.checked_add(plan.resident_bytes as u64).context("EXLR8 shared residency overflow")?;
-        }
-    }
+    let shared = shared_expert_resident(&metadata, &(cfg.first_moe_layer..cfg.layers).collect::<Vec<_>>(), gpu_count)?;
     let programs = read_json(layout.workspace_manifest.as_deref()
         .unwrap_or_else(|| Path::new("/opt/cuteafd/share/PROGRAMS.json")))?;
-    let workspace = shared_workspace(&programs)?;
+    let records = dense::DenseRecord::inventory(snapshot)?;
+    let selection = dense::DenseSelection::from_hf(&checkpoint.config)?;
+    let backbone = selection.backbone(&records, cfg.layers)?;
+    let plans = (0..gpu_count).map(|rank| dense::DensePlan::for_rank(&backbone, gpu_count, rank))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let activations = dense::programs::resolve_activations(&programs, &checkpoint.config, &records,
+        cfg.layers, &plans, layout.exlr8_prefill_pin, layout.exlr8_prefill_activations)?;
+    ensure!(activations == layout.exlr8_prefill_activations,
+        "EXLR8 resolved activation differs from requested layout charge");
+    let workspace = shared_workspace(&programs, cuteafd_ffi::exlr8::KernelFamily::Glm)?;
     drop(catalog_timer);
     let (memory, placement) = {
         let _timer = super::PhaseTimer::new(&input.phases.layout, &[]);
@@ -244,6 +212,8 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
         ("rtx".into(), memory.devices.iter().flat_map(|d| &d.items)
             .filter(|i| matches!(i.category, cuteafd_core::memory_layout::Category::Weights
                 | cuteafd_core::memory_layout::Category::Embedding | cuteafd_core::memory_layout::Category::Experts)).map(|i| i.bytes).sum())]);
+    let mut memory = memory;
+    append_spark_devices(&mut memory, layout, &residents);
     report.memory_layout = Some(memory);
     report.solver_placement = Some(placement);
     {
@@ -252,6 +222,53 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     }
     Ok(NativePlan { report, selection: NativeSelection { manifest: selected.into(), set_id }, sparks: SparkRequirements { resident_bytes_per_rank: residents,
         k1_workspace: "checked_by_worker_live_admission" } })
+}
+
+fn append_spark_devices(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
+    layout: &super::layout::LayoutOptions, residents: &[u64]) {
+    use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item};
+    memory.devices.extend(residents.iter().enumerate().map(|(rank, &bytes)| DeviceLayout {
+        kind: DeviceKind::Spark, index: rank as u32,
+        capacity_bytes: layout.spark_bytes, worker_budget_bytes: layout.spark_bytes,
+        items: vec![Item::new(Category::Experts, "routed_expert", "exlr8", bytes, Basis::Exact)],
+        kv_tokens: 0,
+    }));
+}
+
+fn served_routed_layers(input: &residency::MetadataInput, layers: &[usize]) -> Result<()> {
+    let config = input.config.get("text_config").unwrap_or(&input.config);
+    let first = number(config, "first_k_dense_replace")?;
+    let end = number(config, "num_hidden_layers")?;
+    ensure!(layers.iter().all(|&layer| (first..end).contains(&layer))
+        && layers.windows(2).all(|pair| pair[0] < pair[1]),
+        "EXLR8 target routed layers must be ordered backbone layers, excluding MTP");
+    Ok(())
+}
+
+/// Format-level native costs. Router ownership is a family fact, not part of an expert arena.
+pub fn routed_expert_costs(input: &residency::MetadataInput, layers: &[usize])
+    -> Result<Vec<crate::placement::ExpertCost>> {
+    use crate::placement::{Bytes2, ExpertCost};
+    use residency::ExpertSet;
+    served_routed_layers(input, layers)?;
+    layers.iter().map(|&layer| {
+        let resident = |world, rank| -> Result<Bytes2> {
+            Ok(Bytes2 { resident: u64::try_from(input.plan(layer, world, rank, ExpertSet::Routed)?.resident_bytes)?,
+                staging: 0 })
+        };
+        Ok(ExpertCost { whole: resident(1, 0)?, half: [resident(2, 0)?, resident(2, 1)?],
+            tp2: true, spark_ok: true })
+    }).collect()
+}
+
+/// Shared-expert arenas summed once per admitted target rank; never include native MTP.
+pub fn shared_expert_resident(input: &residency::MetadataInput, layers: &[usize], world: usize) -> Result<Vec<u64>> {
+    served_routed_layers(input, layers)?;
+    ensure!(matches!(world, 1 | 2), "EXLR8 shared experts require one/two target ranks");
+    (0..world).map(|rank| layers.iter().try_fold(0u64, |sum, &layer| {
+        let bytes = u64::try_from(input.plan(layer, world, rank, residency::ExpertSet::Shared)?.resident_bytes)?;
+        sum.checked_add(bytes).context("EXLR8 shared residency overflow")
+    })).collect()
 }
 
 /// Physical native residency for precisely the admitted Spark suffix.
@@ -1174,6 +1191,38 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn native_min_max_worker_devices_preserve_residents_and_rtx_layout() {
+        use cuteafd_core::memory_layout::{DeviceKind, DeviceLayout, MemoryLayout};
+        for (gpus, ranks) in [(1, 4), (2, 6)] {
+            for budget in [108u64 << 30, 104u64 << 30] {
+                let layout = super::super::layout::LayoutOptions { spark_bytes: budget, ..Default::default() };
+                let mut memory = MemoryLayout { devices: (0..gpus).map(|index| DeviceLayout {
+                    kind: DeviceKind::Rtx, index, capacity_bytes: 96 << 30, worker_budget_bytes: 0,
+                    items: Vec::new(), kv_tokens: 262144,
+                }).collect(), pool_tokens: 262144, waste: Vec::new(), notes: Vec::new() };
+                let rtx = memory.devices.clone();
+                let residents = (0..ranks).map(|rank| (80 << 30) + rank as u64).collect::<Vec<_>>();
+                append_spark_devices(&mut memory, &layout, &residents);
+                assert_eq!(&memory.devices[..gpus as usize], rtx.as_slice());
+                assert_eq!(memory.pool_tokens, 262144);
+                for (rank, device) in memory.devices[gpus as usize..].iter().enumerate() {
+                    assert_eq!(device.index, rank as u32);
+                    assert_eq!(device.worker_budget_bytes, budget);
+                    assert_eq!(device.capacity_bytes, budget);
+                    assert_eq!(device.items.len(), 1);
+                    assert_eq!(device.items[0].bytes, residents[rank]);
+                }
+                let with_sparks = memory.clone();
+                append_spark_devices(&mut memory, &layout, &[]);
+                assert_eq!(memory, with_sparks);
+            }
+        }
+        let body = include_str!("exlr8.rs").split("pub(super) fn native_plan_of(").nth(1).unwrap()
+            .split("fn append_spark_devices(").next().unwrap();
+        assert!(body.contains("append_spark_devices(&mut memory, layout, &residents)"));
+    }
+
+    #[test]
     fn native_prefill_uses_the_serving_family_limits() {
         let source = include_str!("exlr8.rs");
         let body = source.split("pub(super) fn native_plan_of(").nth(1).unwrap()
@@ -1203,36 +1252,6 @@ mod tests {
     }
     fn metadata() -> Value {
         json!({"format":FORMAT,"scheme":SCHEME})
-    }
-
-    #[test]
-    fn native_shared_workspace_uses_published_scratch_and_checked_arena() {
-        let entry = json!({"name":"exlr8_shared_a16_serving", "capacity_rows":64,
-            "geometry":{"abi_version":3,"hidden":6144,"top_k":1,"units":16,"max_groups":4},
-            "scratch_bytes_at_capacity":{"fc1":6291456,"intermediate":262144,"fc2":1572864}});
-        let mut manifest = json!({"programs":[entry,
-            {"name":"exlr8_shared_group","capacity_rows":64,
-                "geometry":{"abi_version":2,"experts":1,"top_k":1,"max_groups":4,
-                    "hidden":6144,"input_format":"bf16","input_row_bytes":12288,
-                    "ctas_per_sm":4,"ingress_warps":8}}]});
-        let bytes = shared_workspace(&manifest).unwrap();
-        for missing in 0..2 {
-            let mut invalid = manifest.clone();
-            invalid["programs"].as_array_mut().unwrap().remove(missing);
-            assert!(shared_workspace(&invalid).is_err());
-        }
-        assert_eq!(bytes, residency::execution_workspace_layout(64,64,16,6144,1,4,
-            6291456,262144,1572864,residency::ExpertSet::Shared).unwrap().1 as u64);
-        for (field, value) in [("abi_version", 1), ("hidden", 128), ("top_k", 8), ("units", 0), ("max_groups", 512)] {
-            let mut invalid = manifest.clone();
-            invalid["programs"][0]["geometry"][field] = json!(value);
-            assert!(shared_workspace(&invalid).is_err(), "{field}");
-        }
-        for bytes in [0, 1_572_863, u64::MAX] {
-            manifest["programs"][0]["scratch_bytes_at_capacity"]["fc2"] = json!(bytes);
-            assert!(shared_workspace(&manifest).is_err());
-        }
-        assert!(shared_workspace(&json!({"programs":[]})).is_err());
     }
 
     #[test]

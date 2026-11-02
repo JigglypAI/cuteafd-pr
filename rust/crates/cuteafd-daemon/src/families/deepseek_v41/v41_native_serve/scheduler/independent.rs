@@ -149,7 +149,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                     Boundary::Run(members) => members,
                 }
             };
-            ensure!(members.len() <= 8, "independent lane exceeds eight requests");
+            ensure!(members.len() <= active.borrow().len().div_ceil(2), "independent lane exceeds request capacity");
             // A member whose next round would pass its reservation needs a top-up, which the
             // outer loop plans at a boundary where both lanes have drained.
             {

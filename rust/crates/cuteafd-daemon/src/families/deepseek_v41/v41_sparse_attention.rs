@@ -512,7 +512,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         self.acquire_scratch()?;
         ensure!(self.cold.is_none(), "attention warmup is pending");
         ensure!(
-            layer < 40 && !requests.is_empty() && requests.len() <= 16,
+            layer < 40 && !requests.is_empty() && requests.len() <= cuteafd_core::V41_MAX_REQUESTS,
             "invalid attention layer or request count"
         );
         let rows: usize = requests.iter().map(|r| r.positions.len()).sum();

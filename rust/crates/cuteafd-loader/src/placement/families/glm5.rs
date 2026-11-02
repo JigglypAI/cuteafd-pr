@@ -912,21 +912,17 @@ fn exlr8_expert_costs(snapshot: &std::path::Path, selected: &str, first: usize, 
 /// Exact checkpoint-native TP2 costs; rotated ownership forbids proportional halves.
 fn exlr8_expert_costs_of(input: &crate::plan::exlr8::residency::MetadataInput, first: usize, layers: usize,
     router: &[crate::plan::exlr8::dense::DenseRecord]) -> anyhow::Result<Vec<ExpertCost>> {
-    use crate::plan::exlr8::residency::ExpertSet;
-    (first..layers).map(|layer| {
-        let whole = input.plan(layer, 1, 0, ExpertSet::Routed)?.resident_bytes as u64;
-        let mut half = [Bytes2::default(); 2];
-        for (rank, cost) in half.iter_mut().enumerate() {
-            cost.resident = input.plan(layer, 2, rank, ExpertSet::Routed)?.resident_bytes as u64;
-        }
+    let mut costs = crate::plan::exlr8::routed_expert_costs(input, &(first..layers).collect::<Vec<_>>())?;
+    // GLM keeps the lead router in its baseline; only a local TP2 layer needs a peer replica.
+    for (layer, cost) in (first..layers).zip(&mut costs) {
         for record in router.iter().filter(|record| record.tensor.starts_with(&format!("model.layers.{layer}.mlp.gate."))) {
             for component in &record.components {
-                half[1].resident = half[1].resident.checked_add((component.source.bytes as u64).max(FLOOR))
+                cost.half[1].resident = cost.half[1].resident.checked_add((component.source.bytes as u64).max(FLOOR))
                     .ok_or_else(|| anyhow::anyhow!("EXLR8 local router storage overflow"))?;
             }
         }
-        Ok(ExpertCost { whole: Bytes2 { resident: whole, staging: 0 }, half, tp2: true, spark_ok: true })
-    }).collect()
+    }
+    Ok(costs)
 }
 
 /// Native manifest selection is mandatory; never route EXLR8 through EXL3.

@@ -1,7 +1,6 @@
 //! Typed bindings for the EXLR8 native dense companions beside the ABI-v1
-//! linears (`native_dense`): trellis H128 input/output transforms, the exact
-//! E4M3 trellis unpack and its block-FP8 W8A16 prefill GEMM (unit grid, F32
-//! out), the split-gate SwiGLU, F32 -> BF16 column packing and the indexer
+//! linears (`native_dense`): trellis H128 input/output transforms, the
+//! split-gate SwiGLU, F32 -> BF16 column packing and the indexer
 //! weights projection. Every contract is checked from the manifest before any
 //! kernel loads; launches take caller-owned device storage.
 use super::programs::{Program, ProgramSpec, Programs, Scalar};
@@ -23,8 +22,6 @@ pub enum Op {
     TrellisInput { features: u32, rotated_bf16: bool },
     TrellisOutput { features: u32 },
     Mx8Quant { features: u32 },
-    Unpack { input: u32, output: u32, side: u32 },
-    Prefill { input: u32, output: u32 },
     SwigluSplit { inter: u32 },
     NarrowPack { width: u32, pitch: u32 },
     IndexWeights { width: u32, outputs: u32 },
@@ -45,14 +42,6 @@ impl Op {
             Op::Mx8Quant { .. } => (vec![
                 ("rotated_inputs", "int64", "[4]".into(), "in"),
                 ("records", "uint8", "[record_bytes]".into(), "out")], &["rows", "rotation_id", "cta_limit"]),
-            Op::Unpack { input: k, output: n, .. } => (vec![
-                ("payload", "uint8", format!("[{}]", u64::from(k) * u64::from(n) / 2), "in"),
-                ("output", "uint8", format!("[{n},{k}]"), "out")], &[]),
-            Op::Prefill { input: k, output: n } => (vec![
-                ("x", "bfloat16", format!("[rows,{k}]"), "in"),
-                ("w", "uint8", format!("[{n},{k}]"), "in"),
-                ("scale", "float32", format!("[{},{}]", n.div_ceil(128), k / 128), "in"),
-                ("out", "float32", format!("[rows,{n}]"), "out")], &["rows"]),
             Op::SwigluSplit { inter } => (vec![
                 ("gate", "bfloat16", format!("[rows,{inter}]"), "in"),
                 ("up", "bfloat16", format!("[rows,{inter}]"), "in"),
@@ -97,19 +86,6 @@ pub fn op_of(entry: &serde_json::Value) -> Result<Option<Op>> {
             if g["output_dtype"].as_str() != Some("bf16") { return Err(invalid("trellis output is BF16")); }
             Op::TrellisOutput { features: u32_of(g, "features")? }
         }
-        Some("trellis_unpack_e4m3") => {
-            if g["bits"].as_u64() != Some(4) || g["codebook"].as_str() != Some("e4m3") || g["abi_version"].as_u64() != Some(1) {
-                return Err(invalid("unpack requires K4 e4m3 ABI v1"));
-            }
-            Op::Unpack { input: u32_of(g, "input_features")?, output: u32_of(g, "output_features")?,
-                side: u32_of(g, "sharded_side")? }
-        }
-        Some("trellis_fp8_prefill") => {
-            if g["scales"].as_str() != Some("block") || g["output_dtype"].as_str() != Some("f32") {
-                return Err(invalid("prefill GEMM is block-scaled with F32 output"));
-            }
-            Op::Prefill { input: u32_of(g, "input_features")?, output: u32_of(g, "output_features")? }
-        }
         Some("swiglu_split") => Op::SwigluSplit { inter: u32_of(g, "inter")? },
         Some("f32_narrow_pack") => Op::NarrowPack { width: u32_of(g, "width")?, pitch: u32_of(g, "pitch")? },
         Some("bf16_projection") => {
@@ -137,7 +113,7 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<O
         || spec.scalar_kinds != vec![b'i'; scalars.len()] || !spec.scratch.values().all(|&b| b == 0) {
         return Err(invalid(format!("{}: scalar ABI or scratch", spec.name)));
     }
-    if !matches!(op, Op::Unpack { .. }) && spec.capacity_rows != 4096 {
+    if spec.capacity_rows != 4096 {
         return Err(invalid(format!("{}: row capacity", spec.name)));
     }
     Ok(op)
@@ -167,13 +143,13 @@ impl<'a> Companion<'a> {
     /// # Safety
     /// `pointers` are device buffers of the kind's contract (in its pointer
     /// order) on the bound device, live through stream completion; `rows` live
-    /// rows (ignored by the unpack), `c0` the pack's first column.
+    /// rows, `c0` the pack's first column.
     pub unsafe fn launch(&self, pointers: &[*mut c_void], rows: u32, c0: u32, stream: *mut c_void) -> Result<()> {
         let (contract, scalar_names) = self.op.contract();
         if pointers.len() != contract.len() || pointers.iter().any(|p| p.is_null()) {
             return Err(invalid("companion storage"));
         }
-        if !matches!(self.op, Op::Unpack { .. }) && (rows == 0 || rows > 4096) {
+        if rows == 0 || rows > 4096 {
             return Err(invalid("companion rows outside compiled capacity"));
         }
         if let Op::NarrowPack { width, pitch } = self.op {
@@ -242,19 +218,6 @@ mod tests {
 
     #[test]
     fn exported_companion_contracts_validate_and_mutations_fail() {
-        let prefill = entry("trellis_fp8_prefill", json!({"input_features": 2048, "output_features": 16384,
-            "max_rows": 4096, "scales": "block", "output_dtype": "f32", "compute_warps": 8, "num_stages": 3}),
-            json!([{"name":"x","dtype":"bfloat16","shape":"[rows,2048]","role":"in"},
-                {"name":"w","dtype":"uint8","shape":"[16384,2048]","role":"in"},
-                {"name":"scale","dtype":"float32","shape":"[128,16]","role":"in"},
-                {"name":"out","dtype":"float32","shape":"[rows,16384]","role":"out"}]), &["rows"]);
-        assert_eq!(validate_entry(&spec("exlr8_dense_prefill_q_b", &prefill, 4096), &prefill).unwrap(),
-            Op::Prefill { input: 2048, output: 16384 });
-        let unpack = entry("trellis_unpack_e4m3", json!({"input_features": 2048, "output_features": 16384,
-            "sharded_side": 1, "bits": 4, "codebook": "e4m3", "abi_version": 1}),
-            json!([{"name":"payload","dtype":"uint8","shape":"[16777216]","role":"in"},
-                {"name":"output","dtype":"uint8","shape":"[16384,2048]","role":"out"}]), &[]);
-        assert!(validate_entry(&spec("exlr8_dense_unpack_q_b", &unpack, 4096), &unpack).is_ok());
         let pack = entry("f32_narrow_pack", json!({"width": 576, "pitch": 2624}),
             json!([{"name":"input","dtype":"float32","shape":"[rows,576]","role":"in"},
                 {"name":"output","dtype":"bfloat16","shape":"[rows,2624]","role":"out"}]), &["rows", "c0"]);
@@ -267,54 +230,10 @@ mod tests {
                 {"name":"input_block_scales","dtype":"float16","shape":"[16]","role":"out"}]), &["rows", "cta_limit"]);
         assert_eq!(validate_entry(&spec("exlr8_dense_trellis_input_k2048_bf16", &input, 4096), &input).unwrap(),
             Op::TrellisInput { features: 2048, rotated_bf16: true });
-        // Mutations: dtype, shape, scalar name, capacity, non-unit scales mode.
-        let mut bad = prefill.clone();
-        bad["pointers"][2]["shape"] = json!("[128,8]");
-        assert!(validate_entry(&spec("p", &bad, 4096), &bad).is_err());
-        let mut bad = prefill.clone();
-        bad["geometry"]["scales"] = json!("row_kmajor");
-        assert!(validate_entry(&spec("p", &bad, 4096), &bad).is_err());
         let mut bad = pack.clone();
         bad["scalars"][1]["name"] = json!("col");
         assert!(validate_entry(&spec("p", &bad, 4096), &bad).is_err());
-        assert!(validate_entry(&spec("p", &prefill, 64), &prefill).is_err());
-        let mut bad = unpack.clone();
-        bad["geometry"]["codebook"] = json!("mcg");
-        assert!(validate_entry(&spec("u", &bad, 4096), &bad).is_err());
+        assert!(validate_entry(&spec("p", &pack, 64), &pack).is_err());
         assert!(op_of(&json!({"op": "trellis_linear"})).unwrap().is_none());
-    }
-}
-
-#[cfg(test)]
-mod exported_manifest {
-    /// Every exported EXLR8 dense entry the activation binds validates through
-    /// the program loader's routing (companion by op, ABI-v1 linear by name).
-    /// Set CUTEAFD_EXLR8_DENSE_ABIS to the export's binding ABI listing.
-    #[test]
-    #[ignore = "requires the exported binding ABI listing"]
-    fn every_exported_dense_entry_validates() {
-        let path = std::env::var("CUTEAFD_EXLR8_DENSE_ABIS").expect("CUTEAFD_EXLR8_DENSE_ABIS");
-        let listing: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        let mut checked = 0;
-        for entry in listing["programs"].as_array().unwrap() {
-            let name = entry["name"].as_str().unwrap();
-            let spec = super::ProgramSpec { name: name.into(), pointers: entry["pointers"].as_array().unwrap().iter()
-                .map(|p| p["name"].as_str().unwrap().into()).collect(),
-                scalar_kinds: entry["scalars"].as_array().unwrap().iter().map(|s|
-                    if s["type"] == "int32" { b'i' } else { b'?' }).collect(),
-                scratch: entry["scratch_bytes_at_capacity"].as_object().unwrap().iter()
-                    .map(|(k, v)| (k.clone(), v.as_u64().unwrap())).collect(),
-                capacity_rows: entry["capacity_rows"].as_u64().unwrap() as u32, geometry: entry["geometry"].clone() };
-            if name.starts_with("glm_stage_") || name.starts_with("glm2_stage_") {
-                super::super::glm_stage::validate_entry(&spec, entry).unwrap_or_else(|e| panic!("{name}: {e}"));
-            } else if super::op_of(entry).unwrap().is_some() {
-                super::validate_entry(&spec, entry).unwrap_or_else(|e| panic!("{name}: {e}"));
-            } else {
-                super::super::native_dense::validate_entry(&spec, entry).unwrap_or_else(|e| panic!("{name}: {e}"));
-            }
-            checked += 1;
-        }
-        // 76 dense operands/companions, 14 full-head and 18 TP2 attention stages.
-        assert_eq!(checked, 108);
     }
 }

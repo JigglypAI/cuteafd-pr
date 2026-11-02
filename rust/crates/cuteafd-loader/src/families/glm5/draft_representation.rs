@@ -116,6 +116,8 @@ pub struct GlmDraftRuntimeLayout {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum GlmDraftStorageError {
+    #[error(transparent)]
+    Topk(#[from] crate::formats::dflash::DflashTopkVocabError),
     #[error("unsupported GLM DFlash storage: {0}")]
     Unsupported(&'static str),
     #[error("GLM DFlash storage byte count overflow")]
@@ -135,6 +137,7 @@ fn sum(values: impl IntoIterator<Item = u64>) -> Result<u64, GlmDraftStorageErro
 impl GlmDraftRuntimeLayout {
     pub fn new(g: GlmDraftGeometry, mode: GlmDraftRepresentation, capacity: GlmDraftCapacity,
         tap_rows: usize) -> Result<Self, GlmDraftStorageError> {
+        crate::formats::dflash::validate_topk_vocab(g.vocab)?;
         if [g.hidden, g.intermediate, g.layers, g.heads, g.kv_heads, g.head_dim, g.taps, g.vocab,
             g.conv_group, g.selector_rank].contains(&0) || g.heads % g.kv_heads != 0
             || g.hidden % g.conv_group != 0 || tap_rows == 0 {
@@ -274,6 +277,7 @@ pub fn draft_geometry(config: &serde_json::Value) -> Result<(GlmDraftGeometry, u
     let int = |value: &serde_json::Value, name: &str| value[name].as_u64()
         .ok_or(GlmDraftStorageError::Unsupported("missing draft geometry"));
     let d = &config["dflash_config"];
+    crate::formats::dflash::validate_topk_vocab(int(config, "vocab_size")?)?;
     Ok((GlmDraftGeometry {
         hidden: int(config, "hidden_size")?, intermediate: int(config, "intermediate_size")?,
         layers: int(config, "num_hidden_layers")?, heads: int(config, "num_attention_heads")?,
@@ -337,6 +341,20 @@ mod tests {
             kv_heads: 8, head_dim: 128, taps: if flash { 5 } else { 6 }, vocab: 154880,
             conv_group: 16, selector_rank: 256,
         }
+    }
+
+    #[test]
+    fn topk_vocab_refuses_native_abi_before_weight_inventory() {
+        let capacity = GlmDraftCapacity::new(20, 16, 8).unwrap();
+        for vocab in [15, i32::MAX as u64 + 1] {
+            let mut g = geometry(false);
+            g.vocab = vocab;
+            assert!(matches!(GlmDraftRuntimeLayout::new(g, GlmDraftRepresentation::Bf16Only,
+                capacity, 2048), Err(GlmDraftStorageError::Topk(_))));
+        }
+        let mut g = geometry(false);
+        g.vocab = 202048;
+        assert!(GlmDraftRuntimeLayout::new(g, GlmDraftRepresentation::Bf16Only, capacity, 2048).is_ok());
     }
 
     /// RedHatAI/GLM-5.3-Flash-speculator.dspark-preview, revision 1972f1f0.

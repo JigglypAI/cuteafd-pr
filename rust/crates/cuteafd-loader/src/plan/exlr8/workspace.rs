@@ -90,7 +90,7 @@ pub fn execution_workspace(spec: &ProgramSpec, rows: usize, set: ExpertSet,
         unit_limit: if compact { unit_limit } else { units }, intermediate_bytes, compact, unit_tables })
 }
 
-fn program_spec(programs: &Value, name: &str) -> Result<ProgramSpec> {
+pub(super) fn program_spec(programs: &Value, name: &str) -> Result<ProgramSpec> {
     let entries = programs["programs"].as_array().context("PROGRAMS.json programs must be an array")?;
     let matches = entries.iter().filter(|entry| entry["name"] == name).collect::<Vec<_>>();
     ensure!(matches.len() == 1, "PROGRAMS.json requires one {name}");
@@ -108,6 +108,22 @@ fn program_spec(programs: &Value, name: &str) -> Result<ProgramSpec> {
     Ok(ProgramSpec { name: name.into(), pointers, scalar_kinds: scalars, scratch,
         capacity_rows: u32::try_from(entry["capacity_rows"].as_u64().context("EXLR8 capacity missing")?)?,
         geometry: entry["geometry"].clone() })
+}
+
+/// Admit the shared expert from the same validated geometry and arena as runtime.
+pub fn shared_workspace(programs: &Value, family: KernelFamily) -> Result<u64> {
+    let variant = ExecutionVariant::SharedDecode;
+    let group_name = variant.group(family);
+    let group = program_spec(programs, group_name)?;
+    let entry = programs["programs"].as_array().context("EXLR8 programs missing")?.iter()
+        .find(|entry| entry["name"] == group_name).context("EXLR8 grouping entry missing")?;
+    cuteafd_ffi::exlr8::validate_entry(&group, entry)?;
+    ensure!(group.geometry["hidden"].as_u64() == Some(family.geometry().hidden as u64),
+        "EXLR8 shared grouping hidden differs from compute family");
+    let spec = program_spec(programs, variant.program(family, PrefillActivations::A16))?;
+    let rows = cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS;
+    Ok(u64::try_from(execution_workspace(&spec, rows, ExpertSet::Shared, variant,
+        family.geometry().units, PrefillActivations::A16)?.bytes)?)
 }
 
 /// The stream-serialized TP2 backend owns both decode variants, one prefill
@@ -162,6 +178,70 @@ mod tests {
         if variant == ExecutionVariant::DecodeGrouped { value["geometry"]["fc2_partials"] = json!("f32"); }
         if activations == PrefillActivations::A8 && prefill { value["geometry"]["activations"] = json!("a8"); }
         value
+    }
+
+    fn shared_entries(family: KernelFamily) -> Value {
+        let h = family.geometry().hidden as u64;
+        let mut core = entry(ExecutionVariant::SharedDecode, PrefillActivations::A16);
+        core["name"] = json!(family.program(KernelKind::Shared));
+        core["geometry"]["hidden"] = json!(h);
+        core["geometry"]["top_k"] = json!(1);
+        core["geometry"]["max_groups"] = json!(4);
+        core["geometry"]["fc1_splits"] = json!(h.div_ceil(1024));
+        if family == KernelFamily::GlmFlash { core["geometry"]["swiglu_limit"] = json!(10.0); }
+        core["scratch_bytes_at_capacity"] = json!({"fc1":4*16*2*h.div_ceil(1024)*16*128*4,
+            "intermediate":4*16*16*128*2,"fc2":4*16*h*4});
+        let descriptors = [("ids", "int32", "[rows,1]".into(), "in"),
+            ("x", "bfloat16", format!("[rows,{h}]"), "in"),
+            ("signs_in", "int8", format!("[{h}]"), "in"),
+            ("group_expert", "int32", "[4]".into(), "out"),
+            ("route_slots", "int32", "[4,16]".into(), "out"),
+            ("route_group_lane", "int32", "[rows,1]".into(), "out"),
+            ("group_count", "int32", "[1]".into(), "out"),
+            ("activation", "float16", format!("[rows,{h}]"), "out")];
+        let group = json!({"name":family.program(KernelKind::SharedGroup),"capacity_rows":64,
+            "geometry":{"abi_version":2,"experts":1,"top_k":1,"max_groups":4,"max_rows":64,
+                "hidden":h,"input_format":"bf16","input_row_bytes":h*2,"ctas_per_sm":4,"ingress_warps":8},
+            "pointers":descriptors.iter().map(|(name,dtype,shape,role)|
+                json!({"name":name,"dtype":dtype,"shape":shape,"role":role})).collect::<Vec<_>>(),
+            "scalars":[{"type":"int32"},{"type":"int32"}],"scratch_bytes_at_capacity":{}});
+        json!({"programs":[core,group]})
+    }
+
+    #[test]
+    fn shared_arenas_use_the_runtime_layout_for_both_families() {
+        for family in [KernelFamily::Glm, KernelFamily::GlmFlash] {
+            let manifest = shared_entries(family);
+            let h = family.geometry().hidden;
+            let bytes = shared_workspace(&manifest, family).unwrap();
+            assert_eq!(bytes, execution_workspace_layout(64,64,16,h,1,4,
+                4*16*2*h.div_ceil(1024)*16*128*4,4*16*16*128*2,4*16*h*4,
+                ExpertSet::Shared).unwrap().1 as u64);
+            for missing in 0..2 {
+                let mut invalid = manifest.clone();
+                invalid["programs"].as_array_mut().unwrap().remove(missing);
+                assert!(shared_workspace(&invalid, family).is_err());
+            }
+            for (field,value) in [("abi_version",1),("hidden",128),("top_k",8),("units",0),("max_groups",512)] {
+                let mut invalid = manifest.clone();
+                invalid["programs"][0]["geometry"][field] = json!(value);
+                assert!(shared_workspace(&invalid, family).is_err(), "{field}");
+            }
+            for bytes in [0,u64::MAX] {
+                let mut invalid = manifest.clone();
+                invalid["programs"][0]["scratch_bytes_at_capacity"]["fc2"] = json!(bytes);
+                assert!(shared_workspace(&invalid, family).is_err());
+            }
+            let mut invalid = manifest.clone();
+            invalid["programs"][1]["pointers"][1]["dtype"] = json!("float16");
+            assert!(shared_workspace(&invalid, family).is_err());
+            invalid = manifest.clone();
+            invalid["programs"].as_array_mut().unwrap().push(manifest["programs"][1].clone());
+            assert!(shared_workspace(&invalid, family).is_err());
+            let other = if family == KernelFamily::Glm { KernelFamily::GlmFlash } else { KernelFamily::Glm };
+            assert!(shared_workspace(&manifest, other).is_err());
+        }
+        assert!(shared_workspace(&json!({"programs":[]}), KernelFamily::Glm).is_err());
     }
 
     #[test]

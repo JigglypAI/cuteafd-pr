@@ -375,3 +375,34 @@ def test_stop_grace_fits_systemd_default_and_exceeds_smokes_teardown_bound():
     cards = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cards)
     assert smoke < cards.SMOKE_STOP_GRACE_S < hwlock.STOP_GRACE_S < 90
+
+
+REAL_LOCK_DIR = Path.home() / '.cache' / 'cuteafd'
+
+
+def test_session_lock_directory_never_reaches_the_real_cache(tmp_path_factory):
+    """#1048: with no per-test patch, taking gpu1 lands in the session's private
+    directory, never in ~/.cache/cuteafd."""
+    lock_dir = hwlock.lock_dir()
+    assert lock_dir == Path(os.environ['CUTEAFD_LOCK_DIR'])
+    # pytest's basetemp may itself live under ~/.cache/cuteafd/builds; what matters
+    # is that this is not the hardware lock directory or its queue.
+    assert lock_dir.is_relative_to(tmp_path_factory.getbasetemp())
+    assert lock_dir.parent != REAL_LOCK_DIR
+    real_lock = REAL_LOCK_DIR / 'gpu1.lock'
+    before = real_lock.stat().st_mtime_ns if real_lock.exists() else None
+    with hwlock.hold(['gpu1'], wait=10) as handles:
+        assert len(handles) == 1
+        assert (lock_dir / 'gpu1.lock').exists()
+    after = real_lock.stat().st_mtime_ns if real_lock.exists() else None
+    assert after == before
+    assert not list((lock_dir / 'hwq').glob('*.ticket'))
+
+
+def test_the_guard_refuses_the_real_lock_directory():
+    """The session fixtures route every lock to tmp; a code path that reaches the
+    real directory anyway fails the test instead of taking a cluster lock."""
+    with pytest.raises(pytest.fail.Exception):
+        open(REAL_LOCK_DIR / 'gpu1.lock')
+    with pytest.raises(pytest.fail.Exception):
+        os.open(REAL_LOCK_DIR / 'hwq', os.O_RDONLY)

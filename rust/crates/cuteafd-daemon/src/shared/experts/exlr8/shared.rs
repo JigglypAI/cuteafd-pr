@@ -1,15 +1,15 @@
-//! Native shared expert owner used by the ordinary GLM MoE execution path.
-use super::*;
-use crate::shared::experts::exlr8::{Exlr8Execution, Exlr8Weights, view};
+//! Native shared-expert residency and bounded lane execution for EXLR8 families.
+use super::{Exlr8Execution, Exlr8Weights, view};
+use anyhow::{Context, Result, ensure};
+use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, exlr8::KernelFamily, programs::Programs};
 use cuteafd_loader::plan::exlr8::residency::{ExpertSet, Residency};
+use std::ffi::c_void;
 
 const ROWS: usize = cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS;
 
-#[cfg(test)]
-mod golden;
-
 pub(crate) struct NativePlan {
     plans: Vec<Residency>,
+    family: KernelFamily,
     pub(crate) resident: u64,
     pub(crate) workspace: usize,
     host_peak: usize,
@@ -22,6 +22,7 @@ impl NativePlan {
         first: usize,
         layers: usize,
         programs: &Programs<'_>,
+        family: KernelFamily,
         world: usize,
         rank: usize,
     ) -> Result<Self> {
@@ -60,9 +61,10 @@ impl NativePlan {
             .checked_add(pinned)
             .and_then(|n| n.checked_add(scratch))
             .context("EXLR8 coordinator host peak overflow")?;
-        let workspace = Exlr8Execution::shared_workspace_bytes(programs, cuteafd_ffi::exlr8::KernelFamily::Glm, ROWS)?;
+        let workspace = Exlr8Execution::shared_workspace_bytes(programs, family, ROWS)?;
         Ok(Self {
             plans,
+            family,
             resident,
             workspace,
             host_peak,
@@ -82,19 +84,20 @@ impl NativePlan {
 }
 
 pub(crate) struct NativeExperts<'a> {
+    family: KernelFamily,
     workspace: usize,
     weights: Vec<Exlr8Weights<'a>>,
     first: usize,
 }
 
 impl<'a> NativeExperts<'a> {
-    pub(crate) fn load(
-        library: &'a NativeLibrary,
-        plan: NativePlan,
-    ) -> Result<Self> {
+    pub(crate) fn load(library: &'a NativeLibrary, plan: NativePlan) -> Result<Self> {
         plan.admit_host()?;
         let NativePlan {
-            plans, workspace, ..
+            plans,
+            family,
+            workspace,
+            ..
         } = plan;
         let first = plans
             .first()
@@ -115,21 +118,23 @@ impl<'a> NativeExperts<'a> {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            family,
             workspace,
             weights,
             first,
         })
     }
 
-    pub(super) fn execution(
+    pub(crate) fn execution(
         &self,
         library: &'a NativeLibrary,
         programs: &'a Programs<'a>,
     ) -> Result<Exlr8Execution<'a>> {
         let mut execution =
-            Exlr8Execution::new_shared(library, programs, cuteafd_ffi::exlr8::KernelFamily::Glm, ROWS, self.workspace)?;
+            Exlr8Execution::new_shared(library, programs, self.family, ROWS, self.workspace)?;
         library.copy_h2d(execution.ids()?, &vec![0; ROWS * 4])?;
-        library.copy_h2d(execution.route_weights()?, bytes_of(&vec![1.0f32; ROWS]))?;
+        let route_weights: Vec<u8> = (0..ROWS).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+        library.copy_h2d(execution.route_weights()?, &route_weights)?;
         execution.seal_graph_storage()?;
         Ok(execution)
     }
@@ -151,25 +156,29 @@ impl<'a> NativeExperts<'a> {
         &self,
         library: &NativeLibrary,
         layer: usize,
-        w: &Workspace<'_>,
+        execution: &Exlr8Execution<'_>,
+        input: CuteafdDeviceBuffer,
+        output: CuteafdDeviceBuffer,
         rows: usize,
         stream: *mut c_void,
     ) -> Result<()> {
         let weights = self.weights(layer)?;
-        let execution = w.native_shared.as_ref().context("EXLR8 lane shared workspace")?;
         let stride = weights.layout.hidden * 2;
         static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let trace = *TRACE.get_or_init(|| std::env::var("CUTEAFD_EXLR8_TILE_TRACE").is_ok_and(|v| v == "1"));
+        let trace = *TRACE
+            .get_or_init(|| std::env::var("CUTEAFD_EXLR8_TILE_TRACE").is_ok_and(|v| v == "1"));
         let issued = |first, operation, returned| {
             if trace {
-                eprintln!("EXLR8 shared enqueue rank={} layer={layer} rows={rows} first={first} stream={stream:p} operation={operation} returned={returned}",
-                    weights.layout.rank);
+                eprintln!(
+                    "EXLR8 shared enqueue rank={} layer={layer} rows={rows} first={first} stream={stream:p} operation={operation} returned={returned}",
+                    weights.layout.rank
+                );
             }
         };
         for first in (0..rows).step_by(ROWS) {
             let count = (rows - first).min(ROWS);
-            let input = view(w.x.buffer, first * stride, count * stride)?;
-            let output = view(w.shared.buffer, first * stride, count * stride)?;
+            let input = view(input, first * stride, count * stride)?;
+            let output = view(output, first * stride, count * stride)?;
             // SAFETY: one stream orders copies, K1 and copies out before the next
             // chunk reuses the bounded arena; no host synchronization is needed.
             unsafe {
@@ -186,5 +195,4 @@ impl<'a> NativeExperts<'a> {
         }
         Ok(())
     }
-
 }

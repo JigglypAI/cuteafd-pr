@@ -11,7 +11,8 @@ const _: () = assert!(ROW_BYTES == 40960 + 16);
 /// Source rows and request-local positions of each member's retained CED tail.
 fn packed_tails(segments: &[crate::shared::prefill_packing::Segment])
     -> Result<Vec<(std::ops::Range<usize>, std::ops::Range<u64>)>> {
-    ensure!(segments.len() > 1 && segments.len() <= 16, "packed suffix needs 2..=16 members");
+    ensure!(segments.len() > 1 && segments.len() <= cuteafd_core::V41_MAX_REQUESTS,
+        "packed suffix needs 2..={} members", cuteafd_core::V41_MAX_REQUESTS);
     let mut first = 0;
     segments.iter().map(|segment| {
         ensure!(segment.first == first && segment.rows > 0, "packed suffix segments differ");
@@ -55,9 +56,10 @@ impl<'a> EncoderSuffix<'a> {
             next: 0, end: 0, binding: QueryBinding::new(19)?, invalid: true, packed: None })
     }
     /// One serially reused arena, charged before KV pool admission.
-    pub(crate) fn packed_storage(library: &'a NativeLibrary, unit: usize) -> Result<Self> {
+    pub(crate) fn packed_storage(library: &'a NativeLibrary, unit: usize, concurrency: usize) -> Result<Self> {
         ensure!(unit > 0 && unit <= 4096, "invalid packed suffix unit");
-        Self::arena(library, owners::packed_suffix_rows(unit as u64) as usize)
+        ensure!((1..=cuteafd_core::V41_MAX_REQUESTS).contains(&concurrency), "invalid packed suffix request count");
+        Self::arena(library, owners::packed_suffix_rows(unit as u64, concurrency as u64) as usize)
     }
     /// One prompt's suffix arena (the final window's rows), allocated at
     /// startup: the prefill slots hold one per request slot, charged with them.
@@ -217,6 +219,28 @@ mod tests {
         invalid = segments.clone(); invalid[1].start = usize::MAX;
         assert!(packed_tails(&invalid).is_err());
         assert!(packed_tails(&segments[..1]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn packed_ced_tails_cover_c33_c64_and_reject_c65() -> Result<()> {
+        use crate::shared::prefill_packing::{plan, Limits};
+        for count in [33, 64] {
+            let chunks: Vec<_> = (0..count).map(|i| (i * 1000, 1 + i % 7)).collect();
+            let segments = plan(&chunks, &Limits {
+                rows: 4096, chunk_rows: 4096, max_context: 1048576, taps: None })?;
+            let tails = packed_tails(&segments)?;
+            assert_eq!(tails.len(), count);
+            let mut first = 0;
+            for ((source, positions), &(start, rows)) in tails.iter().zip(&chunks) {
+                assert_eq!(*source, first..first + rows);
+                assert_eq!(*positions, start as u64..(start + rows) as u64);
+                first += rows;
+            }
+        }
+        let segments = plan(&[(0, 1); 65], &Limits {
+            rows: 4096, chunk_rows: 4096, max_context: 1048576, taps: None })?;
+        assert!(packed_tails(&segments).is_err());
         Ok(())
     }
 

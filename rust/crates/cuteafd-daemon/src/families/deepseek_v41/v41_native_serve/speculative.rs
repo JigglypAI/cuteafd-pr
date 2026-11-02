@@ -67,29 +67,20 @@ struct DraftRequest {
     slot: usize,
 }
 impl<'w, 'a> DraftRuntime<'w, 'a> {
-    pub fn new(
-        lib: &'a NativeLibrary,
-        weights: &'w DsparkWeights<'a>,
-        table: &'w NativeRtxTensors<'a>,
-        head: &'w VocabularyHead<'a>,
-        capacity: u32,
-    ) -> Result<Self> {
-        Self::with_requests(lib, weights, table, head, capacity, 16)
-    }
     pub fn with_requests(
         lib: &'a NativeLibrary, weights: &'w DsparkWeights<'a>,
         table: &'w NativeRtxTensors<'a>, head: &'w VocabularyHead<'a>,
         capacity: u32, requests: u32,
     ) -> Result<Self> {
-        ensure!((1..=16).contains(&requests), "invalid draft request limit");
+        ensure!((1..=cuteafd_core::V41_MAX_REQUESTS as u32).contains(&requests), "invalid draft request limit");
         let window = || DsparkWindow::new(lib, requests as usize, capacity,
             DsparkWindow::device_bytes(requests as usize, capacity)?);
         let lane_count = if requests == 1 { 1 } else { 2 };
         let lane_requests = requests.div_ceil(lane_count as u32);
-        let shared_bytes = weights.draft_bytes(requests)?;
+        let shared_bytes = weights.draft_bytes(lane_requests)?;
         let lane_bytes = weights.draft_bytes(lane_requests)?;
         let mut mains = vec![weights.main_context(capacity, DsparkMainContext::device_bytes(lib, capacity)?)?];
-        if lane_count > 1 { mains.push(weights.main_context(80, DsparkMainContext::device_bytes(lib, 80)?)?); }
+        if lane_count > 1 { mains.push(weights.main_context(cuteafd_core::V41_VERIFY_ROWS as u32, DsparkMainContext::device_bytes(lib, cuteafd_core::V41_VERIFY_ROWS as u32)?)?); }
         let chains = (0..lane_count).map(|_| weights.draft(table, head, lane_requests, lane_bytes))
             .collect::<Result<Vec<_>>>()?;
         tracing::info!(lanes=lane_count, lane_requests, draft_width=weights.draft_width(), shared_workspace_bytes=shared_bytes,
@@ -568,7 +559,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         }
         let started = Instant::now();
         ensure!(self.pending[lane].is_none(), "shared draft proposal still pending");
-        ensure!(!inputs.is_empty() && inputs.len() <= 16, "invalid draft batch size");
+        ensure!(!inputs.is_empty() && inputs.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS, "invalid draft batch size");
         let mut seen = std::collections::BTreeSet::new();
         for &(id, anchor, _, remaining) in inputs {
             ensure!(seen.insert(id) && self.requests.contains_key(&id), "invalid draft request identity");
@@ -624,7 +615,7 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
     ) -> Result<Vec<Vec<u32>>> {
         ensure!(lane < self.lanes.len(), "invalid draft lane");
         ensure!(self.pending.iter().all(Option::is_none), "shared draft proposal still pending");
-        ensure!(!inputs.is_empty() && inputs.len() <= 16, "invalid draft batch size");
+        ensure!(!inputs.is_empty() && inputs.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS, "invalid draft batch size");
         let mut seen = std::collections::BTreeSet::new();
         for &(id, anchor, _, remaining) in inputs {
             ensure!(seen.insert(id) && self.requests.contains_key(&id), "invalid draft request identity");

@@ -920,7 +920,7 @@ mod tests {
             std::fs::write(
                 directory.join("v41_exl3.json"),
                 serde_json::to_vec(&serde_json::json!({
-                    "capacity": capacity, "hidden": 8, "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32}, "buffers": {
+                    "capacity": capacity, "decode_capacity": true, "hidden": 8, "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32}, "buffers": {
                         "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": scratch, "zero_on_create": false},
                         "alias": {"allocation": "scratch", "dtype": "f32", "bytes": 99999, "zero_on_create": false},
                         "state": {"allocation": "state", "dtype": "i32", "bytes": 0, "zero_on_create": true}
@@ -947,7 +947,7 @@ mod tests {
         std::fs::write(
             directory.join("v41_exl3.json"),
             serde_json::to_vec(&serde_json::json!({
-                "capacity": 80, "hidden": 8, "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32}, "buffers": {
+                "capacity": 80, "decode_capacity": true, "hidden": 8, "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32}, "buffers": {
                     "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": 2048, "zero_on_create": false},
                     "state": {"allocation": "state", "dtype": "i32", "bytes": 0, "zero_on_create": true}
                 }

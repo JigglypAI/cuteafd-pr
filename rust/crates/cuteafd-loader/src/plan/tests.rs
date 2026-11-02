@@ -428,6 +428,7 @@ fn boot_concurrency_full_plan_matrix() {
     write_kimi_snapshot(kimi.path(), false);
     fixtures.push(("kimi_k3", kimi));
     fixtures.push(("step5", families::step5::tests::snapshot("fp8")));
+    fixtures.push(("step5", families::step5::tests::exl3_snapshot()));
     let (dense, dense_options, _, _) = crate::families::qwen3_5::tests::native_planner_fixture();
     fixtures.push(("qwen3_5", dense));
     for (family, dir) in fixtures {
@@ -435,11 +436,16 @@ fn boot_concurrency_full_plan_matrix() {
         for gpus in [1, 2] {
             for c in [1, 4, 16, 17, 32, 64, 65, 128] {
                 let mut options = if family == "qwen3_5" { dense_options.clone() }
-                    else { wave_plan_options(dir.path(), 4) };
+                    else { wave_plan_options(dir.path(), if family == "deepseek_v41" { gpus * 3 } else { 4 }) };
                 let layout = options.layout.as_mut().unwrap();
                 layout.state_slots = None;
                 layout.rtx_bytes = vec![96 << 30; gpus];
                 layout.concurrency = c;
+                if family == "deepseek_v41" {
+                    layout.workspace_manifest = v41_workspace(dir.path());
+                    layout.native_mtp_layers = 3;
+                    layout.pool_tokens = Some(262_144);
+                }
                 let (report, phases) = input.plan_with_timings(&options);
                 assert!(phases.total() < std::time::Duration::from_secs(10),
                     "{family} C{c} GPUs={gpus}: {phases:?}");
@@ -453,6 +459,10 @@ fn boot_concurrency_full_plan_matrix() {
                     let cache = report.cache_requirements.as_ref().unwrap();
                     assert_eq!(u64::from(cache.concurrency), c);
                     assert_eq!(u64::from(cache.state_slots), cuteafd_core::concurrency::state_slots(c));
+                    if family == "deepseek_v41" {
+                        assert!(report.fits && report.placement_supported && report.executable(),
+                            "V4.1 C{c} GPUs={gpus}: {}", render(&report));
+                    }
                     if !report.fits || !report.placement_supported {
                         let memory = report.memory_layout.as_ref().unwrap();
                         assert!(!report.hints.is_empty() || !memory.notes.is_empty()
@@ -461,6 +471,38 @@ fn boot_concurrency_full_plan_matrix() {
                     }
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn v41_full_concurrency_launcher_admission_and_configured_draft_width() {
+    use cuteafd_core::memory_layout::Category;
+    let dir = strict_v41_snapshot(false);
+    let input = PlanInput::open(dir.path()).unwrap();
+    for (gpus, ranks) in [(1, 3), (2, 6)] {
+        for concurrency in [17, 32, 33, 64] {
+            let mut draft_bytes = Vec::new();
+            for limit in [5, 7] {
+                let mut options = wave_plan_options(dir.path(), ranks);
+                let layout = options.layout.as_mut().unwrap();
+                layout.rtx_bytes = vec![96 << 30; gpus];
+                layout.concurrency = concurrency;
+                layout.context_tokens = 262_144;
+                layout.pool_tokens = Some(0);
+                layout.workspace_manifest = v41_workspace(dir.path());
+                layout.native_mtp_layers = 3;
+                layout.dspark_draft_limit = limit;
+                let start = std::time::Instant::now();
+                let report = input.plan_spark_count(&options, 6, Some(ranks)).unwrap();
+                assert!(start.elapsed() < std::time::Duration::from_secs(10));
+                assert!(report.fits && report.placement_supported && report.executable(),
+                    "C{concurrency} GPUs={gpus} width={limit}: {}", render(&report));
+                let memory = report.memory_layout.as_ref().unwrap();
+                draft_bytes.push(memory.devices.iter().flat_map(|d| &d.items)
+                    .filter(|i| i.category == Category::Drafter).map(|i| i.bytes).sum::<u64>());
+            }
+            assert!(draft_bytes[1] > draft_bytes[0], "configured width must charge larger terminal/head owners");
         }
     }
 }
@@ -1312,7 +1354,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
         let catalog = crate::read_expert_catalog(dir.path()).unwrap();
         for (ranks, gpus) in [(3, 1), (4, 1), (6, 2)] {
             let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-                rtx_bytes: vec![96 << 30; gpus], local_expert_layers: Some(1),
+                rtx_bytes: vec![96 << 30; gpus], onboard: Some(crate::placement::OnboardSetting::Layers(1)),
                 workspace_manifest: v41_workspace(dir.path()),
                 pool_tokens: Some(2_097_152), ..Default::default()
             }), ..sparks(ranks) };
@@ -2411,7 +2453,7 @@ fn native_display_suffix_does_not_skip_v41_or_v4_resident_census() {
         let dir = if v41 { strict_v41_snapshot(false) } else { v4_snapshot() };
         let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
             host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
-            rtx_bytes: vec![96 << 30], local_expert_layers: Some(1),
+            rtx_bytes: vec![96 << 30], onboard: Some(crate::placement::OnboardSetting::Layers(1)),
             workspace_manifest: v41.then(|| dir.path().join("share/PROGRAMS.json")),
             pool_tokens: Some(262_144), prefill_rows: 256, ..Default::default()
         }), ..sparks(4) }).unwrap();
@@ -2579,9 +2621,9 @@ fn v4_missing_workspace_manifest_keeps_conservative_small_card_reserve() {
 #[test]
 fn v4_pool_first_defaults_and_explicit_layer_failure() {
     let dir = v4_snapshot();
-    let solve = |bytes, pool_tokens, local_expert_layers| plan(dir.path(), &PlanOptions {
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![bytes], pool_tokens, local_expert_layers,
-            onboard: local_expert_layers.is_none().then_some(crate::placement::OnboardSetting::Auto), ..Default::default() }),
+    let solve = |bytes, pool_tokens, layers: Option<usize>| plan(dir.path(), &PlanOptions {
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![bytes], pool_tokens,
+            onboard: Some(layers.map_or(crate::placement::OnboardSetting::Auto, crate::placement::OnboardSetting::Layers)), ..Default::default() }),
         ..sparks(2)
     }).unwrap();
     let large = solve(96 << 30, None, None);
@@ -3624,7 +3666,7 @@ fn glm_next_facts_and_dflash2_drafter_are_described() {
     assert!(notes.contains("SwiGLU clamp 10"), "{notes}");
 
     let draft = snapshot(
-        json!({"architectures": ["DFlash2DraftModel"], "hidden_size": 64, "vocab_size": 8,
+        json!({"architectures": ["DFlash2DraftModel"], "hidden_size": 64, "vocab_size": 16,
                "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 1, "head_dim": 16,
                "sliding_window": 2048, "intermediate_size": 128, "num_target_layers": 45,
                "dflash_config": {"block_size": 8, "target_layer_ids": [5, 14]}}),
@@ -3888,7 +3930,7 @@ fn v41_small_card_graph_envelope_preserves_pro_allowance() {
     let dir = strict_v41_snapshot(false);
     for (gib, expected) in [(32, 2u64 << 30), (96, 3264u64 << 20)] {
         let options = PlanOptions {
-            layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![gib << 30], prefill_rows: 256, local_expert_layers: Some(0),
+            layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![gib << 30], prefill_rows: 256, onboard: Some(crate::placement::OnboardSetting::Layers(0)),
                 pool_tokens: Some(262_144), workspace_manifest: v41_workspace(dir.path()), ..Default::default() }),
             ..sparks(4)
         };
@@ -3927,7 +3969,7 @@ fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
     let mut options = sparks(4);
     options.vision = MediaMode::Auto;
     options.layout = Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![32 << 30], pool_tokens: Some(512),
-        local_expert_layers: Some(0), native_mtp_layers: 0, prefill_rows: 256,
+        onboard: Some(crate::placement::OnboardSetting::Layers(0)), native_mtp_layers: 0, prefill_rows: 256,
         workspace_manifest: v41_workspace(dir.path()), ..Default::default() });
     use super::encoder::EncoderKind;
     let auto_report = plan(dir.path(), &options).unwrap();
@@ -4354,7 +4396,7 @@ fn v41_encoder_preserves_experts_and_falls_back_at_runtime_budget() {
     use cuteafd_core::memory_layout::{Category, DeviceKind};
     let dir = strict_v41_snapshot(false);
     let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-        rtx_bytes: vec![96 << 30], local_expert_layers: Some(0), pool_tokens: Some(32768),
+        rtx_bytes: vec![96 << 30], onboard: Some(crate::placement::OnboardSetting::Layers(0)), pool_tokens: Some(32768),
         prefill_rows: 256, workspace_manifest: v41_workspace(dir.path()),
         spark_allocation_budget_bytes: Some(100 << 30), ..Default::default()
     }), ..Default::default() };
