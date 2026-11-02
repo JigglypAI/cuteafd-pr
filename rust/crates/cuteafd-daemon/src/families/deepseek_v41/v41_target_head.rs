@@ -151,7 +151,7 @@ pub(crate) struct TargetHeadWave<'w, 'a> {
     sampling: TargetSamplingWave<'a>,
 }
 impl TargetHeadWave<'_, '_> {
-    /// Up to 16 decode/prefill-last rows or 80 verification rows per head wave.
+    /// Target verification rows are bounded by the shared V4.1 verifier budget.
     pub fn device_bytes(capacity: usize) -> Result<usize> {
         ensure!(
             (1..=80).contains(&capacity),

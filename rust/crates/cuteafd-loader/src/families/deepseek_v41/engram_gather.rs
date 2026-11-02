@@ -235,7 +235,7 @@ impl EngramGatherer {
     fn job(&self, table: Arc<EngramTable>, batches: &[Arc<EngramBatch>],
         layer: usize) -> Result<EngramGatherJob> {
         ensure!(
-            !batches.is_empty() && batches.len() <= 16,
+            !batches.is_empty() && batches.len() <= cuteafd_core::V41_MAX_REQUESTS,
             "invalid engram request batch count"
         );
         let rows = batches.iter().try_fold(0usize, |sum, batch| {

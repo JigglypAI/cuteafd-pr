@@ -142,6 +142,8 @@ pub struct LayoutOptions {
     pub mimo_expert_input: crate::families::mimo_v2::MimoExpertInput,
     /// Drafter batch override; absent uses the family serving default.
     pub draft_sequences: Option<u64>,
+    /// V4.1 configured proposal limit; loaded neural width is five or seven.
+    pub dspark_draft_limit: u8,
     /// Shared GQA drafter rings, independent of target KV and weight precision.
     pub draft_kv_cache: crate::families::qwen4::Qwen4KvCache,
     /// Explicit MiMo DFlash context arena; does not widen its draft batch.
@@ -282,6 +284,7 @@ impl Default for LayoutOptions {
             mimo_swa_kv: crate::families::mimo_v2::MimoKvFormats::default().sliding,
             mimo_expert_input: Default::default(),
             draft_sequences: None,
+            dspark_draft_limit: 5,
             draft_kv_cache: crate::families::qwen4::Qwen4KvCache::Fp8,
             draft_context_slots: None,
             mimo_decode_graphs: false,

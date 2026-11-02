@@ -357,9 +357,14 @@ impl InstalledExpertVariant {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ExpertGroupingSelector { Native, Exl3Nearest, Exl3GlmFlashK64, Fp8Nearest }
+pub enum ExpertGroupingSelector {
+    Native { exports: cuteafd_core::spark_executions::ExpertExportCapacities },
+    Exl3Nearest,
+    Exl3GlmFlashK64,
+    Fp8Nearest,
+}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("installed expert weight_read_bytes missing for rank {rank}, selector {selector:?}, checkpoint {checkpoint}, manifest {manifest:?}; EXL3 pricing requires its checkpoint manifest")]
@@ -455,17 +460,22 @@ impl InstalledExpertGrouping {
         ensure!(self.variants.windows(2).all(|pair| pair[0].capacity < pair[1].capacity),
             "installed expert capacities must be distinct and ascending");
         let capacities: Vec<_> = self.variants.iter().map(|variant| variant.capacity).collect();
-        let expected = match self.selector {
-            ExpertGroupingSelector::Native => {
+        let expected = match &self.selector {
+            ExpertGroupingSelector::Native { exports } => {
+                exports.validate().map_err(anyhow::Error::msg)?;
                 let main = *capacities.last().context("native main capacity missing")?;
                 ensure!(main >= self.capacity
-                    && capacities.iter().all(|&c| c == main || c == 1 || (c == 80 && main > 80)),
-                    "native report must name its actual main and optional m1/m80 executions");
+                    && capacities.iter().all(|&c| exports.capacities.contains(&(c as u32))),
+                    "native report must name manifest-declared executions covering its live capacity");
                 if let Some(model) = self.loaded.model() {
                     ensure!(main == model.compiled_capacity() as usize,
                         "installed native main capacity differs from ModelAdmission compiled capacity");
                 }
-                capacities.clone()
+                let grouped = exports.grouped_decode(main as u32).map_err(anyhow::Error::msg)?;
+                let mut expected = vec![1, grouped as usize, main];
+                expected.sort_unstable();
+                expected.dedup();
+                expected
             }
             ExpertGroupingSelector::Fp8Nearest => {
                 ensure!(capacities.last().is_some_and(|&last| last >= self.capacity),
@@ -1123,12 +1133,20 @@ mod tests {
         Ok(())
     }
 
+    fn native_selector() -> ExpertGroupingSelector {
+        ExpertGroupingSelector::Native {
+            exports: cuteafd_core::spark_executions::ExpertExportCapacities {
+                capacities: vec![1, 16, 80, 256, 1024, 4096], decode: vec![1, 16, 80],
+            },
+        }
+    }
+
     fn grouping(rank: usize, compact: usize) -> InstalledExpertGrouping {
         let loaded = WorkerSelection::new(identity(), &[13, 14, 15]).unwrap();
         let variants = [1, 80, 256].into_iter().map(|capacity|
             InstalledExpertVariant::from_queries(capacity, |rows|
                 Ok(if rows > 0 && rows <= compact.min(capacity) { 1 } else { 16 })).unwrap()).collect();
-        InstalledExpertGrouping::new(loaded, rank, 256, ExpertGroupingSelector::Native, variants).unwrap()
+        InstalledExpertGrouping::new(loaded, rank, 256, native_selector(), variants).unwrap()
     }
 
     pub(super) fn admission_selection() -> WorkerSelection {
@@ -1519,6 +1537,48 @@ mod tests {
     }
 
     #[test]
+    fn v41_tp3_tp6_native_reports_follow_installed_decode_contract() -> Result<()> {
+        use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings, V41_VERIFY_ROWS};
+        let geometry = ExpertGeometry::DEEPSEEK_V41;
+        let verify = V41_VERIFY_ROWS as u32;
+        for tp in [3u8, 6] {
+            let exports = cuteafd_core::mxfp4_layouts::native_export_capacities("v41",
+                if tp == 3 { "spark_tp3" } else { "spark_tp6" });
+            let identity = WorkerIdentity {
+                geometry: [geometry.hidden, geometry.experts, geometry.topk, geometry.intermediate, geometry.layers],
+                world: u32::from(tp), topology: [tp, 1], ..identity()
+            };
+            let model = ModelAdmission::new(vec![
+                SparkEndpoint { capacity: verify, ingress: SparkIngress::Bf16, ring_depth: None },
+                SparkEndpoint { capacity: verify, ingress: SparkIngress::Bf16, ring_depth: None },
+                SparkEndpoint { capacity: 2752, ingress: SparkIngress::Bf16, ring_depth: None },
+            ], SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+                SparkExecutions::admit(&[verify, verify], 2752, 2752, 3, &exports.capacities)?)?;
+            let loaded = WorkerSelection::new(identity.clone(), &[13])?.with_model(model)?;
+            let variants = |grouped| [1, grouped, 4096].into_iter().map(|capacity|
+                InstalledExpertVariant::from_queries(capacity, |_| Ok(16))).collect::<Result<Vec<_>>>();
+            let selector = ExpertGroupingSelector::Native { exports };
+            let reports = (0..usize::from(tp)).map(|rank| InstalledExpertGrouping::new(
+                loaded.clone(), rank, 2752, selector.clone(), variants(V41_VERIFY_ROWS)?))
+                .collect::<Result<Vec<_>>>()?;
+            InstalledExpertGrouping::validate_ranks(&reports)?;
+            let encoded = serde_json::to_value(&reports[0])?;
+            let restored: InstalledExpertGrouping = serde_json::from_value(encoded.clone())?;
+            restored.validate_for(&identity, 0, V41_VERIFY_ROWS, 13..14)?;
+            assert_eq!(restored, reports[0]);
+            for bad in [16, 80, 128] {
+                assert!(InstalledExpertGrouping::new(loaded.clone(), 0, 2752,
+                    selector.clone(), variants(bad)?).is_err(), "TP{tp} accepted m{bad}");
+            }
+            let mut malformed = encoded;
+            malformed["selector"]["native"]["exports"]["decode"] = serde_json::json!([1, 80]);
+            let malformed: InstalledExpertGrouping = serde_json::from_value(malformed)?;
+            assert!(malformed.validate_for(&identity, 0, V41_VERIFY_ROWS, 13..14).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn native_compiled_capacity_covers_live_but_does_not_admit_extra_rows() -> Result<()> {
         let mut selection = admission_selection();
         let model = selection.model.as_mut().unwrap();
@@ -1528,16 +1588,16 @@ mod tests {
         let variants = [1, 80, 4096].into_iter().map(|capacity|
             InstalledExpertVariant::from_queries(capacity, |_| Ok(16))).collect::<Result<Vec<_>>>()?;
         let report = InstalledExpertGrouping::new(selection.clone(), 0, 2048,
-            ExpertGroupingSelector::Native, variants.clone())?;
+            native_selector(), variants.clone())?;
         assert!(report.group_rows(2048).is_ok());
         assert!(report.group_rows(2049).is_err());
         assert!(InstalledExpertGrouping::new(selection.clone(), 0, 4096,
-            ExpertGroupingSelector::Native, variants.clone()).is_err());
+            native_selector(), variants.clone()).is_err());
         selection.model.as_mut().unwrap().executions.prefill.compiled_capacity = 1024;
         assert!(selection.validate().is_err());
         selection.model.as_mut().unwrap().executions.prefill.compiled_capacity = 2048;
         assert!(InstalledExpertGrouping::new(selection, 0, 2048,
-            ExpertGroupingSelector::Native, variants).is_err());
+            native_selector(), variants).is_err());
         Ok(())
     }
 

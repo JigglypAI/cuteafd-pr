@@ -19,6 +19,9 @@ def layouts() -> dict:
 
 
 def validate(data: dict) -> None:
+    decode = data["decode_capacities"]
+    if not decode or decode[0] != 1 or decode != sorted(set(decode)) or decode[-1] > 80 or data["prefill_capacities"] != [256, 1024, 4096]:
+        raise ValueError("invalid native MXFP4 capacity recipe")
     sms = set()
     for row in data["stream_prefill"]:
         cutoff = row["min_work"]
@@ -166,7 +169,7 @@ def native_scratch_bytes(hidden: int, width: int, experts: int, topk: int,
                          capacity: int, sm: int, role: str, coded: bool) -> int:
     """Exact standard export census, excluding the owner's shared I/O planes."""
     stored_width(hidden, width)
-    if experts <= 0 or topk <= 0 or capacity not in (1, 16, 80, 256, 1024, 4096):
+    if experts <= 0 or topk <= 0 or capacity not in (1, 16, 64, 80, 256, 1024, 4096):
         raise ValueError("invalid native scratch geometry")
     if native_prefill(hidden, width, sm, capacity, experts, topk):
         end = native_prefill_scratch(capacity, hidden, width, experts, topk)[1]
@@ -195,6 +198,19 @@ def assert_native_scratch_variant(variant: dict, hidden: int, width: int, expert
     if (variant["core_scratch_nbytes"] != expected
             or variant["output_kind"] != ("fp32_tokens" if atomic else "fp32_routes")):
         raise ValueError("native exporter scratch/output differs from planner census")
+
+
+def native_export_capacities(family: str, role: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("native_v41_capacities", Path(__file__).with_name("v41_capacities.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    DECODE_CAPACITIES = module.DECODE_CAPACITIES
+    decode = (DECODE_CAPACITIES if family == "v41" and role not in ("coordinator", "dspark_tp2")
+              else tuple(layouts()["decode_capacities"]))
+    draft = (40,) if family == "v41" and role in ("coordinator", "dspark_tp2") else ()
+    decode = tuple(sorted((*decode, *draft)))
+    return (*decode, *layouts()["prefill_capacities"]), decode
 
 
 def native_fc1_k_splits(hidden: int, width: int, sm: int, capacity: int) -> int:

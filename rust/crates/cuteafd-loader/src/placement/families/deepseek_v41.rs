@@ -148,7 +148,7 @@ impl NativeWorkspace {
 pub fn expert_capacities(rows: u64, local: bool) -> anyhow::Result<Vec<u64>> {
     use anyhow::{ensure, Context};
     ensure!((1..=4096).contains(&rows), "invalid V4.1 expert capacity");
-    let capacities = [1, 16, 80, 256, 1024, 4096];
+    let capacities = cuteafd_core::V41_TARGET_CAPACITIES;
     let compiled = capacities
         .into_iter()
         .find(|&n| n >= rows)
@@ -158,7 +158,7 @@ pub fn expert_capacities(rows: u64, local: bool) -> anyhow::Result<Vec<u64>> {
             rows == compiled,
             "local expert rows must be a compiled capacity"
         );
-        Ok([1, 16, 80]
+        Ok(cuteafd_core::V41_DECODE_CAPACITIES.map(|n| n as u64)
             .into_iter()
             .filter(|&n| n < rows)
             .chain([rows])
@@ -397,7 +397,7 @@ pub fn cache_demands(request: &mut PlacementRequest, config: &serde_json::Value,
     use cuteafd_core::memory_layout::{Basis, Category};
     let ranks = request.inventory.gpus.len();
     let geometry = crate::serving_capacity::deepseek_v41_cache_geometry(config, ranks)?;
-    ensure!((1..=16).contains(&slots) && retained_turns <= 128 && (!replicated || ranks == 2),
+    ensure!((1..=cuteafd_core::V41_MAX_REQUESTS as u64).contains(&slots) && retained_turns <= 128 && (!replicated || ranks == 2),
         "invalid V4.1 cache admission shape");
     let tails = slots + 2 * retained_turns;
     let mut units = geometry.ranks.iter().map(|r| r.persistent_unit_bytes).collect::<Vec<_>>();
@@ -756,7 +756,7 @@ mod tests {
     fn exact_cache_demands_match_allocator_across_table_caps_and_replicas() {
         use cuteafd_core::memory_layout::Category;
         for (ranks, replicated) in [(1, false), (2, false), (2, true)] {
-            for (slots, turns) in [(1, 0), (16, 20), (3, 128)] {
+            for (slots, turns) in [(1, 0), (16, 20), (17, 20), (32, 20), (64, 80), (3, 128), (64, 128)] {
                 let tails = slots + 2 * turns;
                 for physical in [tails + slots, 2047, 2048, 2049, 4095, 4096, 4097, 131072] {
                     let logical = physical - tails;
@@ -779,28 +779,35 @@ mod tests {
     }
 
     #[test]
+    fn exact_cache_rejects_slots_outside_compiled_request_bank() {
+        for slots in [0, cuteafd_core::V41_MAX_REQUESTS as u64 + 1] {
+            assert!(crate::serving_capacity::deepseek_v41_cache_bytes(&config(), 1, slots, 2048, false).is_err());
+        }
+    }
+
+    #[test]
     fn native_manifest_demands_use_exact_retained_variants_and_resident_width() {
         let mut manifest = serde_json::json!({"role":"rtx_tp2", "geometry": {
             "hidden":5120,"intermediate":1152,"kernel_intermediate":1280,"experts":256,"topk":6},
-            "variants": ([1,16,80,256,1024,4096].map(|c| serde_json::json!({
+            "variants": ([1,16,64,256,1024,4096].map(|c| serde_json::json!({
                 "capacity_rows":c,"core_scratch_nbytes":if c == 16 { 99999 } else { c * 7 }})))});
         let demand = NativeWorkspace::from_manifest(&manifest,"rtx_tp2", 81,5120,1152,256,6).unwrap();
         assert_eq!(demand, NativeWorkspace { scratch_bytes:99999, kernel_intermediate:1280 });
         assert_eq!(demand.lane_bytes(81,5120,6,true,false).unwrap(),99999+81*5120*(4+26));
         assert_eq!(demand.lane_bytes(81,5120,6,true,true).unwrap(),99999+81*5120*(12+26));
         assert_eq!(demand.lane_bytes(81,5120,6,false,false).unwrap(),99999+81*5120*2);
-        manifest["variants"][2]["requested_rows"] = 80.into();
+        manifest["variants"][2]["requested_rows"] = 64.into();
         manifest["variants"][2]["capacity_rows"] = 96.into();
         assert_eq!(NativeWorkspace::from_manifest(&manifest,"rtx_tp2",81,5120,1152,256,6).unwrap(), demand);
         manifest["variants"][2]["requested_rows"] = 79.into();
         assert!(NativeWorkspace::from_manifest(&manifest,"rtx_tp2",81,5120,1152,256,6).is_err());
-        manifest["variants"][2]["requested_rows"] = 80.into();
+        manifest["variants"][2]["requested_rows"] = 64.into();
         let duplicate = manifest["variants"][2].clone();
         manifest["variants"].as_array_mut().unwrap().push(duplicate);
         assert!(NativeWorkspace::from_manifest(&manifest,"rtx_tp2",81,5120,1152,256,6).is_err());
         assert!(NativeWorkspace::from_manifest(&manifest,"rtx_backbone",256,5120,1152,256,6).is_err());
-        assert_eq!(expert_capacities(4096,true).unwrap(), [1,16,80,4096]);
-        assert_eq!(expert_capacities(81,false).unwrap(), [1,16,80,256]);
+        assert_eq!(expert_capacities(4096,true).unwrap(), [1,16,64,4096]);
+        assert_eq!(expert_capacities(81,false).unwrap(), [1,16,64,256]);
         assert!(expert_capacities(81,true).is_err());
         assert!(expert_capacities(4097,false).is_err());
         assert!(owner_workspace(1,1,u64::MAX).is_err());
@@ -812,7 +819,7 @@ mod tests {
     #[test]
     fn shared_fp8_capacity_scratch_is_a_sum_not_a_maximum() {
         let variants = [(5120,1152),(1152,5120)].into_iter().flat_map(|(k,n)|
-            [1,16,80,256,1024,4096].map(|c| serde_json::json!({"capacity":c,"input_dim":k,
+            [1,16,64,256,1024,4096].map(|c| serde_json::json!({"capacity":c,"input_dim":k,
                 "output_dim":n,"label":format!("shared_{k}_{n}_m{c}"),"scratch_bytes":c+1}))).collect::<Vec<_>>();
         let manifest = serde_json::json!({"variants":variants});
         assert_eq!(shared_workspace(&manifest,257,188).unwrap(),

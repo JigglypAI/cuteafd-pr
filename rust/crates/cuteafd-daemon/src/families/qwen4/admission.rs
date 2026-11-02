@@ -379,7 +379,7 @@ mod tests {
                     .join(format!("rtx-tp2-rank{rank}/m{capacity}"));
                 std::fs::create_dir_all(&path)?;
                 let manifest = serde_json::json!({"hidden": 2560, "intermediate": width, "experts": 512,
-                    "top_k": 10, "capacity": capacity, "output_dtype": "fp32",
+                    "top_k": 10, "capacity": capacity, "decode_capacity": true, "output_dtype": "fp32",
                     "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32},
                     "buffers": {"scratch": {"allocation": "scratch", "bytes": capacity * width,
                         "dtype": "f16", "zero_on_create": false},
@@ -615,7 +615,7 @@ mod tests {
                 let path = packages[rank].join(format!("m{capacity}"));
                 std::fs::create_dir_all(&path)?;
                 let m = serde_json::json!({"hidden": 2560, "intermediate": width, "experts": 512,
-                    "top_k": 10, "capacity": capacity, "output_dtype": "fp32",
+                    "top_k": 10, "capacity": capacity, "decode_capacity": true, "output_dtype": "fp32",
                     "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32},
                     "buffers": {"scratch": {"allocation": "scratch", "bytes": capacity * width,
                         "dtype": "f16", "zero_on_create": false}}});
@@ -628,7 +628,7 @@ mod tests {
                 let path = draft_package.join(format!("m{capacity}"));
                 std::fs::create_dir_all(&path)?;
                 let m = serde_json::json!({"hidden": 2560, "intermediate": 640, "experts": 512,
-                    "top_k": 10, "capacity": capacity, "tile": [64, 128, 64, 128],
+                    "top_k": 10, "capacity": capacity, "decode_capacity": true, "tile": [64, 128, 64, 128],
                     "trellis_lut": {"bytes": 32},
                     "buffers": {"scratch": {"allocation": "scratch", "bytes": capacity * 640,
                         "dtype": "f16", "zero_on_create": false}}});

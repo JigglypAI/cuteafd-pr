@@ -12,14 +12,14 @@ use cuteafd_ffi::{
 };
 use std::{ffi::c_void, rc::Rc};
 
-pub(crate) fn kernel_capacities(max_rows: usize) -> Result<Vec<u32>> {
+pub(crate) fn kernel_capacities(max_rows: usize, exports: &[u32]) -> Result<Vec<u32>> {
     ensure!((1..=4096).contains(&max_rows), "invalid TP2 rank capacity");
-    let capacities = [1, 16, 80, 256, 1024, 4096];
+    let capacities = exports;
     let compiled = capacities
-        .into_iter()
+        .iter().copied()
         .find(|&c| c as usize >= max_rows)
-        .unwrap();
-    Ok(capacities.into_iter().filter(|&c| c <= compiled).collect())
+        .context("native package lacks covering capacity")?;
+    Ok(capacities.iter().copied().filter(|&c| c <= compiled).collect())
 }
 
 pub(super) fn output_bytes(geometry: ExpertGeometry, rows: usize) -> Result<usize> {
@@ -255,7 +255,8 @@ impl<'a> NativeTp2<'a> {
             "NVFP4 W4A4 requires BF16 route planes and explicit FirstCapacity selection"
         );
         let layer = ExpertLayer::BackboneTp2 { layer: 0, rank: 0 };
-        let infos = kernel_capacities(max_rows)?
+        let infos = kernel_capacities(max_rows, &if nvfp4 { library.nvfp4_expert_exports(3)? }
+            else { library.native_expert_exports(3)? }.capacities)?
             .into_iter()
             .map(|capacity| layer.select_info(library, capacity, nvfp4))
             .collect::<Result<Vec<_>>>()?;
@@ -649,7 +650,8 @@ impl<'a> NativeTp2<'a> {
             "NVFP4 W4A4 requires BF16 route planes and explicit FirstCapacity selection"
         );
         let kernels = device.run(|| {
-            kernel_capacities(max_rows)?
+            kernel_capacities(max_rows, &if nvfp4 { device.library.nvfp4_expert_exports(3)? }
+                else { device.library.native_expert_exports(3)? }.capacities)?
                 .into_iter()
                 .map(|c| {
                     ExpertLayer::BackboneTp2 {
@@ -1127,10 +1129,10 @@ mod tests {
             (255, vec![1, 16, 80, 256]),
             (4096, vec![1, 16, 80, 256, 1024, 4096]),
         ] {
-            assert_eq!(kernel_capacities(rows).unwrap(), expected);
+            assert_eq!(kernel_capacities(rows, &[1,16,80,256,1024,4096]).unwrap(), expected);
         }
-        assert!(kernel_capacities(0).is_err());
-        assert!(kernel_capacities(4097).is_err());
+        assert!(kernel_capacities(0, &[1,16,80,256,1024,4096]).is_err());
+        assert!(kernel_capacities(4097, &[1,16,80,256,1024,4096]).is_err());
     }
     #[test]
     fn output_extent_uses_each_geometry() {

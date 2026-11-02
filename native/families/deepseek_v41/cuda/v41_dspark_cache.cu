@@ -1,3 +1,4 @@
+#include "v41_capacity.h"
 #include "cuteafd_v41_dspark_cache.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -42,12 +43,12 @@ bool separate(const void* a, uint64_t an, const void* b, uint64_t bn) {
 extern "C" int32_t cuteafd_v41_dspark_cache_write_fp8(const uint16_t* source,
     const cuteafd_v41_kv_write_t* writes, uint8_t* ring, int32_t source_rows,
     int32_t slots, void* stream) {
-  if (source_rows < 1 || source_rows > 4096 || slots < 1 || slots > 16) return cudaErrorInvalidValue;
+  if (source_rows < 1 || source_rows > 4096 || slots < 1 || slots > CUTEAFD_V41_MAX_REQUESTS) return cudaErrorInvalidValue;
   const uint64_t input_bytes = uint64_t(source_rows) * 1024, ring_bytes = uint64_t(slots) * 128 * CUTEAFD_V41_DSPARK_KV_ROW_BYTES;
-  if (!span(source,input_bytes,2) || !span(writes,384,8) || !span(ring,ring_bytes,1) ||
-      !separate(source,input_bytes,writes,384) || !separate(source,input_bytes,ring,ring_bytes) ||
-      !separate(writes,384,ring,ring_bytes)) return cudaErrorInvalidValue;
-  write_window<<<dim3(128,16),512,0,reinterpret_cast<cudaStream_t>(stream)>>>(
+  if (!span(source,input_bytes,2) || !span(writes,CUTEAFD_V41_WRITE_DESCRIPTOR_BYTES,8) || !span(ring,ring_bytes,1) ||
+      !separate(source,input_bytes,writes,CUTEAFD_V41_WRITE_DESCRIPTOR_BYTES) || !separate(source,input_bytes,ring,ring_bytes) ||
+      !separate(writes,CUTEAFD_V41_WRITE_DESCRIPTOR_BYTES,ring,ring_bytes)) return cudaErrorInvalidValue;
+  write_window<<<dim3(128,CUTEAFD_V41_MAX_REQUESTS),512,0,reinterpret_cast<cudaStream_t>(stream)>>>(
       reinterpret_cast<const __nv_bfloat16*>(source), writes,
       ring,source_rows,slots);
   return cudaGetLastError();

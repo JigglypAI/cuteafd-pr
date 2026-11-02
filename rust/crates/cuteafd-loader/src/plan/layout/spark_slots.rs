@@ -147,10 +147,13 @@ fn mxfp4_owner_bytes(geometry: cuteafd_core::ExpertGeometry,
     anyhow::ensure!(!artifacts.is_empty() && artifacts.len() <= 2,
         "native owner needs one or two retained width states");
     let mut scratch = 0u64;
-    let mut capacities = vec![extent.compiled];
-    if extent.compiled > 1 { capacities.push(1); }
-    if extent.compiled > 80 { capacities.push(80); }
     for artifact in artifacts {
+        let exports = cuteafd_core::mxfp4_layouts::native_export_capacities(
+            geometry.family().context("unknown native expert family")?, &artifact.name);
+        let grouped = exports.grouped_decode(extent.compiled).map_err(anyhow::Error::msg)?;
+        let mut capacities = vec![extent.compiled];
+        if extent.compiled > 1 { capacities.push(1); }
+        if extent.compiled > grouped { capacities.push(grouped); }
         for &capacity in &capacities {
             let bytes = cuteafd_core::mxfp4_layouts::native_scratch_bytes(geometry.hidden as usize,
                 geometry.experts as usize, geometry.topk as usize, artifact.logical,
@@ -199,7 +202,7 @@ pub(crate) fn owner_bytes(input: &super::super::PlanInput, working: &SparkWorkin
     let geometry = catalog.routed_experts().geometry()?;
     let backend = SparkBackend::for_catalog(catalog)?;
     let groups = native_groups(input, family, working, rank)?;
-    let artifacts = if matches!(backend, SparkBackend::Native) && catalog.nvfp4().is_none() {
+    let artifacts = if backend.is_native_census() && catalog.nvfp4().is_none() {
         Some(mxfp4_rank_artifacts(catalog, working, rank)?)
     } else { None };
     let coded = catalog.mxfp4_scale_codes();
@@ -211,7 +214,7 @@ pub(crate) fn owner_bytes(input: &super::super::PlanInput, working: &SparkWorkin
         match (&groups, backend) {
             (Some((geometry, formats)), SparkBackend::Fp8) => fp8_owner_bytes(&family, *geometry, formats, extent),
             (_, SparkBackend::Exl3(_)) => exl3_owner_bytes(&family, geometry, extent),
-            (_, SparkBackend::Native | SparkBackend::Exlr8 | SparkBackend::Fp8) =>
+            (_, SparkBackend::Native | SparkBackend::V41 | SparkBackend::Exlr8 | SparkBackend::Fp8) =>
                 Ok(legacy_owner_bytes(&family, geometry, extent)),
         }
     })
@@ -268,8 +271,10 @@ mod tests {
             for world in 2..=8 {
                 let artifacts = native_spark_artifacts(geometry.hidden as usize,
                     geometry.intermediate as usize, world)?;
-                for compiled in [1, 16, 80, 256, 1024, 4096] {
-                    let live = compiled.min(80);
+                let exports = cuteafd_core::mxfp4_layouts::native_export_capacities(geometry.family().unwrap(), "spark");
+                let decode = *exports.decode.last().unwrap();
+                for compiled in exports.capacities {
+                    let live = compiled.min(decode);
                     let shape = extent(live, compiled);
                     let total = mxfp4_owner_bytes(geometry, &artifacts, coded, shape)?;
                     let singles = artifacts.iter().map(|artifact|
@@ -278,7 +283,7 @@ mod tests {
                     assert_eq!(total.scratch, singles.iter().map(|owner| owner.scratch).sum::<u64>());
                     assert_eq!(total.io, singles[0].io);
                     assert_eq!(total.pinned_staging, singles[0].pinned_staging);
-                    let capacities = [Some(compiled), (compiled > 1).then_some(1), (compiled > 80).then_some(80)];
+                    let capacities = [Some(compiled), (compiled > 1).then_some(1), (compiled > decode).then_some(decode)];
                     let expected = artifacts.iter().map(|a| capacities.into_iter().flatten().map(|rows|
                         cuteafd_core::mxfp4_layouts::native_scratch_bytes(geometry.hidden as usize,
                             geometry.experts as usize, geometry.topk as usize, a.logical, a.role, rows, coded).unwrap())

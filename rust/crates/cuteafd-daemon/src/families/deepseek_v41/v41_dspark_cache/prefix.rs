@@ -28,7 +28,7 @@ impl<'a> DsparkWindow<'a> {
         ensure!(copies.pending.is_none(), "draft snapshot lane is occupied");
         let stream = copies.stream.raw;
         let slot = self.validate(lease)?;
-        let mut used = [false; 16]; used[slot] = true;
+        let mut used = [false; cuteafd_core::V41_MAX_REQUESTS]; used[slot] = true;
         let reservation = self.access.reserve(used)?;
         let end = self.copy_ring(lease, destination, stream)?;
         self.prefix_copies[lane].pending = Some((lease, reservation));

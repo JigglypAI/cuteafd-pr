@@ -55,7 +55,20 @@ LAN_SEEDS = ('kakapo', 'cassowary')
 # CPU gates and single-GPU correctness, never perf A/B, cards or serving.
 ORDER = ('sparks', 'gpu0', 'gpu1', 'rhea', 'moa', *LAN_SEEDS, *(f'{seed}-export' for seed in LAN_SEEDS),
          'maxq')
-LOCK_DIR = Path(os.environ.get('CUTEAFD_LOCK_DIR', Path.home() / '.cache/cuteafd'))
+_DEFAULT_LOCK_DIR = Path(os.environ.get('CUTEAFD_LOCK_DIR', Path.home() / '.cache/cuteafd'))
+# An explicit assignment (a driver pinning a private directory, a test) wins;
+# otherwise CUTEAFD_LOCK_DIR is read when the lock is taken, so a process that
+# sets it after importing this module still never reaches the real locks.
+LOCK_DIR = _DEFAULT_LOCK_DIR
+
+
+def lock_dir() -> Path:
+    """The lock directory for this call: an explicit LOCK_DIR assignment, else CUTEAFD_LOCK_DIR."""
+    if LOCK_DIR != _DEFAULT_LOCK_DIR:
+        return LOCK_DIR
+    return Path(os.environ.get('CUTEAFD_LOCK_DIR', Path.home() / '.cache/cuteafd'))
+
+
 POLL_S = 2.0
 # How long a signalled CMD may take to exit (its teardown) before it is killed;
 # under systemd's default TimeoutStopSec (90 s), above smoke's 60 s teardown bound.
@@ -73,7 +86,7 @@ def canonical(names) -> list[str]:
 
 
 def _queue() -> Path:
-    queue = LOCK_DIR / 'hwq'
+    queue = lock_dir() / 'hwq'
     queue.mkdir(parents=True, exist_ok=True)
     return queue
 
@@ -151,7 +164,7 @@ def older_conflicts(queue: Path, locks: list[str], before: int | None) -> list[s
 def _try_flocks(locks: list[str]) -> list | None:
     held = []
     for name in locks:
-        handle = open(LOCK_DIR / f'{name}.lock', 'a')
+        handle = open(lock_dir() / f'{name}.lock', 'a')
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:

@@ -48,7 +48,12 @@ ${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc\"
 ")
   set(objects)
   set(headers)
-  foreach(rows 1 16 80 256 1024 4096)
+  set(width_rows 1 16 80 256 1024 4096)
+  if(family STREQUAL "v41")
+    set(width_rows ${CUTEAFD_V41_TARGET_ROWS})
+  endif()
+  list(JOIN width_rows "," width_rows_arg)
+  foreach(rows IN LISTS width_rows)
     list(APPEND objects "${dir}/${family}_${role}_m${rows}.o")
     list(APPEND headers "${dir}/${family}_${role}_m${rows}.h")
   endforeach()
@@ -67,10 +72,11 @@ ${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc\"
       "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
       --geometry "${family}" --role "${role}" --output-dir "${dir}"
-      --rows 1,16,80,256,1024,4096 --width "${slice}" --standard-names
+      --rows "${width_rows_arg}" --width "${slice}" --standard-names
     COMMAND "${CMAKE_COMMAND}" -E copy
       "${dir}/v41_expert_variants.h" "${dir}/${variant_header}"
-    DEPENDS
+    DEPENDS "${CUTEAFD_V41_CAPACITY_SOURCE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_capacities.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/spark_packages.py"

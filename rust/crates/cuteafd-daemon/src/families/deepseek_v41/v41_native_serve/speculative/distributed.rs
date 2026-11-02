@@ -11,14 +11,14 @@ impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
     pub fn with_distributed_requests(devices: [Device<'a>; 2], weights: &'w DsparkWeights<'a>,
         table: &'w NativeRtxTensors<'a>, shards: [&'w VocabularyShard<'a>; 2],
         capacity: u32, requests: u32) -> Result<DeviceOwner<'a, Self>> {
-        ensure!((1..=16).contains(&requests), "invalid draft request limit");
+        ensure!((1..=cuteafd_core::V41_MAX_REQUESTS as u32).contains(&requests), "invalid draft request limit");
         devices[1].own(|| {
             let lib = devices[1].library;
             let lane_count = if requests == 1 { 1 } else { 2 };
             let lane_requests = requests.div_ceil(lane_count as u32);
             let lane_bytes = DistributedDsparkChain::device_bytes(weights, lane_requests, shards[0].tokens().end)?;
             let mut mains = vec![weights.main_context(capacity, DsparkMainContext::device_bytes(lib, capacity)?)?];
-            if lane_count > 1 { mains.push(weights.main_context(80, DsparkMainContext::device_bytes(lib, 80)?)?); }
+            if lane_count > 1 { mains.push(weights.main_context(cuteafd_core::V41_VERIFY_ROWS as u32, DsparkMainContext::device_bytes(lib, cuteafd_core::V41_VERIFY_ROWS as u32)?)?); }
             let chains = (0..lane_count).map(|_| DistributedDsparkChain::new(devices, weights, table,
                 shards, lane_requests, lane_bytes)).collect::<Result<Vec<_>>>()?;
             let window = || DsparkWindow::new(lib, requests as usize, capacity,

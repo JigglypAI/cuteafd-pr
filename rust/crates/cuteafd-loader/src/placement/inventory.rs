@@ -307,8 +307,9 @@ impl ProgramSet {
         -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
         ensure!((1..=4096).contains(&rows) && sms > 0, "invalid V4.1 FP8 plan geometry");
-        let compiled = [1, 16, 80, 256, 1024, 4096].into_iter().find(|&n| n >= rows).unwrap();
-        let capacities: Vec<_> = [1, 16, 80].into_iter().filter(|&n| n < compiled).chain([compiled]).collect();
+        let covers = if rows == 40 || rows == cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 { [1, 16, cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64, cuteafd_core::V41_DRAFT_WIDE_ROWS as u64, 1024, 4096] } else { cuteafd_core::V41_TARGET_CAPACITIES };
+        let compiled = covers.into_iter().find(|&n| n >= rows).unwrap();
+        let capacities: Vec<_> = covers[..3].iter().copied().filter(|&n| n < compiled).chain([compiled]).collect();
         let variants = manifest["variants"].as_array().context("missing V4.1 FP8 variants")?;
         let card = if sms >= 188 { 188 } else { 170 };
         let mut names = Vec::new();
@@ -797,7 +798,7 @@ mod tests {
 
     #[test]
     fn v41_fp8_retains_aligned_capacity_arenas_and_selects_physical_sms() {
-        let variants = [1, 16, 80, 256, 1024, 4096].into_iter().flat_map(|capacity| {
+        let variants = [1, 16, 64, 80, 256, 1024, 4096].into_iter().flat_map(|capacity| {
             let plans: &[u64] = if capacity <= 16 { &[170, 188] } else { &[0] };
             plans.iter().map(move |&sms| json!({"capacity": capacity, "plan_sms": sms,
                 "input_dim": 5120, "output_dim": 1280,
@@ -806,8 +807,9 @@ mod tests {
         }).collect::<Vec<_>>();
         let manifest = json!({"variants": variants});
         let expected = |rows: u64, sms: u64| {
-            let compiled = [1,16,80,256,1024,4096].into_iter().find(|&n| n >= rows).unwrap();
-            [1,16,80].into_iter().filter(|&n| n < compiled).chain([compiled])
+            let covers = if matches!(rows, 40 | 80) { [1,16,80,256,1024,4096] } else { [1,16,64,256,1024,4096] };
+            let compiled = covers.into_iter().find(|&n| n >= rows).unwrap();
+            covers[..3].iter().copied().filter(|&n| n < compiled).chain([compiled])
                 .map(|n| (n * 257 + if n <= 16 { sms } else { 0 }).div_ceil(256) * 256)
                 .sum::<u64>()
         };
@@ -842,7 +844,7 @@ mod tests {
     #[test]
     fn v41_output_reduction_is_immutable_across_retained_capacities() {
         for n in [2560, 5120] {
-            let variants = [1,16,80,256,1024,4096].into_iter().map(|capacity|
+            let variants = [1,16,64,80,256,1024,4096].into_iter().map(|capacity|
                 json!({"capacity":capacity, "plan_sms":0, "input_dim":8192, "output_dim":n,
                     "label":format!("v41_output_{n}_m{capacity}"), "scratch_bytes":capacity * 257,
                     "expected_m":if capacity <= 80 {16} else {capacity},
@@ -855,7 +857,8 @@ mod tests {
             for (field, value) in [("expected_m", json!(80)), ("split_k_slices", json!(2)),
                 ("all_rows", json!(false))] {
                 let mut changed = manifest.clone();
-                changed["variants"][2][field] = value;
+                changed["variants"][2][field] = value.clone();
+                changed["variants"][3][field] = value;
                 assert!(ProgramSet::v41_fp8(&changed, &[(8192,n)], 80,188).is_err(), "{field}");
                 assert!(ProgramSet::v41_fp8(&changed, &[(8192,n)], 4096,188).is_err(), "{field}");
             }

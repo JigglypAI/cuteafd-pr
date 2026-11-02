@@ -1496,7 +1496,7 @@ mod tests {
         };
         // Native AOT variants supply scratch extents; validate budget boundaries
         // against this library instead of totals from an older export build.
-        for capacity in [1, 80, 4096] {
+        for capacity in [1, cuteafd_core::V41_VERIFY_ROWS as u32, 4096] {
             let groups = BackboneLane::workspace_bytes(&library, capacity)?;
             let total: usize = groups.iter().sum();
             // Both paths must reject without attempting a CUDA allocation. The
