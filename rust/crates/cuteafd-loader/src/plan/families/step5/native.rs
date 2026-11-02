@@ -19,6 +19,10 @@ pub struct RankAdmission {
     pub workspace: u64,
 }
 
+pub fn program_prefixes(split: bool) -> &'static [&'static str] {
+    if split { &["step5", "step52"] } else { &["step5"] }
+}
+
 pub fn validate_span_rows(rows: usize) -> Result<()> {
     let limit = crate::serving_capacity::prefill_waves::PrefillLimits::default().max_span_rows;
     ensure!(rows > 0 && rows as u64 <= limit, "Step-5 allocation span must be 1..={limit} rows");
@@ -415,6 +419,37 @@ mod tests {
 
     fn end(layout: &[(usize, usize)]) -> usize {
         layout.iter().map(|&(offset, bytes)| offset + bytes).max().unwrap()
+    }
+
+    #[test]
+    fn live_and_offline_code_allowances_select_the_same_programs() {
+        use crate::placement::{inventory, ArchContext, ProgramSet};
+        let names = ["step5_hidden_norm", "step5_swa_attention", "step52_hidden_norm",
+            "step52_swa_attention", "glm_hidden_norm"];
+        let manifest = serde_json::json!({"programs": names.iter()
+            .map(|name| serde_json::json!({"name": name})).collect::<Vec<_>>()});
+        let arch = ArchContext::for_device("sm_120", 96 << 30);
+        for split in [false, true] {
+            let prefixes = program_prefixes(split);
+            let offline = ProgramSet::from_manifest(&manifest, prefixes);
+            let live = ProgramSet::from_names(prefixes, names);
+            assert_eq!(live.names, offline.names);
+            assert_eq!(live.names.len(), if split { 4 } else { 2 });
+            let loaded = cuteafd_core::coordinator_programs::CoordinatorPrograms {
+                family: "step5", split_family: split.then_some("step52") };
+            assert_eq!(live.names, names.iter().filter(|name| loaded.contains(name))
+                .map(|name| name.to_string()).collect::<Vec<_>>());
+            for rank in 0..if split { 2 } else { 1 } {
+                let planned = inventory::loaded_code_allowance("step5", "exl3-step5-k46",
+                    split, rank, arch, Some(&offline));
+                let runtime = inventory::loaded_code_allowance("step5", "exl3-step5-k46",
+                    split, rank, arch, Some(&live));
+                assert_eq!(runtime.bytes, planned.bytes);
+                let sampled = arch.context_bytes + 4 * 1024 * 1024;
+                assert_eq!(sampled + runtime.pending(sampled, arch.context_bytes),
+                    arch.context_bytes + planned.bytes);
+            }
+        }
     }
 
     #[test]

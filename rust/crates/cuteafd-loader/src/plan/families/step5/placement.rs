@@ -102,7 +102,7 @@ pub(super) fn layout(
         manifest["capacities"]["max_context"] == model.cfg.max_context,
         "Step-5 exports require the checkpoint's 1M compiled extent"
     );
-    let prefixes: &[&str] = if coordinators == 2 { &["step5", "step52"] } else { &["step5"] };
+    let prefixes = super::native::program_prefixes(coordinators == 2);
     let programs = ProgramSet::from_manifest(&manifest, prefixes);
     let entries = manifest["programs"]
         .as_array()

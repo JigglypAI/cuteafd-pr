@@ -242,7 +242,8 @@ fn with_backend<T>(args: &ServeArgs,
         }
         Ok(())
     })?;
-    let selected_programs = ProgramSet::from_names(&["step5", "step52"], programs.names());
+    let selected_programs = ProgramSet::from_names(
+        cuteafd_loader::plan::families::step5::native::program_prefixes(ids.len() == 2), programs.names());
     let pending_code = ids.iter().enumerate().map(|(rank, &id)| crate::shared::inventory::pending_code(
         &library, id, rank, ids.len() == 2, "step5", &format.package_name(), &selected_programs))
         .collect::<Result<Vec<_>>>()?;
