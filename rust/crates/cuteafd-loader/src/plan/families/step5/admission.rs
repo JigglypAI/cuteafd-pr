@@ -904,7 +904,7 @@ mod tests {
         assert_eq!(old.cache, new.cache);
         assert_eq!(old.marks, new.marks);
         assert_eq!(old.reservations, new.reservations);
-        assert_eq!(serde_json::to_vec(&old.fixed)?, serde_json::to_vec(&new.fixed)?);
+        assert_eq!(old.fixed, new.fixed);
         Ok(())
     }
 
