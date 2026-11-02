@@ -26,8 +26,8 @@ fn groups(rows: &[ExpertRow]) -> Result<Vec<Group>> {
             last.rows += 1;
         } else {
             ensure!(
-                groups.len() < 16 && groups.iter().all(|g| g.request != row.request_id),
-                "main proposal repeats a request or exceeds sixteen requests"
+                groups.len() < cuteafd_core::V41_MAX_LANE_MEMBERS && groups.iter().all(|g| g.request != row.request_id),
+                "main proposal repeats a request or exceeds the lane member limit"
             );
             groups.push(Group {
                 request: row.request_id,
@@ -188,6 +188,18 @@ mod tests {
             position,
             kind: cuteafd_transport::ExpertV2SourceKind::MtpVerify,
         }
+    }
+    #[test]
+    fn main_proposal_covers_every_lane_member() {
+        let rows: Vec<_> = (0..cuteafd_core::V41_MAX_LANE_MEMBERS)
+            .flat_map(|id| [row(id as u64, 7), row(id as u64, 8)]).collect();
+        let plan = groups(&rows).unwrap();
+        assert_eq!(plan.len(), cuteafd_core::V41_MAX_LANE_MEMBERS);
+        assert_eq!(plan.last().unwrap().source, 62);
+        validate_acceptance(&plan, &vec![2; plan.len()]).unwrap();
+        let mut too_many = rows;
+        too_many.push(row(cuteafd_core::V41_MAX_LANE_MEMBERS as u64, 0));
+        assert!(groups(&too_many).is_err());
     }
     #[test]
     fn main_prefixes_keep_flattened_offsets_and_reject_ambiguous_rows() {

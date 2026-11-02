@@ -210,21 +210,21 @@ impl<'library> DsparkWeights<'library> {
             projection_packed_scale_bytes: projection::packed_bytes(library)?,
             grouped_output_resident_bytes: 3 * 1048576,
             projection_bytes_per_wave: projection::wave_bytes(library, capacity)?,
-            draft_token_bytes_per_wave: 64,
+            draft_token_bytes_per_wave: cuteafd_core::V41_MAX_LANE_MEMBERS * 4,
             main_context_additional_bytes_per_wave: DsparkMainContext::additional_bytes(library, capacity)?,
             attention_output_additional_bytes_per_wave: DsparkAttentionOutput::additional_bytes(library, capacity)? * 3,
             attention_wave_additional_bytes_per_wave: DsparkAttentionWave::additional_bytes(capacity)? * 3,
             shared_execution_bytes_per_wave: DsparkSharedFfn::device_bytes(library, capacity)? * 3,
             load_staging_bytes,
-            window_cache_bytes: DsparkWindow::device_bytes(16, 4096)? * 3,
+            window_cache_bytes: DsparkWindow::device_bytes(cuteafd_core::V41_MAX_REQUESTS, 4096)? * 3,
             execution_bytes_per_wave,
             router_bytes_per_wave: DsparkRouter::device_bytes(capacity as usize)? * 3,
             hc_bytes_per_wave: HcSublayer::device_bytes(capacity as usize)?
                 .checked_mul(6)
                 .context("mHC wave budget overflow")?,
-            confidence_bytes_per_wave: DsparkConfidence::device_bytes((capacity as usize).max(16 * width))?,
-            markov_bytes_per_wave: DsparkMarkov::device_bytes(16)?,
-            terminal_additional_bytes_per_wave: DsparkTerminal::additional_bytes_with_width(16, width)?,
+            confidence_bytes_per_wave: DsparkConfidence::device_bytes((capacity as usize).max(cuteafd_core::V41_MAX_LANE_MEMBERS * width))?,
+            markov_bytes_per_wave: DsparkMarkov::device_bytes(cuteafd_core::V41_MAX_LANE_MEMBERS)?,
+            terminal_additional_bytes_per_wave: DsparkTerminal::additional_bytes_with_width(cuteafd_core::V41_MAX_LANE_MEMBERS, width)?,
         })
     }
     /// Single-RTX `serving_bytes` as a drafter inventory: weights, the
@@ -458,18 +458,18 @@ impl<'library> DsparkWeights<'library> {
         })
     }
     /// Three independent committed windows, shared across alternating waves.
-    /// Each admits sixteen requests and a total of 4096 source KV rows per batch.
+    /// Each admits the global request ceiling and a total of 4096 source KV rows per batch.
     pub fn windows(&self, budget: usize) -> Result<[DsparkWindow<'library>; 3]> {
-        let per_stage = DsparkWindow::device_bytes(16, 4096)?;
+        let per_stage = DsparkWindow::device_bytes(cuteafd_core::V41_MAX_REQUESTS, 4096)?;
         ensure!(
             per_stage * 3 <= budget,
             "dSpark windows exceed device budget"
         );
         let library = self.library;
         Ok([
-            DsparkWindow::new(library, 16, 4096, per_stage)?,
-            DsparkWindow::new(library, 16, 4096, per_stage)?,
-            DsparkWindow::new(library, 16, 4096, per_stage)?,
+            DsparkWindow::new(library, cuteafd_core::V41_MAX_REQUESTS, 4096, per_stage)?,
+            DsparkWindow::new(library, cuteafd_core::V41_MAX_REQUESTS, 4096, per_stage)?,
+            DsparkWindow::new(library, cuteafd_core::V41_MAX_REQUESTS, 4096, per_stage)?,
         ])
     }
     pub fn budget(&self) -> DsparkBudget {

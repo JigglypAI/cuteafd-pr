@@ -568,7 +568,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         }
         let started = Instant::now();
         ensure!(self.pending[lane].is_none(), "shared draft proposal still pending");
-        ensure!(!inputs.is_empty() && inputs.len() <= 16, "invalid draft batch size");
+        ensure!(!inputs.is_empty() && inputs.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS, "invalid draft batch size");
         let mut seen = std::collections::BTreeSet::new();
         for &(id, anchor, _, remaining) in inputs {
             ensure!(seen.insert(id) && self.requests.contains_key(&id), "invalid draft request identity");
@@ -624,7 +624,7 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
     ) -> Result<Vec<Vec<u32>>> {
         ensure!(lane < self.lanes.len(), "invalid draft lane");
         ensure!(self.pending.iter().all(Option::is_none), "shared draft proposal still pending");
-        ensure!(!inputs.is_empty() && inputs.len() <= 16, "invalid draft batch size");
+        ensure!(!inputs.is_empty() && inputs.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS, "invalid draft batch size");
         let mut seen = std::collections::BTreeSet::new();
         for &(id, anchor, _, remaining) in inputs {
             ensure!(seen.insert(id) && self.requests.contains_key(&id), "invalid draft request identity");

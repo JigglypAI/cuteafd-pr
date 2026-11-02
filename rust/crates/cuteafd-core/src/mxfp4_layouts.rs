@@ -81,13 +81,14 @@ fn layouts() -> &'static Layouts {
 /// Build-recipe fallback where coordinator images do not carry Spark manifests.
 /// Exporters declare this same contract; runtime reads the installed declaration.
 pub fn native_export_capacities(family: &str, role: &str) -> crate::spark_executions::ExpertExportCapacities {
-    let decode = if family == "v41" && !matches!(role, "coordinator" | "dspark_tp2") {
+    let mut decode = if family == "v41" && !matches!(role, "coordinator" | "dspark_tp2") {
         crate::V41_DECODE_CAPACITIES.map(|n| n as u32).to_vec()
     } else { layouts().decode_capacities.clone() };
-    let mut capacities = decode.clone();
     if family == "v41" && matches!(role, "coordinator" | "dspark_tp2") {
-        capacities.push(40);
+        decode.push(40);
+        decode.sort_unstable();
     }
+    let mut capacities = decode.clone();
     capacities.extend(&layouts().prefill_capacities);
     capacities.sort_unstable();
     crate::spark_executions::ExpertExportCapacities { capacities, decode }

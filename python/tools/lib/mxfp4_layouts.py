@@ -209,7 +209,8 @@ def native_export_capacities(family: str, role: str) -> tuple[tuple[int, ...], t
     decode = (DECODE_CAPACITIES if family == "v41" and role not in ("coordinator", "dspark_tp2")
               else tuple(layouts()["decode_capacities"]))
     draft = (40,) if family == "v41" and role in ("coordinator", "dspark_tp2") else ()
-    return tuple(sorted((*decode, *draft, *layouts()["prefill_capacities"]))), tuple(decode)
+    decode = tuple(sorted((*decode, *draft)))
+    return (*decode, *layouts()["prefill_capacities"]), decode
 
 
 def native_fc1_k_splits(hidden: int, width: int, sm: int, capacity: int) -> int:
