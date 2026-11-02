@@ -3665,7 +3665,7 @@ fn glm_next_facts_and_dflash2_drafter_are_described() {
     assert!(notes.contains("SwiGLU clamp 10"), "{notes}");
 
     let draft = snapshot(
-        json!({"architectures": ["DFlash2DraftModel"], "hidden_size": 64, "vocab_size": 8,
+        json!({"architectures": ["DFlash2DraftModel"], "hidden_size": 64, "vocab_size": 16,
                "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 1, "head_dim": 16,
                "sliding_window": 2048, "intermediate_size": 128, "num_target_layers": 45,
                "dflash_config": {"block_size": 8, "target_layer_ids": [5, 14]}}),
