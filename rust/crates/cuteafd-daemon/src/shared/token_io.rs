@@ -170,6 +170,8 @@ impl<'a> TokenEmbedding<'a> {
     /// Table bytes this embedding charges (a row-FP8 table is charged by its owner's head).
     pub(crate) fn device_bytes(&self) -> usize { if self.row_fp8.is_some() { 0 } else { self.table.device_bytes() } }
 
+    pub(crate) fn allocation_buffer(&self) -> CuteafdDeviceBuffer { self.table.buffer() }
+
     pub fn device_gather(&self) -> bool { true }
 
     pub fn vocab(&self) -> usize {

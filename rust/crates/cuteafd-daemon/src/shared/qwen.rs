@@ -171,6 +171,17 @@ impl<'a> GdnBank<'a> {
             commit_tables })
     }
 
+    pub(crate) fn allocation_buffers(&self) -> Vec<(&'static str, CuteafdDeviceBuffer)> {
+        [("gdn.conv", self.conv.as_ref()), ("gdn.state", self.state.as_ref()), ("gdn.replay", self.replay.as_ref())]
+            .into_iter().filter_map(|(id, allocation)| allocation.map(|a| (id, a.buffer)))
+            .chain(std::iter::once(("gdn.commit", self.commit_tables.buffer))).collect()
+    }
+
+    pub(crate) fn state_views(&self) -> Vec<(usize, usize, [CuteafdDeviceBuffer; 2])> {
+        (0..self.layers).flat_map(|ordinal| (0..self.slots)
+            .map(move |slot| (ordinal, slot, self.slot_regions(ordinal, slot)))).collect()
+    }
+
     pub(crate) fn allocated_bytes(&self) -> [usize; 3] {
         [self.conv.as_ref().map_or(0, |a| a.buffer.bytes)
             + self.state.as_ref().map_or(0, |a| a.buffer.bytes),

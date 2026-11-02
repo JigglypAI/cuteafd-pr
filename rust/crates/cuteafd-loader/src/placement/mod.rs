@@ -20,6 +20,7 @@ use thiserror::Error;
 pub mod draft;
 pub mod families;
 pub mod inventory;
+pub mod planner;
 mod pool;
 pub mod attention;
 mod residual;

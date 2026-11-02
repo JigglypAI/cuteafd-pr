@@ -181,6 +181,9 @@ pub struct PlanReport {
     pub host_budget_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_ledger: Option<cuteafd_core::memory_layout::HostLayout>,
+    /// Phase-aware forecast and exact-owner contract for migrated families.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocation_plan: Option<crate::placement::planner::ResolvedPlan>,
     pub attention_placement: crate::placement::AttentionPlacement,
     /// The routed-expert weight budget per Spark rank this plan used
     /// (explicit, or the family's default).
@@ -731,6 +734,7 @@ pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::
         mapped_placement: Default::default(),
         host_budget_bytes: 0,
         host_ledger: None,
+        allocation_plan: None,
         attention_placement: options.attention_placement.unwrap_or_default(),
         spark_budget_bytes: options.spark_budget(),
         requested_attention: options.attention_placement,

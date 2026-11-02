@@ -2868,6 +2868,23 @@ impl NativeLibrary {
         unsafe { self.copy_h2d_raw_ptr(dst, staging.ptr as *const c_void, src.len()) }
     }
 
+    /// Reserve the largest startup upload once, before loading weights.
+    pub fn reserve_sync_h2d_staging(&self, bytes: usize) -> Result<CuteafdHostBuffer> {
+        self.sync_h2d_staging.lock().map_err(|_| anyhow::anyhow!("synchronous H2D staging lock poisoned"))?.ensure(self, bytes)
+    }
+
+    /// Actual reusable pinned owner, for startup allocation-ID reconciliation.
+    pub fn sync_h2d_staging_buffer(&self) -> Result<CuteafdHostBuffer> {
+        Ok(self.sync_h2d_staging.lock().map_err(|_| anyhow::anyhow!("synchronous H2D staging lock poisoned"))?.buffer)
+    }
+
+    /// Actual pinned owner paired with one ordered-upload destination.
+    pub fn ordered_h2d_staging_buffer(&self, dst: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<CuteafdHostBuffer> {
+        let entries = self.ordered_h2d_staging.lock().map_err(|_| anyhow::anyhow!("ordered H2D staging lock poisoned"))?;
+        Ok(entries.get(&(dst.device_id, stream as usize, dst.ptr as usize))
+            .ok_or_else(|| anyhow::anyhow!("ordered H2D staging was not reserved"))?.staging.buffer)
+    }
+
     /// Create the pinned staging and fence for ordered uploads into `dst` on
     /// `stream`, sized to all of `dst`, without copying. Ports that reuse a
     /// destination mid-call (while peer waits are queued) reserve it before

@@ -2185,10 +2185,12 @@ fi
 # cards: 650K-1.3M tokens with auto).
 if [[ $family =~ ^(glm5|qwen4|qwen3_5|deepseek_v4)$ ]]; then
   pool="$(get POOL_TOKENS auto)"
-  if [[ "$pool" == auto ]]; then
-    pool=0
+  if [[ "$family" == qwen3_5 ]]; then
+    [[ "$pool" == auto ]] || family_args+=(--pool-tokens "$pool")
+  else
+    [[ "$pool" != auto ]] || pool=0
+    family_args+=(--pool-tokens "$pool")
   fi
-  family_args+=(--pool-tokens "$pool")
 fi
 # Kimi K3 and Step-5: unset or auto POOL_TOKENS leaves the KV pool to the serve
 # command's own automatic admission (no --pool-tokens). Kimi's RTX_EXPERT_LAYERS
@@ -2670,7 +2672,12 @@ audio_encoder_ranks=()
 audio_peers=()
 audio_encoder_hash=""
   plan_rtx=1; ((head_split == 0)) || plan_rtx=2
-  plan_pool="$(get POOL_TOKENS auto)"; [[ "$plan_pool" != auto ]] || plan_pool=0
+  plan_pool="$(get POOL_TOKENS auto)"
+  plan_pool_args=()
+  if [[ "$family" != qwen3_5 || "$plan_pool" != auto ]]; then
+    [[ "$plan_pool" != auto ]] || plan_pool=0
+    plan_pool_args=(--pool-tokens "$plan_pool")
+  fi
   plan_gib="$profile_gib"
   if [[ "$family" == qwen4 ]]; then
     total_mib="$(nvidia-smi --id="$gpu" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d ' ')"
@@ -2819,7 +2826,7 @@ audio_encoder_hash=""
   plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e "HF_HOME=$container_hf_home" "${generic_worker_mounts[@]}" "${chat_template_mounts[@]}" "${wip_mount_args[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${spark_budget_args[@]}" \
-    --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
+    --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" "${plan_pool_args[@]}" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
   release_validate_deployment "$plan_json" "$family"
   RELEASE_RECLAIM_ARGS=()
   ((restart == 0)) || release_coordinator_reclaim_args "$coordinator_name"

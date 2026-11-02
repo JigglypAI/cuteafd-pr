@@ -520,7 +520,7 @@ def test_dense_qwen_wip_uses_native_single_gpu_and_no_workers(tmp_path: Path, ca
     assert f"--prefix-point-boundaries {boundaries}" in launch
     if "PREFIX_CACHE_MARK_MIB" in cache_keys:
         assert "--prefix-cache-mark-mib 1024" in launch
-    assert "--pool-tokens 0" in launch and "--vision off --audio off" in launch
+    assert "--pool-tokens" not in launch and "--vision off --audio off" in launch
     for unsupported in ("--max-context", "--local-experts", "--peers", "--split-device"):
         assert unsupported not in launch
     assert "cuteafd expertd-native" not in result.stderr
@@ -529,6 +529,20 @@ def test_dense_qwen_wip_uses_native_single_gpu_and_no_workers(tmp_path: Path, ca
     assert "--spark-ranks 0" in plan and "--state-slots" not in plan
     assert f"--prefix-cache-entries {entries}" in plan
     assert "--prefill-rows 4096" in plan and "--require-ready" not in plan
+
+
+@pytest.mark.parametrize("setting,expected", [(None, None), ("auto", None), ("262144", "262144"), ("0", "0")])
+def test_dense_pool_auto_is_absent_and_exact_pins_pass_through(tmp_path, setting, expected):
+    keys = "SPARK_COUNT=0\nSPECULATOR=off\n" + (f"POOL_TOKENS={setting}\n" if setting is not None else "")
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B", keys,
+        extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode == 0, result.stderr
+    for marker in ("serve-qwen35 --snapshot", "cuteafd plan "):
+        argv = shlex.split(next(line for line in result.stderr.splitlines() if marker in line))
+        assert ("--pool-tokens" in argv) == (expected is not None)
+        if expected is not None:
+            assert argv[argv.index("--pool-tokens") + 1] == expected
 
 
 @pytest.mark.parametrize("model", ["Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B-FP8"])

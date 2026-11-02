@@ -116,11 +116,14 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     report: &mut crate::plan::PlanReport, options: &mut crate::plan::layout::LayoutOptions)
     -> anyhow::Result<cuteafd_core::memory_layout::MemoryLayout> {
     use anyhow::{ensure, Context};
-    use crate::placement::{self, families::qwen3_5::{DenseInputs, NativeBuffers, NativeWeights, PREFILL_ROWS},
-        ArchContext, Baseline, GpuBudget, ProgramSet};
+    use crate::placement::{self, families::qwen3_5::{DenseFacts, NativeBuffers, NativeWeights, PREFILL_ROWS},
+        planner, ProgramSet};
     use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
     ensure!(options.rtx_bytes.len() == 1 && report.spark_ranks == 0,
         "dense Qwen currently requires one coordinator GPU and zero Sparks");
+    if options.context_tokens != 0 && options.context_tokens != cfg.max_context as u64 {
+        return Err(planner::Refusal::InvalidPin("dense executor requires checkpoint maximum context").into());
+    }
     ensure!(!options.host_embedding, "dense Qwen requires device token embedding");
     ensure!(report.vision == crate::plan::MediaMode::Off && report.audio == crate::plan::MediaMode::Off,
         "dense Qwen media execution is not qualified");
@@ -169,9 +172,12 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         options.prefix_entries("qwen3_5"), mark as u64, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
     let buffers = NativeBuffers::new(cfg, scratch as usize, slots, usize::try_from(marks)?, options.full_prefill_logits)?;
     let weights = NativeWeights::native(input.checkpoint(), cfg, norm.context("missing GDN precision")?)?;
-    let (layers, fixed) = weights.demands(cfg, &buffers, slots);
     let capacity = options.rtx_bytes[0];
-    let context = ArchContext::coordinator(capacity, None).context_bytes + set.module_bytes();
+    // A logical cap does not turn a PRO into a 5090. Offline plans default
+    // to the PRO reference; an explicit physical SM witness selects the class.
+    let physical = *placement::ARCH_CONTEXTS.iter().find(|card| card.arch == "sm_120"
+        && card.sms == options.physical_sms.unwrap_or(188)).context("unknown dense coordinator physical class")?;
+    let context = physical.context_bytes + set.module_bytes();
     let draft_anchor_only = options.dense_qwen_drafter_snapshot.is_some()
         && !crate::formats::block_dspark::supports_sequences(slots);
     let drafter = options.dense_qwen_drafter_snapshot.as_ref().filter(|_| !draft_anchor_only).map(|snapshot| {
@@ -180,25 +186,56 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         ensure!(draft.hidden == cfg.hidden && draft.vocab == cfg.vocab && draft.taps.iter().all(|&layer| layer < cfg.attention.len()),
             "dense dSpark checkpoint differs from target geometry");
         placement::families::qwen3_5::DrafterBytes::block_dspark(&config, slots,
-            options.physical_sms.unwrap_or_else(|| ArchContext::coordinator(capacity, None).sms) as u64, cfg.max_context)
+            physical.sms as u64, cfg.max_context)
     }).transpose()?;
     let drafter = if options.dense_qwen_mtp {
         Some(placement::families::qwen3_5::DrafterBytes::native_mtp(input.checkpoint(), cfg)?)
     } else { drafter };
-    let result = placement::families::qwen3_5::placement(DenseInputs { cfg,
-        gpu: GpuBudget { capacity_bytes: capacity, headroom_bytes: 1 << 30,
-            baseline: Baseline::Planned { context_bytes: context, loaded_bytes: 0 } },
-        layers: &layers, fixed, drafter, requested_pool: options.pool_tokens.filter(|&n| n > 0),
-        max_context: cfg.max_context as u64, record_bytes: options.dense_qwen_kv.record_bytes(cfg.kv_heads, cfg.head_dim) as u64,
-        pool_overhead: 0, pool_bounded: vec![] })?;
-    let mut items = result.items[0].clone();
+    let host = match options.host_memory {
+        Some(host) => host,
+        None => {
+            #[cfg(test)]
+            panic!("planner tests must inject LayoutOptions.host_memory");
+            #[cfg(not(test))]
+            crate::formats::mapped_preload::host_memory()?
+        }
+    };
+    let budgets = placement::families::qwen3_5::forecast_budgets(&physical, capacity, set.module_bytes(), host)?;
+    let onboard = match options.onboard {
+        None | Some(placement::Onboard::Auto) => planner::Pin::Auto,
+        Some(placement::Onboard::Layers(layers)) => planner::Pin::Exact(layers as u64),
+        Some(_) => return Err(planner::Refusal::InvalidPin("dense Qwen requires an exact layer pin, not a fraction or policy").into()),
+    };
+    let request = planner::Request { context: cfg.max_context as u64,
+        pool: options.pool_tokens.map_or(planner::Pin::Auto, planner::Pin::Exact), onboard,
+        prefill: planner::Pin::Exact(planner::PrefillShape { rows: prefill.unit_rows, waves: prefill.waves }),
+        operation: if options.full_prefill_logits { planner::Operation::Scoring } else { planner::Operation::Serving } };
+    let result = placement::families::qwen3_5::admit(request, budgets, DenseFacts { cfg,
+        weights: &weights, buffers: &buffers, slots, drafter,
+        record_bytes: options.dense_qwen_kv.record_bytes(cfg.kv_heads, cfg.head_dim) as u64 })?;
+    let mut items = result.items(planner::Location::coordinator(0))?;
+    for reservation in &result.facts.deferred {
+        items.push(Item::new(reservation.category, &reservation.group, "", reservation.bytes, Basis::Formula));
+    }
+    for allowance in &result.facts.allowances {
+        if allowance.location == planner::Location::coordinator(0) && allowance.lifetime.contains(planner::Phase::Ready) {
+            items.push(Item::new(Category::Runtime, &allowance.source, "", allowance.bytes, Basis::Estimated));
+        }
+    }
+    for demand in buffers.fixed().into_iter().filter(|d| d.bytes == 0) {
+        items.push(Item::new(demand.category, demand.group, "", 0, Basis::Exact));
+    }
     items.push(Item::new(Category::Runtime, "context and native modules", "native", context, Basis::Calibrated));
     let mut notes = vec![format!("Native dense admission: {} KV, exact GDN state, no captured graphs; text-only single GPU; fixed slots and prefix marks do not grow when the pool cap frees memory", options.dense_qwen_kv)];
     if draft_anchor_only {
         notes.push(format!("dense dSpark native sequence capacity {}; C{slots} serves anchor-only with no drafter allocation",
             crate::formats::block_dspark::MAX_SEQUENCES));
     }
+    let pool_tokens = result.pool_tokens;
+    let capacity_bytes = result.budgets[0].physical_bytes.min(result.budgets[0].logical_bytes)
+        - result.budgets[0].headroom;
+    report.allocation_plan = Some(result);
     Ok(MemoryLayout { devices: vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
-        capacity_bytes: capacity - (1 << 30), worker_budget_bytes: 0, items, kv_tokens: result.pool_tokens }],
-        pool_tokens: result.pool_tokens, waste: vec![], notes })
+        capacity_bytes, worker_budget_bytes: 0, items, kv_tokens: pool_tokens }],
+        pool_tokens, waste: vec![], notes })
 }

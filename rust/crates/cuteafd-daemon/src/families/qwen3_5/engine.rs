@@ -6,7 +6,7 @@ use crate::shared::{memory::device::{Allocation, Device, Stream}, qwen::{GdnBank
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{programs::{Programs, Scalar, VocabularyHead}, CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{families::{qwen::HybridAttention, qwen3_5::Qwen35Config}, plan::checkpoint::Checkpoint,
-    placement::{self, families::qwen3_5::{DenseInputs, NativeBuffers, NativeWeights}, Baseline, GpuBudget}};
+    placement::{self, families::qwen3_5::{DenseFacts, NativeBuffers, NativeWeights}, planner}};
 
 const _: () = assert!(placement::families::qwen3_5::HEAD_WORKSPACE
     == cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE);
@@ -15,6 +15,8 @@ const ROWS: usize = 4096;
 const HEAD_ROWS: usize = 64;
 const PREFIX: &str = "model.language_model.";
 
+#[path = "allocation.rs"]
+mod allocation;
 #[path = "verify.rs"]
 mod verify;
 #[path = "rows.rs"]
@@ -149,21 +151,31 @@ impl<'a> DenseEngine<'a> {
         let buffers = NativeBuffers::new(&cfg, admitted.scratch_bytes, slots, prefix_marks, full_prefill_logits)?;
         ensure!(buffers.mark_bytes == mark_bytes && buffers.prefix == prefix_bytes,
             "dense native prefix admission differs from state layout");
-        let (layer_bytes, fixed) = weight_bytes.demands(&cfg, &buffers, slots);
         let sizes = buffers.planes;
         let logit_bytes = buffers.logits;
         let (free, total) = library.cuda_memory_info()?;
-        let placement = placement::families::qwen3_5::placement(DenseInputs { cfg: &cfg,
-            gpu: GpuBudget { capacity_bytes: total as u64, headroom_bytes: 1 << 30,
-                baseline: Baseline::Measured { free_bytes: free as u64 } }, layers: &layer_bytes,
-            fixed, drafter, requested_pool, max_context: cfg.max_context as u64,
-            record_bytes: kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64, pool_overhead: 0, pool_bounded: vec![] })?;
-        let pool_tokens = usize::try_from(placement.pool_tokens)?;
-        tracing::info!(pool_tokens, kv_format = %kv_format, slots, prefix_marks, full_prefill_logits, head_rows = buffers.head_rows, kv_bytes_per_token = cfg.full_kv_bytes_per_token(kv_format), layout = %placement.summary(), "dense Qwen admitted before weight/state allocation");
+        let host = cuteafd_ffi::host_memory()?;
+        let physical = *placement::ArchContext::for_device("sm_120", total as u64);
+        let mut budgets = placement::families::qwen3_5::forecast_budgets(&physical, total as u64, 0, host)?;
+        budgets[0].physical_bytes = total as u64;
+        budgets[0].baseline = planner::Baseline::Sampled { free: free as u64, phase: planner::Phase::Load,
+            source: "CUDA after modules, before target weights".into() };
+        let request = planner::Request { context: cfg.max_context as u64,
+            pool: requested_pool.map_or(planner::Pin::Auto, planner::Pin::Exact), onboard: planner::Pin::Auto,
+            prefill: planner::Pin::Auto, operation: if full_prefill_logits { planner::Operation::Scoring } else { planner::Operation::Serving } };
+        let plan = placement::families::qwen3_5::admit(request, budgets, DenseFacts { cfg: &cfg,
+            weights: &weight_bytes, buffers: &buffers, slots, record_bytes: kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64, drafter })?;
+        let pool_tokens = usize::try_from(plan.pool_tokens)?;
+        tracing::info!(pool_tokens, kv_format = %kv_format, slots, prefix_marks, full_prefill_logits,
+            head_rows = buffers.head_rows, deferred_owners = plan.facts.deferred.len(), "dense Qwen admitted before weight/state allocation");
+        let audit = cuteafd_ffi::memory_ledger::AllocationAudit::start();
+        let upload = weight_bytes.allocations.iter().map(|a| a.upload_bytes).max().unwrap_or(0);
+        library.reserve_sync_h2d_staging(usize::try_from(upload)?)?;
         let tensor = reader.tensor(&format!("{PREFIX}embed_tokens.weight"))?;
         let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
         let (embedding, weights) = TokenEmbedding::load(library, source, EmbedPlacement::Gpu,
             || reader.dense_native(&cfg, admitted.norm_dtype.clone(), format))?;
+        let loaded_events = audit.events().len();
         let mut allocated = sizes.into_iter().map(|bytes| Allocation::new(device, alloc_bytes(bytes)))
             .collect::<Result<Vec<_>>>()?;
         let views: Vec<_> = allocated.iter().map(|allocation| allocation.buffer).collect();
@@ -172,6 +184,12 @@ impl<'a> DenseEngine<'a> {
             rope_positions: views[9], kv_slots: views[10], positions: views[11], page_table: views[12] };
         let ids = Allocation::new(device, buffers.ids)?;
         let logits = Allocation::new(device, logit_bytes)?;
+        // Each destination owns separate ordered pinned staging. Reserve the
+        // whole extent now so first use cannot allocate on a request's path.
+        for dst in views[7..].iter().copied().chain(std::iter::once(ids.buffer)) {
+            // SAFETY: these destinations and the stream are retained by the engine.
+            unsafe { library.reserve_h2d_ordered(dst, stream.raw)?; }
+        }
         let head_workspace = Allocation::new(device, buffers.head)?;
         // SAFETY: owned workspace is retained after the head and stream, including error cleanup.
         let head = unsafe { library.vocabulary_head_rows(head_workspace.buffer.ptr, cfg.hidden as u32,
@@ -187,26 +205,10 @@ impl<'a> DenseEngine<'a> {
         let prefix_arena = if prefix_bytes == 0 { None } else {
             Some(std::rc::Rc::new(Allocation::new(device, prefix_bytes)?))
         };
-        // Compare actual allocation owners, not a second evaluation of the
-        // planner recipe. This gate also runs for every golden/serving startup.
-        ensure!(weights.layers.iter().map(|layer| layer.bytes() as u64).collect::<Vec<_>>() == weight_bytes.layers
-            && weights.norm.buffer.bytes as u64 == weight_bytes.norm
-            && weights.head.buffer.bytes as u64 == weight_bytes.head
-            && embedding.device_bytes() as u64 == weight_bytes.embedding,
-            "dense native planner weights differ from actual runtime allocations");
-        ensure!(allocated.iter().map(|a| a.buffer.bytes).collect::<Vec<_>>() == buffers.planes
-            && ids.buffer.bytes == buffers.ids && logits.buffer.bytes == buffers.logits
-            && head_workspace.buffer.bytes == buffers.head
-            && verification.allocated_bytes() == buffers.verify
-            && prefix_arena.as_ref().map_or(0, |a| a.buffer.bytes) == buffers.prefix,
-            "dense native planner workspace/prefix differs from actual runtime allocations");
-        ensure!(bank.allocated_bytes() == [layer_bytes.iter().map(|layer| layer.state as usize).sum(),
-            layer_bytes.iter().map(|layer| layer.replay as usize).sum(), buffers.commit],
-            "dense native planner recurrence/replay differs from actual runtime allocations");
-        ensure!(kv.iter().flatten().map(|a| a.buffer.bytes).sum::<usize>()
-            == pool_tokens * cfg.full_kv_bytes_per_token(kv_format),
-            "dense native planner KV differs from actual runtime allocations");
-        tracing::info!("dense native planner equals actual weight, KV, state, replay, workspace and prefix allocations");
+        stream.drain()?;
+        allocation::reconcile_target(&plan, library, device, stream.raw, &audit, loaded_events, &embedding, &weights, &allocated,
+            &ids, &logits, &head_workspace, &bank, &kv, &verification, prefix_arena.as_deref())?;
+        tracing::info!(ready = plan.facts.deferred.is_empty(), "dense target allocation IDs reconciled; deferred drafter owners are not ready receipts");
         Ok(Self { stream, cfg, kv_format, programs, admitted, embedding, weights, homes, bank, kv, planes,
             _planes: std::mem::take(&mut allocated), ids, logits, head, head_rows: buffers.head_rows, _head_workspace: head_workspace,
             pool_tokens, position: 0, slots: vec![rows::Slot { position: 0, pages: Vec::new() }; slots],

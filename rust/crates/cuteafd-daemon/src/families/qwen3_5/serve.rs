@@ -596,7 +596,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
             }).transpose()?;
             ensure!(engine_args.draft_fixed.is_none() || engine_args.draft.is_some(), "--draft-fixed requires --draft");
             let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint,
-                header.config, engine_args.pool_tokens.filter(|&tokens| tokens > 0),
+                header.config, engine_args.pool_tokens,
                 draft_config.or_else(|| mtp_admission.as_ref().map(|admission| admission.bytes)), slots,
                 Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits)?);
             let mut backend = DenseBackend::new(&engine, &library);

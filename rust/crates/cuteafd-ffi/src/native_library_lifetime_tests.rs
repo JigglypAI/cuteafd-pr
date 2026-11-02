@@ -214,11 +214,11 @@ fn coordinator_budget_refuses_before_allocating_and_checks_untracked_graphs() ->
 fn normal_drop_frees_pinned_staging_before_unloading_module() -> Result<()> {
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
-    library
-        .sync_h2d_staging
-        .lock()
-        .unwrap()
-        .ensure(&library, 64)?;
+    let reserved = library.reserve_sync_h2d_staging(64)?;
+    let retained = library.sync_h2d_staging_buffer()?;
+    assert_eq!((reserved.ptr, reserved.bytes), (retained.ptr, 64));
+    let smaller = library.reserve_sync_h2d_staging(32)?;
+    assert_eq!((smaller.ptr, smaller.bytes), (retained.ptr, 64));
     assert!(fixture.resident()?);
     assert_eq!(fixture.events()?, "A");
     drop(library);

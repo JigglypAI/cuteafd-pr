@@ -403,6 +403,74 @@ fn full_prefill_planner_equals_runtime_recipe_for_each_kv_format() {
 }
 
 #[test]
+fn native_loading_host_bound_covers_header_defined_reader_buffers() {
+    use crate::{plan::checkpoint::Checkpoint, placement::families::qwen3_5::{NativeWeights, weights::{native_operands, Storage}}};
+    use cuteafd_core::DType;
+    let (dir, _, _, _) = native_planner_fixture();
+    let cfg = Qwen35Config::from_hf(&config(4096, 12288, 16, 32, 4)).unwrap();
+    for fp8 in [false, true] {
+        for scale_dtype in [DType::Bf16, DType::F32] {
+            write_snapshot(dir.path(), &config(4096, 12288, 16, 32, 4), &tensors(fp8), None);
+            let mut checkpoint = Checkpoint::open(dir.path()).unwrap();
+            for tensor in &mut checkpoint.tensors {
+                if tensor.meta.name.ends_with("weight_scale_inv") && scale_dtype == DType::F32 {
+                    tensor.meta.dtype = DType::F32;
+                    tensor.meta.byte_length *= 2;
+                }
+            }
+            let weights = NativeWeights::native(&checkpoint, &cfg, DType::F32).unwrap();
+            let header = |name: &str| &checkpoint.tensors.iter().find(|t| t.meta.name == name).unwrap().meta;
+            for (layer, &kind) in cfg.attention.iter().enumerate() {
+                for operand in native_operands(&format!("model.language_model.layers.{layer}"), kind, fp8) {
+                    let sources = operand.tensors.iter().map(|name| header(name)).collect::<Vec<_>>();
+                    let raw: u64 = sources.iter().map(|t| t.byte_length).sum();
+                    // Mirror the reader's simultaneously live buffers, independently
+                    // of the inventory's resident allocation sizes/floors.
+                    let output: u64 = match operand.storage {
+                        Storage::Fp8 => sources.iter().map(|t| t.shape.iter().product::<usize>() as u64).sum(),
+                        Storage::Scales | Storage::F32 => sources.iter().map(|t| t.shape.iter().product::<usize>() as u64 * 4).sum(),
+                        _ => 0,
+                    };
+                    assert!(weights.loading_host_bytes >= raw + output * 2,
+                        "layer {layer} {} exceeds the loading allowance", operand.name);
+                    assert!(weights.loading_host_bytes >= sources.iter().map(|t| t.byte_length).max().unwrap());
+                }
+            }
+            for name in ["model.language_model.norm.weight", "lm_head.weight"] {
+                assert!(weights.loading_host_bytes >= header(name).byte_length);
+            }
+            // A bigger header must update the allowance, not rely on today's
+            // largest projection or on the checkpoint's shard size.
+            let head = checkpoint.tensors.iter_mut().find(|t| t.meta.name == "lm_head.weight").unwrap();
+            head.meta.shape = vec![65536, 4096];
+            head.meta.byte_length = 65536 * 4096 * 2;
+            let larger = NativeWeights::native(&checkpoint, &cfg, DType::F32).unwrap();
+            assert!(larger.loading_host_bytes > weights.loading_host_bytes);
+            assert!(larger.loading_host_bytes >= 65536 * 4096 * 2);
+        }
+    }
+}
+
+#[test]
+fn native_planner_keeps_exact_pins_and_refuses_unimplemented_context() {
+    let (dir, mut options, _, _) = native_planner_fixture();
+    for pool in [0, 262145] {
+        options.layout.as_mut().unwrap().pool_tokens = Some(pool);
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert!(!report.wip_launchable());
+        let message = if pool == 0 { "cannot hold selected context" } else { "not aligned" };
+        assert!(report.hints.iter().any(|hint| hint.what.contains(message)), "{:?}", report.hints);
+    }
+    options.layout.as_mut().unwrap().pool_tokens = Some(262144);
+    options.layout.as_mut().unwrap().context_tokens = 131072;
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.wip_launchable());
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("context")));
+    options.layout.as_mut().unwrap().context_tokens = 262144;
+    assert!(plan::plan(dir.path(), &options).unwrap().wip_launchable());
+}
+
+#[test]
 fn dense_geometry_and_native_gate_sites() {
     for (h, i, heads, values, layers, kv, state) in [(4096, 12288, 16, 32, 32, 32768, 51511296),
         (5120, 17408, 24, 48, 64, 65536, 153944064)] {

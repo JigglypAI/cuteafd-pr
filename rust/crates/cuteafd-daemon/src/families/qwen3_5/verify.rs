@@ -63,8 +63,12 @@ impl<'a> Verification<'a> {
         Ok(Self { owner, generation: 0, mark, layout, logits, hidden, taps: Vec::new(), pending: None })
     }
 
-    pub(super) fn allocated_bytes(&self) -> [usize; 3] {
-        [self.mark.buffer.bytes, self.logits.buffer.bytes, self.hidden.buffer.bytes]
+    pub(super) fn allocation_buffers(&self) -> [CuteafdDeviceBuffer; 3] {
+        [self.mark.buffer, self.logits.buffer, self.hidden.buffer]
+    }
+
+    pub(super) fn state_views(&self) -> Result<Vec<CuteafdDeviceBuffer>> {
+        self.layout.regions.iter().map(|&(_, offset, bytes)| view(self.mark.buffer, offset, bytes)).collect()
     }
 
     pub(super) fn invalidate(&mut self) -> Result<()> {

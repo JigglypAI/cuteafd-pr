@@ -400,7 +400,7 @@ mod tests {
             "--prefix-cache-mark-mib", "1024", "--listen", "0.0.0.0:8000", "--max-output-tokens", "4096"]).unwrap();
         let crate::cli::Commands::ServeQwen35(args) = cli.command else { panic!("dense serving not registered") };
         assert_eq!(args.max_sequences, 8);
-        assert_eq!(args.pool_tokens.filter(|&tokens| tokens > 0), None);
+        assert_eq!(args.pool_tokens, Some(0), "an explicit zero remains an exact pin for admission to refuse");
         assert_eq!(args.prefix.prefix_cache_entries, 4);
         assert_eq!(args.kv_cache, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8);
     }

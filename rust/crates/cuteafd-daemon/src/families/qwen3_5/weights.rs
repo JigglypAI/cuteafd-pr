@@ -22,6 +22,10 @@ impl DenseLayer<'_> {
     pub(crate) fn bytes(&self) -> usize {
         self.operands.values().map(|a| a.buffer.bytes).sum()
     }
+
+    pub(crate) fn allocation_buffers(&self) -> impl Iterator<Item = (&str, cuteafd_ffi::CuteafdDeviceBuffer)> {
+        self.operands.iter().map(|(&name, allocation)| (name, allocation.buffer))
+    }
 }
 
 pub(crate) struct DenseWeights<'a> {
@@ -29,9 +33,6 @@ pub(crate) struct DenseWeights<'a> {
     pub(crate) norm: Allocation<'a>,
     pub(crate) head: Allocation<'a>,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Storage { Bf16, F32, NativeNorm, Fp8, Scales }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DenseFormat { Bf16, Fp8 }
@@ -48,68 +49,9 @@ impl DenseFormat {
     pub(crate) fn fp8(self) -> bool { self == Self::Fp8 }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct Operand {
-    name: &'static str,
-    tensors: Vec<String>,
-    storage: Storage,
-}
-
-fn layer_operands(prefix: &str, attention: HybridAttention) -> Vec<Operand> {
-    let mut out = Vec::new();
-    let mut add = |name, tensors: &[&str], storage| out.push(Operand { name,
-        tensors: tensors.iter().map(|t| format!("{prefix}.{t}")).collect(), storage });
-    for (operand, tensor) in [("attn.norm", "input_layernorm.weight"), ("ffn.norm", "post_attention_layernorm.weight"),
-        ("ffn.w_down", "mlp.down_proj.weight")] {
-        add(operand, &[tensor], Storage::Bf16);
-    }
-    add("ffn.w_gate_up", &["mlp.gate_proj.weight", "mlp.up_proj.weight"], Storage::Bf16);
-    match attention {
-        HybridAttention::Gdn => {
-            add("w_in", &["linear_attn.in_proj_qkv.weight", "linear_attn.in_proj_z.weight",
-                "linear_attn.in_proj_b.weight", "linear_attn.in_proj_a.weight"], Storage::Bf16);
-            for (operand, tensor) in [("conv_w", "conv1d.weight"), ("a_log", "A_log"), ("dt_bias", "dt_bias")] {
-                add(operand, &[&format!("linear_attn.{tensor}")], Storage::F32);
-            }
-            add("norm_w", &["linear_attn.norm.weight"], Storage::NativeNorm);
-            add("w_out", &["linear_attn.out_proj.weight"], Storage::Bf16);
-        }
-        HybridAttention::Full => {
-            add("w_in", &["self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"], Storage::Bf16);
-            for (operand, tensor) in [("q_norm", "q_norm.weight"), ("k_norm", "k_norm.weight"), ("w_o", "o_proj.weight")] {
-                add(operand, &[&format!("self_attn.{tensor}")], Storage::Bf16);
-            }
-        }
-    }
-    out
-}
-
-fn native_operands(prefix: &str, attention: HybridAttention, format: DenseFormat) -> Vec<Operand> {
-    let specs = layer_operands(prefix, attention);
-    if !format.fp8() { return specs; }
-    let mut out = Vec::new();
-    for mut spec in specs {
-        let projection = matches!(spec.name, "w_in" | "w_out" | "w_o" | "ffn.w_gate_up" | "ffn.w_down");
-        if !projection { out.push(spec); continue; }
-        if attention == HybridAttention::Gdn && spec.name == "w_in" {
-            let gates = spec.tensors.split_off(2);
-            out.push(Operand { name: "w_ba", tensors: gates, storage: Storage::Bf16 });
-        }
-        let (weight, scales) = match spec.name {
-            "w_in" if attention == HybridAttention::Gdn => ("w_qkvz_fp8", "w_qkvz_scale"),
-            "w_in" => ("w_in_fp8", "w_in_scale"),
-            "w_out" => ("w_out_fp8", "w_out_scale"),
-            "w_o" => ("w_o_fp8", "w_o_scale"),
-            "ffn.w_gate_up" => ("ffn.w_gate_up_fp8", "ffn.w_gate_up_scale"),
-            "ffn.w_down" => ("ffn.w_down_fp8", "ffn.w_down_scale"),
-            _ => unreachable!(),
-        };
-        out.push(Operand { name: scales, tensors: spec.tensors.iter()
-            .map(|name| format!("{}_scale_inv", name)).collect(), storage: Storage::Scales });
-        out.push(Operand { name: weight, tensors: spec.tensors, storage: Storage::Fp8 });
-    }
-    out
-}
+use cuteafd_loader::placement::families::qwen3_5::weights::{native_operands, Storage};
+#[cfg(test)]
+use cuteafd_loader::placement::families::qwen3_5::weights::layer_operands;
 
 fn packed_native_layout(tensors: &[(Vec<u8>, DType, Vec<usize>)], storage: Storage) -> Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -153,7 +95,7 @@ impl<'a> WeightReader<'a> {
     }
 
     pub(crate) fn dense_layer_bytes(&self, prefix: &str, attention: HybridAttention, format: DenseFormat) -> Result<u64> {
-        native_operands(prefix, attention, format).into_iter().try_fold(0u64, |total, spec| {
+        native_operands(prefix, attention, format.fp8()).into_iter().try_fold(0u64, |total, spec| {
             let bytes = spec.tensors.iter().try_fold(0u64, |bytes, name| {
                 let tensor = &self.tensor(name)?.meta;
                 ensure!(match spec.storage {
@@ -171,7 +113,7 @@ impl<'a> WeightReader<'a> {
 
     /// MTP and target blocks share the checkpoint-native projection packing.
     pub(crate) fn dense_layer(&self, prefix: &str, attention: HybridAttention, format: DenseFormat) -> Result<DenseLayer<'a>> {
-        let operands = native_operands(prefix, attention, format).into_iter().map(|spec| {
+        let operands = native_operands(prefix, attention, format.fp8()).into_iter().map(|spec| {
                 let weight = match spec.storage {
                     Storage::Bf16 if spec.tensors.len() > 1 => self.rows(&spec.tensors, 0)?,
                     Storage::Bf16 => self.bf16(&spec.tensors[0])?,
@@ -197,7 +139,7 @@ mod tests {
 
     #[test]
     fn fp8_operands_keep_raw_weight_bytes_exact_scales_and_bf16_gates() -> Result<()> {
-        let specs = native_operands("layer", HybridAttention::Gdn, DenseFormat::Fp8);
+        let specs = native_operands("layer", HybridAttention::Gdn, true);
         let find = |name| specs.iter().find(|spec| spec.name == name).unwrap();
         assert_eq!(find("w_ba").tensors, ["layer.linear_attn.in_proj_b.weight", "layer.linear_attn.in_proj_a.weight"]);
         assert_eq!(find("w_ba").storage, Storage::Bf16);

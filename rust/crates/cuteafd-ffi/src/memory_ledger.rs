@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Which pool an allocation came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -75,6 +75,7 @@ struct State {
     totals: BTreeMap<Key, (usize, usize)>,
     peak: BTreeMap<(Space, i32), usize>,
     current: BTreeMap<(Space, i32), usize>,
+    audits: Vec<Weak<Mutex<Vec<AllocationEvent>>>>,
 }
 
 fn state() -> &'static Mutex<State> {
@@ -222,6 +223,7 @@ pub(crate) fn record_alloc(space: Space, device: i32, ptr: usize, bytes: usize) 
         // A pointer reused without a recorded free (freed outside the library).
         release(&mut state, previous);
     }
+    audit_event(&mut state, AllocationEvent::Allocated(AllocationRecord { address: ptr, key, bytes }));
 }
 
 fn release(state: &mut State, live: Live) {
@@ -248,6 +250,7 @@ pub(crate) fn record_free(ptr: usize) {
     }
     let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(live) = state.live.remove(&ptr) {
+        audit_event(&mut state, AllocationEvent::Freed(AllocationRecord { address: ptr, key: live.key, bytes: live.bytes }));
         release(&mut state, live);
     }
 }
@@ -270,6 +273,41 @@ pub fn relabel_other(label: &'static str) {
         }
         state.live.insert(ptr, Live { key, bytes: live.bytes });
     }
+}
+
+/// One physical owner, without tensor-stem aggregation. Startup reconciliation
+/// uses addresses to join actual Rust owners to the complete allocation census.
+#[derive(Clone, Copy, Debug)]
+pub struct AllocationRecord { pub address: usize, pub key: Key, pub bytes: usize }
+
+#[derive(Clone, Copy, Debug)]
+pub enum AllocationEvent { Allocated(AllocationRecord), Freed(AllocationRecord) }
+
+/// Startup-only event history. Dropping the audit releases its history; normal
+/// serving keeps no unbounded allocation event log.
+pub struct AllocationAudit { events: Arc<Mutex<Vec<AllocationEvent>>> }
+impl AllocationAudit {
+    pub fn start() -> Self {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        state().lock().unwrap_or_else(|e| e.into_inner()).audits.push(Arc::downgrade(&events));
+        Self { events }
+    }
+    pub fn events(&self) -> Vec<AllocationEvent> {
+        self.events.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+fn audit_event(state: &mut State, event: AllocationEvent) {
+    state.audits.retain(|audit| {
+        if let Some(events) = audit.upgrade() {
+            events.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+            true
+        } else { false }
+    });
+}
+
+pub fn allocations() -> Vec<AllocationRecord> {
+    let state = state().lock().unwrap_or_else(|e| e.into_inner());
+    state.live.iter().map(|(&address, live)| AllocationRecord { address, key: live.key, bytes: live.bytes }).collect()
 }
 
 /// One aggregated ledger row.
@@ -475,6 +513,41 @@ mod tests {
         for ptr in base..base + 3 {
             record_free(ptr);
         }
+    }
+
+    #[test]
+    fn allocation_audit_tracks_unaggregated_owners_frees_and_pointer_reuse() {
+        let base = 0x7200_0000_0000usize;
+        let audit = AllocationAudit::start();
+        let observer = AllocationAudit::start();
+        {
+            let _scope = scope("test/startup-audit");
+            let _owner = owner("test/actual-owner");
+            record_alloc(Space::Device, 12, base, 1024);
+            record_alloc(Space::Pinned, -1, base + 4096, 64);
+        }
+        let live = allocations();
+        let device = live.iter().find(|a| a.address == base).unwrap();
+        assert_eq!((device.key.space, device.key.device, device.key.owner, device.bytes),
+            (Space::Device, 12, Some("test/actual-owner"), 1024));
+        record_free(base);
+        record_alloc(Space::Managed, 12, base, 2048);
+        record_free(base);
+        record_free(base + 4096);
+        let own_events = |audit: &AllocationAudit| audit.events().into_iter().filter(|event| {
+            let a = match event { AllocationEvent::Allocated(a) | AllocationEvent::Freed(a) => a };
+            a.address == base || a.address == base + 4096
+        }).collect::<Vec<_>>();
+        let events = own_events(&audit);
+        assert_eq!(events.len(), 6);
+        assert!(matches!(events[0], AllocationEvent::Allocated(a) if a.bytes == 1024));
+        assert!(matches!(events[2], AllocationEvent::Freed(a) if a.bytes == 1024));
+        assert!(matches!(events[3], AllocationEvent::Allocated(a) if a.key.space == Space::Managed && a.bytes == 2048));
+        assert_eq!(own_events(&observer).len(), events.len());
+        assert!(!allocations().iter().any(|a| a.address == base || a.address == base + 4096));
+        let history = Arc::downgrade(&audit.events);
+        drop(audit);
+        assert!(history.upgrade().is_none(), "the ledger must not retain dropped startup history");
     }
 
     #[test]
