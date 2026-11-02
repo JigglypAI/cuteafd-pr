@@ -177,6 +177,11 @@ impl Client {
 
     /// Wait outside request timing for a new 1 Hz observation on each known
     /// host. This excludes the preceding warm-up and includes the final work;
+    /// Decode counters are sampled outside the timed request.
+    pub fn decode_counters(&self) -> Option<Value> {
+        self.get("/v1/console/snapshot").ok()?.get("g")?.get("totals").cloned()
+    }
+
     /// rates describe the sampled envelope, including idle boundary padding.
     pub fn fabric_mark(&self) -> Option<cuteafd_transport::traffic::Snapshot> {
         let mut before = self.fabric()?;
