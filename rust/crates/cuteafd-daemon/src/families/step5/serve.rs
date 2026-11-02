@@ -415,7 +415,7 @@ fn with_backend<T>(args: &ServeArgs,
         let mut link = SparkLink::new_waves(&library, world, &args.peers, args.prefill_rows, config, 4096 * 2,
             waves, args.prefill_rows)?;
         link.enable_terminal_ownership(library.clone())?;
-        link.bootstrap(&super::execution::bootstrap_request(inputs.unit_rows(), 1)?)?;
+        link.bootstrap(&super::execution::bootstrap_request(inputs.unit_rows(), 1, &format)?)?;
         Ok(link)
     })?;
     library.cuda_set_device(args.device)?;
@@ -653,7 +653,7 @@ mod tests {
             SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
                 rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: 6, prefill_lanes: 1 },
                 6, None, spark_model(&exports, endpoint, 1, clients, TcpTransportConfig::default().max_frame_bytes)?)?;
-            super::super::execution::bootstrap_request(inputs.rows, 1)?;
+            super::super::execution::bootstrap_request(inputs.rows, 1, &format)?;
             let head_rank = usize::from(admitted.ownership.execution().spec().head_gpu);
             for rank in 0..2 {
                 let mut native = Execution::serving_admission(&programs, &checkpoint,

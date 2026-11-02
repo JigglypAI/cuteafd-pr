@@ -454,7 +454,8 @@ pub(super) fn request(
     Ok(request)
 }
 
-fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<(SparkWorld, TcpTransportConfig)> {
+fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
+    -> Result<(SparkWorld, TcpTransportConfig, super::experts::StepExperts)> {
     let world = SparkWorld::canonical(args.peers.len())?;
     let packages = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SPARK_PACKAGES")?);
     let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
@@ -498,24 +499,12 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<
     .select(&args.peers)?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers,
         SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: format.ingress() }, 1)?;
-    Ok((world, config))
+    Ok((world, config, format))
 }
 
 fn link<'a>(device: Device<'a>, args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<RefCell<SparkLink<'a>>> {
-    let (world, config) = expert_admission(args, rows, layers)?;
-    let warm = request(
-        3,
-        rows,
-        ExpertV2Dtype::Bf16,
-        (0..rows * 8)
-            .map(|i| ExpertProtocolV2RouteEntry {
-                row_index: (i / 8) as u32,
-                expert_id: (i % 352) as u32,
-                gate_weight: 0.,
-            })
-            .collect(),
-        vec![0; rows * H * 2].into(),
-    )?;
+    let (world, config, format) = expert_admission(args, rows, layers)?;
+    let warm = super::execution::bootstrap_request(rows, 17, &format)?;
     // The widest wave sizes every rank's rings and the exchange staging.
     let mut link = SparkLink::new(device.library, world, &args.peers, u32::try_from(rows)?, config, H * 2)?;
     link.bootstrap(&warm)?;
@@ -788,7 +777,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
 }
 
 fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
-    reference: Reference, layers: &[usize]) -> Result<()> {
+    reference: Reference, layers: &[usize], format: &super::experts::StepExperts) -> Result<()> {
     use super::execution::Execution;
     use crate::shared::spark_intake::SparkLink;
     use std::sync::Arc;
@@ -841,7 +830,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
                 .and_then(|pages| active.checked_add(pages)))
             .context("Step-5 shared cache overflow")?;
         staging_bytes[rank] = Staging::bytes(&layout, rank)? as u64;
-        let pending = crate::shared::inventory::pending_code(&library, devices[rank].id, rank, true, "step5", "fp8", &selected)?;
+        let pending = crate::shared::inventory::pending_code(&library, devices[rank].id, rank, true, "step5", &format.package_name(), &selected)?;
         let hops = cuteafd_loader::placement::hop_buffer_bytes(ownership.execution().hops(), &ownership.execution().spec(), 2)
             .context("Step-5 shared hop charge")?;
         // Eight peer receive slots, hop buffers/control, intake construction,
@@ -862,13 +851,13 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         RefCell::new(CacheRank::new(devices[1], layout, 1, 1, 0, pages, cache_bytes[1] as usize)?)];
     let stages = [Staging::new_for_units(devices[0], &programs, &caches[0].borrow(), staging_bytes[0] as usize, 1, unit)?,
         Staging::new_for_units(devices[1], &programs, &caches[1].borrow(), staging_bytes[1] as usize, 1, unit)?];
-    let (world, config) = expert_admission(args, rows, layers)?;
+    let (world, config, format) = expert_admission(args, rows, layers)?;
     let transport = devices[0].own(|| {
         let mut link = if waves > 1 {
             SparkLink::new_waves(&library, world, &args.peers, unit as u32, config, H * 2, waves, unit as u32)?
         } else { SparkLink::new(&library, world, &args.peers, unit as u32, config, H * 2)? };
         link.enable_terminal_ownership(library.clone())?;
-        link.bootstrap(&super::execution::bootstrap_request(unit, 17)?)?;
+        link.bootstrap(&super::execution::bootstrap_request(unit, 17, &format)?)?;
         Ok(link)
     })?;
     let family = Step5Prefix::new(vec![&caches[0], &caches[1]])?;
@@ -973,7 +962,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     let cfg = Config::parse(&checkpoint)?;
     let reference = reference(&args, cfg.vocab)?;
     if args.dump_layer0.is_some() { return layer0_run(&args, &checkpoint, &cfg, reference); }
-    if args.split_device.is_some() { return split_run(&args, &checkpoint, &cfg, reference, &layers); }
+    if args.split_device.is_some() { return split_run(&args, &checkpoint, &cfg, reference, &layers, &format); }
     let Reference { tokens, expected, positions, hidden, final_norm } = reference;
     let reference_kind = if args.fp8_diagnostic_reference { "native-FP8 diagnostic" } else { "BF16-root diagnostic" };
     let rows = tokens.len();

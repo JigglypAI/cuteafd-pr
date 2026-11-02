@@ -1013,7 +1013,8 @@ fn expert_request(identity: u64, placement_version: u64, layer: usize,
     Ok(request)
 }
 
-pub(super) fn bootstrap_request(rows: usize, placement_version: u64) -> Result<ExpertProtocolV2Request> {
+pub(super) fn bootstrap_request(rows: usize, placement_version: u64,
+    format: &super::experts::StepExperts) -> Result<ExpertProtocolV2Request> {
     ensure!((1..=4096).contains(&rows), "Step-5 bootstrap row capacity");
     let descriptors = (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
         row_id: u64::from(row), source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1,
@@ -1022,9 +1023,14 @@ pub(super) fn bootstrap_request(rows: usize, placement_version: u64) -> Result<E
     let routes = (0..rows * 8).map(|i| ExpertProtocolV2RouteEntry {
         row_index: (i / 8) as u32, expert_id: (i % 352) as u32, gate_weight: 0.,
     }).collect();
-    // Bootstrap does not execute a layer: retain BF16-max staging for native tails.
-    expert_request(1, placement_version, 3, ExpertV2Dtype::Bf16, descriptors, routes,
-        vec![0; rows * H * 2].into())
+    // Native mixed ingress retains BF16-max staging for tails; EXL3 admits only K32.
+    let (dtype, row_bytes) = match format.ingress() {
+        cuteafd_core::SparkIngress::Fp8K32 => (ExpertV2Dtype::Fp8E4m3Ue8m0K32, H + H / 32),
+        cuteafd_core::SparkIngress::Bf16 | cuteafd_core::SparkIngress::Native => (ExpertV2Dtype::Bf16, H * 2),
+        cuteafd_core::SparkIngress::Bf16Decode { .. } => anyhow::bail!("Step-5 has no row-dependent ingress"),
+    };
+    expert_request(1, placement_version, 3, dtype, descriptors, routes,
+        vec![0; rows * row_bytes].into())
 }
 
 fn check_captures(startup: u64, current: u64) -> Result<()> {
@@ -1519,6 +1525,32 @@ mod tests {
         assert_ne!(request.header.flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, 0);
         for (id, version, layer) in [(0, 812, 88), (39, 0, 88), (39, 812, 2), (39, 812, 91)] {
             assert!(expert_request(id, version, layer, ExpertV2Dtype::Bf16, rows.clone(), routes.clone(), wire.clone()).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_matches_checkpoint_ingress_and_widest_wire() -> Result<()> {
+        use super::super::experts::StepExperts;
+        use cuteafd_loader::formats::fp8_experts::ExpertFormat;
+        for (format, dtype, row_bytes) in [
+            (StepExperts::Exl3(vec![4, 6]), ExpertV2Dtype::Fp8E4m3Ue8m0K32, H + H / 32),
+            (StepExperts::Native(ExpertFormat::Fp8Block128), ExpertV2Dtype::Bf16, H * 2),
+            (StepExperts::Native(ExpertFormat::Nvfp4), ExpertV2Dtype::Bf16, H * 2),
+        ] {
+            for rows in [1, 64, 640, 2752, 4096] {
+                let request = bootstrap_request(rows, 17, &format)?;
+                assert_eq!(request.header.hidden_dtype, dtype);
+                assert_eq!(request.header.hidden_row_stride_bytes as usize, row_bytes);
+                assert_eq!(request.hidden_payload.len(), rows * row_bytes);
+                assert_eq!(request.rows.len(), rows);
+                assert_eq!(request.routes.len(), rows * 8);
+                assert_eq!(request.header.placement_version, 17);
+                assert!(request.routes.iter().all(|route| route.gate_weight == 0.));
+                assert_ne!(request.header.flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, 0);
+            }
+            for rows in [0, 4097] { assert!(bootstrap_request(rows, 17, &format).is_err()); }
+            assert!(bootstrap_request(1, 0, &format).is_err());
         }
         Ok(())
     }
