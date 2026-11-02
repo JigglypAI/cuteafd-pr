@@ -315,8 +315,9 @@ pub(crate) fn read_deepseek_v4_exl3_manifest<'a>(
     tiers: &[usize],
 ) -> Result<V41Exl3Manifest> {
     let config = read_json(&snapshot.join("config.json"), 1024 * 1024)?;
-    let derived = derive_storage_map(headers)?;
-    let source = check_storage_maps(snapshot, &config, &derived, backbone.layers)?;
+    let headers = headers.into_iter().collect::<Vec<_>>();
+    let derived = derive_storage_map(headers.iter().copied())?;
+    let source = check_storage_maps(snapshot, &config, &derived, backbone.layers, &headers)?;
     build_deepseek_v4_manifest(source, &derived, backbone, tiers)
 }
 
@@ -324,7 +325,8 @@ pub(crate) fn read_deepseek_v4_exl3_manifest<'a>(
 /// GPTQModel `quantize_config.json` (and its `quantization_config.json`
 /// copy), an exllamav3 `quantization_config.json`, or none (the compact
 /// `config.json` block alone).
-fn check_storage_maps(snapshot: &Path, config: &Value, derived: &Exl3StorageMap, backbone_layers: usize) -> Result<Exl3StorageSource> {
+fn check_storage_maps(snapshot: &Path, config: &Value, derived: &Exl3StorageMap, backbone_layers: usize,
+    headers: &[&SafetensorsTensorMetadata]) -> Result<Exl3StorageSource> {
     let compact = config.get("quantization_config").context("config.json has no quantization_config")?;
     use sha2::{Digest, Sha256};
     let mut source = None;
@@ -345,6 +347,8 @@ fn check_storage_maps(snapshot: &Path, config: &Value, derived: &Exl3StorageMap,
         normalize_legacy_names(&mut manifest);
         let flavor = if manifest.get("checkpoint_format").is_some() {
             check_gptqmodel_manifest(compact, &manifest, derived, backbone_layers).with_context(|| format!("checking {file}"))?;
+            crate::formats::exl3_contract::check_retained_native_tensors(&manifest, derived, headers)
+                .with_context(|| format!("checking {file}"))?;
             Exl3StorageSource::GptqModel
         } else {
             check_exllamav3_manifest(compact, &manifest).with_context(|| format!("checking {file}"))?;
@@ -485,6 +489,75 @@ fn build_deepseek_v4_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_muse_manifest_key_set_and_native_inventory() -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let bytes = include_bytes!("../../../tests/fixtures/muse-89998fb1.json");
+        assert_eq!(format!("{:x}", Sha256::digest(bytes)),
+            "0d6bde113718c730eab1cead9625f89265eebf3b1ad2a8577702005506682565");
+        let fixture: Value = serde_json::from_slice(bytes)?;
+        assert_eq!(fixture["source"]["revision"], "89998fb177acd9a862ac8bd4fb79bfd50e940c97");
+        assert_eq!(fixture["source"]["manifest_sha256"],
+            "e6b88ef785c5d579cd6ade2ea4cd1cf66f887d18082f76e6591593ac336f6655");
+        assert_eq!(fixture["source"]["headers_sha256"],
+            "35f099e6221c3f3fbc46be6dba25478e5766eaae478deceedf138d72c1b1c1ba");
+        assert_eq!(fixture["source"]["config_sha256"],
+            "7cd07bfb249688d1af42216fdf4a934e5e5c50d45d1f655ec9f7eda491666d8a");
+        let manifest = &fixture["manifest"];
+        assert_eq!(manifest.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
+            ["bits", "calibration", "checkpoint_format", "codebook", "core_bits", "desc_act", "format",
+             "fused_expert_layout", "group_size", "head_bits", "lm_head", "meta", "method", "module_include",
+             "out_scales", "per_module_metadata", "quant_method", "retained_native_tensors", "sym", "tensor_storage"]);
+        let headers = fixture["headers"].as_object().unwrap().iter().map(|(name, h)| {
+            let start = h["data_offsets"][0].as_u64().unwrap();
+            SafetensorsTensorMetadata { name: name.clone(), dtype: DType::from_safetensors(h["dtype"].as_str().unwrap()),
+                shape: serde_json::from_value(h["shape"].clone()).unwrap(), byte_offset: start,
+                byte_length: h["data_offsets"][1].as_u64().unwrap() - start }
+        }).collect::<Vec<_>>();
+        assert_eq!(headers.len(), 161);
+        let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(&fixture["config"])?;
+        // Two layers/two experts retain real tensor geometry, including padded K6
+        // vocabulary, MCG markers, audio/vision classes and BF16/F32 natives.
+        let shape = crate::RoutedExpertShape { layers: 2, first_layer: 0, experts: 2, topk: 2,
+            hidden: cfg.expert_hidden, intermediate: cfg.moe_intermediate, draft_stages: 0, draft_experts: 0 };
+        let parsed = read_publication(&fixture["config"], &[("quantize_config.json", manifest)], shape, &headers, &[4,5])?;
+        assert_eq!(parsed.storage, Exl3StorageSource::GptqModel);
+        assert_eq!(parsed.projections.len(), 12);
+        assert!(parsed.projections.values().all(|p| p.bits == 4));
+        let derived = derive_storage_map(&headers)?;
+        assert_eq!(derived.len(), 25);
+        assert_eq!(derived["lm_head"].bits, 6);
+        assert_eq!(derived["lm_head"].output_features, 202112);
+        let check_native = |value: &Value, headers: &[SafetensorsTensorMetadata]| {
+            crate::formats::exl3_contract::check_retained_native_tensors(value, &derived,
+                &headers.iter().collect::<Vec<_>>())
+        };
+        let native = "model.language_model.layers.0.mlp.gate.weight";
+        for (key, wrong) in [("dtype", serde_json::json!("BF16")), ("shape", serde_json::json!([256,4096])),
+            ("extra", serde_json::json!(true))] {
+            let mut bad = manifest.clone(); bad["retained_native_tensors"][native][key] = wrong;
+            assert!(format!("{:#}", check_native(&bad, &headers).unwrap_err()).contains("retained_native_tensors"));
+        }
+        let mut missing = manifest.clone(); missing["retained_native_tensors"].as_object_mut().unwrap().remove(native);
+        assert!(check_native(&missing, &headers).unwrap_err().to_string().contains(native));
+        let mut extra = manifest.clone();
+        extra["retained_native_tensors"]["absent.weight"] = serde_json::json!({"dtype":"BF16", "shape":[1]});
+        assert!(check_native(&extra, &headers).unwrap_err().to_string().contains("absent.weight"));
+        let mut quantized = manifest.clone();
+        quantized["retained_native_tensors"]["lm_head.mcg"] = serde_json::json!({"dtype":"I32", "shape":[]});
+        assert!(check_native(&quantized, &headers).unwrap_err().to_string().contains("EXL3 storage member"));
+        let mut short = headers.clone(); short.iter_mut().find(|h| h.name == native).unwrap().byte_length -= 1;
+        assert!(check_native(manifest, &short).unwrap_err().to_string().contains(native));
+        let mut unknown = manifest.clone(); unknown["future_storage_key"] = Value::Bool(true);
+        assert!(format!("{:#}", read_publication(&fixture["config"], &[("quantize_config.json", &unknown)],
+            shape, &headers, &[4,5]).unwrap_err()).contains("unexpected key future_storage_key"));
+        let mut wrong_storage = manifest.clone();
+        wrong_storage["tensor_storage"]["lm_head"]["stored_tensors"]["lm_head.svh"]["shape"] = serde_json::json!([202048]);
+        assert!(format!("{:#}", read_publication(&fixture["config"], &[("quantize_config.json", &wrong_storage)],
+            shape, &headers, &[4,5]).unwrap_err()).contains("lm_head"));
+        Ok(())
+    }
 
     fn deepseek_v4_publication_with(
         bits: impl Fn(&str) -> usize,

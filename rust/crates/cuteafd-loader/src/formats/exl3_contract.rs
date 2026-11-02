@@ -105,6 +105,45 @@ fn check_fused_expert_layout(value: &Value, derived: &Exl3StorageMap, layers: us
     Ok(())
 }
 
+pub(crate) fn check_retained_native_tensors(
+    manifest: &Value, derived: &Exl3StorageMap, headers: &[&crate::SafetensorsTensorMetadata],
+) -> Result<()> {
+    let Some(value) = manifest.get("retained_native_tensors") else { return Ok(()); };
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NativeTensor { dtype: String, shape: Vec<usize> }
+    let declarations: std::collections::BTreeMap<String, NativeTensor> =
+        serde_json::from_value(value.clone()).context("EXL3 retained_native_tensors schema")?;
+    let is_exl3 = |name: &str| name.rsplit_once('.').is_some_and(|(stem, suffix)|
+        derived.get(stem).is_some_and(|module| module.tensors.contains_key(suffix)));
+    let mut native = std::collections::BTreeMap::new();
+    for header in headers.iter().filter(|header| !is_exl3(&header.name)) {
+        ensure!(native.insert(header.name.as_str(), *header).is_none(),
+            "EXL3 retained_native_tensors duplicate header {}", header.name);
+    }
+    for (name, declaration) in declarations {
+        ensure!(!is_exl3(&name), "EXL3 retained_native_tensors {name} is an EXL3 storage member");
+        let header = native.remove(name.as_str()).with_context(||
+            format!("EXL3 retained_native_tensors {name} missing from native headers"))?;
+        let dtype = cuteafd_core::DType::from_safetensors(&declaration.dtype);
+        use cuteafd_core::DType;
+        let width = match dtype {
+            DType::Bf16 | DType::F16 | DType::I16 => 2u64,
+            DType::F32 | DType::I32 => 4,
+            DType::I64 => 8,
+            DType::I8 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::F8E8M0 => 1,
+            _ => anyhow::bail!("EXL3 retained_native_tensors {name} unsupported dtype {}", declaration.dtype),
+        };
+        let bytes = declaration.shape.iter().try_fold(width, |bytes, &dim| bytes.checked_mul(dim as u64))
+            .with_context(|| format!("EXL3 retained_native_tensors {name} byte extent overflow"))?;
+        ensure!(dtype == header.dtype && declaration.shape == header.shape && bytes == header.byte_length,
+            "EXL3 retained_native_tensors {name} dtype/shape/bytes disagree with the safetensors header");
+    }
+    ensure!(native.is_empty(), "EXL3 retained_native_tensors omits native header {}",
+        native.keys().next().copied().unwrap_or_default());
+    Ok(())
+}
+
 pub(crate) fn check_gptqmodel_manifest(
     compact: &Value, manifest: &Value, derived: &Exl3StorageMap, backbone_layers: usize,
 ) -> Result<()> {
@@ -112,6 +151,12 @@ pub(crate) fn check_gptqmodel_manifest(
         ensure!(manifest.get(field).and_then(Value::as_str) == Some("exl3"),
             "EXL3 manifest requires {field}=exl3");
     }
+    // Codebook/packing/scale fields constrain native decoder semantics; core_bits,
+    // head_bits and lm_head are checked against headers below. tensor_storage is
+    // consumed by parse_storage_metadata before this check; per_module_metadata
+    // must point to that map. Headers, not module_include's quantizer-selection
+    // regexes, determine inventory. calibration and meta record how weights were
+    // produced, not runtime transforms; retain them only as publication provenance.
     // out_scales describes whether the quantizer folded scales into svh.
     ensure!(manifest["codebook"] == "mcg"
         && matches!(manifest["out_scales"].as_str(), Some("never" | "auto"))
@@ -128,7 +173,8 @@ pub(crate) fn check_gptqmodel_manifest(
             "bits" | "checkpoint_format" | "codebook" | "core_bits" | "head_bits" | "mtp_bits"
             | "desc_act" | "format" | "group_size" | "lm_head" | "meta" | "method" | "module_include"
             | "out_scales" | "pack_dtype" | "quant_method" | "tensor_storage" | "per_module_metadata"
-            | "sym" | "calibration" | "fused_expert_layout"), "EXL3 manifest has unexpected key {key}");
+            | "sym" | "calibration" | "fused_expert_layout" | "retained_native_tensors"),
+            "EXL3 manifest has unexpected key {key}");
     }
     if let Some(layout) = manifest.get("fused_expert_layout") {
         check_fused_expert_layout(layout, derived, backbone_layers)?;
