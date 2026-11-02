@@ -67,15 +67,6 @@ struct DraftRequest {
     slot: usize,
 }
 impl<'w, 'a> DraftRuntime<'w, 'a> {
-    pub fn new(
-        lib: &'a NativeLibrary,
-        weights: &'w DsparkWeights<'a>,
-        table: &'w NativeRtxTensors<'a>,
-        head: &'w VocabularyHead<'a>,
-        capacity: u32,
-    ) -> Result<Self> {
-        Self::with_requests(lib, weights, table, head, capacity, 16)
-    }
     pub fn with_requests(
         lib: &'a NativeLibrary, weights: &'w DsparkWeights<'a>,
         table: &'w NativeRtxTensors<'a>, head: &'w VocabularyHead<'a>,

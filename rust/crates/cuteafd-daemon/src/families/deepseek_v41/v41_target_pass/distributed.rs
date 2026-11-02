@@ -1514,7 +1514,7 @@ mod tests {
         devices[1].run(|| slot_transports[0].get_mut().bootstrap(20, nvfp4))?;
         let [slot0_transport, slot1_transport] = slot_transports;
         let mut prefill_slots = crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillSlots {
-            packed_suffix: pass.new_packed_storage(&lib, unit_rows as usize)?,
+            packed_suffix: pass.new_packed_storage(&lib, unit_rows as usize, 2)?,
             prompt_suffixes: vec![pass.new_prompt_storage(&lib)?],
             slots: vec![(make_slot()?, slot0_transport), (make_slot()?, slot1_transport)],
         };

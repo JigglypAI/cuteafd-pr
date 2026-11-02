@@ -32,14 +32,16 @@ const COMPRESSOR_WORKSPACE: u64 = 4 << 20;
 pub const ENCODER_SUFFIX_ROW_BYTES: u64 = 40960 + 16;
 /// Rows of one prompt's retained suffix: the decoder replay's final window.
 pub const ENCODER_SUFFIX_ROWS: u64 = 128;
-/// The packed arena's rows for units of `unit` rows (up to 16 members' tails).
-pub fn packed_suffix_rows(unit: u64) -> u64 { unit.min(16 * ENCODER_SUFFIX_ROWS) }
+/// The packed arena's rows, bounded by the resolved boot request count.
+pub fn packed_suffix_rows(unit: u64, concurrency: u64) -> u64 {
+    unit.min(concurrency * ENCODER_SUFFIX_ROWS)
+}
 /// The prefill slots' encoder suffix storage: the packed arena plus one
 /// prompt suffix per request slot (`concurrency`), every one allocated at
 /// startup. Prompts mid-encoder (several interleave under the decode share)
 /// each hold one; a request slot holds at most one prompt.
 pub fn encoder_suffix_bytes(unit: u64, concurrency: u64) -> u64 {
-    (packed_suffix_rows(unit) + concurrency * ENCODER_SUFFIX_ROWS) * ENCODER_SUFFIX_ROW_BYTES
+    (packed_suffix_rows(unit, concurrency) + concurrency * ENCODER_SUFFIX_ROWS) * ENCODER_SUFFIX_ROW_BYTES
 }
 
 /// Rows of a decode lane's private owners: the compiled cover of the widest
@@ -582,6 +584,29 @@ mod tests {
         assert_eq!(native_manifest(&lib.join("native.so"), name)?["source"], "sealed");
         std::fs::write(lib.join(name), b"invalid")?;
         assert!(native_manifest(&lib.join("native.so"), name).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn encoder_suffix_admission_scales_with_boot_c_not_global_ceiling() -> Result<()> {
+        let manifest = manifest();
+        let programs = NativePrograms::new(&manifest, 188)?;
+        for ranks in [1, 2] {
+            for concurrency in [16, 33, 64] {
+                let owners = programs.prefill_slots(8256, 2752, ranks, 3, concurrency,
+                    Fp8Head::Off, ranks == 1)?;
+                let expected = (2752u64.min(concurrency * 128) + concurrency * 128) * 40976;
+                assert_eq!(owner(&owners, 0, "prefill slots encoder suffix"), expected);
+                assert!(!owners.iter().any(|d| d.gpu != 0 && d.group.ends_with("encoder suffix")));
+                if concurrency == 16 { assert_eq!(expected, 167837696); }
+                if concurrency == 64 { assert_eq!(expected, 448441344); }
+            }
+        }
+        for unit in [64, 256, 2048, 2752, 4096] {
+            assert_eq!(encoder_suffix_bytes(unit, 16), (unit.min(2048) + 2048) * 40976);
+            assert_eq!(packed_suffix_rows(unit, 33), unit.min(33 * 128));
+            assert_eq!(packed_suffix_rows(unit, 64), unit.min(64 * 128));
+        }
         Ok(())
     }
 
