@@ -371,6 +371,9 @@ fn block_drafter_pages_sources_and_ready_owners_are_exact() {
     for (a, b) in small.allocations.iter().zip(&larger.allocations) {
         let delta = if a.id.ends_with(".k_ring") || a.id.ends_with(".v_ring") {
             262144 * layout.cache.record_bytes as u64 / 2
+        } else if a.id.starts_with("kv.") {
+            assert!(a.view.is_none());
+            262144 * recipe.record_bytes
         } else { 0 };
         assert_eq!(b.bytes - a.bytes, delta, "{}", a.id);
     }
