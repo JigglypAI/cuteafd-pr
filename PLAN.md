@@ -6324,3 +6324,13 @@ Focused finalizer/archive/launcher checks:55 passed. Full-model quality and
 serving qualification remain separate. Production layer15 attention.wo has
 a0.006871 regularized-Hessian relative error; the report preserves this
 outlier separately from the short pilot's unregularized heldout NMSE.
+
+Native storage completion and local weight retirement are durable at
+2026-11-02T03:22:04UTC. All73 sealed shards have exactly one managed Spark
+copy (ostrich/dodo/emu/kiwi/rhea/moa:12/12/12/12/13/12). Final CPU supervisor
+`mistral-core-k6-1793589723765453717` exited0. The30-minute progress timer is
+stopped. A preceding CPU-only retry rejected native refs/main grouping;
+its corrected retry reused the same native jobs without another transfer,
+quantization or publisher pass.56 focused storage/finalizer/launcher cases
+pass. The task's standalone local weight hardlinks are retired; scalar
+proofs, reports, metadata and the managed published revision remain.
