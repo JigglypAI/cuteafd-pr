@@ -168,11 +168,12 @@ pub struct LayoutOptions {
     pub qwen_attention_plan_rows: Option<usize>,
     /// Whole routed backbone layers resident on the coordinator.
     pub local_expert_layers: Option<usize>,
-    /// Families on the shared solver (V4): how many routed layers are
-    /// RTX-resident (`--rtx-expert-layers auto|max|N|N%|all`); a fixed onboard
-    /// makes the KV pool the output. `None` takes the family default (V4:
-    /// `max`); `local_expert_layers` maps onto `Layers(n)` when unset.
-    pub onboard: Option<crate::placement::Onboard>,
+    /// Families on the shared solver (V4): the `--rtx-expert-layers`
+    /// spelling (`auto|all|N`), resolved against the checkpoint's routed-expert
+    /// layer count by each family. A fixed onboard makes the KV pool the
+    /// output. `None` takes the family default; `local_expert_layers` maps onto
+    /// `Layers(n)` when unset.
+    pub onboard: Option<crate::placement::OnboardSetting>,
     /// V4: force FP32 FFN exchange payloads for prefill as well as TP2 decode.
     pub exchange_f32: bool,
     /// GLM Flash KDA partials and their peer payloads use FP32.
@@ -215,6 +216,19 @@ impl LayoutOptions {
 
     pub fn mimo_draft_sequences(&self) -> u64 {
         self.draft_sequences.unwrap_or(crate::families::mimo_v2::draft_representation::DEFAULT_DRAFT_SEQUENCES as u64)
+    }
+
+    /// The unresolved onboard request: `--rtx-expert-layers` wins over the
+    /// `--local-expert-layers N` alias.
+    pub fn requested_onboard(&self) -> Option<crate::placement::OnboardSetting> {
+        self.onboard.or(self.local_expert_layers.map(crate::placement::OnboardSetting::Layers))
+    }
+
+    /// The requested onboard resolved against the target's routed-expert
+    /// layer count (`all` becomes exactly that count); `None` leaves the
+    /// family default in charge.
+    pub fn resolve_onboard(&self, routed: usize) -> Option<crate::placement::Onboard> {
+        self.requested_onboard().map(|setting| setting.resolve(routed))
     }
 }
 
@@ -737,7 +751,7 @@ mod draft_prefix_tests {
         for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
             let mut options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
                 mla_kv: format, prefix_slots: Some(2), host_cache_bytes: Some(0),
-                onboard: Some(crate::placement::Onboard::Layers(5)), ..Default::default() };
+                onboard: Some(crate::placement::OnboardSetting::Layers(5)), ..Default::default() };
             let mut report = plan::plan(target.path(), &PlanOptions {
                 placement: ExpertPlacement::Sparks { ranks: 6 }, layout: Some(options.clone()),
                 ..Default::default()

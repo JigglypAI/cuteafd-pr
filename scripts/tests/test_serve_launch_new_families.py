@@ -94,6 +94,11 @@ def test_kimi_forwards_typed_keys_when_set(tmp_path: Path) -> None:
     assert _flag(serve, "--max-sequences") == "8"
 
 
+def test_kimi_forwards_all_onboard_pin(tmp_path: Path) -> None:
+    serve = _line(_kimi(tmp_path, "RTX_EXPERT_LAYERS=all\n"), "cuteafd serve-kimi --snapshot")
+    assert _flag(serve, "--rtx-expert-layers") == "all"
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_kimi_dflash2_uses_one_resolved_fp8_snapshot_for_plan_and_serve(tmp_path: Path, enabled: bool) -> None:
     model, revision = "lightseekorg/kimi-k3-dflash2", "e77935fb4804e17eb55085bffd045eae1d779769"
@@ -137,7 +142,8 @@ def test_kimi_explicit_spark_budget_reaches_plan_and_workers(tmp_path: Path) -> 
     ("RTX_GPUS=1\n", "TP2 attention on two RTX GPUs"),
     ("COORDINATOR_SPLIT=off\n", "TP2 attention on two RTX GPUs"),
     ("EMBEDDING=host\n", "GPU token embeddings only"),
-    ("RTX_EXPERT_LAYERS=max\n", "auto or a fixed routed-layer count"),
+    ("RTX_EXPERT_LAYERS=max\n", "RTX_EXPERT_LAYERS must be auto, all or N"),
+    ("RTX_EXPERT_LAYERS=50%\n", "RTX_EXPERT_LAYERS must be auto, all or N"),
     ("RTX_EXPERT_LAYERS=94\n", "RTX_EXPERT_LAYERS must be"),
     ("KV_CACHE=int8\n", "KV_CACHE must be bf16 or fp8"),
     ("L2_PREFETCH=auto\n", "unused configuration key: L2_PREFETCH"),

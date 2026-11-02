@@ -499,7 +499,7 @@ fn admit_depth_with(
         .collect::<Vec<_>>();
     let policy = if ranks == 2 { attention::LayerOwnership::Ranges }
         else { attention::LayerOwnership::Alternating };
-    attention::solve_owners(&groups, policy, 0, Onboard::Auto, |owners| -> Result<_> {
+    attention::solve_owners(&groups, policy, 0, |owners| -> Result<_> {
         let ownership = inputs.ownership_for(cfg, owners)?;
         let native = native(&ownership)?;
         let admitted = admit_frozen(cfg, inputs, depth, &ownership, &native)?;
@@ -999,17 +999,17 @@ mod tests {
             let count = |a: &Admission| a.placement.layers.iter().enumerate().filter(|(layer, item)|
                 cfg.full[*layer] && item.mode == WHOLE0).count();
             assert!(count(&candidate) < count(&base), "{format:?}: predictor pressure must move CSA off the head GPU: base={} candidate={}, scores {:?} -> {:?}",
-                count(&base), count(&candidate), attention::owner_score(Onboard::Auto, &base.placement),
-                attention::owner_score(Onboard::Auto, &candidate.placement));
+                count(&base), count(&candidate), attention::owner_score(&base.placement),
+                attention::owner_score(&candidate.placement));
             // At 12 GiB the neighboring 10/13 cut is still slightly worse:
             // BF16 38,284 vs 38,338 pages; FP8 75,409 vs 75,631 pages.
             assert_eq!(count(&old_pressure), 11);
-            assert!(attention::owner_score(Onboard::Auto, &old_pressure.placement)
-                < attention::owner_score(Onboard::Auto, &without_weights.placement));
+            assert!(attention::owner_score(&old_pressure.placement)
+                < attention::owner_score(&without_weights.placement));
             eprintln!("{format:?}: omitted weights cut={}, 12 GiB cut={}, physical scores {:?} -> {:?}",
                 count(&without_weights), count(&old_pressure),
-                attention::owner_score(Onboard::Auto, &without_weights.placement),
-                attention::owner_score(Onboard::Auto, &old_pressure.placement));
+                attention::owner_score(&without_weights.placement),
+                attention::owner_score(&old_pressure.placement));
             assert_eq!(count(&without_weights), 11);
             assert_eq!((count(&base), count(&candidate)), (11, 9),
                 "{format:?}: complete predictor costs must select the expected CSA cut");
@@ -1018,10 +1018,10 @@ mod tests {
             eprintln!("{format:?}: CSA owners base={}/{}, MTP={}/{}, pool alternating={} solved={}, scores {:?} -> {:?}",
                 count(&base), 23 - count(&base), count(&candidate), 23 - count(&candidate),
                 old.placement.pool_tokens, candidate.placement.pool_tokens,
-                attention::owner_score(Onboard::Auto, &old.placement),
-                attention::owner_score(Onboard::Auto, &candidate.placement));
-            assert!(attention::owner_score(Onboard::Auto, &candidate.placement)
-                > attention::owner_score(Onboard::Auto, &old.placement));
+                attention::owner_score(&old.placement),
+                attention::owner_score(&candidate.placement));
+            assert!(attention::owner_score(&candidate.placement)
+                > attention::owner_score(&old.placement));
             assert_eq!(candidate.marks, 2);
             assert_eq!(candidate.cache.ranks[0].mtp_lengths.len(), 3);
             assert!(candidate.cache.ranks[1].mtp_lengths.is_empty());

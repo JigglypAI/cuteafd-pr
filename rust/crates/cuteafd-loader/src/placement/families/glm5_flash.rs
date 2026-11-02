@@ -498,7 +498,7 @@ pub fn solve_attention_working_set_with_graphs(i: &GlmfInputs<'_>,
     });
     let candidate = solve_attention_owner_with_graphs(&alternate, alternate_resident.as_deref(),
         target, automatic_context, sms, rtx_experts);
-    select_attention_working_set(i.onboard, original, candidate)
+    select_attention_working_set(original, candidate)
 }
 
 /// The fixed embedding demand is also the executor's immutable table home.
@@ -524,14 +524,11 @@ fn solve_attention_owner_with_graphs(i: &GlmfInputs<'_>,
     alternate.attention.first_owner ^= 1;
     alternate.resident = resident.to_vec();
     let candidate = solve_working_set_with_graphs(&alternate, target, automatic_context, sms, rtx_experts);
-    select_attention_working_set(i.onboard, original, candidate)
+    select_attention_working_set(original, candidate)
 }
 
-fn attention_owner_score(onboard: Onboard, placed: &Placement) -> Result<((u64, u64), u64), PlacementError> {
-    let policy = match onboard {
-        Onboard::ExpertsFirst { .. } => (placed.onboard_layers as u64, placed.pool_tokens),
-        _ => (placed.pool_tokens, placed.onboard_layers as u64),
-    };
+fn attention_owner_score(placed: &Placement) -> Result<((u64, u64), u64), PlacementError> {
+    let policy = (placed.pool_tokens, placed.onboard_layers as u64);
     // GLM Flash admission uses 256-token pool units, including bounded demands'
     // private reserved units. Match BoundedDemand::bytes rather than max_units.
     let units = placed.pool_tokens.div_ceil(256);
@@ -547,13 +544,13 @@ fn attention_owner_score(onboard: Onboard, placed: &Placement) -> Result<((u64, 
     Ok((policy, headroom))
 }
 
-fn select_attention_working_set(onboard: Onboard,
+fn select_attention_working_set(
     original: Result<(Placement, GraphSet, GlmfWorkingSet), PlacementError>,
     candidate: Result<(Placement, GraphSet, GlmfWorkingSet), PlacementError>)
     -> Result<(Placement, GraphSet, GlmfWorkingSet), PlacementError> {
     match (original, candidate) {
-        (Ok(original), Ok(candidate)) => if attention_owner_score(onboard, &candidate.0)?
-            > attention_owner_score(onboard, &original.0)? {
+        (Ok(original), Ok(candidate)) => if attention_owner_score(&candidate.0)?
+            > attention_owner_score(&original.0)? {
             Ok(candidate)
         } else { Ok(original) },
         (Ok(original), Err(_)) => Ok(original),
@@ -604,18 +601,13 @@ pub fn solve_working_set_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_
         branch.onboard = Onboard::Layers(n);
         let floor = match i.onboard {
             Onboard::Auto if working.spark_ranks > 0 && i.requested_pool.is_none() => Some(0),
-            Onboard::ExpertsFirst { pool_floor } => Some(i.requested_pool.unwrap_or_else(||
-                pool_floor.max(i.max_context).max(if working.spark_ranks == 0 { crate::placement::pool::AGENTIC_FLOOR_TOKENS } else { 0 }))),
             _ => None,
         };
         match solve_profile_with_graphs(&branch, target, automatic_context, sms, rtx_experts,
             cap, floor, &working, &mut graph_cache) {
             Ok((placed, graphs)) => {
                 working.validate(&placed)?;
-                let score = match i.onboard {
-                    Onboard::ExpertsFirst { .. } => (n as u64, placed.pool_tokens),
-                    _ => (placed.pool_tokens, n as u64),
-                };
+                let score = (placed.pool_tokens, n as u64);
                 if best.as_ref().is_none_or(|(previous, ..)| score > *previous) {
                     best = Some((score, placed, graphs, working));
                 }
@@ -624,24 +616,11 @@ pub fn solve_working_set_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_
         }
     }
     if let Some((_, placed, graphs, working)) = best { return Ok((placed, graphs, working)); }
-    // Preserve the legacy experts-first fallback when the compiled context does
-    // not fit but its explicitly chosen lower floor does, without onboarded layers.
-    if let Onboard::ExpertsFirst { pool_floor } = i.onboard {
-        if i.requested_pool.is_none() && pool_floor < i.max_context {
-            let mut branch = i.clone();
-            branch.onboard = Onboard::Layers(0);
-            let working = GlmfWorkingSet::candidate(i, 0)?;
-            let (placed, graphs) = solve_profile_with_graphs(&branch, target, automatic_context, sms,
-                rtx_experts, cap, Some(pool_floor), &working, &mut graph_cache)?;
-            working.validate(&placed)?;
-            return Ok((placed, graphs, working));
-        }
-    }
     Err(refusal.unwrap_or(PlacementError::Inventory("GLM Flash has no executable Spark working set")))
 }
 
 /// Rebuild startup graphs at a fixed expert candidate's admitted pool. The
-/// optional cap preserves pool-first/experts-first ceilings while exact onboard
+/// optional cap preserves the automatic pool's ceiling while exact onboard
 /// counts retain their existing fill-to-capacity policy.
 fn solve_profile_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context: bool,
     sms: usize, rtx_experts: bool, cap: Option<u64>, floor: Option<u64>,
@@ -1049,35 +1028,15 @@ mod tests {
     }
 
     #[test]
-    fn experts_first_local_branch_keeps_agentic_floor_and_explicit_pool() {
+    fn selected_working_set_preserves_exact_counts() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
         input.graphs = GraphSet::budget(&[64 << 20; 2]);
-        input.max_context = 32768;
-        input.onboard = Onboard::ExpertsFirst { pool_floor: 16384 };
-        let (placed, _, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
-        assert!(working.spark_layers.is_empty());
-        assert_eq!(request_for_working_set(&input, &working).unwrap().pool.floor,
-            crate::placement::pool::AGENTIC_FLOOR_TOKENS);
-        assert!(placed.pool_tokens >= crate::placement::pool::AGENTIC_FLOOR_TOKENS);
-        input.requested_pool = Some(32768);
-        let (placed, _, working) = solve_working_set_with_graphs(&input, 32768, false, 188, true).unwrap();
-        assert!(working.spark_layers.is_empty());
-        assert_eq!(placed.pool_tokens, 32768);
-    }
-
-    #[test]
-    fn selected_working_set_preserves_exact_counts_and_experts_first_priority() {
-        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
-        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
-        input.graphs = GraphSet::budget(&[64 << 20; 2]);
-        for (onboard, expected) in [(Onboard::Layers(0), 0), (Onboard::Fraction(0.5), 2),
-            (Onboard::ExpertsFirst { pool_floor: 262_144 }, 3)] {
+        for (onboard, expected) in [(Onboard::Layers(0), 0), (Onboard::Layers(2), 2), (Onboard::Layers(3), 3)] {
             input.onboard = onboard;
             let (placed, _, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
             assert_eq!(placed.onboard_layers, expected);
             assert_eq!(working.spark_layers.len(), input.experts.len() - expected);
-            if matches!(onboard, Onboard::ExpertsFirst { .. }) { assert!(placed.pool_tokens <= 2 << 20); }
         }
     }
 
@@ -1642,9 +1601,9 @@ mod tests {
             alternate.attention.first_owner = 1;
             alternate.resident = resident_weights_placed(&checkpoint, &cfg, cfg.layers, 2,
                 input.representation, AttentionPlacement::Layers, 1).unwrap();
-            let planned = select_attention_working_set(input.onboard, Ok(owner_candidate(&input, false)),
+            let planned = select_attention_working_set(Ok(owner_candidate(&input, false)),
                 Ok(owner_candidate(&alternate, false))).unwrap();
-            let measured = select_attention_working_set(input.onboard, Ok(owner_candidate(&input, true)),
+            let measured = select_attention_working_set(Ok(owner_candidate(&input, true)),
                 Ok(owner_candidate(&alternate, true))).unwrap();
             assert_eq!(placed_attention(input.attention, &planned.0).first_owner, expected);
             assert_eq!(planned.0.items, measured.0.items);
@@ -1654,8 +1613,8 @@ mod tests {
             let selected = solve_attention_working_set_with_graphs(&input, Some(&alternate.resident),
                 2 << 20, false, 188, true).unwrap();
             assert_eq!(placed_attention(input.attention, &selected.0).first_owner, expected);
-            assert!(attention_owner_score(input.onboard, &selected.0).unwrap()
-                >= attention_owner_score(input.onboard, &planned.0).unwrap());
+            assert!(attention_owner_score(&selected.0).unwrap()
+                >= attention_owner_score(&planned.0).unwrap());
             let mut measured_input = input.clone();
             for (capacity, baseline) in &mut measured_input.gpus {
                 let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
@@ -1708,8 +1667,8 @@ mod tests {
                 if expected == 1 {
                     let baseline = solve_attention_owner_with_graphs(&input, None,
                         2 << 20, false, 188, true).unwrap().0;
-                    assert!(attention_owner_score(input.onboard, &planned).unwrap()
-                        > attention_owner_score(input.onboard, &baseline).unwrap());
+                    assert!(attention_owner_score(&planned).unwrap()
+                        > attention_owner_score(&baseline).unwrap());
                 }
                 input.resident[0].embedding = 0;
                 let host = solve_attention_working_set_with_graphs(&input, None,
@@ -1722,7 +1681,7 @@ mod tests {
     }
 
     #[test]
-    fn whole_owner_score_charges_reserved_units_preserves_policy_and_original_ties() {
+    fn whole_owner_score_charges_reserved_units_and_original_ties() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
         input.spark_ranks = 0;
@@ -1732,13 +1691,13 @@ mod tests {
         for layer in &mut alternate.0.layers {
             if let LayerMode::Whole { gpu, ffn: FfnMode::Split } = &mut layer.mode { *gpu ^= 1; }
         }
-        let selected = select_attention_working_set(input.onboard, Ok(original.clone()), Ok(alternate.clone())).unwrap();
+        let selected = select_attention_working_set(Ok(original.clone()), Ok(alternate.clone())).unwrap();
         assert_eq!(placed_attention(input.attention, &selected.0).first_owner, 1);
-        assert_eq!(select_attention_working_set(input.onboard, Err(PlacementError::Inventory("original")),
+        assert_eq!(select_attention_working_set(Err(PlacementError::Inventory("original")),
             Ok(alternate.clone())).unwrap().0.layers, alternate.0.layers);
-        assert_eq!(select_attention_working_set(input.onboard, Ok(original.clone()),
+        assert_eq!(select_attention_working_set(Ok(original.clone()),
             Err(PlacementError::Inventory("alternate"))).unwrap().0.layers, original.0.layers);
-        assert_eq!(select_attention_working_set(input.onboard, Err(PlacementError::Inventory("original")),
+        assert_eq!(select_attention_working_set(Err(PlacementError::Inventory("original")),
             Err(PlacementError::Inventory("alternate"))).unwrap_err(), PlacementError::Inventory("original"));
         let mut placed = original.0;
         placed.pool_tokens = 4 * 256;
@@ -1746,18 +1705,15 @@ mod tests {
         placed.pool_limits = PoolLimits(vec![PoolRankLimit { gpu: 0, available_bytes: 1000, max_units: 100,
             demands: vec![PoolUnitDemand { group: "bounded".into(), bytes_per_unit: 10,
                 offset_units: 3, cap_units: 6 }] }]);
-        assert_eq!(attention_owner_score(Onboard::Auto, &placed).unwrap(), ((1024, 2), 940));
-        assert_eq!(attention_owner_score(Onboard::ExpertsFirst { pool_floor: 256 }, &placed).unwrap(), ((2, 1024), 940));
+        assert_eq!(attention_owner_score(&placed).unwrap(), ((1024, 2), 940));
         let mut more_experts = placed.clone();
         more_experts.pool_tokens = 3 * 256;
         more_experts.onboard_layers = 3;
         more_experts.pool_limits.0[0].available_bytes = 900;
-        assert!(attention_owner_score(Onboard::Auto, &placed).unwrap()
-            > attention_owner_score(Onboard::Auto, &more_experts).unwrap());
-        assert!(attention_owner_score(Onboard::ExpertsFirst { pool_floor: 256 }, &placed).unwrap()
-            < attention_owner_score(Onboard::ExpertsFirst { pool_floor: 256 }, &more_experts).unwrap());
+        assert!(attention_owner_score(&placed).unwrap()
+            > attention_owner_score(&more_experts).unwrap());
         placed.pool_limits.0[0].available_bytes = 59;
-        assert!(attention_owner_score(Onboard::Auto, &placed).is_err());
+        assert!(attention_owner_score(&placed).is_err());
     }
 
     #[test]
@@ -1774,7 +1730,7 @@ mod tests {
             peer.resident[1].embedding = peer.resident[0].embedding;
             peer.resident[0].embedding = 0;
             let candidate = solve_working_set_with_graphs(&peer, 2 << 20, false, 188, true).unwrap();
-            let expected = select_attention_working_set(input.onboard, Ok(original), Ok(candidate)).unwrap();
+            let expected = select_attention_working_set(Ok(original), Ok(candidate)).unwrap();
             assert_eq!(expected.0, placed.0);
             assert_eq!(placed_attention(input.attention, &placed.0), input.attention);
             assert!(matches!(solve_attention_working_set_with_graphs(&input, Some(&input.resident),

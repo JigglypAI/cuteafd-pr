@@ -90,15 +90,18 @@ impl Reservation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LocalLayers {
     Auto,
-    ExpertsFirst,
+    /// Every routed-expert layer of the target model.
+    All,
     Count(usize),
 }
 impl LocalLayers {
-    pub(crate) fn onboard(self) -> cuteafd_loader::placement::Onboard {
-        use cuteafd_loader::placement::{Onboard, EXPERTS_FIRST_POOL_FLOOR};
+    /// Resolve against the target's routed-expert layer count, so `all` is an
+    /// exact pin rather than a priority mode.
+    pub(crate) fn onboard(self, routed: usize) -> cuteafd_loader::placement::Onboard {
+        use cuteafd_loader::placement::Onboard;
         match self {
             Self::Auto => Onboard::Auto,
-            Self::ExpertsFirst => Onboard::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR },
+            Self::All => Onboard::Layers(routed),
             Self::Count(n) => Onboard::Layers(n),
         }
     }
@@ -108,13 +111,13 @@ impl FromStr for LocalLayers {
     fn from_str(value: &str) -> Result<Self> {
         match value {
             "auto" => return Ok(Self::Auto),
-            "max" => return Ok(Self::ExpertsFirst),
+            "all" => return Ok(Self::All),
             _ => {}
         }
         let count: usize = value
             .parse()
-            .context("RTX expert layers must be auto, max or 0..40")?;
-        ensure!(count <= 40, "RTX expert layers must be auto, max or 0..40");
+            .context("RTX expert layers must be auto, all or 0..40")?;
+        ensure!(count <= 40, "RTX expert layers must be auto, all or 0..40");
         Ok(Self::Count(count))
     }
 }
@@ -321,13 +324,12 @@ mod tests {
         }
     }
     #[test]
-    fn local_layers_max_uses_shared_experts_first_policy() {
-        use cuteafd_loader::placement::{Onboard, EXPERTS_FIRST_POOL_FLOOR};
-        assert_eq!("max".parse::<LocalLayers>().unwrap().onboard(),
-            Onboard::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR });
-        assert_eq!("auto".parse::<LocalLayers>().unwrap().onboard(), Onboard::Auto);
-        assert_eq!("40".parse::<LocalLayers>().unwrap().onboard(), Onboard::Layers(40));
-        for value in ["41", "-1", "all", "50%"] {
+    fn local_layers_parse_auto_all_and_exact_counts() {
+        use cuteafd_loader::placement::Onboard;
+        assert_eq!("all".parse::<LocalLayers>().unwrap().onboard(40), Onboard::Layers(40));
+        assert_eq!("auto".parse::<LocalLayers>().unwrap().onboard(40), Onboard::Auto);
+        assert_eq!("40".parse::<LocalLayers>().unwrap().onboard(40), Onboard::Layers(40));
+        for value in ["41", "-1", "max", "50%"] {
             assert!(value.parse::<LocalLayers>().is_err(), "{value}");
         }
     }

@@ -409,55 +409,9 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     if spark_free && fixed_layers != Some(routed) {
         return Err(PlacementError::SparkFree { layers: routed, placed: fixed_layers.unwrap_or(0) });
     }
-    // Experts first: the most layers whose fixed-onboard pool still meets the
-    // floor (pool output is monotone in the layer count, so bisect).
-    let fixed_layers = match (fixed_layers, request.onboard) {
-        (None, Onboard::ExpertsFirst { pool_floor }) => {
-            // An explicit pool is the floor the layers must leave (and then the pool).
-            let floor = request.pool.requested.unwrap_or(pool_floor).max(request.pool.floor);
-            let fits = |n: usize| -> bool {
-                let mut trial = request.clone();
-                trial.onboard = Onboard::Layers(n);
-                trial.pool.requested = None;
-                trial.pool.floor = floor;
-                solve_once(&trial, flips, frozen).is_ok()
-            };
-            let minimum = request.minimum_expert_layers;
-            if minimum > routed { return Err(PlacementError::Inventory("invalid mandatory expert prefix")); }
-            let (mut lo, mut hi) = (minimum, routed);
-            if !fits(minimum) {
-                // With Sparks an automatic pool may fall short of the context: no RTX layers and
-                // the largest pool above v2's floor, the serving context clamped to it (v2 served
-                // a 31.8 GiB V4 Flash card at 905K tokens).
-                let fallback = minimum == 0 && request.pool.requested.is_none() && !spark_free && pool_floor < floor && {
-                    let mut trial = request.clone();
-                    trial.onboard = Onboard::Layers(0);
-                    trial.pool.floor = pool_floor;
-                    solve_once(&trial, flips, frozen).is_ok()
-                };
-                if !fallback {
-                    let mut trial = request.clone();
-                    trial.onboard = Onboard::Layers(minimum);
-                    trial.pool.floor = floor;
-                    return solve_once(&trial, flips, frozen);
-                }
-                let mut trial = request.clone();
-                trial.onboard = Onboard::Layers(0);
-                trial.pool.floor = pool_floor;
-                return solve_once(&trial, flips, frozen);
-            }
-            while lo < hi {
-                let mid = (lo + hi + 1) / 2;
-                if fits(mid) { lo = mid } else { hi = mid - 1 }
-            }
-            Some(lo)
-        }
-        (fixed, _) => fixed,
-    };
     if request.minimum_expert_layers > routed || fixed_layers.is_some_and(|n| n < request.minimum_expert_layers) {
         return Err(PlacementError::Inventory("invalid mandatory expert prefix"));
     }
-    let experts_first = matches!(request.onboard, Onboard::ExpertsFirst { .. });
     let (units, ranges, homes, tp2_range, limits) = match fixed_layers {
         // Pool first: reserve the target, then fill each GPU's arena in order.
         None => {
@@ -526,8 +480,6 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
             };
             let units = match request.pool.requested {
                 Some(_) => pool_units(request, fit, &limits)?,
-                // Experts first keeps v2's automatic ceiling: the target.
-                None if experts_first => fit.min(request.pool.wanted_units()),
                 None => fit.min(request.pool.ceiling_units()),
             };
             let tokens = units.saturating_mul(request.pool.unit_rows);
@@ -700,7 +652,7 @@ fn layer_whole_mode(request: &PlacementRequest, layer: &LayerDemand, gpu: u8) ->
 fn layer_switch(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPlacement)],
     selected: &impl Fn(&LayerDemand) -> bool) -> Result<usize, PlacementError> {
     let groups = request.layers.iter().map(|layer| (selected(layer), layer.colocate)).collect::<Vec<_>>();
-    attention::solve_owners(&groups, request.policy.ownership, request.layers_first_gpu, request.onboard, |owners| {
+    attention::solve_owners(&groups, request.policy.ownership, request.layers_first_gpu, |owners| {
         let modes = resolve_modes(request, flips, None, owners)?;
         let placed = solve_once(request, flips, Some(&modes))?;
         let boundary = owners.iter().take_while(|&&owner| owner == request.layers_first_gpu).count();

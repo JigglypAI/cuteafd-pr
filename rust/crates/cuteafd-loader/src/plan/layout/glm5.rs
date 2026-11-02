@@ -329,7 +329,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     devices: &[DeviceLayout], manifest: Option<&serde_json::Value>, rows: u64, context: u64,
     core: Option<&crate::families::glm5::core::CoreCharges>)
     -> anyhow::Result<(crate::placement::Placement, crate::placement::families::glm5::GlmWorkingSet)> {
-    use crate::placement::{families::glm5 as glm, Baseline, Onboard};
+    use crate::placement::{families::glm5 as glm, Baseline};
     let checkpoint = input.checkpoint();
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
@@ -358,7 +358,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     }).transpose()?;
     let gpus = devices.iter().zip(&options.rtx_bytes).map(|(d, &capacity)| (capacity,
         Baseline::Planned { context_bytes: 0, loaded_bytes: d.used_bytes() })).collect();
-    let onboard = options.onboard.or(options.local_expert_layers.map(Onboard::Layers)).unwrap_or_else(glm::default_onboard);
+    let onboard = options.resolve_onboard(cfg.layers.saturating_sub(cfg.first_moe_layer)).unwrap_or_else(glm::default_onboard);
     let exchange_f32 = glm::local_exchange_f32()?;
     let manifest_path = options.workspace_manifest.as_deref().unwrap_or_else(||
         std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
@@ -393,7 +393,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     workspace: u64, spark_ranks: usize, manifest: &serde_json::Value, selected: Option<&str>,
     metadata: Option<&crate::plan::exlr8::residency::MetadataInput>)
     -> anyhow::Result<(MemoryLayout, crate::placement::Placement)> {
-    use crate::placement::{families::glm5 as glm, Baseline, Onboard};
+    use crate::placement::{families::glm5 as glm, Baseline};
     let gpu_count = options.rtx_bytes.len();
     anyhow::ensure!((1..=2).contains(&gpu_count) && shared_bytes.len() == gpu_count,
         "EXLR8 requires 1..=2 RTX shared owners matching coordinator GPUs");
@@ -447,7 +447,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         devices.push(DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32,
             capacity_bytes: options.rtx_bytes[rank].saturating_sub(options.headroom_bytes), worker_budget_bytes: 0, items, kv_tokens: 0 });
     }
-    let onboard = options.onboard.or(options.local_expert_layers.map(Onboard::Layers)).unwrap_or_else(glm::default_onboard);
+    let onboard = options.resolve_onboard(cfg.layers.saturating_sub(cfg.first_moe_layer)).unwrap_or_else(glm::default_onboard);
     let local = if let Some(selected) = selected {
         let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
         let manifest_path = options.workspace_manifest.as_deref()
@@ -554,7 +554,7 @@ mod tests {
             assert_eq!(new_set.names.len(), if gpus == 2 { 176 } else { 140 });
             let options = LayoutOptions { rtx_bytes: vec![96 << 30; gpus], prefill_rows: 512,
                 prefill_lanes: 3, prefill_waves: 3, context_tokens: 8192, pool_tokens: Some(262144),
-                onboard: Some(crate::placement::Onboard::Layers(0)), glm5_drafter_disabled: true,
+                onboard: Some(crate::placement::OnboardSetting::Layers(0)), glm5_drafter_disabled: true,
                 ..Default::default() };
             let (layout, _) = native_layout(&checkpoint, &options, &vec![256; gpus], 256, 4,
                 &expanded, None).unwrap();
@@ -594,7 +594,7 @@ mod tests {
                 let options = LayoutOptions { rtx_bytes: vec![96 << 30; gpus], prefill_rows: unit,
                     prefill_lanes: requested, prefill_waves: requested.max(1), prefill_span_rows: span,
                     workspace_manifest: Some(path.clone()), context_tokens: 65536,
-                    onboard: Some(crate::placement::Onboard::Layers(0)), glm5_drafter_disabled: true,
+                    onboard: Some(crate::placement::OnboardSetting::Layers(0)), glm5_drafter_disabled: true,
                     host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0), ..Default::default() };
                 let plan_options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: sparks },
                     layout: Some(options.clone()), ..Default::default() };
@@ -659,7 +659,7 @@ mod tests {
         for (gpus, sparks) in [(1, 4), (2, 6)] {
             for (rows, lanes) in [(4096u64, 1u64), (4096, 2), (2048, 3), (1024, 4)] {
                 let options = LayoutOptions { rtx_bytes: vec![96 << 30; gpus], prefill_rows: rows, prefill_lanes: lanes,
-                    prefill_waves: lanes, context_tokens: 65536, onboard: Some(crate::placement::Onboard::Layers(0)),
+                    prefill_waves: lanes, context_tokens: 65536, onboard: Some(crate::placement::OnboardSetting::Layers(0)),
                     glm5_drafter_disabled: true, host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
                     ..Default::default() };
                 let plan = |activations| native_layout(&checkpoint,
@@ -749,7 +749,7 @@ mod tests {
                         else { crate::placement::AttentionPlacement::Heads }), ..Default::default()
                 }).unwrap();
                 for pool_tokens in [None, Some(0)] {
-                    let options = LayoutOptions { pool_tokens, onboard: Some(crate::placement::Onboard::Layers(0)),
+                    let options = LayoutOptions { pool_tokens, onboard: Some(crate::placement::OnboardSetting::Layers(0)),
                         ..options.clone() };
                     let (memory, native) = native_layout(&checkpoint, &options, &shared, 256, sparks, &manifest, None).unwrap();
                     assert!(memory.pool_tokens >= 1 << 20);

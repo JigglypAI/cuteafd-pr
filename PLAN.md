@@ -2895,18 +2895,22 @@ Reserving the 2M pool first on one RTX moves expert layers to the Sparks.
 | Pro min | 356K -> 2.10M | 5 -> 3 | 0.951 |
 | Flash max | 1.18M -> 2.10M | — | C1 0.979, C8 0.873 |
 
-So V4 keeps v2's experts-first default (`Onboard::ExpertsFirst`,
+So V4 initially kept v2's experts-first default (`Onboard::ExpertsFirst`,
 `RTX_EXPERT_LAYERS=max`), resolved by the shared solver. Pool first (`auto`)
-and the GPU1 EXL3 ranges (`RTX_EXPERT_PEER=on`) are opt-in. The way to get
+and the GPU1 EXL3 ranges (`RTX_EXPERT_PEER=on`) were opt-in. The way to get
 both the 2M pool and the RTX experts is TP2 on two RTX (`P4`), not a
 different single-GPU split.
 
 **Decision (TJ, 2026-10-11): pool first is the uniform default, with no
 C1 gate.** `auto` (pool first) is the default on every layout and family.
 A C1 gap against experts-first is a performance bug to fix, not a reason to
-keep experts-first as the default. `max` (experts first) stays a supported
-mode everywhere. This corrects P2, which had kept 1-RTX V4 Pro on
-experts-first after one pair.
+keep experts-first as the default. This corrects P2, which had kept 1-RTX V4
+Pro on experts-first after one pair.
+
+**Decision (TJ, 2026-11-02): RTX onboarding is an automatic default or an
+exact pin.** The experts-first mode (`max`) and the fractional `N%` option
+are removed: `RTX_EXPERT_LAYERS` takes `auto`, `all` (every routed-expert
+layer of the target model, drafter and MTP excluded) or an integer `N`.
 
 **Decision (TJ, 2026-10-10): KV planning is the default rule; TP2 is the only
 dual-RTX expert mode.**
@@ -2916,12 +2920,11 @@ dual-RTX expert mode.**
   - on 1 RTX, the planner's constant over-reservations (`P2`) cost the
     layers.
 
-  `ExpertsFirst` (`RTX_EXPERT_LAYERS=max`) **stays as a supported mode**
-  (TJ, 2026-10-10: "a mode I want … but it is not the default"). Only the
-  default moves: `auto` becomes the V4 default in the steps that recover the
-  layers, `P4` for 2 RTX and `P2` for 1 RTX, both before the first v3 cut.
-  Under TP2, `ExpertsFirst` places TP2 halves first and gives the pool what
-  is left (subject to its floor).
+  Experts-first (`max`) was a supported mode until 2026-11-02 (TJ,
+  2026-10-10: "a mode I want … but it is not the default"); it is removed
+  now, leaving `auto`, `all` and `N`. Only the default moved: `auto` became
+  the V4 default in the steps that recovered the layers, `P4` for 2 RTX and
+  `P2` for 1 RTX, both before the first v3 cut.
 - **In a 2-RTX configuration, routed experts on the RTX cards are always TP2
   halves**, folded into the head split's existing all-reduce. `P4` deletes
   the two placements TP2 replaces, because neither can beat it on PCIe:
@@ -2930,8 +2933,8 @@ dual-RTX expert mode.**
   - the GPU1 whole-layer expert ranges (`RTX_EXPERT_PEER`, a hidden-state
     hop each way per layer, and the path with the two-lane deadlock).
 
-  Every onboard mode (`auto`, `max`/`ExpertsFirst`, `N`, `N%`, `all`) stays
-  and resolves to TP2 halves on 2 RTX.
+  Every onboard mode (`auto`, `all`, `N`) stays and resolves to TP2 halves
+  on 2 RTX.
 - **Single-RTX layouts are TP1 by nature.** Per-layer GPU ownership
   (`Whole{gpu}`: attention, KV and that layer's work on one GPU) stays a
   general capability, and its FFN uses TP2 split or V4.1's owner-reduce per
@@ -3001,11 +3004,13 @@ change.**
 fixed definition: reserve the pool target, then place expert layers in what
 is left. The solver also takes the inverse, for comparison benchmarking and
 the edge cards:
-- `PlacementRequest.onboard: Onboard::{Auto, Layers(n), Fraction(f)}`
-  (`RTX_EXPERT_LAYERS=auto|N|N%`, `--rtx-expert-layers`). `Auto` is today's
+- `PlacementRequest.onboard: Onboard::{Auto, Layers(n)}`
+  (`RTX_EXPERT_LAYERS=auto|all|N`, `--rtx-expert-layers`). `Auto` is today's
   pool-first rule.
-- `Layers(n)`/`Fraction(f)` fixes how many routed-expert layers are
-  resident on the RTX cards. TP2 halves count as one layer. The solver then
+- `Layers(n)` fixes how many routed-expert layers are resident on the RTX
+  cards. TP2 halves count as one layer. The request spelling
+  (`OnboardSetting`) resolves `all` to the target's routed-expert layer
+  count, drafter and MTP layers excluded. The solver then
   fills every remaining byte with KV, so the pool is the output, not the
   input.
   - The pool is rounded to `unit_rows`. It is the total KV shared by all
@@ -3022,8 +3027,8 @@ the edge cards:
     contiguous prefix: GPU0 gets layers `0..k` and GPU1 `k..n`. The solver
     therefore only picks the GPU split, maximizing the pool, and the pin list
     waits for `P7`.
-- `0` means every expert on the Sparks; `all` (or `100%`) means Spark-free
-  where it fits.
+- `0` means every expert on the Sparks; `all` means every routed-expert
+  layer on the RTX cards, refused with the count when it does not fit.
 - The planner (`cuteafd plan --layout --rtx-expert-layers N`) and the runtime
   resolve the same request. The equality test covers a fixed-onboard case for
   each family that has local experts.

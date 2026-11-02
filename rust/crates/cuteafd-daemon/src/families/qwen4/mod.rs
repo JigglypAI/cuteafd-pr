@@ -37,9 +37,10 @@ pub(crate) struct EngineArgs {
     /// Spark-free local TP2 with solver-owned whole-layer attention ranges.
     #[arg(long, env = "CUTEAFD_QWEN_SPLIT_DEVICE", requires = "local_experts", conflicts_with_all = ["peers", "shared_only", "expert_window"])]
     pub split_device: Option<i32>,
-    /// Expert onboarding policy for an explicit local coordinator pair.
-    #[arg(long = "rtx-expert-layers", requires = "split_device", value_parser = |text: &str| text.parse::<cuteafd_loader::placement::Onboard>())]
-    pub onboard: Option<cuteafd_loader::placement::Onboard>,
+    /// Expert onboarding for an explicit local coordinator pair: auto, all
+    /// (every routed-expert layer of the target model), or an exact N.
+    #[arg(long = "rtx-expert-layers", requires = "split_device", value_parser = |text: &str| text.parse::<cuteafd_loader::placement::OnboardSetting>())]
+    pub onboard: Option<cuteafd_loader::placement::OnboardSetting>,
     /// Attention ownership; dual Qwen supports whole layers, not head shards.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto", value_parser = ["auto", "heads", "layers", "context"])]
     pub attention_placement: String,
@@ -436,8 +437,11 @@ mod weight_representation_tests {
         let selector = command.get_arguments().find(|arg| arg.get_id() == "split_device").unwrap();
         assert_eq!(selector.get_env(), Some(std::ffi::OsStr::new("CUTEAFD_QWEN_SPLIT_DEVICE")));
         assert!(args(&["--rtx-expert-layers", "all"]).is_err());
-        for policy in ["auto", "all", "max", "100%"] {
+        for policy in ["auto", "all", "0", "5"] {
             assert!(args(&["--local-experts", "--split-device", "1", "--rtx-expert-layers", policy]).is_ok());
+        }
+        for retired in ["max", "100%"] {
+            assert!(args(&["--local-experts", "--split-device", "1", "--rtx-expert-layers", retired]).is_err());
         }
     }
 

@@ -472,11 +472,10 @@ the coordinator to fit an endpoint
   3. RTX expert layers in what is left.
 - **Onboarding.** `Onboard::Auto` (`mod.rs:425`) is the default:
   - onboarding is on in every shipped config;
-  - explicit `N`, `N%` and `all` are pins;
+  - explicit `all` (every routed-expert layer of the target model) and `N` are
+    pins; a pin that does not fit is refused with its count, never shrunk;
   - a zero-onboard config is only a labelled measurement arm, never a shipped
-    default;
-  - `max` (experts-first) is legacy, being removed with the shared planner
-    (#776): don't use it for a new family.
+    default.
 - **The 30 s budget.** Every full-plan test runs through `BudgetedPlanInput`
   ([loader/plan/testing.rs:12](../../rust/crates/cuteafd-loader/src/plan/testing.rs#L12)).
   It allows 30 s per plan (`:31`) and prints phase timings, so a planner that

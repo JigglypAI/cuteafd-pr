@@ -427,7 +427,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
         &library, &programs, checkpoint, full, cfg, super::startup::Options {
             cache_format: args.kv_cache,
             devices: [args.device, args.split_device], native_lib: args.native_lib.as_deref().context("--native-lib required")?,
-            peers: args.peers.clone(), rtx_expert_layers: cuteafd_loader::placement::Onboard::Layers(args.rtx_expert_layers),
+            peers: args.peers.clone(), rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(args.rtx_expert_layers),
             spark_budget_gib: args.spark_budget_gib,
             rows, waves: usize::try_from(prefill.waves)?, prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
             slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT, pool_tokens: Some(1_048_576), graphs,

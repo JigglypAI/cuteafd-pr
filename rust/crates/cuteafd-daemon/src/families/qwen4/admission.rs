@@ -427,7 +427,8 @@ mod tests {
         let experts = vec![None; 48];
         // Even enough capacity for the full table must retain mapped residency.
         for capacity in [96u64 << 30, 192u64 << 30] {
-            for onboard in [Onboard::Auto, Onboard::ExpertsFirst { pool_floor: 2 << 20 }] {
+            let onboard = Onboard::Auto;
+            {
                 let mut inputs = qwen4::QwenDualInputs { automatic_context: false,
                     owner_manifests: [None; 2],
                     admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp: false,

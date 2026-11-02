@@ -419,8 +419,8 @@ pub struct MovableDemands {
     pub demands: Vec<Demand>,
 }
 
-/// How many routed-expert layers are RTX-resident (`RTX_EXPERT_LAYERS`,
-/// `--rtx-expert-layers`: `auto`, `N`, `N%`, `all`).
+/// The resolved RTX expert onboarding policy: `auto` or an exact routed-layer
+/// count.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "onboard", content = "value")]
 pub enum Onboard {
@@ -432,24 +432,14 @@ pub enum Onboard {
     /// remaining byte (clamped to the policy's ceiling) and is refused below
     /// its floor. TP2 halves count as one layer.
     Layers(usize),
-    /// This fraction of the routed layers, rounded to the nearest layer.
-    Fraction(f64),
-    /// Experts first (v2's V4 policy): the most routed layers that still
-    /// leave a pool of `pool_floor` tokens; the pool then takes what is left
-    /// up to the target. `RTX_EXPERT_LAYERS=max`.
-    ExpertsFirst { pool_floor: u64 },
 }
-
-/// v2's V4 expert-first reserve: experts fill the GPUs above a 262K pool.
-pub const EXPERTS_FIRST_POOL_FLOOR: u64 = 262_144;
 
 impl Onboard {
     /// Routed layers this onboard fixes out of `routed`, or `None` for `Auto`.
     pub fn layers(self, routed: usize) -> Option<usize> {
         match self {
-            Self::Auto | Self::ExpertsFirst { .. } => None,
+            Self::Auto => None,
             Self::Layers(n) => Some(n.min(routed)),
-            Self::Fraction(f) => Some(((routed as f64 * f.clamp(0.0, 1.0)) + 0.5).floor() as usize),
         }
     }
 }
@@ -459,8 +449,6 @@ impl std::fmt::Display for Onboard {
         match self {
             Self::Auto => f.write_str("auto"),
             Self::Layers(n) => write!(f, "{n}"),
-            Self::Fraction(x) => write!(f, "{}%", x * 100.0),
-            Self::ExpertsFirst { .. } => f.write_str("max"),
         }
     }
 }
@@ -469,16 +457,59 @@ impl std::str::FromStr for Onboard {
     type Err = String;
     fn from_str(text: &str) -> Result<Self, String> {
         let text = text.trim();
-        let invalid = || format!("RTX expert layers must be auto, max, all, N or N% (got {text:?})");
         match text {
             "auto" | "" => Ok(Self::Auto),
-            "all" => Ok(Self::Fraction(1.0)),
-            "max" => Ok(Self::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR }),
-            _ => match text.strip_suffix('%') {
-                Some(percent) => percent.parse::<f64>().ok().filter(|p| (0.0..=100.0).contains(p))
-                    .map(|p| Self::Fraction(p / 100.0)).ok_or_else(invalid),
-                None => text.parse().map(Self::Layers).map_err(|_| invalid()),
-            },
+            _ => text.parse().map(Self::Layers)
+                .map_err(|_| format!("RTX expert layers must be auto or N (got {text:?})")),
+        }
+    }
+}
+
+/// The `RTX_EXPERT_LAYERS` / `--rtx-expert-layers` spelling before admission
+/// resolves it against a checkpoint: `auto`, `all` (every routed layer of the
+/// target model) or an exact layer count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OnboardSetting {
+    #[default]
+    Auto,
+    /// Every routed-expert layer the target model runs; the drafter's and
+    /// MTP's own experts are not counted.
+    All,
+    Layers(usize),
+}
+
+impl OnboardSetting {
+    /// Resolve against the target's routed-expert layer count. `all` becomes
+    /// the exact count, so a layout that cannot hold every layer refuses with
+    /// that count instead of shrinking.
+    pub fn resolve(self, routed: usize) -> Onboard {
+        match self {
+            Self::Auto => Onboard::Auto,
+            Self::All => Onboard::Layers(routed),
+            Self::Layers(n) => Onboard::Layers(n),
+        }
+    }
+}
+
+impl std::fmt::Display for OnboardSetting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::All => f.write_str("all"),
+            Self::Layers(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+impl std::str::FromStr for OnboardSetting {
+    type Err = String;
+    fn from_str(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        match text {
+            "auto" | "" => Ok(Self::Auto),
+            "all" => Ok(Self::All),
+            _ => text.parse().map(Self::Layers)
+                .map_err(|_| format!("RTX expert layers must be auto, all or N (got {text:?})")),
         }
     }
 }

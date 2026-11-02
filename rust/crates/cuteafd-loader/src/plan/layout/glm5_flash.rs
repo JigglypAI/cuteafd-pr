@@ -90,7 +90,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         }).transpose()?;
         let catalog = input.expert_catalog()?;
         let shape = catalog.routed_experts();
-        let onboard = options.onboard.or_else(|| options.local_expert_layers.map(|n| Onboard::Layers(n.saturating_sub(shape.first_layer))))
+        let onboard = options.onboard.map(|setting| setting.resolve(shape.routed_layers()))
+            .or_else(|| options.local_expert_layers.map(|n| Onboard::Layers(n.saturating_sub(shape.first_layer))))
             .unwrap_or_else(glmf::default_onboard);
         let max_rows = crate::serving_capacity::glmf_expert_rows(rows, decode_rows);
         let tp = if ranks == 2 { 2 } else { 1 };
