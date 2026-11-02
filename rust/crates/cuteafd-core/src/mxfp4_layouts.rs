@@ -351,7 +351,9 @@ mod tests {
         assert_eq!(stored_width(5120, 576), Some(576));
         assert_eq!(ownership_unit(2304, 5), 64);
         assert_eq!(ownership_unit(2304, 7), 32);
-        assert_eq!(generic_stored_width(6144, 352), 384);
+        for width in [320, 352, 1024, 2048] {
+            assert_eq!(generic_stored_width(6144, width), width);
+        }
         assert_eq!(generic_stored_width(4096, 352), 352);
         for width in [288, 320, 352, 448, 480, 768, 1152, 2304] {
             assert_eq!(stored_width(5120, width), Some(width));
