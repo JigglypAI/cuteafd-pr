@@ -346,7 +346,10 @@ mod tests {
         let window = std::env::var("CUTEAFD_ACTIVATION_TRACE_WINDOW")?;
         let count: usize = std::env::var("CUTEAFD_ACTIVATION_TRACE_TOKENS")?.parse()?;
         let position: usize = std::env::var("CUTEAFD_ACTIVATION_TRACE_POSITION")?.parse()?;
-        ensure!(count <= 64 && position < count, "short activation trace needs at most 64 tokens and an in-prefix position");
+        ensure!(count <= 513 && position < count, "activation trace needs at most 513 tokens and an in-prefix position");
+        let cutoff: usize = std::env::var("CUTEAFD_ACTIVATION_TRACE_BF16_MAX_ROWS")
+            .unwrap_or_else(|_| "4096".into()).parse()?;
+        ensure!(matches!(cutoff, 64 | 4096), "activation trace partial cutoff must be 64 or 4096");
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
             std::path::Path::new(&std::env::var("CUTEAFD_GOLDEN_FIXTURES")?).join("windows.json"))?)?;
         ensure!(manifest["family"] == "muse_spark", "activation trace requires Muse's published text set");
@@ -359,7 +362,7 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         ensure!(args.peers.len() == 4, "short Muse trace uses the smallest four-Spark layout");
         args.max_sequences = 1;
-        args.expert_partial_bf16_max_rows = 4096;
+        args.expert_partial_bf16_max_rows = cutoff;
         args.prefix.resolve_entries(1);
         args.validate()?;
         with_backend(&args, |backend, _| {
