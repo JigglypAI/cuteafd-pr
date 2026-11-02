@@ -136,10 +136,10 @@ impl IndexSelectionOutput<'_> {
     }
 }
 /// Shared selection storage (`row_window` contract).
-/// Row plane: buffer 12 in the source (candidate blocks retained through later
-/// reindex hooks). Follower block output is unused and unit-sized.
-/// Guarded scratch: buffer 9, selected IDs consumed by sparse-attention/peer
-/// fork readers inside the hook. The shared guard covers cross-unit readers.
+/// Row planes: buffer 9 (selected IDs reused by attention until the next index
+/// producer) in both source and follower, and buffer 12 in the source (candidate
+/// blocks retained through later reindex hooks). Follower blocks are unused and
+/// unit-sized. A scratch guard cannot protect readers in those future hooks.
 /// Scratch: 0 metadata, 1 lengths, 2 tile offsets, 3 candidate IDs, 4 scores,
 /// 5 block scores, 6 block IDs, 7 top-k state, 8 top-k workspace,
 /// 10 block top-k state and 11 block workspace. All are written and fully
@@ -191,6 +191,14 @@ fn slice(mut b: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> CuteafdDevi
     b.bytes = bytes;
     b
 }
+fn selection_view(window: &RowWindow, retained_blocks: bool, i: usize,
+    buffer: CuteafdDeviceBuffer) -> CuteafdDeviceBuffer {
+    match i {
+        9 => window.apply(buffer, 2048),
+        12 if retained_blocks => window.apply(buffer, 8192),
+        _ => buffer,
+    }
+}
 impl<'a> IndexSelectionWave<'a> {
     fn sizes(capacity: usize) -> Result<[usize; 13]> {
         ensure!(
@@ -219,7 +227,11 @@ impl<'a> IndexSelectionWave<'a> {
     }
     pub fn storage_bytes(rows: usize, unit: usize) -> Result<usize> {
         ensure!(unit > 0 && unit <= rows, "index selection unit outside reserve");
-        Ok(Self::device_bytes(unit)? + (rows - unit) * 8192)
+        Ok(Self::device_bytes(unit)? + (rows - unit) * (2048 + 8192))
+    }
+    pub fn follower_storage_bytes(rows: usize, unit: usize) -> Result<usize> {
+        ensure!(unit > 0 && unit <= rows, "index selection unit outside reserve");
+        Ok(Self::shared_device_bytes(unit)? + (rows - unit) * 2048)
     }
     pub fn storage(library: &'a NativeLibrary, rows: usize, unit: usize, readers: &[i32]) -> Result<Rc<IndexSelectionStorage<'a>>> {
         Self::storage_bytes(rows, unit)?;
@@ -228,7 +240,11 @@ impl<'a> IndexSelectionWave<'a> {
             guard: Rc::new(ScratchGuard::new(library, readers)?), retained_blocks: true,
             stream: Rc::new(LoadStream { library, raw: library.cuda_stream_create()? }),
             buffers: sizes.into_iter().enumerate().map(|(i, bytes)| {
-                DeviceAllocation::new(library, if i == 12 { rows * 8192 } else { bytes }).map(Rc::new)
+                DeviceAllocation::new(library, match i {
+                    9 => rows * 2048,
+                    12 => rows * 8192,
+                    _ => bytes,
+                }).map(Rc::new)
             }).collect::<Result<_>>()?,
             score: library.v41_index_scores()?, top: library.v41_index_topk()?,
             candidates: library.v41_candidate_blocks()?, rows, unit,
@@ -265,7 +281,8 @@ impl<'a> IndexSelectionWave<'a> {
         ensure!(library.cuda_get_device()? == source.buffers[0].buffer.device_id,
             "shared index workspace device differs");
         let buffers = source.buffers.iter().enumerate().map(|(i, allocation)| {
-            if [9, 12].contains(&i) { DeviceAllocation::new(library, source.unit * if i == 9 { 2048 } else { 8192 }).map(Rc::new) }
+            if [9, 12].contains(&i) { DeviceAllocation::new(library,
+                if i == 9 { source.rows * 2048 } else { source.unit * 8192 }).map(Rc::new) }
             else { Ok(allocation.clone()) }
         }).collect::<Result<_>>()?;
         Ok(Rc::new(IndexSelectionStorage {
@@ -278,7 +295,8 @@ impl<'a> IndexSelectionWave<'a> {
     pub fn sharing_scratch(source: &mut Self, budget: usize) -> Result<Self> {
         ensure!(!source.in_flight && source.shared_scratch_busy.is_none(), "index scratch already shared or pending");
         source.storage.stream.require_complete()?;
-        ensure!(Self::shared_device_bytes(source.capacity)? <= budget, "shared index outputs exceed budget");
+        ensure!(Self::follower_storage_bytes(source.storage.rows, source.storage.unit)? <= budget,
+            "shared index outputs exceed budget");
         let mut value = Self::on_storage(Self::follower_storage(&source.storage)?)?;
         value.window = source.window.clone();
         let busy = Rc::new(Cell::new(false));
@@ -305,11 +323,8 @@ impl<'a> IndexSelectionWave<'a> {
         Ok(())
     }
     fn b(&self, i: usize) -> CuteafdDeviceBuffer {
-        let buffer = self.storage.buffers[i].buffer;
-        match i {
-            12 if self.storage.retained_blocks => self.window.apply(buffer, 8192),
-            _ => buffer,
-        }
+        selection_view(&self.window, self.storage.retained_blocks, i,
+            self.storage.buffers[i].buffer)
     }
     fn synchronize(&self) -> Result<()> {
         unsafe { self.storage.stream.library.cuda_stream_synchronize(self.storage.stream.raw) }
@@ -981,16 +996,63 @@ mod graph_tests {
     use super::*;
 
     #[test]
-    fn reserve_growth_only_adds_source_candidate_blocks() -> Result<()> {
+    fn reserve_growth_retains_source_and_follower_selections() -> Result<()> {
         for unit in [1, 16, 80, 4096] {
             assert_eq!(IndexSelectionWave::storage_bytes(unit, unit)?,
                 IndexSelectionWave::device_bytes(unit)?);
             assert_eq!(IndexSelectionWave::storage_bytes(8256, unit)?
-                - IndexSelectionWave::device_bytes(unit)?, (8256 - unit) * 8192);
+                - IndexSelectionWave::device_bytes(unit)?, (8256 - unit) * (8192 + 2048));
+            assert_eq!(IndexSelectionWave::follower_storage_bytes(8256, unit)?,
+                8256 * 2048 + unit * 8192);
         }
         assert!(IndexSelectionWave::storage_bytes(16, 0).is_err());
         assert!(IndexSelectionWave::storage_bytes(16, 17).is_err());
         assert!(IndexSelectionWave::storage_bytes(8256, 4097).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pipelined_attention_retains_ids_until_the_next_index_producer() -> Result<()> {
+        use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, FfnRoute, Step};
+        let producers = [2, 8, 14, 20, 24, 28, 32, 36];
+        let routes: Vec<_> = (0..40).map(|layer| if layer < 2 {
+            FfnRoute::Local
+        } else { FfnRoute::Spark }).collect();
+        for span in [65, 129, 257] {
+            let units = sequence_units(span, 64, 3, 40)?;
+            let steps = prefill_schedule(&routes, &units, 3)?;
+            // Exercise both the source and follower view used by b(9). Replaying
+            // the old fixed-offset view must corrupt a later attention hook.
+            for retained_blocks in [true, false] {
+                for windowed in [true, false] {
+                    let mut ids = vec![0u32; 3 * 64 * 512];
+                    let buffer = CuteafdDeviceBuffer { ptr: ids.as_mut_ptr().cast(),
+                        bytes: ids.len() * 4, device_id: 0, ..Default::default() };
+                    let mut corrupt = 0;
+                    let mut reads = 0;
+                    for step in &steps {
+                        let Step::Attention { layer, unit } = *step else { continue; };
+                        if layer < 2 || (layer < 24) != retained_blocks { continue; }
+                        let unit = &units[unit];
+                        let window = RowWindow::rows(unit.slot * 64..unit.slot * 64 + unit.rows.len());
+                        let view = selection_view(if windowed { &window } else { &RowWindow::NONE },
+                            retained_blocks, 9, buffer);
+                        let offset = (view.ptr as usize - buffer.ptr as usize) / 4;
+                        let rows = &mut ids[offset..offset + unit.rows.len() * 512];
+                        let producer = *producers.iter().rev().find(|&&p| p <= layer).unwrap();
+                        let expected = (unit.index * 40 + producer + 1) as u32;
+                        if producer == layer { rows.fill(expected); }
+                        else {
+                            reads += 1;
+                            corrupt += usize::from(rows.iter().any(|&id| id != expected));
+                        }
+                    }
+                    assert!(reads > 0);
+                    if windowed { assert_eq!(corrupt, 0, "span {span}, source {retained_blocks}"); }
+                    else { assert!(corrupt > 0, "the old shared output must fail"); }
+                }
+            }
+        }
         Ok(())
     }
 
