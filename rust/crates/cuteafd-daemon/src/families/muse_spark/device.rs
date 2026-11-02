@@ -39,6 +39,7 @@ pub(crate) trait PeerExchange {
 /// The shared TP2 helpers a rank's o_proj reduction launches.
 pub(crate) struct Tp2Ops<'a> {
     pub add: cuteafd_ffi::F32Add<'a>,
+    pub narrow: cuteafd_ffi::F32Bf16Narrow<'a>,
 }
 
 /// A rank's view of one layer's KV storage.
@@ -260,7 +261,10 @@ impl RankDevice<'_, '_> {
         self.copy_rows(local, row_bytes, accumulator, row_bytes, row_bytes, rows)?;
         let received = peer.swap(channel, local)?;
         let (rank0, rank1) = if self.rank == 0 { (local, received) } else { (received, local) };
-        self.core.reduced(&ops.add, rows, rank0, rank1, self.lane.rows("o_reduced", rows)?, core, output, self.stream)
+        // The add consumes local before H128 egress reuses it. Only the final
+        // post-egress value is narrowed, never either rank's partial sum.
+        self.core.reduced(&ops.add, rows, rank0, rank1, self.lane.rows("o_reduced", rows)?, core, local, self.stream)?;
+        crate::shared::dense_trellis::retain_partial(&ops.narrow, local, output, rows * self.cfg.hidden, self.stream)
     }
 
     /// `rows` rows of `width` bytes from `source` (pitch `source_pitch`) into
