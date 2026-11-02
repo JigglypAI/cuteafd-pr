@@ -885,3 +885,42 @@ def test_official_tower_export_family_dispatch_preserves_mimo_default(tmp_path, 
     if family: assert output["family"] == family
     else: assert "family" not in output
     with pytest.raises(ValueError, match="not implemented"): exporter.family_features("deepseek_v4")
+
+
+def test_official_media_registry_discovers_only_present_adapters(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    import fidelity_media as registry
+    import fidelity_windows
+    import golden_media
+    paired = load_script("media-paired-probe")
+    monkeypatch.setattr(registry, "__file__", str(tmp_path / "fidelity_media.py"))
+    assert registry.media_families() == ()
+    assert not registry.has_media_adapter("new_family")
+    for name in ("fidelity_media", "golden_media", "new_family_media"):
+        (tmp_path / (name + ".py")).touch()
+    assert registry.media_families() == ("new_family",)
+    assert registry.has_media_adapter("new_family")
+    assert not registry.has_media_adapter("fidelity")
+    for name in ("../escape", "bad.name", "", None):
+        with pytest.raises(ValueError, match="invalid official media family"):
+            registry.has_media_adapter(name)
+    adapter = SimpleNamespace(window_features=lambda *args: None)
+    monkeypatch.setitem(sys.modules, "new_family_media", adapter)
+    assert golden_media.family_features("new_family") is adapter.window_features
+    monkeypatch.setitem(sys.modules, "new_family_media", SimpleNamespace())
+    with pytest.raises(ValueError, match="lacks window_features"):
+        registry.official_media_adapter("new_family")
+    manifest = {"family": "new_family", "windows": [{"media": [span()]}]}
+    path = tmp_path / "panel.json"
+    path.write_text(json.dumps(manifest))
+    monkeypatch.setattr(fidelity_windows, "validate_set", lambda value: value)
+    assert fidelity_windows.load_set(path, "new_family") == manifest
+    assert paired.load_panel(SimpleNamespace(family="new_family", windows=path)) == manifest
+    (tmp_path / "new_family_media.py").unlink()
+    with pytest.raises(ValueError, match="not support media"):
+        fidelity_windows.load_set(path, "new_family")
+    with pytest.raises(ValueError, match="unsupported paired"):
+        paired.load_panel(SimpleNamespace(family="new_family", windows=path))
+    with pytest.raises(ValueError, match="not implemented"):
+        golden_media.family_features("new_family")

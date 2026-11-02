@@ -370,7 +370,8 @@ def load_set(path: Path, family: str | None = None) -> dict:
     manifest = validate_set(json.loads(path.read_text()))
     if family is not None and manifest["family"] != family:
         raise ValueError(f"set family {manifest['family']} does not match {family}")
-    if (family is not None and family not in ("mimo_v2", "qwen4", "glm5_flash")
+    from fidelity_media import has_media_adapter
+    if (family is not None and not has_media_adapter(family)
             and any(w.get("media") for w in manifest["windows"])):
         raise ValueError(f"{family} golden does not support media; refusing text-only scoring")
     return manifest

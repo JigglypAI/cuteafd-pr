@@ -273,7 +273,7 @@ def synthetic_panel(tmp_path, family, snapshot, vocab, lengths):
     return path
 
 
-def run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel):
+def run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel, media_adapter=None):
     import layer_major
     import types
     monkeypatch.setattr(layer_major, "DEVICE", "cpu")
@@ -281,8 +281,30 @@ def run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel):
     out = tmp_path / "golden"
     args = types.SimpleNamespace(snapshot=snapshot, windows=panel, out=out, layers=None, prefix_only=False,
                                  wait_shards=0, routes=tmp_path / "routes")
-    layer_major.run(args, family, extras_root=getattr(args, "routes", None) if family.name == "muse_spark" else None)
+    args.media = media_adapter is not None
+    args.official_tokens = 4 if args.media else 512
+    layer_major.run(args, family, extras_root=getattr(args, "routes", None) if family.name == "muse_spark" else None,
+                    media_adapter=media_adapter)
     return out
+
+
+def synthetic_media(panel, hidden):
+    import types
+    from fidelity_windows import set_hash
+    manifest = json.loads(panel.read_text())
+    features = {"ab" * 32: torch.randn(6, hidden).bfloat16()}
+    for window in manifest["windows"]:
+        window["tokens"][1:7] = [5, 5, 6, 5, 5, 7]
+        window["media"] = [{"kind": "image", "start": 1, "len": 6, "grid": [1, 4, 4],
+            "key": "ab" * 32, "fixture": {"path": "image.png", "sha256": "cd" * 32}}]
+    manifest["image_processor"] = {"merge": 2, "row_markers": 1,
+        "image_token_id": 5, "row_break_token_id": 6, "end_token_id": 7}
+    manifest["set_sha256"] = set_hash(manifest)
+    panel.write_text(json.dumps(manifest))
+    adapter = types.SimpleNamespace(validate_spans=lambda m, s: None,
+        provenance=lambda a, m: {"synthetic_test_adapter": True},
+        window_features=lambda a, m: (features, {"fixture": True}))
+    return adapter, features
 
 
 def fixture_snapshot(tmp_path, tensors, index_name):
@@ -292,7 +314,8 @@ def fixture_snapshot(tmp_path, tensors, index_name):
     return snapshot
 
 
-def test_muse_golden_qualifies_scores_resumes_and_writes_routes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_media", [False, True])
+def test_muse_golden_qualifies_scores_resumes_and_writes_routes(tmp_path, monkeypatch, with_media):
     from families.muse_spark import golden
     from transformers.models.muse_spark import modeling_muse_spark as reference
     config = tiny_muse_config()
@@ -312,7 +335,8 @@ def test_muse_golden_qualifies_scores_resumes_and_writes_routes(tmp_path, monkey
     family.checkpoint, family.layers, family.dtype, family.outer = muse.Checkpoint(snapshot), config.num_hidden_layers, torch.float32, None
     family.rotary = reference.MuseSparkTextRotaryEmbedding(config)
     panel = synthetic_panel(tmp_path, "muse_spark", snapshot, config.vocab_size, [700, 300])
-    out = run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel)
+    adapter, features = synthetic_media(panel, config.hidden_size) if with_media else (None, None)
+    out = run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel, media_adapter=adapter)
     meta = json.loads((out / "meta.json").read_text())
     assert meta["prefix_qualification"]["passed"] and meta["official_forward"]["passed"]
     assert meta["scored_tokens"] == 128 and len(meta["seconds_per_layer"]) == config.num_hidden_layers
@@ -320,14 +344,29 @@ def test_muse_golden_qualifies_scores_resumes_and_writes_routes(tmp_path, monkey
     ids = __import__("numpy").fromfile(routes / "w0.ids.bin", dtype="<i2").reshape(700, 2)
     assert ids.min() >= 0 and ids.max() < config.num_local_experts
     assert json.loads((routes / "index.json").read_text())["files"]
+    window = json.loads(panel.read_text())["windows"][1]
+    with torch.inference_mode():
+        checkpoint = muse.Checkpoint(snapshot)
+        outer = muse.load_outer(checkpoint, config, device="cpu", dtype=torch.float32)
+        hidden = outer["embed"](torch.tensor([window["tokens"]]))
+        if with_media:
+            hidden[0, 1:7] = features["ab" * 32].float()
+        for index in range(config.num_hidden_layers):
+            layer = muse.load_layer(checkpoint, config, index, device="cpu", dtype=torch.float32)
+            hidden = muse.layer_forward(layer, config, index, hidden, outer["rotary"])
+        expected = muse.logits(outer["norm"](hidden[0, window["score_from"] - 1:-1]), outer["head"], config).numpy()
+    import numpy as np
+    actual = np.fromfile(out / "windows" / "w1" / "logits.bin", dtype="<f4").reshape(expected.shape)
+    assert np.allclose(actual, expected, atol=1e-5, rtol=1e-5)
     # Resume after completion reuses the proof and reproduces identical logits.
     first = (out / "windows" / "w0" / "logits.bin").read_bytes()
     family.outer = None
-    run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel)
+    run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel, media_adapter=adapter)
     assert (out / "windows" / "w0" / "logits.bin").read_bytes() == first
 
 
-def test_mistral_golden_threads_shared_kv_and_topk_across_layers(tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_media", [False, True])
+def test_mistral_golden_threads_shared_kv_and_topk_across_layers(tmp_path, monkeypatch, with_media):
     from families.mistral_large4 import golden
     from transformers.models.mistral_large4 import modeling_mistral_large4 as reference
     config = tiny_mistral_config()
@@ -346,7 +385,8 @@ def test_mistral_golden_threads_shared_kv_and_topk_across_layers(tmp_path, monke
     family.stores = set(family.source.values())
     family.last_reader = {s: max(i for i, x in family.source.items() if x == s) for s in family.stores}
     panel = synthetic_panel(tmp_path, "mistral_large4", snapshot, config.vocab_size, [700, 260])
-    out = run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel)
+    adapter, features = synthetic_media(panel, config.hidden_size) if with_media else (None, None)
+    out = run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel, media_adapter=adapter)
     meta = json.loads((out / "meta.json").read_text())
     assert meta["prefix_qualification"]["passed"] and meta["official_forward"]["passed"]
     # Layer-major logits equal the official full model run on the same window (stable top-k).
@@ -358,6 +398,8 @@ def test_mistral_golden_threads_shared_kv_and_topk_across_layers(tmp_path, monke
         checkpoint = mistral.Checkpoint(snapshot)
         outer = mistral.load_outer(checkpoint, config, device="cpu", dtype=torch.float32)
         hidden = torch.nn.functional.embedding(ids, outer["embed"])
+        if with_media:
+            hidden[0, 1:7] = features["ab" * 32].float()
         shared, topk = {}, None
         for index in range(config.num_hidden_layers):
             layer = mistral.load_layer(checkpoint, config, index, device="cpu", dtype=torch.float32)
@@ -404,3 +446,24 @@ def test_mistral_ordered_experts_equal_the_official_cpu_accumulation():
     _, weights, index = moe.gate(hidden)
     with torch.inference_mode():
         assert torch.equal(moe.experts(hidden, index, weights), mistral.ordered_experts(moe.experts, hidden, index, weights))
+
+
+def test_layer_major_media_embedding_validates_and_preserves_text():
+    from types import SimpleNamespace
+    from layer_major import embed_window
+    hidden = torch.randn(1, 9, 4)
+    family = SimpleNamespace(embed=lambda tokens: hidden.clone())
+    window = {"tokens": list(range(9)), "media": [{"key": "image", "start": 2, "len": 3}]}
+    value = torch.ones(3, 4, dtype=torch.bfloat16)
+    result = embed_window(family, window, {"image": value})
+    assert torch.equal(result[:, :2], hidden[:, :2])
+    assert torch.equal(result[:, 5:], hidden[:, 5:])
+    assert torch.equal(result[0, 2:5], value.float())
+    assert torch.equal(embed_window(family, {"tokens": list(range(9))}), hidden)
+    for features in (None, {}, {"image": torch.ones(2, 4)}, {"image": torch.ones(3, 5)}):
+        with pytest.raises(ValueError, match="official image features"):
+            embed_window(family, window, features)
+    for start in (-1, 8):
+        window["media"][0]["start"] = start
+        with pytest.raises(ValueError, match="span extent"):
+            embed_window(family, window, {"image": value})
