@@ -147,6 +147,9 @@ mod tests {
         let layout = cfg.runtime_layout(GlmDraftRepresentation::Bf16Only, capacity, 1 << 20, 1 << 21, 188, 0,
             cuteafd_core::MlaCacheFormat::Fp8)?;
         assert_eq!(layout.capacity().block_rows, layout.capacity().max_batch_sequences * cfg.block);
+        assert_eq!(layout.selector_workspace_bytes()?, 256);
+        assert_eq!(layout.buffers().iter().find(|b| b.name == "topk_workspace").unwrap().bytes,
+            layout.selector_workspace_bytes()?);
         // Every draft layer is windowed: per-slot rings (window + block, page-rounded), no pooled layers.
         assert_eq!(layout.paged_cache().full_layers, 0);
         for layer in &layout.cache().layers {

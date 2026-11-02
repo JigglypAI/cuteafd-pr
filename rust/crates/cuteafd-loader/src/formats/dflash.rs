@@ -39,6 +39,7 @@ pub struct MlaDraftBuffer {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlaDraftRuntimeLayout {
+    kind: cuteafd_core::coordinator_programs::MlaDraftKind,
     cache_format: MlaCacheFormat,
     target_hidden: usize,
     target_vocab: usize,
@@ -54,9 +55,24 @@ pub struct MlaDraftRuntimeLayout {
     buffers: Vec<MlaDraftBuffer>,
 }
 
+/// Only DFlash2 uses the native top-16 selector; RNN-Markov keeps an unused owner floor.
+pub fn draft_selector_workspace_bytes(kind: cuteafd_core::coordinator_programs::MlaDraftKind,
+    drafted: usize) -> Result<usize> {
+    use cuteafd_core::coordinator_programs::MlaDraftKind;
+    match kind {
+        MlaDraftKind::Dflash2 => drafted.checked_mul(64 * 16 * 8)
+            .map(|bytes| bytes.max(256)).ok_or_else(|| unsupported("draft selector workspace overflow")),
+        MlaDraftKind::Ml4Dspark => Ok(256),
+    }
+}
+
 impl MlaDraftRuntimeLayout {
     pub const TAP_ROWS: usize = 2048;
 
+    pub fn kind(&self) -> cuteafd_core::coordinator_programs::MlaDraftKind { self.kind }
+    pub fn selector_workspace_bytes(&self) -> Result<usize> {
+        draft_selector_workspace_bytes(self.kind, self.capacity.block_rows - self.capacity.max_batch_sequences)
+    }
     pub fn cache_format(&self) -> MlaCacheFormat { self.cache_format }
     pub fn target_hidden(&self) -> usize { self.target_hidden }
     pub fn target_vocab(&self) -> usize { self.target_vocab }
@@ -730,7 +746,7 @@ impl MlaDflashConfig {
             ("projected", vec![rows, self.selector_rank, 2]), ("anchors", vec![seq, 4]),
             ("ids", vec![rows, 4]), ("tokens", vec![drafted, 4]),
             ("features", vec![drafted, 16]), ("positions", vec![rows, 8]),
-            ("topk_workspace", vec![drafted, 64, 16, 8]),
+            ("topk_workspace", vec![draft_selector_workspace_bytes(self.kind, drafted)?]),
         ] { add(name.into(), &dims)?; }
         let fp8_scratch = if fp8 {
             let shapes = vec![
@@ -752,7 +768,7 @@ impl MlaDflashConfig {
             add("fp8_scratch".into(), &[usize::try_from(bytes).map_err(|_| invalid())?])?;
             Some(GlmDraftFp8ScratchLayout { rows: scratch_rows, shapes })
         } else { None };
-        let layout = MlaDraftRuntimeLayout { cache_format, target_hidden: h, target_vocab: self.vocab,
+        let layout = MlaDraftRuntimeLayout { kind: self.kind, cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
             fp8_scratch, sm_count, fp8_mode, buffers };
         layout.resident_bytes()?;
@@ -817,9 +833,11 @@ impl MlaDflashConfig {
             // The shared step workspace's DFlash2-only planes (convolutions, selector,
             // q-LoRA residual): admitted at the 256-byte floor, never written.
             ("conv", vec![1]), ("dynamic", vec![1]), ("unary", vec![1]), ("candidates", vec![1]),
-            ("projected", vec![1]), ("features", vec![1]), ("topk_workspace", vec![1]), ("q_residual", vec![1]),
+            ("projected", vec![1]), ("features", vec![1]),
+            ("topk_workspace", vec![draft_selector_workspace_bytes(self.kind, seq * self.drafts())?]),
+            ("q_residual", vec![1]),
         ] { add(name.into(), &dims)?; }
-        let layout = MlaDraftRuntimeLayout { cache_format, target_hidden: h, target_vocab: self.vocab,
+        let layout = MlaDraftRuntimeLayout { kind: self.kind, cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
             fp8_scratch: None, sm_count, fp8_mode: 0, buffers };
         layout.resident_bytes()?;
@@ -977,6 +995,21 @@ mod tests {
     }
 
     #[test]
+    fn selector_workspace_is_head_aware_and_preserves_glm53_dflash2_bytes() {
+        use cuteafd_core::coordinator_programs::MlaDraftKind::*;
+        use crate::families::glm5::draft_representation::GlmDraftCapacity;
+        for sequences in [1, 8, 16, 32] {
+            let ml4 = GlmDraftCapacity::new(40, sequences, 3).unwrap();
+            let glm53 = GlmDraftCapacity::new(40, sequences, 16).unwrap();
+            let drafted = |c: GlmDraftCapacity| c.block_rows - c.max_batch_sequences;
+            assert_eq!(draft_selector_workspace_bytes(Ml4Dspark, drafted(ml4)).unwrap(), 256);
+            assert_eq!(draft_selector_workspace_bytes(Dflash2, drafted(glm53)).unwrap(),
+                sequences * 15 * 8192);
+        }
+        assert!(draft_selector_workspace_bytes(Dflash2, usize::MAX).is_err());
+    }
+
+    #[test]
     fn runtime_layout_allocates_exact_admitted_bytes_at_both_contexts_and_sm_counts() {
         use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation::*};
         let cfg = MlaDflashConfig::from_json(&config()).unwrap();
@@ -1004,6 +1037,7 @@ mod tests {
                     assert_eq!(bytes("layer.4.cache"), context * 1152);
                     assert_eq!(bytes("layer.4.page_table"), 8 * context / 64 * 4);
                     assert_eq!(bytes("topk_workspace"), 56 * 64 * 16 * 8);
+                    assert_eq!(bytes("topk_workspace"), layout.selector_workspace_bytes().unwrap());
                     assert_eq!(allocated.iter().map(|(_, b)| *b as u64).sum::<u64>(), layout.buffer_bytes().unwrap());
                     assert_eq!(allocated.iter().map(|(n, _)| n).collect::<std::collections::BTreeSet<_>>().len(), allocated.len());
                     assert!(!allocated.iter().any(|(n, _)| n.contains("embed") || n == "mask_row" || n == "head_weights"));

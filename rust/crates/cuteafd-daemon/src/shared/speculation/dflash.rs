@@ -420,9 +420,14 @@ impl<'a> MlaDraftStorage<'a> {
         };
         ensure!(expected("head_workspace")? == VOCABULARY_HEAD_WORKSPACE,
             "MLA draft vocabulary workspace disagrees with admission");
-        let drafted = layout.capacity().block_rows - layout.capacity().max_batch_sequences;
-        ensure!(library.glm_dflash_topk_workspace(drafted)?.max(256) == expected("topk_workspace")?,
+        let selector_bytes = layout.selector_workspace_bytes()?;
+        ensure!(selector_bytes == expected("topk_workspace")?,
             "MLA draft top-k workspace disagrees with admission");
+        if layout.kind() == cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2 {
+            let drafted = layout.capacity().block_rows - layout.capacity().max_batch_sequences;
+            ensure!(library.glm_dflash_topk_workspace(drafted)?.max(256) == selector_bytes,
+                "MLA draft native top-k workspace disagrees with admission");
+        }
         if let Some(scratch) = layout.fp8_scratch() {
             let mut bytes = 256;
             for shape in &scratch.shapes {
