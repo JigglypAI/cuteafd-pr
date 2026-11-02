@@ -168,6 +168,13 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
         assert_eq!(report.prefill_waves, Some(3), "{ranks}+{gpus}");
         let rtx = memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).count();
         assert_eq!(rtx, gpus);
+        let sparks = memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark)
+            .collect::<Vec<_>>();
+        assert_eq!(sparks.len(), ranks);
+        for spark in sparks {
+            assert_eq!(spark.worker_budget_bytes, 108 << 30, "{ranks}+{gpus}");
+            assert!(spark.worker_budget_bytes <= spark.capacity_bytes, "{ranks}+{gpus}");
+        }
         // auto: one GPU's heads, or two GPUs' whole-layer owners until context measures faster.
         assert_eq!(report.attention_placement, if gpus == 2 { crate::placement::AttentionPlacement::Layers }
             else { crate::placement::AttentionPlacement::Heads }, "{ranks}+{gpus}");

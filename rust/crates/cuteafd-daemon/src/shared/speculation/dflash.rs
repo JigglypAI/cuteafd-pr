@@ -2764,6 +2764,10 @@ mod checkpoint_header_tests {
     }
 
     fn native_head_snapshot(bits: usize) -> HeaderSnapshot {
+        native_head_snapshot_named(bits, "lm_head")
+    }
+
+    fn native_head_snapshot_named(bits: usize, stem: &str) -> HeaderSnapshot {
         use std::io::Write;
         let fixture = expert_only_snapshot();
         let index_path = fixture.0.join("model.safetensors.index.json");
@@ -2779,7 +2783,7 @@ mod checkpoint_header_tests {
             let mut headers = serde_json::Map::new();
             let mut offset = 0;
             for (suffix, dtype, shape, bytes) in tensors {
-                let name = format!("lm_head.{suffix}");
+                let name = format!("{stem}.{suffix}");
                 headers.insert(name.clone(), serde_json::json!({"dtype": dtype, "shape": shape,
                     "data_offsets": [offset, offset + bytes]}));
                 map.insert(name, shard.into());
@@ -2834,6 +2838,15 @@ mod checkpoint_header_tests {
         assert!(check_snapshot_target_head(&fixture.0, "lm_head", cfg.hidden, cfg.vocab_size, false).is_err());
         assert!(check_snapshot_target_head(&fixture.0, "", cfg.hidden, cfg.vocab_size, false).is_err());
         assert!(check_snapshot_target_head(&fixture.0, cfg.head(), cfg.hidden, cfg.vocab_size, true).is_err());
+    }
+
+    #[test]
+    fn target_head_guard_requires_the_explicit_output_stem() {
+        let fixture = native_head_snapshot_named(6, "output");
+        check_snapshot_target_head(&fixture.0, "output", 128, 256, false).unwrap();
+        assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, "", 128, 256, false).is_err());
+        assert!(check_snapshot_target_head(&fixture.0, "output", 128, 256, true).is_err());
     }
 
     #[test]

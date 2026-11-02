@@ -5,6 +5,21 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
+/// Shared prefill reserve, page alignment and fixed exchange depth. Exporters
+/// read these literal constants too; do not independently tune their wave size.
+pub const PREFILL_RESERVE_ROWS: u64 = 8192;
+pub const PREFILL_DEPTH: u64 = 3;
+pub const PREFILL_ROW_PAGE: u64 = 64;
+pub const PREFILL_MAX_WAVES: u64 = 4;
+
+pub fn prefill_unit_rows_in(waves: u64, reserve: u64) -> u64 {
+    reserve.div_ceil(waves.clamp(2, PREFILL_MAX_WAVES)).div_ceil(PREFILL_ROW_PAGE) * PREFILL_ROW_PAGE
+}
+
+pub fn default_prefill_unit_rows() -> u64 {
+    prefill_unit_rows_in(PREFILL_DEPTH, PREFILL_RESERVE_ROWS)
+}
+
 /// Common logical GPU pool across model families; larger pools are explicit.
 pub const DEFAULT_GPU_KV_TOKENS: u64 = 2 << 20;
 

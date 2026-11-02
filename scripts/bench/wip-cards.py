@@ -418,6 +418,21 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     return job
 
 
+def apply_arm_config(job, overrides, unsets):
+    """Apply explicit launch-schema edits after generated defaults, on both copies."""
+    if not overrides and not unsets:
+        return
+    if overrides.keys() & unsets:
+        raise ValueError('arm config key is both set and unset')
+    values = job['entry']['set']
+    values.update(overrides)
+    for key in unsets:
+        values.pop(key, None)
+    dest = Path(job['state'])
+    Path(job['entry']['config']).write_text(''.join(f'{k}={v}\n' for k, v in sorted(values.items())))
+    save(dest / 'matrix.json', dict(build='wip-cards', profile=job['entry'].get('profile', 'smoke'), entries=[job['entry']]))
+
+
 def parallel_safe(jobs, parallel):
     if parallel <= 1:
         return
@@ -2253,7 +2268,8 @@ def main():
     parser.add_argument('--binary', help='the cuteafd that runs smoke; default: cuteafd on PATH, else the arm\'s sealed '
                         'slot binary (<WIP_ROOT>/slots/<slot>/coordinator/workspace/.cuteafd-wip/cuteafd)')
     parser.add_argument('--set', action='append', default=[], metavar='CARD:KEY=VALUE')
-    parser.add_argument('--arm-set', action='append', default=[], metavar='ARM:CARD:KEY=VALUE', help='arm-specific setting, overriding --set')
+    parser.add_argument('--arm-set', action='append', default=[], metavar='ARM:[CARD:]KEY=VALUE', help='arm config override; without CARD, applied after generation')
+    parser.add_argument('--arm-unset', action='append', default=[], metavar='ARM:KEY', help='remove an arm config key after generation')
     parser.add_argument('--arm-env', action='append', default=[], metavar='ARM:CUTEAFD_DIAG_NAME=VALUE',
                         help='arm-specific private diagnostic in the launch environment (CUTEAFD_DIAG_* only; '
                         'the launcher forwards those to the coordinator unchanged)')
@@ -2368,10 +2384,21 @@ def main():
     cards = load_cards(kit.expanduser().resolve(), args.cards)
     overrides = overrides_from(args.set)
     arm_overrides = {}
+    arm_config = {}
+    arm_unsets = {}
+    for item in args.arm_unset:
+        name, key = item.split(':', 1)
+        if name not in arms:
+            raise ValueError('unknown override arm: ' + name)
+        overrides_from(['config:' + key + '='])
+        arm_unsets.setdefault(name, set()).add(key)
     for item in args.arm_set:
         name, setting = item.split(':', 1)
         if name not in arms:
             raise ValueError('unknown override arm: ' + name)
+        if ':' not in setting.split('=', 1)[0]:
+            arm_config.setdefault(name, {}).update(overrides_from(['config:' + setting])['config'])
+            continue
         parsed = overrides_from([setting])
         if set(parsed) - set(args.cards):
             raise ValueError('arm override names must be selected cards')
@@ -2513,6 +2540,7 @@ def main():
     jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None, [h for h in (args.cold_window or '').split(',') if h] or None) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
     variants = {(c['name'], n): {**c, 'set': {**c['set'], **arm_overrides.get(n, {}).get(c['name'], {})}} for c in cards for n in arms}
     for job in jobs:
+        apply_arm_config(job, arm_config.get(job['arm'], {}), arm_unsets.get(job['arm'], set()))
         job['launcher'] = dict(repo=arms[job['arm']]['repo'], commit=arms[job['arm']]['repo_commit'])
         job['needs'] = slot_needs(variants[(job['card'], job['arm'])])
         # Per arm: an A/B of two builds runs each arm's own smoke runner.

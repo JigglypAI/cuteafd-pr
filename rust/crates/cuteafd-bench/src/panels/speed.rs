@@ -392,10 +392,113 @@ impl Panel for PrefixCache {
     }
 }
 
+pub static SHARED_PREFIX: SharedPrefix = SharedPrefix;
+pub struct SharedPrefix;
+
+fn identical_prompts(c: usize) -> Vec<String> {
+    let prompt = format!("[{}] {}", nonce(), CONTENT[0].1);
+    vec![prompt; c]
+}
+
+fn identical_bodies(client: &crate::client::Client, c: usize, tokens: u64) -> Vec<Value> {
+    identical_prompts(c).iter().map(|prompt| plain(client, prompt, tokens)).collect()
+}
+
+fn prefix_card_options(limit: usize) -> super::context_load::Options {
+    super::context_load::Options {
+        lengths: vec![32768],
+        levels: [1, 4, 16].into_iter().filter(|&c| c <= limit).collect(),
+        suffix_tokens: 0,
+    }
+}
+
+fn prefix_card_record(identical: &[Value], retained: Value) -> Value {
+    let points: Vec<_> = identical.iter().cloned().map(|mut p| {
+        p["kind"] = json!("identical");
+        p
+    }).chain(retained["points"].as_array().into_iter().flatten().cloned().map(|mut p| {
+        p["kind"] = json!("cached follow-up");
+        p
+    })).collect();
+    let rows = points.iter().map(|p| vec![p["kind"].clone(), p["c"].clone(),
+        p["aggregate_tok_s"].clone(), p["per_request_tok_s"].clone(),
+        json!(p["ttft_s"].as_f64().map(|s| s * 1e3)), p["end_to_end_s"].clone()]).collect();
+    json!({"identical": identical, "retained": retained, "points": points,
+        "table": table(&["case", "C", "aggregate tok/s", "median tok/s", "TTFT ms", "end-to-end s"], rows)})
+}
+
+impl Panel for SharedPrefix {
+    fn id(&self) -> &'static str { "shared_prefix" }
+    fn title(&self) -> &'static str { "Shared-prefix release guard" }
+    fn description(&self) -> &'static str {
+        "Identical full prompts at C4/C16, then fresh follow-up suffixes over a retained 32K base at C1/C4/C16. Warm before timing; cached follow-ups emit up to 512 tokens."
+    }
+    fn estimate_s(&self, rates: &Rates, info: &ServerInfo) -> f64 {
+        let limit = common::concurrency(info).max(1);
+        let shared = [4, 16].into_iter().filter(|&c| c <= limit)
+            .map(|c| 2.0 * rates.seconds(120.0 * c as f64, 192.0) * (1.0 + 0.08 * c as f64)).sum::<f64>();
+        shared + rates.seconds(32768.0, 1.0) + 6.0 * rates.seconds(128.0, 512.0)
+    }
+    fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
+        let limit = common::concurrency(ctx.info).max(1);
+        let mut identical = Vec::new();
+        for c in [4, 16].into_iter().filter(|&c| c <= limit) {
+            wave(ctx.client, identical_bodies(ctx.client, c, 192.min(ctx.max_output)))
+                .into_iter().collect::<Result<Vec<_>>>()?;
+            let timed = wave(ctx.client, identical_bodies(ctx.client, c, 192.min(ctx.max_output)))
+                .into_iter().collect::<Result<Vec<_>>>()?;
+            let mut ttft: Vec<_> = timed.iter().map(|r| r.chat.timing.ttft_s).collect();
+            let mut per: Vec<_> = timed.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
+            let mut total: Vec<_> = timed.iter().map(|r| r.chat.timing.total_s).collect();
+            identical.push(json!({"c": c, "aggregate_tok_s": aggregate(&timed),
+                "per_request_tok_s": common::median(&mut per), "ttft_s": common::median(&mut ttft),
+                "end_to_end_s": common::median(&mut total),
+                "requests": timed.iter().map(|r| &r.chat.timing).collect::<Vec<_>>()}));
+            ctx.progress.partial(json!({"identical": identical}));
+        }
+        let options = prefix_card_options(limit);
+        let retained_ctx = Ctx { context_load: &options, ..*ctx };
+        let retained = super::context_load::CONTEXT_LOAD.run_with_output(&retained_ctx, 512)?;
+        anyhow::ensure!(retained["points"].as_array().is_some_and(|points|
+            !points.is_empty() && points.iter().all(|p| p["status"] == "ok")),
+            "shared-prefix release guard requires successful retained-prefix points");
+        Ok(prefix_card_record(&identical, retained))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn release_guard_covers_identical_and_retained_followup_cells() {
+        let warm = identical_prompts(16);
+        let timed = identical_prompts(16);
+        assert!(warm.iter().all(|p| p == &warm[0]));
+        assert!(timed.iter().all(|p| p == &timed[0]));
+        assert_ne!(warm[0], timed[0]);
+        let options = prefix_card_options(16);
+        assert_eq!(options.lengths, vec![32768]);
+        assert_eq!(options.levels, vec![1, 4, 16]);
+        assert_eq!(prefix_card_options(4).levels, vec![1, 4]);
+        assert_eq!(prefix_card_options(1).levels, vec![1]);
+        assert!(options.validate().is_ok());
+    }
+
+    #[test]
+    fn release_guard_records_cached_c1_latency_and_decode() {
+        let retained = json!({"points": [{"c": 1, "status": "ok", "max_tokens": 512,
+            "aggregate_tok_s": 100.0, "per_request_tok_s": 100.0,
+            "ttft_s": 0.2, "end_to_end_s": 5.32}]});
+        let record = prefix_card_record(&[], retained.clone());
+        assert_eq!(record["retained"], retained);
+        assert_eq!(record["points"][0]["kind"], "cached follow-up");
+        assert_eq!(record["table"]["rows"][0], json!(["cached follow-up", 1, 100.0, 100.0, 200.0, 5.32]));
+        let request = super::super::context_load::request(&crate::report::Configuration::default(),
+            &json!([]), "card", "timed", 1, 0, 512, 0);
+        assert_eq!(request["max_tokens"], 512);
+    }
 
     #[test]
     fn concurrent_waves_give_every_stream_its_own_prompt() {

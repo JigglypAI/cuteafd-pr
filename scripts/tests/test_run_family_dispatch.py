@@ -114,6 +114,45 @@ def test_exlr8_onboarding_reaches_shared_admission_without_zero_override(tmp_pat
         assert argv[argv.index("--pool-tokens") + 1] == "0"
 
 
+@pytest.mark.parametrize("model_type", ["glm_moe_dsa", "deepseek_v4"])
+@pytest.mark.parametrize("explicit", [None, 104 << 30])
+def test_spark_budget_default_is_planner_owned_and_explicit_ceiling_wins(tmp_path, model_type, explicit):
+    config = {"model_type": model_type, "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    keys = "SPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    if explicit is not None:
+        keys += f"SPARK_DEVICE_BUDGET_BYTES={explicit}\n"
+    device_budget = explicit or (108 << 30)
+    result = _family_launch_result(tmp_path, config, "test/budget", keys,
+                                  encoder_plan={"placement_supported": True, "fits": True,
+                                                "spark_budget_bytes": 100 << 30})
+    assert result.returncode == 0, result.stderr
+    plans = [line.split() for line in result.stderr.splitlines() if "cuteafd plan" in line]
+    assert plans
+    for plan in plans:
+        if explicit is None:
+            assert "--spark-budget-gib" not in plan
+        else:
+            assert float(plan[plan.index("--spark-budget-gib") + 1]) == explicit / 2**30
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert len(workers) == 4
+    assert all(f"--device-budget-bytes {device_budget} " in worker for worker in workers)
+
+
+@pytest.mark.parametrize("devices", [[], [{"kind": "spark", "index": 0, "capacity_bytes": 121 << 30}],
+    [{"kind": "spark", "index": 0, "worker_budget_bytes": 0}],
+    [{"kind": "spark", "index": i, "worker_budget_bytes": (108 - i) << 30} for i in range(4)]])
+def test_spark_workers_reject_missing_zero_or_nonuniform_planner_budgets(tmp_path, devices):
+    result = _family_launch_result(tmp_path,
+        {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "test/budget",
+        "SPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        deployment_overrides={"memory_layout": {"devices": [
+            {"kind": "rtx", "index": 0, "capacity_bytes": 96 << 30, "worker_budget_bytes": 0,
+             "items": [], "kv_tokens": 0}, *devices]}})
+    assert result.returncode != 0
+    assert "no uniform Spark worker allocation ceiling" in result.stderr
+    assert "cuteafd expertd-native" not in result.stderr
+
+
 def test_exlr8_onboarded_halves_require_the_shared_committed_push():
     source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/mod.rs").read_text()
     planning = source.split("// Native dense operands and onboarded EXLR8 halves", 1)[1].split(
@@ -850,13 +889,10 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                        cuda_total_bytes if cuda_total_bytes is not None else gpu_total_mib * 2**20)
     copy_input(ROOT / "scripts" / "lib" / "cdi-gpus.sh", repo / "scripts" / "lib")
     copy_input(ROOT / "scripts" / "lib" / "coordinator-gpus.py", repo / "scripts" / "lib")
-    capacity = Path("rust/crates/cuteafd-core/src/serving_capacity.rs")
-    (repo / capacity.parent).mkdir(parents=True)
-    copy_input(ROOT / capacity, repo / capacity)
+    # release-common.sh stages serving_capacity.rs through shared_inputs.
     native_v41 = family_config.get("model_type") == "deepseek_v41"
     if native_v41:
         programs = Path("rust/crates/cuteafd-core/src/coordinator_programs.rs")
-        (repo / programs.parent).mkdir(parents=True, exist_ok=True)
         copy_input(ROOT / programs, repo / programs)
         (repo / "scripts" / "build").mkdir(exist_ok=True)
         (repo / "scripts" / "build" / "verify-sparkinfer-source.py").write_text("print('test-pin')\n")
@@ -977,6 +1013,8 @@ report.update(spark_ranks=ranks)
 if family == "mimo_v2":
     report["prefill_lanes"] = 3
 gpus = int(value("--rtx", "1"))
+spark_capacity = int(float(value("--spark-budget-gib")) * 2**30) if value("--spark-budget-gib") else (
+    report.get("spark_budget_bytes", 108 << 30) if family in {"kimi_k3", "step5"} else 108 << 30)
 placement_ready = report.get("placement_supported", True) and report.get("fits", True)
 shared = family in {"step5", "kimi_k3", "glm5", "glm5_flash", "deepseek_v4", "qwen4", "mistral_large4"}
 # The planner's fixed depth (prefill_waves::depth): three units with Sparks.
@@ -1001,7 +1039,8 @@ deployment = dict(version=1, family=family, executable=family != "qwen3_5" and p
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
     artifact_requirements=dict(spark_tp_role=f"tp{tp}" if family == "deepseek_v41" and explicit and tp != 4 else None), report=report,
     memory_layout=dict(devices=[dict(kind="rtx", index=i, items=[dict(category="weights", bytes=int(os.environ["STUB_PLAN_RTX_BYTES"])),
-                                                                 dict(category="kv", bytes=64 << 30)]) for i in range(gpus)]))
+                                                                 dict(category="kv", bytes=64 << 30)]) for i in range(gpus)] +
+                               [dict(kind="spark", index=i, capacity_bytes=spark_capacity, worker_budget_bytes=spark_capacity, items=[]) for i in range(ranks)]))
 deployment.update(json.loads(os.environ["STUB_DEPLOYMENT_OVERRIDES"]))
 if deployment.get("wip_launchable") == "absent":
     deployment.pop("wip_launchable")
@@ -1082,6 +1121,9 @@ def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, tempor
         for rank, worker in enumerate(sorted(workers, key=lambda w: int(w[w.index("--rank") + 1]))):
             assert worker[worker.index("--rank") + 1] == str(rank)
             assert worker[worker.index("--world") + 1] == "8"
+            device = next(device for device in deployment["memory_layout"]["devices"]
+                          if device["kind"] == "spark" and device["index"] == rank)
+            assert int(worker[worker.index("--device-budget-bytes") + 1]) == device["worker_budget_bytes"]
     layer_bytes = None
     if family == "deepseek_v41":
         arithmetic = subprocess.run(["bash", "-euc", 'source "$1"; release_spark_layer_bytes 8',

@@ -40,7 +40,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let ranks = if split { 2 } else { 1 };
     let mut devices: Vec<DeviceLayout> = options.rtx_bytes.iter().take(gpus).enumerate()
         .map(|(index, &bytes)| DeviceLayout { kind: DeviceKind::Rtx, index: index as u32,
-            capacity_bytes: bytes.saturating_sub(options.headroom_bytes), items: Vec::new(), kv_tokens: 0 }).collect();
+            capacity_bytes: bytes.saturating_sub(options.headroom_bytes), worker_budget_bytes: 0, items: Vec::new(), kv_tokens: 0 }).collect();
     let mut waste = Vec::new();
     let mut notes = vec![format!("resolved context {} tokens (checkpoint {})", shape.context_tokens, shape.checkpoint_context),
         format!("attention placement {}", report.attention_placement)];
@@ -538,7 +538,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         runtime.group = "EXLR8 context+modules".into();
         items.push(runtime);
         devices.push(DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32,
-            capacity_bytes: options.rtx_bytes[rank].saturating_sub(options.headroom_bytes), items, kv_tokens: 0 });
+            capacity_bytes: options.rtx_bytes[rank].saturating_sub(options.headroom_bytes), worker_budget_bytes: 0, items, kv_tokens: 0 });
     }
     let onboard = options.onboard.or(options.local_expert_layers.map(Onboard::Layers)).unwrap_or_else(glm::default_onboard);
     let local = if let Some(selected) = selected {
@@ -731,7 +731,7 @@ mod tests {
                 let plan_options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: sparks },
                     layout: Some(options.clone()), ..Default::default() };
                 let exl3 = input.plan(&plan_options).unwrap();
-                let mut native = crate::plan::empty_report(input.checkpoint(), &plan_options).unwrap();
+                let mut native = crate::plan::empty_report(&input, &plan_options).unwrap();
                 let mut options = options;
                 let shape = crate::plan::layout::resolve_prefill(&mut native, &mut options, sparks,
                     crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5)).unwrap();
@@ -876,7 +876,7 @@ mod tests {
                     256 + device.capacity_bytes - device.used_bytes() + records - target_records + target_records / 8
                 }).collect();
                 let input = crate::plan::PlanInput::open(dir.path()).unwrap();
-                let report = crate::plan::empty_report(&checkpoint, &crate::plan::PlanOptions {
+                let report = crate::plan::empty_report(&input, &crate::plan::PlanOptions {
                     placement: crate::plan::ExpertPlacement::Sparks { ranks: sparks },
                     attention_placement: Some(if gpus == 2 { crate::placement::AttentionPlacement::Context }
                         else { crate::placement::AttentionPlacement::Heads }), ..Default::default()

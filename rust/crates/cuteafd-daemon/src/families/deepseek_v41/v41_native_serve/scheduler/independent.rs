@@ -484,6 +484,7 @@ pub(super) fn resume_due(rounds: u64, mut closed: impl Iterator<Item = bool>, ep
 mod tests {
     use super::{boundary, drive_lanes, retire_completed, retire_due, round_failure, Boundary, LaneControl};
     use crate::shared::serve::lanes::{LaneLease, LaneSet};
+    use super::admission::Wake;
     use std::cell::{Cell, RefCell};
 
     /// A request of the lane model: its lane, stalled or not, client closed, rounds it still runs
@@ -495,7 +496,7 @@ mod tests {
     /// filter, retirements and rounds recorded only through [`LaneControl`], the decision only
     /// through it, a yield per round like the device waits.
     async fn model_lane(lease: LaneLease<'_>, mut control: LaneControl, active: &RefCell<Vec<Option<Req>>>,
-        epoch: &Cell<u64>, rounds: &[Cell<u32>; 2]) -> anyhow::Result<()> {
+        epoch: &Cell<u64>, rounds: &[Cell<u32>; 2], wake: Wake<'_>) -> anyhow::Result<()> {
         let index = lease.index();
         loop {
             if lease.stopping() { return Ok(()); }
@@ -508,6 +509,9 @@ mod tests {
             }
             let decision = {
                 let active = active.borrow();
+                if wake.ready(active.iter().flatten().count(), active.len(), false, epoch.get()) {
+                    lease.stop(); return Ok(());
+                }
                 control.decide(false, active.iter().flatten().filter(|r| r.stalled).map(|r| r.closed), epoch.get(),
                     active.iter().enumerate().filter_map(|(slot, r)|
                         r.as_ref().filter(|r| r.lane == index && !r.stalled).map(|_| slot)))
@@ -532,9 +536,42 @@ mod tests {
         let set = LaneSet::default();
         let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
         runtime.block_on(drive_lanes(&set, || epoch.get(),
-            |lease, control| model_lane(lease, control, active, epoch, &rounds),
-            |lease, control| model_lane(lease, control, active, epoch, &rounds))).unwrap();
+            |lease, control| model_lane(lease, control, active, epoch, &rounds, Wake::default()),
+            |lease, control| model_lane(lease, control, active, epoch, &rounds, Wake::default()))).unwrap();
         [rounds[0].get(), rounds[1].get()]
+    }
+
+    #[test]
+    fn a_deferred_prefix_waiter_is_admitted_at_the_donor_prefill_boundary() {
+        // The donor just published its prompt snapshot and has a long generation left.
+        // The HTTP queue is empty: only the host-side waiter can wake admission.
+        let active = RefCell::new(vec![Some(Req { lane: 0, stalled: false, closed: false, left: 1000 }), None]);
+        let epoch = Cell::new(7);
+        let mut waiters = std::collections::VecDeque::from([Req { lane: 1, stalled: false, closed: false, left: 20 }]);
+        let wake = Wake { host_pending: !waiters.is_empty(), ..Wake::default() };
+        let rounds = [Cell::new(0u32), Cell::new(0u32)];
+        let set = LaneSet::default();
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        runtime.block_on(drive_lanes(&set, || epoch.get(),
+            |lease, control| model_lane(lease, control, &active, &epoch, &rounds, wake),
+            |lease, control| model_lane(lease, control, &active, &epoch, &rounds, wake))).unwrap();
+        assert_eq!([rounds[0].get(), rounds[1].get()], [0, 0], "admission wakes at this boundary, before donor generation");
+        assert_eq!(epoch.get(), 7, "no retirement or KV-release event is needed");
+        let slot = active.borrow().iter().position(Option::is_none).unwrap();
+        active.borrow_mut()[slot] = waiters.pop_front();
+        assert!(waiters.is_empty() && active.borrow()[slot].is_some(), "the deferred waiter joins at the same boundary");
+        assert_eq!(active.borrow()[0].as_ref().unwrap().left, 1000);
+
+        // Tie the CPU model to the real wake and dequeue sites, not a second scheduler.
+        let lane_source = include_str!("independent.rs");
+        let lane_source = &lane_source[..lane_source.find("#[cfg(test)]").unwrap()];
+        assert!(lane_source.contains("wake.ready(active.iter().flatten().count(), active.len(), !receive.is_empty(),"));
+        let source = include_str!("../scheduler.rs");
+        let serve = &source[source.find("pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>").unwrap()..];
+        let serve = &serve[..serve.find("\n/// Process-wide device-terminal instrumentation.").unwrap()];
+        assert!(serve.contains("host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),"));
+        assert!(serve.contains("AdmissionPoll::Empty if !prefix_waiters.is_empty() => prefix_waiters.pop_front().unwrap(),"));
+        assert!(serve.contains("let mut intake = receive.len().max(1);"), "an empty HTTP queue must still run admission");
     }
 
     /// One stalled request on lane 0 and one runnable request on lane 1. The empty lane returns

@@ -148,8 +148,35 @@ def test_only_qualified_hardware_recipes_override_matching_arithmetic():
     assert LAYOUTS.native_slice_width(5120, 576, 121, 256, 192) == 192
     assert LAYOUTS.ownership_unit(2304, 5) == 64
     assert LAYOUTS.ownership_unit(2304, 7) == 32
-    assert LAYOUTS.generic_stored_width(6144, 352) == 384
+    for width in (320, 352, 1024, 2048):
+        assert LAYOUTS.generic_stored_width(6144, width) == width
     assert LAYOUTS.generic_stored_width(4096, 352) == 352
+
+
+def test_s384_split_recipe_is_explicit_decode_only_and_hardware_scoped():
+    for capacity in (1, 16, 80):
+        assert LAYOUTS.native_slice_width(5120, 384, 121, capacity, 192) == 128
+        assert LAYOUTS.native_fc1_k_splits(5120, 384, 121, capacity) == 2
+    for sm, hidden, width, capacity in [(120, 5120, 384, 1), (121, 5120, 576, 16),
+                                      (121, 4096, 384, 16), (121, 5120, 384, 256),
+                                      (121, 5120, 384, 1024), (121, 5120, 384, 4096)]:
+        assert LAYOUTS.native_fc1_k_splits(hidden, width, sm, capacity) == 1
+    assert LAYOUTS.native_slice_width(5120, 384, 121, 256, 192) == 192
+
+
+def test_native_plan_rejects_mixed_decode_splits_and_prefill_splits():
+    data = LAYOUTS.layouts()
+    row = next(row for row in data["native_slices"]
+               if (row["hidden"], row["width"], row["sm"]) == (5120, 384, 121))
+    row["fc1_k_splits"][1] = 1
+    with pytest.raises(ValueError, match="share one FC1 K split"):
+        LAYOUTS.validate(data)
+    row["fc1_k_splits"][1] = 2
+    row["capacities"].append(256)
+    row["slices"].append(192)
+    row["fc1_k_splits"].append(2)
+    with pytest.raises(ValueError, match="prefill FC1 K splitting is unqualified"):
+        LAYOUTS.validate(data)
 
 
 def test_native_plan_rejects_duplicate_capacity_keys():
@@ -312,20 +339,76 @@ def test_native_gpu_selftest_forward_oracle_matches_tensor_permutation(
     np.testing.assert_array_equal(actual, expected)
 
 
-@pytest.mark.parametrize("hidden,sm,widths", [
-    (4096, 121, [256, 288, 320, 352, 384, 416, 512, 672, 704, 1024]),
-    (5120, 121, [288, 320, 352, 384, 448, 512, 576, 768, 1152]),
-    (4096, 120, [1024, 2048]), (5120, 120, [1152, 2304]),
+@pytest.mark.parametrize("hidden,sm,widths,experts", [
+    (4096, 121, [256, 288, 320, 352, 384, 416, 512, 672, 704, 1024], 256),
+    (5120, 121, [288, 320, 352, 384, 448, 512, 576, 768, 1152], 384),
+    (7168, 121, [384, 512, 768, 1024, 1536], 384),
+    (4096, 120, [1024, 2048], 256), (5120, 120, [1152, 2304], 384),
 ])
-def test_native_prefill_inventory_is_hardware_and_capacity_qualified(hidden, sm, widths):
+def test_native_prefill_inventory_is_hardware_and_capacity_qualified(hidden, sm, widths, experts):
     for width in widths:
         for capacity in (256, 1024, 4096):
-            assert LAYOUTS.native_prefill(hidden, width, sm, capacity)
+            expected = (sm == 121 and min(capacity, 2752) * 6 * width >= 24576 * experts
+                        and (hidden, width) != (5120, 768))
+            assert LAYOUTS.native_prefill(hidden, width, sm, capacity, experts, 6) == expected
         for capacity in (1, 16, 80, 128, 512):
-            assert not LAYOUTS.native_prefill(hidden, width, sm, capacity)
-    for width in widths:
-        assert not LAYOUTS.native_prefill(7168, width, sm, 256)
-    assert not LAYOUTS.native_prefill(5120, 288, 120, 256)
+            assert not LAYOUTS.native_prefill(hidden, width, sm, capacity, experts, 6)
+    assert not LAYOUTS.native_prefill(7168, 608, 121, 4096, 384, 6)
+
+
+@pytest.mark.parametrize("hidden,experts,width,role,sm,coded,sizes", [
+    (4096, 256, 2048, "rtx_backbone", 120, False, [123936, 1905552, 9507216, 30411792, 121631760, 486511632]),
+    (4096, 256, 1024, "rtx_tp2", 120, False, [117024, 1794960, 8954256, 28642320, 114553872, 458200080]),
+    (4096, 256, 512, "spark", 121, False, [113568, 1739664, 8677776, 27757584, 111014928, 433330960]),
+    (7168, 384, 768, "spark", 121, False, [194656, 2998672, 14962576, 9836064, 39321120, 764028688]),
+])
+def test_native_scratch_matches_independent_exported_manifest_census(
+        hidden, experts, width, role, sm, coded, sizes):
+    # Recorded from CPU-only real exports; do not derive expected sizes from policy.
+    for capacity, size in zip((1, 16, 80, 256, 1024, 4096), sizes, strict=True):
+        assert LAYOUTS.native_scratch_bytes(hidden, width, experts, 6, capacity, sm, role, coded) == size
+        stream = LAYOUTS.native_prefill(hidden, width, sm, capacity, experts, 6)
+        atomic = hidden == 7168 and capacity >= 256 and not stream
+        variant = dict(capacity_rows=capacity, core_scratch_nbytes=size,
+                       output_kind="fp32_tokens" if atomic else "fp32_routes")
+        LAYOUTS.assert_native_scratch_variant(variant, hidden, width, experts, 6, sm, role, coded)
+        with pytest.raises(ValueError, match="differs from planner census"):
+            LAYOUTS.assert_native_scratch_variant({**variant, "core_scratch_nbytes": size - 1},
+                hidden, width, experts, 6, sm, role, coded)
+        with pytest.raises(ValueError, match="differs from planner census"):
+            LAYOUTS.assert_native_scratch_variant({**variant, "output_kind": "wrong"},
+                hidden, width, experts, 6, sm, role, coded)
+
+
+def test_native_aot_policy_dependencies_include_shared_prefill_contract():
+    source = (ROOT / "native/CMakeLists.txt").read_text()
+    dependency = source[source.index("set(CUTEAFD_MXFP4_POLICY_INPUTS"):]
+    dependency = dependency[:dependency.index("\n  )")]
+    for path in ("python/tools/lib/mxfp4_layouts.py", "scripts/build/mxfp4-layouts.json",
+                 "rust/crates/cuteafd-core/src/serving_capacity.rs"):
+        assert path in dependency
+    assert "CUTEAFD_SPARKINFER_EXPORT_INPUTS ${CUTEAFD_MXFP4_POLICY_INPUTS}" in source
+    assert "CMAKE_CONFIGURE_DEPENDS ${CUTEAFD_MXFP4_POLICY_INPUTS}" in source
+    for relative in ("shared/expert_families.cmake", "shared/mxfp4_widths.cmake",
+                     "families/deepseek_v41/v41_experts.cmake",
+                     "families/deepseek_v41/v41_spark_tp_experts.cmake",
+                     "families/deepseek_v41/v41_local_experts.cmake",
+                     "families/deepseek_v41/v41_tp2_experts.cmake"):
+        cmake = (ROOT / "native/cmake" / relative).read_text()
+        assert "${CUTEAFD_SPARKINFER_EXPORT_INPUTS}" in cmake[cmake.index("DEPENDS"):]
+
+
+def test_native_prefill_work_boundary_and_default_admitted_rows():
+    assert LAYOUTS.default_prefill_unit_rows() == 2752
+    for rows, width, experts in [(4096, 384, 384), (3072, 512, 384), (2048, 512, 256)]:
+        assert not LAYOUTS.native_prefill_work(121, rows - 1, width, experts, 6)
+        assert LAYOUTS.native_prefill_work(121, rows, width, experts, 6)
+        assert LAYOUTS.native_prefill_work(121, rows + 1, width, experts, 6)
+        assert not LAYOUTS.native_prefill_work(120, rows + 1, width, experts, 6)
+    assert LAYOUTS.native_prefill_work(121, 4096, 384, 384, 6)
+    assert not LAYOUTS.native_prefill(5120, 384, 121, 4096, 384, 6)
+    assert LAYOUTS.native_prefill(4096, 512, 121, 4096, 256, 6)
+    assert LAYOUTS.native_prefill(7168, 768, 121, 4096, 384, 6)
 
 
 def test_native_prefill_scratch_matches_pinned_seven_plane_contract():
@@ -340,7 +423,7 @@ def test_native_prefill_scratch_matches_pinned_seven_plane_contract():
     for row in LAYOUTS.layouts()["native_slices"]:
         for capacity in row.get("prefill", []):
             hidden, width = row["hidden"], row["width"]
-            experts = 384 if hidden == 5120 else 256
+            experts = 256 if hidden == 4096 else 384
             actual, total = LAYOUTS.native_prefill_scratch(capacity, hidden, width, experts, 6)
             expected, expected_total = namespace["stream_scratch_layout"](capacity, hidden, width, experts, 6)
             assert tuple(actual) == expected
@@ -349,6 +432,64 @@ def test_native_prefill_scratch_matches_pinned_seven_plane_contract():
             assert actual[-2]["name"] == "grouped_route"
             assert actual[-2]["nbytes"] == capacity * 6 * 4
             assert all(plane["offset"] % 16 == 0 for plane in actual)
+
+
+def test_native_prefill_default_matches_rust_and_clamps_waves(tmp_path):
+    compiler = shutil.which("rustc")
+    if not compiler:
+        pytest.skip("Rust compiler unavailable")
+    source = (ROOT / "rust/crates/cuteafd-core/src/serving_capacity.rs").read_text()
+    contract = source[source.index("pub const PREFILL_RESERVE_ROWS"):source.index("/// Common logical GPU pool")]
+    program = tmp_path / "prefill.rs"
+    binary = tmp_path / "prefill"
+    program.write_text(contract + '\nfn main() { println!("{}", default_prefill_unit_rows()); }\n')
+    subprocess.run([compiler, str(program), "-o", str(binary)], check=True, capture_output=True)
+    rust_default = int(subprocess.check_output([str(binary)], text=True))
+    assert LAYOUTS.default_prefill_unit_rows() == rust_default == 2752
+    assert LAYOUTS._default_prefill_unit_rows(source.replace("= 8192;", "= 8_192;")) == rust_default
+    for depth, expected in ((0, 4096), (1, 4096), (3, 2752), (4, 2048), (8, 2048)):
+        assert LAYOUTS._default_prefill_unit_rows(
+            source.replace("PREFILL_DEPTH: u64 = 3;", f"PREFILL_DEPTH: u64 = {depth};")) == expected
+    for name in ("RESERVE_ROWS", "DEPTH", "ROW_PAGE", "MAX_WAVES"):
+        with pytest.raises(ValueError, match=f"cannot parse Rust literal PREFILL_{name}"):
+            LAYOUTS._default_prefill_unit_rows(source.replace(f"pub const PREFILL_{name}", "pub const MISSING"))
+
+
+def test_every_prefill_row_is_selected_by_a_shipped_artifact():
+    shipped = {(shape[0], artifact.logical) for family, shape in
+               (("dsv4f", (4096, 256)), ("v41", (5120, 384)), ("dsv4p", (7168, 384)))
+               for artifacts in PACKAGES.native_spark_artifacts(family).values()
+               for artifact in artifacts}
+    for row in LAYOUTS.layouts()["native_slices"]:
+        if not row.get("prefill"):
+            continue
+        hidden, width, sm = row["hidden"], row["width"], row["sm"]
+        assert (hidden, width) in shipped
+        experts = 256 if hidden == 4096 else 384
+        assert any(LAYOUTS.native_prefill(hidden, width, sm, capacity, experts, 6)
+                   for capacity in row["prefill"]), row
+
+
+@pytest.mark.parametrize("failure", ["duplicate_sm", "invalid_sm", "zero_work", "missing_sm",
+                                     "duplicate_hidden", "invalid_hidden", "invalid_atomic_capacity"])
+def test_native_prefill_policy_rejects_invalid_sections(failure):
+    data = LAYOUTS.layouts()
+    if failure == "duplicate_sm":
+        data["stream_prefill"][1]["sm"] = 120
+    elif failure == "invalid_sm":
+        data["stream_prefill"][1]["sm"] = 119
+    elif failure == "zero_work":
+        data["stream_prefill"][1]["min_work"] = 0
+    elif failure == "missing_sm":
+        data["stream_prefill"].pop()
+    elif failure == "duplicate_hidden":
+        data["atomic_slices"].append(dict(data["atomic_slices"][0]))
+    elif failure == "invalid_hidden":
+        data["atomic_slices"][0]["hidden"] = 7169
+    else:
+        data["atomic_slices"][0]["min_capacity"] = 80
+    with pytest.raises(ValueError):
+        LAYOUTS.validate(data)
 
 
 @pytest.mark.parametrize("failure", ["duplicate", "capacity", "empty"])

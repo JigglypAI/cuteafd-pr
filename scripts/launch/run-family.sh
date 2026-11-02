@@ -443,6 +443,14 @@ release_validate_deployment() {
     release_die "invalid deployment specification"
   fi
 }
+release_spark_worker_budget() {
+  local deployment="$1" ranks="$2"
+  jq -er --argjson ranks "$ranks" '
+    [.memory_layout.devices[] | select(.kind == "spark") | .worker_budget_bytes] |
+    select(length == $ranks and all(.[]; type == "number" and . > 0)) |
+    unique | select(length == 1) | .[0]' <<<"$deployment" ||
+    release_die "the deployment plan names no uniform Spark worker allocation ceiling"
+}
 # DeepSeek V4.1 reads shell variables after release_load_config, not get().
 _v41_allowed_keys() {
   cat <<'EOF'
@@ -897,6 +905,9 @@ case "$gateway" in on|off) api_args+=(--gateway "$gateway") ;; "") ;; *) echo "G
 launch_deepseek_v41() {
 # The release loader validates every key (run.sh --set overrides are in $config).
 release_load_config "$config"
+v41_requested_budget="$(get SPARK_DEVICE_BUDGET_BYTES)"
+v41_budget_args=()
+[[ -z "$v41_requested_budget" ]] || v41_budget_args=(--spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$v41_requested_budget")")
 # V4.1 serves its established ranges until its runtime consumes solver placement.
 attention_placement="${ATTENTION_PLACEMENT:-auto}"
 case "$attention_placement" in
@@ -1045,8 +1056,8 @@ fi
 # weights cannot fit the device budget. The floor is derived from the actual
 # budget and the resolved TP degree, not a hardcoded 20.
 # These tensor-window constants describe native weights, not compressed shards.
-if ((topology_explicit)) && [[ "$RTX_EXPERT_LAYERS" == auto ]]; then
-  remote_capacity=$((SPARK_DEVICE_BUDGET_BYTES / $(release_spark_layer_bytes "$spark_tp" "$expert_format")))
+if ((topology_explicit)) && [[ "$RTX_EXPERT_LAYERS" == auto && -n "$v41_requested_budget" ]]; then
+  remote_capacity=$((v41_requested_budget / $(release_spark_layer_bytes "$spark_tp" "$expert_format")))
   ((remote_capacity > 40)) && remote_capacity=40
   topology_min_layers=$((40 - remote_capacity))
   ((topology_min_layers < 1)) && topology_min_layers=1
@@ -1149,7 +1160,7 @@ count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_
   --coordinator-gpu-budget-gib "$profile_gib" --coordinator-weight-budget-gib "$profile_gib" \
   --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --context-tokens "$MAX_CONTEXT_TOKENS" \
   --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --host-cache-bytes "$HOST_CACHE_BYTES" \
-  --spark-budget-gib "$(python3 -c "print($SPARK_DEVICE_BUDGET_BYTES / 2**30)")")"
+  "${v41_budget_args[@]}")"
 release_validate_deployment "$count_plan" deepseek_v41
 release_admit_coordinator_gpus "$gpu_uuid_csv" "$count_plan" ${RELEASE_RECLAIM_ARGS[@]+"${RELEASE_RECLAIM_ARGS[@]}"}
 resolved_decode_lanes="$(jq -er ' .decode_lanes | select(. == 2)' <<<"$count_plan")" ||
@@ -1159,6 +1170,9 @@ if ((RELEASE_SPARK_COUNT_EXPLICIT)); then
   [[ "$selected_count" == "$SPARK_COUNT" ]] || release_die "planner changed exact Spark count $SPARK_COUNT to $selected_count"
 fi
 SPARK_COUNT="$selected_count"
+if ((SPARK_COUNT > 0)); then
+  SPARK_DEVICE_BUDGET_BYTES="$(release_spark_worker_budget "$count_plan" "$SPARK_COUNT")" || exit 1
+fi
 release_prefill_shape "$count_plan" deepseek_v41
 PREFILL_BATCH_TOKENS="$PREFILL_ROWS"
 V41_PREFILL_WAVES="$PREFILL_WAVES"
@@ -2306,11 +2320,9 @@ spark_image="$(get SPARK_EXPERT_DOCKER_INFERENCE)"
 [[ -z "$wip_slot" ]] || spark_image="$(get SPARK_EXPERT_DOCKER_DEV cuteafd-spark-expert-dev)"
 port="$(get EXPERT_PORT 19441)"
 addr="$(get ADDR 0.0.0.0:8000)"
-# Kimi K3 and Step-5 leave an unset budget to the planner, which takes the
-# family's own (the plan's spark_budget_bytes then reaches every worker).
-budget_default=107374182400
-((text_family == 0)) || budget_default=""
-budget="$(get SPARK_DEVICE_BUDGET_BYTES "$budget_default")"
+# Leave automatic weight/device budgets to the planner; an explicit ceiling
+# still applies to the full device layout and is forwarded to every worker.
+budget="$(get SPARK_DEVICE_BUDGET_BYTES)"
 spark_budget_args=()
 [[ -z "$budget" ]] || spark_budget_args=(--spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")")
 # Two coordinator GPUs (resolved above, primary first): families with a head
@@ -2859,8 +2871,9 @@ audio_encoder_hash=""
   if [[ "$(family_prefill_mode "$family")" == units-span ]]; then
     family_args+=(--prefill-span-rows "$PREFILL_SPAN_ROWS")
   fi
-  [[ -n "$budget" ]] || budget="$(jq -er '.spark_budget_bytes | select(type == "number" and . > 0)' <<<"$plan_json")" ||
-    release_die "the deployment plan names no Spark budget"
+  if ((ranks > 0)); then
+    budget="$(release_spark_worker_budget "$deployment_json" "$ranks")" || exit 1
+  fi
 # Check the admitted count's images before --restart or weight loading. The worker's
 # resident admission validates the sibling for its full 4096-row workspace even
 # when only decode requests use BF16, so this preflight requires the same coverage.

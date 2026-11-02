@@ -49,6 +49,74 @@ fn planner_timings_charge_metadata_once_and_preserve_reports() {
 }
 
 #[test]
+fn report_census_reuses_only_checkpoint_facts_across_options() {
+    let mut tensors = mimo_flash_tensors();
+    tensors.extend([
+        t("model.mtp.layers.0.enorm.weight", "BF16", &[128]),
+        t("visual.unknown.weight", "F16", &[2, 2]),
+        t("audio.unknown.weight", "F16", &[2, 2]),
+        t("unclassified.weight", "BF16", &[2]),
+    ]);
+    let dir = snapshot(mimo_flash_config(), &tensors);
+    for missing in [false, true] {
+        let make_input = || {
+            let mut checkpoint = Checkpoint::open(dir.path()).unwrap();
+            if missing {
+                checkpoint.weight_map.insert("model.mtp.layers.0.missing.weight".into(), "missing-draft.safetensors".into());
+                checkpoint.weight_map.insert("visual.missing.weight".into(), "missing-vision.safetensors".into());
+                checkpoint.missing_shards = vec!["missing-draft.safetensors".into(), "missing-vision.safetensors".into()];
+            }
+            PlanInput::from_checkpoint(checkpoint)
+        };
+        let input = make_input();
+        let mut census_address = None;
+        for (ranks, media, draft, reserve) in [
+            (4, MediaMode::Off, spec::DraftOwnership::None, 1024),
+            (0, MediaMode::Auto, spec::DraftOwnership::NativeMtp, 2048),
+            (3, MediaMode::Rtx(Some(0)), spec::DraftOwnership::None, 4096),
+            (4, MediaMode::Off, spec::DraftOwnership::NativeMtp, 1024),
+        ] {
+            let options = PlanOptions { vision: media,
+                audio: if media == MediaMode::Auto { MediaMode::Auto } else { MediaMode::Off },
+                draft_ownership: Some(draft),
+                mapped_scale_host_budget_bytes: Some(64 << 30), mapped_scale_preload_bytes: reserve,
+                layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                    host_cache_bytes: Some(0), pool_tokens: Some(4096), prefill_reserve_rows: Some(reserve),
+                    glm5_drafter_disabled: true, glmf_drafter_disabled: true, ..Default::default() }),
+                ..sparks(ranks) };
+            let expected = make_input().plan(&options).unwrap();
+            let actual = input.plan(&options).unwrap();
+            assert_eq!(serde_json::to_vec(&actual).unwrap(), serde_json::to_vec(&expected).unwrap(),
+                "missing={missing} ranks={ranks} media={media:?} draft={draft:?}");
+            assert_eq!(component(&actual, Component::Speculator).bytes == 0, !draft.uses_checkpoint());
+            assert!(!component(&actual, Component::Vision).rejections.is_empty());
+            assert_eq!(component(&actual, Component::Vision).status == Status::Disabled, media == MediaMode::Off);
+            assert_eq!(actual.unclassified, vec!["unclassified.weight"]);
+            let address = input.census.get().unwrap() as *const ReportCensus;
+            assert_eq!(*census_address.get_or_insert(address), address);
+            assert!(input.model.get().is_some() && input.modelopt.get().is_some()
+                && input.module_numerics.get().is_some());
+        }
+        // Explicit audio requires a bundled tower; a warm census must not
+        // bypass that option-dependent refusal or change its error.
+        let options = PlanOptions { audio: MediaMode::Rtx(Some(0)), ..sparks(4) };
+        assert_eq!(input.plan(&options).unwrap_err().to_string(),
+            make_input().plan(&options).unwrap_err().to_string());
+    }
+}
+
+#[test]
+fn invalid_option_does_not_initialize_checkpoint_census() {
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    assert!(input.plan(&PlanOptions { decode_lanes: Some(2), ..Default::default() }).is_err());
+    assert!(input.model.get().is_none() && input.census.get().is_none());
+    let expected = PlanInput::open(dir.path()).unwrap().plan(&sparks(4)).unwrap();
+    let actual = input.plan(&sparks(4)).unwrap();
+    assert_eq!(serde_json::to_vec(&actual).unwrap(), serde_json::to_vec(&expected).unwrap());
+}
+
+#[test]
 fn native_spark_resident_reuses_headers_without_reusing_placement_totals() {
     use crate::placement::{SparkAssignment, SparkResidentLayout, SparkWorkingSet};
     for v41 in [true, false] {
@@ -175,7 +243,7 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
     report.prefill_span_rows = Some(4096);
     report.prefill_transports = Some(3);
     report.memory_layout = Some(MemoryLayout { devices: vec![DeviceLayout {
-        kind: DeviceKind::Rtx, index: 0, capacity_bytes: 96 << 30, items: vec![], kv_tokens: 0,
+        kind: DeviceKind::Rtx, index: 0, capacity_bytes: 96 << 30, worker_budget_bytes: 0, items: vec![], kv_tokens: 0,
     }], pool_tokens: 0, waste: vec![], notes: vec![] });
     let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
         host_cache_bytes: Some(0), prefill_unit_rows: Some(4096), ..Default::default() };
@@ -3536,7 +3604,7 @@ fn formats_count_logical_weights() {
 }
 
 #[test]
-fn layout_places_every_device_and_names_padded_spark_slices() {
+fn layout_places_every_device_and_names_compact_spark_slices() {
     use crate::plan::testing::{mimo_pro_config, mimo_pro_tensors, write_snapshot};
     use cuteafd_core::memory_layout::{Category, DeviceKind};
     let dir = tempfile::tempdir().unwrap();
@@ -3558,12 +3626,12 @@ fn layout_places_every_device_and_names_padded_spark_slices() {
     assert!(layout.pool_tokens > 0 && layout.pool_tokens <= cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
     assert_eq!(layout.pool_tokens % 64, 0);
     assert!(layout.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).all(|d| d.free_bytes() >= 0));
-    // Logical K32 ranges rotate; Pro's 352-column owner retains 384 physical columns.
+    // Logical K32 ranges rotate; Pro stores each owner at its exact width.
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let model = families::mimo::MIMO_V2.open(&checkpoint).unwrap();
-    assert_eq!(report.spark_rank_share, 384. / 2048.);
+    assert_eq!(report.spark_rank_share, 352. / 2048.);
     let (projected, _) = layout::spark_slices(&report, model.as_ref(), 6, 2048 * 1024);
-    assert_eq!(projected, [384, 384, 384, 384, 320, 320].map(|width| width * 1024));
+    assert_eq!(projected, [352, 352, 352, 352, 320, 320].map(|width| width * 1024));
     let experts = |i: usize| layout.devices[2 + i].by_category()[&Category::Experts];
     let recipe = experts::spark_recipe("mimop:fp8", 2048, 6).unwrap();
     for rank in 0..6 {

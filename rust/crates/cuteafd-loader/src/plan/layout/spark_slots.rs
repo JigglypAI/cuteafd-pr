@@ -627,7 +627,7 @@ mod tests {
             }
             let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
                 prefill_lanes: 2, ..Default::default() };
-            let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 * GIB,
+            let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 * GIB, worker_budget_bytes: 108 * GIB,
                 items: vec![], kv_tokens: 0 };
             let exports = crate::plan::spark_executions::SparkBackend::for_catalog(input.expert_catalog()?)?.exports();
             for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4), (256, 3)] {
@@ -652,7 +652,7 @@ mod tests {
         let input = crate::plan::PlanInput::open(root.path())?;
         let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
             prefill_lanes: 2, ..Default::default() };
-        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 * GIB,
+        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 * GIB, worker_budget_bytes: 108 * GIB,
             items: vec![], kv_tokens: 0 };
         let exports = crate::plan::spark_executions::SparkBackend::for_catalog(input.expert_catalog()?)?.exports();
         let row = 7168 + 7168 / 32 + 6 * 8;
@@ -674,7 +674,7 @@ mod tests {
         let bytes = |extent: cuteafd_core::OwnerExtent| Ok(cuteafd_core::OwnerBytes {
             scratch: if extent.compiled == 4096 { 200 } else { 50 }, io: 0, pinned_staging: 1 });
         for residual in [0, 100, 1000] {
-            let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: GIB,
+            let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: GIB, worker_budget_bytes: GIB,
                 kv_tokens: 0, items: vec![Item::new(Category::Workspace, "expert waves", "", residual, Basis::Calibrated)] };
             charge_owners(&mut device, &executions, bytes).unwrap();
             let charged = device.items.iter().find(|item| item.group == "execution owners").unwrap().bytes;
