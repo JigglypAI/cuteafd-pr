@@ -14,6 +14,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 import pathlib
 import re
 import sys
@@ -66,9 +67,30 @@ class ContextCap(ValueError):
     pass
 
 
+def probe_token(token=None, token_file=None):
+    if token_file is not None:
+        if token is not None:
+            raise ValueError("choose one bench token source")
+        try:
+            token = pathlib.Path(token_file).read_text().strip()
+        except (OSError, UnicodeError):
+            raise ValueError("cannot read bench token file") from None
+        if not token:
+            raise ValueError("bench token file is empty")
+    elif token is None:
+        token = os.environ.get("CUTEAFD_API_KEY")
+    if token and (not token.isascii() or any(ord(c) < 33 or ord(c) == 127 for c in token)):
+        raise ValueError("invalid bench token")
+    return token
+
+
 class ProbeClient:
     def __init__(self, base: str, token: str | None, timeout: float):
-        self.url, self.token, self.timeout = base.rstrip("/") + "/v1/bench/probe", token, timeout
+        self.url, self.token, self.timeout = base.rstrip("/") + "/v1/bench/probe", probe_token(token), timeout
+
+    def redact(self, detail):
+        text = str(detail)
+        return text.replace(self.token, "[redacted]") if self.token else text
 
     def __call__(self, body: dict) -> dict:
         spec = {"cold": True, "no_speculation": True, "record_rows": 0, "top_k": 1}
@@ -81,13 +103,15 @@ class ProbeClient:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 chat = json.load(response)
         except urllib.error.HTTPError as error:
-            detail = error.read(4096).decode("utf-8", errors="replace")
+            detail = self.redact(error.read(4096).decode("utf-8", errors="replace"))
             if error.code == 400 and "prompt of " in detail and "outside 1..16384" in detail:
-                raise ContextCap(f"generation probe HTTP {error.code}: {detail}") from error
-            raise ValueError(f"generation probe HTTP {error.code}: {detail}") from error
+                raise ContextCap(f"generation probe HTTP {error.code}: {detail}") from None
+            raise ValueError(f"generation probe HTTP {error.code}: {detail}") from None
+        except urllib.error.URLError as error:
+            raise ValueError(f"generation probe transport error: {self.redact(error.reason)}") from None
         record = chat.get("probe")
         if not record or record.get("error") or not record.get("engine"):
-            detail = record.get("error") if record else "missing probe record"
+            detail = self.redact(record.get("error") if record else "missing probe record")
             raise ValueError(f"server did not honor the generation probe: {detail}")
         if not record.get("cold") or not record.get("no_speculation") or record.get("cached_tokens", 0):
             raise ValueError("generation must be cold, speculation-free")
@@ -972,7 +996,10 @@ def main(argv=None):
     p.add_argument("--api-wire-order", choices=("request", "sorted"), default="request",
                    help="JSON key order sent to the provider; 'sorted' only to reuse a verified pre-2026-10-31 cache")
     p.add_argument("--snapshot", type=pathlib.Path, help="local HF checkpoint for generation")
-    p.add_argument("--bench-token")
+    auth = p.add_mutually_exclusive_group()
+    auth.add_argument("--bench-token")
+    auth.add_argument("--bench-token-file", type=pathlib.Path,
+                      help="private bench credential file; defaults to CUTEAFD_API_KEY when neither flag is given")
     p.add_argument("--timeout", type=float, default=1800)
     p.add_argument("--template-date", help="YYYY-MM-DD (UTC) for templates that render the current date; "
                    "every cached response must carry that request date")
@@ -982,6 +1009,7 @@ def main(argv=None):
                    help="own-text recipe; v2 continues tool turns in-window and wraps trailing context")
     p.add_argument("--out", type=pathlib.Path)
     a = p.parse_args(argv)
+    a.bench_token = probe_token(a.bench_token, a.bench_token_file)
     if not a.version or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in a.version):
         p.error("version must be a safe directory name")
     if a.file_list:
