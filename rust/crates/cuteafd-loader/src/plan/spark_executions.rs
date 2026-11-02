@@ -68,6 +68,11 @@ impl SparkBackend {
         else { Self::Native }
     }
 
+    /// Native MXFP4 backends share resident-header and execution-owner censuses.
+    pub(crate) fn is_native_census(self) -> bool {
+        matches!(self, Self::Native | Self::V41)
+    }
+
     /// Compiled exports this backend can load for live capacities up to 4096.
     pub fn exports(self) -> Vec<u32> {
         match self {
@@ -111,6 +116,17 @@ pub fn admit_family(family: &str, exports: &[u32], decode_rows: Option<u32>,
 mod tests {
     use super::*;
     use cuteafd_core::{DecodeExecution, PrefillExecution};
+
+    #[test]
+    fn native_census_covers_both_native_capacity_ladders() {
+        for backend in [SparkBackend::Native, SparkBackend::V41] {
+            assert!(backend.is_native_census());
+        }
+        for backend in [SparkBackend::Fp8, SparkBackend::Exlr8,
+            SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest)] {
+            assert!(!backend.is_native_census());
+        }
+    }
 
     #[test]
     fn artifact_format_precedes_v41_native_geometry() {

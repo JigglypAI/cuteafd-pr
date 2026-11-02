@@ -202,7 +202,7 @@ pub(crate) fn owner_bytes(input: &super::super::PlanInput, working: &SparkWorkin
     let geometry = catalog.routed_experts().geometry()?;
     let backend = SparkBackend::for_catalog(catalog)?;
     let groups = native_groups(input, family, working, rank)?;
-    let artifacts = if matches!(backend, SparkBackend::Native | SparkBackend::V41) && catalog.nvfp4().is_none() {
+    let artifacts = if backend.is_native_census() && catalog.nvfp4().is_none() {
         Some(mxfp4_rank_artifacts(catalog, working, rank)?)
     } else { None };
     let coded = catalog.mxfp4_scale_codes();
