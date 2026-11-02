@@ -503,6 +503,22 @@ def test_muse_prefill_scoring_is_launch_admitted(tmp_path: Path, setting: str) -
     assert plan.split().count("--full-prefill-logits") == int(setting == "on")
 
 
+def test_muse_forwards_speculation_trace(tmp_path: Path) -> None:
+    trace = tmp_path / "trace" / "speculation-trace.jsonl"
+    result = _muse(tmp_path, f"SPECULATION_TRACE={trace}\n")
+    serve = _line(result, "cuteafd serve-muse --snapshot")
+    assert f"CUTEAFD_SPECULATION_TRACE={trace}" in serve
+    assert f"{trace.parent}:{trace.parent}" in serve
+
+
+def test_muse_trace_registration_still_rejects_unknown_keys(tmp_path: Path) -> None:
+    trace = tmp_path / "trace" / "speculation-trace.jsonl"
+    result = _muse(tmp_path, f"SPECULATION_TRACE={trace}\nSPECULATION_TRACE_TYPO=on\n")
+    assert result.returncode == 2, result.stderr
+    assert "unknown configuration key: SPECULATION_TRACE_TYPO" in result.stderr
+    assert "docker run -d" not in result.stderr
+
+
 def test_muse_forwards_typed_keys_when_set(tmp_path: Path) -> None:
     result = _muse(tmp_path, "RTX_EXPERT_LAYERS=3\nPOOL_TOKENS=1048576\nMAX_CONTEXT_TOKENS=262144\n"
                              "CONCURRENCY=8\nEXPERT_PARTIAL_BF16_MAX_ROWS=128\nEXPERT_PARTIAL_WIDE_FORMAT=fp8\n"
