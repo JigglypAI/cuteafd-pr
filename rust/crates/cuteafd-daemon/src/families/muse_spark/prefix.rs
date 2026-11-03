@@ -33,6 +33,7 @@ pub(crate) struct Placement {
     pub slot: usize,
     pub pages: Vec<u32>,
     pub len: usize,
+    pub media: Option<cuteafd_engine::media::RequestMedia>,
 }
 
 impl Placement {
@@ -44,7 +45,7 @@ impl crate::shared::qwen::scheduler::Placement for Placement {
     fn set_len(&mut self, len: usize) { self.len = len; }
     fn units(&self) -> &[u32] { &self.pages }
     fn slot(&self) -> i32 { self.slot as i32 }
-    fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
+    fn spans(&self) -> &[cuteafd_core::MediaSpan] { self.media.as_ref().map_or(&[], |media| media.spans()) }
 }
 
 /// Bytes of one mark summed over the coordinator ranks (each keeps its KV heads).
@@ -255,7 +256,7 @@ mod tests {
         for slot in 0..3 {
             let lease = reserve.lease(64, 3000, 4, Reserve::limit(&cache, &family, 1 << 20))?;
             let rows = reserve.admit(&cache, &family, &active, &stalled, &[], &lease).unwrap();
-            let placement = cache.admit_cold(&family, 64, rows, |pages| Placement { slot, pages, len: 64 })?.placement;
+            let placement = cache.admit_cold(&family, 64, rows, |pages| Placement { slot, pages, len: 64, media: None })?.placement;
             let initial_rows = placement.pages.len() * PAGE_ROWS as usize;
             active.push(Request { placement, lease, produced: 1, initial_rows });
         }

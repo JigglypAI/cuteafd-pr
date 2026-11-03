@@ -242,6 +242,7 @@ EOF
     [[ "$1" != kimi_k3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING
     [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE RTX_EXPERT_LAYERS PREFILL_BATCH_TOKENS PREFILL_WAVES FULL_PREFILL_LOGITS PREFILL_PACKING
     [[ "$1" != muse_spark ]] || printf '%s\n' RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS SPECULATION_TRACE DRAFT_KV_CACHE PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING FULL_PREFILL_LOGITS EXPERT_PARTIAL_BF16_MAX_ROWS EXPERT_PARTIAL_WIDE_FORMAT
+    [[ "$1" != muse_spark ]] || printf '%s\n' VISION_REPLICAS
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -1710,7 +1711,10 @@ esac
 # token embeddings. Kimi ships no MTP head; Step-5 defaults to native MTP
 # depth 3 (SPECULATOR=off disables it).
 text_family=0
-[[ "$family" != kimi_k3 && "$family" != step5 && "$family" != muse_spark ]] || text_family=1
+[[ "$family" != kimi_k3 && "$family" != step5 ]] || text_family=1
+# These commands own automatic context, pool and Spark budgets independently of media.
+standalone_family=$text_family
+[[ "$family" != muse_spark ]] || standalone_family=1
 if ((text_family)); then
   case "$vision:$audio" in
     auto:auto|auto:off|off:auto|off:off) vision=off; audio=off ;;
@@ -1728,7 +1732,7 @@ fi
 # set them. Qualified MiMo, GLM Flash and Qwen towers are placed Spark-first by
 # the encoder plan below; DeepSeek V4 and GLM 5.3 have no tower, so auto starts
 # none and serves text only.
-# Only snapshots shipping qualified MiMo audio opt into Spark-first auto.
+# Declared bundled audio is validated strictly by the encoder plan, not disabled here.
 release_validate_verbs_device_map
 audio="$(release_resolve_audio_mode "$audio" "$root/snapshots/$revision")"
 # Auto/spark placement is resolved by the encoder plan below.
@@ -1815,7 +1819,7 @@ if [[ -n "$wip_slot" ]]; then
 fi
 # Families with their own serve command: refuse a WIP slot whose binary
 # predates it before planning or touching any service.
-if ((text_family)) && [[ -n "$wip_slot" ]]; then
+if ((standalone_family)) && [[ -n "$wip_slot" ]]; then
   docker run --rm --network none --mount "type=bind,src=$wip_layout/bin/cuteafd,dst=/opt/cuteafd-serve-probe,readonly" \
     --entrypoint /opt/cuteafd-serve-probe "$coordinator_image" "$serve" --help >/dev/null ||
     release_die "WIP slot $wip_slot has no '$serve' command; build the slot from a commit that serves $family"
@@ -1992,7 +1996,7 @@ if [[ "$family" == mimo_v2 ]]; then
 fi
 case "$embedding" in host|gpu) ;; *) echo "EMBEDDING must be host or gpu" >&2; exit 2 ;; esac
 [[ "$family" != qwen3_5 || "$embedding" == gpu ]] || release_die "dense Qwen requires device token embedding"
-((text_family == 0)) || [[ "$embedding" == gpu ]] || release_die "$family serves GPU token embeddings only (EMBEDDING=gpu)"
+((standalone_family == 0)) || [[ "$embedding" == gpu ]] || release_die "$family serves GPU token embeddings only (EMBEDDING=gpu)"
 decode_lanes="$(get DECODE_LANES)"
 if [[ -n "$decode_lanes" ]]; then
   [[ "$decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
@@ -2223,7 +2227,7 @@ if [[ "$family" == step5 ]]; then
     release_die "Step-5 RTX_EXPERT_LAYERS is auto, all or a fixed routed-layer count, not $local_layers"
   [[ "$local_layers" == auto ]] || family_args+=(--rtx-expert-layers "$local_layers")
 fi
-if ((text_family)); then
+if ((standalone_family)); then
   pool="$(get POOL_TOKENS auto)"
   [[ "$pool" == auto ]] || family_args+=(--pool-tokens "$pool")
 fi
@@ -2927,9 +2931,9 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
     fi
   done
 fi
-if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash ) && "$vision" != off ]] &&
+if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash || "$family" == muse_spark ) && "$vision" != off ]] &&
    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; } ||
-   [[ "$family" == mimo_v2 && "$audio" != off ]]; then
+   [[ "$audio" != off ]]; then
   selected="$(python3 -c '
 import json,sys
 p=json.load(sys.stdin); e=p.get("encoder")
@@ -3138,13 +3142,19 @@ if ((${#audio_encoder_ranks[@]})); then
     host="$(get "SPARK_${audio_rank}_HOST")"
     backend="$(ssh "$host" "docker logs cuteafd-spark-expert-$host-$port 2>&1" | python3 -c '
 import re,sys
-matches=re.findall(r"mimo_audio_fp32_v1/cuda[0-9]+/cufft[0-9]+/cublas[0-9.]+/cute_aot_sm121/export[0-9a-f]{64}",sys.stdin.read())
+matches=[backend for line in sys.stdin if "audio encoder ready" in line
+    for backend in re.findall(r"\bbackend=\"?([^\s\"]+)", line)]
 assert matches and len(set(matches))==1, "missing or conflicting ready audio backend identity"
 print(matches[0])')"
     [[ -z "$audio_backend" || "$audio_backend" == "$backend" ]] || release_die "audio replicas have different backend exports"
     audio_backend="$backend"
   done
-  family_args+=(--audio-encoder-backend "$audio_backend")
+  # RVQ backends identify architecture-specific exports; PCM has a fixed protocol identity.
+  if [[ "$family" == mimo_v2 ]]; then
+    family_args+=(--audio-encoder-backend "$audio_backend")
+  else
+    [[ "$audio_backend" == pcm-bf16-aot-v1 ]] || release_die "unexpected PCM audio backend: $audio_backend"
+  fi
 fi
 peer_csv="$(IFS=,; echo "${peers[*]}")"
 peer_args=()
@@ -3163,7 +3173,7 @@ release_coordinator_device_args "${coordinator_uuids[@]}"
 context_args=(--max-context "$(get MAX_CONTEXT_TOKENS "$default_context")")
 [[ "$family" != qwen3_5 ]] || context_args=()
 # Kimi K3 and Step-5: unset keeps the serve command's own context extent.
-((text_family == 0)) || [[ -n "$(get MAX_CONTEXT_TOKENS)" ]] || context_args=()
+((standalone_family == 0)) || [[ -n "$(get MAX_CONTEXT_TOKENS)" ]] || context_args=()
 docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart no "${RELEASE_COORDINATOR_DEVICE_ARGS[@]}" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info "${shared_env_args[@]:0:4}" \

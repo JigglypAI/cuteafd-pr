@@ -32,6 +32,16 @@ pub(crate) fn embed(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &supe
     })
 }
 
+/// Replace media rows after the weightless text norm on every participating rank.
+pub(crate) fn inject_media(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super::lane::LaneViews,
+    media: &cuteafd_engine::media::MediaChunk, rows: usize, stream: *mut c_void) -> Result<()> {
+    if media.indices.is_empty() { return Ok(()); }
+    // inject_host drains these admitted scratch planes before later layer work reuses them.
+    rank.device.run(|| Ok(rank.device.library.embedding_injection()?.inject_host(
+        &media.features, &media.indices, lane.plane("residual")?, lane.plane("token_ids")?,
+        lane.rows("hidden", rows)?, rows, cfg.hidden, 1, stream)?))
+}
+
 /// The head over `rows` (a contiguous range of the step's rows) on the head rank.
 pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super::lane::LaneViews,
     rows: std::ops::Range<usize>, stream: *mut c_void) -> Result<Buffer> {
@@ -67,7 +77,8 @@ pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super
 /// `experts` is rank 0's Spark path; `peers[r]` rank r's exchange end on a pair.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn step(cfg: &MuseSparkConfig, ranks: &[RankResources<'_>], streams: &[*mut c_void],
-    table: &crate::shared::token_io::TokenEmbedding<'_>, tokens: &[u32], meta: &StepMetadata, prefill: bool,
+    table: &crate::shared::token_io::TokenEmbedding<'_>, tokens: &[u32], media: &cuteafd_engine::media::MediaChunk,
+    meta: &StepMetadata, prefill: bool,
     wave: super::experts::WaveStep,
     experts: &mut dyn SparkExperts, mut peers: Vec<&mut dyn PeerExchange>,
     local: &mut [super::onboard::OnboardedExperts<'_>], draft: Option<&super::draft::MuseDraft<'_>>,
@@ -79,7 +90,10 @@ pub(crate) fn step(cfg: &MuseSparkConfig, ranks: &[RankResources<'_>], streams: 
         let bank = if prefill { 0 } else { rank.step.tables.decode_bank() };
         rank.device.run(|| rank.step.upload(rank.device.library, bank, meta, prefill, wave.clone(), stream))
     }).collect::<Result<_>>()?;
-    for (rank, &stream) in ranks.iter().zip(streams) { embed(cfg, rank, &rank.lane.views, table, tokens, stream)?; }
+    for (rank, &stream) in ranks.iter().zip(streams) {
+        embed(cfg, rank, &rank.lane.views, table, tokens, stream)?;
+        inject_media(cfg, rank, &rank.lane.views, media, tokens.len(), stream)?;
+    }
     let mut experts = Some(experts);
     for layer in 0..cfg.layers {
         for (index, (rank, &stream)) in ranks.iter().zip(streams).enumerate() {

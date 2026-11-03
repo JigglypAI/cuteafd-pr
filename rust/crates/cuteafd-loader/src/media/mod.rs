@@ -1,10 +1,30 @@
 //! CPU media preparation. V4.1 deliberately keeps its original processor and identity.
 pub mod audio;
 pub mod audio_tower;
+pub mod pcm_audio;
 mod decode;
 mod exif;
+mod muse;
+pub mod muse_vision;
 mod resize;
 mod spans;
+
+/// Bundled audio execution selected by the checkpoint's declaration, not its LM family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioTowerKind { MimoRvq, MusePcm }
+impl AudioTowerKind {
+    pub fn from_config(config: &serde_json::Value) -> std::result::Result<Option<Self>, String> {
+        let Some(audio) = config.get("audio_config").filter(|value| !value.is_null()) else { return Ok(None) };
+        if !audio.is_object() { return Err("audio_config must be an object".into()); }
+        match audio.get("model_type") {
+            Some(kind) if kind == "muse_spark_audio" => Ok(Some(Self::MusePcm)),
+            Some(kind) => Err(format!("unsupported bundled audio_config.model_type {kind}; add a tower exporter/kernel")),
+            None if config["model_type"] == "mimo_v2" => Ok(Some(Self::MimoRvq)),
+            None => Err(format!("unsupported bundled audio_config without model_type for root {}; add a tower exporter/kernel",
+                config["model_type"])),
+        }
+    }
+}
 
 pub use cuteafd_core::{ImageKey, MediaSpan};
 pub use decode::{decode, decode_bounded, AlphaPolicy, DecodePolicy};
@@ -84,6 +104,7 @@ pub enum ImageFamily {
     Mimo,
     Qwen,
     GlmFlash,
+    Muse,
 }
 /// Reference processor parameters; all identity-affecting choices live here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -118,9 +139,10 @@ impl ProcessorConfig {
             ImageFamily::Mimo => (16, 3136, 12_845_056, CLIP_MEAN, CLIP_STD),
             ImageFamily::Qwen => (16, 65_536, 16_777_216, [0.5; 3], [0.5; 3]),
             ImageFamily::GlmFlash => (14, 16, 8000, CLIP_MEAN, CLIP_STD),
+            ImageFamily::Muse => (14, 1, 4096, [0.5; 3], [0.5; 3]),
         };
         Self {
-            resample: Resample::Bicubic,
+            resample: if family == ImageFamily::Muse { Resample::Lanczos } else { Resample::Bicubic },
             family,
             patch,
             merge: 2,
@@ -138,7 +160,7 @@ impl ProcessorConfig {
     pub fn from_snapshot(snapshot: &Path, family: ImageFamily) -> Result<Self> {
         // GLM's standard HF snapshot embeds image/video processors in this file.
         // MiMo/Qwen keep their existing AutoProcessor precedence unchanged.
-        let file = if family == ImageFamily::GlmFlash {
+        let file = if matches!(family, ImageFamily::GlmFlash | ImageFamily::Muse) {
             "processor_config.json"
         } else {
             "preprocessor_config.json"
@@ -147,7 +169,7 @@ impl ProcessorConfig {
             .map_err(|e| MediaError::Config(e.to_string()))?;
         let document: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|e| MediaError::Config(e.to_string()))?;
-        let value = if family == ImageFamily::GlmFlash {
+        let value = if matches!(family, ImageFamily::GlmFlash | ImageFamily::Muse) {
             document.get("image_processor").filter(|v| v.is_object()).ok_or_else(|| {
                 MediaError::Config("processor_config.json requires image_processor object".into())
             })?
@@ -178,7 +200,7 @@ impl ProcessorConfig {
                     .map_err(|e| MediaError::Config(format!("{name}: {e}")))?;
             }
         }
-        let (min_name, max_name) = if family == ImageFamily::GlmFlash {
+        let (min_name, max_name) = if matches!(family, ImageFamily::GlmFlash | ImageFamily::Muse) {
             ("min_image_tokens", "max_image_tokens")
         } else {
             ("min_pixels", "max_pixels")
@@ -188,7 +210,7 @@ impl ProcessorConfig {
             (max_name, "longest_edge", &mut config.max_pixels),
         ] {
             let v = value.get(name).or_else(|| {
-                if family == ImageFamily::GlmFlash {
+                if matches!(family, ImageFamily::GlmFlash | ImageFamily::Muse) {
                     None
                 } else {
                     value.get("size").and_then(|s| s.get(size_name))
@@ -206,6 +228,22 @@ impl ProcessorConfig {
                 Some(1) => Resample::Lanczos,
                 _ => return Err(MediaError::Config("unsupported Pillow resampler".into())),
             };
+        }
+        if family == ImageFamily::Muse {
+            config.max_image_tokens = usize::try_from(config.max_pixels)
+                .map_err(|_| MediaError::Config("Muse image token budget overflow".into()))?;
+            for name in ["do_convert_rgb", "do_normalize", "do_rescale", "do_resize"] {
+                if value.get(name).is_some_and(|v| v.as_bool() != Some(true)) {
+                    return Err(MediaError::Config(format!("Muse requires {name}=true")));
+                }
+            }
+            if value.get("rescale_factor").is_some_and(|v| v.as_f64() != Some(1.0 / 255.0)) {
+                return Err(MediaError::Config("Muse requires rescale_factor=1/255".into()));
+            }
+            if config.patch != 14 || config.merge != 2 || config.temporal != 2
+                || config.max_image_tokens > 4096 {
+                return Err(MediaError::Config("unsupported Muse processor geometry or token cap".into()));
+            }
         }
         config.validate()?;
         Ok(config)
@@ -245,7 +283,7 @@ impl ProcessorConfig {
     fn effective_max(&self) -> u64 {
         let cap = self.max_image_tokens as u64;
         self.max_pixels
-            .min(if self.family == ImageFamily::GlmFlash {
+            .min(if matches!(self.family, ImageFamily::GlmFlash | ImageFamily::Muse) {
                 cap
             } else {
                 cap * u64::from(self.patch * self.merge).pow(2)
@@ -268,7 +306,10 @@ impl ProcessorConfig {
             ));
         }
         let factor = self.patch * self.merge;
-        if self.family == ImageFamily::GlmFlash {
+        if self.family == ImageFamily::Muse {
+            muse::resize_shape(height, width, factor, self.effective_max() as u32)
+                .ok_or_else(|| invalid("Muse resize dimensions overflow"))
+        } else if self.family == ImageFamily::GlmFlash {
             glm_resize(height, width, factor, self.min_pixels, self.effective_max())
         } else {
             qwen_resize(height, width, factor, self.min_pixels, self.effective_max())
@@ -425,6 +466,26 @@ impl PreparedImage {
             })
         });
         let mut out = Vec::with_capacity(gh * gw * 3 * t * p * p);
+        if config.family == ImageFamily::Muse {
+            // Muse patch rows are raster ordered, with temporal then channel
+            // inside each patch; spatial merging happens after the encoder.
+            for row in 0..gh {
+                for column in 0..gw {
+                    for _ in 0..t {
+                        for (channel, table) in lut.iter().enumerate() {
+                            for py in 0..p {
+                                for px in 0..p {
+                                    let y = row * p + py;
+                                    let x = column * p + px;
+                                    out.push(table[self.rgb8[(y * gw * p + x) * 3 + channel] as usize]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(out);
+        }
         for bh in 0..gh / m {
             for bw in 0..gw / m {
                 for mh in 0..m {

@@ -30,6 +30,7 @@ pub(crate) struct PrefillCall<'c> {
     pub ring_rows: usize,
     pub slots: usize,
     pub logit_rows: usize,
+    pub media: Option<&'c cuteafd_engine::media::RequestMedia>,
 }
 
 /// Head microbatches within a unit, paired with their output-suffix row offset.
@@ -139,6 +140,11 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
         let meta = StepMetadata::build(&[sequence], self.call.ring_rows, self.call.slots, self.ranks[0].lane.views.rows, true)?;
         let wave = WaveStep { segments: vec![WaveSegment { request: self.call.request, rows }],
             kind: cuteafd_transport::ExpertV2SourceKind::Prefill };
+        let mut media = cuteafd_engine::media::MediaChunk::default();
+        if let Some(request) = self.call.media {
+            let start = self.call.start + unit.rows.start;
+            request.write_chunk(start, start + rows, &mut media)?;
+        }
         let mut lanes = Vec::new();
         let mut planes = Vec::new();
         for (index, rank) in self.ranks.iter().enumerate() {
@@ -146,6 +152,7 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
             let stream = self.streams[index];
             planes.push(rank.device.run(|| rank.step.upload(rank.device.library, unit.slot, &meta, true, wave.clone(), stream))?);
             super::forward::embed(self.cfg, rank, &lane, self.table, tokens, stream)?;
+            super::forward::inject_media(self.cfg, rank, &lane, &media, rows, stream)?;
             lanes.push(lane);
         }
         self.units[unit.index] = Some(UnitState { lanes, planes, wave: None });
