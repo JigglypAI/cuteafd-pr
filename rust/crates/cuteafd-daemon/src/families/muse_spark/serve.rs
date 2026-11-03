@@ -420,11 +420,13 @@ mod tests {
     #[test]
     fn scheduler_and_embedding_keep_their_rank_device_scopes() {
         let serve = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
-        assert!(serve.contains("ranks.last().context(\"Muse scheduler head rank\")?.device\n        .run(|| run(&backend, sequences))"));
-        let forward = include_str!("forward.rs").split("pub(crate) fn head(").next().unwrap();
+        assert!(serve.contains("ranks.last().context(\"Muse scheduler head rank\")?.device\n        .run(|| run(&backend, sequences, media))"));
+        let forward = include_str!("forward.rs").split("pub(crate) fn inject_media(").next().unwrap();
         let body = forward.split("rank.device.run(|| {").nth(1).unwrap();
         assert!(body.find("table.embed(").unwrap() < body.find(".norm(0, \"embed_norm\"").unwrap());
-        assert!(body.split("/// The head").next().unwrap().trim_end().ends_with("})\n}"));
+        assert!(body.split("/// Replace media rows").next().unwrap().trim_end().ends_with("})\n}"));
+        let step = include_str!("forward.rs").split("pub(crate) fn step(").nth(1).unwrap();
+        assert!(step.find("embed(cfg,").unwrap() < step.find("inject_media(cfg,").unwrap());
     }
 
     #[test]
@@ -446,7 +448,7 @@ mod tests {
             ensure!(library.cuda_get_device()? == 1, "Muse scheduler must enter head device 1");
             let (family, mut pool) = backend.prefix_cache(&args.prefix, 1)?;
             let mut request = pool.admit_cold(&family, 1, 2,
-                |pages| super::super::prefix::Placement { pages, slot: 0, len: 0 })?.placement;
+                |pages| super::super::prefix::Placement { pages, slot: 0, len: 0, media: None })?.placement;
             let logits = backend.prefill_device(&mut request, &[1], 1, pool.pool())?
                 .context("TP2 one-token forward returned no logits")?;
             // Deliberately select and download from the other device. The shared
@@ -501,7 +503,7 @@ mod tests {
         with_backend(&args, |backend, _, _| {
             let (family, mut pool) = backend.prefix_cache(&args.prefix, 1)?;
             let mut request = pool.admit_cold(&family, count, count + 1,
-                |pages| super::super::prefix::Placement { pages, slot: 0, len: 0 })?.placement;
+                |pages| super::super::prefix::Placement { pages, slot: 0, len: 0, media: None })?.placement;
             if scored_split {
                 // Match score_plan: the final token is a target, not a prefill input.
                 backend.prefill_device(&mut request, &tokens[..1], 1, pool.pool())?;

@@ -140,7 +140,7 @@ fn candidates(request: &EncoderRequest, hardware: &EncoderHardware) -> Vec<Encod
         weights: request.weights, kind, replicas, reason: reason.into(), shortfall: 0,
     };
     if matches!(request.mode, MediaMode::Auto | MediaMode::Spark(_)) {
-        let required = request.weights.saturating_add(request.scratch).saturating_add(GIB)
+        let required = request.weights.saturating_add(request.scratch)
             .saturating_add(if hardware.v41 { V41_SPARK_CUDA_OVERHEAD_BYTES } else { 0 });
         let mut ranks = hardware.sparks.iter().filter(|spark| spark.free_bytes >= required).collect::<Vec<_>>();
         ranks.sort_by_key(|s| (!s.idle, s.expert_bytes, std::cmp::Reverse(s.free_bytes), s.rank));
@@ -156,7 +156,7 @@ fn candidates(request: &EncoderRequest, hardware: &EncoderHardware) -> Vec<Encod
             let selected = ranks.iter().enumerate().filter(|(i, _)| mask & (1 << i) != 0)
                 .map(|(_, s)| s.rank).collect::<Vec<_>>();
             result.push(make(EncoderKind::Spark { rank: selected[0] }, selected[1..].to_vec(),
-                "Spark: lightest expert slice, then most free memory; tower + scratch + 1 GiB admitted"));
+                "Spark: lightest expert slice, then most free memory; exact tower + scratch ledger admitted"));
         }
     }
     if matches!(request.mode, MediaMode::Auto | MediaMode::Rtx(_)) {
@@ -329,6 +329,22 @@ mod tests {
     }
 
     #[test]
+    fn native_spark_trials_use_exact_ledger_at_capacity_boundary() {
+        let mut hardware = hw(0, 1, 0);
+        let requests = [EncoderRequest { mode: MediaMode::Spark(None), weights: 5, scratch: 2, copies: 1 }];
+        hardware.sparks[0].free_bytes = 7;
+        let (selected, ()) = admit_encoders(&requests, &hardware, |selected| {
+            assert_eq!(selected[0].admitted_bytes(), 7);
+            Ok(())
+        }).unwrap();
+        assert_eq!(selected[0].kind, EncoderKind::Spark { rank: 0 });
+        hardware.sparks[0].free_bytes = 6;
+        let mut calls = 0;
+        assert!(admit_encoders(&requests, &hardware, |_| { calls += 1; Ok(()) }).is_err());
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
     fn mixed_trials_charge_prior_modality_once_and_backtrack_without_panicking() {
         let mut hardware = hw(1, 2, 96);
         for spark in &mut hardware.sparks { spark.free_bytes = 6 * GIB; spark.expert_bytes = 0; }
@@ -336,6 +352,8 @@ mod tests {
             EncoderRequest { mode: MediaMode::Auto, weights: 2 * GIB, scratch: GIB, copies: 1 }];
         let (selected, ()) = admit_encoders(&requests, &hardware, |selected| {
             anyhow::ensure!(selected[0].kind == EncoderKind::Spark { rank: 1 }, "retry first tower");
+            anyhow::ensure!(selected[1].kind == EncoderKind::Spark { rank: 0 },
+                "complete worker solve requires expert room beside both towers");
             Ok(())
         }).unwrap();
         assert_eq!(selected[0].kind, EncoderKind::Spark { rank: 1 });

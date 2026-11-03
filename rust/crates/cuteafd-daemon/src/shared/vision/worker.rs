@@ -149,7 +149,7 @@ fn bundled_audio_reservation(geometry: cuteafd_core::media::AudioTokenGeometry, 
     }
 }
 
-/// Returns weights/scratch plus the Spark guard to charge before experts load.
+/// Returns the native ledger plus any geometry-specific guard before experts load.
 pub fn start_audio(config: &AudioWorkerConfig, snapshot: &Path, library: PathBuf, budget: u64) -> Result<(EncoderServer, u64)> {
     let spec = super::audio::BundledAudioSpec::from_snapshot(snapshot, cuteafd_loader::media::audio::MAX_CLIP_SAMPLES)?;
     let sm = architecture(&library)?;
