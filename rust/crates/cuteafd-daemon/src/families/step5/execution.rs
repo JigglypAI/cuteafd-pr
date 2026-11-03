@@ -477,11 +477,16 @@ impl<'a> LoadedNative<'a> {
     /// Loads the solver's onboarded routed layers whole on `device` (the entry
     /// GPU) from the installed `rtx-tp1` package, inside `budget` bytes.
     pub(super) fn with_onboarded(mut self, device: Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
-        package: &std::path::Path, layers: &[usize], rows: usize, budget: usize) -> Result<Self> {
+        package: &std::path::Path, layers: &[usize], rows: usize, budget: usize,
+        pushed: Option<crate::shared::experts::rtx::push::PushedExperts<'a>>) -> Result<Self> {
         if layers.is_empty() { return Ok(self); }
         use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
-        let weights = Exl3Tp2::load_whole_weights(device, catalog, package, layers.to_vec(), rows, budget,
-            RtxSelectionPolicy::CanonicalDecode)?;
+        let weights = match pushed {
+            Some(pushed) => Exl3Tp2::pushed_whole_weights(device, catalog, package, layers.to_vec(), rows,
+                budget, RtxSelectionPolicy::CanonicalDecode, pushed.exl3()?)?,
+            None => Exl3Tp2::load_whole_weights(device, catalog, package, layers.to_vec(), rows, budget,
+                RtxSelectionPolicy::CanonicalDecode)?,
+        };
         self.0.onboarded = Some(RefCell::new(weights.execution()?));
         tracing::info!(layers = layers.len(), "Step-5 EXL3 routed layers onboarded on the entry RTX");
         Ok(self)
@@ -491,15 +496,25 @@ impl<'a> LoadedNative<'a> {
     /// from the installed TP2 package (EXL3 `rtx-tp2`, or fp8moe `tp2`),
     /// inside each rank's TP2 arena peak.
     pub(super) fn with_onboarded_tp2(mut self, devices: [Device<'a>; 2], catalog: &cuteafd_loader::OfficialV41Catalog,
-        package: &std::path::Path, layers: &[usize], rows: usize, budgets: [usize; 2]) -> Result<Self> {
+        package: &std::path::Path, layers: &[usize], rows: usize, budgets: [usize; 2],
+        pushed: Option<[crate::shared::experts::rtx::push::PushedExperts<'a>; 2]>) -> Result<Self> {
         if layers.is_empty() { return Ok(self); }
         use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2, RtxSelectionPolicy, Tp2Weights};
         self.0.onboarded_tp2 = Some(if catalog.exl3().is_some() {
-            Tp2Weights::Exl3(Exl3Tp2::load_pair_weights(devices, catalog, cuteafd_core::ExpertGeometry::STEP5,
-                [package, package], layers.to_vec(), rows, budgets, RtxSelectionPolicy::CanonicalDecode)?)
+            Tp2Weights::Exl3(match pushed {
+                Some([first, second]) => Exl3Tp2::pushed_pair_weights(devices, catalog, cuteafd_core::ExpertGeometry::STEP5,
+                    [package, package], layers.to_vec(), rows, budgets, RtxSelectionPolicy::CanonicalDecode,
+                    [first.exl3()?, second.exl3()?])?,
+                None => Exl3Tp2::load_pair_weights(devices, catalog, cuteafd_core::ExpertGeometry::STEP5,
+                    [package, package], layers.to_vec(), rows, budgets, RtxSelectionPolicy::CanonicalDecode)?,
+            })
         } else {
-            Tp2Weights::Fp8(Fp8MoeTp2::load_pair(devices, catalog.fp8().context("Step-5 FP8 expert tensors")?,
-                package, layers.to_vec(), rows, budgets)?)
+            let tensors = catalog.fp8().context("Step-5 FP8 expert tensors")?;
+            Tp2Weights::Fp8(match pushed {
+                Some([first, second]) => Fp8MoeTp2::pushed_pair(devices, tensors, package, layers.to_vec(), rows,
+                    budgets, [first.fp8()?, second.fp8()?])?,
+                None => Fp8MoeTp2::load_pair(devices, tensors, package, layers.to_vec(), rows, budgets)?,
+            })
         });
         tracing::info!(layers = layers.len(), "Step-5 routed layers onboarded TP2 over both RTX");
         Ok(self)
