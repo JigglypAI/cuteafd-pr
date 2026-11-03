@@ -31,6 +31,13 @@ pub(crate) fn slot_sizes(hidden: usize, expert: usize, topk: usize, rows: usize,
     Ok(sizes)
 }
 
+/// Largest single decode/verify push, not the sum of receive slots.
+pub(crate) fn decode_peer_bytes(hidden: usize, expert: usize, topk: usize, onboarded: bool) -> Result<usize> {
+    Ok(slot_sizes(hidden, expert, topk,
+        cuteafd_loader::families::muse_spark::lane::HEAD_ROWS, onboarded)?
+        .into_iter().max().context("Muse TP2 decode channels")?)
+}
+
 /// The pair's exchange (both ends); each rank uses it through [`RankEnd`].
 pub(crate) struct MusePeer<'a> {
     exchange: PeerExchange<'a>,
@@ -41,10 +48,10 @@ pub(crate) struct MusePeer<'a> {
 }
 
 impl<'a> MusePeer<'a> {
-    pub(crate) fn new(library: &'a NativeLibrary, ranks: [RankDevice; 2], sizes: Vec<usize>) -> Result<Self> {
+    pub(crate) fn new(library: &'a NativeLibrary, ranks: [RankDevice; 2], sizes: Vec<usize>, decode_bytes: usize) -> Result<Self> {
         ensure!(sizes.len() == Channel::ALL.iter().map(|&c| receive_slots(c)).sum::<usize>(),
             "Muse TP2 needs every channel's slots");
-        let exchange = PeerExchange::new_abortable_sized(library, ranks, &sizes)?;
+        let exchange = PeerExchange::new_abortable_sized(library, ranks, &sizes, decode_bytes)?;
         Ok(Self { exchange, sizes, sent: Default::default(), received: Default::default() })
     }
 
@@ -106,6 +113,23 @@ impl RankExchange for RankEnd<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_decode_extent_is_largest_single_transfer() -> Result<()> {
+        use cuteafd_loader::families::muse_spark::lane::HEAD_ROWS;
+        for (hidden, expert, topk) in [(8192, 4096, 8), (4096, 2048, 2)] {
+            for onboarded in [false, true] {
+                let core = HEAD_ROWS * hidden * 4;
+                let half = HEAD_ROWS * expert;
+                let partials = if onboarded { HEAD_ROWS * topk * expert * 2 } else { 16 };
+                let actual = [core, half, partials, half, core].into_iter().max().unwrap();
+                assert_eq!(decode_peer_bytes(hidden, expert, topk, onboarded)?, actual);
+                assert!(crate::shared::memory::device::sm_peer_copy_for(true, actual, actual));
+                assert!(!crate::shared::memory::device::sm_peer_copy_for(true, actual + 16, actual));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn channel_slots_sized_by_their_payload() -> Result<()> {

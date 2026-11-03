@@ -200,7 +200,8 @@ impl<'r, 'a: 'r> MuseEngine<'r, 'a> {
         let peer = (ranks.len() == 2).then(|| -> Result<super::peer::MusePeer<'a>> {
             let sizes = super::peer::slot_sizes(cfg.hidden, cfg.expert_hidden, cfg.topk, link.unit_rows, onboarded)?;
             super::peer::MusePeer::new(ranks[0].device.library, [0, 1].map(|rank|
-                crate::shared::peer_split::RankDevice { device: ranks[rank].device.id, stream: streams[rank].raw }), sizes)
+                crate::shared::peer_split::RankDevice { device: ranks[rank].device.id, stream: streams[rank].raw }), sizes,
+                super::peer::decode_peer_bytes(cfg.hidden, cfg.expert_hidden, cfg.topk, onboarded)?)
         }).transpose()?;
         let world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
         let config = cuteafd_transport::TcpTransportConfig { max_frame_bytes: link.spark.max_frame_bytes,
@@ -250,6 +251,9 @@ pub(crate) fn shutdown(experts: &mut dyn super::experts::SparkExperts,
         || experts.borrow_mut().release_payloads(),
     );
     if let Some(peer) = peer { peer.exchange().finish_terminal(result.is_ok()); }
+    if result.is_ok() {
+        tracing::info!("Muse engine drained: links quiesced, compute drained, payloads released, peer down");
+    }
     result
 }
 
