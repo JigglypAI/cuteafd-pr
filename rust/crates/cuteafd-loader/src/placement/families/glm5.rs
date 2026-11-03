@@ -2161,21 +2161,34 @@ mod tests {
                 context, (placed.pool_tokens as usize).div_ceil(PAGE_ROWS as usize), &owners, cfg.first_moe_layer).unwrap();
             // Derive pool capacity from the calibrated graph cost and the other
             // ledger charges, rather than baking one calibration's token count in.
-            let graph_bytes = (2 * cfg.layers + cfg.first_moe_layer) as u64 * startup.keys.len() as u64
-                * crate::placement::inventory::GLM_OWNED_SM120_GRAPH_BYTES;
-            let graph_reserve = graph_bytes + (graph_bytes.div_ceil(10)).max(64 << 20);
             let expected_pool = requested_pool.unwrap_or_else(|| {
-                let units = (0..2).map(|rank| {
-                    let fixed: u64 = placed.items[rank].iter()
-                        .filter(|item| !matches!(item.group.as_str(), "graphs" | "graph growth" | "records"))
-                        .map(|item| item.bytes).sum();
-                    let available = GpuBudget { capacity_bytes: i.gpus[rank].0,
-                        headroom_bytes: i.headroom_bytes, baseline: i.gpus[rank].1 }.available();
-                    let per_unit = placed.pool_limits.0[rank].demands.iter()
-                        .map(|demand| demand.bytes_per_unit).sum::<u64>();
-                    (available - fixed - graph_reserve) / per_unit
-                }).min().unwrap();
-                (units * PAGE_ROWS).min(request(&i).unwrap().pool.ceiling)
+                let capacity = |graph_reserve| {
+                    let units = (0..2).map(|rank| {
+                        let fixed: u64 = placed.items[rank].iter()
+                            .filter(|item| !matches!(item.group.as_str(), "graphs" | "graph growth" | "records"))
+                            .map(|item| item.bytes).sum();
+                        let available = GpuBudget { capacity_bytes: i.gpus[rank].0,
+                            headroom_bytes: i.headroom_bytes, baseline: i.gpus[rank].1 }.available();
+                        let per_unit = placed.pool_limits.0[rank].demands.iter()
+                            .map(|demand| demand.bytes_per_unit).sum::<u64>();
+                        (available - fixed - graph_reserve) / per_unit
+                    }).min().unwrap();
+                    (units * PAGE_ROWS).min(request(&i).unwrap().pool.ceiling)
+                };
+                let mut candidate = capacity(0);
+                loop {
+                    let context = crate::serving_capacity::pool_context(i.max_context as usize,
+                        i.automatic_context, candidate as usize, 256).unwrap();
+                    let shapes = crate::serving_capacity::glm_graphs::glm_graph_shapes(
+                        context, (candidate as usize).div_ceil(PAGE_ROWS as usize));
+                    let bytes = (2 * cfg.layers + cfg.first_moe_layer) as u64 * shapes.len() as u64
+                        * crate::placement::inventory::GLM_OWNED_SM120_GRAPH_BYTES;
+                    // Admission descends: crossing a shape boundary does not
+                    // reclaim capacity discarded by an earlier, wider census.
+                    let next = capacity(bytes + bytes.div_ceil(10).max(64 << 20)).min(candidate);
+                    if next == candidate { break candidate; }
+                    candidate = next;
+                }
             });
             assert_eq!(placed.pool_tokens, expected_pool);
             for rank in 0..2 {
