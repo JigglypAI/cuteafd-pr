@@ -385,8 +385,8 @@ fn cache_exact_with(client: &Client, info: &ServerInfo, check: &mut Check, fixtu
     let mut ids = turn.prompt_ids.clone();
     ids.extend(&turn.generated[..turn.generated.len().saturating_sub(1)]);
     // The turn's own generated ids are the prompt, so it is not comparable between arms.
-    let again = request(body("cache probe", 2),
-        ProbeSpec { prompt_ids: Some(ids), output_dependent: true, media: turn.media.clone(), audio: turn.audio.clone(), ..rows(2) })?;
+    let (again_body, again_spec) = cache_replay(client, ids, &turn, fixture, rows(2))?;
+    let again = request(again_body, again_spec)?;
     let cold = request(body(&turn_text, 1), ProbeSpec { cold: true, ..rows(1) })?;
     if let Some(fixture) = fixture {
         for record in [&restored, &reference, &again, &cold] { cache_bound(record, fixture)?; }
@@ -406,6 +406,26 @@ fn cache_exact_with(client: &Client, info: &ServerInfo, check: &mut Check, fixtu
     check.status = verdict.status();
     check.summary = verdict.summary();
     Ok(())
+}
+
+/// Responses strip image URLs and may carry response-only input_key. Restore the
+/// verified source from our original fixture, in the spec only (never duplicated in chat).
+fn cache_replay(client: &Client, ids: Vec<u32>, turn: &ProbeRecord, fixture: Option<&Value>, mut spec: ProbeSpec)
+    -> Result<(Value, ProbeSpec)> {
+    spec.prompt_ids = Some(ids);
+    spec.output_dependent = true;
+    spec.media = turn.media.clone();
+    spec.audio = turn.audio.clone();
+    let mut body = cache_body(client, "cache probe", 2, fixture);
+    if let Some(fixture) = fixture.filter(|f| f["type"] == "image_url") {
+        let source: cuteafd_api::openai::probe::ProbeImageUrl = serde_json::from_value(fixture["image_url"].clone()).context("cache_exact image_url source")?;
+        for span in &mut spec.media {
+            span.image_url = Some(source.clone());
+            span.input_key = None;
+        }
+        body = plain(client, "cache probe", 2);
+    }
+    Ok((body, spec))
 }
 
 fn cache_bound(record: &ProbeRecord, fixture: &Value) -> Result<()> {
@@ -1021,13 +1041,15 @@ mod tests {
         let n = 9000;
         for image in [true, false] {
             for corrupt in [None, Some(1), Some(4)] {
-                let fixture = if image { json!({"type": "image_url", "image_url": {"url": "fixture"}}) }
+                let fixture = if image { json!({"type": "image_url", "image_url": {"url": "fixture", "detail": "low"}}) }
                     else { json!({"type": "input_audio", "input_audio": {"data": "fixture", "format": "wav"}}) };
                 let mut index = 0;
                 let mut check = Check::new("cache_exact", "media");
                 cache_exact_with(&client, &ServerInfo::default(), &mut check, Some(&fixture), |body, spec| {
                     let i = index; index += 1;
-                    assert_eq!(body["messages"][0]["content"][0], fixture);
+                    if image && i == 4 {
+                        assert_eq!(body["messages"][0]["content"], "cache probe", "expanded image source belongs only in spec");
+                    } else { assert_eq!(body["messages"][0]["content"][0], fixture); }
                     assert!(spec.no_speculation);
                     assert_eq!(spec.cold, i == 5);
                     assert_eq!(spec.output_dependent, i == 4);
@@ -1047,9 +1069,14 @@ mod tests {
                     }
                     if i == 4 {
                         assert_eq!(spec.prompt_ids.as_ref().unwrap().len(), prompt);
-                        assert_eq!(spec.media, record.media);
+                        let mut expected = record.media.clone();
+                        if image { expected[0].image_url = Some(serde_json::from_value(fixture["image_url"].clone()).unwrap()); }
+                        assert_eq!(spec.media, expected);
                         assert_eq!(spec.audio, record.audio);
+                        spec.validate_media_geometries(cuteafd_core::media::ImageTokenGeometry::MERGED,
+                            cuteafd_core::media::AudioTokenGeometry::PcmPatches { samples_per_token: 1920 }).unwrap();
                     }
+                    if image { record.media[0].input_key = Some("ef".repeat(32)); }
                     for position in prompt..prompt + count {
                         record.rows.push(cuteafd_api::openai::probe::ProbeRow {
                             position, hash: if corrupt == Some(i) && position == prompt + 1 { "bad".into() }
