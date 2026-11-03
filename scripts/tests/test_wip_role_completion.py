@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 @pytest.mark.parametrize('value', [None, 'ON', 'OFF', 'on', 'ON; touch /bad'])
 def test_wip_audio_aot_reaches_both_native_architectures(role, arch, value):
     script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
-    options = 'exl3_aot=' + script.split('exl3_aot=', 1)[1].split('[[ "$cuda_arch"', 1)[0]
+    options = 'v41_expert_aot=' + script.split('v41_expert_aot=', 1)[1].split('[[ "$cuda_arch"', 1)[0]
     cmake = 'cmake \\\n' + script.split('\ncmake \\\n', 1)[1].split('\ncmake --build', 1)[0]
     env = {key: val for key, val in os.environ.items() if not key.startswith('CUTEAFD_WIP_')}
     if value is not None:
@@ -221,7 +221,7 @@ def test_expert_codec_scope_installs_nonempty_program_manifest(tmp_path, scope):
     generated.write_text(json.dumps(dict(schema=1, programs=[dict(name='expert_reply_quantize')])))
     output.mkdir()
     script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
-    block = script.split('# Generic-family tables must come from this build', 1)[1].split(
+    block = '# Generic-family tables' + script.split('# Generic-family tables', 1)[1].split(
         '# Publish this build', 1)[0]
     env = dict(PATH=os.environ['PATH'], role='expert', expert_families=scope,
                build_dir=str(build), output_dir=str(output))
