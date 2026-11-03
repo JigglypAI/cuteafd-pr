@@ -898,6 +898,11 @@ fn batch_variant_speculation(quality: &mut Quality) {
 }
 
 fn template(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
+    if !run.client.configuration.speculative_acceptance.is_exact() {
+        check.status = CheckStatus::Skipped;
+        check.summary = "relaxed acceptance does not support constrained tool decoding".into();
+        return Ok(());
+    }
     let tools = json!([{"type": "function", "function": {"name": "get_weather",
         "description": "Current weather for a city.",
         "parameters": {"type": "object", "properties": {"city": {"type": "string"},
@@ -1027,6 +1032,24 @@ pub fn describe(timing: &StreamTiming) -> String {
 mod tests {
     use super::*;
     use crate::report::Check;
+
+    #[test]
+    fn relaxed_template_skips_without_sending_a_constrained_request() {
+        for policy in [cuteafd_core::SpeculativeAcceptance::MinP { min_p: 0.3 },
+            cuteafd_core::SpeculativeAcceptance::Typical { epsilon: 0.09, delta: 0.3 }] {
+            let mut client = Client::new("http://127.0.0.1:0", None, Default::default());
+            client.configuration.speculative_acceptance = policy;
+            let info = ServerInfo::default();
+            let progress = Progress::default();
+            let mut run = Run { client: &client, info: &info, progress: &progress, max_context: 8192,
+                baseline: Baseline { fingerprint: String::new(), run_id: String::new(), created: String::new(),
+                    card: BasicCard::default(), quality: Quality::default(), seconds: 0.0, thermal: None, fabric: vec![] } };
+            let mut check = Check::new("template", "Template round trip");
+            template(&mut run, &mut check).unwrap();
+            assert_eq!(check.status, CheckStatus::Skipped);
+            assert_eq!(check.summary, "relaxed acceptance does not support constrained tool decoding");
+        }
+    }
 
     #[test]
     fn short_continuation_keeps_the_prefix_and_appends_only_input_text_ids() {
