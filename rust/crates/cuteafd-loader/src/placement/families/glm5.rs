@@ -2162,19 +2162,37 @@ mod tests {
     #[test]
     fn owned_graphs_use_the_runtime_clamped_context_at_small_pools() {
         let cfg = config();
-        for (requested_pool, expected_pool, expected_context) in [
-            // Prefill slots share step scratch/head/logits; decode intake is 64 rows.
-            (Some(32768), 32768, 32512), (None, 124288, 124032),
-        ] {
+        for requested_pool in [Some(32768), None] {
             let mut i = inputs(&cfg, &[32 * GIB; 2]);
             i.prefill_lanes = 2;
             i.onboard = if requested_pool.is_some() { Onboard::Layers(0) } else { Onboard::Auto };
             i.requested_pool = requested_pool;
             let (placed, _) = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Layers)).unwrap();
-            assert_eq!(placed.pool_tokens, expected_pool);
+            if let Some(tokens) = requested_pool {
+                assert_eq!(placed.pool_tokens, tokens);
+            } else {
+                assert_eq!(placed.onboard_layers, 0);
+                // This fixture stays within one graph-width interval. Compute
+                // the pool from the final charged ledger, not a pinned scalar
+                // whose value changes with the measured graph calibration.
+                let mut req = request(&i).unwrap();
+                configure_attention(&mut req, Some(AttentionPlacement::Layers)).unwrap();
+                let mut maximum_units = u64::MAX;
+                for (rank, items) in placed.items.iter().enumerate() {
+                    let fixed: u64 = items.iter().filter(|item| item.group != "records")
+                        .map(|item| item.bytes).sum();
+                    let unit = req.pool_overhead[rank] + req.layers.iter().zip(&placed.layers)
+                        .filter(|(_, assignment)| matches!(assignment.mode,
+                            LayerMode::Whole { gpu, .. } if usize::from(gpu) == rank))
+                        .map(|(layer, _)| layer.kv_unit.unit_bytes_whole).sum::<u64>();
+                    maximum_units = maximum_units.min((req.inventory.gpus[rank].available() - fixed) / unit);
+                }
+                assert_eq!(placed.pool_tokens, maximum_units * PAGE_ROWS);
+                assert!((1 << 16..1 << 17).contains(&placed.pool_tokens));
+            }
             let context = crate::serving_capacity::pool_context(i.max_context as usize,
                 i.automatic_context, placed.pool_tokens as usize, 256).unwrap();
-            assert_eq!(context, expected_context);
+            assert_eq!(context as u64, placed.pool_tokens - 256);
             let owners: Vec<_> = placed.layers.iter().map(|layer| match layer.mode {
                 LayerMode::Whole { gpu, .. } => gpu, _ => unreachable!(),
             }).collect();

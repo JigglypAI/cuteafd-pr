@@ -116,7 +116,7 @@ impl OwnedGraphs {
                         location: Location::coordinator(rank),
                         bytes,
                         lifetime: Lifetime { first, last: Phase::Growth },
-                        source: format!("GLM owned graph {name}: exact {} keys at selected context {}, {} executables; SM120 {} B/executable, 10% growth (64 MiB minimum); PRO 6000 capture census 2026-10-15, 5090 unmeasured",
+                        source: format!("GLM owned graph {name}: exact {} keys at selected context {}, {} executables; SM120 {} B/executable, 10% growth (64 MiB minimum); PRO 6000 per-executable calibration 2026-11-03 (#1102), 5090 unmeasured",
                             self.startup.keys.len(), self.context, census.executables,
                             GLM_OWNED_SM120_GRAPH_BYTES),
                         assumed: true,

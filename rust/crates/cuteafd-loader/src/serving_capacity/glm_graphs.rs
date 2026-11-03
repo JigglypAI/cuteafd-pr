@@ -99,7 +99,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_sm120_ready_calibration_matches_recorded_capture_census() {
+    fn owned_sm120_allowance_covers_recorded_capture_census() {
         // RTX PRO 6000 SM120, GLM 5.3 EXL3 K4, two RTX + six expert ranks,
         // 2M pool, 1M context, 78 layers (TP2 layers 3..5), 2026-10-15.
         // Both launches measured the same deltas. The 213 shapes use widths
@@ -111,9 +111,40 @@ mod tests {
         assert_eq!(startup.keys.len(), 213);
         for (rank, observed) in [5_790_236_672u64, 5_762_973_696].into_iter().enumerate() {
             assert_eq!(startup.inventory.ranks[rank].executables, 49_416);
-            assert_eq!(startup.inventory.at_ready(rank), 5_781_672_000);
-            assert!(startup.inventory.at_ready(rank).abs_diff(observed) <= 64 << 20);
-            assert_eq!(startup.inventory.growth(rank), 578_167_200);
+            let ready = 49_416 * GLM_OWNED_SM120_GRAPH_BYTES;
+            assert_eq!(startup.inventory.at_ready(rank), ready);
+            // Preserve the historical fit check while using the newer upper mean.
+            assert!((49_416 * 117_000u64).abs_diff(observed) <= 64 << 20);
+            assert!(ready >= observed);
+            assert_eq!(startup.inventory.growth(rank), ready / 10);
+        }
+    }
+
+    #[test]
+    fn owned_sm120_calibration_covers_november_measured_sample_without_changing_census() {
+        // #1102's measured sample is calibration data, not the current graph geometry.
+        let count = 33_867u64;
+        let measured = [4_005_560_320u64, 3_980_394_496];
+        let means = measured.map(|bytes| bytes.div_ceil(count));
+        assert_eq!(means, [118_274, 117_531]);
+        assert_eq!(GLM_OWNED_SM120_GRAPH_BYTES, means.into_iter().max().unwrap().div_ceil(1000) * 1000);
+        let sample = GraphSet::new(&[count; 2], GLM_OWNED_SM120_GRAPH_BYTES,
+            10, 64 << 20, 213, Lifetime::Startup);
+        for (rank, observed) in measured.into_iter().enumerate() {
+            assert_eq!(sample.at_ready(rank), 4_030_173_000);
+            assert!(sample.at_ready(rank) >= observed);
+            assert_eq!(sample.growth(rank), sample.at_ready(rank) / 10);
+        }
+        // The same measurement's baseline uses our unchanged segment census.
+        let owners: Vec<_> = (0..78).map(|layer| (layer % 2) as u8).collect();
+        let tp2: Vec<_> = (0..78).map(|layer| layer == 3).collect();
+        let baseline = glm_owned_startup_graphs(1 << 20, 32768, &owners, &tp2).unwrap();
+        assert_eq!(baseline.keys.len(), 213);
+        for (rank, observed) in [5_813_305_344u64, 5_786_042_368].into_iter().enumerate() {
+            assert_eq!(baseline.inventory.ranks[rank].executables, 49_629);
+            assert_eq!(baseline.inventory.at_ready(rank), 49_629 * GLM_OWNED_SM120_GRAPH_BYTES);
+            assert!(baseline.inventory.at_ready(rank) >= observed);
+            assert_eq!(baseline.inventory.growth(rank), baseline.inventory.at_ready(rank) / 10);
         }
     }
 
