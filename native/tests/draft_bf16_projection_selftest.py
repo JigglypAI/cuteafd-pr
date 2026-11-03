@@ -20,6 +20,7 @@ def shapes():
         "dflash2-glmf": (4096, 32, 8, 128, 12288, 5),
         "dflash-qwen27": (5120, 32, 8, 128, 17408, 5),
         "dflash-qwen35": (2048, 32, 8, 128, 6144, 8),
+        "dflash-kimi-modal": (7168, 32, 8, 128, 14336, 6),
         "dflash-mimo-pro": (6144, 128, 8, 128, 16384, 5),
         "dflash-mimo-flash": (4096, 64, 8, 128, 16384, 5),
         "dflash2-muse-radix": (8192, 64, 8, 128, 28672, 5),
@@ -30,6 +31,12 @@ def shapes():
         for k, n in ((h * taps, h), (h, (heads + 2 * kv) * d),
                      (h, 2 * kv * d), (heads * d, h), (h, 2 * inter), (inter, h)):
             result.setdefault((k, n), []).append(family)
+    for h in (4096, 6144, 7168, 8192):
+        result.setdefault((h, h // 4), []).append("dflash-convolution")
+        result.setdefault((h, 256), []).append("dflash-selector")
+    for h, inter in ((7168, 14336), (6144, 24576)):
+        result.setdefault((h, 2 * inter), []).append("mla-dflash/ml4-ffn")
+        result.setdefault((inter, h), []).append("mla-dflash/ml4-ffn")
     for h in (2048, 4096, 5120, 6144):
         result.setdefault((2 * h, h), []).append("mimo/qwen-mtp")
     result.setdefault((30720, 6144), []).append("ml4-context-fc")
@@ -44,7 +51,8 @@ def main():
     args = parser.parse_args()
     support = ct.CDLL(args.support_library, mode=ct.RTLD_GLOBAL) if args.support_library else None
     library = ct.CDLL(args.library)
-    blas = ct.CDLL("libcublas.so.12")
+    # Resolve through the native library's linked cuBLAS (same toolkit and ABI).
+    blas = library
     handle = ct.c_void_p()
     blas.cublasCreate_v2.argtypes = [ct.POINTER(ct.c_void_p)]
     blas.cublasSetStream_v2.argtypes = [ct.c_void_p, ct.c_void_p]
