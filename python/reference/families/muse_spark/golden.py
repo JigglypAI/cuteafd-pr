@@ -253,6 +253,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("snapshot", "windows", "out"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--media", action="store_true", help="inject official bundled image/audio public features")
+    parser.add_argument("--media-root", type=Path, help="fixture root (default --windows parent)")
+    parser.add_argument("--media-features-out", type=Path, help="immutable BF16 public feature export")
+    parser.add_argument("--tower-dtype", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--geometry", choices=("auto", "tiled", "official-full"), default="auto",
                         help="auto uses official-full for media windows longer than index_topk")
     parser.add_argument("--official-state", type=Path,
@@ -270,7 +274,8 @@ def main():
     if args.layers is not None:
         raise ValueError("partial layers cannot qualify a reference")
     family = Family(args.snapshot, trace_dtype=args.trace_dtype, trace_common_hidden=args.trace_common_hidden)
-    layer_major.run(args, family, extras_root=args.routes)
+    import muse_spark_media
+    layer_major.run(args, family, extras_root=args.routes, media_adapter=muse_spark_media)
 
 
 if __name__ == "__main__":

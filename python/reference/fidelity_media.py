@@ -170,15 +170,26 @@ def read_fixture(root: Path, span: dict) -> bytes:
 
 def read_pcm_fixture(root: Path, span: dict):
     """Pinned mono 24 kHz IEEE float WAV; never resample or silently quantize."""
-    import io
+    import struct
     import numpy as np
-    import soundfile as sf
-    with sf.SoundFile(io.BytesIO(read_fixture(root, span))) as audio:
-        if audio.samplerate != 24000 or audio.channels != 1 or audio.subtype != "FLOAT":
-            raise ValueError("audio fixture requires canonical mono 24000 Hz float WAV")
-        if audio.frames != span["samples"] or not 1 <= audio.frames <= 7_200_000:
-            raise ValueError("audio fixture sample count differs")
-        values = audio.read(dtype="float32")
+    data = read_fixture(root, span)
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE" or struct.unpack_from("<I", data, 4)[0] != len(data) - 8:
+        raise ValueError("audio fixture requires canonical mono 24000 Hz float WAV")
+    offset, chunks = 12, {}
+    while offset < len(data):
+        if offset + 8 > len(data):
+            raise ValueError("truncated PCM WAV chunk")
+        name, size = struct.unpack_from("<4sI", data, offset)
+        offset += 8
+        if offset + size > len(data) or name in chunks:
+            raise ValueError("invalid or duplicate PCM WAV chunk")
+        chunks[name] = data[offset:offset + size]
+        offset += size + size % 2
+    fmt, payload = chunks.get(b"fmt ", b""), chunks.get(b"data", b"")
+    if (len(fmt) < 16 or struct.unpack_from("<HHIIHH", fmt) != (3, 1, 24000, 96000, 4, 32)
+            or len(payload) != span["samples"] * 4 or not 1 <= span["samples"] <= 7_200_000):
+        raise ValueError("audio fixture requires canonical mono 24000 Hz float WAV sample count")
+    values = np.frombuffer(payload, dtype="<f4").copy()
     if not np.isfinite(values).all() or hashlib.sha256(values.astype("<f4").tobytes()).hexdigest() != span["pcm_sha256"]:
         raise ValueError("audio fixture differs from canonical PCM identity")
     return values

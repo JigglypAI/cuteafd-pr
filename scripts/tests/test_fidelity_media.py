@@ -943,13 +943,12 @@ def test_declared_processor_geometry_agrees_without_family_whitelist(tmp_path):
 
 
 def test_pcm_span_identity_geometry_and_feature_metadata(tmp_path):
-    import io
-    import soundfile as sf
+    import struct
     from fidelity_media import read_pcm_fixture
     pcm = np.linspace(-0.2, 0.2, 1921, dtype="<f4")
-    encoded = io.BytesIO()
-    sf.write(encoded, pcm, 24000, format="WAV", subtype="FLOAT")
-    data = encoded.getvalue()
+    fmt = struct.pack("<HHIIHH", 3, 1, 24000, 96000, 4, 32)
+    body = b"WAVEfmt " + struct.pack("<I", len(fmt)) + fmt + b"data" + struct.pack("<I", pcm.nbytes) + pcm.tobytes()
+    data = b"RIFF" + struct.pack("<I", len(body)) + body
     (tmp_path / "audio.wav").write_bytes(data)
     audio = {"start": 1, "len": 2, "kind": "audio", "key": "a" * 64,
              "samples": len(pcm), "pcm_sha256": hashlib.sha256(pcm.tobytes()).hexdigest(),
