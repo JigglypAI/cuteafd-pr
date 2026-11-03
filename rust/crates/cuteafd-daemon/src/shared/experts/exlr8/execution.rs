@@ -364,6 +364,47 @@ impl<'a> Exlr8Execution<'a> {
     }
     pub(crate) fn allocation_buffer(&self) -> CuteafdDeviceBuffer { self.arena.buffer }
 
+    /// Census retained storage and the actual kernel bindings, not forecast records.
+    pub(crate) fn workspace_receipts(&self, prefix: &str,
+        location: cuteafd_loader::placement::planner::Location, physical_device: i32,
+        lifetime: cuteafd_loader::placement::planner::Lifetime)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{Allocation, Domain, Receipt, View};
+        ensure!(!prefix.is_empty() && location.domain == Domain::Device,
+            "invalid EXLR8 workspace census identity");
+        let arena = self.arena.buffer;
+        let receipt = |name: &str, buffer: CuteafdDeviceBuffer| -> Result<Receipt> {
+            ensure!(buffer.device_id == physical_device && !buffer.ptr.is_null() && buffer.bytes > 0,
+                "EXLR8 workspace has wrong physical device or empty buffer");
+            let mut allocation = Allocation::buffer(format!("{prefix}.{name}"), location,
+                u64::try_from(buffer.bytes)?, lifetime, Category::Workspace, "EXLR8 expert workspace");
+            allocation.alignment = 256;
+            Ok(Receipt { allocation, address: buffer.ptr as u64 })
+        };
+        let mut out = vec![receipt("arena", arena)?];
+        let mut binding = |name: &str, buffer: CuteafdDeviceBuffer| -> Result<()> {
+            let mut actual = receipt(name, buffer)?;
+            let offset = (buffer.ptr as usize).checked_sub(arena.ptr as usize)
+                .context("EXLR8 workspace binding precedes physical owner")?;
+            ensure!(offset.checked_add(buffer.bytes).is_some_and(|end| end <= arena.bytes),
+                "EXLR8 workspace binding exceeds physical owner");
+            actual.allocation.view = Some(View { backing: format!("{prefix}.arena"), offset: u64::try_from(offset)? });
+            out.push(actual);
+            Ok(())
+        };
+        for (name, index) in [("input", 0), ("ids", 1), ("route_weights", 2), ("output", 3),
+            ("group_expert", 4), ("route_slots", 5), ("route_group_lane", 6), ("group_count", 7),
+            ("fc1", 8), ("intermediate_fc2", 9), ("rotated", 10)] {
+            binding(name, self.buffer(index)?)?;
+        }
+        let combined = self.buffer(9)?;
+        binding("intermediate", view(combined, 0, self.intermediate_bytes)?)?;
+        binding("fc2", view(combined, self.intermediate_bytes,
+            combined.bytes.checked_sub(self.intermediate_bytes).context("EXLR8 FC2 split exceeds buffer")?)?)?;
+        Ok(out)
+    }
+
     fn buffer(&self, index: usize) -> Result<CuteafdDeviceBuffer> {
         let (offset, bytes) = self.layout.ranges[index];
         view(self.arena.buffer, offset, bytes)
@@ -473,6 +514,174 @@ impl<'a> Exlr8Execution<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Small group capacity bounds CPU memory; the compiled family/ABI remains exact.
+    fn owner_manifest(family: KernelFamily) -> serde_json::Value {
+        use cuteafd_ffi::exlr8::KernelKind;
+        use serde_json::json;
+        let h = family.geometry().hidden;
+        let mut entries = Vec::new();
+        for (variant, activations) in [(Variant::SharedDecode, Exlr8PrefillActivations::A16),
+            (Variant::DecodeCompact, Exlr8PrefillActivations::A16),
+            (Variant::DecodeGrouped, Exlr8PrefillActivations::A16),
+            (Variant::Prefill, Exlr8PrefillActivations::A16),
+            (Variant::Prefill, Exlr8PrefillActivations::A8)] {
+            let shared = variant == Variant::SharedDecode;
+            let grouped = variant.unit_tables();
+            let rows = if variant == Variant::Prefill { 4096 } else { 64 };
+            let top = if shared { 1 } else { 8 };
+            let g = 4usize;
+            let r = 16usize;
+            let s = h.div_ceil(1024);
+            let mut geometry = json!({"abi_version":3,"hidden":h,"units":16,"top_k":top,
+                "max_groups":g,"max_rows":rows,"split_k_blocks":8,"fc1_splits":s,"ctas_per_sm":4});
+            if family == KernelFamily::GlmFlash { geometry["swiglu_limit"] = json!(10.0); }
+            if grouped { geometry["group_rows"] = json!(r); }
+            if variant == Variant::DecodeCompact { geometry["serving_variant"] = json!("k1_k23_coalesced"); }
+            if variant == Variant::DecodeGrouped { geometry["fc2_partials"] = json!("f32"); }
+            if activations == Exlr8PrefillActivations::A8 { geometry["activations"] = json!("a8"); }
+            let shapes = [format!("[rows,{h}]"), "[E,16,3,3]".into(), "[E,16,3]".into(),
+                format!("[{g}]"), format!("[{g},{r}]"), format!("[rows,{top}]"), format!("[rows,{top}]"),
+                format!("[{g},16,2,{s},{r},128]"), format!("[{g},16,{r},128]"),
+                format!("[{g},{r},{h}]"), format!("[{h}]"), format!("[rows,{h}]"), "[1]".into(),
+                "[E]".into(), "[E,16]".into()];
+            let dtypes = ["float16", "int64", "int32", "int32", "int32", "int32", "float32",
+                "float32", "float16", "float32", "int8", "bfloat16", "int32", "int32", "int32"];
+            entries.push(json!({"name":program_names(family, if shared {ExpertSet::Shared} else {ExpertSet::Routed},
+                variant, activations).0,"capacity_rows":rows,"geometry":geometry,
+                "pointers":pointers(if shared {ExpertSet::Shared} else {ExpertSet::Routed}, variant).iter()
+                    .enumerate().map(|(i,name)| json!({"name":name,"dtype":dtypes[i],"shape":shapes[i],
+                        "role":if (7..=9).contains(&i) {"scratch"} else if i==11 {"out"} else {"in"}})).collect::<Vec<_>>(),
+                "scalars":["rows", "cta_limit", "unit_limit", "l2_bytes"][..if grouped {4} else {2}].iter()
+                    .map(|name| json!({"name":name,"type":"int32"})).collect::<Vec<_>>(),
+                "scratch_bytes_at_capacity":{"fc1":g*16*2*s*r*128*4,
+                    "intermediate":g*16*r*128*2,"fc2":g*r*h*4}}));
+        }
+        for kind in [KernelKind::SharedGroup, KernelKind::Group, KernelKind::GroupedGroup] {
+            let shared = kind == KernelKind::SharedGroup;
+            let rows = if kind == KernelKind::GroupedGroup {4096} else {64};
+            let top = if shared {1} else {8};
+            let row = if shared {h} else {h+h/32};
+            let descriptors = [("ids", "int32", format!("[rows,{top}]"), "in"),
+                ("x", if shared {"bfloat16"} else {"uint8"}, format!("[rows,{row}]"), "in"),
+                ("signs_in", "int8", format!("[{h}]"), "in"),
+                ("group_expert", "int32", "[4]".into(), "out"),
+                ("route_slots", "int32", "[4,16]".into(), "out"),
+                ("route_group_lane", "int32", format!("[rows,{top}]"), "out"),
+                ("group_count", "int32", "[1]".into(), "out"),
+                ("activation", "float16", format!("[rows,{h}]"), "out")];
+            let mut geometry = json!({"abi_version":2,"experts":if shared {1} else {family.geometry().experts},
+                "top_k":top,"max_groups":4,"max_rows":rows,"hidden":h,"ctas_per_sm":4,"ingress_warps":8,
+                "input_format":if shared {"bf16"} else {"fp8_k32"},"input_row_bytes":if shared {h*2} else {row}});
+            if kind == KernelKind::GroupedGroup { geometry["group_rows"] = json!(16); }
+            entries.push(json!({"name":family.program(kind),"capacity_rows":rows,"geometry":geometry,
+                "pointers":descriptors.iter().map(|(name,dtype,shape,role)|
+                    json!({"name":name,"dtype":dtype,"shape":shape,"role":role})).collect::<Vec<_>>(),
+                "scalars":[{"name":"rows","type":"int32"},{"name":"cta_limit","type":"int32"}],
+                "scratch_bytes_at_capacity":{}}));
+        }
+        json!({"programs":entries})
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn retained_execution_arenas_reconcile_actual_kernel_bindings() -> Result<()> {
+        execution_owner_fixture(KernelFamily::Glm)
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn retained_flash_execution_arenas_reconcile_actual_kernel_bindings() -> Result<()> {
+        execution_owner_fixture(KernelFamily::GlmFlash)
+    }
+
+    fn execution_owner_fixture(family: KernelFamily) -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::placement::planner::{self, *};
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        {
+            fixture.exlr8_programs(&library, family == KernelFamily::GlmFlash)?;
+            let manifest = fixture.directory().join("PROGRAMS.json");
+            std::fs::write(&manifest, serde_json::to_vec(&owner_manifest(family))?)?;
+            let programs = library.programs()?.with_manifest(&manifest)?;
+            for (physical, location) in [(1, Location::coordinator(0)),
+                (0, Location { device: planner::Device::Spark(3), domain: Domain::Device })] {
+                library.cuda_set_device(physical)?;
+                fixture.configure_memory(&library, physical, 64 << 20)?;
+                for (variant, activations) in [(Variant::SharedDecode, Exlr8PrefillActivations::A16),
+                    (Variant::DecodeCompact, Exlr8PrefillActivations::A16),
+                    (Variant::DecodeGrouped, Exlr8PrefillActivations::A16),
+                    (Variant::Prefill, Exlr8PrefillActivations::A16),
+                    (Variant::Prefill, Exlr8PrefillActivations::A8)] {
+                    let shared = variant == Variant::SharedDecode;
+                    let set = if shared {ExpertSet::Shared} else {ExpertSet::Routed};
+                    let public_variant = match variant {
+                        Variant::SharedDecode => ExecutionVariant::SharedDecode,
+                        Variant::DecodeCompact => ExecutionVariant::DecodeCompact,
+                        Variant::DecodeGrouped => ExecutionVariant::DecodeGrouped,
+                        Variant::Prefill => ExecutionVariant::Prefill,
+                    };
+                    for rows in if variant == Variant::Prefill { [65, 128] } else { [1, 64] } {
+                        let spec = programs.spec(program_names(family, set, variant, activations).0)?;
+                        let layout = cuteafd_loader::plan::exlr8::execution_workspace(spec, rows, set,
+                            public_variant, 3, activations)?;
+                        let allocations = layout.allocations("test.execution", location, Lifetime::RESIDENT)?;
+                        let facts = Facts { allocations, deferred: vec![], sequential: vec![], allowances: vec![] };
+                        let budgets = vec![Budget { id:"CPU fixture".into(),locations:vec![location],
+                            physical_bytes:64<<20,logical_bytes:64<<20,headroom:0,
+                            baseline:Baseline::Forecast {occupied:0,source:"CPU fixture".into(),assumed:false} }];
+                        let phases = planner::evaluate(&facts, &budgets)?;
+                        let plan = ResolvedPlan { request:Request {context:64,pool:Pin::Exact(64),onboard:Pin::Auto,
+                                prefill:Pin::Auto,operation:Operation::Serving},
+                            decisions:Decisions {attention:vec![],onboard_layers:vec![],expert_homes:Default::default(),
+                                embedding:None,prefill:PrefillShape {rows:64,waves:1},lanes:1},
+                            pool_tokens:64,facts,budgets,phases };
+                        assert!(Exlr8Execution::new_for(&library, &programs, family, rows, layout.bytes-1,
+                            set, variant, 3, activations).is_err());
+                        assert_eq!(library.cuda_memory_info()?, (64 << 20, 64 << 20));
+                        let mut execution = Exlr8Execution::new_for(&library, &programs, family, rows,
+                            layout.bytes, set, variant, 3, activations)?;
+                        execution.seal_graph_storage()?;
+                        let receipts = execution.workspace_receipts("test.execution", location, physical, Lifetime::RESIDENT)?;
+                        planner::reconcile(&plan, Phase::Load, &receipts)?;
+                        assert!(execution.workspace_receipts("test.execution", location, 1-physical, Lifetime::RESIDENT).is_err());
+                        assert_eq!(library.cuda_memory_info()?.0, (64 << 20) - layout.bytes);
+                        for negative in 0..11 {
+                            let mut bad = receipts.clone();
+                            match negative {
+                                0 => { bad.pop(); },
+                                1 => { let mut extra=bad[0].clone();extra.allocation.id.push_str(".extra");bad.push(extra); },
+                                2 => bad[0].allocation.bytes += 256,
+                                3 => { bad[1].allocation.bytes += 1;bad[2].allocation.bytes -= 1; },
+                                4 => bad[0].allocation.location=Location::coordinator(7),
+                                5 => bad[0].address=0,
+                                6 => bad[1].address += 256,
+                                7 => bad[1].allocation.view.as_mut().unwrap().offset += 256,
+                                8 => bad[1].allocation.view.as_mut().unwrap().backing=bad[2].allocation.id.clone(),
+                                9 => bad[1].allocation.dtype="bf16".into(),
+                                10 => bad[0].allocation.lifetime.first=Phase::PostTargetKv,
+                                _ => unreachable!(),
+                            }
+                            assert!(planner::reconcile(&plan, Phase::Load, &bad).is_err(), "negative {negative}");
+                        }
+                        let range = execution.layout.ranges[0];
+                        execution.layout.ranges[0].0 = execution.arena.buffer.bytes;
+                        assert!(execution.workspace_receipts("test.execution", location, physical, Lifetime::RESIDENT).is_err());
+                        execution.layout.ranges[0] = range;
+                        let split = execution.intermediate_bytes;
+                        execution.intermediate_bytes = execution.layout.ranges[9].1 + 1;
+                        assert!(execution.workspace_receipts("test.execution", location, physical, Lifetime::RESIDENT).is_err());
+                        execution.intermediate_bytes = split;
+                        execution.routing.check(execution.identity()?)?;
+                        drop(execution);
+                        assert_eq!(library.cuda_memory_info()?, (64 << 20, 64 << 20));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     fn shared_spec() -> ProgramSpec {
         ProgramSpec {

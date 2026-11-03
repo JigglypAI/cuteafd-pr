@@ -129,6 +129,17 @@ impl Fixture {
         Ok(())
     }
 
+    /// Opt-in EXLR8 owner table; launches remain unsupported, metadata is manifest-validated.
+    pub fn exlr8_programs(&self, library: &NativeLibrary, flash: bool) -> Result<()> {
+        // SAFETY: this export only selects the CPU fixture's static program table.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn(i32)> =
+                library.lib.get(b"fixture_configure_exlr8_programs")?;
+            configure(i32::from(flash));
+        }
+        Ok(())
+    }
+
     /// Configure static package ABI before loading a CPU expert module.
     pub fn configure_fp8(&self, library: &NativeLibrary, words: &[u32; 16], scratch: &[u64; 6]) -> Result<()> {
         // SAFETY: the CPU-only export copies the two fixed-size arrays synchronously.

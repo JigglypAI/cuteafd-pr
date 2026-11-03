@@ -47,6 +47,7 @@ int cuteafd_cuda_device_info(int device, struct device_info *info) {
     return 0;
 }
 
+int64_t cuteafd_l2_cache_bytes(void) { return 1 << 20; }
 int cuteafd_cuda_get_device(int *device) { *device = current_device; return 0; }
 int cuteafd_cuda_memory_info(size_t *free_bytes, size_t *total) {
     *total = memory_total[current_device];
@@ -121,10 +122,23 @@ static const char *glm_target_bases[] = {
     "glm_producer", "glm_sparse_mla_decode", "glm_o", "glm_ffn_i2048", "glm_ffn_i12288",
     "glm_producer", "glm_sparse_mla_prefill", "glm_o", "glm_ffn_i2048", "glm_ffn_i12288"
 };
-uint32_t cuteafd_dsv4_program_count(void) { return glm_target_programs ? 31 : 7; }
+/* A separate, bounded ownership table keeps the existing MLA/GLM fixtures intact. */
+static int exlr8_programs, exlr8_flash;
+void fixture_configure_exlr8_programs(int flash) { exlr8_programs = 1; exlr8_flash = flash; }
+static const char *exlr8_suffixes[] = { "shared_a16_serving", "a16_serving", "a16_grouped64",
+    "a16_grouped", "a8_grouped", "shared_group", "group", "grouped_group" };
+uint32_t cuteafd_dsv4_program_count(void) { return exlr8_programs ? 8 : (glm_target_programs ? 31 : 7); }
 int cuteafd_dsv4_program_info(uint32_t index, struct fixture_program_info *info) {
     if (index >= cuteafd_dsv4_program_count() || !info) return 1;
     memset(info, 0, sizeof(*info));
+    if (exlr8_programs) {
+        snprintf(info->name, sizeof(info->name), "exlr8_%s%s", exlr8_flash ? "glmf_" : "", exlr8_suffixes[index]);
+        info->pointers = index >= 5 ? 8 : (index >= 2 ? 15 : 13);
+        const char *scalars = index >= 2 && index < 5 ? "iiii" : "ii";
+        info->scalars = (uint32_t)strlen(scalars);
+        memcpy(info->scalar_kinds, scalars, info->scalars);
+        return 0;
+    }
     if (index >= 7) {
         uint32_t target = index - 7;
         int prefill = (target >= 7 && target < 14) || target >= 19;
