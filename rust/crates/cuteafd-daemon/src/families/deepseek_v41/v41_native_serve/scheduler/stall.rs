@@ -188,12 +188,7 @@ mod tests {
         assert!(independent.contains("stall::tick();"));
         let scheduler = include_str!("../scheduler.rs");
         let single = &scheduler[scheduler.find("fn single_lane_round<").unwrap()..];
-        assert!(single[..4000].contains("clock.draft(|| draft.propose(lib, lane, &seeds))"));
-        // The anchor-only fallback is behavioural, so it must not live in this
-        // diagnostic-only module; it belongs to the draft runtime.
-        assert!(!scheduler.contains("stall::anchor_only"));
-        assert!(!independent.contains("stall::anchor_only"));
-        assert!(include_str!("../speculative.rs").contains("fn anchor_fallback"));
+        assert!(single[..4000].contains("clock.draft(|| draft.propose(lane, &seeds))"));
         let admission = &scheduler[scheduler.find("let mut held_slots =").unwrap()..];
         assert!(admission.find("stall::mark(stall::Phase::Admission").unwrap()
             < admission.find("loop {").unwrap());

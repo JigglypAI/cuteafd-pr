@@ -12,6 +12,8 @@ pub(crate) trait DraftChain<'a> {
     unsafe fn begin_replay(&mut self, windows: [&DsparkWindow<'_>; 3],
         bindings: [&[(WindowLease, u64)]; 3]) -> Result<()>;
     fn poll_replay(&mut self) -> Result<Option<(Vec<u32>, Vec<f32>)>>;
+    /// Copy a draft output buffer to the host on this chain's stream.
+    fn copy_d2h(&self, dst: &mut [u8], buffer: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()>;
     /// Drop a pending replay so its requests can be released.
     fn cancel_replay(&mut self);
     /// Record a CUDA/replay failure as terminal for this chain.
@@ -26,13 +28,55 @@ pub(crate) trait DraftChain<'a> {
     /// and MiMo's `is_terminal`.
     fn require_live(&self) -> Result<()>;
 }
+/// The synchronous draft operations the single-lane `propose` path needs. Only
+/// the local chain implements them; the distributed chain drafts through
+/// `poll_propose` instead.
+pub(crate) trait ProposeChain<'a>: DraftChain<'a> {
+    fn has_graph(&self, count: usize) -> bool;
+    /// Stage the seed tokens and upload them to the device.
+    fn set_tokens(&mut self, tokens: &[i32]) -> Result<()>;
+    /// Reserve a fresh sampling attempt (synchronizes and uploads).
+    fn prepare_sampling(&mut self, rngs: &mut [&mut cuteafd_core::DsparkRng], temperatures: &[f32]) -> Result<()>;
+    /// # Safety
+    /// Same contract as [`DraftChain::begin_replay`].
+    unsafe fn capture(&mut self, windows: [&DsparkWindow<'_>; 3],
+        bindings: [&[(WindowLease, u64)]; 3]) -> Result<()>;
+    /// # Safety
+    /// Same contract as [`DraftChain::begin_replay`].
+    unsafe fn replay(&mut self, windows: [&DsparkWindow<'_>; 3],
+        bindings: [&[(WindowLease, u64)]; 3]) -> Result<()>;
+    fn draft_output(&self) -> Result<[cuteafd_ffi::CuteafdDeviceBuffer; 3]>;
+}
+impl<'w, 'a> ProposeChain<'a> for DsparkChain<'w, 'a> {
+    fn has_graph(&self, count: usize) -> bool { self.has_graph(count) }
+    fn set_tokens(&mut self, tokens: &[i32]) -> Result<()> { self.set_tokens(tokens) }
+    fn prepare_sampling(&mut self, rngs: &mut [&mut cuteafd_core::DsparkRng], temperatures: &[f32]) -> Result<()> {
+        self.prepare_sampling(rngs, temperatures)
+    }
+    unsafe fn capture(&mut self, windows: [&DsparkWindow<'_>; 3],
+        bindings: [&[(WindowLease, u64)]; 3]) -> Result<()> {
+        unsafe { self.capture(windows, bindings) }
+    }
+    unsafe fn replay(&mut self, windows: [&DsparkWindow<'_>; 3],
+        bindings: [&[(WindowLease, u64)]; 3]) -> Result<()> {
+        unsafe { self.replay(windows, bindings).map(drop) }
+    }
+    fn draft_output(&self) -> Result<[cuteafd_ffi::CuteafdDeviceBuffer; 3]> { self.draft_output() }
+}
+
 macro_rules! chain {
     ($ty:ident, $device:expr, $live:expr) => {
         impl<'w, 'a> DraftChain<'a> for $ty<'w, 'a> {
             fn execution_device(&self) -> Option<crate::shared::memory::device::Device<'a>> { ($device)(self) }
-            fn stage_tokens(&mut self, tokens: &[i32]) -> Result<()> { self.stage_tokens(tokens) }
+            fn stage_tokens(&mut self, tokens: &[i32]) -> Result<()> {
+                let result = self.stage_tokens(tokens);
+                if let Err(error) = &result { self.note_failure(error); }
+                result
+            }
             fn stage_sampling(&mut self, rngs: &mut [&mut cuteafd_core::DsparkRng], temperatures: &[f32]) -> Result<()> {
-                self.stage_sampling(rngs, temperatures)
+                let result = self.stage_sampling(rngs, temperatures);
+                if let Err(error) = &result { self.note_failure(error); }
+                result
             }
             unsafe fn begin_replay(&mut self, windows: [&DsparkWindow<'_>; 3],
                 bindings: [&[(WindowLease, u64)]; 3]) -> Result<()> {
@@ -45,10 +89,17 @@ macro_rules! chain {
                 if let Err(error) = &result { self.note_failure(error); }
                 result
             }
+            fn copy_d2h(&self, dst: &mut [u8], buffer: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
+                self.copy_d2h(dst, buffer)
+            }
             fn cancel_replay(&mut self) { self.cancel_replay() }
             fn note_failure(&mut self, error: &anyhow::Error) { self.note_failure(error) }
             fn width(&self) -> usize { self.width() }
-            fn set_width(&mut self, width: usize) -> Result<()> { self.set_width(width) }
+            fn set_width(&mut self, width: usize) -> Result<()> {
+                let result = self.set_width(width);
+                if let Err(error) = &result { self.note_failure(error); }
+                result
+            }
             fn require_live(&self) -> Result<()> { ($live)(self) }
         }
     };

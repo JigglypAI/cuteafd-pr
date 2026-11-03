@@ -11,14 +11,22 @@ use std::ffi::c_void;
 mod distributed;
 pub(crate) use distributed::DistributedDsparkChain;
 
+/// Whether an error is a device/driver failure (a native-library status return)
+/// rather than a host-side invariant failure. Only device failures are terminal
+/// for a draft chain: a CPU-side guard must not latch the lane.
+pub(crate) fn is_device_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<cuteafd_ffi::NativeStatusError>())
+}
+
 /// A sticky terminal failure for a draft chain. A CUDA or replay error is not
 /// recoverable in-process, so the lane must fail the round instead of falling
-/// back to anchors forever with the error masked.
+/// back to anchors forever with the error masked. Host-side invariant failures
+/// are deliberately not recorded: they are recoverable and must not latch.
 #[derive(Default)]
 pub(crate) struct DraftFailure(Option<String>);
 impl DraftFailure {
     pub(crate) fn record(&mut self, error: &anyhow::Error) {
-        if self.0.is_none() { self.0 = Some(format!("{error:#}")); }
+        if self.0.is_none() && is_device_failure(error) { self.0 = Some(format!("{error:#}")); }
     }
     pub(crate) fn check(&self, what: &str) -> Result<()> {
         match &self.0 {
@@ -578,6 +586,10 @@ impl DsparkChain<'_, '_> {
     pub(crate) fn note_failure(&mut self, error: &anyhow::Error) { self.failure.record(error); }
     /// A terminal draft is not a reusable target-only fallback.
     pub fn require_live(&self) -> Result<()> { self.failure.check("dSpark draft chain") }
+    /// Copy a draft output buffer to the host on this chain's stream.
+    pub fn copy_d2h(&self, dst: &mut [u8], buffer: CuteafdDeviceBuffer) -> Result<()> {
+        self.stream.library.copy_d2h(dst, buffer)
+    }
     /// Drop a pending replay so its requests can be released.
     pub fn cancel_replay(&mut self) {
         self.pending = None; // guard drains before releasing reads

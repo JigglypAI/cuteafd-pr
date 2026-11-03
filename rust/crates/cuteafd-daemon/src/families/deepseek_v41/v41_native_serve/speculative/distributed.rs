@@ -32,7 +32,7 @@ impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
             tracing::info!(lanes=lane_count, lane_requests, draft_width=weights.draft_width(), gpu0_bytes_per_lane=lane_bytes[0],
                 gpu1_bytes_per_lane=lane_bytes[1], "distributed lane-local dSpark draft workspaces");
             Ok(Self {
-                mains, chains, windows: [window()?, window()?, window()?],
+                mains, chains, windows: vec![window()?, window()?, window()?],
                 pending_commit_ids: vec![Vec::new(); lane_count], pending_prefix_ids: [None, None],
                 requests: Default::default(), pending: vec![None; lane_count],
                 request_limit: requests as usize, draft_limit: 5, draft_width: weights.draft_width(),

@@ -519,6 +519,17 @@ pub fn graph_capture_sites() -> Vec<(String, u64)> {
 
 pub type CuteafdStatus = c_int;
 
+/// A native-library call returned a non-OK status. This is a device/driver
+/// failure (CUDA, RDMA or NCCL), not a host-side invariant failure: callers
+/// that keep device state alive across calls must treat it as terminal.
+#[derive(Debug, thiserror::Error)]
+#[error("{context} returned status {status}: {detail}")]
+pub struct NativeStatusError {
+    pub context: String,
+    pub status: CuteafdStatus,
+    pub detail: String,
+}
+
 pub const CUTEAFD_STATUS_OK: CuteafdStatus = 0;
 pub const CUTEAFD_STATUS_CUDA_UNAVAILABLE: CuteafdStatus = 3;
 pub const CUTEAFD_STATUS_RDMA_UNAVAILABLE: CuteafdStatus = 7;
@@ -5076,7 +5087,11 @@ impl NativeLibrary {
         let last_error = self
             .last_error()
             .unwrap_or_else(|err| format!("last error unavailable: {err}"));
-        anyhow::bail!("{context} returned status {status}: {last_error}");
+        Err(anyhow::Error::new(NativeStatusError {
+            context: context.to_string(),
+            status,
+            detail: last_error,
+        }))
     }
 }
 
