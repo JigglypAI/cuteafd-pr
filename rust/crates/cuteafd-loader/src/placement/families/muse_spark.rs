@@ -107,7 +107,7 @@ impl MediaOptions {
         };
         ensure!(vision_bytes != (0, 0) || matches!(vision, MediaMode::Auto | MediaMode::Off),
             "checkpoint has no bundled Muse vision tower");
-        let audio = crate::plan::resolve_audio(audio, &checkpoint.snapshot)?;
+        let audio = crate::plan::resolve_audio_config(audio, &checkpoint.snapshot, &checkpoint.config)?;
         let audio_bytes = if audio == MediaMode::Off { (0, 0) } else {
             let plan = media::pcm_audio::PcmAudioPlan::from_snapshot(&checkpoint.snapshot)?;
             (plan.weight_bytes(), media::pcm_audio::scratch_bytes(media::audio::MAX_CLIP_SAMPLES)?)
