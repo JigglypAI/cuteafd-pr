@@ -878,7 +878,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                         }
                     };
                     Ok(request)
-                });
+                })();
                 match admitted {
                     Ok(mut request) => {
                         let token = request.next;
@@ -971,7 +971,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         console::gauges(|| console::Gauges::prefix_cache(cache, active.len() + stalled.len(), prefills.len(),
             receive.len() + kv_waiter.len() + usize::from(snapshot_waiter.is_some())));
         prefills.stepped(cycle.elapsed().as_secs_f64());
-    } })();
+    } });
     if let Err(error) = &result {
         failures.fail_and_close(error, receive);
     }
