@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches};
 use serde::Serialize;
+use std::io::IsTerminal;
 use std::process::Command;
 
 // Optional allocator instrumentation (2026-10-26): `--features jemalloc`
@@ -109,6 +110,7 @@ fn main() -> Result<()> {
     // prebuilt native library (libcuteafd_native.so) uses.
     let malloc = shared::malloc_tune::apply_from_env().to_string();
     tracing_subscriber::fmt()
+        .with_ansi(std::io::stderr().is_terminal())
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
