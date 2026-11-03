@@ -1096,7 +1096,7 @@ fn combined_exlr8_tp2_rank_is_mount_exact_and_drains_on_rejection() -> Result<()
             for fail in [false, true] {
                 let device = Device { library: &library, id: gpu as i32 };
                 let (rank, world, base) = (6 + gpu, 8, 256u64);
-                let plan = CoordinatorExpertPlan::exlr8(&catalog, "mixed", &[3], gpu, usize::MAX)?;
+                let plan = CoordinatorExpertPlan::exlr8(&catalog, "mixed", &[3], 2, gpu, usize::MAX)?;
                 let checked_tp2 = plan.checked(&catalog, root.path(), world, rank)?;
                 let mut arenas = vec![0; world];
                 arenas[rank] = base + plan.logical_bytes();

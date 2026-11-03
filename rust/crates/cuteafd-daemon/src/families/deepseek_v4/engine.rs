@@ -460,7 +460,8 @@ impl<'a> Engine<'a> {
             self.exchange_policy.slot_bytes(self.prefill_rows, self.decode_rows, self.cfg.dim)
         } else { self.prefill_rows.max(self.decode_rows) * self.cfg.dim * 2 };
         let exchange = PeerExchange::new_abortable(self.library, [RankDevice { device: self.device, stream: self.stream },
-            RankDevice { device, stream }], 4 * self.prefill_waves, slot_bytes)?;
+            RankDevice { device, stream }], 4 * self.prefill_waves, slot_bytes,
+            self.exchange_policy.decode_bytes(self.decode_rows, self.cfg.dim))?;
         let peer = exchange.on(1, || -> Result<V4Peer<'a>> {
             self.programs.load_matching(|name| self.selected_programs().contains(name))?;
             // The peer's caches and RoPE tables are KV, not exchange storage.

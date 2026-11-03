@@ -47,7 +47,7 @@ pub fn estimate_s(rates: &Rates, info: &ServerInfo) -> f64 {
     let decode = 3.0 * rates.seconds(60.0, DECODE_TOKENS as f64);
     let prefill = rates.seconds(PREFILL_TOKENS as f64 + 1600.0, 4.0);
     let fidelity = 4096.0 / rates.decode_tok_s + 24000.0 / rates.prefill_tok_s + 8.0 * 0.15;
-    let cache = rates.seconds(6.0 * 1500.0, 30.0);
+    let cache = rates.seconds(6.0 * CACHE_PROMPT_TOKENS as f64, 30.0);
     let spec = rates.seconds(200.0, 2.0 * 128.0 * 1.6);
     let template = rates.seconds(400.0, 400.0);
     let c4 = rates.seconds(500.0, 2.0 * 64.0);
@@ -327,19 +327,24 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let client = run.client;
     let rows = |n: usize| ProbeSpec { no_speculation: true, record_rows: n, top_k: 1, ..ProbeSpec::default() };
     // Prompt end: the first request computes and retains, the second restores it whole.
-    let text = format!("[{}] Read the notes and answer in one word.\n\n{}", nonce(), corpus(31, 1100));
+    let (text, turn_text) = cache_prompts();
     let first = probed(client, plain(client, &text, 2), rows(2))?;
     if !honoured(&first) {
         unsupported(check);
         return Ok(());
     }
     let restored = probed(client, plain(client, &text, 2), rows(2))?;
+    let minimum = cache_minimum_tokens(run.info);
+    check.set("prompt_reference_tokens", CACHE_PROMPT_TOKENS as u64);
+    check.set("minimum_prompt_tokens", minimum as u64);
+    check.set("prompt_tokens", restored.prompt_ids.len() as u64);
+    if !cache_coverage(check, "prompt", restored.prompt_ids.len(), minimum) { return Ok(()); }
     // Turn end. Long enough to clear the cache's minimum snapshot size and several units; the
     // answer runs past 25 tokens, so the turn ends at its length limit and the turn snapshot is
     // followed by a decode step.
-    let turn_text = format!("[{}] Here are some notes.\n\n{}\n\nCount from one to forty in words, separated by commas.",
-        nonce(), corpus(57, 900));
     let turn = probed(client, plain(client, &turn_text, TURN_TOKENS as u64), rows(TURN_TOKENS))?;
+    check.set("turn_prompt_tokens", turn.prompt_ids.len() as u64);
+    if !cache_coverage(check, "turn prompt", turn.prompt_ids.len(), minimum) { return Ok(()); }
     let reference = probed(client, plain(client, &turn_text, TURN_TOKENS as u64 + 1), rows(TURN_TOKENS + 1))?;
     let mut ids = turn.prompt_ids.clone();
     ids.extend(&turn.generated[..turn.generated.len().saturating_sub(1)]);
@@ -348,7 +353,6 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         ProbeSpec { prompt_ids: Some(ids), output_dependent: true, ..rows(2) })?;
     let cold = probed(client, plain(client, &turn_text, 1), ProbeSpec { cold: true, ..rows(1) })?;
     let verdict = Restores::judge(&first, &restored, &turn, &reference, &again, &cold);
-    check.set("prompt_tokens", restored.prompt_ids.len() as u64);
     check.set("prompt_restored", restored.cached_tokens as u64);
     check.set("prompt_rows_compared", verdict.prompt.compared as u64);
     check.set("turn_tokens", again.prompt_ids.len() as u64);
@@ -358,7 +362,114 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     check.set("cold_rows_identical", u64::from(verdict.cold_identical == Some(true)));
     check.status = verdict.status();
     check.summary = verdict.summary();
+    cache_continuation(run, check, minimum)?;
     Ok(())
+}
+
+/// Exercise a short fresh prefill immediately after a multi-unit prompt. Whole
+/// hits above only decode and cannot catch a leaked prefill staging-reuse flag.
+fn cache_continuation(run: &mut Run<'_>, check: &mut Check, minimum: usize) -> Result<()> {
+    let client = run.client;
+    let text = format!("[{}] Read these notes.\n\n{}", nonce(), corpus(73, CACHE_PROMPT_TOKENS));
+    let discovery = probed(client, plain(client, &text, 1), ProbeSpec {
+        no_speculation: true, record_rows: 1, ..ProbeSpec::default() })?;
+    if !cache_coverage(check, "continuation seed", discovery.prompt_ids.len(), minimum) { return Ok(()); }
+    // A suffix has no discovery-prefix hit and ends on exactly three units,
+    // rather than a short last call that clears reuse before the test.
+    let seed_ids = cache_seed_ids(&discovery.prompt_ids, minimum)?;
+    let seed = probed(client, plain(client, "cache continuation seed", 1), ProbeSpec {
+        no_speculation: true, prompt_ids: Some(seed_ids), record_rows: 1, ..ProbeSpec::default() })?;
+    let ids = cache_continuation_ids(&seed.prompt_ids)?;
+    let probe = |cold| ProbeSpec { cold, no_speculation: true, prompt_ids: Some(ids.clone()),
+        record_rows: 1, top_k: usize::MAX, ..ProbeSpec::default() };
+    let warm = probed(client, plain(client, "cache continuation", 1), probe(false))?;
+    let cold = probed(client, plain(client, "cache continuation", 1), probe(true))?;
+    let repeat = probed(client, plain(client, "cache continuation", 1), probe(true))?;
+    let fresh = warm.prompt_ids.len().saturating_sub(warm.cached_tokens);
+    let covered = continuation_covered(&seed, &warm, minimum);
+    check.set("continuation_seed_tokens", seed.prompt_ids.len() as u64);
+    check.set("continuation_seed_cached_tokens", seed.cached_tokens as u64);
+    check.set("continuation_seed_final_units", json!(seed.last_prefill_units));
+    check.set("continuation_final_units", json!(warm.last_prefill_units));
+    check.set("continuation_cached_tokens", warm.cached_tokens as u64);
+    check.set("continuation_fresh_tokens", fresh as u64);
+    check.set("continuation_covered", covered);
+    check.set("continuation_vs_cold", continuation_rows(&warm, &cold)?);
+    check.set("continuation_cold_noise", continuation_rows(&cold, &repeat)?);
+    if !covered {
+        check.summary.push_str(" · short fresh continuation path not covered");
+        if check.status == CheckStatus::Pass { check.status = CheckStatus::Info; }
+    }
+    Ok(())
+}
+
+fn cache_seed_ids(discovered: &[u32], minimum: usize) -> Result<Vec<u32>> {
+    anyhow::ensure!(minimum >= 128 && discovered.len() > minimum, "seed needs a distinct suffix of at least {minimum} input ids");
+    let suffix = &discovered[discovered.len() - minimum..];
+    anyhow::ensure!(suffix[0] != discovered[0], "seed suffix must start outside the discovery prefix");
+    Ok(suffix.to_vec())
+}
+
+fn continuation_covered(seed: &ProbeRecord, warm: &ProbeRecord, minimum: usize) -> bool {
+    seed.prompt_ids.len() == minimum && seed.cached_tokens == 0
+        && seed.last_prefill_units.is_some_and(|units| units >= 2)
+        && warm.cached_tokens == minimum && warm.prompt_ids.len() == minimum + 64
+        && warm.last_prefill_units == Some(1)
+}
+
+fn cache_continuation_ids(prefix: &[u32]) -> Result<Vec<u32>> {
+    anyhow::ensure!(prefix.len() >= 128, "continuation seed is too short");
+    let mut ids = prefix.to_vec();
+    // Reuse input text ids, not generated output: both arms see the same input.
+    ids.extend_from_slice(&prefix[prefix.len() - 128..prefix.len() - 64]);
+    Ok(ids)
+}
+
+/// KL(cold || warm) from complete vocabulary log-probabilities, not a top-k
+/// approximation. Retain scalar evidence only; three full rows stay local.
+fn continuation_rows(warm: &ProbeRecord, cold: &ProbeRecord) -> Result<Value> {
+    anyhow::ensure!(warm.prompt_ids == cold.prompt_ids, "continuation prompts differ");
+    let at = cold.prompt_ids.len();
+    let a = warm.rows.iter().find(|row| row.position == at).context("warm continuation row missing")?;
+    let b = cold.rows.iter().find(|row| row.position == at).context("cold continuation row missing")?;
+    anyhow::ensure!(a.finite && b.finite && !a.top.is_empty() && a.top.len() == b.top.len(),
+        "continuation rows are incomplete or non-finite");
+    let values: std::collections::HashMap<_, _> = a.top.iter().copied().collect();
+    let mut kl = 0.0;
+    let mut mass = 0.0;
+    for &(token, lp) in &b.top {
+        let q = *values.get(&token).context("continuation vocabularies differ")?;
+        let p = f64::from(lp).exp();
+        mass += p;
+        if p > 0.0 { kl += p * (f64::from(lp) - f64::from(q)); }
+    }
+    anyhow::ensure!((mass - 1.0).abs() < 1e-4 && kl.is_finite(), "continuation row is not a full distribution");
+    Ok(json!({"rows": 1, "vocab": b.top.len(), "kl": kl.max(0.0),
+        "top1": u8::from(a.argmax == b.argmax), "warm_argmax": a.argmax,
+        "cold_argmax": b.argmax, "byte_identical": a.hash == b.hash}))
+}
+
+// Leave room for model/reference tokenizer differences above three 2752-row units.
+const CACHE_PROMPT_TOKENS: usize = 10240;
+
+fn cache_minimum_tokens(info: &ServerInfo) -> usize {
+    let positive = |name| info.setting(name).and_then(|s| s.parse::<usize>().ok()).filter(|n| *n > 0);
+    // Qwen's explicit unit override takes precedence over its span-sized prefill-rows.
+    positive("prefill-units").or_else(|| positive("prefill-rows"))
+        .map_or(8256, |rows| rows.saturating_mul(3))
+}
+
+fn cache_coverage(check: &mut Check, name: &str, actual: usize, minimum: usize) -> bool {
+    if actual >= minimum { return true; }
+    check.status = CheckStatus::Skipped;
+    check.summary = format!("multi-unit coverage missing: {name} has {actual} tokens, needs at least {minimum}");
+    false
+}
+
+fn cache_prompts() -> (String, String) {
+    (format!("[{}] Read the notes and answer in one word.\n\n{}", nonce(), corpus(31, CACHE_PROMPT_TOKENS)),
+        format!("[{}] Here are some notes.\n\n{}\n\nCount from one to forty in words, separated by commas.",
+            nonce(), corpus(57, CACHE_PROMPT_TOKENS)))
 }
 
 /// Generated tokens of the turn-end case's turn.
@@ -836,6 +947,97 @@ pub fn describe(timing: &StreamTiming) -> String {
 mod tests {
     use super::*;
     use crate::report::Check;
+
+    #[test]
+    fn short_continuation_keeps_the_prefix_and_appends_only_input_text_ids() {
+        let prefix: Vec<_> = (0..10240).collect();
+        let ids = cache_continuation_ids(&prefix).unwrap();
+        assert_eq!(&ids[..prefix.len()], &prefix);
+        assert_eq!(&ids[prefix.len()..], &prefix[prefix.len() - 128..prefix.len() - 64]);
+        assert!(cache_continuation_ids(&[1; 127]).is_err());
+    }
+
+    #[test]
+    fn continuation_coverage_requires_actual_multi_unit_final_call_and_fresh_seed() {
+        let discovered: Vec<u32> = (0..9592).collect();
+        let ids = cache_seed_ids(&discovered, 8256).unwrap();
+        assert_eq!(ids.len(), 8256);
+        assert_eq!(ids[0], 1336);
+        assert!(cache_seed_ids(&[1; 9000], 8256).is_err());
+        assert!(cache_seed_ids(&discovered, discovered.len()).is_err());
+        let mut seed = ProbeRecord { prompt_ids: ids, last_prefill_units: Some(3), ..ProbeRecord::default() };
+        let mut warm = ProbeRecord { prompt_ids: cache_continuation_ids(&seed.prompt_ids).unwrap(),
+            cached_tokens: 8256, last_prefill_units: Some(1), ..ProbeRecord::default() };
+        assert!(continuation_covered(&seed, &warm, 8256));
+        for units in [None, Some(0), Some(1)] {
+            seed.last_prefill_units = units;
+            assert!(!continuation_covered(&seed, &warm, 8256));
+        }
+        seed.last_prefill_units = Some(3);
+        seed.cached_tokens = 1;
+        assert!(!continuation_covered(&seed, &warm, 8256));
+        seed.cached_tokens = 0;
+        warm.last_prefill_units = None;
+        assert!(!continuation_covered(&seed, &warm, 8256));
+        warm.last_prefill_units = Some(1);
+        warm.cached_tokens -= 1;
+        assert!(!continuation_covered(&seed, &warm, 8256));
+    }
+
+    #[test]
+    fn continuation_kl_distinguishes_gross_drift_from_cold_noise() {
+        use cuteafd_api::openai::probe::summarize;
+        let record = |logits: &[f32]| ProbeRecord { prompt_ids: vec![1, 2],
+            rows: vec![summarize(2, logits, usize::MAX, &[])], ..ProbeRecord::default() };
+        let cold = record(&[0.0, 6.0, -4.0]);
+        let noise = continuation_rows(&record(&[0.0001, 6.0, -4.0]), &cold).unwrap();
+        assert_eq!(noise["top1"], 1);
+        assert!(noise["kl"].as_f64().unwrap() < 1e-5);
+        let missing = continuation_rows(&record(&[6.0, 0.0, -4.0]), &cold).unwrap();
+        assert_eq!(missing["top1"], 0);
+        assert!(missing["kl"].as_f64().unwrap() > 5.0);
+        let mut incomplete = cold.clone();
+        incomplete.rows[0].top.truncate(1);
+        assert!(continuation_rows(&incomplete, &cold).is_err());
+    }
+
+    #[test]
+    fn cache_prompts_cover_three_largest_prefill_units() {
+        assert!(CACHE_PROMPT_TOKENS >= 3 * 2752);
+        let (prompt, turn) = cache_prompts();
+        for (text, seed) in [(prompt, 31), (turn, 57)] {
+            let body = corpus(seed, CACHE_PROMPT_TOKENS);
+            assert!(text.contains(&body));
+            assert!(body.len() > corpus(seed, 3 * 2752).len());
+        }
+    }
+
+    #[test]
+    fn cache_coverage_requires_three_actual_model_units() {
+        use crate::report::Setting;
+        let mut info = ServerInfo::default();
+        assert_eq!(cache_minimum_tokens(&info), 8256);
+        for value in ["0", "auto", ""] {
+            info.configuration.settings = vec![Setting { name: "prefill-rows".into(), value: Some(value.into()),
+                ..Setting::default() }];
+            assert_eq!(cache_minimum_tokens(&info), 8256);
+        }
+        info.configuration.settings = vec![Setting { name: "prefill-rows".into(), value: Some("4096".into()),
+            ..Setting::default() }];
+        assert_eq!(cache_minimum_tokens(&info), 12288);
+        info.configuration.settings.push(Setting { name: "prefill-units".into(), value: Some("2752".into()),
+            ..Setting::default() });
+        let minimum = cache_minimum_tokens(&info);
+        assert_eq!(minimum, 8256);
+        for name in ["prompt", "turn prompt"] {
+            let mut check = Check::new("cache_exact", "Prefix cache exactness");
+            assert!(!cache_coverage(&mut check, name, 8121, minimum));
+            assert_eq!(check.status, CheckStatus::Skipped);
+            assert!(check.summary.contains("8121"));
+            assert!(check.summary.contains("8256"));
+            assert!(cache_coverage(&mut Check::new("cache_exact", "Prefix cache exactness"), name, minimum, minimum));
+        }
+    }
 
     #[test]
     fn concurrent_levels_respect_admission_and_card_memory() {

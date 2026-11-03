@@ -45,6 +45,11 @@ pub(crate) enum BenchAction {
         #[arg(long, env = "CUTEAFD_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
     },
+    /// List every panel id selectable by --panels or profile `panels:...`.
+    Panels {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -137,6 +142,17 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
             other => other,
         },
         Some(BenchAction::Cancel { url, api_key }) => cuteafd_bench::cli::cancel(&url, &api_key),
+        Some(BenchAction::Panels { json }) => {
+            let ids = cuteafd_bench::profiles::selectable_panel_ids();
+            if json {
+                println!("{}", serde_json::to_string(&ids)?);
+            } else {
+                for id in ids {
+                    println!("{id}");
+                }
+            }
+            Ok(())
+        }
         Some(BenchAction::Export { json, out, root, export }) => {
             let report: cuteafd_bench::report::Report = serde_json::from_str(&std::fs::read_to_string(&json)?)?;
             // The exports re-render under the rule in force now (an nvidia NVFP4
@@ -259,7 +275,7 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
     settings.extend(cuteafd_bench::context::env_settings().into_iter()
         .filter(|setting| setting.name != "CUTEAFD_ATTENTION_PLACEMENT"));
     Ok(Some(cuteafd_bench::context::ServerContext { command: name.to_string(),
-        family: Some(family.to_string()), snapshot, settings, supports_thinking_off: None }))
+        family: None, snapshot, settings, supports_thinking_off: None }))
 }
 
 /// The attention placement `requested` resolves to for a serve command: two coordinator GPUs
@@ -307,7 +323,7 @@ mod tests {
                 .into_iter().chain(extra).collect::<Vec<_>>();
             let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
             let context = serve_context(&matches, None).unwrap().expect("Step-5 serve context");
-            assert_eq!(context.family.as_deref(), Some("step5"));
+            assert_eq!(context.family, None);
             let placement = context.settings.iter().find(|s| s.name == "attention-placement").unwrap();
             assert_eq!(placement.value.as_deref(), Some("heads"));
             assert_eq!(placement.default.as_deref(), Some("heads"));
@@ -354,13 +370,13 @@ mod tests {
     }
 
     #[test]
-    fn dense_qwen_context_reports_family_and_active_draft_settings() {
+    fn dense_qwen_context_leaves_family_to_loader_and_reports_active_draft_settings() {
         for draft in [None, Some("/model/dspark")] {
             let mut argv = vec!["cuteafd", "serve-qwen35", "--snapshot", "/target", "--native-lib", "/native.so"];
             if let Some(snapshot) = draft { argv.extend(["--draft", snapshot, "--draft-fixed", "7"]); }
             let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
             let context = serve_context(&matches, None).unwrap().expect("dense serve context");
-            assert_eq!(context.family.as_deref(), Some("qwen3_5"));
+            assert_eq!(context.family, None);
             assert_eq!(context.snapshot.as_deref(), Some(std::path::Path::new("/target")));
             let configuration = cuteafd_bench::server::configuration(&context, &Default::default());
             assert_eq!(configuration.speculator.is_some(), draft.is_some());
@@ -379,7 +395,7 @@ mod tests {
         let cli = crate::cli::Cli::from_arg_matches(&matches).unwrap();
         capture(&matches, cli.coordinator_gpu_budget_gib).unwrap();
         let context = cuteafd_bench::context::get();
-        assert_eq!(context.family.as_deref(), Some("qwen4"));
+        assert_eq!(context.family, None);
         assert_eq!(context.snapshot.as_deref(), Some(std::path::Path::new("/hub/models--Qwen--Q/snapshots/abc")));
         let find = |name: &str| context.settings.iter().find(|s| s.name == name).cloned()
             .unwrap_or_else(|| panic!("{name} missing"));
@@ -417,5 +433,12 @@ mod tests {
         let placed = placement(&one);
         assert_eq!(placed.len(), 1, "{placed:?}");
         assert_eq!(placed[0].value.as_deref(), Some("heads"));
+    }
+
+    #[test]
+    fn bench_panels_subcommand_parses_json_flag() {
+        let matches = crate::cli::Cli::command().try_get_matches_from(["cuteafd", "bench", "panels", "--json"]).unwrap();
+        let bench = BenchArgs::from_arg_matches(matches.subcommand().unwrap().1).unwrap();
+        assert!(matches!(bench.action, Some(BenchAction::Panels { json: true })));
     }
 }

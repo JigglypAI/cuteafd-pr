@@ -52,6 +52,39 @@ fn mixed_rank_plans_land_mount_bytes_and_reject_changed_placement() -> Result<()
 }
 
 #[test]
+fn coordinator_native_worlds_preserve_exact_payload_residency() -> Result<()> {
+    use crate::shared::memory::push_coordinator::CoordinatorExpertPlan;
+    for padded in [false, true] {
+        let root = tempfile::tempdir()?;
+        fixture(root.path(), padded);
+        let catalog = fixture_catalog(root.path())?;
+        for world in [1, 2] {
+            for rank in 0..world {
+                let residency = Residency::plan(root.path(), "mixed", 3, world, rank, ExpertSet::Routed)?;
+                let plan = CoordinatorExpertPlan::exlr8(&catalog, "mixed", &[3], world, rank,
+                    residency.resident_bytes)?;
+                assert_eq!(plan.layout.bytes(), residency.resident_bytes);
+                assert_eq!((plan.exlr8[0].world, plan.exlr8[0].rank), (world, rank));
+                assert_eq!(plan.exlr8[0].compact_unit_limit(), residency.units.div_ceil(world));
+                let mut builder = Builder::new(root.path(), vec![0; world - 1].into_iter()
+                    .chain([plan.logical_bytes()]).collect());
+                // Group rank and native TP rank are independent (the coordinator may follow Sparks).
+                plan.append_at(&mut builder, &catalog, (world - 1) as u32, 0)?;
+                let checked = builder.finish()?;
+                assert!(!checked.plan.entries.is_empty());
+                assert!(checked.plan.entries.iter().all(|entry| entry.rank == (world - 1) as u32));
+                assert!(CoordinatorExpertPlan::exlr8(&catalog, "mixed", &[3], world, rank,
+                    residency.resident_bytes - 1).is_err());
+            }
+        }
+        for (world, rank) in [(0, 0), (1, 1), (2, 2), (3, 0)] {
+            assert!(CoordinatorExpertPlan::exlr8(&catalog, "mixed", &[3], world, rank, usize::MAX).is_err());
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn installed_exlr8_rank_plans_match_admission_when_supplied() -> Result<()> {
     let Some(snapshot) = std::env::var_os("CUTEAFD_PUSH_EXLR8") else { return Ok(()); };
     let snapshot = Path::new(&snapshot);
@@ -122,7 +155,7 @@ fn onboarded_tp2_destinations_join_the_exlr8_group_without_changing_residency() 
         std::fs::write(config_path, serde_json::to_vec(&config)?)?;
         let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
         for (layers, gpu) in [(vec![], 0), (vec![7, 5], 0), (vec![5, 5], 0), (vec![5, 7], 2)] {
-            assert!(CoordinatorExpertPlan::exlr8(&catalog, "mixed", &layers, gpu, usize::MAX).is_err());
+            assert!(CoordinatorExpertPlan::exlr8(&catalog, "mixed", &layers, 2, gpu, usize::MAX).is_err());
         }
         for sparks in [0, 4, 6] {
             let mut assignments = Vec::new();
@@ -146,7 +179,7 @@ fn onboarded_tp2_destinations_join_the_exlr8_group_without_changing_residency() 
             for gpu in 0..2 {
                 let resident = [5, 7].into_iter().map(|layer| Residency::plan(root.path(), "mixed", layer, 2, gpu, ExpertSet::Routed)
                     .map(|r| r.resident_bytes)).collect::<std::result::Result<Vec<_>, _>>()?.into_iter().sum::<usize>();
-                let plan = CoordinatorExpertPlan::exlr8(&catalog, "mixed", &[5, 7], gpu, resident)?;
+                let plan = CoordinatorExpertPlan::exlr8(&catalog, "mixed", &[5, 7], 2, gpu, resident)?;
                 assert_eq!(plan.layers, [5, 7]);
                 assert_eq!(plan.exlr8.len(), 2);
                 assert_eq!(plan.layout.bytes(), resident);
@@ -161,12 +194,12 @@ fn onboarded_tp2_destinations_join_the_exlr8_group_without_changing_residency() 
                     host_peak as u64)?, host_peak);
                 assert!(CoordinatorExpertPlan::admit_host(&host_plans, 128, 1 << 20,
                     host_peak as u64 - 1).is_err());
-                assert!(CoordinatorExpertPlan::exlr8(&catalog, "mixed", &[5, 7], gpu,
+                assert!(CoordinatorExpertPlan::exlr8(&catalog, "mixed", &[5, 7], 2, gpu,
                     resident - 1).is_err());
                 offers.push(Offer { rank: sparks + gpu, host: "coordinator".into(),
                     arena_bytes: base + host_plans[0].as_ref().unwrap().logical_bytes(), placement: Vec::new() });
             }
-            let host_plans = (0..2).map(|gpu| CoordinatorExpertPlan::exlr8(&catalog, "mixed", &[5, 7], gpu,
+            let host_plans = (0..2).map(|gpu| CoordinatorExpertPlan::exlr8(&catalog, "mixed", &[5, 7], 2, gpu,
                 usize::MAX).map(Some)).collect::<Result<Vec<_>>>()?;
             let host_peak = 2 * 128 * (1 << 20) + host_plans.iter().map(|plan|
                 plan.as_ref().unwrap().exlr8_host_bytes()).collect::<Result<Vec<_>>>()?.into_iter().sum::<usize>();
@@ -176,7 +209,7 @@ fn onboarded_tp2_destinations_join_the_exlr8_group_without_changing_residency() 
                 append: Box::new(move |builder, catalog, offers| {
                     let catalog = catalog.context("fixture catalog")?;
                     for (gpu, offer) in offers.iter().enumerate() {
-                        let plan = CoordinatorExpertPlan::exlr8(catalog, "mixed", &[5, 7], gpu, usize::MAX)?;
+                        let plan = CoordinatorExpertPlan::exlr8(catalog, "mixed", &[5, 7], 2, gpu, usize::MAX)?;
                         assert_eq!(offer.arena_bytes, base + plan.logical_bytes());
                         plan.append_at(builder, catalog, offer.rank as u32, base)?;
                     }

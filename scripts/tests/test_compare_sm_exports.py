@@ -1121,3 +1121,44 @@ def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, mon
     records = json.loads((tmp_path / "routed.json").read_text())["programs"]
     assert len(records) == 1
     assert records[0]["scratch_bytes"] == (128 if indirect else 64)
+
+
+def test_default_source_root_resolves_worktree_alias_and_preserves_override(tmp_path, monkeypatch):
+    wt_git = tmp_path / "home/user/Developer/cuteafd/.git/worktrees/feature"
+    sub_git = wt_git / "modules/third_party/sparkinfer"
+    sub_git.mkdir(parents=True)
+    real_wt = tmp_path / "home/user/Developer/cute-worktrees/feature"
+    alias = tmp_path / "workspace/cuteafd"
+    for checkout in (real_wt, alias):
+        (checkout / "scripts/build").mkdir(parents=True)
+        (checkout / "python/tools/lib").mkdir(parents=True)
+        (checkout / "third_party/sparkinfer").mkdir(parents=True)
+        (checkout / ".git").write_text(f"gitdir: {wt_git}\n")
+        (checkout / "third_party/sparkinfer/.git").write_text(
+            "gitdir: ../../../../cuteafd/.git/worktrees/feature/modules/third_party/sparkinfer\n"
+        )
+        (checkout / "scripts/build/compare-sm-exports.py").write_text(
+            (ROOT / "scripts/build/compare-sm-exports.py").read_text()
+        )
+    (real_wt / "python/tools/lib/v41_capacities.py").write_text(
+        "TARGET_CAPACITIES = (1, 16)\nDRAFT_CAPACITIES = (1, 16)\nPROJECTION_CAPACITIES = (1, 16)\n"
+    )
+    (wt_git / "gitdir").write_text(f"{real_wt / '.git'}\n")
+
+    assert not compare_sm._gitdir_from_file(alias / "third_party/sparkinfer/.git").exists()
+    assert compare_sm._gitdir_from_file(real_wt / "third_party/sparkinfer/.git") == sub_git.resolve()
+    assert compare_sm.resolve_source_root(alias, env={}) == real_wt.resolve()
+
+    monkeypatch.delenv("CUTEAFD_SOURCE_ROOT", raising=False)
+    monkeypatch.delenv("CUTEAFD_SPARKINFER_SOURCE_DIR", raising=False)
+    alias_spec = importlib.util.spec_from_file_location(
+        "compare_sm_exports_alias", alias / "scripts/build/compare-sm-exports.py"
+    )
+    alias_module = importlib.util.module_from_spec(alias_spec)
+    alias_spec.loader.exec_module(alias_module)
+    assert alias_module.ROOT == real_wt.resolve()
+
+    override = tmp_path / "explicit-override"
+    override.mkdir()
+    assert compare_sm.resolve_source_root(alias, env={"CUTEAFD_SOURCE_ROOT": str(override)}) == real_wt.resolve()
+    assert compare_sm.resolve_source_root(env={"CUTEAFD_SOURCE_ROOT": str(override)}) == override.resolve()

@@ -108,7 +108,7 @@ pub fn placement(inputs: &QwenInputs<'_>) -> anyhow::Result<Placement> {
         }
         return Ok(result);
     };
-    anyhow::ensure!(sequences <= 16, "Qwen startup graphs support at most 16 concurrent sequences");
+    cuteafd_core::concurrency::validate("qwen4", sequences as u64)?;
     let tokens = solve(&request(inputs, 0)?)?.pool_tokens;
     super::super::settle_pool((tokens, ()), |tokens, _| {
         let graphs = qwen_startup_graphs(usize::try_from(inputs.max_context)?, usize::try_from(tokens)?,
@@ -552,7 +552,7 @@ pub fn dual_placement(inputs: &QwenDualInputs<'_>) -> anyhow::Result<Placement> 
         }
         return Ok(result);
     };
-    anyhow::ensure!(sequences <= 16, "Qwen startup graphs support at most 16 concurrent sequences");
+    cuteafd_core::concurrency::validate("qwen4", sequences as u64)?;
     let result = solve(&dual_request(inputs, [0; 2])?)?;
     super::super::settle_pool((result.pool_tokens, owners(&result)?), |tokens, layer_owners| {
         check_dual_layer_owners(layer_owners)?;

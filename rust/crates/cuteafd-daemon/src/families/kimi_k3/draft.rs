@@ -67,7 +67,8 @@ impl<'a> NativeDraft<'a> {
         ensure!(options.cache_format == layout.cache_format(), "Kimi draft options/admission cache records differ");
         let ranks = streams.each_ref().map(|s| RankDevice { device: s.device.id, stream: s.raw });
         let library = streams[0].device.library;
-        let prepared = Prepared::new(library, ranks[0], ranks[1], 1, "kimi-remote-mla-dflash")?;
+        let prepared = Prepared::new(library, ranks[0], ranks[1], 1, "kimi-remote-mla-dflash", crate::shared::draft::remote::decode_extent(
+            layout.capacity().block_rows, layout.target_hidden(), layout.target_vocab(), 1)?)?;
         let file = std::fs::read(options.snapshot.join("model.safetensors"))?;
         let draft = admission.allocate_draft(prepared.stream.device, programs, &options.snapshot, file,
             prepared.stream.raw, options.representation(), Fp8Scales::Amax, Fp8Rows::W8a16)?;

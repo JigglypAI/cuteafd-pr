@@ -82,7 +82,7 @@ pub fn report(failed: bool) -> Report {
         schema: SCHEMA.into(), prompt_content: Some(crate::text::PROMPT_CONTENT.into()), id: "7c1e2d3f4a5b6c7d8e9f".into(), created: "2026-10-02T10:12:00Z".into(),
         finished: Some("2026-10-02T10:14:31Z".into()), status: RunStatus::Done, profile: "smoke".into(),
         plan: vec![PlannedPanel { id: "hardware".into(), passes: 1 }, PlannedPanel { id: "configuration".into(), passes: 1 }],
-        server: ServerInfo { model: "deepseek-ai/DeepSeek-V4.1-Flash".into(), family: Some("deepseek_v41".into()),
+        server: ServerInfo { model: "deepseek-ai/DeepSeek-V4.1-Flash".into(), executor: Some("serve-native".into()), family: Some("deepseek_v41".into()),
             revision: Some("dba1be0a40aa45a94ad051997016db3960a90277".into()),
             build: BuildInfo { version: "0.1.0".into(), release: None, image: None,
                 remote: Some("https://github.com/tpurtell/cuteafd".into()),

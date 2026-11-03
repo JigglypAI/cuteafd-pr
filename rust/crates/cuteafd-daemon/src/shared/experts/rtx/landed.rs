@@ -7,7 +7,7 @@ use anyhow::Result;
 
 pub(crate) enum Tp2Weights<'a> {
     Exl3([Exl3Tp2Weights<'a>; 2]),
-    Exlr8([super::exlr8::Exlr8Tp2Weights<'a>; 2]),
+    Exlr8([super::exlr8::Exlr8RtxWeights<'a>; 2]),
     /// FP8/NVFP4 halves keep their existing owner: its executor holds no
     /// engine, pool or transport state.
     Fp8([Fp8MoeTp2<'a>; 2]),

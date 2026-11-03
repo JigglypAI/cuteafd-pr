@@ -16,7 +16,7 @@ impl<'a> MimoEngine<'a> {
             let routes = PeerExchange::new_abortable_sized(self.library,
             [RankDevice { device: self.device, stream: self.stream },
              RankDevice { device: self.peer.as_ref().context("MiMo peer")?.device, stream: self.stream_of(1) }],
-            &route_sizes)?.with_decode_lane_bytes((80 * self.cfg.topk * 4).next_multiple_of(16) * 2)?;
+            &route_sizes, (DECODE_ROWS * self.cfg.topk * 4).next_multiple_of(16) * 2)?;
             let planned = cuteafd_loader::placement::families::mimo_v2::route_exchange_bytes(
                 rows as u64, self.cfg.topk as u64, self.prefill_waves() as u64)?;
             let diagnostics = if std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1") {

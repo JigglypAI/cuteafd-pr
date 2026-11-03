@@ -9,15 +9,14 @@ pub(super) struct Execution<'a> {
     plan: LayerExecutionPlan,
     hops: HopLink<'a>,
     // Keep dispatched receivers owned across submission errors until engine drainage.
-    /// Per lane: the return slot of the Spark wave its `begin_ffn` landed.
-    waves: RefCell<Vec<Option<usize>>>,
+    waves: RefCell<Vec<Option<PendingWave>>>,
     pub(super) segments: Vec<GlmOwnedSegment>,
 }
 
 enum Transport<'t, 'l> {
     Serial(Option<(&'t mut SparkLink<'l>, &'t tokio::runtime::Runtime)>),
-    /// Prefill units sharing the one prefill link, borrowed per send/land.
-    Shared(&'t std::cell::RefCell<&'t mut SparkLink<'l>>, &'t tokio::runtime::Runtime),
+    Continuous(&'t mut crate::shared::spark_waves::Waves<'l>),
+    Local,
 }
 
 struct Bindings<'e, 'a, 't, 'l, 'c> {
@@ -31,8 +30,31 @@ struct Bindings<'e, 'a, 't, 'l, 'c> {
     tap: (usize, usize, usize),
 }
 
+enum PendingWave {
+    Landed(usize),
+    Dispatched(crate::shared::spark_waves::WaveTicket),
+}
+
+struct UnitExchange<'e, 'a> {
+    engine: &'e GlmEngine<'a>,
+    execution: &'e Execution<'a>,
+}
+
+impl attention::LayerProtocol for UnitExchange<'_, '_> {
+    type Ticket = crate::shared::peer_split::hop::HopTicket;
+    fn require_live(&self) -> Result<()> { self.engine.exchange()?.require_live() }
+    fn push_entry(&self, from: usize, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()> {
+        self.engine.exchange()?.push_to(from, DIRECT, source, destination, bytes)
+    }
+    fn wait_entry(&self, to: usize) -> Result<()> { self.engine.exchange()?.wait(to, DIRECT) }
+    fn send(&self, index: usize, lane: usize, source: *const c_void, rows: usize) -> Result<Self::Ticket> {
+        self.execution.hops.send(index, lane, source, rows)
+    }
+    fn land(&self, ticket: Self::Ticket) -> Result<*mut c_void> { self.execution.hops.land(ticket) }
+}
+
 #[derive(Clone, Copy)]
-enum Ticket {
+pub(super) enum Ticket {
     Complete,
     Skip(usize),
     Spark,
@@ -68,7 +90,7 @@ impl<'a> GlmEngine<'a> {
         }
         let exchange = self.exchange()?;
         let mut hops = HopLink::new(self.library, [0, 1].map(|rank| RankDevice {
-            device: exchange.device(rank), stream: exchange.stream(rank) }), plan.hops(), spec)?;
+            device: exchange.device(rank), stream: exchange.stream(rank) }), plan.hops(), spec, DECODE_ROWS * self.cfg.hidden * 2)?;
         hops.attach_abort([exchange.abort_word(0)?.context("rank 0 abort")?, exchange.abort_word(1)?.context("rank 1 abort")?])?;
         hops.validate_binding(&plan, exchange)?;
         let owners: Vec<_> = self.weights.layers.iter().map(|layer| layer.attention_owner.unwrap()).collect();
@@ -112,31 +134,68 @@ impl<'a> GlmEngine<'a> {
         Ok(Some(self.device_logits(w, wanted, tables[0].decode && rows == wanted)))
     }
 
-    /// Owned-attention prefill units on the one prefill link. The shared layer
-    /// pipeline's ordered chunks land each wave before the next is sent, so
-    /// the units share the link (its return slots rotate) with one in flight.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn layer_prefill(&self, scope: &SubmissionScope<'_>, work: &[&Workspace<'a>],
-        peers: &PeerWorkspaces<'_, 'a>, tables: &[[StepTables; 2]], wanted: usize,
-        link: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<Option<StepLogits>> {
-        let total = tables.iter().map(|t| t[0].positions.len()).sum::<usize>();
-        let mut first = 0;
-        let mut bindings = Vec::new();
-        let link = std::cell::RefCell::new(link);
-        for (lane, (table, w)) in tables.iter().zip(work).enumerate() {
-            let rows = table[0].positions.len();
-            let start = total.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS).max(first).min(first + rows);
-            let owners = self.loaded_attention_owners();
-            bindings.push(Bindings { engine: self, work: [w, peers.get(lane)?], tables: table, lane,
-                transport: Transport::Shared(&link, runtime), owners, on_layer: None,
-                tap: (start - first, first + rows - start, start.saturating_sub(total.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS))) });
-            first += rows;
+    pub(super) fn validate_owned_units(&self) -> Result<usize> {
+        let execution = self.layer_execution.as_ref().context("GLM layer execution")?;
+        execution.hops.validate_binding(&execution.plan, self.exchange()?)?;
+        for (layer, owners) in self.loaded_attention_owners().iter().enumerate() {
+            execution.plan.validate_state_owners(layer, owners)?;
         }
-        self.run_layer_pipeline(scope, LaneOrder::OrderedChunks, &mut bindings)?;
-        if let Some(pair) = &self.tp2 { pair.finish_checks()?; }
-        let counts: Vec<_> = tables.iter().map(|table| table[0].positions.len()).collect();
-        self.prefill_logits(work, &counts, wanted)
+        Ok(execution.plan.hops().len())
     }
+
+    fn unit_binding<'s, 't, 'l>(&'s self, work: [&'s Workspace<'a>; 2], tables: &'s [StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, total: usize, transport: Transport<'t, 'l>)
+        -> Bindings<'s, 'a, 't, 'l, 's> {
+        let window = total.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS);
+        let from = unit.rows.start.max(window).min(unit.rows.end);
+        Bindings { engine: self, work, tables, lane: unit.slot, transport,
+            owners: self.loaded_attention_owners(), on_layer: None,
+            tap: (from - unit.rows.start, unit.rows.end - from, from.saturating_sub(window)) }
+    }
+
+    pub(super) fn owned_unit_attention(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, layer: usize, total: usize, consumed: &mut [usize]) -> Result<()> {
+        let execution = self.layer_execution.as_ref().context("GLM layer execution")?;
+        let exchange = UnitExchange { engine: self, execution };
+        let mut binding = self.unit_binding(work, tables, unit, total, Transport::Local);
+        unit_attention(&exchange, &execution.plan, unit, layer, &mut binding, consumed)
+    }
+
+    pub(super) fn owned_unit_begin(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, layer: usize, total: usize,
+        waves: &mut crate::shared::spark_waves::Waves<'_>) -> Result<Ticket> {
+        self.unit_binding(work, tables, unit, total, Transport::Continuous(waves)).begin_ffn(layer, None)
+    }
+
+    pub(super) fn owned_unit_finish(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, layer: usize, total: usize,
+        waves: &mut crate::shared::spark_waves::Waves<'_>, ticket: Ticket) -> Result<()> {
+        self.unit_binding(work, tables, unit, total, Transport::Continuous(waves)).finish_ffn(layer, ticket)
+    }
+
+    pub(super) fn owned_unit_exit(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, total: usize, consumed: &mut [usize]) -> Result<()> {
+        let execution = self.layer_execution.as_ref().context("GLM layer execution")?;
+        let exchange = UnitExchange { engine: self, execution };
+        let mut binding = self.unit_binding(work, tables, unit, total, Transport::Local);
+        unit_exit(&exchange, &execution.plan, unit, &mut binding, consumed)
+    }
+}
+
+fn unit_attention(exchange: &impl attention::LayerProtocol, plan: &LayerExecutionPlan,
+    unit: &crate::shared::prefill_pipeline::Unit, layer: usize, kernels: &mut impl LayerKernels,
+    consumed: &mut [usize]) -> Result<()> {
+    attention::pipeline_attention(exchange, plan, layer, unit.slot, unit.rows.len(), kernels, consumed)?;
+    Ok(())
+}
+
+fn unit_exit(exchange: &impl attention::LayerProtocol, plan: &LayerExecutionPlan,
+    unit: &crate::shared::prefill_pipeline::Unit, kernels: &mut impl LayerKernels,
+    consumed: &mut [usize]) -> Result<()> {
+    attention::pipeline_hops(exchange, plan, HopPoint::Exit, unit.slot, unit.rows.len(), kernels, consumed)?;
+    ensure!(consumed.len() == plan.hops().len() && consumed.iter().all(|&count| count == 1),
+        "planned unit hop missing or duplicated");
+    Ok(())
 }
 
 impl Bindings<'_, '_, '_, '_, '_> {
@@ -284,14 +343,13 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         // and the prefetch queue behind them; the planes' wait is queued in
         // `finish_ffn`. The host never waits for the GPU or the Sparks.
         let cap = self.cap();
-        let (slot, ticket) = match &mut self.transport {
-            Transport::Serial(Some((link, _))) => (e.moe_exchange(w, index, layer, real, cap, decode,
-                link.exchange()?)?, Ticket::Spark),
-            Transport::Shared(link, _) => (e.moe_exchange(w, index, layer, real, cap, decode,
-                link.borrow_mut().exchange()?)?, Ticket::Lane),
+        let (pending, ticket) = match &mut self.transport {
+            Transport::Serial(Some((link, _))) => (PendingWave::Landed(e.moe_exchange(w, index, layer, real, cap, decode,
+                link.exchange()?)?), Ticket::Spark),
+            Transport::Continuous(waves) => (PendingWave::Dispatched(e.moe_wave(w, index, layer, real, cap, waves)?), Ticket::Lane),
             _ => anyhow::bail!("GLM MoE layer {index} needs Spark peers"),
         };
-        execution.waves.borrow_mut()[self.lane] = Some(slot);
+        execution.waves.borrow_mut()[self.lane] = Some(pending);
         Ok(ticket)
     }
     fn finish_ffn(&mut self, index: usize, ticket: Ticket) -> Result<()> {
@@ -301,15 +359,19 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         let planes = match ticket {
             Ticket::Skip(ranks) => Some((e.skip.as_ref().context("skip")?.pointers(), ranks)),
             Ticket::Spark | Ticket::Lane => {
-                let slot = e.layer_execution.as_ref().context("layer execution")?.waves.borrow_mut()[self.lane]
+                let pending = e.layer_execution.as_ref().context("layer execution")?.waves.borrow_mut()[self.lane]
                     .take().context("missing dispatched Spark wave")?;
-                let mut reduce = |waves: &mut crate::shared::spark_waves::Waves<'_>| -> Result<()> {
+                let mut reduce = |waves: &mut crate::shared::spark_waves::Waves<'_>, slot| -> Result<()> {
                     e.reduce(waves.planes(slot), w, waves.ranks(), real)?;
                     waves.consumed(slot, e.stream)
                 };
-                match (&mut self.transport, ticket) {
-                    (Transport::Serial(Some((link, _))), Ticket::Spark) => reduce(link.exchange()?)?,
-                    (Transport::Shared(link, _), Ticket::Lane) => reduce(link.borrow_mut().exchange()?)?,
+                match (&mut self.transport, ticket, pending) {
+                    (Transport::Serial(Some((link, _))), Ticket::Spark, PendingWave::Landed(slot)) => reduce(link.exchange()?, slot)?,
+                    (Transport::Continuous(waves), Ticket::Lane, PendingWave::Dispatched(wave)) => {
+                        let slot = wave.slot();
+                        waves.land(wave, e.stream)?;
+                        reduce(waves, slot)?;
+                    }
                     _ => anyhow::bail!("Spark completion transport changed"),
                 }
                 None
@@ -481,6 +543,102 @@ mod tests {
             }
             schedule.sync(0, "layer diagnostic download");
             Ok(())
+        }
+    }
+
+    struct Units<'a> {
+        trace: &'a Trace,
+        live: [Option<usize>; 3],
+        pending: std::collections::VecDeque<(usize, usize)>,
+        consumed: Vec<Vec<usize>>,
+        committed: usize,
+        peak: usize,
+        retired: bool,
+    }
+
+    impl crate::shared::prefill_pipeline::PrefillHooks for Units<'_> {
+        type Ticket = usize;
+        fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
+            if layer % 3 == 2 { crate::shared::prefill_pipeline::FfnRoute::Spark }
+            else { crate::shared::prefill_pipeline::FfnRoute::Local }
+        }
+        fn begin_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+            self.trace.callback()?;
+            ensure!(self.live[unit.slot].replace(unit.index).is_none(), "reused an in-flight GLM unit slot");
+            Ok(())
+        }
+        fn attention(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+            assert_eq!(self.live[unit.slot], Some(unit.index));
+            unit_attention(self.trace, &self.trace.plan, unit, layer,
+                &mut Lane { trace: self.trace, lane: unit.slot }, &mut self.consumed[unit.index])
+        }
+        fn local_ffn(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+            let mut lane = Lane { trace: self.trace, lane: unit.slot };
+            let ticket = lane.begin_ffn(layer, None)?;
+            lane.finish_ffn(layer, ticket)
+        }
+        fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<usize> {
+            let ticket = Lane { trace: self.trace, lane: unit.slot }.begin_ffn(layer, None)?;
+            self.pending.push_back((unit.index, layer));
+            self.peak = self.peak.max(self.pending.len());
+            Ok(ticket)
+        }
+        fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: usize) -> Result<()> {
+            ensure!(self.pending.pop_front() == Some((unit.index, layer)), "GLM Spark completion is not FIFO");
+            Lane { trace: self.trace, lane: unit.slot }.finish_ffn(layer, ticket)
+        }
+        fn end_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+            unit_exit(self.trace, &self.trace.plan, unit, &mut Lane { trace: self.trace, lane: unit.slot },
+                &mut self.consumed[unit.index])
+        }
+        fn commit_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+            assert_eq!(self.committed, unit.index);
+            assert_eq!(self.live[unit.slot].take(), Some(unit.index));
+            assert!(!self.pending.iter().any(|&(index, _)| index == unit.index));
+            self.committed += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn owned_continuous_depth_three_recycles_five_units_and_drains_every_failure() {
+        use crate::shared::prefill_pipeline::{run_prefill_units, Unit};
+        for first in [0, 1] {
+            let mut calls = 0;
+            for failure in std::iter::once(None).chain((0..4096).map(Some)) {
+                if failure.is_some_and(|cut| cut >= calls) { break; }
+                let mut trace = Trace::new(first, 3);
+                trace.k6 = true;
+                trace.fail = failure;
+                let units: Vec<_> = (0..5).map(|index| Unit { index, sequence: 0, segments: vec![],
+                    rows: index * 8..(index + 1) * 8, layers: 0..12, slot: index % 3, barrier: false }).collect();
+                let state = RefCell::new(Units { trace: &trace, live: [None; 3], pending: Default::default(),
+                    consumed: vec![vec![0; trace.plan.hops().len()]; 5], committed: 0, peak: 0, retired: false });
+                let result = pair::submit_scoped(|| Ok(()), || {
+                    let mut state = state.borrow_mut();
+                    state.pending.clear();
+                    state.live.fill(None);
+                    state.retired = true;
+                    Ok(())
+                }, |_| run_prefill_units(&mut *state.borrow_mut(), &units, 3));
+                let state = state.borrow();
+                assert!(state.pending.is_empty() && state.live.iter().all(Option::is_none));
+                if failure.is_none() {
+                    result.unwrap();
+                    assert!(!state.retired);
+                    assert_eq!(state.committed, 5);
+                    assert_eq!(state.peak, 3, "depth three collapsed to serialized GLM waves");
+                    assert!(state.consumed.iter().flatten().all(|&n| n == 1));
+                    check_host(&trace.schedule.borrow()).unwrap();
+                    order::check_submission_faults(&trace.schedule.borrow().streams()).unwrap();
+                    calls = trace.calls.get();
+                    assert!(calls < 4096);
+                } else {
+                    assert!(result.is_err());
+                    assert!(state.retired, "submission failure did not retire GLM units");
+                    order::check_terminal(&trace.schedule.borrow().streams(), true).unwrap();
+                }
+            }
         }
     }
 

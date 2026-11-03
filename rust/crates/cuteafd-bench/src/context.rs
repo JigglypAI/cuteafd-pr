@@ -18,6 +18,18 @@ pub struct ServerContext {
     pub supports_thinking_off: Option<bool>,
 }
 
+impl ServerContext {
+    /// Publish the canonical identity from the engine's validated target configuration.
+    pub fn set_family(&mut self, family: &str) {
+        self.family = Some(family.to_owned());
+    }
+}
+
+/// The engine calls this after loading its target config, independently of its serve alias.
+pub fn set_family(family: &str) {
+    if let Ok(mut slot) = state().context.lock() { slot.set_family(family); }
+}
+
 /// What the engine resolved for its device KV pool and host prefix cache.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct KvCapacity {

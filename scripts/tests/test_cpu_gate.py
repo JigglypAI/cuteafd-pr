@@ -32,6 +32,7 @@ def _fake(monkeypatch, outputs):
         Path(log_path).write_text(text)
         return code, 1.0
     monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
+    monkeypatch.setattr(gate, 'installed_planner_skips', lambda source, env: [])
     monkeypatch.setattr(gate, 'run_logged', run_logged)
     monkeypatch.setattr(gate, 'checked', lambda cmd, **k: '')
     return calls
@@ -228,8 +229,62 @@ def test_default_and_full_select_the_same_named_tests_in_both_runners(tmp_path, 
             assert command[command.index('--') + 2:-1:2] == list(gate.FULL_TESTS)
     record = {'task': 't', 'verdict': 'pass', 'head': 'a' * 40, 'dirty': False, 'suites': [result]}
     assert ('not a merge/release gate' in gate.render(record)) != full
-    assert len(gate.FULL_TESTS) == len(set(gate.FULL_TESTS)) == 15
-    assert 'installed_example_deployments_publish_executable_prefill_shapes' in gate.FULL_TESTS
+    assert len(gate.FULL_TESTS) == len(set(gate.FULL_TESTS)) == 17
+    for name in gate.INSTALLED_PLANNERS:
+        assert name in gate.FULL_TESTS
+
+
+def test_full_gate_records_missing_installed_planner_inputs_in_skipped_live_planners(tmp_path, monkeypatch):
+    source = tmp_path / 'source'
+    (source / 'examples/configs').mkdir(parents=True)
+    (source / 'scripts/bench').mkdir(parents=True)
+    (source / 'examples/configs/glm53-exlr8-min.config').write_text(
+        'MODEL_ID=org/glm-exlr8\nMODEL_REVISION=rev-exlr8\nRTX_GPUS=1\n')
+    (source / 'examples/configs/glm53-exlr8-max.config').write_text(
+        'MODEL_ID=org/glm-exlr8\nMODEL_REVISION=rev-exlr8\nRTX_GPUS=2\n')
+    (source / 'examples/configs/other-min.config').write_text(
+        'MODEL_ID=org/other-model\nMODEL_REVISION=rev-other\nRTX_GPUS=1\n')
+    (source / 'scripts/bench/release-smoke-v4.json').write_text(json.dumps({
+        'entries': [{'name': 'other-min', 'config': 'examples/configs/other-min.config', 'sparks': []}]
+    }))
+    hf_home = tmp_path / 'hf'
+    programs = tmp_path / 'PROGRAMS.json'
+    env = {'HOME': str(tmp_path), 'CUTEAFD_DEPLOYMENT_TEST_HF_HOME': str(hf_home),
+           'CUTEAFD_DEPLOYMENT_TEST_PROGRAMS': str(programs)}
+    # Zero checkpoints and missing PROGRAMS: all three installed-checkpoint planners are skipped.
+    assert gate.installed_planner_skips(source, env) == list(gate.INSTALLED_PLANNERS)
+    # Install only the GLM EXLR8 checkpoint + PROGRAMS (mixed inventory): only the EXLR8 test is runnable.
+    (hf_home / 'hub/models--org--glm-exlr8/snapshots/rev-exlr8').mkdir(parents=True)
+    programs.write_text('{"schema":1,"programs":[]}\n')
+    assert gate.installed_planner_skips(source, env) == [
+        'installed_example_deployments_publish_executable_prefill_shapes',
+        'installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers',
+    ]
+    # Install the remaining checkpoint, then remove PROGRAMS: the header-only matrix test is runnable,
+    # while the two planner/launcher tests that require PROGRAMS are recorded as skipped.
+    (hf_home / 'hub/models--org--other-model/snapshots/rev-other').mkdir(parents=True)
+    assert gate.installed_planner_skips(source, env) == []
+    programs.unlink()
+    assert gate.installed_planner_skips(source, env) == [
+        'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
+        'installed_example_deployments_publish_executable_prefill_shapes',
+    ]
+    (tmp_path / 'logs').mkdir()
+    ok = 'test result: ok. 1 passed; 0 failed; 0 ignored\n'
+    real_skips = gate.installed_planner_skips
+    calls = _fake(monkeypatch, [(0, BUILD_OK), (0, ok)])
+    monkeypatch.setattr(gate, 'installed_planner_skips', real_skips)
+    result = gate.cargo(source, tmp_path, SimpleNamespace(**vars(ARGS), full=True), env)
+    assert result['status'] == 'pass'
+    assert result['skipped_full_tests'] == []
+    assert result['skipped_live_planners'] == [
+        'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
+        'installed_example_deployments_publish_executable_prefill_shapes',
+    ]
+    assert calls[1][calls[1].index('--') + 1:-1] == [
+        '--skip', 'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
+        '--skip', 'installed_example_deployments_publish_executable_prefill_shapes',
+    ]
 
 
 @pytest.mark.parametrize('full', [False, True])
@@ -244,6 +299,7 @@ def test_installed_deployment_inventory_is_enabled_only_for_full(tmp_path, monke
                               'test result: ok. 1 passed; 0 failed; 0 ignored\n')
         return 0, 1.
     monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
+    monkeypatch.setattr(gate, 'installed_planner_skips', lambda source, env: [])
     monkeypatch.setattr(gate, 'run_logged', run_logged)
     monkeypatch.setattr(gate, 'checked', lambda cmd, **kwargs: '')
     env = {'HOME': str(tmp_path)}
@@ -561,3 +617,52 @@ def test_interrupt_stops_running_suites(tmp_path):
         assert gate.run_logged(['true'], log_path, dict(os.environ), tmp_path, 10)[0] == 130
     finally:
         gate.STOPPING.clear()
+
+
+def test_gate_scrubs_inherited_compiler_cache_env_and_records_names(tmp_path, monkeypatch):
+    (tmp_path / 'logs').mkdir()
+    inherited = {
+        'CMAKE_C_COMPILER_LAUNCHER': '/tmp/kache',
+        'CMAKE_CXX_COMPILER_LAUNCHER': '/tmp/kache',
+        'CMAKE_CUDA_COMPILER_LAUNCHER': '/tmp/sccache',
+        'CUTEAFD_KACHE': '/tmp/kache',
+        'CUTEAFD_KACHE_MODE': 'enabled',
+        'KACHE_DIR': '/tmp/kache-dir',
+        'CUTEAFD_SCCACHE_DIR': '/tmp/sccache-dir',
+        'SCCACHE_DIR': '/tmp/sccache',
+        'RUSTC_WRAPPER': '/tmp/kache',
+        'RUSTC_WORKSPACE_WRAPPER': '/tmp/kache',
+    }
+    for key, value in inherited.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv('KEEP_PLAIN_VAR', 'kept')
+    seen_envs = []
+
+    def run_logged(cmd, log_path, env, cwd, timeout):
+        seen_envs.append(dict(env))
+        if 'pytest' in cmd:
+            Path(log_path).write_text('=== 5 passed in 0.10s ===\n')
+        elif '--no-run' in cmd:
+            Path(log_path).write_text(BUILD_OK)
+        else:
+            Path(log_path).write_text('test result: ok. 3 passed; 0 failed; 0 ignored\n')
+        return 0, 1.0
+
+    monkeypatch.setattr(gate, 'prepare', lambda source, root, owned=False: None)
+    monkeypatch.setattr(gate, 'checked', lambda cmd, **k: 'deadbeef' if 'rev-parse' in cmd else '')
+    monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
+    monkeypatch.setattr(gate, 'installed_planner_skips', lambda source, env: [])
+    monkeypatch.setattr(gate, 'python_for', lambda source: Path('/usr/bin/python3'))
+    monkeypatch.setattr(gate, 'run_logged', run_logged)
+    args = SimpleNamespace(**vars(ARGS), cargo=True, scripts=True, benches=False, jobs=1)
+    record = gate.gate(ROOT, tmp_path, args)
+    assert record['status'] == 'pass'
+    expected_scrubbed = sorted(inherited)
+    assert record['scrubbed_env'] == expected_scrubbed
+    for suite in record['suites']:
+        assert suite['scrubbed_env'] == expected_scrubbed
+    assert len(seen_envs) == 3
+    for env in seen_envs:
+        assert env.get('KEEP_PLAIN_VAR') == 'kept'
+        for key in expected_scrubbed:
+            assert key not in env

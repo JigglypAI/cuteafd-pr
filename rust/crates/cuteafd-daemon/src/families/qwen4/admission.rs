@@ -724,12 +724,13 @@ mod tests {
         let cfg = cuteafd_loader::families::qwen4::Qwen4Config::read(snapshot.path())?;
         for (capacity, kv_format) in [32_u64 << 30, 101_973_491_712].into_iter().flat_map(|capacity|
             [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].map(|format| (capacity, format))) {
-            for pool in [None, Some(32768)] {
+            for (pool, concurrency) in [None, Some(32768)].into_iter()
+                .flat_map(|pool| [1, 16, 17, 32, 64].map(|c| (pool, c))) {
                 let context = pool.unwrap_or(131072);
                 let report = plan(snapshot.path(), &PlanOptions {
                     placement: ExpertPlacement::Local,
                     layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![capacity], context_tokens: context,
-                        pool_tokens: pool, qwen_kv: kv_format, concurrency: 8, state_slots: Some(8), prefix_slots: Some(0),
+                        pool_tokens: pool, qwen_kv: kv_format, concurrency, state_slots: Some(concurrency), prefix_slots: Some(0),
                         ..Default::default() }), ..Default::default()
                 })?;
                 assert!(report.placement_supported, "{}", cuteafd_loader::plan::render(&report));
@@ -740,16 +741,36 @@ mod tests {
                     "marks" | "graphs" | "graph growth" | "decode step" | "prefill step"))
                     .map(|i| i.bytes).sum::<u64>();
                 let mut args = Cli::try_parse_from(["serve", "--snapshot", snapshot.path().to_str().unwrap(),
-                    "--native-lib", "/nonexistent/lib.so", "--max-context", &context.to_string(), "--slots", "8",
+                    "--native-lib", "/nonexistent/lib.so", "--max-context", &context.to_string(),
+                    "--slots", &concurrency.to_string(),
                     "--pool-tokens", &pool.unwrap_or(0).to_string(), "--kv-cache", &kv_format.to_string()])?.engine;
                 args.planner_prefix_bytes = Some(0);
-                args.planner_graph_modes = Some((8, true));
+                args.planner_graph_modes = Some((concurrency as usize, true));
                 let inputs = super::inputs(&args, &cfg, 48, false, None, None, 0)?;
                 let placement = qwen4::placement(&qwen4::QwenInputs { automatic_context: false, admission: inputs, capacity_bytes: capacity,
                     baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
                     max_context: context, requested_pool: pool, spark_ranks: 0,
                     startup_graph_modes: args.planner_graph_modes })?;
                 assert_eq!(placement.pool_tokens, layout.pool_tokens);
+                let pool = layout.pool_tokens as usize;
+                let executables = super::super::engine::serving_graph_count(context as usize, pool,
+                    cfg.dense_context(), concurrency as usize, true, cfg.layers)?;
+                let graphs = qwen_startup_graphs(context as usize, pool, cfg.dense_context(),
+                    concurrency as usize, true, cfg.layers).unwrap();
+                assert_eq!(graphs.ranks[0].executables, executables as u64);
+                let admitted = device.items.iter().filter(|item| matches!(item.group.as_str(), "graphs" | "graph growth"))
+                    .map(|item| item.bytes).sum::<u64>();
+                assert_eq!(admitted, graphs.bytes(0));
+                let inputs = super::inputs(&args, &cfg, 48, false, None, None, 0)?;
+                let mut invalid = qwen4::QwenInputs { automatic_context: false, admission: inputs, capacity_bytes: capacity,
+                    baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
+                    max_context: context, requested_pool: Some(layout.pool_tokens), spark_ranks: 0,
+                    startup_graph_modes: Some((65, true)) };
+                let error = qwen4::placement(&invalid).unwrap_err();
+                let error = error.downcast_ref::<cuteafd_core::concurrency::ConcurrencyError>().unwrap();
+                assert_eq!((error.requested, error.capacity), (65, 64));
+                invalid.startup_graph_modes = Some((0, true));
+                assert!(qwen4::placement(&invalid).is_err());
                 for item in &placement.items[0] {
                     assert!(device.items.contains(item), "runtime item absent in plan: {item:?}");
                 }
