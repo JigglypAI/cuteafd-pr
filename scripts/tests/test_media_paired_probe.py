@@ -188,10 +188,10 @@ def compare_case(tmp_path, monkeypatch, family, control=False, native_row=(0., -
     from safetensors.numpy import save_file
     from fidelity_windows import canonical, set_hash
     panel = {"schema": "cuteafd.fidelity.set/1", "family": family, "checkpoint": "model",
-             "quick_windows": ["w1"] if quick else ["w0", "w1"], "windows": []}
+             "quick_windows": ["w1", "w2"] if quick else ["w0", "w1"], "windows": []}
     span = {"start": 0, "len": 1, "kind": "image", "key": "a" * 64, "grid": [1, 2, 2],
             "fixture": {"path": "image.png", "sha256": "b" * 64}}
-    for name in ["w0", "w1"]:
+    for name in (["w0", "w1", "w2"] if quick else ["w0", "w1"]):
         panel["windows"].append({"id": name, "block": "vision", "bucket": "0-2K",
                                 "tokens": [9] * 577, "roles": ["ctx"] * 65 + ["gen"] * 512,
                                 "score_from": 65, "media": [span]})
@@ -536,7 +536,10 @@ def test_compare_rebound_capture_uses_bound_windows_and_sealed_admission(tmp_pat
     report = json.loads(args.out.read_text())
     assert report["input_bindings"] == [binding, binding]
     assert report["admitted_media"][0][0]["media"][0]["identity"]["encoder"] == "e" * 64
-    assert [w["id"] for w in report["windows"]] == (["w1"] if quick else ["w0", "w1"])
+    assert [w["id"] for w in report["windows"]] == (["w1", "w2"] if quick else ["w0", "w1"])
+    if quick:
+        assert not (args.native / "w0").exists()
+        assert not (args.reference / "w0").exists()
     for mutation in ("missing", "encoder", "processor", "key", "response"):
         capture = json.loads(json.dumps(manifests[0]))
         admitted = capture["windows"][0]["admitted_media"]
