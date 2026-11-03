@@ -416,52 +416,14 @@ fn dense_error_mount_group(library: &cuteafd_ffi::NativeLibrary, root: &std::pat
     Ok(())
 }
 
-/// The families plan their dense records before membership: a planning error
-/// there offers no coordinator ranks, so the group driver sees the Spark
-/// ranks alone and opens their push group (the coordinator then loads by
-/// mount). The whole-group fallback stays only for errors after membership.
 #[test]
-fn pre_membership_dense_planning_error_offers_no_coordinator_ranks_and_sparks_push() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    // The families' pre-membership step: planning fails, so nothing is offered.
-    let planned = (|| -> Result<(CoordinatorPush, Vec<std::net::TcpStream>,
-        crate::shared::memory::push_exl3::CoordinatorRanks)> {
+fn pre_membership_dense_planning_error_aborts_required_startup() {
+    let planned = PushPolicy::Required.plan::<(CoordinatorPush, Vec<TcpStream>,
+        crate::shared::memory::push_exl3::CoordinatorRanks)>(|| {
         anyhow::bail!("injected dense planning error")
-    })().map_err(|error| tracing::info!(%error, "coordinator push unavailable; mount")).ok();
-    assert!(planned.is_none());
-    let coordinator_streams = planned.map(|(_, streams, _)| streams).unwrap_or_default();
-    // One Spark rank offering push, and no coordinator rank: the group opens.
-    let (mut spark_driver, mut spark) = control_pair()?;
-    let spark_thread = std::thread::spawn(move || cuteafd_transport::worker_selection::push::offer(&mut spark,
-        Some(cuteafd_transport::worker_selection::push::Offer { rank: 0, host: "spark".into(), arena_bytes: 1,
-            placement: Vec::new() })));
-    let socket = root.path().join("group.sock").to_string_lossy().into_owned();
-    let listener = Listener::bind(&socket)?;
-    let server_socket = socket.clone();
-    let server = std::thread::spawn(move || -> Result<usize> {
-        let conn = crate::shared::memory::push_testing::accept_within(&listener, &server_socket, Duration::from_secs(120))?;
-        conn.set_timeout(Some(Duration::from_secs(10)))?;
-        let (request, _) = conn.next_request()?.context("no Create")?;
-        let Request::Create { ranks, .. } = request else { anyhow::bail!("expected Create") };
-        conn.send_event(&Event::Created { group: 7, token: 11 })?;
-        Ok(ranks.len())
     });
-    let mut streams = vec![spark_driver.try_clone()?];
-    streams.extend(coordinator_streams);
-    let mut offered = 0;
-    let client = PushClient::at(socket, Duration::from_secs(10))?;
-    let _ = cuteafd_transport::worker_selection::push::coordinate(&mut streams, |offers| {
-        offered = offers.len();
-        let ranks = offers.iter().map(|o| cuteafd_loader::push_load::proto::RankSpec {
-            rank: o.rank as u32, host: o.host.clone(), arena_bytes: o.arena_bytes }).collect();
-        Ok(client.create(ranks, Vec::new())?)
-    });
-    drop(spark_driver.shutdown(std::net::Shutdown::Both));
-    assert_eq!(offered, 1, "the Spark rank alone is offered");
-    assert_eq!(server.join().map_err(|_| anyhow::anyhow!("server panicked"))??, 1, "the group opens with the Spark rank");
-    let credentials = spark_thread.join().map_err(|_| anyhow::anyhow!("spark panicked"))??;
-    assert_eq!(credentials, Some((7, 11)), "the Spark rank receives the group's push credentials");
-    Ok(())
+    assert!(matches!(planned, Err(PushStartupError::Planning(_))),
+        "failed required planning must not become a Spark-only group plus mount loading");
 }
 
 /// A model of SparkNest's push credit flow (crates/nest-data/src/push.rs

@@ -11,7 +11,7 @@ pub(crate) enum PushPolicy {
 pub(crate) enum PushStartupError {
     #[error("cannot discover SparkNest namespace for {snapshot:?}: {source}")]
     Namespace { snapshot: PathBuf, #[source] source: std::io::Error },
-    #[error("required coordinator push planning failed: {0:#}")]
+    #[error("required push planning failed: {0:#}")]
     Planning(#[source] anyhow::Error),
     #[error("required coordinator push delivery failed: {0:#}")]
     Delivery(#[source] anyhow::Error),
@@ -21,9 +21,15 @@ pub(crate) enum PushStartupError {
 
 impl PushPolicy {
     pub(crate) fn for_snapshot(snapshot: &Path) -> Result<Self, PushStartupError> {
-        match cuteafd_loader::push_load::namespace(snapshot) {
+        Self::from_namespace(snapshot, cuteafd_loader::push_load::namespace(snapshot))
+    }
+
+    pub(crate) fn from_namespace(snapshot: &Path,
+        namespace: std::io::Result<(PathBuf, String)>) -> Result<Self, PushStartupError> {
+        match namespace {
             Ok(_) => Ok(Self::Required),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && snapshot.exists() => Ok(Self::Mount),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                && error.raw_os_error().is_none() && snapshot.exists() => Ok(Self::Mount),
             Err(source) => Err(PushStartupError::Namespace { snapshot: snapshot.into(), source }),
         }
     }
@@ -85,6 +91,22 @@ mod tests {
             let policy = PushPolicy::for_snapshot(&child);
             if valid { assert_eq!(policy?, PushPolicy::Required); }
             else { assert!(matches!(policy, Err(PushStartupError::Namespace { .. }))); }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn namespace_read_errors_fail_coordinator_startup_with_the_original_errno() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        for code in [libc::EACCES, libc::EIO, libc::ENOENT] {
+            let result = PushPolicy::from_namespace(root.path(), Err(std::io::Error::from_raw_os_error(code)));
+            match result {
+                Err(PushStartupError::Namespace { snapshot, source }) => {
+                    assert_eq!(snapshot, root.path());
+                    assert_eq!(source.raw_os_error(), Some(code));
+                }
+                other => panic!("namespace read failure became {other:?}"),
+            }
         }
         Ok(())
     }
