@@ -1163,7 +1163,7 @@ impl Opened {
                     ring: zeroed(args.rings * engine::RING_ROWS * record)? })
             }).collect::<Result<Vec<_>>>()?;
             let rows = engine::DECODE_ROWS;
-            let drafter = mtp::MtpDrafter { projection: cuteafd_ffi::draft_projection::DraftProjections::load(&programs, &[(2 * h, h)])?, stages, hidden: zeroed(args.rings * mtp::HIDDEN_ROWS * h * 2)?,
+            let drafter = mtp::MtpDrafter { projection: cuteafd_ffi::draft_projection::DraftProjections::load(&programs, &[(2 * h, h)], rows)?, stages, hidden: zeroed(args.rings * mtp::HIDDEN_ROWS * h * 2)?,
                 embed: zeroed(rows * h * 2)?, rows_h: zeroed(rows * h * 2)?, normed_e: zeroed(rows * h * 2)?,
                 normed_h: zeroed(rows * h * 2)?, cat: zeroed(rows * 2 * h * 2)?,
                 ext: std::cell::RefCell::new(vec![vec![0; args.mtp]; args.rings]),

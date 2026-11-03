@@ -380,7 +380,9 @@ impl<'a> DsparkDrafter<'a> {
         let shapes = [(h * cfg.taps.len(), h), (h, cfg.qkv_width()), (h, 2 * cfg.kv_heads * cfg.head_dim),
             (cfg.q_width(), h), (h, 2 * cfg.intermediate), (cfg.intermediate, h)];
         let projections = cuteafd_ffi::draft_projection::DraftProjections::load(programs,
-            if representation == GlmDraftRepresentation::Bf16Only { &shapes } else { &[] })?;
+            if representation == GlmDraftRepresentation::Bf16Only { &shapes } else { &[] },
+            cuteafd_ffi::draft_projection::batch_rows(TAP_ROWS, cfg.block, max_sequences,
+                programs.capacities().decode_rows.unwrap_or(0)))?;
         ensure!(context_capacity > 0 && slots > 0 && max_sequences <= slots,
             "dSpark requires nonzero admitted context slots and capacity");
         ensure!(cfg.window.is_none_or(|window| window == context_capacity),

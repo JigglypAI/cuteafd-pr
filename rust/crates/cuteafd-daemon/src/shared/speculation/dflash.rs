@@ -1141,7 +1141,7 @@ fn check_checkpoint_headers(cfg: &DflashConfig, tensors: &HashMap<String, Safete
 
 impl<'a> DflashDrafter<'a> {
     fn load_projections(programs: &'a cuteafd_ffi::programs::Programs<'a>, cfg: &DflashConfig,
-        representation: GlmDraftRepresentation, mla: bool, ml4: bool)
+        representation: GlmDraftRepresentation, mla: bool, ml4: bool, sequences: usize)
         -> Result<cuteafd_ffi::draft_projection::DraftProjections<'a>> {
         let h = cfg.hidden;
         let mut shapes = Vec::new();
@@ -1154,7 +1154,9 @@ impl<'a> DflashDrafter<'a> {
                 }
             }
         }
-        Ok(cuteafd_ffi::draft_projection::DraftProjections::load(programs, &shapes)?)
+        Ok(cuteafd_ffi::draft_projection::DraftProjections::load(programs, &shapes,
+            cuteafd_ffi::draft_projection::batch_rows(TAP_ROWS, cfg.block, sequences,
+                programs.capacities().decode_rows.unwrap_or(0)))?)
     }
 
     /// The keyed selector prior (`family/dflash2/numerics`), or the generic
@@ -1188,7 +1190,7 @@ impl<'a> DflashDrafter<'a> {
         scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DflashConfig { row_window, ..DflashConfig::read(snapshot)? };
-        let projections = Self::load_projections(programs, &cfg, representation, false, false)?;
+        let projections = Self::load_projections(programs, &cfg, representation, false, false, max_sequences)?;
         let capacity = GlmDraftCapacity::new(slots, max_sequences, cfg.block)?;
         let layout = cfg.runtime_layout(representation, capacity)?;
         let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
@@ -1321,7 +1323,7 @@ impl<'a> DflashDrafter<'a> {
             layout.paged_cache().target_tokens, library.sm_count()?, fp8_rows.code() as u8, layout.cache_format())? == layout,
             "MLA draft checkpoint/runtime differs from admitted immutable layout");
         let cfg = DflashConfig::mla(&native);
-        let projections = Self::load_projections(programs, &cfg, representation, true, false)?;
+        let projections = Self::load_projections(programs, &cfg, representation, true, false, layout.capacity().max_batch_sequences)?;
         let checkpoint = Checkpoint { data: file, tensors: read_safetensors_metadata(&snapshot.join("model.safetensors"))?
             .into_iter().map(|t| (t.name.clone(), t)).collect() };
         for (name, shape) in native.tensor_shapes() { checkpoint.bytes(&name, &shape)?; }
@@ -1432,7 +1434,8 @@ impl<'a> DflashDrafter<'a> {
             layout.paged_cache().target_tokens, library.sm_count()?, 0, layout.cache_format())? == layout,
             "mtp_dspark checkpoint/runtime differs from admitted immutable layout");
         let cfg = DflashConfig::mla(&native);
-        let projections = Self::load_projections(programs, &cfg, GlmDraftRepresentation::Bf16Only, true, true)?;
+        let projections = Self::load_projections(programs, &cfg, GlmDraftRepresentation::Bf16Only, true, true,
+            layout.capacity().max_batch_sequences)?;
         let context_fc = cuteafd_ffi::mla_draft::Ml4ContextProjection::load(programs)?;
         let mut owners = MlaDraftStorage::allocate(library, layout.clone())?.into_owners()?;
         // Destination owners and packing both come from the admitted recipe.

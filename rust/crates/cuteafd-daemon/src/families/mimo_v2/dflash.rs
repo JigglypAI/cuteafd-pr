@@ -387,7 +387,9 @@ impl<'a> MimoDrafter<'a> {
         let shapes = [(h * cfg.taps.len(), h), (h, cfg.qkv_width()), (h, 2 * cfg.kv_heads * cfg.head_dim),
             (cfg.heads * cfg.head_dim, h), (h, 2 * cfg.intermediate), (cfg.intermediate, h)];
         let projections = cuteafd_ffi::draft_projection::DraftProjections::load(programs,
-            if representation == MimoDraftRepresentation::Bf16Only { &shapes } else { &[] })?;
+            if representation == MimoDraftRepresentation::Bf16Only { &shapes } else { &[] },
+            cuteafd_ffi::draft_projection::batch_rows(TAP_ROWS, cfg.block, max_sequences,
+                programs.capacities().decode_rows.unwrap_or(0)))?;
 
         ensure!(matches!(representation, MimoDraftRepresentation::Bf16Only | MimoDraftRepresentation::Fp8Only),
             "MiMo serving supports only immutable bf16-only or fp8-only drafter storage; historical dual/mixed controls are not production modes");
