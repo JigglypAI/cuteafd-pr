@@ -178,11 +178,11 @@ mod tests {
         use cuteafd_loader::media::{ImageGrid, ImageKey, PreparedImage};
         use sha2::{Digest, Sha256};
         let tokens = vec![1, 5, 5, 6, 5, 5, 7, 2];
-        let image = Arc::new(PreparedImage { key: ImageKey([7; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
+        let image = Arc::new(PreparedImage { key: ImageKey([7; 32]), encoder: cuteafd_loader::media::EncoderId([0; 32]), processor: cuteafd_loader::media::PreprocessId([0; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
             rgb8: Arc::from(vec![0; 4 * 4 * 14 * 14 * 3]), tokens: 6 });
         let probe = Probe::new(ProbeSpec { cold: true, no_speculation: true, score_from: Some(7),
             prompt_ids: Some(tokens.clone()), media: vec![ProbeMedia { start: 1, len: 6, kind: "image".into(),
-                key: "07".repeat(32), grid: [1,4,4], fixture: Some(ProbeFixture { path: "chart.png".into(),
+                key: "07".repeat(32), grid: [1,4,4], identity: None, input_key: None, fixture: Some(ProbeFixture { path: "chart.png".into(),
                     sha256: "ab".repeat(32) }), image_url: Some(ProbeImageUrl { url: "fixture".into(), detail: None }) }],
             ..Default::default() });
         let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(),
