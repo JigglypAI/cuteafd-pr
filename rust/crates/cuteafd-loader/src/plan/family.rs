@@ -133,6 +133,9 @@ pub trait Family: Sync {
     /// How the executor feeds the single Spark prefill owner.
     fn detect(&self, checkpoint: &Checkpoint) -> bool;
     fn runtime(&self) -> RuntimeStatus;
+    /// Runtime reserves a shared host embedding cache via `with_media_headroom`
+    /// when a bundled media tower is admitted.
+    fn media_cache_headroom(&self) -> bool { false }
     /// Parses the checkpoint's configuration into the family's canonical model
     /// (the same parser its runtime uses), or the reason the runtime refuses it.
     fn open(&self, checkpoint: &Checkpoint) -> Result<Box<dyn FamilyModel>, ConfigError>;
@@ -162,7 +165,7 @@ pub trait Family: Sync {
     }
 }
 
-static REGISTRY: [&dyn Family; 12] = [
+static REGISTRY: [&dyn Family; 13] = [
     &super::families::deepseek::DEEPSEEK_V41,
     &super::families::deepseek::DEEPSEEK_V4,
     &super::families::glm::GLM5,
@@ -172,6 +175,7 @@ static REGISTRY: [&dyn Family; 12] = [
     &super::families::qwen35::QWEN35,
     &super::families::step5::STEP5,
     &super::families::kimi::KIMI_K3,
+    &super::families::muse_spark::MUSE_SPARK,
     &super::families::mistral_large4::MISTRAL_LARGE4,
     &super::families::dflash::DFLASH2,
     &super::families::dspark::DSPARK,

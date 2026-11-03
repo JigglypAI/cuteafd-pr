@@ -398,7 +398,9 @@ impl DeviceLogits {
         ensure!(spans.iter().all(|&(row, count)| row + count <= self.rows && (count == 1 || self.stride == self.vocab)),
             "logits download outside {} rows", self.rows);
         let mut out = vec![0f32; total * self.vocab];
-        let device_id = library.cuda_get_device()?;
+        // SAFETY: DeviceLogits retains its producing stream through this download.
+        let device_id = unsafe { library.cuda_stream_device(self.stream)? };
+        let _device = crate::shared::memory::device::Device { library, id: device_id }.enter()?;
         let mut rest = out.as_mut_slice();
         let queued = spans.iter().try_for_each(|&(row, count)| {
             let (dst, tail) = std::mem::take(&mut rest).split_at_mut(count * self.vocab);
@@ -579,6 +581,11 @@ fn host_logprob(logits: &[f32], token: u32) -> f32 {
     logits[token as usize] - max - sum.ln() as f32
 }
 
+fn check_selector_device(output: i32, stream: i32) -> Result<()> {
+    ensure!(output == stream, "token selector output operand on device {output}, logits stream on device {stream}");
+    Ok(())
+}
+
 impl<'a> TokenSelector<'a> {
     /// A selector for up to `capacity` rows of `vocab` logits.
     pub fn new(library: &'a NativeLibrary, placement: SelectPlacement, vocab: usize, capacity: usize) -> Result<Self> {
@@ -603,6 +610,7 @@ impl<'a> TokenSelector<'a> {
     /// Allocates the GPU sampler now (eager start-up); otherwise the first sampled or masked
     /// selection does.
     pub fn reserve_sampler(&mut self) -> Result<()> {
+        let _device = crate::shared::memory::device::Device { library: self.library, id: self.out.buffer.device_id }.enter()?;
         if self.wave.is_none() && self.placement != SelectPlacement::Host {
             self.wave = Some(TargetSamplingWave::new(self.library, self.capacity.min(128), self.vocab)?);
         }
@@ -621,6 +629,10 @@ impl<'a> TokenSelector<'a> {
         if n > self.capacity {
             return Err(TokenIoError::Capacity { rows: n, capacity: self.capacity }.into());
         }
+        // SAFETY: selection consumes live rows on the producing engine's stream.
+        let owner = unsafe { self.library.cuda_stream_device(logits.stream)? };
+        let _device = crate::shared::memory::device::Device { library: self.library, id: owner }.enter()?;
+        self.bind_device(owner)?;
         if self.placement == SelectPlacement::Host {
             self.counts[2] += n as u64;
             let host = logits.to_host(self.library)?;
@@ -633,6 +645,24 @@ impl<'a> TokenSelector<'a> {
             return self.greedy(logits, rows);
         }
         self.sampled(logits, rows, &routes)
+    }
+
+    /// A selector can follow a different head, but must never reuse the old
+    /// head's output/sampler allocations on the new stream. Selections drain
+    /// their landing copies before returning, so the old arena is retired.
+    fn bind_device(&mut self, owner: i32) -> Result<()> {
+        let previous = self.out.buffer.device_id;
+        if previous != owner {
+            let out = DeviceAllocation::new(self.library, self.capacity * 12)?;
+            let old = std::mem::replace(&mut self.out, out);
+            let wave = self.wave.take();
+            crate::shared::memory::device::Device { library: self.library, id: previous }.run(|| {
+                drop(wave);
+                drop(old);
+                Ok(())
+            })?;
+        }
+        check_selector_device(self.out.buffer.device_id, owner)
     }
 
     fn host_select(logits: &[f32], row: &RowSelect) -> RowResult {
@@ -930,6 +960,28 @@ fn chi_square_critical(dof: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_and_download_follow_the_producing_stream_device() {
+        let source = include_str!("token_io.rs").split("#[cfg(test)]").next().unwrap();
+        let download = source.split("fn download(").nth(1).unwrap().split("/// One row to select").next().unwrap();
+        assert!(download.find("cuda_stream_device(self.stream)").unwrap() < download.find("copy_d2h_async(").unwrap());
+        assert!(!download.contains("cuda_get_device()"));
+        let select = source.split("pub fn select(").nth(1).unwrap().split("fn bind_device(").next().unwrap();
+        assert!(select.find("cuda_stream_device(logits.stream)").unwrap() < select.find("self.greedy(").unwrap());
+        assert!(select.find("self.bind_device(owner)?").unwrap() < select.find("self.sampled(").unwrap());
+        let memory = include_str!("memory.rs");
+        let wait = memory.split("pub(crate) unsafe fn wait(").nth(1).unwrap().split("impl Drop for BlockingWait").next().unwrap();
+        assert!(wait.find("cuda_stream_device(stream)").unwrap() < wait.find("cuda_event_create_blocking()").unwrap());
+        assert!(!wait.contains("cuda_get_device()"));
+    }
+
+    #[test]
+    fn selector_device_check_names_the_rejected_operand() {
+        for device in [0, 1] { check_selector_device(device, device).unwrap(); }
+        let error = check_selector_device(0, 1).unwrap_err().to_string();
+        assert!(error.contains("output operand on device 0") && error.contains("logits stream on device 1"), "{error}");
+    }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]

@@ -200,9 +200,10 @@ EOF
     _spark_slot_keys HOST LANE_A
     return
   fi
-  # Kimi K3 and Step-5 (WIP slots only): the shared serve contract and Spark
-  # workers, no media or family modes yet; Step-5 takes an opt-in MTP depth.
-  if [[ "$1" == kimi_k3 || "$1" == step5 ]]; then
+  # Kimi K3, Step-5 and Muse Spark (WIP slots only): the shared serve contract
+  # and Spark workers, no media or family modes yet; Step-5 takes an opt-in
+  # MTP depth, Muse a DFlash2 drafter and its partial-reply format.
+  if [[ "$1" == kimi_k3 || "$1" == step5 || "$1" == muse_spark ]]; then
     cat <<'EOF'
 ATTENTION_PLACEMENT
 SPARK_EXPERT_DOCKER_INFERENCE
@@ -240,6 +241,8 @@ PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
     [[ "$1" != kimi_k3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING
     [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE RTX_EXPERT_LAYERS PREFILL_BATCH_TOKENS PREFILL_WAVES FULL_PREFILL_LOGITS PREFILL_PACKING
+    [[ "$1" != muse_spark ]] || printf '%s\n' RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS SPECULATION_TRACE DRAFT_KV_CACHE PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING FULL_PREFILL_LOGITS EXPERT_PARTIAL_BF16_MAX_ROWS EXPERT_PARTIAL_WIDE_FORMAT
+    [[ "$1" != muse_spark ]] || printf '%s\n' VISION_REPLICAS
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -414,7 +417,7 @@ EOF
 # Each shared-executor port opts in here after its serve CLI accepts the shape.
 family_prefill_mode() {
   case "$1" in
-    step5|kimi_k3|qwen4|deepseek_v4|deepseek_v41) echo units ;;
+    step5|kimi_k3|muse_spark|qwen4|deepseek_v4|deepseek_v41) echo units ;;
     glm5|glm5_flash|mimo_v2) echo units-span ;;
     *) echo legacy ;;
   esac
@@ -1699,8 +1702,8 @@ attention_placement="$(get ATTENTION_PLACEMENT auto)"
 # executor exists.
 case "$attention_placement:$family" in
   # Kimi K3 and Step-5 run only their recorded automatic placement.
-  auto:kimi_k3|auto:step5) ;;
-  *:kimi_k3|*:step5) release_die "$family supports only ATTENTION_PLACEMENT=auto" ;;
+  auto:kimi_k3|auto:step5|auto:muse_spark) ;;
+  *:kimi_k3|*:step5|*:muse_spark) release_die "$family supports only ATTENTION_PLACEMENT=auto" ;;
   auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|layers:qwen4) ;;
   # K4/P7 qualified explicit layers; context remains the recorded auto default.
   # The planner still requires the selected image's executor and native programs.
@@ -1718,7 +1721,8 @@ case "$family" in
   qwen3_5) serve=serve-qwen35 ;;
   kimi_k3) serve=serve-kimi ;;
   step5) serve=serve-step5 ;;
-  *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2, Qwen 3.8, Kimi K3 and Step-5 checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
+  muse_spark) serve=serve-muse ;;
+  *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2, Qwen 3.8, Kimi K3, Step-5 and Muse Spark checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
 # Kimi K3 and Step-5 serve through their own commands: automatic attention
 # placement, text only (their bundled vision towers are not in scope) and GPU
@@ -1726,6 +1730,9 @@ esac
 # depth 3 (SPECULATOR=off disables it).
 text_family=0
 [[ "$family" != kimi_k3 && "$family" != step5 ]] || text_family=1
+# These commands own automatic context, pool and Spark budgets independently of media.
+standalone_family=$text_family
+[[ "$family" != muse_spark ]] || standalone_family=1
 if ((text_family)); then
   case "$vision:$audio" in
     auto:auto|auto:off|off:auto|off:off) vision=off; audio=off ;;
@@ -1743,7 +1750,7 @@ fi
 # set them. Qualified MiMo, GLM Flash and Qwen towers are placed Spark-first by
 # the encoder plan below; DeepSeek V4 and GLM 5.3 have no tower, so auto starts
 # none and serves text only.
-# Only snapshots shipping qualified MiMo audio opt into Spark-first auto.
+# Declared bundled audio is validated strictly by the encoder plan, not disabled here.
 release_validate_verbs_device_map
 audio="$(release_resolve_audio_mode "$audio" "$root/snapshots/$revision")"
 # Auto/spark placement is resolved by the encoder plan below.
@@ -1830,7 +1837,7 @@ if [[ -n "$wip_slot" ]]; then
 fi
 # Families with their own serve command: refuse a WIP slot whose binary
 # predates it before planning or touching any service.
-if ((text_family)) && [[ -n "$wip_slot" ]]; then
+if ((standalone_family)) && [[ -n "$wip_slot" ]]; then
   docker run --rm --network none --mount "type=bind,src=$wip_layout/bin/cuteafd,dst=/opt/cuteafd-serve-probe,readonly" \
     --entrypoint /opt/cuteafd-serve-probe "$coordinator_image" "$serve" --help >/dev/null ||
     release_die "WIP slot $wip_slot has no '$serve' command; build the slot from a commit that serves $family"
@@ -1922,6 +1929,7 @@ if [[ $family == deepseek_v4 ]]; then
 fi
 speculator="$(get SPECULATOR)"
 default_drafter=""
+[[ "$family" != muse_spark ]] || default_drafter=nvidia/Muse-Spark-Open-816B-A42B-DFlash2
 if [[ -z "$speculator" ]]; then
   speculator=off
   if [[ $speculator == off && $family == glm5 && -z ${cfg[SPECULATOR]+set} ]]; then
@@ -1950,6 +1958,10 @@ if [[ -z "$speculator" ]]; then
       python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); sys.exit(c.get("text_config",c).get("hidden_size") != 5120)' "$root/snapshots/$revision/config.json"; then
     speculator=dspark default_drafter=RadixArk/Qwen3.8-27B-DSpark
   fi
+  if [[ $speculator == off && $family == muse_spark ]]; then
+    speculator=dflash2
+    echo "note: Muse Spark drafts with DFlash2 ($default_drafter); SPECULATOR=off disables it" >&2
+  fi
   if [[ $speculator == off && $family == step5 ]]; then
     speculator=mtp
     echo "note: Step-5 drafts with native MTP (default depth 3); SPECULATOR=off disables it" >&2
@@ -1966,7 +1978,7 @@ case "$family:$speculator" in
   qwen4:mtp) ;;
   glm5:dspark) [[ "$checkpoint_family" == mistral_large4 ]] ||
     { echo "SPECULATOR=dspark does not apply to $family" >&2; exit 2; } ;; # The MTP layer's experts stay local even with Spark backbone experts.
-  *:off|qwen3_5:dspark|qwen3_5:mtp|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|kimi_k3:dflash2|step5:mtp|deepseek_v4:dspark) ;;
+  *:off|qwen3_5:dspark|qwen3_5:mtp|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|kimi_k3:dflash2|step5:mtp|muse_spark:dflash2|deepseek_v4:dspark) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
 esac
 draft_args=()
@@ -2004,7 +2016,7 @@ if [[ "$family" == mimo_v2 ]]; then
 fi
 case "$embedding" in host|gpu) ;; *) echo "EMBEDDING must be host or gpu" >&2; exit 2 ;; esac
 [[ "$family" != qwen3_5 || "$embedding" == gpu ]] || release_die "dense Qwen requires device token embedding"
-((text_family == 0)) || [[ "$embedding" == gpu ]] || release_die "$family serves GPU token embeddings only (EMBEDDING=gpu)"
+((standalone_family == 0)) || [[ "$embedding" == gpu ]] || release_die "$family serves GPU token embeddings only (EMBEDDING=gpu)"
 decode_lanes="$(get DECODE_LANES)"
 if [[ -n "$decode_lanes" ]]; then
   [[ "$decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
@@ -2072,6 +2084,9 @@ case "$speculator" in
       dspark_args=(--dspark)
     elif [[ -n "$drafter" ]]; then
       draft_revision="$(get SPECULATOR_MODEL_REVISION)"
+      if [[ -z "$draft_revision" && $family == muse_spark && $drafter == nvidia/Muse-Spark-Open-816B-A42B-DFlash2 ]]; then
+        draft_revision=22e2669e4c60689f9bff0749a34d9d8e59ce7cd6
+      fi
       if [[ -z "$draft_revision" && $family:$speculator == qwen3_5:dspark && $drafter == RadixArk/Qwen3.8-27B-DSpark ]]; then
         draft_revision=85ef153be924f17ce4bf62726954eeaa4a73e854
       fi
@@ -2079,6 +2094,11 @@ case "$speculator" in
         { [[ -z "$default_drafter" ]] || echo "download it (hf download $drafter) or set SPECULATOR=off" >&2; exit 1; }
       draft_args=(--draft "$draft_snapshot")
       [[ "$family" != kimi_k3 ]] || draft_args+=(--draft-fp8 true)
+      if [[ "$family" == muse_spark ]]; then
+        muse_draft_kv="$(get DRAFT_KV_CACHE fp8)"
+        case "$muse_draft_kv" in bf16|fp8) ;; *) release_die "DRAFT_KV_CACHE must be bf16 or fp8" ;; esac
+        draft_args+=(--draft-kv-cache "$muse_draft_kv")
+      fi
     elif [[ $family == mimo_v2 ]]; then
       draft_args=(--draft "$snapshot")
     else
@@ -2110,7 +2130,7 @@ kv_reserve_args=()
 [[ -z "$(get KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS)" ]] ||
   kv_reserve_args+=(--kv-early-termination-min-output-tokens "$(get KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS)")
 case $family in
-  mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5)
+  mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5|muse_spark)
     family_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES auto)") ;;
 esac
@@ -2167,6 +2187,9 @@ if [[ "$family" == qwen3_5 ]]; then
   family_args+=(--prefix-point-boundaries "$(get PREFIX_POINT_BOUNDARIES 1)")
 fi
 prefill_packing="$(get PREFILL_PACKING)"
+if [[ -n "$prefill_packing" && "$family" == muse_spark ]]; then
+  release_die "Muse Spark has no packed prefill yet (#923); unset PREFILL_PACKING"
+fi
 if [[ -n "$prefill_packing" ]]; then
   [[ "$family" == mimo_v2 || "$family" == glm5_flash || "$family" == step5 || "$family" == qwen4 || "$family" == qwen3_5 || "$family" == kimi_k3 || "$family" == deepseek_v4 || "$family" == glm5 || "$family" == deepseek_v41 ]] || { echo "PREFILL_PACKING is unsupported for $family" >&2; exit 2; }
   case "$prefill_packing" in
@@ -2224,9 +2247,21 @@ if [[ "$family" == step5 ]]; then
     release_die "Step-5 RTX_EXPERT_LAYERS is auto, all or a fixed routed-layer count, not $local_layers"
   [[ "$local_layers" == auto ]] || family_args+=(--rtx-expert-layers "$local_layers")
 fi
-if ((text_family)); then
+if ((standalone_family)); then
   pool="$(get POOL_TOKENS auto)"
   [[ "$pool" == auto ]] || family_args+=(--pool-tokens "$pool")
+fi
+# Muse Spark: RTX expert onboarding (normalized above; an image without its
+# coordinator EXL3 package refuses rather than serving them from the Sparks),
+# the partial-reply cutoff and wide format (the prefill unit shape comes from the
+# deployment plan, as for every units family).
+if [[ $family == muse_spark ]]; then
+  local_layers="$(get RTX_EXPERT_LAYERS auto)"
+  family_args+=(--rtx-expert-layers "$local_layers")
+  [[ -z "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)" ]] || family_args+=(--expert-partial-bf16-max-rows "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)")
+  [[ -z "$(get EXPERT_PARTIAL_WIDE_FORMAT)" ]] || family_args+=(--expert-partial-wide-format "$(get EXPERT_PARTIAL_WIDE_FORMAT)")
+  [[ -z "$(get SPARK_DEVICE_BUDGET_BYTES)" ]] ||
+    family_args+=(--spark-budget-gib "$(python3 -c 'import sys; print(int(sys.argv[1]) / (1 << 30))' "$(get SPARK_DEVICE_BUDGET_BYTES)")")
 fi
 if [[ $family == kimi_k3 ]]; then
   kv_cache="$(get KV_CACHE fp8)"
@@ -2351,7 +2386,7 @@ fi
 split_hint=""
 split_opt_in=""
 case "$family:$model_type" in
-  deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash|kimi_k3:*|step5:*) ;;
+  deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash|kimi_k3:*|step5:*|muse_spark:*) ;;
   qwen4:*)
     if [[ "$ranks" == 0 ]]; then
       : # Qualified Spark-free pairs default to native TP2 and whole-layer ownership.
@@ -2674,7 +2709,7 @@ case "$family" in
       off) lane_env_args+=(-e CUTEAFD_GLMF_REMOTE_DFLASH=0) ;;
       "") [[ -z "${CUTEAFD_GLMF_REMOTE_DFLASH:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_REMOTE_DFLASH=$CUTEAFD_GLMF_REMOTE_DFLASH") ;;
     esac ;;
-  qwen4|qwen3_5|kimi_k3|step5|mimo_v2) ;;
+  qwen4|qwen3_5|kimi_k3|step5|muse_spark|mimo_v2) ;;
   *) echo "missing worker endpoint geometry for $family" >&2; exit 2 ;;
 esac
 if [[ -n "$expert_input" && "$expert_input" != fp8 && "$ranks" == 0 ]]; then
@@ -2717,6 +2752,9 @@ audio_encoder_hash=""
   fi
   if [[ "$family:$speculator" == kimi_k3:dflash2 ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot" --draft-fp8 true)
+  fi
+  if [[ "$family:$speculator" == muse_spark:dflash2 ]]; then
+    plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
   fi
   # Read the effective serve argv, including family modes that enable auto.
   plan_host_cache=0
@@ -2776,6 +2814,14 @@ audio_encoder_hash=""
     plan_draft_args+=(--kv-cache "$kv_cache")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
+  fi
+  if [[ "$family" == muse_spark ]]; then
+    [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
+    [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
+    # The serve command's partial-reply overrides and drafter rings, so plan == serve admission.
+    [[ -z "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)" ]] || plan_draft_args+=(--expert-partial-bf16-max-rows "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)")
+    [[ -z "$(get EXPERT_PARTIAL_WIDE_FORMAT)" ]] || plan_draft_args+=(--expert-partial-wide-format "$(get EXPERT_PARTIAL_WIDE_FORMAT)")
+    [[ "$speculator" != dflash2 ]] || plan_draft_args+=(--draft-kv-cache "${muse_draft_kv:-fp8}")
   fi
   if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--draft-kv-cache "$draft_kv_cache")
@@ -2906,9 +2952,9 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
   done
 fi
 if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash
-          || "$checkpoint_family" == mistral_large4 ) && "$vision" != off ]] &&
+          || "$family" == muse_spark || "$checkpoint_family" == mistral_large4 ) && "$vision" != off ]] &&
    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; } ||
-   [[ "$family" == mimo_v2 && "$audio" != off ]]; then
+   [[ "$audio" != off ]]; then
   selected="$(python3 -c '
 import json,sys
 p=json.load(sys.stdin); e=p.get("encoder")
@@ -3127,7 +3173,12 @@ print(backend)')"
     [[ -z "$audio_backend" || "$audio_backend" == "$backend" ]] || release_die "audio replicas have different backend exports"
     audio_backend="$backend"
   done
-  family_args+=(--audio-encoder-backend "$audio_backend")
+  # RVQ backends identify architecture-specific exports; PCM has a fixed protocol identity.
+  if [[ "$family" == mimo_v2 ]]; then
+    family_args+=(--audio-encoder-backend "$audio_backend")
+  else
+    [[ "$audio_backend" == pcm-bf16-aot-v1 ]] || release_die "unexpected PCM audio backend: $audio_backend"
+  fi
 fi
 peer_csv="$(IFS=,; echo "${peers[*]}")"
 peer_args=()
@@ -3146,7 +3197,7 @@ release_coordinator_device_args "${coordinator_uuids[@]}"
 context_args=(--max-context "$(get MAX_CONTEXT_TOKENS "$default_context")")
 [[ "$family" != qwen3_5 ]] || context_args=()
 # Kimi K3 and Step-5: unset keeps the serve command's own context extent.
-((text_family == 0)) || [[ -n "$(get MAX_CONTEXT_TOKENS)" ]] || context_args=()
+((standalone_family == 0)) || [[ -n "$(get MAX_CONTEXT_TOKENS)" ]] || context_args=()
 docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart no "${RELEASE_COORDINATOR_DEVICE_ARGS[@]}" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info "${shared_env_args[@]:0:4}" \

@@ -1007,9 +1007,9 @@ def context_split_programs(g, decode_rows: int, max_context: int):
 
 def dense_family_scopes(families, exlr8_family):
     requested = set((families if families is not None else "kimik3").split(","))
-    if not requested or requested - {"kimik3", "glm", "glmf", "step5", "ml4"}:
-        raise ValueError("--dense-trellis-families takes kimik3, glm, glmf, step5 and/or ml4")
-    k6 = tuple(name for name in ("kimik3", "glm", "glmf", "step5", "ml4") if name in requested)
+    if not requested or requested - {"kimik3", "glm", "glmf", "step5", "muse", "ml4"}:
+        raise ValueError("--dense-trellis-families takes kimik3, glm, glmf, step5, muse and/or ml4")
+    k6 = tuple(name for name in ("kimik3", "glm", "glmf", "step5", "muse", "ml4") if name in requested)
     native = tuple(name for name in k6 if name in ("glm", "glmf")) \
         if families is not None else (exlr8_family,)
     return k6, native
@@ -1032,8 +1032,10 @@ def main() -> None:
                              "glmf_stage/glmf2_stage (full/TP2 GLM Flash primitive boundaries), "
                              "dense_trellis_k6 (native K6 core projections)")
     parser.add_argument("--dense-trellis-families",
-                        help="architecture tables for dense_trellis_k6 and exlr8_dense: kimik3,glm,glmf,step5,ml4 "
+                        help="architecture tables for dense_trellis_k6 and exlr8_dense: kimik3,glm,glmf,step5,muse,ml4 "
                              "(defaults: K6 kimik3; EXLR8 --exlr8-family; no checkpoint reads)")
+    parser.add_argument("--expert-partial-width", type=int, default=4096)
+    parser.add_argument("--expert-partial-topk", type=int, default=8)
     parser.add_argument("--exlr8-role", choices=("all", "coordinator", "spark"), default="all",
                         help="with exlr8: coordinator = shared-expert K1/grouping and rotated glue (beside the "
                              "family programs), spark = routed K1 serving and grouping, all = every program")
@@ -1068,9 +1070,9 @@ def main() -> None:
     except ValueError as error:
         raise SystemExit(str(error)) from error
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "ml4") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3 and/or ml4")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split and/or kimik3")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
     kimi_kda = None
@@ -1078,7 +1080,7 @@ def main() -> None:
         from b12x.integration.cuteafd import KDAGeometry
         kimi_kda = KDAGeometry(hidden=7168, kda_heads=96).head_split(2)
     props = torch.cuda.get_device_properties(0)
-    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and geometries != ["exlr8"]):
+    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and geometries not in (["exlr8"], ["expert_partial"])):
         raise SystemExit("coordinator programs export on SM120 (K1 primitives also on SM121)")
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
@@ -1116,6 +1118,20 @@ def main() -> None:
             manifest["families"][name] = {"abi_version": 1}
             work += [(name, suffix, "kimi_split", {"max_rows": capacity}, thunk)
                      for suffix, thunk, capacity in kimi_split_programs()]
+            continue
+        if name == "expert_partial":
+            from export_b12x_expert_partial_aot import programs as partial_programs
+            manifest["families"][name] = {"width": args.expert_partial_width,
+                                          "topk": args.expert_partial_topk}
+            work += [(name, *item) for item in partial_programs(
+                args.expert_partial_width, args.expert_partial_topk, args.prefill_rows)]
+            continue
+        if name in ("muse", "muse2"):
+            from export_b12x_muse_aot import programs as muse_programs
+            heads = 128 if name == "muse" else 64
+            manifest["families"][name] = {"heads": heads, "kv_heads": heads // 8, "head_dim": 64,
+                                           "hidden": 8192, "window": 2048}
+            work += [(name, *item) for item in muse_programs(heads, args.prefill_rows)]
             continue
         if name == "ml4":
             from b12x.integration.cuteafd.mistral_large4 import ML4, ML4_TP2
