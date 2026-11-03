@@ -2147,8 +2147,8 @@ mod tests {
         let cfg = config();
         for (requested_pool, expected_pool, expected_context) in [
             // Prefill slots share step scratch/head/logits; decode intake is 64 rows.
-            // Only dense FFN fronts are captured, leaving more memory for the automatic pool.
-            (Some(32768), 32768, 32512), (None, 194432, 194176),
+            // Dense fronts only, with the measured 119 KB owned-executable allowance.
+            (Some(32768), 32768, 32512), (None, 191872, 191616),
         ] {
             let mut i = inputs(&cfg, &[32 * GIB; 2]);
             i.prefill_lanes = 2;
