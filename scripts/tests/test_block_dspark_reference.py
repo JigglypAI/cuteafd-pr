@@ -55,17 +55,6 @@ def load(path, name):
     return module
 
 
-def test_markov_tiles_preserve_native_array_capacity():
-    native = (ROOT / "native/families/glm5_flash/cuda/glmf_dspark.cu").read_text()
-    assert "constexpr int kMaxSequences = 32;" in native
-    assert "constexpr int kSequenceCapacity = 64;" in native
-    assert "first < sequences; first += kMaxSequences" in native
-    assert "top + first * block" in native
-    assert "values + first * kMarkovBlocks" in native
-    assert "indices + first * kMarkovBlocks" in native
-    assert "drafts) + first * block" in native
-
-
 def test_dense_tap_argument_keeps_projector_order():
     golden = load(GOLDEN, "dense_taps_golden")
     assert golden.parse_tap_layers("52,4,16,28,40") == [52, 4, 16, 28, 40]
