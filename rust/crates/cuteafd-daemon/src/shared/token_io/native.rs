@@ -475,7 +475,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         for flash in [false, true] {
             let records = selection(flash).vocabulary_names().into_iter()
-                .map(|name| record(root.path(), name)).collect::<Vec<_>>();
+                .map(|name| record(root.path(), &name)).collect::<Vec<_>>();
             let plan = VocabularyPlan::new(&records, &selection(flash), 1, 0, 8, 256)?;
             for slice in &plan.dense.tensors {
                 let buffers = std::array::from_fn(|i| CuteafdDeviceBuffer {
