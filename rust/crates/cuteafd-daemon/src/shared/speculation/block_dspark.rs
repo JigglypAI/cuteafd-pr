@@ -547,7 +547,7 @@ impl<'a> DsparkDrafter<'a> {
         k: usize, n: usize) -> Result<()> {
         match weight {
             // SAFETY: rows first..first + n lie in the matrix; the caller's contract.
-            Weight::Bf16(w) => unsafe { self.projections.launch(x, at(w, first * k * 2), out, rows, k, n, self.stream) },
+            Weight::Bf16(w) => unsafe { Ok(self.projections.launch(x, at(w, first * k * 2), out, rows, k, n, self.stream)?) },
             Weight::Fp8(w) => {
                 let scratch = self.fp8_workspace.as_ref().context("FP8 dSpark scratch was not admitted")?;
                 // SAFETY: the scratch covers every shape for up to max(TAP_ROWS, sequences x block) rows

@@ -2243,7 +2243,7 @@ impl Opened {
             }
         }
         engine.bind_expert_homes(&placement, &spark_layers, args.skip_experts)?;
-        engine.drafter = self.load_drafter(args, stream, &engine.embedding, prepared_draft.take(), draft_read)?;
+        engine.drafter = self.load_drafter(args, &programs, stream, &engine.embedding, prepared_draft.take(), draft_read)?;
         engine.bind_draft_core_head()?;
         engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(dspark::Drafter::drafts))?;
         tracing::info!(plan_rows = engine.attention_plan.rows(), active_drafts = ?engine.attention_plan.active_drafts(),
@@ -2289,7 +2289,7 @@ impl Opened {
     }
 
     /// The drafter `--draft` names, on `stream` (it reads only the mask token's embedding row).
-    fn load_drafter<'s>(&'s self, args: &EngineArgs, stream: *mut std::ffi::c_void,
+    fn load_drafter<'s>(&'s self, args: &EngineArgs, programs: &'s cuteafd_ffi::programs::Programs<'s>, stream: *mut std::ffi::c_void,
         embedding: &crate::shared::token_io::TokenEmbedding<'_>, prepared: Option<crate::shared::draft::remote::Prepared<'s>>,
         read: Option<dspark::DraftRead>)
         -> Result<Option<dspark::Drafter<'s>>> {
@@ -2310,11 +2310,11 @@ impl Opened {
             let mask = embedding.host_rows(&[cfg.mask_token])?;
             let file = read.join_dflash()?;
             let device = prepared.stream.device;
-            let draft = device.own(|| DflashDrafter::load(&self.library, &programs, snapshot, file, prepared.stream.raw,
+            let draft = device.own(|| DflashDrafter::load(&self.library, programs, snapshot, file, prepared.stream.raw,
                 slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear, args.draft_kv_cache))?;
             dspark::Drafter::RemoteDflash(remote_dflash::RemoteDflash::new(draft, prepared)?)
         } else {
-            dspark::Drafter::load(&self.library, &programs, snapshot, stream, slots, batch,
+            dspark::Drafter::load(&self.library, programs, snapshot, stream, slots, batch,
                 embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales,
                 args.draft_linear, args.draft_kv_cache, read)?
         };

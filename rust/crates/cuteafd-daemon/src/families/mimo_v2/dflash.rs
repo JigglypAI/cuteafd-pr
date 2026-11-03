@@ -558,7 +558,7 @@ impl<'a> MimoDrafter<'a> {
             DraftWeight::Fp8(_) => anyhow::bail!("FP8-only DFlash has no BF16 fallback"),
         };
         // SAFETY: the selected rows belong to the live BF16 matrix.
-        unsafe { self.projections.launch(x, at(bf16, first * k * 2), out, rows, k, n, self.stream) }
+        unsafe { Ok(self.projections.launch(x, at(bf16, first * k * 2), out, rows, k, n, self.stream)?) }
     }
 
     pub fn context_rings(&self) -> Vec<CuteafdDeviceBuffer> {

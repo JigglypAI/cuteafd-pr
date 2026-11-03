@@ -268,7 +268,7 @@ mod tests {
         // SAFETY: this library outlives every fixture stream and device owner.
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         library.cuda_set_device(0)?;
-        let programs = library.programs()?.with_manifest(std::env::var("CUTEAFD_PROGRAM_MANIFEST")?)?;
+        let programs = library.programs()?.with_manifest(&PathBuf::from(std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
         let device = Device { library: &library, id: 0 };
         let lead = Stream::new(device)?;
         let peer_target = Stream::new(Device { library: &library, id: 1 })?;

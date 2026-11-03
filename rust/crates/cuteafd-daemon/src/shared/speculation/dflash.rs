@@ -1554,7 +1554,7 @@ impl<'a> DflashDrafter<'a> {
             DraftWeight::Bf16(w) => {
                 // SAFETY: source rows first..first+n lie in this matrix;
                 // the caller supplies its selected width and live output.
-                unsafe { self.projections.launch(x, at(w, first * k * 2), out, rows, k, n, self.stream) }
+                unsafe { Ok(self.projections.launch(x, at(w, first * k * 2), out, rows, k, n, self.stream)?) }
             }
             DraftWeight::Fp8(w) => {
                 let scratch = self.fp8_workspace.as_ref().context("FP8 DFlash scratch was not admitted")?;
