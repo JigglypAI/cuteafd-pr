@@ -1025,6 +1025,26 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn whole_push_inventory_follows_solved_owners_and_keeps_dense_only_ranks() -> Result<()> {
+        use cuteafd_loader::placement::{ExpertHome, LayerAssignment, LayerMode};
+        let mut cfg = GlmNextConfig::from_hf(&cuteafd_loader::plan::testing::glm5_flash_config(8))?;
+        cfg.dense = (0..8).map(|layer| layer < 3).collect();
+        for (gpus, owner) in [(1, 0), (2, 0), (2, 1)] {
+            let mut assignments = vec![LayerAssignment { mode: LayerMode::HeadSplit, experts: ExpertHome::Spark }; 8];
+            for layer in [1, 3, 6] { assignments[layer].experts = ExpertHome::RtxWhole { gpu: owner }; }
+            let selected = admitted_whole_layers(&cfg, &assignments, gpus, false)?;
+            assert_eq!(selected.len(), gpus);
+            for (rank, layers) in selected.iter().enumerate() {
+                assert_eq!(layers.as_slice(), if rank == usize::from(owner) { &[3, 6][..] } else { &[] });
+            }
+            assert!(admitted_whole_layers(&cfg, &assignments, gpus, true)?.iter().all(Vec::is_empty));
+            assignments[6].experts = ExpertHome::RtxWhole { gpu: gpus as u8 };
+            assert!(admitted_whole_layers(&cfg, &assignments, gpus, false).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn step_experts_ignore_empty_rtx_ranges() -> Result<()> {
         use cuteafd_loader::placement::{AttentionPlacement, ExpertHome, ExpertRange, FfnMode,
             LayerAssignment, LayerMode, Placement, PoolLimits};
@@ -1456,6 +1476,17 @@ fn admitted_expert_layers(cfg: &GlmNextConfig, assignments: &[cuteafd_loader::pl
         (!skip && !cfg.dense[layer] && assigned.experts == home).then_some(layer)).collect::<Vec<_>>();
     validate_expert_layers(cfg, assignments.len(), &selected)?;
     Ok(selected)
+}
+
+fn admitted_whole_layers(cfg: &GlmNextConfig, assignments: &[cuteafd_loader::placement::LayerAssignment],
+    gpus: usize, skip: bool) -> Result<Vec<Vec<usize>>> {
+    ensure!((1..=2).contains(&gpus), "GLM Flash coordinator rank count");
+    ensure!(skip || assignments.iter().enumerate().all(|(layer, assigned)|
+        cfg.dense.get(layer).copied().unwrap_or(false)
+            || !matches!(assigned.experts, cuteafd_loader::placement::ExpertHome::RtxWhole { gpu } if usize::from(gpu) >= gpus)),
+        "GLM Flash whole expert owner is outside the coordinator group");
+    (0..gpus).map(|rank| admitted_expert_layers(cfg, assignments,
+        cuteafd_loader::placement::ExpertHome::RtxWhole { gpu: rank as u8 }, skip)).collect()
 }
 
 fn admitted_spark_layers(cfg: &GlmNextConfig, layers: &[cuteafd_loader::placement::LayerAssignment],
@@ -2073,6 +2104,9 @@ impl Opened {
         // Every dense rank participates, including ranks without routed experts.
         // Namespace identity alone selects push; planning cannot change that route.
         let gpus = 1 + usize::from(peer_stream.is_some());
+        let whole_layers = admitted_whole_layers(&self.cfg, &placement.layers, gpus, args.skip_experts)?;
+        ensure!(whole_layers.iter().skip(1).all(Vec::is_empty),
+            "GLM Flash executor only binds whole experts on coordinator rank zero");
         let devices: Vec<_> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d))
             .map(|id| crate::shared::memory::device::Device { library: &self.library, id }).collect();
         let plan_dense = |sparks: usize| -> Result<_> {
@@ -2116,15 +2150,13 @@ impl Opened {
                 return Ok(Some(CoordinatorExperts::Tp2 { layers: tp2_layers.clone(), budgets }));
             }
             let mut owners = Vec::new();
-            for rank in 0..gpus {
-                let selected = admitted_expert_layers(&self.cfg, &placement.layers,
-                    cuteafd_loader::placement::ExpertHome::RtxWhole { gpu: u8::try_from(rank)? }, args.skip_experts)?;
+            for (rank, selected) in whole_layers.iter().enumerate() {
                 if selected.is_empty() { continue; }
                 let catalog = catalog.context("whole expert catalog")?;
                 let peak = usize::try_from(placement.expert_ranges.get(rank).context("whole expert arena")?.peak_bytes)?;
                 let selections = if catalog.exl3().is_some() {
                     let (selections, _) = crate::families::deepseek_v4::local::LocalExperts::exl3_selections(
-                        &args.native_lib, catalog, 0, &selected, args.expert_rows(), peak)?
+                        &args.native_lib, catalog, 0, selected, args.expert_rows(), peak)?
                         .context("GLM Flash whole EXL3 package")?;
                     ensure!(selections.len() == selected.len(), "GLM Flash admitted whole EXL3 inventory does not fit");
                     selections
@@ -2290,7 +2322,7 @@ impl Opened {
             let (pushed, loaded) = match coordinator_push.take() {
                 Some((push, sparks, devices, (embedding, model, dense))) => {
                     let split = crate::shared::memory::load_timing::Split::start();
-                    let (pushed, beside) = push.receive_with(devices, self.experts.as_ref(), sparks, Some(Ok(dense)), || Ok(()));
+                    let (pushed, beside) = push.receive_with(devices, self.experts.as_ref(), sparks, Some(Ok(dense)), || Ok::<(), anyhow::Error>(()));
                     let pushed = push_policy.committed(pushed)?;
                     beside?;
                     split.log("glm5_flash dense push");
@@ -2423,8 +2455,7 @@ impl Opened {
         // Spark links remain available for every layer whose admitted home is Spark.
         let spark = !spark_layers.is_empty();
         if moe {
-            let local_layers = admitted_expert_layers(&self.cfg, &placement.layers,
-                cuteafd_loader::placement::ExpertHome::RtxWhole { gpu: 0 }, args.skip_experts)?;
+            let local_layers = whole_layers[0].clone();
             if !local_layers.is_empty() {
                 let budget = usize::try_from(placement.expert_ranges.first().context("local expert arena admission")?.peak_bytes)?;
                 let mut expert_args = args.clone();
@@ -2588,8 +2619,13 @@ impl Opened {
                         &args.native_lib, catalog, 0, selected, args.expert_rows(), budget)?
                         .context("GLM Flash whole EXL3 package")?;
                     ensure!(selections.len() == selected.len(), "committed EXL3 inventory exceeds admission");
+                    let weights = pushed.exl3()?;
+                    ensure!(weights.len() == selected.len() && weights.iter().zip(selected).all(|(weight, &layer)|
+                        weight.layout.layer == cuteafd_loader::V41Exl3Layer::Backbone(layer)
+                            && weight.layout.world == 1 && weight.layout.rank == 0),
+                        "committed GLM Flash whole EXL3 payload differs from solved inventory");
                     let local = crate::families::deepseek_v4::local::LocalExperts::from_exl3_weights(
-                        &self.library, &args.native_lib, catalog, &selections, pushed.exl3()?, args.expert_rows())?
+                        &self.library, &args.native_lib, catalog, &selections, weights, args.expert_rows())?
                         .context("committed GLM Flash EXL3 backend is empty")?;
                     Some((selected.to_vec(), local))
                 }
