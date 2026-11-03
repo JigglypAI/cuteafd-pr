@@ -924,3 +924,48 @@ def test_official_media_registry_discovers_only_present_adapters(tmp_path, monke
         paired.load_panel(SimpleNamespace(family="new_family", windows=path))
     with pytest.raises(ValueError, match="not implemented"):
         golden_media.family_features("new_family")
+
+
+def test_declared_processor_geometry_agrees_without_family_whitelist(tmp_path):
+    import json
+    from fidelity_media import processor_contract
+    image = {"image_processor_type": "MuseGlimmerImageProcessor", "merge_size": 2,
+             "patch_size": 14, "temporal_patch_size": 2}
+    vision = {"merge_size": 2, "patch_size": 14, "patch_temporal": 2}
+    (tmp_path / "processor_config.json").write_text(json.dumps({"image_processor": image}))
+    (tmp_path / "config.json").write_text(json.dumps({"vision_config": vision}))
+    assert processor_contract(tmp_path) == {"merge": 2, "row_markers": 0}
+    for field in vision:
+        wrong = {**vision, field: 3}
+        (tmp_path / "config.json").write_text(json.dumps({"vision_config": wrong}))
+        with pytest.raises(ValueError, match="processor_config.*disagrees with vision_config"):
+            processor_contract(tmp_path)
+
+
+def test_pcm_span_identity_geometry_and_feature_metadata(tmp_path):
+    import io
+    import soundfile as sf
+    from fidelity_media import read_pcm_fixture
+    pcm = np.linspace(-0.2, 0.2, 1921, dtype="<f4")
+    encoded = io.BytesIO()
+    sf.write(encoded, pcm, 24000, format="WAV", subtype="FLOAT")
+    data = encoded.getvalue()
+    (tmp_path / "audio.wav").write_bytes(data)
+    audio = {"start": 1, "len": 2, "kind": "audio", "key": "a" * 64,
+             "samples": len(pcm), "pcm_sha256": hashlib.sha256(pcm.tobytes()).hexdigest(),
+             "fixture": {"path": "audio.wav", "sha256": hashlib.sha256(data).hexdigest()}}
+    policy = {"sampling_rate": 24000, "samples_per_token": 1920}
+    assert validate_media([audio], [1, 8, 8, 2, 3], ["ctx"] * 4 + ["gen"], 4,
+                          audio_processor=policy) == [audio]
+    assert np.array_equal(read_pcm_fixture(tmp_path, audio), pcm)
+    meta = write_features(tmp_path / "features", audio, np.full((2, 8), 0x3f80, dtype=np.uint16),
+                          tower_dtype="bf16", identity={})
+    assert meta["kind"] == "audio" and meta["pcm_sha256"] == audio["pcm_sha256"] and "grid" not in meta
+    for mutation in ({"samples": 0}, {"samples": 1920}, {"pcm_sha256": "bad"}, {"len": 1}):
+        with pytest.raises(ValueError):
+            validate_media([{**audio, **mutation}], [1, 8, 8, 2, 3], ["ctx"] * 4 + ["gen"], 4,
+                           audio_processor=policy)
+    with pytest.raises(ValueError, match="PCM identity"):
+        read_pcm_fixture(tmp_path, {**audio, "pcm_sha256": "b" * 64})
+    with pytest.raises(ValueError, match="processor geometry"):
+        validate_media([audio], [1, 8, 8, 2, 3], ["ctx"] * 4 + ["gen"], 4)
