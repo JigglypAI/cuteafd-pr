@@ -2162,7 +2162,7 @@ mod tests {
             // Derive pool capacity from the calibrated graph cost and the other
             // ledger charges, rather than baking one calibration's token count in.
             let expected_pool = requested_pool.unwrap_or_else(|| {
-                let capacity = |graph_reserve| {
+                let capacity = |graph_reserve: u64| {
                     let units = (0..2).map(|rank| {
                         let fixed: u64 = placed.items[rank].iter()
                             .filter(|item| !matches!(item.group.as_str(), "graphs" | "graph growth" | "records"))
