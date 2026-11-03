@@ -285,11 +285,12 @@ fn actual_exchange_owners_match_independent_contract() -> Result<()> {
         };
         if heterogeneous {
             let ranks = devices.map(|device| RankDevice { device, stream });
+            let decode_bytes = decode_peer_bytes(DECODE_ROWS, cfg.hidden, engine.tp2_exchange);
             engine.exchange = Some(if abort {
-                PeerExchange::new_abortable_sized(&library, ranks, &sizes)?
+                PeerExchange::new_abortable_sized(&library, ranks, &sizes, decode_bytes)?
             } else {
                 // The shared non-abortable constructor is also an independent physical arm.
-                PeerExchange::new(&library, ranks, 3, 512)?
+                PeerExchange::new(&library, ranks, 3, 512, decode_bytes)?
             });
         }
         let receive_bytes = if !abort { vec![512; 3] } else { sizes.clone() };
