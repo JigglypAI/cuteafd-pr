@@ -270,8 +270,7 @@ impl Ready {
                     let rev = args.encoder_revision.as_deref().context("Spark vision needs encoder revision")?;
                     let id = spec.encoder_id(rev, 121);
                     let plan_hash = vision::worker::parse_plan_hash(args.encoder_plan_hash.as_deref().context("Spark vision needs encoder plan hash")?)?;
-                    let expected = EncoderHandshake { encoder_id: id, max_patches: 16384,
-                        output_width: 8192, patch_size: processor.patch, merge_size: processor.merge, plan_hash };
+                    let expected = vision::worker::image_handshake(&spec, &processor, id, plan_hash);
                     (id, Some(RemoteEncoder::connect(args.vision_peers.clone(), expected, Duration::from_secs(60))?))
                 }
                 _ => anyhow::bail!("Muse vision placement has no runnable owner"),
