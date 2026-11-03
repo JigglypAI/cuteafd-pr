@@ -858,31 +858,34 @@ mod draft_cli_tests {
         }
     }
 
-    /// The dense NVFP4 package, local FP8 and EXL3 experts and every Spark transport are sized by
-    /// `expert_rows`, never by the prefill lane's rows alone.
     #[test]
-    fn every_expert_resource_takes_the_expert_rows() {
-        let source = include_str!("mod.rs");
-        // The needles are joined here, so that this test's own text does not match them.
-        let body = |name: &str| {
-            let start = source.find(&["    fn ", name, "<'s>(&'s self, args: &EngineArgs"].concat()).unwrap();
-            let rest = &source[start..];
-            &rest[..rest.find("\n    }\n").unwrap()]
-        };
-        let (dense, experts) = (body("load_dense"), body("experts_for_layers"));
-        let sized = ["args.expert", "_rows()"].concat();
-        assert!(dense.contains(&["DenseNvfp4::load(&self.library, &directory, &self.cfg, ", &sized, ")?"].concat()));
-        // FP8 experts, EXL3 experts and the Spark transports, each with the rows among its arguments.
-        for site in ["Fp8Experts::load(", "max_rows: ", "SparkLink::new_waves("] {
-            let at = experts.find(site).unwrap_or_else(|| panic!("{site}"));
-            let arguments: String = experts[at..].chars().take(200).collect();
-            assert!(arguments.contains(&sized), "{site}");
+    fn expert_capacity_warms_every_route_and_charges_wider_intake() -> Result<()> {
+        let mut cfg = GlmNextConfig::from_hf(&cuteafd_loader::plan::testing::glm5_flash_config(8))?;
+        cfg.dense = (0..8).map(|layer| layer < 3).collect();
+        cfg.hidden = 64;
+        for (prefill, decode, capacity) in [(32, 64, 64), (64, 128, 128), (128, 128, 128), (256, 64, 256)] {
+            let mut args = parse(&["--peers", "127.0.0.1:19441"]);
+            args.prefill_rows = prefill;
+            args.decode_rows = decode;
+            args.prefill_waves = 3;
+            assert_eq!(args.expert_rows(), capacity);
+            for bf16 in [false, true] {
+                let request = engine::spark_warmup_request(&cfg, args.expert_rows(), 6, bf16)?;
+                let stride = if bf16 { cfg.hidden * 2 } else { cfg.hidden + cfg.hidden / 32 };
+                assert_eq!((request.header.row_count as usize, request.rows.len()), (capacity, capacity));
+                assert_eq!(request.header.layer_id, 6);
+                assert_eq!(request.routes.len(), capacity * cfg.topk);
+                assert_eq!(request.hidden_payload.len(), capacity * stride);
+                for (row, routes) in request.routes.chunks_exact(cfg.topk).enumerate() {
+                    assert!(routes.iter().all(|route| route.row_index as usize == row));
+                }
+            }
+            for ranks in [1, 4] {
+                let extra = 3 * ranks * (capacity - prefill) * cfg.hidden * 2;
+                assert_eq!(wide_intake_bytes(&args, ranks, cfg.hidden), extra as u64);
+            }
         }
-        assert_eq!(experts.matches(&sized).count(), 4);
-        let lane = ["args.prefill", "_rows"].concat();
-        assert!(!dense.contains(&lane));
-        // Only the intake plane uses the unit width; all expert math holds expert_rows.
-        assert_eq!(experts.matches(&lane).count(), 1);
+        Ok(())
     }
 
     #[test]
