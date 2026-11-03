@@ -12,6 +12,7 @@
 //! wave stays in flight while the other lane's GPU layers run.
 use super::weights::{GlmLayer, GlmWeights};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
+use crate::shared::decode_graph::real_row_moe;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use crate::shared::token_io::{DeviceLogits, TokenEmbedding};
 use crate::shared::spark_intake::{copy_parallel, IntakeMode, SparkIntake, SparkLink};
@@ -120,7 +121,7 @@ struct StepTables {
     /// below the index top-k; the selection leads each indices row).
     lengths: Vec<i32>,
     /// Leading rows that are real (the rest pad a decode step to its row
-    /// bucket and write only the scratch page): the Spark exchange sends these.
+    /// bucket and write only the scratch page): all MoE work uses this extent.
     exchange_rows: usize,
 }
 
@@ -1203,9 +1204,8 @@ impl<'a> GlmEngine<'a> {
         let before: Vec<i64> = (0..self.ranks()).map(free).collect::<Result<_>>()?;
         let owned = if self.layers_kv() {
             let owners: Vec<_> = self.weights.layers.iter().map(|layer| layer.attention_owner.unwrap()).collect();
-            let tp2: Vec<_> = (0..owners.len()).map(|layer| self.tp2_layer(layer)).collect();
             Some(cuteafd_loader::serving_capacity::glm_graphs::glm_owned_startup_graphs(
-                self.max_context, self.pages, &owners, &tp2).map_err(anyhow::Error::msg)?)
+                self.max_context, self.pages, &owners, self.cfg.first_moe_layer).map_err(anyhow::Error::msg)?)
         } else { None };
         let shapes = owned.as_ref().map(|startup| startup.keys.clone()).unwrap_or_else(||
             cuteafd_loader::serving_capacity::glm_graphs::glm_graph_shapes(self.max_context, self.pages));
@@ -1287,7 +1287,7 @@ impl<'a> GlmEngine<'a> {
         let cap = if tables.decode { "m64" } else { "m4096" };
         let layers = &self.weights.layers;
         if let Some(pair) = &self.tp2 {
-            pair.begin_checks(&[t], self.force_route_check.get())?;
+            pair.begin_checks(&[tables.exchange_rows], self.force_route_check.get())?;
         }
         if self.layer_execution.is_some() {
             self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
@@ -1331,7 +1331,7 @@ impl<'a> GlmEngine<'a> {
                     self.exchange()?.wait(0, attended)?;
                     self.projection_norm(0, index, 0, w, layer, "o", layer.ptr("post_norm")?, rows,
                         w.delta.buffer.ptr, self.recv(0, attended)?)?;
-                    self.peer_ffn(index, 0, w1, rows, cap, bytes)?;
+                    self.peer_ffn(index, 0, w1, rows, cap, bytes, tables.exchange_rows)?;
                 }
                 None => self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
@@ -1342,17 +1342,21 @@ impl<'a> GlmEngine<'a> {
                 if w1.is_some() {
                     self.publish_projection(0, index, 0, w, layer, "down", t)?;
                 }
-            } else if self.tp2_layer(index) {
-                self.moe_front(w, layer, t)?;
-                self.tp2_pair(index, 0, w, w1.context("TP2 peer workspace")?, t, cap)?;
-            } else if let Some(skip) = &self.skip {
-                self.moe_front(w, layer, t)?;
-                let ranks = self.moe_skip(w, index, layer, t, cap)?;
-                self.reduce(skip.pointers(), w, ranks, t)?;
             } else {
-                let (transport, _) = experts.as_mut()
-                    .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
-                self.moe(w, index, layer, t, cap, tables.decode, transport)?;
+                real_row_moe(tables.exchange_rows, t, |real| {
+                    if self.tp2_layer(index) {
+                        self.moe_front(w, layer, real)?;
+                        self.tp2_pair(index, 0, w, w1.context("TP2 peer workspace")?, real, cap)
+                    } else if let Some(skip) = &self.skip {
+                        self.moe_front(w, layer, real)?;
+                        let ranks = self.moe_skip(w, index, layer, real, cap)?;
+                        self.reduce(skip.pointers(), w, ranks, real)
+                    } else {
+                        let (transport, _) = experts.as_mut().with_context(||
+                            format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
+                        self.moe(w, index, layer, real, cap, tables.decode, transport)
+                    }
+                }, |tail| self.clear_moe_tail(0, w.delta.buffer, tail))?;
             }
             if !layer.dense { self.tap_width(w, index, tables.exchange_rows)?; }
             // h += ffn; x = next input_layernorm(h) (or the final norm). Under a head split
@@ -1367,9 +1371,9 @@ impl<'a> GlmEngine<'a> {
                     && (index + 1 < layers.len() || Self::core_split(layer, "down")) {
                     self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes)?;
                 }
-                self.peer_post(index, 0, w1, rows, bytes)?;
+                self.peer_post(index, 0, w1, rows, bytes, tables.exchange_rows)?;
                 self.exchange()?.wait(0, ffn)?;
-                if self.tp2_layer(index) { self.tp2_norm(0, w, weight, index, 0, rows)?; }
+                if self.tp2_layer(index) { self.tp2_norm_rows(0, w, weight, index, 0, rows, tables.exchange_rows)?; }
                 else { self.ffn_norm(0, index, 0, w, layer, weight, rows,
                     w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
             } else {
@@ -1505,7 +1509,7 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn peer_ffn(&self, index: usize, lane: usize, w1: &Workspace<'_>, rows: Scalar,
-        cap: &str, bytes: usize) -> Result<()> {
+        cap: &str, bytes: usize, real: usize) -> Result<()> {
         let peer = self.peer()?;
         let (layer, exchange) = (&peer.layers[index], self.exchange()?);
         let ffn = slot(index, true, lane);
@@ -1513,7 +1517,9 @@ impl<'a> GlmEngine<'a> {
             self.ffn_on(1, w1, layer, self.cfg.dense_intermediate, cap, w1.delta.buffer.ptr, rows)?;
             self.publish_projection(1, index, lane, w1, layer, "down", scalar_rows(rows)?)
         } else {
-            self.shared_on(1, index, w1, layer, rows, cap)?;
+            real_row_moe(real, scalar_rows(rows)?, |real|
+                self.shared_on(1, index, w1, layer, Scalar::I32(real as i32), cap),
+                |tail| self.clear_moe_tail(1, w1.shared.buffer, tail))?;
             if self.tp2_layer(index) { Ok(()) } else { exchange.push(1, ffn, w1.shared.buffer.ptr, bytes) }
         }
     }
@@ -1522,7 +1528,7 @@ impl<'a> GlmEngine<'a> {
     /// routed + shared sum in, then the next layer's input norm (nothing after
     /// the last layer). The norm adds the same two operands in the same order as
     /// rank 0's.
-    fn peer_post(&self, index: usize, lane: usize, w1: &Workspace<'_>, rows: Scalar, bytes: usize) -> Result<()> {
+    fn peer_post(&self, index: usize, lane: usize, w1: &Workspace<'_>, rows: Scalar, bytes: usize, real: usize) -> Result<()> {
         let peer = self.peer()?;
         let Some(next) = peer.layers.get(index + 1) else {
             if !self.tp2_layer(index) && Self::core_split(&peer.layers[index], "down") {
@@ -1536,7 +1542,7 @@ impl<'a> GlmEngine<'a> {
         let (first, second) = if peer.layers[index].dense { (w1.delta.buffer.ptr, received) }
             else { (received, w1.shared.buffer.ptr) };
         if self.tp2_layer(index) {
-            self.tp2_norm(1, w1, next.ptr("input_norm")?, index, lane, rows)
+            self.tp2_norm_rows(1, w1, next.ptr("input_norm")?, index, lane, rows, real)
         } else { self.ffn_norm(1, index, lane, w1, &peer.layers[index], next.ptr("input_norm")?, rows, first, second) }
     }
 
@@ -1570,15 +1576,20 @@ impl<'a> GlmEngine<'a> {
                 .cast_const())) }
     }
 
-    /// Decode layers as captured graph segments: each replays the previous
-    /// layer's reduce + residual norm, this layer's attention and
-    /// post-attention norm, and the dense FFN or the MoE front (router,
-    /// select, wire rows); the Spark exchange runs between segments.
-    ///
-    /// Under a head split each segment exchanges with rank 1's segment of the
-    /// same layer (captured on rank 1's stream); rank 1's next segment is
-    /// queued before the host waits in this layer's Spark exchange, except when
-    /// its current shared-core meet still needs rank 0's publication.
+    fn clear_moe_tail(&self, rank: usize, buffer: cuteafd_ffi::CuteafdDeviceBuffer,
+        tail: std::ops::Range<usize>) -> Result<()> {
+        let offset = tail.start * self.cfg.hidden * 2;
+        let bytes = tail.len() * self.cfg.hidden * 2;
+        ensure!(offset + bytes <= buffer.bytes, "GLM MoE tail exceeds output");
+        self.on(rank, || unsafe {
+            // SAFETY: the output owns this subrange; its final producer precedes the clear on this stream.
+            self.library.cuda_zero_bytes_async(Self::region(buffer, offset, bytes), bytes, self.stream_of(rank))
+        })
+    }
+
+    /// Bucket graphs contain attention, dense FFNs and norms. MoE routing,
+    /// experts and reductions use live rows outside capture; their cleared
+    /// output tails are ready before the next bucket norm consumes them.
     #[allow(clippy::too_many_arguments)]
     fn decode_layers(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, ranked: &[StepTables; 2], t: usize,
         experts: &mut Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, gather: bool, head: bool) -> Result<()> {
@@ -1586,8 +1597,7 @@ impl<'a> GlmEngine<'a> {
         let rows = Scalar::I32(t as i32);
         let layers = &self.weights.layers;
         let bytes = t * self.cfg.hidden * 2;
-        // The decode transport's intake planes (or the skip intake's); the
-        // replayed graphs bake them in.
+        // Only skip reductions need these planes; Spark tickets own their live return slot.
         let planes = match (experts.as_mut(), &self.skip) {
             (_, Some(skip)) => skip.pointers(),
             // One decode slot: the replayed graphs bake slot 0's planes.
@@ -1598,10 +1608,15 @@ impl<'a> GlmEngine<'a> {
             }
             (None, None) => [std::ptr::null(); MAX_RANKS],
         };
-        // Previous layer's FFN output: none (first layer), in `delta`, or Spark planes.
+        // Planes denotes an already-reduced routed + shared result in delta;
+        // unlike a dense/TP2 partial it must still be published to the peer.
         let mut previous = Previous::First;
         for index in 0..=layers.len() {
             let layer = layers.get(index);
+            if let Some(before) = index.checked_sub(1).filter(|&before| self.tp2_layer(before)) {
+                self.exchange()?.wait(0, slot(before, true, 0))?;
+                self.tp2_sum(0, w, before, 0, tables.exchange_rows, t)?;
+            }
             let segment = || -> Result<()> {
                 if index == 0 && gather {
                     // SAFETY: the step's ids are in `ids` before the replay; `h` holds its rows.
@@ -1610,9 +1625,6 @@ impl<'a> GlmEngine<'a> {
                 }
                 if let (0, Some(w1)) = (index, w1) {
                     self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes)?;
-                }
-                if let Previous::Planes(ranks) = previous {
-                    self.reduce(planes, w, ranks, t)?;
                 }
                 let weight = match layer {
                     Some(layer) => layer.ptr("input_norm")?,
@@ -1627,10 +1639,13 @@ impl<'a> GlmEngine<'a> {
                             && (layer.is_some() || Self::core_split(&layers[before], "down")) {
                             self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes)?;
                         }
-                        self.exchange()?.wait(0, ffn)?;
-                        if self.tp2_layer(before) { self.tp2_norm(0, w, weight, before, 0, rows)?; }
-                        else { self.ffn_norm(0, before, 0, w, &layers[before], weight, rows,
-                            w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
+                        if self.tp2_layer(before) {
+                            self.norm_full(0, w, weight, 1, rows, w.delta.buffer.ptr, w.delta.buffer.ptr)?;
+                        } else {
+                            self.exchange()?.wait(0, ffn)?;
+                            self.ffn_norm(0, before, 0, w, &layers[before], weight, rows,
+                                w.delta.buffer.ptr, self.recv(0, ffn)?)?;
+                        }
                     }
                     _ => {
                         let deltas = if matches!(previous, Previous::First) { 0 } else { 1 };
@@ -1669,16 +1684,12 @@ impl<'a> GlmEngine<'a> {
                     }
                     Ok(())
                 } else {
-                    self.moe_front(w, layer, t)
+                    Ok(())
                 }
             };
             let key = GraphKey { layer: index, rows: t, table_width: tables.table_width,
                 table_stride: tables.table_stride, previous, head: head && layer.is_none() };
             self.replay_on(0, key, segment)?;
-            if let (Previous::Planes(_), None, Some((transport, _))) = (previous, &self.skip, experts.as_mut()) {
-                // The segment just queued reduced the previous layer's planes.
-                transport.exchange()?.consumed(0, self.stream)?;
-            }
             let defer_peer = layer.is_some_and(|layer| !layer.dense && !self.tp2_layer(index)
                 && Self::core_split(layer, "down"));
             let peer_next = || -> Result<()> {
@@ -1699,23 +1710,35 @@ impl<'a> GlmEngine<'a> {
                     self.peer_segment(0, Previous::First, w1, t, ranked, bytes)?;
                 }
                 if let Some(_layer) = layer.filter(|_| self.tp2_layer(index)) {
-                    self.tp2_pair(index, 0, w, w1, t, "m64")?;
+                    real_row_moe(tables.exchange_rows, t, |real| {
+                        self.moe_front(w, &layers[index], real)?;
+                        self.tp2_pair(index, 0, w, w1, real, "m64")
+                    }, |tail| self.clear_moe_tail(0, w.delta.buffer, tail))?;
                 }
                 if !defer_peer { peer_next()?; }
             }
             previous = match layer {
                 None => break,
                 Some(layer) if layer.dense || self.tp2_layer(index) => Previous::Delta,
-                // Only the step's real rows go to the Sparks; padded rows reduce stale
-                // planes into their own (scratch) rows.
-                Some(layer) if self.skip.is_some() => Previous::Planes(self.moe_skip(w, index, layer,
-                    tables.exchange_rows, "m64")?),
                 Some(layer) => {
-                    let (transport, _) = experts.as_mut()
-                        .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
-                    let waves = transport.exchange()?;
-                    self.moe_exchange(w, index, layer, tables.exchange_rows, "m64", true, waves)?;
-                    Previous::Planes(waves.ranks())
+                    let mut ranks = 0;
+                    real_row_moe(tables.exchange_rows, t, |real| {
+                        self.moe_front(w, layer, real)?;
+                        if self.skip.is_some() {
+                            ranks = self.moe_skip(w, index, layer, real, "m64")?;
+                            self.reduce(planes, w, ranks, real)?;
+                        } else {
+                            let (transport, _) = experts.as_mut().with_context(||
+                                format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
+                            let waves = transport.exchange()?;
+                            let slot = self.moe_exchange(w, index, layer, real, "m64", true, waves)?;
+                            ranks = waves.ranks();
+                            self.reduce(waves.planes(slot), w, ranks, real)?;
+                            waves.consumed(slot, self.stream)?;
+                        }
+                        Ok(())
+                    }, |tail| self.clear_moe_tail(0, w.delta.buffer, tail))?;
+                    Previous::Planes(ranks)
                 }
             };
             // Instantiating the next peer graph can wait for that device to drain.
@@ -1739,17 +1762,23 @@ impl<'a> GlmEngine<'a> {
         let tables = &ranked[1];
         let peer = self.peer()?;
         let rows = Scalar::I32(t as i32);
+        if let Some(before) = index.checked_sub(1).filter(|&before| self.tp2_layer(before)) {
+            self.exchange()?.wait(1, slot(before, true, 0))?;
+            self.tp2_sum(1, w1, before, 0, tables.exchange_rows, t)?;
+        }
         let segment = || -> Result<()> {
             let exchange = self.exchange()?;
             let layer = &peer.layers[index];
             match (previous, index.checked_sub(1)) {
                 (Previous::Delta | Previous::Planes(_), Some(before)) => {
                     let ffn = slot(before, true, 0);
-                    exchange.wait(1, ffn)?;
+                    if !self.tp2_layer(before) { exchange.wait(1, ffn)?; }
                     let received = self.recv(1, ffn)?;
                     let (first, second) = if matches!(previous, Previous::Delta) { (w1.delta.buffer.ptr, received) }
                         else { (received, w1.shared.buffer.ptr) };
-                    if self.tp2_layer(before) { self.tp2_norm(1, w1, layer.ptr("input_norm")?, before, 0, rows)?; }
+                    if self.tp2_layer(before) {
+                        self.norm_full(1, w1, layer.ptr("input_norm")?, 1, rows, w1.delta.buffer.ptr, w1.delta.buffer.ptr)?;
+                    }
                     else { self.ffn_norm(1, before, 0, w1, &peer.layers[before], layer.ptr("input_norm")?, rows, first, second)?; }
                 }
                 _ => {
@@ -1758,7 +1787,7 @@ impl<'a> GlmEngine<'a> {
                 }
             }
             self.attention_unit(1, w1, index, layer, rows, "m64", ranked, 0)?;
-            let (attended, ffn) = (slot(index, false, 0), slot(index, true, 0));
+            let attended = slot(index, false, 0);
             self.publish_projection(1, index, 0, w1, layer, "o", t)?;
             exchange.wait(1, attended)?;
             self.projection_norm(1, index, 0, w1, layer, "o", layer.ptr("post_norm")?, rows,
@@ -1766,20 +1795,26 @@ impl<'a> GlmEngine<'a> {
             let out = if layer.dense { w1.delta.buffer.ptr } else { w1.shared.buffer.ptr };
             let intermediate = if layer.dense { self.cfg.dense_intermediate } else { self.cfg.moe_intermediate };
             if layer.dense { self.ffn_on(1, w1, layer, intermediate, "m64", out, rows)?; }
-            else { self.shared_on(1, index, w1, layer, rows, "m64")?; }
-            if self.tp2_layer(index) { Ok(()) }
-            else if layer.dense { self.publish_projection(1, index, 0, w1, layer, "down", t) }
-            else {
-                exchange.push(1, ffn, out, bytes)?;
-                if index + 1 == peer.layers.len() && Self::core_split(layer, "down") {
-                    exchange.wait(1, ffn)?;
-                }
-                Ok(())
-            }
+            if layer.dense { self.publish_projection(1, index, 0, w1, layer, "down", t) }
+            else { Ok(()) }
         };
         let key = GraphKey { layer: index, rows: t, table_width: tables.table_width, table_stride: tables.table_stride,
             previous, head: false };
-        self.replay_on(1, key, segment)
+        self.replay_on(1, key, segment)?;
+        let layer = &peer.layers[index];
+        if !layer.dense {
+            real_row_moe(tables.exchange_rows, t, |real|
+                self.shared_on(1, index, w1, layer, Scalar::I32(real as i32), "m64"),
+                |tail| self.clear_moe_tail(1, w1.shared.buffer, tail))?;
+            if !self.tp2_layer(index) {
+                let ffn = slot(index, true, 0);
+                self.exchange()?.push(1, ffn, w1.shared.buffer.ptr, bytes)?;
+                if index + 1 == peer.layers.len() && Self::core_split(layer, "down") {
+                    self.exchange()?.wait(1, ffn)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Launches `segment` through a graph captured the first time `key` is seen.
@@ -2239,7 +2274,7 @@ impl<'a> GlmEngine<'a> {
                 self.projection_norm(0, index, slot, w, layer, "o", layer.ptr("post_norm")?, rows,
                     w.delta.buffer.ptr, self.recv(0, attended)?)?;
                 self.peer_ffn(index, slot, peer_workspaces.as_ref().context("peer workspaces")?.get(slot)?,
-                    rows, cap, bytes_of_unit(unit))?;
+                    rows, cap, bytes_of_unit(unit), counts[unit])?;
             } else {
                 self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
@@ -2272,7 +2307,7 @@ impl<'a> GlmEngine<'a> {
                     self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes_of_unit(unit))?;
                 }
                 self.peer_post(index, slot, peer_workspaces.as_ref().context("peer workspaces")?.get(slot)?,
-                    rows, bytes_of_unit(unit))?;
+                    rows, bytes_of_unit(unit), counts[unit])?;
                 self.exchange()?.wait(0, ffn)?;
                 if self.tp2_layer(index) { self.tp2_norm(0, w, weight, index, slot, rows)?; }
                 else { self.ffn_norm(0, index, slot, w, &layers[index], weight, rows,
@@ -2949,6 +2984,85 @@ mod long_graph_tests {
         assert!(prefill_logits_plan(&[4096, 0], 1).is_err());
     }
 
+
+    #[test]
+    fn padded_moe_runs_live_rows_and_clears_after_all_producers() {
+        use std::cell::RefCell;
+        // A CPU backend records the same live-work / bucket-consumer boundary
+        // used by eager, bucket-graph and owned-layer execution. Poisoned tails
+        // catch reads of unpublished TP2 payloads and stale Spark planes.
+        for graphed in [false, true] {
+            for owned in [false, true] {
+                for gpus in 1..=2 {
+                    if owned && gpus == 1 { continue; }
+                    for payload_bytes in [2, 4] {
+                        let hidden = 4;
+                        let width = 4096;
+                        let mut keys = std::collections::HashSet::new();
+                        for real in [1, 33, 47, 64, 33] {
+                            let bucket = glm_decode_row_bucket(real, width).unwrap();
+                            let mut tables = StepTables { segments: Vec::new(), decode: true,
+                                positions: vec![132_000; real], slots: vec![0; real],
+                                page_table: vec![0; real * width], table_width: width,
+                                table_stride: width, cache_lengths: vec![132_001; real],
+                                lengths: vec![2048; real], exchange_rows: real };
+                            tables.pad_rows(4096, bucket);
+                            // Capture once per bucket, never per live width (33 and
+                            // 47 share the executable warmed using one live row).
+                            let key = GraphKey { layer: 0, rows: bucket, table_width: width,
+                                table_stride: width, previous: Previous::First, head: false };
+                            if graphed { keys.insert(key); }
+                            let events = RefCell::new(Vec::new());
+                            let delta = RefCell::new(vec![u16::MAX; bucket * hidden]);
+                            let routes = RefCell::new(vec![-1; bucket]);
+                            let wire = RefCell::new(vec![0xa5; bucket * hidden]);
+                            let payload = RefCell::new(vec![vec![0xa5; bucket * hidden * payload_bytes]; gpus]);
+                            let mut work = vec![0; gpus];
+                            real_row_moe(tables.exchange_rows, tables.positions.len(), |rows| {
+                                events.borrow_mut().push("route");
+                                routes.borrow_mut()[..rows].fill(7);
+                                wire.borrow_mut()[..rows * hidden].fill(1);
+                                // The quantizer may borrow the entire output as scratch.
+                                delta.borrow_mut().fill(0xdead);
+                                for rank in 0..gpus {
+                                    work[rank] += rows;
+                                    payload.borrow_mut()[rank][..rows * hidden * payload_bytes].fill(rank as u8 + 1);
+                                }
+                                events.borrow_mut().push(if gpus == 1 { "spark_land" } else { "tp2_wait" });
+                                // Sum/reduce only live inputs. Pad payload bytes remain poison.
+                                for row in 0..rows {
+                                    for col in 0..hidden {
+                                        let i = row * hidden + col;
+                                        let sum: u16 = (0..gpus).map(|rank|
+                                            payload.borrow()[rank][i * payload_bytes] as u16).sum();
+                                        delta.borrow_mut()[i] = sum;
+                                    }
+                                }
+                                events.borrow_mut().push("reduce");
+                                Ok(())
+                            }, |tail| {
+                                assert_eq!(events.borrow().last(), Some(&"reduce"));
+                                delta.borrow_mut()[tail.start * hidden..tail.end * hidden].fill(0);
+                                events.borrow_mut().push("clear");
+                                Ok(())
+                            }).unwrap();
+                            assert_eq!(work, vec![real; gpus]);
+                            assert!(routes.borrow()[..real].iter().all(|&v| v == 7));
+                            assert!(routes.borrow()[real..].iter().all(|&v| v == -1));
+                            assert!(wire.borrow()[real * hidden..].iter().all(|&v| v == 0xa5));
+                            for rank in 0..gpus {
+                                assert!(payload.borrow()[rank][real * hidden * payload_bytes..].iter().all(|&v| v == 0xa5));
+                            }
+                            assert!(delta.borrow()[..real * hidden].iter().all(|&v| v == (1..=gpus as u16).sum()));
+                            assert!(delta.borrow()[real * hidden..].iter().all(|&v| v == 0));
+                            assert_eq!(events.borrow().last(), Some(&if real < bucket { "clear" } else { "reduce" }));
+                        }
+                        assert_eq!(keys.len(), if graphed { 2 } else { 0 });
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn long_padding_resolves_only_to_sized_scratch_records() {

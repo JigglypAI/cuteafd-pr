@@ -325,30 +325,12 @@ impl<'a> GlmEngine<'a> {
         lane: usize,
         rows: Scalar,
     ) -> Result<()> {
-        let Scalar::I32(rows_count) = rows else {
-            anyhow::bail!("GLM TP2 norm rows must be i32");
-        };
-        let pair = self.tp2.as_ref().context("TP2 pair")?;
-        let local = w.payload.as_ref().context("TP2 payload")?.buffer.ptr;
-        let received = self.recv(rank, slot(layer, true, lane))?;
-        let (rank0, rank1) = if rank == 0 {
-            (local, received)
-        } else {
-            (received, local)
-        };
-        self.on(rank, || {
-            // SAFETY: FFN wait precedes the rank-ordered sum into disjoint delta storage.
-            unsafe {
-                pair.combine.sum(
-                    rank0,
-                    rank1,
-                    w.delta.buffer.ptr.cast(),
-                    rows_count as usize,
-                    self.cfg.hidden,
-                    self.stream_of(rank),
-                )
-            }
-        })?;
+        self.tp2_norm_rows(rank, w, weight, layer, lane, rows, scalar_rows(rows)?)
+    }
+
+    fn tp2_norm_rows(&self, rank: usize, w: &Workspace<'_>, weight: *mut c_void,
+        layer: usize, lane: usize, rows: Scalar, real: usize) -> Result<()> {
+        self.tp2_sum(rank, w, layer, lane, real, scalar_rows(rows)?)?;
         self.norm_full(
             rank,
             w,
@@ -358,6 +340,20 @@ impl<'a> GlmEngine<'a> {
             w.delta.buffer.ptr,
             w.delta.buffer.ptr,
         )
+    }
+
+    fn tp2_sum(&self, rank: usize, w: &Workspace<'_>, layer: usize, lane: usize,
+        real: usize, bucket: usize) -> Result<()> {
+        let pair = self.tp2.as_ref().context("TP2 pair")?;
+        let local = w.payload.as_ref().context("TP2 payload")?.buffer.ptr;
+        let received = self.recv(rank, slot(layer, true, lane))?;
+        let (rank0, rank1) = if rank == 0 { (local, received) } else { (received, local) };
+        real_row_moe(real, bucket, |rows| self.on(rank, || unsafe {
+            // SAFETY: the caller waited for this FFN slot; only published live rows are read.
+            // Payload dtype and rank order remain owned by FusedCombine, not the bucket norm.
+            pair.combine.sum(rank0, rank1, w.delta.buffer.ptr.cast(), rows,
+                self.cfg.hidden, self.stream_of(rank))
+        }), |tail| self.clear_moe_tail(rank, w.delta.buffer, tail))
     }
 
     pub(crate) fn check_tp2_routes(

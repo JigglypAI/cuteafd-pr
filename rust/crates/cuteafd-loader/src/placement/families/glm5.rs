@@ -538,9 +538,8 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
                 let context = crate::serving_capacity::pool_context(branch.max_context as usize,
                     branch.automatic_context, candidate as usize, 256)
                     .map_err(|_| PlacementError::Inventory("GLM admitted pool cannot support context"))?;
-                let tp2: Vec<_> = layers.iter().map(|layer| layer.experts == ExpertHome::RtxTp2).collect();
                 let startup = crate::serving_capacity::glm_graphs::glm_owned_startup_graphs(
-                    context, (candidate as usize).div_ceil(PAGE_ROWS as usize), &owners, &tp2)
+                    context, (candidate as usize).div_ceil(PAGE_ROWS as usize), &owners, inputs.cfg.first_moe_layer)
                     .map_err(|_| PlacementError::Inventory("GLM owned startup graphs"))?;
                 req.fixed.retain(|d| d.group != "graphs" && d.group != "graph growth");
                 for rank in 0..2 {
@@ -2050,9 +2049,8 @@ mod tests {
         i.requested_pool = Some(2 << 20);
         let (placed, _) = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Layers)).unwrap();
         assert_eq!(placed.pool_tokens, 2 << 20);
-        let tp2: Vec<_> = placed.layers.iter().map(|layer| layer.experts == ExpertHome::RtxTp2).collect();
         let startup = crate::serving_capacity::glm_graphs::glm_owned_startup_graphs(
-            i.max_context as usize, (i.max_context as usize).div_ceil(PAGE_ROWS as usize), &owners, &tp2).unwrap();
+            i.max_context as usize, (i.max_context as usize).div_ceil(PAGE_ROWS as usize), &owners, cfg.first_moe_layer).unwrap();
         for rank in 0..2 {
             assert!(!placed.items[rank].iter().any(|item| item.group == "decode graph allowance"));
             for item in startup.inventory.items(rank) {
@@ -2083,7 +2081,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_graph_census_tracks_the_selected_tp2_prefix() {
+    fn owned_graph_census_is_independent_of_the_selected_tp2_prefix() {
         let cfg = config();
         for onboard in [Onboard::Auto, Onboard::Layers(0), Onboard::Layers(2), Onboard::Layers(3)] {
             let mut i = inputs(&cfg, &[96 * GIB; 2]);
@@ -2100,8 +2098,8 @@ mod tests {
             assert_eq!(tp2.iter().filter(|&&local| local).count(), placed.onboard_layers);
             if onboard == Onboard::Auto { assert!(placed.onboard_layers > 0); }
             let startup = crate::serving_capacity::glm_graphs::glm_owned_startup_graphs(
-                i.max_context as usize, (placed.pool_tokens / PAGE_ROWS) as usize, &owners, &tp2).unwrap();
-            let expected = (3 * cfg.layers - placed.onboard_layers) as u64 * startup.keys.len() as u64;
+                i.max_context as usize, (placed.pool_tokens / PAGE_ROWS) as usize, &owners, cfg.first_moe_layer).unwrap();
+            let expected = (2 * cfg.layers + cfg.first_moe_layer) as u64 * startup.keys.len() as u64;
             for rank in 0..2 {
                 assert_eq!(startup.inventory.ranks[rank].executables, expected);
                 for item in startup.inventory.items(rank) {
@@ -2153,9 +2151,8 @@ mod tests {
             let owners: Vec<_> = placed.layers.iter().map(|layer| match layer.mode {
                 LayerMode::Whole { gpu, .. } => gpu, _ => unreachable!(),
             }).collect();
-            let tp2: Vec<_> = placed.layers.iter().map(|layer| layer.experts == ExpertHome::RtxTp2).collect();
             let startup = crate::serving_capacity::glm_graphs::glm_owned_startup_graphs(
-                context, (placed.pool_tokens as usize).div_ceil(PAGE_ROWS as usize), &owners, &tp2).unwrap();
+                context, (placed.pool_tokens as usize).div_ceil(PAGE_ROWS as usize), &owners, cfg.first_moe_layer).unwrap();
             for rank in 0..2 {
                 for item in startup.inventory.items(rank) {
                     assert!(placed.items[rank].contains(&item), "missing {item:?}");

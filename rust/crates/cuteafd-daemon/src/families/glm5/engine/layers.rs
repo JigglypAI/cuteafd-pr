@@ -94,9 +94,7 @@ impl<'a> GlmEngine<'a> {
         hops.attach_abort([exchange.abort_word(0)?.context("rank 0 abort")?, exchange.abort_word(1)?.context("rank 1 abort")?])?;
         hops.validate_binding(&plan, exchange)?;
         let owners: Vec<_> = self.weights.layers.iter().map(|layer| layer.attention_owner.unwrap()).collect();
-        let tp2: Vec<_> = placement.layers.iter().map(|layer|
-            layer.experts == cuteafd_loader::placement::ExpertHome::RtxTp2).collect();
-        let segments = glm_owned_segments(&owners, &tp2).map_err(anyhow::Error::msg)?;
+        let segments = glm_owned_segments(&owners, self.cfg.first_moe_layer).map_err(anyhow::Error::msg)?;
         self.layer_execution = Some(Execution { plan, hops, segments,
             waves: RefCell::new((0..self.prefill_lanes).map(|_| None).collect()) });
         Ok(())
@@ -219,15 +217,21 @@ impl Bindings<'_, '_, '_, '_, '_> {
         let e = self.engine;
         for rank in 0..2 {
             let w = self.work[rank];
-            self.segment(rank, index, GlmOwnedPhase::FfnJoin, || {
+            if e.tp2_layer(index) {
                 e.exchange()?.wait(rank, slot(index, true, self.lane))?;
+                e.tp2_sum(rank, w, index, self.lane, self.tables[0].exchange_rows, self.rows())?;
+            }
+            self.segment(rank, index, GlmOwnedPhase::FfnJoin, || {
+                if !e.tp2_layer(index) { e.exchange()?.wait(rank, slot(index, true, self.lane))?; }
                 let weight = if let Some(next) = e.weights.layers.get(index + 1) { next.ptr("input_norm")? }
                     else { e.weights.norm.buffer.ptr };
                 // The terminal norm has only rank-0 weights; the residual itself
                 // is replicated by the same rank-ordered BF16 addition on both GPUs.
                 let weight = if rank == 1 { if let Some(next) = e.peer()?.layers.get(index + 1) { next.ptr("input_norm")? }
                     else { self.layer(rank, index).ptr("input_norm")? } } else { weight };
-                if e.tp2_layer(index) { e.tp2_norm(rank, w, weight, index, self.lane, Scalar::I32(self.rows() as i32)) }
+                if e.tp2_layer(index) {
+                    e.norm_full(rank, w, weight, 1, Scalar::I32(self.rows() as i32), w.delta.buffer.ptr, w.delta.buffer.ptr)
+                }
                 else {
                     let local = if rank == 0 || self.layer(rank, index).dense { w.delta.buffer.ptr } else { w.shared.buffer.ptr };
                     let peer = e.recv(rank, slot(index, true, self.lane))?;
@@ -306,79 +310,94 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         let [w, w1] = self.work;
         let layer = &e.weights.layers[index];
         let rows = Scalar::I32(self.rows() as i32);
-        if !layer.dense && e.tp2_layer(index) {
-            e.moe_front(w, layer, self.rows())?;
-            e.ring_local_routes(index, w, self.rows())?;
-            e.shared_on(0, index, w, layer, rows, self.cap())?;
-            e.moe_front_on(1, w1, self.layer(1, index), self.rows())?;
-            e.shared_on(1, index, w1, self.layer(1, index), rows, self.cap())?;
-            let pair = e.tp2.as_ref().context("TP2")?;
-            e.tp2_rank(pair, 0, index, self.lane, w, self.rows())?;
-            e.tp2_rank(pair, 1, index, self.lane, w1, self.rows())?;
-            return Ok(Ticket::Complete);
-        }
-        self.segment(1, index, GlmOwnedPhase::FfnFront, || {
-            e.ffn_on(1, w1, self.layer(1, index),
-                if layer.dense { e.cfg.dense_intermediate } else { e.cfg.moe_intermediate }, self.cap(),
-                if layer.dense { w1.delta.buffer.ptr } else { w1.shared.buffer.ptr }, rows)?;
-            if !layer.dense { e.meet_shared_core(1, index, w1, self.layer(1, index), self.rows())?; }
-            Ok(())
-        })?;
-        if self.tables[0].decode && !layer.dense {
-            if let Some(l2) = &e.peer()?.l2 {
-                e.on(1, || l2.issue(e.library, index, e.stream_of(1)))?;
-            }
-        }
         if layer.dense {
-            self.segment(0, index, GlmOwnedPhase::FfnFront, || e.ffn(w, layer, e.cfg.dense_intermediate, self.cap(), w.delta.buffer.ptr, rows))?;
+            self.segment(1, index, GlmOwnedPhase::FfnFront, ||
+                e.ffn_on(1, w1, self.layer(1, index), e.cfg.dense_intermediate, self.cap(), w1.delta.buffer.ptr, rows))?;
+            self.segment(0, index, GlmOwnedPhase::FfnFront, ||
+                e.ffn(w, layer, e.cfg.dense_intermediate, self.cap(), w.delta.buffer.ptr, rows))?;
             return Ok(Ticket::Complete);
         }
-        self.segment(0, index, GlmOwnedPhase::FfnFront, || e.moe_front(w, layer, self.rows()))?;
-        let real = self.tables[0].exchange_rows;
-        if e.skip.is_some() { return Ok(Ticket::Skip(e.moe_skip(w, index, layer, real, self.cap())?)); }
-        let decode = self.tables[0].decode;
-        let execution = e.layer_execution.as_ref().context("layer execution")?;
-        ensure!(execution.waves.borrow()[self.lane].is_none(), "previous Spark wave is still live");
-        // Routes and wire rows go to the link's exchange; the shared expert
-        // and the prefetch queue behind them; the planes' wait is queued in
-        // `finish_ffn`. The host never waits for the GPU or the Sparks.
-        let cap = self.cap();
-        let (pending, ticket) = match &mut self.transport {
-            Transport::Serial(Some((link, _))) => (PendingWave::Landed(e.moe_exchange(w, index, layer, real, cap, decode,
-                link.exchange()?)?), Ticket::Spark),
-            Transport::Continuous(waves) => (PendingWave::Dispatched(e.moe_wave(w, index, layer, real, cap, waves)?), Ticket::Lane),
-            _ => anyhow::bail!("GLM MoE layer {index} needs Spark peers"),
-        };
-        execution.waves.borrow_mut()[self.lane] = Some(pending);
+        let mut ticket = Ticket::Complete;
+        real_row_moe(self.tables[0].exchange_rows, self.rows(), |real| {
+            let rows = Scalar::I32(real as i32);
+            e.moe_front(w, layer, real)?;
+            if !self.tables[0].decode && !e.tp2_layer(index) {
+                // Preserve the continuous-prefill peer implementation and its core meet.
+                e.ffn_on(1, w1, self.layer(1, index), e.cfg.moe_intermediate, self.cap(), w1.shared.buffer.ptr, rows)?;
+                e.meet_shared_core(1, index, w1, self.layer(1, index), real)?;
+            } else {
+                e.shared_on(1, index, w1, self.layer(1, index), rows, self.cap())?;
+            }
+            if e.tp2_layer(index) {
+                e.ring_local_routes(index, w, real)?;
+                e.shared_on(0, index, w, layer, rows, self.cap())?;
+                e.moe_front_on(1, w1, self.layer(1, index), real)?;
+                let pair = e.tp2.as_ref().context("TP2")?;
+                e.tp2_rank(pair, 0, index, self.lane, w, real)?;
+                e.tp2_rank(pair, 1, index, self.lane, w1, real)?;
+                return Ok(());
+            }
+            if self.tables[0].decode {
+                if let Some(l2) = &e.peer()?.l2 {
+                    e.on(1, || l2.issue(e.library, index, e.stream_of(1)))?;
+                }
+            }
+            if e.skip.is_some() {
+                ticket = Ticket::Skip(e.moe_skip(w, index, layer, real, self.cap())?);
+                return Ok(());
+            }
+            let execution = e.layer_execution.as_ref().context("layer execution")?;
+            ensure!(execution.waves.borrow()[self.lane].is_none(), "previous Spark wave is still live");
+            let cap = self.cap();
+            let decode = self.tables[0].decode;
+            let (pending, result) = match &mut self.transport {
+                Transport::Serial(Some((link, _))) => (PendingWave::Landed(e.moe_exchange(w, index, layer, real, cap, decode,
+                    link.exchange()?)?), Ticket::Spark),
+                Transport::Continuous(waves) => (PendingWave::Dispatched(e.moe_wave(w, index, layer, real, cap, waves)?), Ticket::Lane),
+                _ => anyhow::bail!("GLM MoE layer {index} needs Spark peers"),
+            };
+            execution.waves.borrow_mut()[self.lane] = Some(pending);
+            ticket = result;
+            Ok(())
+        }, |tail| {
+            // The peer shared half is final here. Rank 0's delta is cleared after landing/reduction.
+            e.clear_moe_tail(1, w1.shared.buffer, tail)
+        })?;
         Ok(ticket)
     }
     fn finish_ffn(&mut self, index: usize, ticket: Ticket) -> Result<()> {
         let e = self.engine;
         let w = self.work[0];
         let real = self.tables[0].exchange_rows;
-        let planes = match ticket {
-            Ticket::Skip(ranks) => Some((e.skip.as_ref().context("skip")?.pointers(), ranks)),
-            Ticket::Spark | Ticket::Lane => {
-                let pending = e.layer_execution.as_ref().context("layer execution")?.waves.borrow_mut()[self.lane]
-                    .take().context("missing dispatched Spark wave")?;
-                let mut reduce = |waves: &mut crate::shared::spark_waves::Waves<'_>, slot| -> Result<()> {
-                    e.reduce(waves.planes(slot), w, waves.ranks(), real)?;
-                    waves.consumed(slot, e.stream)
-                };
-                match (&mut self.transport, ticket, pending) {
-                    (Transport::Serial(Some((link, _))), Ticket::Spark, PendingWave::Landed(slot)) => reduce(link.exchange()?, slot)?,
-                    (Transport::Continuous(waves), Ticket::Lane, PendingWave::Dispatched(wave)) => {
-                        let slot = wave.slot();
-                        waves.land(wave, e.stream)?;
-                        reduce(waves, slot)?;
+        real_row_moe(real, self.rows(), |_| {
+            let planes = match ticket {
+                Ticket::Skip(ranks) => Some((e.skip.as_ref().context("skip")?.pointers(), ranks)),
+                Ticket::Spark | Ticket::Lane => {
+                    let pending = e.layer_execution.as_ref().context("layer execution")?.waves.borrow_mut()[self.lane]
+                        .take().context("missing dispatched Spark wave")?;
+                    let mut reduce = |waves: &mut crate::shared::spark_waves::Waves<'_>, slot| -> Result<()> {
+                        e.reduce(waves.planes(slot), w, waves.ranks(), real)?;
+                        waves.consumed(slot, e.stream)
+                    };
+                    match (&mut self.transport, ticket, pending) {
+                        (Transport::Serial(Some((link, _))), Ticket::Spark, PendingWave::Landed(slot)) => reduce(link.exchange()?, slot)?,
+                        (Transport::Continuous(waves), Ticket::Lane, PendingWave::Dispatched(wave)) => {
+                            let slot = wave.slot();
+                            waves.land(wave, e.stream)?;
+                            reduce(waves, slot)?;
+                        }
+                        _ => anyhow::bail!("Spark completion transport changed"),
                     }
-                    _ => anyhow::bail!("Spark completion transport changed"),
+                    None
                 }
-                None
-            }
-            Ticket::Complete => None,
-        };
-        if let Some((planes, ranks)) = planes { e.reduce(planes, w, ranks, real)?; }
+                Ticket::Complete => None,
+            };
+            if let Some((planes, ranks)) = planes { e.reduce(planes, w, ranks, real)?; }
+            Ok(())
+        }, |tail| {
+            if !e.tp2_layer(index) && !self.layer(0, index).dense { e.clear_moe_tail(0, w.delta.buffer, tail)?; }
+            Ok(())
+        })?;
         if !self.layer(0, index).dense { e.tap_width(w, index, real)?; }
         if !e.tp2_layer(index) {
             let bytes = self.rows() * e.cfg.hidden * 2;
