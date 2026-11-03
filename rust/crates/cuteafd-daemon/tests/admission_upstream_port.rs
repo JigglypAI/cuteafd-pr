@@ -759,7 +759,6 @@ mod http_503_mapping {
     }
 
     fn dummy_job() -> openai::NativeRequest {
-            acceptance: Default::default(),
         let (events, _receive) = tokio::sync::mpsc::unbounded_channel();
         openai::NativeRequest {
             acceptance: Default::default(),
