@@ -97,6 +97,11 @@ pub(crate) struct MimoWeights<'a> {
     pub output_fp8: bool,
 }
 
+pub(crate) struct MtpWeights<'a> {
+    pub layer: MimoLayer<'a>,
+    pub extras: [DeviceAllocation<'a>; 4],
+}
+
 #[derive(Clone)]
 pub(crate) struct MimoLoader<'a> {
     pub library: &'a NativeLibrary,
@@ -805,6 +810,15 @@ impl<'a> MimoLoader<'a> {
     pub fn layer(&self, cfg: &MimoV2Config, layer: usize) -> Result<Vec<MimoLayer<'a>>> {
         self.block(cfg, &format!("model.layers.{layer}"), cfg.attention[layer], cfg.dense[layer],
             "post_attention_layernorm", self.ranks())
+    }
+
+    pub fn mtp_weights(&self, cfg: &MimoV2Config, stages: usize) -> Result<Vec<MtpWeights<'a>>> {
+        let available = self.checkpoint.tensor_names()
+            .filter(|name| name.starts_with("model.mtp.layers.") && name.ends_with(".eh_proj.weight"))
+            .count();
+        ensure!(stages <= available, "--mtp {stages} but the checkpoint has {available} MTP layers");
+        (0..stages).map(|k| Ok(MtpWeights { extras: self.mtp_extras(k)?, layer: self.mtp_layer(cfg, k)? }))
+            .collect()
     }
 
     /// MTP layer `k` (`model.mtp.layers.{k}`): an SWA decoder layer with a
