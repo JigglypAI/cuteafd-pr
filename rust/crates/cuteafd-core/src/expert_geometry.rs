@@ -302,6 +302,10 @@ impl ExpertGeometry {
     /// output (not the 7168 residual); routed layers 1..93, sigmoid top-16, Situ.
     pub const KIMI_K3: Self = Self { hidden: 3584, experts: 896, topk: 16, intermediate: 3072, layers: 93 };
 
+    /// Mistral Large 4 (mistral_large4): routed layers 1..72, softmax top-4,
+    /// SiLU unclamped, one shared expert on the coordinator.
+    pub const MISTRAL_LARGE4: Self = Self { hidden: 6144, experts: 128, topk: 4, intermediate: 6144, layers: 72 };
+
     /// Step-5 routed target layers 3..91 (layer 91 is dense).
     pub const STEP5: Self = Self { hidden: 4096, experts: 352, topk: 8, intermediate: 1536, layers: 91 };
     /// Muse Spark: experts see the 4096-wide `pre_expert_proj` stream (not the
@@ -365,6 +369,7 @@ impl ExpertGeometry {
             (Self::STEP5, "step5"),
             (Self::KIMI_K3, "kimik3"),
             (Self::MUSE_SPARK, "muse"),
+            (Self::MISTRAL_LARGE4, "ml4"),
         ]
         .into_iter()
         .find_map(|(shape, family)| self.same_shape(&shape).then_some(family))
@@ -385,12 +390,12 @@ impl ExpertGeometry {
 
     /// Routed-expert SwiGLU clamp: DeepSeek and GLM 5.3 Flash clamp gate/up at
     /// 10; Step-5 clamps post-SiLU at 7 (see `activation`). GLM 5.x, MiMo,
-    /// Qwen 3.8 Flash Next and Muse Spark are unclamped (`None`).
+    /// Qwen 3.8 Flash Next Kimi K3, Muse Spark and Mistral Large 4 are unclamped (`None`).
     pub fn swiglu_limit(&self) -> Option<f32> {
         if self.same_shape(&Self::STEP5) { return Some(7.0); }
         (!self.same_shape(&Self::GLM5) && !self.same_shape(&Self::MIMO_V2_FLASH)
             && !self.same_shape(&Self::MIMO_V26_PRO) && !self.same_shape(&Self::QWEN4)
-            && !self.same_shape(&Self::KIMI_K3) && !self.same_shape(&Self::MUSE_SPARK)).then_some(10.0)
+            && !self.same_shape(&Self::KIMI_K3) && !self.same_shape(&Self::MUSE_SPARK) && !self.same_shape(&Self::MISTRAL_LARGE4)).then_some(10.0)
     }
 
     /// Expert arithmetic; existing families retain their legacy rounding exactly.

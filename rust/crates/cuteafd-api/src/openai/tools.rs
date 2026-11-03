@@ -45,6 +45,8 @@ pub(super) enum ToolSyntax {
     /// Muse `<atem:function_calls>` in a tool-addressed message
     /// (`muse_tool_schema`, the project's native atem parameter grammar).
     MuseAtem,
+    /// Mistral `[TOOL_CALLS]NAME[ARGS]{json}`, calls back to back.
+    MistralCalls,
 }
 
 pub(super) struct ToolConstraints {
@@ -107,6 +109,9 @@ impl ToolConstraints {
                         "content":{"type":"json_schema", "json_schema":schema, "style":"glm_xml", "any_order":false},
                         "end":"</tool_call>"})
                 }
+                // The JSON object closes the call: the next call, or the end of the turn, follows it.
+                ToolSyntax::MistralCalls => json!({"type":"tag", "begin":format!("[TOOL_CALLS]{}[ARGS]", tool.name),
+                    "content":{"type":"ds41_json_schema", "strict":strict, "json_schema":schema}, "end":""}),
                 ToolSyntax::QwenXml => json!({"type":"tag", "begin":format!("<tool_call>\n<function={}>\n", tool.name),
                     "content":{"type":"json_schema", "json_schema":schema, "style":"qwen_xml", "any_order":false},
                     "end":"\n</function>\n</tool_call>"}),
@@ -153,6 +158,12 @@ impl ToolConstraints {
                 json!({"type":"tags_with_separator", "tags":tags, "separator":"", "at_least_one":true,
                     "stop_after_first":!parallel}),
                 json!({"type":"triggered_tags", "triggers":["<tool_call>"], "tags":tags, "at_least_one":false,
+                    "stop_after_first":!parallel}),
+            ),
+            ToolSyntax::MistralCalls => (
+                json!({"type":"tags_with_separator", "tags":tags, "separator":"", "at_least_one":true,
+                    "stop_after_first":!parallel}),
+                json!({"type":"triggered_tags", "triggers":["[TOOL_CALLS]"], "tags":tags, "at_least_one":false,
                     "stop_after_first":!parallel}),
             ),
             ToolSyntax::QwenXml => (

@@ -55,6 +55,9 @@ pub enum ModelEncoding {
     Step5(Arc<step5::Step5Encoding>),
     /// Muse Spark: the checkpoint's template and recipient-addressed messages.
     Muse(Arc<muse::MuseEncoding>),
+    /// Mistral instruct (tekken): the checkpoint's chat template, `[THINK]` reasoning
+    /// and `[TOOL_CALLS]name[ARGS]{json}` calls.
+    Mistral(Arc<mistral::MistralEncoding>),
 }
 
 impl ModelEncoding {
@@ -63,6 +66,7 @@ impl ModelEncoding {
         match self {
             Self::Step5(encoding) => encoding.supports_thinking_off(),
             Self::Muse(_) => false,
+            Self::Mistral(encoding) => encoding.supports_thinking_off(),
             _ => true,
         }
     }
@@ -76,6 +80,7 @@ impl ModelEncoding {
             Self::Kimi(encoding) => encoding.eos_token_ids(),
             Self::Step5(encoding) => encoding.tokens().eos.clone(),
             Self::Muse(encoding) => encoding.tokens().eos.clone(),
+            Self::Mistral(encoding) => encoding.tokens().eos.clone(),
         }
     }
 
@@ -84,7 +89,7 @@ impl ModelEncoding {
             Self::DeepseekV4 | Self::DeepseekV41 => Some(DEEPSEEK_THINK_CLOSE_TOKEN_ID),
             Self::Glm(encoding) => Some(encoding.tokens().think_close),
             Self::Qwen(encoding) => Some(encoding.tokens().think_close),
-            Self::Kimi(_) => None,
+            Self::Kimi(_) | Self::Mistral(_) => None,
             Self::Step5(encoding) => Some(encoding.tokens().think_close),
             Self::Muse(_) => None,
         }
@@ -199,11 +204,12 @@ impl ModelProfile {
     /// Token ids that end generation for one request.
     fn stop_token_ids(&self, tools_declared: bool) -> Vec<u32> {
         match &self.encoding {
-            ModelEncoding::Glm(_) | ModelEncoding::Qwen(_) | ModelEncoding::Step5(_) => {
+            ModelEncoding::Glm(_) | ModelEncoding::Qwen(_) | ModelEncoding::Step5(_) | ModelEncoding::Mistral(_) => {
                 let mut ids = match &self.encoding {
                     ModelEncoding::Glm(encoding) => encoding.stop_token_ids(tools_declared),
                     ModelEncoding::Qwen(encoding) => encoding.stop_token_ids(tools_declared),
                     ModelEncoding::Step5(encoding) => encoding.stop_token_ids(tools_declared),
+                    ModelEncoding::Mistral(encoding) => encoding.stop_token_ids(tools_declared),
                     _ => unreachable!(),
                 };
                 ids.extend(&self.eos_token_ids);
@@ -235,7 +241,7 @@ mod admission;
 mod constraints;
 mod tools;
 pub mod chat;
-use chat::{deepseek, glm5, kimi, muse, qwen4, step5};
+use chat::{deepseek, glm5, kimi, muse, mistral, qwen4, step5};
 pub use constraints::NativeConstraint;
 mod images;
 pub mod media;
@@ -596,6 +602,7 @@ enum Templated {
     Kimi(Arc<kimi::KimiEncoding>),
     Step5(Arc<step5::Step5Encoding>),
     Muse(Arc<muse::MuseEncoding>),
+    Mistral(Arc<mistral::MistralEncoding>),
 }
 
 impl Templated {
@@ -615,6 +622,9 @@ impl Templated {
                 muse::prompt::template_effort(body)?;
                 Ok(glm5::GlmThinking { enabled: true, effort: None })
             }
+            // The template renders an effort, never thinking off; the model may still answer
+            // without a `[THINK]` block, so output starts as content.
+            Self::Mistral(_) => Ok(glm5::GlmThinking { enabled: true, effort: mistral::prompt::effort(body)? }),
         }
     }
 }
@@ -627,6 +637,7 @@ enum OutputProcessor {
     Kimi(glm5::GlmStreamProcessor<ChatGenerator, kimi::KimiOutputParser>),
     Step5(glm5::GlmStreamProcessor<ChatGenerator, step5::Step5OutputParser>),
     Muse(glm5::GlmStreamProcessor<ChatGenerator, muse::MuseOutputParser>),
+    Mistral(glm5::GlmStreamProcessor<ChatGenerator, mistral::MistralOutputParser>),
 }
 
 impl OutputProcessor {
@@ -638,6 +649,7 @@ impl OutputProcessor {
             Self::Kimi(processor) => Box::pin(processor.process(input)),
             Self::Step5(processor) => Box::pin(processor.process(input)),
             Self::Muse(processor) => Box::pin(processor.process(input)),
+            Self::Mistral(processor) => Box::pin(processor.process(input)),
         }
     }
 }
@@ -780,6 +792,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         ModelEncoding::Kimi(encoding) => Some(Templated::Kimi(encoding.clone())),
         ModelEncoding::Step5(encoding) => Some(Templated::Step5(encoding.clone())),
         ModelEncoding::Muse(encoding) => Some(Templated::Muse(encoding.clone())),
+        ModelEncoding::Mistral(encoding) => Some(Templated::Mistral(encoding.clone())),
         ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => None,
     };
     let assistance = match body.get("tool_decoding_assistance") {
@@ -891,20 +904,21 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         Some((Templated::Qwen(_), _, _)) | Some((Templated::Step5(_), _, _)) => tools::ToolSyntax::QwenXml,
         Some((Templated::Kimi(_), _, _)) => tools::ToolSyntax::KimiXtml,
         Some((Templated::Muse(_), _, _)) => tools::ToolSyntax::MuseAtem,
+        Some((Templated::Mistral(_), _, _)) => tools::ToolSyntax::MistralCalls,
         None => tools::ToolSyntax::Dsml,
     };
     let tool_constraints = tools::ToolConstraints::new(&converted.conversation.tools,
         converted.conversation.tool_choice, selection.required, parallel,
         assistance || response_format.as_ref().is_some_and(|v| v["type"] != "text"), syntax).map_err(Rejection::bad)?;
-    let constraint = if matches!(profile.encoding, ModelEncoding::Muse(_)) {
-        constraints::muse_response_constraint(response_format.clone(), tool_constraints.as_ref())
-            .map_err(Rejection::bad)?
-    } else { match profile.encoding.think_close_token_id() {
-        Some(token) => constraints::response_constraint(response_format.clone(), converted.conversation.thinking_mode,
+    let constraint = match (&profile.encoding, profile.encoding.think_close_token_id()) {
+        (ModelEncoding::Muse(_), _) => constraints::muse_response_constraint(response_format.clone(), tool_constraints.as_ref()),
+        (ModelEncoding::Mistral(encoding), _) => constraints::mistral_response_constraint(response_format.clone(),
+            tool_constraints.as_ref(), encoding.tokens().think),
+        (_, Some(token)) => constraints::response_constraint(response_format.clone(), converted.conversation.thinking_mode,
             tool_constraints.as_ref(), token),
-        None => constraints::kimi_response_constraint(response_format.clone(), converted.conversation.thinking_mode,
+        (_, None) => constraints::kimi_response_constraint(response_format.clone(), converted.conversation.thinking_mode,
             tool_constraints.as_ref()),
-    }.map_err(Rejection::bad)? };
+    }.map_err(Rejection::bad)?;
     let validator = tools::CompletionValidator::new(response_validator, tool_constraints);
     let tools_declared = !converted.conversation.tools.is_empty();
     let stop_token_ids = profile.stop_token_ids(tools_declared);
@@ -985,6 +999,17 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
                     .then(|| converted.conversation.tools.clone()),
                 stop_sequences: converted.parsing_options.stop_sequences.clone() });
             (prompt, Vec::new(), OutputProcessor::Muse(glm5::GlmStreamProcessor::new(generator, parser)))
+        Some((Templated::Mistral(encoding), raw, _thinking)) => {
+            let options = mistral::MistralPromptOptions {
+                tool_names: converted.conversation.tools.iter().map(|tool| tool.name.clone()).collect(),
+                response_format };
+            let prompt = if expanded_media_probe { String::new() } else {
+                encoding.render(&raw, &options).map_err(Rejection::bad)?
+            };
+            let parser = mistral::MistralOutputParser::new(mistral::MistralParserOptions {
+                tools: tools_declared.then(|| converted.conversation.tools.clone()),
+                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+            (prompt, Vec::new(), OutputProcessor::Mistral(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Qwen(encoding), raw, thinking)) => {
             let tool_choice = match (selection.name(), selection.required) {
@@ -1784,6 +1809,68 @@ mod tests {
         assert_eq!(job, Some(None), "plain auto tools stay unconstrained");
         let (job, status) = send(json!({"enable_thinking": false})).await;
         assert!(job.is_none() && status == Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn mistral_dispatch_renders_checkpoint_prompt_and_parses_reasoning_and_calls() {
+        for streaming in [false, true] {
+            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+            let worker = tokio::spawn(async move {
+                let job = rx.recv().await.unwrap();
+                assert!(job.prompt.starts_with("<s>[AVAILABLE_TOOLS]"), "{}", job.prompt);
+                assert!(job.prompt.ends_with("[MODEL_SETTINGS]{\"reasoning_effort\": \"medium\"}[/MODEL_SETTINGS][INST]Weather?[/INST]"));
+                assert!(job.stop_token_ids.contains(&2) && job.stop_token_ids.contains(&3));
+                assert!(!job.stop_token_ids.contains(&9) && !job.stop_token_ids.contains(&34));
+                for event in [
+                    InferenceChunk::Ready { system_fingerprint: None,
+                        prompt_usage: PromptUsage { prompt_tokens: 12, prompt_cache_hit_tokens: 0 } },
+                    InferenceChunk::Text { content: "[THINK]Plan[/THINK]".into(), content_tokens: 3 },
+                    InferenceChunk::Text { content: "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}".into(), content_tokens: 8 },
+                    InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop },
+                ] { job.events.send(Ok(event)).unwrap(); }
+            });
+            let profile = ModelProfile::new("ml4-test", ModelEncoding::Mistral(Arc::new(mistral::fixtures::encoding())));
+            assert_eq!(engine::system_placement(&profile), engine::SystemPlacement::Anywhere);
+            let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+            let body = json!({"model": "ml4-test", "messages": [{"role": "user", "content": "Weather?"}],
+                "reasoning_effort": "medium", "max_tokens": 64, "stream": streaming,
+                "tools": [{"type": "function", "function": {"name": "get_weather",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]});
+            let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+                .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+            if streaming {
+                let text = std::str::from_utf8(&bytes).unwrap();
+                assert!(text.contains("reasoning_content") && text.contains("get_weather") && text.contains("tool_calls"));
+            } else {
+                let result: Value = serde_json::from_slice(&bytes).unwrap();
+                let choice = &result["choices"][0];
+                assert_eq!(choice["message"]["reasoning_content"], "Plan");
+                assert_eq!(choice["finish_reason"], "tool_calls");
+                assert_eq!(choice["message"]["tool_calls"][0]["function"]["name"], "get_weather");
+                let arguments: Value = serde_json::from_str(choice["message"]["tool_calls"][0]["function"]["arguments"]
+                    .as_str().unwrap()).unwrap();
+                assert_eq!(arguments, json!({"city": "Paris"}));
+            }
+            worker.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mistral_rejects_thinking_off_before_admission() {
+        let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+        let profile = ModelProfile::new("ml4-test", ModelEncoding::Mistral(Arc::new(mistral::fixtures::encoding())));
+        let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+        let body = json!({"model": "ml4-test", "messages": [{"role": "user", "content": "Hi"}],
+            "thinking": {"type": "disabled"}, "max_tokens": 8});
+        let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

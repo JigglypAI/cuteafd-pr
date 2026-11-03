@@ -176,6 +176,7 @@ static REGISTRY: [&dyn Family; 12] = [
     &super::families::step5::STEP5,
     &super::families::kimi::KIMI_K3,
     &super::families::muse_spark::MUSE_SPARK,
+    &super::families::mistral_large4::MISTRAL_LARGE4,
     &super::families::dflash::DFLASH2,
     &super::families::dspark::DSPARK,
 ];

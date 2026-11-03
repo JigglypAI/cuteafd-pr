@@ -99,6 +99,28 @@ MUSE_SHAPES = (
     ("muse_post_expert_tp2", 2048, 8192, 2),
     ("muse_lm_head", 8192, 202112, 1),
 )
+
+# Mistral Large 4: MLA without q-LoRA (wq straight from the hidden state),
+# kv_a N576 padded to N640 on RoPE layers and native N512 on NoPE layers,
+# 64 heads x 128 (v 128), dense layer 0 (I 24576), one shared expert (I 6144).
+ML4_SHAPES = (
+    ("ml4_q", 6144, 8192, 1),
+    # Also the indexer's wq_b [4096, 6144] when the recipe moves it into the core.
+    ("ml4_q_tp2", 6144, 4096, 1),
+    ("ml4_kv_a_padded", 6144, 640, 1),
+    ("ml4_kv_a_nope", 6144, 512, 1),
+    ("ml4_o", 8192, 6144, 1),
+    ("ml4_o_tp2", 4096, 6144, 2),
+    ("ml4_dense_gate_up", 6144, 24576, 1),
+    ("ml4_dense_gate_up_tp2", 6144, 12288, 1),
+    ("ml4_dense_down", 24576, 6144, 1),
+    ("ml4_dense_down_tp2", 12288, 6144, 2),
+    ("ml4_shared_gate_up", 6144, 6144, 1),
+    ("ml4_shared_gate_up_tp2", 6144, 3072, 1),
+    ("ml4_shared_down", 6144, 6144, 1),
+    ("ml4_shared_down_tp2", 3072, 6144, 2),
+    ("ml4_lm_head", 6144, 204800, 1),
+)
 # Step-5 (head_dim 192, 64 Q / 4 KV heads): K6 target core with the current
 # two-GPU head split (q/k/v rows, o_proj columns) and whole FFNs and heads; its
 # three MTP stages are K4 throughout, each with its own vocabulary head. A fifth
@@ -123,8 +145,8 @@ STEP5_SHAPES = (
     ("step5_mtp_eh", 8192, 4096, 1, 4),
     ("step5_mtp_head", 4096, 128896, 1, 4),
 )
-FAMILY_SHAPES = {"kimik3": KIMI_SHAPES, "glm": GLM_SHAPES, "glmf": GLMF_SHAPES, "step5": STEP5_SHAPES, "muse": MUSE_SHAPES}
-F32_OUTPUTS = (163840, 154880, 128896, 202112)
+FAMILY_SHAPES = {"kimik3": KIMI_SHAPES, "glm": GLM_SHAPES, "glmf": GLMF_SHAPES, "step5": STEP5_SHAPES, "muse": MUSE_SHAPES, "ml4": ML4_SHAPES}
+F32_OUTPUTS = (163840, 154880, 128896, 202112, 204800)
 F32_GEOMETRIES = frozenset({(4096, 8192, 2), (2048, 8192, 2)})
 
 

@@ -130,6 +130,11 @@ foreach(mode full windows)
     POINTWISE_PROGRAMS vision_axial_rotary_d96_f32 vision_position_gather_h1536 ${muse_transformer_programs}
     POINTWISE_ARGS --group pointwise --head-dim 96 --hidden 1536 --learned-position --with-transformer)
 endforeach()
+# Pixtral retains its geometry-keyed exports; the shared owner manages their lifetime.
+cuteafd_vision_owner_entry(d128 HEAD_DIM 128 POINTWISE_GROUP pixtral
+  PROGRAMS vision_attention_d128_full ARGS --group attention --head-dim 128
+  POINTWISE_PROGRAMS vision_axial_rotary_d128_bf16 vision_rms_bf16_gamma_h2048
+  POINTWISE_ARGS --group pointwise --head-dim 128 --hidden 2048 --bf16-products --bf16-before-gamma)
 get_property(owner_outputs GLOBAL PROPERTY CUTEAFD_VISION_OWNER_OUTPUTS)
 list(APPEND CUTEAFD_VISION_ATTENTION_OUTPUTS ${owner_outputs})
 list(REMOVE_DUPLICATES CUTEAFD_VISION_ATTENTION_OUTPUTS)

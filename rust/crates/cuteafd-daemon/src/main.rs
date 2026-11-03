@@ -58,6 +58,8 @@ fn serve_media(command: &mut Commands) -> Option<ServeMedia<'_>> {
             vision: &mut args.vision, audio: Some(&mut args.audio) }),
         Commands::ServeQwen4(args) => Some(ServeMedia { snapshot: &args.engine.snapshot,
             vision: &mut args.vision, audio: None }),
+        Commands::ServeGlm(args) => Some(ServeMedia { snapshot: &args.engine.snapshot,
+            vision: &mut args.vision, audio: None }),
         Commands::ServeGlmf(args) => Some(ServeMedia { snapshot: &args.engine.snapshot,
             vision: &mut args.vision, audio: None }),
         _ => None,
