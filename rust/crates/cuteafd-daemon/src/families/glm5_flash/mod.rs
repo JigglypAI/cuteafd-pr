@@ -873,13 +873,12 @@ mod draft_cli_tests {
             let rows = experts.unwrap();
             assert!(rows > args.prefill_rows && rows <= args.expert_rows(), "{rows} rows at {sms} SMs");
         }
-        // One transport, with three independent return slots per Spark (4 ranks).
-        assert_eq!(wide_intake_bytes(&args, 4, 4096), 3 * 4 * 64 * 4096 * 2);
-        assert_eq!(wide_intake_bytes(&parse(&["--peers", "127.0.0.1:19441", "--prefill-rows", "64", "--decode-rows", "128", "--prefill-waves", "4"]),
-            4, 4096), 4 * 4 * 64 * 4096 * 2);
-        for flags in [&[][..], &["--decode-rows", "128"][..], &["--prefill-rows", "64"][..],
-            &["--prefill-rows", "128", "--decode-rows", "128"][..]] {
-            assert_eq!(wide_intake_bytes(&parse(flags), 4, 4096), 0, "{flags:?}");
+        // A whole reserve is one allocation per rank, even when a wider
+        // verify step leaves its physical backing in the same allocation quantum.
+        for waves in [3, 4] {
+            let bytes = cuteafd_loader::serving_capacity::prefill_return_bytes(waves, 64, 4, 4096);
+            assert_eq!(bytes, 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
+                waves * 64 * 4096 * 2).unwrap());
         }
     }
 
@@ -905,9 +904,15 @@ mod draft_cli_tests {
                     assert!(routes.iter().all(|route| route.row_index as usize == row));
                 }
             }
-            for ranks in [1, 4] {
-                let extra = 3 * ranks * (capacity - prefill) * cfg.hidden * 2;
-                assert_eq!(wide_intake_bytes(&args, ranks, cfg.hidden), extra as u64);
+            for ranks in [1u64, 4] {
+                use cuteafd_core::serving_capacity::spark_intake_allocation_bytes;
+                use cuteafd_loader::serving_capacity::prefill_return_bytes;
+                let waves = args.prefill_waves as u64;
+                let hidden = cfg.hidden as u64;
+                let charged = |rows| prefill_return_bytes(waves, rows, ranks, hidden);
+                let allocation = |rows| spark_intake_allocation_bytes(waves * rows * hidden * 2);
+                assert_eq!(charged(capacity as u64) - charged(prefill as u64),
+                    ranks * (allocation(capacity as u64)? - allocation(prefill as u64)?));
             }
         }
         Ok(())
@@ -1440,16 +1445,6 @@ impl EngineArgs {
     pub(crate) fn expert_rows(&self) -> usize {
         cuteafd_loader::serving_capacity::glmf_expert_rows(self.prefill_rows as u64, self.decode_rows as u64) as usize
     }
-}
-
-/// Device bytes of the Spark intake planes that experts sized for the decode rows hold beyond a
-/// narrower prefill lane's (none when a lane is at least as wide as a decode step): what a planned
-/// admission charges on the lead GPU, as it charges the wide selector, beyond the allowances it
-/// keeps for `--prefill-rows` rows. `ranks` Spark ranks, one transport per prefill lane.
-fn wide_intake_bytes(args: &EngineArgs, ranks: usize, hidden: usize) -> u64 {
-    use cuteafd_loader::serving_capacity::spark_intake_bytes;
-    let at = |rows: usize| spark_intake_bytes(args.prefill_waves as u64, ranks as u64, rows as u64, hidden as u64);
-    at(args.expert_rows()) - at(args.prefill_rows)
 }
 
 /// The step settings these arguments give the engine (its step plan's inputs besides layers and experts),
@@ -2539,7 +2534,7 @@ impl Opened {
             }
         }
         engine.bind_expert_homes(&placement, &spark_layers, args.skip_experts)?;
-        engine.drafter = self.load_drafter(args, stream, &engine.embedding, prepared_draft.take(), draft_read)?;
+        engine.drafter = self.load_drafter(args, &programs, stream, &engine.embedding, prepared_draft.take(), draft_read)?;
         engine.bind_draft_core_head()?;
         engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(dspark::Drafter::drafts))?;
         tracing::info!(plan_rows = engine.attention_plan.rows(), active_drafts = ?engine.attention_plan.active_drafts(),
@@ -2585,7 +2580,7 @@ impl Opened {
     }
 
     /// The drafter `--draft` names, on `stream` (it reads only the mask token's embedding row).
-    fn load_drafter<'s>(&'s self, args: &EngineArgs, stream: *mut std::ffi::c_void,
+    fn load_drafter<'s>(&'s self, args: &EngineArgs, programs: &'s cuteafd_ffi::programs::Programs<'s>, stream: *mut std::ffi::c_void,
         embedding: &crate::shared::token_io::TokenEmbedding<'_>, prepared: Option<crate::shared::draft::remote::Prepared<'s>>,
         read: Option<dspark::DraftRead>)
         -> Result<Option<dspark::Drafter<'s>>> {
@@ -2606,11 +2601,11 @@ impl Opened {
             let mask = embedding.host_rows(&[cfg.mask_token])?;
             let file = read.join_dflash()?;
             let device = prepared.stream.device;
-            let draft = device.own(|| DflashDrafter::load(&self.library, snapshot, file, prepared.stream.raw,
+            let draft = device.own(|| DflashDrafter::load(&self.library, programs, snapshot, file, prepared.stream.raw,
                 slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear, args.draft_kv_cache))?;
             dspark::Drafter::RemoteDflash(remote_dflash::RemoteDflash::new(draft, prepared)?)
         } else {
-            dspark::Drafter::load(&self.library, snapshot, stream, slots, batch,
+            dspark::Drafter::load(&self.library, programs, snapshot, stream, slots, batch,
                 embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales,
                 args.draft_linear, args.draft_kv_cache, read)?
         };
