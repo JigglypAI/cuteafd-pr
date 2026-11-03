@@ -52,7 +52,10 @@ def main():
     parser.add_argument("--shape", action="append", help="restrict to K,N; repeatable")
     parser.add_argument("--support-library", help="load native dependencies for isolated translation-unit iteration")
     parser.add_argument("--screen", action="store_true", help="compare fixed-Lt, padding and existing row-local TMA")
+    parser.add_argument("--skinny-screen", action="store_true",
+                        help="compare canonical TMA with row-retiled M16 tensor-core arms")
     args = parser.parse_args()
+    assert not (args.screen and args.skinny_screen), "select one screen"
     # Empty captures invalidate both the replay proof and event timings.
     warnings.filterwarnings("error", message="The CUDA Graph is empty.*")
     support = ct.CDLL(args.support_library, mode=ct.RTLD_GLOBAL) if args.support_library else None
@@ -102,7 +105,7 @@ def main():
                 assert status == 0, (k, n, status)
 
             arms = {"default": default, "candidate": run}
-            if args.screen:
+            if args.screen or args.skinny_screen:
                 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "third_party/sparkinfer"))
                 from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection
                 from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
@@ -117,8 +120,25 @@ def main():
                     program.launch(input_, w, output, scalars=(input_.shape[0],))
 
                 arms["tma"] = tma
+                if args.skinny_screen:
+                    arms.pop("candidate")
+                    # Retile M/N only: K64 stages and ordered K16 MMA stay canonical.
+                    for tile_n, stages in ((32, 8), (64, 6)):
+                        skinny = TmaBf16Projection(n, k,
+                            tiles_by_rows=((16, 1, 4, 16, tile_n, stages),))
+                        skinny_program = compile_program(skinny,
+                            name=f"draft_bf16_skinny_n{tile_n}_screen", operands=(
+                                Operand("x", torch.bfloat16, f"[rows,{k}]"),
+                                Operand("w", torch.bfloat16, f"[{n},{k}]"),
+                                Operand("out", torch.bfloat16, f"[rows,{n}]", "out")),
+                            scalars=(Scalar("rows"),), key=skinny.key())
+
+                        def skinny_tma(input_, output, compiled=skinny_program):
+                            compiled.launch(input_, w, output, scalars=(input_.shape[0],))
+
+                        arms[f"tma_m16_n{tile_n}"] = skinny_tma
                 # Include staging copies in padding costs, not just the larger GEMM.
-                for name, multiple in (("pad64", 64), ("pad2048", 2048)):
+                for name, multiple in ((("pad64", 64), ("pad2048", 2048)) if args.screen else ()):
                     padded_x = torch.zeros_like(x)
                     padded_out = torch.empty((2048, n), dtype=torch.bfloat16, device="cuda")
 
@@ -132,10 +152,12 @@ def main():
                     arms[name] = padded
 
             results = {}
+            canonical_outputs = {}
+            row_counts = (1, 8, 16, 140, 2048) if args.skinny_screen else (1, 16, 140, 2048)
             for arm, operation in arms.items():
                 outputs, timing = {}, {}
                 graph_exact = True
-                for rows in (1, 16, 140, 2048):
+                for rows in row_counts:
                     out = torch.empty((rows, n), dtype=torch.bfloat16, device="cuda")
                     operation(x[:rows], out)
                     torch.cuda.synchronize()
@@ -167,12 +189,23 @@ def main():
                     for offset in offsets:
                         if offset < rows and not torch.equal(outputs[1][0].view(torch.int16), out[offset].view(torch.int16)):
                             mismatches.append(f"n{rows}/offset{offset}")
+                canonical_exact = None
+                if arm == "tma":
+                    canonical_outputs = outputs
+                elif arm.startswith("tma_m16_"):
+                    canonical_exact = all(torch.equal(out.view(torch.int16),
+                        canonical_outputs[rows].view(torch.int16)) for rows, out in outputs.items())
+                    assert canonical_exact, (k, n, arm, "retile changed canonical TMA bytes")
                 results[arm] = dict(row_invariant=not mismatches, mismatches=mismatches,
-                                    graph_exact=graph_exact, timing=timing)
-            qualified.append(results["tma" if args.screen else "candidate"]["row_invariant"])
+                                    graph_exact=graph_exact, canonical_exact=canonical_exact, timing=timing)
+            if args.skinny_screen:
+                qualified.append(all(result["row_invariant"] for arm, result in results.items()
+                                     if arm.startswith("tma")))
+            else:
+                qualified.append(results["tma" if args.screen else "candidate"]["row_invariant"])
             print(json.dumps(dict(k=k, n=n, families=families, offsets=offsets, arms=results)), flush=True)
         assert all(qualified), "selected row-local/candidate arm failed row invariance"
-        print(f"PASS: {len(inventory)} projection shapes, n1/n16/n140/n2048, offsets and nonempty graphs", flush=True)
+        print(f"PASS: {len(inventory)} projection shapes, rows={row_counts}, offsets and nonempty graphs", flush=True)
     finally:
         assert blas.cublasDestroy_v2(handle) == 0
 
