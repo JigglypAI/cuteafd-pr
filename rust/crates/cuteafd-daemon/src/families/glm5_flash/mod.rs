@@ -2064,37 +2064,87 @@ impl Opened {
                 terminal: if peer_stream.is_some() { cuteafd_loader::placement::TerminalHome::Replicated }
                     else { cuteafd_loader::placement::TerminalHome::AttentionOwner },
             })?;
-        // Each coordinator GPU is one push rank: its dense operands (class 2
-        // landing, class 3 staged and transformed on the GPU) and, with TP2
-        // layers, its EXL3 expert halves. Records are planned from headers
-        // before membership: a planning error offers no coordinator ranks
-        // (the coordinator loads by mount; Sparks still push). Without Spark
-        // peers the coordinator GPUs form the push group alone.
+        use crate::shared::experts::rtx::push::{CoordinatorExperts, CoordinatorPush, PushedExperts, PushPolicy, WholeOwner};
+        let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;
+        let embed = self.embed_source()?;
+        let embedding_rank = cuteafd_loader::placement::families::glm5_flash::embedding_home(&placement) as usize;
+        let embedding_device = crate::shared::memory::device::Device { library: &self.library,
+            id: if embedding_rank == 0 { args.device } else { split_device.context("embedding peer GPU")? } };
+        // Every dense rank participates, including ranks without routed experts.
+        // Namespace identity alone selects push; planning cannot change that route.
         let gpus = 1 + usize::from(peer_stream.is_some());
         let devices: Vec<_> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d))
             .map(|id| crate::shared::memory::device::Device { library: &self.library, id }).collect();
         let plan_dense = |sparks: usize| -> Result<_> {
+            ensure!(dense_pushable(args), "GLM Flash NVFP4 measurement mode cannot record required push operands");
             let load = std::rc::Rc::new(weights::DenseLoad::push(&self.library));
             let planning = weights::GlmfLoader { dense: load.clone(), ..loader.clone() };
-            let model = {
-                let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                planning.model(&self.cfg, &execution)?
-            };
-            let records = load.sink.as_ref().context("push sink")?.take_all();
-            let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records.clone(), &devices, sparks)?;
-            Ok((model, records, dense))
+            let ((embedding, model), mut records) = crate::shared::experts::rtx::dense::recording(|| {
+                embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(
+                    &self.library, embed.clone(), args.token_io.embed_placement, || {
+                        devices[0].run(|| {
+                            let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                            planning.model(&self.cfg, &execution)
+                        })
+                    }))
+            })?;
+            records.extend(load.sink.as_ref().context("push sink")?.take_all());
+            let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records, &devices, sparks)?;
+            Ok((embedding, model, dense))
         };
-        // Each GPU's TP2 halves' resident budget (admitted minus workspace), when any.
-        let tp2_budget_plan = || -> Result<Option<Vec<usize>>> {
-            Ok(match self.experts.as_ref().and_then(|c| c.exl3()) {
-                Some(manifest) if !tp2_layers.is_empty() => {
-                    let workspace = crate::shared::experts::rtx::exl3::Exl3Tp2::workspace_bytes_for(
-                        &tp2_package(manifest), self.cfg.hidden, args.expert_rows())?;
-                    Some(tp2_budgets()?.map(|b| b.saturating_sub(workspace)).to_vec())
-                }
-                None if !tp2_layers.is_empty() => anyhow::bail!("coordinator TP2 push needs EXL3 experts"),
-                _ => None,
-            })
+        let expert_plan = || -> Result<Option<CoordinatorExperts>> {
+            let catalog = self.experts.as_ref();
+            if !tp2_layers.is_empty() {
+                ensure!(placement.layers.iter().enumerate().all(|(layer, assigned)| self.cfg.dense[layer]
+                    || !matches!(assigned.experts, cuteafd_loader::placement::ExpertHome::RtxWhole { .. })),
+                    "GLM Flash combined whole and TP2 expert push requires a mixed coordinator plan");
+                let catalog = catalog.context("TP2 expert catalog")?;
+                let budgets = tp2_budgets()?;
+                let budgets = (0..2).map(|rank| {
+                    let workspace = if let Some(manifest) = catalog.exl3() {
+                        crate::shared::experts::rtx::exl3::Exl3Tp2::workspace_bytes_for(
+                            &tp2_package(manifest), self.cfg.hidden, args.expert_rows())?
+                    } else {
+                        let tensors = catalog.fp8().context("FP8 TP2 tensors")?;
+                        let package = args.fp8_package.clone().unwrap_or_else(||
+                            crate::shared::experts::fp8::package_directory(&args.native_lib, 2, tensors.format()));
+                        crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::plan(tensors, &package, rank,
+                            args.expert_rows())?.workspace_bytes
+                    };
+                    budgets[rank].checked_sub(workspace).context("GLM Flash TP2 workspace exceeds admitted peak")
+                }).collect::<Result<Vec<_>>>()?;
+                return Ok(Some(CoordinatorExperts::Tp2 { layers: tp2_layers.clone(), budgets }));
+            }
+            let mut owners = Vec::new();
+            for rank in 0..gpus {
+                let selected = admitted_expert_layers(&self.cfg, &placement.layers,
+                    cuteafd_loader::placement::ExpertHome::RtxWhole { gpu: u8::try_from(rank)? }, args.skip_experts)?;
+                if selected.is_empty() { continue; }
+                let catalog = catalog.context("whole expert catalog")?;
+                let peak = usize::try_from(placement.expert_ranges.get(rank).context("whole expert arena")?.peak_bytes)?;
+                let selections = if catalog.exl3().is_some() {
+                    let (selections, _) = crate::families::deepseek_v4::local::LocalExperts::exl3_selections(
+                        &args.native_lib, catalog, 0, &selected, args.expert_rows(), peak)?
+                        .context("GLM Flash whole EXL3 package")?;
+                    ensure!(selections.len() == selected.len(), "GLM Flash admitted whole EXL3 inventory does not fit");
+                    selections
+                } else {
+                    selected.iter().map(|&layer| crate::shared::experts::layer::ExpertLayer::BackboneFull { layer }).collect()
+                };
+                let resident = if let Some(tensors) = catalog.fp8() {
+                    let tensors = tensors.for_coordinator();
+                    crate::shared::experts::fp8::Fp8Layer::bytes_for(&tensors, 1, 0, tensors.exact_slicing(1))?
+                        .checked_mul(selected.len()).context("GLM Flash whole resident size overflow")?
+                } else {
+                    selections.iter().try_fold(0usize, |total, &selection| {
+                        total.checked_add(crate::shared::experts::exl3::Exl3Weights::plan(catalog, selection)?.resident_bytes)
+                            .context("GLM Flash whole resident size overflow")
+                    })?
+                };
+                ensure!(resident <= peak, "GLM Flash whole expert residency exceeds admission");
+                owners.push(WholeOwner { rank, selections, budget: resident });
+            }
+            Ok((!owners.is_empty()).then_some(CoordinatorExperts::Whole { owners }))
         };
         let local_layers = admitted_expert_layers(&self.cfg, &placement.layers,
             cuteafd_loader::placement::ExpertHome::RtxWhole { gpu: 0 }, args.skip_experts)?;
@@ -2147,15 +2197,14 @@ impl Opened {
                 native_push = Some((push, peers.len()));
                 Some((streams, ranks))
             } else { None };
-            let ranks = if native_admission.is_none() && admission.coordinator_pushes() && dense_pushable(&args) {
-                (|| -> Result<_> {
-                    let tp2 = tp2_budget_plan()?;
+            let ranks = if native_admission.is_none() {
+                push_policy.plan(|| {
+                    ensure!(admission.coordinator_pushes(), "GLM Flash Spark admission did not select required push");
+                    let experts = expert_plan()?;
                     let planned = plan_dense(peers.len())?;
-                    let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare(&args.snapshot,
-                        self.experts.as_ref().filter(|_| tp2.is_some()), gpus,
-                        tp2.map(|budgets| crate::shared::experts::rtx::push::CoordinatorExperts::Tp2 { layers: tp2_layers.clone(), budgets }))?;
+                    let prepared = CoordinatorPush::prepare(&args.snapshot, self.experts.as_ref(), gpus, experts)?;
                     Ok((prepared, planned))
-                })().map_err(|error| tracing::warn!(%error, "coordinator push unavailable; mount")).ok()
+                })?
             } else { None };
             let ranks = ranks.map(|((push, streams, ranks), planned)| {
                 coordinator_push = Some((push, peers.len(), devices.clone(), planned));
@@ -2163,28 +2212,25 @@ impl Opened {
             });
             Some(admission.start_with(&peers, native_ranks.or(ranks))?)
         } else {
-            // No Spark peers: the coordinator GPUs push alone (dense operands and
-            // their TP2 expert halves).
+            // Native startup keeps its admitted expert-only group until its dense-push port.
             if native_admission.is_some() && !local_layers.is_empty() {
                 let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(
                     &args.snapshot, self.experts.as_ref(), 1, native_push_experts()?)?;
                 native_push = Some((push, 0));
             }
-            if native_admission.is_none() && dense_pushable(&args) {
-                coordinator_push = (|| -> Result<_> {
-                    let tp2 = tp2_budget_plan()?;
+            if native_admission.is_none() {
+                coordinator_push = push_policy.plan(|| {
+                    let experts = expert_plan()?;
                     let planned = plan_dense(0)?;
-                    let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(&args.snapshot,
-                        self.experts.as_ref().filter(|_| tp2.is_some()), gpus,
-                        tp2.map(|budgets| crate::shared::experts::rtx::push::CoordinatorExperts::Tp2 { layers: tp2_layers.clone(), budgets }))?;
+                    let push = CoordinatorPush::prepare_alone(&args.snapshot, self.experts.as_ref(), gpus, experts)?;
                     Ok((push, 0, devices.clone(), planned))
-                })().map_err(|error| tracing::warn!(%error, "coordinator push unavailable; mount")).ok();
+                })?;
             }
             None
         };
         // The admitted TP2 expert halves land inside the Spark admission window;
         // execution (modules, workspaces, routes) binds once the engine exists.
-        let tp2_weights = |pushed| -> Result<crate::shared::experts::rtx::Tp2Weights<'_>> {
+        let tp2_weights = |pushed: Option<Vec<PushedExperts<'_>>>| -> Result<crate::shared::experts::rtx::Tp2Weights<'_>> {
             let catalog = self.experts.as_ref().context("TP2 expert catalog")?;
             let (devices, budgets) = (tp2_devices()?, tp2_budgets()?);
             use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2, RtxSelectionPolicy, Tp2Weights};
@@ -2193,7 +2239,9 @@ impl Opened {
                 let geometry = cuteafd_core::expert_geometry();
                 Tp2Weights::Exl3(match pushed {
                     Some(pushed) => Exl3Tp2::pushed_pair_weights(devices, catalog, geometry, [&package; 2],
-                        tp2_layers.clone(), args.expert_rows(), budgets, RtxSelectionPolicy::CanonicalDecode, pushed)?,
+                        tp2_layers.clone(), args.expert_rows(), budgets, RtxSelectionPolicy::CanonicalDecode,
+                        pushed.into_iter().map(PushedExperts::exl3).collect::<Result<Vec<_>>>()?.try_into()
+                            .map_err(|_| anyhow::anyhow!("two committed EXL3 coordinator ranks required"))?)?,
                     None => Exl3Tp2::load_pair_weights(devices, catalog, geometry, [&package; 2],
                         tp2_layers.clone(), args.expert_rows(), budgets, RtxSelectionPolicy::CanonicalDecode)?,
                 })
@@ -2201,18 +2249,21 @@ impl Opened {
                 let tensors = catalog.fp8().context("FP8 TP2 tensors")?;
                 let package = args.fp8_package.clone().unwrap_or_else(||
                     crate::shared::experts::fp8::package_directory(&args.native_lib, 2, tensors.format()));
-                Tp2Weights::Fp8(Fp8MoeTp2::load_pair(devices, tensors, &package, tp2_layers.clone(),
-                    args.expert_rows(), budgets)?)
+                Tp2Weights::Fp8(match pushed {
+                    Some(pushed) => Fp8MoeTp2::pushed_pair(devices, tensors, &package, tp2_layers.clone(),
+                        args.expert_rows(), budgets, pushed.into_iter().map(PushedExperts::fp8)
+                            .collect::<Result<Vec<_>>>()?.try_into()
+                            .map_err(|_| anyhow::anyhow!("two committed FP8 coordinator ranks required"))?)?,
+                    None => Fp8MoeTp2::load_pair(devices, tensors, &package, tp2_layers.clone(),
+                        args.expert_rows(), budgets)?,
+                })
             })
         };
-        let embedding_rank = cuteafd_loader::placement::families::glm5_flash::embedding_home(&placement) as usize;
-        let embedding_device = crate::shared::memory::device::Device { library: &self.library,
-            id: if embedding_rank == 0 { args.device } else { split_device.context("embedding peer GPU")? } };
-        // Gather still runs on the entry GPU: peer access reads only the selected
-        // token rows, not a second resident table. The drafter borrows it too.
-        // Admission is complete; overlap the drafter read with pushed expert/dense operands.
+        // Gather reads the single admitted table over peer access when necessary.
+        // The drafter read overlaps the committed target group.
         let draft_read = args.draft.as_deref().map(dspark::DraftRead::start).transpose()?;
         let mut native_local = None;
+        let mut pushed_whole = None;
         let (embedding, ((model, mut shares), tp2)) = if let Some(native) = &native_admission {
             crate::shared::placement::load_while_admitting(admission, || {
                 let (pushed, loaded) = match native_push.take() {
@@ -2235,34 +2286,14 @@ impl Opened {
                 Ok((loaded.0, (loaded.1, None)))
             })?
         } else {
-            let embed = self.embed_source()?;
             crate::shared::placement::load_while_admitting(admission, || {
-            let load_embedding = || embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(
-                &self.library, embed.clone(), args.token_io.embed_placement, || Ok(())));
             let (pushed, loaded) = match coordinator_push.take() {
-                Some((push, sparks, devices, (model, records, dense))) => {
-                    // The planned dense operands (and the TP2 halves) arrive in one
-                    // group while the embedding loads beside.
-                    let catalog = self.experts.as_ref().filter(|_| !tp2_layers.is_empty());
-                    // Receive (or fallback fill) through landing: the dense load's wall time.
+                Some((push, sparks, devices, (embedding, model, dense))) => {
                     let split = crate::shared::memory::load_timing::Split::start();
-                    let (pushed, embedding) = push.receive_with(devices, catalog, sparks, Some(Ok(dense)), load_embedding);
-                    let pushed = pushed?;
-                    let (embedding, ()) = embedding?;
-                    if pushed.is_none() {
-                        let rank_stream = |device: i32| if device == args.device { stream }
-                            else { peer_stream.map_or(stream, |(_, s)| s) };
-                        crate::shared::experts::rtx::dense::fill_records_by_mount(&self.library, &records, rank_stream)?;
-                    }
-                    split.log(if pushed.is_some() { "glm5_flash dense push" } else { "glm5_flash dense mount fill" });
-                    tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(), steps = records.steps.len(),
-                        "GLM Flash coordinator dense operands landed");
-                    let pushed = match pushed {
-                        Some(ranks) if !tp2_layers.is_empty() => Some(<[_; 2]>::try_from(
-                            ranks.into_iter().map(|r| r.exl3()).collect::<Result<Vec<_>>>()?)
-                            .map_err(|_| anyhow::anyhow!("two coordinator GPUs"))?),
-                        _ => None,
-                    };
+                    let (pushed, beside) = push.receive_with(devices, self.experts.as_ref(), sparks, Some(Ok(dense)), || Ok(()));
+                    let pushed = push_policy.committed(pushed)?;
+                    beside?;
+                    split.log("glm5_flash dense push");
                     (pushed, (embedding, model))
                 }
                 None => (None, embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(&self.library, embed.clone(),
@@ -2273,7 +2304,8 @@ impl Opened {
                         })
                     }))?),
             };
-            let tp2 = if tp2_layers.is_empty() { None } else { Some(tp2_weights(pushed)?) };
+            let tp2 = if tp2_layers.is_empty() { pushed_whole = pushed; None }
+                else { Some(tp2_weights(pushed)?) };
             Ok((loaded.0, (loaded.1, tp2)))
             })?
         };
@@ -2402,7 +2434,14 @@ impl Opened {
                     engine::Experts::LocalNative(std::cell::RefCell::new(Box::new(native.execution()?)))
                 } else {
                     ensure!(native_admission.is_none(), "native whole expert owner missing");
-                    self.experts_for_layers(&expert_args, &local_layers, Some(budget))?
+                    let pushed = pushed_whole.take().map(|ranks| {
+                        ensure!(ranks.len() == gpus, "GLM Flash committed whole rank count differs from admission");
+                        let mut ranks = ranks.into_iter();
+                        let owner = ranks.next().context("GLM Flash whole owner rank")?;
+                        ensure!(ranks.all(|rank| rank.len() == 0), "GLM Flash dense-only ranks received unbound experts");
+                        Ok(owner)
+                    }).transpose()?;
+                    self.experts_for_layers(&expert_args, &local_layers, Some(budget), pushed)?
                         .context("admitted local expert backend is missing")?
                 };
                 if let engine::Experts::LocalExl3(local) = &experts { local.ensure(local_layers[0], stream)?; }
@@ -2411,7 +2450,7 @@ impl Opened {
             if spark || args.skip_experts {
                 let mut expert_args = args.clone();
                 expert_args.local_experts = false;
-                if let Some(experts) = self.experts_for_layers(&expert_args, &spark_layers, None)? {
+                if let Some(experts) = self.experts_for_layers(&expert_args, &spark_layers, None, None)? {
                     engine.set_experts(experts)?;
                 }
             }
@@ -2510,7 +2549,8 @@ impl Opened {
         Ok(Some(dense))
     }
 
-    fn experts_for_layers<'s>(&'s self, args: &EngineArgs, selected: &[usize], budget: Option<usize>) -> Result<Option<engine::Experts<'s>>> {
+    fn experts_for_layers<'s>(&'s self, args: &EngineArgs, selected: &[usize], budget: Option<usize>,
+        pushed: Option<crate::shared::experts::rtx::push::PushedExperts<'s>>) -> Result<Option<engine::Experts<'s>>> {
         if args.skip_experts {
             return Ok(Some(engine::Experts::Skip));
         }
@@ -2524,10 +2564,13 @@ impl Opened {
                 .saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30)) };
             ensure!(args.expert_window != Some(0), "--expert-window must be at least 1");
             let started = Instant::now();
-            let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, selected, 1, 0,
-                args.expert_rows(), budget)
-                .context("local routed experts must fit with step and prefix-cache reservations; use --peers for Sparks, \
-                    or --expert-window N for diagnostic paging")?;
+            let experts = match pushed {
+                Some(pushed) => crate::shared::experts::fp8::Fp8Experts::from_pushed(&self.library, tensors,
+                    &directory, selected, 1, 0, args.expert_rows(), budget, pushed.fp8()?),
+                None => crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory,
+                    selected, 1, 0, args.expert_rows(), budget),
+            }.context("local routed experts must fit with step and prefix-cache reservations; use --peers for Sparks, \
+                or --expert-window N for diagnostic paging")?;
             let loads = experts.layers.len();
             tracing::info!(layers = loads, window = ?args.expert_window, elapsed_ms = started.elapsed().as_millis() as u64,
                 "GLM 5.3 Flash routed experts resident on this GPU");
@@ -2539,12 +2582,25 @@ impl Opened {
         if let Some(catalog) = self.experts.as_ref().filter(|c| args.local_experts && c.exl3().is_some()) {
             let budget = match budget { Some(bytes) => bytes,
                 None => self.library.cuda_memory_info()?.0.saturating_sub(12 << 30) };
+            let resident = match pushed {
+                Some(pushed) => {
+                    let (selections, _) = crate::families::deepseek_v4::local::LocalExperts::exl3_selections(
+                        &args.native_lib, catalog, 0, selected, args.expert_rows(), budget)?
+                        .context("GLM Flash whole EXL3 package")?;
+                    ensure!(selections.len() == selected.len(), "committed EXL3 inventory exceeds admission");
+                    let local = crate::families::deepseek_v4::local::LocalExperts::from_exl3_weights(
+                        &self.library, &args.native_lib, catalog, &selections, pushed.exl3()?, args.expert_rows())?
+                        .context("committed GLM Flash EXL3 backend is empty")?;
+                    Some((selected.to_vec(), local))
+                }
+                None => None,
+            };
+            let loads = resident.as_ref().map_or(0, |(layers, _)| layers.len());
             return Ok(Some(engine::Experts::LocalExl3(engine::LocalExl3 {
                 library: &self.library, native_lib: args.native_lib.clone(), catalog,
-                resident: std::cell::RefCell::new(None), window: selected.len(),
+                resident: std::cell::RefCell::new(resident), window: selected.len(),
                 layers: selected.to_vec(), max_rows: args.expert_rows(),
-                // Room for the step workspace (logits alone are 2.4 GiB at 4096 rows).
-                budget, loads: std::cell::RefCell::new(0),
+                budget, loads: std::cell::RefCell::new(loads),
             })));
         }
         let Some(peers) = args.peers.as_deref() else { return Ok(None) };
