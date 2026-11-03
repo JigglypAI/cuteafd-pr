@@ -274,6 +274,13 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                 Commands::ServeGlmf(a) => (a.engine.peers.as_deref().unwrap().split(',').count(), None, None),
                 Commands::ServeMimo(a) => (a.engine.peers.as_deref().unwrap().split(',').count(), None, None),
                 Commands::ServeKimi(a) => (a.peers.len(), None, None),
+                Commands::ServeMuse(a) => {
+                    assert_eq!(family, "muse", "{key}: wrong Muse dispatch");
+                    assert_eq!(a.prefill_waves, Some(deployment.prefill_waves as _),
+                        "{key}: launch must preserve the admitted prefill wave count");
+                    assert_eq!(a.prefill_waves, Some(1), "{key}: fixture requests one prefill lane");
+                    (a.peers.len(), None, None)
+                }
                 other => anyhow::bail!("{key}: wrong dispatch {other:?}"),
             };
             assert_eq!(peers, 8, "{key}: lost peers in launch/parse");
@@ -300,6 +307,20 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                 let host = report.host_ledger.as_ref().expect("full host intake ledger");
                 let (group, expected) = if matches!(family, "mimo" | "mimof" | "mimop") {
                     ("mimo/spark-intake-upper-bound", (rows * waves + 64) * hidden * 2 * 8)
+                } else if family == "muse" {
+                    use cuteafd_loader::families::muse_spark::{MuseSparkConfig, replies::Cutoff};
+                    let checkpoint = cuteafd_loader::plan::Checkpoint::open(&snapshot)?;
+                    let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
+                    let layout = options.layout.as_ref().unwrap();
+                    let prefill = cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan {
+                        unit_rows: rows, waves, span_rows: rows * waves,
+                    };
+                    let cutoff = Cutoff::with_wide(layout.muse_partial_bf16_max_rows,
+                        cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
+                        layout.muse_partial_wide_format)?;
+                    let transport = cuteafd_loader::placement::families::muse_spark::host_transport(
+                        &cfg, prefill, cutoff, layout.resolved_state_slots("muse_spark") as usize, peers)?;
+                    ("spark-intake", transport.intake)
                 } else {
                     let endpoints = cuteafd_loader::plan::layout::spark_endpoints(
                         report.family.as_deref().unwrap(), report.prefill_transports.unwrap()) as u64;
