@@ -521,3 +521,17 @@ fn installed_checkpoint_runners_fail_on_missing_hf_home_checkpoints_or_programs(
     assert!(std::panic::catch_unwind(|| assert_programs_input_present(
         "min", None, &absent_programs, &missing_err)).is_err());
 }
+
+#[test]
+fn bench_panels_json_cli_matches_fixture_and_selectable_panel_ids() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
+        .args(["bench", "panels", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let actual: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+    let fixture: Vec<String> = serde_json::from_str(
+        include_str!("../../../../scripts/bench/fixtures/bench-panels-v1.json")).unwrap();
+    assert_eq!(actual, fixture);
+    assert!(actual.iter().any(|id| id == "shared_prefix"));
+}

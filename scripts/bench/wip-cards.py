@@ -26,6 +26,7 @@ import argparse
 import base64
 import concurrent.futures
 import contextlib
+import functools
 import itertools
 import hashlib
 import importlib.util
@@ -83,26 +84,25 @@ SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 
 FIDELITY_PANELS = {'fidelity', 'fidelity_full'}
 LOWER_IS_BETTER = {'kl', 'readiness_s'}  # also every 'prefill N TTFT s'
 FAILURE = re.compile(r'(?i)(\berror\b|\bpanicked\b|\bfatal\b|\bfailed\b|undefined symbol|no such file|refus|exited:|timed out|out of memory|traceback)')
-def bench_panels(repo=REPO, binary=None):
-    """Derive selectable panel ids from cuteafd bench (CLI or panel definitions)."""
-    if binary is not None:
-        return set(json.loads(run([str(binary), 'bench', 'panels', '--json']).stdout))
-    panels_dir = Path(repo) / 'rust/crates/cuteafd-bench/src/panels'
-    ids = {'baseline'}
-    for path in sorted(panels_dir.glob('*.rs')):
-        text = path.read_text()
-        for match in re.finditer(r"fn\s+id\(&self\)\s*->\s*&'static\s+str\s*\{", text):
-            depth, i = 1, match.end()
-            while i < len(text) and depth > 0:
-                depth += (text[i] == '{') - (text[i] == '}')
-                i += 1
-            ids.update(re.findall(r'"([a-z0-9_]+)"', text[match.end():i - 1]))
-    if len(ids) < 2:
-        raise ValueError(f'failed to parse panel ids from {panels_dir}')
-    return ids
-
-
-PANELS = bench_panels()
+@functools.lru_cache(maxsize=None)
+def bench_panels(binary='cuteafd'):
+    """Ask the host cuteafd binary (`cuteafd bench panels --json`) for the selectable panel ids."""
+    cmd = str(binary or shutil.which('cuteafd') or 'cuteafd')
+    try:
+        result = subprocess.run([cmd, 'bench', 'panels', '--json'],
+                                capture_output=True, text=True, timeout=30)
+    except OSError as error:
+        raise ValueError(f'{cmd} bench panels --json failed: {error}') from error
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip().splitlines()[-1:]
+        raise ValueError(f'{cmd} bench panels --json failed: {detail}')
+    try:
+        panels = json.loads(result.stdout)
+    except ValueError as error:
+        raise ValueError(f'{cmd} bench panels --json returned invalid JSON: {error}') from error
+    if not isinstance(panels, list) or not panels or not all(isinstance(p, str) and p for p in panels):
+        raise ValueError(f'{cmd} bench panels --json returned invalid panel list')
+    return frozenset(panels)
 
 
 def short_instance(value):
@@ -183,11 +183,14 @@ def parse_lossless_dump(text, set_path=None):
     return dict(cases=cases, start=start, end=end)
 
 
-def requested_panels(profile):
+def requested_panels(profile, binary=None):
     if not profile.startswith('panels:'):
         return []
     panels = [p.strip() for p in profile[7:].split(',') if p.strip()]
-    bad = set(panels) - PANELS - {'baseline'}
+    if not panels:
+        return []
+    allowed = bench_panels(binary or shutil.which('cuteafd') or 'cuteafd')
+    bad = set(panels) - allowed - {'baseline'}
     if bad:
         raise ValueError('unknown requested panel: ' + ', '.join(sorted(bad)))
     return panels
@@ -333,9 +336,9 @@ def probe_selection(items, cards, arms):
 
 
 def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_pool, repeat, trace=False, exact_state=None,
-             cold_hosts=None):
+             cold_hosts=None, binary=None):
     entry = json.loads(json.dumps(entry))
-    requested_panels(entry.get('profile', 'smoke'))
+    requested_panels(entry.get('profile', 'smoke'), binary=binary)
     entry['fabric'] = 'fabric' in probes
     values = config(entry['config'])
     values.update(entry.pop('set', {}))
@@ -617,6 +620,20 @@ def resolve_binary(binary, arm, dry=False):
         raise ValueError(f'--binary: cuteafd is not on PATH and this arm\'s sealed slot has no binary at {path}; '
                          'build the arm (--build) or pass --binary')
     return str(path)
+
+
+def panel_binary(binary, arms):
+    """The host cuteafd binary for panel queries: --binary, else cuteafd on PATH,
+    else the first arm's sealed slot binary."""
+    if binary:
+        return binary
+    found = shutil.which('cuteafd')
+    if found:
+        return found
+    for arm in (arms or {}).values():
+        if 'release' not in arm and slot_binary(arm).is_file():
+            return str(slot_binary(arm))
+    return 'cuteafd'
 
 
 def binary_supports(binary, repo, job, needs):
@@ -1424,7 +1441,7 @@ def summarize_job(job, exit_code):
         if not row['fabric']:
             row['fabric'].extend(report.get('fabric') or [])
         present = {p['id'] for p in report.get('panels', [])} | ({'baseline'} if report.get('baseline') else set())
-        missing = set(requested_panels(job['entry'].get('profile', 'smoke'))) - present
+        missing = set(requested_panels(job['entry'].get('profile', 'smoke'), binary=job.get('binary'))) - present
         if missing:
             fail(row, 'requested panels absent from report: ' + ', '.join(sorted(missing)))
         baseline = report.get('baseline') or {}
@@ -2546,7 +2563,7 @@ def main():
         if not selection and not (levels or prefill_lengths or args.probe):
             parser.error('--panels none runs nothing without --levels, --prefill-lengths or --probe')
         profile = 'panels:' + selection
-        listed = requested_panels(profile)
+        listed = requested_panels(profile, binary=panel_binary(args.binary, arms))
         for card in cards:
             card['profile'] = profile
             if (listed or not (levels or prefill_lengths)) and 'baseline' not in listed:
@@ -2554,7 +2571,7 @@ def main():
     lossless_set = None
     if args.lossless_set is not None:
         lossless_set = load_lossless_set(args.lossless_set)
-        if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke')) for card in cards):
+        if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms)) for card in cards):
             parser.error('--lossless-set needs --panels with spec_lossless_set')
     lossless_dump = None
     if args.dump_lossless_rows is not None:
@@ -2562,7 +2579,7 @@ def main():
             lossless_dump = parse_lossless_dump(args.dump_lossless_rows, lossless_set)
         except ValueError as error:
             parser.error(f'--dump-lossless-rows: {error}')
-        if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke')) for card in cards):
+        if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms)) for card in cards):
             parser.error('--dump-lossless-rows needs --panels with spec_lossless_set')
     for card in cards:
         if context_lengths is not None:
@@ -2599,7 +2616,7 @@ def main():
             probes[card['name']].add('console')
             if args.matched_prompts and 'image' in probes[card['name']]:
                 raise ValueError('--matched-prompts cannot precede its first benchmark request with an image probe')
-        requested_panels(card.get('profile', 'smoke'))
+        requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms))
         card['set'].update(overrides.get(card['name'], {}))
         values = {**config(card['config']), **card['set']}
         count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
@@ -2640,7 +2657,7 @@ def main():
     bindings = dict(item.split('=', 1) for item in args.card_arm)
     if bindings and (args.interleave or set(bindings) - set(args.cards) or set(bindings.values()) - set(arms)):
         raise ValueError('--card-arm needs selected cards/arms in matrix mode')
-    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None, [h for h in (args.cold_window or '').split(',') if h] or None) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
+    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None, [h for h in (args.cold_window or '').split(',') if h] or None, binary=panel_binary(args.binary, arms)) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
     variants = {(c['name'], n): {**c, 'set': {**c['set'], **arm_overrides.get(n, {}).get(c['name'], {})}} for c in cards for n in arms}
     for job in jobs:
         apply_arm_config(job, arm_config.get(job['arm'], {}), arm_unsets.get(job['arm'], set()))
@@ -2724,6 +2741,7 @@ def main():
         (['context_suffix'] if args.context_suffix is not None else []) + \
         (['worker_stop'] if any(job['entry']['set'].get('PROFILE_SPARK') for job in jobs) else [])
     for job in {j['launcher']['repo']: j for j in reversed(jobs)}.values():
+        requested_panels(job['entry'].get('profile', 'smoke'), binary=job['binary'])
         binary_supports(job['binary'], job['launcher']['repo'], job, fields)
     # Everything checkable without hardware, before any queue ticket.
     problems = []

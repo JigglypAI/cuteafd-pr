@@ -27,6 +27,20 @@ def no_stop_handlers(monkeypatch, tmp_path):
     monkeypatch.setattr(cards.hwlock, 'LOCK_DIR', tmp_path / 'locks')
     monkeypatch.delenv('CUTEAFD_HW_LOCKS_HELD', raising=False)
     monkeypatch.delenv('CUTEAFD_HW_GATE_TICKETS', raising=False)
+    cards.bench_panels.cache_clear()
+    bin_dir = tmp_path / '.cuteafd-test-bin'
+    bin_dir.mkdir(exist_ok=True)
+    cuteafd_bin = bin_dir / 'cuteafd'
+    fixture_path = ROOT / 'scripts/bench/fixtures/bench-panels-v1.json'
+    cuteafd_bin.write_text(
+        f'#!/usr/bin/env python3\nimport pathlib, sys\n'
+        f'if sys.argv[1:] == ["bench", "panels", "--json"]:\n'
+        f'    sys.stdout.write(pathlib.Path({str(fixture_path)!r}).read_text())\n'
+        f'    raise SystemExit(0)\n'
+        f'raise SystemExit(1)\n'
+    )
+    cuteafd_bin.chmod(0o755)
+    monkeypatch.setenv('PATH', f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
 
 
 @pytest.fixture
@@ -2852,20 +2866,26 @@ def test_invalid_container_keys_fail_at_preflight_before_hardware_grant(entry, t
         cards.preflight_job(job, {'instance': 'test-base', 'slot': 's'})
 
 
-def test_panels_allowlist_derives_from_bench_definitions_and_includes_shared_prefix(entry, tmp_path, monkeypatch):
-    profiles_rs = (ROOT / 'rust/crates/cuteafd-bench/src/profiles.rs').read_text()
-    referenced = set(re.findall(r'"([a-z0-9_]+)"', profiles_rs[profiles_rs.index('const SPEED'):profiles_rs.index('pub fn builtin')]))
-    assert 'shared_prefix' in referenced
-    assert referenced <= cards.PANELS
+def test_panels_allowlist_derives_from_bench_cli_and_matches_fixture(entry, tmp_path):
+    fixture = json.loads((ROOT / 'scripts/bench/fixtures/bench-panels-v1.json').read_text())
+    assert 'shared_prefix' in fixture
+    assert cards.bench_panels() == frozenset(fixture)
     assert cards.requested_panels('panels:shared_prefix') == ['shared_prefix']
     assert cards.requested_panels('panels:shared_prefix,baseline') == ['shared_prefix', 'baseline']
     job = cards.generate({**entry, 'profile': 'panels:shared_prefix'}, 'a', dict(instance='p', slot='s'),
                          tmp_path, tmp_path / 'key', {}, set(), None, 1)
     assert job['entry']['profile'] == 'panels:shared_prefix'
-    monkeypatch.setattr(cards, 'run', lambda cmd: SimpleNamespace(
-        stdout=json.dumps(sorted(cards.PANELS)) + '\n'
-    ))
-    assert cards.bench_panels(binary='/opt/bin/cuteafd') == cards.PANELS
+    with pytest.raises(ValueError, match='unknown requested panel: not_a_panel'):
+        cards.requested_panels('panels:not_a_panel')
+    cards.bench_panels.cache_clear()
+    with pytest.raises(ValueError, match='bench panels --json failed'):
+        cards.bench_panels(str(tmp_path / 'missing-cuteafd'))
+    bad_bin = tmp_path / 'bad-cuteafd'
+    bad_bin.write_text('#!/bin/sh\necho "not-json"\n')
+    bad_bin.chmod(0o755)
+    cards.bench_panels.cache_clear()
+    with pytest.raises(ValueError, match='bench panels --json returned invalid JSON'):
+        cards.bench_panels(str(bad_bin))
 
 
 def test_observer_slow_cleanup_exits_within_hook_wait_and_preserves_failures(entry, tmp_path, monkeypatch):

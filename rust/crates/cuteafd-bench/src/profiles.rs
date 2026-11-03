@@ -140,8 +140,16 @@ mod tests {
     #[test]
     fn explicit_smoke_panels_reject_unknown_names() {
         let selectable = selectable_panel_ids();
+        let fixture: Vec<String> = serde_json::from_str(
+            include_str!("../../../../scripts/bench/fixtures/bench-panels-v1.json")).unwrap();
+        assert_eq!(selectable, fixture);
         assert_eq!(selectable[0], "baseline");
         assert!(selectable.contains(&"shared_prefix"));
+        for profile in builtin() {
+            for panel in profile.panels {
+                assert!(selectable.contains(&panel.id.as_str()), "missing {}", panel.id);
+            }
+        }
         assert!(validate_selection(&format!("panels:{}", selectable.join(","))).is_ok());
         assert!(validate_selection("panels:decode_content,fidelity").is_ok());
         assert!(validate_selection("smoke").is_ok());
