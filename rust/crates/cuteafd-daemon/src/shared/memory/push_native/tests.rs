@@ -82,7 +82,7 @@ fn real_1017_coded_scale_plan_file_order_has_bounded_staging_and_no_holes() -> R
         let plan = RankPlan::new(&catalog, &slices, world, rank, slices.len() * planes.bytes)?;
         let checked = plan.checked(&catalog, &snapshot, world, rank)?;
         let tail = plan.scales.base(&plan.layout);
-        assert_eq!(plan.scales.host_peak(), budget);
+        assert_eq!(plan.scales.host_peak()?, budget);
         let mut expected = BTreeMap::new();
         for (region, _) in slices.iter().enumerate() {
             let base = plan.layout.region(region)?.start;
@@ -426,6 +426,34 @@ fn coordinator_native_tp2_halves_land_the_mount_staging_bytes() -> Result<()> {
             eprintln!("{}: gpu{gpu} native TP2 halves land mount staging ({} entries)", root.display(),
                 checked.plan.entries.len());
         }
+    }
+    Ok(())
+}
+
+
+#[test]
+fn coordinator_coded_scales_and_family_dense_staging_are_independent_host_owners() -> Result<()> {
+    use crate::shared::{memory::push_coordinator::CoordinatorExpertPlan,
+        experts::rtx::dense::{HostStaging, STEP_BYTES}};
+    let root = tempfile::tempdir()?;
+    cuteafd_loader::plan::testing::write_v41_snapshot(root.path());
+    let catalog = cuteafd_loader::read_official_v41_catalog(root.path())?;
+    for world in [1, 2] {
+        let plans = (0..world).map(|rank| if world == 1 {
+            CoordinatorExpertPlan::whole_native(&catalog, &[0], usize::MAX)
+        } else { CoordinatorExpertPlan::new(&catalog, &[0], rank, usize::MAX) }).collect::<Result<Vec<_>>>()?;
+        for plan in &plans {
+            let geometry = plan.scales.host_staging();
+            assert_eq!(geometry.buffers, 8);
+            assert_eq!(geometry.buffer_bytes, STEP_BYTES);
+            assert_eq!(geometry.table_bytes, 1 << 20);
+            assert_eq!(plan.host_bytes()?, 8 * STEP_BYTES + (1 << 20));
+        }
+        let dense = vec![HostStaging::new(8, 2 << 20); world];
+        let refs = plans.iter().map(Some).collect::<Vec<_>>();
+        let peak = world * (128 * (1 << 20) + 16 * STEP_BYTES + (3 << 20));
+        assert_eq!(CoordinatorExpertPlan::admit_host(&refs, &dense, 128, 1 << 20, peak as u64)?, peak);
+        assert!(CoordinatorExpertPlan::admit_host(&refs, &dense, 128, 1 << 20, peak as u64 - 1).is_err());
     }
     Ok(())
 }

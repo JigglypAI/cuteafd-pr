@@ -12,10 +12,90 @@ fn coordinator_host_admission_charges_every_concurrent_receive_ring() -> Result<
     for gpus in [1, 2] {
         let plans = (0..gpus).map(|_| None).collect::<Vec<_>>();
         let peak = gpus * 128 * (1 << 20);
-        assert_eq!(CoordinatorExpertPlan::admit_host(&plans, 128, 1 << 20, peak as u64)?, peak);
-        assert!(CoordinatorExpertPlan::admit_host(&plans, 128, 1 << 20, peak as u64 - 1).is_err());
-        assert!(CoordinatorExpertPlan::admit_host(&plans, usize::MAX, 2, u64::MAX).is_err());
+        assert_eq!(CoordinatorExpertPlan::admit_host(&plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[], 128, 1 << 20, peak as u64)?, peak);
+        assert!(CoordinatorExpertPlan::admit_host(&plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[], 128, 1 << 20, peak as u64 - 1).is_err());
+        assert!(CoordinatorExpertPlan::admit_host(&plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[], usize::MAX, 2, u64::MAX).is_err());
     }
+    Ok(())
+}
+
+#[test]
+fn dense_host_geometry_tracks_pools_and_large_quant_tables_without_allocating() -> Result<()> {
+    use crate::shared::{experts::rtx::dense::{HostStaging, Job, RankLayout, Rect, Step, STEP_BYTES},
+        fp8_load_quant::{Layout, Target}, fp8_linear::Fp8Scales};
+    let buffer = cuteafd_ffi::CuteafdDeviceBuffer { device_id: 0, ..Default::default() };
+    let target = Target { q: buffer, q_stride: 128, scales: buffer, kmajor: None };
+    let rect = Rect { name: "rows".into(), path: "header-only".into(), base: 0,
+        row_bytes: 256, rows: 0..131072, cols: 0..256 };
+    let step = Step { device: 0, rects: vec![rect], jobs: vec![Job::Quant { rows: 0..131072,
+        pitch: 128, col0: 0, cols: 128, layout: Layout::Channel, rule: Fp8Scales::Amax, target }] };
+    let empty = RankLayout::new(vec![], vec![], 0)?;
+    assert_eq!(empty.host_staging, HostStaging::default());
+    for count in [1, 2, 8, 11] {
+        let layout = RankLayout::new(vec![], vec![step.clone(); count], 0)?;
+        let staging = layout.plan().host_staging;
+        assert_eq!(staging.buffers, count.min(8));
+        assert_eq!(staging.buffer_bytes, STEP_BYTES);
+        assert!(staging.table_bytes > 1 << 20, "row tables are not capped at the allocation floor");
+        assert_eq!(staging.table_bytes, crate::shared::fp8_load_quant::quant_table_bytes(131072, Layout::Channel)?);
+        assert_eq!(staging.bytes()?, count.min(8) * STEP_BYTES + staging.table_bytes);
+    }
+    let block = crate::shared::fp8_load_quant::quant_table_bytes(131072, Layout::Block)?;
+    assert_eq!(block, 1 << 20);
+    assert!(crate::shared::fp8_load_quant::quant_table_bytes(usize::MAX, Layout::Channel).is_err());
+    assert!(crate::shared::fp8_load_quant::scale_code_table_bytes(usize::MAX).is_err());
+    assert!(HostStaging { buffers: usize::MAX, buffer_bytes: 2, table_bytes: 0 }.bytes().is_err());
+    Ok(())
+}
+
+#[test]
+fn coordinator_host_admission_adds_dense_pools_and_exl3_validation_for_every_rank() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{HostStaging, STEP_BYTES};
+    let root = tempfile::tempdir()?;
+    let (tensors, _) = qwen4_exl3(1, 4);
+    let tensors = tensors.into_iter().filter(|t| !t.0.contains(".experts.") || t.0.contains(".experts.0."))
+        .collect::<Vec<_>>();
+    let mut config = qwen4_config(1);
+    config["text_config"]["num_experts"] = serde_json::json!(1);
+    config["text_config"]["num_experts_per_tok"] = serde_json::json!(1);
+    write_snapshot(root.path(), &config, &tensors, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    for gpus in [1, 2] {
+        let plans = (0..gpus).map(|gpu| if gpus == 1 {
+            CoordinatorExpertPlan::whole(vec![catalog.exl3().unwrap().residency(V41Exl3Layer::Backbone(0), 1, 0)?], usize::MAX)
+        } else { CoordinatorExpertPlan::new(&catalog, &[0], gpu, usize::MAX) }).collect::<Result<Vec<_>>>()?;
+        let owners = plans.iter().map(Some).collect::<Vec<_>>();
+        let dense = vec![HostStaging::new(12, 2 << 20); gpus];
+        let validation = plans.iter().map(|p| p.validation.bytes()).sum::<usize>();
+        assert!(validation > 0);
+        let peak = gpus * (128 * (1 << 20) + 8 * STEP_BYTES + (2 << 20)) + validation;
+        assert_eq!(CoordinatorExpertPlan::admit_host(&owners, &dense, 128, 1 << 20, peak as u64)?, peak);
+        assert!(CoordinatorExpertPlan::admit_host(&owners, &dense, 128, 1 << 20, peak as u64 - 1).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn host_admission_refusal_declines_peers_before_returning_a_typed_planning_error() -> Result<()> {
+    use crate::shared::experts::rtx::dense::HostStaging;
+    let (first_driver, mut first) = control_pair()?;
+    let (second_driver, mut second) = control_pair()?;
+    let driver = std::thread::spawn(move || cuteafd_transport::worker_selection::push::coordinate(
+        &mut [first_driver, second_driver], |_| anyhow::bail!("refused admission must not create a group")));
+    let peer = std::thread::spawn(move || -> Result<()> {
+        let offer = cuteafd_transport::worker_selection::push::Offer { rank: 1, host: "spark".into(),
+            arena_bytes: 1, placement: vec![] };
+        assert!(planned_offer(&mut second, Ok(()), Ok(offer))?.is_none());
+        Ok(())
+    });
+    let planned = CoordinatorExpertPlan::admit_host(&[None], &[HostStaging::new(8, 1 << 20)],
+        128, 1 << 20, 128 << 20);
+    let offer = planned.as_ref().map(|_| unreachable!("staging must exceed this ring-only budget"))
+        .map_err(|error| format!("{error:#}"));
+    let error = planned_offer(&mut first, planned, offer).unwrap_err();
+    assert!(matches!(error.downcast_ref::<PushStartupError>(), Some(PushStartupError::Planning(_))));
+    peer.join().map_err(|_| anyhow::anyhow!("peer panicked"))??;
+    driver.join().map_err(|_| anyhow::anyhow!("driver panicked"))??;
     Ok(())
 }
 

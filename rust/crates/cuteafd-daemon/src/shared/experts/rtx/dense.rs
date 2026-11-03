@@ -42,6 +42,26 @@ pub(crate) fn append(rect: &Rect, builder: &mut Builder, rank: u32, offset: u64)
 /// [`STEP_BYTES`] buffers.
 pub(crate) const MAX_OPEN_STEPS: usize = 8;
 
+/// Independent pinned owners retained by one DenseArena through Done/drop.
+/// Neither the uniform source buffers nor the job table are device allocations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HostStaging {
+    pub buffers: usize,
+    pub buffer_bytes: usize,
+    pub table_bytes: usize,
+}
+
+impl HostStaging {
+    pub fn new(steps: usize, table_bytes: usize) -> Self {
+        Self { buffers: steps.min(MAX_OPEN_STEPS), buffer_bytes: if steps == 0 { 0 } else { STEP_BYTES },
+            table_bytes }
+    }
+    pub fn bytes(self) -> Result<usize> {
+        self.buffers.checked_mul(self.buffer_bytes).and_then(|bytes| bytes.checked_add(self.table_bytes))
+            .context("dense pinned staging overflow")
+    }
+}
+
 /// One GPU's operands and steps in its rank's logical space.
 pub(crate) struct RankLayout {
     pub device: i32,
@@ -53,6 +73,7 @@ pub(crate) struct RankLayout {
     pub host_bytes: u64,
     /// Device-to-device transforms of this GPU's landed operands, run at Done.
     pub finishes: Vec<Finish>,
+    pub host_staging: HostStaging,
 }
 
 impl RankLayout {
@@ -75,8 +96,23 @@ impl RankLayout {
             cursor = start + step.bytes() as u64 + 1;
             staged.push((start, step));
         }
+        let mut table_bytes = 0;
+        for (_, step) in &staged {
+            ensure!(step.bytes() > 0 && step.bytes() <= STEP_BYTES, "dense step exceeds bounded staging");
+            for job in &step.jobs {
+                let bytes = match job {
+                    Job::Quant { rows, layout, .. } =>
+                        crate::shared::fp8_load_quant::quant_table_bytes(rows.len(), *layout)?,
+                    Job::ScaleCodes { .. } => crate::shared::fp8_load_quant::scale_code_table_bytes(1)?,
+                    _ => 0,
+                };
+                table_bytes = table_bytes.max(bytes);
+            }
+        }
+        let host_staging = HostStaging::new(staged.len(), table_bytes);
+        host_staging.bytes()?;
         Ok(Self { device, operands: placed, steps: staged, base, host_bytes: if cursor == 0 { 0 } else { cursor },
-            finishes: Vec::new() })
+            finishes: Vec::new(), host_staging })
     }
 
     /// [`Self::new`] with `device`'s finishes from `finishes`.
@@ -91,7 +127,7 @@ impl RankLayout {
         let operands: Vec<(u64, Vec<(Rect, usize)>)> = self.operands.iter()
             .map(|(start, o)| (*start, o.lands.clone())).collect();
         let steps: Vec<(u64, Vec<Rect>)> = self.steps.iter().map(|(start, s)| (*start, s.rects.clone())).collect();
-        super::push::DensePlan { base: self.base, host_bytes: self.host_bytes,
+        super::push::DensePlan { base: self.base, host_bytes: self.host_bytes, host_staging: self.host_staging,
             append: Box::new(move |builder, rank, host_base| {
                 for (start, lands) in &operands {
                     for (rect, at) in lands { append(rect, builder, rank, start + *at as u64)?; }

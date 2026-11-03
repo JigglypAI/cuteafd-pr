@@ -247,9 +247,9 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
         return Ok(Some(weights));
     }
     drop(candidate);
-    ensure!(!library.is_quarantined_after_failed_drain(), "failed push drain prevents safe mount retry");
+    ensure!(!library.is_quarantined_after_failed_drain(), "failed push drain prevents safe startup cleanup");
     push::drained(stream).context("coordinator push drained barrier")?;
-    tracing::warn!(group, rank, "whole push group discarded; coordinator loads through mount");
+    tracing::warn!(group, rank, "whole push group discarded before coordinator startup failure");
     Ok(None)
 }
 
@@ -260,6 +260,7 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
 pub(crate) struct DensePlan {
     pub base: u64,
     pub host_bytes: u64,
+    pub host_staging: super::dense::HostStaging,
     pub append: Box<dyn Fn(&mut cuteafd_loader::push_load::builder::Builder, u32, u64) -> Result<()> + Send>,
 }
 
@@ -373,7 +374,7 @@ impl CoordinatorPush {
             None => (0..gpus).map(|_| None).collect(),
         };
         let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
-        let host_peak = CoordinatorExpertPlan::admit_host(&plans, cuteafd_ffi::push_ring::DEFAULT_SLOTS,
+        let host_peak = CoordinatorExpertPlan::admit_host(&plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[], cuteafd_ffi::push_ring::DEFAULT_SLOTS,
             cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES, available)?;
         tracing::info!(gpus, host_peak_bytes = host_peak, "coordinator push host memory admitted");
         let (mut driver, mut ranks) = (Vec::new(), Vec::new());
@@ -414,7 +415,7 @@ impl CoordinatorPush {
 
     /// [`Self::prepare`] for a launch without Spark peers: the coordinator GPUs
     /// form the push group alone, driven by a thread of this owner (the same
-    /// whole-group commit or mount fallback). Every family's coordinator dense
+    /// whole-group commit or drained failure). Every family's coordinator dense
     /// records push this way on Spark-free layouts.
     /// With `experts`, the GPUs' admitted expert layers join the group too.
     pub(crate) fn prepare_alone(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>, gpus: usize,
@@ -447,9 +448,8 @@ impl CoordinatorPush {
     /// `beside` runs on this thread. `dense`: each GPU's plan (published to the
     /// group driver before the offers) and destination (unaliased descriptors of
     /// operand allocations the caller keeps alive and unread until this returns
-    /// and the group commits). `Ok(None)`: the whole group fell back. A dense
-    /// planning error makes every coordinator GPU offer mount, so the whole
-    /// group (Sparks and TP2 halves too) loads through the mount.
+    /// and the group commits). Planning/admission failures decline all coordinator
+    /// ranks and fail startup only after the peer handshake completes.
     #[allow(clippy::type_complexity)]
     pub(crate) fn receive_with<'a, D: PushDestination<Delivered = ()>, U>(self,
         devices: Vec<crate::shared::memory::device::Device<'a>>, catalog: Option<&OfficialV41Catalog>, sparks: usize,
@@ -462,13 +462,19 @@ impl CoordinatorPush {
             return (Err(anyhow::anyhow!("coordinator push GPUs differ from their plans")), beside());
         }
         let world = sparks + gpus.len();
-        let declined = match &dense {
-            Some(Err(error)) => {
-                tracing::info!(%error, "coordinator dense push planning failed; whole group uses mount");
-                true
-            }
-            _ => false,
-        };
+        // Destinations have no pinned pool/table allocations yet. Admit all independent
+        // owners before offers; a refusal still sends declines to release Spark peers.
+        let admission = (|| -> Result<()> {
+            if let Some(Err(error)) = &dense { anyhow::bail!("dense planning: {error:#}"); }
+            let staging = dense.as_ref().and_then(|d| d.as_ref().ok())
+                .map(|(plans, _)| plans.iter().map(|p| p.host_staging).collect::<Vec<_>>()).unwrap_or_default();
+            let plans = gpus.iter().map(|(plan, _)| plan.as_ref()).collect::<Vec<_>>();
+            let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
+            let peak = CoordinatorExpertPlan::admit_host(&plans, &staging, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES, available)?;
+            tracing::info!(host_peak_bytes = peak, "coordinator push complete host peak admitted before offers");
+            Ok(())
+        })();
+        let declined = admission.is_err();
         let (bases, destinations): (Vec<(u64, u64)>, Vec<Option<D>>) = match dense.and_then(Result::ok) {
             Some((plans, destinations)) => {
                 let bases = plans.iter().map(|p| (p.base, p.host_bytes)).collect();
@@ -495,15 +501,14 @@ impl CoordinatorPush {
                     "coordinator push source is not a SparkNest shard");
                 Ok(Some(checked))
             })();
-            if let Err(error) = &planned { tracing::warn!(gpu, %error, "coordinator push unavailable; offering mount"); }
+            if let Err(error) = &planned { tracing::warn!(gpu, %error, "coordinator push planning failed; declining group"); }
             let tp2_bytes = tp2.as_ref().map_or(0, |p| p.logical_bytes());
             let (host_base, arena_bytes) = rank_bytes(base, tp2_bytes, host);
             let offer = planned.as_ref().map(|_| cuteafd_transport::worker_selection::push::Offer {
                 rank, host: namespace_host.clone(), arena_bytes, placement: Vec::new() })
                 .map_err(|error| format!("{error:#}"));
-            let credentials = cuteafd_transport::worker_selection::push::offer_with(&mut stream, offer)?;
-            let Some(credentials) = credentials else { return Ok(None) };
-            let checked = planned?;
+            let credentials = planned_offer(&mut stream, planned, offer)?;
+            let Some((checked, credentials)) = credentials else { return Ok(None) };
             let tp2 = match (tp2, checked.as_ref()) {
                 (Some(plan), Some(checked)) => Some((catalog.context("expert catalog")?, plan, checked)),
                 _ => None,
@@ -537,6 +542,19 @@ impl CoordinatorPush {
                 _ => anyhow::bail!("coordinator push GPUs disagree on the group commit"),
             }
         });
-        (PushPolicy::Required.committed(pushed).map_err(Into::into), value)
+        let pushed = match admission {
+            Err(error) => Err(PushStartupError::Planning(error).into()),
+            Ok(()) => PushPolicy::Required.committed(pushed).map_err(Into::into),
+        };
+        (pushed, value)
     }
+}
+
+/// Planning failures must participate in Begin/decline before being returned.
+fn planned_offer<T>(stream: &mut std::net::TcpStream, planned: Result<T>,
+    offer: std::result::Result<cuteafd_transport::worker_selection::push::Offer, String>)
+    -> Result<Option<(T, (u64, u64))>> {
+    let credentials = cuteafd_transport::worker_selection::push::offer_with(stream, offer)?;
+    let planned = planned.map_err(PushStartupError::Planning)?;
+    Ok(credentials.map(|credentials| (planned, credentials)))
 }

@@ -2,8 +2,7 @@
 //! Spark group as ranks `sparks` and `sparks + 1`, each with its own ring and
 //! admitted device arena. Plans reuse the shared builder; delivery reuses the
 //! shared consumer and post-Done initialization. Nothing publishes before the
-//! whole group commits; any failure drops every unpublished owner and the
-//! whole group (Sparks included) reloads through the mount.
+//! whole group commits; failures drain every unpublished owner before startup fails.
 use super::{weight_arena::ArenaLayout, weight_validation::ValidationLayout};
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::{push_load::builder::{Builder, CheckedPlan, Destination}, OfficialV41Catalog, V41Exl3Layer,
@@ -125,18 +124,29 @@ impl CoordinatorExpertPlan {
             .context("coordinator host admission overflow")
     }
 
-    /// Both coordinator ranks receive concurrently, so every format pays for
-    /// every pinned ring. EXLR8 additionally pays for retained metadata and its
-    /// per-rank post-Done descriptor scratch, not the deleted mount staging.
-    pub fn admit_host(plans: &[Option<Self>], slots: usize, slot_bytes: usize, available: u64) -> Result<usize> {
+    /// Expert-owned host storage, independent of the family DenseArena and ring.
+    pub fn host_bytes(&self) -> Result<usize> {
+        let scales = self.scales.host_peak()?;
+        self.exlr8_host_bytes()?.checked_add(self.validation.bytes())
+            .and_then(|bytes| bytes.checked_add(scales))
+            .context("coordinator expert host admission overflow")
+    }
+
+    /// All ranks and both DenseArenas per rank coexist with their receive rings.
+    /// Dense staging is supplied only once its records are complete, before offers.
+    pub fn admit_host(plans: &[Option<&Self>], dense: &[crate::shared::experts::rtx::dense::HostStaging],
+        slots: usize, slot_bytes: usize, available: u64) -> Result<usize> {
+        ensure!(dense.is_empty() || dense.len() == plans.len(), "dense host owners differ from coordinator ranks");
         let rings = slots.checked_mul(slot_bytes).and_then(|bytes| bytes.checked_mul(plans.len()))
             .context("coordinator push ring host overflow")?;
         let peak = plans.iter().try_fold(rings, |bytes, plan| {
-            let extra = plan.as_ref().map_or(Ok(0), Self::exlr8_host_bytes)?;
+            let extra = plan.map_or(Ok(0), Self::host_bytes)?;
             bytes.checked_add(extra).context("coordinator push host admission overflow")
         })?;
+        let peak = dense.iter().try_fold(peak, |bytes, staging|
+            bytes.checked_add(staging.bytes()?).context("coordinator dense host admission overflow"))?;
         ensure!(u64::try_from(peak)? <= available,
-            "coordinator push retained metadata, descriptors and receive rings need {peak} host bytes, available {available}");
+            "coordinator push experts, dense staging and receive rings need {peak} host bytes, available {available}");
         Ok(peak)
     }
 
