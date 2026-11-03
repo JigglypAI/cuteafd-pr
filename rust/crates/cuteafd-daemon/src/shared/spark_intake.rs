@@ -384,7 +384,7 @@ pub(crate) struct SparkIntake<'a> {
     rows: usize,
     row_bytes: usize,
     /// One allocation per rank holding its whole reserve range.
-    planes: Vec<DeviceAllocation<'a>>,
+    planes: Vec<IntakePlane<'a>>,
     /// Admitted return slots (events, consumed fences).
     waves: usize,
     geometry: RefCell<SlotGeometry>,
@@ -403,6 +403,12 @@ pub(crate) struct SparkIntake<'a> {
     landed: Vec<*mut c_void>,
     /// Receive slots whose uploads are queued; released before the next wave.
     held: Arc<Mutex<Vec<(usize, u32, VerbsHostProtocolV2ResponsePayload)>>>,
+}
+
+/// Owns the raw cudaMalloc while every consumer uses the aligned interior view.
+struct IntakePlane<'a> {
+    _allocation: DeviceAllocation<'a>,
+    buffer: CuteafdDeviceBuffer,
 }
 
 struct IntakeState {
@@ -478,10 +484,21 @@ impl<'a> SparkIntake<'a> {
         let reserve_bytes = usize::try_from(cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
             u64::try_from(logical_bytes.max(256))?)?)?;
         let planes = (0..ranks).map(|rank| {
-            let plane = DeviceAllocation::new(library, reserve_bytes)?;
+            let allocation = DeviceAllocation::new(library, reserve_bytes)?;
+            let (offset, bytes) = cuteafd_core::serving_capacity::spark_intake_export_range(
+                allocation.buffer.ptr as u64, u64::try_from(logical_bytes.max(256))?)?;
+            let (offset, bytes) = (usize::try_from(offset)?, usize::try_from(bytes)?);
+            ensure!(offset.checked_add(bytes).is_some_and(|end| end <= allocation.buffer.bytes),
+                "Spark intake aligned range exceeds raw allocation");
+            let buffer = CuteafdDeviceBuffer {
+                // SAFETY: the checked aligned interior range belongs to the retained raw allocation.
+                ptr: unsafe { allocation.buffer.ptr.cast::<u8>().add(offset) }.cast(),
+                bytes, ..allocation.buffer
+            };
             tracing::info!(rank, waves, rows, row_bytes, logical_bytes, allocation_bytes = reserve_bytes,
-                ptr = ?plane.buffer.ptr, "allocated Spark intake reserve");
-            Ok(plane)
+                allocation_ptr = ?allocation.buffer.ptr, aligned_offset = offset,
+                ptr = ?buffer.ptr, registered_bytes = bytes, "allocated Spark intake reserve");
+            Ok(IntakePlane { _allocation: allocation, buffer })
         }).collect::<Result<Vec<_>>>()?;
         // Host mode stages every wave; pinned mode only small ones (see `stages`).
         let staging = match mode {
@@ -1820,6 +1837,12 @@ mod tests {
         let logical = geometry.reserve_rows() * row_bytes;
         let backing = cuteafd_core::serving_capacity::spark_intake_allocation_bytes(logical as u64)?;
         assert!(backing > logical as u64);
+        for base in [4096, 4608] {
+            let (aligned_offset, registered_bytes) = cuteafd_core::serving_capacity::spark_intake_export_range(base, logical as u64)?;
+            assert_eq!((base + aligned_offset) % 4096, 0);
+            assert!(aligned_offset + registered_bytes <= backing);
+            cuteafd_core::serving_capacity::validate_spark_intake_export(base + aligned_offset, registered_bytes)?;
+        }
         for slot in 0..waves {
             let (offset, bytes) = geometry.slice(slot, row_bytes);
             assert_eq!((offset, bytes), (slot * rows * row_bytes, rows * row_bytes));

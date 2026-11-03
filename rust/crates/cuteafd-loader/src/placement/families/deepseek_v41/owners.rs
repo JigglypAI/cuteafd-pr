@@ -502,7 +502,8 @@ mod tests {
         assert!(vocabulary_load_phase(&[demand("attention", u64::MAX)], &target, 400).is_err());
         assert!(vocabulary_load_phase(&[demand("attention", 1).on(1)], &target, 400).is_err());
         for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
-            assert_eq!(transport_bytes(1024, ranks)?, 1024 * (ranks as u64 + 2) * 10240);
+            assert_eq!(transport_bytes(1024, ranks)?, ranks as u64 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(1024 * 10240)?
+                + 2 * 1024 * 10240);
         }
         assert!(transport_bytes(0, 4).is_err());
         assert!(transport_bytes(4097, 4).is_err());
@@ -515,11 +516,12 @@ mod tests {
     fn transport_backing_pads_decode_ranges_and_the_whole_prefill_reserve() -> Result<()> {
         for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
             for decode_rows in [64, 80] {
-                let decode = ranks as u64 * (2 << 20) + decode_rows * 20480;
+                let decode = ranks as u64 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(decode_rows * 10240)?
+                    + decode_rows * 20480;
                 assert_eq!(transport_bytes(decode_rows, ranks)?, decode);
                 let outputs = 3 * 2752 * 10240;
                 assert_eq!(transports_bytes(decode_rows, 2752, ranks, 3)?,
-                    2 * decode + outputs + ranks as u64 * 85_983_232);
+                    2 * decode + outputs + ranks as u64 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(3 * 2752 * 10240)?);
             }
         }
         Ok(())

@@ -39,19 +39,23 @@ mod tests {
     #[test]
     fn partial_reply_plan_charges_one_padded_reserve_per_rank() {
         for ranks in [4, 6] {
-            assert_eq!(prefill_return_bytes(3, 2752, ranks, 34_864 / 2), ranks * 289_406_976);
+            let logical = 3 * 2752 * 34_864;
+            assert_eq!(prefill_return_bytes(3, 2752, ranks, 34_864 / 2),
+                ranks * spark_intake_allocation_bytes(logical).unwrap());
         }
-        // Slots share one allocation: rounding each one separately overcharges.
-        assert_eq!(prefill_return_bytes(3, 64, 4, 16), 4 * (2 << 20));
-        assert_eq!(spark_intake_bytes(3, 4, 64, 16), 12 * (2 << 20));
+        let shared = 4 * spark_intake_allocation_bytes(3 * 64 * 16 * 2).unwrap();
+        let independent = 12 * spark_intake_allocation_bytes(64 * 16 * 2).unwrap();
+        assert_eq!(prefill_return_bytes(3, 64, 4, 16), shared);
+        assert_eq!(spark_intake_bytes(3, 4, 64, 16), independent);
+        assert!(shared < independent);
     }
 
     #[test]
-    fn aligned_intake_charge_is_unchanged() {
+    fn aligned_intake_charge_keeps_one_page_of_alignment_slack() {
         for lanes in [1, 2, 4] { for ranks in [0, 4, 6] { for rows in [1024, 4096] {
-            assert_eq!(spark_intake_bytes(lanes, ranks, rows, 6144), lanes * ranks * rows * 6144 * 2);
+            assert_eq!(spark_intake_bytes(lanes, ranks, rows, 6144),
+                lanes * ranks * spark_intake_allocation_bytes(rows * 6144 * 2).unwrap());
         } } }
-        assert_eq!(spark_intake_bytes(1, 6, 4096, 3584), 176_160_768);
     }
 
     #[test]

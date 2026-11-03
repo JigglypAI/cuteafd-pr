@@ -3362,7 +3362,8 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             let slots = 2 * working.prefill_lanes;
             assert_eq!(charged("route exchange"), if expected_rtx == 0 { 0 } else {
                 slots * (4096 * 8 * 8) + ((slots + 1) * 16).max(256) });
-            assert_eq!(charged("Spark intake"), if rank == 0 && spark { 268435456 } else { 0 });
+            assert_eq!(charged("Spark intake"), if rank == 0 && spark { 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
+                working.prefill_lanes * 4096 * cfg.hidden as u64 * 2).unwrap() } else { 0 });
             assert!(request.fixed.iter().filter(|d| d.gpu as usize == rank && d.category == Category::Workspace)
                 .map(|d| d.bytes).sum::<u64>() > 0);
         }

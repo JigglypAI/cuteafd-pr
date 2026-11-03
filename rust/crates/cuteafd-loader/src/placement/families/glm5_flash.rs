@@ -898,7 +898,7 @@ mod tests {
             assert_eq!((p.pool_tokens, &p.layers, p.tp2), (r.pool_tokens, &r.layers, r.tp2));
             let group = |placed: &Placement, rank: usize, name: &str| placed.items[rank].iter()
                 .filter(|d| d.group == name).map(|d| d.bytes).sum::<u64>();
-            assert_eq!(group(&p, 0, "Spark intake"), if spark { 268_435_456 } else { 0 });
+            assert_eq!(group(&p, 0, "Spark intake"), if spark { 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(2 * 4096 * cfg.hidden as u64 * 2).unwrap() } else { 0 });
             for rank in 0..2 {
                 assert_eq!(group(&p, rank, "steps"), if spark { planned.workspace[rank].demand.bytes } else { planned.local_workspace[rank].demand.bytes });
                 let total = |input: &GlmfInputs<'_>, placed: &Placement| input.gpus[rank].0 - GpuBudget {
@@ -919,7 +919,7 @@ mod tests {
         let request = request(&input).unwrap();
         let intake = request.fixed.iter().filter(|d| d.group == "Spark intake")
             .map(|d| d.bytes).sum::<u64>();
-        assert_eq!(intake, 4 * (2 << 20));
+        assert_eq!(intake, 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(input.prefill_lanes * 80 * cfg.hidden as u64 * 2).unwrap());
     }
 
     #[test]

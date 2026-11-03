@@ -3825,16 +3825,17 @@ cuteafd_status_t register_device_dmabuf_current(ibv_pd* pd, void* ptr, size_t by
   if (offset > size || bytes > size - offset) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing range exceeds its allocation");
   }
-  // CUDA exports require host-page alignment, including allocations that the
-  // driver suballocated within a larger chunk. Never export a neighbor's range.
+  // Export only the aligned interior range, never padding or a neighbor's
+  // allocation. The raw cudaMalloc may begin at a sub-page allocator offset.
   const long host_page = sysconf(_SC_PAGESIZE);
-  if (host_page <= 0 || base % static_cast<size_t>(host_page) != 0 ||
-      size % static_cast<size_t>(host_page) != 0) {
-    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing allocation is not host-page aligned; base=" +
-        std::to_string(base) + " bytes=" + std::to_string(size) + " host page=" + std::to_string(host_page));
+  const CUdeviceptr export_base = reinterpret_cast<CUdeviceptr>(ptr);
+  if (host_page <= 0 || export_base % static_cast<size_t>(host_page) != 0 ||
+      bytes == 0 || bytes % static_cast<size_t>(host_page) != 0) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing range is not host-page aligned; base=" +
+        std::to_string(export_base) + " bytes=" + std::to_string(bytes) + " host page=" + std::to_string(host_page));
   }
   int fd = -1;
-  result = cuMemGetHandleForAddressRange(&fd, base, size, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+  result = cuMemGetHandleForAddressRange(&fd, export_base, bytes, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
   if (result != CUDA_SUCCESS || fd < 0) {
     const char* name = "unknown";
     cuGetErrorName(result, &name);
@@ -3847,7 +3848,7 @@ cuteafd_status_t register_device_dmabuf_current(ibv_pd* pd, void* ptr, size_t by
                     " bytes=" + std::to_string(size) + " requested ptr=" +
                     std::to_string(reinterpret_cast<uint64_t>(ptr)) + " bytes=" + std::to_string(bytes));
   }
-  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, offset, bytes, reinterpret_cast<uint64_t>(ptr), fd,
+  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, 0, bytes, reinterpret_cast<uint64_t>(ptr), fd,
                                  IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_RELAXED_ORDERING);
   const int saved_errno = errno;
   close(fd);
