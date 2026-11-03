@@ -50,11 +50,18 @@ pub fn builtin() -> Vec<Profile> {
     ]
 }
 
+/// Every panel id selectable through `--panels` or `panels:...` (`baseline`
+/// plus [`crate::panels::catalog`] in catalog order).
+pub fn selectable_panel_ids() -> Vec<&'static str> {
+    std::iter::once("baseline").chain(crate::panels::catalog().into_iter().map(|p| p.id())).collect()
+}
+
 /// Validate an explicit smoke panel selection before taking locks or launching.
 pub fn validate_selection(profile: &str) -> Result<(), String> {
     if let Some(ids) = profile.strip_prefix("panels:") {
+        let allowed = selectable_panel_ids();
         for id in ids.split(',').map(str::trim).filter(|id| !id.is_empty()) {
-            if id != "baseline" && crate::panels::find(id).is_none() {
+            if !allowed.contains(&id) {
                 return Err(format!("unknown requested panel: {id}"));
             }
         }
@@ -132,6 +139,18 @@ mod tests {
 
     #[test]
     fn explicit_smoke_panels_reject_unknown_names() {
+        let selectable = selectable_panel_ids();
+        let fixture: Vec<String> = serde_json::from_str(
+            include_str!("../../../../scripts/bench/fixtures/bench-panels-v1.json")).unwrap();
+        assert_eq!(selectable, fixture);
+        assert_eq!(selectable[0], "baseline");
+        assert!(selectable.contains(&"shared_prefix"));
+        for profile in builtin() {
+            for panel in profile.panels {
+                assert!(selectable.contains(&panel.id.as_str()), "missing {}", panel.id);
+            }
+        }
+        assert!(validate_selection(&format!("panels:{}", selectable.join(","))).is_ok());
         assert!(validate_selection("panels:decode_content,fidelity").is_ok());
         assert!(validate_selection("smoke").is_ok());
         assert_eq!(validate_selection("panels:decode,fidelity").unwrap_err(), "unknown requested panel: decode");

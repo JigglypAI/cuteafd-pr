@@ -26,6 +26,7 @@ import argparse
 import base64
 import concurrent.futures
 import contextlib
+import functools
 import itertools
 import hashlib
 import importlib.util
@@ -83,13 +84,67 @@ SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 
 FIDELITY_PANELS = {'fidelity', 'fidelity_full'}
 LOWER_IS_BETTER = {'kl', 'readiness_s'}  # also every 'prefill N TTFT s'
 FAILURE = re.compile(r'(?i)(\berror\b|\bpanicked\b|\bfatal\b|\bfailed\b|undefined symbol|no such file|refus|exited:|timed out|out of memory|traceback)')
-PANELS = {'baseline', 'hardware', 'configuration', 'decode_content', 'concurrency', 'draft_mix', 'prefill', 'retained', 'prefix_cache', 'context_load', 'startup', 'agentic', 'tool_eval', 'structured', 'ifeval', 'code', 'math', 'needle', 'fidelity', 'fidelity_full', 'reasoning_effort', 'spec_lossless_set'}
+@functools.lru_cache(maxsize=None)
+def bench_panels(binary='cuteafd'):
+    """Ask the host cuteafd binary (`cuteafd bench panels --json`) for the selectable panel ids."""
+    cmd = str(binary or shutil.which('cuteafd') or 'cuteafd')
+    try:
+        result = subprocess.run([cmd, 'bench', 'panels', '--json'],
+                                capture_output=True, text=True, timeout=30)
+    except OSError as error:
+        raise ValueError(f'{cmd} bench panels --json failed: {error}') from error
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip().splitlines()[-1:]
+        raise ValueError(f'{cmd} bench panels --json failed: {detail}')
+    try:
+        panels = json.loads(result.stdout)
+    except ValueError as error:
+        raise ValueError(f'{cmd} bench panels --json returned invalid JSON: {error}') from error
+    if not isinstance(panels, list) or not panels or not all(isinstance(p, str) and p for p in panels):
+        raise ValueError(f'{cmd} bench panels --json returned invalid panel list')
+    return frozenset(panels)
 
 
 def short_instance(value):
     if not NAME.fullmatch(value):
         raise ValueError('invalid instance: ' + value)
     return value if len(value) <= 41 else value[:32] + '-' + hashlib.sha256(value.encode()).hexdigest()[:8]
+
+
+def launcher_defaults(repo=REPO):
+    """Read the launcher's default EXPERT_PORT and ADDR from scripts/launch/run-family.sh."""
+    text = (Path(repo) / 'scripts/launch/run-family.sh').read_text()
+    defaults = {match[1]: match[2] for match in re.finditer(r'\$\(get\s+(EXPERT_PORT|ADDR)\s+([^\s")]+)\)', text)}
+    if {'EXPERT_PORT', 'ADDR'} - defaults.keys():
+        raise ValueError('missing EXPERT_PORT/ADDR defaults in scripts/launch/run-family.sh')
+    return defaults
+
+
+LAUNCHER_DEFAULTS = launcher_defaults()
+
+
+def resolve_container_keys(entry):
+    """Resolve and validate the container-name and endpoint keys a launch uses."""
+    values = entry.get('set', {})
+    instance = str(values.get('INSTANCE', ''))
+    if not instance or len(instance) > 41 or not NAME.fullmatch(instance):
+        raise ValueError(f'INSTANCE must be [A-Za-z0-9_.-] (1..41 chars): {instance!r}')
+    port = str(values['EXPERT_PORT']) if 'EXPERT_PORT' in values else LAUNCHER_DEFAULTS['EXPERT_PORT']
+    if not port.isascii() or not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ValueError(f'EXPERT_PORT must be in 1..65535: {port!r}')
+    addr = str(values['ADDR']) if 'ADDR' in values else LAUNCHER_DEFAULTS['ADDR']
+    sparks = list(entry.get('sparks', []))
+    for host in sparks:
+        if not isinstance(host, str) or not NAME.fullmatch(host) or host not in HOSTS:
+            raise ValueError(f'invalid Spark host: {host!r}')
+    return dict(instance=instance, expert_port=port, addr=addr, sparks=sparks)
+
+
+def container_targets(job):
+    resolved = resolve_container_keys(job['entry'])
+    targets = [('raptor', 'cuteafd-coordinator-' + resolved['instance'])]
+    targets += [(host, f"cuteafd-spark-expert-{host}-{resolved['expert_port']}") for host in resolved['sparks']]
+    return targets
 
 
 def load_lossless_set(path):
@@ -128,11 +183,14 @@ def parse_lossless_dump(text, set_path=None):
     return dict(cases=cases, start=start, end=end)
 
 
-def requested_panels(profile):
+def requested_panels(profile, binary=None):
     if not profile.startswith('panels:'):
         return []
     panels = [p.strip() for p in profile[7:].split(',') if p.strip()]
-    bad = set(panels) - PANELS - {'baseline'}
+    if not panels:
+        return []
+    allowed = bench_panels(binary or shutil.which('cuteafd') or 'cuteafd')
+    bad = set(panels) - allowed - {'baseline'}
     if bad:
         raise ValueError('unknown requested panel: ' + ', '.join(sorted(bad)))
     return panels
@@ -154,7 +212,8 @@ def config(path):
 
 
 def run(cmd, **kwargs):
-    return subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=120, **kwargs)
+    timeout = kwargs.pop('timeout', 120)
+    return subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=timeout, **kwargs)
 
 
 def arms_from(values, releases=()):
@@ -277,9 +336,9 @@ def probe_selection(items, cards, arms):
 
 
 def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_pool, repeat, trace=False, exact_state=None,
-             cold_hosts=None):
+             cold_hosts=None, binary=None):
     entry = json.loads(json.dumps(entry))
-    requested_panels(entry.get('profile', 'smoke'))
+    requested_panels(entry.get('profile', 'smoke'), binary=binary)
     entry['fabric'] = 'fabric' in probes
     values = config(entry['config'])
     values.update(entry.pop('set', {}))
@@ -347,11 +406,12 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
         # the sweep's first warm wave and closes them (writing the reports) at
         # sweep end, or before teardown if the sweep stopped in between.
         sessions = []
+        resolved = resolve_container_keys(dict(set=values, sparks=hosts))
         if 'nsys' in values.get('PROFILE', '').split(','):
-            sessions.append(['docker', 'exec', 'cuteafd-coordinator-' + values['INSTANCE'], '/usr/local/cuda/bin/nsys'])
+            sessions.append(['docker', 'exec', 'cuteafd-coordinator-' + resolved['instance'], '/usr/local/cuda/bin/nsys'])
         if values.get('PROFILE_SPARK') == 'nsys':
             for rank in spark_profile_ranks(values, hosts):
-                worker = f"cuteafd-spark-expert-{hosts[rank]}-{values.get('EXPERT_PORT', '19441')}"
+                worker = f"cuteafd-spark-expert-{hosts[rank]}-{resolved['expert_port']}"
                 sessions.append(['ssh', '-o', 'BatchMode=yes', hosts[rank], 'docker', 'exec', worker, '/usr/local/cuda/bin/nsys'])
         if sessions:
             if not (entry.get('levels') or entry.get('prefill_lengths')):
@@ -406,7 +466,8 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     hook = [sys.executable, str(Path(__file__).resolve())]
     timeout = int(entry.get('timeout_s', 900)) + int(entry.get('run_timeout_s', 900)) + 120
     if probes & {'memory', 'console'} or trace:
-        entry['observer'] = dict(argv=hook + ['--observe', str(dest / 'job.json')], timeout_s=min(timeout, 7200), required=True)
+        entry['observer'] = dict(argv=hook + ['--observe', str(dest / 'job.json')], timeout_s=min(timeout, 7200),
+                                 finish_timeout_s=OBSERVER_FINISH_TIMEOUT_S, required=True)
         if 'memory' in probes:
             entry['observer']['cleanup'] = sampler_cleanup(job)
     if expected_pool is not None or 'image' in probes:
@@ -449,12 +510,13 @@ def parallel_safe(jobs, parallel):
             raise ValueError('parallel profile is published')
     for a, b in itertools.combinations(jobs, 2):
         ea, eb = a['entry'], b['entry']
-        if set(ea['gpus']) & set(eb['gpus']) or set(ea['sparks']) & set(eb['sparks']):
+        ra, rb = resolve_container_keys(ea), resolve_container_keys(eb)
+        if set(ea['gpus']) & set(eb['gpus']) or set(ra['sparks']) & set(rb['sparks']):
             raise ValueError('parallel cards overlap GPUs or Sparks')
-        for key in ('ADDR', 'EXPERT_PORT'):
-            if ea['set'].get(key) == eb['set'].get(key):
+        for key, field in (('ADDR', 'addr'), ('EXPERT_PORT', 'expert_port')):
+            if ra[field] == rb[field]:
                 raise ValueError('parallel cards overlap ' + key)
-        if ea['set']['INSTANCE'] == eb['set']['INSTANCE']:
+        if ra['instance'] == rb['instance']:
             raise ValueError('parallel cards need separate instances')
 
 
@@ -560,6 +622,20 @@ def resolve_binary(binary, arm, dry=False):
     return str(path)
 
 
+def panel_binary(binary, arms):
+    """The host cuteafd binary for panel queries: --binary, else cuteafd on PATH,
+    else the first arm's sealed slot binary."""
+    if binary:
+        return binary
+    found = shutil.which('cuteafd')
+    if found:
+        return found
+    for arm in (arms or {}).values():
+        if 'release' not in arm and slot_binary(arm).is_file():
+            return str(slot_binary(arm))
+    return 'cuteafd'
+
+
 def binary_supports(binary, repo, job, needs):
     """Asks the smoke binary itself (a CPU-only --dry-run of this job's matrix)
     whether it knows each needed entry field; an older binary would ignore them."""
@@ -606,7 +682,11 @@ def preflight_job(job, arm):
     values = job['entry']['set']
     needs = job.get('needs') or {'coordinator': [], 'spark': [], 'audio': False}
     artifacts, problems = {}, []
-    for host in ('raptor', *job['entry']['sparks']):
+    try:
+        container_targets(job)
+    except ValueError as error:
+        problems.append(str(error))
+    for host in ('raptor', *(h for h in job['entry']['sparks'] if isinstance(h, str) and h in HOSTS)):
         meta = json.loads(slot_check(arm, host))
         release = 'release' in arm
         keys = ('image', 'image_id', 'repo_digests') if release else ('slot', 'seal_sha256', 'artifact_manifest_sha256')
@@ -704,6 +784,16 @@ def smoke_command(binary, repo, job):
 # How long a signalled smoke may take to tear down before it is killed: above its
 # own 60 s bound, under hwlock.py's 80 s grace and systemd's 90 s TimeoutStopSec.
 SMOKE_STOP_GRACE_S = 75.0
+# Matches HookChild::spawn's default finish_timeout_s in rust/crates/cuteafd-bench/src/smoke.rs.
+OBSERVER_FINISH_TIMEOUT_S = 5
+
+
+def observer_teardown_budget(job):
+    """Total observer teardown budget, derived from and strictly shorter than finish_timeout_s."""
+    observer = (job.get('entry') or {}).get('observer') or {}
+    finish_timeout = float(observer.get('finish_timeout_s') or OBSERVER_FINISH_TIMEOUT_S)
+    margin = 1.5 if finish_timeout > 2.0 else finish_timeout * 0.3
+    return max(0.1, min(finish_timeout * 0.7, finish_timeout - margin))
 STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 # The first stop signal received, and the detached smoke process groups it reaches.
 STOP = dict(signal=None)
@@ -988,18 +1078,51 @@ def observe(job):
                         policy_sample_at = time.monotonic() + 1.
                 except (OSError, RuntimeError):
                     pass
-            time.sleep(.25)
+            if not stop.exists():
+                time.sleep(.25)
     finally:
-        if sampler:
-            run(sampler_cleanup(job))
-            sampler.wait(timeout=10)
+        teardown_start = time.monotonic()
+        finish_timeout_s = float(((job.get('entry') or {}).get('observer') or {}).get('finish_timeout_s') or OBSERVER_FINISH_TIMEOUT_S)
+        budget_s = observer_teardown_budget(job)
+        deadline = teardown_start + budget_s
+        phases = []
         stop.touch()
+        if sampler:
+            phase_start = time.monotonic()
+            cleanup_timeout = min(budget_s * 0.6, max(0.0, deadline - phase_start))
+            try:
+                run(sampler_cleanup(job), timeout=cleanup_timeout)
+                phases.append(dict(phase='sampler_cleanup', status='ok', elapsed_s=round(time.monotonic() - phase_start, 4)))
+            except subprocess.TimeoutExpired:
+                phases.append(dict(phase='sampler_cleanup', status='timeout', elapsed_s=round(time.monotonic() - phase_start, 4)))
+                print(f'wip-cards: observer sampler_cleanup timed out after {cleanup_timeout:.2f}s (hook cleanup will retry)', file=sys.stderr, flush=True)
+            phase_start = time.monotonic()
+            wait_timeout = min(budget_s * 0.25, max(0.0, deadline - phase_start))
+            try:
+                sampler.wait(timeout=wait_timeout)
+                phases.append(dict(phase='sampler_wait', status='ok', elapsed_s=round(time.monotonic() - phase_start, 4)))
+            except subprocess.TimeoutExpired:
+                phases.append(dict(phase='sampler_wait', status='timeout', elapsed_s=round(time.monotonic() - phase_start, 4)))
+                with contextlib.suppress(OSError):
+                    sampler.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                    sampler.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic())))
         if reader:
-            reader.join(timeout=3)
+            phase_start = time.monotonic()
+            join_timeout = max(0.0, deadline - phase_start)
+            reader.join(timeout=join_timeout)
+            phases.append(dict(phase='reader_join', status='timeout' if reader.is_alive() else 'ok',
+                               elapsed_s=round(time.monotonic() - phase_start, 4)))
         frames.close()
         policy.close()
         memory.close()
         console.close()
+        save(dest / 'observer-teardown.json', dict(
+            finish_timeout_s=finish_timeout_s,
+            budget_s=round(budget_s, 4),
+            elapsed_s=round(time.monotonic() - teardown_start, 4),
+            phases=phases,
+        ))
     if 'memory' in job['probes'] and not (dest / 'memory.jsonl').stat().st_size:
         raise ValueError('memory probe produced no samples')
     if 'console' in job['probes'] and not (dest / 'console.jsonl').stat().st_size:
@@ -1318,7 +1441,7 @@ def summarize_job(job, exit_code):
         if not row['fabric']:
             row['fabric'].extend(report.get('fabric') or [])
         present = {p['id'] for p in report.get('panels', [])} | ({'baseline'} if report.get('baseline') else set())
-        missing = set(requested_panels(job['entry'].get('profile', 'smoke'))) - present
+        missing = set(requested_panels(job['entry'].get('profile', 'smoke'), binary=job.get('binary'))) - present
         if missing:
             fail(row, 'requested panels absent from report: ' + ', '.join(sorted(missing)))
         baseline = report.get('baseline') or {}
@@ -1672,10 +1795,7 @@ def write_summary(state, rows, arms):
 
 
 def assert_absent(job):
-    e = job['entry']
-    targets = [('raptor', 'cuteafd-coordinator-' + e['set']['INSTANCE'])]
-    targets += [(h, f"cuteafd-spark-expert-{h}-{e['set']['EXPERT_PORT']}") for h in e['sparks']]
-    for host, name in targets:
+    for host, name in container_targets(job):
         cmd = ['docker', 'ps', '-a', '--format', '{{.Names}}']
         if host != 'raptor':
             cmd = ['ssh', '-o', 'BatchMode=yes', host, shlex.join(cmd)]
@@ -2443,7 +2563,7 @@ def main():
         if not selection and not (levels or prefill_lengths or args.probe):
             parser.error('--panels none runs nothing without --levels, --prefill-lengths or --probe')
         profile = 'panels:' + selection
-        listed = requested_panels(profile)
+        listed = requested_panels(profile, binary=panel_binary(args.binary, arms))
         for card in cards:
             card['profile'] = profile
             if (listed or not (levels or prefill_lengths)) and 'baseline' not in listed:
@@ -2451,7 +2571,7 @@ def main():
     lossless_set = None
     if args.lossless_set is not None:
         lossless_set = load_lossless_set(args.lossless_set)
-        if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke')) for card in cards):
+        if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms)) for card in cards):
             parser.error('--lossless-set needs --panels with spec_lossless_set')
     lossless_dump = None
     if args.dump_lossless_rows is not None:
@@ -2459,7 +2579,7 @@ def main():
             lossless_dump = parse_lossless_dump(args.dump_lossless_rows, lossless_set)
         except ValueError as error:
             parser.error(f'--dump-lossless-rows: {error}')
-        if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke')) for card in cards):
+        if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms)) for card in cards):
             parser.error('--dump-lossless-rows needs --panels with spec_lossless_set')
     for card in cards:
         if context_lengths is not None:
@@ -2496,7 +2616,7 @@ def main():
             probes[card['name']].add('console')
             if args.matched_prompts and 'image' in probes[card['name']]:
                 raise ValueError('--matched-prompts cannot precede its first benchmark request with an image probe')
-        requested_panels(card.get('profile', 'smoke'))
+        requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms))
         card['set'].update(overrides.get(card['name'], {}))
         values = {**config(card['config']), **card['set']}
         count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
@@ -2537,7 +2657,7 @@ def main():
     bindings = dict(item.split('=', 1) for item in args.card_arm)
     if bindings and (args.interleave or set(bindings) - set(args.cards) or set(bindings.values()) - set(arms)):
         raise ValueError('--card-arm needs selected cards/arms in matrix mode')
-    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None, [h for h in (args.cold_window or '').split(',') if h] or None) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
+    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None, [h for h in (args.cold_window or '').split(',') if h] or None, binary=panel_binary(args.binary, arms)) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
     variants = {(c['name'], n): {**c, 'set': {**c['set'], **arm_overrides.get(n, {}).get(c['name'], {})}} for c in cards for n in arms}
     for job in jobs:
         apply_arm_config(job, arm_config.get(job['arm'], {}), arm_unsets.get(job['arm'], set()))
@@ -2621,6 +2741,7 @@ def main():
         (['context_suffix'] if args.context_suffix is not None else []) + \
         (['worker_stop'] if any(job['entry']['set'].get('PROFILE_SPARK') for job in jobs) else [])
     for job in {j['launcher']['repo']: j for j in reversed(jobs)}.values():
+        requested_panels(job['entry'].get('profile', 'smoke'), binary=job['binary'])
         binary_supports(job['binary'], job['launcher']['repo'], job, fields)
     # Everything checkable without hardware, before any queue ticket.
     problems = []

@@ -73,7 +73,12 @@ BUILDS = Path.home() / '.cache/cuteafd/builds'
 # Real-checkpoint V4 placement tests: minutes each, need sparknest snapshots.
 LIVE_PLANNERS = ('families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4',
                  'families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4_missing_tp2_package')
-# Actual >60s IDs from the 081a00072 full gate, not the earlier estimated list.
+INSTALLED_PLANNERS = (
+    'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
+    'installed_example_deployments_publish_executable_prefill_shapes',
+    'installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers',
+)
+# Actual >60s IDs from the 081a00072 full gate, plus installed-checkpoint planners.
 FULL_TESTS = (
     'families::kimi_k3::admission::tests::installed_max_planner_and_runtime_remaining_kv_match_per_gpu',
     'plan::families::step5::tests::adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity',
@@ -89,7 +94,7 @@ FULL_TESTS = (
     'plan::families::kimi::tests::planner_resolves_every_spark_count_before_recipe_refusal',
     'plan::families::kimi::tests::direct_layout_uses_shared_host_mark_rule_and_preserves_overrides',
     'plan::tests::v41_32gib_counts_share_pool_and_local_layer_admission',
-    'installed_example_deployments_publish_executable_prefill_shapes',
+    *INSTALLED_PLANNERS,
 )
 SLOW_TESTS = (('cuteafd-hostcache', 'soak_has_no_leak_and_balances_the_counters'),
               ('cuteafd-hostcache', 'soak_in_bank_order_has_no_leak_and_balances_the_counters'),
@@ -107,6 +112,9 @@ PYTEST_FAIL = re.compile(r'^(?:FAILED|ERROR) (\S+)', re.M)
 BENCHES = (('cuteafd-core', 'draft_policy_bench', {'CUTEAFD_POLICY_BENCH_MAX_US': '1200'}),)
 BENCH_MEDIANS = re.compile(r'medians: (.*?)(?:, total|$)', re.M)
 BENCH_VALUE = re.compile(r'(\w+) ([\d.]+) us')
+CMAKE_LAUNCHER_ENV = re.compile(r'CMAKE_.*_COMPILER_LAUNCHER\Z')
+SCRUBBED_ENV_PREFIXES = ('CUTEAFD_KACHE', 'KACHE_', 'CUTEAFD_SCCACHE', 'SCCACHE_')
+SCRUBBED_ENV_NAMES = ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER')
 # Per-run scratch under head/ and base/, deleted on exit unless --keep.
 SCRATCH = ('tmp', 'target-cpu-gate', 'target-cpu-gate-release')
 SCRATCH_TOP = 10
@@ -379,19 +387,86 @@ def cargo_build_succeeded(path):
     return finished == [True] and not errors
 
 
+def _config_kv(path):
+    return dict(line.split('=', 1) for line in path.read_text().splitlines() if '=' in line)
+
+
+def _snapshot_installed(hf_home, model_id, revision=None):
+    if hf_home is None or not hf_home.is_dir():
+        return False
+    snapshots = hf_home / 'hub' / f"models--{model_id.replace('/', '--')}" / 'snapshots'
+    if not snapshots.is_dir():
+        return False
+    return (snapshots / revision).is_dir() if revision else any(snapshots.iterdir())
+
+
+def _programs_installed(env):
+    override = env.get('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS')
+    if override is not None:
+        return bool(override) and Path(override).exists()
+    home = Path(env.get('HOME') or Path.home())
+    return any(path.exists() for path in (
+        Path('/opt/cuteafd/share/PROGRAMS.json'),
+        home / '.local/share/cuteafd/PROGRAMS.json',
+        home / '.cache/cuteafd/builds/v3-p4/c1/artifacts/PROGRAMS.json',
+    ))
+
+
+def installed_planner_skips(source, env):
+    """Installed-checkpoint tests in budget_cli.rs whose required HF_HOME, PROGRAMS.json
+    or checkpoint snapshots are absent."""
+    root = source if (source / 'examples/configs').is_dir() else REPO
+    raw_hf = env.get('CUTEAFD_DEPLOYMENT_TEST_HF_HOME')
+    hf_home = Path(raw_hf) if raw_hf else None
+    has_programs = _programs_installed(env)
+    skipped = []
+    exlr8_configs = [_config_kv(root / f'examples/configs/glm53-exlr8-{name}.config') for name in ('min', 'max')]
+    if not has_programs or not all(_snapshot_installed(hf_home, cfg['MODEL_ID'], cfg.get('MODEL_REVISION'))
+                                   for cfg in exlr8_configs):
+        skipped.append('installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget')
+    example_configs = [_config_kv(path) for path in sorted((root / 'examples/configs').glob('*.config'))]
+    if not has_programs or not example_configs or not all(
+            _snapshot_installed(hf_home, cfg['MODEL_ID'], cfg.get('MODEL_REVISION')) for cfg in example_configs):
+        skipped.append('installed_example_deployments_publish_executable_prefill_shapes')
+    matrix = json.loads((root / 'scripts/bench/release-smoke-v4.json').read_text()).get('entries', [])
+    matrix_configs = []
+    for entry in matrix:
+        cfg = _config_kv(root / entry['config'])
+        for key, value in (entry.get('set') or {}).items():
+            if isinstance(value, str):
+                cfg[key] = value
+        matrix_configs.append(cfg)
+    if not matrix_configs or not all(
+            _snapshot_installed(hf_home, cfg['MODEL_ID'], cfg.get('MODEL_REVISION')) for cfg in matrix_configs):
+        skipped.append('installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers')
+    return skipped
+
+
+def scrub_compiler_cache_env(env):
+    """Remove inherited compiler-launcher and cache variables so Cargo and script suites
+    never share read-only kache outputs or inherit ambient launcher overrides."""
+    cleaned = dict(env)
+    scrubbed = sorted(key for key in list(cleaned)
+                      if key in SCRUBBED_ENV_NAMES or key.startswith(SCRUBBED_ENV_PREFIXES)
+                      or CMAKE_LAUNCHER_ENV.fullmatch(key))
+    for key in scrubbed:
+        cleaned.pop(key, None)
+    return cleaned, scrubbed
+
+
 def cargo(source, root, args, env):
     target = root / 'target-cpu-gate'
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
+    env, scrubbed_env = scrub_compiler_cache_env(env)
     env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': str(getattr(args, 'cargo_jobs', 16)),
            'RUST_TEST_THREADS': str(getattr(args, 'cargo_jobs', 16))}
-    for key in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'):
-        env.pop(key, None)  # Plain rustc: never share a target with kache's read-only outputs.
     log('cargo: compiling tests (build slot held while compiling)')
     build_log = root / 'logs/cargo-build.log'
     code, build_s = run_logged(['nice', '-n', '19', str(source / 'scripts/build/build-slot.sh'), 'cargo', 'test', '--workspace', '--locked',
                                 '--no-run', '--message-format=json-render-diagnostics'], build_log, env, source / 'rust', args.cargo_build_timeout)
     complete = cargo_build_succeeded(build_log)
-    result = dict(suite='cargo', build_exit=code, build_complete=complete, build_s=round(build_s), build_log=str(build_log))
+    result = dict(suite='cargo', build_exit=code, build_complete=complete, build_s=round(build_s), build_log=str(build_log),
+                  scrubbed_env=scrubbed_env)
     if code or not complete:
         tail = [line for line in build_log.read_text(errors='replace').splitlines() if line.startswith('error')][:5]
         return {**result, 'status': 'failed', 'error': 'compile failed: ' + ('; '.join(tail) or
@@ -402,6 +477,8 @@ def cargo(source, root, args, env):
                        env.get('HF_HOME') or str(Path(env.get('HOME', str(Path.home()))) / '.cache/huggingface'))
     skipped_full = [] if full else list(FULL_TESTS)
     skipped_live = list(LIVE_PLANNERS) if args.skip_live_planners else []
+    if full:
+        skipped_live.extend(list(INSTALLED_PLANNERS) if args.skip_live_planners else installed_planner_skips(source, env))
     skipped = skipped_full + skipped_live
     skips = [flag for name in skipped for flag in ('--skip', name)]
     test_args = ['nice', '-n', '19', 'cargo', 'test', '--workspace', '--locked', '--no-fail-fast', '--', *skips]
@@ -501,10 +578,9 @@ def benches(source, root, args, env):
     """Release-mode bound checks: each bench passes only when its test ran and passed."""
     target = root / 'target-cpu-gate-release'
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
+    env, scrubbed_env = scrub_compiler_cache_env(env)
     env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': str(getattr(args, 'cargo_jobs', 16))}
-    for key in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'):
-        env.pop(key, None)
-    result = dict(suite='benches', passed=0, failed=0, failing=[], medians={}, logs=[])
+    result = dict(suite='benches', passed=0, failed=0, failing=[], medians={}, logs=[], scrubbed_env=scrubbed_env)
     build_s = test_s = 0.
     for crate, test, bounds in BENCHES:
         log(f'benches: compiling {crate}/{test} (release, build slot held while compiling)')
@@ -545,6 +621,7 @@ def benches(source, root, args, env):
 
 
 def scripts(source, root, args, env):
+    env, scrubbed_env = scrub_compiler_cache_env(env)
     python = python_for(source)
     test_log = root / 'logs/pytest.log'
     log(f"scripts: pytest ({python}, {getattr(args, 'pytest_jobs', 16)} workers)")
@@ -558,7 +635,8 @@ def scripts(source, root, args, env):
     ids = sorted(set(PYTEST_FAIL.findall(text)))
     result = dict(suite='scripts', exit=code, test_s=round(seconds), log=str(test_log), python=str(python),
                   passed=counts.get('passed', 0), failed=counts.get('failed', 0) + counts.get('error', 0) + counts.get('errors', 0),
-                  skipped=counts.get('skipped', 0), failing=ids, summary=summary[-1] if summary else None)
+                  skipped=counts.get('skipped', 0), failing=ids, summary=summary[-1] if summary else None,
+                  scrubbed_env=scrubbed_env)
     if code == 124:
         result.update(status='failed', error=f'timed out after {args.scripts_timeout} s')
     elif not summary or result['passed'] == 0:
@@ -575,7 +653,7 @@ def gate(source, root, args, owned=False):
     # Record the gated commit before running: a checkout that moves during the
     # gate would otherwise be credited with tests that ran against older source.
     head = checked(['git', '-C', str(source), 'rev-parse', 'HEAD']).strip()
-    env = {**os.environ, 'TMPDIR': str(root / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'}
+    env, scrubbed_env = scrub_compiler_cache_env({**os.environ, 'TMPDIR': str(root / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'})
     requested = [fn for enabled, fn in ((args.cargo, cargo), (args.scripts, scripts),
                                          (args.benches, benches)) if enabled]
     # Cargo and its release benches share compiler resources; only pytest overlaps them.
@@ -587,13 +665,15 @@ def gate(source, root, args, owned=False):
         suites = rust.result()
         if python is not None:
             suites.append(python.result())
+    for suite in suites:
+        suite['scrubbed_env'] = sorted(set(suite.get('scrubbed_env', [])) | set(scrubbed_env))
     suites.sort(key=lambda suite: ('cargo', 'scripts', 'benches').index(suite['suite']))
     scratch = scratch_usage(root / 'tmp')
     moved = checked(['git', '-C', str(source), 'rev-parse', 'HEAD']).strip() != head
     dirty = bool(checked(['git', '-C', str(source), 'status', '--porcelain', '--untracked-files=no']).strip())
     passed = suites and all(s['status'] == 'pass' for s in suites) and not moved
     return dict(source=str(source), head=head, dirty=dirty, moved=moved, suites=suites, scratch=scratch,
-                status='pass' if passed else 'failed')
+                scrubbed_env=scrubbed_env, status='pass' if passed else 'failed')
 
 
 def render(record):

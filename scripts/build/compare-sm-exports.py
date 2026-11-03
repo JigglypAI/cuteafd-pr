@@ -24,7 +24,32 @@ import subprocess
 import sys
 import time
 
-ROOT = Path(os.environ.get("CUTEAFD_SOURCE_ROOT", Path(__file__).resolve().parents[2])).resolve()
+def _gitdir_from_file(dot_git: Path) -> Path | None:
+    if not dot_git.is_file():
+        return None
+    for line in dot_git.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("gitdir:"):
+            return (dot_git.parent / line.partition(":")[2].strip()).resolve()
+    return None
+
+
+def resolve_source_root(path: Path | str | None = None, env=os.environ) -> Path:
+    if path is None and env.get("CUTEAFD_SOURCE_ROOT"):
+        return Path(env["CUTEAFD_SOURCE_ROOT"]).expanduser().resolve()
+    root = Path(path or Path(__file__).resolve().parents[2]).expanduser().resolve()
+    gitdir = _gitdir_from_file(root / ".git")
+    if gitdir is not None and (gitdir / "gitdir").is_file():
+        worktree_git = (gitdir / (gitdir / "gitdir").read_text(encoding="utf-8").strip()).resolve()
+        if worktree_git.parent.is_dir():
+            return worktree_git.parent
+    if path is None and env.get("CUTEAFD_SPARKINFER_SOURCE_DIR"):
+        sparkinfer = Path(env["CUTEAFD_SPARKINFER_SOURCE_DIR"]).expanduser().resolve()
+        if sparkinfer.name == "sparkinfer" and sparkinfer.parent.name == "third_party" and sparkinfer.parents[1].is_dir():
+            return sparkinfer.parents[1]
+    return root
+
+
+ROOT = resolve_source_root()
 GEOMETRIES = ("flash", "pro", "flash2", "pro2", "glm", "glm2", "glmf", "glmf2",
               "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "step5", "step52")
 CAPACITIES = "1,16,80,256,1024,4096"
@@ -893,7 +918,7 @@ def main():
     if args.workers < 1 or args.timeout < 1:
         parser.error("--workers and --timeout must be positive")
     reports = []
-    baseline_source = args.baseline_source.expanduser().resolve() if args.baseline_source else None
+    baseline_source = resolve_source_root(args.baseline_source) if args.baseline_source else None
     if baseline_source and not (baseline_source / "third_party/sparkinfer.lock.json").is_file():
         parser.error("--baseline-source must be an engine checkout with a pinned SparkInfer tree")
 
