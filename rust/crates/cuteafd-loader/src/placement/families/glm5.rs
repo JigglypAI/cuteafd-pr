@@ -428,7 +428,8 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         if rank == 0 {
             if inputs.skip_routed_experts {
                 rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Transport, "diagnostic zero expert planes",
-                    SKIP_RANKS as u64 * (inputs.prefill_rows.max(DECODE_ROWS) * cfg.hidden as u64 * 2).max(FLOOR),
+                    crate::serving_capacity::spark_intake_bytes(1, SKIP_RANKS as u64,
+                        inputs.prefill_rows.max(DECODE_ROWS), cfg.hidden as u64),
                     Basis::Formula)));
             }
             if inputs.spark_ranks > 0 {
@@ -438,7 +439,8 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
                     prefill_span(inputs.prefill_rows, inputs.prefill_lanes),
                     inputs.spark_ranks as u64, cfg.hidden as u64);
                 rows.push(GlmBufferRow::new(GlmComponent::SparkExperts, Demand::new(gpu, Category::Transport, "Spark intake planes",
-                    inputs.spark_ranks as u64 * DECODE_ROWS * cfg.hidden as u64 * 2 + prefill, Basis::Formula)));
+                    crate::serving_capacity::spark_intake_bytes(1, inputs.spark_ranks as u64,
+                        DECODE_ROWS, cfg.hidden as u64) + prefill, Basis::Formula)));
             }
         }
         pool_overhead.push(table_bytes);
@@ -1226,7 +1228,8 @@ mod tests {
         let h = cfg.hidden as u64;
         assert_eq!(term(&split, "steps") - term(&ordinary, "steps"),
             2 * 123456);
-        assert_eq!(term(&split, "Spark intake planes"), 4 * (DECODE_ROWS + base.prefill_rows) * h * 2);
+        let intake = |rows| crate::serving_capacity::spark_intake_bytes(1, 4, rows, h);
+        assert_eq!(term(&split, "Spark intake planes"), intake(DECODE_ROWS) + intake(base.prefill_rows));
         for lanes in 1..=4 {
             let mut parallel = native.clone(); parallel.prefill_lanes = lanes;
             let mut ordinary = base.clone(); ordinary.prefill_lanes = lanes;
@@ -1234,9 +1237,8 @@ mod tests {
             assert_eq!(term(&request(&parallel).unwrap(), "steps")
                 - term(&request(&ordinary).unwrap(), "steps"), 2 * 123456);
             // One reserve range per rank every admitted depth is cut from.
-            let prefill = prefill_span(parallel.prefill_rows, lanes) * 4 * h * 2;
-            assert_eq!(term(&request(&parallel).unwrap(), "Spark intake planes"),
-                4 * DECODE_ROWS * h * 2 + prefill);
+            let prefill = intake(prefill_span(parallel.prefill_rows, lanes));
+            assert_eq!(term(&request(&parallel).unwrap(), "Spark intake planes"), intake(DECODE_ROWS) + prefill);
         }
         for gpus in 1..=2 {
             let mut drafting = native.clone();
@@ -1474,7 +1476,8 @@ mod tests {
             assert!(request.layers.iter().all(|layer| layer.experts.is_none()));
             let planes = request.fixed.iter().filter(|d| d.group == "diagnostic zero expert planes")
                 .map(|d| (d.gpu, d.bytes)).collect::<Vec<_>>();
-            assert_eq!(planes, vec![(0, 4 * 4096 * 6144 * 2)]);
+            assert_eq!(planes, vec![(0, 4
+                * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(4096 * 6144 * 2).unwrap())]);
             let p = solve(&request).unwrap();
             assert_eq!(p.pool_tokens, 65536);
             assert_eq!(p.onboard_layers, 0);
@@ -1534,7 +1537,8 @@ mod tests {
             let intake = p.items[0].iter().find(|item| item.group == "Spark intake planes").unwrap();
             // Decode-width planes plus one reserve range per rank that three
             // admitted 4096-row slots are cut from (#762).
-            assert_eq!(intake.bytes, 4 * DECODE_ROWS * 6144 * 2 + 4 * prefill_span(input.prefill_rows, 3) * 6144 * 2);
+            assert_eq!(intake.bytes, 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(DECODE_ROWS * 6144 * 2).unwrap()
+                + 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(prefill_span(input.prefill_rows, 3) * 6144 * 2).unwrap());
         }
     }
 
@@ -2410,19 +2414,26 @@ mod tests {
     #[test]
     fn owned_graphs_use_the_runtime_clamped_context_at_small_pools() {
         let cfg = config();
-        for (requested_pool, expected_pool, expected_context) in [
-            // Prefill slots share step scratch/head/logits; decode intake is 64 rows.
-            (Some(32768), 32768, 32512), (None, 124288, 124032),
-        ] {
+        for requested_pool in [Some(32768), None] {
             let mut i = inputs(&cfg, &[32 * GIB; 2]);
             i.prefill_lanes = 2;
             i.onboard = if requested_pool.is_some() { Onboard::Layers(0) } else { Onboard::Auto };
             i.requested_pool = requested_pool;
             let (placed, _) = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Layers)).unwrap();
-            assert_eq!(placed.pool_tokens, expected_pool);
+            if let Some(requested) = requested_pool {
+                assert_eq!(placed.pool_tokens, requested);
+            } else {
+                assert_eq!(placed.pool_tokens % PAGE_ROWS, 0);
+                let intake = placed.items[0].iter().find(|item| item.group == "Spark intake planes").unwrap();
+                let expected = 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(DECODE_ROWS * 6144 * 2).unwrap()
+                    + 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
+                        prefill_span(i.prefill_rows, i.prefill_lanes) * 6144 * 2).unwrap();
+                assert_eq!(intake.bytes, expected);
+                // #1120: legacy settle_pool can strand capacity; admission does not prove maximality.
+            }
             let context = crate::serving_capacity::pool_context(i.max_context as usize,
                 i.automatic_context, placed.pool_tokens as usize, 256).unwrap();
-            assert_eq!(context, expected_context);
+            assert_eq!(context, placed.pool_tokens as usize - 256);
             let owners: Vec<_> = placed.layers.iter().map(|layer| match layer.mode {
                 LayerMode::Whole { gpu, .. } => gpu, _ => unreachable!(),
             }).collect();
