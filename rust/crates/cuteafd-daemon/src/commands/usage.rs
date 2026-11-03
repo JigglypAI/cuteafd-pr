@@ -259,9 +259,16 @@ mod tests {
             out: Some(out.clone()) }).unwrap();
         let text = std::fs::read_to_string(out).unwrap();
         let mut lines = text.lines();
-        let column = lines.next().unwrap().split(',').position(|c| c == "finish_detail").unwrap();
-        assert_eq!(lines.next().unwrap().split(',').nth(column), Some(""));
-        assert_eq!(lines.next().unwrap().split(',').nth(column), Some("repetition"));
+        let columns = lines.next().unwrap().split(',').collect::<Vec<_>>();
+        let rid = columns.iter().position(|c| *c == "rid").unwrap();
+        let detail = columns.iter().position(|c| *c == "finish_detail").unwrap();
+        let rows = lines.map(|line| {
+            let fields = line.split(',').collect::<Vec<_>>();
+            (fields[rid], fields[detail])
+        }).collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.get("normal"), Some(&""));
+        assert_eq!(rows.get("looped"), Some(&"repetition"));
     }
 
     #[test]
