@@ -29,6 +29,25 @@ pub(crate) struct Rect {
 }
 
 impl Rect {
+    /// Header-only source selection; never opens the tensor payload.
+    pub fn tensor(checkpoint: &cuteafd_loader::plan::Checkpoint, name: &str,
+        rows: Option<Range<usize>>, cols: Option<Range<usize>>) -> Result<Self> {
+        let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
+            .map_err(|_| anyhow::anyhow!("checkpoint lacks {name}"))?;
+        let tensor = &checkpoint.tensors[at];
+        ensure!(checkpoint.weight_map.get(name) == Some(&tensor.shard),
+            "tensor header differs from checkpoint index: {name}");
+        let total = if tensor.meta.shape.len() >= 2 { tensor.meta.shape[0] } else { 1 };
+        let bytes = usize::try_from(tensor.meta.byte_length)?;
+        ensure!(total > 0 && bytes % total == 0, "{name}: invalid tensor row extent");
+        let row_bytes = bytes / total;
+        let (rows, cols) = (rows.unwrap_or(0..total), cols.unwrap_or(0..row_bytes));
+        ensure!(!rows.is_empty() && !cols.is_empty() && rows.end <= total && cols.end <= row_bytes,
+            "{name}: rectangle outside the tensor");
+        Ok(Self { name: name.into(), path: checkpoint.snapshot.join(&tensor.shard),
+            base: tensor.meta.byte_offset, row_bytes, rows, cols })
+    }
+
     pub fn width(&self) -> usize { self.cols.len() }
     pub fn bytes(&self) -> usize { self.rows.len() * self.cols.len() }
 

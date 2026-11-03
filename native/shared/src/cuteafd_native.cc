@@ -5574,15 +5574,6 @@ extern "C" cuteafd_status_t cuteafd_cuda_linear_bf16_cublas_async(
               "CUDA BF16 cuBLAS linear projection kernel is unavailable in this build");
 }
 
-extern "C" cuteafd_status_t
-cuteafd_cuda_linear_bf16_m1_parity_batched_cublaslt_async(
-    const uint16_t*, const uint16_t*, uint16_t*, size_t, size_t, size_t,
-    void*) {
-  return fail(
-      CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-      "CUDA BF16 parity-batched cuBLASLt projection kernel is unavailable in this build");
-}
-
 extern "C" cuteafd_status_t cuteafd_cuda_quantize_bf16_w8a16_group256_async(
     const uint16_t*, int8_t*, float*, size_t, size_t, int, void*) {
   return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,

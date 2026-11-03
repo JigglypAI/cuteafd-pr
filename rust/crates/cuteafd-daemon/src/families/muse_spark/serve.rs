@@ -251,7 +251,7 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
     // The drafter beside the target head, on the head rank's stream (admission charged it there).
     let head_stream = *streams.last().context("Muse head stream")?;
     let draft = match (args.draft.as_deref(), &built.drafter) {
-        (Some(snapshot), Some(admitted)) => Some(super::draft::MuseDraft::load(&cfg, ranks.last().context("Muse head rank")?,
+        (Some(snapshot), Some(admitted)) => Some(super::draft::MuseDraft::load(programs.last().context("Muse head programs")?, &cfg, ranks.last().context("Muse head rank")?,
             head_stream, snapshot, &embedding, admitted, args.draft_kv_cache)?),
         (None, None) => None,
         _ => anyhow::bail!("Muse drafter admission differs from --draft"),
