@@ -2958,6 +2958,3 @@ def test_observer_slow_cleanup_exits_within_hook_wait_and_preserves_failures(ent
     monkeypatch.setattr(cards.subprocess, 'Popen', lambda cmd, **kw: SlowSampler(kw['stdout']))
     with pytest.raises(ValueError, match='memory probe produced no samples'):
         cards.observe(job)
-
-
-

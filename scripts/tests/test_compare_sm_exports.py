@@ -1140,4 +1140,3 @@ def test_default_source_root_resolves_worktree_alias_and_preserves_override(tmp_
     override.mkdir()
     assert compare_sm.resolve_source_root(alias, env={"CUTEAFD_SOURCE_ROOT": str(override)}) == real_wt.resolve()
     assert compare_sm.resolve_source_root(env={"CUTEAFD_SOURCE_ROOT": str(override)}) == override.resolve()
-

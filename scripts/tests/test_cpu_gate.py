@@ -666,4 +666,3 @@ def test_gate_scrubs_inherited_compiler_cache_env_and_records_names(tmp_path, mo
         assert env.get('KEEP_PLAIN_VAR') == 'kept'
         for key in expected_scrubbed:
             assert key not in env
-
