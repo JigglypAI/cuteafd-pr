@@ -5,7 +5,18 @@ use serde_json::Value;
 
 pub const MAX_TOKENS: u64 = 4096;
 
+/// Public vision and audio features use the text embedding's weightless RMSNorm.
+pub fn feature_norm_eps(cfg: &Value) -> Result<f32, String> {
+    let epsilon = cfg["text_config"]["rms_norm_eps"].as_f64()
+        .ok_or("Muse text_config.rms_norm_eps must be explicitly declared")? as f32;
+    if !epsilon.is_finite() || epsilon <= 0.0 {
+        return Err("Muse text_config.rms_norm_eps must be positive finite FP32".into());
+    }
+    Ok(epsilon)
+}
+
 pub fn validate_config(cfg: &Value) -> Result<Vec<u32>, String> {
+    feature_norm_eps(cfg)?;
     let v = &cfg["vision_config"];
     for (field, expected) in [("hidden_size",1536), ("intermediate_size",8960),
         ("num_attention_heads",16), ("num_hidden_layers",50), ("patch_size",14),
@@ -95,13 +106,26 @@ pub fn scratch_bytes(tokens: u64) -> Result<u64, String> {
 mod tests {
     use super::*;
     fn config() -> Value {
-        serde_json::json!({"text_config":{"hidden_size":8192}, "out_hidden_size":6144,
+        serde_json::json!({"text_config":{"hidden_size":8192,"rms_norm_eps":1e-5}, "out_hidden_size":6144,
             "projector_hidden_size":4096, "projector_hidden_act":"gelu", "vision_config":{
             "hidden_size":1536, "intermediate_size":8960, "num_attention_heads":16,
             "num_hidden_layers":50, "patch_size":14, "patch_temporal":2, "merge_size":2,
             "pos_emb_height":32, "pos_emb_width":32, "hidden_act":"gelu", "layer_norm_eps":1e-5,
             "rope_parameters":{"rope_type":"axial", "rope_theta":10000.0},
             "layer_types":vec!["window_attention";50]}})
+    }
+    #[test]
+    fn public_feature_epsilon_is_declared_and_finite() {
+        let mut cfg = config();
+        assert_eq!(feature_norm_eps(&cfg).unwrap(), 1e-5f32);
+        cfg["text_config"]["rms_norm_eps"] = serde_json::json!(2e-4);
+        assert_eq!(feature_norm_eps(&cfg).unwrap(), 2e-4f32);
+        for value in [Value::Null, serde_json::json!(0), serde_json::json!(-1),
+            serde_json::json!(1e100), serde_json::json!(1e-100)] {
+            cfg["text_config"]["rms_norm_eps"] = value;
+            assert!(feature_norm_eps(&cfg).is_err());
+            assert!(validate_config(&cfg).is_err());
+        }
     }
     #[test]
     fn header_native_weights_refuse_missing_extra_or_converted_tensors() {

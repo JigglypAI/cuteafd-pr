@@ -46,6 +46,13 @@ def read_visual(snapshot):
     return tensors
 
 
+def feature_norm_eps(cfg):
+    epsilon = float(cfg["text_config"]["rms_norm_eps"])
+    if not np.isfinite(epsilon) or epsilon <= 0 or not np.isfinite(np.float32(epsilon)) or np.float32(epsilon) <= 0:
+        raise ValueError("positive finite checkpoint text RMS epsilon required")
+    return epsilon
+
+
 def pack_spec(cfg, tensors, max_tokens=4096):
     vision = cfg["vision_config"]
     for name, want in dict(hidden_size=1536, intermediate_size=8960, num_attention_heads=16,
@@ -57,7 +64,8 @@ def pack_spec(cfg, tensors, max_tokens=4096):
         raise ValueError("unsupported Muse LM width/capacity")
     spec = Spec(abi_version=2, reserved=5, max_tokens=max_tokens, output_width=8192,
                 hidden=1536, depth=50, heads=16, kv_heads=16, head_dim=96,
-                intermediate=8960, patch_size=14, merger_width=6144, norm_eps=1e-5)
+                intermediate=8960, patch_size=14, merger_width=6144,
+                norm_eps=feature_norm_eps(cfg))
     for name in ("patch_bias", "merger_fc1_bias", "merger_fc2_bias"):
         setattr(spec, name, common.NO_OFFSET)
     spec.merger_extra[:] = [common.NO_OFFSET] * 8
@@ -149,6 +157,23 @@ def official_modules(snapshot, tensors, device):
     tower.rotary_emb.inv_freq = inv
     tower.rotary_emb.original_inv_freq = inv.clone()
     return tower, adapter, projection
+
+
+def official_features(modules, rgb, cfg):
+    """Public image output boundary, not the adapter's raw projection."""
+    import torch
+    from types import SimpleNamespace
+    from transformers.models.muse_spark.modeling_muse_spark import MuseSparkModel, MuseSparkRMSNorm
+    tower, adapter, projection = modules
+    parameter = next(tower.parameters())
+    owner = SimpleNamespace(vision_tower=tower, vision_adapter=adapter, vision_projection=projection,
+        perception_emb_norm=MuseSparkRMSNorm(eps=feature_norm_eps(cfg), with_scale=False),
+        config=SimpleNamespace(vision_config=SimpleNamespace(merge_size=cfg["vision_config"]["merge_size"])))
+    grid = torch.tensor([[1, rgb.shape[0] // 14, rgb.shape[1] // 14]], device=parameter.device)
+    inputs = torch.from_numpy(patches(rgb)).to(parameter.device, parameter.dtype)
+    with torch.inference_mode():
+        result = MuseSparkModel.get_image_features(owner, inputs, grid, return_dict=True)
+    return torch.cat(result.pooler_output).float().cpu().numpy()
 
 
 def reference_precision(modules, dtype, official_rope):
@@ -359,7 +384,9 @@ def run(args):
             elapsed = (time.perf_counter() - start) * 1000
             if errors:
                 raise RuntimeError(errors)
-            stages["56"] = (output.astype(np.uint32) << 16).view(np.float32)
+            features = (output.astype(np.uint32) << 16).view(np.float32)
+            bf16_features = official_features(modules, rgb, cfg)
+            public_features = dict(strict_bf16=common.metrics(features, bf16_features))
             metadata = {native: bool(np.array_equal(stages[native], refs[official]))
                         for native, official in [("-1", "patch_input"), ("-2", "cos"), ("-3", "sin")]}
             comparisons = {key: common.metrics(value, refs[key]) for key, value in stages.items() if int(key) >= 0}
@@ -395,6 +422,8 @@ def run(args):
                 reference_precision(modules, torch.float32, official_rope)
                 result["precision"]["official_fp32_rope"] = rope_dtypes(modules)
                 fp32_refs = reference_stages(modules, rgb)
+                fp32_features = official_features(modules, rgb, cfg)
+                public_features["fp32_yardstick"] = stage_metrics(features, bf16_features, fp32_features)
                 yardstick = {key: stage_metrics(stages[key], refs[key], fp32_refs[key])
                     for key in comparisons}
                 if args.replay_tail:
@@ -405,7 +434,7 @@ def run(args):
                     for name, original in zip(("inv_freq", "original_inv_freq"), official_rope)):
                     raise AssertionError("official BF16 RoPE buffers were not restored unchanged")
             result["images"][str(path)] = dict(grid=[gh, gw], tokens=tokens, encode_ms=elapsed,
-                stages=comparisons, metadata_exact=metadata, block_replay=replay,
+                stages=comparisons, public_features=public_features, metadata_exact=metadata, block_replay=replay,
                 fp32_yardstick=yardstick, tail_replay=tail_replay,
                 byte_repeatable=repeat, output_sha256=hashlib.sha256(output.tobytes()).hexdigest())
             if args.dump_stages:
@@ -421,6 +450,9 @@ def run(args):
             for row in result["images"].values())
         result["fp32_yardstick_pass"] = integrity and all(all(stage["passed"]
             for stage in row["fp32_yardstick"].values()) for row in result["images"].values()) if args.fp32_yardstick else None
+        result["pass"] &= all(row["public_features"]["strict_bf16"]["pass"] for row in result["images"].values())
+        if args.fp32_yardstick:
+            result["fp32_yardstick_pass"] &= all(row["public_features"]["fp32_yardstick"]["passed"] for row in result["images"].values())
         result["gate_basis"] = "fp32_yardstick" if args.fp32_yardstick else "strict_bf16"
         result["gate_pass"] = result["fp32_yardstick_pass"] if args.fp32_yardstick else result["pass"]
         args.output.write_text(json.dumps(result, indent=2) + "\n")

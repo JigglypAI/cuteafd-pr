@@ -30,7 +30,8 @@ impl TowerSpec {
         };
         let mut native = VisionSpec { abi_version:2, reserved:5, max_tokens:max_tokens as u32,
             output_width:8192, hidden:1536, depth:50, heads:16, kv_heads:16, head_dim:96,
-            intermediate:8960, patch_size:14, merger_width:6144, norm_eps:1e-5,
+            intermediate:8960, patch_size:14, merger_width:6144, norm_eps:cuteafd_loader::media::muse_vision::feature_norm_eps(&cfg)
+                .map_err(VisionError::Unsupported)?,
             patch_bias:NO_VISION_OFFSET, merger_fc1_bias:NO_VISION_OFFSET,
             merger_fc2_bias:NO_VISION_OFFSET, merger_extra:[NO_VISION_OFFSET;8],
             ..Default::default() }.with_depth(50);

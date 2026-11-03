@@ -25,6 +25,7 @@ fn align(n: u64) -> u64 {
 #[derive(Clone, Debug)]
 pub struct PcmAudioPlan {
     weight_bytes: u64,
+    feature_norm_eps: f32,
     reads: BTreeMap<String, AudioTensorRead>,
     pub audio_token: u32,
 }
@@ -52,16 +53,18 @@ impl PcmAudioPlan {
     pub fn weight_bytes(&self) -> u64 {
         self.weight_bytes
     }
+    pub fn feature_norm_eps(&self) -> f32 { self.feature_norm_eps }
     pub fn reads(&self) -> &BTreeMap<String, AudioTensorRead> {
         &self.reads
     }
     pub fn encoder_id(&self, revision: &str, sm: u32) -> super::EncoderId {
-        let headers = self.reads.iter().map(|(name, read)| {
+        let mut headers: BTreeMap<String, serde_json::Value> = self.reads.iter().map(|(name, read)| {
             let m = &read.metadata;
             (name.clone(), serde_json::json!({"dtype":"BF16", "shape":m.shape,
                 "offset":m.byte_offset, "length":m.byte_length}))
         }).collect();
-        super::EncoderId::derive("muse_spark_pcm_bf16", revision, &headers, 1, sm)
+        headers.insert("feature_norm_eps".into(), serde_json::json!(self.feature_norm_eps.to_bits()));
+        super::EncoderId::derive("muse_spark_pcm_bf16", revision, &headers, 2, sm)
     }
     pub fn required_bytes(&self, samples: usize) -> Result<u64> {
         self.weight_bytes
@@ -116,6 +119,7 @@ impl PcmAudioPlan {
         }
         let mut result = Self {
             weight_bytes: 0,
+            feature_norm_eps: super::muse_vision::feature_norm_eps(&root).map_err(unsupported)?,
             reads: BTreeMap::new(),
             audio_token: root["audio_token_id"].as_u64().unwrap() as u32,
         };
@@ -187,6 +191,7 @@ fn validate_tensor(m: &SafetensorsTensorMetadata, shape: &[usize]) -> Result<()>
     Ok(())
 }
 fn validate_config(root: &serde_json::Value, processor: &serde_json::Value) -> Result<()> {
+    super::muse_vision::feature_norm_eps(root).map_err(unsupported)?;
     let a = &root["audio_config"];
     let p = &processor["feature_extractor"];
     if root["model_type"] != "muse_spark"
@@ -274,7 +279,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let config = serde_json::json!({"model_type":"muse_spark", "audio_token_id":200038,
-            "text_config":{"hidden_size":8192}, "audio_config":{
+            "text_config":{"hidden_size":8192,"rms_norm_eps":1e-5}, "audio_config":{
                 "model_type":"muse_spark_audio", "hidden_sizes":WIDTHS, "patch_sizes":PATCHES,
                 "depths":[2,2,2,2], "num_hidden_layers":4, "conv_kernel_size":7,
                 "mlp_ratio":4, "rms_norm_eps":1e-6, "hidden_act":"gelu", "out_hidden_size":8192}});
@@ -310,6 +315,15 @@ mod tests {
         assert_ne!(identity, plan.encoder_id("different-revision", 121));
         assert_ne!(identity, plan.encoder_id("snapshot-revision", 120));
         assert!(matches!(plan.read_weights(plan.weight_bytes()-1), Err(AudioTowerError::Admission { .. })));
+        let mut changed_epsilon = config.clone();
+        changed_epsilon["text_config"]["rms_norm_eps"] = serde_json::json!(2e-4);
+        std::fs::write(root.join("config.json"), changed_epsilon.to_string()).unwrap();
+        let changed = PcmAudioPlan::from_snapshot(root).unwrap();
+        assert_eq!(changed.feature_norm_eps(), 2e-4f32);
+        assert_ne!(identity, changed.encoder_id("snapshot-revision", 121));
+        changed_epsilon["text_config"]["rms_norm_eps"] = serde_json::Value::Null;
+        std::fs::write(root.join("config.json"), changed_epsilon.to_string()).unwrap();
+        assert!(PcmAudioPlan::from_snapshot(root).is_err());
         let mut unsupported_config = config;
         unsupported_config["audio_config"]["conv_kernel_size"] = serde_json::json!(9);
         std::fs::write(root.join("config.json"), unsupported_config.to_string()).unwrap();

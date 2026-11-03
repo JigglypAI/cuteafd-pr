@@ -14,7 +14,8 @@ typedef struct {
   cuteafd_pcm_block blocks[2];
 } cuteafd_pcm_stage;
 typedef struct {
-  uint32_t abi_version, max_samples, output_width, reserved;
+  uint32_t abi_version, max_samples, output_width;
+  float feature_norm_eps; /* ABI 2: checkpoint text RMS epsilon. */
   uint64_t weight_bytes;
   cuteafd_pcm_stage stages[4];
   uint64_t norm, projection, bias, post_norm;
@@ -23,7 +24,7 @@ typedef struct {
   uint64_t weights, scratch, device_allocations, encodes;
 } cuteafd_pcm_ledger;
 /* Observed BF16 data is device-resident and valid only during the callback.
- * Stages 0..11: patch, block0, block1 per pyramid level; 12: final embedding.
+ * Stages 0..11: patch, block0, block1 per pyramid level; 12: raw learned post-projection norm, before public feature RMSNorm.
  * token_offset is the global output-token offset of this streaming chunk. */
 typedef int32_t (*cuteafd_pcm_observer)(void*, int32_t stage, uint32_t token_offset,
                                       const void*, uint32_t rows, uint32_t width);

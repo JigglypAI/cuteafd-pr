@@ -317,7 +317,7 @@ impl TowerSpec {
     }
     /// Canonical header extents, sorted by tensor name; no tower payload is read.
     pub fn encoder_id(&self, revision: &str, sm: u32) -> cuteafd_loader::media::EncoderId {
-        let headers = self.reads.iter().map(|read| {
+        let mut headers: BTreeMap<String, serde_json::Value> = self.reads.iter().map(|read| {
             let m = &read.metadata;
             (m.name.clone(), serde_json::json!({"dtype": format!("{:?}", m.dtype),
                 "shape": m.shape, "byte_offset": m.byte_offset, "byte_length": m.byte_length}))
@@ -328,7 +328,11 @@ impl TowerSpec {
             cuteafd_loader::media::ImageFamily::GlmFlash => "glm5_flash",
             cuteafd_loader::media::ImageFamily::Muse => "muse_spark",
         };
-        cuteafd_loader::media::EncoderId::derive(family, revision, &headers, 1, sm)
+        let numerics = if self.image_family() == cuteafd_loader::media::ImageFamily::Muse {
+            headers.insert("feature_norm_eps".into(), serde_json::json!(self.native.norm_eps.to_bits()));
+            2
+        } else { 1 };
+        cuteafd_loader::media::EncoderId::derive(family, revision, &headers, numerics, sm)
     }
 
     fn load_weights(&self) -> Result<Vec<u8>> {

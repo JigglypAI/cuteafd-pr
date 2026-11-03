@@ -88,3 +88,13 @@ def test_pcm_dispatcher_shares_modules_across_devices_without_encode_mutex(tmp_p
     launch = source.split('extern "C" int cuteafd_pcm_support_launch', 1)[1]
     assert "mutex" not in launch
     assert "program.launch(a,rows,stream)" in launch
+
+
+def test_pcm_feature_epsilon_uses_versioned_float_slot():
+    assert gate.Spec.feature_norm_eps.offset == 12
+    assert gate.Spec.weight_bytes.offset == 16
+    spec = gate.Spec(abi_version=2, feature_norm_eps=2e-4)
+    assert gate.Spec.from_buffer_copy(spec).feature_norm_eps == pytest.approx(2e-4)
+    for epsilon in (0, -1, float("nan"), float("inf"), 1e100, 1e-100):
+        with pytest.raises(ValueError, match="epsilon"):
+            gate.descriptor({}, 1, epsilon)

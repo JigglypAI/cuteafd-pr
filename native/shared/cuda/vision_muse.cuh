@@ -26,7 +26,7 @@ bool valid_muse(const cuteafd_vision_spec& s) {
   if(s.abi_version!=2 || s.reserved!=5 || s.geometry_reserved || !s.max_tokens || s.max_tokens>4096 ||
      s.hidden!=1536 || s.depth!=50 || s.heads!=16 || s.kv_heads!=16 || s.head_dim!=96 ||
      s.intermediate!=8960 || s.patch_size!=14 || s.merger_width!=6144 || s.output_width!=8192 ||
-     s.norm_eps!=1e-5f || !s.weight_bytes || s.weight_bytes>(4ULL<<30) ||
+     (!isfinite(s.norm_eps) || s.norm_eps<=0.0f) || !s.weight_bytes || s.weight_bytes>(4ULL<<30) ||
      s.patch_bias!=UINT64_MAX || s.merger_fc1_bias!=UINT64_MAX || s.merger_fc2_bias!=UINT64_MAX)return false;
   const uint64_t offsets[]={s.patch,s.pos_embed,s.merger_extra[0],s.merger_extra[1],s.merger_norm,
     s.merger_norm_bias,s.merger_fc1,s.merger_fc2,s.merger_extra[2],s.inv_freq};
@@ -177,6 +177,7 @@ int encode_muse(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const float* lut,
   MUSE_RUN(observe(o,cb,ctx,55,o->muse_qkv,units,4096,false));
   MUSE_RUN(muse_program(o,"vision_projection_h4096_o8192",{o->muse_qkv,o->weights+s.merger_extra[2],o->output},{uint64_t(units)}));
   MUSE_RUN(observe(o,cb,ctx,56,o->output,units,8192,false));
+  MUSE_RUN(media_feature_norm(o->output,units,8192,s.norm_eps,stream));
   MUSE_RUN(cudaMemcpyAsync(output,o->output,output_bytes,cudaMemcpyDeviceToHost,stream));
   MUSE_RUN(cudaStreamSynchronize(stream));++o->ledger.encodes;
 #undef MUSE_LAUNCH

@@ -19,7 +19,8 @@ impl PcmTowerSpec {
                 .ok_or_else(|| VisionError::Unsupported(format!("missing PCM tensor {key}")))
         };
         let mut native = PcmSpec {
-            abi_version: 1,
+            abi_version: 2,
+            feature_norm_eps: plan.feature_norm_eps(),
             max_samples: max_samples as u32,
             output_width: 8192,
             weight_bytes: plan.weight_bytes(),

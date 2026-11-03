@@ -1,12 +1,16 @@
-// Shared BF16 causal PCM pyramid. Arithmetic comes solely from pinned AOT
-// programs; this owner handles admission, streaming history and lifetimes.
+// Shared BF16 causal PCM pyramid. Tower arithmetic uses pinned AOT programs;
+// the owner handles streaming/lifetimes and the public feature RMSNorm egress.
 #include "cuteafd_pcm_audio.h"
 #include "cuteafd_pcm_support_internal.h"
+#include "media_feature_norm.cuh"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstring>
 #include <new>
 #include <type_traits>
+#include <cstddef>
+static_assert(sizeof(cuteafd_pcm_spec)==600,"PCM ABI 2 size");
+static_assert(offsetof(cuteafd_pcm_spec,feature_norm_eps)==12,"PCM ABI 2 feature epsilon");
 
 namespace {
 constexpr uint32_t WIDTHS[4]={256,512,1024,2048}, PATCHES[4]={16,6,5,4};
@@ -27,7 +31,7 @@ bool extent(const cuteafd_pcm_spec& s,uint64_t off,uint64_t bytes){
   return off%256==0&&off<=s.weight_bytes&&bytes<=s.weight_bytes-off;
 }
 bool valid(const cuteafd_pcm_spec& s){
-  if(s.abi_version!=1||s.reserved||!s.max_samples||s.max_samples>MAX_SAMPLES||
+  if(s.abi_version!=2||!isfinite(s.feature_norm_eps)||s.feature_norm_eps<=0.0f||!s.max_samples||s.max_samples>MAX_SAMPLES||
      s.output_width!=8192||!s.weight_bytes||s.weight_bytes>(1ULL<<30))return false;
   uint64_t previous=1;
   for(int i=0;i<4;++i){
@@ -139,6 +143,7 @@ extern "C" int32_t cuteafd_pcm_encode(void* p,const uint16_t* pcm,uint32_t sampl
     if(!e)e=linear(o,o->z,o->y,o->s.projection,o->s.bias,rows,previous,o->s.output_width);
     if(!e)e=norm(o,o->y,o->z,o->s.post_norm,rows,o->s.output_width);
     if(!e)e=observe(o,cb,context,12,offset,o->z,rows,o->s.output_width);
+    if(!e)e=media_feature_norm(o->z,rows,o->s.output_width,o->s.feature_norm_eps,o->stream);
     if(!e)e=cudaMemcpyAsync(output+uint64_t(offset)*o->s.output_width,o->z,uint64_t(count)*o->s.output_width*2,cudaMemcpyDeviceToHost,o->stream);
     // Drain even on observer/launch errors before reusing host or device storage.
     e=drain(o,e);

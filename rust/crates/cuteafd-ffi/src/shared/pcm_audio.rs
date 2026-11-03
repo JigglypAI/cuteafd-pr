@@ -27,7 +27,7 @@ pub struct PcmSpec {
     pub abi_version: u32,
     pub max_samples: u32,
     pub output_width: u32,
-    pub reserved: u32,
+    pub feature_norm_eps: f32,
     pub weight_bytes: u64,
     pub stages: [PcmStage; 4],
     pub norm: u64,
@@ -83,6 +83,9 @@ impl NativePcmAudio {
         admitted: u64,
         weights: &[u8],
     ) -> Result<Self, AudioError> {
+        if spec.abi_version != 2 || !spec.feature_norm_eps.is_finite() || spec.feature_norm_eps <= 0.0 {
+            return Err(AudioError::InvalidInput("PCM ABI 2 and positive finite feature epsilon required"));
+        }
         if weights.len() as u64 != spec.weight_bytes {
             return Err(AudioError::InvalidInput("PCM weight arena length"));
         }
@@ -176,10 +179,21 @@ impl Drop for NativePcmAudio {
 mod tests {
     use super::*;
     #[test]
+    fn rejects_old_abi_and_invalid_feature_epsilon_before_loading_library() {
+        for (version, epsilon) in [(1, 1e-5), (3, 1e-5), (2, 0.0),
+            (2, f32::NAN), (2, f32::INFINITY), (2, -1.0)] {
+            let spec = PcmSpec { abi_version: version, feature_norm_eps: epsilon, ..Default::default() };
+            assert!(matches!(NativePcmAudio::load(Path::new("missing-library"), &spec, 0, 0, &[]),
+                Err(AudioError::InvalidInput("PCM ABI 2 and positive finite feature epsilon required"))));
+        }
+    }
+    #[test]
     fn c_abi_sizes() {
         assert_eq!(std::mem::size_of::<PcmBlock>(), 56);
         assert_eq!(std::mem::size_of::<PcmStage>(), 136);
         assert_eq!(std::mem::size_of::<PcmSpec>(), 600);
+        assert_eq!(std::mem::offset_of!(PcmSpec, feature_norm_eps), 12);
+        assert_eq!(std::mem::offset_of!(PcmSpec, weight_bytes), 16);
         assert_eq!(std::mem::size_of::<PcmLedger>(), 32);
     }
 }

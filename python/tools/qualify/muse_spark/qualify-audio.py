@@ -20,7 +20,8 @@ class Block(C.Structure):
 class Stage(C.Structure):
     _fields_ = [(name, C.c_uint64) for name in ("projection", "bias", "norm")] + [("blocks", Block * 2)]
 class Spec(C.Structure):
-    _fields_ = [(name, C.c_uint32) for name in ("abi_version", "max_samples", "output_width", "reserved")]
+    _fields_ = [(name, C.c_uint32) for name in ("abi_version", "max_samples", "output_width")]
+    _fields_ += [("feature_norm_eps", C.c_float)]
     _fields_ += [("weight_bytes", C.c_uint64), ("stages", Stage * 4)]
     _fields_ += [(name, C.c_uint64) for name in ("norm", "projection", "bias", "post_norm")]
 class Ledger(C.Structure):
@@ -42,8 +43,13 @@ def scratch_bytes(samples):
     return align(largest * 2) * 3 + align(largest * 8) * 2 + sum(align(h * 6 * 2) * 2 for h in (256, 512, 1024, 2048))
 
 
-def descriptor(weights, max_samples):
-    spec = Spec(abi_version=1, max_samples=max_samples, output_width=8192)
+def descriptor(weights, max_samples, feature_norm_eps):
+    import math
+    narrowed = C.c_float(feature_norm_eps).value
+    if not math.isfinite(narrowed) or narrowed <= 0:
+        raise ValueError("positive finite checkpoint text RMS epsilon required")
+    spec = Spec(abi_version=2, max_samples=max_samples, output_width=8192,
+                feature_norm_eps=feature_norm_eps)
     offsets, cursor = {}, 0
     for name, tensor in sorted(weights.items()):
         if str(tensor.dtype) != "torch.bfloat16":
@@ -91,6 +97,25 @@ def stage_metrics(actual, bf16, fp32):
 def check(code):
     if code:
         raise RuntimeError(f"native PCM status {code}")
+
+
+def official_features(model, prepared, config, dtype):
+    """Call the exact public wrapper without allocating the 816B language model."""
+    import torch
+    from types import SimpleNamespace
+    from transformers.models.muse_spark.modeling_muse_spark import (
+        MuseSparkForConditionalGeneration, MuseSparkRMSNorm)
+    model.to(dtype=dtype)
+    owner = SimpleNamespace(audio_tower=model,
+        config=SimpleNamespace(return_dict=True, audio_config=SimpleNamespace(
+            samples_per_token=config["audio_config"]["samples_per_token"])),
+        get_input_embeddings=lambda: SimpleNamespace(embed_norm=MuseSparkRMSNorm(
+            eps=config["text_config"]["rms_norm_eps"], with_scale=False)))
+    with torch.inference_mode():
+        result = MuseSparkForConditionalGeneration.get_audio_features(
+            owner, input_values=prepared[None].to(next(model.parameters()).device, dtype),
+            return_dict=True)
+    return result.pooler_output.float().cpu()
 
 
 def main():
@@ -154,7 +179,9 @@ def main():
         if sr != 24000 or pcm.ndim != 1:
             raise ValueError(f"{path}: qualification requires 24 kHz mono")
         clips.append((path.stem, pcm))
-    spec, arena = descriptor(weights, max(len(pcm) for _, pcm in clips))
+    root_config = json.loads((args.snapshot / "config.json").read_text())
+    epsilon = root_config["text_config"]["rms_norm_eps"]
+    spec, arena = descriptor(weights, max(len(pcm) for _, pcm in clips), epsilon)
     lib = C.CDLL(str(args.library))
     cudart = C.CDLL("libcudart.so")
     cudart.cudaMemcpy.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t, C.c_int]
@@ -165,6 +192,11 @@ def main():
     lib.cuteafd_pcm_get_ledger.argtypes = [C.c_void_p, C.POINTER(Ledger)]
     lib.cuteafd_pcm_destroy.argtypes = [C.c_void_p]
     charge = Ledger()
+    for version in (0, 1, 3):
+        rejected = Spec.from_buffer_copy(spec)
+        rejected.abi_version = version
+        if lib.cuteafd_pcm_required(C.byref(rejected), C.byref(charge)) == 0:
+            raise AssertionError(f"PCM ABI mismatch {version} accepted")
     check(lib.cuteafd_pcm_required(C.byref(spec), C.byref(charge)))
     expected = dict(weights=spec.weight_bytes, scratch=scratch_bytes(spec.max_samples), device_allocations=2, encodes=0)
     if charge.as_dict() != expected:
@@ -335,7 +367,9 @@ def main():
             independent = ref.forward(pcm, {name: tensor.to("cuda") for name, tensor in weights.items()}).float().cpu()
             if not torch.equal(independent, official_stages[12]):
                 raise AssertionError(f"{label}: independent reference differs from official BF16")
+            bf16_features = official_features(model, prepared, root_config, torch.bfloat16)
             fp32_stages = official_stages_for(torch.float32)
+            fp32_features = official_features(model, prepared, root_config, torch.float32)
             chunks = {i: [] for i in range(13)}
             errors = []
             @OBSERVER
@@ -361,11 +395,11 @@ def main():
                 stages.append(dict(stage=stage, **metric))
                 report["cumulative_stage_yardstick_pass"] &= metric["passed"]
             final = torch.from_numpy(output).view(torch.bfloat16).float()
-            if not torch.equal(final, torch.cat([x for _, x in sorted(chunks[12])])):
-                raise AssertionError("returned feature bytes differ from final stage")
+            feature_metrics = stage_metrics(final, bf16_features, fp32_features)
+            report["cumulative_stage_yardstick_pass"] &= feature_metrics["passed"]
             linears = [metric for metric in primitive_metrics if "linear_path" in metric]
             report["clips"].append(dict(name=label, samples=len(pcm), tokens=tokens, spans_exact=True,
-                stages=stages, primitives=primitive_metrics,
+                stages=stages, public_features=feature_metrics, primitives=primitive_metrics,
                 per_op_native_not_worse=all(metric["native_not_worse"] for metric in primitive_metrics) if primitive_metrics else None,
                 per_op_fp32_yardstick_pass=all(metric["within_bf16_yardstick"] for metric in primitive_metrics) if primitive_metrics else None,
                 linear_fp32_yardstick_pass=all(metric["within_bf16_yardstick"] for metric in linears) if linears else None))
