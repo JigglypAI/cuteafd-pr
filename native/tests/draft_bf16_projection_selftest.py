@@ -22,6 +22,8 @@ def shapes():
         "dflash-qwen35": (2048, 32, 8, 128, 6144, 8),
         "dflash-mimo-pro": (6144, 128, 8, 128, 16384, 5),
         "dflash-mimo-flash": (4096, 64, 8, 128, 16384, 5),
+        "dflash2-muse-radix": (8192, 64, 8, 128, 28672, 5),
+        "dflash2-muse-nvidia": (8192, 128, 16, 64, 24576, 5),
     }
     result = {}
     for family, (h, heads, kv, d, inter, taps) in families.items():
