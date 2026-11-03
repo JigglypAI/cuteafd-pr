@@ -103,6 +103,15 @@ def test_propagation_mode_stops_at_second_patch_and_checks_every_boundary():
     assert all(not name.startswith(("layers.2.", "layers.3.")) for name, *_ in steps)
 
 
+def test_signed_channel_error_keeps_bias_when_global_mean_cancels():
+    result = gate.signed_channel_errors([[1, -1], [3, -3]], [[2, -2], [2, -2]],
+        [[0, 0], [0, 0]])
+    assert result["native"]["mean_by_channel"] == [2, -2]
+    assert result["native"]["signed_mean"] == 0
+    assert result["native"]["channel_mean_rms"] == 2
+    assert result["official_bf16"]["channel_mean_max_abs"] == 2
+
+
 def test_pcm_feature_epsilon_uses_versioned_float_slot():
     assert gate.Spec.feature_norm_eps.offset == 12
     assert gate.Spec.weight_bytes.offset == 16

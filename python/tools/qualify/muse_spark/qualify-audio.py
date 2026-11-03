@@ -94,6 +94,19 @@ def stage_metrics(actual, bf16, fp32):
                 passed=native_error <= 1.1 * max(official_error, floor))
 
 
+def signed_channel_errors(actual, bf16, fp32):
+    """Retain channel direction; RMS alone hides coherent bias on silence."""
+    import numpy as np
+    result = {}
+    for name, value in (("native", actual), ("official_bf16", bf16)):
+        delta = np.asarray(value, dtype=np.float64) - np.asarray(fp32, dtype=np.float64)
+        means = delta.reshape(-1, delta.shape[-1]).mean(axis=0)
+        result[name] = dict(mean_by_channel=means.tolist(), signed_mean=float(means.mean()),
+            channel_mean_rms=float(np.sqrt(np.mean(means * means))),
+            channel_mean_max_abs=float(np.abs(means).max()))
+    return result
+
+
 def check(code):
     if code:
         raise RuntimeError(f"native PCM status {code}")
@@ -222,7 +235,8 @@ def diagnose_propagation(lib, model, prepared, native_stages):
                     inherited_absolute_rms=rms(inherited),
                     local_inherited_cross_mse=float((local_error * inherited).mean()),
                     official_input_local_absolute_rms=rms(expected.float() - same_official),
-                    fp32_input_native_absolute_rms=rms(oracle_input_native.float() - oracle_output)))
+                    fp32_input_native_absolute_rms=rms(oracle_input_native.float() - oracle_output),
+                    signed_channel_errors=signed_channel_errors(cpu(actual), cpu(expected), cpu(oracle_output))))
                 chains = dict(native=actual, official=expected, fp32=oracle_output)
                 if op == 4 or name.endswith("patch_embedder.norm"):
                     observed = native_stages[stage][:actual.shape[1]]
@@ -517,7 +531,9 @@ def main():
             for stage in range(13):
                 actual = native_stages[stage]
                 metric = stage_metrics(actual, official_stages[stage], fp32_stages[stage])
-                stages.append(dict(stage=stage, **metric))
+                stages.append(dict(stage=stage, **metric,
+                    signed_channel_errors=signed_channel_errors(actual, official_stages[stage], fp32_stages[stage])
+                        if args.diagnose_propagation else None))
                 report["cumulative_stage_yardstick_pass"] &= metric["passed"]
             final = torch.from_numpy(output).view(torch.bfloat16).float()
             feature_metrics = stage_metrics(final, bf16_features, fp32_features)
