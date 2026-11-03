@@ -18,6 +18,7 @@ pub struct Glm {
     id: &'static str,
     architecture: &'static str,
     runtime: RuntimeStatus,
+    media_cache_headroom: bool,
     /// Rows of one decode step's Spark request (the engine's decode programs).
     decode_rows: u32,
     decode_lanes: crate::plan::decode_lanes::LaneSupport,
@@ -25,13 +26,13 @@ pub struct Glm {
 
 /// GLM 5.x: serve-glm / glm-golden on the glm coordinator programs.
 pub static GLM5: Glm =
-    Glm { id: "glm5", architecture: "GlmMoeDsaForCausalLM", runtime: RuntimeStatus::Serving,
+    Glm { id: "glm5", architecture: "GlmMoeDsaForCausalLM", runtime: RuntimeStatus::Serving, media_cache_headroom: false,
         decode_rows: crate::placement::families::glm5::DECODE_ROWS as u32,
         decode_lanes: crate::plan::decode_lanes::LaneSupport::One {
             reason: "a second lane needs its own graph set, about 3 GiB per GPU today (213 shapes), more than one onboarded layer (2.26 GiB per GPU), and the big dense core leaves little round trip to hide (predicted loss, #705, #744)" } };
 /// GLM 5.3 Flash: serve-glmf / glmf-golden on the glmf coordinator programs.
 pub static GLM5_FLASH: Glm =
-    Glm { id: "glm5_flash", architecture: "Glm5NextForConditionalGeneration", runtime: RuntimeStatus::Serving,
+    Glm { id: "glm5_flash", architecture: "Glm5NextForConditionalGeneration", runtime: RuntimeStatus::Serving, media_cache_headroom: true,
         decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS as u32,
         decode_lanes: crate::plan::decode_lanes::LaneSupport::One {
             reason: "the second lane is not wired yet: only the Spark-bound min card (1 RTX + 2 Sparks) can hide a round trip, and it is the OneOrTwo candidate awaiting its A/B; the 0-Spark layout has no exchange to hide (#744)" } };
@@ -56,6 +57,7 @@ impl Family for Glm {
     fn id(&self) -> &'static str {
         self.id
     }
+    fn media_cache_headroom(&self) -> bool { self.media_cache_headroom }
     fn runtime(&self) -> RuntimeStatus {
         self.runtime
     }

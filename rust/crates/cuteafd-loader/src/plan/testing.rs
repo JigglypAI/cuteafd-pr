@@ -419,6 +419,12 @@ pub fn glm5_flash_config(layers: usize) -> Value {
     })
 }
 
+/// Complete bundled GLM Flash tower headers for cross-crate admission tests.
+pub fn glm5_flash_vision_tensors() -> Vec<Tensor> {
+    super::families::glm::glm_flash_vision_tensors().into_iter()
+        .map(|(name, shape)| t(format!("model.visual.{name}"), "BF16", &shape)).collect()
+}
+
 /// Complete coordinator headers plus one expert per routed layer; payloads stay sparse.
 pub fn glm5_flash_tensors(config: &Value) -> Vec<Tensor> {
     use crate::families::glm5_flash::{GlmNextAttention, GlmNextConfig};

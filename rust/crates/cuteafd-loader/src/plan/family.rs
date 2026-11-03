@@ -133,6 +133,9 @@ pub trait Family: Sync {
     /// How the executor feeds the single Spark prefill owner.
     fn detect(&self, checkpoint: &Checkpoint) -> bool;
     fn runtime(&self) -> RuntimeStatus;
+    /// Runtime reserves a shared host embedding cache via `with_media_headroom`
+    /// when a bundled media tower is admitted.
+    fn media_cache_headroom(&self) -> bool { false }
     /// Parses the checkpoint's configuration into the family's canonical model
     /// (the same parser its runtime uses), or the reason the runtime refuses it.
     fn open(&self, checkpoint: &Checkpoint) -> Result<Box<dyn FamilyModel>, ConfigError>;

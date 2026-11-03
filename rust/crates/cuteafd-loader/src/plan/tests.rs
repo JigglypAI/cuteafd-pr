@@ -920,6 +920,15 @@ fn host_automatic_quota_depends_on_concurrency_not_device_entries() {
 
 #[test]
 fn host_media_quota_is_charged_only_for_supported_loaded_towers() {
+    use super::encoder::{EncoderKind, EncoderPlacement};
+    let placement = |mode| Some(EncoderPlacement {
+        kind: match mode {
+            MediaMode::Off => EncoderKind::Off,
+            MediaMode::Spark(_) => EncoderKind::Spark { rank: 0 },
+            _ => EncoderKind::Rtx { gpu: 0 },
+        },
+        weights: 1024, scratch: 512, replicas: vec![], reason: "admitted fixture".into(), shortfall: 0,
+    });
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
     let input = PlanInput::open(dir.path()).unwrap();
     let mut report = input.plan(&PlanOptions::default()).unwrap();
@@ -937,11 +946,23 @@ fn host_media_quota_is_charged_only_for_supported_loaded_towers() {
     ] {
         report.vision = vision;
         report.audio = audio;
+        report.encoder = placement(vision);
+        report.audio_encoder = placement(audio);
         options.media_cache_bytes = quota;
         layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
         let media: u64 = report.host_ledger.as_ref().unwrap().items.iter()
             .filter(|item| item.group == "media/embedding-cache").map(|item| item.bytes).sum();
         assert_eq!(media, expected);
+    }
+    // Requested media without an admitted tower cannot allocate a runtime cache.
+    report.vision = MediaMode::Rtx(Some(0));
+    report.audio = MediaMode::Rtx(Some(0));
+    for admitted in [None, placement(MediaMode::Off)] {
+        report.encoder = admitted.clone();
+        report.audio_encoder = admitted;
+        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        assert!(!report.host_ledger.as_ref().unwrap().items.iter()
+            .any(|item| item.group == "media/embedding-cache"));
     }
 }
 
