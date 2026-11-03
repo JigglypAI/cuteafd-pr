@@ -4,6 +4,7 @@
 //! its own adapter under `layout/` (`FamilyModel::placement`), solving the
 //! same placement request its runtime admits.
 use super::{Component, ExpertPlacement, Owner, PlanReport, Status};
+use crate::serving_capacity::Exl3Epilogue;
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout, Waste};
 
 pub(crate) mod deepseek_v4;
@@ -538,7 +539,7 @@ mod selected_spark_io_tests {
                 "dtype": "i32", "zero_on_create": true}));
             json!({"capacity": rows, "hidden": 2560, "trellis_lut": {"bytes": 4096}, "buffers": buffers})
         }).collect::<Vec<_>>();
-        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true).unwrap();
+        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum).unwrap();
         let wire_routes = 4096 * (2560 + 2560 / 32 + 8 * 10);
         assert_eq!(retained + wire_routes, 674_287_636);
         for rows in [64, 2048, 2752, 4096] {
@@ -565,7 +566,7 @@ mod selected_spark_io_tests {
                 "dtype": "i32", "zero_on_create": true}));
             json!({"capacity": rows, "hidden": 4096, "trellis_lut": {"bytes": 4096}, "buffers": buffers})
         }).collect::<Vec<_>>();
-        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true).unwrap();
+        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum).unwrap();
         assert_eq!(retained, 567_814_976);
         let slot = retained + 4096 * (4096 + 4096 / 32 + 8 * 8);
         assert_eq!(slot, 585_378_624);
@@ -594,7 +595,7 @@ mod selected_spark_io_tests {
                 "dtype": "i32", "zero_on_create": true}));
             json!({"capacity": rows, "hidden": 3584, "trellis_lut": {"bytes": 4096}, "buffers": buffers})
         }).collect::<Vec<_>>();
-        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true).unwrap();
+        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum).unwrap();
         let slot = retained + 4096 * (3584 + 3584 / 32 + 8 * 16);
         assert_eq!(slot, 844_696_852);
         for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
@@ -1190,7 +1191,7 @@ pub(crate) fn expert_workspace(report: &PlanReport, model: &dyn super::FamilyMod
     if manifests.iter().any(|m| m["hidden"].as_u64() != Some(model.spec().hidden as u64)
         || m["intermediate"].as_u64() != Some(moe.intermediate as u64)
         || m["experts"].as_u64() != Some(moe.experts as u64)) { return None; }
-    crate::serving_capacity::exl3_workspace_bytes(&manifests, true).ok()?
+    crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum).ok()?
         .checked_add(maximum * model.spec().hidden as u64 * 2)
 }
 

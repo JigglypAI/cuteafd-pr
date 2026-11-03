@@ -1,7 +1,7 @@
 //! Spark request adapter: preserve the compact BF16 wire response and write
 //! directly into registered send storage when the transport permits it.
 use super::{
-    execution::{Exl3Execution, Exl3InputFormat, Exl3Modules, Exl3ReductionPlan, Exl3RowPolicy, Exl3Schedule, Exl3Workspace},
+    execution::{Exl3Epilogue, Exl3Execution, Exl3InputFormat, Exl3Modules, Exl3ReductionPlan, Exl3RowPolicy, Exl3Schedule, Exl3Workspace},
     Exl3Weights,
 };
 use crate::shared::experts::execution::HostExpertExchange;
@@ -183,11 +183,12 @@ impl<'a> Exl3Worker<'a> {
         cuteafd_core::expert_geometry().topk as usize
     }
 
-    pub(crate) fn plan(directory: &Path, capacity: u32, schedule: Exl3Schedule) -> Result<usize> {
+    pub(crate) fn plan(directory: &Path, capacity: u32, schedule: Exl3Schedule,
+        epilogue: Exl3Epilogue) -> Result<usize> {
         let directories: Vec<_> = Self::capacities(capacity)?.into_iter()
             .map(|c| schedule.directory(directory, c)).collect();
         Exl3ReductionPlan::new(&directories)?;
-        Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)?
+        Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32, epilogue)?
             .checked_add(capacity as usize * (Self::wire_row_bytes() + Self::topk() * 8))
             .context("EXL3 worker workspace budget overflow")
     }
@@ -233,19 +234,20 @@ impl<'a> Exl3Worker<'a> {
         capacity: u32,
         available_bytes: usize,
         schedule: Exl3Schedule,
+        epilogue: Exl3Epilogue,
     ) -> Result<Self> {
-        Self::with_modules(library, weights, directory, capacity, available_bytes, schedule, None)
+        Self::with_modules(library, weights, directory, capacity, available_bytes, schedule, epilogue, None)
     }
 
     pub(crate) fn with_modules(
         library: &'a NativeLibrary, weights: Rc<Vec<Exl3Weights<'a>>>, directory: &Path,
-        capacity: u32, available_bytes: usize, schedule: Exl3Schedule,
+        capacity: u32, available_bytes: usize, schedule: Exl3Schedule, epilogue: Exl3Epilogue,
         modules: Option<Vec<Exl3Modules<'a>>>,
     ) -> Result<Self> {
         let first = weights.first().context("EXL3 worker has no layers")?;
         let layer_ids = Self::resident_layers(weights.iter().map(|weight| &weight.layout))?;
         let rank = first.layout.rank;
-        let budget = Self::plan(directory, capacity, schedule)?;
+        let budget = Self::plan(directory, capacity, schedule, epilogue)?;
         ensure!(
             budget <= available_bytes,
             "EXL3 worker workspace exceeds device budget"
@@ -255,7 +257,7 @@ impl<'a> Exl3Worker<'a> {
         let capacities = Self::capacities(capacity)?;
         let directories: Vec<_> = capacities.iter().map(|&c| schedule.directory(directory, c)).collect();
         let reduction_plan = Exl3ReductionPlan::new(&directories)?;
-        let arena = Exl3Workspace::new(library, &directories)?;
+        let arena = Exl3Workspace::new(library, &directories, epilogue)?;
         let mut modules = modules.map(Vec::into_iter);
         if let Some(modules) = &modules {
             ensure!(modules.len() == capacities.len(), "EXL3 warmed capacity count mismatch");
@@ -268,7 +270,7 @@ impl<'a> Exl3Worker<'a> {
             };
             // SAFETY: this worker serializes all executions sharing the arena.
             let execution = unsafe {
-                Exl3Execution::with_modules(library, weights.clone(), module, Some(arena.clone()))?
+                Exl3Execution::with_modules(library, weights.clone(), module, epilogue, Some(arena.clone()))?
             };
             ensure!(
                 execution.capacity() == c as usize && execution.output_element_bytes() == 2,

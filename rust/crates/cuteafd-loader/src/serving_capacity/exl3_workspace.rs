@@ -3,7 +3,42 @@ use super::{product, sum, CacheGeometryError};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub fn exl3_workspace_bytes(manifests: &[Value], fp8_k32: bool) -> Result<u64, CacheGeometryError> {
+/// The routed-expert epilogue a family's runtime executes after the EXL3 core.
+///
+/// The weighted top-k sum is its own native object; it reads the executor's
+/// `output` owner. Families whose experts carry a per-expert output norm reply
+/// unweighted per-expert partials instead, launch the core only and never read
+/// that owner. Planner censuses and worker allocations must declare the same
+/// epilogue, or admission and allocation disagree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Exl3Epilogue {
+    /// Core then the weighted top-k sum into the token output.
+    #[default]
+    Sum,
+    /// Core only; the coordinator combines per-expert partial replies.
+    PartialReplies,
+}
+
+/// The weighted token sum's allocation owner.
+const OUTPUT_OWNER: &str = "output";
+
+impl Exl3Epilogue {
+    /// The epilogue the checkpoint's routed experts declare.
+    pub fn for_catalog(catalog: &crate::OfficialV41Catalog) -> Self {
+        if catalog.exl3().is_some() && catalog.per_expert_output_norm() {
+            Self::PartialReplies
+        } else {
+            Self::Sum
+        }
+    }
+    /// Whether `owner` is allocated for this epilogue.
+    pub fn allocates(self, owner: &str) -> bool {
+        self == Self::Sum || owner != OUTPUT_OWNER
+    }
+}
+
+pub fn exl3_workspace_bytes(manifests: &[Value], fp8_k32: bool, epilogue: Exl3Epilogue)
+    -> Result<u64, CacheGeometryError> {
     let invalid = |name: &str, what: &str| CacheGeometryError::ResidentTensor {
         name: format!("EXL3 workspace/{name}"), what: what.into(),
     };
@@ -16,7 +51,7 @@ pub fn exl3_workspace_bytes(manifests: &[Value], fp8_k32: bool) -> Result<u64, C
             .ok_or_else(|| invalid("trellis_lut", "missing asset extent"))?.max(16));
         for (name, spec) in buffers {
             let allocation = spec["allocation"].as_str().ok_or_else(|| invalid(name, "missing allocation owner"))?;
-            if name != allocation { continue; }
+            if name != allocation || !epilogue.allocates(name) { continue; }
             let bytes = spec["bytes"].as_u64().ok_or_else(|| invalid(name, "missing byte extent"))?.max(16);
             let zero = spec["zero_on_create"].as_bool().ok_or_else(|| invalid(name, "missing initialization policy"))?;
             if zero { private.push(bytes); continue; }
@@ -52,10 +87,22 @@ mod tests {
                 "alias": {"bytes": 99999, "allocation": "scratch", "dtype": "f16", "zero_on_create": false},
                 "state": {"bytes": 0, "allocation": "state", "dtype": "i32", "zero_on_create": true}}});
         let manifests = [manifest(1, 64), manifest(16, 1024)];
-        assert_eq!(exl3_workspace_bytes(&manifests, true).unwrap(), 1024 + 2 * (32 + 16) + 17 * 8 * 2);
-        assert_eq!(exl3_workspace_bytes(&manifests, false).unwrap(), 1024 + 2 * (32 + 16));
+        let sum = |manifests, wire| exl3_workspace_bytes(manifests, wire, Exl3Epilogue::Sum);
+        assert_eq!(sum(&manifests, true).unwrap(), 1024 + 2 * (32 + 16) + 17 * 8 * 2);
+        assert_eq!(sum(&manifests, false).unwrap(), 1024 + 2 * (32 + 16));
+        // A partial-reply epilogue launches the core only: the weighted sum's
+        // output owner is never allocated, and every core owner is unchanged.
+        let mut partial = manifests.clone();
+        partial[0]["buffers"]["output"] = json!({"bytes": 64, "allocation": "output",
+            "dtype": "bf16", "zero_on_create": false});
+        partial[1]["buffers"]["output"] = json!({"bytes": 1024, "allocation": "output",
+            "dtype": "bf16", "zero_on_create": false});
+        assert_eq!(exl3_workspace_bytes(&partial, true, Exl3Epilogue::PartialReplies).unwrap(),
+            1024 + 2 * (32 + 16) + 17 * 8 * 2);
+        assert_eq!(exl3_workspace_bytes(&partial, true, Exl3Epilogue::Sum).unwrap(),
+            1024 + 2 * (32 + 16) + 17 * 8 * 2 + 1024);
         let mut conflict = manifests.clone();
         conflict[1]["buffers"]["scratch"]["dtype"] = json!("f32");
-        assert!(exl3_workspace_bytes(&conflict, true).is_err());
+        assert!(exl3_workspace_bytes(&conflict, true, Exl3Epilogue::Sum).is_err());
     }
 }
