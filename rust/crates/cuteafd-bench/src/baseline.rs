@@ -327,7 +327,7 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let client = run.client;
     let rows = |n: usize| ProbeSpec { no_speculation: true, record_rows: n, top_k: 1, ..ProbeSpec::default() };
     // Prompt end: the first request computes and retains, the second restores it whole.
-    let text = format!("[{}] Read the notes and answer in one word.\n\n{}", nonce(), corpus(31, 1100));
+    let (text, turn_text) = cache_prompts();
     let first = probed(client, plain(client, &text, 2), rows(2))?;
     if !honoured(&first) {
         unsupported(check);
@@ -337,8 +337,6 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     // Turn end. Long enough to clear the cache's minimum snapshot size and several units; the
     // answer runs past 25 tokens, so the turn ends at its length limit and the turn snapshot is
     // followed by a decode step.
-    let turn_text = format!("[{}] Here are some notes.\n\n{}\n\nCount from one to forty in words, separated by commas.",
-        nonce(), corpus(57, 900));
     let turn = probed(client, plain(client, &turn_text, TURN_TOKENS as u64), rows(TURN_TOKENS))?;
     let reference = probed(client, plain(client, &turn_text, TURN_TOKENS as u64 + 1), rows(TURN_TOKENS + 1))?;
     let mut ids = turn.prompt_ids.clone();
@@ -348,6 +346,8 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         ProbeSpec { prompt_ids: Some(ids), output_dependent: true, ..rows(2) })?;
     let cold = probed(client, plain(client, &turn_text, 1), ProbeSpec { cold: true, ..rows(1) })?;
     let verdict = Restores::judge(&first, &restored, &turn, &reference, &again, &cold);
+    check.set("prompt_reference_tokens", CACHE_PROMPT_TOKENS as u64);
+    check.set("turn_prompt_tokens", turn.prompt_ids.len() as u64);
     check.set("prompt_tokens", restored.prompt_ids.len() as u64);
     check.set("prompt_restored", restored.cached_tokens as u64);
     check.set("prompt_rows_compared", verdict.prompt.compared as u64);
@@ -359,6 +359,15 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     check.status = verdict.status();
     check.summary = verdict.summary();
     Ok(())
+}
+
+// Cover three of the largest shipped prefill units (2752 rows), not just one.
+const CACHE_PROMPT_TOKENS: usize = 8704;
+
+fn cache_prompts() -> (String, String) {
+    (format!("[{}] Read the notes and answer in one word.\n\n{}", nonce(), corpus(31, CACHE_PROMPT_TOKENS)),
+        format!("[{}] Here are some notes.\n\n{}\n\nCount from one to forty in words, separated by commas.",
+            nonce(), corpus(57, CACHE_PROMPT_TOKENS)))
 }
 
 /// Generated tokens of the turn-end case's turn.
@@ -836,6 +845,17 @@ pub fn describe(timing: &StreamTiming) -> String {
 mod tests {
     use super::*;
     use crate::report::Check;
+
+    #[test]
+    fn cache_prompts_cover_three_largest_prefill_units() {
+        assert!(CACHE_PROMPT_TOKENS >= 3 * 2752);
+        let (prompt, turn) = cache_prompts();
+        for (text, seed) in [(prompt, 31), (turn, 57)] {
+            let body = corpus(seed, CACHE_PROMPT_TOKENS);
+            assert!(text.contains(&body));
+            assert!(body.len() > corpus(seed, 3 * 2752).len());
+        }
+    }
 
     #[test]
     fn concurrent_levels_respect_admission_and_card_memory() {
