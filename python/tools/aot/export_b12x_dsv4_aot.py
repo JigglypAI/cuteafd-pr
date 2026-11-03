@@ -51,6 +51,19 @@ CHECKPOINT_CONTEXTS = {
 }
 
 
+def native_scalar_abi(stem: str, geometry: dict, scalars: list) -> tuple[str, list]:
+    # Old geometry has no flag; explicit false must generate the same native ABI.
+    runtime_sms = geometry.get("runtime_sm_count", False)
+    if type(runtime_sms) is not bool:
+        raise ValueError(f"{stem}: runtime_sm_count must be a boolean")
+    if runtime_sms and (not scalars or scalars[-1] != ("device_sm_count", "int32")
+                        or sum(name == "device_sm_count" for name, _ in scalars) != 1):
+        raise ValueError(f"{stem}: runtime SM count must be the last int32 scalar")
+    public = scalars[:-1] if runtime_sms else scalars
+    kinds = "".join(SCALAR_KINDS[kind] for _, kind in public)
+    return kinds + ("s" if runtime_sms else ""), public
+
+
 def geometry_context(name: str, requested: int) -> int:
     if requested <= 0:
         raise ValueError("max_context must be positive")
@@ -1292,7 +1305,7 @@ def main() -> None:
             if abi is not None and program.abi != abi:
                 raise ValueError(f"{stem}: card plans disagree on their ABI")
             abi = program.abi
-            kinds = "".join(SCALAR_KINDS[kind] for _, kind in abi["scalars"])
+            kinds, public_scalars = native_scalar_abi(stem, program.geometry, abi["scalars"])
             program.export_to_c(str(output), label, "cuteafd_" + label)
             checked = validate_exported_header(program, output / f"{label}.h", "cuteafd_" + label)
             if checked["argument_count"] != len(abi["pointers"]) + len(kinds) + 1:
@@ -1309,7 +1322,7 @@ def main() -> None:
             "name": stem, "family": family, "op": op, "params": params,
             "geometry": plans[-1]["geometry"],
             "pointers": [dict(zip(("name", "dtype", "shape", "role"), p)) for p in abi["pointers"]],
-            "scalars": [dict(zip(("name", "type"), s)) for s in abi["scalars"]],
+            "scalars": [dict(zip(("name", "type"), s)) for s in public_scalars],
             "scratch_bytes_at_capacity": scratch, "capacity_rows": capacity,
             **({"card_plans": plans} if len(plans) > 1 else
                {"entry": plans[0]["entry"], "object_sha256": plans[0]["object_sha256"]}),
