@@ -412,8 +412,8 @@
       "name": "step5-nvfp4-min",
       "config": "examples/configs/step5-nvfp4-min.config",
       "report": "benchmarks/step5/2026-10-30-smoke-step-5-preview-nvfp4-1rtx-4spark-step5-nvfp4-min",
-      "release": "v4.0.0",
-      "release_note": "Tagged build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
+      "release": "v4.0.0-rc2",
+      "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
     }
   ]
 }
