@@ -106,10 +106,8 @@ pub(crate) enum Job {
     /// 16-row tile is independent, so row windows reproduce the whole pack.
     W8a16Pack { n: usize, k: usize, rule: crate::shared::fp8_linear::Fp8Scales,
         packed: CuteafdDeviceBuffer, scale: CuteafdDeviceBuffer },
-    /// One plane (`plane`: 0 gate/up weights, 2 down weights) of a native
-    /// MXFP4 expert packed from its fused raw image at staged `at..at + bytes`
-    /// (plane 0: up rows then gate rows, each padded) into `dst`.
-    NativePlane { intermediate: u32, plane: u32, at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
+    /// Tile-aligned source rows of one native gate/up/down weight projection.
+    NativeWindow { intermediate: u32, projection: u32, first: u32, rows: u32, dst: CuteafdDeviceBuffer },
     /// The staged FP8 `kv_b` rows of `heads` heads (E4M3 at `at..`, the first
     /// at checkpoint row `row0`) and the whole tensor's FP32 128x128 grid (at
     /// `grid_at..`, `grid_bytes`) split into the GLM FP8 programs' `uk`/`uk_scale`
@@ -366,14 +364,13 @@ impl Step {
                         library.cuda_stream_synchronize(stream)
                     })?;
                 }
-                Job::NativePlane { intermediate, plane, at, bytes, dst } => {
-                    ensure!(at + bytes <= self.bytes() && at % 4 == 0, "native plane outside its step");
+                Job::NativeWindow { intermediate, projection, first, rows, dst } => {
                     let base = device_copy(scratch)?;
-                    // SAFETY: the plane's source lies in the live device scratch (checked
-                    // above), `dst` is a live operand slice; drained before reuse.
-                    let source = CuteafdDeviceBuffer { ptr: unsafe { base.add(at) }.cast_mut().cast(), bytes, ..dst };
-                    load_timing::quantize(bytes, || unsafe {
-                        library.v41_pack_plane_async(source, dst, intermediate, plane, stream)?;
+                    let source = CuteafdDeviceBuffer { ptr: base.cast_mut().cast(), bytes: self.bytes(), ..dst };
+                    // SAFETY: source is the live step scratch, dst the owned plane;
+                    // native checks tile geometry and extents before launch.
+                    load_timing::quantize(self.bytes(), || unsafe {
+                        library.v41_pack_window_async(source, dst, intermediate, projection, first, rows, stream)?;
                         library.cuda_stream_synchronize(stream)
                     })?;
                 }
