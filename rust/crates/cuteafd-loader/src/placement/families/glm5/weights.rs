@@ -586,15 +586,16 @@ impl WeightInventory {
                                 component.suffix
                             )
                         };
+                        let format = if slice.transform == DenseTransform::WidenBf16 {
+                            "f32".into()
+                        } else {
+                            component.dtype.to_lowercase()
+                        };
                         out.add(
                             rank,
                             &name,
                             group,
-                            if slice.transform == DenseTransform::WidenBf16 {
-                                "f32"
-                            } else {
-                                &component.dtype.to_lowercase()
-                            },
+                            &format,
                             slice.transform.allocation_bytes(component)? as u64,
                         )?;
                     }
