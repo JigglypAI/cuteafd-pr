@@ -3142,7 +3142,8 @@ if ((${#audio_encoder_ranks[@]})); then
     host="$(get "SPARK_${audio_rank}_HOST")"
     backend="$(ssh "$host" "docker logs cuteafd-spark-expert-$host-$port 2>&1" | python3 -c '
 import re,sys
-matches=[backend for line in sys.stdin if "audio encoder ready" in line
+text=re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", sys.stdin.read())
+matches=[backend for line in text.splitlines() if "audio encoder ready" in line
     for backend in re.findall(r"\bbackend=\"?([^\s\"]+)", line)]
 assert matches and len(set(matches))==1, "missing or conflicting ready audio backend identity"
 print(matches[0])')"

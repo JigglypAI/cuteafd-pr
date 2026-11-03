@@ -929,7 +929,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
                                     'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker bootstrap ready}"; '
-                                    'echo "audio encoder ready backend=' + audio_backend + '" ;; esac\n' +
+                                    'printf "audio encoder ready \\033[3mbackend\\033[0m\\033[2m=\\033[0m%s\\n" '
+                                    '"' + audio_backend + '" ;; esac\n' +
                                     ('case "$*" in image\\ inspect*) echo test-pin ;; '
                                      'cp\\ *) dst="${@: -1}"; mkdir -p "$dst"; '
                                      'touch "$dst/cuteafd" "$dst/libcuteafd_native.so" "$dst/release-entrypoint.sh"; '
