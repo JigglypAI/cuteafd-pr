@@ -150,7 +150,22 @@ impl<'a> GlmContextSplit<'a> {
 pub(super) struct ContextUnit {
     pub history: usize,
     pub shards: [usize; 2],
+    /// Source-pool pages including this unit's rows, for layers borrowing latent KV.
+    pub source_shards: [usize; 2],
     pub commits: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrefillSource {
+    slot: usize,
+    record_bytes: usize,
+    shards: [usize; 2],
+}
+
+fn prefill_source(cfg: &GlmDsaConfig, index: usize, unit: ContextUnit) -> PrefillSource {
+    let source = cfg.kv_source(index);
+    PrefillSource { slot: source % 2, record_bytes: cfg.record_bytes(source),
+        shards: if source == index { unit.shards } else { unit.source_shards } }
 }
 
 impl<'a> GlmEngine<'a> {
@@ -194,9 +209,13 @@ impl<'a> GlmEngine<'a> {
         let history = gather.div_ceil(PAGE_ROWS);
         let half = split.staging_pages.div_ceil(2);
         let mut shards = [0; 2];
-        for (owner, shard) in shards.iter_mut().enumerate() {
-            let local = local_pages(&pages[..history], owner)?;
-            *shard = local.len();
+        let mut source_shards = [0; 2];
+        for owner in 0..2 {
+            shards[owner] = local_pages(&pages[..history], owner)?.len();
+            // History is a prefix of this list. Borrowers also need the current rows,
+            // already committed by their source before its attention publication.
+            let local = local_pages(&pages[..(start + rows).div_ceil(PAGE_ROWS)], owner)?;
+            source_shards[owner] = local.len();
             if !local.is_empty() {
                 // The owner's whole list region: ordered uploads size their staging
                 // once per destination and never regrow it mid-call.
@@ -207,7 +226,7 @@ impl<'a> GlmEngine<'a> {
         let (table, commits) = commit_blocks(&self.record_contracts(), rank, start, rows, pages, limit)?;
         let commit = own.commit.get(lane).context("commit lane")?;
         upload(commit.buffer, bytes_of(&table))?;
-        Ok(ContextUnit { history, shards, commits })
+        Ok(ContextUnit { history, shards, source_shards, commits })
     }
 
     /// Decode attention of layer `index` on `rank` under context (module docs); leaves the
@@ -306,26 +325,29 @@ impl<'a> GlmEngine<'a> {
         -> Result<()> {
         let split = self.context.as_ref().context("context split")?;
         let own = &split.ranks[rank];
-        let staging = &own.staging[index % 2];
-        // This layer's records at its own pitch (656 B, Mistral Large 4's NoPE 528 B) inside a
-        // view sized for the widest; the index pages follow that widest extent.
-        let record_bytes = self.cfg.record_bytes(index);
+        let source = prefill_source(&self.cfg, index, unit);
+        let staging = &own.staging[source.slot];
+        // Parity staging may have been overwritten since the source layer. Borrowers
+        // re-gather its committed records, including this unit, at the source's pitch.
+        let record_bytes = source.record_bytes;
         let widest = record_page_bytes(&self.cfg) as usize;
         let records = view(staging, 0, split.staging_pages * PAGE_ROWS * record_bytes)?;
         let keys = view(staging, split.staging_pages * widest, split.staging_pages * INDEX_PAGE_BYTES)?;
-        let kv_gather = context_gather(&self.cfg, self.cfg.attention_kind(index));
+        let kv_gather = context_gather(&self.cfg, self.cfg.attention_kind(self.cfg.kv_source(index)));
         let index_gather = self.family_program("paged_staging_gather_index");
         let (kv, index_cache, _) = self.rank_caches(rank, index);
         let half = split.staging_pages.div_ceil(2);
-        for (owner, &shard) in unit.shards.iter().enumerate().filter(|(_, &n)| n > 0) {
+        for owner in 0..2 {
             let (pool, pool_keys, _) = self.rank_caches(owner, index);
-            let table = view(&own.gather, owner * half * 4, shard * 4)?.ptr;
-            let gather = |name: &str, pool: *mut c_void, staging: *mut c_void| self.run_on(rank, name,
-                &[("pool", pool), ("table", table), ("staging", staging)],
-                &[Scalar::I32((shard * PAGE_ROWS) as i32), Scalar::I32(2), Scalar::I32(owner as i32)]);
-            gather(&kv_gather, pool.buffer.ptr, records.ptr)?;
+            let gather = |name: &str, pool: *mut c_void, staging: *mut c_void, shard: usize| -> Result<()> {
+                if shard == 0 { return Ok(()); }
+                let table = view(&own.gather, owner * half * 4, shard * 4)?.ptr;
+                self.run_on(rank, name, &[("pool", pool), ("table", table), ("staging", staging)],
+                    &[Scalar::I32((shard * PAGE_ROWS) as i32), Scalar::I32(2), Scalar::I32(owner as i32)])
+            };
+            gather(&kv_gather, pool.buffer.ptr, records.ptr, source.shards[owner])?;
             if let (Some(pool_keys), true) = (pool_keys, index_cache.is_some()) {
-                gather(&index_gather, pool_keys.buffer.ptr, keys.ptr)?;
+                gather(&index_gather, pool_keys.buffer.ptr, keys.ptr, unit.shards[owner])?;
             }
         }
         self.attention_over(rank, w, index, layer, rows, cap, tables, records,
@@ -439,6 +461,109 @@ mod tests {
     /// A parity pool's ids for logical pages `0..n` (page `j` of parity `j % 2`).
     fn ids(n: usize, base: u32) -> Vec<u32> {
         (0..n as u32).map(|j| 2 * (base + j) + (j & 1)).collect()
+    }
+
+    #[test]
+    fn borrowers_gather_current_source_rows_after_intervening_formats_with_overlapping_units() -> Result<()> {
+        use crate::shared::prefill_pipeline::{run_prefill_units, sequence_units, FfnRoute, PrefillHooks, Unit};
+        let mut cfg = GlmDsaConfig::from_hf(&cuteafd_loader::plan::testing::mistral_large4_config())?;
+        assert_eq!((cfg.kv_source(39), cfg.record_bytes(35), cfg.record_bytes(37)), (35, 528, 656));
+        // A different-parity borrower still selects its source's slot and pitch;
+        // this mechanism must not depend on ML4's every-fourth-layer schedule.
+        if let cuteafd_loader::families::glm5::GlmVariant::MistralLarge4(ml4) = &mut cfg.variant {
+            ml4.kv_sources[40] = 35;
+        }
+        assert_eq!(prefill_source(&cfg, 40, ContextUnit::default()),
+            PrefillSource { slot: 1, record_bytes: 528, shards: [0; 2] });
+        struct Hooks {
+            cfg: GlmDsaConfig,
+            pools: [Vec<u8>; 2],
+            staging: [[Vec<u8>; 2]; 2],
+            published: [usize; 2],
+            live: usize,
+            peak: usize,
+            checked: Vec<usize>,
+        }
+        impl PrefillHooks for Hooks {
+            type Ticket = ();
+            fn route(&self, _: usize) -> FfnRoute { FfnRoute::Spark }
+            fn begin_unit(&mut self, _: &Unit) -> Result<()> {
+                self.live += 1;
+                self.peak = self.peak.max(self.live);
+                Ok(())
+            }
+            fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
+                let mut plan = ContextUnit::default();
+                let history = unit.rows.start.div_ceil(PAGE_ROWS);
+                let current = unit.rows.end.div_ceil(PAGE_ROWS);
+                for rank in 0..2 {
+                    plan.shards[rank] = (rank..history).step_by(2).count();
+                    plan.source_shards[rank] = (rank..current).step_by(2).count();
+                }
+                let source = prefill_source(&self.cfg, layer, plan);
+                if layer == 35 {
+                    // Both stream-local commits precede the source attention's
+                    // projection push/wait, which publishes them to the other rank.
+                    for rank in 0..2 {
+                        assert!(self.published[rank] >= unit.rows.start);
+                        for row in unit.rows.clone() {
+                            let value = (row / PAGE_ROWS + 1) as u8;
+                            self.pools[rank][row * 528..(row + 1) * 528].fill(value);
+                        }
+                        self.published[rank] = unit.rows.end;
+                    }
+                } else if layer == 37 {
+                    // Same parity as 35/39, but a different record format.
+                    assert_eq!(source.record_bytes, 656);
+                    for rank in 0..2 { self.staging[rank][source.slot].fill(0xff); }
+                } else if layer == 39 {
+                    assert_eq!((source.slot, source.record_bytes), (35 % 2, 528));
+                    assert_eq!(source.shards.iter().sum::<usize>(), current);
+                    assert!(source.shards.iter().sum::<usize>() > plan.shards.iter().sum::<usize>());
+                    for rank in 0..2 {
+                        // The real hook publishes source commits on BOTH ranks
+                        // before either rank can advance this unit past layer 35.
+                        assert!(self.published.iter().all(|&end| end >= unit.rows.end));
+                        let records = &mut self.staging[rank][source.slot];
+                        for row in 0..unit.rows.end {
+                            let owner = page_owner(row / PAGE_ROWS);
+                            records[row * 528..(row + 1) * 528]
+                                .copy_from_slice(&self.pools[owner][row * 528..(row + 1) * 528]);
+                            assert!(records[row * 528..(row + 1) * 528].iter()
+                                .all(|&v| v == (row / PAGE_ROWS + 1) as u8));
+                        }
+                    }
+                    self.checked.push(unit.index);
+                }
+                Ok(())
+            }
+            fn local_ffn(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
+            fn send_experts(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
+            fn land_experts(&mut self, _: usize, _: &Unit, _: ()) -> Result<()> { Ok(()) }
+            fn end_unit(&mut self, _: &Unit) -> Result<()> { self.live -= 1; Ok(()) }
+            fn commit_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
+        }
+        let units = sequence_units(4 * PAGE_ROWS, PAGE_ROWS, 3, 40)?;
+        let mut hooks = Hooks { cfg, pools: std::array::from_fn(|_| vec![0; 4 * PAGE_ROWS * 528]),
+            staging: std::array::from_fn(|_| std::array::from_fn(|_| vec![0; 4 * PAGE_ROWS * 656])),
+            published: [0; 2], live: 0, peak: 0, checked: Vec::new() };
+        run_prefill_units(&mut hooks, &units, 3)?;
+        assert_eq!(hooks.peak, 3, "the test must overlap units at the shared depth");
+        assert_eq!(hooks.checked, [0, 1, 2, 3]);
+        // Bind the modeled cross-rank publication to the runtime hook: source
+        // KV commits precede projection publication, and both ranks wait on it.
+        let context = include_str!("context.rs");
+        let prefill = context.split("pub(super) fn context_prefill_attention(").nth(1).unwrap();
+        assert!(prefill.contains("copy(plane, records, kv)?"));
+        let engine = include_str!("../engine.rs");
+        let peer = engine.split("fn peer_attention(").nth(1).unwrap().split("fn peer_ffn(").next().unwrap();
+        assert!(peer.find("self.attention_unit(1,").unwrap() < peer.find("self.publish_projection(1,").unwrap());
+        assert!(peer.find("self.publish_projection(1,").unwrap() < peer.find("exchange.wait(1, attended)").unwrap());
+        let own = engine.split("let attention = |index: usize, unit: usize|").nth(1).unwrap()
+            .split("let post = |index").next().unwrap();
+        assert!(own.find("self.attention_unit(0,").unwrap() < own.find("self.publish_projection(0,").unwrap());
+        assert!(own.find("self.publish_projection(0,").unwrap() < own.find("self.exchange()?.wait(0, attended)").unwrap());
+        Ok(())
     }
 
     #[test]

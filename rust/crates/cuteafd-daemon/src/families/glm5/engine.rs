@@ -2589,7 +2589,7 @@ impl<'a> GlmEngine<'a> {
     /// sequence in order, so unit `lane - 1` is the predecessor.
     pub(super) fn context_unit_turn(&self, index: usize, lane: usize) -> Result<()> {
         let mut owner = self.staging_owner.borrow_mut();
-        let view = &mut owner[index % 2];
+        let view = &mut owner[self.cfg.kv_source(index) % 2];
         self.context_reuse.set(lane > 0 && *view == Some((index, lane - 1)));
         *view = Some((index, lane));
         Ok(())
