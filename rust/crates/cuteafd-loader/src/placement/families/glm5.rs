@@ -12,6 +12,7 @@ use cuteafd_core::memory_layout::{Basis, Category};
 
 pub mod buffers;
 pub mod hooks;
+pub mod weights;
 
 pub const PAGE_ROWS: u64 = 64;
 pub const DECODE_ROWS: u64 = 64;

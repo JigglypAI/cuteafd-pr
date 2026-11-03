@@ -140,6 +140,108 @@ fn pushed_head_split_operands_match_the_mount_golden() -> Result<()> {
     Ok(())
 }
 
+fn retained_weight_plan(inventory: &cuteafd_loader::placement::families::glm5::weights::WeightInventory)
+    -> Result<cuteafd_loader::placement::planner::ResolvedPlan> {
+    use cuteafd_loader::placement::planner::{self, *};
+    let facts = Facts { allocations: inventory.owners.iter().map(|o| o.allocation.clone()).collect(),
+        deferred: vec![], sequential: vec![], allowances: vec![] };
+    let budgets: Vec<_> = (0..inventory.ranks).map(|rank| Location::coordinator(rank as u8))
+        .chain([Location::PINNED]).enumerate().map(|(index, location)| Budget {
+            id: format!("weights.fixture.{index}"), locations: vec![location],
+            physical_bytes: 1 << 34, logical_bytes: 1 << 34, headroom: 0,
+            baseline: Baseline::Forecast { occupied: 0, source: "CPU retained-weight fixture".into(), assumed: false },
+        }).collect();
+    let prefill = PrefillShape { rows: 128, waves: 1 };
+    Ok(ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
+            prefill: Pin::Exact(prefill), operation: Operation::Serving },
+        decisions: Decisions { attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
+            embedding: None, prefill, lanes: 1 }, pool_tokens: 64,
+        phases: planner::evaluate(&facts, &budgets)?, budgets, facts })
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn retained_weight_owners_match_actual_loader_and_physical_embedding() -> Result<()> {
+    use crate::shared::token_io::{EmbedPlacement, EmbedSource, TokenEmbedding};
+    use cuteafd_loader::placement::{families::glm5::weights::WeightInventory, planner::{self, *}};
+    let fixture_dso = Fixture::build()?;
+    let library = fixture_dso.load()?;
+    for device in 0..2 { fixture_dso.configure_memory(&library, device, 1 << 34)?; }
+    // Allocation-only checks: the fake DSO does not qualify forward numerics.
+    for (ranks, owned, host, native_shared, core) in [
+        (1, false, false, false, false), (2, false, false, false, false),
+        (2, true, true, false, false), (2, false, true, true, false),
+        (2, true, false, false, true),
+    ] {
+        library.cuda_set_device(0)?;
+        let root = tempfile::tempdir_in(fixture_dso.directory())?;
+        let (mut config, mut tensors) = fixture::glm5_compact_weights();
+        if core {
+            config["vocab_size"] = serde_json::json!(256);
+            let cfg = GlmDsaConfig::from_hf(&config)?;
+            tensors = tensors.into_iter().filter(|t| !t.0.ends_with("_scale_inv"))
+                .flat_map(|(name, dtype, mut shape)| {
+                    if ["lm_head.weight", "model.embed_tokens.weight"].contains(&name.as_str()) { shape[0] = 256; }
+                    if let Some(stem) = name.strip_suffix(".weight").filter(|stem|
+                        cuteafd_loader::families::glm5::core::split(&cfg, stem).is_some()) {
+                        let n = if stem.ends_with("kv_a_proj_with_mqa") { shape[0].next_multiple_of(128) } else { shape[0] };
+                        fixture::exl3(stem, n, shape[1], 6)
+                    } else {
+                        vec![(name, if dtype == "F8_E4M3" { "BF16" } else { dtype }, shape)]
+                    }
+                }).collect();
+        }
+        fixture::write_snapshot(root.path(), &config, &tensors, None);
+        let mut catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
+        if core {
+            for tensor in catalog.tensors().iter().filter(|t| t.metadata.name.ends_with(".mcg")) {
+                std::fs::File::options().write(true).open(root.path().join(&tensor.shard))?
+                    .write_all_at(&0xcbac1fedu32.to_le_bytes(), tensor.metadata.byte_offset)?;
+            }
+        }
+        let cfg = GlmDsaConfig::from_hf(&config)?;
+        let checkpoint = cuteafd_loader::plan::Checkpoint::inventory(root.path())?;
+        let owners = owned.then_some([0, 1]);
+        let home = if host { EmbeddingHome::HostPinned } else { EmbeddingHome::Device(0) };
+        let mut inventory = WeightInventory::from_checkpoint(&checkpoint, ranks, cfg.layers,
+            owners.as_ref().map(|o| o.as_slice()), bf16_programs(), native_shared, home)?;
+        let stream = std::ptr::null_mut();
+        let loader = GlmLoader { library: &library, catalog: &catalog, stream, device: 0,
+            peers: (ranks == 2).then_some(crate::shared::peer_split::RankDevice { device: 1, stream })
+                .into_iter().collect(), push: None };
+        let tensor = catalog.tensor("model.embed_tokens.weight")?;
+        let source = EmbedSource::new(root.path(), &tensor.shard, &tensor.metadata, cfg.hidden)?;
+        let (embedding, (model, mut peers)) = TokenEmbedding::load(&library, source,
+            if host { EmbedPlacement::Host } else { EmbedPlacement::Gpu },
+            || loader.model(&cfg, cfg.layers, owners.as_ref().map(|o| o.as_slice()), native_shared))?;
+        if ranks == 2 {
+            loader.peer_routers(&mut peers[0], 1..2)?;
+            inventory.add_peer_routers(&[1])?;
+        }
+        let plan = retained_weight_plan(&inventory)?;
+        let receipts = model.allocation_receipts(&peers, &embedding)?;
+        planner::reconcile(&plan, Phase::Warmup, &receipts)?;
+        let table = receipts.iter().find(|r| r.allocation.id == "glm.weights.embedding").unwrap();
+        assert_eq!(table.allocation.location, if host { Location::PINNED } else { Location::coordinator(0) });
+        assert_ne!(table.address, 0);
+        let mut missing = receipts.clone();
+        missing.pop();
+        assert!(planner::reconcile(&plan, Phase::Warmup, &missing).is_err());
+        let mut extra = receipts.clone();
+        extra[0].allocation.id.push_str(".extra");
+        assert!(planner::reconcile(&plan, Phase::Warmup, &extra).is_err());
+        let mut changed = receipts.clone();
+        changed[0].allocation.bytes += 1;
+        changed[1].allocation.bytes -= 1;
+        assert!(planner::reconcile(&plan, Phase::Warmup, &changed).is_err());
+        let mut wrong_device = receipts;
+        wrong_device[0].allocation.location = Location::coordinator(7);
+        assert!(planner::reconcile(&plan, Phase::Warmup, &wrong_device).is_err());
+    }
+    Ok(())
+}
+
 #[test]
 fn native_decode_prefetch_keeps_projection_order_before_budget_and_peer_has_no_head() {
     use crate::shared::l2_prefetch::{prefix, Range};

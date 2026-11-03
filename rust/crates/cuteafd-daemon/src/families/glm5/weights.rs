@@ -165,6 +165,68 @@ pub(crate) struct GlmWeights<'a> {
     pub head: GlmHead<'a>,
 }
 
+impl GlmWeights<'_> {
+    /// Retained physical fields only. This does not attest loading temporaries or Ready.
+    pub(crate) fn allocation_receipts(&self, peers: &[Vec<GlmLayer<'_>>],
+        embedding: &crate::shared::token_io::TokenEmbedding<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location, Receipt};
+        let mut receipts = Vec::new();
+        let mut put = |id: String, buffer: CuteafdDeviceBuffer, category: Category| -> Result<()> {
+            receipts.push(Receipt { allocation: Allocation::buffer(id,
+                Location::coordinator(u8::try_from(buffer.device_id)?), buffer.bytes as u64,
+                Lifetime::RESIDENT, category, "GLM target weights"), address: buffer.ptr as u64 });
+            Ok(())
+        };
+        for (rank, layers) in std::iter::once(self.layers.as_slice())
+            .chain(peers.iter().map(Vec::as_slice)).enumerate() {
+            for (index, layer) in layers.iter().enumerate() {
+                let prefix = format!("glm.weights.gpu.{rank}.layer.{index}");
+                for (name, owner) in &layer.operands {
+                    put(format!("{prefix}.operand.{name}"), owner.buffer, Category::Weights)?;
+                }
+                for (name, owner) in &layer.native {
+                    put(format!("{prefix}.native.{name}"), owner.buffer, Category::Weights)?;
+                }
+                for (name, owner) in &layer.core {
+                    for (suffix, buffer) in [("payload", owner.payload.buffer), ("suh", owner.suh.buffer),
+                        ("svh", owner.svh.buffer)] {
+                        put(format!("{prefix}.core.{name}.{suffix}"), buffer, Category::Weights)?;
+                    }
+                }
+            }
+        }
+        put("glm.weights.gpu.0.norm".into(), self.norm.buffer, Category::Weights)?;
+        match &self.head {
+            GlmHead::Bf16(owner) => {
+                ensure!(embedding.vocabulary_owner().is_none(), "BF16 head has native vocabulary embedding");
+                put("glm.weights.gpu.0.head".into(), owner.buffer, Category::Weights)?;
+            }
+            GlmHead::K6(owner) => {
+                ensure!(embedding.vocabulary_owner().is_none(), "K6 head has native vocabulary embedding");
+                for (suffix, buffer) in [("payload", owner.payload.buffer), ("suh", owner.suh.buffer),
+                    ("svh", owner.svh.buffer)] {
+                    put(format!("glm.weights.gpu.0.core.head.{suffix}"), buffer, Category::Weights)?;
+                }
+            }
+            GlmHead::RowFp8(owner) => {
+                ensure!(embedding.vocabulary_owner().is_some_and(|embedding|
+                    std::rc::Rc::ptr_eq(owner, embedding)), "head and embedding have different vocabulary owners");
+                for (name, table, category) in [("embedding", &owner.embedding, Category::Embedding),
+                    ("head", &owner.head, Category::Weights)] {
+                    for (suffix, buffer) in [("fp8", table.payload()), ("scale", table.scales())] {
+                        put(format!("glm.weights.gpu.0.vocabulary.{name}.{suffix}"), buffer, category)?;
+                    }
+                }
+            }
+        }
+        receipts.push(embedding.allocation_receipt("glm.weights.embedding", "GLM target weights")?);
+        receipts.sort_by(|a, b| a.allocation.id.cmp(&b.allocation.id));
+        Ok(receipts)
+    }
+}
+
 /// The vocabulary head rank 0 owns: the checkpoint's BF16 head (the shared
 /// tensor-core route), or an EXLR8 checkpoint's row-FP8 head (its own program).
 pub(crate) enum GlmHead<'a> {

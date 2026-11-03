@@ -172,6 +172,23 @@ impl<'a> TokenEmbedding<'a> {
 
     pub(crate) fn allocation_buffer(&self) -> CuteafdDeviceBuffer { self.table.buffer() }
 
+    pub(crate) fn vocabulary_owner(&self) -> Option<&std::rc::Rc<native::NativeVocabulary<'a>>> {
+        self.row_fp8.as_ref()
+    }
+
+    /// Physical table storage, not a mapped device alias or the shared vocabulary.
+    pub(crate) fn allocation_receipt(&self, id: &str, group: &str) -> anyhow::Result<cuteafd_loader::placement::planner::Receipt> {
+        use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location, Receipt};
+        let (location, bytes, address) = match &self.table {
+            ResidentWeight::Device(owner) => (Location::coordinator(u8::try_from(owner.buffer.device_id)?),
+                owner.buffer.bytes, owner.buffer.ptr as u64),
+            ResidentWeight::Host { storage, .. } => (Location::PINNED,
+                storage.buffer.bytes, storage.buffer.ptr as u64),
+        };
+        Ok(Receipt { allocation: Allocation::buffer(id, location, bytes as u64,
+            Lifetime::RESIDENT, cuteafd_core::memory_layout::Category::Embedding, group), address })
+    }
+
     pub fn device_gather(&self) -> bool { true }
 
     pub fn vocab(&self) -> usize {
