@@ -5,6 +5,8 @@ use super::{PAGE_ROWS, weights::WeightInventory};
 use super::{buffers::TargetBuffers, exchanges::ExchangeBuffers, hooks::HookBuffers};
 use crate::families::glm5::GlmDsaConfig;
 use crate::placement::{LayerMode, planner::*};
+use crate::serving_capacity::glm_graphs::{GlmGraphShape, glm_owned_startup_graphs};
+use crate::placement::inventory::{StartupGraphs, GLM_OWNED_SM120_GRAPH_BYTES};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A condition names a domain value, never a solver variable index. Conditions
@@ -56,9 +58,74 @@ pub struct GlmRecipe<'a> {
     pub hooks: Vec<Case<HookBuffers>>,
     pub exchanges: Vec<Case<ExchangeBuffers>>,
     pub weights: Vec<Case<WeightInventory>>,
-    /// Expert, drafter, serving, code/graph and temporary physical components.
+    pub graphs: Vec<Case<OwnedGraphs>>,
+    /// Expert, drafter, serving, code and temporary physical components.
     /// Their constructors remain responsible for independent actual receipts.
     pub owners: Vec<Case<Vec<Component>>>,
+}
+
+/// Exact owned-attention startup keys and separately bounded opaque graph memory.
+/// The selected full context fixes the key census for every admissible pool.
+#[derive(Debug, Clone)]
+pub struct OwnedGraphs {
+    context: u64,
+    owners: Vec<u8>,
+    tp2: Vec<bool>,
+    startup: StartupGraphs<GlmGraphShape>,
+}
+
+impl OwnedGraphs {
+    pub fn new(context: u64, owners: &[u8], tp2: &[bool]) -> Result<Self, Refusal> {
+        if context == 0 {
+            return Err(invalid("zero graph context"));
+        }
+        let extent = usize::try_from(context)
+            .map_err(|_| Refusal::Overflow("GLM graph context"))?;
+        let startup = glm_owned_startup_graphs(
+            extent, extent.div_ceil(PAGE_ROWS as usize), owners, tp2,
+        ).map_err(Refusal::InvalidFact)?;
+        Ok(Self { context, owners: owners.to_vec(), tp2: tp2.to_vec(), startup })
+    }
+
+    pub fn startup(&self) -> &StartupGraphs<GlmGraphShape> {
+        &self.startup
+    }
+
+    pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        if maximum_pages == 0 {
+            return Err(invalid("zero graph pool extent"));
+        }
+        let mut out = Vec::new();
+        for (rank, census) in self.startup.inventory.ranks.iter().enumerate() {
+            let rank = u8::try_from(rank).map_err(|_| Refusal::Overflow("GLM graph rank"))?;
+            let ready = census.executables.checked_mul(GLM_OWNED_SM120_GRAPH_BYTES)
+                .ok_or(Refusal::Overflow("GLM graph executables"))?;
+            let margin = census.bytes.checked_sub(ready)
+                .ok_or_else(|| invalid("graph bound is below executable calibration"))?;
+            if margin != census.margin {
+                return Err(invalid("graph census differs from checked calibration"));
+            }
+            for (bytes, first, name) in [
+                (ready, Phase::Warmup, "startup"),
+                (margin, Phase::Growth, "growth"),
+            ] {
+                out.push(Component {
+                    activation: Activation::always(),
+                    bytes: ByteCurve::fixed(bytes, maximum_pages),
+                    kind: ComponentKind::Allowance(Allowance {
+                        location: Location::coordinator(rank),
+                        bytes,
+                        lifetime: Lifetime { first, last: Phase::Growth },
+                        source: format!("GLM owned graph {name}: exact {} keys at selected context {}, {} executables; SM120 {} B/executable, 10% growth (64 MiB minimum); PRO 6000 capture census 2026-10-15, 5090 unmeasured",
+                            self.startup.keys.len(), self.context, census.executables,
+                            GLM_OWNED_SM120_GRAPH_BYTES),
+                        assumed: true,
+                    }),
+                });
+            }
+        }
+        Ok(out)
+    }
 }
 
 struct Domains<'a> {
@@ -213,7 +280,7 @@ impl Recipe for GlmRecipe<'_> {
             || self.attention.len() > self.cfg.layers
             || self.context == 0
             || request.context == 0
-            || request.context > self.context
+            || request.context != self.context
             || self.maximum_pages == 0
             || self.maximum_pages == u64::MAX
             || self.page_tokens == 0
@@ -405,6 +472,35 @@ impl Recipe for GlmRecipe<'_> {
                 &case.when,
                 case.value.components(self.maximum_pages)?,
             )?;
+        }
+        for case in &self.graphs {
+            let graph = &case.value;
+            if self.gpus != 2 || graph.context != self.context
+                || graph.owners.len() != self.attention.len()
+                || self.attention.iter().zip(&graph.owners).any(|(mode, owner)|
+                    !matches!(mode, LayerMode::Whole { gpu, .. } if gpu == owner)) {
+                return Err(invalid("owned graph geometry differs from contract"));
+            }
+            let activation = domains.activation(&case.when)?;
+            for clause in &activation.clauses {
+                let counts: Vec<_> = if let Some((variable, profile)) = onboard {
+                    profile.counts.iter().enumerate().filter(|(option, _)|
+                        clause.iter().all(|choice| choice.variable != variable || choice.option == *option))
+                        .map(|(_, &count)| count).collect()
+                } else { vec![0] };
+                for count in counts {
+                    let mut tp2 = vec![false; self.attention.len()];
+                    if let Some((_, profile)) = onboard {
+                        if profile.destination == [0, 1] {
+                            for &layer in &profile.layers[..count] { tp2[layer] = true; }
+                        }
+                    }
+                    if graph.tp2 != tp2 {
+                        return Err(invalid("owned graph TP2 census differs from activation"));
+                    }
+                }
+            }
+            domains.append(&mut contract, &case.when, graph.components(self.maximum_pages)?)?;
         }
         for case in &self.owners {
             domains.append(&mut contract, &case.when, case.value.clone())?;
