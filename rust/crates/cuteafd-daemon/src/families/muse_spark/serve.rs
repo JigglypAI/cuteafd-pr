@@ -583,7 +583,7 @@ mod tests {
         assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
         assert!(!body.contains("bail!(\"Muse Spark step executor"), "serving no longer stops after bring-up");
         let worker = source.split("\nfn worker(").nth(1).unwrap().split("\npub(crate) async fn run(").next().unwrap();
-        assert!(worker.contains("scheduler::Drafts::None") && worker.contains("ready.encoder"));
+        assert!(worker.contains("scheduler::Drafts::None") && worker.contains("Ready { encoder, image, audio, cache_bytes, prefix } = ready"));
         // `--draft` drives neural drafts (the policy's depth, or the fixed one); without it, none.
         assert!(worker.contains("(Some(_), Some(depth)) => scheduler::Drafts::Neural { depth: usize::from(depth), fixed: true }"));
         assert!(worker.contains("DflashConfig::read(snapshot)?.drafts(), fixed: false"));
