@@ -513,10 +513,30 @@ impl WeightInventory {
             ranks: plans.len(),
             owners: Vec::new(),
         };
+        out.extend_native(selection, layers, &plans.iter().collect::<Vec<_>>())?;
+        Ok(out)
+    }
+
+    /// Append a separately validated owner group, such as the vocabulary, from
+    /// the executor's existing per-rank plans without rebuilding their geometry.
+    pub fn extend_native(
+        &mut self,
+        selection: &DenseSelection,
+        layers: usize,
+        plans: &[&DensePlan],
+    ) -> Result<()> {
+        ensure!(
+            (1..=2).contains(&self.ranks) && plans.len() == self.ranks,
+            "GLM native owner group ranks"
+        );
+        let mut out = Self {
+            ranks: self.ranks,
+            owners: Vec::new(),
+        };
         let mut embedding = false;
         for (rank, plan) in plans.iter().enumerate() {
             ensure!(
-                plan.rank == rank && plan.world == plans.len(),
+                plan.rank == rank && plan.world == self.ranks,
                 "GLM native plan rank identity"
             );
             let before = sum(out.owners.iter().map(|owner| owner.allocation.bytes))?;
@@ -610,7 +630,15 @@ impl WeightInventory {
         if embedding {
             out.embedding(EmbeddingHome::Device(0), 256, "placeholder")?;
         }
-        Ok(out)
+        ensure!(
+            out.owners.iter().all(|new| self
+                .owners
+                .iter()
+                .all(|old| old.allocation.id != new.allocation.id)),
+            "duplicate GLM native owner group"
+        );
+        self.owners.extend(out.owners);
+        Ok(())
     }
 }
 

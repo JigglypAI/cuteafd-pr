@@ -113,6 +113,10 @@ impl VocabularyPlan {
         Ok(cuteafd_loader::plan::exlr8::dense::resident_native(selection, layers, &self.dense)?)
     }
 
+    pub(crate) fn dense_plan(&self) -> &DensePlan {
+        &self.dense
+    }
+
     pub(crate) fn resident_bytes(&self) -> usize {
         self.dense.resident_bytes
     }

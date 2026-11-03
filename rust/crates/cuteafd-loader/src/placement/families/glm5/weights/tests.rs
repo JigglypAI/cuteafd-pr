@@ -236,8 +236,7 @@ fn checkpoint_owners_refuse_missing_sources_and_invalid_block_splits() {
     assert!(inventory.add_peer_routers(&[0]).is_err());
 }
 
-#[test]
-fn native_owners_consume_shared_slices_absorption_and_vocabulary_once() {
+fn native_fixture() -> (DenseSelection, Vec<DenseRecord>) {
     let (config, _) = testing::glm5_compact_weights();
     let selection = DenseSelection::from_hf(&config).unwrap();
     let component = |suffix: &str, dtype: &str, shape: Vec<usize>, bytes| DenseComponent {
@@ -329,6 +328,12 @@ fn native_owners_consume_shared_slices_absorption_and_vocabulary_once() {
             ],
         ),
     ];
+    (selection, records)
+}
+
+#[test]
+fn native_owners_consume_shared_slices_absorption_and_vocabulary_once() {
+    let (selection, records) = native_fixture();
     let plans: Vec<_> = (0..2)
         .map(|rank| DensePlan::for_rank(&records, 2, rank).unwrap())
         .collect();
@@ -369,4 +374,55 @@ fn native_owners_consume_shared_slices_absorption_and_vocabulary_once() {
     let duplicate = invalid[0].tensors[0].clone();
     invalid[0].tensors.push(duplicate);
     assert!(WeightInventory::from_native(&selection, 2, &invalid).is_err());
+}
+
+#[test]
+fn native_owner_groups_compose_once_and_refuse_without_mutation() {
+    let (selection, records) = native_fixture();
+    let backbone = selection.backbone(&records, 2).unwrap();
+    let names = selection.vocabulary_names();
+    let vocabulary: Vec<_> = records
+        .iter()
+        .filter(|record| names.contains(&record.tensor))
+        .cloned()
+        .collect();
+    let census = |inventory: &WeightInventory| {
+        inventory.owners.iter().map(|owner| (
+            owner.allocation.id.clone(),
+            (owner.allocation.clone(), owner.group.clone(), owner.format.clone()),
+        )).collect::<BTreeMap<_, _>>()
+    };
+    for ranks in [1, 2] {
+        let plans = |records: &[DenseRecord]| (0..ranks)
+            .map(|rank| DensePlan::for_rank(records, ranks, rank).unwrap())
+            .collect::<Vec<_>>();
+        let whole = WeightInventory::from_native(&selection, 2, &plans(&records)).unwrap();
+        let mut separate = WeightInventory::from_native(&selection, 2, &plans(&backbone)).unwrap();
+        let vocabulary = plans(&vocabulary);
+        separate.extend_native(&selection, 2, &vocabulary.iter().collect::<Vec<_>>()).unwrap();
+        let expected = census(&whole);
+        assert_eq!(census(&separate), expected);
+        assert_eq!(separate.resident_groups().unwrap(), whole.resident_groups().unwrap());
+        assert_eq!(separate.owners.iter().filter(|owner|
+            owner.allocation.id == "glm.weights.embedding").count(), 1);
+        assert_eq!(bytes(&separate, "glm.weights.embedding"), 256);
+
+        assert!(separate.extend_native(&selection, 2,
+            &vocabulary.iter().collect::<Vec<_>>()).is_err());
+        assert_eq!(census(&separate), expected);
+        for defect in 0..4 {
+            let mut fresh = WeightInventory::from_native(&selection, 2, &plans(&backbone)).unwrap();
+            let before = census(&fresh);
+            let mut broken = vocabulary.clone();
+            match defect {
+                0 => { broken.pop(); }
+                1 => broken[ranks - 1].rank = ranks,
+                2 => broken[ranks - 1].world = ranks + 1,
+                _ => broken[ranks - 1].resident_bytes += 1,
+            }
+            assert!(fresh.extend_native(&selection, 2,
+                &broken.iter().collect::<Vec<_>>()).is_err(), "{ranks} ranks defect {defect}");
+            assert_eq!(census(&fresh), before, "{ranks} ranks defect {defect}");
+        }
+    }
 }

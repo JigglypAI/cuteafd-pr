@@ -855,27 +855,31 @@ impl Opened {
         let native_workspace = native_plans.iter().map(|plan| plan.workspace as u64).max().unwrap_or(0);
         let host_embedding = args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host;
         ensure!(!native || !host_embedding, "the EXLR8 row-FP8 embedding is device-resident (its owner holds the head too)");
-        let groups = match (&checkpoint, &native_records) {
+        use cuteafd_loader::placement::{families::glm5::weights::WeightInventory, planner::EmbeddingHome};
+        let weight_inventory = match (&checkpoint, &native_records) {
             (Some(checkpoint), _) => {
                 if host_embedding { checkpoint.require_untied_embedding("model.embed_tokens.weight")?; }
-                cuteafd_loader::plan::layout::glm5::resident_owned(checkpoint, devices.len(), layers, owners.as_deref())?
+                WeightInventory::from_checkpoint(checkpoint, devices.len(), layers, owners.as_deref(),
+                    weights::bf16_programs(), native,
+                    if host_embedding { EmbeddingHome::HostPinned } else { EmbeddingHome::Device(0) })?
             }
             (None, Some(records)) => {
-                use cuteafd_loader::plan::exlr8::dense::{DenseSelection, resident_native};
+                use cuteafd_loader::plan::exlr8::dense::DenseSelection;
                 let config = serde_json::from_slice(&std::fs::read(self.snapshot.join("config.json"))?)?;
                 let selection = DenseSelection::from_hf(&config)?;
-                native_dense_records.iter().enumerate().map(|(rank, owned)| -> Result<_> {
-                    let mut groups = resident_native(&selection, layers, &owned.plan)?;
-                    groups.extend(crate::shared::token_io::native::VocabularyPlan::new(records, &selection,
-                        devices.len(), rank, self.cfg.hidden, self.cfg.vocab_size)?.resident_groups(&selection, layers)?);
-                    Ok(groups)
-                }).collect::<Result<Vec<_>>>()?
+                let plans = native_dense_records.iter().map(|owned| owned.plan.clone()).collect::<Vec<_>>();
+                let mut inventory = WeightInventory::from_native(&selection, layers, &plans)?;
+                let vocabulary = (0..devices.len()).map(|rank|
+                    crate::shared::token_io::native::VocabularyPlan::new(records, &selection,
+                        devices.len(), rank, self.cfg.hidden, self.cfg.vocab_size)).collect::<Result<Vec<_>>>()?;
+                inventory.extend_native(&selection, layers,
+                    &vocabulary.iter().map(|plan| plan.dense_plan()).collect::<Vec<_>>())?;
+                inventory
             }
             (None, None) => anyhow::bail!("GLM coordinator operands need a checkpoint"),
         };
-        let mut reserved_weights = groups.into_iter().map(|groups|
-                groups.into_iter().filter(|(group, _, _)| (!host_embedding || group != "embedding")
-                    && (!native || group != "shared_expert"))
+        let mut reserved_weights = weight_inventory.resident_groups()?.into_iter().map(|groups|
+                groups.into_iter().filter(|(group, _, _)| !native || group != "shared_expert")
                     .try_fold(0u64, |sum, (_, _, bytes)| sum.checked_add(bytes)
                         .context("GLM coordinator weight reservation overflow")))
                 .collect::<Result<Vec<_>>>()?;
