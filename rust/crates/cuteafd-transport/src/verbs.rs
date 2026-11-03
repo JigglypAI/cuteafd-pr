@@ -1,7 +1,7 @@
 mod registered_response;
 mod send_queue;
 mod landing;
-pub use landing::{gpu_landing_probe, DeviceLanding, GpuLandingProbe, LandingSlice};
+pub use landing::{gpu_landing_probe, DeviceLanding, GpuLandingProbe, GpuLandingRegistrationError, LandingSlice};
 use registered_response::{RegisteredResponseFrame, RegisteredResponseRing};
 mod egress;
 pub use egress::StagingArena;
@@ -2118,7 +2118,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
                 } else {
                     cuteafd_core::SparkIngress::Fp8K32
                 };
-                let (max_request, max_response) = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows, ingress }
+                let (max_request, max_response) = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows, ingress, partial_reply_bytes: None }
                     .wire_bytes(cuteafd_core::expert_geometry()).context("invalid expert endpoint wire geometry")?;
                 (request_wire_bytes.max(max_request), expected_response_wire_bytes.max(max_response))
             }
@@ -2238,7 +2238,10 @@ impl VerbsHostProtocolV2PersistentClientSession {
         }
         endpoint.connect_with_flow_label(&ready.server_native_endpoint, flow_label)?;
         // Before any receive is posted, so every response slot scatters alike.
-        let gpu_landing = landing.is_some_and(|landing| landing::attach(&endpoint, landing, addr));
+        let gpu_landing = if let Some(landing) = landing {
+            landing::attach(&endpoint, landing, addr)?;
+            true
+        } else { false };
         // A placed landing posts each receive with its request (at that
         // wave's slice); everything else keeps the whole ring posted.
         let placed_landing = gpu_landing && landing.is_some_and(|landing| landing.placed);
@@ -4235,6 +4238,17 @@ fn verbs_host_expected_response_for_request(
 }
 
 fn verbs_host_expected_response_wire_bytes(request: &ExpertProtocolV2Request) -> Result<usize> {
+    if let Some(plan) = &request.partial {
+        // A partial reply is its header and the request's own region payload, never row-indexed.
+        let rows = request.header.row_count as usize;
+        anyhow::ensure!(rows > 0 && request.header.route_count as usize % rows == 0,
+            "verbs-host partial reply needs a uniform top-k per row");
+        let topk = request.header.route_count as usize / rows;
+        let header = if request.debug_checksum_enabled() { EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN }
+            else { EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN };
+        return header.checked_add(plan.payload(topk, request.header.hidden_dim as usize)?.3)
+            .context("verbs-host partial reply wire byte count overflow");
+    }
     let hidden_dim = request.header.hidden_dim as usize;
     let bf16_row_bytes = ExpertV2Dtype::Bf16.row_bytes(hidden_dim)?;
     let negotiated_row_bytes = if request.nvfp4_e2m1_fp8_e4m3_response_enabled() {
@@ -5309,6 +5323,31 @@ mod persistent_tests {
         assert_eq!(assembler.finish_validation().unwrap().row_count, 1);
     }
 
+    /// A partial reply is bounded by its own region plan (never the compact
+    /// plane, never row-indexed), with or without the debug header.
+    #[test]
+    fn expected_partial_response_is_the_request_plan() -> Result<()> {
+        use crate::{ExpertProtocolV2RouteEntry, PartialReplyPlan, PartialWire};
+        let (rows, topk, width) = (5usize, 8usize, 4096usize);
+        let descriptors: Vec<ExpertProtocolV2RowDescriptor> = (0..rows).map(|row| ExpertProtocolV2RowDescriptor { row_id: row as u64,
+            source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1, token_position: row as u64,
+            route_offset: (row * topk) as u32, route_count: topk as u32 }).collect();
+        let routes: Vec<ExpertProtocolV2RouteEntry> = (0..rows * topk).map(|i| ExpertProtocolV2RouteEntry { row_index: (i / topk) as u32,
+            expert_id: i as u32 % 256, gate_weight: 0.125 }).collect();
+        for (wide, regions) in [(PartialWire::Nvfp4, vec![0, 0, 1, 1, 1]), (PartialWire::Fp8, vec![1; 5]),
+            (PartialWire::Nvfp4, vec![0; 5])] {
+            let plan = PartialReplyPlan { wide, regions };
+            let request = ExpertProtocolV2Request::new_bytes(3, 17, 1, width as u32, ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+                descriptors.clone(), routes.clone(), bytes::Bytes::from(vec![0; rows * (width + width / 32)]))?
+                .with_partial_replies(plan.clone())?;
+            let payload = plan.payload(topk, width)?.3;
+            assert_eq!(verbs_host_expected_response_wire_bytes(&request)?, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN + payload);
+            assert_eq!(verbs_host_expected_response_wire_bytes(&request.clone().with_debug_checksum())?,
+                EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN + payload);
+        }
+        Ok(())
+    }
+
     #[test]
     fn expected_response_wire_bytes_cover_row_indexed_device_output() {
         let request = persistent_chunk_request(3);
@@ -5337,7 +5376,7 @@ mod persistent_tests {
             request.header.hidden_row_stride_bytes = geometry.hidden + geometry.hidden / 32;
             request.header.flags = crate::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
             let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity,
-                ingress: cuteafd_core::SparkIngress::Fp8K32 };
+                ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None };
             let (_, response) = endpoint.wire_bytes(geometry).unwrap();
             for debug in [false, true] {
                 if debug { request.header.flags |= crate::EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM; }

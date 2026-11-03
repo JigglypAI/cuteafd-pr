@@ -15,21 +15,12 @@ fn spark_model(catalog: &cuteafd_loader::OfficialV41Catalog, capacity: u32, wave
     // The two decode lanes' links at the decode width and the one prefill
     // link at the unit (its `waves` units are the prefill owner's buffered units).
     let model = cuteafd_transport::worker_selection::ModelAdmission::new(
-        vec![SparkEndpoint { ring_depth: None, capacity: decode.min(capacity), ingress },
-             SparkEndpoint { ring_depth: None, capacity: decode.min(capacity), ingress },
-             SparkEndpoint { ring_depth: None, capacity, ingress }],
+        vec![SparkEndpoint { ring_depth: None, capacity: decode.min(capacity), ingress, partial_reply_bytes: None },
+             SparkEndpoint { ring_depth: None, capacity: decode.min(capacity), ingress, partial_reply_bytes: None },
+             SparkEndpoint { ring_depth: None, capacity, ingress, partial_reply_bytes: None }],
         crate::shared::placement::spark_rings(64 << 20)?, executions)?;
     model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
     Ok(model)
-}
-
-pub(super) fn start_sparks(args: &crate::cli::NativeServeArgs,
-    catalog: &cuteafd_loader::OfficialV41Catalog, local_layers: usize,
-    capacity: u32,
-    topology: Option<cuteafd_transport::expert::SparkTopology>)
-    -> Result<Option<crate::shared::placement::PendingSparkAdmission>> {
-    plan_sparks(args, catalog, local_layers, capacity, topology)?
-        .map(|admission| admission.start(&args.peers)).transpose()
 }
 
 /// The Spark admission (headers only), before any worker is contacted.
@@ -65,20 +56,6 @@ pub(crate) fn spark_admission(snapshot: &std::path::Path, catalog: &cuteafd_load
 #[cfg(test)]
 mod spark_tests {
     use super::*;
-
-    #[test]
-    fn local_load_overlaps_spark_load_before_transport_connects() {
-        for (source, load, connect) in [
-            (include_str!("../v41_native_serve.rs"), "ExpertWeights::load(", "transport.bootstrap("),
-            (include_str!("distributed.rs"), "tp2_ffn::load_routed_weights(", "super::spark_transport("),
-        ] {
-            let start = source.find("admission::start_sparks(").or_else(|| source.find("plan.start_with(")).unwrap();
-            let load = source[start..].find(load).unwrap() + start;
-            let wait = source.find("pending.wait()?").unwrap();
-            let connect = source[wait..].find(connect).unwrap() + wait;
-            assert!(start < load && load < wait && wait < connect);
-        }
-    }
 
     #[test]
     fn planner_and_serve_admit_identical_spark_owners() -> Result<()> {

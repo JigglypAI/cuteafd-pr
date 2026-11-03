@@ -2153,7 +2153,7 @@ impl<'a> MimoEngine<'a> {
             if gather {
                 // SAFETY: the step's ids are in `ids` before the replay; `h` holds its rows.
                 unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, 1, std::ptr::null(),
-                    w.h.buffer.ptr, self.stream)? };
+                    w.h.buffer.ptr, None, self.stream)? };
             }
             if let Some(w1) = w1 {
                 // The embedded rows to the second GPU's residual stream.
@@ -2754,7 +2754,7 @@ impl<'a> MimoEngine<'a> {
         unsafe {
             self.library.glm_dflash_tap(mtp.normed_e.buffer.ptr, mtp.cat.buffer.ptr, t, h, 2 * h, 0, self.stream)?;
             self.library.glm_dflash_tap(mtp.normed_h.buffer.ptr, mtp.cat.buffer.ptr, t, h, 2 * h, h, self.stream)?;
-            self.library.linear_bf16(mtp.cat.buffer.ptr, stage.eh.buffer.ptr, w.h.buffer.ptr, t, 2 * h, h, self.stream)?;
+            mtp.projection.launch(mtp.cat.buffer.ptr, stage.eh.buffer.ptr, w.h.buffer.ptr, t, 2 * h, h, self.stream)?;
         }
         let layer = &stage.layer;
         self.norm(w, layer.ptr("input_norm")?, 0, rows)?;

@@ -90,6 +90,7 @@ fn selection_fingerprint(
     rows: usize,
     request_lengths: &[usize],
     group_rows: &[usize],
+    committed: &[bool],
     max_length: u64,
 ) -> Vec<usize> {
     let width = tile_width(max_length as usize, DECODE_WIDTH_BUCKET);
@@ -100,11 +101,16 @@ fn selection_fingerprint(
     // context. Hashing `tiles` here would recapture every follower layer at
     // 16K for no geometry change.
     let passes = if layer > 20 { 1 } else { tiles };
-    let mut fingerprint = Vec::with_capacity(6 + request_lengths.len() + group_rows.len());
+    let mut fingerprint = Vec::with_capacity(7 + request_lengths.len() * 2 + group_rows.len());
     fingerprint.push(layer);
     fingerprint.push(rows);
     fingerprint.extend(request_lengths.iter().copied());
     fingerprint.extend(group_rows.iter().copied());
+    // The committed/live choice binds different `packed`/`scales` pointers, so
+    // two rounds that alternate it must not share a graph: the native update
+    // would see the same old value mapped to two different replacements and
+    // refuse, forcing a recapture every round.
+    fingerprint.extend(committed.iter().map(|&c| usize::from(c)));
     fingerprint.extend([width, usize::from(use_candidates), passes,
         request_lengths.len(), group_rows.len()]);
     fingerprint
@@ -300,6 +306,12 @@ pub(crate) struct IndexSelectionWave<'a> {
     ready: Option<Ready>,
     pending: Option<Ready>,
     in_flight: bool,
+    /// Completion event recorded after the last launch on `storage.stream`.
+    /// The in-place graph update mutates the executable on the host, so it must
+    /// not run while a previous launch of that executable is still executing.
+    /// Under `chain::deferred()` the stream is never drained between rounds, so
+    /// this event is the only proof the previous launch finished.
+    graph_event: Option<*mut c_void>,
     audit: bool,
     async_audit: Option<AsyncAudit<'a>>,
 }
@@ -380,6 +392,8 @@ impl<'a> IndexSelectionWave<'a> {
             retain_decode_graphs: false, fixed_captures: BTreeSet::new(), fixed_recaptures: 0,
             graph_update_fallbacks: 0,
             ready: None, pending: None, in_flight: false,
+            // The current device is the storage device (checked above).
+            graph_event: Some(library.cuda_event_create()?),
             audit: std::env::var_os("CUTEAFD_V41_INDEX_AUDIT").is_some_and(|v| v == "1"),
             async_audit: AsyncAudit::new(library, capacity)?,
         })
@@ -448,6 +462,23 @@ impl<'a> IndexSelectionWave<'a> {
     fn synchronize(&self) -> Result<()> {
         unsafe { self.storage.stream.library.cuda_stream_synchronize(self.storage.stream.raw) }
     }
+    /// Record the completion of the launch just enqueued on the shared stream.
+    /// The in-place update waits on this event before mutating the executable.
+    fn record_launch(&self) -> Result<()> {
+        let Some(event) = self.graph_event else { return Ok(()) };
+        // SAFETY: the event was created on this wave's device and the stream is
+        // live; recording orders it after the launch just enqueued.
+        unsafe { self.storage.stream.library.cuda_event_record(event, self.storage.stream.raw) }
+    }
+    /// Wait for the previous launch of the retained executable to finish before
+    /// the host mutates it. `chain::deferred()` makes `require_complete` a
+    /// no-op, so this event is the only drain on the chained target pass.
+    fn drain_graph_launch(&self) -> Result<()> {
+        let Some(event) = self.graph_event else { return Ok(()) };
+        // SAFETY: the event was recorded on this wave's stream after its last
+        // launch; synchronizing it retires that launch before the update.
+        unsafe { self.storage.stream.library.cuda_event_synchronize(event) }
+    }
     pub fn enable_small_graph_shapes(&mut self) {
         if !self.retain_decode_graphs {
             self.retain_decode_graphs = true;
@@ -481,6 +512,9 @@ impl<'a> IndexSelectionWave<'a> {
                 drop(self.graphs.drain_retired(|| Ok(()))?);
                 self.graph = None;
             } else {
+                // Advance the LRU clock on the most common hit so a hot graph is
+                // not evicted ahead of a colder one.
+                self.graphs.launch(&key);
                 return Ok(true);
             }
         }
@@ -535,19 +569,30 @@ impl<'a> IndexSelectionWave<'a> {
     fn update_graph_values(&mut self, key: &Vec<usize>, values: &[u64], widths: &[u8],
         kinds: &[u8], extents: &[u64]) -> Result<()> {
         let library = self.storage.stream.library;
+        {
+            let owner = self.graphs.get(key).context("index selection graph owner missing")?;
+            ensure!(owner.graph.is_some(), "index selection retained graph missing");
+            if owner.pins.0.as_slice() == values && owner.pins.1.as_slice() == widths
+                && owner.pins.2.as_slice() == kinds { return Ok(()); }
+            // A changing scalar whose old value equals a launch extent would
+            // rewrite the extent parameter while the captured gridDim stays at
+            // the old size. Refuse before the native call so the caller
+            // recaptures.
+            ensure_no_extent_rewrite(&owner.pins.0, values, widths, kinds, extents)?;
+        }
+        // The previous launch of this executable may still be executing: the
+        // chained target pass never drains the stream between rounds. Wait on
+        // the completion event recorded after that launch before mutating the
+        // executable on the host.
+        self.drain_graph_launch()?;
         let owner = self.graphs.get_mut(key).context("index selection graph owner missing")?;
         let graph = owner.graph.context("index selection retained graph missing")?;
-        if owner.pins.0.as_slice() == values && owner.pins.1.as_slice() == widths
-            && owner.pins.2.as_slice() == kinds { return Ok(()); }
-        // A changing scalar whose old value equals a launch extent would rewrite
-        // the extent parameter while the captured gridDim stays at the old size.
-        // Refuse before the native call so the caller recaptures.
-        ensure_no_extent_rewrite(&owner.pins.0, values, widths, kinds, extents)?;
         let mut found = vec![0u8; values.len()];
         let started = std::time::Instant::now();
         // SAFETY: the executable and retained graph belong to this device, the
-        // stream is drained, and the value arrays describe captured kernel
-        // arguments (see `cuda_graph_exec_update_pointers`).
+        // previous launch has drained (see `drain_graph_launch`), and the value
+        // arrays describe captured kernel arguments (see
+        // `cuda_graph_exec_update_pointers`).
         unsafe {
             library.cuda_graph_exec_update_pointers(
                 owner.raw, graph, &owner.pins.0, values, widths, kinds, &mut found)?;
@@ -600,6 +645,9 @@ impl<'a> IndexSelectionWave<'a> {
         ensure!(!self.in_flight, "index selection pending");
         self.ready = None;
         self.storage.stream.require_complete()?;
+        // `require_complete` is a no-op under `chain::deferred()`; the recorded
+        // launch event is the real proof the executable is idle before destroy.
+        self.drain_graph_launch()?;
         self.graph = None;
         self.graphs.retire_all();
         drop(self.graphs.drain_retired(|| Ok(()))?);
@@ -794,6 +842,7 @@ impl<'a> IndexSelectionWave<'a> {
         // Stable launch geometry only. Volatile device pointers and per-request
         // capacities are updated in the captured graph instead of keying on them.
         let mut request_lengths = Vec::with_capacity(requests.len());
+        let mut committed = Vec::with_capacity(requests.len());
         let mut metadata = Vec::with_capacity(rows);
         let mut groups = Vec::new();
         for (i, r) in requests.iter().enumerate() {
@@ -820,6 +869,7 @@ impl<'a> IndexSelectionWave<'a> {
             );
             let p = r.proposal;
             request_lengths.push(r.positions.len());
+            committed.push(p.committed());
             ensure!(p.cache.pool_rows.bytes > 0 && p.cache.slot < p.cache.pool_rows.bytes / 8
                 && p.cache.pool_pages.bytes == (p.cache.pool_rows.bytes / 8) * p.cache.device_pages.bytes,
                 "index pool table geometry differs");
@@ -873,7 +923,7 @@ impl<'a> IndexSelectionWave<'a> {
         let tiles = (max_length as usize).div_ceil(width).max(1);
         let group_rows: Vec<usize> = groups.iter().map(|group| group.rows).collect();
         let fingerprint = selection_fingerprint(
-            query.layer, rows, &request_lengths, &group_rows, max_length);
+            query.layer, rows, &request_lengths, &group_rows, &committed, max_length);
         let extents = launch_extent_values(&groups, rows, width);
         // Kernel arguments that change between rounds with the same geometry:
         // the query/cache/proposal device pointers and the capacity/stride
@@ -928,12 +978,13 @@ impl<'a> IndexSelectionWave<'a> {
             widths.push(4);
             kinds.push(KIND_SCALAR);
         }
-        // `1` and `0` are the top-k finish `reset` argument; the rest are the
-        // top-k tiles/merge extents. `group.rows`, `rows`, `width` and
-        // `width / 8` are already covered above.
-        values.extend([rows as u64, width as u64, (width / 8) as u64, 1, 0]);
-        widths.extend([4, 4, 4, 4, 4]);
-        kinds.extend([KIND_SCALAR; 5]);
+        // `1` and `0` are the top-k finish `reset` argument. The remaining
+        // launch extents (`rows`, `width`, `width / 8`, the top-k tiles/merge
+        // extents) come from `launch_extent_values` below; pushing them here as
+        // well would duplicate the probes.
+        values.extend([1, 0]);
+        widths.extend([4, 4]);
+        kinds.extend([KIND_SCALAR; 2]);
         let extra_extents = launch_extent_values(&[], rows, width);
         values.extend(extra_extents.iter().copied());
         widths.extend(std::iter::repeat(4).take(extra_extents.len()));
@@ -969,14 +1020,21 @@ impl<'a> IndexSelectionWave<'a> {
             self.storage.stream.library.copy_h2d(lengths, &staged[rows * 48..rows * 56])?;
         }
         if capture && self.graph.is_none() {
+            // SAFETY: the stream is live on this wave's device and idle (the
+            // caller drained it before selecting a capture).
             unsafe {
                 self.storage.stream
                     .library
                     .cuda_graph_begin_capture(self.storage.stream.raw)?;
             }
+            // SAFETY: the capture is open on this stream; `enqueue` launches the
+            // selection kernels into it with the same retained inputs as a
+            // normal round.
             let launched = unsafe {
                 self.enqueue(query, requests, &groups, shared, rows, tiles, width, use_candidates)
             };
+            // SAFETY: the stream is capturing; ending the capture returns the
+            // source graph and its executable, which this wave now owns.
             let captured = unsafe {
                 self.storage.stream.library.cuda_graph_end_capture_retained(self.storage.stream.raw)
             };
@@ -988,9 +1046,19 @@ impl<'a> IndexSelectionWave<'a> {
                     self.insert_graph(info.graph_exec, info.graph, fingerprint, values, widths, kinds)?;
                 },
                 (Err(e), Ok(info)) => {
+                    // Destroy both handles even if the first destroy fails, so a
+                    // failed exec destroy cannot leak the retained source graph.
+                    // The original launch error is the one the caller needs.
+                    // SAFETY: the capture ended and neither handle has launched.
                     unsafe {
-                        self.storage.stream.library.cuda_graph_exec_destroy(info.graph_exec)?;
-                        self.storage.stream.library.cuda_graph_destroy(info.graph)?;
+                        if let Err(error) = self.storage.stream.library
+                            .cuda_graph_exec_destroy(info.graph_exec) {
+                            tracing::error!(%error, "destroying failed-capture graph exec");
+                        }
+                        if let Err(error) = self.storage.stream.library
+                            .cuda_graph_destroy(info.graph) {
+                            tracing::error!(%error, "destroying failed-capture retained graph");
+                        }
                     }
                     return Err(e);
                 }
@@ -1007,6 +1075,13 @@ impl<'a> IndexSelectionWave<'a> {
             unsafe { self.storage.stream.library.cuda_graph_census_call(self.storage.stream.raw, c"index", rows, capture,
                 crate::shared::decode_graph::census::arm(), dispatch) }
         } else { dispatch() };
+        if capture && launched.is_ok() {
+            // Order the completion event after this graph launch so the next
+            // in-place update can prove the executable is idle before mutating
+            // it. Eager rounds do not touch the executable, so they need no
+            // event (the last capture launch is still the one to drain).
+            self.record_launch()?;
+        }
         if self.audit && launched.is_ok() {
             // SAFETY: execute_inner retains its inputs; the audit drains before reading scratch.
             unsafe { self.audit_scores(query, requests, rows, width)?; }
@@ -1237,6 +1312,13 @@ impl Drop for IndexSelectionWave<'_> {
                 tracing::error!(%error, "final asynchronous index audit failed");
             }
         }
+        if let Some(event) = self.graph_event.take() {
+            // SAFETY: the stream drained above (or in clear_graph); the event is
+            // owned by this wave and no longer recorded.
+            if let Err(error) = unsafe { self.storage.stream.library.cuda_event_destroy(event) } {
+                tracing::error!(%error, "destroying index selection graph event");
+            }
+        }
     }
 }
 
@@ -1397,11 +1479,11 @@ mod graph_tests {
         // score kernel's gridDim.y is group.rows, so the two layouts need
         // different graphs even though every request is two rows long.
         let lengths = [2, 2, 2];
-        let left = selection_fingerprint(2, 6, &lengths, &[4, 2], 2);
-        let right = selection_fingerprint(2, 6, &lengths, &[2, 4], 2);
+        let left = selection_fingerprint(2, 6, &lengths, &[4, 2], &[], 2);
+        let right = selection_fingerprint(2, 6, &lengths, &[2, 4], &[], 2);
         assert_ne!(left, right);
         // The same split fingerprints identically.
-        assert_eq!(left, selection_fingerprint(2, 6, &lengths, &[4, 2], 2));
+        assert_eq!(left, selection_fingerprint(2, 6, &lengths, &[4, 2], &[], 2));
         // The split is derived from the bindings, not the request order alone.
         let mut groups = Vec::new();
         let a = [1usize; 10];
@@ -1418,8 +1500,21 @@ mod graph_tests {
         extend_score_groups(&mut groups, 2, 2, b);
         let split_b: Vec<usize> = groups.iter().map(|g| g.rows).collect();
         assert_eq!(split_b, vec![2, 4]);
-        assert_ne!(selection_fingerprint(2, 6, &lengths, &split_a, 2),
-            selection_fingerprint(2, 6, &lengths, &split_b, 2));
+        assert_ne!(selection_fingerprint(2, 6, &lengths, &split_a, &[], 2),
+            selection_fingerprint(2, 6, &lengths, &split_b, &[], 2));
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_committed_and_live_proposals() {
+        // The committed and live proposals bind different `packed`/`scales`
+        // pointers. Two rounds that alternate the choice must not share a graph,
+        // or the native update sees one old value mapped to two replacements
+        // and refuses every round.
+        let lengths = [2];
+        let live = selection_fingerprint(2, 2, &lengths, &[2], &[false], 2);
+        let committed = selection_fingerprint(2, 2, &lengths, &[2], &[true], 2);
+        assert_ne!(live, committed);
+        assert_eq!(live, selection_fingerprint(2, 2, &lengths, &[2], &[false], 2));
     }
 
     #[test]
@@ -1429,10 +1524,10 @@ mod graph_tests {
         // the same width bucket must share a graph; producer layers still key
         // on the tile count.
         let lengths = [1];
-        assert_eq!(selection_fingerprint(24, 1, &lengths, &[1], 20_000),
-            selection_fingerprint(24, 1, &lengths, &[1], 40_000));
-        assert_ne!(selection_fingerprint(2, 1, &lengths, &[1], 20_000),
-            selection_fingerprint(2, 1, &lengths, &[1], 40_000));
+        assert_eq!(selection_fingerprint(24, 1, &lengths, &[1], &[], 20_000),
+            selection_fingerprint(24, 1, &lengths, &[1], &[], 40_000));
+        assert_ne!(selection_fingerprint(2, 1, &lengths, &[1], &[], 20_000),
+            selection_fingerprint(2, 1, &lengths, &[1], &[], 40_000));
     }
 
     #[test]
@@ -1591,6 +1686,120 @@ mod graph_tests {
             assert!(wave.graphs.len() <= 2);
         }
         assert_eq!(wave.fixed_captures.len(), 2);
+        wave.clear_graph()?;
+        Ok(())
+    }
+
+    /// A real kernel-node update: capture the V4.1 index score kernel, change
+    /// its bound `keys` pointer between two selections, and prove the replayed
+    /// output follows the new buffer. The existing lifetime test captures a
+    /// memcpy node and passes empty value slices, so it never exercises the
+    /// kernel-argument substitution path. Skips without a CUDA device.
+    #[test]
+    fn cuda_index_score_kernel_node_update_follows_new_pointer() -> Result<()> {
+        let Some(path) = std::env::var_os("CUTEAFD_INDEX_GRAPH_LIBRARY") else {
+            eprintln!("skip index score kernel update test: CUTEAFD_INDEX_GRAPH_LIBRARY unset");
+            return Ok(());
+        };
+        let library = unsafe { NativeLibrary::load(path)? };
+        if library.cuda_set_device(0).is_err() {
+            eprintln!("skip index score kernel update test: no CUDA device");
+            return Ok(());
+        }
+        let score = match library.v41_index_scores() {
+            Ok(score) => score,
+            Err(error) => {
+                eprintln!("skip index score kernel update test: {error}");
+                return Ok(());
+            }
+        };
+        let mut wave = IndexSelectionWave::new(&library, 1, IndexSelectionWave::device_bytes(1)?)?;
+        // Minimal score geometry: one query, one candidate, one slot, one page.
+        let (queries, candidates, slots, stride, capacity, proposal_capacity) = (1, 1, 1, 1, 1, 1);
+        let alloc = |bytes: usize| DeviceAllocation::new(&library, bytes);
+        let q = alloc(queries * 2048)?;
+        let qs = alloc(queries * 128)?;
+        let weights = alloc(queries * 64)?;
+        let keys_a = alloc(capacity * 64)?;
+        let keys_b = alloc(capacity * 64)?;
+        let ks = alloc(capacity * 4)?;
+        let pages = alloc(slots * stride * 4)?;
+        let lengths = alloc(slots * 8)?;
+        let metadata = alloc(queries * 48)?;
+        let positions = alloc(queries * candidates * 8)?;
+        let output = alloc(queries * candidates * 4)?;
+        let proposals = alloc(proposal_capacity * 64)?;
+        let proposal_scales = alloc(proposal_capacity * 4)?;
+        // Query and key patterns differ so the two key buffers score differently.
+        library.copy_h2d(q.buffer, &vec![0x12u8; queries * 2048])?;
+        library.copy_h2d(qs.buffer, &vec![0x7fu8; queries * 128])?;
+        library.copy_h2d(weights.buffer, &vec![0x3fu8; queries * 64])?;
+        library.copy_h2d(keys_a.buffer, &vec![0x11u8; capacity * 64])?;
+        library.copy_h2d(keys_b.buffer, &vec![0x77u8; capacity * 64])?;
+        library.copy_h2d(ks.buffer, &vec![0x7fu8; capacity * 4])?;
+        library.copy_h2d(pages.buffer, &0u32.to_ne_bytes())?;
+        library.copy_h2d(lengths.buffer, &1u64.to_ne_bytes())?;
+        // metadata = (slot, causal rows, committed start, proposal count, offset, step)
+        let metadata_values: [u64; 6] = [0, 1, 1, 0, 0, 1];
+        library.copy_h2d(metadata.buffer, &metadata_values
+            .iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>())?;
+        library.copy_h2d(positions.buffer, &0u64.to_ne_bytes())?;
+        library.copy_h2d(proposals.buffer, &vec![0u8; proposal_capacity * 64])?;
+        library.copy_h2d(proposal_scales.buffer, &vec![0u8; proposal_capacity * 4])?;
+        let run = |keys: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
+            library.copy_h2d(output.buffer, &[0u8; 4])?;
+            // SAFETY: all buffers are live, disjoint and shape-exact; the stream
+            // drains before the read.
+            unsafe {
+                score.execute_overlay(q.buffer, qs.buffer, weights.buffer, keys, ks.buffer,
+                    pages.buffer, lengths.buffer, metadata.buffer, positions.buffer,
+                    output.buffer, proposals.buffer, proposal_scales.buffer, proposal_capacity,
+                    queries, candidates, slots, stride, capacity, wave.storage.stream.raw)?;
+            }
+            wave.synchronize()?;
+            let mut bytes = vec![0u8; 4];
+            library.copy_d2h(&mut bytes, output.buffer)?;
+            Ok(bytes)
+        };
+        let eager_a = run(keys_a.buffer)?;
+        let eager_b = run(keys_b.buffer)?;
+        assert_ne!(eager_a, eager_b, "the two key buffers must score differently");
+        // Capture the same kernel with keys_a bound.
+        let fingerprint = vec![2usize, 1];
+        // SAFETY: the stream is idle and the capture is opened on it.
+        unsafe { library.cuda_graph_begin_capture(wave.storage.stream.raw)?; }
+        // SAFETY: the capture is open; the score kernel is recorded into it.
+        let launched = unsafe {
+            score.execute_overlay(q.buffer, qs.buffer, weights.buffer, keys_a.buffer, ks.buffer,
+                pages.buffer, lengths.buffer, metadata.buffer, positions.buffer, output.buffer,
+                proposals.buffer, proposal_scales.buffer, proposal_capacity, queries, candidates,
+                slots, stride, capacity, wave.storage.stream.raw)
+        };
+        // SAFETY: the stream is capturing; ending it returns the retained graph.
+        let captured = unsafe {
+            library.cuda_graph_end_capture_retained(wave.storage.stream.raw)
+        };
+        let info = match (launched, captured) {
+            (Ok(()), Ok(info)) => info,
+            (Err(error), _) | (_, Err(error)) => {
+                eprintln!("skip index score kernel update test: capture failed: {error}");
+                return Ok(());
+            }
+        };
+        wave.insert_graph(info.graph_exec, info.graph, fingerprint.clone(),
+            vec![keys_a.buffer.ptr as u64], vec![8], vec![KIND_POINTER])?;
+        // Change the bound pointer between two selections.
+        wave.update_graph_values(&fingerprint, &[keys_b.buffer.ptr as u64], &[8],
+            &[KIND_POINTER], &[])?;
+        // Replay: the output must follow keys_b, not the captured keys_a.
+        library.copy_h2d(output.buffer, &[0u8; 4])?;
+        // SAFETY: the graph and its inputs are live; the stream drains below.
+        unsafe { library.cuda_graph_launch(wave.active_exec().unwrap(), wave.storage.stream.raw)?; }
+        wave.synchronize()?;
+        let mut replayed = vec![0u8; 4];
+        library.copy_d2h(&mut replayed, output.buffer)?;
+        assert_eq!(replayed, eager_b, "replayed output must follow the updated pointer");
+        assert_ne!(replayed, eager_a, "replayed output must not use the captured pointer");
         wave.clear_graph()?;
         Ok(())
     }

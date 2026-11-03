@@ -165,6 +165,7 @@ mod tests {
                 ("dsv4p", "mxfp4") => testing::write_v4_pro_mxfp4_snapshot(&snapshot),
                 ("dsv4p", "exl3") => testing::write_v4_pro_exl3_snapshot(&snapshot),
                 ("kimik3", _) => testing::write_kimi_snapshot(&snapshot, true),
+                ("muse", _) => testing::write_muse_spark_snapshot(&snapshot, &(0..62).collect::<Vec<_>>()),
                 ("mimo", _) => testing::write_snapshot(&snapshot, &testing::mimo_flash_config(), &testing::mimo_flash_tensors(), None),
                 ("mimof", _) => testing::write_snapshot(&snapshot, &testing::mimo_flash_mopd_config(), &testing::mimo_flash_mopd_tensors(), Some(4)),
                 ("mimop", _) => testing::write_snapshot(&snapshot, &testing::mimo_pro_config(), &testing::mimo_pro_tensors(), Some(8)),
@@ -194,7 +195,7 @@ mod tests {
                 ("ml4", _) => testing::write_mistral_large4_snapshot(&snapshot, None, true),
                 _ => anyhow::bail!("missing full launch fixture for covered {key}"),
             }
-            if !matches!(family, "v41" | "kimik3" | "ml4") {
+            if !matches!(family, "v41" | "kimik3" | "muse" | "ml4") {
                 expand_eight_rank_fixture(&snapshot)?;
             }
             let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
@@ -223,6 +224,19 @@ mod tests {
                     ..Default::default() }), ..Default::default()
             };
             let report = testing::BudgetedPlanInput::open(&snapshot)?.plan(&options)?;
+            // Coverage follows each family's own runtime status: a Planned family must
+            // be refused at deployment until it serves; flipping it to Serving puts it
+            // through the whole chain below (and requires its launch dispatch).
+            if report.runtime == Some(cuteafd_loader::plan::RuntimeStatus::Planned) {
+                let refused = DeploymentOptions { rtx_gpus: gpus,
+                    peers: (0..8).map(|rank| format!("192.0.2.{}:9100", rank + 1)).collect(),
+                    speculator: "off".into(), ..Default::default() };
+                let deployment = DeploymentSpec::from_report(&report, &refused)?;
+                assert!(!report.executable() && !deployment.executable, "{key}: a planned family must be refused at deployment");
+                eprintln!("N8 launch-chain: {key} planned; refused at deployment");
+                tested.push(key.clone());
+                continue;
+            }
             assert!(report.fits && report.placement_supported, "{key}: {:?}", report.hints);
             let deployment_options = DeploymentOptions { rtx_gpus: gpus,
                 peers: (0..8).map(|rank| format!("192.0.2.{}:9100", rank + 1)).collect(),
@@ -260,6 +274,13 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                 Commands::ServeGlmf(a) => (a.engine.peers.as_deref().unwrap().split(',').count(), None, None),
                 Commands::ServeMimo(a) => (a.engine.peers.as_deref().unwrap().split(',').count(), None, None),
                 Commands::ServeKimi(a) => (a.peers.len(), None, None),
+                Commands::ServeMuse(a) => {
+                    assert_eq!(family, "muse", "{key}: wrong Muse dispatch");
+                    assert_eq!(a.prefill_waves, Some(deployment.prefill_waves as _),
+                        "{key}: launch must preserve the admitted prefill wave count");
+                    assert_eq!(a.prefill_waves, Some(1), "{key}: fixture requests one prefill lane");
+                    (a.peers.len(), None, None)
+                }
                 other => anyhow::bail!("{key}: wrong dispatch {other:?}"),
             };
             assert_eq!(peers, 8, "{key}: lost peers in launch/parse");
@@ -275,17 +296,33 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
             let hidden = catalog.routed_experts().geometry()?.hidden as u64;
             let rows = deployment.prefill_unit_rows;
             let waves = deployment.prefill_waves;
-            let intake = cuteafd_loader::serving_capacity::spark_intake_bytes(waves, peers as u64, rows, hidden);
-            assert_eq!(intake, 8 * waves * rows * hidden * 2, "{key}");
+            let intake = cuteafd_loader::serving_capacity::prefill_return_bytes(waves, rows, peers as u64, hidden);
+            assert_eq!(intake, 8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(waves * rows * hidden * 2)?, "{key}");
             if family == "v41" {
                 use cuteafd_loader::placement::families::deepseek_v41::owners;
                 let charged = owners::transports_bytes(64, rows, peers, waves as usize)?;
-                assert_eq!(charged, 2 * 64 * (8 + 2) * 5120 * 2 + rows * waves * (1 + 8) * 5120 * 2);
+                assert_eq!(charged, 2 * (8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(64 * 5120 * 2)?
+                    + 2 * 64 * 5120 * 2) + rows * waves * 5120 * 2
+                    + 8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * waves * 5120 * 2)?);
             }
             if family != "kimik3" {
                 let host = report.host_ledger.as_ref().expect("full host intake ledger");
                 let (group, expected) = if matches!(family, "mimo" | "mimof" | "mimop") {
                     ("mimo/spark-intake-upper-bound", (rows * waves + 64) * hidden * 2 * 8)
+                } else if family == "muse" {
+                    use cuteafd_loader::families::muse_spark::{MuseSparkConfig, replies::Cutoff};
+                    let checkpoint = cuteafd_loader::plan::Checkpoint::open(&snapshot)?;
+                    let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
+                    let layout = options.layout.as_ref().unwrap();
+                    let prefill = cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan {
+                        unit_rows: rows, waves, span_rows: rows * waves,
+                    };
+                    let cutoff = Cutoff::with_wide(layout.muse_partial_bf16_max_rows,
+                        cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
+                        layout.muse_partial_wide_format)?;
+                    let transport = cuteafd_loader::placement::families::muse_spark::host_transport(
+                        &cfg, prefill, cutoff, layout.resolved_state_slots("muse_spark") as usize, peers)?;
+                    ("spark-intake", transport.intake)
                 } else {
                     let endpoints = cuteafd_loader::plan::layout::spark_endpoints(
                         report.family.as_deref().unwrap(), report.prefill_transports.unwrap()) as u64;

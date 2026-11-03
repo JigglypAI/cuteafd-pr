@@ -1050,6 +1050,47 @@ impl Opened {
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream }).collect(),
             dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)),
             transient: Default::default() };
+        use crate::shared::experts::rtx::push::{CoordinatorExperts, CoordinatorPush, PushPolicy};
+        let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;
+        let mut pushed_experts = None;
+        let embed_placement = args.token_io.embed_placement.context("MiMo embedding placement must resolve before admission")?;
+        let prepare_push = |sparks: usize| -> Result<_> {
+            let devices: Vec<_> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d))
+                .map(|id| crate::shared::memory::device::Device { library: &self.library, id }).collect();
+            let load = std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::push(&self.library));
+            let planning = weights::MimoLoader { dense: load.clone(), ..loader.clone() };
+            let (loaded, mut records) = crate::shared::experts::rtx::dense::recording(||
+                planning.with_embedding(&self.cfg, layers, args.mtp, self.embed_source()?, embed_placement))?;
+            records.extend(load.sink.as_ref().context("push sink")?.take_all());
+            let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records, &devices, sparks)?;
+            let experts = if let Some(tp2) = preflight.placement.tp2 {
+                let tensors = self.catalog.as_ref().and_then(|c| c.fp8()).context("MiMo expert headers")?;
+                let directory = preflight.expert_directory.as_deref().context("MiMo expert package")?;
+                let budgets = (0..2).map(|rank| {
+                    let plan = crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::plan(tensors, directory, rank,
+                        args.prefill_rows.max(engine::DECODE_ROWS))?;
+                    (tp2.peak_bytes[rank] as usize).checked_sub(plan.workspace_bytes)
+                        .context("MiMo TP2 workspace exceeds admitted peak")
+                }).collect::<Result<Vec<_>>>()?;
+                Some(CoordinatorExperts::Tp2 { layers: (tp2.first..tp2.first + tp2.layers).collect(), budgets })
+            } else if preflight.placement.onboard_layers > 0 {
+                let range = preflight.placement.expert_ranges[0];
+                let tensors = self.catalog.as_ref().and_then(|c| c.fp8()).context("MiMo expert headers")?.for_coordinator();
+                let resident = crate::shared::experts::fp8::Fp8Layer::bytes_for(&tensors, 1, 0, tensors.exact_slicing(1))?
+                    .checked_mul(range.layers).context("MiMo whole expert size overflow")?;
+                ensure!(resident <= range.peak_bytes as usize, "MiMo whole expert residency exceeds admission");
+                Some(CoordinatorExperts::Whole { owners: vec![crate::shared::experts::rtx::push::WholeOwner { rank: 0,
+                    selections: (range.first..range.first + range.layers)
+                        .map(|layer| crate::shared::experts::layer::ExpertLayer::BackboneFull { layer }).collect(), budget: resident }] })
+            } else { None };
+            let prepared = if sparks == 0 {
+                (CoordinatorPush::prepare_alone(&args.snapshot, self.catalog.as_ref(), devices.len(), experts)?, None)
+            } else {
+                let (push, streams, ranks) = CoordinatorPush::prepare(&args.snapshot, self.catalog.as_ref(), devices.len(), experts)?;
+                (push, Some((streams, ranks)))
+            };
+            Ok((prepared, (loaded, planning.transient.clone(), dense, devices)))
+        };
         let mut coordinator_push = None;
         let admission = if args.peers.is_some() {
             let peers = args.peers.as_deref().context("worker admission needs Spark peers")?
@@ -1070,69 +1111,35 @@ impl Opened {
                 crate::shared::placement::spark_rings(64 << 20)?, executions)?;
             let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
                 &preflight.working_set, peers.len(), None, model)?;
-            // Each coordinator GPU joins the Spark push group as one more rank with
-            // its dense operands, recorded and planned from headers before
-            // membership: a planning error offers no coordinator ranks (the
-            // coordinator loads by mount, the Sparks still push).
-            let ranks = if admission.coordinator_pushes() {
-                (|| -> Result<_> {
-                    let devices: Vec<_> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d))
-                        .map(|id| crate::shared::memory::device::Device { library: &self.library, id }).collect();
-                    let load = std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::push(&self.library));
-                    let planning = weights::MimoLoader { dense: load.clone(), ..loader.clone() };
-                    let model = {
-                        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                        planning.model(&self.cfg, layers)?
-                    };
-                    let records = load.sink.as_ref().context("push sink")?.take_all();
-                    let (landed, operands, staged, steps, largest, finishes) = records.summary();
-                    tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
-                        "MiMo coordinator dense records planned");
-                    let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records.clone(),
-                        &devices, peers.len())?;
-                    let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare(&args.snapshot, None,
-                        devices.len(), None)?;
-                    Ok((prepared, (model, planning.transient.clone(), records, dense, devices)))
-                })().map_err(|error| tracing::info!(%error, "MiMo coordinator push unavailable; mount")).ok()
-            } else { None };
-            let ranks = ranks.map(|((push, streams, ranks), planned)| {
+            let ranks = push_policy.plan(|| {
+                ensure!(admission.coordinator_pushes(), "MiMo Spark admission did not select required push");
+                prepare_push(peers.len())
+            })?.and_then(|((push, ranks), planned)| {
                 coordinator_push = Some((push, peers.len(), planned));
-                (streams, ranks)
+                ranks
             });
             Some(admission.start_with(&peers, ranks)?)
-        } else { None };
-        let embed_placement = args.token_io.embed_placement.context("MiMo embedding placement must resolve before admission")?;
-        let (embedding, (model, mut shares)) = crate::shared::placement::load_while_admitting(admission, || {
-            let Some((push, sparks, (model, transient, records, dense, devices))) = coordinator_push.take() else {
-                return crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?, embed_placement,
-                    || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) });
-            };
-            // The planned dense operands arrive in the group while the embedding loads beside.
-            let split = crate::shared::memory::load_timing::Split::start();
-            let (pushed, embedding) = push.receive_with(devices, None, sparks, Some(Ok(dense)), || {
-                crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?, embed_placement, || Ok(()))
-            });
-            let pushed = pushed?;
-            let (embedding, ()) = embedding?;
-            if pushed.is_none() {
-                let rank_stream = |device: i32| if device == args.device { stream }
-                    else { peer_stream.map_or(stream, |(_, s)| s) };
-                crate::shared::experts::rtx::dense::fill_records_by_mount(&self.library, &records, rank_stream)?;
+        } else {
+            if let Some(((push, _), planned)) = push_policy.plan(|| prepare_push(0))? {
+                coordinator_push = Some((push, 0, planned));
             }
-            // Every gather ran (at Done or in the fill): free the landed grids.
+            None
+        };
+        let (embedding, ((model, mut shares), mtp_weights)) = crate::shared::placement::load_while_admitting(admission, || {
+            let Some((push, sparks, (loaded, transient, dense, devices))) = coordinator_push.take() else {
+                return loader.with_embedding(&self.cfg, layers, args.mtp, self.embed_source()?, embed_placement);
+            };
+            let split = crate::shared::memory::load_timing::Split::start();
+            let (pushed, ()) = push.receive_with(devices, self.catalog.as_ref(), sparks, Some(Ok(dense)), || ());
+            pushed_experts = push_policy.committed(pushed)?;
+            // Target, predictor and GPU embedding bytes all commit before their owners publish.
             transient.borrow_mut().clear();
-            split.log(if pushed.is_some() { "mimo dense push" } else { "mimo dense mount fill" });
-            tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(), steps = records.steps.len(),
-                finishes = records.finishes.len(), "MiMo coordinator dense operands landed");
-            Ok((embedding, model))
+            split.log("mimo dense, MTP and onboarded expert push");
+            Ok(loaded)
         })?;
         loader.release_transient();
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
-            let available = self.checkpoint.tensor_names()
-                .filter(|name| name.starts_with("model.mtp.layers.") && name.ends_with(".eh_proj.weight"))
-                .count();
-            ensure!(args.mtp <= available, "--mtp {} but the checkpoint has {available} MTP layers", args.mtp);
             let zeroed = |bytes: usize| -> Result<crate::shared::memory::DeviceAllocation<'_>> {
                 let allocation = crate::shared::memory::DeviceAllocation::new(&self.library, bytes.max(256))?;
                 self.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
@@ -1140,13 +1147,13 @@ impl Opened {
             };
             let (h, record) = (self.cfg.hidden, self.cfg.record_bytes(cuteafd_loader::families::mimo_v2::MimoAttention::Sliding,
                 args.kv_formats()));
-            let stages = (0..args.mtp).map(|k| -> Result<mtp::MtpStage<'_>> {
-                let [eh, enorm, hnorm, final_norm] = loader.mtp_extras(k)?;
-                Ok(mtp::MtpStage { layer: loader.mtp_layer(&self.cfg, k)?, eh, enorm, hnorm, final_norm,
+            let stages = mtp_weights.into_iter().map(|weights| -> Result<mtp::MtpStage<'_>> {
+                let [eh, enorm, hnorm, final_norm] = weights.extras;
+                Ok(mtp::MtpStage { layer: weights.layer, eh, enorm, hnorm, final_norm,
                     ring: zeroed(args.rings * engine::RING_ROWS * record)? })
             }).collect::<Result<Vec<_>>>()?;
             let rows = engine::DECODE_ROWS;
-            let drafter = mtp::MtpDrafter { stages, hidden: zeroed(args.rings * mtp::HIDDEN_ROWS * h * 2)?,
+            let drafter = mtp::MtpDrafter { projection: cuteafd_ffi::draft_projection::DraftProjections::load(&programs, &[(2 * h, h)], rows)?, stages, hidden: zeroed(args.rings * mtp::HIDDEN_ROWS * h * 2)?,
                 embed: zeroed(rows * h * 2)?, rows_h: zeroed(rows * h * 2)?, normed_e: zeroed(rows * h * 2)?,
                 normed_h: zeroed(rows * h * 2)?, cat: zeroed(rows * 2 * h * 2)?,
                 ext: std::cell::RefCell::new(vec![vec![0; args.mtp]; args.rings]),
@@ -1202,7 +1209,7 @@ impl Opened {
                     .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
                 let capacity = args.draft_capacity(cfg.block)?;
                 let representation = self.weight_formats.draft;
-                let drafter = dflash::MimoDrafter::load(&self.library, dir, file, stream, capacity.context_slots,
+                let drafter = dflash::MimoDrafter::load(&self.library, &programs, dir, file, stream, capacity.context_slots,
                     capacity.max_batch_sequences, mask, representation, args.fp8_scales, args.draft_kv_cache)?;
                 engine.drafter = Some(drafter);
                 tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
@@ -1220,20 +1227,37 @@ impl Opened {
                 use crate::shared::memory::device::Device;
                 let peer = peer_stream.context("MiMo TP2 requires two GPUs")?;
                 let tensors = self.catalog.as_ref().and_then(|catalog| catalog.fp8()).context("MiMo expert headers")?;
-                let pair = Fp8MoeTp2::load_pair([Device { library: &self.library, id: args.device },
-                    Device { library: &self.library, id: peer.0 }], tensors,
-                    preflight.expert_directory.as_deref().context("MiMo expert package")?,
-                    (tp2.first..tp2.first + tp2.layers).collect(), args.prefill_rows.max(engine::DECODE_ROWS),
-                    tp2.peak_bytes.map(|bytes| bytes as usize))?;
+                let devices = [Device { library: &self.library, id: args.device }, Device { library: &self.library, id: peer.0 }];
+                let directory = preflight.expert_directory.as_deref().context("MiMo expert package")?;
+                let layers = (tp2.first..tp2.first + tp2.layers).collect();
+                let rows = args.prefill_rows.max(engine::DECODE_ROWS);
+                let budgets = tp2.peak_bytes.map(|bytes| bytes as usize);
+                let pair = match pushed_experts.take() {
+                    Some(ranks) => {
+                        let [left, right]: [_; 2] = ranks.try_into().map_err(|_| anyhow::anyhow!("MiMo requires two pushed ranks"))?;
+                        Fp8MoeTp2::pushed_pair(devices, tensors, directory, layers, rows, budgets,
+                            [left.fp8()?, right.fp8()?])?
+                    }
+                    None => Fp8MoeTp2::load_pair(devices, tensors, directory, layers, rows, budgets)?,
+                };
                 engine.install_tp2(pair)?;
             } else if preflight.placement.onboard_layers > 0 {
                 let range = preflight.placement.expert_ranges[0];
                 let tensors = self.catalog.as_ref().and_then(|catalog| catalog.fp8()).context("MiMo expert headers")?;
                 let layer_ids: Vec<_> = (range.first..range.first + range.layers).collect();
-                let local = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors,
-                    preflight.expert_directory.as_deref().context("MiMo expert package")?,
-                    &layer_ids, 1, 0, args.prefill_rows.max(engine::DECODE_ROWS),
-                    range.peak_bytes as usize)?;
+                let coordinator = tensors.for_coordinator();
+                let directory = preflight.expert_directory.as_deref().context("MiMo expert package")?;
+                let rows = args.prefill_rows.max(engine::DECODE_ROWS);
+                let local = match pushed_experts.take() {
+                    Some(mut ranks) => {
+                        ensure!(ranks.len() == 1, "MiMo whole expert push requires one rank");
+                        crate::shared::experts::fp8::Fp8Experts::from_pushed(&self.library, &coordinator,
+                            directory, &layer_ids, 1, 0, rows, range.peak_bytes as usize,
+                            ranks.pop().context("MiMo pushed rank")?.fp8()?)?
+                    }
+                    None => crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors,
+                        directory, &layer_ids, 1, 0, rows, range.peak_bytes as usize)?,
+                };
                 engine.set_rtx_local(local);
             }
             if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
@@ -1382,12 +1406,13 @@ impl Opened {
             let actual = cuteafd_ffi::memory_ledger::snapshot()
                 .by_owner(cuteafd_ffi::memory_ledger::Space::Device, args.device)
                 .get(label.as_str()).copied().unwrap_or(0);
-            let planned = capacity as usize * waves * peers.len() * self.cfg.hidden * 2;
-            anyhow::ensure!(actual == planned,
+            let planned = cuteafd_loader::serving_capacity::prefill_return_bytes(
+                waves as u64, capacity as u64, peers.len() as u64, self.cfg.hidden as u64);
+            anyhow::ensure!(actual as u64 == planned,
                 "MiMo {label}: allocated {actual} device bytes != planned {planned}");
             Ok(link)
         };
-        crate::shared::memory_report::release_load_staging(&self.library);
+        crate::shared::memory_report::release_load_staging(&self.library)?;
         // Decode keeps fixed graph-safe planes and the probed landing path;
         // only prefill owns overlapping waves and per-slot GPU landing planes.
         let mut decode = link(0, 1, &decode_warm)?;

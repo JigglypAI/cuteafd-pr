@@ -1,6 +1,6 @@
 mod families;
 mod shared;
-pub use shared::{audio, dense_trellis, exlr8, fp8_moe, glm_stage, mla_draft, native_dense, native_dense_glue, peer_exchange, programs, vision};
+pub use shared::{audio, pcm_audio, dense_trellis, draft_projection, exlr8, fp8_moe, glm_stage, mla_draft, native_dense, native_dense_glue, peer_exchange, programs, projected_index, projected_kda, vision};
 pub use families::kimi_k3::{KimiMla, KimiMlaBatch, KimiMlaError, KimiMlaMode, KimiMlaWeights,
     KimiFfn, KimiFfnBatch, KimiFfnMode, KimiLatent, KimiPrefixMode, KimiResidual, KimiResidualBatch, KimiResidualSite,
     KimiRmsNorm, KimiSitu, KimiW8Error, KimiKda, KimiKdaBatch, KimiKdaWeights, KimiKdaCommit,
@@ -39,6 +39,7 @@ pub mod host_isa;
 pub mod memory_ledger;
 pub mod synchronized_load;
 pub mod push_ring;
+pub mod event_waiters;
 
 static COORDINATOR_GPU_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GPU_BUDGET_ALLOCATION: Mutex<()> = Mutex::new(());
@@ -1688,6 +1689,7 @@ native_symbols! {
     cuteafd_free_host_buffer: FreeHostBufferFn,
     cuteafd_cuda_memory_info: unsafe extern "C" fn(*mut usize, *mut usize) -> CuteafdStatus,
     cuteafd_cuda_get_device: unsafe extern "C" fn(*mut i32) -> CuteafdStatus,
+    cuteafd_cuda_stream_device: unsafe extern "C" fn(*mut c_void, *mut i32) -> CuteafdStatus,
     cuteafd_cuda_set_device: unsafe extern "C" fn(i32) -> CuteafdStatus,
     cuteafd_cuda_enable_peer: unsafe extern "C" fn(i32) -> CuteafdStatus,
     cuteafd_copy_peer_async: unsafe extern "C" fn(CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize, *mut c_void) -> CuteafdStatus,
@@ -2481,6 +2483,18 @@ impl NativeLibrary {
         Ok(device)
     }
 
+    /// Owning device of a live stream, independent of the host thread's device.
+    /// # Safety
+    /// `stream` must remain a live CUDA stream for this call.
+    pub unsafe fn cuda_stream_device(&self, stream: *mut c_void) -> Result<i32> {
+        let call = self.cuteafd_cuda_stream_device()?;
+        let mut device = -1;
+        // SAFETY: the caller retains the stream; device is a writable out-pointer.
+        self.status_to_result("cuteafd_cuda_stream_device", unsafe { call(stream, &mut device) })?;
+        anyhow::ensure!(device >= 0, "CUDA stream device query returned {device}");
+        Ok(device)
+    }
+
     /// PCI identity of this process's CUDA ordinal (not the NVML index).
     pub fn cuda_device_pci_bus_id(&self, device: i32) -> Option<String> {
         cuda_runtime::device_pci_bus_id(device)
@@ -2848,16 +2862,44 @@ impl NativeLibrary {
     /// The caller owns both handles and must destroy them (the graph via
     /// `cuda_graph_destroy`, the exec via `cuda_graph_exec_destroy`).
     /// # Safety
-    /// The stream is live on the current device and is not capturing.
+    /// The stream is live on the current device and is capturing.
+    #[track_caller]
     pub unsafe fn cuda_graph_end_capture_retained(
         &self,
         cuda_stream: *mut c_void,
     ) -> Result<CuteafdCudaGraphCaptureInfo> {
+        // Same GPU-budget admission as `cuda_graph_end_capture`: the retained
+        // variant is now V4.1 index selection's capture path, so it must take
+        // the budget lock, log the census call site, and fail when the process
+        // is over `--coordinator-gpu-budget-gib`.
+        let _budget_guard = coordinator_gpu_budget().map(|_| GPU_BUDGET_ALLOCATION.lock()
+            .unwrap_or_else(|e| e.into_inner()));
         let end_capture_fn: CudaGraphEndCaptureRetainedFn =
             self.cuteafd_cuda_graph_end_capture_retained()?;
         let mut info = CuteafdCudaGraphCaptureInfo::default();
         let status = unsafe { end_capture_fn(cuda_stream, &mut info) };
         self.status_to_result("cuteafd_cuda_graph_end_capture_retained", status)?;
+        if std::env::var_os("CUTEAFD_GRAPH_CENSUS").is_some_and(|value| value == "1") {
+            tracing::info!(target: "cuteafd::graph_capture", exec = ?info.graph_exec,
+                site = %std::panic::Location::caller(), "graph census executable site");
+        }
+        if coordinator_gpu_budget().is_some() {
+            if let Err(error) = self.cuda_memory_info() {
+                // SAFETY: capture ended and this executable has never launched;
+                // destroying it cannot invalidate queued graph work. Destroy
+                // both handles even if the first destroy fails, so a failed exec
+                // destroy cannot leak the retained source graph.
+                unsafe {
+                    if let Err(destroy) = self.cuda_graph_exec_destroy(info.graph_exec) {
+                        tracing::error!(%destroy, "destroying over-budget graph exec");
+                    }
+                    if let Err(destroy) = self.cuda_graph_destroy(info.graph) {
+                        tracing::error!(%destroy, "destroying over-budget retained graph");
+                    }
+                }
+                return Err(error.context("graph executable exceeds coordinator GPU budget"));
+            }
+        }
         Ok(info)
     }
 
@@ -7482,6 +7524,10 @@ mod tests {
         }
         let mut source = library.alloc_device_buffer(64)?;
         let mut destination = library.alloc_device_buffer(64)?;
+        // A real allocation that is NOT referenced by the captured graph, so the
+        // not-found path is exercised with a value that passes pointer
+        // validation (an interior/out-of-range address would be refused first).
+        let mut unused = library.alloc_device_buffer(64)?;
         let stream = library.cuda_stream_create()?;
         let result = (|| -> Result<()> {
             unsafe { library.cuda_graph_begin_capture(stream)?; }
@@ -7493,8 +7539,17 @@ mod tests {
             unsafe {
                 library.cuda_graph_exec_update_pointers(
                     info.graph_exec, info.graph,
-                    &[source.ptr as u64 + 4096], &[destination.ptr as u64 + 4096],
+                    &[unused.ptr as u64], &[destination.ptr as u64],
                     &[8], &[1], &mut found)?;
+            }
+            assert_eq!(found, [0]);
+            // A scalar `0` probe must not match a memcpy node's NULL srcHost /
+            // dstHost: the update succeeds and reports the probe not-found.
+            let mut found = [1u8; 1];
+            unsafe {
+                library.cuda_graph_exec_update_pointers(
+                    info.graph_exec, info.graph,
+                    &[0], &[0], &[4], &[0], &mut found)?;
             }
             assert_eq!(found, [0]);
             // A memcpy node that references an old value refuses the whole update.
@@ -7515,6 +7570,7 @@ mod tests {
         unsafe { library.cuda_stream_destroy(stream)?; }
         library.free_device_buffer(&mut source)?;
         library.free_device_buffer(&mut destination)?;
+        library.free_device_buffer(&mut unused)?;
         result
     }
 

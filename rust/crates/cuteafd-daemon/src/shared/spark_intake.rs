@@ -27,8 +27,9 @@
 //! copy engine or receive-slot retention, and prefill lanes overlap each
 //! wave's wire time with the other lanes' GPU work, so a wave's standalone
 //! landing time (18 ms for V4 Pro TP6's 352 MB) is not on the critical path.
-//! Any `gpu` failure (no dma-buf, no registration, GPUDirect writes not
-//! ordered for kernels) falls back to `pinned` and says why.
+//! An unusable capability probe selects `pinned` and says why. Once `gpu`
+//! is selected, range alignment or registration failure refuses startup;
+//! the selected path never silently changes to pinned receives.
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
@@ -383,7 +384,7 @@ pub(crate) struct SparkIntake<'a> {
     rows: usize,
     row_bytes: usize,
     /// One allocation per rank holding its whole reserve range.
-    planes: Vec<DeviceAllocation<'a>>,
+    planes: Vec<IntakePlane<'a>>,
     /// Admitted return slots (events, consumed fences).
     waves: usize,
     geometry: RefCell<SlotGeometry>,
@@ -402,6 +403,12 @@ pub(crate) struct SparkIntake<'a> {
     landed: Vec<*mut c_void>,
     /// Receive slots whose uploads are queued; released before the next wave.
     held: Arc<Mutex<Vec<(usize, u32, VerbsHostProtocolV2ResponsePayload)>>>,
+}
+
+/// Owns the raw cudaMalloc while every consumer uses the aligned interior view.
+struct IntakePlane<'a> {
+    _allocation: DeviceAllocation<'a>,
+    buffer: CuteafdDeviceBuffer,
 }
 
 struct IntakeState {
@@ -472,9 +479,27 @@ impl<'a> SparkIntake<'a> {
         ensure!((1..=4).contains(&waves), "Spark intake admits 1..=4 return slots");
         let geometry = SlotGeometry::new(waves, rows)?;
         let reserve_rows = geometry.reserve_rows();
-        let plane_bytes = rows * row_bytes;
-        let planes = (0..ranks).map(|_| DeviceAllocation::new(library, (reserve_rows * row_bytes).max(256)))
-            .collect::<Result<Vec<_>>>()?;
+        let plane_bytes = rows.checked_mul(row_bytes).context("Spark intake plane size overflow")?;
+        let logical_bytes = reserve_rows.checked_mul(row_bytes).context("Spark intake reserve size overflow")?;
+        let reserve_bytes = usize::try_from(cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
+            u64::try_from(logical_bytes.max(256))?)?)?;
+        let planes = (0..ranks).map(|rank| {
+            let allocation = DeviceAllocation::new(library, reserve_bytes)?;
+            let (offset, bytes) = cuteafd_core::serving_capacity::spark_intake_export_range(
+                allocation.buffer.ptr as u64, u64::try_from(logical_bytes.max(256))?)?;
+            let (offset, bytes) = (usize::try_from(offset)?, usize::try_from(bytes)?);
+            ensure!(offset.checked_add(bytes).is_some_and(|end| end <= allocation.buffer.bytes),
+                "Spark intake aligned range exceeds raw allocation");
+            let buffer = CuteafdDeviceBuffer {
+                // SAFETY: the checked aligned interior range belongs to the retained raw allocation.
+                ptr: unsafe { allocation.buffer.ptr.cast::<u8>().add(offset) }.cast(),
+                bytes, ..allocation.buffer
+            };
+            tracing::info!(rank, waves, rows, row_bytes, logical_bytes, allocation_bytes = reserve_bytes,
+                allocation_ptr = ?allocation.buffer.ptr, aligned_offset = offset,
+                ptr = ?buffer.ptr, registered_bytes = bytes, "allocated Spark intake reserve");
+            Ok(IntakePlane { _allocation: allocation, buffer })
+        }).collect::<Result<Vec<_>>>()?;
         // Host mode stages every wave; pinned mode only small ones (see `stages`).
         let staging = match mode {
             IntakeMode::Host => Some(RefCell::new(HostAllocation::new(library, ranks * plane_bytes)?)),
@@ -1804,6 +1829,72 @@ impl Drop for SparkLink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn mimo_endpoint_reservation_matches_allocated_backing() -> Result<()> {
+        use cuteafd_loader::families::mimo_v2::{admission, MimoExpertInput, MimoV2Config};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        for hidden in [17, 6144] {
+            let cfg = MimoV2Config::from_hf(&serde_json::json!({
+                "model_type": "mimo_v2", "num_hidden_layers": 1, "hidden_size": hidden,
+                "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 128,
+                "v_head_dim": 128, "rope_theta": 10000.0, "swa_rope_theta": 10000.0,
+                "sliding_window": 128, "vocab_size": 256, "intermediate_size": 256,
+                "n_routed_experts": 8, "num_experts_per_tok": 2, "moe_intermediate_size": 128,
+            }))?;
+            for ranks in [1, 2, 6] { for rows in [1, 64, 256] { for waves in [1, 3, 4] {
+                // Reload resets the fake DSO's bounded, lifetime-wide event registry.
+                let library = fixture.load()?;
+                let endpoints = admission::spark_endpoints(rows, MimoExpertInput::Fp8)?;
+                let reservation = admission::transport_reservations(&cfg, 1, 0, rows, waves, ranks)?;
+                let planned = reservation.iter().find(|item| item.name == "transport.spark_intake_planes").unwrap().bytes;
+                let owner = "test/mimo-endpoint-reservation";
+                let _owner = cuteafd_ffi::memory_ledger::owner(owner);
+                let decode = SparkIntake::with_waves(&library, IntakeMode::Gpu, ranks,
+                    endpoints[0].capacity as usize, hidden * 2, 1)?;
+                let prefill = SparkIntake::with_waves(&library, IntakeMode::Gpu, ranks,
+                    endpoints[1].capacity as usize, hidden * 2, waves)?;
+                for (intake, slots) in [(&decode, 1), (&prefill, waves)] {
+                    let backing: u64 = intake.planes.iter().map(|plane| plane._allocation.buffer.bytes as u64).sum();
+                    assert_eq!(backing, cuteafd_loader::serving_capacity::prefill_return_bytes(
+                        slots as u64, intake.rows as u64, ranks as u64, hidden as u64));
+                }
+                let actual = cuteafd_ffi::memory_ledger::snapshot()
+                    .by_owner(cuteafd_ffi::memory_ledger::Space::Device, library.cuda_get_device()?)
+                    .get(owner).copied().unwrap_or(0);
+                assert_eq!(planned, actual as u64, "hidden={hidden} ranks={ranks} rows={rows} waves={waves}");
+                drop((decode, prefill));
+                assert_eq!(cuteafd_ffi::memory_ledger::snapshot()
+                    .by_owner(cuteafd_ffi::memory_ledger::Space::Device, library.cuda_get_device()?)
+                    .get(owner).copied().unwrap_or(0), 0);
+            } } }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn padded_partial_reserve_keeps_logical_wave_offsets_and_plan_charge() -> Result<()> {
+        let (waves, rows, row_bytes, ranks) = (3, 2752, 34_864, 6);
+        let geometry = SlotGeometry::new(waves, rows)?;
+        let logical = geometry.reserve_rows() * row_bytes;
+        let backing = cuteafd_core::serving_capacity::spark_intake_allocation_bytes(logical as u64)?;
+        assert!(backing > logical as u64);
+        for base in [4096, 4608] {
+            let (aligned_offset, registered_bytes) = cuteafd_core::serving_capacity::spark_intake_export_range(base, logical as u64)?;
+            assert_eq!((base + aligned_offset) % 4096, 0);
+            assert!(aligned_offset + registered_bytes <= backing);
+            cuteafd_core::serving_capacity::validate_spark_intake_export(base + aligned_offset, registered_bytes)?;
+        }
+        for slot in 0..waves {
+            let (offset, bytes) = geometry.slice(slot, row_bytes);
+            assert_eq!((offset, bytes), (slot * rows * row_bytes, rows * row_bytes));
+            assert!((offset + bytes) as u64 <= backing);
+        }
+        assert_eq!(cuteafd_loader::serving_capacity::prefill_return_bytes(
+            waves as u64, rows as u64, ranks, row_bytes as u64 / 2), ranks * backing);
+        Ok(())
+    }
 
     fn probe(gpu_gbps: f64) -> GpuLandingProbe {
         GpuLandingProbe {

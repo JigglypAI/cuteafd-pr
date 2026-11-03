@@ -51,6 +51,66 @@ CHECKPOINT_CONTEXTS = {
 }
 
 
+def draft_bf16_shapes():
+    # hidden, query heads, KV heads, head width, MLP width, tap count
+    families = {
+        "dspark-qwen": (5120, 40, 8, 128, 10240, 5),
+        "dspark-kimi": (7168, 64, 16, 64, 14336, 5),
+        "dflash2-glm": (6144, 64, 8, 128, 12288, 6),
+        "dflash2-glmf": (4096, 32, 8, 128, 12288, 5),
+        "dflash-qwen27": (5120, 32, 8, 128, 17408, 5),
+        "dflash-qwen35": (2048, 32, 8, 128, 6144, 8),
+        "dflash-kimi-modal": (7168, 32, 8, 128, 14336, 6),
+        "dflash-mimo-pro": (6144, 128, 8, 128, 16384, 5),
+        "dflash-mimo-flash": (4096, 64, 8, 128, 16384, 5),
+        "dflash2-muse-radix": (8192, 64, 8, 128, 28672, 5),
+        "dflash2-muse-nvidia": (8192, 128, 16, 64, 24576, 5),
+    }
+    result = {}
+    for family, (h, heads, kv, d, inter, taps) in families.items():
+        for k, n in ((h * taps, h), (h, (heads + 2 * kv) * d),
+                     (h, 2 * kv * d), (heads * d, h), (h, 2 * inter), (inter, h)):
+            result.setdefault((k, n), []).append(family)
+    for h in (2048, 4096, 5120, 6144, 7168, 8192):
+        result.setdefault((h, h // 4), []).append("dflash-convolution")
+        result.setdefault((h, 256), []).append("dflash-selector")
+    for h, inter in ((7168, 14336), (6144, 24576)):
+        result.setdefault((h, 2 * inter), []).append("mla-dflash/ml4-ffn")
+        result.setdefault((inter, h), []).append("mla-dflash/ml4-ffn")
+    for h in (2048, 4096, 5120, 6144):
+        result.setdefault((2 * h, h), []).append("mimo/qwen-mtp")
+    result.setdefault((30720, 6144), []).append("ml4-context-fc")
+    return result
+
+
+def compile_draft_bf16_projection(k, n):
+    import torch
+    from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    tiles = ((16, 1, 4, 16, 64, 6),)
+    launch = TmaBf16Projection(n, k, tiles_by_rows=tiles)
+    return compile_program(launch, name="draft_bf16_projection", operands=(
+        Operand("x", torch.bfloat16, f"[rows,{k}]"),
+        Operand("w", torch.bfloat16, f"[{n},{k}]"),
+        Operand("out", torch.bfloat16, f"[rows,{n}]", "out")),
+        scalars=(Scalar("rows"),), key=launch.key(), geometry=dict(
+            width=k, outputs=n, output_dtype="torch.bfloat16",
+            reduction="ordered_k16", tiles_by_rows=tiles))
+
+
+def native_scalar_abi(stem: str, geometry: dict, scalars: list) -> tuple[str, list]:
+    # Old geometry has no flag; explicit false must generate the same native ABI.
+    runtime_sms = geometry.get("runtime_sm_count", False)
+    if type(runtime_sms) is not bool:
+        raise ValueError(f"{stem}: runtime_sm_count must be a boolean")
+    if runtime_sms and (not scalars or scalars[-1] != ("device_sm_count", "int32")
+                        or sum(name == "device_sm_count" for name, _ in scalars) != 1):
+        raise ValueError(f"{stem}: runtime SM count must be the last int32 scalar")
+    public = scalars[:-1] if runtime_sms else scalars
+    kinds = "".join(SCALAR_KINDS[kind] for _, kind in public)
+    return kinds + ("s" if runtime_sms else ""), public
+
+
 def geometry_context(name: str, requested: int) -> int:
     if requested <= 0:
         raise ValueError("max_context must be positive")
@@ -193,7 +253,10 @@ def glm_stage_programs(g, decode_rows: int, prefill_rows: int):
 def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
     """Native trellis projection boundaries using the original Flash primitives."""
     from functools import partial
-    from b12x.integration.cuteafd.glmf_split import compile_glmf_kda_core_aot, compile_glmf_stage_aot
+    from b12x.integration.cuteafd.glmf_split import (
+        compile_glmf_kda_core_aot, compile_glmf_stage_aot,
+        compile_glmf_projected_kda_aot, compile_glmf_fp8_stage_aot,
+        compile_glmf_projected_index_c_aot, compile_glmf_projected_index_keys_aot)
     out = []
     # Wide decode still selects the narrow stage for batches of at most 64 rows.
     decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
@@ -209,6 +272,24 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
             params = dict(stage="swiglu", max_rows=rows, inter=inter)
             out.append((f"swiglu_i{inter}_m{rows}", "swiglu_split", params,
                         partial(compile_glmf_stage_aot, g, **params)))
+    # Append native-weight seams without moving or changing the existing entries.
+    for rows in sorted(decode_caps | {prefill_rows}):
+        params = dict(max_rows=rows, decode=rows in decode_caps)
+        out.append((f"kda_projected_m{rows}", "kda_core", params,
+                    partial(compile_glmf_projected_kda_aot, g, **params)))
+        for stage in ("absorb", "values"):
+            params = dict(stage=stage, max_rows=rows,
+                          mode="decode" if rows in decode_caps else "prefill")
+            out.append((f"{stage}_fp8_m{rows}", "attention_stage", params,
+                        partial(compile_glmf_fp8_stage_aot, g, **params)))
+    for rows in sorted(decode_caps | {prefill_rows}):
+        params = dict(max_rows=rows, verify_rows=rows if rows in decode_caps else 64)
+        out.append((f"index_projected_c_m{rows}", "index_producer", params,
+                    partial(compile_glmf_projected_index_c_aot, g, **params)))
+    for rows in sorted(decode_caps | {prefill_rows}):
+        params = dict(max_rows=rows)
+        out.append((f"index_projected_keys_m{rows}", "index_producer", params,
+                    partial(compile_glmf_projected_index_keys_aot, g, **params)))
     return out
 
 
@@ -1007,11 +1088,11 @@ def context_split_programs(g, decode_rows: int, max_context: int):
 
 def dense_family_scopes(families, exlr8_family):
     requested = set((families if families is not None else "kimik3").split(","))
-    if not requested or requested - {"kimik3", "glm", "glmf", "step5", "ml4"}:
-        raise ValueError("--dense-trellis-families takes kimik3, glm, glmf, step5 and/or ml4")
-    k6 = tuple(name for name in ("kimik3", "glm", "glmf", "step5", "ml4") if name in requested)
+    if not requested or requested - {"kimik3", "glm", "glmf", "step5", "muse", "ml4"}:
+        raise ValueError("--dense-trellis-families takes kimik3, glm, glmf, step5, muse and/or ml4")
+    k6 = tuple(name for name in ("kimik3", "glm", "glmf", "step5", "muse", "ml4") if name in requested)
     native = tuple(name for name in k6 if name in ("glm", "glmf")) \
-        if families is not None else (exlr8_family,)
+        if families is not None else tuple(filter(None, (exlr8_family or "").split(",")))
     return k6, native
 
 
@@ -1032,13 +1113,15 @@ def main() -> None:
                              "glmf_stage/glmf2_stage (full/TP2 GLM Flash primitive boundaries), "
                              "dense_trellis_k6 (native K6 core projections)")
     parser.add_argument("--dense-trellis-families",
-                        help="architecture tables for dense_trellis_k6 and exlr8_dense: kimik3,glm,glmf,step5,ml4 "
+                        help="architecture tables for dense_trellis_k6 and exlr8_dense: kimik3,glm,glmf,step5,muse,ml4 "
                              "(defaults: K6 kimik3; EXLR8 --exlr8-family; no checkpoint reads)")
+    parser.add_argument("--expert-partial-width", type=int, default=4096)
+    parser.add_argument("--expert-partial-topk", type=int, default=8)
     parser.add_argument("--exlr8-role", choices=("all", "coordinator", "spark"), default="all",
                         help="with exlr8: coordinator = shared-expert K1/grouping and rotated glue (beside the "
                              "family programs), spark = routed K1 serving and grouping, all = every program")
-    parser.add_argument("--exlr8-family", choices=("glm", "glmf"), default="glm",
-                        help="static routed geometry for exlr8; leaves the existing GLM exports unchanged")
+    parser.add_argument("--exlr8-family",
+                        help="explicit comma-separated EXLR8 checkpoint families: glm,glmf")
     parser.add_argument("--decode-rows", type=int, default=64)
     parser.add_argument("--glmf-wide-decode-rows", type=int, default=128,
                         help="with glmf: also the decode and verify programs at this many rows (serve "
@@ -1056,21 +1139,25 @@ def main() -> None:
         args.context_split = "only"
     args.context_split_only = args.context_split == "only"
 
+    geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
+    exlr8_families = tuple(args.exlr8_family.split(",")) if args.exlr8_family else ()
+    if "exlr8" in geometries and (not exlr8_families or set(exlr8_families) - {"glm", "glmf"}
+            or len(set(exlr8_families)) != len(exlr8_families)):
+        raise SystemExit("EXLR8 requires explicit --exlr8-family glm and/or glmf")
     import torch
     from b12x.integration.cuteafd import (
         FLASH, GLM53, GLM53_FLASH, MIMO_V2_FLASH, MIMO_V26_FLASH, MIMO_V26_PRO, PRO, QWEN35_9B, QWEN38_27B, QWEN38_FLASH_NEXT, exportable_compilation,
         validate_exported_header,
     )
 
-    geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     try:
         dense_families, native_families = dense_family_scopes(args.dense_trellis_families, args.exlr8_family)
     except ValueError as error:
         raise SystemExit(str(error)) from error
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "ml4") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3 and/or ml4")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split and/or kimik3")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
     kimi_kda = None
@@ -1078,7 +1165,7 @@ def main() -> None:
         from b12x.integration.cuteafd import KDAGeometry
         kimi_kda = KDAGeometry(hidden=7168, kda_heads=96).head_split(2)
     props = torch.cuda.get_device_properties(0)
-    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and geometries != ["exlr8"]):
+    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and geometries not in (["exlr8"], ["expert_partial"])):
         raise SystemExit("coordinator programs export on SM120 (K1 primitives also on SM121)")
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
@@ -1116,6 +1203,20 @@ def main() -> None:
             manifest["families"][name] = {"abi_version": 1}
             work += [(name, suffix, "kimi_split", {"max_rows": capacity}, thunk)
                      for suffix, thunk, capacity in kimi_split_programs()]
+            continue
+        if name == "expert_partial":
+            from export_b12x_expert_partial_aot import programs as partial_programs
+            manifest["families"][name] = {"width": args.expert_partial_width,
+                                          "topk": args.expert_partial_topk}
+            work += [(name, *item) for item in partial_programs(
+                args.expert_partial_width, args.expert_partial_topk, args.prefill_rows)]
+            continue
+        if name in ("muse", "muse2"):
+            from export_b12x_muse_aot import programs as muse_programs
+            heads = 128 if name == "muse" else 64
+            manifest["families"][name] = {"heads": heads, "kv_heads": heads // 8, "head_dim": 64,
+                                           "hidden": 8192, "window": 2048}
+            work += [(name, *item) for item in muse_programs(heads, args.prefill_rows)]
             continue
         if name == "ml4":
             from b12x.integration.cuteafd.mistral_large4 import ML4, ML4_TP2
@@ -1240,22 +1341,28 @@ def main() -> None:
         # Last, so every other family's objects and table indices are unchanged.
         # The fork owns the program list and its role split.
         from export_b12x_exlr8_aot import programs as exlr8_programs
-        if args.exlr8_family == "glm":
-            exlr8_work = exlr8_programs(role=args.exlr8_role)
-            family = "exlr8"
-            geometry = {"hidden": 6144, "units": 16, "top_k": 8}
-        else:
-            cfg = GLM53_FLASH
-            exlr8_work = exlr8_programs(role=args.exlr8_role, hidden=cfg.hidden,
-                units=cfg.moe_inter // 128, top_k=cfg.top_k, experts=cfg.routed_experts,
-                swiglu_limit=cfg.swiglu_limit)
-            family = "exlr8_glmf"
-            geometry = {"hidden": cfg.hidden, "units": cfg.moe_inter // 128,
-                        "top_k": cfg.top_k, "experts": cfg.routed_experts,
-                        "swiglu_limit": cfg.swiglu_limit}
-        manifest["families"][family] = {**geometry, "role": args.exlr8_role,
-                                       "programs": [f"{family}_{item[0]}" for item in exlr8_work]}
-        work += [(family, *item) for item in exlr8_work]
+        for exlr8_family in exlr8_families:
+            if exlr8_family == "glm":
+                exlr8_work = exlr8_programs(role=args.exlr8_role)
+                family = "exlr8"
+                geometry = {"hidden": 6144, "units": 16, "top_k": 8}
+            else:
+                cfg = GLM53_FLASH
+                exlr8_work = exlr8_programs(role=args.exlr8_role, hidden=cfg.hidden,
+                    units=cfg.moe_inter // 128, top_k=cfg.top_k, experts=cfg.routed_experts,
+                    swiglu_limit=cfg.swiglu_limit)
+                family = "exlr8_glmf"
+                geometry = {"hidden": cfg.hidden, "units": cfg.moe_inter // 128,
+                            "top_k": cfg.top_k, "experts": cfg.routed_experts,
+                            "swiglu_limit": cfg.swiglu_limit}
+            manifest["families"][family] = {**geometry, "role": args.exlr8_role,
+                                           "programs": [f"{family}_{item[0]}" for item in exlr8_work]}
+            work += [(family, *item) for item in exlr8_work]
+    # Append shared drafter exports after all existing objects: table indices stay stable.
+    if any(name in geometries for name in ("glm", "glm2", "glmf", "glmf2", "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "kimik3", "ml4", "muse", "muse2")):
+        work += [("draft_bf16", f"k{k}_n{n}", "bf16_projection", {"max_rows": 2048},
+                  lambda k=k, n=n: compile_draft_bf16_projection(k, n))
+                 for k, n in sorted(draft_bf16_shapes())]
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue
@@ -1276,7 +1383,7 @@ def main() -> None:
             if abi is not None and program.abi != abi:
                 raise ValueError(f"{stem}: card plans disagree on their ABI")
             abi = program.abi
-            kinds = "".join(SCALAR_KINDS[kind] for _, kind in abi["scalars"])
+            kinds, public_scalars = native_scalar_abi(stem, program.geometry, abi["scalars"])
             program.export_to_c(str(output), label, "cuteafd_" + label)
             checked = validate_exported_header(program, output / f"{label}.h", "cuteafd_" + label)
             if checked["argument_count"] != len(abi["pointers"]) + len(kinds) + 1:
@@ -1293,7 +1400,7 @@ def main() -> None:
             "name": stem, "family": family, "op": op, "params": params,
             "geometry": plans[-1]["geometry"],
             "pointers": [dict(zip(("name", "dtype", "shape", "role"), p)) for p in abi["pointers"]],
-            "scalars": [dict(zip(("name", "type"), s)) for s in abi["scalars"]],
+            "scalars": [dict(zip(("name", "type"), s)) for s in public_scalars],
             "scratch_bytes_at_capacity": scratch, "capacity_rows": capacity,
             **({"card_plans": plans} if len(plans) > 1 else
                {"entry": plans[0]["entry"], "object_sha256": plans[0]["object_sha256"]}),

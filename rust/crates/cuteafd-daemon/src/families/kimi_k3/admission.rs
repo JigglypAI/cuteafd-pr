@@ -15,6 +15,11 @@ const EXECUTOR: ExecutorModes = families::KIMI_K3;
 const MODES: &[LayerMode] = EXECUTOR.modes;
 const DRAFT_MARKS: &str = "Kimi exact draft windows";
 
+fn push_resident_budgets(peaks: [usize; 2], workspace: usize) -> Result<[usize; 2]> {
+    Ok([peaks[0].checked_sub(workspace).context("Kimi rank 0 workspace exceeds expert peak")?,
+        peaks[1].checked_sub(workspace).context("Kimi rank 1 workspace exceeds expert peak")?])
+}
+
 /// Diagnostic inventories retain checkpoint numerics and select only a prefix.
 pub(super) fn prefix(cfg: &KimiK3Config, layers: usize) -> Result<KimiK3Config> {
     ensure!((1..=cfg.layers).contains(&layers), "Kimi prefix layer count outside checkpoint");
@@ -254,18 +259,23 @@ impl<'a> Admission<'a> {
         let rtx = self.rtx_plan(devices)?;
         let load = DenseLoad::push(devices[0].library);
         // Dense owners and records, planned before membership.
-        let planned = if spark.coordinator_pushes() { (|| -> Result<_> {
+        let policy = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&checkpoint.snapshot)?;
+        let planned = policy.plan(|| -> Result<_> {
+            ensure!(spark.coordinator_pushes(), "Kimi Spark admission did not select required push");
             let owners = self.record(devices, checkpoint, &load, streams)?;
             let records = load.sink.as_ref().context("push sink")?.take_all();
             let (landed, operands, staged, steps, largest, finishes) = records.summary();
             tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
                 "Kimi coordinator dense records planned");
             let dense = dense::plan_records(&checkpoint.snapshot, records.clone(), &devices, peers.len())?;
-            let experts = rtx.as_ref().map(|(layers, budgets, _)| CoordinatorExperts::Tp2 { layers: layers.clone(),
-                budgets: budgets.to_vec() });
+            let experts = rtx.as_ref().map(|(layers, budgets, _)| -> Result<_> {
+                let workspace = self.rtx.as_ref().context("Kimi missing TP2 inventory")?.workspace;
+                Ok(CoordinatorExperts::Tp2 { layers: layers.clone(),
+                    budgets: push_resident_budgets(*budgets, workspace)?.to_vec() })
+            }).transpose()?;
             let prepared = CoordinatorPush::prepare(&checkpoint.snapshot, Some(catalog), 2, experts)?;
             Ok((prepared, owners, records, dense))
-        })().map_err(|error| tracing::info!(%error, "Kimi coordinator push unavailable; mount")).ok() } else { None };
+        })?;
         let (planned, ranks) = match planned {
             Some(((push, streams, ranks), owners, records, dense)) => (Some((push, owners, records, dense)), Some((streams, ranks))),
             None => (None, None),
@@ -275,11 +285,7 @@ impl<'a> Admission<'a> {
         let (weights, pushed) = match planned {
             Some((push, owners, records, dense)) => {
                 let (pushed, ()) = push.receive_with(devices.to_vec(), Some(catalog), peers.len(), Some(Ok(dense)), || ());
-                let pushed = pushed?;
-                if pushed.is_none() {
-                    dense::fill_records_by_mount(devices[0].library, &records, |device| streams.iter()
-                        .find(|(id, _)| *id == device).map_or(std::ptr::null_mut(), |(_, s)| *s))?;
-                }
+                let pushed = policy.committed(pushed)?;
                 tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(), steps = records.steps.len(),
                     elapsed_ms = started.elapsed().as_millis() as u64, "Kimi coordinator dense operands landed");
                 (owners, pushed)
@@ -296,8 +302,8 @@ impl<'a> Admission<'a> {
         Ok((pending, experts, self.register(devices, weights)?))
     }
 
-    /// The admitted TP2 expert layers and per-rank weight budgets (workspace
-    /// excluded), or none.
+    /// The admitted TP2 expert layers and binder peaks (one lane's workspace
+    /// retained), or none. Push offers subtract that final workspace separately.
     #[allow(clippy::type_complexity)]
     fn rtx_plan(&self, devices: [Device<'a>; 2]) -> Result<Option<(Vec<usize>, [usize; 2], std::path::PathBuf)>> {
         let Some(inventory) = &self.rtx else { return Ok(None) };
@@ -799,6 +805,18 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
 pub(super) mod tests {
     use super::*;
 
+    #[test]
+    fn push_payload_cannot_spend_the_binders_execution_workspace() -> Result<()> {
+        let peaks = [4096, 8192];
+        let resident = push_resident_budgets(peaks, 1024)?;
+        assert_eq!(resident, [3072, 7168]);
+        for rank in 0..2 { assert_eq!(resident[rank] + 1024, peaks[rank]); }
+        assert_eq!(push_resident_budgets([1024; 2], 1024)?, [0; 2]);
+        assert!(push_resident_budgets([1023, 8192], 1024).is_err());
+        assert!(push_resident_budgets([4096, 1023], 1024).is_err());
+        Ok(())
+    }
+
     /// The unit admission derives for these test inputs.
     pub(in crate::families::kimi_k3) fn test_unit(rows: usize, waves: usize, unit: Option<usize>) -> usize {
         cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(rows, waves, unit).unwrap().unit_rows as usize
@@ -818,7 +836,7 @@ pub(super) mod tests {
         let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: cfg.dense.iter().enumerate()
             .filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(), spark_ranks: 6, prefill_lanes: 1 };
         let spark = SparkBudgetInventory::exl3(&catalog, &working,
-            &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 4096, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
+            &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 4096, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
             crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
             cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
             cuteafd_loader::families::kimi_k3::spark_reserve_bytes(2, 4096)?)?;
@@ -1228,7 +1246,7 @@ pub(super) mod tests {
                 spark_ranks: 6, prefill_lanes: 1 };
             let rings = cuteafd_loader::plan::layout::spark_ring_geometry(1);
             let spark = SparkBudgetInventory::exl3(&catalog, &working,
-                &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
+                &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
                 cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                     slot_bytes: rings.slot_bytes, alignment: rings.alignment }, spark_bytes,
                 cuteafd_loader::families::kimi_k3::spark_reserve_bytes(waves as u64, unit as u64)?)?;
@@ -1786,7 +1804,9 @@ pub(super) mod tests {
             let demand = super::super::spark::admitted_demand(waves, unit, lane, ranks)?;
             let items = admitted.placement.items[1].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
             assert_eq!(items.len(), 1);
-            assert_eq!(items[0].bytes, (ranks * waves * unit * 3584 * 2) as u64);
+            assert_eq!(items[0].bytes, ranks as u64
+                * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
+                    (waves * unit * 3584 * 2) as u64)?);
             assert_eq!(items[0].basis, Basis::Exact);
             assert_eq!(items[0].category, Category::Workspace);
             assert!(!admitted.placement.items[0].iter().any(|item| item.group == demand.group));
