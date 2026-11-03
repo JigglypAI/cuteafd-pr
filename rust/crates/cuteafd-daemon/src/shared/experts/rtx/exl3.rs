@@ -179,11 +179,17 @@ fn validate_shard_package(package: &Path, rows: usize, policy: Exl3RowPolicy,
             && meta["output_dtype"].as_str() == Some("fp32"),
             "EXL3 shard package geometry/output differs from selected experts");
         let activation = match geometry.activation() {
+            cuteafd_core::FfnActivation::SiluBf16Product { .. } => "silu",
+            cuteafd_core::FfnActivation::SiluPostClampFp32Product { .. } => "silu_post_clamp",
             cuteafd_core::FfnActivation::Situ { .. } => "situ",
-            _ => "silu",
         };
-        ensure!(meta["activation"].as_str() == Some(activation),
-            "EXL3 shard package activation differs from checkpoint geometry");
+        // The exporter omits the activation key only for its ordinary SiLU default.
+        let exported_activation = match meta.get("activation") {
+            None => Some("silu"),
+            Some(value) => value.as_str(),
+        };
+        ensure!(exported_activation == Some(activation),
+            "EXL3 shard package activation differs from checkpoint geometry; rebuild exports for {activation}");
     }
     Ok(())
 }
@@ -842,6 +848,37 @@ impl RtxExpertLayer for Exl3Tp2<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn package_activation_matches_exporter_defaults_and_all_native_variants() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().join("m1");
+        std::fs::create_dir(&directory)?;
+        for (geometry, activation) in [(ExpertGeometry::GLM5, "silu"),
+            (ExpertGeometry::KIMI_K3, "situ"), (ExpertGeometry::STEP5, "silu_post_clamp")] {
+            for intermediate in [geometry.intermediate, geometry.intermediate / 2] {
+                let mut meta = serde_json::json!({"hidden":geometry.hidden,
+                    "intermediate":intermediate,"experts":geometry.experts,
+                    "top_k":geometry.topk,"output_dtype":"fp32"});
+                let validate = |meta: &serde_json::Value| -> Result<()> {
+                    std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(meta)?)?;
+                    validate_shard_package(temp.path(), 1, Exl3RowPolicy::for_geometry(geometry),
+                        RtxSelectionPolicy::FirstCapacity, geometry, u64::from(intermediate))
+                };
+                assert_eq!(validate(&meta).is_ok(), activation == "silu");
+                meta["activation"] = activation.into();
+                validate(&meta)?;
+                for wrong in [serde_json::Value::Null, serde_json::json!(false),
+                    serde_json::json!(17), serde_json::json!("unknown"),
+                    serde_json::json!(if activation == "silu" { "situ" } else { "silu" })] {
+                    meta["activation"] = wrong;
+                    let error = validate(&meta).unwrap_err();
+                    assert!(error.to_string().contains("rebuild exports"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn whole_package_rejects_half_width_and_wrong_output_before_allocation() -> Result<()> {
         let temp = tempfile::tempdir()?;
