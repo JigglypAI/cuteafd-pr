@@ -781,12 +781,21 @@ mod tests {
         let config = args.loop_abort.config();
         assert_eq!(config.run, 0);
         assert_eq!(config.fast_span, 0);
-        let detail = cuteafd_api::openai::FinishDetail::default();
-        let mut abort = config.guard(detail.clone(), 1);
-        for token in 0..10_000u32 {
-            assert!(!abort.push(token), "the disabled detector never aborts");
+        let super::Commands::ServeNative(enabled_args) = super::Cli::try_parse_from(base)
+            .unwrap().command else { panic!("expected native serving") };
+        for period in [1, 300] {
+            let detail = cuteafd_api::openai::FinishDetail::default();
+            let mut abort = config.guard(detail.clone(), 1);
+            let mut enabled = enabled_args.loop_abort.config()
+                .guard(cuteafd_api::openai::FinishDetail::default(), 2);
+            let mut enabled_aborted = false;
+            for token in (0..if period == 1 { 2_000 } else { 3_000 }).map(|i| i % period) {
+                assert!(!abort.push(token), "the disabled detector never aborts");
+                if !enabled_aborted { enabled_aborted = enabled.push(token); }
+            }
+            assert!(enabled_aborted, "CLI defaults must abort period {period}");
+            assert_eq!(detail.name(), None);
         }
-        assert_eq!(detail.name(), None);
     }
 
     #[test]

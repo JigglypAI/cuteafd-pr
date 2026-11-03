@@ -25,6 +25,8 @@ Modes
                        known-good output. `--config` picks the config subdir
                        (default `deepseek_v41-v2_20261005`); `--all-roles` feeds
                        the whole window (ctx + gen) as a secondary check.
+  --registered DIR     replay every registered text config, using its pinned
+                       revision in fidelity_dataset.rs; write --evidence JSON.
   --tokenizer PATH     optional: tokenize a text field with a HF tokenizer.json
                        (needs the `tokenizers` package) instead of reading ids.
 
@@ -33,11 +35,14 @@ Dataset layout is NOT assumed: pass --tokens-field (default: first of
 `text`). If the real fidelity dataset stores safetensors windows, extract the
 generated-row token ids first and feed them as JSON.
 
-Read-only. Writes nothing.
+Input transcripts are read-only. --registered writes only --evidence.
 """
 from __future__ import annotations
 
 import argparse
+import datetime
+import hashlib
+import re
 import json
 import pathlib
 import sys
@@ -46,6 +51,22 @@ WINDOW = 32
 FAST_WINDOW = 256
 MIN_REPEAT_PERIOD = FAST_WINDOW + 1
 MAX_ENTRIES = 65_536
+RUN = 512
+COPIES = 8
+FAST_SPAN = 1024
+FAST_COPIES = 8
+
+
+def rule_r_min_tokens():
+    return WINDOW + (COPIES - 1) * MIN_REPEAT_PERIOD + RUN - 1
+
+
+def rule_f_min_tokens():
+    return 1 + max(FAST_COPIES - 1, FAST_SPAN)
+
+
+def shipped_guard():
+    return RepeatGuard(RUN, COPIES, FAST_SPAN, FAST_COPIES)
 
 
 class RepeatGuard:
@@ -165,8 +186,8 @@ def repeat(unit: list[int], copies: int) -> list[int]:
 def rust_test_fixture() -> dict[str, list[int]]:
     """The synthetic streams the Rust unit tests build in `repeat_guard.rs`.
 
-    The checked-in `repeat_guard_fixture.json` is a stub (the Rust tests generate
-    these streams from `block()`/`repeat()`), so reproduce them here exactly.
+    The full checked-in fixture is also consumed by Rust's fixture test.
+    Reproduce its deterministic streams here to cross-check its contents.
     """
     looped = block(200, 101) + repeat(block(640, 102), 19)
     a = block(1500, 103)
@@ -177,9 +198,8 @@ def rust_test_fixture() -> dict[str, list[int]]:
 
 def run_fixture(fixture_path: pathlib.Path) -> int:
     data = json.loads(fixture_path.read_text())
-    if not {"looped", "draft_then_write", "fast_loop"} <= set(data):
-        print(f"note: {fixture_path} is a stub; using the Rust tests' generated fixture")
-        data = rust_test_fixture()
+    if {name: data.get(name) for name in rust_test_fixture()} != rust_test_fixture():
+        raise ValueError(f"{fixture_path}: differs from the Rust tests' generated fixture")
     failures = 0
 
     def check(name: str, ok: bool, detail: str) -> None:
@@ -303,7 +323,7 @@ def run_dataset(root: pathlib.Path, tokens_field: str, text_field: str, tokenize
             if ids is None:
                 continue
             transcripts += 1
-            guard = RepeatGuard(512, 8, 1024, 8)
+            guard = shipped_guard()
             got = feed(guard, ids)
             if got is not None:
                 fires += 1
@@ -313,78 +333,109 @@ def run_dataset(root: pathlib.Path, tokens_field: str, text_field: str, tokenize
                 )
 
     print(f"transcripts={transcripts} fires={fires}")
-    return 0
+    return int(fires != 0 or transcripts == 0)
+
+
+def fidelity_metrics(windows_path: pathlib.Path, all_roles: bool = False) -> dict:
+    data = json.loads(windows_path.read_text())
+    windows = data.get("windows")
+    if not isinstance(windows, list) or not windows:
+        raise ValueError(f"{windows_path}: no windows")
+    metrics = dict(transcripts=0, tokens=0, fires=0, rule_r_eligible=0,
+                   rule_f_eligible=0, max_consecutive_seen=0, max_shingle_copies=0)
+    for window in windows:
+        tokens, roles = window.get("tokens"), window.get("roles")
+        if (not isinstance(tokens, list) or not isinstance(roles, list)
+                or len(tokens) != len(roles) or any(r not in ("ctx", "gen") for r in roles)
+                or any(type(t) is not int or not 0 <= t <= 0xFFFFFFFF for t in tokens)):
+            raise ValueError(f"{windows_path}#{window.get('id')}: malformed tokens/roles")
+        ids = tokens if all_roles else [t for t, role in zip(tokens, roles) if role == "gen"]
+        if not ids:
+            continue
+        metrics["transcripts"] += 1
+        metrics["tokens"] += len(ids)
+        metrics["rule_r_eligible"] += int(len(ids) >= rule_r_min_tokens())
+        metrics["rule_f_eligible"] += int(len(ids) >= rule_f_min_tokens())
+        guard = shipped_guard()
+        for i, token in enumerate(ids):
+            hit = guard.push(token)
+            metrics["max_consecutive_seen"] = max(metrics["max_consecutive_seen"], guard.consecutive)
+            if hit is not None:
+                raise ValueError(f"FIRE {windows_path}#{window.get('id')} at token {i + 1} "
+                                 f"rule={hit[0]} period={hit[1]} onset={guard.onset()}")
+        metrics["max_shingle_copies"] = max(metrics["max_shingle_copies"],
+                                          max((v[0] for v in guard.counts.values()), default=0))
+    if not metrics["transcripts"]:
+        raise ValueError(f"{windows_path}: no generated transcripts")
+    return metrics
 
 
 def run_fidelity(root: pathlib.Path, config: str, all_roles: bool) -> int:
-    """Run the detector over the published fidelity dataset's windows.
+    print(json.dumps(fidelity_metrics(root / config / "windows.json", all_roles), sort_keys=True))
+    return 0
 
-    Each window stores exact token ids and a per-token role (`ctx` = prompt /
-    repository source, `gen` = assistant-generated). The engine detector only
-    ever sees generated tokens, so the primary corpus is the `gen` span of each
-    window. `--all-roles` feeds the whole window as a secondary check.
-    """
-    windows_path = root / config / "windows.json"
-    if not windows_path.is_file():
-        raise SystemExit(f"missing {windows_path} (pass --fidelity <dataset-dir> --config <name>)")
-    data = json.loads(windows_path.read_text())
-    windows = data.get("windows")
-    if not isinstance(windows, list):
-        raise SystemExit(f"{windows_path}: no `windows` list")
 
-    transcripts = 0
-    fires = 0
-    total_tokens = 0
-    eligible = 0
-    eligible_fires = 0
-    max_run = 0
-    max_copies = 0
-    for window in windows:
-        tokens = window.get("tokens")
-        roles = window.get("roles")
-        if not isinstance(tokens, list) or not isinstance(roles, list) or len(tokens) != len(roles):
-            print(f"SKIP {window.get('id')}: tokens/roles missing or mismatched")
+def registered_configs(registry: pathlib.Path):
+    constants = dict(re.findall(r'pub const (\w+): &str = "([^"\n]+)";', registry.read_text()))
+    for name, config in constants.items():
+        if not name.endswith("CONFIG") or name.startswith("RETIRED_") or name.endswith("MEDIA_CONFIG"):
             continue
-        if all_roles:
-            ids = tokens
-        else:
-            ids = [t for t, r in zip(tokens, roles) if r == "gen"]
-        if not ids:
-            continue
-        transcripts += 1
-        total_tokens += len(ids)
-        # Rule R needs WINDOW + run = 544 generated tokens before it can fire.
-        can_fire = len(ids) >= WINDOW + 512
-        if can_fire:
-            eligible += 1
-        guard = RepeatGuard(512, 8, 1024, 8)
-        got = None
-        for i, token in enumerate(ids):
-            hit = guard.push(token)
-            max_run = max(max_run, guard.consecutive)
-            if hit is not None:
-                got = (i + 1, hit)
-                break
-        max_copies = max(max_copies, max((s[0] for s in guard.counts.values()), default=0))
-        if got is not None:
-            fires += 1
-            if can_fire:
-                eligible_fires += 1
-            print(
-                f"FIRE {window.get('id')} at token {got[0]} rule={got[1][0]} "
-                f"period={got[1][1]} onset={guard.onset()} tokens={len(ids)}"
-            )
+        revision = constants[name.removesuffix("CONFIG") + "REVISION"]
+        yield config, revision
 
-    print(
-        f"transcripts={transcripts} fires={fires} tokens={total_tokens} "
-        f"rule_r_eligible={eligible} rule_r_eligible_fires={eligible_fires} "
-        f"max_consecutive_seen={max_run} max_shingle_copies={max_copies}"
-    )
+
+def run_registered(cache: pathlib.Path, output: pathlib.Path) -> int:
+    root = pathlib.Path(__file__).resolve().parents[4]
+    registry = root / "rust/crates/cuteafd-bench/src/fidelity_dataset.rs"
+    configs = []
+    for config, revision in registered_configs(registry):
+        path = cache / revision / config / "windows.json"
+        metrics = fidelity_metrics(path)
+        print(config, json.dumps(metrics, sort_keys=True), flush=True)
+        configs.append(dict(config=config, revision=revision,
+                            windows_sha256=hashlib.sha256(path.read_bytes()).hexdigest(), **metrics))
+    fixture = root / "rust/crates/cuteafd-daemon/src/shared/repeat_guard_fixture.json"
+    if run_fixture(fixture):
+        return 1
+    detector = root / "rust/crates/cuteafd-daemon/src/shared/repeat_guard.rs"
+    evidence = {
+        "schema": "cuteafd.loop_abort.fidelity_evidence/2",
+        "generated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "detector": dict(module=str(detector.relative_to(root)),
+                         sha256=hashlib.sha256(detector.read_bytes()).hexdigest(),
+                         rule_r=dict(window=WINDOW, run=RUN, copies=COPIES,
+                                     min_period=MIN_REPEAT_PERIOD, min_tokens=rule_r_min_tokens()),
+                         rule_f=dict(window=FAST_WINDOW, span=FAST_SPAN, copies=FAST_COPIES,
+                                     min_tokens=rule_f_min_tokens()), max_entries=MAX_ENTRIES),
+        "harness": dict(path=str(pathlib.Path(__file__).resolve().relative_to(root)),
+                        sha256=hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()),
+        "fidelity": dict(repository="wrldsuksgo2mars/cuteafd-fidelity",
+                         registry=str(registry.relative_to(root)),
+                         registry_sha256=hashlib.sha256(registry.read_bytes()).hexdigest(),
+                         configs_run=len(configs), configs=configs,
+                         note="Every registered text config, pinned to fidelity_dataset.rs. "
+                              "Only assistant-generated tokens are fed, with a fresh guard per window. "
+                              "Neither rule can fire inside a 1024-token generation window: "
+                              "Rule R's periodic-stream minimum and Rule F's minimum are derived "
+                              "from the shipped constants. Longer windows are reported as eligible; "
+                              "synthetic boundary tests exercise actual loop detection."),
+        "fixture": dict(path=str(fixture.relative_to(root)),
+                        sha256=hashlib.sha256(fixture.read_bytes()).hexdigest(),
+                        streams={k: len(v) for k, v in rust_test_fixture().items()},
+                        validated=True),
+        "corpus_replay": "Dropped: private production inputs are unavailable; no old control metrics retained.",
+        "reproduce": ["python3 -I rust/crates/cuteafd-daemon/tests/loop-abort-fidelity-harness.py "
+                      "--registered <fidelity-cache/repository> --evidence "
+                      "rust/crates/cuteafd-daemon/tests/loop-abort-fidelity-evidence.json"],
+    }
+    output.write_text(json.dumps(evidence, indent=2) + "\n")
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--registered", type=pathlib.Path, help="replay all registered text configs from revision/config/windows.json cache")
+    parser.add_argument("--evidence", type=pathlib.Path, help="write regenerated evidence (requires --registered)")
     parser.add_argument("--fixture", type=pathlib.Path, help="run the crate fixture self-test")
     parser.add_argument("--dataset", type=pathlib.Path, help="directory of transcript JSON/JSONL")
     parser.add_argument("--fidelity", type=pathlib.Path, help="fidelity dataset root (contains <config>/windows.json)")
@@ -395,6 +446,12 @@ def main() -> int:
     parser.add_argument("--tokenizer", help="HF tokenizer.json for text transcripts")
     args = parser.parse_args()
 
+    if args.registered:
+        if not args.evidence:
+            parser.error("--registered requires --evidence")
+        return run_registered(args.registered, args.evidence)
+    if args.evidence:
+        parser.error("--evidence requires --registered")
     if args.fixture:
         return run_fixture(args.fixture)
     if args.dataset:

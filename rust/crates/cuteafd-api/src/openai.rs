@@ -1233,6 +1233,7 @@ impl Submitter {
         // backlog is bounded by its own max_tokens.
         let (events, mut receive) = mpsc::unbounded_channel();
         let prefix_cache_source = PrefixCacheSource::default();
+        if let Some(scope) = &usage { scope.finish_detail(finish_detail.clone()); }
         let job = NativeRequest {
             prefix_cache_source: prefix_cache_source.clone(),
             finish_detail: finish_detail.clone(),

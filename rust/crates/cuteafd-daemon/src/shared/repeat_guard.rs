@@ -21,7 +21,7 @@
 //! (`period > FAST_WINDOW`). Without that gate rule R would fire first for every
 //! `period <= 80` (rule R at `7P + 543`, rule F at `P + 1024`), so a period-1
 //! run would abort at 550 tokens instead of the documented 1,024-token patience.
-//! With the gate the shipped span is 1,024 tokens for every short-period repeat,
+//! With the gate the shipped span is at least 1,024 tokens for every short-period repeat,
 //! so a legitimate 400-token identical run (a zero array, a table row) does not
 //! abort, and a period-1 run aborts at 1,025 tokens (rule F), not 550.
 //!
@@ -194,6 +194,11 @@ impl RepeatGuard {
     /// The current run of consecutive seen positions (rule R).
     pub(crate) fn consecutive(&self) -> u32 {
         self.consecutive
+    }
+
+    /// The matched span after the first copy for a rule-F hit.
+    pub(crate) fn fast_span(&self, period: u32) -> u32 {
+        self.fast_run[period as usize]
     }
 
     /// The distance from the first copy of the current run to now (rule R).

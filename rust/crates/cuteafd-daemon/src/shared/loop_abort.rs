@@ -106,12 +106,12 @@ impl LoopAbort {
         let Some(hit) = self.guard.push(token) else { return false };
         self.detail.set_repetition();
         super::console::totals::loop_abort();
-        let (rule, period) = match hit {
-            LoopHit::Repeat { period } => ("repeat", Some(period)),
-            LoopHit::Fast { period } => ("fast", Some(period as usize)),
+        let (rule, period, span, period_hint) = match hit {
+            LoopHit::Repeat { period } => ("repeat", period, self.guard.consecutive(), self.guard.period_hint()),
+            LoopHit::Fast { period } => ("fast", period as usize, self.guard.fast_span(period), None),
         };
         tracing::info!(target: "cuteafd::loop_abort", request_id = self.request_id,
-            rule, period, run = self.guard.consecutive(), period_hint = ?self.guard.period_hint(),
+            rule, period, span, period_hint = ?period_hint,
             last_ids = ?self.guard.last_ids(),
             "loop abort: repeated block; finishing with length");
         true
@@ -128,12 +128,18 @@ mod tests {
     #[test]
     fn disabled_config_never_aborts() {
         let config = LoopAbortConfig { run: 0, copies: 8, fast_span: 0, fast_copies: 8 };
-        let detail = FinishDetail::default();
-        let mut abort = config.guard(detail.clone(), 1);
-        for token in 0..10_000u32 {
-            assert!(!abort.push(token));
+        for period in [1, 300] {
+            let detail = FinishDetail::default();
+            let mut abort = config.guard(detail.clone(), 1);
+            let mut enabled = LoopAbortConfig::default().guard(FinishDetail::default(), 2);
+            let mut enabled_aborted = false;
+            for token in (0..if period == 1 { 2_000 } else { 3_000 }).map(|i| i % period) {
+                assert!(!abort.push(token));
+                if !enabled_aborted { enabled_aborted = enabled.push(token); }
+            }
+            assert!(enabled_aborted, "enabled detector must abort period {period}");
+            assert_eq!(detail.name(), None);
         }
-        assert_eq!(detail.name(), None);
     }
 
     #[test]
