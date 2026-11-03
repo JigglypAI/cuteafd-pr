@@ -207,6 +207,24 @@ pub(crate) struct PeerExchange<'a> {
 }
 
 impl<'a> PeerExchange<'a> {
+    /// Physical retained owners, never reconstructed from requested slot extents.
+    pub(crate) fn allocation_buffers(&self) -> Vec<(usize, String, cuteafd_ffi::CuteafdDeviceBuffer)> {
+        let mut out = Vec::new();
+        for (rank, end) in self.ends.iter().enumerate() {
+            for (slot, recv) in end.recv.iter().enumerate() {
+                out.push((rank, format!("peer.recv.{slot}"), recv.buffer));
+            }
+            out.push((rank, "peer.control".into(), end.control.buffer));
+            if let Some(progress) = &end.progress {
+                out.push((rank, "peer.progress".into(), progress.buffer));
+            }
+            if let Some(abort) = &self.abort {
+                out.push((rank, "peer.abort".into(), abort.sides[rank].word.buffer));
+            }
+        }
+        out
+    }
+
     /// Enables peer access both ways and allocates `slots` zeroed receive
     /// buffers of `slot_bytes` and the control words on each rank; `ranks[0]`'s
     /// device must be current (and is again on return).

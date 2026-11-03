@@ -82,6 +82,7 @@ int cuteafd_set_expert_hidden(uint32_t hidden) { (void)hidden; return 0; }
 int cuteafd_cuda_enable_peer(int peer) { (void)peer; return 0; }
 int cuteafd_tp2_native_initialize(void) { return 0; }
 int cuteafd_peer_exchange_initialize(void) { return 0; }
+int cuteafd_peer_diagnostic_initialize(void) { return 0; }
 
 /* Ownership-only MLA programs: real Rust manifest/ABI validation still runs.
  * Numerical launches are deliberately unsupported by this CPU fixture. */

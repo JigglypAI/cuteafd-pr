@@ -2,7 +2,10 @@ use super::*;
 use crate::shared::token_io::{EmbedPlacement, EmbedSource};
 use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
 use cuteafd_loader::placement::{
-    families::glm5::buffers::TargetBuffers,
+    families::glm5::{
+        buffers::TargetBuffers,
+        exchanges::{ContextOwners, ExchangeBuffers},
+    },
     planner::{self, *},
 };
 use cuteafd_loader::{
@@ -149,6 +152,244 @@ fn plan(
         facts,
         phases,
     })
+}
+
+fn exchange_plan(cfg: &GlmDsaConfig, buffers: &ExchangeBuffers) -> Result<ResolvedPlan> {
+    let mut contract = Contract::fixed(
+        64,
+        buffers.maximum_pages,
+        1,
+        Facts {
+            allocations: vec![],
+            deferred: vec![],
+            sequential: vec![],
+            allowances: vec![],
+        },
+    );
+    contract.components = buffers.components(cfg)?;
+    let facts = contract.facts(&[], 1)?;
+    let budgets: Vec<_> = [
+        Location::coordinator(0),
+        Location::coordinator(1),
+        Location::PINNED,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, location)| Budget {
+        id: format!("fixture.exchange.{index}"),
+        locations: vec![location],
+        physical_bytes: 1 << 40,
+        logical_bytes: 1 << 40,
+        baseline: Baseline::Forecast {
+            occupied: 0,
+            source: "CPU fake DSO only".into(),
+            assumed: false,
+        },
+        headroom: 0,
+    })
+    .collect();
+    let phases = planner::evaluate(&facts, &budgets)?;
+    Ok(ResolvedPlan {
+        request: Request {
+            context: 64,
+            pool: Pin::Exact(64),
+            onboard: Pin::Auto,
+            prefill: Pin::Auto,
+            operation: Operation::Serving,
+        },
+        decisions: contract.decisions(&[])?,
+        pool_tokens: 64,
+        budgets,
+        facts,
+        phases,
+    })
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn actual_exchange_owners_match_independent_contract() -> Result<()> {
+    let fixture = Fixture::build()?;
+    let cfg = GlmDsaConfig::from_hf(&cuteafd_loader::plan::testing::glm5_config())?;
+    let directory = tempfile::tempdir_in(fixture.directory())?;
+    let path = directory.path().join("embedding.bf16");
+    std::fs::write(&path, vec![0; cfg.vocab_size * cfg.hidden * 2])?;
+    let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
+    for (context, waves, reverse, heterogeneous, abort) in [
+        (false, 1, false, false, true),
+        (false, 1, true, true, false),
+        (true, 3, false, false, true),
+        (true, 1, true, true, true),
+    ] {
+        let library = fixture.load()?;
+        fixture.quiet_events(&library, true)?;
+        fixture.immediate_copies(&library)?;
+        fixture.glm_target_programs(&library)?;
+        for device in 0..2 {
+            fixture.configure_memory(&library, device, 8 << 30)?;
+        }
+        let programs = library.programs()?;
+        let devices = if reverse { [1, 0] } else { [0, 1] };
+        library.cuda_set_device(devices[0])?;
+        let weights = GlmWeights {
+            layers: GlmLayer::allocation_fixture(&library, &cfg, 0, None)?,
+            norm: DeviceAllocation::new(&library, 256)?,
+            head: super::super::super::weights::GlmHead::Bf16(DeviceAllocation::new(
+                &library, 256,
+            )?),
+        };
+        let (embedding, ()) = TokenEmbedding::load(
+            &library,
+            EmbedSource {
+                path: path.clone(),
+                offset: 0,
+                vocab: cfg.vocab_size,
+                hidden: cfg.hidden,
+                snapshot: None,
+                tensor_name: "fixture.embedding".into(),
+            },
+            EmbedPlacement::Gpu,
+            || Ok(()),
+        )?;
+        let stream = std::ptr::null_mut();
+        let scratch = GlmContext {
+            topk_scratch: 17,
+            partial_scratch: 1024,
+        };
+        let mut engine = GlmEngine::new(
+            &library,
+            &programs,
+            cfg.clone(),
+            weights,
+            stream,
+            4096,
+            128,
+            2,
+            embedding,
+            crate::shared::prefill_depth::PrefillDepth::new(waves, 128)?,
+            context.then_some(scratch),
+        )?;
+        let layers = crate::shared::peer_split::on_device(&library, devices[1], || {
+            GlmLayer::allocation_fixture(&library, &cfg, 1, None)
+        })?;
+        engine.attach_peer(devices[1], stream, layers)?;
+        let sizes = if heterogeneous {
+            vec![16, 256, 512]
+        } else {
+            vec![128 * cfg.hidden * 2; 4 * waves]
+        };
+        if heterogeneous {
+            let ranks = devices.map(|device| RankDevice { device, stream });
+            engine.exchange = Some(if abort {
+                PeerExchange::new_abortable_sized(&library, ranks, &sizes)?
+            } else {
+                // The shared non-abortable constructor is also an independent physical arm.
+                PeerExchange::new(&library, ranks, 3, 512)?
+            });
+        }
+        let receive_bytes = if !abort { vec![512; 3] } else { sizes.clone() };
+        let extent = if reverse { 65 } else { 4096 };
+        let buffers = ExchangeBuffers {
+            devices: devices.map(|device| device as u8),
+            maximum_pages: 128,
+            receive_bytes: receive_bytes
+                .into_iter()
+                .map(|bytes| bytes as u64)
+                .collect(),
+            terminal_abort: abort,
+            diagnostics,
+            context: context.then_some(ContextOwners {
+                extent,
+                prefill: PrefillShape {
+                    rows: 128,
+                    waves: waves as u64,
+                },
+                scratch,
+            }),
+        };
+        let expected = exchange_plan(&cfg, &buffers)?;
+        if context {
+            assert!(
+                planner::reconcile(&expected, Phase::PostTargetKv, &engine.exchange_receipts()?)
+                    .is_err()
+            );
+            // Real constructor and production manifest selector, without numerical binding or launches.
+            let manifest = serde_json::json!({"programs": [
+                {"name": "glm_sparse_mla_partial_h0_s1_m64"},
+                {"name": "glm_sparse_mla_partial_h32_s1_m64"},
+            ]});
+            engine.attach_context(extent as usize, &manifest)?;
+        }
+        let actual = engine.exchange_receipts()?;
+        planner::reconcile(&expected, Phase::PostTargetKv, &actual)?;
+        assert_eq!(
+            actual
+                .iter()
+                .filter(|r| r.allocation.id.ends_with("peer.abort"))
+                .count(),
+            if abort { 2 } else { 0 }
+        );
+        assert_eq!(
+            actual
+                .iter()
+                .filter(|r| r.allocation.id.ends_with("peer.progress"))
+                .count(),
+            if diagnostics { 2 } else { 0 }
+        );
+        if let Some(split) = &engine.context {
+            for (rank, bytes) in split.bytes().into_iter().enumerate() {
+                let prefix = format!("glm.exchange.rank.{rank}.context.");
+                assert_eq!(
+                    actual
+                        .iter()
+                        .filter(|r| r.allocation.id.starts_with(&prefix)
+                            && r.allocation.id != format!("{prefix}exchange")
+                            && r.allocation.location != Location::PINNED)
+                        .map(|r| r.allocation.bytes as usize)
+                        .sum::<usize>(),
+                    bytes
+                );
+            }
+        }
+        for defect in 0..7 {
+            let mut broken = actual.clone();
+            match defect {
+                0 => {
+                    broken.remove(0);
+                }
+                1 => {
+                    let mut extra = broken[0].clone();
+                    extra.allocation.id.push_str(".unexpected");
+                    broken.push(extra);
+                }
+                2 => broken[0].allocation.bytes += 1,
+                3 => {
+                    broken[0].allocation.bytes += 1;
+                    broken[1].allocation.bytes -= 1;
+                }
+                4 => broken[0].allocation.location = Location::coordinator((1 - devices[0]) as u8),
+                5 => broken[0].address = 0,
+                _ => broken[1].address = broken[0].address,
+            }
+            assert!(
+                planner::reconcile(&expected, Phase::PostTargetKv, &broken).is_err(),
+                "defect {defect}"
+            );
+        }
+        if context {
+            let mut broken = actual.clone();
+            broken
+                .iter_mut()
+                .find(|r| r.allocation.id.ends_with("context.upload.gather.0"))
+                .unwrap()
+                .allocation
+                .bytes += 1;
+            assert!(planner::reconcile(&expected, Phase::PostTargetKv, &broken).is_err());
+            let mut broken = actual.clone();
+            broken.retain(|r| !r.allocation.id.ends_with("context.sink"));
+            assert!(planner::reconcile(&expected, Phase::PostTargetKv, &broken).is_err());
+        }
+    }
+    Ok(())
 }
 
 #[test]

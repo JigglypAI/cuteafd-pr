@@ -120,7 +120,7 @@ impl<'a> GlmContextSplit<'a> {
                 let _scope = cuteafd_ffi::memory_ledger::scope("context-staging");
                 let view = staging_pages * (RECORD_PAGE_BYTES + INDEX_PAGE_BYTES);
                 let staging = [engine.alloc(view)?, engine.alloc(view)?];
-                // The sink operand is never read (no sink): a 256-byte floor allocation, uncharged.
+                // The unused sink still owns a floored allocation and participates in admission.
                 let sink = engine.alloc(0)?;
                 Ok((ContextRank { candidates, own, peer, topk_scratch, partial_scratch, gather, commit, staging }, sink))
             })
@@ -135,8 +135,59 @@ impl<'a> GlmContextSplit<'a> {
     /// Bytes this split allocated on each GPU beside the exchange (the solver's
     /// "context workspace" + "context staging").
     pub fn bytes(&self) -> [usize; 2] {
-        self.ranks.each_ref().map(|r| [&r.candidates, &r.own, &r.peer, &r.topk_scratch, &r.partial_scratch, &r.gather]
-            .into_iter().chain(&r.commit).chain(&r.staging).map(|d| d.buffer.bytes).sum())
+        std::array::from_fn(|rank| {
+            let r = &self.ranks[rank];
+            [&r.candidates, &r.own, &r.peer, &r.topk_scratch, &r.partial_scratch, &r.gather, &self.sink[rank]]
+                .into_iter().chain(&r.commit).chain(&r.staging).map(|d| d.buffer.bytes).sum()
+        })
+    }
+
+    pub(super) fn allocation_receipts(&self, engine: &GlmEngine<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use super::allocation::Census;
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location, Receipt};
+        let mut out = Vec::new();
+        let storage = self.exchange.allocation_buffers();
+        for (rank, r) in self.ranks.iter().enumerate() {
+            let mut census = Census {
+                prefix: format!("glm.exchange.rank.{rank}"), receipts: Vec::new(),
+            };
+            for (name, buffer, category) in [
+                ("exchange", storage[rank], Category::Transport),
+                ("candidates", r.candidates.buffer, Category::Workspace),
+                ("own", r.own.buffer, Category::Workspace),
+                ("peer", r.peer.buffer, Category::Workspace),
+                ("topk_scratch", r.topk_scratch.buffer, Category::Workspace),
+                ("partial_scratch", r.partial_scratch.buffer, Category::Workspace),
+                ("gather", r.gather.buffer, Category::Workspace),
+                ("sink", self.sink[rank].buffer, Category::Workspace),
+            ] {
+                census.record(&format!("context.{name}"), buffer, Lifetime::TARGET, category, "GLM exchanges")?;
+            }
+            let mut uploads = Vec::new();
+            for (lane, table) in r.commit.iter().enumerate() {
+                census.record(&format!("context.commit.{lane}"), table.buffer, Lifetime::TARGET,
+                    Category::Workspace, "GLM exchanges")?;
+                uploads.push((format!("commit.{lane}"), table.buffer));
+            }
+            for (parity, staging) in r.staging.iter().enumerate() {
+                census.record(&format!("context.staging.{parity}"), staging.buffer, Lifetime::TARGET,
+                    Category::Workspace, "GLM exchanges")?;
+                let half = self.staging_pages.div_ceil(2);
+                uploads.push((format!("gather.{parity}"), view(&r.gather, parity * half * 4, half * 4)?));
+            }
+            for (name, destination) in uploads {
+                let actual = engine.library.ordered_h2d_staging_buffer(destination, engine.stream_of(rank))?;
+                census.receipts.push(Receipt {
+                    allocation: Allocation::buffer(format!("{}.context.upload.{name}", census.prefix),
+                        Location::PINNED, actual.bytes as u64, Lifetime::TARGET, Category::Staging, "GLM exchanges"),
+                    address: actual.ptr as u64,
+                });
+            }
+            out.extend(census.receipts);
+        }
+        Ok(out)
     }
 }
 

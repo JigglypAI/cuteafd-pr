@@ -1,13 +1,13 @@
-//! Independent retained-field census for the target buffer subrecipe. This is
-//! not a complete family census and cannot by itself authorize Ready.
+//! Independent retained-field census for target, hook and exchange subrecipes.
+//! This is not a complete family census and cannot by itself authorize Ready.
 use super::*;
 use cuteafd_core::memory_layout::Category;
 use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location, Phase, Receipt, View};
 use std::collections::BTreeMap;
 
-struct Census {
-    prefix: String,
-    receipts: Vec<Receipt>,
+pub(super) struct Census {
+    pub(super) prefix: String,
+    pub(super) receipts: Vec<Receipt>,
 }
 impl Census {
     fn buffer(
@@ -19,7 +19,7 @@ impl Census {
     ) -> Result<()> {
         self.record(id, buffer, lifetime, category, "GLM target buffers")
     }
-    fn record(
+    pub(super) fn record(
         &mut self,
         id: &str,
         buffer: cuteafd_ffi::CuteafdDeviceBuffer,
@@ -353,6 +353,23 @@ impl Census {
 }
 
 impl GlmEngine<'_> {
+    pub(crate) fn exchange_receipts(&self) -> Result<Vec<Receipt>> {
+        let mut out = Vec::new();
+        if let Some(exchange) = &self.exchange {
+            for (rank, name, buffer) in exchange.allocation_buffers() {
+                let mut census = Census {
+                    prefix: format!("glm.exchange.rank.{rank}"), receipts: Vec::new(),
+                };
+                census.record(&name, buffer, Lifetime::TARGET, Category::Transport, "GLM exchanges")?;
+                out.extend(census.receipts);
+            }
+        }
+        if let Some(context) = &self.context {
+            out.extend(context.allocation_receipts(self)?);
+        }
+        Ok(out)
+    }
+
     pub(crate) fn target_hook_receipts(&self) -> Result<Vec<Receipt>> {
         let mut out = Vec::new();
         for rank in 0..self.ranks() {

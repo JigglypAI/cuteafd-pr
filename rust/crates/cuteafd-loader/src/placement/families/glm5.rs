@@ -11,6 +11,7 @@ use crate::serving_capacity::{glm_cache_geometry, glm_decode_graph_allowance};
 use cuteafd_core::memory_layout::{Basis, Category};
 
 pub mod buffers;
+pub mod exchanges;
 pub mod hooks;
 pub mod weights;
 
@@ -148,7 +149,8 @@ pub fn manifest_context(manifest: Option<&serde_json::Value>, sms: usize,
 /// [`context_workspace`]'s bytes with the engine's allocation floor.
 pub fn context_workspace_bytes(cfg: &GlmDsaConfig, extent: u64, prefill_rows: u64, lanes: u64, context: GlmContext)
     -> u64 {
-    context_workspace(cfg, extent, prefill_rows, lanes, context).iter().map(|&(_, b)| b.max(FLOOR)).sum()
+    context_workspace(cfg, extent, prefill_rows, lanes, context).iter().map(|&(_, b)| b.max(FLOOR)).sum::<u64>()
+        + FLOOR // The unused lse_combine2 sink is still a retained physical owner.
 }
 
 /// Program scratch selection mirrors `glm5::engine::workspace_here`. Optional
@@ -2220,7 +2222,7 @@ mod tests {
         assert_eq!(demands[1].bytes, 2 * 64 * (2 * 36_864 + 32_896 + 2 * 16_384) + 2 * 3 * 16);
         let workspace = context_workspace(&cfg, 1 << 20, 4096, 3, CONTEXT_SCRATCH);
         assert_eq!(workspace.len(), 6 + 3, "one commit list per prefill lane");
-        assert_eq!(demands[2].bytes, workspace.iter().map(|&(_, b)| b.max(FLOOR)).sum::<u64>());
+        assert_eq!(demands[2].bytes, workspace.iter().map(|&(_, b)| b.max(FLOOR)).sum::<u64>() + FLOOR);
         let unit = |p: &Placement, gpu: usize| item(p, gpu, "records") / (p.pool_tokens / PAGE_ROWS);
         assert_eq!(unit(&auto, 0) + unit(&auto, 1) - 2 * (DECODE_ROWS + 3) * 4, unit(&heads, 0) - (DECODE_ROWS + 3) * 4);
         // Commit lists: a 4,096-row lane spans 65 pages, 33 of either parity.

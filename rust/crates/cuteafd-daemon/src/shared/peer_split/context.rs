@@ -214,6 +214,11 @@ impl<'a> ContextExchange<'a> {
         Ok(Self { library, ranks, layout, storage: [side(0)?, side(1)?], abort })
     }
 
+    /// The abort pointers are borrowed; only these two storage allocations are owners.
+    pub(crate) fn allocation_buffers(&self) -> [cuteafd_ffi::CuteafdDeviceBuffer; 2] {
+        self.storage.each_ref().map(|owner| owner.buffer)
+    }
+
     /// Bytes allocated on each GPU (the solver charged exactly this).
     pub fn bytes(&self) -> usize {
         self.storage[0].buffer.bytes
