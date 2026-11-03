@@ -100,15 +100,17 @@ mod tests {
 
     #[test]
     fn owned_sm120_allowance_uses_only_dense_fronts() {
-        // Retain the conservative per-executable SM120 allowance; MoE fronts no
-        // longer contribute executables. Hardware records the new actual bytes.
+        // RTX PRO 6000 EXL3 K4, 2026-11-03: dense fronts only; all 213 shapes.
+        let measured = [4_005_560_320, 3_980_394_496];
         let owners: Vec<_> = (0..78).map(|layer| (layer % 2) as u8).collect();
         let startup = glm_owned_startup_graphs(1 << 20, 32768, &owners, 3).unwrap();
         assert_eq!(startup.keys.len(), 213);
         for rank in 0..2 {
             let count = (2 * 78 + 3) * startup.keys.len() as u64;
             assert_eq!(startup.inventory.ranks[rank].executables, count);
+            assert_eq!(startup.inventory.at_ready(rank), 4_030_173_000);
             assert_eq!(startup.inventory.at_ready(rank), count * GLM_OWNED_SM120_GRAPH_BYTES);
+            assert!(startup.inventory.at_ready(rank) >= measured[rank]);
             assert_eq!(startup.inventory.growth(rank), startup.inventory.at_ready(rank) / 10);
         }
     }
