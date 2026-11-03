@@ -8,6 +8,18 @@ use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, F32Bf16Narrow,
 use cuteafd_loader::plan::exlr8::native::{FlashCharges, FlashRankLayout, FlashStageLayout};
 use std::collections::{BTreeMap, BTreeSet};
 
+// GlmfIndexPost and GlmfIndexPostRows in b12x/integration/cuteafd/_glmf_kernels.py
+// consume [wk128 | weights32 | gate128], not [wk | gate | weights].
+const INDEX_KEY_WIDTH: usize = 128;
+const INDEX_WEIGHT_COLUMN: usize = INDEX_KEY_WIDTH;
+const INDEX_GATE_COLUMN: usize = INDEX_WEIGHT_COLUMN + projected_index::HEADS;
+const INDEX_PACKED_WIDTH: usize = INDEX_GATE_COLUMN + INDEX_KEY_WIDTH;
+const INDEX_PACK: [(&str, usize, usize); 3] = [
+    ("index_k", INDEX_KEY_WIDTH, 0),
+    ("index_w", projected_index::HEADS, INDEX_WEIGHT_COLUMN),
+    ("index_gate", INDEX_KEY_WIDTH, INDEX_GATE_COLUMN),
+];
+
 pub(super) fn is_native(layer: &GlmfLayer<'_>) -> bool { !layer.native_projections.is_empty() }
 pub(super) fn dense_ffn(layer: &GlmfLayer<'_>) -> bool {
     layer.dense && layer.native_projections.contains_key("down")
@@ -244,18 +256,23 @@ impl<'a> GlmfEngine<'a> {
         let input = matrix(w.x.buffer, first, count, self.cfg.hidden, 2)?;
         let q_resid = matrix(w.q_resid.buffer, first, count, self.cfg.q_lora_rank, 2)?;
         self.native_linear(rank, w, layer, "index_q", q_resid, query, count)?;
-        let geometry = layer.native_projections.get("index_k").context("native Flash index K geometry")?;
-        self.on(rank, || {
-            ensure!(matches!(self.native_rank(rank)?.programs.linear(geometry,
-                |component| layer.native(&key("index_k", component)), scratch.linear.view(), input, count,
-                packed, false, self.stream_of(rank))?, NativeOut::F32 { n: 128 }), "native Flash index K must remain MXFP8");
-            Ok(())
-        })?;
-        self.native_pack(rank, w, packed, count, 128, 288, 0)?;
-        self.native_bf16(rank, w, input, layer.buffer("index_gate")?, count, 128)?;
-        self.native_pack(rank, w, packed, count, 128, 288, 128)?;
-        self.native_bf16(rank, w, input, layer.native(&key("index_w", "bf16"))?, count, 32)?;
-        self.native_pack(rank, w, packed, count, 32, 288, 256)?;
+        for (projection, width, column) in INDEX_PACK {
+            if projection == "index_k" {
+                let geometry = layer.native_projections.get(projection).context("native Flash index K geometry")?;
+                self.on(rank, || {
+                    ensure!(matches!(self.native_rank(rank)?.programs.linear(geometry,
+                        |component| layer.native(&key(projection, component)), scratch.linear.view(), input, count,
+                        packed, false, self.stream_of(rank))?, NativeOut::F32 { n } if n == width),
+                        "native Flash index K must remain MXFP8");
+                    Ok(())
+                })?;
+            } else {
+                let weights = if projection == "index_gate" { layer.buffer("index_gate")? }
+                    else { layer.native(&key(projection, "bf16"))? };
+                self.native_bf16(rank, w, input, weights, count, width)?;
+            }
+            self.native_pack(rank, w, packed, count, width, INDEX_PACKED_WIDTH, column)?;
+        }
         let weights = projected_index::Weights { norm: layer.buffer("k_norm_w")?, bias: layer.buffer("k_norm_b")?, ape: layer.buffer("ape")? };
         let caches = self.caches_of(rank);
         let cache = caches.index[index].as_ref().context("native Flash index cache")?;
@@ -294,6 +311,34 @@ impl<'a> GlmfEngine<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projected_index_pack_matches_consumer_column_ranges() {
+        let rows = 3;
+        let mut packed = vec![u16::MAX; rows * INDEX_PACKED_WIDTH];
+        for (projection, width, column) in INDEX_PACK {
+            let base = match projection { "index_k" => 0, "index_w" => 1024, "index_gate" => 2048,
+                _ => panic!("unknown index projection") };
+            let source: Vec<u16> = (0..rows * width).map(|i| (base + i) as u16).collect();
+            for row in 0..rows {
+                let target = row * INDEX_PACKED_WIDTH + column;
+                packed[target..target + width].copy_from_slice(&source[row * width..(row + 1) * width]);
+            }
+        }
+        // Independently mirror both consumers' key, head-weight and gate reads.
+        for row in 0..rows {
+            let values = &packed[row * INDEX_PACKED_WIDTH..(row + 1) * INDEX_PACKED_WIDTH];
+            assert_eq!(values.len(), 288);
+            for channel in 0..128 {
+                assert_eq!(values[channel], (row * 128 + channel) as u16);
+                assert_eq!(values[128 + 32 + channel], (2048 + row * 128 + channel) as u16);
+            }
+            for head in 0..32 {
+                assert_eq!(values[128 + head], (1024 + row * 32 + head) as u16);
+            }
+            assert!(!values.contains(&u16::MAX));
+        }
+    }
 
     #[test]
     fn projected_sequences_count_live_slots_not_verify_rows() {
