@@ -2145,25 +2145,39 @@ mod tests {
     #[test]
     fn owned_graphs_use_the_runtime_clamped_context_at_small_pools() {
         let cfg = config();
-        for (requested_pool, expected_pool, expected_context) in [
-            // Prefill slots share step scratch/head/logits; decode intake is 64 rows.
-            // Dense fronts only, with the measured 119 KB owned-executable allowance.
-            (Some(32768), 32768, 32512), (None, 191872, 191616),
-        ] {
+        for requested_pool in [Some(32768), None] {
             let mut i = inputs(&cfg, &[32 * GIB; 2]);
             i.prefill_lanes = 2;
             i.onboard = if requested_pool.is_some() { Onboard::Layers(0) } else { Onboard::Auto };
             i.requested_pool = requested_pool;
             let (placed, _) = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Layers)).unwrap();
-            assert_eq!(placed.pool_tokens, expected_pool);
             let context = crate::serving_capacity::pool_context(i.max_context as usize,
                 i.automatic_context, placed.pool_tokens as usize, 256).unwrap();
-            assert_eq!(context, expected_context);
+            assert_eq!(context as u64, placed.pool_tokens - 256);
             let owners: Vec<_> = placed.layers.iter().map(|layer| match layer.mode {
                 LayerMode::Whole { gpu, .. } => gpu, _ => unreachable!(),
             }).collect();
             let startup = crate::serving_capacity::glm_graphs::glm_owned_startup_graphs(
                 context, (placed.pool_tokens as usize).div_ceil(PAGE_ROWS as usize), &owners, cfg.first_moe_layer).unwrap();
+            // Derive pool capacity from the calibrated graph cost and the other
+            // ledger charges, rather than baking one calibration's token count in.
+            let graph_bytes = (2 * cfg.layers + cfg.first_moe_layer) as u64 * startup.keys.len() as u64
+                * crate::placement::inventory::GLM_OWNED_SM120_GRAPH_BYTES;
+            let graph_reserve = graph_bytes + (graph_bytes.div_ceil(10)).max(64 << 20);
+            let expected_pool = requested_pool.unwrap_or_else(|| {
+                let units = (0..2).map(|rank| {
+                    let fixed: u64 = placed.items[rank].iter()
+                        .filter(|item| !matches!(item.group.as_str(), "graphs" | "graph growth" | "records"))
+                        .map(|item| item.bytes).sum();
+                    let available = GpuBudget { capacity_bytes: i.gpus[rank].0,
+                        headroom_bytes: i.headroom_bytes, baseline: i.gpus[rank].1 }.available();
+                    let per_unit = placed.pool_limits.0[rank].demands.iter()
+                        .map(|demand| demand.bytes_per_unit).sum::<u64>();
+                    (available - fixed - graph_reserve) / per_unit
+                }).min().unwrap();
+                (units * PAGE_ROWS).min(request(&i).unwrap().pool.ceiling)
+            });
+            assert_eq!(placed.pool_tokens, expected_pool);
             for rank in 0..2 {
                 for item in startup.inventory.items(rank) {
                     assert!(placed.items[rank].contains(&item), "missing {item:?}");
