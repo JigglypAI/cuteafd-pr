@@ -296,12 +296,14 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
             let hidden = catalog.routed_experts().geometry()?.hidden as u64;
             let rows = deployment.prefill_unit_rows;
             let waves = deployment.prefill_waves;
-            let intake = cuteafd_loader::serving_capacity::spark_intake_bytes(waves, peers as u64, rows, hidden);
-            assert_eq!(intake, 8 * waves * rows * hidden * 2, "{key}");
+            let intake = cuteafd_loader::serving_capacity::prefill_return_bytes(waves, rows, peers as u64, hidden);
+            assert_eq!(intake, 8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(waves * rows * hidden * 2)?, "{key}");
             if family == "v41" {
                 use cuteafd_loader::placement::families::deepseek_v41::owners;
                 let charged = owners::transports_bytes(64, rows, peers, waves as usize)?;
-                assert_eq!(charged, 2 * 64 * (8 + 2) * 5120 * 2 + rows * waves * (1 + 8) * 5120 * 2);
+                assert_eq!(charged, 2 * (8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(64 * 5120 * 2)?
+                    + 2 * 64 * 5120 * 2) + rows * waves * 5120 * 2
+                    + 8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * waves * 5120 * 2)?);
             }
             if family != "kimik3" {
                 let host = report.host_ledger.as_ref().expect("full host intake ledger");
