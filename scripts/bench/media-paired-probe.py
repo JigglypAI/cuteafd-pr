@@ -69,6 +69,29 @@ def load_panel(a):
     return load_set(a.windows, family)
 
 
+def digest_hex(value):
+    return (isinstance(value, str) and len(value) == 64
+            and all(c in "0123456789abcdef" for c in value))
+
+
+def check_media_echo(window, actual):
+    expected = window.get("media", [])
+    if not isinstance(actual, list) or len(expected) != len(actual):
+        raise ValueError("prepared media echo differs")
+    for span, got in zip(expected, actual):
+        if not isinstance(got, dict) or any(got.get(k) != span[k] for k in ("start", "len", "kind", "grid")):
+            raise ValueError("prepared media echo differs")
+        if span.get("identity"):
+            identity = got.get("identity")
+            if (not isinstance(identity, dict) or not digest_hex(got.get("key"))
+                    or got.get("input_key") != span["key"]
+                    or identity.get("processor") != span["identity"]["processor"]
+                    or any(not digest_hex(identity.get(k)) for k in ("encoder", "processor"))):
+                raise ValueError("prepared input/admitted encoder identity differs")
+        elif got.get("key") != span["key"]:
+            raise ValueError("prepared media echo differs")
+
+
 def check_record(window, response, checkpoint, mode, features_root=None, family=None):
     record = response.get("probe", {})
     if (record.get("error") or not record.get("engine") or not record.get("cold")
@@ -77,11 +100,7 @@ def check_record(window, response, checkpoint, mode, features_root=None, family=
             or response.get("server", {}).get("model") != checkpoint
             or family is not None and response.get("server", {}).get("family") != family):
         raise ValueError("media scoring identity/cold/path contract not honored")
-    fields = ("start", "len", "kind", "key", "grid")
-    expected = [{k: span[k] for k in fields} for span in window.get("media", [])]
-    actual = [{k: span.get(k) for k in fields} for span in record.get("media", [])]
-    if actual != expected:
-        raise ValueError("prepared media echo differs")
+    check_media_echo(window, record.get("media", []))
     positions = list(range(window["score_from"], len(window["tokens"])))
     if ([row["position"] for row in record.get("rows", [])] != positions
             or record.get("scored") != len(positions)
@@ -109,9 +128,42 @@ def check_record(window, response, checkpoint, mode, features_root=None, family=
             raise ValueError("reference feature provenance differs from sealed export")
 
 
+def bound_panel(panel, path):
+    """A sidecar adds input identity without changing the immutable set or golden."""
+    if path is None:
+        return panel, None
+    payload = Path(path).read_bytes()
+    sidecar = json.loads(payload)
+    result, _ = bound_panel_document(panel, sidecar)
+    return result, {"sha256": hashlib.sha256(payload).hexdigest(),
+                    "canonical_sha256": hashlib.sha256(canonical(sidecar)).hexdigest(), "document": sidecar}
+
+
+def bound_panel_document(panel, sidecar):
+    if (sidecar.get("schema") != "cuteafd.media.input-binding/1"
+            or sidecar.get("set_sha256") != panel["set_sha256"]):
+        raise ValueError("input binding set identity differs")
+    identities = sidecar.get("images", {})
+    keys = {s["key"] for w in panel["windows"] for s in w.get("media", [])}
+    if set(identities) != keys:
+        raise ValueError("input binding image keys differ")
+    result = json.loads(json.dumps(panel))
+    for window in result["windows"]:
+        for span in window.get("media", []):
+            identity = identities[span["key"]]
+            if (not isinstance(identity, dict) or set(identity) != {"encoder", "processor"}
+                    or any(not isinstance(v, str) or len(v) != 64
+                           or any(c not in "0123456789abcdef" for c in v) for v in identity.values())):
+                raise ValueError("invalid input binding identity")
+            if span.get("identity", identity) != identity:
+                raise ValueError("input binding conflicts with sealed identity")
+            span["identity"] = identity
+    return result, None
+
+
 def capture(a):
     a.bench_token = probe_token(a.bench_token, getattr(a, "bench_token_file", None))
-    panel = load_panel(a)
+    panel, binding = bound_panel(load_panel(a), getattr(a, "input_binding", None))
     if a.out.exists():
         raise ValueError("capture output must be new")
     models = http(a.url.rstrip("/") + "/v1/models", a.bench_token)
@@ -123,6 +175,7 @@ def capture(a):
     selected = [w for w in panel["windows"] if not a.quick or w["id"] in panel["quick_windows"]]
     a.out.mkdir(parents=True)
     entries, server = [], None
+    admitted_encoder = None
     started = time.monotonic()
     for window in selected:
         media = []
@@ -146,18 +199,25 @@ def capture(a):
         # Retain an invalid response too; it is evidence of a failed live gate.
         write_new(a.out / (leaf + ".json"), response)
         check_record(window, response, panel["checkpoint"], a.mode, a.features, panel["family"])
+        for span in response["probe"].get("media", []):
+            identity = span.get("identity")
+            if identity is not None:
+                if admitted_encoder is not None and identity != admitted_encoder:
+                    raise ValueError("admitted encoder changed during capture")
+                admitted_encoder = identity
         current = response["server"]
         if server is not None and current != server:
             raise ValueError("server build/settings changed during capture")
         server = current
         rows = dump_rows(a.host_dump / leaf, window, None)
-        entries.append({"id": leaf, "response_sha256": hashlib.sha256((a.out / (leaf + ".json")).read_bytes()).hexdigest(),
+        entries.append({"id": leaf, "admitted_media": response["probe"].get("media", []), "response_sha256": hashlib.sha256((a.out / (leaf + ".json")).read_bytes()).hexdigest(),
                         "path": str((a.host_dump / leaf).resolve()),
                         "manifest_sha256": hashlib.sha256((a.host_dump / leaf / "manifest.jsonl").read_bytes()).hexdigest(),
                         "files": [{"position": pos, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                                   for pos, path in rows.items()]})
     write_new(a.out / "capture.json", {"schema": "cuteafd.media.paired.capture/1", "mode": a.mode,
         "set_sha256": panel["set_sha256"], "checkpoint": panel["checkpoint"], "server": server,
+        "input_binding": binding,
         "quick": a.quick, "seconds": time.monotonic() - started, "windows": entries})
 
 
@@ -252,6 +312,16 @@ def native_metrics(summaries, bar):
             "pass": kl <= bar["max_kl"] and top1 >= bar["min_top1"]}
 
 
+def report_provenance(captures, paired):
+    admitted = [[{"id": w["id"], "media": w["admitted_media"]} for w in capture["windows"]
+                 if any(s.get("identity") for s in w.get("admitted_media", []))] for capture in captures]
+    bindings = [capture.get("input_binding") for capture in captures]
+    fields = {"admitted_media": admitted if paired else admitted[0],
+              "input_bindings" if paired else "input_binding": bindings if paired else bindings[0]}
+    return {key: value for key, value in fields.items()
+            if (any(value) if paired else bool(value))}
+
+
 def compare(a):
     paired = a.reference is not None
     if paired != (a.features is not None):
@@ -267,11 +337,28 @@ def compare(a):
     if meta["set_sha256"] != panel["set_sha256"] or meta["checkpoint"] != panel["checkpoint"]:
         raise ValueError("golden provenance differs")
     captures = [json.loads((root / "capture.json").read_text()) for root in roots]
+    identity_panels = []
     for capture_record, mode in zip(captures, ("native", "reference")):
         if (capture_record["schema"] != "cuteafd.media.paired.capture/1" or capture_record["mode"] != mode
                 or capture_record["set_sha256"] != panel["set_sha256"]
                 or capture_record["checkpoint"] != panel["checkpoint"]):
             raise ValueError("arm capture identity differs")
+        binding = capture_record.get("input_binding")
+        identity_panel = panel
+        if binding is not None:
+            if (not digest_hex(binding.get("sha256"))
+                    or hashlib.sha256(canonical(binding["document"])).hexdigest() != binding["canonical_sha256"]
+                    or binding["document"].get("set_sha256") != panel["set_sha256"]):
+                raise ValueError("capture input binding provenance differs")
+            identity_panel, _ = bound_panel_document(panel, binding["document"])
+        identity_windows = {w["id"]: w for w in identity_panel["windows"]}
+        for sealed in capture_record["windows"]:
+            window = identity_windows.get(sealed["id"])
+            if window is None:
+                raise ValueError("capture binding windows differ")
+            if binding is not None or "admitted_media" in sealed or any(s.get("identity") for s in window.get("media", [])):
+                check_media_echo(window, sealed.get("admitted_media", []))
+        identity_panels.append(identity_windows)
     # Only the image tag may differ; commit and all effective model knobs must match.
     servers = json.loads(json.dumps([c["server"] for c in captures]))
     for server in servers:
@@ -313,13 +400,15 @@ def compare(a):
             raise ValueError("golden tokens differ")
         logits = np.memmap(path, dtype="<f4", mode="r", shape=(len(positions), vocab))
         arms = []
-        for arm, capture_root, mode in zip(arm_maps, roots, ("native", "reference")):
+        for arm, capture_root, mode, identity_windows in zip(arm_maps, roots, ("native", "reference"), identity_panels):
             sealed = arm[window["id"]]
             response_path = capture_root / (window["id"] + ".json")
             if hashlib.sha256(response_path.read_bytes()).hexdigest() != sealed["response_sha256"]:
                 raise ValueError("capture response changed")
             response = json.loads(response_path.read_text())
-            check_record(window, response, panel["checkpoint"], mode, a.features, panel["family"])
+            check_record(identity_windows[window["id"]], response, panel["checkpoint"], mode, a.features, panel["family"])
+            if "admitted_media" in sealed and sealed["admitted_media"] != response["probe"].get("media", []):
+                raise ValueError("capture admitted media differs from sealed response")
             if response["server"] != captures[0 if mode == "native" else 1]["server"]:
                 raise ValueError("capture server differs from manifest")
             root = Path(sealed["path"])
@@ -372,6 +461,7 @@ def compare(a):
         result = {"schema": "cuteafd.media.g4.native/1", "set_sha256": panel["set_sha256"],
                   "checkpoint": panel["checkpoint"], "golden_seal_sha256": file_hash(a.golden_seal),
                   "path": "decode-shaped", "bar": bar, "windows": summaries, **metrics,
+                  **report_provenance(captures, paired=False),
                   "criterion": "native vs official golden; pooled and each nonempty media/image/control group meet expert bit-tier bar",
                   "pass": all(m["pass"] for m in metrics.values() if m is not None),
                   "scope": "following-text decode fidelity only; no prefill qualification or precision-default promotion"}
@@ -382,6 +472,7 @@ def compare(a):
     result = {"schema": "cuteafd.media.g4/1", "criterion": CRITERION, "set_sha256": panel["set_sha256"],
               "checkpoint": panel["checkpoint"], "golden_seal_sha256": file_hash(a.golden_seal),
               "path": "decode-shaped", "windows": summaries, **bounds,
+              **report_provenance(captures, paired=True),
               "pass": bounds["kl_increase_upper95"] <= .005 and bounds["top1_loss_upper95"] <= .005,
               "scope": "encoder-swap gate only; no prefill qualification or precision-default promotion"}
     write_new(a.out, result)
@@ -397,6 +488,7 @@ def main():
         capture_parser.add_argument("--" + flag, type=Path, required=True)
     capture_parser.add_argument("--mode", choices=("native", "reference"), required=True)
     capture_parser.add_argument("--features", type=Path)
+    capture_parser.add_argument("--input-binding", type=Path)
     capture_parser.add_argument("--url", required=True)
     auth = capture_parser.add_mutually_exclusive_group()
     auth.add_argument("--bench-token")

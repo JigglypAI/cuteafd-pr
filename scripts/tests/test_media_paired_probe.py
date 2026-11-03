@@ -182,16 +182,16 @@ def test_log_probs_validate_shape_and_normalize(tmp_path):
         module.normalize([0, float("nan")])
 
 
-def compare_case(tmp_path, monkeypatch, family, control=False, native_row=(0., -5.), geometry="tiled"):
+def compare_case(tmp_path, monkeypatch, family, control=False, native_row=(0., -5.), geometry="tiled", quick=False):
     import hashlib
     from types import SimpleNamespace
     from safetensors.numpy import save_file
     from fidelity_windows import canonical, set_hash
     panel = {"schema": "cuteafd.fidelity.set/1", "family": family, "checkpoint": "model",
-             "quick_windows": ["w0", "w1"], "windows": []}
+             "quick_windows": ["w1", "w2"] if quick else ["w0", "w1"], "windows": []}
     span = {"start": 0, "len": 1, "kind": "image", "key": "a" * 64, "grid": [1, 2, 2],
             "fixture": {"path": "image.png", "sha256": "b" * 64}}
-    for name in ["w0", "w1"]:
+    for name in (["w0", "w1", "w2"] if quick else ["w0", "w1"]):
         panel["windows"].append({"id": name, "block": "vision", "bucket": "0-2K",
                                 "tokens": [9] * 577, "roles": ["ctx"] * 65 + ["gen"] * 512,
                                 "score_from": 65, "media": [span]})
@@ -255,10 +255,12 @@ def compare_case(tmp_path, monkeypatch, family, control=False, native_row=(0., -
         root = tmp_path / mode
         root.mkdir()
         capture = {"schema": "cuteafd.media.paired.capture/1", "mode": mode, "set_sha256": panel["set_sha256"],
-                   "checkpoint": "model", "quick": False,
+                   "checkpoint": "model", "quick": quick,
                    "server": {"model": "model", "family": family,
                               "build": {"commit": "same", "image": mode}}, "windows": []}
         for window in panel["windows"]:
+            if quick and window["id"] not in panel["quick_windows"]:
+                continue
             dump = root / window["id"]
             dump.mkdir()
             manifest, files = [], []
@@ -485,3 +487,90 @@ def test_capture_cli_accepts_token_file_without_argv_secret(tmp_path, monkeypatc
     module.main()
     assert seen[0].bench_token is None
     assert seen[0].bench_token_file == tmp_path / "key"
+
+
+def test_input_binding_keeps_set_identity_and_rejects_wrong_sidecars(tmp_path):
+    span = {"key": "a" * 64}
+    panel = {"set_sha256": "b" * 64, "windows": [{"media": [span]}]}
+    sidecar = {"schema": "cuteafd.media.input-binding/1", "set_sha256": panel["set_sha256"],
+               "images": {span["key"]: {"encoder": "c" * 64, "processor": "d" * 64}}}
+    path = tmp_path / "binding.json"
+    path.write_text(json.dumps(sidecar))
+    bound, provenance = module.bound_panel(panel, path)
+    assert bound["set_sha256"] == panel["set_sha256"] and "identity" not in span
+    assert bound["windows"][0]["media"][0]["identity"] == sidecar["images"][span["key"]]
+    assert provenance["document"] == sidecar and len(provenance["sha256"]) == 64
+    sidecar["set_sha256"] = "e" * 64
+    path.write_text(json.dumps(sidecar))
+    with pytest.raises(ValueError, match="set identity"):
+        module.bound_panel(panel, path)
+
+
+@pytest.mark.parametrize("quick", [False, True])
+def test_compare_rebound_capture_uses_bound_windows_and_sealed_admission(tmp_path, monkeypatch, quick):
+    import hashlib
+    from fidelity_windows import canonical
+    args, panel = compare_case(tmp_path, monkeypatch, "mimo_v2", quick=quick)
+    sidecar = {"schema": "cuteafd.media.input-binding/1", "set_sha256": panel["set_sha256"],
+               "images": {"a" * 64: {"encoder": "b" * 64, "processor": "c" * 64}}}
+    binding_path = tmp_path / "binding.json"
+    binding_path.write_bytes(canonical(sidecar))
+    _, binding = module.bound_panel(panel, binding_path)
+    manifests = []
+    for root in (args.native, args.reference):
+        path = root / "capture.json"
+        capture = json.loads(path.read_text())
+        capture["input_binding"] = binding
+        for entry in capture["windows"]:
+            response_path = root / (entry["id"] + ".json")
+            response = json.loads(response_path.read_text())
+            for span in response["probe"]["media"]:
+                span.update(key="d" * 64, input_key="a" * 64,
+                            identity={"encoder": "e" * 64, "processor": "c" * 64})
+            response_path.write_bytes(canonical(response))
+            entry["response_sha256"] = hashlib.sha256(response_path.read_bytes()).hexdigest()
+            entry["admitted_media"] = response["probe"]["media"]
+        path.write_bytes(canonical(capture))
+        manifests.append(capture)
+    assert module.compare(args)
+    report = json.loads(args.out.read_text())
+    assert report["input_bindings"] == [binding, binding]
+    assert report["admitted_media"][0][0]["media"][0]["identity"]["encoder"] == "e" * 64
+    assert [w["id"] for w in report["windows"]] == (["w1", "w2"] if quick else ["w0", "w1"])
+    if quick:
+        assert not (args.native / "w0").exists()
+        assert not (args.reference / "w0").exists()
+    for mutation in ("missing", "encoder", "processor", "key", "response"):
+        capture = json.loads(json.dumps(manifests[0]))
+        admitted = capture["windows"][0]["admitted_media"]
+        if mutation == "missing":
+            admitted.clear()
+        elif mutation == "encoder":
+            admitted[0]["identity"].pop("encoder")
+        elif mutation == "processor":
+            admitted[0]["identity"]["processor"] = "f" * 64
+        elif mutation == "key":
+            admitted[0]["key"] = "invalid"
+        else:
+            admitted[0]["identity"]["encoder"] = "f" * 64
+        (args.native / "capture.json").write_bytes(canonical(capture))
+        args.out = tmp_path / (mutation + ".json")
+        with pytest.raises(ValueError, match="media|identity"):
+            module.compare(args)
+
+
+def test_rebound_capture_requires_verified_input_and_admitted_encoder():
+    span = {"start": 0, "len": 1, "kind": "image", "key": "a" * 64, "grid": [1, 2, 2],
+            "identity": {"encoder": "b" * 64, "processor": "c" * 64}}
+    window = {"tokens": [9, 2], "score_from": 1, "media": [span]}
+    actual = {**span, "key": "d" * 64, "identity": {"encoder": "e" * 64, "processor": "c" * 64},
+              "input_key": span["key"]}
+    record = {"engine": "glm5", "cold": True, "no_speculation": True, "cached_tokens": 0,
+              "score_path": "decode", "prompt_ids": [9, 2], "media": [actual],
+              "rows": [{"position": 1, "finite": True}], "scored": 1}
+    response = {"probe": record, "server": {"model": "model"}}
+    module.check_record(window, response, "model", "native")
+    for field, value in [("input_key", "f" * 64), ("identity", {"processor": "c" * 64})]:
+        broken = json.loads(json.dumps(response)); broken["probe"]["media"][0][field] = value
+        with pytest.raises(ValueError, match="identity"):
+            module.check_record(window, broken, "model", "native")

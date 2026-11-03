@@ -924,3 +924,14 @@ def test_official_media_registry_discovers_only_present_adapters(tmp_path, monke
         paired.load_panel(SimpleNamespace(family="new_family", windows=path))
     with pytest.raises(ValueError, match="not implemented"):
         golden_media.family_features("new_family")
+
+
+def test_prepared_span_preserves_sealed_encoder_and_processor_ids():
+    from fidelity_media import prepared_span
+    span = {"start": 1, "len": 4, "kind": "image", "key": "a" * 64, "grid": [1, 4, 4],
+            "identity": {"encoder": "b" * 64, "processor": "c" * 64}, "image_url": "not retained"}
+    sealed = prepared_span(span)
+    assert sealed["identity"] == span["identity"] and "image_url" not in sealed
+    span["identity"]["encoder"] = "bad"
+    with pytest.raises(ValueError, match="identity"):
+        prepared_span(span)
