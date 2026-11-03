@@ -241,3 +241,38 @@ def test_fabric_persist_prints_root_owned_unit_without_writes(tmp_path, role):
     assert 'Type=oneshot' in result.stdout and 'RemainAfterExit=yes' in result.stdout
     assert '/home/' not in result.stdout and str(tmp_path) not in result.stdout
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize('action', ['apply', 'reapply'])
+def test_fabric_mutation_refuses_sparknest_owned_nic(tmp_path, action):
+    backup = fabric_fixture(tmp_path, backup=action == 'reapply')
+    other = put(tmp_path, 'var/lib/sparknest/fabric-qos/roce0.json', '{"owner":"sparknest"}\n')
+    before = other.read_bytes(), other.stat().st_mtime_ns
+    result = run_fabric(tmp_path, action)
+    assert result.returncode != 0
+    assert 'roce0: refusing NIC changes; owner=SparkNest' in result.stderr
+    assert str(other) in result.stderr
+    assert not commands(result)
+    assert (other.read_bytes(), other.stat().st_mtime_ns) == before
+    if backup:
+        assert json.loads(backup.read_text()) == ORIGINAL
+
+
+def test_fabric_check_accepts_sparknest_superset_and_reports_owner(tmp_path):
+    fabric_fixture(tmp_path)
+    put(tmp_path, 'var/lib/sparknest/fabric-qos/roce0.json', '{}')
+    state = applied_state()
+    state['pfc'][2] = '1'
+    state['buffers'] = ['0', '0', '1', '2', '0', '0', '0', '0']
+    state['sizes'] = ['153088'] * 3 + ['0'] * 5
+    state['app']['dscp_prio'] = [[d, 2 if d == 18 else p] for d, p in state['app']['dscp_prio']]
+    nic_state(tmp_path, state)
+    result = run_fabric(tmp_path, 'check', dry_run=False)
+    assert result.returncode == 0, result.stderr
+    assert 'roce0: cuteafd-compliant; owner=SparkNest' in result.stdout
+    assert 'command ' not in result.stdout
+    state['pfc'][3] = '0'
+    nic_state(tmp_path, state)
+    result = run_fabric(tmp_path, 'check', dry_run=False)
+    assert result.returncode == 0, result.stderr
+    assert 'roce0: NOT cuteafd-compliant; owner=SparkNest' in result.stdout

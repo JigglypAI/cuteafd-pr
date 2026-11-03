@@ -294,6 +294,11 @@ shared-memory expansion. Verify headroom/pause counts before loading models.
 
 ### Persist across reboot (TJ only)
 
+On fabrics running SparkNest's QoS, SparkNest owns the NIC policy; cuteafd's
+`apply` and `reapply` refuse its backed-up NICs, while `check` accepts the extra
+lossless class 2 and reports the owner. The boot unit below is for deployments
+without SparkNest-managed QoS.
+
 Raptor's 2026-10-31 reboot silently reset its NIC policy. After the first reviewed
 `apply`, install the script and enable the boot unit below; `persist` only prints
 instructions and a unit, installing nothing. Run the privileged commands as root

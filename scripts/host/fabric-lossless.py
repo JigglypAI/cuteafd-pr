@@ -145,8 +145,28 @@ def pending_backups(state_dir):
                          "an operator with root access must review") from error
 
 
-def wait_for_ports(sysfs, required):
-    deadline = time.monotonic() + 60
+def sparknest_owner(sysfs, netdev):
+    directory = (sysfs / "var/lib/sparknest/fabric-qos" if sysfs != Path("/sys") else
+                 Path("/var/lib/sparknest/fabric-qos"))
+    backup = directory / (netdev + ".json")
+    try:
+        backup.lstat()
+        return f"SparkNest ({backup})"
+    except FileNotFoundError:
+        return None
+    except PermissionError:
+        return f"unknown (cannot inspect SparkNest ownership at {backup}: permission denied)"
+
+
+def refuse_sparknest_owner(sysfs, ports):
+    for netdev, _, _ in ports:
+        owner = sparknest_owner(sysfs, netdev)
+        if owner:
+            raise ValueError(f"{netdev}: refusing NIC changes; owner={owner}; "
+                             "SparkNest fabric QoS must be managed by its own tool")
+
+
+def wait_for_ports(sysfs, required, deadline):
     while True:
         try:
             ports = inventory(sysfs, deadline)
@@ -324,27 +344,40 @@ def main():
         if not args.dry_run:
             command(*argv)
 
-    if args.action == "tools" or (args.action == "apply" and not fixture):
+    if args.action == "tools":
         install_tools(mutate, args.dry_run)
-        if args.action == "tools":
-            return
+        return
     if args.action == "rollback":
         planned = rollback_plan(sysfs, state_dir)
         if not planned:
             print("no pending NIC backups; nothing to restore")
         restore_backups(planned, mutate, command, args.dry_run)
         return
-    if args.action == "apply" and pending_backups(state_dir):
-        raise ValueError("pending NIC backups exist; complete rollback before another apply")
     saved_ports = {}
     if args.action == "reapply":
+        # Check visible ports before reading our backup, which may be root-only.
+        deadline = time.monotonic() + 60
+        try:
+            visible_ports = inventory(sysfs, deadline)
+        except (PortsNotReady, FileNotFoundError, subprocess.SubprocessError):
+            visible_ports = []
+        refuse_sparknest_owner(sysfs, visible_ports)
+        for backup in pending_backups(state_dir):
+            refuse_sparknest_owner(sysfs, [(backup.stem, None, None)])
         # Read authorization before waiting; device identities may not exist yet at boot.
         saved_ports = {n: (s, b) for n, s, b in rollback_plan(sysfs, state_dir, check_identity=False)}
         if not saved_ports:
             raise ValueError("no pending NIC backup; reapply requires an operator's original apply")
-        ports = wait_for_ports(sysfs, set(saved_ports))
+        ports = wait_for_ports(sysfs, set(saved_ports), deadline)
     else:
         ports = inventory(sysfs)
+    if args.action in ("apply", "reapply"):
+        refuse_sparknest_owner(sysfs, ports)
+    if args.action == "apply":
+        if pending_backups(state_dir):
+            raise ValueError("pending NIC backups exist; complete rollback before another apply")
+        if not fixture:
+            install_tools(mutate, args.dry_run)
     planned = []
     for netdev, dev, port in ports:
         if args.action == "reapply" and netdev not in saved_ports:
@@ -360,6 +393,21 @@ def main():
         pause_text = (nic / "pause.txt").read_text() if fixture else command("ethtool", "-a", netdev)
         print(pause_text)
         if args.action == "check":
+            checked = parse_qos(text)
+            pause = parse_pause(pause_text)
+            compliant = (checked["trust"] == "dscp" and checked["pfc"][3] == "1" and
+                         (26, 3) in dscp_map(app) and
+                         pause["rx"] == "off" and pause["tx"] == "off")
+            owner = sparknest_owner(sysfs, netdev)
+            if not owner:
+                try:
+                    (state_dir / (netdev + ".json")).lstat()
+                    owner = "cuteafd"
+                except FileNotFoundError:
+                    owner = "unmanaged"
+                except PermissionError:
+                    owner = "unknown (cannot inspect cuteafd backup: permission denied)"
+            print(f"{netdev}: {'cuteafd-compliant' if compliant else 'NOT cuteafd-compliant'}; owner={owner}")
             continue
         current = parse_qos(text)
         if (sysfs / "class/net" / netdev / "qos/dscp2prio").exists():
