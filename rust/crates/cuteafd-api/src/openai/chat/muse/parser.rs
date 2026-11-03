@@ -37,6 +37,7 @@ use serde_json::Value;
 
 use super::{END_OF_MESSAGE, END_OF_TEXT, END_OF_TURN, MESSAGE, START};
 use crate::openai::chat::glm5::parser::{accepts_string, GlmStop};
+use crate::openai::chat::stream_args::{ArgStream, held_prefix, json_string_contents, name_is_readable};
 use crate::openai::chat::glm5::TextParser;
 
 const CALLS: &str = "<atem:function_calls>";
@@ -64,6 +65,26 @@ enum Recipient { Reasoning, Visible, Tool(String) }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode { Header, Body, Done }
 
+/// Where the incremental argument scanner is in the `<atem:function_calls>`
+/// block (streaming only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum StreamState {
+    #[default]
+    SeekCalls,
+    SeekInvoke,
+    SeekParam,
+    InValue,
+    Done,
+}
+
+/// The parameter whose value is being streamed.
+#[derive(Debug, Clone)]
+struct StreamParam {
+    key: String,
+    string: bool,
+    skip: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Marker { EndOfMessage, Start, EndOfTurn, Sequence }
 
@@ -79,14 +100,42 @@ pub struct MuseOutputParser {
     content_started: bool,
     held_whitespace: String,
     stop: Option<GlmStop>,
+    /// Emit tool-call argument deltas as they arrive instead of holding the
+    /// whole call until it closes (`CUTEAFD_STREAM_TOOLCALL_ARGS=0` disables).
+    stream_args: ArgStream,
+    /// Any call was streamed to the client (a call that turns out unreadable
+    /// has already been streamed and cannot be retracted).
+    streamed: bool,
+    /// Cursor into `body` for the incremental scanner.
+    stream_pos: usize,
+    stream_state: StreamState,
+    /// The current call's `{` was emitted.
+    stream_args_open: bool,
+    /// The current call's name.
+    stream_tool_name: String,
+    /// Keys already emitted for the current call (first-wins on repeats).
+    stream_seen_keys: Vec<String>,
+    /// Arguments emitted for the current call (comma placement).
+    stream_arg_count: usize,
+    /// The parameter whose value is being streamed.
+    stream_param: Option<StreamParam>,
 }
 
 impl MuseOutputParser {
-    pub fn new(mut options: MuseParserOptions) -> Self {
+    pub fn new(options: MuseParserOptions) -> Self {
+        Self::with_stream_args(options, false)
+    }
+
+    /// [`Self::new`] with the streaming knob set explicitly, so tests and the
+    /// router can enable it without touching process env.
+    pub fn with_stream_args(mut options: MuseParserOptions, stream_args: bool) -> Self {
         options.stop_sequences.retain(|sequence| !sequence.is_empty());
         let mode = if options.prefilled_user { Mode::Body } else { Mode::Header };
         Self { options, mode, pending: String::new(), recipient: Recipient::Visible, body: String::new(),
-            calls: 0, content_started: false, held_whitespace: String::new(), stop: None }
+            calls: 0, content_started: false, held_whitespace: String::new(), stop: None,
+            stream_args: ArgStream::new(stream_args), streamed: false, stream_pos: 0,
+            stream_state: StreamState::SeekCalls, stream_args_open: false, stream_tool_name: String::new(),
+            stream_seen_keys: Vec::new(), stream_arg_count: 0, stream_param: None }
     }
 
     pub fn push(&mut self, text: &str) -> Vec<OutputChunk> {
@@ -166,7 +215,20 @@ impl MuseOutputParser {
         if recipient == Recipient::Visible && self.content_started { self.held_whitespace.push_str("\n\n"); }
         self.recipient = recipient;
         self.body.clear();
+        self.stream_reset();
         self.mode = Mode::Body;
+    }
+
+    /// Reset the incremental scanner for a new message.
+    fn stream_reset(&mut self) {
+        self.streamed = false;
+        self.stream_pos = 0;
+        self.stream_state = StreamState::SeekCalls;
+        self.stream_args_open = false;
+        self.stream_tool_name.clear();
+        self.stream_seen_keys.clear();
+        self.stream_arg_count = 0;
+        self.stream_param = None;
     }
 
     fn markers(&self) -> Vec<(&str, Marker)> {
@@ -215,7 +277,121 @@ impl MuseOutputParser {
         match self.recipient {
             Recipient::Reasoning => out.push(OutputChunk::Reasoning { content: text }),
             Recipient::Visible => if self.calls == 0 { self.emit_content(&text, out) },
-            Recipient::Tool(_) => self.body.push_str(&text),
+            Recipient::Tool(_) => {
+                self.body.push_str(&text);
+                if self.stream_args.enabled() { self.stream_scan(out); }
+            }
+        }
+    }
+
+    /// Emit argument deltas for whatever of `body` has arrived. Chunk-boundary
+    /// independent: an incomplete tag is held until its bytes arrive.
+    fn stream_scan(&mut self, out: &mut Vec<OutputChunk>) {
+        loop {
+            let rest = self.body[self.stream_pos..].to_owned();
+            match self.stream_state {
+                StreamState::SeekCalls => {
+                    let Some(at) = rest.find(CALLS) else { return; };
+                    self.stream_pos += at + CALLS.len();
+                    self.stream_state = StreamState::SeekInvoke;
+                }
+                StreamState::SeekInvoke => {
+                    let Some(at) = rest.find(INVOKE) else { return; };
+                    let after = &rest[at + INVOKE.len()..];
+                    let Some(end) = after.find("\">") else { return; };
+                    let name = after[..end].to_owned();
+                    self.stream_pos += at + INVOKE.len() + end + 2;
+                    self.stream_tool_name = name.clone();
+                    self.stream_seen_keys.clear();
+                    self.stream_arg_count = 0;
+                    if name_is_readable(&name, self.options.tools.as_deref()) {
+                        self.stream_args.begin(out);
+                        self.stream_args.call(&name, out);
+                        self.stream_args.delta("{", out);
+                        self.stream_args_open = true;
+                        self.streamed = true;
+                    } else {
+                        self.stream_args_open = false;
+                    }
+                    self.stream_state = StreamState::SeekParam;
+                }
+                StreamState::SeekParam => {
+                    let mut best: Option<(usize, u8)> = None;
+                    for (found, kind) in [(rest.find(PARAMETER), 0u8), (rest.find(INVOKE_END), 1),
+                        (rest.find(CALLS_END), 2)] {
+                        if let Some(index) = found {
+                            if best.is_none_or(|(at, _)| index < at) { best = Some((index, kind)); }
+                        }
+                    }
+                    let Some((at, kind)) = best else { return; };
+                    match kind {
+                        0 => {
+                            let after = &rest[at + PARAMETER.len()..];
+                            let Some(end) = after.find("\">") else { return; };
+                            let key = after[..end].to_owned();
+                            self.stream_pos += at + PARAMETER.len() + end + 2;
+                            let tools = self.options.tools.as_deref().unwrap_or_default();
+                            let string = accepts_string(&self.stream_tool_name, &key, tools);
+                            let skip = self.stream_seen_keys.iter().any(|seen| *seen == key);
+                            if !skip { self.stream_seen_keys.push(key.clone()); }
+                            if string && !skip {
+                                if self.stream_arg_count > 0 { self.stream_args.delta(",", out); }
+                                let label = format!("{}:\"", serde_json::to_string(&key).expect("string key"));
+                                self.stream_args.delta(&label, out);
+                                self.stream_arg_count += 1;
+                            }
+                            self.stream_param = Some(StreamParam { key, string, skip });
+                            self.stream_state = StreamState::InValue;
+                        }
+                        1 => {
+                            self.stream_pos += at + INVOKE_END.len();
+                            if self.stream_args_open {
+                                self.stream_args.delta("}", out);
+                                self.calls += 1;
+                            }
+                            self.stream_args_open = false;
+                            self.stream_state = StreamState::SeekInvoke;
+                        }
+                        _ => {
+                            self.stream_pos += at + CALLS_END.len();
+                            self.stream_state = StreamState::Done;
+                        }
+                    }
+                }
+                StreamState::InValue => {
+                    let param = self.stream_param.clone().expect("a parameter is open");
+                    let Some(at) = rest.find(PARAMETER_END) else {
+                        let hold = held_prefix(&rest, PARAMETER_END);
+                        let emit = rest.len() - hold;
+                        if emit == 0 { return; }
+                        let text = rest[..emit].to_owned();
+                        self.stream_pos += emit;
+                        if param.string && !param.skip {
+                            self.stream_args.delta(&json_string_contents(&text), out);
+                        }
+                        return;
+                    };
+                    let raw = rest[..at].to_owned();
+                    self.stream_pos += at + PARAMETER_END.len();
+                    if param.string {
+                        if !param.skip {
+                            self.stream_args.delta(&json_string_contents(&raw), out);
+                            self.stream_args.delta("\"", out);
+                        }
+                    } else if !param.skip {
+                        let tools = self.options.tools.as_deref().unwrap_or_default();
+                        let value = value(&self.stream_tool_name, &param.key, &raw, tools);
+                        if self.stream_arg_count > 0 { self.stream_args.delta(",", out); }
+                        let text = format!("{}:{}", serde_json::to_string(&param.key).expect("string key"),
+                            serde_json::to_string(&value).expect("JSON value"));
+                        self.stream_args.delta(&text, out);
+                        self.stream_arg_count += 1;
+                    }
+                    self.stream_param = None;
+                    self.stream_state = StreamState::SeekParam;
+                }
+                StreamState::Done => return,
+            }
         }
     }
 
@@ -223,6 +399,21 @@ impl MuseOutputParser {
     fn end_message(&mut self, out: &mut Vec<OutputChunk>) {
         let Recipient::Tool(recipient) = std::mem::replace(&mut self.recipient, Recipient::Visible) else { return };
         let body = std::mem::take(&mut self.body);
+        if self.stream_args.enabled() {
+            // The calls were emitted as they arrived. A call still open when the
+            // block ends was streamed but never closed: count it so the
+            // validator rejects its partial arguments. A message that streamed
+            // nothing is returned as content, exactly as in hold mode.
+            if self.stream_args_open {
+                self.calls += 1;
+                tracing::warn!(recipient, text = %excerpt(&body), "Muse tool call streamed, then found unreadable");
+            } else if !self.streamed && self.calls == 0 {
+                if self.content_started { self.held_whitespace.push_str("\n\n"); }
+                self.emit_content(&body, out);
+            }
+            self.stream_reset();
+            return;
+        }
         let tools = self.options.tools.as_deref().unwrap_or_default();
         match read_calls(&body).and_then(|calls| {
             for (name, _) in &calls {
@@ -349,17 +540,6 @@ fn value(tool: &str, key: &str, raw: &str, tools: &[ToolDefinition]) -> Value {
     if accepts_string(tool, key, tools) { return Value::String(raw.to_owned()); }
     let trimmed = raw.trim();
     serde_json::from_str(trimmed).unwrap_or_else(|_| Value::String(raw.to_owned()))
-}
-
-/// Length of the longest suffix of `text` that is a proper prefix of `marker`.
-fn held_prefix(text: &str, marker: &str) -> usize {
-    let longest = text.len().min(marker.len().saturating_sub(1));
-    (1..=longest).rev()
-        .find(|length| {
-            let start = text.len() - length;
-            text.is_char_boundary(start) && marker.starts_with(&text[start..])
-        })
-        .unwrap_or(0)
 }
 
 fn excerpt(text: &str) -> String {

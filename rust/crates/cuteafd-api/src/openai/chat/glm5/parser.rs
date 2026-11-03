@@ -29,7 +29,7 @@ use deepseek_recipe::stream::OutputChunk;
 use deepseek_recipe_core::tools::ToolDefinition;
 use serde_json::Value;
 
-use crate::openai::chat::stream_args::{ArgStream, name_is_readable};
+use crate::openai::chat::stream_args::{ArgStream, held_prefix, json_string_contents, name_is_readable};
 
 pub const THINK_OPEN: &str = "<think>";
 pub const THINK_CLOSE: &str = "</think>";
@@ -345,7 +345,10 @@ impl GlmOutputParser {
                 let call = self.call.as_mut().expect("a call is open");
                 let key = call.key.as_deref().expect("a key precedes its value");
                 let duplicate = call.arguments.iter().any(|argument| argument.0 == key);
-                if duplicate {
+                // Streaming cannot retract a value already sent, so a repeated
+                // key keeps its first value there. The hold path keeps the last
+                // value, in the place of its first, as standard JSON does.
+                if self.streamed && duplicate {
                     call.skip_value = true;
                 }
                 if accepts_string(&call.name, key, self.options.tools.as_deref().unwrap_or_default()) {
@@ -417,7 +420,14 @@ impl GlmOutputParser {
             tracing::warn!(id = %self.options.id, tool = %call.name, key = %key,
                 "GLM tool call argument repeated; the first value is kept");
         } else {
-            call.arguments.push((key, value));
+            match call.arguments.iter_mut().find(|(existing, _)| *existing == key) {
+                Some(argument) => {
+                    tracing::warn!(id = %self.options.id, tool = %call.name, key = %key,
+                        "GLM tool call argument repeated; the last value is kept");
+                    argument.1 = value;
+                }
+                None => call.arguments.push((key, value)),
+            }
         }
         self.mode = Mode::KeyOrEnd;
         true
@@ -523,17 +533,6 @@ impl GlmOutputParser {
 
 fn arguments(content: String) -> OutputChunk { OutputChunk::ToolArgumentsDelta { content } }
 
-/// Length of the longest suffix of `text` that is a proper prefix of `marker`.
-fn held_prefix(text: &str, marker: &str) -> usize {
-    let longest = text.len().min(marker.len().saturating_sub(1));
-    (1..=longest).rev()
-        .find(|length| {
-            let start = text.len() - length;
-            text.is_char_boundary(start) && marker.starts_with(&text[start..])
-        })
-        .unwrap_or(0)
-}
-
 /// The earliest of `tags` in `text`: (index, tag).
 fn first_of(text: &str, tags: &[&'static str]) -> Option<(usize, &'static str)> {
     tags.iter().filter_map(|&tag| text.find(tag).map(|index| (index, tag))).min_by_key(|&(index, _)| index)
@@ -557,11 +556,6 @@ fn excerpt(text: &str) -> String {
         Some((cut, _)) => format!("{:?}...", &text[..cut]),
         None => format!("{text:?}"),
     }
-}
-
-fn json_string_contents(value: &str) -> String {
-    let quoted = serde_json::to_string(value).expect("string serializes");
-    quoted[1..quoted.len() - 1].to_owned()
 }
 
 fn parse_value(tool: &str, key: &str, raw: &str, tools: &[ToolDefinition]) -> Value {

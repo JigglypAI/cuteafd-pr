@@ -8,7 +8,7 @@
 //! rejects its arguments with a clean 400/SSE error rather than a 500.
 use super::{close, open, END, OPEN, SEP};
 use crate::openai::chat::glm5::{parser::GlmStop, TextParser};
-use crate::openai::chat::stream_args::{ArgStream, name_is_readable};
+use crate::openai::chat::stream_args::{ArgStream, held_prefix, json_string_contents, name_is_readable};
 use deepseek_recipe::stream::OutputChunk;
 use deepseek_recipe_core::tools::ToolDefinition;
 use serde_json::{Map, Value};
@@ -57,6 +57,9 @@ struct Call {
     object_call: bool,
     /// The streamed arguments object has been opened with `{`.
     args_open: bool,
+    /// The current value repeats a key already read: it is consumed but not
+    /// emitted, so the first value is kept.
+    skip_value: bool,
 }
 
 /// The result of reading one `<|open|>tag …<|sep|>` from the front of `pending`.
@@ -336,11 +339,17 @@ impl KimiOutputParser {
                             call.key = Some(key.clone());
                             call.kind = kind.clone();
                             call.value.clear();
+                            // A repeated key keeps its first value when streaming:
+                            // the duplicate is consumed but never emitted, so the
+                            // streamed bytes stay a valid JSON object. The check
+                            // runs before any byte of the duplicate is streamed.
+                            // The hold path keeps the last value, as standard JSON.
+                            call.skip_value = self.streamed && call.values.contains_key(&key);
                             if self.streamed && !call.args_open {
                                 self.stream_args.delta("{", out);
                                 call.args_open = true;
                             }
-                            if self.streamed && kind == "string" {
+                            if self.streamed && kind == "string" && !call.skip_value {
                                 let index = call.values.len();
                                 if index > 0 { self.stream_args.delta(",", out); }
                                 let label = format!("{}:\"", serde_json::to_string(&key).expect("string key"));
@@ -374,6 +383,9 @@ impl KimiOutputParser {
                     let call = self.call.as_mut().expect("a call is open");
                     call.text.push_str(&text);
                     call.value.push_str(&text);
+                    if self.streamed {
+                        self.stream_args.delta(&text, out);
+                    }
                     return true;
                 };
                 let raw: String = self.pending.drain(..at).collect();
@@ -382,6 +394,9 @@ impl KimiOutputParser {
                 call.text.push_str(&raw);
                 call.text.push_str(&end);
                 call.value.push_str(&raw);
+                if self.streamed {
+                    self.stream_args.delta(&raw, out);
+                }
                 let Some(values) = crate::openai::tools::unique_json(&call.value).ok()
                     .and_then(|value| value.as_object().cloned()) else {
                     self.mode = Mode::Lost;
@@ -401,7 +416,7 @@ impl KimiOutputParser {
                     let call = self.call.as_mut().expect("a call is open");
                     call.text.push_str(&text);
                     call.value.push_str(&text);
-                    if self.streamed && call.kind == "string" {
+                    if self.streamed && call.kind == "string" && !call.skip_value {
                         let escaped = json_string_contents(&text);
                         self.stream_args.delta(&escaped, out);
                     }
@@ -414,7 +429,7 @@ impl KimiOutputParser {
                 call.text.push_str(&end);
                 call.value.push_str(&raw);
                 let value = if call.kind == "string" {
-                    if self.streamed {
+                    if self.streamed && !call.skip_value {
                         let escaped = json_string_contents(&raw);
                         self.stream_args.delta(&escaped, out);
                         self.stream_args.delta("\"", out);
@@ -429,7 +444,7 @@ impl KimiOutputParser {
                         self.mode = Mode::Lost;
                         return true;
                     }
-                    if self.streamed {
+                    if self.streamed && !call.skip_value {
                         let index = call.values.len();
                         if index > 0 { self.stream_args.delta(",", out); }
                         let text = format!("{}:{}",
@@ -440,9 +455,11 @@ impl KimiOutputParser {
                     value
                 };
                 let key = call.key.take().expect("a key precedes its value");
-                if call.values.insert(key, value).is_some() {
-                    self.mode = Mode::Lost;
-                    return true;
+                if call.skip_value {
+                    tracing::warn!(tool = %call.name, key = %key,
+                        "Kimi tool call argument repeated; the first value is kept");
+                } else {
+                    call.values.insert(key, value);
                 }
                 self.mode = Mode::CallBody;
                 true
@@ -523,9 +540,7 @@ impl KimiOutputParser {
         let call = self.call.take().expect("a call is open");
         if self.streamed {
             if call.object_call {
-                // An object call is buffered: emit the same compact JSON the
-                // hold path sends, never the raw wire bytes.
-                self.stream_args.delta(&Value::Object(call.values).to_string(), out);
+                // The raw JSON body was streamed as it arrived; nothing is owed.
             } else if call.args_open {
                 // The deltas were emitted as they arrived; only the close is owed.
                 self.stream_args.delta("}", out);
@@ -534,21 +549,19 @@ impl KimiOutputParser {
             }
             self.streamed = false;
         } else {
-            out.push(OutputChunk::ToolCall {
-                tool_name: call.name,
-                arguments: Value::Object(call.values).to_string(),
-            });
+            // An object call keeps the raw JSON body so the hold path and the
+            // streamed path emit the same bytes; an argument-form call is
+            // re-serialized from the parsed values.
+            let arguments = if call.object_call {
+                call.value
+            } else {
+                Value::Object(call.values).to_string()
+            };
+            out.push(OutputChunk::ToolCall { tool_name: call.name, arguments });
         }
         self.calls += 1;
         self.mode = Mode::Calls;
     }
-}
-
-fn held_prefix(text: &str, marker: &str) -> usize {
-    (1..=text.len().min(marker.len()))
-        .rev()
-        .find(|&len| text.is_char_boundary(text.len() - len) && marker.starts_with(&text[text.len() - len..]))
-        .unwrap_or(0)
 }
 
 fn unescape(text: &str) -> String {
@@ -577,12 +590,6 @@ fn attributes<'a>(text: &'a str, tag: &str) -> Option<(Vec<(String, String)>, &'
         attrs.push((key.into(), unescape(&rest[..end])));
         rest = &rest[end + 1..];
     }
-}
-
-/// `content` as a JSON string body, for a schema-typed (string) XTML argument.
-fn json_string_contents(value: &str) -> String {
-    let quoted = serde_json::to_string(value).expect("string serializes");
-    quoted[1..quoted.len() - 1].to_owned()
 }
 
 /// A short excerpt of model text for a log line.

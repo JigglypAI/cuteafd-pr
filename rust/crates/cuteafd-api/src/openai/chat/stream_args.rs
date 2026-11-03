@@ -5,8 +5,8 @@
 //! `close()` validates it exactly as the hold path does. The assembled call is
 //! byte-identical to the non-streamed one.
 //!
-//! The knob is `CUTEAFD_STREAM_TOOLCALL_ARGS=1`, read only for streamed
-//! requests: a non-streamed response always buffers, so a call cut at
+//! Streaming is ON for every streamed request; `CUTEAFD_STREAM_TOOLCALL_ARGS=0`
+//! is the kill switch. A non-streamed response always buffers, so a call cut at
 //! `max_tokens` never returns partial JSON in `arguments`.
 //!
 //! A call whose name is unreadable is never streamed as a tool call (the name
@@ -20,9 +20,10 @@ use deepseek_recipe_core::tools::ToolDefinition;
 /// Whether to stream tool-call argument deltas for this request.
 ///
 /// `streaming` is the request's own `stream` flag: a non-streamed request
-/// always buffers, whatever the environment says.
+/// always buffers. `CUTEAFD_STREAM_TOOLCALL_ARGS=0` is the kill switch; any
+/// other value (or unset) leaves streaming on.
 pub fn stream_toolcall_args_enabled(streaming: bool) -> bool {
-    streaming && matches!(std::env::var("CUTEAFD_STREAM_TOOLCALL_ARGS").as_deref(), Ok("1"))
+    streaming && !matches!(std::env::var("CUTEAFD_STREAM_TOOLCALL_ARGS").as_deref(), Ok("0"))
 }
 
 /// Whether a call's name may be emitted as a `ToolCall`.
@@ -76,4 +77,21 @@ impl ArgStream {
             out.push(OutputChunk::ToolArgumentsDelta { content: content.to_owned() });
         }
     }
+}
+
+/// `value` as a JSON string body, for a schema-typed (string) parameter.
+pub fn json_string_contents(value: &str) -> String {
+    let quoted = serde_json::to_string(value).expect("string serializes");
+    quoted[1..quoted.len() - 1].to_owned()
+}
+
+/// Length of the longest suffix of `text` that is a proper prefix of `marker`.
+pub fn held_prefix(text: &str, marker: &str) -> usize {
+    let longest = text.len().min(marker.len().saturating_sub(1));
+    (1..=longest).rev()
+        .find(|length| {
+            let start = text.len() - length;
+            text.is_char_boundary(start) && marker.starts_with(&text[start..])
+        })
+        .unwrap_or(0)
 }

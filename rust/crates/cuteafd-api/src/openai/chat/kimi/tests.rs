@@ -409,6 +409,22 @@ mod streamed_args {
             chunks.extend(parser.finish());
             assert_eq!(assembled(&chunks), assembled(&hold), "{shape}: split at {split}");
         }
+        // A buffering constructor would pass every check above; prove a delta
+        // actually arrives before the call closes.
+        let close = wire.find(&close("call")).expect("the call closes");
+        let mut parser = KimiOutputParser::with_stream_args(KimiParserOptions {
+            thinking: false, tools: Some(vec![lookup()]), stop_sequences: Vec::new() }, true);
+        let mut saw_delta_before_close = false;
+        for (index, character) in wire.char_indices() {
+            let chunks = parser.push(&character.to_string());
+            if index < close
+                && chunks.iter().any(|chunk| matches!(chunk, OutputChunk::ToolArgumentsDelta { .. }))
+            {
+                saw_delta_before_close = true;
+            }
+        }
+        parser.finish();
+        assert!(saw_delta_before_close, "{shape}: a delta must arrive before the call closes");
     }
 
     fn call(body: &str) -> String {
@@ -439,6 +455,29 @@ mod streamed_args {
         let wire = call(&format!("{}{}{}", open("json", &[("type", "object".into())]),
             "{\"q\": \"A & B\", \"n\": 1}", close("json")));
         assert_streamed_matches_hold("object", &wire);
+    }
+
+    /// A repeated key is the one case the two paths cannot agree on: the hold
+    /// path keeps the last value (standard JSON), the streaming path keeps the
+    /// first because a streamed value cannot be retracted. Both stay a valid
+    /// JSON object with no duplicate keys.
+    #[test]
+    fn repeated_keys_keep_the_last_value_in_hold_and_the_first_when_streamed() {
+        let wire = call(&format!("{}{}{}{}", argument("q", "string", "A"), argument("n", "string", "1"),
+            argument("q", "string", "B"), argument("n", "string", "2")));
+        let (hold, hold_calls) = parse_streaming(&wire, false);
+        let (streamed, streamed_calls) = parse_streaming(&wire, true);
+        assert_eq!((hold_calls, streamed_calls), (1, 1));
+        assert_eq!(assembled(&hold), r#"{"q":"B","n":"2"}"#);
+        assert_eq!(assembled(&streamed), r#"{"q":"A","n":"1"}"#);
+        for split in wire.char_indices().map(|(index, _)| index).chain([wire.len()]) {
+            let mut parser = KimiOutputParser::with_stream_args(KimiParserOptions {
+                thinking: false, tools: Some(vec![lookup()]), stop_sequences: Vec::new() }, true);
+            let mut chunks = parser.push(&wire[..split]);
+            chunks.extend(parser.push(&wire[split..]));
+            chunks.extend(parser.finish());
+            assert_eq!(assembled(&chunks), r#"{"q":"A","n":"1"}"#, "split at {split}");
+        }
     }
 
     /// A malformed call that is lost before any argument byte is streamed (a

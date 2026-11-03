@@ -141,6 +141,22 @@ mod streamed_args {
             chunks.extend(parser.finish());
             assert_eq!(assembled(&chunks), assembled(&hold), "{shape}: split at {split}");
         }
+        // A buffering constructor would pass every check above; prove a delta
+        // actually arrives before the call closes.
+        let close = text.find("</tool_call>").expect("the call closes");
+        let mut parser = Step5OutputParser::with_stream_args(Step5ParserOptions {
+            tools: Some(vec![inspect()]), stop_sequences: Vec::new() }, true);
+        let mut saw_delta_before_close = false;
+        for (index, character) in text.char_indices() {
+            let chunks = parser.push(&character.to_string());
+            if index < close
+                && chunks.iter().any(|chunk| matches!(chunk, OutputChunk::ToolArgumentsDelta { .. }))
+            {
+                saw_delta_before_close = true;
+            }
+        }
+        parser.finish();
+        assert!(saw_delta_before_close, "{shape}: a delta must arrive before the call closes");
     }
 
     #[test]
@@ -162,12 +178,29 @@ mod streamed_args {
             "<parameter=detail>\n{\"a\": 1, \"b\": [2, 3]}\n</parameter>\n</function>\n</tool_call>"));
     }
 
+    /// A repeated key is the one case the two paths cannot agree on: the hold
+    /// path keeps the last value (standard JSON), the streaming path keeps the
+    /// first because a streamed value cannot be retracted. Both stay a valid
+    /// JSON object with no duplicate keys.
     #[test]
-    fn repeated_keys_stream_byte_for_byte() {
-        assert_streamed_matches_hold("repeated", concat!("</think><tool_call>\n<function=inspect>\n",
+    fn repeated_keys_keep_the_last_value_in_hold_and_the_first_when_streamed() {
+        let text = concat!("</think> <tool_call>\n<function=inspect>\n",
             "<parameter=name>\nfirst\n</parameter>\n<parameter=items>\n[1]\n</parameter>\n",
             "<parameter=name>\nsecond\n</parameter>\n<parameter=items>\n[2]\n</parameter>\n",
-            "</function>\n</tool_call>"));
+            "</function>\n</tool_call>");
+        let (hold, hold_calls) = parse_streaming(text, false);
+        let (streamed, streamed_calls) = parse_streaming(text, true);
+        assert_eq!((hold_calls, streamed_calls), (1, 1));
+        assert_eq!(assembled(&hold), r#"{"name":"second","items":[2]}"#);
+        assert_eq!(assembled(&streamed), r#"{"name":"first","items":[1]}"#);
+        for split in text.char_indices().map(|(index, _)| index).chain([text.len()]) {
+            let mut parser = Step5OutputParser::with_stream_args(Step5ParserOptions {
+                tools: Some(vec![inspect()]), stop_sequences: Vec::new() }, true);
+            let mut chunks = parser.push(&text[..split]);
+            chunks.extend(parser.push(&text[split..]));
+            chunks.extend(parser.finish());
+            assert_eq!(assembled(&chunks), r#"{"name":"first","items":[1]}"#, "split at {split}");
+        }
     }
 
     #[test]

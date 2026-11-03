@@ -1030,11 +1030,11 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             let prompt = if expanded_media_probe { String::new() } else {
                 encoding.render(&raw, &options).map_err(Rejection::bad)?
             };
-            let parser = muse::MuseOutputParser::new(muse::MuseParserOptions {
+            let parser = muse::MuseOutputParser::with_stream_args(muse::MuseParserOptions {
                 prefilled_user: !thinking.enabled,
                 tools: (tools_declared && converted.conversation.tool_choice != deepseek_recipe_core::tools::ToolChoice::None)
                     .then(|| converted.conversation.tools.clone()),
-                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+                stop_sequences: converted.parsing_options.stop_sequences.clone() }, stream_args);
             (prompt, Vec::new(), OutputProcessor::Muse(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Mistral(encoding), raw, _thinking)) => {
@@ -1044,9 +1044,9 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             let prompt = if expanded_media_probe { String::new() } else {
                 encoding.render(&raw, &options).map_err(Rejection::bad)?
             };
-            let parser = mistral::MistralOutputParser::new(mistral::MistralParserOptions {
+            let parser = mistral::MistralOutputParser::with_stream_args(mistral::MistralParserOptions {
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
-                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+                stop_sequences: converted.parsing_options.stop_sequences.clone() }, stream_args);
             (prompt, Vec::new(), OutputProcessor::Mistral(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Qwen(encoding), raw, thinking)) => {

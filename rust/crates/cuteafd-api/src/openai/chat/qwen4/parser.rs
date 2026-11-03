@@ -45,7 +45,7 @@ use serde_json::Value;
 
 use crate::openai::chat::glm5::parser::GlmStop;
 use crate::openai::chat::glm5::TextParser;
-use crate::openai::chat::stream_args::{ArgStream, name_is_readable};
+use crate::openai::chat::stream_args::{ArgStream, held_prefix, json_string_contents, name_is_readable};
 
 pub const THINK_OPEN: &str = "<think>";
 pub const THINK_CLOSE: &str = "</think>";
@@ -462,8 +462,20 @@ impl QwenOutputParser {
         }
         let call = self.call.as_mut().expect("a call is open");
         if duplicate {
-            tracing::warn!(tool = %call.name, key = %key,
-                "Qwen tool call argument repeated; the first value is kept");
+            if self.streamed {
+                // Streaming cannot retract a value already sent: the first
+                // value is kept.
+                tracing::warn!(tool = %call.name, key = %key,
+                    "Qwen tool call argument repeated; the first value is kept");
+            } else {
+                // The hold path keeps the last value, in the place of its
+                // first, as standard JSON does.
+                tracing::warn!(tool = %call.name, key = %key,
+                    "Qwen tool call argument repeated; the last value is kept");
+                if let Some(argument) = call.arguments.iter_mut().find(|(existing, _)| *existing == key) {
+                    argument.1 = text;
+                }
+            }
         } else {
             call.arguments.push((key, text));
         }
@@ -559,23 +571,6 @@ impl TextParser for QwenOutputParser {
 }
 
 fn arguments(content: String) -> OutputChunk { OutputChunk::ToolArgumentsDelta { content } }
-
-/// `content` as a JSON string body, for a schema-typed (string) parameter.
-fn json_string_contents(value: &str) -> String {
-    let quoted = serde_json::to_string(value).expect("string serializes");
-    quoted[1..quoted.len() - 1].to_owned()
-}
-
-/// Length of the longest suffix of `text` that is a proper prefix of `marker`.
-fn held_prefix(text: &str, marker: &str) -> usize {
-    let longest = text.len().min(marker.len().saturating_sub(1));
-    (1..=longest).rev()
-        .find(|length| {
-            let start = text.len() - length;
-            text.is_char_boundary(start) && marker.starts_with(&text[start..])
-        })
-        .unwrap_or(0)
-}
 
 /// The earliest of `tags` in `text`: (index, tag).
 fn first_of(text: &str, tags: &[&'static str]) -> Option<(usize, &'static str)> {

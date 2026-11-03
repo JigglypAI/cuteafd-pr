@@ -475,12 +475,10 @@ impl DeepseekOutputParser {
                 Vec::new()
             }
             OutputAction::ToolCallBegin => {
-                let mut out = Vec::new();
                 if last_pop_action != OutputAction::ToolCallBegin {
                     self.held.push(OutputChunk::ToolCallBegin);
-                    self.stream_args.begin(&mut out);
                 }
-                out
+                Vec::new()
             }
             OutputAction::ToolName => {
                 if let Some(content) = front_chunk {
@@ -498,6 +496,10 @@ impl DeepseekOutputParser {
                     // is never streamed as a tool call (it is returned as
                     // content on loss, as in hold mode).
                     if self.stream_args.enabled() && name_is_readable(&tool_name, None) {
+                        // Begin and call together, after the name check, as the
+                        // other families do: a call with an unreadable name is
+                        // never streamed as a tool call.
+                        self.stream_args.begin(&mut out);
                         self.stream_args.call(&tool_name, &mut out);
                         self.streamed = true;
                     }
@@ -1018,21 +1020,28 @@ mod tests {
                 "properties": {"query": {"type": "string"}}}}}]);
             let valid = "Plan.\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"search\">\n\
 <｜DSML｜ parameter name=\"query\" string=\"true\">cats</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
-            for (shape, text, content, calls, finish) in [
-                // An unreadable call: content, stop, never a failed request.
-                ("unreadable", "Plan.\n<｜DSML｜ invoke name=\"search\">\n\
-<｜DSML｜ parameter name=\"query\" string\"true\">cats</｜DSML｜ parameter>\n</｜DSML｜ invoke>".to_owned(),
-                    "Plan.\n<｜DSML｜ invoke name=\"search\">\n\
-<｜DSML｜ parameter name=\"query\" string\"true\">cats</｜DSML｜ parameter>\n</｜DSML｜ invoke>".to_owned(),
-                    0, "stop"),
-                // A call that parsed: tool_calls.
-                ("readable", valid.to_owned(), "Plan.".to_owned(), 1, "tool_calls"),
+            // A call whose NAME is unreadable is never streamed as a tool call, so
+            // it comes back as content in both modes. A call whose name IS readable
+            // begins streaming before its arguments are known: a later malformed
+            // argument cannot be retracted, so the streamed request is rejected
+            // with a clean SSE error while the hold path still returns content.
+            let malformed = "Plan.\n<｜DSML｜ invoke name=\"search\">\n\
+<｜DSML｜ parameter name=\"query\" string\"true\">cats</｜DSML｜ parameter>\n</｜DSML｜ invoke>".to_owned();
+            for (shape, text, hold, streamed) in [
+                ("malformed", malformed.clone(), Some((malformed.as_str(), 0, "stop")), None),
+                ("readable", valid.to_owned(), Some(("Plan.", 1, "tool_calls")), Some(("Plan.", 1, "tool_calls"))),
             ] {
                 for streaming in [false, true] {
+                    let expected = if streaming { streamed } else { hold };
                     let body = json!({"model": MODEL, "stream": streaming, "enable_thinking": false,
                         "tools": tools, "messages": [{"role": "user", "content": "Search for cats."}]});
                     let (status, bytes) = serve(body, &text).await;
                     assert_eq!(status, StatusCode::OK, "{shape} streaming={streaming}");
+                    let Some((content, calls, finish)) = expected else {
+                        let text = std::str::from_utf8(&bytes).unwrap();
+                        assert!(text.contains("\"error\""), "{shape} streaming={streaming}: {text}");
+                        continue;
+                    };
                     let (reply, names, reason) = if streaming {
                         let events = sse_events(&bytes);
                         let reply: String = events.iter()
@@ -1051,7 +1060,7 @@ mod tests {
                             value["choices"][0]["finish_reason"].clone())
                     };
                     assert_eq!((reply.as_str(), names.len(), reason.as_str()),
-                        (content.as_str(), calls, Some(finish)), "{shape} streaming={streaming}");
+                        (content, calls, Some(finish)), "{shape} streaming={streaming}");
                 }
             }
         }
