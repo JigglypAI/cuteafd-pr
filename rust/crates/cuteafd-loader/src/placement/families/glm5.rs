@@ -571,14 +571,14 @@ pub struct GlmWorkingSet {
 }
 
 /// The attention placement a request resolves to before admission: the
-/// request, except that auto on two GPUs for Mistral Large 4 means whole-layer
-/// owners until context measures faster (heads and context are explicit
-/// requests there). GLM is unchanged (auto stays auto; the solver picks
-/// context on two GPUs).
+/// request, except that auto on two GPUs for Mistral Large 4 means context
+/// after its correctness and interleaved throughput qualification. Explicit
+/// requests are preserved. GLM is unchanged (auto stays auto; the solver
+/// picks context on two GPUs).
 pub fn resolve_attention(cfg: &GlmDsaConfig, requested: Option<AttentionPlacement>, gpus: usize)
     -> Option<AttentionPlacement> {
     if requested.is_none() && gpus == 2 && !cfg.variant.is_glm() {
-        Some(AttentionPlacement::Layers)
+        Some(AttentionPlacement::Context)
     } else { requested }
 }
 
@@ -2215,22 +2215,24 @@ mod tests {
         let units: u64 = req.layers.iter().map(|l| l.kv_unit.unit_bytes_whole).sum();
         let geometry = crate::serving_capacity::mistral_large4_cache_geometry(cfg.variant.ml4().unwrap(), 1).unwrap();
         assert_eq!(units, geometry.ranks[0].persistent_unit_bytes);
-        // Its ml42 share programs give two GPUs the head split (context too, with its programs);
-        // auto stays whole-layer owners until context measures faster.
+        // Its ml42 share programs support heads and the qualified context default.
         assert!(req.layers.iter().all(|l| l.modes == [LayerMode::HeadSplit]), "head split on two GPUs");
-        assert_eq!(resolve_attention(&cfg, None, 2), Some(AttentionPlacement::Layers));
+        assert_eq!(resolve_attention(&cfg, None, 2), Some(AttentionPlacement::Context));
+        for explicit in [AttentionPlacement::Layers, AttentionPlacement::Heads, AttentionPlacement::Context] {
+            assert_eq!(resolve_attention(&cfg, Some(explicit), 2), Some(explicit));
+        }
         assert_eq!(resolve_attention(&cfg, None, 1), None);
         assert_eq!(resolve_attention(&config(), None, 2), None);
         assert!(solve_working_set(&i, [0; 2], Some(AttentionPlacement::Heads)).is_ok());
         // Context without its programs fails closed and names ML4's own programs.
-        let missing = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Context)).unwrap_err().to_string();
+        let missing = solve_working_set(&i, [0; 2], resolve_attention(&cfg, None, 2)).unwrap_err().to_string();
         assert!(missing.contains("ml4_sparse_mla_nope_partial_h32") && missing.contains("ml4_paged_staging_gather_kv_nope"),
             "{missing}");
         let mut ctx = i.clone();
         ctx.context = Some(GlmContext { topk_scratch: 1 << 20, partial_scratch: 1 << 20 });
-        let (placed, _) = solve_working_set(&ctx, [0; 2], Some(AttentionPlacement::Context)).unwrap();
+        let (placed, _) = solve_working_set(&ctx, [0; 2], resolve_attention(&cfg, None, 2)).unwrap();
         assert!(placed.layers.iter().all(|l| l.mode == LayerMode::ContextSplit));
-        let (placed, _) = solve_working_set(&i, [0; 2], resolve_attention(&cfg, None, 2)).unwrap();
+        let (placed, _) = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Layers)).unwrap();
         let owners = attention_owners(&cfg, cfg.layers).unwrap();
         for (layer, assignment) in placed.layers.iter().enumerate() {
             assert_eq!(assignment.mode, LayerMode::Whole { gpu: owners[layer], ffn: FfnMode::Split });

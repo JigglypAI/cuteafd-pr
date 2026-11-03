@@ -175,8 +175,8 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
             assert_eq!(spark.worker_budget_bytes, 108 << 30, "{ranks}+{gpus}");
             assert!(spark.worker_budget_bytes <= spark.capacity_bytes, "{ranks}+{gpus}");
         }
-        // auto: one GPU's heads, or two GPUs' whole-layer owners until context measures faster.
-        assert_eq!(report.attention_placement, if gpus == 2 { crate::placement::AttentionPlacement::Layers }
+        // auto: one GPU's heads, or the qualified context placement on two GPUs.
+        assert_eq!(report.attention_placement, if gpus == 2 { crate::placement::AttentionPlacement::Context }
             else { crate::placement::AttentionPlacement::Heads }, "{ranks}+{gpus}");
         let groups: std::collections::BTreeSet<_> = memory.devices[0].items.iter().map(|item| item.group.clone()).collect();
         for group in ["attention", "indexer", "embedding", "lm_head"] {
