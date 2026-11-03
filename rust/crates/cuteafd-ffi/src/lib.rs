@@ -2862,16 +2862,44 @@ impl NativeLibrary {
     /// The caller owns both handles and must destroy them (the graph via
     /// `cuda_graph_destroy`, the exec via `cuda_graph_exec_destroy`).
     /// # Safety
-    /// The stream is live on the current device and is not capturing.
+    /// The stream is live on the current device and is capturing.
+    #[track_caller]
     pub unsafe fn cuda_graph_end_capture_retained(
         &self,
         cuda_stream: *mut c_void,
     ) -> Result<CuteafdCudaGraphCaptureInfo> {
+        // Same GPU-budget admission as `cuda_graph_end_capture`: the retained
+        // variant is now V4.1 index selection's capture path, so it must take
+        // the budget lock, log the census call site, and fail when the process
+        // is over `--coordinator-gpu-budget-gib`.
+        let _budget_guard = coordinator_gpu_budget().map(|_| GPU_BUDGET_ALLOCATION.lock()
+            .unwrap_or_else(|e| e.into_inner()));
         let end_capture_fn: CudaGraphEndCaptureRetainedFn =
             self.cuteafd_cuda_graph_end_capture_retained()?;
         let mut info = CuteafdCudaGraphCaptureInfo::default();
         let status = unsafe { end_capture_fn(cuda_stream, &mut info) };
         self.status_to_result("cuteafd_cuda_graph_end_capture_retained", status)?;
+        if std::env::var_os("CUTEAFD_GRAPH_CENSUS").is_some_and(|value| value == "1") {
+            tracing::info!(target: "cuteafd::graph_capture", exec = ?info.graph_exec,
+                site = %std::panic::Location::caller(), "graph census executable site");
+        }
+        if coordinator_gpu_budget().is_some() {
+            if let Err(error) = self.cuda_memory_info() {
+                // SAFETY: capture ended and this executable has never launched;
+                // destroying it cannot invalidate queued graph work. Destroy
+                // both handles even if the first destroy fails, so a failed exec
+                // destroy cannot leak the retained source graph.
+                unsafe {
+                    if let Err(destroy) = self.cuda_graph_exec_destroy(info.graph_exec) {
+                        tracing::error!(%destroy, "destroying over-budget graph exec");
+                    }
+                    if let Err(destroy) = self.cuda_graph_destroy(info.graph) {
+                        tracing::error!(%destroy, "destroying over-budget retained graph");
+                    }
+                }
+                return Err(error.context("graph executable exceeds coordinator GPU budget"));
+            }
+        }
         Ok(info)
     }
 
@@ -7496,6 +7524,10 @@ mod tests {
         }
         let mut source = library.alloc_device_buffer(64)?;
         let mut destination = library.alloc_device_buffer(64)?;
+        // A real allocation that is NOT referenced by the captured graph, so the
+        // not-found path is exercised with a value that passes pointer
+        // validation (an interior/out-of-range address would be refused first).
+        let mut unused = library.alloc_device_buffer(64)?;
         let stream = library.cuda_stream_create()?;
         let result = (|| -> Result<()> {
             unsafe { library.cuda_graph_begin_capture(stream)?; }
@@ -7507,8 +7539,17 @@ mod tests {
             unsafe {
                 library.cuda_graph_exec_update_pointers(
                     info.graph_exec, info.graph,
-                    &[source.ptr as u64 + 4096], &[destination.ptr as u64 + 4096],
+                    &[unused.ptr as u64], &[destination.ptr as u64],
                     &[8], &[1], &mut found)?;
+            }
+            assert_eq!(found, [0]);
+            // A scalar `0` probe must not match a memcpy node's NULL srcHost /
+            // dstHost: the update succeeds and reports the probe not-found.
+            let mut found = [1u8; 1];
+            unsafe {
+                library.cuda_graph_exec_update_pointers(
+                    info.graph_exec, info.graph,
+                    &[0], &[0], &[4], &[0], &mut found)?;
             }
             assert_eq!(found, [0]);
             // A memcpy node that references an old value refuses the whole update.
@@ -7529,6 +7570,7 @@ mod tests {
         unsafe { library.cuda_stream_destroy(stream)?; }
         library.free_device_buffer(&mut source)?;
         library.free_device_buffer(&mut destination)?;
+        library.free_device_buffer(&mut unused)?;
         result
     }
 

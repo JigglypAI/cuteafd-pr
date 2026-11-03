@@ -1814,11 +1814,22 @@ static CUresult kernel_param_sizes(CUfunction func, std::vector<size_t>* sizes) 
 // matches exact values only; a memcpy that points inside an updated allocation
 // is not rewritten by this API either, so it is left as captured.
 static CUresult non_kernel_node_references(const CUgraphNode node, CUgraphNodeType type,
-    const uint64_t* old_values, size_t count, bool* references) {
+    const uint64_t* old_values, const uint64_t* new_values, const uint8_t* kinds,
+    size_t count, bool* references) {
   *references = false;
+  // Only a pointer-kind value that is actually being rewritten can leave a
+  // memcpy/memset node on a stale address. A NULL pointer (0) is never a real
+  // reference, a scalar-kind value can never be a memcpy/memset address, and an
+  // identity mapping (old == new) does not change the address the node already
+  // holds. Without these checks the scalar `0` probe that every selection
+  // pushes would match a memcpy node's NULL srcHost/dstHost and refuse the
+  // update for any graph that contains a memcpy or memset node.
   auto matches = [&](uint64_t value) {
+    if (value == 0) { return false; }
     for (size_t j = 0; j < count; ++j) {
-      if (old_values[j] == value) { return true; }
+      if (kinds[j] == 1 && old_values[j] == value && old_values[j] != new_values[j]) {
+        return true;
+      }
     }
     return false;
   };
@@ -1920,9 +1931,17 @@ static cuteafd_status_t graph_exec_update_pointers_impl(
     if (result != CUDA_SUCCESS) {
       return fail_cu(CUTEAFD_STATUS_INTERNAL_ERROR, "cuGraphNodeGetType failed", result);
     }
+    if (type == CU_GRAPH_NODE_TYPE_GRAPH) {
+      // `cudaGraphGetNodes` lists top-level nodes only, so a value that also
+      // appears inside a child graph would be reported found while the child
+      // node keeps the stale pointer. Refuse so the caller recaptures.
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                  "CUDA graph contains a child graph node; recapture instead of updating");
+    }
     if (type != CU_GRAPH_NODE_TYPE_KERNEL) {
       bool references = false;
-      result = non_kernel_node_references(node, type, old_values, count, &references);
+      result = non_kernel_node_references(node, type, old_values, new_values, kinds, count,
+                                          &references);
       if (result != CUDA_SUCCESS) {
         return fail_cu(CUTEAFD_STATUS_INTERNAL_ERROR,
                        "cuGraphMemcpyNodeGetParams/cuGraphMemsetNodeGetParams failed", result);

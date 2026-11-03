@@ -607,6 +607,12 @@ impl IndexProposal<'_> {
     pub fn binding(&self) -> IndexBinding {
         self.binding
     }
+    /// Whether this proposal binds the committed cache planes (`true`) or the
+    /// private current-wave proposal planes (`false`). The two bind different
+    /// `packed`/`scales` pointers, so the choice is part of the graph identity.
+    pub fn committed(&self) -> bool {
+        self.committed
+    }
     /// Metadata uses slot zero because cache is a single-request page-table view.
     pub fn metadata(&self, position: u64) -> Result<[u64; 6]> {
         ensure!(
