@@ -1730,7 +1730,10 @@ impl<'a> SparkLink<'a> {
             next_slot: intake.dispatch_slot() };
         // Read-only worker metadata, kept so callers need not reach the transport.
         let grouping = transport.installed_grouping().unwrap_or_default();
-        let storage = intake.exchange_storage(&geometry)?;
+        let storage = match intake.exchange_storage(&geometry) {
+            Ok(storage) => storage,
+            Err(error) => { self.transport = Some(transport); return Err(error); }
+        };
         self.exchange = Some(crate::shared::spark_waves::Waves::start(intake.library, geometry, transport, grouping,
             arenas, self.timing, storage)?);
         Ok(())

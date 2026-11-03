@@ -650,6 +650,7 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
     let weak = std::rc::Rc::downgrade(&storage);
     let control = storage.control.buffer.ptr;
     let pull_block = storage.pull_block.as_ref().unwrap().buffer.ptr;
+    assert!(owner.exchange_storage(&intake).is_err(), "live exchange storage must not be reset");
     let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false, storage)?;
     let _ = words.set(exchange.words());
     let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
@@ -695,6 +696,7 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
     assert_eq!(reset.control.buffer.ptr, control, "reset reuses counters");
     assert_eq!(reset.pull_block.as_ref().unwrap().buffer.ptr, pull_block, "reset reuses descriptors");
     assert_eq!(reset.control.bytes().iter().copied().max(), Some(0));
+    assert_eq!(reset.pull_block.as_ref().unwrap().bytes().iter().copied().max(), Some(0));
     drop(reset);
     owner.terminal_release_payloads()?;
     assert!(weak.upgrade().is_none(), "only proved terminal drainage releases storage");
