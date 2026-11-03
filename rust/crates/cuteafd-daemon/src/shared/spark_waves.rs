@@ -832,6 +832,8 @@ impl<T: Transport> Backend for Native<T> {
 /// What a link hands its exchange: each rank's reserve range and the
 /// admitted/current cut of it ([`SlotGeometry`]) the worker lands in.
 pub(crate) struct Intake {
+    /// Physical link can carry prefill; dedicated decode/verify links are false.
+    pub prefill: bool,
     pub ranks: usize,
     pub row_bytes: usize,
     /// Per rank: the device range every return slot is a slice of.
@@ -910,29 +912,41 @@ impl<'a> ExchangeStorage<'a> {
     }
 }
 
-/// One packed scratch plane reused rank-by-rank, never another BF16 reserve.
+/// One allocation with independent slot slices, reused rank-by-rank on each
+/// slot's consumer stream. Other slots may land concurrently on other streams.
 struct ReplyDecode<'a> {
     stage: cuteafd_ffi::programs::BoundProgram<'a>,
     decode: cuteafd_ffi::programs::BoundProgram<'a>,
     scratch: crate::shared::memory::DeviceAllocation<'a>,
+    geometry: SlotGeometry,
+    row_bytes: usize,
 }
 impl<'a> ReplyDecode<'a> {
-    fn new(library: &'a NativeLibrary, rows: usize, format: cuteafd_core::SparkReplyFormat) -> Result<Self> {
+    fn new(library: &'a NativeLibrary, intake: &Intake, format: cuteafd_core::SparkReplyFormat) -> Result<Option<Self>> {
+        let hidden = cuteafd_core::expert_geometry().hidden as usize;
+        let bytes = format.combined_scratch_bytes(hidden, intake.geometry.cut().rows, intake.geometry.slots(),
+            intake.prefill, cuteafd_core::expert_geometry().partial_replies()).context("reply scratch overflow")?;
+        if bytes == 0 { return Ok(None); }
         let programs = library.programs()?;
-        let bytes = rows.checked_mul(format.row_bytes(cuteafd_core::expert_geometry().hidden as usize)
-            .context("invalid reply codec width")?).context("reply scratch overflow")?;
-        Ok(Self { stage: programs.bound("expert_reply_stage", &["source", "out", "mode"])?,
+        Ok(Some(Self { stage: programs.bound("expert_reply_stage", &["source", "out", "mode"])?,
             decode: programs.bound("expert_reply_dequantize", &["source", "out", "mode"])?,
-            scratch: crate::shared::memory::DeviceAllocation::named(library, bytes, "spark-intake/reply_codec")? })
+            scratch: crate::shared::memory::DeviceAllocation::named(library, bytes, "spark-intake/reply_codec")?,
+            geometry: intake.geometry.clone(), row_bytes: format.row_bytes(hidden).context("invalid reply codec width")? }))
     }
-    unsafe fn launch(&self, plane: CuteafdDeviceBuffer, mode: *mut u32, rows: usize, stream: *mut c_void) -> Result<()> {
+    unsafe fn launch(&self, slot: usize, plane: CuteafdDeviceBuffer, mode: *mut u32, rows: usize, stream: *mut c_void) -> Result<()> {
         use cuteafd_ffi::programs::Scalar;
+        ensure!(rows <= self.geometry.cut().rows, "reply codec rows exceed slot capacity");
+        let (offset, bytes) = self.geometry.slice(slot, self.row_bytes);
+        ensure!(offset.checked_add(bytes).is_some_and(|end| end <= self.scratch.buffer.bytes),
+            "reply codec slot exceeds scratch allocation");
+        let scratch = (self.scratch.buffer.ptr as usize + offset) as *mut c_void;
         let scalars = [Scalar::I32(i32::try_from(rows)?),
             Scalar::I32(i32::try_from(cuteafd_core::expert_geometry().hidden)?), Scalar::I32(-1)];
-        // SAFETY: caller's live plane and format word; scratch is retained by this link.
+        // SAFETY: caller's live plane and format word; this slot's exclusive
+        // scratch is retained by the link until all consumer streams drain.
         unsafe {
-            self.stage.launch(&[plane.ptr, self.scratch.buffer.ptr, mode.cast()], &scalars, stream)?;
-            self.decode.launch(&[self.scratch.buffer.ptr, plane.ptr, mode.cast()], &scalars, stream)
+            self.stage.launch(&[plane.ptr, scratch, mode.cast()], &scalars, stream)?;
+            self.decode.launch(&[scratch, plane.ptr, mode.cast()], &scalars, stream)
         }
     }
 }
@@ -1005,10 +1019,7 @@ impl<'a> Waves<'a> {
         warm_reducer(library, &intake)?;
         let timeout = transport.timeout();
         let reply_format = cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false);
-        let reply_decode = if reply_format != cuteafd_core::SparkReplyFormat::Bf16
-            && !cuteafd_core::expert_geometry().partial_replies() {
-            Some(ReplyDecode::new(library, intake.geometry.cut().rows, reply_format)?)
-        } else { None };
+        let reply_decode = ReplyDecode::new(library, &intake, reply_format)?;
         let mut native = Native { transport, reply_format, reply_payloads: vec![0; slots],
             prefill_rows: 0, compressed_prefill_rows: 0, mixed_fallback_rows: 0, arenas: arenas.clone(), words,
             pulls: pulls.unwrap_or(Pulls { base: 0 }), slots, ranks: intake.ranks, row_bytes: intake.row_bytes,
@@ -1169,7 +1180,7 @@ impl<'a> Waves<'a> {
             for plane in self.slot_planes(slot) {
                 // SAFETY: all ranks landed, the slot is exclusive until consumed;
                 // staging and expansion are separate launches on this stream.
-                unsafe { codec.launch(plane, self.words.ptr(Counter::ReplyFormat(slot)), ticket.rows, stream)?; }
+                unsafe { codec.launch(slot, plane, self.words.ptr(Counter::ReplyFormat(slot)), ticket.rows, stream)?; }
             }
         }
         self.unread[slot] = true;

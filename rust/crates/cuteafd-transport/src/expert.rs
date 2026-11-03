@@ -1006,6 +1006,23 @@ mod tests {
                 assert_eq!(planes.insert(frame)?, rank);
             }
             assert!(planes.complete());
+            let mut mismatch = owned.clone();
+            mismatch.select_combined_reply(if format == SparkReplyFormat::Bf16 {
+                SparkReplyFormat::Nvfp4
+            } else { SparkReplyFormat::Bf16 })?;
+            let other_encoded = mismatch.encode()?;
+            let other = BackboneRequest::parse_native_group(&other_encoded, 65, topology)?;
+            assert!(V41Tp4Planes::new_ranks(&other, &ranks)?.insert(&frames[0]).is_err());
+            if format != SparkReplyFormat::Bf16 {
+                for kind in [ExpertV2SourceKind::Decode, ExpertV2SourceKind::MtpVerify] {
+                    let mut invalid = owned.clone();
+                    invalid.rows[0].source_kind = kind;
+                    assert!(BackboneRequest::parse_native_group(&invalid.encode()?, 65, topology).is_err());
+                }
+                let mut invalid = owned.clone();
+                invalid.rows[0].source_request_id = 2;
+                assert!(BackboneRequest::parse_native_group(&invalid.encode()?, 65, topology).is_err());
+            }
         }
         Ok(())
     }

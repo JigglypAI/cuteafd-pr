@@ -253,10 +253,7 @@ impl<'w, 'a> Worker<'w, 'a> {
                     // SAFETY: the transport owns the destination until the response send completes.
                     unsafe {
                         if compressed {
-                            // Request row count is the whole unit; the current implementation's
-                            // arena covers a full prefill unit (at most PREFILL_ROWS).
-                            ensure!(first == 0 && rows == request.rows() as usize, "compressed reply exceeds one arena");
-                            self.reply_codec.quantize(request, output, target, self.stream.raw)?;
+                            self.reply_codec.quantize(request, output, target, rows, self.stream.raw)?;
                         } else { library_copy(self.library, target, output, output.bytes, self.stream.raw)?; }
                     }
                 }

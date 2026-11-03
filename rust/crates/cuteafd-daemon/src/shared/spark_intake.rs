@@ -1556,6 +1556,7 @@ fn log_transfer_plan(mode: IntakeMode, ranks: usize) {
 
 /// A Spark transport and the intake its waves land in (dropped in that order).
 pub(crate) struct SparkLink<'a> {
+    prefill: bool,
     intake: std::rc::Rc<SparkIntake<'a>>,
     /// Bytes of the transport's egress buffer (0: none).
     egress_bytes: usize,
@@ -1585,7 +1586,9 @@ impl<'a> SparkLink<'a> {
     /// waves land in an intake of the process-wide [`choose_mode`].
     pub(crate) fn new(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld, peers: &[std::net::SocketAddr], capacity: u32,
         config: cuteafd_transport::TcpTransportConfig, row_bytes: usize) -> Result<Self> {
-        Self::new_waves(library, world, peers, capacity, config, row_bytes, 1, capacity)
+        let timing = config.timing;
+        let transport = SparkExperts::new_world(world, peers, capacity, config, 0)?;
+        Self::with_egress_waves(library, transport, row_bytes, IntakePreference::Probed, true, false, 1, capacity, timing)
     }
 
     /// A link admitting `waves` outstanding waves of up to `capacity` rows,
@@ -1600,7 +1603,7 @@ impl<'a> SparkLink<'a> {
         let timing = config.timing;
         let mut transport = SparkExperts::new_world(world, peers, capacity, config, 0)?;
         transport.set_max_waves(waves)?;
-        Self::with_egress_waves(library, transport, row_bytes, IntakePreference::Probed, true, waves, wave_rows, timing)
+        Self::with_egress_waves(library, transport, row_bytes, IntakePreference::Probed, true, true, waves, wave_rows, timing)
     }
 
     /// Return slots.
@@ -1618,7 +1621,7 @@ impl<'a> SparkLink<'a> {
     pub(crate) fn from_transport(library: &'a NativeLibrary, transport: SparkExperts,
         row_bytes: usize, preference: IntakePreference, timing: bool) -> Result<Self> {
         let capacity = transport.capacity();
-        Self::with_egress_waves(library, transport, row_bytes, preference, false, 1, capacity, timing)
+        Self::with_egress_waves(library, transport, row_bytes, preference, false, false, 1, capacity, timing)
     }
 
     /// [`Self::from_transport`] with `waves` outstanding waves of `wave_rows`
@@ -1627,12 +1630,12 @@ impl<'a> SparkLink<'a> {
         row_bytes: usize, preference: IntakePreference, waves: usize, wave_rows: u32, timing: bool) -> Result<Self> {
         ensure!((1..=transport.capacity()).contains(&wave_rows), "Spark return slot rows exceed the transport capacity");
         transport.set_max_waves(waves)?;
-        Self::with_egress_waves(library, transport, row_bytes, preference, false, waves, wave_rows, timing)
+        Self::with_egress_waves(library, transport, row_bytes, preference, false, true, waves, wave_rows, timing)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn with_egress_waves(library: &'a NativeLibrary, mut transport: SparkExperts,
-        row_bytes: usize, preference: IntakePreference, enable_egress: bool, waves: usize, wave_rows: u32,
+        row_bytes: usize, preference: IntakePreference, enable_egress: bool, prefill: bool, waves: usize, wave_rows: u32,
         timing: bool) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
         let ranks = transport.world_size();
@@ -1648,7 +1651,7 @@ impl<'a> SparkLink<'a> {
         unsafe { intake.attach(&mut transport)? };
         log_transfer_plan(mode, ranks);
         let world = transport.world();
-        Ok(Self { intake: std::rc::Rc::new(intake), egress_bytes: 0, egress_enabled: enable_egress,
+        Ok(Self { prefill, intake: std::rc::Rc::new(intake), egress_bytes: 0, egress_enabled: enable_egress,
             terminal_library: None, terminal_released: false, exchange: None, transport: Some(transport),
             staging_bytes: 0, bootstrap: None, timing, world, world_size: ranks, capacity })
     }
@@ -1724,7 +1727,7 @@ impl<'a> SparkLink<'a> {
         tracing::info!(slots, bytes, registered, "Spark exchange staging");
         let landing = transport.gpu_landing_ranks().iter().enumerate()
             .fold(0u8, |bits, (rank, &landed)| if landed { bits | 1 << rank } else { bits });
-        let geometry = crate::shared::spark_waves::Intake { ranks: intake.ranks(), row_bytes: intake.row_bytes(),
+        let geometry = crate::shared::spark_waves::Intake { prefill: self.prefill, ranks: intake.ranks(), row_bytes: intake.row_bytes(),
             ranges: intake.ranges(), geometry: intake.geometry(),
             landing: if intake.mode == IntakeMode::Gpu { landing } else { 0 }, placed: intake.placed(),
             next_slot: intake.dispatch_slot() };

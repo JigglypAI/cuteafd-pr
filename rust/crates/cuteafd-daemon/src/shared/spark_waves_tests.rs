@@ -536,7 +536,7 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
             ranges.iter().map(|range| range.ptr as usize).collect(), hosts.clone(), words.clone(), delay, stagger,
             slots, max_rows.div_ceil(2) * row_bytes)?;
         let geometry = crate::shared::wave_geometry::SlotGeometry::new(slots, max_rows)?;
-        let intake = Intake { ranks, row_bytes, ranges, geometry, landing, placed: true, next_slot: 0 };
+        let intake = Intake { prefill: true, ranks, row_bytes, ranges, geometry, landing, placed: true, next_slot: 0 };
         let storage = std::rc::Rc::new(ExchangeStorage::new(&library, slots, landing != (1u8 << ranks) - 1)?);
         let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false, storage.clone())?;
         let _ = words.set(exchange.words());
@@ -645,7 +645,7 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
     let echo = EchoWorld::new(library.clone(), ranks, row_bytes, 0, ranges.iter().map(|range| range.ptr as usize).collect(),
         hosts, words.clone(), Duration::from_secs(1), Duration::ZERO, waves, rows * row_bytes)?;
     let geometry = crate::shared::wave_geometry::SlotGeometry::new(waves, rows)?;
-    let intake = Intake { ranks, row_bytes, ranges, geometry, landing: 0, placed: true, next_slot: 0 };
+    let intake = Intake { prefill: true, ranks, row_bytes, ranges, geometry, landing: 0, placed: true, next_slot: 0 };
     let storage = owner.exchange_storage(&intake)?;
     let weak = std::rc::Rc::downgrade(&storage);
     let control = storage.control.buffer.ptr;
@@ -690,7 +690,7 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
     // The landing wait queued behind an abandoned wave was released (a
     // worker that did not release it would leave this stream blocked).
     stream.finish()?;
-    let geometry = Intake { ranks, row_bytes, ranges: owner.ranges(), geometry: owner.geometry(),
+    let geometry = Intake { prefill: true, ranks, row_bytes, ranges: owner.ranges(), geometry: owner.geometry(),
         landing: 0, placed: true, next_slot: 0 };
     let reset = owner.exchange_storage(&geometry)?;
     assert_eq!(reset.control.buffer.ptr, control, "reset reuses counters");
@@ -1078,7 +1078,7 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
         let buffers = echo.buffers.clone();
         echo.stagger = Duration::ZERO;
         let geometry = crate::shared::wave_geometry::SlotGeometry::new(1, rows)?;
-        let intake = Intake { ranks, row_bytes, ranges, geometry, landing: 0, placed: true, next_slot: 0 };
+        let intake = Intake { prefill: true, ranks, row_bytes, ranges, geometry, landing: 0, placed: true, next_slot: 0 };
         let stagger = Arc::new(AtomicUsize::new(0));
         let storage = std::rc::Rc::new(ExchangeStorage::new(&library, 1, true)?);
         let mut exchange = Waves::start(&library, intake, StaggerSwitch { echo, stagger: stagger.clone() }, Vec::new(),

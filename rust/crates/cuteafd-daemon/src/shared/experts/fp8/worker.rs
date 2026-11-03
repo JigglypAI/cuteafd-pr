@@ -439,7 +439,7 @@ impl<'a> Fp8Worker<'a> {
             if let Some(timing) = &self.timing { timing.borrow().record(1, self.stream.raw)?; }
             if compressed {
                 self.reply_codec.quantize(request, output,
-                    destination.context("missing compressed reply slot")?, self.stream.raw)?;
+                    destination.context("missing compressed reply slot")?, request.rows() as usize, self.stream.raw)?;
             }
             // The transport holds both mapped slots until this unit's fence,
             // independent of later work queued on the owner's stream.

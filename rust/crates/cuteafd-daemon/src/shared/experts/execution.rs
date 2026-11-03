@@ -965,7 +965,7 @@ impl ExpertExecution<'_, '_> {
         if compressed {
             // SAFETY: BF16 scratch and mapped destination live through the unit fence below.
             unsafe { self.reply_codec.as_ref().context("missing reply codec")?.quantize(request,
-                output, destination.context("missing compressed destination")?, self.stream.raw)?; }
+                output, destination.context("missing compressed destination")?, request.rows() as usize, self.stream.raw)?; }
         }
         if let Some(timing) = &self.timing {
             unsafe {

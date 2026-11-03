@@ -586,7 +586,7 @@ impl<'a> Exl3Worker<'a> {
         if compressed {
             // SAFETY: execution output and transport slot stay live through this unit's fence.
             unsafe { self.reply_codec.quantize(request, output,
-                destination.context("missing compressed reply slot")?, self.stream.raw)?; }
+                destination.context("missing compressed reply slot")?, request.rows() as usize, self.stream.raw)?; }
         }
         let enqueued_us = started.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
         if let Some([_, end]) = &self.timing {
