@@ -8,6 +8,22 @@ use cuteafd_loader::{plan::testing::{qwen4_config, qwen4_exl3, write_snapshot},
 use std::{fs::File, net::TcpStream, os::unix::fs::FileExt, time::Duration};
 
 #[test]
+fn whole_binding_requires_exact_selected_inventory_and_admission() -> Result<()> {
+    use crate::shared::experts::layer::ExpertLayer::BackboneFull;
+    let expected = [(BackboneFull { layer: 0 }, 256), (BackboneFull { layer: 1 }, 512)];
+    validate_whole_inventory(&expected, &expected, 768)?;
+    assert!(validate_whole_inventory(&expected, &expected, 767).is_err());
+    assert!(validate_whole_inventory(&expected[..1], &expected, 768).is_err());
+    assert!(validate_whole_inventory(&[expected[1], expected[0]], &expected, 768).is_err());
+    assert!(validate_whole_inventory(&[expected[0], expected[0]], &expected, 768).is_err());
+    assert!(validate_whole_inventory(&[(BackboneFull { layer: 0 }, 257), expected[1]], &expected, 769).is_err());
+    let overflow = [(BackboneFull { layer: 0 }, usize::MAX), (BackboneFull { layer: 1 }, 1)];
+    assert!(validate_whole_inventory(&overflow, &overflow, usize::MAX).is_err());
+    validate_whole_inventory(&[], &[], 0)?;
+    Ok(())
+}
+
+#[test]
 fn coordinator_host_admission_charges_every_concurrent_receive_ring() -> Result<()> {
     for gpus in [1, 2] {
         let plans = (0..gpus).map(|_| None).collect::<Vec<_>>();

@@ -104,6 +104,23 @@ impl<'a> PushedExperts<'a> {
         match self { Self::Native(w) => Ok(w), Self::Exl3(w) if w.is_empty() => Ok(Vec::new()),
             _ => anyhow::bail!("non-native TP2 halves where native expected") }
     }
+
+    pub fn whole_native(self, expected: &[(crate::shared::experts::layer::ExpertLayer, usize)],
+        admitted: usize) -> Result<Vec<crate::shared::experts::layer::ExpertWeights<'a>>> {
+        let weights = self.native()?;
+        let actual = weights.iter().map(|w| (w.layer, w.budget.resident_bytes)).collect::<Vec<_>>();
+        validate_whole_inventory(&actual, expected, admitted)?;
+        Ok(weights)
+    }
+}
+
+fn validate_whole_inventory(actual: &[(crate::shared::experts::layer::ExpertLayer, usize)],
+    expected: &[(crate::shared::experts::layer::ExpertLayer, usize)], admitted: usize) -> Result<()> {
+    ensure!(actual == expected, "committed whole expert inventory differs from selected layers or resident bytes");
+    let bytes = actual.iter().try_fold(0usize, |total, (_, bytes)| total.checked_add(*bytes))
+        .context("committed whole expert bytes overflow")?;
+    ensure!(bytes <= admitted, "committed whole experts exceed admitted resident bytes");
+    Ok(())
 }
 
 /// A family's dense operands for one GPU: their destination, and where the

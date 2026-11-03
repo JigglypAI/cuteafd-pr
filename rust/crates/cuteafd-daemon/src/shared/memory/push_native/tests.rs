@@ -374,8 +374,16 @@ fn coordinator_native_tp2_halves_land_the_mount_staging_bytes() -> Result<()> {
     if let Some(root) = std::env::var_os("CUTEAFD_PUSH_V41") { roots.push((root.into(), vec![0, 7])); }
     for (root, layers) in roots {
         let catalog = cuteafd_loader::read_expert_catalog(&root)?;
-        for gpu in 0..2 {
-            let plan = super::super::push_coordinator::CoordinatorExpertPlan::new(&catalog, &layers, gpu, usize::MAX)?;
+        for (expert_world, gpu) in [(1, 0), (2, 0), (2, 1)] {
+            use super::super::push_coordinator::CoordinatorExpertPlan;
+            let make = |budget| if expert_world == 1 {
+                CoordinatorExpertPlan::whole_native(&catalog, &layers, budget)
+            } else { CoordinatorExpertPlan::new(&catalog, &layers, gpu, budget) };
+            let plan = make(usize::MAX)?;
+            let admitted = plan.layout.bytes();
+            assert!(admitted > 0);
+            assert_eq!(make(admitted)?.layout.bytes(), admitted);
+            assert!(make(admitted - 1).is_err());
             assert!(!plan.native.is_empty() && plan.validation.bytes() == 0);
             let world = 6;
             let checked = plan.checked(&catalog, &root, world, 4 + gpu)?;
@@ -398,8 +406,10 @@ fn coordinator_native_tp2_halves_land_the_mount_staging_bytes() -> Result<()> {
             for (region, (&layer, planes)) in layers.iter().zip(&plan.native).enumerate() {
                 let base = plan.layout.region(region)?.start;
                 for expert in [0, planes.experts - 1] {
-                    let staging = catalog.expert_staging(cuteafd_loader::V41ExpertSelection::BackboneTp2 {
-                        layer, expert, rank: gpu })?;
+                    let selection = if expert_world == 1 {
+                        cuteafd_loader::V41ExpertSelection::BackboneFull { layer, expert }
+                    } else { cuteafd_loader::V41ExpertSelection::BackboneTp2 { layer, expert, rank: gpu } };
+                    let staging = catalog.expert_staging(selection)?;
                     let mut staged = vec![0u8; staging.staging_bytes()];
                     let mut scratch = vec![0u8; staging.minimum_read_scratch_bytes().max(1 << 20)];
                     staging.read_into(&mut staged, &mut scratch)?;
