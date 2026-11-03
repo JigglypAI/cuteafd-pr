@@ -175,8 +175,8 @@ def real_vision_input(tmp_path):
     return manifest, snapshot, tmp_path / "fixtures"
 
 
-@pytest.mark.parametrize("server_family,checkpoint", [("glm5", "model"), ("mimo_v2", "model"),
-                                                        (None, "model"), ("glm5", "other")])
+@pytest.mark.parametrize("server_family,checkpoint", [("mistral_large4", "model"), ("glm5", "model"),
+    ("mimo_v2", "model"), (None, "model"), ("mistral_large4", "other")])
 def test_real_vision_manifest_pins_resizes_and_scores_following_text(real_vision_input, server_family, checkpoint):
     from fidelity_media import processor_contract
     manifest, snapshot, destination = real_vision_input
@@ -198,7 +198,7 @@ def test_real_vision_manifest_pins_resizes_and_scores_following_text(real_vision
     kwargs = dict(family="mistral_large4", model="model", checkpoint="model",
         version="real1", arm=arm, probe=probe, fixtures=destination, tokenizer_sha256="c" * 64,
         vision_manifest=manifest, snapshot=snapshot)
-    if server_family != "glm5" or checkpoint != "model":
+    if server_family != "mistral_large4" or checkpoint != "model":
         with pytest.raises(ValueError, match="server identity"):
             builder.build_vision_set(**kwargs)
         return

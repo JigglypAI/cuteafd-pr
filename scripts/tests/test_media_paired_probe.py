@@ -99,6 +99,9 @@ def test_record_requires_native_identity_and_override_metadata(tmp_path):
     with pytest.raises(ValueError, match="identity"):
         module.check_record(window, response, "model", "native", family="qwen4")
     response["server"]["family"] = "glm5"
+    with pytest.raises(ValueError, match="identity"):
+        module.check_record(window, response, "model", "native", family="mistral_large4")
+    response["server"]["family"] = "mistral_large4"
     module.check_record(window, response, "model", "native", family="mistral_large4")
     with pytest.raises(ValueError, match="identity"):
         module.check_record(window, response, "other", "native", family="mistral_large4")
