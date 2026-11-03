@@ -1067,6 +1067,10 @@ cuteafd_status_t validate_bf16_graph_linear_buffers(cuteafd_device_buffer_t inpu
   return CUTEAFD_STATUS_OK;
 }
 
+cuteafd_status_t launch_linear_bf16_invariant(const uint16_t* input, const uint16_t* weight,
+                                             uint16_t* output, size_t rows, size_t input_dim,
+                                             size_t output_dim, cudaStream_t stream);
+
 cuteafd_status_t launch_linear_bf16_cublas(const uint16_t* input, const uint16_t* weight,
                                          const uint16_t* bias, uint16_t* output, size_t rows,
                                          size_t input_dim, size_t output_dim,
@@ -1081,26 +1085,10 @@ cuteafd_status_t launch_linear_bf16_cublas(const uint16_t* input, const uint16_t
       output_dim > static_cast<size_t>(std::numeric_limits<int>::max())) {
     return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  cublasHandle_t handle = nullptr;
-  cuteafd_status_t handle_status = cublas_handle(&handle);
-  if (handle_status != CUTEAFD_STATUS_OK) {
-    return handle_status;
-  }
-  cublasStatus_t status = cublasSetStream(handle, stream);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    return status_from_cublas(status);
-  }
-
-  const float alpha = 1.0f;
-  const float beta = 0.0f;
-  status = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, static_cast<int>(output_dim),
-                        static_cast<int>(rows), static_cast<int>(input_dim), &alpha, weight,
-                        CUDA_R_16BF, static_cast<int>(input_dim), input, CUDA_R_16BF,
-                        static_cast<int>(input_dim), &beta, output, CUDA_R_16BF,
-                        static_cast<int>(output_dim), CUBLAS_COMPUTE_32F,
-                        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    return status_from_cublas(status);
+  const auto status = launch_linear_bf16_invariant(input, weight, output, rows,
+                                                  input_dim, output_dim, stream);
+  if (status != CUTEAFD_STATUS_OK) {
+    return status;
   }
 
   if (bias != nullptr) {
@@ -1214,6 +1202,115 @@ bool create_cublaslt_linear_shape(CublasLtLinearShape* shape, size_t rows,
     return false;
   }
   return true;
+}
+
+// All row counts use one canonical tile/K reduction, without split-K or workspace.
+struct InvariantBf16Algorithm {
+  cublasLtHandle_t handle = nullptr;
+  cublasLtMatmulAlgo_t algorithm{};
+  cublasStatus_t status = CUBLAS_STATUS_NOT_SUPPORTED;
+
+  ~InvariantBf16Algorithm() { if (handle) cublasLtDestroy(handle); }
+};
+
+cuteafd_status_t launch_linear_bf16_invariant(const uint16_t* input, const uint16_t* weight,
+                                             uint16_t* output, size_t rows, size_t input_dim,
+                                             size_t output_dim, cudaStream_t stream) {
+  int device = -1;
+  auto cuda_status = cudaGetDevice(&device);
+  if (cuda_status != cudaSuccess) return status_from_cuda(cuda_status);
+  // Thread-local descriptors/handles avoid mutating plans used by another launch thread.
+  static thread_local std::unordered_map<std::string, InvariantBf16Algorithm> algorithms;
+  const auto key = std::to_string(device) + "/" + std::to_string(input_dim) + "/" +
+                   std::to_string(output_dim);
+  auto found = algorithms.find(key);
+  if (found == algorithms.end()) {
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    cuda_status = cudaStreamIsCapturing(stream, &capture);
+    if (cuda_status != cudaSuccess) return status_from_cuda(cuda_status);
+    if (capture != cudaStreamCaptureStatusNone) return CUTEAFD_STATUS_INVALID_ARGUMENT;
+    auto& plan = algorithms[key];
+    plan.status = cublasLtCreate(&plan.handle);
+    CublasLtLinearShape canonical;
+    if (plan.status == CUBLAS_STATUS_SUCCESS &&
+        create_cublaslt_linear_shape(&canonical, 16, input_dim, output_dim)) {
+      cublasLtMatmulPreference_t preference = nullptr;
+      plan.status = cublasLtMatmulPreferenceCreate(&preference);
+      const size_t workspace_bytes = 0;
+      if (plan.status == CUBLAS_STATUS_SUCCESS)
+        plan.status = cublasLtMatmulPreferenceSetAttribute(preference,
+            CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_bytes, sizeof(workspace_bytes));
+      cublasLtMatmulHeuristicResult_t results[32]{};
+      int count = 0;
+      if (plan.status == CUBLAS_STATUS_SUCCESS)
+        plan.status = cublasLtMatmulAlgoGetHeuristic(plan.handle, canonical.operation,
+            canonical.weight, canonical.input, canonical.output, canonical.output,
+            preference, 32, results, &count);
+      if (preference) cublasLtMatmulPreferenceDestroy(preference);
+      if (plan.status == CUBLAS_STATUS_SUCCESS) {
+        plan.status = CUBLAS_STATUS_NOT_SUPPORTED;
+        for (int i = 0; i < count; ++i) {
+          if (results[i].state != CUBLAS_STATUS_SUCCESS) continue;
+          auto algorithm = results[i].algo;
+          const uint32_t split_k = 0, reduction = CUBLASLT_REDUCTION_SCHEME_NONE;
+          if (cublasLtMatmulAlgoConfigSetAttribute(&algorithm, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+                  &split_k, sizeof(split_k)) != CUBLAS_STATUS_SUCCESS ||
+              cublasLtMatmulAlgoConfigSetAttribute(&algorithm, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+                  &reduction, sizeof(reduction)) != CUBLAS_STATUS_SUCCESS) continue;
+          bool supported = true;
+          for (uint64_t n : {uint64_t{1}, uint64_t{140}, uint64_t{2048}}) {
+            if (cublasLtMatrixLayoutSetAttribute(canonical.input, CUBLASLT_MATRIX_LAYOUT_COLS,
+                    &n, sizeof(n)) != CUBLAS_STATUS_SUCCESS ||
+                cublasLtMatrixLayoutSetAttribute(canonical.output, CUBLASLT_MATRIX_LAYOUT_COLS,
+                    &n, sizeof(n)) != CUBLAS_STATUS_SUCCESS) { supported = false; break; }
+            cublasLtMatmulHeuristicResult_t checked{};
+            if (cublasLtMatmulAlgoCheck(plan.handle, canonical.operation, canonical.weight,
+                    canonical.input, canonical.output, canonical.output, &algorithm, &checked)
+                    != CUBLAS_STATUS_SUCCESS || checked.state != CUBLAS_STATUS_SUCCESS ||
+                checked.workspaceSize != 0) { supported = false; break; }
+          }
+          if (supported) { plan.algorithm = algorithm; plan.status = CUBLAS_STATUS_SUCCESS; break; }
+        }
+      }
+    } else if (plan.status == CUBLAS_STATUS_SUCCESS) {
+      plan.status = CUBLAS_STATUS_INVALID_VALUE;
+    }
+    destroy_cublaslt_linear_shape(&canonical);
+    found = algorithms.find(key);
+  }
+  auto& plan = found->second;
+  if (plan.status != CUBLAS_STATUS_SUCCESS) return status_from_cublas(plan.status);
+  struct ShapeOwner {
+    CublasLtLinearShape shape;
+    ~ShapeOwner() { destroy_cublaslt_linear_shape(&shape); }
+  };
+  static thread_local std::unordered_map<std::string, ShapeOwner> shapes;
+  const auto shape_key = key + "/" + std::to_string(rows);
+  auto shape = shapes.find(shape_key);
+  if (shape == shapes.end()) {
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    cuda_status = cudaStreamIsCapturing(stream, &capture);
+    if (cuda_status != cudaSuccess) return status_from_cuda(cuda_status);
+    if (capture != cudaStreamCaptureStatusNone) return CUTEAFD_STATUS_INVALID_ARGUMENT;
+    auto& owner = shapes[shape_key];
+    if (!create_cublaslt_linear_shape(&owner.shape, rows, input_dim, output_dim)) {
+      shapes.erase(shape_key);
+      return CUTEAFD_STATUS_INVALID_ARGUMENT;
+    }
+    cublasLtMatmulHeuristicResult_t checked{};
+    auto status = cublasLtMatmulAlgoCheck(plan.handle, owner.shape.operation, owner.shape.weight,
+        owner.shape.input, owner.shape.output, owner.shape.output, &plan.algorithm, &checked);
+    if (status != CUBLAS_STATUS_SUCCESS || checked.state != CUBLAS_STATUS_SUCCESS || checked.workspaceSize) {
+      shapes.erase(shape_key);
+      return status_from_cublas(status != CUBLAS_STATUS_SUCCESS ? status :
+          checked.state != CUBLAS_STATUS_SUCCESS ? checked.state : CUBLAS_STATUS_NOT_SUPPORTED);
+    }
+    shape = shapes.find(shape_key);
+  }
+  const auto& s = shape->second.shape;
+  const float alpha = 1.f, beta = 0.f;
+  return status_from_cublas(cublasLtMatmul(plan.handle, s.operation, &alpha, weight, s.weight,
+      input, s.input, &beta, output, s.output, output, s.output, &plan.algorithm, nullptr, 0, stream));
 }
 
 struct CublasLtM1ParityBatchedPlan {
