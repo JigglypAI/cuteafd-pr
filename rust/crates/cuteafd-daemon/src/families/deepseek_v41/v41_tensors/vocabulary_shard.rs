@@ -48,7 +48,7 @@ impl<'a> VocabularyShard<'a> {
             // staged BF16 rows straight into it (tiles are independent).
             let packed = crate::shared::fp8_linear::Fp8Weight::allocate(library, rows, 5120)?;
             let (values, scale) = packed.buffers();
-            let per = (crate::shared::experts::rtx::dense::STEP_BYTES / Self::ROW_BYTES) / 16 * 16;
+            let per = (crate::shared::experts::rtx::dense::TRANSFORM_BYTES / Self::ROW_BYTES) / 16 * 16;
             let stream = library.cuda_stream_create()?;
             let staged = (|| -> Result<()> {
                 for first in (0..rows).step_by(per) {

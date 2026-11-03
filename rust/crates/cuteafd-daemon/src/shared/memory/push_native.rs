@@ -68,7 +68,8 @@ impl ScalePlan {
             }
         }
         let table = if plan.steps.is_empty() { 0 } else { crate::shared::fp8_load_quant::scale_code_table_bytes(1)? };
-        plan.host_staging = crate::shared::experts::rtx::dense::HostStaging::new(plan.steps.len(), table);
+        plan.host_staging = crate::shared::experts::rtx::dense::HostStaging::for_steps(
+            plan.steps.iter().map(|(_, step)| step.rects.as_slice()), table)?;
         plan.host_staging.bytes()?;
         Ok(plan)
     }

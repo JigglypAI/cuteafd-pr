@@ -50,17 +50,35 @@ fn dense_host_geometry_tracks_pools_and_large_quant_tables_without_allocating() 
     for count in [1, 2, 8, 11] {
         let layout = RankLayout::new(vec![], vec![step.clone(); count], 0)?;
         let staging = layout.plan().host_staging;
-        assert_eq!(staging.buffers, count.min(8));
-        assert_eq!(staging.buffer_bytes, STEP_BYTES);
+        assert_eq!(staging.staging_bytes, count * STEP_BYTES);
+        assert_eq!(staging.largest_step, STEP_BYTES);
         assert!(staging.table_bytes > 1 << 20, "row tables are not capped at the allocation floor");
         assert_eq!(staging.table_bytes, crate::shared::fp8_load_quant::quant_table_bytes(131072, Layout::Channel)?);
-        assert_eq!(staging.bytes()?, count.min(8) * STEP_BYTES + staging.table_bytes);
+        assert_eq!(staging.bytes()?, count * STEP_BYTES + staging.table_bytes);
     }
     let block = crate::shared::fp8_load_quant::quant_table_bytes(131072, Layout::Block)?;
     assert_eq!(block, 1 << 20);
     assert!(crate::shared::fp8_load_quant::quant_table_bytes(usize::MAX, Layout::Channel).is_err());
     assert!(crate::shared::fp8_load_quant::scale_code_table_bytes(usize::MAX).is_err());
-    assert!(HostStaging { buffers: usize::MAX, buffer_bytes: 2, table_bytes: 0 }.bytes().is_err());
+    assert!(HostStaging { staging_bytes: usize::MAX, largest_step: 2, table_bytes: 1 }.bytes().is_err());
+    Ok(())
+}
+
+#[test]
+fn staging_uses_actual_sizes_and_charges_disconnected_transforms_in_full() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{HostStaging, Rect};
+    let rect = |base, bytes| Rect { name: "scale".into(), path: "shard".into(), base,
+        row_bytes: bytes, rows: 0..1, cols: 0..bytes };
+    let steps = (0..4096).map(|i| vec![rect(i * 122880, 122880)]).collect::<Vec<_>>();
+    let bound = HostStaging::for_steps(steps.iter().map(Vec::as_slice), 1 << 20)?;
+    assert_eq!(bound.largest_step, 122880);
+    assert_eq!(bound.staging_bytes, 128 * ((1 << 20) + 2 * 122880) + 122880);
+    assert!(bound.bytes()? < 160 << 20);
+    let mixed = (0..1024).map(|i| vec![rect(i * 4096, 4096), rect((1 << 30) + i * 4096, 4096)])
+        .collect::<Vec<_>>();
+    assert_eq!(HostStaging::for_steps(mixed.iter().map(Vec::as_slice), 0)?.staging_bytes, 1024 * 8192);
+    let overlapping = vec![vec![rect(0, 4096)]; 1024];
+    assert_eq!(HostStaging::for_steps(overlapping.iter().map(Vec::as_slice), 0)?.staging_bytes, 1024 * 4096);
     Ok(())
 }
 
@@ -81,10 +99,10 @@ fn coordinator_host_admission_adds_dense_pools_and_exl3_validation_for_every_ran
             CoordinatorExpertPlan::whole(vec![catalog.exl3().unwrap().residency(V41Exl3Layer::Backbone(0), 1, 0)?], usize::MAX)
         } else { CoordinatorExpertPlan::new(&catalog, &[0], gpu, usize::MAX) }).collect::<Result<Vec<_>>>()?;
         let owners = plans.iter().map(Some).collect::<Vec<_>>();
-        let dense = vec![HostStaging::new(12, 2 << 20); gpus];
+        let dense = vec![HostStaging { staging_bytes: 12 * STEP_BYTES, largest_step: STEP_BYTES, table_bytes: 2 << 20 }; gpus];
         let validation = plans.iter().map(|p| p.validation.bytes()).sum::<usize>();
         assert!(validation > 0);
-        let peak = gpus * (128 * (1 << 20) + 8 * STEP_BYTES + (2 << 20)) + validation;
+        let peak = gpus * (128 * (1 << 20) + 12 * STEP_BYTES + (2 << 20)) + validation;
         assert_eq!(CoordinatorExpertPlan::admit_host(&owners, &dense, 128, 1 << 20, peak as u64)?, peak);
         assert!(CoordinatorExpertPlan::admit_host(&owners, &dense, 128, 1 << 20, peak as u64 - 1).is_err());
     }
@@ -104,7 +122,7 @@ fn host_admission_refusal_declines_peers_before_returning_a_typed_planning_error
         assert!(planned_offer(&mut second, Ok(()), Ok(offer))?.is_none());
         Ok(())
     });
-    let planned = CoordinatorExpertPlan::admit_host(&[None], &[HostStaging::new(8, 1 << 20)],
+    let planned = CoordinatorExpertPlan::admit_host(&[None], &[HostStaging { staging_bytes: 8 << 20, largest_step: 1 << 20, table_bytes: 1 << 20 }],
         128, 1 << 20, 128 << 20);
     let offer = planned.as_ref().map(|_| unreachable!("staging must exceed this ring-only budget"))
         .map_err(|error| format!("{error:#}"));
@@ -821,22 +839,18 @@ fn fake_source_accept_is_bounded() -> Result<()> {
     Ok(())
 }
 
-/// A shard that stores every expert's scales at its front and the weights
-/// after them (the V4.1 dSpark layout), streamed by one source in file order:
-/// one staged step per expert holding both pieces opens every step at once and
-/// is refused by the staging bound; the recipe that stages only each expert's
-/// contiguous weights (scales landing as operands) keeps one step open and
-/// pinned staging at one buffer.
+/// Upload-only steps require no transform staging, even when their checkpoint
+/// rectangles live far apart. Both mixed and split recipes land bytes directly.
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
-fn scales_first_shard_keeps_one_open_step_per_source() -> Result<()> {
-    use crate::shared::experts::rtx::dense::{testing::PEAKS, Job, Operand, Rect, Records, Step, MAX_OPEN_STEPS};
+fn scales_first_shard_uploads_land_without_transform_staging() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{testing::PEAKS, Job, Operand, Rect, Records, Step};
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
     fixture.configure_memory(&library, 0, 64 << 30)?;
     let root = tempfile::tempdir_in(fixture.directory())?;
     // A SparkNest-shaped namespace with one shard: 16 scales (4 KiB each), then 16 weights (256 KiB each).
-    let experts = MAX_OPEN_STEPS * 2;
+    let experts = 16;
     let (scale, weight) = (4096usize, 256usize << 10);
     let shard = root.path().join("model-00001-of-00001.safetensors");
     std::fs::write(&shard, (0..experts * (scale + weight)).map(|i| (i % 251) as u8).collect::<Vec<_>>())?;
@@ -865,13 +879,23 @@ fn scales_first_shard_keeps_one_open_step_per_source() -> Result<()> {
     let staged = crate::shared::memory::DeviceAllocation::new(&library, experts * (scale + weight))?;
     let mut mixed = Records::default();
     for e in 0..experts {
-        let dst = cuteafd_ffi::CuteafdDeviceBuffer { bytes: scale + weight, ..staged.buffer };
+        // SAFETY: expert e's complete image lies inside the retained allocation.
+        let dst = cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe {
+            staged.buffer.ptr.cast::<u8>().add(e * (scale + weight)).cast()
+        }, bytes: scale + weight, ..staged.buffer };
         mixed.steps.push(Step { device: 0, rects: vec![rect(scale_at(e), scale), rect(weight_at(e), weight)],
             jobs: vec![Job::Upload { at: 0, bytes: scale + weight, dst }] });
     }
-    let refused = receive_pushed(device, Some(&catalog), root.path(), sockets.path(), &mixed, None, 1, 0);
-    anyhow::ensure!(refused.is_err(), "interleaved steps must be refused by the staging bound");
-    PEAKS.with(|p| p.take());
+    receive_pushed(device, Some(&catalog), root.path(), sockets.path(), &mixed, None, 1, 0)?;
+    assert_eq!(PEAKS.with(|p| p.take()), vec![(0, 0)]);
+    let file = std::fs::read(&shard)?;
+    let mut actual = vec![0; experts * (scale + weight)];
+    library.copy_d2h(&mut actual, staged.buffer)?;
+    for e in 0..experts {
+        let base = e * (scale + weight);
+        assert_eq!(&actual[base..base + scale], &file[scale_at(e)..scale_at(e) + scale]);
+        assert_eq!(&actual[base + scale..base + scale + weight], &file[weight_at(e)..weight_at(e) + weight]);
+    }
     // New shape: weights-only steps, scales as operands.
     let scales = crate::shared::memory::DeviceAllocation::new(&library, experts * scale)?;
     let weights = crate::shared::memory::DeviceAllocation::new(&library, experts * weight)?;
@@ -889,8 +913,7 @@ fn scales_first_shard_keeps_one_open_step_per_source() -> Result<()> {
     let peaks = PEAKS.with(|p| p.take());
     assert_eq!(peaks.len(), 1);
     let (staged, pinned) = peaks[0];
-    assert_eq!((staged, pinned), (crate::shared::experts::rtx::dense::STEP_BYTES as u64,
-        crate::shared::experts::rtx::dense::STEP_BYTES as u64), "one open step, one pinned buffer");
+    assert_eq!((staged, pinned), (0, 0), "uploads bypass whole-step staging");
     let mut actual = vec![0u8; experts * weight];
     library.copy_d2h(&mut actual, weights.buffer)?;
     let file = std::fs::read(&shard)?;

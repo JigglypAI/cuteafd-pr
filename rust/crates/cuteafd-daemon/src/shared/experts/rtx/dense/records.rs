@@ -12,6 +12,8 @@ use std::{ffi::c_void, ops::Range, os::unix::fs::FileExt, path::PathBuf};
 
 /// The most bytes one step stages (one or more whole scale units).
 pub(crate) use cuteafd_loader::shared::dense_read::STEP_BYTES;
+/// Preferred transform window; indivisible scale units still fit STEP_BYTES.
+pub(crate) const TRANSFORM_BYTES: usize = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES;
 use cuteafd_loader::shared::dense_read::{ReadBatch, PINNED_FLOOR_BYTES};
 
 /// Rows `rows` of a checkpoint tensor (rows of `row_bytes` at `base` in `path`),
@@ -404,7 +406,7 @@ pub(crate) fn windows_with_tail(rects: &[Rect], unit: usize) -> Result<Vec<(Vec<
     ensure!(rects.iter().all(|r| r.width() == width), "staged rows differ in width");
     let total: usize = rects.iter().map(|r| r.rows.len()).sum();
     ensure!(unit > 0 && total > 0, "no staged rows");
-    let per = (STEP_BYTES / width / unit).max(1) * unit;
+    let per = (TRANSFORM_BYTES / width / unit).max(1) * unit;
     // Unit-aligned rectangle boundaries (row offsets of the whole).
     let mut cuts = Vec::new();
     let mut at = 0;
