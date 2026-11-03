@@ -811,9 +811,9 @@ impl<'a> Exl3Execution<'a> {
     ) -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
         use cuteafd_core::memory_layout::Category;
         use cuteafd_loader::placement::planner::{Allocation, Device, Domain, Receipt, View};
-        ensure!(physical_device >= 0 && matches!((location.device, location.domain),
-            (Device::Coordinator(_), Domain::Device) | (Device::Spark(_), Domain::Managed)),
-            "EXL3 workspace requires a logical coordinator or Spark device");
+        ensure!(!prefix.is_empty() && !states.is_empty() && physical_device >= 0
+            && location.domain == Domain::Device && location.device != Device::Host,
+            "EXL3 workspace requires retained states and a logical CUDA device");
         let receipt = |name: &str, buffer: CuteafdDeviceBuffer| -> Result<Receipt> {
             ensure!(buffer.device_id == physical_device && buffer.bytes > 0 && !buffer.ptr.is_null(),
                 "EXL3 workspace {name} has an invalid extent or physical device");

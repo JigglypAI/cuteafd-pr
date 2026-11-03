@@ -120,8 +120,11 @@ fn verify_workspace_receipts(states: &[Exl3Execution<'_>], manifests: &[serde_js
     assert!(receipts.iter().all(|receipt| receipt.allocation.location == location));
     assert!(Exl3Execution::workspace_receipts(states, "expert.test", location, -1, lifetime).is_err());
     assert!(Exl3Execution::workspace_receipts(states, "expert.test", location, 1-physical_device, lifetime).is_err());
+    assert!(Exl3Execution::workspace_receipts(states, "", location, physical_device, lifetime).is_err());
+    assert!(Exl3Execution::workspace_receipts(&[], "expert.test", location, physical_device, lifetime).is_err());
     for invalid in [Location::HOST, Location::PINNED,
-        Location { device: Device::Spark(0), domain: Domain::Device },
+        Location { device: Device::Host, domain: Domain::Device },
+        Location { device: Device::Spark(0), domain: Domain::Managed },
         Location { device: Device::Coordinator(0), domain: Domain::Managed }] {
         assert!(Exl3Execution::workspace_receipts(states, "expert.test", invalid, physical_device, lifetime).is_err());
     }
@@ -248,7 +251,7 @@ fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()
     use cuteafd_loader::placement::planner::{Device, Domain, Lifetime, Location};
     let manifests = [meta.clone(), wide];
     for location in [Location::coordinator(0), Location::coordinator(1),
-        Location { device: Device::Spark(3), domain: Domain::Managed }] {
+        Location { device: Device::Spark(3), domain: Domain::Device }] {
         verify_workspace_receipts(&executions, &manifests, location, 1)?;
     }
     executions[0].device = 0;
