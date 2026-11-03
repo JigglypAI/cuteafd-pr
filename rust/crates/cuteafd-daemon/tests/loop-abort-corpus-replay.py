@@ -3,9 +3,10 @@
 corpus: every assistant step the production replica served since 2026-10-22 22:00Z.
 
 This is the long-generation control the review asked for: the fidelity windows
-are capped at 1,024 generated tokens, so rule R can only fire on periods <= ~170
-there and rule F (>= 1,025 identical tokens) cannot fire at all. The opencode
-corpus has real 32k-token generations, so both rules are exercised.
+are capped at 1,024 generated tokens, so rule R can only fire on periods <= 68
+there (7P + 543 <= 1,024) and rule F (>= 1,025 identical tokens) cannot fire at
+all. The opencode corpus has real 32k-token generations, so both rules are
+exercised.
 
 Read-only on the opencode DB (`mode=ro`). Reuses the DB reader from
 `loop-replay.py` and the detector port from `loop-abort-fidelity-harness.py`.

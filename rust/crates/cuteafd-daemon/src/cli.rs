@@ -740,21 +740,43 @@ mod tests {
         assert_eq!(args.loop_abort.loop_fast_copies, 8);
     }
 
-    /// LD-01: `--loop-abort-run 0` is the kill switch; the range is 0..=65536.
+    /// LD-01/N4: `--loop-abort-run 0` disables rule R only; rule F is gated by
+    /// `--loop-fast-span` independently. The full kill switch is both knobs at
+    /// zero. The range is 0..=65536.
     #[test]
-    fn loop_abort_run_zero_is_the_kill_switch() {
+    fn loop_abort_run_zero_disables_rule_r_only() {
         use clap::Parser;
         let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
         let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
             base.iter().chain(["--loop-abort-run", "0"].iter())).unwrap().command else {
             panic!("expected native serving") };
         assert_eq!(args.loop_abort.loop_abort_run, 0);
+        assert_eq!(args.loop_abort.loop_fast_span, 1024, "rule F stays on");
         assert!(super::Cli::try_parse_from(
             base.iter().chain(["--loop-abort-run", "65537"].iter())).is_err());
         assert!(super::Cli::try_parse_from(
             base.iter().chain(["--loop-abort-copies", "1"].iter())).is_err());
         assert!(super::Cli::try_parse_from(
             base.iter().chain(["--loop-fast-copies", "65"].iter())).is_err());
+    }
+
+    /// LD-01/N4: the full kill switch is both rule knobs at zero.
+    #[test]
+    fn loop_abort_both_rules_zero_is_the_kill_switch() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
+            base.iter().chain(["--loop-abort-run", "0", "--loop-fast-span", "0"].iter()))
+            .unwrap().command else { panic!("expected native serving") };
+        let config = args.loop_abort.config();
+        assert_eq!(config.run, 0);
+        assert_eq!(config.fast_span, 0);
+        let detail = cuteafd_api::openai::FinishDetail::default();
+        let mut abort = config.guard(detail.clone(), 1);
+        for token in 0..10_000u32 {
+            assert!(!abort.push(token), "the disabled detector never aborts");
+        }
+        assert_eq!(detail.name(), None);
     }
 
     #[test]

@@ -1895,6 +1895,14 @@ mod loop_abort_tests {
         fn close(&mut self, _token: u32) {}
     }
 
+    /// A lease wide enough for the synthetic streams; `emit` only reads
+    /// `capacity` and `job.max_tokens`, so the exact bounds do not matter here.
+    fn test_lease(max_tokens: usize) -> Lease {
+        cuteafd_engine::reserve::KvReserve::new(
+            cuteafd_engine::reserve::ReserveConfig::new(16_384, 0, -1, 1_000_000).unwrap(), 1)
+            .lease(0, max_tokens.max(1), 1, usize::MAX).unwrap()
+    }
+
     fn active(dir: &tempfile::TempDir, max_tokens: usize, config: crate::shared::loop_abort::LoopAbortConfig)
         -> (Active<'static, TestPlacement, TestDraft>, mpsc::UnboundedReceiver<Result<InferenceChunk, cuteafd_api::openai::NativeFailure>>) {
         let (events, receive) = mpsc::unbounded_channel();
@@ -1907,7 +1915,8 @@ mod loop_abort_tests {
             job,
             history: Vec::new(), keyed_history: Vec::new(), constraint: None,
             placement: TestPlacement::default(), draft: TestDraft, outcomes: DraftHistory::default(),
-            proposed: 0, accepted: 0, cycles: 0, turn: None, capacity: usize::MAX, next: 0,
+            proposed: 0, accepted: 0, cycles: 0, turn: None, capacity: usize::MAX,
+            lease: test_lease(max_tokens), next: 0,
             decoder: cuteafd_loader::streaming_token_decoder(dir.path(), false).unwrap(),
             generated: 0, buffered: 0, started: Instant::now(), id: 1,
             ticket: console::Ticket::new(1, 0, None), loop_abort, looped: false,

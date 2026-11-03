@@ -11,6 +11,10 @@
 //! every family shares them; the rule itself lives in [`super::repeat_guard`].
 //! They are boot-time configuration only: the values are read once at startup
 //! and there is no runtime setter or admin endpoint.
+//!
+//! Each rule has its own off switch: `--loop-abort-run 0` disables rule R and
+//! `--loop-fast-span 0` disables rule F. The detector is fully off only when
+//! **both** are zero; setting just one leaves the other rule active.
 
 use clap::Args;
 use cuteafd_api::openai::FinishDetail;
@@ -22,7 +26,8 @@ use super::repeat_guard::{LoopHit, RepeatGuard};
 pub(crate) struct LoopAbortArgs {
     /// Loop abort: end a response with finish_reason=length once this many
     /// consecutive 32-token shingles are an eighth-or-later verbatim copy of
-    /// earlier output (rule R). 0 = off.
+    /// earlier output (rule R). Rule R only considers blocks longer than 256
+    /// tokens; shorter units are rule F's. 0 = off.
     #[arg(long, default_value_t = 512, env = "CUTEAFD_LOOP_ABORT_RUN",
         value_parser = clap::value_parser!(u32).range(0..=65536))]
     pub loop_abort_run: u32,

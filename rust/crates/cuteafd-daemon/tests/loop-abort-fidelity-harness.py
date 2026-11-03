@@ -44,6 +44,7 @@ import sys
 
 WINDOW = 32
 FAST_WINDOW = 256
+MIN_REPEAT_PERIOD = FAST_WINDOW + 1
 MAX_ENTRIES = 65_536
 
 
@@ -83,17 +84,21 @@ class RepeatGuard:
                 key = self._ring_tuple()
                 entry = self.counts.get(key)
                 seen = entry is not None and entry[0] >= self.copies - 1
+                period = (pushed - entry[2]) if entry is not None else None
                 if entry is not None:
                     if entry[0] < self.copies:
                         entry[0] += 1
+                    entry[2] = pushed
                 elif len(self.counts) < MAX_ENTRIES:
-                    self.counts[key] = [1, pushed - WINDOW]
+                    self.counts[key] = [1, pushed, pushed]
                 if seen:
                     if self.consecutive == 0:
                         self.first_seen_at = self.counts[key][1]
                     self.consecutive += 1
-                    if self.consecutive >= self.run:
-                        hit = ("Repeat", None)
+                    # Rule R is the long-block detector: only periods beyond
+                    # rule F's window may fire it (see the Rust module doc).
+                    if self.consecutive >= self.run and period is not None and period >= MIN_REPEAT_PERIOD:
+                        hit = ("Repeat", period)
                 else:
                     self.consecutive = 0
                     self.first_seen_at = None
@@ -217,6 +222,28 @@ def run_fixture(fixture_path: pathlib.Path) -> int:
     g = RepeatGuard(512, 8, 1024, 8)
     got = feed(g, [0] * 400)
     check("legitimate 400 identical tokens do not fire", got is None, f"got={got}")
+
+    # V2: rule R is gated to periods > FAST_WINDOW, so a period-1 run waits for
+    # rule F's 1,024-token span (without the gate rule R would fire at 550).
+    g = RepeatGuard(512, 8, 1024, 8)
+    got = feed(g, [0] * 1024)
+    check("1,024 identical tokens do not fire", got is None, f"got={got}")
+
+    g = RepeatGuard(512, 8, 1024, 8)
+    got = feed(g, [0] * 1025)
+    check(
+        "1,025 identical tokens fire rule F at the span",
+        got is not None and got[1] == ("Fast", 1) and got[0] == 1 + 1024,
+        f"got={got}",
+    )
+
+    g = RepeatGuard(512, 8, 1024, 8)
+    got = feed(g, repeat(block(8, 12), 200))
+    check(
+        "period-8 repeat waits for rule F",
+        got is not None and got[1] == ("Fast", 8) and got[0] == 8 + 1024,
+        f"got={got}",
+    )
 
     g = RepeatGuard(512, 8, 1024, 8)
     got = feed(g, repeat(block(600, 3), 9))

@@ -7,7 +7,9 @@
       "window": 32,
       "run": 512,
       "copies": 8,
-      "seen": 7
+      "seen": 7,
+      "min_period": 257,
+      "note": "Rule R only fires for period > FAST_WINDOW (256); rule F owns 1..=256."
     },
     "rule_f": {
       "window": 256,
@@ -18,7 +20,7 @@
   },
   "harness": {
     "path": "rust/crates/cuteafd-daemon/tests/loop-abort-fidelity-harness.py",
-    "sha256": "eca5e3a7a15b5ff15525f39841c6178efa61c9a82c22933fb58e2da6106f8c8e",
+    "sha256": "cc5a7ff0949a812d5a4d9c499d5abda978cf1db609f1a0fe8eadc1233e4228c9",
     "note": "Faithful Python port of rules R and F; validated against the crate fixture by --fixture."
   },
   "fidelity": {
@@ -27,7 +29,7 @@
     "revision": "01a0948a62a478a0a9355dd5b57fe4a49bc6cca0",
     "windows_sha256": "5580f716306b78201c3a5b029a5a7971bbb0ae9cbbbc8161653f040bbcdaf80b",
     "published_configs": 13,
-    "note": "13 configs exist at BASE; this run covers 1 (deepseek_v41-v2_20261005). Windows are capped at 1,024 generated tokens, so rule R can only fire on periods <= ~170 there and rule F (>= 1,025 identical tokens) cannot fire; the long-generation control below reaches both rules.",
+    "note": "13 configs exist at BASE; this run covers 1 (deepseek_v41-v2_20261005) \u2014 the other 12 need a dataset download (DEFERRED). Windows are capped at 1,024 generated tokens, so rule R can only fire on periods <= 68 there (7P + 543 <= 1,024) and rule F (>= 1,025 identical tokens) cannot fire in a gen window at all; the long-generation control below reaches both rules. The gen-row metrics also show max_shingle_copies 2 (gen_rows) / 6 (all_roles), never the 7 copies rule R needs, so this 0-fire result does not exercise rule R's shipped threshold.",
     "gen_rows": {
       "transcripts": 53,
       "tokens": 28820,

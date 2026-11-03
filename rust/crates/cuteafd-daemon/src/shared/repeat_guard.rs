@@ -7,8 +7,8 @@
 //! Rule R: slide a 32-token shingle over the generated tokens one token at a
 //! time; a position is "seen" when that exact shingle already occurred at least
 //! `copies - 1` times earlier in the same reply; abort when `run` consecutive
-//! positions are seen (the eighth-or-later verbatim copy of a >= 543-token block
-//! at the shipped defaults of 8 copies and a run of 512).
+//! positions are seen. At the shipped defaults (8 copies, run 512) a period-P
+//! block fires at `7P + 543` tokens.
 //!
 //! Rule F: the tail of the reply is `copies` identical copies of a short unit of
 //! `period` tokens (`period` in `1..=256`); abort when the copies after the first
@@ -16,9 +16,14 @@
 //! streaming form: `run[P]` counts consecutive positions with `t[i] == t[i - P]`
 //! and fires when `run[P] >= max((copies - 1) * P, fast_span)`.
 //!
-//! The shipped span is 1,024 tokens, so a legitimate 400-token identical run
-//! (a zero array, a table row) does not abort; rule R still catches a real loop
-//! with a short period.
+//! The two rules are **disjoint by period**: rule F owns short units
+//! (`period <= FAST_WINDOW`, i.e. 1..=256) and rule R owns long blocks
+//! (`period > FAST_WINDOW`). Without that gate rule R would fire first for every
+//! `period <= 80` (rule R at `7P + 543`, rule F at `P + 1024`), so a period-1
+//! run would abort at 550 tokens instead of the documented 1,024-token patience.
+//! With the gate the shipped span is 1,024 tokens for every short-period repeat,
+//! so a legitimate 400-token identical run (a zero array, a table row) does not
+//! abort, and a period-1 run aborts at 1,025 tokens (rule F), not 550.
 //!
 //! Both rules are off when their knob is zero (`run == 0`, `fast_span == 0`).
 
@@ -30,6 +35,10 @@ use std::hash::{Hash, Hasher};
 pub(crate) const WINDOW: usize = 32;
 /// The ring width for rule F (design §9: `period` in `1..=256`).
 pub(crate) const FAST_WINDOW: usize = 256;
+/// Rule R only considers periods longer than rule F's window, so the two rules
+/// are disjoint by period (rule F owns 1..=256, rule R owns 257+). See the
+/// module doc for why the overlap had to be removed.
+pub(crate) const MIN_REPEAT_PERIOD: usize = FAST_WINDOW + 1;
 /// The most distinct shingles rule R remembers; beyond this it stops inserting
 /// and never fires on a new shingle (design §3, memory bound).
 pub(crate) const MAX_ENTRIES: usize = 65_536;
@@ -37,9 +46,10 @@ pub(crate) const MAX_ENTRIES: usize = 65_536;
 /// Which rule fired, so the abort log can name it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LoopHit {
-    /// Rule R: the eighth-or-later verbatim copy of a >= 543-token block.
-    /// `period` is the distance between the current shingle and its previous
-    /// occurrence (the block length), distinct from the span from the first copy.
+    /// Rule R: the eighth-or-later verbatim copy of a block longer than rule F's
+    /// window (`period >= MIN_REPEAT_PERIOD`). `period` is the distance between
+    /// the current shingle and its previous occurrence (the block length),
+    /// distinct from the span from the first copy.
     Repeat { period: usize },
     /// Rule F: `copies` identical copies of a short unit of `period` tokens.
     Fast { period: u32 },
@@ -47,7 +57,8 @@ pub(crate) enum LoopHit {
 
 /// One shingle's history: occurrences so far (saturating at `copies`), the
 /// pushed index at which the shingle was first seen, and the pushed index of
-/// its most recent occurrence (for the rule-R period).
+/// its most recent occurrence (for the rule-R period). Both indices are the
+/// `pushed` value of the sighting, so `pushed - last` is exactly the period.
 #[derive(Clone, Copy)]
 struct Shingle {
     count: u16,
@@ -122,7 +133,7 @@ impl RepeatGuard {
                 }
                 None => {
                     if self.counts.len() < MAX_ENTRIES {
-                        self.counts.insert(hash, Shingle { count: 1, first: pushed - WINDOW, last: pushed - WINDOW });
+                        self.counts.insert(hash, Shingle { count: 1, first: pushed, last: pushed });
                     }
                 }
             }
@@ -131,7 +142,13 @@ impl RepeatGuard {
                     self.first_seen_at = self.counts.get(&hash).map(|s| s.first);
                 }
                 self.consecutive += 1;
-                if self.consecutive >= self.run {
+                // Rule R is the long-block detector: only periods beyond rule F's
+                // window may fire it (see the module doc). `period` is the
+                // distance to the previous sighting, which is the block length
+                // once the shingle is on its `copies`-th sighting.
+                if self.consecutive >= self.run
+                    && period.is_some_and(|p| p >= MIN_REPEAT_PERIOD)
+                {
                     hit = Some(LoopHit::Repeat { period: period.unwrap_or(0) });
                 }
             } else {
@@ -316,6 +333,17 @@ mod tests {
         assert_eq!(at, 7 * 600 + 31 + 512);
     }
 
+    /// N3: a hit on a shingle's *second* sighting must report the true period,
+    /// not `period + WINDOW`. Reachable with `--loop-abort-copies 2` when
+    /// `run < period`; the shipped 8 copies never hit this path.
+    #[test]
+    fn second_sighting_reports_the_true_period() {
+        let unit = block(600, 16);
+        let mut guard = RepeatGuard::new(512, 2, 0, 8);
+        let (_, hit) = feed(&mut guard, &repeat(&unit, 2)).expect("the second copy fires");
+        assert_eq!(hit, LoopHit::Repeat { period: 600 });
+    }
+
     #[test]
     fn repeat_hit_reports_the_block_period() {
         let unit = block(600, 9);
@@ -398,6 +426,61 @@ mod tests {
         // A table row repeated 50 times (period 8) is legitimate output.
         let mut guard = shipped();
         assert!(feed(&mut guard, &repeat(&block(8, 11), 50)).is_none());
+    }
+
+    /// V2: rule R is gated to periods beyond rule F's window, so a period-1 run
+    /// is protected by the full 1,024-token span. Without the gate rule R would
+    /// fire at 550 tokens (7P + 543 for P = 1).
+    #[test]
+    fn identical_run_below_rule_f_span_does_not_abort() {
+        let mut guard = shipped();
+        assert!(feed(&mut guard, &[0u32; 1024]).is_none(), "1,024 identical tokens are below rule F's span");
+    }
+
+    /// V2: the same period-1 run aborts at exactly 1,025 tokens, via rule F.
+    #[test]
+    fn identical_run_fires_rule_f_at_span() {
+        let mut guard = shipped();
+        let (at, hit) = feed(&mut guard, &[0u32; 1025]).expect("rule F fires at the span");
+        assert_eq!(hit, LoopHit::Fast { period: 1 });
+        assert_eq!(at, 1 + 1024);
+    }
+
+    /// V2: a short-period repeat (period 8) also waits for rule F's span; rule R
+    /// never fires for it.
+    #[test]
+    fn short_period_repeat_waits_for_rule_f() {
+        let unit = block(8, 12);
+        let mut guard = shipped();
+        // 128 rows = 1,024 tokens: still below the span.
+        assert!(feed(&mut guard, &repeat(&unit, 128)).is_none());
+        let mut guard = shipped();
+        let (at, hit) = feed(&mut guard, &repeat(&unit, 200)).expect("rule F fires");
+        assert_eq!(hit, LoopHit::Fast { period: 8 });
+        assert_eq!(at, 8 + 1024);
+    }
+
+    /// V2: rule R still owns long blocks (period > 256), which rule F cannot see.
+    #[test]
+    fn long_block_still_fires_rule_r() {
+        let unit = block(300, 13);
+        let mut guard = shipped();
+        let (at, hit) = feed(&mut guard, &repeat(&unit, 10)).expect("rule R fires");
+        assert_eq!(hit, LoopHit::Repeat { period: 300 });
+        assert_eq!(at, 7 * 300 + 31 + 512);
+    }
+
+    /// V2: the boundary is rule F's window. A period-256 unit is rule F's; a
+    /// period-257 unit is rule R's.
+    #[test]
+    fn rule_r_is_gated_to_periods_above_the_fast_window() {
+        let mut guard = shipped();
+        let (_, hit) = feed(&mut guard, &repeat(&block(256, 14), 9)).expect("rule F fires");
+        assert_eq!(hit, LoopHit::Fast { period: 256 }, "period 256 belongs to rule F");
+
+        let mut guard = shipped();
+        let (_, hit) = feed(&mut guard, &repeat(&block(257, 15), 10)).expect("rule R fires");
+        assert_eq!(hit, LoopHit::Repeat { period: 257 }, "period 257 belongs to rule R");
     }
 
     #[test]

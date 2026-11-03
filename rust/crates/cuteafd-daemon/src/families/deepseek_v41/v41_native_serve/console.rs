@@ -237,7 +237,7 @@ mod tests {
         // A loop abort accepts the drafts but truncates the emissions: the
         // console must not report more accepted tokens than were emitted.
         let inputs = vec![vec![10, 11, 12, 13, 14]];
-        let proposal = Proposal { drafted: [4, 0, 0, 0, 0, 0, 0, 0], tokens: Vec::new() };
+        let proposal = Proposal { drafted: vec![4], tokens: Vec::new() };
         let tally = Tally::new(proposal, &inputs, &[5], &[vec![11]], None);
         assert_eq!(&tally.verified[..1], &[4]);
         assert_eq!(&tally.emitted[..1], &[1]);
