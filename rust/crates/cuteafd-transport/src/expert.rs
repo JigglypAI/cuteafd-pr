@@ -959,7 +959,7 @@ mod tests {
             assert_eq!(native.output_row_bytes()?, stride);
             let payload = vec![0; 65 * stride as usize];
             let response = native.response(11, &payload)?;
-            let frame = response.encode()?;
+            let frame = response.to_owned()?.encode()?;
             let mut planes = V41Tp4Planes::new_ranks(&native, &[11])?;
             assert_eq!(planes.insert(&frame)?, 0);
             let mut mismatch = owned.clone();
@@ -997,11 +997,11 @@ mod tests {
             owned.select_combined_reply(format)?;
             let encoded = owned.encode()?;
             let request = BackboneRequest::parse_native_group(&encoded, 65, topology)?;
-            let ranks = (0..4).map(|r| topology.executor_id(r)).collect::<Result<Vec<_>>>()?;
+            let ranks = topology.executor_ids();
             let mut planes = V41Tp4Planes::new_ranks(&request, &ranks)?;
             for (rank, executor) in ranks.iter().enumerate() {
                 let response = request.response(*executor, &vec![0; request.plane_bytes()?])?;
-                assert_eq!(planes.insert(&response.encode()?)?, rank);
+                assert_eq!(planes.insert(&response.to_owned()?.encode()?)?, rank);
             }
             assert!(planes.complete());
         }
