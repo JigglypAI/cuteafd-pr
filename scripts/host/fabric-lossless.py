@@ -229,7 +229,7 @@ def persist(role):
 Description=cuteafd lossless RoCE NIC policy ({role})
 After=network-online.target
 Wants=network-online.target
-ConditionPathIsExecutable=/usr/local/lib/cuteafd/fabric-lossless.py
+ConditionFileIsExecutable=/usr/local/lib/cuteafd/fabric-lossless.py
 
 [Service]
 Type=oneshot

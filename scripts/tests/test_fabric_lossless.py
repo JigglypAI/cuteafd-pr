@@ -237,6 +237,7 @@ def test_fabric_persist_prints_root_owned_unit_without_writes(tmp_path, role):
     assert 'cuteafd-fabric-lossless.service' in result.stdout
     assert 'After=network-online.target' in result.stdout
     assert 'Wants=network-online.target' in result.stdout
+    assert 'ConditionFileIsExecutable=/usr/local/lib/cuteafd/fabric-lossless.py' in result.stdout
     assert 'Type=oneshot' in result.stdout and 'RemainAfterExit=yes' in result.stdout
     assert '/home/' not in result.stdout and str(tmp_path) not in result.stdout
     assert not list(tmp_path.iterdir())
