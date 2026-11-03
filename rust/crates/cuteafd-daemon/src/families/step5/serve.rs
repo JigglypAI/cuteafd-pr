@@ -389,11 +389,18 @@ fn with_backend<T>(args: &ServeArgs,
     use crate::shared::experts::rtx::{dense, push::{CoordinatorPush, PushPolicy}};
     let native_start = std::time::Instant::now();
     let policy = PushPolicy::for_snapshot(&args.snapshot)?;
+    let load = || TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Gpu, || -> Result<_> {
+        let native = Execution::load_native_with_plan(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
+            inputs.unit_rows(), inputs.rows, inputs.logit_rows(), &available, &reserves, 92, &native_plan)?;
+        let mtp = predictor_budget.map(|(available, reserved)| native.load_predictor(
+            &programs, &checkpoint, &caches[head_rank].borrow(), stages[head_rank].stream.clone(),
+            usize::from(args.mtp), inputs.unit_rows(), available, &[reserved])).transpose()?;
+        Ok((native, mtp))
+    });
     let planned = policy.plan(|| -> Result<_> {
         ensure!(spark_admission.coordinator_pushes(), "Step-5 Spark admission did not select required push");
         let recorder = dense::Recorder::start(true)?.context("dense recorder")?;
-        let loaded = Execution::load_native_with_plan(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
-            inputs.unit_rows(), inputs.rows, inputs.logit_rows(), &available, &reserves, 92, &native_plan);
+        let loaded = load();
         let records = recorder.finish();
         let loaded = loaded?;
         let (landed, operands, staged, steps, largest, finishes) = records.summary();
@@ -416,45 +423,42 @@ fn with_backend<T>(args: &ServeArgs,
         "Step-5 startup native preparation complete");
     let push_start = std::time::Instant::now();
     let pending = spark_admission.start_with(&args.peers, ranks)?;
-    let (embedding, native) = crate::shared::placement::load_while_admitting(Some(pending), || {
-        TokenEmbedding::load(&library, source, EmbedPlacement::Gpu, || -> Result<super::execution::LoadedNative<'_>> {
-            let (native, mut pushed) = match coordinator {
-                Some((push, loaded, records, dense)) => {
-                    let split = crate::shared::memory::load_timing::Split::start();
-                    let (received, ()) = push.receive_with(devices.clone(), Some(&catalog), args.peers.len(), Some(Ok(dense)), || ());
-                    let pushed = policy.committed(received)?;
-                    split.log("step5 dense and onboarded expert push");
-                    tracing::info!(operands = records.operands.len(), steps = records.steps.len(),
-                        "Step-5 coordinator dense operands landed");
-                    (loaded, pushed)
-                }
-                None => (Execution::load_native_with_plan(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
-                    inputs.unit_rows(), inputs.rows, inputs.logit_rows(),
-                    &available, &reserves, 92, &native_plan)?, None),
-            };
-            // Onboarded EXL3 routed layers inside their solved expert arenas:
-            // TP2 halves over two GPUs, else whole on the entry GPU.
-            let entry = usize::from(ownership.execution().spec().entry_gpu);
-            let onboarded = ownership.onboarded_layers();
-            if onboarded.is_empty() { return Ok(native); }
-            let budget = onboarded_budget.context("Step-5 onboarded layers without a solved expert arena")?;
-            let package = budget.package(&format, &args.native_lib)?;
-            match budget {
-                OnboardBudget::Whole(peak) => {
-                    let payload = pushed.take().map(|ranks| {
-                        ensure!(ranks.len() == 1, "Step-5 whole expert payload requires one coordinator rank");
-                        ranks.into_iter().next().context("Step-5 whole expert payload")
-                    }).transpose()?;
-                    native.with_onboarded(devices[entry], &catalog, &package, onboarded, inputs.unit_rows(), peak, payload)
-                }
-                OnboardBudget::Tp2(peaks) => {
-                    let payload = pushed.take().map(|ranks| <[_; 2]>::try_from(ranks)
-                        .map_err(|_| anyhow::anyhow!("Step-5 TP2 payload requires two coordinator ranks"))).transpose()?;
-                    native.with_onboarded_tp2([devices[0], devices[1]], &catalog, &package, onboarded,
-                        inputs.unit_rows(), peaks, payload)
-                }
+    let (embedding, native, mtp) = crate::shared::placement::load_while_admitting(Some(pending), || {
+        let ((embedding, (native, mtp)), mut pushed) = match coordinator {
+            Some((push, loaded, records, dense)) => {
+                let split = crate::shared::memory::load_timing::Split::start();
+                let (received, ()) = push.receive_with(devices.clone(), Some(&catalog), args.peers.len(), Some(Ok(dense)), || ());
+                let pushed = policy.committed(received)?;
+                split.log("step5 dense and onboarded expert push");
+                tracing::info!(operands = records.operands.len(), steps = records.steps.len(),
+                    "Step-5 coordinator dense operands landed");
+                (loaded, pushed)
             }
-        })
+            None => (load()?, None),
+        };
+        // Onboarded EXL3 routed layers inside their solved expert arenas:
+        // TP2 halves over two GPUs, else whole on the entry GPU.
+        let entry = usize::from(ownership.execution().spec().entry_gpu);
+        let onboarded = ownership.onboarded_layers();
+        if onboarded.is_empty() { return Ok((embedding, native, mtp)); }
+        let budget = onboarded_budget.context("Step-5 onboarded layers without a solved expert arena")?;
+        let package = budget.package(&format, &args.native_lib)?;
+        let native = match budget {
+            OnboardBudget::Whole(peak) => {
+                let payload = pushed.take().map(|ranks| {
+                    ensure!(ranks.len() == 1, "Step-5 whole expert payload requires one coordinator rank");
+                    ranks.into_iter().next().context("Step-5 whole expert payload")
+                }).transpose()?;
+                native.with_onboarded(devices[entry], &catalog, &package, onboarded, inputs.unit_rows(), peak, payload)
+            }
+            OnboardBudget::Tp2(peaks) => {
+                let payload = pushed.take().map(|ranks| <[_; 2]>::try_from(ranks)
+                    .map_err(|_| anyhow::anyhow!("Step-5 TP2 payload requires two coordinator ranks"))).transpose()?;
+                native.with_onboarded_tp2([devices[0], devices[1]], &catalog, &package, onboarded,
+                    inputs.unit_rows(), peaks, payload)
+            }
+        }?;
+        Ok((embedding, native, mtp))
     })?;
     tracing::info!(elapsed_s = push_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup weight delivery complete");
@@ -473,9 +477,6 @@ fn with_backend<T>(args: &ServeArgs,
     library.cuda_set_device(args.device)?;
     let execution = Execution::bind_native(&checkpoint, ownership, native, caches_ref, stages_ref, inputs.rows,
         Some(transport), 92, 1)?;
-    let mtp = predictor_budget.map(|(available, reserved)| super::mtp::Runtime::load(
-        &execution, &programs, &checkpoint, &caches[head_rank].borrow(),
-        usize::from(args.mtp), inputs.unit_rows(), available, &[reserved])).transpose()?;
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?
         .with_full_prefill_logits(args.full_prefill_logits)
         .with_prefill_depth(crate::shared::prefill_depth::PrefillDepth::new(usize::from(args.prefill_waves),

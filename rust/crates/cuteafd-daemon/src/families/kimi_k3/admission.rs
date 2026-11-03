@@ -15,6 +15,11 @@ const EXECUTOR: ExecutorModes = families::KIMI_K3;
 const MODES: &[LayerMode] = EXECUTOR.modes;
 const DRAFT_MARKS: &str = "Kimi exact draft windows";
 
+fn push_resident_budgets(peaks: [usize; 2], workspace: usize) -> Result<[usize; 2]> {
+    Ok([peaks[0].checked_sub(workspace).context("Kimi rank 0 workspace exceeds expert peak")?,
+        peaks[1].checked_sub(workspace).context("Kimi rank 1 workspace exceeds expert peak")?])
+}
+
 /// Diagnostic inventories retain checkpoint numerics and select only a prefix.
 pub(super) fn prefix(cfg: &KimiK3Config, layers: usize) -> Result<KimiK3Config> {
     ensure!((1..=cfg.layers).contains(&layers), "Kimi prefix layer count outside checkpoint");
@@ -263,8 +268,11 @@ impl<'a> Admission<'a> {
             tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
                 "Kimi coordinator dense records planned");
             let dense = dense::plan_records(&checkpoint.snapshot, records.clone(), &devices, peers.len())?;
-            let experts = rtx.as_ref().map(|(layers, budgets, _)| CoordinatorExperts::Tp2 { layers: layers.clone(),
-                budgets: budgets.to_vec() });
+            let experts = rtx.as_ref().map(|(layers, budgets, _)| -> Result<_> {
+                let workspace = self.rtx.as_ref().context("Kimi missing TP2 inventory")?.workspace;
+                Ok(CoordinatorExperts::Tp2 { layers: layers.clone(),
+                    budgets: push_resident_budgets(*budgets, workspace)?.to_vec() })
+            }).transpose()?;
             let prepared = CoordinatorPush::prepare(&checkpoint.snapshot, Some(catalog), 2, experts)?;
             Ok((prepared, owners, records, dense))
         })?;
@@ -294,8 +302,8 @@ impl<'a> Admission<'a> {
         Ok((pending, experts, self.register(devices, weights)?))
     }
 
-    /// The admitted TP2 expert layers and per-rank weight budgets (workspace
-    /// excluded), or none.
+    /// The admitted TP2 expert layers and binder peaks (one lane's workspace
+    /// retained), or none. Push offers subtract that final workspace separately.
     #[allow(clippy::type_complexity)]
     fn rtx_plan(&self, devices: [Device<'a>; 2]) -> Result<Option<(Vec<usize>, [usize; 2], std::path::PathBuf)>> {
         let Some(inventory) = &self.rtx else { return Ok(None) };
@@ -796,6 +804,18 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[test]
+    fn push_payload_cannot_spend_the_binders_execution_workspace() -> Result<()> {
+        let peaks = [4096, 8192];
+        let resident = push_resident_budgets(peaks, 1024)?;
+        assert_eq!(resident, [3072, 7168]);
+        for rank in 0..2 { assert_eq!(resident[rank] + 1024, peaks[rank]); }
+        assert_eq!(push_resident_budgets([1024; 2], 1024)?, [0; 2]);
+        assert!(push_resident_budgets([1023, 8192], 1024).is_err());
+        assert!(push_resident_budgets([4096, 1023], 1024).is_err());
+        Ok(())
+    }
 
     /// The unit admission derives for these test inputs.
     pub(in crate::families::kimi_k3) fn test_unit(rows: usize, waves: usize, unit: Option<usize>) -> usize {

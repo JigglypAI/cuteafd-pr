@@ -474,6 +474,17 @@ impl<'e, 'a> Execution<'e, 'a> {
 pub(super) struct LoadedNative<'a>(NativeOwners<'a>);
 
 impl<'a> LoadedNative<'a> {
+    /// Predictor weights share the target's admitted owners before publication.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn load_predictor(&self, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        cache: &CacheRank<'a>, stream: Rc<crate::shared::memory::device::Stream<'a>>,
+        depth: usize, rows: usize, available: u64, reservations: &[u64]) -> Result<super::mtp::Runtime<'a>> {
+        let rank = cache.rank();
+        super::mtp::Runtime::load(&self.0.contract, self.0.rope.get(rank).context("Step-5 predictor rope rank")?.clone(),
+            self.0.arenas.get(rank).context("Step-5 predictor arena rank")?, stream,
+            programs, checkpoint, cache, depth, rows, available, reservations)
+    }
+
     /// Loads the solver's onboarded routed layers whole on `device` (the entry
     /// GPU) from the installed `rtx-tp1` package, inside `budget` bytes.
     pub(super) fn with_onboarded(mut self, device: Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
@@ -861,18 +872,6 @@ impl<'e, 'a> Execution<'e, 'a> {
             };
             resource::worker_group_rows_for_input(&reports, layer, rows, ffn.wire_dtype() == ExpertV2Dtype::Bf16)
         })
-    }
-    pub(super) fn predictor_contract(&self) -> &CoordinatorContract {
-        &self.main.native.contract
-    }
-    pub(super) fn predictor_rope(&self) -> Rc<TargetTables<'a>> {
-        self.main.native.rope[self.ownership().execution().spec().head_gpu as usize].clone()
-    }
-    pub(super) fn predictor_arena(&self) -> &Arena<'a> {
-        &self.main.native.arenas[self.ownership().execution().spec().head_gpu as usize]
-    }
-    pub(super) fn predictor_stream(&self) -> Rc<crate::shared::memory::device::Stream<'a>> {
-        self.main.stages[self.ownership().execution().spec().head_gpu as usize].stream.clone()
     }
     pub(super) fn poison_scratch_between_layers(&self) { self.main.poison_scratch.set(true); }
     pub(super) fn retain_diagnostic_outputs(&self, layers: &[usize]) -> Result<()> {
@@ -1715,8 +1714,6 @@ mod tests {
         let start = swa.find("pub(super) fn for_mtp_stage(").context("MTP constructor")?;
         let end = start + swa[start..].find("\n    }").context("MTP constructor end")?;
         assert!(swa[start..end].contains("Some(contract)"));
-        let mtp = include_str!("mtp.rs");
-        assert!(mtp.contains("cache.layout().kv_format, execution.predictor_contract())?"));
         Ok(())
     }
 
