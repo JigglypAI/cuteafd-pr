@@ -38,8 +38,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("library")
     parser.add_argument("--shape", action="append", help="restrict to K,N; repeatable")
+    parser.add_argument("--support-library", help="load native dependencies for isolated translation-unit iteration")
     args = parser.parse_args()
+    support = ct.CDLL(args.support_library, mode=ct.RTLD_GLOBAL) if args.support_library else None
     library = ct.CDLL(args.library)
+    blas = ct.CDLL("libcublas.so.12")
+    handle = ct.c_void_p()
+    blas.cublasCreate_v2.argtypes = [ct.POINTER(ct.c_void_p)]
+    blas.cublasSetStream_v2.argtypes = [ct.c_void_p, ct.c_void_p]
+    blas.cublasDestroy_v2.argtypes = [ct.c_void_p]
+    blas.cublasGemmEx.argtypes = [ct.c_void_p, ct.c_int, ct.c_int, ct.c_int, ct.c_int,
+        ct.c_int, ct.c_void_p, ct.c_void_p, ct.c_int, ct.c_int, ct.c_void_p,
+        ct.c_int, ct.c_int, ct.c_void_p, ct.c_void_p, ct.c_int, ct.c_int,
+        ct.c_int, ct.c_int]
+    assert blas.cublasCreate_v2(ct.byref(handle)) == 0
+    assert blas.cublasSetStream_v2(handle, torch.cuda.current_stream().cuda_stream) == 0
+    alpha, beta = ct.c_float(1), ct.c_float(0)
     launch = library.cuteafd_cuda_linear_bf16_cublas_async
     launch.argtypes = [ct.c_void_p] * 4 + [ct.c_size_t] * 3 + [ct.c_void_p]
     launch.restype = ct.c_int
@@ -81,11 +95,17 @@ def main():
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(outputs[140], outputs[2048][:140]), (k, n, "graph")
-        # Compare against the default algorithm through torch's BF16 GEMM.
+        def default(input_, output):
+            # Exact old cublasGemmEx transposed-weight BF16/FP32 default call.
+            status = blas.cublasGemmEx(handle, 1, 0, n, input_.shape[0], k,
+                ct.byref(alpha), w.data_ptr(), 14, k, input_.data_ptr(), 14, k,
+                ct.byref(beta), output.data_ptr(), 14, n, 68, 99)
+            assert status == 0, (k, n, status)
+
         timing = {}
         for rows in (1, 16, 140, 2048):
             out = outputs[rows]
-            arms = {"default": lambda: torch.mm(x[:rows], w.t(), out=out),
+            arms = {"default": lambda: default(x[:rows], out),
                     "candidate": lambda: run(x[:rows], out)}
             for arm, operation in arms.items():
                 operation()
