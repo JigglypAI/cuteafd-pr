@@ -563,8 +563,8 @@ mod tests {
         assert_eq!(defaults.spark_budget_bytes(), cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES);
         assert_eq!(defaults.expert_partial_bf16_max_rows, 64);
         assert_eq!(cuteafd_core::SparkReplyFormat::resolve(None, true), cuteafd_core::SparkReplyFormat::Nvfp4);
-        assert!(args(&["--peers", PEERS, "--expert-partial-wide-format", "fp8"]).is_ok());
-        assert!(args(&["--peers", PEERS, "--expert-partial-wide-format", "bf16"]).is_err());
+        assert!(args(&["--peers", PEERS, "--spark-reply-format", "fp8"]).is_ok());
+        assert!(args(&["--peers", PEERS, "--spark-reply-format", "bf16"]).is_ok());
         args(&["--peers", PEERS, "--expert-partial-bf16-max-rows", "4096"])?.validate()?;
         let single = args(&["--peers", PEERS, "--device", "1"])?;
         single.validate()?;

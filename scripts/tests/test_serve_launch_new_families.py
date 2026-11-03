@@ -501,7 +501,7 @@ def test_muse_dispatches_to_serve_muse_with_its_own_defaults(tmp_path: Path) -> 
     assert _flag(serve, "--prefix-cache-entries") == "20"
     assert _flag(serve, "--vision") == _flag(serve, "--audio") == "off"
     for absent in ("--max-context", "--pool-tokens", "--draft", "--mtp", "--kv-cache",
-                   "--prefill-packing", "--expert-partial-bf16-max-rows", "--expert-partial-wide-format"):
+                   "--prefill-packing", "--expert-partial-bf16-max-rows", "--spark-reply-format"):
         assert absent not in serve.split(), absent
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
     assert len(workers) == 6 and all("--world 6 " in worker for worker in workers)

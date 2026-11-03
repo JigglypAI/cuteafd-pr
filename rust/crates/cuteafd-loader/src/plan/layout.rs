@@ -123,8 +123,7 @@ pub struct LayoutOptions {
     pub kimi_drafter_snapshot: Option<std::path::PathBuf>,
     /// Muse Spark's DFlash2 drafter (opt-in), charged from its own config on the head GPU.
     pub muse_drafter_snapshot: Option<std::path::PathBuf>,
-    /// Muse Spark's partial-reply cutoff and wide format (serve-muse's
-    /// `--expert-partial-bf16-max-rows` / `--expert-partial-wide-format`).
+    /// Muse Spark's lossless partial-reply cutoff (`--expert-partial-bf16-max-rows`).
     pub muse_partial_bf16_max_rows: usize,
     pub kimi_draft_fp8: bool,
     pub mla_kv: cuteafd_core::MlaCacheFormat,
