@@ -1080,8 +1080,9 @@ impl Opened {
                 let resident = crate::shared::experts::fp8::Fp8Layer::bytes_for(&tensors, 1, 0, tensors.exact_slicing(1))?
                     .checked_mul(range.layers).context("MiMo whole expert size overflow")?;
                 ensure!(resident <= range.peak_bytes as usize, "MiMo whole expert residency exceeds admission");
-                Some(CoordinatorExperts::Whole { selections: (range.first..range.first + range.layers)
-                    .map(|layer| crate::shared::experts::layer::ExpertLayer::BackboneFull { layer }).collect(), budget: resident })
+                Some(CoordinatorExperts::Whole { owners: vec![crate::shared::experts::rtx::push::WholeOwner { rank: 0,
+                    selections: (range.first..range.first + range.layers)
+                        .map(|layer| crate::shared::experts::layer::ExpertLayer::BackboneFull { layer }).collect(), budget: resident }] })
             } else { None };
             let prepared = if sparks == 0 {
                 (CoordinatorPush::prepare_alone(&args.snapshot, self.catalog.as_ref(), devices.len(), experts)?, None)
