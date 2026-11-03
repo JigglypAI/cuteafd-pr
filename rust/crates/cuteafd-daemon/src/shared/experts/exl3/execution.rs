@@ -805,15 +805,22 @@ impl<'a> Exl3Execution<'a> {
     pub(crate) fn workspace_receipts(
         states: &[Self],
         prefix: &str,
+        location: cuteafd_loader::placement::planner::Location,
+        physical_device: i32,
         lifetime: cuteafd_loader::placement::planner::Lifetime,
     ) -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
         use cuteafd_core::memory_layout::Category;
-        use cuteafd_loader::placement::planner::{Allocation, Location, Receipt, View};
+        use cuteafd_loader::placement::planner::{Allocation, Device, Domain, Receipt, View};
+        ensure!(physical_device >= 0 && matches!((location.device, location.domain),
+            (Device::Coordinator(_), Domain::Device) | (Device::Spark(_), Domain::Managed)),
+            "EXL3 workspace requires a logical coordinator or Spark device");
         let receipt = |name: &str, buffer: CuteafdDeviceBuffer| -> Result<Receipt> {
+            ensure!(buffer.device_id == physical_device && buffer.bytes > 0 && !buffer.ptr.is_null(),
+                "EXL3 workspace {name} has an invalid extent or physical device");
             Ok(Receipt {
                 allocation: Allocation::buffer(
                     format!("{prefix}.{name}"),
-                    Location::coordinator(u8::try_from(buffer.device_id)?),
+                    location,
                     buffer.bytes as u64, lifetime, Category::Workspace, "EXL3 expert workspace",
                 ),
                 address: buffer.ptr as u64,
@@ -823,6 +830,7 @@ impl<'a> Exl3Execution<'a> {
         let mut shared: Option<&Rc<Exl3Workspace<'a>>> = None;
         let mut capacities = std::collections::BTreeSet::new();
         for state in states {
+            ensure!(state.device == physical_device, "EXL3 execution has a different physical device");
             ensure!(capacities.insert(state.capacity), "duplicate retained EXL3 capacity");
             if let Some(arena) = &state._shared_workspace {
                 if let Some(previous) = shared {

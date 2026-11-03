@@ -90,17 +90,18 @@ fn shared_capacity_scratch_matches_private_and_graph_replay() -> Result<()> {
     Ok(())
 }
 
-fn verify_workspace_receipts(states: &[Exl3Execution<'_>], manifests: &[serde_json::Value]) -> Result<()> {
+fn verify_workspace_receipts(states: &[Exl3Execution<'_>], manifests: &[serde_json::Value],
+    location: cuteafd_loader::placement::planner::Location, physical_device: i32) -> Result<()> {
     use cuteafd_loader::placement::planner::{self, *};
     let lifetime = Lifetime { first: Phase::Warmup, last: Phase::Growth };
     let layout = cuteafd_loader::serving_capacity::Exl3WorkspaceLayout::from_manifests(
         manifests, true)?;
     let facts = Facts {
-        allocations: layout.allocations("expert.test", Location::coordinator(1), lifetime),
+        allocations: layout.allocations("expert.test", location, lifetime),
         deferred: vec![], sequential: vec![], allowances: vec![],
     };
     let budgets = vec![Budget {
-        id: "fixture physical device".into(), locations: vec![Location::coordinator(1)],
+        id: "fixture physical device".into(), locations: vec![location],
         physical_bytes: 1 << 30, logical_bytes: 1 << 30,
         baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false },
         headroom: 0,
@@ -114,8 +115,16 @@ fn verify_workspace_receipts(states: &[Exl3Execution<'_>], manifests: &[serde_js
             prefill: PrefillShape { rows: 64, waves: 1 }, lanes: 1 },
         pool_tokens: 64, budgets, facts, phases,
     };
-    let receipts = Exl3Execution::workspace_receipts(states, "expert.test", lifetime)?;
+    let receipts = Exl3Execution::workspace_receipts(states, "expert.test", location, physical_device, lifetime)?;
     planner::reconcile(&plan, Phase::Warmup, &receipts)?;
+    assert!(receipts.iter().all(|receipt| receipt.allocation.location == location));
+    assert!(Exl3Execution::workspace_receipts(states, "expert.test", location, -1, lifetime).is_err());
+    assert!(Exl3Execution::workspace_receipts(states, "expert.test", location, 1-physical_device, lifetime).is_err());
+    for invalid in [Location::HOST, Location::PINNED,
+        Location { device: Device::Spark(0), domain: Domain::Device },
+        Location { device: Device::Coordinator(0), domain: Domain::Managed }] {
+        assert!(Exl3Execution::workspace_receipts(states, "expert.test", invalid, physical_device, lifetime).is_err());
+    }
     let physical: Vec<_> = receipts.iter().enumerate()
         .filter(|(_, r)| r.allocation.view.is_none()).map(|(i, _)| i).collect();
     assert_eq!(physical.iter().map(|&i| receipts[i].allocation.bytes).sum::<u64>(), layout.bytes()?);
@@ -128,7 +137,9 @@ fn verify_workspace_receipts(states: &[Exl3Execution<'_>], manifests: &[serde_js
             1 => { let mut extra = bad[physical[0]].clone(); extra.allocation.id.push_str(".unexpected"); bad.push(extra); },
             2 => bad[physical[0]].allocation.bytes += 1,
             3 => { bad[physical[0]].allocation.bytes += 1; bad[physical[1]].allocation.bytes -= 1; },
-            4 => bad[physical[0]].allocation.location = Location::coordinator(0),
+            4 => bad[physical[0]].allocation.location = if location == Location::coordinator(0) {
+                Location::coordinator(1)
+            } else { Location::coordinator(0) },
             5 => bad[physical[0]].address = 0,
             6 => bad[physical[1]].address = bad[physical[0]].address,
             7 => bad.iter_mut().find(|r| r.allocation.view.is_some()).unwrap().address += 1,
@@ -234,7 +245,22 @@ fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()
         // SAFETY: allocation-only CPU fixture; no queued work, launches or graphs.
         executions.push(unsafe { Exl3Execution::with_modules(&library, weights.clone(), modules, Some(workspace.clone()))? });
     }
-    verify_workspace_receipts(&executions, &[meta.clone(), wide])?;
+    use cuteafd_loader::placement::planner::{Device, Domain, Lifetime, Location};
+    let manifests = [meta.clone(), wide];
+    for location in [Location::coordinator(0), Location::coordinator(1),
+        Location { device: Device::Spark(3), domain: Domain::Managed }] {
+        verify_workspace_receipts(&executions, &manifests, location, 1)?;
+    }
+    executions[0].device = 0;
+    assert!(Exl3Execution::workspace_receipts(&executions, "expert.test", Location::coordinator(0),
+        1, Lifetime::RESIDENT).is_err());
+    executions[0].device = 1;
+    let binding = executions[0].workspace_bindings.values_mut().next().unwrap();
+    let original_device = binding.device_id;
+    binding.device_id = 0;
+    assert!(Exl3Execution::workspace_receipts(&executions, "expert.test", Location::coordinator(0),
+        1, Lifetime::RESIDENT).is_err());
+    executions[0].workspace_bindings.values_mut().next().unwrap().device_id = original_device;
     assert_eq!(fixture.events()?.chars().filter(|c| "KRW".contains(*c)).collect::<String>(), "KRWKR",
         "execution must consume the measured handles, never reload");
     // Dropping retained native contexts restores their own device even from a peer.
