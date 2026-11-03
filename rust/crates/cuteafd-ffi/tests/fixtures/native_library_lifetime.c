@@ -488,7 +488,10 @@ int cuteafd_cuda_event_synchronize(void *handle) {
         }
     }
     int status = ++drain_calls > drain_after ? drain_status : 0;
-    if (!status) finish_uploads(upload);
+    if (!status) {
+        finish_uploads(upload);
+        event('L'); /* Successful event completion, after every retained copy. */
+    }
     pthread_mutex_unlock(&upload_mutex);
     if (status) return status;
     return 0;

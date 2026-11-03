@@ -286,8 +286,9 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
                     };
                     ensure!(inflight.remove(&(slot as usize)), "duplicate release");
                     let events = fixture_events(&fixture)?;
-                    ensure!(events.contains('S'), "Release preceded CUDA completion");
                     let count = released.fetch_add(1, Ordering::Relaxed) + 1;
+                    ensure!(events.matches('L').count() >= count,
+                        "Release {count} preceded successful CUDA copy completion: {events}");
                     if matches!(mode, Mode::Delayed) && count <= 3 {
                         ensure!(slot != 0 && slot != 4,
                             "stalled stream released before three independent completions");

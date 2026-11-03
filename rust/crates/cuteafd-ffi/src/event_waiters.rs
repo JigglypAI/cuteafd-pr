@@ -53,6 +53,8 @@ impl EventWaiters {
                             let message = if unsafe { last_error(text.as_mut_ptr(), text.len()) } == 0 {
                                 // Do not rely on an erroneous DSO to terminate its message.
                                 text[text.len() - 1] = 0;
+                                // SAFETY: text is a live local buffer with its final byte
+                                // explicitly NUL-terminated immediately above.
                                 unsafe { CStr::from_ptr(text.as_ptr()) }.to_string_lossy().into_owned()
                             } else { "last error unavailable".into() };
                             Err(anyhow::anyhow!("push copy event wait returned status {status}: {message}"))
