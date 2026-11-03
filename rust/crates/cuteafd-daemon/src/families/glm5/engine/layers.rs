@@ -90,7 +90,7 @@ impl<'a> GlmEngine<'a> {
         }
         let exchange = self.exchange()?;
         let mut hops = HopLink::new(self.library, [0, 1].map(|rank| RankDevice {
-            device: exchange.device(rank), stream: exchange.stream(rank) }), plan.hops(), spec)?;
+            device: exchange.device(rank), stream: exchange.stream(rank) }), plan.hops(), spec, DECODE_ROWS * self.cfg.hidden * 2)?;
         hops.attach_abort([exchange.abort_word(0)?.context("rank 0 abort")?, exchange.abort_word(1)?.context("rank 1 abort")?])?;
         hops.validate_binding(&plan, exchange)?;
         let owners: Vec<_> = self.weights.layers.iter().map(|layer| layer.attention_owner.unwrap()).collect();

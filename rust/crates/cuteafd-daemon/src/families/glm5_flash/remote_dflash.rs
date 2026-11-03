@@ -292,7 +292,7 @@ mod tests {
         let mask = embedding.host_rows(&[cfg.mask_token])?;
         for representation in [GlmDraftRepresentation::Fp8Only, GlmDraftRepresentation::Bf16Only] {
             let prepared = Prepared::new(&library, RankDevice { device: 0, stream: lead.raw },
-                RankDevice { device: 1, stream: peer_target.raw }, 0, IDENTITY)?;
+                RankDevice { device: 1, stream: peer_target.raw }, 0, IDENTITY, crate::shared::draft::remote::decode_extent(4 * cfg.block, cfg.hidden, cfg.vocab, 0)?)?;
             let local = DflashDrafter::load(&library, &draft_path, file.clone(), lead.raw, 4, 4,
                 mask.clone(), true, representation, Fp8Scales::Pow2, Fp8Rows::W8a8, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
             let draft_device = prepared.stream.device;

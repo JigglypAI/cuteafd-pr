@@ -193,6 +193,10 @@ pub(crate) struct PackedRoutes {
     pub bytes: usize,
 }
 impl PackedRoutes {
+    pub(crate) fn with_input_bytes(rows: usize, topk: usize, input_row_bytes: usize) -> usize {
+        Self::new(rows, topk).bytes + rows * input_row_bytes
+    }
+
     pub(crate) fn new(rows: usize, topk: usize) -> Self {
         let section = rows * topk * 4;
         let weights = section.next_multiple_of(16);
@@ -246,10 +250,11 @@ impl<'a> Pair<'a> {
         hidden: usize,
         topk: usize,
         max_rows: usize,
+        decode_rows: usize,
         lanes: usize,
         exchange: ExchangeDtype,
     ) -> Result<Self> {
-        Self::new_with_wire(library, devices, ranks, hidden, topk, max_rows, lanes, exchange, false)
+        Self::new_with_wire(library, devices, ranks, hidden, topk, max_rows, decode_rows, lanes, exchange, false)
     }
 
     /// As [`Self::new`]; with `wire`, each route slot also holds `max_rows`
@@ -264,10 +269,12 @@ impl<'a> Pair<'a> {
         hidden: usize,
         topk: usize,
         max_rows: usize,
+        decode_rows: usize,
         lanes: usize,
         exchange: ExchangeDtype,
         wire: bool,
     ) -> Result<Self> {
+        ensure!((1..=max_rows).contains(&decode_rows), "TP2 decode rows outside admission");
         let fp8 = ranks[0].uses_fp8_input();
         let wire_row_bytes = match (wire, fp8) { (false, _) => 0, (true, true) => hidden + hidden / 32, (true, false) => hidden * 2 };
         let layers = ranks[0].layers().to_vec();
@@ -297,6 +304,7 @@ impl<'a> Pair<'a> {
             devices,
             2 * lanes,
             PackedRoutes::new(max_rows, topk).bytes + max_rows * wire_row_bytes,
+            PackedRoutes::with_input_bytes(decode_rows, topk, wire_row_bytes),
         )?;
         for (rank, producer) in devices.into_iter().enumerate() {
             routes.require_cooperative_producer_stream(rank, producer)?;
@@ -1209,7 +1217,7 @@ mod tests {
         let enqueue = body("    pub(crate) unsafe fn enqueue(\n");
         assert!(enqueue.contains("(self.source.get() == RouteSource::Broadcast).then_some(Broadcast { source: 0, wire: false })"));
         let new = body("    pub(crate) fn new(\n");
-        assert!(new.contains("Self::new_with_wire(library, devices, ranks, hidden, topk, max_rows, lanes, exchange, false)"));
+        assert!(new.contains("Self::new_with_wire(library, devices, ranks, hidden, topk, max_rows, decode_rows, lanes, exchange, false)"));
         let with = source.split("    pub(crate) fn new_with_wire(").nth(1).unwrap();
         assert!(with.contains("let wire_row_bytes = match (wire, fp8) { (false, _) => 0,"));
         assert!(with.contains("PackedRoutes::new(max_rows, topk).bytes + max_rows * wire_row_bytes"));

@@ -175,8 +175,9 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         .collect::<Vec<_>>();
     let streams = [Rc::new(Stream::new(devices[0])?), Rc::new(Stream::new(devices[1])?)];
     let ranks = streams.each_ref().map(|s| RankDevice { device: s.device.id, stream: s.raw });
-    let peer = devices[0].run(|| PeerExchange::new_abortable(library, ranks, 1, exchange_recv_bytes(unit)?))?;
-    let mut hops = devices[0].run(|| HopLink::new(library, ranks, plan.hops(), plan.spec()))?;
+    let peer = devices[0].run(|| PeerExchange::new_abortable(library, ranks, 1, exchange_recv_bytes(unit)?, exchange_recv_bytes(unit.min(64))?))?;
+    let mut hops = devices[0].run(|| HopLink::new(library, ranks, plan.hops(), plan.spec(),
+        unit.min(64) * plan.spec().row_bytes as usize))?;
     hops.attach_abort([peer.abort_word(0)?.context("Kimi missing abort owner")?,
         peer.abort_word(1)?.context("Kimi missing abort owner")?])?;
     let lane_streams = [Rc::new(Stream::new(devices[0])?), Rc::new(Stream::new(devices[1])?)];
@@ -276,5 +277,24 @@ mod tests {
     fn missing_inventory_is_refused_without_native_or_device_access() {
         let dir = tempfile::tempdir().unwrap();
         assert!(super::preflight(&dir.path().join("share/absent.json"), &dir.path().join("lib/native.so")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod decode_extent_tests {
+    use super::*;
+
+    #[test]
+    fn declared_decode_extent_matches_native_projection_and_residual() -> Result<()> {
+        for capacity in [32usize, 64, 2048] {
+            let rows = capacity.min(64);
+            let actual = [rows * HIDDEN * 2, rows * 3584 * 2];
+            assert_eq!(exchange_recv_bytes(rows)?, actual.into_iter().max().unwrap());
+            for verify in [0, 16, 64] {
+                assert!(cuteafd_loader::families::kimi_k3::allocation::graph_rows(verify, capacity)
+                    .into_iter().all(|width| width <= rows));
+            }
+        }
+        Ok(())
     }
 }

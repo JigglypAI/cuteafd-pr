@@ -99,6 +99,9 @@ mod units;
 pub(crate) use cuteafd_loader::placement::families::glm5_flash::GlmfAttention;
 
 const HC: usize = 4;
+
+fn decode_peer_bytes(rows: usize, hidden: usize) -> usize { rows * HC * hidden * 2 }
+
 pub(crate) const PAGE_ROWS: usize = 64;
 /// Rows of the decode-route programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = 64;
@@ -2011,8 +2014,8 @@ impl<'a> GlmfEngine<'a> {
         }
         let routes = PeerExchange::new_abortable(self.library,
             [RankDevice { device: self.device, stream: self.stream }, RankDevice { device: peer.device, stream: peer.stream }],
-            2 * self.prefill_waves, PackedRoutes::new(self.prefill_rows.max(self.decode_rows), self.cfg.topk).bytes)?
-            .with_decode_lane_bytes(PackedRoutes::new(self.decode_rows, self.cfg.topk).bytes)?;
+            2 * self.prefill_waves, PackedRoutes::new(self.prefill_rows.max(self.decode_rows), self.cfg.topk).bytes,
+            PackedRoutes::new(self.decode_rows, self.cfg.topk).bytes)?;
         routes.trace_identity("glmf-tp2-routes");
         for (rank, producer) in [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device: peer.device, stream: peer.stream }].into_iter().enumerate() {
@@ -2705,8 +2708,8 @@ impl<'a> GlmfEngine<'a> {
             RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * self.prefill_waves,
             rows * self.cfg.hidden * (self.partial_bytes()
                 + if self.weights.layers.iter().chain(&layers).flat_map(|l| l.core.values())
-                    .any(|w| w.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input) { 2 } else { 0 }))?
-            .with_decode_lane_bytes(self.decode_rows * HC * self.cfg.hidden * 2)?;
+                    .any(|w| w.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input) { 2 } else { 0 }),
+            decode_peer_bytes(self.decode_rows, self.cfg.hidden))?;
         exchange.trace_identity("glmf-target-main");
         // Compact state belongs only to whole MLA owners, or to both context halves.
         ensure!(self.index_cache == IndexCache::Keys || self.context_mode.is_some()
@@ -6645,5 +6648,25 @@ mod packed_step_tests {
         let tables = StepTables { kv_slots: vec![0; 141], segments, ..Default::default() };
         assert_eq!(tables.spans(), [Span { first: 0, rows: 40 }, Span { first: 40, rows: 100 },
             Span { first: 140, rows: 1 }]);
+    }
+}
+
+#[cfg(test)]
+mod decode_extent_tests {
+    use super::*;
+
+    #[test]
+    fn declared_decode_extent_matches_mhc_and_route_transfers() {
+        for rows in [64, 128] {
+            for hidden in [4096, 6144] {
+                let residual = rows * HC * hidden * 2;
+                let partial_f32 = rows * hidden * 4;
+                let projection = rows * hidden * 2;
+                assert_eq!(decode_peer_bytes(rows, hidden),
+                    [residual, partial_f32, projection].into_iter().max().unwrap());
+                let routes = PackedRoutes::new(rows, 8);
+                assert_eq!(routes.bytes, (routes.weights + routes.section).next_multiple_of(16));
+            }
+        }
     }
 }
