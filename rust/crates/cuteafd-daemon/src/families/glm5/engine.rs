@@ -2117,9 +2117,9 @@ impl<'a> GlmEngine<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn step_lanes_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>, lanes: &[StepTables],
+    fn step_lanes_inner(&self, _scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>, lanes: &[StepTables],
         chunks: &[&[u32]], depth: crate::shared::prefill_depth::PrefillDepth, logit_rows: usize, link: &mut SparkLink<'_>,
-        runtime: &tokio::runtime::Runtime) -> Result<Option<StepLogits>> {
+        _runtime: &tokio::runtime::Runtime) -> Result<Option<StepLogits>> {
         // `lanes` are the call's units in order; at most `waves` are in flight,
         // unit `u` holding slot `u % waves` on both ranks.
         let waves = depth.waves.min(lanes.len()).max(1);
@@ -2723,11 +2723,11 @@ pub(crate) fn print_mla_check(layer: usize, stats: &[[f64; 3]; 5]) {
 /// GLM's per-unit hooks over the unchanged lane arithmetic. Unit `u` holds
 /// workspace slot `u % waves` (rank 0's and rank 1's) and that slot's
 /// exchange lane; its Spark waves go out on the prefill link, one return slot each.
-struct UnitHooks<'h, 'e, 'a, 'l, B, A, P> {
+struct UnitHooks<'h, 'a, 'l, B, A, P> {
     engine: &'h GlmEngine<'a>,
-    workspaces: &'h [&'h Workspace<'e>],
+    workspaces: &'h [&'h Workspace<'a>],
     /// Rank 1's workspace per slot (borrowed once for the call).
-    peers: &'h [Option<&'h Workspace<'e>>],
+    peers: &'h [Option<&'h Workspace<'a>>],
     layers: &'h [GlmLayer<'a>],
     counts: &'h [usize],
     begin: &'h B,
@@ -2746,7 +2746,7 @@ enum UnitTicket {
     Owned(layers::Ticket),
 }
 
-impl<B, A, P> crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, B, A, P>
+impl<B, A, P> crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, B, A, P>
 where B: Fn(usize) -> Result<()>,
       A: Fn(usize, usize) -> Result<()>,
       P: Fn(usize, usize, Option<([*const u16; MAX_RANKS], usize)>) -> Result<()> {
