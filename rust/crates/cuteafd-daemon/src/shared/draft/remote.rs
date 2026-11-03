@@ -11,7 +11,7 @@
 //! completion event ([`RemoteBridge::publish_context`]), never a host sync.
 use crate::shared::memory::device::{Device, Event, Stream};
 use crate::shared::peer_split::{PeerExchange, RankDevice, TerminalState};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::peer_exchange::PeerPlane;
 use cuteafd_ffi::NativeLibrary;
 use std::cell::Cell;
