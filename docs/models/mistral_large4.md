@@ -11,9 +11,9 @@ and [max, 2 RTX + 6 Sparks](../../examples/configs/mistral-large4-exl3-k4-core-k
 Gate cards `ml4-exl3-min` and `ml4-exl3-max` in
 `scripts/bench/kits/gate/matrix-ml4.json` use these recipes. TP2 expert
 onboarding, official-reference image fidelity, exact prefix restores and
-lossless speculation have passed on hardware. `auto` remains `layers`;
-`context` also passes correctness, with its default-promotion timing check
-pending a quiet-window follow-up.
+lossless speculation have passed on hardware. On two GPUs, `auto` selects
+`context` after correctness and interleaved throughput qualification;
+explicit `layers` remains available.
 
 ## How it runs
 
@@ -37,9 +37,9 @@ names.
   reference.
 - **Router and head:** a softmax top-4 of 128 experts, renormalized. The head
   is soft-capped with `tanh(x / 30) * 30`.
-- **Placement:** on two GPUs, `auto` resolves to whole-layer owners (`layers`).
-  A layer stays on the GPU of the layer whose latent and top-k it reads.
-  `heads` and `context` run GLM 5.3's head split with Mistral Large 4's
+- **Placement:** on two GPUs, `auto` resolves to `context`. Explicit `layers`
+  uses whole-layer owners: a layer stays on the GPU of the layer whose latent
+  and top-k it reads. `heads` and `context` run GLM 5.3's head split with Mistral Large 4's
   `ml42_*` share programs: each GPU projects its 32 heads and runs its half of
   `o`, followed by an all-reduce. Under `context`, each 64-row latent page
   lives once. GPUs exchange queries and run 64-head partials over their own

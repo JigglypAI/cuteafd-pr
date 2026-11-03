@@ -1447,7 +1447,7 @@ mod draft_tests {
         std::fs::write(dir.path().join("config.json"), include_str!(
             "../../../../cuteafd-loader/src/families/mistral_large4/official-config.json"))?;
         let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::read(dir.path())?;
-        for (placement, expected) in [("auto", "layers split"), ("layers", "layers split"),
+        for (placement, expected) in [("auto", "context split"), ("layers", "layers split"),
             ("context", "context split"), ("heads", "heads split")] {
             let args = Cli::try_parse_from(["test", "--snapshot", dir.path().to_str().unwrap(),
                 "--native-lib", "/unused", "--manifest", "/unused", "--split-device", "1",

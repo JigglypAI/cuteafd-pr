@@ -175,8 +175,8 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
             assert_eq!(spark.worker_budget_bytes, 108 << 30, "{ranks}+{gpus}");
             assert!(spark.worker_budget_bytes <= spark.capacity_bytes, "{ranks}+{gpus}");
         }
-        // auto: one GPU's heads, or two GPUs' whole-layer owners until context measures faster.
-        assert_eq!(report.attention_placement, if gpus == 2 { crate::placement::AttentionPlacement::Layers }
+        // auto: one GPU's heads, or the qualified context placement on two GPUs.
+        assert_eq!(report.attention_placement, if gpus == 2 { crate::placement::AttentionPlacement::Context }
             else { crate::placement::AttentionPlacement::Heads }, "{ranks}+{gpus}");
         let groups: std::collections::BTreeSet<_> = memory.devices[0].items.iter().map(|item| item.group.clone()).collect();
         for group in ["attention", "indexer", "embedding", "lm_head"] {
@@ -315,7 +315,20 @@ fn vision_on_two_rtx_reserves_the_tower_before_the_solve() {
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
     let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, &checkpoint).unwrap();
     let manifest = dir.path().join("PROGRAMS.json");
-    std::fs::write(&manifest, testing::glm_k6_programs(&cfg, &core).unwrap().to_string()).unwrap();
+    let mut programs = testing::glm_k6_programs(&cfg, &core).unwrap();
+    let entries = programs["programs"].as_array_mut().unwrap();
+    // Use admission's requirements, materializing its partial-count wildcard as s2.
+    let mut context: Vec<String> = crate::placement::families::glm5::context_program_list(&cfg)
+        .split(", ").map(|name| name.replace("_s*_", "_s2_")).collect();
+    context.extend(crate::families::glm5::core::ml4_split_programs(&cfg, true).unwrap());
+    for name in context {
+        if !entries.iter().any(|entry| entry["name"] == name) {
+            entries.push(serde_json::json!({
+                "name": name, "scratch_bytes_at_capacity": {"scratch": 256}
+            }));
+        }
+    }
+    std::fs::write(&manifest, programs.to_string()).unwrap();
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let plan = |ranks: usize, vision: MediaMode| {
         let mut options = layout_options(ranks, 2);

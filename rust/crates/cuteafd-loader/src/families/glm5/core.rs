@@ -190,6 +190,22 @@ impl CoreRankLayout {
     }
 }
 
+/// ML4 stages for each GPU's head share; Context writes into the combined query.
+pub(crate) fn ml4_split_programs(cfg: &GlmDsaConfig, context: bool) -> Result<Vec<String>> {
+    let split = cfg.split_program_family().context("Mistral Large 4 head split family")?;
+    let mut names = Vec::new();
+    for cap in ["m64", "m4096"] {
+        names.push(format!("{split}_values_{cap}"));
+        for tag in ["", "_nope"] {
+            names.push(format!("{split}_query_scale{tag}_{cap}"));
+            names.push(format!("{split}_absorb{tag}_{cap}"));
+            if context { names.push(format!("{split}_absorb{tag}_context_{cap}")); }
+        }
+        if context { names.push(format!("{split}_query_scale_context_{cap}")); }
+    }
+    Ok(names)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreCharges {
     pub ranks: Vec<CoreRankLayout>,
@@ -261,23 +277,13 @@ impl CoreCharges {
             // A head split (heads or context placement) runs each GPU's 32-head share
             // (`ml42_*`); context also writes the share into the combined query (`_context`).
             if ranks == 2 && owners.is_none() {
-                let split = cfg.split_program_family().context("Mistral Large 4 head split family")?;
                 let context = crate::placement::families::glm5::context_programs(cfg,
                     entries.iter().filter_map(|p| p["name"].as_str()),
                     |name| entries.iter().any(|p| p["name"] == name).then_some(0)).is_some();
-                for cap in ["m64", "m4096"] {
-                    let mut names = vec![format!("{split}_values_{cap}")];
-                    for tag in ["", "_nope"] {
-                        names.push(format!("{split}_query_scale{tag}_{cap}"));
-                        names.push(format!("{split}_absorb{tag}_{cap}"));
-                        if context { names.push(format!("{split}_absorb{tag}_context_{cap}")); }
-                    }
-                    if context { names.push(format!("{split}_query_scale_context_{cap}")); }
-                    for name in names {
-                        ensure!(entries.iter().filter(|p| p["name"] == name).count() == 1,
-                            "Mistral Large 4 head split requires {name}");
-                        programs.insert(name);
-                    }
+                for name in ml4_split_programs(cfg, context)? {
+                    ensure!(entries.iter().filter(|p| p["name"] == name).count() == 1,
+                        "Mistral Large 4 head split requires {name}");
+                    programs.insert(name);
                 }
             }
         } else if bodies.iter().any(|body| !body.is_empty()) {
