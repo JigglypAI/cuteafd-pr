@@ -1,4 +1,4 @@
-//! Native EXLR8 routed halves on the shared RTX paired-expert executor.
+//! Native EXLR8 routed experts on one RTX or the shared paired-expert executor.
 use super::native::RankCompletion;
 use super::{ExpertInput, PartialDtype, Routes, RtxExpertLayer, RtxShard};
 use crate::shared::experts::exlr8::{grouped_decode_from_row, view, Exlr8Execution, Exlr8PrefillActivations, Exlr8Weights};
@@ -11,8 +11,23 @@ use std::{ffi::c_void, rc::Rc};
 const DECODE_ROWS: usize = 64;
 const TP2_UNITS: usize = 8;
 
+fn native_shard(world: usize, rank: usize) -> Result<RtxShard> {
+    ensure!((1..=2).contains(&world) && rank < world, "EXLR8 RTX requires world 1 or 2 and a valid rank");
+    Ok(if world == 1 { RtxShard::Whole } else { RtxShard::Tp2 { rank: rank as u8 } })
+}
+
 #[cfg(test)]
 mod copy_tests {
+    #[test]
+    fn native_rtx_shards_follow_actual_world_and_rank() {
+        use super::{native_shard, RtxShard};
+        assert_eq!(native_shard(1, 0).unwrap(), RtxShard::Whole);
+        for rank in 0..2 { assert_eq!(native_shard(2, rank).unwrap(), RtxShard::Tp2 { rank: rank as u8 }); }
+        for (world, rank) in [(0, 0), (1, 1), (2, 2), (3, 0), (usize::MAX, 0)] {
+            assert!(native_shard(world, rank).is_err());
+        }
+    }
+
     #[test]
     fn all_decode_operands_use_the_shared_sm_copy_route() {
         use crate::shared::memory::device::sm_peer_copy_for;
@@ -33,9 +48,10 @@ mod copy_tests {
     use super::DECODE_ROWS;
 }
 
-pub(crate) struct Exlr8Tp2Weights<'a> {
+pub(crate) struct Exlr8RtxWeights<'a> {
     device: Device<'a>,
-    rank: u8,
+    shard: RtxShard,
+    unit_limit: usize,
     layers: Vec<usize>,
     programs: &'a Programs<'a>,
     max_rows: usize,
@@ -47,24 +63,30 @@ pub(crate) struct Exlr8Tp2Weights<'a> {
     weights: Rc<DeviceOwner<'a, Vec<Exlr8Weights<'a>>>>,
 }
 
-pub(crate) struct Exlr8Tp2<'a> {
+pub(crate) struct Exlr8Rtx<'a> {
     // Drain every consumer before releasing graph-visible scratch or weights.
     completion: RankCompletion<Event<'a>>,
-    owner: Exlr8Tp2Weights<'a>,
+    owner: Exlr8RtxWeights<'a>,
     executions: DeviceOwner<'a, Vec<Exlr8Execution<'a>>>,
     output: Allocation<'a>,
     sm_copy: cuteafd_ffi::V41PeerCopy<'a>,
 }
 
-impl<'a> Exlr8Tp2Weights<'a> {
+impl<'a> Exlr8RtxWeights<'a> {
     pub(crate) fn workspace_bytes(programs: &'a Programs<'a>, family: KernelFamily, max_rows: usize,
         activations: Exlr8PrefillActivations) -> Result<usize> {
+        Self::workspace_bytes_with_limit(programs, family, max_rows, TP2_UNITS, activations)
+    }
+
+    pub(crate) fn workspace_bytes_with_limit(programs: &'a Programs<'a>, family: KernelFamily,
+        max_rows: usize, unit_limit: usize, activations: Exlr8PrefillActivations) -> Result<usize> {
         ensure!((DECODE_ROWS..=4096).contains(&max_rows), "EXLR8 RTX row capacity");
+        ensure!((1..=family.geometry().units).contains(&unit_limit), "EXLR8 RTX unit capacity");
         let hidden = Exlr8Execution::routed_hidden(programs, family)?;
-        let compact = Exlr8Execution::decode_compact_workspace_bytes(programs, family, DECODE_ROWS, TP2_UNITS)?;
-        let grouped = Exlr8Execution::decode_grouped_workspace_bytes(programs, family, DECODE_ROWS, TP2_UNITS)?;
+        let compact = Exlr8Execution::decode_compact_workspace_bytes(programs, family, DECODE_ROWS, unit_limit)?;
+        let grouped = Exlr8Execution::decode_grouped_workspace_bytes(programs, family, DECODE_ROWS, unit_limit)?;
         let prefill = if max_rows > DECODE_ROWS {
-            Exlr8Execution::workspace_bytes_with_limit(programs, family, max_rows, ExpertSet::Routed, TP2_UNITS, activations)?
+            Exlr8Execution::workspace_bytes_with_limit(programs, family, max_rows, ExpertSet::Routed, unit_limit, activations)?
         } else { 0 };
         compact.checked_add(grouped).and_then(|bytes| bytes.checked_add(prefill))
             .and_then(|bytes| max_rows.checked_mul(hidden)?.checked_mul(2)?.checked_add(bytes))
@@ -74,48 +96,55 @@ impl<'a> Exlr8Tp2Weights<'a> {
     pub(crate) fn pushed_pair(devices: [Device<'a>; 2], programs: &'a Programs<'a>,
         layers: Vec<usize>, max_rows: usize, budgets: [usize; 2],
         activations: Exlr8PrefillActivations, pushed: [Vec<Exlr8Weights<'a>>; 2]) -> Result<[Self; 2]> {
+        let [left, right] = pushed;
+        Ok([Self::pushed_rank(devices[0], programs, layers.clone(), max_rows, budgets[0], activations, 2, 0, left)?,
+            Self::pushed_rank(devices[1], programs, layers, max_rows, budgets[1], activations, 2, 1, right)?])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pushed_rank(device: Device<'a>, programs: &'a Programs<'a>, layers: Vec<usize>,
+        max_rows: usize, budget: usize, activations: Exlr8PrefillActivations,
+        world: usize, rank: usize, weights: Vec<Exlr8Weights<'a>>) -> Result<Self> {
+        let shard = native_shard(world, rank)?;
         ensure!(!layers.is_empty() && layers.windows(2).all(|ids| ids[0] < ids[1]),
             "EXLR8 RTX needs ordered resident layer IDs");
-        let first = &pushed[0].first().context("EXLR8 TP2 has no pushed weights")?.layout;
+        let first = &weights.first().context("EXLR8 RTX has no pushed weights")?.layout;
         let expected = (first.hidden, first.units, first.experts);
         let family = KernelFamily::from_geometry(expected.0, expected.1, 8, expected.2)?;
         let hidden = Exlr8Execution::routed_hidden(programs, family)?;
-        let workspace_bytes = Self::workspace_bytes(programs, family, max_rows, activations)?;
-        let mut ranks = Vec::new();
-        for (rank, (device, weights)) in devices.into_iter().zip(pushed).enumerate() {
-            let info = device.library.cuda_device_info(device.id)?;
-            let grouped_from_row = grouped_decode_from_row(TP2_UNITS,
-                (info.compute_capability_major, info.compute_capability_minor));
-            ensure!(weights.len() == layers.len(), "EXLR8 pushed layer count differs from admission");
-            let resident = weights.iter().zip(&layers).try_fold(0usize, |sum, (weight, &layer)| {
-                ensure!(weight.layout.layer == layer && weight.layout.world == 2 && weight.layout.rank == rank
-                    && weight.layout.hidden == hidden && weight.layout.experts == expected.2
-                    && weight.layout.units == expected.1
-                    && weight.layout.set == ExpertSet::Routed && weight.layout.compact_unit_limit() <= TP2_UNITS,
-                    "EXLR8 pushed TP2 selection differs from admission");
-                sum.checked_add(weight.budget.resident_bytes).context("EXLR8 RTX residency overflow")
-            })?;
-            ensure!(resident.checked_add(workspace_bytes).is_some_and(|bytes| bytes <= budgets[rank]),
-                "EXLR8 RTX weights and execution exceed admitted peak");
-            let weights = device.own(|| Ok(weights))?;
-            ranks.push(Self { device, rank: rank as u8, layers: layers.clone(), programs,
-                max_rows, family, hidden, activations, workspace_bytes, grouped_from_row, weights: Rc::new(weights) });
-        }
-        ranks.try_into().map_err(|_| anyhow::anyhow!("EXLR8 needs two RTX owners"))
+        let unit_limit = first.compact_unit_limit();
+        let workspace_bytes = Self::workspace_bytes_with_limit(programs, family, max_rows, unit_limit, activations)?;
+        let info = device.library.cuda_device_info(device.id)?;
+        let grouped_from_row = grouped_decode_from_row(unit_limit,
+            (info.compute_capability_major, info.compute_capability_minor));
+        ensure!(weights.len() == layers.len(), "EXLR8 pushed layer count differs from admission");
+        let resident = weights.iter().zip(&layers).try_fold(0usize, |sum, (weight, &layer)| {
+            ensure!(weight.layout.layer == layer && weight.layout.world == world && weight.layout.rank == rank
+                && weight.layout.hidden == hidden && weight.layout.experts == expected.2
+                && weight.layout.units == expected.1 && weight.layout.set == ExpertSet::Routed
+                && weight.layout.compact_unit_limit() == unit_limit,
+                "EXLR8 pushed RTX selection differs from admission");
+            sum.checked_add(weight.budget.resident_bytes).context("EXLR8 RTX residency overflow")
+        })?;
+        ensure!(resident.checked_add(workspace_bytes).is_some_and(|bytes| bytes <= budget),
+            "EXLR8 RTX weights and execution exceed admitted peak");
+        let weights = device.own(|| Ok(weights))?;
+        Ok(Self { device, shard, unit_limit, layers, programs, max_rows, family, hidden,
+            activations, workspace_bytes, grouped_from_row, weights: Rc::new(weights) })
     }
 
-    pub(crate) fn execution(self) -> Result<Exlr8Tp2<'a>> {
+    pub(crate) fn execution(self) -> Result<Exlr8Rtx<'a>> {
         let device = self.device;
         let executions = device.own(|| {
             let mut executions = vec![
                 Exlr8Execution::new_decode_compact(device.library, self.programs, self.family, DECODE_ROWS,
-                    self.workspace_bytes, TP2_UNITS)?,
+                    self.workspace_bytes, self.unit_limit)?,
                 Exlr8Execution::new_decode_grouped(device.library, self.programs, self.family, DECODE_ROWS,
-                    self.workspace_bytes, TP2_UNITS)?,
+                    self.workspace_bytes, self.unit_limit)?,
             ];
             if self.max_rows > DECODE_ROWS {
                 executions.push(Exlr8Execution::new_with_limit(device.library, self.programs, self.family,
-                    self.max_rows, self.workspace_bytes, ExpertSet::Routed, TP2_UNITS, self.activations)?);
+                    self.max_rows, self.workspace_bytes, ExpertSet::Routed, self.unit_limit, self.activations)?);
             }
             for execution in &mut executions { execution.seal_graph_storage()?; }
             Ok(executions)
@@ -123,12 +152,12 @@ impl<'a> Exlr8Tp2Weights<'a> {
         let completion = RankCompletion::new(Event::new(device)?);
         let output = Allocation::new(device, self.max_rows * self.hidden * 2)?;
         let sm_copy = device.run(|| device.library.v41_peer_copy())?;
-        Ok(Exlr8Tp2 { completion, owner: self, executions, output, sm_copy })
+        Ok(Exlr8Rtx { completion, owner: self, executions, output, sm_copy })
     }
 }
 
-impl RtxExpertLayer for Exlr8Tp2<'_> {
-    fn shard(&self) -> RtxShard { RtxShard::Tp2 { rank: self.owner.rank } }
+impl RtxExpertLayer for Exlr8Rtx<'_> {
+    fn shard(&self) -> RtxShard { self.owner.shard }
     fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }
     fn uses_fp8_input(&self) -> bool { true }
     fn layers(&self) -> &[usize] { &self.owner.layers }
@@ -137,8 +166,9 @@ impl RtxExpertLayer for Exlr8Tp2<'_> {
     fn output(&self) -> *mut c_void { self.output.buffer.ptr }
     fn group_rows(&self, rows: usize) -> Result<usize> {
         ensure!(rows <= self.owner.max_rows, "EXLR8 grouping rows exceed admission");
-        let name = if rows == 0 || rows > DECODE_ROWS { "exlr8_a16_grouped" }
-            else { "exlr8_a16_serving" };
+        let kind = if rows == 0 || rows > DECODE_ROWS { cuteafd_ffi::exlr8::KernelKind::GroupedA16 }
+            else { cuteafd_ffi::exlr8::KernelKind::Routed };
+        let name = self.owner.family.program(kind);
         Ok(cuteafd_ffi::exlr8::group_rows(self.owner.programs.spec(name)?)?)
     }
     fn weight_read_bytes(&self) -> Result<usize> {
