@@ -1003,6 +1003,53 @@ def test_declared_processor_geometry_agrees_without_family_whitelist(tmp_path):
             processor_contract(tmp_path)
 
 
+@pytest.mark.parametrize("official_stride", [1920, 960])
+def test_muse_official_audio_stride_is_validated_without_mutating_property(monkeypatch, official_stride):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    import muse_spark_media
+
+    class AudioConfig:
+        @property
+        def samples_per_token(self):
+            return official_stride
+
+    config = SimpleNamespace(vision_config=SimpleNamespace(), audio_config=AudioConfig())
+    calls = []
+
+    class Tower:
+        def __init__(self, audio):
+            assert audio is config.audio_config
+            calls.append("construct")
+
+        def state_dict(self):
+            return {}
+
+        def load_state_dict(self, state, *, strict, assign):
+            assert state == {} and strict and assign
+
+        def eval(self):
+            calls.append("eval")
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(device=lambda _: nullcontext()))
+    monkeypatch.setitem(sys.modules, "transformers.models.muse_spark.configuration_muse_spark",
+                        SimpleNamespace(MuseSparkConfig=SimpleNamespace(from_pretrained=lambda *a, **k: config)))
+    monkeypatch.setitem(sys.modules, "transformers.models.muse_spark.modeling_muse_spark",
+                        SimpleNamespace(MuseSparkVisionModel=Tower, MuseSparkVisionAdapter=Tower,
+                                        MuseSparkAudioModel=Tower))
+    monkeypatch.setattr(muse_spark_media, "audio_contract", lambda _: {"samples_per_token": 1920})
+    monkeypatch.setattr(muse_spark_media.text, "Checkpoint",
+                        lambda _: SimpleNamespace(index={}, close=lambda: calls.append("close")))
+    if official_stride != 1920:
+        with pytest.raises(ValueError, match="samples_per_token differs"):
+            muse_spark_media.load_modules("unused", "audio", "bf16")
+        assert calls == []
+    else:
+        modules, loaded = muse_spark_media.load_modules("unused", "audio", "bf16")
+        assert len(modules) == 1 and loaded is config
+        assert calls == ["construct", "eval", "close"]
+
+
 def test_pcm_span_identity_geometry_and_feature_metadata(tmp_path):
     import struct
     from fidelity_media import read_pcm_fixture
