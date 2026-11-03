@@ -40,7 +40,7 @@ pub(crate) struct Exl3Weights<'a> {
 
 enum ArenaOwner<'a> {
     Mount(DeviceAllocation<'a>),
-    Push { _rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>> },
+    Push { _rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>>, region: usize },
 }
 
 struct WeightBuffer { buffer: CuteafdDeviceBuffer }
@@ -123,6 +123,84 @@ impl<'a> Exl3Weights<'a> {
         }
     }
 
+    /// Independent retained-owner census. Shared rank storage is charged once;
+    /// region and kernel views point directly to its actual physical address.
+    pub(crate) fn weight_receipts(
+        states: &[Self],
+        prefix: &str,
+        location: cuteafd_loader::placement::planner::Location,
+        physical_device: i32,
+        lifetime: cuteafd_loader::placement::planner::Lifetime,
+    ) -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{Allocation, Domain, Receipt, View};
+        use std::collections::BTreeSet;
+        ensure!(!prefix.is_empty() && !states.is_empty() && location.domain == Domain::Device,
+            "empty or invalid EXL3 weight census");
+        let receipt = |id: String, buffer: CuteafdDeviceBuffer| -> Result<Receipt> {
+            ensure!(buffer.device_id == physical_device && !buffer.ptr.is_null() && buffer.bytes > 0,
+                "EXL3 retained buffer has wrong physical device or empty address/extent");
+            let mut allocation = Allocation::buffer(
+                id, location, buffer.bytes as u64, lifetime, Category::Experts, "EXL3 expert weights");
+            allocation.alignment = 256;
+            Ok(Receipt { allocation, address: buffer.ptr as u64 })
+        };
+        let direct_view = |id: String, buffer: CuteafdDeviceBuffer, backing: &str,
+                           owner: CuteafdDeviceBuffer| -> Result<Receipt> {
+            let start = buffer.ptr as usize;
+            ensure!(start >= owner.ptr as usize && start.checked_add(buffer.bytes).is_some_and(|end|
+                (owner.ptr as usize).checked_add(owner.bytes).is_some_and(|limit| end <= limit)),
+                "EXL3 retained view exceeds physical owner");
+            let mut view = receipt(id, buffer)?;
+            view.allocation.view = Some(View {
+                backing: backing.into(), offset: (start - owner.ptr as usize) as u64,
+            });
+            Ok(view)
+        };
+        let pushed = match &states[0]._arena { ArenaOwner::Push { _rank, .. } => Some(_rank), _ => None };
+        let mut out = Vec::new();
+        let mut layers = BTreeSet::new();
+        let mut regions = BTreeSet::new();
+        if let Some(rank) = pushed {
+            out.push(receipt(format!("{prefix}.arena.rank"), rank.physical_buffer())?);
+        }
+        for state in states {
+            let name = match state.layout.layer {
+                V41Exl3Layer::Backbone(layer) => format!("target.{layer}"),
+                V41Exl3Layer::Dspark(stage) => format!("draft.{stage}"),
+            };
+            ensure!(layers.insert(name.clone()), "duplicate retained EXL3 layer");
+            let (backing, owner, region) = match (&state._arena, pushed) {
+                (ArenaOwner::Mount(arena), None) => {
+                    let backing = format!("{prefix}.arena.{name}");
+                    out.push(receipt(backing.clone(), arena.buffer)?);
+                    (backing, arena.buffer, arena.buffer)
+                }
+                (ArenaOwner::Push { _rank, region }, Some(rank)) => {
+                    ensure!(std::rc::Rc::ptr_eq(_rank, rank) && regions.insert(*region),
+                        "EXL3 census mixes physical ranks or repeats a rank region");
+                    (format!("{prefix}.arena.rank"), rank.physical_buffer(), rank.region(*region)?.buffer())
+                }
+                _ => anyhow::bail!("EXL3 census mixes physical arena topologies"),
+            };
+            out.push(direct_view(format!("{prefix}.layer.{name}.region"), region, &backing, owner)?);
+            ensure!(state.buffers.len() == state.layout.buffers.len() && !state.buffers.is_empty(),
+                "EXL3 retained kernel buffer inventory differs");
+            let mut buffers = BTreeSet::new();
+            for (spec, buffer) in state.layout.buffers.iter().zip(&state.buffers) {
+                ensure!(!spec.name.is_empty() && buffers.insert(&spec.name), "invalid retained EXL3 kernel identity");
+                // Check both layer-region containment and direct physical backing.
+                direct_view(String::new(), buffer.buffer, &backing, region)?;
+                out.push(direct_view(format!("{prefix}.layer.{name}.buffer.{}", spec.name),
+                    buffer.buffer, &backing, owner)?);
+            }
+        }
+        if let Some(rank) = pushed {
+            ensure!(regions.len() == rank.region_count(), "EXL3 census omits a retained rank region");
+        }
+        Ok(out)
+    }
+
     pub(crate) fn from_push(
         rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>>,
         region: usize, layout: V41Exl3Residency, mut budget: ExpertLoadBudget,
@@ -138,7 +216,7 @@ impl<'a> Exl3Weights<'a> {
         budget.device_staging_bytes = 0;
         budget.pinned_host_bytes = 0;
         budget.read_scratch_bytes = 0;
-        Ok(Self { buffers, _arena: ArenaOwner::Push { _rank: rank }, layout, budget })
+        Ok(Self { buffers, _arena: ArenaOwner::Push { _rank: rank, region }, layout, budget })
     }
 
     pub(crate) fn plan(
@@ -454,6 +532,170 @@ impl<'a> Exl3Weights<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reconcile_weight_owners(
+        allocations: Vec<cuteafd_loader::placement::planner::Allocation>,
+        states: &[Exl3Weights<'_>],
+        location: cuteafd_loader::placement::planner::Location,
+        physical: i32,
+    ) -> Result<()> {
+        use cuteafd_loader::placement::planner::{self, *};
+        let facts = Facts { allocations, deferred: vec![], sequential: vec![], allowances: vec![] };
+        let budgets = vec![Budget {
+            id: "CPU fixture".into(), locations: vec![location],
+            physical_bytes: 1 << 30, logical_bytes: 1 << 30, headroom: 0,
+            baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false },
+        }];
+        let phases = planner::evaluate(&facts, &budgets)?;
+        let plan = ResolvedPlan {
+            request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
+                prefill: Pin::Auto, operation: Operation::Serving },
+            decisions: Decisions { attention: vec![], onboard_layers: vec![],
+                expert_homes: Default::default(), embedding: None,
+                prefill: PrefillShape { rows: 64, waves: 1 }, lanes: 1 },
+            pool_tokens: 64, facts, budgets, phases,
+        };
+        let receipts = Exl3Weights::weight_receipts(states, "test.weights", location, physical, Lifetime::RESIDENT)?;
+        planner::reconcile(&plan, Phase::Load, &receipts)?;
+        assert!(Exl3Weights::weight_receipts(states, "test.weights", location, 1 - physical, Lifetime::RESIDENT).is_err());
+        let physical: Vec<_> = receipts.iter().enumerate().filter(|(_, r)| r.allocation.view.is_none())
+            .map(|(i, _)| i).collect();
+        let views: Vec<_> = receipts.iter().enumerate().filter(|(_, r)| r.allocation.view.is_some())
+            .map(|(i, _)| i).collect();
+        for negative in 0..11 {
+            let mut bad = receipts.clone();
+            match negative {
+                0 => { bad.pop(); },
+                1 => { let mut extra = bad[physical[0]].clone(); extra.allocation.id.push_str(".extra"); bad.push(extra); },
+                2 => bad[physical[0]].allocation.bytes += 1,
+                3 => { bad[views[0]].allocation.bytes += 1; bad[views[1]].allocation.bytes -= 1; },
+                4 => bad[physical[0]].allocation.location = Location::coordinator(7),
+                5 => bad[physical[0]].address = 0,
+                6 => bad[views[0]].address += 256,
+                7 => bad[views[0]].allocation.view.as_mut().unwrap().offset += 256,
+                8 => bad[views[0]].allocation.view.as_mut().unwrap().backing = bad[views[1]].allocation.id.clone(),
+                9 => bad[views[0]].allocation.dtype = "bf16".into(),
+                10 => bad[physical[0]].allocation.lifetime.first = Phase::PostTargetKv,
+                _ => unreachable!(),
+            }
+            assert!(planner::reconcile(&plan, Phase::Load, &bad).is_err(), "negative {negative}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn retained_mount_and_shared_push_weight_arenas_reconcile_direct_views() -> Result<()> {
+        use crate::shared::memory::{device::Device, push_initialize, weight_arena::*};
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::{Exl3ArenaTopology, Exl3WeightLayout, plan::testing::*};
+        use cuteafd_loader::placement::planner::{Device as PlannedDevice, Domain, Lifetime, Location};
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::rc::Rc;
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let snapshot = fixture.directory().join("snapshot");
+        let mut config = glm5_config();
+        config["hidden_size"] = serde_json::json!(128);
+        config["moe_intermediate_size"] = serde_json::json!(256);
+        config["n_routed_experts"] = serde_json::json!(2);
+        config["num_experts_per_tok"] = serde_json::json!(1);
+        config["first_k_dense_replace"] = serde_json::json!(0);
+        config["mlp_layer_types"] = serde_json::json!(["sparse", "sparse"]);
+        config["quantization_config"] = exl3_compact(4);
+        let mut tensors = Vec::new();
+        for layer in 0..2 {
+            for expert in 0..2 {
+                for (projection, (name, n, k)) in [("gate_proj", 256, 128), ("up_proj", 256, 128),
+                    ("down_proj", 128, 256)].into_iter().enumerate() {
+                    tensors.extend(exl3(&format!("model.layers.{layer}.mlp.experts.{expert}.{name}"),
+                        n, k, 4 + (layer + expert + projection) % 2));
+                }
+            }
+        }
+        write_snapshot(&snapshot, &config, &tensors, None);
+        // Sparse header fixtures use zero payloads; only this required format
+        // scalar needs a real value for the actual mount loader's validation.
+        let mut file = std::fs::OpenOptions::new().read(true).write(true)
+            .open(snapshot.join("model-00001-of-00001.safetensors"))?;
+        let mut size = [0; 8];
+        file.read_exact(&mut size)?;
+        let size = u64::from_le_bytes(size);
+        let mut header = vec![0; size as usize];
+        file.read_exact(&mut header)?;
+        let header: serde_json::Value = serde_json::from_slice(&header)?;
+        for (name, tensor) in header.as_object().unwrap() {
+            if name.ends_with(".mcg") {
+                file.seek(SeekFrom::Start(8 + size + tensor["data_offsets"][0].as_u64().unwrap()))?;
+                file.write_all(&0xcbac1fedu32.to_le_bytes())?;
+            }
+        }
+        drop(file);
+        let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+        for mode in 0..3 {
+            let physical = if mode == 2 { 0 } else { 1 };
+            let location = if mode == 2 { Location { device: PlannedDevice::Spark(3), domain: Domain::Device } }
+                else { Location::coordinator(0) };
+            let selection = |layer| match mode {
+                0 => ExpertLayer::BackboneFull { layer },
+                1 => ExpertLayer::BackboneTp2 { layer, rank: 1 },
+                _ => ExpertLayer::BackboneExl3Tp { layer, rank: 0, world: 2 },
+            };
+            library.cuda_set_device(physical)?;
+            fixture.configure_memory(&library, physical, 1 << 30)?;
+            let planned = (0..2).map(|layer| planned_residency(&catalog, selection(layer))).collect::<Result<Vec<_>>>()?;
+            let residencies = planned.iter().collect::<Vec<_>>();
+            let mounted = Exl3WeightLayout::from_residencies("test.weights", &residencies,
+                Exl3ArenaTopology::PerLayer, location, Lifetime::RESIDENT)?;
+            let pushed = Exl3WeightLayout::from_residencies("test.weights", &residencies,
+                Exl3ArenaTopology::SharedRank, location, Lifetime::RESIDENT)?;
+            assert_eq!(mounted.bytes()?, pushed.bytes()?);
+            let states = (0..2).map(|layer| Exl3Weights::load(&library, &catalog,
+                selection(layer), 1 << 30)).collect::<Result<Vec<_>>>()?;
+            reconcile_weight_owners(mounted.allocations, &states, location, physical)?;
+            let sizes = planned.iter().map(|r| r.device_arena_layout().map(|(_, bytes)| bytes))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let bytes = pushed.bytes()? as usize;
+            let arena = ArenaLayout::new(sizes, bytes)?;
+            let expected = ExpectedCoverage::spans(&[(0, bytes as u64)]);
+            let device = Device { library: &library, id: physical };
+            let mut loading = LoadingArena::new(device, arena.clone(), expected)?;
+            // Deliver each actual mounted image into the corresponding rank
+            // region. Protocol/source coverage is tested elsewhere, not here.
+            for (region, state) in states.iter().enumerate() {
+                let ArenaOwner::Mount(owner) = &state._arena else { unreachable!() };
+                let mut image = vec![0; owner.buffer.bytes];
+                library.copy_d2h(&mut image, owner.buffer)?;
+                let start = arena.region(region)?.start;
+                library.copy_h2d(loading.destination(start, image.len())?, &image)?;
+            }
+            loading.copied(0, bytes as u64)?;
+            let layers = planned.iter().enumerate().map(|(region, residency)|
+                push_initialize::Layer::Exl3 { region, residency }).collect::<Vec<_>>();
+            let ready = Rc::new(push_initialize::initialize(loading.done()?, &layers, None, 0)?);
+            let mut pushed_states = planned.into_iter().enumerate().map(|(region, layout)| {
+                let budget = budget(&catalog, &layout)?;
+                Exl3Weights::from_push(ready.clone(), region, layout, budget)
+            }).collect::<Result<Vec<_>>>()?;
+            reconcile_weight_owners(pushed.allocations, &pushed_states, location, physical)?;
+            let receipts = Exl3Weights::weight_receipts(&pushed_states, "test.weights", location, physical, Lifetime::RESIDENT)?;
+            assert_eq!(receipts.iter().filter(|r| r.allocation.view.is_none()).count(), 1);
+            let second = receipts.iter().find(|r| r.allocation.id == "test.weights.layer.target.1.region").unwrap();
+            assert_eq!(second.allocation.view.as_ref().unwrap().offset, arena.region(1)?.start as u64);
+            assert!(second.allocation.view.as_ref().unwrap().offset > 0);
+            assert!(Exl3Weights::weight_receipts(&pushed_states[..1], "test.weights", location, physical, Lifetime::RESIDENT).is_err());
+            let buffer = pushed_states[1].buffers[0].buffer;
+            pushed_states[1].buffers[0].buffer.ptr = std::ptr::null_mut();
+            assert!(Exl3Weights::weight_receipts(&pushed_states, "test.weights", location, physical, Lifetime::RESIDENT).is_err());
+            pushed_states[1].buffers[0].buffer = buffer;
+            drop(pushed_states);
+            drop(ready);
+            drop(states);
+            assert_eq!(library.cuda_memory_info()?, (1 << 30, 1 << 30));
+        }
+        Ok(())
+    }
 
     #[test]
     fn larger_read_windows_preserve_device_and_pinned_admission() -> Result<()> {

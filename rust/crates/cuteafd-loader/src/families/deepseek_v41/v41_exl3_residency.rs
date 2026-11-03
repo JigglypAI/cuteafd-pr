@@ -47,6 +47,99 @@ pub struct V41Exl3Residency {
     pub loads: Vec<V41Exl3Load>,
 }
 
+/// Physical topology, independent of where compressed bytes were read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exl3ArenaTopology {
+    PerLayer,
+    SharedRank,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exl3WeightLayout {
+    pub allocations: Vec<crate::placement::planner::Allocation>,
+}
+
+impl Exl3WeightLayout {
+    /// Describe every physical backing and bounded direct region/kernel view.
+    /// A shared rank preserves each layer's complete, page-rounded arena.
+    pub fn from_residencies(
+        prefix: &str,
+        residencies: &[&V41Exl3Residency],
+        topology: Exl3ArenaTopology,
+        location: crate::placement::planner::Location,
+        lifetime: crate::placement::planner::Lifetime,
+    ) -> std::result::Result<Self, crate::serving_capacity::CacheGeometryError> {
+        use crate::placement::planner::{Allocation, View};
+        use crate::serving_capacity::CacheGeometryError::{Overflow, ResidentTensor};
+        use cuteafd_core::memory_layout::Category;
+        let invalid = |what: &str| ResidentTensor {
+            name: format!("{prefix}/EXL3 weight arenas"), what: what.into(),
+        };
+        if prefix.is_empty() || residencies.is_empty() {
+            return Err(invalid("empty physical owner namespace or layer list"));
+        }
+        let allocation = |id: String, bytes| {
+            let mut allocation = Allocation::buffer(
+                id, location, bytes, lifetime, Category::Experts, "EXL3 expert weights");
+            allocation.alignment = 256;
+            allocation
+        };
+        let mut allocations = Vec::new();
+        let mut names = std::collections::BTreeSet::new();
+        let mut rank_bytes = 0u64;
+        for residency in residencies {
+            let name = match residency.layer {
+                V41Exl3Layer::Backbone(layer) => format!("target.{layer}"),
+                V41Exl3Layer::Dspark(stage) => format!("draft.{stage}"),
+            };
+            if !names.insert(name.clone()) || residency.buffers.is_empty() {
+                return Err(invalid("duplicate or empty retained layer"));
+            }
+            let (offsets, bytes) = residency.device_arena_layout()?;
+            let bytes = bytes as u64;
+            let (backing, base) = match topology {
+                Exl3ArenaTopology::PerLayer => {
+                    let backing = format!("{prefix}.arena.{name}");
+                    allocations.push(allocation(backing.clone(), bytes));
+                    (backing, 0)
+                }
+                Exl3ArenaTopology::SharedRank => {
+                    let base = rank_bytes.checked_add(255)
+                        .ok_or(Overflow("EXL3 rank alignment"))? & !255;
+                    rank_bytes = base.checked_add(bytes).ok_or(Overflow("EXL3 rank extent"))?;
+                    (format!("{prefix}.arena.rank"), base)
+                }
+            };
+            let mut region = allocation(format!("{prefix}.layer.{name}.region"), bytes);
+            region.view = Some(View { backing: backing.clone(), offset: base });
+            allocations.push(region);
+            let mut buffers = std::collections::BTreeSet::new();
+            for (buffer, offset) in residency.buffers.iter().zip(offsets) {
+                if buffer.name.is_empty() || !buffers.insert(&buffer.name) {
+                    return Err(invalid("empty or duplicate kernel buffer"));
+                }
+                let mut view = allocation(
+                    format!("{prefix}.layer.{name}.buffer.{}", buffer.name), buffer.bytes.max(16) as u64);
+                view.view = Some(View {
+                    backing: backing.clone(),
+                    offset: base.checked_add(offset as u64).ok_or(Overflow("EXL3 rank view"))?,
+                });
+                allocations.push(view);
+            }
+        }
+        if topology == Exl3ArenaTopology::SharedRank {
+            allocations.push(allocation(format!("{prefix}.arena.rank"), rank_bytes));
+        }
+        Ok(Self { allocations })
+    }
+
+    pub fn bytes(&self) -> std::result::Result<u64, crate::serving_capacity::CacheGeometryError> {
+        self.allocations.iter().filter(|owner| owner.view.is_none()).try_fold(0u64, |sum, owner|
+            sum.checked_add(owner.bytes)
+                .ok_or(crate::serving_capacity::CacheGeometryError::Overflow("EXL3 physical weights")))
+    }
+}
+
 impl V41Exl3Residency {
     /// Installed code follows the storage contract, not a directory-name guess.
     pub fn aot_layout(&self) -> String {
@@ -475,6 +568,44 @@ mod tests {
                 eprintln!("EXL3 H{hidden}/I{intermediate}/E{experts} TP{world} allocated arena bytes old/compact: {allocated_bytes:?}");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn named_weight_arenas_preserve_bytes_and_use_direct_physical_views() -> Result<()> {
+        use crate::placement::planner::{Lifetime, Location};
+        let first = fixture(&[4, 5]).residency(V41Exl3Layer::Backbone(0), 1, 0)?;
+        let mut second = fixture(&[4, 5]).residency(V41Exl3Layer::Backbone(0), 2, 1)?;
+        second.layer = V41Exl3Layer::Dspark(0);
+        let lifetimes = Lifetime::RESIDENT;
+        let residencies = [&first, &second];
+        let expected = residencies.iter().map(|r| r.device_arena_layout().unwrap().1 as u64).sum::<u64>();
+        for topology in [Exl3ArenaTopology::PerLayer, Exl3ArenaTopology::SharedRank] {
+            let layout = Exl3WeightLayout::from_residencies("test", &residencies, topology,
+                Location::coordinator(1), lifetimes)?;
+            assert_eq!(layout.bytes()?, expected);
+            assert_eq!(layout.allocations.iter().filter(|a| a.view.is_none()).count(),
+                if topology == Exl3ArenaTopology::SharedRank { 1 } else { 2 });
+            for allocation in &layout.allocations {
+                assert_eq!(allocation.alignment, 256);
+                if let Some(view) = &allocation.view {
+                    let owner = layout.allocations.iter().find(|a| a.id == view.backing).unwrap();
+                    assert!(owner.view.is_none());
+                    assert!(view.offset + allocation.bytes <= owner.bytes);
+                    assert_eq!(view.offset % 256, 0);
+                }
+            }
+            assert!(layout.allocations.iter().any(|a| a.id.contains(".layer.draft.0.")));
+        }
+        let make = |prefix, residencies: &[&V41Exl3Residency]| Exl3WeightLayout::from_residencies(
+            prefix, residencies, Exl3ArenaTopology::SharedRank, Location::coordinator(0), lifetimes);
+        assert!(make("", &residencies).is_err());
+        assert!(make("test", &[]).is_err());
+        assert!(make("test", &[&first, &first]).is_err());
+        second.buffers[1].name = second.buffers[0].name.clone();
+        assert!(make("test", &[&second]).is_err());
+        second.buffers.clear();
+        assert!(make("test", &[&second]).is_err());
         Ok(())
     }
 

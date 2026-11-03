@@ -580,6 +580,10 @@ impl<'a> DeliveredArena<'a> {
 }
 
 impl ReadyArena<'_> {
+    /// The physical retained allocation, not the rank's padded logical space.
+    pub fn physical_buffer(&self) -> CuteafdDeviceBuffer { self.allocation.buffer }
+    pub fn region_count(&self) -> usize { self.layout.regions.len() }
+
     pub fn region(&self, index: usize) -> Result<WeightView<'_>> {
         Ok(WeightView {
             buffer: slice(self.allocation.buffer, self.layout.region(index)?)?,
