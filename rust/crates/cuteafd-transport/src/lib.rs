@@ -70,6 +70,7 @@ pub use protocol_v2::{
     ExpertProtocolV2Status, ExpertProtocolV2StreamPlan, ExpertProtocolV2StreamRouteGroup,
     ExpertProtocolV2WireStats, ExpertV2Dtype, ExpertV2SourceKind, expert_protocol_v2_compact_id,
     EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32,
+    EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3,
     EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES, EXPERT_PROTOCOL_V2_PARTIAL_REGION_ALIGN, PartialReplyPlan, PartialWire,
 };
 #[cfg(test)]

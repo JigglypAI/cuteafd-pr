@@ -984,6 +984,31 @@ mod tests {
     }
 
     #[test]
+    fn native_group_reply_formats_roundtrip() -> Result<()> {
+        use cuteafd_core::SparkReplyFormat;
+        let topology = SparkTopology::NATIVE_TP2_EP2;
+        for format in [SparkReplyFormat::Bf16, SparkReplyFormat::Fp8, SparkReplyFormat::Nvfp4] {
+            let mut owned = request(65);
+            for row in &mut owned.rows {
+                row.source_kind = ExpertV2SourceKind::Prefill;
+                row.source_request_id = 1;
+            }
+            owned.with_native_group_owners(&vec![0; 384], topology)?;
+            owned.select_combined_reply(format)?;
+            let encoded = owned.encode()?;
+            let request = BackboneRequest::parse_native_group(&encoded, 65, topology)?;
+            let ranks = (0..4).map(|r| topology.executor_id(r)).collect::<Result<Vec<_>>>()?;
+            let mut planes = V41Tp4Planes::new_ranks(&request, &ranks)?;
+            for (rank, executor) in ranks.iter().enumerate() {
+                let response = request.response(*executor, &vec![0; request.plane_bytes()?])?;
+                assert_eq!(planes.insert(&response.encode()?)?, rank);
+            }
+            assert!(planes.complete());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn fp8_k32_wire_roundtrip_preserves_rows_and_bf16_worker_rejects_it() {
         for rows in [1, 16, 80] {
             let base = request(rows);
