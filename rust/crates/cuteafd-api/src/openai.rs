@@ -722,7 +722,9 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     if let Some(p) = &probe {
         let geometry = profile.media_preparer.as_ref().map(|p| p.config().token_geometry())
             .unwrap_or(cuteafd_core::media::ImageTokenGeometry::MERGED);
-        if let Err(message) = p.spec.validate_media_geometry(geometry) {
+        let audio = profile.audio_preparer.as_ref().map(|p| p.geometry())
+            .unwrap_or(cuteafd_core::media::AudioTokenGeometry::MimoRvq);
+        if let Err(message) = p.spec.validate_media_geometries(geometry, audio) {
             p.fail(format!("{message:#}"));
             return Err(Rejection::bad(message));
         }

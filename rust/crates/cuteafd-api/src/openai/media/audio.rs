@@ -134,6 +134,9 @@ impl AudioPreparer {
             memo_bytes: 128 << 20,
         }
     }
+    pub fn geometry(&self) -> cuteafd_core::media::AudioTokenGeometry {
+        self.geometry
+    }
     pub fn encoder(&self) -> EncoderId {
         self.encoder
     }

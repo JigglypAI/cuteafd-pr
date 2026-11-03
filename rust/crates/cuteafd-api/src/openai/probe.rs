@@ -182,6 +182,10 @@ impl ProbeSpec {
     }
 
     pub fn validate_audio(&self) -> anyhow::Result<()> {
+        self.validate_audio_geometry(cuteafd_core::media::AudioTokenGeometry::MimoRvq)
+    }
+
+    pub fn validate_audio_geometry(&self, policy: cuteafd_core::media::AudioTokenGeometry) -> anyhow::Result<()> {
         if self.audio.is_empty() { return Ok(()); }
         anyhow::ensure!(self.media.is_empty(), "mixed expanded image/audio probes are not supported");
         let tokens = self.prompt_ids.as_ref().ok_or_else(|| anyhow::anyhow!("probe audio requires prompt_ids"))?;
@@ -189,7 +193,7 @@ impl ProbeSpec {
         let mut previous = 0;
         let mut samples = 0usize;
         for span in &self.audio {
-            let geometry = cuteafd_loader::media::audio::AudioGeometry::for_samples(span.samples)?;
+            let geometry = cuteafd_loader::media::audio::AudioGeometry::for_policy(span.samples, policy)?;
             let end = span.start.checked_add(span.len).ok_or_else(|| anyhow::anyhow!("probe audio extent overflow"))?;
             anyhow::ensure!(span.len == geometry.tokens && span.start >= previous && end <= tokens.len()
                 && self.score_from.is_none_or(|from| end <= from), "probe audio spans must match geometry and precede scoring");
@@ -206,7 +210,12 @@ impl ProbeSpec {
     }
 
     pub fn validate_media_geometry(&self, geometry: cuteafd_core::media::ImageTokenGeometry) -> anyhow::Result<()> {
-        self.validate_audio()?;
+        self.validate_media_geometries(geometry, cuteafd_core::media::AudioTokenGeometry::MimoRvq)
+    }
+
+    pub fn validate_media_geometries(&self, geometry: cuteafd_core::media::ImageTokenGeometry,
+        audio: cuteafd_core::media::AudioTokenGeometry) -> anyhow::Result<()> {
+        self.validate_audio_geometry(audio)?;
         if self.media.is_empty() { return Ok(()); }
         let tokens = self.prompt_ids.as_ref().ok_or_else(|| anyhow::anyhow!("probe media requires prompt_ids"))?;
         anyhow::ensure!(self.media.len() <= 128, "probe media exceeds history limit");
@@ -565,6 +574,25 @@ mod tests {
             }
             assert!(bad.validate_audio().is_err(), "{mutation}");
         }
+    }
+    #[test]
+    fn audio_probe_uses_selected_tower_policy() {
+        use cuteafd_core::media::{AudioTokenGeometry, ImageTokenGeometry};
+        let policy = AudioTokenGeometry::PcmPatches { samples_per_token: 1920 };
+        for (samples, len) in [(1, 1), (1920, 1), (1921, 2), (24000, 13)] {
+            let spec = ProbeSpec { prompt_ids: Some(vec![0; len + 4]), score_from: Some(len + 2),
+                audio: vec![ProbeAudio { start: 1, len, key: "ab".repeat(32), samples,
+                    pcm_sha256: "cd".repeat(32) }], ..Default::default() };
+            spec.validate_media_geometries(ImageTokenGeometry::MERGED, policy).unwrap();
+            assert!(spec.validate_audio().is_err(), "PCM must not use MiMo geometry");
+            let mut bad = spec.clone();
+            bad.audio[0].len += 1;
+            assert!(bad.validate_audio_geometry(policy).is_err());
+        }
+        let spec = ProbeSpec { prompt_ids: Some(vec![0; 4]), audio: vec![ProbeAudio {
+            start: 1, len: 1, key: "ab".repeat(32), samples: 1, pcm_sha256: "cd".repeat(32)
+        }], ..Default::default() };
+        assert!(spec.validate_audio_geometry(AudioTokenGeometry::PcmPatches { samples_per_token: 0 }).is_err());
     }
     use super::*;
 
