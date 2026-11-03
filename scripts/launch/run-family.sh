@@ -142,6 +142,8 @@ _family_allowed_keys() {
   cat <<'EOF'
 VISION
 AUDIO
+MEDIA_FEATURES_DIR
+AUDIO_FEATURES_DIR
 COORDINATOR_GPU_BUDGET_GIB
 MAPPED_SCALE_PRELOAD_GIB
 INSTANCE
@@ -469,6 +471,8 @@ API_KEY_FILE
 ATTENTION_PLACEMENT
 ATTENTION_PLAN_ROWS
 AUDIO
+MEDIA_FEATURES_DIR
+AUDIO_FEATURES_DIR
 CONCURRENCY
 DECODE_LANES
 DECODE_SHARE
@@ -612,6 +616,14 @@ if [[ -n "$probe_root" ]]; then
   release_require_writable_state "$probe_root"
   probe_args=(-v "$probe_root:$probe_root" -e "CUTEAFD_PROBE_DUMP_ROOT=$probe_root")
 fi
+local feature_key feature_root
+for feature_key in MEDIA_FEATURES_DIR AUDIO_FEATURES_DIR; do
+  feature_root="$(get "$feature_key")"
+  [[ -n "$feature_root" ]] || continue
+  [[ "$feature_root" == /* && -d "$feature_root" ]] \
+    || release_die "$feature_key must be an existing absolute directory"
+  probe_args+=(-v "$feature_root:$feature_root:ro" -e "CUTEAFD_$feature_key=$feature_root")
+done
 }
 # SPECULATION_TRACE=/abs/host/file.jsonl: the per-cycle speculation trace
 # (CUTEAFD_SPECULATION_TRACE, written by serve-glm and serve-qwen4; read by
