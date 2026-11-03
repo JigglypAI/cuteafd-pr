@@ -1827,7 +1827,7 @@ impl Opened {
     /// Builds the engine and hands it to `body`. Either KV admission keeps the prefix marks of
     /// `args.mark_arena` the caller allocates once the engine exists free, counted on the layout
     /// the engine serves (`engine.mark_slots`).
-    pub fn with_engine<T>(&self, args: &EngineArgs, body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>)
+    pub fn with_engine<'s, T>(&'s self, args: &EngineArgs, body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>)
         -> Result<T> {
         // A head split whose GPUs lack peer access serves from --device alone, decided before any load or
         // admission. The arena is counted after both decisions (below), on the layout this engine serves:
@@ -2262,7 +2262,7 @@ impl Opened {
         };
         // The admitted TP2 expert halves land inside the Spark admission window;
         // execution (modules, workspaces, routes) binds once the engine exists.
-        let tp2_weights = |pushed: Option<Vec<PushedExperts<'_>>>| -> Result<crate::shared::experts::rtx::Tp2Weights<'_>> {
+        let tp2_weights = |pushed: Option<Vec<PushedExperts<'s>>>| -> Result<crate::shared::experts::rtx::Tp2Weights<'s>> {
             let catalog = self.experts.as_ref().context("TP2 expert catalog")?;
             let (devices, budgets) = (tp2_devices()?, tp2_budgets()?);
             use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2, RtxSelectionPolicy, Tp2Weights};
@@ -2621,7 +2621,7 @@ impl Opened {
                     ensure!(selections.len() == selected.len(), "committed EXL3 inventory exceeds admission");
                     let weights = pushed.exl3()?;
                     ensure!(weights.len() == selected.len() && weights.iter().zip(selected).all(|(weight, &layer)|
-                        weight.layout.layer == cuteafd_loader::V41Exl3Layer::Backbone(layer)
+                        matches!(weight.layout.layer, cuteafd_loader::V41Exl3Layer::Backbone(id) if id == layer)
                             && weight.layout.world == 1 && weight.layout.rank == 0),
                         "committed GLM Flash whole EXL3 payload differs from solved inventory");
                     let local = crate::families::deepseek_v4::local::LocalExperts::from_exl3_weights(
