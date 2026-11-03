@@ -75,6 +75,9 @@ pub(crate) struct EngineArgs {
     /// A manifest published inside the native EXLR8 checkpoint (k2, k3 or k4).
     #[arg(long)]
     pub exlr8_manifest: Option<String>,
+    /// Native Flash preserves the checkpoint's A16 activation numerics.
+    #[arg(long, default_value = "a16", value_parser = native::prefill_activations)]
+    pub exlr8_prefill_activations: cuteafd_loader::plan::exlr8::PrefillActivations,
     #[arg(long, default_value_t = 0)]
     pub device: i32,
     /// Second GPU of a two-GPU head split: each GPU runs half the KDA and MLA heads (its

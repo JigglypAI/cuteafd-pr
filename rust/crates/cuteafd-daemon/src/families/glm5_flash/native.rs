@@ -8,6 +8,18 @@ use cuteafd_loader::plan::exlr8::{self, dense::{DensePlan, DenseRecord, DenseSel
     native::{DenseFacts, FlashCharges}, residency::MetadataInput};
 use std::collections::BTreeMap;
 
+#[derive(Debug, thiserror::Error)]
+#[error("native Flash EXLR8 prefill is A16 (requested {0:?})")]
+pub(super) struct PrefillActivationsError(String);
+
+pub(super) fn prefill_activations(value: &str)
+    -> Result<exlr8::PrefillActivations, PrefillActivationsError> {
+    match value {
+        "a16" => Ok(exlr8::PrefillActivations::A16),
+        _ => Err(PrefillActivationsError(value.into())),
+    }
+}
+
 pub(super) fn normalize(args: &mut EngineArgs) {
     args.kda_fp8 = fp8::KdaFp8::Off;
     args.fp8_head = false;
