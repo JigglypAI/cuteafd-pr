@@ -20,6 +20,8 @@ pub(crate) fn image_echo(job: &cuteafd_api::openai::NativeRequest, spans: &[cute
             cuteafd_api::openai::probe::ProbeMedia { start: span.start, len: span.len, kind: "image".into(),
                 key: image.key.0.iter().map(|b| format!("{b:02x}")).collect(),
                 grid: [image.grid.t, image.grid.h, image.grid.w],
+                identity: Some(cuteafd_api::openai::probe::ProbeImageIdentity::prepared(image)),
+                input_key: probe.spec.media.get(i).filter(|s| s.identity.is_some()).map(|s| s.key.clone()),
                 fixture: probe.spec.media.get(i).and_then(|s| s.fixture.clone()), image_url: None }
         }).collect());
     }
@@ -62,9 +64,7 @@ pub(crate) fn image_spans(spec: &cuteafd_api::openai::probe::ProbeSpec, tokens: 
     let mut covered = std::collections::BTreeSet::new();
     for (span, image) in spec.media.iter().zip(images) {
         let end = span.start.checked_add(span.len).ok_or_else(|| anyhow::anyhow!("probe media extent"))?;
-        let key = image.key.0.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-        anyhow::ensure!(span.len == image.tokens && span.grid == [image.grid.t, image.grid.h, image.grid.w]
-            && span.key == key, "probe prepared image identity differs");
+        span.verify_image(image)?;
         match markers {
             ImageMarkers::Bounded(m) => {
                 anyhow::ensure!(span.start > 0 && end < tokens.len() && tokens[span.start - 1] == m.start
@@ -121,15 +121,38 @@ mod image_span_tests {
     use cuteafd_loader::media::{ImageGrid, ImageKey, PreparedImage, SpanExpander};
 
     #[test]
+    fn row_marker_fixture_rebinds_encoder_but_not_prepared_bytes() {
+        use cuteafd_loader::media::{EncoderId, PreprocessId};
+        use cuteafd_api::openai::probe::ProbeImageIdentity;
+        let grid = ImageGrid { t: 1, h: 4, w: 4 };
+        let processor = PreprocessId([2; 32]);
+        let rgb: Arc<[u8]> = Arc::from([37; 48]);
+        let key = PreparedImage::key_for(EncoderId([120; 32]), processor, grid, &rgb);
+        let mut remote = PreparedImage { key: PreparedImage::key_for(EncoderId([121; 32]), processor, grid, &rgb),
+            encoder: EncoderId([121; 32]), processor, grid, rgb8: rgb, tokens: 6 };
+        let tokens = vec![1, 5, 5, 4, 5, 5, 6, 2];
+        let spec = ProbeSpec { prompt_ids: Some(tokens.clone()), media: vec![ProbeMedia {
+            start: 1, len: 6, kind: "image".into(), key: key.0.iter().map(|b| format!("{b:02x}")).collect(),
+            grid: [1,4,4], identity: Some(ProbeImageIdentity { encoder: "78".repeat(32), processor: "02".repeat(32) }),
+            input_key: None, fixture: None, image_url: Some(ProbeImageUrl { url: "fixture".into(), detail: None }) }],
+            ..Default::default() };
+        let markers = ImageMarkers::Rows(RowMarkers { image: 5, row_break: 4, end: 6, merge: 2, vocabulary: 32 });
+        let spans = image_spans(&spec, &tokens, &[remote.clone()], markers, 16).unwrap();
+        assert_eq!(spans[0].key, remote.key.into());
+        remote.rgb8 = Arc::from([38; 48]);
+        assert!(image_spans(&spec, &tokens, &[remote], markers, 16).is_err());
+    }
+
+    #[test]
     fn bounded_and_row_marker_probes_bind_exactly_once() {
         let rows = ImageMarkers::Rows(RowMarkers { image: 5, row_break: 4, end: 6, merge: 2, vocabulary: 32 });
         let bounded = ImageMarkers::Bounded(SpanExpander { placeholder: 5, start: 4, end: 6, vocabulary: 32 });
         for (markers, tokens, start, len) in [(bounded, vec![1, 4, 5, 5, 5, 5, 6, 2], 2, 4),
             (rows, vec![1, 5, 5, 4, 5, 5, 6, 2], 1, 6)] {
-            let image = PreparedImage { key: ImageKey([7; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
+            let image = PreparedImage { key: ImageKey([7; 32]), encoder: cuteafd_loader::media::EncoderId([0; 32]), processor: cuteafd_loader::media::PreprocessId([0; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
                 rgb8: Arc::from([]), tokens: len };
             let mut spec = ProbeSpec { prompt_ids: Some(tokens.clone()), media: vec![ProbeMedia { start, len,
-                kind: "image".into(), key: "07".repeat(32), grid: [1, 4, 4], fixture: None,
+                kind: "image".into(), key: "07".repeat(32), grid: [1, 4, 4], identity: None, input_key: None, fixture: None,
                 image_url: Some(ProbeImageUrl { url: "fixture".into(), detail: None }) }], ..Default::default() };
             let images = [image];
             let spans = image_spans(&spec, &tokens, &images, markers, 16).unwrap();

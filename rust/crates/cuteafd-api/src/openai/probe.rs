@@ -119,6 +119,13 @@ pub struct ProbeImageUrl {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct ProbeImageIdentity {
+    pub encoder: String,
+    pub processor: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProbeMedia {
     pub start: usize,
     pub len: usize,
@@ -126,9 +133,40 @@ pub struct ProbeMedia {
     pub key: String,
     pub grid: [u32; 3],
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ProbeImageIdentity>,
+    /// Original fixture key, recomputed over the actual prepared input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixture: Option<ProbeFixture>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_url: Option<ProbeImageUrl>,
+}
+
+impl ProbeImageIdentity {
+    pub fn prepared(image: &cuteafd_loader::media::PreparedImage) -> Self {
+        Self { encoder: hex(&image.encoder.0), processor: hex(&image.processor.0) }
+    }
+}
+fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
+fn digest(value: &str) -> anyhow::Result<[u8; 32]> {
+    anyhow::ensure!(sha256_hex(value), "invalid prepared image identity digest");
+    let mut bytes = [0; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() { *byte = u8::from_str_radix(&value[i * 2..i * 2 + 2], 16)?; }
+    Ok(bytes)
+}
+impl ProbeMedia {
+    pub fn verify_image(&self, image: &cuteafd_loader::media::PreparedImage) -> anyhow::Result<()> {
+        use cuteafd_loader::media::{EncoderId, PreparedImage, PreprocessId};
+        let key = if let Some(identity) = &self.identity {
+            let processor = PreprocessId(digest(&identity.processor)?);
+            anyhow::ensure!(processor == image.processor, "probe image processor differs");
+            PreparedImage::key_for(EncoderId(digest(&identity.encoder)?), processor, image.grid, &image.rgb8)
+        } else { image.key };
+        anyhow::ensure!(self.len == image.tokens && self.grid == [image.grid.t, image.grid.h, image.grid.w]
+            && self.key == hex(&key.0), "probe prepared image identity differs");
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -217,6 +255,11 @@ impl ProbeSpec {
                 "probe media spans must be sorted, disjoint and inside prompt_ids");
             anyhow::ensure!(sha256_hex(&span.key) && geometry.extent(span.grid)
                 .is_some_and(|(_, _, rows)| rows == span.len), "invalid probe media identity/grid");
+            if let Some(identity) = &span.identity {
+                anyhow::ensure!(sha256_hex(&identity.encoder) && sha256_hex(&identity.processor),
+                    "invalid probe prepared input identity");
+            }
+            anyhow::ensure!(span.input_key.is_none(), "probe input_key is response-only");
             let source = span.image_url.as_ref().ok_or_else(|| anyhow::anyhow!("probe media image_url required"))?;
             anyhow::ensure!(!source.url.is_empty() && source.detail.as_deref().is_none_or(|v| matches!(v, "auto" | "high" | "low")),
                 "invalid probe image source/detail");
@@ -544,7 +587,7 @@ mod tests {
     fn image_probe_serialization_is_unchanged_when_audio_is_empty() {
         use super::*;
         let media = ProbeMedia { start: 2, len: 4, kind: "image".into(), key: "ab".repeat(32), grid: [1,4,4],
-            fixture: None, image_url: None };
+            identity: None, input_key: None, fixture: None, image_url: None };
         assert_eq!(serde_json::to_string(&media).unwrap(), format!(
             "{{\"start\":2,\"len\":4,\"kind\":\"image\",\"key\":\"{}\",\"grid\":[1,4,4]}}", "ab".repeat(32)));
         let spec = ProbeSpec { media: vec![media], ..Default::default() };
@@ -824,5 +867,36 @@ mod tests {
         let (id, probe) = registry().register(ProbeSpec { output_dependent: true, ..ProbeSpec::default() });
         let claimed = registry().claim(&id).expect("registered");
         assert!(Arc::ptr_eq(&probe, &claimed) && !claimed.input_determined());
+    }
+}
+
+#[cfg(test)]
+mod input_identity_tests {
+    use super::*;
+    use cuteafd_loader::media::{EncoderId, ImageFamily, ImageProcessor, ProcessorConfig, RgbImage};
+
+    #[test]
+    fn fixture_input_is_exact_across_encoder_architectures_for_qwen_and_mimo() {
+        for family in [ImageFamily::Qwen, ImageFamily::Mimo] {
+            let processor = ProcessorConfig::for_family(family);
+            let rgb = RgbImage { width: 64, height: 64, data: vec![37; 64 * 64 * 3] };
+            let resident = processor.prepare_rgb(rgb.clone(), EncoderId([120; 32])).unwrap();
+            let mut remote = processor.prepare_rgb(rgb, EncoderId([121; 32])).unwrap();
+            assert_ne!(resident.key, remote.key);
+            let span = ProbeMedia { start: 1, len: resident.tokens, kind: "image".into(),
+                key: hex(&resident.key.0), grid: [resident.grid.t, resident.grid.h, resident.grid.w],
+                identity: Some(ProbeImageIdentity::prepared(&resident)), input_key: None,
+                fixture: None, image_url: None };
+            span.verify_image(&resident).unwrap();
+            span.verify_image(&remote).unwrap();
+            assert_ne!(ProbeImageIdentity::prepared(&resident), ProbeImageIdentity::prepared(&remote));
+            let mut changed = remote.rgb8.to_vec(); changed[0] ^= 1; remote.rgb8 = changed.into();
+            assert!(span.verify_image(&remote).is_err());
+            remote.rgb8 = resident.rgb8.clone(); remote.processor.0[0] ^= 1;
+            assert!(span.verify_image(&remote).is_err());
+            let mut legacy = span.clone(); legacy.identity = None;
+            legacy.verify_image(&resident).unwrap();
+            assert!(legacy.verify_image(&remote).is_err());
+        }
     }
 }

@@ -1929,7 +1929,7 @@ mod tests {
         let key: String = image.key.0.iter().map(|v| format!("{v:02x}")).collect();
         let spec = probe::ProbeSpec { prompt_ids: Some(vec![1; image.tokens + 2]),
             media: vec![probe::ProbeMedia { start: 1, len: image.tokens, kind: "image".into(), key,
-                grid: [image.grid.t, image.grid.h, image.grid.w], fixture: None,
+                grid: [image.grid.t, image.grid.h, image.grid.w], identity: None, input_key: None, fixture: None,
                 image_url: Some(probe::ProbeImageUrl { url, detail: None }) }], ..Default::default() };
         for encoding in [ModelEncoding::DeepseekV4,
             ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding())),
