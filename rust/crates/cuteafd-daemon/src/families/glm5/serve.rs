@@ -561,6 +561,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let lanes = LaneSet::default();
     // Prefix capacity and all fallible scheduler initialization precede readiness.
     ready();
+    crate::shared::api::run_scheduler(|| {
     loop {
         engine.require_live()?;
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
@@ -923,6 +924,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
+    })
 }
 
 /// The lane's commit. GLM keeps no recurrent target state (a verify's

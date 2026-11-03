@@ -789,6 +789,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let neural = matches!(drafts, Drafts::Neural { .. });
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<MediaReady<Prompt>>::default();
+    crate::shared::api::run_scheduler(|| {
     loop {
         engine.require_live()?;
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
@@ -1237,6 +1238,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
+    })
 }
 
 /// Lane-owned decode state: this scheduler's only lane (`LaneSupport::One`).
