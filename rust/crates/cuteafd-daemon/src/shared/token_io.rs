@@ -151,8 +151,10 @@ impl<'a> TokenEmbedding<'a> {
     pub fn row_fp8(library: &'a NativeLibrary, source: EmbedSource,
         owner: std::rc::Rc<native::NativeVocabulary<'a>>) -> Result<Self> {
         let file = std::fs::File::open(&source.path).with_context(|| format!("opening {}", source.path.display()))?;
-        ensure!(owner.embedding.payload().bytes == source.vocab * source.hidden,
-            "row-FP8 embedding payload differs from [{}, {}]", source.vocab, source.hidden);
+        ensure!(owner.embedding.payload().bytes == source.vocab * source.hidden
+            && owner.embedding.scales().bytes == source.vocab * 4
+            && owner.embedding.payload().device_id == owner.embedding.scales().device_id,
+            "row-FP8 embedding payload/scales differ from [{}, {}] on one device", source.vocab, source.hidden);
         let table = ResidentWeight::new(library, 256, false)?;
         tracing::info!(vocab = source.vocab, hidden = source.hidden, "token embedding: checkpoint row-FP8 (single residency)");
         Ok(Self { library, source, file, table, row_fp8: Some(owner) })
@@ -164,11 +166,20 @@ impl<'a> TokenEmbedding<'a> {
 
     /// CUDA owner of the resident table or mapped alias.
     pub(crate) fn owner(&self) -> crate::shared::memory::device::Device<'a> {
-        crate::shared::memory::device::Device { library: self.library, id: self.table.buffer().device_id }
+        let id = self.row_fp8.as_ref().map_or_else(|| self.table.buffer().device_id,
+            |owner| owner.embedding.residency().device);
+        crate::shared::memory::device::Device { library: self.library, id }
     }
 
-    /// Table bytes this embedding charges (a row-FP8 table is charged by its owner's head).
-    pub(crate) fn device_bytes(&self) -> usize { if self.row_fp8.is_some() { 0 } else { self.table.device_bytes() } }
+    /// Device bytes of this table only; the vocabulary head charges its own table.
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.row_fp8.as_ref().map_or_else(|| self.table.device_bytes(),
+            |owner| owner.embedding.residency().bytes)
+    }
+
+    pub(crate) fn validate_residency(&self, device: i32, bytes: u64) -> Result<()> {
+        validate_embedding_residency(self.owner().id, self.device_bytes(), device, bytes)
+    }
 
     pub fn device_gather(&self) -> bool { true }
 
@@ -319,6 +330,13 @@ impl<'a> TokenEmbedding<'a> {
         }
         Ok(total)
     }
+}
+
+pub(super) fn validate_embedding_residency(actual_device: i32, actual_bytes: usize,
+    device: i32, bytes: u64) -> Result<()> {
+    ensure!(actual_device == device && actual_bytes as u64 == bytes,
+        "embedding differs from admitted owner/bytes: actual GPU {actual_device}, {actual_bytes} bytes; admitted GPU {device}, {bytes} bytes");
+    Ok(())
 }
 
 /// E4M3 byte to F32 (finite codes; NaN for 0x7f/0xff).

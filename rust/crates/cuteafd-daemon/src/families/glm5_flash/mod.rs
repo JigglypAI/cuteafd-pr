@@ -2278,11 +2278,10 @@ impl Opened {
             Ok((loaded.0, (loaded.1, tp2)))
             })?
         };
-        ensure!(embedding.owner().id == embedding_device.id
-            && embedding.device_bytes() as u64 == placement.items[embedding_rank].iter()
-                .filter(|item| item.category == cuteafd_core::memory_layout::Category::Embedding
-                    && item.group == "embedding" && item.bytes > 0)
-                .map(|item| item.bytes).sum::<u64>(), "GLM Flash embedding differs from admitted owner/bytes");
+        embedding.validate_residency(embedding_device.id, placement.items[embedding_rank].iter()
+            .filter(|item| item.category == cuteafd_core::memory_layout::Category::Embedding
+                && item.group == "embedding" && item.bytes > 0)
+            .map(|item| item.bytes).sum::<u64>()).context("GLM Flash embedding admission")?;
         tracing::info!(rank = embedding_rank, device = embedding_device.id, bytes = embedding.device_bytes(),
             "GLM Flash embedding matches admission (peer-readable single residency)");
         probe("target-weights")?;
