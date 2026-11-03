@@ -12,10 +12,10 @@ use std::ffi::c_void;
 // Bound disk concurrency and pinned staging independently of model layer count.
 pub(crate) const EXPERT_READ_LANES: usize = 16;
 
-fn native_weight_windows(rect: crate::shared::experts::rtx::dense::Rect, device: i32,
+pub(crate) fn native_weight_windows(rect: crate::shared::experts::rtx::dense::Rect, device: i32,
     hidden: usize, intermediate: u32, projection: u32, dst: cuteafd_ffi::CuteafdDeviceBuffer,
 ) -> Result<Vec<crate::shared::experts::rtx::dense::Step>> {
-    use crate::shared::experts::rtx::dense::{Job, Step, TRANSFORM_BYTES, STEP_BYTES};
+    use crate::shared::experts::rtx::dense::{Job, Step, STEP_BYTES};
     let logical = intermediate as usize;
     let stored = cuteafd_core::mxfp4_layouts::stored_width(hidden, logical)
         .context("invalid native window geometry")?;
@@ -25,13 +25,34 @@ fn native_weight_windows(rect: crate::shared::experts::rtx::dense::Rect, device:
         && rect.width() == if projection == 2 { logical / 2 } else { hidden / 2 },
         "native weight projection geometry changed");
     let tile = if stored == logical && logical % 128 != 0 { 128 } else { 256 };
-    let rows = (TRANSFORM_BYTES / rect.width() / tile).max(1) * tile;
+    let rows = tile;
     (0..rect.rows.len()).step_by(rows).map(|first| {
         let end = (first + rows).min(rect.rows.len());
         let piece = rect.sub(first..end);
         ensure!(piece.bytes() <= STEP_BYTES, "native weight tile exceeds staging limit");
         Ok(Step { device, rects: vec![piece], jobs: vec![Job::NativeWindow { intermediate,
             projection, first: u32::try_from(first)?, rows: u32::try_from(end - first)?, dst }] })
+    }).collect()
+}
+
+/// Scale recipes without allocation, shared by recording and header-only admission.
+pub(crate) fn native_coded_scale_steps(catalog: &OfficialV41Catalog, names: &[String],
+    intermediate: usize, device: i32, planes: [cuteafd_ffi::CuteafdDeviceBuffer; 2],
+) -> Result<Vec<crate::shared::experts::rtx::dense::Step>> {
+    use crate::shared::experts::rtx::dense::{Job, Rect, Step};
+    let hidden = catalog.routed_experts().hidden;
+    let stored = cuteafd_core::mxfp4_layouts::stored_width(hidden, intermediate)
+        .context("invalid coded expert resident width")?;
+    [(4, 0), (3, stored), (5, 0)].into_iter().map(|(slot, start_row)| {
+        let tensor = catalog.tensor(&names[slot])?;
+        let rows = tensor.metadata.shape[0];
+        let columns = tensor.metadata.shape[1];
+        let rect = Rect { name: names[slot].clone(), path: catalog.snapshot().join(&tensor.shard),
+            base: tensor.metadata.byte_offset, row_bytes: columns, rows: 0..rows, cols: 0..columns };
+        Ok(Step { device, rects: vec![rect], jobs: vec![Job::ScaleCodes { rect: 0, at: 0,
+            stored_rows: if slot == 5 { hidden } else { 2 * stored }, start_row,
+            dst: planes[usize::from(slot == 5)],
+        }] })
     }).collect()
 }
 
@@ -805,7 +826,7 @@ impl<'a> ExpertWeights<'a> {
     /// Uncoded scales retain a transient raw image packed at Done.
     fn record_steps(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: ExpertLayer, intermediate: u32,
         experts: usize, sizes: &[usize; 4], buffers: &[DeviceAllocation<'a>; 4]) -> Result<RawScales<'a>> {
-        use crate::shared::experts::rtx::dense::{DenseLoad, Finish, Job, Operand, Rect, Step};
+        use crate::shared::experts::rtx::dense::{DenseLoad, Finish, Operand, Rect};
         let dense = DenseLoad::mount(library);
         let device = library.cuda_get_device()?;
         let whole = |name: &str| -> Result<Rect> {
@@ -859,19 +880,9 @@ impl<'a> ExpertWeights<'a> {
                 }
             }
             if catalog.mxfp4_scale_codes() {
-                let hidden = catalog.routed_experts().hidden;
-                let stored = cuteafd_core::mxfp4_layouts::stored_width(hidden, intermediate as usize)
-                    .context("invalid coded expert resident width")?;
-                for (slot, start_row) in [(4, 0), (3, stored), (5, 0)] {
-                    let tensor = catalog.tensor(&n[slot])?;
-                    let rows = tensor.metadata.shape[0];
-                    let columns = tensor.metadata.shape[1];
-                    let rect = Rect { name: n[slot].clone(), path: catalog.snapshot().join(&tensor.shard),
-                        base: tensor.metadata.byte_offset, row_bytes: columns, rows: 0..rows, cols: 0..columns };
-                    dense.step(Step { device, rects: vec![rect], jobs: vec![Job::ScaleCodes {
-                        rect: 0, at: 0, stored_rows: if slot == 5 { hidden } else { 2 * stored },
-                        start_row, dst: plane(if slot == 5 { 3 } else { 1 }, expert),
-                    }] }, std::ptr::null_mut())?;
+                for step in native_coded_scale_steps(catalog, n, intermediate as usize, device,
+                    [plane(1, expert), plane(3, expert)])? {
+                    dense.step(step, std::ptr::null_mut())?;
                 }
                 continue;
             }
