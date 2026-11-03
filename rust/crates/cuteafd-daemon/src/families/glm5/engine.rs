@@ -2150,17 +2150,7 @@ impl<'a> GlmEngine<'a> {
             } else { [tables.clone(), tables.clone()] });
         }
         *self.context_units.borrow_mut() = vec![[context::ContextUnit::default(); 2]; lanes.len()];
-        if self.layer_execution.is_some() {
-            ensure!(lanes.len() <= waves, "owned-attention prefill takes one unit per slot");
-            if let Some(pair) = &self.tp2 { pair.begin_checks(&counts, self.force_route_check.get())?; }
-            for (unit, w) in workspaces.iter().enumerate() {
-                self.put_tables(w, &ranked[unit][0])?;
-                if let Some(peers) = &peer_workspaces { self.on(1, || self.put_tables(peers.get(unit)?, &ranked[unit][1]))?; }
-                self.embedding.embed(chunks[unit], w.ids.buffer, 1, w.h.buffer, self.stream)?;
-            }
-            return self.layer_prefill(scope, &workspaces[..lanes.len()],
-                peer_workspaces.as_ref().context("owned attention lanes")?, &ranked, logit_rows, link, runtime);
-        }
+        let owned_hops = self.layer_execution.as_ref().map(|_| self.validate_owned_units()).transpose()?;
         let layers = &self.weights.layers;
         let cap = "m4096";
         let rows_of = |unit: usize| Scalar::I32(counts[unit] as i32);
@@ -2303,7 +2293,8 @@ impl<'a> GlmEngine<'a> {
         let transport = link.exchange()?;
         ensure!(transport.fits(self.wave_staging_bytes()?), "the prefill link's staging is narrower than its widest wave");
         let mut hooks = UnitHooks { engine: self, workspaces: &workspaces, peers: &peers, layers, counts: &counts,
-            begin: &begin, attention: &attention, post: &post, transport, cap, waves };
+            begin: &begin, attention: &attention, post: &post, transport, cap, waves,
+            ranked: &ranked, total, owned_hops: owned_hops.map(|n| vec![vec![0; n]; lanes.len()]) };
         let ran = crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &unit_list, waves);
         drop(hooks);
         if let Some(pair) = &self.tp2 { ran.and(pair.finish_span())?; } else { ran?; }
@@ -2745,13 +2736,21 @@ struct UnitHooks<'h, 'e, 'a, 'l, B, A, P> {
     transport: &'h mut crate::shared::spark_waves::Waves<'l>,
     cap: &'static str,
     waves: usize,
+    ranked: &'h [[StepTables; 2]],
+    total: usize,
+    owned_hops: Option<Vec<Vec<usize>>>,
+}
+
+enum UnitTicket {
+    Spark(crate::shared::spark_waves::WaveTicket),
+    Owned(layers::Ticket),
 }
 
 impl<B, A, P> crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, B, A, P>
 where B: Fn(usize) -> Result<()>,
       A: Fn(usize, usize) -> Result<()>,
       P: Fn(usize, usize, Option<([*const u16; MAX_RANKS], usize)>) -> Result<()> {
-    type Ticket = crate::shared::spark_waves::WaveTicket;
+    type Ticket = UnitTicket;
     fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
         if self.layers[layer].dense || self.engine.tp2_layer(layer) {
             crate::shared::prefill_pipeline::FfnRoute::Local
@@ -2762,10 +2761,19 @@ where B: Fn(usize) -> Result<()>,
         (self.begin)(unit.index)
     }
     fn attention(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        if let Some(hops) = &mut self.owned_hops {
+            return self.engine.owned_unit_attention([self.workspaces[unit.slot], self.peers[unit.slot].context("owned peer")?],
+                &self.ranked[unit.index], unit, layer, self.total, &mut hops[unit.index]);
+        }
         self.engine.context_unit_turn(layer, unit.index)?;
         (self.attention)(layer, unit.index)
     }
     fn local_ffn(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        if self.owned_hops.is_some() {
+            let work = [self.workspaces[unit.slot], self.peers[unit.slot].context("owned peer")?];
+            let ticket = self.engine.owned_unit_begin(work, &self.ranked[unit.index], unit, layer, self.total, self.transport)?;
+            return self.engine.owned_unit_finish(work, &self.ranked[unit.index], unit, layer, self.total, self.transport, ticket);
+        }
         let slot = unit.index % self.waves;
         if self.engine.tp2_layer(layer) {
             let w1 = self.peers[slot].context("TP2 peer workspaces")?;
@@ -2774,13 +2782,23 @@ where B: Fn(usize) -> Result<()>,
         (self.post)(layer, unit.index, None)
     }
     fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit)
-        -> Result<crate::shared::spark_waves::WaveTicket> {
+        -> Result<UnitTicket> {
+        if self.owned_hops.is_some() {
+            return self.engine.owned_unit_begin([self.workspaces[unit.slot], self.peers[unit.slot].context("owned peer")?],
+                &self.ranked[unit.index], unit, layer, self.total, self.transport).map(UnitTicket::Owned);
+        }
         let w = self.workspaces[unit.index % self.waves];
         let rows = self.counts[unit.index];
-        self.engine.moe_wave(w, layer, &self.layers[layer], rows, self.cap, self.transport)
+        self.engine.moe_wave(w, layer, &self.layers[layer], rows, self.cap, self.transport).map(UnitTicket::Spark)
     }
     fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit,
-        wave: crate::shared::spark_waves::WaveTicket) -> Result<()> {
+        ticket: UnitTicket) -> Result<()> {
+        let wave = match ticket {
+            UnitTicket::Owned(ticket) => return self.engine.owned_unit_finish(
+                [self.workspaces[unit.slot], self.peers[unit.slot].context("owned peer")?],
+                &self.ranked[unit.index], unit, layer, self.total, self.transport, ticket),
+            UnitTicket::Spark(wave) => wave,
+        };
         let slot = wave.slot();
         self.transport.land(wave, self.engine.stream)?;
         // The reduce reads the return slot this wave just landed in; the slot
@@ -2789,6 +2807,10 @@ where B: Fn(usize) -> Result<()>,
         self.transport.consumed(slot, self.engine.stream)
     }
     fn end_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        if let Some(hops) = &mut self.owned_hops {
+            self.engine.owned_unit_exit([self.workspaces[unit.slot], self.peers[unit.slot].context("owned peer")?],
+                &self.ranked[unit.index], unit, self.total, &mut hops[unit.index])?;
+        }
         // Drains (diagnostics only) and compares this unit's routes before its slot is reused.
         if let Some(pair) = &self.engine.tp2 { pair.finish_unit(unit.slot, unit.index)?; }
         Ok(())
