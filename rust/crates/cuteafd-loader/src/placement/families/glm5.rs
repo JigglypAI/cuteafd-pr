@@ -1536,7 +1536,8 @@ mod tests {
             let intake = p.items[0].iter().find(|item| item.group == "Spark intake planes").unwrap();
             // Decode-width planes plus one reserve range per rank that three
             // admitted 4096-row slots are cut from (#762).
-            assert_eq!(intake.bytes, 4 * DECODE_ROWS * 6144 * 2 + 4 * prefill_span(input.prefill_rows, 3) * 6144 * 2);
+            assert_eq!(intake.bytes, 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(DECODE_ROWS * 6144 * 2).unwrap()
+                + 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(prefill_span(input.prefill_rows, 3) * 6144 * 2).unwrap());
         }
     }
 
@@ -2412,19 +2413,29 @@ mod tests {
     #[test]
     fn owned_graphs_use_the_runtime_clamped_context_at_small_pools() {
         let cfg = config();
-        for (requested_pool, expected_pool, expected_context) in [
-            // Prefill slots share step scratch/head/logits; decode intake is 64 rows.
-            (Some(32768), 32768, 32512), (None, 124288, 124032),
-        ] {
+        for requested_pool in [Some(32768), None] {
             let mut i = inputs(&cfg, &[32 * GIB; 2]);
             i.prefill_lanes = 2;
             i.onboard = if requested_pool.is_some() { Onboard::Layers(0) } else { Onboard::Auto };
             i.requested_pool = requested_pool;
             let (placed, _) = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Layers)).unwrap();
-            assert_eq!(placed.pool_tokens, expected_pool);
+            if let Some(requested) = requested_pool {
+                assert_eq!(placed.pool_tokens, requested);
+            } else {
+                assert_eq!(placed.pool_tokens % PAGE_ROWS, 0);
+                let intake = placed.items[0].iter().find(|item| item.group == "Spark intake planes").unwrap();
+                let expected = 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(DECODE_ROWS * 6144 * 2).unwrap()
+                    + 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
+                        prefill_span(i.prefill_rows, i.prefill_lanes) * 6144 * 2).unwrap();
+                assert_eq!(intake.bytes, expected);
+                let mut next = i.clone();
+                next.onboard = Onboard::Layers(placed.onboard_layers);
+                next.requested_pool = Some(placed.pool_tokens + PAGE_ROWS);
+                assert!(solve_working_set(&next, [0; 2], Some(AttentionPlacement::Layers)).is_err());
+            }
             let context = crate::serving_capacity::pool_context(i.max_context as usize,
                 i.automatic_context, placed.pool_tokens as usize, 256).unwrap();
-            assert_eq!(context, expected_context);
+            assert_eq!(context, placed.pool_tokens as usize - 256);
             let owners: Vec<_> = placed.layers.iter().map(|layer| match layer.mode {
                 LayerMode::Whole { gpu, .. } => gpu, _ => unreachable!(),
             }).collect();

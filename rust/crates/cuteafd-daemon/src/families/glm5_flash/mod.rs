@@ -848,13 +848,12 @@ mod draft_cli_tests {
             let rows = experts.unwrap();
             assert!(rows > args.prefill_rows && rows <= args.expert_rows(), "{rows} rows at {sms} SMs");
         }
-        // One transport, with three independent return slots per Spark (4 ranks).
-        assert_eq!(wide_intake_bytes(&args, 4, 4096), 3 * 4 * 64 * 4096 * 2);
-        assert_eq!(wide_intake_bytes(&parse(&["--peers", "127.0.0.1:19441", "--prefill-rows", "64", "--decode-rows", "128", "--prefill-waves", "4"]),
-            4, 4096), 4 * 4 * 64 * 4096 * 2);
-        for flags in [&[][..], &["--decode-rows", "128"][..], &["--prefill-rows", "64"][..],
-            &["--prefill-rows", "128", "--decode-rows", "128"][..]] {
-            assert_eq!(wide_intake_bytes(&parse(flags), 4, 4096), 0, "{flags:?}");
+        // A whole reserve is one allocation per rank, even when a wider
+        // verify step leaves its physical backing in the same allocation quantum.
+        for waves in [3, 4] {
+            let bytes = cuteafd_loader::serving_capacity::prefill_return_bytes(waves, 64, 4, 4096);
+            assert_eq!(bytes, 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
+                waves * 64 * 4096 * 2).unwrap());
         }
     }
 
@@ -1392,16 +1391,6 @@ impl EngineArgs {
     pub(crate) fn expert_rows(&self) -> usize {
         cuteafd_loader::serving_capacity::glmf_expert_rows(self.prefill_rows as u64, self.decode_rows as u64) as usize
     }
-}
-
-/// Device bytes of the Spark intake planes that experts sized for the decode rows hold beyond a
-/// narrower prefill lane's (none when a lane is at least as wide as a decode step): what a planned
-/// admission charges on the lead GPU, as it charges the wide selector, beyond the allowances it
-/// keeps for `--prefill-rows` rows. `ranks` Spark ranks, one transport per prefill lane.
-fn wide_intake_bytes(args: &EngineArgs, ranks: usize, hidden: usize) -> u64 {
-    use cuteafd_loader::serving_capacity::spark_intake_bytes;
-    let at = |rows: usize| spark_intake_bytes(args.prefill_waves as u64, ranks as u64, rows as u64, hidden as u64);
-    at(args.expert_rows()) - at(args.prefill_rows)
 }
 
 /// The step settings these arguments give the engine (its step plan's inputs besides layers and experts),

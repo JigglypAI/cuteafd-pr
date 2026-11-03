@@ -1028,7 +1028,8 @@ mod upload_tests {
         assert!(NativeTp4Wave::device_bytes(4097).is_err());
         for capacity in [1, 16, 80, 4096] {
             let reserved = NativeTp4Wave::device_bytes(capacity)?;
-            assert_eq!(reserved, capacity as usize * 6 * 10240);
+            assert_eq!(reserved as u64, 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(capacity as u64 * 10240)?
+                + capacity as u64 * 2 * 10240);
             assert!(reserved >= capacity as usize * (2 * V41_PARTIAL_ROW_BYTES as usize + 2 * 10240));
         }
         Ok(())

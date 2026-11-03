@@ -479,6 +479,14 @@ pub fn resolve_capacity_with_startup_peaks(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefill_default_and_wave_clamp() {
+        assert_eq!(super::default_prefill_unit_rows(), 2752);
+        for (depth, expected) in [(0, 4096), (1, 4096), (3, 2752), (4, 2048), (8, 2048)] {
+            assert_eq!(super::prefill_unit_rows_in(depth, super::PREFILL_RESERVE_ROWS), expected);
+        }
+    }
+
     use super::*;
     const GIB: u64 = 1 << 30;
 
