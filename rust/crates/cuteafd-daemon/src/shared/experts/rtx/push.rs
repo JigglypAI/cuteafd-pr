@@ -257,16 +257,16 @@ type DenseSlot = std::sync::Arc<std::sync::Mutex<Option<Vec<DensePlan>>>>;
 #[derive(Clone, Debug)]
 pub(crate) enum CoordinatorExperts {
     Tp2 { layers: Vec<usize>, budgets: Vec<usize> },
-    Exlr8Tp2 { manifest: String, layers: Vec<usize>, budgets: Vec<usize> },
+    Exlr8 { manifest: String, layers: Vec<usize>, budgets: Vec<usize> },
     Whole { selections: Vec<crate::shared::experts::layer::ExpertLayer>, budget: usize },
 }
 
 impl CoordinatorExperts {
-    fn gpus(&self) -> usize { match self { Self::Tp2 { .. } | Self::Exlr8Tp2 { .. } => 2, Self::Whole { .. } => 1 } }
+    fn gpus(&self) -> usize { match self { Self::Tp2 { .. } => 2, Self::Exlr8 { budgets, .. } => budgets.len(), Self::Whole { .. } => 1 } }
     /// GPU `gpu`'s plan, re-derived from headers alone.
     fn plan(&self, catalog: &OfficialV41Catalog, gpu: usize) -> Result<CoordinatorExpertPlan> {
         match self {
-            Self::Exlr8Tp2 { manifest, layers, budgets } => CoordinatorExpertPlan::exlr8(catalog, manifest, layers, gpu,
+            Self::Exlr8 { manifest, layers, budgets } => CoordinatorExpertPlan::exlr8(catalog, manifest, layers, budgets.len(), gpu,
                 *budgets.get(gpu).context("coordinator EXLR8 TP2 budget per GPU")?),
             Self::Tp2 { layers, budgets } => CoordinatorExpertPlan::new(catalog, layers, gpu,
                 *budgets.get(gpu).context("coordinator TP2 budget per GPU")?),

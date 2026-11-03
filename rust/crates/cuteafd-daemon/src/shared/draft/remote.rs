@@ -11,7 +11,7 @@
 //! completion event ([`RemoteBridge::publish_context`]), never a host sync.
 use crate::shared::memory::device::{Device, Event, Stream};
 use crate::shared::peer_split::{PeerExchange, RankDevice, TerminalState};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::peer_exchange::PeerPlane;
 use cuteafd_ffi::NativeLibrary;
 use std::cell::Cell;
@@ -52,9 +52,19 @@ fn head_route(rank: usize, send_hidden: impl FnOnce() -> Result<()>,
     send_logits()
 }
 
+/// The bridge slots own only flags; payloads land in external draft/target buffers.
+pub(crate) fn decode_extent(rows: usize, hidden: usize, vocab: usize, head_rank: usize) -> Result<usize> {
+    check_head_rank(head_rank)?;
+    ensure!(rows > 0 && hidden > 0 && vocab > 0, "remote draft decode geometry must be nonzero");
+    let row_bytes = if head_rank == 0 { hidden.checked_mul(2).zip(vocab.checked_mul(4))
+        .map(|(hidden, logits)| hidden.max(logits)) } else { hidden.checked_mul(2) };
+    rows.checked_mul(row_bytes.context("remote draft row extent overflow")?)
+        .context("remote draft decode extent overflow")
+}
+
 impl<'a> Prepared<'a> {
     pub fn new(library: &'a NativeLibrary, target: RankDevice, target_peer: RankDevice,
-        head_rank: usize, identity: &'static str) -> Result<Self> {
+        head_rank: usize, identity: &'static str, decode_lane_bytes: usize) -> Result<Self> {
         check_head_rank(head_rank)?;
         ensure!(target.device != target_peer.device && !target_peer.stream.is_null(),
             "remote draft requires the peer target producer stream");
@@ -62,7 +72,7 @@ impl<'a> Prepared<'a> {
         let stream = Stream::new(device)?;
         let target_ready = Event { device, raw: device.run(|| library.cuda_event_create_ordering())? };
         let exchange = PeerExchange::new_abortable_sized(library,
-            [target, RankDevice { device: target_peer.device, stream: stream.raw }], &BRIDGE_SLOT_SIZES)?;
+            [target, RankDevice { device: target_peer.device, stream: stream.raw }], &BRIDGE_SLOT_SIZES, decode_lane_bytes)?;
         exchange.trace_identity(identity);
         Ok(Self { exchange, stream, target_peer, target_ready, head_rank })
     }
@@ -211,6 +221,21 @@ impl<'a> RemoteBridge<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_decode_extent_is_the_largest_actual_bridge_transfer() -> Result<()> {
+        for rows in [16, 512] {
+            let (hidden, vocab) = (7168, 163840);
+            for head in [0, 1] {
+                let input = rows * hidden * 2;
+                let actual = if head == 0 { input.max(rows * vocab * 4) } else { input };
+                assert_eq!(decode_extent(rows, hidden, vocab, head)?, actual);
+                assert!(actual > BRIDGE_SLOT_SIZES[0]);
+            }
+        }
+        assert!(decode_extent(usize::MAX, 7168, 163840, 0).is_err());
+        Ok(())
+    }
     use crate::shared::peer_split::order::{self, Schedule};
 
     fn update(schedule: &mut Schedule, pending: bool) {

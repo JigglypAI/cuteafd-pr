@@ -35,6 +35,10 @@ use crate::shared::experts::rtx::{pair::Pair, ExpertInput, Routes, ExchangeDtype
 
 #[path = "engine/context.rs"]
 mod context;
+fn decode_peer_bytes(rows: usize, hidden: usize, exchange: ExchangeDtype) -> usize {
+    (rows * hidden * 2).max(rows * hidden * exchange.element_bytes())
+}
+
 mod tp2;
 mod packing;
 mod layers;
@@ -818,7 +822,8 @@ impl<'a> GlmEngine<'a> {
             layer.core.values().any(|weight| weight.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input)) { 2 } else { 0 };
         let exchange = PeerExchange::new_abortable(self.library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], 4 * self.prefill_lanes.max(1),
-            rows * self.cfg.hidden * (self.tp2_exchange.element_bytes() + core_bytes))?;
+            rows * self.cfg.hidden * (self.tp2_exchange.element_bytes() + core_bytes),
+            decode_peer_bytes(DECODE_ROWS, self.cfg.hidden, self.tp2_exchange))?;
         let peer = exchange.on(1, || -> Result<GlmPeer<'a>> {
             let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: self.cfg.program_family(),
                 split_family: self.cfg.split_program_family() };
@@ -3532,5 +3537,42 @@ mod prefill_unit_tests {
         assert!(first < push && push < wait, "entry push precedes rank 1's wait, inside the first layer only");
         let peer = source.split("fn peer_attention(").nth(1).unwrap().split("\n    }\n").next().unwrap();
         assert!(peer.find("exchange.wait(1, DIRECT)").is_some_and(|w| w < peer.find("attention_unit(1,").unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod decode_extent_tests {
+    use super::*;
+
+    #[test]
+    fn ml4_decode_extent_matches_checkpoint_transfers() -> Result<()> {
+        let cfg = GlmDsaConfig::from_hf(&cuteafd_loader::plan::testing::mistral_large4_config())?;
+        assert_eq!((cfg.hidden, cfg.topk), (6144, 4));
+        let residual_hop = DECODE_ROWS * cfg.hidden * std::mem::size_of::<u16>();
+        assert_eq!(residual_hop, 786_432);
+        for exchange in [ExchangeDtype::Bf16, ExchangeDtype::F32] {
+            let projection = DECODE_ROWS * cfg.hidden * std::mem::size_of::<u16>();
+            let routed = DECODE_ROWS * cfg.hidden * exchange.element_bytes();
+            assert_eq!(decode_peer_bytes(DECODE_ROWS, cfg.hidden, exchange),
+                [residual_hop, projection, routed].into_iter().max().unwrap());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn declared_decode_extent_is_largest_single_transfer() {
+        use crate::shared::experts::rtx::pair::PackedRoutes;
+        for hidden in [6144, 7168] {
+            for exchange in [ExchangeDtype::Bf16, ExchangeDtype::F32] {
+                let attention = DECODE_ROWS * hidden * 2;
+                let projection = DECODE_ROWS * hidden * 2;
+                let routed = DECODE_ROWS * hidden * exchange.element_bytes();
+                assert_eq!(decode_peer_bytes(DECODE_ROWS, hidden, exchange),
+                    [attention, projection, routed].into_iter().max().unwrap());
+                let routes = PackedRoutes::new(DECODE_ROWS, 8);
+                assert_eq!(PackedRoutes::with_input_bytes(DECODE_ROWS, 8, 0),
+                    (routes.weights + routes.section).next_multiple_of(16));
+            }
+        }
     }
 }

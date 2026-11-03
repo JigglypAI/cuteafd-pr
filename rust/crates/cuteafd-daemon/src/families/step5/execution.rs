@@ -20,6 +20,8 @@ use std::{cell::{Cell, RefCell}, ffi::c_void, rc::Rc};
 
 const H: usize = 4096;
 
+fn decode_peer_bytes(capacity: usize) -> usize { capacity.min(64) * H * 4 }
+
 fn draft_homes(ownership: &ExecutionOwnership, catalog: &cuteafd_loader::OfficialV41Catalog,
     reports: &[cuteafd_transport::worker_selection::InstalledExpertGrouping],
     read_bytes: impl Fn(usize) -> Result<usize>) -> Result<Vec<crate::shared::draft::resource::LayerHome>> {
@@ -533,10 +535,11 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                 stream: stages[rank].stream.raw });
             // Peer partials and replications complete inside one unit's hook.
             let unit = usize::try_from(ownership.execution().spec().rows)?;
-            let peer = devices[0].run(|| PeerExchange::new_abortable(devices[0].library, native_ranks, 8, unit * H * 4))?;
+            let peer = devices[0].run(|| PeerExchange::new_abortable(devices[0].library, native_ranks, 8, unit * H * 4, decode_peer_bytes(rows)))?;
             // One hop lane per prefill unit slot (spec lanes = waves in flight).
             let mut hops = devices[0].run(|| HopLink::new(devices[0].library, native_ranks,
-                ownership.execution().hops(), ownership.execution().spec()))?;
+                ownership.execution().hops(), ownership.execution().spec(),
+                rows.min(64) * ownership.execution().spec().row_bytes as usize))?;
             hops.attach_abort([peer.abort_word(0)?.context("Step-5 lead abort")?,
                 peer.abort_word(1)?.context("Step-5 peer abort")?])?;
             hops.validate_binding(ownership.execution(), &peer)?;
@@ -614,7 +617,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                 ensure!(ranks[0].layers() == ownership.onboarded_layers(), "Step-5 TP2 layers differ from the solved homes");
                 let exchange_dtype = match kind { Tp2Exchange::Exl3 => ExchangeDtype::F32, Tp2Exchange::Fp8 => ExchangeDtype::Bf16 };
                 let streams = std::array::from_fn(|rank| RankDevice { device: devices[rank].id, stream: stages[rank].stream.raw });
-                let pair = devices[0].run(|| Pair::new_with_wire(devices[0].library, streams, ranks, H, 8, unit, lanes,
+                let pair = devices[0].run(|| Pair::new_with_wire(devices[0].library, streams, ranks, H, 8, unit, rows.min(64), lanes,
                     exchange_dtype, true))?;
                 let plane = |rank: usize, bytes: usize| Allocation::new(devices[rank], bytes.max(256));
                 let section = unit * 8 * 4;
@@ -2425,5 +2428,27 @@ mod unit_selection_reset_tests {
         let units = body("pub fn enqueue_units<'s");
         let finish = units.find("finish_units()").unwrap();
         assert!(units[finish..].contains("main.reset_units()?;"));
+    }
+}
+
+#[cfg(test)]
+mod decode_extent_tests {
+    use super::*;
+
+    #[test]
+    fn declared_decode_extent_matches_native_residual_and_tp2_packets() {
+        use crate::shared::experts::rtx::pair::PackedRoutes;
+        use cuteafd_loader::plan::families::step5::admission::Tp2Exchange;
+        for capacity in [32usize, 64, 2048] {
+            let rows = capacity.min(64);
+            for kind in [Tp2Exchange::Exl3, Tp2Exchange::Fp8] {
+                let residual = rows * H * std::mem::size_of::<f32>();
+                let routed = rows * H * kind.partial_bytes();
+                assert_eq!(decode_peer_bytes(capacity), residual.max(routed));
+                let routes = PackedRoutes::new(rows, 8);
+                let input = rows * kind.input_row_bytes(H);
+                assert_eq!(PackedRoutes::with_input_bytes(rows, 8, kind.input_row_bytes(H)), routes.bytes + input);
+            }
+        }
     }
 }

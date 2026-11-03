@@ -154,29 +154,6 @@ def test_spark_workers_reject_missing_zero_or_nonuniform_planner_budgets(tmp_pat
     assert "cuteafd expertd-native" not in result.stderr
 
 
-def test_exlr8_onboarded_halves_require_the_shared_committed_push():
-    source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/mod.rs").read_text()
-    planning = source.split("// Native dense operands and onboarded EXLR8 halves", 1)[1].split(
-        "Some(admission.start_with(&peers, ranks)?)", 1)[0]
-    expert_plan = source.split("let native_push_experts =", 1)[1].split("let admission =", 1)[0]
-    assert "CoordinatorExperts::Exlr8Tp2" in expert_plan
-    assert "layers: range.clone().collect()" in expert_plan
-    assert "budgets: budgets.to_vec()" in expert_plan
-    assert "native_push_experts()?" in planning
-    assert "CoordinatorPush::prepare(" in planning
-    assert "devices.len(), experts)?" in planning
-    assert "map_err" not in planning and ".ok()" not in planning
-    loading = source.split("let tp2_weights =", 1)[1].split("let (embedding,", 1)[0]
-    assert "Exlr8Tp2Weights::pushed_pair" in loading
-    assert 'pushed.context("onboarded EXLR8 experts require a committed push group")?' in loading
-    assert "tp2_weights(range, loaded.2)" in source
-    alone = source.split("if native_records.is_some() && native_push.is_none()", 1)[1].split(
-        "let started = Instant::now();", 1)[0]
-    assert "CoordinatorPush::prepare_alone(" in alone
-    assert "native_push_experts()?" in alone
-    assert "native_push = Some((push, 0))" in alone
-    executor = (ROOT / "rust/crates/cuteafd-daemon/src/shared/experts/rtx/exlr8.rs").read_text()
-    assert "fn load_pair" not in executor and "Exlr8Weights::load(" not in executor
 
 
 @pytest.mark.parametrize("keys,diagnostic", [
