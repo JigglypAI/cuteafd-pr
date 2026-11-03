@@ -83,7 +83,26 @@ SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 
 FIDELITY_PANELS = {'fidelity', 'fidelity_full'}
 LOWER_IS_BETTER = {'kl', 'readiness_s'}  # also every 'prefill N TTFT s'
 FAILURE = re.compile(r'(?i)(\berror\b|\bpanicked\b|\bfatal\b|\bfailed\b|undefined symbol|no such file|refus|exited:|timed out|out of memory|traceback)')
-PANELS = {'baseline', 'hardware', 'configuration', 'decode_content', 'concurrency', 'draft_mix', 'prefill', 'retained', 'prefix_cache', 'context_load', 'startup', 'agentic', 'tool_eval', 'structured', 'ifeval', 'code', 'math', 'needle', 'fidelity', 'fidelity_full', 'reasoning_effort', 'spec_lossless_set'}
+def bench_panels(repo=REPO, binary=None):
+    """Derive selectable panel ids from cuteafd bench (CLI or panel definitions)."""
+    if binary is not None:
+        return set(json.loads(run([str(binary), 'bench', 'panels', '--json']).stdout))
+    panels_dir = Path(repo) / 'rust/crates/cuteafd-bench/src/panels'
+    ids = {'baseline'}
+    for path in sorted(panels_dir.glob('*.rs')):
+        text = path.read_text()
+        for match in re.finditer(r"fn\s+id\(&self\)\s*->\s*&'static\s+str\s*\{", text):
+            depth, i = 1, match.end()
+            while i < len(text) and depth > 0:
+                depth += (text[i] == '{') - (text[i] == '}')
+                i += 1
+            ids.update(re.findall(r'"([a-z0-9_]+)"', text[match.end():i - 1]))
+    if len(ids) < 2:
+        raise ValueError(f'failed to parse panel ids from {panels_dir}')
+    return ids
+
+
+PANELS = bench_panels()
 
 
 def short_instance(value):

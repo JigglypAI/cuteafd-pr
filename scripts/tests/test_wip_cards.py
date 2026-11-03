@@ -2851,3 +2851,20 @@ def test_invalid_container_keys_fail_at_preflight_before_hardware_grant(entry, t
     with pytest.raises(ValueError, match='INSTANCE must be'):
         cards.preflight_job(job, {'instance': 'test-base', 'slot': 's'})
 
+
+def test_panels_allowlist_derives_from_bench_definitions_and_includes_shared_prefix(entry, tmp_path, monkeypatch):
+    profiles_rs = (ROOT / 'rust/crates/cuteafd-bench/src/profiles.rs').read_text()
+    referenced = set(re.findall(r'"([a-z0-9_]+)"', profiles_rs[profiles_rs.index('const SPEED'):profiles_rs.index('pub fn builtin')]))
+    assert 'shared_prefix' in referenced
+    assert referenced <= cards.PANELS
+    assert cards.requested_panels('panels:shared_prefix') == ['shared_prefix']
+    assert cards.requested_panels('panels:shared_prefix,baseline') == ['shared_prefix', 'baseline']
+    job = cards.generate({**entry, 'profile': 'panels:shared_prefix'}, 'a', dict(instance='p', slot='s'),
+                         tmp_path, tmp_path / 'key', {}, set(), None, 1)
+    assert job['entry']['profile'] == 'panels:shared_prefix'
+    monkeypatch.setattr(cards, 'run', lambda cmd: SimpleNamespace(
+        stdout=json.dumps(sorted(cards.PANELS)) + '\n'
+    ))
+    assert cards.bench_panels(binary='/opt/bin/cuteafd') == cards.PANELS
+
+
