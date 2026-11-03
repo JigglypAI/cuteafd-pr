@@ -213,7 +213,11 @@ def diagnose_propagation(lib, model, prepared, native_stages):
                 local = stage_metrics(cpu(actual), cpu(official_on_native), cpu(same_native))
                 cumulative = stage_metrics(cpu(actual), cpu(expected), cpu(oracle_output))
                 rms = lambda value: float(value.float().square().mean().sqrt())
+                inherited = same_native - oracle_output
+                local_error = actual.float() - same_native
                 records.append(dict(primitive=name, native_input_local=local, cumulative=cumulative,
+                    inherited_absolute_rms=rms(inherited),
+                    local_inherited_cross_mse=float((local_error * inherited).mean()),
                     official_input_local_absolute_rms=rms(expected.float() - same_official),
                     fp32_input_native_absolute_rms=rms(oracle_input_native.float() - oracle_output)))
                 chains = dict(native=actual, official=expected, fp32=oracle_output)
