@@ -890,6 +890,7 @@ fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
     // the native module or any device allocation is admitted.
     args.draft_storage()?;
     let cfg = MimoV2Config::read(&args.snapshot)?;
+    cuteafd_bench::context::set_family(cfg.family_id());
     let checkpoint = Checkpoint::coordinator(&args.snapshot,
         args.local_experts && !args.skip_experts, args.mtp > 0)?;
     let weight_formats = resolve_weight_formats(args, &checkpoint, &cfg)?;

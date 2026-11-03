@@ -701,6 +701,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     cuteafd_core::set_expert_geometry(catalog.routed_experts().geometry()?)
         .map_err(|g| anyhow::anyhow!("geometry already {g:?}"))?;
     let cfg = GlmDsaConfig::read(&args.snapshot)?;
+    cuteafd_bench::context::set_family(cfg.family_id());
     let native = catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8;
     if native {
         ensure!(args.exlr8_manifest.is_some(), "native EXLR8 requires --exlr8-manifest");

@@ -534,6 +534,7 @@ fn expert_catalog(args: &EngineArgs) -> Result<Option<cuteafd_loader::OfficialV4
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let checkpoint = Checkpoint::coordinator(&args.snapshot, args.local_experts, args.mtp > 0)?;
     let cfg = Qwen4Config::read(&args.snapshot)?;
+    cuteafd_bench::context::set_family(cfg.family_id());
     cfg.check_programs()?;
     // The expert geometry is process-wide and must be fixed before the native
     // library loads (its expert helpers size rows from it).
