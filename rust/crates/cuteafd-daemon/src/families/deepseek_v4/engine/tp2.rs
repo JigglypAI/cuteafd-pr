@@ -37,6 +37,10 @@ impl ExchangePolicy {
         }
     }
 
+    pub(super) fn decode_bytes(self, rows: usize, hidden: usize) -> usize {
+        (rows * hidden * 2).max(rows * hidden * self.dtype(rows, rows).element_bytes())
+    }
+
     pub(super) fn slot_bytes(self, prefill: usize, decode: usize, hidden: usize) -> usize {
         match self {
             Self::F32 => prefill.max(decode) * hidden * 4,
@@ -115,7 +119,8 @@ impl<'a> Engine<'a> {
         let routes = PeerExchange::new_abortable(self.library,
             [RankDevice { device: self.device, stream: self.stream },
              RankDevice { device: peer.device, stream: peer.stream }],
-            2 * self.prefill_waves, rows * self.cfg.n_activated_experts * 8 + 16)?;
+            2 * self.prefill_waves, rows * self.cfg.n_activated_experts * 8 + 16,
+            PackedRoutes::new(self.decode_rows, self.cfg.n_activated_experts).push_bytes)?;
         let interval = std::env::var("CUTEAFD_ROUTE_CHECK").ok()
             .map(|v| v.parse::<usize>().context("CUTEAFD_ROUTE_CHECK must be a nonnegative step interval"))
             .transpose()?.unwrap_or(0);
@@ -686,5 +691,24 @@ mod tests {
             assert_eq!(ExchangePolicy::F32.dtype(rows, 80), ExchangeDtype::F32);
         }
         assert!(ExchangePolicy::parse("fp8").is_err());
+    }
+}
+
+#[cfg(test)]
+mod decode_extent_tests {
+    use super::*;
+
+    #[test]
+    fn declared_decode_extent_matches_attention_combine_and_routes() {
+        for rows in [64, 128] {
+            for policy in [ExchangePolicy::Auto, ExchangePolicy::Bf16, ExchangePolicy::F32] {
+                let hidden = 7168;
+                let attention = rows * hidden * 2;
+                let routed = rows * hidden * policy.dtype(rows, rows).element_bytes();
+                assert_eq!(policy.decode_bytes(rows, hidden), attention.max(routed));
+                let routes = PackedRoutes::new(rows, 8);
+                assert_eq!(routes.push_bytes, (routes.weights_at + routes.section_bytes).next_multiple_of(16));
+            }
+        }
     }
 }

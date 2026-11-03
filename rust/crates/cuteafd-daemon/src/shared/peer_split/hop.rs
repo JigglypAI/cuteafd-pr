@@ -171,7 +171,8 @@ impl<'a> HopLink<'a> {
     /// Allocates the receive slots `hops` need on each destination (exactly
     /// [`hop_buffer_bytes`]) and the control words on both GPUs; `ranks[0]`'s
     /// device must be current, and is again on return.
-    pub fn new(library: &'a NativeLibrary, ranks: [RankDevice; 2], hops: &[Hop], spec: HopSpec) -> Result<Self> {
+    pub fn new(library: &'a NativeLibrary, ranks: [RankDevice; 2], hops: &[Hop], spec: HopSpec, decode_lane_bytes: usize) -> Result<Self> {
+        super::validate_decode_extent(decode_lane_bytes)?;
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("residual-hops");
         ensure!(spec.storage == cuteafd_loader::placement::HopStorage::ReceiveSlots,
             "HopLink requires receive-slot storage; direct-input hops use the destination's own buffers");
@@ -206,22 +207,15 @@ impl<'a> HopLink<'a> {
             .map(|_| Event::new(Device { library, id: ranks[rank].device })).collect::<Result<Vec<_>>>());
         let [ready0, ready1] = consumer_ready;
         Ok(Self { library, ranks, ends: [end(0)?, end(1)?], spec, private_lane: None,
-            hops: hops.to_vec(), per_lane, abort: None, decode_lane_bytes: usize::MAX,
+            hops: hops.to_vec(), per_lane, abort: None, decode_lane_bytes,
             consumer_ready: [ready0?, ready1?] })
-    }
-
-    /// Admit the largest decode residual; wider hops use the copy engine.
-    pub fn with_decode_lane_bytes(mut self, bytes: usize) -> Result<Self> {
-        ensure!(bytes > 0 && bytes % 16 == 0, "decode peer extent must contain aligned rows");
-        self.decode_lane_bytes = bytes;
-        Ok(self)
     }
 
     /// Independent streams carry one logical lane, so allocate only its slots.
     pub(crate) fn new_private_lane(library: &'a NativeLibrary, ranks: [RankDevice; 2],
-        hops: &[Hop], spec: HopSpec, lane: usize) -> Result<Self> {
+        hops: &[Hop], spec: HopSpec, lane: usize, decode_lane_bytes: usize) -> Result<Self> {
         let allocation = private_lane_spec(spec, lane)?;
-        let mut link = Self::new(library, ranks, hops, allocation)?;
+        let mut link = Self::new(library, ranks, hops, allocation, decode_lane_bytes)?;
         link.spec = spec;
         link.private_lane = Some(lane);
         Ok(link)
@@ -442,10 +436,10 @@ mod cuda_tests {
             rank.stream = on_device(&library, rank.device, || library.cuda_stream_create())?;
         }
         let result = (|| -> Result<()> {
-            let link = HopLink::new(&library, ranks, &hops, spec)?;
+            let link = HopLink::new(&library, ranks, &hops, spec, spec.row_bytes as usize)?;
             let charged = hop_buffer_bytes(&hops, &spec, 2).unwrap();
             assert_eq!([link.receive_bytes(0), link.receive_bytes(1)], [charged[0], charged[1]]);
-            let private = (0..2).map(|lane| HopLink::new_private_lane(&library, ranks, &hops, spec, lane))
+            let private = (0..2).map(|lane| HopLink::new_private_lane(&library, ranks, &hops, spec, lane, spec.row_bytes as usize))
                 .collect::<Result<Vec<_>>>()?;
             let single = hop_buffer_bytes(&hops, &HopSpec { lanes: 1, ..spec }, 2).unwrap();
             for rank in 0..2 {

@@ -12,6 +12,38 @@ import secrets
 
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 
+# Existing adapters predate the <family>_media module convention.
+MEDIA_MODULES = {"mimo_v2": "mimo_media", "qwen4": "qwen_media", "glm5_flash": "glm_flash_media"}
+
+
+def media_adapter_name(family):
+    if not isinstance(family, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", family):
+        raise ValueError("invalid official media family")
+    return MEDIA_MODULES.get(family, family + "_media")
+
+
+def has_media_adapter(family):
+    """Discover official adapters without importing Torch or constructing a tower."""
+    name = media_adapter_name(family)
+    return name not in ("fidelity_media", "golden_media") and Path(__file__).with_name(name + ".py").is_file()
+
+
+def media_families():
+    aliases = {module: family for family, module in MEDIA_MODULES.items()}
+    return tuple(sorted({aliases.get(path.stem, path.stem[:-6])
+        for path in Path(__file__).parent.glob("*_media.py")
+        if path.stem not in ("fidelity_media", "golden_media")}))
+
+
+def official_media_adapter(family):
+    import importlib
+    if not has_media_adapter(family):
+        raise ValueError(f"{family} official media exporter is not implemented")
+    adapter = importlib.import_module(media_adapter_name(family))
+    if not callable(getattr(adapter, "window_features", None)):
+        raise ValueError(f"{family} official media adapter lacks window_features")
+    return adapter
+
 
 def processor_contract(snapshot):
     """The shared image-span layout, derived from the checkpoint processor."""
@@ -213,3 +245,15 @@ def write_features(root: Path, span: dict, values, *, tower_dtype: str, identity
         _publish_locked([(root / (span["key"] + ".bf16"), data),
                          (root / (span["key"] + ".json"), encoded)])
     return meta
+
+
+def prepared_span(span):
+    """Preserve the encoder/preprocessor identity sealed by the generation server."""
+    result = {k: span[k] for k in ("start", "len", "kind", "key", "grid")}
+    if "identity" in span:
+        identity = span["identity"]
+        if (not isinstance(identity, dict) or set(identity) != {"encoder", "processor"}
+                or any(not isinstance(v, str) or not HEX.fullmatch(v) for v in identity.values())):
+            raise ValueError("invalid prepared input identity")
+        result["identity"] = dict(identity)
+    return result

@@ -11,7 +11,7 @@ use cuteafd_loader::{push_load::builder::{Builder, CheckedPlan, Destination}, Of
 
 /// One coordinator GPU's admitted expert layers, laid out as today's mount
 /// arenas, one region per layer: EXL3 residencies of TP2 halves or of whole
-/// (world 1) layers and draft stages, native EXLR8 TP2 unit arenas, or native
+/// (world 1) layers and draft stages, native EXLR8 world-1/2 unit arenas, or native
 /// MXFP4 TP2 planes (the Spark native images at world 2, packed after Done).
 pub(crate) struct CoordinatorExpertPlan {
     pub residencies: Vec<V41Exl3Residency>,
@@ -35,11 +35,11 @@ impl CoordinatorExpertPlan {
         Self::exl3(residencies, layers.to_vec(), gpu, admitted)
     }
 
-    pub fn exlr8(catalog: &OfficialV41Catalog, manifest: &str, layers: &[usize], gpu: usize,
+    pub fn exlr8(catalog: &OfficialV41Catalog, manifest: &str, layers: &[usize], world: usize, gpu: usize,
         admitted: usize) -> Result<Self> {
-        ensure!(gpu < 2 && !layers.is_empty() && layers.windows(2).all(|ids| ids[0] < ids[1]),
-            "EXLR8 TP2 needs ordered layers on two GPUs");
-        let plan = super::push_exlr8::RankPlan::new(catalog.snapshot(), manifest, layers, 2, gpu, admitted)?;
+        ensure!((1..=2).contains(&world) && gpu < world && !layers.is_empty()
+            && layers.windows(2).all(|ids| ids[0] < ids[1]), "EXLR8 RTX needs ordered layers on one or two GPUs");
+        let plan = super::push_exlr8::RankPlan::new(catalog.snapshot(), manifest, layers, world, gpu, admitted)?;
         let validation = ValidationLayout::exl3(&[], plan.layout.bytes() as u64, usize::MAX)?;
         Ok(Self { residencies: Vec::new(), exlr8: plan.residencies, native: Vec::new(),
             layers: layers.to_vec(), gpu, layout: plan.layout, validation, scales: Default::default() })

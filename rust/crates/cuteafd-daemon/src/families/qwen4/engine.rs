@@ -487,11 +487,32 @@ mod tests {
     }
 
     #[test]
+    fn serving_graph_inventory_covers_every_reachable_c64_plain_shape() {
+        use super::*;
+        use cuteafd_loader::serving_capacity::qwen_graphs::qwen_startup_graphs;
+        for concurrency in [1, 16, 17, 32, 64] {
+            for speculation in [false, true] {
+                let shapes = serving_graph_shapes(32768, 512, 2051, concurrency, speculation);
+                for geometry in graph_geometries(32768, 512, 2051) {
+                    for live in 1..=concurrency {
+                        assert!(shapes.contains(&(decode_bucket(live, false), false, geometry)));
+                    }
+                }
+                let graphs = qwen_startup_graphs(32768, 32768, 2051, concurrency, speculation, 48).unwrap();
+                assert_eq!(graphs.shapes, shapes.len() as u64);
+                assert_eq!(graphs.ranks[0].executables, (shapes.len() * 49) as u64);
+            }
+        }
+    }
+
+    #[test]
     fn decode_buckets_preserve_registered_arithmetic_routes() {
         use super::*;
         check_bucket_thresholds(PLAIN_BUCKETS, DECODE_PROJECTION_THRESHOLDS).unwrap();
         check_bucket_thresholds(SPEC_BUCKETS, DECODE_PROJECTION_THRESHOLDS).unwrap();
         for (real, spec, bucket) in [(5, false, 8), (9, false, 16), (3, true, 4),
+            (17, false, 24), (24, false, 24), (25, false, 32), (32, false, 32),
+            (33, false, 64), (64, false, 64),
             (5, true, 8), (9, true, 16), (17, true, 24), (25, true, 32), (33, true, 64)] {
             assert_eq!(decode_bucket(real, spec), bucket);
             for projection in DECODE_PROJECTION_THRESHOLDS {
@@ -873,6 +894,8 @@ struct Tp2Rows {
 }
 
 impl Tp2Rows {
+    fn transfer_bytes(&self) -> usize { self.bytes.max(self.partial_bytes) }
+
     fn new(hidden: usize, topk: usize, rows: usize, wire: bool,
         partial: crate::shared::experts::rtx::PartialDtype) -> Result<Self> {
         use crate::shared::experts::rtx::PartialDtype;
@@ -926,7 +949,10 @@ impl<'a> QwenTp2<'a> {
         };
         let _scope = devices[0].enter()?;
         let exchange = crate::shared::peer_split::PeerExchange::new_abortable(library, ranks, 2,
-            layout.exchange_slot_bytes)?;
+            layout.exchange_slot_bytes, {
+                let decode = Tp2Rows::new(hidden, topk, DECODE_ROWS, wire, experts[0].partial())?;
+                decode.transfer_bytes()
+            })?;
         let combine = [devices[0].run(|| library.rtx_tp2_combine())?, devices[1].run(|| library.rtx_tp2_combine())?];
         let send = [zero(0, layout.bytes)?, zero(1, layout.bytes)?];
         let reduced = [zero(0, layout.reduction_bytes)?, zero(1, layout.reduction_bytes)?];
@@ -1366,7 +1392,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         let routed = QwenTp2::new(self.library, ranks, experts, self.cfg.hidden, self.cfg.topk,
             self.prefill_rows.max(DECODE_ROWS), wire)?;
-        let mut link = crate::shared::peer_split::hop::HopLink::new(self.library, ranks, &hops, spec)?;
+        let mut link = crate::shared::peer_split::hop::HopLink::new(self.library, ranks, &hops, spec, DECODE_ROWS * spec.row_bytes as usize)?;
         link.attach_abort([routed.exchange.abort_word(0)?.context("Qwen rank zero abort word")?,
             routed.exchange.abort_word(1)?.context("Qwen rank one abort word")?])?;
         self.hops = Some(link);
@@ -1446,8 +1472,7 @@ impl<'a> Qwen4Engine<'a> {
     /// Pre-capture every reachable bucket/geometry on no-storage rows, without expert traffic.
     pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool) -> Result<usize> {
         if !self.use_graphs || !self.startup_graphs { return Ok(0); }
-        ensure!(sequences <= *PLAIN_BUCKETS.last().unwrap(),
-            "Qwen startup graphs support at most 16 concurrent sequences");
+        cuteafd_core::concurrency::validate("qwen4", sequences as u64)?;
         check_bucket_thresholds(PLAIN_BUCKETS, DECODE_PROJECTION_THRESHOLDS)?;
         check_bucket_thresholds(SPEC_BUCKETS, DECODE_PROJECTION_THRESHOLDS)?;
         let shapes = serving_graph_shapes(self.max_context, self.pages, self.cfg.dense_context(), sequences, speculation);
@@ -4493,6 +4518,26 @@ mod owner_state_tests {
         }
         assert!(LayerStateMap::new(&kinds, &[0], 2).is_err());
         assert!(LayerStateMap::new(&[Gdn], &[2], 2).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod decode_extent_tests {
+    use super::*;
+
+    #[test]
+    fn declared_decode_extent_matches_real_tp2_layout() -> Result<()> {
+        use crate::shared::experts::rtx::PartialDtype;
+        for (wire, partial) in [(true, PartialDtype::F32), (false, PartialDtype::Bf16)] {
+            for hidden in [4096, 5120] {
+                let layout = Tp2Rows::new(hidden, 8, DECODE_ROWS, wire, partial)?;
+                let actual = cuteafd_loader::placement::families::qwen4::QwenTp2Rows::new(
+                    hidden as u64, 8, DECODE_ROWS as u64, wire)?;
+                assert_eq!(layout.transfer_bytes() as u64, actual.bytes.max(actual.partial_bytes));
+                assert!(layout.transfer_bytes() <= layout.exchange_slot_bytes);
+            }
+        }
         Ok(())
     }
 }

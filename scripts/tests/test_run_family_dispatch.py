@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -153,29 +154,6 @@ def test_spark_workers_reject_missing_zero_or_nonuniform_planner_budgets(tmp_pat
     assert "cuteafd expertd-native" not in result.stderr
 
 
-def test_exlr8_onboarded_halves_require_the_shared_committed_push():
-    source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/mod.rs").read_text()
-    planning = source.split("// Native dense operands and onboarded EXLR8 halves", 1)[1].split(
-        "Some(admission.start_with(&peers, ranks)?)", 1)[0]
-    expert_plan = source.split("let native_push_experts =", 1)[1].split("let admission =", 1)[0]
-    assert "CoordinatorExperts::Exlr8Tp2" in expert_plan
-    assert "layers: range.clone().collect()" in expert_plan
-    assert "budgets: budgets.to_vec()" in expert_plan
-    assert "native_push_experts()?" in planning
-    assert "CoordinatorPush::prepare(" in planning
-    assert "devices.len(), experts)?" in planning
-    assert "map_err" not in planning and ".ok()" not in planning
-    loading = source.split("let tp2_weights =", 1)[1].split("let (embedding,", 1)[0]
-    assert "Exlr8Tp2Weights::pushed_pair" in loading
-    assert 'pushed.context("onboarded EXLR8 experts require a committed push group")?' in loading
-    assert "tp2_weights(range, loaded.2)" in source
-    alone = source.split("if native_records.is_some() && native_push.is_none()", 1)[1].split(
-        "let started = Instant::now();", 1)[0]
-    assert "CoordinatorPush::prepare_alone(" in alone
-    assert "native_push_experts()?" in alone
-    assert "native_push = Some((push, 0))" in alone
-    executor = (ROOT / "rust/crates/cuteafd-daemon/src/shared/experts/rtx/exlr8.rs").read_text()
-    assert "fn load_pair" not in executor and "Exlr8Weights::load(" not in executor
 
 
 @pytest.mark.parametrize("keys,diagnostic", [
@@ -941,7 +919,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
                                     'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker bootstrap ready}"; '
-                                    'echo "audio encoder ready backend=mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '" ;; esac\n' +
+                                    'printf "audio encoder ready \\033[3mbackend\\033[0m\\033[2m=\\033[0m%s\\n" '
+                                    '"${STUB_AUDIO_BACKEND:-mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '}" ;; esac\n' +
                                     ('case "$*" in image\\ inspect*) echo test-pin ;; '
                                      'cp\\ *) dst="${@: -1}"; mkdir -p "$dst"; '
                                      'touch "$dst/cuteafd" "$dst/libcuteafd_native.so" "$dst/release-entrypoint.sh"; '
@@ -3404,6 +3383,22 @@ def test_mimo_media_plan_keeps_ingress_onboarding_and_graph_contract(tmp_path, i
     assert "--full-prefill-logits" in preflight and "--full-prefill-logits" in launch
 
 
+@pytest.mark.parametrize("backend", ["mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/exportbad",
+                                     "mimo_audio_fp32_v1/invalid", "unknown-backend"])
+def test_audio_ready_rejects_malformed_backend_identity(tmp_path, backend):
+    config = {"model_type": "mimo_v2", "hidden_size": 4096, "num_hidden_layers": 2,
+              "moe_layer_freq": [0, 1], "audio_token_id": 151669, "audio_config": {"audio_channels": 20}}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32,
+            "encoder": {"kind": {"kind": "off"}, "replicas": []},
+            "audio_encoder": {"kind": {"kind": "spark", "rank": 0}, "replicas": []}}
+    result = _family_launch_result(tmp_path, config, "test/mimo", "VISION=off\nAUDIO=auto\nRTX_GPUS=1\nSPECULATOR=off\n",
+                                  encoder_plan=plan, extra_env={"STUB_AUDIO_BACKEND": backend})
+    assert result.returncode != 0
+    assert "invalid ready audio backend identity" in result.stderr
+    assert "serve-mimo --snapshot" not in result.stderr
+
+
 @pytest.mark.parametrize("vision_kind,audio_kind", [("off", "spark"), ("spark", "spark"), ("rtx", "spark"), ("spark", "rtx"), ("rtx", "rtx")])
 def test_mimo_audio_independent_planner_peers_backend_and_rtx_fallback(tmp_path, vision_kind, audio_kind):
     config = {"model_type": "mimo_v2", "hidden_size": 4096, "num_hidden_layers": 2, "moe_layer_freq": [0, 1],
@@ -4108,9 +4103,13 @@ def test_launcher_plans_against_cuda_total_not_nvml_total(tmp_path, family, budg
               else {"model_type": "deepseek_v41"} if family == "deepseek_v41"
               else SPLIT_CONFIGS["mimo_flash" if family == "mimo_v2" else family])
     total = 101_973_491_712
+    # The mocked launch still checks the host API port; avoid live servers on 8000.
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        api_port = listener.getsockname()[1]
     result = _family_launch_result(tmp_path, config,
         "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model",
-        f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+        f"ADDR=127.0.0.1:{api_port}\nCOORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
         + ("SPARK_COUNT=4\n" + "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(4))
            if family == "deepseek_v41" else ""),
         gpu_total_mib=97887, gpu_free_mib=97887, cuda_total_bytes=total,

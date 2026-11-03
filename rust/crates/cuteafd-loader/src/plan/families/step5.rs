@@ -45,6 +45,9 @@ pub struct Config {
 }
 
 impl Config {
+    /// The planner's canonical family for this validated configuration.
+    pub fn family_id(&self) -> &'static str { STEP5.id() }
+
     pub fn parse(checkpoint: &Checkpoint) -> Result<Self> {
         let v = checkpoint.config.get("text_config").unwrap_or(&checkpoint.config);
         ensure!(v["model_type"] == "step5", "expected nested text_config.model_type=step5");

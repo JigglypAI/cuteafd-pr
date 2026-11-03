@@ -701,6 +701,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     cuteafd_core::set_expert_geometry(catalog.routed_experts().geometry()?)
         .map_err(|g| anyhow::anyhow!("geometry already {g:?}"))?;
     let cfg = GlmDsaConfig::read(&args.snapshot)?;
+    cuteafd_bench::context::set_family(cfg.family_id());
     let native = catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8;
     if native {
         ensure!(args.exlr8_manifest.is_some(), "native EXLR8 requires --exlr8-manifest");
@@ -981,7 +982,7 @@ impl Opened {
                     &local.package, self.cfg.hidden, max_rows)? as u64 == local.backend_workspace,
                     "GLM EXL3 planner/runtime backend workspace mismatch"),
                 glm::GlmLocalFormat::Exlr8 => ensure!(
-                    crate::shared::experts::rtx::exlr8::Exlr8Tp2Weights::workspace_bytes(
+                    crate::shared::experts::rtx::exlr8::Exlr8RtxWeights::workspace_bytes(
                         &programs, cuteafd_ffi::exlr8::KernelFamily::Glm, max_rows, args.exlr8_prefill_activations)? as u64 == local.backend_workspace,
                     "GLM EXLR8 planner/runtime backend workspace mismatch"),
                 glm::GlmLocalFormat::Nvfp4 { .. } => {
@@ -1032,10 +1033,10 @@ impl Opened {
         let mut native_push = None;
         let native_push_experts = || -> Result<_> {
             tp2_range.as_ref().map(|range| -> Result<_> {
-                let workspace = crate::shared::experts::rtx::exlr8::Exlr8Tp2Weights::workspace_bytes(
+                let workspace = crate::shared::experts::rtx::exlr8::Exlr8RtxWeights::workspace_bytes(
                     &programs, cuteafd_ffi::exlr8::KernelFamily::Glm, max_rows, args.exlr8_prefill_activations)?;
                 let budgets = tp2_budgets()?.map(|b| b.saturating_sub(workspace));
-                Ok(crate::shared::experts::rtx::push::CoordinatorExperts::Exlr8Tp2 {
+                Ok(crate::shared::experts::rtx::push::CoordinatorExperts::Exlr8 {
                     manifest: args.exlr8_manifest.clone().context("EXLR8 manifest")?,
                     layers: range.clone().collect(), budgets: budgets.to_vec() })
             }).transpose()
@@ -1118,7 +1119,7 @@ impl Opened {
                         [&local.package; 2], range.collect(), max_rows, budgets, CanonicalDecode)?,
                 }),
                 glm::GlmLocalFormat::Exlr8 => crate::shared::experts::rtx::Tp2Weights::Exlr8(
-                    crate::shared::experts::rtx::exlr8::Exlr8Tp2Weights::pushed_pair(devices,
+                    crate::shared::experts::rtx::exlr8::Exlr8RtxWeights::pushed_pair(devices,
                         &programs, range.collect(), max_rows, budgets, args.exlr8_prefill_activations,
                         pushed.context("onboarded EXLR8 experts require a committed push group")?
                             .into_iter().map(|r| r.exlr8()).collect::<Result<Vec<_>>>()?

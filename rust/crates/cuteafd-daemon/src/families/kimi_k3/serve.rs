@@ -114,6 +114,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&worker_args.snapshot, false, false)?;
             let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
             cfg.release_geometry()?;
+            cuteafd_bench::context::set_family(cfg.family_id());
             let concurrency = usize::from(worker_args.max_sequences);
             let slots = cuteafd_core::concurrency::state_slots(concurrency as u64) as usize;
             let prefill = worker_args.prefill()?;

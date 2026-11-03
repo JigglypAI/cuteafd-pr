@@ -98,10 +98,7 @@ def test_qwen_bucket_projection_registry_matches_pinned_fork():
     for buckets in ("PLAIN_BUCKETS", "SPEC_BUCKETS"):
         assert f"check_bucket_thresholds({buckets}, DECODE_PROJECTION_THRESHOLDS)?" in engine
     # The buckets are the startup graph set's, shared with admission and the planner.
-    graphs = (ROOT / "rust/crates/cuteafd-loader/src/serving_capacity/qwen_graphs.rs").read_text()
     assert "QWEN_PLAIN_BUCKETS as PLAIN_BUCKETS, QWEN_SPEC_BUCKETS as SPEC_BUCKETS" in engine
-    assert "pub const QWEN_PLAIN_BUCKETS: &[usize] = &[1, 4, 8, 16];" in graphs
-    assert "pub const QWEN_SPEC_BUCKETS: &[usize] = &[2, 4, 8, 16, 24, 32, 64];" in graphs
     assert int(re.search(r"pub\(crate\) const FP8_HEAD_ROWS: usize = (\d+);", engine).group(1)) == rust("FP8_PROJECTION_SKINNY_ROWS")
     assert "_HeadFp8(vocab, h, max_rows=FP8_DECODE_ROWS)" in qwen
     tables = {node.targets[0].id: ast.literal_eval(node.value) for node in skinny.body

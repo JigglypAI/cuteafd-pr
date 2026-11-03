@@ -44,6 +44,7 @@ impl<'a> GlmEngine<'a> {
             self.cfg.hidden,
             self.cfg.topk,
             self.prefill_rows.max(DECODE_ROWS),
+            DECODE_ROWS,
             self.prefill_lanes,
             self.tp2_exchange,
         )?);

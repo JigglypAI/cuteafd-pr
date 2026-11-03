@@ -39,7 +39,7 @@ fn standard_api_fixture_preserves_each_legacy_family_token_count() {
         let spec = ProbeSpec {
             prompt_ids: Some(vec![9; image.tokens]),
             media: vec![ProbeMedia { start: 0, len: image.tokens, kind: "image".into(),
-                key: format!("{:x}", Sha256::digest(image.key.0)), grid, fixture: None,
+                key: format!("{:x}", Sha256::digest(image.key.0)), grid, identity: None, input_key: None, fixture: None,
                 image_url: Some(ProbeImageUrl { url: source().url, detail: None }) }],
             ..ProbeSpec::default()
         };

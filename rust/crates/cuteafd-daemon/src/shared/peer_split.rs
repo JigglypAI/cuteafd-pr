@@ -206,6 +206,12 @@ pub(crate) struct PeerExchange<'a> {
     host_ordinals: RefCell<Vec<[[u64; 2]; 2]>>,
 }
 
+/// Decode copies stay on SMs; wider transfers use the sender's copy engine.
+fn validate_decode_extent(bytes: usize) -> Result<()> {
+    ensure!(bytes > 0 && bytes % 16 == 0, "decode peer extent must contain aligned rows");
+    Ok(())
+}
+
 impl<'a> PeerExchange<'a> {
     /// Physical retained owners, never reconstructed from requested slot extents.
     pub(crate) fn allocation_buffers(&self) -> Vec<(usize, String, cuteafd_ffi::CuteafdDeviceBuffer)> {
@@ -233,12 +239,14 @@ impl<'a> PeerExchange<'a> {
         ranks: [RankDevice; 2],
         slots: usize,
         slot_bytes: usize,
+        decode_lane_bytes: usize,
     ) -> Result<Self> {
-        Self::new_sized(library, ranks, &vec![slot_bytes; slots])
+        Self::new_sized(library, ranks, &vec![slot_bytes; slots], decode_lane_bytes)
     }
 
-    fn new_sized(library: &'a NativeLibrary, ranks: [RankDevice; 2], sizes: &[usize]) -> Result<Self> {
+    fn new_sized(library: &'a NativeLibrary, ranks: [RankDevice; 2], sizes: &[usize], decode_lane_bytes: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("peer-split");
+        validate_decode_extent(decode_lane_bytes)?;
         let slots = sizes.len();
         validate_slot_sizes(ranks.map(|rank| rank.device), sizes)?;
         let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
@@ -273,17 +281,10 @@ impl<'a> PeerExchange<'a> {
             ranks,
             ends: [end(0)?, end(1)?],
             abort: None,
-            decode_lane_bytes: usize::MAX,
+            decode_lane_bytes,
             trace_name: Cell::new("unnamed"),
             host_ordinals: RefCell::new(if diagnostics { vec![[[0; 2]; 2]; slots + 1] } else { Vec::new() }),
         })
-    }
-
-    /// Admit the largest decode transfer; wider pushes use the copy engine.
-    pub fn with_decode_lane_bytes(mut self, bytes: usize) -> Result<Self> {
-        ensure!(bytes > 0 && bytes % 16 == 0, "decode peer extent must contain aligned rows");
-        self.decode_lane_bytes = bytes;
-        Ok(self)
     }
 
     /// Optional MiMo terminal ownership. Other families retain the legacy ABI.
@@ -292,15 +293,17 @@ impl<'a> PeerExchange<'a> {
         ranks: [RankDevice; 2],
         slots: usize,
         slot_bytes: usize,
+        decode_lane_bytes: usize,
     ) -> Result<Self> {
-        Self::new_abortable_sized(library, ranks, &vec![slot_bytes; slots])
+        Self::new_abortable_sized(library, ranks, &vec![slot_bytes; slots], decode_lane_bytes)
     }
 
     /// Receive extents are admitted per slot, including private decode slots.
-    pub fn new_abortable_sized(library: &'a NativeLibrary, ranks: [RankDevice; 2], sizes: &[usize]) -> Result<Self> {
+    pub fn new_abortable_sized(library: &'a NativeLibrary, ranks: [RankDevice; 2], sizes: &[usize], decode_lane_bytes: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("peer-split");
+        validate_decode_extent(decode_lane_bytes)?;
         library.peer_abort_available()?;
-        let mut exchange = Self::new_sized(library, ranks, sizes)?;
+        let mut exchange = Self::new_sized(library, ranks, sizes, decode_lane_bytes)?;
         let side = |rank: usize| {
             on_device(library, ranks[rank].device, || {
                 let probe = |stage| crate::shared::inventory::startup_probe(
@@ -774,6 +777,17 @@ mod tests {
     }
 
     #[test]
+    fn decode_extent_validation_and_copy_boundary() {
+        for invalid in [0, 1, 17, usize::MAX] { assert!(validate_decode_extent(invalid).is_err()); }
+        let decode = 64 * 6144 * 2;
+        assert!(validate_decode_extent(decode).is_ok());
+        for bytes in [16, decode - 16, decode] {
+            assert!(crate::shared::memory::device::sm_peer_copy_for(true, bytes, decode));
+        }
+        assert!(!crate::shared::memory::device::sm_peer_copy_for(true, decode + 16, decode));
+    }
+
+    #[test]
     fn invalid_slot_sizes_name_the_slot_and_extent() {
         for bytes in [0, 17] {
             let error = validate_slot_sizes([0, 1], &[256, bytes]).unwrap_err().to_string();
@@ -793,7 +807,7 @@ mod tests {
         let ranks = [RankDevice { device: 0, stream: std::ptr::null_mut() },
             RankDevice { device: 1, stream: std::ptr::null_mut() }];
         let sizes = [256, 256, 1024, 1024, 1024];
-        let exchange = PeerExchange::new_sized(&library, ranks, &sizes)?;
+        let exchange = PeerExchange::new_sized(&library, ranks, &sizes, 256)?;
         for rank in 0..2 {
             for (slot, &bytes) in sizes.iter().enumerate() {
                 assert_eq!(exchange.ends[rank].recv[slot].buffer.bytes, bytes);
@@ -805,8 +819,8 @@ mod tests {
         let source = DeviceAllocation::new(&library, 1024)?;
         assert!(exchange.push(0, 0, source.buffer.ptr, 272).is_err());
         assert!(exchange.push(0, sizes.len(), source.buffer.ptr, 16).is_err());
-        assert!(PeerExchange::new_sized(&library, ranks, &[0]).is_err());
-        assert!(PeerExchange::new_sized(&library, ranks, &[17]).is_err());
+        assert!(PeerExchange::new_sized(&library, ranks, &[0], 256).is_err());
+        assert!(PeerExchange::new_sized(&library, ranks, &[17], 256).is_err());
         Ok(())
     }
 

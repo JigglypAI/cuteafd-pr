@@ -355,7 +355,7 @@ mod tests {
                     };
                     let images = if real_image {
                         vec![PreparedImage {
-                            key: ImageKey([0; 32]),
+                            key: ImageKey([0; 32]), encoder: cuteafd_loader::media::EncoderId([0; 32]), processor: cuteafd_loader::media::PreprocessId([0; 32]),
                             grid: ImageGrid { t: 1, h: 2, w: 2 },
                             rgb8: Arc::from([0; 3]),
                             tokens: 4,
