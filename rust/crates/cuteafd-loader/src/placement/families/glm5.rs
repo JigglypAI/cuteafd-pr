@@ -2172,22 +2172,40 @@ mod tests {
                 assert_eq!(placed.pool_tokens, tokens);
             } else {
                 assert_eq!(placed.onboard_layers, 0);
-                // This fixture stays within one graph-width interval. Compute
-                // the pool from the final charged ledger, not a pinned scalar
-                // whose value changes with the measured graph calibration.
+                // Characterize the legacy descending ceiling (#1120), not the
+                // new full-context contract: the first, wider census strands
+                // capacity when the smaller final census would fit more pages.
                 let mut req = request(&i).unwrap();
                 configure_attention(&mut req, Some(AttentionPlacement::Layers)).unwrap();
-                let mut maximum_units = u64::MAX;
-                for (rank, items) in placed.items.iter().enumerate() {
-                    let fixed: u64 = items.iter().filter(|item| item.group != "records")
+                let terms: Vec<_> = placed.items.iter().enumerate().map(|(rank, items)| {
+                    let fixed: u64 = items.iter().filter(|item|
+                        !matches!(item.group.as_str(), "records" | "graphs" | "graph growth"))
                         .map(|item| item.bytes).sum();
                     let unit = req.pool_overhead[rank] + req.layers.iter().zip(&placed.layers)
                         .filter(|(_, assignment)| matches!(assignment.mode,
                             LayerMode::Whole { gpu, .. } if usize::from(gpu) == rank))
                         .map(|(layer, _)| layer.kv_unit.unit_bytes_whole).sum::<u64>();
-                    maximum_units = maximum_units.min((req.inventory.gpus[rank].available() - fixed) / unit);
-                }
-                assert_eq!(placed.pool_tokens, maximum_units * PAGE_ROWS);
+                    (req.inventory.gpus[rank].available() - fixed, unit)
+                }).collect();
+                let fit = |graphs: Option<&crate::placement::inventory::GraphSet>| {
+                    terms.iter().enumerate().map(|(rank, &(available, unit))|
+                        (available - graphs.map_or(0, |g| g.bytes(rank))) / unit)
+                        .min().unwrap() * PAGE_ROWS
+                };
+                let initial = fit(None).min(req.pool.target);
+                let initial_context = crate::serving_capacity::pool_context(
+                    i.max_context as usize, true, initial as usize, 256).unwrap();
+                let owners = attention_owners(&cfg, i.layers).unwrap();
+                let first = crate::serving_capacity::glm_graphs::glm_owned_startup_graphs(
+                    initial_context, (initial / PAGE_ROWS) as usize, &owners,
+                    &vec![false; i.layers]).unwrap();
+                assert_eq!(placed.pool_tokens, fit(Some(&first.inventory)));
+                let final_context = (placed.pool_tokens - 256) as usize;
+                let final_graphs = crate::serving_capacity::glm_graphs::glm_owned_startup_graphs(
+                    final_context, (placed.pool_tokens / PAGE_ROWS) as usize, &owners,
+                    &vec![false; i.layers]).unwrap();
+                assert!(first.keys.len() > final_graphs.keys.len());
+                assert!(fit(Some(&final_graphs.inventory)) > placed.pool_tokens);
                 assert!((1 << 16..1 << 17).contains(&placed.pool_tokens));
             }
             let context = crate::serving_capacity::pool_context(i.max_context as usize,
