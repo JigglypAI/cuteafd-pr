@@ -525,8 +525,7 @@ fn boot_concurrency_full_plan_matrix() {
             Case { family: "deepseek_v41", label: "deepseek_v41", dir: strict_v41_snapshot(false), topologies: &[(1, 3), (2, 6)], concurrencies: ALL_CONCURRENCIES, manifest: None, base_options: None }
         }),
         Box::new(|| {
-            // Supported concurrencies C=1..64 are covered in `boot_concurrency_full_plan_matrix_muse_spark`
-            // (`#[ignore = "bug: #1135"]` while MuseSpark::runtime() remains RuntimeStatus::Planned).
+            // Supported concurrencies C=1..64 are covered in `boot_concurrency_full_plan_matrix_muse_spark`.
             let dir = tempfile::tempdir().unwrap();
             write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
             let manifest = write_muse_exl3_capacities(dir.path());
@@ -630,7 +629,6 @@ fn boot_concurrency_full_plan_matrix() {
 }
 
 #[test]
-#[ignore = "bug: #1135"]
 fn boot_concurrency_full_plan_matrix_muse_spark() {
     let dir = tempfile::tempdir().unwrap();
     write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
