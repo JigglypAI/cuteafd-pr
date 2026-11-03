@@ -254,7 +254,9 @@ impl<'a> Admission<'a> {
         let rtx = self.rtx_plan(devices)?;
         let load = DenseLoad::push(devices[0].library);
         // Dense owners and records, planned before membership.
-        let planned = if spark.coordinator_pushes() { (|| -> Result<_> {
+        let policy = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&checkpoint.snapshot)?;
+        let planned = policy.plan(|| -> Result<_> {
+            ensure!(spark.coordinator_pushes(), "Kimi Spark admission did not select required push");
             let owners = self.record(devices, checkpoint, &load, streams)?;
             let records = load.sink.as_ref().context("push sink")?.take_all();
             let (landed, operands, staged, steps, largest, finishes) = records.summary();
@@ -265,7 +267,7 @@ impl<'a> Admission<'a> {
                 budgets: budgets.to_vec() });
             let prepared = CoordinatorPush::prepare(&checkpoint.snapshot, Some(catalog), 2, experts)?;
             Ok((prepared, owners, records, dense))
-        })().map_err(|error| tracing::info!(%error, "Kimi coordinator push unavailable; mount")).ok() } else { None };
+        })?;
         let (planned, ranks) = match planned {
             Some(((push, streams, ranks), owners, records, dense)) => (Some((push, owners, records, dense)), Some((streams, ranks))),
             None => (None, None),
@@ -275,11 +277,7 @@ impl<'a> Admission<'a> {
         let (weights, pushed) = match planned {
             Some((push, owners, records, dense)) => {
                 let (pushed, ()) = push.receive_with(devices.to_vec(), Some(catalog), peers.len(), Some(Ok(dense)), || ());
-                let pushed = pushed?;
-                if pushed.is_none() {
-                    dense::fill_records_by_mount(devices[0].library, &records, |device| streams.iter()
-                        .find(|(id, _)| *id == device).map_or(std::ptr::null_mut(), |(_, s)| *s))?;
-                }
+                let pushed = policy.committed(pushed)?;
                 tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(), steps = records.steps.len(),
                     elapsed_ms = started.elapsed().as_millis() as u64, "Kimi coordinator dense operands landed");
                 (owners, pushed)

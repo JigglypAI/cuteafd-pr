@@ -409,7 +409,7 @@ fn dense_error_mount_group(library: &cuteafd_ffi::NativeLibrary, root: &std::pat
     let devices = [Device { library, id: 0 }, Device { library, id: 1 }];
     let dense: Option<Result<(Vec<DensePlan>, Vec<NoDense>)>> = Some(Err(anyhow::anyhow!("injected dense planning error")));
     let (pushed, ()) = push.receive_with(devices.to_vec(), Some(catalog), sparks, dense, || ());
-    assert!(pushed?.is_none(), "a declined dense plan must fall back to mount");
+    assert!(pushed.is_err(), "an uncommitted required coordinator group must fail startup after draining");
     assert!(!driver.join().map_err(|_| anyhow::anyhow!("driver panicked"))??, "the group driver must not prepare a group");
     assert_eq!(spark_thread.join().map_err(|_| anyhow::anyhow!("spark panicked"))??, None,
         "the Spark rank receives the whole-group mount decision");

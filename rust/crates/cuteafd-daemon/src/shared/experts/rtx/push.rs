@@ -4,6 +4,8 @@
 //! Spark rank. Publication follows the whole-group commit.
 #[cfg(test)]
 pub(crate) mod tests;
+mod policy;
+pub(crate) use policy::{PushPolicy, PushStartupError};
 use crate::shared::memory::{push_consumer::PushDestination, push_coordinator::CoordinatorExpertPlan};
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::{push_load::builder::CheckedPlan, OfficialV41Catalog, V41Exl3Layer};
@@ -80,6 +82,7 @@ pub(crate) enum PushedExperts<'a> {
     Exl3(Vec<crate::shared::experts::exl3::Exl3Weights<'a>>),
     Exlr8(Vec<crate::shared::experts::exlr8::Exlr8Weights<'a>>),
     Native(Vec<crate::shared::experts::layer::ExpertWeights<'a>>),
+    Fp8(Vec<crate::shared::experts::fp8::Fp8Layer<'a>>),
 }
 
 impl<'a> Default for PushedExperts<'a> {
@@ -87,12 +90,15 @@ impl<'a> Default for PushedExperts<'a> {
 }
 
 impl<'a> PushedExperts<'a> {
-    pub fn len(&self) -> usize { match self { Self::Exl3(w) => w.len(), Self::Native(w) => w.len(), Self::Exlr8(w) => w.len() } }
+    pub fn len(&self) -> usize { match self { Self::Exl3(w) => w.len(), Self::Native(w) => w.len(), Self::Exlr8(w) => w.len(), Self::Fp8(w) => w.len() } }
     pub fn exl3(self) -> Result<Vec<crate::shared::experts::exl3::Exl3Weights<'a>>> {
         match self { Self::Exl3(w) => Ok(w), _ => anyhow::bail!("non-EXL3 TP2 halves where EXL3 expected") }
     }
     pub fn exlr8(self) -> Result<Vec<crate::shared::experts::exlr8::Exlr8Weights<'a>>> {
         match self { Self::Exlr8(w) => Ok(w), _ => anyhow::bail!("non-EXLR8 TP2 halves where EXLR8 expected") }
+    }
+    pub fn fp8(self) -> Result<Vec<crate::shared::experts::fp8::Fp8Layer<'a>>> {
+        match self { Self::Fp8(w) => Ok(w), _ => anyhow::bail!("non-FP8-family payload where FP8-family expected") }
     }
     pub fn native(self) -> Result<Vec<crate::shared::experts::layer::ExpertWeights<'a>>> {
         match self { Self::Native(w) => Ok(w), Self::Exl3(w) if w.is_empty() => Ok(Vec::new()),
@@ -182,6 +188,19 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
             (None, None) => unreachable!("checked above"),
         };
         let Some(((catalog, plan, _), delivered)) = tp2.zip(delivered) else { return Ok(PushedExperts::default()) };
+        if let Some(fp8) = &plan.fp8 {
+            let initialize = fp8.layers.iter().map(|layer| match &layer.initialize {
+                push_initialize::Layer::Fp8 { widen, scalars, inputs, expand } => push_initialize::Layer::Fp8 {
+                    widen: widen.clone(), scalars: scalars.clone(), inputs: inputs.clone(), expand: expand.clone(),
+                },
+                _ => unreachable!("FP8 planner only emits FP8 initializers"),
+            }).collect::<Vec<_>>();
+            let ready = std::rc::Rc::new(push_initialize::initialize(delivered, &initialize, None, 0)?);
+            return fp8.layers.iter().enumerate().map(|(region, layer)| {
+                crate::shared::experts::fp8::Fp8Layer::from_push(ready.clone(), region, layer,
+                    fp8.layout.region(region)?.start)
+            }).collect::<Result<Vec<_>>>().map(PushedExperts::Fp8);
+        }
         if !plan.exlr8.is_empty() {
             let initialize = plan.exlr8.iter().enumerate().map(|(region, residency)|
                 push_initialize::Layer::Exlr8 { region, residency }).collect::<Vec<_>>();
@@ -197,7 +216,9 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
                 push_initialize::Layer::Native { region, layout, scalars: 0..0 }).collect::<Vec<_>>();
             let ready = std::rc::Rc::new(push_initialize::initialize(delivered, &initialize, None, plan.scratch_bytes())?);
             return plan.native.iter().zip(&plan.layers).enumerate().map(|(region, (layout, &layer))| {
-                let selection = crate::shared::experts::layer::ExpertLayer::BackboneTp2 { layer, rank: plan.gpu };
+                let selection = if plan.world == 1 {
+                    crate::shared::experts::layer::ExpertLayer::BackboneFull { layer }
+                } else { crate::shared::experts::layer::ExpertLayer::BackboneTp2 { layer, rank: plan.gpu } };
                 let budget = crate::shared::experts::layer::ExpertWeights::plan(library, catalog, selection)?;
                 crate::shared::experts::layer::ExpertWeights::from_push(library, ready.clone(), region, selection,
                     layout, budget)
@@ -275,6 +296,13 @@ impl CoordinatorExperts {
                 ensure!(gpu == 0, "whole coordinator expert layers live on one GPU");
                 ensure!(selections.iter().all(|s| matches!(s, ExpertLayer::BackboneFull { .. } | ExpertLayer::Dspark { .. })),
                     "a whole-layer coordinator plan takes full backbone layers and draft stages");
+                if catalog.exl3().is_none() {
+                    let layers = selections.iter().map(|s| match s {
+                        ExpertLayer::BackboneFull { layer } => Ok(*layer),
+                        _ => anyhow::bail!("native whole coordinator push requires backbone layers"),
+                    }).collect::<Result<Vec<_>>>()?;
+                    return CoordinatorExpertPlan::whole_native(catalog, &layers, *budget);
+                }
                 let residencies = selections.iter().map(|&s| crate::shared::experts::exl3::planned_residency(catalog, s))
                     .collect::<Result<Vec<_>>>()?;
                 CoordinatorExpertPlan::whole(residencies, *budget)
@@ -509,6 +537,6 @@ impl CoordinatorPush {
                 _ => anyhow::bail!("coordinator push GPUs disagree on the group commit"),
             }
         });
-        (pushed, value)
+        (PushPolicy::Required.committed(pushed).map_err(Into::into), value)
     }
 }

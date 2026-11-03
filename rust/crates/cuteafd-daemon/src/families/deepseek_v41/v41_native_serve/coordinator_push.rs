@@ -4,17 +4,21 @@
 //! native TP2 routed halves arrive in the Spark push group. Dense records are
 //! planned from headers before membership: a planning error offers no
 //! coordinator ranks (the Sparks still push, the coordinator fills by mount).
-use crate::shared::experts::rtx::{dense::{self, Records}, push::{CoordinatorPush, PushedExperts}};
+use crate::shared::experts::rtx::{dense::{self, Records}, push::{CoordinatorPush, PushedExperts, PushPolicy}};
 use crate::shared::memory::device::Device;
 use anyhow::{Context, Result};
 use cuteafd_loader::OfficialV41Catalog;
 
 /// Whether this launch may push its coordinator ranks (records are taken
 /// while loading; unused records then fill through the mount).
-pub(super) fn wanted(args: &crate::cli::NativeServeArgs, catalog: &OfficialV41Catalog) -> bool {
-    !args.peers.is_empty() && catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none()
-        && !args.tp2_query_projection && !args.tp2_output_projection && !args.tp2_dspark_experts
-        && cuteafd_loader::push_load::namespace(&args.snapshot).is_ok()
+pub(super) fn wanted(args: &crate::cli::NativeServeArgs, catalog: &OfficialV41Catalog) -> Result<bool> {
+    let policy = PushPolicy::for_snapshot(&args.snapshot)?;
+    policy.plan(|| {
+        anyhow::ensure!(!args.peers.is_empty() && catalog.exl3().is_none() && catalog.nvfp4().is_none()
+            && catalog.fp8().is_none() && !args.tp2_query_projection && !args.tp2_output_projection
+            && !args.tp2_dspark_experts, "V4.1 coordinator push does not support this weight placement yet");
+        Ok(())
+    }).map(|planned| planned.is_some()).map_err(Into::into)
 }
 
 /// The coordinator ranks the Spark admission starts with, or none (the
@@ -46,7 +50,7 @@ impl<'a> Planned<'a> {
         let Self { push, dense, sparks } = self;
         let started = std::time::Instant::now();
         let (pushed, ()) = push.receive_with(devices.to_vec(), Some(catalog), sparks, dense.map(Ok), || ());
-        let pushed = pushed?;
+        let pushed = PushPolicy::Required.committed(pushed)?;
         tracing::info!(pushed = pushed.is_some(), elapsed_ms = started.elapsed().as_millis(),
             "V4.1 coordinator push ranks received");
         pushed.map(|ranks| <[_; 2]>::try_from(ranks).map_err(|_| anyhow::anyhow!("two coordinator GPUs"))).transpose()
