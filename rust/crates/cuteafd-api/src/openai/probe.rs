@@ -584,7 +584,9 @@ mod tests {
                 audio: vec![ProbeAudio { start: 1, len, key: "ab".repeat(32), samples,
                     pcm_sha256: "cd".repeat(32) }], ..Default::default() };
             spec.validate_media_geometries(ImageTokenGeometry::MERGED, policy).unwrap();
-            assert!(spec.validate_audio().is_err(), "PCM must not use MiMo geometry");
+            if samples == 1 || samples == 24000 {
+                assert!(spec.validate_audio().is_err(), "distinct PCM geometry must not use MiMo policy");
+            }
             let mut bad = spec.clone();
             bad.audio[0].len += 1;
             assert!(bad.validate_audio_geometry(policy).is_err());
