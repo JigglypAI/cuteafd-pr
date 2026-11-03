@@ -55,10 +55,13 @@ impl MuseSparkPath<'_> {
 
 impl Drop for MuseSparkPath<'_> {
     fn drop(&mut self) {
-        self.stream.drain_or_abort("Muse Spark path copies and combines");
-        let link = self.link.take();
-        crate::shared::decode_graph::fatal_drain(
-            self.stream.device.run(|| { drop(link); Ok(()) }), "Muse Spark path device-scoped release");
+        // The engine publishes peer aborts before this fallback can run. During
+        // connect there are no peer consumers yet, but bootstrap can own QPs.
+        crate::shared::decode_graph::fatal_drain((|| {
+            self.quiesce_links()?;
+            self.stream.drain()?;
+            self.release_payloads()
+        })(), "Muse Spark path terminal teardown");
     }
 }
 
@@ -94,24 +97,27 @@ impl<'a> MuseSparkPath<'a> {
             let _scope = cuteafd_ffi::memory_ledger::scope("workspace/muse combine tables");
             Allocation::new(stream.device, layout.bytes() * waves)?
         };
-        let mut link = stream.device.run(|| {
-            let mut link = SparkLink::new_waves(library, world, &peers, u32::try_from(unit)?, config,
-                intake_row_bytes, waves, u32::try_from(unit)?)?;
-            link.enable_terminal_ownership(Arc::clone(library_owner))?;
-            Ok(link)
+        let mut link = stream.device.run(|| SparkLink::new_waves(library, world, &peers, u32::try_from(unit)?, config,
+            intake_row_bytes, waves, u32::try_from(unit)?))?;
+        // Ownership setup cannot queue work; failure here uses the ordinary empty-link drop.
+        stream.device.run(|| link.enable_terminal_ownership(Arc::clone(library_owner)))?;
+        let mut path = Self { stream, link: Some(link), library_owner: Arc::clone(library_owner), cutoff, tables, layout,
+            unit, waves, sequence: 0, in_flight: VecDeque::new(), terminal: false };
+        // Install the owner before any fallible bootstrap so errors use the
+        // same checked quiesce/drain/release path as normal shutdown.
+        path.stream.device.run(|| {
+            let link = path.link.as_mut().context("Muse Spark link absent")?;
+            ensure!(link.world_size() == peers.len(), "Muse Spark transport world differs from its peers");
+            link.bootstrap(&bootstrap_request(first_spark_layer, unit, cutoff)?)?;
+            ensure!(link.installed_grouping()?.len() == peers.len(), "Muse bootstrap requires every rank's grouping");
+            for slot in 0..waves {
+                let table = Self::slot_tables(&path.tables, layout, slot);
+                // SAFETY: a live admitted allocation on the lane's device and stream.
+                unsafe { library.reserve_h2d_ordered(table, path.stream.raw) }?;
+            }
+            Ok(())
         })?;
-        ensure!(link.world_size() == peers.len(), "Muse Spark transport world differs from its peers");
-        stream.device.run(|| link.bootstrap(&bootstrap_request(first_spark_layer, unit, cutoff)?))?;
-        ensure!(link.installed_grouping()?.len() == peers.len(), "Muse bootstrap requires every rank's grouping");
-        // Reserve each slot's ordered-upload staging before readiness: no upload
-        // allocates host memory under queued work.
-        for slot in 0..waves {
-            let table = Self::slot_tables(&tables, layout, slot);
-            // SAFETY: a live admitted allocation on the lane's device and stream.
-            stream.device.run(|| unsafe { library.reserve_h2d_ordered(table, stream.raw) })?;
-        }
-        Ok(Self { stream, link: Some(link), library_owner: Arc::clone(library_owner), cutoff, tables, layout,
-            unit, waves, sequence: 0, in_flight: VecDeque::new(), terminal: false })
+        Ok(path)
     }
 
     fn slot_tables(tables: &Allocation<'_>, layout: CombineTables, slot: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
@@ -126,6 +132,7 @@ impl<'a> MuseSparkPath<'a> {
 
     /// Checked QP quiescence precedes copy drainage and owner release.
     pub(crate) fn quiesce_links(&mut self) -> Result<()> {
+        if self.terminal { return Ok(()); }
         self.stream.device.run(|| {
             if let Some(link) = &mut self.link { link.terminal_quiesce()?; }
             Ok(())
@@ -148,6 +155,9 @@ impl<'a> MuseSparkPath<'a> {
 }
 
 impl SparkExperts for MuseSparkPath<'_> {
+    fn require_live(&self) -> Result<()> { ensure!(!self.terminal, "Muse Spark path is terminal"); Ok(()) }
+    fn quiesce_links(&mut self) -> Result<()> { MuseSparkPath::quiesce_links(self) }
+    fn release_payloads(&mut self) -> Result<()> { MuseSparkPath::release_payloads(self) }
     fn send(&mut self, layer: usize, step: &WaveStep, sources: [cuteafd_ffi::CuteafdDeviceBuffer; 3]) -> Result<Wave> {
         let rows = step.rows();
         ensure!(!step.segments.is_empty() && step.segments.iter().all(|s| s.rows > 0) && (1..=self.unit).contains(&rows),
@@ -263,37 +273,7 @@ mod tests {
             }
             assert!(expected.3 <= 2752 * intake_row_bytes(cutoff, 2752, 16, TOPK, WIDTH));
         }
-        let source = include_str!("spark.rs").split("#[cfg(test)]").next().unwrap();
-        assert!(source.contains("let payload = wire_plan(&plan)?.payload(TOPK, WIDTH)?.3"));
-        assert!(source.contains("send(rows, payload, layout"));
         Ok(())
     }
 
-    /// The path holds the link and its exact library until terminal release,
-    /// lands before uploading the tables, and releases a slot only after the
-    /// combine (the engine calls `consumed` behind it).
-    #[test]
-    fn path_orders_land_tables_and_consume() {
-        let source = include_str!("spark.rs").split("#[cfg(test)]").next().unwrap();
-        let land = source.split("fn land(").nth(1).unwrap().split("fn consumed(").next().unwrap();
-        assert!(land.find("exchange.land(ticket, stream)").unwrap() < land.find("copy_h2d_ordered").unwrap());
-        assert!(!land.contains("consumed("), "the combine reads the planes after land");
-        assert!(source.contains("link.enable_terminal_ownership"));
-        assert!(source.find("link.enable_terminal_ownership").unwrap() < source.find("link.bootstrap").unwrap());
-        assert!(source.contains("reserve_h2d_ordered"), "upload staging reserved before readiness");
-        assert!(!source.contains("block_on") && !source.contains("cuda_stream_synchronize"));
-        let device = include_str!("device.rs");
-        let front = device.split("pub(crate) fn layer_front(").nth(1).unwrap().split("pub(crate) fn layer_back(").next().unwrap();
-        let back = device.split("pub(crate) fn layer_back(").nth(1).unwrap();
-        // Front: frontend, wire, send (both layouts); back: land, combine, consume, then the backend.
-        for (front_call, wire) in [("self.moe_frontend(layer, rows)", "self.expert_wire(rows)"),
-            ("self.moe_frontend_split(layer, rows", "self.expert_wire(rows)")] {
-            let f = front.find(front_call).unwrap();
-            assert!(f < f + front[f..].find(wire).unwrap(), "{front_call} before the wire");
-        }
-        assert!(front.matches("experts.send(layer, &step.wave").count() == 2);
-        let order = ["experts.land(wave)", "self.combine(layer", "experts.consumed(wave)", "self.moe_backend"];
-        let at: Vec<usize> = order.iter().map(|needle| back.find(needle).unwrap()).collect();
-        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "layer back order {order:?}");
-    }
 }

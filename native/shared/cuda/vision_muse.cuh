@@ -18,7 +18,6 @@ size_t scratch_muse(Owner* o,size_t tokens,int output_width) {
   take(o->col,n*4);take(o->inverse,n*4);
   take(o->pos_indices,n*4*4);take(o->pos_weights,n*4*4);
   take(o->cu_seqlens,513*4);take(o->lse,size_t(16384)*16*4);
-  take(o->workspace,BLAS_BYTES);
   return cursor;
 }
 

@@ -193,7 +193,8 @@ extern "C" int32_t cuteafd_vision_required(const cuteafd_vision_spec* s, cuteafd
   Owner o;
   if(!copy_spec(o,*s))return cudaErrorMemoryAllocation;
   size_t bytes=scratch_tower(&o);
-  *out={s->weight_bytes,bytes-BLAS_BYTES,BLAS_BYTES,0,0}; return 0;
+  size_t blas_bytes=(s->abi_version==2 && s->reserved==5) ? 0 : BLAS_BYTES;
+  *out={s->weight_bytes,bytes-blas_bytes,blas_bytes,0,0}; return 0;
 }
 extern "C" int32_t cuteafd_vision_destroy(void* owner) {
   if(!owner)return cudaErrorInvalidValue;
@@ -242,11 +243,13 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
     }
   }
 #endif
-  e=blas_status(cublasCreate(&o->blas));if(e)return fail(e);
-  e=blas_status(cublasSetMathMode(o->blas,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION));if(e)return fail(e);
-  e=blas_status(cublasSetAtomicsMode(o->blas,CUBLAS_ATOMICS_NOT_ALLOWED));if(e)return fail(e);
-  e=blas_status(cublasSetStream(o->blas,o->stream));if(e)return fail(e);
-  e=blas_status(cublasSetWorkspace(o->blas,o->workspace,BLAS_BYTES));if(e)return fail(e);
+  if(ledger.blas_workspace) {
+    e=blas_status(cublasCreate(&o->blas));if(e)return fail(e);
+    e=blas_status(cublasSetMathMode(o->blas,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION));if(e)return fail(e);
+    e=blas_status(cublasSetAtomicsMode(o->blas,CUBLAS_ATOMICS_NOT_ALLOWED));if(e)return fail(e);
+    e=blas_status(cublasSetStream(o->blas,o->stream));if(e)return fail(e);
+    e=blas_status(cublasSetWorkspace(o->blas,o->workspace,BLAS_BYTES));if(e)return fail(e);
+  }
   if(s->abi_version==1) { e=cudaFuncSetAttribute(vit_attn_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,sizeof(AttnSmem));if(e)return fail(e); }
   *out=o;return 0;
 }

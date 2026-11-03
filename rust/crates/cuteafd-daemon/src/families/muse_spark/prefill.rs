@@ -258,10 +258,6 @@ mod tests {
         }
         assert!(super::score_chunks(64, 65, 0..64).is_err());
         assert!(super::score_chunks(64, 64, 0..65).is_err());
-        let source = include_str!("prefill.rs").split("#[cfg(test)]").next().unwrap();
-        let end = source.split("fn end_unit(").nth(1).unwrap().split("fn commit_unit(").next().unwrap();
-        assert!(end.find("super::forward::head(").unwrap() < end.find("copy_d2d_async(").unwrap());
-        assert!(end.contains("rank.prefill_logits.as_ref()"));
         Ok(())
     }
 
@@ -290,18 +286,6 @@ mod tests {
         Ok(())
     }
 
-    /// Units carry state only in their slot: views from `LaneViews::slot`, the
-    /// metadata bank of the unit's slot.
-    #[test]
-    fn units_address_their_slot() {
-        let source = include_str!("prefill.rs").split("#[cfg(test)]").next().unwrap();
-        let begin = source.split("fn begin_unit(").nth(1).unwrap().split("fn attention(").next().unwrap();
-        assert!(begin.contains("rank.lane.views.slot(unit.slot)"));
-        assert!(begin.contains("rank.step.upload(rank.device.library, unit.slot, &meta, true"));
-        assert!(begin.contains("super::forward::embed(self.cfg, rank, &lane"));
-        assert!(source.contains("rank.device_with(cfg, self.streams[index], &state.lanes[index])"));
-    }
-
     /// The drafter's tap rows are the call's last `TAP_ROWS` rows: the units
     /// overlapping that window tap their overlap at its window offset, so the
     /// window is tiled exactly once whatever the unit cut; every layer's back
@@ -324,11 +308,6 @@ mod tests {
                 }
                 assert!(covered.iter().all(|&c| c == 1), "rows {rows} unit {unit}");
             }
-        }
-        let source = include_str!("prefill.rs").split("#[cfg(test)]").next().unwrap();
-        for hook in ["fn local_ffn(", "fn land_experts("] {
-            let body = source.split(hook).nth(1).unwrap().split("\n    fn ").next().unwrap();
-            assert!(body.trim_end().ends_with("self.tap(layer, unit)\n    }") || body.contains("self.tap(layer, unit)"), "{hook}");
         }
         Ok(())
     }

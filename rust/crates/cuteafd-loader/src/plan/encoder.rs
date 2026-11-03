@@ -170,6 +170,13 @@ fn candidates(request: &EncoderRequest, hardware: &EncoderHardware) -> Vec<Encod
     result
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{reason}; exact ledger shortfall {shortfall} bytes")]
+pub struct EncoderAdmissionError {
+    pub reason: String,
+    pub shortfall: u64,
+}
+
 /// Return the actual successful solve with its reservations. Candidates follow
 /// a fixed order and stop at the first fit; no second solve can choose a new
 /// topology or silently refund a tower. Auto's final Off candidate is considered
@@ -237,7 +244,7 @@ pub fn admit_encoders<T>(requests: &[EncoderRequest], hardware: &EncoderHardware
             selected.push(EncoderPlacement { kind: EncoderKind::Off, weights: 0, scratch: 0,
                 replicas: Vec::new(), reason, shortfall: diagnostic.shortfall });
             visit(requests, hardware_base, index + 1, selected, solve)
-        } else { anyhow::bail!("{reason}; exact ledger shortfall {} bytes", diagnostic.shortfall) }
+        } else { Err(EncoderAdmissionError { reason, shortfall: diagnostic.shortfall }.into()) }
     }
     let mut selected = Vec::new();
     let result = visit(requests, hardware, 0, &mut selected, &mut solve)?;
@@ -367,8 +374,9 @@ mod tests {
         assert_eq!(selected[0].kind, EncoderKind::Spark { rank: 0 });
         hardware.sparks[0].free_bytes = 6;
         let mut calls = 0;
-        let error = admit_encoders(&requests, &hardware, |_| { calls += 1; Ok(()) }).unwrap_err().to_string();
-        assert!(error.contains("exact ledger shortfall 1 bytes"), "{error}");
+        let error = admit_encoders(&requests, &hardware, |_| { calls += 1; Ok(()) }).unwrap_err();
+        assert_eq!(error.downcast_ref::<EncoderAdmissionError>().unwrap().shortfall, 1);
+        assert!(error.to_string().contains("exact ledger shortfall 1 bytes"), "{error}");
         assert_eq!(calls, 0);
         let requests = [EncoderRequest { mode: MediaMode::Auto, ..requests[0].clone() }];
         let (selected, ()) = admit_encoders(&requests, &hardware, |_| Ok(())).unwrap();

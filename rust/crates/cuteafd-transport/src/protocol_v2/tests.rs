@@ -927,6 +927,35 @@ fn request_frame_view_checksum_is_explicit_debug_validation() -> Result<()> {
 }
 
 #[test]
+fn request_checksum_covers_header_regions_routes_and_payload() -> Result<()> {
+    let request = request(6, ExpertV2SourceKind::Prefill)?
+        .with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0, 0, 1, 1, 1, 0] })?
+        .with_debug_checksum();
+    let encoded = request.encode()?;
+    let prefix = request_payload_offset(&request);
+    let mut split_prefix = Vec::new();
+    request.encode_prefix_into(&mut split_prefix)?;
+    assert_eq!(split_prefix, encoded[..prefix]);
+    ExpertProtocolV2RequestView::parse(&encoded)?.verify_checksum()?;
+    assert_eq!(ExpertProtocolV2Request::decode(&encoded)?, request);
+    for (offset, value) in [
+        (16, encoded[16] ^ 1), // request id, still structurally valid
+        (46, PartialWire::Fp8 as u8),
+        (request.header_len() + 10, 1), // real row region
+        (request.header_len() + request.rows.len() * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN + 4, 1),
+        (prefix, encoded[prefix] ^ 1),
+    ] {
+        let mut damaged = encoded.clone();
+        damaged[offset] = value;
+        let view = ExpertProtocolV2RequestView::parse(&damaged)?;
+        assert!(view.verify_checksum().unwrap_err().to_string().contains("checksum mismatch"), "offset {offset}");
+        assert!(ExpertProtocolV2Request::decode(&damaged).unwrap_err().to_string().contains("checksum mismatch"),
+            "offset {offset}");
+    }
+    Ok(())
+}
+
+#[test]
 fn response_frame_view_checksum_is_explicit_debug_validation() -> Result<()> {
     let response = ExpertProtocolV2Response::new(
         42,

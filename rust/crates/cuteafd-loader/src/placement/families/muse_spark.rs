@@ -159,13 +159,35 @@ impl MuseRequest {
             });
             return Ok(());
         }
+        // Price fixed LM state and only mandatory onboarding. Optional expert
+        // layers remain movable when the joint solve tries a tower candidate.
+        let minimum = self.request.onboard.layers(self.spark_budget.layers.len())
+            .unwrap_or(self.request.minimum_expert_layers);
+        let mut baseline = self.request.clone();
+        baseline.onboard = Onboard::Layers(minimum);
+        let placed = solve(&baseline)?;
+        let units = baseline.pool.requested.unwrap_or(baseline.pool.target)
+            .div_ceil(baseline.pool.unit_rows.max(1));
         let hardware = EncoderHardware { v41: false,
-            gpus: self.request.inventory.gpus.iter().map(|gpu| EncoderGpuBudget {
-                free_bytes: gpu.available(), kv_target_bytes: 0 }).collect(),
-            sparks: (0..self.spark_budget.resident.len()).map(|rank| EncoderSparkBudget {
-                rank, host: format!("spark{rank}"), idle: false,
-                expert_bytes: self.spark_budget.resident[rank].iter().sum(),
-                free_bytes: self.spark_budget.budget }).collect() };
+            gpus: placed.pool_limits.0.iter().map(|rank| {
+                let kv_target_bytes = rank.demands.iter().try_fold(0u64, |sum, demand| {
+                    let bytes = units.saturating_add(demand.offset_units).min(demand.cap_units)
+                        .checked_mul(demand.bytes_per_unit).context("Muse media KV reservation overflow")?;
+                    sum.checked_add(bytes).context("Muse media KV reservation overflow")
+                })?;
+                Ok(EncoderGpuBudget { free_bytes: rank.available_bytes, kv_target_bytes })
+            }).collect::<Result<Vec<_>>>()?,
+            sparks: (0..self.spark_budget.resident.len()).map(|rank| {
+                // A tower must retain an expert worker; maximum admissible
+                // room excludes I/O/runtime plus the final routed layer.
+                let maximum = self.request.onboard.layers(self.spark_budget.layers.len())
+                    .unwrap_or(self.spark_budget.layers.len().saturating_sub(1));
+                let resident = self.spark_budget.resident[rank][maximum..].iter().sum::<u64>();
+                EncoderSparkBudget { rank, host: format!("spark{rank}"), idle: false,
+                    expert_bytes: self.spark_budget.resident[rank][minimum..].iter().sum(),
+                    free_bytes: self.spark_budget.budget.saturating_sub(self.spark_budget.overhead[rank])
+                        .saturating_sub(resident) }
+            }).collect() };
         let requests = [EncoderRequest { mode: options.vision, weights: options.vision_bytes.0,
             scratch: options.vision_bytes.1, copies: options.replicas },
             EncoderRequest { mode: options.audio, weights: options.audio_bytes.0,

@@ -12,7 +12,7 @@ use super::{
     ExpertProtocolV2Status, ExpertProtocolV2WireStats, ExpertV2Dtype, REQUEST_CHECKSUM_OFFSET,
     REQUEST_KIND, RESPONSE_CHECKSUM_OFFSET, RESPONSE_EXECUTOR_ID_OFFSET, RESPONSE_KIND,
     checked_usize, debug_checksum_enabled, decode_route_entry, decode_row_descriptor,
-    payload_checksum, precompile_warmup_enabled, read_u16, read_u32, read_u64,
+    request_checksum, precompile_warmup_enabled, read_u16, read_u32, read_u64,
     request_header_len_from_flags, response_fp8_e4m3_row_scaled_enabled,
     response_header_len_from_flags, response_more_chunks_enabled,
     response_nvfp4_e2m1_fp8_e4m3_enabled, response_row_indices_enabled,
@@ -326,23 +326,8 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
         if !self.debug_checksum_enabled() {
             bail!("ExpertProtocolV2 request debug checksum flag is not set");
         }
-        let descriptor_rows = if self.stream_data_enabled() {
-            0
-        } else {
-            self.header.row_count as usize
-        };
-        let route_entries = if self.stream_data_enabled() {
-            0
-        } else {
-            self.header.route_count as usize
-        };
-        let rows = (0..descriptor_rows)
-            .map(|index| self.row(index))
-            .collect::<Result<Vec<_>>>()?;
-        let routes = (0..route_entries)
-            .map(|index| self.route(index))
-            .collect::<Result<Vec<_>>>()?;
-        let actual = payload_checksum(&rows, &routes, self.hidden_payload);
+        let prefix_len = self.frame_bytes.len() - self.hidden_payload.len();
+        let actual = request_checksum(&self.frame_bytes[..prefix_len], self.hidden_payload);
         let Some(checksum) = self.checksum else {
             bail!("ExpertProtocolV2 request checksum header is malformed");
         };

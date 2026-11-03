@@ -549,6 +549,15 @@ fn media_auto_off_disables_component_bytes() {
     assert!(off.fits, "{:?}", off.hints);
     assert_eq!(off.encoder.as_ref().unwrap().kind, crate::plan::encoder::EncoderKind::Off);
     assert_eq!(off.audio_encoder.as_ref().unwrap().kind, crate::plan::encoder::EncoderKind::Off);
+    assert!(off.encoder.as_ref().unwrap().shortfall > 0, "{:?}", off.encoder);
+    assert!(off.audio_encoder.as_ref().unwrap().shortfall > 0, "{:?}", off.audio_encoder);
+    assert_eq!(off.memory_layout.as_ref().unwrap().pool_tokens, 4096);
+    assert!(plan::render(&off).contains("Muse axial/window attention"));
+    options.vision = MediaMode::Rtx(Some(0));
+    options.audio = MediaMode::Off;
+    let refused = input.plan(&options).unwrap();
+    assert!(!refused.fits);
+    assert!(refused.encoder.as_ref().unwrap().shortfall > 0, "{:?}", refused.encoder);
     assert!(off.disabled_media_bytes > 0, "{:?}", off.hints);
     for component in [Component::Vision, Component::Audio] {
         let component = off.components.iter().find(|c| c.component == component).unwrap();
@@ -592,5 +601,34 @@ fn coordinator_media_hash_includes_vision_and_pcm_tensor_headers() {
         let next = hash();
         assert_ne!(previous, next, "{prefix}");
         previous = next;
+    }
+}
+
+#[test]
+fn host_transport_uses_resolved_small_and_large_card_slots_only() {
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(&testing::muse_spark_config()).unwrap();
+    for (bytes, slots) in [(32 << 30, 8), (crate::placement::inventory::PRO_TOTAL_BYTES, 16)] {
+        let mut options = with_layout(1, 6);
+        options.layout.as_mut().unwrap().rtx_bytes = vec![bytes];
+        options.layout.as_mut().unwrap().context_tokens = 4096;
+        options.layout.as_mut().unwrap().pool_tokens = Some(4096);
+        let report = input.plan(&options).unwrap();
+        let opts = options.layout.as_ref().unwrap();
+        assert_eq!(opts.resolved_state_slots("muse_spark"), slots);
+        let unit_rows = report.prefill_unit_rows.unwrap();
+        let waves = report.prefill_waves.unwrap();
+        let shape = crate::serving_capacity::prefill_waves::PrefillPlan { unit_rows, waves, span_rows: unit_rows * waves };
+        let cutoff = crate::families::muse_spark::replies::Cutoff::with_wide(opts.muse_partial_bf16_max_rows,
+            crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, opts.muse_partial_wide_format).unwrap();
+        let expected = crate::placement::families::muse_spark::host_transport(&cfg, shape, cutoff, slots as usize, 6).unwrap();
+        let host = report.host_ledger.as_ref().unwrap();
+        for (name, bytes) in [("transport/rdma-rings", expected.rings), ("transport/egress", expected.egress),
+            ("spark-intake", expected.intake)] {
+            assert_eq!(host.items.iter().find(|item| item.group == name).unwrap().bytes, bytes, "{name}");
+        }
+        assert!(host.items.iter().all(|item| !matches!(item.group.as_str(),
+            "workspace/router" | "staging/tables-and-sync")));
     }
 }

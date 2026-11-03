@@ -782,24 +782,11 @@ fn decode_route_entry(bytes: &[u8], offset: usize) -> Result<ExpertProtocolV2Rou
     })
 }
 
-fn payload_checksum(
-    rows: &[ExpertProtocolV2RowDescriptor],
-    routes: &[ExpertProtocolV2RouteEntry],
-    hidden_payload: &[u8],
-) -> [u8; CHECKSUM_LEN] {
+fn request_checksum(prefix: &[u8], hidden_payload: &[u8]) -> [u8; CHECKSUM_LEN] {
     let mut hasher = Sha256::new();
-    let mut scratch = Vec::with_capacity(EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN);
-    for row in rows {
-        scratch.clear();
-        encode_row_descriptor(&mut scratch, row, 0);
-        hasher.update(&scratch);
-    }
-    scratch.reserve(EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN);
-    for route in routes {
-        scratch.clear();
-        encode_route_entry(&mut scratch, route);
-        hasher.update(&scratch);
-    }
+    // Hash the actual wire image, excluding only the checksum's own bytes.
+    hasher.update(&prefix[..REQUEST_CHECKSUM_OFFSET]);
+    hasher.update(&prefix[REQUEST_CHECKSUM_OFFSET + CHECKSUM_LEN..]);
     hasher.update(hidden_payload);
     hasher.finalize().into()
 }

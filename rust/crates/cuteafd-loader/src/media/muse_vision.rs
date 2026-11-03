@@ -91,14 +91,14 @@ pub fn is_tensor(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
-/// Exactly scratch_muse, including fixed-capacity attention LSE and BLAS workspace.
+/// Exactly scratch_muse, including fixed-capacity attention LSE (no BLAS workspace).
 pub fn scratch_bytes(tokens: u64) -> Result<u64, String> {
     if !(1..=MAX_TOKENS).contains(&tokens) { return Err("Muse vision capacity must be 1..=4096".into()); }
     let n = tokens * 4;
     Ok([n*1536*2, n*1536*2, n*1536*2, n*1176*2, n*4608*2,
         n*1536*2, n*1536*2, n*1536*2, n*1536*2, n*1536*2, n*8960*2,
         tokens*4096*2, tokens*8192*2, n*96*2, n*96*2, n*14*14*3, 768*4,
-        n*4, n*4, n*4*4, n*4*4, 513*4, 16384*16*4, 4*1024*1024]
+        n*4, n*4, n*4*4, n*4*4, 513*4, 16384*16*4]
         .into_iter().map(|b| b.div_ceil(256)*256).sum())
 }
 
@@ -154,7 +154,7 @@ mod tests {
         let bytes: usize = shapes.iter().map(|(_, shape)| shape.iter().product::<usize>() * 2).sum();
         assert_eq!(bytes, 3_856_274_432);
         assert_eq!(bytes % 256, 0);
-        assert_eq!(scratch_bytes(4096).unwrap(), 1_008_276_736);
+        assert_eq!(scratch_bytes(4096).unwrap(), 1_004_082_432);
         assert!(scratch_bytes(0).is_err());
         assert!(scratch_bytes(4097).is_err());
     }
