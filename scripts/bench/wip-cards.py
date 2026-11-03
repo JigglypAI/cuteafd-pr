@@ -92,6 +92,42 @@ def short_instance(value):
     return value if len(value) <= 41 else value[:32] + '-' + hashlib.sha256(value.encode()).hexdigest()[:8]
 
 
+def launcher_defaults(repo=REPO):
+    """Read the launcher's default EXPERT_PORT and ADDR from scripts/launch/run-family.sh."""
+    text = (Path(repo) / 'scripts/launch/run-family.sh').read_text()
+    defaults = {match[1]: match[2] for match in re.finditer(r'\$\(get\s+(EXPERT_PORT|ADDR)\s+([^\s")]+)\)', text)}
+    if {'EXPERT_PORT', 'ADDR'} - defaults.keys():
+        raise ValueError('missing EXPERT_PORT/ADDR defaults in scripts/launch/run-family.sh')
+    return defaults
+
+
+LAUNCHER_DEFAULTS = launcher_defaults()
+
+
+def resolve_container_keys(entry):
+    """Resolve and validate the container-name and endpoint keys a launch uses."""
+    values = entry.get('set', {})
+    instance = str(values.get('INSTANCE', ''))
+    if not instance or len(instance) > 41 or not NAME.fullmatch(instance):
+        raise ValueError(f'INSTANCE must be [A-Za-z0-9_.-] (1..41 chars): {instance!r}')
+    port = str(values['EXPERT_PORT']) if 'EXPERT_PORT' in values else LAUNCHER_DEFAULTS['EXPERT_PORT']
+    if not port.isascii() or not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ValueError(f'EXPERT_PORT must be in 1..65535: {port!r}')
+    addr = str(values['ADDR']) if 'ADDR' in values else LAUNCHER_DEFAULTS['ADDR']
+    sparks = list(entry.get('sparks', []))
+    for host in sparks:
+        if not isinstance(host, str) or not NAME.fullmatch(host) or host not in HOSTS:
+            raise ValueError(f'invalid Spark host: {host!r}')
+    return dict(instance=instance, expert_port=port, addr=addr, sparks=sparks)
+
+
+def container_targets(job):
+    resolved = resolve_container_keys(job['entry'])
+    targets = [('raptor', 'cuteafd-coordinator-' + resolved['instance'])]
+    targets += [(host, f"cuteafd-spark-expert-{host}-{resolved['expert_port']}") for host in resolved['sparks']]
+    return targets
+
+
 def load_lossless_set(path):
     """An absolute, checked spec_lossless_set case file; the server re-validates."""
     path = Path(path).expanduser().resolve()
@@ -347,11 +383,12 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
         # the sweep's first warm wave and closes them (writing the reports) at
         # sweep end, or before teardown if the sweep stopped in between.
         sessions = []
+        resolved = resolve_container_keys(dict(set=values, sparks=hosts))
         if 'nsys' in values.get('PROFILE', '').split(','):
-            sessions.append(['docker', 'exec', 'cuteafd-coordinator-' + values['INSTANCE'], '/usr/local/cuda/bin/nsys'])
+            sessions.append(['docker', 'exec', 'cuteafd-coordinator-' + resolved['instance'], '/usr/local/cuda/bin/nsys'])
         if values.get('PROFILE_SPARK') == 'nsys':
             for rank in spark_profile_ranks(values, hosts):
-                worker = f"cuteafd-spark-expert-{hosts[rank]}-{values.get('EXPERT_PORT', '19441')}"
+                worker = f"cuteafd-spark-expert-{hosts[rank]}-{resolved['expert_port']}"
                 sessions.append(['ssh', '-o', 'BatchMode=yes', hosts[rank], 'docker', 'exec', worker, '/usr/local/cuda/bin/nsys'])
         if sessions:
             if not (entry.get('levels') or entry.get('prefill_lengths')):
@@ -449,12 +486,13 @@ def parallel_safe(jobs, parallel):
             raise ValueError('parallel profile is published')
     for a, b in itertools.combinations(jobs, 2):
         ea, eb = a['entry'], b['entry']
-        if set(ea['gpus']) & set(eb['gpus']) or set(ea['sparks']) & set(eb['sparks']):
+        ra, rb = resolve_container_keys(ea), resolve_container_keys(eb)
+        if set(ea['gpus']) & set(eb['gpus']) or set(ra['sparks']) & set(rb['sparks']):
             raise ValueError('parallel cards overlap GPUs or Sparks')
-        for key in ('ADDR', 'EXPERT_PORT'):
-            if ea['set'].get(key) == eb['set'].get(key):
+        for key, field in (('ADDR', 'addr'), ('EXPERT_PORT', 'expert_port')):
+            if ra[field] == rb[field]:
                 raise ValueError('parallel cards overlap ' + key)
-        if ea['set']['INSTANCE'] == eb['set']['INSTANCE']:
+        if ra['instance'] == rb['instance']:
             raise ValueError('parallel cards need separate instances')
 
 
@@ -606,7 +644,11 @@ def preflight_job(job, arm):
     values = job['entry']['set']
     needs = job.get('needs') or {'coordinator': [], 'spark': [], 'audio': False}
     artifacts, problems = {}, []
-    for host in ('raptor', *job['entry']['sparks']):
+    try:
+        container_targets(job)
+    except ValueError as error:
+        problems.append(str(error))
+    for host in ('raptor', *(h for h in job['entry']['sparks'] if isinstance(h, str) and h in HOSTS)):
         meta = json.loads(slot_check(arm, host))
         release = 'release' in arm
         keys = ('image', 'image_id', 'repo_digests') if release else ('slot', 'seal_sha256', 'artifact_manifest_sha256')
@@ -1672,10 +1714,7 @@ def write_summary(state, rows, arms):
 
 
 def assert_absent(job):
-    e = job['entry']
-    targets = [('raptor', 'cuteafd-coordinator-' + e['set']['INSTANCE'])]
-    targets += [(h, f"cuteafd-spark-expert-{h}-{e['set']['EXPERT_PORT']}") for h in e['sparks']]
-    for host, name in targets:
+    for host, name in container_targets(job):
         cmd = ['docker', 'ps', '-a', '--format', '{{.Names}}']
         if host != 'raptor':
             cmd = ['ssh', '-o', 'BatchMode=yes', host, shlex.join(cmd)]

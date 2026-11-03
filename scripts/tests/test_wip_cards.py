@@ -2787,3 +2787,67 @@ def test_cold_window_drops_page_cache_when_the_timed_sweep_opens(entry, tmp_path
     with pytest.raises(ValueError, match='needs the SparkNest `nest` CLI'):
         cards.generate({**entry, 'prefill_lengths': [8192]}, 'd', dict(instance='s', slot='s'), tmp_path,
                        tmp_path / 'key', {}, set(), None, 1, cold_hosts=['raptor'])
+
+
+def test_omitted_expert_port_uses_launcher_default_in_preflight_and_assert_absent(entry, tmp_path, monkeypatch):
+    omitted = {**entry, 'set': {k: v for k, v in entry['set'].items() if k != 'EXPERT_PORT'}}
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[omitted])))
+    state = tmp_path / 'state'
+    monkeypatch.setattr(cards, 'slot_check', _fake_slot())
+    monkeypatch.setattr(cards, 'binary_supports', lambda *a, **k: None)
+    monkeypatch.setattr(sys, 'argv', [
+        'wip-cards', '--kit', str(kit), '--cards', omitted['name'], '--matrix',
+        '--arm', 'base=b:s', '--state', str(state), '--binary', sys.executable,
+        '--preflight-only',
+    ])
+    assert cards.main() == 0
+    assert json.loads((state / 'preflight.json').read_text())['status'] == 'pass'
+    plan = json.loads((state / 'plan.json').read_text())
+    job = plan['jobs'][0]
+    assert 'EXPERT_PORT' not in job['entry']['set']
+    assert cards.LAUNCHER_DEFAULTS == {'EXPERT_PORT': '19441', 'ADDR': '0.0.0.0:8000'}
+    assert cards.container_targets(job) == [
+        ('raptor', 'cuteafd-coordinator-' + job['entry']['set']['INSTANCE']),
+        *((host, f'cuteafd-spark-expert-{host}-19441') for host in omitted['sparks']),
+    ]
+    seen = []
+    monkeypatch.setattr(cards, 'run', lambda cmd: seen.append(cmd) or SimpleNamespace(stdout=''))
+    cards.preflight_at_grant(job, {'instance': 'b', 'slot': 's'})
+    assert len(seen) == 1 + len(omitted['sparks'])
+    monkeypatch.setattr(cards, 'run', lambda cmd: SimpleNamespace(stdout='cuteafd-spark-expert-ostrich-19441\n'))
+    with pytest.raises(ValueError, match='cuteafd-spark-expert-ostrich-19441'):
+        cards.assert_absent(job)
+
+
+@pytest.mark.parametrize('extra_argv,expected', [
+    (['--set', 'v41-min:EXPERT_PORT=99999'], 'EXPERT_PORT must be in 1..65535'),
+    (['--arm-set', 'base:EXPERT_PORT=0'], 'EXPERT_PORT must be in 1..65535'),
+    (['--set', 'v41-min:EXPERT_PORT=not-a-port'], 'EXPERT_PORT must be in 1..65535'),
+])
+def test_invalid_container_keys_fail_at_preflight_before_hardware_grant(entry, tmp_path, monkeypatch, extra_argv, expected):
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
+    state = tmp_path / 'state'
+    monkeypatch.setattr(cards, 'slot_check', _fake_slot())
+    monkeypatch.setattr(cards, 'binary_supports', lambda *a, **k: None)
+    granted = []
+    monkeypatch.setattr(cards, 'serving_turn', lambda *a, **k: granted.append(True))
+    monkeypatch.setattr(sys, 'argv', [
+        'wip-cards', '--kit', str(kit), '--cards', entry['name'], '--matrix',
+        '--arm', 'base=b:s', '--state', str(state), '--binary', sys.executable,
+        *extra_argv,
+    ])
+    with pytest.raises(ValueError, match=expected):
+        cards.main()
+    assert not granted
+    preflight = json.loads((state / 'preflight.json').read_text())
+    assert preflight['status'] == 'failed'
+    assert any(expected in problem for problem in preflight['problems'])
+    job = make(entry, tmp_path / 'direct')
+    job['entry']['set'].pop('INSTANCE')
+    with pytest.raises(ValueError, match='INSTANCE must be'):
+        cards.preflight_job(job, {'instance': 'test-base', 'slot': 's'})
+
