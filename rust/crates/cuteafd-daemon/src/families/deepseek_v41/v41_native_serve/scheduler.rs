@@ -33,7 +33,7 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
     let mut prefixes = PrefixCache::disabled();
     let image_keys = super::prefix::media_keys(tokens, &[])?;
     let mut request = Active { constraint: None, ticket: console::Ticket::new(id, 0, None), lease,
-        job: NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
+        job: NativeRequest { acceptance: Default::default(), prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?, anchor,
         generated: 0, buffered: 0, finished: false, cacheable: false, failed: false,
         tokens: tokens.to_vec(), image_keys, next_after_commit: None,
@@ -565,7 +565,7 @@ pub(crate) fn exercise_packed_prefill<'w, 'a: 'w>(
         if let Some(draft) = draft.as_deref_mut() { draft.admit(id)?; }
         let (events, receive) = mpsc::unbounded_channel();
         receivers.push(receive);
-        let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(),
+        let job = NativeRequest { acceptance: Default::default(), prefix_cache_source: Default::default(), literal_spans: Vec::new(),
             prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(),
             max_tokens: 1, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
         let images = super::prefix::media_keys(tokens, &[])?;
@@ -2129,7 +2129,12 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         pass.set_route_capture(false);
         // Reuse the shared tail below by re-entering the same control flow.
         let next = match next {
-            Ok(next) => next,
+            Ok(mut next) => {
+                if let Some(proposals) = acceptance_proposals(active, members, &inputs) {
+                    next.acceptance_stats = Some(runtime.block_on(pass.acceptance_stats(&proposals))?);
+                }
+                next
+            },
             Err(error) => {
                 if let Some(batch) = &mut batch { pass.discard(batch)?; }
                 return Err(error);
@@ -2173,7 +2178,10 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     let next = runtime.block_on(execute_logits(lib, pass, requests, &mut batch, transport, capture, compact));
     let executed_us = started.elapsed().as_micros() as u64;
     let result = (|| -> Result<()> {
-        let next = next?;
+        let mut next = next?;
+        if let Some(proposals) = acceptance_proposals(active, members, &inputs) {
+            next.acceptance_stats = Some(runtime.block_on(pass.acceptance_stats(&proposals))?);
+        }
         tracing::debug!(target: "cuteafd::cost_model", batch=batch_id, lane,
             requests=members.len(), rows=inputs.iter().map(Vec::len).sum::<usize>(),
             prepared_us, verify_us=executed_us-prepared_us, "verification round cost");
@@ -2444,6 +2452,20 @@ where
     }
 }
 
+/// Proposals are aligned to target rows, not request slots. Exact peers and
+/// final bonus rows need checked argmax only, never probability statistics.
+fn acceptance_proposals(active: &[Option<Active<'_>>], members: &[usize], inputs: &[Vec<u32>]) -> Option<Vec<u32>> {
+    if members.iter().all(|&slot| active[slot].as_ref().unwrap().job.acceptance.is_exact()) {
+        return None;
+    }
+    Some(members.iter().zip(inputs).flat_map(|(&slot, input)| {
+        let exact = active[slot].as_ref().unwrap().job.acceptance.is_exact();
+        (0..input.len()).map(move |row| if exact { u32::MAX } else {
+            input.get(row + 1).copied().unwrap_or(u32::MAX)
+        })
+    }).collect())
+}
+
 fn prepare_commit_lane<'a, C: DraftChain<'a>>(lane: usize,
     requests: &Requests<'a>, active: &[Option<Active<'a>>], members: &[usize], inputs: &[Vec<u32>],
     next: &ScoreRows, draft: Option<&DraftRuntime<'_, 'a, C>>, verify_us: u64,
@@ -2490,8 +2512,11 @@ fn prepare_commit_lane<'a, C: DraftChain<'a>>(lane: usize,
             }
         })?;
         let selected: &[u32] = &selected;
-        let decision = cuteafd_core::verify_dspark_greedy(input,
-            selected, 1, request.job.max_tokens - request.generated)
+        let stats = next.acceptance_stats.as_ref()
+            .map_or(&[][..], |stats| &stats[offset..offset + input.len()]);
+        let decision = cuteafd_core::verify_dspark_relaxed_vocab(input,
+            selected, stats, request.job.acceptance, Some(1),
+            request.job.max_tokens - request.generated, scores::VOCAB)
             .map_err(anyhow::Error::msg)?;
         if tracing::enabled!(target: "cuteafd::logit_trace", tracing::Level::DEBUG) {
             let top_two = (offset..offset + input.len())

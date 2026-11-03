@@ -31,6 +31,17 @@ pub(crate) trait VerificationTarget<'a>: TargetCache<'a> {
     async unsafe fn execute_shared_greedy(&mut self, requests: &RefCell<&mut Requests<'a>>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, placement: u64,
         selected: &[usize]) -> Result<Vec<(u32, f32)>>;
+    async unsafe fn execute_shared_relaxed(&mut self, requests: &RefCell<&mut Requests<'a>>,
+        batch: &mut RequestBatch, transport: &mut Self::Transport, placement: u64,
+        selected: &[usize], proposals: &[u32],
+    ) -> Result<crate::shared::speculation::acceptance::AcceptanceOutput> {
+        let _ = (requests, batch, transport, placement, selected, proposals);
+        anyhow::bail!("relaxed acceptance unsupported by target layout")
+    }
+    async fn acceptance_stats(&mut self, proposals: &[u32]) -> Result<Vec<cuteafd_core::AcceptanceStats>> {
+        let _ = proposals;
+        anyhow::bail!("relaxed acceptance unsupported by target layout")
+    }
     /// Whether this layout can select rows on the device at all.
     ///
     /// A layout without the sampled terminal must never be routed into it: the
@@ -101,6 +112,15 @@ impl<'a> VerificationTarget<'a> for TargetPass<'_, 'a> {
         batch: &mut RequestBatch, transport: &mut Self::Transport, placement: u64,
         selected: &[usize]) -> Result<Vec<(u32, f32)>> {
         unsafe { TargetPass::execute_shared_greedy(self, requests, batch, transport, placement, selected).await }
+    }
+    async unsafe fn execute_shared_relaxed(&mut self, requests: &RefCell<&mut Requests<'a>>,
+        batch: &mut RequestBatch, transport: &mut Self::Transport, placement: u64,
+        selected: &[usize], proposals: &[u32],
+    ) -> Result<crate::shared::speculation::acceptance::AcceptanceOutput> {
+        unsafe { TargetPass::execute_shared_relaxed(self, requests, batch, transport, placement, selected, proposals).await }
+    }
+    async fn acceptance_stats(&mut self, proposals: &[u32]) -> Result<Vec<cuteafd_core::AcceptanceStats>> {
+        TargetPass::acceptance_stats(self, proposals).await
     }
     async unsafe fn execute_shared_sampled(&mut self, requests: &RefCell<&mut Requests<'a>>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, placement: u64,

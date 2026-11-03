@@ -1080,6 +1080,10 @@ def main() -> None:
         manifest["families"][family] = {**geometry, "role": args.exlr8_role,
                                        "programs": [f"{family}_{item[0]}" for item in exlr8_work]}
         work += [(family, *item) for item in exlr8_work]
+    if props.minor == 0:
+        from b12x.integration.cuteafd.sampling import compile_relaxed_acceptance_stats_f32_aot
+        work.append(("shared", "relaxed_acceptance_stats_f32", "acceptance_stats", {},
+                     compile_relaxed_acceptance_stats_f32_aot))
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue

@@ -127,7 +127,7 @@ impl SampledTargetRows {
             ensure!(row < packs.len(), "sampled row is outside the batch");
             packs[row] = pack;
         }
-        Ok(ScoreRows { best: std::mem::take(&mut self.ids), bytes, packs, vocab })
+        Ok(ScoreRows { best: std::mem::take(&mut self.ids), bytes, packs, vocab, acceptance_stats: None })
     }
 }
 
@@ -136,6 +136,7 @@ impl SampledTargetRows {
 /// the caller named them; `packs[row]` maps a batch row to its slice.
 pub(crate) struct ScoreRows {
     pub best: Vec<u32>,
+    pub acceptance_stats: Option<Vec<cuteafd_core::AcceptanceStats>>,
     bytes: Vec<u8>,
     /// For each batch row, its packed position in `bytes`, or `usize::MAX` when
     /// the row has no logits. Storing the mapping (rather than assuming the
@@ -159,7 +160,7 @@ impl ScoreRows {
         ensure!(!ids.is_empty() && bytes.len() == ids.len() * vocab * 4,
             "test batch extents differ");
         let packs = (0..ids.len()).collect();
-        Ok(ScoreRows { best: ids.to_vec(), bytes, packs, vocab })
+        Ok(ScoreRows { best: ids.to_vec(), bytes, packs, vocab, acceptance_stats: None })
     }
     fn row_bytes(&self) -> usize { self.vocab * 4 }
 
@@ -248,14 +249,14 @@ impl ScoreRows {
             best.push(id);
         }
         let packs = vec![usize::MAX; best.len()];
-        Ok(Self { best, bytes: Vec::new(), packs, vocab })
+        Ok(Self { best, bytes: Vec::new(), packs, vocab, acceptance_stats: None })
     }
     /// The legacy full-batch construction: every row carries its logits.
     pub fn new(vocab: usize, bytes: Vec<u8>) -> Result<Self> {
         ensure!(bytes.len() % (vocab * 4) == 0, "invalid target logit batch");
         let best: Vec<u32> = bytes.chunks_exact(vocab * 4).map(|row| argmax(row, None, vocab)).collect::<Result<_>>()?;
         let packs = (0..best.len()).collect();
-        Ok(Self { best, bytes, packs, vocab })
+        Ok(Self { best, bytes, packs, vocab, acceptance_stats: None })
     }
     /// Compact construction: the ids are known (device-selected greedy rows or
     /// the compact lane) and no row has logits yet.
@@ -265,7 +266,7 @@ impl ScoreRows {
             "invalid token or non-finite target logit");
         let best = values.into_iter().map(|v| v.0).collect::<Vec<_>>();
         let packs = vec![usize::MAX; best.len()];
-        Ok(Self { best, bytes: Vec::new(), packs, vocab })
+        Ok(Self { best, bytes: Vec::new(), packs, vocab, acceptance_stats: None })
     }
     /// The completed head buffer stays unchanged until commit returns. Fetch only
     /// a finishing request's frontier; a later grammar still sees all vocabulary scores.
@@ -698,6 +699,7 @@ mod tests {
         mask[1 / 32] |= 1 << (1 % 32);
         let constrained = ScoreRows {
             best: vec![1],
+            acceptance_stats: None,
             bytes: bytes.clone(),
             packs: vec![0],
             vocab: VOCAB,

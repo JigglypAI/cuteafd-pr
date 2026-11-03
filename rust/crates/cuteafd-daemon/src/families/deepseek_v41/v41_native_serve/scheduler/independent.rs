@@ -267,13 +267,25 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 // whose every row is unservable, or a layout without the
                 // terminal, keeps the whole-round CPU path.
                 let mut round = None;
-                let next = if compact {
-                    let greedy = unsafe { pass.execute_shared_greedy(requests, current, transport, 0, &selected).await? };
+                let proposals = acceptance_proposals(&active.borrow(), &members, &inputs);
+                let mut next = if compact {
+                    let mut stats = None;
+                    let greedy = if let Some(proposals) = proposals.as_ref() {
+                        // SAFETY: the lane owns this request batch and drains its terminal.
+                        let output = unsafe { pass.execute_shared_relaxed(requests, current, transport,
+                            0, &selected, proposals).await? };
+                        stats = Some(output.stats);
+                        output.greedy
+                    } else {
+                        unsafe { pass.execute_shared_greedy(requests, current, transport, 0, &selected).await? }
+                    };
                     if tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG) {
                         tracing::debug!(target: "cuteafd::timing", lane,
                             pass_us=started.elapsed().as_micros() as u64 - prepared_us, "independent greedy pass returned");
                     }
-                    ScoreRows::from_greedy(scores::VOCAB, greedy)?
+                    let mut next = ScoreRows::from_greedy(scores::VOCAB, greedy)?;
+                    next.acceptance_stats = stats;
+                    next
                 } else if use_sampled_terminal(P::SUPPORTS_SAMPLED_TERMINAL,
                     round_has_device_rows(&active.borrow(), &members)) {
                     let built = build_sampling_round(&active.borrow(), &members, &inputs,
@@ -289,6 +301,11 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                     unsafe { pass.execute_shared(requests, current, transport, 0, &selected).await?; }
                     ScoreRows::new(scores::VOCAB, pass.download_logits(current, &selected).await?)?
                 };
+                if next.acceptance_stats.is_none() {
+                    if let Some(proposals) = proposals.as_ref() {
+                        next.acceptance_stats = Some(pass.acceptance_stats(proposals).await?);
+                    }
+                }
                 let verify_us = started.elapsed().as_micros() as u64 - prepared_us;
                 tracing::debug!(target: "cuteafd::cost_model", batch=batch_id, lane, round_id,
                     requests=members.len(), rows=selected.len(), prepared_us, verify_us,

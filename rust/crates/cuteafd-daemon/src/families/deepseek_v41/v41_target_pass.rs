@@ -78,6 +78,7 @@ impl<'a> RequestAccess<'a> for std::cell::RefCell<&mut Requests<'a>> {
 enum HeadTerminal<'m> {
     Regular,
     Greedy,
+    Relaxed { proposals: &'m [u32] },
     Sampled {
         requests: &'m [TargetSamplingRowRequest],
         masks: Option<&'m [u32]>,
@@ -350,6 +351,20 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         unsafe { self.execute_phase(requests, batch, transport, placement, selected, None, None, HeadTerminal::Greedy).await?; }
         self.resources.head.greedy_output()
     }
+    pub async unsafe fn execute_shared_relaxed(&mut self,
+        requests: &std::cell::RefCell<&mut Requests<'a>>, batch: &mut RequestBatch,
+        transport: &mut NativeTp4Wave<'a>, placement: u64, selected: &[usize], proposals: &[u32],
+    ) -> Result<crate::shared::speculation::acceptance::AcceptanceOutput> {
+        self.set_attention_decode(true);
+        ensure!(batch.cache()?.stage() == CacheStage::Full, "relaxed verification requires full phase");
+        // SAFETY: same request/storage ownership as shared greedy execution.
+        unsafe { self.execute_phase(requests, batch, transport, placement, selected, None, None,
+            HeadTerminal::Relaxed { proposals }).await?; }
+        self.resources.head.relaxed_output()
+    }
+    pub async fn acceptance_stats(&mut self, proposals: &[u32]) -> Result<Vec<cuteafd_core::AcceptanceStats>> {
+        self.resources.head.acceptance_stats(proposals).await
+    }
     /// Run one verification pass and select every row on the device with the
     /// v4.1 target-sampler. The caller names the per-row parameters and, for
     /// constrained rows, the packed mask arena; `sampled_rows` then exposes the
@@ -457,7 +472,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         // Only verification passes (greedy or device-sampled head) are chained.
         // Prefill, encoder and replay passes keep host-drained stages: their
         // many-row paths publish KV and encoder state through host-ordered copies.
-        let verification = matches!(terminal, HeadTerminal::Greedy | HeadTerminal::Sampled { .. });
+        let verification = matches!(terminal, HeadTerminal::Greedy | HeadTerminal::Relaxed { .. } | HeadTerminal::Sampled { .. });
         let step_sample = if verification && tracing::enabled!(target: "cuteafd::target_step", tracing::Level::DEBUG) {
             Some((batch.cache()?.positions().len(), std::time::Instant::now()))
         } else { None };
@@ -652,6 +667,9 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             match terminal {
                 HeadTerminal::Greedy => {
                     unsafe { self.resources.head.execute_block_greedy(&output, selected, requests.cooperative_completion()).await?; }
+                }
+                HeadTerminal::Relaxed { proposals } => {
+                    unsafe { self.resources.head.execute_block_relaxed(&output, selected, proposals, requests.cooperative_completion()).await?; }
                 }
                 HeadTerminal::Regular => {
                     if requests.cooperative_completion() {

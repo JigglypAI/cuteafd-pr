@@ -107,6 +107,8 @@ impl<'a> TargetHeadWeights<'a> {
             tokens: Vec::new(),
             greedy_staging: HostAllocation::new(self.library, capacity * 8)?,
             greedy_ready: false,
+            acceptance: crate::shared::speculation::acceptance::AcceptanceWave::new(self.library, capacity)?,
+            acceptance_output: None,
             sampling: TargetSamplingWave::new(self.library, capacity, SAMPLING_VOCAB)?,
             download: crate::shared::memory::RowDownload::new(self.library, capacity * STRIDES[4])?,
         })
@@ -148,6 +150,8 @@ pub(crate) struct TargetHeadWave<'w, 'a> {
     tokens: Vec<u64>,
     greedy_staging: HostAllocation<'a>,
     greedy_ready: bool,
+    acceptance: crate::shared::speculation::acceptance::AcceptanceWave<'a>,
+    acceptance_output: Option<crate::shared::speculation::acceptance::AcceptanceOutput>,
     sampling: TargetSamplingWave<'a>,
 }
 impl TargetHeadWave<'_, '_> {
@@ -159,7 +163,8 @@ impl TargetHeadWave<'_, '_> {
         );
         Ok(V41VocabularyProjection::WORKSPACE_BYTES
             + capacity * STRIDES.iter().sum::<usize>()
-            + TargetSamplingWave::device_bytes(capacity, SAMPLING_VOCAB))
+            + TargetSamplingWave::device_bytes(capacity, SAMPLING_VOCAB)
+            + crate::shared::speculation::acceptance::AcceptanceWave::device_bytes(capacity))
     }
     fn b(&self, i: usize) -> CuteafdDeviceBuffer {
         self.buffers[i].buffer
@@ -172,6 +177,7 @@ impl TargetHeadWave<'_, '_> {
     }
     fn invalidate(&mut self) {
         self.greedy_ready = false;
+        self.acceptance_output = None;
         self.ready = None;
         self.origin = None;
         self.selected.clear();
@@ -418,6 +424,48 @@ impl TargetHeadWave<'_, '_> {
         self.publish_block(block, selected);
         self.greedy_ready = true;
         Ok(())
+    }
+    /// Keep logits on the device, downloading only checked greedy IDs/scores.
+    pub async unsafe fn execute_block_relaxed(&mut self, block: &BlockOutput<'_>,
+        selected: &[usize], proposals: &[u32], cooperative: bool) -> Result<()> {
+        unsafe { self.copy_block(block, selected)?; }
+        let rows = selected.len();
+        ensure!(proposals.len() == rows, "acceptance proposal extent differs");
+        let captured = super::graph_policy::captures_shape(rows as u32);
+        if captured && self.graph(rows).is_none() {
+            if cooperative { unsafe { self.prepare_head_cooperative(rows).await?; } }
+            else { self.synchronize()?; unsafe { self.capture_block_head(rows)?; } }
+        }
+        self.invalidate();
+        let graph = if captured { Some(self.graph(rows).context("target head graph missing")?) } else { None };
+        let logits = Self::slice(self.b(4), 0, rows * STRIDES[4])?;
+        let launched = (|| -> Result<()> { unsafe {
+            let lib = self.stream.library;
+            if let Some(graph) = graph { lib.cuda_graph_launch(graph, self.stream.raw)?; }
+            else { self.enqueue(rows)?; }
+            self.acceptance.enqueue(logits, proposals, SAMPLING_VOCAB, SAMPLING_VOCAB, self.stream.raw)?;
+            Ok(())
+        } })();
+        let drained = if cooperative { self.stream.wait().await } else { self.synchronize() };
+        launched.and(drained)?;
+        self.publish_block(block, selected);
+        self.acceptance_output = Some(self.acceptance.output(proposals, SAMPLING_VOCAB)?);
+        Ok(())
+    }
+    pub fn relaxed_output(&mut self) -> Result<crate::shared::speculation::acceptance::AcceptanceOutput> {
+        self.acceptance_output.take().context("acceptance output unpublished")
+    }
+    /// Mixed sampled/traced rounds already selected their exact peers. Compute
+    /// only the relaxed rows' compact distribution data without moving logits.
+    pub async fn acceptance_stats(&mut self, proposals: &[u32]) -> Result<Vec<cuteafd_core::AcceptanceStats>> {
+        let logits = self.output()?.logits;
+        ensure!(proposals.len() == self.ready.unwrap(), "acceptance rows differ");
+        // SAFETY: this wave owns the logits and staging until the stream drains.
+        let launched = unsafe { self.acceptance.enqueue(logits, proposals, SAMPLING_VOCAB,
+            SAMPLING_VOCAB, self.stream.raw) };
+        let drained = self.stream.wait().await;
+        launched.and(drained)?;
+        Ok(self.acceptance.output(proposals, SAMPLING_VOCAB)?.stats)
     }
     /// Run the head and then the v4.1 target-sampler on the same stream,
     /// downloading only `rows x (4 + 4 + 4 + 4)` bytes (ids, raw scores, status,

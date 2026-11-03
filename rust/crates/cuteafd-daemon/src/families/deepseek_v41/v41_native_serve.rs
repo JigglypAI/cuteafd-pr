@@ -40,6 +40,7 @@ use tokio::sync::{mpsc, oneshot};
 pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     // Identify the checkpoint before loading it: an unidentifiable directory fails in seconds.
     let mut profile = served_profile(args.model_id.clone(), &args.snapshot)?;
+    profile.relaxed_acceptance_supported = args.rtx_gpus == 1;
     let Started { send, readiness, worker_thread, stats, http } = start(args, true)?;
     let Http { api, listen, snapshot, limits, http_queue_wait, console_hub } = http.expect("serving start loads the API");
     let vision_health = readiness
