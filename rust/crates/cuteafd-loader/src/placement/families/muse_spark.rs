@@ -163,8 +163,14 @@ impl MuseRequest {
         // layers remain movable when the joint solve tries a tower candidate.
         let minimum = self.request.onboard.layers(self.spark_budget.layers.len())
             .unwrap_or(self.request.minimum_expert_layers);
+        let production = solve(&self.request)?;
         let mut baseline = self.request.clone();
         baseline.onboard = Onboard::Layers(minimum);
+        // Pricing optional experts must not introduce a context floor that
+        // production Auto admission already clamped to its selected pool.
+        if self.request.onboard == Onboard::Auto {
+            baseline.pool.pin_selected(production.pool_tokens);
+        }
         let placed = solve(&baseline)?;
         let units = baseline.pool.requested.unwrap_or(baseline.pool.target)
             .div_ceil(baseline.pool.unit_rows.max(1));
