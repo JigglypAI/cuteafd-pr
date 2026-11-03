@@ -194,12 +194,15 @@ def dscp_map(app):
     if not isinstance(app, dict):
         raise ValueError("unsupported dcb app JSON")
     pairs = app.get("dscp_prio", [])
+    # iproute2 `dcb -j app show` emits [dscp, prio, flag] (flag a string such
+    # as " "); saved backups and fixtures may hold plain [dscp, prio].
     if not isinstance(pairs, list) or any(
-            not isinstance(pair, list) or len(pair) != 2 or
-            any(type(v) is not int for v in pair) or
+            not isinstance(pair, list) or len(pair) not in (2, 3) or
+            any(type(v) is not int for v in pair[:2]) or
+            (len(pair) == 3 and not isinstance(pair[2], str)) or
             not (0 <= pair[0] <= 63 and 0 <= pair[1] <= 7) for pair in pairs):
         raise ValueError("invalid DSCP mappings")
-    return sorted({tuple(pair) for pair in pairs})
+    return sorted({(pair[0], pair[1]) for pair in pairs})
 
 
 def comparable_state(state):
@@ -306,7 +309,7 @@ def restore_backups(planned, mutate, probe, dry_run):
         mutate("mlnx_qos", "-i", netdev, "--prio2buffer", ",".join(saved["buffers"]))
         mutate("mlnx_qos", "-i", netdev, "--buffer_size", ",".join(saved["sizes"]))
         mutate("dcb", "app", "flush", "dev", netdev, "dscp-prio")
-        pairs = saved["app"].get("dscp_prio", [])
+        pairs = dscp_map(saved["app"])
         if pairs:
             mutate("dcb", "app", "add", "dev", netdev, "dscp-prio", *[f"{d}:{p}" for d, p in pairs])
         mutate("mlnx_qos", "-i", netdev, "--trust", saved["trust"])

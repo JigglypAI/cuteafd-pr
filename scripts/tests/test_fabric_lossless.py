@@ -276,3 +276,22 @@ def test_fabric_check_accepts_sparknest_superset_and_reports_owner(tmp_path):
     result = run_fabric(tmp_path, 'check', dry_run=False)
     assert result.returncode == 0, result.stderr
     assert 'roce0: NOT cuteafd-compliant; owner=SparkNest' in result.stdout
+
+
+def test_fabric_check_reads_iproute2_dscp_triples(tmp_path):
+    # Real `dcb -j app show` output carries a third flag element per mapping.
+    fabric_fixture(tmp_path)
+    put(tmp_path, 'var/lib/sparknest/fabric-qos/roce0.json', '{}')
+    state = applied_state()
+    state['pfc'][2] = '1'
+    state['buffers'] = ['0', '0', '1', '2', '0', '0', '0', '0']
+    state['sizes'] = ['153088'] * 3 + ['0'] * 5
+    state['app']['dscp_prio'] = [[d, 2 if d == 18 else p, ' '] for d, p in state['app']['dscp_prio']]
+    nic_state(tmp_path, state)
+    result = run_fabric(tmp_path, 'check', dry_run=False)
+    assert result.returncode == 0, result.stderr
+    assert 'roce0: cuteafd-compliant; owner=SparkNest' in result.stdout
+    state['app']['dscp_prio'] = [[d, p, 7] for d, p, _ in state['app']['dscp_prio']]
+    nic_state(tmp_path, state)
+    result = run_fabric(tmp_path, 'check', dry_run=False)
+    assert result.returncode != 0 and 'invalid DSCP mappings' in result.stderr
