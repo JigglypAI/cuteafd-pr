@@ -62,8 +62,7 @@ fn predictor_and_embedding_record_before_commit_and_replay_mount_bytes() -> Resu
         ("input_layernorm.weight", vec![256]), ("pre_mlp_layernorm.weight", vec![256]),
         ("self_attn.o_proj.weight", vec![256, 256]), ("self_attn.attention_sink_bias", vec![2]),
     ] { tensors.push((format!("{p}.{name}"), DType::Bf16, shape)); }
-    for (name, rows) in [("self_attn.q_proj.weight", 256), ("self_attn.k_proj.weight", 128),
-        ("self_attn.v_proj.weight", 128), ("mlp.gate_proj.weight", 256),
+    for (name, rows) in [("self_attn.qkv_proj.weight", 512), ("mlp.gate_proj.weight", 256),
         ("mlp.up_proj.weight", 256), ("mlp.down_proj.weight", 256)] {
         tensors.push((format!("{p}.{name}"), DType::F8E4M3, vec![rows, 256]));
         tensors.push((format!("{p}.{name}_scale_inv"), DType::F32, vec![rows / 128, 2]));
@@ -109,6 +108,7 @@ fn predictor_and_embedding_record_before_commit_and_replay_mount_bytes() -> Resu
         let load = std::rc::Rc::new(dense::DenseLoad::push(&library));
         let mut planning = loader(&library, &checkpoint, &formats);
         planning.peers.truncate(peers);
+        planning.fp8_head = true;
         planning.dense = load.clone();
         let empty = planning.mtp_weights(&cfg, 0)?;
         assert!(empty.is_empty());
@@ -124,10 +124,11 @@ fn predictor_and_embedding_record_before_commit_and_replay_mount_bytes() -> Resu
         assert!(!predictors[0].layer.split);
         assert!(predictors[0].layer.buffers().iter().all(|(_, b)| b.device_id == 0));
         assert!(predictors[0].extras.iter().all(|w| w.buffer.device_id == 0));
-        let names = records.operands.iter().flat_map(|o| {
-            assert_eq!(o.device, 0);
-            o.lands.iter().map(|(rect, _)| rect.name.clone())
-        }).collect::<std::collections::BTreeSet<_>>();
+        assert!(records.operands.iter().all(|o| o.device == 0));
+        assert!(records.steps.iter().all(|s| s.device == 0 && s.bytes() <= dense::STEP_BYTES));
+        let names = records.operands.iter().flat_map(|o| o.lands.iter().map(|(rect, _)| rect.name.clone()))
+            .chain(records.steps.iter().flat_map(|s| s.rects.iter().map(|rect| rect.name.clone())))
+            .collect::<std::collections::BTreeSet<_>>();
         assert!(names.contains("model.embed_tokens.weight"));
         for (name, _, _) in &tensors {
             assert!(names.contains(name), "unrecorded operand {name}");
