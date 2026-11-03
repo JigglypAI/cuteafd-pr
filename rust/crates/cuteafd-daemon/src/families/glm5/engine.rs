@@ -1493,7 +1493,7 @@ impl<'a> GlmEngine<'a> {
     /// post-attention norm. Both ranks queue this front before either queues FFN work.
     #[allow(clippy::too_many_arguments)]
     fn peer_attention(&self, index: usize, lane: usize, w1: &Workspace<'_>, rows: Scalar, cap: &str,
-        tables: &[StepTables; 2], bytes: usize) -> Result<()> {
+        tables: &[StepTables; 2], _bytes: usize) -> Result<()> {
         let peer = self.peer()?;
         let (layer, exchange) = (&peer.layers[index], self.exchange()?);
         if index == 0 {
@@ -3053,7 +3053,7 @@ mod long_graph_tests {
                             for rank in 0..gpus {
                                 assert!(payload.borrow()[rank][real * hidden * payload_bytes..].iter().all(|&v| v == 0xa5));
                             }
-                            assert!(delta.borrow()[..real * hidden].iter().all(|&v| v == (1..=gpus as u16).sum()));
+                            assert!(delta.borrow()[..real * hidden].iter().all(|&v| v == (1..=gpus as u16).sum::<u16>()));
                             assert!(delta.borrow()[real * hidden..].iter().all(|&v| v == 0));
                             assert_eq!(events.borrow().last(), Some(&if real < bucket { "clear" } else { "reduce" }));
                         }

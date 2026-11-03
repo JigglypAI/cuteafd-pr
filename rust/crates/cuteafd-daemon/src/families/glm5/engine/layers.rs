@@ -369,13 +369,14 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         let e = self.engine;
         let w = self.work[0];
         let real = self.tables[0].exchange_rows;
+        let clear_delta = !e.tp2_layer(index) && !self.layer(0, index).dense;
         real_row_moe(real, self.rows(), |_| {
             let planes = match ticket {
                 Ticket::Skip(ranks) => Some((e.skip.as_ref().context("skip")?.pointers(), ranks)),
                 Ticket::Spark | Ticket::Lane => {
                     let pending = e.layer_execution.as_ref().context("layer execution")?.waves.borrow_mut()[self.lane]
                         .take().context("missing dispatched Spark wave")?;
-                    let mut reduce = |waves: &mut crate::shared::spark_waves::Waves<'_>, slot| -> Result<()> {
+                    let reduce = |waves: &mut crate::shared::spark_waves::Waves<'_>, slot| -> Result<()> {
                         e.reduce(waves.planes(slot), w, waves.ranks(), real)?;
                         waves.consumed(slot, e.stream)
                     };
@@ -395,7 +396,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
             if let Some((planes, ranks)) = planes { e.reduce(planes, w, ranks, real)?; }
             Ok(())
         }, |tail| {
-            if !e.tp2_layer(index) && !self.layer(0, index).dense { e.clear_moe_tail(0, w.delta.buffer, tail)?; }
+            if clear_delta { e.clear_moe_tail(0, w.delta.buffer, tail)?; }
             Ok(())
         })?;
         if !self.layer(0, index).dense { e.tap_width(w, index, real)?; }

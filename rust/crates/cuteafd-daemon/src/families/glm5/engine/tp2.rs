@@ -328,7 +328,7 @@ impl<'a> GlmEngine<'a> {
         self.tp2_norm_rows(rank, w, weight, layer, lane, rows, scalar_rows(rows)?)
     }
 
-    fn tp2_norm_rows(&self, rank: usize, w: &Workspace<'_>, weight: *mut c_void,
+    pub(super) fn tp2_norm_rows(&self, rank: usize, w: &Workspace<'_>, weight: *mut c_void,
         layer: usize, lane: usize, rows: Scalar, real: usize) -> Result<()> {
         self.tp2_sum(rank, w, layer, lane, real, scalar_rows(rows)?)?;
         self.norm_full(
@@ -342,7 +342,7 @@ impl<'a> GlmEngine<'a> {
         )
     }
 
-    fn tp2_sum(&self, rank: usize, w: &Workspace<'_>, layer: usize, lane: usize,
+    pub(super) fn tp2_sum(&self, rank: usize, w: &Workspace<'_>, layer: usize, lane: usize,
         real: usize, bucket: usize) -> Result<()> {
         let pair = self.tp2.as_ref().context("TP2 pair")?;
         let local = w.payload.as_ref().context("TP2 payload")?.buffer.ptr;
