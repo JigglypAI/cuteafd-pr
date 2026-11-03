@@ -236,13 +236,6 @@ workloads are unchanged.
 - 2026-10-31 · Release smoke · wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 6× DGX Spark · build v4.1.0-rc1 · [report](kimi_k3/2026-10-31-smoke-kimi-k3-exl3-k2-core-k6-2rtx-6spark-kimi-k3-max/report.svg)
 - 2026-10-30 · Release smoke · wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 6× DGX Spark · build v4.0.0-rc2 · [report](kimi_k3/2026-10-30-smoke-kimi-k3-exl3-k2-core-k6-2rtx-6spark-kimi-k3-max/report.svg)
 
-## Mistral Large 4
-
-- 2026-11-02 · Custom · wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6 · 2x RTX PRO 6000 + 6x DGX Spark · build ed34ed61ebdd · [report](mistral_large4/2026-11-02-custom-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max-candidate-r1/report.svg)
-  measured on ed34, layers placement, before the #1077 prefill port and the context borrower fix; v5 release cards supersede
-- 2026-11-02 · Custom · wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6 · 1x RTX PRO 6000 + 5x DGX Spark · build ed34ed61ebdd · [report](mistral_large4/2026-11-02-custom-mistral-large-4-exl3-k4-core-k6-1rtx-5spark-ml4-exl3-min-candidate-r1/report.svg)
-  measured on ed34, layers placement, before the #1077 prefill port and the context borrower fix; v5 release cards supersede
-
 ## MiMo V2
 
 - 2026-10-30 · Release smoke · XiaomiMiMo/MiMo-V2.6-Flash-MOPD · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark · build v4.0.0-rc1 · [report](mimo_v2/2026-10-30-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-5090/report.svg)
@@ -282,6 +275,13 @@ workloads are unchanged.
 - 2026-10-04 · Release smoke · XiaomiMiMo/MiMo-V2.6-Pro-MOPD · 1× RTX PRO 6000 @ 325 W + 6× DGX Spark · build mopd-319ccdb · [report](mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-1rtx-6spark/report.svg)
 - 2026-10-02 · Release smoke · XiaomiMiMo/MiMo-V2-Flash · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v0.1.0 · [report](mimo_v2/2026-10-02-smoke-mimo-v2-flash-2rtx-4spark/report.svg)
 - 2026-10-02 · Release smoke · XiaomiMiMo/MiMo-V2-Flash · 1× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v0.1.0 · [report](mimo_v2/2026-10-02-smoke-mimo-v2-flash-1rtx-4spark/report.svg)
+
+## Mistral Large 4
+
+- 2026-11-02 · Custom · wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (310–550) + 6× DGX Spark · build ed34ed61ebdd · [report](mistral_large4/2026-11-02-custom-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max-candidate-r1/report.svg)
+  measured on ed34, layers placement, before the #1077 prefill port and the context borrower fix; v5 release cards supersede
+- 2026-11-02 · Custom · wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6 · 1× RTX PRO 6000 @ gpu-powerd 455 W (450–600) + 5× DGX Spark · build ed34ed61ebdd · [report](mistral_large4/2026-11-02-custom-mistral-large-4-exl3-k4-core-k6-1rtx-5spark-ml4-exl3-min-candidate-r1/report.svg)
+  measured on ed34, layers placement, before the #1077 prefill port and the context borrower fix; v5 release cards supersede
 
 ## Qwen 3.5 / 3.8 dense
 
