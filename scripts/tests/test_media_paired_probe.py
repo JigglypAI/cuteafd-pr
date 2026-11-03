@@ -130,7 +130,7 @@ def test_reference_provenance_keeps_family_contract_exact(tmp_path, family):
     metadata = feature_metadata(span["key"], family)
     (tmp_path / (span["key"] + ".json")).write_text(json.dumps(metadata))
     provenance = reference_provenance(metadata, family)
-    response = {"server": {"model": "model", "family": module.media_server_family(family)}, "probe": {
+    response = {"server": {"model": "model", "family": family}, "probe": {
         "engine": family, "cold": True, "no_speculation": True, "cached_tokens": 0,
         "score_path": "decode", "prompt_ids": window["tokens"], "media": [span],
         "rows": [{"position": 1, "finite": True}], "scored": 1, "provenance": provenance}}
@@ -190,7 +190,7 @@ def test_log_probs_validate_shape_and_normalize(tmp_path):
         module.normalize([0, float("nan")])
 
 
-def compare_case(tmp_path, monkeypatch, family, control=False, native_row=(0., -5.)):
+def compare_case(tmp_path, monkeypatch, family, control=False, native_row=(0., -5.), geometry="tiled"):
     import hashlib
     from types import SimpleNamespace
     from safetensors.numpy import save_file
@@ -227,6 +227,27 @@ def compare_case(tmp_path, monkeypatch, family, control=False, native_row=(0., -
         np.asarray(window["tokens"], dtype="<i4").tofile(folder / "tokens.bin")
         meta["windows"].append({"id": window["id"], "path": window["id"], "positions": list(range(65, 577)),
                                 "vocab": 2, "media": window.get("media", [])})
+    if geometry == "official-full":
+        import copy
+        from fidelity_windows import validate_reference
+        meta.pop("prefix_qualification")
+        meta.update(geometry=geometry, attention="eager", use_cache=False, mtp=False,
+                    source_pin={"official": "pinned"})
+        meta["official_full"] = {"schema": "cuteafd.reference.official-full/1", "family": panel["family"],
+            "set_sha256": panel["set_sha256"], "snapshot_identity": identity,
+            "layers": 72, "completed_layers": 72, "tiling": False, "head": "full-length",
+            "windows": {w["id"]: {"tokens": len(w["tokens"]),
+                "tokens_sha256": hashlib.sha256(canonical(w["tokens"])).hexdigest()} for w in panel["windows"]}}
+        assert validate_reference(meta, panel) == 2
+        for change in ({"tiling": True}, {"completed_layers": 71}, {"head": "fixed-M128"}, {"windows": {}}):
+            bad = copy.deepcopy(meta)
+            bad["official_full"].update(change)
+            with pytest.raises(ValueError, match="incomplete or mismatched"):
+                validate_reference(bad, panel)
+        bad = copy.deepcopy(meta)
+        bad["prefix_qualification"] = {}
+        with pytest.raises(ValueError, match="must not claim"):
+            validate_reference(bad, panel)
     (golden / "meta.json").write_bytes(canonical(meta))
     (golden / "windows.json").write_bytes(canonical(panel))
     seal = tmp_path / "golden-seal.json"
@@ -243,7 +264,7 @@ def compare_case(tmp_path, monkeypatch, family, control=False, native_row=(0., -
         root.mkdir()
         capture = {"schema": "cuteafd.media.paired.capture/1", "mode": mode, "set_sha256": panel["set_sha256"],
                    "checkpoint": "model", "quick": False,
-                   "server": {"model": "model", "family": module.media_server_family(family),
+                   "server": {"model": "model", "family": family,
                               "build": {"commit": "same", "image": mode}}, "windows": []}
         for window in panel["windows"]:
             dump = root / window["id"]
@@ -274,10 +295,11 @@ def compare_case(tmp_path, monkeypatch, family, control=False, native_row=(0., -
     return args, panel
 
 
+@pytest.mark.parametrize("geometry", ["tiled", "official-full"])
 @pytest.mark.parametrize("family", module.FAMILIES)
-def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, family):
+def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, family, geometry):
     from fidelity_windows import canonical
-    args, panel = compare_case(tmp_path, monkeypatch, family)
+    args, panel = compare_case(tmp_path, monkeypatch, family, geometry=geometry)
     if family != "mimo_v2":
         with pytest.raises(ValueError, match="set family"):
             module.compare(args)

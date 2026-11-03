@@ -905,11 +905,6 @@ def test_official_media_registry_discovers_only_present_adapters(tmp_path, monke
     monkeypatch.setattr(registry, "__file__", str(tmp_path / "fidelity_media.py"))
     assert registry.media_families() == ()
     assert not registry.has_media_adapter("new_family")
-    assert registry.media_server_family("mistral_large4") == "mistral_large4"
-    (tmp_path / "mistral_large4_media.py").touch()
-    assert registry.media_server_family("mistral_large4") == "glm5"
-    assert registry.media_server_family("mimo_v2") == "mimo_v2"
-    (tmp_path / "mistral_large4_media.py").unlink()
     for name in ("fidelity_media", "golden_media", "new_family_media"):
         (tmp_path / (name + ".py")).touch()
     assert registry.media_families() == ("new_family",)

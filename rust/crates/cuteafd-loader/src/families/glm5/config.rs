@@ -222,7 +222,6 @@ impl GlmDsaConfig {
         self.kv_lora_rank + 4 * (self.kv_lora_rank / 128) + if self.rope(layer) { 2 * self.qk_rope_head_dim } else { 0 }
     }
 
-    /// The head's tanh soft cap, if any.
     /// The plan family descriptor this checkpoint is admitted under.
     pub fn family_id(&self) -> &'static str {
         if self.variant.is_glm() { "glm5" } else { "mistral_large4" }
@@ -260,6 +259,7 @@ impl GlmDsaConfig {
     pub fn max_record_bytes(&self) -> usize { (0..self.layers).map(|l| self.record_bytes(l)).max().unwrap_or(0) }
     pub fn max_latent_dim(&self) -> usize { (0..self.layers).map(|l| self.latent_dim(l)).max().unwrap_or(0) }
 
+    /// The head's tanh soft cap, if any.
     pub fn logit_softcap(&self) -> Option<f64> {
         self.variant.ml4().map(|cfg| cfg.logit_softcap)
     }

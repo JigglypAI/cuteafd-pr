@@ -16,6 +16,9 @@ F = C.c_float
 def bind(path):
     lib = C.CDLL(path)
     signatures = {
+        "cuteafd_glmf_dspark_markov_workspace": ([I, I], C.c_uint64),
+        "cuteafd_glmf_dspark_markov_norms": ([P, P, I, I, P], I),
+        "cuteafd_glmf_dspark_markov": ([P] * 7 + [I] * 4 + [P], I),
         "cuteafd_glmf_dspark_qk_rope": ([P] * 8 + [I] * 3 + [F] * 2 + [P], I),
         "cuteafd_block_dspark_qk_rope": ([P] * 9 + [I] * 4 + [F] * 3 + [P], I),
         "cuteafd_block_dspark_attention_workspace": ([I] * 6, C.c_uint64),
@@ -197,14 +200,70 @@ def attention_check(lib):
     print("attention legacy64 bytes and 35-query/two-slice FP64 gate passed")
 
 
+def markov_check(lib, baseline=None):
+    stream = torch.cuda.current_stream().cuda_stream
+    vocab, rank, block = 8192, 256, 3
+    w1 = torch.randn(vocab, rank, device="cuda").bfloat16()
+    w2 = (torch.randn(vocab, rank, device="cuda") * 0.05).bfloat16()
+    norms = torch.empty(vocab, device="cuda")
+    assert lib.cuteafd_glmf_dspark_markov_norms(w2.data_ptr(), norms.data_ptr(), vocab, rank, stream) == 0
+    logits = torch.randn(64, block, vocab, device="cuda")
+    anchors = torch.randint(vocab, (64,), device="cuda", dtype=torch.int32)
+
+    def run(library, scores, previous):
+        sequences = previous.numel()
+        size = library.cuteafd_glmf_dspark_markov_workspace(sequences, block)
+        scratch = torch.full((size + 256,), 173, device="cuda", dtype=torch.uint8)
+        drafts = torch.empty(sequences, block, device="cuda", dtype=torch.int32)
+        def launch():
+            assert library.cuteafd_glmf_dspark_markov(scores.data_ptr(), w1.data_ptr(), w2.data_ptr(),
+                norms.data_ptr(), previous.data_ptr(), drafts.data_ptr(), scratch.data_ptr(),
+                sequences, block, vocab, rank, stream) == 0
+        launch()
+        torch.cuda.synchronize()
+        assert torch.all(scratch[size:] == 173), "Markov workspace overrun"
+        return drafts, launch
+
+    for sequences in (1, 8, 16, 32, 33, 64):
+        actual, launch = run(lib, logits[:sequences], anchors[:sequences])
+        tiles = [run(baseline or lib, logits[first:min(first + 32, sequences)],
+                     anchors[first:min(first + 32, sequences)])[0]
+                 for first in range(0, sequences, 32)]
+        assert torch.equal(actual, torch.cat(tiles)), f"C{sequences} differs from independent C32 tiles"
+        if baseline is not None and sequences <= 32:
+            expected, old_launch = run(baseline, logits[:sequences], anchors[:sequences])
+            assert torch.equal(actual, expected), f"C{sequences} baseline bytes changed"
+            if sequences in (1, 16, 32):
+                def timing(call):
+                    call()  # warm up before timing
+                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    for _ in range(10):
+                        call()
+                    end.record()
+                    end.synchronize()
+                    return start.elapsed_time(end) / 10
+                old_ms, new_ms = timing(old_launch), timing(launch)
+                print(f"Markov C{sequences}: baseline={old_ms:.4f}ms candidate={new_ms:.4f}ms ratio={new_ms / old_ms:.4f}")
+        print(f"Markov C{sequences}: byte-exact independent sequence tiles; guard intact")
+    invalid = lib.cuteafd_glmf_dspark_markov(None, None, None, None, None, None, None,
+                                            65, block, vocab, rank, stream)
+    assert invalid != 0, "C65 must be rejected before launching"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("library")
+    parser.add_argument("--baseline", help="Old native library for Markov byte/timing comparisons")
+    parser.add_argument("--markov-only", action="store_true")
     args = parser.parse_args()
+    torch.cuda.set_per_process_memory_fraction(0.1)
     torch.manual_seed(276)
     lib = bind(args.library)
-    rotary_check(lib)
-    attention_check(lib)
+    markov_check(lib, bind(args.baseline) if args.baseline else None)
+    if not args.markov_only:
+        rotary_check(lib)
+        attention_check(lib)
     print("block dSpark kernels: all checks passed")
 
 

@@ -15,69 +15,15 @@
 //! by intermediate) before the existing BF16 partial exchange, the order the
 //! shared trellis ABI permits ("transform each rank then reduce BF16 outputs").
 use super::*;
-use cuteafd_ffi::native_dense::DenseLinear;
-use cuteafd_ffi::native_dense_glue::Companion;
 use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
-use cuteafd_loader::plan::exlr8::dense::DenseEncoding;
-use std::collections::HashMap;
-
-/// Decode/verify rows run every native kernel; wider steps take the prefill route.
-pub(super) const NATIVE_DECODE_ROWS: usize = 64;
-
-/// One GPU's bound native programs (keyed by exported name).
-pub(crate) struct NativePrograms<'a> {
-    linears: HashMap<String, DenseLinear<'a>>,
-    companions: HashMap<String, Companion<'a>>,
-}
-
-/// The exported names a rank binds: every native linear, transform and glue
-/// program of the build's `exlr8_dense` table.
-fn exported(programs: &Programs<'_>) -> Vec<String> {
-    programs.names().filter(|n| n.starts_with("exlr8_dense_") && *n != "exlr8_dense_fp8_row_embedding"
-        && *n != "exlr8_dense_fp8_row_lm_head").map(str::to_owned).collect()
-}
-
-impl<'a> NativePrograms<'a> {
-    /// Binds on the current device (runtime SM count) before any capture.
-    pub(crate) fn bind(programs: &'a Programs<'a>, manifest: &serde_json::Value) -> Result<Self> {
-        let entries: HashMap<&str, &serde_json::Value> = manifest["programs"].as_array().context("manifest programs")?
-            .iter().filter_map(|e| Some((e["name"].as_str()?, e))).collect();
-        let (mut linears, mut companions) = (HashMap::new(), HashMap::new());
-        for name in exported(programs) {
-            let entry = entries.get(name.as_str()).with_context(|| format!("{name}: no manifest entry"))?;
-            match cuteafd_ffi::native_dense_glue::op_of(entry)? {
-                Some(op) => { companions.insert(name.clone(), Companion::bind(programs, &name, op)?); }
-                None => { linears.insert(name.clone(), DenseLinear::bind(programs, &name)?); }
-            }
-        }
-        ensure!(!linears.is_empty() && !companions.is_empty(), "the build carries no native dense programs");
-        Ok(Self { linears, companions })
-    }
-
-    /// Conservatively include every bound native route: attention-only entries
-    /// may tighten exact packing, but never allow an unreviewed FFN transition.
-    pub(super) fn packed_programs(&self) -> impl Iterator<Item = &str> {
-        self.linears.keys().chain(self.companions.keys()).map(String::as_str)
-    }
-
-    fn linear(&self, name: &str) -> Result<&DenseLinear<'a>> {
-        self.linears.get(name).with_context(|| format!("native dense program {name} is not in this build"))
-    }
-
-    fn companion(&self, name: &str) -> Result<&Companion<'a>> {
-        self.companions.get(name).with_context(|| format!("native dense program {name} is not in this build"))
-    }
-}
+pub(crate) use crate::shared::experts::exlr8::dense_execution::NativePrograms;
+use crate::shared::experts::exlr8::dense_execution::{NativeOut, ScratchOwner};
+pub(super) use crate::shared::experts::exlr8::dense_execution::DECODE_ROWS as NATIVE_DECODE_ROWS;
 
 /// Per-lane native scratch: one rotated input, the trellis core's pointer
 /// table/scales/partials, an F32 accumulator and BF16 intermediates.
 pub(crate) struct NativeScratch<'a> {
-    rotated: Dev<'a>,
-    table: Dev<'a>,
-    block_scales: Dev<'a>,
-    partial: Dev<'a>,
-    records: Option<Dev<'a>>,
-    acc: Dev<'a>,
+    linear: ScratchOwner<'a>,
     qkv: Dev<'a>,
     q: Dev<'a>,
     gate: Dev<'a>,
@@ -89,25 +35,15 @@ pub(crate) struct NativeScratch<'a> {
 }
 
 impl<'a> NativeScratch<'a> {
-    pub(crate) fn new(engine: &GlmEngine<'a>, heads: usize, inter: usize, rows: usize) -> Result<Self> {
+    pub(crate) fn new(engine: &GlmEngine<'a>,
+        layout: &cuteafd_loader::families::glm5::native::ScratchLayout) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("native-dense-scratch");
-        let cfg = &engine.cfg;
-        let (h, q, ih) = (cfg.hidden, cfg.q_lora_rank, cfg.index_heads);
-        let max_k = [h, q, heads * cfg.v_head_dim, inter].into_iter().max().unwrap_or(0);
-        let max_n = [heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), h, inter, ih * 128].into_iter().max().unwrap_or(0);
-        let a = |bytes: usize| engine.alloc(bytes);
-        let scratch = Self { rotated: a(rows * max_k * 2)?, table: a(64)?, block_scales: a(max_k / 128 * 2)?,
-            records: if engine.exlr8_prefill_activations == super::super::Exlr8PrefillActivations::A8 && rows > NATIVE_DECODE_ROWS {
-                Some(a(cuteafd_loader::plan::exlr8::dense::a8_scratch_bytes(cfg, heads, inter, rows))?)
-            } else { None },
-            // Exact trellis prefill and native scaled linears do not use partials.
-            partial: a(rows.min(NATIVE_DECODE_ROWS) * max_k.div_ceil(1024) * max_n * 4)?, acc: a(rows * max_n * 4)?,
-            qkv: a(rows * (q + cfg.kv_lora_rank + cfg.qk_rope_head_dim) * 2)?, q: a(rows * heads * 256 * 2)?,
-            gate: a(rows * inter * 2)?, up: a(rows * inter * 2)?, hidden: a(rows * inter * 2)?,
-            kw: a(rows * (128 + ih) * 2)?, iq: a(rows * ih * 128 * 2)?, values: a(rows * heads * cfg.v_head_dim * 2)? };
-        // The trellis core reads rotated inputs through a one-entry pointer table (rotation id 0).
-        engine.library.copy_h2d(scratch.table.buffer, &(scratch.rotated.buffer.ptr as u64).to_le_bytes())?;
-        Ok(scratch)
+        let device = crate::shared::memory::device::Device {
+            library: engine.library, id: engine.library.cuda_get_device()? };
+        let stage = |name| engine.alloc(*layout.stages.get(name).context("GLM native stage layout")?);
+        Ok(Self { linear: ScratchOwner::new(device, &layout.linear)?,
+            qkv: stage("qkv")?, q: stage("q")?, gate: stage("gate")?, up: stage("up")?,
+            hidden: stage("hidden")?, kw: stage("kw")?, iq: stage("iq")?, values: stage("values")? })
     }
 }
 
@@ -115,12 +51,6 @@ impl<'a> NativeScratch<'a> {
 fn head(buffer: Buffer, bytes: usize) -> Result<Buffer> {
     ensure!(bytes <= buffer.bytes, "native view of {bytes} B past a {} B buffer", buffer.bytes);
     Ok(Buffer { bytes, ..buffer })
-}
-
-/// Exported name stem of a trellis/int4 projection shape on this rank.
-fn shape_name(projection: &str, split: bool) -> String {
-    let base = match projection { "gate" | "up" => "gate_up", other => other };
-    if split { format!("{base}_tp2") } else { base.to_owned() }
 }
 
 impl<'a> GlmEngine<'a> {
@@ -138,66 +68,22 @@ impl<'a> GlmEngine<'a> {
     /// Returns which buffer holds the result: F32 accumulator or BF16 `bf16_out`.
     #[allow(clippy::too_many_arguments)]
     fn native_linear(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, projection: &str,
-        x: Buffer, rows: usize, bf16_out: Buffer, split: bool) -> Result<NativeOut> {
+        x: Buffer, rows: usize, bf16_out: Buffer) -> Result<NativeOut> {
         let programs = self.native_programs(rank)?;
         let s = self.native_scratch(rank, w)?;
-        let stream = self.stream_of(rank);
-        let encoding = layer.native_encoding(projection)?;
-        let key = |c: &str| layer.native(&crate::families::glm5::native_dense::key(projection, c));
-        match encoding {
-            DenseEncoding::Mxfp8 | DenseEncoding::Int4G32 => {
-                let prefix = if encoding == DenseEncoding::Mxfp8 { "mxfp8" } else { "int4" };
-                let name = format!("exlr8_dense_{prefix}_{}", if encoding == DenseEncoding::Mxfp8 { projection.to_owned() }
-                    else { shape_name(projection, split) });
-                let linear = programs.linear(&name)?;
-                let (payload, scales) = if encoding == DenseEncoding::Mxfp8 { (key("fp8")?, key("e8m0")?) }
-                    else { (key("q4")?, key("s4")?) };
-                let n = linear.geometry().output_features as usize;
-                // SAFETY: x holds rows x K BF16, the payload/scales are this layer's resident
-                // operands of the validated geometry, acc holds rows x N F32; all on this rank.
-                self.on(rank, || unsafe { linear.launch(x.ptr, payload.ptr, scales.ptr, s.partial.buffer.ptr,
-                    s.partial.buffer.bytes as u64, s.acc.buffer.ptr, rows as u32, 0, stream) }.map_err(Into::into))?;
-                Ok(NativeOut::F32 { n })
-            }
-            DenseEncoding::Trellis { bits: 4 } => {
-                let stem = shape_name(projection, split);
-                let a8 = self.exlr8_prefill_activations == super::super::Exlr8PrefillActivations::A8 && rows > NATIVE_DECODE_ROWS;
-                let dtype = if rows > NATIVE_DECODE_ROWS && !a8 { "bf16" } else { "f16" };
-                let suffix = if a8 { "_a8" } else if dtype == "bf16" { "_bf16" } else { "" };
-                let core = programs.linear(&format!("exlr8_dense_trellis_{stem}{suffix}"))?;
-                let (k, n) = (core.geometry().input_features as usize, core.geometry().output_features as usize);
-                let (payload, suh, svh) = (key("trellis")?, key("suh")?, key("svh")?);
-                let input = programs.companion(&format!("exlr8_dense_trellis_input_k{k}_{dtype}"))?;
-                let output = programs.companion(&format!("exlr8_dense_trellis_output_n{n}"))?;
-                let rotated = head(s.rotated.buffer, rows * k * 2)?;
-                // SAFETY (each launch): rank-local live buffers of the companion/linear
-                // contracts at `rows`; this rank's stream orders them.
-                self.on(rank, || unsafe {
-                    input.launch(&[x.ptr, suh.ptr, rotated.ptr, s.block_scales.buffer.ptr], rows as u32, 0, stream)?;
-                    if a8 {
-                        let records = s.records.as_ref().context("A8 prefill lane records")?.buffer;
-                        programs.companion(&format!("exlr8_dense_quant_k{k}_a8"))?
-                            .launch(&[s.table.buffer.ptr, records.ptr], rows as u32, 0, stream)?;
-                        core.launch(s.table.buffer.ptr, payload.ptr, s.block_scales.buffer.ptr, records.ptr,
-                            records.bytes as u64, s.acc.buffer.ptr, rows as u32, 0, stream)?;
-                    } else {
-                        core.launch(s.table.buffer.ptr, payload.ptr, s.block_scales.buffer.ptr, s.partial.buffer.ptr,
-                            s.partial.buffer.bytes as u64, s.acc.buffer.ptr, rows as u32, 0, stream)?;
-                    }
-                    output.launch(&[s.acc.buffer.ptr, svh.ptr, head(bf16_out, rows * n * 2)?.ptr], rows as u32, 0, stream)?;
-                    Ok::<_, anyhow::Error>(())
-                })?;
-                Ok(NativeOut::Bf16 { n })
-            }
-            other => anyhow::bail!("{projection}: no native GLM dense route for {other:?}"),
-        }
+        let projection_geometry = layer.native_projections.get(projection).context("native projection geometry")?;
+        self.on(rank, || programs.linear(projection_geometry,
+            |component| layer.native(&crate::shared::experts::exlr8::dense_weights::key(projection, component)),
+            s.linear.view(),
+            x, rows, bf16_out, self.exlr8_prefill_activations == super::super::Exlr8PrefillActivations::A8,
+            self.stream_of(rank)))
     }
 
     /// F32 accumulator rows narrowed (RNE) into BF16 `out` (contiguous `[rows, n]`).
     fn native_narrow(&self, rank: usize, w: &Workspace<'_>, rows: usize, n: usize, out: Buffer) -> Result<()> {
         let s = self.native_scratch(rank, w)?;
         // SAFETY: acc holds rows x n F32, out rows x n BF16, both on this rank's stream.
-        self.on(rank, || unsafe { self.library.cuda_f32_to_bf16_async(head(s.acc.buffer, rows * n * 4)?,
+        self.on(rank, || unsafe { self.library.cuda_f32_to_bf16_async(head(s.linear.view().acc, rows * n * 4)?,
             head(out, rows * n * 2)?, rows * n, self.stream_of(rank)) })
     }
 
@@ -212,10 +98,10 @@ impl<'a> GlmEngine<'a> {
         let (_, _, cos_sin) = self.rank_caches(rank, 0);
         let x = head(w.x.buffer, rows * self.cfg.hidden * 2)?;
         for (projection, pack) in [("q_a", "exlr8_dense_f32_narrow_pack_n2048_p2624"), ("kv_a", "exlr8_dense_f32_narrow_pack_n576_p2624")] {
-            self.native_linear(rank, w, layer, projection, x, rows, s.q.buffer, false)?;
+            self.native_linear(rank, w, layer, projection, x, rows, s.q.buffer)?;
             let c0 = if projection == "q_a" { 0 } else { self.cfg.q_lora_rank as u32 };
             // SAFETY: acc holds the projection's F32 rows; qkv holds rows x 2624 BF16.
-            self.on(rank, || unsafe { programs.companion(pack)?.launch(&[s.acc.buffer.ptr, s.qkv.buffer.ptr],
+            self.on(rank, || unsafe { programs.companion(pack)?.launch(&[s.linear.view().acc.ptr, s.qkv.buffer.ptr],
                 rows as u32, c0, stream).map_err(anyhow::Error::from) })?;
         }
         let prefix = if layer.attention_split { "glm2" } else { "glm" };
@@ -226,7 +112,7 @@ impl<'a> GlmEngine<'a> {
         let q_resid = head(w.q_resid.buffer, rows * self.cfg.q_lora_rank * 2)?;
         let heads = self.cfg.heads / if layer.attention_split { 2 } else { 1 };
         let q_bytes = rows * heads * 256 * 2;
-        match self.native_linear(rank, w, layer, "q_b", q_resid, rows, s.q.buffer, layer.attention_split)? {
+        match self.native_linear(rank, w, layer, "q_b", q_resid, rows, s.q.buffer)? {
             NativeOut::F32 { n } => self.native_narrow(rank, w, rows, n, head(s.q.buffer, q_bytes)?)?,
             NativeOut::Bf16 { .. } => {}
         }
@@ -247,19 +133,19 @@ impl<'a> GlmEngine<'a> {
         let (_, _, cos_sin) = self.rank_caches(rank, 0);
         let ih = self.cfg.index_heads;
         let q_resid = head(w.q_resid.buffer, rows * self.cfg.q_lora_rank * 2)?;
-        let n = match self.native_linear(rank, w, layer, "index_q", q_resid, rows, s.iq.buffer, false)? {
+        let n = match self.native_linear(rank, w, layer, "index_q", q_resid, rows, s.iq.buffer)? {
             NativeOut::F32 { n } => n, NativeOut::Bf16 { .. } => anyhow::bail!("index_q is MXFP8") };
         self.native_narrow(rank, w, rows, n, s.iq.buffer)?;
         let x = head(w.x.buffer, rows * self.cfg.hidden * 2)?;
-        self.native_linear(rank, w, layer, "index_k", x, rows, s.q.buffer, false)?;
+        self.native_linear(rank, w, layer, "index_k", x, rows, s.q.buffer)?;
         // SAFETY (both): acc holds the F32 rows; kw holds rows x (128 + I) BF16; weights_proj is resident.
         self.on(rank, || unsafe { programs.companion("exlr8_dense_f32_narrow_pack_n128_p160")?
-            .launch(&[s.acc.buffer.ptr, s.kw.buffer.ptr], rows as u32, 0, stream).map_err(anyhow::Error::from) })?;
+            .launch(&[s.linear.view().acc.ptr, s.kw.buffer.ptr], rows as u32, 0, stream).map_err(anyhow::Error::from) })?;
         self.on(rank, || unsafe { programs.companion("exlr8_dense_bf16_index_weights")?
-            .launch(&[x.ptr, layer.native(&crate::families::glm5::native_dense::key("index_w", "bf16"))?.ptr, s.acc.buffer.ptr],
+            .launch(&[x.ptr, layer.native(&crate::shared::experts::exlr8::dense_weights::key("index_w", "bf16"))?.ptr, s.linear.view().acc.ptr],
                 rows as u32, 0, stream)?;
             programs.companion("exlr8_dense_f32_narrow_pack_n32_p160")?
-                .launch(&[s.acc.buffer.ptr, s.kw.buffer.ptr], rows as u32, 128, stream).map_err(anyhow::Error::from) })?;
+                .launch(&[s.linear.view().acc.ptr, s.kw.buffer.ptr], rows as u32, 128, stream).map_err(anyhow::Error::from) })?;
         self.run_on(rank, &format!("glm_stage_index_post_{cap}"), &[("iq", s.iq.buffer.ptr), ("kw", s.kw.buffer.ptr),
             ("positions", w.positions.buffer.ptr), ("slots", w.slots.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr),
             ("k_weight", layer.ptr("k_norm_w")?), ("k_bias", layer.ptr("k_norm_b")?), ("q_fp8", w.q_fp8.buffer.ptr),
@@ -279,7 +165,7 @@ impl<'a> GlmEngine<'a> {
             &[Scalar::I32(rows as i32)])?;
         let heads = self.cfg.heads / if layer.attention_split { 2 } else { 1 };
         let values = head(s.values.buffer, rows * heads * self.cfg.v_head_dim * 2)?;
-        match self.native_linear(rank, w, layer, "o", values, rows, w.delta.buffer, layer.attention_split)? {
+        match self.native_linear(rank, w, layer, "o", values, rows, w.delta.buffer)? {
             NativeOut::F32 { n } => self.native_narrow(rank, w, rows, n, w.delta.buffer),
             NativeOut::Bf16 { .. } => Ok(()),
         }
@@ -293,7 +179,7 @@ impl<'a> GlmEngine<'a> {
         let x = head(w.x.buffer, rows * self.cfg.hidden * 2)?;
         let inter = self.cfg.dense_intermediate / if layer.split { 2 } else { 1 };
         for (projection, dst) in [("gate", s.gate.buffer), ("up", s.up.buffer)] {
-            match self.native_linear(rank, w, layer, projection, x, rows, dst, layer.split)? {
+            match self.native_linear(rank, w, layer, projection, x, rows, dst)? {
                 NativeOut::Bf16 { .. } => {}
                 NativeOut::F32 { .. } => anyhow::bail!("dense {projection} is trellis"),
             }
@@ -302,7 +188,7 @@ impl<'a> GlmEngine<'a> {
         self.on(rank, || unsafe { programs.companion(&format!("exlr8_dense_swiglu_split_i{inter}"))?
             .launch(&[s.gate.buffer.ptr, s.up.buffer.ptr, s.hidden.buffer.ptr], rows as u32, 0, self.stream_of(rank))
             .map_err(anyhow::Error::from) })?;
-        match self.native_linear(rank, w, layer, "down", head(s.hidden.buffer, rows * inter * 2)?, rows, out, layer.split)? {
+        match self.native_linear(rank, w, layer, "down", head(s.hidden.buffer, rows * inter * 2)?, rows, out)? {
             NativeOut::Bf16 { .. } => Ok(()),
             NativeOut::F32 { .. } => anyhow::bail!("dense down is trellis"),
         }
@@ -576,14 +462,6 @@ impl<'a> GlmEngine<'a> {
     }
 }
 
-/// Where a native projection left its rows.
-pub(super) enum NativeOut {
-    /// F32 `[rows, n]` in the lane accumulator (MXFP8 / int4).
-    F32 { n: usize },
-    /// BF16 `[rows, n]` in the caller's output (trellis after its output transform).
-    Bf16 { #[allow(dead_code)] n: usize },
-}
-
 #[cfg(test)]
 mod charge_tests {
     use super::*;
@@ -599,16 +477,21 @@ mod charge_tests {
             first_moe_layer: 3, dense_intermediate: 12288, experts: 256, topk: 8, moe_intermediate: 2048,
             shared_experts: 1, routed_scale: 2.5, rope_theta: 8000000.0, rms_norm_eps: 1e-5,
             mtp_layers: 1, eos_tokens: vec![154820], variant: cuteafd_loader::families::glm5::GlmVariant::Glm };
-        let (heads, inter) = (cfg.heads / 2, cfg.dense_intermediate / 2);
-        let scratch_bytes = cuteafd_loader::plan::exlr8::dense::scratch_bytes;
-        let decode = scratch_bytes(&cfg, heads, inter, NATIVE_DECODE_ROWS);
-        let prefill = scratch_bytes(&cfg, heads, inter, 4096);
+        let root = tempfile::tempdir().unwrap();
+        cuteafd_loader::plan::testing::exlr8::glm_snapshot(root.path());
+        let records = cuteafd_loader::plan::exlr8::dense::DenseRecord::inventory(root.path()).unwrap();
+        let plan = cuteafd_loader::plan::exlr8::dense::DensePlan::for_rank(&records, 2, 0).unwrap();
+        let layouts = cuteafd_loader::families::glm5::native::scratch_layouts(&cfg, &records, &plan,
+            NATIVE_DECODE_ROWS, 4096, false).unwrap();
+        let (decode, prefill) = (layouts[0].bytes().unwrap(), layouts[1].bytes().unwrap());
         // Rows-proportional terms only: no 1 GiB (4096 x 8 x 8192 x 4) partial.
         assert!(prefill < 640 << 20, "prefill lane scratch {prefill}");
         assert!(decode < 32 << 20, "decode scratch {decode}");
-        let a8 = cuteafd_loader::plan::exlr8::dense::a8_scratch_bytes(&cfg, heads, inter, 4096);
-        assert_eq!(a8, 256 * (8192 / 32) * 528);
-        assert_eq!(cuteafd_loader::plan::exlr8::dense::a8_scratch_bytes(&cfg, heads, inter, 64), 0);
+        let wide = cuteafd_loader::families::glm5::native::scratch_layouts(&cfg, &records, &plan,
+            NATIVE_DECODE_ROWS, 4096, true).unwrap();
+        let a8 = wide[1].linear.records.unwrap();
+        assert_eq!(a8, 256 * (128 / 32) * 528);
+        assert!(wide[0].linear.records.is_none());
         assert!(prefill + a8 < 640 << 20);
     }
 }

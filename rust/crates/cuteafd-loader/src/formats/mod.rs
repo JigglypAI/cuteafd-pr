@@ -12,6 +12,7 @@ pub mod exl3_storage;
 pub(crate) mod exl3_contract;
 pub(crate) mod expert_format;
 pub mod fp8_experts;
+pub mod head;
 pub mod mapped_table;
 pub mod mapped_preload;
 pub mod mapped_warm;

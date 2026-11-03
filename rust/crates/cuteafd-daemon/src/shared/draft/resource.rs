@@ -166,6 +166,22 @@ pub(crate) enum LayerHome {
     Remote { slice_bytes: f64 },
 }
 
+/// Price actual placement using checkpoint-native EXL3 extents or the installed
+/// FP8-family descriptor. The descriptor is deliberately never queried for EXL3.
+pub(crate) fn layer_homes(layers: impl IntoIterator<Item = (bool, bool, usize)>,
+    exl3: Option<&cuteafd_loader::V41Exl3Manifest>,
+    read_bytes: impl Fn(usize) -> Result<usize>) -> Result<Vec<LayerHome>> {
+    layers.into_iter().enumerate().map(|(layer, (dense, local, tp))| {
+        if dense { return Ok(LayerHome::Dense); }
+        ensure!(tp > 0, "layer {layer} has no installed expert ranks");
+        let slice_bytes = match exl3 {
+            Some(manifest) => exl3_slice_bytes(manifest, layer, tp)?,
+            None => read_bytes(layer)? as f64,
+        };
+        Ok(if local { LayerHome::Local { slice_bytes } } else { LayerHome::Remote { slice_bytes } })
+    }).collect()
+}
+
 /// GLM Flash's policy geometry from each layer's home, the router's expert
 /// count and top-k, the step's row budget, the drafter's block and the copy
 /// positions that may extend it.
@@ -818,6 +834,57 @@ mod tests {
         reports[1] = InstalledExpertGrouping::new(loaded, 5, 80, ExpertGroupingSelector::Fp8Nearest,
             vec![variant]).unwrap();
         assert!(worker_weight_read_bytes(&reports, 3).is_err());
+    }
+
+    #[test]
+    fn glm_and_qwen_layer_prices_remain_bit_identical() -> Result<()> {
+        use cuteafd_loader::plan::testing;
+        for family in ["glm", "qwen"] {
+            let fixture = tempfile::tempdir()?;
+            let (config, tensors, first, layers, hidden, intermediate, experts) = if family == "glm" {
+                let mut config = testing::glm5_config();
+                config["quantization_config"] = testing::exl3_compact(4);
+                let mut tensors = Vec::new();
+                for expert in 0..256 {
+                    for (projection, n, k) in [("gate_proj", 2048, 6144), ("up_proj", 2048, 6144),
+                        ("down_proj", 6144, 2048)] {
+                        tensors.extend(testing::exl3(&format!("model.layers.1.mlp.experts.{expert}.{projection}"), n, k, 4));
+                    }
+                }
+                (config, tensors, 1, 2, 6144, 2048, 256)
+            } else {
+                let (tensors, _) = testing::qwen4_exl3(2, 4);
+                (testing::qwen4_config(2), tensors, 0, 2, 2560, 640, 512)
+            };
+            testing::write_snapshot(fixture.path(), &config, &tensors, None);
+            let catalog = cuteafd_loader::read_expert_catalog(fixture.path())?;
+            for tp in [1, 2, 3, 6] {
+                for local in [false, true] {
+                    let homes = layer_homes((0..layers).map(|layer| (layer < first, local, tp)),
+                        catalog.exl3(), |_| panic!("EXL3 must not query installed FP8 descriptors"))?;
+                    let width = (intermediate / 128usize).div_ceil(tp) * 128;
+                    let bytes = (3 * (hidden * width * 4 / 8 + hidden * 2 + width * 2)) as f64;
+                    for (layer, home) in homes.iter().enumerate() {
+                        let previous = if layer < first { LayerHome::Dense }
+                            else if local { LayerHome::Local { slice_bytes: bytes } }
+                            else { LayerHome::Remote { slice_bytes: bytes } };
+                        assert_eq!(*home, previous, "{family} TP{tp}");
+                    }
+                    for bytes in [12_288_024usize, 6_291_456, 7_077_900] {
+                        let native = layer_homes((0..layers).map(|layer| (layer < first, local, tp)), None, |_| Ok(bytes))?;
+                        let previous = (0..layers).map(|layer| if layer < first { LayerHome::Dense }
+                            else if local { LayerHome::Local { slice_bytes: bytes as f64 } }
+                            else { LayerHome::Remote { slice_bytes: bytes as f64 } }).collect::<Vec<_>>();
+                        assert_eq!(native, previous, "{family} native TP{tp}");
+                        let geometry = |homes: &[_]| geometry_with_grouping(homes, experts, 8, 64, 3, 0, |_, _| Ok(48));
+                        assert_eq!(geometry(&native)?, geometry(&previous)?, "{family} native TP{tp}");
+                    }
+                }
+            }
+        }
+        assert!(layer_homes([(false, false, 0)], None, |_| Ok(1)).is_err());
+        assert_eq!(layer_homes([(true, false, 0)], None, |_| panic!("dense descriptor"))?, [LayerHome::Dense]);
+        Ok(())
     }
 
     #[test]

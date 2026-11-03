@@ -12,6 +12,11 @@ use cuteafd_loader::{placement::{Demand, GpuBudget, Inventory, ProgramSet, Spark
 use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission, TcpTransportConfig};
 use std::{cell::RefCell, net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}};
 
+
+/// The solved arena an onboarded routed set loads into.
+#[derive(Debug, Clone, Copy)]
+enum OnboardBudget { Whole(usize), Tp2([usize; 2]) }
+
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
     #[arg(long)]
@@ -43,6 +48,10 @@ pub(crate) struct ServeArgs {
     /// Pack queued short prompts, optionally preserving singleton arithmetic routes.
     #[arg(long, value_enum, default_value = "unrestricted")]
     prefill_packing: crate::shared::prefill_packing::PackingMode,
+    /// RTX expert layers: auto fills beside the pool, all fixes every routed
+    /// target layer, or N fixes exactly N. Two RTX split onboarded layers TP2.
+    #[arg(long, default_value = "auto")]
+    rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
     /// Native predictor depth; 0 disables speculation.
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=3))]
     mtp: u8,
@@ -66,8 +75,8 @@ pub(crate) struct ServeArgs {
 }
 
 impl ServeArgs {
-    fn endpoint(&self, bf16: bool) -> SparkEndpoint {
-        SparkEndpoint { ring_depth: None, capacity: self.prefill_rows, ingress: if bf16 { SparkIngress::Bf16 } else { SparkIngress::Native } }
+    fn endpoint(&self, ingress: SparkIngress) -> SparkEndpoint {
+        SparkEndpoint { ring_depth: None, capacity: self.prefill_rows, ingress }
     }
 
     fn shape(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
@@ -80,10 +89,14 @@ impl ServeArgs {
     }
 
     fn validate(&self) -> Result<()> {
+        cuteafd_core::concurrency::validate("step5", u64::from(self.max_sequences))?;
         let shape = self.shape()?;
         ensure!(self.device >= 0 && self.split_device.is_none_or(|d| d >= 0 && d != self.device),
             "Step-5 needs one GPU or two distinct actual GPUs");
-        ensure!(cuteafd_core::tp_units::spark_package_worlds("step5", "fp8").contains(&self.peers.len()),
+        // Transport check only: the checkpoint's own format and the shared
+        // width-class ranges decide the world in admission (spark_recipe).
+        ensure!(["exl3", "fp8", "nvfp4"].iter().any(|format|
+            cuteafd_core::tp_units::spark_package_worlds("step5", format).contains(&self.peers.len())),
             "Step-5 requires a shared width-class Spark recipe");
         ensure!(self.peers.iter().enumerate().all(|(i, peer)| !self.peers[..i].contains(peer)),
             "Step-5 Spark peers must be distinct");
@@ -145,9 +158,11 @@ const PACKED_PROGRAM_ROLES: &[(&str, crate::shared::prefill_packing::ProgramRows
         ("index_weight", PackedRows),
         ("dense_gate_up", PackedRows), ("dense_down", PackedRows),
         ("post_silu_w13824_c7", PackedRows), ("post_silu_w13824_c10", PackedRows),
+        ("post_silu_split_w13824_c7", PackedRows), ("post_silu_split_w13824_c10", PackedRows),
         ("router", PackedRows), ("route_weights", PackedRows),
         ("shared_gate_up", PackedRows), ("shared_down", PackedRows),
         ("post_silu_w1536_c7", PackedRows), ("post_silu_w1536_c10", PackedRows),
+        ("post_silu_split_w1536_c7", PackedRows), ("post_silu_split_w1536_c10", PackedRows),
         ("residual_bf16", PackedRows), ("residual_f32", PackedRows),
         ("expert_input_quant", PackedRows), ("pack_fp8_kv_plane", PackedRows),
         ("sliding_positions", SequenceLocal), ("sliding_commit", SequenceLocal),
@@ -193,21 +208,18 @@ fn with_backend<T>(args: &ServeArgs,
     resolved.prefill_waves = u8::try_from(shape.waves)?;
     let args = &resolved;
     args.validate()?;
+    let startup = std::time::Instant::now();
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, args.mtp > 0)?;
     let cfg = Config::parse(&checkpoint)?;
+    cuteafd_bench::context::set_family(cfg.family_id());
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     catalog.select_draft(DraftOwnership::None)?;
     ensure!(catalog.routed_experts().geometry()? == ExpertGeometry::STEP5, "Step-5 routed geometry mismatch");
-    let format = catalog.fp8().context("Step-5 requires native FP8 or NVFP4 expert headers")?.format();
-    ensure!(matches!(format, cuteafd_loader::formats::fp8_experts::ExpertFormat::Fp8Block128
-        | cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4),
-        "Step-5 BF16 is a fidelity reference, not a serving fallback");
+    let format = super::experts::StepExperts::from_catalog(&catalog)?;
     cuteafd_core::set_expert_geometry(ExpertGeometry::STEP5)
         .map_err(|_| anyhow::anyhow!("Step-5 serving requires an isolated process"))?;
-    let package = args.native_lib.parent().context("native library directory")?.join("fp8")
-        .join(format.package_name("step5")).join("manifest.json");
-    let metadata = cuteafd_loader::plan::checkpoint::read_json(&package)?;
-    let exports = package_exports(&metadata)?;
+    let metadata = cuteafd_loader::plan::checkpoint::read_json(&format.package_manifest(&args.native_lib)?)?;
+    let exports = format.exports(&metadata)?;
     // SAFETY: this owner outlives all programs, native lanes, transports and allocations.
     let library = Arc::new(unsafe { NativeLibrary::load(&args.native_lib)? });
     library.cuda_set_device(args.device)?;
@@ -231,9 +243,10 @@ fn with_backend<T>(args: &ServeArgs,
         }
         Ok(())
     })?;
-    let selected_programs = ProgramSet::from_names(&["step5", "step52"], programs.names());
+    let selected_programs = ProgramSet::from_names(
+        cuteafd_loader::plan::families::step5::native::program_prefixes(ids.len() == 2), programs.names());
     let pending_code = ids.iter().enumerate().map(|(rank, &id)| crate::shared::inventory::pending_code(
-        &library, id, rank, ids.len() == 2, "step5", &format.package_name("step5"), &selected_programs))
+        &library, id, rank, ids.len() == 2, "step5", &format.package_name(), &selected_programs))
         .collect::<Result<Vec<_>>>()?;
     let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
     let mut inputs = RuntimeInputs { kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
@@ -244,8 +257,17 @@ fn with_backend<T>(args: &ServeArgs,
         sequences: usize::from(args.max_sequences), context: args.max_context,
         requested_pool: args.pool_tokens,
         marks: admission::prefix_marks(&args.prefix, usize::from(args.max_sequences)),
-        peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code, startup: vec![] };
-    let admission = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(args.mtp))?;
+        peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code, startup: vec![],
+        onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
+            Some(&args.manifest), args.prefill_rows as usize, ids.len(), usize::from(args.prefill_waves),
+            args.rtx_expert_layers.resolve(catalog.routed_experts().routed_layers()))? };
+    let contract = std::rc::Rc::new(cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?);
+    tracing::info!(elapsed_s = startup.elapsed().as_secs_f64(), "Step-5 startup inventory complete");
+    let planning = std::time::Instant::now();
+    // The first solve only prices retained startup owners. Validate native ABIs
+    // once, after the final solve selects the ownership used for allocation.
+    let admission = cuteafd_loader::plan::families::step5::admission::admit_mtp_with_contract(
+        &checkpoint, &inputs, usize::from(args.mtp), &contract)?;
     cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
     // Uploads convert on the host and copy synchronously. No transient device
     // conversion arena exists: each loading phase is bounded by retained owners.
@@ -255,22 +277,27 @@ fn with_backend<T>(args: &ServeArgs,
         Ok(Demand::new(rank as u8, cuteafd_core::memory_layout::Category::Workspace,
             "Step-5 retained loading peak", bytes, cuteafd_core::memory_layout::Basis::Exact))
     }).collect::<Result<Vec<_>>>()?;
-    let admission = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(args.mtp))?;
+    let (admission, native_plan) = admission::admit_mtp_with_contract(&programs, &checkpoint, &inputs, usize::from(args.mtp), contract)?;
+    tracing::info!(elapsed_s = planning.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
+        "Step-5 startup planning complete");
     measured.record("step5", &measured.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
-    let endpoint = args.endpoint(format.bf16_input());
+    let endpoint = args.endpoint(format.ingress());
     let clients = admission.ownership.routed_endpoints()?;
     let config = TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() };
     // Spark admission is planned (headers only) here and started below, once the
     // coordinator's own allocations are admitted; the coordinator then loads
     // its weights while the Sparks load theirs (and, pushing, in one group).
-    let spark_admission = SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
-        rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: args.peers.len(),
-        prefill_lanes: 1 }, args.peers.len(), None,
+    let spark_working = SparkWorkingSet {
+        rtx_layers: admission.ownership.onboarded_layers().to_vec(),
+        spark_layers: (3..91).filter(|layer| !admission.ownership.onboarded(*layer)).collect(), spark_ranks: args.peers.len(),
+        prefill_lanes: 1 };
+    let bootstrap = super::execution::bootstrap_request(inputs.unit_rows(), 1, &format, &spark_working.spark_layers)?;
+    let spark_admission = SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &spark_working, args.peers.len(), None,
         spark_model(&exports, endpoint, u64::from(args.prefill_waves), clients, config.max_frame_bytes)?)?;
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
     let reserves = (0..ids.len()).map(|rank| {
-        let native = Execution::serving_admission(&programs, &checkpoint, &admission.ownership, rank, inputs.unit_rows(),
-            inputs.rows, inputs.logit_rows())?;
+        let native = Execution::serving_admission_with_plan(&programs, &checkpoint, &admission.ownership, rank, inputs.unit_rows(),
+            inputs.rows, inputs.logit_rows(), &native_plan)?;
         let mut native = native;
         if rank == usize::from(admission.ownership.execution().spec().head_gpu) {
             native.workspace = native.workspace.max(
@@ -282,9 +309,16 @@ fn with_backend<T>(args: &ServeArgs,
         total.checked_sub(native).context("Step-5 native allocation missing from solved ledger")
     }).collect::<Result<Vec<_>>>()?;
     let head_rank = usize::from(admission.ownership.execution().spec().head_gpu);
+    // The solved expert arenas: TP2 halves over two GPUs, else the entry GPU's whole layers.
+    let onboarded_budget = match &admission.placement.tp2 {
+        Some(range) => Some(OnboardBudget::Tp2([usize::try_from(range.peak_bytes[0])?, usize::try_from(range.peak_bytes[1])?])),
+        None => admission.placement.expert_ranges.get(usize::from(
+            admission.ownership.execution().spec().entry_gpu)).filter(|range| range.layers > 0)
+            .map(|range| usize::try_from(range.peak_bytes)).transpose()?.map(OnboardBudget::Whole),
+    };
     let predictor_budget = if args.mtp > 0 {
-        let own = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::for_mtp(
-            &checkpoint, usize::from(args.mtp))?.resident_bytes;
+        let own = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::mtp_from_contract(
+            &checkpoint, &native_plan.contract, usize::from(args.mtp))?.resident_bytes;
         let total = admission.placement.items[head_rank].iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
             .context("Step-5 solved predictor allocation overflow")?;
         Some((available[head_rank], total.checked_sub(own).context("Step-5 predictor absent from ledger")?))
@@ -312,14 +346,15 @@ fn with_backend<T>(args: &ServeArgs,
     // planning error offers no coordinator ranks: the Sparks still push and the
     // coordinator fills through the mount); otherwise they load through the
     // mount while the Sparks load.
+    let native_start = std::time::Instant::now();
     let push = spark_admission.coordinator_pushes();
     let mut native = None;
     let mut coordinator = None;
     let mut ranks = None;
     if push {
         let recorder = crate::shared::experts::rtx::dense::Recorder::start(true)?.context("dense recorder")?;
-        let loaded = Execution::load_native(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
-            inputs.unit_rows(), inputs.rows, inputs.logit_rows(), &available, &reserves, 92);
+        let loaded = Execution::load_native_with_plan(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
+            inputs.unit_rows(), inputs.rows, inputs.logit_rows(), &available, &reserves, 92, &native_plan);
         let records = recorder.finish();
         native = Some(loaded?);
         let planned = (|| -> Result<_> {
@@ -344,6 +379,9 @@ fn with_backend<T>(args: &ServeArgs,
             }
         }
     }
+    tracing::info!(elapsed_s = native_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
+        "Step-5 startup native preparation complete");
+    let push_start = std::time::Instant::now();
     let pending = spark_admission.start_with(&args.peers, ranks)?;
     let (embedding, native) = crate::shared::placement::load_while_admitting(Some(pending), || {
         TokenEmbedding::load(&library, source, EmbedPlacement::Gpu, || -> Result<super::execution::LoadedNative<'_>> {
@@ -358,14 +396,39 @@ fn with_backend<T>(args: &ServeArgs,
                 tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(), steps = records.steps.len(),
                     "Step-5 coordinator dense operands landed");
             }
-            match native {
-                Some(native) => Ok(native),
-                None => Execution::load_native(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
+            let native = match native {
+                Some(native) => native,
+                None => Execution::load_native_with_plan(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
                     inputs.unit_rows(), inputs.rows, inputs.logit_rows(),
-                    &available, &reserves, 92),
+                    &available, &reserves, 92, &native_plan)?,
+            };
+            // Onboarded EXL3 routed layers inside their solved expert arenas:
+            // TP2 halves over two GPUs, else whole on the entry GPU.
+            let entry = usize::from(ownership.execution().spec().entry_gpu);
+            let onboarded = ownership.onboarded_layers();
+            if onboarded.is_empty() { return Ok(native); }
+            match onboarded_budget.context("Step-5 onboarded layers without a solved expert arena")? {
+                OnboardBudget::Whole(peak) => {
+                    ensure!(format.is_exl3(), "Step-5 whole-layer onboarding runs EXL3 experts (FP8 is TP2 on two RTX)");
+                    let package = format.package_manifest(&args.native_lib)?.parent().context("EXL3 package")?.join("rtx-tp1");
+                    native.with_onboarded(devices[entry], &catalog, &package, onboarded, inputs.unit_rows(), peak)
+                }
+                OnboardBudget::Tp2(peaks) => {
+                    let package = match &format {
+                        super::experts::StepExperts::Exl3(_) => format.package_manifest(&args.native_lib)?
+                            .parent().context("EXL3 package")?.join("rtx-tp2"),
+                        super::experts::StepExperts::Native(expert) => crate::shared::experts::fp8::package_directory(
+                            &args.native_lib, 2, *expert),
+                    };
+                    native.with_onboarded_tp2([devices[0], devices[1]], &catalog, &package, onboarded,
+                        inputs.unit_rows(), peaks)
+                }
             }
         })
     })?;
+    tracing::info!(elapsed_s = push_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
+        "Step-5 startup weight delivery complete");
+    let bind_start = std::time::Instant::now();
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;
     let world = SparkWorld::canonical(args.peers.len())?;
     let transport = devices[0].own(|| {
@@ -374,7 +437,7 @@ fn with_backend<T>(args: &ServeArgs,
         let mut link = SparkLink::new_waves(&library, world, &args.peers, args.prefill_rows, config, 4096 * 2,
             waves, args.prefill_rows)?;
         link.enable_terminal_ownership(library.clone())?;
-        link.bootstrap(&super::execution::bootstrap_request(inputs.unit_rows(), 1)?)?;
+        link.bootstrap(&bootstrap)?;
         Ok(link)
     })?;
     library.cuda_set_device(args.device)?;
@@ -390,6 +453,8 @@ fn with_backend<T>(args: &ServeArgs,
         .configure_packing(args.prefill_packing, coordinator_cap)?;
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
     library.cuda_set_device(args.device)?;
+    tracing::info!(elapsed_s = bind_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
+        "Step-5 startup native binding complete");
     tracing::info!(rows=inputs.rows, sequences=inputs.sequences, mtp=args.mtp,
         context=backend.geometry().max_context, pool_tokens=admission.placement.pool_tokens,
         "Step-5 admitted eager target and native predictor depth");
@@ -408,10 +473,9 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
-    cuteafd_core::concurrency::validate("step5", args.max_sequences as u64)?;
-    args.prefix.resolve_entries(args.max_sequences as usize);
     use cuteafd_api::openai::{chat::step5::Step5Encoding, ModelEncoding, ModelProfile};
     args.validate()?;
+    args.prefix.resolve_entries(usize::from(args.max_sequences));
     let api = args.api.load()?;
     let snapshot = args.snapshot.clone();
     let encoding = Arc::new(Step5Encoding::from_snapshot(&snapshot)?);
@@ -469,8 +533,69 @@ mod tests {
     }
 
     #[test]
+    fn boot_concurrency_resolves_retention_and_names_native_refusals() -> Result<()> {
+        for c in [1u8, 4, 16, 17, 32, 64, 65] {
+            let mut args = args();
+            args.max_sequences = c;
+            if c > 64 {
+                let error = args.validate().unwrap_err().to_string();
+                assert!(error.contains("step5") && error.contains("decode program capacity 64"));
+                continue;
+            }
+            args.validate()?;
+            args.prefix.resolve_entries(usize::from(c));
+            assert_eq!(args.prefix.prefix_cache_entries, 20.max((5 * usize::from(c)).div_ceil(4)));
+            assert_eq!(cuteafd_core::concurrency::state_slots(u64::from(c)), u64::from(c));
+            assert_eq!(cuteafd_core::concurrency::queue_depth(u64::from(c)), u64::from(c));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn output_limits_use_shared_signed_reservation_options() -> Result<()> {
+        let mut args = args();
+        for maximum in [-1, 0, 32768, 131072] {
+            args.prefix.reserve.max_output_tokens = maximum;
+            let expected = cuteafd_api::openai::NativeLimits::new(262_144, maximum)?;
+            assert_eq!(args.prefix.reserve.limits(262_144)?.output(), expected.output());
+            args.prefix.reserve.config(262_144)?;
+        }
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-step5", "--snapshot", "/m",
+            "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2",
+            "--max-output-tokens", "-1", "--kv-decode-reserve-chunk", "640"])?;
+        let crate::cli::Commands::ServeStep5(args) = cli.command else { panic!("Step-5 dispatch") };
+        assert_eq!(args.prefix.reserve.max_output_tokens, -1);
+        assert_eq!(args.prefix.reserve.kv_decode_reserve_chunk, 640);
+        Ok(())
+    }
+
+    #[test]
+    fn onboarding_uses_shared_target_layer_grammar() -> Result<()> {
+        use cuteafd_loader::placement::{Onboard, OnboardSetting};
+        for (text, setting, resolved) in [
+            ("auto", OnboardSetting::Auto, Onboard::Auto),
+            ("all", OnboardSetting::All, Onboard::Layers(88)),
+            ("0", OnboardSetting::Layers(0), Onboard::Layers(0)),
+            ("2", OnboardSetting::Layers(2), Onboard::Layers(2)),
+        ] {
+            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-step5", "--snapshot", "/m",
+                "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2",
+                "--rtx-expert-layers", text])?;
+            let crate::cli::Commands::ServeStep5(args) = cli.command else { panic!("Step-5 dispatch") };
+            assert_eq!(args.rtx_expert_layers, setting);
+            assert_eq!(args.rtx_expert_layers.resolve(88), resolved);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn spark_count_admission_matches_shared_width_coverage() {
-        let worlds = cuteafd_core::tp_units::spark_package_worlds("step5", "fp8");
+        // Any Step format's shared width-class coverage; the checkpoint's own
+        // format decides the exact world in admission.
+        let worlds = ["exl3", "fp8", "nvfp4"].iter()
+            .flat_map(|format| cuteafd_core::tp_units::spark_package_worlds("step5", format))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(worlds.contains(&2) && worlds.contains(&6) && !worlds.contains(&1));
         for world in 1..=cuteafd_core::MAX_SPARK_WORLD {
             let mut args = args();
             args.peers = (0..world).map(|rank| format!("127.0.0.1:{}", rank + 1).parse().unwrap()).collect();
@@ -530,11 +655,9 @@ mod tests {
         let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
         catalog.select_draft(DraftOwnership::None)?;
         ensure!(catalog.routed_experts().geometry()? == ExpertGeometry::STEP5, "routed geometry");
-        let format = catalog.fp8().context("native experts")?.format();
-        let package = args.native_lib.parent().context("native package")?.join("fp8")
-            .join(format.package_name("step5")).join("manifest.json");
-        let metadata = plan::checkpoint::read_json(&package)?;
-        let exports = package_exports(&metadata)?;
+        let format = super::super::experts::StepExperts::from_catalog(&catalog)?;
+        let metadata = plan::checkpoint::read_json(&format.package_manifest(&args.native_lib)?)?;
+        let exports = format.exports(&metadata)?;
         let manifest = plan::checkpoint::read_json(&args.manifest)?;
         ensure!(manifest["programs"].as_array().context("native programs")?.iter()
             .all(|program| program.get("card_plans").is_none()),
@@ -553,8 +676,10 @@ mod tests {
             rows: 256, waves: 1, unit: 0, full_prefill_logits: false, sequences: 16, context: args.max_context, requested_pool: None,
             marks: admission::prefix_marks(&args.prefix, 16), peer_diagnostics: false,
             pending_code: (0..2).map(|rank| placement::inventory::loaded_code_allowance(
-                "step5", &format.package_name("step5"), true, rank, &arch, Some(&selected)).bytes).collect(),
+                "step5", &format.package_name(), true, rank, &arch, Some(&selected)).bytes).collect(),
             startup: vec![],
+            onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
+                Some(&args.manifest), 256, 2, 1, args.rtx_expert_layers.resolve(catalog.routed_experts().routed_layers()))?,
         };
         for depth in 1..=3 {
             args.mtp = depth;
@@ -566,12 +691,15 @@ mod tests {
                     "Step-5 retained loading peak", items.iter().map(|item| item.bytes).sum(),
                     cuteafd_core::memory_layout::Basis::Exact)).collect();
             let admitted = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(depth))?;
-            let endpoint = args.endpoint(format.bf16_input());
+            let endpoint = args.endpoint(format.ingress());
             let clients = admitted.ownership.routed_endpoints()?;
-            SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
-                rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: 6, prefill_lanes: 1 },
+            let working = SparkWorkingSet {
+                rtx_layers: admitted.ownership.onboarded_layers().to_vec(),
+                spark_layers: (3..91).filter(|layer| !admitted.ownership.onboarded(*layer)).collect(),
+                spark_ranks: 6, prefill_lanes: 1 };
+            SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &working,
                 6, None, spark_model(&exports, endpoint, 1, clients, TcpTransportConfig::default().max_frame_bytes)?)?;
-            super::super::execution::bootstrap_request(inputs.rows, 1)?;
+            super::super::execution::bootstrap_request(inputs.unit_rows(), 1, &format, &working.spark_layers)?;
             let head_rank = usize::from(admitted.ownership.execution().spec().head_gpu);
             for rank in 0..2 {
                 let mut native = Execution::serving_admission(&programs, &checkpoint,
@@ -591,12 +719,13 @@ mod tests {
             ensure!(predictor <= total
                 && admitted.cache.ranks[head_rank].mtp_lengths.len() == usize::from(depth),
                 "predictor runtime exceeds admitted owners/cache");
+            let contract = plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?;
             for stage in 0..usize::from(depth) {
-                super::super::mtp::InputPlan::prepare(&programs, &checkpoint, stage, inputs.unit_rows())?;
+                super::super::mtp::InputPlan::prepare(&programs, &checkpoint, stage, inputs.unit_rows(), &contract)?;
                 super::super::head::HeadPlan::for_mtp_stage(&programs, &checkpoint, stage,
-                    plan::families::step5::native::head_rows(inputs.rows, false))?;
+                    plan::families::step5::native::head_rows(inputs.rows, false), &contract)?;
                 super::super::ffn::DensePlan::for_mtp_stage(&programs, &checkpoint,
-                    stage, inputs.rows, u64::MAX, &[])?;
+                    stage, inputs.rows, u64::MAX, &[], &contract)?;
             }
             let planned = plan::plan(&args.snapshot, &plan::PlanOptions {
                 placement: plan::ExpertPlacement::from_spark_ranks(6),
@@ -619,6 +748,7 @@ mod tests {
         use crate::shared::qwen::scheduler::DraftState as _;
         use cuteafd_engine::prefix::{After, PrefixFamily, SnapshotKind};
         use super::super::prefix::Placement;
+        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
         let mut args = live_mtp_args();
         args.kv_cache = std::env::var("CUTEAFD_STEP5_KV_CACHE")
             .unwrap_or_else(|_| "bf16".into()).parse()?;
@@ -929,8 +1059,8 @@ mod tests {
         for split in [false, true] {
             let owned = packed_program_inventory(split);
             let inventory = owned.iter().map(|(name, role)| (name.as_str(), *role)).collect::<Vec<_>>();
-            assert_eq!(inventory.len(), if split { 96 } else { 48 });
-            validate_program_inventory(inventory.iter().map(|(name, _)| *name), &inventory)?;
+            // Exporter namespace equality is exercised independently by test_step5_reference.py.
+            assert_eq!(inventory.len(), if split { 104 } else { 52 });
             let mut required = inventory.iter().map(|(name, _)| *name).collect::<Vec<_>>();
             required.push("step5_new_projection");
             assert!(validate_program_inventory(required, &inventory).is_err());
@@ -938,7 +1068,9 @@ mod tests {
             for prefix in std::iter::once("step5").chain(split.then_some("step52")) {
                 let role = |suffix| inventory.iter().find(|(name, _)| *name == format!("{prefix}_{suffix}"))
                     .map(|(_, role)| *role).unwrap();
-                for suffix in ["router", "attn_q", "index_weight", "pack_fp8_kv_plane", "shared_gate_up"] {
+                for suffix in ["router", "attn_q", "index_weight", "pack_fp8_kv_plane", "shared_gate_up",
+                    "post_silu_split_w13824_c7", "post_silu_split_w13824_c10",
+                    "post_silu_split_w1536_c7", "post_silu_split_w1536_c10"] {
                     assert_eq!(role(suffix), PackedRows);
                 }
                 for suffix in ["swa_attention", "csa_attention_fp8", "region_compress", "mtp_eh", "final_norm"] {
@@ -1010,7 +1142,7 @@ mod tests {
             assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (unit, waves, span));
             args.prefill_rows = unit as u32;
             let exports = [1, 16, 80, 256, 1024, 4096];
-            let model = spark_model(&exports, args.endpoint(false), waves, 2, TcpTransportConfig::default().max_frame_bytes)?;
+            let model = spark_model(&exports, args.endpoint(SparkIngress::Native), waves, 2, TcpTransportConfig::default().max_frame_bytes)?;
             // One prefill owner at the selected unit's covering export; the k units only buffer I/O.
             assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: unit as u32,
                 compiled_capacity: 4096, unit_rows: unit as u32, buffered_units: waves as u8 });
@@ -1093,9 +1225,9 @@ mod load_order_tests {
         let start = source.find("fn with_backend<T>").unwrap();
         let body = &source[start..start + source[start..].find("\nfn worker(").unwrap()];
         let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
-        assert!(at("admission::admit_mtp(") < at("let spark_admission = SparkAdmission::plan("));
-        assert!(at("let spark_admission = SparkAdmission::plan(") < at("Execution::load_native("));
-        assert!(at("Execution::load_native(") < at("spark_admission.start_with("));
+        assert!(at("admission::admit_mtp_with_contract(") < at("let spark_admission = SparkAdmission::plan("));
+        assert!(at("let spark_admission = SparkAdmission::plan(") < at("Execution::load_native_with_plan("));
+        assert!(at("Execution::load_native_with_plan(") < at("spark_admission.start_with("));
         assert!(at("spark_admission.start_with(") < at("load_while_admitting(Some(pending)"));
         assert!(at("load_while_admitting(Some(pending)") < at("require_peer_clients("));
         assert!(at("require_peer_clients(") < at("SparkLink::new_waves("));

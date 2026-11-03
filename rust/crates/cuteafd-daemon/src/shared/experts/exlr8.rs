@@ -6,7 +6,11 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_loader::plan::exlr8::residency::Residency;
 
 mod execution;
+pub(crate) mod dense_execution;
+pub(crate) mod dense_weights;
+mod shared;
 pub(crate) use execution::{grouped_decode_from_row, Exlr8Execution};
+pub(crate) use shared::{NativeExperts, NativePlan};
 
 pub(crate) use cuteafd_loader::plan::exlr8::PrefillActivations as Exlr8PrefillActivations;
 

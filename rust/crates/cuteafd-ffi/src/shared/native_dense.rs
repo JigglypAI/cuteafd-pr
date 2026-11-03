@@ -32,6 +32,35 @@ pub struct DenseGeometry {
     pub max_rows: u32,
 }
 
+fn keyed_geometry(name: &str) -> Option<(Encoding, u64, u64, u64)> {
+    let (encoding, shape) = if let Some(shape) = name.strip_prefix("trellis_k") {
+        (Encoding::Trellis, shape)
+    } else if let Some(shape) = name.strip_prefix("mxfp8_k") {
+        (Encoding::Mxfp8, shape)
+    } else if let Some(shape) = name.strip_prefix("fp8_row_k") {
+        (Encoding::RowFp8, shape)
+    } else if let Some(shape) = name.strip_prefix("fp8_row_embedding_k") {
+        (Encoding::Embedding, shape)
+    } else { return None; };
+    let (k, rest) = shape.split_once("_n")?;
+    let (n, side) = if encoding == Encoding::Embedding { (rest, "1") }
+        else { rest.split_once("_s")? };
+    let (k, n, side): (u64, u64, u64) = (k.parse().ok()?, n.parse().ok()?, side.parse().ok()?);
+    let canonical = if encoding == Encoding::Embedding { format!("{k}_n{n}") }
+        else { format!("{k}_n{n}_s{side}") };
+    if canonical != shape || k == 0 || n == 0 || !matches!(side, 1 | 2)
+        || (encoding == Encoding::Trellis && (k % 128 != 0 || n % 128 != 0))
+        || (matches!(encoding, Encoding::Mxfp8 | Encoding::RowFp8) && (k % 128 != 0 || n % 32 != 0)) {
+        return None;
+    }
+    if k > i32::MAX as u64 || n > i32::MAX as u64
+        || k.checked_mul(n).and_then(|v| v.checked_mul(4096 * 4)).is_none()
+        || (encoding == Encoding::Embedding && (k % 2 != 0 || 4096 * k.div_ceil(256) > i32::MAX as u64 / 2)) {
+        return None;
+    }
+    Some((encoding, k, n, side))
+}
+
 fn geometry(spec: &ProgramSpec) -> Result<DenseGeometry> {
     let name = spec
         .name
@@ -59,12 +88,8 @@ fn geometry(spec: &ProgramSpec) -> Result<DenseGeometry> {
         "mxfp8_index_k" => (Encoding::Mxfp8, 6144, 128, 1),
         "fp8_row_lm_head" => (Encoding::RowFp8, 6144, 154880, 1),
         "fp8_row_embedding" => (Encoding::Embedding, 6144, 154880, 1),
-        _ => {
-            return Err(invalid(format!(
-                "unsupported native dense program {}",
-                spec.name
-            )));
-        }
+        _ => keyed_geometry(shape).ok_or_else(|| invalid(format!(
+            "unsupported native dense program {}", spec.name)))?,
     };
     if bf16_input && encoding != Encoding::Trellis {
         return Err(invalid("BF16 core suffix requires trellis encoding"));
@@ -182,7 +207,7 @@ impl DenseGeometry {
     }
 }
 
-fn validate_spec(spec: &ProgramSpec) -> Result<DenseGeometry> {
+pub fn validate_spec(spec: &ProgramSpec) -> Result<DenseGeometry> {
     let g = geometry(spec)?;
     let kinds: &[u8] = if matches!(g.encoding, Encoding::Trellis | Encoding::TrellisA8) {
         b"iii"
@@ -500,6 +525,26 @@ mod tests {
                 "max_rows":4096,"split_k_blocks":8,"splits":2,"ctas_per_sm":4}),
         };
         (spec, entry)
+    }
+
+    #[test]
+    fn native_dense_geometry_keys_validate_and_reject_mutations() {
+        let (mut spec, entry) = trellis();
+        spec.name = "exlr8_dense_trellis_k2048_n8192_s1".into();
+        let legacy = validate_entry(&spec, &entry).unwrap();
+        assert_eq!(legacy.input_features, 2048);
+        for name in ["trellis_k02048_n8192_s1", "trellis_k2048_n8192_s0",
+            "trellis_k2048_n8193_s1", "trellis_k2048_n8192_s1_junk",
+            "trellis_k2048_n8192_s1_bf16_a8", "mxfp8_k128_n31_s1",
+            "mxfp8_k64_n32_s1", "fp8_row_embedding_k4095_n154880",
+            "trellis_k18446744073709551615_n8192_s1"] {
+            spec.name = format!("exlr8_dense_{name}");
+            assert!(validate_entry(&spec, &entry).is_err(), "{name}");
+        }
+        assert_eq!(keyed_geometry("mxfp8_k4096_n32_s1"), Some((Encoding::Mxfp8, 4096, 32, 1)));
+        assert_eq!(keyed_geometry("mxfp8_k128_n8192_s1"), Some((Encoding::Mxfp8, 128, 8192, 1)));
+        spec.name = "exlr8_dense_trellis_k1536_n8192_s1".into();
+        assert!(validate_entry(&spec, &entry).is_err());
     }
 
     #[test]

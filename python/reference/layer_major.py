@@ -13,7 +13,8 @@ A family supplies a ``Family`` object:
   load_layer(index) -> module, release_layer(module),
   embed(tokens) -> [1, T, H] F32, forward(module, index, hidden, carry) -> (hidden, carry),
   carry_spec(index) -> names of tensors forwarded to later layers (persisted),
-  final(hidden) -> F32 logits rows, geometry() context, official_geometry() context,
+  final(hidden), official_final(hidden) -> F32 logits rows,
+  geometry() context, official_geometry() context,
   provenance() -> dict, observe(module, index) -> context yielding per-window extras.
 """
 from __future__ import annotations

@@ -74,7 +74,6 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 vision_replicas: args.vision_replicas as usize,
                 host_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Host),
                 force_gpu_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Gpu),
-                local_expert_layers: args.local_expert_layers,
                 onboard: args.rtx_expert_layers,
                 exchange_f32: args.exchange_f32,
                 context_tokens: args.context_tokens,
@@ -84,6 +83,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 prefill_lanes: args.prefill_waves,
                 prefill_waves: args.prefill_waves.max(1),
                 exlr8_prefill_activations: args.exlr8_prefill_activations.unwrap_or_default(),
+                exlr8_prefill_pin: args.exlr8_prefill_activations,
                 prefill_span_rows: (args.prefill_span_rows > 0).then_some(args.prefill_span_rows),
                 glmf_decode_rows: args.decode_rows,
                 glmf_representation: cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation {
@@ -800,8 +800,11 @@ mod tests {
             let mut argv = vec!["cuteafd", "plan", "model", "--layout"];
             argv.extend_from_slice(extra);
             crate::cli::Cli::try_parse_from(argv).map(|cli| match cli.command {
-                crate::cli::Commands::Plan(args) => options(&args).map(|o| (args.exlr8_prefill_activations,
-                    o.layout.unwrap().exlr8_prefill_activations)),
+                crate::cli::Commands::Plan(args) => options(&args).map(|o| {
+                    let layout = o.layout.unwrap();
+                    assert_eq!(layout.exlr8_prefill_pin, args.exlr8_prefill_activations);
+                    (layout.exlr8_prefill_pin, layout.exlr8_prefill_activations)
+                }),
                 _ => panic!("expected plan command"),
             })
         };
@@ -930,7 +933,6 @@ mod tests {
             kda_state: crate::families::glm5_flash::engine::KdaState::F32,
             fp8_head: true, target_head: None, draft_head: crate::shared::speculation::dflash::DraftHead::Exact,
             drafter_gib: 0.0,
-            local_expert_layers: None,
             rtx_expert_layers: None,
             deprecated_peer_expert_ranges: false,
             exchange_f32: false,

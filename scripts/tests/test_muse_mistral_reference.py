@@ -351,8 +351,9 @@ def fixture_snapshot(tmp_path, tensors, index_name):
     return snapshot
 
 
+@pytest.mark.parametrize("geometry", ["tiled", "official-full"])
 @pytest.mark.parametrize("with_media", [False, True])
-def test_muse_golden_qualifies_scores_resumes_and_writes_routes(tmp_path, monkeypatch, with_media):
+def test_muse_golden_qualifies_scores_resumes_and_writes_routes(tmp_path, monkeypatch, with_media, geometry):
     from families.muse_spark import golden
     from transformers.models.muse_spark import modeling_muse_spark as reference
     config = tiny_muse_config()
@@ -373,9 +374,14 @@ def test_muse_golden_qualifies_scores_resumes_and_writes_routes(tmp_path, monkey
     family.rotary = reference.MuseSparkTextRotaryEmbedding(config)
     panel = synthetic_panel(tmp_path, "muse_spark", snapshot, config.vocab_size, [700, 300])
     adapter, features = synthetic_media(panel, config.hidden_size) if with_media else (None, None)
-    out = run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel, media_adapter=adapter)
+    out = run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel, media_adapter=adapter, geometry=geometry)
     meta = json.loads((out / "meta.json").read_text())
-    assert meta["prefix_qualification"]["passed"] and meta["official_forward"]["passed"]
+    if geometry == "tiled":
+        assert meta["prefix_qualification"]["passed"] and meta["official_forward"]["passed"]
+    else:
+        from fidelity_windows import validate_reference
+        assert validate_reference(meta, json.loads(panel.read_text())) == config.vocab_size
+        assert not {"prefix_qualification", "fixed_rows", "official_forward"}.intersection(meta)
     assert meta["scored_tokens"] == 128 and len(meta["seconds_per_layer"]) == config.num_hidden_layers
     routes = tmp_path / "routes" / "layer000"
     ids = __import__("numpy").fromfile(routes / "w0.ids.bin", dtype="<i2").reshape(700, 2)
@@ -391,14 +397,17 @@ def test_muse_golden_qualifies_scores_resumes_and_writes_routes(tmp_path, monkey
         for index in range(config.num_hidden_layers):
             layer = muse.load_layer(checkpoint, config, index, device="cpu", dtype=torch.float32)
             hidden = muse.layer_forward(layer, config, index, hidden, outer["rotary"])
-        expected = muse.logits(outer["norm"](hidden[0, window["score_from"] - 1:-1]), outer["head"], config).numpy()
+        head_input = hidden[0] if geometry == "official-full" else hidden[0, window["score_from"] - 1:-1]
+        expected = muse.logits(outer["norm"](head_input), outer["head"], config).numpy()
+        if geometry == "official-full":
+            expected = expected[window["score_from"] - 1:-1]
     import numpy as np
     actual = np.fromfile(out / "windows" / "w1" / "logits.bin", dtype="<f4").reshape(expected.shape)
     assert np.allclose(actual, expected, atol=1e-5, rtol=1e-5)
     # Resume after completion reuses the proof and reproduces identical logits.
     first = (out / "windows" / "w0" / "logits.bin").read_bytes()
     family.outer = None
-    run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel, media_adapter=adapter)
+    run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel, media_adapter=adapter, geometry=geometry)
     assert (out / "windows" / "w0" / "logits.bin").read_bytes() == first
 
 

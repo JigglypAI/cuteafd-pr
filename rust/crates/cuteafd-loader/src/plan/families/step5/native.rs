@@ -19,6 +19,10 @@ pub struct RankAdmission {
     pub workspace: u64,
 }
 
+pub fn program_prefixes(split: bool) -> &'static [&'static str] {
+    if split { &["step5", "step52"] } else { &["step5"] }
+}
+
 pub fn validate_span_rows(rows: usize) -> Result<()> {
     let limit = crate::serving_capacity::prefill_waves::PrefillLimits::default().max_span_rows;
     ensure!(rows > 0 && rows as u64 <= limit, "Step-5 allocation span must be 1..={limit} rows");
@@ -291,14 +295,27 @@ pub fn rank_admission(
     span: usize,
     logits: usize,
 ) -> Result<RankAdmission> {
+    let cfg = Config::parse(checkpoint)?;
+    let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+    rank_admission_from_contract(&contract, &cfg, ownership, rank, unit, span, logits)
+}
+
+pub(super) fn rank_admission_from_contract(
+    contract: &CoordinatorContract, cfg: &Config, ownership: &ExecutionOwnership,
+    rank: usize, unit: usize, span: usize, logits: usize,
+) -> Result<RankAdmission> {
     ensure!(
         unit > 0 && unit <= span && unit as u64 <= ownership.execution().spec().rows
             && (1..=span).contains(&logits),
         "Step-5 native row admission"
     );
-    let cfg = Config::parse(checkpoint)?;
-    let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-    let layout = RankWeightLayout::for_execution(checkpoint, rank, ownership)?;
+    let layout = RankWeightLayout::from_contract(contract, cfg, rank, ownership.ranks(), Some(ownership))?;
+    rank_admission_for_layout(contract, cfg, &layout, ownership, rank, unit, span, logits)
+}
+
+pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, layout: &RankWeightLayout,
+    ownership: &ExecutionOwnership, rank: usize, unit: usize, span: usize, logits: usize,
+) -> Result<RankAdmission> {
     let immutable = layout
         .operands
         .iter()
@@ -307,18 +324,80 @@ pub fn rank_admission(
             n.checked_add(w.allocation_bytes)
         })
         .context("Step-5 native rank immutable overflow")?;
+    let mut immutable = layout.core.values().try_fold(immutable, |n, core| n.checked_add(core.bytes as u64))
+        .context("Step-5 native core immutable overflow")?;
     let owns = (0..cfg.layers).any(|layer| ownership.layer(layer, rank).is_ok_and(|l| l.query_heads > 0));
     let mut workspace = if owns {
         rank_attention_bytes(&cfg, ownership, rank, unit)?.checked_add(ffn_region_bytes(unit, span)?)
+            .and_then(|n| n.checked_add(native_scratch_bytes(&layout, unit).ok()?))
             .context("Step-5 rank workspace overflow")?
     } else { 0 };
     if rank == ownership.execution().spec().head_gpu as usize {
+        // Only logit planes reuse the arena; native scratch lives with the head's private owners.
+        let head_scratch = layout.core.get("lm_head.weight").map(|core|
+            crate::formats::head::native_private_scratch(core.shape, unit)?.bytes())
+            .transpose()?.unwrap_or(0) as u64;
+        immutable = immutable.checked_add(head_scratch).context("Step-5 private head scratch overflow")?;
         workspace = workspace.max(plane_bytes(&head_planes(logits)?)?);
     }
     Ok(RankAdmission {
         immutable,
         workspace,
     })
+}
+
+/// The one serialized native projection scratch a rank's layers share, placed
+/// after its FFN region; zero when the rank owns no native operand.
+pub fn native_scratch_bytes(layout: &RankWeightLayout, unit: usize) -> Result<u64> {
+    let mut merged: Option<crate::formats::trellis_core::ProjectionScratchLayout> = None;
+    for core in layout.core.iter().filter(|(name, _)| name.as_str() != "lm_head.weight").map(|(_, core)| core) {
+        let [n, k] = core.shape;
+        let next = crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, unit)?;
+        match &mut merged { Some(layout) => layout.merge(&next)?, None => merged = Some(next) }
+    }
+    Ok(merged.map(|layout| layout.bytes()).transpose()?.map_or(0, |bytes| bytes as u64))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MtpRows {
+    pub layer: usize,
+    pub head: usize,
+}
+
+/// Predictor input, attention and dense owners use one prefill unit; the
+/// vocabulary head retains only its decode/verify width, never the wave span.
+pub fn mtp_rows(unit: usize) -> Result<MtpRows> {
+    ensure!((1..=4096).contains(&unit), "Step-5 MTP allocation unit must be 1..=4096 rows");
+    Ok(MtpRows { layer: unit, head: head_rows(unit, false) })
+}
+
+/// Each predictor stage's native owners hold private projection scratch at
+/// exactly the row capacities used by StageOwner::load.
+pub fn mtp_native_scratch_bytes(checkpoint: &Checkpoint, depth: usize, unit: usize) -> Result<u64> {
+    let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+    mtp_native_scratch_from_contract(checkpoint, &contract, depth, unit)
+}
+
+pub fn mtp_native_scratch_from_contract(checkpoint: &Checkpoint, contract: &CoordinatorContract,
+    depth: usize, unit: usize) -> Result<u64> {
+    let rows = mtp_rows(unit)?;
+    use crate::formats::trellis_core::ProjectionScratchLayout;
+    let mut total = 0u64;
+    for stage in 0..depth {
+        let layout = RankWeightLayout::mtp_stage_from_contract(checkpoint, contract, stage)?;
+        let mut owners = std::collections::BTreeMap::<&str, ProjectionScratchLayout>::new();
+        for (name, core) in &layout.core {
+            let owner = if name.contains(".self_attn.") { "attention" } else if name.contains(".mlp.") { "dense" }
+                else if name.ends_with(".eh_proj.weight") { "eh" } else { "head" };
+            let [n, k] = core.shape;
+            let next = ProjectionScratchLayout::new(k, n, if owner == "head" { rows.head } else { rows.layer })?;
+            match owners.get_mut(owner) { Some(layout) => layout.merge(&next)?, None => { owners.insert(owner, next); } }
+        }
+        for layout in owners.values() {
+            total = total.checked_add(layout.bytes()? as u64).context("Step-5 MTP native scratch overflow")?;
+        }
+    }
+    Ok(total)
 }
 
 pub fn plane_bytes(planes: &[usize]) -> Result<u64> {
@@ -340,6 +419,98 @@ mod tests {
 
     fn end(layout: &[(usize, usize)]) -> usize {
         layout.iter().map(|&(offset, bytes)| offset + bytes).max().unwrap()
+    }
+
+    #[test]
+    fn live_and_offline_code_allowances_select_the_same_programs() {
+        use crate::placement::{inventory, ArchContext, ProgramSet};
+        let names = ["step5_hidden_norm", "step5_swa_attention", "step52_hidden_norm",
+            "step52_swa_attention", "glm_hidden_norm"];
+        let manifest = serde_json::json!({"programs": names.iter()
+            .map(|name| serde_json::json!({"name": name})).collect::<Vec<_>>()});
+        let arch = ArchContext::for_device("sm_120", 96 << 30);
+        for split in [false, true] {
+            let prefixes = program_prefixes(split);
+            let offline = ProgramSet::from_manifest(&manifest, prefixes);
+            let live = ProgramSet::from_names(prefixes, names);
+            assert_eq!(live.names, offline.names);
+            assert_eq!(live.names.len(), if split { 4 } else { 2 });
+            let loaded = cuteafd_core::coordinator_programs::CoordinatorPrograms {
+                family: "step5", split_family: split.then_some("step52") };
+            assert_eq!(live.names, names.iter().filter(|name| loaded.contains(name))
+                .map(|name| name.to_string()).collect::<Vec<_>>());
+            for rank in 0..if split { 2 } else { 1 } {
+                let planned = inventory::loaded_code_allowance("step5", "exl3-step5-k46",
+                    split, rank, arch, Some(&offline));
+                let runtime = inventory::loaded_code_allowance("step5", "exl3-step5-k46",
+                    split, rank, arch, Some(&live));
+                assert_eq!(runtime.bytes, planned.bytes);
+                let sampled = arch.context_bytes + 4 * 1024 * 1024;
+                assert_eq!(sampled + runtime.pending(sampled, arch.context_bytes),
+                    arch.context_bytes + planned.bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn mtp_private_scratch_matches_runtime_owner_rows() -> Result<()> {
+        use crate::formats::trellis_core::ProjectionScratchLayout;
+        let fixture = super::super::tests::exl3_snapshot();
+        let checkpoint = Checkpoint::open(fixture.path())?;
+        for unit in [16, 64, 2752, 4096] {
+            let rows = mtp_rows(unit)?;
+            assert_eq!(rows.layer, unit);
+            assert_eq!(rows.head, unit.min(64));
+            let mut expected = 0u64;
+            for stage in 0..3 {
+                let layout = RankWeightLayout::for_mtp_stage(&checkpoint, stage)?;
+                let mut layer_owners = std::collections::BTreeMap::<&str, ProjectionScratchLayout>::new();
+                for (name, core) in &layout.core {
+                    let [n, k] = core.shape;
+                    if name.contains(".transformer.shared_head.") {
+                        expected += crate::formats::head::native_private_scratch(core.shape, rows.head)?.bytes()? as u64;
+                        continue;
+                    }
+                    let owner = if name.contains(".self_attn.") { "attention" }
+                        else if name.contains(".mlp.") { "dense" } else { "eh" };
+                    let scratch = ProjectionScratchLayout::new(k, n, rows.layer)?;
+                    match layer_owners.get_mut(owner) {
+                        Some(layout) => layout.merge(&scratch)?,
+                        None => { layer_owners.insert(owner, scratch); }
+                    }
+                }
+                for layout in layer_owners.values() { expected += layout.bytes()? as u64; }
+            }
+            assert_eq!(mtp_native_scratch_bytes(&checkpoint, 3, unit)?, expected);
+        }
+        assert!(mtp_rows(0).is_err());
+        assert!(mtp_rows(8256).is_err(), "a multi-wave span is not an allocation unit");
+        Ok(())
+    }
+
+    #[test]
+    fn native_k6_head_private_owner_is_not_reusable_plane_workspace() -> Result<()> {
+        use crate::placement::{FfnMode, LayerMode};
+        use super::super::ownership;
+        let fixture = super::super::tests::exl3_snapshot();
+        let checkpoint = Checkpoint::open(fixture.path())?;
+        let cfg = Config::parse(&checkpoint)?;
+        let modes = vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }; cfg.layers];
+        let ownership = ExecutionOwnership::new(&cfg, 1, ownership::plan(&modes, 0, 0))?;
+        let layout = RankWeightLayout::for_execution(&checkpoint, 0, &ownership)?;
+        assert_eq!(layout.core["lm_head.weight"].bits, 6);
+        let weights = layout.operands.iter().filter(|w| w.name != "model.embed_tokens.weight")
+            .map(|w| w.allocation_bytes).sum::<u64>()
+            + layout.core.values().map(|core| core.bytes as u64).sum::<u64>()
+            + CoordinatorContract::from_checkpoint(&checkpoint)?.rope_tables.allocation_bytes;
+        for logits in [16, 64] {
+            let admitted = rank_admission(&checkpoint, &ownership, 0, 64, 64, logits)?;
+            assert_eq!(admitted.immutable, weights + 165511240);
+            let reusable = rank_attention_bytes(&cfg, &ownership, 0, 64)?
+                + ffn_region_bytes(64, 64)? + native_scratch_bytes(&layout, 64)?;
+            assert_eq!(admitted.workspace, reusable.max(plane_bytes(&head_planes(logits)?)?));
+        }
+        Ok(())
     }
 
     #[test]

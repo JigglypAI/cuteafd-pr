@@ -3,6 +3,7 @@
 use super::exl3_storage::{check_quantization_config, Exl3StorageMap};
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 pub(crate) fn check_native_quantization_config(quant: &Value) -> Result<()> {
     let Some(value) = quant.get("native_quantization_config") else { return Ok(()); };
@@ -44,6 +45,10 @@ fn mtp(name: &str, backbone_layers: usize) -> bool {
         .is_some_and(|layer| layer >= backbone_layers)
 }
 
+fn layer_of(name: &str) -> Option<usize> {
+    name.split_once(".layers.").and_then(|(_, tail)| tail.split('.').next()?.parse().ok())
+}
+
 fn bits(key: &str, value: &Value, max: usize) -> Result<usize> {
     Ok(value.as_f64().filter(|v| v.fract() == 0.0 && (1.0..=max as f64).contains(v))
         .with_context(|| format!("EXL3 {key} must be an integer in 1..{max}"))? as usize)
@@ -67,6 +72,25 @@ pub(crate) fn check_header_widths(
         for (name, module) in modules {
             ensure!(module.bits == width,
                 "EXL3 {key}={width} disagrees with the headers at {name} (K{})", module.bits);
+        }
+    }
+    // Routed experts: `expert_bits_by_layer` overrides `expert_bits` per target layer.
+    if quant.get("expert_bits").is_some() || quant.get("expert_bits_by_layer").is_some() {
+        let base = quant.get("expert_bits").map(|v| bits("expert_bits", v, 8)).transpose()?;
+        let by_layer = match quant.get("expert_bits_by_layer") {
+            None => BTreeMap::new(),
+            Some(map) => map.as_object().context("EXL3 expert_bits_by_layer must be an object")?.iter()
+                .map(|(layer, v)| Ok((layer.parse::<usize>().with_context(||
+                    format!("EXL3 expert_bits_by_layer key {layer} is not a layer"))?, bits("expert_bits_by_layer", v, 8)?)))
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        };
+        for (name, module) in derived.iter().filter(|(name, _)| routed(name) && !mtp(name, backbone_layers)) {
+            let layer = layer_of(name);
+            let declared = layer.and_then(|l| by_layer.get(&l).copied()).or(base);
+            if let Some(width) = declared {
+                ensure!(module.bits == width,
+                    "EXL3 routed width K{width} disagrees with the headers at {name} (K{})", module.bits);
+            }
         }
     }
     if let Some(value) = quant.get("lm_head") {
@@ -100,7 +124,15 @@ pub(crate) fn check_gptqmodel_manifest(
             "bits" | "checkpoint_format" | "codebook" | "core_bits" | "head_bits" | "mtp_bits"
             | "desc_act" | "format" | "group_size" | "lm_head" | "meta" | "method" | "module_include"
             | "out_scales" | "pack_dtype" | "quant_method" | "tensor_storage" | "per_module_metadata"
-            | "sym" | "calibration" | "native_quantization_config"), "EXL3 manifest has unexpected key {key}");
+            | "sym" | "calibration" | "native_quantization_config" | "mcg_multiplier" | "expert_bits" | "expert_bits_by_layer"
+            | "kept_tensors"), "EXL3 manifest has unexpected key {key}");
+    }
+    if let Some(multiplier) = manifest.get("mcg_multiplier") {
+        ensure!(multiplier.as_u64() == Some(super::exl3_storage::EXL3_MCG_MULTIPLIER),
+            "EXL3 mcg_multiplier {multiplier} (the decoders implement 0xCBAC1FED)");
+    }
+    if let Some(kept) = manifest.get("kept_tensors") {
+        ensure!(kept.is_object(), "EXL3 kept_tensors must map tensor names to native dtypes/shapes");
     }
     check_native_quantization_config(manifest)?;
     ensure!(compact.get("native_quantization_config") == manifest.get("native_quantization_config"),

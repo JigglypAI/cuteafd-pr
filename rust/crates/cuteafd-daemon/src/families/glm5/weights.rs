@@ -44,9 +44,10 @@ pub(crate) struct GlmLayer<'a> {
     /// Set only after this rank's attention operands have loaded successfully.
     attention_resident: bool,
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
-    /// The EXLR8 checkpoint's own dense operands (`native_dense::key`), when
+    /// The EXLR8 checkpoint's own dense operands (`dense_weights::key`), when
     /// the layer runs natively; empty on the official path.
     pub(crate) native: HashMap<String, DeviceAllocation<'a>>,
+    pub(crate) native_projections: HashMap<&'static str, crate::shared::experts::exlr8::dense_weights::NativeProjection>,
     /// Standard HF K6 payload/vector owners, separate from EXLR8 encodings.
     pub(crate) core: std::collections::BTreeMap<&'static str, CoreWeights<'a>>,
 }
@@ -104,7 +105,7 @@ fn native_projection_ranges(name: &str, range: impl Fn(&str) -> Option<crate::sh
     // Input transform, payload, output transform; scaled native formats keep
     // their payload/scale order. Only this rank's resident components enter.
     ["suh", "trellis", "svh", "q4", "s4", "fp8", "e8m0", "scale", "bf16", "fp32"]
-        .into_iter().filter_map(|component| range(&super::native_dense::key(name, component))).collect()
+        .into_iter().filter_map(|component| range(&crate::shared::experts::exlr8::dense_weights::key(name, component))).collect()
 }
 
 impl GlmLayer<'_> {
@@ -142,15 +143,6 @@ impl GlmLayer<'_> {
     /// A native operand's device buffer.
     pub fn native(&self, key: &str) -> Result<CuteafdDeviceBuffer> {
         Ok(self.native.get(key).with_context(|| format!("layer has no native operand {key}"))?.buffer)
-    }
-
-    /// The native encoding of `projection` (from its stored components).
-    pub fn native_encoding(&self, projection: &str) -> Result<cuteafd_loader::plan::exlr8::dense::DenseEncoding> {
-        use cuteafd_loader::plan::exlr8::dense::DenseEncoding;
-        let has = |c: &str| self.native.contains_key(&super::native_dense::key(projection, c));
-        Ok(if has("trellis") { DenseEncoding::Trellis { bits: 4 } } else if has("q4") { DenseEncoding::Int4G32 }
-            else if has("e8m0") { DenseEncoding::Mxfp8 } else if has("bf16") { DenseEncoding::Bf16 }
-            else { anyhow::bail!("layer has no native {projection}") })
     }
 
     /// Whether the layer runs the checkpoint's native dense operands.
@@ -1073,7 +1065,7 @@ impl<'a> GlmLoader<'a> {
             Ok(GlmLayer { dense, full_indexer, mlp_numerics, split: ranks > 1,
                 attention_split: ranks > 1 && owner.is_none(), attention_owner: owner,
                 attention_resident: attention_resident[rank], operands,
-                native: HashMap::new(), core })
+                native: HashMap::new(), native_projections: HashMap::new(), core })
         }).collect()
     }
 
@@ -1122,21 +1114,19 @@ impl<'a> GlmLoader<'a> {
     /// Routed experts and the shared expert stay on their native owners.
     #[allow(clippy::type_complexity)]
     pub fn native_model(&self, cfg: &GlmDsaConfig, layers: usize,
-        records: &[super::native_dense::NativeDenseRecords], load: &crate::shared::experts::rtx::dense::DenseLoad<'a>,
+        records: &[crate::shared::experts::exlr8::dense_weights::NativeDenseRecords], load: &crate::shared::experts::rtx::dense::DenseLoad<'a>,
         vocabulary: std::rc::Rc<crate::shared::token_io::native::NativeVocabulary<'a>>)
         -> Result<(GlmWeights<'a>, Vec<Vec<GlmLayer<'a>>>)> {
         let ranks = self.ranks();
         ensure!(records.len() == ranks && cfg.heads % ranks == 0, "native GLM records per coordinator rank");
         let split = crate::shared::memory::load_timing::Split::start();
-        let heads = cfg.heads / ranks;
         let mut shares: Vec<Vec<GlmLayer<'a>>> = (0..ranks).map(|_| Vec::new()).collect();
         for layer in 0..layers.min(cfg.layers) {
             for (rank, share) in shares.iter_mut().enumerate() {
                 let layer_records = records[rank].layers.get(layer).context("native layer records")?;
                 let part = self.on_rank(rank, |stream| -> Result<GlmLayer<'a>> {
                     let _memory_format = cuteafd_ffi::memory_ledger::format("native");
-                    let mut native = super::native_dense::load_layer(self.library, load, layer_records, cfg.heads,
-                        rank * heads, heads, cfg.qk_nope_head_dim, cfg.v_head_dim, cfg.kv_lora_rank, stream)?;
+                    let mut native = crate::shared::experts::exlr8::dense_weights::load_layer(self.library, load, layer_records, stream)?;
                     let p = format!("model.layers.{layer}");
                     let mut operands: HashMap<&'static str, DeviceAllocation<'a>> = HashMap::new();
                     for (key, name) in [("w_uk_fp8", "w_uk_fp8"), ("w_uk_scale", "w_uk_scale"), ("w_uv_fp8", "w_uv_fp8"),
@@ -1150,7 +1140,7 @@ impl<'a> GlmLoader<'a> {
                         if let Some(allocation) = native.remove(&format!("{p}.{tensor}")) { operands.insert(key, allocation); }
                     }
                     // The router (BF16 record) on rank 0, as on the official path.
-                    if let Some(gate) = native.remove(&super::native_dense::key("router", "bf16")) {
+                    if let Some(gate) = native.remove(&crate::shared::experts::exlr8::dense_weights::key("router", "bf16")) {
                         operands.insert("gate", gate);
                     }
                     let dense = layer < cfg.first_moe_layer;
@@ -1161,6 +1151,7 @@ impl<'a> GlmLoader<'a> {
                         mlp_numerics: cuteafd_loader::plan::checkpoint::ModuleNumerics::CheckpointPrecision,
                         split: ranks > 1, attention_split: ranks > 1, attention_owner: None,
                         attention_resident: true, operands, native,
+                        native_projections: layer_records.projections.iter().map(|(&stem, (p, _))| (stem, p.clone())).collect(),
                         core: Default::default() })
                 })?;
                 share.push(part);
@@ -1168,7 +1159,8 @@ impl<'a> GlmLoader<'a> {
         }
         let norm = {
             let component = &records[0].norm;
-            let allocation = DeviceAllocation::new(self.library, component.source.bytes.max(256))?;
+            let allocation = DeviceAllocation::new(self.library,
+                cuteafd_loader::plan::exlr8::dense::DenseTransform::Identity.allocation_bytes(component)?)?;
             load.operand(crate::shared::experts::rtx::dense::Operand { device: self.library.cuda_get_device()?,
                 buffer: allocation.buffer, bytes: component.source.bytes,
                 lands: vec![(crate::shared::experts::rtx::dense::Rect { name: "model.norm.weight".into(),

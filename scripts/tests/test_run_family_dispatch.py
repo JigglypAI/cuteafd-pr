@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -1664,18 +1665,15 @@ def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: 
 
 
 @pytest.mark.parametrize("value", [None, "auto", "0", "5", "all"])
-def test_deepseek_v4_honors_explicit_local_expert_limit(tmp_path, value):
+def test_deepseek_v4_honors_explicit_rtx_expert_limit(tmp_path, value):
     keys = "" if value is None else f"RTX_EXPERT_LAYERS={value}\n"
     result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4", "num_hidden_layers": 61}, "test/dsv4", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-dsv4" in line)
     if value is None:
         assert "--local-expert-layers" not in launch and "--rtx-expert-layers" not in launch
-    elif value in ("auto", "all"):
-        assert f"--rtx-expert-layers {value}" in launch
     else:
-        # Whole layer counts keep the flag older images accept.
-        assert f"--local-expert-layers {value}" in launch
+        assert f"--rtx-expert-layers {value}" in launch
 
 
 @pytest.mark.parametrize("value", [None, "auto", "0", "5", "all"])
@@ -4175,9 +4173,13 @@ def test_launcher_plans_against_cuda_total_not_nvml_total(tmp_path, family, budg
               else {"model_type": "deepseek_v41"} if family == "deepseek_v41"
               else SPLIT_CONFIGS["mimo_flash" if family == "mimo_v2" else family])
     total = 101_973_491_712
+    # The mocked launch still checks the host API port; avoid live servers on 8000.
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        api_port = listener.getsockname()[1]
     result = _family_launch_result(tmp_path, config,
         "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model",
-        f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+        f"ADDR=127.0.0.1:{api_port}\nCOORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
         + ("SPARK_COUNT=4\n" + "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(4))
            if family == "deepseek_v41" else ""),
         gpu_total_mib=97887, gpu_free_mib=97887, cuda_total_bytes=total,
