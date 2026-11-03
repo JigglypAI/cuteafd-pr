@@ -203,6 +203,67 @@ def test_real_vision_manifest_pins_resizes_and_scores_following_text(real_vision
             assert image["start"] + image["len"] <= window["score_from"]
     assert not result["windows"][-1].get("media") and len(calls) == 3
     assert result["windows"][0]["media"][0]["fixture"] == records[0]["fixture"]
+    assert hashlib.sha256(builder.canonical(result)).hexdigest() == (
+        "a893473148496389421db2e21fb76676d57b1f2c5d263065436f470c54f982fe")
+
+
+def test_real_manifest_audio_uses_pinned_pcm_and_ordinary_transport(real_vision_input):
+    import base64
+    import json
+    import struct
+    manifest, snapshot, destination = real_vision_input
+    pcm = np.linspace(-0.25, 0.25, 1921, dtype="<f4").tobytes()
+    fmt = struct.pack("<HHIIHH", 3, 1, 24000, 96000, 4, 32)
+    chunks = b"fmt " + struct.pack("<I", len(fmt)) + fmt + b"data" + struct.pack("<I", len(pcm)) + pcm
+    wav = b"RIFF" + struct.pack("<I", len(chunks) + 4) + b"WAVE" + chunks
+    (manifest.parent / "clip.wav").write_bytes(wav)
+    digest = hashlib.sha256(pcm).hexdigest()
+    document = {"audio": [{"file": "clip.wav", "sha256": hashlib.sha256(wav).hexdigest(),
+        "samples": 1921, "pcm_sha256": digest}]}
+    manifest.write_text(json.dumps(document))
+    processor = json.loads((snapshot / "processor_config.json").read_text())
+    processor["feature_extractor"] = {"sampling_rate": 24000, "samples_per_token": 1920}
+    (snapshot / "processor_config.json").write_text(json.dumps(processor))
+    calls = []
+    def probe(body):
+        calls.append(body)
+        audio = body["messages"][0]["content"][0]
+        is_audio = audio["type"] == "input_audio"
+        if is_audio:
+            assert audio["input_audio"]["format"] == "wav"
+            assert base64.b64decode(audio["input_audio"]["data"]) == wav
+        return {"probe": {"engine": "fake", "prompt_ids": [1, 9, 9, 2] if is_audio else [1, 2],
+            "generated": [3] * 600, "audio": [{"start": 1, "len": 2, "key": "a" * 64,
+                "samples": 1921, "pcm_sha256": digest}] if is_audio else []},
+            "server": {"model": "model", "family": "muse_spark"}}
+    arm = {"checkpoint": "model", "head": "bf16", "activations": "bf16", "kv": "bf16",
+        "state": "bf16", "speculation": False, "prefix_cache": False}
+    builder = load_script("fidelity-set")
+    kwargs = dict(family="muse_spark", model="model", checkpoint="model", version="audio1", arm=arm,
+        fixtures=destination, tokenizer_sha256="c" * 64, vision_manifest=manifest, snapshot=snapshot)
+    result = builder.build_vision_set(probe=probe, **kwargs)
+    assert [w["id"] for w in result["windows"]] == ["audio_00", "text_control"]
+    span = result["windows"][0]["media"][0]
+    assert span["kind"] == "audio" and span["pcm_sha256"] == digest and "grid" not in span
+    assert result["audio_processor"] == processor["feature_extractor"]
+    assert len(calls) == 2 and not result["windows"][-1].get("media")
+    def wrong_echo(body):
+        result = probe(body)
+        if result["probe"]["audio"]:
+            result["probe"]["audio"][0]["pcm_sha256"] = "0" * 64
+        return result
+    with pytest.raises(ValueError, match="audio echo"):
+        builder.build_vision_set(probe=wrong_echo, **kwargs)
+    def short_output(body):
+        result = probe(body)
+        result["probe"]["generated"] = [3] * 575
+        return result
+    with pytest.raises(ValueError, match="576"):
+        builder.build_vision_set(probe=short_output, **kwargs)
+    document["audio"][0]["pcm_sha256"] = "0" * 64
+    manifest.write_text(json.dumps(document))
+    with pytest.raises(ValueError, match="canonical PCM identity"):
+        builder.real_vision_fixtures(manifest, destination, snapshot)
 
 
 @pytest.mark.parametrize("mutation,match", [
