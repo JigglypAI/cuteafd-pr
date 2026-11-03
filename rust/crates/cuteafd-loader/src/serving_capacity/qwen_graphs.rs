@@ -7,7 +7,7 @@ use crate::placement::inventory::{GraphSet, Lifetime};
 /// Rows of the decode-shaped programs (`_m64`).
 pub const QWEN_DECODE_ROWS: usize = 64;
 /// Plain decode row buckets.
-pub const QWEN_PLAIN_BUCKETS: &[usize] = &[1, 4, 8, 16];
+pub const QWEN_PLAIN_BUCKETS: &[usize] = &[1, 4, 8, 16, 24, 32, 64];
 /// Speculative verify row buckets.
 pub const QWEN_SPEC_BUCKETS: &[usize] = &[2, 4, 8, 16, 24, 32, 64];
 /// Tokens per allocation unit (four 64-row record pages) and pages per unit.
@@ -70,7 +70,7 @@ pub fn qwen_graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<
 /// and, with speculation, every verify bucket.
 pub fn qwen_serving_graph_shapes(context: usize, pages: usize, dense: usize, sequences: usize, speculation: bool)
     -> Vec<(usize, bool, QwenGraphGeometry)> {
-    let plain = qwen_decode_bucket(sequences.min(QWEN_DECODE_ROWS), false);
+    let plain = qwen_decode_bucket(sequences, false);
     qwen_graph_geometries(context, pages, dense).into_iter().flat_map(|geometry| {
         QWEN_PLAIN_BUCKETS.iter().copied().filter(move |&rows| rows <= plain).map(move |rows| (rows, false, geometry))
             .chain(QWEN_SPEC_BUCKETS.iter().copied().filter(move |_| speculation).map(move |rows| (rows, true, geometry)))

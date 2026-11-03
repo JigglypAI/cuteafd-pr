@@ -300,6 +300,9 @@ mod tests {
         assert_eq!((cfg.first_moe_layer, cfg.topk, cfg.eos_tokens.len()), (3, 8, 3));
         assert_eq!(cfg.index_source(5), 2);
         assert_eq!(cfg.index_source(6), 6);
+        for layer in 0..cfg.layers {
+            assert_eq!(cfg.kv_source(layer), layer, "GLM 5.3 owns every KV layer");
+        }
         assert!((cfg.softmax_scale() - 1.0 / 16.0).abs() < 1e-12);
         Ok(())
     }

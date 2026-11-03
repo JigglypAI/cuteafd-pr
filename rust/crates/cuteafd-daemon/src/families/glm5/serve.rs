@@ -542,6 +542,7 @@ fn prefill_group(engine: &GlmEngine<'_>, family: &GlmPrefix<'_, '_>,
             }
             if cache.enabled() && !probe::cold(&job.probe) { **retained = Some(logits.row_host(engine.library, 0)?); }
             if probe::wants_first(&job.probe) {
+                if let Some(probe) = &job.probe { probe.prefill_units(engine.last_prefill_units.get()); }
                 probe::device_rows(engine.library, &job.probe, &logits, 0, 1, *len)?;
             }
             Ok(Ok(()))
@@ -650,6 +651,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let lanes = LaneSet::default();
     // Prefix capacity and all fallible scheduler initialization precede readiness.
     ready();
+    crate::shared::api::run_scheduler(|| {
     loop {
         engine.require_live()?;
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
@@ -889,6 +891,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                                 p.logits = Some(logits.row_host(&opened.library, 0)?);
                             }
                             if probe::wants_first(&p.job.probe) {
+                                if let Some(probe) = &p.job.probe { probe.prefill_units(engine.last_prefill_units.get()); }
                                 probe::device_rows(&opened.library, &p.job.probe, &logits, 0, 1, p.tokens.len())?;
                             }
                         }
@@ -1089,6 +1092,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         if active.is_empty() && prefills.is_empty() && !media.is_empty() { std::thread::park_timeout(Duration::from_millis(1)); }
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
+    })
 }
 
 /// The lane's commit. GLM keeps no recurrent target state (a verify's

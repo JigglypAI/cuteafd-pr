@@ -45,6 +45,11 @@ pub(crate) enum BenchAction {
         #[arg(long, env = "CUTEAFD_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
     },
+    /// List every panel id selectable by --panels or profile `panels:...`.
+    Panels {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -137,6 +142,17 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
             other => other,
         },
         Some(BenchAction::Cancel { url, api_key }) => cuteafd_bench::cli::cancel(&url, &api_key),
+        Some(BenchAction::Panels { json }) => {
+            let ids = cuteafd_bench::profiles::selectable_panel_ids();
+            if json {
+                println!("{}", serde_json::to_string(&ids)?);
+            } else {
+                for id in ids {
+                    println!("{id}");
+                }
+            }
+            Ok(())
+        }
         Some(BenchAction::Export { json, out, root, export }) => {
             let report: cuteafd_bench::report::Report = serde_json::from_str(&std::fs::read_to_string(&json)?)?;
             // The exports re-render under the rule in force now (an nvidia NVFP4
@@ -417,5 +433,12 @@ mod tests {
         let placed = placement(&one);
         assert_eq!(placed.len(), 1, "{placed:?}");
         assert_eq!(placed[0].value.as_deref(), Some("heads"));
+    }
+
+    #[test]
+    fn bench_panels_subcommand_parses_json_flag() {
+        let matches = crate::cli::Cli::command().try_get_matches_from(["cuteafd", "bench", "panels", "--json"]).unwrap();
+        let bench = BenchArgs::from_arg_matches(matches.subcommand().unwrap().1).unwrap();
+        assert!(matches!(bench.action, Some(BenchAction::Panels { json: true })));
     }
 }

@@ -740,6 +740,7 @@ fn schedule(
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<NativeRequest>::default();
     // Prefix capacity and all fallible scheduler initialization precede readiness.
     ready();
+    crate::shared::api::run_scheduler(|| {
     loop {
         engine.require_live()?;
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
@@ -1083,6 +1084,7 @@ fn schedule(
             receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
+    })
 }
 
 /// Lane-owned decode state: V4's only lane (`LaneSupport::One`), with its

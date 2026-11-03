@@ -430,6 +430,18 @@ fn context_plan_index(unit: usize, lane: usize) -> usize {
     if unit == usize::MAX { lane } else { unit }
 }
 
+fn context_single_step(unit: &Cell<usize>, reuse: &Cell<bool>, owner: &RefCell<[Option<(usize, usize)>; 2]>) {
+    unit.set(usize::MAX);
+    reuse.set(false);
+    *owner.borrow_mut() = [None; 2];
+}
+
+fn context_staging_turn(owner: &mut [Option<(usize, usize)>; 2], parity: usize, index: usize, lane: usize) -> bool {
+    let reuse = lane > 0 && owner[parity] == Some((index, lane - 1));
+    owner[parity] = Some((index, lane));
+    reuse
+}
+
 /// Borrowed workspaces of the head split's second GPU.
 enum PeerWorkspaces<'e, 'a> {
     Decode(std::cell::Ref<'e, Option<Workspace<'a>>>),
@@ -499,6 +511,8 @@ pub(crate) struct GlmEngine<'a> {
     staging_owner: RefCell<[Option<(usize, usize)>; 2]>,
     /// Set by [`Self::context_unit_turn`] for the attention about to run.
     context_reuse: Cell<bool>,
+    /// Probe metadata only: no device synchronization or allocation at dispatch.
+    pub(crate) last_prefill_units: Cell<usize>,
     /// The prefill unit whose attention runs next (its context gather/commit plan).
     context_unit: Cell<usize>,
     /// The one prefill transport: every unit's waves, up to `prefill_lanes`
@@ -679,7 +693,7 @@ impl<'a> GlmEngine<'a> {
             decode_workspace: RefCell::new(None), prefill_slots: RefCell::new(Vec::new()),
             prefill_lanes, depth,
             staged: Cell::new(library.cuda_event_create_ordering()?),
-            staging_owner: RefCell::new([None; 2]), context_reuse: Cell::new(false), context_unit: Cell::new(0), prefill_link: RefCell::new(None), prefill_runtime: None,
+            staging_owner: RefCell::new([None; 2]), context_reuse: Cell::new(false), last_prefill_units: Cell::new(0), context_unit: Cell::new(0), prefill_link: RefCell::new(None), prefill_runtime: None,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             pending_media: RefCell::new(None),
@@ -1285,6 +1299,7 @@ impl<'a> GlmEngine<'a> {
         }
         ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
         let tables = self.prefill_tables(placement, start, t)?;
+        self.last_prefill_units.set(1);
         // Short chunks, callbacks and partial-layer goldens use the same
         // prefill owner as units; the decode link admits decode rows only.
         let logits = if experts.is_some() {
@@ -2345,12 +2360,13 @@ impl<'a> GlmEngine<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn step_lanes_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>, lanes: &[StepTables],
+    fn step_lanes_inner(&self, _scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>, lanes: &[StepTables],
         chunks: &[&[u32]], depth: crate::shared::prefill_depth::PrefillDepth, logit_rows: usize, link: &mut SparkLink<'_>,
-        runtime: &tokio::runtime::Runtime) -> Result<Option<StepLogits>> {
+        _runtime: &tokio::runtime::Runtime) -> Result<Option<StepLogits>> {
         // `lanes` are the call's units in order; at most `waves` are in flight,
         // unit `u` holding slot `u % waves` on both ranks.
         let waves = depth.waves.min(lanes.len()).max(1);
+        self.last_prefill_units.set(lanes.len());
         ensure!(waves <= link.waves(), "{waves} prefill units in flight exceed the link's {} waves", link.waves());
         let owned = self.slot_workspaces(depth.waves)?;
         let workspaces: Vec<&Workspace<'_>> = owned.iter().take(waves).collect();
@@ -2378,18 +2394,7 @@ impl<'a> GlmEngine<'a> {
             } else { [tables.clone(), tables.clone()] });
         }
         *self.context_units.borrow_mut() = vec![[context::ContextUnit::default(); 2]; lanes.len()];
-        if self.layer_execution.is_some() {
-            ensure!(lanes.len() <= waves, "owned-attention prefill takes one unit per slot");
-            if let Some(pair) = &self.tp2 { pair.begin_checks(&counts, self.force_route_check.get())?; }
-            for (unit, w) in workspaces.iter().enumerate() {
-                self.put_tables(w, &ranked[unit][0])?;
-                if let Some(peers) = &peer_workspaces { self.on(1, || self.put_tables(peers.get(unit)?, &ranked[unit][1]))?; }
-                self.embedding.embed(chunks[unit], w.ids.buffer, 1, w.h.buffer, self.stream)?;
-                self.inject_media(w, &lanes[unit])?;
-            }
-            return self.layer_prefill(scope, &workspaces[..lanes.len()],
-                peer_workspaces.as_ref().context("owned attention lanes")?, &ranked, logit_rows, link, runtime);
-        }
+        let owned_hops = self.layer_execution.as_ref().map(|_| self.validate_owned_units()).transpose()?;
         let layers = &self.weights.layers;
         let cap = "m4096";
         let rows_of = |unit: usize| Scalar::I32(counts[unit] as i32);
@@ -2533,7 +2538,8 @@ impl<'a> GlmEngine<'a> {
         let transport = link.exchange()?;
         ensure!(transport.fits(self.wave_staging_bytes()?), "the prefill link's staging is narrower than its widest wave");
         let mut hooks = UnitHooks { engine: self, workspaces: &workspaces, peers: &peers, layers, counts: &counts,
-            begin: &begin, attention: &attention, post: &post, transport, cap, waves };
+            begin: &begin, attention: &attention, post: &post, transport, cap, waves,
+            ranked: &ranked, total, owned_hops: owned_hops.map(|n| vec![vec![0; n]; lanes.len()]) };
         let ran = crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &unit_list, waves);
         drop(hooks);
         if let Some(pair) = &self.tp2 { ran.and(pair.finish_span())?; } else { ran?; }
@@ -2588,10 +2594,8 @@ impl<'a> GlmEngine<'a> {
     /// there); otherwise it gathers its own whole history. Units of a call are one
     /// sequence in order, so unit `lane - 1` is the predecessor.
     pub(super) fn context_unit_turn(&self, index: usize, lane: usize) -> Result<()> {
-        let mut owner = self.staging_owner.borrow_mut();
-        let view = &mut owner[self.cfg.kv_source(index) % 2];
-        self.context_reuse.set(lane > 0 && *view == Some((index, lane - 1)));
-        *view = Some((index, lane));
+        self.context_reuse.set(context_staging_turn(&mut self.staging_owner.borrow_mut(),
+            self.cfg.kv_source(index) % 2, index, lane));
         Ok(())
     }
 
@@ -2702,8 +2706,9 @@ impl<'a> GlmEngine<'a> {
             out.push(ranked);
         }
         *self.context_units.borrow_mut() = context_units;
-        // A single-pass step's lanes index their own plans (`attention_unit`'s `lane`).
-        self.context_unit.set(usize::MAX);
+        // Single-pass steps do not visit context_unit_turn: no staging reuse
+        // from a preceding pipelined call is valid for their layer-by-layer pass.
+        context_single_step(&self.context_unit, &self.context_reuse, &self.staging_owner);
         Ok(out)
     }
 
@@ -3015,11 +3020,11 @@ pub(crate) fn print_mla_check(layer: usize, stats: &[[f64; 3]; 5]) {
 /// GLM's per-unit hooks over the unchanged lane arithmetic. Unit `u` holds
 /// workspace slot `u % waves` (rank 0's and rank 1's) and that slot's
 /// exchange lane; its Spark waves go out on the prefill link, one return slot each.
-struct UnitHooks<'h, 'e, 'a, 'l, B, A, P> {
+struct UnitHooks<'h, 'a, 'l, B, A, P> {
     engine: &'h GlmEngine<'a>,
-    workspaces: &'h [&'h Workspace<'e>],
+    workspaces: &'h [&'h Workspace<'a>],
     /// Rank 1's workspace per slot (borrowed once for the call).
-    peers: &'h [Option<&'h Workspace<'e>>],
+    peers: &'h [Option<&'h Workspace<'a>>],
     layers: &'h [GlmLayer<'a>],
     counts: &'h [usize],
     begin: &'h B,
@@ -3028,13 +3033,21 @@ struct UnitHooks<'h, 'e, 'a, 'l, B, A, P> {
     transport: &'h mut crate::shared::spark_waves::Waves<'l>,
     cap: &'static str,
     waves: usize,
+    ranked: &'h [[StepTables; 2]],
+    total: usize,
+    owned_hops: Option<Vec<Vec<usize>>>,
 }
 
-impl<B, A, P> crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, B, A, P>
+enum UnitTicket {
+    Spark(crate::shared::spark_waves::WaveTicket),
+    Owned(layers::Ticket),
+}
+
+impl<B, A, P> crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, B, A, P>
 where B: Fn(usize) -> Result<()>,
       A: Fn(usize, usize) -> Result<()>,
       P: Fn(usize, usize, Option<([*const u16; MAX_RANKS], usize)>) -> Result<()> {
-    type Ticket = crate::shared::spark_waves::WaveTicket;
+    type Ticket = UnitTicket;
     fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
         if self.layers[layer].dense || self.engine.tp2_layer(layer) {
             crate::shared::prefill_pipeline::FfnRoute::Local
@@ -3045,10 +3058,19 @@ where B: Fn(usize) -> Result<()>,
         (self.begin)(unit.index)
     }
     fn attention(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        if let Some(hops) = &mut self.owned_hops {
+            return self.engine.owned_unit_attention([self.workspaces[unit.slot], self.peers[unit.slot].context("owned peer")?],
+                &self.ranked[unit.index], unit, layer, self.total, &mut hops[unit.index]);
+        }
         self.engine.context_unit_turn(layer, unit.index)?;
         (self.attention)(layer, unit.index)
     }
     fn local_ffn(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        if self.owned_hops.is_some() {
+            let work = [self.workspaces[unit.slot], self.peers[unit.slot].context("owned peer")?];
+            let ticket = self.engine.owned_unit_begin(work, &self.ranked[unit.index], unit, layer, self.total, self.transport)?;
+            return self.engine.owned_unit_finish(work, &self.ranked[unit.index], unit, layer, self.total, self.transport, ticket);
+        }
         let slot = unit.index % self.waves;
         if self.engine.tp2_layer(layer) {
             let w1 = self.peers[slot].context("TP2 peer workspaces")?;
@@ -3057,13 +3079,23 @@ where B: Fn(usize) -> Result<()>,
         (self.post)(layer, unit.index, None)
     }
     fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit)
-        -> Result<crate::shared::spark_waves::WaveTicket> {
+        -> Result<UnitTicket> {
+        if self.owned_hops.is_some() {
+            return self.engine.owned_unit_begin([self.workspaces[unit.slot], self.peers[unit.slot].context("owned peer")?],
+                &self.ranked[unit.index], unit, layer, self.total, self.transport).map(UnitTicket::Owned);
+        }
         let w = self.workspaces[unit.index % self.waves];
         let rows = self.counts[unit.index];
-        self.engine.moe_wave(w, layer, &self.layers[layer], rows, self.cap, self.transport)
+        self.engine.moe_wave(w, layer, &self.layers[layer], rows, self.cap, self.transport).map(UnitTicket::Spark)
     }
     fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit,
-        wave: crate::shared::spark_waves::WaveTicket) -> Result<()> {
+        ticket: UnitTicket) -> Result<()> {
+        let wave = match ticket {
+            UnitTicket::Owned(ticket) => return self.engine.owned_unit_finish(
+                [self.workspaces[unit.slot], self.peers[unit.slot].context("owned peer")?],
+                &self.ranked[unit.index], unit, layer, self.total, self.transport, ticket),
+            UnitTicket::Spark(wave) => wave,
+        };
         let slot = wave.slot();
         self.transport.land(wave, self.engine.stream)?;
         // The reduce reads the return slot this wave just landed in; the slot
@@ -3072,6 +3104,10 @@ where B: Fn(usize) -> Result<()>,
         self.transport.consumed(slot, self.engine.stream)
     }
     fn end_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        if let Some(hops) = &mut self.owned_hops {
+            self.engine.owned_unit_exit([self.workspaces[unit.slot], self.peers[unit.slot].context("owned peer")?],
+                &self.ranked[unit.index], unit, self.total, &mut hops[unit.index])?;
+        }
         // Drains (diagnostics only) and compares this unit's routes before its slot is reused.
         if let Some(pair) = &self.engine.tp2 { pair.finish_unit(unit.slot, unit.index)?; }
         Ok(())
@@ -3387,7 +3423,34 @@ mod prefill_unit_tests {
         let own = body.find("self.attention_unit(0,").expect("rank 0 attention");
         assert!(set < peer && set < own, "the plan is selected before either rank's attention");
         let tables = source.split("fn step_tables(").nth(1).unwrap().split("\n    }\n").next().unwrap();
-        assert!(tables.contains("self.context_unit.set(usize::MAX)"), "single-pass steps reset the unit cursor");
+        assert!(tables.contains("context_single_step(&self.context_unit, &self.context_reuse, &self.staging_owner)"),
+            "single-pass steps reset both their cursor and staging reuse");
+
+        let (unit, reuse, owner) = (std::cell::Cell::new(0), std::cell::Cell::new(false),
+            std::cell::RefCell::new([None; 2]));
+        // Three units at every layer leave a valid reuse decision for the last
+        // unit, but that decision must not leak into a short continuation.
+        for layer in 0..78 {
+            for lane in 0..3 {
+                unit.set(lane);
+                reuse.set(super::context_staging_turn(&mut owner.borrow_mut(), layer % 2, layer, lane));
+            }
+        }
+        assert!(reuse.get());
+        assert_eq!(owner.borrow()[1], Some((77, 2)));
+        super::context_single_step(&unit, &reuse, &owner);
+        assert_eq!(unit.get(), usize::MAX);
+        assert!(!reuse.get());
+        assert_eq!(*owner.borrow(), [None; 2]);
+        for _layer in 0..78 {
+            for rank in 0..2 {
+                let history = [65, 64];
+                let gathered = if reuse.get() { [0; 2] } else { history };
+                assert_eq!(gathered[rank], history[rank], "the continuation gathers all history on both ranks");
+            }
+        }
+        assert!(!super::context_staging_turn(&mut owner.borrow_mut(), 0, 0, 1),
+            "a new pipelined call cannot reuse the preceding call's ownership");
     }
 
     /// GLM's hook mapping for TP2 route diagnostics (begin at Begin on the

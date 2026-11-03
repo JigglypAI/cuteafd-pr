@@ -27,6 +27,20 @@ def no_stop_handlers(monkeypatch, tmp_path):
     monkeypatch.setattr(cards.hwlock, 'LOCK_DIR', tmp_path / 'locks')
     monkeypatch.delenv('CUTEAFD_HW_LOCKS_HELD', raising=False)
     monkeypatch.delenv('CUTEAFD_HW_GATE_TICKETS', raising=False)
+    cards.bench_panels.cache_clear()
+    bin_dir = tmp_path / '.cuteafd-test-bin'
+    bin_dir.mkdir(exist_ok=True)
+    cuteafd_bin = bin_dir / 'cuteafd'
+    fixture_path = ROOT / 'scripts/bench/fixtures/bench-panels-v1.json'
+    cuteafd_bin.write_text(
+        f'#!/usr/bin/env python3\nimport pathlib, sys\n'
+        f'if sys.argv[1:] == ["bench", "panels", "--json"]:\n'
+        f'    sys.stdout.write(pathlib.Path({str(fixture_path)!r}).read_text())\n'
+        f'    raise SystemExit(0)\n'
+        f'raise SystemExit(1)\n'
+    )
+    cuteafd_bin.chmod(0o755)
+    monkeypatch.setenv('PATH', f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
 
 
 @pytest.fixture
@@ -2787,3 +2801,163 @@ def test_cold_window_drops_page_cache_when_the_timed_sweep_opens(entry, tmp_path
     with pytest.raises(ValueError, match='needs the SparkNest `nest` CLI'):
         cards.generate({**entry, 'prefill_lengths': [8192]}, 'd', dict(instance='s', slot='s'), tmp_path,
                        tmp_path / 'key', {}, set(), None, 1, cold_hosts=['raptor'])
+
+
+def test_omitted_expert_port_uses_launcher_default_in_preflight_and_assert_absent(entry, tmp_path, monkeypatch):
+    omitted = {**entry, 'set': {k: v for k, v in entry['set'].items() if k != 'EXPERT_PORT'}}
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[omitted])))
+    state = tmp_path / 'state'
+    monkeypatch.setattr(cards, 'slot_check', _fake_slot())
+    monkeypatch.setattr(cards, 'binary_supports', lambda *a, **k: None)
+    monkeypatch.setattr(sys, 'argv', [
+        'wip-cards', '--kit', str(kit), '--cards', omitted['name'], '--matrix',
+        '--arm', 'base=b:s', '--state', str(state), '--binary', sys.executable,
+        '--preflight-only',
+    ])
+    assert cards.main() == 0
+    assert json.loads((state / 'preflight.json').read_text())['status'] == 'pass'
+    plan = json.loads((state / 'plan.json').read_text())
+    job = plan['jobs'][0]
+    assert 'EXPERT_PORT' not in job['entry']['set']
+    assert cards.LAUNCHER_DEFAULTS == {'EXPERT_PORT': '19441', 'ADDR': '0.0.0.0:8000'}
+    assert cards.container_targets(job) == [
+        ('raptor', 'cuteafd-coordinator-' + job['entry']['set']['INSTANCE']),
+        *((host, f'cuteafd-spark-expert-{host}-19441') for host in omitted['sparks']),
+    ]
+    seen = []
+    monkeypatch.setattr(cards, 'run', lambda cmd: seen.append(cmd) or SimpleNamespace(stdout=''))
+    cards.preflight_at_grant(job, {'instance': 'b', 'slot': 's'})
+    assert len(seen) == 1 + len(omitted['sparks'])
+    monkeypatch.setattr(cards, 'run', lambda cmd: SimpleNamespace(stdout='cuteafd-spark-expert-ostrich-19441\n'))
+    with pytest.raises(ValueError, match='cuteafd-spark-expert-ostrich-19441'):
+        cards.assert_absent(job)
+
+
+@pytest.mark.parametrize('extra_argv,expected', [
+    (['--set', 'v41-min:EXPERT_PORT=99999'], 'EXPERT_PORT must be in 1..65535'),
+    (['--arm-set', 'base:EXPERT_PORT=0'], 'EXPERT_PORT must be in 1..65535'),
+    (['--set', 'v41-min:EXPERT_PORT=not-a-port'], 'EXPERT_PORT must be in 1..65535'),
+])
+def test_invalid_container_keys_fail_at_preflight_before_hardware_grant(entry, tmp_path, monkeypatch, extra_argv, expected):
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
+    state = tmp_path / 'state'
+    monkeypatch.setattr(cards, 'slot_check', _fake_slot())
+    monkeypatch.setattr(cards, 'binary_supports', lambda *a, **k: None)
+    granted = []
+    monkeypatch.setattr(cards, 'serving_turn', lambda *a, **k: granted.append(True))
+    monkeypatch.setattr(sys, 'argv', [
+        'wip-cards', '--kit', str(kit), '--cards', entry['name'], '--matrix',
+        '--arm', 'base=b:s', '--state', str(state), '--binary', sys.executable,
+        *extra_argv,
+    ])
+    with pytest.raises(ValueError, match=expected):
+        cards.main()
+    assert not granted
+    preflight = json.loads((state / 'preflight.json').read_text())
+    assert preflight['status'] == 'failed'
+    assert any(expected in problem for problem in preflight['problems'])
+    job = make(entry, tmp_path / 'direct')
+    job['entry']['set'].pop('INSTANCE')
+    with pytest.raises(ValueError, match='INSTANCE must be'):
+        cards.preflight_job(job, {'instance': 'test-base', 'slot': 's'})
+
+
+def test_panels_allowlist_derives_from_bench_cli_and_matches_fixture(entry, tmp_path):
+    fixture = json.loads((ROOT / 'scripts/bench/fixtures/bench-panels-v1.json').read_text())
+    assert 'shared_prefix' in fixture
+    assert cards.bench_panels() == frozenset(fixture)
+    assert cards.requested_panels('panels:shared_prefix') == ['shared_prefix']
+    assert cards.requested_panels('panels:shared_prefix,baseline') == ['shared_prefix', 'baseline']
+    job = cards.generate({**entry, 'profile': 'panels:shared_prefix'}, 'a', dict(instance='p', slot='s'),
+                         tmp_path, tmp_path / 'key', {}, set(), None, 1)
+    assert job['entry']['profile'] == 'panels:shared_prefix'
+    with pytest.raises(ValueError, match='unknown requested panel: not_a_panel'):
+        cards.requested_panels('panels:not_a_panel')
+    cards.bench_panels.cache_clear()
+    with pytest.raises(ValueError, match='bench panels --json failed'):
+        cards.bench_panels(str(tmp_path / 'missing-cuteafd'))
+    bad_bin = tmp_path / 'bad-cuteafd'
+    bad_bin.write_text('#!/bin/sh\necho "not-json"\n')
+    bad_bin.chmod(0o755)
+    cards.bench_panels.cache_clear()
+    with pytest.raises(ValueError, match='bench panels --json returned invalid JSON'):
+        cards.bench_panels(str(bad_bin))
+
+
+def test_observer_slow_cleanup_exits_within_hook_wait_and_preserves_failures(entry, tmp_path, monkeypatch):
+    job = cards.generate(entry, 'candidate', dict(instance='obs-test', slot='s'),
+                         tmp_path, tmp_path / 'key', {}, {'memory', 'console'}, None, 1)
+    assert job['entry']['observer']['finish_timeout_s'] == cards.OBSERVER_FINISH_TIMEOUT_S == 5
+    assert cards.observer_teardown_budget(job) == pytest.approx(3.5)
+    hook_wait_s = 0.5
+    job['entry']['observer']['finish_timeout_s'] = hook_wait_s
+    budget_s = cards.observer_teardown_budget(job)
+    assert 0.1 <= budget_s < hook_wait_s
+    stop = tmp_path / 'observer.stop'
+    monkeypatch.setenv('CUTEAFD_SMOKE_STOP', str(stop))
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost:8500')
+    killed = []
+
+    class SlowSampler:
+        def __init__(self, stdout):
+            self.stdout = stdout
+            self.stderr = SimpleNamespace(read=lambda: 'sampler boom')
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            time.sleep(min(timeout or 10.0, 10.0))
+            raise subprocess.TimeoutExpired(['docker', 'run'], timeout or 10.0)
+
+        def kill(self):
+            killed.append(True)
+
+    def fake_popen(cmd, **kwargs):
+        kwargs['stdout'].write('{"time":1.0,"devices":[{"gpu":0,"raw_bytes":1,"sampler_bytes":0,"corrected_bytes":1}]}\n')
+        kwargs['stdout'].flush()
+        return SlowSampler(kwargs['stdout'])
+
+    def slow_run(cmd, **kwargs):
+        timeout = kwargs.get('timeout', 120)
+        time.sleep(min(timeout, 10.0))
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    def slow_console_frames(url, stop_path, output):
+        while not stop_path.exists():
+            time.sleep(0.01)
+        time.sleep(2.0)
+
+    def http(url, path):
+        if path == '/v1/stats':
+            stop.touch()
+            return {'dspark_policy': {}}
+        return {'type': 'snapshot'}
+
+    monkeypatch.setattr(cards.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(cards, 'run', slow_run)
+    monkeypatch.setattr(cards, 'console_frames', slow_console_frames)
+    monkeypatch.setattr(cards, 'http', http)
+    started = time.monotonic()
+    cards.observe(job)
+    elapsed = time.monotonic() - started
+    assert elapsed < hook_wait_s
+    assert killed == [True]
+    teardown = json.loads((Path(job['state']) / 'observer-teardown.json').read_text())
+    assert teardown['finish_timeout_s'] == hook_wait_s
+    assert teardown['budget_s'] == pytest.approx(budget_s, abs=0.01)
+    assert [p['phase'] for p in teardown['phases']] == ['sampler_cleanup', 'sampler_wait', 'reader_join']
+    assert [p['status'] for p in teardown['phases']] == ['timeout', 'timeout', 'timeout']
+
+    # Required observer failures (e.g. empty memory samples) still raise after bounded teardown.
+    stop.unlink()
+    monkeypatch.setattr(cards.subprocess, 'Popen', lambda cmd, **kw: SlowSampler(kw['stdout']))
+    with pytest.raises(ValueError, match='memory probe produced no samples'):
+        cards.observe(job)
+
+
+
