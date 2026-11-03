@@ -121,6 +121,28 @@ def test_audio_capture_uses_ordinary_source_and_probe_audio_echo(tmp_path, monke
         module.check_record(window, response, "model", "native", family="muse_spark")
 
 
+@pytest.mark.parametrize("family", module.FAMILIES)
+def test_reference_record_requires_provenance_only_for_media(family):
+    window = {"tokens": [9, 2], "score_from": 1}
+    response = {"server": {"model": "model", "family": family}, "probe": {
+        "engine": family, "cold": True, "no_speculation": True, "cached_tokens": 0,
+        "score_path": "decode", "prompt_ids": window["tokens"], "scored": 1,
+        "rows": [{"position": 1, "finite": True}]}}
+    # A reference-arm text control never bypassed an encoder.
+    module.check_record(window, response, "model", "reference", family=family)
+    response["probe"]["provenance"] = {"mode": "reference_features", "probe_only": True,
+        "encoder_bypassed": True, "features": []}
+    with pytest.raises(ValueError, match="text control.*provenance"):
+        module.check_record(window, response, "model", "reference", family=family)
+    del response["probe"]["provenance"]
+    span = {"start": 0, "len": 1, "kind": "audio", "key": "a" * 64,
+        "samples": 1, "pcm_sha256": "b" * 64}
+    window["media"] = [span]
+    response["probe"]["audio"] = [{k: span[k] for k in ("start", "len", "key", "samples", "pcm_sha256")}]
+    with pytest.raises(ValueError, match="reference media.*missing.*provenance"):
+        module.check_record(window, response, "model", "reference", family=family)
+
+
 def test_mixed_record_checks_rebound_image_and_exact_audio_independently():
     image = {"start": 0, "len": 1, "kind": "image", "key": "a" * 64, "grid": [1, 2, 2],
              "identity": {"encoder": "b" * 64, "processor": "c" * 64}}
@@ -524,7 +546,8 @@ def test_native_only_official_golden_and_text_control(tmp_path, monkeypatch, row
         module.compare(args)
 
 
-def test_capture_text_control_without_media(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", ["native", "reference"])
+def test_capture_text_control_without_media(tmp_path, monkeypatch, mode):
     from types import SimpleNamespace
     window = {"id": "control", "tokens": [9, 2], "score_from": 1}
     panel = {"family": "mimo_v2", "checkpoint": "model", "set_sha256": "a" * 64,
@@ -548,7 +571,8 @@ def test_capture_text_control_without_media(tmp_path, monkeypatch):
             "rows": [{"position": 1, "finite": True}]}}
     monkeypatch.setattr(module, "http", http)
     args = SimpleNamespace(out=tmp_path / "out", url="http://localhost", bench_token=None,
-        mode="native", features=None, quick=False, media_root=tmp_path,
+        mode=mode, features=tmp_path / "unused-features" if mode == "reference" else None,
+        quick=False, media_root=tmp_path,
         host_dump=tmp_path / "host", server_dump=tmp_path / "server", timeout=10)
     module.capture(args)
     assert json.loads((args.out / "capture.json").read_text())["windows"][0]["id"] == "control"

@@ -116,7 +116,12 @@ def check_record(window, response, checkpoint, mode, features_root=None, family=
     if mode == "native":
         if provenance is not None:
             raise ValueError("native arm unexpectedly reports feature override provenance")
+    elif not window.get("media"):
+        if provenance is not None:
+            raise ValueError("text control unexpectedly reports feature override provenance")
     else:
+        if provenance is None:
+            raise ValueError("reference media record is missing feature override provenance")
         metadata = [json.loads((features_root / (s["key"] + ".json")).read_text()) for s in window.get("media", [])]
         for span, meta in zip(window.get("media", []), metadata):
             if span.get("kind") == "audio":
