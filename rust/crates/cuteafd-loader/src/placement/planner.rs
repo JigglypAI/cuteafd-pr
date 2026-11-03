@@ -296,6 +296,7 @@ pub struct Facts {
 
 mod contract;
 mod search;
+pub mod serving;
 pub use contract::{
     Activation, ByteCurve, BytePiece, Choice, Component, ComponentKind, Contract, Requires,
     Variable,

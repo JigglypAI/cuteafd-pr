@@ -602,8 +602,9 @@ impl<'a> TokenSelector<'a> {
     /// A selector for up to `capacity` rows of `vocab` logits.
     pub fn new(library: &'a NativeLibrary, placement: SelectPlacement, vocab: usize, capacity: usize) -> Result<Self> {
         ensure!(capacity > 0 && vocab > 0, "token selector of {capacity} rows x {vocab}");
-        Ok(Self { library, placement, vocab, capacity, out: DeviceAllocation::new(library, capacity * 12)?,
-            landing: HostAllocation::new(library, capacity * 12)?, wave: None, landed: crate::shared::memory::BlockingWait::new(library), counts: [0; 3] })
+        let bytes = capacity.checked_mul(12).context("token selector output overflow")?;
+        Ok(Self { library, placement, vocab, capacity, out: DeviceAllocation::new(library, bytes)?,
+            landing: HostAllocation::new(library, bytes)?, wave: None, landed: crate::shared::memory::BlockingWait::new(library), counts: [0; 3] })
     }
 
     /// Waits until `stream` passed the work queued on it so far (the
@@ -644,6 +645,36 @@ impl<'a> TokenSelector<'a> {
             pinned.extend(host.into_iter().map(|(id, buffer)| (format!("selector.sampler.{id}"), buffer)));
         }
         (device, pinned)
+    }
+
+    /// Independent retained-owner census; a missing eager sampler stays missing.
+    pub(crate) fn allocation_receipts(&self,
+        location: cuteafd_loader::placement::planner::Location, physical_device: i32,
+        lifetime: cuteafd_loader::placement::planner::Lifetime,
+    ) -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{Allocation, Device, Domain, Location, Receipt};
+        ensure!(location.domain == Domain::Device && location.device != Device::Host,
+            "token selector requires a logical device location");
+        let (device, pinned) = self.allocation_buffers();
+        let mut receipts = Vec::with_capacity(device.len() + pinned.len());
+        for (id, buffer) in device {
+            ensure!(buffer.device_id == physical_device && buffer.bytes > 0 && !buffer.ptr.is_null(),
+                "token selector owner {id} has an invalid extent or physical device");
+            let group = if id.starts_with("selector.sampler.") {"target sampler"} else {"token selector"};
+            receipts.push(Receipt { allocation: Allocation::buffer(id, location,
+                u64::try_from(buffer.bytes)?, lifetime, Category::Workspace, group),
+                address: buffer.ptr as u64 });
+        }
+        for (id, buffer) in pinned {
+            ensure!(buffer.bytes > 0 && !buffer.ptr.is_null(), "token selector pinned owner {id} is empty");
+            let sampler = id.starts_with("selector.sampler.");
+            receipts.push(Receipt { allocation: Allocation::buffer(id, Location::PINNED,
+                u64::try_from(buffer.bytes)?, lifetime,
+                if sampler {Category::Workspace} else {Category::Staging},
+                if sampler {"target sampler"} else {"token selector"}), address: buffer.ptr as u64 });
+        }
+        Ok(receipts)
     }
 
     /// Selects `batch.rows[i]` from logits row `i`.
@@ -1012,6 +1043,77 @@ mod tests {
             assert_eq!(census(&selector), owners);
             assert_eq!(audit.events().len(), allocations);
             assert_eq!(fixture.events()?, events, "repeat reservation must not create another CUDA event");
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn retained_selector_receipts_reconcile_shared_recipe_and_require_eager_reservation() -> Result<()> {
+        use cuteafd_loader::placement::planner::{self, serving::SelectorOwners, *};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let library = fixture.load()?;
+        let total = 16 << 20;
+        let life = serving::ServingOwners::LIFETIME;
+        for (capacity, vocab) in [(0, 33), (64, 0), (usize::MAX, 33)] {
+            let audit = cuteafd_ffi::memory_ledger::AllocationAudit::start();
+            assert!(TokenSelector::new(&library, SelectPlacement::Device, vocab, capacity).is_err());
+            assert!(audit.events().is_empty(), "invalid selector must refuse before allocating");
+        }
+        for (physical, location) in [(1, Location::coordinator(0)), (0, Location::coordinator(1))] {
+            library.cuda_set_device(physical)?;
+            fixture.configure_memory(&library, physical, total)?;
+            for capacity in [1, 64, 256] {
+                for placement in [SelectPlacement::Device, SelectPlacement::Host] {
+                    let owners = SelectorOwners {location, capacity, vocab: 33,
+                        device_sampling: placement == SelectPlacement::Device}.allocations("selector", life)?;
+                    let facts = Facts {allocations: owners, deferred: vec![], sequential: vec![], allowances: vec![]};
+                    let budgets = vec![Budget {id: "CPU fixture".into(), locations: vec![location, Location::PINNED],
+                        physical_bytes: total as u64, logical_bytes: total as u64, headroom: 0,
+                        baseline: Baseline::Forecast {occupied: 0, source: "CPU fixture".into(), assumed: false}}];
+                    let phases = planner::evaluate(&facts, &budgets)?;
+                    let plan = ResolvedPlan {request: Request {context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
+                            prefill: Pin::Auto, operation: Operation::Serving},
+                        decisions: Decisions {attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
+                            embedding: None, prefill: PrefillShape {rows: 64, waves: 1}, lanes: 1},
+                        pool_tokens: 64, facts, budgets, phases};
+                    let mut selector = TokenSelector::new(&library, placement, 33, capacity)?;
+                    let early = selector.allocation_receipts(location, physical, life)?;
+                    assert_eq!(early.len(), 2);
+                    assert_eq!(planner::reconcile(&plan, Phase::Ready, &early).is_ok(),
+                        placement == SelectPlacement::Host, "missing eager sampler must not be synthesized");
+                    selector.reserve_sampler()?;
+                    let receipts = selector.allocation_receipts(location, physical, life)?;
+                    planner::reconcile(&plan, Phase::Ready, &receipts)?;
+                    assert!(selector.allocation_receipts(location, 1 - physical, life).is_err());
+                    assert!(selector.allocation_receipts(Location::PINNED, physical, life).is_err());
+                    assert!(selector.allocation_receipts(Location {device: planner::Device::Host,
+                        domain: Domain::Device}, physical, life).is_err());
+                    let addresses: Vec<_> = receipts.iter().map(|r| r.address).collect();
+                    selector.reserve_sampler()?;
+                    assert_eq!(selector.allocation_receipts(location, physical, life)?.iter()
+                        .map(|r| r.address).collect::<Vec<_>>(), addresses);
+                    for mismatch in 0..10 {
+                        let mut bad = receipts.clone();
+                        match mismatch {
+                            0 => {bad.pop();},
+                            1 => {let mut extra = bad[0].clone(); extra.allocation.id.push_str(".extra"); bad.push(extra);},
+                            2 => bad[0].allocation.bytes += 1,
+                            3 => {bad[0].allocation.bytes += 1; bad[1].allocation.bytes -= 1;},
+                            4 => bad[0].allocation.location = Location::coordinator(7),
+                            5 => bad[0].address = 0,
+                            6 => bad[0].allocation.dtype = "bf16".into(),
+                            7 => bad[0].allocation.lifetime.first = Phase::Load,
+                            8 => bad[0].allocation.shape[0] += 1,
+                            9 => bad[0].allocation.category = cuteafd_core::memory_layout::Category::Weights,
+                            _ => unreachable!(),
+                        }
+                        assert!(planner::reconcile(&plan, Phase::Ready, &bad).is_err(), "mismatch {mismatch}");
+                    }
+                    drop(selector);
+                    assert_eq!(library.cuda_memory_info()?, (total, total));
+                }
+            }
         }
         Ok(())
     }

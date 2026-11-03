@@ -354,48 +354,10 @@ impl Startup {
             first: Phase::Warmup,
             last: Phase::Growth,
         };
-        let (gpu, pinned) = selector.allocation_buffers();
         let mut receipts = self.receipts.clone();
-        for (id, buffer) in gpu {
-            let group = if id.starts_with("selector.sampler.") {
-                "target sampler"
-            } else {
-                "token selector"
-            };
-            receipts.push(receipt(id, buffer, Category::Workspace, group, lifetime));
-        }
-        for (id, buffer) in pinned {
-            let (category, group) = if id.starts_with("selector.sampler.") {
-                (Category::Workspace, "target sampler")
-            } else {
-                (Category::Staging, "token selector")
-            };
-            receipts.push(Receipt {
-                allocation: Spec::buffer(
-                    id,
-                    Location::PINNED,
-                    buffer.bytes as u64,
-                    lifetime,
-                    category,
-                    group,
-                ),
-                address: buffer.ptr as u64,
-            });
-        }
+        receipts.extend(selector.allocation_receipts(Location::coordinator(0), device.id, lifetime)?);
         if let Some(copy) = cache.host_engine_mut() {
-            for (index, buffer) in copy.allocation_buffers() {
-                receipts.push(Receipt {
-                    allocation: Spec::buffer(
-                        format!("host.prefix.{index}"),
-                        Location::PINNED,
-                        buffer.bytes as u64,
-                        lifetime,
-                        Category::Prefix,
-                        "retained host prefix chunk",
-                    ),
-                    address: buffer.ptr as u64,
-                });
-            }
+            receipts.extend(copy.allocation_receipts("host.prefix", lifetime)?);
         }
         reconcile_startup(
             &self.plan,

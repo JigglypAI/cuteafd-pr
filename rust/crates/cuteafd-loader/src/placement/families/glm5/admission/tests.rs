@@ -262,6 +262,35 @@ fn one_contract_activates_physical_owners_by_shape_home_and_unique_target_count(
 }
 
 #[test]
+fn shared_serving_owners_compose_without_family_private_geometry_or_policy() {
+    use planner::serving::{HostPrefixOwners, SelectorOwners, ServingOwners};
+    let cfg = cfg();
+    for device_sampling in [false, true] {
+        let mut recipe = recipe(&cfg);
+        let serving = ServingOwners {
+            selector: SelectorOwners { location: Location::coordinator(0),
+                capacity: super::super::DECODE_ROWS as usize, vocab: cfg.vocab_size, device_sampling },
+            prefix: HostPrefixOwners { quota_bytes: 2 * 4096 + 17, chunk_bytes: 4096 },
+        };
+        let expected = serving.allocations().unwrap();
+        recipe.owners.push(Case {when: vec![], value: serving.components(recipe.maximum_pages).unwrap()});
+        let contract = recipe.prepare(&request()).unwrap();
+        for prefill in 0..2 {
+            for embedding in 0..2 {
+                for onboard in 0..2 {
+                    let selected = [0, 0, prefill, 0, embedding, onboard, 0];
+                    let facts = contract.facts(&selected, 32).unwrap();
+                    planner::evaluate(&facts, &budgets()).unwrap();
+                    assert_eq!(facts.allocations.iter().filter(|a| a.id.starts_with("selector.")
+                        || a.id.starts_with("host.prefix.")).cloned().collect::<Vec<_>>(), expected);
+                    assert!(!facts.allocations.iter().any(|a| a.id == "host.prefix.2"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn named_conditions_intersect_count_domains_and_reject_private_indexes() {
     let cfg = cfg();
     let mut recipe = recipe(&cfg);

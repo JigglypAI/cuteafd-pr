@@ -98,62 +98,18 @@ impl ServingFacts {
     }
 
     fn allocations(self, vocab: usize) -> Result<Vec<Allocation>, Refusal> {
-        let lifetime = Lifetime {
-            first: Phase::Warmup,
-            last: Phase::Growth,
-        };
-        let mut owners = vec![
-            Allocation::buffer(
-                "selector.output",
-                Location::coordinator(0),
-                super::VERIFY_ROWS as u64 * 12,
-                lifetime,
-                Category::Workspace,
-                "token selector",
-            ),
-            Allocation::buffer(
-                "selector.landing",
-                Location::PINNED,
-                super::VERIFY_ROWS as u64 * 12,
-                lifetime,
-                Category::Staging,
-                "token selector",
-            ),
-        ];
-        if self.device_sampling {
-            for owner in cuteafd_core::target_sampler_allocations(super::VERIFY_ROWS, vocab)
-                .map_err(|e| Refusal::InvalidFact(e.into()))?
-            {
-                owners.push(Allocation::buffer(
-                    format!("selector.sampler.{}", owner.id),
-                    if owner.pinned {
-                        Location::PINNED
-                    } else {
-                        Location::coordinator(0)
-                    },
-                    owner.bytes as u64,
-                    lifetime,
-                    Category::Workspace,
-                    "target sampler",
-                ));
-            }
-        }
-        if self.host_quota > 0 {
-            if self.host_chunk == 0 || self.host_chunk > self.host_quota {
-                return Err(Refusal::InvalidFact("invalid host prefix chunk".into()));
-            }
-            for index in 0..self.host_quota / self.host_chunk {
-                owners.push(Allocation::buffer(
-                    format!("host.prefix.{index}"),
-                    Location::PINNED,
-                    self.host_chunk,
-                    lifetime,
-                    Category::Prefix,
-                    "retained host prefix chunk",
-                ));
-            }
-        }
-        Ok(owners)
+        serving::ServingOwners {
+            selector: serving::SelectorOwners {
+                location: Location::coordinator(0),
+                capacity: super::VERIFY_ROWS,
+                vocab,
+                device_sampling: self.device_sampling,
+            },
+            prefix: serving::HostPrefixOwners {
+                quota_bytes: self.host_quota,
+                chunk_bytes: self.host_chunk,
+            },
+        }.allocations()
     }
 }
 

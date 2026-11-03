@@ -124,6 +124,21 @@ impl<'a> CudaCopyEngine<'a> {
         self.chunks.iter().enumerate().filter_map(|(index, chunk)| chunk.map(|b| (index, b))).collect()
     }
 
+    /// Physical retained chunks only, not carved slabs or registered GPU aliases.
+    pub(crate) fn allocation_receipts(&self, prefix: &str,
+        lifetime: cuteafd_loader::placement::planner::Lifetime,
+    ) -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{Allocation, Location, Receipt};
+        ensure!(!prefix.is_empty(), "empty host prefix owner identity");
+        self.allocation_buffers().into_iter().map(|(index, buffer)| {
+            ensure!(buffer.bytes > 0 && !buffer.ptr.is_null(), "host prefix chunk {index} is empty");
+            Ok(Receipt { allocation: Allocation::buffer(format!("{prefix}.{index}"), Location::PINNED,
+                u64::try_from(buffer.bytes)?, lifetime, Category::Prefix, "retained host prefix chunk"),
+                address: buffer.ptr as u64 })
+        }).collect()
+    }
+
     /// Legacy single-stream-device mode. Peer-addressed ranges retain their
     /// existing behavior; registered families select the allocation owner.
     pub fn new(library: &'a NativeLibrary, template: CuteafdDeviceBuffer) -> Result<Self> {
@@ -383,6 +398,45 @@ mod cuda_tests {
         let mut pool = SlabPool::new(2 * 4096 + 17, 4096, Layout::family(256, 64, 0), &mut engine)?;
         let chunks = engine.allocation_buffers();
         assert_eq!(chunks.iter().map(|(id, b)| (*id, b.bytes)).collect::<Vec<_>>(), vec![(0, 4096), (1, 4096)]);
+        use cuteafd_loader::placement::planner::{self, serving::{HostPrefixOwners, ServingOwners},
+            Baseline, Budget, Decisions, Facts, Location, Operation, Phase, Pin, PrefillShape, Request, ResolvedPlan};
+        let life = ServingOwners::LIFETIME;
+        let facts = Facts {allocations: HostPrefixOwners {quota_bytes: 2 * 4096 + 17, chunk_bytes: 4096}
+            .allocations("host.prefix", life)?, deferred: vec![], sequential: vec![], allowances: vec![]};
+        let budgets = vec![Budget {id: "CPU pinned fixture".into(), locations: vec![Location::PINNED],
+            physical_bytes: 8192, logical_bytes: 8192, headroom: 0,
+            baseline: Baseline::Forecast {occupied: 0, source: "CPU fixture".into(), assumed: false}}];
+        let phases = planner::evaluate(&facts, &budgets)?;
+        let plan = ResolvedPlan {request: Request {context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
+                prefill: Pin::Auto, operation: Operation::Serving},
+            decisions: Decisions {attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
+                embedding: None, prefill: PrefillShape {rows: 64, waves: 1}, lanes: 1},
+            pool_tokens: 64, facts, budgets, phases};
+        let receipts = engine.allocation_receipts("host.prefix", life)?;
+        planner::reconcile(&plan, Phase::Ready, &receipts)?;
+        assert!(engine.allocation_receipts("", life).is_err());
+        for mismatch in 0..8 {
+            let mut bad = receipts.clone();
+            match mismatch {
+                0 => {bad.pop();},
+                1 => {let mut extra = bad[0].clone(); extra.allocation.id.push_str(".extra"); bad.push(extra);},
+                2 => bad[0].allocation.bytes += 1,
+                3 => {bad[0].allocation.bytes += 1; bad[1].allocation.bytes -= 1;},
+                4 => bad[0].allocation.location = Location::HOST,
+                5 => bad[0].address = 0,
+                6 => bad[0].allocation.lifetime.first = Phase::Load,
+                7 => bad[0].allocation.dtype = "f32".into(),
+                _ => unreachable!(),
+            }
+            assert!(planner::reconcile(&plan, Phase::Ready, &bad).is_err(), "mismatch {mismatch}");
+        }
+        let saved = engine.chunks[0];
+        engine.chunks[0].as_mut().unwrap().ptr = std::ptr::null_mut();
+        assert!(engine.allocation_receipts("host.prefix", life).is_err());
+        engine.chunks[0] = saved;
+        engine.chunks[0].as_mut().unwrap().bytes = 0;
+        assert!(engine.allocation_receipts("host.prefix", life).is_err());
+        engine.chunks[0] = saved;
         let events = audit.events();
         assert_eq!(events.len(), chunks.len());
         for event in &events {
