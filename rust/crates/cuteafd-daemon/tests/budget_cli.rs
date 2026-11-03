@@ -258,25 +258,43 @@ fn installed_example_programs_discovery_preserves_overrides_and_planner_errors()
     assert!(!missing_programs_input(&image, "parsing JSON: invalid manifest"));
 }
 
-#[test]
-fn installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget() {
-    let Some(hf_home) = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME") else { return; };
-    let hf_home = std::path::PathBuf::from(hf_home);
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    let programs = installed_example_programs(
-        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into),
-        &std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME")),
-        std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
+fn require_installed_hf_home(test_name: &str, hf_home: Option<std::ffi::OsString>) -> std::path::PathBuf {
+    let Some(hf_home) = hf_home.filter(|value| !value.is_empty()).map(std::path::PathBuf::from) else {
+        panic!("{test_name}: CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required (skip via cpu-gate when absent)");
+    };
+    assert!(hf_home.is_dir(), "{test_name}: CUTEAFD_DEPLOYMENT_TEST_HF_HOME is not a directory: {}",
+        hf_home.display());
+    hf_home
+}
+
+fn require_installed_snapshot(scope: &str, model_id: &str, revision: Option<&str>,
+    hf_home: &std::path::Path) -> std::path::PathBuf {
+    installed_example_snapshot(model_id, revision, hf_home).unwrap_or_else(|| panic!(
+        "{scope}: required checkpoint not installed in {}: {model_id}@{}",
+        hf_home.display(), revision.unwrap_or("main")))
+}
+
+fn assert_programs_input_present(scope: &str, programs: Option<&std::path::Path>,
+    default_programs: &std::path::Path, stderr: &str) {
+    let manifest = programs.unwrap_or(default_programs);
+    assert!(!missing_programs_input(manifest, stderr),
+        "{scope}: required PROGRAMS manifest not installed: {}", manifest.display());
+}
+
+fn run_installed_glm_exlr8_worker_budget(hf_home: Option<std::ffi::OsString>,
+    programs_override: Option<std::path::PathBuf>, home: &std::path::Path,
+    default_programs: &std::path::Path, root: &std::path::Path) {
+    let hf_home = require_installed_hf_home(
+        "installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget", hf_home);
+    let programs = installed_example_programs(programs_override, home, default_programs);
+    let mut tested = 0;
     for (name, gpus, ranks) in [("min", "1", 4), ("max", "2", 6)] {
         let example = root.join(format!("examples/configs/glm53-exlr8-{name}.config"));
         let raw = std::fs::read_to_string(&example).unwrap();
         let config = raw.lines().filter_map(|line| line.split_once('='))
             .collect::<std::collections::BTreeMap<_, _>>();
-        let Some(snapshot) = installed_example_snapshot(config["MODEL_ID"],
-            Some(config["MODEL_REVISION"]), &hf_home) else {
-            eprintln!("{name}: SKIP GLM EXLR8 checkpoint not installed");
-            continue;
-        };
+        let snapshot = require_installed_snapshot(
+            name, config["MODEL_ID"], Some(config["MODEL_REVISION"]), &hf_home);
         for explicit in [None, Some("104")] {
             let mut command = Command::new("timeout");
             command.args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
@@ -289,11 +307,7 @@ fn installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget() {
             if let Some(budget) = explicit { command.args(["--spark-budget-gib", budget]); }
             let output = command.output().unwrap();
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if missing_programs_input(programs.as_deref()
-                .unwrap_or(std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json")), &stderr) {
-                eprintln!("{name}: SKIP native PROGRAMS not installed");
-                continue;
-            }
+            assert_programs_input_present(name, programs.as_deref(), default_programs, &stderr);
             assert!(output.status.success(), "{name}, budget={explicit:?}: {stderr}");
             let deployment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(deployment["spark_ranks"], ranks);
@@ -317,23 +331,32 @@ from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
 from test_run_family_dispatch import capture_native_exlr8_launch
 capture_native_exlr8_launch(*map(Path, sys.argv[2:]))
-"#]).arg(&root).arg(&snapshot).arg(&path).arg(temporary.path()).output().unwrap();
+"#]).arg(root).arg(&snapshot).arg(&path).arg(temporary.path()).output().unwrap();
             assert!(python.status.success(), "{name}: {}", String::from_utf8_lossy(&python.stderr));
+            tested += 1;
         }
     }
+    assert_eq!(tested, 4);
 }
 
 #[test]
-fn installed_example_deployments_publish_executable_prefill_shapes() {
-    // cpu-gate --full enables the installed inventory; sparse fixtures always run.
-    let Some(hf_home) = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME") else { return; };
-    let hf_home = std::path::PathBuf::from(hf_home);
-    let default_programs = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
-    let programs = installed_example_programs(
-        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into),
-        &std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME")), default_programs);
-    eprintln!("installed example PROGRAMS: {}", programs.as_deref().unwrap_or(default_programs).display());
+fn installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    run_installed_glm_exlr8_worker_budget(
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"),
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into),
+        &std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME")),
+        std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"),
+        &root);
+}
+
+fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
+    programs_override: Option<std::path::PathBuf>, home: &std::path::Path,
+    default_programs: &std::path::Path, root: &std::path::Path) {
+    let hf_home = require_installed_hf_home(
+        "installed_example_deployments_publish_executable_prefill_shapes", hf_home);
+    let programs = installed_example_programs(programs_override, home, default_programs);
+    eprintln!("installed example PROGRAMS: {}", programs.as_deref().unwrap_or(default_programs).display());
     let mut examples = std::fs::read_dir(root.join("examples/configs")).unwrap()
         .map(|entry| entry.unwrap().path()).filter(|path|
             path.extension().is_some_and(|extension| extension == "config"))
@@ -342,8 +365,6 @@ fn installed_example_deployments_publish_executable_prefill_shapes() {
     assert!(!examples.is_empty(), "no example configs found");
     let total = examples.len();
     let mut tested = 0;
-    let mut skipped = 0;
-    let mut skipped_programs = 0;
     let mut families = std::collections::BTreeSet::new();
     for example in examples {
         let raw = std::fs::read_to_string(&example).unwrap();
@@ -351,12 +372,7 @@ fn installed_example_deployments_publish_executable_prefill_shapes() {
             .collect::<std::collections::BTreeMap<_, _>>();
         let name = example.file_name().unwrap().to_str().unwrap();
         let revision = config.get("MODEL_REVISION").copied();
-        if installed_example_snapshot(config["MODEL_ID"], revision, &hf_home).is_none() {
-            skipped += 1;
-            eprintln!("{name}: SKIP checkpoint not installed: {}@{}", config["MODEL_ID"],
-                revision.unwrap_or("main"));
-            continue;
-        }
+        let _snapshot = require_installed_snapshot(name, config["MODEL_ID"], revision, &hf_home);
         let mut command = Command::new("timeout");
         command.args(["180", env!("CARGO_BIN_EXE_cuteafd"), "plan", config["MODEL_ID"],
             "--deployment", "--config"]).arg(&example)
@@ -377,13 +393,8 @@ fn installed_example_deployments_publish_executable_prefill_shapes() {
         }
         let output = command.output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if output.status.code() == Some(1) && missing_programs_input(
-            programs.as_deref().unwrap_or(default_programs), &stderr) {
-            skipped += 1;
-            skipped_programs += 1;
-            eprintln!("{name}: SKIP PROGRAMS manifest not installed: {}",
-                programs.as_deref().unwrap_or(default_programs).display());
-            continue;
+        if output.status.code() == Some(1) {
+            assert_programs_input_present(name, programs.as_deref(), default_programs, &stderr);
         }
         assert!(output.status.success(), "{name}: {stderr}");
         let deployment = release_accepts_prefill(&output.stdout);
@@ -393,18 +404,31 @@ fn installed_example_deployments_publish_executable_prefill_shapes() {
             deployment["prefill_unit_rows"], deployment["prefill_waves"], deployment["prefill_slots"],
             deployment["prefill_span_rows"]);
     }
-    assert_eq!(tested + skipped, total);
-    eprintln!("installed example deployments: {tested} tested, {skipped} skipped ({skipped_programs} missing PROGRAMS), {total} configs, families={families:?}");
+    assert_eq!(tested, total);
+    eprintln!("installed example deployments: {tested} tested, {total} configs, families={families:?}");
 }
 
 #[test]
-fn installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers() {
-    let Some(hf_home) = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME") else { return; };
-    let hf_home = std::path::PathBuf::from(hf_home);
+fn installed_example_deployments_publish_executable_prefill_shapes() {
+    // cpu-gate --full enables the installed inventory; sparse fixtures always run.
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    let matrix: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../scripts/bench/release-smoke-v4.json")).unwrap();
-    for entry in matrix["entries"].as_array().unwrap() {
+    run_installed_example_deployments(
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"),
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into),
+        &std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME")),
+        std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"),
+        &root);
+}
+
+fn run_installed_release_v4_matrix_recipes(hf_home: Option<std::ffi::OsString>,
+    root: &std::path::Path, matrix: &serde_json::Value) {
+    let hf_home = require_installed_hf_home(
+        "installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers", hf_home);
+    let entries = matrix["entries"].as_array().unwrap();
+    assert!(!entries.is_empty(), "no release-smoke-v4 matrix entries found");
+    let mut tested = 0;
+    for entry in entries {
+        let entry_name = entry["name"].as_str().unwrap();
         let example = root.join(entry["config"].as_str().unwrap());
         let raw = std::fs::read_to_string(&example).unwrap();
         let mut config = raw.lines().filter_map(|line| line.split_once('='))
@@ -415,7 +439,7 @@ fn installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers() {
             } }
         }
         let revision = config.get("MODEL_REVISION").map(String::as_str);
-        let Some(snapshot) = installed_example_snapshot(&config["MODEL_ID"], revision, &hf_home) else { continue; };
+        let snapshot = require_installed_snapshot(entry_name, &config["MODEL_ID"], revision, &hf_home);
         let ranks = entry["sparks"].as_array().map_or(0, Vec::len);
         use cuteafd_loader::plan::{family, format, spec::Component, Checkpoint};
         // Exercise production recipe construction from real tensor headers without
@@ -423,6 +447,7 @@ fn installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers() {
         let checkpoint = Checkpoint::open(&snapshot).unwrap();
         let family = family::detect(&checkpoint).unwrap();
         let model = family.open(&checkpoint).unwrap();
+        tested += 1;
         let Some(moe) = model.spec().moe.as_ref() else { continue; };
         let tensors = checkpoint.tensors.iter().filter(|tensor|
             family.classify(model.spec(), &tensor.meta.name)
@@ -435,19 +460,64 @@ fn installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers() {
         }
         if config.contains_key("EXLR8_MANIFEST") {
             // EXLR8 is admitted by exlr8_native_plan, not spark_recipe.
-            assert!(packages.is_empty(), "{}: EXLR8 unexpectedly selected a generic package", entry["name"]);
+            assert!(packages.is_empty(), "{entry_name}: EXLR8 unexpectedly selected a generic package");
             continue;
         }
-        assert!(!packages.is_empty(), "{}: missing routed recipe", entry["name"]);
+        assert!(!packages.is_empty(), "{entry_name}: missing routed recipe");
         for package in packages {
             // Local-only coordinators need no Spark TP1 package, but their IDs
             // must parse against a registered Spark world.
             let world = if ranks == 0 {
                 *cuteafd_loader::plan::experts::spark_worlds(&package, moe.intermediate).first()
-                    .unwrap_or_else(|| panic!("{}: unrecognized recipe {package}", entry["name"]))
+                    .unwrap_or_else(|| panic!("{entry_name}: unrecognized recipe {package}"))
             } else { ranks };
             cuteafd_loader::plan::experts::spark_recipe(&package, moe.intermediate, world)
-                .unwrap_or_else(|error| panic!("{}: {package}: {error}", entry["name"]));
+                .unwrap_or_else(|error| panic!("{entry_name}: {package}: {error}"));
         }
     }
+    assert_eq!(tested, entries.len());
+}
+
+#[test]
+fn installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let matrix: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../scripts/bench/release-smoke-v4.json")).unwrap();
+    run_installed_release_v4_matrix_recipes(
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"), &root, &matrix);
+}
+
+#[test]
+fn installed_checkpoint_runners_fail_on_missing_hf_home_checkpoints_or_programs() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let absent_programs = temp.path().join("absent/PROGRAMS.json");
+    let matrix = serde_json::json!({
+        "entries": [{
+            "name": "v41-flash-min",
+            "config": "examples/configs/deepseek-v41-mxfp4-min.config",
+            "sparks": ["s1", "s2", "s3", "s4"]
+        }]
+    });
+    for missing_hf in [None, Some( std::ffi::OsString::from("") ),
+        Some(temp.path().join("missing-hf").into_os_string())] {
+        assert!(std::panic::catch_unwind(|| run_installed_glm_exlr8_worker_budget(
+            missing_hf.clone(), None, temp.path(), &absent_programs, &root)).is_err());
+        assert!(std::panic::catch_unwind(|| run_installed_example_deployments(
+            missing_hf.clone(), None, temp.path(), &absent_programs, &root)).is_err());
+        assert!(std::panic::catch_unwind(|| run_installed_release_v4_matrix_recipes(
+            missing_hf.clone(), &root, &matrix)).is_err());
+    }
+    let hf_home = temp.path().join("hf");
+    std::fs::create_dir_all(&hf_home).unwrap();
+    assert!(std::panic::catch_unwind(|| run_installed_glm_exlr8_worker_budget(
+        Some(hf_home.clone().into_os_string()), None, temp.path(), &absent_programs, &root)).is_err());
+    assert!(std::panic::catch_unwind(|| run_installed_example_deployments(
+        Some(hf_home.clone().into_os_string()), None, temp.path(), &absent_programs, &root)).is_err());
+    assert!(std::panic::catch_unwind(|| run_installed_release_v4_matrix_recipes(
+        Some(hf_home.clone().into_os_string()), &root, &matrix)).is_err());
+    let missing_err = format!(
+        "Error: reading JSON {}: No such file or directory (os error 2)", absent_programs.display());
+    assert!(std::panic::catch_unwind(|| assert_programs_input_present(
+        "min", None, &absent_programs, &missing_err)).is_err());
 }

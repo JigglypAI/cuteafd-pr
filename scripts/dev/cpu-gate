@@ -73,7 +73,12 @@ BUILDS = Path.home() / '.cache/cuteafd/builds'
 # Real-checkpoint V4 placement tests: minutes each, need sparknest snapshots.
 LIVE_PLANNERS = ('families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4',
                  'families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4_missing_tp2_package')
-# Actual >60s IDs from the 081a00072 full gate, not the earlier estimated list.
+INSTALLED_PLANNERS = (
+    'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
+    'installed_example_deployments_publish_executable_prefill_shapes',
+    'installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers',
+)
+# Actual >60s IDs from the 081a00072 full gate, plus installed-checkpoint planners.
 FULL_TESTS = (
     'families::kimi_k3::admission::tests::installed_max_planner_and_runtime_remaining_kv_match_per_gpu',
     'plan::families::step5::tests::adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity',
@@ -89,7 +94,7 @@ FULL_TESTS = (
     'plan::families::kimi::tests::planner_resolves_every_spark_count_before_recipe_refusal',
     'plan::families::kimi::tests::direct_layout_uses_shared_host_mark_rule_and_preserves_overrides',
     'plan::tests::v41_32gib_counts_share_pool_and_local_layer_admission',
-    'installed_example_deployments_publish_executable_prefill_shapes',
+    *INSTALLED_PLANNERS,
 )
 SLOW_TESTS = (('cuteafd-hostcache', 'soak_has_no_leak_and_balances_the_counters'),
               ('cuteafd-hostcache', 'soak_in_bank_order_has_no_leak_and_balances_the_counters'),
@@ -379,6 +384,61 @@ def cargo_build_succeeded(path):
     return finished == [True] and not errors
 
 
+def _config_kv(path):
+    return dict(line.split('=', 1) for line in path.read_text().splitlines() if '=' in line)
+
+
+def _snapshot_installed(hf_home, model_id, revision=None):
+    if hf_home is None or not hf_home.is_dir():
+        return False
+    snapshots = hf_home / 'hub' / f"models--{model_id.replace('/', '--')}" / 'snapshots'
+    if not snapshots.is_dir():
+        return False
+    return (snapshots / revision).is_dir() if revision else any(snapshots.iterdir())
+
+
+def _programs_installed(env):
+    override = env.get('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS')
+    if override is not None:
+        return bool(override) and Path(override).exists()
+    home = Path(env.get('HOME') or Path.home())
+    return any(path.exists() for path in (
+        Path('/opt/cuteafd/share/PROGRAMS.json'),
+        home / '.local/share/cuteafd/PROGRAMS.json',
+        home / '.cache/cuteafd/builds/v3-p4/c1/artifacts/PROGRAMS.json',
+    ))
+
+
+def installed_planner_skips(source, env):
+    """Installed-checkpoint tests in budget_cli.rs whose required HF_HOME, PROGRAMS.json
+    or checkpoint snapshots are absent."""
+    root = source if (source / 'examples/configs').is_dir() else REPO
+    raw_hf = env.get('CUTEAFD_DEPLOYMENT_TEST_HF_HOME')
+    hf_home = Path(raw_hf) if raw_hf else None
+    has_programs = _programs_installed(env)
+    skipped = []
+    exlr8_configs = [_config_kv(root / f'examples/configs/glm53-exlr8-{name}.config') for name in ('min', 'max')]
+    if not has_programs or not all(_snapshot_installed(hf_home, cfg['MODEL_ID'], cfg.get('MODEL_REVISION'))
+                                   for cfg in exlr8_configs):
+        skipped.append('installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget')
+    example_configs = [_config_kv(path) for path in sorted((root / 'examples/configs').glob('*.config'))]
+    if not has_programs or not example_configs or not all(
+            _snapshot_installed(hf_home, cfg['MODEL_ID'], cfg.get('MODEL_REVISION')) for cfg in example_configs):
+        skipped.append('installed_example_deployments_publish_executable_prefill_shapes')
+    matrix = json.loads((root / 'scripts/bench/release-smoke-v4.json').read_text()).get('entries', [])
+    matrix_configs = []
+    for entry in matrix:
+        cfg = _config_kv(root / entry['config'])
+        for key, value in (entry.get('set') or {}).items():
+            if isinstance(value, str):
+                cfg[key] = value
+        matrix_configs.append(cfg)
+    if not matrix_configs or not all(
+            _snapshot_installed(hf_home, cfg['MODEL_ID'], cfg.get('MODEL_REVISION')) for cfg in matrix_configs):
+        skipped.append('installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers')
+    return skipped
+
+
 def cargo(source, root, args, env):
     target = root / 'target-cpu-gate'
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
@@ -402,6 +462,8 @@ def cargo(source, root, args, env):
                        env.get('HF_HOME') or str(Path(env.get('HOME', str(Path.home()))) / '.cache/huggingface'))
     skipped_full = [] if full else list(FULL_TESTS)
     skipped_live = list(LIVE_PLANNERS) if args.skip_live_planners else []
+    if full:
+        skipped_live.extend(list(INSTALLED_PLANNERS) if args.skip_live_planners else installed_planner_skips(source, env))
     skipped = skipped_full + skipped_live
     skips = [flag for name in skipped for flag in ('--skip', name)]
     test_args = ['nice', '-n', '19', 'cargo', 'test', '--workspace', '--locked', '--no-fail-fast', '--', *skips]

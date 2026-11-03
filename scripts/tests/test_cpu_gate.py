@@ -32,6 +32,7 @@ def _fake(monkeypatch, outputs):
         Path(log_path).write_text(text)
         return code, 1.0
     monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
+    monkeypatch.setattr(gate, 'installed_planner_skips', lambda source, env: [])
     monkeypatch.setattr(gate, 'run_logged', run_logged)
     monkeypatch.setattr(gate, 'checked', lambda cmd, **k: '')
     return calls
@@ -228,8 +229,62 @@ def test_default_and_full_select_the_same_named_tests_in_both_runners(tmp_path, 
             assert command[command.index('--') + 2:-1:2] == list(gate.FULL_TESTS)
     record = {'task': 't', 'verdict': 'pass', 'head': 'a' * 40, 'dirty': False, 'suites': [result]}
     assert ('not a merge/release gate' in gate.render(record)) != full
-    assert len(gate.FULL_TESTS) == len(set(gate.FULL_TESTS)) == 15
-    assert 'installed_example_deployments_publish_executable_prefill_shapes' in gate.FULL_TESTS
+    assert len(gate.FULL_TESTS) == len(set(gate.FULL_TESTS)) == 17
+    for name in gate.INSTALLED_PLANNERS:
+        assert name in gate.FULL_TESTS
+
+
+def test_full_gate_records_missing_installed_planner_inputs_in_skipped_live_planners(tmp_path, monkeypatch):
+    source = tmp_path / 'source'
+    (source / 'examples/configs').mkdir(parents=True)
+    (source / 'scripts/bench').mkdir(parents=True)
+    (source / 'examples/configs/glm53-exlr8-min.config').write_text(
+        'MODEL_ID=org/glm-exlr8\nMODEL_REVISION=rev-exlr8\nRTX_GPUS=1\n')
+    (source / 'examples/configs/glm53-exlr8-max.config').write_text(
+        'MODEL_ID=org/glm-exlr8\nMODEL_REVISION=rev-exlr8\nRTX_GPUS=2\n')
+    (source / 'examples/configs/other-min.config').write_text(
+        'MODEL_ID=org/other-model\nMODEL_REVISION=rev-other\nRTX_GPUS=1\n')
+    (source / 'scripts/bench/release-smoke-v4.json').write_text(json.dumps({
+        'entries': [{'name': 'other-min', 'config': 'examples/configs/other-min.config', 'sparks': []}]
+    }))
+    hf_home = tmp_path / 'hf'
+    programs = tmp_path / 'PROGRAMS.json'
+    env = {'HOME': str(tmp_path), 'CUTEAFD_DEPLOYMENT_TEST_HF_HOME': str(hf_home),
+           'CUTEAFD_DEPLOYMENT_TEST_PROGRAMS': str(programs)}
+    # Zero checkpoints and missing PROGRAMS: all three installed-checkpoint planners are skipped.
+    assert gate.installed_planner_skips(source, env) == list(gate.INSTALLED_PLANNERS)
+    # Install only the GLM EXLR8 checkpoint + PROGRAMS (mixed inventory): only the EXLR8 test is runnable.
+    (hf_home / 'hub/models--org--glm-exlr8/snapshots/rev-exlr8').mkdir(parents=True)
+    programs.write_text('{"schema":1,"programs":[]}\n')
+    assert gate.installed_planner_skips(source, env) == [
+        'installed_example_deployments_publish_executable_prefill_shapes',
+        'installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers',
+    ]
+    # Install the remaining checkpoint, then remove PROGRAMS: the header-only matrix test is runnable,
+    # while the two planner/launcher tests that require PROGRAMS are recorded as skipped.
+    (hf_home / 'hub/models--org--other-model/snapshots/rev-other').mkdir(parents=True)
+    assert gate.installed_planner_skips(source, env) == []
+    programs.unlink()
+    assert gate.installed_planner_skips(source, env) == [
+        'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
+        'installed_example_deployments_publish_executable_prefill_shapes',
+    ]
+    (tmp_path / 'logs').mkdir()
+    ok = 'test result: ok. 1 passed; 0 failed; 0 ignored\n'
+    real_skips = gate.installed_planner_skips
+    calls = _fake(monkeypatch, [(0, BUILD_OK), (0, ok)])
+    monkeypatch.setattr(gate, 'installed_planner_skips', real_skips)
+    result = gate.cargo(source, tmp_path, SimpleNamespace(**vars(ARGS), full=True), env)
+    assert result['status'] == 'pass'
+    assert result['skipped_full_tests'] == []
+    assert result['skipped_live_planners'] == [
+        'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
+        'installed_example_deployments_publish_executable_prefill_shapes',
+    ]
+    assert calls[1][calls[1].index('--') + 1:-1] == [
+        '--skip', 'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
+        '--skip', 'installed_example_deployments_publish_executable_prefill_shapes',
+    ]
 
 
 @pytest.mark.parametrize('full', [False, True])
@@ -244,6 +299,7 @@ def test_installed_deployment_inventory_is_enabled_only_for_full(tmp_path, monke
                               'test result: ok. 1 passed; 0 failed; 0 ignored\n')
         return 0, 1.
     monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
+    monkeypatch.setattr(gate, 'installed_planner_skips', lambda source, env: [])
     monkeypatch.setattr(gate, 'run_logged', run_logged)
     monkeypatch.setattr(gate, 'checked', lambda cmd, **kwargs: '')
     env = {'HOME': str(tmp_path)}
