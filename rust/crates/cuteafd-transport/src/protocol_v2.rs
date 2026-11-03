@@ -245,15 +245,6 @@ impl ExpertProtocolV2FrameBuffer {
         Ok(self.as_slice())
     }
 
-    pub fn encode_regular_forwarded_request(
-        &mut self,
-        request: &ExpertProtocolV2RequestView<'_>,
-        response_dtype: ExpertV2Dtype,
-    ) -> Result<&[u8]> {
-        request.encode_regular_forwarded_into(response_dtype, &mut self.bytes)?;
-        Ok(self.as_slice())
-    }
-
     pub(crate) fn encode_request_prefix(
         &mut self,
         request: &ExpertProtocolV2Request,

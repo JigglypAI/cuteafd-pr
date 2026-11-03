@@ -3,9 +3,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use super::{
-    CHECKSUM_LEN, EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM,
-    EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED,
-    EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN,
+    CHECKSUM_LEN, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN,
     EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN, EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN,
     EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN, ExpertProtocolV2RequestHeader,
     ExpertProtocolV2ResponseHeader, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
@@ -181,41 +179,6 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
 
     pub fn hidden_payload(&self) -> &'a [u8] {
         self.hidden_payload
-    }
-
-    pub(crate) fn encode_regular_forwarded_into(
-        &self,
-        response_dtype: ExpertV2Dtype,
-        out: &mut Vec<u8>,
-    ) -> Result<()> {
-        if self.stream_plan_enabled()
-            || self.stream_data_enabled()
-            || self.precompile_warmup_enabled()
-            || self.partial_replies()
-        {
-            bail!("only regular ExpertProtocolV2 requests can be forwarded");
-        }
-        let response_flags = match response_dtype {
-            ExpertV2Dtype::Bf16 => 0,
-            ExpertV2Dtype::Fp8E4m3RowScaled => EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED,
-            ExpertV2Dtype::Nvfp4E2m1Fp8E4m3 => EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3,
-            other => bail!("unsupported forwarded response dtype {other:?}"),
-        };
-        let flags = response_flags
-            | if self.debug_checksum_enabled() {
-                EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
-            } else {
-                0
-            };
-        validate_flags(flags, "request")?;
-
-        out.clear();
-        if out.capacity() < self.frame_bytes.len() {
-            out.reserve(self.frame_bytes.len() - out.capacity());
-        }
-        out.extend_from_slice(self.frame_bytes);
-        out[84..88].copy_from_slice(&flags.to_le_bytes());
-        Ok(())
     }
 
     pub fn hidden_row_payload(&self, index: usize) -> Result<&'a [u8]> {

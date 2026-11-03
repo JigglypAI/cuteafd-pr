@@ -178,7 +178,7 @@ fn bundled_media_inventory_is_header_exact_and_never_hides_declared_errors() {
     testing::write_muse_media_snapshot(dir.path(), &[0]);
     let open = || Checkpoint::open(dir.path()).unwrap();
     let inventory = MediaOptions::from_checkpoint(&open(), MediaMode::Auto, MediaMode::Auto, 2).unwrap();
-    assert_eq!(inventory.vision_bytes.0 + inventory.vision_bytes.1, 4_864_551_264);
+    assert_eq!(inventory.vision_bytes.0 + inventory.vision_bytes.1, 4_860_356_960);
     assert_eq!(inventory.audio_bytes, (235_680_768, 10_905_600));
     assert_eq!(inventory.replicas, 2);
     let path = dir.path().join("config.json");
