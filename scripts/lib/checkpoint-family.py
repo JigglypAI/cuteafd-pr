@@ -5,7 +5,7 @@ layers carry routed experts.
   checkpoint-family.py CONFIG_JSON   -> "FAMILY MODEL_TYPE FIRST_LAYER LAST_LAYER"
 
 FAMILY is the long family id (deepseek_v41, deepseek_v4, glm5, glm5_flash,
-mimo_v2, qwen4, qwen3_5, step5, kimi_k3, mistral_large4). The Spark ranks serve routed experts on [FIRST, LAST]
+mimo_v2, qwen4, qwen3_5, step5, kimi_k3, muse_spark, mistral_large4). The Spark ranks serve routed experts on [FIRST, LAST]
 (LAST -1: through the end); MTP/nextn layers past the decoder stay off them for
 GLM 5.3 Flash and Qwen 3.8, whose serve paths do not run their MTP heads.
 
@@ -130,6 +130,7 @@ def describe(config: dict) -> tuple[str, str, int, int]:
         # Every decoder layer is a MoE (mlp_layer_types all sparse).
         if _pattern(text, layers, {"mlp_layer_types": {"sparse": False}}) is None:
             raise SystemExit("config lacks mlp_layer_types")
+        last = layers - 1
     elif family == "mistral_large4":
         if text.get("model_type") != "mistral_large4_text":
             raise SystemExit("mistral_large4 needs text_config.model_type mistral_large4_text")

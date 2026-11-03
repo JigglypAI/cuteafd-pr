@@ -277,8 +277,7 @@ GEOMETRIES = {
 }
 # SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
 # elides the clamp). DeepSeek clamps at 10.
-SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None, 'step5': 7.0, 'muse': None}
-SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None, 'step5': 7.0, 'ml4': None}
+SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None, 'step5': 7.0, 'muse': None, 'ml4': None}
 # Activation per geometry, mirroring cuteafd_core::ExpertGeometry::activation.
 ACTIVATIONS = {'kimik3': 'situ', 'step5': 'silu_post_clamp'}
 

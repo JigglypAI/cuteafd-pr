@@ -207,9 +207,13 @@ def test_spark_and_coordinator_program_geometry_by_scope(tmp_path):
     # Muse coordinator: its programs, the epilogue for onboarded layers, the K6 core once.
     fields, _ = _program_geometry(tmp_path, CUTEAFD_ENABLE_MUSE_AOT='ON')
     assert fields['GEOMETRY'] == 'muse,muse2,expert_partial,dense_trellis_k6' and fields['DENSE'] == 'muse'
-    for other in ('CUTEAFD_ENABLE_GLM_AOT', 'CUTEAFD_ENABLE_GLMF_AOT', 'CUTEAFD_ENABLE_KIMIK3_AOT'):
+    for other in ('CUTEAFD_ENABLE_GLM_AOT', 'CUTEAFD_ENABLE_GLMF_AOT', 'CUTEAFD_ENABLE_KIMIK3_AOT',
+                  'CUTEAFD_ENABLE_ML4_AOT'):
         fields, _ = _program_geometry(tmp_path, CUTEAFD_ENABLE_MUSE_AOT='ON', **{other: 'ON'})
         assert fields['GEOMETRY'].split(',').count('dense_trellis_k6') == 1, (other, fields)
+    fields, _ = _program_geometry(tmp_path, CUTEAFD_ENABLE_MUSE_AOT='ON', CUTEAFD_ENABLE_ML4_AOT='ON')
+    assert fields['DENSE'] == 'muse;ml4'
+    assert fields['GEOMETRY'] == 'muse,muse2,expert_partial,dense_trellis_k6,ml4'
     # Without Muse, existing coordinator tables are unchanged.
     fields, _ = _program_geometry(tmp_path, CUTEAFD_ENABLE_GLM_AOT='ON')
     assert fields['GEOMETRY'] == 'glm,glm2,dense_trellis_k6,glm_stage,glm2_stage'

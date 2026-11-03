@@ -491,15 +491,6 @@ mod tests {
     ///
     /// The closure below deliberately leaves the reused buffer untouched when
     /// no mask is needed, exactly as the matcher does.
-    /// The XGrammar matcher's mask buffer is reused across rows and
-    /// `fill_bitmask` returns whether that row needs a mask at all. A row whose
-    /// grammar allows every token must be recorded as `None`; recording the
-    /// buffer anyway would apply the **previous** row's grammar to it, which is
-    /// a wrong-answer path (the device would either report a spurious
-    /// `grammar allows no target token` or silently pick a filtered token).
-    ///
-    /// The closure below deliberately leaves the reused buffer untouched when
-    /// no mask is needed, exactly as the matcher does.
     #[test]
     fn a_row_that_needs_no_mask_does_not_inherit_the_previous_rows_bits() {
         let words = 4;
