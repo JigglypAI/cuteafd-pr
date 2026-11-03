@@ -14,7 +14,7 @@ use std::{
 
 struct SocketRank(Conn);
 impl RankEvents for SocketRank {
-    fn fd(&self) -> std::os::fd::BorrowedFd<'_> { self.0.fd() }
+    fn fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> { Some(self.0.fd()) }
     fn next(&self) -> std::io::Result<Event> {
         self.0
             .event()?

@@ -49,7 +49,7 @@ impl<'a> PushDestination for LoadingArena<'a> {
 }
 
 pub(crate) trait RankEvents {
-    fn fd(&self) -> std::os::fd::BorrowedFd<'_>;
+    fn fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> { None }
     fn next(&self) -> std::io::Result<Event>;
     /// The group's first event: no hub event (not even Progress) precedes the
     /// group's start, which waits for every rank to join.
@@ -58,7 +58,7 @@ pub(crate) trait RankEvents {
     fn release(&self, slot: u32) -> std::io::Result<()>;
 }
 impl RankEvents for PushRank {
-    fn fd(&self) -> std::os::fd::BorrowedFd<'_> { self.fd() }
+    fn fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> { Some(self.fd()) }
     fn next(&self) -> std::io::Result<Event> {
         self.next()
     }

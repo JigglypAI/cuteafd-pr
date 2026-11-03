@@ -80,10 +80,10 @@ impl EventWaiters {
 
     /// One blocking wake source for socket arrivals and copy completions.
     /// A true result means at least one completed event can be received.
-    pub fn wait(&self, socket: BorrowedFd<'_>) -> Result<bool> {
+    pub fn wait(&self, socket: Option<BorrowedFd<'_>>) -> Result<bool> {
         let mut fds = [
             libc::pollfd { fd: self.wake.as_raw_fd(), events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: socket.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: socket.map_or(-1, |fd| fd.as_raw_fd()), events: libc::POLLIN, revents: 0 },
         ];
         loop {
             // SAFETY: both descriptors remain borrowed/live, the array is writable,
