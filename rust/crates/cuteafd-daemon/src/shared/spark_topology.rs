@@ -274,6 +274,13 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                 Commands::ServeGlmf(a) => (a.engine.peers.as_deref().unwrap().split(',').count(), None, None),
                 Commands::ServeMimo(a) => (a.engine.peers.as_deref().unwrap().split(',').count(), None, None),
                 Commands::ServeKimi(a) => (a.peers.len(), None, None),
+                Commands::ServeMuse(a) => {
+                    assert_eq!(family, "muse", "{key}: wrong Muse dispatch");
+                    assert_eq!(a.prefill_waves, Some(deployment.prefill_waves as _),
+                        "{key}: launch must preserve the admitted prefill wave count");
+                    assert_eq!(a.prefill_waves, Some(1), "{key}: fixture requests one prefill lane");
+                    (a.peers.len(), None, None)
+                }
                 other => anyhow::bail!("{key}: wrong dispatch {other:?}"),
             };
             assert_eq!(peers, 8, "{key}: lost peers in launch/parse");
