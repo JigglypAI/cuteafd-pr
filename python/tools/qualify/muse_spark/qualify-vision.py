@@ -168,7 +168,7 @@ def official_features(modules, rgb, cfg):
     parameter = next(tower.parameters())
     owner = SimpleNamespace(vision_tower=tower, vision_adapter=adapter, vision_projection=projection,
         perception_emb_norm=MuseSparkRMSNorm(eps=feature_norm_eps(cfg), with_scale=False),
-        config=SimpleNamespace(vision_config=SimpleNamespace(merge_size=cfg["vision_config"]["merge_size"])))
+        config=SimpleNamespace(return_dict=True, vision_config=SimpleNamespace(merge_size=cfg["vision_config"]["merge_size"])))
     grid = torch.tensor([[1, rgb.shape[0] // 14, rgb.shape[1] // 14]], device=parameter.device)
     inputs = torch.from_numpy(patches(rgb)).to(parameter.device, parameter.dtype)
     with torch.inference_mode():

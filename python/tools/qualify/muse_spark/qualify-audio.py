@@ -99,20 +99,20 @@ def check(code):
         raise RuntimeError(f"native PCM status {code}")
 
 
-def official_features(model, prepared, config, dtype):
+def official_features(model, prepared, config, dtype, samples_per_token):
     """Call the exact public wrapper without allocating the 816B language model."""
     import torch
     from types import SimpleNamespace
     from transformers.models.muse_spark.modeling_muse_spark import (
-        MuseSparkForConditionalGeneration, MuseSparkRMSNorm)
+        MuseSparkModel, MuseSparkRMSNorm)
     model.to(dtype=dtype)
     owner = SimpleNamespace(audio_tower=model,
         config=SimpleNamespace(return_dict=True, audio_config=SimpleNamespace(
-            samples_per_token=config["audio_config"]["samples_per_token"])),
+            samples_per_token=samples_per_token)),
         get_input_embeddings=lambda: SimpleNamespace(embed_norm=MuseSparkRMSNorm(
             eps=config["text_config"]["rms_norm_eps"], with_scale=False)))
     with torch.inference_mode():
-        result = MuseSparkForConditionalGeneration.get_audio_features(
+        result = MuseSparkModel.get_audio_features(
             owner, input_values=prepared[None].to(next(model.parameters()).device, dtype),
             return_dict=True)
     return result.pooler_output.float().cpu()
@@ -367,9 +367,9 @@ def main():
             independent = ref.forward(pcm, {name: tensor.to("cuda") for name, tensor in weights.items()}).float().cpu()
             if not torch.equal(independent, official_stages[12]):
                 raise AssertionError(f"{label}: independent reference differs from official BF16")
-            bf16_features = official_features(model, prepared, root_config, torch.bfloat16)
+            bf16_features = official_features(model, prepared, root_config, torch.bfloat16, processor_config["samples_per_token"])
             fp32_stages = official_stages_for(torch.float32)
-            fp32_features = official_features(model, prepared, root_config, torch.float32)
+            fp32_features = official_features(model, prepared, root_config, torch.float32, processor_config["samples_per_token"])
             chunks = {i: [] for i in range(13)}
             errors = []
             @OBSERVER
