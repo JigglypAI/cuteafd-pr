@@ -177,7 +177,11 @@ struct RawConfig {
     rms_norm_eps: f64,
     sliding_window: usize,
     vocab_size: usize,
-    rope_parameters: RawRope,
+    /// Newer configs nest the base in `rope_parameters`; others keep a flat `rope_theta`.
+    #[serde(default)]
+    rope_parameters: Option<RawRope>,
+    #[serde(default)]
+    rope_theta: Option<f64>,
     dflash_config: RawDflash,
 }
 
@@ -230,10 +234,10 @@ impl DflashConfig {
         let raw: RawConfig = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)
             .context("parsing the DFlash2 config.json")?;
         let d = &raw.dflash_config;
-        ensure!(raw.head_dim == 128 && raw.num_key_value_heads > 0
+        ensure!(matches!(raw.head_dim, 128 | 64) && raw.num_key_value_heads > 0
             && raw.num_attention_heads % raw.num_key_value_heads == 0
             && raw.num_attention_heads / raw.num_key_value_heads * d.block_size <= 64,
-            "DFlash2 kernels take 128-wide heads and at most 64 queries per kv head and block \
+            "DFlash2 kernels take 128- or 64-wide heads and at most 64 queries per kv head and block \
              (got {} heads, {} kv, block {})", raw.num_attention_heads, raw.num_key_value_heads, d.block_size);
         ensure!(d.conv_kernel_size == 2 && d.selector_rank == 256 && d.selector_top_k == 16,
             "DFlash2 kernels take two-tap convolutions and a rank-256 top-16 selector");
@@ -246,7 +250,8 @@ impl DflashConfig {
             kv_heads: raw.num_key_value_heads,
             head_dim: raw.head_dim,
             eps: raw.rms_norm_eps as f32,
-            theta: raw.rope_parameters.rope_theta as f32,
+            theta: raw.rope_parameters.as_ref().map(|r| r.rope_theta).or(raw.rope_theta)
+                .context("DFlash2 config lacks rope_parameters.rope_theta and rope_theta")? as f32,
             block: d.block_size,
             group: d.conv_group_size,
             mask_token: d.mask_token_id,
@@ -928,6 +933,7 @@ pub(crate) struct DflashDrafter<'a> {
     pub slots: usize,
     max_sequences: usize,
     fc: DraftWeight<'a>,
+    projections: cuteafd_ffi::draft_projection::DraftProjections<'a>,
     context_fc: Option<cuteafd_ffi::mla_draft::Ml4ContextProjection<'a>>,
     hidden_norm: Dev<'a>,
     norm: Dev<'a>,
@@ -1134,6 +1140,25 @@ fn check_checkpoint_headers(cfg: &DflashConfig, tensors: &HashMap<String, Safete
 }
 
 impl<'a> DflashDrafter<'a> {
+    fn load_projections(programs: &'a cuteafd_ffi::programs::Programs<'a>, cfg: &DflashConfig,
+        representation: GlmDraftRepresentation, mla: bool, ml4: bool, sequences: usize)
+        -> Result<cuteafd_ffi::draft_projection::DraftProjections<'a>> {
+        let h = cfg.hidden;
+        let mut shapes = Vec::new();
+        if representation == GlmDraftRepresentation::Bf16Only {
+            shapes.extend([(h, 2 * cfg.intermediate), (cfg.intermediate, h)]);
+            if !ml4 {
+                shapes.extend([(h * cfg.taps.len(), h), (h, cfg.conv_width()), (h, cfg.rank)]);
+                if !mla {
+                    shapes.extend([(h, cfg.qkv_width()), (h, 2 * cfg.kv_width()), (cfg.heads * cfg.head_dim, h)]);
+                }
+            }
+        }
+        Ok(cuteafd_ffi::draft_projection::DraftProjections::load(programs, &shapes,
+            cuteafd_ffi::draft_projection::batch_rows(TAP_ROWS, cfg.block, sequences,
+                programs.capacities().decode_rows.unwrap_or(0)))?)
+    }
+
     /// The keyed selector prior (`family/dflash2/numerics`), or the generic
     /// GLM-5.3 fit when the drafter ships none for this key.
     /// Drafts carry no per-token evidence (mtp_dspark's Markov head): the
@@ -1160,11 +1185,12 @@ impl<'a> DflashDrafter<'a> {
     /// the mask token. `fp8_rows` is how the FP8 GEMMs run (their scratch serves
     /// it and the modes before it, see [`Self::set_draft_linear`]).
     #[allow(clippy::too_many_arguments)]
-    pub fn load(library: &'a NativeLibrary, snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
+    pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
         max_sequences: usize, mask_row: Vec<u8>, row_window: bool, representation: GlmDraftRepresentation,
         scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DflashConfig { row_window, ..DflashConfig::read(snapshot)? };
+        let projections = Self::load_projections(programs, &cfg, representation, false, false, max_sequences)?;
         let capacity = GlmDraftCapacity::new(slots, max_sequences, cfg.block)?;
         let layout = cfg.runtime_layout(representation, capacity)?;
         let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
@@ -1247,7 +1273,7 @@ impl<'a> DflashDrafter<'a> {
             stream,
             slots,
             max_sequences,
-            fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps)?, context_fc: None,
+            fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps)?, context_fc: None, projections,
             hidden_norm: tensor("hidden_norm.weight", &[h])?,
             norm: tensor("norm.weight", &[h])?,
             head_ops: DraftHeadOps::Selector {
@@ -1297,6 +1323,7 @@ impl<'a> DflashDrafter<'a> {
             layout.paged_cache().target_tokens, library.sm_count()?, fp8_rows.code() as u8, layout.cache_format())? == layout,
             "MLA draft checkpoint/runtime differs from admitted immutable layout");
         let cfg = DflashConfig::mla(&native);
+        let projections = Self::load_projections(programs, &cfg, representation, true, false, layout.capacity().max_batch_sequences)?;
         let checkpoint = Checkpoint { data: file, tensors: read_safetensors_metadata(&snapshot.join("model.safetensors"))?
             .into_iter().map(|t| (t.name.clone(), t)).collect() };
         for (name, shape) in native.tensor_shapes() { checkpoint.bytes(&name, &shape)?; }
@@ -1365,7 +1392,7 @@ impl<'a> DflashDrafter<'a> {
             native.rotary.inv_freq.len() * 4)?, bytes_of(&native.rotary.inv_freq))?;
         let result = Self { kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, library, stream, slots: layout.capacity().context_slots,
             max_sequences: layout.capacity().max_batch_sequences,
-            fc: matrix(tensor("fc.weight", &[h, cfg.taps.len() * h])?, h, cfg.taps.len() * h)?, context_fc: None,
+            fc: matrix(tensor("fc.weight", &[h, cfg.taps.len() * h])?, h, cfg.taps.len() * h)?, context_fc: None, projections,
             hidden_norm: tensor("hidden_norm.weight", &[h])?, norm: tensor("norm.weight", &[h])?,
             head_ops: DraftHeadOps::Selector {
                 projection: matrix(tensor("candidate_selector.hidden_projection.weight", &[cfg.rank, h])?, cfg.rank, h)?,
@@ -1407,6 +1434,8 @@ impl<'a> DflashDrafter<'a> {
             layout.paged_cache().target_tokens, library.sm_count()?, 0, layout.cache_format())? == layout,
             "mtp_dspark checkpoint/runtime differs from admitted immutable layout");
         let cfg = DflashConfig::mla(&native);
+        let projections = Self::load_projections(programs, &cfg, GlmDraftRepresentation::Bf16Only, true, true,
+            layout.capacity().max_batch_sequences)?;
         let context_fc = cuteafd_ffi::mla_draft::Ml4ContextProjection::load(programs)?;
         let mut owners = MlaDraftStorage::allocate(library, layout.clone())?.into_owners()?;
         // Destination owners and packing both come from the admitted recipe.
@@ -1469,7 +1498,7 @@ impl<'a> DflashDrafter<'a> {
         let result = Self { kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, library, stream,
             slots: layout.capacity().context_slots, max_sequences: layout.capacity().max_batch_sequences,
             fc: DraftWeight::Bf16(tensor(&mut owners, "backbone.target_projection.weight", &[h, cfg.taps.len() * h])?),
-            context_fc: Some(context_fc),
+            context_fc: Some(context_fc), projections,
             hidden_norm: tensor(&mut owners, "backbone.target_norm.weight", &[h])?,
             norm: tensor(&mut owners, "backbone.final_norm.weight", &[h])?,
             head_ops: DraftHeadOps::RnnMarkov { softcap,
@@ -1528,7 +1557,7 @@ impl<'a> DflashDrafter<'a> {
             DraftWeight::Bf16(w) => {
                 // SAFETY: source rows first..first+n lie in this matrix;
                 // the caller supplies its selected width and live output.
-                unsafe { self.library.linear_bf16(x, at(w, first * k * 2), out, rows, k, n, self.stream) }
+                unsafe { Ok(self.projections.launch(x, at(w, first * k * 2), out, rows, k, n, self.stream)?) }
             }
             DraftWeight::Fp8(w) => {
                 let scratch = self.fp8_workspace.as_ref().context("FP8 DFlash scratch was not admitted")?;
@@ -1704,7 +1733,8 @@ impl<'a> DflashDrafter<'a> {
                 self.library.glm_dflash_qk_rope(context.kv.buffer.ptr, layer.q_norm.buffer.ptr,
                     layer.k_norm.buffer.ptr, self.context_positions.buffer.ptr, context.slots.buffer.ptr,
                     std::ptr::null_mut(), layer.k_ring.buffer.ptr, layer.v_ring.buffer.ptr, n, 0, self.cfg.kv_heads,
-                    self.cfg.theta, self.cfg.eps, self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
+                    self.cfg.theta, self.cfg.eps, self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
+                    self.cfg.head_dim, s)?;
             }
         }
         self.timing.end(context_span, s)?;
@@ -2192,7 +2222,7 @@ impl<'a> DflashDrafter<'a> {
         let head_workspace = alloc(VOCABULARY_HEAD_WORKSPACE)?;
         let attention_workspace = {
             let _scope = cuteafd_ffi::memory_ledger::scope("workspace/draft-attention");
-            alloc(self.library.glm_dflash_attention_workspace(sequences, c.kv_heads, RING + c.block)?)?
+            alloc(self.library.glm_dflash_attention_workspace(sequences, c.kv_heads, RING + c.block, c.head_dim)?)?
         };
         Ok(Workspace {
             sequences,
@@ -2418,12 +2448,12 @@ impl<'a> DflashDrafter<'a> {
                         self.linear(w.dflash()?.conv.buffer.ptr, &a.qkv, 0, attention.qkv.buffer.ptr, rows, h, c.qkv_width())?;
                         l.glm_dflash_qk_rope(attention.qkv.buffer.ptr, a.q_norm.buffer.ptr, a.k_norm.buffer.ptr,
                             w.positions.buffer.ptr, std::ptr::null(), attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
-                            rows, c.heads, c.kv_heads, c.theta, eps, false, s)?;
+                            rows, c.heads, c.kv_heads, c.theta, eps, false, c.head_dim, s)?;
                         l.glm_dflash_attention(attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
                             a.k_ring.buffer.ptr, a.v_ring.buffer.ptr, attention.tables.buffer.ptr,
                             at(&attention.tables, s_count * 4), at(&attention.tables, 2 * s_count * 4),
                             attention.attn.buffer.ptr, attention.scratch.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
-                            max_keys, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(), self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
+                            max_keys, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(), self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, c.head_dim, s)?;
                         self.linear(attention.attn.buffer.ptr, &a.o, 0, w.delta.buffer.ptr, rows, attention_width, h)?;
                     }
                     (DraftAttention::Mla(a), AttentionWorkspace::Mla(attention), DraftContext::Mla(context)) => {

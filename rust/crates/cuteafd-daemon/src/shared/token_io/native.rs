@@ -1,5 +1,6 @@
 //! Dormant checkpoint-native vocabulary ownership; the official token I/O is unchanged.
 use crate::shared::experts::exlr8::view;
+use crate::shared::experts::rtx::dense::{self, DenseLoad, Operand, Rect};
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{Context, Result, ensure};
 use cuteafd_ffi::native_dense::{DenseEmbedding, DenseLinear};
@@ -148,7 +149,24 @@ pub(crate) struct RowFp8Weights<'a> {
     scales: DeviceAllocation<'a>,
 }
 
+/// One named table's residency, independent of the shared vocabulary lifetime owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowFp8Residency {
+    pub(crate) device: i32,
+    pub(crate) bytes: usize,
+}
+
+impl RowFp8Residency {
+    pub(crate) fn from_buffers(payload: CuteafdDeviceBuffer, scales: CuteafdDeviceBuffer) -> Self {
+        Self { device: payload.device_id, bytes: payload.bytes + scales.bytes }
+    }
+}
+
 impl RowFp8Weights<'_> {
+    pub(crate) fn residency(&self) -> RowFp8Residency {
+        RowFp8Residency::from_buffers(self.payload(), self.scales())
+    }
+
     pub(crate) fn payload(&self) -> CuteafdDeviceBuffer {
         self.payload.buffer
     }
@@ -256,11 +274,35 @@ impl NativeVocabulary<'_> {
         Ok(())
     }
 
-    /// Device bytes of the payloads and scales.
+    /// Whole-owner inventory; named embedding/head charges partition this total.
     pub(crate) fn bytes(&self) -> usize {
-        [self.embedding.payload(), self.embedding.scales(), self.head.payload(), self.head.scales()]
-            .iter().map(|b| b.bytes).sum()
+        self.embedding.residency().bytes + self.head.residency().bytes
     }
+}
+
+/// Validate the native partition before publishing bytes or deferred records.
+fn row_lands(slice: &DenseSlice) -> Result<[Vec<(Rect, usize)>; 2]> {
+    ensure!(slice.components.len() == 2 && !slice.units.is_empty(), "native vocabulary partition");
+    let mut lands: [Vec<_>; 2] = Default::default();
+    let mut covered = [0usize; 2];
+    for (index, unit) in slice.units.iter().enumerate() {
+        ensure!(unit.block == index && unit.source.len() == 2, "native vocabulary block order");
+        for (i, source) in unit.source.iter().enumerate() {
+            let component = &slice.components[i].source;
+            let offset = usize::try_from(source.offset.checked_sub(component.offset)
+                .context("native vocabulary component offset")?)?;
+            let end = offset.checked_add(source.bytes).context("native vocabulary upload overflow")?;
+            ensure!(source.bytes > 0 && source.path == component.path && offset == covered[i]
+                && end <= component.bytes, "native vocabulary component coverage");
+            lands[i].push((Rect { name: format!("{}/{}", slice.tensor, slice.components[i].suffix),
+                path: source.path.clone(), base: source.offset, row_bytes: source.bytes,
+                rows: 0..1, cols: 0..source.bytes }, offset));
+            covered[i] = end;
+        }
+    }
+    ensure!(covered == [slice.components[0].source.bytes, slice.components[1].source.bytes],
+        "native vocabulary incomplete component coverage");
+    Ok(lands)
 }
 
 /// Source order is payload then scales. Read the whole block before any upload.
@@ -270,48 +312,26 @@ fn stream_rows(
     staging: &mut [u8],
     mut publish: impl FnMut(usize, usize, &[u8]) -> Result<()>,
 ) -> Result<()> {
-    ensure!(
-        slice.components.len() == 2 && !slice.units.is_empty(),
-        "native vocabulary partition"
-    );
-    let mut covered = [0usize; 2];
+    let lands = row_lands(slice)?;
     for (index, unit) in slice.units.iter().enumerate() {
-        ensure!(
-            unit.block == index && unit.source.len() == 2,
-            "native vocabulary block order"
-        );
         let bytes = unit.staging_bytes()?;
         ensure!(bytes <= staging.len(), "native vocabulary staging extent");
         unit.read(&mut staging[..bytes])?;
         let mut at = 0;
         for (i, source) in unit.source.iter().enumerate() {
-            let component = &slice.components[i].source;
-            let offset = usize::try_from(
-                source
-                    .offset
-                    .checked_sub(component.offset)
-                    .context("native vocabulary component offset")?,
-            )?;
-            let end = offset
-                .checked_add(source.bytes)
-                .context("native vocabulary upload overflow")?;
-            ensure!(
-                source.path == component.path && offset == covered[i] && end <= component.bytes,
-                "native vocabulary component coverage"
-            );
-            publish(i, offset, &staging[at..at + source.bytes])?;
-            covered[i] = end;
+            publish(i, lands[i][index].1, &staging[at..at + source.bytes])?;
             at += source.bytes;
         }
     }
-    ensure!(
-        covered
-            == [
-                slice.components[0].source.bytes,
-                slice.components[1].source.bytes
-            ],
-        "native vocabulary incomplete component coverage"
-    );
+    Ok(())
+}
+
+fn record_rows(slice: &DenseSlice, buffers: [CuteafdDeviceBuffer; 2],
+    mut publish: impl FnMut(Operand) -> Result<()>) -> Result<()> {
+    for (lands, buffer) in row_lands(slice)?.into_iter().zip(buffers) {
+        let bytes = lands.iter().map(|(rect, _)| rect.bytes()).sum();
+        publish(Operand { device: buffer.device_id, buffer, lands, bytes })?;
+    }
     Ok(())
 }
 
@@ -332,6 +352,11 @@ fn load_rows<'a>(
             "native-vocabulary-scales",
         )?,
     };
+    if dense::is_recording() {
+        let load = DenseLoad::mount(library);
+        record_rows(slice, [weights.payload(), weights.scales()], |operand| load.operand(operand))?;
+        return Ok(weights);
+    }
     let host = staging.buffer;
     stream_rows(slice, staging.bytes_mut(), |i, offset, bytes| {
         let device = if i == 0 {
@@ -406,6 +431,88 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn native_embedding_and_head_charges_partition_planned_residency() -> Result<()> {
+        use super::super::validate_embedding_residency;
+        let root = tempfile::tempdir()?;
+        let records = [record(root.path(), EMBEDDING), record(root.path(), HEAD)];
+        for flash in [false, true] {
+            let mut records = records.clone();
+            for (record, name) in records.iter_mut().zip(selection(flash).vocabulary_names()) {
+                record.tensor = name.into();
+            }
+            for world in [1, 2] {
+                let plan = VocabularyPlan::new(&records, &selection(flash), world, 0, 8, 256)?;
+                let named = plan.dense.tensors.iter().map(|table| {
+                    let buffers = table.components.iter().map(|component| CuteafdDeviceBuffer {
+                        bytes: component.source.bytes, device_id: 3, ..Default::default()
+                    }).collect::<Vec<_>>();
+                    RowFp8Residency::from_buffers(buffers[0], buffers[1])
+                }).collect::<Vec<_>>();
+                let (embedding, head) = (named[0], named[1]);
+                assert_eq!(embedding, RowFp8Residency { device: 3, bytes: 3072 });
+                assert_eq!(head.bytes, 3072);
+                assert_eq!(embedding.bytes + head.bytes, plan.resident_bytes());
+                validate_embedding_residency(embedding.device, embedding.bytes, 3, 3072)?;
+                for (device, bytes) in [(0, 3072), (3, 0), (3, 256), (3, 6144), (3, 2048)] {
+                    assert!(validate_embedding_residency(embedding.device, embedding.bytes, device, bytes).is_err());
+                }
+                // GLM previously put both tables in the head charge; splitting owners must conserve bytes.
+                let body = 12345;
+                let before = body + plan.resident_bytes();
+                let after = body + head.bytes + embedding.bytes;
+                assert_eq!(before, after);
+                assert_ne!(after + embedding.bytes, before);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_vocabulary_recording_replays_exact_mount_components() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        for flash in [false, true] {
+            let records = selection(flash).vocabulary_names().into_iter()
+                .map(|name| record(root.path(), &name)).collect::<Vec<_>>();
+            let plan = VocabularyPlan::new(&records, &selection(flash), 1, 0, 8, 256)?;
+            for slice in &plan.dense.tensors {
+                let buffers = std::array::from_fn(|i| CuteafdDeviceBuffer {
+                    bytes: slice.components[i].source.bytes, device_id: 3, ..Default::default()
+                });
+                let sink = dense::DenseSink::default();
+                record_rows(slice, buffers, |operand| sink.operand(operand))?;
+                let operands = sink.take_all().operands;
+                assert_eq!(operands.len(), 2);
+                let mut mount = [vec![0; buffers[0].bytes], vec![0; buffers[1].bytes]];
+                stream_rows(slice, &mut vec![0; plan.staging_bytes()], |i, at, bytes| {
+                    mount[i][at..at + bytes.len()].copy_from_slice(bytes);
+                    Ok(())
+                })?;
+                for (operand, expected) in operands.iter().zip(&mount) {
+                    assert_eq!(operand.device, 3);
+                    let mut replay = vec![0; operand.bytes];
+                    for (rect, at) in &operand.lands {
+                        rect.read(&mut replay[*at..*at + rect.bytes()])?;
+                    }
+                    assert_eq!(&replay, expected);
+                }
+                let mut invalid = slice.clone();
+                invalid.units.last_mut().unwrap().block += 1;
+                let mut published = 0;
+                assert!(record_rows(&invalid, buffers, |_| { published += 1; Ok(()) }).is_err());
+                assert_eq!(published, 0);
+                // Recording validates metadata, not source availability.
+                let mut absent = slice.clone();
+                for component in &mut absent.components { component.source.path = root.path().join("absent"); }
+                for unit in &mut absent.units {
+                    for source in &mut unit.source { source.path = root.path().join("absent"); }
+                }
+                record_rows(&absent, buffers, |operand| sink.operand(operand))?;
+            }
+        }
+        Ok(())
     }
 
     #[test]

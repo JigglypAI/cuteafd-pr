@@ -27,6 +27,8 @@ mod shared {
                 pub(crate) struct DensePlan {
                     pub base: u64,
                     pub host_bytes: u64,
+                    pub host_staging: super::dense::HostStaging,
+                    pub peer_copies: Vec<super::dense::PeerCopy>,
                     pub append: Box<dyn Fn(&mut cuteafd_loader::push_load::builder::Builder,
                         u32, u64) -> anyhow::Result<()> + Send>,
                 }

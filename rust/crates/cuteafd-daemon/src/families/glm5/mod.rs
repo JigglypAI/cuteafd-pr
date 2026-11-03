@@ -214,8 +214,8 @@ fn spark_model(family: &str, backend: SparkBackend, waves: usize, unit_rows: u32
         cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, executions.capacity())?
     } else { 64 << 20 })?;
     let model = cuteafd_transport::worker_selection::ModelAdmission::new(
-        vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: engine::DECODE_ROWS as u32, ingress },
-            cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit_rows, ingress }], rings, executions)?;
+        vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: engine::DECODE_ROWS as u32, ingress, partial_reply_bytes: None },
+            cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit_rows, ingress, partial_reply_bytes: None }], rings, executions)?;
     validate_spark_endpoint_count(family, model.endpoints.len(), waves)?;
     Ok(model)
 }
@@ -1074,6 +1074,11 @@ impl Opened {
             onboard: if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) }
                 else { onboard }, full_prefill_logits: args.full_prefill_logits, context };
         let (placement, working) = glm::solve_working_set(&inputs, serial_workspace, requested)?;
+        if native {
+            use cuteafd_loader::plan::family::Family;
+            cuteafd_loader::plan::families::glm::GLM5.exlr8_execution()
+                .check(devices.len(), placement.onboard_layers > 0)?;
+        }
         ensure!(!native || devices.len() != 2
             || placement.attention_placement == cuteafd_loader::placement::AttentionPlacement::Context,
             "EXLR8 two-coordinator admission requires context attention programs");
@@ -1236,7 +1241,7 @@ impl Opened {
         self.library.cuda_set_device(args.device)?;
         let bytes = model.layers.iter().map(|layer| layer.bytes()).sum::<usize>()
             + model.norm.buffer.bytes + model.head.bytes();
-        let embedding_bytes = if host_embedding || native { 0 } else { embedding.vocab() * embedding.hidden() * 2 };
+        let embedding_bytes = embedding.device_bytes();
         let actual_weights = std::iter::once((bytes + embedding_bytes) as u64)
             .chain(shares.iter().map(|rank| rank.iter().map(|layer| layer.bytes() as u64).sum()))
             .enumerate().map(|(rank, bytes)| bytes
@@ -1268,7 +1273,7 @@ impl Opened {
                 .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
             let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
                 ::from_fp8_option(args.draft_fp8);
-            let drafter = dflash::DflashDrafter::load(&self.library, snapshot, file, stream,
+            let drafter = dflash::DflashDrafter::load(&self.library, &programs, snapshot, file, stream,
                 args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
                 mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache)?;
             // Admission includes the shared drafter's maximum serving workspace.
@@ -1357,7 +1362,7 @@ impl Opened {
         let config = cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(),
             timeout: std::time::Duration::from_secs(120), max_frame_bytes: if native { cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?)? } else { 64 << 20 } };
         let row_bytes = self.cfg.hidden * 2;
-        crate::shared::memory_report::release_load_staging(&self.library);
+        crate::shared::memory_report::release_load_staging(&self.library)?;
         // Connect every rank and register full-size buffers now: the first
         // request otherwise pays seconds of connection setup.
         let (h, topk, experts, layer) =

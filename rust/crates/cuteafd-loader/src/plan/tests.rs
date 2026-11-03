@@ -251,7 +251,7 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
     let moe = spec.moe.as_ref().unwrap();
     let geometry = ExpertGeometry { hidden: spec.hidden as u32, experts: moe.experts as u32,
         topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: spec.layers.len() as u32 };
-    let endpoint = SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32 };
+    let endpoint = SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None };
     let (request, response) = endpoint.wire_bytes(geometry).unwrap();
     let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
         depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
@@ -287,9 +287,9 @@ fn mimo_split_links_charge_decode_and_each_prefill_return_slot() {
                 let ingress = match input { MimoExpertInput::Fp8 => SparkIngress::Fp8K32,
                     MimoExpertInput::Bf16 => SparkIngress::Bf16,
                     MimoExpertInput::Bf16Decode => SparkIngress::Fp8K32 };
-                let endpoint = SparkEndpoint { capacity: rows as u32, ingress, ring_depth: None };
+                let endpoint = SparkEndpoint { capacity: rows as u32, ingress, ring_depth: None, partial_reply_bytes: None };
                 let decode = SparkEndpoint { capacity: 64, ingress: if input.bf16(true) { SparkIngress::Bf16 }
-                    else { SparkIngress::Fp8K32 }, ring_depth: Some(1) };
+                    else { SparkIngress::Fp8K32 }, ring_depth: Some(1), partial_reply_bytes: None };
                 assert_eq!(admission::spark_endpoints(rows, input).unwrap(), [decode, endpoint]);
                 let (request, response) = endpoint.wire_bytes(geometry).unwrap();
                 let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
@@ -304,7 +304,9 @@ fn mimo_split_links_charge_decode_and_each_prefill_return_slot() {
                         + geometry.compact_wire_bytes(64, input.bf16(true)).unwrap().0) as u64);
                 let device = admission::transport_reservations(&cfg, 2, 0, rows, waves, 6).unwrap();
                 let intake = device.iter().find(|item| item.name == "transport.spark_intake_planes").unwrap();
-                assert_eq!(intake.bytes, (rows.max(64) as u64 * waves as u64 + 64) * cfg.hidden as u64 * 2 * 6);
+                assert_eq!(intake.bytes, crate::serving_capacity::prefill_return_bytes(
+                    waves as u64, rows.max(64) as u64, 6, cfg.hidden as u64)
+                    + crate::serving_capacity::spark_intake_bytes(1, 6, 64, cfg.hidden as u64));
                 let peer = admission::transport_reservations(&cfg, 2, 1, rows, waves, 6).unwrap();
                 assert!(!peer.iter().any(|item| item.name == "transport.spark_intake_planes"));
             }
@@ -351,7 +353,7 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
                 }
                 let endpoints = layout::spark_endpoints(family, 1) as u64;
                 let ingress = if !native && family == "glm5" { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
-                let endpoint = SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress };
+                let endpoint = SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress, partial_reply_bytes: None };
                 let (frame_request, response) = endpoint.wire_bytes(geometry).unwrap();
                 let request = geometry.compact_wire_bytes(unit as u32,
                     !native && input.checkpoint().spark_input_is_bf16()).unwrap().0;
@@ -419,61 +421,230 @@ fn onboard_all_resolves_to_each_target_models_routed_layer_count() {
     }
 }
 
+fn qwen4_matrix_snapshot() -> (tempfile::TempDir, std::path::PathBuf) {
+    let config = qwen4_config(4);
+    let mut tensors = qwen4_coordinator(&config, false);
+    let (experts, storage) = qwen4_exl3(4, 4);
+    tensors.extend(experts);
+    let dir = snapshot(config, &tensors);
+    write_quantize_config(dir.path(), &storage);
+    let manifest = write_qwen4_exl3_capacities(dir.path(), "45");
+    for (rank, width) in [384, 256].into_iter().enumerate() {
+        for capacity in crate::placement::inventory::exl3_capacities(4096) {
+            let path = dir.path().join(format!("lib/exl3/exl3-qwen4-k45/rtx-tp2-rank{rank}/m{capacity}"));
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&json!({
+                "hidden": 2560, "intermediate": width, "experts": 512, "top_k": 10,
+                "capacity": capacity, "output_dtype": "fp32", "tile": [64, 128, 64, 128],
+                "trellis_lut": {"bytes": 32}, "buffers": {
+                    "scratch": {"allocation": "scratch", "dtype": "f16", "bytes": capacity * width,
+                        "zero_on_create": false}}
+            })).unwrap()).unwrap();
+        }
+    }
+    (dir, manifest)
+}
+
+fn write_mistral_large4_matrix_manifest(root: &Path) -> std::path::PathBuf {
+    let checkpoint = Checkpoint::open(root).unwrap();
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+    let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, &checkpoint).unwrap();
+    let manifest = root.join("PROGRAMS.json");
+    let mut programs = testing::glm_k6_programs(&cfg, &core).unwrap();
+    let entries = programs["programs"].as_array_mut().unwrap();
+    let mut context: Vec<String> = crate::placement::families::glm5::context_program_list(&cfg)
+        .split(", ").map(|name| name.replace("_s*_", "_s2_")).collect();
+    context.extend(crate::families::glm5::core::ml4_split_programs(&cfg, true).unwrap());
+    for name in context {
+        if !entries.iter().any(|entry| entry["name"] == name) {
+            entries.push(json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 256}}));
+        }
+    }
+    std::fs::write(&manifest, programs.to_string()).unwrap();
+    manifest
+}
+
+fn check_concurrency_plan_cell(
+    input: &PlanInput,
+    family: &str,
+    label: &str,
+    gpus: usize,
+    ranks: usize,
+    c: u64,
+    options: &PlanOptions,
+) {
+    let (report, phases) = input.plan_with_timings(options);
+    assert!(phases.total() < std::time::Duration::from_secs(10),
+        "{label} C{c} GPUs={gpus} Sparks={ranks}: {phases:?}");
+    let report = report.unwrap();
+    assert_eq!(report.family.as_deref(), Some(family));
+    if let Err(error) = cuteafd_core::concurrency::validate(family, c) {
+        assert!(!report.fits && !report.placement_supported && !report.executable(),
+            "{label} C{c} GPUs={gpus} Sparks={ranks}: {}", render(&report));
+        assert!(report.hints.iter().any(|hint| hint.what.contains(&error.to_string())),
+            "{label} C{c} GPUs={gpus} Sparks={ranks}: {}", render(&report));
+    } else {
+        let cache = report.cache_requirements.as_ref().unwrap();
+        assert_eq!(u64::from(cache.concurrency), c);
+        assert_eq!(u64::from(cache.state_slots), cuteafd_core::concurrency::state_slots(c));
+        assert!(report.fits && report.placement_supported && report.executable(),
+            "{label} C{c} GPUs={gpus} Sparks={ranks}: {}", render(&report));
+    }
+}
+
 #[test]
 fn boot_concurrency_full_plan_matrix() {
-    let mut fixtures = shared_wave_snapshots();
-    fixtures.push(("deepseek_v41", strict_v41_snapshot(false)));
-    fixtures.push(("mimo_v2", snapshot(mimo_flash_config(), &mimo_flash_tensors())));
-    let kimi = tempfile::tempdir().unwrap();
-    write_kimi_snapshot(kimi.path(), false);
-    fixtures.push(("kimi_k3", kimi));
-    fixtures.push(("step5", families::step5::tests::snapshot("fp8")));
-    let ml4 = tempfile::tempdir().unwrap();
-    write_mistral_large4_snapshot(ml4.path(), None, true);
-    fixtures.push(("mistral_large4", ml4));
-    fixtures.push(("step5", families::step5::tests::exl3_snapshot()));
-    let (dense, dense_options, _, _) = crate::families::qwen3_5::tests::native_planner_fixture();
-    fixtures.push(("qwen3_5", dense));
-    for (family, dir) in fixtures {
-        let input = PlanInput::open(dir.path()).unwrap();
-        for gpus in [1, 2] {
-            for c in [1, 4, 16, 17, 32, 64, 65, 128] {
-                let mut options = if family == "qwen3_5" { dense_options.clone() }
-                    else { wave_plan_options(dir.path(), if family == "deepseek_v41" { gpus * 3 } else { 4 }) };
-                let layout = options.layout.as_mut().unwrap();
-                layout.state_slots = None;
-                layout.rtx_bytes = vec![96 << 30; gpus];
-                layout.concurrency = c;
-                if family == "deepseek_v41" {
-                    layout.workspace_manifest = v41_workspace(dir.path());
-                    layout.native_mtp_layers = 3;
-                    layout.pool_tokens = Some(262_144);
-                }
-                let (report, phases) = input.plan_with_timings(&options);
-                assert!(phases.total() < std::time::Duration::from_secs(10),
-                    "{family} C{c} GPUs={gpus}: {phases:?}");
-                let report = report.unwrap();
-                assert_eq!(report.family.as_deref(), Some(family));
-                if let Err(error) = cuteafd_core::concurrency::validate(family, c) {
-                    assert!(!report.fits && !report.placement_supported);
-                    assert!(report.hints.iter().any(|hint| hint.what.contains(&error.to_string())),
-                        "{family} C{c}: {}", render(&report));
-                } else {
-                    let cache = report.cache_requirements.as_ref().unwrap();
-                    assert_eq!(u64::from(cache.concurrency), c);
-                    assert_eq!(u64::from(cache.state_slots), cuteafd_core::concurrency::state_slots(c));
-                    if family == "deepseek_v41" {
-                        assert!(report.fits && report.placement_supported && report.executable(),
-                            "V4.1 C{c} GPUs={gpus}: {}", render(&report));
+    const ALL_CONCURRENCIES: &[u64] = &[1, 4, 16, 17, 32, 64, 65, 128];
+    struct Case {
+        family: &'static str,
+        label: &'static str,
+        dir: tempfile::TempDir,
+        topologies: &'static [(usize, usize)],
+        concurrencies: &'static [u64],
+        manifest: Option<std::path::PathBuf>,
+        base_options: Option<PlanOptions>,
+    }
+    type Builder = Box<dyn FnOnce() -> Case + Send>;
+    let builders: Vec<Builder> = vec![
+        Box::new(|| {
+            let dir = tempfile::tempdir().unwrap();
+            write_kimi_snapshot(dir.path(), true);
+            let manifest = write_kimi_installed_inventory(dir.path(), false);
+            Case { family: "kimi_k3", label: "kimi_k3", dir, topologies: &[(2, 6)], concurrencies: ALL_CONCURRENCIES, manifest: Some(manifest), base_options: None }
+        }),
+        Box::new(|| {
+            let dir = families::step5::tests::snapshot("fp8");
+            let manifest = testing::step5_native_manifest(dir.path());
+            Case { family: "step5", label: "step5_fp8", dir, topologies: &[(2, 6)], concurrencies: ALL_CONCURRENCIES, manifest: Some(manifest), base_options: None }
+        }),
+        Box::new(|| {
+            let dir = families::step5::tests::exl3_snapshot();
+            let manifest = testing::step5_native_manifest(dir.path());
+            testing::install_step5_exl3_rtx_package(&manifest);
+            Case { family: "step5", label: "step5_exl3", dir, topologies: &[(1, 4), (2, 6)], concurrencies: ALL_CONCURRENCIES, manifest: Some(manifest), base_options: None }
+        }),
+        Box::new(|| {
+            Case { family: "deepseek_v41", label: "deepseek_v41", dir: strict_v41_snapshot(false), topologies: &[(1, 3), (2, 6)], concurrencies: ALL_CONCURRENCIES, manifest: None, base_options: None }
+        }),
+        Box::new(|| {
+            // Supported concurrencies C=1..64 are covered in `boot_concurrency_full_plan_matrix_muse_spark`.
+            let dir = tempfile::tempdir().unwrap();
+            write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
+            let manifest = write_muse_exl3_capacities(dir.path());
+            Case { family: "muse_spark", label: "muse_spark", dir, topologies: &[(1, 4), (2, 4)], concurrencies: &[65, 128], manifest: Some(manifest), base_options: None }
+        }),
+        Box::new(|| {
+            let dir = tempfile::tempdir().unwrap();
+            write_mistral_large4_snapshot(dir.path(), None, true);
+            let manifest = write_mistral_large4_matrix_manifest(dir.path());
+            Case { family: "mistral_large4", label: "mistral_large4", dir, topologies: &[(1, 6), (2, 6)], concurrencies: ALL_CONCURRENCIES, manifest: Some(manifest), base_options: None }
+        }),
+        Box::new(|| {
+            let (dir, manifest) = qwen4_matrix_snapshot();
+            Case { family: "qwen4", label: "qwen4", dir, topologies: &[(1, 0), (2, 0), (1, 4), (2, 4)], concurrencies: ALL_CONCURRENCIES, manifest: Some(manifest), base_options: None }
+        }),
+        Box::new(|| {
+            let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+            Case { family: "glm5", label: "glm5", dir, topologies: &[(1, 4), (2, 4)], concurrencies: ALL_CONCURRENCIES, manifest: None, base_options: None }
+        }),
+        Box::new(|| {
+            let flash = glm5_flash_config(2);
+            let dir = snapshot(flash.clone(), &glm5_flash_tensors(&flash));
+            Case { family: "glm5_flash", label: "glm5_flash", dir, topologies: &[(1, 4), (2, 4)], concurrencies: ALL_CONCURRENCIES, manifest: None, base_options: None }
+        }),
+        Box::new(|| {
+            Case { family: "deepseek_v4", label: "deepseek_v4", dir: v4_snapshot(), topologies: &[(1, 4), (2, 4)], concurrencies: ALL_CONCURRENCIES, manifest: None, base_options: None }
+        }),
+        Box::new(|| {
+            let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+            Case { family: "mimo_v2", label: "mimo_v2", dir, topologies: &[(1, 4), (2, 4)], concurrencies: ALL_CONCURRENCIES, manifest: None, base_options: None }
+        }),
+        Box::new(|| {
+            let (dir, options, _, _) = crate::families::qwen3_5::tests::native_planner_fixture();
+            Case { family: "qwen3_5", label: "qwen3_5", dir, topologies: &[(1, 0)], concurrencies: ALL_CONCURRENCIES, manifest: None, base_options: Some(options) }
+        }),
+    ];
+
+    let queue = std::sync::Mutex::new(builders.into_iter());
+    let seen = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                loop {
+                    let Some(build) = ({
+                        let mut guard = queue.lock().unwrap();
+                        guard.next()
+                    }) else {
+                        break;
+                    };
+                    let case = build();
+                    let family = case.family;
+                    seen.lock().unwrap().insert(family);
+                    let input = PlanInput::open(case.dir.path()).unwrap();
+                    for &(gpus, ranks) in case.topologies {
+                        for &c in case.concurrencies {
+                            let mut options = case.base_options.clone()
+                                .unwrap_or_else(|| wave_plan_options(case.dir.path(), ranks));
+                            if family == "qwen4" && gpus == 2 && ranks == 0 {
+                                options.attention_placement = Some(AttentionPlacement::Layers);
+                            }
+                            if family == "step5" {
+                                options.draft_ownership = Some(spec::DraftOwnership::None);
+                            }
+                            let layout = options.layout.as_mut().unwrap();
+                            layout.state_slots = None;
+                            layout.rtx_bytes = vec![96 << 30; gpus];
+                            layout.concurrency = c;
+                            if let Some(manifest) = &case.manifest {
+                                layout.workspace_manifest = Some(manifest.clone());
+                            }
+                            if family == "deepseek_v41" {
+                                layout.workspace_manifest = v41_workspace(case.dir.path());
+                                layout.native_mtp_layers = 3;
+                                layout.pool_tokens = Some(262_144);
+                            } else if family == "kimi_k3" {
+                                layout.context_tokens = 262_144;
+                                layout.pool_tokens = Some(262_144);
+                            } else if family == "step5" {
+                                layout.context_tokens = 262_144;
+                                layout.pool_tokens = Some(262_144);
+                                layout.prefix_slots = None;
+                            }
+                            check_concurrency_plan_cell(&input, family, case.label, gpus, ranks, c, &options);
+                        }
                     }
-                    if !report.fits || !report.placement_supported {
-                        let memory = report.memory_layout.as_ref().unwrap();
-                        assert!(!report.hints.is_empty() || !memory.notes.is_empty()
-                            || memory.devices.iter().any(|device| device.used_bytes() > device.capacity_bytes),
-                            "{family} C{c}: refusal must name its cause");
-                    }
                 }
-            }
+            });
+        }
+    });
+    let seen = seen.into_inner().unwrap();
+    for family in ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2",
+        "qwen4", "qwen3_5", "kimi_k3", "step5", "muse_spark", "mistral_large4"] {
+        assert!(seen.contains(family), "missing concurrency family {family}");
+    }
+    for entry in family::registry() {
+        let id = entry.id();
+        if cuteafd_core::concurrency::validate(id, 0).unwrap_err().cause != "boot-time concurrency" {
+            assert!(seen.contains(id), "missing declared concurrency family {id}");
+        }
+    }
+}
+
+#[test]
+fn boot_concurrency_full_plan_matrix_muse_spark() {
+    let dir = tempfile::tempdir().unwrap();
+    write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
+    let manifest = write_muse_exl3_capacities(dir.path());
+    let input = PlanInput::open(dir.path()).unwrap();
+    for (gpus, ranks) in [(1, 4), (2, 4)] {
+        for c in [1, 4, 16, 17, 32, 64, 65, 128] {
+            let mut options = wave_plan_options(dir.path(), ranks);
+            let layout = options.layout.as_mut().unwrap();
+            layout.state_slots = None;
+            layout.rtx_bytes = vec![96 << 30; gpus];
+            layout.concurrency = c;
+            layout.workspace_manifest = Some(manifest.clone());
+            check_concurrency_plan_cell(&input, "muse_spark", "muse_spark", gpus, ranks, c, &options);
         }
     }
 }
@@ -920,6 +1091,15 @@ fn host_automatic_quota_depends_on_concurrency_not_device_entries() {
 
 #[test]
 fn host_media_quota_is_charged_only_for_supported_loaded_towers() {
+    use super::encoder::{EncoderKind, EncoderPlacement};
+    let placement = |mode| Some(EncoderPlacement {
+        kind: match mode {
+            MediaMode::Off => EncoderKind::Off,
+            MediaMode::Spark(_) => EncoderKind::Spark { rank: 0 },
+            _ => EncoderKind::Rtx { gpu: 0 },
+        },
+        weights: 1024, scratch: 512, replicas: vec![], reason: "admitted fixture".into(), shortfall: 0,
+    });
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
     let input = PlanInput::open(dir.path()).unwrap();
     let mut report = input.plan(&PlanOptions::default()).unwrap();
@@ -937,11 +1117,23 @@ fn host_media_quota_is_charged_only_for_supported_loaded_towers() {
     ] {
         report.vision = vision;
         report.audio = audio;
+        report.encoder = placement(vision);
+        report.audio_encoder = placement(audio);
         options.media_cache_bytes = quota;
         layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
         let media: u64 = report.host_ledger.as_ref().unwrap().items.iter()
             .filter(|item| item.group == "media/embedding-cache").map(|item| item.bytes).sum();
         assert_eq!(media, expected);
+    }
+    // Requested media without an admitted tower cannot allocate a runtime cache.
+    report.vision = MediaMode::Rtx(Some(0));
+    report.audio = MediaMode::Rtx(Some(0));
+    for admitted in [None, placement(MediaMode::Off)] {
+        report.encoder = admitted.clone();
+        report.audio_encoder = admitted;
+        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        assert!(!report.host_ledger.as_ref().unwrap().items.iter()
+            .any(|item| item.group == "media/embedding-cache"));
     }
 }
 
@@ -1393,8 +1585,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                         // lanes plus each further prefill slot), as serve opens them.
                         let endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None,
                             capacity: report.prefill_unit_rows.unwrap() as u32,
-                            ingress
-                        }; report.prefill_waves.unwrap().max(2) as usize];
+                            ingress, partial_reply_bytes: None }; report.prefill_waves.unwrap().max(2) as usize];
                         assert_eq!(rings.bytes, endpoints.iter().map(|endpoint| endpoint.ring_bytes(
                             cuteafd_core::ExpertGeometry::DEEPSEEK_V41, cuteafd_core::SparkRings {
                                 max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20,
@@ -2212,6 +2403,29 @@ fn audio_defaults_off_without_qualified_bundle_and_explicit_placement_refuses() 
 }
 
 #[test]
+fn declared_audio_kind_is_checkpoint_native_and_invalid_towers_never_disable_auto() {
+    use crate::media::AudioTowerKind;
+    let cases = [
+        (json!({"model_type":"muse_spark", "audio_config":{"model_type":"muse_spark_audio"}}),
+            Some(AudioTowerKind::MusePcm), "MusePcm"),
+        (json!({"model_type":"mimo_v2", "audio_config":{"audio_channels":20}}),
+            Some(AudioTowerKind::MimoRvq), "MimoRvq"),
+        (json!({"model_type":"mimo_v2", "audio_config":{"model_type":"unknown_audio"}}),
+            None, "unknown_audio"),
+        (json!({"model_type":"qwen4_exp", "audio_config":{}}), None, "qwen4_exp"),
+    ];
+    for (config, kind, named) in cases {
+        let declared = AudioTowerKind::from_config(&config);
+        if let Some(kind) = kind { assert_eq!(declared.unwrap(), Some(kind)); }
+        else { assert!(declared.unwrap_err().contains(named)); }
+        let dir = snapshot(config, &[]);
+        let error = resolve_audio(MediaMode::Auto, dir.path()).unwrap_err().to_string();
+        assert!(error.contains(named), "{error}");
+        assert_eq!(resolve_audio(MediaMode::Off, dir.path()).unwrap(), MediaMode::Off);
+    }
+}
+
+#[test]
 #[ignore = "slow tier: scans mounted multimodal checkpoint inventories (>60s); cpu-gate --slow"]
 fn mounted_mimo_audio_inventory_is_independently_admitted() {
     use encoder::EncoderKind;
@@ -2592,7 +2806,8 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
             let notes = layout.notes.clone();
             let device = layout.devices.remove(0);
             let steps = device.items.iter().find(|i| i.group == "steps").unwrap_or_else(|| panic!("{gib} {context}: {notes:?}"));
-            let intake = (2 * 4096 + 64) * 2 * cfg.dim as u64 * 2;
+            let intake = 2 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(2 * 4096 * cfg.dim as u64 * 2).unwrap()
+                + 2 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(64 * cfg.dim as u64 * 2).unwrap();
             assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Formula));
             let records = device.items.iter().find(|i| i.group == "records").unwrap();
             let cache = crate::serving_capacity::deepseek_v4_cache_geometry(&cfg, 1, 4096, 0).unwrap();
@@ -3149,7 +3364,8 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             let slots = 2 * working.prefill_lanes;
             assert_eq!(charged("route exchange"), if expected_rtx == 0 { 0 } else {
                 slots * (4096 * 8 * 8) + ((slots + 1) * 16).max(256) });
-            assert_eq!(charged("Spark intake"), if rank == 0 && spark { 268435456 } else { 0 });
+            assert_eq!(charged("Spark intake"), if rank == 0 && spark { 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
+                working.prefill_lanes * 4096 * cfg.hidden as u64 * 2).unwrap() } else { 0 });
             assert!(request.fixed.iter().filter(|d| d.gpu as usize == rank && d.category == Category::Workspace)
                 .map(|d| d.bytes).sum::<u64>() > 0);
         }
@@ -3290,8 +3506,8 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
         let engine = glmf_step_workspaces(&cfg, 3, rows, decode_rows, &shape,
             glmf_step_scratch(&lookup, &cfg, Default::default(), decode_rows, true).unwrap(),
             glmf_step_scratch(&lookup, &cfg, Default::default(), rows, false).unwrap()).device_bytes();
-        let intake = crate::serving_capacity::spark_intake_bytes(3, 4, intake_rows, 4096);
-        assert_eq!(intake, 3 * 4 * intake_rows * 4096 * 2);
+        let intake = crate::serving_capacity::prefill_return_bytes(3, intake_rows, 4, 4096);
+        assert_eq!(intake, 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(3 * intake_rows * 4096 * 2).unwrap());
         assert_eq!(item(&lane(rows, decode_rows), "steps"), Some((Category::Workspace, engine, Basis::Formula)),
             "{rows} prefill rows, {decode_rows} decode rows");
     }

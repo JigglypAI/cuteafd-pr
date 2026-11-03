@@ -559,6 +559,25 @@ impl<'a> Exl3Tp2<'a> {
         package: &Path, layers: Vec<usize>, max_rows: usize, budget: usize,
         selection: RtxSelectionPolicy,
     ) -> Result<Exl3Tp2Weights<'a>> {
+        Self::whole_weights(device, catalog, package, layers, max_rows, budget, selection, None)
+    }
+
+    /// Binds committed whole-layer payloads with the mount path's package and admission checks.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pushed_whole_weights(
+        device: Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
+        package: &Path, layers: Vec<usize>, max_rows: usize, budget: usize,
+        selection: RtxSelectionPolicy, pushed: Vec<Exl3Weights<'a>>,
+    ) -> Result<Exl3Tp2Weights<'a>> {
+        Self::whole_weights(device, catalog, package, layers, max_rows, budget, selection, Some(pushed))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn whole_weights(
+        device: Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
+        package: &Path, layers: Vec<usize>, max_rows: usize, budget: usize,
+        selection: RtxSelectionPolicy, pushed: Option<Vec<Exl3Weights<'a>>>,
+    ) -> Result<Exl3Tp2Weights<'a>> {
         validate_layers(&layers, 0)?;
         let geometry = expert_geometry();
         let row_policy = Exl3RowPolicy::for_geometry(geometry);
@@ -576,14 +595,28 @@ impl<'a> Exl3Tp2<'a> {
         let label = format!("experts/whole expert layers {layers:?}");
         let weights = device.own(|| {
             let _scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
-            let mut weights = Vec::with_capacity(layers.len());
-            let mut remaining = budget.checked_sub(workspace_bytes).context("EXL3 whole workspace exceeds budget")?;
-            for &layer in &layers {
-                let weight = Exl3Weights::load(device.library, catalog,
-                    ExpertLayer::BackboneFull { layer }, remaining)?;
-                remaining -= weight.budget.resident_bytes;
-                weights.push(weight);
-            }
+            let weights = match pushed {
+                Some(weights) => {
+                    ensure!(weights.len() == plans.len() && weights.iter().zip(&layers).zip(&plans)
+                        .all(|((weight, &layer), plan)|
+                            matches!(weight.layout.layer, cuteafd_loader::V41Exl3Layer::Backbone(id) if id == layer)
+                            && weight.layout.world == 1 && weight.layout.rank == 0
+                            && weight.budget.resident_bytes == plan.resident_bytes),
+                        "pushed whole EXL3 weights differ from the admitted inventory and footprint");
+                    weights
+                }
+                None => {
+                    let mut weights = Vec::with_capacity(layers.len());
+                    let mut remaining = budget.checked_sub(workspace_bytes).context("EXL3 whole workspace exceeds budget")?;
+                    for &layer in &layers {
+                        let weight = Exl3Weights::load(device.library, catalog,
+                            ExpertLayer::BackboneFull { layer }, remaining)?;
+                        remaining -= weight.budget.resident_bytes;
+                        weights.push(weight);
+                    }
+                    weights
+                }
+            };
             Ok(Rc::new(weights))
         })?;
         Ok(Exl3Tp2Weights { device, rank: 0, shard: RtxShard::Whole, layers, geometry,
@@ -708,6 +741,44 @@ impl<'a> Exl3Tp2<'a> {
             .iter()
             .map(|weight| weight.budget.resident_bytes)
             .sum()
+    }
+}
+
+impl Exl3Tp2<'_> {
+    /// Per-expert partial replies of `layer` for `rows` rows (families with a
+    /// per-expert output norm, combined by the coordinator): the EXL3 core on
+    /// this rank's half, then the shared partial-reply epilogue writing every
+    /// routed (row, slot)'s unweighted BF16 partial into `out` (`plan`'s BF16
+    /// region; RTX holders reply BF16 at every width). The same core and
+    /// epilogue the Spark worker runs, so the bytes are the Sparks'.
+    ///
+    /// # Safety
+    /// `wire` and `routes` are this rank's FP8 K32 rows and route ids/weights,
+    /// written on `stream` before this call; `out` is an exclusive device
+    /// allocation of at least the plan's payload, live through the stream.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn enqueue_partials(&mut self, layer: usize, rows: usize, wire: *mut c_void, routes: Routes,
+        epilogue: &mut crate::shared::experts::exl3::partial::PartialEpilogue<'_>,
+        plan: &cuteafd_transport::PartialReplyPlan, out: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
+        ensure!(self.layers.contains(&layer) && (1..=self.max_rows).contains(&rows) && plan.regions.len() == rows,
+            "EXL3 TP2 partial layer/rows not resident");
+        ensure!(!wire.is_null() && !routes.ids.is_null() && !routes.weights.is_null(), "null EXL3 TP2 partial input");
+        let buffer = |ptr, width| CuteafdDeviceBuffer { ptr, bytes: rows * width, device_id: self.device.id, flags: 0 };
+        let inputs = [buffer(wire, self.geometry.hidden as usize * 33 / 32),
+            buffer(routes.ids, self.geometry.topk as usize * 4), buffer(routes.weights, self.geometry.topk as usize * 4)];
+        let ids = inputs[1];
+        let selected = self.execution_index(rows)?;
+        let resident = super::resident_index(&self.layers, layer)?;
+        let (topk, width) = (self.geometry.topk as usize, self.geometry.hidden as usize);
+        self.device.run(|| {
+            let executions = self.executions.as_mut().expect("initialized EXL3 rank");
+            // SAFETY: the caller's inputs and output contract; the core's sources are
+            // this execution's own, read by the epilogue on the same stream.
+            unsafe {
+                let sources = executions[selected].launch_layer_core(resident, inputs, rows, stream)?;
+                epilogue.launch(plan, rows, topk, width, sources, ids, out, stream)
+            }
+        })
     }
 }
 

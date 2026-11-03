@@ -805,6 +805,18 @@ extern "C" cuteafd_status_t cuteafd_cuda_get_device(int* device_id) {
 #endif
 }
 
+extern "C" cuteafd_status_t cuteafd_cuda_stream_device(void* cuda_stream, int* device_id) {
+  if (device_id == nullptr) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "stream device output is null");
+  *device_id = -1;
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  const auto err = cudaStreamGetDevice(reinterpret_cast<cudaStream_t>(cuda_stream), device_id);
+  if (err != cudaSuccess) return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaStreamGetDevice failed", err);
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "stream device query requires CUDA");
+#endif
+}
+
 extern "C" cuteafd_status_t cuteafd_cuda_set_device(int device_id) {
   if (device_id < 0) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "negative CUDA device");
 #if CUTEAFD_NATIVE_ENABLE_CUDA
@@ -3813,14 +3825,30 @@ cuteafd_status_t register_device_dmabuf_current(ibv_pd* pd, void* ptr, size_t by
   if (offset > size || bytes > size - offset) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing range exceeds its allocation");
   }
-  int fd = -1;
-  result = cuMemGetHandleForAddressRange(&fd, base, size, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
-  if (result != CUDA_SUCCESS || fd < 0) {
-    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
-                "cuMemGetHandleForAddressRange(DMA_BUF_FD) failed (" +
-                    std::to_string(static_cast<int>(result)) + ")");
+  // Export only the aligned interior range, never padding or a neighbor's
+  // allocation. The raw cudaMalloc may begin at a sub-page allocator offset.
+  const long host_page = sysconf(_SC_PAGESIZE);
+  const CUdeviceptr export_base = reinterpret_cast<CUdeviceptr>(ptr);
+  if (host_page <= 0 || export_base % static_cast<size_t>(host_page) != 0 ||
+      bytes == 0 || bytes % static_cast<size_t>(host_page) != 0) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing range is not host-page aligned; base=" +
+        std::to_string(export_base) + " bytes=" + std::to_string(bytes) + " host page=" + std::to_string(host_page));
   }
-  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, offset, bytes, reinterpret_cast<uint64_t>(ptr), fd,
+  int fd = -1;
+  result = cuMemGetHandleForAddressRange(&fd, export_base, bytes, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+  if (result != CUDA_SUCCESS || fd < 0) {
+    const char* name = "unknown";
+    cuGetErrorName(result, &name);
+    int device = -1;
+    cudaGetDevice(&device);
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+                "cuMemGetHandleForAddressRange(DMA_BUF_FD) failed (CUDA " +
+                    std::to_string(static_cast<int>(result)) + " " + (name ? name : "unknown") +
+                    "); device=" + std::to_string(device) + " allocation base=" + std::to_string(base) +
+                    " bytes=" + std::to_string(size) + " requested ptr=" +
+                    std::to_string(reinterpret_cast<uint64_t>(ptr)) + " bytes=" + std::to_string(bytes));
+  }
+  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, 0, bytes, reinterpret_cast<uint64_t>(ptr), fd,
                                  IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_RELAXED_ORDERING);
   const int saved_errno = errno;
   close(fd);
@@ -5544,15 +5572,6 @@ extern "C" cuteafd_status_t cuteafd_cuda_linear_bf16_cublas_async(
     const uint16_t*, const uint16_t*, const uint16_t*, uint16_t*, size_t, size_t, size_t, void*) {
   return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
               "CUDA BF16 cuBLAS linear projection kernel is unavailable in this build");
-}
-
-extern "C" cuteafd_status_t
-cuteafd_cuda_linear_bf16_m1_parity_batched_cublaslt_async(
-    const uint16_t*, const uint16_t*, uint16_t*, size_t, size_t, size_t,
-    void*) {
-  return fail(
-      CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-      "CUDA BF16 parity-batched cuBLASLt projection kernel is unavailable in this build");
 }
 
 extern "C" cuteafd_status_t cuteafd_cuda_quantize_bf16_w8a16_group256_async(
