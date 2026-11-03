@@ -228,7 +228,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         pending_code_bytes: 0, max_context: shape.context_tokens,
         requested_pool: options.pool_tokens.filter(|&n| n > 0),
         spark_ranks: match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 },
-        startup_graph_modes: Some((shape.concurrency.min(16) as usize, true)),
+        startup_graph_modes: Some((shape.concurrency as usize, true)),
     };
     let placement = crate::placement::families::qwen4::placement(&inputs)?;
     report.prefill_span_rows = Some(span);
@@ -374,7 +374,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
         tp2_workspace: workspace, pending_code_bytes: [0; 2], mark_slots: marks, max_context: context,
         requested_pool: options.pool_tokens.filter(|&n| n > 0), spark_ranks: 0,
         onboard: options.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto),
-        startup_graph_modes: Some((concurrency.min(16) as usize, true)),
+        startup_graph_modes: Some((concurrency as usize, true)),
     };
     let placement = qwen4::dual_placement(&inputs).context("solving Qwen owner ranges")?;
     for (rank, device) in devices.iter_mut().enumerate() {
