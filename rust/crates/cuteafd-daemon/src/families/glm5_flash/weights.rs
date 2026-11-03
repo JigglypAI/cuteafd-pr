@@ -892,15 +892,11 @@ impl<'a> GlmfLoader<'a> {
     /// is enabled by the split setup).
     fn replicate(&self, first: DeviceAllocation<'a>) -> Result<Vec<DeviceAllocation<'a>>> {
         let mut out = vec![first];
-        for (rank, peer) in self.peers.iter().enumerate() {
+        for rank in 0..self.peers.len() {
             let source = out[0].buffer;
             out.push(self.on_rank(rank + 1, || {
                 let copy = DeviceAllocation::new(self.library, source.bytes)?;
-                // SAFETY: both allocations hold `source.bytes`; the peer stream drains before return.
-                unsafe {
-                    self.library.copy_d2d_async(copy.buffer, source, source.bytes, peer.stream)?;
-                    self.library.cuda_stream_synchronize(peer.stream)?;
-                }
+                self.dense.peer_copy(source, copy.buffer, source.bytes)?;
                 Ok(copy)
             })?);
         }

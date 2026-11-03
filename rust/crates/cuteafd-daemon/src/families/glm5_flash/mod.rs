@@ -1975,10 +1975,9 @@ impl Opened {
                 let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
                 planning.model(&self.cfg, &execution)?
             };
-            let (operands, steps) = load.sink.as_ref().context("push sink")?.take();
-            let dense = crate::shared::experts::rtx::dense::plan_ranks(&args.snapshot, operands.clone(),
-                steps.clone(), &devices, sparks)?;
-            Ok((model, operands, steps, dense))
+            let records = load.sink.as_ref().context("push sink")?.take_all();
+            let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records.clone(), &devices, sparks)?;
+            Ok((model, records, dense))
         };
         // Each GPU's TP2 halves' resident budget (admitted minus workspace), when any.
         let tp2_budget_plan = || -> Result<Option<Vec<usize>>> {
@@ -2078,7 +2077,7 @@ impl Opened {
             let load_embedding = || embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(
                 &self.library, embed.clone(), args.token_io.embed_placement, || Ok(())));
             let (pushed, loaded) = match coordinator_push.take() {
-                Some((push, sparks, devices, (model, operands, steps, dense))) => {
+                Some((push, sparks, devices, (model, records, dense))) => {
                     // The planned dense operands (and the TP2 halves) arrive in one
                     // group while the embedding loads beside.
                     let catalog = self.experts.as_ref().filter(|_| !tp2_layers.is_empty());
@@ -2090,10 +2089,10 @@ impl Opened {
                     if pushed.is_none() {
                         let rank_stream = |device: i32| if device == args.device { stream }
                             else { peer_stream.map_or(stream, |(_, s)| s) };
-                        crate::shared::experts::rtx::dense::fill_by_mount(&self.library, &operands, &steps, rank_stream)?;
+                        crate::shared::experts::rtx::dense::fill_records_by_mount(&self.library, &records, rank_stream)?;
                     }
                     split.log(if pushed.is_some() { "glm5_flash dense push" } else { "glm5_flash dense mount fill" });
-                    tracing::info!(pushed = pushed.is_some(), operands = operands.len(), steps = steps.len(),
+                    tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(), steps = records.steps.len(),
                         "GLM Flash coordinator dense operands landed");
                     let pushed = match pushed {
                         Some(ranks) if !tp2_layers.is_empty() => Some(<[_; 2]>::try_from(

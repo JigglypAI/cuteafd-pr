@@ -214,7 +214,7 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
     ensure!(largest <= STEP_BYTES, "a step stages {largest} bytes");
     for gpu in 0..2 {
         let mine = Records { operands: records.operands.iter().filter(|o| o.device == gpu).cloned().collect(),
-            steps: records.steps.iter().filter(|s| s.device == gpu).cloned().collect(), finishes: Vec::new() };
+            steps: records.steps.iter().filter(|s| s.device == gpu).cloned().collect(), ..Default::default() };
         crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: gpu },
             None, &root, sockets.path(), &mine, None, 0, gpu as usize)?;
     }
@@ -388,7 +388,7 @@ fn recorded_k6_operands_match_the_host_packer_on_mount_and_push() -> Result<()> 
     let sockets = tempfile::tempdir_in(fixture.directory())?;
     for gpu in 0..2 {
         let mine = Records { operands: records.operands.iter().filter(|o| o.device == gpu).cloned().collect(),
-            steps: records.steps.iter().filter(|s| s.device == gpu).cloned().collect(), finishes: Vec::new() };
+            steps: records.steps.iter().filter(|s| s.device == gpu).cloned().collect(), ..Default::default() };
         crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: gpu },
             None, root.path(), sockets.path(), &mine, None, 0, gpu as usize)?;
     }
