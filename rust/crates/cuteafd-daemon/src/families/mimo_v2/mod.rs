@@ -1417,8 +1417,9 @@ impl Opened {
             let actual = cuteafd_ffi::memory_ledger::snapshot()
                 .by_owner(cuteafd_ffi::memory_ledger::Space::Device, args.device)
                 .get(label.as_str()).copied().unwrap_or(0);
-            let planned = capacity as usize * waves * peers.len() * self.cfg.hidden * 2;
-            anyhow::ensure!(actual == planned,
+            let planned = cuteafd_loader::serving_capacity::prefill_return_bytes(
+                waves as u64, capacity as u64, peers.len() as u64, self.cfg.hidden as u64);
+            anyhow::ensure!(actual as u64 == planned,
                 "MiMo {label}: allocated {actual} device bytes != planned {planned}");
             Ok(link)
         };
