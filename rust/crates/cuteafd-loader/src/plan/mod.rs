@@ -1204,8 +1204,9 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     for shard in shards {
         for meta in crate::read_safetensors_metadata(&checkpoint.snapshot.join(shard))? {
             if selected_tower(&meta.name) && !present.contains(&meta.name) {
-                anyhow::ensure!(checkpoint.weight_map.get(&meta.name) == Some(shard),
-                    "media tensor {} appears in unexpected shard {shard}", meta.name);
+                if checkpoint.weight_map.get(&meta.name) != Some(shard) {
+                    return Err(anyhow::anyhow!("media tensor {} appears in unexpected shard {shard}", meta.name).into());
+                }
                 additional.push(checkpoint::CheckpointTensor { shard: shard.clone(), meta });
             }
         }
