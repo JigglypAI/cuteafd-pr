@@ -671,6 +671,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 cuteafd_engine::prefix::AdmissionPoll::Ready(admit) => admit,
                 cuteafd_engine::prefix::AdmissionPoll::Empty => match media.poll(|prompt| prompt.job.events.is_closed()) {
                     MediaPoll::Ready(ready) => {
+                        if let Some(probe) = &ready.job().job.probe {
+                            let (encoded, ms) = ready.encoding();
+                            probe.encoding(encoded, ms);
+                        }
                         let (prompt, request_media) = ready.into_parts();
                         Admit { prompt, media: request_media, constraint: None }
                     }

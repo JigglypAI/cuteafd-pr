@@ -695,6 +695,10 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                     continue;
                 }
             };
+            if let Some(probe) = &ready.job().job.probe {
+                let (encoded, ms) = ready.encoding();
+                probe.encoding(encoded, ms);
+            }
             let (super::media::Prompt { job, tokens, keys }, request_media) = ready.into_parts();
             job.prefix_cache_source.set(resume, admitted.source.as_ref().is_some_and(|source| source.host));
             probe::admitted(&job.probe, "mimo_v2", &tokens, resume);

@@ -934,6 +934,10 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     continue;
                 }
             };
+            if let Some(probe) = &ready.job().job.probe {
+                let (encoded, ms) = ready.encoding();
+                probe.encoding(encoded, ms);
+            }
             let (Prompt { job, tokens, keys }, request_media) = ready.into_parts();
             admissions += 1;
             let mut placement = admitted.placement;
