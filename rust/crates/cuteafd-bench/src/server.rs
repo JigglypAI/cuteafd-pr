@@ -224,10 +224,14 @@ pub fn configuration(context: &ServerContext, hardware: &Hardware) -> Configurat
 /// Everything a report says about the server (`model` from `/v1/models`).
 pub fn server_info(model: &str) -> ServerInfo {
     let context = context::get();
-    let hardware = hardware(&context.settings);
-    let configuration = configuration(&context, &hardware);
+    server_info_from_context(model, &context, hardware(&context.settings))
+}
+
+fn server_info_from_context(model: &str, context: &ServerContext, hardware: Hardware) -> ServerInfo {
+    let configuration = configuration(context, &hardware);
     ServerInfo {
         model: model.to_string(),
+        executor: (!context.command.is_empty()).then(|| context.command.clone()),
         family: context.family.clone(),
         revision: context.snapshot.as_deref().and_then(revision),
         build: build_info(),
@@ -279,6 +283,42 @@ pub fn fingerprint(info: &ServerInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loaded_config_identity_is_independent_of_executor_in_reports_and_probes() {
+        let glm = cuteafd_loader::families::glm5::GlmDsaConfig::from_hf(
+            &cuteafd_loader::plan::testing::glm5_config()).unwrap();
+        let mimo = cuteafd_loader::families::mimo_v2::MimoV2Config::from_hf(
+            &cuteafd_loader::plan::testing::mimo_flash_config()).unwrap();
+        assert_eq!(glm.family_id(), "glm5");
+        assert_eq!(mimo.family_id(), "mimo_v2");
+        for (executor, loaded_family) in [("serve-glm", glm.family_id()), ("serve-mimo", mimo.family_id())] {
+            let mut context = ServerContext { command: executor.into(), ..Default::default() };
+            assert!(context.family.is_none());
+            context.set_family(loaded_family);
+            let report = server_info_from_context("served-alias", &context, Hardware::default());
+            assert_eq!(report.family.as_deref(), Some(loaded_family));
+            assert_eq!(report.executor.as_deref(), Some(executor));
+            let probe = crate::runner::probe_server("served-alias", &context);
+            assert_eq!(probe["family"], loaded_family);
+            assert_eq!(probe["executor"], executor);
+            assert_eq!(probe["model"], "served-alias");
+            // A shared executor can serve a different canonical checkpoint family.
+            context.set_family("other_checkpoint_family");
+            assert_eq!(server_info_from_context("served-alias", &context, Hardware::default())
+                .family.as_deref(), Some("other_checkpoint_family"));
+            assert_eq!(crate::runner::probe_server("served-alias", &context)["executor"], executor);
+        }
+    }
+
+    #[test]
+    fn legacy_reports_without_executor_still_deserialize() {
+        let report = ServerInfo { model: "legacy".into(), ..Default::default() };
+        let mut value = serde_json::to_value(report).unwrap();
+        value.as_object_mut().unwrap().remove("executor");
+        let loaded: ServerInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.executor, None);
+    }
 
     fn s(name: &str, value: &str, default: Option<&str>, source: &str) -> Setting {
         Setting { name: name.into(), value: Some(value.into()), default: default.map(str::to_string), source: source.into() }

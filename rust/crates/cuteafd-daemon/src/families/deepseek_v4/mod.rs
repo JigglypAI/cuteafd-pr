@@ -366,6 +366,7 @@ pub(crate) fn load(args: &EngineArgs) -> Result<Loaded> {
         other => anyhow::bail!("not a DeepSeek V4 checkpoint (expert family {other:?})"),
     };
     let cfg = DeepseekV4Config::read(&args.snapshot, 1)?;
+    cuteafd_bench::context::set_family(cfg.family_id());
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
     library.cuda_set_device(args.device)?;
     let mut manifest = serde_json::from_str(&std::fs::read_to_string(&args.manifest)

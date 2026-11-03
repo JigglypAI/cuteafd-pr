@@ -211,6 +211,7 @@ fn with_backend<T>(args: &ServeArgs,
     let startup = std::time::Instant::now();
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, args.mtp > 0)?;
     let cfg = Config::parse(&checkpoint)?;
+    cuteafd_bench::context::set_family(cfg.family_id());
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     catalog.select_draft(DraftOwnership::None)?;
     ensure!(catalog.routed_experts().geometry()? == ExpertGeometry::STEP5, "Step-5 routed geometry mismatch");

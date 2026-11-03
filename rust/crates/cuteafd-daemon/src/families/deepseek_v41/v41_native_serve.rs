@@ -354,6 +354,7 @@ fn worker(
     super::graph_policy::set_prefill_rows(args.prefill_batch_tokens)?;
     let mut catalog = cuteafd_loader::read_official_v41_catalog(&args.snapshot,
     )?;
+    cuteafd_bench::context::set_family(catalog.config().family_id());
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("deepseek_v41",
         if args.dspark { "dspark" } else { "off" }))?;
     let topology = crate::shared::spark_topology::resolve(
