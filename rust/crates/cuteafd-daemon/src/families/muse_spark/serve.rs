@@ -150,6 +150,7 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
     let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
+    cuteafd_bench::context::set_family(cfg.family_id());
     let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
     let device_ids = args.devices();
     let gpus = device_ids.len();
