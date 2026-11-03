@@ -1422,7 +1422,7 @@ impl Opened {
                 "MiMo {label}: allocated {actual} device bytes != planned {planned}");
             Ok(link)
         };
-        crate::shared::memory_report::release_load_staging(&self.library);
+        crate::shared::memory_report::release_load_staging(&self.library)?;
         // Decode keeps fixed graph-safe planes and the probed landing path;
         // only prefill owns overlapping waves and per-slot GPU landing planes.
         let mut decode = link(0, 1, &decode_warm)?;
