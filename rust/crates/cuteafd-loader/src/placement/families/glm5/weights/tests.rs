@@ -15,7 +15,7 @@ fn ordinary(
 ) -> WeightInventory {
     let dir = tempfile::tempdir().unwrap();
     write_snapshot(dir.path(), config, tensors, None);
-    let checkpoint = Checkpoint::inventory(dir.path()).unwrap();
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
     WeightInventory::from_checkpoint(&checkpoint, ranks, 2, owners, bf16, false, embedding).unwrap()
 }
 
@@ -201,7 +201,7 @@ fn checkpoint_owners_refuse_missing_sources_and_invalid_block_splits() {
     let dir = tempfile::tempdir().unwrap();
     let check = |tensors: &[Tensor], ranks, owners: Option<&[u8]>, home| {
         write_snapshot(dir.path(), &config, tensors, None);
-        let checkpoint = Checkpoint::inventory(dir.path()).unwrap();
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
         WeightInventory::from_checkpoint(&checkpoint, ranks, 2, owners, false, false, home)
     };
     assert!(check(&tensors, 0, None, EmbeddingHome::Device(0)).is_err());

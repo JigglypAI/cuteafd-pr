@@ -201,7 +201,7 @@ fn retained_weight_owners_match_actual_loader_and_physical_embedding() -> Result
             }
         }
         let cfg = GlmDsaConfig::from_hf(&config)?;
-        let checkpoint = cuteafd_loader::plan::Checkpoint::inventory(root.path())?;
+        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(root.path(), false, false)?;
         let owners = owned.then_some([0, 1]);
         let home = if host { EmbeddingHome::HostPinned } else { EmbeddingHome::Device(0) };
         let mut inventory = WeightInventory::from_checkpoint(&checkpoint, ranks, cfg.layers,
