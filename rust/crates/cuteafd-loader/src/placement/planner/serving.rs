@@ -153,10 +153,11 @@ mod tests {
             capacity: 64, vocab: 33, device_sampling: true}, prefix};
         let exact = serving.allocations().unwrap();
         assert_eq!(exact.len(), 26);
-        let contract = Contract {page_rows: 64, maximum_pages: 16, gpus: 1, variables: vec![], requires: vec![],
-            components: serving.components(16).unwrap()};
+        let contract = Contract {page_rows: 64, maximum_pages: 16, gpus: 1,
+            variables: vec![Variable::Prefill(vec![PrefillShape {rows: 64, waves: 1}]), Variable::Lanes(vec![1])],
+            requires: vec![], components: serving.components(16).unwrap()};
         for pages in [1, 8, 16] {
-            assert_eq!(contract.facts(&[], pages).unwrap().allocations, exact);
+            assert_eq!(contract.facts(&[0, 0], pages).unwrap().allocations, exact);
         }
         assert!(serving.components(0).is_err());
     }
