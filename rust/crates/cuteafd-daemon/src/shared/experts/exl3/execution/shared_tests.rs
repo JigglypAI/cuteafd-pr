@@ -90,6 +90,57 @@ fn shared_capacity_scratch_matches_private_and_graph_replay() -> Result<()> {
     Ok(())
 }
 
+fn verify_workspace_receipts(states: &[Exl3Execution<'_>], manifests: &[serde_json::Value]) -> Result<()> {
+    use cuteafd_loader::placement::planner::{self, *};
+    let lifetime = Lifetime { first: Phase::Warmup, last: Phase::Growth };
+    let layout = cuteafd_loader::serving_capacity::Exl3WorkspaceLayout::from_manifests(
+        manifests, true)?;
+    let facts = Facts {
+        allocations: layout.allocations("expert.test", Location::coordinator(1), lifetime),
+        deferred: vec![], sequential: vec![], allowances: vec![],
+    };
+    let budgets = vec![Budget {
+        id: "fixture physical device".into(), locations: vec![Location::coordinator(1)],
+        physical_bytes: 1 << 30, logical_bytes: 1 << 30,
+        baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false },
+        headroom: 0,
+    }];
+    let phases = planner::evaluate(&facts, &budgets)?;
+    let plan = ResolvedPlan {
+        request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
+            prefill: Pin::Auto, operation: Operation::Serving },
+        decisions: Decisions { attention: vec![], onboard_layers: vec![vec![], vec![]],
+            expert_homes: Default::default(), embedding: None,
+            prefill: PrefillShape { rows: 64, waves: 1 }, lanes: 1 },
+        pool_tokens: 64, budgets, facts, phases,
+    };
+    let receipts = Exl3Execution::workspace_receipts(states, "expert.test", lifetime)?;
+    planner::reconcile(&plan, Phase::Warmup, &receipts)?;
+    let physical: Vec<_> = receipts.iter().enumerate()
+        .filter(|(_, r)| r.allocation.view.is_none()).map(|(i, _)| i).collect();
+    assert_eq!(physical.iter().map(|&i| receipts[i].allocation.bytes).sum::<u64>(), layout.bytes()?);
+    assert!(receipts.iter().any(|r| r.allocation.id.ends_with(".trellis_lut") && r.allocation.bytes == 16));
+    assert!(receipts.iter().any(|r| r.allocation.id.ends_with(".storage.epoch") && r.allocation.bytes == 16));
+    for negative in 0..9 {
+        let mut bad = receipts.clone();
+        match negative {
+            0 => { bad.pop(); },
+            1 => { let mut extra = bad[physical[0]].clone(); extra.allocation.id.push_str(".unexpected"); bad.push(extra); },
+            2 => bad[physical[0]].allocation.bytes += 1,
+            3 => { bad[physical[0]].allocation.bytes += 1; bad[physical[1]].allocation.bytes -= 1; },
+            4 => bad[physical[0]].allocation.location = Location::coordinator(0),
+            5 => bad[physical[0]].address = 0,
+            6 => bad[physical[1]].address = bad[physical[0]].address,
+            7 => bad.iter_mut().find(|r| r.allocation.view.is_some()).unwrap().address += 1,
+            8 => bad.iter_mut().find(|r| r.allocation.view.is_some()).unwrap()
+                .allocation.view.as_mut().unwrap().backing.push_str(".wrong"),
+            _ => unreachable!(),
+        }
+        assert!(planner::reconcile(&plan, Phase::Warmup, &bad).is_err(), "negative {negative}");
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()> {
@@ -106,7 +157,7 @@ fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()
         std::os::unix::fs::symlink(&native, directory.join(name))?;
     }
     std::fs::write(directory.join("routes.json"), b"{}")?;
-    std::fs::write(directory.join("lut"), [0u8; 16])?;
+    std::fs::write(directory.join("lut"), [0u8; 7])?;
     let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"), "/../../../third_party/sparkinfer.lock.json")))?;
     let mut buffers = serde_json::Map::new();
@@ -116,6 +167,12 @@ fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()
         ("expert_counts", 16, "torch.int32")] {
         buffers.insert(name.into(), serde_json::json!({"bytes":bytes,"dtype":dtype,"allocation":name,"zero_on_create":false}));
     }
+    buffers.insert("epoch".into(), serde_json::json!({
+        "bytes":0,"dtype":"torch.int32","allocation":"epoch","zero_on_create":true}));
+    buffers.insert("alias".into(), serde_json::json!({
+        "bytes":8,"dtype":"torch.float32","allocation":"fc2","zero_on_create":false}));
+    buffers.insert("epoch_alias".into(), serde_json::json!({
+        "bytes":8,"dtype":"torch.int32","allocation":"epoch","zero_on_create":false}));
     let meta = serde_json::json!({
         "schema":"cuteafd.v41-exl3-aot.v1", "output_dtype":"fp32", "sparkinfer_revision":lock["revision"],
         "hidden":5120,"intermediate":1152,"experts":6,"capacity":1,"top_k":6,"bits":[3,4],
@@ -123,22 +180,35 @@ fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()
         "buffers":buffers,"objects":[
             {"label":"v41_exl3_core","pointer_slots":["rotation_input_ptr"],"scalar_slots":["active_m"]},
             {"label":"v41_exl3_sum","pointer_slots":["output_ptr"],"scalar_slots":["active_m"]}],
-        "trellis_lut":{"file":"lut","bytes":16,"sha256":format!("{:x}", Sha256::digest([0u8;16]))},
+        "trellis_lut":{"file":"lut","bytes":7,"sha256":format!("{:x}", Sha256::digest([0u8;7]))},
         "route_preparation":{"manifest":"routes.json","sha256":format!("{:x}",Sha256::digest(b"{}"))}
     });
     std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&meta)?)?;
+    let wide_directory = directory.join("m16");
+    std::fs::create_dir(&wide_directory)?;
+    for name in ["libcuteafd_exl3.so", "libv41_exl3_routes.so", "routes.json", "lut"] {
+        std::os::unix::fs::symlink(directory.join(name), wide_directory.join(name))?;
+    }
+    let mut wide = meta.clone();
+    wide["capacity"] = serde_json::json!(16);
+    wide["buffers"]["output"]["bytes"] = serde_json::json!(16*5120*4);
+    wide["buffers"]["fc2"]["bytes"] = serde_json::json!(128);
+    wide["input_format"] = serde_json::json!("e4m3_k32");
+    std::fs::write(wide_directory.join("v41_exl3.json"), serde_json::to_vec(&wide)?)?;
     library.cuda_set_device(0)?;
     let mut lanes = Vec::new();
     let inventory = crate::shared::inventory::RuntimeInventory::measure(&library, &[1], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
-        for _ in 0..2 {
+        for (path, capacity) in [(directory, 1), (wide_directory.as_path(), 16)] {
+            fixture.configure_exl3_capacity(&library, capacity)?;
             // SAFETY: CPU-only fixture implements the trusted module ABI.
-            lanes.push(unsafe { Exl3Modules::load(&library, directory, Exl3InputFormat::Fp8K32)? });
+            lanes.push(unsafe { Exl3Modules::load(&library, path, Exl3InputFormat::Fp8K32)? });
         }
         Ok(())
     })?;
+    fixture.configure_exl3_capacity(&library, 1)?;
     assert_eq!(library.cuda_get_device()?, 0);
-    assert_eq!(inventory.gpus[0].module_bytes, 2*(4096+1024+512));
-    assert_eq!(fixture.events()?, "KRWKRW", "inventory must retain every context");
+    assert_eq!(inventory.gpus[0].module_bytes, 2*(4096+1024)+512);
+    assert_eq!(fixture.events()?, "KRWKR", "inventory must retain every context");
     library.cuda_set_device(1)?;
     let mut names: Vec<String> = ["descriptor_map", "global_to_combined", "intermediate_rotations", "gate_suh", "up_suh", "down_svh", "dummy_scales", "unit_scales"]
         .into_iter().map(str::to_owned).collect();
@@ -158,18 +228,23 @@ fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()
             intermediate_start:1152,experts:6,intermediate:1152,tiers:vec![3,4],projection_counts:vec![[0;3];2],unit_map:None,buffers:specs,loads:vec![] },
         budget: ExpertLoadBudget { resident_bytes:1024,device_staging_bytes:0,pinned_host_bytes:0,read_scratch_bytes:0 },
     }]);
+    let workspace = Exl3Workspace::new(&library, &[directory.to_owned(), wide_directory])?;
     let mut executions = Vec::new();
     for modules in lanes {
-        // SAFETY: private scratch, no queued work or graphs in the CPU fixture.
-        executions.push(unsafe { Exl3Execution::with_modules(&library, weights.clone(), modules, None)? });
+        // SAFETY: allocation-only CPU fixture; no queued work, launches or graphs.
+        executions.push(unsafe { Exl3Execution::with_modules(&library, weights.clone(), modules, Some(workspace.clone()))? });
     }
-    assert_eq!(fixture.events()?.chars().filter(|c| "KRW".contains(*c)).collect::<String>(), "KRWKRW",
+    verify_workspace_receipts(&executions, &[meta.clone(), wide])?;
+    assert_eq!(fixture.events()?.chars().filter(|c| "KRW".contains(*c)).collect::<String>(), "KRWKR",
         "execution must consume the measured handles, never reload");
     // Dropping retained native contexts restores their own device even from a peer.
     library.cuda_set_device(0)?;
     drop(executions);
+    library.cuda_set_device(1)?;
+    drop(workspace);
+    library.cuda_set_device(0)?;
     assert_eq!(library.cuda_get_device()?, 0);
-    assert_eq!(fixture.events()?.chars().filter(|c| "krw".contains(*c)).collect::<String>(), "krwkrw");
+    assert_eq!(fixture.events()?.chars().filter(|c| "krw".contains(*c)).collect::<String>(), "krwkr");
     library.cuda_set_device(1)?;
     drop(weights);
     assert_eq!(library.cuda_memory_info()?, (1 << 30, 1 << 30));

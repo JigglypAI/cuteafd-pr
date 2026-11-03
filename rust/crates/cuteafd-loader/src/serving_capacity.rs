@@ -17,7 +17,7 @@ mod spark_intake;
 pub mod prefill_waves;
 pub use spark_intake::{prefill_return_bytes, spark_intake_bytes, PrefillShape};
 mod exl3_workspace;
-pub use exl3_workspace::exl3_workspace_bytes;
+pub use exl3_workspace::{exl3_workspace_bytes, Exl3WorkspaceBinding, Exl3WorkspaceLayout, Exl3WorkspaceOwner};
 pub mod glm_graphs;
 pub mod glmf_graphs;
 mod glmf_workspace;

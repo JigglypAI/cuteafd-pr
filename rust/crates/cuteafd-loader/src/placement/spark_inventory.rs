@@ -803,7 +803,7 @@ mod tests {
             "sparkinfer_revision":"test","input_format":"e4m3_k32",
             "trellis_lut":{"bytes":32},"buffers":{
                 "scratch":{"bytes":rows*100,"allocation":"scratch","dtype":"bf16","zero_on_create":false},
-                "alias":{"bytes":99999,"allocation":"scratch","dtype":"bf16","zero_on_create":false},
+                "alias":{"bytes":100,"allocation":"scratch","dtype":"bf16","zero_on_create":false},
                 "state":{"bytes":0,"allocation":"state","dtype":"i32","zero_on_create":true}}})).collect();
         let e = SparkExecutionInventory::exl3(&manifests,48,80,16,&[1,16,80],load()).unwrap();
         assert_eq!(e.retained.device[0].bytes,8000 + 3*(32+16));

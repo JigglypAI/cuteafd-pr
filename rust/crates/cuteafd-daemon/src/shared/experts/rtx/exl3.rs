@@ -922,7 +922,7 @@ mod tests {
                 serde_json::to_vec(&serde_json::json!({
                     "capacity": capacity, "decode_capacity": true, "hidden": 8, "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32}, "buffers": {
                         "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": scratch, "zero_on_create": false},
-                        "alias": {"allocation": "scratch", "dtype": "f32", "bytes": 99999, "zero_on_create": false},
+                        "alias": {"allocation": "scratch", "dtype": "f32", "bytes": 64, "zero_on_create": false},
                         "state": {"allocation": "state", "dtype": "i32", "bytes": 0, "zero_on_create": true}
                     }
                 }))?,

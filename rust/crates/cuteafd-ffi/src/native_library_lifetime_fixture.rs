@@ -140,6 +140,16 @@ impl Fixture {
         Ok(())
     }
 
+    pub fn configure_exl3_capacity(&self, library: &NativeLibrary, capacity: u32) -> Result<()> {
+        // SAFETY: CPU-only ABI selection; already loaded modules retain their own metadata.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn(u32)> =
+                library.lib.get(b"fixture_configure_exl3_capacity")?;
+            configure(capacity);
+        }
+        Ok(())
+    }
+
     pub fn configure_fp8_segments(&self, library: &NativeLibrary) -> Result<()> {
         // SAFETY: this CPU-only fixture export toggles its static segment metadata.
         unsafe {

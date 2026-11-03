@@ -681,8 +681,10 @@ static void exl3_destroy(void *handle, char marker) {
     event(marker);
     free(context);
 }
+static uint32_t exl3_capacity = 1;
+void fixture_configure_exl3_capacity(uint32_t capacity) { exl3_capacity = capacity; }
 int cuteafd_exl3_info(uint32_t *out, uint32_t count) {
-    const uint32_t words[16] = {2,5120,1152,6,1,6,2,1,1,1,1,3,4,0,0,4};
+    const uint32_t words[16] = {2,5120,1152,6,exl3_capacity,6,2,1,1,1,1,3,4,0,0,4};
     if (count != 16) return 1;
     memcpy(out, words, sizeof(words));
     return 0;

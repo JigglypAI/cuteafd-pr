@@ -284,26 +284,6 @@ impl Manifest {
         Ok(())
     }
 
-    fn workspace_bytes(&self, format: Exl3InputFormat) -> Result<usize> {
-        let mut bytes = self.trellis_lut.bytes.max(16);
-        for (name, buffer) in &self.buffers {
-            if name == &buffer.allocation {
-                bytes = bytes
-                    .checked_add(buffer.bytes.max(16))
-                    .context("EXL3 workspace budget overflow")?;
-            }
-        }
-        if format == Exl3InputFormat::Fp8K32 && !self.wire_input()? {
-            bytes = bytes
-                .checked_add(
-                    self.capacity
-                        .checked_mul(self.hidden * 2)
-                        .context("EXL3 wire workspace overflow")?,
-                )
-                .context("EXL3 workspace budget overflow")?;
-        }
-        Ok(bytes)
-    }
 }
 
 /// Mutually exclusive capacity specializations in one lane may reuse data
@@ -509,8 +489,9 @@ pub(crate) struct Exl3Execution<'a> {
     wire: Option<DeviceAllocation<'a>>,
     /// Inputs arrive as wire rows (decoded by `wire`, or read by the core).
     wire_rows: bool,
-    _storage: Vec<DeviceAllocation<'a>>,
+    _storage: BTreeMap<String, DeviceAllocation<'a>>,
     _shared_workspace: Option<Rc<Exl3Workspace<'a>>>,
+    workspace_bindings: BTreeMap<String, CuteafdDeviceBuffer>,
     // Keep every prebound pointer alive through the last graph replay.
     _weights: Rc<Vec<Exl3Weights<'a>>>,
     layers: Vec<LayerBinding>,
@@ -550,9 +531,7 @@ impl<'a> Exl3Execution<'a> {
     /// Device allocation payload per lane, including aliases and optional wire
     /// reconstruction. Weight storage and CUDA module/driver reserve are separate.
     pub(crate) fn plan(directory: &Path, format: Exl3InputFormat) -> Result<usize> {
-        let meta: Manifest =
-            serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
-        meta.workspace_bytes(format)
+        Exl3Workspace::plan(&[directory.to_owned()], format)
     }
 
     /// Trusted build artifacts only. Each owner is exclusive to one decode lane;
@@ -622,7 +601,7 @@ impl<'a> Exl3Execution<'a> {
             );
         }
         let info = modules.owner.kernel.info();
-        let mut storage = Vec::new();
+        let mut storage = BTreeMap::new();
         let mut pointers = BTreeMap::new();
         // Never resize to the current device's SM count: compiled grid barriers
         // retain export-time offsets, even when the bridge caps the launch grid.
@@ -642,10 +621,12 @@ impl<'a> Exl3Execution<'a> {
                 library.copy_h2d(allocation.buffer, &vec![0; spec.bytes])?;
             }
             pointers.insert(name.clone(), allocation.buffer);
-            storage.push(allocation);
+            storage.insert(format!("storage.{name}"), allocation);
         }
+        let allocations = pointers;
+        let mut pointers = BTreeMap::new();
         for (name, spec) in &meta.buffers {
-            let mut buffer = *pointers
+            let mut buffer = *allocations
                 .get(&spec.allocation)
                 .context("missing EXL3 workspace allocation")?;
             ensure!(
@@ -655,16 +636,17 @@ impl<'a> Exl3Execution<'a> {
             buffer.bytes = spec.bytes;
             pointers.insert(name.clone(), buffer);
         }
+        let workspace_bindings = pointers.clone();
         let lut = std::fs::read(directory.join(&meta.trellis_lut.file))?;
         ensure!(
             lut.len() == meta.trellis_lut.bytes
                 && format!("{:x}", Sha256::digest(&lut)) == meta.trellis_lut.sha256,
             "EXL3 LUT artifact mismatch"
         );
-        let lut_buffer = DeviceAllocation::new(library, lut.len())?;
+        let lut_buffer = DeviceAllocation::new(library, lut.len().max(16))?;
         library.copy_h2d(lut_buffer.buffer, &lut)?;
         pointers.insert("trellis_lut_ptr".into(), lut_buffer.buffer);
-        storage.push(lut_buffer);
+        storage.insert("trellis_lut".into(), lut_buffer);
         let mut layers = Vec::with_capacity(weights.len());
         for weight in weights.iter() {
             let mut pointers = pointers.clone();
@@ -781,6 +763,7 @@ impl<'a> Exl3Execution<'a> {
             wire_rows: format == Exl3InputFormat::Fp8K32,
             _storage: storage,
             _shared_workspace: shared,
+            workspace_bindings,
             _weights: weights,
             layers,
             route_pointers,
@@ -813,8 +796,77 @@ impl<'a> Exl3Execution<'a> {
 
     /// Privately allocated payload; shared arenas are counted once by their planner.
     pub(crate) fn workspace_bytes(&self) -> usize {
-        self._storage.iter().map(|b| b.buffer.bytes).sum::<usize>()
+        self._storage.values().map(|b| b.buffer.bytes).sum::<usize>()
             + self.wire.as_ref().map_or(0, |b| b.buffer.bytes)
+    }
+
+    /// Independent retained-field census; code, weights, routed output and
+    /// startup allocation/free history are separate owners.
+    pub(crate) fn workspace_receipts(
+        states: &[Self],
+        prefix: &str,
+        lifetime: cuteafd_loader::placement::planner::Lifetime,
+    ) -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{Allocation, Location, Receipt, View};
+        let receipt = |name: &str, buffer: CuteafdDeviceBuffer| -> Result<Receipt> {
+            Ok(Receipt {
+                allocation: Allocation::buffer(
+                    format!("{prefix}.{name}"),
+                    Location::coordinator(u8::try_from(buffer.device_id)?),
+                    buffer.bytes as u64, lifetime, Category::Workspace, "EXL3 expert workspace",
+                ),
+                address: buffer.ptr as u64,
+            })
+        };
+        let mut out = Vec::new();
+        let mut shared: Option<&Rc<Exl3Workspace<'a>>> = None;
+        let mut capacities = std::collections::BTreeSet::new();
+        for state in states {
+            ensure!(capacities.insert(state.capacity), "duplicate retained EXL3 capacity");
+            if let Some(arena) = &state._shared_workspace {
+                if let Some(previous) = shared {
+                    ensure!(Rc::ptr_eq(previous, arena), "EXL3 capacities retain different shared arenas");
+                } else {
+                    for (name, allocation) in &arena.allocations {
+                        out.push(receipt(&format!("shared.{name}"), allocation.buffer)?);
+                    }
+                    shared = Some(arena);
+                }
+            }
+            let capacity = format!("capacity.{}", state.capacity);
+            let mut owners = Vec::new();
+            for (name, allocation) in &state._storage {
+                let name = format!("{capacity}.{name}");
+                out.push(receipt(&name, allocation.buffer)?);
+                owners.push((name, allocation.buffer));
+            }
+            if let Some(wire) = &state.wire {
+                out.push(receipt(&format!("{capacity}.wire"), wire.buffer)?);
+            }
+            if let Some(arena) = &state._shared_workspace {
+                owners.extend(arena.allocations.iter()
+                    .map(|(name, allocation)| (format!("shared.{name}"), allocation.buffer)));
+            }
+            for (name, &buffer) in &state.workspace_bindings {
+                if buffer.bytes == 0 { continue; }
+                let start = buffer.ptr as usize;
+                let end = start.checked_add(buffer.bytes).context("EXL3 binding end overflow")?;
+                let mut backing = owners.iter().filter(|(_, owner)| {
+                    owner.device_id == buffer.device_id && start >= owner.ptr as usize
+                        && (owner.ptr as usize).checked_add(owner.bytes).is_some_and(|limit| end <= limit)
+                });
+                let (owner, storage) = backing.next().context("EXL3 binding outside actual owners")?;
+                ensure!(backing.next().is_none(), "EXL3 binding has ambiguous physical backing");
+                let mut view = receipt(&format!("{capacity}.view.{name}"), buffer)?;
+                view.allocation.view = Some(View {
+                    backing: format!("{prefix}.{owner}"),
+                    offset: (start - storage.ptr as usize) as u64,
+                });
+                out.push(view);
+            }
+        }
+        Ok(out)
     }
 
     /// # Safety
