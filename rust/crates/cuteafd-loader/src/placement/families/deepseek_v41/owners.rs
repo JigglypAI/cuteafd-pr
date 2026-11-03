@@ -310,7 +310,7 @@ impl<'a> NativePrograms<'a> {
                     + self.scratch(u, 6144, 25600)? + 4));
             }
             if rank == ranks - 1 { add(&mut out, "target taps", r * 30720); }
-            add(&mut out, "target heads", slots as u64 * self.head(ranks, rank, head_mode)?);
+            add(&mut out, "target heads", slots as u64 * self.target_head_bytes(ranks, rank, head_mode)?);
         }
         Ok(out)
     }
@@ -318,12 +318,17 @@ impl<'a> NativePrograms<'a> {
     /// One slot pass's verify-width target head on `rank` (every pass has one),
     /// with the GEMV scratch of `head_mode`'s resident copy when target logits
     /// project through it.
-    fn head(&self, ranks: usize, rank: usize, head_mode: Fp8Head) -> Result<u64> {
+    pub fn target_head_bytes(&self, ranks: usize, rank: usize, head_mode: Fp8Head) -> Result<u64> {
+        ensure!(matches!(ranks, 1 | 2) && rank < ranks, "invalid V4.1 target head placement");
         let head_rows = cuteafd_core::V41_VERIFY_ROWS as u64;
         let normalization = head_rows * (40960 + 16 + 10240 + 10240);
         let sampler = head_rows * (64 + 64 + 2 * VOCAB.div_ceil(32) * 4 + 2048 * 4 + 256 * 12 + 32);
+        // AcceptanceWave belongs to the single-RTX target head, not the split head.
+        let acceptance_wave = if ranks == 1 {
+            cuteafd_core::acceptance_wave_device_bytes(cuteafd_core::V41_VERIFY_ROWS) as u64
+        } else { 0 };
         let head = if ranks == 1 {
-            BLAS + normalization + head_rows * (VOCAB * 4 + 8) + sampler
+            BLAS + normalization + head_rows * (VOCAB * 4 + 8) + sampler + acceptance_wave
         } else {
             BLAS + head_rows * (10240 + VOCAB / 2 * 4 + if rank == 0 { 8 } else { 24 })
                 + if rank == 1 { normalization + head_rows * VOCAB * 4 + sampler } else { 0 }
@@ -395,7 +400,7 @@ impl<'a> NativePrograms<'a> {
                         + self.scratch(rows, 6144, 25600)? + 4));
                 }
                 if rank == ranks - 1 { add(&mut out, "target taps", index_rows * 30720); }
-                add(&mut out, "target head", self.head(ranks, rank, head_mode)?);
+                add(&mut out, "target head", self.target_head_bytes(ranks, rank, head_mode)?);
             }
         }
         Ok(out)

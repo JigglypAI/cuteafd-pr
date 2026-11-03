@@ -594,6 +594,24 @@ impl Drop for TargetHeadWave<'_, '_> {
 mod sampling_budget_tests {
     use super::*;
 
+    #[test]
+    fn planned_target_head_owner_equals_runtime_allocation_with_acceptance_wave() -> Result<()> {
+        use cuteafd_loader::placement::families::deepseek_v41::{owners::NativePrograms, resident::Fp8Head};
+        let manifest = serde_json::json!({});
+        let rows = cuteafd_core::V41_VERIFY_ROWS;
+        for sms in [188, 170] {
+            let plan = NativePrograms::new(&manifest, sms)?;
+            assert_eq!(plan.target_head_bytes(1, 0, Fp8Head::Off)?,
+                TargetHeadWave::device_bytes(rows)? as u64);
+            // Split heads do not allocate an AcceptanceWave on either rank.
+            let split = distributed_target::DistributedTargetHead::device_bytes(rows, SAMPLING_VOCAB / 2)?;
+            for (rank, bytes) in split.into_iter().enumerate() {
+                assert_eq!(plan.target_head_bytes(2, rank, Fp8Head::Off)?, bytes as u64);
+            }
+        }
+        Ok(())
+    }
+
     /// D-new: an all-unconstrained round stages no mask rows, and the launch
     /// pair must then be `(None, 0)`. Passing the wave's own non-zero
     /// `mask_words` with a null arena is what the FFI validator and the kernel

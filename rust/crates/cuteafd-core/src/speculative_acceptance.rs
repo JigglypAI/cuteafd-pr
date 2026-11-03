@@ -1,6 +1,15 @@
 //! Host-side draft acceptance, independent of target sampling.
 use crate::TargetSamplingParams;
 
+/// Proposal, three statistics, argmax ID/raw score and status, in separate planes.
+pub const ACCEPTANCE_COMPACT_ROW_BYTES: usize =
+    3 * std::mem::size_of::<u32>() + 4 * std::mem::size_of::<f32>();
+
+/// Persistent device arena owned by one target head's `AcceptanceWave`.
+pub const fn acceptance_wave_device_bytes(rows: usize) -> usize {
+    rows * ACCEPTANCE_COMPACT_ROW_BYTES
+}
+
 /// Target distribution statistics at a drafted position, after any logit masks.
 /// Probabilities and entropy use the untempered target distribution.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]

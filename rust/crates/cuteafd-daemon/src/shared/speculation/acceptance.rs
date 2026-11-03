@@ -22,7 +22,9 @@ pub(crate) struct AcceptanceWave<'a> {
     capacity: usize,
 }
 impl<'a> AcceptanceWave<'a> {
-    pub fn device_bytes(capacity: usize) -> usize { capacity * 28 }
+    pub fn device_bytes(capacity: usize) -> usize {
+        cuteafd_core::acceptance_wave_device_bytes(capacity)
+    }
 
     pub fn new(library: &'a NativeLibrary, capacity: usize) -> Result<Self> {
         let programs = library.programs()?;
