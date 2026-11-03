@@ -322,6 +322,13 @@ mod tests {
                     let mut tensors = testing::mimo_flash_tensors();
                     tensors.push(testing::t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
                     testing::write_snapshot(dir.path(), &config, &tensors, None);
+                    let package = dir.path().join("mimo-experts.json");
+                    std::fs::write(&package, serde_json::to_vec(&json!({"layouts":{"tp1":{
+                        "input":"bf16", "tp":1, "hidden":4096, "experts":256,
+                        "top_k":8, "intermediate":2048, "slice":2048, "weights":"fp8",
+                        "capacities":[{"capacity":4096,"scratch_bytes":671_354_880}]
+                    }}}))?)?;
+                    options.mimo_expert_manifest = Some(package);
                 }
                 "qwen4" => {
                     let mut config = testing::qwen4_config(1);
