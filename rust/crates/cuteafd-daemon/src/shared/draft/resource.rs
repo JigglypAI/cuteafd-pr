@@ -601,6 +601,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn token_only_candidates_do_not_inherit_selector_cold_floor() {
+        let mut policy = DraftPolicy::seeded(geometry(&homes(true), 288, 8, 64, 7, 0).unwrap(), seed()).unwrap();
+        let prior = [0.; 7];
+        let token_only = Candidate { id: 1, prior: &prior, limit: 7, selector: false, cold: true };
+        let without = select_drafted(&mut policy, &[token_only], 3, 64, 1);
+        let selector = Candidate { id: 1, prior: &prior, limit: 7, selector: true, cold: true };
+        let with = select_drafted(&mut policy, &[selector], 3, 64, 1);
+        assert!(without.lengths[0] < START_DRAFTS);
+        assert_eq!(with.lengths[0], START_DRAFTS);
+    }
+
+    #[test]
     fn matches_frozen_glmrt_calibration() {
         let actual = crate::shared::draft_confidence::SelectorFit::default().confidence(&[0.75, 0.6, 0.8, 0.4, 0.9, 0.5, 0.7], &[
             [0.0, 0.0625, 2.765625, 0.0], [1.0, 0.5, 1.0, 2.0], [4.0, 0.96875, 0.25, 0.0], [0.125, 0.25, 1.5, 4.0],

@@ -1772,6 +1772,13 @@ def test_mistral_large4_defaults_to_its_bundled_drafter_and_honors_explicit_off(
     plan = next(shlex.split(line) for line in drafted.stderr.splitlines()
                 if "cuteafd plan" in line and "--deployment" in line)
     assert plan[plan.index("--speculator") + 1] == "dspark"
+    fixed = _family_launch_result(tmp_path / "fixed", config, "test/ml4",
+        f"RTX_GPUS={gpus}\nSPECULATOR=dspark\nSPECULATOR_DRAFTS=2\nVISION=off\nAUDIO=off\n")
+    assert fixed.returncode == 0, fixed.stderr
+    fixed_serve = next(shlex.split(line) for line in fixed.stderr.splitlines()
+                      if "docker run -d" in line and "serve-glm" in line)
+    assert "--dspark" in fixed_serve
+    assert fixed_serve[fixed_serve.index("--draft-fixed") + 1] == "2"
     disabled = _family_launch_result(tmp_path / "off", config, "test/ml4",
                                     f"RTX_GPUS={gpus}\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
     assert disabled.returncode == 0, disabled.stderr

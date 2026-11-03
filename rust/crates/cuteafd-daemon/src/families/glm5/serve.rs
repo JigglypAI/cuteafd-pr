@@ -136,7 +136,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let policy = Policy { fixed: args.draft_fixed,
         decode_share: args.decode_share };
     let prefix = args.prefix.clone();
-    let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
+    let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id, &cfg)));
     let (vision, media_cache_bytes) = (args.vision, args.media_cache_bytes);
     let remote = crate::families::glm5_flash::media::RemoteVision::from_parts(args.vision, args.vision_peers.as_deref(),
         args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
@@ -181,16 +181,22 @@ fn size_draft_window_marks(resolved: &mut super::ResolvedEngineArgs, prefix: &Pr
 }
 
 /// What the live console shows for GLM 5.3.
-fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
+fn console_layout(args: &ServeArgs, model: &str, cfg: &cuteafd_loader::families::glm5::GlmDsaConfig) -> console::Layout {
     use console::{Color::*, StepGroup};
     let mut layout = console::Layout::new("glm5", model.into(), args.engine.snapshot.clone());
     let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
     layout.hardware = console::hardware(1 + usize::from(args.engine.split_device.is_some()), sparks, false);
-    layout.split = args.engine.split_device.map(|_| "head split".into());
+    layout.split = args.engine.split_device.map(|_| {
+        let requested = cuteafd_loader::placement::attention::parse(&args.engine.attention_placement).ok().flatten();
+        let resolved = cuteafd_loader::placement::families::glm5::resolve_attention(cfg, requested, 2)
+            .unwrap_or(cuteafd_loader::placement::AttentionPlacement::Context);
+        format!("{resolved} split")
+    });
     layout.concurrency = args.max_sequences;
     let policy = args.draft_fixed.map_or_else(|| "shared resource-priced + agreed copies".to_string(), |n| format!("fixed {n}"));
-    layout.speculator = args.engine.draft.as_ref().map(|_| console::Speculator {
-        name: "DFlash2".into(), positions: 8, policy });
+    layout.speculator = (args.engine.draft.is_some() || args.engine.dspark).then(|| console::Speculator {
+        name: if args.engine.dspark { "dSpark" } else { "DFlash2" }.into(),
+        positions: if args.engine.dspark { 4 } else { 8 }, policy });
     layout.steps = vec![
         StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
             ("draft", "DFlash2 draft", Accepted), ("plan", "draft plan + copy windows", Ink),
@@ -1199,7 +1205,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
             draft.as_ref().map_or(0, |d| fixed.min(limit).min(d.tokens.len()))).collect(),
         (None, Some(shared)) if drafted_width > 0 => {
             let candidates: Vec<_> = active.iter().zip(&priors).zip(&limits).map(|((a, prior), &limit)|
-                resource::Candidate { id: a.ticket.id(), prior, limit, selector: true, cold: a.drafts.cold() }).collect();
+                resource::Candidate { id: a.ticket.id(), prior, limit, selector: !token_only, cold: a.drafts.cold() }).collect();
             let selection = resource::select_drafted(&mut shared.policy, &candidates, drafted_width, DECODE_ROWS, drafted_requests);
             predicted = selection.predicted;
             selection.lengths
@@ -1337,7 +1343,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
                 source: if rows > 1 && drafted[i].is_some() { DraftSource::Neural }
                     else { DraftSource::Undrafted },
                 prior: drafted[i].as_ref().map(|_| priors[i].as_slice()),
-                features: drafted[i].as_ref().map(|d| d.features.as_slice()),
+                features: drafted[i].as_ref().filter(|_| !token_only).map(|d| d.features.as_slice()),
                 censor }
         }).collect();
         let times = round_clock.observe();
@@ -1431,6 +1437,29 @@ mod lane_tests {
 #[cfg(test)]
 mod draft_tests {
     use super::*;
+
+    #[test]
+    fn ml4_console_reports_layers_context_and_bundled_dspark() -> Result<()> {
+        #[derive(clap::Parser)]
+        struct Cli { #[command(flatten)] args: ServeArgs }
+        use clap::Parser;
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("config.json"), include_str!(
+            "../../../../cuteafd-loader/src/families/mistral_large4/official-config.json"))?;
+        let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::read(dir.path())?;
+        for (placement, expected) in [("auto", "layers split"), ("layers", "layers split"),
+            ("context", "context split"), ("heads", "heads split")] {
+            let args = Cli::try_parse_from(["test", "--snapshot", dir.path().to_str().unwrap(),
+                "--native-lib", "/unused", "--manifest", "/unused", "--split-device", "1",
+                "--attention-placement", placement, "--dspark"])?.args;
+            let layout = console_layout(&args, "ml4", &cfg);
+            assert_eq!(layout.split.as_deref(), Some(expected));
+            let spec = layout.speculator.unwrap();
+            assert_eq!(spec.name, "dSpark");
+            assert_eq!(spec.positions, 4);
+        }
+        Ok(())
+    }
 
     #[test]
     fn auto_context_is_resolved_once_before_window_marks_and_engine() -> Result<()> {

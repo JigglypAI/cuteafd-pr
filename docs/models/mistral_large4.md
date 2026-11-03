@@ -59,10 +59,10 @@ names.
   36, 54 and 71, and uses an RNN Markov head. It defaults on at its native
   depth of three draft tokens after the lossless, exact-restore and
   delivered-tok/s gates passed on hardware. `SPECULATOR=off` disables it;
-  there is no separate drafter checkpoint or width override.
+  there is no separate drafter checkpoint; `SPECULATOR_DRAFTS` can fix the draft count for policy experiments.
 - **Prefix cache:** snapshots carry each layer's records at their own size,
   and none for latent readers, whose pages belong to their source layer.
-- **Not yet:** the vision encoder.
+- **Vision:** the officially bundled Pixtral tower and projector run resident on an RTX or remotely on a planner-selected Spark, with checkpoint-native image preprocessing and row markers.
 
 ## References
 

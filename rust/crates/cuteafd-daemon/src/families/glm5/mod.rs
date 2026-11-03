@@ -229,6 +229,18 @@ fn validate_spark_endpoint_count(family: &str, endpoints: usize, waves: usize) -
 #[cfg(test)]
 mod draft_cli_tests {
     use super::*;
+
+    #[test]
+    fn featureless_drafts_have_no_selector_rank() {
+        let mut ranks = [0; 16];
+        record_selector_rank(&mut ranks, &[]);
+        assert_eq!(ranks, [0; 16]);
+        record_selector_rank(&mut ranks, &[[0., 0., 0., 3.]]);
+        assert_eq!(ranks[3], 1);
+        record_selector_rank(&mut ranks, &[[0., 0., 0., 16.]]);
+        assert_eq!(ranks.iter().sum::<usize>(), 1);
+    }
+
     use clap::Parser;
 
     #[test]
@@ -2082,7 +2094,7 @@ fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
         }
         let accepted = draft.tokens.iter().zip(truth).take_while(|(d, t)| d == t).count();
         histogram[accepted] += 1;
-        first_rank[draft.features[0][3] as usize] += 1;
+        record_selector_rank(&mut first_rank, &draft.features);
     }
     let steps: usize = histogram.iter().sum();
     let accepted: usize = histogram.iter().enumerate().map(|(i, c)| i * c).sum();
@@ -2098,10 +2110,15 @@ fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
     Ok(())
 }
 
+fn record_selector_rank(histogram: &mut [usize; 16], features: &[[f32; 4]]) {
+    if let Some(rank) = features.first().and_then(|f| histogram.get_mut(f[3] as usize)) { *rank += 1; }
+}
+
 /// Runs the drafter alone on the golden taps at reference.py's anchor
 /// positions and compares tokens, selector features and final-norm rows.
 fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, dir: &std::path::Path) -> Result<()> {
     let drafter = engine.drafter.as_ref().context("--draft-oracle needs --draft")?;
+    anyhow::ensure!(!drafter.token_only(), "--draft-oracle requires a selector-feature drafter; bundled dSpark has no selector oracle");
     let (hidden, block, drafts_per) = (opened.cfg.hidden, drafter.cfg.block, drafter.cfg.drafts());
     let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)?;
     let positions: Vec<usize> = meta["positions"].as_array().context("positions")?.iter()
