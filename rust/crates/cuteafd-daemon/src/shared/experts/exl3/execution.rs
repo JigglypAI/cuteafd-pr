@@ -353,6 +353,29 @@ impl<'a> Exl3Workspace<'a> {
     }
 }
 
+/// Bind the per-layer pointers an epilogue's objects read: the sum object is
+/// the only reader of the weighted-sum `output` owner, so a partial-reply
+/// family neither allocates nor binds it.
+fn layer_pointers(
+    epilogue: Exl3Epilogue,
+    pointers: &BTreeMap<String, CuteafdDeviceBuffer>,
+) -> Result<BTreeMap<String, CuteafdDeviceBuffer>> {
+    let mut bound = pointers.clone();
+    bound.insert(
+        "fc2_ptr".into(),
+        *pointers.get("fc2").context("missing EXL3 FC2 workspace")?,
+    );
+    if epilogue == Exl3Epilogue::Sum {
+        bound.insert(
+            "output_ptr".into(),
+            *pointers
+                .get("output")
+                .context("missing EXL3 output workspace")?,
+        );
+    }
+    Ok(bound)
+}
+
 struct Table {
     pointers: Vec<*mut c_void>,
     scalars: Vec<i32>,
@@ -708,14 +731,7 @@ impl<'a> Exl3Execution<'a> {
             ] {
                 pointers.insert(target.into(), weight.buffer(source)?);
             }
-            for (target, source) in [("fc2_ptr", "fc2"), ("output_ptr", "output")] {
-                pointers.insert(
-                    target.into(),
-                    *pointers
-                        .get(source)
-                        .context("missing EXL3 output workspace")?,
-                );
-            }
+            let mut pointers = layer_pointers(epilogue, &pointers)?;
             let mut values = BTreeMap::from([
                 ("active_m".into(), 1),
                 (
@@ -1079,6 +1095,23 @@ mod tests {
         assert_eq!(sum.get("scratch"), partial.get("scratch"));
         assert_eq!(Exl3Workspace::plan(&directories, Exl3InputFormat::Bf16, Exl3Epilogue::PartialReplies)? + 16 * 64,
             Exl3Workspace::plan(&directories, Exl3InputFormat::Bf16, Exl3Epilogue::Sum)?);
+        Ok(())
+    }
+
+    #[test]
+    fn partial_replies_never_bind_the_sum_output_owner() -> Result<()> {
+        let buffer = |bytes| CuteafdDeviceBuffer { bytes, ..Default::default() };
+        // A partial-reply workspace has no `output` allocation at all, as the
+        // Muse catalog produces: binding must still succeed for its layers.
+        let partial = BTreeMap::from([("fc2".to_string(), buffer(64))]);
+        let bound = layer_pointers(Exl3Epilogue::PartialReplies, &partial)?;
+        assert_eq!(bound.get("fc2_ptr").copied().map(|b| b.bytes), Some(64));
+        assert!(!bound.contains_key("output_ptr"));
+        let error = layer_pointers(Exl3Epilogue::Sum, &partial).unwrap_err().to_string();
+        assert!(error.contains("missing EXL3 output workspace"), "{error}");
+        let sum = BTreeMap::from([("fc2".to_string(), buffer(64)), ("output".to_string(), buffer(32))]);
+        let bound = layer_pointers(Exl3Epilogue::Sum, &sum)?;
+        assert_eq!(bound.get("output_ptr").copied().map(|b| b.bytes), Some(32));
         Ok(())
     }
 
