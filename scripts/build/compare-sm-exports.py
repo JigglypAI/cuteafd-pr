@@ -121,6 +121,11 @@ def jobs(scope):
             result.append((f"suspect-{geometry}-m{rows}", "export_b12x_dsv4_aot.py",
                            ["--geometry", geometry, "--decode-rows", str(rows),
                             "--only", f"index_topk_decode_m{rows}"]))
+        # The production decode table selects the tiled m64 route; it must stay
+        # identical across SM counts.
+        result.append((f"production-indexer-{geometry}-m64", "export_b12x_dsv4_aot.py",
+                       ["--geometry", geometry, "--decode-rows", "64",
+                        "--only", "index_topk_decode_m64"]))
         mla = [f"sparse_mla_{mode}{kind}_m{rows}"
                for mode, rows in (("decode", 64), ("prefill", 4096))
                for kind in (("_win", "_c4", "_c128") if geometry in ("flash", "pro") else ("",))]
