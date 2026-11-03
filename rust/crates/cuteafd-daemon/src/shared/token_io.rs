@@ -266,7 +266,7 @@ impl<'a> TokenEmbedding<'a> {
         // pinned input live and orders replacement after previous consumers.
         unsafe { self.library.copy_h2d_ordered(ids, &bytes, stream)?; }
         // SAFETY: `ids` becomes initialized before the gather on this stream; out holds the rows.
-        unsafe { self.gather(ids.ptr, std::ptr::null(), tokens.len(), copies, std::ptr::null(), out.ptr, stream) }
+        unsafe { self.gather(ids.ptr, std::ptr::null(), tokens.len(), copies, std::ptr::null(), out.ptr, None, stream) }
     }
 
     /// Gathers the rows of `rows` device-resident ids (`ids[index[r]]` with a
@@ -279,14 +279,26 @@ impl<'a> TokenEmbedding<'a> {
     /// `fallback` is null or a live row, all on the stream's device. A BF16
     /// table may live on a peer with peer access enabled from this device;
     /// its upload must finish before gathering and its lifetime spans the work.
+    /// Row-FP8 with multiple copies requires disjoint caller scratch of at least
+    /// `[rows, hidden]` BF16 on this device, live until the same stream drains.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gather(&self, ids: *const c_void, index: *const c_void, rows: usize, copies: usize,
-        fallback: *const c_void, out: *mut c_void, stream: *mut c_void) -> Result<()> {
+        fallback: *const c_void, out: *mut c_void, scratch: Option<CuteafdDeviceBuffer>,
+        stream: *mut c_void) -> Result<()> {
         if let Some(owner) = &self.row_fp8 {
-            ensure!(index.is_null() && fallback.is_null() && copies == 1,
-                "the row-FP8 embedding gathers plain ids (no index, fallback or copies)");
-            // SAFETY: the caller's contract; u32 ids below vocab are the gather's I32 ids.
-            return unsafe { owner.embed(ids.cast_mut(), out, rows, stream) };
+            ensure!(index.is_null() && fallback.is_null(),
+                "the row-FP8 embedding gathers plain ids (no index or fallback)");
+            let device = owner.embedding.residency().device;
+            return gather_row_fp8_copies(rows, self.source.hidden, copies, out, scratch, device, |op| {
+                match op {
+                    // SAFETY: the caller retains ids, output and optional scratch through this stream.
+                    EmbeddingOp::Gather(output) => unsafe { owner.embed(ids.cast_mut(), output, rows, stream) },
+                    // SAFETY: checked disjoint pitched views, ordered after the gather on this stream.
+                    EmbeddingOp::Copy { dst, src, width, dst_pitch } => unsafe {
+                        self.library.copy_device_rows_async(dst, src, width, rows, dst_pitch, width, stream)
+                    },
+                }
+            });
         }
         let table = self.table.buffer();
         // SAFETY: the caller's contract; the table is a live [vocab, hidden] BF16 buffer.
@@ -307,7 +319,7 @@ impl<'a> TokenEmbedding<'a> {
         let index_ptr = index.map_or(std::ptr::null(), |(device, _)| device);
         let fallback = fallback.map_or(std::ptr::null(), |(device, _)| device);
         // SAFETY: both placements expose a stable device-visible table; caller owns the stream and outputs.
-        unsafe { self.gather(ids.ptr, index_ptr, rows, copies, fallback, out.ptr, stream) }
+        unsafe { self.gather(ids.ptr, index_ptr, rows, copies, fallback, out.ptr, None, stream) }
     }
 
     /// Compares every byte of the resident table with the shard (the
@@ -330,6 +342,36 @@ impl<'a> TokenEmbedding<'a> {
         }
         Ok(total)
     }
+}
+
+enum EmbeddingOp {
+    Gather(*mut c_void),
+    Copy { dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer, width: usize, dst_pitch: usize },
+}
+
+fn gather_row_fp8_copies(rows: usize, hidden: usize, copies: usize, out: *mut c_void,
+    scratch: Option<CuteafdDeviceBuffer>, device: i32, mut launch: impl FnMut(EmbeddingOp) -> Result<()>) -> Result<()> {
+    ensure!(rows > 0 && hidden > 0 && copies > 0 && !out.is_null(), "empty row-FP8 embedding gather");
+    let width = hidden.checked_mul(2).context("embedding row overflow")?;
+    let bytes = rows.checked_mul(width).context("embedding scratch overflow")?;
+    let pitch = copies.checked_mul(width).context("embedding copies overflow")?;
+    let output_bytes = rows.checked_mul(pitch).context("embedding output overflow")?;
+    let output_end = (out as usize).checked_add(output_bytes).context("embedding output address overflow")?;
+    if copies == 1 { return launch(EmbeddingOp::Gather(out)); }
+    let src = scratch.context("row-FP8 embedding copies require caller scratch")?;
+    ensure!(!src.ptr.is_null() && src.bytes >= bytes && src.device_id == device && src.flags == 0,
+        "row-FP8 embedding scratch differs from required device/extent");
+    let scratch_end = (src.ptr as usize).checked_add(bytes).context("embedding scratch address overflow")?;
+    ensure!(output_end <= src.ptr as usize || scratch_end <= out as usize,
+        "row-FP8 embedding scratch overlaps output");
+    launch(EmbeddingOp::Gather(src.ptr))?;
+    for copy in 0..copies {
+        let offset = copy * width;
+        let dst = CuteafdDeviceBuffer { ptr: out.cast::<u8>().wrapping_add(offset).cast(),
+            bytes: output_bytes - offset, device_id: device, flags: 0 };
+        launch(EmbeddingOp::Copy { dst, src, width, dst_pitch: pitch })?;
+    }
+    Ok(())
 }
 
 pub(super) fn validate_embedding_residency(actual_device: i32, actual_bytes: usize,
@@ -948,6 +990,77 @@ fn chi_square_critical(dof: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_fp8_copies_gather_once_then_expand_on_device() -> Result<()> {
+        use std::cell::RefCell;
+        for rows in [1, 3, 64] {
+            for copies in [1, 4] {
+                let hidden = 7;
+                let width = hidden * 2;
+                let output = RefCell::new(vec![0u8; rows * copies * width]);
+                let scratch = RefCell::new(vec![0u8; rows * width]);
+                let out = output.borrow_mut().as_mut_ptr().cast();
+                let src = CuteafdDeviceBuffer { ptr: scratch.borrow_mut().as_mut_ptr().cast(),
+                    bytes: rows * width, device_id: 2, flags: 0 };
+                let mut events = Vec::new();
+                gather_row_fp8_copies(rows, hidden, copies, out, (copies > 1).then_some(src), 2, |op| {
+                    match op {
+                        EmbeddingOp::Gather(ptr) => {
+                            assert!(events.is_empty());
+                            events.push("gather");
+                            let mut table = if ptr == out { output.borrow_mut() } else {
+                                assert_eq!(ptr, src.ptr); scratch.borrow_mut()
+                            };
+                            for (row, bytes) in table.chunks_exact_mut(width).enumerate() {
+                                bytes.fill((row + 1) as u8);
+                            }
+                        }
+                        EmbeddingOp::Copy { dst, src: actual_src, width: actual_width, dst_pitch } => {
+                            assert_eq!(events.first(), Some(&"gather"));
+                            assert_eq!(actual_src.ptr, src.ptr);
+                            assert_eq!(actual_width, width);
+                            assert_eq!(dst_pitch, copies * width);
+                            let offset = dst.ptr as usize - out as usize;
+                            assert_eq!(dst.bytes, rows * dst_pitch - offset);
+                            for row in 0..rows {
+                                let at = offset + row * dst_pitch;
+                                output.borrow_mut()[at..at + width]
+                                    .copy_from_slice(&scratch.borrow()[row * width..(row + 1) * width]);
+                            }
+                            events.push("copy");
+                        }
+                    }
+                    Ok(())
+                })?;
+                assert_eq!(events.iter().filter(|&&event| event == "gather").count(), 1);
+                assert_eq!(events.len(), if copies == 1 { 1 } else { 1 + copies });
+                for (row, bytes) in output.borrow().chunks_exact(copies * width).enumerate() {
+                    assert!(bytes.iter().all(|&byte| byte == (row + 1) as u8));
+                }
+                if copies > 1 {
+                    for bad in [None, Some(CuteafdDeviceBuffer { bytes: src.bytes - 1, ..src }),
+                        Some(CuteafdDeviceBuffer { device_id: 0, ..src }),
+                        Some(CuteafdDeviceBuffer { ptr: out, ..src })] {
+                        let mut launched = false;
+                        assert!(gather_row_fp8_copies(rows, hidden, copies, out, bad, 2,
+                            |_| { launched = true; Ok(()) }).is_err());
+                        assert!(!launched);
+                    }
+                }
+            }
+        }
+        let mut launches = 0;
+        let mut output = [0u8; 32];
+        let mut scratch = [0u8; 8];
+        let src = CuteafdDeviceBuffer { ptr: scratch.as_mut_ptr().cast(), bytes: 8,
+            device_id: 0, flags: 0 };
+        assert!(gather_row_fp8_copies(1, 4, 4, output.as_mut_ptr().cast(), Some(src), 0, |_| {
+            launches += 1; anyhow::bail!("injected gather failure")
+        }).is_err());
+        assert_eq!(launches, 1);
+        Ok(())
+    }
 
     #[test]
     fn routes_follow_the_device_sampler_limits() {

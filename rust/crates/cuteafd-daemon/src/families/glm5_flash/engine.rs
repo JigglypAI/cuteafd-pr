@@ -3340,7 +3340,7 @@ impl<'a> GlmfEngine<'a> {
     fn gather_streams(&self, w: &Workspace<'_>, t: usize) -> Result<()> {
         // SAFETY: the ids upload precedes this gather on the same stream; streams hold t x 4 rows.
         unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, HC, std::ptr::null(),
-            w.streams[0].buffer.ptr, self.stream) }
+            w.streams[0].buffer.ptr, Some(w.streams[1].buffer), self.stream) }
     }
 
     fn inject_media(&self, w: &Workspace<'_>, tables: &StepTables,
