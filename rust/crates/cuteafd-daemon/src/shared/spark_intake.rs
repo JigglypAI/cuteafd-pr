@@ -819,16 +819,13 @@ impl<'a> SparkIntake<'a> {
     /// Called initially or after the link's reset proved consumer drainage.
     pub(crate) fn exchange_storage(&self, geometry: &crate::shared::spark_waves::Intake)
         -> Result<std::rc::Rc<crate::shared::spark_waves::ExchangeStorage<'a>>> {
-        let slots = geometry.geometry.slots();
-        let all = if geometry.ranks == 8 { u8::MAX } else { (1u8 << geometry.ranks) - 1 };
-        let pinned = all & !geometry.landing != 0;
         let mut retained = self.exchange_storage.borrow_mut();
         if let Some(storage) = retained.as_ref() {
-            ensure!(storage.matches(slots, pinned), "exchange storage geometry changed across reset");
+            ensure!(storage.matches(geometry), "exchange storage geometry changed across reset");
             ensure!(std::rc::Rc::strong_count(storage) == 1, "previous exchange still owns its storage");
             storage.reset_drained();
         } else {
-            *retained = Some(std::rc::Rc::new(crate::shared::spark_waves::ExchangeStorage::new(self.library, slots, pinned)?));
+            *retained = Some(std::rc::Rc::new(crate::shared::spark_waves::ExchangeStorage::new(self.library, geometry)?));
         }
         Ok(retained.as_ref().unwrap().clone())
     }

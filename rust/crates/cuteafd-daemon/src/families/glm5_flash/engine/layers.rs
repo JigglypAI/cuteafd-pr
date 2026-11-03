@@ -11,7 +11,6 @@ pub(super) struct Execution<'a> {
 }
 
 struct RecordedExchange<'e, 'a> {
-    unit: Option<&'e crate::shared::prefill_pipeline::Unit>,
     engine: &'e GlmfEngine<'a>,
     execution: &'e Execution<'a>,
     entry: Cell<Option<*mut c_void>>,
@@ -68,6 +67,7 @@ struct Owners {
 }
 
 struct Bindings<'e, 'a, 'c> {
+    unit: Option<&'e crate::shared::prefill_pipeline::Unit>,
     engine: &'e GlmfEngine<'a>,
     work: [&'e Workspace<'a>; 2],
     tables: [&'e StepTables; 2],

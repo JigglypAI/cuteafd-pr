@@ -850,6 +850,17 @@ pub(crate) struct Intake {
 }
 
 impl Intake {
+    fn reply_format(&self) -> cuteafd_core::SparkReplyFormat {
+        if self.prefill {
+            cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false)
+        } else { cuteafd_core::SparkReplyFormat::Bf16 }
+    }
+
+    fn pinned(&self) -> u8 {
+        let all = if self.ranks == 8 { u8::MAX } else { (1u8 << self.ranks) - 1 };
+        all & !self.landing
+    }
+
     /// Rank planes of `slot` under the current cut, in rank order.
     pub(crate) fn slot_planes(&self, slot: usize) -> Vec<CuteafdDeviceBuffer> {
         let (offset, bytes) = self.geometry.slice(slot, self.row_bytes);
@@ -875,15 +886,21 @@ fn warm_reducer(library: &NativeLibrary, intake: &Intake) -> Result<()> {
     stream.finish()
 }
 
-/// Mapped inputs of queued stream waits and pulls. The intake retains this
+/// Inputs and scratch of queued waits, pulls and codec kernels. The intake retains this
 /// owner beyond a consuming Waves::close until terminal consumer drainage.
 pub(crate) struct ExchangeStorage<'a> {
     control: HostAllocation<'a>,
     pull_block: Option<HostAllocation<'a>>,
-    slots: usize,
+    reply_decode: Option<ReplyDecode<'a>>,
+    geometry: SlotGeometry,
+    prefill: bool,
+    format: cuteafd_core::SparkReplyFormat,
 }
 impl<'a> ExchangeStorage<'a> {
-    pub(crate) fn new(library: &'a NativeLibrary, slots: usize, pinned: bool) -> Result<Self> {
+    pub(crate) fn new(library: &'a NativeLibrary, intake: &Intake) -> Result<Self> {
+        let slots = intake.geometry.slots();
+        let pinned = intake.pinned() != 0;
+        let format = intake.reply_format();
         let _scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
         let control = HostAllocation::new(library, Counter::words(slots) * LINE)?;
         let pull_block = pinned.then(|| HostAllocation::new(library, Pulls::bytes(slots))).transpose()?;
@@ -892,11 +909,13 @@ impl<'a> ExchangeStorage<'a> {
             ensure!(alias.ptr == block.buffer.ptr,
                 "mapped pinned memory is not device-visible at its host address (no unified addressing)");
         }
-        Ok(Self { control, pull_block, slots })
+        let reply_decode = ReplyDecode::new(library, intake, format)?;
+        Ok(Self { control, pull_block, reply_decode, geometry: intake.geometry.clone(), prefill: intake.prefill, format })
     }
 
-    pub(crate) fn matches(&self, slots: usize, pinned: bool) -> bool {
-        self.slots == slots && self.pull_block.is_some() == pinned
+    pub(crate) fn matches(&self, intake: &Intake) -> bool {
+        self.geometry == intake.geometry && self.prefill == intake.prefill
+            && self.format == intake.reply_format() && self.pull_block.is_some() == (intake.pinned() != 0)
     }
 
     /// Only after the previous worker joined and every consumer drained.
@@ -922,7 +941,7 @@ struct ReplyDecode<'a> {
     row_bytes: usize,
 }
 impl<'a> ReplyDecode<'a> {
-    fn new(library: &'a NativeLibrary, intake: &Intake, format: cuteafd_core::SparkReplyFormat) -> Result<Option<Self>> {
+    pub(crate) fn new(library: &'a NativeLibrary, intake: &Intake, format: cuteafd_core::SparkReplyFormat) -> Result<Option<Self>> {
         let hidden = cuteafd_core::expert_geometry().hidden as usize;
         let bytes = format.combined_scratch_bytes(hidden, intake.geometry.cut().rows, intake.geometry.slots(),
             intake.prefill, cuteafd_core::expert_geometry().partial_replies()).context("reply scratch overflow")?;
@@ -932,6 +951,10 @@ impl<'a> ReplyDecode<'a> {
             decode: programs.bound("expert_reply_dequantize", &["source", "out", "mode"])?,
             scratch: crate::shared::memory::DeviceAllocation::named(library, bytes, "spark-intake/reply_codec")?,
             geometry: intake.geometry.clone(), row_bytes: format.row_bytes(hidden).context("invalid reply codec width")? }))
+    }
+    pub(crate) fn matches(&self, intake: &Intake, format: cuteafd_core::SparkReplyFormat) -> bool {
+        self.geometry == intake.geometry
+            && format.row_bytes(cuteafd_core::expert_geometry().hidden as usize) == Some(self.row_bytes)
     }
     unsafe fn launch(&self, slot: usize, plane: CuteafdDeviceBuffer, mode: *mut u32, rows: usize, stream: *mut c_void) -> Result<()> {
         use cuteafd_ffi::programs::Scalar;
@@ -953,7 +976,6 @@ impl<'a> ReplyDecode<'a> {
 
 /// A link's persistent exchange: the engine side of the worker.
 pub(crate) struct Waves<'a> {
-    reply_decode: Option<ReplyDecode<'a>>,
     library: &'a NativeLibrary,
     /// Dropped first: closing it ends the worker, joined in `Drop`.
     jobs: Option<mpsc::Sender<Command>>,
@@ -1004,7 +1026,7 @@ impl<'a> Waves<'a> {
         let all = if intake.ranks == 8 { u8::MAX } else { (1u8 << intake.ranks) - 1 };
         let pinned = all & !intake.landing;
         check_reply_ring(&transport.retained_reply_slots(), pinned, slots)?;
-        ensure!(storage.matches(slots, pinned != 0), "exchange storage differs from link geometry");
+        ensure!(storage.matches(&intake), "exchange storage differs from link geometry");
         let pulls = storage.pull_block.as_ref().map(|block| Pulls { base: block.buffer.ptr as usize });
         let arena_alias = arenas.iter().map(|arena| library.cuda_host_buffer_device_alias(arena.host())
             .map(|alias| alias.ptr as usize)).collect::<Result<Vec<_>>>()?;
@@ -1018,8 +1040,14 @@ impl<'a> Waves<'a> {
         library.peer_exchange_initialize()?;
         warm_reducer(library, &intake)?;
         let timeout = transport.timeout();
-        let reply_format = cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false);
-        let reply_decode = ReplyDecode::new(library, &intake, reply_format)?;
+        let reply_format = intake.reply_format();
+        let codec_bytes = reply_format.combined_scratch_bytes(cuteafd_core::expert_geometry().hidden as usize,
+            intake.geometry.cut().rows, slots, intake.prefill, cuteafd_core::expert_geometry().partial_replies())
+            .context("reply scratch overflow")?;
+        ensure!(storage.reply_decode.is_some() == (codec_bytes != 0), "reply codec does not match physical link policy");
+        if let Some(codec) = &storage.reply_decode {
+            ensure!(codec.matches(&intake, reply_format), "reply codec geometry changed across reset");
+        }
         let mut native = Native { transport, reply_format, reply_payloads: vec![0; slots],
             prefill_rows: 0, compressed_prefill_rows: 0, mixed_fallback_rows: 0, arenas: arenas.clone(), words,
             pulls: pulls.unwrap_or(Pulls { base: 0 }), slots, ranks: intake.ranks, row_bytes: intake.row_bytes,
@@ -1043,7 +1071,7 @@ impl<'a> Waves<'a> {
             let frames = native.frames();
             (Box::new((native.transport, frames)) as Box<dyn std::any::Any + Send>, result)
         })?;
-        Ok(Self { reply_decode, library, jobs: Some(jobs), worker: Some(worker), _storage: storage, words, arenas, arena_alias,
+        Ok(Self { library, jobs: Some(jobs), worker: Some(worker), _storage: storage, words, arenas, arena_alias,
             pulls, pinned, ranges: intake.ranges, layouts: vec![None; slots],
             unread: vec![false; slots], uses: vec![0; slots], ranks: intake.ranks, row_bytes: intake.row_bytes,
             next_slot: intake.next_slot % cut.waves, geometry: intake.geometry, sequence: 0,
@@ -1176,7 +1204,7 @@ impl<'a> Waves<'a> {
             // SAFETY: as `pull`'s contract; behind the `landed` wait.
             unsafe { self.pull(ticket.sequence, slot, ticket.payload_bytes, rest, false, stream)? };
         }
-        if let Some(codec) = &self.reply_decode {
+        if let Some(codec) = &self._storage.reply_decode {
             for plane in self.slot_planes(slot) {
                 // SAFETY: all ranks landed, the slot is exclusive until consumed;
                 // staging and expansion are separate launches on this stream.

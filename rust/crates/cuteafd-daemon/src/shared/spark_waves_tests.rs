@@ -537,7 +537,7 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
             slots, max_rows.div_ceil(2) * row_bytes)?;
         let geometry = crate::shared::wave_geometry::SlotGeometry::new(slots, max_rows)?;
         let intake = Intake { prefill: true, ranks, row_bytes, ranges, geometry, landing, placed: true, next_slot: 0 };
-        let storage = std::rc::Rc::new(ExchangeStorage::new(&library, slots, landing != (1u8 << ranks) - 1)?);
+        let storage = std::rc::Rc::new(ExchangeStorage::new(&library, &intake)?);
         let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false, storage.clone())?;
         let _ = words.set(exchange.words());
         let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
@@ -627,12 +627,25 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
 #[test]
 #[ignore = "requires a GPU and the native library (CUTEAFD_PLANE_UPLOAD_LIBRARY)"]
 fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()> {
+    terminal_close_with_codec(false)
+}
+
+#[test]
+#[ignore = "requires a GPU and native codec exports; run alone (--exact)"]
+fn gpu_compressed_close_retains_scratch_and_reset_reuses_allocation() -> Result<()> {
+    cuteafd_core::spark_reply::set_requested(Some(cuteafd_core::SparkReplyFormat::Nvfp4))
+        .map_err(anyhow::Error::msg)?;
+    terminal_close_with_codec(true)
+}
+
+fn terminal_close_with_codec(compressed: bool) -> Result<()> {
     use crate::shared::memory::DeviceAllocation;
     let path = std::env::var_os("CUTEAFD_PLANE_UPLOAD_LIBRARY").context("set CUTEAFD_PLANE_UPLOAD_LIBRARY")?;
     // SAFETY: the opt-in path names the built native library for this GPU.
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&path)? });
     cuteafd_transport::set_verbs_host_native_library_path(std::path::PathBuf::from(&path))?;
-    let (hidden, topk, ranks, rows, waves, layers) = (5120usize, 6usize, 3usize, 4usize, 2usize, 4usize);
+    let (hidden, topk, ranks, rows, waves, layers) = (5120usize, 6usize, 3usize,
+        if compressed { 65usize } else { 4usize }, 2usize, 4usize);
     let row_bytes = hidden * 2;
     let owner = crate::shared::spark_intake::SparkIntake::with_waves(&library,
         crate::shared::spark_intake::IntakeMode::Pinned, ranks, rows, row_bytes, waves)?;
@@ -650,6 +663,12 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
     let weak = std::rc::Rc::downgrade(&storage);
     let control = storage.control.buffer.ptr;
     let pull_block = storage.pull_block.as_ref().unwrap().buffer.ptr;
+    let scratch_ptr = storage.reply_decode.as_ref().map(|codec| codec.scratch.buffer.ptr);
+    assert_eq!(scratch_ptr.is_some(), compressed);
+    if let Some(codec) = &storage.reply_decode {
+        let bytes = cuteafd_core::SparkReplyFormat::Nvfp4.combined_scratch_bytes(hidden, rows, waves, true, false).unwrap();
+        assert_eq!(codec.scratch.buffer.bytes, bytes);
+    }
     assert!(owner.exchange_storage(&intake).is_err(), "live exchange storage must not be reset");
     let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false, storage)?;
     let _ = words.set(exchange.words());
@@ -665,7 +684,8 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
             Box::new(move |routes, wire| ExpertProtocolV2Request::new_bytes(layer as u64 + 1, 1, layer as u32,
                 h as u32, cuteafd_transport::ExpertV2Dtype::Bf16, (0..rows as u32).map(|row|
                     cuteafd_transport::ExpertProtocolV2RowDescriptor { row_id: row.into(),
-                    source_kind: cuteafd_transport::ExpertV2SourceKind::Decode, source_request_id: 1,
+                    source_kind: if compressed { cuteafd_transport::ExpertV2SourceKind::Prefill }
+                        else { cuteafd_transport::ExpertV2SourceKind::Decode }, source_request_id: 1,
                     token_position: row.into(), route_offset: row * topk as u32, route_count: topk as u32 })
                     .collect(), routes, wire)))? });
     }
@@ -695,6 +715,7 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
     let reset = owner.exchange_storage(&geometry)?;
     assert_eq!(reset.control.buffer.ptr, control, "reset reuses counters");
     assert_eq!(reset.pull_block.as_ref().unwrap().buffer.ptr, pull_block, "reset reuses descriptors");
+    assert_eq!(reset.reply_decode.as_ref().map(|codec| codec.scratch.buffer.ptr), scratch_ptr, "reset reuses codec scratch");
     assert_eq!(reset.control.bytes().iter().copied().max(), Some(0));
     assert_eq!(reset.pull_block.as_ref().unwrap().bytes().iter().copied().max(), Some(0));
     drop(reset);
@@ -1080,7 +1101,7 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
         let geometry = crate::shared::wave_geometry::SlotGeometry::new(1, rows)?;
         let intake = Intake { prefill: true, ranks, row_bytes, ranges, geometry, landing: 0, placed: true, next_slot: 0 };
         let stagger = Arc::new(AtomicUsize::new(0));
-        let storage = std::rc::Rc::new(ExchangeStorage::new(&library, 1, true)?);
+        let storage = std::rc::Rc::new(ExchangeStorage::new(&library, &intake)?);
         let mut exchange = Waves::start(&library, intake, StaggerSwitch { echo, stagger: stagger.clone() }, Vec::new(),
             arenas, false, storage.clone())?;
         let _ = words.set(exchange.words());
