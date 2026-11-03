@@ -894,6 +894,8 @@ struct Tp2Rows {
 }
 
 impl Tp2Rows {
+    fn transfer_bytes(&self) -> usize { self.bytes.max(self.partial_bytes) }
+
     fn new(hidden: usize, topk: usize, rows: usize, wire: bool,
         partial: crate::shared::experts::rtx::PartialDtype) -> Result<Self> {
         use crate::shared::experts::rtx::PartialDtype;
@@ -947,7 +949,10 @@ impl<'a> QwenTp2<'a> {
         };
         let _scope = devices[0].enter()?;
         let exchange = crate::shared::peer_split::PeerExchange::new_abortable(library, ranks, 2,
-            layout.exchange_slot_bytes)?;
+            layout.exchange_slot_bytes, {
+                let decode = Tp2Rows::new(hidden, topk, DECODE_ROWS, wire, experts[0].partial())?;
+                decode.transfer_bytes()
+            })?;
         let combine = [devices[0].run(|| library.rtx_tp2_combine())?, devices[1].run(|| library.rtx_tp2_combine())?];
         let send = [zero(0, layout.bytes)?, zero(1, layout.bytes)?];
         let reduced = [zero(0, layout.reduction_bytes)?, zero(1, layout.reduction_bytes)?];
@@ -1387,7 +1392,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         let routed = QwenTp2::new(self.library, ranks, experts, self.cfg.hidden, self.cfg.topk,
             self.prefill_rows.max(DECODE_ROWS), wire)?;
-        let mut link = crate::shared::peer_split::hop::HopLink::new(self.library, ranks, &hops, spec)?;
+        let mut link = crate::shared::peer_split::hop::HopLink::new(self.library, ranks, &hops, spec, DECODE_ROWS * spec.row_bytes as usize)?;
         link.attach_abort([routed.exchange.abort_word(0)?.context("Qwen rank zero abort word")?,
             routed.exchange.abort_word(1)?.context("Qwen rank one abort word")?])?;
         self.hops = Some(link);
@@ -4513,6 +4518,26 @@ mod owner_state_tests {
         }
         assert!(LayerStateMap::new(&kinds, &[0], 2).is_err());
         assert!(LayerStateMap::new(&[Gdn], &[2], 2).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod decode_extent_tests {
+    use super::*;
+
+    #[test]
+    fn declared_decode_extent_matches_real_tp2_layout() -> Result<()> {
+        use crate::shared::experts::rtx::PartialDtype;
+        for (wire, partial) in [(true, PartialDtype::F32), (false, PartialDtype::Bf16)] {
+            for hidden in [4096, 5120] {
+                let layout = Tp2Rows::new(hidden, 8, DECODE_ROWS, wire, partial)?;
+                let actual = cuteafd_loader::placement::families::qwen4::QwenTp2Rows::new(
+                    hidden as u64, 8, DECODE_ROWS as u64, wire)?;
+                assert_eq!(layout.transfer_bytes() as u64, actual.bytes.max(actual.partial_bytes));
+                assert!(layout.transfer_bytes() <= layout.exchange_slot_bytes);
+            }
+        }
         Ok(())
     }
 }

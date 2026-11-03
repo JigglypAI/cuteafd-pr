@@ -1896,10 +1896,15 @@ impl Opened {
             (Some(_), Some(path)) if cuteafd_loader::placement::families::glm5_flash::remote_dflash_requested()
                 && !dspark::is_dspark(path)? => {
                 let (device, peer_stream) = peer_stream.context("remote draft needs the peer target stream")?;
+                let config = serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
+                let capacity = cuteafd_loader::families::glm5::draft_representation::flash_draft_capacity(&config,
+                    args.draft_context_slots, args.draft_sequences)?;
+                let draft = crate::shared::speculation::dflash::DflashConfig::read(path)?;
                 Some(crate::shared::draft::remote::Prepared::new(&self.library,
                     crate::shared::peer_split::RankDevice { device: args.device, stream },
                     crate::shared::peer_split::RankDevice { device, stream: peer_stream },
-                    0, remote_dflash::IDENTITY)?)
+                    0, remote_dflash::IDENTITY, crate::shared::draft::remote::decode_extent(
+                        capacity.block_rows, draft.hidden, draft.vocab, 0)?)?)
             },
             _ => None,
         };

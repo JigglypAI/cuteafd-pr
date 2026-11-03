@@ -1110,7 +1110,7 @@ impl<'a> MimoEngine<'a> {
         let exchange = {
             let _owner = cuteafd_ffi::memory_ledger::owner("mimo/transport/peer");
             let exchange = PeerExchange::new_abortable_sized(library, [RankDevice { device: self.device, stream: self.stream },
-            RankDevice { device, stream }], &cuteafd_loader::families::mimo_v2::admission::peer_slot_bytes(rows, prefill_lanes, self.cfg.hidden)?)?.with_decode_lane_bytes(80 * self.cfg.hidden * 2)?;
+            RankDevice { device, stream }], &cuteafd_loader::families::mimo_v2::admission::peer_slot_bytes(rows, prefill_lanes, self.cfg.hidden)?, decode_peer_bytes(self.cfg.hidden)?)?;
             let ledger = cuteafd_ffi::memory_ledger::snapshot();
             for (rank, gpu) in [self.device, device].into_iter().enumerate() {
                 let planned = cuteafd_loader::families::mimo_v2::admission::transport_reservations(
@@ -3515,4 +3515,29 @@ mod tests {
         assert!(a.prefill_tables(65, 256).is_err(), "unadmitted pages cannot be queued");
         assert!(b.prefill_tables(1, 66).is_err(), "context overflow cannot be queued");
     }
+}
+
+
+#[cfg(test)]
+mod decode_extent_tests {
+    use super::*;
+
+    #[test]
+    fn declared_decode_extent_matches_native_decode_planes() -> Result<()> {
+        use cuteafd_loader::families::mimo_v2::{admission::peer_slot_bytes, decode_graph::MIMO_DECODE_ROWS};
+        for hidden in [4096, 7168] {
+            let actual = MIMO_DECODE_ROWS * hidden * 2;
+            assert_eq!(decode_peer_bytes(hidden)?, actual);
+            assert_eq!(peer_slot_bytes(2048, 3, hidden)?[..4], [actual; 4]);
+            for topk in [6, 8] {
+                let routes = crate::shared::experts::rtx::pair::PackedRoutes::new(MIMO_DECODE_ROWS, topk);
+                assert_eq!((MIMO_DECODE_ROWS * topk * 4).next_multiple_of(16) * 2, routes.bytes);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn decode_peer_bytes(hidden: usize) -> Result<usize> {
+    Ok(cuteafd_loader::families::mimo_v2::admission::peer_slot_bytes(1, 1, hidden)?[0])
 }
