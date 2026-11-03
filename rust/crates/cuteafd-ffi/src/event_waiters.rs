@@ -67,10 +67,19 @@ impl EventWaiters {
             .send(Wait { event, tag }).map_err(|_| anyhow::anyhow!("copy waiter closed"))
     }
 
-    pub fn complete(&self) -> Result<u32> {
-        let (tag, result) = self.completed.recv().context("copy waiters closed")?;
-        result?;
-        Ok(tag)
+    /// Sleep for a completion, with a bounded wait so the receiver can also
+    /// service newly arriving socket events when only a slow stream is pending.
+    pub fn complete(&self, timeout: Option<std::time::Duration>) -> Result<Option<u32>> {
+        let completion = match timeout {
+            Some(timeout) => match self.completed.recv_timeout(timeout) {
+                Ok(value) => value,
+                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => anyhow::bail!("copy waiters closed"),
+            },
+            None => self.completed.recv().context("copy waiters closed")?,
+        };
+        completion.1?;
+        Ok(Some(completion.0))
     }
 
     /// Close submissions and join every waiter, including on cancellation.

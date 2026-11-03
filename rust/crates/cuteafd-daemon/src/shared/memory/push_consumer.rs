@@ -99,10 +99,11 @@ impl<'a> Copies<'a> {
         }
         Ok(copies)
     }
-    fn complete(&mut self, arena: &mut impl PushDestination, rank: &impl RankEvents) -> Result<()> {
+    fn complete(&mut self, arena: &mut impl PushDestination, rank: &impl RankEvents, receive: bool) -> Result<()> {
         // Every stream has a sleeping waiter: one slow stream cannot hold the
         // credits of a different stream whose event has already completed.
-        let slot = self.waiters.complete()?;
+        let timeout = receive.then_some(std::time::Duration::from_millis(1));
+        let Some(slot) = self.waiters.complete(timeout)? else { return Ok(()); };
         let fragments = self.pending.get(&slot).context("unknown completed slot")?;
         for &(offset, bytes) in fragments {
             arena.copied(offset, bytes)?;
@@ -184,7 +185,7 @@ pub(crate) fn consume<'a, A: PushDestination>(
     let looped = (|| -> Result<()> {
     while !done {
         if copies.pending.len() == window {
-            copies.complete(&mut arena, &rank)?;
+            copies.complete(&mut arena, &rank, false)?;
         }
         let event = if !started {
             started = true;
@@ -195,7 +196,7 @@ pub(crate) fn consume<'a, A: PushDestination>(
             match rank.try_next()? {
                 Poll::Ready(event) => event,
                 Poll::Empty => {
-                    copies.complete(&mut arena, &rank)?;
+                    copies.complete(&mut arena, &rank, true)?;
                     continue;
                 }
                 Poll::Closed => anyhow::bail!("push closed before Done"),
@@ -267,7 +268,7 @@ pub(crate) fn consume<'a, A: PushDestination>(
         }
     }
     while !copies.pending.is_empty() {
-        copies.complete(&mut arena, &rank)?;
+        copies.complete(&mut arena, &rank, false)?;
     }
     Ok(())
     })();
