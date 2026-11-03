@@ -928,7 +928,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
                                     'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker bootstrap ready}"; '
-                                    'echo "audio encoder ready backend=mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '" ;; esac\n' +
+                                    'printf "audio encoder ready \\033[3mbackend\\033[0m\\033[2m=\\033[0m%s\\n" '
+                                    '"${STUB_AUDIO_BACKEND:-mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '}" ;; esac\n' +
                                     ('case "$*" in image\\ inspect*) echo test-pin ;; '
                                      'cp\\ *) dst="${@: -1}"; mkdir -p "$dst"; '
                                      'touch "$dst/cuteafd" "$dst/libcuteafd_native.so" "$dst/release-entrypoint.sh"; '
@@ -3389,6 +3390,22 @@ def test_mimo_media_plan_keeps_ingress_onboarding_and_graph_contract(tmp_path, i
     assert "--context-tokens 262144" in preflight and "--max-context 262144" in launch
     assert "--mimo-decode-graphs" in preflight and "--decode-graphs true" in launch
     assert "--full-prefill-logits" in preflight and "--full-prefill-logits" in launch
+
+
+@pytest.mark.parametrize("backend", ["mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/exportbad",
+                                     "mimo_audio_fp32_v1/invalid", "unknown-backend"])
+def test_audio_ready_rejects_malformed_backend_identity(tmp_path, backend):
+    config = {"model_type": "mimo_v2", "hidden_size": 4096, "num_hidden_layers": 2,
+              "moe_layer_freq": [0, 1], "audio_token_id": 151669, "audio_config": {"audio_channels": 20}}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32,
+            "encoder": {"kind": {"kind": "off"}, "replicas": []},
+            "audio_encoder": {"kind": {"kind": "spark", "rank": 0}, "replicas": []}}
+    result = _family_launch_result(tmp_path, config, "test/mimo", "VISION=off\nAUDIO=auto\nRTX_GPUS=1\nSPECULATOR=off\n",
+                                  encoder_plan=plan, extra_env={"STUB_AUDIO_BACKEND": backend})
+    assert result.returncode != 0
+    assert "invalid ready audio backend identity" in result.stderr
+    assert "serve-mimo --snapshot" not in result.stderr
 
 
 @pytest.mark.parametrize("vision_kind,audio_kind", [("off", "spark"), ("spark", "spark"), ("rtx", "spark"), ("spark", "rtx"), ("rtx", "rtx")])

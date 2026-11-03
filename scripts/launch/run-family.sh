@@ -3096,9 +3096,13 @@ if ((${#audio_encoder_ranks[@]})); then
     host="$(get "SPARK_${audio_rank}_HOST")"
     backend="$(ssh "$host" "docker logs cuteafd-spark-expert-$host-$port 2>&1" | python3 -c '
 import re,sys
-matches=re.findall(r"mimo_audio_fp32_v1/cuda[0-9]+/cufft[0-9]+/cublas[0-9.]+/cute_aot_sm121/export[0-9a-f]{64}",sys.stdin.read())
+text=re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", sys.stdin.read())
+matches=[backend for line in text.splitlines() if "audio encoder ready" in line
+    for backend in re.findall(r"\bbackend=\"?([^\s\"]+)", line)]
 assert matches and len(set(matches))==1, "missing or conflicting ready audio backend identity"
-print(matches[0])')"
+backend=matches[0]
+assert re.fullmatch(r"(?:mimo_audio_fp32_v1/cuda[0-9]+/cufft[0-9]+/cublas[0-9.]+/cute_aot_sm121/export[0-9a-f]{64}|pcm-bf16-aot-v1)", backend), "invalid ready audio backend identity"
+print(backend)')"
     [[ -z "$audio_backend" || "$audio_backend" == "$backend" ]] || release_die "audio replicas have different backend exports"
     audio_backend="$backend"
   done
