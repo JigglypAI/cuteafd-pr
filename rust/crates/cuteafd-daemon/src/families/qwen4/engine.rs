@@ -511,7 +511,8 @@ mod tests {
         check_bucket_thresholds(PLAIN_BUCKETS, DECODE_PROJECTION_THRESHOLDS).unwrap();
         check_bucket_thresholds(SPEC_BUCKETS, DECODE_PROJECTION_THRESHOLDS).unwrap();
         for (real, spec, bucket) in [(5, false, 8), (9, false, 16), (3, true, 4),
-            (17, false, 24), (25, false, 32), (33, false, 64), (64, false, 64),
+            (17, false, 24), (24, false, 24), (25, false, 32), (32, false, 32),
+            (33, false, 64), (64, false, 64),
             (5, true, 8), (9, true, 16), (17, true, 24), (25, true, 32), (33, true, 64)] {
             assert_eq!(decode_bucket(real, spec), bucket);
             for projection in DECODE_PROJECTION_THRESHOLDS {
