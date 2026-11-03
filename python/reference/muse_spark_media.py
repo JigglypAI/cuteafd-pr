@@ -108,7 +108,8 @@ def load_modules(snapshot, kind, dtype):
         MuseSparkVisionModel, MuseSparkVisionAdapter, MuseSparkAudioModel)
     config = MuseSparkConfig.from_pretrained(snapshot, local_files_only=True)
     config.vision_config._attn_implementation = "sdpa"
-    config.audio_config.samples_per_token = audio_contract(snapshot)["samples_per_token"]
+    if config.audio_config.samples_per_token != audio_contract(snapshot)["samples_per_token"]:
+        raise ValueError("official audio samples_per_token differs from the checkpoint processor")
     with torch.device("meta"):
         if kind == "image":
             modules = [(MuseSparkVisionModel(config.vision_config), "model.vision_tower."),
