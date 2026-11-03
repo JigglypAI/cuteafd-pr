@@ -543,19 +543,9 @@ pub(crate) struct ServeArgs {
     pub api: crate::shared::api::ApiArgs,
 }
 
-fn resolve_draft_capacity(args: &mut ServeArgs) {
-    if args.draft.is_some() && !cuteafd_loader::formats::block_dspark::supports_sequences(args.max_sequences as usize) {
-        tracing::info!(concurrency = args.max_sequences,
-            "dense dSpark native sequence capacity exceeded; serving anchor-only");
-        args.draft = None;
-        args.draft_fixed = None;
-    }
-}
-
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     cuteafd_core::concurrency::validate("qwen3_5", args.max_sequences as u64)?;
     args.prefix.resolve_entries(args.max_sequences as usize);
-    resolve_draft_capacity(&mut args);
     use cuteafd_api::openai::{chat::qwen4::QwenEncoding, ModelEncoding, ModelProfile};
     use std::sync::{Arc, Mutex};
     let api = args.api.load()?;
@@ -759,11 +749,10 @@ mod tests {
     }
 
     #[test]
-    fn dense_dspark_capacity_falls_back_without_changing_target_concurrency() {
-        for c in [17, 32, 33, 64] {
-            let mut args = Cli::try_parse_from(["dense", "--snapshot", "checkpoint", "--native-lib", "native.so",
+    fn dense_dspark_preserves_drafting_through_boot_capacity() {
+        for c in [1, 16, 17, 32, 33, 64] {
+            let args = Cli::try_parse_from(["dense", "--snapshot", "checkpoint", "--native-lib", "native.so",
                 "--draft", "external", "--draft-fixed", "3", "--max-sequences", &c.to_string()]).unwrap().serve;
-            resolve_draft_capacity(&mut args);
             assert_eq!(usize::from(args.max_sequences), c);
             assert_eq!(args.draft.is_some(), c <= block_dspark::MAX_SEQUENCES);
             assert_eq!(args.draft_fixed.is_some(), c <= block_dspark::MAX_SEQUENCES);
