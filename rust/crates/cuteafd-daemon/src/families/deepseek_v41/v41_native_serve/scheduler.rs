@@ -856,7 +856,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     // Keep pending owners outside the fallible loop so every fatal exit can drain them.
     let mut admitted = std::collections::VecDeque::<PackedAdmission>::new();
     let mut media_ready = std::collections::VecDeque::new();
-    let result = (|| -> Result<()> {
+    let result = crate::shared::api::run_scheduler(|| {
     loop {
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
@@ -1055,7 +1055,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     if requests.images(lease)?.needed(start, prompt.len())?.is_empty() { prompt.len() } else { start }
                 };
                 Ok((image_keys, hit, restore, resume))
-            })();
+            });
             let (image_keys, hit, restore, resume) = match admitted {
                 Ok(value) => value,
                 Err(error) => {

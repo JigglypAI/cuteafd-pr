@@ -540,7 +540,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     ready();
     // Keep admitted request owners alive until a fatal cause has reached every
     // affected client, including requests waiting for prefill or KV admission.
-    let result = (|| -> Result<()> { loop {
+    let result = crate::shared::api::run_scheduler(|| { loop {
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
@@ -878,7 +878,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                         }
                     };
                     Ok(request)
-                })();
+                });
                 match admitted {
                     Ok(mut request) => {
                         let token = request.next;
