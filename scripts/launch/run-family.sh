@@ -262,6 +262,8 @@ EXPERT_PORT
 SPARK_DEVICE_BUDGET_BYTES
 MAX_CONTEXT_TOKENS
 RTX_EXPERT_LAYERS
+EXLR8_MANIFEST
+EXLR8_PREFILL_ACTIVATIONS
 PROBE_DUMP_ROOT
 DRAFT_SURVIVAL_LENGTHS
 DRAFT_POLICY
@@ -311,8 +313,6 @@ PREFILL_PACKING
 PREFILL_ROWS
 PREFILL_WAVES
 PREFILL_SPAN_ROWS
-EXLR8_MANIFEST
-EXLR8_PREFILL_ACTIVATIONS
 RTX_EXPERT_PEER
 L2_PREFETCH
 FP8_SCALES
@@ -1875,8 +1875,7 @@ if [[ -n "$exlr8_prefill_activations" ]]; then
 fi
 exlr8_plan_args=()
 if [[ -n "$exlr8_manifest" ]]; then
-  [[ "$family" == glm5 ]] || release_die "EXLR8 is supported only for glm5"
-  [[ "$exlr8_manifest" == up1 || "$exlr8_manifest" == bit325 ]] || release_die "EXLR8_MANIFEST must be up1 or bit325"
+  [[ "$exlr8_manifest" != *[!a-zA-Z0-9_-]* ]] || release_die "EXLR8_MANIFEST must be a published name, not a path"
   exlr8_gpu_count="$(get RTX_GPUS 1)"
   [[ ( "$exlr8_gpu_count" == 1 || "$exlr8_gpu_count" == 2 ) && "$ranks" -ge 1 && "$ranks" -le 8 ]] || release_die "EXLR8 requires 1..2 RTX GPUs and 1..8 canonical Spark ranks"
   [[ "$(get SPECULATOR dflash2)" == off || "$(get SPECULATOR dflash2)" == dflash2 ]] || release_die "EXLR8 supports SPECULATOR=off or dflash2"

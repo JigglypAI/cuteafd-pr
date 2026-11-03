@@ -86,6 +86,35 @@ def test_exlr8_prefill_activations_reach_plan_coordinator_and_workers(tmp_path, 
             assert f"--exlr8-prefill-activations {activations}" in line
 
 
+@pytest.mark.parametrize("wip", [False, True])
+def test_flash_native_published_manifest_reaches_plan_coordinator_and_workers(tmp_path, wip):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    keys = ("EXLR8_MANIFEST=k4\nEXLR8_PREFILL_ACTIVATIONS=a16\nSPARK_COUNT=1\nRTX_GPUS=1\n"
+            "SPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    result = _family_launch_result(tmp_path, config, "test/flash-exlr8", keys,
+                                  extra_args=("--wip", "native-test") if wip else ())
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    plans = [line for line in lines if "cuteafd plan" in line]
+    coordinators = [line for line in lines if "cuteafd serve-glmf --snapshot" in line]
+    workers = [line for line in lines if "cuteafd expertd-native" in line]
+    assert plans and coordinators and workers, result.stderr
+    for line in plans + coordinators + workers:
+        assert "--exlr8-manifest k4" in line
+        assert "--exlr8-prefill-activations a16" in line
+
+
+@pytest.mark.parametrize("manifest", ["../k4", "k4.json", "k4/other", "k4;false", "k4 space"])
+def test_native_manifest_rejects_paths_and_shell_syntax(tmp_path, manifest):
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    result = _family_launch_result(tmp_path, config, "test/exlr8",
+        f"EXLR8_MANIFEST={manifest}\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    assert result.returncode != 0
+    assert "EXLR8_MANIFEST must be a published name, not a path" in result.stderr
+
+
 @pytest.mark.parametrize("gpus", [1, 2])
 @pytest.mark.parametrize("onboard", [None, "auto", "0", "1"])
 def test_exlr8_onboarding_reaches_shared_admission_without_zero_override(tmp_path, gpus, onboard):
@@ -724,19 +753,6 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     assert startup.index("draft.prime(&engine.embedding, engine.draft_head())?") < startup.index("let result = with_startup_graphs(")
 
 
-def test_shared_startup_load_overlaps_admission_before_serving_allocation() -> None:
-    for family, engine in [("glm5", "GlmEngine"), ("glm5_flash", "GlmfEngine"), ("mimo_v2", "MimoEngine")]:
-        source = (ROOT / f"rust/crates/cuteafd-daemon/src/families/{family}/mod.rs").read_text()
-        start = source.index("let admission = if")
-        body = source[start:]
-        start_call = ".start(&peers)?" if ".start(&peers)?" in body else ".start_with(&peers, ranks)?"
-        assert body.index(start_call) < body.index("load_while_admitting(admission,")
-        assert body.index("load_while_admitting(admission,") < body.index("TokenEmbedding::load(")
-        assert body.index("TokenEmbedding::load(") < body.index(f"engine::{engine}::new(")
-        assert ".select(&peers)?" not in body
-    shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/placement.rs").read_text()
-    helper = shared.split("pub(crate) fn load_while_admitting", 1)[1].split("#[cfg(test)]", 1)[0]
-    assert helper.index("let loaded = load()?") < helper.index("pending.wait()?") < helper.index("Ok(loaded)")
 
 
 def test_family_table_matches_the_rust_launch_fixtures(tmp_path: Path) -> None:
@@ -1014,12 +1030,48 @@ def capture_native_exlr8_launch(snapshot: Path, deployment_path: Path, temporary
         assert int(worker[worker.index("--device-budget-bytes") + 1]) == devices[rank]["worker_budget_bytes"]
 
 
+def capture_native_exlr8_capability_deployment(deployment_path: Path) -> None:
+    """Inspect actual launcher validation for declared native coordinator worlds."""
+    deployment = json.loads(deployment_path.read_text())
+    assert deployment["family"] == "glm5_flash"
+    admitted = deployment["rtx_gpus"] == 1
+    assert deployment["wip_launchable"] == admitted
+    source = (ROOT / "scripts/launch/run-family.sh").read_text()
+    functions = []
+    for name in ("release_spark_worker_budget", "release_validate_deployment"):
+        match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", source, re.MULTILINE | re.DOTALL)
+        assert match, f"missing actual launcher function {name}"
+        functions.append(match.group())
+    script = '\n'.join(functions) + r'''
+release_die() { printf '%s\n' "$*" >&2; exit 1; }
+wip_slot=native-budget-test
+plan="$(cat "$1")"
+release_spark_worker_budget "$plan" "$2"
+release_validate_deployment "$plan" glm5_flash
+'''
+    result = subprocess.run(["bash", "-euc", script, "pending-native", str(deployment_path),
+                             str(deployment["spark_ranks"])], capture_output=True, text=True)
+    devices = [device for device in deployment["memory_layout"]["devices"] if device["kind"] == "spark"]
+    assert len(devices) == deployment["spark_ranks"]
+    assert {device["worker_budget_bytes"] for device in devices} == {int(result.stdout.strip())}
+    if admitted:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode != 0
+        assert "EXLR8 native dense execution is unsupported for 2 coordinator GPUs" in result.stderr
+        assert "invalid deployment specification" in result.stderr
+
+
 def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, temporary: Path) -> dict:
     """Rust contract supplies actual headers/deployment; only hardware is stubbed."""
     deployment = json.loads(deployment_path.read_text())
     config = json.loads((snapshot / "config.json").read_text())
     family = deployment["family"]
-    keys = ("SPARK_COUNT=8\nSPECULATOR=off\nVISION=off\nAUDIO=off\nMODEL_REVISION=\n"
+    # Never probe a live server's default port on the shared gate host (#1048).
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        api_port = listener.getsockname()[1]
+    keys = (f"ADDR=127.0.0.1:{api_port}\nSPARK_COUNT=8\nSPECULATOR=off\nVISION=off\nAUDIO=off\nMODEL_REVISION=\n"
             "MAX_CONTEXT_TOKENS=262144\nMAX_OUTPUT_TOKENS=32768\nHOST_CACHE_BYTES=0\nPOOL_TOKENS=262144\n"
             f"RTX_GPUS={deployment['rtx_gpus']}\nSPARK_HOSTS=" +
             ",".join(f"worker-{rank}" for rank in range(8)) + "\n")

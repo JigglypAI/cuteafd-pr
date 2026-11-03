@@ -109,13 +109,14 @@ def family_scopes(cards, config_reader):
         # EXLR8 checkpoints retain family coordinator programs without expert packages.
         exlr8 = bool(values.get('EXLR8_MANIFEST'))
         if exlr8:
-            if family != 'glm5':
-                raise ValueError(f'EXLR8_MANIFEST is supported only for glm5 checkpoints, not {family}')
             env['CUTEAFD_WIP_EXLR8_AOT'] = 'ON'
         for fam, tag, switch in [('glm5', 'glm', 'GLM'), ('glm5_flash', 'glmf', 'GLMF'), ('mimo_v2', 'mimop' if 'pro' in card['name'] else 'mimof', 'MIMO'), ('qwen4', 'qwen4', 'QWEN4'), ('step5', 'step5', 'STEP5')]:
             if family == fam:
                 env['CUTEAFD_WIP_' + switch + '_AOT'] = 'ON'
                 if exlr8:
+                    families = set(filter(None, env.get('CUTEAFD_WIP_EXLR8_FAMILIES', '').split(';')))
+                    families.add(tag)
+                    env['CUTEAFD_WIP_EXLR8_FAMILIES'] = ';'.join(sorted(families))
                     continue
                 if count and fam != 'step5':
                     counts.add(f"{tag}={int(values.get('SPARK_TP', count))}")
