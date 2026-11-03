@@ -82,13 +82,13 @@ static inline int cuteafd_expert_pack_window_geometry(uint32_t hidden,
   const uint32_t k = projection == 2 ? intermediate : hidden;
   const uint32_t n = projection == 2 ? hidden : 2 * stored;
   const uint64_t columns = k / 8;
-  const uint64_t base = compact ? uint64_t(half) * columns : 0;
+  const uint64_t base = compact ? (uint64_t)half * columns : 0;
   const uint32_t local_first = compact ? first : half + first;
   const uint32_t local_end = compact ? end : half + end;
-  const uint64_t begin = base + uint64_t(local_first / tile) * tile * columns;
-  const uint64_t limit = compact && projection != 2 ? base + uint64_t(stored) * columns
-      : uint64_t(n) * columns;
-  uint64_t stop = base + uint64_t((local_end + tile - 1) / tile) * tile * columns;
+  const uint64_t begin = base + (uint64_t)(local_first / tile) * tile * columns;
+  const uint64_t limit = compact && projection != 2 ? base + (uint64_t)stored * columns
+      : (uint64_t)n * columns;
+  uint64_t stop = base + (uint64_t)((local_end + tile - 1) / tile) * tile * columns;
   if (stop > limit) stop = limit;
   out->n = n; out->k = k;
   out->half = compact && projection != 2 ? stored : 0;
