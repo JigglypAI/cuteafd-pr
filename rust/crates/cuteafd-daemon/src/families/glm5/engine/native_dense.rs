@@ -45,6 +45,22 @@ impl<'a> NativeScratch<'a> {
             qkv: stage("qkv")?, q: stage("q")?, gate: stage("gate")?, up: stage("up")?,
             hidden: stage("hidden")?, kw: stage("kw")?, iq: stage("iq")?, values: stage("values")? })
     }
+
+    /// Retained physical owners, independent of the admission layouts.
+    pub(super) fn allocation_buffers(&self) -> Vec<(&'static str, Buffer)> {
+        let linear = self.linear.view();
+        let mut buffers = vec![
+            ("linear.rotated", linear.rotated), ("linear.table", linear.table),
+            ("linear.block_scales", linear.block_scales), ("linear.partial", linear.partial),
+            ("linear.acc", linear.acc),
+            ("stage.qkv", self.qkv.buffer), ("stage.q", self.q.buffer),
+            ("stage.gate", self.gate.buffer), ("stage.up", self.up.buffer),
+            ("stage.hidden", self.hidden.buffer), ("stage.kw", self.kw.buffer),
+            ("stage.iq", self.iq.buffer), ("stage.values", self.values.buffer),
+        ];
+        if let Some(records) = linear.records { buffers.push(("linear.records", records)); }
+        buffers
+    }
 }
 
 /// A buffer's first `bytes`.

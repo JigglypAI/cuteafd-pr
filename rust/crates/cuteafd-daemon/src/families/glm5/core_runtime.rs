@@ -78,10 +78,7 @@ impl<'a> CorePrograms<'a> {
         let index = usize::from(!decode);
         let layout = &self.layouts[index];
         ensure!(rows == layout.rows, "GLM K6 scratch differs from admitted row capacity");
-        let projection = layout.allocate(device)?;
-        let stages = self.stages[index].extents.iter().map(|(&name, &bytes)|
-            Ok((name, Allocation::new(device, bytes)?))).collect::<Result<_>>()?;
-        Ok(CoreScratch { projection, stages })
+        CoreScratch::new(device, layout, &self.stages[index])
     }
 }
 
@@ -89,9 +86,21 @@ pub(crate) struct CoreScratch<'a> {
     pub projection: ProjectionScratch<'a>,
     stages: BTreeMap<&'static str, Allocation<'a>>,
 }
-impl CoreScratch<'_> {
+impl<'a> CoreScratch<'a> {
+    pub(crate) fn new(device: Device<'a>, layout: &ProjectionLayout,
+        stages: &cuteafd_loader::families::glm5::core::CoreStageLayout) -> Result<Self> {
+        let projection = layout.allocate(device)?;
+        let stages = stages.extents.iter().map(|(&name, &bytes)|
+            Ok((name, Allocation::new(device, bytes)?))).collect::<Result<_>>()?;
+        Ok(Self { projection, stages })
+    }
+
     pub(crate) fn stage(&self, name: &str) -> Result<Buffer> {
         Ok(self.stages.get(name).with_context(|| format!("GLM K6 missing stage {name}"))?.buffer)
+    }
+
+    pub(crate) fn allocation_stages(&self) -> impl Iterator<Item = (&'static str, Buffer)> + '_ {
+        self.stages.iter().map(|(&name, owner)| (name, owner.buffer))
     }
 }
 fn stage_program(name: &str, ranks: usize) -> bool {

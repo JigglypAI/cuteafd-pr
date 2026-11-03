@@ -5,6 +5,48 @@ use cuteafd_loader::placement::{
     families::glm5::buffers::TargetBuffers,
     planner::{self, *},
 };
+use cuteafd_loader::{
+    families::glm5::{
+        core::{CoreRankLayout, CoreStageLayout},
+        native::ScratchLayout,
+    },
+    formats::trellis_core::ProjectionScratchLayout,
+    placement::families::glm5::hooks::HookBuffers,
+    plan::exlr8::dense::scratch::LinearScratchLayout,
+};
+
+fn native_layout(cfg: &GlmDsaConfig, rows: usize) -> Result<ScratchLayout> {
+    ScratchLayout::new(
+        cfg,
+        cfg.heads / 2,
+        cfg.dense_intermediate / 2,
+        rows,
+        LinearScratchLayout {
+            rotated: rows * 128 * 2,
+            table: 256,
+            block_scales: 256,
+            partial: 1024,
+            records: (rows > 64).then_some(640),
+            acc: rows * 256 * 4,
+        },
+    )
+}
+
+fn core_layout(cfg: &GlmDsaConfig, rows: usize) -> Result<CoreRankLayout> {
+    Ok(CoreRankLayout {
+        body: vec![],
+        stages: Some([
+            CoreStageLayout::new(cfg, DECODE_ROWS, 2, false)?,
+            CoreStageLayout::new(cfg, rows, 2, false)?,
+        ]),
+        decode: Some(ProjectionScratchLayout::new(128, 256, DECODE_ROWS)?),
+        prefill: Some(ProjectionScratchLayout::new(128, 256, rows)?),
+        target_head: None,
+        draft_head: None,
+        retained_rows: 0,
+        receive_suffix: 0,
+    })
+}
 
 fn plan(
     cfg: &GlmDsaConfig,
@@ -13,6 +55,8 @@ fn plan(
     pages: u64,
     shape: PrefillShape,
     full: bool,
+    native: bool,
+    core: bool,
 ) -> Result<ResolvedPlan> {
     let mut contract = Contract::fixed(
         128,
@@ -48,6 +92,25 @@ fn plan(
                 core_rows: false,
             }
             .components(cfg)?,
+        );
+        contract.components.extend(
+            HookBuffers {
+                device: rank,
+                maximum_pages: 128,
+                native: native
+                    .then(|| {
+                        Ok::<_, anyhow::Error>([
+                            native_layout(cfg, DECODE_ROWS)?,
+                            native_layout(cfg, shape.rows as usize)?,
+                        ])
+                    })
+                    .transpose()?,
+                core: core
+                    .then(|| core_layout(cfg, shape.rows as usize))
+                    .transpose()?,
+                shared_workspace: None,
+            }
+            .components()?,
         );
     }
     let facts = contract.facts(&[0, 0], pages / 2)?;
@@ -96,10 +159,11 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
     let directory = tempfile::tempdir_in(fixture.directory())?;
     let path = directory.path().join("embedding.bf16");
     std::fs::write(&path, vec![0; cfg.vocab_size * cfg.hidden * 2])?;
-    for (partitioned, owned, waves, full, pages) in [
-        (false, false, 1, false, 2),
-        (true, false, 3, true, 64),
-        (false, true, 3, false, 66),
+    for (partitioned, owned, waves, full, pages, native, core) in [
+        (false, false, 1, false, 2, false, false),
+        (true, false, 3, true, 64, false, false),
+        (false, true, 3, false, 66, false, false),
+        (false, false, 3, false, 2, true, true),
     ] {
         let library = fixture.load()?;
         fixture.quiet_events(&library, true)?;
@@ -154,7 +218,21 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
             GlmLayer::allocation_fixture(&library, &cfg, 1, owners)
         })?;
         engine.attach_peer(1, stream, layers)?;
-        let expected = plan(&cfg, partitioned, owners, pages, shape, full)?;
+        if native {
+            // Only an ownership marker is loaded; no numerical native programs run.
+            engine.weights.layers[0]
+                .native
+                .insert("fixture".into(), DeviceAllocation::new(&library, 256)?);
+            engine.native_scratch = (0..2)
+                .map(|_| {
+                    Ok([
+                        native_layout(&cfg, DECODE_ROWS)?,
+                        native_layout(&cfg, shape.rows as usize)?,
+                    ])
+                })
+                .collect::<Result<_>>()?;
+        }
+        let expected = plan(&cfg, partitioned, owners, pages, shape, full, native, core)?;
         assert!(
             planner::reconcile(&expected, Phase::Warmup, &engine.target_buffer_receipts()?)
                 .is_err()
@@ -162,6 +240,46 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
         *engine.decode_workspace.borrow_mut() = Some(engine.workspace(DECODE_ROWS, true)?);
         let _ = engine.peer_workspaces(true, 1)?;
         engine.ensure_prefill_slots()?;
+        if core {
+            // Allocate through the production CoreScratch constructor; program binding is not
+            // emulated. The retained workspaces expose the actual projection owners and views.
+            for rank in 0..2 {
+                let device = crate::shared::memory::device::Device {
+                    library: &library,
+                    id: rank as i32,
+                };
+                let layout = core_layout(&cfg, shape.rows as usize)?;
+                let allocate = |index: usize| {
+                    let projection = if index == 0 {
+                        layout.decode.as_ref()
+                    } else {
+                        layout.prefill.as_ref()
+                    }
+                    .unwrap();
+                    super::super::super::core_runtime::CoreScratch::new(
+                        device,
+                        &crate::shared::dense_trellis::ProjectionLayout {
+                            extents: projection.extents.clone(),
+                            rows: projection.rows,
+                        },
+                        &layout.stages.as_ref().unwrap()[index],
+                    )
+                    .map(Rc::new)
+                };
+                let decode = allocate(0)?;
+                let prefill = allocate(1)?;
+                let (decode_slot, prefill_slots) = if rank == 0 {
+                    (&engine.decode_workspace, &engine.prefill_slots)
+                } else {
+                    let peer = engine.peer()?;
+                    (&peer.decode_workspace, &peer.prefill_slots)
+                };
+                decode_slot.borrow_mut().as_mut().unwrap().core = Some(decode);
+                for slot in prefill_slots.borrow_mut().iter_mut() {
+                    slot.core = Some(prefill.clone());
+                }
+            }
+        }
         // Emulate the actual warmup metadata writers without launching a numerical kernel.
         for rank in 0..2 {
             let decode = if rank == 0 {
@@ -191,8 +309,36 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
                 Ok(())
             })?;
         }
-        let actual = engine.target_buffer_receipts()?;
+        let receipts = || -> Result<Vec<Receipt>> {
+            let mut actual = engine.target_buffer_receipts()?;
+            actual.extend(engine.target_hook_receipts()?);
+            Ok(actual)
+        };
+        let actual = receipts()?;
         planner::reconcile(&expected, Phase::Warmup, &actual)?;
+        if core {
+            let slots = engine.prefill_slots.borrow();
+            let original = slots[0].core.as_ref().unwrap().clone();
+            drop(slots);
+            let device = crate::shared::memory::device::Device {
+                library: &library,
+                id: 0,
+            };
+            let layout = core_layout(&cfg, shape.rows as usize)?;
+            let projection = layout.prefill.as_ref().unwrap();
+            let replacement = Rc::new(super::super::super::core_runtime::CoreScratch::new(
+                device,
+                &crate::shared::dense_trellis::ProjectionLayout {
+                    extents: projection.extents.clone(),
+                    rows: projection.rows,
+                },
+                &layout.stages.as_ref().unwrap()[1],
+            )?);
+            engine.prefill_slots.borrow_mut()[1].core = Some(replacement);
+            assert!(engine.target_hook_receipts().is_err());
+            engine.prefill_slots.borrow_mut()[1].core = Some(original);
+            planner::reconcile(&expected, Phase::Warmup, &receipts()?)?;
+        }
         let mut wrong = actual.clone();
         let index = wrong
             .iter()
@@ -221,7 +367,7 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
             drop(slots);
             let saved = engine.prefill_slots.borrow()[1].h.clone();
             engine.prefill_slots.borrow_mut()[1].h = original;
-            let aliased = engine.target_buffer_receipts()?;
+            let aliased = receipts()?;
             assert!(planner::reconcile(&expected, Phase::Warmup, &aliased).is_err());
             engine.prefill_slots.borrow_mut()[1].h = saved;
         }

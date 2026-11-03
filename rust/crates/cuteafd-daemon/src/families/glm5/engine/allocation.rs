@@ -17,6 +17,16 @@ impl Census {
         lifetime: Lifetime,
         category: Category,
     ) -> Result<()> {
+        self.record(id, buffer, lifetime, category, "GLM target buffers")
+    }
+    fn record(
+        &mut self,
+        id: &str,
+        buffer: cuteafd_ffi::CuteafdDeviceBuffer,
+        lifetime: Lifetime,
+        category: Category,
+        source: &str,
+    ) -> Result<()> {
         let device = u8::try_from(buffer.device_id).context("GLM buffer physical device")?;
         self.receipts.push(Receipt {
             allocation: Allocation::buffer(
@@ -25,10 +35,128 @@ impl Census {
                 buffer.bytes as u64,
                 lifetime,
                 category,
-                "GLM target buffers",
+                source,
             ),
             address: buffer.ptr as u64,
         });
+        Ok(())
+    }
+    fn projection(
+        &mut self,
+        kind: &str,
+        scratch: &crate::shared::dense_trellis::ProjectionScratch<'_>,
+        lifetime: Lifetime,
+        category: Category,
+    ) -> Result<()> {
+        for (&name, owner) in &scratch._owners {
+            self.record(
+                &format!("{kind}.storage.{}", name.replace(' ', "_")),
+                owner.buffer,
+                lifetime,
+                category,
+                "GLM target hooks",
+            )?;
+        }
+        for (&name, &buffer) in &scratch.buffers {
+            let start = buffer.ptr as usize;
+            let end = start
+                .checked_add(buffer.bytes)
+                .context("GLM hook view end")?;
+            let mut owners = scratch._owners.iter().filter(|(_, owner)| {
+                let base = owner.buffer.ptr as usize;
+                buffer.device_id == owner.buffer.device_id
+                    && start >= base
+                    && base
+                        .checked_add(owner.buffer.bytes)
+                        .is_some_and(|limit| end <= limit)
+            });
+            let (&backing, owner) = owners
+                .next()
+                .context("GLM hook view outside actual owners")?;
+            ensure!(
+                owners.next().is_none(),
+                "GLM hook view has ambiguous actual backing"
+            );
+            self.record(
+                &format!("{kind}.view.{name}"),
+                buffer,
+                lifetime,
+                category,
+                "GLM target hooks",
+            )?;
+            self.receipts.last_mut().unwrap().allocation.view = Some(View {
+                backing: format!(
+                    "{}.{kind}.storage.{}",
+                    self.prefix,
+                    backing.replace(' ', "_")
+                ),
+                offset: (start - owner.buffer.ptr as usize) as u64,
+            });
+        }
+        Ok(())
+    }
+    fn hooks(&mut self, kind: &str, slots: &[Workspace<'_>]) -> Result<()> {
+        let lifetime = Lifetime {
+            first: Phase::Warmup,
+            last: Phase::Growth,
+        };
+        let mut shared: Option<Vec<Receipt>> = None;
+        for w in slots {
+            let mut actual = Census {
+                prefix: self.prefix.clone(),
+                receipts: Vec::new(),
+            };
+            if let Some(native) = &w.native_dense {
+                for (name, buffer) in native.allocation_buffers() {
+                    actual.record(
+                        &format!("{kind}.native.{name}"),
+                        buffer,
+                        lifetime,
+                        Category::Workspace,
+                        "GLM target hooks",
+                    )?;
+                }
+            }
+            if let Some(core) = &w.core {
+                actual.projection(
+                    &format!("{kind}.core.projection"),
+                    &core.projection,
+                    lifetime,
+                    Category::Workspace,
+                )?;
+                for (name, buffer) in core.allocation_stages() {
+                    actual.record(
+                        &format!("{kind}.core.stage.{name}"),
+                        buffer,
+                        lifetime,
+                        Category::Workspace,
+                        "GLM target hooks",
+                    )?;
+                }
+            }
+            if let Some(native) = &w.native_shared {
+                actual.record(
+                    &format!("{kind}.native.shared"),
+                    native.allocation_buffer(),
+                    lifetime,
+                    Category::Workspace,
+                    "GLM target hooks",
+                )?;
+            }
+            if let Some(previous) = &shared {
+                ensure!(
+                    previous.len() == actual.receipts.len()
+                        && previous
+                            .iter()
+                            .zip(&actual.receipts)
+                            .all(|(a, b)| a.allocation == b.allocation && a.address == b.address),
+                    "GLM hook owners differ between retained slots"
+                );
+            } else {
+                shared = Some(actual.receipts);
+            }
+        }
+        self.receipts.extend(shared.into_iter().flatten());
         Ok(())
     }
     fn rows(
@@ -225,6 +353,71 @@ impl Census {
 }
 
 impl GlmEngine<'_> {
+    pub(crate) fn target_hook_receipts(&self) -> Result<Vec<Receipt>> {
+        let mut out = Vec::new();
+        for rank in 0..self.ranks() {
+            let (decode, prefill) = if rank == 0 {
+                (&self.decode_workspace, &self.prefill_slots)
+            } else {
+                let peer = self.peer()?;
+                (&peer.decode_workspace, &peer.prefill_slots)
+            };
+            let device = u8::try_from(self.exchange_device(rank)?).context("GLM hook device")?;
+            let mut census = Census {
+                prefix: format!("glm.target.gpu.{device}"),
+                receipts: Vec::new(),
+            };
+            if let Some(w) = decode.borrow().as_ref() {
+                census.hooks("decode", std::slice::from_ref(w))?;
+            }
+            census.hooks("prefill", &prefill.borrow())?;
+            if rank == 0 {
+                for (name, head, category) in [
+                    (
+                        "target_head",
+                        self.target_core_head.as_deref(),
+                        Category::Workspace,
+                    ),
+                    (
+                        "draft_head",
+                        self.draft_core_head.as_ref(),
+                        Category::Drafter,
+                    ),
+                ] {
+                    if let Some(head) = head {
+                        census.projection(
+                            &format!("core.{name}"),
+                            head.allocation_scratch(),
+                            Lifetime::TARGET,
+                            category,
+                        )?;
+                    }
+                }
+                for w in decode.borrow().iter().chain(prefill.borrow().iter()) {
+                    ensure!(
+                        match (&w.core_head, &self.target_core_head) {
+                            (Some(actual), Some(owner)) => Rc::ptr_eq(actual, owner),
+                            (None, None) => true,
+                            _ => false,
+                        },
+                        "GLM retained target head does not share its engine owner"
+                    );
+                }
+            } else {
+                ensure!(
+                    decode
+                        .borrow()
+                        .iter()
+                        .chain(prefill.borrow().iter())
+                        .all(|w| w.core_head.is_none()),
+                    "GLM peer retains an unexpected target head"
+                );
+            }
+            out.extend(census.receipts);
+        }
+        Ok(out)
+    }
+
     pub(crate) fn target_buffer_receipts(&self) -> Result<Vec<Receipt>> {
         let mut out = Vec::new();
         for rank in 0..self.ranks() {

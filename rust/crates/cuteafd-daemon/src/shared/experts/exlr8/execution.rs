@@ -362,6 +362,8 @@ impl<'a> Exlr8Execution<'a> {
             set,
         })
     }
+    pub(crate) fn allocation_buffer(&self) -> CuteafdDeviceBuffer { self.arena.buffer }
+
     fn buffer(&self, index: usize) -> Result<CuteafdDeviceBuffer> {
         let (offset, bytes) = self.layout.ranges[index];
         view(self.arena.buffer, offset, bytes)

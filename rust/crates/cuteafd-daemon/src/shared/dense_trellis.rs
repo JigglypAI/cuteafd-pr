@@ -270,6 +270,8 @@ impl<'a> CoreHead<'a> {
         Ok(Self { projection, scratch, device, stream, rows })
     }
 
+    pub(crate) fn allocation_scratch(&self) -> &ProjectionScratch<'a> { &self.scratch }
+
     pub(crate) fn launch(&self, weights: &CoreWeights<'_>, input: Buffer, output: Buffer,
         rows: usize, stream: *mut c_void) -> Result<()> {
         head_launch(self.rows, self.stream, rows, stream, || {
