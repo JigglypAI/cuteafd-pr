@@ -1075,9 +1075,11 @@ impl<'a> IndexSelectionWave<'a> {
             unsafe { self.storage.stream.library.cuda_graph_census_call(self.storage.stream.raw, c"index", rows, capture,
                 crate::shared::decode_graph::census::arm(), dispatch) }
         } else { dispatch() };
-        if launched.is_ok() {
-            // Order the completion event after this launch so the next in-place
-            // update can prove the executable is idle before mutating it.
+        if capture && launched.is_ok() {
+            // Order the completion event after this graph launch so the next
+            // in-place update can prove the executable is idle before mutating
+            // it. Eager rounds do not touch the executable, so they need no
+            // event (the last capture launch is still the one to drain).
             self.record_launch()?;
         }
         if self.audit && launched.is_ok() {
