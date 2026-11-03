@@ -262,6 +262,7 @@ cmake \
   -DCUTEAFD_ENABLE_MUSE_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_MUSE_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_ML4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_ML4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_EXLR8_AOT="${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" \
+  -DCUTEAFD_EXLR8_FAMILIES="${CUTEAFD_RELEASE_EXLR8_FAMILIES:-}" \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_NARROW_AOT="$coordinator_aot" \
@@ -427,7 +428,8 @@ test -s "$output_dir/libcuteafd_native.so"
 # its manifest, and the role's EXLR8 programs must all be present.
 if [[ "${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" == ON ]]; then
   "$output_dir/cuteafd" programs-check --native-lib "$output_dir/libcuteafd_native.so" \
-    --manifest "$output_dir/PROGRAMS.json" --exlr8-role "$([[ "$role" == coordinator ]] && echo coordinator || echo spark)"
+    --manifest "$output_dir/PROGRAMS.json" --exlr8-role "$([[ "$role" == coordinator ]] && echo coordinator || echo spark)" \
+    --exlr8-family "${CUTEAFD_RELEASE_EXLR8_FAMILIES:-}"
 fi
 test -s "$output_dir/V41_EXPERT_TP_AOT.json"
 test -s "$output_dir/THIRD_PARTY_NOTICES.md"

@@ -150,6 +150,15 @@ impl V41CoordinatorTensorReader {
 }
 
 impl OfficialV41Catalog {
+    /// Transport tests use miniature payloads, never a serving admission contract.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn exlr8_transport_fixture(snapshot: &Path, experts: RoutedExpertShape) -> Self {
+        Self { reader: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::Exlr8,
+            config: None, experts, snapshot: snapshot.into(), tensors: Vec::new(),
+            exl3: None, nvfp4: None, fp8: None }
+    }
+
     pub(crate) fn shard_file(&self, shard: &str) -> std::io::Result<crate::expert_reader::ShardFile> {
         if let Some(fp8) = &self.fp8 { return fp8.shard_file(shard); }
         self.reader.open(&self.snapshot.join(shard))
@@ -999,12 +1008,13 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value,
         draft_experts: 0,
     };
     if crate::plan::checkpoint::CheckpointFormat::detect(snapshot)? == crate::plan::checkpoint::CheckpointFormat::Exlr8 {
-        ensure!(config["model_type"] == "glm_moe_dsa", "EXLR8 requires GLM DSA");
+        let (_, _, family) = crate::plan::exlr8::native::family_geometry(config)?;
         crate::plan::Checkpoint::inventory(snapshot)?;
         let draft_layers = crate::plan::exlr8::draft_layers(snapshot, config)?;
         let mut shape = shape;
-        shape.draft_stages = draft_layers.len();
-        shape.draft_experts = if draft_layers.is_empty() { 0 } else { shape.experts };
+        // Flash uses an external drafter; its published MTP is not a worker owner.
+        shape.draft_stages = if family == cuteafd_ffi::exlr8::KernelFamily::GlmFlash { 0 } else { draft_layers.len() };
+        shape.draft_experts = if shape.draft_stages == 0 { 0 } else { shape.experts };
         return Ok(OfficialV41Catalog { reader: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::Exlr8,
             config: None, experts: shape, snapshot: snapshot.into(), tensors: Vec::new(),
             exl3: None, nvfp4: None, fp8: None });

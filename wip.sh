@@ -18,7 +18,8 @@ bf16_family_pattern='^(mimo|mimop|mimof|glm|glmf|qwen4|step5)(;(mimo|mimop|mimof
 usage() {
   cat <<'EOF'
 Usage: ./wip.sh [--slot NAME] [--role coordinator|expert|both]
-                [--from-slot NAME] [--config FILE] [--seed HOST] [--recreate] [--dry-run]
+                [--from-slot NAME] [--config FILE] [--seed HOST]
+                [--recreate|--refresh-containers] [--dry-run]
 
 Synchronizes the current checkout into persistent development containers and
 incrementally builds a named WIP slot. The coordinator container builds and
@@ -53,6 +54,9 @@ keeps the legacy names. WIP_ROOT (environment or config) optionally puts /wip
 and source-staging under ~/.cache/cuteafd/builds/ on each host.
 --recreate discards only this instance before
 creating them again from the configured development images.
+--refresh-containers recreates this instance's containers from the configured
+development images so bind mounts are re-resolved, while preserving /wip/slots,
+/wip/build, /wip/output and /wip/cache.
 EOF
 }
 
@@ -63,6 +67,7 @@ from_slot=
 seed_option="${WIP_SEED_HOST:-}"
 seed_explicit=0
 recreate=0
+refresh_containers=0
 dry_run=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -91,6 +96,10 @@ while [[ $# -gt 0 ]]; do
       recreate=1
       shift
       ;;
+    --refresh-containers)
+      refresh_containers=1
+      shift
+      ;;
     --dry-run)
       dry_run=1
       shift
@@ -113,6 +122,8 @@ done
 [[ -z "$seed_option" || "$seed_option" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
   release_die "invalid WIP seed host: $seed_option"
 case "$role" in coordinator|expert|both) ;; *) release_die "--role must be coordinator, expert, or both" ;; esac
+((!recreate || !refresh_containers)) ||
+  release_die "--recreate and --refresh-containers cannot be combined"
 # A fresh coordinator-only slot (0-Spark cards) touches no Spark: no Spark dev
 # image, container, process check, build or distribution.
 wip_spark_leg=1
@@ -149,7 +160,10 @@ bf16_families="${CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES:-}"
 # legs only when on, so an OFF build's environment and native key are unchanged.
 case "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" in ON|OFF) ;; *) release_die "CUTEAFD_WIP_EXLR8_AOT must be ON or OFF, got: $CUTEAFD_WIP_EXLR8_AOT" ;; esac
 wip_exlr8_env=()
-[[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == OFF ]] || wip_exlr8_env=(-e CUTEAFD_WIP_EXLR8_AOT=ON)
+if [[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON ]]; then
+  [[ -n "${CUTEAFD_WIP_EXLR8_FAMILIES:-}" ]] || release_die "EXLR8 enabled without explicit family scope"
+  wip_exlr8_env=(-e CUTEAFD_WIP_EXLR8_AOT=ON -e "CUTEAFD_WIP_EXLR8_FAMILIES=$CUTEAFD_WIP_EXLR8_FAMILIES")
+fi
 echo "WIP AOT scopes ($wip_program_family): ${wip_scope_summary[*]}"
 case "${CUTEAFD_RELEASE_DEV_IMAGE_SOURCE:-registry}" in registry|build) ;; *) release_die "CUTEAFD_RELEASE_DEV_IMAGE_SOURCE must be registry or build" ;; esac
 release_validate_wip_instance
@@ -569,7 +583,8 @@ bad_owner="$(find "$state_dir" -maxdepth 2 ! -user "$(id -u)" -print -quit)"
 if [[ ! -w "$state_dir" || -n "$bad_owner" ]]; then
   release_die "WIP path ${bad_owner:-$state_dir} is not owned/writable by host uid $(id -u); choose a fresh WIP instance with --recreate, or have the user run agent-sudo chown -R $(id -u):$(id -g) -- '${bad_owner:-$state_dir}' (no automatic chown or deletion)"
 fi
-if ((recreate)); then
+check_remote_wip_root_ownership() {
+  local host
   # Refuse before removing any container or payload, including remote uid-1001
   # trees. Legacy root slots stay available until an operator chooses a new root.
   ((recreate_remote == 0)) || for host in "${wip_container_hosts[@]}"; do
@@ -587,6 +602,9 @@ if [[ -e "$root" && ( ! -w "$root" || -n "$bad_owner" ) ]]; then
 fi
 CHECK_ROOT
   done
+}
+if ((recreate)); then
+  check_remote_wip_root_ownership
   echo "== discarding persistent WIP containers and build caches =="
   remove_wip_containers
   # The frozen source and global stores survive. --recreate clears this
@@ -604,6 +622,11 @@ rm -rf "$root/$3"
 CLEAR_ROOT
     done
   done
+fi
+if ((refresh_containers)); then
+  check_remote_wip_root_ownership
+  echo "== refreshing persistent WIP containers (preserving slots and build caches) =="
+  remove_wip_containers
 fi
 
 preflight_existing_container_images() {
@@ -842,7 +865,7 @@ if [[ "$source_revision" != *dirty* && "$source_revision" != unknown && -z "$fro
         printf '%s=%s\n' "$local_name" "${!local_name:-<default>}"
       done
       # Keyed only when on, so every existing slot keeps its build key.
-      [[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == OFF ]] || printf 'CUTEAFD_WIP_EXLR8_AOT=%s\n' "$CUTEAFD_WIP_EXLR8_AOT"
+      [[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == OFF ]] || printf 'CUTEAFD_WIP_EXLR8_AOT=%s\nCUTEAFD_WIP_EXLR8_FAMILIES=%s\n' "$CUTEAFD_WIP_EXLR8_AOT" "$CUTEAFD_WIP_EXLR8_FAMILIES"
     } | sha256sum | awk '{print $1}'
   )"
   # Each role's key adds the dev image that builds it.
@@ -1423,7 +1446,7 @@ build_expert() (
   # The role list and build-scope opt-ins travel inside a single quoted remote
   # command so a `tp2;tp3` value is never split by the remote shell.
   local build_command
-  build_command="docker exec -e 'CUTEAFD_WIP_DEV_IMAGE_ID=$image_id' -e 'CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}' -e 'CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}' -e 'CUTEAFD_EXPORT_HOST_CONTEXTS=${CUTEAFD_EXPORT_HOST_CONTEXTS:-}' -e 'CUTEAFD_EXPORT_WORKER_RAM_MIB=${CUTEAFD_EXPORT_WORKER_RAM_MIB:-}' -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot'${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}'} '$spark_container' timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
+  build_command="docker exec -e 'CUTEAFD_WIP_DEV_IMAGE_ID=$image_id' -e 'CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}' -e 'CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}' -e 'CUTEAFD_EXPORT_HOST_CONTEXTS=${CUTEAFD_EXPORT_HOST_CONTEXTS:-}' -e 'CUTEAFD_EXPORT_WORKER_RAM_MIB=${CUTEAFD_EXPORT_WORKER_RAM_MIB:-}' -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot'${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}' -e 'CUTEAFD_WIP_EXLR8_FAMILIES=${CUTEAFD_WIP_EXLR8_FAMILIES}'} '$spark_container' timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
   timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command rust" ||
     release_die "Spark WIP Rust phase on $seed_host failed (exit $?)"
   local seed_root

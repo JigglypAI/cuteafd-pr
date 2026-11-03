@@ -32,6 +32,7 @@ family=""
 embedding_override=""
 wip_slot=""
 dry_run=0
+dry_run_total_capacity=0
 # --set KEY=VALUE overrides one configuration key for this launch (validated by
 # the same key grammar as the file).
 declare -A cfg_overrides=()
@@ -49,11 +50,13 @@ while [[ $# -gt 0 ]]; do
     --all) restart_all=1; shift ;;
     --wip) wip_slot="${2:?--wip requires SLOT}"; shift 2 ;;
     --dry-run) dry_run=1; shift ;;
-    *) echo "usage: $0 [--config FILE] [--family ID] [--set KEY=VALUE]... [--embedding-placement host|gpu] [--restart [--all]] [--wip SLOT] [--dry-run]" >&2; exit 2 ;;
+    --total-capacity) dry_run_total_capacity=1; shift ;;
+    *) echo "usage: $0 [--config FILE] [--family ID] [--set KEY=VALUE]... [--embedding-placement host|gpu] [--restart [--all]] [--wip SLOT] [--dry-run [--total-capacity]]" >&2; exit 2 ;;
   esac
 done
 ((restart_all == 0 || restart == 1)) || release_die "--all requires --restart"
 ((restart == 0 || dry_run == 0)) || release_die "--restart and --dry-run are mutually exclusive"
+((dry_run_total_capacity == 0 || dry_run == 1)) || release_die "--total-capacity requires --dry-run"
 [[ -z "$embedding_override" ]] || cfg_overrides[EMBEDDING]="$embedding_override"
 # Overrides are appended to a copy of the file (a later line wins in every
 # parser), so they get exactly the file's validation. The copy is named by its
@@ -262,6 +265,8 @@ EXPERT_PORT
 SPARK_DEVICE_BUDGET_BYTES
 MAX_CONTEXT_TOKENS
 RTX_EXPERT_LAYERS
+EXLR8_MANIFEST
+EXLR8_PREFILL_ACTIVATIONS
 PROBE_DUMP_ROOT
 DRAFT_SURVIVAL_LENGTHS
 DRAFT_POLICY
@@ -311,8 +316,6 @@ PREFILL_PACKING
 PREFILL_ROWS
 PREFILL_WAVES
 PREFILL_SPAN_ROWS
-EXLR8_MANIFEST
-EXLR8_PREFILL_ACTIVATIONS
 RTX_EXPERT_PEER
 L2_PREFETCH
 FP8_SCALES
@@ -1075,6 +1078,7 @@ if [[ "$gpu_selection_mode" == auto && "$COORDINATOR_GPUS" != *,* ]] &&
   gpu_selection_mode=1
 fi
 compact_selection_args=()
+((dry_run_total_capacity == 0)) || compact_selection_args+=(--total-capacity)
 gpu_selection="$(python3 "$repo_root/scripts/lib/coordinator-gpus.py" select \
   --selectors "$COORDINATOR_GPUS" \
   --mode "$gpu_selection_mode" \
@@ -1875,8 +1879,7 @@ if [[ -n "$exlr8_prefill_activations" ]]; then
 fi
 exlr8_plan_args=()
 if [[ -n "$exlr8_manifest" ]]; then
-  [[ "$family" == glm5 ]] || release_die "EXLR8 is supported only for glm5"
-  [[ "$exlr8_manifest" == up1 || "$exlr8_manifest" == bit325 ]] || release_die "EXLR8_MANIFEST must be up1 or bit325"
+  [[ "$exlr8_manifest" != *[!a-zA-Z0-9_-]* ]] || release_die "EXLR8_MANIFEST must be a published name, not a path"
   exlr8_gpu_count="$(get RTX_GPUS 1)"
   [[ ( "$exlr8_gpu_count" == 1 || "$exlr8_gpu_count" == 2 ) && "$ranks" -ge 1 && "$ranks" -le 8 ]] || release_die "EXLR8 requires 1..2 RTX GPUs and 1..8 canonical Spark ranks"
   [[ "$(get SPECULATOR dflash2)" == off || "$(get SPECULATOR dflash2)" == dflash2 ]] || release_die "EXLR8 supports SPECULATOR=off or dflash2"
@@ -2730,7 +2733,7 @@ audio_encoder_hash=""
   plan_rtx=1; ((head_split == 0)) || plan_rtx=2
   plan_pool="$(get POOL_TOKENS auto)"; [[ "$plan_pool" != auto ]] || plan_pool=0
   plan_gib="$profile_gib"
-  if [[ "$family" == qwen4 ]]; then
+  if [[ "$family" == qwen4 ]] && ((!dry_run_total_capacity)); then
     total_mib="$(nvidia-smi --id="$gpu" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d ' ')"
     free_mib="$(nvidia-smi --id="$gpu" --query-gpu=memory.free --format=csv,noheader,nounits | tr -d ' ')"
     if ((restart)); then

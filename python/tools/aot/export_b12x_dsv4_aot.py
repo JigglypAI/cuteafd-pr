@@ -253,7 +253,10 @@ def glm_stage_programs(g, decode_rows: int, prefill_rows: int):
 def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
     """Native trellis projection boundaries using the original Flash primitives."""
     from functools import partial
-    from b12x.integration.cuteafd.glmf_split import compile_glmf_kda_core_aot, compile_glmf_stage_aot
+    from b12x.integration.cuteafd.glmf_split import (
+        compile_glmf_kda_core_aot, compile_glmf_stage_aot,
+        compile_glmf_projected_kda_aot, compile_glmf_fp8_stage_aot,
+        compile_glmf_projected_index_c_aot, compile_glmf_projected_index_keys_aot)
     out = []
     # Wide decode still selects the narrow stage for batches of at most 64 rows.
     decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
@@ -269,6 +272,24 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
             params = dict(stage="swiglu", max_rows=rows, inter=inter)
             out.append((f"swiglu_i{inter}_m{rows}", "swiglu_split", params,
                         partial(compile_glmf_stage_aot, g, **params)))
+    # Append native-weight seams without moving or changing the existing entries.
+    for rows in sorted(decode_caps | {prefill_rows}):
+        params = dict(max_rows=rows, decode=rows in decode_caps)
+        out.append((f"kda_projected_m{rows}", "kda_core", params,
+                    partial(compile_glmf_projected_kda_aot, g, **params)))
+        for stage in ("absorb", "values"):
+            params = dict(stage=stage, max_rows=rows,
+                          mode="decode" if rows in decode_caps else "prefill")
+            out.append((f"{stage}_fp8_m{rows}", "attention_stage", params,
+                        partial(compile_glmf_fp8_stage_aot, g, **params)))
+    for rows in sorted(decode_caps | {prefill_rows}):
+        params = dict(max_rows=rows, verify_rows=rows if rows in decode_caps else 64)
+        out.append((f"index_projected_c_m{rows}", "index_producer", params,
+                    partial(compile_glmf_projected_index_c_aot, g, **params)))
+    for rows in sorted(decode_caps | {prefill_rows}):
+        params = dict(max_rows=rows)
+        out.append((f"index_projected_keys_m{rows}", "index_producer", params,
+                    partial(compile_glmf_projected_index_keys_aot, g, **params)))
     return out
 
 
@@ -1071,7 +1092,7 @@ def dense_family_scopes(families, exlr8_family):
         raise ValueError("--dense-trellis-families takes kimik3, glm, glmf, step5, muse and/or ml4")
     k6 = tuple(name for name in ("kimik3", "glm", "glmf", "step5", "muse", "ml4") if name in requested)
     native = tuple(name for name in k6 if name in ("glm", "glmf")) \
-        if families is not None else (exlr8_family,)
+        if families is not None else tuple(filter(None, (exlr8_family or "").split(",")))
     return k6, native
 
 
@@ -1099,8 +1120,8 @@ def main() -> None:
     parser.add_argument("--exlr8-role", choices=("all", "coordinator", "spark"), default="all",
                         help="with exlr8: coordinator = shared-expert K1/grouping and rotated glue (beside the "
                              "family programs), spark = routed K1 serving and grouping, all = every program")
-    parser.add_argument("--exlr8-family", choices=("glm", "glmf"), default="glm",
-                        help="static routed geometry for exlr8; leaves the existing GLM exports unchanged")
+    parser.add_argument("--exlr8-family",
+                        help="explicit comma-separated EXLR8 checkpoint families: glm,glmf")
     parser.add_argument("--decode-rows", type=int, default=64)
     parser.add_argument("--glmf-wide-decode-rows", type=int, default=128,
                         help="with glmf: also the decode and verify programs at this many rows (serve "
@@ -1118,13 +1139,17 @@ def main() -> None:
         args.context_split = "only"
     args.context_split_only = args.context_split == "only"
 
+    geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
+    exlr8_families = tuple(args.exlr8_family.split(",")) if args.exlr8_family else ()
+    if "exlr8" in geometries and (not exlr8_families or set(exlr8_families) - {"glm", "glmf"}
+            or len(set(exlr8_families)) != len(exlr8_families)):
+        raise SystemExit("EXLR8 requires explicit --exlr8-family glm and/or glmf")
     import torch
     from b12x.integration.cuteafd import (
         FLASH, GLM53, GLM53_FLASH, MIMO_V2_FLASH, MIMO_V26_FLASH, MIMO_V26_PRO, PRO, QWEN35_9B, QWEN38_27B, QWEN38_FLASH_NEXT, exportable_compilation,
         validate_exported_header,
     )
 
-    geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     try:
         dense_families, native_families = dense_family_scopes(args.dense_trellis_families, args.exlr8_family)
     except ValueError as error:
@@ -1316,22 +1341,23 @@ def main() -> None:
         # Last, so every other family's objects and table indices are unchanged.
         # The fork owns the program list and its role split.
         from export_b12x_exlr8_aot import programs as exlr8_programs
-        if args.exlr8_family == "glm":
-            exlr8_work = exlr8_programs(role=args.exlr8_role)
-            family = "exlr8"
-            geometry = {"hidden": 6144, "units": 16, "top_k": 8}
-        else:
-            cfg = GLM53_FLASH
-            exlr8_work = exlr8_programs(role=args.exlr8_role, hidden=cfg.hidden,
-                units=cfg.moe_inter // 128, top_k=cfg.top_k, experts=cfg.routed_experts,
-                swiglu_limit=cfg.swiglu_limit)
-            family = "exlr8_glmf"
-            geometry = {"hidden": cfg.hidden, "units": cfg.moe_inter // 128,
-                        "top_k": cfg.top_k, "experts": cfg.routed_experts,
-                        "swiglu_limit": cfg.swiglu_limit}
-        manifest["families"][family] = {**geometry, "role": args.exlr8_role,
-                                       "programs": [f"{family}_{item[0]}" for item in exlr8_work]}
-        work += [(family, *item) for item in exlr8_work]
+        for exlr8_family in exlr8_families:
+            if exlr8_family == "glm":
+                exlr8_work = exlr8_programs(role=args.exlr8_role)
+                family = "exlr8"
+                geometry = {"hidden": 6144, "units": 16, "top_k": 8}
+            else:
+                cfg = GLM53_FLASH
+                exlr8_work = exlr8_programs(role=args.exlr8_role, hidden=cfg.hidden,
+                    units=cfg.moe_inter // 128, top_k=cfg.top_k, experts=cfg.routed_experts,
+                    swiglu_limit=cfg.swiglu_limit)
+                family = "exlr8_glmf"
+                geometry = {"hidden": cfg.hidden, "units": cfg.moe_inter // 128,
+                            "top_k": cfg.top_k, "experts": cfg.routed_experts,
+                            "swiglu_limit": cfg.swiglu_limit}
+            manifest["families"][family] = {**geometry, "role": args.exlr8_role,
+                                           "programs": [f"{family}_{item[0]}" for item in exlr8_work]}
+            work += [(family, *item) for item in exlr8_work]
     # Append shared drafter exports after all existing objects: table indices stay stable.
     if any(name in geometries for name in ("glm", "glm2", "glmf", "glmf2", "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "kimik3", "ml4", "muse", "muse2")):
         work += [("draft_bf16", f"k{k}_n{n}", "bf16_projection", {"max_rows": 2048},

@@ -110,6 +110,26 @@ mod media_defaults_tests {
     }
 
     #[test]
+    fn native_flash_serving_cli_accepts_a16_and_refuses_a8() {
+        use clap::Parser;
+        use super::cli::{Cli, Commands};
+        use cuteafd_loader::plan::exlr8::PrefillActivations;
+        let base = ["cuteafd", "serve-glmf", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--exlr8-manifest", "k4"];
+        for extra in [vec![], vec!["--exlr8-prefill-activations", "a16"]] {
+            let cli = Cli::try_parse_from(base.into_iter().chain(extra)).unwrap();
+            let Commands::ServeGlmf(args) = cli.command else { panic!("expected Flash serving"); };
+            assert_eq!(args.engine.exlr8_prefill_activations, PrefillActivations::A16);
+        }
+        for value in ["a8", "auto", "unknown"] {
+            let error = Cli::try_parse_from(base.into_iter()
+                .chain(["--exlr8-prefill-activations", value])).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            assert!(error.to_string().contains("native Flash EXLR8 prefill is A16"), "{error}");
+        }
+    }
+
+    #[test]
     fn planner_audio_defaults_auto_and_preserves_global_off() {
         use clap::Parser;
         let cli = super::cli::Cli::try_parse_from(["cuteafd", "plan", "/model"]).unwrap();
