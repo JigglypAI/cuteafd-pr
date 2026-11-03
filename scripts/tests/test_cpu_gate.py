@@ -617,3 +617,53 @@ def test_interrupt_stops_running_suites(tmp_path):
         assert gate.run_logged(['true'], log_path, dict(os.environ), tmp_path, 10)[0] == 130
     finally:
         gate.STOPPING.clear()
+
+
+def test_gate_scrubs_inherited_compiler_cache_env_and_records_names(tmp_path, monkeypatch):
+    (tmp_path / 'logs').mkdir()
+    inherited = {
+        'CMAKE_C_COMPILER_LAUNCHER': '/tmp/kache',
+        'CMAKE_CXX_COMPILER_LAUNCHER': '/tmp/kache',
+        'CMAKE_CUDA_COMPILER_LAUNCHER': '/tmp/sccache',
+        'CUTEAFD_KACHE': '/tmp/kache',
+        'CUTEAFD_KACHE_MODE': 'enabled',
+        'KACHE_DIR': '/tmp/kache-dir',
+        'CUTEAFD_SCCACHE_DIR': '/tmp/sccache-dir',
+        'SCCACHE_DIR': '/tmp/sccache',
+        'RUSTC_WRAPPER': '/tmp/kache',
+        'RUSTC_WORKSPACE_WRAPPER': '/tmp/kache',
+    }
+    for key, value in inherited.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv('KEEP_PLAIN_VAR', 'kept')
+    seen_envs = []
+
+    def run_logged(cmd, log_path, env, cwd, timeout):
+        seen_envs.append(dict(env))
+        if 'pytest' in cmd:
+            Path(log_path).write_text('=== 5 passed in 0.10s ===\n')
+        elif '--no-run' in cmd:
+            Path(log_path).write_text(BUILD_OK)
+        else:
+            Path(log_path).write_text('test result: ok. 3 passed; 0 failed; 0 ignored\n')
+        return 0, 1.0
+
+    monkeypatch.setattr(gate, 'prepare', lambda source, root, owned=False: None)
+    monkeypatch.setattr(gate, 'checked', lambda cmd, **k: 'deadbeef' if 'rev-parse' in cmd else '')
+    monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
+    monkeypatch.setattr(gate, 'installed_planner_skips', lambda source, env: [])
+    monkeypatch.setattr(gate, 'python_for', lambda source: Path('/usr/bin/python3'))
+    monkeypatch.setattr(gate, 'run_logged', run_logged)
+    args = SimpleNamespace(**vars(ARGS), cargo=True, scripts=True, benches=False, jobs=1)
+    record = gate.gate(ROOT, tmp_path, args)
+    assert record['status'] == 'pass'
+    expected_scrubbed = sorted(inherited)
+    assert record['scrubbed_env'] == expected_scrubbed
+    for suite in record['suites']:
+        assert suite['scrubbed_env'] == expected_scrubbed
+    assert len(seen_envs) == 3
+    for env in seen_envs:
+        assert env.get('KEEP_PLAIN_VAR') == 'kept'
+        for key in expected_scrubbed:
+            assert key not in env
+

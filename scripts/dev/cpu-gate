@@ -112,6 +112,9 @@ PYTEST_FAIL = re.compile(r'^(?:FAILED|ERROR) (\S+)', re.M)
 BENCHES = (('cuteafd-core', 'draft_policy_bench', {'CUTEAFD_POLICY_BENCH_MAX_US': '1200'}),)
 BENCH_MEDIANS = re.compile(r'medians: (.*?)(?:, total|$)', re.M)
 BENCH_VALUE = re.compile(r'(\w+) ([\d.]+) us')
+CMAKE_LAUNCHER_ENV = re.compile(r'CMAKE_.*_COMPILER_LAUNCHER\Z')
+SCRUBBED_ENV_PREFIXES = ('CUTEAFD_KACHE', 'KACHE_', 'CUTEAFD_SCCACHE', 'SCCACHE_')
+SCRUBBED_ENV_NAMES = ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER')
 # Per-run scratch under head/ and base/, deleted on exit unless --keep.
 SCRATCH = ('tmp', 'target-cpu-gate', 'target-cpu-gate-release')
 SCRATCH_TOP = 10
@@ -439,19 +442,31 @@ def installed_planner_skips(source, env):
     return skipped
 
 
+def scrub_compiler_cache_env(env):
+    """Remove inherited compiler-launcher and cache variables so Cargo and script suites
+    never share read-only kache outputs or inherit ambient launcher overrides."""
+    cleaned = dict(env)
+    scrubbed = sorted(key for key in list(cleaned)
+                      if key in SCRUBBED_ENV_NAMES or key.startswith(SCRUBBED_ENV_PREFIXES)
+                      or CMAKE_LAUNCHER_ENV.fullmatch(key))
+    for key in scrubbed:
+        cleaned.pop(key, None)
+    return cleaned, scrubbed
+
+
 def cargo(source, root, args, env):
     target = root / 'target-cpu-gate'
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
+    env, scrubbed_env = scrub_compiler_cache_env(env)
     env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': str(getattr(args, 'cargo_jobs', 16)),
            'RUST_TEST_THREADS': str(getattr(args, 'cargo_jobs', 16))}
-    for key in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'):
-        env.pop(key, None)  # Plain rustc: never share a target with kache's read-only outputs.
     log('cargo: compiling tests (build slot held while compiling)')
     build_log = root / 'logs/cargo-build.log'
     code, build_s = run_logged(['nice', '-n', '19', str(source / 'scripts/build/build-slot.sh'), 'cargo', 'test', '--workspace', '--locked',
                                 '--no-run', '--message-format=json-render-diagnostics'], build_log, env, source / 'rust', args.cargo_build_timeout)
     complete = cargo_build_succeeded(build_log)
-    result = dict(suite='cargo', build_exit=code, build_complete=complete, build_s=round(build_s), build_log=str(build_log))
+    result = dict(suite='cargo', build_exit=code, build_complete=complete, build_s=round(build_s), build_log=str(build_log),
+                  scrubbed_env=scrubbed_env)
     if code or not complete:
         tail = [line for line in build_log.read_text(errors='replace').splitlines() if line.startswith('error')][:5]
         return {**result, 'status': 'failed', 'error': 'compile failed: ' + ('; '.join(tail) or
@@ -563,10 +578,9 @@ def benches(source, root, args, env):
     """Release-mode bound checks: each bench passes only when its test ran and passed."""
     target = root / 'target-cpu-gate-release'
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
+    env, scrubbed_env = scrub_compiler_cache_env(env)
     env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': str(getattr(args, 'cargo_jobs', 16))}
-    for key in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'):
-        env.pop(key, None)
-    result = dict(suite='benches', passed=0, failed=0, failing=[], medians={}, logs=[])
+    result = dict(suite='benches', passed=0, failed=0, failing=[], medians={}, logs=[], scrubbed_env=scrubbed_env)
     build_s = test_s = 0.
     for crate, test, bounds in BENCHES:
         log(f'benches: compiling {crate}/{test} (release, build slot held while compiling)')
@@ -607,6 +621,7 @@ def benches(source, root, args, env):
 
 
 def scripts(source, root, args, env):
+    env, scrubbed_env = scrub_compiler_cache_env(env)
     python = python_for(source)
     test_log = root / 'logs/pytest.log'
     log(f"scripts: pytest ({python}, {getattr(args, 'pytest_jobs', 16)} workers)")
@@ -620,7 +635,8 @@ def scripts(source, root, args, env):
     ids = sorted(set(PYTEST_FAIL.findall(text)))
     result = dict(suite='scripts', exit=code, test_s=round(seconds), log=str(test_log), python=str(python),
                   passed=counts.get('passed', 0), failed=counts.get('failed', 0) + counts.get('error', 0) + counts.get('errors', 0),
-                  skipped=counts.get('skipped', 0), failing=ids, summary=summary[-1] if summary else None)
+                  skipped=counts.get('skipped', 0), failing=ids, summary=summary[-1] if summary else None,
+                  scrubbed_env=scrubbed_env)
     if code == 124:
         result.update(status='failed', error=f'timed out after {args.scripts_timeout} s')
     elif not summary or result['passed'] == 0:
@@ -637,7 +653,7 @@ def gate(source, root, args, owned=False):
     # Record the gated commit before running: a checkout that moves during the
     # gate would otherwise be credited with tests that ran against older source.
     head = checked(['git', '-C', str(source), 'rev-parse', 'HEAD']).strip()
-    env = {**os.environ, 'TMPDIR': str(root / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'}
+    env, scrubbed_env = scrub_compiler_cache_env({**os.environ, 'TMPDIR': str(root / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'})
     requested = [fn for enabled, fn in ((args.cargo, cargo), (args.scripts, scripts),
                                          (args.benches, benches)) if enabled]
     # Cargo and its release benches share compiler resources; only pytest overlaps them.
@@ -649,13 +665,15 @@ def gate(source, root, args, owned=False):
         suites = rust.result()
         if python is not None:
             suites.append(python.result())
+    for suite in suites:
+        suite['scrubbed_env'] = sorted(set(suite.get('scrubbed_env', [])) | set(scrubbed_env))
     suites.sort(key=lambda suite: ('cargo', 'scripts', 'benches').index(suite['suite']))
     scratch = scratch_usage(root / 'tmp')
     moved = checked(['git', '-C', str(source), 'rev-parse', 'HEAD']).strip() != head
     dirty = bool(checked(['git', '-C', str(source), 'status', '--porcelain', '--untracked-files=no']).strip())
     passed = suites and all(s['status'] == 'pass' for s in suites) and not moved
     return dict(source=str(source), head=head, dirty=dirty, moved=moved, suites=suites, scratch=scratch,
-                status='pass' if passed else 'failed')
+                scrubbed_env=scrubbed_env, status='pass' if passed else 'failed')
 
 
 def render(record):
