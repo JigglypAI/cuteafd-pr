@@ -9,8 +9,11 @@ qualification continues, with no release card yet. WIP examples:
 [min, 1 RTX + 5 Sparks](../../examples/configs/mistral-large4-exl3-k4-core-k6-min.config)
 and [max, 2 RTX + 6 Sparks](../../examples/configs/mistral-large4-exl3-k4-core-k6-max.config).
 Gate cards `ml4-exl3-min` and `ml4-exl3-max` in
-`scripts/bench/kits/gate/matrix-ml4.json` use these recipes; TP2 qualification
-and the attention-placement decision are still pending.
+`scripts/bench/kits/gate/matrix-ml4.json` use these recipes. TP2 expert
+onboarding, official-reference image fidelity, exact prefix restores and
+lossless speculation have passed on hardware. `auto` remains `layers`;
+`context` also passes correctness, with its default-promotion timing check
+pending a quiet-window follow-up.
 
 ## How it runs
 
