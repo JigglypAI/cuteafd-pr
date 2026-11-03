@@ -879,9 +879,15 @@ mod draft_cli_tests {
                     assert!(routes.iter().all(|route| route.row_index as usize == row));
                 }
             }
-            for ranks in [1, 4] {
-                let extra = 3 * ranks * (capacity - prefill) * cfg.hidden * 2;
-                assert_eq!(wide_intake_bytes(&args, ranks, cfg.hidden), extra as u64);
+            for ranks in [1u64, 4] {
+                use cuteafd_core::serving_capacity::spark_intake_allocation_bytes;
+                use cuteafd_loader::serving_capacity::prefill_return_bytes;
+                let waves = args.prefill_waves as u64;
+                let hidden = cfg.hidden as u64;
+                let charged = |rows| prefill_return_bytes(waves, rows, ranks, hidden);
+                let allocation = |rows| spark_intake_allocation_bytes(waves * rows * hidden * 2);
+                assert_eq!(charged(capacity as u64) - charged(prefill as u64),
+                    ranks * (allocation(capacity as u64)? - allocation(prefill as u64)?));
             }
         }
         Ok(())
