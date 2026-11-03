@@ -323,7 +323,12 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                     ensure!(!self.job.events.is_closed(), "client disconnected");
                     self.runtime.block_on(pass.commit_prefill::<C>(self.requests, &mut batch, None, chunk.len() as u32))
                 })();
-                if result.is_err() { pass.discard(&mut batch)?; }
+                if let Err(error) = &result {
+                    // A quarantined commit keeps its storage: never discard it.
+                    if error.downcast_ref::<crate::shared::serve::lanes::CommitQuarantined>().is_none() {
+                        pass.discard(&mut batch)?;
+                    }
+                }
                 result?;
                 if matches!(unit.work, V41Unit::Single(_)) {
                     console::totals::prefill(chunk.len());
@@ -391,7 +396,11 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                     self.runtime.block_on(pass.commit_prefill(self.requests, &mut batch, self.draft.as_deref_mut(), rows))?;
                     Ok(scores)
                 })();
-                if result.is_err() { pass.discard(&mut batch)?; }
+                if let Err(error) = &result {
+                    if error.downcast_ref::<crate::shared::serve::lanes::CommitQuarantined>().is_none() {
+                        pass.discard(&mut batch)?;
+                    }
+                }
                 console::Prefill::done(console::PrefillKind::Replay, 0, 0, 1, rows as usize, started);
                 tracing::debug!(target: "cuteafd::timing", rows, total_us=started.elapsed().as_micros() as u64, "target decoder replay");
                 let scores = result?;
@@ -652,10 +661,10 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
         }, crate::shared::serve::lanes::COMMIT_DEADLINE).await?;
         if outcome == crate::shared::serve::lanes::WaitOutcome::TimedOut {
             // Do not synchronize on the abandoned stream in Drop: that would
-            // block the current-thread serving runtime. Quarantine instead.
+            // block the current-thread serving runtime. Quarantine instead: the
+            // caller must not discard or release this batch.
             commit.armed = false;
-            anyhow::bail!("prefill target commit did not drain within {:?}",
-                crate::shared::serve::lanes::COMMIT_DEADLINE);
+            return Err(crate::shared::serve::lanes::CommitQuarantined.into());
         }
         if let Some(draft) = &mut commit.draft {
             draft.finish_queued_commit(0, commit.pass, commit.requests, commit.batch, accepted)?;

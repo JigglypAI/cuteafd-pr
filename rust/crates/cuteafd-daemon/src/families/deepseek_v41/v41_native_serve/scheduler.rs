@@ -39,7 +39,7 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
         generated: 0, buffered: 0, finished: false, cacheable: false, failed: false,
         tokens: tokens.to_vec(), image_keys, next_after_commit: None,
         reserve: KvReserve::new(cuteafd_engine::reserve::ReserveConfig::new(16_384, 0, -1, 4).unwrap(), UNIT_TOKENS)
-            .lease(tokens.len(), 4, 1, usize::MAX).unwrap(), stalled: false,
+            .lease(tokens.len(), 4, 1, usize::MAX).unwrap(), stalled: false, quarantined: false,
         loop_abort: crate::shared::loop_abort::LoopAbortConfig::default().guard(Default::default(), id) };
     request.emit(&[anchor])?;
     ensure!(!request.finished, "fixture requires a nonterminal continuation anchor");
@@ -90,6 +90,10 @@ pub(super) struct Active<'a> {
     reserve: Lease,
     /// Waiting for a reservation top-up: kept out of rounds, holding its slot and units.
     stalled: bool,
+    /// Its last commit timed out and is quarantined: kept out of rounds and out
+    /// of retirement until the abandoned device stream completes and the
+    /// quarantine releases it.
+    quarantined: bool,
     /// Loop abort: the per-request guard, built at admission from the live knobs.
     loop_abort: LoopAbort,
 }
@@ -521,7 +525,12 @@ fn prefill_packed_admissions<'w, 'a, P: ServingTarget<'w, 'a>>(
                 stall::tick();
                 Ok(scores)
             })();
-            if replay.is_err() { pass.discard(&mut batch)?; }
+            if let Err(error) = &replay {
+                // A quarantined commit keeps its storage: never discard it.
+                if error.downcast_ref::<crate::shared::serve::lanes::CommitQuarantined>().is_none() {
+                    pass.discard(&mut batch)?;
+                }
+            }
             replay
         })();
         match result {
@@ -746,7 +755,7 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
         let loop_abort = self.args.loop_abort.config().guard(job.finish_detail.clone(), id);
         let mut request = Active { constraint, ticket, lease, job, decoder, anchor, generated: 0, buffered: 0,
             finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit,
-            reserve, stalled: false, loop_abort };
+            reserve, stalled: false, quarantined: false, loop_abort };
         request.ticket.first(request.anchor);
         if let Err(error) = request.emit(&[request.anchor]) {
             request.failed = !request.job.events.is_closed();
@@ -869,6 +878,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
         prefixes.tick(requests, draft.as_deref_mut())?;
+        // A commit that timed out is polled here (never synchronized) until its
+        // device copies drain; its requests stay out of rounds until then.
+        if !requests.quarantine.is_empty() {
+            independent::poll_quarantine(first, second, requests, &mut draft, &mut active)?;
+        }
         media_ready.extend(media.poll(requests, draft.as_deref_mut()));
         if stats_published.elapsed() >= std::time::Duration::from_secs(1) {
             stats_published = Instant::now();
@@ -1189,10 +1203,13 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         }
         let members: [Vec<usize>; 2] = std::array::from_fn(|lane| active.iter().enumerate()
             .filter_map(|(slot, request)| request.as_ref().filter(|r| r.lane() == lane && !r.finished && !r.stalled
-                && !r.job.events.is_closed()).map(|_| slot)).collect());
+                && !r.quarantined && !r.job.events.is_closed()).map(|_| slot)).collect());
         if members.iter().all(Vec::is_empty) {
             // Every decoding request waits for units: a retirement or snapshot capture frees them.
-            if active.iter().flatten().any(|r| r.stalled) { std::thread::sleep(Duration::from_millis(1)); }
+            // A quarantined commit is polled by `decode_round`; sleep so the loop does not spin.
+            if active.iter().flatten().any(|r| r.stalled) || !requests.quarantine.is_empty() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             continue;
         }
         let capacity: Vec<_> = members.iter().flatten().map(|&slot| {

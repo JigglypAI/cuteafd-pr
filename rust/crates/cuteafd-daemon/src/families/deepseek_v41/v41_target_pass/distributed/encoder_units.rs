@@ -99,6 +99,10 @@ struct UnitSlot<'s, 'w, 'a> {
     started: Instant,
     /// As on one RTX: this slot's per-layer publication events.
     published: super::super::encoder_units::PublishedLayers<'a>,
+    /// Its commit did not drain within the deadline. Drop must not synchronize
+    /// on the abandoned stream (that would freeze the serving thread) or abort
+    /// the process; the slot's owners stay held until the process restarts.
+    quarantined: bool,
 }
 #[cfg(test)]
 thread_local! {
@@ -158,6 +162,13 @@ impl Drop for UnitHooks<'_, '_, '_, '_> {
         // units' reservations included) after each slot's work drained.
         let mut requests = self.requests.borrow_mut();
         for slot in &mut self.slots {
+            if slot.quarantined {
+                // The commit did not drain: never synchronize on the abandoned
+                // stream or release storage the device may still read. The
+                // slot's owners stay held until the process restarts.
+                tracing::error!("quarantined distributed encoder unit; its slot stays owned");
+                continue;
+            }
             if let Some(mut batch) = slot.batch.take() {
                 if let Err(error) = slot.pass.abort_cache_commit(&mut requests) {
                     tracing::error!(%error, "draining cancelled distributed encoder unit");
@@ -281,8 +292,13 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         slot.pass.enqueue_cache_commit(&self.requests.borrow(), batch, &rows)?;
         let outcome = crate::shared::serve::lanes::wait_ready(|| slot.pass.poll_cache_commit(),
             crate::shared::serve::lanes::COMMIT_DEADLINE).await?;
-        anyhow::ensure!(outcome == crate::shared::serve::lanes::WaitOutcome::Ready,
-            "encoder unit commit did not drain within {:?}", crate::shared::serve::lanes::COMMIT_DEADLINE);
+        if outcome != crate::shared::serve::lanes::WaitOutcome::Ready {
+            // Quarantine: keep the batch, slot and window bits owned. Drop must
+            // not synchronize on the abandoned stream or abort the process.
+            slot.quarantined = true;
+            anyhow::bail!("encoder unit commit did not drain within {:?}",
+                crate::shared::serve::lanes::COMMIT_DEADLINE);
+        }
         slot.pass.commit(&mut self.requests.borrow_mut(), batch, &rows)?;
         slot.batch = None;
         crate::families::deepseek_v41::v41_native_serve::console::totals::prefill(unit.rows.len());
@@ -437,7 +453,8 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 pass.set_attention_decode(false);
                 let published = super::super::encoder_units::PublishedLayers::on_devices(library,
                     |layer| Ok(pass.resources.lanes[map.attention(layer)?].device.id))?;
-                Ok(UnitSlot { pass, transport, batch: None, prepared: None, started: Instant::now(), published })
+                Ok(UnitSlot { pass, transport, batch: None, prepared: None, started: Instant::now(), published,
+                    quarantined: false })
             }).collect::<Result<Vec<_>>>()?,
             requests: RefCell::new(requests), lease, packed, chunks, suffix, ahead, keep_running, before_unit, complete: false,
         };

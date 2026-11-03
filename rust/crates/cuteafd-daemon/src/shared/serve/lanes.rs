@@ -19,10 +19,8 @@ use std::time::{Duration, Instant};
 pub(crate) const COMMIT_DEADLINE: Duration = Duration::from_secs(120);
 /// How long a lane may wait for a queued prefix retain before giving up.
 pub(crate) const RETAIN_DEADLINE: Duration = Duration::from_secs(30);
-/// Polls before a bounded wait starts sleeping instead of yielding.
-const WAIT_SPINS: u32 = 64;
-/// One sleep of a bounded wait past [`WAIT_SPINS`].
-const WAIT_SLEEP: Duration = Duration::from_micros(200);
+/// How long a lane may wait for the drafter's proposal before giving up.
+pub(crate) const DRAFT_DEADLINE: Duration = Duration::from_secs(120);
 
 /// The outcome of a bounded wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +33,9 @@ pub(crate) enum WaitOutcome {
 
 /// Poll `ready` until it reports true, bounded by `deadline`. A device copy or
 /// commit that never completes must not spin the lane at 100% CPU forever
-/// (W64 F3): after a short spin, sleep; after `deadline`, give up so the caller
+/// (W64 F3): the wait uses the shared host-wait policy
+/// ([`cuteafd_transport::wait_policy`]) so it spins on the critical path and
+/// sleeps once the policy says so, and it gives up at `deadline` so the caller
 /// can quarantine the copy instead of synchronizing on it.
 ///
 /// The already-ready path is the hot path: it polls once and never reads the
@@ -43,15 +43,11 @@ pub(crate) enum WaitOutcome {
 pub(crate) async fn wait_ready(mut ready: impl FnMut() -> Result<bool>, deadline: Duration) -> Result<WaitOutcome> {
     if ready()? { return Ok(WaitOutcome::Ready); }
     let started = Instant::now();
-    let mut spins = 0u32;
+    let mut backoff = cuteafd_transport::wait_policy::Backoff::new();
     loop {
         if started.elapsed() >= deadline { return Ok(WaitOutcome::TimedOut); }
-        if spins < WAIT_SPINS {
-            spins += 1;
-            tokio::task::yield_now().await;
-        } else {
-            tokio::time::sleep(WAIT_SLEEP).await;
-        }
+        backoff.pause();
+        tokio::task::yield_now().await;
         if ready()? { return Ok(WaitOutcome::Ready); }
     }
 }
@@ -180,16 +176,40 @@ pub(crate) trait LaneCommit {
     fn quarantine(&mut self) -> Result<()> { Ok(()) }
 }
 
+/// A commit that timed out and was quarantined. Callers must NOT discard or
+/// release its storage: the device may still be reading it. The owners stay
+/// held until the abandoned stream completes (or the process restarts).
+#[derive(Debug)]
+pub(crate) struct CommitQuarantined;
+impl std::fmt::Display for CommitQuarantined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "commit did not drain; quarantined")
+    }
+}
+impl std::error::Error for CommitQuarantined {}
+
+/// What [`commit`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitOutcome {
+    /// The commit drained and published.
+    Done,
+    /// The commit did not drain within the deadline. Its owners (workspace,
+    /// slot, window bits, snapshot buffers) are still held; the caller must
+    /// keep them owned and poll the abandoned stream until it completes, then
+    /// release. Never synchronize on it from the host.
+    Quarantined,
+}
+
 /// Begin, wait (yielding to peer lanes) and publish one commit; on failure
 /// drain it first and return the original error. A timed-out commit is
 /// quarantined instead of drained: synchronizing on the stream it just gave up
 /// on would freeze the whole server.
-pub(crate) async fn commit(commit: &mut impl LaneCommit) -> Result<()> {
+pub(crate) async fn commit(commit: &mut impl LaneCommit) -> Result<CommitOutcome> {
     commit_with_deadline(commit, COMMIT_DEADLINE).await
 }
 
 /// [`commit`] with an explicit deadline (tests use a short one).
-async fn commit_with_deadline(commit: &mut impl LaneCommit, deadline: Duration) -> Result<()> {
+async fn commit_with_deadline(commit: &mut impl LaneCommit, deadline: Duration) -> Result<CommitOutcome> {
     let mut timed_out = false;
     let result = match commit.begin() {
         Ok(()) => match wait_ready(|| commit.ready(), deadline).await {
@@ -203,13 +223,20 @@ async fn commit_with_deadline(commit: &mut impl LaneCommit, deadline: Duration) 
         Err(error) => Err(error),
     };
     if let Err(error) = result {
-        let cleanup = if timed_out { commit.quarantine() } else { commit.abort_and_drain() };
-        if let Err(cleanup) = cleanup {
+        if timed_out {
+            // Leave the owners in place: the caller quarantines them and polls
+            // the abandoned stream instead of synchronizing on it.
+            if let Err(cleanup) = commit.quarantine() {
+                tracing::error!(%cleanup, "quarantining a timed-out lane commit");
+            }
+            return Ok(CommitOutcome::Quarantined);
+        }
+        if let Err(cleanup) = commit.abort_and_drain() {
             tracing::error!(%cleanup, "draining a failed lane commit");
         }
         return Err(error);
     }
-    Ok(())
+    Ok(CommitOutcome::Done)
 }
 
 #[cfg(test)]
@@ -354,7 +381,7 @@ mod tests {
     #[test]
     fn commit_waits_for_both_halves_and_drains_on_failure() {
         let mut ok = Fake::default();
-        block_on(commit(&mut ok)).unwrap();
+        assert_eq!(block_on(commit(&mut ok)).unwrap(), CommitOutcome::Done);
         assert_eq!((ok.log.as_slice(), ok.polls), (&["begin", "publish"][..], 3));
         let mut early = Fake { fail_begin: true, ..Fake::default() };
         assert_eq!(block_on(commit(&mut early)).unwrap_err().to_string(), "begin failed");
@@ -411,20 +438,78 @@ mod tests {
         }
         let mut stuck = Stuck { log: Vec::new() };
         // A zero deadline makes the first non-ready poll time out immediately.
-        let error = block_on(commit_with_deadline(&mut stuck, Duration::ZERO));
-        assert!(error.is_err());
+        let outcome = block_on(commit_with_deadline(&mut stuck, Duration::ZERO)).unwrap();
+        assert_eq!(outcome, CommitOutcome::Quarantined);
         assert_eq!(stuck.log, ["begin", "quarantine"], "a timed-out commit must not drain");
     }
-    /// The commit and the cancel/retire path both use the bounded wait, so a
-    /// stuck device copy cannot hold a lane forever.
+
+    /// Engine-level lifecycle: a commit that times out keeps its owners (slot,
+    /// window bit, prefix lane) held while the abandoned stream is still
+    /// pending, and releases them only once the device-side completion fires.
+    /// A second, independent slot keeps working throughout, so the engine does
+    /// not freeze on the abandoned stream.
     #[test]
-    fn lane_waits_are_bounded() {
-        let source = include_str!("lanes.rs");
-        assert!(source.contains("wait_ready(|| commit.ready(), COMMIT_DEADLINE)"));
-        let independent = include_str!("../../families/deepseek_v41/v41_native_serve/scheduler/independent.rs");
-        assert!(independent.contains("lanes::wait_ready("));
-        assert!(independent.contains("lanes::RETAIN_DEADLINE"));
-        assert!(independent.contains("quarantine_retain"));
-        assert!(!independent.contains("loop {\n                    let ready = prefixes.borrow_mut().poll_retain"));
+    fn a_quarantined_commit_holds_its_owners_until_the_stream_completes() {
+        /// Models the three owners a decode commit holds: the request slot, the
+        /// window's `writing` bit and the prefix capture lane.
+        #[derive(Default)]
+        struct Owners {
+            slot: Cell<bool>,
+            writing: Cell<bool>,
+            prefix_lane: Cell<bool>,
+            device_done: Cell<bool>,
+            log: RefCell<Vec<&'static str>>,
+        }
+        impl LaneCommit for Owners {
+            fn begin(&mut self) -> Result<()> {
+                self.slot.set(true);
+                self.writing.set(true);
+                self.prefix_lane.set(true);
+                self.log.borrow_mut().push("begin");
+                Ok(())
+            }
+            fn ready(&mut self) -> Result<bool> { Ok(self.device_done.get()) }
+            fn publish(&mut self) -> Result<()> {
+                self.slot.set(false);
+                self.writing.set(false);
+                self.prefix_lane.set(false);
+                self.log.borrow_mut().push("publish");
+                Ok(())
+            }
+            fn abort_and_drain(&mut self) -> Result<()> {
+                self.slot.set(false);
+                self.writing.set(false);
+                self.prefix_lane.set(false);
+                self.log.borrow_mut().push("abort");
+                Ok(())
+            }
+            fn quarantine(&mut self) -> Result<()> {
+                // Keep every owner: the device may still be reading them.
+                self.log.borrow_mut().push("quarantine");
+                Ok(())
+            }
+        }
+        let mut owners = Owners::default();
+        let outcome = block_on(commit_with_deadline(&mut owners, Duration::ZERO)).unwrap();
+        assert_eq!(outcome, CommitOutcome::Quarantined);
+        assert!(owners.slot.get() && owners.writing.get() && owners.prefix_lane.get(),
+            "a quarantined commit must keep its slot, window bit and prefix lane owned");
+        assert_eq!(owners.log.borrow().as_slice(), ["begin", "quarantine"]);
+
+        // A second, independent slot is usable while the abandoned stream is
+        // still pending: the engine keeps serving.
+        let mut other = Owners::default();
+        other.device_done.set(true);
+        assert_eq!(block_on(commit_with_deadline(&mut other, Duration::from_secs(1))).unwrap(),
+            CommitOutcome::Done);
+        assert!(!other.slot.get() && !other.writing.get() && !other.prefix_lane.get());
+
+        // The abandoned stream completes: the owners are released and reusable.
+        owners.device_done.set(true);
+        assert!(owners.ready().unwrap());
+        owners.publish().unwrap();
+        assert!(!owners.slot.get() && !owners.writing.get() && !owners.prefix_lane.get(),
+            "the owners are released once the device-side completion fires");
+        assert_eq!(owners.log.borrow().as_slice(), ["begin", "quarantine", "publish"]);
     }
 }

@@ -92,6 +92,21 @@ impl Drop for RequestBatch {
         if let Some(engram) = &mut self.engram { engram.cancel(); }
     }
 }
+/// A decode commit whose device copies did not drain within the deadline. It
+/// keeps the batch (workspace), the request slots and the window `writing` bits
+/// owned until the device-side completion events fire, then publishes or aborts
+/// and releases. It is polled (never synchronized) at each scheduler boundary.
+pub(crate) struct QuarantinedCommit {
+    /// The lane whose pass owns the abandoned commit.
+    pub lane: usize,
+    /// Accepted rows per member, in `slots` order.
+    pub accepted: Vec<u32>,
+    /// The round's workspace; dropping it would cancel the engram wave, so it
+    /// stays owned until the commit settles.
+    pub batch: RequestBatch,
+    /// The active slots whose requests the commit covers.
+    pub slots: Vec<usize>,
+}
 pub(crate) struct Requests<'a> {
     cache: BackboneCache<'a>,
     /// Per capture lane: the lease whose snapshot is queued.
@@ -107,6 +122,8 @@ pub(crate) struct Requests<'a> {
     prefetched: prefetch::PrefetchSlot<CacheLease, EngramWave>,
     /// Requests released so far; admission waiters retry when it moves.
     releases: u64,
+    /// Commits that timed out and are waiting for their device copies to drain.
+    pub quarantine: Vec<QuarantinedCommit>,
 }
 impl<'a> Requests<'a> {
     pub fn engram_host_formulas(&self) -> [(&'static str, u64); 2] {
@@ -139,6 +156,7 @@ impl<'a> Requests<'a> {
             image_requests: 0,
             prefetched: Default::default(),
             releases: 0,
+            quarantine: Vec::new(),
         })
     }
     pub fn new_distributed(
@@ -159,6 +177,7 @@ impl<'a> Requests<'a> {
             image_requests: 0,
             prefetched: Default::default(),
             releases: 0,
+            quarantine: Vec::new(),
         })
     }
     pub fn cache(&self) -> &BackboneCache<'a> {
@@ -168,7 +187,7 @@ impl<'a> Requests<'a> {
         pages:[usize;4],map:crate::families::deepseek_v41::v41_backbone_cache::CachePlacement,budgets:[usize;2])->Result<Self> {
         Ok(Self { cache:BackboneCache::new_replicated(library,map,slots,pages,budgets)?,
             prefix_leases:[None,None],pipeline,slots:(0..slots).map(|_|None).collect(),units:vec![Vec::new();slots],
-            released_units:Vec::new(),image_requests:0, prefetched: Default::default(),releases:0 })
+            released_units:Vec::new(),image_requests:0, prefetched: Default::default(),releases:0,quarantine:Vec::new() })
     }
     fn request_identity(&self, lease: CacheLease) -> Result<&Request> {
         self.slots.iter().flatten().find(|r| r.lease == lease).context("request history missing")

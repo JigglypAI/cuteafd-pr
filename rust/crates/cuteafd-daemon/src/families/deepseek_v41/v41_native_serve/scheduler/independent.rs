@@ -1,14 +1,22 @@
 //! Lane-local rounds; shared owners are borrowed only during synchronous work.
 use super::*;
+use crate::families::deepseek_v41::v41_requests::QuarantinedCommit;
 use crate::shared::serve::lanes::{self, LaneCommit, LaneLease, LaneSet};
 use std::cell::RefCell;
 
 pub(super) fn run<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(runtime: &tokio::runtime::Runtime,
     first: &mut P, second: &mut P, requests: &mut Requests<'a>,
     first_transport: &mut P::Transport, second_transport: &mut P::Transport,
-    active: &mut [Option<Active<'a>>], draft: Option<&mut DraftRuntime<'_, 'a, C>>,
+    active: &mut [Option<Active<'a>>], mut draft: Option<&mut DraftRuntime<'_, 'a, C>>,
     prefixes: &mut PrefixCache<'a>, receive: &mpsc::Receiver<NativeRequest>, wake: admission::Wake<'_>,
 ) -> Result<()> {
+    // A commit that timed out keeps its pass busy until its device copies
+    // drain. Poll it (never synchronize) and skip the round while it is still
+    // pending, so the abandoned stream cannot wedge the lane.
+    if !requests.quarantine.is_empty() {
+        poll_quarantine(first, second, requests, &mut draft, active)?;
+        if !requests.quarantine.is_empty() { return Ok(()); }
+    }
     let requests = RefCell::new(requests);
     let active = RefCell::new(active);
     let draft = RefCell::new(draft);
@@ -18,6 +26,60 @@ pub(super) fn run<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(runtime: &to
         |lease, control| lane(lease, control, first, first_transport, &requests, &active, &draft, &prefixes, receive, wake),
         |lease, control| lane(lease, control, second, second_transport, &requests, &active, &draft, &prefixes, receive, wake),
     ))
+}
+
+/// Settle quarantined commits whose device copies have drained. Never
+/// synchronizes: it polls the abandoned stream and, once it completes,
+/// publishes (or aborts) and releases the requests it covered. Returns whether
+/// any quarantine is still pending.
+pub(super) fn poll_quarantine<'w, 'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(
+    first: &mut P, second: &mut P, requests: &mut Requests<'a>,
+    draft: &mut Option<&mut DraftRuntime<'w, 'a, C>>, active: &mut [Option<Active<'a>>],
+) -> Result<bool> {
+    let mut index = 0;
+    while index < requests.quarantine.len() {
+        let lane = requests.quarantine[index].lane;
+        let pass: &mut P = if lane == 0 { first } else { second };
+        let ready = pass.poll_cache_commit()?;
+        let draft_ready = match draft.as_deref() {
+            Some(d) => d.poll_queued_commit(lane)?,
+            None => true,
+        };
+        if !(ready && draft_ready) { index += 1; continue; }
+        let mut entry = requests.quarantine.swap_remove(index);
+        let published = match draft.as_deref_mut() {
+            Some(d) => d.finish_queued_commit(lane, pass, requests, &mut entry.batch, &entry.accepted),
+            None => pass.commit(requests, &mut entry.batch, &entry.accepted),
+        };
+        if let Err(error) = published {
+            tracing::error!(%error, lane, "quarantined commit failed to publish; aborting");
+            if let Err(cleanup) = pass.abort_cache_commit(requests) {
+                tracing::error!(%cleanup, lane, "aborting a failed quarantined commit");
+            }
+            if let Some(d) = draft.as_deref_mut() {
+                if let Err(cleanup) = d.abort_queued_commit(lane, requests, &mut entry.batch) {
+                    tracing::error!(%cleanup, lane, "aborting a failed quarantined draft commit");
+                }
+            }
+        }
+        // The storage is settled: release the requests the commit covered.
+        for &slot in &entry.slots {
+            if let Some(mut request) = active[slot].take() {
+                request.console_retire();
+                if let Err(error) = requests.release_if_present(request.lease) {
+                    tracing::error!(request_id = request.id(), %error,
+                        "releasing a quarantined request failed");
+                }
+                if let Some(d) = draft.as_deref_mut() {
+                    if let Err(error) = d.release(request.id()) {
+                        tracing::error!(request_id = request.id(), %error,
+                            "releasing a quarantined draft request failed");
+                    }
+                }
+            }
+        }
+    }
+    Ok(!requests.quarantine.is_empty())
 }
 
 /// Run both lanes of one call. Units released since both lanes started (a retirement on
@@ -127,7 +189,8 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             // This lane has completed all of its own GPU/transport work. Retire
             // only its requests; the peer need not stop or migrate survivors.
             let retired: Vec<_> = active.borrow().iter().enumerate().filter_map(|(slot, entry)|
-                entry.as_ref().filter(|r| retire_due(lane, r.lane(), r.finished, r.job.events.is_closed()))
+                entry.as_ref().filter(|r| !r.quarantined
+                    && retire_due(lane, r.lane(), r.finished, r.job.events.is_closed()))
                     .map(|_| slot)).collect();
             if !retired.is_empty() { control.retired(); }
             retire_completed(active, retired, lane, round_id,
@@ -143,7 +206,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 let stalled = active.iter().flatten().filter(|r| r.stalled).map(|r| r.job.events.is_closed());
                 match control.decide(wake.prefill_due(round_id), stalled, requests.borrow().release_epoch(),
                     active.iter().enumerate().filter_map(|(slot, r)|
-                        r.as_ref().filter(|r| r.lane() == lane && !r.stalled).map(|_| slot))) {
+                        r.as_ref().filter(|r| r.lane() == lane && !r.stalled && !r.quarantined).map(|_| slot))) {
                     Boundary::Stop => { lease.stop(); return Ok(()); }
                     Boundary::Done => return Ok(()),
                     Boundary::Run(members) => members,
@@ -320,12 +383,34 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                     }
                 }
                 let commit_timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG).then(Instant::now);
-                lanes::commit(&mut Commit { lane, pass: &mut *pass, requests, draft, batch: batch.as_mut().unwrap(),
-                    accepted: &decision.accepted }).await?;
+                let outcome = lanes::commit(&mut Commit { lane, pass: &mut *pass, requests, draft,
+                    batch: batch.as_mut().unwrap(), accepted: &decision.accepted }).await?;
                 if let Some(t) = commit_timed {
                     tracing::debug!(target: "cuteafd::timing", lane, commit_us=t.elapsed().as_micros() as u64,
                         decide_us=t.duration_since(started).as_micros() as u64 - prepared_us - verify_us,
                         "independent lane commit");
+                }
+                if outcome == lanes::CommitOutcome::Quarantined {
+                    // The commit did not drain. Keep its workspace, slots and
+                    // window bits owned (never synchronize on the abandoned
+                    // stream) and let the scheduler poll it to completion.
+                    let batch = batch.take().expect("quarantined commit owns its batch");
+                    let accepted = decision.accepted.clone();
+                    {
+                        let mut active = active.borrow_mut();
+                        for &slot in &members {
+                            let request = active[slot].as_mut().unwrap();
+                            request.quarantined = true;
+                            request.cacheable = false;
+                            request.failed = true;
+                            let _ = request.job.events.send(Err(
+                                "lane commit did not drain; request quarantined".into()));
+                        }
+                    }
+                    requests.borrow_mut().quarantine.push(QuarantinedCommit {
+                        lane, accepted, batch, slots: members.clone() });
+                    lease.stop();
+                    return Ok(());
                 }
                 let (accepted, emitted, emissions, accepted_inputs) = publish_commit_lane(&mut active.borrow_mut(),
                     &members, &mut batch, decision)?;
