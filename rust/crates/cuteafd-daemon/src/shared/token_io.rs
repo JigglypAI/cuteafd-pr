@@ -177,14 +177,20 @@ impl<'a> TokenEmbedding<'a> {
     }
 
     /// Physical table storage, not a mapped device alias or the shared vocabulary.
-    pub(crate) fn allocation_receipt(&self, id: &str, group: &str) -> anyhow::Result<cuteafd_loader::placement::planner::Receipt> {
-        use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location, Receipt};
+    pub(crate) fn allocation_receipt(&self, id: &str, group: &str,
+        location: cuteafd_loader::placement::planner::Location, physical_device: i32,
+    ) -> anyhow::Result<cuteafd_loader::placement::planner::Receipt> {
+        use cuteafd_loader::placement::planner::{Allocation, Device, Domain, Lifetime, Location, Receipt};
+        ensure!(location.domain == Domain::Device && location.device != Device::Host,
+            "token embedding requires a logical device location");
+        ensure!(physical_device >= 0 && self.table.buffer().device_id == physical_device,
+            "token embedding has a different physical device");
         let (location, bytes, address) = match &self.table {
-            ResidentWeight::Device(owner) => (Location::coordinator(u8::try_from(owner.buffer.device_id)?),
-                owner.buffer.bytes, owner.buffer.ptr as u64),
+            ResidentWeight::Device(owner) => (location, owner.buffer.bytes, owner.buffer.ptr as u64),
             ResidentWeight::Host { storage, .. } => (Location::PINNED,
                 storage.buffer.bytes, storage.buffer.ptr as u64),
         };
+        ensure!(bytes > 0 && address != 0, "token embedding has an empty physical owner");
         Ok(Receipt { allocation: Allocation::buffer(id, location, bytes as u64,
             Lifetime::RESIDENT, cuteafd_core::memory_layout::Category::Embedding, group), address })
     }

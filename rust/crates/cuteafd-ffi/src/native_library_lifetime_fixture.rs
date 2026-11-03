@@ -140,6 +140,17 @@ impl Fixture {
         Ok(())
     }
 
+    /// Opt-in small row-FP8 vocabulary table; numerical launches remain unsupported.
+    pub fn native_vocabulary_programs(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: this export only selects the CPU fixture's static program table.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn()> =
+                library.lib.get(b"fixture_configure_native_vocabulary_programs")?;
+            configure();
+        }
+        Ok(())
+    }
+
     /// Configure static package ABI before loading a CPU expert module.
     pub fn configure_fp8(&self, library: &NativeLibrary, words: &[u32; 16], scratch: &[u64; 6]) -> Result<()> {
         // SAFETY: the CPU-only export copies the two fixed-size arrays synchronously.

@@ -127,10 +127,22 @@ static int exlr8_programs, exlr8_flash;
 void fixture_configure_exlr8_programs(int flash) { exlr8_programs = 1; exlr8_flash = flash; }
 static const char *exlr8_suffixes[] = { "shared_a16_serving", "a16_serving", "a16_grouped64",
     "a16_grouped", "a8_grouped", "shared_group", "group", "grouped_group" };
-uint32_t cuteafd_dsv4_program_count(void) { return exlr8_programs ? 8 : (glm_target_programs ? 31 : 7); }
+static int native_vocabulary_programs;
+void fixture_configure_native_vocabulary_programs(void) { native_vocabulary_programs = 1; }
+uint32_t cuteafd_dsv4_program_count(void) {
+    return native_vocabulary_programs ? 2 : (exlr8_programs ? 8 : (glm_target_programs ? 31 : 7));
+}
 int cuteafd_dsv4_program_info(uint32_t index, struct fixture_program_info *info) {
     if (index >= cuteafd_dsv4_program_count() || !info) return 1;
     memset(info, 0, sizeof(*info));
+    if (native_vocabulary_programs) {
+        strcpy(info->name, index == 0 ? "exlr8_dense_fp8_row_embedding_k128_n256"
+                                     : "exlr8_dense_fp8_row_k128_n256_s1");
+        info->pointers = index == 0 ? 4 : 5;
+        info->scalars = 2;
+        memcpy(info->scalar_kinds, "ii", 2);
+        return 0;
+    }
     if (exlr8_programs) {
         snprintf(info->name, sizeof(info->name), "exlr8_%s%s", exlr8_flash ? "glmf_" : "", exlr8_suffixes[index]);
         info->pointers = index >= 5 ? 8 : (index >= 2 ? 15 : 13);

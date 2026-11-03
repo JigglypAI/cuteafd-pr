@@ -168,12 +168,14 @@ fn retained_weight_owners_match_actual_loader_and_physical_embedding() -> Result
     let library = fixture_dso.load()?;
     for device in 0..2 { fixture_dso.configure_memory(&library, device, 1 << 34)?; }
     // Allocation-only checks: the fake DSO does not qualify forward numerics.
-    for (ranks, owned, host, native_shared, core) in [
-        (1, false, false, false, false), (2, false, false, false, false),
-        (2, true, true, false, false), (2, false, true, true, false),
-        (2, true, false, false, true),
+    for (ranks, owned, host, native_shared, core, first_device) in [
+        (1, false, false, false, false, 0), (2, false, false, false, false, 0),
+        (2, true, true, false, false, 0), (2, false, true, true, false, 0),
+        (2, true, false, false, true, 0), (1, false, false, false, false, 1),
+        (2, true, true, false, false, 1), (2, false, false, false, false, 1),
     ] {
-        library.cuda_set_device(0)?;
+        let physical_devices = if ranks == 2 { vec![first_device, 1 - first_device] } else { vec![first_device] };
+        library.cuda_set_device(first_device)?;
         let root = tempfile::tempdir_in(fixture_dso.directory())?;
         let (mut config, mut tensors) = fixture::glm5_compact_weights();
         if core {
@@ -207,8 +209,8 @@ fn retained_weight_owners_match_actual_loader_and_physical_embedding() -> Result
         let mut inventory = WeightInventory::from_checkpoint(&checkpoint, ranks, cfg.layers,
             owners.as_ref().map(|o| o.as_slice()), bf16_programs(), native_shared, home)?;
         let stream = std::ptr::null_mut();
-        let loader = GlmLoader { library: &library, catalog: &catalog, stream, device: 0,
-            peers: (ranks == 2).then_some(crate::shared::peer_split::RankDevice { device: 1, stream })
+        let loader = GlmLoader { library: &library, catalog: &catalog, stream, device: first_device,
+            peers: (ranks == 2).then_some(crate::shared::peer_split::RankDevice { device: 1 - first_device, stream })
                 .into_iter().collect(), push: None };
         let tensor = catalog.tensor("model.embed_tokens.weight")?;
         let source = EmbedSource::new(root.path(), &tensor.shard, &tensor.metadata, cfg.hidden)?;
@@ -220,8 +222,18 @@ fn retained_weight_owners_match_actual_loader_and_physical_embedding() -> Result
             inventory.add_peer_routers(&[1])?;
         }
         let plan = retained_weight_plan(&inventory)?;
-        let receipts = model.allocation_receipts(&peers, &embedding)?;
+        let receipts = model.allocation_receipts(&peers, &embedding, &physical_devices)?;
         planner::reconcile(&plan, Phase::Warmup, &receipts)?;
+        assert!(model.allocation_receipts(&peers, &embedding, &[]).is_err());
+        assert!(model.allocation_receipts(&peers, &embedding, &[-1]).is_err());
+        if ranks == 2 {
+            assert!(model.allocation_receipts(&peers, &embedding, &[first_device, first_device]).is_err());
+            assert!(model.allocation_receipts(&peers, &embedding, &[1 - first_device, first_device]).is_err());
+        } else {
+            assert!(model.allocation_receipts(&peers, &embedding, &[1 - first_device]).is_err());
+        }
+        assert!(embedding.allocation_receipt("fixture", "fixture", Location::PINNED, first_device).is_err());
+        assert!(embedding.allocation_receipt("fixture", "fixture", Location::coordinator(0), 1 - first_device).is_err());
         let table = receipts.iter().find(|r| r.allocation.id == "glm.weights.embedding").unwrap();
         assert_eq!(table.allocation.location, if host { Location::PINNED } else { Location::coordinator(0) });
         assert_ne!(table.address, 0);
@@ -238,6 +250,188 @@ fn retained_weight_owners_match_actual_loader_and_physical_embedding() -> Result
         let mut wrong_device = receipts;
         wrong_device[0].allocation.location = Location::coordinator(7);
         assert!(planner::reconcile(&plan, Phase::Warmup, &wrong_device).is_err());
+    }
+    Ok(())
+}
+
+fn vocabulary_manifest() -> serde_json::Value {
+    use serde_json::json;
+    let pointer = |name, dtype, shape, role| json!({"name":name,"dtype":dtype,"shape":shape,"role":role});
+    let scalars = json!([{"name":"rows","type":"int32"},{"name":"cta_limit","type":"int32"}]);
+    json!({"programs":[{
+        "name":"exlr8_dense_fp8_row_embedding_k128_n256","capacity_rows":4096,
+        "geometry":{"abi_version":1,"max_rows":4096,"hidden":128,"vocabulary":256,"ctas_per_sm":4},
+        "pointers":[pointer("ids","int32","[rows]","in"),
+            pointer("payload","uint8","[256,128]","in"),
+            pointer("scales","float32","[256]","in"),
+            pointer("output","bfloat16","[rows,128]","out")],
+        "scalars":scalars,"scratch_bytes_at_capacity":{}
+    },{
+        "name":"exlr8_dense_fp8_row_k128_n256_s1","capacity_rows":4096,
+        "geometry":{"abi_version":1,"max_rows":4096,"input_features":128,"output_features":256,
+            "sharded_side":1,"ctas_per_sm":4,"splits":1,"split_k":128,"segments":1,
+            "encoding":"fp8_row","core":"tile"},
+        "pointers":[pointer("x","bfloat16","[rows,128]","in"),
+            pointer("payload","uint8","[32768]","in"),
+            pointer("scales","float32","[256]","in"),
+            pointer("partial","float32","[0]","scratch"),
+            pointer("output","float32","[rows,256]","out")],
+        "scalars":scalars,"scratch_bytes_at_capacity":{"partial":0}
+    }]})
+}
+
+fn vocabulary_records(root: &std::path::Path)
+    -> Result<Vec<cuteafd_loader::plan::exlr8::dense::DenseRecord>> {
+    use cuteafd_loader::plan::exlr8::dense::*;
+    let mut records = Vec::new();
+    for name in ["model.embed_tokens.weight", "lm_head.weight", "model.norm.weight"] {
+        let norm = name == "model.norm.weight";
+        let path = root.join(name);
+        let payload = if norm { vec![0; 256] } else { vec![0x38; 256 * 128] };
+        let scales = if norm { vec![] } else { 0.5f32.to_le_bytes().repeat(256) };
+        std::fs::write(&path, [&payload[..], &scales[..]].concat())?;
+        let shape = if norm { vec![128] } else { vec![256, 128] };
+        let mut components = vec![DenseComponent { suffix: if norm {"bf16"} else {"fp8"}.into(),
+            dtype: if norm {"BF16"} else {"U8"}.into(), shape: shape.clone(), window: None,
+            source: DenseRange { path: path.clone(), offset: 0, bytes: payload.len() } }];
+        if !norm {
+            components.push(DenseComponent { suffix: "scale".into(), dtype: "F32".into(), shape: vec![256],
+                window: None, source: DenseRange { path, offset: payload.len() as u64, bytes: scales.len() } });
+        }
+        records.push(DenseRecord { tensor: name.into(),
+            encoding: if norm {DenseEncoding::Bf16} else {DenseEncoding::RowFp8}, shape,
+            side: if norm {ShardSide::Replicated} else {ShardSide::Output},
+            ownership: DenseOwnership::new(DenseExecution::RankZero),
+            channels_per_shard: if norm {0} else {128}, rotation_id: 0, rotation: None,
+            hessian_solved: false, components, native_blocks: if norm {0} else {2} });
+    }
+    Ok(records)
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn native_vocabulary_retained_owner_sharing_and_load_history_reconcile() -> Result<()> {
+    use crate::shared::token_io::{EmbedSource, TokenEmbedding, native::{NativeVocabulary, VocabularyPlan}};
+    use cuteafd_ffi::memory_ledger::{AllocationAudit, AllocationEvent, Space};
+    use cuteafd_loader::plan::exlr8::dense::{DensePlan, DenseSelection};
+    use cuteafd_loader::placement::{families::glm5::weights::WeightInventory, planner::{self, *}};
+    use std::rc::Rc;
+    let fixture_dso = Fixture::build()?;
+    let library = fixture_dso.load()?;
+    fixture_dso.native_vocabulary_programs(&library)?;
+    for device in 0..2 { fixture_dso.configure_memory(&library, device, 16 << 20)?; }
+    let root = tempfile::tempdir_in(fixture_dso.directory())?;
+    let path = root.path().join("programs.json");
+    std::fs::write(&path, serde_json::to_vec(&vocabulary_manifest())?)?;
+    let programs = library.programs()?.with_manifest(&path)?;
+    let records = vocabulary_records(root.path())?;
+    let selection = DenseSelection::from_hf(&fixture::glm5_config())?;
+    for physical_devices in [vec![0], vec![1], vec![0, 1], vec![1, 0]] {
+        let ranks = physical_devices.len();
+        library.cuda_set_device(physical_devices[0])?;
+        let audit = AllocationAudit::start();
+        let vocabulary_plan = || VocabularyPlan::new(&records, &selection, ranks, 0, 128, 256);
+        let staging_bytes = vocabulary_plan()?.staging_bytes();
+        assert_eq!(staging_bytes, 128 * (128 + 4));
+        // Missing geometry and admission failures must allocate nothing.
+        let metadata_only = library.programs()?;
+        assert!(NativeVocabulary::load(&library, &metadata_only, vocabulary_plan()?, 1 << 20, 0, 0).is_err());
+        assert!(NativeVocabulary::load(&library, &programs, vocabulary_plan()?, staging_bytes - 1, 0, 0).is_err());
+        assert!(NativeVocabulary::load(&library, &programs, vocabulary_plan()?, 1 << 20, 16 << 20, 0).is_err());
+        if ranks == 2 {
+            library.cuda_set_device(physical_devices[1])?;
+            assert!(NativeVocabulary::load(&library, &metadata_only,
+                VocabularyPlan::new(&records, &selection, ranks, 1, 128, 256)?, 0, 0, 0)?.is_none());
+            library.cuda_set_device(physical_devices[0])?;
+        }
+        assert!(audit.events().is_empty());
+        let owner = Rc::new(NativeVocabulary::load(&library, &programs, vocabulary_plan()?, 1 << 20, 0, 0)?
+            .context("fixture vocabulary owner")?);
+        assert_eq!(owner.bytes(), 2 * (256 * 128 + 256 * 4));
+        let source = || EmbedSource { path: records[0].components[0].source.path.clone(), offset: 0,
+            vocab: 256, hidden: 128, snapshot: None, tensor_name: records[0].tensor.clone() };
+        let embedding = TokenEmbedding::row_fp8(&library, source(), owner.clone())?;
+        let mut model = GlmWeights { layers: vec![], norm: DeviceAllocation::new(&library, 256)?,
+            head: GlmHead::RowFp8(owner.clone()) };
+        let peers = (1..ranks).map(|_| Vec::new()).collect::<Vec<_>>();
+        let plans = (0..ranks).map(|rank| DensePlan::for_rank(&records, ranks, rank)).collect::<std::result::Result<Vec<_>, _>>()?;
+        let inventory = WeightInventory::from_native(&selection, 1, &plans)?;
+        let mut plan = retained_weight_plan(&inventory)?;
+        let receipts = model.allocation_receipts(&peers, &embedding, &physical_devices)?;
+        assert_eq!(receipts.len(), 6); // Four native owners, one placeholder and the norm.
+        assert_eq!(receipts.iter().map(|r| r.allocation.bytes).sum::<u64>(), 68096);
+        assert!(receipts.iter().all(|r| r.allocation.location == Location::coordinator(0)));
+        assert_eq!(receipts.iter().map(|r| r.address).collect::<std::collections::BTreeSet<_>>().len(), 6);
+        assert_eq!(Rc::strong_count(&owner), 3);
+        planner::reconcile(&plan, Phase::Warmup, &receipts)?;
+        // One shared pinned stream buffer is created and freed during Load;
+        // its observed address/extent comes from the allocator, not the forecast.
+        let events = audit.events();
+        assert_eq!(events.len(), 8);
+        let staging = match events[0] {
+            AllocationEvent::Allocated(record) => record,
+            _ => anyhow::bail!("staging was not the first native allocation"),
+        };
+        assert_eq!((staging.key.space, staging.key.scope, staging.bytes),
+            (Space::Pinned, "native-vocabulary-staging", staging_bytes));
+        let staging_spec = Allocation::buffer("fixture.vocabulary.staging", Location::PINNED,
+            staging_bytes as u64, Lifetime { first: Phase::Load, last: Phase::Load },
+            cuteafd_core::memory_layout::Category::Staging, "native vocabulary load");
+        let observed = Receipt { allocation: Allocation::buffer("fixture.vocabulary.staging", Location::PINNED,
+            staging.bytes as u64, staging_spec.lifetime, staging_spec.category, "native vocabulary load"),
+            address: staging.address as u64 };
+        plan.facts.allocations.push(staging_spec);
+        plan.phases = planner::evaluate(&plan.facts, &plan.budgets)?;
+        let history = events.iter().map(|event| -> Result<OwnerEvent> {
+            let (record, allocated) = match event {
+                AllocationEvent::Allocated(record) => (record, true),
+                AllocationEvent::Freed(record) => (record, false),
+            };
+            let receipt = if record.key.space == Space::Pinned {
+                ensure!(record.address == staging.address && record.bytes == staging_bytes, "unknown staging event");
+                observed.clone()
+            } else {
+                ensure!(record.key.space == Space::Device && record.key.device == physical_devices[0], "unknown device event");
+                let receipt = receipts.iter().find(|r| r.address == record.address as u64).context("unowned native allocation")?;
+                ensure!(receipt.allocation.bytes == record.bytes as u64, "native allocation extent mismatch");
+                receipt.clone()
+            };
+            Ok(if allocated { OwnerEvent::Allocated { receipt, phase: Phase::Load } }
+                else { OwnerEvent::Freed { receipt, phase: Phase::Load } })
+        }).collect::<Result<Vec<_>>>()?;
+        planner::reconcile_events(&plan, Phase::Warmup, &history, &[])?;
+        let without_free = history.iter().filter(|event| matches!(event, OwnerEvent::Allocated { .. })).cloned().collect::<Vec<_>>();
+        assert!(planner::reconcile_events(&plan, Phase::Warmup, &without_free, &[]).is_err());
+        for variant in 0..7 {
+            let mut changed = receipts.clone();
+            match variant {
+                0 => { changed.pop(); }
+                1 => { let mut extra = changed[0].clone(); extra.allocation.id.push_str(".extra"); changed.push(extra); }
+                2 => { changed[0].allocation.bytes += 1; }
+                3 => { changed[0].allocation.bytes += 1; changed[1].allocation.bytes -= 1; }
+                4 => { changed[0].address = 0; }
+                5 => { changed[0].allocation.location = Location::coordinator(1); }
+                _ => { changed[0].address = changed[1].address; }
+            }
+            assert!(planner::reconcile(&plan, Phase::Warmup, &changed).is_err(), "mismatch {variant}");
+        }
+        // Equal geometry is not ownership: another real constructor makes a
+        // distinct Rc and cannot replace the embedding's retained head owner.
+        let other = Rc::new(NativeVocabulary::load(&library, &programs, vocabulary_plan()?, 1 << 20, 0, 0)?
+            .context("second fixture vocabulary")?);
+        model.head = GlmHead::RowFp8(other.clone());
+        assert!(model.allocation_receipts(&peers, &embedding, &physical_devices).is_err());
+        model.head = GlmHead::RowFp8(owner.clone());
+        drop(other);
+        let saved = model.norm.buffer.device_id;
+        model.norm.buffer.device_id = 1 - saved;
+        assert!(model.allocation_receipts(&peers, &embedding, &physical_devices).is_err());
+        model.norm.buffer.device_id = saved;
+        drop((model, embedding, owner));
+        for &device in &physical_devices {
+            library.cuda_set_device(device)?;
+            assert_eq!(library.cuda_memory_info()?.0, 16 << 20);
+        }
     }
     Ok(())
 }

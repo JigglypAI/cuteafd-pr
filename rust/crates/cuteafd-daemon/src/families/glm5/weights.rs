@@ -168,14 +168,20 @@ pub(crate) struct GlmWeights<'a> {
 impl GlmWeights<'_> {
     /// Retained physical fields only. This does not attest loading temporaries or Ready.
     pub(crate) fn allocation_receipts(&self, peers: &[Vec<GlmLayer<'_>>],
-        embedding: &crate::shared::token_io::TokenEmbedding<'_>)
+        embedding: &crate::shared::token_io::TokenEmbedding<'_>, physical_devices: &[i32])
         -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
         use cuteafd_core::memory_layout::Category;
         use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location, Receipt};
+        ensure!((1..=2).contains(&physical_devices.len()) && physical_devices.len() == peers.len() + 1
+                && physical_devices.iter().all(|&device| device >= 0)
+                && physical_devices.iter().collect::<std::collections::BTreeSet<_>>().len() == physical_devices.len(),
+            "GLM weight census requires distinct physical devices for every logical rank");
         let mut receipts = Vec::new();
-        let mut put = |id: String, buffer: CuteafdDeviceBuffer, category: Category| -> Result<()> {
+        let mut put = |rank: usize, id: String, buffer: CuteafdDeviceBuffer, category: Category| -> Result<()> {
+            ensure!(buffer.device_id == physical_devices[rank] && buffer.bytes > 0 && !buffer.ptr.is_null(),
+                "GLM weight owner {id} has an invalid extent or physical device");
             receipts.push(Receipt { allocation: Allocation::buffer(id,
-                Location::coordinator(u8::try_from(buffer.device_id)?), buffer.bytes as u64,
+                Location::coordinator(u8::try_from(rank)?), buffer.bytes as u64,
                 Lifetime::RESIDENT, category, "GLM target weights"), address: buffer.ptr as u64 });
             Ok(())
         };
@@ -184,30 +190,30 @@ impl GlmWeights<'_> {
             for (index, layer) in layers.iter().enumerate() {
                 let prefix = format!("glm.weights.gpu.{rank}.layer.{index}");
                 for (name, owner) in &layer.operands {
-                    put(format!("{prefix}.operand.{name}"), owner.buffer, Category::Weights)?;
+                    put(rank, format!("{prefix}.operand.{name}"), owner.buffer, Category::Weights)?;
                 }
                 for (name, owner) in &layer.native {
-                    put(format!("{prefix}.native.{name}"), owner.buffer, Category::Weights)?;
+                    put(rank, format!("{prefix}.native.{name}"), owner.buffer, Category::Weights)?;
                 }
                 for (name, owner) in &layer.core {
                     for (suffix, buffer) in [("payload", owner.payload.buffer), ("suh", owner.suh.buffer),
                         ("svh", owner.svh.buffer)] {
-                        put(format!("{prefix}.core.{name}.{suffix}"), buffer, Category::Weights)?;
+                        put(rank, format!("{prefix}.core.{name}.{suffix}"), buffer, Category::Weights)?;
                     }
                 }
             }
         }
-        put("glm.weights.gpu.0.norm".into(), self.norm.buffer, Category::Weights)?;
+        put(0, "glm.weights.gpu.0.norm".into(), self.norm.buffer, Category::Weights)?;
         match &self.head {
             GlmHead::Bf16(owner) => {
                 ensure!(embedding.vocabulary_owner().is_none(), "BF16 head has native vocabulary embedding");
-                put("glm.weights.gpu.0.head".into(), owner.buffer, Category::Weights)?;
+                put(0, "glm.weights.gpu.0.head".into(), owner.buffer, Category::Weights)?;
             }
             GlmHead::K6(owner) => {
                 ensure!(embedding.vocabulary_owner().is_none(), "K6 head has native vocabulary embedding");
                 for (suffix, buffer) in [("payload", owner.payload.buffer), ("suh", owner.suh.buffer),
                     ("svh", owner.svh.buffer)] {
-                    put(format!("glm.weights.gpu.0.core.head.{suffix}"), buffer, Category::Weights)?;
+                    put(0, format!("glm.weights.gpu.0.core.head.{suffix}"), buffer, Category::Weights)?;
                 }
             }
             GlmHead::RowFp8(owner) => {
@@ -216,12 +222,13 @@ impl GlmWeights<'_> {
                 for (name, table, category) in [("embedding", &owner.embedding, Category::Embedding),
                     ("head", &owner.head, Category::Weights)] {
                     for (suffix, buffer) in [("fp8", table.payload()), ("scale", table.scales())] {
-                        put(format!("glm.weights.gpu.0.vocabulary.{name}.{suffix}"), buffer, category)?;
+                        put(0, format!("glm.weights.gpu.0.vocabulary.{name}.{suffix}"), buffer, category)?;
                     }
                 }
             }
         }
-        receipts.push(embedding.allocation_receipt("glm.weights.embedding", "GLM target weights")?);
+        receipts.push(embedding.allocation_receipt("glm.weights.embedding", "GLM target weights",
+            Location::coordinator(0), physical_devices[0])?);
         receipts.sort_by(|a, b| a.allocation.id.cmp(&b.allocation.id));
         Ok(receipts)
     }
