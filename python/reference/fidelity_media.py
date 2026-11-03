@@ -290,3 +290,15 @@ def write_features(root: Path, span: dict, values, *, tower_dtype: str, identity
         _publish_locked([(root / (span["key"] + ".bf16"), data),
                          (root / (span["key"] + ".json"), encoded)])
     return meta
+
+
+def prepared_span(span):
+    """Preserve the encoder/preprocessor identity sealed by the generation server."""
+    result = {k: span[k] for k in ("start", "len", "kind", "key", "grid")}
+    if "identity" in span:
+        identity = span["identity"]
+        if (not isinstance(identity, dict) or set(identity) != {"encoder", "processor"}
+                or any(not isinstance(v, str) or not HEX.fullmatch(v) for v in identity.values())):
+            raise ValueError("invalid prepared input identity")
+        result["identity"] = dict(identity)
+    return result

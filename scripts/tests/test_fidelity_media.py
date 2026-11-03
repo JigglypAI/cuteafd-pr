@@ -205,6 +205,16 @@ def test_real_vision_manifest_pins_resizes_and_scores_following_text(real_vision
     assert result["windows"][0]["media"][0]["fixture"] == records[0]["fixture"]
     assert hashlib.sha256(builder.canonical(result)).hexdigest() == (
         "a893473148496389421db2e21fb76676d57b1f2c5d263065436f470c54f982fe")
+    identity = {"encoder": "b" * 64, "processor": "c" * 64}
+    def sealed_probe(body):
+        response = probe(body)
+        for span in response["probe"]["media"]:
+            span["identity"] = identity
+        return response
+    sealed = builder.build_vision_set(family="mistral_large4", model="model", checkpoint="model",
+        version="real2", arm=arm, probe=sealed_probe, fixtures=destination, tokenizer_sha256="c" * 64,
+        vision_manifest=manifest, snapshot=snapshot)
+    assert all(span["identity"] == identity for window in sealed["windows"] for span in window.get("media", []))
 
 
 def test_real_manifest_audio_uses_pinned_pcm_and_ordinary_transport(real_vision_input):
@@ -1076,3 +1086,14 @@ def test_pcm_span_identity_geometry_and_feature_metadata(tmp_path):
         read_pcm_fixture(tmp_path, {**audio, "pcm_sha256": "b" * 64})
     with pytest.raises(ValueError, match="processor geometry"):
         validate_media([audio], [1, 8, 8, 2, 3], ["ctx"] * 4 + ["gen"], 4)
+
+
+def test_prepared_span_preserves_sealed_encoder_and_processor_ids():
+    from fidelity_media import prepared_span
+    span = {"start": 1, "len": 4, "kind": "image", "key": "a" * 64, "grid": [1, 4, 4],
+            "identity": {"encoder": "b" * 64, "processor": "c" * 64}, "image_url": "not retained"}
+    sealed = prepared_span(span)
+    assert sealed["identity"] == span["identity"] and "image_url" not in sealed
+    span["identity"]["encoder"] = "bad"
+    with pytest.raises(ValueError, match="identity"):
+        prepared_span(span)

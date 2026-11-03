@@ -144,8 +144,7 @@ impl Binding {
             ensure!(probe.spec.media.len() == job.media.len() && probe.spec.audio.len() == job.audio.len(), "Muse probe media count");
             let mut spans = Vec::new();
             for (span, image) in probe.spec.media.iter().zip(&job.media) {
-                ensure!(span.len == image.tokens && span.grid == [image.grid.t, image.grid.h, image.grid.w]
-                    && span.key == key_hex(image.key.into()), "Muse image probe identity differs");
+                span.verify_image(image)?;
                 spans.push(MediaSpan { start: span.start, len: span.len, key: image.key.into() });
             }
             for (span, clip) in probe.spec.audio.iter().zip(&job.audio) {
@@ -159,9 +158,12 @@ impl Binding {
         let media = RequestMedia::new(spans.clone(), hidden, tokens.len())?;
         self.coordinates(&tokens, &media)?;
         if let Some(probe) = &job.probe {
-            probe.media(spans.iter().filter(|s| !s.key.is_audio()).zip(&job.media).map(|(span, image)|
+            probe.media(spans.iter().filter(|s| !s.key.is_audio()).zip(&job.media).enumerate().map(|(i, (span, image))|
                 cuteafd_api::openai::probe::ProbeMedia { start: span.start, len: span.len, kind: "image".into(),
-                    key: key_hex(span.key), grid: [image.grid.t, image.grid.h, image.grid.w], fixture: None, image_url: None }).collect());
+                    key: key_hex(span.key), grid: [image.grid.t, image.grid.h, image.grid.w],
+                    identity: Some(cuteafd_api::openai::probe::ProbeImageIdentity::prepared(image)),
+                    input_key: probe.spec.media.get(i).filter(|s| s.identity.is_some()).map(|s| s.key.clone()),
+                    fixture: probe.spec.media.get(i).and_then(|s| s.fixture.clone()), image_url: None }).collect());
             probe.audio(spans.iter().filter(|s| s.key.is_audio()).zip(&job.audio).map(|(span, clip)|
                 cuteafd_api::openai::probe::ProbeAudio { start: span.start, len: span.len, key: key_hex(span.key),
                     samples: clip.pcm.len(), pcm_sha256: pcm_hash(&clip.pcm) }).collect());
@@ -380,6 +382,42 @@ mod tests {
             AudioTokenGeometry::PcmPatches { samples_per_token: 1920 }));
         assert!(ApiReady { context: 1, image: None, audio: Some(audio),
             image_health: None, audio_health: None }.install(profile()?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn probe_rebinds_image_encoder_and_echoes_admitted_identity() -> Result<()> {
+        use std::sync::Arc;
+        use cuteafd_api::openai::probe::{Probe, ProbeImageIdentity, ProbeMedia, ProbeSpec};
+        use cuteafd_loader::media::{EncoderId, ImageGrid, PreparedImage, PreprocessId};
+        let grid = ImageGrid { t: 1, h: 2, w: 2 };
+        let processor = PreprocessId([2; 32]);
+        let rgb: Arc<[u8]> = Arc::from([37; 48]);
+        let source = PreparedImage::key_for(EncoderId([120; 32]), processor, grid, &rgb);
+        let image = Arc::new(PreparedImage { key: PreparedImage::key_for(EncoderId([121; 32]), processor, grid, &rgb),
+            encoder: EncoderId([121; 32]), processor, grid, rgb8: rgb, tokens: 1 });
+        let tokens = vec![1, 8, 7, 9, 2];
+        let span = ProbeMedia { start: 2, len: 1, kind: "image".into(), key: key_hex(source.into()),
+            grid: [1, 2, 2], identity: Some(ProbeImageIdentity { encoder: "78".repeat(32), processor: "02".repeat(32) }),
+            input_key: None, fixture: None, image_url: None };
+        let run = |span: ProbeMedia| {
+            let probe = Probe::new(ProbeSpec { prompt_ids: Some(tokens.clone()), media: vec![span], ..Default::default() });
+            let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(),
+                prompt: String::new(), constraint: None, images: Vec::new(), media: vec![image.clone()], audio: Vec::new(),
+                max_tokens: 8, sampling: Default::default(), stop_token_ids: Vec::new(),
+                events: tokio::sync::mpsc::unbounded_channel().0, usage: None, probe: Some(probe) };
+            binding().prepare(job, tokens.clone(), 32, 8, 16)
+        };
+        let (prompt, media, _) = run(span.clone())?;
+        assert_eq!(media.spans()[0].key, image.key.into());
+        let record = prompt.job.probe.as_ref().unwrap().record();
+        assert_eq!(record.media[0].key, key_hex(image.key.into()));
+        assert_eq!(record.media[0].input_key.as_deref(), Some(span.key.as_str()));
+        assert_eq!(record.media[0].identity, Some(ProbeImageIdentity::prepared(&image)));
+        let mut bad = span.clone(); bad.key = "00".repeat(32);
+        assert!(run(bad).is_err());
+        let mut bad = span; bad.identity.as_mut().unwrap().processor = "03".repeat(32);
+        assert!(run(bad).is_err());
         Ok(())
     }
 

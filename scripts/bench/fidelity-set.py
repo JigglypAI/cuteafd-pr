@@ -659,7 +659,7 @@ def real_vision_fixtures(path, destination, snapshot):
 def build_real_vision_set(*, family, model, checkpoint, version, arm, probe, fixtures,
                           tokenizer_sha256, vision_manifest, snapshot):
     import base64
-    from fidelity_media import validate_media
+    from fidelity_media import validate_media, prepared_span
     arm_policy(arm, checkpoint)
     records, contract = real_vision_fixtures(vision_manifest, fixtures, snapshot)
     audio_contract = None
@@ -705,7 +705,7 @@ def build_real_vision_set(*, family, model, checkpoint, version, arm, probe, fix
             if spans[0]["samples"] != item["samples"] or spans[0]["pcm_sha256"] != item["pcm_sha256"]:
                 raise ValueError("prepared audio echo differs from canonical PCM identity")
         else:
-            spans = [{**{k: span[k] for k in ("start", "len", "kind", "key", "grid")}, "fixture": item["fixture"]} for span in spans]
+            spans = [{**prepared_span(span), "fixture": item["fixture"]} for span in spans]
         if "grid" in item.get("provenance", {}) and spans[0]["grid"] != item["provenance"]["grid"]:
             raise ValueError("prepared resize grid differs from pinned resize case")
         generated, prompt = record["generated"], record["prompt_ids"]
@@ -747,7 +747,7 @@ def build_vision_set(*, family, model, checkpoint, version, arm, probe, fixtures
             arm=arm, probe=probe, fixtures=fixtures, tokenizer_sha256=tokenizer_sha256,
             vision_manifest=vision_manifest, snapshot=snapshot)
     import base64
-    from fidelity_media import read_fixture, validate_media
+    from fidelity_media import read_fixture, validate_media, prepared_span
     if family not in ("mimo_v2", "qwen4", "glm5_flash"):
         raise ValueError("this family has no supported v2 vision tower")
     arm_policy(arm, checkpoint)
@@ -795,7 +795,7 @@ def build_vision_set(*, family, model, checkpoint, version, arm, probe, fixtures
         spans = record.get("media")
         if not isinstance(spans, list) or len(spans) != 1:
             raise ValueError("media probe must return one prepared image span; refusing text-only generation")
-        span = {k: spans[0][k] for k in ("start", "len", "kind", "key", "grid")}
+        span = prepared_span(spans[0])
         span["fixture"] = fixture
         prompt, generated = record["prompt_ids"], record["generated"]
         if not 576 <= len(generated) <= body["max_tokens"]:
