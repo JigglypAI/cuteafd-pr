@@ -317,18 +317,17 @@ fn vision_on_two_rtx_reserves_the_tower_before_the_solve() {
     let manifest = dir.path().join("PROGRAMS.json");
     let mut programs = testing::glm_k6_programs(&cfg, &core).unwrap();
     let entries = programs["programs"].as_array_mut().unwrap();
-    let family = cfg.program_family();
-    let mut context: Vec<String> = crate::placement::families::glm5::CONTEXT_PROGRAMS.iter()
-        .map(|name| format!("{family}_{name}")).collect();
-    for kind in cfg.attention_kinds() {
-        context.push(crate::placement::families::glm5::context_gather(&cfg, kind));
-        for head in [0, cfg.heads / 2] {
-            context.push(format!("{family}_{kind}_partial_h{head}_s2_m64"));
+    // Use admission's requirements, materializing its partial-count wildcard as s2.
+    let mut context: Vec<String> = crate::placement::families::glm5::context_program_list(&cfg)
+        .split(", ").map(|name| name.replace("_s*_", "_s2_")).collect();
+    context.extend(crate::families::glm5::core::ml4_split_programs(&cfg, true).unwrap());
+    for name in context {
+        if !entries.iter().any(|entry| entry["name"] == name) {
+            entries.push(serde_json::json!({
+                "name": name, "scratch_bytes_at_capacity": {"scratch": 256}
+            }));
         }
     }
-    entries.extend(context.into_iter().map(|name| serde_json::json!({
-        "name": name, "scratch_bytes_at_capacity": {"scratch": 256}
-    })));
     std::fs::write(&manifest, programs.to_string()).unwrap();
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let plan = |ranks: usize, vision: MediaMode| {
