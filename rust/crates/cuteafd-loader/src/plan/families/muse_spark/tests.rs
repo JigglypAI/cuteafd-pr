@@ -530,7 +530,7 @@ fn media_auto_off_disables_component_bytes() {
     let opts = options.layout.as_mut().unwrap();
     opts.context_tokens = 4096;
     opts.pool_tokens = Some(4096);
-    opts.onboard = Some(crate::placement::Onboard::Layers(0));
+    opts.onboard = Some(crate::placement::OnboardSetting::Layers(0));
     let text = input.plan(&options).unwrap();
     let used = text.memory_layout.as_ref().unwrap().devices[0].used_bytes();
     options.vision = MediaMode::Auto;

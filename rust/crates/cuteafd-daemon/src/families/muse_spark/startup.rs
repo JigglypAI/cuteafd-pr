@@ -388,8 +388,11 @@ mod tests {
         for device in layout.devices.iter().filter(|device| device.kind == DeviceKind::Spark) {
             let expected = &admitted.spark_items[device.index as usize];
             for item in expected { assert!(device.items.contains(item)); }
-            let guards = device.items.iter().filter(|item| item.group == "media admission guard").count();
-            assert_eq!(guards, usize::from(!expected.is_empty()));
+            let native = device.items.iter().filter(|item| matches!(item.group.as_str(),
+                "vision tower" | "vision scratch" | "audio tower" | "audio scratch"))
+                .map(|item| item.bytes).sum::<u64>();
+            assert_eq!(native, expected.iter().map(|item| item.bytes).sum::<u64>());
+            assert!(!device.items.iter().any(|item| item.group == "media admission guard"));
         }
         let host = report.host_ledger.as_ref().context("media host ledger")?;
         let cache = if vision == MediaMode::Off && audio == MediaMode::Off { 0 } else { 123_456_789 };

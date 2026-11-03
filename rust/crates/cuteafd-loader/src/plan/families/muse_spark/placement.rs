@@ -15,6 +15,16 @@ use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Ite
 const GIB: u64 = 1 << 30;
 use crate::placement::families::muse_spark::LANES;
 
+fn disable_media_component(report: &mut PlanReport, component: Component) {
+    use crate::plan::Status;
+    if let Some(entry) = report.components.iter_mut().find(|entry| entry.component == component)
+        .filter(|entry| entry.status != Status::Unused && entry.status != Status::Disabled) {
+        report.disabled_media_bytes += entry.bytes;
+        entry.bytes = 0;
+        entry.status = Status::Disabled;
+    }
+}
+
 pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut PlanReport,
     opts: &mut crate::plan::layout::LayoutOptions, requested: ExpertPlacement) -> MemoryLayout {
     let limits = crate::plan::Family::prefill_limits(&super::MUSE_SPARK);
@@ -148,10 +158,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         report.encoder = Some(media.vision.clone());
         report.audio_encoder = Some(media.audio.clone());
         if media.vision.kind == crate::plan::encoder::EncoderKind::Off {
-            crate::plan::layout::disable_media_component(report, Component::Vision);
+            disable_media_component(report, Component::Vision);
         }
         if media.audio.kind == crate::plan::encoder::EncoderKind::Off {
-            crate::plan::layout::disable_media_component(report, Component::Audio);
+            disable_media_component(report, Component::Audio);
             report.audio = crate::plan::MediaMode::Off;
         }
     }

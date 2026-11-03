@@ -480,14 +480,14 @@ MUSE = {"model_type": "muse_spark", "vision_config": {"depth": 2},
         "text_config": {"model_type": "muse_spark_text", "num_hidden_layers": 62,
                         "mlp_layer_types": ["sparse"] * 62}}
 MUSE_ID = "meta-models/Muse-Spark-Open-816B-A42B"
+MUSE_PLANNED = {**PLANNED, "spark_ranks": 6, "encoder_plan_hash": "ab" * 32,
+                "encoder": None, "audio_encoder": {"kind": {"kind": "off"}, "replicas": []}}
 
 
 def _muse(tmp_path: Path, keys: str = "", *, wip: bool = True, **kwargs):
     return _family_launch_result(tmp_path, MUSE, MUSE_ID, "SPARK_COUNT=6\nRTX_GPUS=2\nSPECULATOR=off\n" + _hosts(6) + keys,
                                  extra_args=("--wip", "muse") if wip else (),
-                                 encoder_plan=kwargs.pop("encoder_plan", {**PLANNED, "spark_ranks": 6,
-                                     "encoder_plan_hash": "ab" * 32, "encoder": None,
-                                     "audio_encoder": {"kind": {"kind": "off"}, "replicas": []}}), **kwargs)
+                                 encoder_plan=kwargs.pop("encoder_plan", MUSE_PLANNED), **kwargs)
 
 
 def test_muse_dispatches_to_serve_muse_with_its_own_defaults(tmp_path: Path) -> None:
@@ -528,7 +528,7 @@ def test_muse_default_drafter_is_pinned_and_off_is_explicit(tmp_path: Path, mode
     if mode is not None:
         keys += f"SPECULATOR={mode}\n"
     result = _family_launch_result(tmp_path, MUSE, MUSE_ID, keys,
-                                  extra_args=("--wip", "muse"), encoder_plan=PLANNED)
+                                  extra_args=("--wip", "muse"), encoder_plan=MUSE_PLANNED)
     serve, plan = _line(result, "cuteafd serve-muse --snapshot"), _line(result, "cuteafd plan")
     assert _flag(plan, "--speculator") == ("off" if mode == "off" else "dflash2")
     if mode == "off":
@@ -664,7 +664,7 @@ def test_muse_examples_and_smoke_pin_the_qualified_drafter(tmp_path: Path, size,
                    if k not in ("MODEL_ID", "MODEL_REVISION") and not k.startswith("SPARK_"))
     keys += f"SPARK_COUNT={ranks}\n" + _hosts(ranks)
     result = _family_launch_result(tmp_path, MUSE, values["MODEL_ID"], keys,
-                                  extra_args=("--wip", "muse"), encoder_plan=PLANNED)
+                                  extra_args=("--wip", "muse"), encoder_plan=MUSE_PLANNED)
     serve = _line(result, "cuteafd serve-muse --snapshot")
     assert "--draft" in serve.split() and "--pool-tokens" not in serve.split()
     matrix = json.loads((ROOT / "scripts/bench/release-smoke-muse.json").read_text())

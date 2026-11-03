@@ -139,7 +139,7 @@ pub struct MuseRequest {
 pub struct MediaAdmission {
     pub vision: crate::plan::encoder::EncoderPlacement,
     pub audio: crate::plan::encoder::EncoderPlacement,
-    /// Native ledgers only; the Spark guard is reserved separately.
+    /// Exact native weights and scratch, charged before expert allocation.
     pub spark_items: Vec<Vec<cuteafd_core::memory_layout::Item>>,
 }
 
@@ -187,12 +187,6 @@ impl MuseRequest {
                             .context("Muse Spark media overhead")?;
                     }
                 }
-            }
-            for (rank, items) in spark_items.iter_mut().enumerate().filter(|(_, items)| !items.is_empty()) {
-                let guard = 1 << 30;
-                budget.overhead[rank] = budget.overhead[rank].checked_add(guard).context("Muse Spark media guard")?;
-                items.push(Item::new(Category::Reserved, "media admission guard", "not allocated", guard, Basis::Formula)
-                    .with_lifetime(cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve));
             }
             budget.constrain(&mut request)?;
             let placed = solve(&request)?;
