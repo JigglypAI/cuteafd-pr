@@ -1053,8 +1053,12 @@ mod tests {
     fn workspace_layout_follows_the_familys_epilogue() -> Result<()> {
         let root = tempfile::tempdir()?;
         let manifest = |capacity: u64, output: u64| serde_json::json!({
-            "capacity": capacity, "hidden": 8,
-            "trellis_lut": {"bytes": 32},
+            "schema": "cuteafd.v41-exl3-aot.v1", "output_dtype": "bf16",
+            "sparkinfer_revision": "test", "hidden": 8, "intermediate": 16,
+            "experts": 1, "capacity": capacity, "top_k": 1, "bits": [4, 5],
+            "swiglu_limit": serde_json::Value::Null, "direct": false, "sms": 48,
+            "blocks_per_sm": 1, "objects": [],
+            "trellis_lut": {"file": "lut", "bytes": 32, "sha256": "test"},
             "buffers": {
                 "scratch": {"bytes": output * 2, "allocation": "scratch",
                     "dtype": "f16", "zero_on_create": false},
