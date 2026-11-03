@@ -448,9 +448,13 @@ int cuteafd_cuda_event_record(void *handle, void *stream) {
     upload->stream = stream;
     upload->copies = malloc(pending_count * sizeof(struct upload));
     if (pending_count && !upload->copies) { pthread_mutex_unlock(&upload_mutex); return 1; }
-    if (pending_count) memcpy(upload->copies, pending_uploads, pending_count * sizeof(struct upload));
-    upload->count = pending_count;
-    pending_count = 0;
+    size_t retained = 0;
+    upload->count = 0;
+    for (size_t i = 0; i < pending_count; ++i) {
+        if (pending_uploads[i].stream == stream) upload->copies[upload->count++] = pending_uploads[i];
+        else pending_uploads[retained++] = pending_uploads[i];
+    }
+    pending_count = retained;
     pthread_mutex_unlock(&upload_mutex);
     event('R');
     return 0;
@@ -517,11 +521,13 @@ int cuteafd_cuda_stream_synchronize(void *stream) {
         if (upload_events[i] && ((struct upload_event *)upload_events[i])->stream == stream)
             finish_uploads(upload_events[i]);
     }
+    size_t retained = 0;
     for (size_t i = 0; i < pending_count; ++i) {
         struct upload *copy = &pending_uploads[i];
-        memcpy(copy->dst, copy->src, copy->bytes);
+        if (copy->stream == stream) memcpy(copy->dst, copy->src, copy->bytes);
+        else pending_uploads[retained++] = *copy;
     }
-    pending_count = 0;
+    pending_count = retained;
     pthread_mutex_unlock(&upload_mutex);
     return 0;
 }
