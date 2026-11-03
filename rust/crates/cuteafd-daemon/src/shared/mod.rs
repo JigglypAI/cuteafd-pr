@@ -3,6 +3,7 @@
 pub(crate) mod activation_trace;
 pub(crate) mod api;
 pub(crate) mod console;
+pub(crate) mod checkpoint_read;
 pub(crate) mod malloc_tune;
 pub(crate) mod context;
 pub(crate) mod checkpoint_read;
