@@ -999,6 +999,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
                     .then(|| converted.conversation.tools.clone()),
                 stop_sequences: converted.parsing_options.stop_sequences.clone() });
             (prompt, Vec::new(), OutputProcessor::Muse(glm5::GlmStreamProcessor::new(generator, parser)))
+        }
         Some((Templated::Mistral(encoding), raw, _thinking)) => {
             let options = mistral::MistralPromptOptions {
                 tool_names: converted.conversation.tools.iter().map(|tool| tool.name.clone()).collect(),

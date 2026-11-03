@@ -36,7 +36,8 @@ class GlmExl3PackageTest(unittest.TestCase):
         self.assertEqual(set(coordinator), {"rtx-tp1", "rtx-tp2"})
         self.assertEqual(coordinator["rtx-tp1"], (3072, 896, 16, "fp32", ["rtx-tp1"]))
         self.assertEqual(coordinator["rtx-tp2"], (1536, 896, 16, "fp32", ["rtx-tp2"]))
-        for geometry in set(tool.GEOMETRIES) - {"kimik3"}:
+        self.assertEqual(tool.activation("step5"), "silu_post_clamp")
+        for geometry in set(tool.GEOMETRIES) - {"kimik3", "step5"}:
             self.assertEqual(tool.activation(geometry), "silu")
 
     def test_kimi_capacity_set(self):
