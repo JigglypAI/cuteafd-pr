@@ -1590,7 +1590,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
                 span_rows: unit_rows * options.prefill_waves };
             let cutoff = crate::families::muse_spark::replies::Cutoff::with_wide(options.muse_partial_bf16_max_rows,
                 crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, options.muse_partial_wide_format)?;
-            let sequences = usize::try_from(options.state_slots.unwrap_or(if options.concurrency > 0 { options.concurrency } else { 16 }))?;
+            let sequences = usize::try_from(options.resolved_state_slots("muse_spark"))?;
             let host = crate::placement::families::muse_spark::host_transport(&cfg, prefill, cutoff, sequences, ranks)?;
             push(Category::Transport, "transport/rdma-rings", "registered", host.rings, Basis::Exact);
             push(Category::Transport, "transport/egress", "registered request slots", host.egress, Basis::Exact);
@@ -1640,7 +1640,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         let work_rows = unit_rows.checked_mul(lanes).and_then(|n| n.checked_add(64)).context("host workspace rows overflow")?;
         // GLM route staging lives in the exchange slots already charged above;
         // standalone router_host storage is allocated only by diagnostics.
-        if family != "qwen4" && family != "glm5" {
+        if !matches!(family, "qwen4" | "glm5" | "muse_spark") {
             let router = work_rows.checked_mul(hidden.checked_mul(2).and_then(|n| n.checked_add(topk * 8))
                 .context("host routing stride overflow")?).context("host routing workspace overflow")?;
             push(Category::Workspace, "workspace/router", "BF16 upper bound", router, Basis::Estimated);
@@ -1665,8 +1665,10 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             staging = prefill.capacity_bytes()?.checked_add(decode.capacity_bytes()?).and_then(|n| n.checked_add(separate_mtp))
                 .and_then(|n| n.checked_mul(options.rtx_bytes.len())).context("Qwen retained uploads overflow")? as u64;
         }
-        push(Category::Staging, "staging/tables-and-sync", "row metadata", staging,
-            if family == "qwen4" { Basis::Formula } else { Basis::Estimated });
+        if family != "muse_spark" {
+            push(Category::Staging, "staging/tables-and-sync", "row metadata", staging,
+                if family == "qwen4" { Basis::Formula } else { Basis::Estimated });
+        }
 
     }
 

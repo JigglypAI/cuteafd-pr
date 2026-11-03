@@ -1588,6 +1588,7 @@ pub fn render(report: &PlanReport) -> String {
         let attention = match report.family.as_deref() {
             Some("qwen4") => "Qwen full-image head72 attention",
             Some("glm5_flash") => "GLM Flash full-image head64 attention",
+            Some("muse_spark") => "Muse axial/window attention",
             _ => "MiMo key-0 attention",
         };
         let _ = writeln!(out, "vision     {:?}: {}; weights {} scratch {} bytes; {} ({attention}); shortfall {} bytes", encoder.kind, encoder.reason, encoder.weights, encoder.scratch, arch, encoder.shortfall);

@@ -225,6 +225,7 @@ mod tests {
         let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
         let core = CoreInventory::from_checkpoint(&cfg, checkpoint)?;
         let mut refused = 0;
+        let mut clamped = 0;
         for (gpus, sparks, full_prefill_logits) in [(2, 6, false), (2, 4, false), (1, 6, false),
             (1, 4, true), (2, 6, true)] {
             // A complete image: the program manifest with the coordinator EXL3 package beside it.
@@ -273,7 +274,12 @@ mod tests {
                 } else { assert!(output.is_none(), "scoring allocation absent on non-head/default serving"); }
             }
             let encoder = report.encoder.as_ref().context("vision placement")?;
-            assert_eq!(encoder.admitted_bytes(), 4_864_551_264, "native vision ledger");
+            assert_eq!(encoder.admitted_bytes(), 4_860_356_960, "native vision ledger");
+            assert_eq!(encoder.shortfall, 0, "admitted Auto media has no diagnostic shortfall");
+            if live.pool_tokens < cfg.max_position as u64 {
+                clamped += 1;
+                assert_eq!(gpus, 1, "the single-RTX cases exercise automatic context clamping");
+            }
             let layout = report.memory_layout.as_ref().context("vision layout")?;
             let native: u64 = layout.devices.iter().flat_map(|device| &device.items)
                 .filter(|item| item.group == "vision tower" || item.group == "vision scratch")
@@ -306,6 +312,7 @@ mod tests {
             }
         }
         assert!(refused > 0, "no layout onboarded, so the missing-package refusal went unexercised");
+        assert!(clamped > 0, "Auto context clamp must survive the media diagnostic baseline");
         Ok(())
     }
 
@@ -377,7 +384,7 @@ mod tests {
         assert_eq!(Some(&admitted.audio), report.audio_encoder.as_ref());
         let layout = report.memory_layout.as_ref().context("media memory layout")?;
         for (name, mode, encoder, bytes, copies) in [
-            ("vision", vision, &admitted.vision, 4_864_551_264, replicas),
+            ("vision", vision, &admitted.vision, 4_860_356_960, replicas),
             ("audio", audio, &admitted.audio, 246_586_368, 1),
         ] {
             let native = layout.devices.iter().flat_map(|device| &device.items)

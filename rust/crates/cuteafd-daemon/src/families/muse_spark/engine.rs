@@ -179,7 +179,7 @@ pub(crate) struct LinkPlan {
 
 /// The running Muse coordinator over its loaded ranks: the pair's exchange
 /// and the Spark link on rank 0 (the intake planes' device, where admission
-/// charged them). Ranks, peer and link drop in reverse order of this struct.
+/// charged them). Explicit terminal teardown precedes field destruction.
 pub(crate) struct MuseEngine<'r, 'a> {
     pub link: super::spark::MuseSparkPath<'r>,
     pub peer: Option<super::peer::MusePeer<'a>>,
@@ -209,4 +209,107 @@ impl<'r, 'a: 'r> MuseEngine<'r, 'a> {
             link.spark.first_spark_layer)?;
         Ok(Self { link: path, peer, streams, ranks })
     }
+}
+
+/// Quiescence releases Spark waits before compute drainage. No owner is released
+/// unless abort publication, QP quiescence and every consumer drain succeeded.
+fn terminal_order(
+    abort: impl FnOnce() -> Result<()>,
+    quiesce: impl FnOnce() -> Result<()>,
+    compute: impl FnOnce() -> Result<()>,
+    release: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let aborted = abort();
+    let quiesced = quiesce();
+    aborted?;
+    quiesced?;
+    compute()?;
+    release()
+}
+
+pub(crate) fn shutdown(experts: &mut dyn super::experts::SparkExperts,
+    peer: Option<&super::peer::MusePeer<'_>>, ranks: &[RankResources<'_>],
+    streams: &[*mut std::ffi::c_void]) -> Result<()> {
+    let experts = std::cell::RefCell::new(experts);
+    let result = terminal_order(
+        || peer.map_or(Ok(()), |peer| peer.exchange().publish_abort()),
+        || experts.borrow_mut().quiesce_links(),
+        || {
+            if let Some(peer) = peer {
+                if peer.exchange().terminal_state() != crate::shared::peer_split::TerminalState::Drained {
+                    peer.exchange().drain_compute()?;
+                }
+            } else {
+                for (rank, stream) in ranks.iter().zip(streams) {
+                    // SAFETY: the engine retains every queued owner and the stream's device.
+                    rank.device.run(|| unsafe { rank.device.library.cuda_stream_synchronize(*stream) })?;
+                }
+            }
+            Ok(())
+        },
+        || experts.borrow_mut().release_payloads(),
+    );
+    if let Some(peer) = peer { peer.exchange().finish_terminal(result.is_ok()); }
+    result
+}
+
+impl Drop for MuseEngine<'_, '_> {
+    fn drop(&mut self) {
+        let streams = self.streams.iter().map(|stream| stream.raw).collect::<Vec<_>>();
+        crate::shared::decode_graph::fatal_drain(
+            shutdown(&mut self.link, self.peer.as_ref(), self.ranks, &streams), "Muse engine terminal teardown");
+    }
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn shutdown_unblocks_both_peer_and_spark_waits_before_compute_and_release() -> Result<()> {
+        let events = RefCell::new(Vec::new());
+        terminal_order(|| { events.borrow_mut().push("abort"); Ok(()) },
+            || { events.borrow_mut().push("quiesce"); Ok(()) },
+            || { assert_eq!(*events.borrow(), ["abort", "quiesce"]); events.borrow_mut().push("drain"); Ok(()) },
+            || { assert_eq!(*events.borrow(), ["abort", "quiesce", "drain"]); events.borrow_mut().push("release"); Ok(()) })?;
+        assert_eq!(*events.borrow(), ["abort", "quiesce", "drain", "release"]);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_shutdown_never_releases_unsafe_owners() {
+        for failed in ["abort", "quiesce", "drain"] {
+            let events = RefCell::new(Vec::new());
+            let operation = |name| { events.borrow_mut().push(name); anyhow::ensure!(failed != name, "injected {name}"); Ok(()) };
+            assert!(terminal_order(|| operation("abort"), || operation("quiesce"),
+                || operation("drain"), || operation("release")).is_err());
+            assert!(!events.borrow().contains(&"release"));
+            assert_eq!(&events.borrow()[..2], &["abort", "quiesce"]);
+        }
+    }
+    #[test]
+    fn submission_error_and_unwind_share_terminal_cleanup() {
+        for unwind in [false, true] {
+            let events = RefCell::new(Vec::new());
+            let borrowed = RefCell::new(());
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::shared::experts::rtx::pair::submit(|| Ok(()), || {
+                    // The submission body's borrows must be gone before cleanup.
+                    let _borrow = borrowed.borrow_mut();
+                    terminal_order(|| { events.borrow_mut().push("abort"); Ok(()) },
+                        || { events.borrow_mut().push("quiesce"); Ok(()) },
+                        || { events.borrow_mut().push("drain"); Ok(()) },
+                        || { events.borrow_mut().push("release"); Ok(()) })
+                }, || -> Result<()> {
+                    let _borrow = borrowed.borrow_mut();
+                    if unwind { panic!("injected cancellation"); }
+                    anyhow::bail!("injected enqueue failure")
+                })
+            }));
+            if unwind { assert!(result.is_err()); } else { assert!(result.unwrap().is_err()); }
+            assert_eq!(*events.borrow(), ["abort", "quiesce", "drain", "release"]);
+        }
+    }
+
 }

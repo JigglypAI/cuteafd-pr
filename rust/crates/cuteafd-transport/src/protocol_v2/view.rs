@@ -3,16 +3,14 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use super::{
-    CHECKSUM_LEN, EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM,
-    EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED,
-    EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN,
+    CHECKSUM_LEN, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN,
     EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN, EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN,
     EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN, ExpertProtocolV2RequestHeader,
     ExpertProtocolV2ResponseHeader, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
     ExpertProtocolV2Status, ExpertProtocolV2WireStats, ExpertV2Dtype, REQUEST_CHECKSUM_OFFSET,
     REQUEST_KIND, RESPONSE_CHECKSUM_OFFSET, RESPONSE_EXECUTOR_ID_OFFSET, RESPONSE_KIND,
     checked_usize, debug_checksum_enabled, decode_route_entry, decode_row_descriptor,
-    payload_checksum, precompile_warmup_enabled, read_u16, read_u32, read_u64,
+    request_checksum, precompile_warmup_enabled, read_u16, read_u32, read_u64,
     request_header_len_from_flags, response_fp8_e4m3_row_scaled_enabled,
     response_header_len_from_flags, response_more_chunks_enabled,
     response_nvfp4_e2m1_fp8_e4m3_enabled, response_row_indices_enabled,
@@ -183,41 +181,6 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
         self.hidden_payload
     }
 
-    pub(crate) fn encode_regular_forwarded_into(
-        &self,
-        response_dtype: ExpertV2Dtype,
-        out: &mut Vec<u8>,
-    ) -> Result<()> {
-        if self.stream_plan_enabled()
-            || self.stream_data_enabled()
-            || self.precompile_warmup_enabled()
-            || self.partial_replies()
-        {
-            bail!("only regular ExpertProtocolV2 requests can be forwarded");
-        }
-        let response_flags = match response_dtype {
-            ExpertV2Dtype::Bf16 => 0,
-            ExpertV2Dtype::Fp8E4m3RowScaled => EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED,
-            ExpertV2Dtype::Nvfp4E2m1Fp8E4m3 => EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3,
-            other => bail!("unsupported forwarded response dtype {other:?}"),
-        };
-        let flags = response_flags
-            | if self.debug_checksum_enabled() {
-                EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
-            } else {
-                0
-            };
-        validate_flags(flags, "request")?;
-
-        out.clear();
-        if out.capacity() < self.frame_bytes.len() {
-            out.reserve(self.frame_bytes.len() - out.capacity());
-        }
-        out.extend_from_slice(self.frame_bytes);
-        out[84..88].copy_from_slice(&flags.to_le_bytes());
-        Ok(())
-    }
-
     pub fn hidden_row_payload(&self, index: usize) -> Result<&'a [u8]> {
         if self.stream_plan_enabled() {
             bail!("ExpertProtocolV2 stream plan payload does not contain hidden rows");
@@ -326,23 +289,8 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
         if !self.debug_checksum_enabled() {
             bail!("ExpertProtocolV2 request debug checksum flag is not set");
         }
-        let descriptor_rows = if self.stream_data_enabled() {
-            0
-        } else {
-            self.header.row_count as usize
-        };
-        let route_entries = if self.stream_data_enabled() {
-            0
-        } else {
-            self.header.route_count as usize
-        };
-        let rows = (0..descriptor_rows)
-            .map(|index| self.row(index))
-            .collect::<Result<Vec<_>>>()?;
-        let routes = (0..route_entries)
-            .map(|index| self.route(index))
-            .collect::<Result<Vec<_>>>()?;
-        let actual = payload_checksum(&rows, &routes, self.hidden_payload);
+        let prefix_len = self.frame_bytes.len() - self.hidden_payload.len();
+        let actual = request_checksum(&self.frame_bytes[..prefix_len], self.hidden_payload);
         let Some(checksum) = self.checksum else {
             bail!("ExpertProtocolV2 request checksum header is malformed");
         };

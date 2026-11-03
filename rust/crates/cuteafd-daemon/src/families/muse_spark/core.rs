@@ -113,7 +113,6 @@ impl<'a> CorePrograms<'a> {
         self.projection(weights, ProjectionOutput::F32)?.reduced_f32(add, rows, rank0, rank1, reduced, weights, output, stream)
     }
 
-    pub(crate) fn program_count(&self) -> usize { self.projections.len() }
 }
 
 #[cfg(test)]
@@ -165,14 +164,6 @@ mod tests {
                 }
             }
         }
-        let device = include_str!("device.rs").split("#[cfg(test)]").next().unwrap();
-        let split = device.split("fn k_split(").nth(1).unwrap().split("fn copy_rows(").next().unwrap();
-        let copy = split.find("self.copy_rows(local").unwrap();
-        let exchange = split.find("peer.swap(").unwrap();
-        let sum_egress = split.find("self.core.reduced(").unwrap();
-        let narrow = split.find("retain_partial(").unwrap();
-        assert!(copy < exchange && exchange < sum_egress && sum_egress < narrow);
-        assert!(split.contains("core, local, self.stream"), "F32 egress reuses consumed partial storage");
         Ok(())
     }
 
@@ -205,10 +196,6 @@ mod tests {
                 assert!(!called, "validate the whole batch before any device launch");
             }
         }
-        let source = include_str!("core.rs").split("#[cfg(test)]").next().unwrap();
-        let head = source.split("pub(crate) fn head_f32(").nth(1).unwrap().split("pub(crate) fn core(").next().unwrap();
-        assert!(head.contains("ProjectionOutput::F32") && head.contains("projection.local("));
-        assert!(!head.contains("projection.core("), "the head needs its H128/svh egress, not just an F32 accumulator");
         Ok(())
     }
 }

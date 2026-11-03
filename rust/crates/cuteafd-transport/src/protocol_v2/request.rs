@@ -16,7 +16,7 @@ use super::{
     ExpertProtocolV2RequestHeader, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
     ExpertProtocolV2WireStats, ExpertV2Dtype, MAGIC, REQUEST_CHECKSUM_OFFSET, REQUEST_KIND,
     VERSION, checked_u32, checked_usize, debug_checksum_enabled, decode_route_entry,
-    decode_row_descriptor, decode_row_region, encode_route_entry, encode_row_descriptor, payload_checksum,
+    decode_row_descriptor, decode_row_region, encode_route_entry, encode_row_descriptor, request_checksum,
     PartialReplyPlan, PartialWire, EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES,
     precompile_warmup_enabled, push_u16, push_u32, push_u64, read_u16, read_u32, read_u64,
     request_header_len_from_flags, response_fp8_e4m3_row_scaled_enabled,
@@ -378,13 +378,6 @@ impl ExpertProtocolV2Request {
         push_u64(out, wire_bytes as u64);
         push_u32(out, self.header.flags);
         push_u32(out, self.header.hidden_row_stride_bytes);
-        if self.debug_checksum_enabled() {
-            out.extend_from_slice(&payload_checksum(
-                &self.rows,
-                &self.routes,
-                &self.hidden_payload,
-            ));
-        }
         out.resize(header_len, 0);
 
         for (index, row) in self.rows.iter().enumerate() {
@@ -394,6 +387,11 @@ impl ExpertProtocolV2Request {
             encode_route_entry(out, route);
         }
         out.resize(prefix_bytes, 0);
+        if self.debug_checksum_enabled() {
+            let checksum = request_checksum(out, &self.hidden_payload);
+            out[REQUEST_CHECKSUM_OFFSET..REQUEST_CHECKSUM_OFFSET + CHECKSUM_LEN]
+                .copy_from_slice(&checksum);
+        }
         Ok(())
     }
 
@@ -518,7 +516,7 @@ impl ExpertProtocolV2Request {
                 ..REQUEST_CHECKSUM_OFFSET
                     .checked_add(CHECKSUM_LEN)
                     .expect("checksum range overflow")];
-            let actual_checksum = payload_checksum(&rows, &routes, &hidden_payload);
+            let actual_checksum = request_checksum(&bytes[..payload_start], &bytes[payload_start..frame_end]);
             if actual_checksum.as_slice() != expected_checksum {
                 bail!("ExpertProtocolV2 request checksum mismatch");
             }

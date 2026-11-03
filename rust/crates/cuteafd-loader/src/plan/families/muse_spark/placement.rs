@@ -142,10 +142,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let media = crate::placement::families::muse_spark::MediaOptions::from_checkpoint(input.checkpoint(),
         report.vision, report.audio, opts.vision_replicas).and_then(|options| built.admit_media(&options));
     if let Err(error) = media {
+        let shortfall = error.downcast_ref::<crate::plan::encoder::EncoderAdmissionError>()
+            .map_or(0, |error| error.shortfall);
         for component in [Component::Vision, Component::Audio] {
             let encoder = crate::plan::encoder::EncoderPlacement {
                 kind: crate::plan::encoder::EncoderKind::Off, weights: 0, scratch: 0, replicas: Vec::new(),
-                reason: format!("Muse bundled media admission refused: {error:#}"), shortfall: 0,
+                reason: format!("Muse bundled media admission refused: {error:#}"), shortfall,
             };
             if component == Component::Vision { report.encoder = Some(encoder); }
             else { report.audio_encoder = Some(encoder); }

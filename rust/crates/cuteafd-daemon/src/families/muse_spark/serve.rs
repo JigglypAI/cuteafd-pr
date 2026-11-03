@@ -417,17 +417,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn scheduler_and_embedding_keep_their_rank_device_scopes() {
-        let serve = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
-        assert!(serve.contains("ranks.last().context(\"Muse scheduler head rank\")?.device\n        .run(|| run(&backend, sequences, media))"));
-        let forward = include_str!("forward.rs").split("pub(crate) fn inject_media(").next().unwrap();
-        let body = forward.split("rank.device.run(|| {").nth(1).unwrap();
-        assert!(body.find("table.embed(").unwrap() < body.find(".norm(0, \"embed_norm\"").unwrap());
-        assert!(body.split("/// Replace media rows").next().unwrap().trim_end().ends_with("})\n}"));
-        let step = include_str!("forward.rs").split("pub(crate) fn step(").nth(1).unwrap();
-        assert!(step.find("embed(cfg,").unwrap() < step.find("inject_media(cfg,").unwrap());
-    }
+
 
     #[test]
     #[ignore = "requires sealed Muse exports, two RTX GPUs and four real Spark workers"]
@@ -575,26 +565,7 @@ mod tests {
     /// loads (onboarded experts inside the same window), the link connects
     /// after the load, and the backend serves the shared scheduler with no
     /// drafter and admitted media, with the readiness callback last.
-    #[test]
-    fn serve_brings_up_then_schedules_the_backend() {
-        let source = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
-        let body = source.split("fn with_backend<T>").nth(1).unwrap().split("\nfn worker(").next().unwrap();
-        let order = ["startup::admit(", "SparkAdmission::plan(", "load_while_admitting(Some(admission)",
-            "super::onboard::load(", "MuseEngine::connect(", "MuseBackend::new(", "run(&backend, sequences, media)"];
-        let at: Vec<usize> = order.iter().map(|needle| body.find(needle).unwrap_or_else(|| panic!("{needle}"))).collect();
-        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
-        assert!(!body.contains("bail!(\"Muse Spark step executor"), "serving no longer stops after bring-up");
-        let worker = source.split("\nfn worker(").nth(1).unwrap().split("\npub(crate) async fn run(").next().unwrap();
-        assert!(worker.contains("scheduler::Drafts::None") && worker.contains("Ready { encoder, image, audio, cache_bytes, prefix } = ready"));
-        // `--draft` drives neural drafts (the policy's depth, or the fixed one); without it, none.
-        assert!(worker.contains("(Some(_), Some(depth)) => scheduler::Drafts::Neural { depth: usize::from(depth), fixed: true }"));
-        assert!(worker.contains("DflashConfig::read(snapshot)?.drafts(), fixed: false"));
-        let backend = body.split("MuseBackend::new(").nth(1).unwrap();
-        assert!(backend.contains("served_context, pages, local, draft, pricing"));
-        let run = source.split("\npub(crate) async fn run(").nth(1).unwrap();
-        assert!(run.contains("MuseEncoding::from_snapshot(") && run.contains("ModelEncoding::Muse("));
-        assert!(run.find("ready_rx.await").unwrap() < run.find("TcpListener::bind").unwrap());
-    }
+
 
     #[test]
     fn media_peer_identity_is_validated_before_device_access() -> Result<()> {

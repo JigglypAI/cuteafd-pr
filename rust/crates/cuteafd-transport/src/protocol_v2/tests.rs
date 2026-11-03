@@ -138,43 +138,6 @@ fn striped_collective_part_count_requires_row_sharding_and_multiple_parts() -> R
 }
 
 #[test]
-fn forwarded_request_reuses_frame_and_strips_owner_flags() -> Result<()> {
-    let mut request = request(4, ExpertV2SourceKind::Prefill)?
-        .with_fp8_e4m3_row_scaled_response()
-        .with_spark_row_sharded_reduction()
-        .with_debug_checksum();
-    request.set_spark_collective_part_count(2)?;
-    let encoded = request.encode()?;
-    let view = ExpertProtocolV2RequestView::parse(&encoded)?;
-    let mut frame = ExpertProtocolV2FrameBuffer::with_capacity(encoded.len());
-
-    let first_ptr = {
-        let forwarded =
-            frame.encode_regular_forwarded_request(&view, ExpertV2Dtype::Nvfp4E2m1Fp8E4m3)?;
-        let decoded = ExpertProtocolV2Request::decode(forwarded)?;
-        assert!(!decoded.spark_reduction_enabled());
-        assert!(!decoded.spark_row_sharded_reduction_enabled());
-        assert_eq!(decoded.spark_collective_part_count(), 0);
-        assert!(!decoded.fp8_e4m3_row_scaled_response_enabled());
-        assert!(decoded.nvfp4_e2m1_fp8_e4m3_response_enabled());
-        assert!(decoded.debug_checksum_enabled());
-        assert_eq!(decoded.rows, request.rows);
-        assert_eq!(decoded.routes, request.routes);
-        assert_eq!(decoded.hidden_payload, request.hidden_payload);
-        ExpertProtocolV2RequestView::parse(forwarded)?.verify_checksum()?;
-        forwarded.as_ptr()
-    };
-    let capacity = frame.capacity();
-    let second_ptr = frame
-        .encode_regular_forwarded_request(&view, ExpertV2Dtype::Bf16)?
-        .as_ptr();
-
-    assert_eq!(second_ptr, first_ptr);
-    assert_eq!(frame.capacity(), capacity);
-    Ok(())
-}
-
-#[test]
 fn row_scaled_fp8_response_negotiation_and_payload_roundtrip() -> Result<()> {
     let request = request(2, ExpertV2SourceKind::Prefill)?.with_fp8_e4m3_row_scaled_response();
     let request_wire = request.encode()?;
@@ -923,6 +886,35 @@ fn request_frame_view_checksum_is_explicit_debug_validation() -> Result<()> {
         .unwrap_err()
         .to_string()
         .contains("checksum mismatch"));
+    Ok(())
+}
+
+#[test]
+fn request_checksum_covers_header_regions_routes_and_payload() -> Result<()> {
+    let request = request(6, ExpertV2SourceKind::Prefill)?
+        .with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0, 0, 1, 1, 1, 0] })?
+        .with_debug_checksum();
+    let encoded = request.encode()?;
+    let prefix = request_payload_offset(&request);
+    let mut split_prefix = Vec::new();
+    request.encode_prefix_into(&mut split_prefix)?;
+    assert_eq!(split_prefix, encoded[..prefix]);
+    ExpertProtocolV2RequestView::parse(&encoded)?.verify_checksum()?;
+    assert_eq!(ExpertProtocolV2Request::decode(&encoded)?, request);
+    for (offset, value) in [
+        (16, encoded[16] ^ 1), // request id, still structurally valid
+        (46, PartialWire::Fp8 as u8),
+        (request.header_len() + 10, 1), // real row region
+        (request.header_len() + request.rows.len() * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN + 4, 1),
+        (prefix, encoded[prefix] ^ 1),
+    ] {
+        let mut damaged = encoded.clone();
+        damaged[offset] = value;
+        let view = ExpertProtocolV2RequestView::parse(&damaged)?;
+        assert!(view.verify_checksum().unwrap_err().to_string().contains("checksum mismatch"), "offset {offset}");
+        assert!(ExpertProtocolV2Request::decode(&damaged).unwrap_err().to_string().contains("checksum mismatch"),
+            "offset {offset}");
+    }
     Ok(())
 }
 
@@ -1763,11 +1755,6 @@ fn mapped_request_padding_aligns_odd_rows_and_sparse_routes() -> Result<()> {
             assert_eq!(ExpertProtocolV2Request::decode(&wire)?, request);
             assert_eq!(view.wire_stats(), request.wire_stats());
             assert_eq!(wire.len(), offset + rows * 4224);
-            let mut forwarded = ExpertProtocolV2FrameBuffer::default();
-            let forwarded = forwarded.encode_regular_forwarded_request(&view, ExpertV2Dtype::Bf16)?;
-            let forwarded_view = ExpertProtocolV2RequestView::parse(forwarded)?;
-            assert_eq!(forwarded_view.hidden_payload(), request.hidden_payload.as_ref());
-            assert_eq!(forwarded_view.hidden_payload().as_ptr() as usize - forwarded.as_ptr() as usize, offset);
             if topk == 8 {
                 assert_eq!(cuteafd_core::ExpertGeometry::MIMO_V2_FLASH.compact_wire_bytes(rows as u32, false).unwrap().0
                     + if debug { 32 } else { 0 }, wire.len());
@@ -1931,8 +1918,5 @@ fn request_view_reads_and_validates_partial_regions() -> Result<()> {
     let mut stray = plain_bytes.clone();
     stray[header_len + 10] = 1;
     assert!(ExpertProtocolV2RequestView::parse(&stray).is_err());
-    // A partial request is never forwarded as a regular one.
-    let mut out = Vec::new();
-    assert!(ExpertProtocolV2RequestView::parse(&bytes)?.encode_regular_forwarded_into(ExpertV2Dtype::Bf16, &mut out).is_err());
     Ok(())
 }

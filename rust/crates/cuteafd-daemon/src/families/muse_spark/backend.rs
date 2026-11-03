@@ -170,6 +170,14 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
 
     fn head_rank(&self) -> usize { self.ranks.len() - 1 }
 
+    fn shutdown(&self) -> Result<()> {
+        let result = super::engine::shutdown(&mut **self.experts.borrow_mut(), self.peer, self.ranks, &self.streams);
+        // This backend owns queued local/draft/probe storage; failed drainage
+        // cannot return and allow those fields to be destroyed.
+        crate::shared::decode_graph::fatal_drain(result, "Muse backend terminal teardown");
+        Ok(())
+    }
+
     fn verify_rows(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         kind: cuteafd_transport::ExpertV2SourceKind) -> Result<Option<DeviceLogits>> {
         let logits = self.step(sequences, kind)?;
@@ -203,24 +211,26 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
     /// One decode/verify step over `sequences` (each from its committed length).
     fn step(&self, sequences: &[(&mut Placement, &[u32])], kind: cuteafd_transport::ExpertV2SourceKind)
         -> Result<DeviceLogits> {
-        let rows = sequences.iter().map(|(_, tokens)| tokens.len()).sum::<usize>();
-        ensure!((1..=HEAD_ROWS).contains(&rows), "Muse decode step of {rows} rows (at most {HEAD_ROWS})");
-        let described = sequences.iter().map(|(placement, tokens)| StepSequence { slot: placement.slot,
-            start: placement.len, rows: tokens.len(), pages: &placement.pages }).collect::<Vec<_>>();
-        let meta = StepMetadata::build(&described, self.ring_rows, self.slots, self.unit_rows, false)?;
-        let wave = WaveStep { segments: sequences.iter().map(|(placement, tokens)| WaveSegment {
-            request: placement.slot as u64 + 1, rows: tokens.len() }).collect(), kind };
-        let media = step_media(sequences.iter().map(|(placement, tokens)|
-            (placement.media.as_ref(), placement.len, tokens.len())))?;
-        let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
-        let mut ends = self.peer.map(|peer| (0..2).map(|rank| peer.rank(rank)).collect::<Vec<_>>()).unwrap_or_default();
-        let peers = ends.iter_mut().map(|end| end as &mut dyn super::device::PeerExchange).collect();
-        let mut experts = self.experts.borrow_mut();
-        let mut probe = self.probe.borrow_mut();
-        let logits = forward::step(self.cfg, self.ranks, &self.streams, self.table, &tokens, &media, &meta, false, wave,
-            &mut **experts, peers, &mut self.local.borrow_mut(), self.draft.as_ref(),
-            probe.as_mut().map(|owner| owner.get_mut()), 0..rows)?;
-        Ok(self.logits(logits, rows))
+        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown(), || {
+            let rows = sequences.iter().map(|(_, tokens)| tokens.len()).sum::<usize>();
+            ensure!((1..=HEAD_ROWS).contains(&rows), "Muse decode step of {rows} rows (at most {HEAD_ROWS})");
+            let described = sequences.iter().map(|(placement, tokens)| StepSequence { slot: placement.slot,
+                start: placement.len, rows: tokens.len(), pages: &placement.pages }).collect::<Vec<_>>();
+            let meta = StepMetadata::build(&described, self.ring_rows, self.slots, self.unit_rows, false)?;
+            let wave = WaveStep { segments: sequences.iter().map(|(placement, tokens)| WaveSegment {
+                request: placement.slot as u64 + 1, rows: tokens.len() }).collect(), kind };
+            let media = step_media(sequences.iter().map(|(placement, tokens)|
+                (placement.media.as_ref(), placement.len, tokens.len())))?;
+            let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
+            let mut ends = self.peer.map(|peer| (0..2).map(|rank| peer.rank(rank)).collect::<Vec<_>>()).unwrap_or_default();
+            let peers = ends.iter_mut().map(|end| end as &mut dyn super::device::PeerExchange).collect();
+            let mut experts = self.experts.borrow_mut();
+            let mut probe = self.probe.borrow_mut();
+            let logits = forward::step(self.cfg, self.ranks, &self.streams, self.table, &tokens, &media, &meta, false, wave,
+                &mut **experts, peers, &mut self.local.borrow_mut(), self.draft.as_ref(),
+                probe.as_mut().map(|owner| owner.get_mut()), 0..rows)?;
+            Ok(self.logits(logits, rows))
+        })
     }
 }
 
@@ -280,36 +290,41 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
         Ok(())
     }
     fn history(&self, _placement: &Placement) {}
-    fn require_live(&self) -> Result<()> { Ok(()) }
+    fn require_live(&self) -> Result<()> {
+        self.experts.borrow().require_live()?;
+        self.peer.map_or(Ok(()), |peer| peer.exchange().require_live())
+    }
     fn log_table_stats(&self, _phase: &str) {}
 
     fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize, _pool: &RefPagePool)
         -> Result<Option<DeviceLogits>> {
-        ensure!(logit_rows <= tokens.len(), "Muse prefill logit rows exceed tokens");
-        if logit_rows > 1 {
-            let output = self.ranks.last().and_then(|rank| rank.prefill_logits.as_ref())
-                .context("Muse prefill scoring requires --full-prefill-logits at launch")?;
-            ensure!(cuteafd_loader::families::muse_spark::lane::prefill_logits_bytes(logit_rows,
-                self.cfg.vocab_size)? <= output.buffer.bytes, "Muse prefill scoring exceeds admitted rows");
-        }
-        let units = crate::shared::prefill_pipeline::prefill_units(tokens.len(), self.unit_rows, self.waves, 64)?
-            .into_iter().enumerate().map(|(index, rows)| crate::shared::prefill_pipeline::Unit { index, sequence: 0,
-                segments: Vec::new(), rows, layers: 0..self.cfg.layers, slot: index % self.waves, barrier: false })
-            .collect::<Vec<_>>();
-        let mut ends = self.peer.map(|peer| (0..2).map(|rank| peer.rank(rank)).collect::<Vec<_>>()).unwrap_or_default();
-        let peers = ends.iter_mut().map(|end| end as &mut dyn super::device::PeerExchange).collect();
-        let mut experts = self.experts.borrow_mut();
-        let mut local = self.local.borrow_mut();
-        let call = PrefillCall { request: placement.slot as u64 + 1, slot: placement.slot, start: placement.len, tokens,
-            pages: &placement.pages, ring_rows: self.ring_rows, slots: self.slots, media: placement.media.as_ref(), logit_rows };
-        let mut hooks = MusePrefill::new(self.cfg, self.ranks, self.streams.clone(), self.table, &mut **experts, peers,
-            call, &mut local, self.draft.as_ref(), units.len())?;
-        crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &units, self.waves)?;
-        let logits = hooks.logits.take();
-        drop(hooks);
-        placement.len += tokens.len();
-        if logit_rows == 0 { return Ok(None); }
-        Ok(Some(self.logits(logits.context("Muse prefill scored no rows")?, logit_rows)))
+        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown(), || {
+            ensure!(logit_rows <= tokens.len(), "Muse prefill logit rows exceed tokens");
+            if logit_rows > 1 {
+                let output = self.ranks.last().and_then(|rank| rank.prefill_logits.as_ref())
+                    .context("Muse prefill scoring requires --full-prefill-logits at launch")?;
+                ensure!(cuteafd_loader::families::muse_spark::lane::prefill_logits_bytes(logit_rows,
+                    self.cfg.vocab_size)? <= output.buffer.bytes, "Muse prefill scoring exceeds admitted rows");
+            }
+            let units = crate::shared::prefill_pipeline::prefill_units(tokens.len(), self.unit_rows, self.waves, 64)?
+                .into_iter().enumerate().map(|(index, rows)| crate::shared::prefill_pipeline::Unit { index, sequence: 0,
+                    segments: Vec::new(), rows, layers: 0..self.cfg.layers, slot: index % self.waves, barrier: false })
+                .collect::<Vec<_>>();
+            let mut ends = self.peer.map(|peer| (0..2).map(|rank| peer.rank(rank)).collect::<Vec<_>>()).unwrap_or_default();
+            let peers = ends.iter_mut().map(|end| end as &mut dyn super::device::PeerExchange).collect();
+            let mut experts = self.experts.borrow_mut();
+            let mut local = self.local.borrow_mut();
+            let call = PrefillCall { request: placement.slot as u64 + 1, slot: placement.slot, start: placement.len, tokens,
+                pages: &placement.pages, ring_rows: self.ring_rows, slots: self.slots, media: placement.media.as_ref(), logit_rows };
+            let mut hooks = MusePrefill::new(self.cfg, self.ranks, self.streams.clone(), self.table, &mut **experts, peers,
+                call, &mut local, self.draft.as_ref(), units.len())?;
+            crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &units, self.waves)?;
+            let logits = hooks.logits.take();
+            drop(hooks);
+            placement.len += tokens.len();
+            if logit_rows == 0 { return Ok(None); }
+            Ok(Some(self.logits(logits.context("Muse prefill scored no rows")?, logit_rows)))
+        })
     }
 
     /// Scores every row of every sequence (an anchor and its drafts) from its
@@ -342,27 +357,30 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
     /// The chunk's tail was tapped during its prefill call: commit it as context.
     fn prefill_draft(&self, placement: &Placement, start: usize, chunk: &[u32], next: Option<u32>,
         seq: &mut DraftState) -> Result<()> {
-        let draft = self.draft.as_ref().context("Muse drafter was not admitted")?;
-        ensure!(!chunk.is_empty() && placement.len == start + chunk.len(),
-            "Muse draft prefill differs from the committed target frontier");
-        let rows = chunk.len().min(crate::shared::speculation::dflash::TAP_ROWS);
-        draft.update(placement.slot, start + chunk.len() - rows, rows)?;
-        if !seq.ready && seq.valid_from > start { seq.valid_from = start; }
-        if start == 0 { seq.valid_from = 0; }
-        seq.ready = true;
-        seq.anchor = next;
-        Ok(())
+        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown(), || {
+            let draft = self.draft.as_ref().context("Muse drafter was not admitted")?;
+            ensure!(!chunk.is_empty() && placement.len == start + chunk.len(),
+                "Muse draft prefill differs from the committed target frontier");
+            let rows = chunk.len().min(crate::shared::speculation::dflash::TAP_ROWS);
+            draft.update(placement.slot, start + chunk.len() - rows, rows)?;
+            if !seq.ready && seq.valid_from > start { seq.valid_from = start; }
+            if start == 0 { seq.valid_from = 0; }
+            seq.ready = true;
+            seq.anchor = next;
+            Ok(())
+        })
     }
     fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, DraftState>], timing: &mut scheduler::DraftTiming)
         -> Result<Vec<Vec<u32>>> {
-        let draft = self.draft.as_ref().context("Muse drafter was not admitted")?;
-        let started = std::time::Instant::now();
-        let mut output = vec![Vec::new(); sequences.len()];
-        let selected = sequences.iter().enumerate().filter(|(_, seq)| seq.depth > 0).map(|(index, seq)| {
-            ensure!(seq.seq.ready && seq.depth < draft.block, "Muse draft continuation is cold or too wide");
-            Ok((index, crate::shared::speculation::dflash::DraftSeq { slot: seq.placement.slot,
-                anchor: seq.seq.anchor.context("Muse draft anchor absent")?, position: seq.placement.len,
-                valid_from: seq.seq.valid_from }))
+        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown(), || {
+            let draft = self.draft.as_ref().context("Muse drafter was not admitted")?;
+            let started = std::time::Instant::now();
+            let mut output = vec![Vec::new(); sequences.len()];
+            let selected = sequences.iter().enumerate().filter(|(_, seq)| seq.depth > 0).map(|(index, seq)| {
+                ensure!(seq.seq.ready && seq.depth < draft.block, "Muse draft continuation is cold or too wide");
+                Ok((index, crate::shared::speculation::dflash::DraftSeq { slot: seq.placement.slot,
+                    anchor: seq.seq.anchor.context("Muse draft anchor absent")?, position: seq.placement.len,
+                    valid_from: seq.seq.valid_from }))
         }).collect::<Result<Vec<_>>>()?;
         let last = self.ranks.len() - 1;
         for batch in selected.chunks(draft.drafter.max_batch_sequences()) {
@@ -376,25 +394,28 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
         }
         timing.seconds += started.elapsed().as_secs_f64();
         Ok(output)
+        })
     }
     /// The frontier advances by the kept rows; a drafting sequence's kept rows
     /// (tapped by the verify step at its offset) become drafter context.
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, ()>], speculative: bool) -> Result<()> {
-        ensure!(!speculative || self.draft.is_some(), "Muse speculative accept without a drafter");
-        for sequence in verified.iter_mut() {
-            sequence.placement.len = committed(sequence.start, sequence.rows.len(), sequence.kept.map(|(rows, _)| rows))?;
-        }
-        if let Some(draft) = &self.draft {
+        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown(), || {
+            ensure!(!speculative || self.draft.is_some(), "Muse speculative accept without a drafter");
             for sequence in verified.iter_mut() {
-                let Some((keep, after)) = sequence.neural_kept() else { continue };
-                ensure!(keep > 0 && sequence.placement.len == sequence.start + keep,
-                    "Muse draft accept differs from the committed target state");
-                draft.update_rows(sequence.placement.slot, sequence.first_row, sequence.start, keep)?;
-                sequence.seq.ready = true;
-                sequence.seq.anchor = Some(after);
+                sequence.placement.len = committed(sequence.start, sequence.rows.len(), sequence.kept.map(|(rows, _)| rows))?;
             }
-        }
-        Ok(())
+            if let Some(draft) = &self.draft {
+                for sequence in verified.iter_mut() {
+                    let Some((keep, after)) = sequence.neural_kept() else { continue };
+                    ensure!(keep > 0 && sequence.placement.len == sequence.start + keep,
+                        "Muse draft accept differs from the committed target state");
+                    draft.update_rows(sequence.placement.slot, sequence.first_row, sequence.start, keep)?;
+                    sequence.seq.ready = true;
+                    sequence.seq.anchor = Some(after);
+                }
+            }
+            Ok(())
+        })
     }
     fn probe_begin(&self, rows: usize) {
         if let Some(probe) = self.probe.borrow_mut().as_mut() { probe.get_mut().begin(rows); }
@@ -489,4 +510,8 @@ mod tests {
         assert_eq!(ungraphed_kind(true, scheduler::UngraphedKind::Scoring), cuteafd_transport::ExpertV2SourceKind::MtpVerify);
         Ok(())
     }
+}
+
+impl Drop for MuseBackend<'_, '_> {
+    fn drop(&mut self) { let _ = self.shutdown(); }
 }

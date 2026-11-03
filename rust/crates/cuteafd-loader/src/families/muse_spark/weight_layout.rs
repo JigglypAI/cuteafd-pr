@@ -24,14 +24,6 @@ impl LayerLayout {
             .try_fold(0usize, |n, b| n.checked_add(b).context("Muse layer weight extent overflow"))
     }
 
-    /// Bytes of the head-split attention operands on this rank (query, key,
-    /// value, output and gate projections): what the solver charges per mode.
-    pub fn attention_bytes(&self) -> Result<usize> {
-        self.operands.iter().filter(|(n, _)| n.starts_with("attn.")).map(|(_, b)| *b)
-            .chain(self.core.iter().filter(|(n, _)| n.starts_with("attn.")).map(|(_, c)| c.bytes))
-            .try_fold(0usize, |n, b| n.checked_add(b).context("Muse attention extent overflow"))
-    }
-
     /// The layout of every rank (one RTX: `ranks` 1; a head-split pair: 2).
     pub fn ranks(cfg: &MuseSparkConfig, layer: usize, ranks: usize, core: &CoreInventory) -> Result<Vec<Self>> {
         ensure!(layer < cfg.layers && matches!(ranks, 1 | 2) && cfg.heads % ranks == 0 && cfg.kv_heads % ranks == 0,
@@ -190,10 +182,6 @@ mod tests {
             let halves = pair[0].core[name].bytes + pair[1].core[name].bytes;
             assert!(halves >= whole.core[name].bytes && halves - whole.core[name].bytes < 1 << 20, "{name}");
         }
-        let pair_total = pair[0].attention_bytes().unwrap() + pair[1].attention_bytes().unwrap();
-        // Split halves sum to the whole payload plus one replicated input/output vector set.
-        assert!(pair_total >= whole.attention_bytes().unwrap());
-        assert!(pair_total - whole.attention_bytes().unwrap() < 1 << 20);
         let global = GlobalLayout::new(&cfg, &core).unwrap();
         assert_eq!(global.head.as_ref().unwrap().shape, [202112, 8192]);
     }
