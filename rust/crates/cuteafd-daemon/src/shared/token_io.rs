@@ -940,6 +940,7 @@ mod tests {
         let library = fixture.load()?;
         fixture.configure_memory(&library, 0, 1 << 30)?;
         fixture.immediate_copies(&library)?;
+        std::fs::write(fixture.directory().join("events"), [])?;
         let dir = tempfile::tempdir_in(fixture.directory())?;
         let path = dir.path().join("embedding.bin");
         // An empty shard can be opened, but any eager payload read must fail.
