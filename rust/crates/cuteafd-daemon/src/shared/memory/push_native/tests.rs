@@ -47,14 +47,15 @@ fn real_1017_coded_scale_plan_file_order_has_bounded_staging_and_no_holes() -> R
             // Expand row ownership independently into every lane-major code
             // byte and row base. Duplicate writes and unwritten padding fail.
             for group in (0..self.rows.len()).step_by(256) {
+                let tile_rows = (self.rows.len() - group).min(256);
                 let mut first = group;
-                while first < group + 256 {
+                while first < group + tile_rows {
                     let owner = self.rows[first];
                     assert_ne!(owner, 0, "generated plane contains an unwritten row");
-                    let end = (first + 1..group + 256).find(|&row| self.rows[row] != owner)
-                        .unwrap_or(group + 256);
+                    let end = (first + 1..group + tile_rows).find(|&row| self.rows[row] != owner)
+                        .unwrap_or(group + tile_rows);
                     for tile in 0..tiles {
-                        let start = ((group / 256 * tiles + tile) * 256 + first % 256) * 2;
+                        let start = (group * tiles + tile * tile_rows + first % 256) * 2;
                         let range = &mut writes[start..start + (end - first) * 2];
                         assert!(range.iter().all(|&n| n == 0), "overlapping generated code bytes");
                         range.fill(owner);
@@ -74,7 +75,7 @@ fn real_1017_coded_scale_plan_file_order_has_bounded_staging_and_no_holes() -> R
         // with layers 8..39; the card-only TP4/TP6 screen missed this route.
         let rank = if world == 3 { 1 } else { world - 1 };
         let logical = shape.intermediate / world;
-        let stored = logical.div_ceil(128) * 128;
+        let stored = cuteafd_core::mxfp4_layouts::stored_width(shape.hidden, logical).context("stored width")?;
         let planes = NativePlanes::with_scale_codes(shape.hidden, logical, stored, shape.experts, false, true)?;
         let first_layer = if world == 3 { 8 } else { shape.first_layer };
         let slices = (first_layer..shape.layers).map(|layer| SparkSlice {
