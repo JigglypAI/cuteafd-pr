@@ -1054,18 +1054,13 @@ impl Opened {
         let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;
         let mut pushed_experts = None;
         let embed_placement = args.token_io.embed_placement.context("MiMo embedding placement must resolve before admission")?;
-        let load_weights = |loader: &weights::MimoLoader<'_>| {
-            crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?, embed_placement, || {
-                let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                Ok((loader.model(&self.cfg, layers)?, loader.mtp_weights(&self.cfg, args.mtp)?))
-            })
-        };
         let prepare_push = |sparks: usize| -> Result<_> {
             let devices: Vec<_> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d))
                 .map(|id| crate::shared::memory::device::Device { library: &self.library, id }).collect();
             let load = std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::push(&self.library));
             let planning = weights::MimoLoader { dense: load.clone(), ..loader.clone() };
-            let (loaded, mut records) = crate::shared::experts::rtx::dense::recording(|| load_weights(&planning))?;
+            let (loaded, mut records) = crate::shared::experts::rtx::dense::recording(||
+                planning.with_embedding(&self.cfg, layers, args.mtp, self.embed_source()?, embed_placement))?;
             records.extend(load.sink.as_ref().context("push sink")?.take_all());
             let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records, &devices, sparks)?;
             let experts = if let Some(tp2) = preflight.placement.tp2 {
@@ -1132,7 +1127,7 @@ impl Opened {
         };
         let (embedding, ((model, mut shares), mtp_weights)) = crate::shared::placement::load_while_admitting(admission, || {
             let Some((push, sparks, (loaded, transient, dense, devices))) = coordinator_push.take() else {
-                return load_weights(&loader);
+                return loader.with_embedding(&self.cfg, layers, args.mtp, self.embed_source()?, embed_placement);
             };
             let split = crate::shared::memory::load_timing::Split::start();
             let (pushed, ()) = push.receive_with(devices, self.catalog.as_ref(), sparks, Some(Ok(dense)), || ());

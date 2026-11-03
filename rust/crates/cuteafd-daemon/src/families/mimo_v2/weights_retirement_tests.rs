@@ -117,8 +117,7 @@ fn predictor_and_embedding_record_before_commit_and_replay_mount_bytes() -> Resu
         assert!(format!("{error:#}").contains("checkpoint has 1 MTP layers"));
         assert_eq!(load.sink.as_ref().unwrap().take_all().summary(), (0, 0, 0, 0, 0, 0));
         let ((embedding, (target, predictors)), mut records) = dense::recording(||
-            TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Gpu, ||
-                Ok((planning.model(&cfg, 0)?, planning.mtp_weights(&cfg, 1)?))))?;
+            planning.with_embedding(&cfg, 0, 1, source.clone(), EmbedPlacement::Gpu))?;
         records.extend(load.sink.as_ref().unwrap().take_all());
         assert!(target.1.is_empty() || target.1.iter().all(Vec::is_empty));
         assert_eq!(predictors.len(), 1);
