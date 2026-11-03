@@ -1055,7 +1055,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     if requests.images(lease)?.needed(start, prompt.len())?.is_empty() { prompt.len() } else { start }
                 };
                 Ok((image_keys, hit, restore, resume))
-            });
+            })();
             let (image_keys, hit, restore, resume) = match admitted {
                 Ok(value) => value,
                 Err(error) => {
@@ -1240,7 +1240,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         }
     }
     Ok(())
-    })();
+    });
     // A fatal target/transport error must not orphan encoder tickets or cache owners.
     {
         let message = match &result { Ok(()) => "serve loop stopped".to_owned(),
