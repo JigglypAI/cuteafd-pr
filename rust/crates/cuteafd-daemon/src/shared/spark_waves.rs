@@ -181,7 +181,7 @@ const PULL_PER_RANK_BYTES: usize = 1 << 20;
 
 /// A counter word of the control block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Counter { Landed, Staged(usize), Consumed(usize), Arrived(usize) }
+pub(crate) enum Counter { Landed, Staged(usize), Consumed(usize), Arrived(usize), ReplyFormat(usize) }
 
 impl Counter {
     fn index(self, slots: usize) -> usize {
@@ -189,10 +189,11 @@ impl Counter {
             Self::Landed => 0,
             Self::Staged(slot) => { assert!(slot < slots, "staged counter of slot {slot} past {slots}"); 1 + 2 * slot }
             Self::Consumed(slot) => { assert!(slot < slots, "consumed counter of slot {slot} past {slots}"); 2 + 2 * slot }
+            Self::ReplyFormat(slot) => { assert!(slot < slots); 1 + 2 * slots + MAX_INTAKE_RANKS + slot }
             Self::Arrived(rank) => { assert!(rank < MAX_INTAKE_RANKS, "arrived counter of rank {rank}"); 1 + 2 * slots + rank }
         }
     }
-    fn words(slots: usize) -> usize { 1 + 2 * slots + MAX_INTAKE_RANKS }
+    fn words(slots: usize) -> usize { 1 + 3 * slots + MAX_INTAKE_RANKS }
 }
 
 /// The control block's words as raw addresses: pinned, device-mapped host
@@ -286,6 +287,7 @@ pub(crate) trait Backend {
     /// retained until the wave's `release`). `true` once every rank's rows
     /// are in place.
     fn poll(&mut self, wave: &mut Self::Wave, info: &WaveInfo) -> Result<bool>;
+    fn payload_bytes(&self, _slot: usize, admitted: usize) -> usize { admitted }
     /// Stores `landed = sequence`.
     fn publish(&mut self, sequence: u32);
     /// Returns retained reply frames whose wave's reduce was consumed; true
@@ -420,12 +422,13 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                     // post finds their receives (counters only grow).
                     backend.release_consumed();
                     let job = queued.pop_front().expect("front job");
-                    let info = WaveInfo { sequence: job.sequence, slot: job.slot, rows: job.rows, payload_bytes: job.payload_bytes, slice: job.slice,
+                    let mut info = WaveInfo { sequence: job.sequence, slot: job.slot, rows: job.rows, payload_bytes: job.payload_bytes, slice: job.slice,
                         release: job.release };
                     let mut times = WaveTimes { staged: job.sent.elapsed().as_secs_f64(), ..Default::default() };
                     Pace::add(&mut pace.staging, job.sent.max(last_landed).elapsed().as_secs_f64());
                     let started = Instant::now();
                     let wave = backend.post(job)?;
+                    info.payload_bytes = backend.payload_bytes(info.slot, info.payload_bytes);
                     times.posted = started.elapsed().as_secs_f64();
                     inflight.push_back(Inflight { info, wave, posted: Instant::now(), times });
                     progressed = true;
@@ -663,6 +666,11 @@ struct Retained<F> {
 /// the pull descriptors, the retained reply frames and the control counters.
 struct Native<T: Transport> {
     transport: T,
+    reply_format: cuteafd_core::SparkReplyFormat,
+    reply_payloads: Vec<usize>,
+    prefill_rows: u64,
+    compressed_prefill_rows: u64,
+    mixed_fallback_rows: u64,
     arenas: Vec<StagingArena>,
     words: Words,
     pulls: Pulls,
@@ -697,7 +705,7 @@ impl<T: Transport> Backend for Native<T> {
     fn counter(&self, counter: Counter) -> u32 { self.words.load(counter) }
 
     fn post(&mut self, job: Job) -> Result<Self::Wave> {
-        let request = match job.source {
+        let mut request = match job.source {
             Source::Built(request) => request,
             Source::Staged { layout, build } => {
                 let arena = &self.arenas[job.slot];
@@ -712,12 +720,38 @@ impl<T: Transport> Backend for Native<T> {
                 build(routes, wire)?
             }
         };
-        validate_payload(job.payload_bytes, job.slice.1)?;
+        let mut payload_bytes = job.payload_bytes;
+        if request.header.flags & cuteafd_transport::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES == 0 {
+            let decision = request.select_combined_reply(self.reply_format)?;
+            self.prefill_rows += decision.prefill_rows as u64;
+            self.mixed_fallback_rows += decision.mixed_fallback_rows as u64;
+            if decision.format != cuteafd_core::SparkReplyFormat::Bf16 {
+                self.compressed_prefill_rows += decision.prefill_rows as u64;
+            }
+            payload_bytes = job.rows * decision.format.row_bytes(request.header.hidden_dim as usize)
+                .context("invalid combined reply width")?;
+            self.words.store(Counter::ReplyFormat(job.slot), match decision.format {
+                cuteafd_core::SparkReplyFormat::Bf16 => 0,
+                cuteafd_core::SparkReplyFormat::Fp8 => 1,
+                cuteafd_core::SparkReplyFormat::Nvfp4 => 2,
+            });
+            if decision.prefill_rows != 0 {
+                tracing::info!(target: "cuteafd::spark_reply", sequence = job.sequence, format = %decision.format,
+                    prefill_rows = self.prefill_rows, compressed_prefill_rows = self.compressed_prefill_rows,
+                    mixed_fallback_rows = self.mixed_fallback_rows,
+                    mixed_fallback_fraction = self.mixed_fallback_rows as f64 / self.prefill_rows as f64,
+                    "Spark reply prefill rows (cumulative per link)");
+            }
+        }
+        self.reply_payloads[job.slot] = payload_bytes;
+        validate_payload(payload_bytes, job.slice.1)?;
         ensure!(request.header.row_count as usize == job.rows, "wave request rows differ from admission");
         let slices = (self.placed && self.landing != 0).then(|| vec![cuteafd_transport::LandingSlice {
-            offset: job.slice.0, bytes: job.payload_bytes }; self.ranks]);
+            offset: job.slice.0, bytes: payload_bytes }; self.ranks]);
         self.transport.dispatch(&request, slices.as_deref())
     }
+
+    fn payload_bytes(&self, slot: usize, _admitted: usize) -> usize { self.reply_payloads[slot] }
 
     fn poll(&mut self, wave: &mut Self::Wave, info: &WaveInfo) -> Result<bool> {
         let (ranks, row_bytes, landing, words, pulls) = (self.ranks, self.row_bytes, self.landing, self.words, self.pulls);
@@ -875,8 +909,36 @@ impl<'a> ExchangeStorage<'a> {
     }
 }
 
+/// One packed scratch plane reused rank-by-rank, never another BF16 reserve.
+struct ReplyDecode<'a> {
+    stage: cuteafd_ffi::programs::BoundProgram<'a>,
+    decode: cuteafd_ffi::programs::BoundProgram<'a>,
+    scratch: crate::shared::memory::DeviceAllocation<'a>,
+}
+impl<'a> ReplyDecode<'a> {
+    fn new(library: &'a NativeLibrary, rows: usize, format: cuteafd_core::SparkReplyFormat) -> Result<Self> {
+        let programs = library.programs()?;
+        let bytes = rows.checked_mul(format.row_bytes(cuteafd_core::expert_geometry().hidden as usize)
+            .context("invalid reply codec width")?).context("reply scratch overflow")?;
+        Ok(Self { stage: programs.bound("expert_reply_stage", &["source", "out", "mode"])?,
+            decode: programs.bound("expert_reply_dequantize", &["source", "out", "mode"])?,
+            scratch: crate::shared::memory::DeviceAllocation::named(library, bytes, "spark-intake/reply_codec")? })
+    }
+    unsafe fn launch(&self, plane: CuteafdDeviceBuffer, mode: *mut u32, rows: usize, stream: *mut c_void) -> Result<()> {
+        use cuteafd_ffi::programs::Scalar;
+        let scalars = [Scalar::I32(i32::try_from(rows)?),
+            Scalar::I32(i32::try_from(cuteafd_core::expert_geometry().hidden)?), Scalar::I32(-1)];
+        // SAFETY: caller's live plane and format word; scratch is retained by this link.
+        unsafe {
+            self.stage.launch(&[plane.ptr, self.scratch.buffer.ptr, mode.cast()], &scalars, stream)?;
+            self.decode.launch(&[self.scratch.buffer.ptr, plane.ptr, mode.cast()], &scalars, stream)
+        }
+    }
+}
+
 /// A link's persistent exchange: the engine side of the worker.
 pub(crate) struct Waves<'a> {
+    reply_decode: Option<ReplyDecode<'a>>,
     library: &'a NativeLibrary,
     /// Dropped first: closing it ends the worker, joined in `Drop`.
     jobs: Option<mpsc::Sender<Command>>,
@@ -941,7 +1003,13 @@ impl<'a> Waves<'a> {
         library.peer_exchange_initialize()?;
         warm_reducer(library, &intake)?;
         let timeout = transport.timeout();
-        let mut native = Native { transport, arenas: arenas.clone(), words,
+        let reply_format = cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false);
+        let reply_decode = if reply_format != cuteafd_core::SparkReplyFormat::Bf16
+            && !cuteafd_core::expert_geometry().partial_replies() {
+            Some(ReplyDecode::new(library, intake.geometry.cut().rows, reply_format)?)
+        } else { None };
+        let mut native = Native { transport, reply_format, reply_payloads: vec![0; slots],
+            prefill_rows: 0, compressed_prefill_rows: 0, mixed_fallback_rows: 0, arenas: arenas.clone(), words,
             pulls: pulls.unwrap_or(Pulls { base: 0 }), slots, ranks: intake.ranks, row_bytes: intake.row_bytes,
             landing: intake.landing, placed: intake.placed,
             receiving: (0..intake.ranks).map(|_| (0, Vec::new(), Vec::new())).collect(), retained: VecDeque::new() };
@@ -963,7 +1031,7 @@ impl<'a> Waves<'a> {
             let frames = native.frames();
             (Box::new((native.transport, frames)) as Box<dyn std::any::Any + Send>, result)
         })?;
-        Ok(Self { library, jobs: Some(jobs), worker: Some(worker), _storage: storage, words, arenas, arena_alias,
+        Ok(Self { reply_decode, library, jobs: Some(jobs), worker: Some(worker), _storage: storage, words, arenas, arena_alias,
             pulls, pinned, ranges: intake.ranges, layouts: vec![None; slots],
             unread: vec![false; slots], uses: vec![0; slots], ranks: intake.ranks, row_bytes: intake.row_bytes,
             next_slot: intake.next_slot % cut.waves, geometry: intake.geometry, sequence: 0,
@@ -1095,6 +1163,13 @@ impl<'a> Waves<'a> {
         if rest != 0 && !self.wide(ticket.payload_bytes, rest) {
             // SAFETY: as `pull`'s contract; behind the `landed` wait.
             unsafe { self.pull(ticket.sequence, slot, ticket.payload_bytes, rest, false, stream)? };
+        }
+        if let Some(codec) = &self.reply_decode {
+            for plane in self.slot_planes(slot) {
+                // SAFETY: all ranks landed, the slot is exclusive until consumed;
+                // staging and expansion are separate launches on this stream.
+                unsafe { codec.launch(plane, self.words.ptr(Counter::ReplyFormat(slot)), ticket.rows, stream)?; }
+            }
         }
         self.unread[slot] = true;
         Ok(())

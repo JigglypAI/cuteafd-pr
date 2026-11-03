@@ -225,6 +225,7 @@ HOST_ISA
 PROBE_DUMP_ROOT
 TARGET_HEAD
 SPARK_INTAKE
+SPARK_REPLY_FORMAT
 HOST_WAIT
 IDLE_PARK_SECONDS
 CONSOLE_TEXT
@@ -250,7 +251,7 @@ PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
     [[ "$1" != kimi_k3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING
     [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE RTX_EXPERT_LAYERS PREFILL_BATCH_TOKENS PREFILL_WAVES FULL_PREFILL_LOGITS PREFILL_PACKING
-    [[ "$1" != muse_spark ]] || printf '%s\n' RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS SPECULATION_TRACE DRAFT_KV_CACHE PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING FULL_PREFILL_LOGITS EXPERT_PARTIAL_BF16_MAX_ROWS EXPERT_PARTIAL_WIDE_FORMAT
+    [[ "$1" != muse_spark ]] || printf '%s\n' RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS SPECULATION_TRACE DRAFT_KV_CACHE PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING FULL_PREFILL_LOGITS EXPERT_PARTIAL_BF16_MAX_ROWS
     [[ "$1" != muse_spark ]] || printf '%s\n' VISION_REPLICAS
     _spark_slot_keys HOST LANE_A
     return
@@ -280,6 +281,7 @@ DRAFT_ROW_COST
 SPECULATION_TRACE
 TARGET_HEAD
 SPARK_INTAKE
+SPARK_REPLY_FORMAT
 HOST_WAIT
 IDLE_PARK_SECONDS
 CONSOLE_TEXT
@@ -556,6 +558,7 @@ SPARKINFER_EXL3
 SPECULATION_TRACE
 SPECULATOR
 SPARK_INTAKE
+SPARK_REPLY_FORMAT
 HOST_WAIT
 IDLE_PARK_SECONDS
 TARGET_HEAD
@@ -699,6 +702,8 @@ intake="$(get SPARK_INTAKE auto)"
 case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, gpu, pinned or host" >&2; exit 2 ;; esac
 console_text="$(get CONSOLE_TEXT on)"
 case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2; exit 2 ;; esac
+spark_reply_format="$(get SPARK_REPLY_FORMAT "")"
+case "$spark_reply_format" in ""|bf16|fp8|nvfp4) ;; *) release_die "SPARK_REPLY_FORMAT must be bf16, fp8 or nvfp4" ;; esac
 fp8_prefill="$(get FP8_EXPERT_PREFILL auto)"
 case "$fp8_prefill" in auto|w8a8|w8a16) ;; *) echo "FP8_EXPERT_PREFILL must be auto, w8a8 or w8a16" >&2; exit 2 ;; esac
 attention_plan_rows="$(get ATTENTION_PLAN_ROWS auto)"
@@ -709,6 +714,9 @@ shared_env_args=(-e "HF_HOME=$container_hf_home" -e "CUTEAFD_SPARK_INTAKE=$intak
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)"
   -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill"
   -e "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}")
+if [[ -n $spark_reply_format ]]; then
+  shared_env_args+=(-e "CUTEAFD_SPARK_REPLY_FORMAT=$spark_reply_format")
+fi
 if [[ $attention_plan_rows != auto ]]; then
   shared_env_args+=(-e "CUTEAFD_ATTENTION_PLAN_ROWS=$attention_plan_rows")
 fi
@@ -2295,7 +2303,6 @@ if [[ $family == muse_spark ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
   family_args+=(--rtx-expert-layers "$local_layers")
   [[ -z "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)" ]] || family_args+=(--expert-partial-bf16-max-rows "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)")
-  [[ -z "$(get EXPERT_PARTIAL_WIDE_FORMAT)" ]] || family_args+=(--expert-partial-wide-format "$(get EXPERT_PARTIAL_WIDE_FORMAT)")
   [[ -z "$(get SPARK_DEVICE_BUDGET_BYTES)" ]] ||
     family_args+=(--spark-budget-gib "$(python3 -c 'import sys; print(int(sys.argv[1]) / (1 << 30))' "$(get SPARK_DEVICE_BUDGET_BYTES)")")
 fi
@@ -2851,12 +2858,12 @@ audio_encoder_hash=""
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
   fi
+  [[ -z "$(get SPARK_REPLY_FORMAT)" ]] || plan_draft_args+=(--spark-reply-format "$(get SPARK_REPLY_FORMAT)")
   if [[ "$family" == muse_spark ]]; then
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
     # The serve command's partial-reply overrides and drafter rings, so plan == serve admission.
     [[ -z "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)" ]] || plan_draft_args+=(--expert-partial-bf16-max-rows "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)")
-    [[ -z "$(get EXPERT_PARTIAL_WIDE_FORMAT)" ]] || plan_draft_args+=(--expert-partial-wide-format "$(get EXPERT_PARTIAL_WIDE_FORMAT)")
     [[ "$speculator" != dflash2 ]] || plan_draft_args+=(--draft-kv-cache "${muse_draft_kv:-fp8}")
   fi
   if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 ]]; then
