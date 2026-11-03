@@ -599,7 +599,7 @@ impl<'a> Exl3Tp2<'a> {
                 Some(weights) => {
                     ensure!(weights.len() == plans.len() && weights.iter().zip(&layers).zip(&plans)
                         .all(|((weight, &layer), plan)|
-                            weight.layout.layer == cuteafd_loader::V41Exl3Layer::Backbone(layer)
+                            matches!(weight.layout.layer, cuteafd_loader::V41Exl3Layer::Backbone(id) if id == layer)
                             && weight.layout.world == 1 && weight.layout.rank == 0
                             && weight.budget.resident_bytes == plan.resident_bytes),
                         "pushed whole EXL3 weights differ from the admitted inventory and footprint");

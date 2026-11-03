@@ -173,7 +173,7 @@ impl CoordinatorExpertPlan {
                         cuteafd_loader::V41ExpertSelection::BackboneFull { layer, expert }
                     } else { cuteafd_loader::V41ExpertSelection::BackboneTp2 { layer, expert, rank: self.gpu } };
                     let names = catalog.expert_staging(selection)?.tensor_names().to_vec();
-                    builder.v41_resident(catalog, &names, planes, expert, self.world, self.gpu as u32, destination, None)?;
+                    builder.v41_resident(catalog, &names, planes, expert, u32::try_from(self.world)?, self.gpu as u32, destination, None)?;
                 }
             }
             self.scales.append(builder, rank, base + self.scales.base(&self.layout))?;
