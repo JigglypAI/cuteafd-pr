@@ -94,7 +94,7 @@ impl<'a> GlmEngine<'a> {
         hops.attach_abort([exchange.abort_word(0)?.context("rank 0 abort")?, exchange.abort_word(1)?.context("rank 1 abort")?])?;
         hops.validate_binding(&plan, exchange)?;
         let owners: Vec<_> = self.weights.layers.iter().map(|layer| layer.attention_owner.unwrap()).collect();
-        let segments = glm_owned_segments(&owners, self.cfg.first_moe_layer).map_err(anyhow::Error::msg)?;
+        let segments = glm_owned_segments(&owners, self.cfg.first_moe_layer.min(owners.len())).map_err(anyhow::Error::msg)?;
         self.layer_execution = Some(Execution { plan, hops, segments,
             waves: RefCell::new((0..self.prefill_lanes).map(|_| None).collect()) });
         Ok(())
@@ -321,13 +321,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         real_row_moe(self.tables[0].exchange_rows, self.rows(), |real| {
             let rows = Scalar::I32(real as i32);
             e.moe_front(w, layer, real)?;
-            if !self.tables[0].decode && !e.tp2_layer(index) {
-                // Preserve the continuous-prefill peer implementation and its core meet.
-                e.ffn_on(1, w1, self.layer(1, index), e.cfg.moe_intermediate, self.cap(), w1.shared.buffer.ptr, rows)?;
-                e.meet_shared_core(1, index, w1, self.layer(1, index), real)?;
-            } else {
-                e.shared_on(1, index, w1, self.layer(1, index), rows, self.cap())?;
-            }
+            e.shared_on(1, index, w1, self.layer(1, index), rows, self.cap())?;
             if e.tp2_layer(index) {
                 e.ring_local_routes(index, w, real)?;
                 e.shared_on(0, index, w, layer, rows, self.cap())?;

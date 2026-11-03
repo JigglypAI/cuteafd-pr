@@ -539,7 +539,7 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
                     branch.automatic_context, candidate as usize, 256)
                     .map_err(|_| PlacementError::Inventory("GLM admitted pool cannot support context"))?;
                 let startup = crate::serving_capacity::glm_graphs::glm_owned_startup_graphs(
-                    context, (candidate as usize).div_ceil(PAGE_ROWS as usize), &owners, inputs.cfg.first_moe_layer)
+                    context, (candidate as usize).div_ceil(PAGE_ROWS as usize), &owners, branch.cfg.first_moe_layer.min(owners.len()))
                     .map_err(|_| PlacementError::Inventory("GLM owned startup graphs"))?;
                 req.fixed.retain(|d| d.group != "graphs" && d.group != "graph growth");
                 for rank in 0..2 {
@@ -2127,6 +2127,16 @@ mod tests {
             assert_eq!(placed.layers.iter().map(|l| match l.mode {
                 LayerMode::Whole { gpu, .. } => gpu, _ => unreachable!(),
             }).collect::<Vec<_>>(), expected);
+            let dense_layers = cfg.first_moe_layer.min(layers);
+            let startup = crate::serving_capacity::glm_graphs::glm_owned_startup_graphs(
+                i.max_context as usize, (placed.pool_tokens / PAGE_ROWS) as usize, &expected, dense_layers).unwrap();
+            for rank in 0..2 {
+                assert_eq!(startup.inventory.ranks[rank].executables,
+                    (2 * layers + dense_layers) as u64 * startup.keys.len() as u64);
+                for item in startup.inventory.items(rank) {
+                    assert!(placed.items[rank].contains(&item), "{layers} layers: missing {item:?}");
+                }
+            }
         }
         assert!(attention_owners(&cfg, cfg.layers + 1).is_err());
         assert!(attention_owners(&cfg, 0).is_err());
@@ -2137,7 +2147,8 @@ mod tests {
         let cfg = config();
         for (requested_pool, expected_pool, expected_context) in [
             // Prefill slots share step scratch/head/logits; decode intake is 64 rows.
-            (Some(32768), 32768, 32512), (None, 124288, 124032),
+            // Only dense FFN fronts are captured, leaving more memory for the automatic pool.
+            (Some(32768), 32768, 32512), (None, 194432, 194176),
         ] {
             let mut i = inputs(&cfg, &[32 * GIB; 2]);
             i.prefill_lanes = 2;

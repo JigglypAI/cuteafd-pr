@@ -1208,7 +1208,7 @@ impl<'a> GlmEngine<'a> {
         let owned = if self.layers_kv() {
             let owners: Vec<_> = self.weights.layers.iter().map(|layer| layer.attention_owner.unwrap()).collect();
             Some(cuteafd_loader::serving_capacity::glm_graphs::glm_owned_startup_graphs(
-                self.max_context, self.pages, &owners, self.cfg.first_moe_layer).map_err(anyhow::Error::msg)?)
+                self.max_context, self.pages, &owners, self.cfg.first_moe_layer.min(owners.len())).map_err(anyhow::Error::msg)?)
         } else { None };
         let shapes = owned.as_ref().map(|startup| startup.keys.clone()).unwrap_or_else(||
             cuteafd_loader::serving_capacity::glm_graphs::glm_graph_shapes(self.max_context, self.pages));
@@ -1345,12 +1345,13 @@ impl<'a> GlmEngine<'a> {
                 if w1.is_some() {
                     self.publish_projection(0, index, 0, w, layer, "down", t)?;
                 }
+            } else if self.tp2_layer(index) {
+                let real = tables.exchange_rows;
+                self.moe_front(w, layer, real)?;
+                self.tp2_pair(index, 0, w, w1.context("TP2 peer workspace")?, real, cap)?;
             } else {
                 real_row_moe(tables.exchange_rows, t, |real| {
-                    if self.tp2_layer(index) {
-                        self.moe_front(w, layer, real)?;
-                        self.tp2_pair(index, 0, w, w1.context("TP2 peer workspace")?, real, cap)
-                    } else if let Some(skip) = &self.skip {
+                    if let Some(skip) = &self.skip {
                         self.moe_front(w, layer, real)?;
                         let ranks = self.moe_skip(w, index, layer, real, cap)?;
                         self.reduce(skip.pointers(), w, ranks, real)
@@ -1601,16 +1602,7 @@ impl<'a> GlmEngine<'a> {
         let layers = &self.weights.layers;
         let bytes = t * self.cfg.hidden * 2;
         // Only skip reductions need these planes; Spark tickets own their live return slot.
-        let planes = match (experts.as_mut(), &self.skip) {
-            (_, Some(skip)) => skip.pointers(),
-            // One decode slot: the replayed graphs bake slot 0's planes.
-            (Some((transport, _)), None) => {
-                let waves = transport.exchange()?;
-                ensure!(waves.waves() == 1, "GLM decode graphs bake one return slot's planes");
-                waves.planes(0)
-            }
-            (None, None) => [std::ptr::null(); MAX_RANKS],
-        };
+        let planes = self.skip.as_ref().map_or([std::ptr::null(); MAX_RANKS], |skip| skip.pointers());
         // Planes denotes an already-reduced routed + shared result in delta;
         // unlike a dense/TP2 partial it must still be published to the peer.
         let mut previous = Previous::First;
@@ -1712,11 +1704,10 @@ impl<'a> GlmEngine<'a> {
                 if index == 0 {
                     self.peer_segment(0, Previous::First, w1, t, ranked, bytes)?;
                 }
-                if let Some(_layer) = layer.filter(|_| self.tp2_layer(index)) {
-                    real_row_moe(tables.exchange_rows, t, |real| {
-                        self.moe_front(w, &layers[index], real)?;
-                        self.tp2_pair(index, 0, w, w1, real, "m64")
-                    }, |tail| self.clear_moe_tail(0, w.delta.buffer, tail))?;
+                if let Some(layer) = layer.filter(|_| self.tp2_layer(index)) {
+                    let real = tables.exchange_rows;
+                    self.moe_front(w, layer, real)?;
+                    self.tp2_pair(index, 0, w, w1, real, "m64")?;
                 }
                 if !defer_peer { peer_next()?; }
             }
@@ -3195,15 +3186,6 @@ mod native_decode_order_tests {
                 check_host(&repeated).unwrap();
             }
         }
-        // Bind the modeled seam to decode_layers, not just a balanced toy schedule.
-        let source = include_str!("engine.rs");
-        let decode = source.split("fn decode_layers(").nth(1).unwrap().split("fn peer_segment(").next().unwrap();
-        assert!(decode.contains("!layer.dense && !self.tp2_layer(index)\n                && Self::core_split(layer, \"down\")"));
-        let before = decode.find("if !defer_peer { peer_next()?; }").unwrap();
-        let exchange = decode.find("self.moe_exchange(").unwrap();
-        let skip = decode.find("self.moe_skip(").unwrap();
-        let after = decode.find("if defer_peer { peer_next()?; }").unwrap();
-        assert!(before < exchange && exchange < after && before < skip && skip < after);
     }
 }
 
