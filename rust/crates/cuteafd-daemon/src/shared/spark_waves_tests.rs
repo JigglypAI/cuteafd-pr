@@ -659,7 +659,23 @@ fn terminal_close_with_codec(compressed: bool) -> Result<()> {
         hosts, words.clone(), Duration::from_secs(1), Duration::ZERO, waves, rows * row_bytes)?;
     let geometry = crate::shared::wave_geometry::SlotGeometry::new(waves, rows)?;
     let intake = Intake { prefill: true, ranks, row_bytes, ranges, geometry, landing: 0, placed: true, next_slot: 0 };
-    let storage = owner.exchange_storage(&intake)?;
+    let ledger_owner = "test/reply-codec-terminal-close";
+    let device = library.cuda_get_device()?;
+    let receipt = || {
+        cuteafd_ffi::memory_ledger::snapshot().rows.iter().filter(|row|
+            row.key.space == cuteafd_ffi::memory_ledger::Space::Device && row.key.device == device
+                && row.key.owner == Some(ledger_owner) && row.key.scope == "spark-intake/reply_codec")
+            .fold((0usize, 0usize), |(bytes, allocations), row| (bytes + row.bytes, allocations + row.allocations))
+    };
+    assert_eq!(receipt(), (0, 0));
+    let storage = {
+        let _owner = cuteafd_ffi::memory_ledger::owner(ledger_owner);
+        owner.exchange_storage(&intake)?
+    };
+    let expected_receipt = if compressed {
+        (cuteafd_core::SparkReplyFormat::Nvfp4.combined_scratch_bytes(hidden, rows, waves, true, false).unwrap(), 1)
+    } else { (0, 0) };
+    assert_eq!(receipt(), expected_receipt, "one allocation, not one per rank or slot");
     let weak = std::rc::Rc::downgrade(&storage);
     let control = storage.control.buffer.ptr;
     let pull_block = storage.pull_block.as_ref().unwrap().buffer.ptr;
@@ -707,6 +723,7 @@ fn terminal_close_with_codec(compressed: bool) -> Result<()> {
     assert!(weak.upgrade().is_some());
     assert_eq!(weak.upgrade().unwrap().control.buffer.ptr, control);
     assert_eq!(weak.upgrade().unwrap().pull_block.as_ref().unwrap().buffer.ptr, pull_block);
+    assert_eq!(receipt(), expected_receipt, "close retains queued codec storage before drainage");
     // The landing wait queued behind an abandoned wave was released (a
     // worker that did not release it would leave this stream blocked).
     stream.finish()?;
@@ -716,11 +733,15 @@ fn terminal_close_with_codec(compressed: bool) -> Result<()> {
     assert_eq!(reset.control.buffer.ptr, control, "reset reuses counters");
     assert_eq!(reset.pull_block.as_ref().unwrap().buffer.ptr, pull_block, "reset reuses descriptors");
     assert_eq!(reset.reply_decode.as_ref().map(|codec| codec.scratch.buffer.ptr), scratch_ptr, "reset reuses codec scratch");
+    assert_eq!(receipt(), expected_receipt, "reset allocates no additional codec storage");
     assert_eq!(reset.control.bytes().iter().copied().max(), Some(0));
     assert_eq!(reset.pull_block.as_ref().unwrap().bytes().iter().copied().max(), Some(0));
     drop(reset);
     owner.terminal_release_payloads()?;
     assert!(weak.upgrade().is_none(), "only proved terminal drainage releases storage");
+    assert_eq!(receipt(), (0, 0), "terminal release removes the codec ledger owner");
+    eprintln!("reply codec receipt: bytes={} allocations={} ranks={ranks} slots={waves} rows={rows}; retained through close, reused on reset, released after drain",
+        expected_receipt.0, expected_receipt.1);
     assert!(started.elapsed() < Duration::from_millis(900), "the queued landing waited out the reply");
     drop(tickets);
     Ok(())
@@ -1303,6 +1324,108 @@ fn wave_payload_is_independent_of_reserved_slot_stride() -> Result<()> {
         assert!(validate_payload(payload_bytes, payload_bytes - 1).is_err());
     }
     assert!(validate_payload(0, 1234).is_err());
+    Ok(())
+}
+
+#[test]
+fn native_post_selects_reply_wire_and_preserves_bf16_slot_geometry() -> Result<()> {
+    use cuteafd_core::SparkReplyFormat::{Bf16, Fp8, Nvfp4};
+    use cuteafd_transport::{ExpertProtocolV2RowDescriptor, ExpertV2Dtype,
+        ExpertV2SourceKind::{Decode, MtpVerify, Prefill},
+        EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32,
+        EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3};
+    let (hidden, ranks, slots, slot_rows) = (32usize, 3usize, 2usize, 130usize);
+    let row_bytes = hidden * 2;
+    let cases = [
+        (vec![(65, Prefill)], true),
+        (vec![(64, Prefill)], false),
+        (vec![(64, Prefill), (64, Prefill)], false),
+        (vec![(65, Prefill), (65, Prefill)], true),
+        (vec![(65, Prefill), (64, Prefill)], false),
+        (vec![(65, Prefill), (1, Decode)], false),
+        (vec![(65, Prefill), (1, MtpVerify)], false),
+        (vec![(65, Decode)], false),
+        (vec![(65, MtpVerify)], false),
+    ];
+    for selected in [Bf16, Fp8, Nvfp4] {
+        for landing in [0, (1 << ranks) - 1] {
+            let (mut backend, _control, _pulls) = ring_backend(Ring::new(ranks, slots, slot_rows, row_bytes), slots);
+            backend.reply_format = selected;
+            backend.landing = landing;
+            for (index, (sources, eligible)) in cases.iter().enumerate() {
+                let origins: Vec<_> = sources.iter().enumerate().flat_map(|(id, &(rows, kind))|
+                    std::iter::repeat_n((id as u64 + 1, kind), rows)).collect();
+                let rows = origins.len();
+                let request = ExpertProtocolV2Request::new_bytes(index as u64 + 1, 1, 0, hidden as u32, ExpertV2Dtype::Bf16,
+                    origins.iter().enumerate().map(|(row, &(source_request_id, source_kind))| ExpertProtocolV2RowDescriptor {
+                        row_id: row as u64, source_kind, source_request_id, token_position: row as u64,
+                        route_offset: row as u32, route_count: 1 }).collect(),
+                    (0..rows as u32).map(|row| ExpertProtocolV2RouteEntry {
+                        row_index: row, expert_id: 0, gate_weight: 1.0 }).collect(),
+                    bytes::Bytes::from(vec![0; rows * row_bytes]))?;
+                let before = request.encode()?;
+                let actual = if *eligible { selected } else { Bf16 };
+                let payload_bytes = rows * actual.row_bytes(hidden).unwrap();
+                backend.transport.payload_bytes = Some(payload_bytes);
+                let sequence = index as u32 + 1;
+                let slot = index % slots;
+                let slice = (slot * slot_rows * row_bytes, slot_rows * row_bytes);
+                let mut job = built_job(sequence, slot, rows, &[0, 0], vec![(slot, 0)]);
+                job.source = Source::Built(request);
+                job.payload_bytes = rows * row_bytes;
+                job.slice = slice;
+                let mut wave = backend.post(job)?;
+                let encoded = backend.transport.request_bytes.as_ref().unwrap();
+                let posted = ExpertProtocolV2Request::decode(encoded)?;
+                let (mode, flags) = match actual {
+                    Bf16 => (0, 0),
+                    Fp8 => (1, EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32),
+                    Nvfp4 => (2, EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3),
+                };
+                assert_eq!(posted.header.flags, flags, "{selected} {sources:?}");
+                assert_eq!(backend.words.load(Counter::ReplyFormat(slot)), mode);
+                assert_eq!(backend.payload_bytes(slot, rows * row_bytes), payload_bytes);
+                if actual == Bf16 { assert_eq!(encoded, &before, "fallback/default preserves the request bytes"); }
+                if landing != 0 {
+                    assert_eq!(backend.transport.landing_slices, vec![(slice.0, payload_bytes); ranks]);
+                } else {
+                    assert!(backend.transport.landing_slices.is_empty());
+                    let info = WaveInfo { sequence, slot, rows, payload_bytes, slice, release: sequence };
+                    for _ in 0..ranks { backend.poll(&mut wave, &info)?; }
+                    for rank in 0..ranks {
+                        // SAFETY: ring_backend retains the mapped descriptor block until the backend drops.
+                        let descriptor = unsafe { *backend.pulls.at(slot, rank) };
+                        assert_eq!(descriptor.count, 1);
+                        assert_eq!((descriptor.frame[0].offset, descriptor.frame[0].bytes), (0, payload_bytes as u64));
+                    }
+                    backend.words.store(Counter::Consumed(slot), sequence);
+                    assert!(backend.release_consumed());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn native_compressed_poll_rejects_wrong_frame_extent() -> Result<()> {
+    use cuteafd_core::SparkReplyFormat::{Fp8, Nvfp4};
+    for format in [Fp8, Nvfp4] {
+        let (hidden, rows) = (32usize, 65usize);
+        let expected = rows * format.row_bytes(hidden).unwrap();
+        for actual in [expected - 1, expected + 1] {
+            let mut ring = Ring::new(1, 1, rows, hidden * 2);
+            ring.payload_bytes = Some(actual);
+            let (mut backend, _control, _pulls) = ring_backend(ring, 1);
+            let job = built_job(1, 0, rows, &[0], vec![(0, 0)]);
+            let mut wave = backend.post(job)?;
+            let info = WaveInfo { sequence: 1, slot: 0, rows, payload_bytes: expected,
+                slice: (0, rows * hidden * 2), release: 1 };
+            let error = backend.poll(&mut wave, &info).unwrap_err();
+            assert!(format!("{error:#}").contains("variable reply plane must arrive whole"), "{error:#}");
+            assert!(!reached(backend.words.load(Counter::Arrived(0)), 1));
+        }
+    }
     Ok(())
 }
 
