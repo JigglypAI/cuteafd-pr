@@ -315,7 +315,21 @@ fn vision_on_two_rtx_reserves_the_tower_before_the_solve() {
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
     let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, &checkpoint).unwrap();
     let manifest = dir.path().join("PROGRAMS.json");
-    std::fs::write(&manifest, testing::glm_k6_programs(&cfg, &core).unwrap().to_string()).unwrap();
+    let mut programs = testing::glm_k6_programs(&cfg, &core).unwrap();
+    let entries = programs["programs"].as_array_mut().unwrap();
+    let family = cfg.program_family();
+    let mut context: Vec<String> = crate::placement::families::glm5::CONTEXT_PROGRAMS.iter()
+        .map(|name| format!("{family}_{name}")).collect();
+    for kind in cfg.attention_kinds() {
+        context.push(crate::placement::families::glm5::context_gather(&cfg, kind));
+        for head in [0, cfg.heads / 2] {
+            context.push(format!("{family}_{kind}_partial_h{head}_s2_m64"));
+        }
+    }
+    entries.extend(context.into_iter().map(|name| serde_json::json!({
+        "name": name, "scratch_bytes_at_capacity": {"scratch": 256}
+    })));
+    std::fs::write(&manifest, programs.to_string()).unwrap();
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let plan = |ranks: usize, vision: MediaMode| {
         let mut options = layout_options(ranks, 2);
