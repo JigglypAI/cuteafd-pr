@@ -297,7 +297,10 @@ mod tests {
                     max_context: None, pool_tokens: None, onboard: Onboard::Auto,
                     spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
                     partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
-                    partial_wide_format: Default::default(), local, drafter: None, media: None }).err().expect("missing package refuses").to_string();
+                    partial_wide_format: Default::default(), local, drafter: None,
+                    media: Some(shared::MediaOptions::from_checkpoint(checkpoint,
+                        cuteafd_loader::plan::MediaMode::Auto, cuteafd_loader::plan::MediaMode::Off, 1)?)
+                }).err().expect("missing package refuses").to_string();
                 assert!(error.contains("rebuild with the Muse coordinator scope"), "{error}");
                 refused += 1;
             }

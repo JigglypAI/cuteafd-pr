@@ -51,10 +51,23 @@ impl std::str::FromStr for MediaMode {
     }
 }
 
-/// Auto enables only the complete, qualified MiMo V2.6 Flash/Pro tower.
+/// Resolve a checkpoint's bundled native audio tower before placement.
 /// Explicit placement still reports missing or unsupported checkpoint tensors.
 pub fn resolve_audio(mode: MediaMode, snapshot: &Path) -> Result<MediaMode, PlanError> {
     if mode == MediaMode::Off { return Ok(mode); }
+    let config: serde_json::Value = crate::read_json_file(&snapshot.join("config.json"))
+        .map_err(|error| PlanError::InvalidOption { option: "audio placement", reason: error.to_string() })?;
+    let kind = crate::media::AudioTowerKind::from_config(&config)
+        .map_err(|reason| PlanError::InvalidOption { option: "audio placement", reason })?;
+    if let Some(kind) = kind {
+        let validation = match kind {
+            crate::media::AudioTowerKind::MusePcm => crate::media::pcm_audio::PcmAudioPlan::from_snapshot(snapshot).map(|_| ()),
+            crate::media::AudioTowerKind::MimoRvq => crate::media::audio_tower::AudioTowerPlan::from_snapshot(snapshot,
+                crate::media::audio_tower::AudioStorage::Fp32).map(|_| ()),
+        };
+        return validation.map(|_| mode).map_err(|error| PlanError::InvalidOption {
+            option: "audio placement", reason: format!("{kind:?}: {error}") });
+    }
     match crate::media::audio_tower::AudioTowerPlan::from_snapshot(snapshot,
         crate::media::audio_tower::AudioStorage::Fp32) {
         Ok(_) => Ok(mode),
@@ -1171,9 +1184,19 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         if let Some(owner) = owner { report.bytes_by_owner.insert(owner, encoder.admitted_bytes()); }
     }
     use sha2::{Digest, Sha256};
+    let selected_tower = |name: &str| family.classify(spec, name).is_some_and(|r|
+        matches!(r.component, Component::Vision | Component::Audio));
+    // A coordinator's role view omits remote towers. Hash the selected headers
+    // from their own shards too, independently of which rank owns the encoder.
+    let present: std::collections::BTreeSet<_> = checkpoint.tensors.iter().map(|t| &t.meta.name).collect();
+    let missing: std::collections::BTreeSet<_> = checkpoint.weight_map.keys()
+        .filter(|name| selected_tower(name) && !present.contains(name)).cloned().collect();
+    let additional = if missing.is_empty() { None } else {
+        Some(Checkpoint::open_required(&checkpoint.snapshot, "media identity", &missing)?)
+    };
     let tower_headers: BTreeMap<_, _> = checkpoint.tensors.iter()
-        .filter(|t| family.classify(spec, &t.meta.name).is_some_and(|r| r.component == Component::Vision
-            || (report.audio != MediaMode::Off && r.component == Component::Audio)))
+        .chain(additional.iter().flat_map(|checkpoint| &checkpoint.tensors))
+        .filter(|t| selected_tower(&t.meta.name))
         .map(|t| (&t.meta.name, format!("{:?}:{:?}:{}:{}", t.meta.dtype, t.meta.shape, t.meta.byte_offset, t.meta.byte_length))).collect();
     // Preserve the vision-only peer contract exactly while audio is disabled.
     let contract = if report.audio == MediaMode::Off {

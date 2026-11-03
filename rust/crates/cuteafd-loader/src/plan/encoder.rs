@@ -203,14 +203,41 @@ pub fn admit_encoders<T>(requests: &[EncoderRequest], hardware: &EncoderHardware
             }
             selected.truncate(index);
         }
-        let diagnostic = encoder_placement(request.mode, &hardware, request.weights, request.scratch, request.copies);
+        let required = request.weights.saturating_add(request.scratch);
+        let mut shortfalls = Vec::new();
+        if matches!(request.mode, MediaMode::Auto | MediaMode::Spark(_)) {
+            let spark_required = required.saturating_add(if hardware.v41 { V41_SPARK_CUDA_OVERHEAD_BYTES } else { 0 });
+            let mut deficits = hardware.sparks.iter().map(|spark|
+                (spark.rank, spark_required.saturating_sub(spark.free_bytes))).collect::<Vec<_>>();
+            deficits.sort_by_key(|(_, deficit)| *deficit);
+            let copies = request.copies.max(1);
+            let lead = if let MediaMode::Spark(Some(rank)) = request.mode {
+                deficits.iter().position(|(candidate, _)| *candidate == rank)
+                    .map(|index| deficits.remove(index).1)
+            } else { Some(0) };
+            let remaining = copies - usize::from(matches!(request.mode, MediaMode::Spark(Some(_))));
+            let deficit = if deficits.len() >= remaining {
+                lead.map(|lead| lead.max(if remaining == 0 { 0 } else { deficits[remaining - 1].1 }))
+            } else { None };
+            shortfalls.push(("requested Spark encoder/replicas unavailable", deficit.unwrap_or(spark_required)));
+        }
+        if matches!(request.mode, MediaMode::Auto | MediaMode::Rtx(_)) {
+            let gpu = rtx_encoder_gpu(request.mode, hardware.v41, hardware.gpus.len());
+            shortfalls.push(hardware.gpus.get(gpu).map_or(("requested RTX device absent", required), |gpu|
+                ("tower would reduce the requested KV target",
+                    required.saturating_add(gpu.kv_target_bytes).saturating_sub(gpu.free_bytes))));
+        }
+        let (diagnostic_reason, shortfall) = shortfalls.into_iter().min_by_key(|(_, bytes)| *bytes)
+            .unwrap_or(("disabled or no checkpoint tower", 0));
+        let diagnostic = EncoderPlacement { kind: EncoderKind::Off, weights: 0, scratch: 0,
+            replicas: Vec::new(), reason: diagnostic_reason.into(), shortfall };
         let reason = if reasons.is_empty() { diagnostic.reason.clone() }
             else { format!("no native tower candidate fits the pool floor: {}", reasons.join("; ")) };
         if request.mode == MediaMode::Auto {
             selected.push(EncoderPlacement { kind: EncoderKind::Off, weights: 0, scratch: 0,
                 replicas: Vec::new(), reason, shortfall: diagnostic.shortfall });
             visit(requests, hardware_base, index + 1, selected, solve)
-        } else { anyhow::bail!("{reason}") }
+        } else { anyhow::bail!("{reason}; exact ledger shortfall {} bytes", diagnostic.shortfall) }
     }
     let mut selected = Vec::new();
     let result = visit(requests, hardware, 0, &mut selected, &mut solve)?;
@@ -340,8 +367,13 @@ mod tests {
         assert_eq!(selected[0].kind, EncoderKind::Spark { rank: 0 });
         hardware.sparks[0].free_bytes = 6;
         let mut calls = 0;
-        assert!(admit_encoders(&requests, &hardware, |_| { calls += 1; Ok(()) }).is_err());
+        let error = admit_encoders(&requests, &hardware, |_| { calls += 1; Ok(()) }).unwrap_err().to_string();
+        assert!(error.contains("exact ledger shortfall 1 bytes"), "{error}");
         assert_eq!(calls, 0);
+        let requests = [EncoderRequest { mode: MediaMode::Auto, ..requests[0].clone() }];
+        let (selected, ()) = admit_encoders(&requests, &hardware, |_| Ok(())).unwrap();
+        assert_eq!(selected[0].kind, EncoderKind::Off);
+        assert_eq!(selected[0].shortfall, 1);
     }
 
     #[test]
