@@ -185,7 +185,7 @@ impl ExchangeBuffers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::placement::planner::{Contract, Facts};
+    use crate::placement::planner::{Contract, Facts, Variable};
 
     fn fixture() -> (GlmDsaConfig, ExchangeBuffers) {
         (
@@ -204,8 +204,8 @@ mod tests {
     fn allocations(cfg: &GlmDsaConfig, buffers: &ExchangeBuffers) -> Vec<Allocation> {
         let mut contract = Contract::fixed(
             64,
-            128,
-            1,
+            buffers.maximum_pages,
+            2,
             Facts {
                 allocations: vec![],
                 deferred: vec![],
@@ -213,8 +213,14 @@ mod tests {
                 allowances: vec![],
             },
         );
+        contract.variables = vec![
+            Variable::Prefill(vec![buffers
+                .context
+                .map_or(PrefillShape { rows: 64, waves: 1 }, |c| c.prefill)]),
+            Variable::Lanes(vec![1]),
+        ];
         contract.components = buffers.components(cfg).unwrap();
-        contract.facts(&[], 1).unwrap().allocations
+        contract.facts(&[0, 0], 1).unwrap().allocations
     }
 
     #[test]
@@ -235,11 +241,9 @@ mod tests {
                         rank_owners.len(),
                         3 + usize::from(abort) + usize::from(diagnostics)
                     );
-                    assert!(
-                        rank_owners
-                            .iter()
-                            .all(|a| a.location == Location::coordinator(buffers.devices[rank]))
-                    );
+                    assert!(rank_owners
+                        .iter()
+                        .all(|a| a.location == Location::coordinator(buffers.devices[rank])));
                     for (name, bytes) in [("recv.0", 256), ("recv.1", 512), ("control", 256)] {
                         assert_eq!(
                             rank_owners
@@ -331,33 +335,27 @@ mod tests {
     fn malformed_exchange_geometry_refuses_before_publication() {
         let (cfg, buffers) = fixture();
         for receive in [vec![], vec![0], vec![17]] {
-            assert!(
-                ExchangeBuffers {
-                    receive_bytes: receive,
-                    ..buffers.clone()
-                }
-                .components(&cfg)
-                .is_err()
-            );
-        }
-        for devices in [[0, 0], [0, 2]] {
-            assert!(
-                ExchangeBuffers {
-                    devices,
-                    ..buffers.clone()
-                }
-                .components(&cfg)
-                .is_err()
-            );
-        }
-        assert!(
-            ExchangeBuffers {
-                maximum_pages: 0,
+            assert!(ExchangeBuffers {
+                receive_bytes: receive,
                 ..buffers.clone()
             }
             .components(&cfg)
-            .is_err()
-        );
+            .is_err());
+        }
+        for devices in [[0, 0], [0, 2]] {
+            assert!(ExchangeBuffers {
+                devices,
+                ..buffers.clone()
+            }
+            .components(&cfg)
+            .is_err());
+        }
+        assert!(ExchangeBuffers {
+            maximum_pages: 0,
+            ..buffers.clone()
+        }
+        .components(&cfg)
+        .is_err());
         let context = ContextOwners {
             extent: 4096,
             prefill: PrefillShape {

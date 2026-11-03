@@ -158,7 +158,7 @@ fn exchange_plan(cfg: &GlmDsaConfig, buffers: &ExchangeBuffers) -> Result<Resolv
     let mut contract = Contract::fixed(
         64,
         buffers.maximum_pages,
-        1,
+        2,
         Facts {
             allocations: vec![],
             deferred: vec![],
@@ -166,8 +166,14 @@ fn exchange_plan(cfg: &GlmDsaConfig, buffers: &ExchangeBuffers) -> Result<Resolv
             allowances: vec![],
         },
     );
+    contract.variables = vec![
+        Variable::Prefill(vec![buffers
+            .context
+            .map_or(PrefillShape { rows: 64, waves: 1 }, |c| c.prefill)]),
+        Variable::Lanes(vec![1]),
+    ];
     contract.components = buffers.components(cfg)?;
-    let facts = contract.facts(&[], 1)?;
+    let facts = contract.facts(&[0, 0], 1)?;
     let budgets: Vec<_> = [
         Location::coordinator(0),
         Location::coordinator(1),
@@ -197,7 +203,7 @@ fn exchange_plan(cfg: &GlmDsaConfig, buffers: &ExchangeBuffers) -> Result<Resolv
             prefill: Pin::Auto,
             operation: Operation::Serving,
         },
-        decisions: contract.decisions(&[])?,
+        decisions: contract.decisions(&[0, 0])?,
         pool_tokens: 64,
         budgets,
         facts,
@@ -308,10 +314,12 @@ fn actual_exchange_owners_match_independent_contract() -> Result<()> {
         };
         let expected = exchange_plan(&cfg, &buffers)?;
         if context {
-            assert!(
-                planner::reconcile(&expected, Phase::PostTargetKv, &engine.exchange_receipts()?)
-                    .is_err()
-            );
+            assert!(planner::reconcile(
+                &expected,
+                Phase::PostTargetKv,
+                &engine.exchange_receipts()?
+            )
+            .is_err());
             // Real constructor and production manifest selector, without numerical binding or launches.
             let manifest = serde_json::json!({"programs": [
                 {"name": "glm_sparse_mla_partial_h0_s1_m64"},
