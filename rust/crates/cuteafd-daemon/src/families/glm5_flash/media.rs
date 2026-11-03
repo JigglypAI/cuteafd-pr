@@ -293,7 +293,7 @@ mod tests {
             "image_start_token_id": 4, "image_end_token_id": 6})
     }
     fn image() -> Arc<PreparedImage> {
-        Arc::new(PreparedImage { key: ImageKey([7; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
+        Arc::new(PreparedImage { key: ImageKey([7; 32]), encoder: cuteafd_loader::media::EncoderId([0; 32]), processor: cuteafd_loader::media::PreprocessId([0; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
             rgb8: Arc::from(vec![0; 4 * 4 * 14 * 14 * 3]), tokens: 4 })
     }
     fn feature_request() -> (Prompt, RequestMedia, serde_json::Value) {
@@ -301,7 +301,7 @@ mod tests {
         let tokens = vec![1, 4, 5, 5, 5, 5, 6, 2];
         let spec = ProbeSpec { prompt_ids: Some(tokens.clone()), cold: true, no_speculation: true, score_from: Some(7),
             media: vec![ProbeMedia { start: 2, len: 4, kind: "image".into(), key: "07".repeat(32), grid: [1, 4, 4],
-                fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
+                identity: None, input_key: None, fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
                 image_url: Some(ProbeImageUrl { url: "fixture".into(), detail: None }) }], ..Default::default() };
         let mut job = request(vec![image()]); job.probe = Some(Probe::new(spec));
         let (prompt, media, _) = prepare(job, tokens, &config(), 32, 2, 16).unwrap();
@@ -495,7 +495,7 @@ mod tests {
         use cuteafd_api::openai::probe::{Probe, ProbeSpec, ProbeMedia, ProbeImageUrl, ProbeFixture};
         let tokens = vec![1, 4, 5, 5, 5, 5, 6, 2];
         let span = ProbeMedia { start: 2, len: 4, kind: "image".into(), key: "07".repeat(32), grid: [1, 4, 4],
-            fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
+            identity: None, input_key: None, fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
             image_url: Some(ProbeImageUrl { url: "data:image/png;base64,fixture".into(), detail: None }) };
         let run = |span: ProbeMedia, tokens: Vec<u32>| {
             let probe = Probe::new(ProbeSpec { prompt_ids: Some(tokens.clone()), media: vec![span], ..Default::default() });

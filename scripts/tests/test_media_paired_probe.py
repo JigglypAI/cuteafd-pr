@@ -496,3 +496,37 @@ def test_capture_cli_accepts_token_file_without_argv_secret(tmp_path, monkeypatc
     module.main()
     assert seen[0].bench_token is None
     assert seen[0].bench_token_file == tmp_path / "key"
+
+
+def test_input_binding_keeps_set_identity_and_rejects_wrong_sidecars(tmp_path):
+    span = {"key": "a" * 64}
+    panel = {"set_sha256": "b" * 64, "windows": [{"media": [span]}]}
+    sidecar = {"schema": "cuteafd.media.input-binding/1", "set_sha256": panel["set_sha256"],
+               "images": {span["key"]: {"encoder": "c" * 64, "processor": "d" * 64}}}
+    path = tmp_path / "binding.json"
+    path.write_text(json.dumps(sidecar))
+    bound, provenance = module.bound_panel(panel, path)
+    assert bound["set_sha256"] == panel["set_sha256"] and "identity" not in span
+    assert bound["windows"][0]["media"][0]["identity"] == sidecar["images"][span["key"]]
+    assert provenance["document"] == sidecar and len(provenance["sha256"]) == 64
+    sidecar["set_sha256"] = "e" * 64
+    path.write_text(json.dumps(sidecar))
+    with pytest.raises(ValueError, match="set identity"):
+        module.bound_panel(panel, path)
+
+
+def test_rebound_capture_requires_verified_input_and_admitted_encoder():
+    span = {"start": 0, "len": 1, "kind": "image", "key": "a" * 64, "grid": [1, 2, 2],
+            "identity": {"encoder": "b" * 64, "processor": "c" * 64}}
+    window = {"tokens": [9, 2], "score_from": 1, "media": [span]}
+    actual = {**span, "key": "d" * 64, "identity": {"encoder": "e" * 64, "processor": "c" * 64},
+              "input_key": span["key"]}
+    record = {"engine": "glm5", "cold": True, "no_speculation": True, "cached_tokens": 0,
+              "score_path": "decode", "prompt_ids": [9, 2], "media": [actual],
+              "rows": [{"position": 1, "finite": True}], "scored": 1}
+    response = {"probe": record, "server": {"model": "model"}}
+    module.check_record(window, response, "model", "native")
+    for field, value in [("input_key", "f" * 64), ("identity", {"processor": "c" * 64})]:
+        broken = json.loads(json.dumps(response)); broken["probe"]["media"][0][field] = value
+        with pytest.raises(ValueError, match="identity"):
+            module.check_record(window, broken, "model", "native")

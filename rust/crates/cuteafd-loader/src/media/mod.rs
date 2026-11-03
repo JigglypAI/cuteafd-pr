@@ -42,6 +42,8 @@ pub struct ImageGrid {
 #[derive(Debug, Clone)]
 pub struct PreparedImage {
     pub key: ImageKey,
+    pub encoder: EncoderId,
+    pub processor: PreprocessId,
     /// ViT patch grid, not the merged LM grid; t=1 for still images.
     pub grid: ImageGrid,
     pub rgb8: Arc<[u8]>,
@@ -453,16 +455,11 @@ impl ImageProcessor for ProcessorConfig {
             h: height / self.patch,
             w: width / self.patch,
         };
-        let mut hash = Sha256::new();
-        hash.update(b"cuteafd-image-v1");
-        hash.update(encoder.0);
-        hash.update(self.id().0);
-        for dim in [grid.t, grid.h, grid.w] {
-            hash.update(dim.to_le_bytes());
-        }
-        hash.update(&rgb.data);
+        let processor = self.id();
         Ok(PreparedImage {
-            key: ImageKey(hash.finalize().into()),
+            key: PreparedImage::key_for(encoder, processor, grid, &rgb.data),
+            encoder,
+            processor,
             grid,
             rgb8: rgb.data.into(),
             tokens,
@@ -471,6 +468,17 @@ impl ImageProcessor for ProcessorConfig {
 }
 
 impl PreparedImage {
+    /// Rebind input identity without changing the admitted encoder's cache key.
+    pub fn key_for(encoder: EncoderId, processor: PreprocessId, grid: ImageGrid, rgb: &[u8]) -> ImageKey {
+        let mut hash = Sha256::new();
+        hash.update(b"cuteafd-image-v1");
+        hash.update(encoder.0);
+        hash.update(processor.0);
+        for dim in [grid.t, grid.h, grid.w] { hash.update(dim.to_le_bytes()); }
+        hash.update(rgb);
+        ImageKey(hash.finalize().into())
+    }
+
     /// Reference-compatible f32 patches. The encoder's RGB8/LUT path avoids
     /// constructing this large array; qualification uses it to check layout.
     pub fn patches(&self, config: &ProcessorConfig) -> Result<Vec<f32>> {

@@ -136,8 +136,7 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
             let mut spans = Vec::with_capacity(images.len());
             for (span, image) in probe.spec.media.iter().zip(&images) {
                 let end = span.start.checked_add(span.len).context("probe media extent")?;
-                anyhow::ensure!(span.len == image.tokens && span.grid == [image.grid.t, image.grid.h, image.grid.w]
-                    && span.key == key_hex(image.key), "probe prepared image identity differs");
+                span.verify_image(image)?;
                 anyhow::ensure!(span.start > 0 && end < tokens.len() && tokens[span.start - 1] == expander.start
                     && tokens[end] == expander.end && tokens[span.start..end].iter().all(|&id| id == expander.placeholder),
                     "probe image rows/marker boundaries differ");
@@ -159,6 +158,8 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
         let echo = spans.iter().zip(&job.media).enumerate().map(|(i, (span, image))| {
             cuteafd_api::openai::probe::ProbeMedia { start: span.start, len: span.len, kind: "image".into(),
                 key: key_hex(span.key), grid: [image.grid.t, image.grid.h, image.grid.w],
+                identity: Some(cuteafd_api::openai::probe::ProbeImageIdentity::prepared(image)),
+                input_key: probe.spec.media.get(i).filter(|s| s.identity.is_some()).map(|s| s.key.clone()),
                 fixture: probe.spec.media.get(i).and_then(|s| s.fixture.clone()), image_url: None }
         }).collect();
         probe.media(echo);
@@ -356,7 +357,7 @@ mod tests {
             "vision_start_token_id": 4, "vision_end_token_id": 6})
     }
     fn image() -> Arc<PreparedImage> {
-        Arc::new(PreparedImage { key: ImageKey([7; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
+        Arc::new(PreparedImage { key: ImageKey([7; 32]), encoder: cuteafd_loader::media::EncoderId([0; 32]), processor: cuteafd_loader::media::PreprocessId([0; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
             rgb8: Arc::from(vec![0; 4 * 4 * 768]), tokens: 4 })
     }
     fn feature_request() -> (Prompt, RequestMedia, serde_json::Value) {
@@ -364,7 +365,7 @@ mod tests {
         let tokens = vec![1, 4, 5, 5, 5, 5, 6, 2];
         let spec = ProbeSpec { prompt_ids: Some(tokens.clone()), cold: true, no_speculation: true, score_from: Some(7),
             media: vec![ProbeMedia { start: 2, len: 4, kind: "image".into(), key: "07".repeat(32), grid: [1, 4, 4],
-                fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
+                identity: None, input_key: None, fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
                 image_url: Some(ProbeImageUrl { url: "fixture".into(), detail: None }) }], ..Default::default() };
         let mut job = request(vec![image()]); job.probe = Some(Probe::new(spec));
         let (prompt, media, _) = prepare(job, tokens, &config(), 32, 2, 16).unwrap();
@@ -564,7 +565,7 @@ mod tests {
         use cuteafd_api::openai::probe::{Probe, ProbeSpec, ProbeMedia, ProbeImageUrl, ProbeFixture};
         let tokens = vec![1, 4, 5, 5, 5, 5, 6, 2];
         let span = ProbeMedia { start: 2, len: 4, kind: "image".into(), key: "07".repeat(32), grid: [1, 4, 4],
-            fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
+            identity: None, input_key: None, fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
             image_url: Some(ProbeImageUrl { url: "data:image/png;base64,fixture".into(), detail: None }) };
         let run = |span: ProbeMedia, tokens: Vec<u32>| {
             let probe = Probe::new(ProbeSpec { prompt_ids: Some(tokens.clone()), media: vec![span], ..Default::default() });
