@@ -838,22 +838,55 @@ fn warm_reducer(library: &NativeLibrary, intake: &Intake) -> Result<()> {
     stream.finish()
 }
 
+/// Mapped inputs of queued stream waits and pulls. The intake retains this
+/// owner beyond a consuming Waves::close until terminal consumer drainage.
+pub(crate) struct ExchangeStorage<'a> {
+    control: HostAllocation<'a>,
+    pull_block: Option<HostAllocation<'a>>,
+    slots: usize,
+}
+impl<'a> ExchangeStorage<'a> {
+    pub(crate) fn new(library: &'a NativeLibrary, slots: usize, pinned: bool) -> Result<Self> {
+        let _scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
+        let control = HostAllocation::new(library, Counter::words(slots) * LINE)?;
+        let pull_block = pinned.then(|| HostAllocation::new(library, Pulls::bytes(slots))).transpose()?;
+        if let Some(block) = &pull_block {
+            let alias = library.cuda_host_buffer_device_alias(block.buffer)?;
+            ensure!(alias.ptr == block.buffer.ptr,
+                "mapped pinned memory is not device-visible at its host address (no unified addressing)");
+        }
+        Ok(Self { control, pull_block, slots })
+    }
+
+    pub(crate) fn matches(&self, slots: usize, pinned: bool) -> bool {
+        self.slots == slots && self.pull_block.is_some() == pinned
+    }
+
+    /// Only after the previous worker joined and every consumer drained.
+    pub(crate) fn reset_drained(&self) {
+        // SAFETY: the sole intake owner calls this before handing a clone to
+        // a new Waves; its old worker and consumer streams have drained.
+        unsafe {
+            std::ptr::write_bytes(self.control.buffer.ptr.cast::<u8>(), 0, self.control.buffer.bytes);
+            if let Some(block) = &self.pull_block {
+                std::ptr::write_bytes(block.buffer.ptr.cast::<u8>(), 0, block.buffer.bytes);
+            }
+        }
+    }
+}
+
 /// A link's persistent exchange: the engine side of the worker.
 pub(crate) struct Waves<'a> {
     library: &'a NativeLibrary,
     /// Dropped first: closing it ends the worker, joined in `Drop`.
     jobs: Option<mpsc::Sender<Command>>,
     worker: Option<std::thread::JoinHandle<(Box<dyn std::any::Any + Send>, Result<()>)>>,
-    /// Owns the counters; freed only after the worker joined.
-    _control: HostAllocation<'a>,
+    /// Also retained by SparkIntake until all consumer streams drained.
+    _storage: std::rc::Rc<ExchangeStorage<'a>>,
     words: Words,
     arenas: Vec<StagingArena>,
     /// Per slot: the request arena's device alias (mapped pinned memory).
     arena_alias: Vec<usize>,
-    /// Owns the pull descriptors of the ranks that arrive in host memory
-    /// (mapped; written by the worker, read by pull kernels); freed only after
-    /// the worker joined.
-    _pull_block: Option<HostAllocation<'a>>,
     pulls: Option<Pulls>,
     /// Bit r: rank r's rows arrive in pinned host memory and are pulled.
     pinned: u8,
@@ -883,29 +916,19 @@ impl<'a> Waves<'a> {
     /// `intake`'s slots, staging each wave's request in `arenas` (one per slot).
     pub(crate) fn start<T: Transport>(library: &'a NativeLibrary, intake: Intake, transport: T,
         grouping: Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>,
-        arenas: Vec<StagingArena>, timing: bool) -> Result<Self> {
+        arenas: Vec<StagingArena>, timing: bool, storage: std::rc::Rc<ExchangeStorage<'a>>) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
         let slots = intake.geometry.slots();
         let range_bytes = intake.geometry.reserve_rows() * intake.row_bytes;
         ensure!(arenas.len() == slots, "one staging arena per admitted slot");
         ensure!(intake.ranges.len() == intake.ranks && intake.ranges.iter().all(|range| range.bytes >= range_bytes),
             "one reserve range of {range_bytes} bytes per rank");
-        let control = HostAllocation::new(library, Counter::words(slots) * LINE)?;
-        let words = Words { base: control.buffer.ptr as usize, slots };
+        let words = Words { base: storage.control.buffer.ptr as usize, slots };
         let all = if intake.ranks == 8 { u8::MAX } else { (1u8 << intake.ranks) - 1 };
         let pinned = all & !intake.landing;
         check_reply_ring(&transport.retained_reply_slots(), pinned, slots)?;
-        // Pinned ranks reach the planes by SM pulls on the consuming stream
-        // straight from their receive slots; the kernels read the frames'
-        // host addresses, so mapped pinned memory must be device-visible at
-        // its host address (UVA).
-        let pull_block = (pinned != 0).then(|| HostAllocation::new(library, Pulls::bytes(slots))).transpose()?;
-        if let Some(block) = &pull_block {
-            let alias = library.cuda_host_buffer_device_alias(block.buffer)?;
-            ensure!(alias.ptr == block.buffer.ptr,
-                "mapped pinned memory is not device-visible at its host address (no unified addressing)");
-        }
-        let pulls = pull_block.as_ref().map(|block| Pulls { base: block.buffer.ptr as usize });
+        ensure!(storage.matches(slots, pinned != 0), "exchange storage differs from link geometry");
+        let pulls = storage.pull_block.as_ref().map(|block| Pulls { base: block.buffer.ptr as usize });
         let arena_alias = arenas.iter().map(|arena| library.cuda_host_buffer_device_alias(arena.host())
             .map(|alias| alias.ptr as usize)).collect::<Result<Vec<_>>>()?;
         // Every registered native kernel loads now, with nothing pending: a
@@ -940,8 +963,8 @@ impl<'a> Waves<'a> {
             let frames = native.frames();
             (Box::new((native.transport, frames)) as Box<dyn std::any::Any + Send>, result)
         })?;
-        Ok(Self { library, jobs: Some(jobs), worker: Some(worker), _control: control, words, arenas, arena_alias,
-            _pull_block: pull_block, pulls, pinned, ranges: intake.ranges, layouts: vec![None; slots],
+        Ok(Self { library, jobs: Some(jobs), worker: Some(worker), _storage: storage, words, arenas, arena_alias,
+            pulls, pinned, ranges: intake.ranges, layouts: vec![None; slots],
             unread: vec![false; slots], uses: vec![0; slots], ranks: intake.ranks, row_bytes: intake.row_bytes,
             next_slot: intake.next_slot % cut.waves, geometry: intake.geometry, sequence: 0,
             outstanding: VecDeque::new(), grouping })

@@ -385,6 +385,7 @@ pub(crate) struct SparkIntake<'a> {
     row_bytes: usize,
     /// One allocation per rank holding its whole reserve range.
     planes: Vec<IntakePlane<'a>>,
+    exchange_storage: RefCell<Option<std::rc::Rc<crate::shared::spark_waves::ExchangeStorage<'a>>>>,
     /// Admitted return slots (events, consumed fences).
     waves: usize,
     geometry: RefCell<SlotGeometry>,
@@ -511,7 +512,7 @@ impl<'a> SparkIntake<'a> {
         let copy_stream = library.cuda_stream_create()?;
         Ok(Self {
             library, mode, ranks, rows, row_bytes, planes, waves, geometry: RefCell::new(geometry),
-            state: IntakeState::new(waves), staging, copy_stream,
+            state: IntakeState::new(waves), staging, copy_stream, exchange_storage: RefCell::new(None),
             copied: library.cuda_event_create_ordering()?,
             consumed: (0..waves).map(|_| library.cuda_event_create_ordering()).collect::<Result<_>>()?,
             landed: (0..waves).map(|_| library.cuda_event_create_ordering()).collect::<Result<_>>()?,
@@ -809,9 +810,27 @@ impl<'a> SparkIntake<'a> {
 
     pub(crate) fn terminal_release_payloads(&self) -> Result<()> {
         self.held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?.clear();
+        self.exchange_storage.borrow_mut().take();
         self.state.copies_pending.set(false);
         for pending in &self.state.consumed_pending { pending.set(false); }
         Ok(())
+    }
+
+    /// Called initially or after the link's reset proved consumer drainage.
+    pub(crate) fn exchange_storage(&self, geometry: &crate::shared::spark_waves::Intake)
+        -> Result<std::rc::Rc<crate::shared::spark_waves::ExchangeStorage<'a>>> {
+        let slots = geometry.geometry.slots();
+        let all = if geometry.ranks == 8 { u8::MAX } else { (1u8 << geometry.ranks) - 1 };
+        let pinned = all & !geometry.landing != 0;
+        let mut retained = self.exchange_storage.borrow_mut();
+        if let Some(storage) = retained.as_ref() {
+            ensure!(storage.matches(slots, pinned), "exchange storage geometry changed across reset");
+            ensure!(std::rc::Rc::strong_count(storage) == 1, "previous exchange still owns its storage");
+            storage.reset_drained();
+        } else {
+            *retained = Some(std::rc::Rc::new(crate::shared::spark_waves::ExchangeStorage::new(self.library, slots, pinned)?));
+        }
+        Ok(retained.as_ref().unwrap().clone())
     }
 
     /// Small waves upload on the compute stream itself (a cross-stream wait
@@ -1711,8 +1730,9 @@ impl<'a> SparkLink<'a> {
             next_slot: intake.dispatch_slot() };
         // Read-only worker metadata, kept so callers need not reach the transport.
         let grouping = transport.installed_grouping().unwrap_or_default();
+        let storage = intake.exchange_storage(&geometry)?;
         self.exchange = Some(crate::shared::spark_waves::Waves::start(intake.library, geometry, transport, grouping,
-            arenas, self.timing)?);
+            arenas, self.timing, storage)?);
         Ok(())
     }
 

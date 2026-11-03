@@ -537,7 +537,8 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
             slots, max_rows.div_ceil(2) * row_bytes)?;
         let geometry = crate::shared::wave_geometry::SlotGeometry::new(slots, max_rows)?;
         let intake = Intake { ranks, row_bytes, ranges, geometry, landing, placed: true, next_slot: 0 };
-        let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false)?;
+        let storage = std::rc::Rc::new(ExchangeStorage::new(&library, slots, landing != (1u8 << ranks) - 1)?);
+        let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false, storage.clone())?;
         let _ = words.set(exchange.words());
         let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
         let ids = DeviceAllocation::new(&library, max_rows * topk * 4)?;
@@ -633,9 +634,9 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
     cuteafd_transport::set_verbs_host_native_library_path(std::path::PathBuf::from(&path))?;
     let (hidden, topk, ranks, rows, waves, layers) = (5120usize, 6usize, 3usize, 4usize, 2usize, 4usize);
     let row_bytes = hidden * 2;
-    let ranges_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, rows * row_bytes * waves))
-        .collect::<Result<Vec<_>>>()?;
-    let ranges: Vec<CuteafdDeviceBuffer> = ranges_owned.iter().map(|range| range.buffer).collect();
+    let owner = crate::shared::spark_intake::SparkIntake::with_waves(&library,
+        crate::shared::spark_intake::IntakeMode::Pinned, ranks, rows, row_bytes, waves)?;
+    let ranges = owner.ranges();
     let layout = RouteStaging::new(rows, topk, row_bytes)?;
     let arenas = (0..waves).map(|_| StagingArena::new(layout.bytes)).collect::<Result<Vec<_>>>()?;
     let words = Arc::new(std::sync::OnceLock::new());
@@ -645,7 +646,11 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
         hosts, words.clone(), Duration::from_secs(1), Duration::ZERO, waves, rows * row_bytes)?;
     let geometry = crate::shared::wave_geometry::SlotGeometry::new(waves, rows)?;
     let intake = Intake { ranks, row_bytes, ranges, geometry, landing: 0, placed: true, next_slot: 0 };
-    let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false)?;
+    let storage = owner.exchange_storage(&intake)?;
+    let weak = std::rc::Rc::downgrade(&storage);
+    let control = storage.control.buffer.ptr;
+    let pull_block = storage.pull_block.as_ref().unwrap().buffer.ptr;
+    let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false, storage)?;
     let _ = words.set(exchange.words());
     let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
     let ids = DeviceAllocation::new(&library, rows * topk * 4)?;
@@ -676,9 +681,23 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
     let error = result.expect_err("closing with waves in flight reports them");
     assert!(format!("{error:#}").contains("outstanding"), "{error:#}");
     assert_eq!(echo.ranks, ranks, "the transport comes back to the link");
+    // Both queued waits and queued pull descriptor loads still own storage
+    // after the consuming close returned, before any stream synchronization.
+    assert!(weak.upgrade().is_some());
+    assert_eq!(weak.upgrade().unwrap().control.buffer.ptr, control);
+    assert_eq!(weak.upgrade().unwrap().pull_block.as_ref().unwrap().buffer.ptr, pull_block);
     // The landing wait queued behind an abandoned wave was released (a
     // worker that did not release it would leave this stream blocked).
     stream.finish()?;
+    let geometry = Intake { ranks, row_bytes, ranges: owner.ranges(), geometry: owner.geometry(),
+        landing: 0, placed: true, next_slot: 0 };
+    let reset = owner.exchange_storage(&geometry)?;
+    assert_eq!(reset.control.buffer.ptr, control, "reset reuses counters");
+    assert_eq!(reset.pull_block.as_ref().unwrap().buffer.ptr, pull_block, "reset reuses descriptors");
+    assert_eq!(reset.control.bytes().iter().copied().max(), Some(0));
+    drop(reset);
+    owner.terminal_release_payloads()?;
+    assert!(weak.upgrade().is_none(), "only proved terminal drainage releases storage");
     assert!(started.elapsed() < Duration::from_millis(900), "the queued landing waited out the reply");
     drop(tickets);
     Ok(())
@@ -1058,8 +1077,9 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
         let geometry = crate::shared::wave_geometry::SlotGeometry::new(1, rows)?;
         let intake = Intake { ranks, row_bytes, ranges, geometry, landing: 0, placed: true, next_slot: 0 };
         let stagger = Arc::new(AtomicUsize::new(0));
+        let storage = std::rc::Rc::new(ExchangeStorage::new(&library, 1, true)?);
         let mut exchange = Waves::start(&library, intake, StaggerSwitch { echo, stagger: stagger.clone() }, Vec::new(),
-            arenas, false)?;
+            arenas, false, storage.clone())?;
         let _ = words.set(exchange.words());
         let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
         let ids = DeviceAllocation::new(&library, rows * topk * 4)?;
