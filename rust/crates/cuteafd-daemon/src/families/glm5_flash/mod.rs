@@ -2100,7 +2100,8 @@ impl Opened {
             })?;
         use crate::shared::experts::rtx::push::{CoordinatorExperts, CoordinatorPush, PushedExperts, PushPolicy, WholeOwner};
         let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;
-        let embed = self.embed_source()?;
+        // Native checkpoints describe their row-FP8 vocabulary in the native manifest.
+        let embed = if native_admission.is_none() { Some(self.embed_source()?) } else { None };
         let embedding_rank = cuteafd_loader::placement::families::glm5_flash::embedding_home(&placement) as usize;
         let embedding_device = crate::shared::memory::device::Device { library: &self.library,
             id: if embedding_rank == 0 { args.device } else { split_device.context("embedding peer GPU")? } };
@@ -2118,7 +2119,7 @@ impl Opened {
             let planning = weights::GlmfLoader { dense: load.clone(), ..loader.clone() };
             let ((embedding, model), mut records) = crate::shared::experts::rtx::dense::recording(|| {
                 embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(
-                    &self.library, embed.clone(), args.token_io.embed_placement, || {
+                    &self.library, embed.as_ref().context("legacy Flash embedding source")?.clone(), args.token_io.embed_placement, || {
                         devices[0].run(|| {
                             let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
                             planning.model(&self.cfg, &execution)
@@ -2331,7 +2332,8 @@ impl Opened {
                     split.log("glm5_flash dense push");
                     (pushed, (embedding, model))
                 }
-                None => (None, embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(&self.library, embed.clone(),
+                None => (None, embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(&self.library,
+                    embed.as_ref().context("legacy Flash embedding source")?.clone(),
                     args.token_io.embed_placement, || {
                         crate::shared::memory::device::Device { library: &self.library, id: args.device }.run(|| {
                             let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
