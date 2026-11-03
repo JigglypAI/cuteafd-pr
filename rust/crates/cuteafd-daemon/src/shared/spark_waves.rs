@@ -721,7 +721,8 @@ impl<T: Transport> Backend for Native<T> {
             }
         };
         let mut payload_bytes = job.payload_bytes;
-        if request.header.flags & cuteafd_transport::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES == 0 {
+        if self.reply_format != cuteafd_core::SparkReplyFormat::Bf16
+            && request.header.flags & cuteafd_transport::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES == 0 {
             let decision = request.select_combined_reply(self.reply_format)?;
             self.prefill_rows += decision.prefill_rows as u64;
             self.mixed_fallback_rows += decision.mixed_fallback_rows as u64;

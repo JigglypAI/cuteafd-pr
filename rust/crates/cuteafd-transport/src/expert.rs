@@ -361,7 +361,7 @@ impl<'a> BackboneRequest<'a> {
     pub fn output_dtype(&self) -> ExpertV2Dtype {
         combined_output_dtype(self.view.header.flags)
     }
-    fn output_row_bytes(&self) -> Result<u32> {
+    pub fn output_row_bytes(&self) -> Result<u32> {
         u32::try_from(
             self.output_dtype()
                 .row_bytes(cuteafd_core::expert_geometry().hidden as usize)?,
@@ -998,10 +998,12 @@ mod tests {
             let encoded = owned.encode()?;
             let request = BackboneRequest::parse_native_group(&encoded, 65, topology)?;
             let ranks = topology.executor_ids();
+            let payload = vec![0; request.plane_bytes()?];
+            let frames = ranks.iter().map(|executor|
+                request.response(*executor, &payload)?.to_owned()?.encode()).collect::<Result<Vec<_>>>()?;
             let mut planes = V41Tp4Planes::new_ranks(&request, &ranks)?;
-            for (rank, executor) in ranks.iter().enumerate() {
-                let response = request.response(*executor, &vec![0; request.plane_bytes()?])?;
-                assert_eq!(planes.insert(&response.to_owned()?.encode()?)?, rank);
+            for (rank, frame) in frames.iter().enumerate() {
+                assert_eq!(planes.insert(frame)?, rank);
             }
             assert!(planes.complete());
         }
