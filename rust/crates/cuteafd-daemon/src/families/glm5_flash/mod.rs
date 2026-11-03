@@ -2310,11 +2310,11 @@ impl Opened {
             let mask = embedding.host_rows(&[cfg.mask_token])?;
             let file = read.join_dflash()?;
             let device = prepared.stream.device;
-            let draft = device.own(|| DflashDrafter::load(&self.library, snapshot, file, prepared.stream.raw,
+            let draft = device.own(|| DflashDrafter::load(&self.library, &programs, snapshot, file, prepared.stream.raw,
                 slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear, args.draft_kv_cache))?;
             dspark::Drafter::RemoteDflash(remote_dflash::RemoteDflash::new(draft, prepared)?)
         } else {
-            dspark::Drafter::load(&self.library, snapshot, stream, slots, batch,
+            dspark::Drafter::load(&self.library, &programs, snapshot, stream, slots, batch,
                 embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales,
                 args.draft_linear, args.draft_kv_cache, read)?
         };

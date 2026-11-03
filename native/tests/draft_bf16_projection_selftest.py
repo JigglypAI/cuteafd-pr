@@ -34,7 +34,7 @@ def shapes():
         for k, n in ((h * taps, h), (h, (heads + 2 * kv) * d),
                      (h, 2 * kv * d), (heads * d, h), (h, 2 * inter), (inter, h)):
             result.setdefault((k, n), []).append(family)
-    for h in (4096, 6144, 7168, 8192):
+    for h in (2048, 4096, 5120, 6144, 7168, 8192):
         result.setdefault((h, h // 4), []).append("dflash-convolution")
         result.setdefault((h, 256), []).append("dflash-selector")
     for h, inter in ((7168, 14336), (6144, 24576)):
@@ -76,6 +76,21 @@ def main():
     launch = library.cuteafd_cuda_linear_bf16_cublas_async
     launch.argtypes = [ct.c_void_p] * 4 + [ct.c_size_t] * 3 + [ct.c_void_p]
     launch.restype = ct.c_int
+    indices = {}
+    if not (args.screen or args.skinny_screen):
+        class Info(ct.Structure):
+            _fields_ = [("name", ct.c_char * 64), ("pointers", ct.c_uint32),
+                        ("scalars", ct.c_uint32), ("scalar_kinds", ct.c_char * 16)]
+        library.cuteafd_dsv4_program_info.argtypes = [ct.c_uint32, ct.POINTER(Info)]
+        library.cuteafd_dsv4_program_load.argtypes = [ct.c_uint32]
+        library.cuteafd_dsv4_program_launch.argtypes = [ct.c_uint32, ct.POINTER(ct.c_void_p),
+                                                       ct.POINTER(ct.c_uint64), ct.c_void_p]
+        for index in range(library.cuteafd_dsv4_program_count()):
+            info = Info()
+            assert library.cuteafd_dsv4_program_info(index, ct.byref(info)) == 0
+            if info.name.startswith(b"draft_bf16_"):
+                assert (info.pointers, info.scalars, info.scalar_kinds) == (3, 1, b"i")
+                indices[info.name.decode()] = index
     inventory = shapes()
     if args.shape:
         requested = {tuple(map(int, value.split(","))) for value in args.shape}
@@ -91,9 +106,19 @@ def main():
                 x[offset].copy_(row)
             w = (torch.randn(n, k, device="cuda") * .02).bfloat16()
 
+            if not (args.screen or args.skinny_screen):
+                program_index = indices[f"draft_bf16_k{k}_n{n}"]
+                assert library.cuteafd_dsv4_program_load(program_index) == 0
+
             def run(input_, output):
-                status = launch(input_.data_ptr(), w.data_ptr(), None, output.data_ptr(),
-                                input_.shape[0], k, n, torch.cuda.current_stream().cuda_stream)
+                if args.screen or args.skinny_screen:
+                    status = launch(input_.data_ptr(), w.data_ptr(), None, output.data_ptr(),
+                                    input_.shape[0], k, n, torch.cuda.current_stream().cuda_stream)
+                else:
+                    pointers = (ct.c_void_p * 3)(input_.data_ptr(), w.data_ptr(), output.data_ptr())
+                    scalars = (ct.c_uint64 * 1)(input_.shape[0])
+                    status = library.cuteafd_dsv4_program_launch(program_index, pointers, scalars,
+                                                                torch.cuda.current_stream().cuda_stream)
                 assert status == 0, (k, n, input_.shape[0], status)
 
             def default(input_, output):
@@ -153,7 +178,7 @@ def main():
 
             results = {}
             canonical_outputs = {}
-            row_counts = (1, 8, 16, 140, 2048) if args.skinny_screen else (1, 16, 140, 2048)
+            row_counts = (1, 8, 16, 128, 140, 2048)
             for arm, operation in arms.items():
                 outputs, timing = {}, {}
                 graph_exact = True

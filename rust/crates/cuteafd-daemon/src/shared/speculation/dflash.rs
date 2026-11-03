@@ -933,6 +933,7 @@ pub(crate) struct DflashDrafter<'a> {
     pub slots: usize,
     max_sequences: usize,
     fc: DraftWeight<'a>,
+    projections: cuteafd_ffi::draft_projection::DraftProjections<'a>,
     context_fc: Option<cuteafd_ffi::mla_draft::Ml4ContextProjection<'a>>,
     hidden_norm: Dev<'a>,
     norm: Dev<'a>,
@@ -1139,6 +1140,23 @@ fn check_checkpoint_headers(cfg: &DflashConfig, tensors: &HashMap<String, Safete
 }
 
 impl<'a> DflashDrafter<'a> {
+    fn load_projections(programs: &'a cuteafd_ffi::programs::Programs<'a>, cfg: &DflashConfig,
+        representation: GlmDraftRepresentation, mla: bool, ml4: bool)
+        -> Result<cuteafd_ffi::draft_projection::DraftProjections<'a>> {
+        let h = cfg.hidden;
+        let mut shapes = Vec::new();
+        if representation == GlmDraftRepresentation::Bf16Only {
+            shapes.extend([(h, 2 * cfg.intermediate), (cfg.intermediate, h)]);
+            if !ml4 {
+                shapes.extend([(h * cfg.taps.len(), h), (h, cfg.conv_width()), (h, cfg.rank)]);
+                if !mla {
+                    shapes.extend([(h, cfg.qkv_width()), (h, 2 * cfg.kv_width()), (cfg.heads * cfg.head_dim, h)]);
+                }
+            }
+        }
+        Ok(cuteafd_ffi::draft_projection::DraftProjections::load(programs, &shapes)?)
+    }
+
     /// The keyed selector prior (`family/dflash2/numerics`), or the generic
     /// GLM-5.3 fit when the drafter ships none for this key.
     /// Drafts carry no per-token evidence (mtp_dspark's Markov head): the
@@ -1165,11 +1183,12 @@ impl<'a> DflashDrafter<'a> {
     /// the mask token. `fp8_rows` is how the FP8 GEMMs run (their scratch serves
     /// it and the modes before it, see [`Self::set_draft_linear`]).
     #[allow(clippy::too_many_arguments)]
-    pub fn load(library: &'a NativeLibrary, snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
+    pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
         max_sequences: usize, mask_row: Vec<u8>, row_window: bool, representation: GlmDraftRepresentation,
         scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DflashConfig { row_window, ..DflashConfig::read(snapshot)? };
+        let projections = Self::load_projections(programs, &cfg, representation, false, false)?;
         let capacity = GlmDraftCapacity::new(slots, max_sequences, cfg.block)?;
         let layout = cfg.runtime_layout(representation, capacity)?;
         let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
@@ -1252,7 +1271,7 @@ impl<'a> DflashDrafter<'a> {
             stream,
             slots,
             max_sequences,
-            fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps)?, context_fc: None,
+            fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps)?, context_fc: None, projections,
             hidden_norm: tensor("hidden_norm.weight", &[h])?,
             norm: tensor("norm.weight", &[h])?,
             head_ops: DraftHeadOps::Selector {
@@ -1302,6 +1321,7 @@ impl<'a> DflashDrafter<'a> {
             layout.paged_cache().target_tokens, library.sm_count()?, fp8_rows.code() as u8, layout.cache_format())? == layout,
             "MLA draft checkpoint/runtime differs from admitted immutable layout");
         let cfg = DflashConfig::mla(&native);
+        let projections = Self::load_projections(programs, &cfg, representation, true, false)?;
         let checkpoint = Checkpoint { data: file, tensors: read_safetensors_metadata(&snapshot.join("model.safetensors"))?
             .into_iter().map(|t| (t.name.clone(), t)).collect() };
         for (name, shape) in native.tensor_shapes() { checkpoint.bytes(&name, &shape)?; }
@@ -1370,7 +1390,7 @@ impl<'a> DflashDrafter<'a> {
             native.rotary.inv_freq.len() * 4)?, bytes_of(&native.rotary.inv_freq))?;
         let result = Self { kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, library, stream, slots: layout.capacity().context_slots,
             max_sequences: layout.capacity().max_batch_sequences,
-            fc: matrix(tensor("fc.weight", &[h, cfg.taps.len() * h])?, h, cfg.taps.len() * h)?, context_fc: None,
+            fc: matrix(tensor("fc.weight", &[h, cfg.taps.len() * h])?, h, cfg.taps.len() * h)?, context_fc: None, projections,
             hidden_norm: tensor("hidden_norm.weight", &[h])?, norm: tensor("norm.weight", &[h])?,
             head_ops: DraftHeadOps::Selector {
                 projection: matrix(tensor("candidate_selector.hidden_projection.weight", &[cfg.rank, h])?, cfg.rank, h)?,
@@ -1412,6 +1432,7 @@ impl<'a> DflashDrafter<'a> {
             layout.paged_cache().target_tokens, library.sm_count()?, 0, layout.cache_format())? == layout,
             "mtp_dspark checkpoint/runtime differs from admitted immutable layout");
         let cfg = DflashConfig::mla(&native);
+        let projections = Self::load_projections(programs, &cfg, GlmDraftRepresentation::Bf16Only, true, true)?;
         let context_fc = cuteafd_ffi::mla_draft::Ml4ContextProjection::load(programs)?;
         let mut owners = MlaDraftStorage::allocate(library, layout.clone())?.into_owners()?;
         // Destination owners and packing both come from the admitted recipe.
@@ -1474,7 +1495,7 @@ impl<'a> DflashDrafter<'a> {
         let result = Self { kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, library, stream,
             slots: layout.capacity().context_slots, max_sequences: layout.capacity().max_batch_sequences,
             fc: DraftWeight::Bf16(tensor(&mut owners, "backbone.target_projection.weight", &[h, cfg.taps.len() * h])?),
-            context_fc: Some(context_fc),
+            context_fc: Some(context_fc), projections,
             hidden_norm: tensor(&mut owners, "backbone.target_norm.weight", &[h])?,
             norm: tensor(&mut owners, "backbone.final_norm.weight", &[h])?,
             head_ops: DraftHeadOps::RnnMarkov { softcap,
@@ -1533,7 +1554,7 @@ impl<'a> DflashDrafter<'a> {
             DraftWeight::Bf16(w) => {
                 // SAFETY: source rows first..first+n lie in this matrix;
                 // the caller supplies its selected width and live output.
-                unsafe { self.library.linear_bf16(x, at(w, first * k * 2), out, rows, k, n, self.stream) }
+                unsafe { self.projections.launch(x, at(w, first * k * 2), out, rows, k, n, self.stream) }
             }
             DraftWeight::Fp8(w) => {
                 let scratch = self.fp8_workspace.as_ref().context("FP8 DFlash scratch was not admitted")?;
