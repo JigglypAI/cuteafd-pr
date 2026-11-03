@@ -552,8 +552,8 @@ mod tests {
                 "pointers":pointers(if shared {ExpertSet::Shared} else {ExpertSet::Routed}, variant).iter()
                     .enumerate().map(|(i,name)| json!({"name":name,"dtype":dtypes[i],"shape":shapes[i],
                         "role":if (7..=9).contains(&i) {"scratch"} else if i==11 {"out"} else {"in"}})).collect::<Vec<_>>(),
-                "scalars":["rows", "cta_limit", "unit_limit", "l2_bytes"][..if grouped {4} else {2}].iter()
-                    .map(|name| json!({"name":name,"type":"int32"})).collect::<Vec<_>>(),
+                "scalars":(["rows", "cta_limit", "unit_limit", "l2_bytes"][..if grouped {4} else {2}].iter()
+                    .map(|name| json!({"name":name,"type":"int32"})).collect::<Vec<_>>()),
                 "scratch_bytes_at_capacity":{"fc1":g*16*2*s*r*128*4,
                     "intermediate":g*16*r*128*2,"fc2":g*r*h*4}}));
         }
