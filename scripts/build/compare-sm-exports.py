@@ -113,7 +113,8 @@ def dense_geometry_jobs():
 
 
 def jobs(scope):
-    result = []
+    result = [("sampling", "export_b12x_dsv4_aot.py",
+               ["--geometry", "sampling", "--only", "relaxed_acceptance_stats_f32"])]
     # Small-row top-k deliberately exercises the fused persistent route, which
     # the production m64 table does not select.
     for geometry in ("flash", "pro", "glm", "glmf"):

@@ -61,6 +61,13 @@ def test_two_target_counts():
     assert compare_sm.parse_sms("188,170") == (188, 170)
 
 
+@pytest.mark.parametrize("scope", ["suspects", "all"])
+def test_sampling_group_selects_shared_runtime_geometry_program(scope):
+    job = next(job for job in compare_sm.jobs(scope) if job[0] == "sampling")
+    assert job == ("sampling", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "sampling", "--only", "relaxed_acceptance_stats_f32"])
+
+
 def test_pro_native_tp3_has_equal_k32_geometry_without_v41_identity():
     path = ROOT / "python/tools/aot/export_b12x_slices_aot.py"
     tree = ast.parse(path.read_text())
