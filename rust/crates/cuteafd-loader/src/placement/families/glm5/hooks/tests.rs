@@ -1,6 +1,6 @@
 use super::*;
-use crate::families::glm5::{core::CoreStageLayout, GlmDsaConfig};
-use crate::placement::planner::{self, Baseline, Budget, Contract, Facts};
+use crate::families::glm5::{GlmDsaConfig, core::CoreStageLayout};
+use crate::placement::planner::{self, Baseline, Budget, Contract, Facts, PrefillShape, Variable};
 use crate::plan::exlr8::dense::scratch::LinearScratchLayout;
 
 fn layouts() -> HookBuffers {
@@ -57,8 +57,15 @@ fn native_hooks_name_physical_owners_and_k6_route_aliases_once() {
             allowances: vec![],
         },
     );
+    contract.variables = vec![
+        Variable::Prefill(vec![PrefillShape {
+            rows: 128,
+            waves: 3,
+        }]),
+        Variable::Lanes(vec![1]),
+    ];
     contract.components = hooks.components().unwrap();
-    let facts = contract.facts(&[], 8).unwrap();
+    let facts = contract.facts(&[0, 0], 8).unwrap();
     let get = |suffix: &str| {
         facts
             .allocations
@@ -68,10 +75,12 @@ fn native_hooks_name_physical_owners_and_k6_route_aliases_once() {
     };
     assert_eq!(get("decode.native.linear.rotated").bytes, 64 * 128 * 2);
     assert_eq!(get("prefill.native.linear.records").bytes, 640);
-    assert!(!facts
-        .allocations
-        .iter()
-        .any(|a| a.id.ends_with("decode.native.linear.records")));
+    assert!(
+        !facts
+            .allocations
+            .iter()
+            .any(|a| a.id.ends_with("decode.native.linear.records"))
+    );
     assert_eq!(get("decode.native.stage.qkv").bytes, 64 * 2624 * 2);
     assert_eq!(get("prefill.native.stage.values").bytes, 128 * 2 * 256 * 2);
     assert_eq!(get("decode.core.projection.storage.table").bytes, 8);
@@ -95,10 +104,12 @@ fn native_hooks_name_physical_owners_and_k6_route_aliases_once() {
         get("core.target_head.storage.rotated").lifetime,
         Lifetime::TARGET
     );
-    assert!(facts
-        .allocations
-        .iter()
-        .all(|a| a.location == Location::coordinator(1)));
+    assert!(
+        facts
+            .allocations
+            .iter()
+            .all(|a| a.location == Location::coordinator(1))
+    );
     // Retained row planes and peer suffix belong to their own recipes, not these hooks.
     let expected: u64 = hooks
         .native
