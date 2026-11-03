@@ -208,14 +208,17 @@ def diagnose_propagation(lib, model, prepared, native_stages):
                 same_native = reference(op, module, x, residuals.get("native"), True)
                 official_on_native = reference(op, module, x, residuals.get("native"))
                 same_official = reference(op, module, official, residuals.get("official"), True)
+                official_input_native = native(op, module, official, residuals.get("official"))
                 oracle_input_native = native(op, module, fp32, residuals.get("fp32"))
                 cpu = lambda value: value.detach().float().cpu()
                 local = stage_metrics(cpu(actual), cpu(official_on_native), cpu(same_native))
+                official_local = stage_metrics(cpu(official_input_native), cpu(expected), cpu(same_official))
                 cumulative = stage_metrics(cpu(actual), cpu(expected), cpu(oracle_output))
                 rms = lambda value: float(value.float().square().mean().sqrt())
                 inherited = same_native - oracle_output
                 local_error = actual.float() - same_native
-                records.append(dict(primitive=name, native_input_local=local, cumulative=cumulative,
+                records.append(dict(primitive=name, native_input_local=local,
+                    official_input_local=official_local, cumulative=cumulative,
                     inherited_absolute_rms=rms(inherited),
                     local_inherited_cross_mse=float((local_error * inherited).mean()),
                     official_input_local_absolute_rms=rms(expected.float() - same_official),
