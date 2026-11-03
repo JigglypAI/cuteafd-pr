@@ -1835,7 +1835,6 @@ mod tests {
     fn mimo_endpoint_reservation_matches_allocated_backing() -> Result<()> {
         use cuteafd_loader::families::mimo_v2::{admission, MimoExpertInput, MimoV2Config};
         let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
-        let library = fixture.load()?;
         for hidden in [17, 6144] {
             let cfg = MimoV2Config::from_hf(&serde_json::json!({
                 "model_type": "mimo_v2", "num_hidden_layers": 1, "hidden_size": hidden,
@@ -1845,6 +1844,8 @@ mod tests {
                 "n_routed_experts": 8, "num_experts_per_tok": 2, "moe_intermediate_size": 128,
             }))?;
             for ranks in [1, 2, 6] { for rows in [1, 64, 256] { for waves in [1, 3, 4] {
+                // Reload resets the fake DSO's bounded, lifetime-wide event registry.
+                let library = fixture.load()?;
                 let endpoints = admission::spark_endpoints(rows, MimoExpertInput::Fp8)?;
                 let reservation = admission::transport_reservations(&cfg, 1, 0, rows, waves, ranks)?;
                 let planned = reservation.iter().find(|item| item.name == "transport.spark_intake_planes").unwrap().bytes;
