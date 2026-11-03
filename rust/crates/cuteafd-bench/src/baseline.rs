@@ -47,7 +47,7 @@ pub fn estimate_s(rates: &Rates, info: &ServerInfo) -> f64 {
     let decode = 3.0 * rates.seconds(60.0, DECODE_TOKENS as f64);
     let prefill = rates.seconds(PREFILL_TOKENS as f64 + 1600.0, 4.0);
     let fidelity = 4096.0 / rates.decode_tok_s + 24000.0 / rates.prefill_tok_s + 8.0 * 0.15;
-    let cache = rates.seconds(6.0 * 1500.0, 30.0);
+    let cache = rates.seconds(6.0 * CACHE_PROMPT_TOKENS as f64, 30.0);
     let spec = rates.seconds(200.0, 2.0 * 128.0 * 1.6);
     let template = rates.seconds(400.0, 400.0);
     let c4 = rates.seconds(500.0, 2.0 * 64.0);
@@ -334,10 +334,17 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         return Ok(());
     }
     let restored = probed(client, plain(client, &text, 2), rows(2))?;
+    let minimum = cache_minimum_tokens(run.info);
+    check.set("prompt_reference_tokens", CACHE_PROMPT_TOKENS as u64);
+    check.set("minimum_prompt_tokens", minimum as u64);
+    check.set("prompt_tokens", restored.prompt_ids.len() as u64);
+    if !cache_coverage(check, "prompt", restored.prompt_ids.len(), minimum) { return Ok(()); }
     // Turn end. Long enough to clear the cache's minimum snapshot size and several units; the
     // answer runs past 25 tokens, so the turn ends at its length limit and the turn snapshot is
     // followed by a decode step.
     let turn = probed(client, plain(client, &turn_text, TURN_TOKENS as u64), rows(TURN_TOKENS))?;
+    check.set("turn_prompt_tokens", turn.prompt_ids.len() as u64);
+    if !cache_coverage(check, "turn prompt", turn.prompt_ids.len(), minimum) { return Ok(()); }
     let reference = probed(client, plain(client, &turn_text, TURN_TOKENS as u64 + 1), rows(TURN_TOKENS + 1))?;
     let mut ids = turn.prompt_ids.clone();
     ids.extend(&turn.generated[..turn.generated.len().saturating_sub(1)]);
@@ -346,9 +353,6 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         ProbeSpec { prompt_ids: Some(ids), output_dependent: true, ..rows(2) })?;
     let cold = probed(client, plain(client, &turn_text, 1), ProbeSpec { cold: true, ..rows(1) })?;
     let verdict = Restores::judge(&first, &restored, &turn, &reference, &again, &cold);
-    check.set("prompt_reference_tokens", CACHE_PROMPT_TOKENS as u64);
-    check.set("turn_prompt_tokens", turn.prompt_ids.len() as u64);
-    check.set("prompt_tokens", restored.prompt_ids.len() as u64);
     check.set("prompt_restored", restored.cached_tokens as u64);
     check.set("prompt_rows_compared", verdict.prompt.compared as u64);
     check.set("turn_tokens", again.prompt_ids.len() as u64);
@@ -361,8 +365,22 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     Ok(())
 }
 
-// Cover three of the largest shipped prefill units (2752 rows), not just one.
-const CACHE_PROMPT_TOKENS: usize = 8704;
+// Leave room for model/reference tokenizer differences above three 2752-row units.
+const CACHE_PROMPT_TOKENS: usize = 10240;
+
+fn cache_minimum_tokens(info: &ServerInfo) -> usize {
+    let positive = |name| info.setting(name).and_then(|s| s.parse::<usize>().ok()).filter(|n| *n > 0);
+    // Qwen's explicit unit override takes precedence over its span-sized prefill-rows.
+    positive("prefill-units").or_else(|| positive("prefill-rows"))
+        .map_or(8256, |rows| rows.saturating_mul(3))
+}
+
+fn cache_coverage(check: &mut Check, name: &str, actual: usize, minimum: usize) -> bool {
+    if actual >= minimum { return true; }
+    check.status = CheckStatus::Skipped;
+    check.summary = format!("multi-unit coverage missing: {name} has {actual} tokens, needs at least {minimum}");
+    false
+}
 
 fn cache_prompts() -> (String, String) {
     (format!("[{}] Read the notes and answer in one word.\n\n{}", nonce(), corpus(31, CACHE_PROMPT_TOKENS)),
@@ -854,6 +872,33 @@ mod tests {
             let body = corpus(seed, CACHE_PROMPT_TOKENS);
             assert!(text.contains(&body));
             assert!(body.len() > corpus(seed, 3 * 2752).len());
+        }
+    }
+
+    #[test]
+    fn cache_coverage_requires_three_actual_model_units() {
+        use crate::report::Setting;
+        let mut info = ServerInfo::default();
+        assert_eq!(cache_minimum_tokens(&info), 8256);
+        for value in ["0", "auto", ""] {
+            info.configuration.settings = vec![Setting { name: "prefill-rows".into(), value: Some(value.into()),
+                ..Setting::default() }];
+            assert_eq!(cache_minimum_tokens(&info), 8256);
+        }
+        info.configuration.settings = vec![Setting { name: "prefill-rows".into(), value: Some("4096".into()),
+            ..Setting::default() }];
+        assert_eq!(cache_minimum_tokens(&info), 12288);
+        info.configuration.settings.push(Setting { name: "prefill-units".into(), value: Some("2752".into()),
+            ..Setting::default() });
+        let minimum = cache_minimum_tokens(&info);
+        assert_eq!(minimum, 8256);
+        for name in ["prompt", "turn prompt"] {
+            let mut check = Check::new("cache_exact", "Prefix cache exactness");
+            assert!(!cache_coverage(&mut check, name, 8121, minimum));
+            assert_eq!(check.status, CheckStatus::Skipped);
+            assert!(check.summary.contains("8121"));
+            assert!(check.summary.contains("8256"));
+            assert!(cache_coverage(&mut Check::new("cache_exact", "Prefix cache exactness"), name, minimum, minimum));
         }
     }
 
