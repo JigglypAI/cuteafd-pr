@@ -755,8 +755,6 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
 
 
 
-
-
 def test_family_table_matches_the_rust_launch_fixtures(tmp_path: Path) -> None:
     """checkpoint-family.py and cuteafd-loader plan::launch read the same cases the
     same way (both spellings, exact pattern lengths, agreement)."""
@@ -835,6 +833,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         _snapshot(hf, "incoai/GLM-5.3-DFlash2", {"architectures": ["DFlash2DraftModel"]})
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
+    audio_backend = ("pcm-bf16-aot-v1" if family_config.get("model_type") == "muse_spark" else
+                     "mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export" + "cd" * 32)
     for tool in ("docker", "ssh", "nest") if with_nest else ("docker", "ssh"):
         # One line per invocation, in a single write: the per-host worker legs
         # run concurrently, and a two-write line (argv, then newline) lets a
@@ -844,7 +844,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                        if preflight_error and tool == "ssh" else '') +
                                     'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker bootstrap ready}"; '
                                     'printf "audio encoder ready \\033[3mbackend\\033[0m\\033[2m=\\033[0m%s\\n" '
-                                    '"${STUB_AUDIO_BACKEND:-mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '}" ;; esac\n' +
+                                    '"${STUB_AUDIO_BACKEND:-' + audio_backend + '}" ;; esac\n' +
                                     ('case "$*" in image\\ inspect*) echo test-pin ;; '
                                      'cp\\ *) dst="${@: -1}"; mkdir -p "$dst"; '
                                      'touch "$dst/cuteafd" "$dst/libcuteafd_native.so" "$dst/release-entrypoint.sh"; '
@@ -3942,20 +3942,20 @@ def test_mimo_audio_auto_without_admitted_owner_serves_text(tmp_path, tower, rea
     assert ("audio auto disabled" in result.stderr) == tower
 
 
-@pytest.mark.parametrize("model_type,width,tower,want", [
-    ("mimo_v2", 4096, True, "auto"), ("mimo_v2", 6144, True, "auto"),
-    ("mimo_v2", 4096, False, "off"), ("mimo_v2", 128, True, "off"),
-    ("deepseek_v41", 4096, True, "off"), ("qwen4_exp", 4096, True, "off"),
-    ("glm5_next", 4096, True, "off"), ("deepseek_v4", 4096, True, "off"),
+@pytest.mark.parametrize("declaration,want", [
+    ({"model_type": "mimo_v2", "audio_config": {"audio_channels": 20}}, "auto"),
+    ({"model_type": "muse_spark", "audio_config": {"model_type": "muse_spark_audio"}}, "auto"),
+    ({"model_type": "mimo_v2", "audio_config": {"model_type": "unknown_audio"}}, "auto"),
+    ({"model_type": "qwen4_exp", "audio_config": {}}, "auto"),
+    ({"model_type": "mimo_v2", "audio_config": "invalid"}, "auto"),
+    ({"model_type": "mimo_v2", "audio_config": None}, "off"),
+    ({"model_type": "mimo_v2"}, "off"),
 ])
-def test_release_audio_default_resolves_per_snapshot(tmp_path, model_type, width, tower, want):
+def test_release_audio_default_resolves_per_snapshot(tmp_path, declaration, want):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
-    (snapshot / "config.json").write_text(json.dumps({"model_type": model_type, "hidden_size": width, "audio_config": {"audio_channels": 20}}))
-    if tower:
-        (snapshot / "audio_tokenizer").mkdir()
-        (snapshot / "audio_tokenizer/config.json").write_text("{}")
-        (snapshot / "audio_tokenizer/model.safetensors").write_bytes(b"stub")
+    (snapshot / "config.json").write_text(json.dumps(declaration))
+    # The shell preserves declarations; the planner validates types, geometry and headers.
     config = tmp_path / "release.config"
     config.write_text("SPARK_COUNT=4\n" + "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i+1}\nSPARK_{i}_LANE_B=10.0.1.{i+1}\n" for i in range(4)))
     script = f'source "{ROOT}/scripts/lib/release-common.sh"; release_load_config "$1"; test "$AUDIO" = auto; release_resolve_audio_mode "$AUDIO" "$2"'

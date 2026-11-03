@@ -634,7 +634,7 @@ impl<'a> GlmfLoader<'a> {
         ensure!(n % ranks == 0, "{n} MLA heads do not split over {ranks} GPUs");
         let heads = n / ranks;
         // Steps of whole heads, each at most the step bound.
-        let per = (crate::shared::experts::rtx::dense::STEP_BYTES / ((nope + v) * lat * 2)).max(1);
+        let per = (crate::shared::experts::rtx::dense::TRANSFORM_BYTES / ((nope + v) * lat * 2)).max(1);
         (0..ranks).map(|rank| {
             let (uk, uv) = self.on_rank(rank, || Ok((
                 DeviceAllocation::new(self.library, (heads * lat * nope * 2).max(256))?,
@@ -904,15 +904,11 @@ impl<'a> GlmfLoader<'a> {
     /// is enabled by the split setup).
     fn replicate(&self, first: DeviceAllocation<'a>) -> Result<Vec<DeviceAllocation<'a>>> {
         let mut out = vec![first];
-        for (rank, peer) in self.peers.iter().enumerate() {
+        for rank in 0..self.peers.len() {
             let source = out[0].buffer;
             out.push(self.on_rank(rank + 1, || {
                 let copy = DeviceAllocation::new(self.library, source.bytes)?;
-                // SAFETY: both allocations hold `source.bytes`; the peer stream drains before return.
-                unsafe {
-                    self.library.copy_d2d_async(copy.buffer, source, source.bytes, peer.stream)?;
-                    self.library.cuda_stream_synchronize(peer.stream)?;
-                }
+                self.dense.peer_copy(source, copy.buffer, source.bytes)?;
                 Ok(copy)
             })?);
         }
