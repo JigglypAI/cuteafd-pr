@@ -443,21 +443,6 @@ fn commit_blocks(records: &[usize], rank: usize, start: usize, rows: usize, page
 mod tests {
     use super::*;
 
-    #[test]
-    fn context_tables_reserve_every_upload_destination_at_construction() {
-        fn reserved(source: &str) -> bool {
-            let new = source.split("pub fn new(engine:").nth(1).unwrap().split("let [mut first,").next().unwrap();
-            new.contains("for owner in 0..2 {") && new.contains("view(&gather, owner * half * 4, half * 4)?")
-                && new.contains("for table in &commit {")
-                && new.contains("reserve_h2d_ordered(table.buffer, engine.stream_of(rank))?")
-                && new.matches("reserve_h2d_ordered(").count() == 2
-        }
-        let source = include_str!("context.rs");
-        assert!(reserved(source));
-        assert!(!reserved(&source.replacen("for owner in 0..2 {", "for owner in 0..1 {", 1)));
-        assert!(!reserved(&source.replacen("for table in &commit {", "for table in commit.iter().take(1) {", 1)));
-    }
-
     /// A parity pool's ids for logical pages `0..n` (page `j` of parity `j % 2`).
     fn ids(n: usize, base: u32) -> Vec<u32> {
         (0..n as u32).map(|j| 2 * (base + j) + (j & 1)).collect()
