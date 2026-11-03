@@ -276,6 +276,85 @@ pub struct Residency {
     pub staging_bytes: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightView {
+    pub name: String,
+    pub offset: usize,
+    pub bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightLayout {
+    pub allocations: Vec<crate::placement::planner::Allocation>,
+}
+impl WeightLayout {
+    pub fn from_residencies(
+        prefix: &str,
+        residencies: &[&Residency],
+        topology: crate::placement::planner::WeightArenaTopology,
+        location: crate::placement::planner::Location,
+        lifetime: crate::placement::planner::Lifetime,
+    ) -> Result<Self> {
+        Self::from_residencies_inner(prefix, residencies, topology, location, lifetime).map_err(Into::into)
+    }
+
+    fn from_residencies_inner(
+        prefix: &str,
+        residencies: &[&Residency],
+        topology: crate::placement::planner::WeightArenaTopology,
+        location: crate::placement::planner::Location,
+        lifetime: crate::placement::planner::Lifetime,
+    ) -> anyhow::Result<Self> {
+        use crate::placement::planner::{Allocation, View, WeightArenaTopology};
+        use cuteafd_core::memory_layout::Category;
+        ensure!(!prefix.is_empty() && !residencies.is_empty(), "empty EXLR8 weight namespace or layers");
+        let allocation = |id: String, bytes| {
+            let mut allocation = Allocation::buffer(id, location, bytes, lifetime,
+                Category::Experts, "EXLR8 expert weights");
+            allocation.alignment = 256;
+            allocation
+        };
+        let mut allocations = Vec::new();
+        let mut identities = BTreeSet::new();
+        let mut rank_bytes = 0usize;
+        for residency in residencies {
+            let name = format!("target.{}.{}", residency.layer,
+                if residency.set == ExpertSet::Routed { "routed" } else { "shared" });
+            ensure!(identities.insert(name.clone()), "duplicate EXLR8 layer/set");
+            let views = residency.weight_views()?;
+            let (backing, base) = match topology {
+                WeightArenaTopology::PerLayer => {
+                    let backing = format!("{prefix}.arena.{name}");
+                    allocations.push(allocation(backing.clone(), residency.resident_bytes as u64));
+                    (backing, 0)
+                }
+                WeightArenaTopology::SharedRank => {
+                    let base = reserve(&mut rank_bytes, residency.resident_bytes)?;
+                    (format!("{prefix}.arena.rank"), base)
+                }
+            };
+            let mut region = allocation(format!("{prefix}.layer.{name}.region"), residency.resident_bytes as u64);
+            region.view = Some(View { backing: backing.clone(), offset: base as u64 });
+            allocations.push(region);
+            for view in views {
+                let mut record = allocation(format!("{prefix}.layer.{name}.{}", view.name), view.bytes as u64);
+                record.view = Some(View { backing: backing.clone(), offset: base.checked_add(view.offset)
+                    .context("EXLR8 rank view overflow")? as u64 });
+                allocations.push(record);
+            }
+        }
+        if topology == WeightArenaTopology::SharedRank {
+            allocations.push(allocation(format!("{prefix}.arena.rank"), rank_bytes as u64));
+        }
+        Ok(Self { allocations })
+    }
+
+    pub fn bytes(&self) -> Result<u64> {
+        self.allocations.iter().filter(|a| a.view.is_none()).try_fold(0u64, |sum, a|
+            sum.checked_add(a.bytes).context("EXLR8 weight sum overflow").map_err(Into::into))
+    }
+}
+
 fn reserve(cursor: &mut usize, bytes: usize) -> anyhow::Result<usize> {
     let start = cursor
         .checked_add(255)
@@ -679,6 +758,50 @@ impl Residency {
         })
     }
 
+    /// Direct ranges in the retained arena. Repeated block scales alias one
+    /// physical range, but every unit binding still has its own stable identity.
+    pub fn weight_views(&self) -> Result<Vec<WeightView>> {
+        self.weight_views_inner().map_err(Into::into)
+    }
+
+    fn weight_views_inner(&self) -> anyhow::Result<Vec<WeightView>> {
+        ensure!(self.hidden > 0 && self.experts > 0 && self.units > 0
+            && self.world > 0 && self.rank < self.world && self.resident_bytes > 0
+            && self.resident_bytes % 256 == 0, "invalid EXLR8 retained arena geometry");
+        let slots = self.experts.checked_mul(self.units).and_then(|n| n.checked_mul(3))
+            .context("EXLR8 descriptor extent overflow")?;
+        let mut views = Vec::new();
+        let mut names = BTreeSet::new();
+        let mut add = |name: String, offset: usize, bytes: usize| -> anyhow::Result<()> {
+            ensure!(bytes > 0 && offset % 256 == 0 && offset.checked_add(bytes)
+                .is_some_and(|end| end <= self.resident_bytes) && names.insert(name.clone()),
+                "invalid EXLR8 retained range {name}");
+            views.push(WeightView { name, offset, bytes });
+            Ok(())
+        };
+        for (index, label) in ["in", "out"].into_iter().enumerate() {
+            ensure!(self.signs[index].len() == self.hidden, "EXLR8 sign extent differs");
+            add(format!("signs.{label}"), self.signs_offsets[index], self.hidden)?;
+        }
+        add("pointers".into(), self.pointers_offset, slots.checked_mul(24).context("EXLR8 pointers overflow")?)?;
+        add("bits".into(), self.bits_offset, slots.checked_mul(4).context("EXLR8 widths overflow")?)?;
+        if self.set == ExpertSet::Routed {
+            add("compact.counts".into(), self.compact_offsets[0], self.experts.checked_mul(4)
+                .context("EXLR8 compact counts overflow")?)?;
+            add("compact.units".into(), self.compact_offsets[1], self.experts.checked_mul(self.units)
+                .and_then(|n| n.checked_mul(4)).context("EXLR8 compact map overflow")?)?;
+        }
+        for unit in &self.loads {
+            ensure!(unit.expert < self.experts && unit.unit < self.units && unit.projection < 3
+                && (2..=4).contains(&unit.bits), "invalid EXLR8 retained unit identity");
+            for (index, label) in ["payload", "channel", "block"].into_iter().enumerate() {
+                add(format!("unit.{}.{}.{}.{label}", unit.expert, unit.unit, unit.projection),
+                    unit.destination[index], unit.source[index].bytes)?;
+            }
+        }
+        Ok(views)
+    }
+
     /// Same rotated ownership used by payload selection, built before allocation.
     pub fn compact_descriptors(&self) -> anyhow::Result<(Vec<i32>, Vec<i32>, usize)> {
         use cuteafd_core::tp_units::{unit_owner, UnitRule};
@@ -793,6 +916,59 @@ mod tests {
     use std::io::Write;
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn weight_owners_preserve_shared_blocks_and_direct_rank_offsets() {
+        use crate::placement::planner::{Lifetime, Location, WeightArenaTopology};
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), false);
+        for (world, rank) in [(1, 0), (2, 1), (4, 3)] {
+            let routed = Residency::plan(root.path(), "mixed", 3, world, rank, ExpertSet::Routed).unwrap();
+            let shared = Residency::plan(root.path(), "mixed", 3, world, rank, ExpertSet::Shared).unwrap();
+            let residencies = [&routed, &shared];
+            let expected = (routed.resident_bytes + shared.resident_bytes) as u64;
+            for topology in [WeightArenaTopology::PerLayer, WeightArenaTopology::SharedRank] {
+                let layout = WeightLayout::from_residencies("test", &residencies, topology,
+                    Location::coordinator(0), Lifetime::RESIDENT).unwrap();
+                assert_eq!(layout.bytes().unwrap(), expected);
+                let physical = layout.allocations.iter().filter(|a| a.view.is_none())
+                    .map(|a| (a.id.as_str(), a)).collect::<BTreeMap<_, _>>();
+                assert_eq!(physical.len(), if topology == WeightArenaTopology::SharedRank { 1 } else { 2 });
+                for view in layout.allocations.iter().filter(|a| a.view.is_some()) {
+                    let direct = view.view.as_ref().unwrap();
+                    let owner = physical[direct.backing.as_str()];
+                    assert!(direct.offset.checked_add(view.bytes).is_some_and(|end| end <= owner.bytes));
+                    assert_eq!(direct.offset % 256, 0);
+                }
+                let second = layout.allocations.iter().find(|a| a.id == "test.layer.target.3.shared.region").unwrap();
+                assert_eq!(second.view.as_ref().unwrap().offset,
+                    if topology == WeightArenaTopology::SharedRank { routed.resident_bytes as u64 } else { 0 });
+            }
+            let views = routed.weight_views().unwrap();
+            let blocks = views.iter().filter(|v| v.name.ends_with(".block")).collect::<Vec<_>>();
+            if world == 1 {
+                assert!(blocks.iter().enumerate().any(|(i, a)| blocks[i+1..].iter()
+                    .any(|b| a.offset == b.offset && a.bytes == b.bytes)));
+            }
+            let make = |prefix, states: &[&Residency]| WeightLayout::from_residencies(prefix, states,
+                WeightArenaTopology::SharedRank, Location::coordinator(0), Lifetime::RESIDENT);
+            assert!(make("", &residencies).is_err());
+            assert!(make("test", &[]).is_err());
+            assert!(make("test", &[&routed, &routed]).is_err());
+            for negative in 0..5 {
+                let mut bad = routed.clone();
+                match negative {
+                    0 => bad.resident_bytes -= 1,
+                    1 => bad.signs[0].clear(),
+                    2 => bad.pointers_offset = bad.resident_bytes,
+                    3 => bad.loads[0].destination[0] = usize::MAX,
+                    4 => bad.loads.push(bad.loads[0].clone()),
+                    _ => unreachable!(),
+                }
+                assert!(make("test", &[&bad]).is_err(), "negative {negative}");
+            }
+        }
+    }
 
     #[test]
     fn execution_workspace_is_exact_aligned_and_checked() {

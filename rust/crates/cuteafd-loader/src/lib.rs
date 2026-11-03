@@ -17,7 +17,7 @@ pub use families::deepseek_v41::v41_catalog::{
     read_expert_catalog, read_official_v41_catalog, read_official_v41_role_catalog, read_official_v41_spark_catalog, read_qwen4_mtp_expert_catalog, OfficialV41Catalog, RoutedExpertShape,
     V41StorageBudget, V41Tensor, V41TensorPlacement, V41CoordinatorTensorReader,
 };
-pub use families::deepseek_v41::v41_exl3_residency::{Exl3ArenaTopology, Exl3WeightLayout, V41Exl3Layer, V41Exl3Load, V41Exl3Residency, V41Exl3ResidentBuffer};
+pub use families::deepseek_v41::v41_exl3_residency::{Exl3WeightLayout, V41Exl3Layer, V41Exl3Load, V41Exl3Residency, V41Exl3ResidentBuffer};
 pub use families::deepseek_v41::v41_exl3_staging::{V41Exl3TensorGather, V41Exl3TensorSlice};
 pub use families::deepseek_v41::v41_exl3::{V41Exl3Manifest, V41Exl3Naming, V41Exl3Projection,
     V41Exl3ProjectionKind};

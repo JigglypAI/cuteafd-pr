@@ -47,12 +47,7 @@ pub struct V41Exl3Residency {
     pub loads: Vec<V41Exl3Load>,
 }
 
-/// Physical topology, independent of where compressed bytes were read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Exl3ArenaTopology {
-    PerLayer,
-    SharedRank,
-}
+use crate::placement::planner::WeightArenaTopology;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Exl3WeightLayout {
@@ -65,7 +60,7 @@ impl Exl3WeightLayout {
     pub fn from_residencies(
         prefix: &str,
         residencies: &[&V41Exl3Residency],
-        topology: Exl3ArenaTopology,
+        topology: WeightArenaTopology,
         location: crate::placement::planner::Location,
         lifetime: crate::placement::planner::Lifetime,
     ) -> std::result::Result<Self, crate::serving_capacity::CacheGeometryError> {
@@ -98,12 +93,12 @@ impl Exl3WeightLayout {
             let (offsets, bytes) = residency.device_arena_layout()?;
             let bytes = bytes as u64;
             let (backing, base) = match topology {
-                Exl3ArenaTopology::PerLayer => {
+                WeightArenaTopology::PerLayer => {
                     let backing = format!("{prefix}.arena.{name}");
                     allocations.push(allocation(backing.clone(), bytes));
                     (backing, 0)
                 }
-                Exl3ArenaTopology::SharedRank => {
+                WeightArenaTopology::SharedRank => {
                     let base = rank_bytes.checked_add(255)
                         .ok_or(Overflow("EXL3 rank alignment"))? & !255;
                     rank_bytes = base.checked_add(bytes).ok_or(Overflow("EXL3 rank extent"))?;
@@ -127,7 +122,7 @@ impl Exl3WeightLayout {
                 allocations.push(view);
             }
         }
-        if topology == Exl3ArenaTopology::SharedRank {
+        if topology == WeightArenaTopology::SharedRank {
             allocations.push(allocation(format!("{prefix}.arena.rank"), rank_bytes));
         }
         Ok(Self { allocations })
@@ -580,12 +575,12 @@ mod tests {
         let lifetimes = Lifetime::RESIDENT;
         let residencies = [&first, &second];
         let expected = residencies.iter().map(|r| r.device_arena_layout().unwrap().1 as u64).sum::<u64>();
-        for topology in [Exl3ArenaTopology::PerLayer, Exl3ArenaTopology::SharedRank] {
+        for topology in [WeightArenaTopology::PerLayer, WeightArenaTopology::SharedRank] {
             let layout = Exl3WeightLayout::from_residencies("test", &residencies, topology,
                 Location::coordinator(1), lifetimes)?;
             assert_eq!(layout.bytes()?, expected);
             assert_eq!(layout.allocations.iter().filter(|a| a.view.is_none()).count(),
-                if topology == Exl3ArenaTopology::SharedRank { 1 } else { 2 });
+                if topology == WeightArenaTopology::SharedRank { 1 } else { 2 });
             for allocation in &layout.allocations {
                 assert_eq!(allocation.alignment, 256);
                 if let Some(view) = &allocation.view {
@@ -598,7 +593,7 @@ mod tests {
             assert!(layout.allocations.iter().any(|a| a.id.contains(".layer.draft.0.")));
         }
         let make = |prefix, residencies: &[&V41Exl3Residency]| Exl3WeightLayout::from_residencies(
-            prefix, residencies, Exl3ArenaTopology::SharedRank, Location::coordinator(0), lifetimes);
+            prefix, residencies, WeightArenaTopology::SharedRank, Location::coordinator(0), lifetimes);
         assert!(make("", &residencies).is_err());
         assert!(make("test", &[]).is_err());
         assert!(make("test", &[&first, &first]).is_err());

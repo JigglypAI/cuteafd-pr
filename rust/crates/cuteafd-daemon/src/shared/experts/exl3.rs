@@ -588,7 +588,8 @@ mod tests {
     fn retained_mount_and_shared_push_weight_arenas_reconcile_direct_views() -> Result<()> {
         use crate::shared::memory::{device::Device, push_initialize, weight_arena::*};
         use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
-        use cuteafd_loader::{Exl3ArenaTopology, Exl3WeightLayout, plan::testing::*};
+        use cuteafd_loader::{Exl3WeightLayout, plan::testing::*};
+        use cuteafd_loader::placement::planner::WeightArenaTopology;
         use cuteafd_loader::placement::planner::{Device as PlannedDevice, Domain, Lifetime, Location};
         use std::io::{Read, Seek, SeekFrom, Write};
         use std::rc::Rc;
@@ -647,9 +648,9 @@ mod tests {
             let planned = (0..2).map(|layer| planned_residency(&catalog, selection(layer))).collect::<Result<Vec<_>>>()?;
             let residencies = planned.iter().collect::<Vec<_>>();
             let mounted = Exl3WeightLayout::from_residencies("test.weights", &residencies,
-                Exl3ArenaTopology::PerLayer, location, Lifetime::RESIDENT)?;
+                WeightArenaTopology::PerLayer, location, Lifetime::RESIDENT)?;
             let pushed = Exl3WeightLayout::from_residencies("test.weights", &residencies,
-                Exl3ArenaTopology::SharedRank, location, Lifetime::RESIDENT)?;
+                WeightArenaTopology::SharedRank, location, Lifetime::RESIDENT)?;
             assert_eq!(mounted.bytes()?, pushed.bytes()?);
             let states = (0..2).map(|layer| Exl3Weights::load(&library, &catalog,
                 selection(layer), 1 << 30)).collect::<Result<Vec<_>>>()?;

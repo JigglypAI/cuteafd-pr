@@ -143,6 +143,13 @@ impl Budget {
     }
 }
 
+/// Physical expert-weight backing; loading source does not affect payload bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightArenaTopology {
+    PerLayer,
+    SharedRank,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct View {
     pub backing: String,
