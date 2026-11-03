@@ -2868,3 +2868,76 @@ def test_panels_allowlist_derives_from_bench_definitions_and_includes_shared_pre
     assert cards.bench_panels(binary='/opt/bin/cuteafd') == cards.PANELS
 
 
+def test_observer_slow_cleanup_exits_within_hook_wait_and_preserves_failures(entry, tmp_path, monkeypatch):
+    job = cards.generate(entry, 'candidate', dict(instance='obs-test', slot='s'),
+                         tmp_path, tmp_path / 'key', {}, {'memory', 'console'}, None, 1)
+    assert job['entry']['observer']['finish_timeout_s'] == cards.OBSERVER_FINISH_TIMEOUT_S == 5
+    assert cards.observer_teardown_budget(job) == pytest.approx(3.5)
+    hook_wait_s = 0.5
+    job['entry']['observer']['finish_timeout_s'] = hook_wait_s
+    budget_s = cards.observer_teardown_budget(job)
+    assert 0.1 <= budget_s < hook_wait_s
+    stop = tmp_path / 'observer.stop'
+    monkeypatch.setenv('CUTEAFD_SMOKE_STOP', str(stop))
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost:8500')
+    killed = []
+
+    class SlowSampler:
+        def __init__(self, stdout):
+            self.stdout = stdout
+            self.stderr = SimpleNamespace(read=lambda: 'sampler boom')
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            time.sleep(min(timeout or 10.0, 10.0))
+            raise subprocess.TimeoutExpired(['docker', 'run'], timeout or 10.0)
+
+        def kill(self):
+            killed.append(True)
+
+    def fake_popen(cmd, **kwargs):
+        kwargs['stdout'].write('{"time":1.0,"devices":[{"gpu":0,"raw_bytes":1,"sampler_bytes":0,"corrected_bytes":1}]}\n')
+        kwargs['stdout'].flush()
+        return SlowSampler(kwargs['stdout'])
+
+    def slow_run(cmd, **kwargs):
+        timeout = kwargs.get('timeout', 120)
+        time.sleep(min(timeout, 10.0))
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    def slow_console_frames(url, stop_path, output):
+        while not stop_path.exists():
+            time.sleep(0.01)
+        time.sleep(2.0)
+
+    def http(url, path):
+        if path == '/v1/stats':
+            stop.touch()
+            return {'dspark_policy': {}}
+        return {'type': 'snapshot'}
+
+    monkeypatch.setattr(cards.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(cards, 'run', slow_run)
+    monkeypatch.setattr(cards, 'console_frames', slow_console_frames)
+    monkeypatch.setattr(cards, 'http', http)
+    started = time.monotonic()
+    cards.observe(job)
+    elapsed = time.monotonic() - started
+    assert elapsed < hook_wait_s
+    assert killed == [True]
+    teardown = json.loads((Path(job['state']) / 'observer-teardown.json').read_text())
+    assert teardown['finish_timeout_s'] == hook_wait_s
+    assert teardown['budget_s'] == pytest.approx(budget_s, abs=0.01)
+    assert [p['phase'] for p in teardown['phases']] == ['sampler_cleanup', 'sampler_wait', 'reader_join']
+    assert [p['status'] for p in teardown['phases']] == ['timeout', 'timeout', 'timeout']
+
+    # Required observer failures (e.g. empty memory samples) still raise after bounded teardown.
+    stop.unlink()
+    monkeypatch.setattr(cards.subprocess, 'Popen', lambda cmd, **kw: SlowSampler(kw['stdout']))
+    with pytest.raises(ValueError, match='memory probe produced no samples'):
+        cards.observe(job)
+
+
+

@@ -209,7 +209,8 @@ def config(path):
 
 
 def run(cmd, **kwargs):
-    return subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=120, **kwargs)
+    timeout = kwargs.pop('timeout', 120)
+    return subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=timeout, **kwargs)
 
 
 def arms_from(values, releases=()):
@@ -462,7 +463,8 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     hook = [sys.executable, str(Path(__file__).resolve())]
     timeout = int(entry.get('timeout_s', 900)) + int(entry.get('run_timeout_s', 900)) + 120
     if probes & {'memory', 'console'} or trace:
-        entry['observer'] = dict(argv=hook + ['--observe', str(dest / 'job.json')], timeout_s=min(timeout, 7200), required=True)
+        entry['observer'] = dict(argv=hook + ['--observe', str(dest / 'job.json')], timeout_s=min(timeout, 7200),
+                                 finish_timeout_s=OBSERVER_FINISH_TIMEOUT_S, required=True)
         if 'memory' in probes:
             entry['observer']['cleanup'] = sampler_cleanup(job)
     if expected_pool is not None or 'image' in probes:
@@ -765,6 +767,16 @@ def smoke_command(binary, repo, job):
 # How long a signalled smoke may take to tear down before it is killed: above its
 # own 60 s bound, under hwlock.py's 80 s grace and systemd's 90 s TimeoutStopSec.
 SMOKE_STOP_GRACE_S = 75.0
+# Matches HookChild::spawn's default finish_timeout_s in rust/crates/cuteafd-bench/src/smoke.rs.
+OBSERVER_FINISH_TIMEOUT_S = 5
+
+
+def observer_teardown_budget(job):
+    """Total observer teardown budget, derived from and strictly shorter than finish_timeout_s."""
+    observer = (job.get('entry') or {}).get('observer') or {}
+    finish_timeout = float(observer.get('finish_timeout_s') or OBSERVER_FINISH_TIMEOUT_S)
+    margin = 1.5 if finish_timeout > 2.0 else finish_timeout * 0.3
+    return max(0.1, min(finish_timeout * 0.7, finish_timeout - margin))
 STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 # The first stop signal received, and the detached smoke process groups it reaches.
 STOP = dict(signal=None)
@@ -1049,18 +1061,51 @@ def observe(job):
                         policy_sample_at = time.monotonic() + 1.
                 except (OSError, RuntimeError):
                     pass
-            time.sleep(.25)
+            if not stop.exists():
+                time.sleep(.25)
     finally:
-        if sampler:
-            run(sampler_cleanup(job))
-            sampler.wait(timeout=10)
+        teardown_start = time.monotonic()
+        finish_timeout_s = float(((job.get('entry') or {}).get('observer') or {}).get('finish_timeout_s') or OBSERVER_FINISH_TIMEOUT_S)
+        budget_s = observer_teardown_budget(job)
+        deadline = teardown_start + budget_s
+        phases = []
         stop.touch()
+        if sampler:
+            phase_start = time.monotonic()
+            cleanup_timeout = min(budget_s * 0.6, max(0.0, deadline - phase_start))
+            try:
+                run(sampler_cleanup(job), timeout=cleanup_timeout)
+                phases.append(dict(phase='sampler_cleanup', status='ok', elapsed_s=round(time.monotonic() - phase_start, 4)))
+            except subprocess.TimeoutExpired:
+                phases.append(dict(phase='sampler_cleanup', status='timeout', elapsed_s=round(time.monotonic() - phase_start, 4)))
+                print(f'wip-cards: observer sampler_cleanup timed out after {cleanup_timeout:.2f}s (hook cleanup will retry)', file=sys.stderr, flush=True)
+            phase_start = time.monotonic()
+            wait_timeout = min(budget_s * 0.25, max(0.0, deadline - phase_start))
+            try:
+                sampler.wait(timeout=wait_timeout)
+                phases.append(dict(phase='sampler_wait', status='ok', elapsed_s=round(time.monotonic() - phase_start, 4)))
+            except subprocess.TimeoutExpired:
+                phases.append(dict(phase='sampler_wait', status='timeout', elapsed_s=round(time.monotonic() - phase_start, 4)))
+                with contextlib.suppress(OSError):
+                    sampler.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                    sampler.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic())))
         if reader:
-            reader.join(timeout=3)
+            phase_start = time.monotonic()
+            join_timeout = max(0.0, deadline - phase_start)
+            reader.join(timeout=join_timeout)
+            phases.append(dict(phase='reader_join', status='timeout' if reader.is_alive() else 'ok',
+                               elapsed_s=round(time.monotonic() - phase_start, 4)))
         frames.close()
         policy.close()
         memory.close()
         console.close()
+        save(dest / 'observer-teardown.json', dict(
+            finish_timeout_s=finish_timeout_s,
+            budget_s=round(budget_s, 4),
+            elapsed_s=round(time.monotonic() - teardown_start, 4),
+            phases=phases,
+        ))
     if 'memory' in job['probes'] and not (dest / 'memory.jsonl').stat().st_size:
         raise ValueError('memory probe produced no samples')
     if 'console' in job['probes'] and not (dest / 'console.jsonl').stat().st_size:
