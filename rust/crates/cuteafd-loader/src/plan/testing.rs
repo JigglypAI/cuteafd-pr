@@ -1657,8 +1657,10 @@ fn placement_input_source_hashes(root: &std::path::Path) -> anyhow::Result<Value
         let path = entry?.path();
         if path.extension().is_some_and(|extension| extension == "config") {
             let relative = path.strip_prefix(root)?.to_string_lossy().into_owned();
-            if !retired.contains(relative.as_str()) { live.push(relative); }
-            paths.push(path);
+            if !retired.contains(relative.as_str()) {
+                live.push(relative);
+                paths.push(path);
+            }
         }
     }
     live.sort();
@@ -1785,6 +1787,34 @@ mod v4_input_tests {
         let metadata = json!({"engine_sources_sha256": v4_placement_source_hashes(root.path()).unwrap()});
         fs::remove_file(added).unwrap();
         assert!(validate_v4_placement_sources(&metadata, root.path()).is_err());
+    }
+
+    #[test]
+    fn placement_fingerprints_ignore_retired_contents_but_track_live_revision_and_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for relative in ["python/tools/aot", "python/tools/lib", "scripts/build", "scripts/lib",
+            "examples/configs", "benchmarks"] {
+            fs::create_dir_all(root.join(relative)).unwrap();
+        }
+        for relative in ["scripts/build/compare-sm-exports.py", "scripts/build/export-placement-inputs.py",
+            "scripts/build/release-scope.py", "scripts/lib/wip_aot_scopes.py",
+            "examples/configs/live.config", "examples/configs/retired.config"] {
+            fs::write(root.join(relative), "original").unwrap();
+        }
+        let matrix = root.join("benchmarks/current-matrix.json");
+        let retired = json!([{"config": "examples/configs/retired.config"}]);
+        fs::write(&matrix, json!({"retired": retired, "cells": [{"report": "old"}]}).to_string()).unwrap();
+        let before = placement_input_source_hashes(root).unwrap();
+        assert!(before.get("examples/configs/retired.config").is_none());
+        fs::write(root.join("examples/configs/retired.config"), "retired edit").unwrap();
+        fs::write(&matrix, json!({"retired": retired, "cells": [{"report": "new"}]}).to_string()).unwrap();
+        assert_eq!(placement_input_source_hashes(root).unwrap(), before);
+        fs::write(root.join("examples/configs/live.config"), "MODEL_REVISION=changed").unwrap();
+        assert_ne!(placement_input_source_hashes(root).unwrap(), before);
+        fs::write(root.join("examples/configs/live.config"), "original").unwrap();
+        fs::write(&matrix, json!({"retired": [], "cells": []}).to_string()).unwrap();
+        assert_ne!(placement_input_source_hashes(root).unwrap()["installed_live_configs"], before["installed_live_configs"]);
     }
 
     #[test]

@@ -42,10 +42,10 @@ def source_hashes():
     # rewrites do not affect compilation; only the selected example inventory does.
     paths = [ROOT / "scripts/build/export-placement-inputs.py",
              ROOT / "scripts/build/release-scope.py", ROOT / "scripts/lib/wip_aot_scopes.py",
-             *sorted((ROOT / "examples/configs").glob("*.config"))]
+             *(ROOT / config for config in live_configs(ROOT))]
     return {**compare.v4_placement_sources(),
             **{str(path.relative_to(ROOT)): compare.sha(path.read_bytes()) for path in paths},
-            "installed_live_configs": compare.sha("\n".join(live_configs()).encode())}
+            "installed_live_configs": compare.sha("\n".join(live_configs(ROOT)).encode())}
 
 
 def export_jobs():
@@ -88,7 +88,11 @@ def reusable_workers(previous, staging, jobs, sources, lock):
     # actual compiler inputs, including added/removed source files, must match.
     ignored = {"scripts/build/export-placement-inputs.py", "benchmarks/current-matrix.json",
                "installed_live_configs"}
-    compiler_sources = lambda hashes: {key: value for key, value in hashes.items() if key not in ignored}
+    retired = {entry["config"] for entry in json.loads((ROOT / "benchmarks/current-matrix.json").read_text())["retired"]}
+    # Older publications also hashed retired examples. Drop only those legacy
+    # entries; live content and every compiler-source fingerprint still match.
+    compiler_sources = lambda hashes: {key: value for key, value in hashes.items()
+                                      if key not in ignored and key not in retired}
     if (metadata.get("schema") != 1 or metadata.get("sparkinfer_revision") != lock["revision"]
             or metadata.get("source_tree_sha256") != lock["source_tree_sha256"]
             or compiler_sources(metadata.get("engine_sources_sha256", {})) != compiler_sources(sources)):
