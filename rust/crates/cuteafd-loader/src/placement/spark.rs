@@ -554,19 +554,18 @@ impl SparkBudgetInventory {
         endpoints: &[cuteafd_core::SparkEndpoint], rings: cuteafd_core::SparkRings,
         budget: u64, estimated_reserve: u64) -> anyhow::Result<Self> {
         use anyhow::Context;
-        let mut resident = Vec::new();
+        let mut resident = vec![Vec::with_capacity(working.spark_layers.len()); working.spark_ranks];
+        for &layer in &working.spark_layers {
+            for (costs, bytes) in resident.iter_mut().zip(catalog.exl3_spark_arena_bytes(layer, working.spark_ranks)?) {
+                costs.push(bytes);
+            }
+        }
         let mut overhead = Vec::new();
         for rank in 0..working.spark_ranks {
-            let mut costs = Vec::new();
-            for &layer in &working.spark_layers {
-                costs.push(catalog.exl3().context("Spark EXL3 budget needs EXL3 headers")?
-                    .resident_arena_bytes(crate::V41Exl3Layer::Backbone(layer), working.spark_ranks, rank, true)?);
-            }
             let io = working.rank_endpoints_io(rank, catalog.routed_experts().geometry()?, endpoints, rings)?;
             let bytes = [io.intake, io.host_exchange, io.row_indices, io.mapped_rings,
                 io.endpoint_staging, estimated_reserve].into_iter().try_fold(0u64, |sum, bytes|
                     sum.checked_add(bytes).context("Spark estimated overhead overflow"))?;
-            resident.push(costs);
             overhead.push(bytes);
         }
         Ok(Self { layers: working.spark_layers.clone(), resident, overhead, budget })

@@ -177,7 +177,7 @@ impl OfficialV41Catalog {
 #[derive(Debug, Default)]
 pub(crate) struct ResidentBytesCache(std::sync::Mutex<std::collections::BTreeMap<ResidentBytesKey, u64>>);
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ResidentBytesKey {
     world: usize,
     rank: usize,
@@ -194,6 +194,22 @@ impl V41Exl3Manifest {
     /// Exact arena bytes without rebuilding load jobs for every admission shape.
     /// The key contains header geometry, not tensor names or a mutable manifest's address.
     pub fn resident_arena_bytes(&self, layer: V41Exl3Layer, world: usize, rank: usize, balanced: bool) -> Result<u64> {
+        let key = self.resident_bytes_key(layer, world, rank, balanced)?;
+        self.resident_bytes_for_key(layer, key)
+    }
+
+    /// Validate the mutable header signature once, then use the exact native
+    /// residency builder for every distinct rank that is not already cached.
+    pub(crate) fn resident_arena_bytes_all_ranks(&self, layer: V41Exl3Layer, world: usize, balanced: bool) -> Result<Vec<u64>> {
+        let signature = self.resident_bytes_key(layer, world, 0, balanced)?;
+        (0..world).map(|rank| {
+            let mut key = signature.clone();
+            key.rank = rank;
+            self.resident_bytes_for_key(layer, key)
+        }).collect()
+    }
+
+    fn resident_bytes_key(&self, layer: V41Exl3Layer, world: usize, rank: usize, balanced: bool) -> Result<ResidentBytesKey> {
         ensure!((1..=8).contains(&world) && rank < world, "invalid EXL3 TP rank/world");
         let (draft, index, experts) = match layer {
             V41Exl3Layer::Backbone(index) => {
@@ -218,13 +234,17 @@ impl V41Exl3Manifest {
                     V41Exl3ProjectionKind::Up => 1, V41Exl3ProjectionKind::Down => 2 };
                 Ok((kind, p.bits, p.input_features, p.output_features))
             }).collect::<Result<Vec<_>>>()?;
-        let key = ResidentBytesKey { world, rank, hidden: self.experts.hidden,
+        Ok(ResidentBytesKey { world, rank, hidden: self.experts.hidden,
             intermediate: self.experts.intermediate, experts, tiers: self.decoder_tiers.clone(),
-            compact_layer: (balanced && self.experts.intermediate / 128 % world != 0).then_some(index), balanced, projections };
+            compact_layer: (balanced && self.experts.intermediate / 128 % world != 0).then_some(index), balanced, projections })
+    }
+
+    fn resident_bytes_for_key(&self, layer: V41Exl3Layer, key: ResidentBytesKey) -> Result<u64> {
         if let Some(bytes) = self.resident_bytes.0.lock().expect("EXL3 byte cache poisoned").get(&key) {
             return Ok(*bytes);
         }
-        let plan = if balanced { self.balanced_residency(layer, world, rank)? } else { self.residency(layer, world, rank)? };
+        let (world, rank) = (key.world, key.rank);
+        let plan = if key.balanced { self.balanced_residency(layer, world, rank)? } else { self.residency(layer, world, rank)? };
         let bytes = plan.device_arena_layout()?.1 as u64;
         self.resident_bytes.0.lock().expect("EXL3 byte cache poisoned").insert(key, bytes);
         Ok(bytes)
@@ -485,7 +505,7 @@ impl V41Exl3Manifest {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::{OfficialV41Config, V41Exl3Projection};
     use std::collections::BTreeMap;
@@ -495,6 +515,15 @@ mod tests {
         for tiers in [&[2][..], &[2, 3][..], &[4, 5][..]] {
             let mut manifest = fixture_geometry(tiers, 5120, 2304, 16);
             for world in [1, 2, 4, 6] {
+                for balanced in [false, true] {
+                    let layer = V41Exl3Layer::Backbone(0);
+                    let expected = (0..world).map(|rank| {
+                        let native = if balanced { manifest.balanced_residency(layer, world, rank)? }
+                            else { manifest.residency(layer, world, rank)? };
+                        Ok(native.device_arena_layout()?.1 as u64)
+                    }).collect::<Result<Vec<_>>>()?;
+                    assert_eq!(manifest.resident_arena_bytes_all_ranks(layer, world, balanced)?, expected);
+                }
                 for rank in 0..world {
                     for balanced in [false, true] {
                         let layer = V41Exl3Layer::Backbone(0);
@@ -633,7 +662,7 @@ mod tests {
         fixture_geometry(tiers, 5120, 2304, 384)
     }
 
-    fn fixture_geometry(tiers: &[usize], hidden: usize, intermediate: usize, experts: usize) -> V41Exl3Manifest {
+    pub(super) fn fixture_geometry(tiers: &[usize], hidden: usize, intermediate: usize, experts: usize) -> V41Exl3Manifest {
         let config = OfficialV41Config::from_json(include_bytes!("official-v41-config.json")).unwrap();
         let mut shape = crate::RoutedExpertShape::of_v41(&config);
         shape.hidden = hidden;
