@@ -310,7 +310,12 @@ impl<'a> WindowWeights<'a> {
         ensure!(storage.input.buffer.device_id == self.tensors.get(&self.names[0])?.device_id,
             "window storage device differs");
         let unit = storage.unit;
+        let device = crate::shared::memory::device::Device {
+            library: self.library, id: storage.input.buffer.device_id,
+        };
         Ok(WindowWave {
+            produced: crate::shared::memory::device::Event::new(device)?,
+            committed: crate::shared::memory::device::Event::new(device)?,
             #[cfg(test)]
             own_stream: PRIVATE_STREAM.with(|private| private.get()).then(|| -> Result<_> { Ok(LoadStream {
                 library: self.library, raw: self.library.cuda_stream_create()? }) }).transpose()?,
@@ -419,8 +424,12 @@ pub(crate) struct WindowPlanes<'a> {
 /// layers share it within a pass; prefill slots share it across their units.
 /// Each layer retains its own graph and proposal plane. The pass orders layer
 /// L+1's producer after layer L's attention on the chain or a host drain.
+/// A separate persistent commit stream stores each layer's proposal after its
+/// producer event; a completion event orders that layer's next plane reuse.
+/// Independent passes retain separate producer/commit stream pairs.
 pub(crate) struct WindowStorage<'a> {
     stream: LoadStream<'a>,
+    commit_stream: LoadStream<'a>,
     fp8: V41Fp8Plan<'a>,
     scratch: DeviceAllocation<'a>,
     alpha: DeviceAllocation<'a>,
@@ -455,6 +464,7 @@ impl<'a> WindowStorage<'a> {
         let fp8 = library.v41_fp8_matrix_plan(unit as u32, 5120, 512)?;
         let value = Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
+            commit_stream: LoadStream { library, raw: library.cuda_stream_create()? },
             scratch: DeviceAllocation::new(library, fp8.info().scratch_bytes as usize)?,
             alpha: DeviceAllocation::new(library, 4)?,
             input: DeviceAllocation::new(library, unit * 10240)?,
@@ -484,6 +494,8 @@ impl Drop for WindowStorage<'_> {
     fn drop(&mut self) {
         // SAFETY: owned stream; its queued work reads only this storage.
         fatal_drain(unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }, "window storage");
+        // SAFETY: the persistent commit stream reads this storage's proposal planes.
+        fatal_drain(unsafe { self.commit_stream.library.cuda_stream_synchronize(self.commit_stream.raw) }, "window commits");
     }
 }
 
@@ -494,6 +506,8 @@ thread_local! {
     pub(crate) static SHARED_COMMIT_STAGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 pub(crate) struct WindowWave<'w, 'a> {
+    produced: crate::shared::memory::device::Event<'a>,
+    committed: crate::shared::memory::device::Event<'a>,
     /// Negative control only: bypass the shared scratch ordering stream.
     #[cfg(test)]
     own_stream: Option<LoadStream<'a>>,
@@ -558,7 +572,10 @@ impl WindowWave<'_, '_> {
         Ok(())
     }
     fn synchronize(&self) -> Result<()> {
-        unsafe { self.stream().library.cuda_stream_synchronize(self.stream().raw) }
+        // SAFETY: both streams and their referenced storage belong to this wave.
+        let produced = unsafe { self.stream().library.cuda_stream_synchronize(self.stream().raw) };
+        let committed = unsafe { self.stream().library.cuda_stream_synchronize(self.storage.commit_stream.raw) };
+        produced.and(committed)
     }
     fn prepare(&mut self, state: &WindowState<'_>, chunks: &[WindowChunk]) -> Result<Prepared> {
         ensure!(self.pending_query.is_none(), "cache query production pending");
@@ -604,6 +621,11 @@ impl WindowWave<'_, '_> {
         Ok(p)
     }
     fn upload(&mut self, p: &Prepared) -> Result<()> {
+        // Reuse of this layer's proposal plane follows its last off-stream store.
+        // Keep this after graph selection's at-rest check and outside capture.
+        // SAFETY: events/streams share a device and live through both drains;
+        // CUDA treats an event not yet recorded (the first production) as complete.
+        unsafe { self.stream().library.cuda_stream_wait_event(self.stream().raw, self.committed.raw)?; }
         let bytes = self.staging.bytes_mut();
         for (i, c) in p.chunks.iter().enumerate() {
             for j in 0..c.tokens as usize {
