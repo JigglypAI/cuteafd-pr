@@ -208,7 +208,7 @@ fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
         let mut options = layout::LayoutOptions { host_memory: Some((total << 30, total << 30)),
             full_prefill_logits: true, context_tokens: 1 << 40,
             prefill_unit_rows: Some(4096), ..Default::default() };
-        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        layout::charge_host(&mut report, &options, &input, false).unwrap();
         let host = report.host_ledger.as_ref().unwrap();
         assert_eq!(report.host_budget_bytes, expected << 30);
         assert_eq!(host.host_budget_bytes, report.host_budget_bytes);
@@ -219,15 +219,15 @@ fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
         assert!(host.host_budget_bytes + host.deferred_bytes + host.reserve_bytes <= host.total_bytes);
         assert_eq!(host.shortfall_bytes, 0);
         options.host_memory = Some((total << 30, 8 << 30));
-        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        layout::charge_host(&mut report, &options, &input, false).unwrap();
         assert!(!report.fits);
         assert!(report.host_ledger.as_ref().unwrap().shortfall_bytes > 0);
         assert!(report.hints.iter().any(|h| h.what.contains("coordinator host memory shortfall")));
         options.host_cache_bytes = Some(40 << 30);
-        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        layout::charge_host(&mut report, &options, &input, false).unwrap();
         assert_eq!(report.host_budget_bytes, 40 << 30); // Explicit quota bypasses both caps.
         options.host_cache_bytes = Some(0);
-        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        layout::charge_host(&mut report, &options, &input, false).unwrap();
         assert_eq!(report.host_budget_bytes, 0);
     }
 }
@@ -257,7 +257,7 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
         depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
     // Two endpoints per rank (decode link + one prefill link) over six ranks.
     let expected = endpoint.ring_bytes(geometry, rings).unwrap() as u64 * 2 * 6;
-    layout::charge_host(&mut report, &options, input.checkpoint(), true).unwrap();
+    layout::charge_host(&mut report, &options, &input, true).unwrap();
     let host = report.host_ledger.as_ref().unwrap();
     let registered = host.items.iter().find(|i| i.group == "transport/rdma-rings").unwrap();
     assert_eq!(registered.bytes, expected);
@@ -266,7 +266,7 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
     assert_eq!(intake.bytes, 4096 * geometry.hidden as u64 * 4 * 2 * 6);
     assert_eq!(host.shortfall_bytes, 0);
     report.spark_ranks = 0;
-    layout::charge_host(&mut report, &options, input.checkpoint(), true).unwrap();
+    layout::charge_host(&mut report, &options, &input, true).unwrap();
     assert!(!report.host_ledger.as_ref().unwrap().items.iter()
         .any(|i| matches!(i.group.as_str(), "transport/rdma-rings" | "spark-intake")));
 }
@@ -342,7 +342,7 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
             report.prefill_span_rows = Some(span);
             for family in ["glm5", "glm5_flash"] {
                 report.family = Some(family.into());
-                layout::charge_host(&mut report, &options, input.checkpoint(), native).unwrap();
+                layout::charge_host(&mut report, &options, &input, native).unwrap();
                 assert_eq!(report.prefill_span_rows, Some(span));
                 let host = report.host_ledger.as_ref().unwrap();
                 let bytes = |name: &str| host.items.iter().find(|i| i.group == name).unwrap().bytes;
@@ -1041,13 +1041,13 @@ fn spark_host_layout_requires_explicit_family_unit_even_for_one_wave() {
             report.prefill_span_rows = Some(2048 * waves);
             let mut options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 host_cache_bytes: Some(0), prefill_rows: 4096, prefill_waves: waves, ..Default::default() };
-            let error = layout::charge_host(&mut report, &options, input.checkpoint(), native).unwrap_err();
+            let error = layout::charge_host(&mut report, &options, &input, native).unwrap_err();
             assert!(error.to_string().contains("requires family-resolved prefill_unit_rows"), "{error:#}");
             assert_eq!(report.prefill_span_rows, Some(2048 * waves));
             options.prefill_unit_rows = Some(0);
-            assert!(layout::charge_host(&mut report, &options, input.checkpoint(), native).is_err());
+            assert!(layout::charge_host(&mut report, &options, &input, native).is_err());
             options.prefill_unit_rows = Some(2048);
-            layout::charge_host(&mut report, &options, input.checkpoint(), native).unwrap();
+            layout::charge_host(&mut report, &options, &input, native).unwrap();
             assert_eq!(report.prefill_span_rows, Some(2048 * waves));
         }
     }
@@ -1088,7 +1088,7 @@ fn host_automatic_quota_depends_on_concurrency_not_device_entries() {
             let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 context_tokens: 1 << 20, concurrency, mimo_prefix_entries: entries,
                 prefill_unit_rows: Some(4096), ..Default::default() };
-            layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+            layout::charge_host(&mut report, &options, &input, false).unwrap();
             assert_eq!(report.host_budget_bytes, expected);
         }
     }
@@ -1125,7 +1125,7 @@ fn host_media_quota_is_charged_only_for_supported_loaded_towers() {
         report.encoder = placement(vision);
         report.audio_encoder = placement(audio);
         options.media_cache_bytes = quota;
-        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        layout::charge_host(&mut report, &options, &input, false).unwrap();
         let media: u64 = report.host_ledger.as_ref().unwrap().items.iter()
             .filter(|item| item.group == "media/embedding-cache").map(|item| item.bytes).sum();
         assert_eq!(media, expected);
@@ -1136,7 +1136,7 @@ fn host_media_quota_is_charged_only_for_supported_loaded_towers() {
     for admitted in [None, placement(MediaMode::Off)] {
         report.encoder = admitted.clone();
         report.audio_encoder = admitted;
-        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        layout::charge_host(&mut report, &options, &input, false).unwrap();
         assert!(!report.host_ledger.as_ref().unwrap().items.iter()
             .any(|item| item.group == "media/embedding-cache"));
     }
@@ -1155,7 +1155,7 @@ fn host_full_logits_charge_gather_and_live_lane_but_not_mimo_pipeline() {
     for (family, rows) in [("mimo_v2", 4096u64), ("glm5_flash", 4096), ("glm5", 4096)] {
         report.family = Some(family.into());
         report.prefill_transports = None;
-        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        layout::charge_host(&mut report, &options, &input, false).unwrap();
         let logits = report.host_ledger.as_ref().unwrap().items.iter()
             .find(|item| item.group == "scoring/full-logits").unwrap().bytes;
         assert_eq!(logits, rows * vocab * 4, "{family}");
@@ -2758,7 +2758,7 @@ fn v4_egress_is_exact_registered_host_memory_not_a_gpu_demand() {
                 host_cache_bytes: Some(0), prefill_unit_rows: Some(unit), prefill_waves: waves,
                 workspace_manifest: Some(path.clone()), ..Default::default() };
             report.spark_ranks = 4;
-            layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+            layout::charge_host(&mut report, &options, &input, false).unwrap();
             let egress = report.host_ledger.as_ref().unwrap().items.iter()
                 .find(|i| i.group == "transport/egress").unwrap().bytes;
             let expected = geometry.compact_wire_bytes(unit as u32, false).unwrap().0 as u64 * waves
@@ -2767,7 +2767,7 @@ fn v4_egress_is_exact_registered_host_memory_not_a_gpu_demand() {
             assert_ne!(egress, geometry.compact_wire_bytes(unit as u32, false).unwrap().0 as u64 * waves * 2,
                 "the decode endpoint must not reserve another prefill-sized slot per wave");
             report.spark_ranks = 0;
-            layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+            layout::charge_host(&mut report, &options, &input, false).unwrap();
             assert!(!report.host_ledger.as_ref().unwrap().items.iter().any(|i| i.group == "transport/egress"));
         }
     }

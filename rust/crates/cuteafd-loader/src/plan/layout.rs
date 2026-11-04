@@ -746,7 +746,9 @@ mod draft_prefix_tests {
         use crate::plan::{self, testing, ExpertPlacement, PlanOptions};
         let target = tempfile::tempdir()?;
         testing::write_kimi_snapshot(target.path(), true);
-        let checkpoint = super::super::Checkpoint::open(target.path())?;
+        let input = super::super::PlanInput::open(target.path())?;
+        let checkpoint = input.checkpoint();
+        let model = input.family_model()?;
         let draft = tempfile::tempdir()?;
         let config = serde_json::json!({"architectures":["DFlash2DraftModel"], "hidden_size":7168,
             "intermediate_size":14336, "num_hidden_layers":5, "num_attention_heads":64,
@@ -773,17 +775,17 @@ mod draft_prefix_tests {
                 placement: ExpertPlacement::Sparks { ranks: 6 }, layout: Some(options.clone()),
                 ..Default::default()
             })?;
-            let (base, context, concurrency) = selected_host_geometry(&mut report, &options, &checkpoint)?;
+            let (base, context, concurrency) = selected_host_geometry(&mut report, &options, checkpoint, model)?;
             assert_eq!(context, crate::families::kimi_k3::DEFAULT_CONTEXT as u64);
             assert_eq!(concurrency, 2);
             assert_eq!(base.page_bytes, 24 * 64 * format.record_bytes() as u64);
             options.kimi_drafter_snapshot = Some(draft.path().to_path_buf());
-            let (with_draft, _, _) = selected_host_geometry(&mut report, &options, &checkpoint)?;
+            let (with_draft, _, _) = selected_host_geometry(&mut report, &options, checkpoint, model)?;
             assert_eq!(with_draft.mark_bytes - base.mark_bytes, 4 * 4160 * format.record_bytes() as u64);
             assert_eq!(with_draft.page_bytes, base.page_bytes);
             for context in [262_144, 524_288, 1_048_576] {
                 options.context_tokens = context;
-                let (_, selected, _) = selected_host_geometry(&mut report, &options, &checkpoint)?;
+                let (_, selected, _) = selected_host_geometry(&mut report, &options, checkpoint, model)?;
                 assert_eq!(selected, context);
             }
         }
@@ -1452,12 +1454,12 @@ pub(crate) fn qwen_scratch_bytes(tokens: u64) -> u64 {
 }
 
 /// Resolve the serving representation, not the inventory's target-only defaults.
-fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, checkpoint: &super::Checkpoint)
+fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, checkpoint: &super::Checkpoint,
+    model: &dyn super::FamilyModel)
     -> anyhow::Result<(cuteafd_core::prefix::HostCacheGeometry, u64, u64)> {
     use anyhow::{Context, ensure};
     use crate::serving_capacity::{CacheOptions, KvPlacement};
     let family = super::family::detect(checkpoint).context("missing host cache family")?;
-    let model = family.open(checkpoint)?;
     let id = family.id();
     let policy = ShapePolicy {
         context: if matches!(id, "mimo_v2" | "deepseek_v41") { ContextPolicy::Checkpoint }
@@ -1466,7 +1468,7 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         all_native_stages: id == "deepseek_v4",
     };
     let admitted_rows = report.prefill_span_rows;
-    let shape = Shape::resolve(report, model.as_ref(), &mut options.clone(), policy);
+    let shape = Shape::resolve(report, model, &mut options.clone(), policy);
     report.prefill_span_rows = admitted_rows;
     let ranks = if id == "deepseek_v41" || options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
     let selected = CacheOptions { coordinator_ranks: ranks,
@@ -1508,11 +1510,10 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         mark_bytes = mark_bytes.checked_add(3 * 128 * 528).context("dSpark mark overflow")?;
     }
     let mut context = shape.context_tokens;
+    if options.context_tokens == 0 {
+        context = model.default_context_tokens().unwrap_or(context);
+    }
     if id == "kimi_k3" {
-        if options.context_tokens == 0 {
-            context = crate::families::kimi_k3::default_context(
-                &crate::plan::families::kimi::core_inventory(checkpoint)?) as u64;
-        }
         if let Some(snapshot) = &options.kimi_drafter_snapshot {
             let draft = crate::formats::dflash::MlaDflashConfig::read(snapshot)?;
             let windows = draft.paged_cache_layout(1, usize::try_from(context)?,
@@ -1561,7 +1562,8 @@ pub(crate) fn engram_row_bytes(checkpoint: &super::Checkpoint) -> anyhow::Result
     Ok(bytes)
 }
 
-pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, checkpoint: &super::Checkpoint, native: bool) -> anyhow::Result<()> {
+pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, input: &super::PlanInput, native: bool) -> anyhow::Result<()> {
+    let checkpoint = input.checkpoint();
     use anyhow::{Context, ensure};
     use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
     use cuteafd_core::memory_layout::{HostLayout, ItemLifetime, host_logits_bytes};
@@ -1792,7 +1794,8 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         && report.attention_placement == crate::placement::AttentionPlacement::Heads;
     let family = family.to_owned();
     let cache = if options.mimo_prefix_entries == 0 || tier_disabled || options.host_cache_bytes == Some(0) { 0 } else {
-        let resolved = selected_host_geometry(report, options, checkpoint).and_then(|(geometry, context, concurrency)| {
+        let resolved = input.family_model().map_err(anyhow::Error::from).and_then(|model|
+            selected_host_geometry(report, options, checkpoint, model)).and_then(|(geometry, context, concurrency)| {
             let chunk = geometry.chunk_bytes();
             let bytes = geometry.resolve(options.host_cache_bytes, context, concurrency, total, chunk)
                 .with_context(|| format!("invalid host snapshot geometry {geometry:?}, context {context}, concurrency {concurrency}"))?;

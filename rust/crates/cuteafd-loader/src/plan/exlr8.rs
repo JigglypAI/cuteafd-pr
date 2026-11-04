@@ -252,7 +252,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     report.solver_placement = Some(placement);
     {
         let _timer = super::PhaseTimer::new(&input.phases.admission, &[]);
-        super::layout::charge_host(&mut report, layout, checkpoint, true)?;
+        super::layout::charge_host(&mut report, layout, input, true)?;
     }
     Ok(NativePlan { report, selection: NativeSelection { manifest: selected.into(), set_id }, sparks: SparkRequirements { resident_bytes_per_rank: residents,
         k1_workspace: "checked_by_worker_live_admission" } })

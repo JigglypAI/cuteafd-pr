@@ -205,6 +205,10 @@ impl V41Exl3Manifest {
                 (true, index, self.experts.draft_experts)
             }
         };
+        ensure!((1..=1024).contains(&experts), "EXL3 supports 1..1024 routed experts");
+        if balanced && self.experts.intermediate / 128 % world != 0 {
+            ensure!(!draft, "compact EXL3 draft placement is not qualified");
+        }
         let projections = (0..experts).flat_map(|expert| [V41Exl3ProjectionKind::Gate,
             V41Exl3ProjectionKind::Up, V41Exl3ProjectionKind::Down].map(move |kind| (expert, kind)))
             .map(|(expert, kind)| {
@@ -509,6 +513,32 @@ mod tests {
             let layer = V41Exl3Layer::Backbone(0);
             assert_eq!(manifest.resident_arena_bytes(layer, 1, 0, false)?,
                 manifest.residency(layer, 1, 0)?.device_arena_layout()?.1 as u64);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn memoized_arena_bytes_preserve_draft_and_expert_validation() -> Result<()> {
+        let mut manifest = fixture_geometry(&[2, 3], 5120, 2304, 16);
+        manifest.experts.draft_stages = 1;
+        manifest.experts.draft_experts = 16;
+        let draft = manifest.projections.values().cloned().map(|mut projection| {
+            projection.name = projection.name.replacen("layers.", "mtp.", 1);
+            (projection.name.clone(), projection)
+        }).collect::<Vec<_>>();
+        manifest.projections.extend(draft);
+        manifest.resident_arena_bytes(V41Exl3Layer::Backbone(0), 4, 0, true)?;
+        let layer = V41Exl3Layer::Dspark(0);
+        assert!(manifest.balanced_residency(layer, 4, 0).unwrap_err().to_string().contains("draft placement"));
+        assert!(manifest.resident_arena_bytes(layer, 4, 0, true).unwrap_err().to_string().contains("draft placement"));
+        assert_eq!(manifest.resident_arena_bytes(layer, 2, 0, true)?,
+            manifest.balanced_residency(layer, 2, 0)?.device_arena_layout()?.1 as u64);
+        for experts in [0, 1025] {
+            manifest.experts.draft_experts = experts;
+            assert!(manifest.resident_arena_bytes(layer, 2, 0, true).unwrap_err().to_string().contains("1..1024"));
+            manifest.experts.experts = experts;
+            assert!(manifest.resident_arena_bytes(V41Exl3Layer::Backbone(0), 2, 0, false)
+                .unwrap_err().to_string().contains("1..1024"));
         }
         Ok(())
     }

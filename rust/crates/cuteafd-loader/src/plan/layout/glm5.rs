@@ -746,7 +746,7 @@ mod tests {
                 native.spark_ranks = sparks;
                 native.memory_layout = Some(native_layout(input.checkpoint(), &options,
                     &vec![256; gpus], 256, sparks, &manifest, None).unwrap().0);
-                charge_host(&mut native, &options, input.checkpoint(), true).unwrap();
+                charge_host(&mut native, &options, &input, true).unwrap();
                 let geometry = |r: &PlanReport| (r.prefill_unit_rows, r.prefill_waves,
                     r.prefill_span_rows, r.prefill_transports);
                 // Unpinned, the fixed depth (3 x 2752 with Sparks, one unit

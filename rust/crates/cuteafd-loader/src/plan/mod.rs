@@ -623,6 +623,17 @@ impl PlanInput {
         Ok(Some(total))
     }
 
+    pub(crate) fn family_model(&self) -> Result<&dyn FamilyModel, ConfigError> {
+        let family = family::detect(&self.checkpoint).ok_or_else(|| ConfigError("missing model family".into()))?;
+        match self.model.get_or_init(|| family.open(&self.checkpoint).and_then(|mut model| {
+            model.configure()?;
+            Ok(model)
+        })) {
+            Ok(model) => Ok(model.as_ref()),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
     /// The plan for `options` over this checkpoint.
     pub fn plan(&self, options: &PlanOptions) -> Result<PlanReport, PlanError> {
         self.plan_with_timings(options).0
@@ -957,10 +968,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             crate::media::ImageFamily::Mistral).ok().map(|config| config.max_image_tokens);
     }
     report.runtime = Some(family.runtime());
-    let model = match input.model.get_or_init(|| family.open(checkpoint).and_then(|mut model| {
-        model.configure()?;
-        Ok(model)
-    })) {
+    let model = match input.family_model() {
         Ok(model) => model,
         Err(error) => {
             report.hints.push(Hint {
@@ -1019,7 +1027,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             .filter(|shard| !needed.contains(*shard)).cloned().collect();
         report.missing_shards.retain(|shard| needed.contains(shard));
     }
-    match crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config) {
+    match crate::serving_capacity::cache_requirements(model, &checkpoint.config) {
         Ok(requirements) => report.cache_requirements = requirements,
         Err(error) => report.hints.push(Hint {
             what: format!("cache capacity cannot be described: {error}"),
@@ -1028,7 +1036,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         }),
     }
 
-    let census = input.census.get_or_init(|| report_census(checkpoint, family, model.as_ref(), modelopt));
+    let census = input.census.get_or_init(|| report_census(checkpoint, family, model, modelopt));
     report.unclassified = census.unclassified.clone();
     let ReportCensus { mapped_names, scales, scale_bytes, table_bytes, .. } = *census;
     let host_budget = if scales == 0 && table_bytes == 0 { 0 } else {
@@ -1099,12 +1107,12 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             rejections,
         });
     }
-    place(&mut report, options, spec, model.as_ref(), &census.routed_operands);
+    place(&mut report, options, spec, model, &census.routed_operands);
     if let Some(layout_options) = &options.layout {
         let mut layout_options = layout_options.clone();
         if !ownership.uses_checkpoint() { layout_options.native_mtp_layers = 0; }
         layout_options.weight_budget_bytes = options.coordinator_budget_bytes;
-        let mut memory = family_layout(model.as_ref(), input, &mut report, &mut layout_options, options.placement)?;
+        let mut memory = family_layout(model, input, &mut report, &mut layout_options, options.placement)?;
         report.prefill_unit_rows = layout_options.prefill_unit_rows;
         report.prefill_waves = Some(layout_options.prefill_waves);
         if family.id() == "deepseek_v41" && !memory.devices.is_empty() {
@@ -1147,7 +1155,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         }
         let refused = !report.placement_supported && memory.devices.is_empty();
         report.memory_layout = Some(memory);
-        if !refused { layout::charge_host(&mut report, &layout_options, checkpoint, false)?; }
+        if !refused { layout::charge_host(&mut report, &layout_options, input, false)?; }
     }
     if !report.unclassified.is_empty() {
         report.hints.push(Hint {
@@ -1172,7 +1180,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             spark_allocation_budget_bytes: Some(options.spark_budget()), glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
             weight_budget_bytes: options.coordinator_budget_bytes, ..Default::default() };
-        let _ = family_layout(model.as_ref(), input, &mut report, &mut inventory, options.placement)?;
+        let _ = family_layout(model, input, &mut report, &mut inventory, options.placement)?;
         report.prefill_unit_rows = inventory.prefill_unit_rows;
         report.prefill_waves = Some(inventory.prefill_waves);
     }
