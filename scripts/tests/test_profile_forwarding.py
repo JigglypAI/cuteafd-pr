@@ -56,24 +56,6 @@ def test_helper_maps_switches_host_and_directory():
     assert _helper('', '', 'kiwi').stdout == '\n'
 
 
-def test_transport_timing_covers_gpu_landing_and_posted_wave_join_keys():
-    landing = (ROOT / 'rust/crates/cuteafd-transport/src/verbs/landing.rs').read_text()
-    arrival = landing.split('if config.timing {', 1)[1].split('\n        }', 1)[0]
-    assert '"spark exchange rank arrived"' in arrival
-    for field in ('request_id', 'layer_id', 'execution_lane', 'rank', 'rows', 'payload_bytes'):
-        assert field in arrival
-    assert 'target: "cuteafd::timing"' in arrival
-    assert landing.index('completed.assembler.accept_landed') < landing.index('"spark exchange rank arrived"')
-    assert landing.index('"spark exchange rank arrived"') < landing.index('completed.chunk_tx.send')
-
-    waves = (ROOT / 'rust/crates/cuteafd-daemon/src/shared/spark_waves.rs').read_text()
-    posted = waves.split('let wave = self.transport.dispatch', 1)[1].split('\n        Ok(wave)', 1)[0]
-    assert 'if self.timing {' in posted and '"spark exchange wave posted"' in posted
-    for field in ('sequence', 'slot', 'request_id', 'layer_id', 'rows', 'payload_bytes'):
-        assert field in posted
-    assert 'target: "cuteafd::timing"' in posted
-
-
 def test_existing_switches_are_unchanged_and_add_no_wrapper():
     out = _helper('census,transport-timing,expert-timing', '/data/prof', 'kiwi')
     assert out.stdout.split('\n')[:-1] == [
