@@ -1176,7 +1176,7 @@ fn transport_census_observes_native_pinned_recycle_queue_without_consuming_it() 
     let (bytes_tx, _bytes_rx) = mpsc::channel();
     let (pinned_tx, pinned_rx) = mpsc::channel();
     let payload = VerbsHostProtocolV2ResponsePayload::from_response_frame(
-        VerbsHostProtocolV2ResponseFrame::Pinned(frame), 16, 128, bytes_tx, pinned_tx)?;
+        VerbsHostProtocolV2ResponseFrame::Pinned(frame), 16, 128, bytes_tx, pinned_tx.clone())?;
     let before = fixture.events()?;
     let mut held = payload.allocation_census("held");
     held.resolve_recycled_frames();
