@@ -1163,9 +1163,14 @@ pub(super) mod tests {
 
     #[test]
     fn tp1_four_onboard_draft_marks_match_omitted_zero_and_exact_positive_charges() -> Result<()> {
-        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let fixture = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_kimi_core_snapshot(fixture.path(), false);
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open(fixture.path())?;
+        let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
+        let core = cuteafd_loader::plan::families::kimi::core_inventory(&checkpoint)?;
         for marks in [0, 1, 2] {
             let mut i = inputs_for_ranks::<1>(&cfg);
+            i.core = core.clone();
             i.cache_format = cuteafd_core::MlaCacheFormat::Fp8;
             i.rows = 2048; i.waves = 2; i.unit_rows = Some(1024); i.lanes = 1;
             i.state_slots = 2; i.prefix_marks = marks; i.requested_pool = Some(16384);
