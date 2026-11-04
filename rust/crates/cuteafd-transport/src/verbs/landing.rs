@@ -141,6 +141,14 @@ impl VerbsHostProtocolV2PersistentClientSession {
         let mut completed = pending.pop_front()
             .context("persistent verbs-host response arrived without a pending request")?;
         completed.assembler.accept_landed(&completed.request, &header)?;
+        if config.timing {
+            // This is host-observed CQ readiness, not the NIC's wire timestamp.
+            tracing::info!(target: "cuteafd::timing", request_id = header.request_id,
+                layer_id = header.layer_id, execution_lane = self.execution_lane,
+                rank = completed.stream_id, rows = header.row_count,
+                payload_bytes = header.output_payload_bytes, landing = "device",
+                "spark exchange rank arrived");
+        }
         completed.chunk_tx.send(VerbsHostProtocolV2ResponseChunk {
             stream_id: completed.stream_id,
             header,

@@ -782,7 +782,13 @@ impl<T: Transport> Backend for Native<T> {
         ensure!(request.header.row_count as usize == job.rows, "wave request rows differ from admission");
         let slices = (self.placed && self.landing != 0).then(|| vec![cuteafd_transport::LandingSlice {
             offset: job.slice.0, bytes: payload_bytes }; self.ranks]);
-        self.transport.dispatch(&request, slices.as_deref())
+        let wave = self.transport.dispatch(&request, slices.as_deref())?;
+        if self.timing {
+            tracing::info!(target: "cuteafd::timing", sequence = job.sequence, slot = job.slot,
+                rows = job.rows, request_id = request.header.request_id, layer_id = request.header.layer_id,
+                payload_bytes, "spark exchange wave posted");
+        }
+        Ok(wave)
     }
 
     fn payload_bytes(&self, slot: usize, _admitted: usize) -> usize { self.reply_payloads[slot] }
