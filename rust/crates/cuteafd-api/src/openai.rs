@@ -1814,8 +1814,9 @@ mod tests {
                 assert!(profile.encoding.supports_thinking_off());
                 let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
                     std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
-                let body = json!({"model":"muse-test", "messages":[{"role":"user","content":"Hi"}],
-                    "thinking":thinking, "max_tokens":8, "stream":streaming, "stream_options":{"include_usage":true}});
+                let mut body = json!({"model":"muse-test", "messages":[{"role":"user","content":"Hi"}],
+                    "thinking":thinking, "max_tokens":8, "stream":streaming});
+                if streaming { body["stream_options"] = json!({"include_usage":true}); }
                 let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
                     .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
                 assert_eq!(response.status(), StatusCode::OK);
