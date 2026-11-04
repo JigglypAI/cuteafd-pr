@@ -1648,11 +1648,22 @@ fn placement_input_source_hashes(root: &std::path::Path) -> anyhow::Result<Value
     use sha2::{Digest, Sha256};
     let mut files = v4_placement_source_hashes(root)?;
     let mut paths = ["scripts/build/export-placement-inputs.py", "scripts/build/release-scope.py",
-        "scripts/lib/wip_aot_scopes.py", "benchmarks/current-matrix.json"].map(|path| root.join(path)).to_vec();
+        "scripts/lib/wip_aot_scopes.py"].map(|path| root.join(path)).to_vec();
+    let matrix: Value = serde_json::from_slice(&fs::read(root.join("benchmarks/current-matrix.json"))?)?;
+    let retired = matrix["retired"].as_array().ok_or_else(|| anyhow::anyhow!("missing retired config list"))?
+        .iter().filter_map(|entry| entry["config"].as_str()).collect::<std::collections::BTreeSet<_>>();
+    let mut live = Vec::new();
     for entry in fs::read_dir(root.join("examples/configs"))? {
         let path = entry?.path();
-        if path.extension().is_some_and(|extension| extension == "config") { paths.push(path); }
+        if path.extension().is_some_and(|extension| extension == "config") {
+            let relative = path.strip_prefix(root)?.to_string_lossy().into_owned();
+            if !retired.contains(relative.as_str()) { live.push(relative); }
+            paths.push(path);
+        }
     }
+    live.sort();
+    files.as_object_mut().unwrap().insert("installed_live_configs".into(),
+        Value::String(format!("{:x}", Sha256::digest(live.join("\n").as_bytes()))));
     for path in paths {
         files.as_object_mut().unwrap().insert(path.strip_prefix(root)?.to_string_lossy().into_owned(),
             Value::String(format!("{:x}", Sha256::digest(fs::read(path)?))));

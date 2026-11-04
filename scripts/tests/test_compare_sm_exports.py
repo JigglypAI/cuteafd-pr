@@ -1345,7 +1345,12 @@ def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, 
         lock = json.loads((ROOT / 'third_party/sparkinfer.lock.json').read_text())
         (output / 'comparison-context.json').write_text(json.dumps({
             'cuda_initialized': mismatch == 'worker', 'sparkinfer_revision': lock['revision'],
-            'source_tree_sha256': lock['source_tree_sha256']}))
+            'source_tree_sha256': lock['source_tree_sha256'], 'sms': 188, 'capability': [12, 0],
+            'exporter': payload['exporter'], 'args': payload['args'],
+            'exporter_sha256': publisher.compare.sha((ROOT / 'python/tools/aot' / payload['exporter']).read_bytes()),
+            'comparison_script_sha256': publisher.compare.sha((ROOT / 'scripts/build/compare-sm-exports.py').read_bytes()),
+            'export_sources_sha256': {str(path.relative_to(ROOT)): publisher.compare.sha(path.read_bytes())
+                for path in sorted((ROOT / 'python/tools/aot').glob('*.py'))}}))
         if payload['exporter'] == 'package_exl3_aot.py':
             directory = output / 'rtx-tp2/m2752'
             directory.mkdir(parents=True)
@@ -1385,6 +1390,21 @@ def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, 
     for path, checksum in metadata['files'].items():
         assert publisher.compare.sha((target / path).read_bytes()) == checksum
     assert not list(target.rglob('*.o'))
+    reused = tmp_path / 'republished'
+    publisher.publish(reused, staging, 1, 1, target)
+    assert len(calls) == 3  # Re-publication never invokes a compiler.
+    assert json.loads((reused / 'INPUTS.json').read_text())['files'] == metadata['files']
+    context = staging / 'programs/comparison-context.json'
+    original = context.read_text()
+    invalid = json.loads(original)
+    invalid['args'] = ['wrong-selection']
+    context.write_text(json.dumps(invalid))
+    with pytest.raises(ValueError, match='worker provenance mismatch'):
+        publisher.publish(tmp_path / 'bad-worker', staging, 1, 1, target)
+    context.write_text(original)
+    (staging / 'programs/dsv4_programs.json').write_text('{"tampered":true}')
+    with pytest.raises(ValueError, match='output checksum mismatch'):
+        publisher.publish(tmp_path / 'bad-output', staging, 1, 1, target)
     with pytest.raises(ValueError, match='not empty'):
         publisher.publish(target, tmp_path / 'other-staging', 1, 1)
 
@@ -1404,3 +1424,17 @@ def test_installed_placement_export_jobs_cover_live_native_families_and_packages
             'step5', 'kimik3', 'exlr8', 'exlr8_dense', 'dense_trellis_k6'} <= geometry
     assert args[args.index('--exlr8-role') + 1] == 'coordinator'
     assert len(names) == len(jobs)
+
+
+def test_placement_selection_ignores_card_publication_but_tracks_retirement(tmp_path):
+    publisher = compare_sm.load_file('test_live_placement_selection', ROOT / 'scripts/build/export-placement-inputs.py')
+    (tmp_path / 'examples/configs').mkdir(parents=True)
+    (tmp_path / 'benchmarks').mkdir()
+    (tmp_path / 'examples/configs/live.config').write_text('MODEL_ID=test/live\nMODEL_REVISION=pinned\n')
+    matrix = tmp_path / 'benchmarks/current-matrix.json'
+    matrix.write_text(json.dumps({'retired': [], 'cells': [{'report': 'old'}]}))
+    before = publisher.live_configs(tmp_path)
+    matrix.write_text(json.dumps({'retired': [], 'cells': [{'report': 'new', 'status': 'current'}]}))
+    assert publisher.live_configs(tmp_path) == before
+    matrix.write_text(json.dumps({'retired': [{'config': 'examples/configs/live.config'}], 'cells': []}))
+    assert publisher.live_configs(tmp_path) == []
