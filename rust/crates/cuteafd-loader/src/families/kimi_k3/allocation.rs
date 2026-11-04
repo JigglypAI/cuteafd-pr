@@ -354,7 +354,12 @@ pub fn io_extents_for_ranks(vocab: usize, rank: usize, rows: usize, core_head: b
 /// slots of `shape.unit_rows` each.
 pub fn spark_demand(shape: crate::serving_capacity::PrefillShape, lane: usize, ranks: usize,
     format: cuteafd_core::SparkReplyFormat) -> Result<Demand> {
-    Ok(Demand::new(1, Category::Workspace, format!("Kimi Spark lane {lane} latent intake"),
+    spark_demand_on(shape, lane, ranks, 1, format)
+}
+
+pub fn spark_demand_on(shape: crate::serving_capacity::PrefillShape, lane: usize, ranks: usize,
+    owner: u8, format: cuteafd_core::SparkReplyFormat) -> Result<Demand> {
+    Ok(Demand::new(owner, Category::Workspace, format!("Kimi Spark lane {lane} latent intake"),
         crate::serving_capacity::prefill_return_bytes_with_format(shape.waves, shape.unit_rows, ranks as u64, 3584, format)?, Basis::Exact))
 }
 
@@ -380,33 +385,50 @@ pub fn exchange_demand(rows: usize, rank: u8, progress: usize) -> Result<Demand>
 }
 
 pub fn code_demand(rank: usize, pending: u64, cublas_bytes: u64, lanes: usize) -> Result<Demand> {
-    ensure!(rank < 2 && (1..=2).contains(&lanes), "Kimi code allowance rank/lane geometry");
-    let bytes = pending.checked_add(if rank == 1 { lanes as u64 * cublas_bytes } else { 0 })
+    code_demand_for_ranks(rank, pending, cublas_bytes, lanes, 2)
+}
+
+pub fn code_demand_for_ranks(rank: usize, pending: u64, cublas_bytes: u64, lanes: usize,
+    ranks: usize) -> Result<Demand> {
+    ensure!(matches!(ranks, 1 | 2) && rank < ranks && (1..=2).contains(&lanes),
+        "Kimi code allowance physical rank/lane geometry");
+    let bytes = pending.checked_add(if rank == ranks - 1 { lanes as u64 * cublas_bytes } else { 0 })
         .context("Kimi future code/handle allowance overflow")?;
     Ok(Demand::new(rank as u8, Category::Workspace, "Kimi future loaded code and private head handles", bytes, Basis::Formula))
 }
 
-/// Exact FirstCapacity TP2 owner, using the shared EXL3 capacity arenas. A
-/// TP2 FFN completes inside one unit's hook: `rows` is the unit.
+/// Exact FirstCapacity owner, using the shared EXL3 capacity arenas.
 pub fn expert_workspace(package: &std::path::Path, rows: usize) -> Result<u64> {
+    expert_workspace_for_ranks(package, rows, 2)
+}
+
+pub fn expert_workspace_for_ranks(package: &std::path::Path, rows: usize, ranks: usize) -> Result<u64> {
+    ensure!(matches!(ranks, 1 | 2), "Kimi expert workspace physical rank count");
     let capacities = cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
         .capacities(rows)?;
     let manifests = capacities.into_iter().map(|capacity| -> Result<serde_json::Value> {
         let path = package.join(format!("m{capacity}/v41_exl3.json"));
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)
             .with_context(|| format!("read {}", path.display()))?)?;
-        ensure!(manifest["hidden"] == 3584 && manifest["capacity"] == capacity,
-            "Kimi TP2 expert workspace geometry/capacity mismatch");
+        ensure!(manifest["hidden"] == 3584 && manifest["intermediate"] == 3072 / ranks
+            && manifest["experts"] == 896 && manifest["top_k"] == 16
+            && manifest["capacity"] == capacity && manifest["output_dtype"] == "fp32",
+            "Kimi expert workspace geometry/capacity mismatch");
         Ok(manifest)
     }).collect::<Result<Vec<_>>>()?;
     Ok(crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)? + (rows * 3584 * 4) as u64)
 }
 
 pub fn expert_package(manifest: &std::path::Path) -> Result<std::path::PathBuf> {
+    expert_package_for_ranks(manifest, 2)
+}
+
+pub fn expert_package_for_ranks(manifest: &std::path::Path, ranks: usize) -> Result<std::path::PathBuf> {
+    ensure!(matches!(ranks, 1 | 2), "Kimi expert package physical rank count");
     let parent = manifest.parent().context("Kimi manifest has no parent")?;
-    [parent.join("exl3/exl3-kimik3-k23/rtx-tp2"),
-        parent.join("../lib/exl3/exl3-kimik3-k23/rtx-tp2")].into_iter()
-        .find(|path| path.is_dir()).context("Kimi installed TP2 expert workspace manifests missing")
+    let role = format!("exl3/exl3-kimik3-k23/rtx-tp{ranks}");
+    [parent.join(&role), parent.join("../lib").join(&role)].into_iter()
+        .find(|path| path.is_dir()).context("Kimi installed expert workspace manifests missing")
 }
 
 /// Lane row planes plus `shape.waves` return slots of `shape.unit_rows` each.
@@ -414,25 +436,37 @@ pub fn baseline_demands(cfg: &KimiK3Config, manifest: &serde_json::Value,
     rows: usize, shape: crate::serving_capacity::PrefillShape, context: usize, slots: usize, verify: usize,
     core: &super::core::CoreInventory, heads: bool, ranks: usize,
     format: cuteafd_core::SparkReplyFormat) -> Result<Vec<Demand>> {
+    baseline_demands_for_ranks(cfg, manifest, rows, shape, context, slots, verify, core, heads, ranks, 2, format)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn baseline_demands_for_ranks(cfg: &KimiK3Config, manifest: &serde_json::Value,
+    rows: usize, shape: crate::serving_capacity::PrefillShape, context: usize, slots: usize, verify: usize,
+    core: &super::core::CoreInventory, heads: bool, spark_ranks: usize, physical_ranks: usize,
+    format: cuteafd_core::SparkReplyFormat) -> Result<Vec<Demand>> {
+    ensure!(matches!(physical_ranks, 1 | 2), "Kimi baseline physical owner count");
     let shape = shape.validate()?;
     let unit = usize::try_from(shape.unit_rows)?;
     prefill_shape_with(rows, usize::try_from(shape.waves)?, Some(unit))?;
-    let layout = NativeLaneLayout::new(cfg, rows, unit, context, NativeScratch::from_manifest(manifest)?)?;
+    let layout = NativeLaneLayout::for_ranks(cfg, rows, unit, context,
+        NativeScratch::from_manifest_for_ranks(manifest, physical_ranks)?, physical_ranks)?;
     let owners = crate::placement::attention::alternating_owners(
         cfg.attention.iter().map(|kind| (*kind == KimiAttention::Mla, None)), 0)?;
-    let graphs = graphs(cfg, 1, unit, slots, verify, |rank, layer| cfg.attention[layer] == KimiAttention::Kda
-        || heads || rank == usize::from(owners[layer]))?;
-    let mut demands = vec![spark_demand(shape, 0, ranks, format)?];
-    for rank in 0..2 {
+    let graphs = graphs_for_ranks(cfg, 1, unit, slots, verify, physical_ranks,
+        |rank, layer| physical_ranks == 1 || cfg.attention[layer] == KimiAttention::Kda
+            || heads || rank == usize::from(owners[layer]))?;
+    let mut demands = vec![spark_demand_on(shape, 0, spark_ranks, (physical_ranks - 1) as u8, format)?];
+    for rank in 0..physical_ranks {
         demands.push(Demand::new(rank as u8, Category::Workspace, "Kimi lane 0 native operands",
             layout.bytes()? as u64, Basis::Exact));
         demands.push(Demand::new(rank as u8, Category::Workspace, "Kimi lane 0 token IO",
-            io_extents(cfg.vocab_size, rank, rows, core.get_weight("language_model.lm_head").is_some())
+            io_extents_for_ranks(cfg.vocab_size, rank, rows, core.get_weight("language_model.lm_head").is_some(), physical_ranks)?
                 .into_iter().sum::<usize>() as u64, Basis::Exact));
         demands.push(graph_demand(&graphs, rank));
-        demands.push(exchange_demand(unit, rank as u8, 0)?);
+        if physical_ranks == 2 { demands.push(exchange_demand(unit, rank as u8, 0)?); }
         // Active state and retained marks are charged by the caller's mark policy.
-        demands.extend(kda_demands(cfg, slots, 1, 1, rank as u8)?.into_iter()
+        demands.extend(kda_demands_for_heads(cfg.kda_layers(), slots, 1, 1, rank as u8,
+            cfg.kda_heads / physical_ranks)?.into_iter()
             .filter(|d| d.category == Category::Workspace));
     }
     Ok(demands)
@@ -444,6 +478,84 @@ mod tests {
 
     fn cfg() -> KimiK3Config {
         KimiK3Config::from_hf(&crate::plan::testing::kimi_k3_config()).unwrap()
+    }
+
+    #[test]
+    fn expert_packages_match_actual_owner_width_and_shared_capacity_census() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let manifest = root.path().join("PROGRAMS.json");
+        let capacities = cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
+            .capacities(128)?;
+        for ranks in [1, 2] {
+            let package = root.path().join(format!("exl3/exl3-kimik3-k23/rtx-tp{ranks}"));
+            let mut inventory = Vec::new();
+            for &capacity in &capacities {
+                let directory = package.join(format!("m{capacity}"));
+                std::fs::create_dir_all(&directory)?;
+                let value = serde_json::json!({"hidden": 3584, "intermediate": 3072 / ranks,
+                    "experts": 896, "top_k": 16, "capacity": capacity, "output_dtype": "fp32",
+                    "input_format": "e4m3_k32", "trellis_lut": {"bytes": 32}, "buffers": {
+                        "scratch": {"allocation": "scratch", "bytes": capacity * 64 * ranks,
+                            "dtype": "f32", "zero_on_create": false},
+                        "state": {"allocation": "state", "bytes": 16,
+                            "dtype": "i32", "zero_on_create": true}}});
+                std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&value)?)?;
+                inventory.push(value);
+            }
+            assert_eq!(expert_package_for_ranks(&manifest, ranks)?, package);
+            assert_eq!(expert_workspace_for_ranks(&package, 128, ranks)?,
+                crate::serving_capacity::exl3_workspace_bytes(&inventory, true, Exl3Epilogue::Sum)? + 128 * 3584 * 4);
+            assert!(expert_workspace_for_ranks(&package, 128, 3 - ranks).is_err());
+            if ranks == 2 {
+                assert_eq!(expert_package(&manifest)?, package);
+                assert_eq!(expert_workspace(&package, 128)?, expert_workspace_for_ranks(&package, 128, ranks)?);
+            }
+        }
+        assert!(expert_package_for_ranks(&manifest, 0).is_err());
+        assert!(expert_workspace_for_ranks(root.path(), 128, 3).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn single_owner_baseline_charges_full_state_io_and_no_peer_controls() -> Result<()> {
+        let cfg = cfg();
+        let mut programs = Vec::new();
+        let mut add = |name: String, bytes| programs.push(serde_json::json!({
+            "name": name, "scratch_bytes_at_capacity": {"scratch": bytes}}));
+        for (prefix, bytes) in [("kimik3_kda", 1024), ("kda_fused_h96", 2048)] {
+            for rows in [64, 4096] { add(format!("{prefix}_m{rows}"), bytes); }
+        }
+        for suffix in ["", "_h96"] {
+            for (mode, rows) in [("decode", 64), ("verify", 64), ("extend", 4096)] {
+                for name in [format!("kimik3_mla_producer{suffix}_m{rows}"),
+                    format!("kimik3_dense_mla_{mode}{suffix}_m{rows}"),
+                    format!("kimik3_mla_output{suffix}_m{rows}")] { add(name, 512); }
+            }
+        }
+        let manifest = serde_json::json!({"programs": programs});
+        let shape = prefill_shape_with(8256, 3, Some(2752))?;
+        let core = super::super::core::CoreInventory::default();
+        let single = baseline_demands_for_ranks(&cfg, &manifest, 8256, shape, 262144, 16, 8,
+            &core, false, 6, 1)?;
+        let pair = baseline_demands(&cfg, &manifest, 8256, shape, 262144, 16, 8, &core, false, 6)?;
+        assert!(single.iter().all(|d| d.gpu == 0));
+        assert!(!single.iter().any(|d| d.group == "Kimi peer/abort/hop controls"));
+        assert_eq!(pair.iter().filter(|d| d.group == "Kimi peer/abort/hop controls").count(), 2);
+        let bytes = |demands: &[Demand], group: &str| demands.iter().filter(|d| d.group == group)
+            .map(|d| d.bytes).sum::<u64>();
+        for group in ["Kimi lane 0 token IO", "Kimi KDA replay", "Kimi Spark lane 0 latent intake"] {
+            assert_eq!(bytes(&single, group), bytes(&pair, group), "{group}");
+        }
+        let lane = NativeLaneLayout::for_ranks(&cfg, 8256, 2752, 262144,
+            NativeScratch::from_manifest_for_ranks(&manifest, 1)?, 1)?;
+        assert_eq!(bytes(&single, "Kimi lane 0 native operands"), lane.bytes()? as u64);
+        assert_eq!(code_demand_for_ranks(0, 100, 200, 2, 1)?.bytes, 500);
+        assert_eq!(code_demand(0, 100, 200, 2)?.bytes, 100);
+        assert_eq!(code_demand(1, 100, 200, 2)?.bytes, 500);
+        assert!(code_demand_for_ranks(1, 0, 0, 1, 1).is_err());
+        assert!(baseline_demands_for_ranks(&cfg, &manifest, 8256, shape, 262144, 16, 8,
+            &core, false, 6, 0).is_err());
+        Ok(())
     }
 
     #[test]
