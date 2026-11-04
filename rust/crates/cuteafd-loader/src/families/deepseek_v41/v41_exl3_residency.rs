@@ -662,7 +662,7 @@ pub(super) mod tests {
         fixture_geometry(tiers, 5120, 2304, 384)
     }
 
-    pub(super) fn fixture_geometry(tiers: &[usize], hidden: usize, intermediate: usize, experts: usize) -> V41Exl3Manifest {
+    pub(crate) fn fixture_geometry(tiers: &[usize], hidden: usize, intermediate: usize, experts: usize) -> V41Exl3Manifest {
         let config = OfficialV41Config::from_json(include_bytes!("official-v41-config.json")).unwrap();
         let mut shape = crate::RoutedExpertShape::of_v41(&config);
         shape.hidden = hidden;
