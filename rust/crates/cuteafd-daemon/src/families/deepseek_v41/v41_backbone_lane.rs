@@ -780,12 +780,23 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         &mut self, sinks: &[CuteafdDeviceBuffer], selections: &[Option<CuteafdDeviceBuffer>],
         aligned: bool,
     ) -> Result<()> {
+        self.capture_startup_kind(sinks, selections, aligned, true)
+    }
+    /// Prefill keeps its own sparse arithmetic eager: decode reduction recipes
+    /// are not prefill recipes. Query/router still retain sealed exact rows.
+    pub(crate) fn capture_startup_prefill(&mut self) -> Result<()> {
+        self.capture_startup_kind(&[], &[], false, false)
+    }
+    fn capture_startup_kind(
+        &mut self, sinks: &[CuteafdDeviceBuffer], selections: &[Option<CuteafdDeviceBuffer>],
+        aligned: bool, decode: bool,
+    ) -> Result<()> {
         ensure!(self.phase == Phase::Idle && !self.window.is_windowed()
             && self.dual_sparse.is_none() && self.tp2_query.is_none() && self.tp2_output.is_none()
             && !self.weights.split_query_b && !self.weights.split_output_b,
             "startup prototype requires idle unsplit target lanes");
         let rows = cuteafd_core::V41_VERIFY_ROWS;
-        ensure!(self.capacity >= rows && sinks.len() == 40 && selections.len() == 40,
+        ensure!(self.capacity >= rows && (!decode || (sinks.len() == 40 && selections.len() == 40)),
             "startup target capacity or bindings differ");
         let device = self.block.inputs()[0].device_id;
         let layers: Vec<usize> = self.weights.layers.iter().enumerate()
@@ -793,12 +804,12 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         let keys: Vec<(usize, u32)> = layers.iter().flat_map(|&layer|
             (1..=rows).map(move |rows| (layer, rows as u32))).collect();
         let original = self.layer;
-        self.set_attention_decode(true);
+        self.set_attention_decode(decode);
         let result = (|| -> Result<()> {
             self.query.declare_startup(&keys)?;
             self.router.declare_startup(&keys)?;
             let mut sparse_keys = Vec::with_capacity(keys.len());
-            for &layer in &layers {
+            for &layer in layers.iter().filter(|_| decode) {
                 self.rebind_startup(layer)?;
                 let tail = StartupAttentionTail { projection: &mut self.projection, block: &mut self.block };
                 let sparse = self.sparse.as_ref().context("startup sparse owner absent")?;
@@ -812,6 +823,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
                 for rows in 1..=rows {
                     self.query.capture_startup(rows as u32)?;
                     self.router.capture_startup(rows as u32)?;
+                    if !decode { continue; }
                     // SAFETY: only host phase is armed; sparse capture records
                     // stable geometry and never executes its descriptor storage.
                     unsafe { self.block.prepare_startup_ffn(rows)?; }

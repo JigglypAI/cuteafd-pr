@@ -256,8 +256,8 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
     }
     fn graph_count(&self, layer: usize) -> usize { self.graphs.count(|(l, _)| *l == layer) }
     pub(crate) fn declare_startup(&mut self, keys: &[(usize, Vec<usize>)]) -> Result<()> {
-        ensure!(self.decode && !self.window.is_windowed() && self.cold.is_none(),
-            "sparse startup requires an idle full decode owner");
+        ensure!((self.decode || keys.is_empty()) && !self.window.is_windowed() && self.cold.is_none(),
+            "sparse startup requires an idle owner and decode recipes or an empty eager inventory");
         self.storage.stream.require_complete()?;
         self.graphs.declare_startup(keys)
     }

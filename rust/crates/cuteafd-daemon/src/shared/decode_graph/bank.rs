@@ -290,6 +290,31 @@ mod tests {
     }
 
     #[test]
+    fn sealed_prefill_inventory_retains_alternating_tails_and_rejects_cold_shapes() {
+        let mut bank = GraphBank::new(Some(1));
+        let keys: Vec<_> = (0..40).flat_map(|layer| (1..=64).map(move |rows| (layer, rows))).collect();
+        bank.declare_startup(&keys).unwrap();
+        for &key in &keys { bank.insert(key, key, None); }
+        bank.finish_startup().unwrap();
+        for rows in [54, 52, 54, 52, 56, 53, 2752, 579, 4, 128, 65] {
+            for layer in 0..40 {
+                let key = (layer, rows);
+                if rows <= 64 {
+                    assert_eq!(bank.enqueue(&key), (GraphDecision::Replay, Some(&key)));
+                } else {
+                    assert_eq!(bank.enqueue(&key), (GraphDecision::Eager, None));
+                }
+                assert!(!bank.capture_allowed(&key));
+            }
+        }
+        assert_eq!(bank.len(), keys.len());
+        assert_eq!(bank.retired_len(), 0);
+        assert_eq!(bank.stats().captures, keys.len() as u64);
+        assert_eq!(bank.stats().recaptures, 0);
+        assert_eq!(bank.stats().evictions, 0);
+    }
+
+    #[test]
     fn sealed_family_warmup_disallows_live_capture() {
         let mut bank = GraphBank::new(None);
         bank.insert(1, 10, None);

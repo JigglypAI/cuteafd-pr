@@ -74,16 +74,24 @@ impl Drop for ReservedPassGuard<'_, '_, '_, '_, '_> {
     }
 }
 impl<'w, 'a> DistributedTargetPass<'w, 'a> {
-    pub(crate) fn capture_startup_indices(&mut self,
+    pub(crate) fn capture_startup_prefill(&mut self,
         bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>) -> Result<()> {
-        ensure!(self.state == State::Idle, "startup index capture requires idle target pass");
+        ensure!(self.state == State::Idle, "startup prefill capture requires idle target pass");
         let resources = &mut self.resources;
+        let rows: Vec<_> = (1..=cuteafd_core::V41_VERIFY_ROWS).collect();
+        bank.capture_startup_producers(&mut resources.execution.producers.windows,
+            &mut resources.execution.producers.sources, &rows)?;
         for index in resources.indices.iter_mut().flatten() {
             let device = index.device;
             device.run(|| index.get_mut().capture_startup(|layer, row|
                 resources.execution.startup_source(bank, layer, row)))?;
         }
-        Ok(())
+        for lane in &mut resources.lanes {
+            let device = lane.device;
+            device.run(|| lane.get_mut().capture_startup_prefill())?;
+        }
+        resources.engram.capture_startup(&rows)?;
+        resources.head.capture_startup(&rows)
     }
     pub(crate) fn capture_startup(&mut self,
         bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>) -> Result<()> {

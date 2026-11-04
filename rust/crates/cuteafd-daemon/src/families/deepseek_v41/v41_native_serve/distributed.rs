@@ -597,7 +597,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         let capture_started = Instant::now();
         pass.capture_startup(requests.cache())?;
         second.capture_startup(requests.cache())?;
-        for (slot, _) in &mut prefill_slots.slots { slot.capture_startup_indices(requests.cache())?; }
+        for (slot, _) in &mut prefill_slots.slots { slot.capture_startup_prefill(requests.cache())?; }
         if let Some(draft) = &mut draft {
             let device = draft.device;
             device.run(|| draft.get_mut().capture_startup())?;
