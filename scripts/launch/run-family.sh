@@ -759,6 +759,15 @@ done < <(compgen -e CUTEAFD_DIAG_ | sort)
 # CUTEAFD_DIAG_CUDA_LAUNCH_BLOCKING=1 makes CUDA report a kernel fault at the
 # faulting launch instead of a later API call (diagnostic only; slow).
 [[ "${CUTEAFD_DIAG_CUDA_LAUNCH_BLOCKING:-}" != 1 ]] || bench_nonce_env_args+=(-e CUDA_LAUNCH_BLOCKING=1)
+# CUTEAFD_DIAG_CUDA_DEVICE_MAX_CONNECTIONS / _MAX_COPY_CONNECTIONS=N (1-32) set
+# CUDA's hardware work-queue counts for the coordinator (A/B only).
+local key value
+for key in CONNECTIONS COPY_CONNECTIONS; do
+  value=$(printenv "CUTEAFD_DIAG_CUDA_DEVICE_MAX_$key") || continue
+  [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 32 )) \
+    || { echo "run-family: CUTEAFD_DIAG_CUDA_DEVICE_MAX_$key must be 1-32, got '$value'" >&2; exit 2; }
+  bench_nonce_env_args+=(-e "CUDA_DEVICE_MAX_$key=$value")
+done
 }
 # PROFILE=switch[,switch...] turns on profiling for one launch, the same way in
 # every family, through release-common.sh:

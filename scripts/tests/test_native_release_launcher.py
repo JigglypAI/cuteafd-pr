@@ -367,6 +367,17 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         result = subprocess.run(['bash', '-c', block], env=environment, capture_output=True)
         self.assertEqual(result.stdout,
             b'before\0-e\0CUTEAFD_DIAG_CUDA_LAUNCH_BLOCKING=1\0-e\0CUDA_LAUNCH_BLOCKING=1\0after\0')
+        # The work-queue diagnostics set CUDA's own variables; out-of-range values refuse.
+        environment = {k: v for k, v in os.environ.items() if not k.startswith(('CUTEAFD_DIAG_', 'CUTEAFD_BENCH_NONCE'))}
+        environment.update(CUTEAFD_DIAG_CUDA_DEVICE_MAX_CONNECTIONS='32', CUTEAFD_DIAG_CUDA_DEVICE_MAX_COPY_CONNECTIONS='16')
+        result = subprocess.run(['bash', '-c', block], env=environment, capture_output=True)
+        self.assertEqual(result.stdout,
+            b'before\0-e\0CUTEAFD_DIAG_CUDA_DEVICE_MAX_CONNECTIONS=32\0-e\0CUTEAFD_DIAG_CUDA_DEVICE_MAX_COPY_CONNECTIONS=16'
+            b'\0-e\0CUDA_DEVICE_MAX_CONNECTIONS=32\0-e\0CUDA_DEVICE_MAX_COPY_CONNECTIONS=16\0after\0')
+        environment.update(CUTEAFD_DIAG_CUDA_DEVICE_MAX_CONNECTIONS='64')
+        result = subprocess.run(['bash', '-c', block], env=environment, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b'must be 1-32', result.stderr)
 
     def test_v41_speculation_trace_reaches_coordinator_with_host_mount(self) -> None:
         source = FAMILY.read_text()
