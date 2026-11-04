@@ -213,6 +213,33 @@ fn validate_decode_extent(bytes: usize) -> Result<()> {
 }
 
 impl<'a> PeerExchange<'a> {
+    /// Physical retained owners, never reconstructed from requested slot extents.
+    pub(crate) fn allocation_buffers(&self) -> Vec<(usize, String, cuteafd_ffi::CuteafdDeviceBuffer)> {
+        let mut out = Vec::new();
+        for (rank, end) in self.ends.iter().enumerate() {
+            for (slot, recv) in end.recv.iter().enumerate() {
+                out.push((rank, format!("peer.recv.{slot}"), recv.buffer));
+            }
+            out.push((rank, "peer.control".into(), end.control.buffer));
+            if let Some(progress) = &end.progress {
+                out.push((rank, "peer.progress".into(), progress.buffer));
+            }
+            if let Some(abort) = &self.abort {
+                out.push((rank, "peer.abort".into(), abort.sides[rank].word.buffer));
+            }
+        }
+        out
+    }
+
+    /// Ordinary host backing retained by opt-in progress diagnostics.
+    pub(crate) fn diagnostic_host_backing(&self) -> Result<Option<(u64, u64)>> {
+        let ordinals = self.host_ordinals.try_borrow()?;
+        if ordinals.capacity() == 0 { return Ok(None); }
+        let bytes = ordinals.capacity().checked_mul(std::mem::size_of::<[[u64; 2]; 2]>())
+            .context("peer diagnostic host backing overflow")?;
+        Ok(Some((ordinals.as_ptr() as u64, u64::try_from(bytes)?)))
+    }
+
     /// Enables peer access both ways and allocates `slots` zeroed receive
     /// buffers of `slot_bytes` and the control words on each rank; `ranks[0]`'s
     /// device must be current (and is again on return).
@@ -289,7 +316,7 @@ impl<'a> PeerExchange<'a> {
         let side = |rank: usize| {
             on_device(library, ranks[rank].device, || {
                 let probe = |stage| crate::shared::inventory::startup_probe(
-                    library, &[ranks[rank].device], stage);
+                    library, &[ranks[rank].device], stage, Default::default());
                 probe("peer-abort-before-preload")?;
                 library.peer_abort_initialize()?;
                 probe("peer-abort-after-preload")?;

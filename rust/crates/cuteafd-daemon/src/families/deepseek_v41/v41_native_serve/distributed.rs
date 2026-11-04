@@ -37,7 +37,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             .into_iter().collect::<Result<Vec<_>>>()?;
         tracing::info!(stage, occupied_bytes=?occupied, "dual RTX startup memory");
         cuteafd_ffi::memory_ledger::relabel_other(cuteafd_ffi::memory_ledger::intern(&format!("v41/{stage}")));
-        crate::shared::inventory::startup_probe(&lib, &[0, 1], &format!("v41/{stage}"))?;
+        crate::shared::inventory::startup_probe(&lib, &[0, 1], &format!("v41/{stage}"), Default::default())?;
         Ok(())
     };
     memory_checkpoint("CUDA contexts and peer access")?;

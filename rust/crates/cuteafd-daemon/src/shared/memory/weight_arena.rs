@@ -580,6 +580,8 @@ impl<'a> DeliveredArena<'a> {
 }
 
 impl ReadyArena<'_> {
+    pub(crate) fn allocation_buffer(&self) -> CuteafdDeviceBuffer { self.allocation.buffer }
+
     pub fn region(&self, index: usize) -> Result<WeightView<'_>> {
         Ok(WeightView {
             buffer: slice(self.allocation.buffer, self.layout.region(index)?)?,

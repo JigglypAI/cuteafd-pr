@@ -44,6 +44,20 @@ pub(crate) enum Weight<'a> {
     Fp8(Fp8Weight<'a>),
 }
 
+impl Weight<'_> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        match self {
+            Self::Bf16(owner) => inventory.device(name, owner.buffer),
+            Self::Fp8(owner) => {
+                let (payload, scales) = owner.buffers();
+                inventory.device(&format!("{name}.values"), payload)?;
+                inventory.device(&format!("{name}.scales"), scales)
+            }
+        }
+    }
+}
+
 pub(crate) struct Load<'a> {
     library: &'a NativeLibrary,
     source: Source,

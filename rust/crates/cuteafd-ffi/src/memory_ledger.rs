@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Which pool an allocation came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -20,6 +20,8 @@ pub enum Space {
     Device,
     Pinned,
     Managed,
+    /// Native malloc backing registered for RDMA, not CUDA-pinned storage.
+    Host,
 }
 
 impl Space {
@@ -28,6 +30,7 @@ impl Space {
             Self::Device => "device",
             Self::Pinned => "pinned",
             Self::Managed => "managed",
+            Self::Host => "host",
         }
     }
 }
@@ -51,6 +54,7 @@ thread_local! {
 struct Live {
     key: Key,
     bytes: usize,
+    endpoint: Option<usize>,
 }
 
 /// Aggregation key: pool, device (-1 for host memory), category, tensor stem
@@ -75,6 +79,100 @@ struct State {
     totals: BTreeMap<Key, (usize, usize)>,
     peak: BTreeMap<(Space, i32), usize>,
     current: BTreeMap<(Space, i32), usize>,
+    audits: Vec<Weak<Mutex<AuditEvents>>>,
+}
+
+/// An actual native allocation, before aggregation removes pointer identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllocationRecord {
+    pub address: usize,
+    pub key: Key,
+    pub bytes: usize,
+    /// Native endpoint owning an RDMA ring; never the backing address.
+    pub endpoint: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocationEvent {
+    Allocated(AllocationRecord),
+    Freed(AllocationRecord),
+    /// The allocator reused an address whose release bypassed this ledger.
+    /// This is not evidence of a free at the time the reuse was observed.
+    UnobservedRelease(AllocationRecord),
+}
+
+#[derive(Default)]
+struct AuditEvents {
+    events: Vec<AllocationEvent>,
+}
+
+/// Caller-owned, startup-only history. Dropping this handle stops recording;
+/// the process ledger retains only a weak subscription, never the history.
+pub struct AllocationAudit {
+    initial: Vec<AllocationRecord>,
+    events: Arc<Mutex<AuditEvents>>,
+}
+
+#[derive(Debug)]
+pub struct AllocationHistory {
+    pub initial: Vec<AllocationRecord>,
+    pub events: Vec<AllocationEvent>,
+    pub final_allocations: Vec<AllocationRecord>,
+}
+
+impl AllocationAudit {
+    pub fn begin() -> Self {
+        let events = Arc::new(Mutex::new(AuditEvents::default()));
+        let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
+        let initial = live_allocations(&state);
+        state.audits.retain(|audit| audit.strong_count() != 0);
+        state.audits.push(Arc::downgrade(&events));
+        Self { initial, events }
+    }
+
+    /// Position in the ordered stream at an existing startup boundary. This
+    /// neither synchronizes CUDA nor changes the lifetime of any allocation.
+    pub fn checkpoint(&self) -> usize {
+        self.events.lock().unwrap_or_else(|e| e.into_inner()).events.len()
+    }
+
+    /// Sample exact live backing and its event position under the same ledger
+    /// lock, so a worker allocation cannot fall between those observations.
+    pub fn checkpoint_allocations(&self) -> (usize, Vec<AllocationRecord>) {
+        let state = state().lock().unwrap_or_else(|e| e.into_inner());
+        let position = self.events.lock().unwrap_or_else(|e| e.into_inner()).events.len();
+        (position, live_allocations(&state))
+    }
+
+    /// Close the subscription under the allocator's lock before taking history.
+    pub fn finish(self) -> AllocationHistory {
+        let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
+        state.audits.retain(|audit| !audit.ptr_eq(&Arc::downgrade(&self.events))
+            && audit.strong_count() != 0);
+        let events = std::mem::take(&mut self.events.lock().unwrap_or_else(|e| e.into_inner()).events);
+        AllocationHistory { initial: self.initial, events, final_allocations: live_allocations(&state) }
+    }
+}
+
+fn live_allocations(state: &State) -> Vec<AllocationRecord> {
+    let mut allocations = state.live.iter().map(|(&address, live)| AllocationRecord {
+        address, key: live.key, bytes: live.bytes, endpoint: live.endpoint,
+    }).collect::<Vec<_>>();
+    allocations.sort_unstable_by_key(|record| (record.key.space, record.key.device, record.address));
+    allocations
+}
+
+/// Pointer-level snapshot of all currently tracked native owners.
+pub fn allocations() -> Vec<AllocationRecord> {
+    live_allocations(&state().lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+fn audit_event(state: &mut State, event: AllocationEvent) {
+    state.audits.retain(|audit| {
+        let Some(audit) = audit.upgrade() else { return false };
+        audit.lock().unwrap_or_else(|e| e.into_inner()).events.push(event);
+        true
+    });
 }
 
 fn state() -> &'static Mutex<State> {
@@ -197,6 +295,14 @@ fn current_key(space: Space, device: i32) -> (Key, Option<&'static str>) {
 }
 
 pub(crate) fn record_alloc(space: Space, device: i32, ptr: usize, bytes: usize) {
+    record_backing(space, device, ptr, bytes, None);
+}
+
+pub(crate) fn record_endpoint_alloc(space: Space, ptr: usize, bytes: usize, endpoint: usize) {
+    record_backing(space, -1, ptr, bytes, Some(endpoint));
+}
+
+fn record_backing(space: Space, device: i32, ptr: usize, bytes: usize, endpoint: Option<usize>) {
     if ptr == 0 || bytes == 0 {
         return;
     }
@@ -218,10 +324,14 @@ pub(crate) fn record_alloc(space: Space, device: i32, ptr: usize, bytes: usize) 
     let now = *current;
     let peak = state.peak.entry((space, device)).or_default();
     *peak = (*peak).max(now);
-    if let Some(previous) = state.live.insert(ptr, Live { key, bytes }) {
+    if let Some(previous) = state.live.insert(ptr, Live { key, bytes, endpoint }) {
         // A pointer reused without a recorded free (freed outside the library).
         release(&mut state, previous);
+        audit_event(&mut state, AllocationEvent::UnobservedRelease(AllocationRecord {
+            address: ptr, key: previous.key, bytes: previous.bytes, endpoint: previous.endpoint,
+        }));
     }
+    audit_event(&mut state, AllocationEvent::Allocated(AllocationRecord { address: ptr, key, bytes, endpoint }));
 }
 
 fn release(state: &mut State, live: Live) {
@@ -249,6 +359,23 @@ pub(crate) fn record_free(ptr: usize) {
     let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(live) = state.live.remove(&ptr) {
         release(&mut state, live);
+        audit_event(&mut state, AllocationEvent::Freed(AllocationRecord {
+            address: ptr, key: live.key, bytes: live.bytes, endpoint: live.endpoint,
+        }));
+    }
+}
+
+/// Retire all backing of an endpoint only after its native destroy succeeds.
+pub(crate) fn record_endpoint_free(endpoint: usize) {
+    let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
+    let addresses = state.live.iter().filter(|(_, live)| live.endpoint == Some(endpoint))
+        .map(|(&address, _)| address).collect::<Vec<_>>();
+    for address in addresses {
+        let live = state.live.remove(&address).expect("endpoint backing retained under lock");
+        release(&mut state, live);
+        audit_event(&mut state, AllocationEvent::Freed(AllocationRecord {
+            address, key: live.key, bytes: live.bytes, endpoint: live.endpoint,
+        }));
     }
 }
 
@@ -268,7 +395,7 @@ pub fn relabel_other(label: &'static str) {
         if let Some(current) = state.current.get_mut(&(key.space, key.device)) {
             *current += live.bytes;
         }
-        state.live.insert(ptr, Live { key, bytes: live.bytes });
+        state.live.insert(ptr, Live { key, ..live });
     }
 }
 
@@ -424,6 +551,53 @@ pub fn device_memory(device: i32) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_history_preserves_transients_reuse_and_initial_owners() {
+        let base = 0x7300_0000_0000usize;
+        record_alloc(Space::Pinned, -1, base, 64);
+        let audit = AllocationAudit::begin();
+        let position = audit.checkpoint();
+        let (sample_position, live) = audit.checkpoint_allocations();
+        assert_eq!(sample_position, position);
+        assert!(live.iter().any(|r| r.address == base && r.bytes == 64));
+        record_alloc(Space::Device, 17, base + 1, 128);
+        record_free(base + 1);
+        record_alloc(Space::Device, 17, base + 1, 256);
+        record_alloc(Space::Device, 17, base + 1, 512);
+        record_free(base + 1);
+        let history = audit.finish();
+        assert!(history.initial.iter().any(|r| r.address == base && r.bytes == 64));
+        assert!(history.final_allocations.iter().any(|r| r.address == base && r.bytes == 64));
+        assert!(!history.final_allocations.iter().any(|r| r.address == base + 1));
+        let events = history.events[position..].iter().filter(|event| match event {
+            AllocationEvent::Allocated(r) | AllocationEvent::Freed(r)
+                | AllocationEvent::UnobservedRelease(r) => r.address == base + 1,
+        }).copied().collect::<Vec<_>>();
+        let record = |bytes| AllocationRecord { address: base + 1, bytes, endpoint: None,
+            key: Key { space: Space::Device, device: 17, scope: "other",
+                owner: None, tensor: None, format: None } };
+        assert_eq!(events, [AllocationEvent::Allocated(record(128)),
+            AllocationEvent::Freed(record(128)), AllocationEvent::Allocated(record(256)),
+            AllocationEvent::UnobservedRelease(record(256)),
+            AllocationEvent::Allocated(record(512)), AllocationEvent::Freed(record(512))]);
+        record_free(base);
+    }
+
+    #[test]
+    fn dropped_audit_does_not_retain_steady_state_history() {
+        let audit = AllocationAudit::begin();
+        let events = Arc::downgrade(&audit.events);
+        drop(audit);
+        assert!(events.upgrade().is_none());
+        let base = 0x7400_0000_0000usize;
+        record_alloc(Space::Managed, 18, base, 32);
+        let live = allocations();
+        assert!(live.iter().any(|r| r.address == base && r.key.space == Space::Managed
+            && r.key.device == 18 && r.bytes == 32));
+        record_free(base);
+        assert!(!allocations().iter().any(|r| r.address == base));
+    }
 
     #[test]
     fn scopes_tensors_and_frees_balance() {

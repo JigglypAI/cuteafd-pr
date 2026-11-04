@@ -172,28 +172,89 @@ mod startup_probe_tests {
     }
 }
 
+mod startup_memory;
+
+pub(crate) fn startup_probe_enabled() -> bool {
+    std::env::var("CUTEAFD_STARTUP_MEMORY_PROBE").as_deref() == Ok("1")
+}
+
+/// Evidence owned by the family, not a second observer or inferred lifetime.
+#[derive(Default)]
+pub(crate) struct StartupEvidence<'a> {
+    pub audit: Option<&'a cuteafd_ffi::memory_ledger::AllocationAudit>,
+    pub history: Option<&'a cuteafd_ffi::memory_ledger::AllocationHistory>,
+    pub census: Option<&'a crate::shared::memory::receipts::Census>,
+}
+
 /// Opt-in startup attribution only; never sample on the request hot path.
-pub(crate) fn startup_probe(library: &NativeLibrary, devices: &[i32], stage: &str) -> Result<()> {
-    if std::env::var("CUTEAFD_STARTUP_MEMORY_PROBE").as_deref() != Ok("1") { return Ok(()); }
-    if stage.ends_with("/ready") {
-        let host_vm_hwm_bytes = host_high_water_bytes(&std::fs::read_to_string("/proc/self/status")?)?;
-        tracing::info!(target: "cuteafd::placement", stage, host_vm_hwm_bytes,
-            host_memory_scope = "process resident high-water from /proc/self/status; not push staging alone",
-            "startup host memory probe");
-    }
+pub(crate) fn startup_probe(library: &NativeLibrary, devices: &[i32], stage: &str,
+    evidence: StartupEvidence<'_>) -> Result<()> {
+    use cuteafd_ffi::memory_ledger::{self, Space};
+    use serde_json::json;
+    if !startup_probe_enabled() { return Ok(()); }
+    anyhow::ensure!(evidence.audit.is_none() || evidence.history.is_none(), "two native histories in startup probe");
+    let (position, native) = if let Some(audit) = evidence.audit {
+        let (position, records) = audit.checkpoint_allocations();
+        (Some(position), records)
+    } else if let Some(history) = evidence.history {
+        (Some(history.events.len()), history.final_allocations.clone())
+    } else { (None, memory_ledger::allocations()) };
+    let host = startup_memory::host(&native, stage).unwrap_or_else(|error|
+        json!({"complete": false, "findings": [format!("host sampling unavailable: {error:#}")]}));
+    let census = evidence.census.map(|census| startup_memory::census(census, &native, devices)).transpose()?;
     let current = library.cuda_get_device()?;
     let result = (|| -> Result<()> {
-        for &device in devices {
+        for (rank, &device) in devices.iter().enumerate() {
             library.cuda_set_device(device)?;
             let (free, total) = library.cuda_physical_memory_info()?;
-            let tracked = cuteafd_ffi::memory_ledger::snapshot()
-                .total(cuteafd_ffi::memory_ledger::Space::Device, device);
-            tracing::info!(target: "cuteafd::placement", probe = %serde_json::json!({
-                "stage": stage, "device": device, "free": free, "total": total,
+            let tracked = native.iter().filter(|r| r.key.device == device
+                && matches!(r.key.space, Space::Device | Space::Managed)).map(|r| r.bytes as u64).sum::<u64>();
+            let used = total.checked_sub(free).context("CUDA free exceeds total")? as u64;
+            tracing::info!(target: "cuteafd::placement", probe = %json!({
+                "schema": 2, "stage": stage, "device": device, "logical_rank": rank,
+                "free": free, "total": total,
                 "cuda_memory_scope": "raw cudaMemGetInfo; GB10 under-reports reclaimable page cache",
                 "allocatable_free_bytes": library.cuda_allocatable_memory_info()?.0,
-                "tracked": tracked, "untracked": total.saturating_sub(free).saturating_sub(tracked)
+                "tracked": tracked, "untracked": used as i64 - tracked as i64,
+                "cuda_tolerance_bytes": 16 << 20,
+                "runtime_delta_scope": "signed unclassified observation; not a receipt or automatic allowance",
+                "host": host, "native_event_position": position,
+                "native_record_count": native.len(), "census": census,
+                "history_closed": evidence.history.is_some(),
+                "ready_authorized_by_probe": false
             }), "startup memory probe");
+        }
+        for (index, records) in native.chunks(64).enumerate() {
+            tracing::info!(target: "cuteafd::placement", probe = %json!({"schema": 2,
+                "stage": stage, "kind": "native-live", "event_position": position, "offset": index * 64,
+                "records": records.iter().map(startup_memory::record).collect::<Vec<_>>() }), "startup memory probe");
+        }
+        if let Some(census) = evidence.census {
+            for (index, records) in census.receipts.chunks(64).enumerate() {
+                tracing::info!(target: "cuteafd::placement", probe = %json!({"schema": 2,
+                    "stage": stage, "kind": "retained-owners", "offset": index * 64,
+                    "records": records.iter().map(|r| json!({"address": r.address, "allocation": r.allocation})).collect::<Vec<_>>() }), "startup memory probe");
+            }
+            for (index, aliases) in census.aliases.chunks(64).enumerate() {
+                tracing::info!(target: "cuteafd::placement", probe = %json!({"schema": 2,
+                    "stage": stage, "kind": "mapped-aliases", "offset": index * 64,
+                    "records": aliases.iter().map(|a| json!({"owner": a.owner, "backing": a.backing,
+                        "location": a.location, "address": a.address, "bytes": a.bytes})).collect::<Vec<_>>() }), "startup memory probe");
+            }
+        }
+        if let Some(history) = evidence.history {
+            // One bounded startup history, emitted in chunks rather than one
+            // multi-megabyte tracing line. The subscription is already closed.
+            for (index, records) in history.initial.chunks(64).enumerate() {
+                tracing::info!(target: "cuteafd::placement", probe = %json!({"schema": 2,
+                    "stage": stage, "kind": "native-initial", "offset": index * 64,
+                    "records": records.iter().map(startup_memory::record).collect::<Vec<_>>() }), "startup memory probe");
+            }
+            for (index, events) in history.events.chunks(64).enumerate() {
+                tracing::info!(target: "cuteafd::placement", probe = %json!({"schema": 2,
+                    "stage": stage, "kind": "native-events", "offset": index * 64,
+                    "events": events.iter().map(startup_memory::event).collect::<Vec<_>>() }), "startup memory probe");
+            }
         }
         Ok(())
     })();

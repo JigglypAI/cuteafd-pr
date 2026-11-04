@@ -92,6 +92,24 @@ impl LocalTp4Client {
     pub(crate) fn timeout(&self) -> Duration { self.config.timeout }
     pub(crate) fn open_waves(&self) -> usize { self.waves.len() }
 
+    pub(crate) fn allocation_census(&self) -> TransportAllocationCensus {
+        if !self.waves.is_empty() || self.pending.iter().any(|pending| !pending.is_empty()) {
+            return TransportAllocationCensus::unavailable("sessions", "transport has waves in flight");
+        }
+        let mut census = TransportAllocationCensus::default();
+        for (rank, session) in self.sessions.iter().enumerate() {
+            let owner = format!("rank.{rank}");
+            match session {
+                Some(session) => census.extend(session.allocation_census(&owner)),
+                None => census.extend(TransportAllocationCensus::unavailable(owner, "session is not bootstrapped")),
+            }
+        }
+        if let Some(egress) = &self.egress {
+            census.host_buffer("egress".into(), egress.host());
+        }
+        census
+    }
+
     pub(crate) fn installed_grouping(&self) -> Result<Vec<crate::worker_selection::InstalledExpertGrouping>> {
         let reports = self.expert_grouping.iter().enumerate().map(|(rank, report)|
             report.clone().with_context(|| match self.sessions[rank].is_some() {

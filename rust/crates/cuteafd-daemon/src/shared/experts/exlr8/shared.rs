@@ -91,6 +91,14 @@ pub(crate) struct NativeExperts<'a> {
 }
 
 impl<'a> NativeExperts<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for weight in &self.weights {
+            weight.allocation_receipts(inventory, &format!("{name}.layer.{}", weight.layout.layer))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn load(library: &'a NativeLibrary, plan: NativePlan) -> Result<Self> {
         plan.admit_host()?;
         let NativePlan {

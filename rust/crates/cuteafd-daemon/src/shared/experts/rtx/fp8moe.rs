@@ -246,6 +246,15 @@ impl<'a> Fp8MoeTp2<'a> {
 }
 
 impl RtxExpertLayer for Fp8MoeTp2<'_> {
+    fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for weight in &self.experts.layers {
+            weight.allocation_receipts(inventory, &format!("{name}.weight.{}", weight.layer))?;
+        }
+        inventory.device(&format!("{name}.scratch"), self.scratch.buffer)?;
+        inventory.device(&format!("{name}.output"), self.output.buffer)
+    }
+
     fn shard(&self) -> RtxShard { RtxShard::Tp2 { rank: self.rank } }
     fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }
     fn uses_fp8_input(&self) -> bool { false }

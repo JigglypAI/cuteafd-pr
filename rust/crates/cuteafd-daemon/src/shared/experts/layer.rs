@@ -509,6 +509,15 @@ impl<'a> From<DeviceAllocation<'a>> for ResidentPlane<'a> {
     }
 }
 impl<'a> ResidentPlane<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        let owner = match &self._owner {
+            PlaneOwner::Mount { _allocation } => _allocation.buffer,
+            PlaneOwner::Push { _rank } => _rank.allocation_buffer(),
+        };
+        inventory.backed_device(name, self.buffer, owner)
+    }
+
     fn pushed(library: &'a NativeLibrary,
         rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>>,
         region: usize, offset: usize, bytes: usize) -> Result<Self> {
@@ -554,6 +563,21 @@ impl Drop for RawScales<'_> {
     fn drop(&mut self) { self.release(); }
 }
 impl<'a> ExpertWeights<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for (index, plane) in self.buffers.iter().enumerate() {
+            plane.allocation_receipts(inventory, &format!("{name}.plane.{index}"))?;
+        }
+        if let Some(side) = &self.nvfp4 {
+            for (key, plane) in [("alphas", &side.alphas), ("down_alphas", &side.down_alphas),
+                ("input_scales", &side.input_scales), ("down_input_scales", &side.down_input_scales)] {
+                plane.allocation_receipts(inventory, &format!("{name}.{key}"))?;
+            }
+        }
+        if let Some(raw) = self.raw_scales.buffer.get() { inventory.device(&format!("{name}.raw_scales"), raw)?; }
+        Ok(())
+    }
+
     /// Frees raw scale images kept for recorded plane packs (after they ran).
     pub(crate) fn release_raw_scales(&self) { self.raw_scales.release(); }
 

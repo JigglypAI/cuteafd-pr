@@ -249,6 +249,16 @@ impl Fixture {
         Ok(())
     }
 
+    pub fn configure_endpoint_failures(&self, library: &NativeLibrary, view: i32, destroy: i32) -> Result<()> {
+        // SAFETY: this export belongs to the CPU-only fixture loaded above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn(i32, i32)> =
+                library.lib.get(b"fixture_configure_endpoint_failures")?;
+            configure(view, destroy);
+        }
+        Ok(())
+    }
+
     pub fn configure_pack(&self, library: &NativeLibrary, pack: i32, drain: i32) -> Result<()> {
         // SAFETY: this export belongs to the CPU-only fixture loaded above.
         unsafe {
@@ -266,6 +276,13 @@ impl Fixture {
             .unwrap()
             .ensure(library, 64)?;
         Ok(())
+    }
+
+    pub fn reserve_ordered_upload(&self, library: &NativeLibrary, dst: CuteafdDeviceBuffer,
+        stream: usize) -> Result<()> {
+        // SAFETY: the CPU fixture owns this destination and accepts a synthetic
+        // stream; reservation records no pending copy or consumer.
+        unsafe { library.reserve_h2d_ordered(dst, stream as *mut c_void) }
     }
 
     pub fn finish_ordered_uploads(&self, library: &NativeLibrary) -> Result<()> {

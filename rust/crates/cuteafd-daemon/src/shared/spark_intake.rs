@@ -466,6 +466,22 @@ impl IntakeState {
 }
 
 impl<'a> SparkIntake<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for (rank, plane) in self.planes.iter().enumerate() {
+            inventory.backed_device(&format!("{name}.plane.{rank}"), plane.buffer, plane._allocation.buffer)?;
+        }
+        if let Some(storage) = self.exchange_storage.try_borrow()?.as_ref() {
+            storage.allocation_receipts(inventory, &format!("{name}.exchange"))?;
+        }
+        if let Some(staging) = &self.staging {
+            inventory.pinned(&format!("{name}.staging"), staging.try_borrow()?.buffer)?;
+        }
+        inventory.host(&format!("{name}.consumed"), &self.consumed)?;
+        inventory.host(&format!("{name}.landed"), &self.landed)?;
+        inventory.host(&format!("{name}.consumed_pending"), &self.state.consumed_pending)
+    }
+
     pub(crate) fn new(library: &'a NativeLibrary, mode: IntakeMode, ranks: usize, rows: usize, row_bytes: usize)
         -> Result<Self> {
         Self::with_waves(library, mode, ranks, rows, row_bytes, 1)
@@ -1579,6 +1595,51 @@ pub(crate) struct SparkLink<'a> {
 }
 
 impl<'a> SparkLink<'a> {
+    /// Startup/test-only: observe current transport ownership without progressing it.
+    pub(crate) fn allocation_census(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>,
+        prefix: &str) -> Result<crate::shared::memory::receipts::Census> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::Lifetime;
+        let mut census = crate::shared::memory::receipts::Census::default();
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, prefix,
+            Lifetime::TARGET, Category::Transport, "Spark link");
+        self.allocation_receipts(&mut inventory, "storage")?;
+        census.owners(inventory.receipts);
+        if let Some(storage) = self.intake.exchange_storage.try_borrow()?.as_ref() {
+            storage.allocation_aliases(&mut census, devices, &format!("{prefix}.storage.intake.exchange"))?;
+        }
+        if let Some(exchange) = &self.exchange {
+            exchange.allocation_aliases(&mut census, devices, &format!("{prefix}.storage.waves"))?;
+        }
+        let mut transport = match (&self.exchange, &self.transport) {
+            (Some(exchange), None) => exchange.worker_allocation_census(),
+            (None, Some(transport)) => transport.allocation_census(),
+            _ => cuteafd_transport::TransportAllocationCensus::unavailable("transport",
+                "link has no unique transport owner"),
+        };
+        match self.intake.held.try_lock() {
+            Ok(held) => {
+                for (index, (_, _, frame)) in held.iter().enumerate() {
+                    transport.extend(frame.allocation_census(&format!("intake.held.{index}")));
+                }
+            }
+            Err(error) => transport.extend(cuteafd_transport::TransportAllocationCensus::unavailable(
+                "intake.held", format!("held-frame census unavailable: {error}"))),
+        }
+        transport.resolve_recycled_frames();
+        census.transport(&format!("{prefix}.transport"), transport, devices, Lifetime::TARGET)?;
+        Ok(census)
+    }
+
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        self.intake.allocation_receipts(inventory, &format!("{name}.intake"))?;
+        if let Some(exchange) = &self.exchange {
+            exchange.allocation_receipts(inventory, &format!("{name}.waves"))?;
+        }
+        Ok(())
+    }
+
     /// Connects a [`SparkExperts::new_world`] transport whose `capacity`-row
     /// waves land in an intake of the process-wide [`choose_mode`].
     pub(crate) fn new(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld, peers: &[std::net::SocketAddr], capacity: u32,

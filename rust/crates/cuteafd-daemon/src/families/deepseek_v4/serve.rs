@@ -751,7 +751,7 @@ fn schedule(
     // Prefix capacity and all fallible scheduler initialization precede readiness.
     for rank in 0..engine.ranks() {
         engine.on(rank, || crate::shared::inventory::startup_probe(&loaded.library,
-            &[loaded.library.cuda_get_device()?], "v4/ready"))?;
+            &[loaded.library.cuda_get_device()?], "v4/ready", Default::default()))?;
     }
     ready();
     crate::shared::api::run_scheduler(|| {

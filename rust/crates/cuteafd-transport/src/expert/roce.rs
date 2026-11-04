@@ -195,6 +195,14 @@ impl SparkExperts {
     pub fn max_waves(&self) -> usize { self.clients.max_waves() }
     /// The response deadline every wave is held to.
     pub fn timeout(&self) -> std::time::Duration { self.clients.timeout() }
+
+    /// Startup/test-only observation of already bootstrapped coordinator storage.
+    pub fn allocation_census(&self) -> crate::TransportAllocationCensus {
+        if !self.open_waves.is_empty() {
+            return crate::TransportAllocationCensus::unavailable("transport", "expert waves are in flight");
+        }
+        self.clients.allocation_census()
+    }
     pub fn open_waves(&self) -> usize { self.open_waves.len() }
     /// Immutable metadata returned by the workers' completed persistent bootstrap.
     pub fn installed_grouping(&self) -> Result<Vec<crate::worker_selection::InstalledExpertGrouping>> {

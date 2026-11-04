@@ -219,6 +219,26 @@ pub(crate) struct ProjectionScratch<'a> {
     pub(crate) buffers:BTreeMap<&'static str,Buffer>,pub(crate) rows:usize,
 }
 impl ProjectionScratch<'_> {
+    pub(crate) fn allocation_receipts(&self,
+        inventory: &mut crate::shared::memory::receipts::Inventory<'_>, name: &str) -> Result<()> {
+        for (&key, owner) in &self._owners {
+            inventory.device(&format!("{name}.storage.{}", key.replace(' ', "_")), owner.buffer)?;
+        }
+        for (&key, &buffer) in &self.buffers {
+            let start = buffer.ptr as usize;
+            let end = start.checked_add(buffer.bytes).context("projection view overflow")?;
+            let mut owners = self._owners.iter().filter(|(_, owner)| {
+                buffer.device_id == owner.buffer.device_id && start >= owner.buffer.ptr as usize
+                    && (owner.buffer.ptr as usize).checked_add(owner.buffer.bytes)
+                        .is_some_and(|limit| end <= limit)
+            });
+            let (&backing, owner) = owners.next().context("projection view without backing")?;
+            ensure!(owners.next().is_none(), "ambiguous projection backing");
+            inventory.view(&format!("{name}.view.{key}"), buffer,
+                &format!("{name}.storage.{}", backing.replace(' ', "_")), owner.buffer)?;
+        }
+        Ok(())
+    }
     fn buffers(&self,input:Buffer,weights:&CoreWeights<'_>)->DenseTrellisBuffers {
         let get=|name|self.buffers[name];
         DenseTrellisBuffers {input,payload:weights.payload.buffer,suh:weights.suh.buffer,svh:weights.svh.buffer,
@@ -255,6 +275,42 @@ fn validate_retained_partial(source: Buffer, destination: Buffer, count: usize) 
 #[cfg(test)]
 mod retained_tests {
     use super::*;
+
+    #[test]
+    fn projection_census_uses_actual_backing_without_native_work() -> Result<()> {
+        use crate::shared::memory::receipts::Inventory;
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Location};
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let allocation = Allocation::new(Device { library: &library, id: 1 }, 1024)?;
+        let owner = allocation.buffer;
+        let view = Buffer { ptr: (owner.ptr as usize + 128) as *mut c_void, bytes: 256, ..owner };
+        let mut scratch = ProjectionScratch { _owners: BTreeMap::from([("workspace", allocation)]),
+            buffers: BTreeMap::from([("partial", view)]), rows: 8 };
+        library.cuda_set_device(0)?;
+        let before = fixture.events()?;
+        let physical = [1, 0];
+        let devices = CoordinatorDevices::new(&physical)?;
+        let mut inventory = Inventory::new(devices, "fixture", Lifetime::TARGET, Category::Workspace, "projection");
+        scratch.allocation_receipts(&mut inventory, "core")?;
+        assert_eq!(inventory.receipts.len(), 2);
+        let backing = &inventory.receipts[0];
+        assert_eq!((backing.address, backing.allocation.bytes, backing.allocation.location),
+            (owner.ptr as u64, owner.bytes as u64, Location::coordinator(0)));
+        let part = &inventory.receipts[1];
+        assert_eq!((part.address, part.allocation.bytes), (view.ptr as u64, view.bytes as u64));
+        let alias = part.allocation.view.as_ref().unwrap();
+        assert_eq!((&alias.backing, alias.offset), (&backing.allocation.id, 128));
+        for bad in [Buffer { bytes: 1024, ..view }, Buffer { device_id: 0, ..view }] {
+            scratch.buffers.insert("partial", bad);
+            let mut inventory = Inventory::new(devices, "invalid", Lifetime::TARGET, Category::Workspace, "projection");
+            assert!(scratch.allocation_receipts(&mut inventory, "core").is_err());
+        }
+        assert_eq!(library.cuda_get_device()?, 0);
+        assert_eq!(fixture.events()?, before, "census must not allocate, switch, synchronize or reset");
+        Ok(())
+    }
 
     fn draft_head_capacities(input:usize,output:usize,compiled_rows:usize)->Result<()> {
         use cuteafd_ffi::dense_trellis::DenseTrellisGeometry;
@@ -377,6 +433,8 @@ pub(crate) struct CoreHead<'a> {
     stream: *mut c_void, rows: usize,
 }
 impl<'a> CoreHead<'a> {
+    pub(crate) fn allocation_scratch(&self) -> &ProjectionScratch<'a> { &self.scratch }
+
     pub(crate) fn new(programs: &'a Programs<'a>, weights: &CoreWeights<'a>, rows: usize,
         device: Device<'a>, stream: *mut c_void,
         admitted: &cuteafd_loader::formats::trellis_core::ProjectionScratchLayout) -> Result<Self> {

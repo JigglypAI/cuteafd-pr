@@ -63,6 +63,15 @@ fn record_payload(layout: &Residency, buffer: CuteafdDeviceBuffer,
 }
 
 impl<'a> Exlr8Weights<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        let owner = match &self._arena {
+            ArenaOwner::Mount { _allocation } => _allocation.buffer,
+            ArenaOwner::Push { _rank } => _rank.allocation_buffer(),
+        };
+        inventory.backed_device(name, self.buffer, owner)
+    }
+
     #[cfg(test)]
     pub(crate) fn image(&self) -> CuteafdDeviceBuffer { self.buffer }
 

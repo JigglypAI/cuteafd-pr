@@ -61,6 +61,16 @@ pub(crate) struct RoundProbe<'a> {
 }
 
 impl<'a> RoundProbe<'a> {
+    pub(crate) fn allocation_receipts(&self,
+        inventory: &mut crate::shared::memory::receipts::Inventory<'_>, name: &str) -> Result<()> {
+        inventory.pinned(&format!("{name}.ring"), self.ring.buffer)?;
+        inventory.device(&format!("{name}.device_ring"), self.device_ring.buffer)?;
+        inventory.host(&format!("{name}.dense"), &self.dense)?;
+        inventory.host(&format!("{name}.ringed"), &self.ringed)?;
+        inventory.host(&format!("{name}.staged"), &self.staged)?;
+        self.clock.allocation_receipts(inventory, &format!("{name}.clock"))?;
+        self.routes.allocation_receipts(inventory, &format!("{name}.routes"))
+    }
     /// A probe for `dense.len()` layers of `topk` routes and steps of up to
     /// `capacity` rows, on the current device.
     pub fn new(library: &'a NativeLibrary, dense: Vec<bool>, topk: usize, capacity: usize) -> Result<Self> {
@@ -234,6 +244,30 @@ fn settle(routes: &mut RoundRoutes, ring: &[u8], capacity: usize, topk: usize, r
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_census_is_passive_and_does_not_initialize_route_ids() -> Result<()> {
+        use crate::shared::memory::receipts::Inventory;
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime};
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let probe = RoundProbe::new(&library, vec![true, false, false], 2, 8)?;
+        let before = fixture.events()?;
+        let physical = [0];
+        let mut inventory = Inventory::new(CoordinatorDevices::new(&physical)?, "fixture",
+            Lifetime::TARGET, Category::Workspace, "probe");
+        probe.allocation_receipts(&mut inventory, "probe")?;
+        for (name, ptr, bytes) in [("ring", probe.ring.buffer.ptr as u64, probe.ring.buffer.bytes),
+            ("device_ring", probe.device_ring.buffer.ptr as u64, probe.device_ring.buffer.bytes)] {
+            let receipt = inventory.receipts.iter().find(|r| r.allocation.id == format!("fixture.probe.{name}")).unwrap();
+            assert_eq!((receipt.address, receipt.allocation.bytes), (ptr, bytes as u64));
+        }
+        assert!(inventory.receipts.iter().all(|r| r.allocation.id != "fixture.probe.routes.ids"));
+        assert_eq!(probe.routes.rows(), 0);
+        assert_eq!(fixture.events()?, before);
+        Ok(())
+    }
 
     #[test]
     fn timing_only_probe_records_events_without_copying_routes() -> Result<()> {

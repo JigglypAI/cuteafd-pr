@@ -42,6 +42,9 @@ use std::path::Path;
 
 type Dev<'a> = DeviceAllocation<'a>;
 
+#[path = "dflash_allocation.rs"]
+mod allocation;
+
 /// The drafters' exact vocabulary head (`--draft-head exact`) of `rows` rows: 2..=24 rows on the
 /// few-row FP32 kernel (one read of the head per 8 rows), others on the pedantic cuBLAS head;
 /// CUTEAFD_GLM_HEAD=cublas keeps every row count on cuBLAS. Target logits take

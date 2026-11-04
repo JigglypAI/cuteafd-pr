@@ -3,6 +3,8 @@ use anyhow::Result;
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use std::ffi::c_void;
 
+#[path = "memory/receipts.rs"]
+pub(crate) mod receipts;
 #[path = "memory/snapshot.rs"]
 mod snapshot;
 pub(crate) use snapshot::{SnapshotCopies, SnapshotPool, SnapshotStorage};

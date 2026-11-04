@@ -8,6 +8,53 @@ use crate::native_library_lifetime_fixture::Fixture;
 
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn rdma_ring_ledger_uses_native_backing_and_retires_only_after_destroy() -> Result<()> {
+    use memory_ledger::{AllocationAudit, AllocationEvent, Space};
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    let owner = memory_ledger::owner("fixture.rdma.rings");
+    let audit = AllocationAudit::begin();
+    for (flags, space) in [(CUTEAFD_HOST_BUFFER_FLAG_PINNED | CUTEAFD_HOST_BUFFER_FLAG_MAPPED,
+        Space::Pinned), (CUTEAFD_HOST_BUFFER_FLAG_NONE, Space::Host)] {
+        let info = library.rdma_rc_endpoint_create_on_gid_with_buffer_flags(
+            "fixture", 1, 0, 17, 64, 64, 512, 768, 2, 2, 1, flags)?;
+        let views = [library.rdma_rc_endpoint_buffer_view(info.handle, false)?,
+            library.rdma_rc_endpoint_buffer_view(info.handle, true)?];
+        let records = memory_ledger::allocations().into_iter()
+            .filter(|record| record.endpoint == Some(info.handle as usize)).collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        for view in views {
+            let record = records.iter().find(|r| r.address == view.host_ptr as usize).unwrap();
+            assert_eq!(record.bytes, view.bytes);
+            assert_eq!(record.key.space, space);
+            assert_eq!(record.key.owner, Some("fixture.rdma.rings"));
+            assert_ne!(record.address, info.handle as usize);
+        }
+        fixture.configure_endpoint_failures(&library, 0, 1)?;
+        assert!(library.rdma_rc_endpoint_destroy(info.handle).is_err());
+        assert!(records.iter().all(|record| memory_ledger::allocations().contains(record)));
+        fixture.configure_endpoint_failures(&library, 0, 0)?;
+        library.rdma_rc_endpoint_destroy(info.handle)?;
+        assert!(memory_ledger::allocations().iter().all(|r| r.endpoint != Some(info.handle as usize)));
+    }
+    fixture.configure_endpoint_failures(&library, 1, 0)?;
+    let before = fixture.events()?;
+    assert!(library.rdma_rc_endpoint_create_on_gid_with_buffer_flags(
+        "fixture", 1, 0, 17, 64, 64, 512, 768, 2, 2, 1, 0).is_err());
+    assert_eq!(fixture.events()?, format!("{before}X"));
+    drop(owner);
+    let events = audit.finish().events.into_iter().filter(|event| match event {
+        AllocationEvent::Allocated(r) | AllocationEvent::Freed(r) | AllocationEvent::UnobservedRelease(r) =>
+            r.key.owner == Some("fixture.rdma.rings"),
+    }).collect::<Vec<_>>();
+    assert_eq!(events.len(), 8);
+    assert_eq!(events.iter().filter(|e| matches!(e, AllocationEvent::Allocated(_))).count(), 4);
+    assert_eq!(events.iter().filter(|e| matches!(e, AllocationEvent::Freed(_))).count(), 4);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn symbols_resolve_once_and_optional_exports_stay_lazy() -> Result<()> {
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
@@ -58,6 +105,43 @@ fn cached_k6_wire_owners_match_diagnostic_rounding() -> Result<()> {
     assert_eq!(output.map(f32::to_bits), [0, 0x3c800000, 0x7f800000, 0xff800000]);
     assert!(library.symbols.cuteafd_load_narrow_f32_bf16.get().unwrap().is_ok());
     assert!(library.symbols.cuteafd_bf16_f32_add_async.get().unwrap().is_ok());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn staging_census_getters_preserve_absence_backing_and_native_history() -> Result<()> {
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    let mut dst = library.alloc_device_buffer(32)?;
+    let stream = 1usize as *mut c_void;
+    let audit = memory_ledger::AllocationAudit::begin();
+    let before = fixture.events()?;
+    assert!(library.sync_h2d_staging_buffer()?.is_none());
+    assert!(library.ordered_h2d_staging_buffer(dst, stream)?.is_none());
+    assert_eq!(audit.checkpoint(), 0);
+    assert_eq!(fixture.events()?, before);
+    fixture.stage(&library)?;
+    fixture.reserve_ordered_upload(&library, dst, stream as usize)?;
+    let position = audit.checkpoint();
+    let before = fixture.events()?;
+    let sync = library.sync_h2d_staging_buffer()?.unwrap();
+    let ordered = library.ordered_h2d_staging_buffer(dst, stream)?.unwrap();
+    assert_eq!(sync.bytes, 64);
+    assert_eq!(ordered.bytes, dst.bytes);
+    assert_ne!(sync.ptr, ordered.ptr);
+    assert!(library.ordered_h2d_staging_buffer(dst, 2usize as *mut c_void)?.is_none());
+    assert!(library.ordered_h2d_staging_buffer(CuteafdDeviceBuffer { device_id: 1, ..dst }, stream)?.is_none());
+    assert_eq!(library.sync_h2d_staging_buffer()?.unwrap().ptr, sync.ptr);
+    assert_eq!(library.ordered_h2d_staging_buffer(dst, stream)?.unwrap().ptr, ordered.ptr);
+    assert_eq!(audit.checkpoint(), position);
+    assert_eq!(fixture.events()?, before, "getters never allocate, copy, fence or free");
+    assert_eq!(library.cuda_get_device()?, 0);
+    library.release_ordered_h2d_staging()?;
+    library.release_sync_h2d_staging()?;
+    assert!(library.sync_h2d_staging_buffer()?.is_none());
+    assert!(library.ordered_h2d_staging_buffer(dst, stream)?.is_none());
+    library.free_device_buffer(&mut dst)?;
     Ok(())
 }
 

@@ -7,6 +7,32 @@ fn cfg() -> GlmDsaConfig {
 }
 
 #[test]
+fn glm_zero_demand_omits_charge_and_positive_demand_has_one_exact_item() {
+    let cfg = cfg();
+    for bytes in [0, 768] {
+        let mut recipe = recipe(&cfg);
+        let owner = Allocation::buffer("glm.optional.draft_marks", Location::coordinator(0), bytes,
+            Lifetime::TARGET, Category::Prefix, "optional draft marks");
+        recipe.owners.push(Case { when: vec![], value: vec![Component::allocation(owner,
+            ByteCurve::fixed(bytes, recipe.maximum_pages), false, recipe.maximum_pages)] });
+        let resolved = planner::solve(request(), budgets(), &recipe).unwrap();
+        let owners: Vec<_> = resolved.facts.allocations.iter()
+            .filter(|a| a.id == "glm.optional.draft_marks").collect();
+        let items = resolved.items(Location::coordinator(0)).unwrap();
+        let charges: Vec<_> = items.iter().filter(|item| item.group == "optional draft marks").collect();
+        if bytes == 0 {
+            assert!(owners.is_empty());
+            assert!(charges.is_empty(), "zero demand has no manufactured charge");
+        } else {
+            assert_eq!(owners.len(), 1);
+            assert_eq!(owners[0].bytes, bytes);
+            assert_eq!(charges.len(), 1);
+            assert_eq!(charges[0].bytes, bytes);
+        }
+    }
+}
+
+#[test]
 fn glm_draft_first_peak_excludes_target_kv_and_changes_tight_pool_admission() {
     struct Prepared(Contract);
     impl Recipe for Prepared {
