@@ -20,11 +20,23 @@ impl BufferOwner for Plane<'_> {
 }
 
 #[derive(Clone)]
-pub(super) struct Arena<'a>(Rc<Allocation<'a>>);
+pub(super) struct Arena<'a>(Rc<Allocation<'a>>, Rc<Stream<'a>>);
 impl<'a> Arena<'a> {
     pub fn new(device: Device<'a>, bytes: usize) -> Result<Self> {
+        Self::with_stream(device, bytes, Rc::new(Stream::new(device)?))
+    }
+
+    pub(super) fn with_stream(device: Device<'a>, bytes: usize, stream: Rc<Stream<'a>>) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("step5_scratch_workspace");
-        Ok(Self(Rc::new(Allocation::new(device, bytes)?)))
+        ensure!(device.id == stream.device.id && std::ptr::eq(device.library, stream.device.library),
+            "Step-5 arena stream device mismatch");
+        Ok(Self(Rc::new(Allocation::new(device, bytes)?), stream))
+    }
+
+    /// Staging creates the serving stream; sequential arena users may enqueue.
+    /// Each user retains it through graph destruction and drains before releasing planes.
+    pub(super) fn stream(&self) -> Rc<Stream<'a>> {
+        self.1.clone()
     }
 
     pub fn poison_after(&self, keep: usize) -> Result<()> {

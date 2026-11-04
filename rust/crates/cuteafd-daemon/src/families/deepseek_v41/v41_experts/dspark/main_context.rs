@@ -12,7 +12,8 @@ pub(crate) use proposal::prepare_commit_rows;
 pub(crate) use proposal::MainProposal;
 
 pub(crate) struct DsparkMainContext<'weights, 'library> {
-    stream: LoadStream<'library>,
+    // Context owns the stream; projections enqueue serially and retain it through graph retirement.
+    stream: std::rc::Rc<LoadStream<'library>>,
     timing: crate::shared::draft::timing::DraftTiming<'library>,
     main: DsparkProjection<'weights, 'library>,
     kv: [DsparkProjection<'weights, 'library>; 3],
@@ -42,18 +43,16 @@ impl<'library> DsparkWeights<'library> {
             "dSpark main context exceeds budget"
         );
         let normalized = DeviceAllocation::new(library, capacity as usize * 10240)?;
+        let stream = std::rc::Rc::new(LoadStream { library, raw: library.cuda_stream_create()? });
         let kv = |stage| unsafe {
-            self.projection_from(ProjectionKind::Kv(stage), capacity, normalized.buffer,
-                DsparkProjection::external_input_bytes(library, ProjectionKind::Kv(stage), capacity)?)
+            self.projection_input_on(ProjectionKind::Kv(stage), capacity, Some(normalized.buffer),
+                DsparkProjection::external_input_bytes(library, ProjectionKind::Kv(stage), capacity)?, Some(stream.clone()))
         };
         Ok(DsparkMainContext {
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "v41-context")?,
-            stream: LoadStream {
-                library,
-                raw: library.cuda_stream_create()?,
-            },
-            main: self.projection(ProjectionKind::Main, capacity,
-                DsparkProjection::device_bytes(library, ProjectionKind::Main, capacity)?)?,
+            stream: stream.clone(),
+            main: unsafe { self.projection_input_on(ProjectionKind::Main, capacity, None,
+                DsparkProjection::device_bytes(library, ProjectionKind::Main, capacity)?, Some(stream.clone()))? },
             kv: [
                 kv(0)?, kv(1)?, kv(2)?,
             ],

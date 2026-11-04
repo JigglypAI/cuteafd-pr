@@ -126,7 +126,7 @@ struct HeadWeights<'a> {
 
 pub(super) struct TargetHeadOwner<'a> {
     // Drain before programs, library handles, weights and workspace retire.
-    stream: Stream<'a>,
+    stream: std::rc::Rc<Stream<'a>>,
     head: VocabularyHead<'a>,
     planes: Vec<Plane<'a>>,
     rows: usize,
@@ -178,7 +178,10 @@ impl<'a> TargetHeadOwner<'a> {
             // SAFETY: private workspace survives the private handle on this device.
             let head = unsafe { device.library.vocabulary_head_rows(planes[3].buffer.ptr,
                 H as u32, rows as u32, V as u32)? };
-            let stream = Stream::new(device)?;
+            // Arena components share Staging's persistent stream; standalone owners
+        // create a private stream. The retained Rc outlives captured graphs.
+        let stream = match arena { Some((arena, _)) => arena.stream(),
+            None => std::rc::Rc::new(Stream::new(device)?) };
             Ok(Self { stream, head, planes, rows, immutable })
         })
     }
@@ -340,5 +343,11 @@ pub(super) mod tests {
             assert_eq!(planes, [rows * H * 2, rows * H * 2, rows * V * 4, 4 << 20]);
         }
         for rows in [0, 8257, usize::MAX] { assert!(HeadPlan::plane_bytes(rows).is_err()); }
+    }
+}
+
+impl Drop for TargetHeadOwner<'_> {
+    fn drop(&mut self) {
+        self.stream.drain_or_abort("Step-5 head workspace");
     }
 }

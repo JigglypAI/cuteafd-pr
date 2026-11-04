@@ -8,7 +8,9 @@ use cuteafd_ffi::{
 };
 use std::ffi::c_void;
 pub(crate) struct DsparkAttentionOutput<'weights, 'library> {
-    stream: LoadStream<'library>,
+    // The containing draft owner creates this stream and serializes all users.
+    // Retain it through standalone graph retirement; Drop drains before planes retire.
+    stream: std::rc::Rc<LoadStream<'library>>,
     grouped: V41Fp8Plan<'library>,
     grouped_scratch: DeviceAllocation<'library>,
     alpha: DeviceAllocation<'library>,
@@ -28,6 +30,16 @@ impl<'library> DsparkWeights<'library> {
         capacity: u32,
         budget: usize,
     ) -> Result<DsparkAttentionOutput<'_, 'library>> {
+        self.attention_output_on(stage, capacity, budget, None)
+    }
+
+    pub(super) fn attention_output_on(
+        &self,
+        stage: usize,
+        capacity: u32,
+        budget: usize,
+        shared_stream: Option<std::rc::Rc<LoadStream<'library>>>,
+    ) -> Result<DsparkAttentionOutput<'_, 'library>> {
         ensure!(stage < 3, "invalid dSpark attention output stage");
         let library = self.library;
         ensure!(
@@ -37,14 +49,14 @@ impl<'library> DsparkWeights<'library> {
         let grouped = library.v41_fp8_matrix_plan(capacity, 32768, 8192)?;
         let grouped_scratch = DeviceAllocation::new(library, grouped.info().scratch_bytes as usize)?;
         let alpha = DeviceAllocation::new(library, 4)?;
-        let stream = LoadStream { library, raw: library.cuda_stream_create()? };
+        let stream = match shared_stream { Some(stream) => stream, None => std::rc::Rc::new(LoadStream { library, raw: library.cuda_stream_create()? }) };
         let initialized = unsafe { grouped.initialize_scratch(grouped_scratch.buffer, alpha.buffer, stream.raw) };
         initialized.and(unsafe { library.cuda_stream_synchronize(stream.raw) })?;
-        let projection = self.projection(
+        let projection = unsafe { self.projection_input_on(
             ProjectionKind::OutputB(stage),
-            capacity,
-            DsparkProjection::device_bytes(library, ProjectionKind::OutputB(stage), capacity)?,
-        )?;
+            capacity, None,
+            DsparkProjection::device_bytes(library, ProjectionKind::OutputB(stage), capacity)?, Some(stream.clone()),
+        )? };
         Ok(DsparkAttentionOutput {
             stream,
             grouped,

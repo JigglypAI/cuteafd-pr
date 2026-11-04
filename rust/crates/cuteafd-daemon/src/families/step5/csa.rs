@@ -189,7 +189,7 @@ struct CsaWeights<'a> {
 
 pub(super) struct CsaLayer<'a> {
     // Drain the complete staged branch before any pointer owner retires.
-    stream: Stream<'a>,
+    stream: std::rc::Rc<Stream<'a>>,
     ffn: Option<DenseFfn<'a>>,
     planes: Vec<Plane<'a>>,
     native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
@@ -556,7 +556,10 @@ impl<'a> CsaLayer<'a> {
     fn workspace(device: Device<'a>, admission: Admission,
         immutable: std::rc::Rc<CsaWeights<'a>>, ffn: Option<DenseFfn<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
         let planes = scratch::planes(device, &admission.planes, arena)?;
-        let stream = Stream::new(device)?;
+        // Arena components share Staging's persistent stream; standalone owners
+        // create a private stream. The retained Rc outlives captured graphs.
+        let stream = match arena { Some((arena, _)) => arena.stream(),
+            None => std::rc::Rc::new(Stream::new(device)?) };
         let rows = admission.rows;
         let owner = Self { stream, ffn, planes, native_scratch: None, admission, immutable };
         if arena.is_none() {
@@ -1886,5 +1889,11 @@ mod tests {
             eprintln!("CSA rows={rows} queries={count} complete_regions={} passed (query tile {tile_count})",rows/8);
         }
         Ok(())
+    }
+}
+
+impl Drop for CsaLayer<'_> {
+    fn drop(&mut self) {
+        self.stream.drain_or_abort("Step-5 csa workspace");
     }
 }

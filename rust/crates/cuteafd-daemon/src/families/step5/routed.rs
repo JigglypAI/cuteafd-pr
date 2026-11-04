@@ -331,7 +331,7 @@ struct RoutedWeights<'a> {
 }
 
 pub(super) struct RoutedFfn<'a> {
-    stream: Stream<'a>,
+    stream: std::rc::Rc<Stream<'a>>,
     planes: Vec<Plane<'a>>,
     native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
     admission: Admission,
@@ -435,7 +435,10 @@ impl<'a> RoutedFfn<'a> {
         let spans = cuteafd_loader::plan::families::step5::native::routed_layout(admission.rows,
             admission.span, admission.full)?;
         let planes = scratch::region_planes(device, &spans, arena)?;
-        let stream = Stream::new(device)?;
+        // Arena components share Staging's persistent stream; standalone owners
+        // create a private stream. The retained Rc outlives captured graphs.
+        let stream = match arena { Some((arena, _)) => arena.stream(),
+            None => std::rc::Rc::new(Stream::new(device)?) };
         Ok(Self { stream, planes, native_scratch: None, admission, immutable, unit: std::cell::Cell::new(0) })
     }
     pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
@@ -731,5 +734,11 @@ mod tests {
         assert!(Admission::new(1, &[], one.bytes, &[1]).is_err());
         assert!(Admission::new(1, &[], u64::MAX, &[u64::MAX]).is_err());
         Ok(())
+    }
+}
+
+impl Drop for RoutedFfn<'_> {
+    fn drop(&mut self) {
+        self.stream.drain_or_abort("Step-5 routed workspace");
     }
 }

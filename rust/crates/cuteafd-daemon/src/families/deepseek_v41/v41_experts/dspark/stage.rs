@@ -25,6 +25,15 @@ impl<'library> DsparkWeights<'library> {
         requests: u32,
         budget: usize,
     ) -> Result<DsparkStage<'_, 'library>> {
+        self.stage_on(stage, requests, budget, None)
+    }
+    pub(super) fn stage_on(
+        &self,
+        stage: usize,
+        requests: u32,
+        budget: usize,
+        stream: Option<std::rc::Rc<crate::shared::memory::LoadStream<'library>>>,
+    ) -> Result<DsparkStage<'_, 'library>> {
         ensure!(stage < 3, "invalid dSpark stage");
         ensure!(
             self.stage_bytes(requests)? <= budget,
@@ -33,17 +42,13 @@ impl<'library> DsparkWeights<'library> {
         let capacity = DsparkAttentionWave::projection_capacity_with_width(requests, self.draft_width)?;
         let library = self.library;
         Ok(DsparkStage {
-            ffn: self.ffn(stage, capacity, self.ffn_bytes(capacity)?)?,
-            boundary: self.hc_sublayer(
-                stage,
-                true,
-                capacity as usize,
-                HcSublayer::device_bytes(capacity as usize)?,
-            )?,
-            attention: self.attention_wave(
+            ffn: self.ffn_on(stage, capacity, self.ffn_bytes(capacity)?, stream.clone())?,
+            boundary: match &stream { Some(stream) => self.hc_sublayer_on(stage, true, capacity as usize, stream.clone())?,
+                None => self.hc_sublayer(stage, true, capacity as usize, HcSublayer::device_bytes(capacity as usize)?)? },
+            attention: self.attention_wave_on(
                 stage,
                 requests,
-                DsparkAttentionWave::device_bytes_with_width(library, requests, self.draft_width)?,
+                DsparkAttentionWave::device_bytes_with_width(library, requests, self.draft_width)?, stream,
             )?,
             library,
             graph: BindingGraphs::new(library)?,

@@ -9,7 +9,9 @@ use std::ffi::c_void;
 /// Returned views are valid until this owner is reused; preserve embeddings for
 /// the final confidence projection before advancing to the next draft position.
 pub(crate) struct DsparkMarkov<'weights, 'library> {
-    stream: LoadStream<'library>,
+    // The containing draft owner creates this stream and serializes all users.
+    // Retain it through standalone graph retirement; Drop drains before planes retire.
+    stream: std::rc::Rc<LoadStream<'library>>,
     kernel: V41VocabularyProjection<'library>,
     _workspace: DeviceAllocation<'library>,
     tokens: DeviceAllocation<'library>,
@@ -26,6 +28,15 @@ impl<'library> DsparkWeights<'library> {
         capacity: usize,
         available_device_bytes: usize,
     ) -> Result<DsparkMarkov<'_, 'library>> {
+        self.markov_on(capacity, available_device_bytes, None)
+    }
+
+    pub(super) fn markov_on(
+        &self,
+        capacity: usize,
+        available_device_bytes: usize,
+        shared_stream: Option<std::rc::Rc<LoadStream<'library>>>,
+    ) -> Result<DsparkMarkov<'_, 'library>> {
         let bytes = DsparkMarkov::device_bytes(capacity)?;
         ensure!(
             bytes <= available_device_bytes,
@@ -39,10 +50,7 @@ impl<'library> DsparkWeights<'library> {
         Ok(DsparkMarkov {
             kernel,
             _workspace: workspace,
-            stream: LoadStream {
-                library,
-                raw: library.cuda_stream_create()?,
-            },
+            stream: match shared_stream { Some(stream) => stream, None => std::rc::Rc::new(LoadStream { library, raw: library.cuda_stream_create()? }) },
             tokens: DeviceAllocation::new(library, capacity * 4)?,
             embedding: DeviceAllocation::new(library, capacity * 512)?,
             logits: DeviceAllocation::new(library, capacity * 129280 * 4)?,

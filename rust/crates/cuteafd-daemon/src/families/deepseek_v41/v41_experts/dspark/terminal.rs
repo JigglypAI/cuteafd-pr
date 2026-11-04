@@ -20,7 +20,8 @@ struct LocalHead<'w, 'a> {
 /// Width-dependent Markov/sample positions followed by raw confidence, on one
 /// stream. All draft tensors use [position,request,...] order at live row count.
 pub(crate) struct DsparkTerminal<'weights, 'library> {
-    stream: LoadStream<'library>,
+    // Terminal creates this stream; Markov/confidence use it serially and retain it through graphs.
+    stream: std::rc::Rc<LoadStream<'library>>,
     timing: crate::shared::draft::timing::DraftTiming<'library>,
     markov: DsparkMarkov<'weights, 'library>,
     confidence: DsparkConfidence<'weights, 'library>,
@@ -72,18 +73,16 @@ impl<'library> DsparkWeights<'library> {
                 capacity * self.draft_width, crate::families::deepseek_v41::v41_tensors::Fp8Head::Draft)?;
             Ok(LocalHead { kernel, _workspace: workspace, weights, fp8_scratch })
         }).transpose()?;
+        let stream = std::rc::Rc::new(LoadStream { library, raw: library.cuda_stream_create()? });
         Ok(DsparkTerminal {
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "v41-terminal")?,
             local_head,
             normalized: DeviceAllocation::new(library, capacity * self.draft_width * 10240)?,
             weights: self,
-            stream: LoadStream {
-                library,
-                raw: library.cuda_stream_create()?,
-            },
-            markov: self.markov(capacity, DsparkMarkov::device_bytes(capacity)?)?,
+            stream: stream.clone(),
+            markov: self.markov_on(capacity, DsparkMarkov::device_bytes(capacity)?, Some(stream.clone()))?,
             confidence: self
-                .confidence(capacity * self.draft_width, DsparkConfidence::device_bytes(capacity * self.draft_width)?)?,
+                .confidence_on(capacity * self.draft_width, DsparkConfidence::device_bytes(capacity * self.draft_width)?, Some(stream.clone()))?,
             sample: library.v41_draft_step()?,
             hc: library.v41_hc()?,
             residual: DeviceAllocation::new(library, capacity * self.draft_width * 40960)?,

@@ -85,7 +85,7 @@ struct DenseWeights<'a> {
 
 pub(super) struct DenseFfn<'a> {
     // Fields drop in declaration order: drain before storage or programs retire.
-    stream: Stream<'a>,
+    stream: std::rc::Rc<Stream<'a>>,
     planes: Vec<Plane<'a>>,
     /// The rank's serialized native projection scratch (native FFNs only).
     native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
@@ -451,7 +451,10 @@ impl<'a> DenseFfn<'a> {
         ensure!(spans.iter().zip(&admission.planes).all(|(span, &bytes)| span.1 == bytes),
             "Step-5 dense region layout differs from admission");
         let planes = scratch::region_planes(device, &spans, arena)?;
-        let stream = Stream::new(device)?;
+        // Arena components share Staging's persistent stream; standalone owners
+        // create a private stream. The retained Rc outlives captured graphs.
+        let stream = match arena { Some((arena, _)) => arena.stream(),
+            None => std::rc::Rc::new(Stream::new(device)?) };
         Ok(Self { stream, planes, native_scratch: None, admission, immutable, unit: std::cell::Cell::new(0) })
     }
 
@@ -1020,5 +1023,11 @@ mod tests {
             "native GEMM FP64 error exceeds 1.01 times official same-operand cuBLAS error"
         );
         Ok(())
+    }
+}
+
+impl Drop for DenseFfn<'_> {
+    fn drop(&mut self) {
+        self.stream.drain_or_abort("Step-5 ffn workspace");
     }
 }

@@ -163,7 +163,7 @@ struct SwaWeights<'a> {
 
 pub(super) struct SwaLayer<'a> {
     // This stream drains before every composed owner, including the FFN.
-    stream: Stream<'a>,
+    stream: std::rc::Rc<Stream<'a>>,
     ffn: Option<DenseFfn<'a>>,
     planes: Vec<Plane<'a>>,
     native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
@@ -489,7 +489,10 @@ impl<'a> SwaLayer<'a> {
     fn workspace(device: Device<'a>, admission: Admission,
         immutable: std::rc::Rc<SwaWeights<'a>>, ffn: Option<DenseFfn<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
         let planes = scratch::planes(device, &admission.planes, arena)?;
-        let stream = Stream::new(device)?;
+        // Arena components share Staging's persistent stream; standalone owners
+        // create a private stream. The retained Rc outlives captured graphs.
+        let stream = match arena { Some((arena, _)) => arena.stream(),
+            None => std::rc::Rc::new(Stream::new(device)?) };
         let rows = admission.rows;
         let owner = Self { stream, ffn, planes, native_scratch: None, admission, immutable };
         if arena.is_none() {
@@ -1523,5 +1526,11 @@ mod tests {
         assert!(Admission::new(1, &[1000], 2000, 3000, a.bytes - 1, &[]).is_err());
         assert!(Admission::new(1, &[], 0, 0, u64::MAX, &[u64::MAX]).is_err());
         Ok(())
+    }
+}
+
+impl Drop for SwaLayer<'_> {
+    fn drop(&mut self) {
+        self.stream.drain_or_abort("Step-5 swa workspace");
     }
 }

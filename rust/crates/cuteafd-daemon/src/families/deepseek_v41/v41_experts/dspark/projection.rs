@@ -101,7 +101,9 @@ pub(super) fn pack_scales<'a>(
         .context("expected thirteen dSpark projection scales")
 }
 pub(crate) struct DsparkProjection<'weights, 'library> {
-    stream: LoadStream<'library>,
+    // The containing draft owner creates this stream and serializes all users.
+    // Retain it through standalone graph retirement; Drop drains before planes retire.
+    stream: std::rc::Rc<LoadStream<'library>>,
     kernel: V41Fp8Plan<'library>,
     _weights: &'weights DsparkWeights<'library>,
     weight: CuteafdDeviceBuffer,
@@ -135,6 +137,13 @@ impl<'library> DsparkWeights<'library> {
     unsafe fn projection_input(
         &self, kind: ProjectionKind, capacity: u32, external: Option<CuteafdDeviceBuffer>, budget: usize,
     ) -> Result<DsparkProjection<'_, 'library>> {
+        unsafe { self.projection_input_on(kind, capacity, external, budget, None) }
+    }
+
+    pub(super) unsafe fn projection_input_on(
+        &self, kind: ProjectionKind, capacity: u32, external: Option<CuteafdDeviceBuffer>, budget: usize,
+        shared_stream: Option<std::rc::Rc<LoadStream<'library>>>,
+    ) -> Result<DsparkProjection<'_, 'library>> {
         let library = self.library;
         ensure!(
             (if external.is_some() { DsparkProjection::external_input_bytes(library, kind, capacity)? }
@@ -149,10 +158,7 @@ impl<'library> DsparkWeights<'library> {
             && input.device_id == self.tensor(&format!("{name}.weight"))?.device_id,
             "projection input extent or device differs");
         let value = DsparkProjection {
-            stream: LoadStream {
-                library,
-                raw: library.cuda_stream_create()?,
-            },
+            stream: match shared_stream { Some(stream) => stream, None => std::rc::Rc::new(LoadStream { library, raw: library.cuda_stream_create()? }) },
             scratch: DeviceAllocation::new(library, kernel.info().scratch_bytes as usize)?,
             kernel,
             _weights: self,

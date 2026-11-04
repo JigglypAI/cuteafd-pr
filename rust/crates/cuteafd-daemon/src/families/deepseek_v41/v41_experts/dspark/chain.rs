@@ -12,7 +12,8 @@ mod distributed;
 pub(crate) use distributed::DistributedDsparkChain;
 
 pub(crate) struct DsparkChain<'weights, 'library> {
-    stream: LoadStream<'library>,
+    // Chain creates the stream; sequential stages retain it through graph retirement.
+    stream: std::rc::Rc<LoadStream<'library>>,
     timing: crate::shared::draft::timing::DraftTiming<'library>,
     /// Live draft width; storage and the maximum are fixed at load time.
     width: usize,
@@ -113,18 +114,16 @@ impl<'library> DsparkWeights<'library> {
         );
         let library = self.library;
         let bytes = self.stage_bytes(requests)?;
+        let stream = std::rc::Rc::new(LoadStream { library, raw: library.cuda_stream_create()? });
         Ok(DsparkChain {
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "v41-dspark")?,
             width: self.draft_width,
             maximum: self.draft_width,
-            stream: LoadStream {
-                library,
-                raw: library.cuda_stream_create()?,
-            },
+            stream: stream.clone(),
             stages: [
-                self.stage(0, requests, bytes)?,
-                self.stage(1, requests, bytes)?,
-                self.stage(2, requests, bytes)?,
+                self.stage_on(0, requests, bytes, Some(stream.clone()))?,
+                self.stage_on(1, requests, bytes, Some(stream.clone()))?,
+                self.stage_on(2, requests, bytes, Some(stream.clone()))?,
             ],
             graphs: GraphBank::new(None),
             ready: None,

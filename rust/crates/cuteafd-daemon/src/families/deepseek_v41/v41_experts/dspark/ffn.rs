@@ -26,18 +26,23 @@ impl<'library> DsparkWeights<'library> {
         capacity: u32,
         budget: usize,
     ) -> Result<DsparkFfn<'_, 'library>> {
+        self.ffn_on(stage, capacity, budget, None)
+    }
+    pub(super) fn ffn_on(
+        &self,
+        stage: usize,
+        capacity: u32,
+        budget: usize,
+        stream: Option<std::rc::Rc<crate::shared::memory::LoadStream<'library>>>,
+    ) -> Result<DsparkFfn<'_, 'library>> {
         ensure!(stage < 3, "invalid dSpark FFN stage");
         let bytes = self.ffn_bytes(capacity)?;
         ensure!(bytes <= budget, "dSpark FFN exceeds device budget");
         let library = self.library;
         Ok(DsparkFfn {
             experts: self.expert_wave(stage, capacity)?,
-            boundary: self.hc_sublayer(
-                stage,
-                false,
-                capacity as usize,
-                HcSublayer::device_bytes(capacity as usize)?,
-            )?,
+            boundary: match stream { Some(stream) => self.hc_sublayer_on(stage, false, capacity as usize, stream)?,
+                None => self.hc_sublayer(stage, false, capacity as usize, HcSublayer::device_bytes(capacity as usize)?)? },
             router: self.router(
                 stage,
                 capacity as usize,

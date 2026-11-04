@@ -7,7 +7,9 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41DsparkAttention};
 use std::ffi::c_void;
 pub(crate) struct DsparkAttentionWave<'weights, 'library> {
-    stream: LoadStream<'library>,
+    // The containing draft owner creates this stream and serializes all users.
+    // Retain it through standalone graph retirement; Drop drains before planes retire.
+    stream: std::rc::Rc<LoadStream<'library>>,
     qa: DsparkProjection<'weights, 'library>,
     qb: DsparkProjection<'weights, 'library>,
     kv: DsparkProjection<'weights, 'library>,
@@ -33,6 +35,16 @@ impl<'library> DsparkWeights<'library> {
         requests: u32,
         budget: usize,
     ) -> Result<DsparkAttentionWave<'_, 'library>> {
+        self.attention_wave_on(stage, requests, budget, None)
+    }
+
+    pub(super) fn attention_wave_on(
+        &self,
+        stage: usize,
+        requests: u32,
+        budget: usize,
+        shared_stream: Option<std::rc::Rc<LoadStream<'library>>>,
+    ) -> Result<DsparkAttentionWave<'_, 'library>> {
         ensure!(stage < 3, "invalid dSpark attention stage");
         let library = self.library;
         ensure!(
@@ -41,25 +53,24 @@ impl<'library> DsparkWeights<'library> {
         );
         let rows = requests * self.draft_width as u32;
         let capacity = DsparkAttentionWave::projection_capacity_with_width(requests, self.draft_width)?;
-        let projection = |kind| {
-            self.projection(
+        let stream = match shared_stream { Some(stream) => stream,
+            None => std::rc::Rc::new(LoadStream { library, raw: library.cuda_stream_create()? }) };
+        let projection = |kind| unsafe {
+            self.projection_input_on(
                 kind,
-                capacity,
-                DsparkProjection::device_bytes(library, kind, capacity)?,
+                capacity, None,
+                DsparkProjection::device_bytes(library, kind, capacity)?, Some(stream.clone()),
             )
         };
         Ok(DsparkAttentionWave {
-            stream: LoadStream {
-                library,
-                raw: library.cuda_stream_create()?,
-            },
+            stream: stream.clone(),
             qa: projection(ProjectionKind::QueryA(stage))?,
             qb: projection(ProjectionKind::QueryB(stage))?,
             kv: projection(ProjectionKind::Kv(stage))?,
-            output: self.attention_output(
+            output: self.attention_output_on(
                 stage,
                 capacity,
-                DsparkAttentionOutput::device_bytes(library, capacity)?,
+                DsparkAttentionOutput::device_bytes(library, capacity)?, Some(stream.clone()),
             )?,
             ops: library.v41_attention_ops_width(self.draft_width)?,
             attention: library.v41_dspark_attention_width(self.draft_width)?,

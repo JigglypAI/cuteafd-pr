@@ -14,7 +14,7 @@ pub(crate) struct HcBinding<'w, 'a> {
 /// contract: every plane is cross-hook state, so units own disjoint rows; there
 /// is no scratch). Prefill slots share one per GPU; decode lanes own theirs.
 pub(crate) struct HcStorage<'library> {
-    stream: LoadStream<'library>,
+    stream: std::rc::Rc<LoadStream<'library>>,
     residual: DeviceAllocation<'library>,
     incoming_pre: DeviceAllocation<'library>,
     next_pre: DeviceAllocation<'library>,
@@ -28,9 +28,15 @@ pub(crate) struct HcStorage<'library> {
 }
 impl<'library> HcStorage<'library> {
     pub(crate) fn new(library: &'library NativeLibrary, rows: usize) -> Result<std::rc::Rc<Self>> {
+        Self::with_stream(library, rows, std::rc::Rc::new(LoadStream { library, raw: library.cuda_stream_create()? }))
+    }
+    /// The containing dSpark owner creates the stream and serializes its boundaries.
+    /// Retaining it here keeps standalone graphs live through their drained retirement.
+    pub(crate) fn with_stream(library: &'library NativeLibrary, rows: usize,
+        stream: std::rc::Rc<LoadStream<'library>>) -> Result<std::rc::Rc<Self>> {
         ensure!((1..=crate::shared::memory::row_window::MAX_RESERVE_ROWS).contains(&rows), "invalid mHC storage rows {rows}");
         Ok(std::rc::Rc::new(Self {
-            stream: LoadStream { library, raw: library.cuda_stream_create()? },
+            stream,
             residual: DeviceAllocation::new(library, rows * 40960)?,
             incoming_pre: DeviceAllocation::new(library, rows * 16)?,
             next_pre: DeviceAllocation::new(library, rows * 16)?,

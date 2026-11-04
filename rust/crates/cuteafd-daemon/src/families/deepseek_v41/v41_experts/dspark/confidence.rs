@@ -7,7 +7,9 @@ use std::ffi::c_void;
 
 /// Stable per-wave confidence inputs/output; borrowed weights outlive its graph.
 pub(crate) struct DsparkConfidence<'weights, 'library> {
-    stream: LoadStream<'library>,
+    // The containing draft owner creates this stream and serializes all users.
+    // Retain it through standalone graph retirement; Drop drains before planes retire.
+    stream: std::rc::Rc<LoadStream<'library>>,
     hidden: DeviceAllocation<'library>,
     markov: DeviceAllocation<'library>,
     output: DeviceAllocation<'library>,
@@ -23,6 +25,15 @@ impl<'library> DsparkWeights<'library> {
         capacity: usize,
         available_device_bytes: usize,
     ) -> Result<DsparkConfidence<'_, 'library>> {
+        self.confidence_on(capacity, available_device_bytes, None)
+    }
+
+    pub(super) fn confidence_on(
+        &self,
+        capacity: usize,
+        available_device_bytes: usize,
+        shared_stream: Option<std::rc::Rc<LoadStream<'library>>>,
+    ) -> Result<DsparkConfidence<'_, 'library>> {
         let bytes = DsparkConfidence::device_bytes(capacity)?;
         ensure!(
             bytes <= available_device_bytes,
@@ -33,10 +44,7 @@ impl<'library> DsparkWeights<'library> {
         // Resolve the final-stage checkpoint weight before allocating workspace.
         self.tensor("mtp.2.confidence_head.proj.weight")?;
         Ok(DsparkConfidence {
-            stream: LoadStream {
-                library,
-                raw: library.cuda_stream_create()?,
-            },
+            stream: match shared_stream { Some(stream) => stream, None => std::rc::Rc::new(LoadStream { library, raw: library.cuda_stream_create()? }) },
             hidden: DeviceAllocation::new(library, capacity * 10240)?,
             markov: DeviceAllocation::new(library, capacity * 512)?,
             output: DeviceAllocation::new(library, capacity * 4)?,
