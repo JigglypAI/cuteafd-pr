@@ -196,7 +196,7 @@ def test_live_planner_skip_is_explicit_and_recorded(tmp_path, monkeypatch):
     calls = _fake(monkeypatch, [(0, BUILD_OK), (0, 'test result: ok. 1 passed; 0 failed; 0 ignored\n')])
     result = gate.cargo(ROOT, tmp_path, SimpleNamespace(**{**vars(ARGS), 'skip_live_planners': True}), {})
     test_cmd = calls[1]
-    assert test_cmd[-1] == '--exact' and test_cmd.count('--skip') == len(gate.FULL_TESTS) + 2
+    assert test_cmd[-1] == '--exact' and test_cmd.count('--skip') == len(set(gate.FULL_TESTS) | set(gate.LIVE_PLANNERS))
     assert result['skipped_live_planners'] == list(gate.LIVE_PLANNERS)
     record = {'task': 't', 'verdict': 'pass', 'head': 'a' * 40, 'dirty': False, 'suites': [result]}
     assert 'live V4 planner tests skipped' in gate.render(record)
@@ -229,7 +229,7 @@ def test_default_and_full_select_the_same_named_tests_in_both_runners(tmp_path, 
             assert command[command.index('--') + 2:-1:2] == list(gate.FULL_TESTS)
     record = {'task': 't', 'verdict': 'pass', 'head': 'a' * 40, 'dirty': False, 'suites': [result]}
     assert ('not a merge/release gate' in gate.render(record)) != full
-    assert len(gate.FULL_TESTS) == len(set(gate.FULL_TESTS)) == 17
+    assert len(gate.FULL_TESTS) == len(set(gate.FULL_TESTS)) == 21
     for name in gate.INSTALLED_PLANNERS:
         assert name in gate.FULL_TESTS
 
@@ -666,3 +666,9 @@ def test_gate_scrubs_inherited_compiler_cache_env_and_records_names(tmp_path, mo
         assert env.get('KEEP_PLAIN_VAR') == 'kept'
         for key in expected_scrubbed:
             assert key not in env
+
+
+def test_v4_live_planners_are_explicit_full_tier_requirements():
+    assert set(gate.LIVE_PLANNERS) <= set(gate.FULL_TESTS)
+    assert 'families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4_measured' in gate.LIVE_PLANNERS
+    assert 'serving_capacity::v4_placement::tp2_tests::real_tp2_costs_match_catalog_reference' in gate.LIVE_PLANNERS

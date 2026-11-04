@@ -5,7 +5,7 @@
 
 --jobs is the total worker budget: split evenly between Cargo and pytest when
 both run, otherwise given entirely to the requested suite. Default excludes
-15 measured full-plan/cache tests; --full restores them and is required for
+measured full-plan/cache and live V4 tests; --full restores them and is required for
 dev merges and releases. This includes the installed-example deployment-to-
 release_prefill_shape sweep: HF_HOME (or ~/.cache/huggingface) is the default
 inventory; CUTEAFD_DEPLOYMENT_TEST_HF_HOME overrides it. Missing checkpoints skip.
@@ -39,7 +39,9 @@ alone: a suite passes only when its summaries report more than zero tests and
 no failures. Failing test ids are listed per suite. --base REV runs the same
 gate on a detached worktree of REV and reports only the ids that are new in
 this checkout. --skip-live-planners skips the slow live-inventory V4 planner
-tests (real checkpoints + manifests) and records that choice.
+tests (real checkpoints + manifests) and records that choice. Unlike the optional
+installed-example sweep, V4 live tests fail when their required inputs are missing.
+Their compiler provenance must match the checkout's SparkInfer pin.
 
 Writes NAME/cpu-gate.json and NAME/cpu-gate.md; exit 0 only when every
 requested suite passed (or, with --base, introduced no new failing ids).
@@ -72,7 +74,9 @@ REPO = Path(__file__).resolve().parents[2]
 BUILDS = Path.home() / '.cache/cuteafd/builds'
 # Real-checkpoint V4 placement tests: minutes each, need sparknest snapshots.
 LIVE_PLANNERS = ('families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4',
-                 'families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4_missing_tp2_package')
+                 'families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4_missing_tp2_package',
+                 'families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4_measured',
+                 'serving_capacity::v4_placement::tp2_tests::real_tp2_costs_match_catalog_reference')
 INSTALLED_PLANNERS = (
     'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
     'installed_example_deployments_publish_executable_prefill_shapes',
@@ -80,6 +84,7 @@ INSTALLED_PLANNERS = (
 )
 # Actual >60s IDs from the 081a00072 full gate, plus installed-checkpoint planners.
 FULL_TESTS = (
+    *LIVE_PLANNERS,
     'families::kimi_k3::admission::tests::installed_max_planner_and_runtime_remaining_kv_match_per_gpu',
     'plan::families::step5::tests::adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity',
     'families::step5::admission::tests::public_nvfp4_min_card_planner_equals_measured_daemon_before_allocation',
@@ -479,7 +484,7 @@ def cargo(source, root, args, env):
     skipped_live = list(LIVE_PLANNERS) if args.skip_live_planners else []
     if full:
         skipped_live.extend(list(INSTALLED_PLANNERS) if args.skip_live_planners else installed_planner_skips(source, env))
-    skipped = skipped_full + skipped_live
+    skipped = list(dict.fromkeys(skipped_full + skipped_live))
     skips = [flag for name in skipped for flag in ('--skip', name)]
     test_args = ['nice', '-n', '19', 'cargo', 'test', '--workspace', '--locked', '--no-fail-fast', '--', *skips]
     if skips:
