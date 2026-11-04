@@ -545,9 +545,10 @@ impl<'a> Admission<'a> {
         ensure!(!self.kda_allocated[rank], "Kimi KDA bank already allocated");
         for demand in self.kda_layout.demands(rank as u8)? {
             let charges = self.placement.items[rank].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
-            ensure!(charges.len() == 1 && charges[0].category == demand.category
-                && charges[0].basis == Basis::Exact && charges[0].bytes == demand.bytes,
-                "Kimi KDA allocation differs from accepted native pool charge");
+            ensure!(if demand.bytes == 0 { charges.is_empty() } else {
+                charges.len() == 1 && charges[0].category == demand.category
+                    && charges[0].basis == Basis::Exact && charges[0].bytes == demand.bytes
+            }, "Kimi KDA allocation differs from accepted native pool charge");
         }
         Ok(())
     }

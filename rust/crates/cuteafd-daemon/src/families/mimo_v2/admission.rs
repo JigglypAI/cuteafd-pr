@@ -475,6 +475,9 @@ fn preflight_shape(
     };
     let spark_profiles = profiles_for(spark_ranks)?;
     let no_spark_profiles = if spark_ranks == 0 { spark_profiles.clone() } else { profiles_for(0)? };
+    let mut resident_weights = spark_profiles.resident_weights.clone();
+    cuteafd_loader::placement::families::mimo_v2::add_local_media_weights(&mut resident_weights,
+        &devices, args.planner_media_weights, crate::shared::memory::budget::resident_weight_limit())?;
     let policy = CapacityPolicy {
         concurrency: u32::try_from(concurrency)?,
         small_card_headroom: true,
@@ -496,7 +499,7 @@ fn preflight_shape(
     use cuteafd_loader::placement::{Baseline, families::mimo_v2::{MimoInputs, solve_working_set, resolved_capacity}};
     let inputs = MimoInputs {
         resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), automatic_context: automatic_context,
-        cfg, resident_weights: spark_profiles.resident_weights.clone(), profile: &spark_profiles.steady, layers, kv, mtp_stages: args.mtp,
+        cfg, resident_weights, profile: &spark_profiles.steady, layers, kv, mtp_stages: args.mtp,
         gpus: memory.iter().map(|m| (m.total_bytes, Baseline::Measured { free_bytes: m.baseline_free_bytes })).collect(),
         headroom_floor: 0, spark_ranks, startup_probe_bytes: intake_probe_bytes,
         context: args.max_context as u64, requested_pool: policy.pool_tokens, pool_ceiling_at_target: false,

@@ -66,11 +66,19 @@ impl RemoteAudio {
     }
 }
 
+fn checkpoint_weights(vision: Option<cuteafd_ffi::vision::VisionLedger>,
+    audio: Option<cuteafd_ffi::audio::AudioLedger>) -> Result<cuteafd_loader::placement::ResidentWeights> {
+    use cuteafd_loader::placement::ResidentWeights;
+    Ok(ResidentWeights(vision.map_or(0, |ledger| ledger.weights))
+        .checked_add(ResidentWeights(audio.map_or(0, |ledger| ledger.weights)))?)
+}
+
 pub(super) struct ReadyVision {
     pub encoder: Encoder,
     pub preparer: Option<Arc<MediaPreparer>>,
     pub audio_preparer: Option<Arc<cuteafd_api::openai::media::audio::AudioPreparer>>,
     pub cache_bytes: usize,
+    pub weights: Option<(i32, cuteafd_loader::placement::ResidentWeights)>,
 }
 impl ReadyVision {
     pub fn load(args: &super::EngineArgs, library: &cuteafd_ffi::NativeLibrary, mode: MediaMode,
@@ -123,6 +131,7 @@ impl ReadyVision {
                 std::time::Duration::from_secs(60))?);
             audio_preparer = Some(Arc::new(cuteafd_api::openai::media::audio::AudioPreparer::new(id, slots.clone())));
         }
+        let mut weights = None;
         let has_local_image = spec.is_some();
         let has_local_audio = audio_spec.is_some();
         let local = if has_local_image || has_local_audio {
@@ -150,16 +159,22 @@ impl ReadyVision {
                 image_preparer.slots = slots.clone();
                 preparer = Some(Arc::new(image_preparer));
             }
-            let vision_bytes = spec.as_ref().map(|spec| cuteafd_ffi::vision::NativeVision::required(&args.native_lib, &spec.native)
-                .map(|ledger| ledger.total_bytes())).transpose()?.unwrap_or(0);
+            let vision_ledger = spec.as_ref().map(|spec|
+                cuteafd_ffi::vision::NativeVision::required(&args.native_lib, &spec.native)).transpose()?;
+            let vision_bytes = vision_ledger.map_or(0, |ledger| ledger.total_bytes());
+            let mut resident_weights = checkpoint_weights(vision_ledger, None)?;
             let audio = audio_spec.map(|spec| -> Result<_> {
                 let backend = cuteafd_ffi::audio::NativeAudio::backend(&args.native_lib)?;
                 audio_preparer = Some(Arc::new(cuteafd_api::openai::media::audio::AudioPreparer::new(
                     spec.plan().encoder_id(revision, sm, &backend), slots.clone())));
-                let bytes = cuteafd_ffi::audio::NativeAudio::required(&args.native_lib, spec.native())?.total_bytes()?;
+                let ledger = cuteafd_ffi::audio::NativeAudio::required(&args.native_lib, spec.native())?;
+                resident_weights = resident_weights.checked_add(checkpoint_weights(None, Some(ledger))?)?;
+                let bytes = ledger.total_bytes()?;
                 Ok(crate::shared::vision::audio::AudioOwnerConfig::Mimo { spec, admitted_bytes: bytes })
             }).transpose()?;
             let audio_bytes = audio.as_ref().map_or(0, |config| config.admitted_bytes());
+            resident_weights.check(u8::try_from(gpu)?, crate::shared::memory::budget::resident_weight_limit())?;
+            weights = Some((gpu, resident_weights));
             library.cuda_set_device(gpu)?;
             let loaded = (|| -> Result<_> {
                 let (free, total) = library.cuda_memory_info()?;
@@ -187,7 +202,7 @@ impl ReadyVision {
             (_, _, None) => Encoder::split(image_encoder, audio_encoder),
             _ => unreachable!(),
         };
-        Ok((Some(Self { encoder, preparer, audio_preparer, cache_bytes }), prefix))
+        Ok((Some(Self { encoder, preparer, audio_preparer, cache_bytes, weights }), prefix))
     }
 }
 
@@ -482,6 +497,21 @@ mod tests {
     use super::*;
     use cuteafd_core::TargetSamplingParams;
     use cuteafd_loader::media::{ImageGrid, ImageKey, PreparedImage};
+
+    #[test]
+    fn local_media_checkpoint_resources_exclude_scratch_and_remote_towers() {
+        use cuteafd_loader::placement::ResidentWeights;
+        let vision = cuteafd_ffi::vision::VisionLedger { weights: 123, scratch: u64::MAX,
+            blas_workspace: u64::MAX, ..Default::default() };
+        let audio = cuteafd_ffi::audio::AudioLedger { weights: 456, scratch: u64::MAX,
+            blas_workspace: u64::MAX, fft_workspace: u64::MAX, ..Default::default() };
+        assert_eq!(checkpoint_weights(Some(vision), Some(audio)).unwrap(), ResidentWeights(579));
+        assert_eq!(checkpoint_weights(Some(vision), None).unwrap(), ResidentWeights(123));
+        assert_eq!(checkpoint_weights(None, Some(audio)).unwrap(), ResidentWeights(456));
+        assert_eq!(checkpoint_weights(None, None).unwrap(), ResidentWeights(0));
+        assert!(checkpoint_weights(Some(cuteafd_ffi::vision::VisionLedger {
+            weights: u64::MAX, ..vision }), Some(audio)).is_err());
+    }
 
     #[test]
     fn split_owner_tickets_cancel_poll_and_health_are_modality_scoped() {

@@ -1958,7 +1958,19 @@ mod tests {
             assert_eq!(selected.coordinator_gpu_budget_bytes, (95 << 30) + (1 << 29));
             let refused = plan(snapshot.path(), &selected).unwrap();
             assert!(!refused.fits && !refused.executable());
-            assert!(refused.hints.iter().any(|h| h.what.contains("coordinator weights need")), "{:?}", refused.hints);
+            use cuteafd_loader::families::mimo_v2::{MimoV2Config, resident::{MimoResidentLayout, MimoResidentOptions},
+                projection::MimoProjectionRepresentation as R};
+            let checkpoint = cuteafd_loader::plan::Checkpoint::open(snapshot.path()).unwrap();
+            let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
+            let owners = MimoResidentLayout::new(&checkpoint, &cfg, &MimoResidentOptions {
+                layers: cfg.layers, coordinator_ranks: 1, checkpoint_tp: 1, native_mtp_layers: 0,
+                gpu_embedding: true, head_format: R::Fp8,
+                output_formats: (0..cfg.layers).map(|layer|
+                    (format!("model.layers.{layer}.self_attn.o_proj.weight"), R::Fp8)).collect(),
+            }).unwrap();
+            let required = owners.ranks[0].iter().map(|owner| owner.bytes).sum::<u64>();
+            let refusal = format!("rtx0 resident weights need {required} bytes, over the {} byte weight budget", 128 << 20);
+            assert!(refused.hints.iter().any(|h| h.what.contains(&refusal)), "{:?}", refused.hints);
             let error = run_plan(capped).unwrap_err();
             assert!(error.to_string().contains("is not servable"), "{error:#}");
         }

@@ -1304,9 +1304,8 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     Ok(report)
 }
 
-/// Places the routed experts (Spark slices or the coordinator) and checks
-/// memory: the widest Spark rank against the Spark budget, the coordinator's
-/// own tensors (plus every expert, local-only) against its budget.
+/// Inventory display and routed-package compatibility. Native family owners
+/// enforce coordinator resident-weight admission independently of source bytes.
 fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model: &dyn FamilyModel,
     routed_operands: &BTreeMap<String, QuantOperand>) {
     if spec.moe.is_none() {
@@ -1344,7 +1343,6 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
     });
     let intermediate = spec.moe.as_ref().map(|moe| moe.intermediate);
     let gib = |bytes: f64| bytes / GIB;
-    let coordinator = options.coordinator_budget_bytes as f64;
     if routed > 0 {
         let share = |ranks: usize| -> Option<f64> {
             let contract = contract.as_ref()?;
@@ -1429,34 +1427,9 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
                         how: format!("{advice}."),
                     });
                 }
-                // GLM Flash's selected solver ledger checks the full resident layout,
-                // including TP2 halves; source bytes on one GPU are not its admission.
-                Ok(_) if spec.family == "glm5_flash" && options.layout.is_some() => {}
-                Ok(_) => {
-                    let need = (rtx + routed) as f64;
-                    if need > coordinator {
-                        report.fits = false;
-                        report.hints.push(Hint {
-                            what: format!("local-only placement needs {:.1} GiB on the coordinator GPU ({:.1} GiB \
-                                routed experts + {:.1} GiB other weights), {:.1} GiB over the {:.0} GiB budget",
-                                gib(need), gib(routed as f64), gib(rtx as f64), gib(need - coordinator), gib(coordinator)),
-                            how: format!("{advice}."),
-                        });
-                    }
-                }
+                Ok(_) => {}
             },
         }
-    }
-    // The weight budget is per coordinator GPU; a head-split layout spreads
-    // the backbone over each GPU it names.
-    let gpus = options.layout.as_ref().filter(|l| l.head_split).map_or(1, |l| l.rtx_bytes.len().max(1));
-    if options.placement != ExpertPlacement::Local && rtx as f64 > coordinator * gpus as f64 {
-        report.fits = false;
-        report.hints.push(Hint {
-            what: format!("coordinator weights need {:.1} GiB, over the {:.0} GiB coordinator budget{}",
-                gib(rtx as f64), gib(coordinator * gpus as f64), if gpus > 1 { format!(" ({gpus} GPUs)") } else { String::new() }),
-            how: "Split the backbone over two coordinator GPUs or move components to Sparks.".into(),
-        });
     }
     report.experts = contract;
 }
