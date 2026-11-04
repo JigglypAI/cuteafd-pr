@@ -117,9 +117,10 @@ impl<'a> Load<'a> {
 
     pub fn absorb(&self, name: &str, heads: usize, nope: usize, value: usize, latent: usize,
         stream: *mut c_void) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
-        let source = self.source.rect(name, &[heads * (nope + value), latent])?;
-        let uk = DeviceAllocation::new(self.library, heads * latent * nope * 2)?;
-        let uv = DeviceAllocation::new(self.library, heads * value * latent * 2)?;
+        let (rows, _, uk_head, uv_head) = absorb_geometry(heads, nope, value, latent)?;
+        let source = self.source.rect(name, &[heads * rows, latent])?;
+        let uk = DeviceAllocation::new(self.library, heads * uk_head)?;
+        let uv = DeviceAllocation::new(self.library, heads * uv_head)?;
         absorb_into(&self.dense, source, heads, nope, value, latent, uk.buffer, uv.buffer, stream)?;
         Ok((uk, uv))
     }
@@ -159,21 +160,33 @@ impl<'a> Load<'a> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn absorb_into(dense: &DenseLoad<'_>, source: Rect, heads: usize, nope: usize, value: usize, latent: usize,
     uk: CuteafdDeviceBuffer, uv: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
-    let rows = nope.checked_add(value).context("draft absorption head rows overflow")?;
-    let head_bytes = rows.checked_mul(latent).and_then(|n| n.checked_mul(2)).context("draft absorption head bytes overflow")?;
-    ensure!(heads > 0 && nope > 0 && value > 0 && latent > 0 && head_bytes <= STEP_BYTES
-        && source.rows.len() == heads.checked_mul(rows).context("draft absorption rows overflow")?
-        && source.width() == latent * 2 && uk.device_id == uv.device_id,
-        "draft absorption geometry differs from source or staging bound");
+    let (rows, head_bytes, uk_head, uv_head) = absorb_geometry(heads, nope, value, latent)?;
+    ensure!(source.rows.len() == heads * rows && source.width() == latent * 2
+        && uk.device_id == uv.device_id && !uk.ptr.is_null() && !uv.ptr.is_null()
+        && uk.bytes >= heads * uk_head && uv.bytes >= heads * uv_head,
+        "draft absorption geometry differs from source or destination");
     let per = STEP_BYTES / head_bytes;
     for first in (0..heads).step_by(per) {
         let count = per.min(heads - first);
         dense.step(Step { device: uk.device_id, rects: vec![source.sub(first * rows..(first + count) * rows)],
             jobs: vec![Job::Absorb { heads: count, nope, v: value, lat: latent,
-                uk: view(uk, first * latent * nope * 2, count * latent * nope * 2)?,
-                uv: view(uv, first * value * latent * 2, count * value * latent * 2)? }] }, stream)?;
+                uk: view(uk, first * uk_head, count * uk_head)?,
+                uv: view(uv, first * uv_head, count * uv_head)? }] }, stream)?;
     }
     Ok(())
+}
+
+fn absorb_geometry(heads: usize, nope: usize, value: usize, latent: usize) -> Result<(usize, usize, usize, usize)> {
+    ensure!(heads > 0 && nope > 0 && value > 0 && latent > 0, "empty draft absorption geometry");
+    let rows = nope.checked_add(value).context("draft absorption head rows overflow")?;
+    let width = latent.checked_mul(2).context("draft absorption row bytes overflow")?;
+    let head = |rows: usize| rows.checked_mul(width).context("draft absorption head bytes overflow");
+    let (source, uk, uv) = (head(rows)?, head(nope)?, head(value)?);
+    for bytes in [rows, source, uk, uv] {
+        heads.checked_mul(bytes).context("draft absorption total extent overflow")?;
+    }
+    ensure!(source <= STEP_BYTES, "draft absorption head exceeds staging bound");
+    Ok((rows, source, uk, uv))
 }
 
 fn view(buffer: CuteafdDeviceBuffer, at: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
@@ -291,6 +304,106 @@ mod tests {
             packed_bytes += n * k;
         }
         assert_eq!(packed_bytes, 2 * rows * cols);
+        Ok(())
+    }
+
+    #[test]
+    fn absorption_geometry_rejects_empty_overflow_and_oversized_heads() {
+        for (heads, nope, value, latent) in [(0, 192, 256, 512), (1, 0, 256, 512),
+            (1, 192, 0, 512), (1, 192, 256, 0), (1, usize::MAX, 1, 512),
+            (1, 192, 256, usize::MAX), (usize::MAX, 192, 256, 512), (1, 192, 256, STEP_BYTES)] {
+            assert!(absorb_geometry(heads, nope, value, latent).is_err());
+        }
+        assert_eq!(absorb_geometry(8, 192, 256, 512).unwrap(), (448, 458752, 196608, 262144));
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn mla_absorption_and_deferred_norms_match_mount_after_push_commit() -> Result<()> {
+        use crate::shared::memory::device::Device;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 1, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        let root = tempfile::tempdir_in(fixture.directory())?;
+        let path = root.path().join("draft.bin");
+        let (heads, nope, value, latent) = (80usize, 192usize, 256usize, 512usize);
+        let (rows, _, uk_head, uv_head) = absorb_geometry(heads, nope, value, latent)?;
+        let source = (0..heads * rows * latent).flat_map(|i|
+            ((i as u16).wrapping_mul(29) ^ ((i >> 16) as u16)).to_le_bytes()).collect::<Vec<_>>();
+        std::fs::write(&path, &source)?;
+        let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        let mut at = source.len();
+        let mut norms = Vec::new();
+        for cols in [256usize, 512] {
+            let bytes = (0..3 * cols).flat_map(|i| {
+                let row = i / cols;
+                let value = if row == 0 { 0.0f32 } else if row == 1 { 1.0 } else { ((i % 7) as f32 - 3.0) * 0.25 };
+                ((value.to_bits() >> 16) as u16).to_le_bytes()
+            }).collect::<Vec<_>>();
+            file.write_all_at(&bytes, at as u64)?;
+            norms.push(Rect { name: format!("markov-{cols}"), path: path.clone(), base: at as u64,
+                row_bytes: cols * 2, rows: 0..3, cols: 0..cols * 2 });
+            at += bytes.len();
+        }
+        let device = Device { library: &library, id: 1 };
+        let load = || device.run(|| {
+            let dense = DenseLoad::mount(&library);
+            let uk = DeviceAllocation::new(&library, heads * uk_head)?;
+            let uv = DeviceAllocation::new(&library, heads * uv_head)?;
+            absorb_into(&dense, Rect { name: "kv_b".into(), path: path.clone(), base: 0,
+                row_bytes: latent * 2, rows: 0..heads * rows, cols: 0..latent * 2 },
+                heads, nope, value, latent, uk.buffer, uv.buffer, std::ptr::null_mut())?;
+            let mut owners = vec![uk, uv];
+            for rect in &norms {
+                let values = DeviceAllocation::new(&library, rect.bytes())?;
+                let output = DeviceAllocation::new(&library, 3 * 4)?;
+                // Poison output to prove recording does not run a Finish early.
+                library.copy_h2d(output.buffer, &[0xff; 12])?;
+                dense.operand(Operand { device: 1, bytes: rect.bytes(), buffer: values.buffer,
+                    lands: vec![(rect.clone(), 0)] })?;
+                dense.finish(Finish::RowNorms { source: values.buffer, norms: output.buffer,
+                    rows: 3, cols: rect.width() / 2 }, std::ptr::null_mut())?;
+                owners.extend([values, output]);
+            }
+            Ok(owners)
+        });
+        let mounted = load()?;
+        let (pushed, records) = dense::recording(load)?;
+        assert_eq!((records.operands.len(), records.steps.len(), records.finishes.len()), (2, 2, 2));
+        assert!(records.steps.iter().all(|step| step.bytes() <= STEP_BYTES));
+        let read = |owner: &DeviceAllocation<'_>| device.run(|| {
+            let mut bytes = vec![0; owner.buffer.bytes];
+            library.copy_d2h(&mut bytes, owner.buffer)?;
+            Ok(bytes)
+        });
+        for index in [3, 5] { assert_eq!(read(&pushed[index])?, [0xff; 12]); }
+        let sockets = tempfile::tempdir_in(fixture.directory())?;
+        crate::shared::experts::rtx::push::tests::receive_pushed(device, None, root.path(), sockets.path(),
+            &records, None, 6, 1)?;
+        for (index, (expected, actual)) in mounted.iter().zip(&pushed).enumerate() {
+            assert_eq!(read(expected)?, read(actual)?, "owner {index}");
+        }
+        let (uk, uv) = (read(&pushed[0])?, read(&pushed[1])?);
+        for h in 0..heads {
+            for c in 0..latent {
+                for r in 0..nope {
+                    let src = ((h * rows + r) * latent + c) * 2;
+                    let dst = ((h * latent + c) * nope + r) * 2;
+                    assert_eq!(&uk[dst..dst + 2], &source[src..src + 2]);
+                }
+            }
+            let start = (h * rows + nope) * latent * 2;
+            assert_eq!(&uv[h * uv_head..(h + 1) * uv_head], &source[start..start + uv_head]);
+        }
+        for (index, cols) in [(3, 256usize), (5, 512)] {
+            let bytes = read(&pushed[index])?;
+            let floats = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+            let expected = if cols == 256 { [0.0f32, 16.0] } else { [1e-6f32, (cols as f32).sqrt().mul_add(1.0001, 1e-6)] };
+            assert_eq!(floats[0].to_bits(), expected[0].to_bits());
+            assert_eq!(floats[1].to_bits(), expected[1].to_bits());
+            assert!(floats[2].is_finite() && floats[2] > 0.0);
+        }
         Ok(())
     }
 
