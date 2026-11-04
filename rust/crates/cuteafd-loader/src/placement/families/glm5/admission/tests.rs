@@ -700,57 +700,92 @@ fn shared_serving_owners_compose_without_family_private_geometry_or_policy() {
     }
 }
 
+fn graph_layers(owners: &[u8], tp2: &[bool]) -> Vec<GlmGraphLayer> {
+    owners.iter().zip(tp2).enumerate().map(|(index, (&owner, &tp2))| GlmGraphLayer {
+        dense: index == 0, tp2, attention_owner: Some(owner),
+    }).collect()
+}
+
 #[test]
-fn owned_graph_census_is_fixed_above_full_context_and_separates_opaque_growth() {
-    use crate::serving_capacity::glm_graphs::glm_owned_startup_graphs;
-    let owners = [0, 1];
-    let tp2 = [false, true];
-    for context in [64, 1024, 1025, 131072, 131073, 262144, 262145, 1 << 20] {
-        let graphs = OwnedGraphs::new(context, &owners, &tp2).unwrap();
-        let floor = (context as usize).div_ceil(super::super::PAGE_ROWS as usize);
-        for pages in [floor, floor + 1, floor * 2, 32768] {
-            let actual = glm_owned_startup_graphs(context as usize, pages, &owners, &tp2).unwrap();
-            assert_eq!(&actual, graphs.startup());
+fn maintained_graph_figures_cover_every_placement_without_an_automatic_growth_margin() {
+    for (attention, gpus) in [(AttentionPlacement::Heads, 1), (AttentionPlacement::Heads, 2),
+        (AttentionPlacement::Context, 2), (AttentionPlacement::Layers, 2)] {
+        let mut layers = graph_layers(&[0, 1], &[false, gpus == 2]);
+        if attention != AttentionPlacement::Layers {
+            for layer in &mut layers { layer.attention_owner = None; }
         }
-        let components = graphs.components(32768).unwrap();
-        assert_eq!(components.len(), 4);
-        for rank in 0..2 {
-            for (index, at) in [Phase::Warmup, Phase::Growth].into_iter().enumerate() {
-                let component = &components[2 * rank + index];
+        for context in [64, 1024, 1025, 131072, 131073, 262144, 262145, 1 << 20] {
+            let graphs = StartupGraphs::new(context, attention, gpus, &layers, 4).unwrap();
+            let floor = (context as usize).div_ceil(PAGE_ROWS as usize);
+            for pages in [floor, floor + 1, floor * 2, 32768] {
+                let actual = glm_declared_graphs(&glm_graph_shapes(context as usize, pages),
+                    attention, gpus, &layers, 4).unwrap();
+                for (rank, declared) in actual.iter().enumerate() {
+                    assert_eq!(declared.fingerprint(rank as u8).unwrap(),
+                        graphs.declared()[rank].fingerprint(rank as u8).unwrap());
+                }
+            }
+            let components = graphs.components(32768).unwrap();
+            assert_eq!(components.len(), gpus, "one whole-set figure, no growth reserve");
+            for (rank, component) in components.iter().enumerate() {
                 let ComponentKind::Allowance(allowance) = &component.kind else {
                     panic!("graphs are opaque, not physical allocations")
                 };
                 assert_eq!(allowance.location, Location::coordinator(rank as u8));
-                assert_eq!(
-                    allowance.lifetime,
-                    Lifetime {
-                        first: at,
-                        last: Phase::Growth
-                    }
-                );
-                assert!(allowance.assumed);
-                assert!(allowance.source.contains("5090 unmeasured"));
-                let expected = if index == 0 {
-                    graphs.startup().inventory.at_ready(rank)
-                } else {
-                    graphs.startup().inventory.growth(rank)
-                };
-                assert_eq!(allowance.bytes, expected);
+                assert_eq!(allowance.lifetime, Lifetime { first: Phase::Warmup, last: Phase::Growth });
+                assert!(allowance.assumed, "these synthetic layouts are estimated, not measured");
+                assert!(allowance.source.contains("instantiate"));
+                let figure = graphs.figures()[rank];
+                assert_eq!(allowance.bytes, figure.bytes);
+                let source = if gpus == 1 { GLM_MIN_GRAPH } else { GLM_MAX_GRAPH[rank] };
+                let keys = if rank == 0 { 16_827u128 } else { 16_614 };
+                assert_eq!(u128::from(figure.bytes),
+                    (u128::from(source.bytes) * graphs.declared()[rank].len() as u128).div_ceil(keys));
                 for pages in [1, floor as u64, 32768] {
-                    assert_eq!(component.bytes.at(pages).unwrap(), expected);
+                    assert_eq!(component.bytes.at(pages).unwrap(), figure.bytes);
                 }
             }
         }
     }
-    assert!(OwnedGraphs::new(0, &owners, &tp2).is_err());
-    assert!(OwnedGraphs::new(64, &[2, 0], &tp2).is_err());
-    assert!(OwnedGraphs::new(64, &owners, &[false]).is_err());
-    assert!(
-        OwnedGraphs::new(64, &owners, &tp2)
-            .unwrap()
-            .components(0)
-            .is_err()
-    );
+    let layers = graph_layers(&[0, 1], &[false, true]);
+    assert!(StartupGraphs::new(0, AttentionPlacement::Layers, 2, &layers, 4).is_err());
+    assert!(StartupGraphs::new(64, AttentionPlacement::Layers, 2,
+        &graph_layers(&[2, 0], &[false, true]), 4).is_err());
+    assert!(StartupGraphs::new(64, AttentionPlacement::Layers, 1, &layers, 4).is_err());
+    assert!(StartupGraphs::new(64, AttentionPlacement::Layers, 2, &layers, 4)
+        .unwrap().components(0).is_err());
+}
+
+#[test]
+fn measured_reference_figures_match_independently_declared_min_max_sets() {
+    let min_layers: Vec<_> = (0..78).map(|layer| GlmGraphLayer {
+        dense: layer < 3, tp2: false, attention_owner: None,
+    }).collect();
+    let mut max_layers = min_layers.clone();
+    for layer in &mut max_layers[3..9] { layer.tp2 = true; }
+    let min = StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 1, &min_layers, 4).unwrap();
+    let max = StartupGraphs::new(1 << 20, AttentionPlacement::Context, 2, &max_layers, 6).unwrap();
+    assert_eq!(min.declared()[0].fingerprint(0).unwrap(), MIN_GRAPHS);
+    assert_eq!(min.figures(), [GLM_MIN_GRAPH]);
+    assert_eq!(min.figures()[0].bytes, 2_560_622_592);
+    assert_eq!(GLM_MIN_CONTEXT.bytes, 598_999_040);
+    assert_eq!(max.figures(), GLM_MAX_GRAPH);
+    assert_eq!(GLM_MAX_CONTEXT.map(|figure| figure.bytes), [594_804_736, 603_193_344]);
+    assert_eq!(GLM_MAX_GRAPH.map(|figure| figure.bytes), [3_042_967_552, 2_971_664_384]);
+    for rank in 0..2 {
+        assert_eq!(max.declared()[rank].fingerprint(rank as u8).unwrap(), MAX_GRAPHS[rank]);
+        assert_eq!(max.figures()[rank].attribution, FigureAttribution::Measured);
+        let ComponentKind::Allowance(allowance) = &max.components(32768).unwrap()[rank].kind else {
+            panic!("expected graph allowance")
+        };
+        assert!(!allowance.assumed);
+        assert_eq!(allowance.bytes, GLM_MAX_GRAPH[rank].bytes);
+    }
+    // Equal counts are not graph-set identity: heads and context have different tables.
+    let heads = StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 2, &max_layers, 6).unwrap();
+    for figure in heads.figures() {
+        assert!(matches!(figure.attribution, FigureAttribution::Estimated { .. }));
+    }
 }
 
 fn owned_graph_recipe(cfg: &GlmDsaConfig, context: u64) -> GlmRecipe<'_> {
@@ -808,7 +843,8 @@ fn owned_graph_recipe(cfg: &GlmDsaConfig, context: u64) -> GlmRecipe<'_> {
                 first: count,
                 last: count,
             }],
-            value: OwnedGraphs::new(context, &[0, 1], &[false, count != 0]).unwrap(),
+            value: StartupGraphs::new(context, AttentionPlacement::Layers, 2,
+                &graph_layers(&[0, 1], &[false, count != 0]), 4).unwrap(),
         });
     }
     recipe
@@ -843,13 +879,11 @@ fn full_context_graph_boundary_keeps_original_pool_domain_and_exact_pins() {
     assert_eq!(plan.pool_tokens, wanted);
     assert_eq!(plan.request.context, context);
     assert_eq!(contract.maximum_pages, 32768);
-    // Actual startup census differs below the full-context floor; those keys
-    // may not be used to make an otherwise infeasible full request appear to fit.
-    let smaller = OwnedGraphs::new(context - 64, &[0, 1], &[false, false]).unwrap();
-    assert_ne!(
-        smaller.startup().keys,
-        recipe.graphs[0].value.startup().keys
-    );
+    // A smaller context changes the declaration; it cannot make the full request fit.
+    let smaller = StartupGraphs::new(context - 64, AttentionPlacement::Layers, 2,
+        &graph_layers(&[0, 1], &[false, false]), 4).unwrap();
+    assert_ne!(smaller.declared()[0].fingerprint(0).unwrap(),
+        recipe.graphs[0].value.declared()[0].fingerprint(0).unwrap());
     request.pool = Pin::Exact(wanted);
     assert_eq!(
         planner::solve(request.clone(), limits.clone(), &recipe)
@@ -891,7 +925,7 @@ fn full_context_graph_boundary_keeps_original_pool_domain_and_exact_pins() {
 }
 
 #[test]
-fn owned_graph_census_must_match_every_activated_onboard_count_and_attention_owner() {
+fn declared_graphs_must_match_every_activated_onboard_count_and_attention_owner() {
     let cfg = cfg();
     let mut recipe = owned_graph_recipe(&cfg, 4096);
     let request = request();
@@ -902,12 +936,14 @@ fn owned_graph_census_must_match_every_activated_onboard_count_and_attention_own
         Err(Refusal::InvalidFact(_))
     ));
     recipe.graphs[0].when = vec![When::Onboard { first: 0, last: 0 }];
-    recipe.graphs[0].value = OwnedGraphs::new(4096, &[1, 0], &[false, false]).unwrap();
+    recipe.graphs[0].value = StartupGraphs::new(4096, AttentionPlacement::Layers, 2,
+        &graph_layers(&[1, 0], &[false, false]), 4).unwrap();
     assert!(matches!(
         recipe.prepare(&request),
         Err(Refusal::InvalidFact(_))
     ));
-    recipe.graphs[0].value = OwnedGraphs::new(2048, &[0, 1], &[false, false]).unwrap();
+    recipe.graphs[0].value = StartupGraphs::new(2048, AttentionPlacement::Layers, 2,
+        &graph_layers(&[0, 1], &[false, false]), 4).unwrap();
     assert!(matches!(
         recipe.prepare(&request),
         Err(Refusal::InvalidFact(_))

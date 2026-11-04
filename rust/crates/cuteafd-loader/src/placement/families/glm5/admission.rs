@@ -4,9 +4,9 @@
 use super::{PAGE_ROWS, weights::WeightInventory};
 use super::{buffers::TargetBuffers, exchanges::ExchangeBuffers, hooks::HookBuffers};
 use crate::families::glm5::GlmDsaConfig;
-use crate::placement::inventory::{GLM_OWNED_SM120_GRAPH_BYTES, StartupGraphs};
-use crate::placement::{LayerMode, planner::*};
-use crate::serving_capacity::glm_graphs::{GlmGraphShape, glm_owned_startup_graphs};
+use crate::placement::inventory::{DeclaredGraphSet, FigureAttribution, FigureIdentity, MemoryFigure};
+use crate::placement::{AttentionPlacement, LayerMode, planner::*};
+use crate::serving_capacity::glm_graphs::{GlmGraphKey, GlmGraphLayer, glm_declared_graphs, glm_graph_shapes};
 use cuteafd_core::spark_reply::SparkReplyFormats;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -61,7 +61,7 @@ pub struct GlmRecipe<'a> {
     pub hooks: Vec<Case<HookBuffers>>,
     pub exchanges: Vec<Case<ExchangeBuffers>>,
     pub weights: Vec<Case<WeightInventory>>,
-    pub graphs: Vec<Case<OwnedGraphs>>,
+    pub graphs: Vec<Case<StartupGraphs>>,
     /// Separate physical decode/prefill links; each rank retains one return reserve.
     pub returns: Vec<Case<ReplyReturns>>,
     /// Expert, drafter, serving, code and temporary physical components.
@@ -179,76 +179,100 @@ impl DflashPrefetch {
     }
 }
 
-/// Exact owned-attention startup keys and separately bounded opaque graph memory.
-/// The selected full context fixes the key census for every admissible pool.
-#[derive(Debug, Clone)]
-pub struct OwnedGraphs {
-    context: u64,
-    owners: Vec<u8>,
-    tp2: Vec<bool>,
-    startup: StartupGraphs<GlmGraphShape>,
+const CENSUS_PROGRAMS: &str = "15a9aea77733f9be49e7871642e92fd65a64a46d4c7eb1711026307c90c391cf";
+const CENSUS_NATIVE: &str = "f5b8d1e1371ae31c97164f08a6da5de293241ef0a4c1c89beeeba7c52a479513";
+const CENSUS_TOOLCHAIN: &str = "rustc 1.98.1 (48a229cea 2026-09-01); binary: rustc; commit-hash: 48a229ceaefd4985c50990b14116b6d856af0985; commit-date: 2026-09-01; host: x86_64-unknown-linux-gnu; release: 1.98.1; LLVM version: 22.1.8";
+const MIN_LAYOUT: &str = "glm53-exl3-k4/47af23347db743b4666d952e2eb48f2b01c3fede; dflash/425aa615ce320caac34400208b30808c8f14f76c/fp8; heads/1; sparks/4; onboard/0; context/1048576; compiled/1048576; pool/1257856; C16; prefill/2752x3; lanes/1; embedding/device; selector/device; replies/bf16,bf16; l2/auto; host-prefix/34359738368; instrumentation/census";
+const MAX_LAYOUT: &str = "glm53-exl3-k4/47af23347db743b4666d952e2eb48f2b01c3fede; dflash/425aa615ce320caac34400208b30808c8f14f76c/fp8; context/2; sparks/6; onboard/3..9/tp2; context/1048576; compiled/1048576; pool/2097152; C16; prefill/2752x3; lanes/1; embedding/device; selector/device; replies/bf16,bf16; l2/auto; host-prefix/34359738368; instrumentation/census";
+const MIN_GRAPHS: &str = "2bae8417cb9862ba77083453922d96de79b52db8de16a9ddebbd821d476afaf6";
+const MAX_GRAPHS: [&str; 2] = [
+    "b3acfa6e5d560b9f0440af62250a9f3b32424f9186deeb769f1a1ed0d5311543",
+    "7f4662ddadd8137dc854f960c69c41469d82662e9e51073d7747ff4b31a61ccf",
+];
+
+const fn measured(bytes: u64, graphs: &'static str, layout: &'static str,
+    commit: &'static str, evidence: &'static str) -> MemoryFigure {
+    MemoryFigure { bytes, attribution: FigureAttribution::Measured, evidence,
+        producing_commit: commit, identity: FigureIdentity { declared_graphs: graphs,
+            programs_sha256: CENSUS_PROGRAMS, native_sha256: CENSUS_NATIVE,
+            toolchain: CENSUS_TOOLCHAIN, gpu_class: "RTX PRO 6000 Blackwell/sm_120/188",
+            driver: "13.2", layout } }
 }
 
-impl OwnedGraphs {
-    pub fn new(context: u64, owners: &[u8], tp2: &[bool]) -> Result<Self, Refusal> {
-        if context == 0 {
-            return Err(invalid("zero graph context"));
+/// Measured parameters, #1242 min census (2026-11-04), retained under
+/// builds/shared-planner-glm-census-min-4a56925e7/glm53-exl3-min-census-r1.
+/// Context is normalized at preweight (context + streams + selected modules).
+/// Graph bytes are the signed immediate instantiate sum, not whole warm growth.
+/// These are not independently qualified bounds, receipts or post-Ready Growth.
+pub const GLM_MIN_CONTEXT: MemoryFigure = measured(598_999_040, MIN_GRAPHS, MIN_LAYOUT,
+    "4a56925e7986a57e3194c0cca6df256838386519", "#1242 glm53-exl3-min-census-r1/preweight");
+pub const GLM_MIN_GRAPH: MemoryFigure = measured(2_560_622_592, MIN_GRAPHS, MIN_LAYOUT,
+    "4a56925e7986a57e3194c0cca6df256838386519", "#1242 glm53-exl3-min-census-r1/instantiate");
+
+/// Measured parameters, #1242 max census (2026-11-04), retained under
+/// builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1.
+/// Preserve logical-rank asymmetry; rank 0 alone captures the terminal head.
+pub const GLM_MAX_CONTEXT: [MemoryFigure; 2] = [
+    measured(594_804_736, MAX_GRAPHS[0], MAX_LAYOUT, "5d180b5c8d76636d5937336638dfd71c15a8d226",
+        "#1242 glm53-exl3-max-census-r1/preweight/rank0"),
+    measured(603_193_344, MAX_GRAPHS[1], MAX_LAYOUT, "5d180b5c8d76636d5937336638dfd71c15a8d226",
+        "#1242 glm53-exl3-max-census-r1/preweight/rank1"),
+];
+pub const GLM_MAX_GRAPH: [MemoryFigure; 2] = [
+    measured(3_042_967_552, MAX_GRAPHS[0], MAX_LAYOUT, "5d180b5c8d76636d5937336638dfd71c15a8d226",
+        "#1242 glm53-exl3-max-census-r1/instantiate/rank0"),
+    measured(2_971_664_384, MAX_GRAPHS[1], MAX_LAYOUT, "5d180b5c8d76636d5937336638dfd71c15a8d226",
+        "#1242 glm53-exl3-max-census-r1/instantiate/rank1"),
+];
+
+/// Independently declared full-context keys plus maintained whole-set figures.
+/// No per-executable calibration, margin or invented post-Ready reserve.
+#[derive(Debug, Clone)]
+pub struct StartupGraphs {
+    context: u64,
+    attention: AttentionPlacement,
+    layers: Vec<GlmGraphLayer>,
+    declared: Vec<DeclaredGraphSet<GlmGraphKey>>,
+    figures: Vec<MemoryFigure>,
+}
+
+impl StartupGraphs {
+    pub fn new(context: u64, attention: AttentionPlacement, gpus: usize,
+        layers: &[GlmGraphLayer], return_ranks: usize) -> Result<Self, Refusal> {
+        if context == 0 { return Err(invalid("zero graph context")); }
+        let extent = usize::try_from(context).map_err(|_| Refusal::Overflow("GLM graph context"))?;
+        let declared = glm_declared_graphs(&glm_graph_shapes(extent, extent.div_ceil(PAGE_ROWS as usize)),
+            attention, gpus, layers, return_ranks).map_err(Refusal::InvalidFact)?;
+        let mut figures = Vec::with_capacity(gpus);
+        for (rank, keys) in declared.iter().enumerate() {
+            let source = if gpus == 1 { GLM_MIN_GRAPH } else { GLM_MAX_GRAPH[rank] };
+            let identity = keys.fingerprint(rank as u8).map_err(Refusal::InvalidFact)?;
+            figures.push(if identity == source.identity.declared_graphs { source } else {
+                // Estimated, not measured: a new declaration changes the graph
+                // set. Scale the named whole min/max set by exact key counts.
+                source.scaled(keys.len() as u64, if rank == 0 { 16_827 } else { 16_614 },
+                    "whole measured min/max instantiate bytes * declared keys / measured declared keys; different graph layout, not per-executable calibration")
+                    .map_err(|error| invalid(error))?
+            });
         }
-        let extent =
-            usize::try_from(context).map_err(|_| Refusal::Overflow("GLM graph context"))?;
-        let startup =
-            glm_owned_startup_graphs(extent, extent.div_ceil(PAGE_ROWS as usize), owners, tp2)
-                .map_err(Refusal::InvalidFact)?;
-        Ok(Self {
-            context,
-            owners: owners.to_vec(),
-            tp2: tp2.to_vec(),
-            startup,
-        })
+        Ok(Self { context, attention, layers: layers.to_vec(), declared, figures })
     }
 
-    pub fn startup(&self) -> &StartupGraphs<GlmGraphShape> {
-        &self.startup
-    }
+    pub fn declared(&self) -> &[DeclaredGraphSet<GlmGraphKey>] { &self.declared }
+    pub fn figures(&self) -> &[MemoryFigure] { &self.figures }
 
     pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
-        if maximum_pages == 0 {
-            return Err(invalid("zero graph pool extent"));
-        }
-        let mut out = Vec::new();
-        for (rank, census) in self.startup.inventory.ranks.iter().enumerate() {
-            let rank = u8::try_from(rank).map_err(|_| Refusal::Overflow("GLM graph rank"))?;
-            let ready = census
-                .executables
-                .checked_mul(GLM_OWNED_SM120_GRAPH_BYTES)
-                .ok_or(Refusal::Overflow("GLM graph executables"))?;
-            let margin = census
-                .bytes
-                .checked_sub(ready)
-                .ok_or_else(|| invalid("graph bound is below executable calibration"))?;
-            if margin != census.margin {
-                return Err(invalid("graph census differs from checked calibration"));
-            }
-            for (bytes, first, name) in [
-                (ready, Phase::Warmup, "startup"),
-                (margin, Phase::Growth, "growth"),
-            ] {
-                out.push(Component {
-                    activation: Activation::always(),
-                    bytes: ByteCurve::fixed(bytes, maximum_pages),
-                    kind: ComponentKind::Allowance(Allowance {
-                        location: Location::coordinator(rank),
-                        bytes,
-                        lifetime: Lifetime { first, last: Phase::Growth },
-                        source: format!("GLM owned graph {name}: exact {} keys at selected context {}, {} executables; SM120 {} B/executable, 10% growth (64 MiB minimum); PRO 6000 per-executable calibration 2026-11-03 (#1102), 5090 unmeasured",
-                            self.startup.keys.len(), self.context, census.executables,
-                            GLM_OWNED_SM120_GRAPH_BYTES),
-                        assumed: true,
-                    }),
-                });
-            }
-        }
-        Ok(out)
+        if maximum_pages == 0 { return Err(invalid("zero graph pool extent")); }
+        Ok(self.figures.iter().enumerate().map(|(rank, figure)| Component {
+            activation: Activation::always(),
+            bytes: ByteCurve::fixed(figure.bytes, maximum_pages),
+            kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(rank as u8),
+                bytes: figure.bytes, lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth },
+                source: format!("GLM startup graph instantiate: {:?}; {}; exact {} declared keys at context {}; producer {}",
+                    figure.attribution, figure.evidence, self.declared[rank].len(), self.context, figure.producing_commit),
+                assumed: matches!(figure.attribution, FigureAttribution::Estimated { .. }),
+            }),
+        }).collect())
     }
 }
 
@@ -638,14 +662,20 @@ impl Recipe for GlmRecipe<'_> {
         }
         for case in &self.graphs {
             let graph = &case.value;
-            if self.gpus != 2
+            if graph.declared.len() != self.gpus
                 || graph.context != self.context
-                || graph.owners.len() != self.attention.len()
-                || self.attention.iter().zip(&graph.owners).any(
-                    |(mode, owner)| !matches!(mode, LayerMode::Whole { gpu, .. } if gpu == owner),
-                )
+                || graph.layers.len() != self.attention.len()
+                || self.attention.iter().zip(&graph.layers).enumerate().any(|(index, (mode, layer))| {
+                    layer.dense != (index < self.cfg.first_moe_layer) || match (graph.attention, mode) {
+                        (AttentionPlacement::Heads, LayerMode::HeadSplit) => layer.attention_owner.is_some(),
+                        (AttentionPlacement::Heads, LayerMode::Whole { gpu: 0, .. }) if self.gpus == 1 => layer.attention_owner.is_some(),
+                        (AttentionPlacement::Context, LayerMode::ContextSplit) => layer.attention_owner.is_some(),
+                        (AttentionPlacement::Layers, LayerMode::Whole { gpu, .. }) => layer.attention_owner != Some(*gpu),
+                        _ => true,
+                    }
+                })
             {
-                return Err(invalid("owned graph geometry differs from contract"));
+                return Err(invalid("startup graph geometry differs from contract"));
             }
             let activation = domains.activation(&case.when)?;
             for clause in &activation.clauses {
@@ -673,8 +703,8 @@ impl Recipe for GlmRecipe<'_> {
                             }
                         }
                     }
-                    if graph.tp2 != tp2 {
-                        return Err(invalid("owned graph TP2 census differs from activation"));
+                    if !graph.layers.iter().map(|layer| layer.tp2).eq(tp2) {
+                        return Err(invalid("startup graph TP2 declaration differs from activation"));
                     }
                 }
             }
