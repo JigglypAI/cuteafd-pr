@@ -1302,7 +1302,7 @@ pub(super) mod tests {
         let rows = unit * waves;
         let spark_bytes = 110 << 30;
         let report = plan_input.plan(&PlanOptions {
-            placement: ExpertPlacement::Sparks { ranks: 6 },
+            placement: ExpertPlacement::Sparks { ranks: 6 }, coordinator_budget_bytes: capacity,
             layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 rtx_bytes: vec![capacity], head_split: false, concurrency: slots as u64,
                 state_slots: Some(slots as u64), prefix_slots: Some(marks as u64),
