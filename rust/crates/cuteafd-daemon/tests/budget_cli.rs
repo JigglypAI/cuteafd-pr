@@ -386,9 +386,13 @@ fn run_installed_glm_exlr8_worker_budget(hf_home: Option<std::ffi::OsString>,
                 .env_remove("COORDINATOR_GPU_BUDGET_GIB");
             command.arg("--workspace-manifest").arg(&programs);
             if let Some(budget) = explicit { command.args(["--spark-budget-gib", budget]); }
+            let start = std::time::Instant::now();
             let output = command.output().unwrap();
+            let elapsed = start.elapsed();
+            eprintln!("installed plan: glm53-exlr8-{name} budget={explicit:?} wall_seconds={:.3}", elapsed.as_secs_f64());
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(output.status.success(), "{name}, budget={explicit:?}: {stderr}");
+            assert!(elapsed < std::time::Duration::from_secs(30), "{name}: plan took {elapsed:?}");
             let deployment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(deployment["spark_ranks"], ranks);
             let devices = deployment["memory_layout"]["devices"].as_array().unwrap().iter()
@@ -405,7 +409,9 @@ fn run_installed_glm_exlr8_worker_budget(hf_home: Option<std::ffi::OsString>,
             let temporary = tempfile::tempdir().unwrap();
             let path = temporary.path().join("deployment.json");
             std::fs::write(&path, &output.stdout).unwrap();
-            let python = Command::new("python3").args(["-I", "-c", r#"
+            let interpreter = std::env::var_os("CUTEAFD_TEST_PYTHON")
+                .expect("CUTEAFD_TEST_PYTHON must name the gate's venv Python for launcher checks");
+            let python = Command::new(interpreter).args(["-I", "-c", r#"
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
@@ -459,7 +465,9 @@ fn installed_flash_exlr8_bounded_spark_plans_preserve_worker_budget_and_capabili
             let temporary = tempfile::tempdir().unwrap();
             let path = temporary.path().join("flash-deployment.json");
             std::fs::write(&path, &output.stdout).unwrap();
-            let python = Command::new("python3").args(["-I", "-c", r#"
+            let interpreter = std::env::var_os("CUTEAFD_TEST_PYTHON")
+                .expect("CUTEAFD_TEST_PYTHON must name the gate's venv Python for launcher checks");
+            let python = Command::new(interpreter).args(["-I", "-c", r#"
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
@@ -582,9 +590,13 @@ fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
             if let Some(value) = config.get(key) { command.args([flag, value]); }
         }
         command.arg("--workspace-manifest").arg(&programs);
+        let start = std::time::Instant::now();
         let output = command.output().unwrap();
+        let elapsed = start.elapsed();
+        eprintln!("installed plan: {name} wall_seconds={:.3}", elapsed.as_secs_f64());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{name}: {stderr}");
+        assert!(elapsed < std::time::Duration::from_secs(30), "{name}: plan took {elapsed:?}");
         let deployment = release_accepts_prefill(&output.stdout);
         tested += 1;
         families.insert(deployment["family"].as_str().unwrap().to_owned());

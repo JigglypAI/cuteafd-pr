@@ -419,6 +419,9 @@ def cargo(source, root, args, env):
         return {**result, 'status': 'failed', 'error': 'compile failed: ' + ('; '.join(tail) or
                 f'exit {code}; missing or unsuccessful build-finished event')}
     full = getattr(args, 'full', False)
+    if full and not args.skip_live_planners:
+        # Installed launcher checks import the same pytest helpers as the script suite.
+        env['CUTEAFD_TEST_PYTHON'] = str(python_for(source))
     if full:
         env.setdefault('CUTEAFD_DEPLOYMENT_TEST_HF_HOME',
                        env.get('HF_HOME') or str(Path(env.get('HOME', str(Path.home()))) / '.cache/huggingface'))
