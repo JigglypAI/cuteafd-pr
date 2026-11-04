@@ -579,6 +579,19 @@ impl MlaPagedState {
         Ok(batches)
     }
 
+    fn reserve_proposals(&mut self, layout: &cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
+        sequences: &[DraftSeq], block: usize, reservations: &mut Vec<cuteafd_engine::prefix::DraftReservation>) -> Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for seq in sequences {
+            ensure!(seen.insert(seq.slot) && self.rings.frontier(seq.slot)? == (seq.valid_from, seq.position),
+                "MLA draft request differs from bound origin/frontier");
+        }
+        if layout.paged_cache().full_layers > 0 {
+            for seq in sequences { reservations.push(self.reserve(seq.slot, seq.position, block)?); }
+        }
+        Ok(())
+    }
+
     fn reserve(&mut self, slot: usize, start: usize, rows: usize)
         -> Result<cuteafd_engine::prefix::DraftReservation> {
         let binding = self.bindings.get(slot).copied().flatten().context("MLA draft unbound slot")?;
@@ -797,6 +810,8 @@ impl MlaContextUpdate {
         layout: &cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout, rows: &[ContextRow])
         -> Result<(Self, Vec<cuteafd_engine::prefix::DraftReservation>)> {
         let mut plan = Self::checked(&state.rings, layout.cache().layers.len(), rows)?;
+        // Window rings own every destination; only full-context layers consume pooled pages.
+        if layout.paged_cache().full_layers == 0 { return Ok((plan, Vec::new())); }
         let mut reservations = Vec::new();
         let result = (|| -> Result<()> {
             let mut grouped = std::collections::BTreeMap::<usize, Vec<&ContextRow>>::new();
@@ -807,7 +822,6 @@ impl MlaContextUpdate {
                 let finish = group[0].position + group.len();
                 let reservation = state.reserve(slot, start, finish - start)?;
                 reservations.push(reservation);
-                if layout.paged_cache().full_layers == 0 { continue; }
                 let physical = state.pool.destinations(reservation)?;
                 for (layer, destinations) in plan.slots.iter_mut().enumerate() {
                     if layout.cache().layers[layer].window().is_some() { continue; }
@@ -2274,15 +2288,8 @@ impl<'a> DflashDrafter<'a> {
         };
         if let Some(lease) = &mut mla_lease {
             let mut state = lease.context.state.borrow_mut();
-            // Validate every frontier before reserving or enqueueing any sequence.
-            let mut seen = std::collections::BTreeSet::new();
-            for seq in sequences {
-                ensure!(seen.insert(seq.slot) && state.rings.frontier(seq.slot)? == (seq.valid_from, seq.position),
-                    "MLA draft request differs from bound origin/frontier");
-            }
-            for seq in sequences {
-                lease.reservations.push(state.reserve(seq.slot, seq.position, block)?);
-            }
+            // Validate every frontier even when window rings need no pooled destinations.
+            state.reserve_proposals(&lease.context.layout, sequences, block, &mut lease.reservations)?;
         }
         let mla_batches = match (&self.context, &w.attention) {
             (DraftContext::Gqa(_), AttentionWorkspace::Gqa(_)) => {
@@ -3123,6 +3130,82 @@ mod checkpoint_header_tests {
     }
 
     #[test]
+    fn mla_window_slots_at_context_boundary_never_reserve_full_context_pages() {
+        use cuteafd_loader::{families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation},
+            formats::dflash::MlaDraftCacheRequest};
+        let mut cfg = mla_config();
+        cfg.windows.fill(Some(RING));
+        let layout = cfg.runtime_layout(GlmDraftRepresentation::Fp8Only,
+            GlmDraftCapacity::new(3, 3, cfg.block).unwrap(), 4096, 4096, 188, 2,
+            cuteafd_core::MlaCacheFormat::Fp8).unwrap();
+        assert_eq!(layout.paged_cache().full_layers, 0);
+        let mut state = MlaPagedState::new(&layout).unwrap();
+        for start in [TAP_ROWS + 19, 4096 - cfg.block] {
+            let origin = start - TAP_ROWS;
+            let mut sequences = Vec::new();
+            for slot in 0..3 {
+                state.reset(slot, origin).unwrap();
+                let rows = (0..TAP_ROWS).map(|tap_row| ContextRow {
+                    tap_row, slot, position: origin + tap_row }).collect::<Vec<_>>();
+                let (plan, reservations) = MlaContextUpdate::checked_paged(&mut state, &layout, &rows).unwrap();
+                assert!(reservations.is_empty());
+                state.rings = plan.next;
+                sequences.push(DraftSeq { slot, anchor: 0, position: start, valid_from: origin });
+            }
+            for _ in 0..9 {
+                let mut reservations = Vec::new();
+                state.reserve_proposals(&layout, &sequences, cfg.block, &mut reservations).unwrap();
+                assert!(reservations.is_empty());
+                let requests = sequences.iter().map(|seq| MlaDraftCacheRequest {
+                    slot: seq.slot, position: seq.position, valid_from: seq.valid_from }).collect::<Vec<_>>();
+                for layer in 0..cfg.windows.len() {
+                    state.block_batches(layer, &requests, &reservations, false).unwrap();
+                }
+                assert_eq!(state.pool.free(), state.pool.capacity());
+            }
+            let mut invalid = sequences.clone();
+            invalid[1].valid_from += 1;
+            assert!(state.reserve_proposals(&layout, &invalid, cfg.block, &mut Vec::new()).is_err());
+            invalid = sequences.clone();
+            invalid[1].slot = invalid[0].slot;
+            assert!(state.reserve_proposals(&layout, &invalid, cfg.block, &mut Vec::new()).is_err());
+            assert_eq!(state.rings.frontier(2).unwrap(), (origin, start));
+        }
+    }
+
+    #[test]
+    fn mla_full_layer_proposals_still_reserve_and_release_pool_pages() {
+        use cuteafd_loader::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        let cfg = mla_config();
+        let layout = cfg.runtime_layout(GlmDraftRepresentation::Fp8Only,
+            GlmDraftCapacity::new(2, 2, cfg.block).unwrap(), 4096, 4096, 188, 2,
+            cuteafd_core::MlaCacheFormat::Fp8).unwrap();
+        assert_eq!(layout.paged_cache().full_layers, 1);
+        let mut state = MlaPagedState::new(&layout).unwrap();
+        let mut sequences = Vec::new();
+        for slot in 0..2 {
+            state.reset(slot, 19).unwrap();
+            let rows = (0..64).map(|tap_row| ContextRow { tap_row, slot, position: 19 + tap_row }).collect::<Vec<_>>();
+            let (plan, reservations) = MlaContextUpdate::checked_paged(&mut state, &layout, &rows).unwrap();
+            assert_eq!(reservations.len(), 1);
+            state.pool.commit(reservations[0], 64).unwrap();
+            state.rings = plan.next;
+            sequences.push(DraftSeq { slot, anchor: 0, position: 83, valid_from: 19 });
+        }
+        assert_eq!(state.pool.free(), 62);
+        let mut reservations = Vec::new();
+        state.reserve_proposals(&layout, &sequences, cfg.block, &mut reservations).unwrap();
+        assert_eq!(reservations.len(), 2);
+        assert_eq!(state.pool.free(), 60);
+        for reservation in reservations {
+            assert_eq!((reservation.start(), reservation.end()), (83, 83 + cfg.block));
+            assert_eq!(state.pool.destinations(reservation).unwrap().len(), cfg.block);
+            state.pool.commit(reservation, 0).unwrap();
+        }
+        assert_eq!(state.pool.free(), 62);
+    }
+
+    #[test]
     fn mla_pooled_producers_and_proposals_share_only_the_admitted_budget() {
         use cuteafd_loader::{families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation},
             formats::dflash::MlaDraftCacheRequest};
@@ -3268,12 +3351,11 @@ mod checkpoint_header_tests {
             let planned = MlaContextUpdate::checked_paged(&mut state, &layout, &tail);
             if valid {
                 let (plan, reservations) = planned.unwrap();
-                assert_eq!(reservations.len(), 1);
-                assert_eq!((reservations[0].start(), reservations[0].end()), (0, 8332));
-                state.pool.commit(reservations[0], 8332).unwrap();
+                assert!(reservations.is_empty());
+                assert_eq!(state.pool.free(), state.pool.capacity());
                 state.rings = plan.next;
                 assert_eq!(state.rings.frontier(0).unwrap(), (0, 8332));
-                assert_eq!(state.pool.frontier(state.bindings[0].unwrap()).unwrap(), (0, 8332));
+                assert_eq!(state.pool.frontier(state.bindings[0].unwrap()).unwrap(), (0, 0));
                 assert_eq!(state.rings.frontier(1).unwrap(), (513, 513));
                 assert!(state.rings.context_rows(0, 0, 8333, RING - 1).is_err());
                 assert!(state.rings.context_rows(0, 0, 8331, RING).is_err());
