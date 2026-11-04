@@ -362,10 +362,9 @@ fn installed_flash_exlr8_bounded_spark_plans_preserve_worker_budget_and_capabili
             let deployment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(deployment["family"], "glm5_flash");
             assert_eq!(deployment["exlr8"]["manifest"], "k4");
-            let admitted = gpus == "1";
-            assert_eq!(deployment["wip_launchable"], admitted);
-            assert_eq!(deployment["report"]["runtime"], if admitted { "serving" } else { "planned" });
-            assert_eq!(deployment["report"]["placement_supported"], admitted);
+            assert_eq!(deployment["wip_launchable"], true);
+            assert_eq!(deployment["report"]["runtime"], "serving");
+            assert_eq!(deployment["report"]["placement_supported"], true);
             assert_eq!(deployment["spark_ranks"], ranks);
             let devices = deployment["memory_layout"]["devices"].as_array().unwrap().iter()
                 .filter(|device| device["kind"] == "spark").collect::<Vec<_>>();
@@ -409,21 +408,19 @@ fn installed_flash_exlr8_automatic_tp2_plan(ranks: &str) -> serde_json::Value {
 
 #[test]
 #[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT and current CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
-#[should_panic(expected = "https://github.com/tpurtell/cuteafd/issues/776: automatic zero-Spark pool must stop at 2M")]
-fn installed_flash_exlr8_automatic_zero_spark_pool_exact_2m_xfail_776() {
+fn installed_flash_exlr8_automatic_zero_spark_pool_stops_at_2m() {
     let deployment = installed_flash_exlr8_automatic_tp2_plan("0");
     let devices = deployment["memory_layout"]["devices"].as_array().unwrap();
     assert_eq!(devices.len(), 2);
     for device in devices {
-        // Remove should_panic when #776 lands: an unexpected pass must demand that cleanup.
         assert_eq!(device["kv_tokens"], 2_097_152,
-            "https://github.com/tpurtell/cuteafd/issues/776: automatic zero-Spark pool must stop at 2M");
+            "automatic zero-Spark pool must stop at its 2M target when capacity permits");
     }
 }
 
 #[test]
 #[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT and current CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
-fn installed_flash_exlr8_automatic_tp2_max_is_zero_spark_and_pending() {
+fn installed_flash_exlr8_automatic_tp2_max_is_zero_spark_and_launchable() {
     // A requested Spark ceiling must not attach idle workers when all routed layers fit locally.
     for ranks in ["0", "6"] {
         let deployment = installed_flash_exlr8_automatic_tp2_plan(ranks);
@@ -432,17 +429,16 @@ fn installed_flash_exlr8_automatic_tp2_max_is_zero_spark_and_pending() {
         assert_eq!(deployment["spark_ranks"], 0);
         assert_eq!(deployment["spark_requirements"]["resident_bytes_per_rank"], serde_json::json!([]));
         assert_eq!(deployment["report"]["fits"], true);
-        assert_eq!(deployment["report"]["runtime"], "planned");
-        assert_eq!(deployment["report"]["placement_supported"], false);
-        assert_eq!(deployment["executable"], false);
-        assert_eq!(deployment["wip_launchable"], false);
+        assert_eq!(deployment["report"]["runtime"], "serving");
+        assert_eq!(deployment["report"]["placement_supported"], true);
+        assert_eq!(deployment["executable"], true);
+        assert_eq!(deployment["wip_launchable"], true);
         let devices = deployment["memory_layout"]["devices"].as_array().unwrap();
         assert_eq!(devices.len(), 2);
         for (rank, device) in devices.iter().enumerate() {
             assert_eq!(device["kind"], "rtx");
             assert_eq!(device["index"], rank);
-            // Explicit zero-Spark pool policy is covered by the exact-2M xfail above.
-            if ranks == "6" { assert_eq!(device["kv_tokens"], 2_097_152); }
+            assert_eq!(device["kv_tokens"], 2_097_152);
             let items = device["items"].as_array().unwrap();
             let routed = items.iter().find(|item| item["group"] == "TP2 expert layer halves 3..45")
                 .expect("all 42 routed layer halves must be resident on each RTX");
