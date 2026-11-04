@@ -5,8 +5,8 @@ use cuteafd_core::memory_layout::Category;
 use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Phase, Receipt};
 
 impl DflashDrafter<'_> {
-    pub(crate) fn allocation_receipts(&self, devices: CoordinatorDevices<'_>) -> Result<Vec<Receipt>> {
-        let mut inventory = Inventory::new(devices, "glm.draft",
+    pub(crate) fn allocation_receipts(&self, devices: CoordinatorDevices<'_>, prefix: &str) -> Result<Vec<Receipt>> {
+        let mut inventory = Inventory::new(devices, prefix,
             Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, Category::Drafter, "draft owners");
         self.fc.allocation_receipts(&mut inventory, "weight.fc")?;
         for (name, owner) in [("hidden_norm", &self.hidden_norm), ("norm", &self.norm),
