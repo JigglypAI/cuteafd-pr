@@ -316,7 +316,7 @@ impl<'a> PeerExchange<'a> {
         let side = |rank: usize| {
             on_device(library, ranks[rank].device, || {
                 let probe = |stage| crate::shared::inventory::startup_probe(
-                    library, &[ranks[rank].device], stage);
+                    library, &[ranks[rank].device], stage, Default::default());
                 probe("peer-abort-before-preload")?;
                 library.peer_abort_initialize()?;
                 probe("peer-abort-after-preload")?;

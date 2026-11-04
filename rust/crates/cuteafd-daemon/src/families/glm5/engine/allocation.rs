@@ -443,7 +443,7 @@ impl GlmEngine<'_> {
         }))
     }
 
-    pub(super) fn census_physical_devices(&self) -> Result<Vec<i32>> {
+    pub(crate) fn census_physical_devices(&self) -> Result<Vec<i32>> {
         (0..self.ranks()).map(|rank| self.exchange_device(rank)).collect()
     }
 

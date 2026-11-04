@@ -1,0 +1,298 @@
+//! Linux residence and exact native evidence for the shared startup probe.
+use anyhow::{ensure, Context, Result};
+use cuteafd_ffi::memory_ledger::{AllocationEvent, AllocationRecord, Space};
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::os::unix::fs::FileExt;
+
+#[derive(Debug)]
+struct Mapping {
+    begin: u64,
+    end: u64,
+    file: bool,
+    rss: u64,
+    anonymous: u64,
+}
+
+fn kib(line: &str) -> Result<u64> {
+    let mut fields = line.split_whitespace();
+    let bytes = fields.next().context("missing smaps value")?.parse::<u64>()?
+        .checked_mul(1024).context("smaps bytes overflow")?;
+    ensure!(fields.next() == Some("kB") && fields.next().is_none(), "invalid smaps units");
+    Ok(bytes)
+}
+
+fn mappings(text: &str) -> Result<Vec<Mapping>> {
+    let mut out: Vec<Mapping> = Vec::new();
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("Rss:") {
+            out.last_mut().context("smaps RSS before mapping")?.rss = kib(value)?;
+        } else if let Some(value) = line.strip_prefix("Anonymous:") {
+            out.last_mut().context("smaps Anonymous before mapping")?.anonymous = kib(value)?;
+        } else {
+            let mut fields = line.split_whitespace();
+            let Some(range) = fields.next().filter(|field| field.contains('-')) else { continue };
+            let (begin, end) = range.split_once('-').context("invalid smaps address")?;
+            let (begin, end) = (u64::from_str_radix(begin, 16)?, u64::from_str_radix(end, 16)?);
+            let inode = fields.nth(3).context("missing smaps inode")?.parse::<u64>()?;
+            ensure!(begin < end && out.last().is_none_or(|prior| prior.end <= begin), "invalid smaps mapping order");
+            out.push(Mapping { begin, end, file: inode != 0, rss: 0, anonymous: 0 });
+        }
+    }
+    ensure!(!out.is_empty(), "empty smaps");
+    for mapping in &out {
+        ensure!(mapping.anonymous <= mapping.rss && mapping.rss <= mapping.end - mapping.begin,
+            "inconsistent smaps residence");
+    }
+    Ok(out)
+}
+
+fn intervals(records: &[AllocationRecord], page: u64) -> Result<(u64, Vec<(u64, u64)>)> {
+    ensure!(page.is_power_of_two(), "invalid Linux page size");
+    let mut requested = 0u64;
+    let mut ranges = Vec::new();
+    for record in records.iter().filter(|r| r.key.space == Space::Pinned) {
+        ensure!(record.address != 0 && record.bytes != 0, "empty native pinned allocation");
+        requested = requested.checked_add(record.bytes as u64).context("pinned extent overflow")?;
+        let end = (record.address as u64).checked_add(record.bytes as u64).context("pinned address overflow")?;
+        let end = end.checked_add(page - 1).context("pinned page rounding overflow")? & !(page - 1);
+        ranges.push((record.address as u64 & !(page - 1), end));
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (begin, end) in ranges {
+        if let Some(last) = merged.last_mut().filter(|last| begin <= last.1) {
+            last.1 = last.1.max(end);
+        } else { merged.push((begin, end)); }
+    }
+    Ok((requested, merged))
+}
+
+/// Read only pagemap's public present bit. No PFN, privilege or CUDA operation.
+fn present_bytes(file: &File, begin: u64, end: u64, page: u64) -> Result<u64> {
+    let mut present = 0;
+    let mut first = begin / page;
+    let last = end / page;
+    let mut buffer = [0u8; 8192];
+    while first < last {
+        let count = (last - first).min((buffer.len() / 8) as u64) as usize;
+        file.read_exact_at(&mut buffer[..count * 8], first.checked_mul(8).context("pagemap offset overflow")?)?;
+        for entry in buffer[..count * 8].chunks_exact(8) {
+            if u64::from_ne_bytes(entry.try_into().unwrap()) & (1 << 63) != 0 { present += page; }
+        }
+        first += count as u64;
+    }
+    Ok(present)
+}
+
+fn host_accounting(maps: &[Mapping], ranges: &[(u64, u64)], page: u64,
+    mut presence: impl FnMut(u64, u64) -> Result<u64>) -> Result<Value> {
+    let mut rss = 0u64;
+    let mut file_rss = 0u64;
+    let mut pinned_ordinary = 0u64;
+    let mut covered = 0u64;
+    let mut present = 0u64;
+    let mut findings = Vec::new();
+    let mut complete = true;
+    for &(begin, end) in ranges {
+        covered += end - begin;
+        let mut cursor = begin;
+        for map in maps.iter().filter(|m| m.begin < end && begin < m.end) {
+            let lo = begin.max(map.begin);
+            let hi = end.min(map.end);
+            if lo != cursor {
+                findings.push(format!("pinned range {cursor:#x}..{lo:#x} missing from smaps"));
+                complete = false;
+            }
+            cursor = hi;
+            match presence(lo, hi) {
+                Ok(bytes) => {
+                    ensure!(bytes <= hi - lo && bytes % page == 0, "invalid pagemap presence");
+                    present += bytes;
+                    if bytes != hi - lo {
+                        findings.push(format!("CUDA-pinned pages not fully present at {lo:#x}..{hi:#x}: {bytes} bytes"));
+                        complete = false;
+                    }
+                    let ordinary = if map.file { map.anonymous } else { map.rss };
+                    if ordinary == 0 { continue; }
+                    if lo == map.begin && hi == map.end {
+                        pinned_ordinary += ordinary;
+                    } else if ordinary == map.rss && map.rss == map.end - map.begin {
+                        pinned_ordinary += bytes;
+                    } else {
+                        findings.push(format!("partial pinned range in mixed/nonresident smaps mapping at {lo:#x}..{hi:#x}"));
+                        complete = false;
+                    }
+                }
+                Err(error) => {
+                    findings.push(format!("pagemap unavailable for {lo:#x}..{hi:#x}: {error}"));
+                    complete = false;
+                }
+            }
+        }
+        if cursor != end {
+            findings.push(format!("pinned range {cursor:#x}..{end:#x} missing from smaps"));
+            complete = false;
+        }
+    }
+    for map in maps {
+        rss = rss.checked_add(map.rss).context("smaps RSS overflow")?;
+        if map.file { file_rss += map.rss - map.anonymous; }
+    }
+    let heap = rss.checked_sub(file_rss).and_then(|v| v.checked_sub(pinned_ordinary))
+        .context("pinned/file residence exceeds RSS")?;
+    Ok(json!({
+        "smaps_rss_bytes": rss, "file_mapping_resident_bytes": file_rss,
+        "pinned_page_covered_bytes": covered, "pinned_present_bytes": present,
+        "pinned_resident_in_ordinary_rss_bytes": pinned_ordinary,
+        "ordinary_owner": "host-heap (unattributed)",
+        "ordinary_rss_bytes": complete.then_some(heap),
+        "rss_reconstruction_residual_bytes": complete.then_some(rss as i64 - (heap + file_rss + pinned_ordinary) as i64),
+        "rss_tolerance_bytes": page, "complete": complete, "findings": findings,
+        "scope": "phase process residence; exact pinned extents charged separately; diagnostic capacities not additive"
+    }))
+}
+
+pub(super) fn host(records: &[AllocationRecord]) -> Result<Value> {
+    let page = crate::shared::host_heap::page_size();
+    let (requested, ranges) = intervals(records, page)?;
+    let maps = mappings(&std::fs::read_to_string("/proc/self/smaps")?)?;
+    let pagemap = File::open("/proc/self/pagemap");
+    let mut value = host_accounting(&maps, &ranges, page, |begin, end| {
+        let file = pagemap.as_ref().map_err(|error| anyhow::anyhow!("{error}"))?;
+        present_bytes(file, begin, end, page)
+    })?;
+    value["pinned_requested_bytes"] = json!(requested);
+    value["native_malloc_diagnostic_bytes"] = json!(records.iter().filter(|r| r.key.space == Space::Host)
+        .map(|r| r.bytes as u64).sum::<u64>());
+    value["statm_rss_bytes"] = match std::fs::read_to_string("/proc/self/statm") {
+        Ok(text) => text.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok())
+            .and_then(|pages| pages.checked_mul(page)).map_or(Value::Null, |v| json!(v)),
+        Err(_) => Value::Null,
+    };
+    value["statm_scope"] = json!("separate potentially stale telemetry; not the smaps reconciliation baseline");
+    value["vm_hwm_bytes"] = json!(super::host_high_water_bytes(&std::fs::read_to_string("/proc/self/status")?)?);
+    Ok(value)
+}
+
+pub(super) fn record(record: &AllocationRecord) -> Value {
+    json!({"address": record.address, "bytes": record.bytes, "space": record.key.space.label(),
+        "device": record.key.device, "scope": record.key.scope, "owner": record.key.owner,
+        "tensor": record.key.tensor, "format": record.key.format, "endpoint": record.endpoint})
+}
+
+pub(super) fn event(event: &AllocationEvent) -> Value {
+    let (kind, allocation) = match event {
+        AllocationEvent::Allocated(r) => ("allocated", r),
+        AllocationEvent::Freed(r) => ("freed", r),
+        AllocationEvent::UnobservedRelease(r) => ("unobserved-release", r),
+    };
+    json!({"kind": kind, "allocation": record(allocation)})
+}
+
+pub(super) fn census(census: &crate::shared::memory::receipts::Census,
+    records: &[AllocationRecord], devices: &[i32]) -> Result<Value> {
+    use cuteafd_loader::placement::planner::{Device, Domain};
+    let mut owners = BTreeMap::new();
+    for receipt in census.receipts.iter().filter(|r| r.allocation.view.is_none()) {
+        let a = &receipt.allocation;
+        let device = match a.location.device {
+            Device::Coordinator(rank) => *devices.get(rank as usize).context("census logical rank missing")?,
+            Device::Host => -1,
+            Device::Spark(_) => anyhow::bail!("remote owner in coordinator census"),
+        };
+        let space = match a.location.domain {
+            Domain::Device => Space::Device, Domain::Pinned => Space::Pinned,
+            Domain::Managed => Space::Managed, Domain::Host => Space::Host,
+        };
+        ensure!(owners.insert((space, device, receipt.address, a.bytes), a.id.as_str()).is_none(),
+            "duplicate canonical census backing");
+    }
+    let mut missing = Vec::new();
+    let mut observed = std::collections::BTreeSet::new();
+    for native in records.iter().filter(|r| r.key.space != Space::Host) {
+        let key = (native.key.space, native.key.device, native.address as u64, native.bytes as u64);
+        observed.insert(key);
+        if !owners.contains_key(&key) { missing.push(record(native)); }
+    }
+    let unmatched: Vec<_> = owners.iter().filter(|(key, _)| !observed.contains(key)).map(|(key, id)|
+        json!({"owner": id, "space": key.0.label(), "device": key.1, "address": key.2, "bytes": key.3})).collect();
+    Ok(json!({"native_without_named_owner_count": missing.len(), "named_without_native_record_count": unmatched.len(),
+        "detail_scope": "compare chunked native-live and retained-owners records by domain/device/address/extent",
+        "native_identity_tolerance_bytes": 0,
+        "exact_native_coverage": missing.is_empty() && unmatched.is_empty(),
+        "unclassified": census.unclassified.iter().map(|u| json!({"owner": u.owner, "reason": u.reason})).collect::<Vec<_>>(),
+        "diagnostic_heap_capacity_bytes": census.heap_diagnostics.iter().map(|r| r.allocation.bytes).sum::<u64>(),
+        "diagnostic_heap_scope": "already inside phase RSS; not additive"}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smaps_keeps_file_cow_anonymous_and_statm_separate() -> Result<()> {
+        let maps = mappings("1000-3000 rw-p 0000 00:00 0 [heap]\nRss: 8 kB\nAnonymous: 8 kB\n4000-6000 rw-p 0000 08:01 7 /weights\nRss: 8 kB\nAnonymous: 4 kB\n")?;
+        let v = host_accounting(&maps, &[(0x1000, 0x2000)], 4096, |b, e| Ok(e-b))?;
+        assert_eq!(v["smaps_rss_bytes"], 16384);
+        assert_eq!(v["file_mapping_resident_bytes"], 4096);
+        assert_eq!(v["pinned_resident_in_ordinary_rss_bytes"], 4096);
+        assert_eq!(v["ordinary_rss_bytes"], 8192);
+        assert_eq!(v["rss_reconstruction_residual_bytes"], 0);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_pinned_pages_and_unavailable_pagemap_are_findings() -> Result<()> {
+        let maps = mappings("1000-3000 rw-p 0000 00:00 0\nRss: 8 kB\nAnonymous: 8 kB\n")?;
+        for value in [host_accounting(&maps, &[(0x1000, 0x3000)], 4096, |_, _| Ok(4096))?,
+            host_accounting(&maps, &[(0x1000, 0x3000)], 4096, |_, _| anyhow::bail!("denied"))?] {
+            assert_eq!(value["complete"], false);
+            assert!(value["ordinary_rss_bytes"].is_null());
+            assert!(!value["findings"].as_array().unwrap().is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn partial_mixed_mapping_cannot_guess_pinned_rss() -> Result<()> {
+        let maps = mappings("1000-3000 rw-p 0000 08:01 7 /file\nRss: 8 kB\nAnonymous: 4 kB\n")?;
+        let value = host_accounting(&maps, &[(0x1000, 0x2000)], 4096, |b, e| Ok(e-b))?;
+        assert_eq!(value["complete"], false);
+        assert!(value["ordinary_rss_bytes"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_native_coverage_rejects_equal_total_with_wrong_identity() -> Result<()> {
+        use crate::shared::memory::receipts::Census;
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location, Receipt};
+        let native = AllocationRecord { address: 0x123000, bytes: 512, endpoint: None,
+            key: cuteafd_ffi::memory_ledger::Key { space: Space::Device, device: 7, scope: "test",
+                owner: None, tensor: None, format: None } };
+        let mut named = Census::default();
+        named.receipts.push(Receipt { address: native.address as u64,
+            allocation: Allocation::buffer("test", Location::coordinator(1), 512,
+                Lifetime::TARGET, Category::Workspace, "test") });
+        assert_eq!(census(&named, &[native], &[3, 7])?["exact_native_coverage"], true);
+        named.receipts[0].address += 1;
+        let value = census(&named, &[native], &[3, 7])?;
+        assert_eq!(value["exact_native_coverage"], false);
+        assert_eq!(value["native_without_named_owner_count"], 1);
+        assert_eq!(value["named_without_native_record_count"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_page_union_preserves_requested_extents_without_double_charge() -> Result<()> {
+        let make = |address, bytes| AllocationRecord { address, bytes, endpoint: None,
+            key: cuteafd_ffi::memory_ledger::Key { space: Space::Pinned, device: -1, scope: "test",
+                owner: None, tensor: None, format: None } };
+        let (requested, covered) = intervals(&[make(0x1001, 7), make(0x1ff0, 32)], 4096)?;
+        assert_eq!(requested, 39);
+        assert_eq!(covered, [(0x1000, 0x3000)]);
+        Ok(())
+    }
+}

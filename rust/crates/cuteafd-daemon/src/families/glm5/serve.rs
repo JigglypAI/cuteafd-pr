@@ -671,6 +671,11 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     // GLM's only decode lane (`LaneSupport::One`), polled on this thread.
     let lanes = LaneSet::default();
     // Prefix capacity and all fallible scheduler initialization precede readiness.
+    if crate::shared::inventory::startup_probe_enabled() {
+        let census = engine.allocation_census(&family, &cache, &selector, transport.as_deref())?;
+        let devices = engine.census_physical_devices()?;
+        opened.startup_probe(&devices, "glm/ready", Some(&census), true)?;
+    }
     ready();
     crate::shared::api::run_scheduler(|| {
     loop {

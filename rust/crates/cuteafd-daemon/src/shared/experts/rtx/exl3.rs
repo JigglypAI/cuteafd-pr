@@ -663,6 +663,7 @@ impl<'a> Exl3Tp2<'a> {
                         self.device.library,
                         &[self.device.id],
                         &format!("exl3-package-m{capacity}"),
+                        Default::default(),
                     )?;
                     ensure!(
                         execution.capacity() == capacity as usize

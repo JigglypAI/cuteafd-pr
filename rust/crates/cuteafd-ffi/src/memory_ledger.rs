@@ -117,6 +117,7 @@ pub struct AllocationAudit {
 pub struct AllocationHistory {
     pub initial: Vec<AllocationRecord>,
     pub events: Vec<AllocationEvent>,
+    pub final_allocations: Vec<AllocationRecord>,
 }
 
 impl AllocationAudit {
@@ -135,13 +136,21 @@ impl AllocationAudit {
         self.events.lock().unwrap_or_else(|e| e.into_inner()).events.len()
     }
 
+    /// Sample exact live backing and its event position under the same ledger
+    /// lock, so a worker allocation cannot fall between those observations.
+    pub fn checkpoint_allocations(&self) -> (usize, Vec<AllocationRecord>) {
+        let state = state().lock().unwrap_or_else(|e| e.into_inner());
+        let position = self.events.lock().unwrap_or_else(|e| e.into_inner()).events.len();
+        (position, live_allocations(&state))
+    }
+
     /// Close the subscription under the allocator's lock before taking history.
     pub fn finish(self) -> AllocationHistory {
         let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
         state.audits.retain(|audit| !audit.ptr_eq(&Arc::downgrade(&self.events))
             && audit.strong_count() != 0);
         let events = std::mem::take(&mut self.events.lock().unwrap_or_else(|e| e.into_inner()).events);
-        AllocationHistory { initial: self.initial, events }
+        AllocationHistory { initial: self.initial, events, final_allocations: live_allocations(&state) }
     }
 }
 
@@ -549,6 +558,9 @@ mod tests {
         record_alloc(Space::Pinned, -1, base, 64);
         let audit = AllocationAudit::begin();
         let position = audit.checkpoint();
+        let (sample_position, live) = audit.checkpoint_allocations();
+        assert_eq!(sample_position, position);
+        assert!(live.iter().any(|r| r.address == base && r.bytes == 64));
         record_alloc(Space::Device, 17, base + 1, 128);
         record_free(base + 1);
         record_alloc(Space::Device, 17, base + 1, 256);
@@ -556,6 +568,8 @@ mod tests {
         record_free(base + 1);
         let history = audit.finish();
         assert!(history.initial.iter().any(|r| r.address == base && r.bytes == 64));
+        assert!(history.final_allocations.iter().any(|r| r.address == base && r.bytes == 64));
+        assert!(!history.final_allocations.iter().any(|r| r.address == base + 1));
         let events = history.events[position..].iter().filter(|event| match event {
             AllocationEvent::Allocated(r) | AllocationEvent::Freed(r)
                 | AllocationEvent::UnobservedRelease(r) => r.address == base + 1,

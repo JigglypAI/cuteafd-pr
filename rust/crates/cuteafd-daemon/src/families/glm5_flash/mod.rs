@@ -1965,7 +1965,7 @@ impl Opened {
         // each admitted GPU reserves its part of every mark (a lone GPU, the whole mark), as the prefix
         // cache then allocates.
         let probe_devices: Vec<_> = std::iter::once(args.device).chain(args.split_device).collect();
-        let probe = |stage| crate::shared::inventory::startup_probe(&self.library, &probe_devices, stage);
+        let probe = |stage| crate::shared::inventory::startup_probe(&self.library, &probe_devices, stage, Default::default());
         probe("contexts-before-peer")?;
         let mut resolved = args.clone();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);

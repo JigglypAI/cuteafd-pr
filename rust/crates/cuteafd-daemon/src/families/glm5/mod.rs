@@ -791,9 +791,12 @@ pub(crate) struct Opened {
     pub native: bool,
     pub cfg: GlmDsaConfig,
     pub library: std::sync::Arc<NativeLibrary>,
+    startup_audit: std::cell::RefCell<Option<cuteafd_ffi::memory_ledger::AllocationAudit>>,
 }
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
+    let startup_audit = crate::shared::inventory::startup_probe_enabled()
+        .then(cuteafd_ffi::memory_ledger::AllocationAudit::begin);
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     let draft_ownership = catalog.bundled_dspark_ownership(args.dspark)?;
     catalog.select_draft(draft_ownership)?;
@@ -820,7 +823,10 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     }
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
     library.cuda_set_device(args.device)?;
-    Ok(Opened { snapshot: args.snapshot.clone(), catalog, native, cfg, library })
+    let opened = Opened { snapshot: args.snapshot.clone(), catalog, native, cfg, library,
+        startup_audit: std::cell::RefCell::new(startup_audit) };
+    opened.startup_probe(&[args.device], "glm/open", None, false)?;
+    Ok(opened)
 }
 
 struct ResolvedEngineArgs {
@@ -840,6 +846,21 @@ impl ResolvedEngineArgs {
 }
 
 impl Opened {
+    fn startup_probe(&self, devices: &[i32], stage: &str,
+        census: Option<&crate::shared::memory::receipts::Census>, finish: bool) -> Result<()> {
+        use crate::shared::inventory::{startup_probe, StartupEvidence};
+        if !crate::shared::inventory::startup_probe_enabled() { return Ok(()); }
+        if finish {
+            let history = self.startup_audit.borrow_mut().take().map(|audit| audit.finish());
+            startup_probe(&self.library, devices, stage,
+                StartupEvidence { audit: None, history: history.as_ref(), census })
+        } else {
+            let audit = self.startup_audit.borrow();
+            startup_probe(&self.library, devices, stage,
+                StartupEvidence { audit: audit.as_ref(), history: None, census })
+        }
+    }
+
     /// Builds the engine (and the Spark transport when peers are given) and
     /// hands them to `body`.
     pub fn with_engine<T>(&self, args: &EngineArgs,
@@ -915,6 +936,7 @@ impl Opened {
             None => None,
         };
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
+        self.startup_probe(&devices, "glm/streams-before-programs", None, false)?;
         use cuteafd_loader::families::glm5::DensePrograms;
         let dense_programs = if native { DensePrograms::Exlr8 } else { DensePrograms::Fp8 };
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
@@ -949,6 +971,7 @@ impl Opened {
             tracing::info!(loaded, skipped, "GLM programs loaded");
             Ok(())
         })?;
+        self.startup_probe(&devices, "glm/programs-before-weights", None, false)?;
         let mut draft_file = None;
         let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement)
             .map_err(anyhow::Error::msg)?;
@@ -1331,6 +1354,7 @@ impl Opened {
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
             resident_bytes = ?actual_weights,
             "GLM coordinator weights validated against pre-weight reservation after Spark admission (elapsed includes wait)");
+        self.startup_probe(&devices, "glm/weights-before-draft-pool", None, false)?;
         let context_kv = placement.attention_placement == cuteafd_loader::placement::AttentionPlacement::Context;
         ensure!(!context_kv || peer_stream.is_some(), "context attention needs the head split's second GPU");
         cuteafd_bench::context::set_resolved("attention-placement", &placement.attention_summary());
@@ -1346,6 +1370,7 @@ impl Opened {
             None => self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file)?,
         };
         if let Some(drafter) = &drafter { drafter.prepare_workspace()?; }
+        self.startup_probe(&devices, "glm/draft-before-kv", None, false)?;
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill_lanes, args.prefill_rows)?;
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, pages, embedding, depth, context.filter(|_| context_kv))?;
@@ -1405,6 +1430,7 @@ impl Opened {
             timeout: std::time::Duration::from_secs(120), max_frame_bytes: if native { cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?)? } else { 64 << 20 } };
         let row_bytes = self.cfg.hidden * 2;
         crate::shared::memory_report::release_load_staging(&self.library)?;
+        self.startup_probe(&devices, "glm/pool-before-transport", None, false)?;
         // Connect every rank and register full-size buffers now: the first
         // request otherwise pays seconds of connection setup.
         let (h, topk, experts, layer) =
@@ -1473,6 +1499,7 @@ impl Opened {
             }
         }
         engine.prime_tp2()?;
+        self.startup_probe(&devices, "glm/transport-before-graphs", None, false)?;
         // Every decode graph shape serving replays, captured now (CUTEAFD_GLM_WARM_GRAPHS=0 skips it).
         if engine.weights.layers.len() == self.cfg.layers
             && std::env::var("CUTEAFD_GLM_WARM_GRAPHS").map_or(true, |v| v != "0")
@@ -1481,7 +1508,10 @@ impl Opened {
         }
         engine.check_tp2_routes(transport.as_mut().map(|t| (t, &runtime)))?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
+        self.startup_probe(&devices, "glm/graphs-before-serving", None, false)?;
         let result = body(&engine, transport.as_mut(), &runtime);
+        // Non-serving commands do not pass schedule's readiness boundary.
+        drop(self.startup_audit.borrow_mut().take());
         drop(engine);
         drop(transport);
         // SAFETY: the engine that used the streams is gone.
