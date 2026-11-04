@@ -2379,7 +2379,7 @@ impl Opened {
         };
         // The admitted TP2 expert halves land inside the Spark admission window;
         // execution (modules, workspaces, routes) binds once the engine exists.
-        let tp2_weights = |pushed: Option<Vec<PushedExperts<'s>>>| -> Result<crate::shared::experts::rtx::Tp2Weights<'s>> {
+        let tp2_weights = |pushed: Option<Vec<PushedExperts<'s>>>| -> Result<crate::shared::experts::rtx::Tp2Weights<'_>> {
             let catalog = self.experts.as_ref().context("TP2 expert catalog")?;
             let (devices, budgets) = (tp2_devices()?, tp2_budgets()?);
             use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2, RtxSelectionPolicy, Tp2Weights};
