@@ -130,7 +130,7 @@ fn view(buffer: CuteafdDeviceBuffer, at: usize, bytes: usize) -> Result<CuteafdD
 
 fn pack_steps(rects: Vec<Rect>, cols: usize, rule: Fp8Scales, packed: CuteafdDeviceBuffer,
     scale: CuteafdDeviceBuffer) -> Result<Vec<Step>> {
-    let mut first = 0;
+    let mut first = 0usize;
     let mut steps = Vec::new();
     ensure!(cols > 0 && cols % 128 == 0, "drafter FP8 input width must be a multiple of 128");
     let row_bytes = cols.checked_mul(2).context("drafter FP8 row extent overflow")?;
