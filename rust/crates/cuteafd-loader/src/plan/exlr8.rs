@@ -1571,13 +1571,20 @@ mod mounted_tests {
                 println!("{name} uncached={uncached} wall_seconds={:.6}", elapsed.as_secs_f64());
                 // Match the complete `cuteafd plan --json` payload, not a layout projection.
                 let bytes = serde_json::to_vec_pretty(&native.report).unwrap();
+                let deployment_options = crate::plan::deployment::DeploymentOptions {
+                    rtx_gpus: gpus, speculator: "off".into(), ..Default::default()
+                };
+                let deployment = crate::plan::deployment::DeploymentSpec::from_exlr8(&native, &deployment_options).unwrap();
+                let deployment_bytes = serde_json::to_vec_pretty(&deployment).unwrap();
                 let arm = if uncached { "uncached" } else { "memoized" };
                 std::fs::write(output.join(format!("{name}-{arm}.json")), &bytes).unwrap();
-                bytes
+                std::fs::write(output.join(format!("{name}-{arm}-deployment.json")), &deployment_bytes).unwrap();
+                (bytes, deployment_bytes)
             };
             let cached = plan(false);
             let uncached = plan(true);
-            assert!(cached == uncached, "{name}: complete native plan JSON bytes differ");
+            assert!(cached.0 == uncached.0, "{name}: complete native plan JSON bytes differ");
+            assert!(cached.1 == uncached.1, "{name}: complete launcher deployment JSON bytes differ");
         }
     }
 
