@@ -213,24 +213,8 @@ impl<'a> TokenEmbedding<'a> {
         let row = self.source.hidden * 2;
         let mut out = vec![0u8; tokens.len() * row];
         if let Some(owner) = &self.row_fp8 {
-            // The gather's exact rule: bf16(f32(e4m3) * scale), round to nearest even.
-            let hidden = self.source.hidden;
-            let mut bytes = vec![0u8; hidden];
-            let mut scale = [0u8; 4];
             for (slot, &token) in out.chunks_exact_mut(row).zip(tokens) {
-                let token = token as usize;
-                let payload = owner.embedding.payload();
-                let scales = owner.embedding.scales();
-                self.library.copy_d2h(&mut bytes, CuteafdDeviceBuffer { bytes: hidden,
-                    // SAFETY: row `token` lies inside the [vocab, hidden] payload.
-                    ptr: unsafe { payload.ptr.cast::<u8>().add(token * hidden) }.cast(), ..payload })?;
-                self.library.copy_d2h(&mut scale, CuteafdDeviceBuffer { bytes: 4,
-                    // SAFETY: entry `token` lies inside the [vocab] scales.
-                    ptr: unsafe { scales.ptr.cast::<u8>().add(token * 4) }.cast(), ..scales })?;
-                let scale = f32::from_le_bytes(scale);
-                for (out, &b) in slot.chunks_exact_mut(2).zip(&bytes) {
-                    out.copy_from_slice(&bf16_rne(e4m3_to_f32(b) * scale).to_le_bytes());
-                }
+                owner.embedding.host_row(self.library, token as usize, self.source.hidden, slot)?;
             }
             return Ok(out);
         }
