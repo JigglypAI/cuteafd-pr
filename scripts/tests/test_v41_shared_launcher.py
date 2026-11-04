@@ -10,6 +10,7 @@ their defaults, with no V4.1 code.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,7 +19,7 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from v41_launch_capture import CASES, FIXTURES, KIT_CARDS, ROOT, capture, parse_run, namespace_launch_contract  # noqa: E402
+from v41_launch_capture import CASES, FIXTURES, HOSTS, KIT_CARDS, ROOT, capture, parse_run, namespace_launch_contract  # noqa: E402
 
 # Environment the shared launcher adds, by role, at its default values. Each
 # comes from a shared helper in scripts/launch/run-family.sh:
@@ -125,6 +126,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # With Sparks, serve's unit is the planner's third of the reserve (fixed depth 3).
         if role == "coordinator" and value("--prefill-waves") == "3" and "--prefill-batch-tokens" in expected_command:
             expected_command[expected_command.index("--prefill-batch-tokens") + 1] = "2752"
+        if role == "coordinator" and value("--rtx-gpus") == "2" and "--dspark" in expected_command:
+            expected_command.append("--tp2-dspark-experts")
         if role == "worker":
             # Old captures confused the weight ceiling (100 GiB) with the
             # planner's automatic CUDA allocation ceiling (108 GiB).
@@ -167,7 +170,16 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
                       "--deployment-peers", command[command.index("--peers") + 1]]
         expected[expected.index("--rtx"):expected.index("--rtx")] = additions
         index = expected.index("--available-sparks") + 2
-        expected[index:index] = ["--mapped-scale-preload-gib", "0"]
+        expected[index:index] = ["--mapped-scale-preload-gib", "0", "--config", "/run/cuteafd-plan.config"]
+        enabled = command[command.index("--rtx-gpus") + 1] == "2" and "--dspark" in command
+        draft_limit = command[command.index("--dspark-draft-limit") + 1] if "--dspark-draft-limit" in command else ""
+        available = int(expected[expected.index("--available-sparks") + 1])
+        normalized = (f"TP2_DSPARK_EXPERTS={'on' if enabled else 'off'}\nSPECULATOR=dspark\n"
+                      f"DSPARK_DRAFT_LIMIT={draft_limit}\n"
+                      + ''.join(f"SPARK_{rank}_HOST={host}\n" for rank, host in enumerate(HOSTS[:available])))
+        digest = hashlib.sha256(normalized.encode()).hexdigest()[:16]
+        mount_index = expected.index("-v") + 2
+        expected[mount_index:mount_index] = ["-v", f"<root>/hosts/raptor/.cache/cuteafd/run-config/plan-{digest}.config:/run/cuteafd-plan.config:ro"]
         expected = [value.replace("/hf/hub/", "<root>/hf/hub/").replace("HF_HOME=/hf", "HF_HOME=/mnt/sparknest/hf-home") for value in expected]
         expected = ["/mnt/sparknest:/mnt/sparknest:ro" if value.endswith(":/hf/hub:ro") else value for value in expected]
         expected_plans.append(expected)

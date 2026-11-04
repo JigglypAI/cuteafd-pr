@@ -57,6 +57,12 @@ There is no separate scale-only preload. `ENGRAM_WARM` warms the whole mapped ta
 - Optional vision tower (MoonViT-style) when the checkpoint carries
   `vision_config`.
 
+## Settings
+
+| Setting | Default | Scope |
+| --- | --- | --- |
+| `TP2_DSPARK_EXPERTS` | `on` with two RTX GPUs and dSpark; otherwise `off` | Splits dSpark routed experts across the RTX pair. `off` keeps them on the draft GPU. Explicit `on` requires V4.1, two RTX GPUs and dSpark. |
+
 ## Known limits
 
 - Opt-in `L2_PREFETCH=auto`: Hugh Madden measured +2.4% C1 on a 5090; no clear gain on the RTX PRO 6000. The default remains off.
