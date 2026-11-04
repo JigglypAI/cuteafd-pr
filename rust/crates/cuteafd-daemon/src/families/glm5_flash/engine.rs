@@ -490,6 +490,10 @@ fn tp2_input(experts: &dyn RtxExpertLayer, wire: *mut c_void, hidden: *mut c_voi
     if experts.uses_fp8_input() { ExpertInput::Fp8K32(wire) } else { ExpertInput::Bf16(hidden) }
 }
 
+fn tp2_weight_read_bytes(ranks: [&dyn RtxExpertLayer; 2]) -> Result<usize> {
+    ranks.into_iter().try_fold(0, |largest, rank| Ok(largest.max(rank.weight_read_bytes()?)))
+}
+
 /// Per-program GPU times (CUTEAFD_GLMF_PROFILE_OPS=1): timing events around
 /// every launch, read back by [`GlmfEngine::op_profile`].
 #[derive(Default)]
@@ -2386,7 +2390,11 @@ impl<'a> GlmfEngine<'a> {
             };
             ensure!(tp > 0, "GLM Flash layer {layer} has no installed expert ranks");
             let catalog = catalog.context("GLM Flash routed expert catalog missing")?;
-            let slice_bytes = if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+            let slice_bytes = if let Some(tp2) = self.tp2.as_ref().filter(|tp2| tp2.layers.contains(&layer)) {
+                let left = tp2.ranks[0].borrow();
+                let right = tp2.ranks[1].borrow();
+                tp2_weight_read_bytes([left.as_ref(), right.as_ref()])? as f64
+            } else if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
                 match self.routed_experts(layer) {
                     Some(Experts::LocalNative(local)) => local.borrow().weight_read_bytes()? as f64,
                     Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer)? as f64,
@@ -2394,14 +2402,11 @@ impl<'a> GlmfEngine<'a> {
                 }
             } else { match (catalog.fp8(), catalog.exl3()) {
                 (Some(_), _) => {
-                    let bytes = if let Some(tp2) = self.tp2.as_ref().filter(|tp2| tp2.layers.contains(&layer)) {
-                        tp2.ranks.iter().map(|rank| rank.borrow().weight_read_bytes())
-                            .collect::<Result<Vec<_>>>()?.into_iter().max().context("GLM Flash installed TP2 ranks missing")?
-                    } else { match self.routed_experts(layer) {
+                    let bytes = match self.routed_experts(layer) {
                         Some(Experts::Local(local)) => local.experts.borrow().weight_read_bytes(),
                         Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer)?,
                         _ => anyhow::bail!("GLM Flash layer {layer} has no installed FP8-family byte descriptor"),
-                    }};
+                    };
                     bytes as f64
                 }
                 (_, Some(manifest)) => resource::exl3_slice_bytes(manifest, layer, tp)?,
@@ -5483,6 +5488,26 @@ mod tp2_tests {
         assert!(native_local_layers(&wrong, 4).is_err());
         assert!(native_local_layers(&valid(), 0).is_err());
     }
+    #[test]
+    fn draft_geometry_prices_installed_tp2_owners_and_propagates_errors() {
+        struct Rank(Option<usize>);
+        impl RtxExpertLayer for Rank {
+            fn shard(&self) -> crate::shared::experts::rtx::RtxShard { unreachable!() }
+            fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }
+            fn layers(&self) -> &[usize] { &[3] }
+            fn device(&self) -> i32 { 0 }
+            fn workspace_bytes(&self) -> usize { 0 }
+            fn output(&self) -> *mut c_void { std::ptr::null_mut() }
+            fn weight_read_bytes(&self) -> Result<usize> { self.0.context("installed descriptor missing") }
+            unsafe fn enqueue(&mut self, _: usize, _: usize, _: ExpertInput, _: Routes,
+                _: *mut c_void, _: &mut dyn FnMut()) -> Result<()> { unreachable!() }
+        }
+        assert_eq!(tp2_weight_read_bytes([&Rank(Some(123)), &Rank(Some(456))]).unwrap(), 456);
+        assert_eq!(tp2_weight_read_bytes([&Rank(Some(456)), &Rank(Some(123))]).unwrap(), 456);
+        assert!(tp2_weight_read_bytes([&Rank(None), &Rank(Some(456))]).is_err());
+        assert!(tp2_weight_read_bytes([&Rank(Some(456)), &Rank(None)]).is_err());
+    }
+
     #[test]
     fn kda_only_owner_has_no_compact_index_storage() {
         for index in [IndexCache::Keys, IndexCache::Compact] {
