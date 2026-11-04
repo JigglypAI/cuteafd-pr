@@ -1394,6 +1394,18 @@ def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, 
     publisher.publish(reused, staging, 1, 1, target)
     assert len(calls) == 3  # Re-publication never invokes a compiler.
     assert json.loads((reused / 'INPUTS.json').read_text())['files'] == metadata['files']
+    legacy = json.loads((target / 'INPUTS.json').read_text())
+    retired = json.loads((ROOT / 'benchmarks/current-matrix.json').read_text())['retired'][0]['config']
+    legacy['engine_sources_sha256'][retired] = 'old-retired-content'
+    (target / 'INPUTS.json').write_text(json.dumps(legacy))
+    publisher.publish(tmp_path / 'legacy-republished', staging, 1, 1, target)
+    assert len(calls) == 3
+    live = publisher.live_configs()[0]
+    legacy['engine_sources_sha256'][live] = 'changed-live-content'
+    (target / 'INPUTS.json').write_text(json.dumps(legacy))
+    with pytest.raises(ValueError, match='compiler source provenance mismatch'):
+        publisher.publish(tmp_path / 'bad-live-source', staging, 1, 1, target)
+    (target / 'INPUTS.json').write_text(json.dumps(metadata))
     context = staging / 'programs/comparison-context.json'
     original = context.read_text()
     invalid = json.loads(original)
@@ -1424,6 +1436,31 @@ def test_installed_placement_export_jobs_cover_live_native_families_and_packages
             'step5', 'kimik3', 'exlr8', 'exlr8_dense', 'dense_trellis_k6'} <= geometry
     assert args[args.index('--exlr8-role') + 1] == 'coordinator'
     assert len(names) == len(jobs)
+
+
+def test_placement_fingerprints_only_live_config_contents(tmp_path, monkeypatch):
+    publisher = compare_sm.load_file('test_live_placement_hashes', ROOT / 'scripts/build/export-placement-inputs.py')
+    for relative in ('scripts/build/export-placement-inputs.py', 'scripts/build/release-scope.py',
+                     'scripts/lib/wip_aot_scopes.py', 'examples/configs/live.config',
+                     'examples/configs/retired.config', 'benchmarks/current-matrix.json'):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('original')
+    matrix = tmp_path / 'benchmarks/current-matrix.json'
+    retired = [{'config': 'examples/configs/retired.config'}]
+    matrix.write_text(json.dumps({'retired': retired, 'cells': [{'report': 'old'}]}))
+    monkeypatch.setattr(publisher, 'ROOT', tmp_path)
+    monkeypatch.setattr(publisher.compare, 'v4_placement_sources', lambda: {})
+    before = publisher.source_hashes()
+    assert 'examples/configs/retired.config' not in before
+    (tmp_path / 'examples/configs/retired.config').write_text('retired edit')
+    matrix.write_text(json.dumps({'retired': retired, 'cells': [{'report': 'new'}]}))
+    assert publisher.source_hashes() == before
+    (tmp_path / 'examples/configs/live.config').write_text('MODEL_REVISION=changed')
+    assert publisher.source_hashes() != before
+    (tmp_path / 'examples/configs/live.config').write_text('original')
+    matrix.write_text(json.dumps({'retired': [], 'cells': []}))
+    assert publisher.source_hashes()['installed_live_configs'] != before['installed_live_configs']
 
 
 def test_placement_selection_ignores_card_publication_but_tracks_retirement(tmp_path):
