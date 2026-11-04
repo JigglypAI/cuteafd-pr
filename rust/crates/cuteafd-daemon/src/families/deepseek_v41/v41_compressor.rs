@@ -525,6 +525,25 @@ impl IndexBinding {
         self.lease.owner == other.lease.owner
     }
 }
+/// Stable score-launch allocation geometry, independent of request snapshots.
+#[derive(Clone, Copy)]
+pub(crate) struct IndexScoreGeometry {
+    pub packed: CuteafdDeviceBuffer,
+    pub scales: CuteafdDeviceBuffer,
+    pub pool_pages: CuteafdDeviceBuffer,
+    pub pool_rows: CuteafdDeviceBuffer,
+    pub proposal_packed: CuteafdDeviceBuffer,
+    pub proposal_scales: CuteafdDeviceBuffer,
+    pub capacity: usize,
+}
+impl IndexScoreGeometry {
+    pub(crate) fn binding(self) -> [usize; 10] {
+        [self.packed.ptr as usize, self.scales.ptr as usize, self.pool_pages.ptr as usize,
+            self.pool_rows.ptr as usize, self.pool_pages.bytes, self.pool_rows.bytes,
+            self.packed.bytes, self.proposal_packed.ptr as usize, self.proposal_scales.ptr as usize,
+            self.capacity]
+    }
+}
 /// Borrowed accepted-history and current-wave index view. Consumers must drain
 /// before releasing these borrows. No proposed rows are published to the cache.
 pub(crate) struct IndexProposal<'a> {
@@ -548,6 +567,11 @@ pub(crate) struct IndexProposal<'a> {
     _wave: std::marker::PhantomData<&'a ()>,
 }
 impl IndexProposal<'_> {
+    pub(crate) fn score_geometry(&self) -> IndexScoreGeometry {
+        IndexScoreGeometry { packed: self.cache.packed, scales: self.cache.scales,
+            pool_pages: self.cache.pool_pages, pool_rows: self.cache.pool_rows,
+            proposal_packed: self.packed, proposal_scales: self.scales, capacity: self.capacity }
+    }
     /// # Safety
     /// Producer writes are complete or ordered before the replica's stream.
     /// Retain both plane owners until all peer consumers drain.
@@ -663,6 +687,19 @@ impl<'a> CompressorWave<'_, 'a> {
     fn planes(&self) -> &CompressorPlanes<'a> { &self.storage.planes[self.plane] }
     fn kv_values(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().kv_values.buffer, V41Kv::COMPRESSED_VALUE_BYTES) }
     fn kv_scales(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().kv_scales.buffer, V41Kv::COMPRESSED_SCALE_BYTES) }
+    pub(crate) fn startup_index_geometry(&self, state: &CompressorState<'_>, rows: usize) -> Result<IndexScoreGeometry> {
+        ensure!(self.ready.is_none() && self.pending_query.is_none() && self.pending_commit.is_none()
+            && !self.window.is_windowed() && rows > 0 && rows <= self.capacity
+            && state.layer == self.weights.layer, "startup index source geometry requires idle matching owner");
+        let cache = state.source_cache().view(0, 0);
+        let mut proposal_packed = self.index_packed();
+        let mut proposal_scales = self.index_scales();
+        proposal_packed.bytes = rows * 64;
+        proposal_scales.bytes = rows * 4;
+        Ok(IndexScoreGeometry { packed: cache.packed, scales: cache.scales,
+            pool_pages: cache.pool_pages, pool_rows: cache.pool_rows,
+            proposal_packed, proposal_scales, capacity: rows })
+    }
     fn index_packed(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().index_packed.buffer, 64) }
     fn index_scales(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().index_scales.buffer, 4) }
     fn cache_destinations(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().cache_destinations.buffer, 8) }

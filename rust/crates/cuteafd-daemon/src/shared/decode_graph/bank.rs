@@ -70,6 +70,8 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         Ok(())
     }
 
+    pub fn startup_declared(&self) -> bool { self.startup.is_some() }
+
     pub fn capture_allowed(&self, key: &K) -> bool {
         !self.startup_sealed && self.startup.as_ref().map_or(
             self.policy != GraphPolicy::FixedStartup, |keys| keys.contains(key))

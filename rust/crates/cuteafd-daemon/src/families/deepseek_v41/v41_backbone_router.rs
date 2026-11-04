@@ -595,16 +595,31 @@ impl<'a> BackboneRouterWave<'_, 'a> {
     }
     pub(crate) fn declare_startup(&mut self, keys: &[(usize, u32)]) -> Result<()> {
         self.stream().require_complete()?;
-        self.graphs.declare_startup(keys)
+        self.graphs.declare_startup(keys)?;
+        self.other_graphs.declare_startup(keys)
     }
     pub(crate) fn capture_startup(&mut self, rows: u32) -> Result<()> {
         self.validate(rows)?;
         self.stream().require_complete()?;
         // SAFETY: capture records stable owned buffers and borrowed weights;
         // no kernel executes and no routes are published during startup.
-        unsafe { self.capture_ready(rows) }
+        let local = !self.full_request;
+        let result = (|| -> Result<()> {
+            // Runtime swaps banks when expert placement changes the handoff mode.
+            for mode in [local, !local] {
+                self.set_local_mode(mode)?;
+                // SAFETY: both banks record the same stable owner-local enqueue.
+                unsafe { self.capture_ready(rows)?; }
+            }
+            Ok(())
+        })();
+        let restored = self.set_local_mode(local);
+        result.and(restored)
     }
-    pub(crate) fn finish_startup(&mut self) -> Result<()> { self.graphs.finish_startup() }
+    pub(crate) fn finish_startup(&mut self) -> Result<()> {
+        self.graphs.finish_startup()?;
+        self.other_graphs.finish_startup()
+    }
     // Warmup has completed. Capture never yields with the stream in capture mode.
     unsafe fn capture_ready(&mut self, rows: u32) -> Result<()> {
         self.invalidate();

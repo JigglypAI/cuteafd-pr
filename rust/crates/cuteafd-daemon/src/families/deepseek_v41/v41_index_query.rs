@@ -165,6 +165,13 @@ impl Drop for IndexQueryStorage<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct IndexQueryGeometry {
+    pub layer: usize,
+    pub packed: CuteafdDeviceBuffer,
+    pub scales: CuteafdDeviceBuffer,
+    pub head_weights: CuteafdDeviceBuffer,
+}
 pub(crate) struct IndexQueryOutput<'a> {
     origin: Option<QueryBinding>,
     tokens: &'a [u64],
@@ -175,6 +182,10 @@ pub(crate) struct IndexQueryOutput<'a> {
     _owner: PhantomData<&'a ()>,
 }
 impl IndexQueryOutput<'_> {
+    pub(crate) fn geometry(&self) -> IndexQueryGeometry {
+        IndexQueryGeometry { layer: self.layer, packed: self.packed, scales: self.scales,
+            head_weights: self.head_weights }
+    }
     pub fn origin(&self) -> Option<QueryBinding> {
         self.origin
     }
@@ -214,6 +225,15 @@ impl<'w, 'a> IndexQueryWave<'w, 'a> {
     }
 }
 impl IndexQueryWave<'_, '_> {
+    pub(crate) fn startup_geometry(&self, rows: usize) -> Result<IndexQueryGeometry> {
+        ensure!(rows > 0 && rows <= self.capacity as usize && !self.window.is_windowed()
+            && self.pending.is_none() && self.ready.is_none(), "startup index query geometry requires idle full owner");
+        let sized = |mut b: CuteafdDeviceBuffer, stride| { b.bytes = rows * stride; b };
+        Ok(IndexQueryGeometry { layer: self.weights.layer,
+            packed: sized(self.storage.packed.buffer, 2048),
+            scales: sized(self.storage.scales.buffer, 128),
+            head_weights: sized(self.storage.head_weights.buffer, 64) })
+    }
     #[cfg(test)]
     pub(super) fn scratch_stream(&self) -> *mut std::ffi::c_void { self.storage.stream.raw }
     pub(crate) fn release_scratch(&self) -> Result<()> { self.storage.guard.release() }
