@@ -423,6 +423,67 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn bench_verify_mla_tail_binds_and_populates_every_requested_slot() -> Result<()> {
+        use cuteafd_loader::formats::{dflash::{MlaDflashConfig, MlaDraftCacheState,
+            MlaDraftCacheRequest}, mla::MlaGeometry, block_dspark::DsparkRotaryPlan};
+        let cfg = MlaDflashConfig { mla: MlaGeometry { hidden: 128, heads: 2, q_rank: 0,
+            kv_rank: 128, nope: 64, rope: 64, value: 128 }, intermediate: 128, eps: 1e-5,
+            block: 3, group: 0, selector_rank: 512, selector_top_k: 0, taps: vec![0, 1],
+            vocab: 16, mask_token: 0, max_context: 32768, windows: vec![Some(2048); 2],
+            rotary: DsparkRotaryPlan { inv_freq: vec![1.; 32], attention_factor: 1., softmax_factor: 1. },
+            kind: cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark, markov_rank: 512 };
+        let state = std::cell::RefCell::new(MlaDraftCacheState::new(
+            cfg.cache_layout(3, 32768, cuteafd_core::MlaCacheFormat::Bf16)?)?);
+        for start in [17, dflash::TAP_ROWS + 19] {
+            for sequences in [1, 3, 2] {
+                let origin = bench_verify_draft_context(start, sequences,
+                    |slot, origin| Ok(state.borrow_mut().reset(slot, origin)?),
+                    |rows| {
+                        let slot = rows[0].slot;
+                        let first = rows[0].position;
+                        for (offset, row) in rows.iter().enumerate() {
+                            assert_eq!((row.slot, row.tap_row, row.position), (slot, offset, first + offset));
+                        }
+                        let mut state = state.borrow_mut();
+                        for layer in 0..2 { state.context_rows(layer, slot, first, rows.len())?; }
+                        Ok(state.commit_context(slot, first, rows.len())?)
+                    })?;
+                assert_eq!(origin, start.saturating_sub(dflash::TAP_ROWS));
+                let requests = (0..sequences).map(|slot| {
+                    assert_eq!(state.borrow().frontier(slot).unwrap(), (origin, start));
+                    MlaDraftCacheRequest { slot, position: start, valid_from: origin }
+                }).collect::<Vec<_>>();
+                for layer in 0..2 { state.borrow().block_batches(layer, &requests)?; }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires full ML4, CUDA and Spark peers; CUTEAFD_ML4_BENCH_VERIFY_ARGS is a JSON golden argv list"]
+    fn bench_verify_mla_drafter_writes_each_requested_batch() -> Result<()> {
+        #[derive(Parser)]
+        struct Golden { #[command(flatten)] args: GoldenArgs }
+        let argv: Vec<String> = serde_json::from_str(&std::env::var("CUTEAFD_ML4_BENCH_VERIFY_ARGS")?)?;
+        let mut args = Golden::try_parse_from(std::iter::once("ml4-bench-verify".to_owned()).chain(argv))?.args;
+        ensure!(args.engine.dspark && args.engine.peers.is_some() && !args.engine.skip_routed_experts,
+            "MLA bench regression requires the bundled ML4 drafter and live experts");
+        let output = tempfile::tempdir()?;
+        args.bench_verify = Some(1);
+        args.bench_rows = vec![1];
+        args.bench_sequences = vec![1, 2];
+        args.bench_context = Some(dflash::TAP_ROWS + 19);
+        args.bench_dump = Some(output.path().to_owned());
+        golden(args)?;
+        ensure!(!std::fs::read(output.path().join("logits-1.bin"))?.is_empty(), "missing target logits");
+        for sequences in [1, 2] {
+            let drafts = std::fs::read_to_string(output.path().join(format!("drafts-{sequences}.txt")))?;
+            ensure!(drafts.lines().count() == sequences, "missing requested MLA draft slots");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn golden_rejects_invalid_unit_geometry_before_opening_checkpoint() {
         #[derive(Parser)]
         struct Golden { #[command(flatten)] args: GoldenArgs }
@@ -1786,6 +1847,22 @@ fn width_invariance(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
     Ok(())
 }
 
+fn bench_verify_draft_context(start: usize, sequences: usize,
+    mut reset: impl FnMut(usize, usize) -> Result<()>,
+    mut update: impl FnMut(&[dflash::ContextRow]) -> Result<()>) -> Result<usize> {
+    let rows = start.min(dflash::TAP_ROWS);
+    let origin = start - rows;
+    for slot in 0..sequences {
+        reset(slot, origin)?;
+        if rows > 0 {
+            update(&(0..rows).map(|tap_row| dflash::ContextRow {
+                tap_row, slot, position: origin + tap_row,
+            }).collect::<Vec<_>>())?;
+        }
+    }
+    Ok(origin)
+}
+
 fn bench_verify(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, max_rows: usize) -> Result<()> {
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
@@ -1833,10 +1910,6 @@ fn bench_verify(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
             times[0], 1e3 * phases[0] / n, 1e3 * phases[1] / n, 1e3 * phases[2] / n);
     }
     if let Some(drafter) = engine.drafter.as_ref() {
-        // The drafter reads its ring context of the prefilled taps; anchors at the prefill's end.
-        let n = start.min(dflash::TAP_ROWS);
-        drafter.update(&(0..n).map(|r| dflash::ContextRow { tap_row: r, slot: 0, position: start - n + r })
-            .collect::<Vec<_>>())?;
         println!("drafter step (anchors at position {start}, median of 7):");
         let max_batch = dflash::ReplayDrafter::sequences(drafter);
         let mut counts: Vec<usize> = (0..).map(|i| 1usize << i).take_while(|&s| s < max_batch)
@@ -1846,8 +1919,11 @@ fn bench_verify(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
             counts = args.bench_sequences.clone();
         }
         for sequences in counts {
+            // Startup retires MLA bindings; each batch reads the same retained tap tail.
+            let origin = bench_verify_draft_context(start, sequences,
+                |slot, origin| drafter.reset_context(slot, origin), |rows| drafter.update(rows))?;
             let seqs: Vec<dflash::DraftSeq> = (0..sequences)
-                .map(|slot| dflash::DraftSeq { slot, anchor: tokens[start], position: start, valid_from: 0 }).collect();
+                .map(|slot| dflash::DraftSeq { slot, anchor: tokens[start], position: start, valid_from: origin }).collect();
             let mut times = Vec::new();
             for round in 0..9 {
                 let started = Instant::now();
