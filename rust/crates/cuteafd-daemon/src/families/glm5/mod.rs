@@ -888,7 +888,7 @@ impl Opened {
             tracing::info!(loaded, skipped, "GLM programs loaded");
             Ok(())
         })?;
-        let draft_file = args.draft.as_deref().map(dflash::prefetch);
+        let mut draft_file = None;
         let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement)
             .map_err(anyhow::Error::msg)?;
         let requested = cuteafd_loader::placement::families::glm5::resolve_attention(&self.cfg, requested, devices.len());
@@ -1133,15 +1133,21 @@ impl Opened {
                     let devices = tp2_devices()?;
                     let sink = std::rc::Rc::new(landing::PushSink::default());
                     let planning = weights::GlmLoader { push: Some(sink.clone()), ..loader.clone() };
-                    let model = {
-                        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                        planning.model(&self.cfg, layers, owners.as_deref(), native)?
-                    };
-                    let (records, deferred) = sink.take();
+                    let ((embedding, model, drafter), mut records) = crate::shared::experts::rtx::dense::recording(|| {
+                        let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library,
+                            self.embed_source()?, args.token_io.embed_placement, || {
+                                let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                                planning.model(&self.cfg, layers, owners.as_deref(), native)
+                            })?;
+                        let drafter = self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file)?;
+                        Ok((embedding, model, drafter))
+                    })?;
+                    let (operands, deferred) = sink.take();
+                    records.operands.extend(operands);
                     let dense = push::plan_ranks(&self.snapshot, records.clone(), devices, peers.len())?;
                     let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare(&self.snapshot,
                         Some(&self.catalog), 2, Some(crate::shared::experts::rtx::push::CoordinatorExperts::Tp2 { layers: range.clone().collect(), budgets: budgets.to_vec() }))?;
-                    Ok((prepared, (model, records, deferred, dense)))
+                    Ok((prepared, (embedding, model, drafter, records, deferred, dense)))
                 })().map_err(|error| tracing::info!(%error, "coordinator TP2 push unavailable; mount")).ok(),
                 _ => None,
             };
@@ -1170,6 +1176,10 @@ impl Opened {
                 &self.snapshot, Some(&self.catalog), devices.len(), native_push_experts()?)?;
             native_push = Some((push, 0));
         }
+        if coordinator_push.is_none() && native_push.is_none() {
+            draft_file = args.draft.as_deref().map(dflash::prefetch);
+        }
+        let mut planned_drafter = None;
         let started = Instant::now();
         // The admitted TP2 expert halves are charged before the serving pool;
         // their bytes land inside the Spark admission window (pushed, or through
@@ -1203,16 +1213,12 @@ impl Opened {
         let (embedding, ((model, mut shares), tp2)) = crate::shared::placement::load_while_admitting(admission, || {
             if let Some(records) = &native_records {
                 let loaded = self.load_native(args, records, &native_dense_records, layers, &programs, &manifest, &loader, &devices, stream,
-                    peer_stream, native_push.take())?;
+                    peer_stream, native_push.take(), &ml4_draft, &mut draft_file)?;
+                planned_drafter = loaded.3;
                 let tp2 = tp2_range.clone().map(|range| tp2_weights(range, loaded.2)).transpose()?;
                 return Ok((loaded.0, (loaded.1, tp2)));
             }
-            let (embedding, (model, pushed)) = crate::shared::token_io::TokenEmbedding::load(&self.library,
-                self.embed_source()?, args.token_io.embed_placement, || {
-                let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                let Some((push, sparks, (model, records, deferred, dense))) = coordinator_push.take() else {
-                    return Ok((loader.model(&self.cfg, layers, owners.as_deref(), native)?, None));
-                };
+            let (embedding, model, pushed) = if let Some((push, sparks, (embedding, model, drafter, records, deferred, dense))) = coordinator_push.take() {
                 // The planned dense operands join the same ranks as the TP2 halves:
                 // receive both, then run the transforms of landed bytes.
                 let devices = tp2_devices()?;
@@ -1221,16 +1227,24 @@ impl Opened {
                 let rank_stream = |device: i32| if device == args.device { stream }
                     else { peer_stream.map_or(stream, |(_, s)| s) };
                 if pushed.is_none() {
-                    crate::shared::experts::rtx::dense::fill_by_mount(&self.library, &records, &[], rank_stream)?;
+                    crate::shared::experts::rtx::dense::fill_records_by_mount(&self.library, &records, rank_stream)?;
                 }
                 for job in &deferred {
                     crate::shared::memory::device::Device { library: &self.library, id: job.device }
                         .run(|| job.run(&self.library, rank_stream(job.device)))?;
                 }
-                tracing::info!(pushed = pushed.is_some(), operands = records.len(),
+                tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(),
                     "GLM coordinator dense operands landed");
-                Ok((model, pushed))
-            })?;
+                planned_drafter = Some(drafter);
+                (embedding, model, pushed)
+            } else {
+                let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library,
+                    self.embed_source()?, args.token_io.embed_placement, || {
+                        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                        loader.model(&self.cfg, layers, owners.as_deref(), native)
+                    })?;
+                (embedding, model, None)
+            };
             let tp2 = tp2_range.clone().map(|range| tp2_weights(range, pushed)).transpose()?;
             Ok((embedding, (model, tp2)))
         })?;
@@ -1262,49 +1276,11 @@ impl Opened {
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         // Pack before allocating the serving pool and expert arenas: the load-phase
         // admission peak is above the same resident target-weight baseline.
-        let drafter = if let Some(snapshot) = &args.draft {
-            let started = Instant::now();
-            let cfg = dflash::DflashConfig::read(snapshot)?;
-            ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
-                && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
-            let mask = embedding.host_rows(&[cfg.mask_token])?;
-            tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
-            let file = draft_file.context("drafter prefetch")?.join()
-                .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
-            let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
-                ::from_fp8_option(args.draft_fp8);
-            let drafter = dflash::DflashDrafter::load(&self.library, &programs, snapshot, file, stream,
-                args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-                mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache)?;
-            // Admission includes the shared drafter's maximum serving workspace.
-            drafter.prepare_workspace()?;
-            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
-                draft_head = "tensor", "DFlash2 drafter resident");
-            Some(drafter)
-        } else if let Some(layout) = ml4_draft.clone() {
-            let started = Instant::now();
-            let ml4 = self.cfg.variant.ml4().context("mtp_dspark needs the Mistral Large 4 config")?;
-            let params = cuteafd_loader::plan::checkpoint::read_json(&args.snapshot.join("params.json"))?;
-            let dspark = cuteafd_loader::families::mistral_large4::dspark::Ml4DsparkConfig::from_params(&params, ml4.layers)?;
-            let native = cuteafd_loader::formats::dflash::MlaDflashConfig::ml4(&dspark, ml4)?;
-            let catalog = &self.catalog;
-            let source = |name: &str, shape: &[usize]| -> Result<crate::shared::experts::rtx::dense::Rect> {
-                let tensor = catalog.tensor(name)?;
-                let bytes = shape.iter().try_fold(2usize, |n, &d| n.checked_mul(d)).context("mtp_dspark source extent overflow")?;
-                ensure!(tensor.metadata.dtype == cuteafd_core::DType::Bf16 && tensor.metadata.shape == shape
-                    && tensor.metadata.byte_length == bytes as u64,
-                    "{name}: expected BF16 {shape:?}, found {:?} {:?}", tensor.metadata.dtype, tensor.metadata.shape);
-                let rows = if shape.len() >= 2 { shape[0] } else { 1 };
-                ensure!(rows > 0 && bytes > 0 && bytes % rows == 0, "{name}: invalid drafter rows");
-                Ok(crate::shared::experts::rtx::dense::Rect { name: name.into(), path: catalog.snapshot().join(&tensor.shard),
-                    base: tensor.metadata.byte_offset, row_bytes: bytes / rows, rows: 0..rows, cols: 0..bytes / rows })
-            };
-            let drafter = dflash::DflashDrafter::load_ml4(&self.library, &programs, native, ml4,
-                ml4.logit_softcap as f32, stream, layout, &source)?;
-            drafter.prepare_workspace()?;
-            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "mtp_dspark drafter resident");
-            Some(drafter)
-        } else { None };
+        let drafter = match planned_drafter {
+            Some(drafter) => drafter,
+            None => self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file)?,
+        };
+        if let Some(drafter) = &drafter { drafter.prepare_workspace()?; }
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill_lanes, args.prefill_rows)?;
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, pages, embedding, depth, context.filter(|_| context_kv))?;
@@ -1459,17 +1435,70 @@ impl Opened {
 
 
 impl Opened {
-    /// An EXLR8 checkpoint's own dense operands on every coordinator rank: the
-    /// rank-0 row-FP8 vocabulary owner (head and embedding), then each layer's
-    /// native operands through the dense push ranks when the group offered them
-    /// (`push`), else the mount.
+    fn load_drafter<'s>(&'s self, args: &EngineArgs, programs: &'s cuteafd_ffi::programs::Programs<'s>,
+        embedding: &crate::shared::token_io::TokenEmbedding<'s>, stream: *mut c_void,
+        ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
+        draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>)
+        -> Result<Option<dflash::DflashDrafter<'s>>> {
+        Ok(if let Some(snapshot) = &args.draft {
+            let started = Instant::now();
+            let cfg = dflash::DflashConfig::read(snapshot)?;
+            ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
+                && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
+            let mask = embedding.host_rows(&[cfg.mask_token])?;
+            tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
+            let file = if crate::shared::experts::rtx::dense::is_recording() {
+                Vec::new()
+            } else {
+                draft_file.take().unwrap_or_else(|| dflash::prefetch(snapshot)).join()
+                    .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??
+            };
+            let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
+                ::from_fp8_option(args.draft_fp8);
+            let drafter = dflash::DflashDrafter::load(&self.library, programs, snapshot, file, stream,
+                args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
+                mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache)?;
+            // Priming reads the weights; recorded owners prime only after commit.
+            if !crate::shared::experts::rtx::dense::is_recording() { drafter.prepare_workspace()?; }
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
+                draft_head = "tensor", "DFlash2 drafter resident");
+            Some(drafter)
+        } else if let Some(layout) = ml4_draft.clone() {
+            let started = Instant::now();
+            let ml4 = self.cfg.variant.ml4().context("mtp_dspark needs the Mistral Large 4 config")?;
+            let params = cuteafd_loader::plan::checkpoint::read_json(&args.snapshot.join("params.json"))?;
+            let dspark = cuteafd_loader::families::mistral_large4::dspark::Ml4DsparkConfig::from_params(&params, ml4.layers)?;
+            let native = cuteafd_loader::formats::dflash::MlaDflashConfig::ml4(&dspark, ml4)?;
+            let catalog = &self.catalog;
+            let source = |name: &str, shape: &[usize]| -> Result<crate::shared::experts::rtx::dense::Rect> {
+                let tensor = catalog.tensor(name)?;
+                let bytes = shape.iter().try_fold(2usize, |n, &d| n.checked_mul(d)).context("mtp_dspark source extent overflow")?;
+                ensure!(tensor.metadata.dtype == cuteafd_core::DType::Bf16 && tensor.metadata.shape == shape
+                    && tensor.metadata.byte_length == bytes as u64,
+                    "{name}: expected BF16 {shape:?}, found {:?} {:?}", tensor.metadata.dtype, tensor.metadata.shape);
+                let rows = if shape.len() >= 2 { shape[0] } else { 1 };
+                ensure!(rows > 0 && bytes > 0 && bytes % rows == 0, "{name}: invalid drafter rows");
+                Ok(crate::shared::experts::rtx::dense::Rect { name: name.into(), path: catalog.snapshot().join(&tensor.shard),
+                    base: tensor.metadata.byte_offset, row_bytes: bytes / rows, rows: 0..rows, cols: 0..bytes / rows })
+            };
+            let drafter = dflash::DflashDrafter::load_ml4(&self.library, programs, native, ml4,
+                ml4.logit_softcap as f32, stream, layout, &source)?;
+            if !crate::shared::experts::rtx::dense::is_recording() { drafter.prepare_workspace()?; }
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "mtp_dspark drafter resident");
+            Some(drafter)
+        } else { None })
+    }
+
+    /// Native vocabulary, dense operands and drafter share the existing group.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn load_native<'s>(&'s self, args: &EngineArgs, records: &[cuteafd_loader::plan::exlr8::dense::DenseRecord],
         per_rank: &[dense_weights::NativeDenseRecords], layers: usize, programs: &'s cuteafd_ffi::programs::Programs<'s>, _manifest: &serde_json::Value,
         loader: &weights::GlmLoader<'s>, devices: &[i32], stream: *mut c_void, peer_stream: Option<(i32, *mut c_void)>,
-        push: Option<(crate::shared::experts::rtx::push::CoordinatorPush, usize)>)
+        push: Option<(crate::shared::experts::rtx::push::CoordinatorPush, usize)>,
+        ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
+        draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>)
         -> Result<(crate::shared::token_io::TokenEmbedding<'s>, (weights::GlmWeights<'s>, Vec<Vec<weights::GlmLayer<'s>>>),
-            Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'s>>>)> {
+            Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'s>>>, Option<Option<dflash::DflashDrafter<'s>>>)> {
         use crate::shared::token_io::native::{NativeVocabulary, VocabularyPlan};
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
         let world = devices.len();
@@ -1483,6 +1512,7 @@ impl Opened {
         ensure!(load_peak <= available, "native dense load peak {load_peak} exceeds available host bytes {available}");
         let config: serde_json::Value = serde_json::from_slice(&std::fs::read(self.snapshot.join("config.json"))?)?;
         let selection = cuteafd_loader::plan::exlr8::dense::DenseSelection::from_hf(&config)?;
+        let recorder = crate::shared::experts::rtx::dense::Recorder::start(push.is_some())?;
         let vocabulary = NativeVocabulary::load(&self.library, programs,
             VocabularyPlan::new(records, &selection, world, 0, self.cfg.hidden, self.cfg.vocab_size)?, available, 0, 0)?
             .context("rank 0 owns the native vocabulary")?;
@@ -1490,11 +1520,14 @@ impl Opened {
         let source = self.native_embed_source()?;
         let embedding = crate::shared::token_io::TokenEmbedding::row_fp8(&self.library, source, vocabulary.clone())?;
         let rank_stream = |device: i32| if device == args.device { stream } else { peer_stream.map_or(stream, |(_, s)| s) };
+        let mut planned_drafter = None;
         let ((model, shares), pushed) = match push {
             Some((push, sparks)) => {
                 let load = crate::shared::experts::rtx::dense::DenseLoad::push(&self.library);
                 let model = loader.native_model(&self.cfg, layers, &per_rank, &load, vocabulary.clone())?;
-                let records = load.sink.as_ref().context("push sink")?.take_all();
+                planned_drafter = Some(self.load_drafter(args, programs, &embedding, stream, ml4_draft, draft_file)?);
+                let mut records = recorder.context("native push recorder")?.finish();
+                records.extend(load.sink.as_ref().context("push sink")?.take_all());
                 let dense_devices: Vec<_> = devices.iter().map(|&id| crate::shared::memory::device::Device {
                     library: &self.library, id }).collect();
                 let planned = crate::shared::experts::rtx::dense::plan_records(&self.snapshot, records.clone(),
@@ -1515,7 +1548,7 @@ impl Opened {
         };
         self.library.cuda_set_device(args.device)?;
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "GLM native dense weights resident");
-        Ok((embedding, (model, shares), pushed))
+        Ok((embedding, (model, shares), pushed, planned_drafter))
     }
 
     /// The row-FP8 embedding's identity (vocabulary file, payload offset).
