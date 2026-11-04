@@ -306,7 +306,12 @@ fn engram_pipeline(lib: &NativeLibrary, catalog: &cuteafd_loader::OfficialV41Cat
     Ok(pipeline)
 }
 
-fn require_planned_peer(probe: Result<()>) -> Result<()> {
+fn require_planned_peer(probe: Result<()>, restore: Result<()>) -> Result<()> {
+    let probe = match (probe, restore) {
+        (Err(probe), Err(restore)) => Err(probe.context(format!("restoring device 0 also failed: {restore:#}"))),
+        (Err(probe), Ok(())) => Err(probe),
+        (Ok(()), restore) => restore.context("restoring device 0 after P2P probe"),
+    };
     probe.context("V4.1 planned two-RTX layout requires bidirectional P2P between devices 0 and 1; refusing single-GPU fallback")
 }
 
@@ -314,11 +319,17 @@ fn require_planned_peer(probe: Result<()>) -> Result<()> {
 mod planned_peer_tests {
     #[test]
     fn peer_failure_preserves_plan_and_probe_reason() {
-        super::require_planned_peer(Ok(())).unwrap();
-        let error = super::require_planned_peer(Err(anyhow::anyhow!("device 1 cannot access device 0"))).unwrap_err();
-        let message = format!("{error:#}");
-        assert!(message.contains("refusing single-GPU fallback"));
-        assert!(message.contains("device 1 cannot access device 0"));
+        super::require_planned_peer(Ok(()), Ok(())).unwrap();
+        for restore in [Ok(()), Err(anyhow::anyhow!("restore failed"))] {
+            let both_failed = restore.is_err();
+            let error = super::require_planned_peer(Err(anyhow::anyhow!("device 1 cannot access device 0")), restore).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("refusing single-GPU fallback"));
+            assert_eq!(error.root_cause().to_string(), "device 1 cannot access device 0");
+            assert_eq!(message.contains("restore failed"), both_failed);
+        }
+        let error = super::require_planned_peer(Ok(()), Err(anyhow::anyhow!("restore failed"))).unwrap_err();
+        assert!(format!("{error:#}").contains("restoring device 0 after P2P probe"));
     }
 }
 
@@ -346,8 +357,8 @@ fn worker(
                     .run(|| library.cuda_enable_peer(0)))
         };
         // Restore the home device even when a directional probe fails.
-        library.cuda_set_device(0)?;
-        require_planned_peer(probe)?;
+        let restore = library.cuda_set_device(0);
+        require_planned_peer(probe, restore)?;
         return distributed::worker(args, receive, ready, stats);
     }
     // SAFETY: the configured library remains owned by this worker until all CUDA work drains.
