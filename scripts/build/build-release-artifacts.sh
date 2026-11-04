@@ -359,6 +359,10 @@ if [[ "$coordinator_aot" == ON ]]; then
         "$output_dir/V41_EXPERT_WORKSPACES/nvfp4_${expert_role}.json"
     fi
   done
+  if [[ -f "$build_root/native/v41_dspark_tp2_experts/v41_experts.json" ]]; then
+    install -m 0644 "$build_root/native/v41_dspark_tp2_experts/v41_experts.json" \
+      "$output_dir/V41_EXPERT_WORKSPACES/mxfp4_dspark_tp2.json"
+  fi
 fi
 # Always write the built-role manifest, including the empty-role default, so
 # the release Dockerfile can COPY it unconditionally. Every listed role is

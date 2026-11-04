@@ -395,10 +395,11 @@ def test_zero_spark_expert_role_still_refused():
     ("build-release-artifacts.sh", "build_root"),
 ])
 @pytest.mark.parametrize("coordinator,nvfp4", [(True, True), (True, False), (False, True)])
-def test_v41_exact_workspace_manifests_survive_artifact_staging(tmp_path, script_name, source_var, coordinator, nvfp4):
+@pytest.mark.parametrize("draft_tp2", [False, True])
+def test_v41_exact_workspace_manifests_survive_artifact_staging(tmp_path, script_name, source_var, coordinator, nvfp4, draft_tp2):
     text = (ROOT / "scripts/build" / script_name).read_text()
     start = text.index("# Keep planner workspace inputs identical")
-    end = text.index("\nfi\n", start) + len("\nfi\n")
+    end = text.index("\n# Always", start)
     block = text[start:end]
     build = tmp_path / "build"
     output = tmp_path / "output"
@@ -417,6 +418,13 @@ def test_v41_exact_workspace_manifests_survive_artifact_staging(tmp_path, script
             path.write_bytes(payload)
             if coordinator:
                 expected[f"{fmt}_{role}.json"] = payload
+    if draft_tp2:
+        path = build / "native/v41_dspark_tp2_experts/v41_experts.json"
+        path.parent.mkdir(parents=True)
+        payload = json.dumps({"role": "dspark_tp2", "variants": [{"core_scratch_nbytes": 7654321}]}).encode()
+        path.write_bytes(payload)
+        if coordinator:
+            expected["mxfp4_dspark_tp2.json"] = payload
     env = {**os.environ, source_var: str(build), "output_dir": str(output),
            "coordinator_aot": "ON" if coordinator else "OFF", "nvfp4_aot": "ON" if nvfp4 else "OFF",
            "CUTEAFD_RELEASE_NVFP4_AOT": "ON" if nvfp4 else "OFF"}

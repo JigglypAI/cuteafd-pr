@@ -80,6 +80,8 @@ mod tests {
                 ensure!((info.role,info.experts,info.logical_intermediate,info.topk,info.input_dtype)
                     ==(4,128,1152,3,7),"draft TP2 native geometry differs");
                 assert!(!kernel.accumulates_tokens());
+            }
+            for capacity in [1,16,64,256,1024,4096] {
                 let backbone=device.run(||library.v41_tp2_expert_kernel(capacity))?;
                 assert_eq!(backbone.info().role,3);
             }

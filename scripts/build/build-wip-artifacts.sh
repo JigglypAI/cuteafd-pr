@@ -409,6 +409,10 @@ if [[ "$coordinator_aot" == ON ]]; then
         "$output_dir/V41_EXPERT_WORKSPACES/nvfp4_${expert_role}.json"
     fi
   done
+  if [[ -f "$build_dir/native/v41_dspark_tp2_experts/v41_experts.json" ]]; then
+    install -m 0644 "$build_dir/native/v41_dspark_tp2_experts/v41_experts.json" \
+      "$output_dir/V41_EXPERT_WORKSPACES/mxfp4_dspark_tp2.json"
+  fi
 fi
 # Always emit the built-role manifest (empty for the legacy default). Roles are
 # derived from the AOT export manifests CMake actually produced and bound to the

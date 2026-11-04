@@ -39,6 +39,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let turns = if options.host_cache_bytes != Some(0) && marks > 0 { options.prefix_entries("deepseek_v41") }
         else { marks.saturating_sub(2) / 2 };
     let dspark = shape.native_layers > 0;
+    ensure!(!options.tp2_dspark_experts || (ranks == 2 && dspark),
+        "--tp2-dspark-experts requires two RTX GPUs and dSpark");
     ensure!(!dspark || shape.native_layers == 3, "V4.1 dSpark retains all three stages");
     let manifest = options.workspace_manifest.as_deref()
         .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
@@ -100,10 +102,29 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         let staging = catalog.expert_staging(crate::V41ExpertSelection::Dspark { stage: 0, expert: 0 })?.staging_bytes() as u64;
         ensure!((1..=cuteafd_core::MAX_DSPARK_PROPOSALS as u8).contains(&options.dspark_draft_limit), "invalid V4.1 dSpark draft limit");
         let width = if options.dspark_draft_limit > 5 { 7 } else { 5 };
-        Some(DraftInventory { resident: bytes, runtime: programs.dspark(&manifest, rows, shape.concurrency, width, ranks,
+        let mut draft = DraftInventory { resident: bytes, runtime: programs.dspark(&manifest, rows, shape.concurrency, width, ranks,
             mode)?, marks: marks * 3 * 128 * 528,
             staging: [staging, 0], loading_experts: [3 * native_expert_bytes(128, 5120, 2304), 0],
-            loader_peak: [bytes, 0], ..Default::default() })
+            loader_peak: [bytes, 0], ..Default::default() };
+        if options.tp2_dspark_experts {
+            let halves = serde_json::from_slice(&std::fs::read(directory.join("V41_EXPERT_WORKSPACES/mxfp4_dspark_tp2.json"))
+                .context("missing V4.1 TP2 dSpark allocation manifest")?)?;
+            draft.runtime = programs.dspark_tp2(&manifest, &halves, rows, shape.concurrency, width, mode)?;
+            let resident = if catalog.mxfp4_scale_codes() {
+                native_expert_bytes(128, 5120, 1152)
+            } else { v41::resident_bytes(5120, 1152, 128, false)? } * 3;
+            let full = if catalog.mxfp4_scale_codes() {
+                native_expert_bytes(128, 5120, 2304)
+            } else { v41::resident_bytes(5120, 2304, 128, false)? } * 3;
+            draft.resident = bytes.checked_sub(full).context("V4.1 draft resident underflow")? + resident;
+            draft.peer_half = resident;
+            let peer_staging = catalog.expert_staging(crate::V41ExpertSelection::DsparkTp2 {
+                stage: 0, expert: 0, rank: 0 })?.staging_bytes() as u64;
+            draft.staging = [staging, peer_staging];
+            draft.loading_experts = [resident; 2];
+            draft.loader_peak = [draft.resident.max(resident + staging), resident + peer_staging];
+        }
+        Some(draft)
     } else { None };
     let automatic = options.pool_tokens == Some(0);
     let mut pool = PoolPolicy::resolve(&options.rtx_bytes, shape.context_tokens, options.pool_tokens, 512, spark_ranks == 0)
@@ -237,9 +258,8 @@ fn retained_weight_bytes(request: &placement::PlacementRequest, placed: &placeme
             && (matches!(d.category, Category::Weights | Category::Embedding | Category::Tables)
                 || d.group == "external drafter weights"))
             .try_fold(0u64, |sum, d| sum.checked_add(d.bytes).context("V4.1 weight budget overflow"))?;
-        if gpu == ranks - 1 {
-            bytes = bytes.checked_add(draft.map_or(0, |d| d.resident)).context("V4.1 draft weight budget overflow")?;
-        }
+        let draft_bytes = draft.map_or(0, |d| if gpu == ranks - 1 { d.resident } else { d.peer_half });
+        bytes = bytes.checked_add(draft_bytes).context("V4.1 draft weight budget overflow")?;
         for (layer, assigned) in request.layers.iter().zip(&placed.layers) {
             if let Some(cost) = layer.experts {
                 let resident = match assigned.experts {

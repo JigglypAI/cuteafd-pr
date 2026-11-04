@@ -384,7 +384,12 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         ensure!(cuteafd_loader::placement::draft::home(&pool.placement) == Some(1), "V4.1 dSpark must be placed beside the decoder head");
     }
     let recorder = crate::shared::experts::rtx::dense::Recorder::start(records.is_some())?;
-    let draft_weights = if args.dspark {
+    let prepared_draft = if args.dspark && args.tp2_dspark_experts && records.is_some() {
+        Some(devices[1].own(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::prepare_serving_tp2(
+            &lib, &catalog, args.concurrency, [draft_budgets(0), draft_budgets(1)], 16 << 20, draft_width))?)
+    } else { None };
+    let draft_expert_bytes = prepared_draft.as_ref().map_or(0, |draft| draft.expert_resident_bytes());
+    let mut draft_weights = if args.dspark && prepared_draft.is_none() {
         Some(if args.tp2_dspark_experts {
             devices[1].own(||crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_tp2(&lib,&catalog,
                 capacity,args.concurrency,[draft_budgets(0),draft_budgets(1)],16<<20,draft_width))?
@@ -393,6 +398,58 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     } else { None };
     if let (Some(records), Some(recorder)) = (records.as_mut(), recorder) { records.extend(recorder.finish()); }
     memory_checkpoint("draft weights")?;
+    pass.bind_execution_plan(&pool.placement)?;
+    second.bind_execution_plan(&pool.placement)?;
+    for slot in &mut slot_passes { slot.bind_execution_plan(&pool.placement)?; }
+    let expert_layers=pool.placement.onboard_layers;
+    cuteafd_bench::context::set_rtx_expert_layers(pool.placement.onboard_layers);
+    let admitted=pool.placement.tp2.context("dual RTX admission has no routed arena")?;
+    let rank_budgets=std::array::from_fn(|gpu| admitted.peak_bytes[gpu].saturating_sub(ffn_arenas as u64) as usize);
+    tracing::info!(expert_layers,rank_peak_bytes=?rank_budgets,cache_bytes=?pool.cache_bytes,
+        pool_tokens=pool.placement.pool_tokens,deferred_bytes=?deferred,"shared dual RTX admission");
+    let spark_plan = admission::plan_sparks(&args, &catalog, expert_layers, capacity,
+        topology)?;
+    // Coordinator ranks join only a pushing group, planned before membership:
+    // a planning error leaves them out (the Sparks still push).
+    let coordinator = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&args.snapshot)?.plan(|| {
+        ensure!(spark_plan.as_ref().is_some_and(|spark| spark.coordinator_pushes()),
+            "V4.1 Spark admission did not select required push");
+        let records = records.as_ref().context("V4.1 required dense push records")?;
+        super::coordinator_push::plan(&args.snapshot, &catalog, devices, records, expert_layers, rank_budgets, draft_expert_bytes,
+            args.peers.len())
+    })?;
+    let (coordinator, ranks) = match coordinator {
+        Some((planned, streams, ranks)) => (Some(planned), Some((streams, ranks))),
+        None => (None, None),
+    };
+    let spark_admission = spark_plan.map(|plan| plan.start_with(&args.peers, ranks)).transpose()?;
+    eprintln!("loading bottom {expert_layers} expert layers as TP2");
+    let pushed = match coordinator {
+        Some(planned) => planned.receive(devices, &catalog)?,
+        None => None,
+    };
+    if pushed.is_none() { if let Some(records) = &records { super::coordinator_push::fill(&lib, records)?; } }
+    let pushed = if let Some(prepared) = prepared_draft {
+        let [left, right] = pushed.context("V4.1 TP2 dSpark requires committed push")?;
+        let mut weights = [left.native()?, right.native()?];
+        ensure!(weights.iter().all(|rank| rank.len() == expert_layers + 3), "mixed draft inventory differs from admission");
+        let stages = weights.each_mut().map(|rank| rank.split_off(expert_layers));
+        draft_weights = Some(devices[1].own(|| prepared.into_inner().install(stages))?);
+        Some(weights.map(crate::shared::experts::rtx::push::PushedExperts::Native))
+    } else { pushed };
+    let routed = match pushed {
+        Some(pushed) if expert_layers > 0 => {
+            let [left, right] = pushed;
+            tp2_ffn::pushed_routed_weights(devices, &catalog, expert_layers, capacity, rank_budgets,
+                [left.native()?, right.native()?])?
+        }
+        _ => tp2_ffn::load_routed_weights(devices, &catalog, expert_layers, capacity,
+            rank_budgets)?,
+    };
+    drop(records);
+    // Every recorded scale pack ran (Done or mount fill): release raw scales.
+    for weights in shared_owned.iter_mut().flatten() { weights.release_raw_scales(); }
+    if let Some(draft) = draft_weights.as_ref() { draft.release_raw_scales(); }
     if let (Some(weights), Some(inventory)) = (&draft_weights, &dspark_inventory) {
         // The loaded weights size their lane chains through the same shape the
         // pre-load inventory used; any divergence is an accounting defect.
@@ -417,50 +474,6 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         "V4.1 fixed BF16 AOT compressed/native FP32 window attention plan");
     let prefix_arenas = match &draft { Some(draft) => prefix_arenas.with_draft(draft.mark_device())?, None => prefix_arenas };
     memory_checkpoint("draft runtime and marks")?;
-    pass.bind_execution_plan(&pool.placement)?;
-    second.bind_execution_plan(&pool.placement)?;
-    for slot in &mut slot_passes { slot.bind_execution_plan(&pool.placement)?; }
-    let expert_layers=pool.placement.onboard_layers;
-    cuteafd_bench::context::set_rtx_expert_layers(pool.placement.onboard_layers);
-    let admitted=pool.placement.tp2.context("dual RTX admission has no routed arena")?;
-    let rank_budgets=std::array::from_fn(|gpu| admitted.peak_bytes[gpu].saturating_sub(ffn_arenas as u64) as usize);
-    tracing::info!(expert_layers,rank_peak_bytes=?rank_budgets,cache_bytes=?pool.cache_bytes,
-        pool_tokens=pool.placement.pool_tokens,deferred_bytes=?deferred,"shared dual RTX admission");
-    let spark_plan = admission::plan_sparks(&args, &catalog, expert_layers, capacity,
-        topology)?;
-    // Coordinator ranks join only a pushing group, planned before membership:
-    // a planning error leaves them out (the Sparks still push).
-    let coordinator = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&args.snapshot)?.plan(|| {
-        ensure!(spark_plan.as_ref().is_some_and(|spark| spark.coordinator_pushes()),
-            "V4.1 Spark admission did not select required push");
-        let records = records.as_ref().context("V4.1 required dense push records")?;
-        super::coordinator_push::plan(&args.snapshot, &catalog, devices, records, expert_layers, rank_budgets,
-            args.peers.len())
-    })?;
-    let (coordinator, ranks) = match coordinator {
-        Some((planned, streams, ranks)) => (Some(planned), Some((streams, ranks))),
-        None => (None, None),
-    };
-    let spark_admission = spark_plan.map(|plan| plan.start_with(&args.peers, ranks)).transpose()?;
-    eprintln!("loading bottom {expert_layers} expert layers as TP2");
-    let pushed = match coordinator {
-        Some(planned) => planned.receive(devices, &catalog)?,
-        None => None,
-    };
-    if pushed.is_none() { if let Some(records) = &records { super::coordinator_push::fill(&lib, records)?; } }
-    let routed = match pushed {
-        Some(pushed) if expert_layers > 0 => {
-            let [left, right] = pushed;
-            tp2_ffn::pushed_routed_weights(devices, &catalog, expert_layers, capacity, rank_budgets,
-                [left.native()?, right.native()?])?
-        }
-        _ => tp2_ffn::load_routed_weights(devices, &catalog, expert_layers, capacity,
-            rank_budgets)?,
-    };
-    drop(records);
-    // Every recorded scale pack ran (Done or mount fill): release raw scales.
-    for weights in shared_owned.iter_mut().flatten() { weights.release_raw_scales(); }
-    if let Some(draft) = draft_weights.as_ref() { draft.release_raw_scales(); }
     let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = shared_owned.map(Rc::new);
     if let Some(pending) = spark_admission { pending.wait()?; }
     let lanes = crate::shared::serve::lanes::LaneSet::default();

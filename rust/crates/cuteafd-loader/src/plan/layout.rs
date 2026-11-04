@@ -153,6 +153,8 @@ pub struct LayoutOptions {
     pub draft_sequences: Option<u64>,
     /// V4.1 configured proposal limit; loaded neural width is five or seven.
     pub dspark_draft_limit: u8,
+    /// V4.1 native dSpark expert halves on both coordinator GPUs.
+    pub tp2_dspark_experts: bool,
     /// Shared GQA drafter rings, independent of target KV and weight precision.
     pub draft_kv_cache: crate::families::qwen4::Qwen4KvCache,
     /// Explicit MiMo DFlash context arena; does not widen its draft batch.
@@ -303,6 +305,7 @@ impl Default for LayoutOptions {
             mimo_expert_input: Default::default(),
             draft_sequences: None,
             dspark_draft_limit: 5,
+            tp2_dspark_experts: false,
             draft_kv_cache: crate::families::qwen4::Qwen4KvCache::Fp8,
             draft_context_slots: None,
             mimo_decode_graphs: false,

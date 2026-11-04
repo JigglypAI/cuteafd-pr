@@ -433,6 +433,9 @@ pub(crate) struct PlanArgs {
     /// V4.1 proposal limit for --layout (otherwise DSPARK_DRAFT_LIMIT or five).
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=7))]
     pub(crate) dspark_draft_limit: Option<u8>,
+    /// V4.1 native dSpark routed-expert TP2; requires --layout, --rtx 2 and dSpark.
+    #[arg(long, requires = "layout")]
+    pub(crate) tp2_dspark_experts: bool,
     /// Diagnostic recurrent-state slots for --layout; automatic serving storage equals concurrency.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) state_slots: Option<u64>,
