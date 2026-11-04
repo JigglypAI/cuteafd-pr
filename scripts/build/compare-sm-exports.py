@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import runpy
+import shutil
 import struct
 import subprocess
 import sys
@@ -903,6 +904,58 @@ def parse_sms(value):
     return sms
 
 
+def v4_placement_inputs(destination, staging, timeout, workers):
+    """Publish compiler-produced planner metadata, never inferred scratch sizes."""
+    filesystem = load_file("cuteafd_build_filesystem", ROOT / "scripts/build/assert-build-filesystem.py")
+    for path in (destination, staging):
+        filesystem.check_path(str(path))
+        if path.exists() and any(path.iterdir()):
+            raise ValueError(f"output is not empty: {path}")
+        path.mkdir(parents=True, exist_ok=True)
+    engine = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
+    lock = json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text())
+    exports = [(str(context), "export_b12x_dsv4_aot.py",
+                ["--geometry", "flash,pro,flash2,pro2", "--max-context", str(context),
+                 "--decode-rows", "64", "--prefill-rows", "4096", "--context-split", "on"])
+               for context in (131072, 1048576)]
+    exports.append(("exl3", "package_exl3_aot.py",
+                    ["--geometry", "dsv4p", "--capacities", EXL3_CAPACITIES,
+                     "--bits", "2,3", "--role", "coordinator"]))
+
+    def compile_one(job):
+        name, exporter, extra = job
+        output = staging / name
+        output.mkdir()
+        payload = dict(sms=188, exporter=exporter, args=extra, output=str(output))
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(ROOT))
+        print(f"V4 placement export {name}: {extra}", flush=True)
+        with (output / "export.log").open("w") as log:
+            subprocess.run([sys.executable, str(Path(__file__).resolve()), "--_worker", json.dumps(payload)],
+                           env=env, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=timeout)
+        return json.loads((output / "comparison-context.json").read_text())
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        summaries = list(pool.map(compile_one, exports))
+    for context in (131072, 1048576):
+        for model in ("flash", "pro"):
+            for rtx in (1, 2):
+                target = destination / f"{model}-{rtx}-{context}"
+                target.mkdir()
+                shutil.copy2(staging / str(context) / "dsv4_programs.json", target / "PROGRAMS.json")
+                if model == "pro":
+                    package = target / "exl3/exl3-dsv4p-k23"
+                    for source in (staging / "exl3").rglob("v41_exl3.json"):
+                        copied = package / source.relative_to(staging / "exl3")
+                        copied.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source, copied)
+    files = {str(path.relative_to(destination)): sha(path.read_bytes())
+             for path in sorted(destination.rglob("*.json"))}
+    provenance = dict(schema=1, engine_commit=engine, sparkinfer_revision=lock["revision"],
+                      source_tree_sha256=lock["source_tree_sha256"], exports=summaries, files=files)
+    (destination / "INPUTS.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    print(f"Published V4 placement inputs: {destination}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sms", type=parse_sms, default=(188, 170))
@@ -920,10 +973,18 @@ def main():
     parser.add_argument("--require-identical", action="store_true")
     parser.add_argument("--timeout", type=int, default=7200, help="seconds per export context")
     parser.add_argument("--workers", type=int, default=1, help="independent CPU export groups in parallel")
+    parser.add_argument("--v4-placement-inputs", type=Path,
+                        help="CPU-only Flash/Pro 1/2-RTX x 128K/1M planner metadata; --output-dir is staging")
     parser.add_argument("--_worker", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args._worker:
         worker(json.loads(args._worker))
+        return 0
+    if args.v4_placement_inputs:
+        if args.workers < 1 or args.timeout < 1:
+            parser.error("--workers and --timeout must be positive")
+        v4_placement_inputs(args.v4_placement_inputs.expanduser().resolve(),
+                            args.output_dir.expanduser().resolve(), args.timeout, args.workers)
         return 0
     if args.expected_removals and not args.baseline_source:
         parser.error("--expected-removals requires --baseline-source")
