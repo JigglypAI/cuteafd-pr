@@ -88,6 +88,7 @@ fn fill_layer0(dir: &Path) -> Result<()> {
 struct Screen<'a> {
     library: &'a NativeLibrary,
     execution: Exl3Execution<'a>,
+    weighted_execution: Exl3Execution<'a>,
     epilogue: PartialEpilogue<'a>,
     inputs: [DeviceAllocation<'a>; 3],
     slot: DeviceAllocation<'a>,
@@ -124,7 +125,7 @@ impl Screen<'_> {
     /// The weighted reply (unchanged path): BF16 [rows, WIDTH].
     fn weighted(&mut self, rows: &[usize]) -> Result<Vec<u8>> {
         self.stage(rows)?;
-        let out = unsafe { self.execution.launch_layer(0, self.inputs(), rows.len(), self.stream.raw)? };
+        let out = unsafe { self.weighted_execution.launch_layer(0, self.inputs(), rows.len(), self.stream.raw)? };
         unsafe { self.library.cuda_stream_synchronize(self.stream.raw)?; }
         self.read(out, rows.len() * WIDTH * 2)
     }
@@ -195,11 +196,14 @@ fn partial_reply_screen() -> Result<()> {
     library.cuda_set_device(0)?;
     let weights = Rc::new(vec![Exl3Weights::load(&library, &catalog,
         ExpertLayer::BackboneExl3Tp { layer: 0, rank: 0, world: 6 }, 30_000_000_000)?]);
+    // Partial-only admission omits sum scratch and token output; the reference owns its own Sum arena.
+    let weighted_execution = unsafe { Exl3Execution::with_input_format(&library, weights.clone(), &package,
+        Exl3InputFormat::Fp8K32, Exl3Epilogue::Sum)? };
     let execution = unsafe { Exl3Execution::with_input_format(&library, weights, &package,
         Exl3InputFormat::Fp8K32, Exl3Epilogue::PartialReplies)? };
     let capacity = 80;
     let pitch = WIDTH + WIDTH / 32;
-    let mut screen = Screen { library: &library, execution,
+    let mut screen = Screen { library: &library, execution, weighted_execution,
         epilogue: PartialEpilogue::load(&library, &programs, capacity)?,
         inputs: [DeviceAllocation::new(&library, capacity * pitch)?, DeviceAllocation::new(&library, capacity * TOPK * 4)?,
             DeviceAllocation::new(&library, capacity * TOPK * 4)?],
