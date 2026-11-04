@@ -183,8 +183,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             }
         }
         Err(error) => {
-            report.placement_supported = false;
-            notes.push(format!("V4 pool-first placement: {error}"));
+            let reason = format!("V4 pool-first placement: {error:#}");
+            report.refuse_placement(reason.clone(),
+                "Supply complete native checkpoint owners within the device and resident-weight budgets.");
+            notes.push(reason);
         }
     }
     let towers = Towers::checkpoint(report);

@@ -61,9 +61,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             _ => Category::Weights,
         }),
         Err(error) => {
-            report.placement_supported = false;
             let what = format!("GLM resident operands: {error:#}");
-            report.hints.push(crate::plan::Hint { what: what.clone(), how: "Supply the checkpoint's complete coordinator tensor headers.".into() });
+            report.refuse_placement(what.clone(), "Supply the checkpoint's complete coordinator tensor headers.");
             notes.push(what);
         }
     }
@@ -141,7 +140,6 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             }
         }
         Err(error) => {
-            report.placement_supported = false;
             // A failure can come from a different mode than the static
             // pre-solve default: auto resolves to the family default
             // (context on two peers) against the manifest, not the
@@ -152,7 +150,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
                 *note = format!("attention placement {}", report.attention_placement);
             }
             let what = format!("GLM placement: {error:#}");
-            report.hints.push(crate::plan::Hint { what: what.clone(), how: failure_hint(report.attention_placement) });
+            report.refuse_placement(what.clone(), failure_hint(report.attention_placement));
             notes.push(what);
         }
     }

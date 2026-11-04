@@ -9,7 +9,7 @@
 //! planning lower bound (stated in the notes), not serving admission.
 use super::Model;
 use anyhow::Context as _;
-use crate::{placement::*, plan::{Component, ExpertPlacement, Hint, PlanReport}};
+use crate::{placement::*, plan::{Component, ExpertPlacement, PlanReport}};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
 const GIB: u64 = 1 << 30;
@@ -39,36 +39,31 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         "Muse Spark header lower bound: coordinator graphs and step workspaces are charged from the family's \
             PROGRAMS.json once its programs exist; NOT serving admission".into(),
     ] };
-    let refusal = |report: &mut PlanReport, what: String, how: &str| {
-        report.fits = false;
-        report.placement_supported = false;
-        report.hints.push(Hint { what, how: how.into() });
-    };
     report.bytes_by_owner.clear();
     report.attention_placement = AttentionPlacement::Heads;
     let context = if opts.context_tokens == 0 { cfg.max_position as u64 } else { opts.context_tokens };
     if context > cfg.max_position as u64 {
-        refusal(report, format!("Muse Spark context {context} exceeds the checkpoint's {}", cfg.max_position),
+        report.refuse_placement(format!("Muse Spark context {context} exceeds the checkpoint's {}", cfg.max_position),
             "Lower --context-tokens to at most 1M.");
         return memory;
     }
     if !model.complete {
-        refusal(report, "Muse Spark placement cannot infer fit from missing safetensors headers".into(),
+        report.refuse_placement("Muse Spark placement cannot infer fit from missing safetensors headers".into(),
             "Place every shard's header locally (nest replicate) or plan from a complete snapshot.");
         return memory;
     }
     if !model.expert_formats.iter().any(|f| f.starts_with("exl3-k")) {
-        refusal(report, format!("Muse Spark routed experts are {:?}; only the EXL3 publication has an expert package",
+        report.refuse_placement(format!("Muse Spark routed experts are {:?}; only the EXL3 publication has an expert package",
             model.expert_formats), "Serve the EXL3 K4 + Core-K6 snapshot.");
         return memory;
     }
     if ranks == 0 {
-        refusal(report, "Muse Spark routed experts (~400 GB at K4) need Spark ranks".into(),
+        report.refuse_placement("Muse Spark routed experts (~400 GB at K4) need Spark ranks".into(),
             "Use --spark-ranks 4..8.");
         return memory;
     }
     if !(1..=2).contains(&gpus) || (gpus == 2 && !opts.head_split) {
-        refusal(report, "Muse Spark runs on one RTX or a head-split RTX pair".into(), "Use --rtx 1 or 2.");
+        report.refuse_placement("Muse Spark runs on one RTX or a head-split RTX pair".into(), "Use --rtx 1 or 2.");
         return memory;
     }
     // One request builder for planning and serving startup (plan == runtime).
@@ -76,7 +71,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let catalog = match input.expert_catalog() {
         Ok(catalog) => catalog,
         Err(error) => {
-            refusal(report, format!("Muse Spark expert inventory refused: {error:#}"), "Provide complete EXL3 expert headers.");
+            report.refuse_placement(format!("Muse Spark expert inventory refused: {error:#}"), "Provide complete EXL3 expert headers.");
             return memory;
         }
     };
@@ -106,7 +101,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             opts.workspace_manifest.as_deref().filter(|path| path.is_file()), gpus, prefill.unit_rows) {
             Ok(workspace) => workspace,
             Err(error) => {
-                refusal(report, format!("Muse coordinator EXL3 package refused: {error:#}"), "Install the matching package.");
+                report.refuse_placement(format!("Muse coordinator EXL3 package refused: {error:#}"), "Install the matching package.");
                 return memory;
             }
         },
@@ -120,7 +115,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         }).transpose() {
             Ok(drafter) => drafter,
             Err(error) => {
-                refusal(report, format!("Muse DFlash2 drafter refused: {error:#}"),
+                report.refuse_placement(format!("Muse DFlash2 drafter refused: {error:#}"),
                     "Use a drafter trained for this target (RadixArk/Muse-Spark-Open-DFlash2) or drop --draft.");
                 return memory;
             }
@@ -128,14 +123,14 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         fixed: match planned_code(opts, gpus) {
             Ok(fixed) => fixed,
             Err(error) => {
-                refusal(report, format!("Muse Spark program manifest refused: {error:#}"), "Supply the image's PROGRAMS.json.");
+                report.refuse_placement(format!("Muse Spark program manifest refused: {error:#}"), "Supply the image's PROGRAMS.json.");
                 return memory;
             }
         }, startup: Vec::new() };
     let mut built = match crate::placement::families::muse_spark::request(inputs) {
         Ok(built) => built,
         Err(error) => {
-            refusal(report, format!("Muse Spark joint admission refused: {error:#}"),
+            report.refuse_placement(format!("Muse Spark joint admission refused: {error:#}"),
                 "Use more Spark ranks, automatic RTX expert selection, or a larger --spark-budget-gib.");
             return memory;
         }
@@ -153,7 +148,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             if component == Component::Vision { report.encoder = Some(encoder); }
             else { report.audio_encoder = Some(encoder); }
         }
-        refusal(report, format!("Muse bundled media admission refused: {error:#}"),
+        report.refuse_placement(format!("Muse bundled media admission refused: {error:#}"),
             "Use the bundled BF16 towers, a fitting encoder placement, or explicitly disable media.");
         return memory;
     }
@@ -182,13 +177,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let placed = match built.admitted_placement() {
         Ok(placed) => placed,
         Err(error) => {
-            refusal(report, format!("Muse Spark coordinator admission refused: {error}"),
+            report.refuse_placement(format!("Muse Spark coordinator admission refused: {error}"),
                 "Free KV room by placement or add a second RTX; the pool floor is the compiled context.");
             return memory;
         }
     };
     if let Err(error) = built.local.check(&placed).and_then(|_| built.check_media_workers(&placed)) {
-        refusal(report, format!("Muse Spark coordinator admission refused: {error:#}"),
+        report.refuse_placement(format!("Muse Spark coordinator admission refused: {error:#}"),
             "Rebuild the image with the Muse coordinator scope (its EXL3 rtx-tp1/rtx-tp2 package).");
         return memory;
     }
@@ -215,7 +210,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, opts.resolved_spark_reply_format(true).into()) {
         Ok(cutoff) => cutoff,
         Err(error) => {
-            refusal(report, format!("Muse partial-reply cutoff refused: {error:#}"), "Use a cutoff of at least 64 rows.");
+            report.refuse_placement(format!("Muse partial-reply cutoff refused: {error:#}"), "Use a cutoff of at least 64 rows.");
             return memory;
         }
     };
@@ -228,10 +223,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 model.expert_formats.join("+"), resident, Basis::Exact)] };
         if let Err(error) = usize::try_from(slots).map_err(anyhow::Error::from)
             .and_then(|slots| muse_spark_io(&mut device, &working, prefill, slots, rings, cutoff)) {
-            refusal(report, format!("Muse Spark rank {rank} I/O: {error:#}"), "Fix the Spark ring geometry.");
+            report.refuse_placement(format!("Muse Spark rank {rank} I/O: {error:#}"), "Fix the Spark ring geometry.");
         }
         if let Err(error) = muse_owners(&mut device, &working, prefill.unit_rows, prefill.waves) {
-            refusal(report, format!("Muse Spark execution owners: {error:#}"), "Use a supported wave count.");
+            report.refuse_placement(format!("Muse Spark execution owners: {error:#}"), "Use a supported wave count.");
         }
         if let Some(media) = &media { device.items.extend(media.spark_items[rank].iter().cloned()); }
         memory.devices.push(device);

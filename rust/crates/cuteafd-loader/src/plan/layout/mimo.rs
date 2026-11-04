@@ -74,12 +74,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 for spark in &mut sparks { spark.items.retain(|item| item.group != "routed_expert"); }
             }
             Err(error) => {
-                report.placement_supported = false;
-                report.fits = false;
                 notes.push(format!("MiMo media admission: {error:#}"));
-                // The refusal text is built from hints, so carry the actual note.
-                report.hints.push(super::super::Hint { what: format!("MiMo media admission: {error:#}"),
-                    how: "Select a fitting Spark layout or a smaller explicit pool.".into() });
+                report.refuse_placement(format!("MiMo media admission: {error:#}"),
+                    "Select a fitting Spark layout or a smaller explicit pool.");
                 // A mandatory target failure must not leave media unresolved or
                 // advertise its unallocated RTX headroom as available.
                 for device in &mut admission {
@@ -128,11 +125,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             }
         }
         Err(error) => {
-            report.placement_supported = false;
-            report.fits = false;
             notes.push(format!("MiMo placement: {error:#}"));
-            report.hints.push(super::super::Hint { what: format!("MiMo placement: {error:#}"),
-                how: "Supply matching generated BF16-input expert and workspace manifests, or select a fitting Spark layout/pool.".into() });
+            report.refuse_placement(format!("MiMo placement: {error:#}"),
+                "Supply matching generated BF16-input expert and workspace manifests, or select a fitting Spark layout/pool.");
         }
     }
     if options.mimo_prefix_draft && checkpoint.snapshot.join("dflash/config.json").is_file() {

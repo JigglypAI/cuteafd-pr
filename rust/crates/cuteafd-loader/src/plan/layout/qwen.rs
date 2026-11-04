@@ -91,10 +91,8 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
             }
         }
         None => {
-            report.placement_supported = false;
             let what = "Qwen resident weights: checkpoint headers do not describe the serve-qwen4 resident layout".to_string();
-            report.hints.push(crate::plan::Hint { what: what.clone(),
-                how: "Supply the checkpoint's complete coordinator tensor headers.".into() });
+            report.refuse_placement(what.clone(), "Supply the checkpoint's complete coordinator tensor headers.");
             notes.push(what);
         }
     }
@@ -124,10 +122,9 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
             None if shape.manifest.is_none() => notes.push("local EXL3 workspace not charged: no program manifest \
                 (--workspace-manifest or an image's PROGRAMS.json) to read its capacity manifests from".into()),
             None => {
-                report.placement_supported = false;
                 let what = "Qwen local EXL3 workspace: no matching rtx-tp1/m*/v41_exl3.json capacity manifests".to_string();
-                report.hints.push(crate::plan::Hint { what: what.clone(), how: "Images bundle them; or export the exl3 tree \
-                    alongside PROGRAMS.json (--workspace-manifest).".into() });
+                report.refuse_placement(what.clone(), "Images bundle them; or export the exl3 tree \
+                    alongside PROGRAMS.json (--workspace-manifest).");
                 notes.push(what);
             }
         }
@@ -162,11 +159,9 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
         PlanShape { prefill_rows: shape.prefill_rows, concurrency: shape.concurrency, context_tokens: shape.context_tokens, mtp }) {
         Ok(tokens) => pool_tokens = tokens,
         Err(error) => {
-            report.placement_supported = false;
-            report.fits = false;
             let reason = format!("Qwen admission: {error:#}");
-            report.hints.push(super::super::Hint { what: reason.clone(),
-                how: "Supply complete native checkpoint owners within the device and resident-weight budgets.".into() });
+            report.refuse_placement(reason.clone(),
+                "Supply complete native checkpoint owners within the device and resident-weight budgets.");
             notes.push(reason);
         }
     }
@@ -318,8 +313,9 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
     let mut notes = vec![format!("resolved context {context} tokens"),
         "Qwen whole-layer attention ranges; all routed experts native TP2; head and MTP on rtx0".into()];
     if report.requested_attention.is_some_and(|mode| mode != crate::placement::AttentionPlacement::Layers) {
-        report.placement_supported = false;
-        notes.push("Qwen dual supports whole-layer attention only, not head or context shards".into());
+        let reason = "Qwen dual supports whole-layer attention only, not head or context shards".to_string();
+        report.refuse_placement(reason.clone(), "Use whole-layer attention placement.");
+        notes.push(reason);
         return MemoryLayout { devices, pool_tokens: 0, waste: Vec::new(), notes };
     }
     report.attention_placement = crate::placement::AttentionPlacement::Layers;
@@ -336,16 +332,19 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
                         item.group.starts_with("vision") || item.group.starts_with("audio")));
                 }
             }
-            Err(error) => { report.placement_supported = false; notes.push(format!("Qwen media admission: {error:#}")); }
+            Err(error) => {
+                let reason = format!("Qwen media admission: {error:#}");
+                report.refuse_placement(reason.clone(),
+                    "Supply complete checkpoint headers and exact unequal TP2 plus MTP package manifests.");
+                notes.push(reason);
+            }
         }
     }
     let pool_tokens = match apply(input, options, report.encoder.as_ref(), &mut devices, rows, concurrency, context, mtp, manifest) {
         Ok(placement) => { report.solver_placement = Some(placement.clone()); notes.push(format!("placement: {}", placement.summary())); placement.pool_tokens },
         Err(error) => {
-            report.placement_supported = false;
-            report.fits = false;
-            report.hints.push(super::super::Hint { what: format!("Qwen dual admission: {error:#}"),
-                how: "Supply complete checkpoint headers and exact unequal TP2 plus MTP package manifests.".into() });
+            report.refuse_placement(format!("Qwen dual admission: {error:#}"),
+                "Supply complete checkpoint headers and exact unequal TP2 plus MTP package manifests.");
             notes.push(format!("Qwen dual admission: {error:#}")); 0
         }
     };

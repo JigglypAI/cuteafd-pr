@@ -308,6 +308,12 @@ pub struct PlanReport {
 }
 
 impl PlanReport {
+    pub(crate) fn refuse_placement(&mut self, what: String, how: impl Into<String>) {
+        self.fits = false;
+        self.placement_supported = false;
+        self.hints.push(Hint { what, how: how.into() });
+    }
+
     pub fn executable(&self) -> bool { self.launchable(false) }
 
     pub fn wip_launchable(&self) -> bool { self.launchable(true) }
@@ -734,10 +740,8 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
     let family = report.family.as_deref().unwrap_or("unknown");
     let concurrency = options.resolved_concurrency(family);
     if let Err(error) = cuteafd_core::concurrency::validate(family, concurrency) {
-        report.fits = false;
-        report.placement_supported = false;
         let reason = error.to_string();
-        report.hints.push(Hint { what: reason.clone(), how: "Use a supported boot-time concurrency or add the named program capacity.".into() });
+        report.refuse_placement(reason.clone(), "Use a supported boot-time concurrency or add the named program capacity.");
         return Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![reason] });
     }
     if options.mimo_prefix_entries == u64::MAX {
@@ -753,17 +757,13 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
             Ok(memory)
         },
         Some(Err(error)) => {
-            report.fits = false;
-            report.placement_supported = false;
-            report.hints.push(Hint { what: format!("native placement refused: {error:#}"),
-                how: "Supply the native exports and a shape supported by the family's executor.".into() });
+            report.refuse_placement(format!("native placement refused: {error:#}"),
+                "Supply the native exports and a shape supported by the family's executor.");
             Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0,
                 waste: vec![], notes: vec![format!("native placement refused: {error:#}")] })
         }
         None => {
             let family = report.family.as_deref().unwrap_or("unknown");
-            report.fits = false;
-            report.placement_supported = false;
             let drafter = matches!(family, "dflash2" | "dspark");
             let what = if drafter { format!("{family}: a drafter checkpoint has no memory layout of its own") }
                 else { format!("{family}: no placement adapter in this build") };
@@ -774,7 +774,7 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
                 format!("Implement FamilyModel::placement for {family} (plan/families/), solving the same \
                     PlacementRequest its runtime admits, before claiming a memory layout.")
             };
-            report.hints.push(Hint { what: what.clone(), how });
+            report.refuse_placement(what.clone(), how);
             Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![what] })
         }
     }

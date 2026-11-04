@@ -2705,6 +2705,76 @@ fn v4_snapshot() -> tempfile::TempDir {
 }
 
 #[test]
+fn v4_actual_plan_preserves_exact_resident_weight_refusal_with_and_without_layout() {
+    use crate::placement::{FfnMode, LayerMode, OnboardSetting};
+    let dir = v4_snapshot();
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(dir.path(), 0).unwrap();
+    let modes = vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }; cfg.n_layers];
+    let required = crate::families::deepseek_v4::resident::resident_operands(&cfg, &modes, 1,
+        false, checkpoint.tensors.iter().map(|tensor| &tensor.meta)).unwrap()
+        .iter().map(|owner| owner.bytes).sum::<u64>();
+    assert!(required > 0);
+    for full_layout in [false, true] {
+        let options = PlanOptions { coordinator_budget_bytes: required,
+            layout: full_layout.then(|| layout::LayoutOptions {
+                rtx_bytes: vec![96 << 30], context_tokens: 32768, pool_tokens: Some(32768),
+                onboard: Some(OnboardSetting::Layers(0)), host_memory: Some((128 << 30, 128 << 30)),
+                host_cache_bytes: Some(0), ..Default::default()
+            }), ..sparks(4) };
+        let accepted = plan(dir.path(), &options).unwrap();
+        assert!(accepted.fits && accepted.executable(), "{}", render(&accepted));
+        if let Some(memory) = &accepted.memory_layout {
+            assert_eq!(memory.pool_tokens, 32768);
+            assert_eq!(accepted.onboard_layers, Some(0));
+        }
+        let limit = required - 1;
+        let refused = plan(dir.path(), &PlanOptions {
+            coordinator_budget_bytes: limit, ..options
+        }).unwrap();
+        let diagnostic = format!("rtx0 resident weights need {required} bytes, over the {limit} byte weight budget");
+        assert!(!refused.fits && !refused.placement_supported && !refused.executable()
+            && refused.hints.iter().any(|hint| hint.what.starts_with("V4 pool-first placement:")
+                && hint.what.contains(&diagnostic)), "{}", render(&refused));
+        assert_eq!(refused.memory_layout.is_some(), full_layout);
+    }
+}
+
+#[test]
+fn glm5_actual_plan_preserves_exact_resident_weight_refusal_with_and_without_layout() {
+    use crate::placement::OnboardSetting;
+    let dir = snapshot(glm5_config(), &glm5_tensors(|name, rows, columns| fp8(name, rows, columns, None)));
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+    let required = layout::glm5::device_bytes(&checkpoint, 1, cfg.layers, false, None).unwrap()[0];
+    assert!(required > 0);
+    for full_layout in [false, true] {
+        let options = PlanOptions { coordinator_budget_bytes: required,
+            layout: full_layout.then(|| layout::LayoutOptions {
+                rtx_bytes: vec![96 << 30], context_tokens: 32768, pool_tokens: Some(32768),
+                onboard: Some(OnboardSetting::Layers(0)), glm5_drafter_disabled: true,
+                host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+                ..Default::default()
+            }), ..sparks(4) };
+        let accepted = plan(dir.path(), &options).unwrap();
+        assert!(accepted.fits && accepted.executable(), "{}", render(&accepted));
+        if let Some(memory) = &accepted.memory_layout {
+            assert_eq!(memory.pool_tokens, 32768);
+            assert_eq!(accepted.onboard_layers, Some(0));
+        }
+        let limit = required - 1;
+        let refused = plan(dir.path(), &PlanOptions {
+            coordinator_budget_bytes: limit, ..options
+        }).unwrap();
+        let diagnostic = format!("rtx0 resident weights need {required} bytes, over the {limit} byte weight budget");
+        assert!(!refused.fits && !refused.placement_supported && !refused.executable()
+            && refused.hints.iter().any(|hint| hint.what.starts_with("GLM placement:")
+                && hint.what.contains(&diagnostic)), "{}", render(&refused));
+        assert_eq!(refused.memory_layout.is_some(), full_layout);
+    }
+}
+
+#[test]
 fn deepseek_v4_plan_reads_the_runtime_config_source() {
     let dir = v4_snapshot();
     let report = plan(dir.path(), &sparks(4)).unwrap();

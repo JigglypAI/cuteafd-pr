@@ -1961,11 +1961,21 @@ mod tests {
                 projection::MimoProjectionRepresentation as R};
             let checkpoint = cuteafd_loader::plan::Checkpoint::open(snapshot.path()).unwrap();
             let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
+            let ranks = selected.layout.as_ref().map_or(1, |options| options.rtx_bytes.len());
+            use cuteafd_loader::families::mimo_v2::weight_policy::{default_policy, MimoDefaultPolicy};
+            let qualified_fp8 = default_policy(&checkpoint, &cfg) == MimoDefaultPolicy::Fp8;
+            let representation = |name: &str| {
+                let tensor = checkpoint.tensors.iter().find(|tensor| tensor.meta.name == name).unwrap();
+                if tensor.meta.dtype == cuteafd_core::DType::Bf16 && !qualified_fp8 { R::Bf16 } else { R::Fp8 }
+            };
             let owners = MimoResidentLayout::new(&checkpoint, &cfg, &MimoResidentOptions {
-                layers: cfg.layers, coordinator_ranks: 1, checkpoint_tp: 1, native_mtp_layers: 0,
-                gpu_embedding: true, head_format: R::Fp8,
-                output_formats: (0..cfg.layers).map(|layer|
-                    (format!("model.layers.{layer}.self_attn.o_proj.weight"), R::Fp8)).collect(),
+                layers: cfg.layers, coordinator_ranks: ranks, checkpoint_tp: 1, native_mtp_layers: 0,
+                gpu_embedding: true, head_format: representation("lm_head.weight"),
+                output_formats: (0..cfg.layers).map(|layer| {
+                    let name = format!("model.layers.{layer}.self_attn.o_proj.weight");
+                    let format = representation(&name);
+                    (name, format)
+                }).collect(),
             }).unwrap();
             let required = owners.ranks[0].iter().map(|owner| owner.bytes).sum::<u64>();
             let refusal = format!("rtx0 resident weights need {required} bytes, over the {} byte weight budget", 128 << 20);

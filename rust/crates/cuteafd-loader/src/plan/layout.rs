@@ -827,10 +827,8 @@ pub enum ContextPolicy {
 }
 
 pub(crate) fn unsupported_prefill(report: &mut PlanReport, error: anyhow::Error) -> MemoryLayout {
-    report.fits = false;
-    report.placement_supported = false;
-    report.hints.push(crate::plan::Hint { what: format!("prefill unsupported: {error:#}"),
-        how: "Use a supported explicit prefill shape or add the missing executor/kernel capacity.".into() });
+    report.refuse_placement(format!("prefill unsupported: {error:#}"),
+        "Use a supported explicit prefill shape or add the missing executor/kernel capacity.");
     MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![error.to_string()] }
 }
 
