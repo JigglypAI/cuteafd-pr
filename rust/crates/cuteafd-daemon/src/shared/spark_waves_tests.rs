@@ -881,7 +881,7 @@ fn ring_backend(ring: Ring, slots: usize) -> (Native<Ring>, Vec<u8>, Vec<u8>) {
     let ranks = ring.ranks;
     let row_bytes = ring.row_bytes;
     (Native { transport: ring, reply_format: cuteafd_core::SparkReplyFormat::Bf16, reply_payloads: vec![0; slots],
-        prefill_rows: 0, compressed_prefill_rows: 0, mixed_fallback_rows: 0, arenas: Vec::new(), words, pulls: pulls_at, slots, ranks, row_bytes, landing: 0,
+        prefill_rows: 0, compressed_prefill_rows: 0, mixed_fallback_rows: 0, timing: false, arenas: Vec::new(), words, pulls: pulls_at, slots, ranks, row_bytes, landing: 0,
         placed: true, receiving: (0..ranks).map(|_| (0, Vec::new(), Vec::new())).collect(), retained: VecDeque::new() },
         control, pulls)
 }
