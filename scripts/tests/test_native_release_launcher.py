@@ -22,6 +22,42 @@ def v41_source() -> str:
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
+    def test_v41_planner_receives_normalized_effective_config(self) -> None:
+        source = v41_source()
+        block = source[source.index('count_args='):source.index('if [[ -n "$wip_layout" ]]; then', source.index('count_args='))]
+        for requested, expected in [(None, 'on'), ('off', 'off')]:
+            with self.subTest(requested=requested), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = root / 'sparse.config'
+                config.write_text('  SPECULATOR = "dspark" # draft mode\nDSPARK_DRAFT_LIMIT=\'7\' # width\n'
+                                  'SPARK_0_HOST="ostrich" # first\nSPARK_1_HOST=\'dodo\'\n'
+                                  'SPARK_0_LANE_A=10.55.0.1\nSPARK_1_LANE_A=10.55.0.2\n'
+                                  + (f'TP2_DSPARK_EXPERTS="{requested}" # explicit override\n' if requested else ''))
+                script = '''set -euo pipefail
+source scripts/lib/release-common.sh
+release_load_config "$1"
+release_resolve_tp2_dspark_experts deepseek_v41 2
+dspark_draft_limit="$DSPARK_DRAFT_LIMIT"
+get() { printf '%s' "${2:-}"; }
+container_hf_home=/hf
+namespace_mount_args=()
+'''
+                result = subprocess.run(['bash', '-c', script + block + '''
+printf '%s\\n' "$TP2_DSPARK_EXPERTS" "$SPECULATOR" "$dspark_draft_limit" "$RELEASE_AVAILABLE_SPARKS"
+cat "$count_config"
+printf 'arg=%s\\n' "${count_args[@]}"
+printf 'mount=%s\\n' "${count_mounts[@]}"
+''', 'test', str(config)], cwd=ROOT, env={**os.environ, 'HOME': str(root)}, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lines = result.stdout.splitlines()
+                self.assertEqual(lines[:4], [expected, 'dspark', '7', '2'])
+                normalized = dict(line.split('=', 1) for line in lines[4:] if not line.startswith(('arg=', 'mount=')))
+                self.assertEqual(normalized, dict(TP2_DSPARK_EXPERTS=expected, SPECULATOR='dspark', DSPARK_DRAFT_LIMIT='7',
+                    **{f'SPARK_{rank}_HOST': host for rank, host in enumerate(['ostrich', 'dodo'])}))
+                self.assertIn('arg=--config', lines)
+                self.assertIn('arg=/run/cuteafd-plan.config', lines)
+                self.assertTrue(any(line.startswith('mount=') and line.endswith(':/run/cuteafd-plan.config:ro') for line in lines))
+
     def test_cuda_capacity_matches_uuid_not_cuda_ordinal_and_creates_no_context(self) -> None:
         import contextlib
         import ctypes
