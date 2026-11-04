@@ -532,6 +532,8 @@ mod tests {
                     format!("kimik3_mla_output{suffix}_m{rows}")] { add(name, 512); }
             }
         }
+        programs.sort_by_key(|program| program["name"].as_str().unwrap().to_owned());
+        programs.dedup_by(|left, right| left["name"] == right["name"]);
         let manifest = serde_json::json!({"programs": programs});
         let shape = prefill_shape_with(8256, 3, Some(2752))?;
         let core = super::super::core::CoreInventory::default();

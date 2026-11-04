@@ -84,15 +84,17 @@ def test_kimi_dispatches_to_serve_kimi_with_its_own_defaults(tmp_path: Path) -> 
     assert probe < lines.index(plan)
 
 
-@pytest.mark.parametrize("gpus", [1, 2])
-def test_kimi_launch_uses_only_actual_physical_owners(tmp_path: Path, gpus: int) -> None:
-    result = _kimi(tmp_path, f"RTX_GPUS={gpus}\n", physical_gpus=tuple(range(gpus)))
+@pytest.mark.parametrize("gpus,split", [(1, "auto"), (1, "off"), (2, "auto"), (2, "off")])
+def test_kimi_launch_uses_only_actual_physical_owners(tmp_path: Path, gpus: int, split: str) -> None:
+    result = _kimi(tmp_path, f"RTX_GPUS={gpus}\nCOORDINATOR_SPLIT={split}\n",
+                   physical_gpus=tuple(range(gpus)))
     serve = _line(result, "cuteafd serve-kimi --snapshot")
-    assert _coordinator_gpus(serve) == list(range(gpus))
-    assert _flag(serve, "--split-device") == ("1" if gpus == 2 else None)
-    if gpus == 2:
+    owners = gpus if split != "off" else 1
+    assert _coordinator_gpus(serve) == list(range(owners))
+    assert _flag(serve, "--split-device") == ("1" if owners == 2 else None)
+    if owners == 2:
         assert _flag(serve, "--device") == "0"
-    assert _flag(_line(result, "cuteafd plan"), "--rtx") == str(gpus)
+    assert _flag(_line(result, "cuteafd plan"), "--rtx") == str(owners)
 
 
 def test_kimi_forwards_typed_keys_when_set(tmp_path: Path) -> None:
@@ -155,8 +157,6 @@ def test_kimi_unset_spark_budget_leaves_serve_on_the_family_default(tmp_path: Pa
     ("ATTENTION_PLACEMENT=context\n", "kimi_k3 supports only ATTENTION_PLACEMENT=auto"),
     ("VISION=rtx\n", "kimi_k3 bundled media execution is not qualified"),
     ("AUDIO=spark\n", "kimi_k3 bundled media execution is not qualified"),
-    ("RTX_GPUS=1\n", "TP2 attention on two RTX GPUs"),
-    ("COORDINATOR_SPLIT=off\n", "TP2 attention on two RTX GPUs"),
     ("EMBEDDING=host\n", "GPU token embeddings only"),
     ("RTX_EXPERT_LAYERS=max\n", "RTX_EXPERT_LAYERS must be auto, all or N"),
     ("RTX_EXPERT_LAYERS=50%\n", "RTX_EXPERT_LAYERS must be auto, all or N"),

@@ -274,7 +274,8 @@ fn release_headers_classify_native_text_without_installed_artifacts() {
     assert_eq!(report.spark_budget_bytes, SPARK_BUDGET_BYTES);
     // Serving status does not make the default single-GPU header plan fit.
     assert!(!report.executable());
-    assert!(report.hints.iter().any(|hint| hint.what.contains("coordinator admission refused")), "{:?}", report.hints);
+    assert!(report.hints.iter().any(|hint| hint.what.contains("Kimi header inventory refused: missing projection")),
+        "{:?}", report.hints);
     assert_eq!(model.vision_mode(MediaMode::Auto), MediaMode::Off);
     let vision_report = testing::plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(None), ..Default::default() }).unwrap();
     assert!(!vision_report.wip_launchable());
