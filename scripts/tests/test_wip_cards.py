@@ -1406,6 +1406,14 @@ def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_
                                       'tp_role': None, 'nvfp4': False}
 
 
+def test_gate_glm53_max_uses_current_k4_core_k6_checkpoint():
+    card = cards.load_cards(ROOT / 'scripts/bench/kits/gate', ['glm53-exl3-max'])[0]
+    values = {**cards.config(ROOT / card['config']), **card['set']}
+    assert values['MODEL_ID'] == 'wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6'
+    assert values['MODEL_REVISION'] == '5a4e83a09a11f3145332ed632d28a9894ea88225'
+    assert card['gpus'] == [0, 1] and len(card['sparks']) == 6
+
+
 def test_gate_v41_sim5090_matches_pinned_tp4_reproduction():
     kit = ROOT / 'scripts/bench/kits/gate'
     card = cards.load_cards(kit, ['v41-flash-sim5090'])[0]

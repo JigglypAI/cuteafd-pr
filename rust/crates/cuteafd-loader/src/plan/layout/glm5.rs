@@ -458,7 +458,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         rows, lanes, exchange_f32, onboard, false, None)?;
     let tp2_workspace = local.as_ref().map_or([0; 2], |l| l.workspace());
     let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&cfg, rows, 1, exchange_f32));
-    let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
+    let inputs = glm::GlmInputs { spark_reply_format: options.resolved_spark_reply_format(false), cfg: &cfg, layers: cfg.layers, gpus,
         headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: false, native_workspace: 0,
         native_dense: core.map(|c| c.bytes(cfg.hidden)).transpose()?.unwrap_or_default(),
         native_head: core.is_some_and(|c| c.ranks[0].target_head.is_some()), skip_routed_experts: false, prefill_rows: rows, prefill_lanes: lanes,
@@ -562,7 +562,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     } else { None };
     let tp2_workspace = local.as_ref().map_or([0; 2], |local| local.workspace());
     let serial_workspace = local.as_ref().map_or([0; 2], |local| local.workspace_for(&cfg, rows, 1, false));
-    let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers,
+    let inputs = glm::GlmInputs { spark_reply_format: options.resolved_spark_reply_format(false), cfg: &cfg, layers: cfg.layers,
         gpus: devices.iter().zip(&options.rtx_bytes).map(|(device, &capacity)| (capacity,
             Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() })).collect(),
         headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: true,

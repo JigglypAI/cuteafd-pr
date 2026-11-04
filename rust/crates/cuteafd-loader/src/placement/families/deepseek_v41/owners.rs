@@ -97,11 +97,12 @@ pub fn transport_bytes(rows: u64, ranks: usize) -> Result<u64> {
 /// the `slots` prefill slots' reduce output at the unit `rows` (slot 0's FFN
 /// owner also holds the link), and the one prefill link's intake: every
 /// rank's partial-sum plane over its `slots` return slots.
-pub fn transports_bytes(decode_rows: u64, rows: u64, ranks: usize, slots: usize) -> Result<u64> {
+pub fn transports_bytes(decode_rows: u64, rows: u64, ranks: usize, slots: usize,
+    format: cuteafd_core::SparkReplyFormat) -> Result<u64> {
     ensure!((1..=4).contains(&slots), "invalid V4.1 prefill slots");
     let lanes = 2 * transport_bytes(decode_rows, ranks)?;
     let outputs = slots as u64 * rows * 5120 * 2;
-    Ok(lanes + outputs + crate::serving_capacity::prefill_return_bytes(slots as u64, rows, ranks as u64, 5120))
+    Ok(lanes + outputs + crate::serving_capacity::prefill_return_bytes_with_format(slots as u64, rows, ranks as u64, 5120, format)?)
 }
 
 /// Full vocabulary packing peak above the pre-weight sample: the resident
@@ -561,7 +562,7 @@ mod tests {
                     + decode_rows * 20480;
                 assert_eq!(transport_bytes(decode_rows, ranks)?, decode);
                 let outputs = 3 * 2752 * 10240;
-                assert_eq!(transports_bytes(decode_rows, 2752, ranks, 3)?,
+                assert_eq!(transports_bytes(decode_rows, 2752, ranks, 3, cuteafd_core::SparkReplyFormat::Bf16)?,
                     2 * decode + outputs + ranks as u64 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(3 * 2752 * 10240)?);
             }
         }

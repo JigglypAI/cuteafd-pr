@@ -219,7 +219,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         device.items.push(Item::new(Category::Experts, "package scratch", package, bytes, Basis::Formula));
     }
     let loaded_bytes = device.used_bytes();
-    let inputs = crate::placement::families::qwen4::QwenInputs { automatic_context: options.context_tokens == 0,
+    let inputs = crate::placement::families::qwen4::QwenInputs { spark_reply_format: options.resolved_spark_reply_format(false), automatic_context: options.context_tokens == 0,
         admission: QwenAdmissionInputs { prefill_shape, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
             prefill_rows: span, slots: options.resolved_state_slots("qwen4"), mark_bytes: marks,
             full_prefill_logits: logits, ple, future_expert_bytes: 0, headroom: options.headroom_bytes.max(3 * GIB) },

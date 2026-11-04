@@ -671,6 +671,7 @@ struct Native<T: Transport> {
     prefill_rows: u64,
     compressed_prefill_rows: u64,
     mixed_fallback_rows: u64,
+    timing: bool,
     arenas: Vec<StagingArena>,
     words: Words,
     pulls: Pulls,
@@ -759,6 +760,7 @@ impl<T: Transport> Backend for Native<T> {
         let plane_bytes = info.payload_bytes;
         validate_payload(plane_bytes, info.slice.1)?;
         let receiving = &mut self.receiving;
+        let timing = self.timing;
         let done = self.transport.poll(wave, &mut |rank, first, frame| {
             ensure!(rank < ranks && landing & (1 << rank) == 0,
                 "rank {rank} arrived in host memory but its link lands it in device memory");
@@ -775,6 +777,11 @@ impl<T: Transport> Backend for Native<T> {
             frames.push(frame);
             *received += bytes;
             if *received == plane_bytes {
+                if timing {
+                    tracing::info!(target: "cuteafd::timing", sequence = info.sequence, slot = info.slot,
+                        rows = info.rows, rank, payload_bytes = plane_bytes, frames = entries.len(),
+                        "spark exchange rank arrived");
+                }
                 // The rank's rows are all in: its pull may run now. The
                 // frames stay in their receive slots until the reduce.
                 pulls.write(info.slot, rank, entries);
@@ -1049,7 +1056,7 @@ impl<'a> Waves<'a> {
             ensure!(codec.matches(&intake, reply_format), "reply codec geometry changed across reset");
         }
         let mut native = Native { transport, reply_format, reply_payloads: vec![0; slots],
-            prefill_rows: 0, compressed_prefill_rows: 0, mixed_fallback_rows: 0, arenas: arenas.clone(), words,
+            prefill_rows: 0, compressed_prefill_rows: 0, mixed_fallback_rows: 0, timing, arenas: arenas.clone(), words,
             pulls: pulls.unwrap_or(Pulls { base: 0 }), slots, ranks: intake.ranks, row_bytes: intake.row_bytes,
             landing: intake.landing, placed: intake.placed,
             receiving: (0..intake.ranks).map(|_| (0, Vec::new(), Vec::new())).collect(), retained: VecDeque::new() };

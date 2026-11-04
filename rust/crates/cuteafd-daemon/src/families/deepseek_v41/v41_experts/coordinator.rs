@@ -194,11 +194,11 @@ impl<'a> V41Link<'a> {
     }
     /// Device bytes of the prefill link's intake: every rank's partial-sum
     /// plane over its `reserve_rows` (slots x unit) rows.
-    pub(crate) fn prefill_device_bytes(reserve_rows: usize, ranks: usize) -> Result<usize> {
+    pub(crate) fn prefill_device_bytes(reserve_rows: usize, ranks: usize,
+        format: cuteafd_core::SparkReplyFormat) -> Result<usize> {
         ensure!((1..=8).contains(&ranks) && reserve_rows > 0, "invalid V4.1 prefill link geometry");
-        let logical = reserve_rows.checked_mul(V41_PARTIAL_ROW_BYTES as usize).context("prefill link budget overflow")?;
-        let backing = cuteafd_core::serving_capacity::spark_intake_allocation_bytes(u64::try_from(logical)?)?;
-        usize::try_from(backing)?.checked_mul(ranks).context("prefill link budget overflow")
+        usize::try_from(cuteafd_loader::serving_capacity::prefill_return_bytes_with_format(
+            1, reserve_rows as u64, ranks as u64, 5120, format)?).context("prefill link budget overflow")
     }
     pub(crate) fn link(&mut self) -> &mut crate::shared::spark_intake::SparkLink<'a> { &mut self.link }
     pub(crate) fn capacity(&self) -> u32 { self.link.capacity() }

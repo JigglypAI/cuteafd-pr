@@ -405,7 +405,15 @@ impl<'a> Fp8Worker<'a> {
         let hidden_bytes = request.hidden().len();
         // SAFETY: the owner stream outlives every queued unit (#762 pace).
         unsafe { self.pending.arrive(self.stream.raw)?; }
+        let device = self.inputs[0].buffer.device_id;
+        let mut hidden = self.inputs[0].buffer.ptr;
         match hidden_view.filter(|view| view.bytes >= hidden_bytes) {
+            // The kernel reads the rows from its input pointer exactly as it
+            // would read the resident copy, and the transport retains the
+            // mapped frame until this unit's fence, so an aligned same-device
+            // view is input storage: read it where it landed and skip the
+            // LPDDR-to-LPDDR copy pass.
+            Some(view) if view.ptr as usize % 16 == 0 && view.device_id == device => hidden = view.ptr,
             // SAFETY: the view is device-visible request storage of at least
             // `hidden_bytes`, retained by the transport until this request's
             // response is emitted, which follows the stream synchronize below.
@@ -430,10 +438,10 @@ impl<'a> Fp8Worker<'a> {
         unsafe {
             if let Some(timing) = &self.timing { timing.borrow().record(0, self.stream.raw)?; }
             if bf16 {
-                self.experts.run_bf16(self.layer, rows, self.inputs[0].buffer.ptr, self.inputs[1].buffer.ptr,
+                self.experts.run_bf16(self.layer, rows, hidden, self.inputs[1].buffer.ptr,
                     self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?;
             } else {
-                self.experts.run(self.layer, rows, self.inputs[0].buffer.ptr, self.inputs[1].buffer.ptr,
+                self.experts.run(self.layer, rows, hidden, self.inputs[1].buffer.ptr,
                     self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?;
             }
             if let Some(timing) = &self.timing { timing.borrow().record(1, self.stream.raw)?; }
