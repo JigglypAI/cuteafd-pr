@@ -15,6 +15,7 @@ const SELECT: usize = 4 * 4104;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RankAdmission {
+    pub resident_weights: crate::placement::ResidentWeights,
     pub immutable: u64,
     pub workspace: u64,
 }
@@ -316,16 +317,18 @@ pub(super) fn rank_admission_from_contract(
 pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, layout: &RankWeightLayout,
     ownership: &ExecutionOwnership, rank: usize, unit: usize, span: usize, logits: usize,
 ) -> Result<RankAdmission> {
-    let immutable = layout
+    let weights = layout
         .operands
         .iter()
         .filter(|w| w.name != "model.embed_tokens.weight")
-        .try_fold(contract.rope_tables.allocation_bytes, |n, w| {
+        .try_fold(0u64, |n, w| {
             n.checked_add(w.allocation_bytes)
         })
         .context("Step-5 native rank immutable overflow")?;
-    let mut immutable = layout.core.values().try_fold(immutable, |n, core| n.checked_add(core.bytes as u64))
-        .context("Step-5 native core immutable overflow")?;
+    let weights = layout.core.values().try_fold(weights, |n, core| n.checked_add(core.bytes as u64))
+        .context("Step-5 native core weights overflow")?;
+    let mut immutable = weights.checked_add(contract.rope_tables.allocation_bytes)
+        .context("Step-5 native immutable overflow")?;
     let owns = (0..cfg.layers).any(|layer| ownership.layer(layer, rank).is_ok_and(|l| l.query_heads > 0));
     let mut workspace = if owns {
         rank_attention_bytes(&cfg, ownership, rank, unit)?.checked_add(ffn_region_bytes(unit, span)?)
@@ -341,6 +344,7 @@ pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, l
         workspace = workspace.max(plane_bytes(&head_planes(logits)?)?);
     }
     Ok(RankAdmission {
+        resident_weights: crate::placement::ResidentWeights(weights),
         immutable,
         workspace,
     })
@@ -506,6 +510,8 @@ mod tests {
         for logits in [16, 64] {
             let admitted = rank_admission(&checkpoint, &ownership, 0, 64, 64, logits)?;
             assert_eq!(admitted.immutable, weights + 165511240);
+            assert_eq!(admitted.resident_weights.0, weights
+                - CoordinatorContract::from_checkpoint(&checkpoint)?.rope_tables.allocation_bytes);
             let reusable = rank_attention_bytes(&cfg, &ownership, 0, 64)?
                 + ffn_region_bytes(64, 64)? + native_scratch_bytes(&layout, 64)?;
             assert_eq!(admitted.workspace, reusable.max(plane_bytes(&head_planes(logits)?)?));

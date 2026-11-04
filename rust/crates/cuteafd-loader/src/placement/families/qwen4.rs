@@ -24,6 +24,7 @@ pub fn check_dual_layer_owners(owners: &[usize]) -> anyhow::Result<()> {
 }
 
 pub struct QwenInputs<'a> {
+    pub resident_weight_limit: Option<ResidentWeights>,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     /// True only when the operator left context automatic.
     pub automatic_context: bool,
@@ -78,6 +79,7 @@ pub fn request(inputs: &QwenInputs<'_>, graph_bytes: u64) -> anyhow::Result<Plac
         fixed.push(Demand::new(0, Category::Runtime, "loaded code", inputs.pending_code_bytes, Basis::Formula));
     }
     Ok(PlacementRequest {
+        resident_weight_limit: inputs.resident_weight_limit,
         inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: inputs.capacity_bytes,
             headroom_bytes: admission.headroom, baseline: inputs.baseline }],
             spark_ranks: inputs.spark_ranks, peer_access: false },
@@ -230,7 +232,8 @@ pub fn dual_draft_demands(catalog: &crate::OfficialV41Catalog, native_lib: &std:
             .ok_or_else(|| anyhow::anyhow!("Qwen MTP package has no capacity for {rows} rows"))?.max(256);
         (resident, scratch)
     };
-    Ok(vec![Demand::new(0, Category::Experts, "MTP expert weights", resident, Basis::Exact),
+    Ok(vec![Demand::new(0, Category::Experts, "MTP expert weights", resident, Basis::Exact)
+            .with_resident_weights(ResidentWeights(resident)),
         Demand::new(0, Category::Experts, "MTP expert workspace", scratch, Basis::Formula)])
 }
 
@@ -357,7 +360,8 @@ pub fn dual_owner0_weights(resident: &crate::families::qwen4::resident::Qwen4Che
         (Category::Weights, "owner0 MTP weights", resident.mtp_bytes),
         (Category::Embedding, "owner0 embedding", if host_embedding { 0 } else { resident.embedding_bytes }),
     ].into_iter().filter(|(_, _, bytes)| *bytes > 0)
-        .map(|(category, group, bytes)| Demand::new(0, category, group, bytes, Basis::Exact)).collect()
+        .map(|(category, group, bytes)| Demand::new(0, category, group, bytes, Basis::Exact)
+            .with_resident_weights(ResidentWeights(bytes))).collect()
 }
 
 /// Conservative load-only conversion peak on both nonempty owners, before the
@@ -382,7 +386,7 @@ pub fn dual_ple_demands(cfg: &crate::families::qwen4::Qwen4Config, layers: usize
     if let Some(&layer) = cfg.ple_layers.first().filter(|&&layer| layer < layers) {
         anyhow::ensure!(resident.ple_table_bytes > 0, "Qwen PLE layer {layer} has no table backing headers");
         demands[layer].push(LayerExtraDemand::new(Category::Tables, "PLE scale", 256,
-            LayerResidency::Owner, Basis::Formula));
+            LayerResidency::Owner, Basis::Formula).with_resident_weights(ResidentWeights(256)));
     }
     Ok(demands)
 }
@@ -418,6 +422,7 @@ pub fn dual_peer_diagnostics(enabled: bool) -> Vec<Demand> {
 }
 
 pub struct QwenDualInputs<'a> {
+    pub resident_weight_limit: Option<ResidentWeights>,
     /// True only when the operator left context automatic.
     pub automatic_context: bool,
     pub admission: QwenAdmissionInputs<'a>,
@@ -515,6 +520,7 @@ pub fn dual_request(inputs: &QwenDualInputs<'_>, graph_bytes: [u64; 2]) -> anyho
         QWEN_UNIT_ROWS as u64, inputs.spark_ranks == 0).with_automatic_context(inputs.automatic_context);
     pool.ceiling = pool.target;
     Ok(PlacementRequest {
+        resident_weight_limit: inputs.resident_weight_limit,
         inventory: Inventory { gpus: inputs.gpus.to_vec(), spark_ranks: inputs.spark_ranks, peer_access: true },
         attention_placement: Some(AttentionPlacement::Layers), context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
         pool_bounded: Vec::new(),
@@ -620,7 +626,8 @@ mod tests {
         let resident = crate::families::qwen4::resident::Qwen4CheckpointResident {
             ple_table_bytes: 1 << 30, ..Default::default() };
         let extra = dual_ple_demands(&cfg, 4, &resident).unwrap();
-        let inputs = QwenInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
+        let inputs = QwenInputs {
+        resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
             admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false, kv_format: Qwen4KvCache::Bf16,
                 manifest: None, prefill_rows: 4096, slots: 16, mark_bytes: 0, full_prefill_logits: 0,
                 ple: None, future_expert_bytes: 0, headroom: 0 },
@@ -857,7 +864,8 @@ mod tests {
                     Demand::new(0, Category::Experts, "MTP expert weights", 1300 << 20, Basis::Exact),
                     Demand::new(0, Category::Experts, "MTP expert workspace", 64 << 20, Basis::Formula)]);
             }
-            let inputs = QwenDualInputs { automatic_context: false, owner_manifests: [None, None],
+            let inputs = QwenDualInputs {
+        resident_weight_limit: None, automatic_context: false, owner_manifests: [None, None],
                 admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp, kv_format: Qwen4KvCache::Bf16, manifest: None,
                     prefill_rows: 4096, slots: 16, mark_bytes: 0, full_prefill_logits: 0,
                     ple: None, future_expert_bytes: 0, headroom: 3 << 30 },
@@ -916,7 +924,8 @@ mod tests {
                 ]}]});
             let manifests = dual_program_manifests(&manifest, [170, 188],
                 cuteafd_core::coordinator_programs::AttentionReductionPlan::new(64, None, None).unwrap()).unwrap();
-            let inputs = |measured| QwenDualInputs { automatic_context: false,
+            let inputs = |measured| QwenDualInputs {
+        resident_weight_limit: None, automatic_context: false,
                 owner_manifests: manifests.each_ref().map(Some),
                 admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp: false, kv_format, manifest: None,
                     prefill_rows: 4096, slots: 16, mark_bytes: 0, full_prefill_logits: 0,
@@ -990,7 +999,8 @@ mod tests {
                 for requested in [None, Some(32768), Some(2097152)] {
                     let context = requested.unwrap_or(131072).min(131072);
                     let context_bytes = 586_416_128;
-                    let inputs = |baseline| QwenInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
+                    let inputs = |baseline| QwenInputs {
+        resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
                         admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp, kv_format, manifest: None,
                             prefill_rows: 4096, slots: 16, mark_bytes: 256 << 20, full_prefill_logits: 0,
                             ple: Some((160, true)), future_expert_bytes: 0, headroom: 3 << 30 },
@@ -1028,7 +1038,8 @@ mod tests {
             cuteafd_core::SparkReplyFormat::Nvfp4] {
         for shape in [None, Some(crate::serving_capacity::PrefillShape { unit_rows: 2048, waves: 2 }),
             Some(crate::serving_capacity::PrefillShape { unit_rows: 4096, waves: 2 })] {
-            let inputs = |baseline| QwenInputs { spark_reply_format: format, automatic_context: false,
+            let inputs = |baseline| QwenInputs {
+        resident_weight_limit: None, spark_reply_format: format, automatic_context: false,
                 admission: QwenAdmissionInputs { prefill_shape: shape, cfg: &cfg, layers: 48, mtp: false,
                     kv_format: Qwen4KvCache::Fp8, manifest: None,
                     prefill_rows: shape.map_or(4096, |s| s.slot_rows()), slots: 16,
@@ -1070,7 +1081,8 @@ mod tests {
         let cfg = Qwen4Config::from_hf(&config).unwrap();
         for (mtp, kv_format) in [false, true].into_iter().flat_map(|mtp|
             [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].map(|format| (mtp, format))) {
-            let inputs = QwenInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
+            let inputs = QwenInputs {
+        resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
                 admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp, kv_format, manifest: None,
                     prefill_rows: 4096, slots: 16, mark_bytes: 256 << 20, full_prefill_logits: 0,
                     ple: None, future_expert_bytes: 10 << 30, headroom: 3 << 30 },

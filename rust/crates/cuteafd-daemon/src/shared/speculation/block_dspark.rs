@@ -389,10 +389,10 @@ impl<'a> DsparkDrafter<'a> {
         let cache_layout = cuteafd_loader::formats::block_dspark::BlockDsparkConfig::from_json(&config)?
             .paged_cache_layout(slots, context_capacity, target_tokens, kv_cache)?;
         let cache_rows = cache_layout.layer_bytes[0] / cache_layout.record_bytes;
-        let (resident_bytes, scratch_bytes) = cuteafd_loader::families::glm5::draft_representation::block_dspark_paged_resident_bytes(
+        let residency = cuteafd_loader::families::glm5::draft_representation::block_dspark_paged_resident_bytes(
             &config, slots, max_sequences, library.sm_count()? as u64, representation, fp8_rows.code() as u8,
             context_capacity, target_tokens, kv_cache)?;
-        tracing::info!(resident_bytes, scratch_bytes, kv_cache = %kv_cache, "dSpark shared readiness inventory");
+        tracing::info!(resident_bytes = residency.owned, scratch_bytes = residency.scratch, kv_cache = %kv_cache, "dSpark shared readiness inventory");
         ensure!((1..=MAX_SEQUENCES).contains(&max_sequences), "dSpark drafts take 1..={MAX_SEQUENCES} sequences");
         let load = Load::with_tensors(library, snapshot, tensors)?;
         let upload = |data: &[u8]| -> Result<Dev<'a>> {

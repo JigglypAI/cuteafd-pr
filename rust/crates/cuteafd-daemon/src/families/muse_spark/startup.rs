@@ -75,7 +75,8 @@ pub(crate) fn admit(options: Options<'_>) -> Result<(shared::MuseRequest, Placem
             baseline: Baseline::Measured { free_bytes: sample.free_bytes } })
     }).collect::<Result<Vec<_>>>()?;
     let context = options.max_context.unwrap_or(options.cfg.max_position as u64);
-    let mut built = shared::request(shared::MuseInputs { cfg: options.cfg, core: options.core, catalog: options.catalog,
+    let mut built = shared::request(shared::MuseInputs {
+        resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), cfg: options.cfg, core: options.core, catalog: options.catalog,
         gpus: budgets, spark_ranks: options.spark_ranks, prefill: options.prefill,
         full_prefill_logits: options.full_prefill_logits, slots: options.slots,
         mark_slots: options.mark_slots, context,

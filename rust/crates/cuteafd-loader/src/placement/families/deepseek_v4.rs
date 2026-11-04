@@ -34,6 +34,7 @@ const fn gib(hundredths: u64) -> u64 { hundredths * (1 << 30) / 100 }
 /// checkpoint, the program manifest and the CLI.
 #[derive(Debug, Clone)]
 pub struct V4Inputs<'a> {
+    pub resident_weight_limit: Option<ResidentWeights>,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     /// True only when the operator left context automatic.
     pub automatic_context: bool,
@@ -288,7 +289,9 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
     // dSpark reads the head GPU's taps every step, so it stays beside the head (no bridge).
     let movables = if inputs.draft.is_empty() { Vec::new() } else {
         vec![crate::placement::draft::DrafterDemand::local(MovableId::DsparkExperts,
-            inputs.draft.iter().map(|c| Bytes2 { resident: c.resident_bytes, staging: c.staging_bytes }).collect(), 0)
+            inputs.draft.iter().map(|c| MovablePart::new(
+                Bytes2 { resident: c.resident_bytes, staging: c.staging_bytes },
+                ResidentWeights(c.resident_bytes))).collect(), 0)
             .movable(gpus)?]
     };
     let payload = crate::serving_capacity::deepseek_v4_tp2_payload_bytes(inputs.cfg.dim as u64,
@@ -300,6 +303,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
     }
     let geometry_unit = 256;
     Ok(PlacementRequest {
+        resident_weight_limit: inputs.resident_weight_limit,
         pool_bounded: Vec::new(),
         attention_placement: inputs.attention,
         layers_first_gpu: 0,
@@ -388,6 +392,7 @@ mod default_tests {
             cfg.index_topk = topk;
             for gpus in [1, 2] {
                 let mut input = V4Inputs {
+        resident_weight_limit: None,
                     spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
                     cfg: &cfg, weights: crate::families::deepseek_v4::resident::WeightInventory {
                         c4_attention: Vec::new(), fixed: Vec::new() },

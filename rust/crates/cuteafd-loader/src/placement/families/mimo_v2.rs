@@ -8,6 +8,8 @@ use cuteafd_core::serving_capacity::{CapacityProfile, MemoryReservation, Resolve
 
 #[derive(Clone)]
 pub struct MimoInputs<'a> {
+    pub resident_weight_limit: Option<ResidentWeights>,
+    pub resident_weights: Vec<ResidentWeights>,
     /// True only when the operator left context automatic.
     pub automatic_context: bool,
     pub cfg: &'a MimoV2Config,
@@ -216,7 +218,8 @@ mod tests {
             let local = profile(false);
             let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
                 half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true };
-            let inputs = MimoInputs { automatic_context: false, cfg: &cfg, profile: &spark, layers: 4, kv: MimoKvFormats::default(),
+            let inputs = MimoInputs {
+        resident_weight_limit: None, resident_weights: vec![ResidentWeights::default(); ranks], automatic_context: false, cfg: &cfg, profile: &spark, layers: 4, kv: MimoKvFormats::default(),
                 mtp_stages: 0, gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 90 << 30 }); ranks],
                 headroom_floor: 0, spark_ranks: 6, startup_probe_bytes: 64 << 20, context: 256 << 10,
                 requested_pool: Some(2 << 20), pool_ceiling_at_target: false, onboard: Onboard::Auto,
@@ -328,7 +331,8 @@ mod tests {
             let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
                 half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true };
             for onboard in [Onboard::Auto, Onboard::Layers(2)] {
-                let inputs = MimoInputs { automatic_context: false, cfg: &cfg, profile: &profile, layers: 4, kv: MimoKvFormats::default(),
+                let inputs = MimoInputs {
+        resident_weight_limit: None, resident_weights: vec![ResidentWeights::default(); ranks], automatic_context: false, cfg: &cfg, profile: &profile, layers: 4, kv: MimoKvFormats::default(),
                     mtp_stages: 0, gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 90 << 30 }); ranks],
                     headroom_floor: 0, spark_ranks: 6, startup_probe_bytes: 64 << 20, context: 256 << 10,
                     requested_pool: None, pool_ceiling_at_target: false, onboard,
@@ -410,7 +414,8 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
     let ranks = inputs.gpus.len();
     let profile = inputs.profile;
     let layers = inputs.layers;
-    if !(1..=2).contains(&ranks) || profile.devices.len() != ranks || inputs.experts.len() != layers {
+    if !(1..=2).contains(&ranks) || profile.devices.len() != ranks || inputs.experts.len() != layers
+        || inputs.resident_weights.len() != ranks {
         return Err(PlacementError::Inventory("MiMo ranks, profile and layer costs disagree").into());
     }
     let cache = mimo_cache_geometry(inputs.cfg, layers, ranks, inputs.kv, inputs.mtp_stages)?;
@@ -421,6 +426,8 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
     let mut drafter = Vec::new();
     let mut pool_overhead = Vec::new();
     for (rank, costs) in profile.devices.iter().enumerate() {
+        fixed.push(Demand::new(rank as u8, Category::Weights, "MiMo selected checkpoint owners", 0, Basis::Exact)
+            .with_resident_weights(inputs.resident_weights[rank]));
         for reservation in &costs.reservations {
             let demand = Demand::new(rank as u8, reservation_category(&reservation.name),
                 reservation_group(&reservation.name), reservation.bytes, Basis::Formula);
@@ -489,6 +496,7 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
             .max(inputs.headroom_floor),
     }).collect();
     Ok(PlacementRequest {
+        resident_weight_limit: inputs.resident_weight_limit,
         pool_bounded: Vec::new(),
         inventory: Inventory { gpus, spark_ranks: inputs.spark_ranks, peer_access: ranks == 2 },
         pool,

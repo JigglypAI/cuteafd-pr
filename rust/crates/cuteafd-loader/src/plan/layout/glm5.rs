@@ -77,9 +77,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
         if core.projections.is_empty() { return Ok(None); }
         let owners = layers.then(|| crate::placement::families::glm5::attention_owners(&cfg, cfg.layers)).transpose()?;
-        let (_, _, _, draft_rows) = drafter_admission(options, checkpoint)?;
-        anyhow::ensure!(options.glm5_drafter_disabled || draft_rows.is_some(),
-            "native K6 drafter head needs its actual DFlash config, not a bytes-only override");
+        let (_, _, _, draft_rows, _) = drafter_admission(options, checkpoint)?;
         Ok(Some(crate::families::glm5::core::CoreCharges::from_package(&cfg, &core, cfg.layers,
             ranks, owners.as_deref(), shape.prefill_rows as usize, prefill.waves as usize, draft_rows,
             shape.manifest.as_deref().context("GLM K6 requires PROGRAMS.json with native exports")?)?))
@@ -372,10 +370,9 @@ fn failure_hint(mode: crate::placement::AttentionPlacement) -> String {
 }
 
 fn drafter_admission(options: &LayoutOptions, checkpoint: &Checkpoint)
-    -> anyhow::Result<(u64, u64, Option<usize>, Option<usize>)> {
+    -> anyhow::Result<(u64, u64, Option<usize>, Option<usize>, crate::placement::ResidentWeights)> {
     use crate::placement::families::glm5 as glm;
-    Ok(if options.glm5_drafter_disabled { (0, 0, None, None) }
-        else if options.drafter_bytes > 0 { (options.drafter_bytes, 0, None, None) }
+    let admitted = if options.glm5_drafter_disabled { (0, 0, None, None, crate::placement::ResidentWeights::default()) }
         else if checkpoint.model_type() == Some("mistral_large4") {
             // The bundled mtp_dspark: its own immutable layout, drafting its whole block.
             let sequences = usize::try_from(options.glm_draft_sequences())?;
@@ -394,14 +391,18 @@ fn drafter_admission(options: &LayoutOptions, checkpoint: &Checkpoint)
                     glm::draft_window_mark_bytes(&layout).unwrap_or(0) as u64, options.mimo_prefix_mark_bytes,
                     options.host_cache_bytes != Some(0))) as usize };
             (glm::ml4_draft_resident_bytes(&layout, marks)?, layout.weights().max_load_staging, Some(block),
-                Some(layout.capacity().block_rows))
+                Some(layout.capacity().block_rows), crate::placement::ResidentWeights(layout.weights().resident_bytes()?))
         }
         else {
             let snapshot = options.glm5_drafter_snapshot.clone().or_else(|| {
                 let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
                     .unwrap_or_else(|| std::path::PathBuf::from("/mnt/sparknest/hf-home"));
                 crate::resolve_snapshot_at_revision("incoai/GLM-5.3-DFlash2", Some(&home), None).ok().and_then(|r| r.snapshot_path)
-            }).ok_or_else(|| anyhow::anyhow!("GLM drafter config unavailable; pass its snapshot, --drafter-gib, or disable speculation"))?;
+            });
+            let Some(snapshot) = snapshot else {
+                anyhow::ensure!(options.drafter_bytes > 0, "GLM drafter config unavailable; pass its snapshot, --drafter-gib, or disable speculation");
+                return Ok((options.drafter_bytes, 0, None, None, crate::placement::ResidentWeights(options.drafter_bytes)));
+            };
             let sequences = usize::try_from(options.glm_draft_sequences())?;
             let slots = crate::families::glm5::draft_representation::serving_draft_context_slots(
                 sequences, usize::try_from(options.resolved_concurrency("glm5"))?, options.draft_context_slots.map(usize::try_from).transpose()?);
@@ -409,11 +410,15 @@ fn drafter_admission(options: &LayoutOptions, checkpoint: &Checkpoint)
             let (_, block) = crate::families::glm5::draft_representation::draft_geometry(&config)?;
             let drafts = usize::try_from(block)?.checked_sub(1)
                 .ok_or_else(|| anyhow::anyhow!("GLM draft block must include an anchor"))?;
-            (glm::drafter_bytes(&snapshot, slots, sequences,
+            let (bytes, weights) = glm::drafter_residency(&snapshot, slots, sequences,
                 options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms) as u64,
-                options.glm5_draft_bf16, options.draft_kv_cache)?, glm::drafter_staging(&snapshot, slots, sequences, options.glm5_draft_bf16)?, Some(drafts),
-                Some(sequences.checked_mul(usize::try_from(block)?).context("GLM native draft head row extent")?))
-        })
+                options.glm5_draft_bf16, options.draft_kv_cache)?;
+            (bytes, glm::drafter_staging(&snapshot, slots, sequences, options.glm5_draft_bf16)?, Some(drafts),
+                Some(sequences.checked_mul(usize::try_from(block)?).context("GLM native draft head row extent")?), weights)
+        };
+    anyhow::ensure!(options.glm5_drafter_disabled || options.drafter_bytes == 0 || options.drafter_bytes == admitted.4.0,
+        "drafter weight override {} disagrees with checkpoint resident weights {}", options.drafter_bytes, admitted.4.0);
+    Ok(admitted)
 }
 
 fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &LayoutOptions,
@@ -428,7 +433,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     anyhow::ensure!(report.requested_attention != Some(crate::placement::AttentionPlacement::Layers)
         || lanes <= crate::placement::LAYER_PIPELINE_MAX_LANES,
         "layer-owned prefill lacks capacity for {lanes} waves");
-    let (draft, draft_staging, active_drafts, _) = drafter_admission(options, checkpoint)?;
+    let (draft, draft_staging, active_drafts, _, drafter_weights) = drafter_admission(options, checkpoint)?;
     let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         glm::DECODE_ROWS as usize, active_drafts, options.glm5_attention_plan_rows)?;
     let selected_manifest = manifest.map(|m| -> anyhow::Result<_> {
@@ -458,7 +463,18 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         rows, lanes, exchange_f32, onboard, false, None)?;
     let tp2_workspace = local.as_ref().map_or([0; 2], |l| l.workspace());
     let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&cfg, rows, 1, exchange_f32));
-    let inputs = glm::GlmInputs { spark_reply_format: options.resolved_spark_reply_format(false), cfg: &cfg, layers: cfg.layers, gpus,
+    let owners = (report.requested_attention == Some(crate::placement::AttentionPlacement::Layers))
+        .then(|| glm::attention_owners(&cfg, cfg.layers)).transpose()?;
+    let mut loaded_weights = device_bytes(checkpoint, devices.len(), cfg.layers, options.host_embedding, owners.as_deref())?
+        .into_iter().map(crate::placement::ResidentWeights).collect::<Vec<_>>();
+    if let Some(encoder) = &report.encoder {
+        if let crate::plan::encoder::EncoderKind::Rtx { gpu } = encoder.kind {
+            loaded_weights[gpu] = loaded_weights[gpu].checked_add(crate::placement::ResidentWeights(encoder.weights))?;
+        }
+    }
+    let inputs = glm::GlmInputs {
+        loaded_weights, drafter_weights,
+        resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), cfg: &cfg, layers: cfg.layers, gpus,
         headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: false, native_workspace: 0,
         native_dense: core.map(|c| c.bytes(cfg.hidden)).transpose()?.unwrap_or_default(),
         native_head: core.is_some_and(|c| c.ranks[0].target_head.is_some()), skip_routed_experts: false, prefill_rows: rows, prefill_lanes: lanes,
@@ -494,7 +510,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
     let rows = if options.prefill_rows == 0 { 4096 } else { options.prefill_rows };
     let context = if options.context_tokens == 0 { 1 << 20 } else { options.context_tokens };
-    let (draft, draft_staging, active_drafts, _) = drafter_admission(options, checkpoint)?;
+    let (draft, draft_staging, active_drafts, _, drafter_weights) = drafter_admission(options, checkpoint)?;
     let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         glm::DECODE_ROWS as usize, active_drafts, options.glm5_attention_plan_rows)?;
     let mut manifest = manifest.clone();
@@ -529,7 +545,12 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     } else { resident_owned(checkpoint, gpu_count, cfg.layers, None)? };
     let lanes = options.prefill_waves;
     let mut devices = Vec::new();
+    let mut loaded_weights = Vec::new();
     for (rank, groups) in resident.into_iter().enumerate() {
+        let bytes = groups.iter().filter(|(group, _, _)| group != "shared_expert")
+            .try_fold(shared_bytes[rank], |sum, (_, _, bytes)| sum.checked_add(*bytes))
+            .context("GLM native checkpoint weights overflow")?;
+        loaded_weights.push(crate::placement::ResidentWeights(bytes));
         let mut items: Vec<_> = groups.into_iter().filter(|(group, _, _)| group != "shared_expert")
             .map(|(group, format, bytes)| Item::new(if group == "embedding" { Category::Embedding }
                 else { Category::Weights }, group, format, bytes, Basis::Exact)).collect();
@@ -562,7 +583,9 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     } else { None };
     let tp2_workspace = local.as_ref().map_or([0; 2], |local| local.workspace());
     let serial_workspace = local.as_ref().map_or([0; 2], |local| local.workspace_for(&cfg, rows, 1, false));
-    let inputs = glm::GlmInputs { spark_reply_format: options.resolved_spark_reply_format(false), cfg: &cfg, layers: cfg.layers,
+    let inputs = glm::GlmInputs {
+        loaded_weights, drafter_weights,
+        resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), cfg: &cfg, layers: cfg.layers,
         gpus: devices.iter().zip(&options.rtx_bytes).map(|(device, &capacity)| (capacity,
             Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() })).collect(),
         headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: true,

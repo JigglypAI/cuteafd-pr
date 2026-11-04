@@ -210,10 +210,9 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             options.physical_sms.unwrap_or(placement::ArchContext::coordinator(total, None).sms) as u64).collect();
         // Explicit fixture totals remain opaque: do not add inferred scratch on top.
         let mut draft_rows = None;
-        let (draft, drafter_scratch, drafter_bridge) = if options.glmf_drafter_disabled { (0, vec![0; ranks], None) }
-            else if options.drafter_bytes > 0 {
-                anyhow::ensure!(!native, "native K6 drafter head requires its actual DFlash2 config, not a bytes-only override");
-                (options.drafter_bytes, vec![0; ranks], None)
+        let (draft, drafter_weights, drafter_scratch, drafter_bridge) = if options.glmf_drafter_disabled { (0, placement::ResidentWeights::default(), vec![0; ranks], None) }
+            else if options.drafter_bytes > 0 && options.glmf_drafter_snapshot.is_none() {
+                (options.drafter_bytes, placement::ResidentWeights(options.drafter_bytes), vec![0; ranks], None)
             } else {
             let (config, capacity) = draft_config.as_ref().context("resolved Flash drafter config")?;
             let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);
@@ -222,7 +221,10 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 &draft_sms, crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only, 2, options.draft_kv_cache)?;
             let bridge = if ranks == 2 && glmf::remote_dflash_requested() {
                 glmf::drafter_bridge_inventory(&config, slots, batch)? } else { None };
-            (bytes, scratch, bridge)
+            anyhow::ensure!(options.drafter_bytes == 0 || options.drafter_bytes == bytes.resident_weights.0,
+                "drafter weight override {} differs from checkpoint-resident weights {}",
+                options.drafter_bytes, bytes.resident_weights.0);
+            (bytes.memory.resident, bytes.resident_weights, scratch, bridge)
         };
         let core_charge = if native && exlr8.is_none() {
             let owners = (attention.mode == placement::AttentionPlacement::Layers).then(|| {
@@ -298,7 +300,8 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         let graphs = options.graph_budget_bytes.map(|bytes| placement::GraphSet::budget(&vec![bytes; ranks]))
             .unwrap_or_else(|| glmf::startup_graphs(&cfg, cfg.layers, context as usize, target as usize,
                 sequences as usize, draft > 0, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize));
-        let inputs = glmf::GlmfInputs { spark_reply_format: options.resolved_spark_reply_format(false), automatic_context: options.context_tokens == 0, attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3: local_tp2_exl3 && !native, gpus: baselines, pending_code: vec![0; ranks],
+        let inputs = glmf::GlmfInputs {
+        resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), automatic_context: options.context_tokens == 0, attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3: local_tp2_exl3 && !native, gpus: baselines, pending_code: vec![0; ranks],
             headroom_bytes: options.headroom_bytes, spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
             decode_rows, partial_bytes: if options.glmf_kda_fp32_partials && !native_kda { 4 } else { 2 }, max_context: context, sequences, speculation: draft > 0, state_slots: options.resolved_state_slots("glm5_flash"),
             mark_slots: marks, pool_marks: options.glmf_pool_marks && options.prefix_entries("glm5_flash") > 0,
@@ -306,7 +309,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             resident, workspace, local_workspace, graphs, experts,
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
-            drafter_bytes: draft, drafter_scratch, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
+            drafter_bytes: draft, drafter_weights, drafter_scratch, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
             full_prefill_logits: if options.full_prefill_logits && exlr8.is_none() && core.get_weight("lm_head").is_none() { full_prefill_logits_bytes("glm5_flash", rows, cfg.vocab_size as u64) } else { 0 } };
         let (placed, _, working) = glmf::solve_attention_working_set_with_graphs(&inputs,
             alternate_resident.as_deref(), target, options.context_tokens == 0,
@@ -317,31 +320,6 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             else { alternate_resident.as_ref().expect("solved alternate MLA inventory") };
         if chosen_attention.mode == placement::AttentionPlacement::Layers {
             notes.push(format!("first MLA owner: rtx{}", chosen_attention.first_owner));
-        }
-        if spark_ranks == 0 {
-            let mut weights: Vec<_> = chosen_resident.iter().map(|rank| rank.weights).collect();
-            let embedding_bytes = chosen_resident.iter().map(|rank| rank.embedding).sum::<u64>();
-            let embedding_rank = glmf::embedding_home(&placed) as usize;
-            weights[embedding_rank] = weights[embedding_rank].checked_add(embedding_bytes)
-                .ok_or_else(|| anyhow::anyhow!("GLM Flash resident weight overflow"))?;
-            for ((layer, _), cost) in cfg.dense.iter().enumerate().filter(|(_, dense)| !**dense).zip(&inputs.experts) {
-                for (rank, bytes) in weights.iter_mut().enumerate() {
-                    let resident = match placed.layers[layer].experts {
-                        placement::ExpertHome::RtxTp2 => cost.half[rank].resident,
-                        placement::ExpertHome::RtxWhole { gpu } if gpu as usize == rank => cost.whole.resident,
-                        _ => 0,
-                    };
-                    *bytes = bytes.checked_add(resident)
-                        .ok_or_else(|| anyhow::anyhow!("GLM Flash routed weight overflow"))?;
-                }
-            }
-            for (rank, bytes) in weights.into_iter().enumerate().filter(|(_, bytes)| *bytes > weight_budget) {
-                report.fits = false;
-                report.hints.push(super::super::Hint {
-                    what: format!("rtx{rank} resident weights need {bytes} bytes, over the {weight_budget} byte weight budget"),
-                    how: "Raise --coordinator-weight-budget-gib or use Spark experts.".into(),
-                });
-            }
         }
         let replicas = glmf::replicated_mla_bytes(&cfg, inputs.index, &placed)?;
         if replicas > 0 {

@@ -1786,7 +1786,10 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
                 (device.capacity_bytes, Baseline::Measured { free_bytes: device.capacity_bytes - context - weights })
             }).collect::<Vec<_>>();
             assert_eq!(pre_weight, gpus);
-            let inputs = glm::GlmInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, cfg: &cfg, layers: cfg.layers, gpus,
+            let inputs = glm::GlmInputs {
+                loaded_weights: vec![crate::placement::ResidentWeights::default(); gpus.len()],
+                drafter_weights: crate::placement::ResidentWeights::default(),
+        resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, cfg: &cfg, layers: cfg.layers, gpus,
                 headroom_bytes: options.headroom_bytes, spark_ranks: report.spark_ranks, native_experts: false, native_workspace: 0, native_dense: Vec::new(), native_head: false, skip_routed_experts: false,
                 prefill_rows: 4096,
                 prefill_lanes: 1, max_context: 65536, automatic_context: options.context_tokens == 0, scratch: None, drafter_bytes: 0,
@@ -3324,7 +3327,8 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         let report = plan(dir.path(), &options).unwrap();
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
-        let input = glmf::GlmfInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
+        let input = glmf::GlmfInputs {
+        resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
             gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)| (total, Baseline::Planned {
                 context_bytes: placement::ArchContext::coordinator(total, None).context_bytes
                     + placement::loaded_code("glmf", "fp8", true, rank as u8).unwrap().bytes,
@@ -3339,7 +3343,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
                 GlmfStepShape { spark: false, ..shape }, decode, prefill),
             graphs: placement::GraphSet::budget(&[64 << 20; 2]), experts: glmf::expert_costs(&catalog, true).unwrap(),
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
-            drafter_bytes: 0, drafter_scratch: vec![0; 2], drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
+            drafter_bytes: 0, drafter_weights: placement::ResidentWeights::default(), drafter_scratch: vec![0; 2], drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
             full_prefill_logits: 0 };
         let (placed, graphs, working) = glmf::solve_attention_working_set_with_graphs(&input, None,
             2 << 20, false, 188, true).unwrap();
@@ -3811,8 +3815,9 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
             .filter(|d| d.kind == DeviceKind::Rtx && d.index == rank).flat_map(|d| &d.items)
             .filter(|i| i.category == category && (category == Category::Drafter || i.group == "DFlash linear/attention scratch"))
             .map(|i| i.bytes).sum::<u64>();
-        let (owned, scratch) = crate::placement::families::glm5_flash::drafter_inventory(&config,8,8,
+        let (native_draft, scratch) = crate::placement::families::glm5_flash::drafter_inventory(&config,8,8,
             &[170,188],GlmDraftRepresentation::Fp8Only,2, draft_kv_cache).unwrap();
+        let owned = native_draft.memory.resident;
         let natural = run(&options);
         assert_eq!(bytes(&natural,0,Category::Drafter), owned);
         assert_eq!(bytes(&natural,0,Category::Workspace), scratch[0]);

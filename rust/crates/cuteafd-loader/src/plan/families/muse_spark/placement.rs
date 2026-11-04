@@ -90,7 +90,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             crate::placement::families::muse_spark::mark_bytes(cfg, 1), opts.mimo_prefix_mark_bytes,
             if opts.prefix_slots.is_some() { " (explicit slot override)" } else { "" }));
     }
-    let inputs = crate::placement::families::muse_spark::MuseInputs { cfg, core: &model.core, catalog, mark_slots,
+    let inputs = crate::placement::families::muse_spark::MuseInputs {
+        resident_weight_limit: Some(crate::placement::ResidentWeights(opts.weight_budget_bytes)), cfg, core: &model.core, catalog, mark_slots,
         gpus: opts.rtx_bytes.iter().map(|bytes| GpuBudget { capacity_bytes: *bytes, headroom_bytes: opts.headroom_bytes,
             baseline: Baseline::Planned { context_bytes: ArchContext::for_device("sm_120", *bytes).context_bytes,
                 loaded_bytes: 0 } }).collect(),

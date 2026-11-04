@@ -256,6 +256,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
     let mut runtime = Vec::new();
     for rank in 0..ranks {
         let mut additional = Vec::new();
+        let mut resident_weights = crate::placement::ResidentWeights::default();
         additional.extend(transport_reservations(&cfg, ranks, rank, rows as usize, lanes, spark_ranks, options.resolved_spark_reply_format(false))?);
         if rank == 0 {
             additional.extend(sampling_reservations(cfg.vocab_size)?);
@@ -270,6 +271,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
                         else { draft_representation::MimoDraftRepresentation::Fp8Only }, capacity,
                     |shape| draft_scratch_bytes(shape, options.physical_sms.unwrap_or_else(||
                         crate::placement::inventory::ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms) as usize))?;
+                resident_weights = resident_weights.checked_add(costs.resident_weights)?;
                 additional.extend(costs.steady);
 
             }
@@ -290,7 +292,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
         debug_assert_eq!(graphs.graph_set(decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES,
             decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES).bytes(rank), additional.iter()
                 .filter(|r| r.name.starts_with("runtime.decode_graph")).map(|r| r.bytes).sum::<u64>());
-        runtime.push(MimoRankRuntime { device: rank as u32, workspaces,
+        runtime.push(MimoRankRuntime { resident_weights, device: rank as u32, workspaces,
             loading_additional: Vec::new(), additional });
     }
     let host_embedding = use_host_embedding(checkpoint, options);
@@ -401,8 +403,9 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     let ranks = devices.len();
     let (experts, expert_workspace, tp2_workspace, onboard) = expert_costs(input, &cfg, options, ranks, spark_ranks, rows)?;
     let lanes = if options.prefill_lanes > 0 { options.prefill_lanes } else { prefill_shape(spark_ranks, None)?.waves } as usize;
-    let inputs = crate::placement::families::mimo_v2::MimoInputs { automatic_context: options.context_tokens == 0,
-        cfg: &cfg, profile: &profiles.steady, layers: cfg.layers,
+    let inputs = crate::placement::families::mimo_v2::MimoInputs {
+        resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), automatic_context: options.context_tokens == 0,
+        cfg: &cfg, resident_weights: profiles.resident_weights.clone(), profile: &profiles.steady, layers: cfg.layers,
         kv: MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, mtp_stages: 0,
         gpus: devices.iter().enumerate().map(|(rank, device)| (options.rtx_bytes[rank],
             crate::placement::Baseline::Planned { context_bytes: 0,
@@ -492,7 +495,7 @@ mod tests {
                             if rank == 0 { additional.extend(sampling_reservations(cfg.vocab_size).unwrap()); }
                             additional.extend(graph.reservations(rank, decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES,
                                 decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES).unwrap());
-                            MimoRankRuntime { device: rank as u32, loading_additional: vec![], additional,
+                            MimoRankRuntime { resident_weights: Default::default(), device: rank as u32, loading_additional: vec![], additional,
                                 workspaces: workspace_options(&cfg, ranks, rank, 4096, 32768, lanes, true,
                                     opts.mimo_expert_input, kv, 0, MimoPrefillOutput::LastRow, pro, |_| Ok(0)).unwrap() }
                         }).collect();
@@ -666,7 +669,8 @@ mod tests {
                     let (experts, expert_workspace, tp2_workspace, onboard) =
                         expert_costs(&input, &cfg, &opts, ranks, sparks, 4096).unwrap();
                     let lanes = prefill_shape(6, None).unwrap().waves as usize;
-                    let inputs = MimoInputs { automatic_context: opts.context_tokens == 0, cfg: &cfg, profile: &costs.steady, layers: cfg.layers,
+                    let inputs = MimoInputs {
+        resident_weight_limit: Some(crate::placement::ResidentWeights(opts.weight_budget_bytes)), automatic_context: opts.context_tokens == 0, cfg: &cfg, resident_weights: costs.resident_weights.clone(), profile: &costs.steady, layers: cfg.layers,
                         kv, mtp_stages: 0, gpus: totals.iter().enumerate().map(|(rank, &total)|
                             (total, Baseline::Measured { free_bytes: total - baseline[rank] })).collect(),
                         headroom_floor: opts.headroom_bytes, spark_ranks: sparks, startup_probe_bytes: 64 << 20,

@@ -250,6 +250,11 @@ impl ComponentDemand {
         basis: cuteafd_core::memory_layout::Basis) -> Self {
         Self { component, demand: Demand::new(gpu, category, group, bytes, basis) }
     }
+
+    pub fn with_resident_weights(mut self, weights: super::ResidentWeights) -> Self {
+        self.demand.resident_weights = weights;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

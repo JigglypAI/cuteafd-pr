@@ -284,6 +284,10 @@ pub fn slot_views(unit_rows: u64, slots: u64) -> Vec<std::ops::Range<u64>> {
 /// weights and already-loaded code belong to the caller's baseline, not layers.
 #[derive(Debug, Clone)]
 pub struct GlmInputs<'a> {
+    pub resident_weight_limit: Option<ResidentWeights>,
+    /// Selected checkpoint owners already included in the allocation baseline.
+    pub loaded_weights: Vec<ResidentWeights>,
+    pub drafter_weights: ResidentWeights,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     pub cfg: &'a GlmDsaConfig,
     pub layers: usize,
@@ -355,7 +359,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         && inputs.onboard.layers(routed) != Some(0) && routed > 0;
     let gpus = inputs.gpus.len();
     let cfg = inputs.cfg;
-    if !(1..=2).contains(&gpus) || !(1..=4).contains(&inputs.prefill_lanes)
+    if inputs.loaded_weights.len() != gpus || !(1..=2).contains(&gpus) || !(1..=4).contains(&inputs.prefill_lanes)
         || inputs.prefill_rows == 0 || inputs.prefill_rows > 4096 || inputs.max_context == 0 {
         return Err(PlacementError::Inventory("GLM rank/lane/step/context geometry"));
     }
@@ -452,13 +456,17 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         }
         pool_overhead.push(table_bytes);
     }
-    let fixed = rows.into_iter().filter(|row| row.component.selected(rtx, inputs.spark_ranks > 0))
-        .map(|row| row.demand).collect();
+    let mut fixed = rows.into_iter().filter(|row| row.component.selected(rtx, inputs.spark_ranks > 0))
+        .map(|row| row.demand).collect::<Vec<_>>();
+    fixed.extend(inputs.loaded_weights.iter().enumerate().map(|(rank, &weights)|
+        Demand::new(rank as u8, Category::Weights, "GLM loaded checkpoint owners", 0, Basis::Exact)
+            .with_resident_weights(weights)));
     // DFlash2 reads GPU0's taps and borrows its head; the shared Movable keeps
     // it there until a measured bridge binding allows the other GPU.
     let movables = if inputs.drafter_bytes == 0 { Vec::new() } else {
         vec![draft::DrafterDemand::itemized(vec![
-            Demand::new(0, Category::Drafter, "drafter owned storage", inputs.drafter_bytes, Basis::Formula)], 0)
+            Demand::new(0, Category::Drafter, "drafter owned storage", inputs.drafter_bytes, Basis::Formula)
+                .with_resident_weights(inputs.drafter_weights)], 0)
             .movable(gpus)?]
     };
     let groups = colocate_groups(cfg, inputs.layers);
@@ -498,6 +506,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
     } else { Vec::new() };
     let cards: Vec<_> = inputs.gpus.iter().map(|g| g.0).collect();
     Ok(PlacementRequest {
+        resident_weight_limit: inputs.resident_weight_limit,
         pool_bounded: Vec::new(),
         attention_placement: None,
         layers_first_gpu: 0,
@@ -720,13 +729,14 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
 }
 
 /// Header-only draft storage shared by plan and serve (mode 0 is GLM's W8A16).
-pub fn drafter_bytes(snapshot: &std::path::Path, slots: usize, sequences: usize,
-    sms: u64, bf16: bool, kv_cache: crate::families::qwen4::Qwen4KvCache) -> anyhow::Result<u64> {
+pub fn drafter_residency(snapshot: &std::path::Path, slots: usize, sequences: usize,
+    sms: u64, bf16: bool, kv_cache: crate::families::qwen4::Qwen4KvCache) -> anyhow::Result<(u64, ResidentWeights)> {
     use crate::families::glm5::draft_representation::{draft_resident_bytes_with_mode, GlmDraftRepresentation};
     let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
-    let (owned, scratch) = draft_resident_bytes_with_mode(&config, slots, sequences, sms,
+    let residency = draft_resident_bytes_with_mode(&config, slots, sequences, sms,
         if bf16 { GlmDraftRepresentation::Bf16Only } else { GlmDraftRepresentation::Fp8Only }, 0, kv_cache)?;
-    owned.checked_add(scratch).ok_or_else(|| anyhow::anyhow!("GLM draft storage overflow"))
+    Ok((residency.owned.checked_add(residency.scratch)
+        .ok_or_else(|| anyhow::anyhow!("GLM draft storage overflow"))?, residency.weights))
 }
 
 /// Largest transient BF16 source retained while packing one draft projection.
@@ -1161,7 +1171,8 @@ mod tests {
     }
 
     fn inputs<'a>(cfg: &'a GlmDsaConfig, cards: &[u64]) -> GlmInputs<'a> {
-        GlmInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, cfg, layers: cfg.layers, gpus: cards.iter().enumerate().map(|(rank, &total)| (total,
+        GlmInputs { resident_weight_limit: None, loaded_weights: vec![ResidentWeights::default(); cards.len()],
+            drafter_weights: ResidentWeights(3 * GIB), spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, cfg, layers: cfg.layers, gpus: cards.iter().enumerate().map(|(rank, &total)| (total,
             Baseline::Planned { context_bytes: GIB, loaded_bytes: if rank == 0 { 14 * GIB } else { 12 * GIB } })).collect(),
             headroom_bytes: 2 * GIB, spark_ranks: 4, native_experts: false, native_workspace: 0, native_dense: Vec::new(), native_head: false, skip_routed_experts: false, prefill_rows: 4096, prefill_lanes: 3,
             max_context: 1 << 20, automatic_context: true, scratch: Some([GlmScratch { programs: 16 << 20, topk: 1 << 20 }; 2]),

@@ -153,7 +153,8 @@ impl<'a> DenseEngine<'a> {
         let sizes = buffers.planes;
         let logit_bytes = buffers.logits;
         let (free, total) = library.cuda_memory_info()?;
-        let placement = placement::families::qwen3_5::placement(DenseInputs { cfg: &cfg,
+        let placement = placement::families::qwen3_5::placement(DenseInputs {
+        resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), cfg: &cfg,
             gpu: GpuBudget { capacity_bytes: total as u64, headroom_bytes: 1 << 30,
                 baseline: Baseline::Measured { free_bytes: free as u64 } }, layers: &layer_bytes,
             fixed, drafter, requested_pool, max_context: cfg.max_context as u64,

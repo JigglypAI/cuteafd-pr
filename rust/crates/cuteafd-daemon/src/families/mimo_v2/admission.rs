@@ -376,6 +376,7 @@ fn preflight_shape(
                 &[cfg.program_family()?, &format!("{}2", cfg.program_family()?)], programs.names()))?;
         let cublas = MemoryReservation { name: "runtime.loaded_code".into(), bytes: pending };
         let mut additional = vec![cublas.clone()];
+        let mut resident_weights = cuteafd_loader::placement::ResidentWeights::default();
         additional.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
             cfg, ranks, rank, args.prefill_rows, transport_lanes, 0, cuteafd_core::SparkReplyFormat::Bf16)?);
         // Only modules and the already-attached peer are live before drafter
@@ -403,13 +404,16 @@ fn preflight_shape(
                     opened.weight_formats.draft,
                     args.draft_capacity(draft.block)?,
                 )?;
+                resident_weights = resident_weights.checked_add(reservations.resident_weights)?;
                 additional.extend(reservations.steady);
                 additional.extend(draft_prefix_reservations(prefix_draft, draft_mark_bytes, mark_slots,
                     args.rings as u64)?);
                 draft_packing = reservations.packing;
             }
             if backend == ExpertBackend::Local && args.expert_window.is_some() {
-                additional.extend(local_expert_reservations(opened, args, layers)?);
+                let (reservations, weights) = local_expert_reservations(opened, args, layers)?;
+                additional.extend(reservations);
+                resident_weights = resident_weights.checked_add(weights)?;
             }
         }
         additional.extend(graph_reservations[rank].iter().cloned());
@@ -426,6 +430,7 @@ fn preflight_shape(
             opened.weight_formats.any_fp8_output(),
         )?;
         runtime.push(MimoRankRuntime {
+            resident_weights,
             device: device_id,
             workspaces,
             additional,
@@ -489,8 +494,9 @@ fn preflight_shape(
                 small_card_headroom_bytes(sample.total_bytes))?);
     }
     use cuteafd_loader::placement::{Baseline, families::mimo_v2::{MimoInputs, solve_working_set, resolved_capacity}};
-    let inputs = MimoInputs { automatic_context: automatic_context,
-        cfg, profile: &spark_profiles.steady, layers, kv, mtp_stages: args.mtp,
+    let inputs = MimoInputs {
+        resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), automatic_context: automatic_context,
+        cfg, resident_weights: spark_profiles.resident_weights.clone(), profile: &spark_profiles.steady, layers, kv, mtp_stages: args.mtp,
         gpus: memory.iter().map(|m| (m.total_bytes, Baseline::Measured { free_bytes: m.baseline_free_bytes })).collect(),
         headroom_floor: 0, spark_ranks, startup_probe_bytes: intake_probe_bytes,
         context: args.max_context as u64, requested_pool: policy.pool_tokens, pool_ceiling_at_target: false,
@@ -742,7 +748,7 @@ fn local_expert_reservations(
     opened: &super::Opened,
     args: &super::EngineArgs,
     layers: usize,
-) -> Result<Vec<MemoryReservation>> {
+) -> Result<(Vec<MemoryReservation>, cuteafd_loader::placement::ResidentWeights)> {
     use cuteafd_ffi::fp8_moe::{Fp8MoeMetadata, Fp8MoeWeights};
     use cuteafd_loader::formats::fp8_experts::ExpertFormat;
     let count = opened
@@ -753,7 +759,7 @@ fn local_expert_reservations(
         .filter(|&&dense| !dense)
         .count();
     if count == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Default::default()));
     }
     let tensors = opened
         .catalog
@@ -788,10 +794,11 @@ fn local_expert_reservations(
     let resident_layers = args.expert_window.map_or(count, |window| window.min(count));
     ensure!(resident_layers > 0, "MiMo expert window must be positive");
     let layer_bytes = crate::shared::experts::fp8::Fp8Layer::bytes(tensors, 1)?;
-    Ok(vec![
+    let weights = tensor_bytes("MiMo local expert store", &[resident_layers, layer_bytes])?;
+    Ok((vec![
         MemoryReservation {
             name: "experts.local_resident_weights".into(),
-            bytes: tensor_bytes("MiMo local expert store", &[resident_layers, layer_bytes])?,
+            bytes: weights,
         },
         MemoryReservation {
             name: "experts.local_scratch".into(),
@@ -805,7 +812,7 @@ fn local_expert_reservations(
                 bytes
             },
         },
-    ])
+    ], cuteafd_loader::placement::ResidentWeights(weights)))
 }
 
 pub(super) fn draft_reservations(

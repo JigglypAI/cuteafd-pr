@@ -180,7 +180,7 @@ pub(super) fn layout(
         spark_ranks,
         peer_access: coordinators == 2,
     };
-    let inputs = RuntimeInputs { spark_reply_format: opts.resolved_spark_reply_format(false),
+    let inputs = RuntimeInputs { resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)), spark_reply_format: opts.resolved_spark_reply_format(false),
                 kv_format: opts.step5_kv,
         inventory,
         rows: usize::try_from(shape.span_rows)?,
