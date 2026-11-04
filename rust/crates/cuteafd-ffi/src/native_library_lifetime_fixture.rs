@@ -192,6 +192,16 @@ impl Fixture {
         Ok(())
     }
 
+    /// Record ready checks only for tests asserting host-wait placement.
+    pub fn trace_stream_queries(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: this export toggles recording in the CPU-only fixture above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn()> = library.lib.get(b"fixture_trace_stream_queries")?;
+            configure();
+        }
+        Ok(())
+    }
+
     /// Queue copies and deterministic route-dependent fake expert reads, rather
     /// than executing either at submission. Only explicit advance/drain runs work.
     pub fn queued_experts(&self, library: &NativeLibrary) -> Result<()> {

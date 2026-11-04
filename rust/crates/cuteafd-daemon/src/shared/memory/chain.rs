@@ -402,6 +402,19 @@ pub(crate) async unsafe fn finish_cooperative(stream: &LoadStream<'_>) -> Result
     }
 }
 
+/// Complete an issued stage either on the chain or at its existing host wait.
+/// # Safety
+/// Same as [`finish`]; the caller retains all stage storage through completion.
+#[inline(always)]
+pub(crate) async unsafe fn finish_or_wait(stream: &LoadStream<'_>, chain_only: bool) -> Result<()> {
+    if chain_only {
+        // SAFETY: forwarded from this function's contract.
+        unsafe { finish(stream.library, stream.raw) }
+    } else {
+        stream.wait().await
+    }
+}
+
 /// The device whose event is the chain head (None outside a scope or before
 /// any stage finished).
 pub(crate) fn head_device() -> Option<i32> {

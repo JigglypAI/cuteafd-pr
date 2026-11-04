@@ -670,7 +670,8 @@ impl<'w> NativePendingFfn<'w, '_> {
             // The layer's one host wait for its streams: the reduce joined the
             // chain head (attention, router, shared FFN), so its completion is
             // what the next layer's rebinds check (`require_complete`).
-            self.stream.wait().await?;
+            // SAFETY: this pending owner retains the reduction's queued storage.
+            unsafe { crate::shared::memory::chain::finish_or_wait(self.stream, false).await?; }
         }
         tracing::debug!(target: "cuteafd::timing", layer = self.layer, rows,
             collect_us = timing.elapsed().as_micros() as u64, "target collection");
