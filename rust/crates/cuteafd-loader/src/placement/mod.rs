@@ -21,12 +21,13 @@ pub mod draft;
 pub mod rtx_onboard;
 pub mod families;
 pub mod inventory;
+pub mod planner;
 mod pool;
 pub mod attention;
 mod residual;
 mod solve;
 mod spark;
-pub use spark::{ComponentDemand, SparkAssignment, SparkBudgetInventory, SparkIoBytes, SparkResidentLayout, SparkRingGeometry, SparkWorkingSet, WorkingSetComponent};
+pub use spark::{ComponentDemand, SparkAssignment, SparkBudgetInventory, SparkEndpointOwners, SparkIntakeMode, SparkIntakeOwners, SparkIoBytes, SparkLinkOwners, SparkResidentLayout, SparkRingGeometry, SparkWaveOwners, SparkWaveStaging, SparkWorkingSet, WorkingSetComponent};
 #[cfg(test)]
 mod tests;
 
@@ -35,6 +36,19 @@ pub use pool::{PoolPolicy, AGENTIC_FLOOR_TOKENS};
 pub use residual::{validate_layer_pipeline_lanes, LAYER_PIPELINE_MAX_LANES, hop_buffer_bytes, plan_hops, residual_homes, Hop, HopKind, HopPoint, HopSpec, HopStorage, LayerExecutionPlan, LayerPlanError, ResidualHome, RoutedReplication, TerminalHome, Transition, HOP_SLOTS};
 pub use solve::{solve, solve_frozen, solve_with_marks, MarkSelection};
 pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, KvDemand, LayerOwnership, CONTEXT_EXCHANGES};
+
+/// Weight residency is independent of future allocation bytes and CUDA baselines.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResidentWeights(pub u64);
+
+impl ResidentWeights {
+    pub const DEFAULT_LIMIT: Self = Self(80 << 30);
+
+    pub fn checked_add(self, other: Self) -> Result<Self, PlacementError> {
+        self.0.checked_add(other.0).map(Self)
+            .ok_or(PlacementError::Overflow("resident weights"))
+    }
+}
 
 /// What a request asks of the hardware, built by a family from its own
 /// geometry; see `families::<family>`.
