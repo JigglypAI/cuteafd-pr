@@ -380,7 +380,7 @@ mod default_tests {
     }
 
     #[test]
-    fn combined_reply_formats_charge_one_codec_reserve_for_flash_and_pro() {
+    fn combined_reply_formats_reuse_bf16_capacity_for_flash_and_pro() {
         for (hidden, heads, topk) in [(4096, 64, 512), (7168, 128, 1024)] {
             let mut cfg = context_cfg();
             cfg.dim = hidden;
@@ -401,16 +401,15 @@ mod default_tests {
                     full_prefill_logits: 0, code_bytes: Vec::new(), context: None, attention: None,
                 };
                 let baseline = fixed_demands(&input).unwrap().0;
-                for (format, row_bytes) in [(cuteafd_core::SparkReplyFormat::Bf16, 0),
-                    (cuteafd_core::SparkReplyFormat::Fp8, hidden + hidden / 32),
-                    (cuteafd_core::SparkReplyFormat::Nvfp4, hidden / 2 + hidden / 16)] {
+                for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
+                    cuteafd_core::SparkReplyFormat::Nvfp4] {
                     input.spark_reply_format = format;
                     let fixed = fixed_demands(&input).unwrap().0;
                     for rank in 0..gpus {
                         let steps = |items: &[Demand]| items.iter().find(|d|
                             d.gpu == rank as u8 && d.group == "steps").unwrap().bytes;
                         assert_eq!(steps(&fixed) - steps(&baseline),
-                            if rank == 0 { 3 * 2752 * row_bytes as u64 } else { 0 });
+                            0);
                     }
                 }
             }

@@ -1236,12 +1236,15 @@ def main() -> None:
                      for suffix, thunk, capacity in kimi_split_programs()]
             continue
         if name == "expert_reply":
-            from b12x.moe._shared.kernels.w4a16.expert_reply import compile_expert_reply_aot
+            from b12x.moe._shared.kernels.w4a16.expert_reply import (compile_expert_reply_aot,
+                compile_expert_reply_reduce_aot)
             manifest["families"][name] = {"fp8_block": 32, "nvfp4_block": 16}
             for suffix, quantize, stage in (("quantize", True, False), ("dequantize", False, False), ("stage", False, True)):
                 work.append((name, suffix, "expert_reply", {"max_rows": args.prefill_rows},
                              lambda q=quantize, s=stage: compile_expert_reply_aot(quantize=q, stage=s)))
             work += [(name, *item) for item in exl3_reply_programs(args.prefill_rows)]
+            work.append((name, "reduce", "expert_reply", {"max_rows": args.prefill_rows},
+                         compile_expert_reply_reduce_aot))
             continue
         if name == "expert_partial":
             from export_b12x_expert_partial_aot import programs as partial_programs

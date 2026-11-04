@@ -919,16 +919,15 @@ mod tests {
             let mut input = inputs(&cfg, gpus, inventory::PRO_TOTAL_BYTES);
             input.onboard = Onboard::Layers(1);
             input.prefill_rows = 80;
-            for (format, row_bytes) in [(cuteafd_core::SparkReplyFormat::Bf16, 0),
-                (cuteafd_core::SparkReplyFormat::Fp8, cfg.hidden + cfg.hidden / 32),
-                (cuteafd_core::SparkReplyFormat::Nvfp4, cfg.hidden / 2 + cfg.hidden / 16)] {
+            for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
+                    cuteafd_core::SparkReplyFormat::Nvfp4] {
                 input.spark_reply_format = format;
                 let request = request(&input).unwrap();
                 let intake = request.fixed.iter().filter(|d| d.group == "Spark intake")
                     .map(|d| d.bytes).sum::<u64>();
                 let rows = input.prefill_lanes * input.prefill_rows;
                 assert_eq!(intake, 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
-                    rows * cfg.hidden as u64 * 2).unwrap() + rows * row_bytes as u64);
+                    rows * cfg.hidden as u64 * 2).unwrap());
             }
         }
     }

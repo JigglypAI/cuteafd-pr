@@ -2096,7 +2096,7 @@ impl<'a> MimoEngine<'a> {
                 (None, _) => None,
             };
             self.graph(0, key, launch, || self.decode_segment(index, previous, w, w1, tables, t, gather, key.head,
-                reduction, bf16_input))?;
+                reduction.clone(), bf16_input))?;
             if let (Some(slot), Some(link)) = (landed, link.as_mut()) {
                 // The planes are free for the next wave once the stream passes this segment's reduce.
                 link.exchange()?.consumed(slot, self.stream)?;
@@ -2144,7 +2144,7 @@ impl<'a> MimoEngine<'a> {
     /// Rank 0's decode segment `index` (see [`Self::decode_layers`]).
     #[allow(clippy::too_many_arguments)]
     fn decode_segment(&self, index: usize, previous: Previous, w: &Workspace<'_>, w1: Option<&Workspace<'_>>,
-        tables: &StepTables, t: usize, gather: bool, head: bool, reduction: Option<crate::shared::spark_waves::ReplyReduction>, bf16_input: bool)
+        tables: &StepTables, t: usize, gather: bool, head: bool, reduction: Option<crate::shared::spark_waves::ReplyReduction<'_>>, bf16_input: bool)
         -> Result<()> {
         let layers = &self.weights.layers;
         let rows = Scalar::I32(t as i32);

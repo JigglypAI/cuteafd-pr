@@ -13,8 +13,7 @@ pub fn prefill_return_bytes(waves: u64, unit_rows: u64, ranks: u64, hidden: u64)
     spark_intake_bytes(1, ranks, waves * unit_rows, hidden)
 }
 
-/// BF16 fallback planes plus one compressed staging reserve per physical
-/// prefill link, independent of the number of replying ranks.
+/// BF16 fallback capacity also holds packed replies; fused reduction needs no scratch.
 pub fn prefill_return_bytes_with_format(waves: u64, unit_rows: u64, ranks: u64,
     hidden: u64, format: cuteafd_core::SparkReplyFormat) -> anyhow::Result<u64> {
     use anyhow::Context;
@@ -24,9 +23,8 @@ pub fn prefill_return_bytes_with_format(waves: u64, unit_rows: u64, ranks: u64,
         .context("Spark return plane overflow")?;
     let planes = spark_intake_allocation_bytes(logical)?
         .checked_mul(ranks).context("Spark return planes overflow")?;
-    let scratch = format.combined_scratch_bytes(usize::try_from(hidden)?, usize::try_from(unit_rows)?,
-        usize::try_from(waves)?, true, false).context("unsupported Spark combined reply width or scratch overflow")?;
-    planes.checked_add(u64::try_from(scratch)?).context("Spark return codec allocation overflow")
+    anyhow::ensure!(format.row_bytes(usize::try_from(hidden)?).is_some(), "unsupported Spark combined reply width");
+    Ok(planes)
 }
 
 /// Prefill row units and how many are in flight on one lane and transport.
@@ -81,16 +79,15 @@ mod tests {
     }
 
     #[test]
-    fn combined_reply_charge_retains_bf16_planes_and_one_codec_reserve() -> anyhow::Result<()> {
+    fn combined_reply_charge_retains_bf16_planes_without_codec_scratch() -> anyhow::Result<()> {
         use cuteafd_core::SparkReplyFormat::{Bf16, Fp8, Nvfp4};
         for hidden in [2560, 3584, 4096, 5120, 6144, 7168] {
             for (waves, rows) in [(1, 64), (2, 4096), (3, 2752), (4, 2048)] {
                 for ranks in [1, 2, 4, 6, 8] {
                     let planes = ranks * spark_intake_allocation_bytes(waves * rows * hidden * 2)?;
-                    for (format, row_bytes) in [(Bf16, 0), (Fp8, hidden + hidden / 32),
-                        (Nvfp4, hidden / 2 + hidden / 16)] {
+                    for format in [Bf16, Fp8, Nvfp4] {
                         assert_eq!(prefill_return_bytes_with_format(waves, rows, ranks, hidden, format)?,
-                            planes + waves * rows * row_bytes);
+                            planes);
                     }
                 }
             }

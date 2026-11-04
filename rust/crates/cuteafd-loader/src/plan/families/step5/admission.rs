@@ -920,11 +920,10 @@ mod tests {
     }
 
     #[test]
-    fn combined_reply_formats_charge_one_codec_reserve_on_the_entry_gpu() -> Result<()> {
+    fn combined_reply_formats_reuse_bf16_capacity_on_the_entry_gpu() -> Result<()> {
         for ranks in [1, 2] {
-            for (format, row_bytes) in [(cuteafd_core::SparkReplyFormat::Bf16, 0),
-                (cuteafd_core::SparkReplyFormat::Fp8, 4096 + 4096 / 32),
-                (cuteafd_core::SparkReplyFormat::Nvfp4, 4096 / 2 + 4096 / 16)] {
+            for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
+                    cuteafd_core::SparkReplyFormat::Nvfp4] {
                 let mut input = inputs(ranks);
                 input.spark_reply_format = format;
                 input.rows = 3 * 2752;
@@ -936,8 +935,7 @@ mod tests {
                 assert_eq!(intake.len(), 1);
                 assert_eq!(intake[0].gpu, admission.ownership.execution().spec().entry_gpu);
                 assert_eq!(intake[0].bytes, 4
-                    * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(input.rows as u64 * 4096 * 2)?
-                    + input.rows as u64 * row_bytes);
+                    * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(input.rows as u64 * 4096 * 2)?);
             }
         }
         Ok(())

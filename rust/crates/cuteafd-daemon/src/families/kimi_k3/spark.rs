@@ -319,14 +319,13 @@ mod tests {
     #[test]
     fn admitted_intake_charges_every_actual_rank() -> Result<()> {
         for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
-            for (format, row_bytes) in [(cuteafd_core::SparkReplyFormat::Bf16, 0),
-                (cuteafd_core::SparkReplyFormat::Fp8, LATENT + LATENT / 32),
-                (cuteafd_core::SparkReplyFormat::Nvfp4, LATENT / 2 + LATENT / 16)] {
+            for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
+                    cuteafd_core::SparkReplyFormat::Nvfp4] {
                 for lane in [0, 1] {
                     let charge = admitted_demand(3, 2752, lane, ranks, format)?;
                     assert_eq!(charge.gpu, 1);
                     assert_eq!(charge.bytes, ranks as u64 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
-                        (3 * 2752 * LATENT * 2) as u64)? + (3 * 2752 * row_bytes) as u64);
+                        (3 * 2752 * LATENT * 2) as u64)?);
                     assert_eq!(charge, cuteafd_loader::families::kimi_k3::allocation::spark_demand(
                         cuteafd_loader::serving_capacity::PrefillShape { unit_rows: 2752, waves: 3 },
                         lane, ranks, format)?);

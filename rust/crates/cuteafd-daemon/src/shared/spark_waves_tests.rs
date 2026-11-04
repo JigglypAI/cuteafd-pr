@@ -1005,7 +1005,7 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
 
 #[test]
 #[ignore = "requires a GPU and native codec exports; run alone (--exact)"]
-fn gpu_compressed_close_retains_scratch_and_reset_reuses_allocation() -> Result<()> {
+fn gpu_compressed_close_retains_reducer_and_reset_reuses_storage() -> Result<()> {
     cuteafd_core::spark_reply::set_requested(Some(cuteafd_core::SparkReplyFormat::Nvfp4))
         .map_err(anyhow::Error::msg)?;
     terminal_close_with_codec(true)
@@ -1045,19 +1045,13 @@ fn terminal_close_with_codec(compressed: bool) -> Result<()> {
         let _owner = cuteafd_ffi::memory_ledger::owner(ledger_owner);
         owner.exchange_storage(&intake)?
     };
-    let expected_receipt = if compressed {
-        (cuteafd_core::SparkReplyFormat::Nvfp4.combined_scratch_bytes(hidden, rows, waves, true, false).unwrap(), 1)
-    } else { (0, 0) };
-    assert_eq!(receipt(), expected_receipt, "one allocation, not one per rank or slot");
+    let expected_receipt = (0, 0);
+    assert_eq!(receipt(), expected_receipt, "fused decode/reduce allocates no codec scratch");
     let weak = std::rc::Rc::downgrade(&storage);
     let control = storage.control.buffer.ptr;
     let pull_block = storage.pull_block.as_ref().unwrap().buffer.ptr;
-    let scratch_ptr = storage.reply_decode.as_ref().map(|codec| codec.scratch.buffer.ptr);
-    assert_eq!(scratch_ptr.is_some(), compressed);
-    if let Some(codec) = &storage.reply_decode {
-        let bytes = cuteafd_core::SparkReplyFormat::Nvfp4.combined_scratch_bytes(hidden, rows, waves, true, false).unwrap();
-        assert_eq!(codec.scratch.buffer.bytes, bytes);
-    }
+    let reducer = storage.reply_reduce.as_ref().map(std::rc::Rc::as_ptr);
+    assert_eq!(reducer.is_some(), compressed);
     assert!(owner.exchange_storage(&intake).is_err(), "live exchange storage must not be reset");
     let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false, storage)?;
     let _ = words.set(exchange.words());
@@ -1105,7 +1099,7 @@ fn terminal_close_with_codec(compressed: bool) -> Result<()> {
     let reset = owner.exchange_storage(&geometry)?;
     assert_eq!(reset.control.buffer.ptr, control, "reset reuses counters");
     assert_eq!(reset.pull_block.as_ref().unwrap().buffer.ptr, pull_block, "reset reuses descriptors");
-    assert_eq!(reset.reply_decode.as_ref().map(|codec| codec.scratch.buffer.ptr), scratch_ptr, "reset reuses codec scratch");
+    assert_eq!(reset.reply_reduce.as_ref().map(std::rc::Rc::as_ptr), reducer, "reset reuses the prebound reducer");
     assert_eq!(receipt(), expected_receipt, "reset allocates no additional codec storage");
     assert_eq!(reset.control.bytes().iter().copied().max(), Some(0));
     assert_eq!(reset.pull_block.as_ref().unwrap().bytes().iter().copied().max(), Some(0));
@@ -1868,34 +1862,16 @@ fn compact_wave_keeps_wire_bytes_and_reserved_landing_offsets() -> Result<()> {
 }
 
 #[test]
-fn bf16_units_under_compressed_settings_dispatch_zero_reply_decode_launches() -> Result<()> {
+fn bf16_units_under_compressed_settings_dispatch_zero_reply_decode_launches() {
     use cuteafd_transport::ExpertV2SourceKind::{Decode, MtpVerify, Prefill};
-    use cuteafd_core::SparkReplyFormat;
-    for format in [SparkReplyFormat::Fp8, SparkReplyFormat::Nvfp4] {
-        let codec = Some(&format);
+    for available in [false, true] {
         for (rows, kind) in [(1, Decode), (96, Decode), (192, MtpVerify), (64, Prefill)] {
-            let mut launches = 0;
-            for_compressed_reply(single_reply_eligible(rows, kind), codec, 6, |_, _| {
-                launches += 2;
-                Ok(())
-            })?;
-            assert_eq!(launches, 0, "{format:?}: {rows} {kind:?}");
+            assert!(!compressed_reduction(single_reply_eligible(rows, kind), available));
         }
-        let mut launches = 0;
-        for_compressed_reply(single_reply_eligible(65, Prefill), codec, 6, |_, _| {
-            launches += 2;
-            Ok(())
-        })?;
-        assert_eq!(launches, 12, "eligible prefill must retain both codec kernels per rank");
+        assert_eq!(compressed_reduction(single_reply_eligible(65, Prefill), available), available);
         for rows in [vec![(1, true); 64].into_iter().chain(vec![(2, true); 65]).collect::<Vec<_>>(),
             vec![(1, true); 65].into_iter().chain(vec![(2, false); 96]).collect()] {
-            let mut launches = 0;
-            for_compressed_reply(combined_reply_eligible(rows), codec, 6, |_, _| {
-                launches += 2;
-                Ok(())
-            })?;
-            assert_eq!(launches, 0, "mixed or short-source units must have no codec nodes");
+            assert!(!compressed_reduction(combined_reply_eligible(rows), available));
         }
     }
-    Ok(())
 }

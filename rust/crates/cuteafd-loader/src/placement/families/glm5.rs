@@ -1217,7 +1217,7 @@ mod tests {
     }
 
     #[test]
-    fn combined_reply_formats_charge_one_codec_reserve_for_glm_and_ml4() {
+    fn combined_reply_formats_reuse_bf16_capacity_for_glm_and_ml4() {
         let glm = config();
         let ml4 = GlmDsaConfig::from_hf(&crate::plan::testing::mistral_large4_config()).unwrap();
         for cfg in [&glm, &ml4] {
@@ -1228,9 +1228,8 @@ mod tests {
                     input.prefill_rows = 2752;
                     let h = cfg.hidden as u64;
                     let rows = lanes * input.prefill_rows;
-                    for (format, row_bytes) in [(cuteafd_core::SparkReplyFormat::Bf16, 0),
-                        (cuteafd_core::SparkReplyFormat::Fp8, h + h / 32),
-                        (cuteafd_core::SparkReplyFormat::Nvfp4, h / 2 + h / 16)] {
+                    for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
+                    cuteafd_core::SparkReplyFormat::Nvfp4] {
                         input.spark_reply_format = format;
                         let request = request(&input).unwrap();
                         let intake = request.fixed.iter().filter(|d| d.group == "Spark intake planes")
@@ -1239,8 +1238,7 @@ mod tests {
                         assert_eq!(intake[0].gpu, 0);
                         assert_eq!(intake[0].bytes, 4 * (
                             cuteafd_core::serving_capacity::spark_intake_allocation_bytes(DECODE_ROWS * h * 2).unwrap()
-                            + cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * h * 2).unwrap())
-                            + rows * row_bytes);
+                            + cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * h * 2).unwrap()));
                     }
                 }
             }

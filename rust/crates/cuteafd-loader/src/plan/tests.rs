@@ -346,15 +346,13 @@ fn mimo_split_links_charge_decode_and_each_prefill_return_slot() {
                 assert_eq!(bytes("mimo/transport/egress"),
                     (geometry.compact_wire_bytes(rows as u32, input.bf16(false)).unwrap().0 * waves
                         + geometry.compact_wire_bytes(64, input.bf16(true)).unwrap().0) as u64);
-                for (format, row_bytes) in [(cuteafd_core::SparkReplyFormat::Bf16, 0),
-                    (cuteafd_core::SparkReplyFormat::Fp8, cfg.hidden + cfg.hidden / 32),
-                    (cuteafd_core::SparkReplyFormat::Nvfp4, cfg.hidden / 2 + cfg.hidden / 16)] {
+                for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
+                    cuteafd_core::SparkReplyFormat::Nvfp4] {
                     let device = admission::transport_reservations(&cfg, 2, 0, rows, waves, 6, format).unwrap();
                     let intake = device.iter().find(|item| item.name == "transport.spark_intake_planes").unwrap();
                     assert_eq!(intake.bytes, 6 * (
                         cuteafd_core::serving_capacity::spark_intake_allocation_bytes((waves * rows.max(64) * cfg.hidden * 2) as u64).unwrap()
-                        + cuteafd_core::serving_capacity::spark_intake_allocation_bytes((64 * cfg.hidden * 2) as u64).unwrap())
-                        + (waves * rows.max(64) * row_bytes) as u64);
+                        + cuteafd_core::serving_capacity::spark_intake_allocation_bytes((64 * cfg.hidden * 2) as u64).unwrap()));
                     let peer = admission::transport_reservations(&cfg, 2, 1, rows, waves, 6, format).unwrap();
                     assert!(!peer.iter().any(|item| item.name == "transport.spark_intake_planes"));
                 }
