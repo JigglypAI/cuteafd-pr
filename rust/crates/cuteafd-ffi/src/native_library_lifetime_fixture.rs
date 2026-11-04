@@ -112,10 +112,9 @@ impl Fixture {
             .env("TMPDIR", &directory)
             .status()?;
         anyhow::ensure!(status.success(), "linking CPU lifetime fixture failed");
-        Ok(Self {
-            module,
-            events: directory.join("events"),
-        })
+        let events = directory.join("events");
+        fs::write(&events, [])?;
+        Ok(Self { module, events })
     }
 
     /// Configure static package ABI before loading a CPU expert module.
