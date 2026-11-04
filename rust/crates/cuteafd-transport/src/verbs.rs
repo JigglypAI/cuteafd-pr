@@ -1804,6 +1804,7 @@ struct VerbsHostProtocolV2PersistentClientSession {
     _stream: TcpStream,
     expert_grouping: Option<crate::worker_selection::InstalledExpertGrouping>,
     addr: SocketAddr,
+    execution_lane: u32,
     endpoint: Arc<NativeRdmaEndpoint>,
     retained_response_ring: Option<RegisteredResponseRing>,
     cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
@@ -2262,6 +2263,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             _stream: stream,
             expert_grouping: ready.expert_grouping,
             addr,
+            execution_lane,
             endpoint: Arc::new(endpoint),
             retained_response_ring,
             cq_waiter: cq_harvester

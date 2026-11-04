@@ -1270,6 +1270,43 @@ fn built_job(sequence: u32, slot: usize, rows: usize, uses: &[u32], fences: Vec<
         release: uses[slot] + 1, sent: Instant::now() }
 }
 
+#[test]
+fn exchange_timing_posts_and_arrivals_are_opt_in() -> Result<()> {
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    for timing in [false, true] {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = bytes.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_writer(move || Writer(writer.clone())).finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (mut backend, _control, _pulls) = ring_backend(Ring::new(2, 1, 1, 16), 1);
+        backend.timing = timing;
+        let job = built_job(42, 0, 1, &[0], Vec::new());
+        let info = WaveInfo { sequence: 42, slot: 0, rows: 1, payload_bytes: 16, slice: job.slice, release: 1 };
+        let mut wave = backend.post(job)?;
+        while !backend.poll(&mut wave, &info)? {}
+        let output = String::from_utf8(bytes.lock().unwrap().clone())?;
+        if timing {
+            let posted = output.lines().find(|line| line.contains("spark exchange wave posted")).unwrap();
+            for field in ["sequence=42", "slot=0", "request_id=42", "layer_id=0", "rows=1", "payload_bytes=16"] {
+                assert!(posted.contains(field), "missing {field}: {posted}");
+            }
+            for rank in 0..2 {
+                assert!(output.lines().any(|line| line.contains("spark exchange rank arrived")
+                    && line.contains("sequence=42") && line.contains(&format!("rank={rank}"))), "{output}");
+            }
+        } else { assert!(output.is_empty(), "{output}"); }
+    }
+    Ok(())
+}
+
 /// #815: reply frames stay in their receive slots until their wave's reduce
 /// is consumed, so the ring bounds the waves in flight. At the deepest
 /// admission (4 slots, every one landed and unread while the engine queues
