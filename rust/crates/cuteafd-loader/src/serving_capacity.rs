@@ -1378,7 +1378,7 @@ mod tests {
         assert_eq!(requirements.requested_kv_floor_tokens, Some(2 << 20));
         assert_eq!(
             (requirements.concurrency, requirements.state_slots),
-            (4, 4)
+            (16, 16)
         );
         assert!(!requirements.compiled_index_extent_required);
         assert_eq!(requirements.target_only_layouts.len(), 2);

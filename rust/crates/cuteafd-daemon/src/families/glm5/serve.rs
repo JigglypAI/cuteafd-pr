@@ -52,8 +52,8 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
     /// Sequences decoding at once (at most the decode programs' 64 rows).
-    #[arg(long, default_value_t = cuteafd_loader::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES)]
-    pub max_sequences: usize,
+    #[arg(long)]
+    pub max_sequences: Option<usize>,
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)]
     pub model_id: Option<String>,
@@ -112,9 +112,11 @@ fn chat_encoding(snapshot: &std::path::Path, thinking_off: GlmThinkingOff) -> Re
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    let max_sequences = crate::shared::memory::budget::serving_concurrency(
+        args.max_sequences, &args.engine.native_lib, args.engine.device)?;
     let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::read(&args.engine.snapshot)?;
-    cuteafd_core::concurrency::validate(cfg.family_id(), args.max_sequences as u64)?;
-    args.prefix.resolve_entries(args.max_sequences);
+    cuteafd_core::concurrency::validate(cfg.family_id(), max_sequences as u64)?;
+    args.prefix.resolve_entries(max_sequences);
     if cuteafd_loader::plan::exlr8::recognizes(&args.engine.snapshot)? {
         super::native_activation(&args.engine, cfg.first_moe_layer, cfg.layers, true)?;
     }
@@ -124,21 +126,25 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         args.model_id.clone().or_else(|| model_id(&snapshot)).context("model id")?,
         chat_encoding(&snapshot, args.thinking_off)?,
     );
-    let (queue, receive) = mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(args.max_sequences as u64) as usize);
+    let (queue, receive) = mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
     if engine_args.draft_context_slots.is_none() {
         engine_args.draft_context_slots = Some(cuteafd_loader::families::glm5::draft_representation::serving_draft_context_slots(
-            engine_args.draft_sequences, args.max_sequences, None));
+            engine_args.draft_sequences, max_sequences, None));
+    }
+    cuteafd_bench::context::set_resolved("max-sequences", &max_sequences.to_string());
+    if let Some(slots) = engine_args.draft_context_slots {
+        cuteafd_bench::context::set_resolved("draft-context-slots", &slots.to_string());
     }
     let mut engine_args = super::ResolvedEngineArgs::new(&engine_args)?;
-    size_draft_window_marks(&mut engine_args, &args.prefix, args.max_sequences)?;
-    let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
+    size_draft_window_marks(&mut engine_args, &args.prefix, max_sequences)?;
+    let (worker_stats, max_sequences) = (stats.clone(), max_sequences);
     let policy = Policy { fixed: args.draft_fixed,
         decode_share: args.decode_share };
     let prefix = args.prefix.clone();
-    let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id, &cfg)));
+    let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id, &cfg, max_sequences)));
     let (vision, media_cache_bytes) = (args.vision, args.media_cache_bytes);
     let remote = crate::families::glm5_flash::media::RemoteVision::from_parts(args.vision, args.vision_peers.as_deref(),
         args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
@@ -183,7 +189,7 @@ fn size_draft_window_marks(resolved: &mut super::ResolvedEngineArgs, prefix: &Pr
 }
 
 /// What the live console shows for GLM 5.3.
-fn console_layout(args: &ServeArgs, model: &str, cfg: &cuteafd_loader::families::glm5::GlmDsaConfig) -> console::Layout {
+fn console_layout(args: &ServeArgs, model: &str, cfg: &cuteafd_loader::families::glm5::GlmDsaConfig, max_sequences: usize) -> console::Layout {
     use console::{Color::*, StepGroup};
     let mut layout = console::Layout::new("glm5", model.into(), args.engine.snapshot.clone());
     let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
@@ -194,7 +200,7 @@ fn console_layout(args: &ServeArgs, model: &str, cfg: &cuteafd_loader::families:
             .unwrap_or(cuteafd_loader::placement::AttentionPlacement::Context);
         format!("{resolved} split")
     });
-    layout.concurrency = args.max_sequences;
+    layout.concurrency = max_sequences;
     let policy = args.draft_fixed.map_or_else(|| "shared resource-priced + agreed copies".to_string(), |n| format!("fixed {n}"));
     layout.speculator = (args.engine.draft.is_some() || args.engine.dspark).then(|| console::Speculator {
         name: if args.engine.dspark { "dSpark" } else { "DFlash2" }.into(),
@@ -1468,7 +1474,7 @@ mod draft_tests {
             let args = Cli::try_parse_from(["test", "--snapshot", dir.path().to_str().unwrap(),
                 "--native-lib", "/unused", "--manifest", "/unused", "--split-device", "1",
                 "--attention-placement", placement, "--dspark"])?.args;
-            let layout = console_layout(&args, "ml4", &cfg);
+            let layout = console_layout(&args, "ml4", &cfg, 16);
             assert_eq!(layout.split.as_deref(), Some(expected));
             let spec = layout.speculator.unwrap();
             assert_eq!(spec.name, "dSpark");
@@ -1497,14 +1503,14 @@ mod draft_tests {
             let mut args = Cli::try_parse_from(["test", "--snapshot", dir.path().to_str().unwrap(),
                 "--native-lib", "/unused", "--manifest", manifest.to_str().unwrap(),
                 "--max-context", &context.to_string(), "--dspark", "--max-sequences", "16"])?.args;
-            args.prefix.resolve_entries(args.max_sequences);
+            args.prefix.resolve_entries(args.max_sequences.unwrap());
             let mut resolved = super::super::ResolvedEngineArgs::new(&args.engine)?;
             assert_eq!(resolved.args.max_context, 1_048_576);
             assert_eq!(resolved.automatic_context, context == 0);
             assert_eq!(args.engine.max_context, context, "CLI auto policy must remain intact");
             // Removing the manifest after resolution proves sizing does not resolve it again.
             std::fs::remove_file(&manifest)?;
-            size_draft_window_marks(&mut resolved, &args.prefix, args.max_sequences)?;
+            size_draft_window_marks(&mut resolved, &args.prefix, args.max_sequences.unwrap())?;
             assert!(resolved.args.draft_window_marks > 0);
             census.push((resolved.args.max_context, resolved.args.draft_window_marks));
             let pool_context = crate::shared::context::pool_context("glm5", resolved.args.max_context,
@@ -1525,7 +1531,7 @@ mod draft_tests {
         for c in [1usize, 4, 16, 17, 32, 64, 65] {
             let mut args = Cli::try_parse_from(["test", "--snapshot", "/absent", "--native-lib", "/absent",
                 "--max-sequences", &c.to_string()]).unwrap().args;
-            let admission = cuteafd_core::concurrency::validate("mistral_large4", args.max_sequences as u64);
+            let admission = cuteafd_core::concurrency::validate("mistral_large4", args.max_sequences.unwrap() as u64);
             if c > DECODE_ROWS {
                 let error = admission.unwrap_err().to_string();
                 assert!(error.contains("mistral_large4") && error.contains("decode program capacity 64"));

@@ -3495,7 +3495,7 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
         let geometry = glm_flash_rank_cache_geometry_rows(&cfg, 2, 1, GlmfIndexCache::Keys, 4, rows).unwrap();
         let rank = &geometry.ranks[0];
         assert_eq!(item(report, "state").map(|(_, bytes, _)| bytes), Some(rank.fixed_state_bytes
-            + rank.active_state_per_sequence_bytes * 4 + rank.speculative_replay_bytes));
+            + rank.active_state_per_sequence_bytes * 8 + rank.speculative_replay_bytes));
     }
     // 128 rows: +64,606,464 B of decode workspace, the wide selector, one KDA layer's 64 more record rows.
     let steps = |report| item(report, "steps").unwrap().1;
@@ -3863,8 +3863,8 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
     // Normalize a clone for current admission; the raw historical value only pins provenance.
     for report in expected.as_object_mut().unwrap().values_mut() {
         report["cache_requirements"]["checkpoint_max_context_tokens"] = json!(1_048_576);
-        report["cache_requirements"]["concurrency"] = json!(4);
-        report["cache_requirements"]["state_slots"] = json!(4);
+        report["cache_requirements"]["concurrency"] = json!(16);
+        report["cache_requirements"]["state_slots"] = json!(16);
     }
     // The shared solver cannot admit this historical A_log-only checkpoint.
     // Preserve the old snapshot/hash as provenance, but require a named refusal
@@ -4067,11 +4067,11 @@ fn mimo_small_card_auto_embedding_and_full_context() {
 }
 
 #[test]
-fn mimo_native_default_concurrency_is_preserved_and_rings_follow_overrides() {
+fn mimo_logical_capacity_concurrency_matches_serving_and_rings_follow_overrides() {
     let dir = tempfile::tempdir().unwrap();
     write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
     for gib in [32, 96] {
-        let expected = crate::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES as u64;
+        let expected = cuteafd_core::serving_capacity::default_concurrency(gib << 30);
         let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
             rtx_bytes: vec![gib << 30], ..Default::default()
         }), ..sparks(4) };
@@ -4080,7 +4080,7 @@ fn mimo_native_default_concurrency_is_preserved_and_rings_follow_overrides() {
         let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         assert_eq!(automatic.pool_tokens, explicit.pool_tokens);
         assert_eq!(automatic.devices[0].used_bytes(), explicit.devices[0].used_bytes());
-        options.layout.as_mut().unwrap().concurrency = 16;
+        options.layout.as_mut().unwrap().concurrency = 32;
         let overridden = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         let state = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
             .find(|item| item.group == "state").unwrap().bytes;
@@ -4103,16 +4103,11 @@ fn all_family_concurrency_defaults_match_explicit_logical_capacity() {
     for dir in snapshots {
         for bytes in [32u64 << 30, (32u64 << 30) + 1, 96u64 << 30] {
             let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-                rtx_bytes: vec![bytes], workspace_manifest: Some(dir.path().join("absent.json")),
+                rtx_bytes: vec![bytes; 2], head_split: true, workspace_manifest: Some(dir.path().join("absent.json")),
                 glm5_drafter_disabled: true, glmf_drafter_disabled: true, ..Default::default()
             }), ..sparks(4) };
             let automatic = plan(dir.path(), &options).unwrap();
-            options.layout.as_mut().unwrap().concurrency = match automatic.family.as_deref() {
-                Some("glm5") => crate::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
-                Some("glm5_flash") => crate::families::glm5_flash::DEFAULT_MAX_SEQUENCES as u64,
-                Some("mimo_v2") => crate::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
-                _ => cuteafd_core::serving_capacity::default_concurrency(bytes),
-            };
+            options.layout.as_mut().unwrap().concurrency = cuteafd_core::serving_capacity::default_concurrency(bytes);
             let explicit = plan(dir.path(), &options).unwrap();
             assert_eq!(automatic.memory_layout, explicit.memory_layout, "family {:?}, {bytes}", automatic.family);
             assert_eq!(automatic.placement_supported, explicit.placement_supported);

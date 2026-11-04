@@ -128,10 +128,22 @@ impl VocabularyPlan {
         device_reserved: usize,
         host_reserved: usize,
     ) -> Result<()> {
-        let device = self
-            .resident_bytes()
+        self.admit_devices(device_available, None, host_available, device_reserved, host_reserved)
+    }
+
+    fn admit_devices(&self, head_available: usize, embedding_available: Option<usize>,
+        host_available: usize, device_reserved: usize, host_reserved: usize) -> Result<()> {
+        let resident = if let Some(available) = embedding_available {
+            let embedding = self.dense.tensors.first().context("native vocabulary embedding missing")?
+                .components.iter().try_fold(0usize, |sum, c| sum.checked_add(c.source.bytes)
+                    .context("native embedding admission overflow"))?;
+            ensure!(embedding <= available, "native vocabulary embedding device admission needs {embedding}, available {available}");
+            self.resident_bytes().checked_sub(embedding).context("native vocabulary owner partition")?
+        } else { self.resident_bytes() };
+        let device = resident
             .checked_add(device_reserved)
             .context("native vocabulary device admission overflow")?;
+        let device_available = head_available;
         ensure!(
             device <= device_available,
             "native vocabulary device admission needs {device}, available {device_available}"
@@ -176,7 +188,8 @@ impl RowFp8Weights<'_> {
 }
 
 /// Owns immutable native bytes. Callers must drain all users before releasing this owner.
-/// Binding is done before allocation; rank 1 owns no vocabulary or gather/head binding.
+/// Binding is done before allocation; the head stays on rank 0 while the
+/// embedding may reside on a peer selected by admission.
 pub(crate) struct NativeVocabulary<'a> {
     pub(crate) embedding: RowFp8Weights<'a>,
     pub(crate) head: RowFp8Weights<'a>,
@@ -193,6 +206,15 @@ impl<'a> NativeVocabulary<'a> {
         device_reserved: usize,
         host_reserved: usize,
     ) -> Result<Option<Self>> {
+        Self::load_with_embedding_device(library, programs, plan, host_available,
+            device_reserved, host_reserved, library.cuda_get_device()?)
+    }
+
+    pub(crate) fn load_with_embedding_device(
+        library: &'a NativeLibrary, programs: &'a Programs<'a>, plan: VocabularyPlan,
+        host_available: usize, device_reserved: usize, host_reserved: usize, embedding_device: i32,
+    ) -> Result<Option<Self>> {
+        use crate::shared::memory::device::Device;
         ensure!(
             std::ptr::eq(library, programs.library()),
             "native vocabulary library mismatch"
@@ -227,15 +249,16 @@ impl<'a> NativeVocabulary<'a> {
             );
         }
         let host_available = cuteafd_ffi::cgroup_memory_headroom(host_available)?;
-        plan.admit(
-            library.cuda_memory_info()?.0,
-            host_available,
-            device_reserved,
-            host_reserved,
-        )?;
+        let head_device = library.cuda_get_device()?;
+        let embedding_available = if embedding_device == head_device { None } else {
+            Some(Device { library, id: embedding_device }.run(|| library.cuda_memory_info())?.0)
+        };
+        plan.admit_devices(library.cuda_memory_info()?.0, embedding_available,
+            host_available, device_reserved, host_reserved)?;
         let mut staging =
             HostAllocation::named(library, plan.staging_bytes(), "native-vocabulary-staging")?;
-        let embedding = load_rows(library, &plan.dense.tensors[0], &mut staging)?;
+        let embedding = Device { library, id: embedding_device }
+            .run(|| load_rows(library, &plan.dense.tensors[0], &mut staging))?;
         let head = load_rows(library, &plan.dense.tensors[1], &mut staging)?;
         Ok(Some(Self {
             embedding,
@@ -467,6 +490,22 @@ mod tests {
                 assert_ne!(after + embedding.bytes, before);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn split_vocabulary_admission_charges_each_table_once() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let records = [record(root.path(), EMBEDDING), record(root.path(), HEAD)];
+        let plan = VocabularyPlan::new(&records, &selection(false), 2, 0, 8, 256)?;
+        let table = plan.resident_bytes() / 2;
+        let host = plan.staging_bytes() + 17;
+        plan.admit_devices(table + 23, Some(table), host, 23, 17)?;
+        assert!(plan.admit_devices(table + 22, Some(table), host, 23, 17).is_err());
+        assert!(plan.admit_devices(table + 23, Some(table - 1), host, 23, 17).is_err());
+        assert!(plan.admit_devices(table + 23, Some(table), host - 1, 23, 17).is_err());
+        assert!(plan.admit_devices(table + 23, None, host, 23, 17).is_err());
+        plan.admit_devices(2 * table + 23, None, host, 23, 17)?;
         Ok(())
     }
 
@@ -757,6 +796,43 @@ mod tests {
                 .chunks_exact(4)
                 .all(|b| f32::from_le_bytes(b.try_into().unwrap()) == 3072.0)
         );
+        drop(owner);
+        let stream = crate::shared::memory::device::Stream::new(
+            crate::shared::memory::device::Device { library: &library, id: 0 })?;
+        let expanded = DeviceAllocation::new(&library, 5 * 4 * K * 2)?;
+        for embedding_device in [0, 1] {
+            if embedding_device == 1 {
+                stream.device.run(|| library.cuda_enable_peer(1))?;
+            }
+            let vocabulary = std::rc::Rc::new(NativeVocabulary::load_with_embedding_device(
+                &library, &programs, VocabularyPlan::new(&records, &selection(false), 2, 0, K, N)?,
+                32 << 20, 0, 0, embedding_device)?.context("capture vocabulary")?);
+            let embedding = crate::shared::token_io::TokenEmbedding::row_fp8(&library, crate::shared::token_io::EmbedSource {
+                path: records[0].components[0].source.path.clone(), offset: 0, vocab: N, hidden: K,
+                snapshot: None, tensor_name: EMBEDDING.into(),
+            }, vocabulary)?;
+            embedding.validate_residency(embedding_device, (N * K + N * 4) as u64)?;
+            // SAFETY: all buffers and the table survive capture, replay and the stream drain.
+            unsafe {
+                library.cuda_graph_begin_capture(stream.raw)?;
+                let gathered = embedding.gather(ids.buffer.ptr, std::ptr::null(), 5, 4,
+                    std::ptr::null(), expanded.buffer.ptr, Some(output.buffer),
+                    crate::shared::peer_split::RankDevice { device: stream.device.id, stream: stream.raw });
+                let graph = library.cuda_graph_end_capture(stream.raw)?;
+                gathered?;
+                let replayed = library.cuda_graph_launch(graph, stream.raw);
+                let drained = stream.drain();
+                library.cuda_graph_exec_destroy(graph)?;
+                replayed?;
+                drained?;
+            }
+            let mut copied = vec![0; expanded.buffer.bytes];
+            library.copy_d2h(&mut copied, expanded.buffer)?;
+            for (row, bytes) in copied.chunks_exact(4 * K * 2).enumerate() {
+                let expected = if row < 3 { 0x3f00u16 } else { 0 };
+                assert!(bytes.chunks_exact(2).all(|b| u16::from_le_bytes(b.try_into().unwrap()) == expected));
+            }
+        }
         Ok(())
     }
 

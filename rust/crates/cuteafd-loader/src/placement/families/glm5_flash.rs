@@ -61,6 +61,22 @@ pub fn manifest_context(manifest: &serde_json::Value) -> Option<GlmfAttention> {
         .map(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0)))
 }
 
+/// Context admission selects the same partial program as runtime, not the largest exported variant.
+pub fn manifest_context_for_plan(manifest: &serde_json::Value, heads: usize, sms: usize,
+    plan: &cuteafd_core::coordinator_programs::AttentionReductionPlan) -> anyhow::Result<Option<GlmfAttention>> {
+    let Some(mut context) = manifest_context(manifest) else { return Ok(None) };
+    let mut scratch = 0;
+    for begin in [0, heads / 2] {
+        let name = cuteafd_core::coordinator_programs::attention_partial_program(
+            manifest, "glmf", begin, 64, sms, plan)?;
+        let bytes = crate::serving_capacity::glmf_manifest_scratch(manifest)(&name)
+            .ok_or_else(|| anyhow::anyhow!("selected Flash context partial missing: {name}"))?;
+        scratch = scratch.max(bytes);
+    }
+    context.partial_scratch = scratch;
+    Ok(Some(context))
+}
+
 /// The MLA placement a GLM Flash engine on `gpus` GPUs serves: `requested` (None: auto), checked
 /// against the build's `context` programs. Auto is `context` on two GPUs, as `ExecutorModes::check_attention`
 /// records for this family; without the context programs that placement cannot run, so a chosen
@@ -583,8 +599,9 @@ pub fn solve_working_set_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_
     let mut graph_cache = std::collections::BTreeMap::new();
     if i.spark_ranks == 0 {
         let working = GlmfWorkingSet::candidate(i, i.experts.len())?;
+        let cap = i.onboard.layers(i.experts.len()).is_none().then_some(target.max(i.max_context));
         let (placed, graphs) = solve_profile_with_graphs(i, target, automatic_context, sms, rtx_experts,
-            None, None, &working, &mut graph_cache)?;
+            cap, None, &working, &mut graph_cache)?;
         working.validate(&placed)?;
         return Ok((placed, graphs, working));
     }
@@ -950,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_peer_working_set_preserves_existing_request_and_pool_policy() {
+    fn zero_peer_auto_pool_stops_at_target_for_planned_and_sampled_baselines() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
         input.spark_ranks = 0;
@@ -959,15 +976,63 @@ mod tests {
         input.graphs = GraphSet::budget(&[64 << 20; 2]);
         for pool in [None, Some(2 << 20)] {
             input.requested_pool = pool;
-            let prior = solve_profile_with_graphs(&input, 2 << 20, false, 188, true,
-                None, None, &GlmfWorkingSet::candidate(&input, input.experts.len()).unwrap(),
-                &mut std::collections::BTreeMap::new()).unwrap();
             let (placed, graphs, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
-            assert_eq!(placed, prior.0);
-            assert_eq!(graphs, prior.1);
+            assert_eq!(placed.pool_tokens, 2 << 20);
+            assert_eq!(placed.onboard_layers, input.experts.len());
+            assert!(placed.layers.iter().enumerate().filter(|(layer, _)| !cfg.dense[*layer])
+                .all(|(_, layer)| layer.experts == ExpertHome::RtxTp2));
+            let mut sampled = input.clone();
+            for rank in 0..2 {
+                let Baseline::Planned { context_bytes, loaded_bytes } = input.gpus[rank].1 else { unreachable!() };
+                sampled.gpus[rank].1 = Baseline::Measured { free_bytes: sampled.gpus[rank].0 - context_bytes - loaded_bytes };
+            }
+            let (runtime, runtime_graphs, runtime_working) = solve_working_set_with_graphs(&sampled, 2 << 20, false, 188, true).unwrap();
+            assert_eq!((placed.pool_tokens, &placed.layers, placed.tp2), (runtime.pool_tokens, &runtime.layers, runtime.tp2));
+            assert_eq!(graphs, runtime_graphs);
+            assert_eq!(working, runtime_working);
             assert_eq!((working.spark_ranks, working.prefill_lanes), (0, 1));
             assert!(working.spark_layers.is_empty());
         }
+    }
+
+    #[test]
+    fn native_tp2_zero_spark_dflash_default_concurrency_plan_equals_runtime() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
+        let capacity = inventory::PRO_TOTAL_BYTES;
+        let options = crate::plan::layout::LayoutOptions { rtx_bytes: vec![capacity; 2], ..Default::default() };
+        let mut planned = inputs(&cfg, 2, capacity);
+        planned.spark_ranks = 0;
+        planned.prefill_lanes = 1;
+        planned.prefill_rows = 4096;
+        planned.sequences = options.resolved_concurrency("glm5_flash");
+        planned.state_slots = options.resolved_state_slots("glm5_flash");
+        planned.workspace = planned.local_workspace.clone();
+        planned.speculation = true;
+        let (slots, batch) = crate::families::glm5::draft_representation::flash_serving_draft_limits(
+            planned.sequences as usize, options.glm_draft_sequences() as usize, None);
+        let config = draft_config();
+        let draft_capacity = crate::families::glm5::draft_representation::flash_draft_capacity(&config, slots, batch).unwrap();
+        let (bytes, scratch) = drafter_inventory(&config, draft_capacity.context_slots, draft_capacity.max_batch_sequences, &[188; 2],
+            crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only,
+            2, options.draft_kv_cache).unwrap();
+        planned.drafter_bytes = bytes;
+        planned.drafter_scratch = scratch;
+        let mut runtime = planned.clone();
+        let boot = cuteafd_core::serving_capacity::default_concurrency(capacity);
+        runtime.sequences = boot;
+        runtime.state_slots = cuteafd_core::concurrency::state_slots(boot);
+        assert_eq!(planned.sequences, 16);
+        for rank in 0..2 {
+            let Baseline::Planned { context_bytes, loaded_bytes } = planned.gpus[rank].1 else { unreachable!() };
+            runtime.gpus[rank].1 = Baseline::Measured { free_bytes: capacity - context_bytes - loaded_bytes };
+        }
+        let (plan, pg, pw) = solve_working_set_with_graphs(&planned, 2 << 20, true, 188, true).unwrap();
+        let (live, lg, lw) = solve_working_set_with_graphs(&runtime, 2 << 20, true, 188, true).unwrap();
+        assert_eq!(plan.pool_tokens, live.pool_tokens);
+        assert_eq!(plan.items, live.items);
+        assert_eq!(plan.layers, live.layers);
+        assert_eq!(pg, lg);
+        assert_eq!(pw, lw);
     }
 
     #[test]

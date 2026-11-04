@@ -202,10 +202,6 @@ impl LayoutOptions {
     pub fn resolved_concurrency(&self, family: &str) -> u64 {
         if self.concurrency > 0 { return self.concurrency; }
         match family {
-            "glm5_flash" => crate::families::glm5_flash::DEFAULT_MAX_SEQUENCES as u64,
-            // Mistral Large 4 runs the GLM 5.3 engine.
-            "glm5" | "mistral_large4" => crate::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
-            "mimo_v2" => crate::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
             "qwen3_5" => 4,
             _ => cuteafd_core::serving_capacity::default_concurrency(self.rtx_bytes.first().copied().unwrap_or(0)),
         }
@@ -717,6 +713,23 @@ mod draft_prefix_tests {
         Shape::resolve(&input, &mut report, model.as_ref(), &mut options, ShapePolicy::manifest_bounded());
         assert_eq!(report.prefill_span_rows, Some(4096));
         Ok(())
+    }
+
+    #[test]
+    fn shared_concurrency_matches_launcher_capacity_for_every_moe_family() {
+        for family in ["glm5_flash", "glm5", "mistral_large4", "mimo_v2", "deepseek_v4",
+            "deepseek_v41", "kimi_k3", "qwen4", "step5", "muse_spark"] {
+            for bytes in [30 << 30, 32 << 30, 96 << 30] {
+                let mut options = LayoutOptions { rtx_bytes: vec![bytes; 2], ..Default::default() };
+                let boot = cuteafd_core::serving_capacity::default_concurrency(bytes);
+                assert_eq!(options.resolved_concurrency(family), boot, "{family}");
+                assert_eq!(options.resolved_state_slots(family), cuteafd_core::concurrency::state_slots(boot));
+                assert_eq!(options.prefix_entries(family), cuteafd_core::concurrency::prefix_entries(boot));
+                options.concurrency = 32;
+                assert_eq!(options.resolved_concurrency(family), 32);
+                assert_eq!(options.resolved_state_slots(family), 32);
+            }
+        }
     }
 
     #[test]

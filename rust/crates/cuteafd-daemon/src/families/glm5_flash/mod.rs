@@ -601,6 +601,13 @@ mod draft_cli_tests {
         converted.fp8_prefill = vec![Fp8PrefillGroup::All];
         native::normalize(&mut ordinary);
         native::normalize(&mut converted);
+        assert_eq!(native::resolved_settings(&ordinary), native::resolved_settings(&converted));
+        let settings: std::collections::BTreeMap<_, _> = native::resolved_settings(&converted).into_iter().collect();
+        for key in ["kda-output-shard", "kda-prefill-expanded", "kda-fp32-partials", "fp8-head"] {
+            assert_eq!(settings[key], "false");
+        }
+        assert_eq!(settings["kda-fp8"], "off");
+        assert_eq!(settings["fp8-prefill"], "none");
         let demands = |args: &EngineArgs| -> Result<Vec<_>> {
             check_options(args)?;
             let options = GlmfScratchOptions { split: false, kda_w8: args.kda_fp8 != fp8::KdaFp8::Off,
@@ -1034,6 +1041,19 @@ mod draft_cli_tests {
         }
         for option in ["max", "50%", "x"] {
             assert!(option.parse::<cuteafd_loader::placement::OnboardSetting>().is_err(), "{option}");
+        }
+    }
+
+    #[test]
+    fn native_local_default_preserves_automatic_pool_policy_and_explicit_pins() {
+        use cuteafd_loader::placement::Onboard;
+        let local = parse(&["--local-experts", "--split-device", "1"]);
+        assert_eq!(runtime_onboard(&local, true, 42, 42), Onboard::Auto);
+        assert_eq!(runtime_onboard(&local, false, 42, 42), Onboard::Layers(42));
+        for (option, expected) in [("auto", Onboard::Auto), ("all", Onboard::Layers(42)),
+            ("3", Onboard::Layers(3))] {
+            let args = parse(&["--local-experts", "--rtx-expert-layers", option]);
+            assert_eq!(runtime_onboard(&args, true, 42, 42), expected);
         }
     }
 
@@ -1547,6 +1567,14 @@ fn parse_onboard(text: &str) -> std::result::Result<cuteafd_loader::placement::O
     text.parse()
 }
 
+fn runtime_onboard(args: &EngineArgs, native: bool, routed: usize, experts: usize)
+    -> cuteafd_loader::placement::Onboard {
+    args.rtx_expert_layers.map(|setting| setting.resolve(routed)).unwrap_or_else(|| {
+        if args.local_experts && !native { cuteafd_loader::placement::Onboard::Layers(experts) }
+        else { cuteafd_loader::placement::families::glm5_flash::default_onboard() }
+    })
+}
+
 fn runtime_resident_weights(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers: usize, ranks: usize,
     representation: cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation,
     embedding: crate::shared::token_io::EmbedPlacement, attention: engine::GlmfAttention)
@@ -1628,6 +1656,9 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let mut resolved = args.clone();
     if native {
         native::normalize(&mut resolved);
+        for (name, value) in native::resolved_settings(&resolved) {
+            cuteafd_bench::context::set_resolved(name, &value);
+        }
         ensure!(args.exlr8_manifest.is_some(), "native Flash requires --exlr8-manifest k2, k3 or k4");
         ensure!(args.kda_state == engine::KdaState::F32, "native Flash requires F32 KDA state programs");
     } else { ensure!(args.exlr8_manifest.is_none(), "--exlr8-manifest requires a native EXLR8 checkpoint"); }
@@ -1880,9 +1911,7 @@ impl Opened {
                 sequences, speculation, devices.len(), args.decode_rows, sms)
         } else { placement::GraphSet::budget(&vec![args.graph_budget_mib.map_or(1536 << 20, |mib| mib << 20); devices.len()]) };
         let routed = self.cfg.dense.iter().filter(|dense| !**dense).count();
-        let onboard = args.rtx_expert_layers.map(|setting| setting.resolve(routed))
-            .unwrap_or_else(|| if args.local_experts {
-                placement::Onboard::Layers(experts.len()) } else { admission::default_onboard() });
+        let onboard = runtime_onboard(args, self.native, routed, experts.len());
         let inputs = admission::GlmfInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false), automatic_context: automatic_context, attention, cfg: &self.cfg, layers, local_tp2_exl3: local_tp2_exl3 && core_charge.is_none(),
             gpus: inventory.gpus.iter().map(|gpu| (gpu.total_bytes, placement::Baseline::Measured {
                 free_bytes: gpu.free_bytes + prepared_draft.map_or(0, crate::shared::draft::remote::Prepared::sampled_bytes) })).collect(),
@@ -2092,6 +2121,7 @@ impl Opened {
             tracing::warn!(device, "--index-cache compact is single-GPU under heads; the head split keeps the token keys");
         }
         cuteafd_bench::context::set_resolved("attention-placement", &attention.mode.to_string());
+        cuteafd_bench::context::set_resolved("index-cache", match index_cache { engine::IndexCache::Compact => "compact", engine::IndexCache::Keys => "keys" });
         let peer_stream = match split_device {
             Some(device) => {
                 ensure!(device != args.device, "--split-device must differ from --device");
@@ -2287,25 +2317,25 @@ impl Opened {
                 .context("native local expert budget exceeds address space")
         };
         let native_push_experts = || -> Result<_> {
-            if local_layers.is_empty() { return Ok(None); }
-            let workspace = crate::shared::experts::rtx::exlr8::Exlr8RtxWeights::workspace_bytes_with_limit(
-                &programs, cuteafd_ffi::exlr8::KernelFamily::GlmFlash, args.expert_rows(),
-                cuteafd_ffi::exlr8::KernelFamily::GlmFlash.geometry().units,
-                cuteafd_loader::plan::exlr8::PrefillActivations::A16)?;
+            let selected = if tp2_layers.is_empty() { &local_layers } else { &tp2_layers };
+            if selected.is_empty() { return Ok(None); }
+            ensure!(tp2_layers.is_empty() || local_layers.is_empty(), "native Flash mixed whole/TP2 expert homes");
             let native = native_admission.as_ref().context("native expert admission")?;
             let manifest = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
-            let planned = cuteafd_loader::plan::exlr8::native::flash_routed_workspace(
-                &native.metadata, &self.cfg, &manifest, 1, args.expert_rows() as u64)?;
-            ensure!(workspace as u64 == planned, "native whole expert workspace differs from planner");
-            Ok(Some(crate::shared::experts::rtx::push::CoordinatorExperts::Exlr8 {
+            let world = if tp2_layers.is_empty() { 1 } else { 2 };
+            let workspace = usize::try_from(cuteafd_loader::plan::exlr8::native::flash_routed_workspace(
+                &native.metadata, &self.cfg, &manifest, world, args.expert_rows() as u64)?)?;
+            let peaks = if world == 1 { vec![native_local_budget()?] } else { tp2_budgets()?.to_vec() };
+            let budgets = peaks.into_iter().map(|peak| peak.checked_sub(workspace)
+                .context("native expert workspace exceeds admission")).collect::<Result<Vec<_>>>()?;
+            Ok(Some(CoordinatorExperts::Exlr8 {
                 manifest: args.exlr8_manifest.clone().context("native Flash manifest")?,
-                layers: local_layers.clone(), budgets: vec![native_local_budget()?.checked_sub(workspace)
-                    .context("native local workspace exceeds admission")?] }))
+                layers: selected.clone(), budgets }))
         };
         let plan_native = |sparks: usize| -> Result<_> {
             let native = native_admission.as_ref().context("native Flash admission")?;
             let (owners, records) = crate::shared::experts::rtx::dense::recording(|| {
-                let loaded = native.load(&self.library, &programs, &loader, &self.cfg, &execution)?;
+                let loaded = native.load(&self.library, &programs, &loader, &self.cfg, &execution, embedding_device.id)?;
                 let shared = native.load_shared(args, &self.cfg, &self.library, &programs)?;
                 Ok((loaded, shared))
             })?;
@@ -2379,11 +2409,18 @@ impl Opened {
         };
         // The admitted TP2 expert halves land inside the Spark admission window;
         // execution (modules, workspaces, routes) binds once the engine exists.
-        let tp2_weights = |pushed: Option<Vec<PushedExperts<'s>>>| -> Result<crate::shared::experts::rtx::Tp2Weights<'s>> {
+        let tp2_weights = |pushed: Option<Vec<PushedExperts<'s>>>| -> Result<crate::shared::experts::rtx::Tp2Weights<'_>> {
             let catalog = self.experts.as_ref().context("TP2 expert catalog")?;
             let (devices, budgets) = (tp2_devices()?, tp2_budgets()?);
             use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2, RtxSelectionPolicy, Tp2Weights};
-            Ok(if let Some(manifest) = catalog.exl3() {
+            Ok(if native_admission.is_some() {
+                let pushed = pushed.context("native TP2 expert destination missing")?;
+                Tp2Weights::Exlr8(crate::shared::experts::rtx::exlr8::Exlr8RtxWeights::pushed_pair(
+                    devices, &programs, tp2_layers.clone(), args.expert_rows(), budgets,
+                    cuteafd_loader::plan::exlr8::PrefillActivations::A16,
+                    pushed.into_iter().map(PushedExperts::exlr8).collect::<Result<Vec<_>>>()?.try_into()
+                        .map_err(|_| anyhow::anyhow!("two committed EXLR8 coordinator ranks required"))?)?)
+            } else if let Some(manifest) = catalog.exl3() {
                 let package = tp2_package(manifest);
                 let geometry = cuteafd_core::expert_geometry();
                 Tp2Weights::Exl3(match pushed {
@@ -2416,7 +2453,7 @@ impl Opened {
         let mut pushed_whole = None;
         let (embedding, ((model, mut shares), tp2)) = if let Some(native) = &native_admission {
             crate::shared::placement::load_while_admitting(admission, || {
-                let (pushed, (loaded, shared)) = match native_push.take() {
+                let (mut pushed, (loaded, shared)) = match native_push.take() {
                     Some((push, sparks, (owners, dense))) => {
                         // Records borrow these native allocations; retain every owner until
                         // the single dense/shared/routed group has committed or drained.
@@ -2427,19 +2464,20 @@ impl Opened {
                         split.log("glm5_flash native dense push");
                         (pushed, owners)
                     }
-                    None => (None, (native.load(&self.library, &programs, &loader, &self.cfg, &execution)?,
+                    None => (None, (native.load(&self.library, &programs, &loader, &self.cfg, &execution, embedding_device.id)?,
                         native.load_shared(args, &self.cfg, &self.library, &programs)?)),
                 };
                 native_shared = Some(shared);
                 if !local_layers.is_empty() {
-                    let mut ranks = pushed.context("native RTX expert destination missing")?;
+                    let mut ranks = pushed.take().context("native RTX expert destination missing")?;
                     ensure!(ranks.len() == 1, "native whole expert push must publish one rank");
                     let weights = ranks.pop().context("native RTX expert rank")?.exlr8()?;
                     native_local = Some(crate::shared::experts::rtx::exlr8::Exlr8RtxWeights::pushed_rank(
                         devices[0], &programs, local_layers.clone(), args.expert_rows(), native_local_budget()?,
                         cuteafd_loader::plan::exlr8::PrefillActivations::A16, 1, 0, weights)?);
                 }
-                Ok((loaded.0, (loaded.1, None)))
+                let tp2 = if tp2_layers.is_empty() { None } else { Some(tp2_weights(pushed)?) };
+                Ok((loaded.0, (loaded.1, tp2)))
             })?
         } else {
             crate::shared::placement::load_while_admitting(admission, || {

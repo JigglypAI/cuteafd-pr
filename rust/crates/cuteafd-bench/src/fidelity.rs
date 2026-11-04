@@ -66,6 +66,23 @@ pub struct Comparison {
     pub cross_checkpoint: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoints: Option<CrossCheckpoints>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_ab: Option<LayoutComparison>,
+}
+
+/// The original evidence is retained, including every permitted changed key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutComparison {
+    pub candidate: serde_json::Value,
+    pub baseline: serde_json::Value,
+    pub differences: Vec<LayoutDifference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutDifference {
+    pub key: String,
+    pub candidate: Option<serde_json::Value>,
+    pub baseline: Option<serde_json::Value>,
 }
 
 /// One arm's served checkpoint: its id and the snapshot revision that served it.
@@ -92,6 +109,8 @@ pub enum Pairing<'a> {
     SameCheckpoint,
     CrossCheckpoint { hub: &'a Path },
     CodeChange,
+    /// Identical checkpoint, precision and scoring evidence on two explicit layouts/builds.
+    LayoutChange,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,6 +334,50 @@ const QUANT_SELECTION_SETTINGS: &[&str] = &[
 /// definition: the served model id and the snapshot path.
 const QUANT_SELECTION_SERVER_FIELDS: &[&str] = &["model", "snapshot"];
 
+// Layout/topology and non-numeric endpoint metadata only. Precision, reply format,
+// speculation, concurrency and unknown keys remain identical and fail closed.
+const LAYOUT_SETTINGS: &[&str] = &["split-device", "rtx-gpus", "peers", "spark-count",
+    "local-experts", "rtx-expert-layers", "attention-placement", "index-cache",
+    "embedding-placement", "replay-records", "prefill-rows", "prefill-span-rows", "prefill-waves",
+    "route-source",
+    "listen", "CUTEAFD_CONSOLE_LINK_COMMAND"];
+
+fn layout_settings(server: &serde_json::Value) -> Result<serde_json::Value> {
+    let mut value = server.clone();
+    let object = value.as_object_mut().context("missing server settings")?;
+    object.remove("build");
+    if let Some(settings) = object.get_mut("settings") {
+        let mut fixed = BTreeMap::new();
+        for setting in settings.as_array().context("server settings must be an array")? {
+            let name = setting["name"].as_str().filter(|s| !s.is_empty()).context("setting name missing")?;
+            let value = setting.get("value").context("setting value missing")?;
+            if let Some(previous) = fixed.insert(name.to_owned(), value.clone()) {
+                ensure!(previous == *value, "server setting {name} has conflicting values");
+            }
+        }
+        *settings = serde_json::to_value(fixed)?;
+    }
+    Ok(value)
+}
+
+fn layout_comparison(a: &Run, b: &Run) -> Result<LayoutComparison> {
+    let (mut candidate, mut baseline) = (layout_settings(&a.settings)?, layout_settings(&b.settings)?);
+    let mut differences = Vec::new();
+    if a.settings.get("build") != b.settings.get("build") {
+        differences.push(LayoutDifference { key: "build".into(), candidate: a.settings.get("build").cloned(),
+            baseline: b.settings.get("build").cloned() });
+    }
+    for key in LAYOUT_SETTINGS {
+        let av = candidate.get_mut("settings").and_then(|s| s.as_object_mut()).and_then(|s| s.remove(*key));
+        let bv = baseline.get_mut("settings").and_then(|s| s.as_object_mut()).and_then(|s| s.remove(*key));
+        if av != bv { differences.push(LayoutDifference { key: (*key).into(), candidate: av, baseline: bv }); }
+    }
+    ensure!(candidate == baseline, "layout A/B runs differ outside the explicit layout allow-list (including precision, reply or speculation settings)");
+    ensure!(a.settings.get("snapshot").and_then(|v| v.as_str()).is_some_and(|v| !v.is_empty()),
+        "layout A/B requires the pinned checkpoint snapshot");
+    Ok(LayoutComparison { candidate: serde_json::to_value(a)?, baseline: serde_json::to_value(b)?, differences })
+}
+
 fn comparison_settings(server: &serde_json::Value, cross_checkpoint: bool) -> Result<serde_json::Value> {
     let mut normalized = server.clone();
     ensure!(normalized.is_object(), "missing server settings");
@@ -423,11 +486,12 @@ pub fn compare_paired(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootst
     ensure!(a.tier == b.tier && a.path_shape == b.path_shape && a.kl_kind == b.kl_kind && a.verify_rows == b.verify_rows && a.dataset == b.dataset,
         "runs use different tiers, scoring shapes, KL estimators or verify widths");
     ensure!(cross || a.precision == b.precision, "same-checkpoint runs use different routed-expert precision/tier");
-    let code = code_change;
+    let layout = matches!(pairing, Pairing::LayoutChange);
+    let code = code_change || layout;
     ensure!(a.engine == b.engine && (code || a.settings.get("build") == b.settings.get("build"))
         && (cross || a.settings.get("snapshot") == b.settings.get("snapshot")), "runs use different engines, builds or snapshots");
     let checkpoints = match pairing {
-        Pairing::SameCheckpoint | Pairing::CodeChange => None,
+        Pairing::SameCheckpoint | Pairing::CodeChange | Pairing::LayoutChange => None,
         Pairing::CrossCheckpoint { hub } => Some(cross_checkpoints(a, b, hub)?),
     };
     let settings = |run: &Run| -> Result<serde_json::Value> {
@@ -435,7 +499,8 @@ pub fn compare_paired(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootst
         if code { value.as_object_mut().unwrap().remove("build"); }
         Ok(value)
     };
-    ensure!(settings(a)? == settings(b)?, "{}",
+    let layout_ab = if layout { Some(layout_comparison(a, b)?) } else { None };
+    ensure!(layout || settings(a)? == settings(b)?, "{}",
         if cross { "runs use different server settings outside the precision and quant-selection lists" }
         else { "runs use different nonprecision server settings" });
     ensure!(matches!(a.path_shape.as_str(), "decode-shaped" | "prefill-shaped"), "unknown scoring shape");
@@ -549,7 +614,7 @@ pub fn compare_paired(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootst
         kl_se_clustered: clustered_se(&stats.iter().map(|s| s[1]).collect::<Vec<_>>(), &counts),
         mcnemar_p: if discordant == 0 { 1.0 } else { erfc((chi2 / 2.0).sqrt()) },
         top1_margin, kl_margin, bootstrap, seed, absolute_pass, tripwires, calibrated_tripwires,
-        cross_checkpoint: cross, checkpoints })
+        cross_checkpoint: cross, checkpoints, layout_ab })
 }
 
 #[cfg(test)]
@@ -808,6 +873,36 @@ mod tests {
         a = b.clone(); a.tier = "quick".into(); a.path_shape = "prefill-shaped".into();
         assert!(compare(&a, &a, 0.01, 0.01, 100, 1).is_err());
     }
+    #[test]
+    fn layout_pairing_preserves_evidence_and_refuses_nonlayout_changes() {
+        let mut baseline = run(3, 8);
+        baseline.settings = serde_json::json!({"snapshot": "/hub/checkpoint/snapshots/revision",
+            "build": {"commit": "baseline"}, "settings": [
+                {"name": "split-device", "value": null},
+                {"name": "kda-output-shard", "value": "false"},
+                {"name": "CUTEAFD_SPARK_REPLY_FORMAT", "value": "bf16"}]});
+        let mut candidate = baseline.clone();
+        candidate.settings["build"]["commit"] = serde_json::json!("candidate");
+        candidate.settings["settings"][0]["value"] = serde_json::json!("1");
+        let compare = |a: &Run| compare_paired(a, &baseline, 0.005, 0.005, 100, 1, Pairing::LayoutChange);
+        let result = compare(&candidate).unwrap();
+        assert!(result.pass);
+        let evidence = result.layout_ab.unwrap();
+        assert_eq!(evidence.differences.len(), 2);
+        assert_eq!(evidence.differences[1].key, "split-device");
+        assert_eq!(evidence.candidate, serde_json::to_value(&candidate).unwrap());
+        assert_eq!(evidence.baseline, serde_json::to_value(&baseline).unwrap());
+        for name in ["kda-output-shard", "CUTEAFD_SPARK_REPLY_FORMAT", "draft-sequences", "unknown"] {
+            let mut bad = candidate.clone();
+            bad.settings["settings"].as_array_mut().unwrap().push(serde_json::json!({"name": name, "value": "different"}));
+            assert!(compare(&bad).is_err(), "{name}");
+        }
+        let mut bad = candidate.clone(); bad.settings["snapshot"] = serde_json::json!("other");
+        assert!(compare(&bad).is_err());
+        let mut bad = candidate.clone(); bad.set_sha256 = "other".into(); assert!(compare(&bad).is_err());
+        let mut bad = candidate.clone(); bad.score.records[0].window = "other".into(); assert!(compare(&bad).is_err());
+    }
+
     #[test]
     fn pairing_allows_only_precision_switches_to_change() {
         let mut b = run(3, 8);
