@@ -173,7 +173,17 @@ mod tp2_tests {
                         arena = arena.div_ceil(16) * 16 + plane;
                     }
                     arena + 4096 * h * 4
-                } else { 1343287468 };
+                } else {
+                    let root = manifest.parent().unwrap().join("exl3/exl3-dsv4p-k23/rtx-tp2");
+                    let mut manifests = std::fs::read_dir(root).unwrap().map(|entry| {
+                        let path = entry.unwrap().path().join("v41_exl3.json");
+                        serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap()).unwrap()
+                    }).collect::<Vec<_>>();
+                    manifests.sort_by_key(|m| m["capacity"].as_u64().unwrap());
+                    assert_eq!(manifests.len(), 8, "published TP2 EXL3 capacity ladder");
+                    super::super::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum).unwrap()
+                        + 4096 * catalog.routed_experts().hidden as u64 * 4
+                };
                 assert_eq!(workspace, expected);
                 eprintln!("TP2 {family} rank{rank}: resident={} staging={} workspace={workspace}", cost.resident_bytes, cost.staging_bytes);
             }

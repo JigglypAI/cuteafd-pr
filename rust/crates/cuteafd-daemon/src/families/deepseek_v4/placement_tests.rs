@@ -672,7 +672,8 @@ struct Fixture {
     onboard: Option<String>,
     driver: String,
     gpus: Vec<FixtureGpu>,
-    /// The launch's admitted pool and RTX expert layers (the runtime's answer).
+    /// Current replay's expected pool and RTX layers. Shape-only refreshes
+    /// retain the original launch answer and provenance in the fixture JSON.
     pool_tokens: u64,
     onboard_layers: usize,
 }
