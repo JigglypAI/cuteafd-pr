@@ -313,9 +313,12 @@ impl<'a> WindowWeights<'a> {
         let device = crate::shared::memory::device::Device {
             library: self.library, id: storage.input.buffer.device_id,
         };
+        let ordering = || -> Result<_> { Ok(crate::shared::memory::device::Event {
+            device, raw: device.run(|| self.library.cuda_event_create_ordering())?,
+        }) };
         Ok(WindowWave {
-            produced: crate::shared::memory::device::Event::new(device)?,
-            committed: crate::shared::memory::device::Event::new(device)?,
+            produced: ordering()?,
+            committed: ordering()?,
             #[cfg(test)]
             own_stream: PRIVATE_STREAM.with(|private| private.get()).then(|| -> Result<_> { Ok(LoadStream {
                 library: self.library, raw: self.library.cuda_stream_create()? }) }).transpose()?,
