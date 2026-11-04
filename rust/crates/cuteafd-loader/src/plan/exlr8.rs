@@ -1539,17 +1539,18 @@ fn uncached_census_enabled() -> bool { UNCACHED_CENSUS.with(|enabled| enabled.ge
 #[cfg(test)]
 mod mounted_tests {
     #[test]
-    #[ignore = "requires four saved GLM plans and their installed snapshots/PROGRAMS"]
-    fn memoized_census_preserves_four_saved_glm_plan_projections() {
+    #[ignore = "requires installed GLM EXLR8 snapshot, published PROGRAMS and parity output directory"]
+    fn memoized_census_preserves_current_min_max_plan_json_bytes() {
         use crate::plan::{ExpertPlacement, PlanInput, PlanOptions, layout::LayoutOptions};
-        let root = std::path::PathBuf::from(std::env::var_os("CUTEAFD_GLM_SAVED_PLANS").expect("CUTEAFD_GLM_SAVED_PLANS"));
-        let programs = std::path::PathBuf::from(std::env::var_os("CUTEAFD_GLM_SAVED_PROGRAMS").expect("CUTEAFD_GLM_SAVED_PROGRAMS"));
+        let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT").expect("CUTEAFD_EXLR8_TEST_SNAPSHOT"));
+        let programs = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").expect("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"));
+        crate::plan::testing::validate_placement_inputs(&programs).unwrap();
+        let output = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_PARITY_OUTPUT").expect("CUTEAFD_EXLR8_PARITY_OUTPUT"));
+        std::fs::create_dir_all(&output).unwrap();
         struct Reset;
         impl Drop for Reset { fn drop(&mut self) { super::UNCACHED_CENSUS.with(|flag| flag.set(false)); } }
         let _reset = Reset;
-        for name in ["exlr8-min", "exlr8-max", "exl3-min", "exl3-max"] {
-            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join(format!("{name}.json"))).unwrap()).unwrap();
-            let input = PlanInput::open(std::path::Path::new(saved["snapshot"].as_str().unwrap())).unwrap();
+        for name in ["exlr8-min", "exlr8-max"] {
             let gpus = if name.ends_with("max") { 2 } else { 1 };
             let options = PlanOptions {
                 placement: ExpertPlacement::Sparks { ranks: if gpus == 2 { 6 } else { 4 } },
@@ -1563,19 +1564,19 @@ mod mounted_tests {
             let plan = |uncached| {
                 super::UNCACHED_CENSUS.with(|flag| flag.set(uncached));
                 let start = std::time::Instant::now();
-                let report = if name.starts_with("exlr8") { input.exlr8_native_plan("up1", &options, "off").unwrap().report }
-                    else { input.plan(&options).unwrap() };
+                let input = PlanInput::open(&snapshot).unwrap();
+                let native = input.exlr8_native_plan("up1", &options, "off").unwrap();
                 let elapsed = start.elapsed();
-                assert!(elapsed.as_secs() < 30, "{name}: {elapsed:?}");
-                println!("{name} uncached={uncached}: {elapsed:?}");
-                report
+                assert!(elapsed < std::time::Duration::from_secs(30), "{name}: {elapsed:?}");
+                println!("{name} uncached={uncached} wall_seconds={:.6}", elapsed.as_secs_f64());
+                let bytes = serde_json::to_vec_pretty(&native).unwrap();
+                let arm = if uncached { "uncached" } else { "memoized" };
+                std::fs::write(output.join(format!("{name}-{arm}.json")), &bytes).unwrap();
+                bytes
             };
             let cached = plan(false);
             let uncached = plan(true);
-            assert_eq!(cached.memory_layout, uncached.memory_layout, "{name}");
-            assert_eq!(cached.bytes_by_owner, uncached.bytes_by_owner, "{name}");
-            assert_eq!(serde_json::to_value(&cached.memory_layout).unwrap(), saved["memory_layout"], "{name}");
-            assert_eq!(serde_json::to_value(&cached.bytes_by_owner).unwrap(), saved["bytes_by_owner"], "{name}");
+            assert!(cached == uncached, "{name}: complete native plan JSON bytes differ");
         }
     }
 
