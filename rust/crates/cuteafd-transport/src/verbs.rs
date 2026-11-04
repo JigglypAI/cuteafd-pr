@@ -4253,6 +4253,8 @@ fn verbs_host_expected_response_wire_bytes(request: &ExpertProtocolV2Request) ->
     let bf16_row_bytes = ExpertV2Dtype::Bf16.row_bytes(hidden_dim)?;
     let negotiated_row_bytes = if request.nvfp4_e2m1_fp8_e4m3_response_enabled() {
         ExpertV2Dtype::Nvfp4E2m1Fp8E4m3.row_bytes(hidden_dim)?
+    } else if request.header.flags & crate::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32 != 0 {
+        ExpertV2Dtype::Fp8E4m3Ue8m0K32.row_bytes(hidden_dim)?
     } else if request.fp8_e4m3_row_scaled_response_enabled() {
         ExpertV2Dtype::Fp8E4m3RowScaled.row_bytes(hidden_dim)?
     } else {
