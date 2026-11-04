@@ -796,6 +796,43 @@ mod tests {
                 .chunks_exact(4)
                 .all(|b| f32::from_le_bytes(b.try_into().unwrap()) == 3072.0)
         );
+        drop(owner);
+        let stream = crate::shared::memory::device::Stream::new(
+            crate::shared::memory::device::Device { library: &library, id: 0 })?;
+        let expanded = DeviceAllocation::new(&library, 5 * 4 * K * 2)?;
+        for embedding_device in [0, 1] {
+            if embedding_device == 1 {
+                stream.device.run(|| library.cuda_enable_peer(1))?;
+            }
+            let vocabulary = std::rc::Rc::new(NativeVocabulary::load_with_embedding_device(
+                &library, &programs, VocabularyPlan::new(&records, &selection(false), 2, 0, K, N)?,
+                32 << 20, 0, 0, embedding_device)?.context("capture vocabulary")?);
+            let embedding = crate::shared::token_io::TokenEmbedding::row_fp8(&library, crate::shared::token_io::EmbedSource {
+                path: records[0].components[0].source.path.clone(), offset: 0, vocab: N, hidden: K,
+                snapshot: None, tensor_name: EMBEDDING.into(),
+            }, vocabulary)?;
+            embedding.validate_residency(embedding_device, (N * K + N * 4) as u64)?;
+            // SAFETY: all buffers and the table survive capture, replay and the stream drain.
+            unsafe {
+                library.cuda_graph_begin_capture(stream.raw)?;
+                let gathered = embedding.gather(ids.buffer.ptr, std::ptr::null(), 5, 4,
+                    std::ptr::null(), expanded.buffer.ptr, Some(output.buffer),
+                    crate::shared::peer_split::RankDevice { device: stream.device.id, stream: stream.raw });
+                let graph = library.cuda_graph_end_capture(stream.raw)?;
+                gathered?;
+                let replayed = library.cuda_graph_launch(graph, stream.raw);
+                let drained = stream.drain();
+                library.cuda_graph_exec_destroy(graph)?;
+                replayed?;
+                drained?;
+            }
+            let mut copied = vec![0; expanded.buffer.bytes];
+            library.copy_d2h(&mut copied, expanded.buffer)?;
+            for (row, bytes) in copied.chunks_exact(4 * K * 2).enumerate() {
+                let expected = if row < 3 { 0x3f00u16 } else { 0 };
+                assert!(bytes.chunks_exact(2).all(|b| u16::from_le_bytes(b.try_into().unwrap()) == expected));
+            }
+        }
         Ok(())
     }
 
