@@ -39,7 +39,7 @@ impl<'library> DsparkWeights<'library> {
         })
     }
 }
-impl<'library> DsparkRouter<'_, 'library> {
+impl DsparkRouter<'_, '_> {
     pub fn device_bytes(capacity: usize) -> Result<usize> {
         ensure!(
             (1..=4096).contains(&capacity),
@@ -47,8 +47,8 @@ impl<'library> DsparkRouter<'_, 'library> {
         );
         Ok(capacity * 128 * 4)
     }
-    pub(super) fn matches_stage(&self, weights: &DsparkWeights<'library>, stage: usize) -> bool {
-        self.stage == stage && std::ptr::eq(self._weights, weights)
+    pub(super) fn matches_stage(&self, weights: &DsparkWeights<'_>, stage: usize) -> bool {
+        self.stage == stage && std::ptr::addr_eq(self._weights, weights)
     }
     pub(in crate::families::deepseek_v41::v41_experts) fn matches(
         &self,

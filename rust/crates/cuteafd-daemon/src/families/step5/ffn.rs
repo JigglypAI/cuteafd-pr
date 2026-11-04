@@ -434,6 +434,10 @@ impl<'a> DenseFfn<'a> {
         }), arena)
     }
 
+    pub(super) fn share_standalone(&mut self, stream: std::rc::Rc<crate::shared::memory::StandaloneStream<'a>>) {
+        self.stream = stream;
+    }
+
     /// The caller admits all lanes together before creating any workspace.
     pub(super) fn new_lane(&self) -> Result<Self> {
         let mut lane = Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), None)?;
@@ -689,16 +693,13 @@ mod tests {
     #[test]
     #[ignore = "requires sealed native library, pinned real-weight component fixtures and CUDA"]
     fn native_dense_ffn_official_boundaries_and_graph_replay() -> Result<()> {
-        native_dense_component(0)
+        native_dense_components(&[0])
     }
 
     #[test]
     #[ignore = "requires pinned dense layer-1/2 fixtures, sealed native library and CUDA"]
     fn native_dense_layers1_2_boundaries_and_graph_replay() -> Result<()> {
-        for layer in 1..3 {
-            native_dense_component(layer)?;
-        }
-        Ok(())
+        native_dense_components(&[1, 2])
     }
 
     impl DenseFfn<'_> {
@@ -806,7 +807,30 @@ mod tests {
         }
     }
 
-    fn native_dense_component(layer: usize) -> Result<()> {
+    fn native_dense_components(layers: &[usize]) -> Result<()> {
+        // SAFETY: this explicit GPU qualification supplies a sealed native library.
+        let library =
+            unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = crate::shared::memory::device::cache_test_device(&library)?;
+        let programs = library
+            .programs()?
+            .with_manifest(std::path::Path::new(&std::env::var(
+                "CUTEAFD_PROGRAM_MANIFEST",
+            )?))?;
+        let checkpoint =
+            Checkpoint::open(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let planes = cuteafd_loader::plan::families::step5::native::dense_planes(128)?;
+        let bytes = cuteafd_loader::plan::families::step5::native::plane_bytes(&planes)?;
+        let arena = Arena::new(device, usize::try_from(bytes)?)?;
+        for &layer in layers {
+            native_dense_component(device, &programs, &checkpoint, &arena, layer)?;
+        }
+        Ok(())
+    }
+
+    fn native_dense_component<'a>(device: Device<'a>, programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint, arena: &Arena<'a>, layer: usize) -> Result<()> {
+        let library = device.library;
         let mut root = std::path::PathBuf::from(std::env::var("CUTEAFD_STEP5_FFN_FIXTURE_DIR")?);
         if layer > 0 {
             root.push(format!("layer{layer}"));
@@ -822,23 +846,14 @@ mod tests {
                 && manifest["rows"] == serde_json::json!([1, 7, 128]),
             "unsupported dense fixture identity"
         );
-        // SAFETY: this explicit GPU qualification supplies a sealed native library.
-        let library =
-            unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        let device = crate::shared::memory::device::cache_test_device(&library)?;
-        let programs = library
-            .programs()?
-            .with_manifest(std::path::Path::new(&std::env::var(
-                "CUTEAFD_PROGRAM_MANIFEST",
-            )?))?;
-        let checkpoint =
-            Checkpoint::open(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
         ensure!(
             checkpoint.snapshot.file_name().and_then(|v| v.to_str())
                 == manifest["revision"].as_str(),
             "native checkpoint revision differs from fixture"
         );
-        let mut chain = DenseFfn::load(device, &programs, &checkpoint, layer, 128, u64::MAX, &[])?;
+        let plan = DensePlan::prepare(programs, checkpoint, layer, 128, u64::MAX, &[])?;
+        let mut chain = DenseFfn::load_plan_in(device, programs, checkpoint, plan, Some((arena, 0)))?;
+        assert!(std::rc::Rc::ptr_eq(&chain.stream, &arena.standalone()));
         ensure!(
             manifest["epsilon"].as_f64().map(|v| v as f32) == Some(chain.immutable.epsilon),
             "fixture epsilon differs"

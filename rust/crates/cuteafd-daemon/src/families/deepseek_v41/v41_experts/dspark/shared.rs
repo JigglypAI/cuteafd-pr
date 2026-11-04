@@ -75,12 +75,12 @@ impl<'library> DsparkWeights<'library> {
         })
     }
 }
-impl<'library> DsparkSharedFfn<'_, 'library> {
+impl DsparkSharedFfn<'_, '_> {
     pub fn device_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
         crate::families::deepseek_v41::v41_shared_ffn::SharedFfn::device_bytes(library, capacity)
     }
-    pub(super) fn matches_stage(&self, weights: &DsparkWeights<'library>, stage: usize) -> bool {
-        self.stage == stage && std::ptr::eq(self.weights, weights)
+    pub(super) fn matches_stage(&self, weights: &DsparkWeights<'_>, stage: usize) -> bool {
+        self.stage == stage && std::ptr::addr_eq(self.weights, weights)
     }
     pub(in crate::families::deepseek_v41::v41_experts) fn matches(
         &self,
