@@ -5,6 +5,381 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// #1183: idle CE throughput at the actual Muse 2752-row reply size. No
+/// network/model is involved; this is a prerequisite, not an overlap claim.
+#[test]
+#[ignore = "requires one idle GPU and CUTEAFD_PLANE_UPLOAD_LIBRARY; run alone (--exact)"]
+fn gpu_reply_copy_engine_bandwidth() -> Result<()> {
+    use crate::shared::memory::{DeviceAllocation, device::{Device, Event, Stream}};
+    const BYTES: usize = 304_349_184;
+    const RANKS: usize = 6;
+    let path = library_path()?;
+    // SAFETY: the opt-in path names the matching built native library.
+    let library = unsafe { NativeLibrary::load(&path)? };
+    library.cuda_set_device(0)?;
+    let device = Device { library: &library, id: 0 };
+    let mut host = HostAllocation::new(&library, BYTES)?;
+    for (i, byte) in host.bytes_mut().iter_mut().enumerate() { *byte = (i % 251) as u8; }
+    let output = DeviceAllocation::new(&library, BYTES)?;
+    let streams = (0..RANKS).map(|_| Stream::new(device)).collect::<Result<Vec<_>>>()?;
+    let mut start = Event::new(device)?;
+    let mut end = Event::new(device)?;
+    let mut done = (0..RANKS).map(|_| Event::new(device)).collect::<Result<Vec<_>>>()?;
+    for (name, copies, stream_count) in [("one", 1, 1), ("six_serial", RANKS, 1), ("six_streams", RANKS, RANKS)] {
+        let chunk = BYTES / copies;
+        let mut samples = Vec::new();
+        for repeat in 0..6 {
+            start.record(&streams[0])?;
+            for stream in streams.iter().take(stream_count).skip(1) {
+                // SAFETY: start is already recorded for this repeat; all owners survive drainage.
+                unsafe { library.cuda_stream_wait_event(stream.raw, start.raw)?; }
+            }
+            for copy in 0..copies {
+                let offset = copy * chunk;
+                let mut dst = output.buffer;
+                let mut src = host.buffer;
+                // SAFETY: the disjoint slices are within the BYTES-sized live allocations.
+                unsafe {
+                    dst.ptr = dst.ptr.cast::<u8>().add(offset).cast();
+                    src.ptr = src.ptr.cast::<u8>().add(offset).cast();
+                }
+                dst.bytes = chunk;
+                src.bytes = chunk;
+                // SAFETY: immutable pinned source and disjoint device destination outlive all copies.
+                unsafe { library.copy_host_buffers_h2d_batch_async(&[dst], &[src], &[chunk], streams[copy % stream_count].raw)?; }
+            }
+            for index in 1..stream_count {
+                done[index].record(&streams[index])?;
+                // SAFETY: each current completion event is recorded before this fan-in wait.
+                unsafe { library.cuda_stream_wait_event(streams[0].raw, done[index].raw)?; }
+            }
+            end.record(&streams[0])?;
+            streams[0].drain()?;
+            // SAFETY: both timing events completed; fan-in includes every copy stream.
+            let ms = unsafe { library.cuda_event_elapsed_ms(start.raw, end.raw)? };
+            ensure!(ms.is_finite() && ms > 0.0, "invalid CE timing {ms}");
+            if repeat > 0 {
+                let gbps = BYTES as f64 / (ms as f64 * 1e6);
+                samples.push(gbps);
+                eprintln!("reply_ce case={name} bytes={BYTES} copies={copies} streams={stream_count} repeat={repeat} ms={ms:.6} gbps={gbps:.3}");
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        eprintln!("reply_ce case={name} median_gbps={:.3} min_gbps={:.3} max_gbps={:.3}", samples[2], samples[0], samples[4]);
+        let mut actual = vec![0u8; BYTES];
+        library.copy_d2h(&mut actual, output.buffer)?;
+        ensure!(actual == host.bytes(), "CE output differs for {name}");
+    }
+    Ok(())
+}
+
+/// #815: queue compute before arrival and hold representative kernel/H2D work
+/// on other streams. Report whether a fresh CE stream can release compute;
+/// always release the host words before draining, including error paths.
+#[test]
+#[ignore = "requires one idle GPU, CUDA_MODULE_LOADING=EAGER and CUTEAFD_PLANE_UPLOAD_LIBRARY"]
+fn gpu_reply_ce_land_before_arrival_pressure() -> Result<()> {
+    use crate::shared::memory::{DeviceAllocation, device::{Device, Event, Stream}};
+    ensure!(std::env::var("CUDA_MODULE_LOADING").as_deref() == Ok("EAGER"), "run with CUDA_MODULE_LOADING=EAGER");
+    let path = library_path()?;
+    // SAFETY: the opt-in path names the matching built native library.
+    let library = unsafe { NativeLibrary::load(&path)? };
+    library.cuda_set_device(0)?;
+    let device = Device { library: &library, id: 0 };
+    let host = HostAllocation::new(&library, 304_349_184)?;
+    let output = DeviceAllocation::new(&library, host.buffer.bytes)?;
+    struct ReleaseWords<'a>(&'a HostAllocation<'a>);
+    impl Drop for ReleaseWords<'_> {
+        fn drop(&mut self) {
+            for offset in [0, 64] {
+                // SAFETY: aligned atomics of the live mapped control allocation.
+                unsafe { (*self.0.buffer.ptr.cast::<u8>().add(offset).cast::<AtomicU32>()).store(1, Ordering::Release); }
+            }
+        }
+    }
+    for pressure in [0, 4, 16] {
+        let control = HostAllocation::new(&library, 128)?;
+        let pressure_outputs = (0..=pressure).map(|_| DeviceAllocation::new(&library, 65536)).collect::<Result<Vec<_>>>()?;
+        let streams = (0..=pressure).map(|_| Stream::new(device)).collect::<Result<Vec<_>>>()?;
+        let copy_stream = Stream::new(device)?;
+        let mut done = Event::new(device)?;
+        // Warm the exact kernel and copy API before any memory wait exists.
+        for (stream, target) in streams.iter().zip(&pressure_outputs) {
+            // SAFETY: live disjoint destinations and immutable pinned source; drained below.
+            unsafe {
+                library.sm_copy_regions(&[(target.buffer.ptr, host.buffer.ptr.cast_const(), 65536)], stream.raw)?;
+                library.copy_host_buffers_h2d_batch_async(&[target.buffer], &[host.buffer], &[65536], stream.raw)?;
+            }
+            stream.drain()?;
+        }
+        // Declared after every stream: unwinding releases words before stream Drop drains.
+        let release = ReleaseWords(&control);
+        let copied = control.buffer.ptr.cast::<u32>();
+        let ready = control.buffer.ptr.cast::<u8>().wrapping_add(64).cast::<u32>();
+        for (index, (stream, target)) in streams.iter().zip(&pressure_outputs).enumerate() {
+            // SAFETY: current compute waits for copied; pressure waits for a host release.
+            // All sources/words survive stream drainage, and release covers errors too.
+            unsafe {
+                library.cuda_stream_wait_value32(stream.raw, if index == 0 { copied } else { ready }, 1)?;
+                library.sm_copy_regions(&[(target.buffer.ptr, host.buffer.ptr.cast_const(), 65536)], stream.raw)?;
+                library.copy_host_buffers_h2d_batch_async(&[target.buffer], &[host.buffer], &[65536], stream.raw)?;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        // Simulated host-observed arrival: NO unsatisfied wait on the CE stream.
+        // SAFETY: the immutable pinned source and full destination are retained to drain.
+        unsafe {
+            library.copy_host_buffers_h2d_batch_async(&[output.buffer], &[host.buffer], &[host.buffer.bytes], copy_stream.raw)?;
+            library.cuda_stream_write_value32(copy_stream.raw, copied, 1)?;
+        }
+        done.record(&copy_stream)?;
+        let started = Instant::now();
+        let completed = loop {
+            // SAFETY: the current completion event was recorded above and remains live.
+            if unsafe { library.cuda_event_query(done.raw)? } { break true; }
+            if started.elapsed() >= Duration::from_millis(50) { break false; }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        eprintln!("reply_ce_pressure pressure_streams={pressure} completed_before_host_release={completed} observed_ms={:.3}", started.elapsed().as_secs_f64() * 1e3);
+        drop(release);
+        copy_stream.drain()?;
+        for stream in &streams { stream.drain()?; }
+        let mut actual = vec![0u8; host.buffer.bytes];
+        library.copy_d2h(&mut actual, output.buffer)?;
+        ensure!(actual == host.bytes(), "CE output differs under {pressure}-stream pressure");
+    }
+    Ok(())
+}
+
+/// #1183: the Muse dependency shape, not synthetic blocked CE pressure.
+/// One compute stream, depth-three slots, 19 ms replies and 750 us rank skew;
+/// compare total ring time, including the CE current-record host handshake.
+#[test]
+#[ignore = "requires one idle GPU, CUDA_MODULE_LOADING=EAGER and CUTEAFD_PLANE_UPLOAD_LIBRARY"]
+fn gpu_reply_ce_current_event_depth_three() -> Result<()> {
+    use crate::shared::memory::{DeviceAllocation, device::{Device, Event, Stream}};
+    const RANKS: usize = 6;
+    const SLOTS: usize = 3;
+    const WAVES: u32 = 18;
+    const CHUNK: usize = 50_724_864;
+    const BYTES: usize = RANKS * CHUNK;
+    const STAGING: usize = 2752 * (2 * 8 * 4 + 4224);
+    const TABLES: usize = 22_144;
+    ensure!(std::env::var("CUDA_MODULE_LOADING").as_deref() == Ok("EAGER"), "run with CUDA_MODULE_LOADING=EAGER");
+    let path = library_path()?;
+    // SAFETY: the opt-in path names the matching built native library.
+    let library = Arc::new(unsafe { NativeLibrary::load(&path)? });
+    library.cuda_set_device(0)?;
+    let device = Device { library: &library, id: 0 };
+    let mut host = HostAllocation::new(&library, BYTES)?;
+    for (i, byte) in host.bytes_mut().iter_mut().enumerate() { *byte = (i % 251) as u8; }
+    let output = DeviceAllocation::new(&library, SLOTS * BYTES)?;
+    let input = DeviceAllocation::new(&library, STAGING)?;
+    let staging = HostAllocation::new(&library, SLOTS * STAGING)?;
+    let table = DeviceAllocation::new(&library, SLOTS * TABLES)?;
+    let descriptors = HostAllocation::new(&library, Pulls::bytes(SLOTS))?;
+    let pulls = Pulls { base: descriptors.buffer.ptr as usize };
+    let stream = Stream::new(device)?;
+    let copy = Stream::new(device)?;
+    let copied = (0..SLOTS).map(|_| Event::new(device)).collect::<Result<Vec<_>>>()?;
+    let mut staged = (0..SLOTS).map(|_| Event::new(device)).collect::<Result<Vec<_>>>()?;
+    // All allocation, lazy loading and ordered-upload reservations precede waits.
+    library.tp2_native_initialize()?;
+    library.peer_exchange_initialize()?;
+    library.copy_h2d(input.buffer, &vec![0x35; STAGING])?;
+    for slot in 0..SLOTS {
+        let target = cuteafd_ffi::CuteafdDeviceBuffer { ptr: (table.buffer.ptr as usize + slot * TABLES) as *mut c_void,
+            bytes: TABLES, ..table.buffer };
+        // SAFETY: fixed admitted table destinations on the compute stream.
+        unsafe { library.reserve_h2d_ordered(target, stream.raw)?; }
+        for rank in 0..RANKS {
+            pulls.write(slot, rank, &[PullEntry { source: (host.buffer.ptr as usize + rank * CHUNK) as u64,
+                offset: 0, bytes: CHUNK as u64 }]);
+        }
+    }
+    // Warm exact launch shapes, including the SM path, before either arm.
+    // SAFETY: live, disjoint destinations and immutable sources, drained below.
+    unsafe {
+        library.sm_copy_regions(&[(staging.buffer.ptr, input.buffer.ptr.cast_const(), STAGING as u64)], stream.raw)?;
+        library.pull_frames(&[pulls.at(0, 0).cast_const()], &[(output.buffer.ptr, CHUNK as u64)], stream.raw)?;
+        library.copy_host_buffers_h2d_batch_async(&[CuteafdDeviceBuffer { bytes: BYTES, ..output.buffer }],
+            &[host.buffer], &[BYTES], copy.raw)?;
+    }
+    stream.drain()?;
+    copy.drain()?;
+    let mut results = Vec::new();
+    for ce in [false, true] {
+        let control = HostAllocation::new(&library, Counter::words(SLOTS) * LINE)?;
+        let words = Words { base: control.buffer.ptr as usize, slots: SLOTS };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (send, receive) = std::sync::mpsc::channel::<(u32, usize)>();
+        let (recorded, acknowledgement) = std::sync::mpsc::channel::<u32>();
+        let worker_library = library.clone();
+        let worker_stop = stop.clone();
+        let (source, destination, copy_raw) = (host.buffer.ptr as usize, output.buffer.ptr as usize, copy.raw as usize);
+        let events: Vec<usize> = copied.iter().map(|event| event.raw as usize).collect();
+        let started = Instant::now();
+        let mut host_wait = Duration::ZERO;
+        let mut max_ahead = 0usize;
+        let mut first_land_gpu_staged = 0usize;
+        let result = std::thread::scope(|scope| -> Result<()> {
+            let worker = scope.spawn(move || -> Result<()> {
+                struct ReleaseOnExit(Words);
+                impl Drop for ReleaseOnExit {
+                    fn drop(&mut self) {
+                        for rank in 0..RANKS { self.0.store(Counter::Arrived(rank), WAVES); }
+                        self.0.store(Counter::Landed, WAVES);
+                    }
+                }
+                // A worker error must not leave the engine's SM/table upload stuck.
+                let _release = ReleaseOnExit(words);
+                worker_library.cuda_set_device(0)?;
+                let mut jobs = VecDeque::<(u32, usize, Option<Instant>, usize)>::new();
+                let mut closed = false;
+                let mut progress = Instant::now();
+                loop {
+                    if worker_stop.load(Ordering::Acquire) { return Ok(()); }
+                    loop {
+                        match receive.try_recv() {
+                            Ok((sequence, slot)) => { jobs.push_back((sequence, slot, None, 0)); progress = Instant::now(); }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => { closed = true; break; }
+                        }
+                    }
+                    if closed && jobs.is_empty() { break; }
+                    ensure!(progress.elapsed() < Duration::from_secs(2), "fixture worker progress timeout");
+                    // Post all staged/free waves, so reply delays overlap at depth three.
+                    for (sequence, slot, arrival, _) in &mut jobs {
+                        if arrival.is_none() && reached(words.load(Counter::Staged(*slot)), *sequence)
+                            && reached(words.load(Counter::Consumed(*slot)), (*sequence - 1) / SLOTS as u32) {
+                            *arrival = Some(Instant::now() + Duration::from_millis(19));
+                            progress = Instant::now();
+                        }
+                    }
+                    let Some((sequence, slot, Some(arrival), index)) = jobs.front_mut() else {
+                        std::thread::sleep(Duration::from_micros(50)); continue;
+                    };
+                    if Instant::now() < *arrival + Duration::from_micros(*index as u64 * 150) {
+                        std::thread::sleep(Duration::from_micros(50)); continue;
+                    }
+                    let (sequence, slot) = (*sequence, *slot);
+                    let rank = [1usize, 4, 0, 5, 3, 2][*index];
+                    if ce {
+                        let dst = CuteafdDeviceBuffer { ptr: (destination + slot * BYTES + rank * CHUNK) as *mut c_void,
+                            bytes: CHUNK, device_id: 0, flags: 0 };
+                        let src = cuteafd_ffi::CuteafdHostBuffer { ptr: (source + rank * CHUNK) as *mut c_void,
+                            bytes: CHUNK, flags: cuteafd_ffi::CUTEAFD_HOST_BUFFER_FLAG_PINNED };
+                        // SAFETY: receive source retained through final drain; slot's prior consumer completed.
+                        unsafe { worker_library.copy_host_buffers_h2d_batch_async(&[dst], &[src], &[CHUNK], copy_raw as *mut c_void)?; }
+                    }
+                    words.store(Counter::Arrived(rank), sequence);
+                    *index += 1;
+                    progress = Instant::now();
+                    if *index != RANKS { continue; }
+                    jobs.pop_front();
+                    if ce {
+                        // SAFETY: current record is submitted BEFORE acknowledgement; no future-record wait.
+                        unsafe { worker_library.cuda_event_record(events[slot] as *mut c_void, copy_raw as *mut c_void)?; }
+                    }
+                    words.store(Counter::Landed, sequence);
+                    if ce && recorded.send(sequence).is_err() { return Ok(()); }
+                }
+                Ok(())
+            });
+            let engine = (|| -> Result<()> {
+                let mut pending = VecDeque::new();
+                for sequence in 1..=WAVES {
+                    let slot = (sequence as usize - 1) % SLOTS;
+                    let previous = sequence.saturating_sub(SLOTS as u32);
+                    // Under the fallback, a reused slot's prior wave was host-acknowledged at land.
+                    if ce { ensure!(reached(words.load(Counter::Landed), previous), "unsatisfied staging reuse wait before CE"); }
+                    // SAFETY: live slot staging/control and input; reuse waits precede SM staging.
+                    unsafe {
+                        library.cuda_stream_wait_value32(stream.raw, words.ptr(Counter::Landed), previous)?;
+                        library.sm_copy_regions(&[((staging.buffer.ptr as usize + slot * STAGING) as *mut c_void,
+                            input.buffer.ptr.cast_const(), STAGING as u64)], stream.raw)?;
+                        library.cuda_stream_write_value32(stream.raw, words.ptr(Counter::Staged(slot)), sequence)?;
+                    }
+                    staged[slot].record(&stream)?;
+                    send.send((sequence, slot))?;
+                    pending.push_back((sequence, slot));
+                    max_ahead = max_ahead.max(pending.len());
+                    if pending.len() < SLOTS && sequence < WAVES { continue; }
+                    loop {
+                        let (sequence, slot) = pending.pop_front().context("fixture oldest wave")?;
+                        if ce {
+                            let waiting = Instant::now();
+                            ensure!(acknowledgement.recv_timeout(Duration::from_secs(2))? == sequence, "fixture event generation mismatch");
+                            host_wait += waiting.elapsed();
+                            if sequence == 1 {
+                                for event in &staged {
+                                    // SAFETY: all three current staging records precede first land.
+                                    first_land_gpu_staged += usize::from(unsafe { library.cuda_event_query(event.raw)? });
+                                }
+                                ensure!(first_land_gpu_staged == SLOTS, "host land wait prevented depth-three GPU run-ahead");
+                            }
+                            // SAFETY: worker recorded THIS generation before acknowledging; slot not reused until consumed.
+                            unsafe { library.cuda_stream_wait_event(stream.raw, copied[slot].raw)?; }
+                        } else {
+                            for rank in 0..RANKS {
+                                // SAFETY: same host-release/per-rank SM pulls as today's Waves::land.
+                                unsafe {
+                                    library.cuda_stream_wait_value32(stream.raw, words.ptr(Counter::Arrived(rank)), sequence)?;
+                                    library.pull_frames(&[pulls.at(slot, rank).cast_const()],
+                                        &[((output.buffer.ptr as usize + slot * BYTES + rank * CHUNK) as *mut c_void, CHUNK as u64)], stream.raw)?;
+                                }
+                            }
+                            // SAFETY: the worker publishes all completed replies from the host.
+                            unsafe { library.cuda_stream_wait_value32(stream.raw, words.ptr(Counter::Landed), sequence)?; }
+                        }
+                        let target = CuteafdDeviceBuffer { ptr: (table.buffer.ptr as usize + slot * TABLES) as *mut c_void,
+                            bytes: TABLES, ..table.buffer };
+                        // SAFETY: actual Muse table-upload API after the landing dependency; reserved before waits.
+                        unsafe {
+                            library.copy_h2d_ordered(target, &vec![0x51; TABLES], stream.raw)?;
+                            library.cuda_stream_write_value32(stream.raw, words.ptr(Counter::Consumed(slot)),
+                                (sequence - 1) / SLOTS as u32 + 1)?;
+                        }
+                        if sequence < WAVES - SLOTS as u32 + 1 || pending.is_empty() { break; }
+                    }
+                }
+                Ok(())
+            })();
+            drop(send);
+            if engine.is_err() {
+                stop.store(true, Ordering::Release);
+                for rank in 0..RANKS { words.store(Counter::Arrived(rank), WAVES); }
+                words.store(Counter::Landed, WAVES);
+            }
+            let worker_result = worker.join().map_err(|_| anyhow::anyhow!("fixture worker panicked"))?;
+            engine?;
+            worker_result?;
+            Ok(())
+        });
+        // A failed worker must release every current/future SM wait before RAII stream drainage.
+        if result.is_err() {
+            for rank in 0..RANKS { words.store(Counter::Arrived(rank), WAVES); }
+            words.store(Counter::Landed, WAVES);
+        }
+        stream.drain()?;
+        copy.drain()?;
+        result?;
+        let elapsed = started.elapsed();
+        for slot in 0..SLOTS {
+            let mut actual = vec![0u8; BYTES];
+            let view = CuteafdDeviceBuffer { ptr: (output.buffer.ptr as usize + slot * BYTES) as *mut c_void,
+                bytes: BYTES, ..output.buffer };
+            library.copy_d2h(&mut actual, view)?;
+            ensure!(actual == host.bytes(), "fixture slot {slot} differs, CE={ce}");
+        }
+        eprintln!("reply_ce_ring ce={ce} waves={WAVES} depth={SLOTS} bytes={BYTES} arrival_delay_us=19000 rank_skew_us=750 elapsed_ms={:.3} wave_ms={:.3} host_land_wait_ms={:.3} max_ahead={max_ahead}",
+            elapsed.as_secs_f64() * 1e3, elapsed.as_secs_f64() * 1e3 / WAVES as f64, host_wait.as_secs_f64() * 1e3);
+        results.push(elapsed.as_secs_f64());
+    }
+    eprintln!("reply_ce_ring speedup={:.6}", results[0] / results[1]);
+    Ok(())
+}
+
 /// The "GPU": the control words, written by the engine side of the test as
 /// a stream would (staged after copies, consumed after a reduce) and read by
 /// the worker; the worker publishes `landed` here.
