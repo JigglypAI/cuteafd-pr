@@ -36,7 +36,7 @@ fn direct_family_concurrency_matches_logical_capacity_and_explicit_launcher_inpu
             for explicit in [None, Some(expected), Some(4)] {
                 let mut command = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
                 command.args([family, "--snapshot", "/direct-cli-missing-snapshot", "--native-lib", "/unused",
-                    "--coordinator-gpu-budget-gib", &gib.to_string()]);
+                    "--coordinator-gpu-budget-gib", &gib.to_string(), "--vision", "off", "--audio", "off"]);
                 if let Some(value) = explicit { command.args(["--max-sequences", &value.to_string()]); }
                 let output = command.env("RUST_LOG", "info")
                     .env_remove("COORDINATOR_GPU_BUDGET_GIB").output().unwrap();
