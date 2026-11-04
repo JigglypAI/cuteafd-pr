@@ -640,12 +640,34 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         include_shared: bool,
         stream: *mut c_void,
     ) -> Result<()> {
+        unsafe { self.launch_hidden_on(rows, include_shared, stream, None) }
+    }
+    /// Launch with the rows already in the transport's mapped request frame
+    /// instead of this execution's resident input buffer.
+    /// # Safety
+    /// Same contract as `launch`: `hidden` addresses `rows * row_bytes`
+    /// initialized wire rows on this execution's device, and the transport
+    /// retains that storage until the stream work that reads it completes.
+    pub(crate) unsafe fn launch_hidden(&mut self, rows: u32, hidden: *mut c_void) -> Result<()> {
+        unsafe { self.launch_hidden_on(rows, false, self.stream.raw, Some(hidden)) }
+    }
+    unsafe fn launch_hidden_on(
+        &mut self,
+        rows: u32,
+        include_shared: bool,
+        stream: *mut c_void,
+        hidden: Option<*mut c_void>,
+    ) -> Result<()> {
         ensure!(
             !include_shared || self.shared.is_some(),
             "shared output belongs on coordinator RTX"
         );
         let (kernel, slots, _) = self.execution_state(rows)?;
-        let args = V41ExpertLaunchArgs::new(kernel.info(), *slots, rows, stream)?;
+        let mut pointers = *slots;
+        if let Some(hidden) = hidden {
+            pointers[0] = hidden;
+        }
+        let args = V41ExpertLaunchArgs::new(kernel.info(), pointers, rows, stream)?;
         unsafe {
             kernel.launch(&args)?;
         }
@@ -909,10 +931,19 @@ impl ExpertExecution<'_, '_> {
                     std::slice::from_raw_parts(exchange.routing.as_ptr().cast::<u8>(), routes * 4));
             }
         }
+        let device = self.hidden.buffer.device_id;
+        let mut in_frame = None;
         let uploaded = (|| -> Result<()> { unsafe {
             // The unit's pace starts before its input copies (#762).
             self.pending.arrive(self.stream.raw)?;
             match hidden_view.filter(|view| view.bytes >= hidden_bytes) {
+                // The kernel reads the rows from its input pointer exactly as
+                // it would read the resident copy, and the transport retains
+                // the frame until this unit's fence, so an aligned same-device
+                // view is input storage: read it where it landed and skip the
+                // LPDDR-to-LPDDR copy pass.
+                Some(view) if view.ptr as usize % 16 == 0 && view.device_id == device =>
+                    in_frame = Some(view.ptr),
                 Some(view) => self.library.copy_d2d_async(self.hidden.buffer,
                     CuteafdDeviceBuffer { bytes: hidden_bytes, ..view }, hidden_bytes, self.stream.raw)?,
                 None => self.library.copy_h2d_async(self.hidden.buffer, request.hidden(), self.stream.raw)?,
@@ -935,7 +966,10 @@ impl ExpertExecution<'_, '_> {
         // SAFETY: this worker retains events, inputs and stream through the barrier below.
         unsafe {
             if let Some(timing) = &self.worker_timing { timing.record(0, self.stream.raw)?; }
-            self.launch(request.rows(), false)?;
+            match in_frame {
+                Some(hidden) => self.launch_hidden(request.rows(), hidden)?,
+                None => self.launch(request.rows(), false)?,
+            }
         }
         if let Some(timing) = &self.timing {
             unsafe {
