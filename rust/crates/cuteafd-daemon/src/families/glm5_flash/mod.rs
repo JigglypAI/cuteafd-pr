@@ -1038,6 +1038,19 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn native_local_default_preserves_automatic_pool_policy_and_explicit_pins() {
+        use cuteafd_loader::placement::Onboard;
+        let local = parse(&["--local-experts", "--split-device", "1"]);
+        assert_eq!(runtime_onboard(&local, true, 42, 42), Onboard::Auto);
+        assert_eq!(runtime_onboard(&local, false, 42, 42), Onboard::Layers(42));
+        for (option, expected) in [("auto", Onboard::Auto), ("all", Onboard::Layers(42)),
+            ("3", Onboard::Layers(3))] {
+            let args = parse(&["--local-experts", "--rtx-expert-layers", option]);
+            assert_eq!(runtime_onboard(&args, true, 42, 42), expected);
+        }
+    }
+
+    #[test]
     fn prefix_marks_default_to_the_arena_and_take_the_pool() {
         assert_eq!(parse(&[]).prefix_marks, prefix::PrefixMarks::Arena);
         assert_eq!(parse(&["--prefix-marks", "pool"]).prefix_marks, prefix::PrefixMarks::Pool);
@@ -1547,6 +1560,14 @@ fn parse_onboard(text: &str) -> std::result::Result<cuteafd_loader::placement::O
     text.parse()
 }
 
+fn runtime_onboard(args: &EngineArgs, native: bool, routed: usize, experts: usize)
+    -> cuteafd_loader::placement::Onboard {
+    args.rtx_expert_layers.map(|setting| setting.resolve(routed)).unwrap_or_else(|| {
+        if args.local_experts && !native { cuteafd_loader::placement::Onboard::Layers(experts) }
+        else { cuteafd_loader::placement::families::glm5_flash::default_onboard() }
+    })
+}
+
 fn runtime_resident_weights(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers: usize, ranks: usize,
     representation: cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation,
     embedding: crate::shared::token_io::EmbedPlacement, attention: engine::GlmfAttention)
@@ -1880,9 +1901,7 @@ impl Opened {
                 sequences, speculation, devices.len(), args.decode_rows, sms)
         } else { placement::GraphSet::budget(&vec![args.graph_budget_mib.map_or(1536 << 20, |mib| mib << 20); devices.len()]) };
         let routed = self.cfg.dense.iter().filter(|dense| !**dense).count();
-        let onboard = args.rtx_expert_layers.map(|setting| setting.resolve(routed))
-            .unwrap_or_else(|| if args.local_experts {
-                placement::Onboard::Layers(experts.len()) } else { admission::default_onboard() });
+        let onboard = runtime_onboard(args, self.native, routed, experts.len());
         let inputs = admission::GlmfInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false), automatic_context: automatic_context, attention, cfg: &self.cfg, layers, local_tp2_exl3: local_tp2_exl3 && core_charge.is_none(),
             gpus: inventory.gpus.iter().map(|gpu| (gpu.total_bytes, placement::Baseline::Measured {
                 free_bytes: gpu.free_bytes + prepared_draft.map_or(0, crate::shared::draft::remote::Prepared::sampled_bytes) })).collect(),
