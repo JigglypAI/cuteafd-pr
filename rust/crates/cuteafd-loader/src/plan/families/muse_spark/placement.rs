@@ -28,7 +28,7 @@ fn disable_media_component(report: &mut PlanReport, component: Component) {
 pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut PlanReport,
     opts: &mut crate::plan::layout::LayoutOptions, requested: ExpertPlacement) -> MemoryLayout {
     let limits = crate::plan::Family::prefill_limits(&super::MUSE_SPARK);
-    let prefill = match crate::plan::layout::resolve_prefill(report, opts, requested.spark_ranks(), limits) {
+    let prefill = match crate::plan::layout::resolve_prefill(input, report, opts, requested.spark_ranks(), limits) {
         Ok(prefill) => prefill,
         Err(error) => return crate::plan::layout::unsupported_prefill(report, error),
     };

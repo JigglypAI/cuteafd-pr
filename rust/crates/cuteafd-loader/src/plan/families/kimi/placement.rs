@@ -16,7 +16,7 @@ const LANES: u64 = 1;
 pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut PlanReport, opts: &mut crate::plan::layout::LayoutOptions,
     requested: ExpertPlacement) -> MemoryLayout {
     let limits = crate::plan::Family::prefill_limits(&super::KIMI_K3);
-    let prefill = match crate::plan::layout::resolve_prefill(report, opts, requested.spark_ranks(), limits) {
+    let prefill = match crate::plan::layout::resolve_prefill(input, report, opts, requested.spark_ranks(), limits) {
         Ok(prefill) => prefill,
         Err(error) => return crate::plan::layout::unsupported_prefill(report, error),
     };
@@ -84,8 +84,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     // Header-only diagnostics remain available without installed artifacts. An
     // explicit package or a serving image must supply a complete allocation ledger.
     let manifest = if path.is_file() {
-        match std::fs::read(path).map_err(anyhow::Error::from)
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).map_err(Into::into)) {
+        match input.manifest(path) {
             Ok(value) => Some(value),
             Err(error) => { refusal(report, format!("Kimi package inventory refused: {error:#}"),
                 "Supply the matching PROGRAMS.json through --workspace-manifest."); return memory; }
@@ -156,7 +155,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             }
             if opts.onboard != Some(OnboardSetting::Layers(0)) {
                 let package = allocation::expert_package_for_ranks(path, gpus)?;
-                tp2_workspace = [allocation::expert_workspace_for_ranks(&package, unit, gpus)?; 2];
+                tp2_workspace = [allocation::expert_workspace_for_ranks_with(&package, unit, gpus, |path| input.manifest(path))?; 2];
             }
             Ok(demands)
         })();

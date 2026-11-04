@@ -9,15 +9,15 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, _ => 0 };
     // MiMo's external chunk is independent of the shared live-slot arena.
     let external_span = options.prefill_span_rows.take().unwrap_or(16384);
-    let selected = super::resolve_prefill(report, options, spark_ranks,
+    let selected = super::resolve_prefill(input, report, options, spark_ranks,
         crate::serving_capacity::prefill_waves::PrefillLimits::default());
     options.prefill_span_rows = Some(external_span);
     if let Err(error) = selected { return unsupported_prefill(report, error); }
     report.prefill_span_rows = Some(external_span);
-    let shape = Shape::resolve(report, model, options,
+    let shape = Shape::resolve(input, report, model, options,
         ShapePolicy { context: ContextPolicy::Checkpoint, ..ShapePolicy::manifest_bounded() });
     let (concurrency, context, manifest) = (shape.concurrency, shape.context_tokens,
-        shape.manifest.as_ref());
+        shape.manifest.as_deref());
     let checkpoint = input.checkpoint();
     let ranks = if options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
     let mut notes = vec![format!("resolved context {context} tokens"), "MiMo attention placement heads".into()];

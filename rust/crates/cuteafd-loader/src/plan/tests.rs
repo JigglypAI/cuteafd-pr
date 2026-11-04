@@ -49,6 +49,50 @@ fn planner_timings_charge_metadata_once_and_preserve_reports() {
 }
 
 #[test]
+fn plan_manifest_cache_parses_each_path_once_across_candidates() {
+    let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let input = PlanInput::open(dir.path()).unwrap();
+    let options = wave_plan_options(dir.path(), 6);
+    let programs = options.layout.as_ref().unwrap().workspace_manifest.as_ref().unwrap().clone();
+    std::fs::write(&programs, json!({"capacities":{"prefill_rows":4096,"decode_rows":64}}).to_string()).unwrap();
+    for rows in [1024, 2048, 1024] {
+        let mut candidate = options.clone();
+        candidate.layout.as_mut().unwrap().prefill_rows = rows;
+        input.plan(&candidate).unwrap();
+    }
+    assert_eq!(input.manifests.parses.lock().unwrap().get(&programs), Some(&1));
+    let original = input.manifest(&programs).unwrap();
+    std::fs::write(&programs, "not JSON").unwrap();
+    assert!(std::sync::Arc::ptr_eq(&original, &input.manifest(&programs).unwrap()));
+
+    let package = dir.path().join("capacities");
+    for capacity in cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
+        .capacities(1024).unwrap() {
+        let path = package.join(format!("m{capacity}/v41_exl3.json"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, json!({"hidden":3584,"intermediate":3072,"experts":896,
+            "top_k":16,"capacity":capacity,"output_dtype":"fp32","input_format":"e4m3_k32",
+            "trellis_lut":{"bytes":32},"buffers":{"scratch":{"allocation":"scratch",
+                "bytes":capacity * 64,"dtype":"f32","zero_on_create":false}}}).to_string()).unwrap();
+    }
+    for rows in [256, 1024, 512, 1024] {
+        let cached = crate::families::kimi_k3::allocation::expert_workspace_for_ranks_with(
+            &package, rows, 1, |path| input.manifest(path)).unwrap();
+        let direct = crate::families::kimi_k3::allocation::expert_workspace_for_ranks(&package, rows, 1).unwrap();
+        assert_eq!(cached, direct);
+    }
+    assert!(input.manifests.parses.lock().unwrap().values().all(|&count| count == 1));
+    let fresh = PlanInput::open(dir.path()).unwrap();
+    assert!(fresh.manifest(&programs).is_err());
+    std::fs::write(&programs, "{}").unwrap();
+    assert!(fresh.manifest(&programs).is_err());
+    assert_eq!(fresh.manifests.parses.lock().unwrap().get(&programs), Some(&1));
+    let separate = dir.path().join("other.json");
+    std::fs::write(&separate, "{}").unwrap();
+    assert_eq!(*fresh.manifest(&separate).unwrap(), json!({}));
+}
+
+#[test]
 fn report_census_reuses_only_checkpoint_facts_across_options() {
     let mut tensors = mimo_flash_tensors();
     tensors.extend([
@@ -807,7 +851,8 @@ fn shared_prefill_public_plan_honors_a_real_manifest_unit_bound() {
 fn shared_prefill_family_estimates_match_runtime_and_pins_keep_hard_limits() {
     use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillError, PrefillOverrides};
     let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
-    let mut report = plan(dir.path(), &wave_plan_options(dir.path(), 6)).unwrap();
+    let input = PlanInput::open(dir.path()).unwrap();
+    let mut report = input.plan(&wave_plan_options(dir.path(), 6)).unwrap();
     let manifest = dir.path().join("bounded.json");
     std::fs::write(&manifest, r#"{"capacities":{"prefill_rows":1024}}"#).unwrap();
     for family in family::registry() {
@@ -821,7 +866,7 @@ fn shared_prefill_family_estimates_match_runtime_and_pins_keep_hard_limits() {
                 unit_rows: (unit != 0).then_some(unit), waves: (waves != 0).then_some(waves), span_rows: None,
                 reserve_rows: None,
             }).unwrap();
-            let shape = layout::resolve_prefill(&mut report, &mut options, 6, limits).unwrap();
+            let shape = layout::resolve_prefill(&input, &mut report, &mut options, 6, limits).unwrap();
             assert_eq!(shape, daemon, "planner/daemon prefill mismatch: {}", family.id());
             let expected = daemon.unit_rows;
             assert_eq!((options.prefill_rows, options.spark_capacity_rows), (expected, expected));
@@ -832,7 +877,7 @@ fn shared_prefill_family_estimates_match_runtime_and_pins_keep_hard_limits() {
         options.workspace_manifest = Some(manifest.clone());
         options.prefill_rows = 2048;
         options.prefill_lanes = 2;
-        let error = layout::resolve_prefill(&mut report, &mut options, 6, limits).unwrap_err();
+        let error = layout::resolve_prefill(&input, &mut report, &mut options, 6, limits).unwrap_err();
         assert!(matches!(error.downcast_ref::<PrefillError>(),
             Some(PrefillError::ExecutorCapacity { max_unit_rows: 1024, .. })), "{}: {error}", family.id());
     }
@@ -842,7 +887,8 @@ fn shared_prefill_family_estimates_match_runtime_and_pins_keep_hard_limits() {
 fn every_family_caps_the_shared_reserve_only_to_fit_a_fake_card() {
     use crate::serving_capacity::prefill_waves::{depth, unit_rows_in, RESERVE_ROWS, ROW_PAGE};
     let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
-    let template = plan(dir.path(), &wave_plan_options(dir.path(), 6)).unwrap();
+    let input = PlanInput::open(dir.path()).unwrap();
+    let template = input.plan(&wave_plan_options(dir.path(), 6)).unwrap();
     for family in family::registry() {
         let limits = family.prefill_limits();
         let waves = depth(6, limits);
@@ -856,7 +902,7 @@ fn every_family_caps_the_shared_reserve_only_to_fit_a_fake_card() {
                 let mut report = template.clone();
                 let mut options = wave_plan_options(dir.path(), 6).layout.unwrap();
                 options.prefill_reserve_rows = Some(reserve);
-                let shape = layout::resolve_prefill(&mut report, &mut options, 6, limits).unwrap();
+                let shape = layout::resolve_prefill(&input, &mut report, &mut options, 6, limits).unwrap();
                 assert_eq!(shape.waves, waves, "{}", family.id());
                 assert_eq!(options.spark_capacity_rows, shape.unit_rows);
                 Ok((1024 + shape.span_rows <= capacity).then_some((reserve, shape)))

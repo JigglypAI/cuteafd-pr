@@ -23,7 +23,7 @@ pub mod testing;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::{OnceLock, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, AtomicU64, Ordering}};
 use std::time::{Duration, Instant};
 
 pub use checkpoint::Checkpoint;
@@ -519,12 +519,40 @@ pub struct PlanInput {
     phases: PhaseCounters,
     /// The routed-expert catalog, read on first use.
     catalog: OnceLock<anyhow::Result<crate::OfficialV41Catalog>>,
+    manifests: ManifestCache,
     /// Source headers do not change when placement searches worlds or prefill shapes.
     native_spark_headers: OnceLock<Vec<OnceLock<Result<(), String>>>>,
     module_numerics: OnceLock<anyhow::Result<BTreeMap<String, checkpoint::ModuleNumerics>>>,
     modelopt: OnceLock<Result<Option<crate::formats::modelopt::ModelOpt>, crate::formats::modelopt::ModelOptError>>,
     model: OnceLock<Result<Box<dyn FamilyModel>, ConfigError>>,
     census: OnceLock<ReportCensus>,
+}
+
+/// Immutable installed artifacts are shared across every candidate of one input.
+#[derive(Default)]
+struct ManifestCache {
+    values: Mutex<BTreeMap<std::path::PathBuf, Result<Arc<serde_json::Value>, String>>>,
+    #[cfg(test)]
+    parses: Mutex<BTreeMap<std::path::PathBuf, usize>>,
+}
+
+impl ManifestCache {
+    fn read(&self, path: &Path) -> anyhow::Result<Arc<serde_json::Value>> {
+        use anyhow::Context;
+        let mut values = self.values.lock().expect("plan manifest cache poisoned");
+        match values.entry(path.to_path_buf()).or_insert_with(|| {
+            #[cfg(test)]
+            { *self.parses.lock().unwrap().entry(path.to_path_buf()).or_default() += 1; }
+            (|| -> anyhow::Result<_> {
+                let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+                Ok(Arc::new(serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parse {}", path.display()))?))
+            })().map_err(|error| format!("{error:#}"))
+        }) {
+            Ok(value) => Ok(Arc::clone(value)),
+            Err(error) => Err(anyhow::anyhow!("{error}")),
+        }
+    }
 }
 
 // Only checkpoint facts live here. Ownership, media policy and all admission
@@ -552,7 +580,7 @@ impl PlanInput {
     pub fn open(snapshot: &Path) -> anyhow::Result<Self> {
         let start = Instant::now();
         let (checkpoint, validation) = Checkpoint::open_with_header_validation(snapshot)?;
-        Ok(Self { checkpoint, header_validation: Some(validation), catalog: OnceLock::new(),
+        Ok(Self { checkpoint, header_validation: Some(validation), catalog: OnceLock::new(), manifests: ManifestCache::default(),
             open_time: start.elapsed(), open_reported: AtomicBool::new(false), phases: PhaseCounters::default(),
             native_spark_headers: OnceLock::new(), module_numerics: OnceLock::new(),
             modelopt: OnceLock::new(), model: OnceLock::new(), census: OnceLock::new() })
@@ -560,10 +588,14 @@ impl PlanInput {
 
     /// Any role's checkpoint (`Checkpoint::open`, `::inventory`, `::coordinator`).
     pub fn from_checkpoint(checkpoint: Checkpoint) -> Self {
-        Self { checkpoint, header_validation: None, catalog: OnceLock::new(),
+        Self { checkpoint, header_validation: None, catalog: OnceLock::new(), manifests: ManifestCache::default(),
             open_time: Duration::ZERO, open_reported: AtomicBool::new(false), phases: PhaseCounters::default(),
             native_spark_headers: OnceLock::new(), module_numerics: OnceLock::new(),
             modelopt: OnceLock::new(), model: OnceLock::new(), census: OnceLock::new() }
+    }
+
+    pub(crate) fn manifest(&self, path: &Path) -> anyhow::Result<Arc<serde_json::Value>> {
+        self.manifests.read(path)
     }
 
     pub fn checkpoint(&self) -> &Checkpoint {

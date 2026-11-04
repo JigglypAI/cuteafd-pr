@@ -21,8 +21,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     // Units, waves and span come from the shared prefill policy and the
     // descriptor (two units in flight, one target pass per slot).
     let limits = crate::plan::Family::prefill_limits(&crate::plan::families::deepseek::DEEPSEEK_V41);
-    let prefill = super::resolve_prefill(report, options, report.placement.spark_ranks(), limits)?;
-    let mut shape = Shape::resolve(report, model, options, ShapePolicy {
+    let prefill = super::resolve_prefill(input, report, options, report.placement.spark_ranks(), limits)?;
+    let mut shape = Shape::resolve(input, report, model, options, ShapePolicy {
         context: ContextPolicy::Checkpoint, prefill_rows: Some(prefill.unit_rows), all_native_stages: false,
     });
     shape.prefill_rows = prefill.unit_rows;

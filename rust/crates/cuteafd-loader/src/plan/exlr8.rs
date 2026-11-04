@@ -139,7 +139,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     report.spec = Some(model.spec().clone());
     report.cache_requirements = crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config)?;
     if family.id() == "glm5" {
-        super::layout::resolve_prefill(&mut report, &mut resolved_layout, world, family.prefill_limits())?;
+        super::layout::resolve_prefill(input, &mut report, &mut resolved_layout, world, family.prefill_limits())?;
     }
     let catalog_timer = super::PhaseTimer::new(&input.phases.catalog, &[]);
     let metadata = residency::MetadataInput::open(snapshot, selected)?;

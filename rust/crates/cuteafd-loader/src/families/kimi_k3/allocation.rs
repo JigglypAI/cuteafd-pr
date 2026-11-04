@@ -403,20 +403,27 @@ pub fn expert_workspace(package: &std::path::Path, rows: usize) -> Result<u64> {
 }
 
 pub fn expert_workspace_for_ranks(package: &std::path::Path, rows: usize, ranks: usize) -> Result<u64> {
+    expert_workspace_for_ranks_with(package, rows, ranks, |path| {
+        Ok(std::sync::Arc::new(serde_json::from_slice(&std::fs::read(path)
+            .with_context(|| format!("read {}", path.display()))?)?))
+    })
+}
+
+pub(crate) fn expert_workspace_for_ranks_with(package: &std::path::Path, rows: usize, ranks: usize,
+    read: impl Fn(&std::path::Path) -> Result<std::sync::Arc<serde_json::Value>>) -> Result<u64> {
     ensure!(matches!(ranks, 1 | 2), "Kimi expert workspace physical rank count");
     let capacities = cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
         .capacities(rows)?;
-    let manifests = capacities.into_iter().map(|capacity| -> Result<serde_json::Value> {
+    let manifests = capacities.into_iter().map(|capacity| -> Result<std::sync::Arc<serde_json::Value>> {
         let path = package.join(format!("m{capacity}/v41_exl3.json"));
-        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)
-            .with_context(|| format!("read {}", path.display()))?)?;
+        let manifest = read(&path)?;
         ensure!(manifest["hidden"] == 3584 && manifest["intermediate"] == 3072 / ranks
             && manifest["experts"] == 896 && manifest["top_k"] == 16
             && manifest["capacity"] == capacity && manifest["output_dtype"] == "fp32",
             "Kimi expert workspace geometry/capacity mismatch");
         Ok(manifest)
     }).collect::<Result<Vec<_>>>()?;
-    Ok(crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)? + (rows * 3584 * 4) as u64)
+    Ok(crate::serving_capacity::exl3_workspace_bytes_from_refs(manifests.iter().map(|m| m.as_ref()), true, Exl3Epilogue::Sum)? + (rows * 3584 * 4) as u64)
 }
 
 pub fn expert_package(manifest: &std::path::Path) -> Result<std::path::PathBuf> {
