@@ -3447,7 +3447,7 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
         let geometry = glm_flash_rank_cache_geometry_rows(&cfg, 2, 1, GlmfIndexCache::Keys, 4, rows).unwrap();
         let rank = &geometry.ranks[0];
         assert_eq!(item(report, "state").map(|(_, bytes, _)| bytes), Some(rank.fixed_state_bytes
-            + rank.active_state_per_sequence_bytes * 4 + rank.speculative_replay_bytes));
+            + rank.active_state_per_sequence_bytes * 8 + rank.speculative_replay_bytes));
     }
     // 128 rows: +64,606,464 B of decode workspace, the wide selector, one KDA layer's 64 more record rows.
     let steps = |report| item(report, "steps").unwrap().1;
@@ -3815,8 +3815,8 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
     // Normalize a clone for current admission; the raw historical value only pins provenance.
     for report in expected.as_object_mut().unwrap().values_mut() {
         report["cache_requirements"]["checkpoint_max_context_tokens"] = json!(1_048_576);
-        report["cache_requirements"]["concurrency"] = json!(4);
-        report["cache_requirements"]["state_slots"] = json!(4);
+        report["cache_requirements"]["concurrency"] = json!(16);
+        report["cache_requirements"]["state_slots"] = json!(16);
     }
     // The shared solver cannot admit this historical A_log-only checkpoint.
     // Preserve the old snapshot/hash as provenance, but require a named refusal

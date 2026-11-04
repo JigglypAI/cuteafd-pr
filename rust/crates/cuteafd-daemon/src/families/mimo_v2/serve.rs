@@ -1560,7 +1560,7 @@ mod port_tests {
     fn port_knobs_default_off_and_sixteen_slots_are_configurable() {
         let default = Cli::parse_from(["serve", "--snapshot", "/model", "--native-lib", "/lib"]);
         let args = default.serve;
-        assert_eq!(args.max_sequences, 4);
+        assert_eq!(args.max_sequences, cuteafd_core::serving_capacity::LARGE_CARD_DEFAULT_CONCURRENCY as usize);
         assert_eq!(args.http_queue_depth, None);
         assert_eq!(args.http_queue_wait_ms, 25_000);
         assert!(!args.prefix.mimo_prefix_draft && !args.mimo_snapshot_wait);

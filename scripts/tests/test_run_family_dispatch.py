@@ -1327,8 +1327,8 @@ def test_shared_concurrency_default_reaches_plan_and_serve(tmp_path, family, bud
                  "SPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n")
     if override:
         keys += f"CONCURRENCY={4 if override == 'config' else 7}\n"
-    result = _family_launch_result(tmp_path, config, model, keys, gpu_total_mib=total,
-                                   gpu_free_mib=total - 1024,
+    result = _family_launch_result(tmp_path, config, model, keys, physical_gpus=tuple(range(rtx_gpus)),
+                                   gpu_total_mib=total, gpu_free_mib=total - 1024,
                                    extra_args=("--set", "CONCURRENCY=4") if override == "set" else ())
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
