@@ -1411,12 +1411,10 @@ impl Opened {
             let actual = cuteafd_ffi::memory_ledger::snapshot()
                 .by_owner(cuteafd_ffi::memory_ledger::Space::Device, args.device)
                 .get(label.as_str()).copied().unwrap_or(0);
-            let codec_bytes = cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false)
-                .combined_scratch_bytes(self.cfg.hidden, capacity as usize, waves, endpoint != 0, false)
-                .context("MiMo reply codec scratch overflow")?;
-            let planned = cuteafd_loader::serving_capacity::prefill_return_bytes(
-                waves as u64, capacity as u64, peers.len() as u64, self.cfg.hidden as u64)
-                .checked_add(codec_bytes as u64).context("MiMo return allocation overflow")?;
+            let format = if endpoint == 0 { cuteafd_core::SparkReplyFormat::Bf16 }
+                else { cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false) };
+            let planned = cuteafd_loader::serving_capacity::prefill_return_bytes_with_format(
+                waves as u64, capacity as u64, peers.len() as u64, self.cfg.hidden as u64, format)?;
             anyhow::ensure!(actual as u64 == planned,
                 "MiMo {label}: allocated {actual} device bytes != planned {planned}");
             Ok(link)

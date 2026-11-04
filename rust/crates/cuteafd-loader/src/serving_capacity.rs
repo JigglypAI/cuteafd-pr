@@ -15,7 +15,7 @@ mod deepseek;
 pub mod step5;
 mod spark_intake;
 pub mod prefill_waves;
-pub use spark_intake::{prefill_return_bytes, spark_intake_bytes, PrefillShape};
+pub use spark_intake::{prefill_return_bytes, prefill_return_bytes_with_format, spark_intake_bytes, PrefillShape};
 mod exl3_workspace;
 pub use exl3_workspace::{exl3_workspace_bytes, Exl3Epilogue};
 pub mod glm_graphs;

@@ -1709,8 +1709,7 @@ fn native_post_selects_reply_wire_and_preserves_bf16_slot_geometry() -> Result<(
         ExpertV2SourceKind::{Decode, MtpVerify, Prefill},
         EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32,
         EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3};
-    let (hidden, ranks, slots, slot_rows) = (32usize, 3usize, 2usize, 130usize);
-    let row_bytes = hidden * 2;
+    let (ranks, slots, slot_rows) = (3usize, 2usize, 130usize);
     let cases = [
         (vec![(65, Prefill)], true),
         (vec![(64, Prefill)], false),
@@ -1722,6 +1721,11 @@ fn native_post_selects_reply_wire_and_preserves_bf16_slot_geometry() -> Result<(
         (vec![(65, Decode)], false),
         (vec![(65, MtpVerify)], false),
     ];
+    for (family, hidden) in [("v41", 5120usize), ("v4-flash", 4096), ("v4-pro", 7168),
+        ("glm53", 6144), ("glm-flash", 4096), ("glm-flash-exlr8", 4096),
+        ("mimo-flash", 4096), ("mimo-pro", 6144), ("kimi", 3584),
+        ("qwen", 2560), ("step5", 4096), ("ml4", 6144)] {
+    let row_bytes = hidden * 2;
     for selected in [Bf16, Fp8, Nvfp4] {
         for landing in [0, (1 << ranks) - 1] {
             let (mut backend, _control, _pulls) = ring_backend(Ring::new(ranks, slots, slot_rows, row_bytes), slots);
@@ -1757,7 +1761,7 @@ fn native_post_selects_reply_wire_and_preserves_bf16_slot_geometry() -> Result<(
                     Fp8 => (1, EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32),
                     Nvfp4 => (2, EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3),
                 };
-                assert_eq!(posted.header.flags, flags, "{selected} {sources:?}");
+                assert_eq!(posted.header.flags, flags, "{family} {selected} {sources:?}");
                 assert_eq!(backend.words.load(Counter::ReplyFormat(slot)), mode);
                 assert_eq!(backend.payload_bytes(slot, rows * row_bytes), payload_bytes);
                 if actual == Bf16 { assert_eq!(encoded, &before, "fallback/default preserves the request bytes"); }
@@ -1777,7 +1781,10 @@ fn native_post_selects_reply_wire_and_preserves_bf16_slot_geometry() -> Result<(
                     assert!(backend.release_consumed());
                 }
             }
+            assert_eq!(backend.compressed_prefill_rows,
+                if selected == Bf16 { 0 } else { 195 }, "{family} {selected}");
         }
+    }
     }
     Ok(())
 }

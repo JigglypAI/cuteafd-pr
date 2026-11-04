@@ -256,7 +256,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
     let mut runtime = Vec::new();
     for rank in 0..ranks {
         let mut additional = Vec::new();
-        additional.extend(transport_reservations(&cfg, ranks, rank, rows as usize, lanes, spark_ranks)?);
+        additional.extend(transport_reservations(&cfg, ranks, rank, rows as usize, lanes, spark_ranks, options.resolved_spark_reply_format(false))?);
         if rank == 0 {
             additional.extend(sampling_reservations(cfg.vocab_size)?);
             if let Some(draft) = &draft {
@@ -488,7 +488,7 @@ mod tests {
                         let slots = cuteafd_core::prefix::mark_slots_with_host(4, opts.prefix_entries("mimo_v2"), mark_bytes, opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0));
                         let graph = decode_graph::MimoDecodeGraphPlan::new(cfg.layers, ranks, 64, graphs).unwrap();
                         let runtime = (0..ranks).map(|rank| {
-                            let mut additional = transport_reservations(&cfg, ranks, rank, 4096, lanes, 4).unwrap();
+                            let mut additional = transport_reservations(&cfg, ranks, rank, 4096, lanes, 4, cuteafd_core::SparkReplyFormat::Bf16).unwrap();
                             if rank == 0 { additional.extend(sampling_reservations(cfg.vocab_size).unwrap()); }
                             additional.extend(graph.reservations(rank, decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES,
                                 decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES).unwrap());

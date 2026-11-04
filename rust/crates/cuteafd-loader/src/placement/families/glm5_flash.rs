@@ -125,6 +125,7 @@ pub fn context_buffers(cfg: &GlmNextConfig, extent: u64, rows: u64, lanes: u64,
 
 #[derive(Debug, Clone)]
 pub struct GlmfInputs<'a> {
+    pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     /// True only when the operator left context automatic.
     pub automatic_context: bool,
     pub attention: GlmfAttention,
@@ -385,8 +386,9 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
                         - cache::glmf_selector_bytes(cache::GLMF_DECODE_ROWS, i.cfg.vocab_size as u64), Basis::Formula));
             }
             fixed.push(GlmfBufferDemand::new(GlmfComponent::SparkExperts, gpu, Category::Transport, "Spark intake",
-                cache::prefill_return_bytes(working.prefill_lanes, i.prefill_rows,
-                    working.spark_ranks as u64, i.cfg.hidden as u64), Basis::Formula));
+                cache::prefill_return_bytes_with_format(working.prefill_lanes, i.prefill_rows,
+                    working.spark_ranks as u64, i.cfg.hidden as u64, i.spark_reply_format)
+                    .map_err(|_| PlacementError::Inventory("GLM Flash Spark reply width or allocation overflow"))?, Basis::Formula));
             fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Workspace, "probe prefill logits", i.full_prefill_logits, Basis::Formula));
         }
     }
@@ -699,7 +701,7 @@ mod tests {
 
     fn inputs(cfg: &GlmNextConfig, ranks: usize, capacity: u64) -> GlmfInputs<'_> {
         let context = ArchContext::coordinator(capacity, None).context_bytes;
-        GlmfInputs { automatic_context: false,
+        GlmfInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
             attention: Default::default(), cfg, layers: cfg.layers,
             gpus: (0..ranks).map(|rank| (capacity, Baseline::Planned {
                 context_bytes: context + loaded_code("glmf", "exl3", ranks == 2, rank as u8).unwrap().bytes,
@@ -913,13 +915,22 @@ mod tests {
     #[test]
     fn spark_prefill_slots_share_one_padded_backing_per_rank() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
-        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
-        input.onboard = Onboard::Layers(1);
-        input.prefill_rows = 80;
-        let request = request(&input).unwrap();
-        let intake = request.fixed.iter().filter(|d| d.group == "Spark intake")
-            .map(|d| d.bytes).sum::<u64>();
-        assert_eq!(intake, 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(input.prefill_lanes * 80 * cfg.hidden as u64 * 2).unwrap());
+        for gpus in [1, 2] {
+            let mut input = inputs(&cfg, gpus, inventory::PRO_TOTAL_BYTES);
+            input.onboard = Onboard::Layers(1);
+            input.prefill_rows = 80;
+            for (format, row_bytes) in [(cuteafd_core::SparkReplyFormat::Bf16, 0),
+                (cuteafd_core::SparkReplyFormat::Fp8, cfg.hidden + cfg.hidden / 32),
+                (cuteafd_core::SparkReplyFormat::Nvfp4, cfg.hidden / 2 + cfg.hidden / 16)] {
+                input.spark_reply_format = format;
+                let request = request(&input).unwrap();
+                let intake = request.fixed.iter().filter(|d| d.group == "Spark intake")
+                    .map(|d| d.bytes).sum::<u64>();
+                let rows = input.prefill_lanes * input.prefill_rows;
+                assert_eq!(intake, 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
+                    rows * cfg.hidden as u64 * 2).unwrap() + rows * row_bytes as u64);
+            }
+        }
     }
 
     #[test]

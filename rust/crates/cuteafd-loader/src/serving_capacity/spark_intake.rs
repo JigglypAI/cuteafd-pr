@@ -13,6 +13,22 @@ pub fn prefill_return_bytes(waves: u64, unit_rows: u64, ranks: u64, hidden: u64)
     spark_intake_bytes(1, ranks, waves * unit_rows, hidden)
 }
 
+/// BF16 fallback planes plus one compressed staging reserve per physical
+/// prefill link, independent of the number of replying ranks.
+pub fn prefill_return_bytes_with_format(waves: u64, unit_rows: u64, ranks: u64,
+    hidden: u64, format: cuteafd_core::SparkReplyFormat) -> anyhow::Result<u64> {
+    use anyhow::Context;
+    if ranks == 0 { return Ok(0); }
+    let rows = waves.checked_mul(unit_rows).context("Spark return rows overflow")?;
+    let logical = rows.checked_mul(hidden).and_then(|n| n.checked_mul(2))
+        .context("Spark return plane overflow")?;
+    let planes = spark_intake_allocation_bytes(logical)?
+        .checked_mul(ranks).context("Spark return planes overflow")?;
+    let scratch = format.combined_scratch_bytes(usize::try_from(hidden)?, usize::try_from(unit_rows)?,
+        usize::try_from(waves)?, true, false).context("unsupported Spark combined reply width or scratch overflow")?;
+    planes.checked_add(u64::try_from(scratch)?).context("Spark return codec allocation overflow")
+}
+
 /// Prefill row units and how many are in flight on one lane and transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefillShape {
@@ -62,6 +78,31 @@ mod tests {
     fn two_2048_row_return_slots_cost_one_4096_row_intake() {
         assert_eq!(prefill_return_bytes(2, 2048, 6, 3584), spark_intake_bytes(1, 6, 4096, 3584));
         assert_eq!(PrefillShape { unit_rows: 2048, waves: 2 }.slot_rows(), 4096);
+    }
+
+    #[test]
+    fn combined_reply_charge_retains_bf16_planes_and_one_codec_reserve() -> anyhow::Result<()> {
+        use cuteafd_core::SparkReplyFormat::{Bf16, Fp8, Nvfp4};
+        for hidden in [2560, 3584, 4096, 5120, 6144, 7168] {
+            for (waves, rows) in [(1, 64), (2, 4096), (3, 2752), (4, 2048)] {
+                for ranks in [1, 2, 4, 6, 8] {
+                    let planes = ranks * spark_intake_allocation_bytes(waves * rows * hidden * 2)?;
+                    for (format, row_bytes) in [(Bf16, 0), (Fp8, hidden + hidden / 32),
+                        (Nvfp4, hidden / 2 + hidden / 16)] {
+                        assert_eq!(prefill_return_bytes_with_format(waves, rows, ranks, hidden, format)?,
+                            planes + waves * rows * row_bytes);
+                    }
+                }
+            }
+        }
+        assert_eq!(prefill_return_bytes_with_format(u64::MAX, u64::MAX, 0, 17, Fp8)?, 0);
+        for format in [Fp8, Nvfp4] {
+            assert!(prefill_return_bytes_with_format(1, 64, 1, 17, format).is_err());
+            assert!(prefill_return_bytes_with_format(u64::MAX, 2, 1, 4096, format).is_err());
+            assert!(prefill_return_bytes_with_format(1, u64::MAX, 1, 4096, format).is_err());
+            assert!(prefill_return_bytes_with_format(1, 64, u64::MAX, 4096, format).is_err());
+        }
+        Ok(())
     }
 
     #[test]
