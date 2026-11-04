@@ -36,7 +36,7 @@ def test_switch_files_keep_updated_baseline_and_separate_dscp_only():
     setup = (ROOT / 'scripts/fabric/mikrotik-crs8xx-roce-lossless.rsc').read_text()
     rollback = (ROOT / 'scripts/fabric/mikrotik-crs8xx-roce-rollback.rsc').read_text()
     for text in [setup, rollback]:
-        assert 'ecn=yes' not in text and 'wred=yes' not in text
+        assert 'wred=yes' not in text
         lines = text.splitlines()
         for index, line in enumerate(lines):
             if line and not line.startswith('#'):
@@ -48,6 +48,9 @@ def test_switch_files_keep_updated_baseline_and_separate_dscp_only():
     assert 'map ip add dscp=26 profile=cuteafd-roce' in setup
     assert 'map ip add dscp=48 profile=cuteafd-cnp' in setup
     assert 'traffic-class=3 rx=yes tx=yes' in setup
+    assert setup.count('ecn=yes') == 1
+    assert 'queue set [find traffic-class=3] ecn=yes wred=no' in setup
+    assert 'ecn=yes' not in rollback
     assert 'set 1 ecn=no schedule=low-priority-group weight=2 wred=no' in rollback
     assert rollback.count('!egress-rate-queue3') == 33
     assert rollback.count('pfc=disabled') == 32

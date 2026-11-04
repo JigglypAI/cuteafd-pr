@@ -194,7 +194,8 @@ packets. It reduces retransmits and their goodput cost, not numerical errors:
 Consider it when retransmits exceed about 0.5% of packets under sustained load
 (at least 2 GB moved per measured port). Go-back-N resends recover the data but
 may lower throughput. Check cabling and link errors too. Pause counts alone do
-not establish a pause storm; zero ECN marking is normal for Not-ECT/PFC traffic.
+not establish a pause storm. With switch ECN on, ECN marks and CNPs under load are
+normal congestion signalling, not errors; judge health by retransmits and sequence errors.
 See [#759](https://github.com/tpurtell/cuteafd/pull/759) for this cluster's
 DSCP 26 / priority 3 switch and NIC configuration and measured evidence.
 
@@ -210,9 +211,9 @@ cannot freeze the engine's stdout.
 
 ## MikroTik CRS8xx lossless RoCE
 
-**Prepared, not applied. Do not merge until TJ applies and measures.** Stop all
-serving before changing the fabric. The baseline is TJ's 2026-10-25 post-06:54Z
-configuration: all eight queues have `ecn=no wred=no`. Never turn either on.
+Applied on this cluster (PFC since 2026-10-25, TC3 ECN since 2026-11-04). Stop all
+serving before changing the fabric. The rollback baseline is TJ's 2026-10-25
+post-06:54Z configuration: all eight queues have `ecn=no wred=no`. Never turn on WRED.
 The rollback was generated from a fresh read-only verbose QoS export, not
 inferred defaults. It restores every exported field and removes only our named
 profiles/maps. Do not import over unrelated subsequent QoS changes.
@@ -228,9 +229,20 @@ observed wire speeds (required to interpret received pause time); check them
 again before import. RouterOS >=7.23 automatically sizes lossless/shared
 buffers; do not copy legacy `use-shared-buffers` settings into this export.
 
-This is **PFC-only**, not a DCQCN experiment. The manual's ECN example is for
-ECT-capable traffic; byte104 has ECN bits00 (Not-ECT). ECN/WRED stay off, including
-TC3. CNP classification does not turn on ECN or change NIC congestion controls.
+TC3 also runs **ECN** (`ecn=yes wred=no`). The engine's GRH byte 104 carries ECN
+bits 00, but mlx5 DCQCN (on by default) sends RoCE data as ECT, so the switch marks
+congested TC3 packets, receivers send CNPs (DSCP 48, strict TC6) and senders back
+off before PFC has to pause. SparkNest's class 2 (`pfc-2-3` lossless) runs ECN on
+queue 2 the same way; its policy belongs to SparkNest. WRED stays off everywhere.
+
+Muse max card A/B (2× RTX + 6 Sparks, sealed slot, one launch per arm, 2026-11-04),
+q3 ECN off → on: readiness 57.23 → 55.49 s, 8K prefill 3,314 → 3,292 tok/s,
+C1 54.35 → 51.93, C4 87.34 → 90.76, C8 114.47 → 106.93, C16 129.22 → 130.71 tok/s
+(decode deltas inside the card's single-launch spread; C1 ranged 48.9–55.9 within the
+off arm), KL/top-1 identical, 0 retransmits both arms. Off: every ECN/CNP counter 0.
+On: raptor marked 101.9M packets and sent 2.38M CNPs (87% in the many-to-one
+shared-prefix phase), Sparks handled ~400K CNPs each, 0 ignored CNPs, 0 slow
+restarts, 0 sequence errors.
 PFC prevents avoidable congestion loss only when every hop and endpoint agrees;
 it adds no sink capacity and can introduce head-of-line blocking or pause storms.
 No losslessness or speedup is claimed before counters and warmed runs prove it.
@@ -368,7 +380,8 @@ stop bars from [#733](https://github.com/tpurtell/cuteafd/pull/733).
 ### Roll back (TJ only)
 
 Stop serving. Import the reviewed switch rollback, then restore each host's
-captured NIC state. It deliberately leaves every switch queue's ECN/WRED off.
+captured NIC state. It restores the captured baseline, so every switch queue's
+ECN/WRED ends up off (including SparkNest's queue 2; tell SparkNest first).
 
 ```bash
 ssh SWITCH_ADMIN@switch.200gb '/import file-name=mikrotik-crs8xx-roce-rollback.rsc verbose=yes'
