@@ -353,7 +353,7 @@ impl<'a> Admission<'a> {
         load: &crate::shared::experts::rtx::dense::DenseLoad<'a>, streams: [(i32, *mut std::ffi::c_void); 2])
         -> Result<([GlobalWeights<'a>; 2], Vec<[LayerWeights<'a>; 2]>)> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-        let records = super::weights::records::KimiRecords { checkpoint, cfg: &self.cfg, core: &self.core, dense: load, streams };
+        let records = super::weights::records::KimiRecords { checkpoint, cfg: &self.cfg, core: &self.core, dense: load, streams: streams.to_vec() };
         let global = [records.global(devices[0], &self.global_layouts[0])?, records.global(devices[1], &self.global_layouts[1])?];
         let layers = (0..self.cfg.layers).map(|layer| records.layer(devices, layer, &self.layouts[layer]))
             .collect::<Result<Vec<_>>>()?;

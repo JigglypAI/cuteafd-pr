@@ -1843,7 +1843,7 @@ mod tests {
                 assert_eq!(whole.extents(), [rows * 4, rows.min(64) * cfg.vocab_size * 4,
                     if inventory.projections.is_empty() { VOCABULARY_HEAD_WORKSPACE } else { 0 }]);
                 assert_eq!(whole.demand(0)?.gpu, 0);
-                assert_eq!(whole.demand(0)?.bytes, pair.iter().map(|io| io.demand(0).unwrap().bytes).sum());
+                assert_eq!(whole.demand(0)?.bytes, pair.iter().map(|io| io.demand(0).unwrap().bytes).sum::<u64>());
             }
         }
         for (rank, ranks) in [(1, 1), (0, 0), (0, 3)] {
