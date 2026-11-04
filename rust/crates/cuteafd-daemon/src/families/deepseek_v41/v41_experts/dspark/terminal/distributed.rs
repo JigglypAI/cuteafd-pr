@@ -118,8 +118,10 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
             && !crate::shared::decode_graph::census::eager("dspark") {
             let graph = device.run(|| unsafe {
                 device.library.cuda_graph_begin_capture(terminal.stream.raw)?;
-                let queued = if sampling { terminal.enqueue_sampling_on(requests, terminal.stream.raw) }
-                    else { terminal.enqueue_normalize_on(requests, terminal.stream.raw) };
+                // Capture records commands only; runtime begin/enqueue retain
+                // sampling validation before any execution or graph replay.
+                let queued = if sampling { terminal.enqueue_sampling_geometry(requests, terminal.stream.raw) }
+                    else { terminal.enqueue_normalize_geometry(requests, terminal.stream.raw) };
                 let captured = device.library.cuda_graph_end_capture(terminal.stream.raw);
                 match (queued, captured) {
                     (Ok(()), Ok(graph)) => Ok(graph),
@@ -251,6 +253,12 @@ mod tests {
         let mut lanes = [DistributedDsparkTerminal::new(devices, &weights, [&shards[0], &shards[1]], 16, budgets)?,
             DistributedDsparkTerminal::new(devices, &weights, [&shards[0], &shards[1]], 16, budgets)?];
         let mut reference = devices[1].own(|| weights.terminal(&full, 16, DsparkTerminal::device_bytes_with_width(16, width)?))?;
+        lanes[0].capture_startup(16, width)?;
+        assert!(lanes[0].terminal.sampling_requests.is_none());
+        for count in [0, 1, 17] {
+            assert!(unsafe { lanes[0].begin(count) }.is_err());
+            assert!(lanes[0].pending.is_none());
+        }
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         let download = |buffers: [CuteafdDeviceBuffer; 3]| -> Result<Vec<Vec<u8>>> {
             buffers.into_iter().map(|buffer| {
