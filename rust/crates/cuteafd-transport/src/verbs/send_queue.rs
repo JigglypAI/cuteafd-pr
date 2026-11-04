@@ -146,7 +146,7 @@ fn landed_payload_bytes(request: &ExpertProtocolV2Request) -> Result<usize> {
     let hidden = request.header.hidden_dim as usize;
     let row_bytes = if request.nvfp4_e2m1_fp8_e4m3_response_enabled() {
         ExpertV2Dtype::Nvfp4E2m1Fp8E4m3.row_bytes(hidden)?
-    } else if request.fp8_e4m3_row_scaled_response_enabled() {
+    } else if request.header.flags & crate::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32 != 0 {
         ExpertV2Dtype::Fp8E4m3Ue8m0K32.row_bytes(hidden)?
     } else {
         // Packed ingress may still produce BF16 output without reply compression.
