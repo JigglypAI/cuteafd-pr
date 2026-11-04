@@ -61,6 +61,22 @@ pub fn manifest_context(manifest: &serde_json::Value) -> Option<GlmfAttention> {
         .map(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0)))
 }
 
+/// Context admission selects the same partial program as runtime, not the largest exported variant.
+pub fn manifest_context_for_plan(manifest: &serde_json::Value, heads: usize, sms: usize,
+    plan: &cuteafd_core::coordinator_programs::AttentionReductionPlan) -> anyhow::Result<Option<GlmfAttention>> {
+    let Some(mut context) = manifest_context(manifest) else { return Ok(None) };
+    let mut scratch = 0;
+    for begin in [0, heads / 2] {
+        let name = cuteafd_core::coordinator_programs::attention_partial_program(
+            manifest, "glmf", begin, 64, sms, plan)?;
+        let bytes = crate::serving_capacity::glmf_manifest_scratch(manifest)(&name)
+            .ok_or_else(|| anyhow::anyhow!("selected Flash context partial missing: {name}"))?;
+        scratch = scratch.max(bytes);
+    }
+    context.partial_scratch = scratch;
+    Ok(Some(context))
+}
+
 /// The MLA placement a GLM Flash engine on `gpus` GPUs serves: `requested` (None: auto), checked
 /// against the build's `context` programs. Auto is `context` on two GPUs, as `ExecutorModes::check_attention`
 /// records for this family; without the context programs that placement cannot run, so a chosen
@@ -995,7 +1011,8 @@ mod tests {
         let (slots, batch) = crate::families::glm5::draft_representation::flash_serving_draft_limits(
             planned.sequences as usize, options.glm_draft_sequences() as usize, None);
         let config = draft_config();
-        let (bytes, scratch) = drafter_inventory(&config, slots, batch, &[188; 2],
+        let capacity = crate::families::glm5::draft_representation::flash_draft_capacity(&config, slots, batch).unwrap();
+        let (bytes, scratch) = drafter_inventory(&config, capacity.context_slots, capacity.max_batch_sequences, &[188; 2],
             crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only,
             2, options.draft_kv_cache).unwrap();
         planned.drafter_bytes = bytes;
