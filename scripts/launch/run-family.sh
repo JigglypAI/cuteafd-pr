@@ -1138,6 +1138,7 @@ gpu_selection="$(python3 "$repo_root/scripts/lib/coordinator-gpus.py" select \
   --expert-format "$expert_format" \
   "${compact_selection_args[@]}" ${RELEASE_RECLAIM_ARGS[@]+"${RELEASE_RECLAIM_ARGS[@]}"})" || exit 2
 RELEASE_RTX_GPUS="$(jq -r '.count' <<<"$gpu_selection")"
+release_resolve_tp2_dspark_experts deepseek_v41 "$RELEASE_RTX_GPUS"
 ((SPARK_COUNT != 0 || RELEASE_RTX_GPUS == 2)) || release_die "SPARK_COUNT=0 requires two selected RTX GPUs"
 if release_tp2_enabled; then
   ((RELEASE_RTX_GPUS == 2)) || release_die "TP2 options require two selected RTX GPUs; use --rtx-gpus 2"
@@ -1701,6 +1702,8 @@ echo "  context/output: $MAX_CONTEXT_TOKENS/$MAX_OUTPUT_TOKENS; dSpark: $SPECULA
 # The family: run.sh passes --family; a direct call reads the checkpoint's own config.json.
 detected_family="$(release_config_family "$config")"
 [[ -n "$family" ]] || family="$detected_family"
+[[ "$family" == deepseek_v41 || "$(get TP2_DSPARK_EXPERTS off)" != on ]] ||
+  release_die "TP2_DSPARK_EXPERTS requires V4.1, two selected RTX GPUs and dSpark"
 if [[ "$family" == deepseek_v41 ]]; then
   [[ "$detected_family" == deepseek_v41 ]] ||
     release_die "--family deepseek_v41 does not match the checkpoint ($detected_family)"

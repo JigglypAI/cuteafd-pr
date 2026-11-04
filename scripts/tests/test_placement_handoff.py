@@ -75,7 +75,8 @@ dspark_draft_limit=
 TP2_ATTENTION=off
 TP2_QUERY_PROJECTION=off
 TP2_OUTPUT_PROJECTION=off
-TP2_DSPARK_EXPERTS=off
+TP2_DSPARK_EXPERTS=
+release_resolve_tp2_dspark_experts deepseek_v41 "$RELEASE_RTX_GPUS"
 topology_explicit=0
 spark_ep=1
 spark_admission=not-applicable
@@ -248,7 +249,7 @@ resolved_decode_lanes=2
                 self.assertEqual(result.returncode,0,result.stderr)
                 args=next(args for tool,args in events if tool=='docker' and 'serve-native' in args)
                 for option,flag in zip(options,flags):
-                    self.assertEqual(flag in args,option in enabled)
+                    self.assertEqual(flag in args,option in enabled or option == 'DSPARK_EXPERTS')
 
     def test_filesystem_plan_is_not_a_startup_input(self):
         # A stale/invalid filesystem payload is ignored; the daemon validates

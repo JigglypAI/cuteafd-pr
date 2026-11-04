@@ -1100,7 +1100,8 @@ release_load_config() {
   TP2_ATTENTION=off
   TP2_QUERY_PROJECTION=off
   TP2_OUTPUT_PROJECTION=off
-  TP2_DSPARK_EXPERTS=off
+  # Resolve the implicit default once the actual RTX count is selected.
+  TP2_DSPARK_EXPERTS=
   DSPARK_DRAFT_POLICY=adaptive
   DSPARK_DRAFT_LIMIT=
   V41_FP8_HEAD=
@@ -2068,9 +2069,22 @@ PYWEIGHTS
 # command-line overrides, before launcher operations that change services.
 release_validate_tp2_options() {
   local name
-  for name in TP2_ATTENTION TP2_QUERY_PROJECTION TP2_OUTPUT_PROJECTION TP2_DSPARK_EXPERTS; do
+  for name in TP2_ATTENTION TP2_QUERY_PROJECTION TP2_OUTPUT_PROJECTION; do
     case "${!name}" in on|off) ;; *) release_die "$name must be on or off" ;; esac
   done
+  case "$TP2_DSPARK_EXPERTS" in ''|on|off) ;; *) release_die "TP2_DSPARK_EXPERTS must be on or off" ;; esac
+}
+
+release_resolve_tp2_dspark_experts() {
+  local family="$1" rtx_gpus="$2"
+  if [[ -z "$TP2_DSPARK_EXPERTS" ]]; then
+    TP2_DSPARK_EXPERTS=off
+    if [[ "$family" == deepseek_v41 && "$rtx_gpus" == 2 && "$SPECULATOR" == dspark ]]; then
+      TP2_DSPARK_EXPERTS=on
+    fi
+  fi
+  [[ "$TP2_DSPARK_EXPERTS" != on || ( "$family" == deepseek_v41 && "$rtx_gpus" == 2 && "$SPECULATOR" == dspark ) ]] ||
+    release_die "TP2_DSPARK_EXPERTS requires V4.1, two selected RTX GPUs and dSpark"
 }
 
 release_tp2_enabled() {

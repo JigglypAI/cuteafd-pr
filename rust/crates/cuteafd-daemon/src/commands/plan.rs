@@ -149,12 +149,14 @@ fn v41_layout(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, args: &P
 
 fn v41_tp2_dspark_experts(args: &PlanArgs, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<bool> {
+    let applicable = args.layout && family == "deepseek_v41" && args.rtx == 2 && args.speculator == "dspark";
     let enabled = args.tp2_dspark_experts || match cfg.get("TP2_DSPARK_EXPERTS").map(String::as_str) {
-        None | Some("" | "off") => false,
+        None | Some("") => applicable,
+        Some("off") => false,
         Some("on") => true,
         Some(_) => anyhow::bail!("TP2_DSPARK_EXPERTS must be on or off"),
     };
-    anyhow::ensure!(!enabled || (args.layout && family == "deepseek_v41" && args.rtx == 2 && args.speculator == "dspark"),
+    anyhow::ensure!(!enabled || applicable,
         "--tp2-dspark-experts requires V4.1, --layout, --rtx 2 and dSpark");
     Ok(enabled)
 }
@@ -910,7 +912,7 @@ mod tests {
         let argv = ["cuteafd", "plan", "model", "--layout", "--rtx", "2", "--speculator", "dspark"];
         let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(argv).unwrap().command
             else { panic!("expected plan") };
-        for (configured, expected) in [(None, false), (Some(""), false), (Some("off"), false), (Some("on"), true)] {
+        for (configured, expected) in [(None, true), (Some(""), true), (Some("off"), false), (Some("on"), true)] {
             let cfg = configured.map(|value| [("TP2_DSPARK_EXPERTS".into(), value.into())].into()).unwrap_or_default();
             assert_eq!(v41_tp2_dspark_experts(&request, "deepseek_v41", &cfg).unwrap(), expected);
         }
@@ -921,6 +923,9 @@ mod tests {
             request.rtx = rtx;
             request.layout = layout;
             request.speculator = speculator.into();
+            assert!(!v41_tp2_dspark_experts(&request, family, &Default::default()).unwrap());
+            let off = [("TP2_DSPARK_EXPERTS".into(), "off".into())].into();
+            assert!(!v41_tp2_dspark_experts(&request, family, &off).unwrap());
             assert!(v41_tp2_dspark_experts(&request, family, &cfg).is_err());
         }
         let crate::cli::Commands::Plan(request) = crate::cli::Cli::try_parse_from(
