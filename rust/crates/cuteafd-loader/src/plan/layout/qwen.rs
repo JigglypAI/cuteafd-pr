@@ -163,7 +163,11 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
         Ok(tokens) => pool_tokens = tokens,
         Err(error) => {
             report.placement_supported = false;
-            notes.push(format!("Qwen admission: {error}"));
+            report.fits = false;
+            let reason = format!("Qwen admission: {error:#}");
+            report.hints.push(super::super::Hint { what: reason.clone(),
+                how: "Supply complete native checkpoint owners within the device and resident-weight budgets.".into() });
+            notes.push(reason);
         }
     }
     if pool_tokens < shape.context_tokens {
@@ -339,6 +343,7 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
         Ok(placement) => { report.solver_placement = Some(placement.clone()); notes.push(format!("placement: {}", placement.summary())); placement.pool_tokens },
         Err(error) => {
             report.placement_supported = false;
+            report.fits = false;
             report.hints.push(super::super::Hint { what: format!("Qwen dual admission: {error:#}"),
                 how: "Supply complete checkpoint headers and exact unequal TP2 plus MTP package manifests.".into() });
             notes.push(format!("Qwen dual admission: {error:#}")); 0

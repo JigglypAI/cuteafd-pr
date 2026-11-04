@@ -393,6 +393,9 @@ fn drafter_admission(options: &LayoutOptions, checkpoint: &Checkpoint)
             (glm::ml4_draft_resident_bytes(&layout, marks)?, layout.weights().max_load_staging, Some(block),
                 Some(layout.capacity().block_rows), crate::placement::ResidentWeights(layout.weights().resident_bytes()?))
         }
+        else if options.drafter_bytes > 0 && options.glm5_drafter_snapshot.is_none() {
+            (options.drafter_bytes, 0, None, None, crate::placement::ResidentWeights(options.drafter_bytes))
+        }
         else {
             let snapshot = options.glm5_drafter_snapshot.clone().or_else(|| {
                 let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)

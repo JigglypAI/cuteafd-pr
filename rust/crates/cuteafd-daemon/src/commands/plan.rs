@@ -1931,8 +1931,7 @@ mod tests {
         assert_eq!(weight_only.coordinator_budget_bytes, 80 << 30);
         assert_eq!(weight_only.coordinator_gpu_budget_bytes, 2 << 30);
         let inventory = plan(snapshot.path(), &weight_only).unwrap();
-        assert!(inventory.fits, "weight inventory fits");
-        assert!(!inventory.placement_supported && !inventory.executable());
+        assert!(!inventory.fits && !inventory.placement_supported && !inventory.executable());
         assert!(inventory.hints.iter().any(|h| h.what.contains("MiMo placement")
             && (h.what.contains("mandatory") || h.what.contains("pool"))), "{:?}", inventory.hints);
         let report = plan(snapshot.path(), &options(&tiny).unwrap()).unwrap();

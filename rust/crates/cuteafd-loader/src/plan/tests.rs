@@ -3386,12 +3386,11 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             assert!(weight_rejected.hints.iter().any(|hint| hint.what.contains("resident weights need")));
             let weight_only = plan(dir.path(), &PlanOptions { layout: None, ..local.clone() }).unwrap();
             assert!(!weight_only.fits && !weight_only.executable());
-            let inventory_owners = resident::resident_weights(&checkpoint, &cfg, cfg.layers, 1,
-                layout::LayoutOptions::default().glmf_representation).unwrap();
-            let required = inventory_owners[0].embedding + inventory_owners[0].weights
-                + input.experts.iter().map(|cost| cost.whole.resident).sum::<u64>();
-            let refusal = format!("rtx0 resident weights need {required} bytes, over the {budget} byte weight budget");
-            assert!(weight_only.hints.iter().any(|hint| hint.what.contains(&refusal)), "{}", render(&weight_only));
+            // The inventory-only request has no package manifest: native
+            // compatibility refuses it before the weight boundary is reached.
+            assert!(weight_only.hints.iter().any(|hint|
+                hint.what.contains("GLM Flash pool-first placement: missing fp8-glmf package")),
+                "{}", render(&weight_only));
             let mut strict = local;
             strict.layout.as_mut().unwrap().pool_tokens = Some(1 << 40);
             let rejected = plan(dir.path(), &strict).unwrap();
@@ -3842,7 +3841,7 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
         assert_eq!(bytes(&simulated,0,Category::Workspace), scratch[1]);
         options.drafter_bytes = native_draft.resident_weights.0;
         // An explicit weight-only override has no inferred runtime scratch.
-        options.glmf_drafter_snapshot = Some(draft.path().join("absent"));
+        options.glmf_drafter_snapshot = None;
         let explicit = run(&options);
         assert_eq!(bytes(&explicit,0,Category::Drafter), options.drafter_bytes);
         assert_eq!(bytes(&explicit,0,Category::Workspace), 0);
@@ -4192,7 +4191,11 @@ fn qwen_default_attention_follows_spark_free_coordinator_layout() {
 #[test]
 fn qwen_split_off_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle() {
     use cuteafd_core::memory_layout::Category;
-    let dir = snapshot(qwen4_config(48), &[]);
+    let config = qwen4_config(4);
+    let (mut tensors, manifest) = qwen4_exl3(4, 4);
+    tensors.extend(qwen4_coordinator(&config, false));
+    let dir = snapshot(config, &tensors);
+    write_quantize_config(dir.path(), &manifest);
     let options = PlanOptions {
         layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
             rtx_bytes: vec![12 << 30, 96 << 30], head_split: false, pool_tokens: Some(0),
@@ -4865,7 +4868,7 @@ fn mimo_local_media_weights_share_the_native_cap_without_charging_scratch() {
 }
 
 #[test]
-fn qwen_native_fp8_head_admission_is_not_source_inventory_admission() {
+fn qwen_native_resident_admission_includes_padding_not_source_inventory() {
     let dir = qwen_snapshot(4);
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config).unwrap();
@@ -4878,12 +4881,17 @@ fn qwen_native_fp8_head_admission_is_not_source_inventory_admission() {
     let report = plan(dir.path(), &options).unwrap();
     let source = report.components.iter().filter(|c| matches!(c.owner, Owner::Rtx | Owner::SparkSliced))
         .map(|c| c.bytes).sum::<u64>();
-    assert!(source > required, "source {source}, native {required}");
+    assert_eq!(source, 1_397_074_944);
+    assert_eq!(required, 1_408_128_000);
     assert!(report.executable(), "{}", render(&report));
-    let refused = plan(dir.path(), &PlanOptions { coordinator_budget_bytes: required - 1, ..options }).unwrap();
-    let refusal = format!("rtx0 resident weights need {required} bytes, over the {} byte weight budget", required - 1);
-    assert!(!refused.executable() && refused.hints.iter().any(|h| h.what.contains(&refusal)),
-        "{}", render(&refused));
+    // Expert arena padding outweighs this fixture's small FP8-head saving.
+    // A budget that fits the source inventory must still refuse native owners.
+    for limit in [source, required - 1] {
+        let refused = plan(dir.path(), &PlanOptions { coordinator_budget_bytes: limit, ..options.clone() }).unwrap();
+        let refusal = format!("rtx0 resident weights need {required} bytes, over the {limit} byte weight budget");
+        assert!(!refused.fits && !refused.executable()
+            && refused.hints.iter().any(|h| h.what.contains(&refusal)), "{}", render(&refused));
+    }
 }
 
 /// A Spark-hosted MiMo tower is admitted against what each worker holds after
@@ -5070,11 +5078,14 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
         "num_heads":16,"num_position_embeddings":2304,"out_hidden_size":2560,
         "patch_size":16,"temporal_patch_size":2,"spatial_merge_size":2,
         "hidden_act":"gelu_pytorch_tanh","deepstack_visual_indexes":[]});
-    let tensors = [t("model.visual.patch_embed.proj.weight", "BF16", &[1152,3,2,16,16]),
+    let (mut tensors, manifest) = qwen4_exl3(1, 4);
+    tensors.extend(qwen4_coordinator(&cfg, false));
+    tensors.extend([t("model.visual.patch_embed.proj.weight", "BF16", &[1152,3,2,16,16]),
         t("model.visual.patch_embed.proj.bias", "BF16", &[1152]),
         t("model.visual.blocks.0.norm1.weight", "BF16", &[1152]),
-        t("model.visual.blocks.0.norm1.bias", "BF16", &[1152])];
+        t("model.visual.blocks.0.norm1.bias", "BF16", &[1152])]);
     let dir = snapshot(cfg.clone(), &tensors);
+    write_quantize_config(dir.path(), &manifest);
     let options = PlanOptions { placement: ExpertPlacement::Local, layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
         rtx_bytes: vec![96<<30], pool_tokens: Some(32768), target_pool_tokens: 32768,
         ..Default::default()

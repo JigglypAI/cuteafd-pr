@@ -75,6 +75,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             }
             Err(error) => {
                 report.placement_supported = false;
+                report.fits = false;
                 notes.push(format!("MiMo media admission: {error:#}"));
                 // The refusal text is built from hints, so carry the actual note.
                 report.hints.push(super::super::Hint { what: format!("MiMo media admission: {error:#}"),
@@ -128,6 +129,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         }
         Err(error) => {
             report.placement_supported = false;
+            report.fits = false;
             notes.push(format!("MiMo placement: {error:#}"));
             report.hints.push(super::super::Hint { what: format!("MiMo placement: {error:#}"),
                 how: "Supply matching generated BF16-input expert and workspace manifests, or select a fitting Spark layout/pool.".into() });
