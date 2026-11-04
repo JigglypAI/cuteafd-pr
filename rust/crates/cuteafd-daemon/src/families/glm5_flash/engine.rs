@@ -486,6 +486,10 @@ fn native_local_layers(experts: &dyn RtxExpertLayer, device: i32) -> Result<Vec<
     Ok(experts.layers().to_vec())
 }
 
+fn tp2_input(experts: &dyn RtxExpertLayer, wire: *mut c_void, hidden: *mut c_void) -> ExpertInput {
+    if experts.uses_fp8_input() { ExpertInput::Fp8K32(wire) } else { ExpertInput::Bf16(hidden) }
+}
+
 /// Per-program GPU times (CUTEAFD_GLMF_PROFILE_OPS=1): timing events around
 /// every launch, read back by [`GlmfEngine::op_profile`].
 #[derive(Default)]
@@ -2153,15 +2157,15 @@ impl<'a> GlmfEngine<'a> {
             let layer = tp2.layers[0];
             self.on(rank, || {
                 let mut experts = tp2.ranks[rank].borrow_mut();
-                let input = if experts.partial() == PartialDtype::F32 {
+                if experts.uses_fp8_input() {
                     let grid = self.quantize_grid.blocks(rows, self.cfg.hidden);
                     // SAFETY: the scale section follows the FP8 values in the admitted wire buffer.
                     self.run_on(rank, false, "expert_input_quant", &[("source_ptr", w.x.buffer.ptr),
                         ("values_ptr", w.wire.buffer.ptr), ("scale_rows_ptr", unsafe {
                             w.wire.buffer.ptr.cast::<u8>().add(self.cfg.hidden).cast() }),
                         ("scale_mma_ptr", w.scratch.buffer.ptr)], &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)])?;
-                    ExpertInput::Fp8K32(w.wire.buffer.ptr)
-                } else { ExpertInput::Bf16(w.x.buffer.ptr) };
+                }
+                let input = tp2_input(experts.as_ref(), w.wire.buffer.ptr, w.x.buffer.ptr);
                 let routes = Routes { ids: w.route_ids.buffer.ptr, weights: w.route_weights.buffer.ptr };
                 // SAFETY: valid maximum-capacity startup input/routes stay live through the synchronization.
                 unsafe {
@@ -2676,7 +2680,7 @@ impl<'a> GlmfEngine<'a> {
                 }
             }
             let mut experts = tp2.ranks[rank].borrow_mut();
-            let input = if experts.partial() == PartialDtype::F32 {
+            if experts.uses_fp8_input() {
                 if rank == 1 {
                     let grid = self.quantize_grid.blocks(rows, self.cfg.hidden);
                     // SAFETY: scale rows start after the FP8 values in each wire row.
@@ -2685,8 +2689,8 @@ impl<'a> GlmfEngine<'a> {
                             .add(self.cfg.hidden).cast() }), ("scale_mma_ptr", w.scratch.buffer.ptr)],
                         &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)])?;
                 }
-                ExpertInput::Fp8K32(w.wire.buffer.ptr)
-            } else { ExpertInput::Bf16(w.x.buffer.ptr) };
+            }
+            let input = tp2_input(experts.as_ref(), w.wire.buffer.ptr, w.x.buffer.ptr);
             // SAFETY: input/routes and expert scratch are rank-local and serialized on one stream.
             unsafe { experts.enqueue(layer, rows, input, routes, self.stream_of(rank),
                 &mut || self.abort_tp2_or_terminate())?; }
@@ -5462,6 +5466,15 @@ mod tp2_tests {
         }
         let valid = || Rank { shard: RtxShard::Whole, partial: PartialDtype::Bf16, fp8: true, device: 4 };
         assert_eq!(native_local_layers(&valid(), 4).unwrap(), [3, 7]);
+        let wire = 0x1000usize as *mut c_void;
+        let hidden = 0x2000usize as *mut c_void;
+        for (partial, fp8) in [(PartialDtype::Bf16, true), (PartialDtype::F32, true), (PartialDtype::Bf16, false)] {
+            let rank = Rank { shard: RtxShard::Tp2 { rank: 0 }, partial, fp8, device: 4 };
+            match tp2_input(&rank, wire, hidden) {
+                ExpertInput::Fp8K32(pointer) => { assert!(fp8); assert_eq!(pointer, wire); }
+                ExpertInput::Bf16(pointer) => { assert!(!fp8); assert_eq!(pointer, hidden); }
+            }
+        }
         let mut wrong = valid(); wrong.shard = RtxShard::Tp2 { rank: 0 };
         assert!(native_local_layers(&wrong, 4).is_err());
         let mut wrong = valid(); wrong.partial = PartialDtype::F32;
