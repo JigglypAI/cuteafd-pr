@@ -731,91 +731,101 @@ fn planner_equals_runtime_deepseek_v4_measured() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shared/placement_fixtures");
     let inputs = cuteafd_loader::plan::testing::v4_placement_inputs().unwrap();
     let mut checked = 0;
-    for entry in std::fs::read_dir(&dir).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
+    let mut failures = Vec::new();
+    let mut paths = std::fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().path()).collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
         if !path.file_name().unwrap().to_string_lossy().starts_with("v4-") { continue; }
         let fixture: Fixture = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         if fixture.historical_tp1 { continue; }
         let label = path.file_stem().unwrap().to_string_lossy().into_owned();
-        let model = if fixture.model.contains("Flash") { "flash" } else { "pro" };
-        let manifest = inputs.join(format!("{model}-{}-{}/PROGRAMS.json", fixture.rtx, fixture.context));
-        let snapshot = snapshot(&fixture.model).unwrap_or_else(|| panic!("{label}: required checkpoint {} missing", fixture.model));
-        let shared = Shared::open(&snapshot).unwrap();
-        let budget = fixture.gpus[0].total_bytes;
-        assert!(fixture.gpus.iter().all(|g| g.total_bytes.abs_diff(budget) < 8 * MIB), "{label}: unequal GPUs");
-        let onboard = fixture.onboard.as_deref().map(|o| o.parse::<OnboardSetting>().unwrap());
-        let case = Case { snapshot: &snapshot, manifest: &manifest, rtx: fixture.rtx, sparks: fixture.sparks,
-            context: fixture.context, budget, onboard, dspark: true, exchange_f32: false,
-            peer_budget: fixture.gpus.get(1).map(|g| g.total_bytes), physical_sms: None, attention: None };
-        let (layout, supported, hints) = planned(&shared, &case);
-        assert!(supported, "{label}: planner refused: {:?} {:?}", layout.notes, hints);
-        let catalog = shared.input.expert_catalog().unwrap();
-        let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(&snapshot, 1).unwrap();
-        let code = cuteafd_loader::placement::families::deepseek_v4::code_bytes(
-            cfg.dim, cuteafd_loader::placement::families::deepseek_v4::code_experts(&catalog), fixture.rtx);
-        // Replay pending-code reservation, retaining the raw launch sample.
-        for (gpu, measured) in fixture.gpus.iter().enumerate() {
-            let device = &layout.devices[gpu];
-            let planned_loaded: u64 = device.items.iter().filter(|i| matches!(i.category,
-                Category::Weights | Category::Embedding | Category::Drafter) || i.group == "context+modules")
-                .map(|i| i.bytes).sum();
-            let measured_loaded = measured.total_bytes - measured.free_with_current_code(code[gpu]);
-            let diff = planned_loaded as i64 - measured_loaded as i64;
-            eprintln!("{label} rtx{gpu}: planned loaded {planned_loaded} measured {measured_loaded} diff {diff} \
-                (driver {})", fixture.driver);
-            assert!(diff.unsigned_abs() <= 64 * MIB, "{label} rtx{gpu}: planner baseline {diff:+} B from the \
-                measured inventory");
-        }
-        // The runtime's admission over the measured sample.
-        let runtime = runtime_measured(&shared, &case, &fixture).unwrap_or_else(|e| panic!("{label}: runtime: {e:#}"));
-        assert_eq!(runtime.pool_tokens, fixture.pool_tokens, "{label}: fixture pool vs this build's runtime");
-        assert_eq!(runtime.onboard_layers, fixture.onboard_layers, "{label}: fixture layers vs this build's runtime");
-        // The planner resolves the same layers and a pool within the baseline difference.
-        let notes = runtime.expert_ranges.iter().enumerate().map(|(gpu, r)|
-            format!("rtx{gpu}: {} local expert layers ({}..{})", r.layers, r.first, r.first + r.layers));
-        for note in notes { assert!(layout.notes.contains(&note), "{label}: planner lacks {note}"); }
-        let unit: u64 = layout.devices[0].items.iter().filter(|i| i.group == "records").map(|i| i.bytes).sum::<u64>()
-            / (layout.pool_tokens / 256).max(1);
-        let slack = (64 * MIB).div_ceil(unit.max(1)) * 256;
-        assert!(layout.pool_tokens.abs_diff(runtime.pool_tokens) <= slack, "{label}: pool {} planned vs {} measured",
-            layout.pool_tokens, runtime.pool_tokens);
-        if fixture.rtx == 2 {
-            assert!(runtime.expert_ranges.iter().all(|r| r.layers == 0));
-            assert_eq!(runtime.tp2.map_or(0, |t| t.layers), fixture.onboard_layers);
-            // Re-solve the same measured pre-allocation inventory for every
-            // retained onboard policy; no deleted two-RTX TP1 placement.
-            for onboard in [None, Some(OnboardSetting::Auto), Some(OnboardSetting::Layers(0)),
-                Some(OnboardSetting::Layers(1)), Some(OnboardSetting::Layers(2))] {
-                let variant = Case { onboard, ..case };
-                let (layout, supported, hints) = planned(&shared, &variant);
-                assert!(supported, "{label} {onboard:?}: {hints:?}");
-                let runtime = runtime_measured(&shared, &variant, &fixture).unwrap();
-                assert!(runtime.expert_ranges.iter().all(|r| r.layers == 0));
-                assert_eq!(runtime.tp2.map_or(0, |t| t.layers), runtime.onboard_layers);
-                if let Some(tp2) = runtime.tp2 {
-                    assert!(layout.notes.contains(&format!(
-                        "rtx0/rtx1: {} TP2 expert layer halves ({}..{})",
-                        tp2.layers, tp2.first, tp2.first + tp2.layers)), "{label} {onboard:?}");
-                } else {
-                    assert!(!layout.notes.iter().any(|note| note.starts_with("rtx0/rtx1:")), "{label} {onboard:?}");
-                }
-                assert!(layout.pool_tokens.abs_diff(runtime.pool_tokens) <= slack,
-                    "{label} {onboard:?}: pool {} planned vs {} measured",
-                    layout.pool_tokens, runtime.pool_tokens);
-                if runtime.onboard_layers > 0 && (onboard.is_none() || onboard == Some(OnboardSetting::Auto)) {
-                    assert_eq!(runtime.pool_tokens, 2 << 20);
-                }
-                if let Some(OnboardSetting::Layers(n)) = onboard {
-                    assert_eq!(runtime.onboard_layers, n);
-                }
-                eprintln!("{label} {onboard:?}: TP2 {} layers pool {}", runtime.onboard_layers, runtime.pool_tokens);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let model = if fixture.model.contains("Flash") { "flash" } else { "pro" };
+            let manifest = inputs.join(format!("{model}-{}-{}/PROGRAMS.json", fixture.rtx, fixture.context));
+            let snapshot = snapshot(&fixture.model).unwrap_or_else(|| panic!("{label}: required checkpoint {} missing", fixture.model));
+            let shared = Shared::open(&snapshot).unwrap();
+            let budget = fixture.gpus[0].total_bytes;
+            assert!(fixture.gpus.iter().all(|g| g.total_bytes.abs_diff(budget) < 8 * MIB), "{label}: unequal GPUs");
+            let onboard = fixture.onboard.as_deref().map(|o| o.parse::<OnboardSetting>().unwrap());
+            let case = Case { snapshot: &snapshot, manifest: &manifest, rtx: fixture.rtx, sparks: fixture.sparks,
+                context: fixture.context, budget, onboard, dspark: true, exchange_f32: false,
+                peer_budget: fixture.gpus.get(1).map(|g| g.total_bytes), physical_sms: None, attention: None };
+            let (layout, supported, hints) = planned(&shared, &case);
+            assert!(supported, "{label}: planner refused: {:?} {:?}", layout.notes, hints);
+            let catalog = shared.input.expert_catalog().unwrap();
+            let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(&snapshot, 1).unwrap();
+            let code = cuteafd_loader::placement::families::deepseek_v4::code_bytes(
+                cfg.dim, cuteafd_loader::placement::families::deepseek_v4::code_experts(&catalog), fixture.rtx);
+            // Replay pending-code reservation, retaining the raw launch sample.
+            for (gpu, measured) in fixture.gpus.iter().enumerate() {
+                let device = &layout.devices[gpu];
+                let planned_loaded: u64 = device.items.iter().filter(|i| matches!(i.category,
+                    Category::Weights | Category::Embedding | Category::Drafter) || i.group == "context+modules")
+                    .map(|i| i.bytes).sum();
+                let measured_loaded = measured.total_bytes - measured.free_with_current_code(code[gpu]);
+                let diff = planned_loaded as i64 - measured_loaded as i64;
+                eprintln!("{label} rtx{gpu}: planned loaded {planned_loaded} measured {measured_loaded} diff {diff} \
+                    (driver {})", fixture.driver);
+                assert!(diff.unsigned_abs() <= 64 * MIB, "{label} rtx{gpu}: planner baseline {diff:+} B from the \
+                    measured inventory");
             }
-        }
+            // The runtime's admission over the measured sample.
+            let runtime = runtime_measured(&shared, &case, &fixture).unwrap_or_else(|e| panic!("{label}: runtime: {e:#}"));
+            assert_eq!(runtime.pool_tokens, fixture.pool_tokens, "{label}: fixture pool vs this build's runtime");
+            assert_eq!(runtime.onboard_layers, fixture.onboard_layers, "{label}: fixture layers vs this build's runtime");
+            // The planner resolves the same layers and a pool within the baseline difference.
+            let notes = runtime.expert_ranges.iter().enumerate().map(|(gpu, r)|
+                format!("rtx{gpu}: {} local expert layers ({}..{})", r.layers, r.first, r.first + r.layers));
+            for note in notes { assert!(layout.notes.contains(&note), "{label}: planner lacks {note}"); }
+            let unit: u64 = layout.devices[0].items.iter().filter(|i| i.group == "records").map(|i| i.bytes).sum::<u64>()
+                / (layout.pool_tokens / 256).max(1);
+            let slack = (64 * MIB).div_ceil(unit.max(1)) * 256;
+            assert!(layout.pool_tokens.abs_diff(runtime.pool_tokens) <= slack, "{label}: pool {} planned vs {} measured",
+                layout.pool_tokens, runtime.pool_tokens);
+            if fixture.rtx == 2 {
+                assert!(runtime.expert_ranges.iter().all(|r| r.layers == 0));
+                assert_eq!(runtime.tp2.map_or(0, |t| t.layers), fixture.onboard_layers);
+                // Re-solve the same measured pre-allocation inventory for every
+                // retained onboard policy; no deleted two-RTX TP1 placement.
+                for onboard in [None, Some(OnboardSetting::Auto), Some(OnboardSetting::Layers(0)),
+                    Some(OnboardSetting::Layers(1)), Some(OnboardSetting::Layers(2))] {
+                    let variant = Case { onboard, ..case };
+                    let (layout, supported, hints) = planned(&shared, &variant);
+                    assert!(supported, "{label} {onboard:?}: {hints:?}");
+                    let runtime = runtime_measured(&shared, &variant, &fixture).unwrap();
+                    assert!(runtime.expert_ranges.iter().all(|r| r.layers == 0));
+                    assert_eq!(runtime.tp2.map_or(0, |t| t.layers), runtime.onboard_layers);
+                    if let Some(tp2) = runtime.tp2 {
+                        assert!(layout.notes.contains(&format!(
+                            "rtx0/rtx1: {} TP2 expert layer halves ({}..{})",
+                            tp2.layers, tp2.first, tp2.first + tp2.layers)), "{label} {onboard:?}");
+                    } else {
+                        assert!(!layout.notes.iter().any(|note| note.starts_with("rtx0/rtx1:")), "{label} {onboard:?}");
+                    }
+                    assert!(layout.pool_tokens.abs_diff(runtime.pool_tokens) <= slack,
+                        "{label} {onboard:?}: pool {} planned vs {} measured",
+                        layout.pool_tokens, runtime.pool_tokens);
+                    if runtime.onboard_layers > 0 && (onboard.is_none() || onboard == Some(OnboardSetting::Auto)) {
+                        assert_eq!(runtime.pool_tokens, 2 << 20);
+                    }
+                    if let Some(OnboardSetting::Layers(n)) = onboard {
+                        assert_eq!(runtime.onboard_layers, n);
+                    }
+                    eprintln!("{label} {onboard:?}: TP2 {} layers pool {}", runtime.onboard_layers, runtime.pool_tokens);
+                }
+            }
+        }));
         checked += 1;
+        if let Err(payload) = result {
+            let message = payload.downcast_ref::<String>().map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            failures.push(format!("{label}\n{message}"));
+        }
     }
     assert!(checked > 0, "no live V4 measured fixtures found");
     eprintln!("planner_equals_runtime_deepseek_v4_measured: {checked} fixtures");
+    assert!(failures.is_empty(), "{} V4 measured fixtures failed:\n{}", failures.len(), failures.join("\n\n"));
 }
 
 
