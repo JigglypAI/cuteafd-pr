@@ -52,51 +52,13 @@ impl Census<'_> {
         lifetime: Lifetime,
         category: Category,
     ) -> Result<()> {
-        for (&name, owner) in &scratch._owners {
-            self.record(
-                &format!("{kind}.storage.{}", name.replace(' ', "_")),
-                owner.buffer,
-                lifetime,
-                category,
-                "GLM target hooks",
-            )?;
-        }
-        for (&name, &buffer) in &scratch.buffers {
-            let start = buffer.ptr as usize;
-            let end = start
-                .checked_add(buffer.bytes)
-                .context("GLM hook view end")?;
-            let mut owners = scratch._owners.iter().filter(|(_, owner)| {
-                let base = owner.buffer.ptr as usize;
-                buffer.device_id == owner.buffer.device_id
-                    && start >= base
-                    && base
-                        .checked_add(owner.buffer.bytes)
-                        .is_some_and(|limit| end <= limit)
-            });
-            let (&backing, owner) = owners
-                .next()
-                .context("GLM hook view outside actual owners")?;
-            ensure!(
-                owners.next().is_none(),
-                "GLM hook view has ambiguous actual backing"
-            );
-            self.record(
-                &format!("{kind}.view.{name}"),
-                buffer,
-                lifetime,
-                category,
-                "GLM target hooks",
-            )?;
-            self.receipts.last_mut().unwrap().allocation.view = Some(View {
-                backing: format!(
-                    "{}.{kind}.storage.{}",
-                    self.prefix,
-                    backing.replace(' ', "_")
-                ),
-                offset: (start - owner.buffer.ptr as usize) as u64,
-            });
-        }
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(
+            self.devices, &self.prefix, lifetime, category, "target hooks");
+        scratch.allocation_receipts(&mut inventory, kind)?;
+        ensure!(inventory.receipts.iter().all(|receipt|
+            receipt.allocation.location == Location::coordinator(self.rank)),
+            "GLM projection belongs to the wrong logical rank");
+        self.receipts.extend(inventory.receipts);
         Ok(())
     }
     fn hooks(&mut self, kind: &str, slots: &[Workspace<'_>]) -> Result<()> {
