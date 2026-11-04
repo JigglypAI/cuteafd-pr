@@ -30,6 +30,73 @@ use std::time::{Duration, Instant};
 use crate::synthetic::{expert_response_from_protocol_v2_response, protocol_v2_request_from_expert_request, ProtocolV2ExecutorResponseRef, ProtocolV2ExpertExecutor, ProtocolV2RequestDevicePayload, SyntheticRouteExecutor};
 use crate::{is_connection_closed, verbs_host_preflight, ExpertProtocolV2FrameBuffer, ExpertProtocolV2Request, ExpertProtocolV2RequestView, ExpertProtocolV2Response, ExpertProtocolV2ResponseHeader, ExpertProtocolV2ResponseView, ExpertProtocolV2Status, ExpertV2Dtype, TcpTransportConfig, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN};
 
+/// Actual retained transport storage; mapped addresses are aliases, not owners.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransportHostAllocation {
+    pub owner: String,
+    pub address: u64,
+    pub bytes: u64,
+    pub flags: u64,
+    pub mapped: Option<TransportDeviceAlias>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransportDeviceAlias {
+    pub address: u64,
+    pub device: i32,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnclassifiedTransportOwner {
+    pub owner: String,
+    pub reason: String,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TransportAllocationCensus {
+    pub host: Vec<TransportHostAllocation>,
+    pub unclassified: Vec<UnclassifiedTransportOwner>,
+}
+impl TransportAllocationCensus {
+    pub fn unavailable(owner: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self { host: Vec::new(), unclassified: vec![UnclassifiedTransportOwner {
+            owner: owner.into(), reason: reason.into(),
+        }] }
+    }
+    pub fn extend(&mut self, other: Self) {
+        self.host.extend(other.host);
+        self.unclassified.extend(other.unclassified);
+    }
+    fn host_buffer(&mut self, owner: String, buffer: CuteafdHostBuffer) {
+        if buffer.bytes == 0 { return; }
+        if buffer.ptr.is_null() {
+            self.unclassified.push(UnclassifiedTransportOwner { owner, reason: "null retained host backing".into() });
+            return;
+        }
+        self.host.push(TransportHostAllocation { owner, address: buffer.ptr as u64,
+            bytes: buffer.bytes as u64, flags: buffer.flags, mapped: None });
+    }
+    fn endpoint_view(&mut self, owner: String, view: Result<CuteafdRdmaRcEndpointBufferView>) {
+        let view = match view {
+            Ok(view) => view,
+            Err(error) => {
+                self.unclassified.push(UnclassifiedTransportOwner { owner, reason: format!("buffer view unavailable: {error:#}") });
+                return;
+            }
+        };
+        if view.host_ptr.is_null() || view.bytes == 0 {
+            self.unclassified.push(UnclassifiedTransportOwner { owner, reason: "empty retained endpoint backing".into() });
+            return;
+        }
+        let mapped = if view.host_flags & CUTEAFD_HOST_BUFFER_FLAG_MAPPED != 0 {
+            if view.device_ptr.is_null() || view.device_id < 0 {
+                self.unclassified.push(UnclassifiedTransportOwner { owner: owner.clone(),
+                    reason: "mapped endpoint alias unavailable".into() });
+                None
+            } else { Some(TransportDeviceAlias { address: view.device_ptr as u64, device: view.device_id }) }
+        } else { None };
+        self.host.push(TransportHostAllocation { owner, address: view.host_ptr as u64,
+            bytes: view.bytes as u64, flags: view.host_flags, mapped });
+    }
+}
+
 const PERSISTENT_CONTROL_VERSION: u32 = 8;
 const PERSISTENT_CONTROL_LIMIT: usize = 64 * 1024;
 
@@ -967,6 +1034,19 @@ impl VerbsHostProtocolV2ResponsePayload {
             .payload_host_buffer(self.payload_start, self.payload_end)
     }
 
+    /// Passive startup/test inventory. A receive slot keeps its whole endpoint
+    /// alive; the aggregate deduplicates that backing against the live session.
+    pub fn allocation_census(&self, owner: &str) -> TransportAllocationCensus {
+        let mut census = TransportAllocationCensus::default();
+        if let Some(frame) = &self.pinned_frame {
+            census.host_buffer(format!("{owner}.copy"), frame.buffer);
+        }
+        if let Some(frame) = &self.registered_frame {
+            census.extend(frame.allocation_census(owner));
+        }
+        census
+    }
+
     /// True when this owner retains an unposted receive slot, rather than a
     /// copied response frame. Releasing it permits the next local dispatch.
     pub fn retains_receive_slot(&self) -> bool { self.registered_frame.is_some() }
@@ -1028,6 +1108,30 @@ impl Drop for VerbsHostProtocolV2ResponsePayload {
             }
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn transport_census_preserves_exact_endpoint_views_and_unavailable_reason() {
+    let view = CuteafdRdmaRcEndpointBufferView {
+        host_ptr: std::ptr::without_provenance_mut(0x1000),
+        device_ptr: std::ptr::without_provenance_mut(0x9000),
+        bytes: 12288, device_id: 1,
+        host_flags: CUTEAFD_HOST_BUFFER_FLAG_PINNED | CUTEAFD_HOST_BUFFER_FLAG_MAPPED,
+    };
+    let mut census = TransportAllocationCensus::default();
+    census.endpoint_view("rank.0.receive".into(), Ok(view));
+    assert_eq!(census.host, [TransportHostAllocation { owner: "rank.0.receive".into(),
+        address: view.host_ptr as u64, bytes: view.bytes as u64, flags: view.host_flags,
+        mapped: Some(TransportDeviceAlias { address: view.device_ptr as u64, device: view.device_id }) }]);
+    assert!(census.unclassified.is_empty());
+    census.endpoint_view("rank.0.send".into(), Err(anyhow::anyhow!("getter unavailable")));
+    assert_eq!(census.host.len(), 1);
+    assert_eq!(census.unclassified.len(), 1);
+    assert_eq!(census.unclassified[0].owner, "rank.0.send");
+    assert!(census.unclassified[0].reason.contains("getter unavailable"));
+    // An absent ordinary/pinned copied frame is not a manufactured owner.
+    assert!(VerbsHostProtocolV2ResponsePayload::from_owned(vec![1, 2]).allocation_census("copy").host.is_empty());
 }
 
 #[cfg(test)]
@@ -2289,6 +2393,21 @@ impl VerbsHostProtocolV2PersistentClientSession {
             response_post_sequence: 0,
             egress: None,
         })
+    }
+
+    fn allocation_census(&self, owner: &str) -> TransportAllocationCensus {
+        let mut census = TransportAllocationCensus::default();
+        census.endpoint_view(format!("{owner}.send"), self.endpoint.send_buffer_view());
+        census.endpoint_view(format!("{owner}.receive"), self.endpoint.recv_buffer_view());
+        for (index, frame) in self.pinned_response_frame_pool.iter().enumerate() {
+            census.host_buffer(format!("{owner}.response_copy.{index}"), frame.buffer);
+        }
+        census.unclassified.push(UnclassifiedTransportOwner { owner: format!("{owner}.driver"),
+            reason: "QP/CQ/MR driver storage requires an owner-labelled startup memory delta".into() });
+        // Receiver has no non-consuming inspection API. Do not drain it for a census.
+        census.unclassified.push(UnclassifiedTransportOwner { owner: format!("{owner}.recycled_copies"),
+            reason: "recycled pinned frame channel cannot be inspected passively".into() });
+        census
     }
 
     /// Final reply frames this session can leave with consumers at once.

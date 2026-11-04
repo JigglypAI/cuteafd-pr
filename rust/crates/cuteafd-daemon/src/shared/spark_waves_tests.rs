@@ -442,6 +442,73 @@ impl Backend for Fake {
     }
 }
 
+#[test]
+fn worker_census_reports_actual_mock_views_without_post_poll_or_retry() -> Result<()> {
+    use cuteafd_transport::{TransportAllocationCensus, TransportHostAllocation};
+    struct CensusBackend { bytes: Vec<u8>, observed: Arc<AtomicUsize> }
+    impl Backend for CensusBackend {
+        type Wave = ();
+        fn allocation_census(&self) -> TransportAllocationCensus {
+            self.observed.fetch_add(1, Ordering::Relaxed);
+            TransportAllocationCensus { host: vec![TransportHostAllocation { owner: "rank.0.receive".into(),
+                address: self.bytes.as_ptr() as u64, bytes: self.bytes.len() as u64,
+                flags: cuteafd_ffi::CUTEAFD_HOST_BUFFER_FLAG_PINNED, mapped: None }], unclassified: Vec::new() }
+        }
+        fn counter(&self, _: Counter) -> u32 { 0 }
+        fn post(&mut self, _: Job) -> Result<()> { panic!("census must not post") }
+        fn poll(&mut self, _: &mut (), _: &WaveInfo) -> Result<bool> { panic!("census must not poll") }
+        fn publish(&mut self, _: u32) { panic!("census must not publish") }
+    }
+    let observed = Arc::new(AtomicUsize::new(0));
+    let mut backend = CensusBackend { bytes: vec![0; 768], observed: observed.clone() };
+    let expected = (backend.bytes.as_ptr() as u64, backend.bytes.len() as u64);
+    let (jobs, inbox) = mpsc::channel();
+    std::thread::scope(|scope| -> Result<()> {
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false));
+        let census = worker_census(Some(&jobs), Duration::from_secs(1));
+        assert!(census.unclassified.is_empty());
+        assert_eq!(census.host.len(), 1);
+        assert_eq!((census.host[0].address, census.host[0].bytes), expected);
+        assert_eq!(observed.load(Ordering::Relaxed), 1);
+        jobs.send(Command::Cancel)?;
+        assert_eq!(worker.join().unwrap().0?, Stop::Cancelled);
+        Ok(())
+    })?;
+    assert_eq!(observed.load(Ordering::Relaxed), 1);
+    let absent = worker_census(None, Duration::from_millis(1));
+    assert_eq!(absent.unclassified[0].owner, "worker");
+    assert!(absent.unclassified[0].reason.contains("unavailable"));
+    let (jobs, inbox) = mpsc::channel();
+    let unavailable = worker_census(Some(&jobs), Duration::from_millis(1));
+    assert!(unavailable.host.is_empty());
+    assert!(unavailable.unclassified[0].reason.contains("did not answer"));
+    assert!(matches!(inbox.try_recv(), Ok(Command::Census(_))));
+    assert!(matches!(inbox.try_recv(), Err(mpsc::TryRecvError::Empty)), "census must not retry");
+    drop(inbox);
+    assert!(worker_census(Some(&jobs), Duration::from_millis(1)).unclassified[0].reason.contains("closed"));
+    Ok(())
+}
+
+#[test]
+fn worker_census_marks_busy_and_missing_backend_unclassified() -> Result<()> {
+    let world = World::new(1);
+    let mut backend = Fake { world: world.clone() };
+    let (jobs, inbox) = mpsc::channel();
+    jobs.send(Command::Wave(job(1, 0, 0)))?;
+    let (reply, answer) = mpsc::sync_channel(1);
+    jobs.send(Command::Census(reply))?;
+    jobs.send(Command::Cancel)?;
+    assert_eq!(run_worker(&mut backend, &inbox, Duration::from_secs(1), false).0?, Stop::Cancelled);
+    let census = answer.recv_timeout(Duration::from_secs(1))?;
+    assert!(census.host.is_empty());
+    assert!(census.unclassified[0].reason.contains("in-flight"));
+    assert!(world.posted.lock().unwrap().is_empty());
+    assert_eq!(world.polls.load(Ordering::Relaxed), 0);
+    let missing = backend.allocation_census();
+    assert!(missing.unclassified[0].reason.contains("unavailable"));
+    Ok(())
+}
+
 fn job(sequence: u32, slot: usize, consumed: u32) -> Job {
     Job { sequence, slot, rows: 1, payload_bytes: 64, consumed: vec![(slot, consumed)], slice: (slot * 64, 64),
         release: consumed + 1, sent: Instant::now(),

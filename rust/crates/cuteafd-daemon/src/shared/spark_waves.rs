@@ -312,6 +312,32 @@ pub(crate) enum Command {
     /// A deliberate stop (a link reset after a cancelled request): waves
     /// still outstanding are given up without marking the process unhealthy.
     Cancel,
+    /// One startup/test-only observation. Never schedules or drains work.
+    Census(mpsc::SyncSender<cuteafd_transport::TransportAllocationCensus>),
+}
+
+fn worker_census(jobs: Option<&mpsc::Sender<Command>>, timeout: Duration)
+    -> cuteafd_transport::TransportAllocationCensus {
+    use cuteafd_transport::TransportAllocationCensus;
+    let Some(jobs) = jobs else {
+        return TransportAllocationCensus::unavailable("worker", "worker command channel is unavailable");
+    };
+    let (reply, answer) = mpsc::sync_channel(1);
+    if jobs.send(Command::Census(reply)).is_err() {
+        return TransportAllocationCensus::unavailable("worker", "worker command channel is closed");
+    }
+    match answer.recv_timeout(timeout) {
+        Ok(census) => census,
+        Err(reason) => TransportAllocationCensus::unavailable("worker", format!("worker did not answer: {reason}")),
+    }
+}
+
+fn answer_census<B: Backend>(backend: &B, idle: bool,
+    reply: mpsc::SyncSender<cuteafd_transport::TransportAllocationCensus>) {
+    let census = if idle { backend.allocation_census() } else {
+        cuteafd_transport::TransportAllocationCensus::unavailable("worker", "worker has queued or in-flight waves")
+    };
+    let _ = reply.send(census);
 }
 
 /// Host seconds of one wave on the worker (the transport-timing profile).
@@ -329,6 +355,9 @@ pub(crate) struct WaveTimes {
 /// serving, a fake in the CPU tests.
 pub(crate) trait Backend {
     type Wave;
+    fn allocation_census(&self) -> cuteafd_transport::TransportAllocationCensus {
+        cuteafd_transport::TransportAllocationCensus::unavailable("worker", "backend census is unavailable")
+    }
     /// The current value of `counter` (never blocks).
     fn counter(&self, counter: Counter) -> u32;
     /// Builds (from its slot's staging) and posts the job's request.
@@ -441,6 +470,7 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                 match inbox.recv() {
                     Ok(Command::Wave(job)) => { highest = Some(job.sequence); queued.push_back(job); progressed = true; }
                     Ok(Command::Cancel) => { backend.release_consumed(); return Ok(Stop::Cancelled); }
+                    Ok(Command::Census(reply)) => answer_census(backend, true, reply),
                     Err(_) => {
                         // At rest: the frames of reduces already consumed go back now.
                         backend.release_consumed();
@@ -453,6 +483,7 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                     Ok(Command::Wave(job)) => { highest = Some(job.sequence); queued.push_back(job); progressed = true; }
                     // Outstanding waves are given up by the caller (`finish_worker`).
                     Ok(Command::Cancel) => return Ok(Stop::Cancelled),
+                    Ok(Command::Census(reply)) => answer_census(backend, queued.is_empty() && inflight.is_empty(), reply),
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => { closed = true; break; }
                 }
@@ -560,7 +591,12 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
 fn release_until_closed<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Command>, highest: Option<u32>) {
     if let Some(highest) = highest { backend.fail(highest); }
     while let Ok(command) = inbox.recv() {
-        if let Command::Wave(job) = command { backend.fail(job.sequence); }
+        match command {
+            Command::Wave(job) => backend.fail(job.sequence),
+            Command::Census(reply) => { let _ = reply.send(cuteafd_transport::TransportAllocationCensus::unavailable(
+                "worker", "worker is stopping after cancel or failure")); }
+            Command::Cancel => {}
+        }
     }
 }
 
@@ -594,9 +630,15 @@ fn finish_worker<T: Transport>(native: &mut Native<T>, inbox: &mpsc::Receiver<Co
 pub(crate) trait ReplyFrame: Send + 'static {
     fn len(&self) -> usize;
     fn device_address(&self) -> Option<u64>;
+    fn allocation_census(&self, owner: &str) -> cuteafd_transport::TransportAllocationCensus {
+        cuteafd_transport::TransportAllocationCensus::unavailable(owner, "retained frame census is unavailable")
+    }
 }
 
 impl ReplyFrame for VerbsHostProtocolV2ResponsePayload {
+    fn allocation_census(&self, owner: &str) -> cuteafd_transport::TransportAllocationCensus {
+        VerbsHostProtocolV2ResponsePayload::allocation_census(self, owner)
+    }
     fn len(&self) -> usize { self.as_ref().len() }
     fn device_address(&self) -> Option<u64> {
         self.pinned_host_buffer().filter(|buffer| buffer.flags & cuteafd_ffi::CUTEAFD_HOST_BUFFER_FLAG_MAPPED != 0)
@@ -609,6 +651,9 @@ impl ReplyFrame for VerbsHostProtocolV2ResponsePayload {
 pub(crate) trait Transport: Send + 'static {
     type Wave: Send;
     type Frame: ReplyFrame;
+    fn allocation_census(&self) -> cuteafd_transport::TransportAllocationCensus {
+        cuteafd_transport::TransportAllocationCensus::unavailable("transport", "transport census is unavailable")
+    }
     /// Posts `request`; `landing` places the payload of each GPU-landing rank
     /// at that slice of its registered range.
     fn dispatch(&mut self, request: &ExpertProtocolV2Request, landing: Option<&[cuteafd_transport::LandingSlice]>)
@@ -630,6 +675,9 @@ pub(crate) trait Transport: Send + 'static {
 }
 
 impl Transport for SparkExperts {
+    fn allocation_census(&self) -> cuteafd_transport::TransportAllocationCensus {
+        SparkExperts::allocation_census(self)
+    }
     type Wave = (SparkExpertWave, WaveReceipt);
     type Frame = VerbsHostProtocolV2ResponsePayload;
     fn dispatch(&mut self, request: &ExpertProtocolV2Request, landing: Option<&[cuteafd_transport::LandingSlice]>)
@@ -753,6 +801,21 @@ impl<T: Transport> Native<T> {
 
 impl<T: Transport> Backend for Native<T> {
     type Wave = T::Wave;
+
+    fn allocation_census(&self) -> cuteafd_transport::TransportAllocationCensus {
+        let mut census = self.transport.allocation_census();
+        for (rank, (_, _, frames)) in self.receiving.iter().enumerate() {
+            for (index, frame) in frames.iter().enumerate() {
+                census.extend(frame.allocation_census(&format!("receiving.{rank}.{index}")));
+            }
+        }
+        for (wave, retained) in self.retained.iter().enumerate() {
+            for (index, frame) in retained.frames.iter().enumerate() {
+                census.extend(frame.allocation_census(&format!("retained.{wave}.{index}")));
+            }
+        }
+        census
+    }
 
     fn counter(&self, counter: Counter) -> u32 { self.words.load(counter) }
 
@@ -1070,6 +1133,11 @@ pub(crate) struct Waves<'a> {
 }
 
 impl<'a> Waves<'a> {
+    /// Bounded, one-shot observation only; not called by send/land/reduce.
+    pub(crate) fn worker_allocation_census(&self) -> cuteafd_transport::TransportAllocationCensus {
+        worker_census(self.jobs.as_ref(), Duration::from_secs(1))
+    }
+
     pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
         name: &str) -> Result<()> {
         self._storage.allocation_receipts(inventory, &format!("{name}.exchange"))?;
