@@ -199,7 +199,7 @@ pub(crate) fn startup_probe(library: &NativeLibrary, devices: &[i32], stage: &st
     } else if let Some(history) = evidence.history {
         (Some(history.events.len()), history.final_allocations.clone())
     } else { (None, memory_ledger::allocations()) };
-    let host = startup_memory::host(&native).unwrap_or_else(|error|
+    let host = startup_memory::host(&native, stage).unwrap_or_else(|error|
         json!({"complete": false, "findings": [format!("host sampling unavailable: {error:#}")]}));
     let census = evidence.census.map(|census| startup_memory::census(census, &native, devices)).transpose()?;
     let current = library.cuda_get_device()?;

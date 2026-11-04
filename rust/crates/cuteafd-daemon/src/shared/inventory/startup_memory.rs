@@ -69,8 +69,26 @@ fn intervals(records: &[AllocationRecord], page: u64) -> Result<(u64, Vec<(u64, 
     Ok((requested, merged))
 }
 
-/// Read only pagemap's public present bit. No PFN, privilege or CUDA operation.
-fn present_bytes(file: &File, begin: u64, end: u64, page: u64) -> Result<u64> {
+fn pagemap_presence(entries: &[u8], first: u64, page: u64,
+    missing: &mut impl FnMut(u64, u64)) -> u64 {
+    let mut present = 0;
+    for (index, entry) in entries.chunks_exact(8).enumerate() {
+        let entry = u64::from_ne_bytes(entry.try_into().unwrap());
+        if entry & (1 << 63) != 0 { present += page; }
+        else { missing((first + index as u64) * page, entry); }
+    }
+    present
+}
+
+fn pagemap_record(address: u64, entry: u64) -> Value {
+    json!({"address": address, "entry_hex": format!("{entry:#018x}"),
+        "present": entry & (1 << 63) != 0, "swapped": entry & (1 << 62) != 0,
+        "exclusive": entry & (1 << 56) != 0})
+}
+
+/// Unprivileged pagemap metadata only; never resolve PFNs or touch observed pages.
+fn present_bytes(file: &File, begin: u64, end: u64, page: u64,
+    missing: &mut impl FnMut(u64, u64)) -> Result<u64> {
     let mut present = 0;
     let mut first = begin / page;
     let last = end / page;
@@ -78,9 +96,7 @@ fn present_bytes(file: &File, begin: u64, end: u64, page: u64) -> Result<u64> {
     while first < last {
         let count = (last - first).min((buffer.len() / 8) as u64) as usize;
         file.read_exact_at(&mut buffer[..count * 8], first.checked_mul(8).context("pagemap offset overflow")?)?;
-        for entry in buffer[..count * 8].chunks_exact(8) {
-            if u64::from_ne_bytes(entry.try_into().unwrap()) & (1 << 63) != 0 { present += page; }
-        }
+        present += pagemap_presence(&buffer[..count * 8], first, page, missing);
         first += count as u64;
     }
     Ok(present)
@@ -95,6 +111,7 @@ fn host_accounting(maps: &[Mapping], ranges: &[(u64, u64)], page: u64,
     let mut present = 0u64;
     let mut findings = Vec::new();
     let mut complete = true;
+    let mut ordinary_complete = true;
     for &(begin, end) in ranges {
         covered += end - begin;
         let mut cursor = begin;
@@ -104,24 +121,28 @@ fn host_accounting(maps: &[Mapping], ranges: &[(u64, u64)], page: u64,
             if lo != cursor {
                 findings.push(format!("pinned range {cursor:#x}..{lo:#x} missing from smaps"));
                 complete = false;
+                ordinary_complete = false;
             }
             cursor = hi;
+            // RSS partitioning is smaps evidence, independent of pagemap presence.
+            let ordinary = if map.file { map.anonymous } else { map.rss };
+            if ordinary != 0 {
+                if lo == map.begin && hi == map.end {
+                    pinned_ordinary += ordinary;
+                } else if ordinary == map.rss && map.rss == map.end - map.begin {
+                    pinned_ordinary += hi - lo;
+                } else {
+                    findings.push(format!("partial pinned range in mixed/nonresident smaps mapping at {lo:#x}..{hi:#x}"));
+                    complete = false;
+                    ordinary_complete = false;
+                }
+            }
             match presence(lo, hi) {
                 Ok(bytes) => {
                     ensure!(bytes <= hi - lo && bytes % page == 0, "invalid pagemap presence");
                     present += bytes;
                     if bytes != hi - lo {
                         findings.push(format!("CUDA-pinned pages not fully present at {lo:#x}..{hi:#x}: {bytes} bytes"));
-                        complete = false;
-                    }
-                    let ordinary = if map.file { map.anonymous } else { map.rss };
-                    if ordinary == 0 { continue; }
-                    if lo == map.begin && hi == map.end {
-                        pinned_ordinary += ordinary;
-                    } else if ordinary == map.rss && map.rss == map.end - map.begin {
-                        pinned_ordinary += bytes;
-                    } else {
-                        findings.push(format!("partial pinned range in mixed/nonresident smaps mapping at {lo:#x}..{hi:#x}"));
                         complete = false;
                     }
                 }
@@ -134,6 +155,7 @@ fn host_accounting(maps: &[Mapping], ranges: &[(u64, u64)], page: u64,
         if cursor != end {
             findings.push(format!("pinned range {cursor:#x}..{end:#x} missing from smaps"));
             complete = false;
+            ordinary_complete = false;
         }
     }
     for map in maps {
@@ -147,22 +169,38 @@ fn host_accounting(maps: &[Mapping], ranges: &[(u64, u64)], page: u64,
         "pinned_page_covered_bytes": covered, "pinned_present_bytes": present,
         "pinned_resident_in_ordinary_rss_bytes": pinned_ordinary,
         "ordinary_owner": "host-heap (unattributed)",
-        "ordinary_rss_bytes": complete.then_some(heap),
-        "rss_reconstruction_residual_bytes": complete.then_some(rss as i64 - (heap + file_rss + pinned_ordinary) as i64),
+        "ordinary_rss_bytes": ordinary_complete.then_some(heap),
+        "ordinary_rss_complete": ordinary_complete,
+        "rss_reconstruction_residual_bytes": ordinary_complete.then_some(rss as i64 - (heap + file_rss + pinned_ordinary) as i64),
         "rss_tolerance_bytes": page, "complete": complete, "findings": findings,
         "scope": "phase process residence; exact pinned extents charged separately; diagnostic capacities not additive"
     }))
 }
 
-pub(super) fn host(records: &[AllocationRecord]) -> Result<Value> {
+fn log_missing_pagemap(stage: &str, records: &mut Vec<Value>) {
+    if records.is_empty() { return; }
+    tracing::info!(target: "cuteafd::placement", probe = %json!({"schema": 2,
+        "stage": stage, "kind": "pinned-missing-pages", "records": records}), "startup memory probe");
+    records.clear();
+}
+
+pub(super) fn host(records: &[AllocationRecord], stage: &str) -> Result<Value> {
     let page = crate::shared::host_heap::page_size();
     let (requested, ranges) = intervals(records, page)?;
     let maps = mappings(&std::fs::read_to_string("/proc/self/smaps")?)?;
     let pagemap = File::open("/proc/self/pagemap");
+    let mut missing = Vec::with_capacity(64);
+    let mut missing_count = 0u64;
     let mut value = host_accounting(&maps, &ranges, page, |begin, end| {
         let file = pagemap.as_ref().map_err(|error| anyhow::anyhow!("{error}"))?;
-        present_bytes(file, begin, end, page)
+        present_bytes(file, begin, end, page, &mut |address, entry| {
+            missing_count += 1;
+            missing.push(pagemap_record(address, entry));
+            if missing.len() == 64 { log_missing_pagemap(stage, &mut missing); }
+        })
     })?;
+    log_missing_pagemap(stage, &mut missing);
+    value["missing_pagemap_pages"] = json!(missing_count);
     value["pinned_requested_bytes"] = json!(requested);
     value["native_malloc_diagnostic_bytes"] = json!(records.iter().filter(|r| r.key.space == Space::Host)
         .map(|r| r.bytes as u64).sum::<u64>());
@@ -244,15 +282,34 @@ mod tests {
     }
 
     #[test]
-    fn missing_pinned_pages_and_unavailable_pagemap_are_findings() -> Result<()> {
-        let maps = mappings("1000-3000 rw-p 0000 00:00 0\nRss: 8 kB\nAnonymous: 8 kB\n")?;
-        for value in [host_accounting(&maps, &[(0x1000, 0x3000)], 4096, |_, _| Ok(4096))?,
-            host_accounting(&maps, &[(0x1000, 0x3000)], 4096, |_, _| anyhow::bail!("denied"))?] {
+    fn missing_pinned_pages_and_unavailable_pagemap_keep_measured_rss() -> Result<()> {
+        let maps = mappings("1000-3000 rw-p 0000 00:00 0\nRss: 8 kB\nAnonymous: 8 kB\n4000-6000 rw-p 0000 08:01 7 /cuda\nRss: 8 kB\nAnonymous: 0 kB\n7000-9000 rw-p 0000 00:00 0\nRss: 8 kB\nAnonymous: 8 kB\n")?;
+        for value in [host_accounting(&maps, &[(0x1000, 0x3000), (0x4000, 0x6000)], 4096, |_, _| Ok(4096))?,
+            host_accounting(&maps, &[(0x1000, 0x3000), (0x4000, 0x6000)], 4096, |_, _| anyhow::bail!("denied"))?] {
             assert_eq!(value["complete"], false);
-            assert!(value["ordinary_rss_bytes"].is_null());
+            assert_eq!(value["ordinary_rss_complete"], true);
+            assert_eq!(value["ordinary_rss_bytes"], 8192);
+            assert_eq!(value["pinned_resident_in_ordinary_rss_bytes"], 8192);
+            assert_eq!(value["file_mapping_resident_bytes"], 8192);
+            assert_eq!(value["rss_reconstruction_residual_bytes"], 0);
             assert!(!value["findings"].as_array().unwrap().is_empty());
         }
         Ok(())
+    }
+
+    #[test]
+    fn missing_pagemap_entries_preserve_address_raw_bits_and_presence() {
+        let words = [1u64 << 63, (1u64 << 62) | (1 << 56) | 7, 0];
+        let bytes = words.into_iter().flat_map(u64::to_ne_bytes).collect::<Vec<_>>();
+        let mut missing = Vec::new();
+        assert_eq!(pagemap_presence(&bytes, 3, 4096, &mut |a, e| missing.push((a, e))), 4096);
+        assert_eq!(missing, [(0x4000, words[1]), (0x5000, words[2])]);
+        let record = pagemap_record(missing[0].0, missing[0].1);
+        assert_eq!(record["address"], 0x4000);
+        assert_eq!(record["entry_hex"], "0x4100000000000007");
+        assert_eq!(record["present"], false);
+        assert_eq!(record["swapped"], true);
+        assert_eq!(record["exclusive"], true);
     }
 
     #[test]
