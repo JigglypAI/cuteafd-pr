@@ -3842,10 +3842,12 @@ impl<'a> Qwen4Engine<'a> {
         let position = w.position.get();
         // SAFETY: ids, weights and input rows hold this wave's `t` rows in
         // stream order; the copies read them before later stream work.
+        let combined_reply = origins.as_ref().map_or_else(|| crate::shared::spark_waves::single_reply_eligible(t, kind),
+            crate::shared::prefill_pipeline::ReplyOrigins::combined_reply_eligible);
         let ticket = unsafe {
             exchange.send(t, exchange.compact_payload(t), layout, [sized(w.route_ids.buffer, layout.route_bytes),
                 sized(w.route_weights.buffer, layout.route_bytes), sized(input, layout.wire_bytes)],
-                self.execution_stream(), Box::new(move |routes, wire| {
+                self.execution_stream(), combined_reply, Box::new(move |routes, wire| {
                     let mut request = ExpertProtocolV2Request::new_bytes(request_id, 17, index as u32, h as u32,
                         if bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
                         (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {

@@ -195,6 +195,11 @@ void fixture_configure_pack(int pack, int drain) {
 
 void fixture_configure_drain_after(int after) { drain_after = after; }
 
+int cuteafd_cuda_dmabuf_allocation_granularity(size_t *out) {
+    *out = 2 * 1024 * 1024;
+    return 0;
+}
+
 int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out) {
     if (posix_memalign(&out->ptr, 256, bytes)) return 1;
     /* Zeroed so operand digests never read unspecified padding. */
@@ -717,4 +722,25 @@ int cuteafd_exl3_wire_decode(void *handle, const uint8_t *input, uint64_t in_byt
                            uint16_t *output, uint64_t out_bytes, uint32_t rows, void *stream) {
     (void)handle; (void)input; (void)in_bytes; (void)output;
     (void)out_bytes; (void)rows; (void)stream; return 0;
+}
+
+/* Device SEND registration fails deliberately; the real ring must select and
+ * register its existing pinned payload slots, not retry device allocation. */
+int cuteafd_rdma_rc_endpoint_register_device_region(void *handle, void *ptr,
+        size_t bytes, uint32_t *region) {
+    (void)handle; (void)region;
+    if (!ptr || bytes != 2 * 1024 * 1024) return 1;
+    event('G');
+    return 7;
+}
+int cuteafd_rdma_rc_endpoint_register_region(void *handle, void *ptr,
+        size_t bytes, uint32_t *region) {
+    (void)handle;
+    if (!ptr || !bytes || !region) return 1;
+    event('H');
+    *region = 7;
+    return 0;
+}
+int cuteafd_rdma_rc_endpoint_destroy(void *handle) {
+    (void)handle; event('X'); return 0;
 }

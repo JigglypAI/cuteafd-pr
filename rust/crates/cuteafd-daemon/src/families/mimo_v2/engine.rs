@@ -3069,8 +3069,10 @@ impl<'a> MimoEngine<'a> {
         ensure!(exchange.ranks() <= MAX_RANKS, "{} Spark ranks exceed the reduction planes", exchange.ranks());
         // SAFETY: ids, weights and input rows hold this wave's `t` rows in
         // stream order; the copies read them before later stream work.
+        let combined_reply = origins.as_ref().map_or_else(|| crate::shared::spark_waves::single_reply_eligible(t, kind),
+            crate::shared::prefill_pipeline::ReplyOrigins::combined_reply_eligible);
         unsafe {
-            exchange.send(t, exchange.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer, input.buffer], self.stream,
+            exchange.send(t, exchange.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer, input.buffer], self.stream, combined_reply,
                 Box::new(move |routes, wire| {
                     let mut request = mimo_request(routes, wire, index, t, h, topk, kind, bf16_input)?;
                     if let Some(origins) = origins { origins.apply(&mut request)?; }
