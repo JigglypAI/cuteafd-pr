@@ -242,6 +242,30 @@ pub(crate) struct Pair<'a> {
 }
 
 impl<'a> Pair<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for (rank, backend) in self.ranks.iter().enumerate() {
+            backend.try_borrow()?.allocation_receipts(inventory, &format!("{name}.rank.{rank}"))?;
+        }
+        for (rank, key, buffer) in self.routes.allocation_buffers() {
+            inventory.device(&format!("{name}.routes.rank.{rank}.{key}"), buffer)?;
+        }
+        if let Some((address, bytes)) = self.routes.diagnostic_host_backing()? {
+            inventory.host_backing(&format!("{name}.routes.ordinals"), address, bytes)?;
+        }
+        inventory.host(&format!("{name}.active"), &*self.active.try_borrow()?)?;
+        if let Some(checks) = self.checks.try_borrow()?.as_ref() {
+            for (slot, layers) in checks.allocation_storage().enumerate() {
+                for (layer, ranks) in layers {
+                    for (rank, host) in ranks.iter().enumerate() {
+                        inventory.pinned(&format!("{name}.checks.{slot}.{layer}.{rank}"), host.buffer)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         library: &'a NativeLibrary,

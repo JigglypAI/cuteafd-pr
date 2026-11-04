@@ -119,6 +119,18 @@ fn budget(catalog: &OfficialV41Catalog, plan: &V41Exl3Residency) -> Result<Exper
 }
 
 impl<'a> Exl3Weights<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        let owner = match &self._arena {
+            ArenaOwner::Mount(owner) => owner.buffer,
+            ArenaOwner::Push { _rank } => _rank.allocation_buffer(),
+        };
+        for (index, buffer) in self.buffers.iter().enumerate() {
+            inventory.backed_device(&format!("{name}.{index}"), buffer.buffer, owner)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn resident_bytes(&self) -> usize {
         match &self._arena {
             ArenaOwner::Mount(arena) => arena.buffer.bytes,

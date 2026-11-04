@@ -47,6 +47,23 @@ impl<'a> NativeScratch<'a> {
     }
 }
 
+impl NativeScratch<'_> {
+    /// Actual retained owners, independent of requested scratch extents.
+    pub(super) fn allocation_buffers(&self) -> Vec<(&'static str, Buffer)> {
+        let linear = self.linear.view();
+        let mut out = vec![
+            ("linear.rotated", linear.rotated), ("linear.table", linear.table),
+            ("linear.block_scales", linear.block_scales), ("linear.partial", linear.partial),
+            ("linear.acc", linear.acc), ("stage.qkv", self.qkv.buffer), ("stage.q", self.q.buffer),
+            ("stage.gate", self.gate.buffer), ("stage.up", self.up.buffer),
+            ("stage.hidden", self.hidden.buffer), ("stage.kw", self.kw.buffer),
+            ("stage.iq", self.iq.buffer), ("stage.values", self.values.buffer),
+        ];
+        if let Some(records) = linear.records { out.push(("linear.records", records)); }
+        out
+    }
+}
+
 /// A buffer's first `bytes`.
 fn head(buffer: Buffer, bytes: usize) -> Result<Buffer> {
     ensure!(bytes <= buffer.bytes, "native view of {bytes} B past a {} B buffer", buffer.bytes);

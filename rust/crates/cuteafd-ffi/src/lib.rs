@@ -3220,6 +3220,24 @@ impl NativeLibrary {
         Ok(bytes)
     }
 
+    /// Inspect the current synchronous upload backing without allocating or waiting.
+    /// The descriptor borrows this library's storage and must not outlive it.
+    pub fn sync_h2d_staging_buffer(&self) -> Result<Option<CuteafdHostBuffer>> {
+        let staging = self.sync_h2d_staging.lock()
+            .map_err(|_| anyhow::anyhow!("synchronous H2D pinned staging lock is poisoned"))?;
+        Ok((!staging.buffer.ptr.is_null()).then_some(staging.buffer))
+    }
+
+    /// Inspect an existing ordered-upload backing. An unused destination is absent;
+    /// observing it never creates staging, records an event or changes the device.
+    pub fn ordered_h2d_staging_buffer(&self, dst: CuteafdDeviceBuffer,
+        stream: *mut c_void) -> Result<Option<CuteafdHostBuffer>> {
+        let entries = self.ordered_h2d_staging.lock()
+            .map_err(|_| anyhow::anyhow!("ordered H2D staging lock is poisoned"))?;
+        Ok(entries.get(&(dst.device_id, stream as usize, dst.ptr as usize))
+            .map(|entry| entry.staging.buffer))
+    }
+
     #[cfg(test)]
     fn sync_h2d_staging_snapshot(&self) -> Option<(usize, usize)> {
         let staging = self.sync_h2d_staging.lock().ok()?;

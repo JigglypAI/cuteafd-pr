@@ -109,6 +109,19 @@ fn native_projection_ranges(name: &str, range: impl Fn(&str) -> Option<crate::sh
 }
 
 impl GlmLayer<'_> {
+    pub(crate) fn allocation_buffers(&self) -> Vec<(String, CuteafdDeviceBuffer)> {
+        let mut out = self.operands.iter().map(|(name, owner)| (format!("operand.{name}"), owner.buffer))
+            .chain(self.native.iter().map(|(name, owner)| (format!("native.{name}"), owner.buffer)))
+            .collect::<Vec<_>>();
+        for (name, weights) in &self.core {
+            for (component, owner) in [("payload", &weights.payload), ("suh", &weights.suh), ("svh", &weights.svh)] {
+                out.push((format!("core.{name}.{component}"), owner.buffer));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// The loader's attention residency controls cache and prefix-snapshot ownership.
     pub fn holds_attention(&self) -> bool {
         self.attention_resident

@@ -785,6 +785,20 @@ impl Exl3Tp2<'_> {
 }
 
 impl RtxExpertLayer for Exl3Tp2<'_> {
+    fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for (index, weight) in self.weights.iter().enumerate() {
+            weight.allocation_receipts(inventory, &format!("{name}.weight.{}", self.layers[index]))?;
+        }
+        if let Some(executions) = &self.executions {
+            for (index, execution) in executions.iter().enumerate() {
+                execution.allocation_receipts(inventory, &format!("{name}.execution.{index}"))?;
+            }
+        }
+        if let Some(output) = &self.output { inventory.device(&format!("{name}.output"), output.buffer)?; }
+        Ok(())
+    }
+
     fn shard(&self) -> RtxShard {
         self.shard
     }

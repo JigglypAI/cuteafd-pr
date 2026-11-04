@@ -793,6 +793,15 @@ impl<'a> NativeTp2<'a> {
 }
 
 impl RtxExpertLayer for NativeTp2<'_> {
+    fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for (index, weight) in self.weights.iter().enumerate() {
+            weight.allocation_receipts(inventory, &format!("{name}.weight.{}", self.layers[index]))?;
+        }
+        inventory.device(&format!("{name}.scratch"), self._scratch.buffer)?;
+        inventory.device(&format!("{name}.output"), self.output.buffer)
+    }
+
     fn shard(&self) -> RtxShard {
         RtxShard::Tp2 { rank: self.rank }
     }

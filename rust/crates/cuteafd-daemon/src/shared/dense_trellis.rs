@@ -377,6 +377,8 @@ pub(crate) struct CoreHead<'a> {
     stream: *mut c_void, rows: usize,
 }
 impl<'a> CoreHead<'a> {
+    pub(crate) fn allocation_scratch(&self) -> &ProjectionScratch<'a> { &self.scratch }
+
     pub(crate) fn new(programs: &'a Programs<'a>, weights: &CoreWeights<'a>, rows: usize,
         device: Device<'a>, stream: *mut c_void,
         admitted: &cuteafd_loader::formats::trellis_core::ProjectionScratchLayout) -> Result<Self> {

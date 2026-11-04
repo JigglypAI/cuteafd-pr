@@ -466,6 +466,22 @@ impl IntakeState {
 }
 
 impl<'a> SparkIntake<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for (rank, plane) in self.planes.iter().enumerate() {
+            inventory.backed_device(&format!("{name}.plane.{rank}"), plane.buffer, plane._allocation.buffer)?;
+        }
+        if let Some(storage) = self.exchange_storage.try_borrow()?.as_ref() {
+            storage.allocation_receipts(inventory, &format!("{name}.exchange"))?;
+        }
+        if let Some(staging) = &self.staging {
+            inventory.pinned(&format!("{name}.staging"), staging.try_borrow()?.buffer)?;
+        }
+        inventory.host(&format!("{name}.consumed"), &self.consumed)?;
+        inventory.host(&format!("{name}.landed"), &self.landed)?;
+        inventory.host(&format!("{name}.consumed_pending"), &self.state.consumed_pending)
+    }
+
     pub(crate) fn new(library: &'a NativeLibrary, mode: IntakeMode, ranks: usize, rows: usize, row_bytes: usize)
         -> Result<Self> {
         Self::with_waves(library, mode, ranks, rows, row_bytes, 1)
@@ -1579,6 +1595,15 @@ pub(crate) struct SparkLink<'a> {
 }
 
 impl<'a> SparkLink<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        self.intake.allocation_receipts(inventory, &format!("{name}.intake"))?;
+        if let Some(exchange) = &self.exchange {
+            exchange.allocation_receipts(inventory, &format!("{name}.waves"))?;
+        }
+        Ok(())
+    }
+
     /// Connects a [`SparkExperts::new_world`] transport whose `capacity`-row
     /// waves land in an intake of the process-wide [`choose_mode`].
     pub(crate) fn new(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld, peers: &[std::net::SocketAddr], capacity: u32,

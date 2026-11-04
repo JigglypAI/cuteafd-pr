@@ -97,6 +97,8 @@ impl StagingArena {
     pub fn host(&self) -> CuteafdHostBuffer {
         self.buffer.target(self.slot).expect("validated egress slot")
     }
+    /// The whole retained allocation, not just this arena's slot view.
+    pub fn allocation_buffer(&self) -> CuteafdHostBuffer { self.buffer.host() }
     pub fn bytes(&self) -> usize { self.buffer.slot_bytes }
     /// No request payload views the arena.
     pub fn writable(&self) -> bool { self.buffer.writable(self.slot) }

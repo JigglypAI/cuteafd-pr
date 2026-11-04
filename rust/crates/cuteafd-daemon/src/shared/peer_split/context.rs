@@ -185,6 +185,10 @@ pub(crate) struct ContextExchange<'a> {
 }
 
 impl<'a> ContextExchange<'a> {
+    pub(crate) fn allocation_buffers(&self) -> [cuteafd_ffi::CuteafdDeviceBuffer; 2] {
+        self.storage.each_ref().map(|owner| owner.buffer)
+    }
+
     /// Allocates the exchange `buffers` describes on both GPUs (zeroed),
     /// enabling peer access both ways; `ranks[0]`'s device must be current,
     /// and is again on return. `abort`: the head split's terminal abort words

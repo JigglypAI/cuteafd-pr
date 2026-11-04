@@ -376,6 +376,26 @@ pub(crate) fn mask_launch_arguments(mask_rows: usize, mask_device: CuteafdDevice
 }
 
 impl<'a> TargetSamplingWave<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for (key, owner) in [
+            ("params", &self.param_device), ("masks", &self.mask_device), ("scratch", &self.scratch),
+            ("bitmap", &self.bitmap), ("histogram", &self.histogram), ("ids", &self.ids_device),
+            ("status", &self.status_device), ("detail", &self.detail_device), ("scores", &self.scores_device),
+            ("total", &self.total_device), ("nucleus", &self.nucleus_device),
+            ("rank_ids", &self.rank_order_ids), ("rank_scratch", &self.rank_order_scratch),
+            ("retained", &self.retained_count_device), ("passes", &self.pivot_passes_device),
+        ] { inventory.device(&format!("{name}.device.{key}"), owner.buffer)?; }
+        for (key, owner) in [
+            ("params", &self.param_pinned), ("masks", &self.mask_pinned), ("ids", &self.ids_pinned),
+            ("status", &self.status_pinned), ("detail", &self.detail_pinned), ("scores", &self.scores_pinned),
+            ("retained", &self.retained_count_staging),
+        ] { inventory.pinned(&format!("{name}.pinned.{key}"), owner.buffer)?; }
+        inventory.host(&format!("{name}.host.params"), &self.params)?;
+        inventory.host(&format!("{name}.host.status"), &self.last_status)?;
+        inventory.host(&format!("{name}.host.retained"), &self.last_retained)
+    }
+
     pub(crate) fn new(library: &'a NativeLibrary, capacity: usize, vocab: usize) -> Result<Self> {
         Self::allocate(library, SamplerStages::native(), capacity, vocab)
     }

@@ -111,6 +111,27 @@ pub(crate) struct TokenEmbedding<'a> {
 }
 
 impl<'a> TokenEmbedding<'a> {
+    pub(crate) fn allocation_receipts(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::Lifetime;
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "glm.embedding",
+            Lifetime::TARGET, Category::Weights, "embedding owners");
+        match &self.table {
+            ResidentWeight::Device(owner) => inventory.device("table", owner.buffer)?,
+            ResidentWeight::Host { storage, .. } => inventory.pinned("table", storage.buffer)?,
+        }
+        if let Some(vocabulary) = &self.row_fp8 {
+            inventory.device("native.payload", vocabulary.embedding.payload())?;
+            inventory.device("native.scales", vocabulary.embedding.scales())?;
+        }
+        Ok(inventory.receipts)
+    }
+
+    pub(crate) fn shares_vocabulary(&self, vocabulary: &std::rc::Rc<native::NativeVocabulary<'_>>) -> bool {
+        self.row_fp8.as_ref().is_some_and(|owner| std::rc::Rc::ptr_eq(owner, vocabulary))
+    }
+
     /// Opens the table. With [`EmbedPlacement::Gpu`] the table is allocated
     /// first (so it is admitted with the weights) and filled on a background
     /// thread while `during` runs. Under dense recording, its operand is
@@ -635,6 +656,14 @@ fn check_selector_device(output: i32, stream: i32) -> Result<()> {
 }
 
 impl<'a> TokenSelector<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        inventory.device(&format!("{name}.greedy"), self.out.buffer)?;
+        inventory.pinned(&format!("{name}.landing"), self.landing.buffer)?;
+        if let Some(wave) = &self.wave { wave.allocation_receipts(inventory, &format!("{name}.sampler"))?; }
+        Ok(())
+    }
+
     /// A selector for up to `capacity` rows of `vocab` logits.
     pub fn new(library: &'a NativeLibrary, placement: SelectPlacement, vocab: usize, capacity: usize) -> Result<Self> {
         ensure!(capacity > 0 && vocab > 0, "token selector of {capacity} rows x {vocab}");

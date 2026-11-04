@@ -214,6 +214,20 @@ impl<'a> From<DeviceAllocation<'a>> for Fp8Region<'a> {
 }
 
 impl<'a> Fp8Layer<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for (index, region) in self.regions.iter().enumerate() {
+            if let Some(region) = region {
+                let owner = match &region._storage {
+                    Fp8Storage::Owned { _allocation } => _allocation.buffer,
+                    Fp8Storage::Shared { _arena } => _arena.allocation_buffer(),
+                };
+                inventory.backed_device(&format!("{name}.plane.{index}"), region.buffer, owner)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn from_push(owner: Rc<ReadyArena<'a>>, region: usize,
         plan: &crate::shared::memory::push_fp8::LayerPlan, base: usize) -> Result<Self> {
         let view = owner.region(region)?;

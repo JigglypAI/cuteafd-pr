@@ -92,6 +92,10 @@ pub(crate) struct CoreScratch<'a> {
     stages: BTreeMap<&'static str, Allocation<'a>>,
 }
 impl CoreScratch<'_> {
+    pub(crate) fn allocation_stages(&self) -> impl Iterator<Item = (&'static str, Buffer)> + '_ {
+        self.stages.iter().map(|(&name, owner)| (name, owner.buffer))
+    }
+
     pub(crate) fn stage(&self, name: &str) -> Result<Buffer> {
         Ok(self.stages.get(name).with_context(|| format!("GLM K6 missing stage {name}"))?.buffer)
     }

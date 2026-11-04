@@ -87,6 +87,10 @@ struct CheckedUnit {
 }
 
 impl<T> SlotRouteChecks<T> {
+    pub(crate) fn allocation_storage(&self) -> impl Iterator<Item = &T> {
+        self.slots.iter().map(|(storage, _)| storage)
+    }
+
     /// Explicit opt-in diagnostics use `strict`; startup checks keep broadcast fallback.
     pub(crate) fn new(storage: Vec<T>, strict: bool) -> anyhow::Result<Self> {
         anyhow::ensure!(!storage.is_empty(), "route diagnostics need at least one slot");

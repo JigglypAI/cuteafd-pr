@@ -42,6 +42,7 @@ fn decode_peer_bytes(rows: usize, hidden: usize, exchange: ExchangeDtype) -> usi
 mod tp2;
 mod packing;
 mod layers;
+mod allocation;
 #[path = "engine/native_dense.rs"]
 pub(crate) mod native_dense;
 #[cfg(test)]

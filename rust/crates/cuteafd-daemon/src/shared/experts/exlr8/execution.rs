@@ -362,6 +362,47 @@ impl<'a> Exlr8Execution<'a> {
             set,
         })
     }
+    /// Census retained storage and the actual kernel bindings, not forecast records.
+    pub(crate) fn workspace_receipts(&self, prefix: &str,
+        location: cuteafd_loader::placement::planner::Location, physical_device: i32,
+        lifetime: cuteafd_loader::placement::planner::Lifetime)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{Allocation, Domain, Receipt, View};
+        ensure!(!prefix.is_empty() && location.domain == Domain::Device,
+            "invalid EXLR8 workspace census identity");
+        let arena = self.arena.buffer;
+        let receipt = |name: &str, buffer: CuteafdDeviceBuffer| -> Result<Receipt> {
+            ensure!(buffer.device_id == physical_device && !buffer.ptr.is_null() && buffer.bytes > 0,
+                "EXLR8 workspace has wrong physical device or empty buffer");
+            let mut allocation = Allocation::buffer(format!("{prefix}.{name}"), location,
+                u64::try_from(buffer.bytes)?, lifetime, Category::Workspace, "EXLR8 expert workspace");
+            allocation.alignment = 256;
+            Ok(Receipt { allocation, address: buffer.ptr as u64 })
+        };
+        let mut out = vec![receipt("arena", arena)?];
+        let mut binding = |name: &str, buffer: CuteafdDeviceBuffer| -> Result<()> {
+            let mut actual = receipt(name, buffer)?;
+            let offset = (buffer.ptr as usize).checked_sub(arena.ptr as usize)
+                .context("EXLR8 workspace binding precedes physical owner")?;
+            ensure!(offset.checked_add(buffer.bytes).is_some_and(|end| end <= arena.bytes),
+                "EXLR8 workspace binding exceeds physical owner");
+            actual.allocation.view = Some(View { backing: format!("{prefix}.arena"), offset: u64::try_from(offset)? });
+            out.push(actual);
+            Ok(())
+        };
+        for (name, index) in [("input", 0), ("ids", 1), ("route_weights", 2), ("output", 3),
+            ("group_expert", 4), ("route_slots", 5), ("route_group_lane", 6), ("group_count", 7),
+            ("fc1", 8), ("intermediate_fc2", 9), ("rotated", 10)] {
+            binding(name, self.buffer(index)?)?;
+        }
+        let combined = self.buffer(9)?;
+        binding("intermediate", view(combined, 0, self.intermediate_bytes)?)?;
+        binding("fc2", view(combined, self.intermediate_bytes,
+            combined.bytes.checked_sub(self.intermediate_bytes).context("EXLR8 FC2 split exceeds buffer")?)?)?;
+        Ok(out)
+    }
+
     fn buffer(&self, index: usize) -> Result<CuteafdDeviceBuffer> {
         let (offset, bytes) = self.layout.ranges[index];
         view(self.arena.buffer, offset, bytes)

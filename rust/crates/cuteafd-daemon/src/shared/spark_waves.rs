@@ -982,6 +982,15 @@ pub(crate) struct ExchangeStorage<'a> {
     format: cuteafd_core::SparkReplyFormat,
 }
 impl<'a> ExchangeStorage<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        inventory.backed_pinned(&format!("{name}.control"), self.control.buffer, self.control.buffer)?;
+        if let Some(block) = &self.pull_block {
+            inventory.backed_pinned(&format!("{name}.pull"), block.buffer, block.buffer)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(library: &'a NativeLibrary, intake: &Intake) -> Result<Self> {
         let slots = intake.geometry.slots();
         let pinned = intake.pinned() != 0;
@@ -1061,6 +1070,20 @@ pub(crate) struct Waves<'a> {
 }
 
 impl<'a> Waves<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        self._storage.allocation_receipts(inventory, &format!("{name}.exchange"))?;
+        for (slot, arena) in self.arenas.iter().enumerate() {
+            inventory.backed_pinned(&format!("{name}.egress.{slot}"), arena.host(), arena.allocation_buffer())?;
+        }
+        inventory.host(&format!("{name}.arena_alias"), &self.arena_alias)?;
+        inventory.host(&format!("{name}.ranges"), &self.ranges)?;
+        inventory.host(&format!("{name}.layouts"), &self.layouts)?;
+        inventory.host(&format!("{name}.unread"), &self.unread)?;
+        inventory.host(&format!("{name}.uses"), &self.uses)?;
+        inventory.host(&format!("{name}.grouping"), &self.grouping)
+    }
+
     /// Starts the worker on `transport` (bootstrapped; connections open) for
     /// `intake`'s slots, staging each wave's request in `arenas` (one per slot).
     pub(crate) fn start<T: Transport>(library: &'a NativeLibrary, intake: Intake, transport: T,

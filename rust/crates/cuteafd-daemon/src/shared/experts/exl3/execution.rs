@@ -577,6 +577,20 @@ pub(crate) enum Exl3InputFormat {
 }
 
 impl<'a> Exl3Execution<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        if let Some(wire) = &self.wire { inventory.device(&format!("{name}.wire"), wire.buffer)?; }
+        for (index, owner) in self._storage.iter().enumerate() {
+            inventory.device(&format!("{name}.storage.{index}"), owner.buffer)?;
+        }
+        if let Some(shared) = &self._shared_workspace {
+            for (key, owner) in &shared.allocations {
+                inventory.backed_device(&format!("{name}.shared.{key}"), owner.buffer, owner.buffer)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_artifact(directory: &Path) -> Result<()> {
         let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
         meta.validate_native_contract()

@@ -157,6 +157,18 @@ impl<'a> Exlr8RtxWeights<'a> {
 }
 
 impl RtxExpertLayer for Exlr8Rtx<'_> {
+    fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for (index, weight) in self.owner.weights.iter().enumerate() {
+            weight.allocation_receipts(inventory, &format!("{name}.weight.{}", self.owner.layers[index]))?;
+        }
+        for (index, execution) in self.executions.iter().enumerate() {
+            inventory.extend(execution.workspace_receipts(&format!("{name}.execution.{index}"),
+                inventory.location(self.owner.device.id)?, self.owner.device.id, inventory.lifetime())?)?;
+        }
+        inventory.device(&format!("{name}.output"), self.output.buffer)
+    }
+
     fn shard(&self) -> RtxShard { self.owner.shard }
     fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }
     fn uses_fp8_input(&self) -> bool { true }
