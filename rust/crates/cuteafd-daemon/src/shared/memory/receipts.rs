@@ -109,26 +109,6 @@ impl<'a> Inventory<'a> {
         self.receipts.last_mut().unwrap().allocation.view = Some(View { backing, offset });
         Ok(())
     }
-
-    pub(crate) fn projection(&mut self, name: &str,
-        scratch: &crate::shared::dense_trellis::ProjectionScratch<'_>) -> Result<()> {
-        for (&key, owner) in &scratch._owners {
-            self.device(&format!("{name}.storage.{}", key.replace(' ', "_")), owner.buffer)?;
-        }
-        for (&key, &buffer) in &scratch.buffers {
-            let start = buffer.ptr as usize;
-            let end = start.checked_add(buffer.bytes).context("projection view overflow")?;
-            let mut matches = scratch._owners.iter().filter(|(_, owner)| {
-                buffer.device_id == owner.buffer.device_id && start >= owner.buffer.ptr as usize
-                    && (owner.buffer.ptr as usize).checked_add(owner.buffer.bytes).is_some_and(|limit| end <= limit)
-            });
-            let (&backing, owner) = matches.next().context("projection view without backing")?;
-            ensure!(matches.next().is_none(), "ambiguous projection backing");
-            self.view(&format!("{name}.view.{key}"), buffer,
-                &format!("{name}.storage.{}", backing.replace(' ', "_")), owner.buffer)?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
