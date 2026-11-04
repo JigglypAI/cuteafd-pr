@@ -147,9 +147,9 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
 - Submodules are pinned with tree locks (`third_party/*.lock.json`).
   Kernel changes go to `~/Developer/sparkinfer-glmrt` master, quantizer changes to
   `~/Developer/GPTQModel` main; push there first, then bump pin and lock here.
-  A fork or export-source bump regenerates and publishes V4 placement inputs
+  A fork or export-source bump regenerates and publishes V4 and all-family placement inputs (`scripts/build/export-placement-inputs.py`, `~/.cache/cuteafd/builds/placement-inputs/<sha>/` plus `current`)
   at the merged dev SHA, validated beforehand through
-  `CUTEAFD_V4_PLACEMENT_INPUTS` without switching `current`.
+  `CUTEAFD_V4_PLACEMENT_INPUTS` / `CUTEAFD_DEPLOYMENT_TEST_PROGRAMS` without switching `current`.
   Dev images are toolchain-only and pin-independent: a SparkInfer bump
   needs only a new WIP slot build. Rebuild them with
   `scripts/build/build-dev-images.sh` only when the toolchain changes;
@@ -173,8 +173,11 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   plans through the launcher's `release_prefill_shape`. That sweep uses
   `HF_HOME` (or `~/.cache/huggingface`); override with
   `CUTEAFD_DEPLOYMENT_TEST_HF_HOME` and optionally supply the matching
-  `CUTEAFD_DEPLOYMENT_TEST_PROGRAMS` manifest and adjacent exports. Missing
-  checkpoints/revisions skip explicitly; installed planner failures still fail.
+  `CUTEAFD_DEPLOYMENT_TEST_PROGRAMS` manifest and adjacent exports (default
+  `~/.cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json`). Missing
+  checkpoints/revisions or missing/stale exports fail; only the explicitly
+  recorded `--skip-live-planners` opts out. Installed inventories exclude
+  retired example configs and read live cells from `benchmarks/current-matrix.json`.
   Release cuts also add `--slow`
   for explicit ignored CPU soaks, not arbitrary ignored GPU/network tests.
   Full-plan tests use `plan::testing::BudgetedPlanInput`'s strict 30 s per-plan
@@ -227,7 +230,9 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   `scripts/build/cuteafd-dev.sh cpu -- COMMAND` runs CPU-only with the canonical
   `/workspace/cuteafd` source mount and passes optional cache mounts/setup. Container
   targets use `CUTEAFD_DEV_TARGET_DIR=$HOME/.cache/cuteafd/builds/<task>/target`
-  (guarded NVMe bind mount); do not use an image-layer target cache as a substitute. Prefer canonical CPU gates
+  (guarded NVMe bind mount); do not use an image-layer target cache as a substitute.
+  `CUTEAFD_DEV_BASELINE_SOURCE=<engine checkout>` mounts a second pinned checkout read-only
+  at its own path for `compare-sm-exports.py --baseline-source`. Prefer canonical CPU gates
   for cross-worktree hits; never normalize `CARGO_MANIFEST_DIR` away (it is a real runtime input).
   Opt-in artifacts carry `COMPILER_PROVENANCE.json`: source commit/dirty, toolchain,
   actual cache mode/fallback, flags/remapping and binary SHA256. Vanilla hashes may
