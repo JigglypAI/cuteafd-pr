@@ -579,6 +579,7 @@ fn planner_equals_runtime_deepseek_v4() {
     let pro = Shared::open(&pro).unwrap();
     eprintln!("live V4 equality: checkpoints ready after {:?}", sweep_started.elapsed());
     let mut cases = 0;
+    let mut failures = Vec::new();
     for context in [131_072u64, 1_048_576] {
         for (model, shared, rtx, sparks) in [("flash", &flash, 1, 2), ("flash", &flash, 2, 4),
             ("pro", &pro, 1, 4), ("pro", &pro, 2, 6)] {
@@ -592,21 +593,36 @@ fn planner_equals_runtime_deepseek_v4() {
                         peer_budget: asymmetric.then_some(budget - (2 << 30)), attention: None };
                     eprintln!("live V4 equality: starting case {} after {:?}: {model} rtx{rtx} {context} {onboard:?} asym={asymmetric}",
                         cases + 1, sweep_started.elapsed());
-                    let placement = assert_equal(shared, &case, &format!("{model} rtx{rtx} {context} {onboard:?} asym={asymmetric}"));
+                    let label = format!("{model} rtx{rtx} {context} {onboard:?} asym={asymmetric}");
+                    // Run the complete matrix even when one case fails; retain every diagnostic.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let placement = assert_equal(shared, &case, &label);
+                        if rtx == 2 {
+                            assert!(placement.expert_ranges.iter().all(|r| r.layers == 0));
+                            assert_eq!(placement.tp2.map_or(0, |t| t.layers), placement.onboard_layers);
+                            assert_eq!(placement.expert_ranges[1].peak_bytes, 0);
+                            if placement.onboard_layers > 0 {
+                                assert!(placement.expert_ranges[0].peak_bytes > 0);
+                                if onboard.is_none() || onboard == Some(OnboardSetting::Auto) {
+                                    assert_eq!(placement.pool_tokens, 2 << 20);
+                                }
+                            }
+                        } else { assert!(placement.tp2.is_none()); }
+                    }));
                     cases += 1;
-                    if rtx == 2 {
-                        assert!(placement.expert_ranges.iter().all(|r| r.layers == 0));
-                        assert_eq!(placement.tp2.unwrap().layers, placement.onboard_layers);
-                        assert!(placement.expert_ranges[0].peak_bytes > 0);
-                        assert_eq!(placement.expert_ranges[1].peak_bytes, 0);
-                        if onboard.is_none() || onboard == Some(OnboardSetting::Auto) { assert_eq!(placement.pool_tokens, 2 << 20); }
-                    } else { assert!(placement.tp2.is_none()); }
+                    if let Err(payload) = result {
+                        let message = payload.downcast_ref::<String>().map(String::as_str)
+                            .or_else(|| payload.downcast_ref::<&str>().copied())
+                            .unwrap_or("non-string panic payload");
+                        failures.push(format!("case {cases}: {label}\n{message}"));
+                    }
                 }
             }
         }
     }
     assert_eq!(cases, 80);
     eprintln!("live V4 equality: {cases} cases in {:?}", sweep_started.elapsed());
+    assert!(failures.is_empty(), "{} V4 equality cases failed:\n{}", failures.len(), failures.join("\n\n"));
 }
 
 #[test]
