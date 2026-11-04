@@ -1607,3 +1607,126 @@ pub fn write_mistral_large4_snapshot(dir: &Path, expert_layers: Option<&[usize]>
     fs::write(dir.join("processor_config.json"),
         include_str!("../families/mistral_large4/official-processor-config.json")).unwrap();
 }
+
+/// Live V4 planner inputs are compiled by compare-sm-exports.py, not fixtures.
+/// A missing inventory or a changed fork pin must fail the requested live gate.
+pub fn v4_placement_inputs() -> anyhow::Result<std::path::PathBuf> {
+    let root = std::env::var_os("CUTEAFD_V4_PLACEMENT_INPUTS").map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home)
+            .join(".cache/cuteafd/builds/v4-placement-inputs/current")))
+        .ok_or_else(|| anyhow::anyhow!("set HOME or CUTEAFD_V4_PLACEMENT_INPUTS"))?;
+    validate_v4_placement_inputs(&root)?;
+    Ok(root)
+}
+
+fn v4_placement_source_hashes(root: &std::path::Path) -> anyhow::Result<Value> {
+    use sha2::{Digest, Sha256};
+    fn collect(root: &std::path::Path, directory: &std::path::Path, recursive: bool, extension: &str,
+        files: &mut serde_json::Map<String, Value>) -> anyhow::Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let path = entry?.path();
+            if path.is_dir() && recursive { collect(root, &path, true, extension, files)?; }
+            else if path.is_file() && path.extension().is_some_and(|value| value == extension) {
+                files.insert(path.strip_prefix(root)?.to_string_lossy().into_owned(),
+                    Value::String(format!("{:x}", Sha256::digest(fs::read(&path)?))));
+            }
+        }
+        Ok(())
+    }
+    // Keep this set identical to compare-sm-exports.py::v4_placement_sources.
+    let mut files = serde_json::Map::new();
+    for directory in ["python/tools/aot", "python/tools/lib"] {
+        collect(root, &root.join(directory), true, "py", &mut files)?;
+    }
+    collect(root, &root.join("scripts/build"), false, "json", &mut files)?;
+    let script = "scripts/build/compare-sm-exports.py";
+    files.insert(script.into(), Value::String(format!("{:x}", Sha256::digest(fs::read(root.join(script))?))));
+    Ok(Value::Object(files))
+}
+
+fn validate_v4_placement_sources(metadata: &Value, root: &std::path::Path) -> anyhow::Result<()> {
+    anyhow::ensure!(metadata["engine_sources_sha256"] == v4_placement_source_hashes(root)?,
+        "stale V4 placement inputs: engine export sources changed; regenerate inputs");
+    Ok(())
+}
+
+fn validate_v4_placement_inputs(root: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use sha2::{Digest, Sha256};
+    let metadata: Value = serde_json::from_slice(&fs::read(root.join("INPUTS.json"))
+        .with_context(|| format!("missing live V4 inputs at {}; regenerate with scripts/build/compare-sm-exports.py --v4-placement-inputs", root.display()))?)?;
+    let lock: Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+        "/../../../third_party/sparkinfer.lock.json")))?;
+    anyhow::ensure!(metadata["schema"] == 1 && metadata["engine_commit"].as_str().is_some_and(|s| s.len() == 40),
+        "invalid V4 input provenance");
+    anyhow::ensure!(metadata["sparkinfer_revision"] == lock["revision"]
+        && metadata["source_tree_sha256"] == lock["source_tree_sha256"],
+        "stale V4 placement inputs: exported fork {} differs from tree {}; regenerate inputs",
+        metadata["sparkinfer_revision"], lock["revision"]);
+    validate_v4_placement_sources(&metadata, &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.."))?;
+    let exports = metadata["exports"].as_array().ok_or_else(|| anyhow::anyhow!("missing V4 worker provenance"))?;
+    anyhow::ensure!(exports.len() == 3 && exports.iter().all(|export|
+        export["sparkinfer_revision"] == lock["revision"]
+        && export["source_tree_sha256"] == lock["source_tree_sha256"]
+        && export["cuda_initialized"] == false), "V4 worker provenance mismatch");
+    let files = metadata["files"].as_object().ok_or_else(|| anyhow::anyhow!("V4 input file inventory missing"))?;
+    for context in [131072, 1048576] {
+        for model in ["flash", "pro"] {
+            for rtx in [1, 2] {
+                let manifest = format!("{model}-{rtx}-{context}/PROGRAMS.json");
+                anyhow::ensure!(files.contains_key(&manifest), "missing required V4 manifest {manifest}");
+                if model == "pro" {
+                    for tp in [1, 2] {
+                        for rows in cuteafd_core::EXL3_CAPACITIES {
+                            let path = format!("{model}-{rtx}-{context}/exl3/exl3-dsv4p-k23/rtx-tp{tp}/m{rows}/v41_exl3.json");
+                            anyhow::ensure!(files.contains_key(&path), "missing required V4 package {path}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (path, expected) in files {
+        anyhow::ensure!(std::path::Path::new(path).components().all(|p| matches!(p, std::path::Component::Normal(_))),
+            "invalid V4 input path {path}");
+        let actual = format!("{:x}", Sha256::digest(fs::read(root.join(path))
+            .with_context(|| format!("missing V4 placement input {path}"))?));
+        anyhow::ensure!(expected.as_str() == Some(&actual), "V4 placement input checksum mismatch: {path}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod v4_input_tests {
+    use super::*;
+
+    #[test]
+    fn live_v4_inputs_refuse_same_fork_changed_added_or_removed_export_sources() {
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["python/tools/aot", "python/tools/lib", "scripts/build"] {
+            fs::create_dir_all(root.path().join(directory)).unwrap();
+        }
+        let script = root.path().join("scripts/build/compare-sm-exports.py");
+        fs::write(&script, "source").unwrap();
+        let metadata = json!({"engine_sources_sha256": v4_placement_source_hashes(root.path()).unwrap()});
+        validate_v4_placement_sources(&metadata, root.path()).unwrap();
+        fs::write(&script, "changed").unwrap();
+        assert!(validate_v4_placement_sources(&metadata, root.path()).is_err());
+        fs::write(&script, "source").unwrap();
+        let added = root.path().join("python/tools/lib/new.py");
+        fs::write(&added, "new").unwrap();
+        assert!(validate_v4_placement_sources(&metadata, root.path()).is_err());
+        let metadata = json!({"engine_sources_sha256": v4_placement_source_hashes(root.path()).unwrap()});
+        fs::remove_file(added).unwrap();
+        assert!(validate_v4_placement_sources(&metadata, root.path()).is_err());
+    }
+
+    #[test]
+    fn live_v4_inputs_refuse_missing_and_stale_provenance() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(validate_v4_placement_inputs(root.path()).unwrap_err().to_string().contains("missing live V4 inputs"));
+        fs::write(root.path().join("INPUTS.json"), json!({"schema": 1, "engine_commit": "a".repeat(40),
+            "sparkinfer_revision": "wrong", "source_tree_sha256": "wrong", "files": {}}).to_string()).unwrap();
+        assert!(validate_v4_placement_inputs(root.path()).unwrap_err().to_string().contains("stale V4 placement inputs"));
+    }
+}
