@@ -343,6 +343,25 @@ mod load_stream_lifetime_tests {
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn standalone_stream_is_lazy_shared_and_drains_without_initializing() -> Result<()> {
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        let device = device::Device { library: &library, id: 0 };
+        let owner = std::rc::Rc::new(StandaloneStream::new(device));
+        let component = owner.clone();
+        owner.drain()?;
+        component.require_complete()?;
+        assert!(!fixture.events()?.contains('V'), "metadata/drain must not create a stream");
+        assert_eq!(owner.get()?.raw, component.get()?.raw);
+        assert_eq!(fixture.events()?.matches('V').count(), 1);
+        drop(component);
+        drop(owner);
+        assert_eq!(fixture.events()?.matches('V').count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn failed_load_stream_drains_abort_before_release() -> Result<()> {
         use std::os::unix::process::ExitStatusExt;
         const CHILD: &str = "CUTEAFD_FATAL_LOAD_STREAM_CHILD";

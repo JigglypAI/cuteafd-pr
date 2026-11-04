@@ -930,6 +930,7 @@ mod tests {
             let mut drain = graph
                 .pins
                 .stream
+                .get()?
                 .cancellation_guard("interrupted dense graph replay");
             device.run(|| {
                 // SAFETY: graph pins the same device/stream/storage until replay drains.

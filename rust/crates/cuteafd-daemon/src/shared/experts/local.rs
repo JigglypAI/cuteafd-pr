@@ -385,7 +385,7 @@ impl<'a> LocalExpertWave<'a> {
         // SAFETY: the caller retains complete buffers until finish drains them.
         unsafe {
             self.enqueue_buffers(layer, rows, inputs, shared)?;
-            crate::shared::memory::chain::finish(self.library, self.stream())?;
+            crate::shared::memory::chain::finish(self.stream.library, self.stream.raw)?;
         }
         Ok(self.output_rows(rows))
     }
@@ -447,7 +447,7 @@ impl<'a> LocalExpertWave<'a> {
                 // Device-ordered passes do not drain the router on the host:
                 // the routed kernels follow it (and the shared expert) in the chain.
                 unsafe {
-                    crate::shared::memory::chain::join(self.library, self.stream())?;
+                    crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
                 }
             }
             match &mut self.backend {
@@ -460,11 +460,11 @@ impl<'a> LocalExpertWave<'a> {
                             layer,
                             [inputs[0], inputs[1], inputs[2]],
                             rows as usize,
-                            self.stream(),
+                            self.stream.raw,
                         )?
                     };
                     unsafe {
-                        crate::shared::memory::chain::join(self.library, self.stream())?;
+                        crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
                     }
                     unsafe {
                         self.reducer.finish(
@@ -473,7 +473,7 @@ impl<'a> LocalExpertWave<'a> {
                             self.output.buffer.ptr.cast(),
                             rows,
                             true,
-                            self.stream(),
+                            self.stream.raw,
                         )
                     }
                 }
@@ -510,7 +510,7 @@ impl<'a> LocalExpertWave<'a> {
                         max_tasks: info.max_tasks,
                         max_phys_tiles: info.max_phys_tiles,
                         max_active_clusters: info.max_active_clusters,
-                        stream: self.stream(),
+                        stream: self.stream.raw,
                     };
                     // Shared arena remains exclusive through this drain, including failure.
 
@@ -518,7 +518,7 @@ impl<'a> LocalExpertWave<'a> {
                         state.kernel.launch(&args)?;
                     }
                     unsafe {
-                        crate::shared::memory::chain::join(self.library, self.stream())?;
+                        crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
                     }
                     unsafe {
                         match state.kernel.output_kind() {
@@ -528,7 +528,7 @@ impl<'a> LocalExpertWave<'a> {
                                     shared.ptr.cast(),
                                     self.output.buffer.ptr.cast(),
                                     rows,
-                                    self.stream(),
+                                    self.stream.raw,
                                 )
                             }
                             cuteafd_ffi::V41ExpertOutputKind::Fp32Routes
@@ -538,7 +538,7 @@ impl<'a> LocalExpertWave<'a> {
                                 self.output.buffer.ptr.cast(),
                                 rows,
                                 state.kernel.accumulates_tokens(),
-                                self.stream(),
+                                self.stream.raw,
                             ),
                         }
                     }
@@ -549,7 +549,7 @@ impl<'a> LocalExpertWave<'a> {
             unsafe {
                 self.stream
                     .library
-                    .cuda_stream_synchronize(self.stream())?;
+                    .cuda_stream_synchronize(self.stream.raw)?;
             }
             return Err(error);
         }

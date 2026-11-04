@@ -130,6 +130,26 @@ mod tests {
     use cuteafd_loader::plan::families::step5::native;
 
     #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn arena_components_share_one_lazy_standalone_stream() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 0 };
+        let arena = Arena::new(device, 256)?;
+        let first = standalone(device, Some((&arena, 0)));
+        let second = standalone(device, Some((&arena, 128)));
+        assert!(Rc::ptr_eq(&first, &second));
+        first.drain()?;
+        assert!(!fixture.events()?.contains('V'));
+        assert_eq!(first.get()?.raw, second.get()?.raw);
+        assert_eq!(fixture.events()?.matches('V').count(), 1);
+        let lane = standalone(device, None);
+        assert_ne!(lane.get()?.raw, first.get()?.raw);
+        assert_eq!(fixture.events()?.matches('V').count(), 2);
+        Ok(())
+    }
+
+    #[test]
     fn predictor_arena_spans_preserve_live_inputs_output_and_selected_tokens() -> Result<()> {
         let disjoint = |a: (usize, usize), b: (usize, usize)|
             a.0 + a.1 <= b.0 || b.0 + b.1 <= a.0;
