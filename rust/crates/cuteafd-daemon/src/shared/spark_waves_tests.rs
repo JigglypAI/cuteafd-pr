@@ -445,7 +445,7 @@ impl Backend for Fake {
 fn job(sequence: u32, slot: usize, consumed: u32) -> Job {
     Job { sequence, slot, rows: 1, payload_bytes: 64, consumed: vec![(slot, consumed)], slice: (slot * 64, 64),
         release: consumed + 1, sent: Instant::now(),
-        source: Source::Staged { layout: RouteStaging::new(1, 8, 16).unwrap(),
+        source: Source::Staged { layout: RouteStaging::new(1, 8, 16).unwrap(), combined_reply: false,
             build: Box::new(|_, _| anyhow::bail!("the fake posts without building")) } }
 }
 
@@ -958,7 +958,7 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
                 let (h, l) = (hidden, layer);
                 // SAFETY: ids, weights and the layer's input are live device buffers of the layout's extents.
                 let ticket = unsafe { exchange.send(rows, rows * row_bytes, layout, [ids.buffer, weights.buffer, inputs[layer].buffer],
-                    stream.raw(), Box::new(move |routes, wire| ExpertProtocolV2Request::new_bytes(l as u64 + 1, 1, l as u32,
+                    stream.raw(), false, Box::new(move |routes, wire| ExpertProtocolV2Request::new_bytes(l as u64 + 1, 1, l as u32,
                         h as u32, cuteafd_transport::ExpertV2Dtype::Bf16, (0..rows as u32).map(|row|
                             cuteafd_transport::ExpertProtocolV2RowDescriptor { row_id: row.into(),
                             source_kind: cuteafd_transport::ExpertV2SourceKind::Decode, source_request_id: 1,
@@ -1071,7 +1071,7 @@ fn terminal_close_with_codec(compressed: bool) -> Result<()> {
     for layer in 0..waves {
         let h = hidden;
         // SAFETY: ids, weights and input are live device buffers of the layout's extents.
-        tickets.push(unsafe { exchange.send(rows, rows * row_bytes, layout, [ids.buffer, weights.buffer, input.buffer], stream.raw(),
+        tickets.push(unsafe { exchange.send(rows, rows * row_bytes, layout, [ids.buffer, weights.buffer, input.buffer], stream.raw(), compressed && rows > 64,
             Box::new(move |routes, wire| ExpertProtocolV2Request::new_bytes(layer as u64 + 1, 1, layer as u32,
                 h as u32, cuteafd_transport::ExpertV2Dtype::Bf16, (0..rows as u32).map(|row|
                     cuteafd_transport::ExpertProtocolV2RowDescriptor { row_id: row.into(),
@@ -1513,7 +1513,7 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
             let h = hidden;
             // SAFETY: ids, weights and the layer's input are live device buffers of the layout's extents.
             let ticket = unsafe { exchange.send(rows, rows * row_bytes, layout, [ids.buffer, weights.buffer, inputs[layer].buffer],
-                stream.raw(), Box::new(move |routes, wire| ExpertProtocolV2Request::new_bytes(layer as u64 + 1, 1,
+                stream.raw(), false, Box::new(move |routes, wire| ExpertProtocolV2Request::new_bytes(layer as u64 + 1, 1,
                     layer as u32, h as u32, cuteafd_transport::ExpertV2Dtype::Bf16, (0..rows as u32).map(|row|
                         cuteafd_transport::ExpertProtocolV2RowDescriptor { row_id: row.into(),
                         source_kind: cuteafd_transport::ExpertV2SourceKind::Decode, source_request_id: 1,
@@ -1830,6 +1830,39 @@ fn compact_wave_keeps_wire_bytes_and_reserved_landing_offsets() -> Result<()> {
         backend.post(job)?;
         assert_eq!(backend.transport.request_bytes.as_deref(), Some(before.as_slice()));
         assert_eq!(backend.transport.landing_slices, vec![(8192, rows * 16)]);
+    }
+    Ok(())
+}
+
+#[test]
+fn bf16_units_under_compressed_settings_dispatch_zero_reply_decode_launches() -> Result<()> {
+    use cuteafd_transport::ExpertV2SourceKind::{Decode, MtpVerify, Prefill};
+    use cuteafd_core::SparkReplyFormat;
+    for format in [SparkReplyFormat::Fp8, SparkReplyFormat::Nvfp4] {
+        let codec = Some(&format);
+        for (rows, kind) in [(1, Decode), (96, Decode), (192, MtpVerify), (64, Prefill)] {
+            let mut launches = 0;
+            for_compressed_reply(single_reply_eligible(rows, kind), codec, 6, |_, _| {
+                launches += 2;
+                Ok(())
+            })?;
+            assert_eq!(launches, 0, "{format:?}: {rows} {kind:?}");
+        }
+        let mut launches = 0;
+        for_compressed_reply(single_reply_eligible(65, Prefill), codec, 6, |_, _| {
+            launches += 2;
+            Ok(())
+        })?;
+        assert_eq!(launches, 12, "eligible prefill must retain both codec kernels per rank");
+        for rows in [vec![(1, true); 64].into_iter().chain(vec![(2, true); 65]).collect::<Vec<_>>(),
+            vec![(1, true); 65].into_iter().chain(vec![(2, false); 96]).collect()] {
+            let mut launches = 0;
+            for_compressed_reply(combined_reply_eligible(rows), codec, 6, |_, _| {
+                launches += 2;
+                Ok(())
+            })?;
+            assert_eq!(launches, 0, "mixed or short-source units must have no codec nodes");
+        }
     }
     Ok(())
 }

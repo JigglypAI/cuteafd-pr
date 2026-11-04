@@ -5327,9 +5327,11 @@ impl<'a> GlmfEngine<'a> {
         let audit = self.split_audit && !decode && t >= 256;
         // SAFETY: ids, weights and wire rows hold this layer's `t` rows in
         // stream order; the copies read them before later stream work.
+        let combined_reply = origins.as_ref().map_or_else(|| crate::shared::spark_waves::single_reply_eligible(t, kind),
+            crate::shared::prefill_pipeline::ReplyOrigins::combined_reply_eligible);
         let ticket = unsafe {
             exchange.send(t, exchange.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer,
-                if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream, Box::new(move |routes, wire| {
+                if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream, combined_reply, Box::new(move |routes, wire| {
                     let mut request = spark_request_bytes(h, topk, index, t, routes, wire, kind, bf16)?;
                     if let Some(origins) = origins { origins.apply(&mut request)?; }
                     if audit {

@@ -174,7 +174,7 @@ impl SparkExperts for MuseSparkPath<'_> {
         let ticket = device.run(|| {
             // SAFETY: the lane retains these planes through teardown; the routes and
             // wire were written on this stream before this call (`RankDevice::layer_front`).
-            unsafe { link.exchange()?.send(rows, payload, layout, sources, stream, Box::new(move |routes, wire|
+            unsafe { link.exchange()?.send(rows, payload, layout, sources, stream, false, Box::new(move |routes, wire|
                 wave_request(layer, sequence, kind, &segments, cutoff, routes, wire))) }
         })?;
         self.sequence = sequence;
