@@ -1320,9 +1320,21 @@ mod tests {
                 1 << 20, 1 << 21, 188, 0, MlaCacheFormat::Fp8)?;
             let allocated: BTreeMap<_, _> = layout.allocate_device_with(|b| Ok::<_, anyhow::Error>((b.name.clone(), b.bytes)))?
                 .into_iter().collect();
-            let demanded: BTreeMap<_, _> = layout.demands(device)?.0.movable(2)?.conditional[0].demands.iter()
+            let movable = layout.demands(device)?.0.movable(2)?;
+            let demands = &movable.conditional[0].demands;
+            let demanded: BTreeMap<_, _> = demands.iter()
                 .map(|d| (d.group.strip_prefix("MLA DFlash ").unwrap().to_string(), d.bytes as usize)).collect();
             assert_eq!(allocated, demanded, "{label}: every owner, not just totals");
+            let weights = layout.weight_destinations().iter().map(|weight|
+                (weight.shape.iter().product::<usize>() * 2).max(256) as u64).sum::<u64>();
+            assert_eq!(demands.iter().map(|d| d.resident_weights.0).sum::<u64>(), weights);
+            assert_eq!(weights, layout.weights().resident_bytes()?);
+            for owner in layout.owners() {
+                let expected = if layout.weight_destinations().iter().any(|weight| weight.owner == owner.id) {
+                    owner.bytes as u64
+                } else { 0 };
+                assert_eq!(owner.resident_weights.0, expected, "{label}: {}", owner.id);
+            }
             let shipped: Vec<serde_json::Value> = serde_json::from_str(include_str!("../families/mistral_large4/official-tensors.json"))?;
             let mut headers = BTreeMap::new();
             for tensor in shipped {

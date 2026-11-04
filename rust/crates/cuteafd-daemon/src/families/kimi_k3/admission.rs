@@ -821,7 +821,6 @@ fn request<const RANKS: usize>(i: Inputs<'_, RANKS>) -> Result<PlacementRequest>
     }
     let mut layers = Vec::with_capacity(cfg.layers);
     for layer in 0..cfg.layers {
-
         let mla = cfg.attention[layer] == KimiAttention::Mla;
         let (whole, split_attention) = if RANKS == 1 {
             let layouts = LayerLayout::ranks_with_core(cfg, layer, WHOLE, &i.core, 1)?;
@@ -1076,6 +1075,31 @@ pub(super) mod tests {
             !item.group.contains("peer exchange") && !item.group.contains("hop link")));
         assert!(admitted.check_kda(1, 1).is_err());
         assert!(admitted.check_global(1, 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn single_owner_cap_counts_both_frontends_and_whole_layer_weights() -> Result<()> {
+        let cfg = cfg();
+        let core = Default::default();
+        let expected = (0..cfg.layers).try_fold(
+            GlobalLayout::ranks_with_core(&cfg, &core, 1)?[0].bytes()? as u64,
+            |sum, layer| -> Result<_> {
+                sum.checked_add(LayerLayout::ranks_with_core(&cfg, layer, WHOLE, &core, 1)?[0].bytes()? as u64)
+                    .context("single-owner native resident weights overflow")
+            })?;
+        let mut i = inputs_for_ranks::<1>(&cfg);
+        i.resident_weight_limit = ResidentWeights(expected);
+        let mut request = request(i)?;
+        assert_eq!(request.fixed.iter().map(|d| d.resident_weights.0).sum::<u64>()
+            + request.layers.iter().map(|d| d.weights.whole).sum::<u64>(), expected);
+        assert!(solve(&request).is_ok());
+        request.resident_weight_limit = Some(ResidentWeights(expected - 1));
+        let error = solve(&request).unwrap_err();
+        let mut typed = &error;
+        while let PlacementError::OwnerCandidates { source, .. }
+            | PlacementError::PrefixMarks { source, .. } = typed { typed = source; }
+        assert_eq!(*typed, PlacementError::ResidentWeightLimit { gpu: 0, required: expected, limit: expected - 1 });
         Ok(())
     }
 
