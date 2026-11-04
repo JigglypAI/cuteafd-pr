@@ -174,7 +174,57 @@ impl OfficialV41Catalog {
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct ResidentBytesCache(std::sync::Mutex<std::collections::BTreeMap<ResidentBytesKey, u64>>);
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ResidentBytesKey {
+    world: usize,
+    rank: usize,
+    hidden: usize,
+    intermediate: usize,
+    experts: usize,
+    tiers: Vec<usize>,
+    compact_layer: Option<usize>,
+    balanced: bool,
+    projections: Vec<(usize, usize, usize, usize)>,
+}
+
 impl V41Exl3Manifest {
+    /// Exact arena bytes without rebuilding load jobs for every admission shape.
+    /// The key contains header geometry, not tensor names or a mutable manifest's address.
+    pub fn resident_arena_bytes(&self, layer: V41Exl3Layer, world: usize, rank: usize, balanced: bool) -> Result<u64> {
+        ensure!((1..=8).contains(&world) && rank < world, "invalid EXL3 TP rank/world");
+        let (draft, index, experts) = match layer {
+            V41Exl3Layer::Backbone(index) => {
+                ensure!(index < self.experts.layers, "EXL3 backbone layer out of range");
+                (false, index, self.experts.experts)
+            }
+            V41Exl3Layer::Dspark(index) => {
+                ensure!(index < self.experts.draft_stages, "EXL3 dSpark stage out of range");
+                (true, index, self.experts.draft_experts)
+            }
+        };
+        let projections = (0..experts).flat_map(|expert| [V41Exl3ProjectionKind::Gate,
+            V41Exl3ProjectionKind::Up, V41Exl3ProjectionKind::Down].map(move |kind| (expert, kind)))
+            .map(|(expert, kind)| {
+                let p = self.projections.get(&self.naming.projection(draft, index, expert, kind))
+                    .context("missing EXL3 resident projection")?;
+                let kind = match p.kind { V41Exl3ProjectionKind::Gate => 0,
+                    V41Exl3ProjectionKind::Up => 1, V41Exl3ProjectionKind::Down => 2 };
+                Ok((kind, p.bits, p.input_features, p.output_features))
+            }).collect::<Result<Vec<_>>>()?;
+        let key = ResidentBytesKey { world, rank, hidden: self.experts.hidden,
+            intermediate: self.experts.intermediate, experts, tiers: self.decoder_tiers.clone(),
+            compact_layer: (balanced && self.experts.intermediate / 128 % world != 0).then_some(index), balanced, projections };
+        if let Some(bytes) = self.resident_bytes.0.lock().expect("EXL3 byte cache poisoned").get(&key) {
+            return Ok(*bytes);
+        }
+        let plan = if balanced { self.balanced_residency(layer, world, rank)? } else { self.residency(layer, world, rank)? };
+        let bytes = plan.device_arena_layout()?.1 as u64;
+        self.resident_bytes.0.lock().expect("EXL3 byte cache poisoned").insert(key, bytes);
+        Ok(bytes)
+    }
     /// Plan whole-unit balanced owned-byte storage.
     /// Divisible geometry returns the legacy plan verbatim, including descriptors.
     pub fn balanced_residency(&self, layer: V41Exl3Layer, world: usize, rank: usize) -> Result<V41Exl3Residency> {
@@ -437,6 +487,33 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn memoized_arena_bytes_match_native_plans_and_mutated_headers() -> Result<()> {
+        for tiers in [&[2][..], &[2, 3][..], &[4, 5][..]] {
+            let mut manifest = fixture_geometry(tiers, 5120, 2304, 16);
+            for world in [1, 2, 4, 6] {
+                for rank in 0..world {
+                    for balanced in [false, true] {
+                        let layer = V41Exl3Layer::Backbone(0);
+                        let native = if balanced { manifest.balanced_residency(layer, world, rank)? }
+                            else { manifest.residency(layer, world, rank)? };
+                        let expected = native.device_arena_layout()?.1 as u64;
+                        for _ in 0..2 {
+                            assert_eq!(manifest.resident_arena_bytes(layer, world, rank, balanced)?, expected);
+                        }
+                    }
+                }
+            }
+            // Header mutations cannot reuse a geometry-only or layer-address cache entry.
+            for projection in manifest.projections.values_mut() { projection.bits = 5; }
+            manifest.decoder_tiers = vec![4, 5];
+            let layer = V41Exl3Layer::Backbone(0);
+            assert_eq!(manifest.resident_arena_bytes(layer, 1, 0, false)?,
+                manifest.residency(layer, 1, 0)?.device_arena_layout()?.1 as u64);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn compact_owned_payloads_match_offsets_and_even_layouts_are_unchanged() -> Result<()> {
         for (hidden, intermediate, experts, tiers) in [
             (5120, 2304, 384, [3, 4]), (6144, 2048, 256, [4, 5]),
@@ -561,6 +638,7 @@ mod tests {
             decoder_tiers: crate::families::deepseek_v41::v41_exl3::decoder_family(&projections).unwrap(),
             projections,
             storage: crate::formats::exl3_storage::Exl3StorageSource::GptqModel,
+            resident_bytes: Default::default(),
         }
     }
 

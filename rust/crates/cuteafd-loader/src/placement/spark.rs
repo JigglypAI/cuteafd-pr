@@ -559,9 +559,8 @@ impl SparkBudgetInventory {
         for rank in 0..working.spark_ranks {
             let mut costs = Vec::new();
             for &layer in &working.spark_layers {
-                let one = SparkWorkingSet { spark_layers: vec![layer], ..working.clone() };
-                costs.push(SparkAssignment::from_catalog(catalog, &one, rank,
-                    SparkResidentLayout::Exl3 { world: working.spark_ranks, rank }, endpoints, rings)?.resident_bytes);
+                costs.push(catalog.exl3().context("Spark EXL3 budget needs EXL3 headers")?
+                    .resident_arena_bytes(crate::V41Exl3Layer::Backbone(layer), working.spark_ranks, rank, true)?);
             }
             let io = working.rank_endpoints_io(rank, catalog.routed_experts().geometry()?, endpoints, rings)?;
             let bytes = [io.intake, io.host_exchange, io.row_indices, io.mapped_rings,

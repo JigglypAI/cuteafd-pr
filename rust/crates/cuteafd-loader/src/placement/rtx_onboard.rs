@@ -14,8 +14,7 @@ pub fn expert_costs(catalog: &crate::OfficialV41Catalog, tp2: bool) -> Result<Ve
     let exl3 = catalog.exl3().context("EXL3 onboarding needs EXL3 expert headers")?;
     let shape = catalog.routed_experts();
     let cost = |layer, tp, rank| -> Result<Bytes2> {
-        Ok(Bytes2 { resident: exl3.residency(crate::V41Exl3Layer::Backbone(layer), tp, rank)?
-            .device_arena_layout()?.1 as u64, staging: 0 })
+        Ok(Bytes2 { resident: exl3.resident_arena_bytes(crate::V41Exl3Layer::Backbone(layer), tp, rank, false)?, staging: 0 })
     };
     (shape.first_layer..shape.layers).map(|layer| Ok(ExpertCost { whole: cost(layer, 1, 0)?,
         half: if tp2 { [cost(layer, 2, 0)?, cost(layer, 2, 1)?] } else { [Bytes2::default(); 2] },

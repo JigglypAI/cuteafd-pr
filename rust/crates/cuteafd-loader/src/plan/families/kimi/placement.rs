@@ -187,8 +187,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let mut costs = vec![[Bytes2::default(); 2]; cfg.layers];
         for &layer in &working.spark_layers {
             for rank in 0..gpus {
-                costs[layer][rank].resident = manifest.residency(crate::V41Exl3Layer::Backbone(layer), gpus, rank)?
-                    .device_arena_layout()?.1 as u64;
+                costs[layer][rank].resident = manifest.resident_arena_bytes(crate::V41Exl3Layer::Backbone(layer), gpus, rank, false)?;
             }
         }
         Ok((spark, costs))

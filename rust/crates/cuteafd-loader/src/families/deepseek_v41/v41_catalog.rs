@@ -1908,6 +1908,7 @@ mod tests {
                         bits: 4, input_features: 128, output_features: 128 })
                 }).collect(), decoder_tiers: vec![4],
                 storage: crate::formats::exl3_storage::Exl3StorageSource::Headers,
+                resident_bytes: Default::default(),
             }), nvfp4: None, fp8: None,
         };
         catalog.select_draft(DraftOwnership::selected("deepseek_v41", "dspark")).unwrap();

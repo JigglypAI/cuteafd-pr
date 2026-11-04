@@ -649,3 +649,36 @@ fn bench_panels_json_cli_matches_fixture_and_selectable_panel_ids() {
     assert_eq!(actual, fixture);
     assert!(actual.iter().any(|id| id == "shared_prefix"));
 }
+
+#[test]
+#[ignore = "requires real CUTEAFD_KIMI_SNAPSHOT, CUTEAFD_KIMI_DRAFTER and CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
+fn installed_kimi_tp1_automatic_plan_finishes_within_ten_seconds() {
+    let required = |key| std::env::var_os(key).unwrap_or_else(|| panic!("{key} required"));
+    let start = std::time::Instant::now();
+    let output = Command::new("timeout")
+        .args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
+        .arg(required("CUTEAFD_KIMI_SNAPSHOT"))
+        .args(["--deployment", "--rtx", "1", "--spark-ranks", "6", "--spark-budget-gib", "110",
+            "--speculator", "dflash2", "--drafter-snapshot"])
+        .arg(required("CUTEAFD_KIMI_DRAFTER"))
+        .args(["--vision", "off", "--audio", "off", "--workspace-manifest"])
+        .arg(required("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"))
+        .env_remove("COORDINATOR_GPU_BUDGET_GIB").output().unwrap();
+    let elapsed = start.elapsed();
+    assert!(output.status.success(), "{elapsed:?}: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(elapsed <= std::time::Duration::from_secs(10), "TP1 plan took {elapsed:?}");
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["rtx_gpus"], 1);
+    assert_eq!(plan["spark_ranks"], 6);
+    assert_eq!(plan["speculator"], "dflash2");
+    assert_eq!(plan["executable"], true, "{plan}");
+    let placement = &plan["estimated_placement"];
+    assert_eq!(placement["items"].as_array().unwrap().len(), 1);
+    assert!(placement["hops"].as_array().unwrap().is_empty());
+    for layer in placement["layers"].as_array().unwrap() {
+        assert_eq!(layer["mode"]["mode"], "whole");
+        assert_eq!(layer["mode"]["gpu"], 0);
+        assert_eq!(layer["mode"]["ffn"], "owner");
+    }
+    eprintln!("real K6 TP1 automatic plan: {elapsed:?}");
+}
