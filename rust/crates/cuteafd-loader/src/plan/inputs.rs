@@ -67,13 +67,37 @@ fn placement_input_source_hashes(root: &std::path::Path) -> anyhow::Result<Value
     Ok(files)
 }
 
+/// A verified publication; reads recheck the bytes actually returned to the caller.
+#[derive(Debug)]
+pub struct PublishedPlacementInputs {
+    root: std::path::PathBuf,
+    files: std::collections::BTreeMap<String, String>,
+    fork_revision: String,
+    fork_tree_sha256: String,
+}
+impl PublishedPlacementInputs {
+    pub fn checksums(&self) -> &std::collections::BTreeMap<String, String> { &self.files }
+    pub fn fork_revision(&self) -> &str { &self.fork_revision }
+    pub fn fork_tree_sha256(&self) -> &str { &self.fork_tree_sha256 }
+
+    pub fn read(&self, name: &str) -> anyhow::Result<Vec<u8>> {
+        use anyhow::Context;
+        use sha2::{Digest, Sha256};
+        let expected = self.files.get(name).context("file absent from placement provenance")?;
+        let bytes = fs::read(self.root.join(name)).with_context(|| format!("reading placement input {name}"))?;
+        anyhow::ensure!(*expected == format!("{:x}", Sha256::digest(&bytes)),
+            "placement input checksum mismatch: {name}");
+        Ok(bytes)
+    }
+}
+
 /// Installed planners consume a published CPU export, never an ambient WIP slot.
 /// Explicit manifest overrides receive the same pin/source/checksum validation.
-pub fn validate_placement_inputs(manifest: &std::path::Path) -> anyhow::Result<()> {
+pub fn validate_placement_inputs(manifest: &std::path::Path) -> anyhow::Result<PublishedPlacementInputs> {
     use anyhow::Context;
     use sha2::{Digest, Sha256};
     let regenerate = "regenerate with scripts/build/cuteafd-dev.sh cpu -- python3 scripts/build/export-placement-inputs.py --output <NVMe>/placement-inputs/<sha> --staging <NVMe>/placement-inputs/staging-<sha>";
-    (|| -> anyhow::Result<()> {
+    (|| -> anyhow::Result<PublishedPlacementInputs> {
         anyhow::ensure!(manifest.is_file(), "required PROGRAMS.json missing: {}", manifest.display());
         let root = manifest.parent().context("PROGRAMS.json parent")?;
         let metadata: Value = serde_json::from_slice(&fs::read(root.join("INPUTS.json"))
@@ -95,14 +119,18 @@ pub fn validate_placement_inputs(manifest: &std::path::Path) -> anyhow::Result<(
         let files = metadata["files"].as_object().context("missing placement file inventory")?;
         let name = manifest.file_name().context("PROGRAMS.json filename")?.to_str().context("manifest UTF-8 filename")?;
         anyhow::ensure!(files.contains_key(name), "PROGRAMS.json missing from placement provenance");
+        let mut checksums = std::collections::BTreeMap::new();
         for (path, expected) in files {
-            anyhow::ensure!(std::path::Path::new(path).components().all(|part|
+            anyhow::ensure!(!path.is_empty() && std::path::Path::new(path).components().all(|part|
                 matches!(part, std::path::Component::Normal(_))), "invalid placement input path {path}");
             let actual = format!("{:x}", Sha256::digest(fs::read(root.join(path))
                 .with_context(|| format!("missing placement input {path}"))?));
             anyhow::ensure!(expected.as_str() == Some(&actual), "placement input checksum mismatch: {path}");
+            checksums.insert(path.clone(), actual);
         }
-        Ok(())
+        Ok(PublishedPlacementInputs { root: root.into(), files: checksums,
+            fork_revision: metadata["sparkinfer_revision"].as_str().context("fork revision")?.into(),
+            fork_tree_sha256: metadata["source_tree_sha256"].as_str().context("fork tree hash")?.into() })
     })().with_context(|| format!("placement inputs at {}; {regenerate}", manifest.display()))
 }
 
@@ -156,6 +184,28 @@ fn validate_v4_placement_inputs(root: &std::path::Path) -> anyhow::Result<()> {
         anyhow::ensure!(expected.as_str() == Some(&actual), "V4 placement input checksum mismatch: {path}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn write_test_publication(root: &std::path::Path, files: &[(&str, &[u8])]) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let lock: Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+        "/../../../third_party/sparkinfer.lock.json"))).unwrap();
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let mut checksums = serde_json::Map::new();
+    for (name, bytes) in files {
+        let path = root.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+        checksums.insert((*name).into(), Value::String(format!("{:x}", Sha256::digest(bytes))));
+    }
+    let metadata = serde_json::json!({"schema": 1, "engine_commit": "a".repeat(40),
+        "sparkinfer_revision": lock["revision"], "source_tree_sha256": lock["source_tree_sha256"],
+        "engine_sources_sha256": placement_input_source_hashes(&source).unwrap(),
+        "exports": [{"sparkinfer_revision": lock["revision"],
+            "source_tree_sha256": lock["source_tree_sha256"], "cuda_initialized": false}], "files": checksums});
+    fs::write(root.join("INPUTS.json"), metadata.to_string()).unwrap();
+    root.join("PROGRAMS.json")
 }
 
 #[cfg(test)]
@@ -247,6 +297,36 @@ mod tests {
         fs::write(&metadata_path, valid.to_string()).unwrap();
         fs::write(&manifest, "modified").unwrap();
         assert!(format!("{:#}", validate_placement_inputs(&manifest).unwrap_err()).contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn published_reads_recheck_returned_bytes_and_refuse_unlisted_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"published programs";
+        let manifest = write_test_publication(directory.path(), &[("PROGRAMS.json", bytes.as_slice())]);
+        let publication = validate_placement_inputs(&manifest).unwrap();
+        assert_eq!(publication.read("PROGRAMS.json").unwrap(), bytes);
+        assert_eq!(publication.fork_revision().len(), 40);
+        assert_eq!(publication.fork_tree_sha256().len(), 64);
+        for name in ["", "unlisted.json", "../PROGRAMS.json", "/PROGRAMS.json"] {
+            assert!(publication.read(name).unwrap_err().to_string().contains("absent from placement provenance"));
+        }
+        fs::write(&manifest, "changed after validation").unwrap();
+        assert!(publication.read("PROGRAMS.json").unwrap_err().to_string().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn published_inputs_reject_escaping_and_empty_inventory_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = write_test_publication(directory.path(), &[("PROGRAMS.json", b"programs")]);
+        let metadata = directory.path().join("INPUTS.json");
+        let valid: Value = serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
+        for name in ["", "../escape", "/absolute"] {
+            let mut invalid = valid.clone();
+            invalid["files"][name] = json!("a".repeat(64));
+            fs::write(&metadata, invalid.to_string()).unwrap();
+            assert!(format!("{:#}", validate_placement_inputs(&manifest).unwrap_err()).contains("invalid placement input path"));
+        }
     }
 
     #[test]
