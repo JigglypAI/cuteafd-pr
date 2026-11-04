@@ -8,11 +8,6 @@ fn cfg() -> GlmDsaConfig {
 
 #[test]
 fn glm_draft_first_peak_excludes_target_kv_and_changes_tight_pool_admission() {
-    use crate::families::glm5::draft_representation::{
-        GlmDraftCapacity, GlmDraftGeometry, GlmDraftRepresentation, GlmDraftRuntimeLayout,
-    };
-    use crate::families::qwen4::Qwen4KvCache;
-
     struct Prepared(Contract);
     impl Recipe for Prepared {
         fn prepare(&self, _: &Request) -> Result<Contract, Refusal> {
@@ -20,44 +15,43 @@ fn glm_draft_first_peak_excludes_target_kv_and_changes_tight_pool_admission() {
         }
     }
 
-    // Real-width drafter and two-layer target owners, not a complete card forecast.
+    // Synthetic retained/load draft owners isolate chronology; this is not a
+    // native drafter census or a complete card forecast.
     let cfg = cfg();
     let mut recipe = recipe(&cfg);
-    let draft = GlmDraftRuntimeLayout::new(
-        GlmDraftGeometry {
-            hidden: 6144,
-            intermediate: 12288,
-            layers: 6,
-            heads: 64,
-            kv_heads: 8,
-            head_dim: 128,
-            taps: 6,
-            vocab: 154880,
-            conv_group: 16,
-            selector_rank: 256,
-        },
-        GlmDraftRepresentation::Fp8Only,
-        GlmDraftCapacity::new(20, 16, 8).unwrap(),
-        2048,
-    )
-    .unwrap();
-    let mut owners = draft.gqa_facts(0, 188, 2, Qwen4KvCache::Bf16).unwrap();
-    owners.phase_order = PhaseOrder::DRAFT_THEN_TARGET;
-    // GLM calls both load and prepare_workspace before GlmEngine::new.
-    for owner in &mut owners.allocations {
-        owner.lifetime.first = Phase::DraftLoad;
-    }
-    for group in &mut owners.sequential {
-        for member in &mut group.members {
-            member.lifetime = Lifetime {
+    let owners = [
+        Allocation::buffer(
+            "draft.retained",
+            Location::coordinator(0),
+            1 << 30,
+            Lifetime {
+                first: Phase::DraftLoad,
+                last: Phase::Growth,
+            },
+            Category::Drafter,
+            "synthetic retained draft",
+        ),
+        Allocation::buffer(
+            "draft.load",
+            Location::coordinator(0),
+            1 << 30,
+            Lifetime {
                 first: Phase::DraftLoad,
                 last: Phase::DraftLoad,
-            };
-        }
-    }
+            },
+            Category::Staging,
+            "synthetic draft load",
+        ),
+    ];
     recipe.owners.push(Case {
         when: vec![],
-        value: Contract::fixed(recipe.page_tokens, recipe.maximum_pages, 2, owners).components,
+        value: owners
+            .into_iter()
+            .map(|owner| {
+                let bytes = ByteCurve::fixed(owner.bytes, recipe.maximum_pages);
+                Component::allocation(owner, bytes, false, recipe.maximum_pages)
+            })
+            .collect(),
     });
     let req = Request {
         pool: Pin::Auto,
@@ -1189,7 +1183,7 @@ fn resident_cap_counts_target_draft_and_asymmetric_expert_owners_not_storage() {
         ..request()
     };
     let plan = planner::solve(req.clone(), budgets(), &recipe).unwrap();
-    assert_eq!(plan.decisions.onboard_layers, vec![vec![], vec![]]);
+    assert_eq!(plan.decisions.onboard_layers, vec![Vec::<usize>::new(); 2]);
     assert_eq!(plan.pool_tokens, 4096);
     assert!(
         !plan
