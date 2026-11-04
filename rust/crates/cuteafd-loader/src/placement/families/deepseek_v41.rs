@@ -534,7 +534,7 @@ pub struct DraftInventory {
     pub runtime: Vec<Demand>,
     /// Prefix draft marks (`DRAFT_MARK_BYTES` per retained mark slot).
     pub marks: u64,
-    /// `--tp2-dspark-experts`: GPU0's expert halves plus its wave workspace.
+    /// `--tp2-dspark-experts`: GPU0's checkpoint expert halves; runtime is separate.
     pub peer_half: u64,
     /// Largest transient load staging on the home and on the peer half; the
     /// caller folds it into the full dSpark load-phase peak.
@@ -579,7 +579,8 @@ pub fn drafter(inventory: &DraftInventory, ranks: usize) -> Result<Movable, Plac
         return Err(PlacementError::Inventory("V4.1 dSpark draft inventory"));
     }
     let home = (ranks - 1) as u8;
-    let mut owned = vec![Demand::new(home, Category::Drafter, "dSpark weights", inventory.resident, Basis::Exact)];
+    let mut owned = vec![Demand::new(home, Category::Drafter, "dSpark weights", inventory.resident, Basis::Exact)
+        .with_resident_weights(ResidentWeights(inventory.resident))];
     if inventory.marks > 0 {
         owned.push(Demand::new(home, Category::Prefix, "dSpark marks", inventory.marks, Basis::Formula));
     }
@@ -590,7 +591,8 @@ pub fn drafter(inventory: &DraftInventory, ranks: usize) -> Result<Movable, Plac
     let mut drafter = draft::DrafterDemand::itemized(owned, home);
     let mut cross = peer;
     if inventory.peer_half > 0 {
-        cross.push(Demand::new(0, Category::Drafter, "dSpark TP2 expert half", inventory.peer_half, Basis::Exact));
+        cross.push(Demand::new(0, Category::Drafter, "dSpark TP2 expert half", inventory.peer_half, Basis::Exact)
+            .with_resident_weights(ResidentWeights(inventory.peer_half)));
     }
     if !cross.is_empty() {
         drafter.per_home = vec![MovableDemands { placement_gpu: home, demands: cross }];

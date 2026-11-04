@@ -633,7 +633,30 @@ fn worker(
     }
     let memory = admission::admission_memory(&lib, &inventory)?;
     let (free, _) = memory[0];
-    let pool = admission::resolve(&args, &memory, experts, local_workspace, &[0], 0, None)?;
+    use cuteafd_core::memory_layout::{Basis, Category};
+    use cuteafd_loader::placement::{Demand, ResidentWeights};
+    let config = serde_json::from_slice(&std::fs::read(args.snapshot.join("config.json"))?)?;
+    let target_weights = cuteafd_loader::placement::families::deepseek_v41::resident::resident_headers(
+        &config, catalog.tensors().iter().map(|tensor| &tensor.metadata), 1, false)
+        .context("unsupported V4.1 native backbone residency")?;
+    // All selected weights are already in the CUDA baseline; do not charge storage twice.
+    let mut loaded_weights = target_weights.into_iter().flatten()
+        .filter(|item| item.category != Category::Embedding)
+        .map(|item| Demand::new(0, item.category, item.group, 0, item.basis)
+            .with_resident_weights(ResidentWeights(item.bytes))).collect::<Vec<_>>();
+    loaded_weights.push(Demand::new(0, Category::Embedding, "loaded device embedding", 0, Basis::Exact)
+        .with_resident_weights(ResidentWeights(table.resident_bytes() as u64)));
+    if let Some(weights) = &draft_weights {
+        loaded_weights.push(Demand::new(0, Category::Drafter, "loaded dSpark checkpoint owners", 0, Basis::Exact)
+            .with_resident_weights(ResidentWeights(weights.budget().resident_bytes()? as u64)));
+    }
+    if matches!(&vision, crate::families::deepseek_v41::v41_vision_encoder::Encoder::Local(_)) {
+        loaded_weights.push(Demand::new(0, Category::Weights, "loaded vision checkpoint owners", 0, Basis::Exact)
+            .with_resident_weights(ResidentWeights(
+                crate::families::deepseek_v41::v41_vision::VisionRuntime::weight_bytes(&catalog)? as u64)));
+    }
+    let pool = admission::resolve_with_owners(&args, &memory, experts, local_workspace, &[0], 0,
+        &loaded_weights, &[], None)?;
     pass.bind_execution_plan(&pool.placement)?;
     second.bind_execution_plan(&pool.placement)?;
     for (slot, _) in &mut prefill_slots.slots { slot.bind_execution_plan(&pool.placement)?; }

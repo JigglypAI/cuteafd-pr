@@ -259,7 +259,8 @@ pub(super) fn admit_startup(
         .filter(|item| item.category != Category::Embedding
             || embedding_placement(args.embedding_placement, total)
                 == crate::shared::memory::EmbedPlacement::Gpu)
-        .map(|item| Demand::new(0, item.category, item.group, item.bytes, item.basis))
+        .map(|item| Demand::new(0, item.category, item.group, item.bytes, item.basis)
+            .with_resident_weights(ResidentWeights(item.bytes)))
         .collect::<Vec<_>>();
     let manifest = owners::native_manifest(&args.native_lib, "V41_FP8_AOT.json")?;
     let programs = owners::NativePrograms::new(&manifest, u32::try_from(lib.sm_count()?)?)?;
@@ -297,7 +298,8 @@ pub(super) fn admit_startup(
     if local_vision_owner(cuteafd_api::openai::vision_input_enabled(), args.vision_peers.is_some()) {
         target_owners.add_vision(Demand::new(0, Category::Workspace, "vision weights/scratch",
             crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(catalog, 9216)? as u64,
-            Basis::Formula))?;
+            Basis::Formula).with_resident_weights(ResidentWeights(
+                crate::families::deepseek_v41::v41_vision::VisionRuntime::weight_bytes(catalog)? as u64)))?;
     }
     let fixed_demands = target_owners.fixed;
     let fixed = fixed_demands.iter().try_fold(0u64, |n, d|
@@ -591,6 +593,7 @@ pub(super) fn resolve_with_owners(
         workspace,
         onboard,
     );
+    req.resident_weight_limit = Some(crate::shared::memory::budget::resident_weight_limit());
     req.fixed = fixed;
     req.startup = startup.to_vec();
     if let Some(draft) = draft {
@@ -861,7 +864,8 @@ mod admission_tests {
                     .context("synthetic native backbone residency")?;
                 let weights = weights.into_iter().enumerate().flat_map(|(gpu, items)|
                     items.into_iter().map(move |item| Demand::new(gpu as u8, item.category,
-                        item.group, item.bytes, item.basis))).collect::<Vec<_>>();
+                        item.group, item.bytes, item.basis).with_resident_weights(ResidentWeights(item.bytes))))
+                    .collect::<Vec<_>>();
                 let target = programs.target(owners::DECODE_LANE_ROWS, 512, 256, ranks, 2, 16, resident::Fp8Head::All, ranks == 1)?;
                 // The startup validators accept the planner's own target list.
                 if ranks == 1 { validate_engram_rows(&target, 512, owners::DECODE_LANE_ROWS as usize)?; }

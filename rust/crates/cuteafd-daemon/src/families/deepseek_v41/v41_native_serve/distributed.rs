@@ -75,11 +75,23 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // possible their bytes are recorded and arrive in the Spark push group.
     let pushing = super::coordinator_push::wanted(&args, &catalog)?;
     let recorder = crate::shared::experts::rtx::dense::Recorder::start(pushing)?;
+    use cuteafd_core::memory_layout::{Basis, Category};
+    use cuteafd_loader::placement::{Demand, ResidentWeights};
+    // These owners are already in the CUDA sample; only their independent weight resource is future.
+    let checkpoint_owner = |rank: usize, name: &str, bytes: usize|
+        Demand::new(rank as u8, Category::Weights, name, 0, Basis::Exact)
+            .with_resident_weights(ResidentWeights(bytes as u64));
+    let mut loaded_weights = Vec::new();
+    let backbone_bytes = BackboneLaneWeights::distributed_device_bytes_with_split(
+        &lib, &catalog, map, args.tp2_query_projection, args.tp2_output_projection)?;
+    for (rank, bytes) in backbone_bytes.into_iter().enumerate() {
+        loaded_weights.push(checkpoint_owner(rank, "loaded backbone checkpoint owners", bytes));
+    }
     let weights = BackboneLaneWeights::load_distributed_with_split(
         &lib,
         &catalog,
         map,
-        BackboneLaneWeights::distributed_device_bytes_with_split(&lib, &catalog, map,args.tp2_query_projection,args.tp2_output_projection)?,
+        backbone_bytes,
         16 << 20,
         args.tp2_query_projection,
         args.tp2_output_projection,
@@ -98,28 +110,51 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
                 Weights::load_peak_device_bytes(Kind::OutputB))).collect::<Result<Vec<_>>>())
             .into_iter().collect::<Result<Vec<_>>>()?)
     } else { None };
+    use crate::families::deepseek_v41::v41_projection_tp2::{Kind, Weights as ProjectionWeights};
+    for (shards, kind, name) in [(&query_shards, Kind::QueryB, "loaded query projection shards"),
+        (&output_shards, Kind::OutputB, "loaded output projection shards")] {
+        if let Some(shards) = shards {
+            for (rank, layers) in shards.iter().enumerate() {
+                let bytes = layers.len().checked_mul(ProjectionWeights::device_bytes(kind))
+                    .context("V4.1 projection resident weights overflow")?;
+                loaded_weights.push(checkpoint_owner(rank, name, bytes));
+            }
+        }
+    }
     memory_checkpoint("attention mHC router weights")?;
+    let producers_bytes = CacheProducerWeights::distributed_device_bytes(&lib, &catalog, map)?;
+    for (rank, bytes) in producers_bytes.into_iter().enumerate() {
+        loaded_weights.push(checkpoint_owner(rank, "loaded cache producer checkpoint owners", bytes));
+    }
     let producers = CacheProducerWeights::load_distributed(
         &lib,
         &catalog,
         map,
-        CacheProducerWeights::distributed_device_bytes(&lib, &catalog, map)?,
+        producers_bytes,
         16 << 20,
     )?;
     memory_checkpoint("cache producer weights")?;
+    let iw_bytes = IndexLaneWeights::distributed_device_bytes(&lib, &catalog, map)?;
+    for (rank, bytes) in iw_bytes.into_iter().enumerate() {
+        loaded_weights.push(checkpoint_owner(rank, "loaded index checkpoint owners", bytes));
+    }
     let iw = IndexLaneWeights::load_distributed(
         &lib,
         &catalog,
         map,
-        IndexLaneWeights::distributed_device_bytes(&lib, &catalog, map)?,
+        iw_bytes,
         16 << 20,
     )?;
     memory_checkpoint("index query weights")?;
+    let ew_bytes = PlacedEngramWeights::device_bytes(&lib, &catalog, map)?;
+    for (rank, bytes) in ew_bytes.into_iter().enumerate() {
+        loaded_weights.push(checkpoint_owner(rank, "loaded Engram checkpoint owners", bytes));
+    }
     let ew = PlacedEngramWeights::load(
         &lib,
         &catalog,
         map,
-        PlacedEngramWeights::device_bytes(&lib, &catalog, map)?,
+        ew_bytes,
         16 << 20,
     )?;
     memory_checkpoint("Engram weights")?;
@@ -128,11 +163,15 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         NativeRtxTensors::load_embedding(&lib, &catalog,
             super::admission::embedding_placement(args.embedding_placement, total))
     })?;
+    loaded_weights.push(checkpoint_owner(0, "loaded device embedding", table.resident_bytes()));
     memory_checkpoint("embedding weights")?;
     let vocab = [
         devices[0].own(|| crate::families::deepseek_v41::v41_tensors::VocabularyShard::load(&lib, &catalog, 0..64640, 1 << 30, 16 << 20))?,
         devices[1].own(|| crate::families::deepseek_v41::v41_tensors::VocabularyShard::load(&lib, &catalog, 64640..129280, 1 << 30, 16 << 20))?,
     ];
+    for (rank, shard) in vocab.iter().enumerate() {
+        loaded_weights.push(checkpoint_owner(rank, "loaded vocabulary checkpoint owners", shard.resident_bytes()));
+    }
     memory_checkpoint("vocabulary weights")?;
     let hw = devices[1].own(|| {
         TargetHeadWeights::load(
@@ -142,6 +181,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             16 << 20,
         )
     })?;
+    loaded_weights.push(checkpoint_owner(1, "loaded target normalization", TargetHeadWeights::device_bytes(&catalog)?));
     memory_checkpoint("head normalization weights")?;
     let mut shared_owned: [Vec<SharedWeights<'_>>; 2] = [0, 1]
         .map(|r| {
@@ -162,6 +202,11 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         .try_into()
         .ok()
         .expect("two ranks");
+    for (rank, layers) in shared_owned.iter().enumerate() {
+        let bytes = layers.len().checked_mul(SharedWeights::device_bytes())
+            .context("V4.1 shared resident weights overflow")?;
+        loaded_weights.push(checkpoint_owner(rank, "loaded shared expert checkpoint owners", bytes));
+    }
     let mut records = recorder.map(|r| r.finish());
     memory_checkpoint("weights")?;
     tracing::info!(capacity, backbone_lane_bytes=BackboneLane::placed_workspace_bytes_with_split(&lib, capacity,args.tp2_query_projection,args.tp2_output_projection)?,
@@ -270,7 +315,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let embedding_storage = admission::scoped(p, "embedding", || devices[0].own(|| TargetEmbeddingWave::storage(&lib, reserve, capacity as usize)))?;
     let engram_storage = admission::scoped(p, "engram", || PlacedEngram::storage(&ew, reserve, capacity as usize))?;
     let tap_storage = admission::scoped(p, "target taps", || devices[1].own(|| TargetTapWave::storage(&lib, reserve, capacity as usize)))?;
-    use crate::families::deepseek_v41::v41_projection_tp2::{Kind, Storage as ProjectionStorage};
+    use crate::families::deepseek_v41::v41_projection_tp2::Storage as ProjectionStorage;
     let projection_storage = |kind: Kind, enabled: bool| -> Result<Option<[Rc<ProjectionStorage<'_>>; 2]>> {
         if !enabled { return Ok(None); }
         Ok(Some([ProjectionStorage::new(devices, kind, capacity, 0)?, ProjectionStorage::new(devices, kind, capacity, 1)?]))
@@ -347,6 +392,10 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     } else { None };
     // Vision and target snapshot copies use GPU0. These allocations precede KV sizing.
     let mut vision = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load(&args, &catalog)?;
+    if matches!(&vision, crate::families::deepseek_v41::v41_vision_encoder::Encoder::Local(_)) {
+        loaded_weights.push(checkpoint_owner(0, "loaded vision checkpoint owners",
+            crate::families::deepseek_v41::v41_vision::VisionRuntime::weight_bytes(&catalog)?));
+    }
     memory_checkpoint("vision")?;
     let prefix_arenas = super::prefix::Arenas::new(devices[0], None, snapshot_slots)?;
     let snapshot_bytes = super::prefix::Arenas::device_bytes(snapshot_slots, args.dspark);
@@ -369,8 +418,9 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // Decode lanes' links at their own width (P3); the prefill link at the unit.
     let wave_bytes = NativeTp4Wave::device_bytes_for(decode_rows, spark_ranks)?;
     let memory=admission::admission_memory(&lib,&inventory)?;
-    let deferred = cuteafd_loader::placement::families::deepseek_v41::owners::deferred_owners(
+    let mut deferred = cuteafd_loader::placement::families::deepseek_v41::owners::deferred_owners(
         2, cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(decode_rows), u64::from(capacity), spark_ranks, slots, cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false))?)?;
+    deferred.extend(loaded_weights);
     // The dSpark load phase is its experts plus their transient staging above
     // this sample; nothing else is allocated until it drains.
     let draft_load = dspark_inventory.as_ref().map(|draft| draft.load_phase(2)).transpose()?.unwrap_or_default();

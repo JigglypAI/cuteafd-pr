@@ -106,6 +106,17 @@ pub fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool)
 pub fn resident_headers<'a>(config: &serde_json::Value,
     tensors: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>,
     ranks: usize, dspark: bool) -> Option<Vec<Vec<Item>>> {
+    resident_inventory(config, tensors, ranks, dspark, true)
+}
+
+/// Only the drafter's own checkpoint allocations; borrowed target owners are excluded.
+pub fn drafter_weights(checkpoint: &Checkpoint, ranks: usize) -> Option<Vec<Vec<Item>>> {
+    resident_inventory(&checkpoint.config, checkpoint.tensors.iter().map(|tensor| &tensor.meta), ranks, true, false)
+}
+
+fn resident_inventory<'a>(config: &serde_json::Value,
+    tensors: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>,
+    ranks: usize, dspark: bool, target: bool) -> Option<Vec<Vec<Item>>> {
     let config = config.get("text_config").unwrap_or(config);
     let tensors = tensors.into_iter().collect::<Vec<_>>();
     if ![1, 2].contains(&ranks) || config["num_hidden_layers"].as_u64() != Some(40)
@@ -144,6 +155,7 @@ pub fn resident_headers<'a>(config: &serde_json::Value,
             add(decoder, Category::Drafter, "dspark-auxiliary", &format, bytes);
             continue;
         }
+        if !target { continue; }
         if name == "head.weight" {
             let (resident, head_format) = head_mode.resident(bytes / ranks as u64);
             for rank in 0..ranks { add(rank, Category::Weights, "lm_head", head_format, resident); }
