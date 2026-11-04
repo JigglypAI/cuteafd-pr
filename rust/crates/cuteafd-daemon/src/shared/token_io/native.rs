@@ -7,7 +7,7 @@ use cuteafd_ffi::native_dense::{DenseEmbedding, DenseLinear};
 use cuteafd_ffi::programs::Programs;
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_loader::plan::exlr8::dense::{
-    DenseEncoding, DensePlan, DenseRecord, DenseSelection, DenseSlice, ShardSide,
+    DenseEncoding, DensePlan, DenseRange, DenseRecord, DenseSelection, DenseSlice, ShardSide,
 };
 
 const EMBEDDING: &str = "model.embed_tokens.weight";
@@ -159,6 +159,7 @@ impl VocabularyPlan {
 pub(crate) struct RowFp8Weights<'a> {
     payload: DeviceAllocation<'a>,
     scales: DeviceAllocation<'a>,
+    source: [DenseRange; 2],
 }
 
 /// One named table's residency, independent of the shared vocabulary lifetime owner.
@@ -185,6 +186,45 @@ impl RowFp8Weights<'_> {
     pub(crate) fn scales(&self) -> CuteafdDeviceBuffer {
         self.scales.buffer
     }
+
+    pub(crate) fn host_row(&self, library: &NativeLibrary, token: usize, hidden: usize,
+        output: &mut [u8]) -> Result<()> {
+        ensure!(hidden.checked_mul(2) == Some(output.len()), "native vocabulary BF16 row width");
+        let mut bytes = vec![0u8; hidden];
+        let mut scale = [0u8; 4];
+        if dense::is_recording() {
+            // Recorded destinations have not landed. Only the requested row
+            // comes from storage, with the same native decode as the mount.
+            read_source_row(&self.source, token, hidden, &mut bytes, &mut scale)?;
+        } else {
+            let first = token.checked_mul(hidden).context("native vocabulary row offset overflow")?;
+            let scale_first = token.checked_mul(4).context("native vocabulary scale offset overflow")?;
+            library.copy_d2h(&mut bytes, view(self.payload(), first, hidden)?)?;
+            library.copy_d2h(&mut scale, view(self.scales(), scale_first, 4)?)?;
+        }
+        let scale = f32::from_le_bytes(scale);
+        for (out, &b) in output.chunks_exact_mut(2).zip(&bytes) {
+            out.copy_from_slice(&super::bf16_rne(super::e4m3_to_f32(b) * scale).to_le_bytes());
+        }
+        Ok(())
+    }
+}
+
+fn read_source_row(source: &[DenseRange; 2], token: usize, hidden: usize,
+    payload: &mut [u8], scale: &mut [u8; 4]) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    ensure!(hidden > 0 && payload.len() == hidden, "native vocabulary row width");
+    for (range, width, output) in [(&source[0], hidden, payload), (&source[1], 4, scale.as_mut_slice())] {
+        let first = token.checked_mul(width).context("native vocabulary row offset overflow")?;
+        ensure!(first.checked_add(width).is_some_and(|end| end <= range.bytes),
+            "native vocabulary row outside source");
+        let offset = range.offset.checked_add(u64::try_from(first)?)
+            .context("native vocabulary source offset overflow")?;
+        std::fs::File::open(&range.path)
+            .with_context(|| format!("opening {}", range.path.display()))?
+            .read_exact_at(output, offset)?;
+    }
+    Ok(())
 }
 
 /// Owns immutable native bytes. Callers must drain all users before releasing this owner.
@@ -374,6 +414,7 @@ fn load_rows<'a>(
             slice.components[1].source.bytes,
             "native-vocabulary-scales",
         )?,
+        source: [slice.components[0].source.clone(), slice.components[1].source.clone()],
     };
     if dense::is_recording() {
         let load = DenseLoad::mount(library);
@@ -551,6 +592,84 @@ mod tests {
                 record_rows(&absent, buffers, |operand| sink.operand(operand))?;
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn source_mask_rows_match_mount_stream_with_separate_component_files() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut item = record(root.path(), EMBEDDING);
+        let payload = (0..256 * 8).map(|i| i as u8).collect::<Vec<_>>();
+        let scales = (0..256).flat_map(|i| [0.5f32, 1.0, 1.00390625, 0.0, -2.0][i % 5].to_le_bytes())
+            .collect::<Vec<_>>();
+        for (i, bytes) in [&payload, &scales].into_iter().enumerate() {
+            let prefix = 13 + i * 7;
+            let path = root.path().join(format!("component-{i}"));
+            std::fs::write(&path, [vec![0xa5; prefix], bytes.clone()].concat())?;
+            item.components[i].source = DenseRange { path, offset: prefix as u64, bytes: bytes.len() };
+        }
+        let slice = item.slice(0, 256)?;
+        let source = [slice.components[0].source.clone(), slice.components[1].source.clone()];
+        let mut mounted = [vec![0; payload.len()], vec![0; scales.len()]];
+        stream_rows(&slice, &mut vec![0; 1536], |i, at, bytes| {
+            mounted[i][at..at + bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        })?;
+        for token in 0..256 {
+            let mut row = [0u8; 8];
+            let mut scale = [0u8; 4];
+            read_source_row(&source, token, 8, &mut row, &mut scale)?;
+            assert_eq!(row, mounted[0][token * 8..(token + 1) * 8]);
+            assert_eq!(scale, mounted[1][token * 4..(token + 1) * 4]);
+            let decode = |bytes: &[u8], scale: &[u8]| {
+                let scale = f32::from_le_bytes(scale.try_into().unwrap());
+                bytes.iter().flat_map(|&b| super::super::bf16_rne(
+                    super::super::e4m3_to_f32(b) * scale).to_le_bytes()).collect::<Vec<_>>()
+            };
+            assert_eq!(decode(&row, &scale), decode(&mounted[0][token * 8..(token + 1) * 8],
+                &mounted[1][token * 4..(token + 1) * 4]));
+        }
+        assert!(read_source_row(&source, 256, 8, &mut [0; 8], &mut [0; 4]).is_err());
+        assert!(read_source_row(&source, usize::MAX, 8, &mut [0; 8], &mut [0; 4]).is_err());
+        assert!(read_source_row(&source, 0, 8, &mut [0; 7], &mut [0; 4]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn recorded_mask_row_matches_mounted_device_without_reading_unlanded_bytes() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 1, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        let root = tempfile::tempdir_in(fixture.directory())?;
+        let item = record(root.path(), EMBEDDING);
+        let mut bytes = (0..256 * 8).map(|i| i as u8).collect::<Vec<_>>();
+        bytes.extend((0..256).flat_map(|i| [0.5f32, 1.00390625, -2.0][i % 3].to_le_bytes()));
+        std::fs::write(&item.components[0].source.path, &bytes)?;
+        let slice = item.slice(0, 256)?;
+        let mut staging = HostAllocation::named(&library, 1536, "mask-row-test")?;
+        let mounted = load_rows(&library, &slice, &mut staging)?;
+        let ((recorded, rows), records) = dense::recording(|| {
+            let recorded = load_rows(&library, &slice, &mut staging)?;
+            // Poison both device tables: recording must use storage, not these.
+            library.copy_h2d(recorded.payload(), &vec![0x7f; 256 * 8])?;
+            library.copy_h2d(recorded.scales(), &vec![0xff; 256 * 4])?;
+            let mut rows = Vec::new();
+            for token in 0..256 {
+                let mut row = vec![0; 16];
+                recorded.host_row(&library, token, 8, &mut row)?;
+                rows.push(row);
+            }
+            Ok((recorded, rows))
+        })?;
+        assert_eq!(records.operands.len(), 2);
+        for (token, expected) in rows.into_iter().enumerate() {
+            let mut actual = vec![0; 16];
+            mounted.host_row(&library, token, 8, &mut actual)?;
+            assert_eq!(actual, expected, "mask token {token}");
+        }
+        drop(recorded);
         Ok(())
     }
 
