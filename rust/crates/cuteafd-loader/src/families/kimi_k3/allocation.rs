@@ -538,8 +538,8 @@ mod tests {
         let shape = prefill_shape_with(8256, 3, Some(2752))?;
         let core = super::super::core::CoreInventory::default();
         let single = baseline_demands_for_ranks(&cfg, &manifest, 8256, shape, 262144, 16, 8,
-            &core, false, 6, 1)?;
-        let pair = baseline_demands(&cfg, &manifest, 8256, shape, 262144, 16, 8, &core, false, 6)?;
+            &core, false, 6, 1, cuteafd_core::SparkReplyFormat::Bf16)?;
+        let pair = baseline_demands(&cfg, &manifest, 8256, shape, 262144, 16, 8, &core, false, 6, cuteafd_core::SparkReplyFormat::Bf16)?;
         assert!(single.iter().all(|d| d.gpu == 0));
         assert!(!single.iter().any(|d| d.group == "Kimi peer/abort/hop controls"));
         assert_eq!(pair.iter().filter(|d| d.group == "Kimi peer/abort/hop controls").count(), 2);
@@ -556,7 +556,7 @@ mod tests {
         assert_eq!(code_demand(1, 100, 200, 2)?.bytes, 500);
         assert!(code_demand_for_ranks(1, 0, 0, 1, 1).is_err());
         assert!(baseline_demands_for_ranks(&cfg, &manifest, 8256, shape, 262144, 16, 8,
-            &core, false, 6, 0).is_err());
+            &core, false, 6, 0, cuteafd_core::SparkReplyFormat::Bf16).is_err());
         Ok(())
     }
 

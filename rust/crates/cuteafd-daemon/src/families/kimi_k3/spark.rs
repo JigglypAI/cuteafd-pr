@@ -337,7 +337,7 @@ mod tests {
                 }
             }
         }
-        assert!(admitted_demand_on(3, 2752, 0, 6, 2).is_err());
+        assert!(admitted_demand_on(3, 2752, 0, 6, 2, cuteafd_core::SparkReplyFormat::Bf16).is_err());
         Ok(())
     }
 
