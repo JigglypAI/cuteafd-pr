@@ -1323,3 +1323,84 @@ def test_v4_placement_publication_preserves_compiler_metadata_and_provenance(tmp
                 assert args[args.index('--max-context') + 1] == str(context)
     with pytest.raises(ValueError, match='not empty'):
         compare_sm.v4_placement_inputs(target, tmp_path / 'staging2', 1, 1)
+
+
+@pytest.mark.parametrize("mismatch", [None, "worker", "sources"])
+def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, monkeypatch, mismatch):
+    publisher = compare_sm.load_file("test_placement_inputs", ROOT / "scripts/build/export-placement-inputs.py")
+    real_load = publisher.compare.load_file
+    filesystem = SimpleNamespace(check_path=lambda path: None)
+    monkeypatch.setattr(publisher.compare, 'load_file', lambda name, path:
+        filesystem if name == 'placement_filesystem' else real_load(name, path))
+    jobs = [("programs", "export_b12x_dsv4_aot.py", []),
+            ("exl3/exl3-glm-k45", "package_exl3_aot.py", []),
+            ("fp8/fp8-mimop", "package_fp8_moe_aot.py", [])]
+    monkeypatch.setattr(publisher, 'export_jobs', lambda: jobs)
+    calls = []
+
+    def compile_export(command, **kwargs):
+        payload = json.loads(command[-1])
+        calls.append(payload)
+        output = Path(payload['output'])
+        lock = json.loads((ROOT / 'third_party/sparkinfer.lock.json').read_text())
+        (output / 'comparison-context.json').write_text(json.dumps({
+            'cuda_initialized': mismatch == 'worker', 'sparkinfer_revision': lock['revision'],
+            'source_tree_sha256': lock['source_tree_sha256']}))
+        if payload['exporter'] == 'package_exl3_aot.py':
+            directory = output / 'rtx-tp2/m2752'
+            directory.mkdir(parents=True)
+            (directory / 'v41_exl3.json').write_text('{"scratch":123,"compiler":true}')
+        elif payload['exporter'] == 'package_fp8_moe_aot.py':
+            (output / 'routed.json').write_text(json.dumps({'programs': [
+                {'layout': 'tp1', 'capacity': 2752, 'scratch_bytes': 123},
+                {'layout': 'tp1', 'capacity': 2752, 'scratch_bytes': 456},
+                {'layout': 'tp2', 'capacity': 4096, 'scratch_bytes': 789}]}))
+        else:
+            (output / 'dsv4_programs.json').write_text('{"compiler":true}')
+    monkeypatch.setattr(publisher.subprocess, 'run', compile_export)
+    monkeypatch.setattr(publisher.subprocess, 'check_output', lambda *a, **kw: 'a' * 40)
+    if mismatch == 'sources':
+        original = publisher.source_hashes
+        captures = []
+        def changed():
+            captures.append(True)
+            return original() if len(captures) == 1 else {}
+        monkeypatch.setattr(publisher, 'source_hashes', changed)
+    target, staging = tmp_path / 'published', tmp_path / 'staging'
+    if mismatch:
+        with pytest.raises(ValueError, match='provenance mismatch' if mismatch == 'worker' else 'sources changed'):
+            publisher.publish(target, staging, 1, 1)
+        assert not (target / 'INPUTS.json').exists()
+        return
+    publisher.publish(target, staging, 1, 1)
+    metadata = json.loads((target / 'INPUTS.json').read_text())
+    assert metadata['engine_commit'] == 'a' * 40
+    assert metadata['engine_sources_sha256'] == publisher.source_hashes()
+    assert len(calls) == len(metadata['exports']) == 3
+    assert (target / 'PROGRAMS.json').read_bytes() == (staging / 'programs/dsv4_programs.json').read_bytes()
+    assert (target / 'exl3/exl3-glm-k45/rtx-tp2/m2752/v41_exl3.json').read_bytes() == b'{"scratch":123,"compiler":true}'
+    fp8 = json.loads((target / 'fp8/fp8-mimop/manifest.json').read_text())
+    assert fp8['layouts']['tp1']['capacities'] == [{'capacity': 2752, 'scratch_bytes': 456}]
+    assert fp8['layouts']['tp2']['capacities'] == [{'capacity': 4096, 'scratch_bytes': 789}]
+    for path, checksum in metadata['files'].items():
+        assert publisher.compare.sha((target / path).read_bytes()) == checksum
+    assert not list(target.rglob('*.o'))
+    with pytest.raises(ValueError, match='not empty'):
+        publisher.publish(target, tmp_path / 'other-staging', 1, 1)
+
+
+def test_installed_placement_export_jobs_cover_live_native_families_and_packages():
+    publisher = compare_sm.load_file("test_placement_jobs", ROOT / "scripts/build/export-placement-inputs.py")
+    jobs = publisher.export_jobs()
+    names = {name for name, _, _ in jobs}
+    assert {'exl3/exl3-glm-k45', 'exl3/exl3-glmf-k34', 'exl3/exl3-kimik3-k23',
+            'exl3/exl3-step5-k46', 'exl3/exl3-muse-k45', 'exl3/exl3-ml4-k45',
+            'exl3/exl3-qwen4-k45', 'fp8/fp8-step5-bf16-weights', 'fp8/fp8-step5',
+            'fp8/fp8-mimop', 'fp8/fp8-mimof'} <= names
+    assert not any('nvfp4' in name for name in names)
+    args = jobs[0][2]
+    geometry = set(args[args.index('--geometry') + 1].split(','))
+    assert {'flash', 'pro', 'glm', 'glmf', 'muse', 'ml4', 'qwen35', 'qwen38',
+            'step5', 'kimik3', 'exlr8', 'exlr8_dense', 'dense_trellis_k6'} <= geometry
+    assert args[args.index('--exlr8-role') + 1] == 'coordinator'
+    assert len(names) == len(jobs)

@@ -1777,6 +1777,43 @@ mod v4_input_tests {
     }
 
     #[test]
+    fn published_placement_inputs_fail_closed_for_missing_stale_and_modified_files() {
+        use sha2::{Digest, Sha256};
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = directory.path().join("PROGRAMS.json");
+        let metadata_path = directory.path().join("INPUTS.json");
+        assert!(format!("{:#}", validate_placement_inputs(&manifest).unwrap_err()).contains("PROGRAMS.json missing"));
+        fs::write(&manifest, r#"{"programs":[]}"#).unwrap();
+        assert!(format!("{:#}", validate_placement_inputs(&manifest).unwrap_err()).contains("missing placement provenance"));
+        let lock: Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/../../../third_party/sparkinfer.lock.json"))).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let valid = json!({"schema": 1, "engine_commit": "a".repeat(40),
+            "sparkinfer_revision": lock["revision"], "source_tree_sha256": lock["source_tree_sha256"],
+            "engine_sources_sha256": placement_input_source_hashes(&root).unwrap(),
+            "exports": [{"sparkinfer_revision": lock["revision"],
+                "source_tree_sha256": lock["source_tree_sha256"], "cuda_initialized": false}],
+            "files": {"PROGRAMS.json": format!("{:x}", Sha256::digest(fs::read(&manifest).unwrap()))}});
+        fs::write(&metadata_path, valid.to_string()).unwrap();
+        validate_placement_inputs(&manifest).unwrap();
+        for (field, value, expected) in [
+            ("sparkinfer_revision", json!("wrong"), "fork pin mismatch"),
+            ("engine_sources_sha256", json!({}), "source fingerprints differ"),
+            ("exports", json!([]), "worker provenance mismatch"),
+            ("files", json!({}), "PROGRAMS.json missing from placement provenance"),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            fs::write(&metadata_path, invalid.to_string()).unwrap();
+            let error = format!("{:#}", validate_placement_inputs(&manifest).unwrap_err());
+            assert!(error.contains(expected) && error.contains("export-placement-inputs.py"), "{error}");
+        }
+        fs::write(&metadata_path, valid.to_string()).unwrap();
+        fs::write(&manifest, "modified").unwrap();
+        assert!(format!("{:#}", validate_placement_inputs(&manifest).unwrap_err()).contains("checksum mismatch"));
+    }
+
+    #[test]
     fn live_v4_inputs_refuse_missing_and_stale_provenance() {
         let root = tempfile::tempdir().unwrap();
         assert!(validate_v4_placement_inputs(root.path()).unwrap_err().to_string().contains("missing live V4 inputs"));

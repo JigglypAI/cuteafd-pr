@@ -149,7 +149,7 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   `~/Developer/GPTQModel` main; push there first, then bump pin and lock here.
   A fork or export-source bump regenerates and publishes V4 and all-family placement inputs (`scripts/build/export-placement-inputs.py`, `~/.cache/cuteafd/builds/placement-inputs/<sha>/` plus `current`)
   at the merged dev SHA, validated beforehand through
-  `CUTEAFD_V4_PLACEMENT_INPUTS` without switching `current`.
+  `CUTEAFD_V4_PLACEMENT_INPUTS` / `CUTEAFD_DEPLOYMENT_TEST_PROGRAMS` without switching `current`.
   Dev images are toolchain-only and pin-independent: a SparkInfer bump
   needs only a new WIP slot build. Rebuild them with
   `scripts/build/build-dev-images.sh` only when the toolchain changes;

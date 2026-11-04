@@ -321,8 +321,7 @@ fn installed_example_inventory_detects_absent_checkpoints_and_revisions() {
         "a broken installed main ref is not an absent-checkpoint skip");
 }
 
-fn installed_example_programs(override_path: Option<std::path::PathBuf>, home: &std::path::Path,
-    _image_manifest: &std::path::Path) -> std::path::PathBuf {
+fn installed_example_programs(override_path: Option<std::path::PathBuf>, home: &std::path::Path) -> std::path::PathBuf {
     let manifest = override_path.unwrap_or_else(|| home.join(".cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json"));
     cuteafd_loader::plan::testing::validate_placement_inputs(&manifest)
         .unwrap_or_else(|error| panic!("{error:#}"));
@@ -334,7 +333,7 @@ fn installed_example_programs_fail_on_missing_override_or_published_default() {
     let home = tempfile::tempdir().unwrap();
     let absent = home.path().join("absent/PROGRAMS.json");
     for path in [None, Some(absent.clone())] {
-        let failed = std::panic::catch_unwind(|| installed_example_programs(path, home.path(), &absent));
+        let failed = std::panic::catch_unwind(|| installed_example_programs(path, home.path()));
         let error = failed.unwrap_err();
         let message = error.downcast_ref::<String>().unwrap();
         assert!(message.contains("PROGRAMS.json missing"), "{message}");
@@ -342,7 +341,7 @@ fn installed_example_programs_fail_on_missing_override_or_published_default() {
     }
     std::fs::create_dir_all(absent.parent().unwrap()).unwrap();
     std::fs::write(&absent, r#"{"schema":1,"programs":[]}"#).unwrap();
-    let failed = std::panic::catch_unwind(|| installed_example_programs(Some(absent.clone()), home.path(), &absent));
+    let failed = std::panic::catch_unwind(|| installed_example_programs(Some(absent.clone()), home.path()));
     let error = failed.unwrap_err();
     assert!(error.downcast_ref::<String>().unwrap().contains("missing placement provenance"));
 }
@@ -365,10 +364,10 @@ fn require_installed_snapshot(scope: &str, model_id: &str, revision: Option<&str
 
 fn run_installed_glm_exlr8_worker_budget(hf_home: Option<std::ffi::OsString>,
     programs_override: Option<std::path::PathBuf>, home: &std::path::Path,
-    default_programs: &std::path::Path, root: &std::path::Path) {
+    root: &std::path::Path) {
     let hf_home = require_installed_hf_home(
         "installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget", hf_home);
-    let programs = installed_example_programs(programs_override, home, default_programs);
+    let programs = installed_example_programs(programs_override, home);
     let mut tested = 0;
     for (name, gpus, ranks) in [("min", "1", 4), ("max", "2", 6)] {
         let example = root.join(format!("examples/configs/glm53-exlr8-{name}.config"));
@@ -537,16 +536,15 @@ fn installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget() {
         std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"),
         std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into),
         &std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME")),
-        std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"),
         &root);
 }
 
 fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
     programs_override: Option<std::path::PathBuf>, home: &std::path::Path,
-    default_programs: &std::path::Path, root: &std::path::Path) {
+    root: &std::path::Path) {
     let hf_home = require_installed_hf_home(
         "installed_example_deployments_publish_executable_prefill_shapes", hf_home);
-    let programs = installed_example_programs(programs_override, home, default_programs);
+    let programs = installed_example_programs(programs_override, home);
     eprintln!("installed example PROGRAMS: {}", programs.display());
     let matrix: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(root.join("benchmarks/current-matrix.json")).unwrap()).unwrap();
@@ -606,7 +604,6 @@ fn installed_example_deployments_publish_executable_prefill_shapes() {
         std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"),
         std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into),
         &std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME")),
-        std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"),
         &root);
 }
 
@@ -744,23 +741,22 @@ fn installed_test_entrypoints_fail_instead_of_skipping_absent_inputs() {
 fn installed_checkpoint_runners_fail_on_missing_hf_home_checkpoints_or_programs() {
     let temp = tempfile::tempdir().unwrap();
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    let absent_programs = temp.path().join("absent/PROGRAMS.json");
     let matrix = serde_json::json!({"cells": [], "retired": []});
     for missing_hf in [None, Some( std::ffi::OsString::from("") ),
         Some(temp.path().join("missing-hf").into_os_string())] {
         assert!(std::panic::catch_unwind(|| run_installed_glm_exlr8_worker_budget(
-            missing_hf.clone(), None, temp.path(), &absent_programs, &root)).is_err());
+            missing_hf.clone(), None, temp.path(), &root)).is_err());
         assert!(std::panic::catch_unwind(|| run_installed_example_deployments(
-            missing_hf.clone(), None, temp.path(), &absent_programs, &root)).is_err());
+            missing_hf.clone(), None, temp.path(), &root)).is_err());
         assert!(std::panic::catch_unwind(|| run_installed_release_matrix_recipes(
             missing_hf.clone(), &root, &matrix)).is_err());
     }
     let hf_home = temp.path().join("hf");
     std::fs::create_dir_all(&hf_home).unwrap();
     assert!(std::panic::catch_unwind(|| run_installed_glm_exlr8_worker_budget(
-        Some(hf_home.clone().into_os_string()), None, temp.path(), &absent_programs, &root)).is_err());
+        Some(hf_home.clone().into_os_string()), None, temp.path(), &root)).is_err());
     assert!(std::panic::catch_unwind(|| run_installed_example_deployments(
-        Some(hf_home.clone().into_os_string()), None, temp.path(), &absent_programs, &root)).is_err());
+        Some(hf_home.clone().into_os_string()), None, temp.path(), &root)).is_err());
     assert!(std::panic::catch_unwind(|| run_installed_release_matrix_recipes(
         Some(hf_home.clone().into_os_string()), &root, &matrix)).is_err());
 
