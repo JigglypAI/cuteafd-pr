@@ -929,7 +929,7 @@ impl Shape {
         if let Some(manifest) = self.manifest.as_mut() {
             let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
                 "sm_120", options.rtx_bytes[0]).sms);
-            if let Err(error) = cuteafd_core::coordinator_programs::select_card_plans(manifest, sms) {
+            if let Err(error) = cuteafd_core::coordinator_programs::select_card_plans(std::sync::Arc::make_mut(manifest), sms) {
                 report.placement_supported = false;
                 notes.push(error.to_string());
             }
