@@ -204,6 +204,7 @@ PROFILE_NCU_SET
 PROFILE_NCU_SKIP
 PROFILE_NSYS_GPU_METRICS
 PROFILE_NSYS_CPU
+PROFILE_NSYS_GRAPH_TRACE
 EOF
     # Inventory hosts are accepted but never contacted by this RTX-only family.
     _spark_slot_keys HOST LANE_A
@@ -239,6 +240,7 @@ PROFILE_NCU_SET
 PROFILE_NCU_SKIP
 PROFILE_NSYS_GPU_METRICS
 PROFILE_NSYS_CPU
+PROFILE_NSYS_GRAPH_TRACE
 PROFILE_EXPERT_INPUT_SAMPLE
 PROFILE_EXPERT_ROUTE_WEIGHTS
 PROFILE_SPARK
@@ -295,6 +297,7 @@ PROFILE_NCU_SET
 PROFILE_NCU_SKIP
 PROFILE_NSYS_GPU_METRICS
 PROFILE_NSYS_CPU
+PROFILE_NSYS_GRAPH_TRACE
 PROFILE_EXPERT_INPUT_SAMPLE
 PROFILE_EXPERT_ROUTE_WEIGHTS
 PROFILE_SPARK
@@ -536,6 +539,7 @@ PROFILE_NCU_SET
 PROFILE_NCU_SKIP
 PROFILE_NSYS_GPU_METRICS
 PROFILE_NSYS_CPU
+PROFILE_NSYS_GRAPH_TRACE
 PROFILE_SPARK
 PROFILE_SPARK_RANKS
 PROFILE_SPARK_NCU_KERNEL
@@ -784,6 +788,8 @@ done < <(compgen -e CUTEAFD_DIAG_ | sort)
 #                     `docker stop`, never `docker rm -f`) to PROFILE_DIR/nsys-HOST.nsys-rep.
 #                     wip-cards opens the window after the sweep's first warm wave and
 #                     closes it at sweep end: `--set CARD:PROFILE=nsys --levels ...`.
+#                     PROFILE_NSYS_GRAPH_TRACE=graph traces whole graphs instead of
+#                     individual nodes (default node).
 #                     PROFILE_NSYS_CPU=on adds CPU sampling and context switches
 #                     (host-side stalls; perturbs host timing).
 #                     PROFILE_NSYS_GPU_METRICS=all also samples every GPU's clocks,
@@ -830,6 +836,7 @@ release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s
 profile_args=(${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"})
 release_profile_sample_args "$(get PROFILE)" "$(get PROFILE_EXPERT_INPUT_SAMPLE)" "$(get PROFILE_EXPERT_ROUTE_WEIGHTS)"
 profile_args+=(${RELEASE_PROFILE_SAMPLE_ARGS[@]+"${RELEASE_PROFILE_SAMPLE_ARGS[@]}"})
+RELEASE_PROFILE_NSYS_GRAPH_TRACE="$(get PROFILE_NSYS_GRAPH_TRACE)" \
 RELEASE_PROFILE_NSYS_CPU="$(get PROFILE_NSYS_CPU)" release_profile_wrapper "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)" coordinator \
   "$(get PROFILE_NCU_KERNEL)" "$(get PROFILE_NCU_COUNT)" "$(get PROFILE_NCU_SET)" "$(get PROFILE_NSYS_GPU_METRICS)" "$(get PROFILE_NCU_SKIP)"
 profile_wrapper=(${RELEASE_PROFILE_WRAPPER[@]+"${RELEASE_PROFILE_WRAPPER[@]}"})
