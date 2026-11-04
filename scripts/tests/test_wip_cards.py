@@ -3010,7 +3010,7 @@ def test_observer_slow_cleanup_exits_within_hook_wait_and_preserves_failures(ent
 
 @pytest.mark.parametrize('profile,policy,expected', [('', 'simple', 'off'),
     ('', 'shared', 'on (perturbing)'), ('draft-timing', 'simple', 'on (perturbing)'),
-    ('transport-timing', 'simple', 'on (perturbing)'), ('nsys', 'simple', 'off')])
+    ('transport-timing', 'simple', 'on (perturbing)'), ('census', 'simple', 'off')])
 def test_layer_timing_reported_in_result_and_summary(entry, tmp_path, profile, policy, expected):
     job = cards.generate(entry, 'a', dict(instance='a', slot='s'), tmp_path, tmp_path / 'key',
                          {'PROFILE': profile, 'DRAFT_POLICY': policy}, set(), None, 1)

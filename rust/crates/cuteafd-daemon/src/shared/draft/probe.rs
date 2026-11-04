@@ -178,7 +178,7 @@ impl<'a> RoundProbe<'a> {
         let _timing = super::clock::HostSpan::new(super::clock::HostStage::Routes);
         self.active = false;
         if !std::mem::take(&mut self.pending) { return None; }
-        if !self.collect_routes { return Some((&self.routes, Vec::new())); }
+        if !self.collect_routes { return Some((&self.routes, self.clock.read())); }
         if self.ringed.iter().any(|&queued| queued) && !self.downloaded {
             tracing::debug!("draft policy route arena was not downloaded before verifier sync");
             return None;
