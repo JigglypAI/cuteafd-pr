@@ -1644,6 +1644,61 @@ fn v4_placement_source_hashes(root: &std::path::Path) -> anyhow::Result<Value> {
     Ok(Value::Object(files))
 }
 
+fn placement_input_source_hashes(root: &std::path::Path) -> anyhow::Result<Value> {
+    use sha2::{Digest, Sha256};
+    let mut files = v4_placement_source_hashes(root)?;
+    let mut paths = ["scripts/build/export-placement-inputs.py", "scripts/build/release-scope.py",
+        "scripts/lib/wip_aot_scopes.py", "benchmarks/current-matrix.json"].map(|path| root.join(path)).to_vec();
+    for entry in fs::read_dir(root.join("examples/configs"))? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|extension| extension == "config") { paths.push(path); }
+    }
+    for path in paths {
+        files.as_object_mut().unwrap().insert(path.strip_prefix(root)?.to_string_lossy().into_owned(),
+            Value::String(format!("{:x}", Sha256::digest(fs::read(path)?))));
+    }
+    Ok(files)
+}
+
+/// Installed planners consume a published CPU export, never an ambient WIP slot.
+/// Explicit manifest overrides receive the same pin/source/checksum validation.
+pub fn validate_placement_inputs(manifest: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use sha2::{Digest, Sha256};
+    let regenerate = "regenerate with scripts/build/cuteafd-dev.sh cpu -- python3 scripts/build/export-placement-inputs.py --output <NVMe>/placement-inputs/<sha> --staging <NVMe>/placement-inputs/staging-<sha>";
+    (|| -> anyhow::Result<()> {
+        anyhow::ensure!(manifest.is_file(), "required PROGRAMS.json missing: {}", manifest.display());
+        let root = manifest.parent().context("PROGRAMS.json parent")?;
+        let metadata: Value = serde_json::from_slice(&fs::read(root.join("INPUTS.json"))
+            .with_context(|| format!("missing placement provenance {}", root.join("INPUTS.json").display()))?)?;
+        let lock: Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/../../../third_party/sparkinfer.lock.json")))?;
+        anyhow::ensure!(metadata["schema"] == 1 && metadata["engine_commit"].as_str().is_some_and(|sha| sha.len() == 40),
+            "invalid placement input provenance");
+        anyhow::ensure!(metadata["sparkinfer_revision"] == lock["revision"]
+            && metadata["source_tree_sha256"] == lock["source_tree_sha256"], "stale placement inputs: fork pin mismatch");
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        anyhow::ensure!(metadata["engine_sources_sha256"] == placement_input_source_hashes(&source)?,
+            "stale placement inputs: export source fingerprints differ");
+        let exports = metadata["exports"].as_array().context("missing placement worker provenance")?;
+        anyhow::ensure!(!exports.is_empty() && exports.iter().all(|export|
+            export["sparkinfer_revision"] == lock["revision"]
+            && export["source_tree_sha256"] == lock["source_tree_sha256"]
+            && export["cuda_initialized"] == false), "placement worker provenance mismatch");
+        let files = metadata["files"].as_object().context("missing placement file inventory")?;
+        let name = manifest.file_name().context("PROGRAMS.json filename")?.to_str().context("manifest UTF-8 filename")?;
+        anyhow::ensure!(files.contains_key(name), "PROGRAMS.json missing from placement provenance");
+        for (path, expected) in files {
+            anyhow::ensure!(std::path::Path::new(path).components().all(|part|
+                matches!(part, std::path::Component::Normal(_))), "invalid placement input path {path}");
+            let actual = format!("{:x}", Sha256::digest(fs::read(root.join(path))
+                .with_context(|| format!("missing placement input {path}"))?));
+            anyhow::ensure!(expected.as_str() == Some(&actual), "placement input checksum mismatch: {path}");
+        }
+        Ok(())
+    })().with_context(|| format!("placement inputs at {}; {regenerate}", manifest.display()))
+}
+
 fn validate_v4_placement_sources(metadata: &Value, root: &std::path::Path) -> anyhow::Result<()> {
     anyhow::ensure!(metadata["engine_sources_sha256"] == v4_placement_source_hashes(root)?,
         "stale V4 placement inputs: engine export sources changed; regenerate inputs");

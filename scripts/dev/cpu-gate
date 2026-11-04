@@ -77,7 +77,7 @@ LIVE_PLANNERS = ('families::deepseek_v4::placement_tests::planner_equals_runtime
 INSTALLED_PLANNERS = (
     'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
     'installed_example_deployments_publish_executable_prefill_shapes',
-    'installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers',
+    'installed_release_matrix_recipe_ids_parse_from_checkpoint_headers',
 )
 # Actual >60s IDs from the 081a00072 full gate, plus installed-checkpoint planners.
 FULL_TESTS = (
