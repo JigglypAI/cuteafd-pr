@@ -2408,6 +2408,9 @@ addr="$(get ADDR 0.0.0.0:8000)"
 budget="$(get SPARK_DEVICE_BUDGET_BYTES)"
 spark_budget_args=()
 [[ -z "$budget" ]] || spark_budget_args=(--spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")")
+# Kimi's serve admission checks onboarding against the same explicit Spark
+# ceiling the plan and workers get; unset keeps the family default.
+[[ $family != kimi_k3 ]] || family_args+=("${spark_budget_args[@]}")
 # Two coordinator GPUs (resolved above, primary first): families with a head
 # split (MiMo V2 Flash/Pro, GLM 5.x, GLM 5.3 Flash, DeepSeek V4) split every layer's
 # attention heads and dense / shared-expert MLPs over both by default (COORDINATOR_SPLIT=auto

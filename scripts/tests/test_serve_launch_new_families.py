@@ -130,6 +130,11 @@ def test_kimi_explicit_spark_budget_reaches_plan_and_workers(tmp_path: Path) -> 
     result = _kimi(tmp_path, "SPARK_DEVICE_BUDGET_BYTES=107374182400\n")
     assert _flag(_line(result, "cuteafd plan"), "--spark-budget-gib") == "100.0"
     assert "--device-budget-bytes 107374182400 " in _line(result, "cuteafd expertd-native")
+    assert _flag(_line(result, "cuteafd serve-kimi --snapshot"), "--spark-budget-gib") == "100.0"
+
+
+def test_kimi_unset_spark_budget_leaves_serve_on_the_family_default(tmp_path: Path) -> None:
+    assert "--spark-budget-gib" not in _line(_kimi(tmp_path, ""), "cuteafd serve-kimi --snapshot")
 
 
 @pytest.mark.parametrize("keys,diagnostic", [
@@ -656,7 +661,7 @@ def test_muse_examples_and_smoke_pin_the_qualified_drafter(tmp_path: Path, size,
     assert values["SPECULATOR_MODEL_ID"] == "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"
     assert values["SPECULATOR_MODEL_REVISION"] == "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6"
     assert (values["RTX_GPUS"], values["SPARK_COUNT"], values["POOL_TOKENS"]) == (str(len(gpus)), str(ranks), "auto")
-    assert values["VISION"] == values["AUDIO"] == "off"
+    assert values["VISION"] == values["AUDIO"] == "auto"
     assert not any(key in values for key in ("MAX_CONTEXT_TOKENS", "RTX_EXPERT_LAYERS", "CONCURRENCY", "SPARK_DEVICE_BUDGET_BYTES"))
     assert not any(needle in path.read_text().lower() for needle in PRIVATE)
     _snapshot(tmp_path / "hf", values["SPECULATOR_MODEL_ID"], {}, revision=values["SPECULATOR_MODEL_REVISION"])
