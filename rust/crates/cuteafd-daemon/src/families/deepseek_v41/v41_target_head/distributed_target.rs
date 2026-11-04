@@ -145,7 +145,9 @@ impl<'w, 'a> DistributedTargetHead<'w, 'a> {
     pub(crate) fn capture_startup(&mut self, rows: &[usize]) -> Result<()> {
         ensure!(self.binding.is_none() && self.selected.is_empty(), "target head startup requires an idle owner");
         ensure!(rows.iter().all(|&row| row <= self.capacity), "target head startup row exceeds capacity");
-        self.normalize.on_device_mut(|norm| {
+        let device = self.normalize.device;
+        device.run(|| {
+            let norm = self.normalize.get_mut();
             norm.stream.require_complete()?;
             norm.graphs.declare_startup(rows)?;
             for &row in rows { norm.capture_ready(row)?; }

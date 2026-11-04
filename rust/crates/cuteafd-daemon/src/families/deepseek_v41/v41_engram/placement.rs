@@ -76,7 +76,8 @@ pub(crate) struct PlacedEngram<'w, 'a> {
 impl<'w, 'a> PlacedEngram<'w, 'a> {
     pub(crate) fn capture_startup(&mut self, rows: &[usize]) -> Result<()> {
         for gate in &mut self.gates {
-            gate.on_device_mut(|gate| gate.capture_startup(rows))?;
+            let device = gate.device;
+            device.run(|| gate.get_mut().capture_startup(rows))?;
         }
         Ok(())
     }

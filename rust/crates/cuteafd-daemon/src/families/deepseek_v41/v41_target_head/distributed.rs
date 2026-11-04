@@ -143,7 +143,9 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
         ensure!(self.ready.is_none() && self.pending_logits.is_none() && !self.copy_pending,
             "vocabulary startup requires an idle owner");
         for rank in &mut self.ranks {
-            rank.on_device_mut(|rank| {
+            let device = rank.device;
+            device.run(|| {
+                let rank = rank.get_mut();
                 rank.stream.require_complete()?;
                 for mode in 0..2 {
                     rank.graphs[mode].declare_startup(rows)?;
