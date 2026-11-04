@@ -1288,18 +1288,19 @@ impl Opened {
             let dspark = cuteafd_loader::families::mistral_large4::dspark::Ml4DsparkConfig::from_params(&params, ml4.layers)?;
             let native = cuteafd_loader::formats::dflash::MlaDflashConfig::ml4(&dspark, ml4)?;
             let catalog = &self.catalog;
-            let read = |name: &str, shape: &[usize]| -> Result<Vec<u8>> {
+            let source = |name: &str, shape: &[usize]| -> Result<crate::shared::experts::rtx::dense::Rect> {
                 let tensor = catalog.tensor(name)?;
-                ensure!(tensor.metadata.dtype == cuteafd_core::DType::Bf16 && tensor.metadata.shape == shape,
+                let bytes = shape.iter().try_fold(2usize, |n, &d| n.checked_mul(d)).context("mtp_dspark source extent overflow")?;
+                ensure!(tensor.metadata.dtype == cuteafd_core::DType::Bf16 && tensor.metadata.shape == shape
+                    && tensor.metadata.byte_length == bytes as u64,
                     "{name}: expected BF16 {shape:?}, found {:?} {:?}", tensor.metadata.dtype, tensor.metadata.shape);
-                let mut bytes = vec![0u8; tensor.metadata.byte_length as usize];
-                use std::os::unix::fs::FileExt;
-                std::fs::File::open(catalog.snapshot().join(&tensor.shard))?.read_exact_at(&mut bytes, tensor.metadata.byte_offset)
-                    .with_context(|| format!("reading {name}"))?;
-                Ok(bytes)
+                let rows = if shape.len() >= 2 { shape[0] } else { 1 };
+                ensure!(rows > 0 && bytes > 0 && bytes % rows == 0, "{name}: invalid drafter rows");
+                Ok(crate::shared::experts::rtx::dense::Rect { name: name.into(), path: catalog.snapshot().join(&tensor.shard),
+                    base: tensor.metadata.byte_offset, row_bytes: bytes / rows, rows: 0..rows, cols: 0..bytes / rows })
             };
             let drafter = dflash::DflashDrafter::load_ml4(&self.library, &programs, native, ml4,
-                ml4.logit_softcap as f32, stream, layout, &read)?;
+                ml4.logit_softcap as f32, stream, layout, &source)?;
             drafter.prepare_workspace()?;
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "mtp_dspark drafter resident");
             Some(drafter)

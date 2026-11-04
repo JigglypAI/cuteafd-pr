@@ -1,5 +1,5 @@
 //! Header-only drafter sources and bounded dense load records, shared by block drafters.
-use crate::shared::{experts::rtx::dense::{DenseLoad, Job, Operand, Rect, Step, STEP_BYTES},
+use crate::shared::{experts::rtx::dense::{DenseLoad, Finish, Job, Operand, Rect, Step, STEP_BYTES},
     fp8_linear::{Fp8Scales, Fp8Weight}, memory::DeviceAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
@@ -48,7 +48,12 @@ pub(crate) struct Load<'a> {
     library: &'a NativeLibrary,
     source: Source,
     dense: DenseLoad<'a>,
-    prefetched: Option<Vec<u8>>,
+    prefetched: Option<Prefetched>,
+}
+
+enum Prefetched {
+    File(Vec<u8>),
+    Tensors(HashMap<String, Vec<u8>>),
 }
 
 impl<'a> Load<'a> {
@@ -59,8 +64,19 @@ impl<'a> Load<'a> {
     /// Preserve the existing overlapped mount read when no Recorder is active.
     pub fn with_prefetched(library: &'a NativeLibrary, snapshot: &Path, bytes: Vec<u8>) -> Result<Self> {
         let mut load = Self::open(library, snapshot)?;
-        if !crate::shared::experts::rtx::dense::is_recording() { load.prefetched = Some(bytes); }
+        if !crate::shared::experts::rtx::dense::is_recording() { load.prefetched = Some(Prefetched::File(bytes)); }
         Ok(load)
+    }
+
+    pub fn with_tensors(library: &'a NativeLibrary, snapshot: &Path, tensors: HashMap<String, Vec<u8>>) -> Result<Self> {
+        let mut load = Self::open(library, snapshot)?;
+        if !crate::shared::experts::rtx::dense::is_recording() { load.prefetched = Some(Prefetched::Tensors(tensors)); }
+        Ok(load)
+    }
+
+    pub fn row_norms(&self, source: CuteafdDeviceBuffer, norms: CuteafdDeviceBuffer, rows: usize,
+        cols: usize, stream: *mut c_void) -> Result<()> {
+        self.dense.finish(Finish::RowNorms { source, norms, rows, cols }, stream)
     }
 
     pub fn validate(&self, shapes: impl IntoIterator<Item = (String, Vec<usize>)>) -> Result<()> {
@@ -79,15 +95,33 @@ impl<'a> Load<'a> {
         let lands: Vec<_> = rects.into_iter().map(|rect| { let offset = at; at += rect.bytes(); (rect, offset) }).collect();
         if let Some(prefetched) = &self.prefetched {
             for (rect, offset) in &lands {
-                let start = usize::try_from(rect.base)?;
-                let end = start.checked_add(rect.bytes()).context("drafter prefetched extent overflow")?;
-                let data = prefetched.get(start..end).context("drafter tensor lies past prefetched file")?;
+                let data = match prefetched {
+                    Prefetched::File(bytes) => {
+                        let start = usize::try_from(rect.base)?;
+                        let end = start.checked_add(rect.bytes()).context("drafter prefetched extent overflow")?;
+                        bytes.get(start..end).context("drafter tensor lies past prefetched file")?
+                    }
+                    Prefetched::Tensors(tensors) => {
+                        let bytes = tensors.get(&rect.name).with_context(|| format!("{} was not prefetched", rect.name))?;
+                        ensure!(bytes.len() == rect.bytes(), "{}: prefetched tensor extent differs from its header", rect.name);
+                        bytes.as_slice()
+                    }
+                };
                 self.library.copy_h2d(view(allocation.buffer, *offset, data.len())?, data)?;
             }
         } else {
             self.dense.operand(Operand { device: allocation.buffer.device_id, buffer: allocation.buffer, lands, bytes })?;
         }
         Ok(allocation)
+    }
+
+    pub fn absorb(&self, name: &str, heads: usize, nope: usize, value: usize, latent: usize,
+        stream: *mut c_void) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+        let source = self.source.rect(name, &[heads * (nope + value), latent])?;
+        let uk = DeviceAllocation::new(self.library, heads * latent * nope * 2)?;
+        let uv = DeviceAllocation::new(self.library, heads * value * latent * 2)?;
+        absorb_into(&self.dense, source, heads, nope, value, latent, uk.buffer, uv.buffer, stream)?;
+        Ok((uk, uv))
     }
 
     pub fn concat(&self, parts: &[(&str, usize)], cols: usize) -> Result<DeviceAllocation<'a>> {
@@ -120,6 +154,26 @@ impl<'a> Load<'a> {
         for step in pack_steps(rects, cols, scales, values, scale)? { self.dense.step(step, stream)?; }
         Ok(Weight::Fp8(packed))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn absorb_into(dense: &DenseLoad<'_>, source: Rect, heads: usize, nope: usize, value: usize, latent: usize,
+    uk: CuteafdDeviceBuffer, uv: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
+    let rows = nope.checked_add(value).context("draft absorption head rows overflow")?;
+    let head_bytes = rows.checked_mul(latent).and_then(|n| n.checked_mul(2)).context("draft absorption head bytes overflow")?;
+    ensure!(heads > 0 && nope > 0 && value > 0 && latent > 0 && head_bytes <= STEP_BYTES
+        && source.rows.len() == heads.checked_mul(rows).context("draft absorption rows overflow")?
+        && source.width() == latent * 2 && uk.device_id == uv.device_id,
+        "draft absorption geometry differs from source or staging bound");
+    let per = STEP_BYTES / head_bytes;
+    for first in (0..heads).step_by(per) {
+        let count = per.min(heads - first);
+        dense.step(Step { device: uk.device_id, rects: vec![source.sub(first * rows..(first + count) * rows)],
+            jobs: vec![Job::Absorb { heads: count, nope, v: value, lat: latent,
+                uk: view(uk, first * latent * nope * 2, count * latent * nope * 2)?,
+                uv: view(uv, first * value * latent * 2, count * value * latent * 2)? }] }, stream)?;
+    }
+    Ok(())
 }
 
 fn view(buffer: CuteafdDeviceBuffer, at: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
