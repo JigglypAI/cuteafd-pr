@@ -510,7 +510,9 @@ impl Drop for PhaseTimer<'_> {
 }
 
 /// A checkpoint opened once, with its routed-expert catalog initialized on first use.
-/// Reuse an input when evaluating multiple layouts over the same snapshot.
+/// Reuse an input when evaluating multiple layouts over the same snapshot and
+/// installed artifact set. Manifest paths are snapshotted on first read; create a
+/// new input after replacing artifacts, including after a WIP slot rebuild.
 pub struct PlanInput {
     checkpoint: Checkpoint,
     header_validation: Option<Result<(), String>>,
