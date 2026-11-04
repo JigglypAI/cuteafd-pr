@@ -711,6 +711,25 @@ mod restored_prefix_tests {
         assert_eq!(round_capture(None, true, false, false), Capture::default());
         assert_eq!(round_capture(None, true, false, true), Capture { routes: false, timing: true });
     }
+    #[tokio::test]
+    async fn console_subscriber_keeps_capture_timing_off_unless_profiled() {
+        use tower::ServiceExt;
+        let hub = cuteafd_api::openai::ConsoleHub::new(false);
+        let (queue, _receive) = tokio::sync::mpsc::channel(1);
+        let router = cuteafd_api::openai::router_with_console(queue,
+            cuteafd_api::openai::NativeLimits::default(),
+            std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
+            std::time::Duration::from_secs(1), hub.clone());
+        let response = router.oneshot(axum::http::Request::builder()
+            .uri("/v1/console/events").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(hub.viewers(), 1, "a real console subscriber must be counted");
+        assert!(!round_capture(None, hub.viewers() > 0, false, false).timing);
+        assert!(round_capture(None, hub.viewers() > 0, false, true).timing);
+        drop(response);
+        assert_eq!(hub.viewers(), 0);
+    }
+
     #[test]
     fn long_tail_stats_count_only_judged_positions() {
         assert_eq!(tail_outcome(38, 1, 5), (32, 0, 0));
