@@ -424,9 +424,13 @@ fn recorded_k6_operands_match_the_host_packer_on_mount_and_push() -> Result<()> 
         let records = load.sink.as_ref().context("push sink")?.take_all();
         let (_, _, _, steps, largest, _) = records.summary();
         ensure!(steps > 0 && largest <= STEP_BYTES, "a step stages {largest} bytes");
-        ensure!(records.steps.iter().any(|s| s.jobs.iter().any(|j| matches!(j, crate::shared::experts::rtx::dense::Job::TrellisTiles { input: true, .. })))
-            && records.steps.iter().any(|s| s.jobs.iter().any(|j| matches!(j, crate::shared::experts::rtx::dense::Job::Product { .. }))),
-            "records exercise input-side tiles and products");
+        // Whole input-side weights copy directly; only TP2 slices gather tiles.
+        ensure!(ranks == 1 || records.steps.iter().any(|s| s.jobs.iter().any(|j|
+            matches!(j, crate::shared::experts::rtx::dense::Job::TrellisTiles { input: true, .. }))),
+            "split records exercise input-side tiles");
+        ensure!(records.steps.iter().any(|s| s.jobs.iter().any(|j|
+            matches!(j, crate::shared::experts::rtx::dense::Job::Product { .. }))),
+            "records exercise scale products");
         let sockets = tempfile::tempdir_in(fixture.directory())?;
         for gpu in 0..ranks as i32 {
             let mine = Records { operands: records.operands.iter().filter(|o| o.device == gpu).cloned().collect(),
