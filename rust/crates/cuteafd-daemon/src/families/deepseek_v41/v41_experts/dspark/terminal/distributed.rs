@@ -55,6 +55,32 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
             graphs: crate::shared::decode_graph::GraphBank::new(None), ready: None, pending: None,
         })
     }
+    pub(crate) fn capture_startup(&mut self, capacity: usize, maximum: usize) -> Result<()> {
+        ensure!(self.pending.is_none() && self.ready.is_none(), "terminal startup requires idle owner");
+        let widths: Vec<_> = [5, 7].into_iter().filter(|&w| w <= maximum).collect();
+        let keys: Vec<_> = widths.iter().flat_map(|&width| (0..2).flat_map(move |mode|
+            (1..=capacity).map(move |count| (width, mode, count)))).collect();
+        self.graphs.declare_startup(&keys)?;
+        let original = self.terminal.width();
+        let recorded = (|| -> Result<()> {
+            let mut rows = Vec::new();
+            for width in widths {
+                self.set_width(width)?;
+                for count in 1..=capacity {
+                    rows.push(count * width);
+                    // SAFETY: records existing normalization and sampling
+                    // against stable terminal storage without publishing state.
+                    unsafe { self.capture_stage(count, false)?; self.capture_stage(count, true)?; }
+                }
+            }
+            rows.sort_unstable();
+            rows.dedup();
+            self.head.capture_startup(&rows)?;
+            self.graphs.finish_startup()
+        })();
+        let restored = self.set_width(original);
+        recorded.and(restored)
+    }
     /// GPU1 residual/pre-mix and anchor storage, with the ordinary terminal layout.
     pub fn inputs(&self) -> [CuteafdDeviceBuffer; 3] { self.terminal.inputs() }
     pub fn validate_sampling(&self, requests: usize) -> Result<()> { self.terminal.validate_sampling(requests) }
@@ -87,7 +113,9 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         let terminal = self.terminal.get();
         let mode = usize::from(sampling);
         let width = terminal.width();
-        if !self.graphs.contains(&(width, mode, requests)) && !crate::shared::decode_graph::census::eager("dspark") {
+        if !self.graphs.contains(&(width, mode, requests))
+            && self.graphs.capture_allowed(&(width, mode, requests))
+            && !crate::shared::decode_graph::census::eager("dspark") {
             let graph = device.run(|| unsafe {
                 device.library.cuda_graph_begin_capture(terminal.stream.raw)?;
                 let queued = if sampling { terminal.enqueue_sampling_on(requests, terminal.stream.raw) }

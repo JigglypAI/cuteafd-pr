@@ -74,6 +74,17 @@ impl Drop for ReservedPassGuard<'_, '_, '_, '_, '_> {
     }
 }
 impl<'w, 'a> DistributedTargetPass<'w, 'a> {
+    pub(crate) fn capture_startup_indices(&mut self,
+        bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>) -> Result<()> {
+        ensure!(self.state == State::Idle, "startup index capture requires idle target pass");
+        let resources = &mut self.resources;
+        for index in resources.indices.iter_mut().flatten() {
+            let device = index.device;
+            device.run(|| index.get_mut().capture_startup(|layer, row|
+                resources.execution.startup_source(bank, layer, row)))?;
+        }
+        Ok(())
+    }
     pub(crate) fn capture_startup(&mut self,
         bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>) -> Result<()> {
         ensure!(self.state == State::Idle, "startup graph capture requires idle target pass");
