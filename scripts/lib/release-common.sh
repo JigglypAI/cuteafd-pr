@@ -794,13 +794,18 @@ _release_profile_tool_wrapper() {
     # PROFILE_NSYS_CPU=on adds CPU call-stack sampling and context switches
     # (host-side stalls: reactor, gather and copy threads); off by default
     # because sampling perturbs host timing.
+    local graph_trace="${RELEASE_PROFILE_NSYS_GRAPH_TRACE:-node}"
+    case "$graph_trace" in
+      node|graph) ;;
+      *) release_die "${key}_NSYS_GRAPH_TRACE must be node or graph" ;;
+    esac
     local cpu=(--sample=none --cpuctxsw=none)
     case "${RELEASE_PROFILE_NSYS_CPU:-}" in
       ''|off) ;;
       on) cpu=(--sample=process-tree --cpuctxsw=process-tree --backtrace=dwarf) ;;
       *) release_die "${key}_NSYS_CPU must be on or off" ;;
     esac
-    release_profile_container_wrapper nsys profile --trace=cuda,nvtx,osrt --cuda-graph-trace=node \
+    release_profile_container_wrapper nsys profile --trace=cuda,nvtx,osrt "--cuda-graph-trace=$graph_trace" \
       "${cpu[@]}" --start-later=true "--session-new=$RELEASE_NSYS_SESSION" \
       "--output=$output" --force-overwrite=true
     if [[ -n "$metrics" ]]; then
@@ -812,6 +817,7 @@ _release_profile_tool_wrapper() {
   fi
   [[ -z "$metrics" ]] || release_die "${key}_NSYS_GPU_METRICS needs $key=nsys"
   [[ -z "${RELEASE_PROFILE_NSYS_CPU:-}" ]] || release_die "${key}_NSYS_CPU needs $key=nsys"
+  [[ -z "${RELEASE_PROFILE_NSYS_GRAPH_TRACE:-}" ]] || release_die "${key}_NSYS_GRAPH_TRACE needs $key=nsys"
   [[ -n "$kernel" ]] || release_die "$key=ncu needs ${key}_NCU_KERNEL (a kernel-name regex); it replays every matched launch"
   [[ "$kernel" != *[[:space:]]* ]] || release_die "${key}_NCU_KERNEL must not contain whitespace"
   count="${count:-20}" set="${set:-full}" skip="${skip:-0}"
@@ -904,7 +910,7 @@ release_known_key() {
     GLM5_FLASH_ROUTE_RING_CHECK|GLM5_FLASH_REMOTE_DRAFTER) return 0 ;;
     PROBE_DUMP_ROOT|MEDIA_FEATURES_DIR|AUDIO_FEATURES_DIR|ATTENTION_PLACEMENT|ATTENTION_PLAN_ROWS) return 0 ;;
     DECODE_LANES|PREFILL_ROWS|PREFILL_WAVES|PREFILL_SPAN_ROWS) return 0 ;; # Shared prefill units: rows each, units in flight, rows per continuous span (PLAN "Prefill contract").
-    PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NCU_SKIP|PROFILE_NSYS_GPU_METRICS|PROFILE_NSYS_CPU|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
+    PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NCU_SKIP|PROFILE_NSYS_GPU_METRICS|PROFILE_NSYS_CPU|PROFILE_NSYS_GRAPH_TRACE|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
     PROFILE_SPARK|PROFILE_SPARK_RANKS|PROFILE_SPARK_NCU_KERNEL|PROFILE_SPARK_NCU_COUNT|PROFILE_SPARK_NCU_SET|PROFILE_SPARK_NCU_SKIP|PROFILE_SPARK_NSYS_GPU_METRICS) return 0 ;;
     HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK_DRAFT_POLICY|DSPARK_DRAFT_LIMIT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|KV_DECODE_RESERVE_CHUNK|KV_RESERVE_DRAIN_BUFFER|KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS|LOOP_ABORT_RUN|LOOP_ABORT_COPIES|LOOP_FAST_SPAN|LOOP_FAST_COPIES|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
       return 0
