@@ -73,6 +73,84 @@ fn gpu_reply_copy_engine_bandwidth() -> Result<()> {
     Ok(())
 }
 
+/// #815: queue compute before arrival and hold representative kernel/H2D work
+/// on other streams. Report whether a fresh CE stream can release compute;
+/// always release the host words before draining, including error paths.
+#[test]
+#[ignore = "requires one idle GPU, CUDA_MODULE_LOADING=EAGER and CUTEAFD_PLANE_UPLOAD_LIBRARY"]
+fn gpu_reply_ce_land_before_arrival_pressure() -> Result<()> {
+    use crate::shared::memory::{DeviceAllocation, device::{Device, Event, Stream}};
+    ensure!(std::env::var("CUDA_MODULE_LOADING").as_deref() == Ok("EAGER"), "run with CUDA_MODULE_LOADING=EAGER");
+    let path = library_path()?;
+    // SAFETY: the opt-in path names the matching built native library.
+    let library = unsafe { NativeLibrary::load(&path)? };
+    library.cuda_set_device(0)?;
+    let device = Device { library: &library, id: 0 };
+    let host = HostAllocation::new(&library, 304_349_184)?;
+    let output = DeviceAllocation::new(&library, host.buffer.bytes)?;
+    struct ReleaseWords<'a>(&'a HostAllocation<'a>);
+    impl Drop for ReleaseWords<'_> {
+        fn drop(&mut self) {
+            for offset in [0, 64] {
+                // SAFETY: aligned atomics of the live mapped control allocation.
+                unsafe { (*self.0.buffer.ptr.cast::<u8>().add(offset).cast::<AtomicU32>()).store(1, Ordering::Release); }
+            }
+        }
+    }
+    for pressure in [0, 4, 16] {
+        let control = HostAllocation::new(&library, 128)?;
+        let pressure_outputs = (0..=pressure).map(|_| DeviceAllocation::new(&library, 65536)).collect::<Result<Vec<_>>>()?;
+        let streams = (0..=pressure).map(|_| Stream::new(device)).collect::<Result<Vec<_>>>()?;
+        let copy_stream = Stream::new(device)?;
+        let mut done = Event::new(device)?;
+        // Warm the exact kernel and copy API before any memory wait exists.
+        for (stream, target) in streams.iter().zip(&pressure_outputs) {
+            // SAFETY: live disjoint destinations and immutable pinned source; drained below.
+            unsafe {
+                library.sm_copy_regions(&[(target.buffer.ptr, host.buffer.ptr.cast_const(), 65536)], stream.raw)?;
+                library.copy_host_buffers_h2d_batch_async(&[target.buffer], &[host.buffer], &[65536], stream.raw)?;
+            }
+            stream.drain()?;
+        }
+        // Declared after every stream: unwinding releases words before stream Drop drains.
+        let release = ReleaseWords(&control);
+        let copied = control.buffer.ptr.cast::<u32>();
+        let ready = control.buffer.ptr.cast::<u8>().wrapping_add(64).cast::<u32>();
+        for (index, (stream, target)) in streams.iter().zip(&pressure_outputs).enumerate() {
+            // SAFETY: current compute waits for copied; pressure waits for a host release.
+            // All sources/words survive stream drainage, and release covers errors too.
+            unsafe {
+                library.cuda_stream_wait_value32(stream.raw, if index == 0 { copied } else { ready }, 1)?;
+                library.sm_copy_regions(&[(target.buffer.ptr, host.buffer.ptr.cast_const(), 65536)], stream.raw)?;
+                library.copy_host_buffers_h2d_batch_async(&[target.buffer], &[host.buffer], &[65536], stream.raw)?;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        // Simulated host-observed arrival: NO unsatisfied wait on the CE stream.
+        // SAFETY: the immutable pinned source and full destination are retained to drain.
+        unsafe {
+            library.copy_host_buffers_h2d_batch_async(&[output.buffer], &[host.buffer], &[host.buffer.bytes], copy_stream.raw)?;
+            library.cuda_stream_write_value32(copy_stream.raw, copied, 1)?;
+        }
+        done.record(&copy_stream)?;
+        let started = Instant::now();
+        let completed = loop {
+            // SAFETY: the current completion event was recorded above and remains live.
+            if unsafe { library.cuda_event_query(done.raw)? } { break true; }
+            if started.elapsed() >= Duration::from_millis(50) { break false; }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        eprintln!("reply_ce_pressure pressure_streams={pressure} completed_before_host_release={completed} observed_ms={:.3}", started.elapsed().as_secs_f64() * 1e3);
+        drop(release);
+        copy_stream.drain()?;
+        for stream in &streams { stream.drain()?; }
+        let mut actual = vec![0u8; host.buffer.bytes];
+        library.copy_d2h(&mut actual, output.buffer)?;
+        ensure!(actual == host.bytes(), "CE output differs under {pressure}-stream pressure");
+    }
+    Ok(())
+}
+
 /// The "GPU": the control words, written by the engine side of the test as
 /// a stream would (staged after copies, consumed after a reduce) and read by
 /// the worker; the worker publishes `landed` here.
