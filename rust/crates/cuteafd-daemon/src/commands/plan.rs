@@ -1820,7 +1820,7 @@ mod tests {
             assert_eq!(planned(&["--concurrency", &concurrency.to_string()]),
                 (staging * mark, state(cuteafd_core::concurrency::state_slots(concurrency))));
         }
-        let default_sequences = cuteafd_loader::families::glm5_flash::DEFAULT_MAX_SEQUENCES as u64;
+        let default_sequences = cuteafd_core::serving_capacity::LARGE_CARD_DEFAULT_CONCURRENCY;
         assert_eq!(planned(&[]), served(default_sequences, 20, 2048));
         // Host-off retention remains budgeted separately from the C active state slots.
         assert_eq!(planned(&["--host-cache-bytes", "0", "--concurrency", "16"]), (cuteafd_core::prefix::mark_slots_for(16, 20, mark, 2048 << 20) * mark, state(16)));

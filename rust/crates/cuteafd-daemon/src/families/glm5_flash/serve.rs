@@ -60,7 +60,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
     /// Sequences decoding at once (each holds two KDA state slots).
-    #[arg(long, default_value_t = cuteafd_loader::families::glm5_flash::DEFAULT_MAX_SEQUENCES)]
+    #[arg(long, default_value_t = cuteafd_core::serving_capacity::LARGE_CARD_DEFAULT_CONCURRENCY as usize)]
     pub max_sequences: usize,
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)]
@@ -171,6 +171,12 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     engine_args.slots = cuteafd_core::concurrency::state_slots(args.max_sequences as u64) as usize;
     (engine_args.draft_context_slots, engine_args.draft_sequences) = draft_capacity(args.max_sequences,
         engine_args.draft_sequences, engine_args.draft_context_slots);
+    cuteafd_bench::context::set_resolved("max-sequences", &args.max_sequences.to_string());
+    cuteafd_bench::context::set_resolved("slots", &engine_args.slots.to_string());
+    cuteafd_bench::context::set_resolved("draft-sequences", &engine_args.draft_sequences.to_string());
+    if let Some(slots) = engine_args.draft_context_slots {
+        cuteafd_bench::context::set_resolved("draft-context-slots", &slots.to_string());
+    }
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
     let policy = Policy { fixed: args.draft_fixed, batch: args.prefill_batch };
     let prefix = args.prefix.clone();

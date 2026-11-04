@@ -1649,6 +1649,12 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let mut resolved = args.clone();
     if native {
         native::normalize(&mut resolved);
+        for (name, value) in [("kda-output-shard", resolved.kda_output_shard),
+            ("kda-prefill-expanded", resolved.kda_prefill_expanded), ("fp8-head", resolved.fp8_head)] {
+            cuteafd_bench::context::set_resolved(name, &value.to_string());
+        }
+        cuteafd_bench::context::set_resolved("kda-fp8", "off");
+        cuteafd_bench::context::set_resolved("fp8-prefill", "none");
         ensure!(args.exlr8_manifest.is_some(), "native Flash requires --exlr8-manifest k2, k3 or k4");
         ensure!(args.kda_state == engine::KdaState::F32, "native Flash requires F32 KDA state programs");
     } else { ensure!(args.exlr8_manifest.is_none(), "--exlr8-manifest requires a native EXLR8 checkpoint"); }
@@ -2111,6 +2117,7 @@ impl Opened {
             tracing::warn!(device, "--index-cache compact is single-GPU under heads; the head split keeps the token keys");
         }
         cuteafd_bench::context::set_resolved("attention-placement", &attention.mode.to_string());
+        cuteafd_bench::context::set_resolved("index-cache", match index_cache { engine::IndexCache::Compact => "compact", engine::IndexCache::Keys => "keys" });
         let peer_stream = match split_device {
             Some(device) => {
                 ensure!(device != args.device, "--split-device must differ from --device");

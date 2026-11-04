@@ -980,6 +980,45 @@ mod tests {
     }
 
     #[test]
+    fn native_tp2_zero_spark_dflash_default_concurrency_plan_equals_runtime() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
+        let capacity = inventory::PRO_TOTAL_BYTES;
+        let options = crate::plan::layout::LayoutOptions { rtx_bytes: vec![capacity; 2], ..Default::default() };
+        let mut planned = inputs(&cfg, 2, capacity);
+        planned.spark_ranks = 0;
+        planned.prefill_lanes = 1;
+        planned.prefill_rows = 4096;
+        planned.sequences = options.resolved_concurrency("glm5_flash");
+        planned.state_slots = options.resolved_state_slots("glm5_flash");
+        planned.workspace = planned.local_workspace.clone();
+        planned.speculation = true;
+        let (slots, batch) = crate::families::glm5::draft_representation::flash_serving_draft_limits(
+            planned.sequences as usize, options.glm_draft_sequences() as usize, None);
+        let config = draft_config();
+        let (bytes, scratch) = drafter_inventory(&config, slots, batch, &[188; 2],
+            crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only,
+            2, options.draft_kv_cache).unwrap();
+        planned.drafter_bytes = bytes;
+        planned.drafter_scratch = scratch;
+        let mut runtime = planned.clone();
+        let boot = cuteafd_core::serving_capacity::default_concurrency(capacity);
+        runtime.sequences = boot;
+        runtime.state_slots = cuteafd_core::concurrency::state_slots(boot);
+        assert_eq!(planned.sequences, 16);
+        for rank in 0..2 {
+            let Baseline::Planned { context_bytes, loaded_bytes } = planned.gpus[rank].1 else { unreachable!() };
+            runtime.gpus[rank].1 = Baseline::Measured { free_bytes: capacity - context_bytes - loaded_bytes };
+        }
+        let (plan, pg, pw) = solve_working_set_with_graphs(&planned, 2 << 20, true, 188, true).unwrap();
+        let (live, lg, lw) = solve_working_set_with_graphs(&runtime, 2 << 20, true, 188, true).unwrap();
+        assert_eq!(plan.pool_tokens, live.pool_tokens);
+        assert_eq!(plan.items, live.items);
+        assert_eq!(plan.layers, live.layers);
+        assert_eq!(pg, lg);
+        assert_eq!(pw, lw);
+    }
+
+    #[test]
     fn local_and_tp2_candidates_preserve_every_admitted_lane_without_spark_costs() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
         for ranks in [1, 2] {

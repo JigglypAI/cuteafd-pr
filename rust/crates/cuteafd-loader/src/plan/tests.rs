@@ -4019,11 +4019,11 @@ fn mimo_small_card_auto_embedding_and_full_context() {
 }
 
 #[test]
-fn mimo_native_default_concurrency_is_preserved_and_rings_follow_overrides() {
+fn mimo_logical_capacity_concurrency_matches_serving_and_rings_follow_overrides() {
     let dir = tempfile::tempdir().unwrap();
     write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
     for gib in [32, 96] {
-        let expected = crate::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES as u64;
+        let expected = cuteafd_core::serving_capacity::default_concurrency(gib << 30);
         let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
             rtx_bytes: vec![gib << 30], ..Default::default()
         }), ..sparks(4) };
@@ -4032,7 +4032,7 @@ fn mimo_native_default_concurrency_is_preserved_and_rings_follow_overrides() {
         let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         assert_eq!(automatic.pool_tokens, explicit.pool_tokens);
         assert_eq!(automatic.devices[0].used_bytes(), explicit.devices[0].used_bytes());
-        options.layout.as_mut().unwrap().concurrency = 16;
+        options.layout.as_mut().unwrap().concurrency = 32;
         let overridden = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         let state = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
             .find(|item| item.group == "state").unwrap().bytes;
@@ -4055,16 +4055,11 @@ fn all_family_concurrency_defaults_match_explicit_logical_capacity() {
     for dir in snapshots {
         for bytes in [32u64 << 30, (32u64 << 30) + 1, 96u64 << 30] {
             let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-                rtx_bytes: vec![bytes], workspace_manifest: Some(dir.path().join("absent.json")),
+                rtx_bytes: vec![bytes; 2], head_split: true, workspace_manifest: Some(dir.path().join("absent.json")),
                 glm5_drafter_disabled: true, glmf_drafter_disabled: true, ..Default::default()
             }), ..sparks(4) };
             let automatic = plan(dir.path(), &options).unwrap();
-            options.layout.as_mut().unwrap().concurrency = match automatic.family.as_deref() {
-                Some("glm5") => crate::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
-                Some("glm5_flash") => crate::families::glm5_flash::DEFAULT_MAX_SEQUENCES as u64,
-                Some("mimo_v2") => crate::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
-                _ => cuteafd_core::serving_capacity::default_concurrency(bytes),
-            };
+            options.layout.as_mut().unwrap().concurrency = cuteafd_core::serving_capacity::default_concurrency(bytes);
             let explicit = plan(dir.path(), &options).unwrap();
             assert_eq!(automatic.memory_layout, explicit.memory_layout, "family {:?}, {bytes}", automatic.family);
             assert_eq!(automatic.placement_supported, explicit.placement_supported);

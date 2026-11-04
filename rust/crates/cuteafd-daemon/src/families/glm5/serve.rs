@@ -52,7 +52,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
     /// Sequences decoding at once (at most the decode programs' 64 rows).
-    #[arg(long, default_value_t = cuteafd_loader::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES)]
+    #[arg(long, default_value_t = cuteafd_core::serving_capacity::LARGE_CARD_DEFAULT_CONCURRENCY as usize)]
     pub max_sequences: usize,
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)]
@@ -131,6 +131,10 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     if engine_args.draft_context_slots.is_none() {
         engine_args.draft_context_slots = Some(cuteafd_loader::families::glm5::draft_representation::serving_draft_context_slots(
             engine_args.draft_sequences, args.max_sequences, None));
+    }
+    cuteafd_bench::context::set_resolved("max-sequences", &args.max_sequences.to_string());
+    if let Some(slots) = engine_args.draft_context_slots {
+        cuteafd_bench::context::set_resolved("draft-context-slots", &slots.to_string());
     }
     let mut engine_args = super::ResolvedEngineArgs::new(&engine_args)?;
     size_draft_window_marks(&mut engine_args, &args.prefix, args.max_sequences)?;

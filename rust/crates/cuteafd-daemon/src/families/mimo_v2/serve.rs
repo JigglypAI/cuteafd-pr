@@ -51,7 +51,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
     /// Sequences decoding at once (each holds an SWA ring).
-    #[arg(long, default_value_t = cuteafd_loader::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES)]
+    #[arg(long, default_value_t = cuteafd_core::serving_capacity::LARGE_CARD_DEFAULT_CONCURRENCY as usize)]
     pub max_sequences: usize,
     /// Bounded pending API requests (defaults to concurrency).
     #[arg(long, env = "CUTEAFD_HTTP_QUEUE_DEPTH")]
@@ -146,6 +146,13 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     engine_args.draft_sequences = engine_args.draft_sequences.max(args.max_sequences);
     engine_args.draft_context_slots = Some(serving_context_slots(
         engine_args.draft_sequences, engine_args.rings, engine_args.draft_context_slots, args.prefix.mimo_prefix_draft));
+    for (name, value) in [("max-sequences", args.max_sequences), ("rings", engine_args.rings),
+        ("draft-sequences", engine_args.draft_sequences)] {
+        cuteafd_bench::context::set_resolved(name, &value.to_string());
+    }
+    if let Some(slots) = engine_args.draft_context_slots {
+        cuteafd_bench::context::set_resolved("draft-context-slots", &slots.to_string());
+    }
     let draft = Policy { fixed: args.draft_fixed,
         decode_share: args.decode_share, chunk_s: args.prefill_chunk_s,
         snapshot_wait: args.mimo_snapshot_wait };
