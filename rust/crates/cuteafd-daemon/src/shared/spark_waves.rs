@@ -814,7 +814,7 @@ impl<T: Transport> Backend for Native<T> {
                 census.extend(frame.allocation_census(&format!("retained.{wave}.{index}")));
             }
         }
-        census.resolve_recycled_frames();
+        // The link combines any engine-held frames before resolving the audit.
         census
     }
 

@@ -328,6 +328,53 @@ impl Census<'_> {
 }
 
 impl GlmEngine<'_> {
+    /// Passive startup snapshot of the retained serving roots. This does not
+    /// establish observed lifetimes or replace measured runtime/RSS deltas.
+    pub(crate) fn allocation_census(&self,
+        prefix: &super::super::prefix::GlmPrefix<'_, '_>,
+        cache: &cuteafd_engine::prefix::PrefixCache<crate::shared::prefix::CudaCopyEngine<'_>>,
+        selector: &crate::shared::token_io::TokenSelector<'_>,
+        decode_link: Option<&crate::shared::spark_intake::SparkLink<'_>>)
+        -> Result<crate::shared::memory::receipts::Census> {
+        let physical = self.census_physical_devices()?;
+        let devices = CoordinatorDevices::new(&physical)?;
+        let mut census = crate::shared::memory::receipts::Census::default();
+        for receipts in [self.target_buffer_receipts()?, self.target_hook_receipts()?,
+            self.weight_receipts()?, self.expert_receipts()?, self.exchange_receipts()?,
+            self.serving_probe_receipts()?, prefix.allocation_receipts(devices)?] {
+            census.owners(receipts);
+        }
+        self.embedding.allocation_aliases(&mut census, devices, "glm.embedding")?;
+        if let Some(drafter) = &self.drafter {
+            census.owners(drafter.allocation_receipts(devices, "glm.draft")?);
+        }
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "glm.serving",
+            Lifetime { first: Phase::Warmup, last: Phase::Growth }, Category::Workspace, "serving owners");
+        selector.allocation_receipts(&mut inventory, "selector")?;
+        if let Some(copy) = cache.host_engine() {
+            copy.allocation_receipts(&mut inventory, "host_cache")?;
+        }
+        if let Some(skip) = &self.skip { skip.allocation_receipts(&mut inventory, "skip_intake")?; }
+        census.owners(inventory.receipts);
+        if let Some(upload) = self.warmup_upload_receipt()? { census.owners(vec![upload]); }
+        if let Some(link) = decode_link { census.extend(link.allocation_census(devices, "glm.spark.decode")?); }
+        if let Some(link) = self.prefill_link.try_borrow()?.as_ref() {
+            census.extend(link.allocation_census(devices, "glm.spark.prefill")?);
+        }
+        for rank in 0..self.ranks() {
+            census.unclassified.push(cuteafd_transport::UnclassifiedTransportOwner {
+                owner: format!("glm.runtime.rank.{rank}"),
+                reason: "CUDA context/module/graph/stream/event storage requires owner-labelled startup deltas".into(),
+            });
+        }
+        census.unclassified.push(cuteafd_transport::UnclassifiedTransportOwner {
+            owner: "host-heap (unattributed)".into(),
+            reason: "process RSS phase observations, excluding named pinned and mapped-file residency, are missing".into(),
+        });
+        census.normalize(cuteafd_loader::placement::planner::PhaseOrder::DRAFT_THEN_TARGET)?;
+        Ok(census)
+    }
+
     pub(crate) fn expert_receipts(&self) -> Result<Vec<Receipt>> {
         let physical = self.census_physical_devices()?;
         let devices = CoordinatorDevices::new(&physical)?;

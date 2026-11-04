@@ -1595,6 +1595,36 @@ pub(crate) struct SparkLink<'a> {
 }
 
 impl<'a> SparkLink<'a> {
+    /// Startup/test-only: observe current transport ownership without progressing it.
+    pub(crate) fn allocation_census(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>,
+        prefix: &str) -> Result<crate::shared::memory::receipts::Census> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::Lifetime;
+        let mut census = crate::shared::memory::receipts::Census::default();
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, prefix,
+            Lifetime::TARGET, Category::Transport, "Spark link");
+        self.allocation_receipts(&mut inventory, "storage")?;
+        census.owners(inventory.receipts);
+        let mut transport = match (&self.exchange, &self.transport) {
+            (Some(exchange), None) => exchange.worker_allocation_census(),
+            (None, Some(transport)) => transport.allocation_census(),
+            _ => cuteafd_transport::TransportAllocationCensus::unavailable("transport",
+                "link has no unique transport owner"),
+        };
+        match self.intake.held.try_lock() {
+            Ok(held) => {
+                for (index, (_, _, frame)) in held.iter().enumerate() {
+                    transport.extend(frame.allocation_census(&format!("intake.held.{index}")));
+                }
+            }
+            Err(error) => transport.extend(cuteafd_transport::TransportAllocationCensus::unavailable(
+                "intake.held", format!("held-frame census unavailable: {error}"))),
+        }
+        transport.resolve_recycled_frames();
+        census.transport(&format!("{prefix}.transport"), transport, devices, Lifetime::TARGET)?;
+        Ok(census)
+    }
+
     pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
         name: &str) -> Result<()> {
         self.intake.allocation_receipts(inventory, &format!("{name}.intake"))?;

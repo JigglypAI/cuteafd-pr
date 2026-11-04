@@ -128,6 +128,14 @@ impl<'a> TokenEmbedding<'a> {
         Ok(inventory.receipts)
     }
 
+    pub(crate) fn allocation_aliases(&self, census: &mut crate::shared::memory::receipts::Census,
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>, prefix: &str) -> Result<()> {
+        if let ResidentWeight::Host { alias, .. } = &self.table {
+            census.mapped(format!("{prefix}.table.mapped"), format!("{prefix}.table"), *alias, devices)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn shares_vocabulary(&self, vocabulary: &std::rc::Rc<native::NativeVocabulary<'_>>) -> bool {
         self.row_fp8.as_ref().is_some_and(|owner| std::rc::Rc::ptr_eq(owner, vocabulary))
     }

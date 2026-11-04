@@ -2,7 +2,146 @@
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::Category;
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer};
-use cuteafd_loader::placement::planner::{Allocation, CoordinatorDevices, Lifetime, Location, Receipt, View};
+use cuteafd_loader::placement::planner::{Allocation, CoordinatorDevices, Lifetime, Location, PhaseOrder, Receipt, View};
+use std::collections::BTreeMap;
+
+/// Cross-domain aliases are observations, never another physical allocation.
+#[derive(Debug, Clone)]
+pub(crate) struct MappedAlias {
+    pub owner: String,
+    pub backing: String,
+    pub location: Location,
+    pub address: u64,
+    pub bytes: u64,
+}
+
+/// Retained storage only. Declared lifetimes are not observed startup history.
+#[derive(Debug, Default)]
+pub(crate) struct Census {
+    pub receipts: Vec<Receipt>,
+    pub aliases: Vec<MappedAlias>,
+    /// Diagnostic capacities lie inside the process RSS envelope, not beside it.
+    pub heap_diagnostics: Vec<Receipt>,
+    pub unclassified: Vec<cuteafd_transport::UnclassifiedTransportOwner>,
+}
+impl Census {
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.receipts.extend(other.receipts);
+        self.aliases.extend(other.aliases);
+        self.heap_diagnostics.extend(other.heap_diagnostics);
+        self.unclassified.extend(other.unclassified);
+    }
+    pub(crate) fn owners(&mut self, receipts: Vec<Receipt>) {
+        for receipt in receipts {
+            if receipt.allocation.location == Location::HOST {
+                self.heap_diagnostics.push(receipt);
+            } else {
+                self.receipts.push(receipt);
+            }
+        }
+    }
+    pub(crate) fn mapped(&mut self, owner: String, backing: String,
+        buffer: CuteafdDeviceBuffer, devices: CoordinatorDevices<'_>) -> Result<()> {
+        ensure!(!buffer.ptr.is_null() && buffer.bytes > 0, "empty mapped alias {owner}");
+        self.aliases.push(MappedAlias { owner, backing, location: devices.location(buffer.device_id)?,
+            address: buffer.ptr as u64, bytes: buffer.bytes as u64 });
+        Ok(())
+    }
+    pub(crate) fn transport(&mut self, prefix: &str, transport: cuteafd_transport::TransportAllocationCensus,
+        devices: CoordinatorDevices<'_>, lifetime: Lifetime) -> Result<()> {
+        ensure!(transport.pinned_frame_audits.is_empty(), "unresolved pinned-frame audit in {prefix}");
+        self.unclassified.extend(transport.unclassified.into_iter().map(|mut owner| {
+            owner.owner = format!("{prefix}.{}", owner.owner);
+            owner
+        }));
+        for host in transport.host {
+            let id = format!("{prefix}.{}", host.owner);
+            ensure!(host.address != 0 && host.bytes > 0, "empty transport owner {id}");
+            if host.flags & cuteafd_ffi::CUTEAFD_HOST_BUFFER_FLAG_PINNED == 0 {
+                self.unclassified.push(cuteafd_transport::UnclassifiedTransportOwner {
+                    owner: id, reason: "transport backing is not identified as pinned".into(),
+                });
+                continue;
+            }
+            self.receipts.push(Receipt { allocation: Allocation::buffer(&id, Location::PINNED,
+                host.bytes, lifetime, Category::Transport, "transport backing"), address: host.address });
+            if let Some(alias) = host.mapped {
+                ensure!(alias.address != 0, "null mapped transport alias {id}");
+                self.aliases.push(MappedAlias { owner: format!("{id}.mapped"), backing: id,
+                    location: devices.location(alias.device)?, address: alias.address, bytes: host.bytes });
+            }
+        }
+        Ok(())
+    }
+
+    /// Exact repeated backing becomes a view. Partial overlap without an explicit
+    /// backing relationship is an error, not evidence that one owner contains another.
+    pub(crate) fn normalize(&mut self, order: PhaseOrder) -> Result<()> {
+        let mut ids = BTreeMap::new();
+        for (index, receipt) in self.receipts.iter().enumerate() {
+            let allocation = &receipt.allocation;
+            ensure!(!allocation.id.is_empty() && receipt.address != 0 && allocation.bytes > 0,
+                "empty retained owner {}", allocation.id);
+            ensure!(ids.insert(allocation.id.clone(), index).is_none(), "duplicate owner {}", allocation.id);
+            ensure!(order.at_or_before(allocation.lifetime.first, allocation.lifetime.last),
+                "invalid declared lifetime {}", allocation.id);
+            receipt.address.checked_add(allocation.bytes).context("retained owner address overflow")?;
+        }
+        let mut backing: BTreeMap<(Location, u64, u64), usize> = BTreeMap::new();
+        let mut canonical = BTreeMap::new();
+        for index in 0..self.receipts.len() {
+            let receipt = &self.receipts[index];
+            if receipt.allocation.view.is_some() { continue; }
+            let key = (receipt.allocation.location, receipt.address, receipt.allocation.bytes);
+            if let Some(&owner) = backing.get(&key) {
+                let id = self.receipts[owner].allocation.id.clone();
+                canonical.insert(receipt.allocation.id.clone(), id.clone());
+                let lifetime = receipt.allocation.lifetime;
+                let retained = &mut self.receipts[owner].allocation.lifetime;
+                if order.at_or_before(lifetime.first, retained.first) { retained.first = lifetime.first; }
+                if order.at_or_before(retained.last, lifetime.last) { retained.last = lifetime.last; }
+                self.receipts[index].allocation.view = Some(View { backing: id, offset: 0 });
+            } else {
+                backing.insert(key, index);
+            }
+        }
+        let mut previous: Option<(Location, u64)> = None;
+        for ((location, address, bytes), _) in backing {
+            if let Some((prior_location, end)) = previous {
+                ensure!(prior_location != location || end <= address, "overlapping unclassified backing at {address:#x}");
+            }
+            previous = Some((location, address + bytes));
+        }
+        for receipt in &mut self.receipts {
+            if let Some(view) = &mut receipt.allocation.view {
+                if let Some(id) = canonical.get(&view.backing) { view.backing = id.clone(); }
+            }
+        }
+        for receipt in &self.receipts {
+            let Some(view) = &receipt.allocation.view else { continue };
+            let owner = &self.receipts[*ids.get(&view.backing).context("missing retained backing")?];
+            ensure!(owner.allocation.view.is_none() && owner.allocation.location == receipt.allocation.location
+                && view.offset.checked_add(receipt.allocation.bytes).is_some_and(|end| end <= owner.allocation.bytes)
+                && owner.address.checked_add(view.offset) == Some(receipt.address)
+                && order.at_or_before(owner.allocation.lifetime.first, receipt.allocation.lifetime.first)
+                && order.at_or_before(receipt.allocation.lifetime.last, owner.allocation.lifetime.last),
+                "invalid retained view {}", receipt.allocation.id);
+        }
+        let mut alias_ids = std::collections::BTreeSet::new();
+        for alias in &mut self.aliases {
+            ensure!(alias_ids.insert(alias.owner.clone()) && !ids.contains_key(&alias.owner),
+                "duplicate mapped alias {}", alias.owner);
+            if let Some(id) = canonical.get(&alias.backing) { alias.backing = id.clone(); }
+            let owner = &self.receipts[*ids.get(&alias.backing).context("missing mapped backing")?];
+            ensure!(owner.allocation.location == Location::PINNED && owner.allocation.view.is_none()
+                && alias.location.domain == cuteafd_loader::placement::planner::Domain::Device
+                && alias.address != 0 && alias.bytes == owner.allocation.bytes,
+                "invalid mapped alias {}", alias.owner);
+            alias.address.checked_add(alias.bytes).context("mapped alias address overflow")?;
+        }
+        Ok(())
+    }
+}
 
 pub(crate) struct Inventory<'a> {
     pub receipts: Vec<Receipt>,
@@ -114,6 +253,76 @@ impl<'a> Inventory<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn receipt(id: &str, location: Location, address: u64, bytes: u64, lifetime: Lifetime) -> Receipt {
+        Receipt { allocation: Allocation::buffer(id, location, bytes, lifetime, Category::Workspace, "fixture"), address }
+    }
+
+    #[test]
+    fn census_combines_independent_inventories_without_double_charge() -> Result<()> {
+        let mut census = Census::default();
+        let late = Lifetime { first: cuteafd_loader::placement::planner::Phase::Warmup,
+            last: cuteafd_loader::placement::planner::Phase::Growth };
+        census.owners(vec![receipt("prefix.pool", Location::coordinator(0), 0x1000, 1024, late),
+            receipt("host.capacity", Location::HOST, 0x8000, 128, late)]);
+        census.owners(vec![receipt("target.pool", Location::coordinator(0), 0x1000, 1024, Lifetime::TARGET)]);
+        let mut view = receipt("target.slot", Location::coordinator(0), 0x1100, 128, late);
+        view.allocation.view = Some(View { backing: "target.pool".into(), offset: 256 });
+        census.owners(vec![view]);
+        census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
+        assert_eq!(census.receipts.iter().filter(|r| r.allocation.view.is_none())
+            .map(|r| r.allocation.bytes).sum::<u64>(), 1024);
+        assert_eq!(census.receipts[0].allocation.lifetime, Lifetime::TARGET);
+        assert_eq!(census.receipts[1].allocation.view.as_ref().unwrap().backing, "prefix.pool");
+        assert_eq!(census.receipts[2].allocation.view.as_ref().unwrap(), &View { backing: "prefix.pool".into(), offset: 256 });
+        assert_eq!(census.heap_diagnostics.len(), 1);
+        let before = census.receipts.clone();
+        census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
+        assert!(census.receipts.iter().zip(before).all(|(a, b)| a.address == b.address && a.allocation == b.allocation));
+        Ok(())
+    }
+
+    #[test]
+    fn census_keeps_mapped_aliases_and_unavailable_owners_separate() -> Result<()> {
+        let physical = [1, 0];
+        let devices = CoordinatorDevices::new(&physical)?;
+        let mut transport = cuteafd_transport::TransportAllocationCensus::unavailable("rank.1.driver", "measured delta missing");
+        transport.host.push(cuteafd_transport::TransportHostAllocation { owner: "rank.0.receive".into(),
+            address: 0x1000, bytes: 768, flags: cuteafd_ffi::CUTEAFD_HOST_BUFFER_FLAG_PINNED,
+            mapped: Some(cuteafd_transport::TransportDeviceAlias { address: 0x9000, device: 0 }), audit_owner: None });
+        let mut census = Census::default();
+        census.transport("link", transport, devices, Lifetime::TARGET)?;
+        census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
+        assert_eq!(census.receipts.len(), 1);
+        assert_eq!((census.receipts[0].address, census.receipts[0].allocation.bytes), (0x1000, 768));
+        assert_eq!(census.receipts[0].allocation.location, Location::PINNED);
+        assert_eq!(census.aliases[0].backing, "link.rank.0.receive");
+        assert_eq!(census.aliases[0].location, Location::coordinator(1));
+        assert_eq!(census.aliases[0].address, 0x9000);
+        assert_eq!(census.unclassified[0].owner, "link.rank.1.driver");
+        assert_eq!(census.unclassified[0].reason, "measured delta missing");
+        Ok(())
+    }
+
+    #[test]
+    fn census_rejects_overlap_and_unproved_backing() -> Result<()> {
+        for receipts in [
+            vec![receipt("a", Location::PINNED, 0x1000, 1024, Lifetime::TARGET),
+                receipt("b", Location::PINNED, 0x1100, 128, Lifetime::TARGET)],
+            vec![receipt("a", Location::PINNED, 0x1000, 1024, Lifetime::TARGET),
+                receipt("a", Location::PINNED, 0x2000, 1024, Lifetime::TARGET)],
+        ] {
+            let mut census = Census::default();
+            census.owners(receipts);
+            assert!(census.normalize(PhaseOrder::DRAFT_THEN_TARGET).is_err());
+        }
+        let mut view = receipt("view", Location::coordinator(0), 0x1100, 128, Lifetime::TARGET);
+        view.allocation.view = Some(View { backing: "pinned".into(), offset: 256 });
+        let mut census = Census::default();
+        census.owners(vec![receipt("pinned", Location::PINNED, 0x1000, 1024, Lifetime::TARGET), view]);
+        assert!(census.normalize(PhaseOrder::DRAFT_THEN_TARGET).is_err());
+        Ok(())
+    }
+
     #[test]
     fn views_derive_real_offsets_and_host_capacity_is_not_length() -> Result<()> {
         let devices = [1, 0];
