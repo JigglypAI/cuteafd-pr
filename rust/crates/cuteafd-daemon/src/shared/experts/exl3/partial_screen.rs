@@ -41,12 +41,12 @@ fn bf16_to_f32(bits: u16) -> f32 { f32::from_bits((bits as u32) << 16) }
 /// deterministic, decodable payloads inside the sparse fixture shard.
 fn fill_layer0(dir: &Path) -> Result<()> {
     let shard = dir.join("model-00001.safetensors");
-    let bytes = std::fs::read(&shard).map(|b| b[..8].to_vec())?;
-    let header_len = u64::from_le_bytes(bytes[..8].try_into()?) as usize;
     let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&shard)?;
-    let mut header = vec![0u8; header_len];
     use std::io::Read;
-    file.seek(SeekFrom::Start(8))?;
+    let mut prefix = [0u8; 8];
+    file.read_exact(&mut prefix)?;
+    let header_len = u64::from_le_bytes(prefix) as usize;
+    let mut header = vec![0u8; header_len];
     file.read_exact(&mut header)?;
     let header: serde_json::Value = serde_json::from_slice(&header)?;
     let base = 8 + header_len as u64;
@@ -306,6 +306,21 @@ fn partial_reply_screen() -> Result<()> {
         ensure!(sum_error < 1.0 / 64.0, "{wide:?}: weighted sum of partials differs from the weighted reply ({sum_error})");
         eprintln!("{wide:?}: rows invariant; wide/BF16 worst step ratio {worst:.3} over {normal_blocks}/{live_blocks} \
             normal-scale blocks (peak {peak:e}); weighted-sum rel {sum_error:.4}");
+    }
+    // Every format can coexist in one payload without changing any row's bytes.
+    for wide in [PartialWire::Nvfp4, PartialWire::Fp8] {
+        let regions: Vec<u8> = (0..wave.len()).map(|i| (i % 3) as u8).collect();
+        let (payload, plan) = screen.partial(&wave, wide, regions.clone())?;
+        let layout = plan.layout(TOPK, WIDTH)?;
+        for (i, &row) in wave.iter().enumerate() {
+            let region = regions[i] as usize;
+            let record = match region { 0 => WIDTH * 2, 1 => wide.record_bytes(WIDTH),
+                _ => wide.other().record_bytes(WIDTH) };
+            let before = regions[..i].iter().filter(|&&r| r as usize == region).count();
+            let (alone, _) = screen.partial(&[row], wide, vec![region as u8])?;
+            ensure!(region_row(&payload, layout.offsets[region], before, record) == &alone[..TOPK * record],
+                "{wide:?}: row {row} region {region} differs in a three-region wave");
+        }
     }
     // Gate 4: zero-row regions write nothing (all-BF16 leaves the wide area at its sentinel).
     let (payload, plan) = screen.partial(&wave, PartialWire::Nvfp4, vec![0; wave.len()])?;
