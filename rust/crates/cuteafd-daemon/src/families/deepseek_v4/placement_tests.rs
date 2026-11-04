@@ -540,17 +540,11 @@ fn equality_input_refuses_missing_or_truncated_shards() {
     }
 }
 
-fn inputs_dir() -> Option<PathBuf> {
-    let dir = std::env::var_os("CUTEAFD_V4_PLACEMENT_INPUTS").map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/cuteafd/builds/v4-placement/plans-input")))?;
-    dir.is_dir().then_some(dir)
-}
-
 /// The real checkpoints (headers only) with the release image's program and
 /// EXL3 package manifests: Flash and Pro EXL3 K2, natural minimum and
 /// maximum, compiled extents 131,072 and 1,048,576, automatic and a fixed
-/// onboard of half the routed layers (Flash max). Skips when the snapshots
-/// or manifests are not on this host.
+/// onboard of half the routed layers (Flash max). Missing inputs fail the
+/// full CPU tier; the default cpu-gate explicitly excludes live tests.
 #[test]
 fn planner_equals_runtime_deepseek_v4() {
     const CHILD: &str = "CUTEAFD_V4_EQUALITY_CHILD";
@@ -571,11 +565,10 @@ fn planner_equals_runtime_deepseek_v4() {
             String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         return;
     }
-    let (Some(flash), Some(pro), Some(inputs)) = (snapshot("deepseek-ai/DeepSeek-V4-Flash-0731"),
-        snapshot("wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1"), inputs_dir()) else {
-        eprintln!("planner_equals_runtime_deepseek_v4: V4 snapshots or manifests absent; skipped");
-        return;
-    };
+    let inputs = cuteafd_loader::plan::testing::v4_placement_inputs().unwrap();
+    let flash = snapshot("deepseek-ai/DeepSeek-V4-Flash-0731").expect("required Flash checkpoint missing");
+    let pro = snapshot("wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1")
+        .expect("required Pro EXL3 K2 checkpoint missing");
     let budget = (95.5 * (1u64 << 30) as f64) as u64;
     // One open per checkpoint for all 40 of its cases: the plan and the runtime
     // admission both read its shard headers and routed-expert catalog.
@@ -618,10 +611,9 @@ fn planner_equals_runtime_deepseek_v4() {
 
 #[test]
 fn planner_equals_runtime_deepseek_v4_missing_tp2_package() {
-    let (Some(pro), Some(inputs)) = (snapshot("wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1"), inputs_dir()) else {
-        eprintln!("missing TP2 package test: real EXL3 snapshot/manifests absent; skipped");
-        return;
-    };
+    let inputs = cuteafd_loader::plan::testing::v4_placement_inputs().unwrap();
+    let pro = snapshot("wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1")
+        .expect("required Pro EXL3 K2 checkpoint missing");
     let dir = tempfile::tempdir().unwrap();
     let source = inputs.join("pro-2-1048576");
     let manifest = dir.path().join("PROGRAMS.json");
@@ -656,7 +648,6 @@ struct Fixture {
     context: u64,
     /// `RTX_EXPERT_LAYERS` of the launch (`None`: the default).
     onboard: Option<String>,
-    manifest: String,
     driver: String,
     gpus: Vec<FixtureGpu>,
     /// The launch's admitted pool and RTX expert layers (the runtime's answer).
@@ -711,22 +702,22 @@ const MIB: u64 = 1 << 20;
 /// planner's own loaded bytes), and the planner, at the same CUDA total, must
 /// predict that sample within 64 MiB per GPU and resolve the same placement
 /// (P1 could not see its 1.45M vs 1.18M Flash max gap: it fed the planner's
-/// numbers back in). Skips fixtures whose snapshot or manifest is absent.
+/// numbers back in). Every non-historical fixture is required in the full tier.
 #[test]
 fn planner_equals_runtime_deepseek_v4_measured() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shared/placement_fixtures");
+    let inputs = cuteafd_loader::plan::testing::v4_placement_inputs().unwrap();
     let mut checked = 0;
-    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let entry = entry.unwrap();
         let path = entry.path();
         if !path.file_name().unwrap().to_string_lossy().starts_with("v4-") { continue; }
         let fixture: Fixture = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         if fixture.historical_tp1 { continue; }
         let label = path.file_stem().unwrap().to_string_lossy().into_owned();
-        let manifest = PathBuf::from(shellexpand(&fixture.manifest));
-        let (Some(snapshot), true) = (snapshot(&fixture.model), manifest.is_file()) else {
-            eprintln!("{label}: snapshot or manifest absent; skipped");
-            continue;
-        };
+        let model = if fixture.model.contains("Flash") { "flash" } else { "pro" };
+        let manifest = inputs.join(format!("{model}-{}-{}/PROGRAMS.json", fixture.rtx, fixture.context));
+        let snapshot = snapshot(&fixture.model).unwrap_or_else(|| panic!("{label}: required checkpoint {} missing", fixture.model));
         let shared = Shared::open(&snapshot).unwrap();
         let budget = fixture.gpus[0].total_bytes;
         assert!(fixture.gpus.iter().all(|g| g.total_bytes.abs_diff(budget) < 8 * MIB), "{label}: unequal GPUs");
@@ -796,12 +787,11 @@ fn planner_equals_runtime_deepseek_v4_measured() {
         }
         checked += 1;
     }
+    assert!(checked > 0, "no live V4 measured fixtures found");
     eprintln!("planner_equals_runtime_deepseek_v4_measured: {checked} fixtures");
 }
 
-fn shellexpand(path: &str) -> String {
-    path.replace("~", &std::env::var("HOME").unwrap_or_default())
-}
+
 
 /// serve-dsv4's admission over a fixture's measured free bytes.
 fn runtime_measured(shared: &Shared, case: &Case<'_>, fixture: &Fixture) -> anyhow::Result<Placement> {

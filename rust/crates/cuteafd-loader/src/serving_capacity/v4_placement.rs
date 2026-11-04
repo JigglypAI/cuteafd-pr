@@ -145,20 +145,21 @@ mod tp2_tests {
     }
     #[test]
     fn real_tp2_costs_match_catalog_reference() {
-        let hub = std::path::Path::new("/mnt/sparknest/hf-home/hub");
+        let inputs = crate::plan::testing::v4_placement_inputs().unwrap();
+        let hub = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "/mnt/sparknest/hf-home".into()).join("hub");
         for (model, family, resident, staging) in [
             ("deepseek-ai--DeepSeek-V4-Flash-0731", "flash", 1711276032u64, 6684672u64),
             ("wrldsuksgo2mars--DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1", "pro", 3212836864, 0)] {
-            let Some(snapshot) = std::fs::read_dir(hub.join(format!("models--{model}/snapshots"))).ok()
+            let snapshot = std::fs::read_dir(hub.join(format!("models--{model}/snapshots"))).ok()
                 .and_then(|entries| entries.filter_map(|e| e.ok()).map(|e| e.path())
-                    .find(|p| p.join("model.safetensors.index.json").is_file())) else { continue };
+                    .find(|p| p.join("model.safetensors.index.json").is_file()))
+                .unwrap_or_else(|| panic!("required V4 checkpoint {model} missing"));
             let catalog = crate::read_expert_catalog(&snapshot).unwrap();
-            let manifest = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap()
-                .join(format!(".cache/cuteafd/builds/v4-placement/plans-input/{family}-2-1048576/PROGRAMS.json"));
+            let manifest = inputs.join(format!("{family}-2-1048576/PROGRAMS.json"));
             for rank in 0..2 {
                 let cost = deepseek_v4_tp2_expert_cost(&catalog, catalog.routed_experts().first_layer, rank).unwrap();
                 assert_eq!((cost.resident_bytes, cost.staging_bytes), (resident, staging));
-                if catalog.exl3().is_some() && !manifest.is_file() { continue; }
                 let workspace = deepseek_v4_tp2_workspace(&catalog, Some(&manifest), 4096).unwrap();
                 let expected = if family == "flash" {
                     let shape = catalog.routed_experts();

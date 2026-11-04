@@ -1232,3 +1232,54 @@ def test_combined_exl3_reply_export_operand_and_scalar_abi(monkeypatch):
         assert kernel.full_rotation and kernel.use_expert_map
         assert kernel.full_rotation_output_dtype == "bf16"
         assert kernel.element_dtype == "fp16" and kernel.reply_format == format
+
+
+def test_v4_placement_publication_preserves_compiler_metadata_and_provenance(tmp_path, monkeypatch):
+    """Eight views may share code, but never manufacture program/workspace data."""
+    class Filesystem:
+        @staticmethod
+        def check_path(path):
+            pass
+
+    real_load = compare_sm.load_file
+    monkeypatch.setattr(compare_sm, 'load_file', lambda name, path: Filesystem if name == 'cuteafd_build_filesystem' else real_load(name, path))
+    commands = []
+
+    def compile_export(command, **kwargs):
+        payload = json.loads(command[-1])
+        commands.append(payload)
+        output = Path(payload['output'])
+        (output / 'comparison-context.json').write_text(json.dumps({'cuda_initialized': False, 'args': payload['args']}))
+        if payload['exporter'] == 'package_exl3_aot.py':
+            for tp in (1, 2):
+                for rows in compare_sm.EXL3_CAPACITIES.split(','):
+                    variant = output / f'rtx-tp{tp}/m{rows}'
+                    variant.mkdir(parents=True)
+                    (variant / 'v41_exl3.json').write_text(json.dumps({'scratch': int(rows), 'source': 'compiler'}))
+        else:
+            (output / 'dsv4_programs.json').write_text(json.dumps({'args': payload['args'], 'source': 'compiler'}))
+
+    monkeypatch.setattr(compare_sm.subprocess, 'run', compile_export)
+    monkeypatch.setattr(compare_sm.subprocess, 'check_output', lambda *a, **kw: 'a' * 40)
+    target = tmp_path / 'published'
+    compare_sm.v4_placement_inputs(target, tmp_path / 'staging', 1, 1)
+    provenance = json.loads((target / 'INPUTS.json').read_text())
+    assert provenance['engine_commit'] == 'a' * 40
+    lock = json.loads((ROOT / 'third_party/sparkinfer.lock.json').read_text())
+    assert provenance['sparkinfer_revision'] == lock['revision']
+    assert provenance['source_tree_sha256'] == lock['source_tree_sha256']
+    assert len(commands) == 3
+    assert all(command['sms'] == 188 for command in commands)
+    assert len(list(target.glob('*/PROGRAMS.json'))) == 8
+    assert len(list(target.rglob('v41_exl3.json'))) == 64
+    for relative, checksum in provenance['files'].items():
+        assert compare_sm.sha((target / relative).read_bytes()) == checksum
+    for context in (131072, 1048576):
+        for model in ('flash', 'pro'):
+            for rtx in (1, 2):
+                manifest = json.loads((target / f'{model}-{rtx}-{context}/PROGRAMS.json').read_text())
+                assert manifest['source'] == 'compiler'
+                args = manifest['args']
+                assert args[args.index('--max-context') + 1] == str(context)
+    with pytest.raises(ValueError, match='not empty'):
+        compare_sm.v4_placement_inputs(target, tmp_path / 'staging2', 1, 1)

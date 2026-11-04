@@ -76,6 +76,41 @@ at the qualified C16 output budget; scheduler and EXL3 slots were not the
 limit. Full-width distinct-prompt qualification and default auto admission
 are recorded under Qwen TP4 admission below.
 
+## Live V4 placement inputs
+
+The full CPU gate requires both V4 checkpoints and compiler-produced placement
+metadata; absent or stale inputs fail rather than silently passing. The default
+CPU tier explicitly lists these four live tests among its exclusions. Direct
+Cargo invocations run them and require the inputs. `--skip-live-planners` is an
+explicit, recorded opt-out, not a full gate result for V4 coverage.
+
+Regenerate on root NVMe from a committed checkout with pinned submodules,
+without a GPU or hardware lock:
+
+```sh
+sha=$(git rev-parse HEAD)
+root="$HOME/.cache/cuteafd/builds/v4-placement-inputs"
+python3 scripts/build/assert-build-filesystem.py "$root"
+mkdir -p "$root"
+CUTEAFD_DEV_TARGET_DIR="$root" CUTEAFD_DEV_MEMORY=32g \
+  timeout 14400 scripts/build/cuteafd-dev.sh cpu -- nice -n 19 \
+  scripts/build/build-slot.sh python3 scripts/build/compare-sm-exports.py \
+  --v4-placement-inputs "/opt/cuteafd-target/$sha" \
+  --output-dir "/opt/cuteafd-target/staging-$sha" --workers 1 --timeout 7200
+ln -sfn "$sha" "$root/current"
+rm -rf "$root/staging-$sha"
+```
+
+The exporter compiles Flash/Pro and their split-head programs at both 131072
+and 1048576 context, plus native EXL3 K2/K3 coordinator capacity metadata.
+Each of the eight views contains unmodified exported manifests. `INPUTS.json`
+records engine commit, fork revision/tree hash, compiler environment and file
+checksums. Both daemon equality tests and loader TP2-cost tests use
+`CUTEAFD_V4_PLACEMENT_INPUTS`, defaulting to `$root/current`; they refuse a
+fork-pin/tree-hash mismatch or missing/modified manifests. Keep the published
+commit directory and `current` symlink during build cleanup; delete only export
+staging and task Cargo targets. No weights or generated inputs belong in Git.
+
 ## Architecture
 
 ```
