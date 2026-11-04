@@ -41,7 +41,6 @@ fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize,
     if bf16_sibling(&directory).is_some_and(|path| path.is_dir()) {
         directory = bf16_sibling(&directory).context("MiMo BF16 package sibling")?;
     }
-    let whole = Bytes2 { resident: expert_layer_bytes(tensors, 1, 0, Slicing::Padded)?, staging: 0 };
     let routed = opened.cfg.dense.iter().take(layers).filter(|&&dense| !dense).count();
     let onboard = args.onboard.resolve(routed);
     let zero_local = onboard.layers(routed) == Some(0);
@@ -64,14 +63,13 @@ fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize,
         cuteafd_loader::placement::inventory::fp8moe_scratch_bytes(&metadata, layout, rows as u64)
             .context("MiMo expert manifest lacks selected capacity")
     };
-    let (half, workspace, tp2_workspace) = if ranks == 2 {
+    let (workspace, tp2_workspace) = if ranks == 2 {
         let plans = [Fp8MoeTp2::plan(tensors, &directory, &[tensors.shape().first_layer], 0, rows)?, Fp8MoeTp2::plan(tensors, &directory, &[tensors.shape().first_layer], 1, rows)?];
         for plan in &plans {
             ensure!(scratch(&plan.directory)? == plan.scratch_bytes as u64,
                 "MiMo expert manifest scratch differs from native package ABI");
         }
-        (plans.each_ref().map(|plan| Bytes2 { resident: plan.resident_layer_bytes as u64, staging: plan.staging_bytes as u64 }),
-            0, plans.each_ref().map(|plan| plan.workspace_bytes as u64))
+        (0, plans.each_ref().map(|plan| plan.workspace_bytes as u64))
     } else {
         // SAFETY: this reads only the trusted generated package's static ABI.
         let metadata = unsafe { cuteafd_ffi::fp8_moe::Fp8MoeMetadata::read(&directory) }?;
@@ -81,7 +79,7 @@ fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize,
             && metadata.info.experts == opened.cfg.experts && metadata.info.topk == opened.cfg.topk
             && metadata.info.intermediate == opened.cfg.moe_intermediate,
             "MiMo local package does not match BF16-input checkpoint geometry: {:?}", metadata.info);
-        ([Bytes2::default(); 2], metadata.scratch_for(rows)?.max(256) as u64, [0; 2])
+        (metadata.scratch_for(rows)?.max(256) as u64, [0; 2])
     };
     let costs = opened.cfg.dense.iter().take(layers).enumerate().map(|(layer, &dense)| -> Result<_> {
         if dense { return Ok(None); }
@@ -89,8 +87,11 @@ fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize,
         let supported = view.format() == tensors.format();
         let whole = Bytes2 { resident: expert_layer_bytes(&view, 1, 0, Slicing::Padded)?, staging: 0 };
         let half = if ranks == 2 {
-            [Bytes2 { resident: expert_layer_bytes(&view, 2, 0, Slicing::Blocks(128))?, staging: 0 },
-             Bytes2 { resident: expert_layer_bytes(&view, 2, 1, Slicing::Blocks(128))?, staging: 0 }]
+            let bytes = |rank| -> Result<_> {
+                let (_, slicing) = cuteafd_loader::placement::families::mimo_v2::exact_package(&directory, &view, 2, rank);
+                Ok(Bytes2 { resident: expert_layer_bytes(&view, 2, rank, slicing)?, staging: 0 })
+            };
+            [bytes(0)?, bytes(1)?]
         } else { [Bytes2::default(); 2] };
         Ok(Some(ExpertCost { whole, half, tp2: ranks == 2 && supported,
             whole_supported: supported, spark_ok: args.peers.is_some() }))

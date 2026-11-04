@@ -334,7 +334,6 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
         .unwrap_or_else(|| directory.parent().expect("package parent").join("manifest.json"));
     let metadata = if onboard.layers(routed) == Some(0) { None }
         else { package_manifest(&directory, explicit)? };
-    let mut half = [Bytes2::default(); 2];
     let mut workspace = 0;
     let mut tp2_workspace = [0; 2];
     if let Some(metadata) = metadata.as_ref() {
@@ -359,7 +358,6 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
             let scratch = crate::placement::inventory::fp8moe_scratch_bytes(metadata, layout, rows.max(64))
                 .context("MiMo expert manifest lacks selected capacity")?;
             if ranks == 2 {
-                half[rank] = Bytes2 { resident: expert_layer_bytes(tensors, ranks, rank, slicing)?, staging: 0 };
                 let output = rows.max(64).checked_mul(cfg.hidden as u64).and_then(|bytes| bytes.checked_mul(2))
                     .context("MiMo TP2 output overflow")?;
                 tp2_workspace[rank] = scratch.checked_add(output).context("MiMo TP2 workspace overflow")?;
@@ -370,15 +368,17 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
             || (onboard == Onboard::Auto && explicit.is_none())),
             "MiMo local experts need matching BF16 package manifest {}", path.display());
     }
-    let whole = Bytes2 { resident: expert_layer_bytes(tensors, 1, 0, Slicing::Padded)?, staging: 0 };
     let costs = cfg.dense.iter().enumerate().map(|(layer, &dense)| -> anyhow::Result<_> {
         if dense { return Ok(None); }
         let view = tensors.for_coordinator().for_layer_metadata(layer)?;
         let supported = view.format() == tensors.format();
         let whole = Bytes2 { resident: expert_layer_bytes(&view, 1, 0, Slicing::Padded)?, staging: 0 };
         let half = if ranks == 2 {
-            [Bytes2 { resident: expert_layer_bytes(&view, 2, 0, Slicing::Blocks(128))?, staging: 0 },
-             Bytes2 { resident: expert_layer_bytes(&view, 2, 1, Slicing::Blocks(128))?, staging: 0 }]
+            let bytes = |rank| -> anyhow::Result<_> {
+                let (_, slicing) = exact_package(&directory, &view, 2, rank);
+                Ok(Bytes2 { resident: expert_layer_bytes(&view, 2, rank, slicing)?, staging: 0 })
+            };
+            [bytes(0)?, bytes(1)?]
         } else { [Bytes2::default(); 2] };
         Ok(Some(ExpertCost { whole, half, tp2: ranks == 2 && supported,
             whole_supported: supported, spark_ok: spark_ranks > 0 }))

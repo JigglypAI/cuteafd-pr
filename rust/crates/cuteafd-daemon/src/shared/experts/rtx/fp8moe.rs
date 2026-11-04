@@ -114,9 +114,9 @@ impl<'a> Fp8MoeTp2<'a> {
     #[allow(clippy::too_many_arguments)]
     fn bind_rank(device: Device<'a>, tensors: &Fp8ExpertTensors, directory: &Path,
         layers: Vec<usize>, rank: usize, max_rows: usize, budget: usize, pushed: Option<Vec<Fp8Layer<'a>>>) -> Result<Self> {
-        let coordinator = tensors.for_coordinator();
-        let tensors = &coordinator;
         validate_layers(&layers, tensors.shape(), rank)?;
+        let coordinator = tensors.for_coordinator().for_layer_metadata(layers[0])?;
+        let tensors = &coordinator;
         let plan = Self::plan(tensors, directory, &layers, rank, max_rows)?;
         let resident = plan.resident_layer_bytes.checked_mul(layers.len())
             .context("FP8 MoE TP2 resident size overflow")?;
@@ -149,9 +149,9 @@ impl<'a> Fp8MoeTp2<'a> {
         layers: Vec<usize>, max_rows: usize, budgets: [usize; 2]) -> Result<[Self; 2]> {
         ensure!(devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
             "invalid FP8 MoE TP2 device pair");
-        let coordinator = tensors.for_coordinator();
-        let tensors = &coordinator;
         validate_layers(&layers, tensors.shape(), 0)?;
+        let coordinator = tensors.for_coordinator().for_layer_metadata(layers[0])?;
+        let tensors = &coordinator;
         let started = std::time::Instant::now();
         let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 FP8 expert layer halves");
         let plans = [Self::plan(tensors, directory, &layers, 0, max_rows)?, Self::plan(tensors, directory, &layers, 1, max_rows)?];
