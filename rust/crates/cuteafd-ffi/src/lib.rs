@@ -1762,6 +1762,7 @@ native_symbols! {
     cuteafd_rdma_rc_endpoint_poll: RdmaRcEndpointPollFn,
     cuteafd_rdma_rc_endpoint_copy_recv: RdmaRcEndpointCopyRecvFn,
     cuteafd_rdma_rc_endpoint_copy_recv_at: RdmaRcEndpointCopyRecvAtFn,
+    cuteafd_rdma_rc_endpoint_register_device_region: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut u32) -> CuteafdStatus,
     cuteafd_rdma_rc_endpoint_register_region: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut u32) -> CuteafdStatus,
     cuteafd_rdma_rc_endpoint_post_send_slot_region: unsafe extern "C" fn(*mut c_void, usize, usize, u32, usize, usize, u64) -> CuteafdStatus,
     cuteafd_rdma_rc_endpoint_destroy: RdmaRcEndpointDestroyFn,
@@ -4932,6 +4933,21 @@ impl NativeLibrary {
         let mut region = 0;
         let status = unsafe { register(handle, ptr, bytes, &mut region) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_register_region", status)?;
+        Ok(region)
+    }
+
+    /// Registers page-aligned CUDA device storage through dma-buf.
+    ///
+    /// # Safety
+    /// The allocation must remain live until endpoint destruction completes.
+    pub unsafe fn rdma_rc_endpoint_register_device_region(
+        &self, handle: *mut c_void, ptr: *mut c_void, bytes: usize,
+    ) -> Result<u32> {
+        let register = self.cuteafd_rdma_rc_endpoint_register_device_region()?;
+        let mut region = 0;
+        // SAFETY: the caller retains the allocation for the endpoint's lifetime.
+        let status = unsafe { register(handle, ptr, bytes, &mut region) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_register_device_region", status)?;
         Ok(region)
     }
 
