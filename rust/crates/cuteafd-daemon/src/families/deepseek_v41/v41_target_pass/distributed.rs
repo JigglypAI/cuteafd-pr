@@ -78,12 +78,14 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>) -> Result<()> {
         ensure!(self.state == State::Idle, "startup prefill capture requires idle target pass");
         let resources = &mut self.resources;
-        let rows: Vec<_> = (1..=cuteafd_core::V41_VERIFY_ROWS).collect();
+        // Arbitrary restored tails have no safe padding mask. Keep prefill
+        // sealed eager rather than spending three owners' graph memory on them.
+        let rows = [];
         bank.capture_startup_producers(&mut resources.execution.producers.windows,
             &mut resources.execution.producers.sources, &rows)?;
         for index in resources.indices.iter_mut().flatten() {
             let device = index.device;
-            device.run(|| index.get_mut().capture_startup(|layer, row|
+            device.run(|| index.get_mut().capture_startup(&rows, |layer, row|
                 resources.execution.startup_source(bank, layer, row)))?;
         }
         for lane in &mut resources.lanes {
@@ -103,7 +105,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         for gpu in 0..2 {
             let index = resources.indices[gpu].as_mut().context("startup index lane absent")?;
             let device = index.device;
-            device.run(|| index.get_mut().capture_startup(|layer, row|
+            device.run(|| index.get_mut().capture_startup(&rows, |layer, row|
                 resources.execution.startup_source(bank, layer, row)))?;
             let selections = index.startup_selections();
             let sinks = resources.execution.startup_sinks();

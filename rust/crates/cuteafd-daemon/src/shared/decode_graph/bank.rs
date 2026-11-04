@@ -315,6 +315,23 @@ mod tests {
     }
 
     #[test]
+    fn sealed_empty_prefill_inventory_never_captures_arbitrary_tails() {
+        let mut bank = GraphBank::<(usize, usize), usize>::new(None);
+        bank.declare_startup(&[]).unwrap();
+        bank.finish_startup().unwrap();
+        for rows in (1..=128).chain([301, 552, 808, 810, 2723, 2752]) {
+            for layer in 0..40 {
+                let key = (layer, rows);
+                assert_eq!(bank.enqueue(&key), (GraphDecision::Eager, None));
+                assert!(!bank.capture_allowed(&key));
+            }
+        }
+        assert_eq!(bank.len(), 0);
+        assert_eq!(bank.stats().captures, 0);
+        assert_eq!(bank.stats().evictions, 0);
+    }
+
+    #[test]
     fn sealed_family_warmup_disallows_live_capture() {
         let mut bank = GraphBank::new(None);
         bank.insert(1, 10, None);

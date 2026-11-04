@@ -68,14 +68,13 @@ impl<'w, 'a> IndexLane<'w, 'a> {
             else { self.reindex.as_ref().map(|wave| wave.startup_outputs().0) }
         }).collect()
     }
-    pub(crate) fn capture_startup(&mut self,
+    pub(crate) fn capture_startup(&mut self, rows: &[usize],
         mut source: impl FnMut(usize, usize) -> Result<crate::families::deepseek_v41::v41_compressor::IndexScoreGeometry>) -> Result<()> {
         ensure!(!self.invalid && self.ready.is_none(), "startup index lane requires idle owner");
         let layers: Vec<_> = (0..LAYERS.len()).filter(|&i|
             self.device.is_none_or(|gpu| self.weights.weights[i].device.id == gpu)).collect();
-        let rows = cuteafd_core::V41_VERIFY_ROWS;
-        let keys: Vec<_> = layers.iter().flat_map(|&i| (1..=rows)
-            .map(move |row| (LAYERS[i], row as u32))).collect();
+        let keys: Vec<_> = layers.iter().flat_map(|&i| rows.iter()
+            .map(move |&row| (LAYERS[i], row as u32))).collect();
         let original = self.next;
         let result = (|| -> Result<()> {
             self.query.declare_startup(&keys)?;
@@ -84,7 +83,7 @@ impl<'w, 'a> IndexLane<'w, 'a> {
             let shared = self.source.startup_outputs().1;
             for &i in &layers {
                 self.query.rebind(&self.weights.weights[i])?;
-                for row in 1..=rows {
+                for &row in rows {
                     let query = self.query.startup_geometry(row)?;
                     let geometry = source(if LAYERS[i] >= 20 { 20 } else { LAYERS[i] }, row)?;
                     if LAYERS[i] > 20 {
@@ -97,7 +96,7 @@ impl<'w, 'a> IndexLane<'w, 'a> {
             if let Some(follower) = &mut self.reindex { follower.declare_startup(&follower_keys)?; }
             for &i in &layers {
                 self.query.rebind(&self.weights.weights[i])?;
-                for row in 1..=rows {
+                for &row in rows {
                     self.query.capture_startup(row as u32)?;
                     let query = self.query.startup_geometry(row)?;
                     let geometry = source(if LAYERS[i] >= 20 { 20 } else { LAYERS[i] }, row)?;

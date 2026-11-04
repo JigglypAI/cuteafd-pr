@@ -783,7 +783,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         self.capture_startup_kind(sinks, selections, aligned, true)
     }
     /// Prefill keeps its own sparse arithmetic eager: decode reduction recipes
-    /// are not prefill recipes. Query/router still retain sealed exact rows.
+    /// are not prefill recipes. Empty inventories keep arbitrary tails eager.
     pub(crate) fn capture_startup_prefill(&mut self) -> Result<()> {
         self.capture_startup_kind(&[], &[], false, false)
     }
@@ -795,7 +795,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             && self.dual_sparse.is_none() && self.tp2_query.is_none() && self.tp2_output.is_none()
             && !self.weights.split_query_b && !self.weights.split_output_b,
             "startup prototype requires idle unsplit target lanes");
-        let rows = cuteafd_core::V41_VERIFY_ROWS;
+        let rows = if decode { cuteafd_core::V41_VERIFY_ROWS } else { 0 };
         ensure!(self.capacity >= rows && (!decode || (sinks.len() == 40 && selections.len() == 40)),
             "startup target capacity or bindings differ");
         let device = self.block.inputs()[0].device_id;
