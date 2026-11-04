@@ -288,7 +288,7 @@ impl DflashConfig {
         4 * self.hidden / self.group
     }
 
-    fn tensor_shapes(&self) -> Vec<(String, Vec<usize>)> {
+    pub(crate) fn tensor_shapes(&self) -> Vec<(String, Vec<usize>)> {
         let (h, kv, inter) = (self.hidden, self.kv_width(), self.intermediate);
         let mut shapes = vec![
             ("fc.weight".into(), vec![h, self.taps.len() * h]),
@@ -334,10 +334,7 @@ impl DflashConfig {
 }
 
 /// Exactly one immutable resident representation of a GEMM.
-enum DraftWeight<'a> {
-    Bf16(Dev<'a>),
-    Fp8(Fp8Weight<'a>),
-}
+use super::weights::Weight as DraftWeight;
 
 struct DraftLayer<'a> {
     input_norm: Dev<'a>,
@@ -1198,17 +1195,8 @@ impl<'a> DflashDrafter<'a> {
             &config, slots, max_sequences, library.sm_count()? as u64, representation, fp8_rows.code() as u8, kv_cache)?;
         tracing::info!(resident_bytes, scratch_bytes, kv_cache = %kv_cache, "DFlash shared readiness inventory");
         ensure!(mask_row.len() == cfg.hidden * 2, "DFlash BF16 mask row has wrong hidden width");
-        let path = snapshot.join("model.safetensors");
-        let checkpoint = Checkpoint {
-            data: file,
-            tensors: read_safetensors_metadata(&path)?.into_iter().map(|t| (t.name.clone(), t)).collect(),
-        };
-        checkpoint.validate(&cfg)?;
-        let upload = |bytes: &[u8]| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, bytes.len().max(256))?;
-            library.copy_h2d(allocation.buffer, bytes)?;
-            Ok(allocation)
-        };
+        let checkpoint = super::weights::Load::with_prefetched(library, snapshot, file)?;
+        checkpoint.validate(cfg.tensor_shapes())?;
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
@@ -1220,20 +1208,9 @@ impl<'a> DflashDrafter<'a> {
                 Ok((usize::try_from(shape.k)?, usize::try_from(shape.n)?))).collect::<Result<_>>()?;
             fp8_linear::scratch_rows(library, scratch.rows, &shapes, fp8_rows)
         }).transpose()?;
-        let tensor = |name: &str, shape: &[usize]| checkpoint.bytes(name, shape).and_then(upload);
-        let concat = |parts: &[(&str, usize)], cols: usize| -> Result<Dev<'a>> {
-            let total: usize = parts.iter().map(|(_, rows)| rows * cols * 2).sum();
-            let allocation = DeviceAllocation::new(library, total)?;
-            let mut offset = 0;
-            for (name, rows) in parts {
-                let bytes = checkpoint.bytes(name, &[*rows, cols])?;
-                library.copy_h2d(CuteafdDeviceBuffer { ptr: at(&allocation, offset), bytes: bytes.len(),
-                    ..allocation.buffer }, bytes)?;
-                offset += bytes.len();
-            }
-            Ok(allocation)
-        };
-        let matrix = |source, n, k| pack_draft_weight(library, source, n, k, representation, scales, stream);
+        let tensor = |name: &str, shape: &[usize]| checkpoint.tensor(name, shape);
+        let matrix = |parts: &[(&str, usize)], cols| checkpoint.matrix(parts, cols,
+            representation == GlmDraftRepresentation::Fp8Only, scales, stream);
         let layers = (0..cfg.layers).map(|l| -> Result<DraftLayer<'a>> {
             let p = format!("layers.{l}");
             let a = format!("{p}.self_attn");
@@ -1241,26 +1218,23 @@ impl<'a> DflashDrafter<'a> {
                 input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
                 post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
                 body: LayerBody::Dflash {
-                    attn_conv: matrix(tensor(&format!("{p}.attention_conv.kernel_projection.weight"), &[cfg.conv_width(), h])?,
-                        cfg.conv_width(), h)?,
+                    attn_conv: matrix(&[(&format!("{p}.attention_conv.kernel_projection.weight"), cfg.conv_width())], h)?,
                     attn_base: tensor(&format!("{p}.attention_conv.base_kernel"), &[2, 2, h])?,
-                    mlp_conv: matrix(tensor(&format!("{p}.mlp_conv.kernel_projection.weight"), &[cfg.conv_width(), h])?,
-                        cfg.conv_width(), h)?,
+                    mlp_conv: matrix(&[(&format!("{p}.mlp_conv.kernel_projection.weight"), cfg.conv_width())], h)?,
                     mlp_base: tensor(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
                 },
                 attention: DraftAttention::Gqa(GqaAttention {
-                    qkv: matrix(concat(&[(&format!("{a}.q_proj.weight"), cfg.heads * cfg.head_dim),
-                        (&format!("{a}.k_proj.weight"), kv), (&format!("{a}.v_proj.weight"), kv)], h)?, cfg.qkv_width(), h)?,
+                    qkv: matrix(&[(&format!("{a}.q_proj.weight"), cfg.heads * cfg.head_dim),
+                        (&format!("{a}.k_proj.weight"), kv), (&format!("{a}.v_proj.weight"), kv)], h)?,
                     q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
                     k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
-                    o: matrix(tensor(&format!("{a}.o_proj.weight"), &[h, cfg.heads * cfg.head_dim])?,
-                        h, cfg.heads * cfg.head_dim)?,
+                    o: matrix(&[(&format!("{a}.o_proj.weight"), h)], cfg.heads * cfg.head_dim)?,
                     k_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
                     v_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
                 }),
-                gate_up: matrix(concat(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
-                    (&format!("{p}.mlp.up_proj.weight"), inter)], h)?, 2 * inter, h)?,
-                down: matrix(tensor(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?, h, inter)?,
+                gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
+                    (&format!("{p}.mlp.up_proj.weight"), inter)], h)?,
+                down: matrix(&[(&format!("{p}.mlp.down_proj.weight"), h)], inter)?,
             })
         }).collect::<Result<Vec<_>>>()?;
         let taps = cfg.taps.len() * h;
@@ -1273,11 +1247,11 @@ impl<'a> DflashDrafter<'a> {
             stream,
             slots,
             max_sequences,
-            fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps)?, context_fc: None, projections,
+            fc: matrix(&[("fc.weight", h)], taps)?, context_fc: None, projections,
             hidden_norm: tensor("hidden_norm.weight", &[h])?,
             norm: tensor("norm.weight", &[h])?,
             head_ops: DraftHeadOps::Selector {
-                projection: matrix(tensor("candidate_selector.hidden_projection.weight", &[cfg.rank, h])?, cfg.rank, h)?,
+                projection: matrix(&[("candidate_selector.hidden_projection.weight", cfg.rank)], h)?,
                 predecessor: tensor("candidate_selector.predecessor_codebook", &[cfg.vocab, cfg.rank])?,
                 successor: tensor("candidate_selector.successor_codebook", &[cfg.vocab, cfg.rank])?,
             },
