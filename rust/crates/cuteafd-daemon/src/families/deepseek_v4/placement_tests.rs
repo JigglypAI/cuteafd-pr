@@ -112,6 +112,7 @@ fn runtime_with_upload_check(shared: &Shared, case: &Case<'_>, layout: &MemoryLa
 fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp1_available: bool,
     check_upload: bool, host: bool) -> anyhow::Result<Placement> {
     let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(case.manifest)?)?;
+    // case.budget is plan_options' rtx_bytes[0], matching the planner's fallback.
     cuteafd_core::coordinator_programs::select_card_plans(&mut manifest, case.physical_sms.unwrap_or_else(||
         cuteafd_loader::placement::ArchContext::for_device("sm_120", case.budget).sms))?;
     let catalog = shared.catalog(case.dspark)?;
@@ -545,14 +546,14 @@ fn equality_input_refuses_missing_or_truncated_shards() {
 
 /// The real checkpoints (headers only) with the release image's program and
 /// EXL3 package manifests: Flash and Pro EXL3 K2, natural minimum and
-/// maximum, compiled extents 131,072 and 1,048,576, automatic and a fixed
-/// onboard of half the routed layers (Flash max). Missing inputs fail the
+/// maximum, extents 131,072 and 1,048,576, default/auto/fixed onboarding,
+/// and physical-card recipes for 188 and 170 SMs. Missing inputs fail the
 /// full CPU tier; the default cpu-gate explicitly excludes live tests.
 #[test]
 fn planner_equals_runtime_deepseek_v4() {
     const CHILD: &str = "CUTEAFD_V4_EQUALITY_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        // Bound real-checkpoint/FUSE work without dropping any of the 80 cases.
+        // Bound real-checkpoint/FUSE work without dropping any of the 160 cases.
         let started = std::time::Instant::now();
         let output = std::process::Command::new("timeout").args(["--kill-after=5s", "300s"])
             .arg(std::env::current_exe().unwrap())
@@ -821,6 +822,7 @@ fn planner_equals_runtime_deepseek_v4_measured() {
 /// serve-dsv4's admission over a fixture's measured free bytes.
 fn runtime_measured(shared: &Shared, case: &Case<'_>, fixture: &Fixture) -> anyhow::Result<Placement> {
     let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(case.manifest)?)?;
+    // case.budget is plan_options' rtx_bytes[0], matching the planner's fallback.
     cuteafd_core::coordinator_programs::select_card_plans(&mut manifest, case.physical_sms.unwrap_or_else(||
         cuteafd_loader::placement::ArchContext::for_device("sm_120", case.budget).sms))?;
     let catalog = shared.catalog(case.dspark)?;
