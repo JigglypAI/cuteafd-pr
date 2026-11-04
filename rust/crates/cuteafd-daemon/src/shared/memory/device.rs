@@ -285,7 +285,7 @@ impl<'a> Stream<'a> {
     pub fn new(device: Device<'a>) -> Result<Self> {
         Ok(Self { device, raw: device.run(|| device.library.cuda_stream_create())? })
     }
-    fn ready(&self) -> Result<bool> {
+    pub(super) fn ready(&self) -> Result<bool> {
         self.device.run(|| unsafe { self.device.library.cuda_stream_query(self.raw) })
     }
     pub(crate) fn drain(&self) -> Result<()> {

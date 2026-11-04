@@ -250,6 +250,34 @@ impl Drop for BlockingWait<'_> {
     }
 }
 
+/// Standalone component qualification shares one lazily created stream per owner.
+/// Device metadata and teardown never initialize it; serving uses explicit streams.
+pub(crate) struct StandaloneStream<'a> {
+    pub(crate) device: device::Device<'a>,
+    stream: std::cell::OnceCell<device::Stream<'a>>,
+}
+impl<'a> StandaloneStream<'a> {
+    pub(crate) fn new(device: device::Device<'a>) -> Self {
+        Self { device, stream: std::cell::OnceCell::new() }
+    }
+    pub(crate) fn get(&self) -> Result<&device::Stream<'a>> {
+        if self.stream.get().is_none() {
+            let stream = device::Stream::new(self.device)?;
+            let _ = self.stream.set(stream);
+        }
+        Ok(self.stream.get().expect("initialized standalone stream"))
+    }
+    pub(crate) fn drain(&self) -> Result<()> {
+        self.stream.get().map_or(Ok(()), device::Stream::drain)
+    }
+    pub(crate) fn require_complete(&self) -> Result<()> {
+        if let Some(stream) = self.stream.get() {
+            anyhow::ensure!(stream.ready()?, "standalone component stream is unfinished");
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct LoadStream<'a> {
     pub(crate) library: &'a NativeLibrary,
     pub(crate) raw: *mut c_void,
@@ -308,10 +336,45 @@ impl Drop for LoadStream<'_> {
 }
 
 #[cfg(test)]
+pub(crate) fn cpu_stream_fixture() -> Result<(tempfile::TempDir, cuteafd_ffi::native_library_lifetime_fixture::Fixture)> {
+    use anyhow::Context;
+    let root = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?)
+        .join(".cache/cuteafd/builds");
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let status = std::process::Command::new("python3")
+        .arg(repo.join("scripts/build/assert-build-filesystem.py"))
+        .arg(&root)
+        .status()?;
+    anyhow::ensure!(status.success(), "CPU stream fixture filesystem check failed");
+    std::fs::create_dir_all(&root)?;
+    let directory = tempfile::Builder::new().prefix("cpu-stream-fixture-").tempdir_in(root)?;
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_in(directory.path())?;
+    Ok((directory, fixture))
+}
+
+#[cfg(test)]
 mod load_stream_lifetime_tests {
     use super::*;
     use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
     use std::{future::Future, task::{Context, Poll, Waker}};
+
+    #[test]
+    fn standalone_stream_is_lazy_shared_and_drains_without_initializing() -> Result<()> {
+        let (_directory, fixture) = cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let device = device::Device { library: &library, id: 0 };
+        let owner = std::rc::Rc::new(StandaloneStream::new(device));
+        let component = owner.clone();
+        owner.drain()?;
+        component.require_complete()?;
+        assert!(!fixture.events()?.contains('V'), "metadata/drain must not create a stream");
+        assert_eq!(owner.get()?.raw, component.get()?.raw);
+        assert_eq!(fixture.events()?.matches('V').count(), 1);
+        drop(component);
+        drop(owner);
+        assert_eq!(fixture.events()?.matches('V').count(), 1);
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]

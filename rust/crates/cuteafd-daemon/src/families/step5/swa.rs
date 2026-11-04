@@ -163,7 +163,7 @@ struct SwaWeights<'a> {
 
 pub(super) struct SwaLayer<'a> {
     // This stream drains before every composed owner, including the FFN.
-    stream: Stream<'a>,
+    stream: std::rc::Rc<crate::shared::memory::StandaloneStream<'a>>,
     ffn: Option<DenseFfn<'a>>,
     planes: Vec<Plane<'a>>,
     native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
@@ -487,9 +487,10 @@ impl<'a> SwaLayer<'a> {
     }
 
     fn workspace(device: Device<'a>, admission: Admission,
-        immutable: std::rc::Rc<SwaWeights<'a>>, ffn: Option<DenseFfn<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
+        immutable: std::rc::Rc<SwaWeights<'a>>, mut ffn: Option<DenseFfn<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
         let planes = scratch::planes(device, &admission.planes, arena)?;
-        let stream = Stream::new(device)?;
+        let stream = scratch::standalone(device, arena);
+        if let Some(ffn) = &mut ffn { ffn.share_standalone(stream.clone()); }
         let rows = admission.rows;
         let owner = Self { stream, ffn, planes, native_scratch: None, admission, immutable };
         if arena.is_none() {
@@ -520,7 +521,7 @@ impl<'a> SwaLayer<'a> {
         pointers: &[*mut std::ffi::c_void],
         scalars: &[Scalar],
     ) -> Result<()> {
-        self.launch_on(&self.stream, stage, pointers, scalars)
+        self.launch_on(self.stream.get()?, stage, pointers, scalars)
     }
 
     fn launch_on(
@@ -538,7 +539,7 @@ impl<'a> SwaLayer<'a> {
     }
 
     pub fn enqueue(&self, rows: usize) -> Result<()> {
-        self.project_on(rows, self.planes[POSITIONS].buffer, &self.stream)?;
+        self.project_on(rows, self.planes[POSITIONS].buffer, self.stream.get()?)?;
         self.launch(
             6,
             &[
@@ -549,8 +550,8 @@ impl<'a> SwaLayer<'a> {
             &[Scalar::I32(rows as i32)],
         )?;
         self.attend(rows)?;
-        self.finish_on(rows, &self.stream)?;
-        self.dense_on(rows, &self.stream)
+        self.finish_on(rows, self.stream.get()?)?;
+        self.dense_on(rows, self.stream.get()?)
     }
 
     pub(super) fn project_on(
@@ -842,7 +843,7 @@ impl<'a> SwaLayer<'a> {
             self.planes[TABLE].buffer,
             self.admission.pages,
             self.admission.pages,
-            &self.stream,
+            self.stream.get()?,
         )
     }
 
@@ -1008,19 +1009,40 @@ mod tests {
     #[test]
     #[ignore = "requires pinned layer-0 fixtures, sealed native library and CUDA"]
     fn native_swa_layer0_boundaries_and_graph_replay() -> Result<()> {
-        native_swa_component(0)
+        native_swa_components(&[0])
     }
 
     #[test]
     #[ignore = "requires pinned SWA layer-1/2 fixtures, sealed native library and CUDA"]
     fn native_swa_layers1_2_boundaries_and_graph_replay() -> Result<()> {
-        for layer in 1..3 {
-            native_swa_component(layer)?;
+        native_swa_components(&[1, 2])
+    }
+
+    fn native_swa_components(layers: &[usize]) -> Result<()> {
+        // SAFETY: the explicit GPU test supplies a sealed native library.
+        let library =
+            unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = crate::shared::memory::device::cache_test_device(&library)?;
+        let programs = library
+            .programs()?
+            .with_manifest(std::path::Path::new(&std::env::var(
+                "CUTEAFD_PROGRAM_MANIFEST",
+            )?))?;
+        let checkpoint =
+            Checkpoint::open(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let dense = cuteafd_loader::plan::families::step5::native::dense_planes(513)?;
+        let bytes = SwaLayer::workspace_bytes(513)?
+            + cuteafd_loader::plan::families::step5::native::plane_bytes(&dense)?;
+        let arena = Arena::new(device, usize::try_from(bytes)?)?;
+        for &layer in layers {
+            native_swa_component(device, &programs, &checkpoint, &arena, layer)?;
         }
         Ok(())
     }
 
-    fn native_swa_component(layer: usize) -> Result<()> {
+    fn native_swa_component<'a>(device: Device<'a>, programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint, arena: &Arena<'a>, layer: usize) -> Result<()> {
+        let library = device.library;
         let mut root = std::path::PathBuf::from(std::env::var("CUTEAFD_STEP5_SWA_FIXTURE_DIR")?);
         if layer > 0 {
             root.push(format!("layer{layer}"));
@@ -1036,31 +1058,23 @@ mod tests {
                 && manifest["rows"] == serde_json::json!([1, 7, 128, 513]),
             "SWA fixture identity"
         );
-        // SAFETY: the explicit GPU test supplies a sealed native library.
-        let library =
-            unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        let device = crate::shared::memory::device::cache_test_device(&library)?;
-        let programs = library
-            .programs()?
-            .with_manifest(std::path::Path::new(&std::env::var(
-                "CUTEAFD_PROGRAM_MANIFEST",
-            )?))?;
-        let checkpoint =
-            Checkpoint::open(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
         ensure!(
             checkpoint.snapshot.file_name().and_then(|s| s.to_str())
                 == manifest["revision"].as_str(),
             "SWA snapshot revision mismatch"
         );
-        let mut chain = SwaLayer::load(
-            device,
-            &programs,
-            &checkpoint,
-            layer,
-            513,
-            None,
-            u64::MAX,
-            &[], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
+        let mut chain = SwaLayer::load_layout(device, programs, checkpoint, layer, 513, None,
+            u64::MAX, &[], RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, 64, true,
+            Some((arena, 0)), Qwen4KvCache::Bf16, None, None)?;
+        for (plane, data) in [
+            (POSITIONS, (0..513i64).flat_map(i64::to_le_bytes).collect::<Vec<_>>()),
+            (REQUESTS, vec![0; 513 * 4]),
+            (TABLE, (0..chain.admission.pages as i32).flat_map(i32::to_le_bytes).collect()),
+        ] {
+            device.run(|| library.copy_h2d(chain.planes[plane].buffer, &data))?;
+        }
+        assert!(std::rc::Rc::ptr_eq(&chain.stream, &arena.standalone()));
+        assert!(chain.ffn.as_ref().is_some());
         ensure!(
             manifest["epsilon"].as_f64().map(|v| v as f32) == Some(chain.immutable.epsilon),
             "SWA epsilon mismatch"
@@ -1119,22 +1133,22 @@ mod tests {
             }
             device.run(|| {
                 // SAFETY: stream is idle; all graph operands are pinned below.
-                unsafe { library.cuda_graph_begin_capture(chain.stream.raw) }
+                unsafe { library.cuda_graph_begin_capture(chain.stream.get()?.raw) }
             })?;
             let enqueue = chain.enqueue(rows);
             let raw = device.run(|| {
                 // SAFETY: end capture even if enqueue failed.
-                unsafe { library.cuda_graph_end_capture(chain.stream.raw) }
+                unsafe { library.cuda_graph_end_capture(chain.stream.get()?.raw) }
             })?;
             // SAFETY: mutable chain borrow retains every stream, allocation and program.
             let graph = unsafe {
                 crate::shared::decode_graph::GraphOwner::new(&library, device.id, raw, &mut chain)?
             };
             enqueue?;
-            let mut guard = graph.pins.stream.cancellation_guard("SWA graph replay");
+            let mut guard = graph.pins.stream.get()?.cancellation_guard("SWA graph replay");
             device.run(|| {
                 // SAFETY: retained graph operands remain live until the drain below.
-                unsafe { library.cuda_graph_launch(graph.raw, graph.pins.stream.raw) }
+                unsafe { library.cuda_graph_launch(graph.raw, graph.pins.stream.get()?.raw) }
             })?;
             graph.pins.stream.drain()?;
             guard.complete = true;
@@ -1472,7 +1486,7 @@ mod tests {
         pool.borrow_mut().release(&family, &placement.pages)?;
         let lane = chain.new_lane()?;
         ensure!(std::rc::Rc::ptr_eq(&chain.immutable, &lane.immutable)
-            && chain.stream.raw != lane.stream.raw
+            && chain.stream.get()?.raw != lane.stream.get()?.raw
             && chain.planes.iter().zip(&lane.planes).all(|(a, b)|
                 a.buffer.ptr != b.buffer.ptr && a.buffer.bytes == b.buffer.bytes),
             "Step-5 lane must share immutable storage and isolate every stream/plane");
@@ -1523,5 +1537,12 @@ mod tests {
         assert!(Admission::new(1, &[1000], 2000, 3000, a.bytes - 1, &[]).is_err());
         assert!(Admission::new(1, &[], 0, 0, u64::MAX, &[u64::MAX]).is_err());
         Ok(())
+    }
+}
+
+impl Drop for SwaLayer<'_> {
+    fn drop(&mut self) {
+        // The arena retains the lazy stream beyond this owner's planes; drain first.
+        crate::shared::decode_graph::fatal_drain(self.stream.drain(), "Step-5 swa standalone");
     }
 }

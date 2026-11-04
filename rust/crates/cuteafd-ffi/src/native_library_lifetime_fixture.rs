@@ -23,6 +23,15 @@ impl Fixture {
             std::env::var_os("CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR")
                 .context("set CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR under ~/.cache/cuteafd/builds")?,
         );
+        Self::build_at(root, false)
+    }
+
+    /// Build a test-owned fixture, taking a shared build slot only for compilation.
+    pub fn build_in(root: &std::path::Path) -> Result<Self> {
+        Self::build_at(root.to_path_buf(), true)
+    }
+
+    fn build_at(root: PathBuf, take_build_slot: bool) -> Result<Self> {
         let allowed = PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?)
             .join(".cache/cuteafd/builds")
             .canonicalize()?;
@@ -84,7 +93,16 @@ impl Fixture {
             .arg(directory.join("cuteafd_mxfp4_layouts.h"))
             .status()?;
         anyhow::ensure!(status.success(), "generating CPU fixture MXFP4 layouts failed");
-        let status = Command::new("cc")
+        let compiler = |program: &str| {
+            if take_build_slot {
+                let mut command = Command::new(repo.join("scripts/build/build-slot.sh"));
+                command.arg(program);
+                command
+            } else {
+                Command::new(program)
+            }
+        };
+        let status = compiler("cc")
             .args(["-c", "-fPIC", "-O0", "-Wall", "-Wextra", "-Werror"])
             .arg(fixtures.join("native_library_lifetime.c"))
             .arg("-I")
@@ -95,7 +113,7 @@ impl Fixture {
             .status()?;
         anyhow::ensure!(status.success(), "building CPU lifetime fixture failed");
         // Load-only kernels run the shared CUDA rule on the CPU.
-        let status = Command::new("c++")
+        let status = compiler("c++")
             .args(["-std=c++17", "-c", "-fPIC", "-O1", "-Wall", "-Wextra", "-Werror"])
             .arg(fixtures.join("native_library_kernels.cc"))
             .arg("-o")
@@ -103,7 +121,7 @@ impl Fixture {
             .env("TMPDIR", &directory)
             .status()?;
         anyhow::ensure!(status.success(), "building CPU fixture kernels failed");
-        let status = Command::new("c++")
+        let status = compiler("c++")
             .args(["-shared", "-fPIC"])
             .arg(&c_object)
             .arg(&cc_object)
@@ -112,10 +130,9 @@ impl Fixture {
             .env("TMPDIR", &directory)
             .status()?;
         anyhow::ensure!(status.success(), "linking CPU lifetime fixture failed");
-        Ok(Self {
-            module,
-            events: directory.join("events"),
-        })
+        let events = directory.join("events");
+        fs::write(&events, [])?;
+        Ok(Self { module, events })
     }
 
     /// Configure static package ABI before loading a CPU expert module.
@@ -187,6 +204,16 @@ impl Fixture {
         unsafe {
             let configure: Symbol<unsafe extern "C" fn()> =
                 library.lib.get(b"fixture_configure_immediate_copies")?;
+            configure();
+        }
+        Ok(())
+    }
+
+    /// Record ready checks only for tests asserting host-wait placement.
+    pub fn trace_stream_queries(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: this export toggles recording in the CPU-only fixture above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn()> = library.lib.get(b"fixture_trace_stream_queries")?;
             configure();
         }
         Ok(())

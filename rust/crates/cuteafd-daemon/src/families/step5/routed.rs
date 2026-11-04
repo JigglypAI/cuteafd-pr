@@ -331,7 +331,7 @@ struct RoutedWeights<'a> {
 }
 
 pub(super) struct RoutedFfn<'a> {
-    stream: Stream<'a>,
+    stream: std::rc::Rc<crate::shared::memory::StandaloneStream<'a>>,
     planes: Vec<Plane<'a>>,
     native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
     admission: Admission,
@@ -435,7 +435,7 @@ impl<'a> RoutedFfn<'a> {
         let spans = cuteafd_loader::plan::families::step5::native::routed_layout(admission.rows,
             admission.span, admission.full)?;
         let planes = scratch::region_planes(device, &spans, arena)?;
-        let stream = Stream::new(device)?;
+        let stream = scratch::standalone(device, arena);
         Ok(Self { stream, planes, native_scratch: None, admission, immutable, unit: std::cell::Cell::new(0) })
     }
     pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
@@ -700,7 +700,7 @@ mod tests {
         let owner = RoutedFfn::load(device, &programs, &checkpoint, 3, plan)?;
         let lane = owner.new_lane()?;
         ensure!(std::rc::Rc::ptr_eq(&owner.immutable, &lane.immutable)
-            && owner.stream.raw != lane.stream.raw
+            && owner.stream.get()?.raw != lane.stream.get()?.raw
             && owner.planes.iter().zip(&lane.planes).all(|(a, b)|
                 a.buffer.ptr != b.buffer.ptr && a.buffer.bytes == b.buffer.bytes),
             "Step-5 lane immutable/private storage identities");
@@ -731,5 +731,12 @@ mod tests {
         assert!(Admission::new(1, &[], one.bytes, &[1]).is_err());
         assert!(Admission::new(1, &[], u64::MAX, &[u64::MAX]).is_err());
         Ok(())
+    }
+}
+
+impl Drop for RoutedFfn<'_> {
+    fn drop(&mut self) {
+        // The arena retains the lazy stream beyond this owner's planes; drain first.
+        crate::shared::decode_graph::fatal_drain(self.stream.drain(), "Step-5 routed standalone");
     }
 }

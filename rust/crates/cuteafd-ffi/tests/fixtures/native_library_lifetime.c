@@ -21,6 +21,8 @@ static int bind_after = -1, bind_calls;
 void fixture_configure_bind_after(int after) { bind_after = after; bind_calls = 0; }
 static size_t memory_total[8], memory_used[8], graph_bytes;
 static int immediate_copies;
+static int trace_stream_queries;
+void fixture_trace_stream_queries(void) { trace_stream_queries = 1; }
 static int queued_experts;
 static int queue_expert(void **ptrs, int rows, void *stream);
 static int queue_segment_expert(void **ptrs, int rows, void *stream);
@@ -514,6 +516,7 @@ int cuteafd_cuda_event_destroy(void *handle) {
 
 int cuteafd_cuda_stream_query(void *stream, int *ready) {
     (void)stream;
+    if (trace_stream_queries) event('q');
     *ready = queued_experts ? queued_done == queued_count : immediate_copies;
     return 0;
 }

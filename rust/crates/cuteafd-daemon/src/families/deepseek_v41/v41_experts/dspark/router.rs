@@ -48,7 +48,7 @@ impl DsparkRouter<'_, '_> {
         Ok(capacity * 128 * 4)
     }
     pub(super) fn matches_stage(&self, weights: &DsparkWeights<'_>, stage: usize) -> bool {
-        self.stage == stage && std::ptr::eq(self._weights, weights)
+        self.stage == stage && std::ptr::addr_eq(self._weights, weights)
     }
     pub(in crate::families::deepseek_v41::v41_experts) fn matches(
         &self,

@@ -80,7 +80,7 @@ impl DsparkSharedFfn<'_, '_> {
         crate::families::deepseek_v41::v41_shared_ffn::SharedFfn::device_bytes(library, capacity)
     }
     pub(super) fn matches_stage(&self, weights: &DsparkWeights<'_>, stage: usize) -> bool {
-        self.stage == stage && std::ptr::eq(self.weights, weights)
+        self.stage == stage && std::ptr::addr_eq(self.weights, weights)
     }
     pub(in crate::families::deepseek_v41::v41_experts) fn matches(
         &self,

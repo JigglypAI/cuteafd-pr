@@ -811,11 +811,9 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         // stalling the issuing thread on every layer.
         let captures = !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
             && !crate::shared::decode_graph::census::eager("layer_row");
-        if (!cold || !captures) && device_read {
-            unsafe { crate::shared::memory::chain::finish(self.stream().library, self.stream().raw)?; }
-        } else {
-            self.stream().wait().await?;
-        }
+        // SAFETY: this wave retains all queued input and output storage.
+        unsafe { crate::shared::memory::chain::finish_or_wait(self.stream(),
+            (!cold || !captures) && device_read).await?; }
         if cold && !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
             && !crate::shared::decode_graph::census::eager("layer_row") {
             // The eager execution above already completed these inputs. Capture
@@ -986,43 +984,58 @@ impl BackboneRouterWeights<'_> {
 
 #[cfg(test)]
 mod host_order_tests {
-    /// A host-ordered pass (1 RTX, not `chain::deferred`) rebinds each owner
-    /// per layer only after a host check that its stream completed
-    /// (`LoadStream::require_complete`, exempt exactly when deferred). Its
-    /// remote layers' one host wait is the collect, after the reduce joined
-    /// the chain behind the router; local layers keep the router's host wait.
-    /// The collect waits for the reply on the host before queueing the
-    /// landing (no stream blocked on a device wait through the round trip:
-    /// V4.1 min C16 lost 6% with the router waiting in front of the request
-    /// and the landing queued as a device wait, #731).
+    use crate::shared::memory::{chain::{self, StageChain}, DeviceAllocation, LoadStream};
+    use anyhow::Result;
     #[test]
-    fn host_ordered_passes_wait_once_per_layer_after_issuing_it() {
-        let router = include_str!("v41_backbone_router.rs");
-        let read = router.split("fn device_read(&self) -> bool {").nth(1).unwrap().split("\n    }\n").next().unwrap();
-        assert!(read.contains("crate::shared::memory::chain::active() && if self.full_request { self.ring_capture || !trace }")
-            && read.contains("else { crate::shared::memory::chain::deferred() }"), "{read}");
-        assert!(router.contains("if (!cold || !captures) && device_read {") && router.contains("self.stream().wait().await?;"));
-        let memory = include_str!("../../shared/memory.rs");
-        let complete = memory.split("pub(crate) fn require_complete(&self)").nth(1).unwrap().split("\n    }\n").next().unwrap();
-        assert!(complete.contains("if chain::deferred() {") && complete.contains("cuda_stream_query"));
-        let lane = include_str!("v41_backbone_lane.rs");
-        let advance = lane.split("pub fn advance(&mut self)").nth(1).unwrap().split("\n    }\n").next().unwrap();
-        assert!(advance.contains("self.query.rebind(") && advance.contains("self.router.rebind("));
-        let coordinator = include_str!("v41_experts/coordinator.rs");
-        let dispatch = coordinator.split("unsafe fn send_on<'a>(").nth(1).unwrap()
-            .split("\n}\n").next().unwrap();
-        assert!(dispatch.contains("crate::shared::memory::chain::join(library, stage)?;")
-            && dispatch.contains("exchange.send(routed.rows as usize, exchange.compact_payload(routed.rows as usize), layout, sources, stage,")
-            && dispatch.contains("combined_reply_eligible(rows.iter()"));
-        let collect = coordinator.split("async unsafe fn finish_values(").nth(1).unwrap().split("\n    }\n").next().unwrap();
-        let landed = collect.find("while !exchange.landed(&self.ticket)").expect("host-ordered collect waits for the reply");
-        let land = collect.find("exchange.land(self.ticket, self.stream.raw)").unwrap();
-        let drain = collect.find("if host_ordered && crate::shared::memory::chain::active() {").unwrap();
-        assert!(landed < land && land < drain, "reply wait, then landing and reduce, then the layer's stream wait");
-        // #815: no wait in the collect blocks the engine thread; the peer
-        // encoder lane must be able to issue its next layer meanwhile.
-        assert!(!collect.contains("cuda_stream_synchronize") && !collect.contains("chain::finish(")
-            && collect[landed..land].contains("tokio::task::yield_now().await"), "collect waits must yield");
+    fn host_ordered_passes_wait_once_per_layer_after_issuing_it() -> Result<()> {
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.trace_stream_queries(&library)?;
+        let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
+        let storage = DeviceAllocation::new(&library, 4)?;
+        let pass = StageChain::new(&library)?;
+        pass.set_device_order(false);
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        runtime.block_on(pass.handle().scope(async {
+            for layer in 0..2u8 {
+                let before = fixture.events()?.len();
+                // Router, request issue, shared FFN and reduce use the real
+                // chain/wait helpers over a CPU fake stream, in serving order.
+                // SAFETY: storage, source bytes and stream outlive every copy.
+                unsafe {
+                    library.copy_h2d_async(storage.buffer, &[layer; 4], stream.raw)?;
+                    chain::finish_or_wait(&stream, true).await?;
+                    library.copy_h2d_async(storage.buffer, &[layer; 4], stream.raw)?;
+                    library.copy_h2d_async(storage.buffer, &[layer; 4], stream.raw)?;
+                    assert!(!fixture.events()?[before..].contains('q'),
+                        "remote router must not wait before request/shared issue");
+                    library.copy_h2d_async(storage.buffer, &[layer; 4], stream.raw)?;
+                    chain::finish_cooperative(&stream).await?;
+                    chain::finish_or_wait(&stream, false).await?;
+                }
+                let events = fixture.events()?;
+                let work = &events[before..];
+                assert_eq!(work.chars().filter(|&v| v == 'q').count(), 1,
+                    "one host wait per completed remote layer: {work}");
+                assert!(work.rfind('Q').unwrap() < work.find('q').unwrap(),
+                    "completion wait must follow all issued work: {work}");
+                assert_eq!(work.chars().filter(|&v| v == 'Q').count(), 4);
+                stream.require_complete()?;
+            }
+            let before = fixture.events()?.len();
+            // Local layers retain the router's host completion point.
+            // SAFETY: the same live owners retain this queued copy.
+            unsafe {
+                library.copy_h2d_async(storage.buffer, &[0; 4], stream.raw)?;
+                chain::finish_or_wait(&stream, false).await?;
+            }
+            assert_eq!(&fixture.events()?[before..], "Qq");
+            Ok::<_, anyhow::Error>(())
+        }))?;
+        pass.drain()?;
+        stream.require_complete()?;
+        Ok(())
     }
 }
 

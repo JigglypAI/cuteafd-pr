@@ -16,7 +16,6 @@ use std::{ffi::c_void, rc::Rc};
 
 /// One stage in one lane. The containing chain owns its external capture stream.
 pub(super) struct RoutedWave<'w, 'a> {
-    stream: Stream<'a>,
     pair: pair::Pair<'a>,
     inputs: [Allocation<'a>;3],
     shared: Allocation<'a>,
@@ -33,13 +32,12 @@ impl<'w,'a> RoutedWave<'w,'a> {
     pub fn new(owner:&'w DsparkWeights<'a>,weights:[Rc<Weights<'a>>;2],stage:usize,capacity:u32)->Result<Self> {
         ensure!(stage<3 && owner.library.cuda_get_device()?==1,"draft TP2 transformer must reside on RTX1");
         let device=Device {library:owner.library,id:1};
-        Ok(Self {stream:Stream::new(device)?,pair:pair::Pair::new(weights,capacity,LAYOUT)?,
+        Ok(Self {pair:pair::Pair::new(weights,capacity,LAYOUT)?,
             inputs:[Allocation::new(device,capacity as usize*10240)?,Allocation::new(device,capacity as usize*12)?,Allocation::new(device,capacity as usize*12)?],
             shared:Allocation::new(device,capacity as usize*10240)?,owner,stage,capacity})
     }
-    pub fn stream(&self)->*mut c_void {self.stream.raw}
     pub fn peer_stream(&self)->Rc<Stream<'a>> {self.pair.peer_stream()}
-    pub fn synchronize(&self)->Result<()> {let root=self.stream.drain();let peer=self.pair.drain_peer();root.and(peer)}
+    pub fn synchronize(&self)->Result<()> {let root=self.owner.standalone.drain();let peer=self.pair.drain_peer();root.and(peer)}
     pub fn inputs(&self)->[CuteafdDeviceBuffer;3] {self.inputs.each_ref().map(|a|a.buffer)}
     pub fn output(&self)->CuteafdDeviceBuffer {self.pair.output()}
     /// Caller retains/drains external stream and destroys captured graphs first.

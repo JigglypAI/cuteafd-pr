@@ -92,7 +92,7 @@ impl<'a> DsparkStage<'_, 'a> {
         self.attention.prepare(window, requests)
     }
     unsafe fn enqueue(&mut self, read: &WindowRead, requests: usize) -> Result<()> {
-        unsafe { self.enqueue_on(read, requests, self.ffn.stream()) }
+        unsafe { self.enqueue_on(read, requests, self.ffn.stream()?) }
     }
     pub(super) fn output_storage(&self) -> [CuteafdDeviceBuffer; 2] {
         self.ffn.output_storage()
@@ -173,10 +173,10 @@ impl<'a> DsparkStage<'_, 'a> {
         }
         let read = self.prepare(window, requests)?;
         unsafe {
-            self.library.cuda_graph_begin_capture(self.ffn.stream())?;
+            self.library.cuda_graph_begin_capture(self.ffn.stream()?)?;
         }
         let launched = unsafe { self.enqueue(&read, requests.len()) };
-        let captured = unsafe { self.library.cuda_graph_end_capture(self.ffn.stream()) };
+        let captured = unsafe { self.library.cuda_graph_end_capture(self.ffn.stream()?) };
         self.invalidate();
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
@@ -207,7 +207,7 @@ impl<'a> DsparkStage<'_, 'a> {
             "dSpark stage capture binding differs"
         );
         self.attention.upload(&read, requests)?;
-        let launched = unsafe { self.library.cuda_graph_launch(graph, self.ffn.stream()) };
+        let launched = unsafe { self.library.cuda_graph_launch(graph, self.ffn.stream()?) };
         let drained = self.ffn.synchronize();
         launched.and(drained)?;
         unsafe {

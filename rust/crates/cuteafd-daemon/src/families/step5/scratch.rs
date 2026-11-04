@@ -20,11 +20,15 @@ impl BufferOwner for Plane<'_> {
 }
 
 #[derive(Clone)]
-pub(super) struct Arena<'a>(Rc<Allocation<'a>>);
+pub(super) struct Arena<'a>(Rc<Allocation<'a>>, Rc<crate::shared::memory::StandaloneStream<'a>>);
 impl<'a> Arena<'a> {
     pub fn new(device: Device<'a>, bytes: usize) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("step5_scratch_workspace");
-        Ok(Self(Rc::new(Allocation::new(device, bytes)?)))
+        Ok(Self(Rc::new(Allocation::new(device, bytes)?), Rc::new(crate::shared::memory::StandaloneStream::new(device))))
+    }
+
+    pub(super) fn standalone(&self) -> Rc<crate::shared::memory::StandaloneStream<'a>> {
+        self.1.clone()
     }
 
     pub fn poison_after(&self, keep: usize) -> Result<()> {
@@ -124,6 +128,25 @@ fn view_layout(capacity: usize, sizes: &[usize], offset: usize) -> Result<Vec<(u
 mod tests {
     use super::*;
     use cuteafd_loader::plan::families::step5::native;
+
+    #[test]
+    fn arena_components_share_one_lazy_standalone_stream() -> Result<()> {
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 0 };
+        let arena = Arena::new(device, 256)?;
+        let first = standalone(device, Some((&arena, 0)));
+        let second = standalone(device, Some((&arena, 128)));
+        assert!(Rc::ptr_eq(&first, &second));
+        first.drain()?;
+        assert!(!fixture.events()?.contains('V'));
+        assert_eq!(first.get()?.raw, second.get()?.raw);
+        assert_eq!(fixture.events()?.matches('V').count(), 1);
+        let lane = standalone(device, None);
+        assert_ne!(lane.get()?.raw, first.get()?.raw);
+        assert_eq!(fixture.events()?.matches('V').count(), 2);
+        Ok(())
+    }
 
     #[test]
     fn predictor_arena_spans_preserve_live_inputs_output_and_selected_tokens() -> Result<()> {
@@ -265,4 +288,12 @@ pub(super) fn planes<'a>(device: Device<'a>, sizes: &[usize],
         let owner = Rc::new(Allocation::new(device, bytes)?);
         Ok(Plane { buffer: owner.buffer, _owner: owner })
     }).collect()
+}
+
+/// Arena users share one standalone stream; a separately loaded owner/lane has
+/// its own lazy context. No CUDA stream is created while serving owners load.
+pub(super) fn standalone<'a>(device: Device<'a>, arena: Option<(&Arena<'a>, usize)>)
+    -> Rc<crate::shared::memory::StandaloneStream<'a>> {
+    arena.map_or_else(|| Rc::new(crate::shared::memory::StandaloneStream::new(device)),
+        |(arena, _)| arena.standalone())
 }

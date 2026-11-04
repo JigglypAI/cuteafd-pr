@@ -140,6 +140,7 @@ impl DsparkShape<'_> {
 
 pub(crate) struct DsparkWeights<'library> {
     library: &'library NativeLibrary,
+    standalone: std::rc::Rc<crate::shared::memory::StandaloneStream<'library>>,
     draft_width: usize,
     experts: ExpertStages<'library>,
     auxiliary: NativeRtxTensors<'library>,
@@ -159,7 +160,9 @@ pub(crate) struct PreparedDspark<'a> {
 }
 impl<'a> PreparedDspark<'a> {
     fn finish(self, experts: ExpertStages<'a>) -> DsparkWeights<'a> {
-        DsparkWeights { library: self.library, draft_width: self.draft_width, auxiliary: self.auxiliary,
+        DsparkWeights { standalone: std::rc::Rc::new(crate::shared::memory::StandaloneStream::new(
+            crate::shared::memory::device::Device { library: self.library, id: self.auxiliary.get("mtp.0.main_proj.weight").expect("validated draft main weight").device_id })),
+            library: self.library, draft_width: self.draft_width, auxiliary: self.auxiliary,
             budget: self.budget, shared_scales: self.shared_scales, grouped_output_scales: self.grouped_output_scales,
             projection_scales: self.projection_scales, experts }
     }
@@ -188,7 +191,7 @@ impl<'library> DsparkWeights<'library> {
         ensure!(stage < 3, "invalid dSpark expert stage");
         match &self.experts {
             ExpertStages::Tp2(weights) => Ok(DraftExperts::Tp2(tp2::RoutedWave::new(self,weights.clone(),stage,capacity)?)),
-            ExpertStages::Full(weights) => Ok(DraftExperts::Full(weights[stage].execution(capacity, capacity, self.expert_bytes(capacity)?)?)),
+            ExpertStages::Full(weights) => Ok(DraftExperts::Full(weights[stage].execution_external(capacity, capacity, self.expert_bytes(capacity)?)?)),
 
         }
     }
