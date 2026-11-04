@@ -1290,6 +1290,7 @@ mod tests {
         for gpus in 1..=2 {
             let mut drafting = native.clone();
             drafting.gpus = vec![drafting.gpus[0]; gpus];
+            drafting.loaded_weights.resize(gpus, ResidentWeights::default());
             drafting.drafter_bytes = 3 * GIB;
             drafting.drafter_staging = GIB;
             let request = request(&drafting).unwrap();
@@ -1304,6 +1305,7 @@ mod tests {
         let mut invalid = native.clone(); invalid.spark_ranks = 0;
         assert!(request(&invalid).is_err());
         let mut pair = native.clone(); pair.gpus.push(pair.gpus[0]);
+        pair.loaded_weights.push(ResidentWeights::default());
         assert!(request(&pair).is_ok());
         for ranks in 1..=8 {
             let mut supported = pair.clone(); supported.spark_ranks = ranks;

@@ -779,18 +779,23 @@ mod tests {
         use cuteafd_loader::plan::{plan, testing, ExpertPlacement, PlanOptions};
         use cuteafd_loader::plan::layout::LayoutOptions;
         use cuteafd_loader::families::qwen4::Qwen4KvCache;
-        use cuteafd_loader::placement::{families::qwen4, Baseline};
+        use cuteafd_loader::placement::{families::qwen4, Baseline, ResidentWeights};
         #[derive(Parser)]
         struct Cli {
             #[command(flatten)]
             engine: super::super::EngineArgs,
         }
         let snapshot = tempfile::tempdir()?;
-        // The coordinator headers serve-qwen4 loads: the planner charges their exact
-        // resident inventory and refuses a layout it cannot derive from them.
-        let config = testing::qwen4_config(48);
-        testing::write_snapshot(snapshot.path(), &config, &testing::qwen4_coordinator(&config, false), None);
+        // One full GDN/GQA cycle, with the same native target and expert owners
+        // the live single-GPU executor retains before pool admission.
+        let config = testing::qwen4_config(4);
+        let (mut tensors, metadata) = testing::qwen4_exl3(4, 4);
+        tensors.extend(testing::qwen4_coordinator(&config, false));
+        testing::write_snapshot(snapshot.path(), &config, &tensors, None);
+        testing::write_quantize_config(snapshot.path(), &metadata);
         let cfg = cuteafd_loader::families::qwen4::Qwen4Config::read(snapshot.path())?;
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open(snapshot.path())?;
+        let catalog = cuteafd_loader::read_expert_catalog(snapshot.path())?;
         for (capacity, kv_format) in [32_u64 << 30, 101_973_491_712].into_iter().flat_map(|capacity|
             [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].map(|format| (capacity, format))) {
             for (pool, concurrency) in [None, Some(32768)].into_iter()
@@ -815,10 +820,12 @@ mod tests {
                     "--pool-tokens", &pool.unwrap_or(0).to_string(), "--kv-cache", &kv_format.to_string()])?.engine;
                 args.planner_prefix_bytes = Some(0);
                 args.planner_graph_modes = Some((concurrency as usize, true));
-                let inputs = super::inputs(&args, &cfg, 48, false, None, None, 0)?;
+                let loaded_weights = super::single_weights(&args, &checkpoint, &cfg, cfg.layers, false)?
+                    .checked_add(qwen4::single_expert_weights(&catalog, cfg.layers, true, false)?)?;
+                let inputs = super::inputs(&args, &cfg, cfg.layers, false, None, None, 0)?;
                 let placement = qwen4::placement(&qwen4::QwenInputs {
-        loaded_weights: Default::default(),
-        resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, admission: inputs, capacity_bytes: capacity,
+                    loaded_weights, resident_weight_limit: Some(ResidentWeights::DEFAULT_LIMIT),
+                    spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, admission: inputs, capacity_bytes: capacity,
                     baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
                     max_context: context, requested_pool: pool, spark_ranks: 0,
                     startup_graph_modes: args.planner_graph_modes })?;
@@ -832,10 +839,10 @@ mod tests {
                 let admitted = device.items.iter().filter(|item| matches!(item.group.as_str(), "graphs" | "graph growth"))
                     .map(|item| item.bytes).sum::<u64>();
                 assert_eq!(admitted, graphs.bytes(0));
-                let inputs = super::inputs(&args, &cfg, 48, false, None, None, 0)?;
+                let inputs = super::inputs(&args, &cfg, cfg.layers, false, None, None, 0)?;
                 let mut invalid = qwen4::QwenInputs {
-        loaded_weights: Default::default(),
-        resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, admission: inputs, capacity_bytes: capacity,
+                    loaded_weights, resident_weight_limit: Some(ResidentWeights::DEFAULT_LIMIT),
+                    spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, admission: inputs, capacity_bytes: capacity,
                     baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
                     max_context: context, requested_pool: Some(layout.pool_tokens), spark_ranks: 0,
                     startup_graph_modes: Some((65, true)) };

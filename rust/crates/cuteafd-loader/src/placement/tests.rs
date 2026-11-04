@@ -52,6 +52,10 @@ fn resident_weight_cap_counts_loaded_facts_independently_of_allocation_and_categ
     req.fixed.push(Demand::new(0, Category::Weights, "runtime allocation, not a weight fact", GIB, Basis::Exact));
     let placed = solve(&req).unwrap();
     assert_eq!(placed.pool_tokens, 2 << 20);
+    assert!(placed.items[0].iter().all(|item| item.bytes > 0));
+    assert!(placed.items[0].iter().all(|item| item.group != "already loaded checkpoint"));
+    assert!(placed.items[0].iter().any(|item|
+        item.group == "runtime allocation, not a weight fact" && item.bytes == GIB));
     req.fixed.push(Demand::new(0, Category::Drafter, "loaded draft weight", 0, Basis::Exact)
         .with_resident_weights(ResidentWeights(1)));
     assert_eq!(solve(&req), Err(PlacementError::ResidentWeightLimit {
@@ -1693,11 +1697,22 @@ fn spark_budget_feeds_existing_tp2_pool_first_and_mark_selection() {
     assert_eq!(budget.minimum_rtx_layers().unwrap(), 2); // The asymmetric rank is binding.
     budget.constrain(&mut req).unwrap();
     assert_eq!(req.minimum_expert_layers, 2);
-    let (placed, marks) = solve_with_marks(&req, 4, 1, &marks).unwrap();
+    let (placed, selected_marks) = solve_with_marks(&req, 4, 1, &marks).unwrap();
     assert_eq!(placed.onboard_layers, 2);
     assert_eq!(placed.pool_tokens, 1 << 20);
-    assert_eq!(marks.slots, 3);
+    assert_eq!(selected_marks.slots, 3);
     assert!(placed.layers[..2].iter().all(|layer| layer.experts == ExpertHome::RtxTp2));
+    req.resident_weight_limit = Some(ResidentWeights(2 * GIB));
+    let (capped, capped_marks) = solve_with_marks(&req, 4, 1, &marks).unwrap();
+    assert_eq!(capped, placed);
+    assert_eq!(capped_marks.slots, selected_marks.slots);
+    req.resident_weight_limit = Some(ResidentWeights(2 * GIB - 1));
+    assert!(matches!(solve_with_marks(&req, 4, 1, &marks),
+        Err(PlacementError::ResidentWeightLimit { gpu: 0 | 1, required, limit })
+            if required == 2 * GIB && limit == 2 * GIB - 1));
+    assert_eq!(req.minimum_expert_layers, 2);
+    assert_eq!(req.pool.requested, Some(1 << 20));
+    req.resident_weight_limit = None;
     req.onboard = Onboard::Layers(1);
     let error = budget.constrain(&mut req).unwrap_err().to_string();
     assert!(error.contains("--rtx-expert-layers 1") && error.contains("--spark-budget-gib"));

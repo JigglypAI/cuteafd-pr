@@ -303,7 +303,8 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     let mut resident_weights = vec![ResidentWeights::default(); gpus];
     let charge = |items: &mut Vec<Vec<Item>>, used: &mut Vec<u64>, gpu: usize, item: Item| -> Result<(), PlacementError> {
         used[gpu] = used[gpu].checked_add(item.bytes).ok_or(Overflow("fixed demands"))?;
-        items[gpu].push(item);
+        // Resource-only facts describe baseline owners, not new allocations.
+        if item.bytes > 0 { items[gpu].push(item); }
         Ok(())
     };
     let context = modes.contains(&LayerMode::ContextSplit);
@@ -380,7 +381,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                     totals[index], Basis::Exact));
             }
             selected_fixed.extend(demands.iter().cloned());
-            for demand in demands {
+            for demand in demands.into_iter().filter(|demand| demand.bytes > 0) {
                 items[usize::from(demand.gpu)].push(demand.item());
             }
             movables.push((movable.id, gpu as u8));

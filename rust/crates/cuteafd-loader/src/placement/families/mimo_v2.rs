@@ -426,8 +426,6 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
     let mut drafter = Vec::new();
     let mut pool_overhead = Vec::new();
     for (rank, costs) in profile.devices.iter().enumerate() {
-        fixed.push(Demand::new(rank as u8, Category::Weights, "MiMo selected checkpoint owners", 0, Basis::Exact)
-            .with_resident_weights(inputs.resident_weights[rank]));
         for reservation in &costs.reservations {
             let demand = Demand::new(rank as u8, reservation_category(&reservation.name),
                 reservation_group(&reservation.name), reservation.bytes, Basis::Formula);
@@ -437,6 +435,9 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
         pool_overhead.push(costs.pool_unit_bytes.checked_sub(cache.ranks[rank].persistent_unit_bytes)
             .ok_or(PlacementError::Inventory("MiMo pool tables omit layer records"))?);
     }
+    fixed.extend(inputs.resident_weights.iter().enumerate().map(|(rank, &weights)|
+        Demand::new(rank as u8, Category::Weights, "MiMo selected checkpoint owners", 0, Basis::Exact)
+            .with_resident_weights(weights)));
     let mut tp2_workspace = inputs.tp2_workspace;
     if ranks == 2 && tp2_workspace.iter().any(|&bytes| bytes > 0) {
         let bytes = route_exchange_bytes(inputs.rows.max(64), inputs.cfg.topk as u64, inputs.lanes)
