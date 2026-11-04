@@ -666,7 +666,7 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                             whole: Bytes2::default(),
                             half: [Bytes2::default(); 2],
                             tp2: false,
-                            spark_ok: true,
+                            whole_supported: true, spark_ok: true,
                         })),
                     modes: vec![mode],
                 })

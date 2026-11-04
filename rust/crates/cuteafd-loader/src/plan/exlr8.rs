@@ -293,7 +293,7 @@ pub fn routed_expert_costs(input: &residency::MetadataInput, layers: &[usize])
                 staging: 0 })
         };
         Ok(ExpertCost { whole: resident(1, 0)?, half: [resident(2, 0)?, resident(2, 1)?],
-            tp2: true, spark_ok: true })
+            tp2: true, whole_supported: true, spark_ok: true })
     }).collect()
 }
 

@@ -269,7 +269,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         let experts = layer.checked_sub(first).and_then(|i| inputs.experts.get(i)).map(|cost| ExpertCost {
             whole: Bytes2 { resident: cost.resident_bytes, staging: cost.staging_bytes },
             half: inputs.experts_half.get(layer - first).map(|halves| halves.map(|h| Bytes2 { resident: h.resident_bytes, staging: h.staging_bytes })).unwrap_or_default(),
-            tp2: gpus == 2 && inputs.experts_half.get(layer - first).is_some(), spark_ok: true });
+            tp2: gpus == 2 && inputs.experts_half.get(layer - first).is_some(), whole_supported: true, spark_ok: true });
         LayerDemand {
             kind: AttentionClass::Csa,
             weights: inputs.weights.c4_attention[layer],

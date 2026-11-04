@@ -271,7 +271,7 @@ mod tests {
             headroom_bytes: 0, baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 } }],
             spark_ranks: 4, peer_access: false };
         let expert = placement::ExpertCost { whole: placement::Bytes2 { resident: 4 * GIB, staging: 8 * GIB },
-            half: Default::default(), tp2: false, spark_ok: true };
+            half: Default::default(), tp2: false, whole_supported: true, spark_ok: true };
         let mut request = v41::request(inventory, PoolPolicy::resolve(&[96 * GIB], 512, None, 512, false),
             vec![512 * 1024], vec![expert; 40], 16 * GIB, Onboard::Auto);
         request.fixed.push(Demand::new(0, Category::Weights, "backbone", 2 * GIB, Basis::Exact)

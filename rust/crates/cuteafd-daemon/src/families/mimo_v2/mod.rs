@@ -1070,7 +1070,7 @@ impl Opened {
                 let tensors = self.catalog.as_ref().and_then(|c| c.fp8()).context("MiMo expert headers")?;
                 let directory = preflight.expert_directory.as_deref().context("MiMo expert package")?;
                 let budgets = (0..2).map(|rank| {
-                    let plan = crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::plan(tensors, directory, rank,
+                    let plan = crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::plan(tensors, directory, &(tp2.first..tp2.first + tp2.layers).collect::<Vec<_>>(), rank,
                         args.prefill_rows.max(engine::DECODE_ROWS))?;
                     (tp2.peak_bytes[rank] as usize).checked_sub(plan.workspace_bytes)
                         .context("MiMo TP2 workspace exceeds admitted peak")

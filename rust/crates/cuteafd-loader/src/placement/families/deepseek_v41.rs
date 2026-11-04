@@ -354,7 +354,7 @@ fn expert_workspace(
                 whole: Bytes2::default(),
                 half: [Bytes2::default(); 2],
                 tp2: !local,
-                spark_ok: true,
+                whole_supported: true, spark_ok: true,
             };
             if local {
                 cost.whole = expert_cost(catalog, layer, 1, 0, stored)?;
@@ -650,7 +650,7 @@ mod tests {
                 staging: 16 << 20,
             }; 2],
             tp2: true,
-            spark_ok: true,
+            whole_supported: true, spark_ok: true,
         };
         let placement = solve(&request(
             inventory,
@@ -709,7 +709,7 @@ mod tests {
                 staging: 128,
             }; 2],
             tp2: true,
-            spark_ok: true,
+            whole_supported: true, spark_ok: true,
         };
         for gpus in [1, 2] {
             for prefix in [0, 1, 3, 19, 20, 21, 40] {
@@ -842,7 +842,7 @@ mod tests {
                 let loaded = (20u64 << 30) + 12345;
                 let capacity = 96u64 << 30;
                 let expert = ExpertCost { whole: Bytes2 { resident:1<<30,staging:3<<20 },
-                    half:[Bytes2 {resident:512<<20,staging:2<<20};2],tp2:ranks==2,spark_ok:true };
+                    half:[Bytes2 {resident:512<<20,staging:2<<20};2],tp2:ranks==2,whole_supported: true, spark_ok:true };
                 let build = |baseline| {
                     let mut req = request(Inventory { gpus:vec![GpuBudget {capacity_bytes:capacity,
                         headroom_bytes:2<<30,baseline};ranks], spark_ranks:4,peer_access:ranks==2 },
@@ -895,7 +895,7 @@ mod tests {
             baseline: Baseline::Measured { free_bytes: 80 << 30 } }; 2], spark_ranks: 4, peer_access: true };
         let pool = PoolPolicy::resolve(&[96 << 30; 2], 512, None, 512, false);
         let cost = ExpertCost { whole: Bytes2 { resident: 200 << 20, staging: 32 << 20 },
-            half: [Bytes2 { resident: 100 << 20, staging: 16 << 20 }; 2], tp2: true, spark_ok: true };
+            half: [Bytes2 { resident: 100 << 20, staging: 16 << 20 }; 2], tp2: true, whole_supported: true, spark_ok: true };
         let base = request(inventory, pool, vec![1 << 20; 2], vec![cost; 40], 64 << 20, Onboard::Layers(4));
         let movable = drafter(&DraftInventory { resident: 6 << 30,
             runtime: vec![Demand::new(1, Category::Drafter, "dSpark request lanes", 1 << 30, Basis::Formula)],

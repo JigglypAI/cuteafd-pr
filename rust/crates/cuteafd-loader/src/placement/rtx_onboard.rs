@@ -18,7 +18,7 @@ pub fn expert_costs(catalog: &crate::OfficialV41Catalog, tp2: bool) -> Result<Ve
     };
     (shape.first_layer..shape.layers).map(|layer| Ok(ExpertCost { whole: cost(layer, 1, 0)?,
         half: if tp2 { [cost(layer, 2, 0)?, cost(layer, 2, 1)?] } else { [Bytes2::default(); 2] },
-        tp2, spark_ok: true })).collect()
+        tp2, whole_supported: true, spark_ok: true })).collect()
 }
 
 /// fp8moe (FP8 block-128, NVFP4, MXFP4, BF16) residency over whole H128 blocks.
@@ -26,17 +26,23 @@ fn fp8_expert_costs(catalog: &crate::OfficialV41Catalog, tp2: bool) -> Result<Ve
     use crate::formats::fp8_experts::{Fp8Projection, Slicing};
     let fp8 = catalog.fp8().context("RTX onboarding needs EXL3 or fp8moe expert headers")?;
     let shape = catalog.routed_experts();
-    let cost = |tp, rank| -> Result<Bytes2> {
-        let resident = Fp8Projection::ALL.iter().try_fold(0u64, |sum, &p| -> Result<u64> {
-            let (w, _) = fp8.slice_bytes_with(p, tp, rank, Slicing::Blocks(128))?;
-            Ok(sum + (shape.experts * w).max(256) as u64
-                + fp8.scale_region_bytes_with(p, tp, rank, Slicing::Blocks(128))?.max(256) as u64)
-        })?;
-        Ok(Bytes2 { resident, staging: 0 })
-    };
-    (shape.first_layer..shape.layers).map(|_| Ok(ExpertCost { whole: cost(1, 0)?,
-        half: if tp2 { [cost(2, 0)?, cost(2, 1)?] } else { [Bytes2::default(); 2] },
-        tp2, spark_ok: true })).collect()
+    let coordinator = fp8.for_coordinator();
+    (shape.first_layer..shape.layers).map(|layer| {
+        let view = coordinator.for_layer_metadata(layer)?;
+        let supported = view.format() == fp8.format();
+        let cost = |tp, rank| -> Result<Bytes2> {
+            let resident = Fp8Projection::ALL.iter().try_fold(0u64, |sum, &p| -> Result<u64> {
+                let (w, _) = view.slice_bytes_with(p, tp, rank, Slicing::Blocks(128))?;
+                Ok(sum + (shape.experts * w).max(256) as u64
+                    + view.scale_region_bytes_with(p, tp, rank, Slicing::Blocks(128))?.max(256) as u64)
+            })?;
+            Ok(Bytes2 { resident, staging: 0 })
+        };
+        // One RTX executor owns one homogeneous package; other native formats stay on Sparks.
+        Ok(ExpertCost { whole: cost(1, 0)?,
+            half: if tp2 { [cost(2, 0)?, cost(2, 1)?] } else { [Bytes2::default(); 2] },
+            tp2: tp2 && supported, whole_supported: supported, spark_ok: true })
+    }).collect()
 }
 
 /// The installed RTX expert package's arena at `rows` for TP1 or TP2, plus

@@ -1881,7 +1881,7 @@ impl Opened {
                     let package = args.fp8_package.clone().unwrap_or_else(|| crate::shared::experts::fp8::package_directory(
                         &args.native_lib, 2, tensors.format()));
                     for rank in 0..2 { tp2_workspace[rank] = crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::plan(
-                        tensors, &package, rank, args.expert_rows())?.workspace_bytes as u64; }
+                        tensors, &package, &[tensors.shape().first_layer], rank, args.expert_rows())?.workspace_bytes as u64; }
                 } else {
                     let exl3 = catalog.exl3().context("EXL3 inventory")?;
                     let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib, exl3.decoder_tiers(), "rtx-tp2");
@@ -2275,7 +2275,7 @@ impl Opened {
                         let tensors = catalog.fp8().context("FP8 TP2 tensors")?;
                         let package = args.fp8_package.clone().unwrap_or_else(||
                             crate::shared::experts::fp8::package_directory(&args.native_lib, 2, tensors.format()));
-                        crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::plan(tensors, &package, rank,
+                        crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::plan(tensors, &package, &tp2_layers, rank,
                             args.expert_rows())?.workspace_bytes
                     };
                     budgets[rank].checked_sub(workspace).context("GLM Flash TP2 workspace exceeds admitted peak")

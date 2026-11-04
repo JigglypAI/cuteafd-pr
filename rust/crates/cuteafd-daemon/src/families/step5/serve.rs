@@ -49,7 +49,7 @@ impl OnboardBudget {
                         Exl3Tp2::workspace_bytes_for_selection(package, ExpertGeometry::STEP5.hidden as usize,
                             rows, Exl3RowPolicy::for_geometry(ExpertGeometry::STEP5), RtxSelectionPolicy::CanonicalDecode)?
                     } else {
-                        Fp8MoeTp2::plan(catalog.fp8().context("Step-5 FP8 expert tensors")?, package, rank, rows)?.workspace_bytes
+                        Fp8MoeTp2::plan(catalog.fp8().context("Step-5 FP8 expert tensors")?, package, layers, rank, rows)?.workspace_bytes
                     };
                     resident_budget(peaks[rank], workspace)
                 }).collect::<Result<Vec<_>>>()?;

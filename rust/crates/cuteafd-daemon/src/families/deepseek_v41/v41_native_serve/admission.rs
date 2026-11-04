@@ -669,7 +669,7 @@ pub(super) fn expert_demands(
                 whole: Bytes2::default(),
                 half: [Bytes2::default(); 2],
                 tp2: ranks == 2,
-                spark_ok: true,
+                whole_supported: true, spark_ok: true,
             };
             if ranks == 1 {
                 cost.whole = families::deepseek_v41::expert_cost(catalog, layer, 1, 0, stored)?;
@@ -945,7 +945,7 @@ mod admission_tests {
                 whole: Bytes2 { resident: 1 << 30, staging: 64 << 20 },
                 half: [Bytes2 { resident: 1 << 30, staging: 64 << 20 }; 2],
                 tp2: ranks == 2,
-                spark_ok: true,
+                whole_supported: true, spark_ok: true,
             }; 40];
             let roomy = vec![(80usize << 30, 96usize << 30); ranks];
             let all = resolve(&args, &roomy, experts.clone(), 64 << 20,
@@ -1176,7 +1176,7 @@ mod admission_tests {
             },
             half: [Bytes2::default(); 2],
             tp2: false,
-            spark_ok: true,
+            whole_supported: true, spark_ok: true,
         };
         let memory = [(80usize << 30, 96usize << 30)];
         let admitted = resolve(&args, &memory, vec![expert; 40], 600 << 20, &[0], 0, None)?;

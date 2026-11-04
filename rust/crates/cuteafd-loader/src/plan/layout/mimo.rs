@@ -371,9 +371,18 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
             "MiMo local experts need matching BF16 package manifest {}", path.display());
     }
     let whole = Bytes2 { resident: expert_layer_bytes(tensors, 1, 0, Slicing::Padded)?, staging: 0 };
-    let costs = cfg.dense.iter().map(|&dense| (!dense).then_some(ExpertCost {
-        whole, half, tp2: ranks == 2, spark_ok: spark_ranks > 0,
-    })).collect();
+    let costs = cfg.dense.iter().enumerate().map(|(layer, &dense)| -> anyhow::Result<_> {
+        if dense { return Ok(None); }
+        let view = tensors.for_coordinator().for_layer_metadata(layer)?;
+        let supported = view.format() == tensors.format();
+        let whole = Bytes2 { resident: expert_layer_bytes(&view, 1, 0, Slicing::Padded)?, staging: 0 };
+        let half = if ranks == 2 {
+            [Bytes2 { resident: expert_layer_bytes(&view, 2, 0, Slicing::Blocks(128))?, staging: 0 },
+             Bytes2 { resident: expert_layer_bytes(&view, 2, 1, Slicing::Blocks(128))?, staging: 0 }]
+        } else { [Bytes2::default(); 2] };
+        Ok(Some(ExpertCost { whole, half, tp2: ranks == 2 && supported,
+            whole_supported: supported, spark_ok: spark_ranks > 0 }))
+    }).collect::<anyhow::Result<Vec<_>>>()?;
     Ok((costs, workspace, tp2_workspace, onboard))
 }
 

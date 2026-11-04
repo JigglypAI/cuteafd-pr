@@ -411,7 +411,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
                 KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit / 2; 2], unit_bytes_context: None }
             } else { KvDemand::default() },
             fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false, colocate: None,
-            experts: Some(ExpertCost { whole: Bytes2 { resident: whole, staging: 0 }, half, tp2: pair, spark_ok: true }),
+            experts: Some(ExpertCost { whole: Bytes2 { resident: whole, staging: 0 }, half, tp2: pair, whole_supported: true, spark_ok: true }),
             modes: modes.to_vec(),
         })
     }).collect::<Result<Vec<_>>>()?;

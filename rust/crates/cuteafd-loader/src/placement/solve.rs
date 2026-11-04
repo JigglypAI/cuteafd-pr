@@ -875,6 +875,7 @@ fn place_experts(request: &PlacementRequest, available: &[u64], used: &[u64],
         let mut ordinal = 0;
         while next < limit {
             let Some(cost) = request.layers[next].experts else { next += 1; continue; };
+            if !cost.whole_supported { break; }
             let gpu = ordinal % request.expert_gpus.max(1);
             if gpu >= arenas.len() || counts[gpu] >= caps[gpu] { break; }
             let mut candidate = arenas[gpu].clone();
@@ -908,6 +909,7 @@ fn place_experts(request: &PlacementRequest, available: &[u64], used: &[u64],
         let mut placed = 0;
         while next < limit && placed < caps[gpu] {
             let Some(cost) = request.layers[next].experts else { next += 1; continue };
+            if !cost.whole_supported { break; }
             let mut candidate = trial.clone();
             candidate.open(request.expert_workspace);
             candidate.add(cost.whole, ResidentWeights(cost.whole.resident))?;

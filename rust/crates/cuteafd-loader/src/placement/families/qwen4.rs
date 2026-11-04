@@ -203,8 +203,10 @@ pub fn dual_expert_costs(catalog: &crate::OfficialV41Catalog, layers: usize)
             };
             Ok(Bytes2 { resident, staging: 0 })
         };
+        let supported = catalog.fp8().map(|tensors| tensors.layer_format(layer)
+            .map(|format| format == tensors.format())).transpose()?.unwrap_or(true);
         Ok(Some(ExpertCost { whole: bytes(1, 0)?, half: [bytes(2, 0)?, bytes(2, 1)?],
-            tp2: true, spark_ok: true }))
+            tp2: supported, whole_supported: supported, spark_ok: true }))
     }).collect()
 }
 
@@ -939,7 +941,7 @@ mod tests {
         cfg.mtp_layers = 1;
         let weights = vec![100 << 20; 48];
         let experts = vec![Some(ExpertCost { whole: Bytes2::default(),
-            half: [Bytes2 { resident: 600 << 20, staging: 64 << 20 }; 2], tp2: true, spark_ok: true }); 48];
+            half: [Bytes2 { resident: 600 << 20, staging: 64 << 20 }; 2], tp2: true, whole_supported: true, spark_ok: true }); 48];
         let layer_extra = vec![Vec::new(); 48];
         for mtp in [false, true] {
             let mut fixed = vec![Demand::new(0, Category::Weights, "owner0 head", 1 << 30, Basis::Exact)];
@@ -990,7 +992,7 @@ mod tests {
         let weights = vec![100 << 20; 48];
         let experts = vec![Some(ExpertCost { whole: Bytes2::default(),
             half: [Bytes2 { resident: 600 << 20, staging: 64 << 20 }, Bytes2 { resident: 400 << 20, staging: 32 << 20 }],
-            tp2: true, spark_ok: true }); 48];
+            tp2: true, whole_supported: true, spark_ok: true }); 48];
         for (kv_format, wire, fp8_projections) in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].into_iter()
             .flat_map(|kv| [false, true].into_iter().flat_map(move |wire|
                 [false, true].map(move |fp8| (kv, wire, fp8)))) {

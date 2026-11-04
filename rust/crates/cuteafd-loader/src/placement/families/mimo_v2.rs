@@ -260,7 +260,7 @@ mod tests {
             let spark = profile(true);
             let local = profile(false);
             let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
-                half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true };
+                half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, whole_supported: true, spark_ok: true };
             let inputs = MimoInputs {
         resident_weight_limit: None, resident_weights: vec![ResidentWeights::default(); ranks], automatic_context: false, cfg: &cfg, profile: &spark, layers: 4, kv: MimoKvFormats::default(),
                 mtp_stages: 0, gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 90 << 30 }); ranks],
@@ -372,7 +372,7 @@ mod tests {
                 }).collect(),
             };
             let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
-                half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true };
+                half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, whole_supported: true, spark_ok: true };
             for onboard in [Onboard::Auto, Onboard::Layers(2)] {
                 let inputs = MimoInputs {
         resident_weight_limit: None, resident_weights: vec![ResidentWeights::default(); ranks], automatic_context: false, cfg: &cfg, profile: &profile, layers: 4, kv: MimoKvFormats::default(),
