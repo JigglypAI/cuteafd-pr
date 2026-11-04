@@ -375,6 +375,8 @@ fn recorded_k6_operands_match_the_host_packer_on_mount_and_push() -> Result<()> 
     let mut invalid = LayerLayout::ranks_with_core(&model.cfg, 0, whole, &model.core, 1)?;
     *invalid[0].operands.get_mut("attention.score").unwrap() -= 1;
     *invalid[0].operands.get_mut("ffn.score").unwrap() += 1;
+    // The fake DSO creates its log lazily on the first native operation.
+    let _validation_stream = crate::shared::memory::device::Stream::new(device)?;
     let before = fixture.events()?;
     ensure!(records.layer_ranks(&[device], 0, &invalid).is_err(), "equal-total extent swap must fail");
     let valid = LayerLayout::ranks_with_core(&model.cfg, 0, whole, &model.core, 1)?;

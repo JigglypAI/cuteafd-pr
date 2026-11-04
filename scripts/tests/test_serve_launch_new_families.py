@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from test_run_family_dispatch import _family_launch_result, _snapshot
+from test_run_family_dispatch import _coordinator_gpus, _family_launch_result, _snapshot
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("wip_cards_new_families", ROOT / "scripts/bench/wip-cards.py")
@@ -82,6 +82,17 @@ def test_kimi_dispatches_to_serve_kimi_with_its_own_defaults(tmp_path: Path) -> 
     probe = next(i for i, line in enumerate(lines) if "dst=/opt/cuteafd-serve-probe" in line)
     assert lines[probe].endswith("serve-kimi --help ")
     assert probe < lines.index(plan)
+
+
+@pytest.mark.parametrize("gpus", [1, 2])
+def test_kimi_launch_uses_only_actual_physical_owners(tmp_path: Path, gpus: int) -> None:
+    result = _kimi(tmp_path, f"RTX_GPUS={gpus}\n", physical_gpus=tuple(range(gpus)))
+    serve = _line(result, "cuteafd serve-kimi --snapshot")
+    assert _coordinator_gpus(serve) == list(range(gpus))
+    assert _flag(serve, "--split-device") == ("1" if gpus == 2 else None)
+    if gpus == 2:
+        assert _flag(serve, "--device") == "0"
+    assert _flag(_line(result, "cuteafd plan"), "--rtx") == str(gpus)
 
 
 def test_kimi_forwards_typed_keys_when_set(tmp_path: Path) -> None:

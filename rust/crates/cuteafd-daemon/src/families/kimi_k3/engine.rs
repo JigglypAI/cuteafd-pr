@@ -70,12 +70,21 @@ fn check_exchange_handles(expected: [(i32, *mut std::ffi::c_void); 2],
     Ok(())
 }
 
-fn check_expert_owners(layers: &[cuteafd_loader::placement::LayerAssignment], owners: [&[usize]; 2]) -> Result<()> {
-    for rank in 0..2 {
+fn check_expert_owners<const RANKS: usize>(layers: &[cuteafd_loader::placement::LayerAssignment],
+    owners: [&[usize]; RANKS]) -> Result<()> {
+    use cuteafd_loader::placement::ExpertHome;
+    ensure!(matches!(RANKS, 1 | 2), "Kimi expert physical owner count");
+    ensure!(layers.iter().all(|layer| match layer.experts {
+        ExpertHome::RtxTp2 => RANKS == 2,
+        ExpertHome::RtxWhole { gpu } => RANKS == 1 && gpu == 0,
+        _ => true,
+    }), "Kimi expert placement differs from physical owner geometry");
+    for (rank, owned) in owners.iter().enumerate() {
         let expected = layers.iter().enumerate().filter_map(|(layer, assignment)|
-            (assignment.experts == cuteafd_loader::placement::ExpertHome::RtxTp2).then_some(layer))
+            (assignment.experts == ExpertHome::RtxTp2
+                || assignment.experts == ExpertHome::RtxWhole { gpu: rank as u8 }).then_some(layer))
             .collect::<Vec<_>>();
-        ensure!(owners[rank] == expected, "Kimi TP2 expert owners differ from accepted per-layer placement");
+        ensure!(*owned == expected, "Kimi expert owners differ from accepted per-layer placement");
     }
     Ok(())
 }
@@ -143,16 +152,16 @@ mod tests {
 impl<'a> Engine<'a> {
     /// Complete startup from the measured shared admission and already charged
     /// exchange owners. Worker reconciliation precedes ordinary lane connection.
-    pub(crate) fn load_admitted(library: &'a std::sync::Arc<cuteafd_ffi::NativeLibrary>,
-        exchange_streams: [Rc<Stream<'a>>; 2],
-        lane_streams: [Rc<Stream<'a>>; 2],
+    pub(crate) fn load_admitted<const RANKS: usize>(library: &'a std::sync::Arc<cuteafd_ffi::NativeLibrary>,
+        exchange_streams: [Rc<Stream<'a>>; RANKS],
+        lane_streams: [Rc<Stream<'a>>; RANKS],
         mut draft: Option<super::draft::NativeDraft<'a>>,
         mut admission: super::admission::Admission<'a>,
         checkpoint: &cuteafd_loader::plan::Checkpoint,
-        programs: [std::rc::Rc<super::device::NativePrograms<'a>>; 2],
-        peer: PeerExchange<'a>, hops: HopLink<'a>, peers: Vec<std::net::SocketAddr>,
+        programs: [std::rc::Rc<super::device::NativePrograms<'a>>; RANKS],
+        peer: Option<PeerExchange<'a>>, hops: Option<HopLink<'a>>, peers: Vec<std::net::SocketAddr>,
         config: cuteafd_transport::TcpTransportConfig,
-        mut expert_modules: [Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>; 2]) -> Result<Self> {
+        mut expert_modules: [Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>; RANKS]) -> Result<Self> {
         use crate::shared::placement::{spark_rings, SparkAdmission};
         use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
         use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission};
@@ -161,13 +170,22 @@ impl<'a> Engine<'a> {
         let coordinator_packing_cap = programs.iter().map(|programs| programs.packing_cap).min().unwrap_or(0);
         let plan = admission.execution_plan()?;
         cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
-        hops.validate_binding(&plan, &peer)?;
-        check_exchange_streams(&peer, &exchange_streams)?;
+        ensure!(matches!(RANKS, 1 | 2), "Kimi startup physical rank count");
         let devices = programs.each_ref().map(|programs| programs.device);
-        ensure!((0..2).all(|rank| devices[rank].id == peer.device(rank))
-            && std::ptr::eq(devices[0].library, devices[1].library)
-            && std::ptr::eq(devices[0].library, library.as_ref()),
+        ensure!(devices.iter().all(|device| std::ptr::eq(device.library, library.as_ref()))
+            && exchange_streams.iter().zip(devices).all(|(stream, device)|
+                stream.device.id == device.id && std::ptr::eq(stream.device.library, device.library)),
             "Kimi startup programs differ from exchange devices/library");
+        match (&peer, &hops) {
+            (Some(peer), Some(hops)) if RANKS == 2 => {
+                hops.validate_binding(&plan, peer)?;
+                check_exchange_streams(peer, &[exchange_streams[0].clone(), exchange_streams[1].clone()])?;
+                ensure!((0..RANKS).all(|rank| devices[rank].id == peer.device(rank)),
+                    "Kimi startup program devices differ from peer ranks");
+            }
+            (None, None) if RANKS == 1 => ensure!(plan.hops().is_empty(), "Kimi single owner cannot have hops"),
+            _ => anyhow::bail!("Kimi exchange inventory differs from physical rank count"),
+        }
         let rows = u32::try_from(admission.unit_rows())?;
         let endpoints = vec![SparkEndpoint { ring_depth: None, capacity: rows, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None };
             plan.spec().lanes as usize];
@@ -182,29 +200,29 @@ impl<'a> Engine<'a> {
         // Dense operands and TP2 halves land inside the Spark load (pushed as
         // coordinator ranks when the group pushes, else through the mount).
         let (pending, expert_weights, weights) = admission.start_and_load(spark, &peers, devices, checkpoint, &catalog,
-            [exchange_streams[0].raw, exchange_streams[1].raw])?;
+            exchange_streams.each_ref().map(|stream| stream.raw))?;
         let lanes = usize::try_from(plan.spec().lanes)?;
-        let mut allocated = (0..lanes).map(|lane| Ok([
-            admission.allocate_lane_on(devices[0], 0, lane, lane_streams[0].clone())?,
-            admission.allocate_lane_on(devices[1], 1, lane, lane_streams[1].clone())?,
-        ])).collect::<Result<Vec<_>>>()?;
-        let kda = [admission.allocate_kda(devices[0], 0)?, admission.allocate_kda(devices[1], 1)?];
-        let mla = [admission.allocate_mla(devices[0], 0)?, admission.allocate_mla(devices[1], 1)?];
+        let allocated = (0..lanes).map(|lane| (0..RANKS).map(|rank|
+            admission.allocate_lane_on(devices[rank], rank, lane, lane_streams[rank].clone()))
+            .collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
+        let kda = (0..RANKS).map(|rank| admission.allocate_kda(devices[rank], rank)).collect::<Result<Vec<_>>>()?;
+        let mla = (0..RANKS).map(|rank| admission.allocate_mla(devices[rank], rank)).collect::<Result<Vec<_>>>()?;
         let mut experts = Vec::with_capacity(lanes);
         let mut local = Vec::with_capacity(lanes);
         let mut io = Vec::with_capacity(lanes);
-        for (lane, [zero, one]) in allocated.drain(..).enumerate() {
-            experts.push([expert_weights[0].as_ref().map(|owner| owner.execution_with_modules(expert_modules[0].take())).transpose()?,
-                expert_weights[1].as_ref().map(|owner| owner.execution_with_modules(expert_modules[1].take())).transpose()?]);
-            local.push([admission.bind_local(0, lane, zero, programs[0].clone())?,
-                admission.bind_local(1, lane, one, programs[1].clone())?]);
-            io.push([admission.allocate_io(devices[0], 0, lane)?,
-                admission.allocate_io(devices[1], 1, lane)?]);
+        for (lane, allocated) in allocated.into_iter().enumerate() {
+            experts.push((0..RANKS).map(|rank| expert_weights[rank].as_ref()
+                .map(|owner| owner.execution_with_modules(expert_modules[rank].take())).transpose())
+                .collect::<Result<Vec<_>>>()?);
+            local.push(allocated.into_iter().enumerate().map(|(rank, allocated)|
+                admission.bind_local(rank, lane, allocated, programs[rank].clone())).collect::<Result<Vec<_>>>()?);
+            io.push((0..RANKS).map(|rank| admission.allocate_io(devices[rank], rank, lane))
+                .collect::<Result<Vec<_>>>()?);
         }
-        for pair in &experts {
+        for owners in &experts {
             use crate::shared::experts::rtx::RtxExpertLayer;
             check_expert_owners(&admission.placement.layers,
-                std::array::from_fn(|rank| pair[rank].as_ref().map_or(&[][..], |e| e.layers())))?;
+                std::array::from_fn::<_, RANKS, _>(|rank| owners[rank].as_ref().map_or(&[][..], |e| e.layers())))?;
         }
         // Admission charged this arena before allocation; retain its exact device owner.
         let draft_probe = draft.as_ref().map(|_| devices[0].own(||
@@ -212,17 +230,15 @@ impl<'a> Engine<'a> {
                 local[0][0].config().dense.clone(), local[0][0].config().topk, 64))).transpose()?;
         // Weak admission registries must not outlive these strong startup owners
         // until every persistent local binding has acquired the same operands.
-        if let Some(draft) = draft.as_mut() { draft.bind_target_ranks(weights.global.clone(), programs[1].clone())?; }
+        if let Some(draft) = draft.as_mut() { draft.bind_target_ranks(weights.global.clone(), programs[RANKS - 1].clone())?; }
         drop((weights, kda, mla));
         pending.wait()?;
         let world = SparkWorld::canonical(peers.len())?;
-        let routed = local.iter().map(|pair| admission.connect_spark(library, &pair[1],
+        let routed = local.iter().map(|owners| admission.connect_spark(library, &owners[RANKS - 1],
             world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?;
         let prefill = PrefillUnits { unit_rows: admission.unit_rows(), waves: admission.waves() };
-        let mut engine = Self::bind(exchange_streams.into(), plan, Some(peer), Some(hops),
-            local.into_iter().map(Vec::from).collect(), routed, io.into_iter().map(Vec::from).collect(),
-            experts.into_iter().map(Vec::from).collect(),
-            prefill, coordinator_packing_cap)?;
+        let mut engine = Self::bind(exchange_streams.into(), plan, peer, hops,
+            local, routed, io, experts, prefill, coordinator_packing_cap)?;
         engine.max_pool_tokens_no_onboard = Some(admission.placement.max_pool_tokens_no_onboard);
         engine.draft = draft.map(Rc::new);
         *engine.draft_probe.borrow_mut() = draft_probe;

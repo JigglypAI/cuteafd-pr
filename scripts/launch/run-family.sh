@@ -2478,8 +2478,6 @@ if [[ -n "$second" && "$split" != off ]]; then
     echo "note: $family ($model_type) has no head split; auto selected GPU $gpu alone" >&2
   fi
 fi
-[[ "$family" != kimi_k3 || "$head_split" == 1 ]] ||
-  release_die "Kimi K3 serves TP2 attention on two RTX GPUs; set RTX_GPUS=2"
 if [[ "$family" == qwen4 && "$attention_placement" == layers && "$head_split" != 1 ]]; then
   release_die "Qwen whole-layer attention requires a Spark-free coordinator pair"
 fi

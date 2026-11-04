@@ -1065,7 +1065,7 @@ pub(super) mod tests {
         let full_state = KdaLayout::for_ranks(&cfg, 2, admitted.mark_selection.slots as usize, 2, 1)?;
         assert_eq!(admitted.kda_layout, full_state);
         let plan = admitted.execution_plan()?;
-        assert_eq!((plan.spec().entry, plan.spec().head), (0, 0));
+        assert_eq!((plan.spec().entry_gpu, plan.spec().head_gpu), (0, 0));
         assert!(plan.hops().is_empty());
         assert!(admitted.placement.items[0].iter().all(|item|
             !item.group.contains("peer exchange") && !item.group.contains("hop link")));
