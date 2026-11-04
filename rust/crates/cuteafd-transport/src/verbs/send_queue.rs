@@ -268,7 +268,7 @@ mod tests {
                         row_index: route / geometry.topk, expert_id: route % geometry.topk,
                         gate_weight: 1.0 / geometry.topk as f32 }).collect(),
                     bytes::Bytes::from(vec![0; rows * geometry.row_bytes() as usize]))?;
-                request.header.flags |= crate::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+                request.header.flags |= crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
                 let format = if eligible { selected } else { Bf16 };
                 assert_eq!(request.select_combined_reply(selected)?.format, format);
                 let encoded = request.encode()?;
