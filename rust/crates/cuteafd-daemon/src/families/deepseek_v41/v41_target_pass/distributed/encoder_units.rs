@@ -92,6 +92,8 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
 }
 
 struct UnitSlot<'s, 'w, 'a> {
+    /// This slot's index in the prefill slot set (the scheduler poller's key).
+    index: usize,
     pass: &'s mut DistributedTargetPass<'w, 'a>,
     transport: &'s mut DeviceOwner<'a, NativeTp4Wave<'a>>,
     batch: Option<RequestBatch>,
@@ -101,7 +103,8 @@ struct UnitSlot<'s, 'w, 'a> {
     published: super::super::encoder_units::PublishedLayers<'a>,
     /// Its commit did not drain within the deadline. Drop must not synchronize
     /// on the abandoned stream (that would freeze the serving thread) or abort
-    /// the process; the slot's owners stay held until the process restarts.
+    /// the process; the batch is handed to the scheduler poller, which settles
+    /// the commit and releases the slot's owners.
     quarantined: bool,
 }
 #[cfg(test)]
@@ -147,7 +150,10 @@ impl Drop for UnitHooks<'_, '_, '_, '_> {
     fn drop(&mut self) {
         // Device-ordered units leave queued work (and cross-slot waits) on
         // every slot's chain: drain them all before any storage is released.
+        // A quarantined slot's chain is the abandoned stream: never synchronize
+        // on it (that would freeze the serving thread).
         for slot in &mut self.slots {
+            if slot.quarantined { continue; }
             if slot.pass.chain.is_some() {
                 crate::shared::decode_graph::fatal_drain(slot.pass.drain_chain(), "cancelled prefill unit chain");
             }
@@ -163,10 +169,16 @@ impl Drop for UnitHooks<'_, '_, '_, '_> {
         let mut requests = self.requests.borrow_mut();
         for slot in &mut self.slots {
             if slot.quarantined {
-                // The commit did not drain: never synchronize on the abandoned
-                // stream or release storage the device may still read. The
-                // slot's owners stay held until the process restarts.
-                tracing::error!("quarantined distributed encoder unit; its slot stays owned");
+                // The commit did not drain: hand the batch to the scheduler
+                // poller, which settles the abandoned stream and releases the
+                // slot's owners. Never synchronize on it here.
+                if let Some(batch) = slot.batch.take() {
+                    let accepted = super::super::encoder_units::member_rows(&batch).unwrap_or_default();
+                    for &lease in batch.leases() { requests.quarantine_lease(lease); }
+                    requests.prefill_quarantine.push(
+                        crate::families::deepseek_v41::v41_requests::QuarantinedPrefill {
+                            slot: slot.index, accepted, batch, drafts: Vec::new(), encoder: true });
+                }
                 continue;
             }
             if let Some(mut batch) = slot.batch.take() {
@@ -190,7 +202,9 @@ impl Drop for UnitHooks<'_, '_, '_, '_> {
         drop(requests);
         // Every exit (completion, error, cancel) leaves each drained slot at
         // rows from 0, so later non-unit work on slot 0 finds no stale window.
+        // A quarantined slot is reset by the scheduler poller once it settles.
         for slot in &mut self.slots {
+            if slot.quarantined { continue; }
             if let Err(error) = slot.select_window(crate::shared::memory::row_window::RowWindow::NONE) {
                 tracing::error!(%error, "resetting a prefill slot's window");
             }
@@ -449,11 +463,11 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         let mut hooks = UnitHooks {
             prefill,
             unit_rows,
-            slots: slots.into_iter().map(|(pass, transport)| {
+            slots: slots.into_iter().enumerate().map(|(index, (pass, transport))| {
                 pass.set_attention_decode(false);
                 let published = super::super::encoder_units::PublishedLayers::on_devices(library,
                     |layer| Ok(pass.resources.lanes[map.attention(layer)?].device.id))?;
-                Ok(UnitSlot { pass, transport, batch: None, prepared: None, started: Instant::now(), published,
+                Ok(UnitSlot { index, pass, transport, batch: None, prepared: None, started: Instant::now(), published,
                     quarantined: false })
             }).collect::<Result<Vec<_>>>()?,
             requests: RefCell::new(requests), lease, packed, chunks, suffix, ahead, keep_running, before_unit, complete: false,

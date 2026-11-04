@@ -3,7 +3,7 @@ use super::*;
 use crate::families::deepseek_v41::v41_backbone_cache::{CacheLease, CacheStage};
 use crate::families::deepseek_v41::v41_block::EncoderSuffix;
 use crate::shared::memory::device::DeviceOwner;
-use crate::families::deepseek_v41::v41_requests::RequestBatch;
+use crate::families::deepseek_v41::v41_requests::{QuarantinedPrefill, RequestBatch};
 use crate::families::deepseek_v41::v41_target_pass::{DistributedTargetPass, VerificationTarget};
 use speculative::DraftChain;
 use std::cell::RefCell;
@@ -65,6 +65,16 @@ impl<S> V41Prefill<S> {
 /// The decode share's chunk: one call, the indivisible unit `prompt_units`
 /// cuts (see [`V41PrefillTimes::encoder_unit`]).
 pub(crate) const ONE_CALL: ChunkBudget = ChunkBudget { target: Some(Duration::ZERO), row_cap: 0 };
+
+/// Register a timed-out prefill/encoder commit so the scheduler poller settles
+/// it, and hold its leases until then. Returns the error to propagate: the
+/// request fails, but its storage is never released under the abandoned stream.
+pub(crate) fn quarantine_prefill(requests: &mut Requests<'_>, slot: usize, batch: RequestBatch,
+    accepted: Vec<u32>, drafts: Vec<u64>, encoder: bool) -> anyhow::Error {
+    for &lease in batch.leases() { requests.quarantine_lease(lease); }
+    requests.prefill_quarantine.push(QuarantinedPrefill { slot, accepted, batch, drafts, encoder });
+    crate::shared::serve::lanes::CommitQuarantined.into()
+}
 
 /// The row spans of the calls a cold prompt of `tokens` prefills in from
 /// `cached`, one [`ONE_CALL`] unit at a time: the encoder's calls, then the
@@ -325,9 +335,10 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                 })();
                 if let Err(error) = &result {
                     // A quarantined commit keeps its storage: never discard it.
-                    if error.downcast_ref::<crate::shared::serve::lanes::CommitQuarantined>().is_none() {
-                        pass.discard(&mut batch)?;
+                    if error.downcast_ref::<crate::shared::serve::lanes::CommitQuarantined>().is_some() {
+                        return Err(quarantine_prefill(self.requests, 0, batch, vec![chunk.len() as u32], Vec::new(), false));
                     }
+                    pass.discard(&mut batch)?;
                 }
                 result?;
                 if matches!(unit.work, V41Unit::Single(_)) {
@@ -397,9 +408,13 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                     Ok(scores)
                 })();
                 if let Err(error) = &result {
-                    if error.downcast_ref::<crate::shared::serve::lanes::CommitQuarantined>().is_none() {
-                        pass.discard(&mut batch)?;
+                    if error.downcast_ref::<crate::shared::serve::lanes::CommitQuarantined>().is_some() {
+                        let drafts = if self.draft.is_some() {
+                            self.requests.cache().request_id(self.lease).ok().into_iter().collect()
+                        } else { Vec::new() };
+                        return Err(quarantine_prefill(self.requests, 0, batch, vec![rows], drafts, false));
                     }
+                    pass.discard(&mut batch)?;
                 }
                 console::Prefill::done(console::PrefillKind::Replay, 0, 0, 1, rows as usize, started);
                 tracing::debug!(target: "cuteafd::timing", rows, total_us=started.elapsed().as_micros() as u64, "target decoder replay");
@@ -512,6 +527,10 @@ pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
         suffix: Option<&Self::Suffix>) -> Result<Vec<u8>>;
     async fn commit_prefill<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, batch: &mut RequestBatch,
         draft: Option<&mut DraftRuntime<'_, 'a, C>>, accepted: u32) -> Result<()>;
+    /// Settle a quarantined encoder unit's pass once its commit drained: discard
+    /// its route rings and reset its row window. The 1x RTX path commits
+    /// synchronously and never quarantines, so its impl is a no-op.
+    fn settle_quarantined_encoder(_pass: &mut Self, _transport: &mut Self::Transport) -> Result<()> { Ok(()) }
 }
 impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
     type Suffix = EncoderSuffix<'a>;
@@ -632,6 +651,12 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
     async fn commit_prefill<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, batch: &mut RequestBatch,
         draft: Option<&mut DraftRuntime<'_, 'a, C>>, accepted: u32) -> Result<()> {
         self.commit_packed_prefill(requests, batch, draft, &[accepted]).await
+    }
+    fn settle_quarantined_encoder(pass: &mut Self, transport: &mut Self::Transport) -> Result<()> {
+        pass.discard_route_rings()?;
+        pass.select_window(crate::shared::memory::row_window::RowWindow::NONE)?;
+        let device = transport.device;
+        device.run(|| transport.get_mut().select_window(crate::shared::memory::row_window::RowWindow::NONE))
     }
     async fn commit_packed_prefill<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, batch: &mut RequestBatch,
         draft: Option<&mut DraftRuntime<'_, 'a, C>>, accepted: &[u32]) -> Result<()> {

@@ -11,21 +11,30 @@ pub(super) fn run<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(runtime: &to
     prefixes: &mut PrefixCache<'a>, receive: &mpsc::Receiver<NativeRequest>, wake: admission::Wake<'_>,
 ) -> Result<()> {
     // A commit that timed out keeps its pass busy until its device copies
-    // drain. Poll it (never synchronize) and skip the round while it is still
-    // pending, so the abandoned stream cannot wedge the lane.
+    // drain. Poll it (never synchronize) and skip only the quarantined lane:
+    // the other lane keeps serving, so a quarantine never freezes both lanes.
     if !requests.quarantine.is_empty() {
         poll_quarantine(first, second, requests, &mut draft, active)?;
-        if !requests.quarantine.is_empty() { return Ok(()); }
     }
+    let runnable = runnable_lanes(&requests.quarantine);
+    if !runnable[0] && !runnable[1] { return Ok(()); }
     let requests = RefCell::new(requests);
     let active = RefCell::new(active);
     let draft = RefCell::new(draft);
     let prefixes = RefCell::new(prefixes);
     let set = LaneSet::default();
     runtime.block_on(drive_lanes(&set, || requests.borrow().release_epoch(),
-        |lease, control| lane(lease, control, first, first_transport, &requests, &active, &draft, &prefixes, receive, wake),
-        |lease, control| lane(lease, control, second, second_transport, &requests, &active, &draft, &prefixes, receive, wake),
+        |lease, control| lane(lease, control, !runnable[0], first, first_transport, &requests, &active, &draft,
+            &prefixes, receive, wake),
+        |lease, control| lane(lease, control, !runnable[1], second, second_transport, &requests, &active, &draft,
+            &prefixes, receive, wake),
     ))
+}
+
+/// Which lanes may run a round: a lane whose pass owns a quarantined commit
+/// cannot, but the other lane keeps serving (a quarantine never freezes both).
+pub(super) fn runnable_lanes(quarantine: &[QuarantinedCommit]) -> [bool; 2] {
+    [!quarantine.iter().any(|entry| entry.lane == 0), !quarantine.iter().any(|entry| entry.lane == 1)]
 }
 
 /// Settle quarantined commits whose device copies have drained. Never
@@ -177,11 +186,15 @@ async fn retire_completed<M: round_failure::RoundMember, F: std::future::Future<
 
 #[allow(clippy::too_many_arguments)]
 async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease<'_>, mut control: LaneControl,
-    pass: &mut P, transport: &mut P::Transport, requests: &RefCell<&mut Requests<'a>>,
+    quarantined: bool, pass: &mut P, transport: &mut P::Transport, requests: &RefCell<&mut Requests<'a>>,
     active: &RefCell<&mut [Option<Active<'a>>]>, draft: &RefCell<Option<&mut DraftRuntime<'_, 'a, C>>>,
     prefixes: &RefCell<&mut PrefixCache<'a>>, receive: &mpsc::Receiver<NativeRequest>, wake: admission::Wake<'_>,
 ) -> Result<()> {
     let lane = lease.index();
+    // This lane's pass owns an abandoned commit: it cannot run a round until the
+    // scheduler's quarantine poll settles it. Return without stopping the peer,
+    // which keeps serving its own lane.
+    if quarantined { return Ok(()); }
     {
         let mut round_id = 0u64;
         loop {
@@ -500,8 +513,8 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
     // chose not to download.
     let cacheable = request.cacheable && prefixes.borrow().turn_bank_enabled()
         && requests.borrow().cache().request_id(request.lease).is_ok();
+    let mut timed_out = false;
     if cacheable {
-        let mut timed_out = false;
         let retained: Result<()> = async {
             let next = request.next_after_commit.as_ref().context("finished request has no retained logits")?;
             prefixes.borrow_mut().capture_session(request.job.usage.as_ref().map(|u| u.session_id().to_owned()));
@@ -544,12 +557,21 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
             tracing::warn!(%error, "completed request prefix was not retained");
         }
     }
-    let target = requests.borrow_mut().release_if_present(request.lease);
-    let speculative = draft.borrow_mut().as_deref_mut().map(|d| d.release(request.id())).transpose();
     if let Some(probe) = request.job.probe.as_ref().filter(|probe| probe.spec.record_state) {
         if let Err(error) = &state { probe.fail(format!("state diagnostic: {error:#}")); }
         probe.finish_state();
     }
+    if timed_out {
+        // The retain is quarantined: its copies are still in flight, so releasing
+        // now would fail on the pending copy and leak the slot (the next
+        // admission would then fail `request slot occupied`). Defer the release;
+        // `poll_quarantined_retains` retries it once the stream drains.
+        let id = super::super::prefix::draft_id(&*draft.borrow(), request.id());
+        prefixes.borrow_mut().defer_release(lane, request.lease, id);
+        return state;
+    }
+    let target = requests.borrow_mut().release_if_present(request.lease);
+    let speculative = draft.borrow_mut().as_deref_mut().map(|d| d.release(request.id())).transpose();
     target.and(speculative.map(|_| ())).and(state)
 }
 
@@ -590,10 +612,38 @@ pub(super) fn resume_due(rounds: u64, mut closed: impl Iterator<Item = bool>, ep
 
 #[cfg(test)]
 mod tests {
-    use super::{boundary, drive_lanes, retire_completed, retire_due, round_failure, Boundary, LaneControl};
+    use super::{boundary, drive_lanes, retire_completed, retire_due, round_failure, runnable_lanes,
+        Boundary, LaneControl};
+    use crate::families::deepseek_v41::v41_requests::{QuarantinedCommit, RequestBatch};
     use crate::shared::serve::lanes::{LaneLease, LaneSet};
     use super::admission::Wake;
     use std::cell::{Cell, RefCell};
+
+    /// A quarantine on one lane must not freeze the other: only the lane whose
+    /// pass owns the abandoned commit is skipped. (Fails at BASE, where `run`
+    /// returned early for any pending quarantine and served neither lane.)
+    #[test]
+    fn a_quarantine_on_one_lane_leaves_the_other_runnable() {
+        fn entry(lane: usize) -> QuarantinedCommit {
+            QuarantinedCommit { lane, accepted: Vec::new(), batch: RequestBatch::empty_for_test(), slots: Vec::new() }
+        }
+        assert_eq!(runnable_lanes(&[]), [true, true]);
+        assert_eq!(runnable_lanes(&[entry(0)]), [false, true], "lane 1 keeps serving");
+        assert_eq!(runnable_lanes(&[entry(1)]), [true, false], "lane 0 keeps serving");
+        assert_eq!(runnable_lanes(&[entry(0), entry(1)]), [false, false], "both quarantined: nothing runs");
+        // The production `run` skips exactly the lanes this reports.
+        let source = include_str!("independent.rs");
+        let run = &source[source.find("pub(super) fn run<").unwrap()..];
+        let run = &run[..run.find("/// Which lanes may run").unwrap()];
+        assert!(run.contains("let runnable = runnable_lanes(&requests.quarantine);"));
+        assert!(run.contains("if !runnable[0] && !runnable[1] { return Ok(()); }"));
+        assert!(run.contains("lane(lease, control, !runnable[0], first,"));
+        assert!(run.contains("lane(lease, control, !runnable[1], second,"));
+        let lane = &source[source.find("async fn lane<'a").unwrap()..];
+        let lane = &lane[..lane.find("let mut round_id = 0u64;").unwrap()];
+        assert!(lane.contains("if quarantined { return Ok(()); }"),
+            "the skipped lane returns without stopping its peer");
+    }
 
     /// A request of the lane model: its lane, stalled or not, client closed, rounds it still runs
     /// before finishing (its turn then frees units).
