@@ -171,7 +171,8 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     pub fn has_policy(&self) -> bool { self.policy.is_some() }
     /// What a verification round records: see [`round_capture`].
     pub fn capture(&self) -> Capture {
-        round_capture(self.policy.as_ref(), super::console::live().is_some())
+        round_capture(self.policy.as_ref(), super::console::live().is_some(),
+            crate::shared::draft::binding::replay_trace().is_some(), crate::shared::draft::timing_profile())
     }
     fn wants_confidence(&self) -> bool {
         self.policy.is_some() || tracing::enabled!(target: "cuteafd::draft_policy", tracing::Level::DEBUG)
@@ -677,43 +678,38 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
 
 }
 
-/// A policy-bound verification round captures route ids only for resource
-/// pricing or the replay trace, whatever the draft mode; simple and fixed modes
-/// skip them. Per-layer CUDA-event times and the FFN stage split come with the
-/// routes and also whenever a console viewer is connected (its layer profile
-/// and expert-stage panels), so a default launch keeps them while watched and
-/// skips them while nobody is.
-pub(crate) fn round_capture(policy: Option<&cuteafd_core::DraftPolicy>, console_live: bool) -> Capture {
-    let Some(policy) = policy else { return Capture::default() };
-    let routes = crate::shared::draft::binding::needs_routes(policy);
-    Capture { routes, timing: routes || console_live }
+/// Observers use host round timestamps. Replay routes are read after the pass;
+/// only resource pricing or an explicit timing profile requests layer events.
+pub(crate) fn round_capture(policy: Option<&cuteafd_core::DraftPolicy>, _console_live: bool,
+    replay: bool, profiling: bool) -> Capture {
+    let Some(policy) = policy else { return Capture { routes: false, timing: profiling } };
+    Capture { routes: policy.needs_routes() || replay, timing: policy.needs_routes() || profiling }
 }
 
 #[cfg(test)]
 mod restored_prefix_tests {
     use super::*;
 
-    /// Simple and fixed rounds never capture route ids; a connected console
-    /// still gets per-layer times and the FFN stage split in every mode, and an
-    /// unwatched simple or fixed round records neither. The priced policy
-    /// captures both, watched or not.
     #[test]
-    fn console_keeps_layer_times_in_every_draft_mode() {
+    fn observation_and_replay_do_not_enable_layer_timing() {
         use cuteafd_core::{DraftMode, DraftPolicy, PolicySeed};
-        assert_eq!(round_capture(None, true), Capture::default());
         let geometry = super::policy::remote_geometry(7);
         for (mode, fixed, priced) in [(DraftMode::Simple, false, false), (DraftMode::SimpleRc, false, false),
             (DraftMode::SimpleDerived, false, false), (DraftMode::Shared, true, false), (DraftMode::Shared, false, true)] {
             let mut policy = DraftPolicy::new(geometry.clone(), PolicySeed::weak(7), fixed).unwrap();
             policy.set_draft_mode(mode);
-            // The replay trace (SPECULATION_TRACE) forces routes; this test runs without it.
-            let traced = crate::shared::draft::binding::needs_routes(&policy) && !priced;
-            assert!(!traced, "{mode:?} fixed={fixed}: unexpected route need");
-            let watched = round_capture(Some(&policy), true);
-            let unwatched = round_capture(Some(&policy), false);
-            assert_eq!(watched, Capture { routes: priced, timing: true }, "{mode:?} fixed={fixed} watched");
-            assert_eq!(unwatched, Capture { routes: priced, timing: priced }, "{mode:?} fixed={fixed} unwatched");
+            for watched in [false, true] {
+                for replay in [false, true] {
+                    for profiling in [false, true] {
+                        assert_eq!(round_capture(Some(&policy), watched, replay, profiling),
+                            Capture { routes: priced || replay, timing: priced || profiling },
+                            "{mode:?} fixed={fixed} watched={watched} replay={replay} profiling={profiling}");
+                    }
+                }
+            }
         }
+        assert_eq!(round_capture(None, true, false, false), Capture::default());
+        assert_eq!(round_capture(None, true, false, true), Capture { routes: false, timing: true });
     }
     #[test]
     fn long_tail_stats_count_only_judged_positions() {

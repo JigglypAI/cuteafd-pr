@@ -613,7 +613,7 @@ async fn complete_ffn<T>(
 pub(crate) struct Capture {
     /// Route ids per layer (router ring, staged ids): the priced policy and the replay trace.
     pub routes: bool,
-    /// Per-layer CUDA-event times and the FFN stage split (implied by `routes`).
+    /// Per-layer CUDA-event times and the FFN stage split, independent of routes.
     pub timing: bool,
 }
 
@@ -1265,13 +1265,11 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         self.capture_timing = false;
         self.router.set_ring_capture(false);
     }
-    /// Before a pass: route ids only for the priced policy or the replay
-    /// trace; timing also while a console viewer is connected (its layer and
-    /// expert-stage panels). Always clears the previous pass's marks, so an
+    /// Before a pass: route ids for pricing or replay, timing only for pricing
+    /// or explicit profiling. Always clears the previous pass's marks, so an
     /// untimed pass reports no layer times rather than stale ones.
     pub fn set_capture(&mut self, capture: Capture) {
         let Capture { routes, timing } = capture;
-        let timing = timing || routes;
         self.capture_routes = routes;
         self.capture_timing = timing;
         self.router.set_ring_capture(routes);
