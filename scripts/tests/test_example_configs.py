@@ -24,7 +24,7 @@ TP_EP = {"tp2ep2-native.config", "tp2ep3-native.config", "tp3ep1-native.config",
 # WIP qualification configs for families without a release card yet (#273, #274):
 # served from ./wip.sh slots only, checked by test_serve_launch_new_families.py.
 ML4_QUALIFICATION = {f"mistral-large4-exl3-k4-core-k6-{size}.config" for size in ("min", "max")}
-QUALIFICATION = {"kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config",
+QUALIFICATION = {"kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-min.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config",
                  "muse-spark-exl3-min.config", "muse-spark-exl3-max.config",
                  "step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config"} | ML4_QUALIFICATION
 V4_PREP = {"qwen35-9b-bf16-min.config", "glm53-exlr8-min.config", "glm53-exlr8-max.config",
@@ -727,7 +727,7 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
         ("v41-flash-max", 2, 6), ("v41-flash-reference-tp4", 1, 4),
         ("v4-flash-reference-tp4", 1, 4), ("glm53-exl3-max", 2, 6),
         ("glm53-exlr8-min", 1, 4), ("glm53-exlr8-max", 2, 6), ("glm53-exlr8-a8-max", 2, 6),
-        ("kimi-k3-max", 2, 6), ("step5-fp8-max", 2, 6),
+        ("kimi-k3-min", 1, 6), ("kimi-k3-max", 2, 6), ("step5-fp8-max", 2, 6),
         ("step5-nvfp4-min", 1, 4), ("step5-exl3-k6core-min", 1, 3), ("step5-exl3-k6core-max", 2, 6),
         ("qwen38-27b-bf16-min", 1, 0),
         ("qwen38-27b-fp8-min", 1, 0), ("qwen35-9b-bf16-min", 1, 0),

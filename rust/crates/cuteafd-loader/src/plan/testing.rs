@@ -1116,7 +1116,8 @@ pub fn write_kimi_installed_inventory(root: &std::path::Path, spark: bool) -> st
         if !spark { programs.push(json!({"name":name,"geometry":geometry,"object_sha256":"b".repeat(64)})); }
     }
     if !spark {
-        for (name, bytes) in [("kimik3_kda_m64", 8_673_280), ("kimik3_kda_m4096", 629_464_064)] {
+        for (name, bytes) in [("kimik3_kda_m64", 8_673_280), ("kimik3_kda_m4096", 629_464_064),
+            ("kda_fused_h96_m64", 17_330_176), ("kda_fused_h96_m4096", 1_182_153_728)] {
             programs.push(json!({"name":name,"scratch_bytes_at_capacity":{"scratch":bytes}}));
         }
         for (suffix, producer, output, attention) in [("",92_798_976,100_663_296,50_528_256),

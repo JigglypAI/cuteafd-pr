@@ -49,6 +49,50 @@ fn planner_timings_charge_metadata_once_and_preserve_reports() {
 }
 
 #[test]
+fn plan_manifest_cache_parses_each_path_once_across_candidates() {
+    let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let input = PlanInput::open(dir.path()).unwrap();
+    let options = wave_plan_options(dir.path(), 6);
+    let programs = options.layout.as_ref().unwrap().workspace_manifest.as_ref().unwrap().clone();
+    std::fs::write(&programs, json!({"capacities":{"prefill_rows":4096,"decode_rows":64}}).to_string()).unwrap();
+    for rows in [1024, 2048, 1024] {
+        let mut candidate = options.clone();
+        candidate.layout.as_mut().unwrap().prefill_rows = rows;
+        input.plan(&candidate).unwrap();
+    }
+    assert_eq!(input.manifests.parses.lock().unwrap().get(&programs), Some(&1));
+    let original = input.manifest(&programs).unwrap();
+    std::fs::write(&programs, "not JSON").unwrap();
+    assert!(std::sync::Arc::ptr_eq(&original, &input.manifest(&programs).unwrap()));
+
+    let package = dir.path().join("capacities");
+    for capacity in cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
+        .capacities(1024).unwrap() {
+        let path = package.join(format!("m{capacity}/v41_exl3.json"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, json!({"hidden":3584,"intermediate":3072,"experts":896,
+            "top_k":16,"capacity":capacity,"output_dtype":"fp32","input_format":"e4m3_k32",
+            "trellis_lut":{"bytes":32},"buffers":{"scratch":{"allocation":"scratch",
+                "bytes":capacity * 64,"dtype":"f32","zero_on_create":false}}}).to_string()).unwrap();
+    }
+    for rows in [256, 1024, 512, 1024] {
+        let cached = crate::families::kimi_k3::allocation::expert_workspace_for_ranks_with(
+            &package, rows, 1, |path| input.manifest(path)).unwrap();
+        let direct = crate::families::kimi_k3::allocation::expert_workspace_for_ranks(&package, rows, 1).unwrap();
+        assert_eq!(cached, direct);
+    }
+    assert!(input.manifests.parses.lock().unwrap().values().all(|&count| count == 1));
+    let fresh = PlanInput::open(dir.path()).unwrap();
+    assert!(fresh.manifest(&programs).is_err());
+    std::fs::write(&programs, "{}").unwrap();
+    assert!(fresh.manifest(&programs).is_err());
+    assert_eq!(fresh.manifests.parses.lock().unwrap().get(&programs), Some(&1));
+    let separate = dir.path().join("other.json");
+    std::fs::write(&separate, "{}").unwrap();
+    assert_eq!(*fresh.manifest(&separate).unwrap(), json!({}));
+}
+
+#[test]
 fn report_census_reuses_only_checkpoint_facts_across_options() {
     let mut tensors = mimo_flash_tensors();
     tensors.extend([
@@ -208,7 +252,7 @@ fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
         let mut options = layout::LayoutOptions { host_memory: Some((total << 30, total << 30)),
             full_prefill_logits: true, context_tokens: 1 << 40,
             prefill_unit_rows: Some(4096), ..Default::default() };
-        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        layout::charge_host(&mut report, &options, &input, false).unwrap();
         let host = report.host_ledger.as_ref().unwrap();
         assert_eq!(report.host_budget_bytes, expected << 30);
         assert_eq!(host.host_budget_bytes, report.host_budget_bytes);
@@ -219,15 +263,15 @@ fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
         assert!(host.host_budget_bytes + host.deferred_bytes + host.reserve_bytes <= host.total_bytes);
         assert_eq!(host.shortfall_bytes, 0);
         options.host_memory = Some((total << 30, 8 << 30));
-        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        layout::charge_host(&mut report, &options, &input, false).unwrap();
         assert!(!report.fits);
         assert!(report.host_ledger.as_ref().unwrap().shortfall_bytes > 0);
         assert!(report.hints.iter().any(|h| h.what.contains("coordinator host memory shortfall")));
         options.host_cache_bytes = Some(40 << 30);
-        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        layout::charge_host(&mut report, &options, &input, false).unwrap();
         assert_eq!(report.host_budget_bytes, 40 << 30); // Explicit quota bypasses both caps.
         options.host_cache_bytes = Some(0);
-        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        layout::charge_host(&mut report, &options, &input, false).unwrap();
         assert_eq!(report.host_budget_bytes, 0);
     }
 }
@@ -257,7 +301,7 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
         depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
     // Two endpoints per rank (decode link + one prefill link) over six ranks.
     let expected = endpoint.ring_bytes(geometry, rings).unwrap() as u64 * 2 * 6;
-    layout::charge_host(&mut report, &options, input.checkpoint(), true).unwrap();
+    layout::charge_host(&mut report, &options, &input, true).unwrap();
     let host = report.host_ledger.as_ref().unwrap();
     let registered = host.items.iter().find(|i| i.group == "transport/rdma-rings").unwrap();
     assert_eq!(registered.bytes, expected);
@@ -266,7 +310,7 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
     assert_eq!(intake.bytes, 4096 * geometry.hidden as u64 * 4 * 2 * 6);
     assert_eq!(host.shortfall_bytes, 0);
     report.spark_ranks = 0;
-    layout::charge_host(&mut report, &options, input.checkpoint(), true).unwrap();
+    layout::charge_host(&mut report, &options, &input, true).unwrap();
     assert!(!report.host_ledger.as_ref().unwrap().items.iter()
         .any(|i| matches!(i.group.as_str(), "transport/rdma-rings" | "spark-intake")));
 }
@@ -342,7 +386,7 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
             report.prefill_span_rows = Some(span);
             for family in ["glm5", "glm5_flash"] {
                 report.family = Some(family.into());
-                layout::charge_host(&mut report, &options, input.checkpoint(), native).unwrap();
+                layout::charge_host(&mut report, &options, &input, native).unwrap();
                 assert_eq!(report.prefill_span_rows, Some(span));
                 let host = report.host_ledger.as_ref().unwrap();
                 let bytes = |name: &str| host.items.iter().find(|i| i.group == name).unwrap().bytes;
@@ -807,7 +851,8 @@ fn shared_prefill_public_plan_honors_a_real_manifest_unit_bound() {
 fn shared_prefill_family_estimates_match_runtime_and_pins_keep_hard_limits() {
     use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillError, PrefillOverrides};
     let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
-    let mut report = plan(dir.path(), &wave_plan_options(dir.path(), 6)).unwrap();
+    let input = PlanInput::open(dir.path()).unwrap();
+    let mut report = input.plan(&wave_plan_options(dir.path(), 6)).unwrap();
     let manifest = dir.path().join("bounded.json");
     std::fs::write(&manifest, r#"{"capacities":{"prefill_rows":1024}}"#).unwrap();
     for family in family::registry() {
@@ -821,7 +866,7 @@ fn shared_prefill_family_estimates_match_runtime_and_pins_keep_hard_limits() {
                 unit_rows: (unit != 0).then_some(unit), waves: (waves != 0).then_some(waves), span_rows: None,
                 reserve_rows: None,
             }).unwrap();
-            let shape = layout::resolve_prefill(&mut report, &mut options, 6, limits).unwrap();
+            let shape = layout::resolve_prefill(&input, &mut report, &mut options, 6, limits).unwrap();
             assert_eq!(shape, daemon, "planner/daemon prefill mismatch: {}", family.id());
             let expected = daemon.unit_rows;
             assert_eq!((options.prefill_rows, options.spark_capacity_rows), (expected, expected));
@@ -832,7 +877,7 @@ fn shared_prefill_family_estimates_match_runtime_and_pins_keep_hard_limits() {
         options.workspace_manifest = Some(manifest.clone());
         options.prefill_rows = 2048;
         options.prefill_lanes = 2;
-        let error = layout::resolve_prefill(&mut report, &mut options, 6, limits).unwrap_err();
+        let error = layout::resolve_prefill(&input, &mut report, &mut options, 6, limits).unwrap_err();
         assert!(matches!(error.downcast_ref::<PrefillError>(),
             Some(PrefillError::ExecutorCapacity { max_unit_rows: 1024, .. })), "{}: {error}", family.id());
     }
@@ -842,7 +887,8 @@ fn shared_prefill_family_estimates_match_runtime_and_pins_keep_hard_limits() {
 fn every_family_caps_the_shared_reserve_only_to_fit_a_fake_card() {
     use crate::serving_capacity::prefill_waves::{depth, unit_rows_in, RESERVE_ROWS, ROW_PAGE};
     let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
-    let template = plan(dir.path(), &wave_plan_options(dir.path(), 6)).unwrap();
+    let input = PlanInput::open(dir.path()).unwrap();
+    let template = input.plan(&wave_plan_options(dir.path(), 6)).unwrap();
     for family in family::registry() {
         let limits = family.prefill_limits();
         let waves = depth(6, limits);
@@ -856,7 +902,7 @@ fn every_family_caps_the_shared_reserve_only_to_fit_a_fake_card() {
                 let mut report = template.clone();
                 let mut options = wave_plan_options(dir.path(), 6).layout.unwrap();
                 options.prefill_reserve_rows = Some(reserve);
-                let shape = layout::resolve_prefill(&mut report, &mut options, 6, limits).unwrap();
+                let shape = layout::resolve_prefill(&input, &mut report, &mut options, 6, limits).unwrap();
                 assert_eq!(shape.waves, waves, "{}", family.id());
                 assert_eq!(options.spark_capacity_rows, shape.unit_rows);
                 Ok((1024 + shape.span_rows <= capacity).then_some((reserve, shape)))
@@ -1041,13 +1087,13 @@ fn spark_host_layout_requires_explicit_family_unit_even_for_one_wave() {
             report.prefill_span_rows = Some(2048 * waves);
             let mut options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 host_cache_bytes: Some(0), prefill_rows: 4096, prefill_waves: waves, ..Default::default() };
-            let error = layout::charge_host(&mut report, &options, input.checkpoint(), native).unwrap_err();
+            let error = layout::charge_host(&mut report, &options, &input, native).unwrap_err();
             assert!(error.to_string().contains("requires family-resolved prefill_unit_rows"), "{error:#}");
             assert_eq!(report.prefill_span_rows, Some(2048 * waves));
             options.prefill_unit_rows = Some(0);
-            assert!(layout::charge_host(&mut report, &options, input.checkpoint(), native).is_err());
+            assert!(layout::charge_host(&mut report, &options, &input, native).is_err());
             options.prefill_unit_rows = Some(2048);
-            layout::charge_host(&mut report, &options, input.checkpoint(), native).unwrap();
+            layout::charge_host(&mut report, &options, &input, native).unwrap();
             assert_eq!(report.prefill_span_rows, Some(2048 * waves));
         }
     }
@@ -1088,7 +1134,7 @@ fn host_automatic_quota_depends_on_concurrency_not_device_entries() {
             let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 context_tokens: 1 << 20, concurrency, mimo_prefix_entries: entries,
                 prefill_unit_rows: Some(4096), ..Default::default() };
-            layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+            layout::charge_host(&mut report, &options, &input, false).unwrap();
             assert_eq!(report.host_budget_bytes, expected);
         }
     }
@@ -1125,7 +1171,7 @@ fn host_media_quota_is_charged_only_for_supported_loaded_towers() {
         report.encoder = placement(vision);
         report.audio_encoder = placement(audio);
         options.media_cache_bytes = quota;
-        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        layout::charge_host(&mut report, &options, &input, false).unwrap();
         let media: u64 = report.host_ledger.as_ref().unwrap().items.iter()
             .filter(|item| item.group == "media/embedding-cache").map(|item| item.bytes).sum();
         assert_eq!(media, expected);
@@ -1136,7 +1182,7 @@ fn host_media_quota_is_charged_only_for_supported_loaded_towers() {
     for admitted in [None, placement(MediaMode::Off)] {
         report.encoder = admitted.clone();
         report.audio_encoder = admitted;
-        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        layout::charge_host(&mut report, &options, &input, false).unwrap();
         assert!(!report.host_ledger.as_ref().unwrap().items.iter()
             .any(|item| item.group == "media/embedding-cache"));
     }
@@ -1155,7 +1201,7 @@ fn host_full_logits_charge_gather_and_live_lane_but_not_mimo_pipeline() {
     for (family, rows) in [("mimo_v2", 4096u64), ("glm5_flash", 4096), ("glm5", 4096)] {
         report.family = Some(family.into());
         report.prefill_transports = None;
-        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        layout::charge_host(&mut report, &options, &input, false).unwrap();
         let logits = report.host_ledger.as_ref().unwrap().items.iter()
             .find(|item| item.group == "scoring/full-logits").unwrap().bytes;
         assert_eq!(logits, rows * vocab * 4, "{family}");
@@ -2753,12 +2799,14 @@ fn v4_egress_is_exact_registered_host_memory_not_a_gpu_demand() {
     let path = dir.path().join("PROGRAMS.json");
     for decode in [32, 64] {
         std::fs::write(&path, json!({"capacities": {"decode_rows": decode}}).to_string()).unwrap();
+        // Each installed-artifact version belongs to a fresh planning input.
+        let input = PlanInput::open(dir.path()).unwrap();
         for (unit, waves) in [(2752, 3), (4096, 2)] {
             let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 host_cache_bytes: Some(0), prefill_unit_rows: Some(unit), prefill_waves: waves,
                 workspace_manifest: Some(path.clone()), ..Default::default() };
             report.spark_ranks = 4;
-            layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+            layout::charge_host(&mut report, &options, &input, false).unwrap();
             let egress = report.host_ledger.as_ref().unwrap().items.iter()
                 .find(|i| i.group == "transport/egress").unwrap().bytes;
             let expected = geometry.compact_wire_bytes(unit as u32, false).unwrap().0 as u64 * waves
@@ -2767,7 +2815,7 @@ fn v4_egress_is_exact_registered_host_memory_not_a_gpu_demand() {
             assert_ne!(egress, geometry.compact_wire_bytes(unit as u32, false).unwrap().0 as u64 * waves * 2,
                 "the decode endpoint must not reserve another prefill-sized slot per wave");
             report.spark_ranks = 0;
-            layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+            layout::charge_host(&mut report, &options, &input, false).unwrap();
             assert!(!report.host_ledger.as_ref().unwrap().items.iter().any(|i| i.group == "transport/egress"));
         }
     }

@@ -25,7 +25,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
     exlr8: Option<(&crate::plan::exlr8::native::DenseFacts, &crate::plan::exlr8::residency::MetadataInput)>) -> MemoryLayout {
     let auto_vision_retry = (report.spark_ranks == 0 && report.vision == super::super::MediaMode::Auto)
         .then(|| (report.clone(), options.clone()));
-    let prefill = match resolve_prefill(report, options, report.spark_ranks,
+    let prefill = match resolve_prefill(input, report, options, report.spark_ranks,
         crate::serving_capacity::prefill_waves::PrefillLimits {
             max_waves: if report.spark_ranks == 0 { 1 }
                 else if report.requested_attention == Some(placement::AttentionPlacement::Layers) {
@@ -35,8 +35,8 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         Ok(shape) => shape,
         Err(error) => return unsupported_prefill(report, error),
     };
-    let shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
-    let (manifest, rows, sequences, context, weight_budget) = (shape.manifest.as_ref(), shape.prefill_rows,
+    let shape = Shape::resolve(input, report, model, options, ShapePolicy::manifest_bounded());
+    let (manifest, rows, sequences, context, weight_budget) = (shape.manifest.as_deref(), shape.prefill_rows,
         shape.concurrency, shape.context_tokens, options.weight_budget_bytes);
     let checkpoint = input.checkpoint();
     let mut notes = vec![format!("resolved context {context} tokens")];

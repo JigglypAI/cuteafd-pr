@@ -265,10 +265,16 @@ impl Exl3Epilogue {
 
 pub fn exl3_workspace_bytes(manifests: &[Value], fp8_k32: bool, epilogue: Exl3Epilogue)
     -> Result<u64, CacheGeometryError> {
+    exl3_workspace_bytes_from_refs(manifests.iter(), fp8_k32, epilogue)
+}
+
+pub(crate) fn exl3_workspace_bytes_from_refs<'a>(manifests: impl IntoIterator<Item = &'a Value>,
+    fp8_k32: bool, epilogue: Exl3Epilogue) -> Result<u64, CacheGeometryError> {
     let invalid = |name: &str, what: &str| CacheGeometryError::ResidentTensor {
         name: format!("EXL3 workspace/{name}"), what: what.into(),
     };
-    if manifests.is_empty() { return Err(invalid("manifests", "no capacity specializations")); }
+    let mut manifests = manifests.into_iter().peekable();
+    if manifests.peek().is_none() { return Err(invalid("manifests", "no capacity specializations")); }
     let mut shared = BTreeMap::<String, (u64, String)>::new();
     let mut private = Vec::new();
     for manifest in manifests {

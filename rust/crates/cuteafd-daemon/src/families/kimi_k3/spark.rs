@@ -22,9 +22,15 @@ const TOPK: usize = 16;
 /// The admitted intake: `waves` return slots of `unit` rows per rank.
 pub(crate) fn admitted_demand(waves: usize, unit: usize, lane: usize, ranks: usize,
     format: cuteafd_core::SparkReplyFormat) -> Result<Demand> {
-    ensure!((1..=cuteafd_core::MAX_SPARK_WORLD).contains(&ranks), "Kimi Spark intake requires 1..8 ranks");
+    admitted_demand_on(waves, unit, lane, ranks, 1, format)
+}
+
+pub(crate) fn admitted_demand_on(waves: usize, unit: usize, lane: usize, ranks: usize,
+    owner: usize, format: cuteafd_core::SparkReplyFormat) -> Result<Demand> {
+    ensure!((1..=cuteafd_core::MAX_SPARK_WORLD).contains(&ranks) && owner < 2,
+        "Kimi Spark intake requires 1..8 ranks and an actual owner");
     let shape = cuteafd_loader::serving_capacity::PrefillShape { unit_rows: unit as u64, waves: waves as u64 }.validate()?;
-    cuteafd_loader::families::kimi_k3::allocation::spark_demand(shape, lane, ranks, format)
+    cuteafd_loader::families::kimi_k3::allocation::spark_demand_on(shape, lane, ranks, owner as u8, format)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,8 +75,10 @@ impl<'a> RoutedLane<'a> {
             "Kimi Spark helpers require the process latent expert geometry before native loading");
         let ranks = peers.len();
         ensure!((1..=8).contains(&ranks), "Kimi routed exchange requires 1..8 real Spark ranks");
-        let charge = admitted_demand(waves, unit, local.lane_index(), ranks, cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false))?;
-        let charges = placement.items[1].iter().filter(|item| item.group == charge.group).collect::<Vec<_>>();
+        let owner = placement.items.len().checked_sub(1).context("Kimi Spark intake has no physical owner")?;
+        let charge = admitted_demand_on(waves, unit, local.lane_index(), ranks, owner,
+            cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false))?;
+        let charges = placement.items[owner].iter().filter(|item| item.group == charge.group).collect::<Vec<_>>();
         ensure!(charges.len() == 1 && charges[0].category == charge.category
             && charges[0].basis == charge.basis && charges[0].bytes == charge.bytes,
             "Kimi Spark intake differs from accepted admission");
@@ -322,9 +330,14 @@ mod tests {
                     assert_eq!(charge, cuteafd_loader::families::kimi_k3::allocation::spark_demand(
                         cuteafd_loader::serving_capacity::PrefillShape { unit_rows: 2752, waves: 3 },
                         lane, ranks, format)?);
+                    let local = admitted_demand_on(3, 2752, lane, ranks, 0, format)?;
+                    assert_eq!(local.gpu, 0);
+                    assert_eq!((local.bytes, local.category, local.group, local.basis),
+                        (charge.bytes, charge.category, charge.group, charge.basis));
                 }
             }
         }
+        assert!(admitted_demand_on(3, 2752, 0, 6, 2, cuteafd_core::SparkReplyFormat::Bf16).is_err());
         Ok(())
     }
 

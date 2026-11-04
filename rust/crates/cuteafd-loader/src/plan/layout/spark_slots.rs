@@ -285,6 +285,9 @@ pub(crate) fn charge_executions(device: &mut DeviceLayout, input: &super::super:
     working: &SparkWorkingSet, family: &str, executions: &cuteafd_core::SparkExecutions) -> anyhow::Result<()> {
     device.items.retain(|item| item.group != "execution owners" && item.group != "execution staging");
     if !working.selected_ranks().contains(&(device.index as usize)) { return Ok(()); }
+    if family == "kimi_k3" {
+        return crate::families::kimi_k3::spark::charge(device, working.spark_ranks, executions);
+    }
     charge_owners(device, executions, owner_bytes(input, working, family, device.index as usize)?)
 }
 

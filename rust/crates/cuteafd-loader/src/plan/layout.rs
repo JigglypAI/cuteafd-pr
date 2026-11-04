@@ -709,12 +709,12 @@ mod draft_prefix_tests {
         let mut options = LayoutOptions { rtx_bytes: vec![96 << 30], prefill_rows: 2752,
             prefill_unit_rows: Some(2752), prefill_waves: 3, ..Default::default() };
         report.prefill_span_rows = Some(8256);
-        let shape = Shape::resolve(&mut report, model.as_ref(), &mut options, ShapePolicy::manifest_bounded());
+        let shape = Shape::resolve(&input, &mut report, model.as_ref(), &mut options, ShapePolicy::manifest_bounded());
         assert_eq!(shape.prefill_rows, 2752);
         assert_eq!(report.prefill_span_rows, Some(8256));
         report.prefill_span_rows = None;
         options.prefill_rows = 4096;
-        Shape::resolve(&mut report, model.as_ref(), &mut options, ShapePolicy::manifest_bounded());
+        Shape::resolve(&input, &mut report, model.as_ref(), &mut options, ShapePolicy::manifest_bounded());
         assert_eq!(report.prefill_span_rows, Some(4096));
         Ok(())
     }
@@ -746,7 +746,9 @@ mod draft_prefix_tests {
         use crate::plan::{self, testing, ExpertPlacement, PlanOptions};
         let target = tempfile::tempdir()?;
         testing::write_kimi_snapshot(target.path(), true);
-        let checkpoint = super::super::Checkpoint::open(target.path())?;
+        let input = super::super::PlanInput::open(target.path())?;
+        let checkpoint = input.checkpoint();
+        let model = input.family_model()?;
         let draft = tempfile::tempdir()?;
         let config = serde_json::json!({"architectures":["DFlash2DraftModel"], "hidden_size":7168,
             "intermediate_size":14336, "num_hidden_layers":5, "num_attention_heads":64,
@@ -773,17 +775,17 @@ mod draft_prefix_tests {
                 placement: ExpertPlacement::Sparks { ranks: 6 }, layout: Some(options.clone()),
                 ..Default::default()
             })?;
-            let (base, context, concurrency) = selected_host_geometry(&mut report, &options, &checkpoint)?;
+            let (base, context, concurrency) = selected_host_geometry(&mut report, &options, checkpoint, model, &input)?;
             assert_eq!(context, crate::families::kimi_k3::DEFAULT_CONTEXT as u64);
             assert_eq!(concurrency, 2);
             assert_eq!(base.page_bytes, 24 * 64 * format.record_bytes() as u64);
             options.kimi_drafter_snapshot = Some(draft.path().to_path_buf());
-            let (with_draft, _, _) = selected_host_geometry(&mut report, &options, &checkpoint)?;
+            let (with_draft, _, _) = selected_host_geometry(&mut report, &options, checkpoint, model, &input)?;
             assert_eq!(with_draft.mark_bytes - base.mark_bytes, 4 * 4160 * format.record_bytes() as u64);
             assert_eq!(with_draft.page_bytes, base.page_bytes);
             for context in [262_144, 524_288, 1_048_576] {
                 options.context_tokens = context;
-                let (_, selected, _) = selected_host_geometry(&mut report, &options, &checkpoint)?;
+                let (_, selected, _) = selected_host_geometry(&mut report, &options, checkpoint, model, &input)?;
                 assert_eq!(selected, context);
             }
         }
@@ -822,14 +824,14 @@ pub(crate) fn unsupported_prefill(report: &mut PlanReport, error: anyhow::Error)
 /// Resolve the shared topology policy before family memory admission. Resolved
 /// fields are written back once and then consumed by workspace and transport
 /// ledgers; the manifest's arena capacity is never an implicit row override.
-pub fn resolve_prefill(report: &mut PlanReport, options: &mut LayoutOptions,
+pub fn resolve_prefill(input: &super::PlanInput, report: &mut PlanReport, options: &mut LayoutOptions,
     spark_ranks: usize, mut limits: crate::serving_capacity::prefill_waves::PrefillLimits)
     -> anyhow::Result<crate::serving_capacity::prefill_waves::PrefillPlan> {
     use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
     let manifest_path = options.workspace_manifest.as_deref()
         .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     if manifest_path.is_file() {
-        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
+        let manifest = input.manifest(manifest_path)?;
         if let Some(rows) = manifest["capacities"]["prefill_rows"].as_u64() {
             limits.max_unit_rows = limits.max_unit_rows.min(rows);
         }
@@ -876,7 +878,7 @@ impl ShapePolicy {
 #[derive(Debug, Clone)]
 pub struct Shape {
     /// The program manifest (`--workspace-manifest`, else the image's).
-    pub manifest: Option<serde_json::Value>,
+    pub manifest: Option<std::sync::Arc<serde_json::Value>>,
     pub prefill_rows: u64,
     pub decode_rows: u64,
     pub concurrency: u64,
@@ -888,7 +890,7 @@ pub struct Shape {
 }
 
 impl Shape {
-    pub fn resolve(report: &mut PlanReport, model: &dyn super::FamilyModel, options: &mut LayoutOptions,
+    pub fn resolve(input: &super::PlanInput, report: &mut PlanReport, model: &dyn super::FamilyModel, options: &mut LayoutOptions,
         policy: ShapePolicy) -> Self {
         let discovered = match model.spec().speculator.as_ref() {
             Some(super::spec::SpeculatorSpec::Dspark { stages, .. }) => *stages,
@@ -902,8 +904,7 @@ impl Shape {
         let manifest = options.workspace_manifest.as_deref().or_else(|| {
             let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
             path.is_file().then_some(path)
-        }).and_then(|path| std::fs::read(path).ok())
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        }).and_then(|path| input.manifest(path).ok());
         let prefill_rows = if options.prefill_rows > 0 { options.prefill_rows }
             else if let Some(rows) = policy.prefill_rows { rows }
             else { manifest.as_ref().and_then(|m| m["capacities"]["prefill_rows"].as_u64()).unwrap_or(4096) };
@@ -918,7 +919,7 @@ impl Shape {
         let checkpoint_context = report.cache_requirements.as_ref()
             .and_then(|r| r.checkpoint_max_context_tokens).unwrap_or(0);
         let context_tokens = resolved_context(policy.context, options.context_tokens, checkpoint_context,
-            manifest.as_ref());
+            manifest.as_deref());
         Self { manifest, prefill_rows, decode_rows, concurrency, checkpoint_context, context_tokens, native_layers }
     }
 
@@ -928,7 +929,7 @@ impl Shape {
         if let Some(manifest) = self.manifest.as_mut() {
             let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
                 "sm_120", options.rtx_bytes[0]).sms);
-            if let Err(error) = cuteafd_core::coordinator_programs::select_card_plans(manifest, sms) {
+            if let Err(error) = cuteafd_core::coordinator_programs::select_card_plans(std::sync::Arc::make_mut(manifest), sms) {
                 report.placement_supported = false;
                 notes.push(error.to_string());
             }
@@ -1452,12 +1453,12 @@ pub(crate) fn qwen_scratch_bytes(tokens: u64) -> u64 {
 }
 
 /// Resolve the serving representation, not the inventory's target-only defaults.
-fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, checkpoint: &super::Checkpoint)
+fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, checkpoint: &super::Checkpoint,
+    model: &dyn super::FamilyModel, input: &super::PlanInput)
     -> anyhow::Result<(cuteafd_core::prefix::HostCacheGeometry, u64, u64)> {
     use anyhow::{Context, ensure};
     use crate::serving_capacity::{CacheOptions, KvPlacement};
     let family = super::family::detect(checkpoint).context("missing host cache family")?;
-    let model = family.open(checkpoint)?;
     let id = family.id();
     let policy = ShapePolicy {
         context: if matches!(id, "mimo_v2" | "deepseek_v41") { ContextPolicy::Checkpoint }
@@ -1466,7 +1467,7 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         all_native_stages: id == "deepseek_v4",
     };
     let admitted_rows = report.prefill_span_rows;
-    let shape = Shape::resolve(report, model.as_ref(), &mut options.clone(), policy);
+    let shape = Shape::resolve(input, report, model, &mut options.clone(), policy);
     report.prefill_span_rows = admitted_rows;
     let ranks = if id == "deepseek_v41" || options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
     let selected = CacheOptions { coordinator_ranks: ranks,
@@ -1508,11 +1509,10 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         mark_bytes = mark_bytes.checked_add(3 * 128 * 528).context("dSpark mark overflow")?;
     }
     let mut context = shape.context_tokens;
+    if options.context_tokens == 0 {
+        context = model.default_context_tokens().unwrap_or(context);
+    }
     if id == "kimi_k3" {
-        if options.context_tokens == 0 {
-            context = crate::families::kimi_k3::default_context(
-                &crate::plan::families::kimi::core_inventory(checkpoint)?) as u64;
-        }
         if let Some(snapshot) = &options.kimi_drafter_snapshot {
             let draft = crate::formats::dflash::MlaDflashConfig::read(snapshot)?;
             let windows = draft.paged_cache_layout(1, usize::try_from(context)?,
@@ -1561,7 +1561,8 @@ pub(crate) fn engram_row_bytes(checkpoint: &super::Checkpoint) -> anyhow::Result
     Ok(bytes)
 }
 
-pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, checkpoint: &super::Checkpoint, native: bool) -> anyhow::Result<()> {
+pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, input: &super::PlanInput, native: bool) -> anyhow::Result<()> {
+    let checkpoint = input.checkpoint();
     use anyhow::{Context, ensure};
     use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
     use cuteafd_core::memory_layout::{HostLayout, ItemLifetime, host_logits_bytes};
@@ -1662,8 +1663,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
                 let decode = options.workspace_manifest.as_deref().or_else(|| {
                     let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
                     path.is_file().then_some(path)
-                }).and_then(|path| std::fs::read(path).ok())
-                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                }).and_then(|path| input.manifest(path).ok())
                     .and_then(|manifest| manifest["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
                 let decode_request = geometry.compact_wire_bytes(u32::try_from(decode)?, false)
                     .context("V4 decode egress geometry overflow")?.0 as u64;
@@ -1792,7 +1792,8 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         && report.attention_placement == crate::placement::AttentionPlacement::Heads;
     let family = family.to_owned();
     let cache = if options.mimo_prefix_entries == 0 || tier_disabled || options.host_cache_bytes == Some(0) { 0 } else {
-        let resolved = selected_host_geometry(report, options, checkpoint).and_then(|(geometry, context, concurrency)| {
+        let resolved = input.family_model().map_err(anyhow::Error::from).and_then(|model|
+            selected_host_geometry(report, options, checkpoint, model, input)).and_then(|(geometry, context, concurrency)| {
             let chunk = geometry.chunk_bytes();
             let bytes = geometry.resolve(options.host_cache_bytes, context, concurrency, total, chunk)
                 .with_context(|| format!("invalid host snapshot geometry {geometry:?}, context {context}, concurrency {concurrency}"))?;
