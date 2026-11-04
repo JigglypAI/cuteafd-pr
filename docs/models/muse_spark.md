@@ -133,6 +133,22 @@ multiplier is refused. Taps are the target's hidden rows after the tapped
 layers; a prefill call commits its last 2048 rows (the drafter's window) as
 context.
 
+## Media
+
+The starting configs serve the checkpoint's bundled vision and PCM audio
+towers (`VISION=auto`, `AUDIO=auto`); set either to `off` to drop it. Both
+place on Sparks by default (min: vision on rank 0, 4,860,356,960 B; audio on
+rank 1, 246,586,368 B), never on the RTX. Qualification is on #923:
+
+- **Vision:** byte-exact metadata and the FP32 yardstick (public RMS ratio
+  0.990); prompt and turn prefix-cache restores exact.
+- **Audio:** the native tower drives the same LM to the official BF16 tower's
+  output within KL 0.006–0.010 and top-1 96.9–97.9% on silence, one sample,
+  a 30 s signal and speech (512 generated rows each); restores exact. Its
+  cumulative tower-level silence check stays open (RMS ratio 1.65 against
+  the official BF16 error); it does not show in served output.
+- **Latency (min, first use):** image 5.86 s, speech 11–15 ms.
+
 ## Numerics references
 
 - `python/reference/families/muse_spark/model.py`: the official transformers
