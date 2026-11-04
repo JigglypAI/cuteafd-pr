@@ -78,6 +78,7 @@ pub fn template_context(body: &Value, options: &MusePromptOptions, bos: &str) ->
         context["tools"] = Value::Array(tools.iter().filter(|tool| tool["function"]["name"].as_str()
             .is_some_and(|name| options.tool_names.iter().any(|wanted| wanted == name))).cloned().collect());
     }
+    // A final-answer prefill bypasses reasoning, so effort is ignored when thinking is off.
     if thinking {
         if let Some(effort) = template_effort(body)? { context["reasoning_effort"] = Value::String(effort); }
     }

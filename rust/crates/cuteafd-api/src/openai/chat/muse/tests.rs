@@ -74,6 +74,26 @@ fn efforts_map_onto_the_template_and_thinking_off_prefills_user() {
 }
 
 #[test]
+fn thinking_off_ignores_effort_and_refuses_an_unexpected_generation_header() {
+    let request = |extra: Value| {
+        let mut body = json!({"messages":[{"role":"user","content":"Hi"}], "thinking":{"type":"disabled"}});
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        body
+    };
+    let plain = request(json!({}));
+    let expected = encoding().render(&plain, &options(&plain)).unwrap();
+    for extra in [json!({"reasoning_effort":"low"}), json!({"reasoning_effort":"high"}),
+        json!({"chat_template_kwargs":{"reasoning_effort":"medium"}})] {
+        let body = request(extra);
+        assert_eq!(encoding().render(&body, &options(&body)).unwrap(), expected);
+    }
+    let changed = MuseEncoding::new("{{ bos_token }}<|start|>assistant changed",
+        encoding().tokens().clone(), "<|begin_of_text|>".into()).unwrap();
+    assert_eq!(changed.render(&plain, &options(&plain)).unwrap_err(),
+        "Muse chat template did not leave an assistant generation header to pre-fill");
+}
+
+#[test]
 fn thinking_off_rendered_prefix_matches_final_history_and_parses_split_text() {
     let body = json!({"messages":[{"role":"user","content":"Hi"}], "thinking":{"type":"disabled"}});
     let prompt = encoding().render(&body, &options(&body)).unwrap();
