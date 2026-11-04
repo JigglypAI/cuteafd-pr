@@ -29,6 +29,29 @@ fn plan_accepts_global_budget_and_warns_once_for_each_alias() {
 }
 
 #[test]
+fn direct_family_concurrency_matches_logical_capacity_and_explicit_launcher_input() {
+    for family in ["serve-glmf", "serve-glm", "serve-mimo"] {
+        for gib in [30u64, 32, 96] {
+            let expected = cuteafd_core::serving_capacity::default_concurrency(gib << 30);
+            for explicit in [None, Some(expected), Some(4)] {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
+                command.args([family, "--snapshot", "/direct-cli-missing-snapshot", "--native-lib", "/unused",
+                    "--coordinator-gpu-budget-gib", &gib.to_string()]);
+                if let Some(value) = explicit { command.args(["--max-sequences", &value.to_string()]); }
+                let output = command.env("RUST_LOG", "info")
+                    .env_remove("COORDINATOR_GPU_BUDGET_GIB").output().unwrap();
+                assert!(!output.status.success());
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let resolved = stderr.lines().find(|line| line.contains("resolved boot-time serving concurrency"))
+                    .unwrap_or_else(|| panic!("{family} at {gib} GiB: {stderr}"));
+                assert!(resolved.contains(&format!("concurrency={}", explicit.unwrap_or(expected))), "{resolved}");
+                assert!(!stderr.contains("/unused"), "explicit logical budget must not load CUDA: {stderr}");
+            }
+        }
+    }
+}
+
+#[test]
 fn plan_json_keeps_info_tracing_on_stderr() {
     let snapshot = tempfile::tempdir().unwrap();
     std::fs::write(snapshot.path().join("config.json"), br#"{"model_type":"unknown"}"#).unwrap();

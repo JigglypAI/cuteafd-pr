@@ -51,8 +51,8 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
     /// Sequences decoding at once (each holds an SWA ring).
-    #[arg(long, default_value_t = cuteafd_core::serving_capacity::LARGE_CARD_DEFAULT_CONCURRENCY as usize)]
-    pub max_sequences: usize,
+    #[arg(long)]
+    pub max_sequences: Option<usize>,
     /// Bounded pending API requests (defaults to concurrency).
     #[arg(long, env = "CUTEAFD_HTTP_QUEUE_DEPTH")]
     pub http_queue_depth: Option<usize>,
@@ -120,8 +120,10 @@ use crate::shared::probe;
 
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
-    cuteafd_core::concurrency::validate("mimo_v2", args.max_sequences as u64)?;
-    args.prefix.resolve_entries(args.max_sequences as usize);
+    let max_sequences = crate::shared::memory::budget::serving_concurrency(
+        args.max_sequences, &args.engine.native_lib, args.engine.device)?;
+    cuteafd_core::concurrency::validate("mimo_v2", max_sequences as u64)?;
+    args.prefix.resolve_entries(max_sequences as usize);
     anyhow::ensure!(args.prefill_chunk_s.is_none_or(|s| s.is_finite() && s > 0.0 && s <= 5.0),
         "--prefill-chunk-s must be finite and in (0, 5]");
     anyhow::ensure!(args.prefill_chunk_s.is_none() || args.decode_share.decode_share > 0.0,
@@ -135,18 +137,18 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         args.model_id.clone().or_else(|| crate::families::glm5_flash::serve::model_id(&snapshot)).context("model id")?,
         ModelEncoding::Qwen(Arc::new(encoding)),
     );
-    let depth = serving_queue_depth(args.http_queue_depth, args.max_sequences);
+    let depth = serving_queue_depth(args.http_queue_depth, max_sequences);
     anyhow::ensure!(depth > 0, "--http-queue-depth must be positive");
     let (queue, receive) = mpsc::channel::<NativeRequest>(depth);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
-    engine_args.rings = cuteafd_core::concurrency::request_slots(args.max_sequences as u64, engine_args.rings as u64) as usize;
-    let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
-    engine_args.draft_sequences = engine_args.draft_sequences.max(args.max_sequences);
+    engine_args.rings = cuteafd_core::concurrency::request_slots(max_sequences as u64, engine_args.rings as u64) as usize;
+    let (worker_stats, max_sequences) = (stats.clone(), max_sequences);
+    engine_args.draft_sequences = engine_args.draft_sequences.max(max_sequences);
     engine_args.draft_context_slots = Some(serving_context_slots(
         engine_args.draft_sequences, engine_args.rings, engine_args.draft_context_slots, args.prefix.mimo_prefix_draft));
-    for (name, value) in [("max-sequences", args.max_sequences), ("rings", engine_args.rings),
+    for (name, value) in [("max-sequences", max_sequences), ("rings", engine_args.rings),
         ("draft-sequences", engine_args.draft_sequences)] {
         cuteafd_bench::context::set_resolved(name, &value.to_string());
     }
@@ -157,7 +159,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         decode_share: args.decode_share, chunk_s: args.prefill_chunk_s,
         snapshot_wait: args.mimo_snapshot_wait };
     let prefix = args.prefix.clone();
-    let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
+    let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id, max_sequences)));
     let vision = args.vision;
     let audio = args.audio;
     let remote = super::media::RemoteVision::from_args(&args)?;
@@ -195,14 +197,14 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
 }
 
 /// What the live console shows for MiMo V2 (Flash and V2.6 Pro).
-fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
+fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize) -> console::Layout {
     use console::{Color::*, StepGroup};
     let mut layout = console::Layout::new("mimo_v2", model.into(), args.engine.snapshot.clone());
     let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
     layout.hardware = console::hardware(1 + usize::from(args.engine.split_device.is_some()), sparks,
         args.engine.local_experts);
     layout.split = args.engine.split_device.map(|_| "head split".into());
-    layout.concurrency = args.max_sequences;
+    layout.concurrency = max_sequences;
     let policy = args.draft_fixed.map_or_else(|| "adaptive".to_string(), |n| format!("fixed {n}"));
     let drafter = if args.engine.draft.is_some() { Some("DFlash") } else if args.engine.mtp > 0 { Some("MTP") } else { None };
     layout.speculator = drafter.map(|name| console::Speculator {
@@ -1560,7 +1562,7 @@ mod port_tests {
     fn port_knobs_default_off_and_sixteen_slots_are_configurable() {
         let default = Cli::parse_from(["serve", "--snapshot", "/model", "--native-lib", "/lib"]);
         let args = default.serve;
-        assert_eq!(args.max_sequences, cuteafd_core::serving_capacity::LARGE_CARD_DEFAULT_CONCURRENCY as usize);
+        assert_eq!(args.max_sequences, None);
         assert_eq!(args.http_queue_depth, None);
         assert_eq!(args.http_queue_wait_ms, 25_000);
         assert!(!args.prefix.mimo_prefix_draft && !args.mimo_snapshot_wait);
@@ -1569,7 +1571,7 @@ mod port_tests {
             "--max-sequences", "16", "--http-queue-depth", "32", "--http-queue-wait-ms", "1234",
             "--mimo-prefix-draft", "--mimo-snapshot-wait",
             "--mimo-host-cache", "--host-cache-bytes", "0", "--prefill-chunk-s", "4"]);
-        assert_eq!((enabled.serve.max_sequences, enabled.serve.http_queue_depth), (16, Some(32)));
+        assert_eq!((enabled.serve.max_sequences, enabled.serve.http_queue_depth), (Some(16), Some(32)));
         assert_eq!(enabled.serve.prefix.host_cache_bytes, crate::shared::prefix::HostBudget::Bytes(0));
         assert_eq!(enabled.serve.prefill_chunk_s, Some(4.0));
     }
@@ -1579,7 +1581,7 @@ mod port_tests {
         for sequences in [1, 4, 16, 32, 64] {
             let parsed = Cli::parse_from(["serve", "--snapshot", "/model", "--native-lib", "/lib",
                 "--max-sequences", &sequences.to_string()]);
-            assert_eq!(serving_queue_depth(parsed.serve.http_queue_depth, parsed.serve.max_sequences), parsed.serve.max_sequences);
+            assert_eq!(serving_queue_depth(parsed.serve.http_queue_depth, parsed.serve.max_sequences.unwrap()), parsed.serve.max_sequences.unwrap());
         }
         assert_eq!(serving_queue_depth(Some(32), 4), 32);
         assert_eq!(serving_queue_depth(Some(1), 4), 1);
