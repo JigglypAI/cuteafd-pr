@@ -253,21 +253,28 @@ impl MistralOutputParser {
     /// counted so the validator rejects it.
     fn step_arguments_streaming(&mut self, finishing: bool, out: &mut Vec<OutputChunk>) -> bool {
         let started = self.call.as_ref().expect("a call is open").scan.started;
-        let body = if started { self.pending.as_str() } else { self.pending.trim_start() };
-        let skipped = self.pending.len() - body.len();
-        if body.is_empty() {
+        let skipped = if started { 0 } else { self.pending.len() - self.pending.trim_start().len() };
+        let body_len = self.pending.len() - skipped;
+        if body_len == 0 {
             if finishing { self.lose("arguments cut off", out); return true; }
             return false;
         }
-        if !started && !body.starts_with('{') {
+        if !started && !self.pending[skipped..].starts_with('{') {
             self.lose("arguments are not a JSON object", out);
             return true;
         }
-        let closed = self.call.as_mut().expect("a call is open").scan.scan(body);
-        let emit = closed.unwrap_or(body.len());
-        let text: String = self.pending.drain(..skipped + emit).collect();
+        let closed = {
+            let body = &self.pending[skipped..];
+            self.call.as_mut().expect("a call is open").scan.scan(body)
+        };
+        let emit = closed.unwrap_or(body_len);
+        // Drop the whitespace between `[ARGS]` and the object, as hold mode
+        // does, so the streamed bytes match it exactly.
+        let skipped_text: String = self.pending.drain(..skipped).collect();
+        let text: String = self.pending.drain(..emit).collect();
         {
             let call = self.call.as_mut().expect("a call is open");
+            call.text.push_str(&skipped_text);
             call.text.push_str(&text);
             call.arguments.push_str(&text);
         }

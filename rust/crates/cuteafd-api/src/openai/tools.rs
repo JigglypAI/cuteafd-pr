@@ -177,18 +177,23 @@ impl ToolConstraints {
     }
 
     fn validate(&self, calls: &BTreeMap<u64, Call>, reason: &str) -> Result<()> {
+        if !matches!(reason, "stop" | "tool_calls") {
+            // A call cut at `max_tokens` (finish `length`) may have streamed
+            // argument deltas that cannot be retracted. Reject only a call
+            // whose arguments are incomplete; a complete call followed by more
+            // text is accepted, as in BASE.
+            for call in calls.values() {
+                ensure!(unique_json(&call.arguments).is_ok(),
+                    "native tool arguments are not a complete JSON object");
+            }
+            return Ok(());
+        }
         if calls.is_empty() {
-            if !matches!(reason, "stop" | "tool_calls") { return Ok(()); }
+            ensure!(reason != "tool_calls", "native response claimed tool_calls without a call");
             ensure!(!self.required, "native response omitted a required tool call");
             return Ok(());
         }
-        // Calls were emitted: validate them whatever the finish reason. A call
-        // cut at `max_tokens` (finish `length`) has already streamed its
-        // argument deltas and cannot be retracted, so it must be rejected here
-        // with a clean 400/SSE error rather than reach the client as partial
-        // JSON.
         ensure!(self.parallel || calls.len() <= 1, "native response violated parallel_tool_calls=false");
-        ensure!(reason == "tool_calls", "native tool response ended without tool_calls finish");
         for (expected, (index, call)) in calls.iter().enumerate() {
             ensure!(*index == expected as u64, "native tool call indices are not contiguous");
             let validator = self.validators.get(&call.name)

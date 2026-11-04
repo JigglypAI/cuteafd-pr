@@ -1,8 +1,8 @@
 //! Incremental XTML channels. Calls remain buffered until their closing tag,
 //! so malformed or truncated calls cannot become partial OpenAI tool calls.
 //!
-//! `CUTEAFD_STREAM_TOOLCALL_ARGS=1` (streamed requests only) emits each
-//! argument delta as it arrives instead of holding the whole call. The
+//! Streamed requests emit each argument delta as it arrives instead of holding
+//! the whole call (`CUTEAFD_STREAM_TOOLCALL_ARGS=0` is the kill switch). The
 //! assembled call is byte-identical to the non-streamed one; a call that turns
 //! out unreadable has already been streamed, so it is counted and the validator
 //! rejects its arguments with a clean 400/SSE error rather than a 500.
@@ -55,6 +55,9 @@ struct Call {
     /// buffered and emitted whole, so the streamed bytes are the same compact
     /// JSON the hold path sends.
     object_call: bool,
+    /// The call has read at least one `<|open|>argument`: a call is one form or
+    /// the other, never both.
+    saw_argument: bool,
     /// The streamed arguments object has been opened with `{`.
     args_open: bool,
     /// The current value repeats a key already read: it is consumed but not
@@ -81,7 +84,8 @@ pub struct KimiOutputParser {
     calls: usize,
     stop: Option<GlmStop>,
     /// Emit tool-call argument deltas as they arrive instead of holding the
-    /// whole call until it closes (`CUTEAFD_STREAM_TOOLCALL_ARGS=1`).
+    /// whole call until it closes (on for streamed requests;
+    /// `CUTEAFD_STREAM_TOOLCALL_ARGS=0` is the kill switch).
     stream_args: ArgStream,
     /// The open call's `ToolCall` was emitted to the client: a call that turns
     /// out unreadable has already been streamed and cannot be retracted.
@@ -308,6 +312,12 @@ impl KimiOutputParser {
                                 return true;
                             }
                             let call = self.call.as_mut().expect("a call is open");
+                            // A call is one form or the other, never both.
+                            if call.saw_argument {
+                                call.text.push_str(&head);
+                                self.mode = Mode::Lost;
+                                return true;
+                            }
                             call.text.push_str(&head);
                             call.object_call = true;
                             self.mode = Mode::CallJson;
@@ -335,7 +345,14 @@ impl KimiOutputParser {
                                 return true;
                             }
                             let call = self.call.as_mut().expect("a call is open");
+                            // A call is one form or the other, never both.
+                            if call.object_call {
+                                call.text.push_str(&head);
+                                self.mode = Mode::Lost;
+                                return true;
+                            }
                             call.text.push_str(&head);
+                            call.saw_argument = true;
                             call.key = Some(key.clone());
                             call.kind = kind.clone();
                             call.value.clear();

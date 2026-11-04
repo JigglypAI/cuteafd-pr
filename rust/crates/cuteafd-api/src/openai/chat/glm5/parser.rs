@@ -106,7 +106,8 @@ pub struct GlmOutputParser {
     held_whitespace: String,
     stop: Option<GlmStop>,
     /// Emit tool-call argument deltas as they arrive instead of holding the
-    /// whole call until it closes (`CUTEAFD_STREAM_TOOLCALL_ARGS=1`).
+    /// whole call until it closes (on for streamed requests;
+    /// `CUTEAFD_STREAM_TOOLCALL_ARGS=0` is the kill switch).
     stream_args: ArgStream,
     /// The open call's `ToolCall` was emitted to the client: a call that turns
     /// out unreadable has already been streamed and cannot be retracted.

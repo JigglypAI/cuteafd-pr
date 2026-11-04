@@ -37,7 +37,7 @@ use serde_json::Value;
 
 use super::{END_OF_MESSAGE, END_OF_TEXT, END_OF_TURN, MESSAGE, START};
 use crate::openai::chat::glm5::parser::{accepts_string, GlmStop};
-use crate::openai::chat::stream_args::{ArgStream, held_prefix, json_string_contents, name_is_readable};
+use crate::openai::chat::stream_args::{ArgStream, held_prefix, json_string_contents};
 use crate::openai::chat::glm5::TextParser;
 
 const CALLS: &str = "<atem:function_calls>";
@@ -82,7 +82,6 @@ enum StreamState {
 struct StreamParam {
     key: String,
     string: bool,
-    skip: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,11 +108,21 @@ pub struct MuseOutputParser {
     /// Cursor into `body` for the incremental scanner.
     stream_pos: usize,
     stream_state: StreamState,
-    /// The current call's `{` was emitted.
+    /// The current call's `{` was emitted and its `}` is still owed.
     stream_args_open: bool,
+    /// The current call's arguments are complete (`</atem:invoke>` seen); its
+    /// `}` is deferred until the block closes so a block that never closes (or
+    /// has trailing text) stays incomplete and the validator rejects it.
+    stream_call_complete: bool,
+    /// A hold-mode validation check failed after streaming began: stop emitting
+    /// and let `end_message` count the open call so the validator rejects it.
+    stream_failed: bool,
+    /// `</atem:function_calls>` was seen: the block closed.
+    stream_block_closed: bool,
     /// The current call's name.
     stream_tool_name: String,
-    /// Keys already emitted for the current call (first-wins on repeats).
+    /// Keys already read for the current call (a repeat is an error, as in
+    /// hold mode).
     stream_seen_keys: Vec<String>,
     /// Arguments emitted for the current call (comma placement).
     stream_arg_count: usize,
@@ -134,7 +143,8 @@ impl MuseOutputParser {
         Self { options, mode, pending: String::new(), recipient: Recipient::Visible, body: String::new(),
             calls: 0, content_started: false, held_whitespace: String::new(), stop: None,
             stream_args: ArgStream::new(stream_args), streamed: false, stream_pos: 0,
-            stream_state: StreamState::SeekCalls, stream_args_open: false, stream_tool_name: String::new(),
+            stream_state: StreamState::SeekCalls, stream_args_open: false, stream_call_complete: false,
+            stream_failed: false, stream_block_closed: false, stream_tool_name: String::new(),
             stream_seen_keys: Vec::new(), stream_arg_count: 0, stream_param: None }
     }
 
@@ -225,6 +235,9 @@ impl MuseOutputParser {
         self.stream_pos = 0;
         self.stream_state = StreamState::SeekCalls;
         self.stream_args_open = false;
+        self.stream_call_complete = false;
+        self.stream_failed = false;
+        self.stream_block_closed = false;
         self.stream_tool_name.clear();
         self.stream_seen_keys.clear();
         self.stream_arg_count = 0;
@@ -286,39 +299,93 @@ impl MuseOutputParser {
 
     /// Emit argument deltas for whatever of `body` has arrived. Chunk-boundary
     /// independent: an incomplete tag is held until its bytes arrive.
+    ///
+    /// The scanner applies hold mode's checks as it goes: the block must start
+    /// with `<atem:function_calls>`, names and keys are XML-unescaped and must
+    /// be non-empty with no raw markup, a repeated key is an error, and the
+    /// block must close with `</atem:function_calls>` and no trailing text. A
+    /// check that fails after bytes were streamed cannot retract them, so the
+    /// open call is left incomplete and `end_message` counts it for the
+    /// validator to reject.
     fn stream_scan(&mut self, out: &mut Vec<OutputChunk>) {
         loop {
-            let rest = self.body[self.stream_pos..].to_owned();
+            let rest = &self.body[self.stream_pos..];
             match self.stream_state {
                 StreamState::SeekCalls => {
-                    let Some(at) = rest.find(CALLS) else { return; };
-                    self.stream_pos += at + CALLS.len();
+                    let trimmed = rest.trim_start();
+                    let skipped = rest.len() - trimmed.len();
+                    if trimmed.len() < CALLS.len() {
+                        if CALLS.starts_with(trimmed) { return; }
+                        self.stream_failed = true;
+                        self.stream_state = StreamState::Done;
+                        return;
+                    }
+                    if !trimmed.starts_with(CALLS) {
+                        self.stream_failed = true;
+                        self.stream_state = StreamState::Done;
+                        return;
+                    }
+                    self.stream_pos += skipped + CALLS.len();
                     self.stream_state = StreamState::SeekInvoke;
                 }
                 StreamState::SeekInvoke => {
-                    let Some(at) = rest.find(INVOKE) else { return; };
-                    let after = &rest[at + INVOKE.len()..];
-                    let Some(end) = after.find("\">") else { return; };
-                    let name = after[..end].to_owned();
-                    self.stream_pos += at + INVOKE.len() + end + 2;
-                    self.stream_tool_name = name.clone();
-                    self.stream_seen_keys.clear();
-                    self.stream_arg_count = 0;
-                    if name_is_readable(&name, self.options.tools.as_deref()) {
+                    let trimmed = rest.trim_start();
+                    let skipped = rest.len() - trimmed.len();
+                    if trimmed.starts_with(CALLS_END) {
+                        self.stream_pos += skipped + CALLS_END.len();
+                        self.stream_block_closed = true;
+                        self.stream_state = StreamState::Done;
+                        return;
+                    }
+                    if trimmed.starts_with(INVOKE) {
+                        let after = &trimmed[INVOKE.len()..];
+                        let Some(end) = after.find("\">") else { return; };
+                        let name = match muse_attribute(&after[..end]) {
+                            Ok(name) => name,
+                            Err(_) => {
+                                self.stream_failed = true;
+                                self.stream_state = StreamState::Done;
+                                return;
+                            }
+                        };
+                        let tools = self.options.tools.as_deref().unwrap_or_default();
+                        if !tools.iter().any(|tool| tool.name == name) {
+                            // Hold mode rejects an undeclared tool; the block is
+                            // unreadable, so leave the previous call incomplete.
+                            self.stream_failed = true;
+                            self.stream_state = StreamState::Done;
+                            return;
+                        }
+                        // The next call is readable: close the previous one now.
+                        if self.stream_call_complete {
+                            self.stream_args.delta("}", out);
+                            self.calls += 1;
+                            self.stream_call_complete = false;
+                            self.stream_args_open = false;
+                        }
+                        self.stream_pos += skipped + INVOKE.len() + end + 2;
+                        self.stream_tool_name = name.clone();
+                        self.stream_seen_keys.clear();
+                        self.stream_arg_count = 0;
                         self.stream_args.begin(out);
                         self.stream_args.call(&name, out);
                         self.stream_args.delta("{", out);
                         self.stream_args_open = true;
                         self.streamed = true;
-                    } else {
-                        self.stream_args_open = false;
+                        self.stream_state = StreamState::SeekParam;
+                        continue;
                     }
-                    self.stream_state = StreamState::SeekParam;
+                    if INVOKE.starts_with(trimmed) || CALLS_END.starts_with(trimmed) { return; }
+                    self.stream_failed = true;
+                    self.stream_state = StreamState::Done;
+                    return;
                 }
                 StreamState::SeekParam => {
+                    let trimmed = rest.trim_start();
+                    let skipped = rest.len() - trimmed.len();
                     let mut best: Option<(usize, u8)> = None;
-                    for (found, kind) in [(rest.find(PARAMETER), 0u8), (rest.find(INVOKE_END), 1),
-                        (rest.find(CALLS_END), 2)] {
+                    for (found, kind) in [(trimmed.find(PARAMETER), 0u8), (trimmed.find(INVOKE_END), 1),
+                        (trimmed.find(CALLS_END), 2)] {
                         if let Some(index) = found {
                             if best.is_none_or(|(at, _)| index < at) { best = Some((index, kind)); }
                         }
@@ -326,47 +393,60 @@ impl MuseOutputParser {
                     let Some((at, kind)) = best else { return; };
                     match kind {
                         0 => {
-                            let after = &rest[at + PARAMETER.len()..];
+                            let after = &trimmed[at + PARAMETER.len()..];
                             let Some(end) = after.find("\">") else { return; };
-                            let key = after[..end].to_owned();
-                            self.stream_pos += at + PARAMETER.len() + end + 2;
+                            let key = match muse_attribute(&after[..end]) {
+                                Ok(key) => key,
+                                Err(_) => {
+                                    self.stream_failed = true;
+                                    self.stream_state = StreamState::Done;
+                                    return;
+                                }
+                            };
+                            self.stream_pos += skipped + at + PARAMETER.len() + end + 2;
+                            if self.stream_seen_keys.iter().any(|seen| *seen == key) {
+                                // Hold mode rejects a duplicated parameter.
+                                self.stream_failed = true;
+                                self.stream_state = StreamState::Done;
+                                return;
+                            }
+                            self.stream_seen_keys.push(key.clone());
                             let tools = self.options.tools.as_deref().unwrap_or_default();
                             let string = accepts_string(&self.stream_tool_name, &key, tools);
-                            let skip = self.stream_seen_keys.iter().any(|seen| *seen == key);
-                            if !skip { self.stream_seen_keys.push(key.clone()); }
-                            if string && !skip {
+                            if string && self.stream_args_open {
                                 if self.stream_arg_count > 0 { self.stream_args.delta(",", out); }
                                 let label = format!("{}:\"", serde_json::to_string(&key).expect("string key"));
                                 self.stream_args.delta(&label, out);
                                 self.stream_arg_count += 1;
                             }
-                            self.stream_param = Some(StreamParam { key, string, skip });
+                            self.stream_param = Some(StreamParam { key, string });
                             self.stream_state = StreamState::InValue;
                         }
                         1 => {
-                            self.stream_pos += at + INVOKE_END.len();
-                            if self.stream_args_open {
-                                self.stream_args.delta("}", out);
-                                self.calls += 1;
-                            }
-                            self.stream_args_open = false;
+                            self.stream_pos += skipped + at + INVOKE_END.len();
+                            if self.stream_args_open { self.stream_call_complete = true; }
                             self.stream_state = StreamState::SeekInvoke;
                         }
                         _ => {
-                            self.stream_pos += at + CALLS_END.len();
+                            self.stream_pos += skipped + at + CALLS_END.len();
+                            self.stream_block_closed = true;
                             self.stream_state = StreamState::Done;
+                            return;
                         }
                     }
                 }
                 StreamState::InValue => {
                     let param = self.stream_param.clone().expect("a parameter is open");
                     let Some(at) = rest.find(PARAMETER_END) else {
-                        let hold = held_prefix(&rest, PARAMETER_END);
+                        // A non-string value is buffered until its close tag so
+                        // it is typed from the whole value, not a fragment.
+                        if !param.string { return; }
+                        let hold = held_prefix(rest, PARAMETER_END);
                         let emit = rest.len() - hold;
                         if emit == 0 { return; }
                         let text = rest[..emit].to_owned();
                         self.stream_pos += emit;
-                        if param.string && !param.skip {
+                        if self.stream_args_open {
                             self.stream_args.delta(&json_string_contents(&text), out);
                         }
                         return;
@@ -374,11 +454,11 @@ impl MuseOutputParser {
                     let raw = rest[..at].to_owned();
                     self.stream_pos += at + PARAMETER_END.len();
                     if param.string {
-                        if !param.skip {
+                        if self.stream_args_open {
                             self.stream_args.delta(&json_string_contents(&raw), out);
                             self.stream_args.delta("\"", out);
                         }
-                    } else if !param.skip {
+                    } else if self.stream_args_open {
                         let tools = self.options.tools.as_deref().unwrap_or_default();
                         let value = value(&self.stream_tool_name, &param.key, &raw, tools);
                         if self.stream_arg_count > 0 { self.stream_args.delta(",", out); }
@@ -404,7 +484,26 @@ impl MuseOutputParser {
             // block ends was streamed but never closed: count it so the
             // validator rejects its partial arguments. A message that streamed
             // nothing is returned as content, exactly as in hold mode.
-            if self.stream_args_open {
+            if self.stream_failed {
+                if self.streamed {
+                    if self.stream_args_open { self.calls += 1; }
+                    tracing::warn!(recipient, text = %excerpt(&body), "Muse tool call streamed, then found unreadable");
+                } else if self.calls == 0 {
+                    if self.content_started { self.held_whitespace.push_str("\n\n"); }
+                    self.emit_content(&body, out);
+                }
+            } else if self.stream_call_complete {
+                // The last call's arguments are complete; its `}` was deferred
+                // so a block that never closed, or that has trailing text,
+                // stays incomplete and the validator rejects it.
+                if self.stream_block_closed && body[self.stream_pos..].trim().is_empty() {
+                    self.stream_args.delta("}", out);
+                    self.calls += 1;
+                } else {
+                    self.calls += 1;
+                    tracing::warn!(recipient, text = %excerpt(&body), "Muse tool call streamed, then found unreadable");
+                }
+            } else if self.stream_args_open {
                 self.calls += 1;
                 tracing::warn!(recipient, text = %excerpt(&body), "Muse tool call streamed, then found unreadable");
             } else if !self.streamed && self.calls == 0 {
@@ -528,12 +627,18 @@ fn read_calls(body: &str) -> Result<Calls, &'static str> {
 /// A quoted attribute value up to `">`, XML-unescaped; markup refuses.
 fn attribute(text: &str) -> Result<(String, &str), &'static str> {
     let end = text.find("\">").ok_or("unterminated name")?;
-    let raw = &text[..end];
+    let name = muse_attribute(&text[..end])?;
+    Ok((name, &text[end + 2..]))
+}
+
+/// One attribute value (a name or a key), XML-unescaped as the template
+/// escaped it; empty or raw markup refuses. Shared by the hold path and the
+/// incremental scanner so both accept exactly the same bytes.
+fn muse_attribute(raw: &str) -> Result<String, &'static str> {
     if raw.is_empty() { return Err("empty name"); }
     if raw.contains(['<', '>', '"', '\n']) { return Err("markup in a name"); }
-    let name = raw.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'")
-        .replace("&amp;", "&");
-    Ok((name, &text[end + 2..]))
+    Ok(raw.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'")
+        .replace("&amp;", "&"))
 }
 
 fn value(tool: &str, key: &str, raw: &str, tools: &[ToolDefinition]) -> Value {
