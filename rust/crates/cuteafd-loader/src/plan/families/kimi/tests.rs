@@ -102,6 +102,8 @@ fn single_owner_header_plan_never_synthesizes_a_peer_or_half_experts() {
     let dir = snapshot(true);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let mut options = with_layout(6, Some(110 << 30));
+    // This BF16 geometry fixture needs an explicit weight cap above the native text owners.
+    options.coordinator_budget_bytes = 192 << 30;
     let layout = options.layout.as_mut().unwrap();
     layout.rtx_bytes = vec![192 << 30];
     layout.head_split = false;
@@ -114,6 +116,26 @@ fn single_owner_header_plan_never_synthesizes_a_peer_or_half_experts() {
     assert!(placed.tp2.is_none());
     assert_eq!(report.memory_layout.as_ref().unwrap().devices.iter()
         .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).count(), 1);
+}
+
+#[test]
+fn single_owner_header_plan_refuses_mandatory_weights_above_default_cap() {
+    use crate::placement::{PlacementError, ResidentWeights};
+    let dir = snapshot(true);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let mut options = with_layout(6, Some(110 << 30));
+    assert_eq!(options.coordinator_budget_bytes, ResidentWeights::DEFAULT_LIMIT.0);
+    let layout = options.layout.as_mut().unwrap();
+    layout.rtx_bytes = vec![192 << 30];
+    layout.head_split = false;
+    let report = input.plan(&options).unwrap();
+    let refusal = PlacementError::ResidentWeightLimit { gpu: 0, required: 113_509_540_864,
+        limit: ResidentWeights::DEFAULT_LIMIT.0 };
+    assert!(!report.fits && !report.placement_supported);
+    assert!(report.solver_placement.is_none());
+    assert!(report.hints.iter().any(|hint| hint.what == format!("Kimi K3 coordinator admission refused: {refusal}")),
+        "{:?}", report.hints);
+    assert!(report.memory_layout.unwrap().devices.is_empty());
 }
 
 #[test]
