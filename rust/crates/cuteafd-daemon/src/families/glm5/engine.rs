@@ -2164,7 +2164,7 @@ impl<'a> GlmEngine<'a> {
         // stream order; the copies read them before later stream work.
         let ticket = unsafe {
             transport.send(t, transport.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer,
-                if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream,
+                if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream, crate::shared::spark_waves::single_reply_eligible(t, if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill }),
                 Box::new(move |routes, wire| expert_request_parts(routes, wire, index, t, h, topk, decode, bf16)))?
         };
         self.exchange_host.borrow_mut()[0] += timer.elapsed().as_secs_f64();
@@ -2286,7 +2286,9 @@ impl<'a> GlmEngine<'a> {
         // stream order; the copies read them before later stream work.
         let ticket = unsafe {
             transport.send(t, transport.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer,
-                if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream,
+                if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream, origins.as_ref().map_or_else(
+                    || crate::shared::spark_waves::single_reply_eligible(t, ExpertV2SourceKind::Prefill),
+                    crate::shared::prefill_pipeline::ReplyOrigins::combined_reply_eligible),
                 Box::new(move |routes, wire| {
                     let mut request = expert_request_parts(routes, wire, index, t, h, topk, false, bf16)?;
                     if let Some(origins) = origins { origins.apply(&mut request)?; }

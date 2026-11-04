@@ -161,7 +161,7 @@ impl<'a> RoutedLane<'a> {
             // SAFETY: LocalLane retains these operands through whole-submission
             // teardown; the copies read them in stream order.
             let exchange = link.exchange()?;
-            unsafe { exchange.send(rows, exchange.compact_payload(rows), layout, [routes.ids, routes.weights, wire], stream,
+            unsafe { exchange.send(rows, exchange.compact_payload(rows), layout, [routes.ids, routes.weights, wire], stream, crate::shared::spark_waves::single_reply_eligible(rows, kind),
                 Box::new(move |routes, wire| request_parts(layer, rows, sequence, kind, routes, wire))) }
         })?;
         self.sequence.set(sequence);

@@ -172,6 +172,11 @@ pub(crate) struct UnitSegment {
 /// Source metadata owned by a deferred Spark request builder.
 pub(crate) struct ReplyOrigins(Vec<(u64, u64, cuteafd_transport::ExpertV2SourceKind)>);
 impl ReplyOrigins {
+    pub(crate) fn combined_reply_eligible(&self) -> bool {
+        crate::shared::spark_waves::combined_reply_eligible(self.0.iter().map(|&(id, _, kind)|
+            (id, kind == cuteafd_transport::ExpertV2SourceKind::Prefill)))
+    }
+
     pub(crate) fn apply(self, request: &mut cuteafd_transport::ExpertProtocolV2Request) -> anyhow::Result<()> {
         anyhow::ensure!(request.rows.len() == self.0.len(), "packed Spark origin count differs from request rows");
         for (row, (id, position, kind)) in request.rows.iter_mut().zip(self.0) {

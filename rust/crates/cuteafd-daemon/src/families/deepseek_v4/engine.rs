@@ -1920,12 +1920,15 @@ impl<'a> Engine<'a> {
     fn wave_send(&self, layer: usize, t: usize, w: &Workspace<'_>, first: u64,
         members: Vec<(usize, usize, usize, usize)>, transport: &mut crate::shared::spark_waves::Waves<'_>) -> Result<crate::shared::spark_waves::WaveTicket> {
         let (h, topk) = (self.cfg.dim, self.cfg.n_activated_experts);
+        let combined_reply = if members.is_empty() { crate::shared::spark_waves::single_reply_eligible(t, ExpertV2SourceKind::Prefill) }
+            else { crate::shared::spark_waves::combined_reply_eligible(members.iter().flat_map(|&(_, rows, _, state)|
+                (0..rows).map(move |_| (state as u64 + 1, true)))) };
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, h + h / 32)?;
         let timer = Instant::now();
         // SAFETY: ids, weights and wire rows hold this unit's `t` rows in
         // stream order; the copies read them before later stream work.
         let ticket = unsafe {
-            transport.send(t, transport.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer, w.wire.buffer], self.stream,
+            transport.send(t, transport.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer, w.wire.buffer], self.stream, combined_reply,
                 Box::new(move |routes, wire| {
                     let mut request = spark_request(h, topk, layer, t, routes, wire, ExpertV2SourceKind::Prefill)?;
                     for row in &mut request.rows { row.token_position += first; }
@@ -1992,7 +1995,7 @@ impl<'a> Engine<'a> {
         // stream order (the segment's router ran before); the copies read
         // them before later stream work rewrites them.
         let ticket = unsafe {
-            exchange.send(t, exchange.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer, w.wire.buffer], self.stream,
+            exchange.send(t, exchange.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer, w.wire.buffer], self.stream, false,
                 Box::new(move |routes, wire| spark_request(h, topk, layer, t, routes, wire, ExpertV2SourceKind::Decode)))?
         };
         self.profile.borrow_mut().add(Phase::Routing, timer);

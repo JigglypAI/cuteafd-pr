@@ -110,6 +110,27 @@ fn validate_payload(payload_bytes: usize, capacity: usize) -> Result<()> {
     Ok(())
 }
 
+/// Eligibility is format-independent and known before asynchronous request staging.
+pub(crate) fn combined_reply_eligible(rows: impl IntoIterator<Item = (u64, bool)>) -> bool {
+    use cuteafd_core::SparkReplyFormat;
+    SparkReplyFormat::Fp8.combined(rows).format != SparkReplyFormat::Bf16
+}
+
+pub(crate) fn single_reply_eligible(rows: usize, kind: cuteafd_transport::ExpertV2SourceKind) -> bool {
+    combined_reply_eligible((0..rows).map(|_| (1, kind == cuteafd_transport::ExpertV2SourceKind::Prefill)))
+}
+
+/// Keep BF16 units out of the launch path, including during graph capture.
+fn for_compressed_reply<T>(eligible: bool, codec: Option<&T>, ranks: usize,
+    mut launch: impl FnMut(&T, usize) -> Result<()>) -> Result<()> {
+    if eligible {
+        if let Some(codec) = codec {
+            for rank in 0..ranks { launch(codec, rank)?; }
+        }
+    }
+    Ok(())
+}
+
 /// A wave handed to the worker; land it with [`Waves::land`], oldest first.
 #[derive(Debug)]
 #[must_use = "every sent wave must be landed in dispatch order"]
@@ -118,6 +139,7 @@ pub(crate) struct WaveTicket {
     slot: usize,
     rows: usize,
     payload_bytes: usize,
+    combined_reply: bool,
 }
 
 impl WaveTicket {
@@ -219,7 +241,7 @@ impl Words {
 /// Where a wave's request comes from.
 pub(crate) enum Source {
     /// Staged by the engine stream into the slot's arena; built on the worker.
-    Staged { layout: RouteStaging, build: BuildRequest },
+    Staged { layout: RouteStaging, build: BuildRequest, combined_reply: bool },
     /// Built on the host already (warm-ups, gates): posted as is.
     Built(ExpertProtocolV2Request),
 }
@@ -706,9 +728,13 @@ impl<T: Transport> Backend for Native<T> {
     fn counter(&self, counter: Counter) -> u32 { self.words.load(counter) }
 
     fn post(&mut self, job: Job) -> Result<Self::Wave> {
+        let expected_reply = match &job.source {
+            Source::Staged { combined_reply, .. } => Some(*combined_reply),
+            Source::Built(_) => None,
+        };
         let mut request = match job.source {
             Source::Built(request) => request,
-            Source::Staged { layout, build } => {
+            Source::Staged { layout, build, .. } => {
                 let arena = &self.arenas[job.slot];
                 // The slot's previous request was released when its wave landed.
                 ensure!(arena.writable(), "staging arena {} is still viewed by an unfinished request", job.slot);
@@ -721,6 +747,12 @@ impl<T: Transport> Backend for Native<T> {
                 build(routes, wire)?
             }
         };
+        if let Some(expected) = expected_reply {
+            let actual = request.header.flags & cuteafd_transport::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES == 0
+                && combined_reply_eligible(request.rows.iter().map(|row|
+                (row.source_request_id, row.source_kind == cuteafd_transport::ExpertV2SourceKind::Prefill)));
+            ensure!(expected == actual, "Spark host reply eligibility differs from built request");
+        }
         let mut payload_bytes = job.payload_bytes;
         if self.reply_format != cuteafd_core::SparkReplyFormat::Bf16
             && request.header.flags & cuteafd_transport::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES == 0 {
@@ -1105,6 +1137,12 @@ impl<'a> Waves<'a> {
 
     fn submit(&mut self, rows: usize, payload_bytes: usize, source: Source, stage: Option<(*mut c_void, RouteStaging,
         [CuteafdDeviceBuffer; 3])>) -> Result<WaveTicket> {
+        let combined_reply = match &source {
+            Source::Staged { combined_reply, .. } => *combined_reply,
+            Source::Built(request) => request.header.flags & cuteafd_transport::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES == 0
+                && combined_reply_eligible(request.rows.iter().map(|row|
+                (row.source_request_id, row.source_kind == cuteafd_transport::ExpertV2SourceKind::Prefill))),
+        };
         let cut = self.geometry.cut();
         ensure!(self.outstanding.len() < cut.waves, WaveError::Admission(self.outstanding.len()));
         ensure!(rows > 0 && rows <= cut.rows, WaveError::Rows { rows, capacity: cut.rows });
@@ -1158,7 +1196,7 @@ impl<'a> Waves<'a> {
         self.sequence = sequence;
         self.outstanding.push_back((sequence, slot, 0));
         self.next_slot = (slot + 1) % cut.waves;
-        Ok(WaveTicket { sequence, slot, rows, payload_bytes })
+        Ok(WaveTicket { sequence, slot, rows, payload_bytes, combined_reply })
     }
 
     /// Queues a `rows`-row wave with exactly `payload_bytes` per rank into the next return slot: its route ids, gate
@@ -1170,9 +1208,11 @@ impl<'a> Waves<'a> {
     /// `sources` are live device buffers of `layout`'s extents on `stream`'s
     /// device, written in `stream` order before this call (the copies read
     /// them in stream order, so later stream work may rewrite them).
+    /// `combined_reply` must equal the shared policy on the built row origins;
+    /// partial-reply requests always pass false. The worker checks this agreement.
     pub(crate) unsafe fn send(&mut self, rows: usize, payload_bytes: usize, layout: RouteStaging, sources: [CuteafdDeviceBuffer; 3],
-        stream: *mut c_void, build: BuildRequest) -> Result<WaveTicket> {
-        self.submit(rows, payload_bytes, Source::Staged { layout, build }, Some((stream, layout, sources)))
+        stream: *mut c_void, combined_reply: bool, build: BuildRequest) -> Result<WaveTicket> {
+        self.submit(rows, payload_bytes, Source::Staged { layout, build, combined_reply }, Some((stream, layout, sources)))
     }
 
     /// Queues a wave whose request the host already built (warm-ups, gates):
@@ -1211,13 +1251,12 @@ impl<'a> Waves<'a> {
             // SAFETY: as `pull`'s contract; behind the `landed` wait.
             unsafe { self.pull(ticket.sequence, slot, ticket.payload_bytes, rest, false, stream)? };
         }
-        if let Some(codec) = &self._storage.reply_decode {
-            for plane in self.slot_planes(slot) {
-                // SAFETY: all ranks landed, the slot is exclusive until consumed;
-                // staging and expansion are separate launches on this stream.
-                unsafe { codec.launch(slot, plane, self.words.ptr(Counter::ReplyFormat(slot)), ticket.rows, stream)?; }
-            }
-        }
+        for_compressed_reply(ticket.combined_reply, self._storage.reply_decode.as_ref(), self.ranks, |codec, rank| {
+            let plane = self.slot_planes(slot).nth(rank).context("reply plane missing")?;
+            // SAFETY: all ranks landed, the slot is exclusive until consumed;
+            // staging and expansion are separate launches on this stream.
+            unsafe { codec.launch(slot, plane, self.words.ptr(Counter::ReplyFormat(slot)), ticket.rows, stream) }
+        })?;
         self.unread[slot] = true;
         Ok(())
     }

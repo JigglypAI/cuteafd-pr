@@ -528,7 +528,9 @@ unsafe fn send_on<'a>(library: &'a NativeLibrary, stream: &LoadStream<'a>, link:
     // finished (caller contract).
     let ticket = unsafe {
         crate::shared::memory::chain::join(library, stage)?;
-        exchange.send(routed.rows as usize, exchange.compact_payload(routed.rows as usize), layout, sources, stage, build)?
+        exchange.send(routed.rows as usize, exchange.compact_payload(routed.rows as usize), layout, sources, stage,
+            crate::shared::spark_waves::combined_reply_eligible(rows.iter().map(|row|
+                (row.request_id, row.kind == cuteafd_transport::ExpertV2SourceKind::Prefill))), build)?
     };
     Ok((ticket, binding))
 }
