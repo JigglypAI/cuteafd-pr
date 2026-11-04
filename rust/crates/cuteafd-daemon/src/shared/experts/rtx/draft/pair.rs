@@ -21,7 +21,7 @@ pub(crate) struct Pair<'a> {
     peer_inputs: [Allocation<'a>; 3],
     peer_output: Allocation<'a>,
     output: Allocation<'a>,
-    copies: [V41PeerCopy<'a>; 2],
+    copy: V41PeerCopy<'a>,
     quantizer: V41ExpertInputQuantizer<'a>,
     reducer: V41RouteReducer<'a>,
     owner: Device<'a>,
@@ -58,10 +58,7 @@ impl<'a> Pair<'a> {
         for (rank, device) in devices.iter().enumerate() {
             device.run(|| device.library.cuda_enable_peer(devices[1 - rank].id))?;
         }
-        let copies = [
-            peer.run(|| owner.library.v41_peer_copy())?,
-            owner.run(|| owner.library.v41_peer_copy())?,
-        ];
+        let copy = peer.run(|| owner.library.v41_peer_copy())?;
         let quantizer = owner.run(|| owner.library.v41_expert_input_quantizer())?;
         let reducer = owner.library.v41_route_reducer()?;
         let [left, right] = weights;
@@ -81,7 +78,7 @@ impl<'a> Pair<'a> {
             ],
             peer_output: Allocation::new(owner, rows * layout.route_bytes())?,
             output: Allocation::new(owner, rows * layout.geometry.row_bytes() as usize)?,
-            copies,
+            copy,
             quantizer,
             reducer,
             owner,
@@ -136,7 +133,7 @@ impl<'a> Pair<'a> {
             library.cuda_event_record(self.ready.raw, stream)
         })?;
         let encoded = [self.wire.buffer, inputs[1], inputs[2]];
-        let peer_result = self.peer.device.run(|| unsafe {
+        self.peer.device.run(|| unsafe {
             library.cuda_stream_wait_event(self.peer.raw, self.ready.raw)?;
             for ((destination, source), width) in self
                 .peer_inputs
@@ -144,7 +141,7 @@ impl<'a> Pair<'a> {
                 .zip(encoded)
                 .zip(self.layout.input_bytes())
             {
-                self.copies[0].launch(
+                self.copy.launch(
                     destination.buffer,
                     source,
                     rows as usize * width,
@@ -157,18 +154,19 @@ impl<'a> Pair<'a> {
                 self.peer_inputs.each_ref().map(|v| v.buffer),
                 self.peer.raw,
             )?;
-            library.cuda_event_record(self.done.raw, self.peer.raw)?;
-            Ok(output)
+            // Push completed FP32 routes from their producer; the owner's join
+            // covers the peer write as well as its expert kernels.
+            self.copy.launch(
+                self.peer_output.buffer,
+                output,
+                rows as usize * self.layout.route_bytes(),
+                self.peer.raw,
+            )?;
+            library.cuda_event_record(self.done.raw, self.peer.raw)
         })?;
         self.owner.run(|| unsafe {
             let local = self.ranks[self.layout.owner].enqueue(stage, rows, encoded, stream)?;
             library.cuda_stream_wait_event(stream, self.done.raw)?;
-            self.copies[1].launch(
-                self.peer_output.buffer,
-                peer_result,
-                rows as usize * self.layout.route_bytes(),
-                stream,
-            )?;
             let mut planes = [std::ptr::null(); 4];
             planes[self.layout.owner] = local.ptr.cast();
             planes[1 - self.layout.owner] = self.peer_output.buffer.ptr.cast();

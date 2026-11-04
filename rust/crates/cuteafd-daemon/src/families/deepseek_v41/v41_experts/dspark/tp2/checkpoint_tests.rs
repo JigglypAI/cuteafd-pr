@@ -94,7 +94,7 @@ fn cuda_dspark_tp2_checkpoint_experts_and_graph() -> Result<()> {
             ExpertWeights::load(&lib, &catalog, ExpertLayer::Dspark { stage }, 8usize << 30)
         })?;
         let mut reference = owner.own(|| full.execution(256, 256, 2usize << 30))?;
-        for (rows, include_shared) in [1u32, 7, 16, 65, 112, 1]
+        for (rows, include_shared) in [1u32, 7, 16, 40, 65, 112, 1]
             .into_iter()
             .flat_map(|rows| [false, true].map(|shared| (rows, shared)))
         {
@@ -162,12 +162,22 @@ fn cuda_dspark_tp2_checkpoint_experts_and_graph() -> Result<()> {
                         reference.launch(rows, include_shared)?;
                         reference.synchronize()
                     })?;
+                    // Compare capture/replay with the identical eager TP2 route
+                    // before comparing against the unsplit checkpoint kernel.
+                    owner.run(|| unsafe {
+                        pair.enqueue(stage, rows, inputs, include_shared.then_some(shared), root.raw)
+                    })?;
+                    root.drain()?;
+                    let mut eager = vec![0; rows as usize * 10240];
+                    owner.run(|| lib.copy_d2h(&mut eager, pair.output()))?;
                     owner.run(|| unsafe { lib.cuda_graph_launch(graph, root.raw) })?;
                     root.drain()?;
-                    pair.drain_peer()?;
+                    ensure!(unsafe { lib.cuda_stream_query(pair.peer_stream().raw)? },
+                        "root completion did not cover the producer's route write");
                     let mut actual = vec![0; rows as usize * 10240];
                     let mut expected = actual.clone();
                     owner.run(|| lib.copy_d2h(&mut actual, pair.output()))?;
+                    assert_eq!(actual, eager, "draft TP2 eager/replay bytes differ at stage={stage} rows={rows} shared={include_shared} seed={seed}");
                     owner.run(|| lib.copy_d2h(&mut expected, reference.output().unwrap()))?;
                     let (actual, expected) = (values(&actual), values(&expected));
                     let mut error = 0f64;
