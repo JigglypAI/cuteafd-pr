@@ -486,7 +486,7 @@ mod tests {
         let manifest = root.path().join("PROGRAMS.json");
         let capacities = cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
             .capacities(128)?;
-        for ranks in [1, 2] {
+        for ranks in [1usize, 2] {
             let package = root.path().join(format!("exl3/exl3-kimik3-k23/rtx-tp{ranks}"));
             let mut inventory = Vec::new();
             for &capacity in &capacities {
@@ -495,7 +495,7 @@ mod tests {
                 let value = serde_json::json!({"hidden": 3584, "intermediate": 3072 / ranks,
                     "experts": 896, "top_k": 16, "capacity": capacity, "output_dtype": "fp32",
                     "input_format": "e4m3_k32", "trellis_lut": {"bytes": 32}, "buffers": {
-                        "scratch": {"allocation": "scratch", "bytes": capacity * 64 * ranks,
+                        "scratch": {"allocation": "scratch", "bytes": u64::from(capacity) * 64 * ranks as u64,
                             "dtype": "f32", "zero_on_create": false},
                         "state": {"allocation": "state", "bytes": 16,
                             "dtype": "i32", "zero_on_create": true}}});

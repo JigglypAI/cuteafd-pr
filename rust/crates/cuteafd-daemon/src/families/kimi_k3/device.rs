@@ -324,8 +324,13 @@ impl std::ops::DerefMut for LaneLayout {
 impl LaneLayout {
     pub(crate) fn new(cfg: &KimiK3Config, rows: usize, unit: usize, max_context: usize,
         scratch: NativeScratch) -> Result<Self> {
-        Ok(Self { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::new(
-            cfg, rows, unit, max_context, scratch)?, core: None })
+        Self::for_ranks(cfg, rows, unit, max_context, scratch, 2)
+    }
+
+    pub(crate) fn for_ranks(cfg: &KimiK3Config, rows: usize, unit: usize, max_context: usize,
+        scratch: NativeScratch, ranks: usize) -> Result<Self> {
+        Ok(Self { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::for_ranks(
+            cfg, rows, unit, max_context, scratch, ranks)?, core: None })
     }
 
     pub(crate) fn bytes(&self) -> Result<usize> {
