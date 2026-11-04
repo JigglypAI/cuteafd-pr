@@ -133,7 +133,10 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
             let terminal = self.terminal.get_mut();
             terminal.upload_sampling_on(terminal.stream.raw)
         }).and_then(|_| unsafe { self.enqueue_stage(requests, false) });
-        if queued.is_err() { self.cancel(); }
+        if let Err(error) = &queued {
+            tracing::error!(%error, "distributed terminal submission failed before cancellation drain");
+            self.cancel();
+        }
         queued
     }
     pub fn poll(&mut self) -> Result<bool> {
@@ -175,7 +178,10 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
                 }
             }
         })();
-        if result.is_err() { self.cancel(); }
+        if let Err(error) = &result {
+            tracing::error!(%error, "distributed terminal failed before cancellation drain");
+            self.cancel();
+        }
         result
     }
     pub fn cancel(&mut self) {

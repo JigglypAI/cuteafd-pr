@@ -13,7 +13,7 @@ use std::{ffi::c_void, rc::Rc};
 pub(crate) struct Pair<'a> {
     // External root stream and its graphs must be drained/destroyed by caller
     // first. Our peer stream drains before any of its referenced allocations.
-    peer: Stream<'a>,
+    peer: Rc<Stream<'a>>,
     ready: Event<'a>,
     done: Event<'a>,
     ranks: [Wave<'a>; 2],
@@ -69,7 +69,7 @@ impl<'a> Pair<'a> {
         let rows = capacity as usize;
         let widths = layout.input_bytes();
         Ok(Self {
-            peer: Stream::new(peer)?,
+            peer: Rc::new(Stream::new(peer)?),
             ready: Event::new(owner)?,
             done: Event::new(peer)?,
             ranks,
@@ -182,6 +182,10 @@ impl<'a> Pair<'a> {
                 stream,
             )
         })
+    }
+    /// Keep the peer alive in submission guards, including before a join exists.
+    pub fn peer_stream(&self) -> Rc<Stream<'a>> {
+        Rc::clone(&self.peer)
     }
     /// Used after ending a failed capture or after root completion on error.
     pub fn drain_peer(&self) -> Result<()> {
