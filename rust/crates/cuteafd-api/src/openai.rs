@@ -65,7 +65,6 @@ impl ModelEncoding {
     pub fn supports_thinking_off(&self) -> bool {
         match self {
             Self::Step5(encoding) => encoding.supports_thinking_off(),
-            Self::Muse(_) => false,
             Self::Mistral(encoding) => encoding.supports_thinking_off(),
             _ => true,
         }
@@ -640,9 +639,9 @@ impl Templated {
                 Ok(glm5::GlmThinking { enabled: true, effort: None })
             }
             Self::Muse(_) => {
-                muse::prompt::validate_thinking(body)?;
-                muse::prompt::template_effort(body)?;
-                Ok(glm5::GlmThinking { enabled: true, effort: None })
+                let enabled = glm5::resolve_thinking(body)?;
+                if enabled { muse::prompt::template_effort(body)?; }
+                Ok(glm5::GlmThinking { enabled, effort: None })
             }
             // The template renders an effort, never thinking off; the model may still answer
             // without a `[THINK]` block, so output starts as content.
@@ -891,6 +890,11 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         if glm_request.is_none() { return Err(Rejection::bad("audio requires a checkpoint chat template")); }
         media::audio::strip_adapter_audio(&mut body);
     }
+    if matches!(&glm_request, Some((Templated::Muse(_), _, _))) {
+        if let Some(kind) = body.get("thinking").and_then(Value::as_str).map(str::to_owned) {
+            body["thinking"] = json!({"type": kind.to_ascii_lowercase()});
+        }
+    }
     let mut parsed: ChatCompletionRequest = serde_json::from_value(body).map_err(Rejection::bad)?;
     let include_usage = parsed.include_usage();
     let parallel = parsed.parallel_tool_calls.unwrap_or(true);
@@ -935,6 +939,8 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         converted.conversation.tool_choice, selection.required, parallel,
         assistance || response_format.as_ref().is_some_and(|v| v["type"] != "text"), syntax).map_err(Rejection::bad)?;
     let constraint = match (&profile.encoding, profile.encoding.think_close_token_id()) {
+        (ModelEncoding::Muse(_), _) if !converted.conversation.thinking_mode =>
+            constraints::response_constraint(response_format.clone(), false, tool_constraints.as_ref(), 0),
         (ModelEncoding::Muse(_), _) => constraints::muse_response_constraint(response_format.clone(), tool_constraints.as_ref()),
         (ModelEncoding::Mistral(encoding), _) => constraints::mistral_response_constraint(response_format.clone(),
             tool_constraints.as_ref(), encoding.tokens().think),
@@ -1008,7 +1014,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
                 stop_sequences: converted.parsing_options.stop_sequences.clone() });
             (prompt, Vec::new(), OutputProcessor::Step5(glm5::GlmStreamProcessor::new(generator, parser)))
         }
-        Some((Templated::Muse(encoding), raw, _thinking)) => {
+        Some((Templated::Muse(encoding), raw, thinking)) => {
             let tool_choice = match (selection.name(), selection.required) {
                 (Some(name), _) => muse::MuseToolChoice::Named(name.to_owned()),
                 (None, true) => muse::MuseToolChoice::Required,
@@ -1021,6 +1027,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
                 encoding.render(&raw, &options).map_err(Rejection::bad)?
             };
             let parser = muse::MuseOutputParser::new(muse::MuseParserOptions {
+                prefilled_user: !thinking.enabled,
                 tools: (tools_declared && converted.conversation.tool_choice != deepseek_recipe_core::tools::ToolChoice::None)
                     .then(|| converted.conversation.tools.clone()),
                 stop_sequences: converted.parsing_options.stop_sequences.clone() });
@@ -1787,6 +1794,68 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn muse_thinking_off_renders_and_streams_visible_content() {
+        for thinking in [json!("disabled"), json!({"type":"disabled"})] {
+            for streaming in [false, true] {
+                let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+                let worker = tokio::spawn(async move {
+                    let job = rx.recv().await.unwrap();
+                    assert!(job.prompt.ends_with("<|start|>assistant to=user<|message|>"));
+                    for event in [
+                        InferenceChunk::Ready { system_fingerprint: None,
+                            prompt_usage: PromptUsage { prompt_tokens: 12, prompt_cache_hit_tokens: 0 } },
+                        InferenceChunk::Text { content: "Direct ".into(), content_tokens: 1 },
+                        InferenceChunk::Text { content: "answer".into(), content_tokens: 1 },
+                        InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop },
+                    ] { job.events.send(Ok(event)).unwrap(); }
+                });
+                let profile = ModelProfile::new("muse-test", ModelEncoding::Muse(Arc::new(muse::fixtures::encoding())));
+                assert!(profile.encoding.supports_thinking_off());
+                let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                    std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+                let mut body = json!({"model":"muse-test", "messages":[{"role":"user","content":"Hi"}],
+                    "thinking":thinking, "max_tokens":8, "stream":streaming});
+                if streaming { body["stream_options"] = json!({"include_usage":true}); }
+                let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                let values: Vec<Value> = if streaming {
+                    std::str::from_utf8(&bytes).unwrap().lines().filter_map(|line| line.strip_prefix("data: "))
+                        .filter(|line| *line != "[DONE]").map(|line| serde_json::from_str(line).unwrap()).collect()
+                } else { vec![serde_json::from_slice(&bytes).unwrap()] };
+                let content: String = values.iter().filter_map(|v| {
+                    let message = if streaming { &v["choices"][0]["delta"] } else { &v["choices"][0]["message"] };
+                    assert!(message["reasoning_content"].as_str().is_none_or(str::is_empty));
+                    message["content"].as_str()
+                }).collect();
+                assert_eq!(content, "Direct answer");
+                let usage = values.iter().find_map(|v| v.get("usage").filter(|v| !v.is_null())).unwrap();
+                assert_eq!(usage["completion_tokens"], 2);
+                assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0), 0);
+                worker.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn muse_thinking_off_refuses_tools_before_admission() {
+        let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+        let profile = ModelProfile::new("muse-test", ModelEncoding::Muse(Arc::new(muse::fixtures::encoding())));
+        let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+        let body = json!({"model":"muse-test", "messages":[{"role":"user","content":"Weather?"}],
+            "thinking":{"type":"disabled"}, "tools":[{"type":"function","function":{"name":"weather",
+                "parameters":{"type":"object","properties":{}}}}]});
+        let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert!(std::str::from_utf8(&bytes).unwrap().contains("cannot be combined with tools"));
+        assert!(rx.try_recv().is_err());
+    }
+
     /// Muse renders its own prompt, stops at its EOS ids and routes the
     /// recipient-addressed messages: reasoning, content and a released call.
     #[tokio::test]
@@ -1842,7 +1911,7 @@ mod tests {
     /// Constrained Muse requests carry the native recipient-turn grammar:
     /// strict or required tools (atem `muse_tool_schema` tags), assistance and
     /// structured response formats; unconstrained ones carry none. Thinking off
-    /// still refuses (the template always reasons).
+    /// starts directly in the constrained answer body.
     #[tokio::test]
     async fn muse_constrained_requests_carry_the_native_turn_grammar() {
         let weather = json!({"type": "function", "function": {"name": "get_weather",
@@ -1877,7 +1946,11 @@ mod tests {
         let (job, _) = send(json!({"tools": [weather]})).await;
         assert_eq!(job, Some(None), "plain auto tools stay unconstrained");
         let (job, status) = send(json!({"enable_thinking": false})).await;
-        assert!(job.is_none() && status == Some(StatusCode::BAD_REQUEST));
+        assert_eq!(job, Some(None), "thinking off is unconstrained without a response format: {status:?}");
+        let (job, _) = send(json!({"thinking":{"type":"disabled"}, "response_format":{"type":"json_object"}})).await;
+        let grammar: Value = serde_json::from_str(&job.flatten().expect("direct JSON constraint")).unwrap();
+        assert_eq!(grammar["format"]["type"], "ds41_json_schema");
+        assert_eq!(grammar["format"]["json_schema"]["type"], "object");
     }
 
     #[tokio::test]
