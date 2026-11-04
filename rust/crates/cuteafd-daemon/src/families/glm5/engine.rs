@@ -30,6 +30,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use cuteafd_loader::serving_capacity::{glm_decode_row_bucket,
     glm_decode_table_width, glm_decode_table_widths, GLM_SHORT_ROW_BUCKETS};
+use cuteafd_loader::serving_capacity::glm_graphs::{GlmGraphKey as GraphKey, GlmGraphPrevious as Previous};
 use std::ffi::c_void;
 use crate::shared::experts::rtx::{pair::Pair, ExpertInput, Routes, ExchangeDtype, RtxExpertLayer};
 
@@ -74,26 +75,6 @@ const SKIP_RANKS: usize = cuteafd_loader::placement::families::glm5::SKIP_RANKS;
 pub(crate) const DECODE_ROWS: usize = 64;
 /// Fewest rows per lane worth another exchange per layer.
 const MIN_LANE_ROWS: usize = 256;
-
-/// What precedes a decode segment's residual norm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Previous {
-    First,
-    Delta,
-    Planes(usize),
-}
-
-/// Everything a captured decode segment bakes in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct GraphKey {
-    layer: usize,
-    rows: usize,
-    table_width: usize,
-    table_stride: usize,
-    previous: Previous,
-    /// The last segment ends in the head and the greedy selection.
-    head: bool,
-}
 
 struct GraphExec<'a>(*mut c_void, &'a NativeLibrary);
 
@@ -1405,14 +1386,20 @@ impl<'a> GlmEngine<'a> {
         let started = std::time::Instant::now();
         let free = |rank: usize| self.on(rank, || self.library.cuda_memory_info().map(|(free, _)| free as i64));
         let before: Vec<i64> = (0..self.ranks()).map(free).collect::<Result<_>>()?;
-        let owned = if self.layers_kv() {
-            let owners: Vec<_> = self.weights.layers.iter().map(|layer| layer.attention_owner.unwrap()).collect();
-            let tp2: Vec<_> = (0..owners.len()).map(|layer| self.tp2_layer(layer)).collect();
-            Some(cuteafd_loader::serving_capacity::glm_graphs::glm_owned_startup_graphs(
-                self.max_context, self.pages, &owners, &tp2).map_err(anyhow::Error::msg)?)
-        } else { None };
-        let shapes = owned.as_ref().map(|startup| startup.keys.clone()).unwrap_or_else(||
-            cuteafd_loader::serving_capacity::glm_graphs::glm_graph_shapes(self.max_context, self.pages));
+        use cuteafd_loader::placement::attention::AttentionPlacement;
+        use cuteafd_loader::serving_capacity::glm_graphs::{glm_declared_graphs, glm_graph_shapes, GlmGraphLayer};
+        ensure!(!self.graphs_warmed.get() && self.graphs.borrow().is_empty()
+            && self.peer.as_ref().is_none_or(|peer| peer.graphs.borrow().is_empty()),
+            "GLM startup graph inventory already captured");
+        let attention = if self.layers_kv() { AttentionPlacement::Layers }
+            else if self.context_kv() { AttentionPlacement::Context } else { AttentionPlacement::Heads };
+        let layers: Vec<_> = self.weights.layers.iter().enumerate().map(|(index, layer)| GlmGraphLayer {
+            dense: layer.dense, tp2: self.tp2_layer(index), attention_owner: layer.attention_owner }).collect();
+        let return_ranks = if self.skip.is_some() { SKIP_RANKS }
+            else if let Some((link, _)) = experts.as_mut() { link.exchange()?.ranks() } else { 0 };
+        let shapes = glm_graph_shapes(self.max_context, self.pages);
+        let declared = glm_declared_graphs(&shapes, attention, self.ranks(), &layers, return_ranks)
+            .map_err(anyhow::Error::msg)?;
         self.graphs_warming.set(true);
         for shape in &shapes {
             let (width, bucket) = (shape.table_width, shape.rows);
@@ -1423,21 +1410,13 @@ impl<'a> GlmEngine<'a> {
             let experts = experts.as_mut().map(|(link, runtime)| (&mut **link, *runtime));
             self.step(&tables, &vec![0; bucket], bucket, experts, None)?;
         }
-        if let Some(startup) = &owned {
-            let execution = self.layer_execution.as_ref().context("GLM layer execution")?;
-            for rank in 0..2 {
-                let graphs = if rank == 0 { self.graphs.borrow() } else { self.peer()?.graphs.borrow() };
-                ensure!(graphs.len() as u64 == startup.inventory.ranks[rank].executables,
-                    "GLM rank {rank} captured {} graphs, GraphSet expected {}", graphs.len(), startup.inventory.ranks[rank].executables);
-                for shape in &startup.keys {
-                    for segment in execution.segments.iter().filter(|segment| segment.rank == rank) {
-                        ensure!(graphs.contains_key(&GraphKey { layer: segment.phase.key(segment.layer), rows: shape.rows,
-                            table_width: shape.table_width, table_stride: shape.table_width, previous: Previous::First, head: false }),
-                            "GLM startup capture missing from GraphSet: {segment:?} {shape:?}");
-                    }
-                }
-            }
-            tracing::info!(inventory = ?startup.inventory, "GLM owned startup GraphSet captured");
+        for (rank, expected) in declared.iter().enumerate() {
+            let graphs = if rank == 0 { self.graphs.borrow() } else { self.peer()?.graphs.borrow() };
+            expected.verify(graphs.keys()).map_err(anyhow::Error::msg)
+                .with_context(|| format!("GLM rank {rank} startup graph coverage"))?;
+            let fingerprint = expected.fingerprint(rank as u8).map_err(anyhow::Error::msg)?;
+            tracing::info!(rank, ?attention, graphs = expected.len(), %fingerprint,
+                "GLM declared startup graph set captured exactly");
         }
         // SAFETY: both ranks' streams are live; nothing else is queued.
         unsafe { self.library.cuda_stream_synchronize(self.stream)? };

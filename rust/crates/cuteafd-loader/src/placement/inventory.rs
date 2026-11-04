@@ -420,6 +420,61 @@ pub struct StartupGraphs<K> {
     pub keys: Vec<K>,
 }
 
+/// An independently declared exact executable-key set. Memory observations and
+/// node counts never participate in its identity. Keys must serialize stable
+/// launch geometry, with no pointer addresses or process-local identifiers.
+#[derive(Debug, Clone)]
+pub struct DeclaredGraphSet<K> {
+    keys: std::collections::HashSet<K>,
+}
+
+impl<K: std::hash::Hash + Eq + Clone + std::fmt::Debug> DeclaredGraphSet<K> {
+    pub fn new(keys: &[K]) -> Result<Self, String> {
+        let declared = keys.iter().cloned().collect::<std::collections::HashSet<_>>();
+        if declared.len() != keys.len() { return Err("duplicate startup graph key".into()); }
+        Ok(Self { keys: declared })
+    }
+
+    pub fn contains(&self, key: &K) -> bool { self.keys.contains(key) }
+    pub fn len(&self) -> usize { self.keys.len() }
+    pub fn is_empty(&self) -> bool { self.keys.is_empty() }
+
+    pub fn verify<'a>(&self, actual: impl IntoIterator<Item = &'a K>) -> Result<(), String>
+        where K: 'a {
+        let mut seen = std::collections::HashSet::new();
+        for key in actual {
+            if !seen.insert(key) || !self.contains(key) {
+                return Err(format!("unexpected or duplicate startup graph key: {key:?}"));
+            }
+        }
+        if seen.len() != self.len() {
+            return Err(format!("startup graph coverage differs: declared {}, captured {}", self.len(), seen.len()));
+        }
+        Ok(())
+    }
+
+    /// Sort the serialized keys and length-frame every entry, so declaration
+    /// order and randomized HashSet iteration do not affect a rank's identity.
+    pub fn fingerprint(&self, rank: u8) -> Result<String, String> where K: Serialize {
+        use sha2::{Digest, Sha256};
+        let mut encoded = self.keys.iter().map(serde_json::to_vec)
+            .collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+        encoded.sort_unstable();
+        if encoded.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err("distinct startup graph keys serialize identically".into());
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"cuteafd-declared-graphs-v1\0");
+        hash.update([rank]);
+        hash.update((encoded.len() as u64).to_le_bytes());
+        for key in encoded {
+            hash.update((key.len() as u64).to_le_bytes());
+            hash.update(key);
+        }
+        Ok(format!("{:x}", hash.finalize()))
+    }
+}
+
 /// A measured V4.1 executable class on one lane/device. bindings counts stable
 /// source/table geometries of this exact row shape, not a padding bucket.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -603,6 +658,35 @@ mod tests {
             std::fs::remove_file(root.join("manifest.json")).unwrap();
             assert!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 1).is_none());
         }
+    }
+
+    #[test]
+    fn declared_graph_identity_is_order_independent_ranked_and_exact() {
+        let keys = [(0u32, 1u32, 16u32), (1, 4, 32), (2, 64, 256)];
+        let declared = DeclaredGraphSet::new(&keys).unwrap();
+        let reversed = DeclaredGraphSet::new(&keys.into_iter().rev().collect::<Vec<_>>()).unwrap();
+        let fingerprint = declared.fingerprint(0).unwrap();
+        assert_eq!(fingerprint, reversed.fingerprint(0).unwrap());
+        assert_ne!(fingerprint, declared.fingerprint(1).unwrap());
+        declared.verify(keys.iter().rev()).unwrap();
+        assert!(declared.verify(keys[..2].iter()).is_err());
+        assert!(declared.verify(keys.iter().chain([&(3, 1, 16)])).is_err());
+        assert!(declared.verify(keys.iter().chain(keys[..1].iter())).is_err());
+        assert!(DeclaredGraphSet::new(&[keys[0], keys[0]]).is_err());
+        let changed = DeclaredGraphSet::new(&[(0, 1, 16), (1, 4, 32), (2, 64, 512)]).unwrap();
+        assert_ne!(fingerprint, changed.fingerprint(0).unwrap());
+        let empty = DeclaredGraphSet::<u32>::new(&[]).unwrap();
+        assert!(empty.is_empty());
+        empty.verify([].iter()).unwrap();
+        assert_ne!(empty.fingerprint(0).unwrap(), empty.fingerprint(1).unwrap());
+    }
+
+    #[test]
+    fn declared_graph_identity_rejects_lossy_key_serialization() {
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+        struct Lossy { stable: u32, #[serde(skip)] omitted: u32 }
+        let keys = [Lossy { stable: 1, omitted: 0 }, Lossy { stable: 1, omitted: 1 }];
+        assert!(DeclaredGraphSet::new(&keys).unwrap().fingerprint(0).is_err());
     }
 
     #[test]
