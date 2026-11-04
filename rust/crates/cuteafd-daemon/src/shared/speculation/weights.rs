@@ -176,7 +176,9 @@ mod tests {
         write_safetensors(&path, &tensors);
         let file = std::fs::OpenOptions::new().write(true).open(&path)?;
         for tensor in read_safetensors_metadata(&path)? {
-            let bytes = (0..tensor.byte_length).map(|i| (i as u8).wrapping_mul(29) ^ tensor.name.len() as u8).collect::<Vec<_>>();
+            let seed = tensor.name.bytes().fold(0xcbf29ce484222325u64,
+                |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)).to_le_bytes();
+            let bytes = (0..tensor.byte_length).map(|i| (i as u8).wrapping_mul(29) ^ seed[i as usize % seed.len()]).collect::<Vec<_>>();
             file.write_all_at(&bytes, tensor.byte_offset)?;
         }
         Ok(())
