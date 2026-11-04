@@ -1330,7 +1330,7 @@ pub(super) mod tests {
         let (unit, waves, slots, marks) = (1024, 3, 2, 2);
         let rows = unit * waves;
         let spark_bytes = 110 << 30;
-        let report = plan_input.plan(&PlanOptions {
+        let options = PlanOptions {
             placement: ExpertPlacement::Sparks { ranks: 6 }, coordinator_budget_bytes: capacity,
             layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 rtx_bytes: vec![capacity], head_split: false, concurrency: slots as u64,
@@ -1340,7 +1340,8 @@ pub(super) mod tests {
                 workspace_manifest: Some(path.clone()), onboard: Some(OnboardSetting::Auto),
                 spark_allocation_budget_bytes: Some(spark_bytes), ..Default::default() }),
             ..Default::default()
-        })?;
+        };
+        let report = plan_input.plan(&options)?;
         ensure!(report.fits && report.placement_supported && report.executable(), "{:?}", report.hints);
         let catalog = plan_input.expert_catalog()?;
         let mut rtx = plan_rtx_for_ranks(&cfg, &catalog,
@@ -1360,19 +1361,25 @@ pub(super) mod tests {
         let code = cuteafd_loader::placement::inventory::loaded_code_allowance(
             "kimik3", "exl3", false, 0, arch, Some(&programs));
         let resident = code.bytes - arch.cublas_bytes;
-        let mut i = inputs_for_ranks::<1>(&cfg);
-        i.resident_weight_limit = ResidentWeights(capacity);
-        i.rows = rows; i.waves = waves; i.unit_rows = Some(unit);
-        i.lanes = 1; i.state_slots = slots; i.prefix_marks = marks;
-        i.cache_format = cuteafd_core::MlaCacheFormat::Fp8;
-        i.lane_layouts = vec![[LaneLayout::for_ranks(&cfg, rows, unit, context,
-            allocation::NativeScratch::from_manifest_for_ranks(&manifest, 1)?, 1)?]];
-        i.fixed = vec![allocation::code_demand_for_ranks(0,
-            code.pending(arch.context_bytes + resident, arch.context_bytes), arch.cublas_bytes, 1, 1)?];
-        i.startup = vec![super::super::graphs::demand(
-            &super::super::graphs::inventory_for_ranks(&cfg, 1, unit, slots, 0, 1, |_, _| true)?.inventory, 0)];
-        i.gpus[0] = GpuBudget { capacity_bytes: capacity, headroom_bytes: 2 << 30,
-            baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes - resident } };
+        let runtime_inputs = || -> Result<_> {
+            let mut i = inputs_for_ranks::<1>(&cfg);
+            i.resident_weight_limit = ResidentWeights(options.coordinator_budget_bytes);
+            i.rows = rows; i.waves = waves; i.unit_rows = Some(unit);
+            i.lanes = 1; i.state_slots = slots; i.prefix_marks = marks;
+            i.cache_format = cuteafd_core::MlaCacheFormat::Fp8;
+            i.lane_layouts = vec![[LaneLayout::for_ranks(&cfg, rows, unit, context,
+                allocation::NativeScratch::from_manifest_for_ranks(&manifest, 1)?, 1)?]];
+            i.fixed = vec![allocation::code_demand_for_ranks(0,
+                code.pending(arch.context_bytes + resident, arch.context_bytes), arch.cublas_bytes, 1, 1)?];
+            i.startup = vec![super::super::graphs::demand(
+                &super::super::graphs::inventory_for_ranks(&cfg, 1, unit, slots, 0, 1, |_, _| true)?.inventory, 0)];
+            i.gpus[0] = GpuBudget { capacity_bytes: capacity, headroom_bytes: 2 << 30,
+                baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes - resident } };
+            Ok(i)
+        };
+        assert_eq!(request(runtime_inputs()?)?.resident_weight_limit,
+            Some(ResidentWeights(options.coordinator_budget_bytes)));
+        let mut i = runtime_inputs()?;
         i.rtx = Some(rtx); i.spark_budget = Some(spark);
         let admitted = admit(i)?;
         let memory = report.memory_layout.context("single-owner installed ledger")?;

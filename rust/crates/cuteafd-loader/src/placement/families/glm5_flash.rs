@@ -1018,10 +1018,11 @@ mod tests {
             planned.sequences as usize, options.glm_draft_sequences() as usize, None);
         let config = draft_config();
         let draft_capacity = crate::families::glm5::draft_representation::flash_draft_capacity(&config, slots, batch).unwrap();
-        let (bytes, scratch) = drafter_inventory(&config, draft_capacity.context_slots, draft_capacity.max_batch_sequences, &[188; 2],
+        let (owned, scratch) = drafter_inventory(&config, draft_capacity.context_slots, draft_capacity.max_batch_sequences, &[188; 2],
             crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only,
             2, options.draft_kv_cache).unwrap();
-        planned.drafter_bytes = bytes;
+        planned.drafter_bytes = owned.memory.resident;
+        planned.drafter_weights = owned.resident_weights;
         planned.drafter_scratch = scratch;
         let mut runtime = planned.clone();
         let boot = cuteafd_core::serving_capacity::default_concurrency(capacity);
