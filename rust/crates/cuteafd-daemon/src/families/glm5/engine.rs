@@ -1828,7 +1828,7 @@ impl<'a> GlmEngine<'a> {
                     self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes)?;
                 }
                 if let Previous::Planes(ranks) = previous {
-                    if let Some(reduction) = reduction {
+                    if let Some(reduction) = &reduction {
                         // SAFETY: the landed decode slot and workspace outlive graph replay.
                         unsafe { reduction.launch(self.library, w.shared.buffer.ptr.cast(),
                             w.delta.buffer.ptr.cast(), t, self.stream)?; }

@@ -120,26 +120,21 @@ pub(crate) fn single_reply_eligible(rows: usize, kind: cuteafd_transport::Expert
     combined_reply_eligible((0..rows).map(|_| (1, kind == cuteafd_transport::ExpertV2SourceKind::Prefill)))
 }
 
-/// Keep BF16 units out of the launch path, including during graph capture.
-fn for_compressed_reply<T>(eligible: bool, codec: Option<&T>, ranks: usize,
-    mut launch: impl FnMut(&T, usize) -> Result<()>) -> Result<()> {
-    if eligible {
-        if let Some(codec) = codec {
-            for rank in 0..ranks { launch(codec, rank)?; }
-        }
-    }
-    Ok(())
-}
+fn compressed_reduction(eligible: bool, available: bool) -> bool { eligible && available }
 
-/// Slot-owned reply reduction binding, never a raw-BF16 plane view. Copies
-/// retain the owner's stream/graph lifetime contract, not ownership of storage.
-#[derive(Clone, Copy)]
-pub(crate) struct ReplyReduction {
+/// Slot-owned reply reduction binding, never a raw-BF16 plane view. The
+/// owner retains the planes and mode word through stream/graph drainage.
+#[derive(Clone)]
+pub(crate) struct ReplyReduction<'a> {
     planes: [*const u16; MAX_INTAKE_RANKS],
     ranks: u32,
+    hidden: usize,
+    capacity: usize,
+    fused: Option<std::rc::Rc<cuteafd_ffi::programs::BoundProgram<'a>>>,
+    mode: *mut u32,
 }
 
-impl ReplyReduction {
+impl ReplyReduction<'_> {
     /// Launches the same reduction used by `Waves::reduce`, without consuming
     /// the slot. Captured decode publishes consumption after each replay.
     ///
@@ -147,12 +142,25 @@ impl ReplyReduction {
     /// The owner and its unchanged slot cut outlive stream completion and all
     /// graph replays. `land` precedes every execution; shared/output are live
     /// BF16 [rows, hidden] views on this device, with no plane/output overlap.
-    pub(crate) unsafe fn launch(self, library: &NativeLibrary, shared: *const u16,
+    pub(crate) unsafe fn launch(&self, library: &NativeLibrary, shared: *const u16,
         output: *mut u16, rows: usize, stream: *mut c_void) -> Result<()> {
-        // SAFETY: land currently expands compressed replies before this launch;
-        // the opaque binding cannot be passed to a raw-BF16 reducer by callers.
-        unsafe { library.v41_compact_reducer()?.reduce_planes(self.planes, self.ranks, shared,
-            output, u32::try_from(rows)?, stream) }
+        ensure!(rows <= self.capacity, "reply reduction rows exceed slot capacity");
+        if let Some(program) = &self.fused {
+            use cuteafd_ffi::programs::Scalar;
+            let mut pointers = [std::ptr::null_mut(); MAX_INTAKE_RANKS + 3];
+            for (pointer, plane) in pointers.iter_mut().zip(self.planes) { *pointer = plane.cast_mut().cast(); }
+            pointers[MAX_INTAKE_RANKS] = shared.cast_mut().cast();
+            pointers[MAX_INTAKE_RANKS + 1] = output.cast();
+            pointers[MAX_INTAKE_RANKS + 2] = self.mode.cast();
+            // SAFETY: live slot planes/mode and disjoint output, retained through drainage.
+            unsafe { program.launch(&pointers, &[Scalar::I32(i32::try_from(rows)?),
+                Scalar::I32(i32::try_from(self.hidden)?), Scalar::I32(i32::try_from(self.ranks)?),
+                Scalar::I32(i32::from(!shared.is_null())), Scalar::I32(-1)], stream) }
+        } else {
+            // SAFETY: this binding only selects the native reducer for BF16 units.
+            unsafe { library.v41_compact_reducer()?.reduce_planes(self.planes, self.ranks, shared,
+                output, u32::try_from(rows)?, stream) }
+        }
     }
 }
 
@@ -961,7 +969,7 @@ fn warm_reducer(library: &NativeLibrary, intake: &Intake) -> Result<()> {
 pub(crate) struct ExchangeStorage<'a> {
     control: HostAllocation<'a>,
     pull_block: Option<HostAllocation<'a>>,
-    reply_decode: Option<ReplyDecode<'a>>,
+    reply_reduce: Option<std::rc::Rc<cuteafd_ffi::programs::BoundProgram<'a>>>,
     geometry: SlotGeometry,
     prefill: bool,
     format: cuteafd_core::SparkReplyFormat,
@@ -979,8 +987,11 @@ impl<'a> ExchangeStorage<'a> {
             ensure!(alias.ptr == block.buffer.ptr,
                 "mapped pinned memory is not device-visible at its host address (no unified addressing)");
         }
-        let reply_decode = ReplyDecode::new(library, intake, format)?;
-        Ok(Self { control, pull_block, reply_decode, geometry: intake.geometry.clone(), prefill: intake.prefill, format })
+        let reply_reduce = if combined_codec_enabled(intake, format) {
+            Some(std::rc::Rc::new(library.programs()?.bound("expert_reply_reduce",
+                &["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "shared", "out", "mode"])?))
+        } else { None };
+        Ok(Self { control, pull_block, reply_reduce, geometry: intake.geometry.clone(), prefill: intake.prefill, format })
     }
 
     pub(crate) fn matches(&self, intake: &Intake) -> bool {
@@ -1001,47 +1012,9 @@ impl<'a> ExchangeStorage<'a> {
     }
 }
 
-/// One allocation with independent slot slices, reused rank-by-rank on each
-/// slot's consumer stream. Other slots may land concurrently on other streams.
-struct ReplyDecode<'a> {
-    stage: cuteafd_ffi::programs::BoundProgram<'a>,
-    decode: cuteafd_ffi::programs::BoundProgram<'a>,
-    scratch: crate::shared::memory::DeviceAllocation<'a>,
-    geometry: SlotGeometry,
-    row_bytes: usize,
-}
-impl<'a> ReplyDecode<'a> {
-    pub(crate) fn new(library: &'a NativeLibrary, intake: &Intake, format: cuteafd_core::SparkReplyFormat) -> Result<Option<Self>> {
-        let hidden = cuteafd_core::expert_geometry().hidden as usize;
-        let bytes = format.combined_scratch_bytes(hidden, intake.geometry.cut().rows, intake.geometry.slots(),
-            intake.prefill, cuteafd_core::expert_geometry().partial_replies()).context("reply scratch overflow")?;
-        if bytes == 0 { return Ok(None); }
-        let programs = library.programs()?;
-        Ok(Some(Self { stage: programs.bound("expert_reply_stage", &["source", "out", "mode"])?,
-            decode: programs.bound("expert_reply_dequantize", &["source", "out", "mode"])?,
-            scratch: crate::shared::memory::DeviceAllocation::named(library, bytes, "spark-intake/reply_codec")?,
-            geometry: intake.geometry.clone(), row_bytes: format.row_bytes(hidden).context("invalid reply codec width")? }))
-    }
-    pub(crate) fn matches(&self, intake: &Intake, format: cuteafd_core::SparkReplyFormat) -> bool {
-        self.geometry == intake.geometry
-            && format.row_bytes(cuteafd_core::expert_geometry().hidden as usize) == Some(self.row_bytes)
-    }
-    unsafe fn launch(&self, slot: usize, plane: CuteafdDeviceBuffer, mode: *mut u32, rows: usize, stream: *mut c_void) -> Result<()> {
-        use cuteafd_ffi::programs::Scalar;
-        ensure!(rows <= self.geometry.cut().rows, "reply codec rows exceed slot capacity");
-        let (offset, bytes) = self.geometry.slice(slot, self.row_bytes);
-        ensure!(offset.checked_add(bytes).is_some_and(|end| end <= self.scratch.buffer.bytes),
-            "reply codec slot exceeds scratch allocation");
-        let scratch = (self.scratch.buffer.ptr as usize + offset) as *mut c_void;
-        let scalars = [Scalar::I32(i32::try_from(rows)?),
-            Scalar::I32(i32::try_from(cuteafd_core::expert_geometry().hidden)?), Scalar::I32(-1)];
-        // SAFETY: caller's live plane and format word; this slot's exclusive
-        // scratch is retained by the link until all consumer streams drain.
-        unsafe {
-            self.stage.launch(&[plane.ptr, scratch, mode.cast()], &scalars, stream)?;
-            self.decode.launch(&[scratch, plane.ptr, mode.cast()], &scalars, stream)
-        }
-    }
+fn combined_codec_enabled(intake: &Intake, format: cuteafd_core::SparkReplyFormat) -> bool {
+    intake.prefill && format != cuteafd_core::SparkReplyFormat::Bf16
+        && !cuteafd_core::expert_geometry().partial_replies()
 }
 
 /// A link's persistent exchange: the engine side of the worker.
@@ -1066,6 +1039,7 @@ pub(crate) struct Waves<'a> {
     layouts: Vec<Option<RouteStaging>>,
     /// Per slot: landed and not yet marked consumed.
     unread: Vec<bool>,
+    compressed: Vec<bool>,
     /// Per slot: waves consumed from it (the worker posts the slot's next
     /// wave once `consumed[slot]` reaches this).
     uses: Vec<u32>,
@@ -1111,13 +1085,8 @@ impl<'a> Waves<'a> {
         warm_reducer(library, &intake)?;
         let timeout = transport.timeout();
         let reply_format = intake.reply_format();
-        let codec_bytes = reply_format.combined_scratch_bytes(cuteafd_core::expert_geometry().hidden as usize,
-            intake.geometry.cut().rows, slots, intake.prefill, cuteafd_core::expert_geometry().partial_replies())
-            .context("reply scratch overflow")?;
-        ensure!(storage.reply_decode.is_some() == (codec_bytes != 0), "reply codec does not match physical link policy");
-        if let Some(codec) = &storage.reply_decode {
-            ensure!(codec.matches(&intake, reply_format), "reply codec geometry changed across reset");
-        }
+        ensure!(storage.reply_reduce.is_some() == combined_codec_enabled(&intake, reply_format),
+            "reply reducer does not match physical link policy");
         let mut native = Native { transport, reply_format, reply_payloads: vec![0; slots],
             prefill_rows: 0, compressed_prefill_rows: 0, mixed_fallback_rows: 0, timing, arenas: arenas.clone(), words,
             pulls: pulls.unwrap_or(Pulls { base: 0 }), slots, ranks: intake.ranks, row_bytes: intake.row_bytes,
@@ -1143,7 +1112,7 @@ impl<'a> Waves<'a> {
         })?;
         Ok(Self { library, jobs: Some(jobs), worker: Some(worker), _storage: storage, words, arenas, arena_alias,
             pulls, pinned, ranges: intake.ranges, layouts: vec![None; slots],
-            unread: vec![false; slots], uses: vec![0; slots], ranks: intake.ranks, row_bytes: intake.row_bytes,
+            unread: vec![false; slots], compressed: vec![false; slots], uses: vec![0; slots], ranks: intake.ranks, row_bytes: intake.row_bytes,
             next_slot: intake.next_slot % cut.waves, geometry: intake.geometry, sequence: 0,
             outstanding: VecDeque::new(), grouping })
     }
@@ -1282,12 +1251,7 @@ impl<'a> Waves<'a> {
             // SAFETY: as `pull`'s contract; behind the `landed` wait.
             unsafe { self.pull(ticket.sequence, slot, ticket.payload_bytes, rest, false, stream)? };
         }
-        for_compressed_reply(ticket.combined_reply, self._storage.reply_decode.as_ref(), self.ranks, |codec, rank| {
-            let plane = self.slot_planes(slot).nth(rank).context("reply plane missing")?;
-            // SAFETY: all ranks landed, the slot is exclusive until consumed;
-            // staging and expansion are separate launches on this stream.
-            unsafe { codec.launch(slot, plane, self.words.ptr(Counter::ReplyFormat(slot)), ticket.rows, stream) }
-        })?;
+        self.compressed[slot] = compressed_reduction(ticket.combined_reply, self._storage.reply_reduce.is_some());
         self.unread[slot] = true;
         Ok(())
     }
@@ -1359,12 +1323,15 @@ impl<'a> Waves<'a> {
     }
 
     /// Opaque slot binding for a captured reduction. It exposes no BF16 view:
-    /// the slot may carry packed wire bytes before `land` expands them.
+    /// the slot may carry packed wire bytes, decoded only inside the reduction.
     /// The owner must drain every graph using it before changing the slot cut.
-    pub(crate) fn reduction(&self, slot: usize) -> ReplyReduction {
+    pub(crate) fn reduction(&self, slot: usize) -> ReplyReduction<'a> {
         let mut planes = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
         for (pointer, plane) in planes.iter_mut().zip(self.slot_planes(slot)) { *pointer = plane.ptr.cast(); }
-        ReplyReduction { planes, ranks: self.ranks as u32 }
+        ReplyReduction { planes, ranks: self.ranks as u32,
+            hidden: cuteafd_core::expert_geometry().hidden as usize, capacity: self.geometry.cut().rows,
+            fused: self.compressed[slot].then(|| self._storage.reply_reduce.as_ref().unwrap().clone()),
+            mode: self.words.ptr(Counter::ReplyFormat(slot)) }
     }
 
     /// Byte addresses for Muse's separate partial-wire region tables, not a

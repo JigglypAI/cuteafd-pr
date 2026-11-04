@@ -1232,3 +1232,26 @@ def test_combined_exl3_reply_export_operand_and_scalar_abi(monkeypatch):
         assert kernel.full_rotation and kernel.use_expert_map
         assert kernel.full_rotation_output_dtype == "bf16"
         assert kernel.element_dtype == "fp16" and kernel.reply_format == format
+
+
+def test_combined_reply_reduce_export_has_runtime_geometry_and_no_scratch():
+    source = (ROOT / "third_party/sparkinfer/b12x/moe/_shared/kernels/w4a16/expert_reply.py").read_text()
+    tree = ast.parse(source)
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "compile_expert_reply_reduce_aot")
+    record = lambda *args, **kwargs: SimpleNamespace(args=args, **kwargs)
+    namespace = dict(compile_program=record, ExpertReplyReduce=lambda: "kernel",
+                     Operand=record, Scalar=lambda name: name,
+                     torch=SimpleNamespace(uint8="u8", bfloat16="bf16", uint32="u32"))
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "reply_reduce_abi", "exec"), namespace)
+    program = namespace[function.name]()
+    assert program.name == "expert_reply_reduce" and program.key == ()
+    assert [operand.args[0] for operand in program.operands] == [
+        *(f"p{rank}" for rank in range(8)), "shared", "out", "mode"]
+    assert program.scalars == ("rows", "width", "ranks", "has_shared", "format")
+    assert program.geometry == dict(max_ranks=8, fp8_block=32, nvfp4_block=16,
+                                    rank_rounding="bf16", accumulation="ordered_fp32")
+    assert "scratch" not in vars(program)
+    exporter = (ROOT / "python/tools/aot/export_b12x_dsv4_aot.py").read_text()
+    assert 'work.append((name, "reduce", "expert_reply", {"max_rows": args.prefill_rows},' in exporter
+    assert "compile_expert_reply_reduce_aot))" in exporter

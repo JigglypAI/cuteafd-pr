@@ -1096,7 +1096,7 @@ impl<'a> Engine<'a> {
                             t * 4 * h * 2)?;
                     }
                     if previous > 0 {
-                        self.post_layer(w, lane, 0, previous, decode_reduction, rows, layer - 1)?;
+                        self.post_layer(w, lane, 0, previous, decode_reduction.clone(), rows, layer - 1)?;
                         self.tap(w, lane, layer - 1, t)?;
                     }
                     if w1.is_some() {
@@ -1150,7 +1150,7 @@ impl<'a> Engine<'a> {
                 table_stride: 0, previous: ranks, tp2_broadcast: false, exchange_f32: false };
             self.replay(key, || -> Result<()> {
                 if ranks > 0 {
-                    self.post_layer(w, lane, 0, ranks, decode_reduction, rows, last)?;
+                    self.post_layer(w, lane, 0, ranks, decode_reduction.clone(), rows, last)?;
                     self.tap(w, lane, last, t)?;
                 }
                 self.write_draft_kv(w, lane, t, cap)?;
@@ -1304,7 +1304,7 @@ impl<'a> Engine<'a> {
     /// A backbone layer's [`Self::post`] for lane `index`: [`Self::post_split`] under a head split.
     #[allow(clippy::too_many_arguments)]
     fn post_layer(&self, w: &Workspace<'_>, lane: &UnitSlot<'_>, index: usize, ranks: usize,
-        reduction: Option<crate::shared::spark_waves::ReplyReduction>, rows: Scalar, layer: usize) -> Result<()> {
+        reduction: Option<crate::shared::spark_waves::ReplyReduction<'_>>, rows: Scalar, layer: usize) -> Result<()> {
         if let Some(reduction) = reduction.filter(|_| !matches!(ranks, LOCAL_EXPERTS | SKIPPED_EXPERTS)) {
             let Scalar::I32(count) = rows else { unreachable!() };
             // SAFETY: the landed decode slot and workspace outlive this graph and every replay.

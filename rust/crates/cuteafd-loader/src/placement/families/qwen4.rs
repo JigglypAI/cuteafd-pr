@@ -1038,16 +1038,10 @@ mod tests {
                 requested_pool: None, spark_ranks: 4, startup_graph_modes: None };
             let planned = request(&inputs(Baseline::Planned { context_bytes, loaded_bytes }), 0).unwrap();
             let intake = planned.fixed.iter().find(|d| d.group == "Spark intake planes").unwrap().clone();
-            // Runtime retains the BF16 fallback and one codec slice per slot.
+            // Fused reduction reads packed replies in the BF16 fallback planes.
             let rows = shape.map_or(4096, |s| s.slot_rows());
-            let codec_row = match format {
-                cuteafd_core::SparkReplyFormat::Bf16 => 0,
-                cuteafd_core::SparkReplyFormat::Fp8 => 2560 + 2560 / 32,
-                cuteafd_core::SparkReplyFormat::Nvfp4 => 2560 / 2 + 2560 / 16,
-            };
             assert_eq!(intake.bytes, 4
-                * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * 2560 * 2).unwrap()
-                + rows * codec_row);
+                * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * 2560 * 2).unwrap());
             let measured = inputs(Baseline::Measured {
                 free_bytes: total - context_bytes - loaded_bytes - intake.bytes });
             let runtime = request(&measured, 0).unwrap();
