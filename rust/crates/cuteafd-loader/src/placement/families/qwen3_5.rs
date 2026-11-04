@@ -25,6 +25,7 @@ pub struct LayerBytes {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DrafterBytes {
     pub owned: u64,
+    pub weights: ResidentWeights,
     pub scratch: u64,
     /// Full-context draft K/V per target pool page, not per sequence/context.
     pub pool_unit: u64,
@@ -69,11 +70,12 @@ impl DrafterBytes {
             ensure!(value.dtype == DType::Bf16 && value.shape == shape, "{full}: native MTP shape/dtype differs");
             owned += value.byte_length.max(256);
         }
+        let weights = ResidentWeights(owned);
         owned += ((64 * 2 + 4096) * cfg.hidden * 2 + 64 * cfg.vocab * 4) as u64;
         // The independent greedy selector owns one ID/status/log-probability row.
         owned += 12;
         let record = crate::families::qwen4::Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim);
-        Ok(Self { owned, scratch: 0, pool_unit: (64 * record + cfg.hidden * 2) as u64 })
+        Ok(Self { owned, weights, scratch: 0, pool_unit: (64 * record + cfg.hidden * 2) as u64 })
     }
 
     pub fn block_dspark(config: &serde_json::Value, slots: usize, sms: u64, context: usize)
@@ -83,19 +85,20 @@ impl DrafterBytes {
         let cfg = crate::formats::block_dspark::BlockDsparkConfig::from_json(config)?;
         ensure!(cfg.window.is_none(), "dense dSpark requires full-context cache");
         let layout = cfg.paged_cache_layout(slots, context, PAGE_ROWS as usize, Qwen4KvCache::Bf16)?;
-        let (owned, scratch) = block_dspark_paged_resident_bytes(config, slots, slots, sms,
+        let residency = block_dspark_paged_resident_bytes(config, slots, slots, sms,
             GlmDraftRepresentation::Bf16Only, 0, context, PAGE_ROWS as usize, Qwen4KvCache::Bf16)?;
-        Ok(Self { owned: owned.checked_sub(layout.full_bytes).ok_or_else(|| anyhow::anyhow!("draft inventory underflow"))?,
-            scratch, pool_unit: layout.full_bytes })
+        Ok(Self { owned: residency.owned.checked_sub(layout.full_bytes).ok_or_else(|| anyhow::anyhow!("draft inventory underflow"))?,
+            weights: residency.weights, scratch: residency.scratch, pool_unit: layout.full_bytes })
     }
 
     fn movable(self) -> Result<Movable, PlacementError> {
-        crate::placement::draft::DrafterDemand::local(MovableId::Drafter, vec![Bytes2 { resident: self.owned, staging: 0 },
-            Bytes2 { resident: self.scratch, staging: 0 }], 0).movable(1)
+        crate::placement::draft::DrafterDemand::local(MovableId::Drafter, vec![MovablePart::new(Bytes2 { resident: self.owned, staging: 0 }, self.weights),
+            MovablePart::new(Bytes2 { resident: self.scratch, staging: 0 }, ResidentWeights::default())], 0).movable(1)
     }
 }
 
 pub struct DenseInputs<'a> {
+    pub resident_weight_limit: Option<ResidentWeights>,
     pub cfg: &'a Qwen35Config,
     pub gpu: GpuBudget,
     pub layers: &'a [LayerBytes],
@@ -149,6 +152,7 @@ pub fn request(mut inputs: DenseInputs<'_>) -> Result<PlacementRequest> {
             experts: None, modes: vec![WHOLE] })
     }).collect::<Result<_>>()?;
     Ok(PlacementRequest {
+        resident_weight_limit: inputs.resident_weight_limit,
         inventory: Inventory { gpus: vec![inputs.gpu], spark_ranks: 0, peer_access: false },
         attention_placement: None, context_buffers: ContextBuffers::default(),
         layers_first_gpu: 0,
@@ -320,7 +324,8 @@ impl NativeWeights {
         let mut fixed = buffers.fixed();
         fixed.extend([(Category::Embedding, "token embedding", self.embedding),
             (Category::Weights, "final norm", self.norm), (Category::Weights, "vocabulary head", self.head)]
-            .into_iter().map(|(category, group, bytes)| Demand::new(0, category, group, bytes, Basis::Exact)));
+            .into_iter().map(|(category, group, bytes)| Demand::new(0, category, group, bytes, Basis::Exact)
+                .with_resident_weights(ResidentWeights(bytes))));
         (layers, fixed)
     }
 }
@@ -528,7 +533,8 @@ mod tests {
     }
 
     fn inputs<'a>(cfg: &'a Qwen35Config, layers: &'a [LayerBytes], scratch: u64) -> DenseInputs<'a> {
-        DenseInputs { cfg, layers, gpu: GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 1 << 30,
+        DenseInputs {
+        resident_weight_limit: None, cfg, layers, gpu: GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 1 << 30,
             baseline: Baseline::Measured { free_bytes: 14 << 30 } },
             fixed: vec![Demand::new(0, Category::Workspace, "native AOT scratch", scratch, Basis::Exact)],
             drafter: None, requested_pool: None, max_context: 262144, record_bytes: 4096,
@@ -670,7 +676,8 @@ mod tests {
             input.gpu.capacity_bytes = 32 << 30;
             input.gpu.baseline = Baseline::Measured { free_bytes: 32 << 30 };
             input.requested_pool = Some(tokens);
-            input.drafter = Some(DrafterBytes { owned: 1 << 30, scratch: 1 << 20, pool_unit: 64 * 20480 });
+            input.drafter = Some(DrafterBytes { owned: 1 << 30, weights: ResidentWeights(1 << 30),
+                scratch: 1 << 20, pool_unit: 64 * 20480 });
             let req = request(input)?;
             assert_eq!(req.pool_bounded.len(), 1);
             assert_eq!(req.pool_bounded[0].bytes(tokens / PAGE_ROWS)?, tokens * 20480);

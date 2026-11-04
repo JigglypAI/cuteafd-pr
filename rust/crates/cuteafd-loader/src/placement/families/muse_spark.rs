@@ -51,6 +51,7 @@ pub fn executor(gpus: usize) -> Result<(ExecutorModes, &'static [LayerMode])> {
 }
 
 pub struct MuseInputs<'a> {
+    pub resident_weight_limit: Option<ResidentWeights>,
     pub cfg: &'a MuseSparkConfig,
     pub core: &'a CoreInventory,
     pub catalog: &'a crate::OfficialV41Catalog,
@@ -206,8 +207,11 @@ impl MuseRequest {
                 let items = [Item::new(Category::Weights, format!("{name} tower"), "BF16 native", selected.weights, Basis::Exact),
                     Item::new(Category::Workspace, format!("{name} scratch"), "resident", selected.scratch, Basis::Exact)];
                 if let EncoderKind::Rtx { gpu } = selected.kind {
-                    for item in items { request.fixed.push(Demand::new(u8::try_from(gpu)?,
-                        item.category, item.group, item.bytes, item.basis)); }
+                    request.fixed.push(Demand::new(u8::try_from(gpu)?, Category::Weights,
+                        format!("{name} tower"), selected.weights, Basis::Exact)
+                        .with_resident_weights(ResidentWeights(selected.weights)));
+                    request.fixed.push(Demand::new(u8::try_from(gpu)?, Category::Workspace,
+                        format!("{name} scratch"), selected.scratch, Basis::Exact));
                 } else {
                     for rank in selected.spark_ranks() {
                         spark_items[rank].extend(items.iter().cloned());
@@ -266,7 +270,7 @@ pub fn mark_bytes(cfg: &MuseSparkConfig, ranks: usize) -> u64 {
 }
 
 pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
-    let MuseInputs { cfg, core, catalog, gpus, spark_ranks, prefill, slots, mark_slots, context, automatic_context,
+    let MuseInputs { resident_weight_limit, cfg, core, catalog, gpus, spark_ranks, prefill, slots, mark_slots, context, automatic_context,
         requested_pool, onboard, spark_budget_bytes, partial_bf16_max_rows, partial_wide_format, local,
         drafter, full_prefill_logits, fixed: runtime_fixed, startup } = inputs;
     let ranks = gpus.len();
@@ -300,8 +304,9 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         let gpu = u8::try_from(gpu)?;
         fixed.push(Demand::new(gpu, Category::Weights,
             "layer weights (head-split attention; MoE projections, router, norms, residual gates whole)",
-            weights, Basis::Exact));
-        fixed.push(Demand::new(gpu, Category::Weights, "final norm", global.final_norm as u64, Basis::Exact));
+            weights, Basis::Exact).with_resident_weights(ResidentWeights(weights)));
+        fixed.push(Demand::new(gpu, Category::Weights, "final norm", global.final_norm as u64, Basis::Exact)
+            .with_resident_weights(ResidentWeights(global.final_norm as u64)));
         fixed.push(Demand::new(gpu, Category::Kv, format!("sliding rings, {slots} sequences x {} layers",
             cfg.sliding_layers()), rings * slots / ranks as u64, Basis::Exact));
         // Device mark slots from the shared prefix rule (the host tier holds retention).
@@ -355,7 +360,8 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         fixed.push(Demand::new(u8::try_from(gpu)?, Category::Workspace, "Muse RoPE tables",
             rope.allocation_bytes, Basis::Exact));
     }
-    fixed.push(Demand::new(0, Category::Embedding, "token embedding", global.embedding as u64, Basis::Exact));
+    fixed.push(Demand::new(0, Category::Embedding, "token embedding", global.embedding as u64, Basis::Exact)
+            .with_resident_weights(ResidentWeights(global.embedding as u64)));
     // The head rank's logits planes: the K6 head's F32 rows at its stored width
     // and the softcapped logits trimmed to the vocabulary.
     let (stored, trimmed) = crate::families::muse_spark::lane::head_planes(
@@ -370,7 +376,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
             prefill_logits_bytes as u64, Basis::Exact));
     }
     fixed.push(Demand::new(u8::try_from(ranks - 1)?, Category::Weights, "lm head (K6)", global.head_bytes() as u64,
-        Basis::Exact));
+        Basis::Exact).with_resident_weights(ResidentWeights(global.head_bytes() as u64)));
     // Spark partial replies land on the coordinator: per wave slot, every rank's
     // worst-case mix of BF16 (decode/verify segments) and NVFP4 (prefill) partials.
     let cutoff = crate::families::muse_spark::replies::Cutoff::with_wide(partial_bf16_max_rows, 1, partial_wide_format)?;
@@ -413,6 +419,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     let pool = PoolPolicy::resolve(&capacities, context, requested_pool, PAGE_ROWS, false)
         .with_automatic_context(automatic_context);
     let mut request = PlacementRequest {
+        resident_weight_limit,
         inventory: Inventory { gpus, spark_ranks, peer_access: pair },
         attention_placement: pair.then_some(AttentionPlacement::Heads), context_buffers: ContextBuffers::default(),
         layers_first_gpu: 0, pool, layers, pool_overhead: vec![0; ranks], pool_bounded: Vec::new(), fixed,
@@ -523,6 +530,7 @@ impl LocalPackage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MuseDrafter {
     pub owned: u64,
+    pub weights: ResidentWeights,
     pub scratch: u64,
     pub head_scratch: u64,
     /// The draft batch's input ids and the policy probe's device route ring
@@ -536,8 +544,8 @@ pub struct MuseDrafter {
 
 impl MuseDrafter {
     fn demand(&self, head: u8) -> crate::placement::draft::DrafterDemand {
-        crate::placement::draft::DrafterDemand::local(MovableId::Drafter, vec![Bytes2 {
-            resident: self.owned + self.scratch + self.head_scratch + self.runtime, staging: 0 }], head)
+        crate::placement::draft::DrafterDemand::local(MovableId::Drafter, vec![MovablePart::new(Bytes2 {
+            resident: self.owned + self.scratch + self.head_scratch + self.runtime, staging: 0 }, self.weights)], head)
     }
 }
 
@@ -562,7 +570,7 @@ pub fn drafter_inventory(cfg: &MuseSparkConfig, config: &serde_json::Value, slot
          the target head's", cfg.softcap, cfg.output_multiplier);
     let block = usize::try_from(block)?;
     let capacity = GlmDraftCapacity::new(slots, sequences, block).map_err(|error| anyhow::anyhow!("{error}"))?;
-    let (owned, scratch) = draft_resident_bytes_with_mode(config, capacity.context_slots, capacity.max_batch_sequences,
+    let residency = draft_resident_bytes_with_mode(config, capacity.context_slots, capacity.max_batch_sequences,
         sms, GlmDraftRepresentation::Bf16Only, 2, kv_cache).map_err(|error| anyhow::anyhow!("Muse drafter: {error}"))?;
     // Stored-width F32 rows of the K6 head and the trimmed F32 rows, per draft row.
     ensure!(stored >= cfg.vocab_size, "Muse head stored width below the vocabulary");
@@ -570,7 +578,8 @@ pub fn drafter_inventory(cfg: &MuseSparkConfig, config: &serde_json::Value, slot
     let head_scratch = u64::try_from(rows * (stored + cfg.vocab_size) * 4)?;
     let probe = (cfg.layers * crate::families::muse_spark::lane::HEAD_ROWS * cfg.topk * 4) as u64;
     let runtime = u64::try_from(rows * 4)? + probe;
-    Ok(MuseDrafter { owned, scratch, head_scratch, runtime, context_slots: capacity.context_slots,
+    Ok(MuseDrafter { owned: residency.owned, weights: residency.weights, scratch: residency.scratch,
+        head_scratch, runtime, context_slots: capacity.context_slots,
         sequences: capacity.max_batch_sequences, block, head_dim: geometry.head_dim as usize })
 }
 

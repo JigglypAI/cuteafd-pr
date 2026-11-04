@@ -106,6 +106,17 @@ pub fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool)
 pub fn resident_headers<'a>(config: &serde_json::Value,
     tensors: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>,
     ranks: usize, dspark: bool) -> Option<Vec<Vec<Item>>> {
+    resident_inventory(config, tensors, ranks, dspark, true)
+}
+
+/// Only the drafter's own checkpoint allocations; borrowed target owners are excluded.
+pub fn drafter_weights(checkpoint: &Checkpoint, ranks: usize) -> Option<Vec<Vec<Item>>> {
+    resident_inventory(&checkpoint.config, checkpoint.tensors.iter().map(|tensor| &tensor.meta), ranks, true, false)
+}
+
+fn resident_inventory<'a>(config: &serde_json::Value,
+    tensors: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>,
+    ranks: usize, dspark: bool, target: bool) -> Option<Vec<Vec<Item>>> {
     let config = config.get("text_config").unwrap_or(config);
     let tensors = tensors.into_iter().collect::<Vec<_>>();
     if ![1, 2].contains(&ranks) || config["num_hidden_layers"].as_u64() != Some(40)
@@ -144,6 +155,7 @@ pub fn resident_headers<'a>(config: &serde_json::Value,
             add(decoder, Category::Drafter, "dspark-auxiliary", &format, bytes);
             continue;
         }
+        if !target { continue; }
         if name == "head.weight" {
             let (resident, head_format) = head_mode.resident(bytes / ranks as u64);
             for rank in 0..ranks { add(rank, Category::Weights, "lm_head", head_format, resident); }
@@ -283,6 +295,27 @@ mod tests {
             &[8192, 4096], 8192 * 4096)]);
         let items = resident_weights(&checkpoint, 1, false).unwrap();
         assert_eq!(items[0][0].bytes, 8192 * 4096 + 8192 * 4096 / 32);
+    }
+
+    #[test]
+    fn drafter_weights_exclude_borrowed_target_embedding_head_and_backbone() {
+        use cuteafd_core::DType;
+        let target = vec![tensor("embed.weight", DType::Bf16, &[100], 200),
+            tensor("head.weight", DType::Bf16, &[100], 200),
+            tensor("norm.weight", DType::Bf16, &[10], 20),
+            tensor("layers.0.attn.wq_a.weight", DType::F8E4M3, &[3200], 3200)];
+        let draft = vec![tensor("mtp.0.main_proj.weight", DType::F8E4M3, &[3200], 3200),
+            tensor("mtp.1.main_proj.weight", DType::F8E4M3, &[3200], 3200),
+            tensor("mtp.0.norm.weight", DType::Bf16, &[10], 20)];
+        let mut combined = target.clone();
+        combined.extend(draft.clone());
+        for ranks in [1, 2] {
+            let owned = drafter_weights(&checkpoint(combined.clone()), ranks).unwrap();
+            assert_eq!(owned, drafter_weights(&checkpoint(draft.clone()), ranks).unwrap());
+            assert_eq!(owned[ranks - 1].iter().map(|i| i.bytes).sum::<u64>(), 3200 + 100 + 3200 + 20);
+            assert!(owned[..ranks - 1].iter().all(Vec::is_empty));
+            assert!(drafter_weights(&checkpoint(target.clone()), ranks).unwrap().iter().all(Vec::is_empty));
+        }
     }
 
     #[test]

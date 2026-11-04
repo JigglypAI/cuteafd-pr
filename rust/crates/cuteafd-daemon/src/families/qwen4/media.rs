@@ -57,6 +57,7 @@ pub(super) struct ReadyVision {
     pub encoder: Encoder,
     pub preparer: Arc<MediaPreparer>,
     pub cache_bytes: usize,
+    pub weights: Option<(i32, cuteafd_loader::placement::ResidentWeights)>,
 }
 impl ReadyVision {
     pub fn load(args: &super::EngineArgs, library: &cuteafd_ffi::NativeLibrary, mode: MediaMode, prefix: &super::serve::PrefixArgs,
@@ -83,7 +84,7 @@ impl ReadyVision {
             let encoder = crate::shared::vision::remote::RemoteEncoder::connect(remote.addresses, expected,
                 std::time::Duration::from_secs(60))?;
             tracing::info!(cache_bytes, "Qwen remote vision encoder ready");
-            return Ok((Some(Self { encoder: Encoder::Remote(encoder), preparer, cache_bytes }), prefix));
+            return Ok((Some(Self { encoder: Encoder::Remote(encoder), preparer, cache_bytes, weights: None }), prefix));
         }
         let gpu = match mode {
             MediaMode::Rtx(gpu) => gpu.map(|gpu| i32::try_from(gpu)).transpose()?.unwrap_or(args.device),
@@ -102,6 +103,8 @@ impl ReadyVision {
         anyhow::ensure!(preparer.config().max_image_tokens <= max_tokens, "Qwen tower capacity is {max_tokens} tokens per image");
         warn_cache_capacity(cache_bytes, preparer.config().max_image_tokens, width)?;
         let ledger = cuteafd_ffi::vision::NativeVision::required(&args.native_lib, &spec.native)?;
+        let weights = cuteafd_loader::placement::ResidentWeights(ledger.weights);
+        weights.check(0, crate::shared::memory::budget::resident_weight_limit())?;
         library.cuda_set_device(gpu)?;
         let admitted = ledger.total_bytes();
         let loaded = (|| -> Result<_> {
@@ -118,7 +121,7 @@ impl ReadyVision {
         restored?;
         tracing::info!(gpu, admitted_bytes = admitted, cache_bytes, sm, "Qwen resident vision encoder ready");
         Ok((Some(Self { encoder: Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor, width, max_tokens)),
-            preparer, cache_bytes }), prefix))
+            preparer, cache_bytes, weights: Some((gpu, weights)) }), prefix))
     }
 }
 

@@ -162,6 +162,7 @@ const EXECUTOR: ExecutorModes = crate::placement::families::STEP5;
 /// All demands are future to the pre-weight inventory. Startup phases are
 /// absolute additional peaks above that same sample, not steady-state deltas.
 pub struct RuntimeInputs {
+    pub resident_weight_limit: Option<ResidentWeights>,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     pub kv_format: crate::families::qwen4::Qwen4KvCache,
     pub inventory: Inventory,
@@ -460,8 +461,8 @@ pub fn admit_mtp_with_contract(checkpoint: &Checkpoint, inputs: &RuntimeInputs, 
     ensure!((1..=cfg.mtp).contains(&depth) && inputs.unit_rows() > depth,
         "Step-5 predictor depth must fit checkpoint and row capacity");
     // Native K4 predictor owners keep their own projection scratch beside their weights.
-    let weights = super::coordinator::RankWeightLayout::mtp_from_contract(checkpoint, contract, depth)?.resident_bytes
-        .checked_add(super::native::mtp_native_scratch_from_contract(checkpoint, contract, depth, inputs.unit_rows())?)
+    let weights = super::coordinator::RankWeightLayout::mtp_from_contract(checkpoint, contract, depth)?.resident_bytes;
+    let immutable = weights.checked_add(super::native::mtp_native_scratch_from_contract(checkpoint, contract, depth, inputs.unit_rows())?)
         .context("Step-5 predictor native forecast overflow")?;
     let workspace = super::native::mtp_forecast_workspace(inputs.unit_rows(), depth, inputs.kv_format)?;
     admit_depth_with(&cfg, inputs, depth, |ownership| {
@@ -469,7 +470,8 @@ pub fn admit_mtp_with_contract(checkpoint: &Checkpoint, inputs: &RuntimeInputs, 
             let mut native = super::native::rank_admission_from_contract(&contract, &cfg, ownership, rank, inputs.unit_rows(),
                 inputs.rows, inputs.logit_rows())?;
             if rank == usize::from(ownership.execution().spec().head_gpu) {
-                native.immutable = native.immutable.checked_add(weights)
+                native.resident_weights = native.resident_weights.checked_add(ResidentWeights(weights))?;
+                native.immutable = native.immutable.checked_add(immutable)
                     .context("Step-5 predictor weight forecast overflow")?;
                 native.workspace = native.workspace.max(workspace);
             }
@@ -550,6 +552,14 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                     1,
                     usize::MAX,
                 )?;
+                fixed.push(Demand::new(rank as u8, Category::Weights,
+                    "Step-5 native target and head", native[rank].immutable, Basis::Exact)
+                    .with_resident_weights(native[rank].resident_weights));
+                if rank == 0 {
+                    let bytes = scaled(4096 * 2, cfg.vocab)?;
+                    fixed.push(Demand::new(0, Category::Embedding, "Step-5 GPU embedding", bytes, Basis::Exact)
+                        .with_resident_weights(ResidentWeights(bytes)));
+                }
                 let mut add = |category, group, bytes| {
                     fixed.push(Demand::new(
                         rank as u8,
@@ -559,11 +569,6 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                         Basis::Exact,
                     ))
                 };
-                add(
-                    Category::Weights,
-                    "Step-5 native target and head",
-                    native[rank].immutable,
-                );
                 add(
                     Category::Workspace,
                     "Step-5 native workspace",
@@ -590,11 +595,6 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                     inputs.pending_code[rank],
                 );
                 if rank == 0 {
-                    add(
-                        Category::Embedding,
-                        "Step-5 GPU embedding",
-                        scaled(4096 * 2, cfg.vocab)?,
-                    );
                     add(
                         Category::Workspace,
                         "Step-5 input",
@@ -676,6 +676,7 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                 trial_pool.target = tokens;
             }
             let request = PlacementRequest {
+                resident_weight_limit: inputs.resident_weight_limit,
                 inventory: inputs.inventory.clone(),
                 attention_placement: None,
                 context_buffers: ContextBuffers::default(),
@@ -821,7 +822,7 @@ mod tests {
         }
     }
     fn inputs(ranks: usize) -> RuntimeInputs {
-        RuntimeInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+        RuntimeInputs { resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
             full_prefill_logits: false, waves: 1, unit: 0,
             inventory: Inventory {
@@ -857,6 +858,7 @@ mod tests {
         admit_with(&config(), inputs, |o| {
             Ok(vec![
                 RankAdmission {
+                    resident_weights: ResidentWeights(1 << 30),
                     immutable: 1 << 30,
                     workspace: 1 << 20
                 };
@@ -1006,6 +1008,7 @@ mod tests {
             inputs.marks.host = true;
             let native = |ownership: &ExecutionOwnership, predictor: bool| -> Result<Vec<RankAdmission>> {
                 Ok((0..2).map(|rank| RankAdmission {
+                    resident_weights: ResidentWeights((1 << 30) + if rank == 0 && predictor { 32 << 30 } else { 0 }),
                     // Cross a whole-CSA boundary in both cache formats, not just consume its slack.
                     immutable: (1 << 30) + if rank == 0 && predictor { 32 << 30 } else { 0 },
                     workspace: if rank == 0 && predictor { 512 << 20 } else { 1 << 20 },

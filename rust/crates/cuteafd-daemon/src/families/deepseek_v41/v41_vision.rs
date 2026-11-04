@@ -94,7 +94,7 @@ impl<'a> VisionRuntime<'a> {
             16 * 4,
         ])
     }
-    pub fn device_bytes(catalog: &OfficialV41Catalog, capacity: usize) -> Result<usize> {
+    pub fn weight_bytes(catalog: &OfficialV41Catalog) -> Result<usize> {
         let names = Self::names();
         for name in &names {
             ensure!(
@@ -102,7 +102,10 @@ impl<'a> VisionRuntime<'a> {
                 "vision tensor must retain BF16: {name}"
             );
         }
-        Ok(NativeRtxTensors::plan(catalog, &names)?
+        NativeRtxTensors::plan(catalog, &names)
+    }
+    pub fn device_bytes(catalog: &OfficialV41Catalog, capacity: usize) -> Result<usize> {
+        Ok(Self::weight_bytes(catalog)?
             + Self::buffer_sizes(capacity)?.iter().sum::<usize>()
             + V41VisionOps::WORKSPACE_BYTES)
     }

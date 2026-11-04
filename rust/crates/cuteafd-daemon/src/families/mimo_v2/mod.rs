@@ -51,6 +51,9 @@ pub(crate) struct EngineArgs {
     pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)]
     pub device: i32,
+    /// Already-loaded local media checkpoint owners, keyed by physical CUDA ordinal.
+    #[arg(skip)]
+    pub planner_media_weights: Option<(i32, cuteafd_loader::placement::ResidentWeights)>,
     /// Split every layer's attention heads (and the dense MLP) over --device
     /// and this second GPU (MiMo V2.6 Pro: 64 query / 4 KV heads each, KV
     /// partitioned), one hidden all-reduce per layer over peer memory. Routed

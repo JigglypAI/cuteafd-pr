@@ -147,6 +147,7 @@ pub(crate) struct LocalExperts<'a> {
     pub experts: RefCell<Fp8Experts<'a>>,
     /// Mixed-format MTP owns its FP8 package separately from NVFP4 target layers.
     pub mtp_experts: Option<Fp8Experts<'a>>,
+    pub base_weights: cuteafd_loader::placement::ResidentWeights,
     pub window: Option<usize>,
     pub loads: RefCell<usize>,
 }
@@ -161,6 +162,13 @@ impl LocalExperts<'_> {
         if experts.layers.len() >= window {
             experts.layers.remove(0);
         }
+        let next = Fp8Layer::bytes(&self.tensors.for_layer(layer)?, 1)? as u64;
+        let retained = cuteafd_loader::placement::ResidentWeights(experts.resident_bytes() as u64)
+            .checked_add(cuteafd_loader::placement::ResidentWeights(
+                self.mtp_experts.as_ref().map_or(0, |e| e.resident_bytes() as u64)))?;
+        self.base_weights.checked_add(retained)?
+            .checked_add(cuteafd_loader::placement::ResidentWeights(next))?
+            .check(0, crate::shared::memory::budget::resident_weight_limit())?;
         let started = std::time::Instant::now();
         experts.layers.push(Fp8Layer::load(self.library, self.tensors, layer, 1, 0)?);
         *self.loads.borrow_mut() += 1;
@@ -184,10 +192,22 @@ pub(crate) struct LocalExl3<'a> {
     pub mtp: bool,
     pub max_rows: usize,
     pub budget: usize,
+    pub base_weights: cuteafd_loader::placement::ResidentWeights,
     pub loads: RefCell<usize>,
 }
 
 impl LocalExl3<'_> {
+    fn admit_weights(&self, layers: &[usize]) -> Result<()> {
+        use crate::shared::experts::{exl3::Exl3Weights, layer::ExpertLayer};
+        use cuteafd_loader::placement::ResidentWeights;
+        let mut selections = (0..usize::from(self.mtp)).map(|stage| ExpertLayer::Dspark { stage })
+            .chain(layers.iter().map(|&layer| ExpertLayer::BackboneFull { layer }));
+        let weights = selections.try_fold(self.base_weights, |sum, selection|
+            sum.checked_add(ResidentWeights(Exl3Weights::plan(self.catalog, selection)?.resident_bytes as u64))
+                .map_err(anyhow::Error::from))?;
+        weights.check(0, crate::shared::memory::budget::resident_weight_limit())?;
+        Ok(())
+    }
     /// Pushes the first window (layers from 0, and the MTP stage) in a push
     /// group of this GPU alone, as the first [`Self::ensure`] would load it
     /// through the mount; on any fallback the window stays lazy and later
@@ -199,6 +219,10 @@ impl LocalExl3<'_> {
             &self.native_lib, self.catalog, usize::from(self.mtp), &backbone, self.max_rows, self.budget)?
             else { return Ok(false) };
         if selections.is_empty() { return Ok(false); }
+        let selected_layers = selections.iter().filter_map(|s| match s {
+            crate::shared::experts::layer::ExpertLayer::BackboneFull { layer } => Some(*layer), _ => None,
+        }).collect::<Vec<_>>();
+        self.admit_weights(&selected_layers)?;
         let started = std::time::Instant::now();
         let experts = crate::shared::experts::rtx::push::CoordinatorExperts::Whole { owners: vec![crate::shared::experts::rtx::push::WholeOwner { rank: 0,
             selections: selections.clone(), budget: weights_budget }] };
@@ -235,6 +259,9 @@ impl LocalExl3<'_> {
         unsafe { self.library.cuda_stream_synchronize(stream)? };
         *self.resident.borrow_mut() = None;
         let layers: Vec<_> = (layer..layer + self.window.min(self.layers.saturating_sub(layer))).collect();
+        let planned = crate::families::deepseek_v4::local::plan(self.library, &self.native_lib, self.catalog,
+            usize::from(self.mtp), &layers, self.max_rows, self.budget)?;
+        self.admit_weights(&planned.layers)?;
         let started = std::time::Instant::now();
         let local = crate::families::deepseek_v4::local::LocalExperts::load(self.library, &self.native_lib, self.catalog,
             usize::from(self.mtp), &layers, self.max_rows, self.budget, stream)?

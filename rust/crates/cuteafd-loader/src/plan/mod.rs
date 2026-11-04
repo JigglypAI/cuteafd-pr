@@ -308,6 +308,12 @@ pub struct PlanReport {
 }
 
 impl PlanReport {
+    pub(crate) fn refuse_placement(&mut self, what: String, how: impl Into<String>) {
+        self.fits = false;
+        self.placement_supported = false;
+        self.hints.push(Hint { what, how: how.into() });
+    }
+
     pub fn executable(&self) -> bool { self.launchable(false) }
 
     pub fn wip_launchable(&self) -> bool { self.launchable(true) }
@@ -348,6 +354,9 @@ pub struct PlanOptions {
     /// Weight bytes the coordinator GPU may hold (its own tensors, plus every
     /// routed expert in the local-only placement).
     pub coordinator_budget_bytes: u64,
+    /// Per-GPU storage ceiling for admission without a complete memory layout;
+    /// independent of the resident-weight cap above.
+    pub coordinator_gpu_budget_bytes: u64,
     /// Also lay out every device's memory (`plan --layout`).
     pub layout: Option<layout::LayoutOptions>,
 }
@@ -365,6 +374,7 @@ impl Default for PlanOptions {
             placement: ExpertPlacement::Sparks { ranks: 6 },
             spark_budget_bytes: None,
             coordinator_budget_bytes: 80 << 30,
+            coordinator_gpu_budget_bytes: crate::placement::inventory::PRO_TOTAL_BYTES,
             layout: None,
         }
     }
@@ -395,7 +405,11 @@ impl PlanOptions {
                 });
             }
         }
-        for (option, bytes) in [("Spark budget", self.spark_budget_bytes.unwrap_or(DEFAULT_SPARK_BUDGET_BYTES)), ("coordinator budget", self.coordinator_budget_bytes)] {
+        for (option, bytes) in [
+            ("Spark budget", self.spark_budget_bytes.unwrap_or(DEFAULT_SPARK_BUDGET_BYTES)),
+            ("coordinator weight budget", self.coordinator_budget_bytes),
+            ("coordinator GPU budget", self.coordinator_gpu_budget_bytes),
+        ] {
             if bytes == 0 {
                 return Err(PlanError::InvalidOption { option, reason: "must be positive".into() });
             }
@@ -726,10 +740,8 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
     let family = report.family.as_deref().unwrap_or("unknown");
     let concurrency = options.resolved_concurrency(family);
     if let Err(error) = cuteafd_core::concurrency::validate(family, concurrency) {
-        report.fits = false;
-        report.placement_supported = false;
         let reason = error.to_string();
-        report.hints.push(Hint { what: reason.clone(), how: "Use a supported boot-time concurrency or add the named program capacity.".into() });
+        report.refuse_placement(reason.clone(), "Use a supported boot-time concurrency or add the named program capacity.");
         return Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![reason] });
     }
     if options.mimo_prefix_entries == u64::MAX {
@@ -745,17 +757,13 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
             Ok(memory)
         },
         Some(Err(error)) => {
-            report.fits = false;
-            report.placement_supported = false;
-            report.hints.push(Hint { what: format!("native placement refused: {error:#}"),
-                how: "Supply the native exports and a shape supported by the family's executor.".into() });
+            report.refuse_placement(format!("native placement refused: {error:#}"),
+                "Supply the native exports and a shape supported by the family's executor.");
             Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0,
                 waste: vec![], notes: vec![format!("native placement refused: {error:#}")] })
         }
         None => {
             let family = report.family.as_deref().unwrap_or("unknown");
-            report.fits = false;
-            report.placement_supported = false;
             let drafter = matches!(family, "dflash2" | "dspark");
             let what = if drafter { format!("{family}: a drafter checkpoint has no memory layout of its own") }
                 else { format!("{family}: no placement adapter in this build") };
@@ -766,7 +774,7 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
                 format!("Implement FamilyModel::placement for {family} (plan/families/), solving the same \
                     PlacementRequest its runtime admits, before claiming a memory layout.")
             };
-            report.hints.push(Hint { what: what.clone(), how });
+            report.refuse_placement(what.clone(), how);
             Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![what] })
         }
     }
@@ -1210,7 +1218,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     }
     if options.layout.is_none() {
         // A tensor-only inventory does not request an external speculation checkpoint.
-        let mut inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget(),
+        let mut inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_gpu_budget_bytes], spark_bytes: options.spark_budget(),
             spark_allocation_budget_bytes: Some(options.spark_budget()), glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
             weight_budget_bytes: options.coordinator_budget_bytes, ..Default::default() };
@@ -1296,9 +1304,8 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     Ok(report)
 }
 
-/// Places the routed experts (Spark slices or the coordinator) and checks
-/// memory: the widest Spark rank against the Spark budget, the coordinator's
-/// own tensors (plus every expert, local-only) against its budget.
+/// Inventory display and routed-package compatibility. Native family owners
+/// enforce coordinator resident-weight admission independently of source bytes.
 fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model: &dyn FamilyModel,
     routed_operands: &BTreeMap<String, QuantOperand>) {
     if spec.moe.is_none() {
@@ -1336,7 +1343,6 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
     });
     let intermediate = spec.moe.as_ref().map(|moe| moe.intermediate);
     let gib = |bytes: f64| bytes / GIB;
-    let coordinator = options.coordinator_budget_bytes as f64;
     if routed > 0 {
         let share = |ranks: usize| -> Option<f64> {
             let contract = contract.as_ref()?;
@@ -1421,34 +1427,9 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
                         how: format!("{advice}."),
                     });
                 }
-                // GLM Flash's selected solver ledger checks the full resident layout,
-                // including TP2 halves; source bytes on one GPU are not its admission.
-                Ok(_) if spec.family == "glm5_flash" && options.layout.is_some() => {}
-                Ok(_) => {
-                    let need = (rtx + routed) as f64;
-                    if need > coordinator {
-                        report.fits = false;
-                        report.hints.push(Hint {
-                            what: format!("local-only placement needs {:.1} GiB on the coordinator GPU ({:.1} GiB \
-                                routed experts + {:.1} GiB other weights), {:.1} GiB over the {:.0} GiB budget",
-                                gib(need), gib(routed as f64), gib(rtx as f64), gib(need - coordinator), gib(coordinator)),
-                            how: format!("{advice}."),
-                        });
-                    }
-                }
+                Ok(_) => {}
             },
         }
-    }
-    // The weight budget is per coordinator GPU; a head-split layout spreads
-    // the backbone over each GPU it names.
-    let gpus = options.layout.as_ref().filter(|l| l.head_split).map_or(1, |l| l.rtx_bytes.len().max(1));
-    if options.placement != ExpertPlacement::Local && rtx as f64 > coordinator * gpus as f64 {
-        report.fits = false;
-        report.hints.push(Hint {
-            what: format!("coordinator weights need {:.1} GiB, over the {:.0} GiB coordinator budget{}",
-                gib(rtx as f64), gib(coordinator * gpus as f64), if gpus > 1 { format!(" ({gpus} GPUs)") } else { String::new() }),
-            how: "Split the backbone over two coordinator GPUs or move components to Sparks.".into(),
-        });
     }
     report.experts = contract;
 }

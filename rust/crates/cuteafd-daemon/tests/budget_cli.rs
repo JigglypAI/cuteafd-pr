@@ -7,7 +7,7 @@ fn plan_accepts_global_budget_and_warns_once_for_each_alias() {
         ("--coordinator-gpu-budget-gib", None),
         ("--rtx-budget-gib", Some("--coordinator-gpu-budget-gib")),
         ("--rtx-gib", Some("--coordinator-gpu-budget-gib")),
-        ("--coordinator-budget-gib", Some("--coordinator-weight-budget-gib")),
+        ("--coordinator-weight-budget-gib", None),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
             .args(["plan", "/budget-cli-missing-snapshot", "--layout", flag, "31.8"])
@@ -46,6 +46,90 @@ fn direct_family_concurrency_matches_logical_capacity_and_explicit_launcher_inpu
                     .unwrap_or_else(|| panic!("{family} at {gib} GiB: {stderr}"));
                 assert!(resolved.contains(&format!("concurrency={}", explicit.unwrap_or(expected))), "{resolved}");
                 assert!(!stderr.contains("/unused"), "explicit logical budget must not load CUDA: {stderr}");
+            }
+        }
+    }
+}
+
+#[test]
+fn global_resident_weight_limit_survives_real_binary_family_forwarding() {
+    for command in ["serve", "golden"] {
+        for inner in [false, true] {
+            let mut process = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
+            process.args(["--coordinator-weight-budget-gib", if inner { "73" } else { "0" },
+                "--vision", "off", "--audio", "off", command, "--family", "qwen3_5",
+                "--snapshot", "/budget-cli-missing-snapshot", "--native-lib", "/budget-cli-missing-native.so"]);
+            if command == "golden" { process.args(["--golden", "/budget-cli-missing-golden"]); }
+            if inner { process.args(["--coordinator-weight-budget-gib", "0"]); }
+            let output = process.output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success());
+            assert!(stderr.contains("--coordinator-weight-budget-gib: 0 GiB is not a finite positive size"),
+                "{command}, inner={inner}: {stderr}");
+            assert!(!stderr.contains("unexpected argument"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn global_resident_weight_flag_reaches_plan_admission() {
+    use cuteafd_loader::plan::testing;
+    let snapshot = tempfile::tempdir().unwrap();
+    testing::write_kimi_snapshot(snapshot.path(), true);
+    let package = tempfile::tempdir().unwrap();
+    let manifest = testing::write_kimi_installed_inventory(package.path(), false);
+    for (gib, accepted) in [("80", true), ("1", false)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
+            .args(["--coordinator-weight-budget-gib", gib, "plan"])
+            .arg(snapshot.path()).arg("--workspace-manifest").arg(&manifest)
+            .args(["--layout", "--rtx", "2", "--spark-ranks", "6", "--spark-budget-gib", "256",
+                "--speculator", "off", "--attention-placement", "heads", "--rtx-expert-layers", "0", "--context-tokens", "262144",
+                "--pool-tokens", "262144", "--concurrency", "2", "--prefix-slots", "0",
+                "--host-cache-bytes", "0", "--prefill-rows", "2048", "--prefill-waves", "2",
+                "--vision", "off", "--audio", "off", "--json", "--require-ready"])
+            .env_remove("COORDINATOR_GPU_BUDGET_GIB")
+            .env("HF_HOME", snapshot.path()).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("invalid plan JSON: {error}; {stderr}"));
+        assert_eq!(output.status.success(), accepted, "{gib} GiB: {stderr}");
+        if accepted {
+            assert_eq!(report["fits"], true, "{report}");
+            assert_eq!(report["memory_layout"]["pool_tokens"], 262144);
+        } else {
+            assert_eq!(report["fits"], false, "{report}");
+            assert!(stderr.contains("resident weights need") && stderr.contains("1073741824 byte weight budget"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn global_gpu_storage_flag_reaches_inventory_and_full_layout_admission() {
+    use cuteafd_loader::plan::testing;
+    let snapshot = tempfile::tempdir().unwrap();
+    testing::write_snapshot(snapshot.path(), &testing::mimo_flash_config(),
+        &testing::mimo_flash_tensors(), Some(1));
+    for layout in [false, true] {
+        for (gib, accepted) in [("95.5", true), ("2", false)] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
+            command.args(["--coordinator-gpu-budget-gib", gib,
+                "--coordinator-weight-budget-gib", "80", "plan"]).arg(snapshot.path())
+                .args(["--spark-ranks", "4", "--spark-budget-gib", "100", "--speculator", "off",
+                    "--context-tokens", "262144", "--concurrency", "8", "--prefill-rows", "2048",
+                    "--prefill-waves", "2", "--vision", "off", "--audio", "off", "--json", "--require-ready"]);
+            if layout { command.args(["--layout", "--rtx", "2"]); }
+            let output = command.env_remove("COORDINATOR_GPU_BUDGET_GIB")
+                .env("HF_HOME", snapshot.path()).output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .unwrap_or_else(|error| panic!("invalid plan JSON: {error}; {stderr}"));
+            assert_eq!(output.status.success(), accepted, "layout={layout}, {gib} GiB: {stderr}; {report}");
+            assert_eq!(report["placement_supported"], accepted, "{report}");
+            assert_eq!(report["memory_layout"].is_object(), layout, "{report}");
+            if !accepted {
+                assert!(stderr.contains("is not servable"), "{stderr}");
+                assert!(report["hints"].as_array().unwrap().iter().any(|h| h["what"].as_str()
+                    .is_some_and(|h| h.contains("MiMo placement") && (h.contains("mandatory") || h.contains("pool")))), "{report}");
             }
         }
     }

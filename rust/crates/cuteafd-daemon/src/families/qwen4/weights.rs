@@ -128,6 +128,12 @@ pub(crate) struct Qwen4Weights<'a> {
 }
 
 impl Qwen4Weights<'_> {
+    pub fn bytes(&self) -> usize {
+        self.layers.iter().map(Qwen4Layer::bytes).sum::<usize>()
+            + self.mtp.as_ref().map_or(0, MtpWeights::bytes)
+            + self.mixer.iter().map(|a| a.buffer.bytes).sum::<usize>() + self.head.bytes()
+    }
+
     /// Every layer (target and MTP) with its projections in the representation
     /// `fp8` selects and no other, and the head likewise: device bytes of the
     /// selectable weights as loaded (projections, head).

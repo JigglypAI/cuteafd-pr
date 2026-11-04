@@ -1034,18 +1034,19 @@ impl Opened {
             if owners.is_some() { scratch.programs = scratch.programs.max(glm::step_scratch(&self.cfg, false, decode, lookup)?.programs); }
             Ok(scratch)
         };
-        let drafter_bytes = args.draft.as_deref().map(|snapshot| glm::drafter_bytes(snapshot,
+        let (drafter_bytes, drafter_weights) = args.draft.as_deref().map(|snapshot| glm::drafter_residency(snapshot,
             args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-            self.library.sm_count()? as u64, args.draft_fp8 == Some(false), args.draft_kv_cache)).transpose()?.unwrap_or(0);
+            self.library.sm_count()? as u64, args.draft_fp8 == Some(false), args.draft_kv_cache)).transpose()?.unwrap_or_default();
         let drafter_staging = args.draft.as_deref().map(|snapshot| glm::drafter_staging(snapshot,
             args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
             args.draft_fp8 == Some(false))).transpose()?.unwrap_or(0);
         // mtp_dspark: its admitted layout (weights, rings, arenas), the prefix marks of its
         // draft windows, and load-time staging.
-        let (drafter_bytes, drafter_staging) = match &ml4_draft {
+        let (drafter_bytes, drafter_staging, drafter_weights) = match &ml4_draft {
             Some(layout) => (cuteafd_loader::placement::families::glm5::ml4_draft_resident_bytes(layout,
-                args.draft_window_marks)?, layout.weights().max_load_staging),
-            None => (drafter_bytes, drafter_staging),
+                args.draft_window_marks)?, layout.weights().max_load_staging,
+                cuteafd_loader::placement::ResidentWeights(layout.weights().resident_bytes()?)),
+            None => (drafter_bytes, drafter_staging, drafter_weights),
         };
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
         // Token-split attention: the build's programs (GPU0's table; both GPUs load the same).
@@ -1124,7 +1125,10 @@ impl Opened {
         let tp2_workspace = local.as_ref().map_or([0; 2], |l| l.workspace());
         let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&self.cfg,
             args.prefill_rows as u64, 1, exchange_f32));
-        let inputs = glm::GlmInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false), cfg: &self.cfg, layers, gpus, headroom_bytes: 2 << 30,
+        let inputs = glm::GlmInputs {
+            loaded_weights: reserved_weights.iter().copied().map(cuteafd_loader::placement::ResidentWeights).collect(),
+            drafter_weights,
+        resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false), cfg: &self.cfg, layers, gpus, headroom_bytes: 2 << 30,
             spark_ranks, native_experts: native, native_workspace, native_dense: native_dense_charge.clone(), native_head: core.as_ref().is_some_and(|c| c.ranks[0].target_head.is_some()), skip_routed_experts: args.skip_routed_experts,
             prefill_rows: args.prefill_rows as u64,
             prefill_lanes: prefill_lanes as u64,

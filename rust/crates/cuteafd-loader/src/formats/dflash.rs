@@ -61,6 +61,7 @@ pub struct MlaDraftOwner {
     pub id: String,
     pub domain: MlaDraftDomain,
     pub bytes: usize,
+    pub resident_weights: crate::placement::ResidentWeights,
     pub alignment: usize,
     pub dtype: MlaDraftDtype,
     pub shape: Vec<usize>,
@@ -319,14 +320,20 @@ impl MlaDraftRuntimeLayout {
     /// SM-local scratch, bounded rings and the shared full-layer pool stay on the target's
     /// home. Packing is a separate startup peak, never a second resident copy.
     pub fn demands(&self, gpu: u8) -> Result<(crate::placement::draft::DrafterDemand, crate::placement::Demand)> {
-        use crate::placement::{draft::DrafterDemand, Demand};
+        use crate::placement::{draft::DrafterDemand, Demand, ResidentWeights};
         use cuteafd_core::memory_layout::{Basis, Category};
-        let mut owned = if self.owners.is_empty() {
-            vec![Demand::new(gpu, Category::Drafter, "MLA DFlash owned weights",
-                self.weights.resident_bytes().map_err(|_| unsupported("MLA draft weights overflow"))?, Basis::Formula)]
-        } else { Vec::new() };
-        owned.extend(self.device_buffers().iter().map(|b| Demand::new(gpu, Category::Drafter,
-            format!("MLA DFlash {}", b.name), b.bytes as u64, Basis::Formula)));
+        let owned = if self.owners.is_empty() {
+            let weights = self.weights.resident_bytes().map_err(|_| unsupported("MLA draft weights overflow"))?;
+            let mut owned = vec![Demand::new(gpu, Category::Drafter, "MLA DFlash owned weights",
+                weights, Basis::Formula).with_resident_weights(ResidentWeights(weights))];
+            owned.extend(self.buffers.iter().map(|b| Demand::new(gpu, Category::Drafter,
+                format!("MLA DFlash {}", b.name), b.bytes as u64, Basis::Formula)));
+            owned
+        } else {
+            self.owners.iter().filter(|owner| owner.domain == MlaDraftDomain::Device).map(|owner|
+                Demand::new(gpu, Category::Drafter, format!("MLA DFlash {}", owner.id),
+                    owner.bytes as u64, Basis::Formula).with_resident_weights(owner.resident_weights)).collect()
+        };
         let peak = self.resident_bytes()?.checked_add(self.weights.max_load_staging)
             .ok_or_else(|| unsupported("MLA draft startup peak overflow"))?;
         Ok((DrafterDemand::itemized(owned, gpu), Demand::new(gpu, Category::Drafter,
@@ -1015,6 +1022,7 @@ impl MlaDflashConfig {
             let bytes = dimensions.iter().try_fold(width, |n, &d| n.checked_mul(d))
                 .ok_or_else(|| unsupported("mtp_dspark arena multiplication overflow"))?.max(256);
             owners.push(MlaDraftOwner { id: name.clone(), domain: MlaDraftDomain::Device, bytes,
+                resident_weights: crate::placement::ResidentWeights::default(),
                 alignment: 256, dtype, shape: dimensions.to_vec(), lifetime: MlaDraftLifetime::Runtime,
                 shared_key: None, staging_for: None, on_use: false });
             buffers.push(MlaDraftBuffer { name, bytes });
@@ -1048,6 +1056,7 @@ impl MlaDflashConfig {
             let bytes = weight.shape.iter().try_fold(2usize, |n, &d| n.checked_mul(d))
                 .ok_or_else(|| unsupported("mtp_dspark weight destination overflow"))?.max(256);
             owners.push(MlaDraftOwner { id: weight.owner.clone(), domain: MlaDraftDomain::Device, bytes,
+                resident_weights: crate::placement::ResidentWeights(bytes as u64),
                 alignment: 256, dtype: Bf16, shape: weight.shape.clone(), lifetime: MlaDraftLifetime::Runtime,
                 shared_key: None, staging_for: None, on_use: false });
         }
@@ -1058,17 +1067,20 @@ impl MlaDflashConfig {
         let staging: Vec<_> = owners.iter().filter(|o| metadata.contains(&o.id.as_str())
             || o.id.ends_with(".page_table") || matches!(o.id.as_str(), "h" | "taps"))
             .map(|o| MlaDraftOwner { id: format!("host.ordered.{}", o.id), domain: MlaDraftDomain::HostPinned,
+                resident_weights: crate::placement::ResidentWeights::default(),
                 bytes: o.bytes, alignment: 1, dtype: Bytes, shape: vec![o.bytes], lifetime: MlaDraftLifetime::Library,
                 shared_key: Some(format!("ordered-h2d/{}", o.id)), staging_for: Some(o.id.clone()),
                 on_use: matches!(o.id.as_str(), "h" | "taps") }).collect();
         owners.extend(staging);
         owners.push(MlaDraftOwner { id: "host.landing".into(), domain: MlaDraftDomain::HostPinned,
+            resident_weights: crate::placement::ResidentWeights::default(),
             bytes: seq * self.drafts() * 4, alignment: 1, dtype: U32, shape: vec![seq, self.drafts()],
             lifetime: MlaDraftLifetime::Runtime, shared_key: None, staging_for: None, on_use: false });
         let largest_upload = owners.iter().filter(|o| o.domain == MlaDraftDomain::Device
             && (o.id.starts_with("weight.") || o.id == "inverse_frequencies"))
             .map(|o| o.bytes).max().unwrap_or(0);
         owners.push(MlaDraftOwner { id: "host.sync_h2d".into(), domain: MlaDraftDomain::HostPinned,
+            resident_weights: crate::placement::ResidentWeights::default(),
             bytes: largest_upload, alignment: 1, dtype: Bytes, shape: vec![largest_upload],
             lifetime: MlaDraftLifetime::Library, shared_key: Some("library/sync-h2d".into()),
             staging_for: None, on_use: false });
@@ -1308,9 +1320,21 @@ mod tests {
                 1 << 20, 1 << 21, 188, 0, MlaCacheFormat::Fp8)?;
             let allocated: BTreeMap<_, _> = layout.allocate_device_with(|b| Ok::<_, anyhow::Error>((b.name.clone(), b.bytes)))?
                 .into_iter().collect();
-            let demanded: BTreeMap<_, _> = layout.demands(device)?.0.movable(2)?.conditional[0].demands.iter()
+            let movable = layout.demands(device)?.0.movable(2)?;
+            let demands = &movable.conditional[0].demands;
+            let demanded: BTreeMap<_, _> = demands.iter()
                 .map(|d| (d.group.strip_prefix("MLA DFlash ").unwrap().to_string(), d.bytes as usize)).collect();
             assert_eq!(allocated, demanded, "{label}: every owner, not just totals");
+            let weights = layout.weight_destinations().iter().map(|weight|
+                (weight.shape.iter().product::<usize>() * 2).max(256) as u64).sum::<u64>();
+            assert_eq!(demands.iter().map(|d| d.resident_weights.0).sum::<u64>(), weights);
+            assert_eq!(weights, layout.weights().resident_bytes()?);
+            for owner in layout.owners() {
+                let expected = if layout.weight_destinations().iter().any(|weight| weight.owner == owner.id) {
+                    owner.bytes as u64
+                } else { 0 };
+                assert_eq!(owner.resident_weights.0, expected, "{label}: {}", owner.id);
+            }
             let shipped: Vec<serde_json::Value> = serde_json::from_str(include_str!("../families/mistral_large4/official-tensors.json"))?;
             let mut headers = BTreeMap::new();
             for tensor in shipped {

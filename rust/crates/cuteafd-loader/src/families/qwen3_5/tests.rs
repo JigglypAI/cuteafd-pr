@@ -185,6 +185,35 @@ fn native_planner_uses_export_contract_and_exact_dense_allocations() {
 }
 
 #[test]
+fn native_planner_enforces_independent_checkpoint_weight_and_storage_limits() {
+    use crate::placement::families::qwen3_5::NativeWeights;
+    use cuteafd_core::DType;
+    let (dir, mut options, _, _) = native_planner_fixture();
+    let checkpoint = plan::Checkpoint::open(dir.path()).unwrap();
+    let cfg = Qwen35Config::from_hf(&checkpoint.config).unwrap();
+    let owners = NativeWeights::native(&checkpoint, &cfg, DType::F32).unwrap();
+    let required = owners.layers.iter().sum::<u64>() + owners.embedding + owners.norm + owners.head;
+    assert!(required > 0);
+    options.coordinator_budget_bytes = required;
+    let accepted = plan::plan(dir.path(), &options).unwrap();
+    assert!(accepted.fits && accepted.native_serving_admitted, "{:?}", accepted.hints);
+    assert_eq!(accepted.memory_layout.as_ref().unwrap().pool_tokens, 262144);
+
+    options.coordinator_budget_bytes = required - 1;
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.fits && !refused.native_serving_admitted);
+    let message = format!("rtx0 resident weights need {required} bytes, over the {} byte weight budget", required - 1);
+    assert!(refused.hints.iter().any(|hint| hint.what.contains(&message)), "{:?}", refused.hints);
+
+    options.coordinator_budget_bytes = required;
+    options.layout.as_mut().unwrap().rtx_bytes = vec![4 << 30];
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.fits && !refused.native_serving_admitted);
+    assert!(!refused.hints.iter().any(|hint| hint.what.contains("resident weights need")), "{:?}", refused.hints);
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("native placement refused")), "{:?}", refused.hints);
+}
+
+#[test]
 fn native_planner_resolves_zero_spark_prefill_contract() {
     let (dir, mut options, _, _) = native_planner_fixture();
     for explicit in [false, true] {

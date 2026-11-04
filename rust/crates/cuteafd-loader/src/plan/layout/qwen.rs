@@ -29,17 +29,16 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
 }
 
 /// Exact resident weights on rtx0 (`checkpoint_resident_bytes`).
-fn resident(checkpoint: &crate::plan::Checkpoint, mtp: bool) -> Option<Vec<Vec<(String, String, u64)>>> {
-    use crate::families::qwen4::resident::Qwen4Representation;
+fn resident(checkpoint: &crate::plan::Checkpoint, mtp: bool,
+    representation: crate::families::qwen4::resident::Qwen4Representation) -> Option<Vec<Vec<(String, String, u64)>>> {
     let cfg = Qwen4Config::from_hf(&checkpoint.config).ok()?;
     let mtp = mtp && cfg.mtp_layers > 0;
-    let bytes = checkpoint_resident_bytes(checkpoint, &cfg, cfg.layers, mtp,
-        Qwen4Representation { fp8_projections: false, fp8_head: true }).ok()?;
+    let bytes = checkpoint_resident_bytes(checkpoint, &cfg, cfg.layers, mtp, representation).ok()?;
     Some(vec![vec![
-        ("target incl PLE projections".into(), "bf16+f32".into(), bytes.target_bytes),
+        ("target incl PLE projections".into(), if representation.fp8_projections { "fp8+bf16+f32" } else { "bf16+f32" }.into(), bytes.target_bytes),
         ("embedding".into(), "bf16".into(), bytes.embedding_bytes),
-        ("lm_head".into(), "fp8-row128".into(), bytes.head_bytes),
-        ("speculator".into(), "bf16+f32".into(), bytes.mtp_bytes),
+        ("lm_head".into(), if representation.fp8_head { "fp8-row128" } else { "bf16" }.into(), bytes.head_bytes),
+        ("speculator".into(), if representation.fp8_projections { "fp8+bf16+f32" } else { "bf16+f32" }.into(), bytes.mtp_bytes),
     ]])
 }
 
@@ -75,7 +74,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
         notes.push("Qwen serves on rtx0; rtx1 is idle and contributes no KV capacity".into());
     }
     mapped_table_note(report, &mut notes);
-    match resident(checkpoint, mtp) {
+    match resident(checkpoint, mtp, options.qwen_representation) {
         Some(ranks) => {
             push_resident(&mut devices, &ranks, |group| match group {
                 "embedding" => Category::Embedding,
@@ -92,10 +91,8 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
             }
         }
         None => {
-            report.placement_supported = false;
             let what = "Qwen resident weights: checkpoint headers do not describe the serve-qwen4 resident layout".to_string();
-            report.hints.push(crate::plan::Hint { what: what.clone(),
-                how: "Supply the checkpoint's complete coordinator tensor headers.".into() });
+            report.refuse_placement(what.clone(), "Supply the checkpoint's complete coordinator tensor headers.");
             notes.push(what);
         }
     }
@@ -125,10 +122,9 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
             None if shape.manifest.is_none() => notes.push("local EXL3 workspace not charged: no program manifest \
                 (--workspace-manifest or an image's PROGRAMS.json) to read its capacity manifests from".into()),
             None => {
-                report.placement_supported = false;
                 let what = "Qwen local EXL3 workspace: no matching rtx-tp1/m*/v41_exl3.json capacity manifests".to_string();
-                report.hints.push(crate::plan::Hint { what: what.clone(), how: "Images bundle them; or export the exl3 tree \
-                    alongside PROGRAMS.json (--workspace-manifest).".into() });
+                report.refuse_placement(what.clone(), "Images bundle them; or export the exl3 tree \
+                    alongside PROGRAMS.json (--workspace-manifest).");
                 notes.push(what);
             }
         }
@@ -163,8 +159,10 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
         PlanShape { prefill_rows: shape.prefill_rows, concurrency: shape.concurrency, context_tokens: shape.context_tokens, mtp }) {
         Ok(tokens) => pool_tokens = tokens,
         Err(error) => {
-            report.placement_supported = false;
-            notes.push(format!("Qwen admission: {error}"));
+            let reason = format!("Qwen admission: {error:#}");
+            report.refuse_placement(reason.clone(),
+                "Supply complete native checkpoint owners within the device and resident-weight budgets.");
+            notes.push(reason);
         }
     }
     if pool_tokens < shape.context_tokens {
@@ -219,7 +217,29 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         device.items.push(Item::new(Category::Experts, "package scratch", package, bytes, Basis::Formula));
     }
     let loaded_bytes = device.used_bytes();
-    let inputs = crate::placement::families::qwen4::QwenInputs { spark_reply_format: options.resolved_spark_reply_format(false), automatic_context: options.context_tokens == 0,
+    let resident = checkpoint_resident_bytes(checkpoint, &cfg, cfg.layers, mtp,
+        options.qwen_representation)?;
+    let host_embedding = options.host_embedding && checkpoint.tensors.iter()
+        .filter(|tensor| tensor.meta.name.ends_with("embed_tokens.weight")).count() == 1
+        && checkpoint.require_untied_embedding("model.language_model.embed_tokens.weight").is_ok();
+    let mut loaded_weights = qwen4::single_owner_weights(&resident, host_embedding,
+        cfg.ple_layers.first().is_some_and(|&layer| layer < cfg.layers))?
+        .checked_add(crate::placement::ResidentWeights(options.drafter_bytes))?;
+    let local = report.placement == ExpertPlacement::Local;
+    if local || mtp {
+        loaded_weights = loaded_weights.checked_add(qwen4::single_expert_weights(
+            input.expert_catalog()?, cfg.layers, local, mtp)?)?;
+    }
+    if let Some(encoder) = &report.encoder {
+        if let super::super::encoder::EncoderKind::Rtx { gpu } = encoder.kind {
+            let weights = crate::placement::ResidentWeights(encoder.weights);
+            if gpu == 0 { loaded_weights = loaded_weights.checked_add(weights)?; }
+            else { weights.check(u8::try_from(gpu)?, crate::placement::ResidentWeights(options.weight_budget_bytes))?; }
+        }
+    }
+    let inputs = crate::placement::families::qwen4::QwenInputs {
+        loaded_weights,
+        resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), automatic_context: options.context_tokens == 0,
         admission: QwenAdmissionInputs { prefill_shape, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
             prefill_rows: span, slots: options.resolved_state_slots("qwen4"), mark_bytes: marks,
             full_prefill_logits: logits, ple, future_expert_bytes: 0, headroom: options.headroom_bytes.max(3 * GIB) },
@@ -293,8 +313,9 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
     let mut notes = vec![format!("resolved context {context} tokens"),
         "Qwen whole-layer attention ranges; all routed experts native TP2; head and MTP on rtx0".into()];
     if report.requested_attention.is_some_and(|mode| mode != crate::placement::AttentionPlacement::Layers) {
-        report.placement_supported = false;
-        notes.push("Qwen dual supports whole-layer attention only, not head or context shards".into());
+        let reason = "Qwen dual supports whole-layer attention only, not head or context shards".to_string();
+        report.refuse_placement(reason.clone(), "Use whole-layer attention placement.");
+        notes.push(reason);
         return MemoryLayout { devices, pool_tokens: 0, waste: Vec::new(), notes };
     }
     report.attention_placement = crate::placement::AttentionPlacement::Layers;
@@ -303,7 +324,7 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
         let mut reserved = options.clone();
         reserved.pool_tokens = Some(options.pool_tokens.filter(|&n| n > 0).unwrap_or_else(||
             crate::placement::PoolPolicy::resolve(&options.rtx_bytes, context, None, 256, true).target));
-        match apply(input, &reserved, &mut media, rows, concurrency, context, mtp, manifest) {
+        match apply(input, &reserved, report.encoder.as_ref(), &mut media, rows, concurrency, context, mtp, manifest) {
             Ok(_) => {
                 resolve_encoder(report, &qwen_towers(report), &mut media, &mut [], &[0; 2], options, &mut notes);
                 for (device, admitted) in devices.iter_mut().zip(media) {
@@ -311,15 +332,19 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
                         item.group.starts_with("vision") || item.group.starts_with("audio")));
                 }
             }
-            Err(error) => { report.placement_supported = false; notes.push(format!("Qwen media admission: {error:#}")); }
+            Err(error) => {
+                let reason = format!("Qwen media admission: {error:#}");
+                report.refuse_placement(reason.clone(),
+                    "Supply complete checkpoint headers and exact unequal TP2 plus MTP package manifests.");
+                notes.push(reason);
+            }
         }
     }
-    let pool_tokens = match apply(input, options, &mut devices, rows, concurrency, context, mtp, manifest) {
+    let pool_tokens = match apply(input, options, report.encoder.as_ref(), &mut devices, rows, concurrency, context, mtp, manifest) {
         Ok(placement) => { report.solver_placement = Some(placement.clone()); notes.push(format!("placement: {}", placement.summary())); placement.pool_tokens },
         Err(error) => {
-            report.placement_supported = false;
-            report.hints.push(super::super::Hint { what: format!("Qwen dual admission: {error:#}"),
-                how: "Supply complete checkpoint headers and exact unequal TP2 plus MTP package manifests.".into() });
+            report.refuse_placement(format!("Qwen dual admission: {error:#}"),
+                "Supply complete checkpoint headers and exact unequal TP2 plus MTP package manifests.");
             notes.push(format!("Qwen dual admission: {error:#}")); 0
         }
     };
@@ -327,7 +352,8 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut [DeviceLayout],
+fn apply(input: &super::super::PlanInput, options: &LayoutOptions,
+    encoder: Option<&super::super::encoder::EncoderPlacement>, devices: &mut [DeviceLayout],
     rows: u64, concurrency: u64, context: u64, mtp: bool, manifest: Option<&serde_json::Value>) -> Result<Placement> {
     let checkpoint = input.checkpoint();
     let cfg = Qwen4Config::from_hf(&checkpoint.config)?;
@@ -348,6 +374,18 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let workspace = qwen4::dual_expert_workspace(&catalog, packages.each_ref().map(|p| p.as_path()), rows.max(64))?;
     let host = options.host_embedding;
     let mut fixed = qwen4::dual_owner0_weights(&resident, host);
+    if options.drafter_bytes > 0 {
+        fixed.push(crate::placement::Demand::new(0, Category::Drafter, "drafter", options.drafter_bytes, Basis::Exact)
+            .with_resident_weights(crate::placement::ResidentWeights(options.drafter_bytes)));
+    }
+    if let Some(encoder) = encoder {
+        if let super::super::encoder::EncoderKind::Rtx { gpu } = encoder.kind {
+            anyhow::ensure!(gpu < devices.len(), "Qwen encoder owner is outside the coordinator inventory");
+            fixed.push(crate::placement::Demand::new(u8::try_from(gpu)?, Category::Weights,
+                "loaded vision weights", 0, Basis::Exact)
+                .with_resident_weights(crate::placement::ResidentWeights(encoder.weights)));
+        }
+    }
     fixed.extend(qwen4::dual_projection_load_staging(&cfg, cfg.layers, mtp, selected));
     fixed.extend(qwen4::QwenTp2Rows::new(cfg.hidden as u64, cfg.topk as u64, rows.max(64),
         catalog.exl3().is_some())?.demands()?);
@@ -361,7 +399,8 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let ple = checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
         .map(|t| (resident.ple_row_bytes, t.meta.dtype == cuteafd_core::DType::F8E4M3));
     let headroom = options.headroom_bytes.max(3 * GIB);
-    let inputs = qwen4::QwenDualInputs { automatic_context: options.context_tokens == 0,
+    let inputs = qwen4::QwenDualInputs {
+        resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), automatic_context: options.context_tokens == 0,
         owner_manifests,
         admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
             manifest, prefill_rows: rows, slots: options.resolved_state_slots("qwen4"),

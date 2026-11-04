@@ -1,7 +1,7 @@
 //! Kimi physical-owner admission with checkpoint residency and shared native allocation layouts.
 use super::Model;
 use anyhow::Context;
-use crate::{placement::*, plan::{Component, ExpertPlacement, Hint, PlanReport}};
+use crate::{placement::*, plan::{Component, ExpertPlacement, PlanReport}};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
 const GIB: u64 = 1 << 30;
@@ -31,27 +31,22 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         "Kimi K3 header lower bound: coordinator workspaces/graphs not charged; NOT serving admission".into(),
         "Spark budgets are offline estimates (including an explicit override), not load/steady census-qualified admission".into(),
     ] };
-    let refusal = |report: &mut PlanReport, what: String, how: &str| {
-        report.fits = false;
-        report.placement_supported = false;
-        report.hints.push(Hint { what, how: how.into() });
-    };
     report.bytes_by_owner.clear();
     report.attention_placement = report.requested_attention.unwrap_or(AttentionPlacement::Layers);
     let context = if opts.context_tokens == 0 { crate::families::kimi_k3::default_context(&model.core) as u64 } else { opts.context_tokens };
     memory.notes.push(format!("Kimi API max context: {context} tokens; compiled max context: {COMPILED_CAPACITY} tokens"));
     if context > COMPILED_CAPACITY {
-        refusal(report, format!("Kimi context {context} exceeds compiled capacity {COMPILED_CAPACITY}"),
+        report.refuse_placement(format!("Kimi context {context} exceeds compiled capacity {COMPILED_CAPACITY}"),
             "Lower --context-tokens to at most 1M; the pool must cover the selected context extent.");
         return memory;
     }
     if report.requested_attention == Some(AttentionPlacement::Context) {
-        refusal(report, "Kimi K3 context attention placement has no owned-page query exchange/LSE-combine ABI".into(),
+        report.refuse_placement("Kimi K3 context attention placement has no owned-page query exchange/LSE-combine ABI".into(),
             "Use layers (owned MLA with split KDA/FFNs) or explicitly select heads; context requires a new native ABI.");
         return memory;
     }
     if !model.complete {
-        refusal(report, "Kimi K3 placement cannot infer fit from missing safetensors headers".into(),
+        report.refuse_placement("Kimi K3 placement cannot infer fit from missing safetensors headers".into(),
             "Place every shard's header locally (nest replicate) or plan from a complete snapshot.");
         return memory;
     }
@@ -59,7 +54,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let routed_layers = cfg.dense.iter().filter(|d| !**d).count() as u64;
     let layer_bytes = experts / routed_layers;
     if !matches!(gpus, 1 | 2) || (gpus == 2 && !opts.head_split) {
-        refusal(report, "Kimi K3 requires one owner or two GPUs with split KDA and FFNs".into(),
+        report.refuse_placement("Kimi K3 requires one owner or two GPUs with split KDA and FFNs".into(),
             "Use --rtx 1 or --rtx 2 with head split enabled.");
         return memory;
     }
@@ -86,11 +81,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let manifest = if path.is_file() {
         match input.manifest(path) {
             Ok(value) => Some(value),
-            Err(error) => { refusal(report, format!("Kimi package inventory refused: {error:#}"),
+            Err(error) => { report.refuse_placement(format!("Kimi package inventory refused: {error:#}"),
                 "Supply the matching PROGRAMS.json through --workspace-manifest."); return memory; }
         }
     } else if opts.workspace_manifest.is_some() {
-        refusal(report, "Kimi explicit workspace manifest is missing".into(), "Supply the installed PROGRAMS.json.");
+        report.refuse_placement("Kimi explicit workspace manifest is missing".into(), "Supply the installed PROGRAMS.json.");
         return memory;
     } else { None };
     let state = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) * slots / gpus as u64;
@@ -104,7 +99,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     for demand in &mark_demands {
         let mut demand = demand.clone();
         let Some(bytes) = demand.bytes.checked_mul(legacy_marks) else {
-            refusal(report, "Kimi mark reservation overflow".into(), "Reduce prefix retention.");
+            report.refuse_placement("Kimi mark reservation overflow".into(), "Reduce prefix retention.");
             return memory;
         };
         demand.bytes = bytes;
@@ -113,17 +108,22 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let packed = manifest.as_ref().map(|_| &model.core);
     let globals = packed.map(|core| crate::families::kimi_k3::weight_layout::GlobalLayout::ranks_with_core(cfg, core, gpus)).transpose();
     let globals = match globals { Ok(value) => value, Err(error) => {
-        refusal(report, format!("Kimi packed global inventory refused: {error:#}"), "Check checkpoint global geometry."); return memory;
+        report.refuse_placement(format!("Kimi packed global inventory refused: {error:#}"), "Check checkpoint global geometry."); return memory;
     }};
     for gpu in 0..gpus as u8 {
         if let Some(globals) = &globals {
             fixed.push(globals[usize::from(gpu)].demand().expect("validated global extent"));
         } else {
-        fixed.push(Demand::new(gpu, Category::Weights, "text weights, head/intermediate split", residency.split / gpus as u64, Basis::Exact));
+        let split = residency.split / gpus as u64;
+        fixed.push(Demand::new(gpu, Category::Weights, "text weights, head/intermediate split", split, Basis::Exact)
+            .with_resident_weights(ResidentWeights(split)));
+        let replicated = residency.replicated - if gpus == 2 { model.frontends[1 - gpu as usize] } else { 0 };
         fixed.push(Demand::new(gpu, Category::Weights, "text weights replicated (KDA low-rank A, routers, latent proj, norms)",
-            residency.replicated - if gpus == 2 { model.frontends[1 - gpu as usize] } else { 0 }, Basis::Exact));
-        if gpu == 0 { fixed.push(Demand::new(gpu, Category::Embedding, "token embedding", embedding, Basis::Exact)); }
-        if usize::from(gpu) == head_rank { fixed.push(Demand::new(gpu, Category::Weights, "lm head", head, Basis::Exact)); }
+            replicated, Basis::Exact).with_resident_weights(ResidentWeights(replicated)));
+        if gpu == 0 { fixed.push(Demand::new(gpu, Category::Embedding, "token embedding", embedding, Basis::Exact)
+            .with_resident_weights(ResidentWeights(embedding))); }
+        if usize::from(gpu) == head_rank { fixed.push(Demand::new(gpu, Category::Weights, "lm head", head, Basis::Exact)
+            .with_resident_weights(ResidentWeights(head))); }
         }
         fixed.push(Demand::new(gpu, Category::Kv, format!("KDA FP32 state + BF16 conv, {slots} slots, {} heads", cfg.kda_heads / gpus), state, Basis::Formula));
     }
@@ -161,12 +161,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         })();
         match extra {
             Ok(demands) => fixed.extend(demands),
-            Err(error) => { refusal(report, format!("Kimi package admission refused: {error:#}"),
+            Err(error) => { report.refuse_placement(format!("Kimi package admission refused: {error:#}"),
                 "Supply complete matching native and EXL3 workspace manifests."); return memory; }
         }
         memory.notes[0] = "Kimi shared runtime allocation ledger; graph executable bytes retain the runtime's explicit startup estimate".into();
     } else if !model.core.projections.is_empty() {
-        refusal(report, "Kimi native K6 requires installed workspace inventory".into(),
+        report.refuse_placement("Kimi native K6 requires installed workspace inventory".into(),
             "Supply the matching K6 PROGRAMS.json through --workspace-manifest.");
         return memory;
     }
@@ -194,7 +194,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let (spark_budget, costs) = match inventory {
         Ok(value) => value,
         Err(error) => {
-            refusal(report, format!("Kimi header inventory refused: {error:#}"), "Provide complete native EXL3 headers.");
+            report.refuse_placement(format!("Kimi header inventory refused: {error:#}"), "Provide complete native EXL3 headers.");
             return memory;
         }
     };
@@ -233,7 +233,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let draft = match draft {
         Ok(layout) => layout,
         Err(error) => {
-            refusal(report, format!("Kimi native MLA draft inventory refused: {error:#}"),
+            report.refuse_placement(format!("Kimi native MLA draft inventory refused: {error:#}"),
                 "Provide a supported MLA DFlash2 checkpoint and matching native representation.");
             return memory;
         }
@@ -253,9 +253,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 let mut attention = [0; 2];
                 for rank in 0..gpus {
                     attention[rank] = split[rank].attention_bytes()? as u64;
+                    let fixed_weights = split[rank].bytes()? as u64 - attention[rank];
                     fixed.push(Demand::new(rank as u8, Category::Weights,
                         format!("Kimi layer {layer} TP2 FFN/residual/router/latent"),
-                        split[rank].bytes()? as u64 - attention[rank], Basis::Exact));
+                        fixed_weights, Basis::Exact).with_resident_weights(ResidentWeights(fixed_weights)));
                 }
                 weights = ModeBytes { split: attention, whole: if mla {
                     LayerLayout::pair_with_core(cfg, layer, MODES[1], core)?[0].attention_bytes()? as u64
@@ -271,11 +272,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 half: costs[layer], tp2: gpus == 2, spark_ok: true }), modes: if gpus == 1 { vec![WHOLE] } else if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } })
     }).collect() })();
     let layers = match layers { Ok(value) => value, Err(error) => {
-        refusal(report, format!("Kimi packed layer inventory refused: {error:#}"), "Check checkpoint layer geometry."); return memory;
+        report.refuse_placement(format!("Kimi packed layer inventory refused: {error:#}"), "Check checkpoint layer geometry."); return memory;
     }};
     // Reuse pool-first TP2 onboarding, constrained by the Spark suffix budget.
     let onboard = opts.resolve_onboard(cfg.dense.iter().filter(|dense| !**dense).count()).unwrap_or(Onboard::Auto);
     let mut request = PlacementRequest {
+        resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)),
         inventory: Inventory { gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, bytes)| GpuBudget { capacity_bytes: *bytes,
             headroom_bytes: opts.headroom_bytes, baseline: baseline[rank] }).collect(),
             spark_ranks: ranks, peer_access: gpus == 2 },
@@ -293,7 +295,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         executor: ExecutorModes { family: "kimi_k3", modes, hops: gpus == 2, attention: AttentionPlacement::Layers },
     };
     if let Err(error) = spark_budget.constrain(&mut request) {
-        refusal(report, format!("Kimi joint admission refused: {error:#}"),
+        report.refuse_placement(format!("Kimi joint admission refused: {error:#}"),
             "Use automatic RTX expert selection or increase the explicit estimated Spark budget.");
         return memory;
     }
@@ -355,7 +357,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             onboarded
         }
         Err(error) => {
-            refusal(report, format!("Kimi K3 coordinator admission refused: {error}"),
+            report.refuse_placement(format!("Kimi K3 coordinator admission refused: {error}"),
                 "Coordinator text weights are 105.7 GiB BF16; free KV room by placement, not a smaller pool floor.");
             return memory;
         }
@@ -371,10 +373,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 model.expert_formats.join("+"), resident, Basis::Exact)] };
         if let Err(error) = crate::plan::layout::charge_spark_io(&mut device, &working, cuteafd_core::ExpertGeometry::KIMI_K3,
             unit as u32, false, rings, 0) {
-            refusal(report, format!("Kimi K3 Spark rank {rank} I/O: {error}"), "Fix the Spark ring geometry.");
+            report.refuse_placement(format!("Kimi K3 Spark rank {rank} I/O: {error}"), "Fix the Spark ring geometry.");
         }
         if let Err(error) = kimi_owners(&mut device, &working, admitted.unit_rows, admitted.waves) {
-            refusal(report, format!("Kimi Spark execution owners: {error:#}"), "Use a supported wave count.");
+            report.refuse_placement(format!("Kimi Spark execution owners: {error:#}"), "Use a supported wave count.");
         }
         memory.devices.push(device);
     }

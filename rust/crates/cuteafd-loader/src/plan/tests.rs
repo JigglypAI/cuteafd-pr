@@ -1786,7 +1786,10 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
                 (device.capacity_bytes, Baseline::Measured { free_bytes: device.capacity_bytes - context - weights })
             }).collect::<Vec<_>>();
             assert_eq!(pre_weight, gpus);
-            let inputs = glm::GlmInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, cfg: &cfg, layers: cfg.layers, gpus,
+            let inputs = glm::GlmInputs {
+                loaded_weights: vec![crate::placement::ResidentWeights::default(); gpus.len()],
+                drafter_weights: crate::placement::ResidentWeights::default(),
+        resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, cfg: &cfg, layers: cfg.layers, gpus,
                 headroom_bytes: options.headroom_bytes, spark_ranks: report.spark_ranks, native_experts: false, native_workspace: 0, native_dense: Vec::new(), native_head: false, skip_routed_experts: false,
                 prefill_rows: 4096,
                 prefill_lanes: 1, max_context: 65536, automatic_context: options.context_tokens == 0, scratch: None, drafter_bytes: 0,
@@ -2702,6 +2705,76 @@ fn v4_snapshot() -> tempfile::TempDir {
 }
 
 #[test]
+fn v4_actual_plan_preserves_exact_resident_weight_refusal_with_and_without_layout() {
+    use crate::placement::{FfnMode, LayerMode, OnboardSetting};
+    let dir = v4_snapshot();
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(dir.path(), 0).unwrap();
+    let modes = vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }; cfg.n_layers];
+    let required = crate::families::deepseek_v4::resident::resident_operands(&cfg, &modes, 1,
+        false, checkpoint.tensors.iter().map(|tensor| &tensor.meta)).unwrap()
+        .iter().map(|owner| owner.bytes).sum::<u64>();
+    assert!(required > 0);
+    for full_layout in [false, true] {
+        let options = PlanOptions { coordinator_budget_bytes: required,
+            layout: full_layout.then(|| layout::LayoutOptions {
+                rtx_bytes: vec![96 << 30], context_tokens: 32768, pool_tokens: Some(32768),
+                onboard: Some(OnboardSetting::Layers(0)), host_memory: Some((128 << 30, 128 << 30)),
+                host_cache_bytes: Some(0), ..Default::default()
+            }), ..sparks(4) };
+        let accepted = plan(dir.path(), &options).unwrap();
+        assert!(accepted.fits && accepted.executable(), "{}", render(&accepted));
+        if let Some(memory) = &accepted.memory_layout {
+            assert_eq!(memory.pool_tokens, 32768);
+            assert_eq!(accepted.onboard_layers, Some(0));
+        }
+        let limit = required - 1;
+        let refused = plan(dir.path(), &PlanOptions {
+            coordinator_budget_bytes: limit, ..options
+        }).unwrap();
+        let diagnostic = format!("rtx0 resident weights need {required} bytes, over the {limit} byte weight budget");
+        assert!(!refused.fits && !refused.placement_supported && !refused.executable()
+            && refused.hints.iter().any(|hint| hint.what.starts_with("V4 pool-first placement:")
+                && hint.what.contains(&diagnostic)), "{}", render(&refused));
+        assert_eq!(refused.memory_layout.is_some(), full_layout);
+    }
+}
+
+#[test]
+fn glm5_actual_plan_preserves_exact_resident_weight_refusal_with_and_without_layout() {
+    use crate::placement::OnboardSetting;
+    let dir = snapshot(glm5_config(), &glm5_tensors(|name, rows, columns| fp8(name, rows, columns, None)));
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+    let required = layout::glm5::device_bytes(&checkpoint, 1, cfg.layers, false, None).unwrap()[0];
+    assert!(required > 0);
+    for full_layout in [false, true] {
+        let options = PlanOptions { coordinator_budget_bytes: required,
+            layout: full_layout.then(|| layout::LayoutOptions {
+                rtx_bytes: vec![96 << 30], context_tokens: 32768, pool_tokens: Some(32768),
+                onboard: Some(OnboardSetting::Layers(0)), glm5_drafter_disabled: true,
+                host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+                ..Default::default()
+            }), ..sparks(4) };
+        let accepted = plan(dir.path(), &options).unwrap();
+        assert!(accepted.fits && accepted.executable(), "{}", render(&accepted));
+        if let Some(memory) = &accepted.memory_layout {
+            assert_eq!(memory.pool_tokens, 32768);
+            assert_eq!(accepted.onboard_layers, Some(0));
+        }
+        let limit = required - 1;
+        let refused = plan(dir.path(), &PlanOptions {
+            coordinator_budget_bytes: limit, ..options
+        }).unwrap();
+        let diagnostic = format!("rtx0 resident weights need {required} bytes, over the {limit} byte weight budget");
+        assert!(!refused.fits && !refused.placement_supported && !refused.executable()
+            && refused.hints.iter().any(|hint| hint.what.starts_with("GLM placement:")
+                && hint.what.contains(&diagnostic)), "{}", render(&refused));
+        assert_eq!(refused.memory_layout.is_some(), full_layout);
+    }
+}
+
+#[test]
 fn deepseek_v4_plan_reads_the_runtime_config_source() {
     let dir = v4_snapshot();
     let report = plan(dir.path(), &sparks(4)).unwrap();
@@ -2943,8 +3016,17 @@ fn observed_zero_ranks_panics() {
     assert_eq!(component(&report, Component::RoutedExpert).owner.label(report.placement), "rtx (local)");
     // Over the coordinator budget: the shortfall is named.
     let tight = PlanOptions { coordinator_budget_bytes: 1 << 20, ..sparks(0) };
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config).unwrap();
+    let mtp = cfg.mtp_layers > 0;
+    let owners = crate::families::qwen4::resident::checkpoint_resident_bytes(&checkpoint, &cfg,
+        cfg.layers, mtp, layout::LayoutOptions::default().qwen_representation).unwrap();
+    let required = crate::placement::families::qwen4::single_owner_weights(&owners, false, false).unwrap()
+        .checked_add(crate::placement::families::qwen4::single_expert_weights(
+            &crate::read_expert_catalog(dir.path()).unwrap(), cfg.layers, true, mtp).unwrap()).unwrap().0;
     let report = plan(dir.path(), &tight).unwrap();
-    assert!(!report.fits && report.hints.iter().any(|h| h.what.contains("over the 0 GiB budget")), "{}", render(&report));
+    let refusal = format!("rtx0 resident weights need {required} bytes, over the {} byte weight budget", 1 << 20);
+    assert!(!report.fits && report.hints.iter().any(|h| h.what.contains(&refusal)), "{}", render(&report));
     // GLM 5.x has no local expert package.
     let report = plan(snapshot(glm5_config(), &glm5_tensors(|n, r, k| fp8(n, r, k, None))).path(), &sparks(0)).unwrap();
     assert!(!report.placement_supported && !report.executable());
@@ -3267,7 +3349,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
     let native: Vec<_> = tensors.iter().filter(|(name, ..)| name.contains(".layers.3.mlp.experts.0."))
         .map(|(name, dtype, shape)| (name.replace(".layers.3.", ".layers.4."), *dtype, shape.clone())).collect();
     tensors.extend(native);
-    // Weight-only admission sums checkpoint headers; include every expert as the solver does.
+    // Native local admission owns every expert, not just the example expert headers.
     let expert_zero: Vec<_> = tensors.iter().filter(|(name, ..)| name.contains(".mlp.experts.0.")).cloned().collect();
     for expert in 1..cfg.experts {
         tensors.extend(expert_zero.iter().map(|(name, dtype, shape)|
@@ -3324,7 +3406,8 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         let report = plan(dir.path(), &options).unwrap();
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
-        let input = glmf::GlmfInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
+        let input = glmf::GlmfInputs {
+        resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
             gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)| (total, Baseline::Planned {
                 context_bytes: placement::ArchContext::coordinator(total, None).context_bytes
                     + placement::loaded_code("glmf", "fp8", true, rank as u8).unwrap().bytes,
@@ -3339,7 +3422,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
                 GlmfStepShape { spark: false, ..shape }, decode, prefill),
             graphs: placement::GraphSet::budget(&[64 << 20; 2]), experts: glmf::expert_costs(&catalog, true).unwrap(),
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
-            drafter_bytes: 0, drafter_scratch: vec![0; 2], drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
+            drafter_bytes: 0, drafter_weights: placement::ResidentWeights::default(), drafter_scratch: vec![0; 2], drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
             full_prefill_logits: 0 };
         let (placed, graphs, working) = glmf::solve_attention_working_set_with_graphs(&input, None,
             2 << 20, false, 188, true).unwrap();
@@ -3365,7 +3448,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             let local = PlanOptions { coordinator_budget_bytes: budget, ..options.clone() };
             let fitted = plan(dir.path(), &local).unwrap();
             assert!(fitted.executable(), "{}", render(&fitted));
-            assert!(!fitted.hints.iter().any(|hint| hint.what.contains("local-only placement needs")));
+            assert!(!fitted.hints.iter().any(|hint| hint.what.contains("resident weights need")));
             let weight_rejected = plan(dir.path(), &PlanOptions {
                 coordinator_budget_bytes: budget - (2 << 20), ..local.clone()
             }).unwrap();
@@ -3373,7 +3456,11 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             assert!(weight_rejected.hints.iter().any(|hint| hint.what.contains("resident weights need")));
             let weight_only = plan(dir.path(), &PlanOptions { layout: None, ..local.clone() }).unwrap();
             assert!(!weight_only.fits && !weight_only.executable());
-            assert!(weight_only.hints.iter().any(|hint| hint.what.contains("local-only placement needs")));
+            // The inventory-only request has no package manifest: native
+            // compatibility refuses it before the weight boundary is reached.
+            assert!(weight_only.hints.iter().any(|hint|
+                hint.what.contains("GLM Flash pool-first placement: missing fp8-glmf package")),
+                "{}", render(&weight_only));
             let mut strict = local;
             strict.layout.as_mut().unwrap().pool_tokens = Some(1 << 40);
             let rejected = plan(dir.path(), &strict).unwrap();
@@ -3811,8 +3898,9 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
             .filter(|d| d.kind == DeviceKind::Rtx && d.index == rank).flat_map(|d| &d.items)
             .filter(|i| i.category == category && (category == Category::Drafter || i.group == "DFlash linear/attention scratch"))
             .map(|i| i.bytes).sum::<u64>();
-        let (owned, scratch) = crate::placement::families::glm5_flash::drafter_inventory(&config,8,8,
+        let (native_draft, scratch) = crate::placement::families::glm5_flash::drafter_inventory(&config,8,8,
             &[170,188],GlmDraftRepresentation::Fp8Only,2, draft_kv_cache).unwrap();
+        let owned = native_draft.memory.resident;
         let natural = run(&options);
         assert_eq!(bytes(&natural,0,Category::Drafter), owned);
         assert_eq!(bytes(&natural,0,Category::Workspace), scratch[0]);
@@ -3821,9 +3909,9 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
         let simulated = run(&options);
         assert_eq!(bytes(&simulated,0,Category::Drafter), owned);
         assert_eq!(bytes(&simulated,0,Category::Workspace), scratch[1]);
-        options.drafter_bytes = owned + scratch[1];
-        // An explicit total must work even when no checkpoint can be read.
-        options.glmf_drafter_snapshot = Some(draft.path().join("absent"));
+        options.drafter_bytes = native_draft.resident_weights.0;
+        // An explicit weight-only override has no inferred runtime scratch.
+        options.glmf_drafter_snapshot = None;
         let explicit = run(&options);
         assert_eq!(bytes(&explicit,0,Category::Drafter), options.drafter_bytes);
         assert_eq!(bytes(&explicit,0,Category::Workspace), 0);
@@ -4173,7 +4261,11 @@ fn qwen_default_attention_follows_spark_free_coordinator_layout() {
 #[test]
 fn qwen_split_off_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle() {
     use cuteafd_core::memory_layout::Category;
-    let dir = snapshot(qwen4_config(48), &[]);
+    let config = qwen4_config(4);
+    let (mut tensors, manifest) = qwen4_exl3(4, 4);
+    tensors.extend(qwen4_coordinator(&config, false));
+    let dir = snapshot(config, &tensors);
+    write_quantize_config(dir.path(), &manifest);
     let options = PlanOptions {
         layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
             rtx_bytes: vec![12 << 30, 96 << 30], head_split: false, pool_tokens: Some(0),
@@ -4793,6 +4885,85 @@ fn glm_flash_vision_plan_matches_resident_admission_and_mimo_shape() {
     assert!(!rendered.contains("MiMo key-0"));
 }
 
+#[test]
+fn mimo_local_media_weights_share_the_native_cap_without_charging_scratch() {
+    use super::encoder::EncoderKind;
+    use crate::placement::OnboardSetting;
+    let mut config = mimo_flash_mopd_config();
+    config["vision_config"] = json!({"depth":28,"hidden_size":1280,"intermediate_size":4608,
+        "num_heads":32,"num_key_value_heads":8,"out_hidden_size":4096,"patch_size":16,
+        "temporal_patch_size":2,"spatial_merge_size":2,"hidden_act":"silu"});
+    let mut tensors = mimo_flash_mopd_tensors();
+    tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
+    let dir = snapshot_tp(config, &tensors, Some(4));
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
+    let owners = crate::families::mimo_v2::resident::MimoResidentLayout::new(&checkpoint, &cfg,
+        &crate::families::mimo_v2::resident::MimoResidentOptions {
+            layers: cfg.layers, coordinator_ranks: 1, checkpoint_tp: 4, native_mtp_layers: 0,
+            gpu_embedding: true, head_format: crate::families::mimo_v2::projection::MimoProjectionRepresentation::Bf16,
+            output_formats: (0..cfg.layers).map(|layer| (format!("model.layers.{layer}.self_attn.o_proj.weight"),
+                crate::families::mimo_v2::projection::MimoProjectionRepresentation::Bf16)).collect(),
+        }).unwrap();
+    let target = owners.ranks[0].iter().map(|owner| owner.bytes).sum::<u64>();
+    let options = PlanOptions { vision: MediaMode::Rtx(Some(0)),
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            pool_tokens: Some(32768), concurrency: 4,
+            onboard: Some(OnboardSetting::Layers(0)), ..Default::default() }), ..sparks(4) };
+    let roomy = plan(dir.path(), &options).unwrap();
+    assert!(roomy.executable(), "{}", render(&roomy));
+    let encoder = roomy.encoder.as_ref().unwrap();
+    assert_eq!(encoder.kind, EncoderKind::Rtx { gpu: 0 });
+    assert!(encoder.weights > 0 && encoder.scratch > 0);
+    let required = target + encoder.weights;
+    let exact = PlanOptions { coordinator_budget_bytes: required, ..options.clone() };
+    let admitted = plan(dir.path(), &exact).unwrap();
+    assert!(admitted.executable(), "{}", render(&admitted));
+    assert_eq!(admitted.memory_layout.as_ref().unwrap().pool_tokens, 32768);
+    assert_eq!(admitted.solver_placement.as_ref().unwrap().onboard_layers, 0);
+    assert_eq!(admitted.encoder, roomy.encoder);
+    let refused = plan(dir.path(), &PlanOptions { coordinator_budget_bytes: required - 1,
+        ..options.clone() }).unwrap();
+    let refusal = format!("rtx0 resident weights need {required} bytes, over the {} byte weight budget", required - 1);
+    assert!(!refused.executable() && refused.hints.iter().any(|h| h.what.contains(&refusal)),
+        "{}", render(&refused));
+    // A remote tower still owns physical worker storage, but no RTX weights.
+    for vision in [MediaMode::Off, MediaMode::Spark(None)] {
+        let remote = plan(dir.path(), &PlanOptions { vision, coordinator_budget_bytes: target,
+            ..options.clone() }).unwrap();
+        assert!(remote.executable(), "{}", render(&remote));
+        assert!(!matches!(remote.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { .. }));
+        assert_eq!(remote.memory_layout.as_ref().unwrap().pool_tokens, 32768);
+    }
+}
+
+#[test]
+fn qwen_native_resident_admission_includes_padding_not_source_inventory() {
+    let dir = qwen_snapshot(4);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config).unwrap();
+    let owners = crate::families::qwen4::resident::checkpoint_resident_bytes(&checkpoint, &cfg,
+        cfg.layers, false, layout::LayoutOptions::default().qwen_representation).unwrap();
+    let required = crate::placement::families::qwen4::single_owner_weights(&owners, false, false).unwrap()
+        .checked_add(crate::placement::families::qwen4::single_expert_weights(
+            &crate::read_expert_catalog(dir.path()).unwrap(), cfg.layers, true, false).unwrap()).unwrap().0;
+    let options = PlanOptions { coordinator_budget_bytes: required, ..sparks(0) };
+    let report = plan(dir.path(), &options).unwrap();
+    let source = report.components.iter().filter(|c| matches!(c.owner, Owner::Rtx | Owner::SparkSliced))
+        .map(|c| c.bytes).sum::<u64>();
+    assert_eq!(source, 1_397_074_944);
+    assert_eq!(required, 1_408_128_000);
+    assert!(report.executable(), "{}", render(&report));
+    // Expert arena padding outweighs this fixture's small FP8-head saving.
+    // A budget that fits the source inventory must still refuse native owners.
+    for limit in [source, required - 1] {
+        let refused = plan(dir.path(), &PlanOptions { coordinator_budget_bytes: limit, ..options.clone() }).unwrap();
+        let refusal = format!("rtx0 resident weights need {required} bytes, over the {limit} byte weight budget");
+        assert!(!refused.fits && !refused.executable()
+            && refused.hints.iter().any(|h| h.what.contains(&refusal)), "{}", render(&refused));
+    }
+}
+
 /// A Spark-hosted MiMo tower is admitted against what each worker holds after
 /// its selected rank I/O (rings, intake, exchange, row indices), and the final
 /// layout keeps every Spark's allocations inside --spark-budget-gib.
@@ -4977,11 +5148,14 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
         "num_heads":16,"num_position_embeddings":2304,"out_hidden_size":2560,
         "patch_size":16,"temporal_patch_size":2,"spatial_merge_size":2,
         "hidden_act":"gelu_pytorch_tanh","deepstack_visual_indexes":[]});
-    let tensors = [t("model.visual.patch_embed.proj.weight", "BF16", &[1152,3,2,16,16]),
+    let (mut tensors, manifest) = qwen4_exl3(1, 4);
+    tensors.extend(qwen4_coordinator(&cfg, false));
+    tensors.extend([t("model.visual.patch_embed.proj.weight", "BF16", &[1152,3,2,16,16]),
         t("model.visual.patch_embed.proj.bias", "BF16", &[1152]),
         t("model.visual.blocks.0.norm1.weight", "BF16", &[1152]),
-        t("model.visual.blocks.0.norm1.bias", "BF16", &[1152])];
+        t("model.visual.blocks.0.norm1.bias", "BF16", &[1152])]);
     let dir = snapshot(cfg.clone(), &tensors);
+    write_quantize_config(dir.path(), &manifest);
     let options = PlanOptions { placement: ExpertPlacement::Local, layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
         rtx_bytes: vec![96<<30], pool_tokens: Some(32768), target_pool_tokens: 32768,
         ..Default::default()

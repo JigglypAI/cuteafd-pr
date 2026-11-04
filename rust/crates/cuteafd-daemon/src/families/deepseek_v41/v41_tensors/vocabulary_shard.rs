@@ -104,6 +104,11 @@ impl<'a> VocabularyShard<'a> {
             exceptions, row_exceptions, "V4.1 vocabulary residency");
         Ok(Self { allocation, device_id, tokens, fp8, packed })
     }
+    pub fn resident_bytes(&self) -> usize {
+        self.allocation.as_ref().map_or(0, |a| a.buffer.bytes)
+            + self.fp8.as_ref().map_or(0, |w| w.bytes())
+            + self.packed.as_ref().map_or(0, |head| head.bytes())
+    }
     pub fn weight(&self) -> Option<CuteafdDeviceBuffer> { self.allocation.as_ref().map(|a| a.buffer) }
     pub fn device_id(&self) -> i32 { self.device_id }
     /// The resident copy (`CUTEAFD_V41_FP8_HEAD`), when one was packed.

@@ -4,7 +4,7 @@ pub use crate::placement::families::deepseek_v41::resident::*;
 use super::*;
 use anyhow::{ensure, Context, Result};
 use crate::placement::{self, families::deepseek_v41 as v41, ArchContext, Baseline,
-    Demand, GpuBudget, Inventory, Onboard, PoolPolicy, SparkWorkingSet};
+    Demand, GpuBudget, Inventory, Onboard, PoolPolicy, ResidentWeights, SparkWorkingSet};
 use v41::DraftInventory;
 
 // Conservative combined code/ready-graph envelope; pure LoadedCode is unqualified.
@@ -72,7 +72,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         place_host_embedding(report, checkpoint, &mut devices, &mut waste, &mut notes);
     }
     let fixed = devices.iter().flat_map(|d| d.items.iter().map(|i|
-        Demand::new(d.index as u8, i.category, i.group.clone(), i.bytes, i.basis))).collect::<Vec<_>>();
+        Demand::new(d.index as u8, i.category, i.group.clone(), i.bytes, i.basis)
+            .with_resident_weights(ResidentWeights(i.bytes)))).collect::<Vec<_>>();
     let mut startup = Vec::new();
     if ranks == 1 {
         if let Some(head) = checkpoint.tensors.iter().find(|t| t.meta.name == "head.weight") {
@@ -87,7 +88,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut fixed = fixed;
     if options.drafter_bytes > 0 {
         fixed.push(Demand::new(0, Category::Drafter, "external drafter weights",
-            options.drafter_bytes, Basis::Exact));
+            options.drafter_bytes, Basis::Exact).with_resident_weights(ResidentWeights(options.drafter_bytes)));
     }
     let mut owners = v41::owners::TargetOwners::new(fixed, target, ranks, transport, marks)?;
     let mut fixed = owners.fixed.clone();
@@ -97,8 +98,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let draft = if dspark {
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("V41_EXPERT_AOT.json"))
             .context("missing V4.1 dSpark coordinator allocation manifest")?)?;
-        let resident = resident_weights(checkpoint, ranks, true).context("unsupported V4.1 dSpark resident format")?;
-        let bytes = resident.iter().flatten().filter(|i| i.category == Category::Drafter).map(|i| i.bytes).sum();
+        let resident = drafter_weights(checkpoint, ranks).context("unsupported V4.1 dSpark resident format")?;
+        let bytes = resident.iter().flatten().try_fold(0u64, |sum, owner|
+            sum.checked_add(owner.bytes).context("V4.1 draft weight budget overflow"))?;
         let staging = catalog.expert_staging(crate::V41ExpertSelection::Dspark { stage: 0, expert: 0 })?.staging_bytes() as u64;
         ensure!((1..=cuteafd_core::MAX_DSPARK_PROPOSALS as u8).contains(&options.dspark_draft_limit), "invalid V4.1 dSpark draft limit");
         let width = if options.dspark_draft_limit > 5 { 7 } else { 5 };
@@ -154,13 +156,14 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         options.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto)
     };
     let mut request = v41::request(inventory, pool, vec![0; ranks], experts, workspace, onboard);
+    request.resident_weight_limit = Some(ResidentWeights(options.weight_budget_bytes));
     request.fixed = fixed;
     request.startup = startup.clone();
     if let Some(draft) = &draft { request.startup.extend(owners.draft_load_phases(draft)?); }
     request.minimum_expert_layers = usize::from(ranks == 2 && !matches!(onboard, Onboard::Layers(0)));
     if let Some(draft) = &draft { request.movables.push(v41::drafter(draft, ranks)?); }
     v41::cache_demands(&mut request, &checkpoint.config, shape.concurrency, turns, false)?;
-    let mut placement = solve_with_weight_limit(&request, draft.as_ref(), options.weight_budget_bytes)?;
+    let mut placement = placement::solve(&request)?;
     let mut working = SparkWorkingSet { rtx_layers: (0..placement.onboard_layers).collect(),
         spark_layers: (placement.onboard_layers..40).collect(), spark_ranks, prefill_lanes: slots as u64 };
     let mut sparks = spark_devices(report, model, input, options, SPARK, &working, 2, &mut waste, &mut notes);
@@ -183,12 +186,20 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             request.fixed.push(demand);
         }
     }
+    if let Some(encoder) = &report.encoder {
+        if let super::super::encoder::EncoderKind::Rtx { gpu } = encoder.kind {
+            let weights = Demand::new(gpu as u8, Category::Weights, "vision checkpoint owners", 0, Basis::Formula)
+                .with_resident_weights(ResidentWeights(encoder.weights));
+            owners.add_vision(weights.clone())?;
+            request.fixed.push(weights);
+        }
+    }
     if request.fixed.len() > request.fixed.iter().filter(|d| !d.group.starts_with("vision ")).count() {
         if let Some(draft) = &draft {
             request.startup = startup.clone();
             request.startup.extend(owners.draft_load_phases(draft)?);
         }
-        placement = solve_with_weight_limit(&request, draft.as_ref(), options.weight_budget_bytes)?;
+        placement = placement::solve(&request)?;
     }
     v41::validate_pool_floor(&request.pool, &placement)?;
     working.rtx_layers = (0..placement.onboard_layers).collect();
@@ -231,49 +242,6 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     Ok(MemoryLayout { devices, pool_tokens, waste, notes })
 }
 
-fn solve_with_weight_limit(request: &placement::PlacementRequest, draft: Option<&DraftInventory>,
-    limit: u64) -> Result<placement::Placement> {
-    let mut placement = placement::solve(request)?;
-    loop {
-        let fits = retained_weight_bytes(request, &placement, draft)?.into_iter().all(|bytes| bytes <= limit);
-        if fits { return Ok(placement); }
-        ensure!(request.inventory.spark_ranks > 0 && request.onboard.layers(40).is_none()
-            && placement.onboard_layers > request.minimum_expert_layers,
-            "V4.1 coordinator weight budget exceeded; mandatory owners require more than {limit} bytes");
-        let mut trial = request.clone();
-        trial.onboard = Onboard::Layers(placement.onboard_layers - 1);
-        // Keep pool-first's admitted pool while reducing only the optional prefix.
-        if matches!(request.onboard, Onboard::Auto) {
-            trial.pool.pin_selected(placement.pool_tokens);
-        }
-        placement = placement::solve(&trial)?;
-    }
-}
-
-fn retained_weight_bytes(request: &placement::PlacementRequest, placed: &placement::Placement,
-    draft: Option<&DraftInventory>) -> Result<Vec<u64>> {
-    let ranks = request.inventory.gpus.len();
-    (0..ranks).map(|gpu| {
-        let mut bytes = request.fixed.iter().filter(|d| usize::from(d.gpu) == gpu
-            && (matches!(d.category, Category::Weights | Category::Embedding | Category::Tables)
-                || d.group == "external drafter weights"))
-            .try_fold(0u64, |sum, d| sum.checked_add(d.bytes).context("V4.1 weight budget overflow"))?;
-        let draft_bytes = draft.map_or(0, |d| if gpu == ranks - 1 { d.resident } else { d.peer_half });
-        bytes = bytes.checked_add(draft_bytes).context("V4.1 draft weight budget overflow")?;
-        for (layer, assigned) in request.layers.iter().zip(&placed.layers) {
-            if let Some(cost) = layer.experts {
-                let resident = match assigned.experts {
-                    placement::ExpertHome::RtxTp2 => cost.half[gpu].resident,
-                    placement::ExpertHome::RtxWhole { gpu: owner } if usize::from(owner) == gpu => cost.whole.resident,
-                    _ => 0,
-                };
-                bytes = bytes.checked_add(resident).context("V4.1 expert weight budget overflow")?;
-            }
-        }
-        Ok(bytes)
-    }).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,20 +274,24 @@ mod tests {
             half: Default::default(), tp2: false, spark_ok: true };
         let mut request = v41::request(inventory, PoolPolicy::resolve(&[96 * GIB], 512, None, 512, false),
             vec![512 * 1024], vec![expert; 40], 16 * GIB, Onboard::Auto);
-        request.fixed.push(Demand::new(0, Category::Weights, "backbone", 2 * GIB, Basis::Exact));
+        request.fixed.push(Demand::new(0, Category::Weights, "backbone", 2 * GIB, Basis::Exact)
+            .with_resident_weights(ResidentWeights(2 * GIB)));
         let unconstrained = placement::solve(&request)?;
-        let placed = solve_with_weight_limit(&request, None, 10 * GIB)?;
+        request.resident_weight_limit = Some(ResidentWeights(10 * GIB));
+        let placed = placement::solve(&request)?;
         assert_eq!(placed.onboard_layers, 2);
-        assert_eq!(retained_weight_bytes(&request, &placed, None)?, vec![10 * GIB]);
+        assert_eq!(request.fixed[0].resident_weights.0
+            + placed.onboard_layers as u64 * expert.whole.resident, 10 * GIB);
         assert!(placed.items[0].iter().filter(|i| i.category == Category::Experts)
             .map(|i| i.bytes).sum::<u64>() > 10 * GIB);
         assert!(placed.pool_tokens >= 262_144);
         assert_eq!(placed.pool_tokens, unconstrained.pool_tokens);
         request.onboard = Onboard::Layers(3);
-        assert!(solve_with_weight_limit(&request, None, 10 * GIB).is_err());
+        assert!(matches!(placement::solve(&request), Err(placement::PlacementError::ResidentWeightLimit { .. })));
         request.onboard = Onboard::Auto;
         request.minimum_expert_layers = 1;
-        assert!(solve_with_weight_limit(&request, None, 5 * GIB).is_err());
+        request.resident_weight_limit = Some(ResidentWeights(5 * GIB));
+        assert!(matches!(placement::solve(&request), Err(placement::PlacementError::ResidentWeightLimit { .. })));
         Ok(())
     }
 }

@@ -468,7 +468,8 @@ impl WeightInventory {
             *bytes = bytes.checked_add(item.bytes).context("V4 invariant weight overflow")?;
         }
         let fixed = groups.into_iter().map(|((gpu, group), bytes)|
-            crate::placement::Demand::new(gpu as u8, Category::Weights, group, bytes, Basis::Exact)).collect();
+            crate::placement::Demand::new(gpu as u8, Category::Weights, group, bytes, Basis::Exact)
+                .with_resident_weights(crate::placement::ResidentWeights(bytes))).collect();
         Ok(Self { c4_attention, fixed })
     }
 

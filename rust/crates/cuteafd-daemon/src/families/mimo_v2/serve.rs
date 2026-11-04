@@ -234,7 +234,7 @@ struct Policy {
 type VisionReady = Option<(Option<Arc<cuteafd_api::openai::media::MediaPreparer>>,
     Option<Arc<cuteafd_api::openai::media::audio::AudioPreparer>>, Option<Arc<std::sync::atomic::AtomicBool>>, Option<Arc<std::sync::atomic::AtomicBool>>)>;
 
-fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
+fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     draft: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, audio: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>, remote_audio: Option<super::media::RemoteAudio>,
     loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
@@ -249,6 +249,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         Ok(vision) => vision,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };
+    args.planner_media_weights = vision.as_ref().and_then(|vision| vision.weights);
     let preparer = vision.as_ref().and_then(|vision| vision.preparer.clone());
     let audio_preparer = vision.as_ref().and_then(|vision| vision.audio_preparer.clone());
     let (encoder, bytes) = vision.map_or((super::media::Encoder::Off, 0), |vision|

@@ -104,7 +104,7 @@ pub struct LayoutOptions {
     /// An automatic pool under a fixed onboard stops at its target instead of
     /// growing to all free memory (it still shrinks to fit, down to its floor).
     pub pool_ceiling_at_target: bool,
-    /// External drafter resident bytes on the lead GPU (DFlash), if any.
+    /// Explicit checkpoint-resident drafter weights; no inferred runtime storage.
     pub drafter_bytes: u64,
     pub dense_qwen_drafter_snapshot: Option<std::path::PathBuf>,
     pub dense_qwen_mtp: bool,
@@ -827,10 +827,8 @@ pub enum ContextPolicy {
 }
 
 pub(crate) fn unsupported_prefill(report: &mut PlanReport, error: anyhow::Error) -> MemoryLayout {
-    report.fits = false;
-    report.placement_supported = false;
-    report.hints.push(crate::plan::Hint { what: format!("prefill unsupported: {error:#}"),
-        how: "Use a supported explicit prefill shape or add the missing executor/kernel capacity.".into() });
+    report.refuse_placement(format!("prefill unsupported: {error:#}"),
+        "Use a supported explicit prefill shape or add the missing executor/kernel capacity.");
     MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![error.to_string()] }
 }
 

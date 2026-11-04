@@ -29,6 +29,7 @@ pub fn allocation_bytes(label: &str, dimensions: &[usize]) -> Result<u64> {
 }
 
 pub struct DraftReservations {
+    pub resident_weights: crate::placement::ResidentWeights,
     pub steady: Vec<MemoryReservation>,
     /// Selected weights and FP8 scratch coexist with one drained source
     /// matrix during packing, after target KV but before target workspaces.
@@ -158,6 +159,9 @@ pub fn draft_reservations_with(
         bytes,
     })
     .collect::<Vec<_>>();
+    let resident_weights = crate::placement::ResidentWeights(costs.iter()
+        .try_fold(0u64, |sum, owner| sum.checked_add(owner.bytes))
+        .context("DFlash checkpoint weights overflow")?);
     let mut packing = costs.clone();
     if let Some(fp8) = &layout.fp8_scratch {
         let bytes = fp8
@@ -260,6 +264,7 @@ pub fn draft_reservations_with(
         .try_fold(0u64, |sum, r| sum.checked_add(r.bytes))
         .context("DFlash reservation sum")?;
     Ok(DraftReservations {
+        resident_weights,
         steady: costs,
         packing,
     })

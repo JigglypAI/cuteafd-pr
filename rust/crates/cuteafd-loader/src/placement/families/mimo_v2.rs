@@ -6,8 +6,29 @@ use crate::serving_capacity::{mimo_cache_geometry, CacheGeometryError};
 use cuteafd_core::memory_layout::{Basis, Category, Item};
 use cuteafd_core::serving_capacity::{CapacityProfile, MemoryReservation, ResolvedCapacity, ResolvedDeviceCapacity};
 
+/// Already-loaded tower owners follow physical CUDA ordinals, not rank numbers.
+/// Their physical storage is in the baseline; only checkpoint weights are added.
+pub fn add_local_media_weights(weights: &mut [ResidentWeights], devices: &[i32],
+    media: Option<(i32, ResidentWeights)>, limit: ResidentWeights) -> Result<(), PlacementError> {
+    if weights.len() != devices.len() {
+        return Err(PlacementError::Inventory("MiMo media owner/rank geometry"));
+    }
+    if let Some((device, media)) = media {
+        if let Some(rank) = devices.iter().position(|&ordinal| ordinal == device) {
+            weights[rank] = weights[rank].checked_add(media)?;
+        } else {
+            let gpu = u8::try_from(device)
+                .map_err(|_| PlacementError::Inventory("MiMo media CUDA ordinal"))?;
+            media.check(gpu, limit)?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct MimoInputs<'a> {
+    pub resident_weight_limit: Option<ResidentWeights>,
+    pub resident_weights: Vec<ResidentWeights>,
     /// True only when the operator left context automatic.
     pub automatic_context: bool,
     pub cfg: &'a MimoV2Config,
@@ -180,6 +201,30 @@ pub fn exact_package(directory: &std::path::Path,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_resources_follow_physical_ordinals_and_check_independent_owners() {
+        for devices in [[7, 2], [2, 7]] {
+            for rank in 0..2 {
+                let mut weights = [ResidentWeights(11), ResidentWeights(22)];
+                add_local_media_weights(&mut weights, &devices,
+                    Some((devices[rank], ResidentWeights(123))), ResidentWeights(256)).unwrap();
+                assert_eq!(weights[rank].0, [11, 22][rank] + 123);
+                assert_eq!(weights[1 - rank].0, [11, 22][1 - rank]);
+            }
+            let mut weights = [ResidentWeights(11), ResidentWeights(22)];
+            add_local_media_weights(&mut weights, &devices, None, ResidentWeights(256)).unwrap();
+            add_local_media_weights(&mut weights, &devices, Some((9, ResidentWeights(256))), ResidentWeights(256)).unwrap();
+            assert_eq!(weights, [ResidentWeights(11), ResidentWeights(22)]);
+            assert_eq!(add_local_media_weights(&mut weights, &devices,
+                Some((9, ResidentWeights(257))), ResidentWeights(256)),
+                Err(PlacementError::ResidentWeightLimit { gpu: 9, required: 257, limit: 256 }));
+        }
+        assert!(add_local_media_weights(&mut [ResidentWeights(u64::MAX)], &[7],
+            Some((7, ResidentWeights(1))), ResidentWeights(u64::MAX)).is_err());
+        assert!(add_local_media_weights(&mut [], &[7], None, ResidentWeights(1)).is_err());
+    }
+
     #[test]
     fn route_exchange_matches_native_slot_alignment_and_rejects_overflow() {
         for rows in [1, 3, 64, 4096] {
@@ -216,7 +261,8 @@ mod tests {
             let local = profile(false);
             let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
                 half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true };
-            let inputs = MimoInputs { automatic_context: false, cfg: &cfg, profile: &spark, layers: 4, kv: MimoKvFormats::default(),
+            let inputs = MimoInputs {
+        resident_weight_limit: None, resident_weights: vec![ResidentWeights::default(); ranks], automatic_context: false, cfg: &cfg, profile: &spark, layers: 4, kv: MimoKvFormats::default(),
                 mtp_stages: 0, gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 90 << 30 }); ranks],
                 headroom_floor: 0, spark_ranks: 6, startup_probe_bytes: 64 << 20, context: 256 << 10,
                 requested_pool: Some(2 << 20), pool_ceiling_at_target: false, onboard: Onboard::Auto,
@@ -328,7 +374,8 @@ mod tests {
             let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
                 half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true };
             for onboard in [Onboard::Auto, Onboard::Layers(2)] {
-                let inputs = MimoInputs { automatic_context: false, cfg: &cfg, profile: &profile, layers: 4, kv: MimoKvFormats::default(),
+                let inputs = MimoInputs {
+        resident_weight_limit: None, resident_weights: vec![ResidentWeights::default(); ranks], automatic_context: false, cfg: &cfg, profile: &profile, layers: 4, kv: MimoKvFormats::default(),
                     mtp_stages: 0, gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 90 << 30 }); ranks],
                     headroom_floor: 0, spark_ranks: 6, startup_probe_bytes: 64 << 20, context: 256 << 10,
                     requested_pool: None, pool_ceiling_at_target: false, onboard,
@@ -410,7 +457,8 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
     let ranks = inputs.gpus.len();
     let profile = inputs.profile;
     let layers = inputs.layers;
-    if !(1..=2).contains(&ranks) || profile.devices.len() != ranks || inputs.experts.len() != layers {
+    if !(1..=2).contains(&ranks) || profile.devices.len() != ranks || inputs.experts.len() != layers
+        || inputs.resident_weights.len() != ranks {
         return Err(PlacementError::Inventory("MiMo ranks, profile and layer costs disagree").into());
     }
     let cache = mimo_cache_geometry(inputs.cfg, layers, ranks, inputs.kv, inputs.mtp_stages)?;
@@ -430,6 +478,9 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
         pool_overhead.push(costs.pool_unit_bytes.checked_sub(cache.ranks[rank].persistent_unit_bytes)
             .ok_or(PlacementError::Inventory("MiMo pool tables omit layer records"))?);
     }
+    fixed.extend(inputs.resident_weights.iter().enumerate().map(|(rank, &weights)|
+        Demand::new(rank as u8, Category::Weights, "MiMo selected checkpoint owners", 0, Basis::Exact)
+            .with_resident_weights(weights)));
     let mut tp2_workspace = inputs.tp2_workspace;
     if ranks == 2 && tp2_workspace.iter().any(|&bytes| bytes > 0) {
         let bytes = route_exchange_bytes(inputs.rows.max(64), inputs.cfg.topk as u64, inputs.lanes)
@@ -489,6 +540,7 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
             .max(inputs.headroom_floor),
     }).collect();
     Ok(PlacementRequest {
+        resident_weight_limit: inputs.resident_weight_limit,
         pool_bounded: Vec::new(),
         inventory: Inventory { gpus, spark_ranks: inputs.spark_ranks, peer_access: ranks == 2 },
         pool,

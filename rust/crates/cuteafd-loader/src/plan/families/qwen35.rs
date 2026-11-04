@@ -184,7 +184,8 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     let drafter = if options.dense_qwen_mtp {
         Some(placement::families::qwen3_5::DrafterBytes::native_mtp(input.checkpoint(), cfg)?)
     } else { drafter };
-    let result = placement::families::qwen3_5::placement(DenseInputs { cfg,
+    let result = placement::families::qwen3_5::placement(DenseInputs {
+        resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), cfg,
         gpu: GpuBudget { capacity_bytes: capacity, headroom_bytes: 1 << 30,
             baseline: Baseline::Planned { context_bytes: context, loaded_bytes: 0 } },
         layers: &layers, fixed, drafter, requested_pool: options.pool_tokens.filter(|&n| n > 0),

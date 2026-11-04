@@ -48,6 +48,7 @@ impl Opened {
         let experts = admission::dual_experts(args, catalog, layers)?;
         let weights = admission::dual_weights(args, &self.checkpoint, &self.cfg, layers, mtp)?;
         let mut fixed = weights.fixed;
+        fixed.extend(admission::loaded_media_weights(&[args.device, peer], args.planner_media_weights)?);
         fixed.extend(experts.transport);
         fixed.extend(qwen4::dual_peer_diagnostics(
             std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1")));
@@ -71,7 +72,8 @@ impl Opened {
         let baselines = inventory.baselines(&[]);
         let enabled = engine::startup_graphs_enabled(std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
             std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());
-        let placement = qwen4::dual_placement(&qwen4::QwenDualInputs { automatic_context: automatic_context,
+        let placement = qwen4::dual_placement(&qwen4::QwenDualInputs {
+        resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), automatic_context: automatic_context,
             owner_manifests: manifests.each_ref().map(Some),
             mark_slots: inputs.mark_bytes / mark_bytes, admission: inputs,
             gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: baselines[rank].0,

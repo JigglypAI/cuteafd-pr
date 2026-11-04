@@ -44,6 +44,7 @@ pub(super) fn check_prefix(full: &KimiK3Config, selected: &KimiK3Config) -> Resu
 /// page tables; global weights, token IO and state banks add their own demands.
 pub(crate) struct Inputs<'a, const RANKS: usize = 2> {
     pub cfg: &'a KimiK3Config,
+    pub resident_weight_limit: ResidentWeights,
     pub cache_format: cuteafd_core::MlaCacheFormat,
     pub core: cuteafd_loader::families::kimi_k3::core::CoreInventory,
     pub gpus: [GpuBudget; RANKS],
@@ -544,9 +545,10 @@ impl<'a> Admission<'a> {
         ensure!(!self.kda_allocated[rank], "Kimi KDA bank already allocated");
         for demand in self.kda_layout.demands(rank as u8)? {
             let charges = self.placement.items[rank].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
-            ensure!(charges.len() == 1 && charges[0].category == demand.category
-                && charges[0].basis == Basis::Exact && charges[0].bytes == demand.bytes,
-                "Kimi KDA allocation differs from accepted native pool charge");
+            ensure!(if demand.bytes == 0 { charges.is_empty() } else {
+                charges.len() == 1 && charges[0].category == demand.category
+                    && charges[0].basis == Basis::Exact && charges[0].bytes == demand.bytes
+            }, "Kimi KDA allocation differs from accepted native pool charge");
         }
         Ok(())
     }
@@ -828,9 +830,10 @@ fn request<const RANKS: usize>(i: Inputs<'_, RANKS>) -> Result<PlacementRequest>
             let mut attention = [0; 2];
             for rank in 0..2 {
                 attention[rank] = split[rank].attention_bytes()? as u64;
+                let weights = split[rank].bytes()? as u64 - attention[rank];
                 fixed.push(Demand::new(rank as u8, Category::Weights,
                     format!("Kimi layer {layer} TP2 FFN/residual/router/latent"),
-                    split[rank].bytes()? as u64 - attention[rank], Basis::Exact));
+                    weights, Basis::Exact).with_resident_weights(ResidentWeights(weights)));
             }
             let whole = if mla {
                 LayerLayout::pair_with_core(cfg, layer, MODES[1], &i.core)?[0].attention_bytes()? as u64
@@ -850,7 +853,8 @@ fn request<const RANKS: usize>(i: Inputs<'_, RANKS>) -> Result<PlacementRequest>
     let mut pool = PoolPolicy::resolve(&i.gpus.map(|gpu| gpu.capacity_bytes), context as u64,
         i.requested_pool, MLA_PAGE_ROWS as u64, true);
     pool.ceiling = pool.target.max(pool.requested.unwrap_or(0));
-    Ok(PlacementRequest { inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
+    Ok(PlacementRequest {
+        resident_weight_limit: Some(i.resident_weight_limit), inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
         attention_placement: i.attention, context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
         pool, layers, pool_overhead: vec![0; RANKS], pool_bounded: i.pool_bounded, fixed, startup, movables,
         expert_workspace: 0, tp2_workspace: [0; 2], onboard: Onboard::Layers(0), expert_gpus: 0, minimum_expert_layers: 0,
@@ -1032,7 +1036,7 @@ pub(super) mod tests {
     }
 
     fn inputs_for_ranks<const RANKS: usize>(cfg: &KimiK3Config) -> Inputs<'_, RANKS> {
-        Inputs { cfg, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
+        Inputs { cfg, resident_weight_limit: ResidentWeights::DEFAULT_LIMIT, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: Baseline::Measured { free_bytes: 96 << 30 } }; RANKS], devices: std::array::from_fn(|rank| rank as i32), peer_access: RANKS == 2, spark_ranks: 6,
             attention: None, requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None,
             lane_layouts: vec![std::array::from_fn(|_| LaneLayout::for_ranks(
@@ -1071,6 +1075,31 @@ pub(super) mod tests {
             !item.group.contains("peer exchange") && !item.group.contains("hop link")));
         assert!(admitted.check_kda(1, 1).is_err());
         assert!(admitted.check_global(1, 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn single_owner_cap_counts_both_frontends_and_whole_layer_weights() -> Result<()> {
+        let cfg = cfg();
+        let core = Default::default();
+        let expected = (0..cfg.layers).try_fold(
+            GlobalLayout::ranks_with_core(&cfg, &core, 1)?[0].bytes()? as u64,
+            |sum, layer| -> Result<_> {
+                sum.checked_add(LayerLayout::ranks_with_core(&cfg, layer, WHOLE, &core, 1)?[0].bytes()? as u64)
+                    .context("single-owner native resident weights overflow")
+            })?;
+        let mut i = inputs_for_ranks::<1>(&cfg);
+        i.resident_weight_limit = ResidentWeights(expected);
+        let mut request = request(i)?;
+        assert_eq!(request.fixed.iter().map(|d| d.resident_weights.0).sum::<u64>()
+            + request.layers.iter().map(|d| d.weights.whole).sum::<u64>(), expected);
+        assert!(solve(&request).is_ok());
+        request.resident_weight_limit = Some(ResidentWeights(expected - 1));
+        let error = solve(&request).unwrap_err();
+        let mut typed = &error;
+        while let PlacementError::OwnerCandidates { source, .. }
+            | PlacementError::PrefixMarks { source, .. } = typed { typed = source; }
+        assert_eq!(*typed, PlacementError::ResidentWeightLimit { gpu: 0, required: expected, limit: expected - 1 });
         Ok(())
     }
 
@@ -1301,7 +1330,7 @@ pub(super) mod tests {
         let (unit, waves, slots, marks) = (1024, 3, 2, 2);
         let rows = unit * waves;
         let spark_bytes = 110 << 30;
-        let report = plan_input.plan(&PlanOptions {
+        let options = PlanOptions {
             placement: ExpertPlacement::Sparks { ranks: 6 }, coordinator_budget_bytes: capacity,
             layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 rtx_bytes: vec![capacity], head_split: false, concurrency: slots as u64,
@@ -1311,7 +1340,8 @@ pub(super) mod tests {
                 workspace_manifest: Some(path.clone()), onboard: Some(OnboardSetting::Auto),
                 spark_allocation_budget_bytes: Some(spark_bytes), ..Default::default() }),
             ..Default::default()
-        })?;
+        };
+        let report = plan_input.plan(&options)?;
         ensure!(report.fits && report.placement_supported && report.executable(), "{:?}", report.hints);
         let catalog = plan_input.expert_catalog()?;
         let mut rtx = plan_rtx_for_ranks(&cfg, &catalog,
@@ -1331,18 +1361,25 @@ pub(super) mod tests {
         let code = cuteafd_loader::placement::inventory::loaded_code_allowance(
             "kimik3", "exl3", false, 0, arch, Some(&programs));
         let resident = code.bytes - arch.cublas_bytes;
-        let mut i = inputs_for_ranks::<1>(&cfg);
-        i.rows = rows; i.waves = waves; i.unit_rows = Some(unit);
-        i.lanes = 1; i.state_slots = slots; i.prefix_marks = marks;
-        i.cache_format = cuteafd_core::MlaCacheFormat::Fp8;
-        i.lane_layouts = vec![[LaneLayout::for_ranks(&cfg, rows, unit, context,
-            allocation::NativeScratch::from_manifest_for_ranks(&manifest, 1)?, 1)?]];
-        i.fixed = vec![allocation::code_demand_for_ranks(0,
-            code.pending(arch.context_bytes + resident, arch.context_bytes), arch.cublas_bytes, 1, 1)?];
-        i.startup = vec![super::super::graphs::demand(
-            &super::super::graphs::inventory_for_ranks(&cfg, 1, unit, slots, 0, 1, |_, _| true)?.inventory, 0)];
-        i.gpus[0] = GpuBudget { capacity_bytes: capacity, headroom_bytes: 2 << 30,
-            baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes - resident } };
+        let runtime_inputs = || -> Result<_> {
+            let mut i = inputs_for_ranks::<1>(&cfg);
+            i.resident_weight_limit = ResidentWeights(options.coordinator_budget_bytes);
+            i.rows = rows; i.waves = waves; i.unit_rows = Some(unit);
+            i.lanes = 1; i.state_slots = slots; i.prefix_marks = marks;
+            i.cache_format = cuteafd_core::MlaCacheFormat::Fp8;
+            i.lane_layouts = vec![[LaneLayout::for_ranks(&cfg, rows, unit, context,
+                allocation::NativeScratch::from_manifest_for_ranks(&manifest, 1)?, 1)?]];
+            i.fixed = vec![allocation::code_demand_for_ranks(0,
+                code.pending(arch.context_bytes + resident, arch.context_bytes), arch.cublas_bytes, 1, 1)?];
+            i.startup = vec![super::super::graphs::demand(
+                &super::super::graphs::inventory_for_ranks(&cfg, 1, unit, slots, 0, 1, |_, _| true)?.inventory, 0)];
+            i.gpus[0] = GpuBudget { capacity_bytes: capacity, headroom_bytes: 2 << 30,
+                baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes - resident } };
+            Ok(i)
+        };
+        assert_eq!(request(runtime_inputs()?)?.resident_weight_limit,
+            Some(ResidentWeights(options.coordinator_budget_bytes)));
+        let mut i = runtime_inputs()?;
         i.rtx = Some(rtx); i.spark_budget = Some(spark);
         let admitted = admit(i)?;
         let memory = report.memory_layout.context("single-owner installed ledger")?;
@@ -1361,6 +1398,66 @@ pub(super) mod tests {
         assert_eq!(planned.items.iter().filter(|item| item.category == Category::Prefix)
             .map(|item| item.bytes).sum::<u64>(), mark_bytes * marks as u64);
         assert!(!planned.items.iter().any(|item| item.group == "Kimi peer/abort/hop controls"));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_command_and_live_admission_enforce_the_same_resident_weight_cap() -> Result<()> {
+        use clap::Parser;
+        use cuteafd_loader::plan::testing;
+        let snapshot = tempfile::tempdir()?;
+        testing::write_kimi_snapshot(snapshot.path(), true);
+        let package = tempfile::tempdir()?;
+        let manifest_path = testing::write_kimi_installed_inventory(package.path(), false);
+        let manifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        let config = serde_json::from_slice(&std::fs::read(snapshot.path().join("config.json"))?)?;
+        let cfg = KimiK3Config::from_hf(&config)?;
+        let expected = (0..cfg.layers).try_fold(GlobalLayout::pair(&cfg)?[0].bytes()? as u64,
+            |sum, layer| -> Result<_> {
+                sum.checked_add(LayerLayout::pair(&cfg, layer, LayerMode::HeadSplit)?[0].bytes()? as u64)
+                    .context("native rank-zero resident weights overflow")
+            })?;
+        for (gib, accepted) in [(80u64, true), (1, false)] {
+            let cli = crate::cli::Cli::try_parse_from([
+                "cuteafd".into(), "plan".into(), snapshot.path().as_os_str().to_owned(),
+                "--layout".into(), "--rtx".into(), "2".into(), "--spark-ranks".into(), "6".into(),
+                "--spark-budget-gib".into(), "256".into(),
+                "--workspace-manifest".into(), manifest_path.as_os_str().to_owned(),
+                "--coordinator-weight-budget-gib".into(), gib.to_string().into(),
+                "--attention-placement".into(), "heads".into(), "--rtx-expert-layers".into(), "0".into(),
+                "--context-tokens".into(), "262144".into(), "--pool-tokens".into(), "262144".into(),
+                "--concurrency".into(), "2".into(), "--prefix-slots".into(), "0".into(),
+                "--host-cache-bytes".into(), "0".into(), "--prefill-rows".into(), "2048".into(),
+                "--prefill-waves".into(), "2".into(), "--kv-cache".into(), "bf16".into(),
+                "--speculator".into(), "off".into(), "--vision".into(), "off".into(),
+                "--audio".into(), "off".into(), "--require-ready".into(),
+            ])?;
+            let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan command") };
+            args.coordinator_weight_budget_gib = cli.coordinator_weight_budget_gib.context("global cap")?;
+            let planned = crate::commands::plan::run_plan(args);
+            let mut i = inputs(&cfg);
+            i.resident_weight_limit = ResidentWeights(gib << 30);
+            i.attention = Some(AttentionPlacement::Heads);
+            i.requested_pool = Some(262144);
+            i.prefix_marks = 0;
+            i.lanes = 1;
+            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows,
+                test_unit(i.rows, i.waves, i.unit_rows), 262144,
+                super::super::device::NativeScratch::from_manifest(&manifest).unwrap()).unwrap())];
+            let admitted = admit(i);
+            if accepted {
+                planned?;
+                assert_eq!(admitted?.placement.pool_tokens, 262144);
+            } else {
+                let live_error = admitted.err().context("live admission must refuse the cap")?;
+                let mut typed = live_error.downcast_ref::<PlacementError>().context("typed live refusal")?;
+                while let PlacementError::OwnerCandidates { source, .. }
+                    | PlacementError::PrefixMarks { source, .. } = typed { typed = source; }
+                assert_eq!(*typed, PlacementError::ResidentWeightLimit { gpu: 0, required: expected, limit: gib << 30 });
+                let plan_error = planned.expect_err("plan command must refuse the same cap");
+                assert!(plan_error.to_string().contains(&typed.to_string()), "{plan_error:#}; {live_error:#}");
+            }
+        }
         Ok(())
     }
 

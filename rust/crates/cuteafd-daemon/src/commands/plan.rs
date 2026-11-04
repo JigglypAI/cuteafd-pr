@@ -35,10 +35,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         audio: args.audio,
         placement: ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks)),
         spark_budget_bytes: args.spark_budget_gib.map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
-        coordinator_budget_bytes: budget_bytes("--coordinator-weight-budget-gib", args.coordinator_weight_budget_gib)?
-            .min(if args.layout || args.coordinator_gpu_budget_gib.is_some() {
-                coordinator_bytes(args.coordinator_gpu_budget_gib)?
-            } else { u64::MAX }),
+        coordinator_budget_bytes: budget_bytes("--coordinator-weight-budget-gib", args.coordinator_weight_budget_gib)?,
+        coordinator_gpu_budget_bytes: coordinator_bytes(args.coordinator_gpu_budget_gib)?,
         layout: args.layout.then(|| -> Result<_, PlanError> {
             if !(1..=2).contains(&args.rtx) {
                 return Err(PlanError::InvalidOption { option: "--rtx", reason: "1 or 2 coordinator GPUs".into() });
@@ -1588,17 +1586,23 @@ mod tests {
             let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan") };
             args.coordinator_gpu_budget_gib = cli.coordinator_gpu_budget_gib;
             let options = options(&args).unwrap();
+            assert_eq!(options.coordinator_gpu_budget_bytes, 32 << 30);
             assert_eq!(options.layout.unwrap().rtx_bytes, vec![32 << 30; 2]);
-            assert_eq!(options.coordinator_budget_bytes, 32 << 30);
+            assert_eq!(options.coordinator_budget_bytes, cuteafd_loader::placement::ResidentWeights::DEFAULT_LIMIT.0);
         }
         let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read"]).unwrap();
         let crate::cli::Commands::Plan(plan_args) = cli.command else { panic!("plan") };
         assert!(options(&plan_args).unwrap().layout.is_none());
-        for gib in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let dir = tempfile::tempdir().unwrap();
-            let error = options(&PlanArgs { coordinator_gpu_budget_gib: Some(gib), ..args(dir.path(), 4, false) }).unwrap_err();
-            assert!(matches!(error, PlanError::InvalidOption { option: "--coordinator-gpu-budget-gib", .. }));
+        for layout in [false, true] {
+            for gib in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+                let dir = tempfile::tempdir().unwrap();
+                let error = options(&PlanArgs { layout, coordinator_gpu_budget_gib: Some(gib), ..args(dir.path(), 4, false) }).unwrap_err();
+                assert!(matches!(error, PlanError::InvalidOption { option: "--coordinator-gpu-budget-gib", .. }));
+            }
         }
+        let mut invalid = PlanOptions::default();
+        invalid.coordinator_gpu_budget_bytes = 0;
+        assert!(matches!(invalid.validate(), Err(PlanError::InvalidOption { option: "coordinator GPU budget", .. })));
     }
 
     #[test]
@@ -1670,17 +1674,19 @@ mod tests {
     }
 
     #[test]
-    fn weight_budget_remains_a_distinct_cap_with_deprecated_alias() {
+    fn weight_budget_is_global_and_independent_of_total_memory() {
         use clap::Parser;
-        for flag in ["--coordinator-weight-budget-gib", "--coordinator-budget-gib"] {
-            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", flag, "10"]).unwrap();
-            let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+        for argv in [
+            vec!["cuteafd", "--coordinator-weight-budget-gib", "10", "plan", "/not-read", "--layout"],
+            vec!["cuteafd", "plan", "/not-read", "--layout", "--coordinator-weight-budget-gib", "10"],
+        ] {
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan") };
+            args.coordinator_weight_budget_gib = cli.coordinator_weight_budget_gib.unwrap();
             let options = options(&args).unwrap();
             assert_eq!(options.coordinator_budget_bytes, 10 << 30);
             assert_eq!(options.layout.unwrap().rtx_bytes, vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES]);
         }
-        assert_eq!(crate::cli::deprecated_budget_flags(["--coordinator-budget-gib", "10"]),
-            vec!["--coordinator-weight-budget-gib"]);
     }
 
     #[test]
@@ -1922,9 +1928,10 @@ mod tests {
         let tiny = PlanArgs { coordinator_gpu_budget_gib: Some(2.0), ..args(snapshot.path(), 4, true) };
         let mut weight_only = options(&tiny).unwrap();
         weight_only.layout = None;
+        assert_eq!(weight_only.coordinator_budget_bytes, 80 << 30);
+        assert_eq!(weight_only.coordinator_gpu_budget_bytes, 2 << 30);
         let inventory = plan(snapshot.path(), &weight_only).unwrap();
-        assert!(inventory.fits, "weight inventory fits");
-        assert!(!inventory.placement_supported && !inventory.executable());
+        assert!(!inventory.fits && !inventory.placement_supported && !inventory.executable());
         assert!(inventory.hints.iter().any(|h| h.what.contains("MiMo placement")
             && (h.what.contains("mandatory") || h.what.contains("pool"))), "{:?}", inventory.hints);
         let report = plan(snapshot.path(), &options(&tiny).unwrap()).unwrap();
@@ -1933,6 +1940,49 @@ mod tests {
             && (h.what.contains("mandatory") || h.what.contains("pool"))), "{:?}", report.hints);
         let error = run_plan(tiny).unwrap_err();
         assert!(error.to_string().contains("is not servable"), "{error:#}");
+    }
+
+    #[test]
+    fn resident_weight_shortfall_refuses_even_when_storage_is_sufficient() {
+        let snapshot = tempfile::tempdir().unwrap();
+        write_snapshot(snapshot.path(), &mimo_flash_config(), &mimo_flash_tensors(), Some(1));
+        for layout in [false, true] {
+            let request = PlanArgs { layout, coordinator_gpu_budget_gib: Some(95.5),
+                ..args(snapshot.path(), 4, true) };
+            let admitted = plan(snapshot.path(), &options(&request).unwrap()).unwrap();
+            assert!(admitted.executable(), "{:?}", admitted.hints);
+            let capped = PlanArgs { coordinator_weight_budget_gib: 0.125, ..request };
+            let selected = options(&capped).unwrap();
+            assert_eq!(selected.coordinator_budget_bytes, 128 << 20);
+            assert_eq!(selected.coordinator_gpu_budget_bytes, (95 << 30) + (1 << 29));
+            let refused = plan(snapshot.path(), &selected).unwrap();
+            assert!(!refused.fits && !refused.executable());
+            use cuteafd_loader::families::mimo_v2::{MimoV2Config, resident::{MimoResidentLayout, MimoResidentOptions},
+                projection::MimoProjectionRepresentation as R};
+            let checkpoint = cuteafd_loader::plan::Checkpoint::open(snapshot.path()).unwrap();
+            let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
+            let ranks = selected.layout.as_ref().map_or(1, |options| options.rtx_bytes.len());
+            use cuteafd_loader::families::mimo_v2::weight_policy::{default_policy, MimoDefaultPolicy};
+            let qualified_fp8 = default_policy(&checkpoint, &cfg) == MimoDefaultPolicy::Fp8;
+            let representation = |name: &str| {
+                let tensor = checkpoint.tensors.iter().find(|tensor| tensor.meta.name == name).unwrap();
+                if tensor.meta.dtype == cuteafd_core::DType::Bf16 && !qualified_fp8 { R::Bf16 } else { R::Fp8 }
+            };
+            let owners = MimoResidentLayout::new(&checkpoint, &cfg, &MimoResidentOptions {
+                layers: cfg.layers, coordinator_ranks: ranks, checkpoint_tp: 1, native_mtp_layers: 0,
+                gpu_embedding: true, head_format: representation("lm_head.weight"),
+                output_formats: (0..cfg.layers).map(|layer| {
+                    let name = format!("model.layers.{layer}.self_attn.o_proj.weight");
+                    let format = representation(&name);
+                    (name, format)
+                }).collect(),
+            }).unwrap();
+            let required = owners.ranks[0].iter().map(|owner| owner.bytes).sum::<u64>();
+            let refusal = format!("rtx0 resident weights need {required} bytes, over the {} byte weight budget", 128 << 20);
+            assert!(refused.hints.iter().any(|h| h.what.contains(&refusal)), "{:?}", refused.hints);
+            let error = run_plan(capped).unwrap_err();
+            assert!(error.to_string().contains("is not servable"), "{error:#}");
+        }
     }
 
     /// `cuteafd plan` plans the vision policy serve-glmf serves: automatic vision on a GLM 5.3 Flash

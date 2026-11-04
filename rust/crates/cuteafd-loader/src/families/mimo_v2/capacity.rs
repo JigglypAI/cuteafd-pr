@@ -12,6 +12,8 @@ use cuteafd_core::serving_capacity::{
 
 #[derive(Debug, Clone)]
 pub struct MimoRankRuntime {
+    /// Checkpoint weights in `additional`, from their native owner recipes.
+    pub resident_weights: crate::placement::ResidentWeights,
     pub device: u32,
     /// Every workspace that can remain live together: prefill lanes and decode.
     /// Native scratch comes from the selected manifest, not a guessed headroom.
@@ -40,6 +42,7 @@ pub struct MimoCapacityOptions {
 
 #[derive(Debug, Clone)]
 pub struct MimoCapacityProfiles {
+    pub resident_weights: Vec<crate::placement::ResidentWeights>,
     /// Fixed-only admission before any target weight allocation.
     pub loading: Vec<DeviceCosts>,
     /// Actual target storage after KV/peer attachment, before drafter packing,
@@ -251,7 +254,14 @@ pub fn mimo_capacity_profiles(
             pool_unit_bytes: unit_bytes,
         });
     }
+    let resident_weights = resident.ranks.iter().zip(&options.ranks).map(|(owners, runtime)| {
+        let bytes = owners.iter().try_fold(runtime.resident_weights.0, |sum, owner|
+            sum.checked_add(owner.bytes))
+            .ok_or(CacheGeometryError::Overflow("MiMo checkpoint resident weights"))?;
+        Ok(crate::placement::ResidentWeights(bytes))
+    }).collect::<Result<Vec<_>, CacheGeometryError>>()?;
     Ok(MimoCapacityProfiles {
+        resident_weights,
         loading,
         post_target_kv,
         steady: CapacityProfile {
@@ -303,6 +313,7 @@ mod tests {
             host_prefix_bytes: 64 << 30,
             ranks: (0..ranks)
                 .map(|rank| MimoRankRuntime {
+                    resident_weights: Default::default(),
                     // Rank0 need not be physical device0.
                     device: (1 - rank) as u32,
                     additional: vec![MemoryReservation {
