@@ -1302,7 +1302,7 @@ mod tests {
             "dflash_config":{"target_layer_ids":[0,8,16,24,32], "conv_group_size":16,
                 "selector_rank":256, "block_size":8}});
         for command in ["serve-glmf", "serve-glm", "serve-mimo"] {
-            for concurrency in [0usize, 1, 16, 32] {
+            for concurrency in [0usize, 1, 8, 16, 32, 64] {
                 for extra in [vec![], vec!["--draft-sequences", "8"],
                     vec!["--draft-sequences", "8", "--draft-context-slots", "40"]] {
                     let count = concurrency.to_string();
@@ -1317,37 +1317,54 @@ mod tests {
                     if concurrency > 0 { argv.extend(["--max-sequences", &count]); }
                     let serving = crate::cli::Cli::try_parse_from(argv.into_iter().chain(extra.iter().copied())).unwrap();
                     let (planned, started) = match serving.command {
-                        crate::cli::Commands::ServeGlmf(args) => {
+                        crate::cli::Commands::ServeGlmf(mut args) => {
                             let (slots, batch) = glm::flash_serving_draft_limits(resolved,
                                 layout.glm_draft_sequences() as usize, layout.draft_context_slots.map(|n| n as usize));
                             let planned = glm::flash_draft_capacity(&config, slots, batch).unwrap();
-                            assert_eq!(resolved, args.max_sequences);
+                            let concurrency = crate::shared::memory::budget::resolve_serving_concurrency(
+                                args.max_sequences, || Ok(layout.rtx_bytes[0])).unwrap();
+                            assert_eq!(resolved, concurrency);
+                            args.prefix.resolve_entries(concurrency);
+                            assert_eq!(layout.resolved_state_slots(family),
+                                cuteafd_core::concurrency::state_slots(concurrency as u64));
+                            let marks = args.prefix.mark_rule(concurrency);
+                            assert_eq!(marks.entries as u64, layout.prefix_entries(family));
+                            for mark_bytes in [1024, 1 << 20, 32 << 20] {
+                                assert_eq!(marks.slots(mark_bytes) as u64,
+                                    cuteafd_core::prefix::mark_slots_with_host(resolved as u64,
+                                        layout.prefix_entries(family), mark_bytes as u64,
+                                        marks.budget_bytes, marks.host));
+                            }
                             let (slots, batch) = crate::families::glm5_flash::serve::draft_capacity(
-                                args.max_sequences, args.engine.draft_sequences, args.engine.draft_context_slots);
+                                concurrency, args.engine.draft_sequences, args.engine.draft_context_slots);
                             let started = glm::flash_draft_capacity(&config, slots, batch).unwrap();
                             assert_eq!(planned, started);
                             (planned.block_rows, started.block_rows)
                         }
                         crate::cli::Commands::ServeGlm(args) => {
-                            assert_eq!(resolved, args.max_sequences);
+                            let concurrency = crate::shared::memory::budget::resolve_serving_concurrency(
+                                args.max_sequences, || Ok(layout.rtx_bytes[0])).unwrap();
+                            assert_eq!(resolved, concurrency);
                             let batch = layout.glm_draft_sequences() as usize;
                             let slots = glm::serving_draft_context_slots(batch, resolved,
                                 layout.draft_context_slots.map(|n| n as usize));
                             let startup_slots = glm::serving_draft_context_slots(args.engine.draft_sequences,
-                                args.max_sequences, args.engine.draft_context_slots);
+                                concurrency, args.engine.draft_context_slots);
                             let planned = glm::GlmDraftCapacity::new(slots, batch, 8).unwrap();
                             let started = glm::GlmDraftCapacity::new(startup_slots, args.engine.draft_sequences, 8).unwrap();
                             assert_eq!(planned, started);
                             (planned.block_rows, started.block_rows)
                         }
                         crate::cli::Commands::ServeMimo(args) => {
-                            assert_eq!(resolved, args.max_sequences);
+                            let concurrency = crate::shared::memory::budget::resolve_serving_concurrency(
+                                args.max_sequences, || Ok(layout.rtx_bytes[0])).unwrap();
+                            assert_eq!(resolved, concurrency);
                             let batch = layout.mimo_draft_sequences().max(resolved as u64);
                             let slots = mimo::mimo_draft_context_slots(batch, layout.mimo_rings(),
                                 layout.draft_context_slots);
-                            let startup_batch = args.engine.draft_sequences.max(args.max_sequences);
+                            let startup_batch = args.engine.draft_sequences.max(concurrency);
                             let startup_slots = mimo::mimo_draft_context_slots(startup_batch as u64,
-                                cuteafd_core::concurrency::request_slots(args.max_sequences as u64, args.engine.rings as u64),
+                                cuteafd_core::concurrency::request_slots(concurrency as u64, args.engine.rings as u64),
                                 args.engine.draft_context_slots.map(|n| n as u64));
                             let planned = mimo::MimoDraftCapacity::new(slots as usize, batch as usize, 8).unwrap();
                             let started = mimo::MimoDraftCapacity::new(startup_slots as usize, startup_batch, 8).unwrap();

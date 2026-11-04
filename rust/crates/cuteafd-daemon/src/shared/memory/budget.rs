@@ -135,7 +135,7 @@ pub(crate) fn serving_concurrency(requested: Option<usize>, native_lib: &std::pa
     Ok(concurrency)
 }
 
-fn resolve_serving_concurrency(requested: Option<usize>, logical_bytes: impl FnOnce() -> Result<u64>)
+pub(crate) fn resolve_serving_concurrency(requested: Option<usize>, logical_bytes: impl FnOnce() -> Result<u64>)
     -> Result<usize> {
     match requested {
         Some(value) => Ok(value),

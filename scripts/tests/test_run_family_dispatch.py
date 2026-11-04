@@ -3757,18 +3757,20 @@ def test_glmf_draft_defaults_apply_only_to_the_fp8_drafter(tmp_path, fp8):
     assert ("--draft-linear w8a8" in serve) == (fp8 != "off")
 
 
-def test_glmf_plan_counts_follow_serve_glmf_formulas():
-    """State and mark lanes derive from admitted concurrency, without launcher duplicates."""
-    glmf = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash"
-    serving, engine_args, engine = ((glmf / name).read_text() for name in ("serve.rs", "mod.rs", "engine.rs"))
-    assert "engine_args.slots = cuteafd_core::concurrency::state_slots(args.max_sequences as u64) as usize;" in serving
-    assert "    let lanes = max_sequences;" in serving
-    assert "PrefixMarks::Arena => super::prefix::ArenaMarks::Rule(prefix.mark_rule(lanes))," in serving
-    assert "    #[arg(long, default_value_t = 8)]\n    pub slots: usize,\n" in engine_args
-    assert "pub(crate) const DECODE_ROWS: usize = 64;" in engine
-    launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
-    assert '--state-slots "$((glmf_sequences' not in launcher
-    assert '--mark-lanes "$((glmf_sequences' not in launcher
+@pytest.mark.parametrize("concurrency", [1, 8, 16, 32, 64])
+def test_glmf_plan_counts_follow_serve_glmf_formulas(tmp_path, concurrency):
+    """Only boot concurrency is forwarded; native serve derives state/mark capacity.
+
+    Rust's planner_and_serving_share_draft_head_capacity_and_charge exercises
+    the real planner, serve capacity and prefix-mark functions for these counts.
+    """
+    result = _family_launch_result(tmp_path, _GLMF, "zai-org/GLM-5.3-Flash",
+                                  f"RTX_GPUS=1\nSPECULATOR=off\nCONCURRENCY={concurrency}\n")
+    assert result.returncode == 0, result.stderr
+    serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    argv = shlex.split(serve)
+    assert argv[argv.index("--max-sequences") + 1] == str(concurrency)
+    assert not {"--state-slots", "--mark-lanes", "--slots"}.intersection(argv)
 
 
 @pytest.mark.parametrize("value", ["0", "eight", "-4"])
