@@ -323,7 +323,7 @@ fn installed_example_inventory_detects_absent_checkpoints_and_revisions() {
 
 fn installed_example_programs(override_path: Option<std::path::PathBuf>, home: &std::path::Path) -> std::path::PathBuf {
     let manifest = override_path.unwrap_or_else(|| home.join(".cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json"));
-    cuteafd_loader::plan::testing::validate_placement_inputs(&manifest)
+    cuteafd_loader::plan::inputs::validate_placement_inputs(&manifest)
         .unwrap_or_else(|error| panic!("{error:#}"));
     manifest
 }

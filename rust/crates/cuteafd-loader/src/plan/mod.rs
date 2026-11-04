@@ -10,6 +10,7 @@ pub mod families;
 pub mod family;
 pub mod files;
 pub mod format;
+pub mod inputs;
 pub mod launch;
 pub mod layout;
 pub mod names;

@@ -1549,7 +1549,7 @@ mod mounted_tests {
         use crate::plan::{ExpertPlacement, PlanInput, PlanOptions, layout::LayoutOptions};
         let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT").expect("CUTEAFD_EXLR8_TEST_SNAPSHOT"));
         let programs = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").expect("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"));
-        crate::plan::testing::validate_placement_inputs(&programs).unwrap();
+        crate::plan::inputs::validate_placement_inputs(&programs).unwrap();
         let output = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_PARITY_OUTPUT").expect("CUTEAFD_EXLR8_PARITY_OUTPUT"));
         std::fs::create_dir_all(&output).unwrap();
         struct Reset;
