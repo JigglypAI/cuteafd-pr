@@ -249,6 +249,16 @@ impl Fixture {
         Ok(())
     }
 
+    pub fn configure_endpoint_failures(&self, library: &NativeLibrary, view: i32, destroy: i32) -> Result<()> {
+        // SAFETY: this export belongs to the CPU-only fixture loaded above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn(i32, i32)> =
+                library.lib.get(b"fixture_configure_endpoint_failures")?;
+            configure(view, destroy);
+        }
+        Ok(())
+    }
+
     pub fn configure_pack(&self, library: &NativeLibrary, pack: i32, drain: i32) -> Result<()> {
         // SAFETY: this export belongs to the CPU-only fixture loaded above.
         unsafe {

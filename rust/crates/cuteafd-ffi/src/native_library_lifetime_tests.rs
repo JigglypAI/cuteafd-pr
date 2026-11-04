@@ -8,6 +8,53 @@ use crate::native_library_lifetime_fixture::Fixture;
 
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn rdma_ring_ledger_uses_native_backing_and_retires_only_after_destroy() -> Result<()> {
+    use memory_ledger::{AllocationAudit, AllocationEvent, Space};
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    let owner = memory_ledger::owner("fixture.rdma.rings");
+    let audit = AllocationAudit::begin();
+    for (flags, space) in [(CUTEAFD_HOST_BUFFER_FLAG_PINNED | CUTEAFD_HOST_BUFFER_FLAG_MAPPED,
+        Space::Pinned), (CUTEAFD_HOST_BUFFER_FLAG_NONE, Space::Host)] {
+        let info = library.rdma_rc_endpoint_create_on_gid_with_buffer_flags(
+            "fixture", 1, 0, 17, 64, 64, 512, 768, 2, 2, 1, flags)?;
+        let views = [library.rdma_rc_endpoint_buffer_view(info.handle, false)?,
+            library.rdma_rc_endpoint_buffer_view(info.handle, true)?];
+        let records = memory_ledger::allocations().into_iter()
+            .filter(|record| record.endpoint == Some(info.handle as usize)).collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        for view in views {
+            let record = records.iter().find(|r| r.address == view.host_ptr as usize).unwrap();
+            assert_eq!(record.bytes, view.bytes);
+            assert_eq!(record.key.space, space);
+            assert_eq!(record.key.owner, Some("fixture.rdma.rings"));
+            assert_ne!(record.address, info.handle as usize);
+        }
+        fixture.configure_endpoint_failures(&library, 0, 1)?;
+        assert!(library.rdma_rc_endpoint_destroy(info.handle).is_err());
+        assert!(records.iter().all(|record| memory_ledger::allocations().contains(record)));
+        fixture.configure_endpoint_failures(&library, 0, 0)?;
+        library.rdma_rc_endpoint_destroy(info.handle)?;
+        assert!(memory_ledger::allocations().iter().all(|r| r.endpoint != Some(info.handle as usize)));
+    }
+    fixture.configure_endpoint_failures(&library, 1, 0)?;
+    let before = fixture.events()?;
+    assert!(library.rdma_rc_endpoint_create_on_gid_with_buffer_flags(
+        "fixture", 1, 0, 17, 64, 64, 512, 768, 2, 2, 1, 0).is_err());
+    assert_eq!(fixture.events()?, format!("{before}X"));
+    drop(owner);
+    let events = audit.finish().events.into_iter().filter(|event| match event {
+        AllocationEvent::Allocated(r) | AllocationEvent::Freed(r) | AllocationEvent::UnobservedRelease(r) =>
+            r.key.owner == Some("fixture.rdma.rings"),
+    }).collect::<Vec<_>>();
+    assert_eq!(events.len(), 8);
+    assert_eq!(events.iter().filter(|e| matches!(e, AllocationEvent::Allocated(_))).count(), 4);
+    assert_eq!(events.iter().filter(|e| matches!(e, AllocationEvent::Freed(_))).count(), 4);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn symbols_resolve_once_and_optional_exports_stay_lazy() -> Result<()> {
     let fixture = Fixture::build()?;
     let library = fixture.load()?;

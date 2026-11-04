@@ -1204,7 +1204,7 @@ fn transport_census_observes_native_pinned_recycle_queue_without_consuming_it() 
 #[test]
 fn transport_census_resolves_only_worker_attributed_recycle_frames() {
     use cuteafd_ffi::memory_ledger::{AllocationRecord, Key, Space};
-    let record = |address, bytes, owner| AllocationRecord { address, bytes,
+    let record = |address, bytes, owner| AllocationRecord { address, bytes, endpoint: None,
         key: Key { space: Space::Pinned, device: -1, scope: "fixture", owner: Some(owner), tensor: None, format: None } };
     let visible = TransportHostAllocation { owner: "visible".into(), address: 0x1000, bytes: 512,
         flags: CUTEAFD_HOST_BUFFER_FLAG_PINNED, mapped: None, audit_owner: Some("worker.a".into()) };

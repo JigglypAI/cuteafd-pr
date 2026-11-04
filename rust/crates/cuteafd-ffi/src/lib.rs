@@ -2172,11 +2172,26 @@ impl Drop for CuteafdNcclComm {
     }
 }
 
-/// RC endpoint send/recv spans are allocated natively (pinned or malloc'd and
-/// registered); the ledger keys them by endpoint handle.
-fn record_rdma_rings(handle: *mut c_void, bytes: usize) {
+/// Record native backing, not the endpoint handle or requested ring capacity.
+fn record_rdma_rings(handle: *mut c_void, views: [CuteafdRdmaRcEndpointBufferView; 2]) -> Result<()> {
+    anyhow::ensure!(!handle.is_null(), "null RDMA endpoint owner");
+    for view in &views {
+        anyhow::ensure!(!view.host_ptr.is_null() && view.bytes > 0,
+            "empty RDMA endpoint backing");
+        (view.host_ptr as usize).checked_add(view.bytes).context("RDMA backing overflow")?;
+    }
+    let mut extents = views.map(|view| (view.host_ptr as usize, view.bytes));
+    extents.sort_unstable();
+    anyhow::ensure!(extents[0].0 + extents[0].1 <= extents[1].0,
+        "overlapping RDMA endpoint backing");
     let _scope = memory_ledger::scope("transport/rdma-rings");
-    memory_ledger::record_alloc(memory_ledger::Space::Pinned, -1, handle as usize, bytes);
+    for view in views {
+        let space = if view.host_flags & CUTEAFD_HOST_BUFFER_FLAG_PINNED != 0 {
+            memory_ledger::Space::Pinned
+        } else { memory_ledger::Space::Host };
+        memory_ledger::record_endpoint_alloc(space, view.host_ptr as usize, view.bytes, handle as usize);
+    }
+    Ok(())
 }
 
 /// Per-destination pinned source and copy-completion fence. Raw owners are
@@ -4586,6 +4601,8 @@ impl NativeLibrary {
     ) -> Result<CuteafdRdmaRcEndpointInfo> {
         // SAFETY: the symbol has the declared C ABI; all argument buffers live through the call.
         let create_fn: RdmaRcEndpointCreateOnGidWithBufferFlagsFn = self.cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags()?;
+        let _: RdmaRcEndpointBufferViewFn = self.cuteafd_rdma_rc_endpoint_buffer_view()?;
+        let destroy_fn: RdmaRcEndpointDestroyFn = self.cuteafd_rdma_rc_endpoint_destroy()?;
         let device_name = CString::new(device_name).context("RDMA device name contains NUL")?;
         let mut info = CuteafdRdmaRcEndpointInfo::default();
         // SAFETY: device_name and info remain valid for the synchronous native call.
@@ -4610,7 +4627,17 @@ impl NativeLibrary {
             "cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags",
             status,
         )?;
-        record_rdma_rings(info.handle, send_registered_span_bytes + recv_registered_span_bytes);
+        let tracked = (|| {
+            record_rdma_rings(info.handle, [self.rdma_rc_endpoint_buffer_view(info.handle, false)?,
+                self.rdma_rc_endpoint_buffer_view(info.handle, true)?])
+        })();
+        if let Err(error) = tracked {
+            // SAFETY: creation succeeded; no endpoint or borrowed view escaped.
+            let status = unsafe { destroy_fn(info.handle) };
+            self.status_to_result("cuteafd_rdma_rc_endpoint_destroy after census failure", status)
+                .context(format!("RDMA backing tracking failed: {error:#}"))?;
+            return Err(error);
+        }
         Ok(info)
     }
 
@@ -5001,9 +5028,11 @@ impl NativeLibrary {
 
     pub fn rdma_rc_endpoint_destroy(&self, handle: *mut c_void) -> Result<()> {
         let destroy_fn: RdmaRcEndpointDestroyFn = self.cuteafd_rdma_rc_endpoint_destroy()?;
-        memory_ledger::record_free(handle as usize);
+        // SAFETY: endpoint ownership and quiescence are established by the caller.
         let status = unsafe { destroy_fn(handle) };
-        self.status_to_result("cuteafd_rdma_rc_endpoint_destroy", status)
+        self.status_to_result("cuteafd_rdma_rc_endpoint_destroy", status)?;
+        memory_ledger::record_endpoint_free(handle as usize);
+        Ok(())
     }
 
     /// Metadata-only symbol check; terminal ownership is unavailable on older

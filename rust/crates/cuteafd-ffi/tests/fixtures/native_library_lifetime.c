@@ -744,6 +744,78 @@ int cuteafd_rdma_rc_endpoint_register_region(void *handle, void *ptr,
     *region = 7;
     return 0;
 }
+struct fixture_endpoint_info {
+    int rdma_enabled;
+    void *handle;
+    uint32_t port_num, qp_num, psn, lid, active_mtu;
+    size_t send_frame_bytes, recv_frame_bytes, send_registered_span_bytes, recv_registered_span_bytes;
+    uint32_t max_send_wr, max_recv_wr, max_sge;
+    char gid_hex[33], device_name[128], status[128];
+};
+struct fixture_endpoint_view {
+    void *host_ptr, *device_ptr;
+    size_t bytes;
+    int device_id;
+    uint64_t host_flags;
+};
+struct fixture_endpoint {
+    void *send, *recv;
+    size_t send_bytes, recv_bytes;
+    uint64_t flags;
+    struct fixture_endpoint *next;
+};
+static struct fixture_endpoint *fixture_endpoints;
+static int endpoint_view_failure, endpoint_destroy_failure;
+void fixture_configure_endpoint_failures(int view, int destroy) {
+    endpoint_view_failure = view;
+    endpoint_destroy_failure = destroy;
+}
+int cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags(const char *name,
+        uint32_t port, uint32_t gid, uint32_t psn, size_t send_frame, size_t recv_frame,
+        size_t send_span, size_t recv_span, uint32_t send_wr, uint32_t recv_wr,
+        uint32_t sge, uint64_t flags, struct fixture_endpoint_info *out) {
+    (void)name; (void)gid;
+    struct fixture_endpoint *endpoint = calloc(1, sizeof(*endpoint));
+    if (!endpoint) return 1;
+    endpoint->send = malloc(send_span);
+    endpoint->recv = malloc(recv_span);
+    if (!endpoint->send || !endpoint->recv) {
+        free(endpoint->send); free(endpoint->recv); free(endpoint); return 1;
+    }
+    endpoint->send_bytes = send_span;
+    endpoint->recv_bytes = recv_span;
+    endpoint->flags = flags;
+    endpoint->next = fixture_endpoints;
+    fixture_endpoints = endpoint;
+    memset(out, 0, sizeof(*out));
+    out->rdma_enabled = 1; out->handle = endpoint; out->port_num = port;
+    out->psn = psn; out->send_frame_bytes = send_frame; out->recv_frame_bytes = recv_frame;
+    out->send_registered_span_bytes = send_span; out->recv_registered_span_bytes = recv_span;
+    out->max_send_wr = send_wr; out->max_recv_wr = recv_wr; out->max_sge = sge;
+    return 0;
+}
+int cuteafd_rdma_rc_endpoint_buffer_view(void *handle, int receive,
+        struct fixture_endpoint_view *out) {
+    if (endpoint_view_failure || (receive != 0 && receive != 1)) return 1;
+    struct fixture_endpoint *endpoint = fixture_endpoints;
+    while (endpoint && endpoint != handle) endpoint = endpoint->next;
+    if (!endpoint) return 1;
+    memset(out, 0, sizeof(*out));
+    out->host_ptr = receive ? endpoint->recv : endpoint->send;
+    out->bytes = receive ? endpoint->recv_bytes : endpoint->send_bytes;
+    out->host_flags = endpoint->flags; out->device_id = current_device;
+    if (endpoint->flags & 2) out->device_ptr = out->host_ptr;
+    return 0;
+}
 int cuteafd_rdma_rc_endpoint_destroy(void *handle) {
-    (void)handle; event('X'); return 0;
+    event('X');
+    if (endpoint_destroy_failure) return 1;
+    struct fixture_endpoint **link = &fixture_endpoints;
+    while (*link && *link != handle) link = &(*link)->next;
+    if (*link) {
+        struct fixture_endpoint *endpoint = *link;
+        *link = endpoint->next;
+        free(endpoint->send); free(endpoint->recv); free(endpoint);
+    }
+    return 0;
 }
