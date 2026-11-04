@@ -14,6 +14,7 @@ pub(crate) struct DsparkFfn<'weights, 'library> {
     shared: DsparkSharedFfn<'weights, 'library>,
     device_bytes: usize,
     library: &'library NativeLibrary,
+    standalone: &'weights crate::shared::memory::StandaloneStream<'library>,
     graph: BindingGraphs<'library, u32>,
 }
 impl<'library> DsparkWeights<'library> {
@@ -26,23 +27,18 @@ impl<'library> DsparkWeights<'library> {
         capacity: u32,
         budget: usize,
     ) -> Result<DsparkFfn<'_, 'library>> {
-        self.ffn_on(stage, capacity, budget, None)
-    }
-    pub(super) fn ffn_on(
-        &self,
-        stage: usize,
-        capacity: u32,
-        budget: usize,
-        stream: Option<std::rc::Rc<crate::shared::memory::LoadStream<'library>>>,
-    ) -> Result<DsparkFfn<'_, 'library>> {
         ensure!(stage < 3, "invalid dSpark FFN stage");
         let bytes = self.ffn_bytes(capacity)?;
         ensure!(bytes <= budget, "dSpark FFN exceeds device budget");
         let library = self.library;
         Ok(DsparkFfn {
             experts: self.expert_wave(stage, capacity)?,
-            boundary: match stream { Some(stream) => self.hc_sublayer_on(stage, false, capacity as usize, stream)?,
-                None => self.hc_sublayer(stage, false, capacity as usize, HcSublayer::device_bytes(capacity as usize)?)? },
+            boundary: self.hc_sublayer(
+                stage,
+                false,
+                capacity as usize,
+                HcSublayer::device_bytes(capacity as usize)?,
+            )?,
             router: self.router(
                 stage,
                 capacity as usize,
@@ -53,6 +49,7 @@ impl<'library> DsparkWeights<'library> {
                 capacity,
                 DsparkSharedFfn::device_bytes(library, capacity)?,
             )?,
+            standalone: &self.standalone,
             device_bytes: bytes,
             library,
             graph: BindingGraphs::new(library)?,
@@ -68,11 +65,11 @@ impl<'a> DsparkFfn<'_, 'a> {
         let [hidden,ids,routing]=self.experts.inputs();
         [hidden,ids,routing,self.experts.output().expect("draft output")]
     }
-    pub(super) fn stream(&self) -> *mut c_void {
-        self.experts.stream()
+    pub(super) fn stream(&self) -> Result<*mut c_void> {
+        Ok(self.standalone.get()?.raw)
     }
     pub(super) fn synchronize(&self) -> Result<()> {
-        self.experts.synchronize()
+        self.standalone.drain().and(self.experts.synchronize())
     }
     pub(super) fn invalidate(&mut self) {
         self.boundary.invalidate();
@@ -96,7 +93,7 @@ impl<'a> DsparkFfn<'_, 'a> {
     /// this device, finish producer writes, and serialize all reuse of borrowed views.
     pub unsafe fn execute(&mut self, rows: u32) -> Result<[CuteafdDeviceBuffer; 2]> {
         let launched = unsafe { self.enqueue(rows) };
-        let drained = self.experts.synchronize();
+        let drained = self.synchronize();
         if let Err(error) = launched.and(drained) {
             self.boundary.invalidate();
             return Err(error);
@@ -105,7 +102,7 @@ impl<'a> DsparkFfn<'_, 'a> {
     }
     /// Scratch owners and borrowed weights must live through stream completion.
     pub(super) unsafe fn enqueue(&mut self, rows: u32) -> Result<()> {
-        unsafe { self.enqueue_on(rows, self.experts.stream()) }
+        unsafe { self.enqueue_on(rows, self.stream()?) }
     }
     pub(super) fn output_storage(&self) -> [CuteafdDeviceBuffer; 2] {
         self.boundary.output_storage()
@@ -137,10 +134,10 @@ impl<'a> DsparkFfn<'_, 'a> {
         self.boundary.invalidate();
         unsafe {
             self.library
-                .cuda_graph_begin_capture(self.experts.stream())?;
+                .cuda_graph_begin_capture(self.stream()?)?;
         }
         let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { self.library.cuda_graph_end_capture(self.experts.stream()) };
+        let captured = unsafe { self.library.cuda_graph_end_capture(self.stream()?) };
         self.boundary.invalidate();
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
@@ -166,8 +163,8 @@ impl<'a> DsparkFfn<'_, 'a> {
             rows == captured_rows,
             "dSpark FFN replay rows differ from capture"
         );
-        let launched = unsafe { self.library.cuda_graph_launch(graph, self.experts.stream()) };
-        let drained = self.experts.synchronize();
+        let launched = unsafe { self.library.cuda_graph_launch(graph, self.stream()?) };
+        let drained = self.synchronize();
         launched.and(drained)?;
         unsafe { self.boundary.complete_replay(rows as usize) }
     }
@@ -178,7 +175,7 @@ impl<'a> DsparkFfn<'_, 'a> {
 }
 impl Drop for DsparkFfn<'_, '_> {
     fn drop(&mut self) {
-        fatal_drain(self.experts.synchronize(), "dSpark ffn");
+        fatal_drain(self.synchronize(), "dSpark ffn");
         // SAFETY: owning stream has drained before executable retirement.
         fatal_drain(unsafe { self.graph.clear() }, "dSpark ffn graphs");
     }

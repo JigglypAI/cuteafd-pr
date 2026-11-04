@@ -18,22 +18,13 @@ impl<'library> DsparkWeights<'library> {
             format!("mtp.{stage}.hc_{kind}_base"),
             format!("mtp.{stage}.{kind}_norm.weight"),
         ];
-        HcSublayer::new(
+        HcSublayer::standalone(
             self.library,
             &self.auxiliary,
             names,
             capacity,
             budget,
+            self.standalone.clone(),
         )
     }
-    pub(super) fn hc_sublayer_on(&self, stage: usize, attention: bool, capacity: usize,
-        stream: std::rc::Rc<crate::shared::memory::LoadStream<'library>>) -> Result<HcSublayer<'_, 'library>> {
-        ensure!(stage < 3, "invalid dSpark stage");
-        let kind = if attention { "attn" } else { "ffn" };
-        let names = [format!("mtp.{stage}.hc_{kind}_fn"), format!("mtp.{stage}.hc_{kind}_scale"),
-            format!("mtp.{stage}.hc_{kind}_base"), format!("mtp.{stage}.{kind}_norm.weight")];
-        HcSublayer::on_storage(self.library, &self.auxiliary, names,
-            crate::families::deepseek_v41::v41_hc::HcStorage::with_stream(self.library, capacity, stream)?, capacity)
-    }
-
 }

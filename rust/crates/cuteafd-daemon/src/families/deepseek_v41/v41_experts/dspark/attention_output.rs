@@ -1,4 +1,4 @@
-//! Inverse RoPE -> grouped FP8 wo_a -> native FP8 wo_b on one owned stream.
+//! Inverse RoPE -> grouped FP8 wo_a -> native FP8 wo_b in caller stream order.
 use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::{DsparkProjection, DsparkWeights, ProjectionKind};
 use crate::shared::memory::{DeviceAllocation, LoadStream};
@@ -8,9 +8,7 @@ use cuteafd_ffi::{
 };
 use std::ffi::c_void;
 pub(crate) struct DsparkAttentionOutput<'weights, 'library> {
-    // The containing draft owner creates this stream and serializes all users.
-    // Retain it through standalone graph retirement; Drop drains before planes retire.
-    stream: std::rc::Rc<LoadStream<'library>>,
+    standalone: &'weights crate::shared::memory::StandaloneStream<'library>,
     grouped: V41Fp8Plan<'library>,
     grouped_scratch: DeviceAllocation<'library>,
     alpha: DeviceAllocation<'library>,
@@ -30,16 +28,6 @@ impl<'library> DsparkWeights<'library> {
         capacity: u32,
         budget: usize,
     ) -> Result<DsparkAttentionOutput<'_, 'library>> {
-        self.attention_output_on(stage, capacity, budget, None)
-    }
-
-    pub(super) fn attention_output_on(
-        &self,
-        stage: usize,
-        capacity: u32,
-        budget: usize,
-        shared_stream: Option<std::rc::Rc<LoadStream<'library>>>,
-    ) -> Result<DsparkAttentionOutput<'_, 'library>> {
         ensure!(stage < 3, "invalid dSpark attention output stage");
         let library = self.library;
         ensure!(
@@ -49,16 +37,16 @@ impl<'library> DsparkWeights<'library> {
         let grouped = library.v41_fp8_matrix_plan(capacity, 32768, 8192)?;
         let grouped_scratch = DeviceAllocation::new(library, grouped.info().scratch_bytes as usize)?;
         let alpha = DeviceAllocation::new(library, 4)?;
-        let stream = match shared_stream { Some(stream) => stream, None => std::rc::Rc::new(LoadStream { library, raw: library.cuda_stream_create()? }) };
+        let stream = LoadStream { library, raw: library.cuda_stream_create()? };
         let initialized = unsafe { grouped.initialize_scratch(grouped_scratch.buffer, alpha.buffer, stream.raw) };
         initialized.and(unsafe { library.cuda_stream_synchronize(stream.raw) })?;
-        let projection = unsafe { self.projection_input_on(
+        let projection = self.projection(
             ProjectionKind::OutputB(stage),
-            capacity, None,
-            DsparkProjection::device_bytes(library, ProjectionKind::OutputB(stage), capacity)?, Some(stream.clone()),
-        )? };
+            capacity,
+            DsparkProjection::device_bytes(library, ProjectionKind::OutputB(stage), capacity)?,
+        )?;
         Ok(DsparkAttentionOutput {
-            stream,
+            standalone: &self.standalone,
             grouped,
             grouped_scratch,
             alpha,
@@ -95,7 +83,7 @@ impl DsparkAttentionOutput<'_, '_> {
         self.frequencies.buffer
     }
     fn synchronize(&self) -> Result<()> {
-        unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
+        self.standalone.drain()
     }
     /// # Safety
     /// Inputs/frequencies must be initialized on this device. A containing owner
@@ -130,7 +118,7 @@ impl DsparkAttentionOutput<'_, '_> {
     /// Initialize finite BF16 attention outputs and per-row FP32 complex frequencies,
     /// finish producer writes, and serialize raw view reuse through completion.
     pub unsafe fn execute(&mut self, rows: u32) -> Result<CuteafdDeviceBuffer> {
-        let launched = unsafe { self.enqueue(rows, self.stream.raw) };
+        let launched = unsafe { self.enqueue(rows, self.standalone.get()?.raw) };
         let drained = self.synchronize();
         launched.and(drained)?;
         self.ready = Some(rows);
@@ -148,12 +136,12 @@ impl DsparkAttentionOutput<'_, '_> {
         }
         self.ready = None;
         unsafe {
-            self.stream
+            self.standalone.device
                 .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
+                .cuda_graph_begin_capture(self.standalone.get()?.raw)?;
         }
-        let launched = unsafe { self.enqueue(rows, self.stream.raw) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
+        let launched = unsafe { self.enqueue(rows, self.standalone.get()?.raw) };
+        let captured = unsafe { self.standalone.device.library.cuda_graph_end_capture(self.standalone.get()?.raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
                 // SAFETY: wave pins captured storage through drained teardown.
@@ -161,7 +149,7 @@ impl DsparkAttentionOutput<'_, '_> {
                 Ok(())
             }
             (Err(error), Ok(graph)) => {
-                if let Err(cleanup) = unsafe { self.stream.library.cuda_graph_exec_destroy(graph) }
+                if let Err(cleanup) = unsafe { self.standalone.device.library.cuda_graph_exec_destroy(graph) }
                 {
                     tracing::error!(%cleanup,"destroying failed attention output capture");
                 }
@@ -183,9 +171,9 @@ impl DsparkAttentionOutput<'_, '_> {
             "dSpark attention output replay rows differ"
         );
         let launched = unsafe {
-            self.stream
+            self.standalone.device
                 .library
-                .cuda_graph_launch(graph, self.stream.raw)
+                .cuda_graph_launch(graph, self.standalone.get()?.raw)
         };
         let drained = self.synchronize();
         launched.and(drained)?;

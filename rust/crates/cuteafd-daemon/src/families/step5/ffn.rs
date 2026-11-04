@@ -85,7 +85,7 @@ struct DenseWeights<'a> {
 
 pub(super) struct DenseFfn<'a> {
     // Fields drop in declaration order: drain before storage or programs retire.
-    stream: std::rc::Rc<Stream<'a>>,
+    stream: std::rc::Rc<crate::shared::memory::StandaloneStream<'a>>,
     planes: Vec<Plane<'a>>,
     /// The rank's serialized native projection scratch (native FFNs only).
     native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
@@ -451,10 +451,7 @@ impl<'a> DenseFfn<'a> {
         ensure!(spans.iter().zip(&admission.planes).all(|(span, &bytes)| span.1 == bytes),
             "Step-5 dense region layout differs from admission");
         let planes = scratch::region_planes(device, &spans, arena)?;
-        // Arena components share Staging's persistent stream; standalone owners
-        // create a private stream. The retained Rc outlives captured graphs.
-        let stream = match arena { Some((arena, _)) => arena.stream(),
-            None => std::rc::Rc::new(Stream::new(device)?) };
+        let stream = scratch::standalone(device, arena);
         Ok(Self { stream, planes, native_scratch: None, admission, immutable, unit: std::cell::Cell::new(0) })
     }
 
@@ -518,7 +515,7 @@ impl<'a> DenseFfn<'a> {
     }
 
     fn enqueue_stage(&self, stage: usize, rows: usize) -> Result<()> {
-        self.stage_on(stage, rows, &self.stream)
+        self.stage_on(stage, rows, self.stream.get()?)
     }
 
     fn stage_on(&self, stage: usize, rows: usize, stream: &Stream<'a>) -> Result<()> {
@@ -848,7 +845,7 @@ mod tests {
         );
         let lane = chain.new_lane()?;
         ensure!(std::rc::Rc::ptr_eq(&chain.immutable, &lane.immutable)
-            && chain.stream.raw != lane.stream.raw
+            && chain.stream.get()?.raw != lane.stream.get()?.raw
             && chain.planes.iter().zip(&lane.planes).all(|(a, b)|
                 a.buffer.ptr != b.buffer.ptr && a.buffer.bytes == b.buffer.bytes),
             "Step-5 lane must share immutable storage and isolate every stream/plane");
@@ -916,12 +913,12 @@ mod tests {
             // Capture contains only pre-resolved launches and stable admitted pointers.
             device.run(|| {
                 // SAFETY: the stream is idle, and all chain resources outlive capture/replay.
-                unsafe { library.cuda_graph_begin_capture(chain.stream.raw) }
+                unsafe { library.cuda_graph_begin_capture(chain.stream.get()?.raw) }
             })?;
             let enqueue = chain.enqueue(rows);
             let graph = device.run(|| {
                 // SAFETY: capture was begun on this stream above, even if enqueue failed.
-                unsafe { library.cuda_graph_end_capture(chain.stream.raw) }
+                unsafe { library.cuda_graph_end_capture(chain.stream.get()?.raw) }
             })?;
             // SAFETY: the mutable borrow pins the entire chain until this graph is dropped.
             let graph = unsafe {
@@ -936,7 +933,7 @@ mod tests {
                 .cancellation_guard("interrupted dense graph replay");
             device.run(|| {
                 // SAFETY: graph pins the same device/stream/storage until replay drains.
-                unsafe { library.cuda_graph_launch(graph.raw, graph.pins.stream.raw) }
+                unsafe { library.cuda_graph_launch(graph.raw, graph.pins.stream.get()?.raw) }
             })?;
             graph.pins.stream.drain()?;
             drain.complete = true;
@@ -1028,6 +1025,7 @@ mod tests {
 
 impl Drop for DenseFfn<'_> {
     fn drop(&mut self) {
-        self.stream.drain_or_abort("Step-5 ffn workspace");
+        // The arena retains the lazy stream beyond this owner's planes; drain first.
+        crate::shared::decode_graph::fatal_drain(self.stream.drain(), "Step-5 ffn standalone");
     }
 }

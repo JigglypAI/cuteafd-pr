@@ -48,9 +48,9 @@ fn real_registered_output_matches_device_compaction_and_preserves_guards() -> Re
         let (kernel, slots, _) = execution.execution_state(rows)?;
         unsafe {
             if kernel.accumulates_tokens() {
-                reducer.compact_tokens(slots[41].cast(), device.ptr.cast(), rows, execution.stream.raw)?;
+                reducer.compact_tokens(slots[41].cast(), device.ptr.cast(), rows, execution.stream.as_ref().unwrap().raw)?;
             } else {
-                reducer.compact(execution.route_partials(rows)?.ptr.cast(), device.ptr.cast(), rows, execution.stream.raw)?;
+                reducer.compact(execution.route_partials(rows)?.ptr.cast(), device.ptr.cast(), rows, execution.stream.as_ref().unwrap().raw)?;
             }
         }
         execution.synchronize()?;

@@ -25,15 +25,6 @@ impl<'library> DsparkWeights<'library> {
         requests: u32,
         budget: usize,
     ) -> Result<DsparkStage<'_, 'library>> {
-        self.stage_on(stage, requests, budget, None)
-    }
-    pub(super) fn stage_on(
-        &self,
-        stage: usize,
-        requests: u32,
-        budget: usize,
-        stream: Option<std::rc::Rc<crate::shared::memory::LoadStream<'library>>>,
-    ) -> Result<DsparkStage<'_, 'library>> {
         ensure!(stage < 3, "invalid dSpark stage");
         ensure!(
             self.stage_bytes(requests)? <= budget,
@@ -42,13 +33,17 @@ impl<'library> DsparkWeights<'library> {
         let capacity = DsparkAttentionWave::projection_capacity_with_width(requests, self.draft_width)?;
         let library = self.library;
         Ok(DsparkStage {
-            ffn: self.ffn_on(stage, capacity, self.ffn_bytes(capacity)?, stream.clone())?,
-            boundary: match &stream { Some(stream) => self.hc_sublayer_on(stage, true, capacity as usize, stream.clone())?,
-                None => self.hc_sublayer(stage, true, capacity as usize, HcSublayer::device_bytes(capacity as usize)?)? },
-            attention: self.attention_wave_on(
+            ffn: self.ffn(stage, capacity, self.ffn_bytes(capacity)?)?,
+            boundary: self.hc_sublayer(
+                stage,
+                true,
+                capacity as usize,
+                HcSublayer::device_bytes(capacity as usize)?,
+            )?,
+            attention: self.attention_wave(
                 stage,
                 requests,
-                DsparkAttentionWave::device_bytes_with_width(library, requests, self.draft_width)?, stream,
+                DsparkAttentionWave::device_bytes_with_width(library, requests, self.draft_width)?,
             )?,
             library,
             graph: BindingGraphs::new(library)?,
@@ -97,7 +92,7 @@ impl<'a> DsparkStage<'_, 'a> {
         self.attention.prepare(window, requests)
     }
     unsafe fn enqueue(&mut self, read: &WindowRead, requests: usize) -> Result<()> {
-        unsafe { self.enqueue_on(read, requests, self.ffn.stream()) }
+        unsafe { self.enqueue_on(read, requests, self.ffn.stream()?) }
     }
     pub(super) fn output_storage(&self) -> [CuteafdDeviceBuffer; 2] {
         self.ffn.output_storage()
@@ -178,10 +173,10 @@ impl<'a> DsparkStage<'_, 'a> {
         }
         let read = self.prepare(window, requests)?;
         unsafe {
-            self.library.cuda_graph_begin_capture(self.ffn.stream())?;
+            self.library.cuda_graph_begin_capture(self.ffn.stream()?)?;
         }
         let launched = unsafe { self.enqueue(&read, requests.len()) };
-        let captured = unsafe { self.library.cuda_graph_end_capture(self.ffn.stream()) };
+        let captured = unsafe { self.library.cuda_graph_end_capture(self.ffn.stream()?) };
         self.invalidate();
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
@@ -212,7 +207,7 @@ impl<'a> DsparkStage<'_, 'a> {
             "dSpark stage capture binding differs"
         );
         self.attention.upload(&read, requests)?;
-        let launched = unsafe { self.library.cuda_graph_launch(graph, self.ffn.stream()) };
+        let launched = unsafe { self.library.cuda_graph_launch(graph, self.ffn.stream()?) };
         let drained = self.ffn.synchronize();
         launched.and(drained)?;
         unsafe {

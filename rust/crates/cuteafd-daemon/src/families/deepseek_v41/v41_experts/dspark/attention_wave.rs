@@ -2,14 +2,12 @@
 use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::{DsparkAttentionOutput, DsparkProjection, DsparkWeights, ProjectionKind};
 use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowLease, WindowRead};
-use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41DsparkAttention};
 use std::ffi::c_void;
 pub(crate) struct DsparkAttentionWave<'weights, 'library> {
-    // The containing draft owner creates this stream and serializes all users.
-    // Retain it through standalone graph retirement; Drop drains before planes retire.
-    stream: std::rc::Rc<LoadStream<'library>>,
+    standalone: &'weights crate::shared::memory::StandaloneStream<'library>,
     qa: DsparkProjection<'weights, 'library>,
     qb: DsparkProjection<'weights, 'library>,
     kv: DsparkProjection<'weights, 'library>,
@@ -35,16 +33,6 @@ impl<'library> DsparkWeights<'library> {
         requests: u32,
         budget: usize,
     ) -> Result<DsparkAttentionWave<'_, 'library>> {
-        self.attention_wave_on(stage, requests, budget, None)
-    }
-
-    pub(super) fn attention_wave_on(
-        &self,
-        stage: usize,
-        requests: u32,
-        budget: usize,
-        shared_stream: Option<std::rc::Rc<LoadStream<'library>>>,
-    ) -> Result<DsparkAttentionWave<'_, 'library>> {
         ensure!(stage < 3, "invalid dSpark attention stage");
         let library = self.library;
         ensure!(
@@ -53,24 +41,22 @@ impl<'library> DsparkWeights<'library> {
         );
         let rows = requests * self.draft_width as u32;
         let capacity = DsparkAttentionWave::projection_capacity_with_width(requests, self.draft_width)?;
-        let stream = match shared_stream { Some(stream) => stream,
-            None => std::rc::Rc::new(LoadStream { library, raw: library.cuda_stream_create()? }) };
-        let projection = |kind| unsafe {
-            self.projection_input_on(
+        let projection = |kind| {
+            self.projection(
                 kind,
-                capacity, None,
-                DsparkProjection::device_bytes(library, kind, capacity)?, Some(stream.clone()),
+                capacity,
+                DsparkProjection::device_bytes(library, kind, capacity)?,
             )
         };
         Ok(DsparkAttentionWave {
-            stream: stream.clone(),
+            standalone: &self.standalone,
             qa: projection(ProjectionKind::QueryA(stage))?,
             qb: projection(ProjectionKind::QueryB(stage))?,
             kv: projection(ProjectionKind::Kv(stage))?,
-            output: self.attention_output_on(
+            output: self.attention_output(
                 stage,
                 capacity,
-                DsparkAttentionOutput::device_bytes(library, capacity)?, Some(stream.clone()),
+                DsparkAttentionOutput::device_bytes(library, capacity)?,
             )?,
             ops: library.v41_attention_ops_width(self.draft_width)?,
             attention: library.v41_dspark_attention_width(self.draft_width)?,
@@ -96,7 +82,7 @@ impl DsparkAttentionWave<'_, '_> {
         ensure!(matches!(width, 5 | 7) && width <= maximum, "draft width must be five or seven within the loaded width");
         if width == self.width { return Ok(()); }
         ensure!(self.graph.is_none(), "cannot change the width of a captured attention wave");
-        let library = self.stream.library;
+        let library = self.standalone.device.library;
         self.ops = library.v41_attention_ops_width(width)?;
         self.attention = library.v41_dspark_attention_width(width)?;
         self.width = width;
@@ -147,7 +133,7 @@ impl DsparkAttentionWave<'_, '_> {
         self.qa.input()
     }
     fn synchronize(&self) -> Result<()> {
-        unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
+        self.standalone.drain()
     }
     pub(super) fn prepare(
         &mut self,
@@ -168,8 +154,8 @@ impl DsparkAttentionWave<'_, '_> {
     ) -> Result<()> {
         self.stage_upload(read, requests);
         let staging = self.staging.bytes_mut();
-        self.stream.library.copy_h2d(self.descriptors.buffer, &staging[..cuteafd_core::V41_READ_DESCRIPTOR_BYTES])?;
-        self.stream.library.copy_h2d(self.positions.buffer, &staging[cuteafd_core::V41_READ_DESCRIPTOR_BYTES..])
+        self.standalone.device.library.copy_h2d(self.descriptors.buffer, &staging[..cuteafd_core::V41_READ_DESCRIPTOR_BYTES])?;
+        self.standalone.device.library.copy_h2d(self.positions.buffer, &staging[cuteafd_core::V41_READ_DESCRIPTOR_BYTES..])
     }
     /// The containing chain retains staging and cache reads through completion.
     pub(super) unsafe fn upload_on(&mut self, read: &WindowRead,
@@ -177,8 +163,8 @@ impl DsparkAttentionWave<'_, '_> {
         self.stage_upload(read, requests);
         let staging = self.staging.bytes_mut();
         unsafe {
-            self.stream.library.copy_h2d_async(self.descriptors.buffer, &staging[..cuteafd_core::V41_READ_DESCRIPTOR_BYTES], stream)?;
-            self.stream.library.copy_h2d_async(self.positions.buffer, &staging[cuteafd_core::V41_READ_DESCRIPTOR_BYTES..], stream)
+            self.standalone.device.library.copy_h2d_async(self.descriptors.buffer, &staging[..cuteafd_core::V41_READ_DESCRIPTOR_BYTES], stream)?;
+            self.standalone.device.library.copy_h2d_async(self.positions.buffer, &staging[cuteafd_core::V41_READ_DESCRIPTOR_BYTES..], stream)
         }
     }
     fn stage_upload(&mut self, read: &WindowRead, requests: &[(WindowLease, u64)]) {
@@ -269,7 +255,7 @@ impl DsparkAttentionWave<'_, '_> {
     ) -> Result<CuteafdDeviceBuffer> {
         let read = self.prepare(window, requests)?;
         self.upload(&read, requests)?;
-        let launched = unsafe { self.enqueue_on(&read, requests.len() as u32, self.stream.raw) };
+        let launched = unsafe { self.enqueue_on(&read, requests.len() as u32, self.standalone.get()?.raw) };
         let drained = self.synchronize();
         launched.and(drained)?;
         self.ready = Some(requests.len() as u32);
@@ -289,12 +275,12 @@ impl DsparkAttentionWave<'_, '_> {
         }
         let read = self.prepare(window, requests)?;
         unsafe {
-            self.stream
+            self.standalone.device
                 .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
+                .cuda_graph_begin_capture(self.standalone.get()?.raw)?;
         }
-        let launched = unsafe { self.enqueue_on(&read, requests.len() as u32, self.stream.raw) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
+        let launched = unsafe { self.enqueue_on(&read, requests.len() as u32, self.standalone.get()?.raw) };
+        let captured = unsafe { self.standalone.device.library.cuda_graph_end_capture(self.standalone.get()?.raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
                 // SAFETY: wave pins captured storage through drained teardown.
@@ -302,7 +288,7 @@ impl DsparkAttentionWave<'_, '_> {
                 Ok(())
             }
             (Err(error), Ok(graph)) => {
-                if let Err(cleanup) = unsafe { self.stream.library.cuda_graph_exec_destroy(graph) }
+                if let Err(cleanup) = unsafe { self.standalone.device.library.cuda_graph_exec_destroy(graph) }
                 {
                     tracing::error!(%cleanup,"destroying failed attention wave capture");
                 }
@@ -326,9 +312,9 @@ impl DsparkAttentionWave<'_, '_> {
         );
         self.upload(&read, requests)?;
         let launched = unsafe {
-            self.stream
+            self.standalone.device
                 .library
-                .cuda_graph_launch(graph, self.stream.raw)
+                .cuda_graph_launch(graph, self.standalone.get()?.raw)
         };
         let drained = self.synchronize();
         launched.and(drained)?;

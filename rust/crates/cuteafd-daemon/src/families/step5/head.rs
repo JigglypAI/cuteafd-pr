@@ -126,7 +126,7 @@ struct HeadWeights<'a> {
 
 pub(super) struct TargetHeadOwner<'a> {
     // Drain before programs, library handles, weights and workspace retire.
-    stream: std::rc::Rc<Stream<'a>>,
+    stream: std::rc::Rc<crate::shared::memory::StandaloneStream<'a>>,
     head: VocabularyHead<'a>,
     planes: Vec<Plane<'a>>,
     rows: usize,
@@ -178,10 +178,7 @@ impl<'a> TargetHeadOwner<'a> {
             // SAFETY: private workspace survives the private handle on this device.
             let head = unsafe { device.library.vocabulary_head_rows(planes[3].buffer.ptr,
                 H as u32, rows as u32, V as u32)? };
-            // Arena components share Staging's persistent stream; standalone owners
-        // create a private stream. The retained Rc outlives captured graphs.
-        let stream = match arena { Some((arena, _)) => arena.stream(),
-            None => std::rc::Rc::new(Stream::new(device)?) };
+            let stream = scratch::standalone(device, arena);
             Ok(Self { stream, head, planes, rows, immutable })
         })
     }
@@ -250,8 +247,8 @@ impl<'a> TargetHeadOwner<'a> {
 
     /// Caller drains the target chain first; this diagnostic downloads all rows.
     pub fn logits(&self, input: CuteafdDeviceBuffer) -> Result<Vec<f32>> {
-        let mut guard = self.stream.cancellation_guard("Step-5 diagnostic head input borrow");
-        let logits = self.device_logits_on(input, self.rows, &self.stream)?;
+        let mut guard = self.stream.get()?.cancellation_guard("Step-5 diagnostic head input borrow");
+        let logits = self.device_logits_on(input, self.rows, self.stream.get()?)?;
         let values = self.stream.device.run(|| logits.to_host(self.stream.device.library))?;
         guard.complete = true;
         ensure!(values.iter().all(|v| v.is_finite()), "nonfinite Step-5 logits");
@@ -284,7 +281,7 @@ pub(super) mod tests {
         let owner = TargetHeadOwner::load(device, &programs, &checkpoint, plan, u64::MAX, &[])?;
         let lane = owner.new_lane()?;
         ensure!(std::rc::Rc::ptr_eq(&owner.immutable, &lane.immutable)
-            && owner.stream.raw != lane.stream.raw
+            && owner.stream.get()?.raw != lane.stream.get()?.raw
             && owner.planes.iter().zip(&lane.planes).all(|(a, b)|
                 a.buffer.ptr != b.buffer.ptr && a.buffer.bytes == b.buffer.bytes),
             "Step-5 lane immutable/private storage identities");
@@ -348,6 +345,7 @@ pub(super) mod tests {
 
 impl Drop for TargetHeadOwner<'_> {
     fn drop(&mut self) {
-        self.stream.drain_or_abort("Step-5 head workspace");
+        // The arena retains the lazy stream beyond this owner's planes; drain first.
+        crate::shared::decode_graph::fatal_drain(self.stream.drain(), "Step-5 head standalone");
     }
 }

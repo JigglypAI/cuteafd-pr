@@ -163,7 +163,7 @@ struct SwaWeights<'a> {
 
 pub(super) struct SwaLayer<'a> {
     // This stream drains before every composed owner, including the FFN.
-    stream: std::rc::Rc<Stream<'a>>,
+    stream: std::rc::Rc<crate::shared::memory::StandaloneStream<'a>>,
     ffn: Option<DenseFfn<'a>>,
     planes: Vec<Plane<'a>>,
     native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
@@ -489,10 +489,7 @@ impl<'a> SwaLayer<'a> {
     fn workspace(device: Device<'a>, admission: Admission,
         immutable: std::rc::Rc<SwaWeights<'a>>, ffn: Option<DenseFfn<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
         let planes = scratch::planes(device, &admission.planes, arena)?;
-        // Arena components share Staging's persistent stream; standalone owners
-        // create a private stream. The retained Rc outlives captured graphs.
-        let stream = match arena { Some((arena, _)) => arena.stream(),
-            None => std::rc::Rc::new(Stream::new(device)?) };
+        let stream = scratch::standalone(device, arena);
         let rows = admission.rows;
         let owner = Self { stream, ffn, planes, native_scratch: None, admission, immutable };
         if arena.is_none() {
@@ -523,7 +520,7 @@ impl<'a> SwaLayer<'a> {
         pointers: &[*mut std::ffi::c_void],
         scalars: &[Scalar],
     ) -> Result<()> {
-        self.launch_on(&self.stream, stage, pointers, scalars)
+        self.launch_on(self.stream.get()?, stage, pointers, scalars)
     }
 
     fn launch_on(
@@ -541,7 +538,7 @@ impl<'a> SwaLayer<'a> {
     }
 
     pub fn enqueue(&self, rows: usize) -> Result<()> {
-        self.project_on(rows, self.planes[POSITIONS].buffer, &self.stream)?;
+        self.project_on(rows, self.planes[POSITIONS].buffer, self.stream.get()?)?;
         self.launch(
             6,
             &[
@@ -552,8 +549,8 @@ impl<'a> SwaLayer<'a> {
             &[Scalar::I32(rows as i32)],
         )?;
         self.attend(rows)?;
-        self.finish_on(rows, &self.stream)?;
-        self.dense_on(rows, &self.stream)
+        self.finish_on(rows, self.stream.get()?)?;
+        self.dense_on(rows, self.stream.get()?)
     }
 
     pub(super) fn project_on(
@@ -845,7 +842,7 @@ impl<'a> SwaLayer<'a> {
             self.planes[TABLE].buffer,
             self.admission.pages,
             self.admission.pages,
-            &self.stream,
+            self.stream.get()?,
         )
     }
 
@@ -1122,22 +1119,22 @@ mod tests {
             }
             device.run(|| {
                 // SAFETY: stream is idle; all graph operands are pinned below.
-                unsafe { library.cuda_graph_begin_capture(chain.stream.raw) }
+                unsafe { library.cuda_graph_begin_capture(chain.stream.get()?.raw) }
             })?;
             let enqueue = chain.enqueue(rows);
             let raw = device.run(|| {
                 // SAFETY: end capture even if enqueue failed.
-                unsafe { library.cuda_graph_end_capture(chain.stream.raw) }
+                unsafe { library.cuda_graph_end_capture(chain.stream.get()?.raw) }
             })?;
             // SAFETY: mutable chain borrow retains every stream, allocation and program.
             let graph = unsafe {
                 crate::shared::decode_graph::GraphOwner::new(&library, device.id, raw, &mut chain)?
             };
             enqueue?;
-            let mut guard = graph.pins.stream.cancellation_guard("SWA graph replay");
+            let mut guard = graph.pins.stream.get()?.cancellation_guard("SWA graph replay");
             device.run(|| {
                 // SAFETY: retained graph operands remain live until the drain below.
-                unsafe { library.cuda_graph_launch(graph.raw, graph.pins.stream.raw) }
+                unsafe { library.cuda_graph_launch(graph.raw, graph.pins.stream.get()?.raw) }
             })?;
             graph.pins.stream.drain()?;
             guard.complete = true;
@@ -1475,7 +1472,7 @@ mod tests {
         pool.borrow_mut().release(&family, &placement.pages)?;
         let lane = chain.new_lane()?;
         ensure!(std::rc::Rc::ptr_eq(&chain.immutable, &lane.immutable)
-            && chain.stream.raw != lane.stream.raw
+            && chain.stream.get()?.raw != lane.stream.get()?.raw
             && chain.planes.iter().zip(&lane.planes).all(|(a, b)|
                 a.buffer.ptr != b.buffer.ptr && a.buffer.bytes == b.buffer.bytes),
             "Step-5 lane must share immutable storage and isolate every stream/plane");
@@ -1531,6 +1528,7 @@ mod tests {
 
 impl Drop for SwaLayer<'_> {
     fn drop(&mut self) {
-        self.stream.drain_or_abort("Step-5 swa workspace");
+        // The arena retains the lazy stream beyond this owner's planes; drain first.
+        crate::shared::decode_graph::fatal_drain(self.stream.drain(), "Step-5 swa standalone");
     }
 }

@@ -127,7 +127,7 @@ struct NativeWidthState<'library> {
 /// Upstream producers and transport must obey this owner's stream/lifetime contract.
 pub(crate) struct ExpertExecution<'weights, 'library> {
     // Destroy stream before allocations; Drop drains and destroys the graph first.
-    pub(crate) stream: LoadStream<'library>,
+    pub(crate) stream: Option<LoadStream<'library>>,
     pub(crate) _weights: &'weights ExpertWeights<'library>,
     library: &'library NativeLibrary,
     pub(crate) kernel: V41ExpertKernel<'library>,
@@ -237,6 +237,16 @@ impl<'library> ExpertWeights<'library> {
         live: u32,
         available_device_bytes: usize,
     ) -> Result<ExpertExecution<'_, 'library>> {
+        self.execution_mode(compiled, live, available_device_bytes, true)
+    }
+    /// Composed execution uses only its caller's stream; scratch initialization
+    /// drains a load-only stream before returning any workspace.
+    pub(crate) fn execution_external(&self, compiled: u32, live: u32, available: usize)
+        -> Result<ExpertExecution<'_, 'library>> {
+        self.execution_mode(compiled, live, available, false)
+    }
+    fn execution_mode(&self, compiled: u32, live: u32, available_device_bytes: usize,
+        own_stream: bool) -> Result<ExpertExecution<'_, 'library>> {
         validate_capacity(compiled, live)?;
         let library = self.buffers[0].library;
         let reduction_plan = native_reduction_plan(self.layer, library, compiled, self.is_nvfp4())?;
@@ -347,6 +357,7 @@ impl<'library> ExpertWeights<'library> {
         let route_staging = (0..1).map(|_| crate::shared::memory::HostAllocation::named(library,
             budget.routing_bytes, "experts/workspace/route_staging" )).collect::<Result<Vec<_>>>()?;
         let reply_codec = if compact_output_role(kernel.info().role) { Some(super::reply::ReplyCodec::load(library)?) } else { None };
+        let stream = if own_stream { Some(stream) } else { drop(stream); None };
         Ok(ExpertExecution {
             stream,
             _weights: self,
@@ -420,8 +431,8 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
             weights.bind(&kernel, &mut slots)?;
             // SAFETY: initialization is drained before publishing this state.
             let initialized = unsafe { kernel.initialize_scratch(scratch.buffer.ptr,
-                scratch.buffer.bytes as u64, self.stream.raw) };
-            let drained = unsafe { self.library.cuda_stream_synchronize(self.stream.raw) };
+                scratch.buffer.bytes as u64, self.stream()) };
+            let drained = unsafe { self.library.cuda_stream_synchronize(self.stream()) };
             if drained.is_err() { self.library.quarantine_module_after_failed_drain(); }
             initialized.and(drained)?;
             Ok(DecodeExecution { kernel, scratch, slots })
@@ -478,7 +489,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         self.budget
     }
     pub fn stream(&self) -> *mut c_void {
-        self.stream.raw
+        self.stream.as_ref().expect("expert worker owns its execution stream").raw
     }
     /// Borrowed hidden in the native kernel's input format, I32 route IDs and
     /// FP32 route weights; never free these views. dSpark always uses BF16.
@@ -618,11 +629,15 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     /// Whether every request queued on this execution's stream has completed.
     pub(crate) fn stream_idle(&self) -> Result<bool> {
         // SAFETY: the owned stream is live for the worker's lifetime.
-        unsafe { self.library.cuda_stream_query(self.stream.raw) }
+        unsafe { self.library.cuda_stream_query(self.stream()) }
     }
 
     pub fn synchronize(&self) -> Result<()> {
-        unsafe { self.library.cuda_stream_synchronize(self.stream.raw) }
+        match &self.stream {
+            // SAFETY: the worker retains its stream through completion.
+            Some(stream) => unsafe { self.library.cuda_stream_synchronize(stream.raw) },
+            None => Ok(()),
+        }
     }
 
     /// # Safety
@@ -632,7 +647,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     /// Initialize shared BF16 output too if requested. External readers/writers must
     /// finish before storage is reused; all operations belong to this GPU worker.
     pub unsafe fn launch(&mut self, rows: u32, include_shared: bool) -> Result<()> {
-        unsafe { self.launch_on(rows, include_shared, self.stream.raw) }
+        unsafe { self.launch_on(rows, include_shared, self.stream()) }
     }
     pub(crate) unsafe fn launch_on(
         &mut self,
@@ -649,7 +664,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     /// initialized wire rows on this execution's device, and the transport
     /// retains that storage until the stream work that reads it completes.
     pub(crate) unsafe fn launch_hidden(&mut self, rows: u32, hidden: *mut c_void) -> Result<()> {
-        unsafe { self.launch_hidden_on(rows, false, self.stream.raw, Some(hidden)) }
+        unsafe { self.launch_hidden_on(rows, false, self.stream(), Some(hidden)) }
     }
     unsafe fn launch_hidden_on(
         &mut self,
@@ -708,11 +723,11 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         }
         self.synchronize()?;
         unsafe {
-            self.library.cuda_graph_begin_capture(self.stream.raw)?;
+            self.library.cuda_graph_begin_capture(self.stream())?;
         }
         let launch = unsafe { self.launch(rows, include_shared) };
         // End capture on both paths so an error cannot leave the stream capturing.
-        let captured = unsafe { self.library.cuda_graph_end_capture(self.stream.raw) };
+        let captured = unsafe { self.library.cuda_graph_end_capture(self.stream()) };
         match (launch, captured) {
             (Ok(()), Ok(graph)) => {
                 self.graph = Some((graph, rows, include_shared, self.kernel.info().role,
@@ -736,7 +751,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         let (graph, _, _, role, width) = self.graph.context("expert graph has not been captured")?;
         ensure!(role == self.kernel.info().role && width == self.kernel.info().logical_intermediate,
             "captured expert graph belongs to a different width state");
-        unsafe { self.library.cuda_graph_launch(graph, self.stream.raw) }
+        unsafe { self.library.cuda_graph_launch(graph, self.stream()) }
     }
 }
 impl Drop for ExpertExecution<'_, '_> {
@@ -935,7 +950,7 @@ impl ExpertExecution<'_, '_> {
         let mut in_frame = None;
         let uploaded = (|| -> Result<()> { unsafe {
             // The unit's pace starts before its input copies (#762).
-            self.pending.arrive(self.stream.raw)?;
+            self.pending.arrive(self.stream())?;
             match hidden_view.filter(|view| view.bytes >= hidden_bytes) {
                 // The kernel reads the rows from its input pointer exactly as
                 // it would read the resident copy, and the transport retains
@@ -945,27 +960,27 @@ impl ExpertExecution<'_, '_> {
                 Some(view) if view.ptr as usize % 16 == 0 && view.device_id == device =>
                     in_frame = Some(view.ptr),
                 Some(view) => self.library.copy_d2d_async(self.hidden.buffer,
-                    CuteafdDeviceBuffer { bytes: hidden_bytes, ..view }, hidden_bytes, self.stream.raw)?,
-                None => self.library.copy_h2d_async(self.hidden.buffer, request.hidden(), self.stream.raw)?,
+                    CuteafdDeviceBuffer { bytes: hidden_bytes, ..view }, hidden_bytes, self.stream())?,
+                None => self.library.copy_h2d_async(self.hidden.buffer, request.hidden(), self.stream())?,
             }
             let mut ids = self.route_staging[stage].buffer; ids.bytes = routes * 4;
             let mut weights = self.route_staging[stage].buffer;
             weights.ptr = weights.ptr.cast::<u8>().add(routes * 4).cast(); weights.bytes = routes * 4;
             self.library.copy_host_buffers_h2d_batch_async(
                 &[self.ids.buffer, self.routing.buffer], &[ids, weights],
-                &[routes * 4, routes * 4], self.stream.raw)?;
+                &[routes * 4, routes * 4], self.stream())?;
             Ok(())
         } })();
         if let Err(error) = uploaded { self.synchronize()?; return Err(error); }
         let uploaded_us = started.map(|t| t.elapsed().as_micros() as u64);
         if let Some(timing) = &self.timing {
             unsafe {
-                timing.record(0, self.stream.raw)?;
+                timing.record(0, self.stream())?;
             }
         }
         // SAFETY: this worker retains events, inputs and stream through the barrier below.
         unsafe {
-            if let Some(timing) = &self.worker_timing { timing.record(0, self.stream.raw)?; }
+            if let Some(timing) = &self.worker_timing { timing.record(0, self.stream())?; }
             match in_frame {
                 Some(hidden) => self.launch_hidden(request.rows(), hidden)?,
                 None => self.launch(request.rows(), false)?,
@@ -973,7 +988,7 @@ impl ExpertExecution<'_, '_> {
         }
         if let Some(timing) = &self.timing {
             unsafe {
-                timing.record(1, self.stream.raw)?;
+                timing.record(1, self.stream())?;
             }
         }
         let compressed = request.output_dtype() != cuteafd_transport::ExpertV2Dtype::Bf16;
@@ -988,33 +1003,33 @@ impl ExpertExecution<'_, '_> {
             let (kernel, slots, _) = self.execution_state(request.rows())?;
             match kernel.output_kind() {
                 cuteafd_ffi::V41ExpertOutputKind::Fp32Tokens =>
-                    reducer.compact_tokens(slots[41].cast(), output.ptr.cast(), request.rows(), self.stream.raw)?,
+                    reducer.compact_tokens(slots[41].cast(), output.ptr.cast(), request.rows(), self.stream())?,
                 cuteafd_ffi::V41ExpertOutputKind::Bf16Routes =>
-                    reducer.compact_bf16_routes(slots[41].cast(), output.ptr.cast(), request.rows(), self.stream.raw)?,
+                    reducer.compact_bf16_routes(slots[41].cast(), output.ptr.cast(), request.rows(), self.stream())?,
                 cuteafd_ffi::V41ExpertOutputKind::Fp32Routes =>
                     reducer.compact(self.route_partials(request.rows())?.ptr.cast(),
-                        output.ptr.cast(), request.rows(), self.stream.raw)?,
+                        output.ptr.cast(), request.rows(), self.stream())?,
             }
         }
         if compressed {
             // SAFETY: BF16 scratch and mapped destination live through the unit fence below.
             unsafe { self.reply_codec.as_ref().context("missing reply codec")?.quantize(request,
-                output, destination.context("missing compressed destination")?, request.rows() as usize, self.stream.raw)?; }
+                output, destination.context("missing compressed destination")?, request.rows() as usize, self.stream())?; }
         }
         if let Some(timing) = &self.timing {
             unsafe {
-                timing.record(2, self.stream.raw)?;
+                timing.record(2, self.stream())?;
             }
         }
         // SAFETY: the reducer and kernel precede this end event on the owned stream.
         unsafe {
-            if let Some(timing) = &self.worker_timing { timing.record(1, self.stream.raw)?; }
+            if let Some(timing) = &self.worker_timing { timing.record(1, self.stream())?; }
         }
         // This unit's fence releases its mapped I/O independently of later
         // requests already queued on the same stream.
         if self.deferred && destination.is_some() {
             // SAFETY: all copies, math and output writes precede this unit fence.
-            unsafe { self.pending.record((request.request_id(), request.layer(), request.rows(), executor_id), self.stream.raw)?; }
+            unsafe { self.pending.record((request.request_id(), request.layer(), request.rows(), executor_id), self.stream())?; }
             return Ok(());
         }
         self.synchronize()?;

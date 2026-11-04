@@ -115,7 +115,7 @@ struct NativeOwners<'a> {
 }
 impl<'a> NativeOwners<'a> {
     fn load(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        ownership: &ExecutionOwnership, devices: &[Device<'a>], stages: &[&Staging<'a>], rows: usize, span: usize, logits: usize,
+        ownership: &ExecutionOwnership, devices: &[Device<'a>], rows: usize, span: usize, logits: usize,
         count: usize, available: &[u64], reservations: &[u64], depth: usize, kv_format: Qwen4KvCache,
         plan: &NativePlan) -> Result<Self> {
         validate_rank_inventory(ownership.ranks(), &[devices.len(), available.len(), reservations.len()])?;
@@ -147,7 +147,7 @@ impl<'a> NativeOwners<'a> {
                 let native_layout = native_scratch_layout(rank_layout, rows, count)?;
                 let native_bytes = native_layout.as_ref().map(|l| l.bytes()).transpose()?.unwrap_or(0);
                 // The arena holds attention and FFN regions; the native scratch is its own admitted owner.
-                let arena = Arena::with_stream(device, usize::try_from(admission[rank].workspace)? - native_bytes, stages[rank].stream.clone())?;
+                let arena = Arena::new(device, usize::try_from(admission[rank].workspace)? - native_bytes)?;
                 let native_scratch = native_layout.map(|layout| super::native::NativeScratch::allocate(device, &layout)
                     .map(Rc::new)).transpose()?;
                 let rope = Rc::new(TargetTables::load(device, programs, &contract, "step5_", available[rank], &[])?);
@@ -453,7 +453,7 @@ impl<'e, 'a> Execution<'e, 'a> {
                 && devices[..rank].iter().all(|other| other.id != device.id)), "Step-5 rank devices/library differ");
         let depth = caches[ownership.execution().spec().head_gpu as usize].borrow()
             .layout().ranks[ownership.execution().spec().head_gpu as usize].mtp_lengths.len();
-        Ok(LoadedNative(NativeOwners::load(programs, checkpoint, ownership, &devices, stages, rows, span, logits, count, available,
+        Ok(LoadedNative(NativeOwners::load(programs, checkpoint, ownership, &devices, rows, span, logits, count, available,
             reservations, depth, kv_format, plan)?))
     }
 

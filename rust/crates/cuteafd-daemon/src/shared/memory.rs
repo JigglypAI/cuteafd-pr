@@ -250,6 +250,34 @@ impl Drop for BlockingWait<'_> {
     }
 }
 
+/// Standalone component qualification shares one lazily created stream per owner.
+/// Device metadata and teardown never initialize it; serving uses explicit streams.
+pub(crate) struct StandaloneStream<'a> {
+    pub(crate) device: device::Device<'a>,
+    stream: std::cell::OnceCell<device::Stream<'a>>,
+}
+impl<'a> StandaloneStream<'a> {
+    pub(crate) fn new(device: device::Device<'a>) -> Self {
+        Self { device, stream: std::cell::OnceCell::new() }
+    }
+    pub(crate) fn get(&self) -> Result<&device::Stream<'a>> {
+        if self.stream.get().is_none() {
+            let stream = device::Stream::new(self.device)?;
+            let _ = self.stream.set(stream);
+        }
+        Ok(self.stream.get().expect("initialized standalone stream"))
+    }
+    pub(crate) fn drain(&self) -> Result<()> {
+        self.stream.get().map_or(Ok(()), device::Stream::drain)
+    }
+    pub(crate) fn require_complete(&self) -> Result<()> {
+        if let Some(stream) = self.stream.get() {
+            anyhow::ensure!(stream.ready()?, "standalone component stream is unfinished");
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct LoadStream<'a> {
     pub(crate) library: &'a NativeLibrary,
     pub(crate) raw: *mut c_void,

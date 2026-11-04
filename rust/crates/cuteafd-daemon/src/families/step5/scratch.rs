@@ -20,22 +20,14 @@ impl BufferOwner for Plane<'_> {
 }
 
 #[derive(Clone)]
-pub(super) struct Arena<'a>(Rc<Allocation<'a>>, Rc<Stream<'a>>);
+pub(super) struct Arena<'a>(Rc<Allocation<'a>>, Rc<crate::shared::memory::StandaloneStream<'a>>);
 impl<'a> Arena<'a> {
     pub fn new(device: Device<'a>, bytes: usize) -> Result<Self> {
-        Self::with_stream(device, bytes, Rc::new(Stream::new(device)?))
-    }
-
-    pub(super) fn with_stream(device: Device<'a>, bytes: usize, stream: Rc<Stream<'a>>) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("step5_scratch_workspace");
-        ensure!(device.id == stream.device.id && std::ptr::eq(device.library, stream.device.library),
-            "Step-5 arena stream device mismatch");
-        Ok(Self(Rc::new(Allocation::new(device, bytes)?), stream))
+        Ok(Self(Rc::new(Allocation::new(device, bytes)?), Rc::new(crate::shared::memory::StandaloneStream::new(device))))
     }
 
-    /// Staging creates the serving stream; sequential arena users may enqueue.
-    /// Each user retains it through graph destruction and drains before releasing planes.
-    pub(super) fn stream(&self) -> Rc<Stream<'a>> {
+    pub(super) fn standalone(&self) -> Rc<crate::shared::memory::StandaloneStream<'a>> {
         self.1.clone()
     }
 
@@ -277,4 +269,12 @@ pub(super) fn planes<'a>(device: Device<'a>, sizes: &[usize],
         let owner = Rc::new(Allocation::new(device, bytes)?);
         Ok(Plane { buffer: owner.buffer, _owner: owner })
     }).collect()
+}
+
+/// Arena users share one standalone stream; a separately loaded owner/lane has
+/// its own lazy context. No CUDA stream is created while serving owners load.
+pub(super) fn standalone<'a>(device: Device<'a>, arena: Option<(&Arena<'a>, usize)>)
+    -> Rc<crate::shared::memory::StandaloneStream<'a>> {
+    arena.map_or_else(|| Rc::new(crate::shared::memory::StandaloneStream::new(device)),
+        |(arena, _)| arena.standalone())
 }

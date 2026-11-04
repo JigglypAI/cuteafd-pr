@@ -189,7 +189,7 @@ struct CsaWeights<'a> {
 
 pub(super) struct CsaLayer<'a> {
     // Drain the complete staged branch before any pointer owner retires.
-    stream: std::rc::Rc<Stream<'a>>,
+    stream: std::rc::Rc<crate::shared::memory::StandaloneStream<'a>>,
     ffn: Option<DenseFfn<'a>>,
     planes: Vec<Plane<'a>>,
     native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
@@ -556,10 +556,7 @@ impl<'a> CsaLayer<'a> {
     fn workspace(device: Device<'a>, admission: Admission,
         immutable: std::rc::Rc<CsaWeights<'a>>, ffn: Option<DenseFfn<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
         let planes = scratch::planes(device, &admission.planes, arena)?;
-        // Arena components share Staging's persistent stream; standalone owners
-        // create a private stream. The retained Rc outlives captured graphs.
-        let stream = match arena { Some((arena, _)) => arena.stream(),
-            None => std::rc::Rc::new(Stream::new(device)?) };
+        let stream = scratch::standalone(device, arena);
         let rows = admission.rows;
         let owner = Self { stream, ffn, planes, native_scratch: None, admission, immutable };
         if arena.is_none() {
@@ -599,7 +596,7 @@ impl<'a> CsaLayer<'a> {
         self.planes[plane].buffer.ptr.wrapping_byte_add(offset)
     }
     fn launch(&self, stage: usize, pointers: &[*mut c_void], scalars: &[Scalar]) -> Result<()> {
-        self.launch_on(&self.stream, stage, pointers, scalars)
+        self.launch_on(self.stream.get()?, stage, pointers, scalars)
     }
     fn launch_on(
         &self,
@@ -636,7 +633,7 @@ impl<'a> CsaLayer<'a> {
             width,
             indexer,
             self.planes[POSITIONS].buffer,
-            &self.stream,
+            self.stream.get()?,
         )
     }
     fn norm_on(
@@ -682,7 +679,7 @@ impl<'a> CsaLayer<'a> {
             rows > 0 && rows <= self.admission.rows && query_start < rows,
             "CSA live row range"
         );
-        self.project_on(rows, self.planes[POSITIONS].buffer, &self.stream)?;
+        self.project_on(rows, self.planes[POSITIONS].buffer, self.stream.get()?)?;
         self.compress(rows)?;
         for start in (query_start..rows).step_by(TILE) {
             let count = (rows - start).min(TILE);
@@ -690,7 +687,7 @@ impl<'a> CsaLayer<'a> {
             self.attend(start, count)?;
             self.finish(start, count)?;
         }
-        self.finish_dense_on(query_start, rows - query_start, &self.stream)
+        self.finish_dense_on(query_start, rows - query_start, self.stream.get()?)
     }
     pub(super) fn project_on(
         &self,
@@ -934,7 +931,7 @@ impl<'a> CsaLayer<'a> {
             self.planes[POSITIONS].buffer,
             self.planes[REQUESTS].buffer,
             self.planes[SUMMARY].buffer,
-            &self.stream,
+            self.stream.get()?,
         )
     }
     fn score_select_on(
@@ -975,7 +972,7 @@ impl<'a> CsaLayer<'a> {
             rows,
             self.planes[POSITIONS].buffer,
             self.planes[REQUESTS].buffer,
-            &self.stream,
+            self.stream.get()?,
         )
     }
     fn select_on(
@@ -1014,7 +1011,7 @@ impl<'a> CsaLayer<'a> {
             self.planes[TABLE].buffer,
             self.admission.pages,
             self.admission.pages,
-            &self.stream,
+            self.stream.get()?,
         )
     }
     fn attend_on(
@@ -1059,7 +1056,7 @@ impl<'a> CsaLayer<'a> {
         )
     }
     fn finish(&self, start: usize, rows: usize) -> Result<()> {
-        self.finish_on(start, rows, &self.stream)
+        self.finish_on(start, rows, self.stream.get()?)
     }
     fn finish_on(&self, start: usize, rows: usize, stream: &Stream<'a>) -> Result<()> {
         let scalar = [Scalar::I32(rows as i32)];
@@ -1430,7 +1427,7 @@ mod tests {
         pool.borrow_mut().release(&family, &placement.pages)?;
         let lane = chain.new_lane()?;
         ensure!(std::rc::Rc::ptr_eq(&chain.immutable, &lane.immutable)
-            && chain.stream.raw != lane.stream.raw
+            && chain.stream.get()?.raw != lane.stream.get()?.raw
             && chain.planes.iter().zip(&lane.planes).all(|(a, b)|
                 a.buffer.ptr != b.buffer.ptr && a.buffer.bytes == b.buffer.bytes),
             "Step-5 lane must share immutable storage and isolate every stream/plane");
@@ -1652,22 +1649,22 @@ mod tests {
             let eager_scores = score_bytes(&chain, last_count, (rows / 8).max(1))?;
             device.run(|| {
                 // SAFETY: the stream is idle and the complete owner is pinned below.
-                unsafe { library.cuda_graph_begin_capture(chain.stream.raw) }
+                unsafe { library.cuda_graph_begin_capture(chain.stream.get()?.raw) }
             })?;
             let enqueue = chain.enqueue(rows, start);
             let raw = device.run(|| {
                 // SAFETY: end capture even when the enqueue returns an error.
-                unsafe { library.cuda_graph_end_capture(chain.stream.raw) }
+                unsafe { library.cuda_graph_end_capture(chain.stream.get()?.raw) }
             })?;
             // SAFETY: the mutable borrow pins every stream, weight, table and workspace.
             let graph = unsafe {
                 crate::shared::decode_graph::GraphOwner::new(&library, device.id, raw, &mut chain)?
             };
             enqueue?;
-            let mut guard = graph.pins.stream.cancellation_guard("CSA graph replay");
+            let mut guard = graph.pins.stream.get()?.cancellation_guard("CSA graph replay");
             device.run(|| {
                 // SAFETY: the graph's borrowed owner remains live through the stream drain.
-                unsafe { library.cuda_graph_launch(graph.raw, graph.pins.stream.raw) }
+                unsafe { library.cuda_graph_launch(graph.raw, graph.pins.stream.get()?.raw) }
             })?;
             graph.pins.stream.drain()?;
             guard.complete = true;
@@ -1877,7 +1874,7 @@ mod tests {
                             chain.ptr(POST, start * H * 4),
                         ],
                         &[Scalar::I32(count as i32)],
-                        chain.stream.raw,
+                        chain.stream.get()?.raw,
                     )
                 }
             })?;
@@ -1894,6 +1891,7 @@ mod tests {
 
 impl Drop for CsaLayer<'_> {
     fn drop(&mut self) {
-        self.stream.drain_or_abort("Step-5 csa workspace");
+        // The arena retains the lazy stream beyond this owner's planes; drain first.
+        crate::shared::decode_graph::fatal_drain(self.stream.drain(), "Step-5 csa standalone");
     }
 }
