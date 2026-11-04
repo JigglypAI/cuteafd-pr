@@ -5,6 +5,74 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// #1183: idle CE throughput at the actual Muse 2752-row reply size. No
+/// network/model is involved; this is a prerequisite, not an overlap claim.
+#[test]
+#[ignore = "requires one idle GPU and CUTEAFD_PLANE_UPLOAD_LIBRARY; run alone (--exact)"]
+fn gpu_reply_copy_engine_bandwidth() -> Result<()> {
+    use crate::shared::memory::{DeviceAllocation, device::{Device, Event, Stream}};
+    const BYTES: usize = 304_349_184;
+    const RANKS: usize = 6;
+    let path = library_path()?;
+    // SAFETY: the opt-in path names the matching built native library.
+    let library = unsafe { NativeLibrary::load(&path)? };
+    library.cuda_set_device(0)?;
+    let device = Device { library: &library, id: 0 };
+    let mut host = HostAllocation::new(&library, BYTES)?;
+    for (i, byte) in host.bytes_mut().iter_mut().enumerate() { *byte = (i % 251) as u8; }
+    let output = DeviceAllocation::new(&library, BYTES)?;
+    let streams = (0..RANKS).map(|_| Stream::new(device)).collect::<Result<Vec<_>>>()?;
+    let mut start = Event::new(device)?;
+    let mut end = Event::new(device)?;
+    let mut done = (0..RANKS).map(|_| Event::new(device)).collect::<Result<Vec<_>>>()?;
+    for (name, copies, stream_count) in [("one", 1, 1), ("six_serial", RANKS, 1), ("six_streams", RANKS, RANKS)] {
+        let chunk = BYTES / copies;
+        let mut samples = Vec::new();
+        for repeat in 0..6 {
+            start.record(&streams[0])?;
+            for stream in streams.iter().take(stream_count).skip(1) {
+                // SAFETY: start is already recorded for this repeat; all owners survive drainage.
+                unsafe { library.cuda_stream_wait_event(stream.raw, start.raw)?; }
+            }
+            for copy in 0..copies {
+                let offset = copy * chunk;
+                let mut dst = output.buffer;
+                let mut src = host.buffer;
+                // SAFETY: the disjoint slices are within the BYTES-sized live allocations.
+                unsafe {
+                    dst.ptr = dst.ptr.cast::<u8>().add(offset).cast();
+                    src.ptr = src.ptr.cast::<u8>().add(offset).cast();
+                }
+                dst.bytes = chunk;
+                src.bytes = chunk;
+                // SAFETY: immutable pinned source and disjoint device destination outlive all copies.
+                unsafe { library.copy_host_buffers_h2d_batch_async(&[dst], &[src], &[chunk], streams[copy % stream_count].raw)?; }
+            }
+            for index in 1..stream_count {
+                done[index].record(&streams[index])?;
+                // SAFETY: each current completion event is recorded before this fan-in wait.
+                unsafe { library.cuda_stream_wait_event(streams[0].raw, done[index].raw)?; }
+            }
+            end.record(&streams[0])?;
+            streams[0].drain()?;
+            // SAFETY: both timing events completed; fan-in includes every copy stream.
+            let ms = unsafe { library.cuda_event_elapsed_ms(start.raw, end.raw)? };
+            ensure!(ms.is_finite() && ms > 0.0, "invalid CE timing {ms}");
+            if repeat > 0 {
+                let gbps = BYTES as f64 / (ms as f64 * 1e6);
+                samples.push(gbps);
+                eprintln!("reply_ce case={name} bytes={BYTES} copies={copies} streams={stream_count} repeat={repeat} ms={ms:.6} gbps={gbps:.3}");
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        eprintln!("reply_ce case={name} median_gbps={:.3} min_gbps={:.3} max_gbps={:.3}", samples[2], samples[0], samples[4]);
+        let mut actual = vec![0u8; BYTES];
+        library.copy_d2h(&mut actual, output.buffer)?;
+        ensure!(actual == host.bytes(), "CE output differs for {name}");
+    }
+    Ok(())
+}
+
 /// The "GPU": the control words, written by the engine side of the test as
 /// a stream would (staged after copies, consumed after a reduce) and read by
 /// the worker; the worker publishes `landed` here.
