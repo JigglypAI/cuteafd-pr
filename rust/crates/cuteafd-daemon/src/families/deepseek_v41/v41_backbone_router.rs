@@ -986,12 +986,9 @@ impl BackboneRouterWeights<'_> {
 mod host_order_tests {
     use crate::shared::memory::{chain::{self, StageChain}, DeviceAllocation, LoadStream};
     use anyhow::Result;
-    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
-
     #[test]
-    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn host_ordered_passes_wait_once_per_layer_after_issuing_it() -> Result<()> {
-        let fixture = Fixture::build()?;
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
         let library = fixture.load()?;
         fixture.immediate_copies(&library)?;
         fixture.trace_stream_queries(&library)?;

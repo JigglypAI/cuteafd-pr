@@ -336,15 +336,31 @@ impl Drop for LoadStream<'_> {
 }
 
 #[cfg(test)]
+pub(crate) fn cpu_stream_fixture() -> Result<(tempfile::TempDir, cuteafd_ffi::native_library_lifetime_fixture::Fixture)> {
+    use anyhow::Context;
+    let root = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?)
+        .join(".cache/cuteafd/builds");
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let status = std::process::Command::new("python3")
+        .arg(repo.join("scripts/build/assert-build-filesystem.py"))
+        .arg(&root)
+        .status()?;
+    anyhow::ensure!(status.success(), "CPU stream fixture filesystem check failed");
+    std::fs::create_dir_all(&root)?;
+    let directory = tempfile::Builder::new().prefix("cpu-stream-fixture-").tempdir_in(root)?;
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_in(directory.path())?;
+    Ok((directory, fixture))
+}
+
+#[cfg(test)]
 mod load_stream_lifetime_tests {
     use super::*;
     use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
     use std::{future::Future, task::{Context, Poll, Waker}};
 
     #[test]
-    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn standalone_stream_is_lazy_shared_and_drains_without_initializing() -> Result<()> {
-        let fixture = Fixture::build()?;
+        let (_directory, fixture) = cpu_stream_fixture()?;
         let library = fixture.load()?;
         let device = device::Device { library: &library, id: 0 };
         let owner = std::rc::Rc::new(StandaloneStream::new(device));

@@ -130,9 +130,8 @@ mod tests {
     use cuteafd_loader::plan::families::step5::native;
 
     #[test]
-    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn arena_components_share_one_lazy_standalone_stream() -> Result<()> {
-        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
         let library = fixture.load()?;
         let device = Device { library: &library, id: 0 };
         let arena = Arena::new(device, 256)?;
