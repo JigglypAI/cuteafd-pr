@@ -44,6 +44,13 @@ pub struct ResidentWeights(pub u64);
 impl ResidentWeights {
     pub const DEFAULT_LIMIT: Self = Self(80 << 30);
 
+    pub fn check(self, gpu: u8, limit: Self) -> Result<(), PlacementError> {
+        if self.0 > limit.0 {
+            return Err(PlacementError::ResidentWeightLimit { gpu, required: self.0, limit: limit.0 });
+        }
+        Ok(())
+    }
+
     pub fn checked_add(self, other: Self) -> Result<Self, PlacementError> {
         self.0.checked_add(other.0).map(Self)
             .ok_or(PlacementError::Overflow("resident weights"))

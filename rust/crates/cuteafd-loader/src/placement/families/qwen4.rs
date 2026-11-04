@@ -25,6 +25,8 @@ pub fn check_dual_layer_owners(owners: &[usize]) -> anyhow::Result<()> {
 
 pub struct QwenInputs<'a> {
     pub resident_weight_limit: Option<ResidentWeights>,
+    /// Checkpoint owners already charged to the physical baseline.
+    pub loaded_weights: ResidentWeights,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     /// True only when the operator left context automatic.
     pub automatic_context: bool,
@@ -65,6 +67,8 @@ pub fn request(inputs: &QwenInputs<'_>, graph_bytes: u64) -> anyhow::Result<Plac
         .ok_or_else(|| anyhow::anyhow!("Qwen pool overhead overflow"))?;
     let mut fixed = admission.items.iter().map(|&(category, group, bytes)|
         Demand::new(0, category, group, bytes, Basis::Formula)).collect::<Vec<_>>();
+    fixed.push(Demand::new(0, Category::Weights, "loaded checkpoint owners", 0, Basis::Exact)
+        .with_resident_weights(inputs.loaded_weights));
     fixed.push(Demand::new(0, Category::Runtime, "startup graphs", graph_bytes, Basis::Formula));
     if inputs.spark_ranks > 0 && matches!(inputs.baseline, Baseline::Planned { .. }) {
         // Runtime creates SparkLink before sampling free memory. Only the
@@ -124,6 +128,50 @@ pub fn placement(inputs: &QwenInputs<'_>) -> anyhow::Result<Placement> {
         result.items[0].retain(|i| i.group != "startup graphs");
         result.items[0].extend(graphs.items(0));
         Ok::<_, anyhow::Error>((result.pool_tokens, (), result))
+    })
+}
+
+/// Checkpoint owners on the single target owner; the mapped PLE backing and
+/// the target head borrowed by MTP are not separate device weight owners.
+pub fn single_owner_weights(resident: &crate::families::qwen4::resident::Qwen4CheckpointResident,
+    host_embedding: bool, ple: bool) -> Result<ResidentWeights, PlacementError> {
+    [resident.target_bytes, resident.head_bytes, resident.mtp_bytes,
+        if host_embedding { 0 } else { resident.embedding_bytes }, if ple { 256 } else { 0 }]
+        .into_iter().try_fold(ResidentWeights::default(), |sum, bytes|
+            sum.checked_add(ResidentWeights(bytes)))
+}
+
+/// Native TP1 arenas selected by the single-owner executor. Package scratch
+/// and conversion staging are independent storage, not checkpoint weights.
+pub fn single_expert_weights(catalog: &crate::OfficialV41Catalog, layers: usize,
+    local: bool, mtp: bool) -> anyhow::Result<ResidentWeights> {
+    use crate::formats::fp8_experts::{Fp8Projection, Slicing};
+    use crate::V41Exl3Layer;
+    let shape = catalog.routed_experts();
+    let mut selections = (shape.first_layer..if local { layers } else { shape.first_layer })
+        .map(V41Exl3Layer::Backbone)
+        .chain((0..usize::from(mtp)).map(V41Exl3Layer::Dspark));
+    selections.try_fold(ResidentWeights::default(), |sum, selection| {
+        let bytes = if let Some(exl3) = catalog.exl3() {
+            exl3.residency(selection, 1, 0)?.device_arena_layout()?.1 as u64
+        } else {
+            let layer = match selection {
+                V41Exl3Layer::Backbone(layer) => layer,
+                V41Exl3Layer::Dspark(stage) => shape.layers + stage,
+            };
+            let tensors = catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen expert headers unavailable"))?
+                .for_layer(layer)?.for_coordinator();
+            tensors.validate_layer(layer)?;
+            Fp8Projection::ALL.iter().try_fold(0u64, |sum, &projection| {
+                let (weights, _) = tensors.slice_bytes_with(projection, 1, 0, Slicing::Padded)?;
+                let scales = tensors.scale_region_bytes_with(projection, 1, 0, Slicing::Padded)?;
+                (weights as u64).checked_mul(shape.experts as u64)
+                    .and_then(|bytes| bytes.checked_add(scales as u64))
+                    .and_then(|bytes| sum.checked_add(bytes))
+                    .ok_or_else(|| anyhow::anyhow!("Qwen expert residency overflow"))
+            })?
+        };
+        Ok(sum.checked_add(ResidentWeights(bytes))?)
     })
 }
 
@@ -627,6 +675,7 @@ mod tests {
             ple_table_bytes: 1 << 30, ..Default::default() };
         let extra = dual_ple_demands(&cfg, 4, &resident).unwrap();
         let inputs = QwenInputs {
+        loaded_weights: Default::default(),
         resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
             admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false, kv_format: Qwen4KvCache::Bf16,
                 manifest: None, prefill_rows: 4096, slots: 16, mark_bytes: 0, full_prefill_logits: 0,
@@ -1000,6 +1049,7 @@ mod tests {
                     let context = requested.unwrap_or(131072).min(131072);
                     let context_bytes = 586_416_128;
                     let inputs = |baseline| QwenInputs {
+        loaded_weights: Default::default(),
         resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
                         admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp, kv_format, manifest: None,
                             prefill_rows: 4096, slots: 16, mark_bytes: 256 << 20, full_prefill_logits: 0,
@@ -1039,6 +1089,7 @@ mod tests {
         for shape in [None, Some(crate::serving_capacity::PrefillShape { unit_rows: 2048, waves: 2 }),
             Some(crate::serving_capacity::PrefillShape { unit_rows: 4096, waves: 2 })] {
             let inputs = |baseline| QwenInputs {
+        loaded_weights: Default::default(),
         resident_weight_limit: None, spark_reply_format: format, automatic_context: false,
                 admission: QwenAdmissionInputs { prefill_shape: shape, cfg: &cfg, layers: 48, mtp: false,
                     kv_format: Qwen4KvCache::Fp8, manifest: None,
@@ -1082,6 +1133,7 @@ mod tests {
         for (mtp, kv_format) in [false, true].into_iter().flat_map(|mtp|
             [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].map(|format| (mtp, format))) {
             let inputs = QwenInputs {
+        loaded_weights: Default::default(),
         resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
                 admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp, kv_format, manifest: None,
                     prefill_rows: 4096, slots: 16, mark_bytes: 256 << 20, full_prefill_logits: 0,

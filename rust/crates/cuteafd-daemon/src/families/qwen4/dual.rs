@@ -48,6 +48,7 @@ impl Opened {
         let experts = admission::dual_experts(args, catalog, layers)?;
         let weights = admission::dual_weights(args, &self.checkpoint, &self.cfg, layers, mtp)?;
         let mut fixed = weights.fixed;
+        fixed.extend(admission::loaded_media_weights(&[args.device, peer], args.planner_media_weights)?);
         fixed.extend(experts.transport);
         fixed.extend(qwen4::dual_peer_diagnostics(
             std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1")));

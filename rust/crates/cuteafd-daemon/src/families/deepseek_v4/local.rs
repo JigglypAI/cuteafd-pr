@@ -73,6 +73,7 @@ pub(crate) struct LocalExperts<'a> {
     pub output: DeviceAllocation<'a>,
     topk: usize,
     device: i32,
+    resident_weights: usize,
 }
 
 /// Admission for complete local layers, using the same package and weight
@@ -81,6 +82,7 @@ pub(crate) struct LocalExperts<'a> {
 pub(crate) struct LocalPlan {
     pub layers: Vec<usize>,
     pub peak_bytes: usize,
+    pub resident_weights: usize,
 }
 
 /// Policy setup may precede a lazy window's first execution. Install through
@@ -159,7 +161,7 @@ pub(crate) fn plan(library: &NativeLibrary, native_lib: &Path, catalog: &Officia
     draft_stages: usize, backbone: &[usize], max_rows: usize, budget: usize) -> Result<LocalPlan> {
     let shape = *catalog.routed_experts();
     validate_backbone(backbone, shape.first_layer, shape.layers)?;
-    let empty = || LocalPlan { layers: Vec::new(), peak_bytes: 0 };
+    let empty = || LocalPlan { layers: Vec::new(), peak_bytes: 0, resident_weights: 0 };
     if backbone.is_empty() && draft_stages == 0 { return Ok(empty()); }
     let capacities = capacities(max_rows);
     let workspace = if let Some(manifest) = catalog.exl3() {
@@ -202,10 +204,14 @@ pub(crate) fn plan(library: &NativeLibrary, native_lib: &Path, catalog: &Officia
         resident = resident.checked_add(weights.resident_bytes).context("local expert resident overflow")?;
         layers.push(layer);
     }
-    Ok(if layers.is_empty() && draft_stages == 0 { empty() } else { LocalPlan { layers, peak_bytes: peak } })
+    Ok(if layers.is_empty() && draft_stages == 0 { empty() } else {
+        LocalPlan { layers, peak_bytes: peak, resident_weights: resident - workspace }
+    })
 }
 
 impl<'a> LocalExperts<'a> {
+    pub fn resident_weights(&self) -> usize { self.resident_weights }
+
     /// Loads draft stages first, then an exact ordered backbone inventory while
     /// complete layers fit. Callers validate the returned inventory against admission.
     #[allow(clippy::too_many_arguments)]
@@ -281,7 +287,10 @@ impl<'a> LocalExperts<'a> {
                 library.cuda_stream_synchronize(stream)?;
             }
         }
+        let resident_weights = layers.iter().chain(&stages).try_fold(0usize, |sum, weights|
+            sum.checked_add(weights.budget().resident_bytes).context("local expert resident weights overflow"))?;
         Ok(Some(Self {
+            resident_weights,
             backend: Backend::Native { ids: backbone[..layers.len()].to_vec(), layers, stages, states, reduction_plan, _scratch: scratch },
             reducer: library.v41_local_expert_reducer()?,
             output: DeviceAllocation::new(library, max_rows * shape.hidden * 2)?,
@@ -359,6 +368,8 @@ impl<'a> LocalExperts<'a> {
         }).collect::<Result<Vec<_>>>()?;
         let output_bytes = max_rows * shape.hidden * 2;
         let reduction_plan = Exl3ReductionPlan::new(&directories)?;
+        let resident_weights = weights.iter().try_fold(0usize, |sum, weight|
+            sum.checked_add(weight.resident_bytes()).context("EXL3 resident weights overflow"))?;
         let weights = Rc::new(weights);
         let arena = Exl3Workspace::new(library, &directories, Exl3Epilogue::Sum)?;
         let mut executions = Vec::with_capacity(capacities.len());
@@ -375,6 +386,7 @@ impl<'a> LocalExperts<'a> {
             executions.push(execution);
         }
         Ok(Some(Self {
+            resident_weights,
             backend: Backend::Exl3 { executions, row_policy, reduction_plan, stages, layers },
             reducer: library.v41_local_expert_reducer()?,
             output: DeviceAllocation::new(library, output_bytes)?,

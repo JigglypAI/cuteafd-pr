@@ -65,6 +65,9 @@ pub(crate) struct EngineArgs {
     /// Resolve the serving host quota once the final pool and context are known.
     #[arg(skip)]
     pub planner_host_prefix: Option<(crate::shared::prefix::PrefixArgs, usize)>,
+    /// Actual local encoder checkpoint weights, keyed by physical CUDA ordinal.
+    #[arg(skip)]
+    pub planner_media_weights: Option<(i32, cuteafd_loader::placement::ResidentWeights)>,
     /// Sequences with GDN/PLE state (about 115 MiB each).
     #[arg(long, default_value_t = 8)]
     pub slots: usize,
@@ -623,6 +626,7 @@ impl Opened {
             dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)) };
         let source = self.embed_source()?;
         let with_mtp = args.mtp > 0 && layers == self.cfg.layers;
+        let admitted_target = admission::single_weights(args, &self.checkpoint, &self.cfg, layers, with_mtp)?;
         // The coordinator's dense records push in a group of this GPU alone when
         // the checkpoint is SparkNest's; records are planned from headers first,
         // and any failure loads them through the mount.
@@ -675,8 +679,7 @@ impl Opened {
         }
         tracing::info!(plan_rows = attention_plan.rows(), active_drafts = ?attention_plan.active_drafts(),
             "Qwen immutable attention reduction plan from loaded MTP");
-        let resident: usize = model.layers.iter().map(weights::Qwen4Layer::bytes).sum::<usize>()
-            + model.mtp.as_ref().map_or(0, weights::MtpWeights::bytes) + model.head.bytes();
+        let resident = model.bytes();
         // One resident representation per selectable weight, as the plan accounts for it.
         let (projections, head) = model.check_single_residency(args.fp8_decode, args.mtp_fp8_head)?;
         let selection = cuteafd_loader::families::qwen4::resident::Qwen4Representation {
@@ -698,9 +701,22 @@ impl Opened {
                 engine::DECODE_ROWS)?),
             _ => None,
         };
+        use cuteafd_loader::placement::ResidentWeights;
+        let mut loaded_weights = ResidentWeights(resident as u64)
+            .checked_add(ResidentWeights(embedding.device_bytes() as u64))?
+            .checked_add(ResidentWeights(ple.as_ref().map_or(0, |p| p.scale.buffer.bytes as u64)))?;
+        if let Some((gpu, weights)) = args.planner_media_weights {
+            if gpu == args.device { loaded_weights = loaded_weights.checked_add(weights)?; }
+            else { weights.check(0, crate::shared::memory::budget::resident_weight_limit())?; }
+        }
+        ensure!(loaded_weights == admitted_target,
+            "Qwen checkpoint weight owners differ from the pre-upload admission: {} != {} bytes",
+            loaded_weights.0, admitted_target.0);
+        loaded_weights.check(0, crate::shared::memory::budget::resident_weight_limit())?;
         // Establish expert ownership before admission. EXL3 keeps its existing
         // lazy first-use load; reserve the exact loader plan before sizing KV.
         let mut future_expert_bytes = 0;
+        let mut expert_weights = ResidentWeights::default();
         let startup_admission = args.planner_graph_modes.is_some() && engine::startup_graphs_enabled(
             std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
             std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());
@@ -708,7 +724,7 @@ impl Opened {
         let admitted_experts = if budget_admission {
             ensure!(args.shared_only || self.fp8().is_none() || args.expert_window.is_none(),
                 "Qwen automatic KV admission does not support diagnostic --expert-window paging; use a fixed pool or Sparks");
-            let experts = self.experts(args, layers, stream)?;
+            let experts = self.experts(args, layers, stream, loaded_weights)?;
             if let Some(engine::Experts::LocalExl3(local)) = &experts {
                 ensure!(local.window >= layers,
                     "Qwen automatic KV admission requires all EXL3 backbone experts resident; use --exl3-window at least {layers}, a fixed pool, or Sparks");
@@ -718,16 +734,22 @@ impl Opened {
                 ensure!(plan.layers == expected,
                     "Qwen automatic KV admission requires the complete requested EXL3 expert window to fit");
                 future_expert_bytes = u64::try_from(plan.peak_bytes)?;
+                expert_weights = ResidentWeights(plan.resident_weights as u64);
                 tracing::info!(layers=?plan.layers, peak_bytes=plan.peak_bytes,
                     "Qwen planner reserved the lazy EXL3 expert window");
             }
+            if !matches!(&experts, Some(engine::Experts::LocalExl3(_))) {
+                expert_weights = admission::expert_weights(experts.as_ref())?;
+            }
             Some(experts)
         } else { None };
+        let admitted_weights = loaded_weights.checked_add(expert_weights)?;
+        admitted_weights.check(0, crate::shared::memory::budget::resident_weight_limit())?;
         let pool_tokens = if budget_admission {
             let source = admission::ExpertSource::selected(admitted_experts.as_ref().and_then(Option::as_ref))?;
             admission::pool_tokens(&self.library, args, &admission::inputs(args, &self.cfg, layers, model.mtp.is_some(),
                 manifest_json.as_ref(), ple.as_ref().map(|p| (p.row_bytes as u64, p.fp8)),
-                future_expert_bytes)?, source, automatic_context)?
+                future_expert_bytes)?, source, automatic_context, admitted_weights)?
         } else { args.pool_tokens };
         let max_context = crate::shared::context::pool_context("qwen4", args.max_context, automatic_context, pool_tokens, 256)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
@@ -738,7 +760,10 @@ impl Opened {
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
         if args.planner_graph_modes.is_some() { engine.enable_startup_graphs(); }
         engine.w8a8_prefill = args.fp8_prefill_w8a8;
-        if let Some(experts) = match admitted_experts { Some(experts) => experts, None => self.experts(args, layers, stream)? } {
+        if let Some(experts) = match admitted_experts { Some(experts) => experts,
+            None => self.experts(args, layers, stream, loaded_weights)? } {
+            loaded_weights.checked_add(admission::expert_weights(Some(&experts))?)?
+                .check(0, crate::shared::memory::budget::resident_weight_limit())?;
             // Local EXL3 experts load their first window by push when the
             // checkpoint is SparkNest's (a group of this GPU alone), else lazily.
             if let engine::Experts::LocalExl3(local) = &experts {
@@ -760,8 +785,8 @@ impl Opened {
         result
     }
 
-    fn experts<'s>(&'s self, args: &EngineArgs, layers: usize, stream: *mut std::ffi::c_void)
-        -> Result<Option<engine::Experts<'s>>> {
+    fn experts<'s>(&'s self, args: &EngineArgs, layers: usize, stream: *mut std::ffi::c_void,
+        base_weights: cuteafd_loader::placement::ResidentWeights) -> Result<Option<engine::Experts<'s>>> {
         if args.mtp > 0 && layers == self.cfg.layers
             && self.checkpoint.module_numerics("mtp.layers.0.mlp.experts.0.gate_proj")?
                 == cuteafd_loader::plan::checkpoint::ModuleNumerics::W8A8 {
@@ -782,6 +807,15 @@ impl Opened {
                 0..layers + usize::from(mtp && !mixed_mtp)
             };
             let layer_ids: Vec<_> = resident.collect();
+            let mut weight_bytes = layer_ids.iter().try_fold(base_weights, |sum, &layer| {
+                let bytes = crate::shared::experts::fp8::Fp8Layer::bytes(&tensors.for_layer(layer)?, 1)?;
+                Ok::<_, anyhow::Error>(sum.checked_add(cuteafd_loader::placement::ResidentWeights(bytes as u64))?)
+            })?;
+            if mixed_mtp {
+                weight_bytes = weight_bytes.checked_add(cuteafd_loader::placement::ResidentWeights(
+                    crate::shared::experts::fp8::Fp8Layer::bytes(&tensors.for_layer(layers)?, 1)? as u64))?;
+            }
+            weight_bytes.check(0, crate::shared::memory::budget::resident_weight_limit())?;
             let started = Instant::now();
             let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, &layer_ids, 1, 0,
                 args.prefill_rows, free.saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30)))
@@ -804,7 +838,7 @@ impl Opened {
                 "Qwen routed experts resident on this GPU");
             return Ok(Some(engine::Experts::Local(engine::LocalExperts {
                 library: &self.library, tensors, experts: std::cell::RefCell::new(experts), mtp_experts,
-                window: args.expert_window, loads: std::cell::RefCell::new(loads),
+                base_weights, window: args.expert_window, loads: std::cell::RefCell::new(loads),
             })));
         }
         if let Some(catalog) = self.experts.as_ref().filter(|c| args.local_experts && c.exl3().is_some()) {
@@ -814,11 +848,22 @@ impl Opened {
                 resident: std::cell::RefCell::new(None), window: args.exl3_window.max(1), layers,
                 mtp: args.mtp > 0 && layers == self.cfg.layers,
                 max_rows: args.prefill_rows,
-                budget: free.saturating_sub(args.expert_reserve_gib << 30), loads: std::cell::RefCell::new(0),
+                budget: free.saturating_sub(args.expert_reserve_gib << 30), base_weights,
+                loads: std::cell::RefCell::new(0),
             })));
         }
         let Some(peers) = args.peers.as_deref() else { return Ok(None) };
         let mtp = if args.mtp > 0 && layers == self.cfg.layers {
+            let catalog = self.experts.as_ref().context("Qwen local MTP expert catalog")?;
+            let resident = if catalog.exl3().is_some() {
+                crate::shared::experts::exl3::Exl3Weights::plan(catalog,
+                    crate::shared::experts::layer::ExpertLayer::Dspark { stage: 0 })?.resident_bytes
+            } else {
+                crate::shared::experts::fp8::Fp8Layer::bytes(
+                    &catalog.fp8().context("Qwen MTP native headers")?.for_layer(layers)?, 1)?
+            };
+            base_weights.checked_add(cuteafd_loader::placement::ResidentWeights(resident as u64))?
+                .check(0, crate::shared::memory::budget::resident_weight_limit())?;
             Some(self.spark_mtp_experts(args, layers, stream)?)
         } else { None };
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;

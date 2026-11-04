@@ -770,9 +770,7 @@ fn conditional_movable(request: &PlacementRequest, movable: &Movable, available:
 
 fn check_resident_weights(request: &PlacementRequest, gpu: usize, weights: ResidentWeights) -> Result<(), PlacementError> {
     if let Some(limit) = request.resident_weight_limit {
-        if weights.0 > limit.0 {
-            return Err(PlacementError::ResidentWeightLimit { gpu: gpu as u8, required: weights.0, limit: limit.0 });
-        }
+        weights.check(gpu as u8, limit)?;
     }
     Ok(())
 }
