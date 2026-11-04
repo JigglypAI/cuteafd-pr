@@ -308,7 +308,7 @@ mod tests {
             layers: 2, first_layer: 0, experts: 1, topk: 8, hidden: 4096, intermediate: 256,
             draft_stages: 0, draft_experts: 0 })?;
         let info = Fp8MoeInfo { hidden: 4096, intermediate: 256, slice: 128, experts: 1, topk: 8,
-            tp: 2, wire_input: false, swiglu_limit: 0.0,
+            tp: 2, wire_input: false, swiglu_limit: 10.0,
             activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product,
             projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16,
             capacities: vec![1, 16], weights: Fp8MoeWeights::Fp8 };
