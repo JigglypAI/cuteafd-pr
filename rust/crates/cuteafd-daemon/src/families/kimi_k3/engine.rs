@@ -9,10 +9,10 @@ use std::{cell::{Cell, RefCell}, rc::Rc};
 use crate::shared::memory::device::Stream;
 
 struct Lanes<'a> {
-    local: Vec<[LocalLane<'a>; 2]>,
+    local: Vec<Vec<LocalLane<'a>>>,
     routed: Vec<RoutedLane<'a>>,
-    io: Vec<[TokenIo<'a>; 2]>,
-    experts: Vec<[Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>; 2]>,
+    io: Vec<Vec<TokenIo<'a>>>,
+    experts: Vec<Vec<Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>>>,
 }
 
 pub(crate) struct Engine<'a> {
@@ -25,11 +25,12 @@ pub(crate) struct Engine<'a> {
     prefix: RefCell<Option<super::prefix::KimiPrefix<'a>>>,
     startup_captures: Cell<Option<u64>>,
     provisional: RefCell<Option<super::state::Provisional>>,
-    hops: HopLink<'a>,
-    peer: PeerExchange<'a>,
+    hops: Option<HopLink<'a>>,
+    peer: Option<PeerExchange<'a>>,
+    terminal: Cell<TerminalState>,
     // PeerExchange and HopLink borrow raw handles; keep their exact streams
     // after both links and their terminal abort storage have been released.
-    exchange_streams: [Rc<Stream<'a>>; 2],
+    exchange_streams: Vec<Rc<Stream<'a>>>,
     /// Prefill units: the unit and the waves in flight.
     prefill: PrefillUnits,
     packed_row_cap: Cell<Option<usize>>,
@@ -218,7 +219,9 @@ impl<'a> Engine<'a> {
         let routed = local.iter().map(|pair| admission.connect_spark(library, &pair[1],
             world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?;
         let prefill = PrefillUnits { unit_rows: admission.unit_rows(), waves: admission.waves() };
-        let mut engine = Self::bind(exchange_streams, plan, peer, hops, local, routed, io, experts,
+        let mut engine = Self::bind(exchange_streams.into(), plan, Some(peer), Some(hops),
+            local.into_iter().map(Vec::from).collect(), routed, io.into_iter().map(Vec::from).collect(),
+            experts.into_iter().map(Vec::from).collect(),
             prefill, coordinator_packing_cap)?;
         engine.max_pool_tokens_no_onboard = Some(admission.placement.max_pool_tokens_no_onboard);
         engine.draft = draft.map(Rc::new);
@@ -228,40 +231,42 @@ impl<'a> Engine<'a> {
 
     /// Bind only exact owners already allocated through Admission. No device
     /// allocations or program loading occur after this constructor returns.
-    pub(crate) fn bind(exchange_streams: [Rc<Stream<'a>>; 2],
-        plan: LayerExecutionPlan, peer: PeerExchange<'a>, hops: HopLink<'a>,
-        local: Vec<[LocalLane<'a>; 2]>, routed: Vec<RoutedLane<'a>>,
-        io: Vec<[TokenIo<'a>; 2]>,
-        experts: Vec<[Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>; 2]>,
+    pub(crate) fn bind(exchange_streams: Vec<Rc<Stream<'a>>>,
+        plan: LayerExecutionPlan, peer: Option<PeerExchange<'a>>, hops: Option<HopLink<'a>>,
+        local: Vec<Vec<LocalLane<'a>>>, routed: Vec<RoutedLane<'a>>,
+        io: Vec<Vec<TokenIo<'a>>>,
+        experts: Vec<Vec<Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>>>,
         prefill: PrefillUnits, coordinator_packing_cap: usize) -> Result<Self> {
-        // The units in flight fit the lane.
-        ensure!(prefill.waves > 0 && local.iter().all(|pair| pair[0].rows() >= prefill.unit_rows * prefill.waves
-            || prefill.waves == 1), "Kimi lane rows hold fewer than the admitted prefill units in flight");
-        ensure!(!local.is_empty() && local.len() == routed.len() && local.len() == io.len() && local.len() == experts.len(),
-            "Kimi engine local, Spark and IO lane counts differ");
-        check_exchange_streams(&peer, &exchange_streams)?;
-        for (lane, pair) in local.iter().enumerate() {
-            for rank in 0..2 {
-                io[lane][rank].check_lane(&pair[rank], rank)?;
-                ensure!(std::ptr::eq(pair[rank].stream().device.library,
+        ensure!(matches!(exchange_streams.len(), 1 | 2) && !local.is_empty()
+            && local.len() == routed.len() && local.len() == io.len() && local.len() == experts.len(),
+            "Kimi engine physical ranks or local/Spark/IO lane counts differ");
+        ensure!(prefill.waves > 0 && local.iter().all(|ranks| ranks.len() == exchange_streams.len()
+            && ranks.iter().all(|local| local.rows() >= prefill.unit_rows * prefill.waves || prefill.waves == 1)),
+            "Kimi lane holds fewer ranks or rows than admitted");
+        for (lane, ranks) in local.iter().enumerate() {
+            ensure!(io[lane].len() == ranks.len() && experts[lane].len() == ranks.len(),
+                "Kimi lane IO/expert physical rank count differs");
+            for rank in 0..ranks.len() {
+                io[lane][rank].check_lane(&ranks[rank], rank)?;
+                ensure!(std::ptr::eq(ranks[rank].stream().device.library,
                     exchange_streams[rank].device.library), "Kimi local and exchange native libraries differ");
             }
         }
-        let streams = local.iter().map(|pair| pair.each_ref().map(|local| local.stream().clone())).collect();
-        let execution = Execution::new(plan, &peer, &hops, exchange_streams.clone(), streams)?;
+        let streams = local.iter().map(|ranks| ranks.iter().map(|local| local.stream().clone()).collect()).collect();
+        let execution = Execution::new(plan, peer.as_ref(), hops.as_ref(), exchange_streams.clone(), streams)?;
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill.waves, prefill.unit_rows)?;
         Ok(Self { max_pool_tokens_no_onboard: None, depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
             prefix: RefCell::new(None), startup_captures: Cell::new(None), provisional: RefCell::new(None),
-            hops, peer, exchange_streams, prefill, packed_row_cap: Cell::new(None), coordinator_packing_cap })
+            hops, peer, terminal: Cell::new(TerminalState::Active), exchange_streams, prefill, packed_row_cap: Cell::new(None), coordinator_packing_cap })
     }
 
     pub(crate) fn prefix_family(&self) -> Result<super::prefix::KimiPrefix<'a>> {
         let mut prefix = self.prefix.try_borrow_mut()?;
         if let Some(prefix) = prefix.as_ref() { return Ok(prefix.clone()); }
         let lanes = self.lanes.try_borrow()?;
-        let [(kda0, mla0), (kda1, mla1)] = lanes.local[0].each_ref().map(|lane| lane.prefix_banks());
-        let family = super::prefix::KimiPrefix::new(lanes.local[0][0].config(), lanes.local[0][0].max_context(),
-            [kda0, kda1], [mla0, mla1])?.with_draft(self.draft.clone())?;
+        let (kda, mla) = lanes.local[0].iter().map(|lane| lane.prefix_banks()).unzip();
+        let family = super::prefix::KimiPrefix::from_ranks(lanes.local[0][0].config(), lanes.local[0][0].max_context(),
+            kda, mla)?.with_draft(self.draft.clone())?;
         *prefix = Some(family.clone());
         Ok(family)
     }
@@ -342,7 +347,7 @@ impl<'a> Engine<'a> {
             let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
             lanes.io[0][0].embed(&tokens, lanes.local[0][0].buffer("delta")?)?;
             let Lanes { local, routed, io, experts } = &mut *lanes;
-            let normalized = self.execution.run_packed(scope, &self.peer, &self.hops,
+            let normalized = self.execution.run_packed(scope, self.peer.as_ref(), self.hops.as_ref(),
                 &mut local[0], &mut routed[0], &mut experts[0], &metadata, pool, self.draft.as_deref())?;
             drop(metadata);
             for (placement, tokens) in sequences.iter_mut() {
@@ -355,10 +360,10 @@ impl<'a> Engine<'a> {
                     let count = if ALL_ROWS { (segment.rows - offset).min(64) } else { 1 };
                     let input = crate::shared::prefix::view(normalized,
                         (segment.first + offset) * 7168 * 2, count * 7168 * 2)?;
-                    let logits = io[0][1].project(input, count, &local[0][1])?;
+                    let logits = io[0][self.head()].project(input, count, &local[0][self.head()])?;
                     let row = crate::shared::token_io::DeviceLogits { ptr: logits.ptr.cast_const(), rows: count,
-                        vocab: local[0][1].config().vocab_size, stride: local[0][1].config().vocab_size,
-                        stream: local[0][1].stream().raw, greedy: None };
+                        vocab: local[0][self.head()].config().vocab_size, stride: local[0][self.head()].config().vocab_size,
+                        stream: local[0][self.head()].stream().raw, greedy: None };
                     // Consume every diagnostic tile before reusing shared head scratch.
                     if let Err(error) = on_logits(i, offset, row)? { return Ok(Err(error)); }
                 }
@@ -401,16 +406,16 @@ impl<'a> Engine<'a> {
         let homes = cfg.dense.iter().enumerate().map(|(layer, dense)| {
             if *dense { return Ok(LayerHome::Dense); }
             let resident = local[0].as_ref().is_some_and(|rank| rank.layers().contains(&layer));
-            ensure!(resident == local[1].as_ref().is_some_and(|rank| rank.layers().contains(&layer)),
+            ensure!(local.iter().all(|rank| resident == rank.as_ref().is_some_and(|rank| rank.layers().contains(&layer))),
                 "Kimi TP2 draft policy layer homes disagree");
-            let bytes = resource::exl3_slice_bytes(manifest, layer, if resident { 2 } else { lanes.routed[0].world_size()? })?;
+            let bytes = resource::exl3_slice_bytes(manifest, layer, if resident { local.len() } else { lanes.routed[0].world_size()? })?;
             Ok(if resident { LayerHome::Local { slice_bytes: bytes } }
                 else { LayerHome::Remote { slice_bytes: bytes } })
         }).collect::<Result<Vec<_>>>()?;
         resource::geometry_with_grouping(&homes, cfg.experts, cfg.topk, 64, width, 0, |layer, rows| {
             if matches!(homes[layer], LayerHome::Local { .. }) {
                 let group = local[0].as_ref().unwrap().group_rows(rows)?;
-                ensure!(local[1].as_ref().unwrap().group_rows(rows)? == group,
+                ensure!(local.iter().map(|rank| rank.as_ref().unwrap().group_rows(rows)).collect::<Result<Vec<_>>>()?.iter().all(|&rows| rows == group),
                     "Kimi TP2 draft policy grouping disagrees");
                 Ok(group)
             } else { resource::worker_group_rows_for_input(&reports, layer, rows, false) }
@@ -421,12 +426,15 @@ impl<'a> Engine<'a> {
         self.exchange_streams[0].device.library
     }
 
-    pub(crate) fn devices(&self) -> [i32; 2] {
-        self.exchange_streams.each_ref().map(|stream| stream.device.id)
+    fn head(&self) -> usize { self.execution.plan.spec().head_gpu as usize }
+
+    pub(crate) fn devices(&self) -> Vec<i32> {
+        self.exchange_streams.iter().map(|stream| stream.device.id).collect()
     }
 
     pub(crate) fn require_live(&self) -> Result<()> {
-        self.peer.require_live()?;
+        ensure!(self.terminal.get() == TerminalState::Active, "Kimi engine is terminal ({:?})", self.terminal.get());
+        if let Some(peer) = &self.peer { peer.require_live()?; }
         if let Some(draft) = &self.draft { draft.require_live()?; }
         if let Some(startup) = self.startup_captures.get() {
             super::graphs::check_captures(startup, cuteafd_ffi::graph_captures())?;
@@ -497,7 +505,7 @@ impl<'a> Engine<'a> {
         if let Some(draft) = &self.draft { draft.prepare_target()?; }
         let output = submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
             let mut lanes = self.lanes.try_borrow_mut()?;
-            lanes.local[0][1].config().release_geometry()?;
+            lanes.local[0][self.head()].config().release_geometry()?;
             let metadata = sequences.iter().map(|(placement, tokens)| SequenceRows {
                 slot: placement.slot, start: placement.len, rows: tokens.len(), pages: &placement.units,
             }).collect::<Vec<_>>();
@@ -511,12 +519,12 @@ impl<'a> Engine<'a> {
             for binding in &mut local[0] { binding.enable_replay(graphed); }
             let result = if unit_call {
                 let units = self.prefill_units(rows)?;
-                self.execution.run_units(scope, &self.peer, &self.hops, &mut local[0],
+                self.execution.run_units(scope, self.peer.as_ref(), self.hops.as_ref(), &mut local[0],
                     &mut routed[0], &mut experts[0], &units, self.depth.waves, &metadata[0], pool,
                     self.draft.as_deref()).map(|output| vec![output])
             } else {
                 ensure!(rows <= self.prefill.unit_rows, "Kimi {rows}-row multi-sequence step exceeds one prefill unit");
-                self.execution.run(scope, &self.peer, &self.hops,
+                self.execution.run(scope, self.peer.as_ref(), self.hops.as_ref(),
                     &mut local[..1], &mut routed[..1], &mut experts[..1], &[rows], speculative,
                     super::layers::Output::Normalized, self.draft.as_deref(), Some(&self.draft_probe))
             };
@@ -524,10 +532,10 @@ impl<'a> Engine<'a> {
             let normalized = result?[0];
             let input = crate::shared::prefix::view(normalized,
                 (rows - logit_rows) * 7168 * 2, logit_rows * 7168 * 2)?;
-            let logits = io[0][1].project(input, logit_rows, &local[0][1])?;
-            let stream = local[0][1].stream();
+            let logits = io[0][self.head()].project(input, logit_rows, &local[0][self.head()])?;
+            let stream = local[0][self.head()].stream();
             Ok(crate::shared::token_io::DeviceLogits { ptr: logits.ptr.cast_const(), rows: logit_rows,
-                vocab: local[0][1].config().vocab_size, stride: local[0][1].config().vocab_size,
+                vocab: local[0][self.head()].config().vocab_size, stride: local[0][self.head()].config().vocab_size,
                 stream: stream.raw, greedy: None })
         })?;
         // A nested native operator capturing here is a contract violation too.
@@ -589,14 +597,23 @@ impl<'a> Engine<'a> {
     }
 
     fn shutdown(&self) -> Result<()> {
-        if self.peer.terminal_state() == TerminalState::Drained { return Ok(()); }
+        if self.terminal.get() == TerminalState::Drained { return Ok(()); }
         let lanes = self.lanes.try_borrow_mut()?;
         let lanes = RefCell::new(lanes);
         if let Some(draft) = &self.draft { draft.abort()?; }
         let result = teardown(&mut Teardown {
-            abort: || self.peer.publish_abort(),
+            abort: || {
+                self.terminal.set(TerminalState::Aborting);
+                self.peer.as_ref().map_or(Ok(()), PeerExchange::publish_abort)
+            },
             ranks: || {
-                self.peer.drain_compute()?;
+                if let Some(peer) = &self.peer { peer.drain_compute()?; }
+                for stream in &self.exchange_streams {
+                    stream.device.run(|| {
+                        // SAFETY: exchange storage and streams remain owned through this terminal drain.
+                        unsafe { stream.device.library.cuda_stream_synchronize(stream.raw) }
+                    })?;
+                }
                 for pair in &lanes.borrow().local {
                     for local in pair {
                         let stream = local.stream();
@@ -625,7 +642,8 @@ impl<'a> Engine<'a> {
                 Ok(())
             },
             finish: |drained| {
-                self.peer.finish_terminal(drained);
+                self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
+                if let Some(peer) = &self.peer { peer.finish_terminal(drained); }
                 if let Some(draft) = &self.draft { draft.finish_terminal(drained); }
             },
         });
@@ -638,7 +656,7 @@ impl<'a> Engine<'a> {
     pub(crate) fn prefix_residual(&self, tokens: &[u32], pages: &[u32],
         pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Vec<f32>> {
         ensure!(self.provisional.borrow().is_none(), "Kimi diagnostic cannot overwrite pending verify");
-        submit_scoped(|| self.peer.require_live(), || self.shutdown(), |scope| {
+        submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
             let mut lanes = self.lanes.try_borrow_mut()?;
             ensure!(!tokens.is_empty() && tokens.len() <= self.prefill.unit_rows,
                 "Kimi diagnostic prefix has no tokens or exceeds one prefill unit");
@@ -646,10 +664,10 @@ impl<'a> Engine<'a> {
             for local in &mut lanes.local[0] { local.stage_attention(&sequences, pool)?; }
             lanes.io[0][0].embed(tokens, lanes.local[0][0].buffer("delta")?)?;
             let Lanes { local, routed, experts, .. } = &mut *lanes;
-            let outputs = self.execution.run(scope, &self.peer, &self.hops,
+            let outputs = self.execution.run(scope, self.peer.as_ref(), self.hops.as_ref(),
                 &mut local[..1], &mut routed[..1], &mut experts[..1], &[tokens.len()], false,
                 super::layers::Output::Residual, None, None)?;
-            let stream = local[0][1].stream();
+            let stream = local[0][self.head()].stream();
             stream.device.run(|| {
                 // SAFETY: this uncaptured diagnostic retains every operand until
                 // the terminal lane has completed, then downloads its BF16 rows.
@@ -684,9 +702,9 @@ impl<'a> Engine<'a> {
         pool: &cuteafd_engine::prefix::RefPagePool,
         mut consume: impl FnMut(usize, usize, usize, &[f32]) -> Result<()>) -> Result<()> {
         // A truncated inventory has no meaningful model output mix or logits.
-        self.lanes.try_borrow()?.local[0][1].config().release_geometry()?;
+        self.lanes.try_borrow()?.local[0][self.head()].config().release_geometry()?;
         ensure!(self.provisional.borrow().is_none(), "Kimi diagnostic cannot overwrite pending verify");
-        submit_scoped(|| self.peer.require_live(), || self.shutdown(), |scope| {
+        submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
             let mut lanes = self.lanes.try_borrow_mut()?;
             ensure!(!tokens.is_empty() && tokens.len() == sequences.len() && tokens.len() <= lanes.local.len(),
                 "Kimi forward token/sequence lane count");
@@ -705,21 +723,21 @@ impl<'a> Engine<'a> {
             let Lanes { local, routed, io, experts } = &mut *lanes;
             let normalized = if unit_call {
                 let units = self.prefill_units(rows[0])?;
-                vec![self.execution.run_units(scope, &self.peer, &self.hops, &mut local[0],
+                vec![self.execution.run_units(scope, self.peer.as_ref(), self.hops.as_ref(), &mut local[0],
                     &mut routed[0], &mut experts[0], &units, self.depth.waves, &sequences[0][0], pool, None)?]
             } else {
                 ensure!(rows.iter().sum::<usize>() <= self.prefill.unit_rows,
                     "Kimi multi-sequence diagnostic step exceeds one prefill unit");
-                self.execution.run(scope, &self.peer, &self.hops,
+                self.execution.run(scope, self.peer.as_ref(), self.hops.as_ref(),
                     &mut local[..tokens.len()], &mut routed[..tokens.len()], &mut experts[..tokens.len()], &rows, false,
                     super::layers::Output::Normalized, None, None)?
             };
             for (lane, normalized) in normalized.into_iter().enumerate() {
-                let stream = local[lane][1].stream();
+                let stream = local[lane][self.head()].stream();
                 for first in (0..rows[lane]).step_by(64) {
                     let count = (rows[lane] - first).min(64);
                     let input = crate::shared::prefix::view(normalized, first * 7168 * 2, count * 7168 * 2)?;
-                    let logits = io[lane][1].project(input, count, &local[lane][1])?;
+                    let logits = io[lane][self.head()].project(input, count, &local[lane][self.head()])?;
                     let values = stream.device.run(|| {
                         // SAFETY: diagnostic download is outside capture; the
                         // exact lane's head finishes before its logits are reused.

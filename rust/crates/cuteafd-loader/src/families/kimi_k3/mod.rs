@@ -5,6 +5,7 @@ pub mod core;
 pub mod kda;
 pub mod mla;
 pub mod reference;
+pub mod spark;
 pub mod w8;
 pub mod weight_layout;
 

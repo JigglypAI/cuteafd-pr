@@ -178,7 +178,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let spark = SparkBudgetInventory::exl3(&catalog, &working, &endpoints,
             cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                 slot_bytes: rings.slot_bytes, alignment: rings.alignment }, budget,
-            crate::families::kimi_k3::spark_reserve_bytes(admitted.waves, admitted.unit_rows)?)?;
+            crate::families::kimi_k3::spark::reserve_bytes(ranks, admitted.waves, admitted.unit_rows)?)?;
         let manifest = catalog.exl3().ok_or_else(|| anyhow::anyhow!("Kimi TP2 requires EXL3 headers"))?;
         let mut costs = vec![[Bytes2::default(); 2]; cfg.layers];
         for &layer in &working.spark_layers {
@@ -376,6 +376,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
 /// Kimi's typed owners, the same sum its pre-placement reserve charges.
 fn kimi_owners(device: &mut DeviceLayout, working: &SparkWorkingSet, unit_rows: u64, waves: u64) -> anyhow::Result<()> {
     if !working.selected_ranks().contains(&(device.index as usize)) { return Ok(()); }
-    crate::plan::layout::spark_slots::charge_owners(device,
-        &crate::families::kimi_k3::spark_executions(waves, unit_rows)?, crate::families::kimi_k3::spark_owner_bytes)
+    crate::families::kimi_k3::spark::charge(device, working.spark_ranks,
+        &crate::families::kimi_k3::spark_executions(waves, unit_rows)?)
 }

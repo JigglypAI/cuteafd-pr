@@ -100,7 +100,13 @@ impl NativeLaneLayout {
     /// `rows` lane rows hold units of at most `unit` rows; one-unit lanes pass `unit == rows`.
     pub fn new(cfg: &KimiK3Config, rows: usize, unit: usize, max_context: usize,
         scratch: NativeScratch) -> Result<Self> {
+        Self::for_ranks(cfg, rows, unit, max_context, scratch, 2)
+    }
+
+    pub fn for_ranks(cfg: &KimiK3Config, rows: usize, unit: usize, max_context: usize,
+        scratch: NativeScratch, ranks: usize) -> Result<Self> {
         cfg.release_geometry()?;
+        ensure!(matches!(ranks, 1 | 2), "Kimi native lane physical rank count");
         ensure!((1..=LANE_ROWS_MAX).contains(&rows) && (1..=UNIT_ROWS_MAX.min(rows)).contains(&unit)
             && (1..=1_048_576).contains(&max_context), "Kimi lane row/unit/context capacity");
         let mut operands = BTreeMap::new();
@@ -115,7 +121,7 @@ impl NativeLaneLayout {
         for name in ["delta", "normalized", "attention output", "ffn output", "shared output", "routed output", "combined output"] {
             plane(name, &hidden)?;
         }
-        let intermediate = (cfg.dense_intermediate / 2).max(cfg.moe_intermediate * cfg.shared_experts / 2);
+        let intermediate = (cfg.dense_intermediate / ranks).max(cfg.moe_intermediate * cfg.shared_experts / ranks);
         plane("gate-up", &[unit, 2, intermediate, 2])?;
         plane("activated", &[unit, intermediate, 2])?;
         plane("expert combined", &[rows, cfg.latent, 2])?;
@@ -125,7 +131,7 @@ impl NativeLaneLayout {
         plane("expert wire", &[rows, (3584 + 3584 / 32)])?;
         // Phase-arena operands serve one unit's rows. Metadata has one bank
         // per possible call unit (sized below), never rewritten per layer.
-        plane("KDA normalized", &[unit, 48, 128, 2])?;
+        plane("KDA normalized", &[unit, cfg.kda_heads / ranks, cfg.kda_head_dim, 2])?;
         for name in ["KDA slots", "KDA first"] { plane(name, &[unit, 4])?; }
         plane("MLA slots", &[unit, 8])?;
         plane("MLA query", &[unit, cfg.heads, 576, 2])?;
@@ -227,6 +233,11 @@ impl NativeLaneLayout {
 
 impl NativeScratch {
     pub fn from_manifest(manifest: &serde_json::Value) -> Result<Self> {
+        Self::from_manifest_for_ranks(manifest, 2)
+    }
+
+    pub fn from_manifest_for_ranks(manifest: &serde_json::Value, ranks: usize) -> Result<Self> {
+        ensure!(matches!(ranks, 1 | 2), "Kimi native scratch physical rank count");
         let scratch = |name: &str| -> Result<usize> {
             let found = manifest["programs"].as_array().context("Kimi program inventory missing")?
                 .iter().filter(|p| p["name"] == name).collect::<Vec<_>>();
@@ -242,7 +253,8 @@ impl NativeScratch {
                     scratch(&format!("kimik3_mla_output{suffix}_m{rows}"))?]);
             }
         }
-        Self::combine([scratch("kimik3_kda_m64")?, scratch("kimik3_kda_m4096")?], mla)
+        let prefix = if ranks == 1 { "kda_fused_h96" } else { "kimik3_kda" };
+        Self::combine([scratch(&format!("{prefix}_m64"))?, scratch(&format!("{prefix}_m4096"))?], mla)
     }
 }
 
@@ -269,12 +281,17 @@ pub fn graph_rows(verify: usize, capacity: usize) -> Vec<usize> {
 
 pub fn graphs(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
     resident: impl Fn(usize, usize) -> bool) -> Result<GraphSet> {
-    ensure!((1..=2).contains(&lanes) && (1..=UNIT_ROWS_MAX).contains(&capacity)
+    graphs_for_ranks(cfg, lanes, capacity, slots, verify, 2, resident)
+}
+
+pub fn graphs_for_ranks(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
+    ranks: usize, resident: impl Fn(usize, usize) -> bool) -> Result<GraphSet> {
+    ensure!(matches!(ranks, 1 | 2) && (1..=2).contains(&lanes) && (1..=UNIT_ROWS_MAX).contains(&capacity)
         && (1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots) && verify <= 64, "Kimi graph geometry");
-    let mut counts = [0; 2];
+    let mut counts = vec![0; ranks];
     for (rank, count) in counts.iter_mut().enumerate() {
         for rows in graph_rows(verify, capacity) {
-            *count += (3 * cfg.layers + usize::from(rank == 1)) as u64;
+            *count += (3 * cfg.layers + usize::from(rank == ranks - 1)) as u64;
             for layer in 0..cfg.layers {
                 if resident(rank, layer) {
                     if GRAPH_ROWS.contains(&rows) {
@@ -305,10 +322,15 @@ pub fn kda_demands(cfg: &KimiK3Config, slots: usize, marks: usize, lanes: usize,
 
 pub fn kda_demands_for_layers(layers: usize, slots: usize, marks: usize, lanes: usize,
     rank: u8) -> Result<[Demand; 4]> {
+    kda_demands_for_heads(layers, slots, marks, lanes, rank, 48)
+}
+
+pub fn kda_demands_for_heads(layers: usize, slots: usize, marks: usize, lanes: usize,
+    rank: u8, heads: usize) -> Result<[Demand; 4]> {
     ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots) && (1..=2).contains(&lanes)
-        && rank < 2, "Kimi KDA state geometry");
-    let state = 48 * 128 * 128 * 4 + 3 * 3 * 6144 * 2;
-    let replay = 64 * 48 * (3 * 128 * 4 + 4 + 3 * 128 * 2);
+        && rank < 2 && matches!(heads, 48 | 96), "Kimi KDA state geometry");
+    let state = heads * 128 * 128 * 4 + 3 * 3 * heads * 128 * 2;
+    let replay = 64 * heads * (3 * 128 * 4 + 4 + 3 * 128 * 2);
     Ok([(Category::Kv, "Kimi KDA active state", layers * slots * state),
         (Category::Workspace, "Kimi KDA replay", layers * lanes * replay),
         (Category::Prefix, "Kimi exact KDA marks", layers * marks * state),
@@ -317,8 +339,15 @@ pub fn kda_demands_for_layers(layers: usize, slots: usize, marks: usize, lanes: 
 }
 
 pub fn io_extents(vocab: usize, rank: usize, rows: usize, core_head: bool) -> [usize; 3] {
-    if rank == 0 { [rows * 4, 0, 0] }
-    else { [0, rows.min(64) * vocab * 4, if core_head { 0 } else { 4 << 20 }] }
+    io_extents_for_ranks(vocab, rank, rows, core_head, 2).expect("valid pair token IO rank")
+}
+
+pub fn io_extents_for_ranks(vocab: usize, rank: usize, rows: usize, core_head: bool,
+    ranks: usize) -> Result<[usize; 3]> {
+    ensure!(matches!(ranks, 1 | 2) && rank < ranks, "Kimi token IO physical rank count");
+    Ok([if rank == 0 { rows * 4 } else { 0 },
+        if rank == ranks - 1 { rows.min(64) * vocab * 4 } else { 0 },
+        if rank == ranks - 1 && !core_head { 4 << 20 } else { 0 }])
 }
 
 /// Return slots for the prefill units, from every admitted rank: `shape.waves`

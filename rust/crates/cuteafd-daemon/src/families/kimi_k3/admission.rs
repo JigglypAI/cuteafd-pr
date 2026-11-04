@@ -839,7 +839,7 @@ pub(super) mod tests {
             &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 4096, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
             crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
             cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
-            cuteafd_loader::families::kimi_k3::spark_reserve_bytes(2, 4096)?)?;
+            cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, 2, 4096)?)?;
         println!("spark minimum_onboard={} max_four_expert_bytes={}", spark.minimum_rtx_layers()?,
             (0..6).map(|rank| spark.rank_bytes(rank, 4)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap());
         let context = std::env::var("CUTEAFD_KIMI_REPLAY_CONTEXT").ok().map(|v| v.parse::<usize>()).transpose()?.unwrap_or(1 << 20);
@@ -1249,7 +1249,7 @@ pub(super) mod tests {
                 &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
                 cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                     slot_bytes: rings.slot_bytes, alignment: rings.alignment }, spark_bytes,
-                cuteafd_loader::families::kimi_k3::spark_reserve_bytes(waves as u64, unit as u64)?)?;
+                cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, waves as u64, unit as u64)?)?;
             let programs = ProgramSet::from_manifest(&manifest, &["kimik3"]);
             let arch = ArchContext::for_device("sm_120", capacity);
             let mut i = inputs(&cfg);
