@@ -106,6 +106,38 @@ def test_flash_native_published_manifest_reaches_plan_coordinator_and_workers(tm
         assert "--exlr8-prefill-activations a16" in line
 
 
+@pytest.mark.parametrize("attention", ["auto", "heads", "context"])
+@pytest.mark.parametrize("wip", [False, True])
+def test_flash_native_tp2_without_sparks_leaves_attention_to_planner(tmp_path, attention, wip):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    keys = ("EXLR8_MANIFEST=k4\nEXLR8_PREFILL_ACTIVATIONS=a16\nSPARK_COUNT=0\nRTX_GPUS=2\n"
+            "COORDINATOR_GPUS=0,1\nEXPERT_BACKEND=local\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+            f"ATTENTION_PLACEMENT={attention}\n")
+    result = _family_launch_result(tmp_path, config, "test/flash-exlr8-tp2", keys,
+                                  extra_args=("--wip", "native-test") if wip else ())
+    assert result.returncode == 0, result.stderr
+    plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
+    coordinators = [line for line in result.stderr.splitlines() if "cuteafd serve-glmf --snapshot" in line]
+    assert plans and coordinators, result.stderr
+    assert not any("cuteafd expertd-native" in line for line in result.stderr.splitlines())
+    for line in plans:
+        argv = shlex.split(line)
+        assert argv[argv.index("--attention-placement") + 1] == attention
+    assert f"CUTEAFD_ATTENTION_PLACEMENT={attention}" in coordinators[0]
+    assert "--split-device 1" in coordinators[0]
+
+
+def test_glm_native_without_sparks_still_refuses(tmp_path):
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    keys = ("EXLR8_MANIFEST=up1\nSPARK_COUNT=0\nRTX_GPUS=2\nCOORDINATOR_GPUS=0,1\n"
+            "EXPERT_BACKEND=local\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    result = _family_launch_result(tmp_path, config, "test/glm-exlr8-local", keys)
+    assert result.returncode != 0
+    assert "EXLR8 requires 1..2 RTX GPUs and 1..8 canonical Spark ranks" in result.stderr
+
+
 @pytest.mark.parametrize("manifest", ["../k4", "k4.json", "k4/other", "k4;false", "k4 space"])
 def test_native_manifest_rejects_paths_and_shell_syntax(tmp_path, manifest):
     config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}

@@ -1925,11 +1925,15 @@ exlr8_plan_args=()
 if [[ -n "$exlr8_manifest" ]]; then
   [[ "$exlr8_manifest" != *[!a-zA-Z0-9_-]* ]] || release_die "EXLR8_MANIFEST must be a published name, not a path"
   exlr8_gpu_count="$(get RTX_GPUS 1)"
-  [[ ( "$exlr8_gpu_count" == 1 || "$exlr8_gpu_count" == 2 ) && "$ranks" -ge 1 && "$ranks" -le 8 ]] || release_die "EXLR8 requires 1..2 RTX GPUs and 1..8 canonical Spark ranks"
+  [[ ( "$exlr8_gpu_count" == 1 || "$exlr8_gpu_count" == 2 ) &&
+     ( ( "$ranks" -ge 1 && "$ranks" -le 8 ) ||
+       ( "$family" == glm5_flash && "$exlr8_gpu_count" == 2 && "$ranks" == 0 ) ) ]] || release_die "EXLR8 requires 1..2 RTX GPUs and 1..8 canonical Spark ranks (Flash TP2 also supports 0 Sparks)"
   [[ "$(get SPECULATOR dflash2)" == off || "$(get SPECULATOR dflash2)" == dflash2 ]] || release_die "EXLR8 supports SPECULATOR=off or dflash2"
-  exlr8_attention=heads
-  [[ "$exlr8_gpu_count" != 2 ]] || exlr8_attention=context
-  [[ "$attention_placement" == auto || "$attention_placement" == "$exlr8_attention" ]] || release_die "EXLR8 requires $exlr8_attention attention for $exlr8_gpu_count RTX GPUs"
+  if [[ "$family" != glm5_flash ]]; then
+    exlr8_attention=heads
+    [[ "$exlr8_gpu_count" != 2 ]] || exlr8_attention=context
+    [[ "$attention_placement" == auto || "$attention_placement" == "$exlr8_attention" ]] || release_die "EXLR8 requires $exlr8_attention attention for $exlr8_gpu_count RTX GPUs"
+  fi
   exlr8_plan_args=(--exlr8-manifest "$exlr8_manifest")
   spark_worker_args+=" --exlr8-manifest $exlr8_manifest"
   if [[ -n "$exlr8_prefill_activations" ]]; then
