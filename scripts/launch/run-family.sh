@@ -752,6 +752,9 @@ bench_nonce_env_args=()
 while IFS= read -r name; do
   bench_nonce_env_args+=(-e "$name=${!name}")
 done < <(compgen -e CUTEAFD_DIAG_ | sort)
+# CUTEAFD_DIAG_CUDA_LAUNCH_BLOCKING=1 makes CUDA report a kernel fault at the
+# faulting launch instead of a later API call (diagnostic only; slow).
+[[ "${CUTEAFD_DIAG_CUDA_LAUNCH_BLOCKING:-}" != 1 ]] || bench_nonce_env_args+=(-e CUDA_LAUNCH_BLOCKING=1)
 }
 # PROFILE=switch[,switch...] turns on profiling for one launch, the same way in
 # every family, through release-common.sh:

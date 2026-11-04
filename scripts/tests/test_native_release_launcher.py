@@ -361,6 +361,12 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         environment.update(CUTEAFD_DIAG_V4_VERIFY='/tmp/x', CUTEAFD_DIAG_A='1', CUTEAFD_OTHER='no')
         result = subprocess.run(['bash', '-c', block], env=environment, capture_output=True)
         self.assertEqual(result.stdout, b'before\0-e\0CUTEAFD_DIAG_A=1\0-e\0CUTEAFD_DIAG_V4_VERIFY=/tmp/x\0after\0')
+        # The launch-blocking diagnostic also sets CUDA's own variable for the coordinator.
+        environment = {k: v for k, v in os.environ.items() if not k.startswith(('CUTEAFD_DIAG_', 'CUTEAFD_BENCH_NONCE'))}
+        environment.update(CUTEAFD_DIAG_CUDA_LAUNCH_BLOCKING='1')
+        result = subprocess.run(['bash', '-c', block], env=environment, capture_output=True)
+        self.assertEqual(result.stdout,
+            b'before\0-e\0CUTEAFD_DIAG_CUDA_LAUNCH_BLOCKING=1\0-e\0CUDA_LAUNCH_BLOCKING=1\0after\0')
 
     def test_v41_speculation_trace_reaches_coordinator_with_host_mount(self) -> None:
         source = FAMILY.read_text()
