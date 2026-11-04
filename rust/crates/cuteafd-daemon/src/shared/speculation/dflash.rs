@@ -3134,9 +3134,20 @@ mod checkpoint_header_tests {
         use cuteafd_loader::{families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation},
             formats::dflash::MlaDraftCacheRequest};
         let mut cfg = mla_config();
-        cfg.windows.fill(Some(RING));
-        let layout = cfg.runtime_layout(GlmDraftRepresentation::Fp8Only,
-            GlmDraftCapacity::new(3, 3, cfg.block).unwrap(), 4096, 4096, 188, 2,
+        cfg.kind = cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark;
+        cfg.mla = cuteafd_loader::formats::mla::MlaGeometry { hidden: 6144, heads: 64,
+            q_rank: 0, kv_rank: 512, nope: 64, rope: 64, value: 128 };
+        cfg.block = 3;
+        cfg.intermediate = 24576;
+        cfg.group = 0;
+        cfg.selector_rank = 512;
+        cfg.selector_top_k = 0;
+        cfg.markov_rank = 512;
+        cfg.vocab = 204800;
+        cfg.taps = vec![1, 18, 36, 54, 71];
+        cfg.windows = vec![Some(2048); 3];
+        let layout = cfg.runtime_layout(GlmDraftRepresentation::Bf16Only,
+            GlmDraftCapacity::new(3, 3, cfg.block).unwrap(), 4096, 4096, 188, 0,
             cuteafd_core::MlaCacheFormat::Fp8).unwrap();
         assert_eq!(layout.paged_cache().full_layers, 0);
         let mut state = MlaPagedState::new(&layout).unwrap();
