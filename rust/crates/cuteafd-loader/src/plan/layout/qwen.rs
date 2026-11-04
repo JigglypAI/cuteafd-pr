@@ -29,17 +29,16 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
 }
 
 /// Exact resident weights on rtx0 (`checkpoint_resident_bytes`).
-fn resident(checkpoint: &crate::plan::Checkpoint, mtp: bool) -> Option<Vec<Vec<(String, String, u64)>>> {
-    use crate::families::qwen4::resident::Qwen4Representation;
+fn resident(checkpoint: &crate::plan::Checkpoint, mtp: bool,
+    representation: crate::families::qwen4::resident::Qwen4Representation) -> Option<Vec<Vec<(String, String, u64)>>> {
     let cfg = Qwen4Config::from_hf(&checkpoint.config).ok()?;
     let mtp = mtp && cfg.mtp_layers > 0;
-    let bytes = checkpoint_resident_bytes(checkpoint, &cfg, cfg.layers, mtp,
-        Qwen4Representation { fp8_projections: false, fp8_head: true }).ok()?;
+    let bytes = checkpoint_resident_bytes(checkpoint, &cfg, cfg.layers, mtp, representation).ok()?;
     Some(vec![vec![
-        ("target incl PLE projections".into(), "bf16+f32".into(), bytes.target_bytes),
+        ("target incl PLE projections".into(), if representation.fp8_projections { "fp8+bf16+f32" } else { "bf16+f32" }.into(), bytes.target_bytes),
         ("embedding".into(), "bf16".into(), bytes.embedding_bytes),
-        ("lm_head".into(), "fp8-row128".into(), bytes.head_bytes),
-        ("speculator".into(), "bf16+f32".into(), bytes.mtp_bytes),
+        ("lm_head".into(), if representation.fp8_head { "fp8-row128" } else { "bf16" }.into(), bytes.head_bytes),
+        ("speculator".into(), if representation.fp8_projections { "fp8+bf16+f32" } else { "bf16+f32" }.into(), bytes.mtp_bytes),
     ]])
 }
 
@@ -75,7 +74,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
         notes.push("Qwen serves on rtx0; rtx1 is idle and contributes no KV capacity".into());
     }
     mapped_table_note(report, &mut notes);
-    match resident(checkpoint, mtp) {
+    match resident(checkpoint, mtp, options.qwen_representation) {
         Some(ranks) => {
             push_resident(&mut devices, &ranks, |group| match group {
                 "embedding" => Category::Embedding,

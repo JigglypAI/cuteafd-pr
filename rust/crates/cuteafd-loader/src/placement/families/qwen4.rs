@@ -636,6 +636,41 @@ mod tests {
     use crate::serving_capacity::qwen_graphs::qwen_graph_pool;
 
     #[test]
+    fn single_checkpoint_weights_are_independent_of_mapped_table_and_runtime_storage() {
+        use crate::families::qwen4::resident::Qwen4CheckpointResident;
+        let mut resident = Qwen4CheckpointResident { target_bytes: 700, layer_bytes: vec![200, 400],
+            entry_bytes: 100, mtp_bytes: 300, head_bytes: 500, embedding_bytes: 600,
+            ple_table_bytes: 900, ple_row_bytes: 160 };
+        assert_eq!(single_owner_weights(&resident, false, false).unwrap(), ResidentWeights(2100));
+        assert_eq!(single_owner_weights(&resident, true, false).unwrap(), ResidentWeights(1500));
+        assert_eq!(single_owner_weights(&resident, true, true).unwrap(), ResidentWeights(1756));
+        resident.ple_table_bytes = u64::MAX;
+        assert_eq!(single_owner_weights(&resident, true, true).unwrap(), ResidentWeights(1756));
+        let weights = single_owner_weights(&resident, false, true).unwrap();
+        assert!(weights.check(0, weights).is_ok());
+        assert_eq!(weights.check(0, ResidentWeights(weights.0 - 1)),
+            Err(PlacementError::ResidentWeightLimit { gpu: 0, required: 2356, limit: 2355 }));
+        resident.target_bytes = u64::MAX;
+        assert!(single_owner_weights(&resident, false, true).is_err());
+    }
+
+    #[test]
+    fn single_expert_weights_use_native_whole_arenas_not_tp2_halves_or_workspace() {
+        use crate::plan::testing::{qwen4_config, qwen4_exl3, write_snapshot};
+        let dir = tempfile::tempdir().unwrap();
+        let config = qwen4_config(1);
+        let (tensors, manifest) = qwen4_exl3(1, 4);
+        write_snapshot(dir.path(), &config, &tensors, None);
+        crate::plan::testing::write_quantize_config(dir.path(), &manifest);
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let cost = dual_expert_costs(&catalog, 1).unwrap()[0].unwrap();
+        assert_eq!(single_expert_weights(&catalog, 1, true, false).unwrap(), ResidentWeights(cost.whole.resident));
+        assert_eq!(single_expert_weights(&catalog, 1, false, false).unwrap(), ResidentWeights(0));
+        assert_ne!(cost.whole.resident, cost.half[0].resident);
+        assert_eq!(cost.whole.staging, 0);
+    }
+
+    #[test]
     fn qwen_dual_owner0_weights_exclude_layer_and_table_storage() {
         use crate::families::qwen4::resident::Qwen4CheckpointResident;
         let resident = Qwen4CheckpointResident { target_bytes: 700, layer_bytes: vec![200, 400], entry_bytes: 100,

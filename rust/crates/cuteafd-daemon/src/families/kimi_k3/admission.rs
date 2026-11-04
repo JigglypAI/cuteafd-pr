@@ -1389,6 +1389,7 @@ pub(super) mod tests {
             let cli = crate::cli::Cli::try_parse_from([
                 "cuteafd".into(), "plan".into(), snapshot.path().as_os_str().to_owned(),
                 "--layout".into(), "--rtx".into(), "2".into(), "--spark-ranks".into(), "6".into(),
+                "--spark-budget-gib".into(), "256".into(),
                 "--workspace-manifest".into(), manifest_path.as_os_str().to_owned(),
                 "--coordinator-weight-budget-gib".into(), gib.to_string().into(),
                 "--attention-placement".into(), "heads".into(), "--rtx-expert-layers".into(), "0".into(),

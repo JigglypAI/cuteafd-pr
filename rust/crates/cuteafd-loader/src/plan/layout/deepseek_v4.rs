@@ -99,7 +99,41 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         &mut waste, &mut notes);
     let mut pool_tokens = 0;
     let mut local_layers = 0;
-    match solve(report, input, options, &devices[..ranks], &shape, exl3_workspace, workspace) {
+    let admitted = (|| -> anyhow::Result<_> {
+        let (mut request, reserves) = request(report, input, options, &devices[..ranks],
+            &shape, exl3_workspace, workspace)?;
+        let mut placement = crate::placement::solve(&request)?;
+        if report.encoder.is_none() {
+            let mut mandatory = request.clone();
+            if mandatory.inventory.spark_ranks > 0 && mandatory.onboard.layers(request.layers.len()).is_none() {
+                mandatory.onboard = Onboard::Layers(mandatory.minimum_expert_layers);
+            }
+            mandatory.pool.pin_selected(placement.pool_tokens);
+            let encoder_budget = crate::placement::solve(&mandatory)?;
+            let mut encoder_devices = devices[..ranks].to_vec();
+            for ((device, reserve), items) in encoder_devices.iter_mut().zip(&reserves).zip(&encoder_budget.items) {
+                device.capacity_bytes = device.capacity_bytes.saturating_sub(*reserve);
+                device.items.extend(items.iter().cloned());
+            }
+            resolve_encoder(report, &Towers::checkpoint(report), &mut encoder_devices, &mut sparks,
+                &vec![0; ranks], options, &mut notes);
+        }
+        if let Some(encoder) = &report.encoder {
+            if let super::super::encoder::EncoderKind::Rtx { gpu } = encoder.kind {
+                anyhow::ensure!(gpu < ranks, "V4 encoder owner is not an admitted coordinator GPU");
+                request.fixed.push(crate::placement::Demand::new(gpu as u8, Category::Weights,
+                    "vision tower", encoder.weights, Basis::Formula)
+                    .with_resident_weights(crate::placement::ResidentWeights(encoder.weights)));
+                request.fixed.push(crate::placement::Demand::new(gpu as u8, Category::Workspace,
+                    "vision scratch", encoder.scratch, Basis::Formula));
+                // Mandatory media displaces optional experts, never the admitted pool.
+                request.pool.pin_selected(placement.pool_tokens);
+                placement = crate::placement::solve(&request)?;
+            }
+        }
+        Ok((placement, reserves))
+    })();
+    match admitted {
         Ok((placement, reserves)) => {
             report.solver_placement = Some(placement.clone());
             for (device, reserve) in devices.iter_mut().zip(&reserves) {
@@ -185,10 +219,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
 
 /// V4's planned admission: the same request serve-dsv4 solves. The devices'
 /// capacities become `rtx_bytes - reserve` so `free_bytes` matches.
-fn solve(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutOptions,
+fn request(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutOptions,
     devices: &[DeviceLayout], shape: &Shape, exl3_workspace: Option<u64>,
     workspace: Option<Vec<crate::serving_capacity::V4WorkspaceRank>>)
-    -> anyhow::Result<(crate::placement::Placement, Vec<u64>)> {
+    -> anyhow::Result<(crate::placement::PlacementRequest, Vec<u64>)> {
     let checkpoint = input.checkpoint();
     let cfg = DeepseekV4Config::read(&checkpoint.snapshot, shape.native_layers)?;
     let catalog = input.expert_catalog()?;
@@ -219,10 +253,22 @@ fn solve(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutO
         anyhow::bail!("V4 TP2 expert kernels are missing: export the matching rtx-tp2 package for explicit local layers");
     }
     let id = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
+    let mut weights = crate::families::deepseek_v4::resident::WeightInventory::from_headers(&cfg,
+        devices.len(), shape.native_layers > 0, checkpoint.tensors.iter().map(|t| &t.meta))?;
+    let host_embedding = options.host_embedding && checkpoint.tensors.iter().filter(|t|
+        t.meta.name == "embed.weight" || t.meta.name.ends_with("embed_tokens.weight")).count() == 1
+        && checkpoint.require_untied_embedding("embed.weight").is_ok();
+    let embedding = if host_embedding { 0 } else {
+        checkpoint.tensors.iter().find(|t| t.meta.name == "embed.weight")
+            .ok_or_else(|| anyhow::anyhow!("V4 embedding header missing"))?.meta.byte_length
+    };
+    for (group, bytes) in [("loaded embedding weights", embedding), ("loaded drafter weights", options.drafter_bytes)] {
+        weights.fixed.push(crate::placement::Demand::new(0, Category::Weights, group, 0, Basis::Exact)
+            .with_resident_weights(crate::placement::ResidentWeights(bytes)));
+    }
     let inputs = v4::V4Inputs {
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), automatic_context: options.context_tokens == 0, cfg: &cfg,
-        weights: crate::families::deepseek_v4::resident::WeightInventory::from_headers(&cfg, devices.len(),
-            shape.native_layers > 0, checkpoint.tensors.iter().map(|t| &t.meta))?,
+        weights,
         cache_stages: shape.native_layers, gpus, headroom_floor: options.headroom_bytes,
         spark_ranks, sequences: shape.concurrency, prefill_rows: shape.prefill_rows, prefill_waves: options.prefill_waves, decode_rows: shape.decode_rows,
         max_context: shape.context_tokens, reserve_bytes: v4::RESERVE_BYTES, mark_slots, workspace,
@@ -236,5 +282,5 @@ fn solve(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutO
         attention: report.requested_attention };
     let request = v4::request(&inputs)?;
     let reserves = request.inventory.gpus.iter().map(|g| g.headroom_bytes).collect();
-    Ok((crate::placement::solve(&request)?, reserves))
+    Ok((request, reserves))
 }

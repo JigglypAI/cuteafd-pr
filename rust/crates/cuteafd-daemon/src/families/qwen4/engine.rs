@@ -163,9 +163,10 @@ impl LocalExperts<'_> {
             experts.layers.remove(0);
         }
         let next = Fp8Layer::bytes(&self.tensors.for_layer(layer)?, 1)? as u64;
-        let retained = experts.resident_bytes() as u64
-            + self.mtp_experts.as_ref().map_or(0, |e| e.resident_bytes() as u64);
-        self.base_weights.checked_add(cuteafd_loader::placement::ResidentWeights(retained))?
+        let retained = cuteafd_loader::placement::ResidentWeights(experts.resident_bytes() as u64)
+            .checked_add(cuteafd_loader::placement::ResidentWeights(
+                self.mtp_experts.as_ref().map_or(0, |e| e.resident_bytes() as u64)))?;
+        self.base_weights.checked_add(retained)?
             .checked_add(cuteafd_loader::placement::ResidentWeights(next))?
             .check(0, crate::shared::memory::budget::resident_weight_limit())?;
         let started = std::time::Instant::now();

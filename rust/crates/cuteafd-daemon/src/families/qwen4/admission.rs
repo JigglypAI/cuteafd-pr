@@ -256,6 +256,23 @@ mod tests {
     use cuteafd_loader::serving_capacity::qwen_graphs::*;
 
     #[test]
+    fn local_media_weight_owner_follows_sparse_and_reversed_cuda_ordinals() -> anyhow::Result<()> {
+        use cuteafd_loader::placement::ResidentWeights;
+        for devices in [[7, 2], [2, 7]] {
+            for rank in 0..2 {
+                let demand = super::loaded_media_weights(&devices, Some((devices[rank], ResidentWeights(123))))?.unwrap();
+                assert_eq!(demand.gpu as usize, rank);
+                assert_eq!(demand.bytes, 0, "already-loaded tower storage remains in the baseline");
+                assert_eq!(demand.resident_weights, ResidentWeights(123));
+            }
+            assert!(super::loaded_media_weights(&devices, None)?.is_none());
+            assert!(super::loaded_media_weights(&devices, Some((9, ResidentWeights(123))))?.is_none());
+            assert!(super::loaded_media_weights(&devices, Some((9, ResidentWeights(u64::MAX)))).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn host_tables_match_full_destination_extents() -> anyhow::Result<()> {
         for rows in [1usize, 64, 512, 2048, 2752, 4096] {
             for decode in [false, true] {

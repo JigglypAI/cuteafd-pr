@@ -298,6 +298,27 @@ mod tests {
     }
 
     #[test]
+    fn drafter_weights_exclude_borrowed_target_embedding_head_and_backbone() {
+        use cuteafd_core::DType;
+        let target = vec![tensor("embed.weight", DType::Bf16, &[100], 200),
+            tensor("head.weight", DType::Bf16, &[100], 200),
+            tensor("norm.weight", DType::Bf16, &[10], 20),
+            tensor("layers.0.attn.wq_a.weight", DType::F8E4M3, &[3200], 3200)];
+        let draft = vec![tensor("mtp.0.main_proj.weight", DType::F8E4M3, &[3200], 3200),
+            tensor("mtp.1.main_proj.weight", DType::F8E4M3, &[3200], 3200),
+            tensor("mtp.0.norm.weight", DType::Bf16, &[10], 20)];
+        let mut combined = target.clone();
+        combined.extend(draft.clone());
+        for ranks in [1, 2] {
+            let owned = drafter_weights(&checkpoint(combined.clone()), ranks).unwrap();
+            assert_eq!(owned, drafter_weights(&checkpoint(draft.clone()), ranks).unwrap());
+            assert_eq!(owned[ranks - 1].iter().map(|i| i.bytes).sum::<u64>(), 3200 + 100 + 3200 + 20);
+            assert!(owned[..ranks - 1].iter().all(Vec::is_empty));
+            assert!(drafter_weights(&checkpoint(target.clone()), ranks).unwrap().iter().all(Vec::is_empty));
+        }
+    }
+
+    #[test]
     fn snapshot_and_expert_placement_keep_physical_owners() {
         let (experts, hidden, logical) = (384u64, 5120u64, 576u64);
         let stored = cuteafd_core::mxfp4_layouts::stored_width(hidden as usize, logical as usize).unwrap() as u64;

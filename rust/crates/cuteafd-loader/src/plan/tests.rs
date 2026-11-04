@@ -3826,8 +3826,8 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
         let simulated = run(&options);
         assert_eq!(bytes(&simulated,0,Category::Drafter), owned);
         assert_eq!(bytes(&simulated,0,Category::Workspace), scratch[1]);
-        options.drafter_bytes = owned + scratch[1];
-        // An explicit total must work even when no checkpoint can be read.
+        options.drafter_bytes = native_draft.resident_weights.0;
+        // An explicit weight-only override has no inferred runtime scratch.
         options.glmf_drafter_snapshot = Some(draft.path().join("absent"));
         let explicit = run(&options);
         assert_eq!(bytes(&explicit,0,Category::Drafter), options.drafter_bytes);
