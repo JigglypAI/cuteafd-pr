@@ -229,10 +229,11 @@ observed wire speeds (required to interpret received pause time); check them
 again before import. RouterOS >=7.23 automatically sizes lossless/shared
 buffers; do not copy legacy `use-shared-buffers` settings into this export.
 
-TC3 also runs **ECN** (`ecn=yes wred=no`). The engine's GRH byte 104 carries ECN
-bits 00, but mlx5 DCQCN (on by default) sends RoCE data as ECT, so the switch marks
+TC3 also runs **ECN** (`ecn=yes wred=no`). The engine's GRH byte 106 sets ECT(0),
+and mlx5 DCQCN (on by default) also sends RoCE data as ECT, so the switch marks
 congested TC3 packets, receivers send CNPs (DSCP 48, strict TC6) and senders back
-off before PFC has to pause. SparkNest's class 2 (`pfc-2-3` lossless) runs ECN on
+off before PFC has to pause. (The A/B below ran with byte 104, ECN bits 00: DCQCN
+alone produced the marks.) SparkNest's class 2 (`pfc-2-3` lossless) runs ECN on
 queue 2 the same way; its policy belongs to SparkNest. WRED stays off everywhere.
 
 Muse max card A/B (2× RTX + 6 Sparks, sealed slot, one launch per arm, 2026-11-04),
@@ -354,9 +355,9 @@ Before deliberate rollback, disable this unit so a later boot cannot reapply.
 
 ### Traffic marking and verification
 
-The engine always marks its RoCE QPs DSCP 26 (GRH traffic class 104) with SL 3,
+The engine always marks its RoCE QPs DSCP 26, ECN ECT(0) (GRH traffic class 106), with SL 3,
 the byte's class selector, so priority-3 PFC also stops transmit QPs; startup
-fabric logs show `rdma_tc=104 dscp=26`. There is no launch key: an untuned fabric
+fabric logs show `rdma_tc=106 dscp=26`. There is no launch key: an untuned fabric
 ignores the mark (switch trust `ignore`, NIC trust `pcp` on an untagged link),
 so the same run commands work whether or not the fabric is tuned.
 

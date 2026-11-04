@@ -19,7 +19,7 @@ def test_native_marks_every_rc_qp_dscp26_priority3(tmp_path):
     source = tmp_path / 'traffic.cc'
     source.write_text(r'''
 #include "rdma_traffic_class.h"
-static_assert(cuteafd::kRdmaTrafficClass == 104, "DSCP 26, Not-ECT");
+static_assert(cuteafd::kRdmaTrafficClass == 106, "DSCP 26, ECT(0)");
 static_assert((cuteafd::kRdmaTrafficClass >> 2) == 26 && (cuteafd::kRdmaTrafficClass >> 5) == 3, "SL 3");
 int main() {}
 ''')
