@@ -718,3 +718,23 @@ int cuteafd_exl3_wire_decode(void *handle, const uint8_t *input, uint64_t in_byt
     (void)handle; (void)input; (void)in_bytes; (void)output;
     (void)out_bytes; (void)rows; (void)stream; return 0;
 }
+
+/* Device SEND registration fails deliberately; the real ring must select and
+ * register its existing pinned payload slots, not retry device allocation. */
+int cuteafd_rdma_rc_endpoint_register_device_region(void *handle, void *ptr,
+        size_t bytes, uint32_t *region) {
+    (void)handle; (void)ptr; (void)bytes; (void)region;
+    event('G');
+    return 7;
+}
+int cuteafd_rdma_rc_endpoint_register_region(void *handle, void *ptr,
+        size_t bytes, uint32_t *region) {
+    (void)handle;
+    if (!ptr || !bytes || !region) return 1;
+    event('H');
+    *region = 7;
+    return 0;
+}
+int cuteafd_rdma_rc_endpoint_destroy(void *handle) {
+    (void)handle; event('X'); return 0;
+}

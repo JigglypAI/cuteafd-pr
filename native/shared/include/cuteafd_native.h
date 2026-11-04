@@ -584,6 +584,9 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_copy_recv_at(void* handle, void* out, 
 // a send gathers its header from a send-ring slot and its payload from a region.
 cuteafd_status_t cuteafd_rdma_rc_endpoint_register_region(void* handle, void* ptr, size_t bytes,
                                                       uint32_t* region);
+// Device range must be host-page aligned and retained until endpoint destruction.
+cuteafd_status_t cuteafd_rdma_rc_endpoint_register_device_region(
+    void* handle, void* ptr, size_t bytes, uint32_t* region);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_send_slot_region(
     void* handle, size_t slot_offset, size_t slot_bytes, uint32_t region, size_t region_offset,
     size_t region_bytes, uint64_t wr_id);

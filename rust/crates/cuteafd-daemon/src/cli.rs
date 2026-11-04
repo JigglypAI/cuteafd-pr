@@ -612,6 +612,9 @@ pub(crate) struct BenchRdmaArgs {
     pub(crate) duration_secs: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum RdmaSendMemory { Pinned, Device }
+
 #[derive(Debug, Args)]
 pub(crate) struct BenchRdmaRingArgs {
     #[arg(long, default_value = "server")]
@@ -642,6 +645,9 @@ pub(crate) struct BenchRdmaRingArgs {
     pub(crate) network_label: String,
     #[arg(long, default_value_t = false)]
     pub(crate) gpu_echo: bool,
+    /// SEND payload storage for the basic client/server diagnostic.
+    #[arg(long, value_enum, default_value = "pinned")]
+    pub(crate) send_memory: RdmaSendMemory,
     #[arg(long, default_value = "fp8")]
     pub(crate) wire_codec: String,
     #[arg(long, default_value_t = 1)]
@@ -1081,6 +1087,20 @@ mod tests {
         };
         assert_eq!(span(&["cuteafd", "plan", "model"]), 0, "0 selects the family default");
         assert_eq!(span(&["cuteafd", "plan", "model", "--prefill-span-rows", "8192"]), 8192);
+    }
+
+    #[test]
+    fn rdma_send_memory_parses_and_rejects_unknown_backing() {
+        use super::RdmaSendMemory;
+        for (flags, expected) in [(vec![], RdmaSendMemory::Pinned),
+            (vec!["--send-memory", "pinned"], RdmaSendMemory::Pinned),
+            (vec!["--send-memory", "device"], RdmaSendMemory::Device)] {
+            let Commands::BenchRdmaRing(args) = Cli::try_parse_from(
+                ["cuteafd", "bench-rdma-ring"].into_iter().chain(flags)).unwrap().command
+                else { panic!("expected ring benchmark"); };
+            assert_eq!(args.send_memory, expected);
+        }
+        assert!(Cli::try_parse_from(["cuteafd", "bench-rdma-ring", "--send-memory", "managed"]).is_err());
     }
 
     #[test]

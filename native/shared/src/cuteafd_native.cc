@@ -404,7 +404,7 @@ struct CuteafdRdmaRcEndpointHandle {
   size_t landing_bytes = 0;
   size_t landing_header_bytes = 0;
   cuteafd::RdmaLandingSlots landing_slots;
-  // Host ranges sends may gather from (`cuteafd_rdma_rc_endpoint_register_region`).
+  // Host or dma-buf device ranges gathered by two-SGE SENDs.
   std::vector<ibv_mr*> regions;
   // Send-buffer prefix a peer RDMA-reads (`cuteafd_rdma_rc_endpoint_expose_send_read`).
   ibv_mr* read_mr = nullptr;
@@ -4675,6 +4675,28 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_register_region(void* handl
 #else
   return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
               "RDMA RC endpoint regions require CUTEAFD_ENABLE_RDMA=ON");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_register_device_region(
+    void* handle, void* ptr, size_t bytes, uint32_t* region) {
+  if (handle == nullptr || ptr == nullptr || region == nullptr || bytes == 0) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint device region is invalid");
+  }
+#if CUTEAFD_NATIVE_ENABLE_RDMA && CUTEAFD_NATIVE_ENABLE_CUDA
+  auto* endpoint = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  if (endpoint->regions.size() >= 64) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint has 64 regions already");
+  }
+  ibv_mr* mr = nullptr;
+  const cuteafd_status_t status = register_device_dmabuf(endpoint->pd, ptr, bytes, &mr);
+  if (status != CUTEAFD_STATUS_OK) return status;
+  endpoint->regions.push_back(mr);
+  *region = static_cast<uint32_t>(endpoint->regions.size() - 1);
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+              "RDMA device regions require CUTEAFD_ENABLE_RDMA=ON and CUDA");
 #endif
 }
 
