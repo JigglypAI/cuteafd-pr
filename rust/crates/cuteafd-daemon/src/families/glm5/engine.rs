@@ -1804,15 +1804,15 @@ impl<'a> GlmEngine<'a> {
         let bytes = t * self.cfg.hidden * 2;
         // The decode transport's intake planes (or the skip intake's); the
         // replayed graphs bake them in.
-        let planes = match (experts.as_mut(), &self.skip) {
-            (_, Some(skip)) => skip.pointers(),
+        let reduction = match (experts.as_mut(), &self.skip) {
+            (_, Some(_)) => None,
             // One decode slot: the replayed graphs bake slot 0's planes.
             (Some((transport, _)), None) => {
                 let waves = transport.exchange()?;
                 ensure!(waves.waves() == 1, "GLM decode graphs bake one return slot's planes");
-                waves.planes(0)
+                Some(waves.reduction(0))
             }
-            (None, None) => [std::ptr::null(); MAX_RANKS],
+            (None, None) => None,
         };
         // Previous layer's FFN output: none (first layer), in `delta`, or Spark planes.
         let mut previous = Previous::First;
@@ -1828,7 +1828,13 @@ impl<'a> GlmEngine<'a> {
                     self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes)?;
                 }
                 if let Previous::Planes(ranks) = previous {
-                    self.reduce(planes, w, ranks, t)?;
+                    if let Some(reduction) = reduction {
+                        // SAFETY: the landed decode slot and workspace outlive graph replay.
+                        unsafe { reduction.launch(self.library, w.shared.buffer.ptr.cast(),
+                            w.delta.buffer.ptr.cast(), t, self.stream)?; }
+                    } else {
+                        self.reduce(self.skip.as_ref().context("skip intake")?.pointers(), w, ranks, t)?;
+                    }
                 }
                 let weight = match layer {
                     Some(layer) => layer.ptr("input_norm")?,
@@ -2107,8 +2113,8 @@ impl<'a> GlmEngine<'a> {
         self.moe_front(w, layer, t)?;
         let waves = transport.exchange()?;
         let slot = self.moe_exchange(w, index, layer, t, cap, decode, waves)?;
-        self.reduce(waves.planes(slot), w, waves.ranks(), t)?;
-        waves.consumed(slot, self.stream)
+        // SAFETY: the wave landed on this stream; shared and delta are live workspace views.
+        unsafe { waves.reduce(slot, w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream) }
     }
 
     /// Router scores, the sigmoid top-k selection and the wire rows (device only).
@@ -2491,19 +2497,16 @@ impl<'a> GlmEngine<'a> {
             }
         };
         // h += ffn (routed partials reduced first); x = the next input norm.
-        let post = |index: usize, unit: usize, planes: Option<([*const u16; MAX_RANKS], usize)>| -> Result<()> {
+        let post = |index: usize, unit: usize, routed: bool| -> Result<()> {
             let slot = unit % waves;
             let (w, rows) = (workspaces[slot], rows_of(unit));
-            if let Some((planes, ranks)) = planes {
-                self.reduce(planes, w, ranks, counts[unit])?;
-            }
             let weight = match layers.get(index + 1) {
                 Some(next) => next.ptr("input_norm")?,
                 None => self.weights.norm.buffer.ptr,
             };
             if split {
                 let ffn = slot_of(index, true, slot);
-                if planes.is_some() && (index + 1 < layers.len() || Self::core_split(&layers[index], "down")) {
+                if routed && (index + 1 < layers.len() || Self::core_split(&layers[index], "down")) {
                     self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes_of_unit(unit))?;
                 }
                 self.peer_post(index, slot, peer_workspaces.as_ref().context("peer workspaces")?.get(slot)?,
@@ -3057,7 +3060,7 @@ enum UnitTicket {
 impl<B, A, P> crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, B, A, P>
 where B: Fn(usize) -> Result<()>,
       A: Fn(usize, usize) -> Result<()>,
-      P: Fn(usize, usize, Option<([*const u16; MAX_RANKS], usize)>) -> Result<()> {
+      P: Fn(usize, usize, bool) -> Result<()> {
     type Ticket = UnitTicket;
     fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
         if self.layers[layer].dense || self.engine.tp2_layer(layer) {
@@ -3087,7 +3090,7 @@ where B: Fn(usize) -> Result<()>,
             let w1 = self.peers[slot].context("TP2 peer workspaces")?;
             self.engine.tp2_pair(layer, slot, self.workspaces[slot], w1, self.counts[unit.index], self.cap)?;
         }
-        (self.post)(layer, unit.index, None)
+        (self.post)(layer, unit.index, false)
     }
     fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit)
         -> Result<UnitTicket> {
@@ -3111,8 +3114,11 @@ where B: Fn(usize) -> Result<()>,
         self.transport.land(wave, self.engine.stream)?;
         // The reduce reads the return slot this wave just landed in; the slot
         // takes its next wave only after that reduce.
-        (self.post)(layer, unit.index, Some((self.transport.planes(slot), self.transport.ranks())))?;
-        self.transport.consumed(slot, self.engine.stream)
+        let w = self.workspaces[unit.index % self.waves];
+        // SAFETY: the wave landed on this stream and the unit owns these workspace views.
+        unsafe { self.transport.reduce(slot, w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(),
+            self.counts[unit.index], self.engine.stream)?; }
+        (self.post)(layer, unit.index, true)
     }
     fn end_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         if let Some(hops) = &mut self.owned_hops {

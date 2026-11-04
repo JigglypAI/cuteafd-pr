@@ -369,8 +369,8 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
                 let pending = e.layer_execution.as_ref().context("layer execution")?.waves.borrow_mut()[self.lane]
                     .take().context("missing dispatched Spark wave")?;
                 let mut reduce = |waves: &mut crate::shared::spark_waves::Waves<'_>, slot| -> Result<()> {
-                    e.reduce(waves.planes(slot), w, waves.ranks(), real)?;
-                    waves.consumed(slot, e.stream)
+                    // SAFETY: the landed slot and workspace are ordered on the engine stream.
+                    unsafe { waves.reduce(slot, w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), real, e.stream) }
                 };
                 match (&mut self.transport, ticket, pending) {
                     (Transport::Serial(Some((link, _))), Ticket::Spark, PendingWave::Landed(slot)) => reduce(link.exchange()?, slot)?,

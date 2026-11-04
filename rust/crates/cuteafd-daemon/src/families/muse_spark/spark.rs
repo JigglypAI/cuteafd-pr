@@ -197,7 +197,7 @@ impl SparkExperts for MuseSparkPath<'_> {
             let exchange = link.exchange()?;
             exchange.land(ticket, stream)?;
             let ranks = exchange.ranks();
-            let planes: Vec<u64> = exchange.planes(slot)[..ranks].iter().map(|p| *p as u64).collect();
+            let planes = exchange.partial_reply_addresses(slot)?;
             // The wire layout (`PartialReplyPlan::payload`): the BF16 region, then the
             // wide region at the next region-aligned offset.
             let wide_at = wire_plan(&plan)?.payload(TOPK, WIDTH)?.1;

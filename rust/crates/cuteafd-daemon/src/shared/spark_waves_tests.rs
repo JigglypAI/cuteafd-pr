@@ -934,15 +934,13 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
             }).collect();
             expected.push(sum);
         }
-        let reducer = library.v41_compact_reducer()?;
         let mut tickets = std::collections::VecDeque::new();
         let land = |exchange: &mut Waves<'_>, layer: usize, ticket: WaveTicket| -> Result<()> {
             let slot = ticket.slot();
             exchange.land(ticket, stream.raw())?;
             // SAFETY: planes, output and the null shared plane are live.
-            unsafe { reducer.reduce_planes(exchange.planes(slot), ranks as u32, std::ptr::null(),
-                outputs[layer].buffer.ptr.cast(), widths[layer] as u32, stream.raw())?; }
-            exchange.consumed(slot, stream.raw())
+            unsafe { exchange.reduce(slot, std::ptr::null(),
+                outputs[layer].buffer.ptr.cast(), widths[layer], stream.raw()) }
         };
         for (index, &(waves, rows)) in cuts.iter().enumerate() {
             assert_eq!(exchange.waves(), waves);
@@ -1506,7 +1504,6 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
     cuteafd_transport::set_verbs_host_native_library_path(std::path::PathBuf::from(&path))?;
     let (hidden, topk, ranks, rows) = (5120usize, 6usize, 2usize, 64usize);
     let row_bytes = hidden * 2;
-    let reducer = library.v41_compact_reducer()?;
     for control in [false, true] {
         let ranges_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, rows * row_bytes))
             .collect::<Result<Vec<_>>>()?;
@@ -1573,11 +1570,10 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
             exchange.land(ticket, stream.raw())?;
             // SAFETY: planes, output and the null shared plane are live.
             unsafe {
-                reducer.reduce_planes(exchange.planes(slot), ranks as u32, std::ptr::null(),
-                    outputs[layer].buffer.ptr.cast(), rows as u32, stream.raw())?;
+                exchange.reduce(slot, std::ptr::null(),
+                    outputs[layer].buffer.ptr.cast(), rows, stream.raw())?;
                 library.cuda_event_record(done, stream.raw())?;
             }
-            exchange.consumed(slot, stream.raw())?;
             if layer == 1 && !control {
                 std::thread::sleep(Duration::from_millis(100));
                 // SAFETY: a live event of this device.
