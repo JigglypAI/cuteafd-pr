@@ -2799,6 +2799,8 @@ fn v4_egress_is_exact_registered_host_memory_not_a_gpu_demand() {
     let path = dir.path().join("PROGRAMS.json");
     for decode in [32, 64] {
         std::fs::write(&path, json!({"capacities": {"decode_rows": decode}}).to_string()).unwrap();
+        // Each installed-artifact version belongs to a fresh planning input.
+        let input = PlanInput::open(dir.path()).unwrap();
         for (unit, waves) in [(2752, 3), (4096, 2)] {
             let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 host_cache_bytes: Some(0), prefill_unit_rows: Some(unit), prefill_waves: waves,
