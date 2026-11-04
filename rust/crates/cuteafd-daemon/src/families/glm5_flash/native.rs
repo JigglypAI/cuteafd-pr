@@ -31,6 +31,14 @@ pub(super) fn normalize(args: &mut EngineArgs) {
     args.fp8_prefill.push(super::Fp8PrefillGroup::None);
 }
 
+pub(super) fn resolved_settings(args: &EngineArgs) -> Vec<(&'static str, String)> {
+    vec![("kda-output-shard", args.kda_output_shard.to_string()),
+        ("kda-prefill-expanded", args.kda_prefill_expanded.to_string()),
+        ("kda-fp32-partials", args.kda_fp32_partials.to_string()),
+        ("fp8-head", args.fp8_head.to_string()), ("kda-fp8", "off".into()),
+        ("fp8-prefill", "none".into())]
+}
+
 pub(super) fn validate_headers(format: CheckpointFormat, legacy: impl FnOnce() -> Result<()>) -> Result<()> {
     if format == CheckpointFormat::Exlr8 { Ok(()) } else { legacy() }
 }

@@ -1313,13 +1313,14 @@ def test_family_prelaunch_plan_uses_coordinator_card_memory(tmp_path, family, bu
     ("32.001", 98304, "", 16), ("96", 32768, "", 8),
     ("32", 98304, "config", 4), ("", 98304, "set", 4),
 ])
-def test_shared_concurrency_default_reaches_plan_and_serve(tmp_path, family, budget, total, override, expected):
+@pytest.mark.parametrize("rtx_gpus", [1, 2])
+def test_shared_concurrency_default_reaches_plan_and_serve(tmp_path, family, budget, total, override, expected, rtx_gpus):
     config = ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
               if family == "glm5" else {"model_type": "deepseek_v4"}
               if family == "deepseek_v4" else {"model_type": "deepseek_v41"}
               if family == "deepseek_v41" else SPLIT_CONFIGS["mimo_flash" if family == "mimo_v2" else family])
     model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model"
-    keys = (f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\n"
+    keys = (f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS={rtx_gpus}\n"
             "SPECULATOR=off\nVISION=off\nAUDIO=off\n")
     if family == "deepseek_v41":
         keys += ("MODEL_REVISION=\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\n"

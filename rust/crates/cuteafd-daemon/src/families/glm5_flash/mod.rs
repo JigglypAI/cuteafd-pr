@@ -601,6 +601,13 @@ mod draft_cli_tests {
         converted.fp8_prefill = vec![Fp8PrefillGroup::All];
         native::normalize(&mut ordinary);
         native::normalize(&mut converted);
+        assert_eq!(native::resolved_settings(&ordinary), native::resolved_settings(&converted));
+        let settings: std::collections::BTreeMap<_, _> = native::resolved_settings(&converted).into_iter().collect();
+        for key in ["kda-output-shard", "kda-prefill-expanded", "kda-fp32-partials", "fp8-head"] {
+            assert_eq!(settings[key], "false");
+        }
+        assert_eq!(settings["kda-fp8"], "off");
+        assert_eq!(settings["fp8-prefill"], "none");
         let demands = |args: &EngineArgs| -> Result<Vec<_>> {
             check_options(args)?;
             let options = GlmfScratchOptions { split: false, kda_w8: args.kda_fp8 != fp8::KdaFp8::Off,
@@ -1649,12 +1656,9 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let mut resolved = args.clone();
     if native {
         native::normalize(&mut resolved);
-        for (name, value) in [("kda-output-shard", resolved.kda_output_shard),
-            ("kda-prefill-expanded", resolved.kda_prefill_expanded), ("fp8-head", resolved.fp8_head)] {
-            cuteafd_bench::context::set_resolved(name, &value.to_string());
+        for (name, value) in native::resolved_settings(&resolved) {
+            cuteafd_bench::context::set_resolved(name, &value);
         }
-        cuteafd_bench::context::set_resolved("kda-fp8", "off");
-        cuteafd_bench::context::set_resolved("fp8-prefill", "none");
         ensure!(args.exlr8_manifest.is_some(), "native Flash requires --exlr8-manifest k2, k3 or k4");
         ensure!(args.kda_state == engine::KdaState::F32, "native Flash requires F32 KDA state programs");
     } else { ensure!(args.exlr8_manifest.is_none(), "--exlr8-manifest requires a native EXLR8 checkpoint"); }

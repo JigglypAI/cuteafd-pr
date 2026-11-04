@@ -1011,8 +1011,8 @@ mod tests {
         let (slots, batch) = crate::families::glm5::draft_representation::flash_serving_draft_limits(
             planned.sequences as usize, options.glm_draft_sequences() as usize, None);
         let config = draft_config();
-        let capacity = crate::families::glm5::draft_representation::flash_draft_capacity(&config, slots, batch).unwrap();
-        let (bytes, scratch) = drafter_inventory(&config, capacity.context_slots, capacity.max_batch_sequences, &[188; 2],
+        let draft_capacity = crate::families::glm5::draft_representation::flash_draft_capacity(&config, slots, batch).unwrap();
+        let (bytes, scratch) = drafter_inventory(&config, draft_capacity.context_slots, draft_capacity.max_batch_sequences, &[188; 2],
             crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only,
             2, options.draft_kv_cache).unwrap();
         planned.drafter_bytes = bytes;
