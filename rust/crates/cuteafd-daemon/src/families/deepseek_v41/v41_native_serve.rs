@@ -306,8 +306,24 @@ fn engram_pipeline(lib: &NativeLibrary, catalog: &cuteafd_loader::OfficialV41Cat
     Ok(pipeline)
 }
 
+fn require_planned_peer(probe: Result<()>) -> Result<()> {
+    probe.context("V4.1 planned two-RTX layout requires bidirectional P2P between devices 0 and 1; refusing single-GPU fallback")
+}
+
+#[cfg(test)]
+mod planned_peer_tests {
+    #[test]
+    fn peer_failure_preserves_plan_and_probe_reason() {
+        super::require_planned_peer(Ok(())).unwrap();
+        let error = super::require_planned_peer(Err(anyhow::anyhow!("device 1 cannot access device 0"))).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("refusing single-GPU fallback"));
+        assert!(message.contains("device 1 cannot access device 0"));
+    }
+}
+
 fn worker(
-    mut args: crate::cli::NativeServeArgs,
+    args: crate::cli::NativeServeArgs,
     mut receive: mpsc::Receiver<NativeRequest>,
     ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
@@ -321,15 +337,18 @@ fn worker(
         // Probe before the distributed loader reserves either device's weights.
         // SAFETY: the configured native library is trusted and remains live for the probe.
         let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
-        if crate::shared::peer_split::probed_device(&library, 0, Some(1))?.is_none() {
-            args.rtx_gpus = 1;
-            args.tp2_dspark_experts = false;
-            args.tp2_output_projection = false;
-            args.tp2_query_projection = false;
-            args.tp2_attention = false;
+        let probe = if std::env::var("CUTEAFD_P2P_PROBE").is_ok_and(|v| v == "unavailable") {
+            Err(anyhow::anyhow!("P2P probe forced unavailable"))
         } else {
-            return distributed::worker(args, receive, ready, stats);
-        }
+            crate::shared::memory::device::Device { library: &library, id: 0 }
+                .run(|| library.cuda_enable_peer(1))
+                .and_then(|()| crate::shared::memory::device::Device { library: &library, id: 1 }
+                    .run(|| library.cuda_enable_peer(0)))
+        };
+        // Restore the home device even when a directional probe fails.
+        library.cuda_set_device(0)?;
+        require_planned_peer(probe)?;
+        return distributed::worker(args, receive, ready, stats);
     }
     // SAFETY: the configured library remains owned by this worker until all CUDA work drains.
     let lib = unsafe { NativeLibrary::load(&args.native_lib)? };

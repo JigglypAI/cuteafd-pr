@@ -59,6 +59,12 @@ SPARK_5_LANE_B=
 
 
 class TopologyConfigTest(unittest.TestCase):
+    def test_shipped_config_defaults_dual_rtx_dspark_experts_on(self) -> None:
+        result = load_file(CONFIG, 'release_resolve_tp2_dspark_experts deepseek_v41 2; '
+                           'printf "%s\\n" "$TP2_DSPARK_EXPERTS"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'on')
+
     def test_tp2_dspark_default_follows_resolved_layout(self) -> None:
         for family, gpus, speculator in [('deepseek_v41', 2, 'dspark'),
                                          ('deepseek_v41', 1, 'dspark'),
