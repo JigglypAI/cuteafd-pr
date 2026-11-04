@@ -80,7 +80,8 @@ impl<'a> Load<'a> {
         if let Some(prefetched) = &self.prefetched {
             for (rect, offset) in &lands {
                 let start = usize::try_from(rect.base)?;
-                let data = prefetched.get(start..start + rect.bytes()).context("drafter tensor lies past prefetched file")?;
+                let end = start.checked_add(rect.bytes()).context("drafter prefetched extent overflow")?;
+                let data = prefetched.get(start..end).context("drafter tensor lies past prefetched file")?;
                 self.library.copy_h2d(view(allocation.buffer, *offset, data.len())?, data)?;
             }
         } else {
@@ -99,8 +100,8 @@ impl<'a> Load<'a> {
 
     pub fn matrix(&self, parts: &[(&str, usize)], cols: usize, fp8: bool, scales: Fp8Scales,
         stream: *mut c_void) -> Result<Weight<'a>> {
+        if !fp8 { return self.concat(parts, cols).map(Weight::Bf16); }
         let rects = self.parts(parts, cols)?;
-        if !fp8 { return self.operand(rects).map(Weight::Bf16); }
         let rows = parts.iter().try_fold(0usize, |n, (_, rows)| n.checked_add(*rows)).context("drafter matrix overflow")?;
         if self.prefetched.is_some() {
             let source = self.operand(rects)?;
@@ -132,20 +133,24 @@ fn pack_steps(rects: Vec<Rect>, cols: usize, rule: Fp8Scales, packed: CuteafdDev
     let mut first = 0;
     let mut steps = Vec::new();
     ensure!(cols > 0 && cols % 128 == 0, "drafter FP8 input width must be a multiple of 128");
-    let window = (STEP_BYTES / (cols * 2) / 16) * 16;
+    let row_bytes = cols.checked_mul(2).context("drafter FP8 row extent overflow")?;
+    let scale_cols = cols / 128 * 4;
+    let window = (STEP_BYTES / row_bytes / 16) * 16;
     ensure!(window > 0, "drafter FP8 row tile exceeds bounded staging");
     for rect in rects {
-        ensure!(rect.rows.len() % 16 == 0 && rect.width() == cols * 2, "drafter FP8 source must hold whole 16-row tiles");
+        ensure!(rect.rows.len() % 16 == 0 && rect.width() == row_bytes, "drafter FP8 source must hold whole 16-row tiles");
         for start in (0..rect.rows.len()).step_by(window) {
             let rows = window.min(rect.rows.len() - start);
+            let values_at = first.checked_mul(cols).context("drafter FP8 value offset overflow")?;
+            let scales_at = first.checked_mul(scale_cols).context("drafter FP8 scale offset overflow")?;
             let job = Job::W8a16Pack { n: rows, k: cols, rule,
-                packed: view(packed, first * cols, rows * cols)?,
-                scale: view(scale, first * cols / 128 * 4, rows * cols / 128 * 4)? };
+                packed: view(packed, values_at, rows * cols)?,
+                scale: view(scale, scales_at, rows * scale_cols)? };
             steps.push(Step { device: packed.device_id, rects: vec![rect.sub(start..start + rows)], jobs: vec![job] });
-            first += rows;
+            first = first.checked_add(rows).context("drafter FP8 row count overflow")?;
         }
     }
-    ensure!(first * cols == packed.bytes && first * cols / 128 * 4 == scale.bytes,
+    ensure!(first.checked_mul(cols) == Some(packed.bytes) && first.checked_mul(scale_cols) == Some(scale.bytes),
         "drafter FP8 packing footprint differs from its resident allocation");
     Ok(steps)
 }
@@ -213,17 +218,20 @@ mod tests {
         let rect = |name: &str, rows| Rect { name: name.into(), path: "draft".into(), base: 0,
             row_bytes: cols * 2, rows: 0..rows, cols: 0..cols * 2 };
         let rows = per + 32;
-        let buffer = |bytes| CuteafdDeviceBuffer { bytes, device_id: 1, ..Default::default() };
+        let mut values = vec![0u8; 2 * rows * cols];
+        let mut scales = vec![0u8; 2 * rows * cols / 128 * 4];
+        let buffer = |data: &mut [u8]| CuteafdDeviceBuffer { ptr: data.as_mut_ptr().cast(),
+            bytes: data.len(), device_id: 1, ..Default::default() };
         let steps = pack_steps(vec![rect("gate", rows), rect("up", rows)], cols, Fp8Scales::Amax,
-            buffer(2 * rows * cols), buffer(2 * rows * cols / 128 * 4))?;
+            buffer(&mut values), buffer(&mut scales))?;
         assert_eq!(steps.len(), 4);
         assert!(steps.iter().all(|step| step.device == 1 && step.bytes() <= STEP_BYTES));
         let mut packed_bytes = 0;
         for step in steps {
             let Job::W8a16Pack { n, k, packed, scale, .. } = step.jobs[0] else { panic!("pack job") };
             assert_eq!(n % 16, 0);
-            assert_eq!(packed.ptr as usize, packed_bytes);
-            assert_eq!(scale.ptr as usize, packed_bytes / 128 * 4);
+            assert_eq!(packed.ptr as usize - values.as_ptr() as usize, packed_bytes);
+            assert_eq!(scale.ptr as usize - scales.as_ptr() as usize, packed_bytes / 128 * 4);
             packed_bytes += n * k;
         }
         assert_eq!(packed_bytes, 2 * rows * cols);
@@ -243,28 +251,68 @@ mod tests {
         write_drafter(&snapshot)?;
         let device = Device { library: &library, id: 1 };
         let shapes = config().tensor_shapes();
+        // Fuse the production GQA destinations: Q/K/V and gate/up share owners;
+        // every other source keeps its native shape, including the 3-D bases.
+        let mut groups = shapes.iter().map(|(name, shape)| vec![(name.clone(), shape.clone())]).collect::<Vec<_>>();
+        for layer in 0..config().layers {
+            for suffixes in [vec!["self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"],
+                vec!["mlp.gate_proj.weight", "mlp.up_proj.weight"]] {
+                let mut fused = Vec::new();
+                for suffix in suffixes {
+                    let name = format!("layers.{layer}.{suffix}");
+                    let at = groups.iter().position(|group| group[0].0 == name).context("fused source")?;
+                    fused.extend(groups.remove(at));
+                }
+                groups.push(fused);
+            }
+        }
         let load = || device.run(|| {
-            let load = Load::open(&library, &snapshot)?;
+            // Mount keeps its existing full-file prefetch; recording must ignore it.
+            let bytes = if dense::is_recording() { Vec::new() } else { std::fs::read(snapshot.join("model.safetensors"))? };
+            let load = Load::with_prefetched(&library, &snapshot, bytes)?;
             load.validate(shapes.clone())?;
-            shapes.iter().map(|(name, shape)| load.tensor(name, shape)).collect::<Result<Vec<_>>>()
+            groups.iter().map(|group| {
+                if group.len() == 1 { return load.tensor(&group[0].0, &group[0].1); }
+                let cols = group[0].1[1];
+                let parts = group.iter().map(|(name, shape)| (name.as_str(), shape[0])).collect::<Vec<_>>();
+                let Weight::Bf16(owner) = load.matrix(&parts, cols, false, Fp8Scales::Amax, std::ptr::null_mut())?
+                    else { unreachable!("BF16 fixture") };
+                Ok(owner)
+            }).collect::<Result<Vec<_>>>()
         });
         let mounted = load()?;
         let (pushed, records) = dense::recording(load)?;
-        assert_eq!(records.operands.len(), shapes.len());
+        assert_eq!(records.operands.len(), shapes.len() - 3 * config().layers);
+        assert_eq!(records.operands.iter().map(|operand| operand.lands.len()).sum::<usize>(), shapes.len());
+        let layout = RankLayout::new(records.operands.clone(), Vec::new(), 1)?;
+        let plan = layout.checked(root.path(), 8, 7)?;
+        let source_bytes = shapes.iter().map(|(_, shape)| shape.iter().product::<usize>() * 2).sum::<usize>();
+        assert_eq!(plan.totals.rank_bytes[7], source_bytes as u64);
+        assert_eq!(plan.plan.files.len(), 1);
+        assert!(plan.plan.files[0].contains("models--muse-draft/"));
         assert!(records.steps.is_empty() && records.finishes.is_empty());
         assert!(records.operands.iter().all(|operand| operand.device == 1));
         let sockets = tempfile::tempdir_in(fixture.directory())?;
         // The same receive_rank completion/commit protocol as serving, no GPU.
         crate::shared::experts::rtx::push::tests::receive_pushed(device, None, root.path(), sockets.path(),
             &records, None, 6, 1)?;
-        for (((name, _), expected), actual) in shapes.iter().zip(&mounted).zip(&pushed) {
-            let bytes = records.operands.iter().find(|o| o.lands[0].0.name == *name).context("recorded tensor")?.bytes;
+        for (((group, expected), actual), operand) in groups.iter().zip(&mounted).zip(&pushed).zip(&records.operands) {
+            let bytes = operand.bytes;
             let read = |owner: &DeviceAllocation<'_>| device.run(|| {
                 let mut out = vec![0u8; bytes];
                 library.copy_d2h(&mut out, owner.buffer)?;
                 Ok(out)
             });
-            assert_eq!(read(expected)?, read(actual)?, "{name}");
+            let expected_bytes = read(expected)?;
+            assert_eq!(expected_bytes, read(actual)?, "{group:?}");
+            let source = Source::open(&snapshot)?;
+            let native = group.iter().map(|(name, shape)| {
+                let rect = source.rect(name, shape)?;
+                let mut bytes = vec![0; rect.bytes()];
+                rect.read(&mut bytes)?;
+                Ok(bytes)
+            }).collect::<Result<Vec<_>>>()?.into_iter().flatten().collect::<Vec<_>>();
+            assert_eq!(expected_bytes, native, "mount concatenation {group:?}");
         }
         Ok(())
     }
