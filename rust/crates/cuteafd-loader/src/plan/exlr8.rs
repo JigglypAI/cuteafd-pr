@@ -1569,7 +1569,8 @@ mod mounted_tests {
                 let elapsed = start.elapsed();
                 assert!(elapsed < std::time::Duration::from_secs(30), "{name}: {elapsed:?}");
                 println!("{name} uncached={uncached} wall_seconds={:.6}", elapsed.as_secs_f64());
-                let bytes = serde_json::to_vec_pretty(&native).unwrap();
+                // Match the complete `cuteafd plan --json` payload, not a layout projection.
+                let bytes = serde_json::to_vec_pretty(&native.report).unwrap();
                 let arm = if uncached { "uncached" } else { "memoized" };
                 std::fs::write(output.join(format!("{name}-{arm}.json")), &bytes).unwrap();
                 bytes
