@@ -287,17 +287,19 @@ mod tests {
         let root = tempfile::tempdir()?;
         let mut weights = Vec::new();
         for layer in 0..2 {
-            for (projection, n, k) in [("gate", 256, 4096), ("up", 256, 4096), ("down", 4096, 256)] {
-                let name = format!("model.layers.{layer}.mlp.experts.0.{projection}_proj");
-                weights.extend(if layer == 0 { fp8(&name, n, k, None) }
-                    else { vec![t(format!("{name}.weight"), "BF16", &[n, k])] });
+            for expert in 0..8 {
+                for (projection, n, k) in [("gate", 256, 4096), ("up", 256, 4096), ("down", 4096, 256)] {
+                    let name = format!("model.layers.{layer}.mlp.experts.{expert}.{projection}_proj");
+                    weights.extend(if layer == 0 { fp8(&name, n, k, None) }
+                        else { vec![t(format!("{name}.weight"), "BF16", &[n, k])] });
+                }
             }
         }
         write_snapshot(root.path(), &serde_json::json!({}), &weights, None);
         let tensors = Fp8ExpertTensors::read(root.path(), cuteafd_loader::RoutedExpertShape {
-            layers: 2, first_layer: 0, experts: 1, topk: 8, hidden: 4096, intermediate: 256,
+            layers: 2, first_layer: 0, experts: 8, topk: 8, hidden: 4096, intermediate: 256,
             draft_stages: 0, draft_experts: 0 })?;
-        let info = Fp8MoeInfo { hidden: 4096, intermediate: 256, slice: 128, experts: 1, topk: 8,
+        let info = Fp8MoeInfo { hidden: 4096, intermediate: 256, slice: 128, experts: 8, topk: 8,
             tp: 2, wire_input: false, swiglu_limit: 10.0,
             activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product,
             projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16,
@@ -311,6 +313,26 @@ mod tests {
         for selected in [vec![(0, Slicing::Blocks(128))], vec![(0, Slicing::Blocks(128)), (1, Slicing::Blocks(128))]] {
             crate::shared::memory::push_fp8::RankPlan::from_tensors(&tensors, &selected, 2, 0, usize::MAX)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn native_push_refuses_unadmitted_single_expert_plane_padding() -> Result<()> {
+        use cuteafd_loader::plan::testing::{fp8, write_snapshot};
+        let root = tempfile::tempdir()?;
+        let mut weights = Vec::new();
+        for (projection, n, k) in [("gate", 256, 4096), ("up", 256, 4096), ("down", 4096, 256)] {
+            weights.extend(fp8(&format!("model.layers.0.mlp.experts.0.{projection}_proj"), n, k, None));
+        }
+        write_snapshot(root.path(), &serde_json::json!({}), &weights, None);
+        let tensors = Fp8ExpertTensors::read(root.path(), cuteafd_loader::RoutedExpertShape {
+            layers: 1, first_layer: 0, experts: 1, topk: 1, hidden: 4096, intermediate: 256,
+            draft_stages: 0, draft_experts: 0 })?;
+        assert_eq!(tensors.scale_region_bytes_with(cuteafd_loader::formats::fp8_experts::Fp8Projection::Gate,
+            2, 0, Slicing::Blocks(128))?, 128);
+        let error = crate::shared::memory::push_fp8::RankPlan::from_tensors(&tensors,
+            &[(0, Slicing::Blocks(128))], 2, 0, usize::MAX).err().expect("unaligned scale plane must be refused");
+        assert!(error.to_string().contains("native push plane alignment exceeds mount admission"), "{error:#}");
         Ok(())
     }
 
