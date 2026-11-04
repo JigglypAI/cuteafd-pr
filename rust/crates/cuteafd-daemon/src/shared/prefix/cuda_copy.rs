@@ -120,6 +120,24 @@ pub(crate) struct CudaCopyEngine<'a> {
 }
 
 impl<'a> CudaCopyEngine<'a> {
+    /// Registrations and retained references borrow named device owners; do not charge them twice.
+    pub(crate) fn allocation_receipts(&self,
+        inventory: &mut crate::shared::memory::receipts::Inventory<'_>, name: &str) -> Result<()> {
+        for (index, buffer) in self.chunks.iter().enumerate() {
+            if let Some(buffer) = buffer { inventory.pinned(&format!("{name}.chunk.{index}"), *buffer)?; }
+        }
+        inventory.host(&format!("{name}.chunks"), &self.chunks)?;
+        inventory.host(&format!("{name}.streams"), &self.streams)?;
+        inventory.host(&format!("{name}.batch_dsts"), &self.batch_dsts)?;
+        inventory.host(&format!("{name}.batch_srcs"), &self.batch_srcs)?;
+        inventory.host(&format!("{name}.batch_sizes"), &self.batch_sizes)?;
+        inventory.host(&format!("{name}.ordered"), &self.ordered)?;
+        inventory.host(&format!("{name}.routed"), &self.routed)?;
+        inventory.host(&format!("{name}.owners"), &self.owners)?;
+        inventory.host(&format!("{name}.retained"), &self.retained)?;
+        if let Some(regions) = &self.regions { regions.allocation_receipts(inventory, &format!("{name}.regions"))?; }
+        Ok(())
+    }
     /// Legacy single-stream-device mode. Peer-addressed ranges retain their
     /// existing behavior; registered families select the allocation owner.
     pub fn new(library: &'a NativeLibrary, template: CuteafdDeviceBuffer) -> Result<Self> {
@@ -365,6 +383,36 @@ mod cuda_tests {
     use cuteafd_hostcache::snapshot::{DevicePageId, SnapshotMeta};
     use cuteafd_hostcache::COMPRESSORS;
     use crate::shared::memory::device::{Allocation, Device};
+
+    #[test]
+    fn copy_census_reports_present_chunks_not_quota_without_native_work() -> Result<()> {
+        use crate::shared::memory::receipts::Inventory;
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Location};
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let owner = Allocation::new(Device { library: &library, id: 0 }, 256)?;
+        let mut engine = CudaCopyEngine::registered(&library, &[owner.buffer])?;
+        let physical = [0];
+        let devices = CoordinatorDevices::new(&physical)?;
+        let before = fixture.events()?;
+        let mut empty = Inventory::new(devices, "empty", Lifetime::TARGET, Category::Prefix, "copy");
+        engine.allocation_receipts(&mut empty, "host")?;
+        assert!(empty.receipts.iter().all(|r| r.allocation.location != Location::PINNED));
+        assert_eq!(fixture.events()?, before);
+        let chunk = engine.allocate_chunk(4096)?;
+        let actual = engine.chunks[chunk.id as usize].unwrap();
+        let before = fixture.events()?;
+        let mut inventory = Inventory::new(devices, "fixture", Lifetime::TARGET, Category::Prefix, "copy");
+        engine.allocation_receipts(&mut inventory, "host")?;
+        let pinned: Vec<_> = inventory.receipts.iter().filter(|r| r.allocation.location == Location::PINNED).collect();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!((pinned[0].address, pinned[0].allocation.bytes), (actual.ptr as u64, actual.bytes as u64));
+        assert!(inventory.receipts.iter().all(|r| r.allocation.location != Location::coordinator(0)),
+            "registered target buffers are borrowed, not new owners");
+        assert_eq!(fixture.events()?, before);
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]

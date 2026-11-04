@@ -331,6 +331,10 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     pub fn arena(&self) -> &MarkArena {
         &self.arena
     }
+    /// Read the already-present host tier; absence never initializes one.
+    pub fn host_engine(&self) -> Option<&E> {
+        self.host.as_ref().map(HostCache::engine)
+    }
     pub fn host_engine_mut(&mut self) -> Option<&mut E> {
         self.host.as_mut().map(HostCache::engine_mut)
     }

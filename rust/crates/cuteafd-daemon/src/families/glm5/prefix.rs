@@ -140,6 +140,21 @@ impl<'e, 'a> NativePrefix<'e, 'a> {
         Ok(Self { engine, paged, partial, scratch: DeviceAllocation::new(engine.library, 256)?, copies, draft_marks })
     }
 
+    pub(crate) fn allocation_receipts(&self,
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{Lifetime, Phase};
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "glm.prefix",
+            Lifetime { first: Phase::Warmup, last: Phase::Growth }, Category::Prefix, "prefix owners");
+        inventory.device("scratch", self.scratch.buffer)?;
+        if let Some(marks) = &self.draft_marks { inventory.device("draft_marks", marks.storage.buffer)?; }
+        // Paged descriptors borrow target KV/index storage; charge only their host container here.
+        inventory.host("paged_descriptors", &self.paged)?;
+        self.copies.allocation_receipts(&mut inventory, "copies")?;
+        Ok(inventory.receipts)
+    }
+
     /// The bytes of one prefix mark: a window-ring drafter's windows, otherwise none.
     pub fn mark_bytes(&self) -> usize { self.draft_marks.as_ref().map_or(0, DraftMarks::bytes) }
 

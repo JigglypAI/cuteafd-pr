@@ -369,7 +369,18 @@ impl GlmEngine<'_> {
             }
         }
         if let Some(alpha) = &self.weights.rope_alpha { inventory.host("rope_alpha", alpha)?; }
-        inventory.receipts.extend(self.embedding.allocation_receipts(devices)?);
+        inventory.receipts.extend(self.embedding.allocation_receipts(devices, "glm.embedding")?);
+        Ok(inventory.receipts)
+    }
+
+    pub(crate) fn serving_probe_receipts(&self) -> Result<Vec<Receipt>> {
+        let physical = self.census_physical_devices()?;
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(
+            CoordinatorDevices::new(&physical)?, "glm.serving",
+            Lifetime { first: Phase::Warmup, last: Phase::Growth }, Category::Workspace, "serving probe");
+        if let Some(probe) = self.draft_probe.try_borrow()?.as_ref() {
+            probe.allocation_receipts(&mut inventory, "draft_probe")?;
+        }
         Ok(inventory.receipts)
     }
 

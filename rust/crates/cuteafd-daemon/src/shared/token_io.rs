@@ -111,11 +111,11 @@ pub(crate) struct TokenEmbedding<'a> {
 }
 
 impl<'a> TokenEmbedding<'a> {
-    pub(crate) fn allocation_receipts(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+    pub(crate) fn allocation_receipts(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>, prefix: &str)
         -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
         use cuteafd_core::memory_layout::Category;
         use cuteafd_loader::placement::planner::Lifetime;
-        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "glm.embedding",
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, prefix,
             Lifetime::TARGET, Category::Weights, "embedding owners");
         match &self.table {
             ResidentWeight::Device(owner) => inventory.device("table", owner.buffer)?,
