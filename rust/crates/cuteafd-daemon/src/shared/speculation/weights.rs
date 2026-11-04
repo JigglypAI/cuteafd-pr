@@ -157,6 +157,41 @@ impl<'a> Load<'a> {
     }
 }
 
+/// Source-backed destinations from the admitted MLA recipe; synthetic scales
+/// are initialized separately and Uv shares its Uk source staging.
+pub(crate) fn mla_weights_into(
+    dense: &DenseLoad<'_>,
+    weights: &[cuteafd_loader::formats::dflash::MlaDraftWeight],
+    geometry: &cuteafd_loader::formats::mla::MlaGeometry,
+    destination: impl Fn(&str) -> Result<CuteafdDeviceBuffer>,
+    source: &dyn Fn(&str, &[usize]) -> Result<Rect>,
+    stream: *mut c_void,
+) -> Result<()> {
+    use cuteafd_loader::formats::dflash::MlaDraftPacking;
+    for weight in weights {
+        if matches!(weight.packing, MlaDraftPacking::UnitScale | MlaDraftPacking::Uv) { continue; }
+        let buffer = destination(&weight.owner)?;
+        let rects = weight.sources.iter().map(|(name, shape)| source(name, shape)).collect::<Result<Vec<_>>>()?;
+        if weight.packing == MlaDraftPacking::Uk {
+            let uv_id = weight.owner.strip_suffix(".uk").context("draft Uk owner suffix")?.to_owned() + ".uv";
+            absorb_into(dense, rects.into_iter().next().context("draft Uk source missing")?,
+                geometry.heads, geometry.nope, geometry.value, geometry.kv_rank,
+                buffer, destination(&uv_id)?, stream)?;
+        } else {
+            let mut bytes = 0usize;
+            let mut lands = Vec::with_capacity(rects.len());
+            for rect in rects {
+                let at = bytes;
+                bytes = bytes.checked_add(rect.bytes()).context("draft weight extent overflow")?;
+                lands.push((rect, at));
+            }
+            ensure!(buffer.bytes == bytes.max(256), "draft weight owner extent differs from packing");
+            dense.operand(Operand { device: buffer.device_id, buffer, lands, bytes })?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn absorb_into(dense: &DenseLoad<'_>, source: Rect, heads: usize, nope: usize, value: usize, latent: usize,
     uk: CuteafdDeviceBuffer, uv: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
@@ -403,6 +438,98 @@ mod tests {
             assert_eq!(floats[0].to_bits(), expected[0].to_bits());
             assert_eq!(floats[1].to_bits(), expected[1].to_bits());
             assert!(floats[2].is_finite() && floats[2] > 0.0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn ml4_recipe_joins_target_rank_and_matches_mount_after_commit() -> Result<()> {
+        use crate::shared::memory::device::Device;
+        use cuteafd_loader::{formats::{dflash::MlaDflashConfig, mla::MlaGeometry,
+            block_dspark::DsparkRotaryPlan}, families::glm5::draft_representation::{GlmDraftCapacity,
+            GlmDraftRepresentation::Bf16Only}};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 1, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        let root = tempfile::tempdir_in(fixture.directory())?;
+        let snapshot = root.path().join("models--ml4/snapshots/test");
+        std::fs::create_dir_all(&snapshot)?;
+        // Scaled source dimensions retain the native packing/rank/window recipe;
+        // no target or drafter execution programs are needed for load replay.
+        let cfg = MlaDflashConfig { mla: MlaGeometry { hidden: 128, heads: 2, q_rank: 0,
+            kv_rank: 128, nope: 64, rope: 64, value: 128 }, intermediate: 128, eps: 1e-5,
+            block: 3, group: 0, selector_rank: 512, selector_top_k: 0, taps: vec![0, 1],
+            vocab: 16, mask_token: 0, max_context: 4096, windows: vec![Some(2048); 2],
+            rotary: DsparkRotaryPlan { inv_freq: vec![1.; 32], attention_factor: 1., softmax_factor: 1. },
+            kind: cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark, markov_rank: 512 };
+        let shapes = cfg.tensor_shapes();
+        let tensors = shapes.iter().map(|(name, shape)| t(name.clone(), "BF16", shape))
+            .chain(std::iter::once(t("model.norm.weight", "BF16", &[128]))).collect::<Vec<_>>();
+        let path = snapshot.join("model.safetensors");
+        write_safetensors(&path, &tensors);
+        let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        for tensor in read_safetensors_metadata(&path)? {
+            let bytes = (0..tensor.byte_length / 2).flat_map(|i|
+                (((i % 7) as f32 * 0.25).to_bits().wrapping_shr(16) as u16).to_le_bytes()).collect::<Vec<_>>();
+            file.write_all_at(&bytes, tensor.byte_offset)?;
+        }
+        let layout = cfg.runtime_layout(Bf16Only, GlmDraftCapacity::new(1, 1, 3)?,
+            4096, 4096, 1, 0, cuteafd_core::MlaCacheFormat::Fp8)?;
+        let source = Source::open(&snapshot)?;
+        let device = Device { library: &library, id: 1 };
+        let load = || device.run(|| {
+            let dense = DenseLoad::mount(&library);
+            let mut owners = std::collections::BTreeMap::new();
+            for weight in layout.weight_destinations() {
+                let owner = DeviceAllocation::new(&library, (weight.shape.iter().product::<usize>() * 2).max(256))?;
+                if weight.packing == cuteafd_loader::formats::dflash::MlaDraftPacking::UnitScale {
+                    library.copy_h2d(owner.buffer, &weight.pack(&mut |_, _| unreachable!())?)?;
+                }
+                owners.insert(weight.owner.clone(), owner);
+            }
+            mla_weights_into(&dense, layout.weight_destinations(), &cfg.mla,
+                |name| Ok(owners.get(name).context("fixture destination")?.buffer),
+                &|name, shape| source.rect(name, shape), std::ptr::null_mut())?;
+            let norms = DeviceAllocation::new(&library, cfg.vocab * 4)?;
+            dense.finish(Finish::RowNorms { source: owners["weight.autoregressive_head.output.weight"].buffer,
+                norms: norms.buffer, rows: cfg.vocab, cols: cfg.markov_rank }, std::ptr::null_mut())?;
+            owners.insert("markov_norms".into(), norms);
+            let target = DeviceAllocation::new(&library, 256)?;
+            dense.operand(Operand { device: 1, buffer: target.buffer, bytes: 256,
+                lands: vec![(source.rect("model.norm.weight", &[128])?, 0)] })?;
+            owners.insert("target.norm".into(), target);
+            Ok(owners)
+        });
+        let mounted = load()?;
+        let (pushed, records) = dense::recording(load)?;
+        let rank = RankLayout::new(records.operands.clone(), records.steps.clone(), 1)?.with_finishes(&records.finishes);
+        let plan = rank.checked(root.path(), 8, 7)?;
+        let bytes = shapes.iter().map(|(_, shape)| shape.iter().product::<usize>() * 2).sum::<usize>();
+        assert_eq!(plan.totals.rank_bytes[7], (bytes + 256) as u64);
+        assert_eq!(plan.plan.files.len(), 1);
+        assert!(plan.plan.entries.iter().all(|entry| entry.rank == 7));
+        assert_eq!(records.finishes.len(), 1);
+        let names = records.operands.iter().flat_map(|o| o.lands.iter().map(|(r, _)| &r.name))
+            .chain(records.steps.iter().flat_map(|s| s.rects.iter().map(|r| &r.name)))
+            .collect::<std::collections::BTreeSet<_>>();
+        for (name, _) in &shapes { assert!(names.contains(name), "missing draft source {name}"); }
+        assert!(names.contains(&"model.norm.weight".to_owned()));
+        let sockets = tempfile::tempdir_in(fixture.directory())?;
+        crate::shared::experts::rtx::push::tests::receive_pushed(device, None, root.path(), sockets.path(),
+            &records, None, 6, 1)?;
+        for (name, expected) in &mounted {
+            let actual = &pushed[name];
+            let read = |owner: &DeviceAllocation<'_>| device.run(|| {
+                let mut bytes = vec![0; owner.buffer.bytes];
+                library.copy_d2h(&mut bytes, owner.buffer)?;
+                Ok(bytes)
+            });
+            // Sub-256-byte allocation padding is not checkpoint state.
+            let bytes = layout.weight_destinations().iter().find(|w| w.owner == *name)
+                .map_or(expected.buffer.bytes, |w| w.shape.iter().product::<usize>() * 2);
+            assert_eq!(&read(expected)?[..bytes], &read(actual)?[..bytes], "{name}");
         }
         Ok(())
     }

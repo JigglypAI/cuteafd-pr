@@ -1366,7 +1366,7 @@ impl<'a> DflashDrafter<'a> {
         source: &dyn Fn(&str, &[usize]) -> Result<crate::shared::experts::rtx::dense::Rect>) -> Result<Self> {
         use cuteafd_ffi::mla_draft::MlaDraft;
         use cuteafd_loader::formats::dflash::MlaDraftPacking;
-        use crate::shared::experts::rtx::dense::{DenseLoad, Finish, Operand};
+        use crate::shared::experts::rtx::dense::{DenseLoad, Finish};
         let _scope = cuteafd_ffi::memory_ledger::scope("drafter");
         ensure!(native.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark,
             "load_ml4 takes the mtp_dspark draft kind");
@@ -1380,27 +1380,12 @@ impl<'a> DflashDrafter<'a> {
         let mut owners = MlaDraftStorage::allocate(library, layout.clone())?.into_owners()?;
         let dense = DenseLoad::mount(library);
         // Destination owners and source rectangles both come from the admitted recipe.
-        for weight in layout.weight_destinations() {
+        for weight in layout.weight_destinations().iter().filter(|w| w.packing == MlaDraftPacking::UnitScale) {
             let owner = owners.owners.get(&weight.owner).context("draft weight owner missing")?;
-            if weight.packing == MlaDraftPacking::UnitScale {
-                library.copy_h2d(owner.buffer, &weight.pack(&mut |_, _| unreachable!("synthetic unit scale"))?)?;
-                continue;
-            }
-            if weight.packing == MlaDraftPacking::Uv { continue; } // Written with Uk from one staged source.
-            let rects = weight.sources.iter().map(|(name, shape)| source(name, shape)).collect::<Result<Vec<_>>>()?;
-            if weight.packing == MlaDraftPacking::Uk {
-                let uv_id = weight.owner.strip_suffix(".uk").context("draft Uk owner suffix")?.to_owned() + ".uv";
-                let uv = owners.owners.get(&uv_id).context("draft Uv owner missing")?;
-                super::weights::absorb_into(&dense, rects.into_iter().next().context("draft Uk source missing")?,
-                    native.mla.heads, native.mla.nope, native.mla.value, native.mla.kv_rank,
-                    owner.buffer, uv.buffer, stream)?;
-            } else {
-                let mut bytes = 0usize;
-                let lands = rects.into_iter().map(|rect| { let at = bytes; bytes += rect.bytes(); (rect, at) }).collect();
-                ensure!(owner.buffer.bytes == bytes.max(256), "draft weight owner extent differs from packing");
-                dense.operand(Operand { device: owner.buffer.device_id, buffer: owner.buffer, lands, bytes })?;
-            }
+            library.copy_h2d(owner.buffer, &weight.pack(&mut |_, _| unreachable!("synthetic unit scale"))?)?;
         }
+        super::weights::mla_weights_into(&dense, layout.weight_destinations(), &native.mla,
+            |name| Ok(owners.owners.get(name).context("draft weight owner missing")?.buffer), source, stream)?;
         let tensor = |owners: &mut AdmittedBuffers<Dev<'a>>, name: &str, shape: &[usize]| -> Result<Dev<'a>> {
             let id = format!("weight.{name}");
             let recipe = layout.weight_destinations().iter().find(|w| w.owner == id)
