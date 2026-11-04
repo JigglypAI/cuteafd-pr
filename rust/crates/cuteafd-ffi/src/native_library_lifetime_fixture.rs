@@ -278,6 +278,13 @@ impl Fixture {
         Ok(())
     }
 
+    pub fn reserve_ordered_upload(&self, library: &NativeLibrary, dst: CuteafdDeviceBuffer,
+        stream: usize) -> Result<()> {
+        // SAFETY: the CPU fixture owns this destination and accepts a synthetic
+        // stream; reservation records no pending copy or consumer.
+        unsafe { library.reserve_h2d_ordered(dst, stream as *mut c_void) }
+    }
+
     pub fn finish_ordered_uploads(&self, library: &NativeLibrary) -> Result<()> {
         library.release_ordered_h2d_staging()
     }

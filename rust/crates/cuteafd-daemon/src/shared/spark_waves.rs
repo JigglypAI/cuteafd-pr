@@ -1055,6 +1055,16 @@ impl<'a> ExchangeStorage<'a> {
         Ok(())
     }
 
+    pub(crate) fn allocation_aliases(&self, census: &mut crate::shared::memory::receipts::Census,
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>, name: &str) -> Result<()> {
+        for (field, owner) in [("control", Some(&self.control)), ("pull", self.pull_block.as_ref())] {
+            if let Some(owner) = owner {
+                census.mapped_pinned(owner.library, devices, format!("{name}.{field}.mapped"), owner.buffer)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(library: &'a NativeLibrary, intake: &Intake) -> Result<Self> {
         let slots = intake.geometry.slots();
         let pinned = intake.pinned() != 0;
@@ -1151,6 +1161,19 @@ impl<'a> Waves<'a> {
         inventory.host(&format!("{name}.unread"), &self.unread)?;
         inventory.host(&format!("{name}.uses"), &self.uses)?;
         inventory.host(&format!("{name}.grouping"), &self.grouping)
+    }
+
+    pub(crate) fn allocation_aliases(&self, census: &mut crate::shared::memory::receipts::Census,
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>, name: &str) -> Result<()> {
+        // Report whole egress backing, not a separately charged alias per slot.
+        let mut observed = std::collections::BTreeSet::new();
+        for (slot, arena) in self.arenas.iter().enumerate() {
+            let buffer = arena.allocation_buffer();
+            if observed.insert((buffer.ptr as usize, buffer.bytes)) {
+                census.mapped_pinned(self.library, devices, format!("{name}.egress.{slot}.mapped"), buffer)?;
+            }
+        }
+        Ok(())
     }
 
     /// Starts the worker on `transport` (bootstrapped; connections open) for

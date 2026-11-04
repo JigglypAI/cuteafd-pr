@@ -1605,6 +1605,12 @@ impl<'a> SparkLink<'a> {
             Lifetime::TARGET, Category::Transport, "Spark link");
         self.allocation_receipts(&mut inventory, "storage")?;
         census.owners(inventory.receipts);
+        if let Some(storage) = self.intake.exchange_storage.try_borrow()?.as_ref() {
+            storage.allocation_aliases(&mut census, devices, &format!("{prefix}.storage.intake.exchange"))?;
+        }
+        if let Some(exchange) = &self.exchange {
+            exchange.allocation_aliases(&mut census, devices, &format!("{prefix}.storage.waves"))?;
+        }
         let mut transport = match (&self.exchange, &self.transport) {
             (Some(exchange), None) => exchange.worker_allocation_census(),
             (None, Some(transport)) => transport.allocation_census(),

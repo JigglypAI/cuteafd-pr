@@ -108,6 +108,7 @@ impl DflashDrafter<'_> {
                 }
             }
         }
+        inventory.ordered_uploads(self.library, self.stream)?;
         Ok(inventory.receipts)
     }
 }

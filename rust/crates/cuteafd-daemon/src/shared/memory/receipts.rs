@@ -47,6 +47,18 @@ impl Census {
             address: buffer.ptr as u64, bytes: buffer.bytes as u64 });
         Ok(())
     }
+    pub(crate) fn mapped_pinned(&mut self, library: &cuteafd_ffi::NativeLibrary,
+        devices: CoordinatorDevices<'_>, owner: String, buffer: CuteafdHostBuffer) -> Result<()> {
+        ensure!(buffer.flags & cuteafd_ffi::CUTEAFD_HOST_BUFFER_FLAG_MAPPED != 0,
+            "retained host owner is not mapped: {owner}");
+        let backing = self.receipts.iter().find(|receipt| receipt.allocation.view.is_none()
+            && receipt.allocation.location == Location::PINNED && receipt.address == buffer.ptr as u64
+            && receipt.allocation.bytes == buffer.bytes as u64)
+            .context("mapped pinned owner has no whole retained backing")?.allocation.id.clone();
+        let alias = library.cuda_host_buffer_device_alias(buffer)?;
+        ensure!(alias.bytes == buffer.bytes, "mapped alias extent differs from backing: {owner}");
+        self.mapped(owner, backing, alias, devices)
+    }
     pub(crate) fn transport(&mut self, prefix: &str, transport: cuteafd_transport::TransportAllocationCensus,
         devices: CoordinatorDevices<'_>, lifetime: Lifetime) -> Result<()> {
         ensure!(transport.pinned_frame_audits.is_empty(), "unresolved pinned-frame audit in {prefix}");
@@ -202,6 +214,34 @@ impl<'a> Inventory<'a> {
         self.receipts.last_mut().unwrap().allocation.view = Some(View { backing, offset });
         Ok(())
     }
+    /// Existing per-destination stores only: looking up an unprimed owner never
+    /// reserves staging or waits for a copy. Actual aliases keep their own keys.
+    pub(crate) fn ordered_uploads(&mut self, library: &cuteafd_ffi::NativeLibrary,
+        stream: *mut std::ffi::c_void) -> Result<()> {
+        use cuteafd_loader::placement::planner::{Device, Domain};
+        let mut uploads = Vec::new();
+        let mut observed = std::collections::BTreeSet::new();
+        for receipt in &self.receipts {
+            let allocation = &receipt.allocation;
+            if allocation.location.domain != Domain::Device { continue; }
+            let Device::Coordinator(rank) = allocation.location.device else {
+                anyhow::bail!("ordered upload destination is not coordinator-owned");
+            };
+            let device_id = self.devices.physical_device(rank)?;
+            if !observed.insert((device_id, receipt.address)) { continue; }
+            let dst = CuteafdDeviceBuffer { ptr: receipt.address as *mut std::ffi::c_void,
+                bytes: allocation.bytes.try_into()?, device_id, flags: 0 };
+            if let Some(buffer) = library.ordered_h2d_staging_buffer(dst, stream)? {
+                let name = allocation.id.strip_prefix(&format!("{}.", self.prefix))
+                    .context("ordered upload destination is outside inventory prefix")?;
+                uploads.push((format!("{name}.upload"), buffer));
+            }
+        }
+        for (name, buffer) in uploads {
+            self.pinned(&name, buffer)?;
+        }
+        Ok(())
+    }
     pub(crate) fn pinned(&mut self, name: &str, buffer: CuteafdHostBuffer) -> Result<()> {
         self.add(name, Location::PINNED, buffer.ptr as u64, buffer.bytes as u64)
     }
@@ -320,6 +360,71 @@ mod tests {
         let mut census = Census::default();
         census.owners(vec![receipt("pinned", Location::PINNED, 0x1000, 1024, Lifetime::TARGET), view]);
         assert!(census.normalize(PhaseOrder::DRAFT_THEN_TARGET).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_pinned_census_uses_whole_backing_without_native_work() -> Result<()> {
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let owner = crate::shared::memory::HostAllocation::new(&library, 1024)?;
+        library.cuda_set_device(1)?;
+        let devices = [1, 0];
+        let devices = CoordinatorDevices::new(&devices)?;
+        let mut inventory = Inventory::new(devices, "fixture", Lifetime::TARGET, Category::Transport, "fixture");
+        let slot = CuteafdHostBuffer { ptr: (owner.buffer.ptr as usize + 128) as *mut _, bytes: 256, ..owner.buffer };
+        inventory.backed_pinned("slot", slot, owner.buffer)?;
+        let mut census = Census::default();
+        census.owners(inventory.receipts);
+        let before = fixture.events()?;
+        census.mapped_pinned(&library, devices, "fixture.mapped".into(), owner.buffer)?;
+        census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
+        assert_eq!(census.aliases.len(), 1);
+        let alias = &census.aliases[0];
+        assert_eq!((alias.address, alias.bytes, alias.location),
+            (owner.buffer.ptr as u64, 1024, Location::coordinator(0)));
+        assert_eq!(alias.backing, "fixture.slot.backing");
+        assert_eq!(census.receipts.iter().filter(|r| r.allocation.view.is_none())
+            .map(|r| r.allocation.bytes).sum::<u64>(), 1024);
+        assert!(census.mapped_pinned(&library, devices, "bad".into(), slot).is_err());
+        assert_eq!(fixture.events()?, before);
+        assert_eq!(library.cuda_get_device()?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_upload_census_is_absent_until_reserved_and_never_resizes() -> Result<()> {
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let mut buffer = library.alloc_device_buffer(1024)?;
+        let physical = [1, 0];
+        let devices = CoordinatorDevices::new(&physical)?;
+        let stream = 17;
+        let inventory = || -> Result<Inventory<'_>> {
+            let mut inventory = Inventory::new(devices, "fixture", Lifetime::TARGET, Category::Drafter, "fixture");
+            inventory.device("metadata", buffer)?;
+            inventory.device("same_destination", buffer)?;
+            Ok(inventory)
+        };
+        let before = fixture.events()?;
+        let mut absent = inventory()?;
+        absent.ordered_uploads(&library, stream as *mut _)?;
+        assert_eq!(absent.receipts.len(), 2);
+        assert_eq!(fixture.events()?, before);
+        fixture.reserve_ordered_upload(&library, buffer, stream)?;
+        let actual = library.ordered_h2d_staging_buffer(buffer, stream as *mut _)?.unwrap();
+        library.cuda_set_device(1)?;
+        let before = fixture.events()?;
+        let mut present = inventory()?;
+        present.ordered_uploads(&library, stream as *mut _)?;
+        assert_eq!(present.receipts.len(), 3);
+        let receipt = &present.receipts[2];
+        assert_eq!((receipt.address, receipt.allocation.bytes, receipt.allocation.location),
+            (actual.ptr as u64, actual.bytes as u64, Location::PINNED));
+        assert_eq!(fixture.events()?, before, "no reserve, resize, synchronize or copy during census");
+        assert_eq!(library.cuda_get_device()?, 1);
+        fixture.finish_ordered_uploads(&library)?;
+        library.free_device_buffer(&mut buffer)?;
         Ok(())
     }
 

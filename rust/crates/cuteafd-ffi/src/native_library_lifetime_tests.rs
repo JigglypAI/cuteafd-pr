@@ -110,6 +110,43 @@ fn cached_k6_wire_owners_match_diagnostic_rounding() -> Result<()> {
 
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn staging_census_getters_preserve_absence_backing_and_native_history() -> Result<()> {
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    let mut dst = library.alloc_device_buffer(32)?;
+    let stream = 1usize as *mut c_void;
+    let audit = memory_ledger::AllocationAudit::begin();
+    let before = fixture.events()?;
+    assert!(library.sync_h2d_staging_buffer()?.is_none());
+    assert!(library.ordered_h2d_staging_buffer(dst, stream)?.is_none());
+    assert_eq!(audit.checkpoint(), 0);
+    assert_eq!(fixture.events()?, before);
+    fixture.stage(&library)?;
+    fixture.reserve_ordered_upload(&library, dst, stream as usize)?;
+    let position = audit.checkpoint();
+    let before = fixture.events()?;
+    let sync = library.sync_h2d_staging_buffer()?.unwrap();
+    let ordered = library.ordered_h2d_staging_buffer(dst, stream)?.unwrap();
+    assert_eq!(sync.bytes, 64);
+    assert_eq!(ordered.bytes, dst.bytes);
+    assert_ne!(sync.ptr, ordered.ptr);
+    assert!(library.ordered_h2d_staging_buffer(dst, 2usize as *mut c_void)?.is_none());
+    assert!(library.ordered_h2d_staging_buffer(CuteafdDeviceBuffer { device_id: 1, ..dst }, stream)?.is_none());
+    assert_eq!(library.sync_h2d_staging_buffer()?.unwrap().ptr, sync.ptr);
+    assert_eq!(library.ordered_h2d_staging_buffer(dst, stream)?.unwrap().ptr, ordered.ptr);
+    assert_eq!(audit.checkpoint(), position);
+    assert_eq!(fixture.events()?, before, "getters never allocate, copy, fence or free");
+    assert_eq!(library.cuda_get_device()?, 0);
+    library.release_ordered_h2d_staging()?;
+    library.release_sync_h2d_staging()?;
+    assert!(library.sync_h2d_staging_buffer()?.is_none());
+    assert!(library.ordered_h2d_staging_buffer(dst, stream)?.is_none());
+    library.free_device_buffer(&mut dst)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn ordered_upload_retains_each_source_until_its_copy_event() -> Result<()> {
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
