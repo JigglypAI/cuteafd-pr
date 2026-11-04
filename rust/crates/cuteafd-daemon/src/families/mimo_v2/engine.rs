@@ -2070,13 +2070,13 @@ impl<'a> MimoEngine<'a> {
             Some(Experts::Spark { decode: transport, .. }) => Some(transport.borrow_mut()),
             _ => None,
         };
-        let planes = match link.as_mut() {
+        let reduction = match link.as_mut() {
             Some(link) => {
                 let exchange = link.exchange()?;
                 ensure!(exchange.waves() == 1, "MiMo decode graphs bake one return slot's planes");
-                exchange.planes(0)
+                Some(exchange.reduction(0))
             }
-            None => [std::ptr::null(); MAX_RANKS],
+            None => None,
         };
         let bf16_input = self.expert_bf16_input(true);
         // The previous layer's wave: landed (a device wait) before the segment
@@ -2096,7 +2096,7 @@ impl<'a> MimoEngine<'a> {
                 (None, _) => None,
             };
             self.graph(0, key, launch, || self.decode_segment(index, previous, w, w1, tables, t, gather, key.head,
-                planes, bf16_input))?;
+                reduction, bf16_input))?;
             if let (Some(slot), Some(link)) = (landed, link.as_mut()) {
                 // The planes are free for the next wave once the stream passes this segment's reduce.
                 link.exchange()?.consumed(slot, self.stream)?;
@@ -2144,7 +2144,7 @@ impl<'a> MimoEngine<'a> {
     /// Rank 0's decode segment `index` (see [`Self::decode_layers`]).
     #[allow(clippy::too_many_arguments)]
     fn decode_segment(&self, index: usize, previous: Previous, w: &Workspace<'_>, w1: Option<&Workspace<'_>>,
-        tables: &StepTables, t: usize, gather: bool, head: bool, planes: [*const u16; MAX_RANKS], bf16_input: bool)
+        tables: &StepTables, t: usize, gather: bool, head: bool, reduction: Option<crate::shared::spark_waves::ReplyReduction>, bf16_input: bool)
         -> Result<()> {
         let layers = &self.weights.layers;
         let rows = Scalar::I32(t as i32);
@@ -2160,12 +2160,12 @@ impl<'a> MimoEngine<'a> {
                 self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes)?;
             }
         }
-        if let Previous::Planes(ranks) = previous {
+        if let Previous::Planes(_) = previous {
             // SAFETY: the decode transport's intake planes, the zero plane and delta are live
             // [t, h] BF16 buffers; the planes hold the wave's partials once the stream gets here.
             unsafe {
-                self.library.v41_compact_reducer()?.reduce_planes(planes, ranks as u32, w.zero_plane.buffer.ptr.cast(),
-                    w.delta.buffer.ptr.cast(), t as u32, self.stream)?;
+                reduction.context("decode reply reduction")?.launch(self.library, w.zero_plane.buffer.ptr.cast(),
+                    w.delta.buffer.ptr.cast(), t, self.stream)?;
             }
         }
         // h += the previous layer's FFN output; x = this layer's input norm (or the final norm).

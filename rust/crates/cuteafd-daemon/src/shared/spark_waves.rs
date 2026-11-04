@@ -131,6 +131,31 @@ fn for_compressed_reply<T>(eligible: bool, codec: Option<&T>, ranks: usize,
     Ok(())
 }
 
+/// Slot-owned reply reduction binding, never a raw-BF16 plane view. Copies
+/// retain the owner's stream/graph lifetime contract, not ownership of storage.
+#[derive(Clone, Copy)]
+pub(crate) struct ReplyReduction {
+    planes: [*const u16; MAX_INTAKE_RANKS],
+    ranks: u32,
+}
+
+impl ReplyReduction {
+    /// Launches the same reduction used by `Waves::reduce`, without consuming
+    /// the slot. Captured decode publishes consumption after each replay.
+    ///
+    /// # Safety
+    /// The owner and its unchanged slot cut outlive stream completion and all
+    /// graph replays. `land` precedes every execution; shared/output are live
+    /// BF16 [rows, hidden] views on this device, with no plane/output overlap.
+    pub(crate) unsafe fn launch(self, library: &NativeLibrary, shared: *const u16,
+        output: *mut u16, rows: usize, stream: *mut c_void) -> Result<()> {
+        // SAFETY: land currently expands compressed replies before this launch;
+        // the opaque binding cannot be passed to a raw-BF16 reducer by callers.
+        unsafe { library.v41_compact_reducer()?.reduce_planes(self.planes, self.ranks, shared,
+            output, u32::try_from(rows)?, stream) }
+    }
+}
+
 /// A wave handed to the worker; land it with [`Waves::land`], oldest first.
 #[derive(Debug)]
 #[must_use = "every sent wave must be landed in dispatch order"]
@@ -1333,11 +1358,20 @@ impl<'a> Waves<'a> {
         reached(self.words.load(Counter::Landed), ticket.sequence)
     }
 
-    /// Plane pointers of return slot `slot` (rank order), for the reduce.
-    pub(crate) fn planes(&self, slot: usize) -> [*const u16; MAX_INTAKE_RANKS] {
-        let mut pointers = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
-        for (pointer, plane) in pointers.iter_mut().zip(self.slot_planes(slot)) { *pointer = plane.ptr.cast(); }
-        pointers
+    /// Opaque slot binding for a captured reduction. It exposes no BF16 view:
+    /// the slot may carry packed wire bytes before `land` expands them.
+    /// The owner must drain every graph using it before changing the slot cut.
+    pub(crate) fn reduction(&self, slot: usize) -> ReplyReduction {
+        let mut planes = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
+        for (pointer, plane) in planes.iter_mut().zip(self.slot_planes(slot)) { *pointer = plane.ptr.cast(); }
+        ReplyReduction { planes, ranks: self.ranks as u32 }
+    }
+
+    /// Byte addresses for Muse's separate partial-wire region tables, not a
+    /// combined-reply BF16 view. Its combine kernel interprets each region.
+    pub(crate) fn partial_reply_addresses(&self, slot: usize) -> Result<Vec<u64>> {
+        ensure!(cuteafd_core::expert_geometry().partial_replies(), "partial reply addresses require partial-wire geometry");
+        Ok(self.slot_planes(slot).map(|plane| plane.ptr as u64).collect())
     }
 
     pub(crate) fn ranks(&self) -> usize { self.ranks }
@@ -1368,8 +1402,7 @@ impl<'a> Waves<'a> {
         stream: *mut c_void) -> Result<()> {
         // SAFETY: forwarded from this function's contract.
         unsafe {
-            self.library.v41_compact_reducer()?.reduce_planes(self.planes(slot), self.ranks as u32, shared,
-                output, u32::try_from(rows)?, stream)?;
+            self.reduction(slot).launch(self.library, shared, output, rows, stream)?;
         }
         self.consumed(slot, stream)
     }
