@@ -39,7 +39,7 @@ mod protocol_v2_tcp;
 mod synthetic;
 mod verbs;
 pub use verbs::{load_verbs_host_native_library, set_verbs_host_native_library_path,
-    TransportAllocationCensus, TransportDeviceAlias, TransportHostAllocation, UnclassifiedTransportOwner};
+    PinnedFrameAudit, TransportAllocationCensus, TransportDeviceAlias, TransportHostAllocation, UnclassifiedTransportOwner};
 
 pub use capabilities::{
     VERBS_HOST_APP_TRANSPORT_BLOCKER, VERBS_HOST_APP_TRANSPORT_STATUS,

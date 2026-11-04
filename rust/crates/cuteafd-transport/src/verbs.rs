@@ -38,6 +38,7 @@ pub struct TransportHostAllocation {
     pub bytes: u64,
     pub flags: u64,
     pub mapped: Option<TransportDeviceAlias>,
+    pub audit_owner: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransportDeviceAlias {
@@ -53,16 +54,63 @@ pub struct UnclassifiedTransportOwner {
 pub struct TransportAllocationCensus {
     pub host: Vec<TransportHostAllocation>,
     pub unclassified: Vec<UnclassifiedTransportOwner>,
+    pub pinned_frame_audits: Vec<PinnedFrameAudit>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinnedFrameAudit {
+    pub owner: String,
+    pub records: Vec<cuteafd_ffi::memory_ledger::AllocationRecord>,
+}
+impl PinnedFrameAudit {
+    fn observe(owner: &str) -> Self {
+        Self { owner: owner.into(), records: cuteafd_ffi::memory_ledger::allocations().into_iter().filter(|record|
+            record.key.space == cuteafd_ffi::memory_ledger::Space::Pinned
+                && record.key.owner == Some(owner)).collect() }
+    }
 }
 impl TransportAllocationCensus {
     pub fn unavailable(owner: impl Into<String>, reason: impl Into<String>) -> Self {
         Self { host: Vec::new(), unclassified: vec![UnclassifiedTransportOwner {
             owner: owner.into(), reason: reason.into(),
-        }] }
+        }], pinned_frame_audits: Vec::new() }
     }
     pub fn extend(&mut self, other: Self) {
         self.host.extend(other.host);
         self.unclassified.extend(other.unclassified);
+        self.pinned_frame_audits.extend(other.pinned_frame_audits);
+    }
+    /// Resolve only exact attributed native records, after pool and held-frame
+    /// census are combined. This never receives from the recycle channel.
+    pub fn resolve_recycled_frames(&mut self) {
+        use std::collections::BTreeSet;
+        let mut owners = BTreeSet::new();
+        for audit in std::mem::take(&mut self.pinned_frame_audits) {
+            if !owners.insert(audit.owner.clone()) { continue; }
+            if audit.records.iter().any(|record| record.key.space != cuteafd_ffi::memory_ledger::Space::Pinned
+                || record.key.owner != Some(audit.owner.as_str()) || record.address == 0 || record.bytes == 0)
+                || audit.records.iter().map(|record| record.address).collect::<BTreeSet<_>>().len() != audit.records.len() {
+                self.unclassified.push(UnclassifiedTransportOwner { owner: audit.owner,
+                    reason: "pinned frame audit contains invalid or foreign worker allocation records".into() });
+                continue;
+            }
+            let visible: BTreeSet<_> = self.host.iter().filter(|frame|
+                frame.audit_owner.as_deref() == Some(audit.owner.as_str()))
+                .map(|frame| (frame.address, frame.bytes)).collect();
+            if visible.iter().any(|frame| !audit.records.iter().any(|record|
+                (record.address as u64, record.bytes as u64) == *frame)) {
+                self.unclassified.push(UnclassifiedTransportOwner { owner: audit.owner,
+                    reason: "pinned frame audit cannot attribute every visible allocation to this worker".into() });
+                continue;
+            }
+            for record in &audit.records {
+                if visible.contains(&(record.address as u64, record.bytes as u64)) { continue; }
+                self.host.push(TransportHostAllocation {
+                    owner: format!("{}.pinned frames in recycle queues (audit-derived).{:x}", audit.owner, record.address),
+                    address: record.address as u64, bytes: record.bytes as u64,
+                    flags: CUTEAFD_HOST_BUFFER_FLAG_PINNED, mapped: None, audit_owner: Some(audit.owner.clone()),
+                });
+            }
+        }
     }
     fn host_buffer(&mut self, owner: String, buffer: CuteafdHostBuffer) {
         if buffer.bytes == 0 { return; }
@@ -71,7 +119,7 @@ impl TransportAllocationCensus {
             return;
         }
         self.host.push(TransportHostAllocation { owner, address: buffer.ptr as u64,
-            bytes: buffer.bytes as u64, flags: buffer.flags, mapped: None });
+            bytes: buffer.bytes as u64, flags: buffer.flags, mapped: None, audit_owner: None });
     }
     fn endpoint_view(&mut self, owner: String, view: Result<CuteafdRdmaRcEndpointBufferView>) {
         let view = match view {
@@ -93,7 +141,7 @@ impl TransportAllocationCensus {
             } else { Some(TransportDeviceAlias { address: view.device_ptr as u64, device: view.device_id }) }
         } else { None };
         self.host.push(TransportHostAllocation { owner, address: view.host_ptr as u64,
-            bytes: view.bytes as u64, flags: view.host_flags, mapped });
+            bytes: view.bytes as u64, flags: view.host_flags, mapped, audit_owner: None });
     }
 }
 
@@ -846,6 +894,7 @@ struct VerbsHostProtocolV2PinnedResponseFrame {
     library: Arc<NativeLibrary>,
     buffer: CuteafdHostBuffer,
     len: usize,
+    audit_owner: String,
 }
 
 // The native allocation is portable CUDA-pinned host storage. Ownership of a
@@ -858,7 +907,8 @@ unsafe impl Send for VerbsHostProtocolV2PinnedResponseFrame {}
 unsafe impl Sync for VerbsHostProtocolV2PinnedResponseFrame {}
 
 impl VerbsHostProtocolV2PinnedResponseFrame {
-    fn new(library: Arc<NativeLibrary>, len: usize) -> Result<Self> {
+    fn new(library: Arc<NativeLibrary>, len: usize, audit_owner: &str) -> Result<Self> {
+        let _owner = cuteafd_ffi::memory_ledger::owner(audit_owner);
         let buffer = library
             .alloc_host_buffer(len)
             .context("allocating pinned verbs-host response frame")?;
@@ -866,6 +916,7 @@ impl VerbsHostProtocolV2PinnedResponseFrame {
             library,
             buffer,
             len,
+            audit_owner: audit_owner.into(),
         })
     }
 
@@ -1040,6 +1091,8 @@ impl VerbsHostProtocolV2ResponsePayload {
         let mut census = TransportAllocationCensus::default();
         if let Some(frame) = &self.pinned_frame {
             census.host_buffer(format!("{owner}.copy"), frame.buffer);
+            if let Some(receipt) = census.host.last_mut() { receipt.audit_owner = Some(frame.audit_owner.clone()); }
+            census.pinned_frame_audits.push(PinnedFrameAudit::observe(&frame.audit_owner));
         }
         if let Some(frame) = &self.registered_frame {
             census.extend(frame.allocation_census(owner));
@@ -1110,6 +1163,70 @@ impl Drop for VerbsHostProtocolV2ResponsePayload {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn transport_census_observes_native_pinned_recycle_queue_without_consuming_it() -> Result<()> {
+    let root = PathBuf::from(env::var_os("HOME").context("HOME is unset")?).join(".cache/cuteafd/builds");
+    let directory = tempfile::Builder::new().prefix("transport-census-").tempdir_in(root)?;
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_in(directory.path())?;
+    let library = Arc::new(fixture.load()?);
+    let owner = format!("fixture.{}.pinned_frames", directory.path().display());
+    let frame = VerbsHostProtocolV2PinnedResponseFrame::new(library, 1024, &owner)?;
+    let actual = (frame.buffer.ptr as u64, frame.buffer.bytes as u64);
+    let (bytes_tx, _bytes_rx) = mpsc::channel();
+    let (pinned_tx, pinned_rx) = mpsc::channel();
+    let payload = VerbsHostProtocolV2ResponsePayload::from_response_frame(
+        VerbsHostProtocolV2ResponseFrame::Pinned(frame), 16, 128, bytes_tx, pinned_tx)?;
+    let before = fixture.events()?;
+    let mut held = payload.allocation_census("held");
+    held.resolve_recycled_frames();
+    assert!(held.unclassified.is_empty());
+    assert_eq!(held.host.len(), 1, "held payload charges the whole actual allocation, not only its subview");
+    assert_eq!((held.host[0].address, held.host[0].bytes), actual);
+    assert_eq!(fixture.events()?, before);
+    drop(payload);
+    let before = fixture.events()?;
+    let mut recycled = TransportAllocationCensus::default();
+    recycled.pinned_frame_audits.push(PinnedFrameAudit::observe(&owner));
+    recycled.resolve_recycled_frames();
+    assert!(recycled.unclassified.is_empty());
+    assert_eq!(recycled.host.len(), 1);
+    assert_eq!((recycled.host[0].address, recycled.host[0].bytes), actual);
+    assert!(recycled.host[0].owner.contains("pinned frames in recycle queues (audit-derived)"));
+    assert_eq!(fixture.events()?, before);
+    let frame = pinned_rx.try_recv().context("census consumed the recycle queue")?;
+    assert_eq!((frame.buffer.ptr as u64, frame.buffer.bytes as u64), actual);
+    assert!(matches!(pinned_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn transport_census_resolves_only_worker_attributed_recycle_frames() {
+    use cuteafd_ffi::memory_ledger::{AllocationRecord, Key, Space};
+    let record = |address, bytes, owner| AllocationRecord { address, bytes,
+        key: Key { space: Space::Pinned, device: -1, scope: "fixture", owner: Some(owner), tensor: None, format: None } };
+    let visible = TransportHostAllocation { owner: "visible".into(), address: 0x1000, bytes: 512,
+        flags: CUTEAFD_HOST_BUFFER_FLAG_PINNED, mapped: None, audit_owner: Some("worker.a".into()) };
+    let mut census = TransportAllocationCensus { host: vec![visible.clone()], unclassified: Vec::new(),
+        pinned_frame_audits: vec![PinnedFrameAudit { owner: "worker.a".into(),
+            records: vec![record(0x1000, 512, "worker.a"), record(0x2000, 768, "worker.a")] }] };
+    census.resolve_recycled_frames();
+    assert!(census.unclassified.is_empty());
+    assert_eq!(census.host.len(), 2);
+    assert_eq!(census.host[1].address, 0x2000);
+    assert_eq!(census.host[1].bytes, 768);
+    assert!(census.host[1].owner.contains("pinned frames in recycle queues (audit-derived)"));
+    assert_eq!(census.host.iter().map(|frame| frame.bytes).sum::<u64>(), 1280);
+    census.resolve_recycled_frames();
+    assert_eq!(census.host.len(), 2);
+    let mut missing = TransportAllocationCensus { host: vec![visible], unclassified: Vec::new(),
+        pinned_frame_audits: vec![PinnedFrameAudit { owner: "worker.a".into(), records: Vec::new() }] };
+    missing.resolve_recycled_frames();
+    assert_eq!(missing.host.len(), 1);
+    assert!(missing.unclassified[0].reason.contains("cannot attribute"));
+}
+
 #[cfg(test)]
 #[test]
 fn transport_census_preserves_exact_endpoint_views_and_unavailable_reason() {
@@ -1123,7 +1240,7 @@ fn transport_census_preserves_exact_endpoint_views_and_unavailable_reason() {
     census.endpoint_view("rank.0.receive".into(), Ok(view));
     assert_eq!(census.host, [TransportHostAllocation { owner: "rank.0.receive".into(),
         address: view.host_ptr as u64, bytes: view.bytes as u64, flags: view.host_flags,
-        mapped: Some(TransportDeviceAlias { address: view.device_ptr as u64, device: view.device_id }) }]);
+        mapped: Some(TransportDeviceAlias { address: view.device_ptr as u64, device: view.device_id }), audit_owner: None }]);
     assert!(census.unclassified.is_empty());
     census.endpoint_view("rank.0.send".into(), Err(anyhow::anyhow!("getter unavailable")));
     assert_eq!(census.host.len(), 1);
@@ -1156,7 +1273,7 @@ fn verbs_response_payload_recycles_frame_storage() -> Result<()> {
 #[ignore = "requires CUDA native library"]
 fn verbs_response_payload_exposes_and_recycles_pinned_subview() -> Result<()> {
     let library = load_verbs_host_native_library()?;
-    let mut frame = VerbsHostProtocolV2PinnedResponseFrame::new(library, 5)?;
+    let mut frame = VerbsHostProtocolV2PinnedResponseFrame::new(library, 5, "fixture.pinned_frames")?;
     frame.as_mut_slice().copy_from_slice(&[9, 1, 2, 3, 8]);
     let frame_ptr = frame.buffer.ptr;
     let (bytes_recycle_tx, _bytes_recycle_rx) = mpsc::channel();
@@ -1926,6 +2043,7 @@ struct VerbsHostProtocolV2PersistentClientSession {
     response_frame_recycle_tx: mpsc::Sender<Vec<u8>>,
     response_frame_recycle_rx: mpsc::Receiver<Vec<u8>>,
     pinned_response_frame_pool: Vec<VerbsHostProtocolV2PinnedResponseFrame>,
+    pinned_frame_audit_owner: String,
     pinned_response_frame_recycle_tx: mpsc::Sender<VerbsHostProtocolV2PinnedResponseFrame>,
     pinned_response_frame_recycle_rx: mpsc::Receiver<VerbsHostProtocolV2PinnedResponseFrame>,
     /// Response payloads land in device memory; only headers reach the host.
@@ -2363,6 +2481,9 @@ impl VerbsHostProtocolV2PersistentClientSession {
         let retained_response_ring = if retain_final_response && !gpu_landing {
             Some(RegisteredResponseRing::new(&endpoint, response_ring)?)
         } else { None };
+        static NEXT_AUDIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let pinned_frame_audit_owner = format!("transport.endpoint.{}.pinned_frames",
+            NEXT_AUDIT.fetch_add(1, Ordering::Relaxed));
         Ok(Self {
             _stream: stream,
             expert_grouping: ready.expert_grouping,
@@ -2386,6 +2507,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             response_frame_recycle_tx,
             response_frame_recycle_rx,
             pinned_response_frame_pool: Vec::new(),
+            pinned_frame_audit_owner,
             pinned_response_frame_recycle_tx,
             pinned_response_frame_recycle_rx,
             gpu_landing,
@@ -2401,12 +2523,11 @@ impl VerbsHostProtocolV2PersistentClientSession {
         census.endpoint_view(format!("{owner}.receive"), self.endpoint.recv_buffer_view());
         for (index, frame) in self.pinned_response_frame_pool.iter().enumerate() {
             census.host_buffer(format!("{owner}.response_copy.{index}"), frame.buffer);
+            if let Some(receipt) = census.host.last_mut() { receipt.audit_owner = Some(frame.audit_owner.clone()); }
         }
+        census.pinned_frame_audits.push(PinnedFrameAudit::observe(&self.pinned_frame_audit_owner));
         census.unclassified.push(UnclassifiedTransportOwner { owner: format!("{owner}.driver"),
             reason: "QP/CQ/MR driver storage requires an owner-labelled startup memory delta".into() });
-        // Receiver has no non-consuming inspection API. Do not drain it for a census.
-        census.unclassified.push(UnclassifiedTransportOwner { owner: format!("{owner}.recycled_copies"),
-            reason: "recycled pinned frame channel cannot be inspected passively".into() });
         census
     }
 
@@ -2441,6 +2562,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
                 VerbsHostProtocolV2PinnedResponseFrame::new(
                     Arc::clone(&self.endpoint.library),
                     response_wire_bytes,
+                    &self.pinned_frame_audit_owner,
                 )?,
             ));
         }

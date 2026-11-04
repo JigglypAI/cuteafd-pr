@@ -452,7 +452,8 @@ fn worker_census_reports_actual_mock_views_without_post_poll_or_retry() -> Resul
             self.observed.fetch_add(1, Ordering::Relaxed);
             TransportAllocationCensus { host: vec![TransportHostAllocation { owner: "rank.0.receive".into(),
                 address: self.bytes.as_ptr() as u64, bytes: self.bytes.len() as u64,
-                flags: cuteafd_ffi::CUTEAFD_HOST_BUFFER_FLAG_PINNED, mapped: None }], unclassified: Vec::new() }
+                flags: cuteafd_ffi::CUTEAFD_HOST_BUFFER_FLAG_PINNED, mapped: None, audit_owner: None }],
+                unclassified: Vec::new(), pinned_frame_audits: Vec::new() }
         }
         fn counter(&self, _: Counter) -> u32 { 0 }
         fn post(&mut self, _: Job) -> Result<()> { panic!("census must not post") }
@@ -470,7 +471,7 @@ fn worker_census_reports_actual_mock_views_without_post_poll_or_retry() -> Resul
         assert_eq!(census.host.len(), 1);
         assert_eq!((census.host[0].address, census.host[0].bytes), expected);
         assert_eq!(observed.load(Ordering::Relaxed), 1);
-        jobs.send(Command::Cancel)?;
+        jobs.send(Command::Cancel).map_err(|_| anyhow::anyhow!("worker command channel closed"))?;
         assert_eq!(worker.join().unwrap().0?, Stop::Cancelled);
         Ok(())
     })?;
@@ -494,10 +495,10 @@ fn worker_census_marks_busy_and_missing_backend_unclassified() -> Result<()> {
     let world = World::new(1);
     let mut backend = Fake { world: world.clone() };
     let (jobs, inbox) = mpsc::channel();
-    jobs.send(Command::Wave(job(1, 0, 0)))?;
+    jobs.send(Command::Wave(job(1, 0, 0))).map_err(|_| anyhow::anyhow!("worker command channel closed"))?;
     let (reply, answer) = mpsc::sync_channel(1);
-    jobs.send(Command::Census(reply))?;
-    jobs.send(Command::Cancel)?;
+    jobs.send(Command::Census(reply)).map_err(|_| anyhow::anyhow!("worker command channel closed"))?;
+    jobs.send(Command::Cancel).map_err(|_| anyhow::anyhow!("worker command channel closed"))?;
     assert_eq!(run_worker(&mut backend, &inbox, Duration::from_secs(1), false).0?, Stop::Cancelled);
     let census = answer.recv_timeout(Duration::from_secs(1))?;
     assert!(census.host.is_empty());
