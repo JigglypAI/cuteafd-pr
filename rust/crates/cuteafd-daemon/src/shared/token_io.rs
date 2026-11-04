@@ -296,7 +296,8 @@ impl<'a> TokenEmbedding<'a> {
         if let Some(owner) = &self.row_fp8 {
             ensure!(index.is_null() && fallback.is_null(),
                 "the row-FP8 embedding gathers plain ids (no index or fallback)");
-            let device = owner.embedding.residency().device;
+            // SAFETY: the caller retains this producing stream; the table may reside on a peer.
+            let device = unsafe { self.library.cuda_stream_device(stream)? };
             return gather_row_fp8_copies(rows, self.source.hidden, copies, out, scratch, device, |op| {
                 match op {
                     // SAFETY: the caller retains ids, output and optional scratch through this stream.
@@ -1089,6 +1090,41 @@ mod tests {
             launches += 1; anyhow::bail!("injected gather failure")
         }).is_err());
         assert_eq!(launches, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn row_fp8_peer_table_copies_use_the_producing_stream_device() -> Result<()> {
+        // Every family's row-FP8 gather goes through this shared entry point.
+        let source = include_str!("token_io.rs").split("#[cfg(test)]").next().unwrap();
+        let gather = source.split("pub unsafe fn gather(").nth(1).unwrap()
+            .split("let table = self.table.buffer();").next().unwrap();
+        assert!(gather.find("cuda_stream_device(stream)").unwrap()
+            < gather.find("gather_row_fp8_copies(").unwrap());
+        assert!(!gather.contains("embedding.residency().device"));
+        for (table_device, stream_device) in [(0, 1), (1, 0)] {
+            let mut output = [0u8; 64];
+            let mut scratch = [0u8; 16];
+            let src = CuteafdDeviceBuffer { ptr: scratch.as_mut_ptr().cast(), bytes: scratch.len(),
+                device_id: stream_device, flags: 0 };
+            let mut copies = 0;
+            gather_row_fp8_copies(2, 4, 4, output.as_mut_ptr().cast(), Some(src), stream_device, |op| {
+                match op {
+                    EmbeddingOp::Gather(ptr) => assert_eq!(ptr, src.ptr),
+                    EmbeddingOp::Copy { dst, src, .. } => {
+                        assert_eq!(dst.device_id, stream_device);
+                        assert_eq!(src.device_id, stream_device);
+                        assert_ne!(dst.device_id, table_device);
+                        copies += 1;
+                    }
+                }
+                Ok(())
+            })?;
+            assert_eq!(copies, 4);
+            assert!(gather_row_fp8_copies(2, 4, 4, output.as_mut_ptr().cast(),
+                Some(CuteafdDeviceBuffer { device_id: table_device, ..src }), stream_device,
+                |_| panic!("peer-device scratch must fail before launch")).is_err());
+        }
         Ok(())
     }
 
