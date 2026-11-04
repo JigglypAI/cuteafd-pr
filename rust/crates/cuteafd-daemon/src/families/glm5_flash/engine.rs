@@ -5494,6 +5494,7 @@ mod tp2_tests {
         impl RtxExpertLayer for Rank {
             fn shard(&self) -> crate::shared::experts::rtx::RtxShard { unreachable!() }
             fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }
+            fn uses_fp8_input(&self) -> bool { true }
             fn layers(&self) -> &[usize] { &[3] }
             fn device(&self) -> i32 { 0 }
             fn workspace_bytes(&self) -> usize { 0 }
