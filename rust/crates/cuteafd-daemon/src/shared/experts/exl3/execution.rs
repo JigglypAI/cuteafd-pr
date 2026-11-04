@@ -976,8 +976,8 @@ impl<'a> Exl3Execution<'a> {
         Ok(output)
     }
 
-    /// The core only (wire decode, routes, gate/up and down into FC2), for the
-    /// per-expert partial-reply epilogue that replaces the weighted top-k sum.
+    /// The core only (wire decode, routes, gate/up and down into FC2), for a
+    /// partial-reply or fused compressed-sum epilogue.
     ///
     /// # Safety
     /// Same contract as `launch_layer`; the caller runs the epilogue on `stream`
@@ -987,6 +987,15 @@ impl<'a> Exl3Execution<'a> {
         let mut inputs = inputs;
         ensure!(rows > 0 && rows <= self.capacity, "EXL3 live rows exceed capacity");
         ensure!(self.library.cuda_get_device()? == self.device, "EXL3 execution on wrong device");
+        for (buffer, bytes) in inputs.iter().zip([
+            rows * if self.wire_rows { self.hidden + self.hidden / 32 } else { self.hidden * 2 },
+            rows * self.topk * 4,
+            rows * self.topk * 4,
+        ]) {
+            ensure!(!buffer.ptr.is_null() && buffer.ptr as usize % 16 == 0
+                && buffer.bytes >= bytes && buffer.device_id == self.device,
+                "EXL3 input buffer contract mismatch");
+        }
         let binding = self.layers.get_mut(layer).context("EXL3 layer is not bound")?;
         if let Some(decoded) = &self.wire {
             self.modules.owner.wire.as_ref().context("missing retained EXL3 wire decoder")?.decode(inputs[0], decoded.buffer, rows, stream)?;

@@ -139,7 +139,7 @@ pub(crate) struct Exl3Worker<'a> {
     /// Per-expert partial replies (models with a per-expert output norm): the
     /// epilogue that replaces the weighted top-k sum for flagged requests.
     partial: Option<super::partial::PartialEpilogue<'a>>,
-    reply_codec: super::super::reply::ReplyCodec<'a>,
+    reply_fused: super::super::reply::Exl3Reply<'a>,
 }
 
 impl<'a> Exl3Worker<'a> {
@@ -338,7 +338,7 @@ impl<'a> Exl3Worker<'a> {
             deferred: false,
             pending: super::super::execution::timing::PendingUnits::new(library, 1)?,
             partial: None,
-            reply_codec: super::super::reply::ReplyCodec::load(library)?,
+            reply_fused: super::super::reply::Exl3Reply::load(library)?,
         })
     }
 
@@ -556,7 +556,12 @@ impl<'a> Exl3Worker<'a> {
         let compressed = partial.is_none() && request.output_dtype() != ExpertV2Dtype::Bf16;
         ensure!(!compressed || destination.is_some(), "compressed replies require a mapped response slot");
         let output = unsafe {
-            match (destination.filter(|_| !compressed), partial.as_ref()) {
+            match (destination, partial.as_ref()) {
+                (Some(output), None) if compressed => {
+                    let sources = execution.launch_layer_core(self.layer, inputs, request.rows() as usize, self.stream.raw)?;
+                    self.reply_fused.launch(request, sources, inputs, output, request.rows() as usize, self.stream.raw)?;
+                    output
+                }
                 // Partial replies: the core, then the per-region epilogue into the reply slot.
                 (Some(output), Some(plan)) => {
                     let epilogue = self.partial.as_mut()
@@ -583,11 +588,6 @@ impl<'a> Exl3Worker<'a> {
                 )?,
             }
         };
-        if compressed {
-            // SAFETY: execution output and transport slot stay live through this unit's fence.
-            unsafe { self.reply_codec.quantize(request, output,
-                destination.context("missing compressed reply slot")?, request.rows() as usize, self.stream.raw)?; }
-        }
         let enqueued_us = started.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
         if let Some([_, end]) = &self.timing {
             unsafe { self.library.cuda_event_record(end.raw, self.stream.raw)?; }

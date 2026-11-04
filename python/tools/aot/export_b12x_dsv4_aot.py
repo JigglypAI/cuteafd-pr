@@ -51,6 +51,37 @@ CHECKPOINT_CONTEXTS = {
 }
 
 
+def exl3_reply_programs(max_rows):
+    """Model-shaped fused sums; expert counts and row count remain runtime bounds."""
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.moe._shared.kernels.w4a16.kernel import W4A16TopKSumKernel
+    import torch
+
+    shapes = ((2560, 10), (3584, 16), (4096, 6), (4096, 8),
+              (5120, 6), (6144, 4), (6144, 8), (7168, 6))
+
+    def compile_one(width, topk, format):
+        kernel = W4A16TopKSumKernel(topk=topk, hidden_size=width,
+            element_dtype="fp16", full_rotation=True,
+            full_rotation_output_dtype="bf16", num_experts=1,
+            route_num_experts=1, use_expert_map=True, reply_format=format)
+        row_bytes = width + width // 32 if format == 1 else width // 2 + width // 16
+        return compile_program(kernel, name=f"expert_reply_exl3_h{width}_k{topk}_{format}",
+            operands=(Operand("fc2_ptr", torch.float16, f"[rows,{topk},{width}]"),
+                      Operand("output_ptr", torch.uint8, f"[rows,{row_bytes}]", "out"),
+                      Operand("topk_weights_ptr", torch.float32, f"[rows,{topk}]", align=4),
+                      Operand("route_expert_ids_ptr", torch.int32, f"[rows,{topk}]", align=4),
+                      Operand("expert_map_ptr", torch.int32, "[experts]", align=4),
+                      Operand("svh_ptr", torch.float16, f"[local_experts,{width}]")),
+            scalars=tuple(Scalar(n) for n in ("weight_num_experts", "route_num_experts", "active_m")),
+            key=(width, topk, format), geometry=dict(width=width, topk=topk,
+                format=format, row_bytes=row_bytes))
+
+    return [(f"exl3_h{width}_k{topk}_{format}", "expert_reply_exl3", {"max_rows": max_rows},
+             lambda w=width, k=topk, f=format: compile_one(w, k, f))
+            for width, topk in shapes for format in (1, 2)]
+
+
 def draft_bf16_shapes():
     # hidden, query heads, KV heads, head width, MLP width, tap count
     families = {
@@ -1210,6 +1241,7 @@ def main() -> None:
             for suffix, quantize, stage in (("quantize", True, False), ("dequantize", False, False), ("stage", False, True)):
                 work.append((name, suffix, "expert_reply", {"max_rows": args.prefill_rows},
                              lambda q=quantize, s=stage: compile_expert_reply_aot(quantize=q, stage=s)))
+            work += [(name, *item) for item in exl3_reply_programs(args.prefill_rows)]
             continue
         if name == "expert_partial":
             from export_b12x_expert_partial_aot import programs as partial_programs
