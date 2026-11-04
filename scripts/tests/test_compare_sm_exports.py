@@ -1234,7 +1234,8 @@ def test_combined_exl3_reply_export_operand_and_scalar_abi(monkeypatch):
         assert kernel.element_dtype == "fp16" and kernel.reply_format == format
 
 
-def test_v4_placement_publication_preserves_compiler_metadata_and_provenance(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mismatch", [False, "worker", "sources"])
+def test_v4_placement_publication_preserves_compiler_metadata_and_provenance(tmp_path, monkeypatch, mismatch):
     """Eight views may share code, but never manufacture program/workspace data."""
     class Filesystem:
         @staticmethod
@@ -1249,7 +1250,10 @@ def test_v4_placement_publication_preserves_compiler_metadata_and_provenance(tmp
         payload = json.loads(command[-1])
         commands.append(payload)
         output = Path(payload['output'])
-        (output / 'comparison-context.json').write_text(json.dumps({'cuda_initialized': False, 'args': payload['args']}))
+        lock = json.loads((ROOT / 'third_party/sparkinfer.lock.json').read_text())
+        (output / 'comparison-context.json').write_text(json.dumps({'cuda_initialized': False, 'args': payload['args'],
+            'sparkinfer_revision': 'wrong' if mismatch == 'worker' else lock['revision'],
+            'source_tree_sha256': lock['source_tree_sha256']}))
         if payload['exporter'] == 'package_exl3_aot.py':
             for tp in (1, 2):
                 for rows in compare_sm.EXL3_CAPACITIES.split(','):
@@ -1262,9 +1266,22 @@ def test_v4_placement_publication_preserves_compiler_metadata_and_provenance(tmp
     monkeypatch.setattr(compare_sm.subprocess, 'run', compile_export)
     monkeypatch.setattr(compare_sm.subprocess, 'check_output', lambda *a, **kw: 'a' * 40)
     target = tmp_path / 'published'
+    if mismatch == 'sources':
+        real_sources = compare_sm.v4_placement_sources
+        captures = []
+        def changing_sources():
+            captures.append(True)
+            return real_sources() if len(captures) == 1 else {}
+        monkeypatch.setattr(compare_sm, 'v4_placement_sources', changing_sources)
+    if mismatch:
+        with pytest.raises(ValueError, match='worker provenance' if mismatch == 'worker' else 'sources changed'):
+            compare_sm.v4_placement_inputs(target, tmp_path / 'staging', 1, 1)
+        assert not (target / 'INPUTS.json').exists()
+        return
     compare_sm.v4_placement_inputs(target, tmp_path / 'staging', 1, 1)
     provenance = json.loads((target / 'INPUTS.json').read_text())
     assert provenance['engine_commit'] == 'a' * 40
+    assert provenance['engine_sources_sha256'] == compare_sm.v4_placement_sources()
     lock = json.loads((ROOT / 'third_party/sparkinfer.lock.json').read_text())
     assert provenance['sparkinfer_revision'] == lock['revision']
     assert provenance['source_tree_sha256'] == lock['source_tree_sha256']

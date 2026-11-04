@@ -904,6 +904,15 @@ def parse_sms(value):
     return sms
 
 
+def v4_placement_sources():
+    # Keep this set identical to plan::testing::v4_placement_source_hashes.
+    paths = {ROOT / "scripts/build/compare-sm-exports.py"}
+    for directory in ("python/tools/aot", "python/tools/lib"):
+        paths.update((ROOT / directory).rglob("*.py"))
+    paths.update((ROOT / "scripts/build").glob("*.json"))
+    return {str(path.relative_to(ROOT)): sha(path.read_bytes()) for path in sorted(paths)}
+
+
 def v4_placement_inputs(destination, staging, timeout, workers):
     """Publish compiler-produced planner metadata, never inferred scratch sizes."""
     filesystem = load_file("cuteafd_build_filesystem", ROOT / "scripts/build/assert-build-filesystem.py")
@@ -914,6 +923,7 @@ def v4_placement_inputs(destination, staging, timeout, workers):
         path.mkdir(parents=True, exist_ok=True)
     engine = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
     lock = json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text())
+    sources = v4_placement_sources()
     exports = [(str(context), "export_b12x_dsv4_aot.py",
                 ["--geometry", "flash,pro,flash2,pro2", "--max-context", str(context),
                  "--decode-rows", "64", "--prefill-rows", "4096", "--context-split", "on"])
@@ -927,7 +937,9 @@ def v4_placement_inputs(destination, staging, timeout, workers):
         output = staging / name
         output.mkdir()
         payload = dict(sms=188, exporter=exporter, args=extra, output=str(output))
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(ROOT))
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(ROOT),
+                   CUTEAFD_SPARKINFER_SOURCE_DIR=str(ROOT / "third_party/sparkinfer"),
+                   CUTEAFD_SPARKINFER_LOCK_FILE=str(ROOT / "third_party/sparkinfer.lock.json"))
         print(f"V4 placement export {name}: {extra}", flush=True)
         with (output / "export.log").open("w") as log:
             subprocess.run([sys.executable, str(Path(__file__).resolve()), "--_worker", json.dumps(payload)],
@@ -936,6 +948,13 @@ def v4_placement_inputs(destination, staging, timeout, workers):
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         summaries = list(pool.map(compile_one, exports))
+    if sources != v4_placement_sources() or lock != json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text()):
+        raise ValueError("V4 export sources changed during compilation")
+    for summary in summaries:
+        if (summary.get("sparkinfer_revision") != lock["revision"]
+                or summary.get("source_tree_sha256") != lock["source_tree_sha256"]
+                or summary.get("cuda_initialized") is not False):
+            raise ValueError("V4 worker provenance differs from captured source lock or initialized CUDA")
     for context in (131072, 1048576):
         for model in ("flash", "pro"):
             for rtx in (1, 2):
@@ -951,7 +970,8 @@ def v4_placement_inputs(destination, staging, timeout, workers):
     files = {str(path.relative_to(destination)): sha(path.read_bytes())
              for path in sorted(destination.rglob("*.json"))}
     provenance = dict(schema=1, engine_commit=engine, sparkinfer_revision=lock["revision"],
-                      source_tree_sha256=lock["source_tree_sha256"], exports=summaries, files=files)
+                      source_tree_sha256=lock["source_tree_sha256"], engine_sources_sha256=sources,
+                      exports=summaries, files=files)
     (destination / "INPUTS.json").write_text(json.dumps(provenance, indent=2) + "\n")
     print(f"Published V4 placement inputs: {destination}", flush=True)
 

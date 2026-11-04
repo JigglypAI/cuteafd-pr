@@ -104,8 +104,10 @@ rm -rf "$root/staging-$sha"
 The exporter compiles Flash/Pro and their split-head programs at both 131072
 and 1048576 context, plus native EXL3 K2/K3 coordinator capacity metadata.
 Each of the eight views contains unmodified exported manifests. `INPUTS.json`
-records engine commit, fork revision/tree hash, compiler environment and file
-checksums. Both daemon equality tests and loader TP2-cost tests use
+records engine commit, fork revision/tree hash, compiler environment, engine
+export-source fingerprints and file checksums. Sources are checked before/after
+compilation and every worker must attest the captured fork pin. Consumers reject
+changed, added or removed engine export sources even when the fork pin is unchanged. Both daemon equality tests and loader TP2-cost tests use
 `CUTEAFD_V4_PLACEMENT_INPUTS`, defaulting to `$root/current`; they refuse a
 fork-pin/tree-hash mismatch or missing/modified manifests. Keep the published
 commit directory and `current` symlink during build cleanup; delete only export
