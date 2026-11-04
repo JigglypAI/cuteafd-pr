@@ -132,6 +132,7 @@ def test_native_thinking_renderer_contract():
 
 
 def test_sparse_probe_observes_pruning_and_restores_native_function():
+    pytest.importorskip("torch")
     import torch
     from types import SimpleNamespace
     packed = torch.arange(4 * 513, dtype=torch.int32).reshape(4, 513)
@@ -168,6 +169,7 @@ def test_native_tokenizer_regex_is_preserved_and_heuristic_changes_fail(tmp_path
 
 
 def test_three_stage_alignment_uses_successive_shift_without_repeating_target_rows():
+    pytest.importorskip("torch")
     import torch
     spec = importlib.util.spec_from_file_location("step5_test_mtp_oracle", ROOT / "python/reference/families/step5/mtp.py")
     oracle = importlib.util.module_from_spec(spec)
@@ -242,12 +244,14 @@ def test_partial_capture_cleanup_refuses_symlink(tmp_path):
 
 
 def test_capture_inventory_error_names_the_missing_functional_projection(tmp_path):
+    pytest.importorskip("torch")
     raw = {name:{} for name in pilot.modules(7) if not name.endswith("sparse_indexer_w")}
     with pytest.raises(ValueError, match='"missing":\\["model.layers.7.self_attn.sparse_indexer_w"\\]'):
         pilot._save_hessians(tmp_path, {}, 7, raw, 3)
 
 
 def test_sparse_indexer_w_scoring_uses_native_bf16_without_mutating_source(monkeypatch):
+    pytest.importorskip("torch")
     import torch
     original = torch.tensor([[1.0001, -1.0002]], dtype=torch.float32)
     saved = original.clone()
@@ -263,6 +267,7 @@ def test_sparse_indexer_w_scoring_uses_native_bf16_without_mutating_source(monke
 
 
 def test_mtp_candidate_reuses_committed_payload_after_interrupted_stage(tmp_path):
+    pytest.importorskip("torch")
     import torch
     from types import SimpleNamespace
     calls = []
@@ -345,6 +350,7 @@ def producer_fixture(root, monkeypatch, *, different_reference=False):
 
 
 def test_producer_probe_checks_full_transaction_receipts_and_all_three_outputs(tmp_path,monkeypatch):
+    pytest.importorskip("torch")
     from step5.core_k6.finalize import audit_producer_probe
     proof,identity,records=producer_fixture(tmp_path,monkeypatch)
     verified=audit_producer_probe(tmp_path,proof,identity,records)
@@ -355,6 +361,7 @@ def test_producer_probe_checks_full_transaction_receipts_and_all_three_outputs(t
 
 
 def test_producer_probe_does_not_accept_different_native_replay_outputs(tmp_path,monkeypatch):
+    pytest.importorskip("torch")
     from step5.core_k6.finalize import audit_producer_probe
     proof,identity,records=producer_fixture(tmp_path,monkeypatch,different_reference=True)
     with pytest.raises(ValueError,match="native output bytes differ"):
@@ -362,6 +369,7 @@ def test_producer_probe_does_not_accept_different_native_replay_outputs(tmp_path
 
 
 def test_producer_probe_rejects_retained_recovery_and_corrupt_shard(tmp_path,monkeypatch):
+    pytest.importorskip("torch")
     from step5.core_k6.finalize import audit_producer_probe
     proof,identity,records=producer_fixture(tmp_path,monkeypatch)
     old=tmp_path/"producer-probe/run/frontier/layer--01"
@@ -376,6 +384,7 @@ def test_producer_probe_rejects_retained_recovery_and_corrupt_shard(tmp_path,mon
 
 
 def test_producer_probe_retirement_keeps_scalar_evidence_and_removes_payloads(tmp_path,monkeypatch):
+    pytest.importorskip("torch")
     import json
     from step5.core_k6 import finalize
     proof,identity,_=producer_fixture(tmp_path,monkeypatch)
@@ -402,6 +411,7 @@ def test_producer_probe_cannot_pass_incomplete_transaction(field):
 
 
 def test_final_completion_status_does_not_mutate_audited_event_bytes(tmp_path):
+    pytest.importorskip("psutil")
     import json
     path=tmp_path/"events.jsonl"
     path.write_text('{"event":"audited"}\n')
