@@ -1870,7 +1870,7 @@ mod tests {
                 // Reload resets the fake DSO's bounded, lifetime-wide event registry.
                 let library = fixture.load()?;
                 let endpoints = admission::spark_endpoints(rows, MimoExpertInput::Fp8)?;
-                let reservation = admission::transport_reservations(&cfg, 1, 0, rows, waves, ranks)?;
+                let reservation = admission::transport_reservations(&cfg, 1, 0, rows, waves, ranks, cuteafd_core::SparkReplyFormat::Bf16)?;
                 let planned = reservation.iter().find(|item| item.name == "transport.spark_intake_planes").unwrap().bytes;
                 let owner = "test/mimo-endpoint-reservation";
                 let _owner = cuteafd_ffi::memory_ledger::owner(owner);

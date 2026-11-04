@@ -729,7 +729,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
         }
     }
     for lane in 0..i.lanes {
-        let demand = super::spark::admitted_demand(i.waves, unit, lane, i.spark_ranks)?;
+        let demand = super::spark::admitted_demand(i.waves, unit, lane, i.spark_ranks, cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false))?;
         ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
             "Kimi Spark intake charge supplied twice");
         fixed.push(demand);
@@ -1801,7 +1801,7 @@ pub(super) mod tests {
         let waves = admitted.waves;
         let unit = admitted.unit_rows;
         for lane in 0..lanes {
-            let demand = super::super::spark::admitted_demand(waves, unit, lane, ranks)?;
+            let demand = super::super::spark::admitted_demand(waves, unit, lane, ranks, cuteafd_core::SparkReplyFormat::Bf16)?;
             let items = admitted.placement.items[1].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
             assert_eq!(items.len(), 1);
             assert_eq!(items[0].bytes, ranks as u64
@@ -1812,7 +1812,7 @@ pub(super) mod tests {
             assert!(!admitted.placement.items[0].iter().any(|item| item.group == demand.group));
         }
         let mut duplicate = inputs(&cfg);
-        duplicate.fixed.push(super::super::spark::admitted_demand(waves, unit, 0, ranks)?);
+        duplicate.fixed.push(super::super::spark::admitted_demand(waves, unit, 0, ranks, cuteafd_core::SparkReplyFormat::Bf16)?);
         assert!(admit(duplicate).is_err());
         Ok(())
     }

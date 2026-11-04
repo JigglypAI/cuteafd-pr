@@ -1009,7 +1009,7 @@ mod admitted_prefill_tests {
         assert_eq!((one.unit_cap, one.waves, one.reserve_rows()), (4096, 1, 4096));
         let capped = resolve(&["--prefill-waves", "3", "--prefill-batch-tokens", "1792", "--prefill-reserve-rows", "5376"]);
         assert_eq!((capped.unit_cap, capped.waves, capped.reserve_rows()), (1792, 3, 5376));
-        assert!(cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(80, 4096, 4, 1).is_ok());
+        assert!(cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(80, 4096, 4, 1, cuteafd_core::SparkReplyFormat::Bf16).is_ok());
     }
 }
 

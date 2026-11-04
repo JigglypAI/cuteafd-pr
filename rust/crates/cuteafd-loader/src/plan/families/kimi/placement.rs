@@ -135,7 +135,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 crate::formats::dflash::MlaDflashConfig::read(snapshot).map(|draft| draft.block))
                 .transpose()?.unwrap_or(0);
             let mut demands = allocation::baseline_demands(cfg, manifest, rows, shape, context as usize,
-                usize::try_from(slots)?, verify, &model.core, report.requested_attention == Some(AttentionPlacement::Heads), ranks)?;
+                usize::try_from(slots)?, verify, &model.core, report.requested_attention == Some(AttentionPlacement::Heads), ranks, opts.resolved_spark_reply_format(false))?;
             let families = if model.core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] };
             let programs = ProgramSet::from_manifest(manifest, families);
             for rank in 0..2 {

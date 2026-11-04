@@ -302,13 +302,18 @@ fn mimo_split_links_charge_decode_and_each_prefill_return_slot() {
                 assert_eq!(bytes("mimo/transport/egress"),
                     (geometry.compact_wire_bytes(rows as u32, input.bf16(false)).unwrap().0 * waves
                         + geometry.compact_wire_bytes(64, input.bf16(true)).unwrap().0) as u64);
-                let device = admission::transport_reservations(&cfg, 2, 0, rows, waves, 6).unwrap();
-                let intake = device.iter().find(|item| item.name == "transport.spark_intake_planes").unwrap();
-                assert_eq!(intake.bytes, crate::serving_capacity::prefill_return_bytes(
-                    waves as u64, rows.max(64) as u64, 6, cfg.hidden as u64)
-                    + crate::serving_capacity::spark_intake_bytes(1, 6, 64, cfg.hidden as u64));
-                let peer = admission::transport_reservations(&cfg, 2, 1, rows, waves, 6).unwrap();
-                assert!(!peer.iter().any(|item| item.name == "transport.spark_intake_planes"));
+                for (format, row_bytes) in [(cuteafd_core::SparkReplyFormat::Bf16, 0),
+                    (cuteafd_core::SparkReplyFormat::Fp8, cfg.hidden + cfg.hidden / 32),
+                    (cuteafd_core::SparkReplyFormat::Nvfp4, cfg.hidden / 2 + cfg.hidden / 16)] {
+                    let device = admission::transport_reservations(&cfg, 2, 0, rows, waves, 6, format).unwrap();
+                    let intake = device.iter().find(|item| item.name == "transport.spark_intake_planes").unwrap();
+                    assert_eq!(intake.bytes, 6 * (
+                        cuteafd_core::serving_capacity::spark_intake_allocation_bytes((waves * rows.max(64) * cfg.hidden * 2) as u64).unwrap()
+                        + cuteafd_core::serving_capacity::spark_intake_allocation_bytes((64 * cfg.hidden * 2) as u64).unwrap())
+                        + (waves * rows.max(64) * row_bytes) as u64);
+                    let peer = admission::transport_reservations(&cfg, 2, 1, rows, waves, 6, format).unwrap();
+                    assert!(!peer.iter().any(|item| item.name == "transport.spark_intake_planes"));
+                }
             }
         }
     }
@@ -1737,7 +1742,7 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
                 (device.capacity_bytes, Baseline::Measured { free_bytes: device.capacity_bytes - context - weights })
             }).collect::<Vec<_>>();
             assert_eq!(pre_weight, gpus);
-            let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
+            let inputs = glm::GlmInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, cfg: &cfg, layers: cfg.layers, gpus,
                 headroom_bytes: options.headroom_bytes, spark_ranks: report.spark_ranks, native_experts: false, native_workspace: 0, native_dense: Vec::new(), native_head: false, skip_routed_experts: false,
                 prefill_rows: 4096,
                 prefill_lanes: 1, max_context: 65536, automatic_context: options.context_tokens == 0, scratch: None, drafter_bytes: 0,
@@ -3273,7 +3278,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         let report = plan(dir.path(), &options).unwrap();
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
-        let input = glmf::GlmfInputs { automatic_context: false, attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
+        let input = glmf::GlmfInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
             gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)| (total, Baseline::Planned {
                 context_bytes: placement::ArchContext::coordinator(total, None).context_bytes
                     + placement::loaded_code("glmf", "fp8", true, rank as u8).unwrap().bytes,

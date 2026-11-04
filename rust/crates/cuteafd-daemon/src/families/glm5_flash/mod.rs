@@ -1883,7 +1883,7 @@ impl Opened {
         let onboard = args.rtx_expert_layers.map(|setting| setting.resolve(routed))
             .unwrap_or_else(|| if args.local_experts {
                 placement::Onboard::Layers(experts.len()) } else { admission::default_onboard() });
-        let inputs = admission::GlmfInputs { automatic_context: automatic_context, attention, cfg: &self.cfg, layers, local_tp2_exl3: local_tp2_exl3 && core_charge.is_none(),
+        let inputs = admission::GlmfInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false), automatic_context: automatic_context, attention, cfg: &self.cfg, layers, local_tp2_exl3: local_tp2_exl3 && core_charge.is_none(),
             gpus: inventory.gpus.iter().map(|gpu| (gpu.total_bytes, placement::Baseline::Measured {
                 free_bytes: gpu.free_bytes + prepared_draft.map_or(0, crate::shared::draft::remote::Prepared::sampled_bytes) })).collect(),
             pending_code, headroom_bytes: args.headroom_bytes()?, spark_ranks,
