@@ -259,11 +259,51 @@ def test_kimi_example_config_launches_through_run_family(tmp_path: Path) -> None
     assert "--pool-tokens" not in serve.split() and "--max-context" not in serve.split()
 
 
+@pytest.mark.parametrize("recipe", ["example", "release", "gate"])
+def test_kimi_min_recipe_launches_one_physical_owner_with_automatic_admission(tmp_path: Path, recipe: str) -> None:
+    path = ROOT / "examples/configs/kimi-k3-exl3-k6-min.config"
+    values = _keys(path)
+    if recipe != "example":
+        matrix_path = ("scripts/bench/release-smoke-v4.json" if recipe == "release"
+                       else "scripts/bench/kits/gate/matrix-gate.json")
+        matrix = json.loads((ROOT / matrix_path).read_text())
+        entry = next(entry for entry in matrix["entries"] if entry["name"] == "kimi-k3-min")
+        assert entry["config"] == str(path.relative_to(ROOT))
+        assert entry["family"] == "kimi_k3" and entry["gpus"] == [0]
+        assert len(entry["sparks"]) == 6
+        values.update(matrix.get("defaults", {}).get("set", {}))
+        values.update(entry["set"])
+    assert (values["MODEL_ID"], values["MODEL_REVISION"]) == (KIMI_K6_ID, "1a28050d2954426a43a3db705e53ca120e5f2b47")
+    assert (values["RTX_GPUS"], values["COORDINATOR_GPUS"], values["SPARK_COUNT"]) == ("1", "0", "6")
+    assert values["SPARK_DEVICE_BUDGET_BYTES"] == str(110 << 30)
+    assert values["POOL_TOKENS"] == "auto" and values["SPECULATOR"] == "dflash2"
+    assert not {"RTX_EXPERT_LAYERS", "PREFILL_ROWS", "PREFILL_WAVES", "PREFILL_SPAN_ROWS",
+                "MAX_CONTEXT_TOKENS", "CONCURRENCY", "COORDINATOR_GPU_BUDGET_GIB"}.intersection(values)
+    draft = values["SPECULATOR_MODEL_ID"]
+    _snapshot(tmp_path / "hf", draft, {}, revision="e77935fb4804e17eb55085bffd045eae1d779769")
+    config = "".join(f"{key}={value}\n" for key, value in values.items()
+                     if key not in ("MODEL_ID", "MODEL_REVISION"))
+    result = _family_launch_result(tmp_path, KIMI, KIMI_K6_ID, config,
+                                   extra_args=("--wip", "k3"), physical_gpus=(0,),
+                                   encoder_plan={**PLANNED, "spark_budget_bytes": 110 << 30})
+    serve = _line(result, "cuteafd serve-kimi --snapshot")
+    plan = _line(result, "cuteafd plan")
+    assert _coordinator_gpus(serve) == [0] and _flag(serve, "--split-device") is None
+    assert _flag(plan, "--rtx") == "1" and _flag(plan, "--spark-ranks") == "6"
+    assert _flag(plan, "--speculator") == "dflash2" and _flag(serve, "--draft") is not None
+    assert _flag(plan, "--spark-budget-gib") == _flag(serve, "--spark-budget-gib") == "110.0"
+    assert _flag(serve, "--rtx-expert-layers") == "auto"
+    assert "--pool-tokens" not in serve.split() and "--max-context" not in serve.split()
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert len(workers) == 6 and all(f"--device-budget-bytes {110 << 30} " in worker for worker in workers)
+
+
 # --- the gate card -------------------------------------------------------------
 
-def test_kimi_gate_card_lists_and_generates_a_wip_launch(tmp_path: Path) -> None:
-    card = cards.load_cards(ROOT / "scripts/bench/kits/gate", ["kimi-k3-max"])[0]
-    assert card["family"] == "kimi_k3" and card["gpus"] == [0, 1]
+@pytest.mark.parametrize("size,gpus", [("min", [0]), ("max", [0, 1])])
+def test_kimi_gate_card_lists_and_generates_a_wip_launch(tmp_path: Path, size: str, gpus: list[int]) -> None:
+    card = cards.load_cards(ROOT / "scripts/bench/kits/gate", [f"kimi-k3-{size}"])[0]
+    assert card["family"] == "kimi_k3" and card["gpus"] == gpus
     assert card["sparks"] == ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"]
     assert card["profile"] == "smoke"
     assert cards.config(card["config"])["MODEL_ID"] == "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6"
@@ -274,7 +314,12 @@ def test_kimi_gate_card_lists_and_generates_a_wip_launch(tmp_path: Path) -> None
     job = cards.generate(card, "cand", {"instance": "t", "slot": "s"}, tmp_path, key, {}, {"fabric"}, None, 1)
     values = cards.config(Path(job["entry"]["config"]))
     assert job["entry"]["run_args"] == ["--wip", "s"]
-    assert (values["SPARK_COUNT"], values["RTX_GPUS"], values["SPECULATOR"]) == ("6", "2", "dflash2")
+    assert (values["SPARK_COUNT"], values["RTX_GPUS"], values["SPECULATOR"]) == ("6", str(len(gpus)), "dflash2")
+    assert values["COORDINATOR_GPUS"] == ",".join(map(str, gpus))
+    if size == "min":
+        assert values["SPARK_DEVICE_BUDGET_BYTES"] == str(110 << 30)
+    else:
+        assert "SPARK_DEVICE_BUDGET_BYTES" not in values
     assert not any(key.endswith("_LANE_B") for key in values)
 
 
