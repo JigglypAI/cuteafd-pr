@@ -2324,7 +2324,7 @@ impl Opened {
         let plan_native = |sparks: usize| -> Result<_> {
             let native = native_admission.as_ref().context("native Flash admission")?;
             let (owners, records) = crate::shared::experts::rtx::dense::recording(|| {
-                let loaded = native.load(&self.library, &programs, &loader, &self.cfg, &execution)?;
+                let loaded = native.load(&self.library, &programs, &loader, &self.cfg, &execution, embedding_device.id)?;
                 let shared = native.load_shared(args, &self.cfg, &self.library, &programs)?;
                 Ok((loaded, shared))
             })?;
@@ -2453,7 +2453,7 @@ impl Opened {
                         split.log("glm5_flash native dense push");
                         (pushed, owners)
                     }
-                    None => (None, (native.load(&self.library, &programs, &loader, &self.cfg, &execution)?,
+                    None => (None, (native.load(&self.library, &programs, &loader, &self.cfg, &execution, embedding_device.id)?,
                         native.load_shared(args, &self.cfg, &self.library, &programs)?)),
                 };
                 native_shared = Some(shared);
