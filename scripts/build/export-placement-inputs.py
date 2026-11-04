@@ -45,7 +45,7 @@ def source_hashes():
              *(ROOT / config for config in live_configs(ROOT))]
     return {**compare.v4_placement_sources(),
             **{str(path.relative_to(ROOT)): compare.sha(path.read_bytes()) for path in paths},
-            "installed_live_configs": compare.sha("\n".join(live_configs()).encode())}
+            "installed_live_configs": compare.sha("\n".join(live_configs(ROOT)).encode())}
 
 
 def export_jobs():
