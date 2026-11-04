@@ -74,6 +74,12 @@ pub(crate) struct PlacedEngram<'w, 'a> {
     uploads: [Option<DeviceOwner<'a, EngramDeviceRows<'a>>>; 2],
 }
 impl<'w, 'a> PlacedEngram<'w, 'a> {
+    pub(crate) fn capture_startup(&mut self, rows: &[usize]) -> Result<()> {
+        for gate in &mut self.gates {
+            gate.on_device_mut(|gate| gate.capture_startup(rows))?;
+        }
+        Ok(())
+    }
     pub fn device_bytes(
         library: &NativeLibrary,
         map: CachePlacement,

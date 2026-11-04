@@ -345,6 +345,19 @@ impl IndexQueryWave<'_, '_> {
         self.tokens.clear();
         unsafe { self.capture_ready(rows) }
     }
+    pub(crate) fn declare_startup(&mut self, keys: &[(usize, u32)]) -> Result<()> {
+        self.storage.stream.require_complete()?;
+        ensure!(self.pending.is_none() && self.ready.is_none(), "index query startup requires an idle owner");
+        self.graphs.declare_startup(keys)
+    }
+    pub(crate) fn capture_startup(&mut self, rows: u32) -> Result<()> {
+        self.validate(rows)?;
+        self.storage.stream.require_complete()?;
+        // SAFETY: capture records only owned addresses and the rebound weight
+        // owner, without executing or publishing a query/proposal snapshot.
+        unsafe { self.capture_ready(rows) }
+    }
+    pub(crate) fn finish_startup(&mut self) -> Result<()> { self.graphs.finish_startup() }
     unsafe fn capture_ready(&mut self, rows: u32) -> Result<()> {
         unsafe {
             self.storage.stream
@@ -429,7 +442,9 @@ impl IndexQueryWave<'_, '_> {
             self.storage.stream.library.copy_d2d(dst, src, src.bytes)?;
         }
         let rows = query.rows as u32;
-        if !super::graph_policy::captures_shape(rows) {
+        if !super::graph_policy::captures_shape(rows)
+            || (self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none()
+                && !self.graphs.capture_allowed(self.weights.layer, rows)) {
             unsafe { self.execute(rows)?; }
             self.origin = Some(binding);
             self.tokens.extend_from_slice(tokens);
@@ -464,6 +479,7 @@ impl IndexQueryWave<'_, '_> {
         let rows = query.rows as u32;
         let graph = if self.window.is_windowed() { None } else { self.graphs.get_shape(self.weights.layer, self.weights, rows) };
         self.pending = Some((rows, binding, !self.window.is_windowed() && graph.is_none() && super::graph_policy::captures_shape(rows)
+            && self.graphs.capture_allowed(self.weights.layer, rows)
             && !crate::shared::decode_graph::census::eager("layer_row")));
         let result = (|| -> Result<()> { unsafe {
             crate::shared::memory::chain::join(self.storage.stream.library, self.storage.stream.raw)?;
