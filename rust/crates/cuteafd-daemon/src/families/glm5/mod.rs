@@ -825,7 +825,8 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     library.cuda_set_device(args.device)?;
     let opened = Opened { snapshot: args.snapshot.clone(), catalog, native, cfg, library,
         startup_audit: std::cell::RefCell::new(startup_audit) };
-    opened.startup_probe(&[args.device], "glm/open", None, false)?;
+    opened.startup_probe(&std::iter::once(args.device).chain(args.split_device).collect::<Vec<_>>(),
+        "glm/open", None, false)?;
     Ok(opened)
 }
 
