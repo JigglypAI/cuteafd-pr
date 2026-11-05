@@ -472,7 +472,7 @@ pub(crate) mod testing {
         let source = tempfile::tempdir_in(fixture.directory())?;
         let path = source.path().join("overlapping-k6");
         let file = std::fs::File::create(&path)?;
-        let (count, bytes, stride) = (16384usize, 32768usize, 16384usize);
+        let (count, bytes, stride) = (1024usize, 2usize << 20, 1usize << 20);
         file.set_len((count * stride + bytes) as u64)?;
         for random in [false, true] {
             let steps = (0..count).map(|i| super::Step { device: 0,
@@ -497,9 +497,9 @@ pub(crate) mod testing {
             let mut state = 0x517cc1b727220a95u64;
             let per_slot = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / payload.len();
             let slots = fragments.chunks(per_slot).collect::<Vec<_>>();
-            let mut deliver = |slot: usize| -> Result<()> {
+            let deliver = |arena: &mut super::DenseArena<'_>, slot: usize| -> Result<()> {
                 for &(_, offset) in slots[slot] {
-                    super::PushDestination::copy_validation(&mut arena, offset, &payload)?;
+                    super::PushDestination::copy_validation(arena, offset, &payload)?;
                     assert_eq!(arena.held, arena.staged + arena.pool.iter().map(|p| p.buffer.bytes as u64).sum::<u64>());
                     assert!(arena.held <= charged, "open plus reusable pool exceeds admitted charge");
                 }
@@ -516,9 +516,12 @@ pub(crate) mod testing {
                         batch.swap(i, state as usize % (i + 1));
                     }
                 } else { batch.reverse(); }
-                for &slot in batch.iter() { deliver(slot)?; }
+                for &slot in batch.iter() { deliver(&mut arena, slot)?; }
+                assert!(!arena.open.is_empty() && arena.staged >= bytes as u64,
+                    "delayed slot must retain partial windows through every refill");
             }
-            deliver(delayed)?;
+            assert!(arena.peak >= (32 * bytes) as u64, "reordered slots must open a meaningful window");
+            deliver(&mut arena, delayed)?;
             assert_eq!(arena.run, count);
             super::PushDestination::done(arena)?;
             PEAKS.with(|p| { p.take(); });
