@@ -98,7 +98,6 @@ def test_wip_passes_the_switch_to_both_legs_and_seals_only_when_on():
     expert = wip.split('build_expert() (', 1)[1].split('\n)\n', 1)[0]
     assert coordinator.count('${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"}') == 2  # build + finalize
     assert "${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}' -e 'CUTEAFD_WIP_EXLR8_FAMILIES=${CUTEAFD_WIP_EXLR8_FAMILIES}'}" in expert  # quoted remote build command
-    assert '${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} "$spark_container"' in expert  # finalize
     assert "wip_exlr8_env=()\n" in wip and 'wip_exlr8_env=(-e CUTEAFD_WIP_EXLR8_AOT=ON -e' in wip
     # The remote-export env file carries every CUTEAFD_* -e of the coordinator build.
     assert "grep -E '^CUTEAFD_[A-Z0-9_]+='" in wip
@@ -495,3 +494,16 @@ def test_generic_spark_count_profiles_exist_in_the_package(tmp_path, geometry, c
     import package_exl3_aot
     known = {entry[0] for entry in package_exl3_aot.build_profiles('spark', geometry, all_spark_counts=True)}
     assert requested and requested <= known, (geometry, count, sorted(requested - known))
+
+
+def test_finalize_ssh_keeps_exlr8_values_whole_on_the_remote_shell():
+    """ssh joins argv into one string for the remote shell; a family list with ';' must survive."""
+    wip = (ROOT / 'wip.sh').read_text()
+    expert = wip.split('build_expert() (', 1)[1].split('\n)\n', 1)[0]
+    loop = next(line for line in expert.splitlines() if 'exlr8_remote+=' in line)
+    script = ('wip_exlr8_env=(-e CUTEAFD_WIP_EXLR8_AOT=ON -e "CUTEAFD_WIP_EXLR8_FAMILIES=glm;glmf")\n'
+              'exlr8_remote=()\n' + loop.strip() + '\n'
+              # What ssh does: join the words with spaces and hand them to a remote shell.
+              'bash -c "printf \'%s\\n\' ${exlr8_remote[*]}"')
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, check=True)
+    assert result.stdout.splitlines() == ['-e', 'CUTEAFD_WIP_EXLR8_AOT=ON', '-e', 'CUTEAFD_WIP_EXLR8_FAMILIES=glm;glmf']

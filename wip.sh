@@ -1480,7 +1480,12 @@ build_expert() (
   fi
   native_store_sync "$seed_host" "$seed_root" aarch64 expert publish
   native_store_nest "$seed_host" aarch64 "$seed_root" expert publish
-  timeout --kill-after=30 300 ssh -o BatchMode=yes "$seed_host" docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_expert_key:-}" ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} "$spark_container" \
+  # ssh joins argv into one remote shell string: quote values such as
+  # CUTEAFD_WIP_EXLR8_FAMILIES=glm;glmf so the remote shell keeps them whole.
+  local exlr8_remote=()
+  local arg
+  for arg in ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"}; do exlr8_remote+=("$(printf '%q' "$arg")"); done
+  timeout --kill-after=30 300 ssh -o BatchMode=yes "$seed_host" docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_expert_key:-}" ${exlr8_remote[@]+"${exlr8_remote[@]}"} "$spark_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \
     "$SPARK_EXPERT_DOCKER_DEV" "$image_id" "$(printf '%q' "$image_layers")"
