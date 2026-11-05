@@ -306,6 +306,25 @@ extern "C" int32_t cuteafd_audio_upload(void* opaque,const void* weights,uint64_
   for(int book=0;book<20 && !rc;++book)rc=support(o,AUDIO_SUM_SQUARE,1024,w(o,o->s.codebooks[book]),nullptr,nullptr,o->book_square+book*1024,nullptr,nullptr,BOOKS[book]);
   rc=drain(o,rc);o->uploaded=rc==0;return rc;
 }
+extern "C" int32_t cuteafd_audio_weight_arena(void* opaque,void** arena) {
+  if(!opaque || !arena)return cudaErrorInvalidValue;
+  auto* o=static_cast<Owner*>(opaque);if(o->uploaded)return cudaErrorInvalidValue;
+  int device=-1;int e=cudaGetDevice(&device);if(e)return e;if(device!=o->device)return cudaErrorInvalidDevice;
+  e=drain(o,cudaMemsetAsync(o->weights,0,o->s.weight_bytes,o->stream));
+  if(!e)*arena=o->weights;return e;
+}
+extern "C" int32_t cuteafd_audio_commit_weights(void* opaque) {
+  if(!opaque)return cudaErrorInvalidValue;
+  auto* o=static_cast<Owner*>(opaque);if(o->uploaded)return cudaErrorInvalidValue;
+  int device=-1;int e=cudaGetDevice(&device);if(e)return e;if(device!=o->device)return cudaErrorInvalidDevice;
+  auto copy=[&](void* dst,const void* src,size_t n){return int(cudaMemcpyAsync(dst,src,n,cudaMemcpyHostToDevice,o->stream));};
+  int rc=copy(o->hann,cuteafd_audio_hann,960*4);
+  if(!rc)rc=copy(o->filter,cuteafd_audio_filterbank,481*128*4);
+  if(!rc)rc=copy(o->codec_rope,cuteafd_audio_codec_rotary,size_t(o->codec_capacity)*64*4);
+  if(!rc)rc=copy(o->patch_rope,cuteafd_audio_patch_rotary,4*64*4);
+  for(int book=0;book<20 && !rc;++book)rc=support(o,AUDIO_SUM_SQUARE,1024,w(o,o->s.codebooks[book]),nullptr,nullptr,o->book_square+book*1024,nullptr,nullptr,BOOKS[book]);
+  rc=drain(o,rc);o->uploaded=rc==0;return rc;
+}
 extern "C" int32_t cuteafd_audio_encode(void* opaque,const float* pcm,uint32_t samples,
     float* output,uint64_t output_bytes,int32_t* codes,uint64_t code_bytes,cuteafd_audio_observer cb,void* ctx) {
   if(!opaque || !pcm || !output)return cudaErrorInvalidValue;

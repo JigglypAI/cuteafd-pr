@@ -76,6 +76,18 @@ pub struct NativePcmAudio {
     _thread: PhantomData<Rc<()>>,
 }
 impl NativePcmAudio {
+    /// Query the native ledger without allocating an owner or touching CUDA.
+    pub fn required(path: &Path, spec: &PcmSpec) -> Result<PcmLedger, AudioError> {
+        // SAFETY: the library stays live through the versioned ABI call and the
+        // output ledger is writable for its exact C layout.
+        unsafe {
+            let library = Library::new(path)?;
+            let required: Required = *library.get(b"cuteafd_pcm_required\0")?;
+            let mut ledger = PcmLedger::default();
+            check(required(spec, &mut ledger))?;
+            Ok(ledger)
+        }
+    }
     pub fn load(
         path: &Path,
         spec: &PcmSpec,
@@ -83,10 +95,30 @@ impl NativePcmAudio {
         admitted: u64,
         weights: &[u8],
     ) -> Result<Self, AudioError> {
+        Self::load_inner(path, spec, device, admitted, Some(weights))
+    }
+    pub fn prepare(path: &Path, spec: &PcmSpec, device: i32, admitted: u64) -> Result<Self, AudioError> {
+        Self::load_inner(path, spec, device, admitted, None)
+    }
+    pub fn weight_arena(&self) -> Result<usize, AudioError> {
+        // SAFETY: exact header ABI, live owner; caller retains it through external writes.
+        unsafe {
+            let get = self._library.get::<unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32>(b"cuteafd_pcm_weight_arena")?;
+            let mut arena = std::ptr::null_mut();
+            check(get(self.owner, &mut arena))?;
+            Ok(arena as usize)
+        }
+    }
+    /// Call only after the existing push group drains all external writes.
+    pub fn commit_weights(&mut self) -> Result<(), AudioError> {
+        // SAFETY: exact header ABI and live thread-confined owner.
+        unsafe { check(self._library.get::<unsafe extern "C" fn(*mut c_void) -> i32>(b"cuteafd_pcm_commit_weights")?(self.owner)) }
+    }
+    fn load_inner(path: &Path, spec: &PcmSpec, device: i32, admitted: u64, weights: Option<&[u8]>) -> Result<Self, AudioError> {
         if spec.abi_version != 2 || !spec.feature_norm_eps.is_finite() || spec.feature_norm_eps <= 0.0 {
             return Err(AudioError::InvalidInput("PCM ABI 2 and positive finite feature epsilon required"));
         }
-        if weights.len() as u64 != spec.weight_bytes {
+        if weights.is_some_and(|w| w.len() as u64 != spec.weight_bytes) {
             return Err(AudioError::InvalidInput("PCM weight arena length"));
         }
         // SAFETY: symbols have the versioned C header ABI, and Library is held
@@ -112,9 +144,11 @@ impl NativePcmAudio {
             }
             let mut owner = std::ptr::null_mut();
             check(create(spec, device, admitted, &mut owner))?;
-            if let Err(error) = check(upload(owner, 0, weights.as_ptr(), weights.len() as u64)) {
-                destroy(owner);
-                return Err(error);
+            if let Some(weights) = weights {
+                if let Err(error) = check(upload(owner, 0, weights.as_ptr(), weights.len() as u64)) {
+                    destroy(owner);
+                    return Err(error);
+                }
             }
             Ok(Self {
                 _library: library,
@@ -187,6 +221,35 @@ mod tests {
                 Err(AudioError::InvalidInput("PCM ABI 2 and positive finite feature epsilon required"))));
         }
     }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn required_queries_the_library_without_creating_a_cuda_owner() {
+        let root = std::path::PathBuf::from(std::env::var_os("TMPDIR").unwrap_or_else(||
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+                .join(".cache/cuteafd/builds/pcm-required/tmp").into_os_string()))
+            .join(format!("pcm-required-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("mock.c");
+        let library = root.join("mock.so");
+        // Only the query symbol is provided: owner creation cannot be invoked.
+        std::fs::write(&source, r#"
+#include <stdint.h>
+struct Ledger { uint64_t weights, scratch, device_allocations, encodes; };
+int cuteafd_pcm_required(const void *spec, struct Ledger *out) {
+    if (!spec) return 1;
+    *out = (struct Ledger){4096, 8192, 2, 0};
+    return 0;
+}
+"#).unwrap();
+        let output = std::process::Command::new("cc").args(["-shared", "-fPIC"])
+            .arg(&source).arg("-o").arg(&library).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let ledger = NativePcmAudio::required(&library, &PcmSpec::default()).unwrap();
+        assert_eq!(ledger, PcmLedger { weights:4096, scratch:8192, device_allocations:2, encodes:0 });
+        assert!(NativePcmAudio::required(&root.join("missing.so"), &PcmSpec::default()).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn c_abi_sizes() {
         assert_eq!(std::mem::size_of::<PcmBlock>(), 56);

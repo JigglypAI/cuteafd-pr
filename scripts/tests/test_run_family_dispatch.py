@@ -63,6 +63,31 @@ def _run(repo: Path, hf: Path, *args: str) -> subprocess.CompletedProcess[str]:
                           capture_output=True, text=True, timeout=60)
 
 
+@pytest.mark.parametrize("gpus", [1, 2])
+@pytest.mark.parametrize("attention", ["auto", "heads", "context", "layers"])
+@pytest.mark.parametrize("wip", [False, True])
+def test_glm_native_attention_reaches_plan_and_coordinator(tmp_path, gpus, attention, wip):
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    keys = (f"EXLR8_MANIFEST=up1\nSPARK_COUNT=4\nRTX_GPUS={gpus}\n"
+            f"ATTENTION_PLACEMENT={attention}\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    result = _family_launch_result(tmp_path, config, "test/exlr8-attention", keys,
+                                  extra_args=("--wip", "heads-test") if wip else ())
+    supported = attention in ("auto", "heads") or (gpus == 2 and attention in ("context", "layers"))
+    if not supported:
+        assert result.returncode != 0
+        assert "GLM EXLR8 requires heads or two-GPU context/layers attention" in result.stderr
+        assert "cuteafd serve-glm --snapshot" not in result.stderr
+        return
+    assert result.returncode == 0, result.stderr
+    plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
+    coordinators = [line for line in result.stderr.splitlines() if "cuteafd serve-glm --snapshot" in line]
+    assert plans and coordinators, result.stderr
+    for line in plans:
+        argv = shlex.split(line)
+        assert argv[argv.index("--attention-placement") + 1] == attention
+    assert f"CUTEAFD_ATTENTION_PLACEMENT={attention}" in coordinators[0]
+
+
 @pytest.mark.parametrize("activations", [None, "a16", "a8"])
 @pytest.mark.parametrize("wip", [False, True])
 def test_exlr8_prefill_activations_reach_plan_coordinator_and_workers(tmp_path, activations, wip):

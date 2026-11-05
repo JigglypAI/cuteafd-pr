@@ -108,6 +108,18 @@ extern "C" int32_t cuteafd_pcm_upload(void* p,uint64_t offset,const void* data,u
   e=cudaMemcpyAsync(o->weights+offset,data,bytes,cudaMemcpyHostToDevice,o->stream);e=drain(o,e);
   if(!e)o->uploaded+=bytes;return e;
 }
+extern "C" int32_t cuteafd_pcm_weight_arena(void* p,void** arena){
+  if(!p||!arena)return cudaErrorInvalidValue;auto* o=static_cast<Owner*>(p);
+  if(o->uploaded)return cudaErrorInvalidValue;
+  int d=-1;int e=cudaGetDevice(&d);if(e)return e;if(d!=o->device)return cudaErrorInvalidDevice;
+  e=drain(o,cudaMemsetAsync(o->weights,0,o->s.weight_bytes,o->stream));
+  if(!e)*arena=o->weights;return e;
+}
+extern "C" int32_t cuteafd_pcm_commit_weights(void* p){
+  if(!p)return cudaErrorInvalidValue;auto* o=static_cast<Owner*>(p);
+  int d=-1;int e=cudaGetDevice(&d);if(e)return e;if(d!=o->device)return cudaErrorInvalidDevice;
+  e=drain(o,0);if(!e)o->uploaded=o->s.weight_bytes;return e;
+}
 extern "C" int32_t cuteafd_pcm_get_ledger(void* p,cuteafd_pcm_ledger* out){
   if(!p||!out)return cudaErrorInvalidValue;*out=static_cast<Owner*>(p)->ledger;return 0;
 }

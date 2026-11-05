@@ -528,6 +528,22 @@ def test_requested_panels_preflight_and_report(entry, tmp_path):
 
 
 
+@pytest.mark.parametrize('status', ['fail', 'failed'])
+def test_failed_panel_fails_zero_exit_done_report(entry, tmp_path, status):
+    job = make({**entry, 'profile': 'panels:shared_prefix', 'baseline': False}, tmp_path)
+    report_dir = Path(job['state']) / 'reports' / 'one'
+    report_dir.mkdir(parents=True)
+    panel = {'id': 'shared_prefix', 'status': status, 'error': 'retained 32768 tokens C1: HTTP 400: empty assistant'}
+    report = {'status': 'done', 'panels': [panel]}
+    (report_dir / 'report.json').write_text(json.dumps(report))
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'failed' and row['failure_kind'] == 'measurement'
+    assert row['error'] == 'panel shared_prefix: ' + panel['error']
+    panel.update(status='done', error=None)
+    (report_dir / 'report.json').write_text(json.dumps(report))
+    assert cards.summarize_job(job, 0)['status'] == 'pass'
+
+
 def test_summary_reads_c8_from_the_concurrency_sweep(entry, tmp_path):
     job = make(entry, tmp_path)
     report_dir = Path(job['state']) / 'reports' / 'one'
@@ -1492,6 +1508,25 @@ def test_gate_muse_cards_use_real_hosts_and_native_defaults(size, gpus, count):
     assert values['SPECULATOR'] == 'dflash2' and values['POOL_TOKENS'] == 'auto'
     assert values['VISION'] == values['AUDIO'] == 'auto'
     for rank, host in enumerate(hosts):
+        assert values[f'SPARK_{rank}_HOST'] == host
+        assert values[f'SPARK_{rank}_LANE_A'] == f'10.55.0.{rank + 1}'
+    entries = [entry for matrix in kit.glob('matrix-*.json')
+               for entry in json.loads(matrix.read_text())['entries']]
+    for key in ('ADDR', 'EXPERT_PORT'):
+        assert sum(entry.get('set', {}).get(key) == values[key] for entry in entries) == 1
+
+
+def test_gate_glm53_exlr8_min_uses_real_hosts_and_pool_first_defaults():
+    kit = ROOT / 'scripts/bench/kits/gate'
+    card = cards.load_cards(kit, ['glm53-exlr8-min'])[0]
+    values = {**cards.config(ROOT / card['config']), **card['set']}
+    assert card['family'] == 'glm5' and card['gpus'] == [0]
+    assert card['sparks'] == ['ostrich', 'dodo', 'emu', 'kiwi']
+    assert values['RTX_GPUS'] == '1' and values['COORDINATOR_GPUS'] == '0'
+    assert values['SPARK_COUNT'] == '4' and values['EXLR8_MANIFEST'] == 'up1'
+    assert values['MODEL_ID'] == 'kindlingai/glm-5.3-exlr8-k2-k3-k4'
+    assert values['POOL_TOKENS'] == 'auto' and 'RTX_EXPERT_LAYERS' not in values
+    for rank, host in enumerate(card['sparks']):
         assert values[f'SPARK_{rank}_HOST'] == host
         assert values[f'SPARK_{rank}_LANE_A'] == f'10.55.0.{rank + 1}'
     entries = [entry for matrix in kit.glob('matrix-*.json')

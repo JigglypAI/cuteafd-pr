@@ -354,6 +354,26 @@
    }
   },
   {
+   "name": "glm53-exlr8-min",
+   "family": "glm5",
+   "config": "examples/configs/glm53-exlr8-min.config",
+   "gpus": [0],
+   "sparks": ["ostrich", "dodo", "emu", "kiwi"],
+   "set": {
+    "ADDR": "0.0.0.0:8760",
+    "EXPERT_PORT": "19860",
+    "SPARK_COUNT": "4",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi",
+    "SPARK_0_LANE_A": "10.55.0.1",
+    "SPARK_1_LANE_A": "10.55.0.2",
+    "SPARK_2_LANE_A": "10.55.0.3",
+    "SPARK_3_LANE_A": "10.55.0.4"
+   }
+  },
+  {
    "name": "glm53-exlr8-max",
    "family": "glm5",
    "config": "examples/configs/glm53-exlr8-max.config",

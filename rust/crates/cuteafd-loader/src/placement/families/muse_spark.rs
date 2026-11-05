@@ -559,6 +559,9 @@ pub fn drafter_inventory(cfg: &MuseSparkConfig, config: &serde_json::Value, slot
     use crate::families::glm5::draft_representation::{draft_geometry, draft_resident_bytes_with_mode, GlmDraftCapacity,
         GlmDraftRepresentation};
     let (geometry, block) = draft_geometry(config).map_err(|error| anyhow::anyhow!("Muse drafter geometry: {error}"))?;
+    let ring = crate::families::glm5::draft_physical::RING;
+    ensure!(config["sliding_window"].as_u64() == Some(ring as u64),
+        "Muse DFlash2 window {} (the ring holds {ring})", config["sliding_window"]);
     let d = &config["dflash_config"];
     let taps = d["target_layer_ids"].as_array().context("Muse drafter taps")?.iter()
         .map(|tap| tap.as_u64().map(|t| t as usize).context("Muse drafter tap")).collect::<Result<Vec<_>>>()?;

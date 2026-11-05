@@ -179,11 +179,12 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
             return Ok(());
         }
     };
-    let (vision, prefix) = match super::media::ReadyVision::load(&args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
+    let (mut vision, prefix) = match super::media::ReadyVision::load(&args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
         Ok(vision) => vision,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };
     args.planner_media_weights = vision.as_ref().and_then(|vision| vision.weights);
+    let media_push = vision.as_mut().map(|vision| std::mem::take(&mut vision.push)).unwrap_or_default();
     let preparer = vision.as_ref().map(|vision| vision.preparer.clone());
     let (encoder, bytes) = vision.map_or((crate::shared::qwen::Encoder::Off, 0), |vision| (vision.encoder, vision.cache_bytes));
     let health = encoder.health_handle();
@@ -197,7 +198,8 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     }
     args.planner_host_prefix = Some((prefix.clone(), max_sequences));
     let mut ready = Some(ready);
-    let result = opened.with_engine(&args, |engine| {
+    let result = opened.with_engine_media(&args, media_push.records(), |engine| {
+        media_push.commit()?;
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-qwen4 needs every layer");
         anyhow::ensure!(engine.experts().is_some(),
             "serve-qwen4 needs --peers (or --local-experts) for the routed experts");

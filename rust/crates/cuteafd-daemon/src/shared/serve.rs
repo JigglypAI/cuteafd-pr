@@ -23,6 +23,7 @@ mod readiness_tests {
             ("Qwen4", include_str!("../families/qwen4/serve.rs"), "\nfn prefix_cache<", "\nstruct Qwen4Backend"),
             ("Kimi", include_str!("../families/kimi_k3/backend.rs"), "    fn prefix_cache(", "    fn prepare("),
             ("Step-5", include_str!("../families/step5/backend.rs"), "    fn prefix_cache(", "    fn prepare("),
+            ("Muse", include_str!("../families/muse_spark/backend.rs"), "    fn prefix_cache(", "    fn prepare("),
             ("dense Qwen", include_str!("../families/qwen3_5/serve.rs"), "    fn prefix_cache(", "    fn prepare("),
         ] {
             let prefix = source.split_once(start).unwrap_or_else(|| panic!("{family} prefix path missing")).1

@@ -384,6 +384,7 @@ impl GlmEngine<'_> {
             shared.allocation_receipts(&mut inventory, &format!("shared.rank.{rank}"))?;
         }
         if let Some(pair) = &self.tp2 { pair.allocation_receipts(&mut inventory, "routed")?; }
+        if let Some(whole) = &self.whole { whole.allocation_receipts(&mut inventory, "routed.rank.0")?; }
         Ok(inventory.receipts)
     }
 

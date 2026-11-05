@@ -17,6 +17,7 @@ pub(crate) fn vision_config(mode: MediaMode, snapshot: &std::path::Path) -> Resu
 }
 
 pub(crate) struct ReadyVision {
+    pub push: crate::shared::vision::push::Contribution,
     pub encoder: Encoder,
     pub preparer: Arc<MediaPreparer>,
     pub cache_bytes: usize,
@@ -55,7 +56,7 @@ impl ReadyVision {
             anyhow::ensure!(expected.output_width as usize == width, "Pixtral tower/LM output width mismatch");
             let encoder = remote.connect(expected)?;
             tracing::info!(cache_bytes, "Mistral Large 4 remote vision encoder ready");
-            return Ok((Some(Self { encoder, preparer, cache_bytes, expander }), prefix));
+            return Ok((Some(Self { push: Default::default(), encoder, preparer, cache_bytes, expander }), prefix));
         }
         let gpu = match mode {
             MediaMode::Rtx(_) => crate::families::glm5_flash::media::local_vision_gpu(mode, args.device, args.split_device)?,
@@ -85,13 +86,13 @@ impl ReadyVision {
                 &[cuteafd_core::serving_capacity::MemoryReservation { name: "vision.resident_weights_scratch".into(),
                     bytes: admitted }])?;
             // Start before the LM loads: its live baseline already includes the admitted tower.
-            Ok(crate::shared::vision::EncoderService::start(spec, args.native_lib.clone(), gpu, admitted)?)
+            Ok(crate::shared::vision::EncoderService::start_coordinator(&args.snapshot, Some((spec, admitted)), args.native_lib.clone(), gpu, None)?)
         })();
         let restored = library.cuda_set_device(args.device);
-        let service = loaded?;
+        let (service, push) = loaded?;
         restored?;
-        tracing::info!(gpu, admitted_bytes = admitted, cache_bytes, sm, max_tokens, "Mistral Large 4 resident vision encoder ready");
-        Ok((Some(Self { encoder: Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor,
+        tracing::info!(gpu, admitted_bytes = admitted, cache_bytes, sm, max_tokens, "Mistral Large 4 resident vision encoder allocated");
+        Ok((Some(Self { push, encoder: Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor,
             width, max_tokens)), preparer, cache_bytes, expander }), prefix))
     }
 }

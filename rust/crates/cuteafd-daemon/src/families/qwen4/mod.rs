@@ -557,6 +557,11 @@ impl Opened {
     /// Builds the engine and hands it to `body`.
     pub fn with_engine<T>(&self, args: &EngineArgs, body: impl FnOnce(&engine::Qwen4Engine<'_>) -> Result<T>)
         -> Result<T> {
+        self.with_engine_media(args, Default::default(), body)
+    }
+    pub(super) fn with_engine_media<T>(&self, args: &EngineArgs,
+        media: crate::shared::experts::rtx::dense::Records,
+        body: impl FnOnce(&engine::Qwen4Engine<'_>) -> Result<T>) -> Result<T> {
         let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?;
         let selected = if args.split_device.is_some() {
             ensure!(requested.is_none() || requested == Some(cuteafd_loader::placement::AttentionPlacement::Layers),
@@ -581,6 +586,7 @@ impl Opened {
             (args.pool_tokens > 0).then_some(args.pool_tokens as u64), 256, false)
             .with_automatic_context(automatic_context).validate_explicit()?;
         if let Some(peer) = args.split_device {
+            ensure!(media.operands.is_empty() && media.steps.is_empty(), "Qwen dual media push requires its dense coordinator group");
             return self.with_dual_engine(args, peer, automatic_context, body);
         }
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
@@ -639,7 +645,8 @@ impl Opened {
                 let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
                 planning.model(&self.cfg, layers, with_mtp, args.mtp_fp8_head)?
             };
-            let records = load.sink.as_ref().context("push sink")?.take_all();
+            let mut records = load.sink.as_ref().context("push sink")?.take_all();
+            records.extend(media.clone());
             let (landed, operands, staged, steps, largest, finishes) = records.summary();
             tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
                 "Qwen coordinator dense records planned");

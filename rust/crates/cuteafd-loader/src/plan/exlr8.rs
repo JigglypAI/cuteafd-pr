@@ -116,8 +116,9 @@ fn native_options(selected: &str, options: &super::PlanOptions, speculator: &str
     let attention = options.attention_placement.unwrap_or(default_attention);
     if family == "glm5" {
         ensure!(world > 0, "GLM EXLR8 native deployment requires canonical Sparks with 1..=8 ranks");
-        ensure!(attention == default_attention,
-            "EXLR8 native deployment with {gpu_count} RTX GPUs requires {default_attention} attention");
+        ensure!(attention == crate::placement::AttentionPlacement::Heads
+            || (gpu_count == 2 && matches!(attention, crate::placement::AttentionPlacement::Context | crate::placement::AttentionPlacement::Layers)),
+            "GLM EXLR8 native deployment requires heads or two-GPU context/layers attention");
     } else {
         ensure!(gpu_count == 2 || attention == crate::placement::AttentionPlacement::Heads,
             "Flash EXLR8 {attention} attention requires two RTX GPUs");
@@ -152,7 +153,12 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let records = dense::DenseRecord::inventory(snapshot)?;
     let selection = dense::DenseSelection::from_hf(&checkpoint.config)?;
     let backbone = selection.backbone(&records, layers)?;
-    let plans = (0..gpu_count).map(|rank| dense::DensePlan::for_rank(&backbone, gpu_count, rank))
+    let whole_mla = if family.id() == "glm5" && attention == crate::placement::AttentionPlacement::Layers {
+        let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
+        crate::placement::families::glm5::attention_owners(&cfg, layers)?.into_iter().enumerate()
+            .map(|(layer, rank)| (layer, usize::from(rank))).collect()
+    } else { BTreeMap::new() };
+    let plans = (0..gpu_count).map(|rank| dense::DensePlan::for_rank_owned(&backbone, gpu_count, rank, &whole_mla))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let activations = dense::programs::resolve_activations(&programs, &checkpoint.config, &records,
         layers, &plans, resolved_layout.exlr8_prefill_pin, resolved_layout.exlr8_prefill_activations)?;
@@ -170,7 +176,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
             (memory, placement)
         } else {
             super::layout::glm5::native_layout_with_metadata(checkpoint, &resolved_layout, &facts.shared_bytes,
-                workspace, world, &programs, Some(selected), Some(&metadata))?
+                workspace, world, &programs, Some(selected), Some(&metadata), Some(attention))?
         }
     };
     let layout = &resolved_layout;
@@ -1313,11 +1319,10 @@ mod tests {
             for attention in [None, Some(crate::placement::AttentionPlacement::Heads),
                 Some(crate::placement::AttentionPlacement::Context), Some(crate::placement::AttentionPlacement::Layers)] {
                 options.attention_placement = attention;
-                let expected = if gpus == 2 { crate::placement::AttentionPlacement::Context }
-                    else { crate::placement::AttentionPlacement::Heads };
-                // Family-specific attention refusal follows detection, not a hardcoded GLM default.
+                // Explicit Heads and Layers leave the two-GPU Context default unchanged.
                 assert_eq!(native_options("up1", &options, "off", "glm5").is_ok(),
-                    attention.is_none_or(|a| a == expected));
+                    attention.is_none_or(|a| a == crate::placement::AttentionPlacement::Heads
+                        || (gpus == 2 && matches!(a, crate::placement::AttentionPlacement::Context | crate::placement::AttentionPlacement::Layers))));
                 assert_eq!(native_options("k4", &options, "off", "glm5_flash").is_ok(),
                     gpus == 2 || attention.is_none_or(|a| a == crate::placement::AttentionPlacement::Heads));
             }

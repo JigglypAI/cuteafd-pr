@@ -1852,8 +1852,8 @@ fn glm5_attention_auto_requires_complete_context_programs() {
     names.extend(context.iter().cloned());
     names.extend(["glm_sparse_mla_partial_h0_s1_m64", "glm_sparse_mla_partial_h32_s1_m64"].map(str::to_string));
     let path = dir.path().join("PROGRAMS.json");
-    // Both partials and every primitive are required; auto (context) and an
-    // explicit context fail closed without them, while heads always runs.
+    // Both partials and every primitive are required for Context. Auto falls
+    // back to whole-layer attention; explicit Context still fails closed.
     let missing = std::iter::once(None).chain(names.iter().filter(|name|
         context.contains(name) || name.starts_with("glm_sparse_mla_partial_"))
         .map(|name| Some(name.as_str()))).chain([Some("no-manifest")]);
@@ -1901,18 +1901,18 @@ fn glm5_attention_auto_requires_complete_context_programs() {
                 assert_eq!(auto.attention_placement, AttentionPlacement::Context);
                 assert_eq!(auto.memory_layout, context.memory_layout);
             } else {
-                // The manifest lacks a context program: auto (context) and an
-                // explicit context fail closed, naming the programs to rebuild,
-                // instead of silently downgrading to heads (#202).
-                for report in [&auto, &context] {
-                    assert!(!report.executable(), "omitted {omitted:?}, gpus {gpus}: {}", render(report));
-                    assert!(!report.placement_supported);
-                    assert_eq!(report.attention_placement, AttentionPlacement::Context);
-                    assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|note|
-                        note.contains("context-split programs") && note.contains("glm_dsa_candidate_merge")),
-                        "omitted {omitted:?}, gpus {gpus}: {}", render(report));
-                }
-                assert_eq!(auto.memory_layout, context.memory_layout);
+                assert!(auto.executable(), "omitted {omitted:?}, gpus {gpus}: {}", render(&auto));
+                assert_eq!(auto.attention_placement, AttentionPlacement::Layers);
+                assert_eq!(auto.solver_placement, layers.solver_placement);
+                assert_eq!(auto.memory_layout.as_ref().unwrap().devices,
+                    layers.memory_layout.as_ref().unwrap().devices);
+                assert!(auto.memory_layout.as_ref().unwrap().notes.iter().any(|note|
+                    note.starts_with("auto attention fallback: layers")));
+                assert!(!context.executable() && !context.placement_supported);
+                assert_eq!(context.attention_placement, AttentionPlacement::Context);
+                assert!(context.memory_layout.as_ref().unwrap().notes.iter().any(|note|
+                    note.contains("context-split programs") && note.contains("glm_dsa_candidate_merge")),
+                    "omitted {omitted:?}, gpus {gpus}: {}", render(&context));
             }
         }
     }
@@ -3796,11 +3796,10 @@ fn glm5_flash_spark_count_refusal_preserves_pool_and_replay_constraints() {
     assert!(!reasons.contains("checkpoint tensors or required package artifacts unavailable"), "{reasons}");
 }
 
-/// Auto is `context` on a two-GPU GLM Flash pair, so a build whose manifest lacks the context
-/// programs fails closed naming them (never silently serving heads with replicated KV); an
-/// explicit `heads` request still plans (issue #202).
+/// Missing Context programs select owned MLA under Auto, never replicated KV.
+/// Explicit Context still fails closed, and explicit Heads remains supported.
 #[test]
-fn glm5_flash_two_gpu_auto_without_context_programs_fails_closed() {
+fn glm5_flash_two_gpu_auto_without_context_programs_uses_layers() {
     use crate::placement::AttentionPlacement;
     let config = glm5_flash_config(2);
     let dir = snapshot(config.clone(), &glm5_flash_tensors(&config));
@@ -3831,8 +3830,15 @@ fn glm5_flash_two_gpu_auto_without_context_programs_fails_closed() {
     let heads = plan(dir.path(), &options(Some(AttentionPlacement::Heads))).unwrap();
     assert!(heads.placement_supported && heads.executable(), "{}", render(&heads));
     assert_eq!(heads.attention_placement, AttentionPlacement::Heads);
-    for report in [plan(dir.path(), &options(None)).unwrap(),
-        plan(dir.path(), &options(Some(AttentionPlacement::Context))).unwrap()] {
+    let auto = plan(dir.path(), &options(None)).unwrap();
+    let layers = plan(dir.path(), &options(Some(AttentionPlacement::Layers))).unwrap();
+    assert!(auto.executable() && auto.placement_supported, "{}", render(&auto));
+    assert_eq!(auto.attention_placement, AttentionPlacement::Layers);
+    assert_eq!(auto.solver_placement, layers.solver_placement);
+    assert_eq!(auto.memory_layout.as_ref().unwrap().devices, layers.memory_layout.as_ref().unwrap().devices);
+    assert!(auto.memory_layout.as_ref().unwrap().notes.iter().any(|note|
+        note.starts_with("auto attention fallback: layers")));
+    for report in [plan(dir.path(), &options(Some(AttentionPlacement::Context))).unwrap()] {
         assert!(!report.executable() && !report.placement_supported, "{}", render(&report));
         assert_eq!(report.attention_placement, AttentionPlacement::Context);
         let notes = &report.memory_layout.as_ref().unwrap().notes;
@@ -3955,11 +3961,10 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
     // The shared solver cannot admit this historical A_log-only checkpoint.
     // Preserve the old snapshot/hash as provenance, but require a named refusal
     // instead of manufacturing resident weights and an executable layout.
-    // The reference plans predate GLM Flash's recorded `context` default: the request
-    // resolves to heads on one GPU and context on two, which the refused plan reports
-    // (#202), so the two-GPU rows compare against the mode now requested.
+    // This header-only fixture has no Context programs. Auto selects Heads on
+    // one GPU and owned MLA on two; both still name the missing resident operand.
     for (name, report) in actual.as_object().unwrap() {
-        let requested = if name == "min" { json!("heads") } else { json!("context") };
+        let requested = if name == "min" { json!("heads") } else { json!("layers") };
         assert_eq!(report["attention_placement"], requested);
         assert_eq!(report["cache_requirements"], expected[name]["cache_requirements"]);
         assert_eq!(report["placement_supported"], json!(false));
@@ -3969,13 +3974,8 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
             device["kind"] == json!("rtx") && device["items"].as_array().unwrap().is_empty()));
         let notes = memory["notes"].as_array().unwrap();
         let named = |text: &str| notes.iter().any(|note| note.as_str().unwrap().contains(text));
-        if name == "min" {
-            assert!(named("resident operand missing: model.language_model.embed_tokens.weight"));
-        } else {
-            // Two GPUs request `context`, which this build's manifest cannot serve: the refusal
-            // names the missing context programs before the missing-operand check (#202).
-            assert!(named("context-split programs"));
-        }
+        assert!(named("resident operand missing: model.language_model.embed_tokens.weight"));
+        if name != "min" { assert!(named("auto attention fallback: layers")); }
     }
     // Complete-header solver/working-set tests check the admitted inventory and
     // exact Spark I/O; this fixture remains the unchanged historical reference.
@@ -5308,12 +5308,11 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             let executor = crate::placement::families::executor(auto.family.as_deref().unwrap()).unwrap();
             // No context programs here; Qwen with Spark experts also keeps its single-owner default.
             let peer = gpus == 2 && auto.family.as_deref() != Some("qwen4");
-            // GLM 5.3 and GLM Flash auto resolve `context` on two peers, which the absent
-            // manifest cannot run: the solve fails closed naming the programs (#202).
+            // Standard GLM variants can own whole layers without Context programs;
+            // V4 has no qualified Layers executor and keeps its fail-closed default.
             let default = if matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash")) && peer {
-                AttentionPlacement::Context
-            // V4 without its C4 context programs builds a heads-only executor.
-            } else if !peer || matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash" | "deepseek_v4")) {
+                AttentionPlacement::Layers
+            } else if !peer {
                 AttentionPlacement::Heads
             } else { executor.attention };
             assert_eq!(auto.attention_placement, default);
@@ -5328,13 +5327,16 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             }
             if auto.family.as_deref() == Some("glm5") {
                 assert!(auto.memory_layout.is_some(), "{}", render(&auto));
-                // Supported on one GPU (heads); two-GPU auto fails closed without the programs.
-                assert_eq!(auto.placement_supported, !peer, "{}", render(&auto));
+                assert!(auto.placement_supported, "{}", render(&auto));
             }
             let explicit_default = plan(dir.path(), &PlanOptions {
                 attention_placement: Some(default), ..options.clone()
             }).unwrap();
-            assert_eq!(auto.memory_layout, explicit_default.memory_layout);
+            let mut auto_memory = auto.memory_layout.clone();
+            if let Some(memory) = &mut auto_memory {
+                memory.notes.retain(|note| !note.starts_with("auto attention fallback: layers"));
+            }
+            assert_eq!(auto_memory, explicit_default.memory_layout);
             assert_eq!(auto.config_error, explicit_default.config_error);
             assert_eq!(auto.placement_supported, explicit_default.placement_supported);
             for mode in [AttentionPlacement::Heads, AttentionPlacement::Context, AttentionPlacement::Layers] {

@@ -10,6 +10,7 @@ pub mod remote;
 pub mod worker;
 pub mod audio;
 pub mod pcm_audio;
+pub(crate) mod push;
 
 use cuteafd_core::DType;
 use cuteafd_ffi::vision::{NativeVision, VisionBlock, VisionLedger, VisionSpec, NO_VISION_OFFSET};
@@ -24,7 +25,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc,
     },
-    thread::{self, JoinHandle},
+    thread,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -361,21 +362,19 @@ impl TowerSpec {
                 file.read_exact(&mut weights[start..start + m.byte_length as usize])?;
             }
         }
-        if self.native.reserved == mistral::RESERVED {
-            // Pixtral's interleaved axial order (height half, then width half).
-            for (i, value) in mistral::axial_inv_freq().into_iter().enumerate() {
-                let start = self.native.inv_freq as usize + i * 4;
-                weights[start..start + 4].copy_from_slice(&value.to_le_bytes());
-            }
-            return Ok(weights);
-        }
-        let frequencies = if self.native.abi_version == 2 { self.native.head_dim as usize / 4 } else { 16 };
-        for i in 0..frequencies {
-            let value = axial_frequency(i, frequencies);
-            let start = self.native.inv_freq as usize + i * 4;
-            weights[start..start + 4].copy_from_slice(&value.to_le_bytes());
-        }
+        let constants = self.frequency_bytes();
+        let at = self.native.inv_freq as usize;
+        weights[at..at + constants.len()].copy_from_slice(&constants);
         Ok(weights)
+    }
+    fn frequency_bytes(&self) -> Vec<u8> {
+        let values = if self.native.reserved == mistral::RESERVED {
+            mistral::axial_inv_freq().into_iter().collect::<Vec<_>>()
+        } else {
+            let frequencies = if self.native.abi_version == 2 { self.native.head_dim as usize / 4 } else { 16 };
+            (0..frequencies).map(|i| axial_frequency(i, frequencies)).collect()
+        };
+        values.into_iter().flat_map(f32::to_le_bytes).collect()
     }
 }
 
@@ -397,6 +396,15 @@ pub struct VitRuntime {
     pub spec: TowerSpec,
 }
 impl VitRuntime {
+    fn prepare(spec: TowerSpec, library: &Path, device: i32, admitted: u64) -> Result<Self> {
+        let native = NativeVision::prepare(library, &spec.native, device, admitted)?;
+        Ok(Self { native, spec })
+    }
+    fn weight_arena(&self) -> Result<usize> {
+        let address = self.native.weight_arena()?;
+        self.native.upload_range(self.spec.native.inv_freq, &self.spec.frequency_bytes())?;
+        Ok(address)
+    }
     /// `admitted_bytes` comes from the placement memory ledger, not cudaMemGetInfo.
     pub fn load(spec: TowerSpec, library: &Path, device: i32, admitted_bytes: u64) -> Result<Self> {
         let required = NativeVision::required(library, &spec.native)?;
@@ -487,7 +495,7 @@ fn reply_encode(healthy: &AtomicBool, reply: &mpsc::SyncSender<Result<Vec<u16>>>
 /// Dropping the service closes admission, drains accepted jobs and joins owner.
 pub struct EncoderService {
     queue: Option<mpsc::SyncSender<Work>>,
-    owner: Option<JoinHandle<()>>,
+    owner: Option<Arc<push::OwnerThread>>,
     pub ledger: VisionLedger,
     pub audio_ledger: Option<cuteafd_ffi::audio::AudioLedger>,
     audio_geometry: Option<cuteafd_core::media::AudioTokenGeometry>,
@@ -511,7 +519,7 @@ impl EncoderService {
         admitted_bytes: u64,
         audio: Option<audio::AudioOwnerConfig>,
     ) -> Result<Self> {
-        Self::start_media(Some((spec, admitted_bytes)), library, device, audio)
+        Self::start_media(Some((spec, admitted_bytes)), library, device, audio, false).map(|(service, _)| service)
     }
     /// Audio-only deployment keeps the same owner/queue, without vision weights.
     pub fn start_audio(
@@ -519,14 +527,25 @@ impl EncoderService {
         device: i32,
         audio: audio::AudioOwnerConfig,
     ) -> Result<Self> {
-        Self::start_media(None, library, device, Some(audio))
+        Self::start_media(None, library, device, Some(audio), false).map(|(service, _)| service)
+    }
+    /// Coordinator-only deferred load. Spark owners retain the existing mount startup.
+    pub(crate) fn start_coordinator(
+        snapshot: &Path, vision: Option<(TowerSpec, u64)>, library: PathBuf, device: i32,
+        audio: Option<audio::AudioOwnerConfig>,
+    ) -> anyhow::Result<(Self, push::Contribution)> {
+        use crate::shared::experts::rtx::push::{PushPolicy, PushStartupError};
+        let defer = PushPolicy::for_snapshot(snapshot)? == PushPolicy::Required;
+        Self::start_media(vision, library, device, audio, defer)
+            .map_err(|error| PushStartupError::Planning(error.into()).into())
     }
     fn start_media(
         vision: Option<(TowerSpec, u64)>,
         library: PathBuf,
         device: i32,
         audio: Option<audio::AudioOwnerConfig>,
-    ) -> Result<Self> {
+        defer: bool,
+    ) -> Result<(Self, push::Contribution)> {
         // Query and admit every enabled component before either allocates.
         if let Some((spec, admitted)) = &vision {
             let required = NativeVision::required(&library, &spec.native)?.total_bytes();
@@ -540,6 +559,15 @@ impl EncoderService {
                 return Err(VisionError::Unsupported(format!("audio admission needs {required}, got {}", config.admitted_bytes())));
             }
         }
+        let vision_plan = vision.as_ref().map(|(spec, _)| spec.clone());
+        let pcm_plan = audio.as_ref().and_then(|config| match config {
+            audio::AudioOwnerConfig::Pcm { spec, .. } => Some(spec.clone()), _ => None,
+        });
+        let mimo_plan = audio.as_ref().and_then(|config| match config {
+            audio::AudioOwnerConfig::Mimo { spec, .. } => Some(spec.clone()), _ => None,
+        });
+        let (commit, committed) = mpsc::channel();
+        let (ack, acknowledgement) = mpsc::sync_channel(1);
         let audio_geometry = audio.as_ref().map(audio::AudioOwnerConfig::geometry);
         let (queue, jobs) = mpsc::sync_channel::<Work>(2);
         let (ready, readiness) = mpsc::sync_channel(1);
@@ -560,7 +588,7 @@ impl EncoderService {
                     let _ = ready.send(Err(error));
                     return;
                 }
-                let mut runtime = match vision.map(|(spec, admitted)| VitRuntime::load(spec, &library, device, admitted)).transpose() {
+                let mut runtime = match vision.map(|(spec, admitted)| if defer { VitRuntime::prepare(spec, &library, device, admitted) } else { VitRuntime::load(spec, &library, device, admitted) }).transpose() {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = ready.send(Err(error));
@@ -574,7 +602,7 @@ impl EncoderService {
                         return;
                     }
                 };
-                let mut audio_runtime = match audio.map(|config| audio::AudioRuntime::load(config, &library, device)).transpose() {
+                let mut audio_runtime = match audio.map(|config| if defer { audio::AudioRuntime::prepare(config, &library, device) } else { audio::AudioRuntime::load(config, &library, device) }).transpose() {
                     Ok(runtime) => runtime,
                     Err(error) => { let _ = ready.send(Err(error)); return; }
                 };
@@ -582,9 +610,34 @@ impl EncoderService {
                     Ok(ledger) => ledger,
                     Err(error) => { let _ = ready.send(Err(error)); return; }
                 };
-                owner_health.store(true, Ordering::Release);
-                if ready.send(Ok((ledger, audio_ledger))).is_err() {
-                    return;
+                let arenas = if defer {
+                    (|| -> Result<_> { Ok((runtime.as_ref().map(VitRuntime::weight_arena).transpose()?,
+                        audio_runtime.as_ref().map(audio::AudioRuntime::weight_arena).transpose()?.flatten())) })()
+                } else { Ok((None, None)) };
+                let (vision_arena, pcm_arena) = match arenas {
+                    Ok(arenas) => arenas,
+                    Err(error) => { let _ = ready.send(Err(error)); return; }
+                };
+                if !defer { owner_health.store(true, Ordering::Release); }
+                if ready.send(Ok((ledger, audio_ledger, vision_arena, pcm_arena))).is_err() { return; }
+                if defer {
+                    if committed.recv() != Ok(true) {
+                        if let Err(error) = worker::drain_external_weights(&library, device) {
+                            tracing::error!(%error, "quarantining cancelled media arenas after failed device drain");
+                            // Retain native owners AND their libraries when queued writes cannot be proven drained.
+                            std::mem::forget(runtime);
+                            std::mem::forget(audio_runtime);
+                        }
+                        return;
+                    }
+                    let result = (|| -> Result<()> {
+                        if let Some(runtime) = runtime.as_mut() { runtime.native.commit_weights()?; }
+                        if let Some(runtime) = audio_runtime.as_mut() { runtime.commit_weights()?; }
+                        Ok(())
+                    })();
+                    if result.is_ok() { owner_health.store(true, Ordering::Release); }
+                    let failed = result.is_err();
+                    if ack.send(result).is_err() || failed { return; }
                 }
                 while let Ok(work) = jobs.recv() {
                     let started = std::time::Instant::now();
@@ -618,14 +671,20 @@ impl EncoderService {
                 }
             })?;
         match readiness.recv() {
-            Ok(Ok((ledger, audio_ledger))) => Ok(Self {
+            Ok(Ok((ledger, audio_ledger, vision_arena, pcm_arena))) => {
+                let owner = Arc::new(push::OwnerThread::new(owner, commit.clone()));
+                let contribution = push::Contribution::prepare(device, vision_plan.as_ref().zip(vision_arena),
+                    pcm_plan.as_ref().zip(pcm_arena), mimo_plan.as_ref().zip(pcm_arena), defer.then_some((commit, acknowledgement, owner.clone())))
+                    .map_err(|error| VisionError::Unsupported(error.to_string()))?;
+                Ok((Self {
                 queue: Some(queue),
                 owner: Some(owner),
                 ledger,
                 audio_ledger,
                 audio_geometry,
                 healthy,
-            }),
+            }, contribution))
+            },
             Ok(Err(error)) => {
                 drop(queue);
                 let _ = owner.join();
@@ -680,9 +739,7 @@ impl EncoderService {
 impl Drop for EncoderService {
     fn drop(&mut self) {
         self.queue.take();
-        if let Some(owner) = self.owner.take() {
-            let _ = owner.join();
-        }
+        self.owner.take();
     }
 }
 
@@ -805,7 +862,7 @@ mod tests {
         let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = observed.clone();
         let (gate, wait) = mpsc::sync_channel(0);
-        service.owner = Some(thread::spawn(move || {
+        service.owner = Some(push::OwnerThread::mock(thread::spawn(move || {
             wait.recv().unwrap();
             while let Ok(work) = jobs.recv() {
                 let (kind, output) = match work.job {
@@ -817,7 +874,7 @@ mod tests {
                     Err(VisionError::Cancelled)
                 } else { Ok(output) });
             }
-        }));
+        })));
         let image = service.submit(EncodeJob { rgb: vec![0; 3072].into(), grid: [2,2],
             lut: Arc::new([0.0; 768]), output: vec![0; 4096] }).unwrap();
         let audio = service.submit_audio(audio_job()).unwrap();
@@ -940,6 +997,7 @@ mod tests {
             let snapshot = sparse_snapshot(width);
             let tower = TowerSpec::mimo(snapshot.path(), 4096).unwrap();
             assert_ctypes_spec(snapshot.path(), "mimo_v2", &tower);
+            push::tests::assert_vision_plan(snapshot.path(), &tower);
             assert_eq!(tower.native.output_width, width as u32);
             assert_eq!(
                 tower.native.weight_bytes,

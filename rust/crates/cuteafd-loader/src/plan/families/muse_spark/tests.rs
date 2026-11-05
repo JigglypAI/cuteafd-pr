@@ -486,6 +486,13 @@ fn drafter_is_charged_on_the_head_gpu_and_must_match_the_target_head() {
     std::fs::write(drafter.path().join("config.json"), other.to_string()).unwrap();
     let refused = input.plan(&with_draft).unwrap();
     assert!(refused.hints.iter().any(|h| h.what.contains("softcap/output_multiplier differ")), "{:?}", refused.hints);
+    for window in [serde_json::json!(1024), serde_json::Value::Null] {
+        let mut other = config.clone();
+        other["sliding_window"] = window;
+        std::fs::write(drafter.path().join("config.json"), other.to_string()).unwrap();
+        let refused = input.plan(&with_draft).unwrap();
+        assert!(refused.hints.iter().any(|h| h.what.contains("ring holds 2048")), "{:?}", refused.hints);
+    }
 }
 
 #[test]

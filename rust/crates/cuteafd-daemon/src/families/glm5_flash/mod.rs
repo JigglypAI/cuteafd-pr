@@ -1725,12 +1725,9 @@ pub(crate) fn served_index_cache(requested: engine::IndexCache, split: bool,
 
 /// The MLA placement an engine serves (`glm5_flash::resolve_attention` over the requested mode and
 /// the build's context programs), with its programs' scratch.
-fn resolve_attention(args: &EngineArgs, programs: &cuteafd_ffi::programs::Programs<'_>, split: bool)
+fn resolve_attention(args: &EngineArgs, available: Option<engine::GlmfAttention>, split: bool)
     -> Result<engine::GlmfAttention> {
     let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?;
-    let names: Vec<&str> = programs.names().collect();
-    let available = cuteafd_loader::placement::families::glm5_flash::context_programs(names.iter().copied(),
-        |name| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0)));
     let attention = cuteafd_loader::placement::families::glm5_flash::resolve_attention(requested,
         1 + usize::from(split), available)?;
     // Auto with pool marks keeps heads (context keeps marks in the arena).
@@ -1960,6 +1957,11 @@ impl Opened {
     /// the engine serves (`engine.mark_slots`).
     pub fn with_engine<'s, T>(&'s self, args: &EngineArgs, body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>)
         -> Result<T> {
+        self.with_engine_media(args, Default::default(), body)
+    }
+    pub(super) fn with_engine_media<'s, T>(&'s self, args: &EngineArgs,
+        media: crate::shared::experts::rtx::dense::Records,
+        body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>) -> Result<T> {
         // A head split whose GPUs lack peer access serves from --device alone, decided before any load or
         // admission. The arena is counted after both decisions (below), on the layout this engine serves:
         // each admitted GPU reserves its part of every mark (a lone GPU, the whole mark), as the prefix
@@ -2089,33 +2091,28 @@ impl Opened {
         ensure!(!(args.kda_fp32_partials || args.kda_output_shard || args.kda_prefill_expanded)
             || split_device.is_some(),
             "KDA partial/expanded options require native head-split programs (missing glmf2_kda_m64)");
-        // The MLA placement: auto is context on two GPUs where this build carries its programs
-        // (with the compact index cache), else heads (whose split keeps the token keys).
-        let mut attention = resolve_attention(args, &programs, split_device.is_some())?;
-        let context_manifest = if attention.mode == cuteafd_loader::placement::AttentionPlacement::Context {
+        // Resolve card-specific recipes before choosing cache and operand owners.
+        let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?;
+        let available_manifest = if split_device.is_some() && !matches!(requested,
+            Some(cuteafd_loader::placement::AttentionPlacement::Heads | cuteafd_loader::placement::AttentionPlacement::Layers))
+            && !(requested.is_none() && args.prefix_marks == prefix::PrefixMarks::Pool) {
             let fallback = args.manifest.with_file_name("DSV4_PROGRAMS.json");
             let path = if !args.manifest.exists()
                 && args.manifest.file_name() == Some("PROGRAMS.json".as_ref()) && fallback.exists() {
                 &fallback
             } else { &args.manifest };
-            let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
-            let mut scratch = 0;
-            for device in std::iter::once(args.device).chain(split_device) {
-                let bytes = crate::shared::peer_split::on_device(&self.library, device, || {
-                    let sms = self.library.sm_count()?;
-                    let mut bytes = 0;
-                    for begin in [0, self.cfg.heads / 2] {
-                        let name = cuteafd_core::coordinator_programs::attention_partial_program(
-                            &manifest, "glmf", begin, engine::DECODE_ROWS, sms, &attention_plan)?;
-                        bytes = bytes.max(programs.spec(&name)?.scratch.get("scratch").copied().unwrap_or(0));
-                    }
-                    Ok(bytes)
-                })?;
-                scratch = scratch.max(bytes);
-            }
-            attention.partial_scratch = scratch;
-            Some(manifest)
+            Some(serde_json::from_slice::<serde_json::Value>(&std::fs::read(path)?)?)
         } else { None };
+        let available = available_manifest.as_ref().map(|manifest| -> Result<_> {
+            let sms = std::iter::once(args.device).chain(split_device).map(|device|
+                crate::shared::peer_split::on_device(&self.library, device, || self.library.sm_count()))
+                .collect::<Result<Vec<_>>>()?;
+            cuteafd_loader::placement::families::glm5_flash::manifest_context_for_cards(
+                manifest, self.cfg.heads, &sms, attention_plan)
+        }).transpose()?.flatten();
+        let attention = resolve_attention(args, available, split_device.is_some())?;
+        let context_manifest = (attention.mode == cuteafd_loader::placement::AttentionPlacement::Context)
+            .then_some(available_manifest).flatten();
         let context_mode = (attention.mode == cuteafd_loader::placement::AttentionPlacement::Context).then_some(attention);
         let index_cache = served_index_cache(args.index_cache, split_device.is_some(), attention.mode);
         if let (Some(device), true, None) = (split_device, index_cache != args.index_cache, context_mode) {
@@ -2256,6 +2253,7 @@ impl Opened {
                     }))
             })?;
             records.extend(load.sink.as_ref().context("push sink")?.take_all());
+            records.extend(media.clone());
             let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records, &devices, sparks)?;
             Ok((embedding, model, dense))
         };
@@ -2335,11 +2333,12 @@ impl Opened {
         };
         let plan_native = |sparks: usize| -> Result<_> {
             let native = native_admission.as_ref().context("native Flash admission")?;
-            let (owners, records) = crate::shared::experts::rtx::dense::recording(|| {
+            let (owners, mut records) = crate::shared::experts::rtx::dense::recording(|| {
                 let loaded = native.load(&self.library, &programs, &loader, &self.cfg, &execution, embedding_device.id)?;
                 let shared = native.load_shared(args, &self.cfg, &self.library, &programs)?;
                 Ok((loaded, shared))
             })?;
+            records.extend(media.clone());
             let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records, &devices, sparks)?;
             Ok((owners, dense))
         };

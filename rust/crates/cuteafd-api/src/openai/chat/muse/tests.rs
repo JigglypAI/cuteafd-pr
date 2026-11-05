@@ -65,6 +65,8 @@ fn efforts_map_onto_the_template_and_thinking_off_prefills_user() {
     assert!(render(json!({"reasoning_effort": "MEDIUM"})).unwrap().contains("Reasoning strength: 32."));
     assert!(render(json!({"reasoning_effort": "max"})).unwrap().contains("Reasoning strength: 512."));
     assert!(render(json!({"reasoning_effort": "bogus"})).unwrap_err().contains("not one of"));
+    let conflict = render(json!({"thinking":{"type":"enabled"},"reasoning_effort":"none"})).unwrap_err();
+    assert!(conflict.contains("thinking is enabled") && conflict.contains("reasoning_effort is \"none\""));
     for extra in [json!({"thinking":"disabled"}), json!({"thinking":{"type":"disabled"}}),
         json!({"reasoning_effort":"none"}), json!({"enable_thinking":false})] {
         assert!(render(extra).unwrap().ends_with("<|start|>assistant to=user<|message|>"));

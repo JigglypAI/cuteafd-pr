@@ -230,6 +230,10 @@ mod tests {
             .split("/// Input-side projections").next().unwrap();
         assert!(meet.contains("if !Self::core_split(layer, \"down\") { return Ok(()); }"));
         assert!(meet.contains("if rank == 0") && meet.contains("cuda_zero_bytes_async"));
+        assert!(meet.contains("else if self.shared_zero_elided(index, layer)"));
+        let policy = source.split("fn shared_zero_elided(").nth(1).unwrap()
+            .split("/// Native cores").next().unwrap();
+        assert!(policy.contains("!layer.dense && Self::core_split(layer, \"down\") && !self.tp2_layer(index)"));
         let reduce = source.split("fn reduce_projection(").nth(1).unwrap()
             .split("/// The caller").next().unwrap();
         assert!(reduce.contains("if rank == 0 { (local, peer) } else { (peer, local) }"));
@@ -239,6 +243,49 @@ mod tests {
         assert!(producer.contains("dense_trellis::retain_partial(&programs.narrow, core, retained,"));
         assert!(producer.contains("rows * weights.shape[0], stream)"));
         assert!(!producer.contains("copy_d2d_async"));
+    }
+
+    #[test]
+    fn one_delta_norm_removes_only_the_known_zero_add() {
+        let narrow = |x: f32| {
+            if x.is_nan() { return x; }
+            let bits = x.to_bits();
+            f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff0000)
+        };
+        let mut signed_zero_differences = 0;
+        for bits in 0..=u16::MAX {
+            let delta = f32::from_bits(u32::from(bits) << 16);
+            if delta.is_nan() {
+                // NaN payload propagation is not an exactness contract.
+                assert!((delta + 0.0).is_nan());
+                continue;
+            }
+            let old_delta = narrow(delta + 0.0);
+            if delta != 0.0 { assert_eq!(old_delta.to_bits(), delta.to_bits()); }
+            for residual in [-0.0f32, 0.0, -1.0, 1.0, f32::from_bits(0x00010000)] {
+                let old = narrow(residual + old_delta);
+                let elided = narrow(residual + delta);
+                if old.to_bits() != elided.to_bits() {
+                    assert_eq!(delta.to_bits(), (-0.0f32).to_bits());
+                    assert_eq!(residual.to_bits(), (-0.0f32).to_bits());
+                    assert_eq!(old.to_bits(), 0.0f32.to_bits());
+                    assert_eq!(elided.to_bits(), (-0.0f32).to_bits());
+                    signed_zero_differences += 1;
+                }
+            }
+        }
+        assert_eq!(signed_zero_differences, 1);
+        let native = include_str!("engine/native_dense.rs");
+        let norm = native.split("fn ffn_norm(").nth(1).unwrap()
+            .split("pub(super) fn meet_shared_core").next().unwrap();
+        assert!(norm.contains("if self.shared_zero_elided(index, layer) { 1 } else { 2 }"));
+        let engine = include_str!("engine.rs");
+        assert_eq!(engine.matches("if !self.shared_zero_elided(index, &layers[index]) { self.exchange()?.wait(0, ffn)?; }").count(), 2);
+        assert!(engine.contains("if !self.shared_zero_elided(before, &layers[before]) { self.exchange()?.wait(0, ffn)?; }"));
+        assert!(engine.contains("if !self.shared_zero_elided(index, layer) { exchange.push(1, ffn, out, bytes)?; }"));
+        let owned = include_str!("engine/layers.rs");
+        assert!(owned.contains("rank == 1 || !e.shared_zero_elided(index, self.layer(rank, index))"));
+        assert!(owned.contains("rank == 1 && e.shared_zero_elided(index, layer) { continue; }"));
     }
 
     #[test]
