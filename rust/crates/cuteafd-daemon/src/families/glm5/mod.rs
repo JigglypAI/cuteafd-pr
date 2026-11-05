@@ -976,7 +976,12 @@ impl Opened {
         let mut draft_file = None;
         let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement)
             .map_err(anyhow::Error::msg)?;
-        let requested = cuteafd_loader::placement::families::glm5::resolve_attention(&self.cfg, requested, devices.len());
+        let names: Vec<&str> = programs.names().collect();
+        let available = cuteafd_loader::placement::families::glm5::context_programs(&self.cfg,
+            names.iter().copied(), |name| programs.spec(name).ok()
+                .map(|p| p.scratch.get("scratch").copied().unwrap_or(0))).is_some();
+        let requested = cuteafd_loader::placement::families::glm5::resolve_context_attention(
+            &self.cfg, requested, devices.len(), available, !native)?;
         ensure!(requested != Some(cuteafd_loader::placement::AttentionPlacement::Layers) || devices.len() == 2,
             "GLM layers attention requires two coordinator GPUs");
         let owners = (requested == Some(cuteafd_loader::placement::AttentionPlacement::Layers))

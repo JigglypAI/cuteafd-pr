@@ -93,6 +93,10 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 m, cfg.heads, sms as usize, &attention_plan)).transpose()?.flatten()
         } else { manifest.and_then(glmf::manifest_context) };
         let attention = glmf::resolve_attention(report.requested_attention, ranks, context_programs)?;
+        if report.requested_attention.is_none() && ranks == 2 && context_programs.is_none() {
+            notes.push(format!("auto attention fallback: layers; missing context programs: {}",
+                glmf::context_program_list()));
+        }
         let lanes = glmf::admitted_prefill_waves(attention.mode, lanes)?;
         report.attention_placement = attention.mode;
         let index = match attention.mode {

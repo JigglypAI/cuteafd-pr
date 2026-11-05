@@ -358,7 +358,7 @@ fn planner_equals_runtime_deepseek_v4_fixture_context() {
         let per_unit = |p: &Placement| bytes(p, gpu, "records") / (p.pool_tokens / 256);
         assert_eq!(per_unit(&heads) - per_unit(&context), 45_888, "rtx{gpu} C4 records halve");
     }
-    // A build without the programs refuses an explicit context and runs heads on auto.
+    // A build without the programs refuses both auto and explicit context.
     let plain = synthetic(&dir.path().join("plain").tap_dir());
     let mut refused = case(Some(AttentionPlacement::Context));
     refused.manifest = &plain;
@@ -400,7 +400,7 @@ impl TapDir for PathBuf {
 #[test]
 fn planner_equals_runtime_deepseek_v4_fixture() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = synthetic(dir.path());
+    let manifest = synthetic_context(dir.path());
     let shared = Shared::open(dir.path()).unwrap();
     for (rtx, budget) in [(1, 24u64 << 30), (2, 24 << 30)] {
         for context in [131_072, 1_048_576] {
@@ -431,7 +431,7 @@ fn planner_equals_runtime_deepseek_v4_fixture() {
 #[test]
 fn planner_equals_runtime_deepseek_v4_fixture_tp2_asym_dspark_f32() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = synthetic(dir.path());
+    let manifest = synthetic_context(dir.path());
     cuteafd_loader::plan::testing::write_v4_snapshot_with_dspark(dir.path(), 3);
     let shared = Shared::open(dir.path()).unwrap();
     for onboard in [None, Some(OnboardSetting::Auto), Some(OnboardSetting::Layers(2)), Some(OnboardSetting::All)] {
@@ -451,7 +451,7 @@ fn planner_equals_runtime_deepseek_v4_fixture_tp2_asym_dspark_f32() {
 #[test]
 fn planner_equals_runtime_v4_bundled_draft_off() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = synthetic(dir.path());
+    let manifest = synthetic_context(dir.path());
     cuteafd_loader::plan::testing::write_v4_snapshot_with_dspark(dir.path(), 3);
     let shared = Shared::open(dir.path()).unwrap();
     for rtx in [1, 2] {
@@ -469,7 +469,7 @@ fn planner_equals_runtime_v4_bundled_draft_off() {
 #[test]
 fn tp2_backbone_admission_does_not_require_tp1_kernels() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = synthetic(dir.path());
+    let manifest = synthetic_context(dir.path());
     let shared = Shared::open(dir.path()).unwrap();
     for onboard in [None, Some(OnboardSetting::Auto), Some(OnboardSetting::Layers(0)), Some(OnboardSetting::Layers(2)),
         Some(OnboardSetting::All)] {

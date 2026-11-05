@@ -69,7 +69,7 @@ pub const KIMI_K3: ExecutorModes = ExecutorModes { family: "kimi_k3",
 /// Step-5: SWA head-split on a pair, alternating whole-owned CSA layers;
 /// one GPU owns every layer. No context-split executor is qualified.
 pub const STEP5: ExecutorModes = ExecutorModes { family: "step5", modes: &[WHOLE0, WHOLE1, LayerMode::HeadSplit],
-    hops: true, attention: AttentionPlacement::Heads };
+    hops: true, attention: AttentionPlacement::Layers };
 
 /// Every family's executor set, for lookups by family name.
 pub const EXECUTORS: [ExecutorModes; 10] = [DEEPSEEK_V4, DEEPSEEK_V41, GLM5, GLM5_FLASH, MIMO_V2, QWEN4,

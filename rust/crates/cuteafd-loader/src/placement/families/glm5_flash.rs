@@ -79,9 +79,8 @@ pub fn manifest_context_for_plan(manifest: &serde_json::Value, heads: usize, sms
 
 /// The MLA placement a GLM Flash engine on `gpus` GPUs serves: `requested` (None: auto), checked
 /// against the build's `context` programs. Auto is `context` on two GPUs, as `ExecutorModes::check_attention`
-/// records for this family; without the context programs that placement cannot run, so a chosen
-/// `context` fails closed naming the programs rather than silently serving heads with replicated
-/// KV. One GPU and an explicit `heads` stay heads; `layers` is explicit on two GPUs only.
+/// records for this family; without context programs auto uses whole MLA owners (`layers`).
+/// Explicit `context` still fails closed naming the programs. One GPU and explicit `heads` stay heads.
 pub fn resolve_attention(requested: Option<AttentionPlacement>, gpus: usize, programs: Option<GlmfAttention>)
     -> Result<GlmfAttention, PlacementError> {
     let heads = GlmfAttention { mode: AttentionPlacement::Heads, ..programs.unwrap_or_default() };
@@ -94,7 +93,11 @@ pub fn resolve_attention(requested: Option<AttentionPlacement>, gpus: usize, pro
         Some(mode) if gpus != 2 => refuse(mode, "requires two coordinator GPUs with peer access"),
         Some(AttentionPlacement::Layers) => Ok(GlmfAttention { mode: AttentionPlacement::Layers, ..heads }),
         Some(AttentionPlacement::Context) => programs.map(context).map_or_else(missing, Ok),
-        None if gpus == 2 => programs.map(context).map_or_else(missing, Ok),
+        None if gpus == 2 => Ok(programs.map(context).unwrap_or_else(|| {
+            tracing::warn!(family = "glm5_flash", programs = %context_program_list(), fallback = "layers",
+                "auto context programs missing; falling back to whole-layer attention without KV replication");
+            GlmfAttention { mode: AttentionPlacement::Layers, ..heads }
+        })),
         None => Ok(heads),
     }
 }
@@ -1931,7 +1934,7 @@ mod tests {
     }
 
     #[test]
-    fn glm5_flash_resolves_context_by_default_and_layers_only_when_explicit() {
+    fn glm5_flash_resolves_auto_to_context_or_layers_without_replicating_kv() {
         let programs = Some(GlmfAttention { mode: AttentionPlacement::Context, topk_scratch: 7, partial_scratch: 9,
             ..Default::default() });
         use AttentionPlacement::{Context, Heads, Layers};
@@ -1941,9 +1944,9 @@ mod tests {
         assert_eq!(resolve_attention(None, 1, None).unwrap().mode, Heads);
         assert_eq!(resolve_attention(Some(Heads), 2, None).unwrap().mode, Heads);
         assert_eq!(resolve_attention(Some(Context), 2, programs).unwrap().topk_scratch, 7);
-        // Auto is context on two GPUs, so a build without the programs fails closed, as an
-        // explicit context does (issue #202); heads and one GPU still resolve.
-        for (requested, gpus, programs) in [(None, 2, None), (Some(Context), 2, None)] {
+        assert_eq!(resolve_attention(None, 2, None).unwrap().mode, Layers);
+        // Only explicit context fails without its programs.
+        for (requested, gpus, programs) in [(Some(Context), 2, None)] {
             let error = resolve_attention(requested, gpus, programs).unwrap_err();
             assert!(matches!(error, PlacementError::MissingContextPrograms { family: "glm5_flash", .. }),
                 "{requested:?}: {error}");
@@ -1952,7 +1955,21 @@ mod tests {
         for (mode, gpus, programs) in [(Context, 1, programs), (Layers, 1, programs)] {
             assert!(matches!(resolve_attention(Some(mode), gpus, programs), Err(PlacementError::AttentionPlacement { .. })));
         }
-        // Explicit layers does not need the context programs and never changes auto.
+        let cfg_heads = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        let mut reference = None;
+        for programs in [programs, None] {
+            let mut i = inputs(&cfg_heads, 2, inventory::PRO_TOTAL_BYTES);
+            i.attention = resolve_attention(Some(Heads), 2, programs).unwrap();
+            let placed = solve(&request(&i).unwrap()).unwrap();
+            assert_eq!(placed.attention_placement, Heads);
+            assert!(placed.layers.iter().all(|layer| layer.mode == LayerMode::HeadSplit));
+            if let Some(expected) = &reference { assert_eq!(&placed, expected); }
+            reference = Some(placed);
+            i.attention = resolve_attention(None, 2, programs).unwrap();
+            let placed = solve(&request(&i).unwrap()).unwrap();
+            assert_eq!(placed.attention_placement, if programs.is_some() { Context } else { Layers });
+        }
+        // Explicit layers does not need the context programs.
         for programs in [programs, None] {
             assert_eq!(resolve_attention(Some(Layers), 2, programs).unwrap().mode, Layers);
         }

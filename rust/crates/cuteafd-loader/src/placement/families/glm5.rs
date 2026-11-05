@@ -602,16 +602,32 @@ pub fn resolve_attention(cfg: &GlmDsaConfig, requested: Option<AttentionPlacemen
     } else { requested }
 }
 
+/// Resolve auto before choosing owner-local operands; explicit requests never fall back.
+pub fn resolve_context_attention(cfg: &GlmDsaConfig, requested: Option<AttentionPlacement>, gpus: usize,
+    context_available: bool, layers_supported: bool) -> Result<Option<AttentionPlacement>, PlacementError> {
+    if gpus == 2 && requested.is_none() && !context_available && cfg.split_program_family().is_some() {
+        let programs = context_program_list(cfg);
+        if !layers_supported {
+            return Err(PlacementError::MissingContextPrograms { family: cfg.family_id(), programs });
+        }
+        tracing::warn!(family = cfg.family_id(), %programs, fallback = "layers",
+            "auto context programs missing; falling back to whole-layer attention without KV replication");
+        return Ok(Some(AttentionPlacement::Layers));
+    }
+    Ok(resolve_attention(cfg, requested, gpus))
+}
+
 /// Evaluate each executable local prefix with its own intake, lane and TP2 costs.
 /// An empty Spark suffix is a candidate, never a subtraction after admission.
 pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
     attention: Option<AttentionPlacement>) -> Result<(Placement, GlmWorkingSet), PlacementError> {
     request(inputs)?;
+    let attention = resolve_context_attention(inputs.cfg, attention, inputs.gpus.len(),
+        inputs.context.is_some(), !inputs.native_experts)?;
     // `context` is the auto default on a two-GPU pair, and the requested mode
     // when asked for. A build whose manifest lacks its context programs cannot
-    // run it: fail closed with what to rebuild rather than silently
-    // downgrading the executor to heads (issue #202). Explicit heads is
-    // unaffected.
+    // run it when explicit; auto uses whole-layer owners where supported.
+    // Explicit heads is unaffected.
     let context_chosen = attention.map_or(inputs.gpus.len() == 2 && inputs.cfg.split_program_family().is_some(),
         |mode| mode == AttentionPlacement::Context);
     if inputs.cfg.split_program_family().is_none() && inputs.gpus.len() == 2
@@ -2502,6 +2518,37 @@ mod tests {
     }
 
     const CONTEXT_SCRATCH: GlmContext = GlmContext { topk_scratch: 3 << 20, partial_scratch: 9 << 20 };
+
+    #[test]
+    fn standard_auto_falls_back_to_layers_and_explicit_heads_ignores_context_availability() {
+        let ml4 = GlmDsaConfig::from_hf(&crate::families::mistral_large4::config::tests::official()).unwrap();
+        for cfg in [config(), ml4] {
+            let mut i = inputs(&cfg, &[96 * GIB; 2]);
+            i.spark_ranks = 6;
+            i.prefill_lanes = 2;
+            i.requested_pool = Some(131072);
+            let mut heads = None;
+            for context in [None, Some(CONTEXT_SCRATCH)] {
+                i.context = context;
+                let (placed, _) = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Heads)).unwrap();
+                assert!(placed.layers.iter().all(|layer| layer.mode == LayerMode::HeadSplit));
+                if let Some(expected) = &heads { assert_eq!(&placed, expected); }
+                heads = Some(placed);
+                let (auto, _) = solve_working_set(&i, [0; 2], None).unwrap();
+                assert_eq!(auto.attention_placement, if context.is_some() {
+                    AttentionPlacement::Context
+                } else { AttentionPlacement::Layers });
+                if context.is_none() {
+                    assert!(auto.layers.iter().all(|layer| matches!(layer.mode,
+                        LayerMode::Whole { ffn: FfnMode::Split, .. })));
+                    let error = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Context)).unwrap_err();
+                    assert!(matches!(error, PlacementError::MissingContextPrograms { .. }));
+                }
+            }
+            assert!(matches!(resolve_context_attention(&cfg, None, 2, false, false),
+                Err(PlacementError::MissingContextPrograms { .. })));
+        }
+    }
 
     #[test]
     fn context_is_the_default_where_its_programs_exist_and_charges_what_the_engine_allocates() {

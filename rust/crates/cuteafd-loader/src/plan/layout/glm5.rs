@@ -14,9 +14,26 @@ const SPARK: SparkCharges = SparkCharges { host_bytes: None, wave_bytes: gib(190
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyModel,
     input: &crate::plan::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let checkpoint = input.checkpoint();
+    let mut fallback_note = None;
     if let Ok(cfg) = GlmDsaConfig::from_hf(&checkpoint.config) {
         let gpus = options.rtx_bytes.len().clamp(1, 2);
-        let resolved = crate::placement::families::glm5::resolve_attention(&cfg, report.requested_attention, gpus);
+        let manifest = options.workspace_manifest.as_deref().or_else(|| {
+            let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
+            path.is_file().then_some(path)
+        }).and_then(|path| input.manifest(path).ok());
+        let available = manifest.as_ref().is_some_and(|manifest| {
+            let programs = manifest["programs"].as_array();
+            programs.is_some_and(|programs| crate::placement::families::glm5::context_programs(&cfg,
+                programs.iter().filter_map(|p| p["name"].as_str()), |name| programs.iter()
+                    .find(|p| p["name"].as_str() == Some(name)).map(|_| 0)).is_some())
+        });
+        let resolved = crate::placement::families::glm5::resolve_context_attention(&cfg,
+            report.requested_attention, gpus, available, true)
+            .expect("standard GLM supports whole-layer attention");
+        if report.requested_attention.is_none() && resolved == Some(crate::placement::AttentionPlacement::Layers) {
+            fallback_note = Some(format!("auto attention fallback: layers; missing context programs: {}",
+                crate::placement::families::glm5::context_program_list(&cfg)));
+        }
         if resolved != report.requested_attention {
             report.requested_attention = resolved;
             report.attention_placement = resolved.unwrap_or(report.attention_placement);
@@ -44,6 +61,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut waste = Vec::new();
     let mut notes = vec![format!("resolved context {} tokens (checkpoint {})", shape.context_tokens, shape.checkpoint_context),
         format!("attention placement {}", report.attention_placement)];
+    notes.extend(fallback_note);
     shape.select_card_plans(report, options, &mut notes);
     mapped_table_note(report, &mut notes);
     let resident = (|| -> anyhow::Result<_> {
@@ -522,7 +540,8 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let context_programs = if split { Some(glm::manifest_context(&cfg, &manifest,
         options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
             "sm_120", options.rtx_bytes[0]).sms) as usize, &plan)
-        .ok_or_else(|| anyhow::anyhow!("EXLR8 requires GLM context programs in PROGRAMS.json"))?) }
+        .ok_or_else(|| crate::placement::PlacementError::MissingContextPrograms { family: cfg.family_id(),
+            programs: glm::context_program_list(&cfg) })?) }
         else { None };
     let native = crate::plan::exlr8::recognizes(&checkpoint.snapshot)?;
     let mut dense_scratch = Vec::new();
