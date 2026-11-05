@@ -1224,20 +1224,30 @@ mod tests {
         input.max_context = 65536;
         input.expert_workspace = 700 << 20;
         input.tp2_workspace = [0; 2];
-        let (automatic, working) = solve_working_set(&input, [0; 2], HEADS).unwrap();
-        assert!(automatic.onboard_layers > 0 && automatic.tp2.is_none());
-        assert_eq!(working.spark.rtx_layers.len(), automatic.onboard_layers);
-        let peak = input.expert_workspace + automatic.onboard_layers as u64 * 4 * GIB;
-        assert_eq!(automatic.expert_ranges[0].peak_bytes, peak);
-        let remote = GlmInputs { onboard: Onboard::Layers(0), ..input.clone() };
-        let remote = solve_working_set(&remote, [0; 2], HEADS).unwrap().0;
-        assert_eq!(automatic.pool_tokens, remote.pool_tokens, "experts must use only post-pool headroom");
-        let score = |placement: &Placement| (placement.pool_tokens, placement.onboard_layers);
-        let best = (0..cfg.layers - cfg.first_moe_layer).filter_map(|count| {
-            solve_working_set(&GlmInputs { onboard: Onboard::Layers(count), ..input.clone() }, [0; 2], HEADS)
-                .ok().map(|(placement, _)| score(&placement))
-        }).max().unwrap();
-        assert_eq!(score(&automatic), best);
+        for requested_pool in [None, Some(65536)] {
+            input.requested_pool = requested_pool;
+            let (automatic, working) = solve_working_set(&input, [0; 2], HEADS).unwrap();
+            assert!(automatic.tp2.is_none());
+            assert_eq!(working.spark.rtx_layers.len(), automatic.onboard_layers);
+            // An unconstrained pool can consume all headroom; the explicit pool
+            // also exercises a nonempty Whole owner without changing that policy.
+            if requested_pool.is_some() { assert!(automatic.onboard_layers > 0); }
+            if automatic.onboard_layers > 0 {
+                let peak = input.expert_workspace + automatic.onboard_layers as u64 * 4 * GIB;
+                assert_eq!(automatic.expert_ranges[0].peak_bytes, peak);
+            } else {
+                assert!(automatic.expert_ranges.is_empty());
+            }
+            let remote = GlmInputs { onboard: Onboard::Layers(0), ..input.clone() };
+            let remote = solve_working_set(&remote, [0; 2], HEADS).unwrap().0;
+            assert_eq!(automatic.pool_tokens, remote.pool_tokens, "experts must use only post-pool headroom");
+            let score = |placement: &Placement| (placement.pool_tokens, placement.onboard_layers);
+            let best = (0..=cfg.layers - cfg.first_moe_layer).filter_map(|count| {
+                solve_working_set(&GlmInputs { onboard: Onboard::Layers(count), ..input.clone() }, [0; 2], HEADS)
+                    .ok().map(|(placement, _)| score(&placement))
+            }).max().unwrap();
+            assert_eq!(score(&automatic), best);
+        }
     }
 
     #[test]
