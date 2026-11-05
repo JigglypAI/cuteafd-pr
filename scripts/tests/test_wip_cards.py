@@ -1500,6 +1500,25 @@ def test_gate_muse_cards_use_real_hosts_and_native_defaults(size, gpus, count):
         assert sum(entry.get('set', {}).get(key) == values[key] for entry in entries) == 1
 
 
+def test_gate_glm53_exlr8_min_uses_real_hosts_and_pool_first_defaults():
+    kit = ROOT / 'scripts/bench/kits/gate'
+    card = cards.load_cards(kit, ['glm53-exlr8-min'])[0]
+    values = {**cards.config(ROOT / card['config']), **card['set']}
+    assert card['family'] == 'glm5' and card['gpus'] == [0]
+    assert card['sparks'] == ['ostrich', 'dodo', 'emu', 'kiwi']
+    assert values['RTX_GPUS'] == '1' and values['COORDINATOR_GPUS'] == '0'
+    assert values['SPARK_COUNT'] == '4' and values['EXLR8_MANIFEST'] == 'up1'
+    assert values['MODEL_ID'] == 'kindlingai/glm-5.3-exlr8-k2-k3-k4'
+    assert values['POOL_TOKENS'] == 'auto' and 'RTX_EXPERT_LAYERS' not in values
+    for rank, host in enumerate(card['sparks']):
+        assert values[f'SPARK_{rank}_HOST'] == host
+        assert values[f'SPARK_{rank}_LANE_A'] == f'10.55.0.{rank + 1}'
+    entries = [entry for matrix in kit.glob('matrix-*.json')
+               for entry in json.loads(matrix.read_text())['entries']]
+    for key in ('ADDR', 'EXPERT_PORT'):
+        assert sum(entry.get('set', {}).get(key) == values[key] for entry in entries) == 1
+
+
 def test_gate_glm53_max_uses_current_k4_core_k6_checkpoint():
     card = cards.load_cards(ROOT / 'scripts/bench/kits/gate', ['glm53-exl3-max'])[0]
     values = {**cards.config(ROOT / card['config']), **card['set']}

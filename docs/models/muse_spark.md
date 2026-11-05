@@ -79,7 +79,9 @@ peer access); the head runs on the last rank.
 
 The prefix cache restores exact frontiers (full-layer KV records and the
 sliding rings), with the shared host tier; prefill runs as row units on the
-shared prefill pipeline. Packed prefill is not supported yet (#923).
+shared prefill pipeline. Packed prefill is enabled by default (`unrestricted`);
+`exact` falls back to singleton units for EXL3 when row invariance is not
+available.
 
 ## Chat encoding
 
@@ -99,17 +101,12 @@ response grammar directly on the final answer.
 
 ## Layouts
 
-`cuteafd plan --layout` on the header-only EXL3 K4 + Core-K6 fixture
-(RTX PRO 6000, default Spark budget, no host prefix tier):
-
-| Layout | KV pool | RTX expert layers |
-|---|---|---|
-| 2 RTX + 4..8 Sparks | 2.10M (the 2M target) | automatic (1 here; 3 with the host tier) |
-| 2 RTX + 3 Sparks | refused | |
-| 1 RTX + 4 Sparks | 814K | automatic (0) |
-| 1 RTX + 6 Sparks | 805K | automatic (0) |
-| 1 RTX + 8 Sparks | 796K | automatic (0) |
-| any + 2 Sparks | refused | |
+Use `cuteafd plan --layout` with the actual checkpoint, bundled towers,
+NVIDIA drafter and image's program manifest to resolve the KV pool and RTX
+onboarding. The qualified cards are 1 RTX + 4 Sparks and 2 RTX + 6 Sparks;
+the max card reaches the 2M pool target, while the min card's pool is
+memory-limited. Header-only fixture estimates omit runtime reservations and
+are not served-card capacities.
 
 One RTX admits the pool below the 1M compiled context, so an automatic
 context is clamped to it. KV is 4 KiB per token per full layer (BF16),
@@ -121,7 +118,8 @@ per-sequence ring of the window plus one rollback step.
 The launcher and planner default to NVIDIA DFlash2, pinned to
 `22e2669e4c60689f9bff0749a34d9d8e59ce7cd6`. It is chosen on C4 emitted
 throughput; baseline C1 ties RadixArk. Both pass the lossless set and exact
-prefix-cache checks on the qualified 1 RTX + 4 Spark layout. Set
+prefix-cache checks; NVIDIA is qualified on both the 1 RTX + 4 Spark and
+2 RTX + 6 Spark cards. Set
 `SPECULATOR=off` to disable drafting; an explicit model/revision overrides
 the default.
 
@@ -143,8 +141,10 @@ context.
 
 The starting configs serve the checkpoint's bundled vision and PCM audio
 towers (`VISION=auto`, `AUDIO=auto`); set either to `off` to drop it. Both
-place on Sparks by default (min: vision on rank 0, 4,860,356,960 B; audio on
-rank 1, 246,586,368 B), never on the RTX. Qualification is on #923:
+prefer Sparks in Auto mode (min: vision on rank 0, 4,860,356,960 B; audio on
+rank 1, 246,586,368 B). If no Spark admits a tower and its scratch plus
+headroom, Auto falls back to an RTX with enough memory. Explicit `--vision rtx`
+or `--audio rtx` requests coordinator placement directly. Qualification is on #923:
 
 - **Vision:** byte-exact metadata and the FP32 yardstick (public RMS ratio
   0.990); prompt and turn prefix-cache restores exact.

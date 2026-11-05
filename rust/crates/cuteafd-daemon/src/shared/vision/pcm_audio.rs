@@ -57,15 +57,25 @@ impl PcmTowerSpec {
         self.plan.reads().values()
     }
     pub(super) fn prepare(&self, library: &Path, device: i32, admitted: u64) -> Result<PcmTower> {
-        if admitted < self.required_bytes()? {
+        if admitted < self.required_bytes(library)? {
             return Err(VisionError::Unsupported("PCM admission below requirement".into()));
         }
         let native = NativePcmAudio::prepare(library, &self.native, device, admitted)?;
         self.check_ledger(&native)?;
         Ok(PcmTower { native })
     }
-    pub fn required_bytes(&self) -> Result<u64> {
-        Ok(self.plan.required_bytes(self.native.max_samples as usize)?)
+    pub fn required_bytes(&self, library: &Path) -> Result<u64> {
+        let ledger = NativePcmAudio::required(library, &self.native)?;
+        let required = self.plan.required_bytes(self.native.max_samples as usize)?;
+        if ledger.weights != self.plan.weight_bytes()
+            || ledger.scratch != scratch_bytes(self.native.max_samples as usize)?
+            || ledger.device_allocations != 2
+        {
+            return Err(VisionError::Unsupported(
+                "PCM native requirement differs from admitted plan".into(),
+            ));
+        }
+        Ok(required)
     }
     pub fn native_spec(&self) -> &PcmSpec {
         &self.native
@@ -75,7 +85,7 @@ impl PcmTowerSpec {
     }
     /// Load on the shared media owner's CUDA thread after planner admission.
     pub fn load(&self, library: &Path, device: i32, admitted: u64) -> Result<PcmTower> {
-        let required = self.required_bytes()?;
+        let required = self.required_bytes(library)?;
         if admitted < required {
             return Err(VisionError::Unsupported(format!(
                 "PCM admission {admitted} < {required}"

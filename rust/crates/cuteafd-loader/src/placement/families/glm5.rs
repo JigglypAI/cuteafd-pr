@@ -67,8 +67,8 @@ pub fn context_program_list(cfg: &GlmDsaConfig) -> String {
 }
 
 /// `cfg`'s `context` programs and scratch `lookup` (name -> scratch bytes) finds,
-/// or None when this build lacks any of them (a `context` request then fails
-/// closed; `heads` is the build's only attention executor).
+/// or None when this build lacks any of them (explicit `context` fails closed;
+/// standard auto uses whole-layer owners without replicating the records).
 pub fn context_programs<'n>(cfg: &GlmDsaConfig, names: impl IntoIterator<Item = &'n str> + Clone,
     lookup: impl Fn(&str) -> Option<u64>) -> Option<GlmContext> {
     let family = cfg.program_family();
@@ -151,6 +151,27 @@ pub fn manifest_context(cfg: &GlmDsaConfig, manifest: &serde_json::Value, sms: u
             lookup(&name)
         }).collect::<Option<Vec<_>>>()?.into_iter().max()?;
     Some(context)
+}
+
+/// Resolve context recipes and scratch on every participating card before choosing operand owners.
+pub fn manifest_context_for_cards(cfg: &GlmDsaConfig, manifest: &serde_json::Value, sms: &[usize],
+    plan: cuteafd_core::coordinator_programs::AttentionReductionPlan) -> anyhow::Result<Option<GlmContext>> {
+    let mut context: Option<GlmContext> = None;
+    for &sm_count in sms {
+        let mut selected = manifest.clone();
+        cuteafd_core::coordinator_programs::select_card_plans(&mut selected, sm_count.try_into()?)?;
+        let family = cuteafd_core::coordinator_programs::CoordinatorPrograms {
+            family: cfg.program_family(), split_family: cfg.split_program_family() };
+        cuteafd_core::coordinator_programs::select_attention_plans(&mut selected, plan,
+            |name| family.contains(name))?;
+        let Some(card) = manifest_context(cfg, &selected, sm_count, &plan) else { return Ok(None) };
+        context = Some(match context {
+            Some(previous) => GlmContext { topk_scratch: previous.topk_scratch.max(card.topk_scratch),
+                partial_scratch: previous.partial_scratch.max(card.partial_scratch) },
+            None => card,
+        });
+    }
+    Ok(context)
 }
 
 /// [`context_workspace`]'s bytes with the engine's allocation floor.
@@ -602,16 +623,32 @@ pub fn resolve_attention(cfg: &GlmDsaConfig, requested: Option<AttentionPlacemen
     } else { requested }
 }
 
+/// Resolve auto before choosing owner-local operands; explicit requests never fall back.
+pub fn resolve_context_attention(cfg: &GlmDsaConfig, requested: Option<AttentionPlacement>, gpus: usize,
+    context_available: bool, layers_supported: bool) -> Result<Option<AttentionPlacement>, PlacementError> {
+    if gpus == 2 && requested.is_none() && !context_available && cfg.split_program_family().is_some() {
+        let programs = context_program_list(cfg);
+        if !layers_supported {
+            return Err(PlacementError::MissingContextPrograms { family: cfg.family_id(), programs });
+        }
+        tracing::warn!(family = cfg.family_id(), %programs, fallback = "layers",
+            "auto context programs missing; falling back to whole-layer attention without KV replication");
+        return Ok(Some(AttentionPlacement::Layers));
+    }
+    Ok(resolve_attention(cfg, requested, gpus))
+}
+
 /// Evaluate each executable local prefix with its own intake, lane and TP2 costs.
 /// An empty Spark suffix is a candidate, never a subtraction after admission.
 pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
     attention: Option<AttentionPlacement>) -> Result<(Placement, GlmWorkingSet), PlacementError> {
     request(inputs)?;
+    let attention = resolve_context_attention(inputs.cfg, attention, inputs.gpus.len(),
+        inputs.context.is_some(), !inputs.native_experts)?;
     // `context` is the auto default on a two-GPU pair, and the requested mode
     // when asked for. A build whose manifest lacks its context programs cannot
-    // run it: fail closed with what to rebuild rather than silently
-    // downgrading the executor to heads (issue #202). Explicit heads is
-    // unaffected.
+    // run it when explicit; auto uses whole-layer owners where supported.
+    // Explicit heads is unaffected.
     let context_chosen = attention.map_or(inputs.gpus.len() == 2 && inputs.cfg.split_program_family().is_some(),
         |mode| mode == AttentionPlacement::Context);
     if inputs.cfg.split_program_family().is_none() && inputs.gpus.len() == 2
@@ -804,7 +841,7 @@ pub enum GlmLocalFormat {
     Nvfp4 { w4a4: bool },
 }
 
-/// Header-only TP2 inventory. Runtime must attest the native ABI before execution.
+/// Header-only local inventory. Runtime must attest the native ABI before execution.
 #[derive(Debug, Clone)]
 pub struct LocalInventory {
     pub package: std::path::PathBuf,
@@ -812,15 +849,20 @@ pub struct LocalInventory {
     pub experts: Vec<ExpertCost>,
     pub backend_workspace: u64,
     pub extra_workspace: [u64; 2],
+    pub world: usize,
+    pub unit_limit: usize,
 }
 
 impl LocalInventory {
     pub fn workspace(&self) -> [u64; 2] {
-        self.extra_workspace.map(|bytes| bytes + self.backend_workspace)
+        std::array::from_fn(|rank| if rank < self.world {
+            self.extra_workspace[rank] + self.backend_workspace
+        } else { 0 })
     }
 
     pub fn workspace_for(&self, cfg: &GlmDsaConfig, rows: u64, lanes: u64,
         exchange_f32: bool) -> [u64; 2] {
+        if self.world == 1 { return [self.backend_workspace, 0]; }
         local_extra_workspace(cfg.hidden as u64, cfg.experts as u64, cfg.topk as u64,
             rows, lanes, exchange_f32).map(|bytes| bytes + self.backend_workspace)
     }
@@ -982,7 +1024,7 @@ pub fn local_inventory_selected(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41
         experts.push(ExpertCost { whole: Bytes2 { resident: whole, staging: 0 }, half,
             tp2: true, whole_supported: true, spark_ok: true });
     }
-    Ok(LocalInventory { package, format: GlmLocalFormat::Exl3, experts, backend_workspace,
+    Ok(LocalInventory { package, format: GlmLocalFormat::Exl3, experts, backend_workspace, world: 2, unit_limit: 0,
         extra_workspace: local_extra_workspace(shape.hidden as u64, shape.experts as u64,
             shape.topk as u64, rows, lanes, exchange_f32) })
 }
@@ -1052,7 +1094,7 @@ fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Pa
         }
         Ok(ExpertCost { whole, half, tp2: supported, whole_supported: supported, spark_ok: true })
     }).collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(LocalInventory { package, format: GlmLocalFormat::Nvfp4 { w4a4 }, experts, backend_workspace,
+    Ok(LocalInventory { package, format: GlmLocalFormat::Nvfp4 { w4a4 }, experts, backend_workspace, world: 2, unit_limit: 0,
         extra_workspace: local_extra_workspace(shape.hidden as u64, shape.experts as u64,
             shape.topk as u64, rows, lanes, false) })
 }
@@ -1081,24 +1123,31 @@ fn exlr8_expert_costs_of(input: &crate::plan::exlr8::residency::MetadataInput, f
 
 /// Native manifest selection is mandatory; never route EXLR8 through EXL3.
 pub fn exlr8_inventory(snapshot: &std::path::Path, selected: &str, manifest: &std::path::Path,
-    selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool,
+    selected_layers: usize, world: usize, rows: u64, lanes: u64, exchange_f32: bool,
     activations: crate::plan::exlr8::PrefillActivations) -> anyhow::Result<LocalInventory> {
     let input = crate::plan::exlr8::residency::MetadataInput::open(snapshot, selected)?;
-    exlr8_inventory_with_metadata(snapshot, manifest, selected_layers, rows, lanes, exchange_f32, activations, &input)
+    exlr8_inventory_with_metadata(snapshot, manifest, selected_layers, world, rows, lanes, exchange_f32, activations, &input)
 }
 
 pub(crate) fn exlr8_inventory_with_metadata(snapshot: &std::path::Path, manifest: &std::path::Path,
-    selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool,
+    selected_layers: usize, world: usize, rows: u64, lanes: u64, exchange_f32: bool,
     activations: crate::plan::exlr8::PrefillActivations, input: &crate::plan::exlr8::residency::MetadataInput)
     -> anyhow::Result<LocalInventory> {
-    anyhow::ensure!(!exchange_f32, "GLM EXLR8 TP2 emits BF16 routed partials; use BF16 exchange");
+    anyhow::ensure!((1..=2).contains(&world) && !exchange_f32,
+        "GLM EXLR8 uses one or two ranks and BF16 routed output");
     let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
     let cfg = GlmDsaConfig::from_hf(&config)?;
     anyhow::ensure!(cfg.hidden == 6144 && cfg.moe_intermediate == 2048 && cfg.experts == 256
         && cfg.topk == 8 && (cfg.first_moe_layer..=cfg.layers).contains(&selected_layers)
         && (1..=4).contains(&lanes), "GLM EXLR8 TP2 geometry/layer extent");
     let programs = crate::plan::checkpoint::read_json(manifest)?;
-    let backend_workspace = crate::plan::exlr8::routed_workspace(&programs, cuteafd_ffi::exlr8::KernelFamily::Glm, rows, 8, activations)?;
+    let mut unit_limit = 0;
+    for layer in cfg.first_moe_layer..selected_layers { for rank in 0..world {
+        unit_limit = unit_limit.max(input.plan(layer, world, rank,
+            crate::plan::exlr8::residency::ExpertSet::Routed)?.compact_unit_limit());
+    } }
+    let backend_workspace = crate::plan::exlr8::routed_workspace(&programs,
+        cuteafd_ffi::exlr8::KernelFamily::Glm, rows, unit_limit, activations)?;
     let records = crate::plan::exlr8::dense::DenseRecord::inventory(snapshot)?;
     for layer in cfg.first_moe_layer..selected_layers {
         for suffix in ["weight", "e_score_correction_bias"] {
@@ -1107,8 +1156,11 @@ pub(crate) fn exlr8_inventory_with_metadata(snapshot: &std::path::Path, manifest
         }
     }
     let experts = exlr8_expert_costs_of(input, cfg.first_moe_layer, selected_layers, &records)?;
-    Ok(LocalInventory { package: manifest.to_path_buf(), format: GlmLocalFormat::Exlr8, experts, backend_workspace,
-        extra_workspace: local_extra_workspace(cfg.hidden as u64, cfg.experts as u64, cfg.topk as u64, rows, lanes, false) })
+    Ok(LocalInventory { package: manifest.to_path_buf(), format: GlmLocalFormat::Exlr8, experts,
+        backend_workspace, world, unit_limit,
+        extra_workspace: if world == 1 { [0; 2] } else {
+            local_extra_workspace(cfg.hidden as u64, cfg.experts as u64, cfg.topk as u64, rows, lanes, false)
+        } })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1123,14 +1175,14 @@ pub fn select_local_inventory(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41Ca
     -> anyhow::Result<Option<LocalInventory>> {
     if skip || onboard.layers(layers.saturating_sub(catalog.routed_experts().first_layer)) == Some(0)
         || layers <= catalog.routed_experts().first_layer { return Ok(None); }
+    if catalog.format() == crate::plan::checkpoint::CheckpointFormat::Exlr8 {
+        let (selected, activations) = exlr8.ok_or_else(|| anyhow::anyhow!("EXLR8 local inventory requires the selected native manifest"))?;
+        return exlr8_inventory(catalog.snapshot(), selected, manifest, layers, gpus, rows, lanes, exchange_f32, activations).map(Some);
+    }
     if gpus != 2 {
         anyhow::ensure!(onboard == Onboard::Auto,
             "GLM local experts require a two-GPU TP2 executor");
         return Ok(None);
-    }
-    if catalog.format() == crate::plan::checkpoint::CheckpointFormat::Exlr8 {
-        let (selected, activations) = exlr8.ok_or_else(|| anyhow::anyhow!("EXLR8 local inventory requires the selected native manifest"))?;
-        return exlr8_inventory(catalog.snapshot(), selected, manifest, layers, rows, lanes, exchange_f32, activations).map(Some);
     }
     anyhow::ensure!(exlr8.is_none(), "EXLR8 manifest supplied for non-native checkpoint");
     let automatic = onboard == Onboard::Auto;
@@ -1190,6 +1242,50 @@ mod tests {
     /// solve must request `heads` explicitly: auto resolves to `context`,
     /// which fails closed without its programs (issue #202).
     const HEADS: Option<AttentionPlacement> = Some(AttentionPlacement::Heads);
+
+    #[test]
+    fn whole_workspace_has_no_pair_routes_payloads_or_peer_router_rows() {
+        let cfg = config();
+        let local = LocalInventory { package: Default::default(), format: GlmLocalFormat::Exlr8,
+            experts: Vec::new(), backend_workspace: 17 << 20, extra_workspace: [0; 2], world: 1, unit_limit: 16 };
+        assert_eq!(local.workspace(), [17 << 20, 0]);
+        for rows in [1, 64, 2752, 4096] { for lanes in 1..=4 {
+            assert_eq!(local.workspace_for(&cfg, rows, lanes, false), [17 << 20, 0]);
+        } }
+    }
+
+    #[test]
+    fn one_rank_onboarding_preserves_pool_first_and_exact_whole_peak() {
+        let cfg = config();
+        let mut input = inputs(&cfg, &[96 * GIB]);
+        input.max_context = 65536;
+        input.expert_workspace = 700 << 20;
+        input.tp2_workspace = [0; 2];
+        for requested_pool in [None, Some(65536)] {
+            input.requested_pool = requested_pool;
+            let (automatic, working) = solve_working_set(&input, [0; 2], HEADS).unwrap();
+            assert!(automatic.tp2.is_none());
+            assert_eq!(working.spark.rtx_layers.len(), automatic.onboard_layers);
+            // An unconstrained pool can consume all headroom; the explicit pool
+            // also exercises a nonempty Whole owner without changing that policy.
+            if requested_pool.is_some() { assert!(automatic.onboard_layers > 0); }
+            if automatic.onboard_layers > 0 {
+                let peak = input.expert_workspace + automatic.onboard_layers as u64 * 4 * GIB;
+                assert_eq!(automatic.expert_ranges[0].peak_bytes, peak);
+            } else {
+                assert!(automatic.expert_ranges.iter().all(|range| range.layers == 0 && range.peak_bytes == 0));
+            }
+            let remote = GlmInputs { onboard: Onboard::Layers(0), ..input.clone() };
+            let remote = solve_working_set(&remote, [0; 2], HEADS).unwrap().0;
+            assert_eq!(automatic.pool_tokens, remote.pool_tokens, "experts must use only post-pool headroom");
+            let score = |placement: &Placement| (placement.pool_tokens, placement.onboard_layers);
+            let best = (0..=cfg.layers - cfg.first_moe_layer).filter_map(|count| {
+                solve_working_set(&GlmInputs { onboard: Onboard::Layers(count), ..input.clone() }, [0; 2], HEADS)
+                    .ok().map(|(placement, _)| score(&placement))
+            }).max().unwrap();
+            assert_eq!(score(&automatic), best);
+        }
+    }
 
     #[test]
     fn exlr8_costs_use_rotated_native_residency_and_peer_router_records() {
@@ -1424,7 +1520,7 @@ mod tests {
                         input.native_head = native_head;
                         input.onboard = Onboard::Layers(1);
                         let local = LocalInventory { package: Default::default(), format: GlmLocalFormat::Exl3,
-                            experts: input.experts.clone(), backend_workspace: 17 << 20,
+                            experts: input.experts.clone(), backend_workspace: 17 << 20, world: 2, unit_limit: 0,
                             extra_workspace: local_extra_workspace(cfg.hidden as u64, cfg.experts as u64,
                                 cfg.topk as u64, unit, slots, exchange_f32) };
                         input.tp2_workspace = local.workspace();
@@ -2504,6 +2600,37 @@ mod tests {
     const CONTEXT_SCRATCH: GlmContext = GlmContext { topk_scratch: 3 << 20, partial_scratch: 9 << 20 };
 
     #[test]
+    fn standard_auto_falls_back_to_layers_and_explicit_heads_ignores_context_availability() {
+        let ml4 = GlmDsaConfig::from_hf(&crate::families::mistral_large4::config::tests::official()).unwrap();
+        for cfg in [config(), ml4] {
+            let mut i = inputs(&cfg, &[96 * GIB; 2]);
+            i.spark_ranks = 6;
+            i.prefill_lanes = 2;
+            i.requested_pool = Some(131072);
+            let mut heads = None;
+            for context in [None, Some(CONTEXT_SCRATCH)] {
+                i.context = context;
+                let (placed, _) = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Heads)).unwrap();
+                assert!(placed.layers.iter().all(|layer| layer.mode == LayerMode::HeadSplit));
+                if let Some(expected) = &heads { assert_eq!(&placed, expected); }
+                heads = Some(placed);
+                let (auto, _) = solve_working_set(&i, [0; 2], None).unwrap();
+                assert_eq!(auto.attention_placement, if context.is_some() {
+                    AttentionPlacement::Context
+                } else { AttentionPlacement::Layers });
+                if context.is_none() {
+                    assert!(auto.layers.iter().all(|layer| matches!(layer.mode,
+                        LayerMode::Whole { ffn: FfnMode::Split, .. })));
+                    let error = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Context)).unwrap_err();
+                    assert!(matches!(error, PlacementError::MissingContextPrograms { .. }));
+                }
+            }
+            assert!(matches!(resolve_context_attention(&cfg, None, 2, false, false),
+                Err(PlacementError::MissingContextPrograms { .. })));
+        }
+    }
+
+    #[test]
     fn context_is_the_default_where_its_programs_exist_and_charges_what_the_engine_allocates() {
         let cfg = config();
         let mut i = inputs(&cfg, &[96 * GIB; 2]);
@@ -2605,6 +2732,40 @@ mod tests {
         for missing in names[..5].iter().chain(&names[5..6]) {
             let kept: Vec<_> = names.iter().copied().filter(|n| n != missing).collect();
             assert_eq!(context_programs(&cfg, kept.iter().copied(), |n| kept.contains(&n).then_some(1)), None, "{missing}");
+        }
+    }
+
+    #[test]
+    fn mismatched_card_recipes_fall_back_before_owner_selection() {
+        let ml4 = GlmDsaConfig::from_hf(&crate::families::mistral_large4::config::tests::official()).unwrap();
+        let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(64, None, None).unwrap();
+        for cfg in [config(), ml4] {
+            let mut programs: Vec<_> = CONTEXT_PROGRAMS.iter().map(|suffix|
+                serde_json::json!({"name": format!("{}_{suffix}", cfg.program_family())})).collect();
+            for kind in cfg.attention_kinds() {
+                programs.push(serde_json::json!({"name": context_gather(&cfg, kind)}));
+                for begin in [0, cfg.heads / 2] {
+                    for splits in [2, 4] {
+                        programs.push(serde_json::json!({"name": format!("{}_{kind}_partial_h{begin}_s{splits}_m64", cfg.program_family()),
+                            "params": {"device_sm_counts": [170], "row_caps": {"170": [64]}},
+                            "scratch_bytes_at_capacity": {"scratch": splits * 100}}));
+                    }
+                }
+            }
+            let manifest = serde_json::json!({"programs": programs});
+            assert!(manifest_context_for_cards(&cfg, &manifest, &[170], plan).unwrap().is_some());
+            let context = manifest_context_for_cards(&cfg, &manifest, &[170, 188], plan).unwrap();
+            assert!(context.is_none());
+            let resolved = resolve_context_attention(&cfg, None, 2, context.is_some(), true).unwrap();
+            assert_eq!(resolved, Some(AttentionPlacement::Layers));
+            let mut i = inputs(&cfg, &[96 * GIB; 2]);
+            i.context = context;
+            i.requested_pool = Some(131072);
+            let placement = solve_working_set(&i, [0; 2], resolved).unwrap().0;
+            assert!(placement.layers.iter().all(|layer| matches!(layer.mode, LayerMode::Whole { .. })));
+            assert!(matches!(solve_working_set(&i, [0; 2], Some(AttentionPlacement::Context)),
+                Err(PlacementError::MissingContextPrograms { .. })));
+            assert!(solve_working_set(&i, [0; 2], Some(AttentionPlacement::Heads)).is_ok());
         }
     }
 

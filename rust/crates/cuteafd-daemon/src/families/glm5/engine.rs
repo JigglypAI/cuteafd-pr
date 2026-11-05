@@ -582,6 +582,7 @@ pub(crate) struct GlmEngine<'a> {
     peer: Option<GlmPeer<'a>>,
     exchange: Option<PeerExchange<'a>>,
     tp2: Option<Pair<'a>>,
+    whole: Option<crate::shared::experts::rtx::pair::Whole<'a>>,
     tp2_exchange: ExchangeDtype,
     force_route_check: Cell<bool>,
 }
@@ -693,7 +694,7 @@ impl<'a> GlmEngine<'a> {
         let local = if context_mode.is_some() { pages / 2 } else { pages };
         let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context, weights.rope_alpha.as_deref())?;
         let device = library.cuda_get_device()?;
-        Ok(Self { max_pool_tokens_no_onboard: None, packed_row_cap: Cell::new(None), packed_fallback_reason: RefCell::new(String::new()), quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), native_scratch: Vec::new(), core_programs: Vec::new(), core_admission: None, peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
+        Ok(Self { max_pool_tokens_no_onboard: None, packed_row_cap: Cell::new(None), packed_fallback_reason: RefCell::new(String::new()), quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), native_scratch: Vec::new(), core_programs: Vec::new(), core_admission: None, peer: None, exchange: None, tp2: None, whole: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), prefill_slots: RefCell::new(Vec::new()),
             prefill_lanes, depth,
@@ -1549,9 +1550,9 @@ impl<'a> GlmEngine<'a> {
                 if w1.is_some() {
                     self.publish_projection(0, index, 0, w, layer, "down", t)?;
                 }
-            } else if self.tp2_layer(index) {
+            } else if self.local_layer(index) {
                 self.moe_front(w, layer, t)?;
-                self.tp2_pair(index, 0, w, w1.context("TP2 peer workspace")?, t, cap)?;
+                self.local_ffn(index, 0, w, w1, t, cap)?;
             } else if let Some(skip) = &self.skip {
                 self.moe_front(w, layer, t)?;
                 let ranks = self.moe_skip(w, index, layer, t, cap)?;
@@ -1921,14 +1922,16 @@ impl<'a> GlmEngine<'a> {
                 if index == 0 {
                     self.peer_segment(0, Previous::First, w1, t, ranked, bytes)?;
                 }
-                if let Some(_layer) = layer.filter(|_| self.tp2_layer(index)) {
-                    self.tp2_pair(index, 0, w, w1, t, "m64")?;
+                if layer.is_some() && self.local_layer(index) {
+                    self.local_ffn(index, 0, w, Some(w1), t, "m64")?;
                 }
                 if !defer_peer { peer_next()?; }
+            } else if layer.is_some() && self.local_layer(index) {
+                self.local_ffn(index, 0, w, None, t, "m64")?;
             }
             previous = match layer {
                 None => break,
-                Some(layer) if layer.dense || self.tp2_layer(index) => Previous::Delta,
+                Some(layer) if layer.dense || self.local_layer(index) => Previous::Delta,
                 // Only the step's real rows go to the Sparks; padded rows reduce stale
                 // planes into their own (scratch) rows.
                 Some(layer) if self.skip.is_some() => Previous::Planes(self.moe_skip(w, index, layer,
@@ -2146,7 +2149,8 @@ impl<'a> GlmEngine<'a> {
                 self.cfg.routed_scale as f32, true, self.stream_of(rank))
         })?;
         }
-        if self.spark_bf16 && !self.tp2.as_ref().is_some_and(|p| p.uses_fp8_input()) { return Ok(()); }
+        if self.spark_bf16 && !self.tp2.as_ref().is_some_and(|p| p.uses_fp8_input())
+            && !self.whole.as_ref().is_some_and(|owner| owner.uses_fp8_input()) { return Ok(()); }
         let grid = self.quantize_grid.blocks(t, h);
         self.run_on(rank, &self.family_program("expert_input_quant"), &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
             // SAFETY: the scale rows follow the payload inside each wire row.
@@ -3064,7 +3068,7 @@ where B: Fn(usize) -> Result<()>,
       P: Fn(usize, usize, bool) -> Result<()> {
     type Ticket = UnitTicket;
     fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
-        if self.layers[layer].dense || self.engine.tp2_layer(layer) {
+        if self.layers[layer].dense || self.engine.local_layer(layer) {
             crate::shared::prefill_pipeline::FfnRoute::Local
         } else { crate::shared::prefill_pipeline::FfnRoute::Spark }
     }
@@ -3087,9 +3091,8 @@ where B: Fn(usize) -> Result<()>,
             return self.engine.owned_unit_finish(work, &self.ranked[unit.index], unit, layer, self.total, self.transport, ticket);
         }
         let slot = unit.index % self.waves;
-        if self.engine.tp2_layer(layer) {
-            let w1 = self.peers[slot].context("TP2 peer workspaces")?;
-            self.engine.tp2_pair(layer, slot, self.workspaces[slot], w1, self.counts[unit.index], self.cap)?;
+        if self.engine.local_layer(layer) {
+            self.engine.local_ffn(layer, slot, self.workspaces[slot], self.peers[slot], self.counts[unit.index], self.cap)?;
         }
         (self.post)(layer, unit.index, false)
     }

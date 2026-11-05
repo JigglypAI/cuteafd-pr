@@ -196,6 +196,57 @@ struct Broadcast {
     wire: bool,
 }
 
+/// A complete routed owner on one stream, without peer routes or reduction storage.
+pub(crate) struct Whole<'a> {
+    pub layers: Vec<usize>,
+    backend: RefCell<Box<dyn RtxExpertLayer + 'a>>,
+    add: cuteafd_ffi::Bf16Add<'a>,
+    device: i32,
+    hidden: usize,
+    max_rows: usize,
+}
+
+impl<'a> Whole<'a> {
+    pub(crate) fn new(library: &'a NativeLibrary, device: i32,
+        backend: Box<dyn RtxExpertLayer + 'a>, hidden: usize, max_rows: usize) -> Result<Self> {
+        ensure!(backend.shard() == RtxShard::Whole && backend.device() == device
+            && backend.partial() == PartialDtype::Bf16
+            && backend.partial_layout(max_rows)? == super::PartialLayout::Tokens,
+            "whole routed owner requires device-local BF16 token sums");
+        let layers = backend.layers().to_vec();
+        ensure!(!layers.is_empty() && layers.windows(2).all(|pair| pair[0] < pair[1])
+            && hidden > 0 && max_rows > 0, "invalid whole routed extent");
+        Ok(Self { layers, backend: RefCell::new(backend), add: library.bf16_add()?,
+            device, hidden, max_rows })
+    }
+
+    pub(crate) fn uses_fp8_input(&self) -> bool { self.backend.borrow().uses_fp8_input() }
+    pub(crate) fn group_rows(&self, rows: usize) -> Result<usize> { self.backend.borrow().group_rows(rows) }
+    pub(crate) fn weight_read_bytes(&self) -> Result<usize> { self.backend.borrow().weight_read_bytes() }
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> { self.backend.try_borrow()?.allocation_receipts(inventory, name) }
+
+    /// # Safety
+    /// Input, routes, shared and output are live on this device's serialized stream.
+    /// Shared/output are disjoint from backend storage and retained through completion.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn enqueue(&self, layer: usize, rows: usize, input: ExpertInput,
+        routes: Routes, shared: CuteafdDeviceBuffer, output: CuteafdDeviceBuffer,
+        stream: *mut c_void, abort: &mut dyn FnMut()) -> Result<()> {
+        ensure!(rows > 0 && rows <= self.max_rows && self.layers.binary_search(&layer).is_ok(),
+            "whole routed submission outside admitted extent");
+        let count = rows.checked_mul(self.hidden).context("whole routed output extent")?;
+        let mut backend = self.backend.try_borrow_mut()?;
+        // SAFETY: the caller retains operands on this serialized stream; combine
+        // consumes the result before any subsequent enqueue can reuse its scratch.
+        unsafe {
+            backend.enqueue(layer, rows, input, routes, stream, abort)?;
+            self.add.launch(CuteafdDeviceBuffer { ptr: backend.output(), bytes: count * 2,
+                device_id: self.device, flags: 0 }, shared, output, count, stream)
+        }
+    }
+}
+
 pub(crate) struct Pair<'a> {
     pub layers: Vec<usize>,
     /// Input bytes per row a source broadcast carries (the backends' input

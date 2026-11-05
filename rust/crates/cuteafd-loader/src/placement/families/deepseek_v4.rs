@@ -83,8 +83,8 @@ pub struct V4Inputs<'a> {
     /// both sides; on a PRO card the reserve envelope covers it
     /// (it always did: the code loads after the runtime's sample), so it does not shrink the pool twice.
     pub code_bytes: Vec<u64>,
-    /// The build's C4 token-split programs (`manifest_context`): `None` keeps every layer
-    /// head-split. Only two GPUs with peer access use it.
+    /// The build's C4 token-split programs (`manifest_context`), required for
+    /// automatic or explicit context placement on two GPUs.
     pub context: Option<V4Context>,
     /// `--attention-placement`: `None` is auto (the family's recorded default).
     pub attention: Option<AttentionPlacement>,
@@ -97,8 +97,7 @@ pub struct V4Context {
     pub partial_scratch: u64,
 }
 
-/// Fail closed when either head range or any gather/merge primitive is absent.
-/// A build without them keeps every layer head-split.
+/// Return no context capability when either head range or any gather/merge primitive is absent.
 pub fn manifest_context(manifest: &serde_json::Value, family: &str, heads: usize,
     decode_rows: u64) -> Option<V4Context> {
     let programs = manifest["programs"].as_array()?;
@@ -255,6 +254,20 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
 /// GPU0's arena. The pool unit sums each layer's records plus the overhead.
 pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError> {
     let gpus = inputs.gpus.len();
+    if gpus == 2 && inputs.attention.unwrap_or(AttentionPlacement::Context) == AttentionPlacement::Context
+        && inputs.context.is_none() {
+        let family = if inputs.cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
+        let rows = inputs.decode_rows;
+        let mut programs: Vec<String> = ["dsa_candidate_merge", "lse_combine2",
+            "paged_staging_gather_c4", "paged_staging_gather_index"].iter()
+            .map(|suffix| format!("{family}_{suffix}")).collect();
+        programs.push(format!("{family}_scored_index_topk_decode_m{rows}"));
+        for begin in [0, inputs.cfg.n_heads / 2] {
+            programs.push(format!("{family}_sparse_mla_partial_h{begin}_s*_m{rows}"));
+        }
+        return Err(PlacementError::MissingContextPrograms { family: inputs.cfg.family_id(),
+            programs: programs.join(", ") });
+    }
     let (mut fixed, pool_overhead, reserves) = fixed_demands(inputs)?;
     if inputs.weights.c4_attention.len() != inputs.cfg.n_layers {
         return Err(PlacementError::Inventory("V4 attention weight inventory per layer"));
@@ -336,10 +349,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         // broadcast of the embedding rows into GPU1's step input.
         hops: HopSpec { storage: crate::placement::HopStorage::ReceiveSlots, row_bytes: 4 * inputs.cfg.dim as u64 * 2, rows: inputs.prefill_rows.max(inputs.decode_rows),
             lanes: inputs.prefill_waves, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Head },
-        // A build without the C4 context programs runs heads only.
-        executor: if context.is_some() { super::DEEPSEEK_V4 }
-            else { ExecutorModes { modes: &[LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
-                attention: AttentionPlacement::Heads, ..super::DEEPSEEK_V4 } },
+        executor: super::DEEPSEEK_V4,
     })
 }
 
@@ -463,6 +473,79 @@ mod default_tests {
         }
         assert_eq!(context_commit_units(1), 1);
         assert_eq!(context_commit_units(257), 2);
+    }
+
+    fn plan_inputs(cfg: &DeepseekV4Config) -> V4Inputs<'_> {
+        V4Inputs {
+            resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+            automatic_context: false, cfg,
+            weights: crate::families::deepseek_v4::resident::WeightInventory {
+                c4_attention: vec![ModeBytes::default(); cfg.n_layers], fixed: Vec::new(), startup: Default::default() },
+            cache_stages: 0, gpus: vec![(96 << 30, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }); 2],
+            headroom_floor: 0, spark_ranks: 6, sequences: 1, prefill_rows: 4096, prefill_waves: 3,
+            decode_rows: 64, max_context: 262144, reserve_bytes: RESERVE_BYTES, mark_slots: 0,
+            workspace: None, experts: Vec::new(), draft: Vec::new(), experts_half: Vec::new(),
+            tp2_workspace: [0; 2], exchange_f32: false, expert_workspace: 0, first_routed: 0,
+            requested_pool: Some(262144), onboard: Onboard::Layers(0), full_prefill_logits: 0,
+            code_bytes: Vec::new(), context: None, attention: None,
+        }
+    }
+
+    #[test]
+    fn auto_requires_matching_context_programs_but_explicit_heads_always_plans() {
+        for (family, hidden, heads) in [("dsv4f", 4096, 64), ("dsv4p", 7168, 128)] {
+            let mut cfg = context_cfg();
+            cfg.dim = hidden;
+            cfg.n_heads = heads;
+            let names = ["dsa_candidate_merge", "lse_combine2", "paged_staging_gather_c4",
+                "paged_staging_gather_index"].map(|suffix| format!("{family}_{suffix}"))
+                .into_iter().chain([format!("{family}_scored_index_topk_decode_m64"),
+                    format!("{family}_sparse_mla_partial_h0_s4_m64"),
+                    format!("{family}_sparse_mla_partial_h{}_s4_m64", heads / 2)]).collect::<Vec<_>>();
+            let complete = serde_json::json!({"programs": names.iter().map(|name|
+                serde_json::json!({"name": name})).collect::<Vec<_>>()});
+            let mut manifests = vec![serde_json::json!({}),
+                serde_json::json!({"programs": []}),
+                serde_json::from_str(&complete.to_string().replace(family,
+                    if family == "dsv4f" { "dsv4p" } else { "dsv4f" })).unwrap(),
+                serde_json::from_str(&complete.to_string().replace("_m64", "_m128")).unwrap()];
+            for missing in 0..names.len() {
+                let mut manifest = complete.clone();
+                manifest["programs"].as_array_mut().unwrap().remove(missing);
+                manifests.push(manifest);
+            }
+            for manifest in manifests {
+                let mut input = plan_inputs(&cfg);
+                input.context = manifest_context(&manifest, family, heads, 64);
+                assert!(input.context.is_none());
+                for attention in [None, Some(AttentionPlacement::Context)] {
+                    input.attention = attention;
+                    let error = request(&input).unwrap_err();
+                    let PlacementError::MissingContextPrograms { programs, .. } = error else {
+                        panic!("expected missing programs, got {error}")
+                    };
+                    assert!(programs.contains(&format!("{family}_sparse_mla_partial_h{}_s*_m64", heads / 2)));
+                }
+                input.attention = Some(AttentionPlacement::Heads);
+                let heads_plan = solve(&request(&input).unwrap()).unwrap();
+                input.context = manifest_context(&complete, family, heads, 64);
+                assert_eq!(heads_plan, solve(&request(&input).unwrap()).unwrap(),
+                    "explicit heads replicates and charges the same KV regardless of context programs");
+                assert!(heads_plan.layers.iter().all(|layer| layer.mode == LayerMode::HeadSplit));
+                input.attention = None;
+                let auto = solve(&request(&input).unwrap()).unwrap();
+                assert_eq!(auto.attention_placement, AttentionPlacement::Context);
+                for gpu in 0..2 {
+                    let records = |plan: &Placement| plan.items[gpu].iter().filter(|item| item.group == "records")
+                        .map(|item| item.bytes).sum::<u64>();
+                    assert!(records(&heads_plan) > records(&auto));
+                }
+            }
+            let mut one = plan_inputs(&cfg);
+            one.gpus.truncate(1);
+            assert_eq!(solve(&request(&one).unwrap()).unwrap().attention_placement, AttentionPlacement::Heads);
+            assert!(super::super::DEEPSEEK_V4.check_attention(Some(AttentionPlacement::Layers), 2, true).is_err());
+        }
     }
 
     #[test]

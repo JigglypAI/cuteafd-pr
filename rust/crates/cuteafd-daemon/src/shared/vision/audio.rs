@@ -130,7 +130,7 @@ impl BundledAudioSpec {
     }
     pub fn required_bytes(&self, library: &Path) -> Result<u64> {
         match self { Self::Mimo(spec) => Ok(NativeAudio::required(library, spec.native())?.total_bytes()?),
-            Self::Pcm(spec) => spec.required_bytes() }
+            Self::Pcm(spec) => spec.required_bytes(library) }
     }
     pub fn geometry(&self) -> cuteafd_core::media::AudioTokenGeometry {
         match self { Self::Mimo(_) => cuteafd_core::media::AudioTokenGeometry::MimoRvq,
@@ -167,7 +167,7 @@ impl AudioOwnerConfig {
     }
     pub fn required_bytes(&self, library: &Path) -> Result<u64> {
         match self { Self::Mimo { spec, .. } => Ok(NativeAudio::required(library, spec.native())?.total_bytes()?),
-            Self::Pcm { spec, .. } => spec.required_bytes() }
+            Self::Pcm { spec, .. } => spec.required_bytes(library) }
     }
 }
 pub struct AudioEncodeJob {
