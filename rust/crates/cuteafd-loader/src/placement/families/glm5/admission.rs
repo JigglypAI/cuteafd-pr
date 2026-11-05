@@ -80,7 +80,7 @@ pub enum ReplyPhase {
 impl GlmRecipe<'_> {
     /// Mechanical executor output. Backend bytes come from the selected local
     /// physical inventory, not the report's route/payload/check/view totals.
-    pub fn execution(&self, solved: &ResolvedPlan, backend_bytes: [u64; 2])
+    pub fn execution(&self, solved: &ResolvedPlan, local: &super::local_physical::LocalPhysicalInventory)
         -> Result<(crate::placement::Placement, crate::placement::SparkWorkingSet), Refusal> {
         use crate::placement::{AttentionClass, ExpertHome, ExpertRange, FfnMode, HopSpec,
             HopStorage, LayerAssignment, Placement, PoolLimits, SparkWorkingSet, TerminalHome,
@@ -94,6 +94,10 @@ impl GlmRecipe<'_> {
         {
             return Err(invalid("resolved execution differs from prepared geometry"));
         }
+        let backend_bytes = [
+            local.backend_bytes(0).map_err(|error| invalid(&error.to_string()))?,
+            local.backend_bytes(1).map_err(|error| invalid(&error.to_string()))?,
+        ];
         let modes = &solved.decisions.attention;
         let attention = if modes.iter().all(|mode| *mode == LayerMode::ContextSplit) {
             AttentionPlacement::Context

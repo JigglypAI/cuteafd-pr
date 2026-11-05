@@ -347,6 +347,129 @@ fn budgets() -> Vec<Budget> {
     .collect()
 }
 
+fn local_execution_inventory() -> super::super::local_physical::LocalPhysicalInventory {
+    use super::super::local_physical::LocalPhysicalInventory;
+    let mut inventory = LocalPhysicalInventory::default();
+    for rank in 0..2 {
+        let location = Location::coordinator(rank);
+        for (suffix, bytes) in [("weight.1.backing", 100 + u64::from(rank)),
+            ("execution.scratch", 13 + 4 * u64::from(rank))] {
+            inventory.owners.push(Allocation::buffer(format!("glm.expert.routed.rank.{rank}.{suffix}"),
+                location, bytes, Lifetime::TARGET, Category::Experts, "local backend"));
+        }
+        inventory.owners.push(Allocation::buffer(format!("glm.expert.routed.routes.rank.{rank}.peer.recv.0"),
+            location, 201 + u64::from(rank), Lifetime::TARGET, Category::Experts, "local routes"));
+        let mut view = Allocation::buffer(format!("glm.expert.routed.rank.{rank}.weight.1"),
+            location, 50, Lifetime::TARGET, Category::Experts, "local backend");
+        view.view = Some(View { backing: format!("glm.expert.routed.rank.{rank}.weight.1.backing"), offset: 0 });
+        inventory.views.push(view);
+    }
+    inventory.owners.push(Allocation::buffer("glm.expert.routed.checks.0.1.0", Location::PINNED,
+        81, Lifetime::TARGET, Category::Experts, "local route checks"));
+    inventory
+}
+
+#[test]
+fn execution_adapter_uses_resolved_homes_and_unique_tp2_prefix_and_backend_bytes() {
+    use crate::placement::{ExpertHome, ResidualHome};
+    let cfg = cfg();
+    let mut recipe = recipe(&cfg);
+    let local = local_execution_inventory();
+    recipe.owners.retain(|case| !case.when.iter().any(|when| matches!(when, When::LocalLayer(_))));
+    recipe.owners.push(Case { when: vec![When::LocalLayer(1)], value: local.owners.iter()
+        .chain(&local.views).cloned().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, recipe.maximum_pages);
+            Component::allocation(owner, bytes, false, recipe.maximum_pages)
+        }).collect() });
+    for onboard in [0, 1] {
+        let resolved = planner::solve(Request { onboard: Pin::Exact(onboard), ..request() }, budgets(), &recipe).unwrap();
+        let inventory = if onboard == 0 { Default::default() } else { local.clone() };
+        let (placement, working) = recipe.execution(&resolved, &inventory).unwrap();
+        assert_eq!(placement.pool_tokens, resolved.pool_tokens);
+        assert!(placement.pool_limits.0.is_empty());
+        assert_eq!(placement.max_pool_tokens_no_onboard, None);
+        assert_eq!(placement.onboard_layers, onboard as usize);
+        assert_eq!(placement.layers[0].experts, ExpertHome::Dense);
+        assert_eq!(working.prefill_lanes, resolved.decisions.prefill.waves);
+        assert_eq!(placement.residual, vec![ResidualHome::Owned(0), ResidualHome::Replicated, ResidualHome::Replicated]);
+        let geometry = super::super::context_buffers(&cfg, recipe.context,
+            resolved.decisions.prefill.rows, resolved.decisions.prefill.waves, Default::default());
+        assert_eq!(placement.peer_row_bytes, cfg.layers as u64 *
+            (geometry.query_row_bytes + geometry.partial_row_bytes + geometry.candidate_row_bytes));
+        for rank in 0..2 {
+            assert_eq!(placement.items[rank], resolved.items(Location::coordinator(rank as u8)).unwrap());
+            assert_eq!(placement.expert_ranges[rank].layers, 0);
+            assert_eq!(placement.expert_ranges[rank].peak_bytes, 0);
+        }
+        if onboard == 0 {
+            assert_eq!(placement.layers[1].experts, ExpertHome::Spark);
+            assert_eq!(working.rtx_layers, Vec::<usize>::new());
+            assert_eq!(working.spark_layers, vec![1]);
+            assert_eq!(working.selected_ranks().collect::<Vec<_>>(), vec![0, 1]);
+            assert!(placement.tp2.is_none());
+        } else {
+            assert_eq!(resolved.decisions.onboard_layers, vec![vec![1], vec![1]]);
+            assert_eq!(placement.layers[1].experts, ExpertHome::RtxTp2);
+            assert_eq!(working.rtx_layers, vec![1]);
+            assert!(working.spark_layers.is_empty());
+            assert!(working.selected_ranks().next().is_none());
+            let range = placement.tp2.as_ref().unwrap();
+            assert_eq!((range.first, range.layers, range.peak_bytes), (1, 1, [113, 118]));
+            assert!(placement.summary().contains("TP2"));
+            assert_eq!(placement.items[0].iter().find(|item| item.group == "local routes").unwrap().bytes, 201);
+            assert_eq!(placement.items[0].iter().find(|item| item.group == "local backend").unwrap().bytes, 113);
+        }
+    }
+}
+
+#[test]
+fn execution_adapter_preserves_whole_expert_range_and_shared_hop_geometry() {
+    use crate::placement::{ExpertHome, HopSpec, HopStorage, TerminalHome, plan_hops, residual_homes};
+    let cfg = cfg();
+    let mut recipe = recipe(&cfg);
+    recipe.attention = vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+        LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }];
+    recipe.targets.clear();
+    recipe.exchanges.clear();
+    recipe.experts.as_mut().unwrap().destination = vec![1];
+    let mut local = local_execution_inventory();
+    local.owners.retain(|owner| owner.location == Location::coordinator(1));
+    local.views.retain(|owner| owner.location == Location::coordinator(1));
+    let resolved = planner::solve(Request { onboard: Pin::Exact(1), ..request() }, budgets(), &recipe).unwrap();
+    let (placement, working) = recipe.execution(&resolved, &local).unwrap();
+    assert_eq!(placement.attention_placement, AttentionPlacement::Layers);
+    assert_eq!(placement.layers[1].experts, ExpertHome::RtxWhole { gpu: 1 });
+    assert_eq!(resolved.decisions.onboard_layers, vec![vec![], vec![1]]);
+    assert!(placement.tp2.is_none());
+    assert_eq!(placement.expert_ranges[0].layers, 0);
+    let range = &placement.expert_ranges[1];
+    assert_eq!((range.first, range.layers, range.peak_bytes), (1, 1, 118));
+    assert_eq!(placement.peer_row_bytes, 0);
+    assert_eq!(working.rtx_layers, vec![1]);
+    let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2,
+        rows: resolved.decisions.prefill.rows.max(64), lanes: resolved.decisions.prefill.waves,
+        entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
+    assert_eq!(placement.residual, residual_homes(&recipe.attention, &spec).unwrap());
+    assert_eq!(placement.hops, plan_hops(&recipe.attention, &spec).unwrap());
+}
+
+#[test]
+fn execution_adapter_refuses_nonprefix_sparks_without_renumbering_or_clamping() {
+    let cfg = cfg();
+    let recipe = recipe(&cfg);
+    let resolved = planner::solve(Request { onboard: Pin::Exact(0), ..request() }, budgets(), &recipe).unwrap();
+    let mut nonprefix = resolved.clone();
+    nonprefix.decisions.expert_homes.insert(1, ExpertDestination::Sparks { ranks: vec![2, 3] });
+    let error = recipe.execution(&nonprefix, &Default::default()).unwrap_err();
+    assert!(matches!(error, Refusal::InvalidFact(ref detail)
+        if detail.contains("non-prefix rank sets cannot be renumbered")));
+    let mut wrong_prefix = resolved.clone();
+    wrong_prefix.decisions.expert_homes.insert(1, ExpertDestination::Coordinator { gpus: vec![0, 1] });
+    assert!(matches!(recipe.execution(&wrong_prefix, &Default::default()), Err(Refusal::InvalidFact(_))));
+    assert!(matches!(planner::solve(Request { onboard: Pin::Exact(2), ..request() }, budgets(), &recipe),
+        Err(Refusal::PinConflict)));
+}
+
 #[test]
 fn phase_reply_resolution_is_immutable_and_absent_without_links() {
     use cuteafd_core::SparkReplyFormat::{Bf16, Fp8, Nvfp4};
