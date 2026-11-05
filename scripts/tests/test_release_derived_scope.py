@@ -39,6 +39,27 @@ def fixture_repo(matrix, monkeypatch):
     return repo, path
 
 
+@pytest.mark.parametrize('audio,enabled', [('auto', True), ('on', True), ('off', False)])
+def test_muse_release_audio_scope(fixture_repo, audio, enabled):
+    repo, path = fixture_repo
+    (repo / 'muse.config').write_text(f'FAMILY=muse_spark\nMODEL_ID=fixture/muse-exl3\nSPARK_COUNT=4\nAUDIO={audio}\n')
+    write_json(path, dict(entries=[dict(name='muse', family='muse_spark', config='muse.config')]))
+    derived, _ = SCOPE.derive(repo, path, 'muse', {})
+    assert derived[P + 'AUDIO_AOT'] == ('ON' if enabled else 'OFF')
+    assert SCOPE.requirements(repo, path, 'muse')[0]['audio'] == enabled
+
+
+@pytest.mark.parametrize('role', ['coordinator', 'expert'])
+def test_muse_release_inventory_requires_pcm_symbol(tmp_path, role):
+    root = tmp_path / role
+    write_json(root / 'share/PROGRAMS.json', dict(programs=[]))
+    wanted = [dict(name='muse', family='muse_spark', programs=[], experts=[], spark_experts=[],
+                   spark_count=4, context_split=False, audio=True)]
+    with pytest.raises(ValueError, match='cuteafd_pcm_required'):
+        SCOPE.check_inventory(root, role, wanted, symbols={'cuteafd_audio_required'})
+    SCOPE.check_inventory(root, role, wanted, symbols={'cuteafd_audio_required', 'cuteafd_pcm_required'})
+
+
 def test_union_equals_per_entry_derivation(fixture_repo):
     repo, path = fixture_repo
     union, entries = SCOPE.derive(repo, path, environ={})

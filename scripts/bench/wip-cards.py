@@ -711,6 +711,9 @@ def preflight_job(job, arm):
         if needs['audio'] and contents.get('audio') is False:
             problems.append(f"{host}: slot {arm['slot']} was built without the audio tower (AUDIO={values.get('AUDIO', 'auto')}); "
                             'rebuild with CUTEAFD_WIP_AUDIO_AOT=ON or set AUDIO=off')
+        if needs['audio'] and job['entry'].get('family') == 'muse_spark' and contents.get('pcm_audio') is not True:
+            problems.append(f"{host}: slot {arm['slot']} lacks the Muse audio tower (cuteafd_pcm_required); "
+                            'rebuild with CUTEAFD_WIP_AUDIO_AOT=ON')
         role = needs.get('tp_role')
         # The seal check always reports tp_roles (None: no TP manifest); a record
         # without the field is not a seal check result and carries no attestation.
@@ -1904,13 +1907,16 @@ host=pathlib.Path(root)/'slots'/slot/role
 def contents(p):
     art=p/'workspace/.cuteafd-wip'
     packages=sorted(str(d.relative_to(art)) for kind in ('exl3','fp8') if (art/kind).is_dir() for d in (art/kind).iterdir() if d.is_dir())
-    audio=None
+    audio=pcm_audio=None
     try:
         out=subprocess.run(['nm','-D','--defined-only',str(art/'libcuteafd_native.so')],capture_output=True,text=True,timeout=60)
-        if out.returncode==0: audio=any(line.split()[-1:]==['cuteafd_audio_required'] for line in out.stdout.splitlines())
+        if out.returncode==0:
+            symbols={line.split()[-1] for line in out.stdout.splitlines() if line.split()}
+            audio='cuteafd_audio_required' in symbols
+            pcm_audio='cuteafd_pcm_required' in symbols
     except (OSError,subprocess.SubprocessError):
         pass
-    return dict(packages=packages,audio=audio,tp_roles=tp_roles(p,art))
+    return dict(packages=packages,audio=audio,pcm_audio=pcm_audio,tp_roles=tp_roles(p,art))
 def tp_roles(p,art):
     # The V4.1 Spark TP roles this slot attests, verified as run-family.sh's
     # launch_deepseek_v41 verifies them; None when the slot carries no manifest.
