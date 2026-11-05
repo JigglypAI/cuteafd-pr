@@ -67,14 +67,33 @@ pub fn manifest_context_for_plan(manifest: &serde_json::Value, heads: usize, sms
     let Some(mut context) = manifest_context(manifest) else { return Ok(None) };
     let mut scratch = 0;
     for begin in [0, heads / 2] {
-        let name = cuteafd_core::coordinator_programs::attention_partial_program(
-            manifest, "glmf", begin, 64, sms, plan)?;
+        let Ok(name) = cuteafd_core::coordinator_programs::attention_partial_program(
+            manifest, "glmf", begin, 64, sms, plan) else { return Ok(None) };
         let bytes = crate::serving_capacity::glmf_manifest_scratch(manifest)(&name)
             .ok_or_else(|| anyhow::anyhow!("selected Flash context partial missing: {name}"))?;
         scratch = scratch.max(bytes);
     }
     context.partial_scratch = scratch;
     Ok(Some(context))
+}
+
+/// Resolve the same per-card numerical recipes for serving and plan admission.
+pub fn manifest_context_for_cards(manifest: &serde_json::Value, heads: usize, sms: &[usize],
+    plan: cuteafd_core::coordinator_programs::AttentionReductionPlan) -> anyhow::Result<Option<GlmfAttention>> {
+    let mut context: Option<GlmfAttention> = None;
+    for &sm_count in sms {
+        let mut selected = manifest.clone();
+        cuteafd_core::coordinator_programs::select_card_plans(&mut selected, sm_count.try_into()?)?;
+        cuteafd_core::coordinator_programs::select_attention_plans(&mut selected, plan,
+            |name| (name.starts_with("glmf_") && !name.ends_with("_m128")) || name.starts_with("glmf2_"))?;
+        let Some(card) = manifest_context_for_plan(&selected, heads, sm_count, &plan)? else { return Ok(None) };
+        context = Some(match context {
+            Some(previous) => GlmfAttention { topk_scratch: previous.topk_scratch.max(card.topk_scratch),
+                partial_scratch: previous.partial_scratch.max(card.partial_scratch), ..card },
+            None => card,
+        });
+    }
+    Ok(context)
 }
 
 /// The MLA placement a GLM Flash engine on `gpus` GPUs serves: `requested` (None: auto), checked
@@ -720,6 +739,30 @@ pub fn calibrate_local_tp2_graphs(graphs: &mut GraphSet) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mismatched_card_recipes_resolve_auto_to_layers_but_keep_heads_explicit() {
+        let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(64, None, None).unwrap();
+        let mut programs: Vec<_> = CONTEXT_PROGRAMS.iter().chain(&[
+            "glmf2_kda_commit_c", "glmf_index_producer_c_m64", "glmf_index_producer_c_m4096"])
+            .map(|name| serde_json::json!({"name": name})).collect();
+        for begin in [0, 32] {
+            for splits in [2, 4] {
+                programs.push(serde_json::json!({"name": format!("glmf_sparse_mla_partial_h{begin}_s{splits}_m64"),
+                    "params": {"device_sm_counts": [170], "row_caps": {"170": [64]}},
+                    "scratch_bytes_at_capacity": {"scratch": splits * 100}}));
+            }
+        }
+        let manifest = serde_json::json!({"programs": programs});
+        assert!(manifest_context(&manifest).is_some());
+        assert!(manifest_context_for_cards(&manifest, 64, &[170], plan).unwrap().is_some());
+        let context = manifest_context_for_cards(&manifest, 64, &[170, 188], plan).unwrap();
+        assert!(context.is_none());
+        assert_eq!(resolve_attention(None, 2, context).unwrap().mode, AttentionPlacement::Layers);
+        assert!(matches!(resolve_attention(Some(AttentionPlacement::Context), 2, context),
+            Err(PlacementError::MissingContextPrograms { .. })));
+        assert_eq!(resolve_attention(Some(AttentionPlacement::Heads), 2, context).unwrap().mode, AttentionPlacement::Heads);
+    }
 
     fn workspace_fixture(ranks: usize, bytes: u64) -> Vec<GlmfBufferDemand> {
         (0..ranks).map(|rank| GlmfBufferDemand::new(GlmfComponent::Always,

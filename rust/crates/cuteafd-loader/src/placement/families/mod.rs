@@ -36,8 +36,9 @@ pub const DEEPSEEK_V41: ExecutorModes = ExecutorModes { family: "deepseek_v41", 
 /// `context` is its recorded default (K3, TJ: GLM 5.3 must not replicate KV; pool first
 /// is not C1-gated): at max it admits 2,097,152 tokens against heads' 1,321,216, C8 1.015x,
 /// 8K prefill 1.027x; C1 parity after the per-row-bucket split plans (7689c8c3: 1.043x). A build without the context programs
-/// fails a chosen `context` closed (`glm5::solve_working_set`, #202); `heads` stays an
-/// explicit option.
+/// fails an explicit `context` closed (`glm5::solve_working_set`, #202); standard auto
+/// falls back to whole-layer owners, while native EXLR8 fails closed until qualified.
+/// `heads` stays an explicit option.
 pub const GLM5: ExecutorModes = ExecutorModes { family: "glm5",
     modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0,
         LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
@@ -45,9 +46,9 @@ pub const GLM5: ExecutorModes = ExecutorModes { family: "glm5",
 /// GLM Flash: every layer split over two GPUs; its MLA layers by heads (latent replicated) or by
 /// context (projections head-split, 256-token units owned by parity; #57), KDA always by heads.
 /// `context` is the recorded default on two GPUs (TJ: no context-scaling KV replicated; pool
-/// first); a build without its programs fails a chosen `context` closed
-/// (`glm5_flash::resolve_attention`, #202), and `heads` stays an explicit option. Owned MLA
-/// layers (`layers`) are an explicit per-layer option with split FFNs; auto stays context.
+/// first); a build without its programs fails an explicit `context` closed
+/// (`glm5_flash::resolve_attention`, #202), and `heads` stays an explicit option. Auto falls
+/// back to owned MLA layers (`layers`) with split FFNs when context recipes are unavailable.
 pub const GLM5_FLASH: ExecutorModes = ExecutorModes { family: "glm5_flash",
     modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0,
         LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },

@@ -89,9 +89,9 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         // Context and step admission use the same boot-time numerical recipe as serving.
         let context_programs = if ranks == 2 && !matches!(report.requested_attention,
             Some(placement::AttentionPlacement::Heads | placement::AttentionPlacement::Layers)) {
-            manifest.map(|m| glmf::manifest_context_for_plan(
-                m, cfg.heads, sms as usize, &attention_plan)).transpose()?.flatten()
-        } else { manifest.and_then(glmf::manifest_context) };
+            manifest.map(|m| glmf::manifest_context_for_cards(
+                m, cfg.heads, &[sms as usize], attention_plan)).transpose()?.flatten()
+        } else { None };
         let attention = glmf::resolve_attention(report.requested_attention, ranks, context_programs)?;
         if report.requested_attention.is_none() && ranks == 2 && context_programs.is_none() {
             notes.push(format!("auto attention fallback: layers; missing context programs: {}",

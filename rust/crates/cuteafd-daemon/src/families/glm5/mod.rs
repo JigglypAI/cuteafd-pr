@@ -976,12 +976,15 @@ impl Opened {
         let mut draft_file = None;
         let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement)
             .map_err(anyhow::Error::msg)?;
-        let names: Vec<&str> = programs.names().collect();
-        let available = cuteafd_loader::placement::families::glm5::context_programs(&self.cfg,
-            names.iter().copied(), |name| programs.spec(name).ok()
-                .map(|p| p.scratch.get("scratch").copied().unwrap_or(0))).is_some();
+        let context = if devices.len() == 2 && !matches!(requested,
+            Some(cuteafd_loader::placement::AttentionPlacement::Heads | cuteafd_loader::placement::AttentionPlacement::Layers)) {
+            let sms = devices.iter().map(|&device| crate::shared::peer_split::on_device(
+                &self.library, device, || self.library.sm_count())).collect::<Result<Vec<_>>>()?;
+            cuteafd_loader::placement::families::glm5::manifest_context_for_cards(
+                &self.cfg, &manifest, &sms, attention_plan)?
+        } else { None };
         let requested = cuteafd_loader::placement::families::glm5::resolve_context_attention(
-            &self.cfg, requested, devices.len(), available, !native)?;
+            &self.cfg, requested, devices.len(), context.is_some(), !native)?;
         ensure!(requested != Some(cuteafd_loader::placement::AttentionPlacement::Layers) || devices.len() == 2,
             "GLM layers attention requires two coordinator GPUs");
         let owners = (requested == Some(cuteafd_loader::placement::AttentionPlacement::Layers))
@@ -1078,24 +1081,6 @@ impl Opened {
             None => (drafter_bytes, drafter_staging, drafter_weights),
         };
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
-        // Token-split attention: the build's programs (GPU0's table; both GPUs load the same).
-        let names: Vec<&str> = programs.names().collect();
-        let mut context = (devices.len() == 2).then(|| glm::context_programs(&self.cfg, names.iter().copied(),
-            |name| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0)))).flatten();
-        if let Some(context) = &mut context {
-            let selected_scratch = devices.iter().map(|&device| -> Result<u64> {
-                self.library.cuda_set_device(device)?;
-                let sms = self.library.sm_count()?;
-                self.cfg.attention_kinds().iter().flat_map(|kind| [0, self.cfg.heads / 2].map(|begin| (*kind, begin)))
-                    .map(|(kind, begin)| {
-                    let name = cuteafd_core::coordinator_programs::attention_partial_program_of(
-                        &manifest, self.cfg.program_family(), kind, begin, engine::DECODE_ROWS, sms, &attention_plan)?;
-                    Ok(programs.spec(&name)?.scratch.get("scratch").copied().unwrap_or(0))
-                }).collect::<Result<Vec<_>>>().map(|sizes| sizes.into_iter().max().unwrap_or(0))
-            }).collect::<Result<Vec<_>>>();
-            self.library.cuda_set_device(args.device)?;
-            context.partial_scratch = selected_scratch?.into_iter().max().unwrap_or(0);
-        }
         // Every per-slot owner covers the waves in flight.
         let prefill_lanes = usize::from(args.prefill_waves);
         ensure!(owners.is_none() || prefill_lanes <= cuteafd_loader::placement::LAYER_PIPELINE_MAX_LANES as usize,
