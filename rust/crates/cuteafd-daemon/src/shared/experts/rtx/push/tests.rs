@@ -73,7 +73,7 @@ fn exlr8_coordinator_plan_uses_actual_world_and_committed_native_inventory() -> 
     let catalog = crate::shared::memory::push_exlr8::tests::fixture_catalog(root.path())?;
     for world in [1, 2] {
         let budgets = (0..world).map(|rank| Residency::plan(root.path(), "mixed", 3,
-            world, rank, ExpertSet::Routed).map(|layout| layout.resident_bytes)).collect::<Result<Vec<_>>>()?;
+            world, rank, ExpertSet::Routed).map(|layout| layout.resident_bytes)).collect::<std::result::Result<Vec<_>, _>>()?;
         let experts = CoordinatorExperts::Exlr8 { manifest: "mixed".into(), layers: vec![3], budgets: budgets.clone() };
         experts.validate_ranks(world)?;
         assert!(experts.validate_ranks(3 - world).is_err());

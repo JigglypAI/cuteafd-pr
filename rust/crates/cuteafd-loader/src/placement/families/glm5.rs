@@ -993,7 +993,7 @@ pub fn local_inventory_selected(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41
 }
 
 fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
-    selected_layers: usize, world: usize, rows: u64, lanes: u64, exchange_f32: bool, a4: bool)
+    selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool, a4: bool)
     -> anyhow::Result<LocalInventory> {
     use crate::formats::fp8_experts::{ExpertFormat, Slicing};
     let tensors = catalog.fp8().filter(|t| t.format() == ExpertFormat::Nvfp4)
