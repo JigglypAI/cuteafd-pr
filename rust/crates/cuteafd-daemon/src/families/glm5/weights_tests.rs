@@ -238,7 +238,7 @@ fn pushed_head_split_operands_match_the_mount_golden() -> Result<()> {
     for gpu in 0..2 {
         use crate::shared::experts::rtx::dense::{DenseArena, RankLayout};
         let device = crate::shared::memory::device::Device { library: &library, id: gpu };
-        let layout = RankLayout::new(records.clone(), Vec::new(), gpu)?;
+        let layout = RankLayout::new(records.operands.clone(), records.steps.clone(), gpu)?;
         let checked = layout.checked(root.path(), world, sparks + gpu as usize)?;
         let expected = crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(&checked, (sparks + gpu as usize) as u32)?;
         device.run(|| -> Result<()> {

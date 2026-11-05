@@ -1230,8 +1230,8 @@ impl Opened {
                 let drafter = self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file)?;
                 Ok((embedding, model, drafter))
             })?;
-            let (operands, deferred) = sink.take();
-            records.operands.extend(operands);
+            let (dense_records, deferred) = sink.take();
+            records.extend(dense_records);
             let dense = push::plan_ranks(&self.snapshot, records.clone(), &dense_devices, sparks)?;
             Ok((embedding, model, drafter, records, deferred, dense))
         };

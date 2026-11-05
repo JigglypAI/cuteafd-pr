@@ -153,6 +153,46 @@ fn installed_variant_weight_inventory_equals_production_requests() -> Result<()>
 }
 
 #[test]
+fn installed_k6_max_streaming_staging_covers_measured_pools() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{HostStaging, Rect};
+    for (model, revision, observed, old_dense) in [
+        ("wrldsuksgo2mars--GLM-5.3-EXL3-K4-Core-K6", "5a4e83a09a11f3145332ed632d28a9894ea88225",
+            [240060416usize, 27942912], 11891580928usize),
+        ("wrldsuksgo2mars--Mistral-Large-4-EXL3-K4-Core-K6", "03c80aebaa483d55760703ae5bc0c9734c9d67d6",
+            [33546240, 16048128], 4750802944),
+    ] {
+        let root = installed(model, revision)?;
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open(&root)?;
+        let cfg = GlmDsaConfig::read(&root)?;
+        let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        let mut rects: [Vec<Vec<Rect>>; 2] = Default::default();
+        let mut add = |rank: usize, layout: cuteafd_loader::formats::trellis_core::CoreWeightLayout| -> Result<()> {
+            let outputs = core.get_weight(&layout.stem).context("native projection")?.stored_outputs;
+            let layout = CoreWeightLayout::from_shared(layout);
+            rects[rank].extend(layout.payload_rects(&checkpoint, outputs)?.into_iter().map(|(_, rect)| vec![rect]));
+            Ok(())
+        };
+        for layer in 0..cfg.layers {
+            for (rank, layouts) in core.layer_weights(&cfg, layer, 2, None)?.into_iter().enumerate() {
+                for layout in layouts.into_values() { add(rank, layout)?; }
+            }
+        }
+        if let Some(head) = core.get_weight(cfg.head()) {
+            add(0, cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(head,
+                cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?)?;
+        }
+        let charges = rects.iter().map(|steps| HostStaging::for_steps(steps.iter().map(Vec::as_slice), 0)
+            .and_then(HostStaging::bytes)).collect::<Result<Vec<_>>>()?;
+        for rank in 0..2 {
+            ensure!(charges[rank] >= observed[rank], "{model} rank {rank}: {} < measured {}", charges[rank], observed[rank]);
+        }
+        ensure!(charges.iter().sum::<usize>() < old_dense / 2, "{model}: streaming bound must improve substantially");
+        eprintln!("{model} native K6 max streaming staging bytes {charges:?}; measured pools {observed:?}; old full dense bound {old_dense}");
+    }
+    Ok(())
+}
+
+#[test]
 fn official_ml4_fp8_is_refused_by_inventory_and_expert_catalog() -> Result<()> {
     let root = installed(
         "mistralai--Mistral-Large-4-1T-A52B",
@@ -358,6 +398,88 @@ fn compact_real_load(owners: Option<&[u8]>, core: bool, placement: EmbedPlacemen
 #[test]
 fn compact_k6_payload_vectors_and_head_equal_inventory() -> Result<()> {
     compact_real_load(None, true, EmbedPlacement::Gpu)
+}
+
+#[test]
+fn glm_and_ml4_k6_min_max_push_plans_preserve_packed_bytes() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{self, Job, RankLayout};
+    use cuteafd_loader::formats::{dense_trellis::TrellisSide, trellis_core::CoreWeightLayout as SharedLayout};
+    use std::os::unix::fs::FileExt;
+    let (dso, library) = compact_dso()?;
+    for ml4 in [false, true] {
+        let root = tempfile::tempdir_in(dso.directory())?;
+        let (config, mut tensors) = fixture::glm5_compact_weights();
+        let mut cfg = GlmDsaConfig::from_hf(&config)?;
+        cfg.vocab_size = 256;
+        if ml4 {
+            cfg.variant = GlmDsaConfig::from_hf(&fixture::mistral_large4_config())?.variant;
+            cfg.q_lora_rank = 0;
+        }
+        for (name, shape) in cuteafd_loader::families::glm5::core::expected(&cfg) {
+            let stem = name.strip_suffix(".weight").context("core stem")?;
+            tensors.retain(|t| t.0 != name && t.0 != format!("{name}_scale_inv"));
+            tensors.extend(fixture::exl3(stem, shape[0].next_multiple_of(128), shape[1], 6));
+        }
+        fixture::write_snapshot(root.path(), &config, &tensors, None);
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open(root.path())?;
+        for tensor in &checkpoint.tensors {
+            if tensor.meta.name.ends_with(".mcg") || tensor.meta.name.ends_with(".trellis")
+                || tensor.meta.name.ends_with(".suh") || tensor.meta.name.ends_with(".svh") {
+                let bytes = if tensor.meta.name.ends_with(".mcg") { 0xcbac1fedu32.to_le_bytes().to_vec() }
+                    else { (0..tensor.meta.byte_length).map(|i| (i as u8).wrapping_mul(31).wrapping_add(7)).collect() };
+                std::fs::OpenOptions::new().write(true).open(root.path().join(&tensor.shard))?
+                    .write_all_at(&bytes, tensor.meta.byte_offset)?;
+            }
+        }
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        for ranks in [1, 2] {
+            let sink = std::rc::Rc::new(super::landing::PushSink::default());
+            let loader = GlmLoader { library: &library, catalog: &catalog, device: 0,
+                stream: std::ptr::null_mut(), peers: (1..ranks).map(|rank| crate::shared::peer_split::RankDevice {
+                    device: rank as i32, stream: std::ptr::null_mut() }).collect(), push: Some(sink.clone()) };
+            let mut layouts = Vec::new();
+            for layer in 0..cfg.layers {
+                for (rank, weights) in core.layer_weights(&cfg, layer, ranks, None)?.into_iter().enumerate() {
+                    layouts.extend(weights.into_values().map(|layout| (rank, layout)));
+                }
+            }
+            layouts.push((0, SharedLayout::new(core.get_weight(cfg.head()).context("K6 head")?, TrellisSide::Output, 0, 1)?));
+            let mut weights = Vec::new();
+            let mut expected = Vec::new();
+            for (rank, layout) in &layouts {
+                let packed = CoreWeightLayout::from_shared(layout.clone()).read(|name|
+                    crate::shared::checkpoint_read::read_tensor(&checkpoint, name))?;
+                expected.push(packed.shard);
+                weights.push(loader.core_weights(layout.clone(), &checkpoint, *rank)?);
+            }
+            let (records, deferred) = sink.take();
+            assert!(deferred.is_empty());
+            assert_eq!(records.operands.len(), layouts.len() * 2);
+            assert_eq!(records.steps.iter().flat_map(|s| &s.jobs).filter(|j| matches!(j, Job::TrellisTiles { .. })).count(), layouts.len());
+            // Building the push ranks must retain both payload transforms and vector lands.
+            for rank in 0..ranks {
+                let layout = RankLayout::new(records.operands.clone(), records.steps.clone(), rank as i32)?;
+                let checked = layout.checked(root.path(), ranks + 6, rank + 6)?;
+                assert!(checked.totals.rank_bytes[rank + 6] > 0);
+                assert!(!layout.steps.is_empty() && !layout.operands.is_empty());
+                assert!(layout.host_staging.bytes()? > 0);
+            }
+            // Replay the actual recorded recipes through the mount fallback. This also
+            // catches an eager upload: the original packer is the independent oracle.
+            dense::fill_records_by_mount(&library, &records, |_| std::ptr::null_mut())?;
+            for ((weights, expected), (_, layout)) in weights.iter().zip(&expected).zip(&layouts) {
+                assert_eq!(weights.payload.buffer.bytes + weights.suh.buffer.bytes + weights.svh.buffer.bytes, layout.bytes);
+                for (buffer, bytes) in [(weights.payload.buffer, &expected.payload),
+                    (weights.suh.buffer, &expected.suh), (weights.svh.buffer, &expected.svh)] {
+                    let mut actual = vec![0; buffer.bytes];
+                    library.copy_d2h(&mut actual, buffer)?;
+                    assert_eq!(&actual, bytes, "{} ranks={ranks} ml4={ml4}", layout.stem);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[test]

@@ -45,14 +45,12 @@ pub(crate) struct HostStaging {
 }
 
 impl HostStaging {
-    /// Bound retained transforms from the receiver ring, not the source's send
-    /// concurrency. A missing slot retains its payload plus at most two boundary
-    /// steps. Each file may additionally hold one step at its stream frontier.
-    /// Mixed-file or overlapping source intervals cannot use this argument;
-    /// charge their entire footprint separately.
+    /// Bound open transforms and their reusable pool from the receiver ring.
+    /// Overlapping source windows multiply the ring/frontier bound by their
+    /// simultaneous fanout, not the footprint of a transitively overlapping chain.
+    /// Disconnected rectangles still charge their entire footprint separately.
     pub fn for_steps<'s>(steps: impl IntoIterator<Item = &'s [Rect]>, table_bytes: usize) -> Result<Self> {
-        use std::collections::{BTreeMap, BTreeSet};
-        let mut files = BTreeSet::new();
+        use std::collections::BTreeMap;
         let mut extents = BTreeMap::<std::path::PathBuf, Vec<(u64, u64, usize)>>::new();
         let (mut total, mut fallback, mut largest) = (0usize, 0usize, 0usize);
         for rects in steps {
@@ -73,34 +71,39 @@ impl HostStaging {
             }
             if contiguous {
                 let rect = &rects[0];
-                files.insert(rect.path.clone());
                 let first = rect.base + (rect.rows.start * rect.row_bytes + rect.cols.start) as u64;
                 extents.entry(rect.path.clone()).or_default().push((first, end, bytes));
             } else {
                 fallback = fallback.checked_add(bytes).context("dense fallback staging overflow")?;
             }
         }
-        // Any overlapping intervals are conservatively charged in full. Such
-        // steps may remain open while all later source rows are delivered.
-        for entries in extents.values_mut() {
-            entries.sort_unstable_by_key(|entry| entry.0);
-            let (mut end, mut group_bytes, mut count) = (0, 0usize, 0usize);
-            for &(first, last, bytes) in entries.iter() {
-                if first >= end {
-                    if count > 1 { fallback = fallback.checked_add(group_bytes).context("dense overlap staging overflow")?; }
-                    group_bytes = 0;
-                    count = 0;
-                }
-                group_bytes = group_bytes.checked_add(bytes).context("dense overlap footprint overflow")?;
-                count += 1;
-                end = end.max(last);
+        let (mut fanout, mut frontiers) = (0usize, 0usize);
+        for entries in extents.values() {
+            // End events precede starts: touching half-open windows do not overlap.
+            let mut events = Vec::with_capacity(entries.len() * 2);
+            for &(first, last, bytes) in entries {
+                events.push((first, true, bytes));
+                events.push((last, false, bytes));
             }
-            if count > 1 { fallback = fallback.checked_add(group_bytes).context("dense overlap staging overflow")?; }
+            events.sort_unstable();
+            let (mut active, mut bytes, mut peak) = (0usize, 0usize, 0usize);
+            for (_, start, size) in events {
+                if start {
+                    active += 1;
+                    bytes = bytes.checked_add(size).context("dense overlap staging overflow")?;
+                    fanout = fanout.max(active);
+                    peak = peak.max(bytes);
+                } else { active -= 1; bytes -= size; }
+            }
+            frontiers = frontiers.checked_add(peak).context("dense frontier staging overflow")?;
         }
+        // A delayed ring slot can strand windows on either side of its source
+        // interval for each overlapping recipe. Completed buffers stay in the
+        // pool only while the same bound has room; allocation evicts them first.
         let window = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES.checked_add(largest.checked_mul(2)
             .context("dense boundary staging overflow")?).and_then(|bytes|
-                bytes.checked_mul(cuteafd_ffi::push_ring::DEFAULT_SLOTS)).context("dense ring staging overflow")?;
-        let frontiers = files.len().checked_mul(largest).context("dense frontier staging overflow")?;
+                bytes.checked_mul(cuteafd_ffi::push_ring::DEFAULT_SLOTS)).and_then(|bytes|
+                bytes.checked_mul(fanout)).context("dense ring staging overflow")?;
         let staging_bytes = fallback.checked_add(window).and_then(|bytes| bytes.checked_add(frontiers))
             .context("dense pinned staging overflow")?.min(total);
         let bound = Self { staging_bytes, largest_step: largest, table_bytes };
@@ -454,6 +457,78 @@ pub(crate) mod testing {
         pub(crate) static PEAKS: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     use std::os::unix::fs::FileExt;
+
+    #[test]
+    fn streamed_overlap_reverse_and_random_slots_keep_real_arena_within_charge() -> Result<()> {
+        use anyhow::Context;
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use std::path::PathBuf;
+        let root = PathBuf::from(std::env::var_os("HOME").context("HOME")?)
+            .join(".cache/cuteafd/builds/dense-staging-order-fixture");
+        let fixture = Fixture::build_in(&root)?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        fixture.quiet_events(&library, true)?;
+        let source = tempfile::tempdir_in(fixture.directory())?;
+        let path = source.path().join("overlapping-k6");
+        let file = std::fs::File::create(&path)?;
+        let (count, bytes, stride) = (1024usize, 2usize << 20, 1usize << 20);
+        file.set_len((count * stride + bytes) as u64)?;
+        for random in [false, true] {
+            let steps = (0..count).map(|i| super::Step { device: 0,
+                rects: vec![super::Rect { name: format!("K6-{i}"), path: path.clone(),
+                    base: (i * stride) as u64, row_bytes: bytes, rows: 0..1, cols: 0..bytes }],
+                jobs: Vec::new() }).collect();
+            let layout = super::RankLayout::new(Vec::new(), steps, 0)?;
+            let charged = layout.host_staging.staging_bytes as u64;
+            assert!(charged < (count * bytes) as u64);
+            let checked = layout.checked(source.path(), 1, 0)?;
+            let expected = super::ExpectedCoverage::from_plan(&checked, 0)?;
+            let mut fragments = Vec::new();
+            for (i, (offset, _)) in layout.steps.iter().enumerate() {
+                for half in 0..2 {
+                    fragments.push((i * stride + half * bytes / 2, layout.base + offset + (half * bytes / 2) as u64));
+                }
+            }
+            fragments.sort_unstable();
+            let device = super::Device { library: &library, id: 0 };
+            let mut arena = super::DenseArena::new(device, layout, expected)?;
+            let payload = vec![0u8; bytes / 2];
+            let mut state = 0x517cc1b727220a95u64;
+            let per_slot = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / payload.len();
+            let slots = fragments.chunks(per_slot).collect::<Vec<_>>();
+            let deliver = |arena: &mut super::DenseArena<'_>, slot: usize| -> Result<()> {
+                for &(_, offset) in slots[slot] {
+                    super::PushDestination::copy_validation(arena, offset, &payload)?;
+                    assert_eq!(arena.held, arena.staged + arena.pool.iter().map(|p| p.buffer.bytes as u64).sum::<u64>());
+                    assert!(arena.held <= charged, "open plus reusable pool exceeds admitted charge");
+                }
+                Ok(())
+            };
+            // Delay one actual 1 MiB slot across every refill. The remaining
+            // 127 slots keep cycling; the hole's partial windows stay open.
+            let delayed = 1;
+            let mut pending = (0..slots.len()).filter(|&i| i != delayed).collect::<Vec<_>>();
+            for batch in pending.chunks_mut(cuteafd_ffi::push_ring::DEFAULT_SLOTS - 1) {
+                if random {
+                    for i in (1..batch.len()).rev() {
+                        state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+                        batch.swap(i, state as usize % (i + 1));
+                    }
+                } else { batch.reverse(); }
+                for &slot in batch.iter() { deliver(&mut arena, slot)?; }
+                assert!(!arena.open.is_empty() && arena.staged >= bytes as u64,
+                    "delayed slot must retain partial windows through every refill");
+            }
+            let minimum_peak = if random { 32 * bytes } else { 2 * bytes };
+            assert!(arena.peak >= minimum_peak as u64, "reordered slots must open a meaningful window");
+            deliver(&mut arena, delayed)?;
+            assert_eq!(arena.run, count);
+            super::PushDestination::done(arena)?;
+            PEAKS.with(|p| { p.take(); });
+        }
+        Ok(())
+    }
 
     /// A one-source fake SparkNest for one rank: packs the rank's planned runs
     /// into ring slots in plan order, Filled per slot (each written only after its
