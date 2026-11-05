@@ -1047,7 +1047,11 @@ impl MlaDflashConfig {
             ("h", vec![rows, h], Bf16), ("n", vec![rows, h], Bf16), ("delta", vec![rows, h], Bf16),
             ("gate_up", vec![rows, 2 * inter], Bf16), ("act", vec![rows, inter], Bf16),
             ("logits", vec![rows, self.vocab], F32), ("markov_norms", vec![self.vocab], F32),
-            ("markov_workspace", vec![seq * 296 * 8 + rows * 4 + seq * self.markov_rank * 4], Bytes),
+            // cuteafd_ml4_dspark_markov_workspace: partial values+indices (296
+            // blocks x 8 B), base argmax top, state+embedding (2 x rank BF16) and
+            // the joint projection (3 x rank F32).
+            ("markov_workspace", vec![seq * 296 * 8 + rows * 4 + seq * self.markov_rank * 4
+                + seq * 3 * self.markov_rank * 4], Bytes),
             ("anchors", vec![seq], U32), ("ids", vec![rows], U32),
             ("tokens", vec![seq * self.drafts()], U32), ("positions", vec![rows], I64),
         ] { add(name.into(), &dims, dtype)?; }
