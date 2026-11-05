@@ -786,7 +786,9 @@ impl<'a> LocalLane<'a> {
     }
 
     fn replay(&mut self, rows: usize, op: super::graphs::Op) -> Result<bool> {
-        if !self.replay_enabled || self.lane.window.is_some() { return Ok(false); }
+        if !super::graphs::replay_allowed(op, self.replay_enabled, self.lane.window.is_some())? {
+            return Ok(false);
+        }
         let rank = self.rank;
         let key = super::graphs::Key { lane: self.lane_index, rank, rows, op };
         let stream = self.stream().clone();
@@ -945,7 +947,7 @@ impl<'a> LocalLane<'a> {
     pub(crate) fn context_decode(&mut self, layer: usize, rows: usize, speculative: bool) -> Result<()> {
         ensure!(self.lane.window.is_none() && self.lane.metadata_bank == 0,
             "Kimi context decode needs its fixed metadata bank");
-        ensure!(self.graphs.is_some() && self.replay_enabled, "Kimi context decode requires startup graphs");
+        ensure!(self.graphs.is_some(), "Kimi context decode requires startup graphs");
         let context = self.context.as_ref().context("Kimi context not bound")?.0.clone();
         let bucket = context.ranks[self.rank].decode().dispatch_rows(rows, speculative)?;
         let input = context.ranks[self.rank].buffer("decode input")?;

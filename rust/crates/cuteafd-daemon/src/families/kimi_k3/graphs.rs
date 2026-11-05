@@ -18,6 +18,17 @@ pub(crate) enum Op {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Key { pub lane: usize, pub rank: usize, pub rows: usize, pub op: Op }
 
+/// Scoring and diagnostic decode disable optional arithmetic graphs, not the
+/// mandatory Context exchange executable. Context never runs in a row window.
+pub(crate) fn replay_allowed(op: Op, optional: bool, window: bool) -> Result<bool> {
+    if matches!(op, Op::Context { .. }) {
+        ensure!(!window, "Kimi context graph needs its fixed row storage");
+        Ok(true)
+    } else {
+        Ok(optional && !window)
+    }
+}
+
 pub(crate) use cuteafd_loader::families::kimi_k3::allocation::{GRAPH_RESERVE as RESERVE,
     graph_demand as demand};
 use cuteafd_loader::families::kimi_k3::allocation::{graph_rows, verify_graph_rows};
