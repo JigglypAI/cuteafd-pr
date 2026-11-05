@@ -57,7 +57,7 @@ impl V41DsparkConfidence<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "native dSpark confidence CUDA status {status}");
+        crate::native_status("native dSpark confidence CUDA status", status)?;
         Ok(())
     }
 }
@@ -147,7 +147,7 @@ impl NativeLibrary {
         let status = unsafe { launch(candidates[0].0.ptr.cast(), candidates[0].1.ptr.cast(),
             candidates[1].0.ptr.cast(), candidates[1].1.ptr.cast(), output.0.ptr.cast(),
             output.1.ptr.cast(), rows as i32, split as i32, stream) };
-        ensure!(status == 0, "vocabulary greedy merge status {status}");
+        crate::native_status("vocabulary greedy merge status", status)?;
         Ok(())
     }
     unsafe fn v41_head_projection(
@@ -279,7 +279,7 @@ impl V41VocabularyProjection<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "Markov launch status {status}");
+        crate::native_status("Markov launch status", status)?;
         Ok(())
     }
 }
@@ -362,7 +362,7 @@ impl V41DraftStep<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "draft sampling CUDA status {status}");
+        crate::native_status("draft sampling CUDA status", status)?;
         Ok(())
     }
 }

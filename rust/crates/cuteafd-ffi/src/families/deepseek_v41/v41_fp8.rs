@@ -367,7 +367,7 @@ impl V41SharedSwiGlu<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "native shared SwiGLU CUDA status {status}");
+        crate::native_status("native shared SwiGLU CUDA status", status)?;
         Ok(())
     }
 }

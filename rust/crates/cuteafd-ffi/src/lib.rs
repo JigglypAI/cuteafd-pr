@@ -530,6 +530,15 @@ pub struct NativeStatusError {
     pub detail: String,
 }
 
+/// A non-zero native status is a device failure. The draft liveness gate
+/// classifies on [`NativeStatusError`], so every wrapper on the draft path must
+/// return one instead of a plain `ensure!` message.
+pub(crate) fn native_status(context: &str, status: CuteafdStatus) -> Result<()> {
+    if status == CUTEAFD_STATUS_OK { return Ok(()); }
+    Err(anyhow::Error::new(NativeStatusError { context: context.to_string(), status,
+        detail: format!("native status {status}") }))
+}
+
 pub const CUTEAFD_STATUS_OK: CuteafdStatus = 0;
 pub const CUTEAFD_STATUS_CUDA_UNAVAILABLE: CuteafdStatus = 3;
 pub const CUTEAFD_STATUS_RDMA_UNAVAILABLE: CuteafdStatus = 7;
