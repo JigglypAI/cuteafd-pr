@@ -458,6 +458,62 @@ pub(crate) mod testing {
     }
     use std::os::unix::fs::FileExt;
 
+    #[test]
+    fn streamed_overlap_reverse_and_random_slots_keep_real_arena_within_charge() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use std::path::PathBuf;
+        let root = PathBuf::from(std::env::var_os("HOME").context("HOME")?)
+            .join(".cache/cuteafd/builds/dense-staging-order-fixture");
+        let fixture = Fixture::build_in(&root)?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        fixture.quiet_events(&library, true)?;
+        let source = tempfile::tempdir_in(fixture.directory())?;
+        let path = source.path().join("overlapping-k6");
+        let file = std::fs::File::create(&path)?;
+        let (count, bytes, stride) = (16384usize, 32768usize, 16384usize);
+        file.set_len((count * stride + bytes) as u64)?;
+        for random in [false, true] {
+            let steps = (0..count).map(|i| super::Step { device: 0,
+                rects: vec![super::Rect { name: format!("K6-{i}"), path: path.clone(),
+                    base: (i * stride) as u64, row_bytes: bytes, rows: 0..1, cols: 0..bytes }],
+                jobs: Vec::new() }).collect();
+            let layout = super::RankLayout::new(Vec::new(), steps, 0)?;
+            let charged = layout.host_staging.staging_bytes as u64;
+            assert!(charged < (count * bytes) as u64);
+            let checked = layout.checked(source.path(), 1, 0)?;
+            let expected = super::ExpectedCoverage::from_plan(&checked, 0)?;
+            let mut fragments = Vec::new();
+            for (i, (offset, _)) in layout.steps.iter().enumerate() {
+                for half in 0..2 {
+                    fragments.push((i * stride + half * bytes / 2, layout.base + offset + (half * bytes / 2) as u64));
+                }
+            }
+            fragments.sort_unstable();
+            let device = super::Device { library: &library, id: 0 };
+            let mut arena = super::DenseArena::new(device, layout, expected)?;
+            let payload = vec![0u8; bytes / 2];
+            let mut state = 0x517cc1b727220a95u64;
+            for slots in fragments.chunks_mut(cuteafd_ffi::push_ring::DEFAULT_SLOTS) {
+                if random {
+                    for i in (1..slots.len()).rev() {
+                        state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+                        slots.swap(i, state as usize % (i + 1));
+                    }
+                } else { slots.reverse(); }
+                for &(_, offset) in slots.iter() {
+                    super::PushDestination::copy_validation(&mut arena, offset, &payload)?;
+                    assert_eq!(arena.held, arena.staged + arena.pool.iter().map(|p| p.buffer.bytes as u64).sum::<u64>());
+                    assert!(arena.held <= charged, "open plus reusable pool exceeds admitted charge");
+                }
+            }
+            assert_eq!(arena.run, count);
+            super::PushDestination::done(arena)?;
+            PEAKS.with(|p| { p.take(); });
+        }
+        Ok(())
+    }
+
     /// A one-source fake SparkNest for one rank: packs the rank's planned runs
     /// into ring slots in plan order, Filled per slot (each written only after its
     /// previous use was released), then Done.
