@@ -33,6 +33,8 @@ Cards and quality findings are in the main README and each family doc.
 | Model · quant | Min | Max | Speculator | `POOL_TOKENS` |
 | --- | --- | --- | --- | --- |
 | [DeepSeek V4.1 Flash · MXFP4](../../docs/models/deepseek_v41.md) | [1 RTX + 3 Spark (TP3)](deepseek-v41-mxfp4-min.config) | [2 RTX + 6 Spark](deepseek-v41-mxfp4-max.config) | `DSPARK=on` | `auto` (exception, below) |
+| DeepSeek V4.1 Flash · MXFP4, release-only FP8/FP8 replies | - | [2 RTX + 6 Spark](deepseek-v41-mxfp4-max-fp8-reply.config) | `dspark` | `auto` |
+| DeepSeek V4.1 Flash · MXFP4, release-only NVFP4/NVFP4 replies | - | [2 RTX + 6 Spark](deepseek-v41-mxfp4-max-nvfp4-reply.config) | `dspark` | `auto` |
 | DeepSeek V4.1 Flash · StridedPLE (byte-identical FP8 Engram) | [1 RTX + 3 Spark](v41-flash-strided-min.config) | [2 RTX + 6 Spark](v41-flash-strided-max.config) | `dspark` | `auto` |
 | [DeepSeek V4 Flash · MXFP4](../../docs/models/deepseek_v4.md) | [1 RTX + 2 Spark](deepseek-v4-flash-mxfp4-min.config) | [2 RTX + 4 Spark](deepseek-v4-flash-mxfp4-max.config) | `dspark` | `auto` |
 | [DeepSeek V4 Pro · EXL3 K2](../../docs/models/deepseek_v4.md) | [1 RTX + 4 Spark](deepseek-v4-pro-exl3-min.config) | [2 RTX + 6 Spark](deepseek-v4-pro-exl3-max.config) | `dspark` | `auto` |

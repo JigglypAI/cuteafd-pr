@@ -532,8 +532,13 @@ def test_release_matrix_showcases_both_compressed_v41_reply_formats(matrix):
         assert not entry.get("run_args")
         assert entry["set"]["SPARK_PREFILL_REPLY_FORMAT"] == codec
         assert entry["set"]["SPARK_DECODE_REPLY_FORMAT"] == codec
-        config = (REPO / entry["config"]).read_text()
-        assert f"SPARK_PREFILL_REPLY_FORMAT={codec}" in config
-        assert f"SPARK_DECODE_REPLY_FORMAT={codec}" in config
-        assert "COORDINATOR_DOCKER_INFERENCE=ghcr.io/" in config
-        assert "SPARK_EXPERT_DOCKER_INFERENCE=ghcr.io/" in config
+        def config_values(path):
+            return dict(line.split("=", 1) for line in path.read_text().splitlines()
+                        if line and not line.startswith("#"))
+
+        config = config_values(REPO / entry["config"])
+        baseline = config_values(REPO / base["config"])
+        assert config == {**baseline, "SPARK_PREFILL_REPLY_FORMAT": codec,
+                          "SPARK_DECODE_REPLY_FORMAT": codec}
+        assert config["COORDINATOR_DOCKER_INFERENCE"].startswith("ghcr.io/")
+        assert config["SPARK_EXPERT_DOCKER_INFERENCE"].startswith("ghcr.io/")

@@ -204,17 +204,6 @@ def test_engine_build_kind_selects_reply_producers(monkeypatch, build_kind):
         names if build_kind == "release" else names[:6])
 
 
-def test_build_kind_is_internal_and_script_identity_driven():
-    cmake = (ROOT / "native/CMakeLists.txt").read_text()
-    assert 'set(CUTEAFD_BUILD_KIND "development")' in cmake
-    assert 'set(CUTEAFD_BUILD_KIND "${CUTEAFD_BUILD_KIND}" CACHE INTERNAL' in cmake
-    assert '"CUTEAFD_BUILD_KIND=${CUTEAFD_BUILD_KIND}"' in cmake
-    for script, kind in [("build-release-artifacts.sh", "release"), ("build-wip-artifacts.sh", "development")]:
-        assert f"-DCUTEAFD_BUILD_KIND={kind}" in (ROOT / "scripts/build" / script).read_text()
-    for script in ["dsv4_programs.cmake", "fp8_moe.cmake"]:
-        assert "${CUTEAFD_BUILD_KIND}|" in (ROOT / "native/cmake/shared" / script).read_text()
-
-
 @pytest.mark.parametrize("build_kind", [None, "development", "release"])
 def test_cmake_build_identity_preserves_release_argument(tmp_path, build_kind):
     import subprocess

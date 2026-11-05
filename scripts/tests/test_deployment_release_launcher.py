@@ -14,6 +14,8 @@ FIXTURES = Path(__file__).parent / "fixtures/deployment-launch"
 BASELINE_CAPTURES = {
     "glm53-exl3-k6core-min": "glm53-exl3-min",
     "glm53-exl3-k6core-max": "glm53-exl3-max",
+    "v41-flash-max-fp8-reply": "v41-flash-max",
+    "v41-flash-max-nvfp4-reply": "v41-flash-max",
 }
 
 
@@ -38,19 +40,21 @@ def release_entry(entry: dict) -> dict:
 def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: str | None, draft_kv: str) -> None:
     golden_name = BASELINE_CAPTURES.get(entry['name'], entry['name'])
     golden_text = (FIXTURES / f"{golden_name}.json").read_text()
-    if entry['name'] in BASELINE_CAPTURES:
+    if entry['name'].startswith('glm53-exl3-k6core-'):
         # Core storage changes inside the loader, not the launch ABI. Compare
         # against K4-v1's full capture, changing only checkpoint and endpoints.
         golden_text = golden_text.replace('models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-v1',
                                            'models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-Core-K6')
         golden_text = golden_text.replace('47af23347db743b4666d952e2eb48f2b01c3fede',
                                            '5a4e83a09a11f3145332ed632d28a9894ea88225')
+    if entry['name'] in BASELINE_CAPTURES:
         baseline = next(e for e in ENTRIES if e['name'] == golden_name)
         for key in ('ADDR', 'EXPERT_PORT'):
             old = baseline['set'][key].rsplit(':', 1)[-1]
             new = entry['set'][key].rsplit(':', 1)[-1]
             golden_text = golden_text.replace(':' + old, ':' + new)
             if key == 'EXPERT_PORT':
+                golden_text = golden_text.replace(':' + str(int(old) + 100), ':' + str(int(new) + 100))
                 for rank in range(len(entry['sparks'])):
                     golden_text = golden_text.replace(
                         f'cuteafd-spark-expert-worker-{rank}-{old}',
@@ -66,6 +70,28 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
     assert [run["host"] for run in current["containers"]] == [run["host"] for run in golden]
     for old, new in zip(golden, current["containers"]):
         before, after = namespace_launch_contract(parse_run(old["argv"])), parse_run(new["argv"])
+        if entry["name"].endswith(("-fp8-reply", "-nvfp4-reply")):
+            # The historical max capture used a WIP slot. These showcases use
+            # release images: remove only that slot's exact mounts/env/entrypoint.
+            before["options"].remove("--entrypoint /opt/cuteafd/share/release-entrypoint.sh")
+            for name, value in {
+                "PYTHONPATH": "/source/third_party/sparkinfer",
+                "PATH": "/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "CUTEAFD_NATIVE_LIB": "/opt/cuteafd/lib/libcuteafd_native.so",
+            }.items():
+                assert before["env"].pop(name) == value
+            root = f"<root>/hosts/{old['host']}/.cache/cuteafd/wip-run/gate/serve-default"
+            for source, destination in (("bin", "/opt/cuteafd/bin"), ("lib", "/opt/cuteafd/lib"),
+                                        ("share", "/opt/cuteafd/share"), ("source", "/source")):
+                before["mounts"].remove(f"{root}/{source}:{destination}:ro")
+            role_key = ("COORDINATOR_DOCKER_INFERENCE" if old["host"] == "coordinator"
+                        else "SPARK_EXPERT_DOCKER_INFERENCE")
+            before["image"] = selected["set"][role_key]
+            if old["host"] == "coordinator":
+                before["env"]["CUTEAFD_IMAGE"] = before["image"]
+                for phase in ("PREFILL", "DECODE"):
+                    key = f"CUTEAFD_SPARK_{phase}_REPLY_FORMAT"
+                    before["env"][key] = entry["set"][f"SPARK_{phase}_REPLY_FORMAT"]
         # Serving containers now run under --init (tini forwards SIGTERM to the daemon).
         if "--init" not in before["options"]:
             before["options"] = sorted([*before["options"], "--init"])

@@ -8,6 +8,7 @@ import dataclasses
 import importlib.util
 import json
 import re
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -431,20 +432,40 @@ def test_the_head_split_takes_no_wide_program(exporter):
     assert stems and not any("m128" in stem for stem in stems)
 
 
-def test_builds_export_the_wide_programs_unless_switched_off():
-    """CMake's CUTEAFD_GLMF_WIDE_DECODE_ROWS (default 128) reaches the exporter and its stamp; WIP
-    builds pass CUTEAFD_WIP_GLMF_WIDE_DECODE_ROWS through (0 leaves the wide programs out)."""
-    cmake = (ROOT / "native" / "CMakeLists.txt").read_text()
-    assert re.search(r'set\(CUTEAFD_GLMF_WIDE_DECODE_ROWS "128" CACHE STRING', cmake)
-    programs = (ROOT / "native" / "cmake" / "shared" / "dsv4_programs.cmake").read_text()
-    assert '--glmf-wide-decode-rows "${CUTEAFD_GLMF_WIDE_DECODE_ROWS}"' in programs
-    # The stamp holds the export arguments, so changing the switch exports again.
-    assert 'file(GENERATE OUTPUT "${stamp}" CONTENT "${CUTEAFD_DSV4_EXPORT_ARGS}\\n")' in programs
-    wip = (ROOT / "scripts" / "build" / "build-wip-artifacts.sh").read_text()
-    assert '-DCUTEAFD_GLMF_WIDE_DECODE_ROWS="${CUTEAFD_WIP_GLMF_WIDE_DECODE_ROWS:-128}"' in wip
-    assert '"CUTEAFD_WIP_GLMF_WIDE_DECODE_ROWS=${CUTEAFD_WIP_GLMF_WIDE_DECODE_ROWS:-128}"' in (ROOT / "wip.sh").read_text()
-    exporter = EXPORTER.read_text()
-    assert 'parser.add_argument("--glmf-wide-decode-rows", type=int, default=128,' in exporter
+def test_build_stamp_tracks_build_kind_and_wide_decode_rows(tmp_path):
+    """Configure the real module without CUDA; both inputs invalidate its stamp."""
+    source = tmp_path / "source"
+    source.mkdir()
+    module = ROOT / "native/cmake/shared/dsv4_programs.cmake"
+    (source / "CMakeLists.txt").write_text(f"""cmake_minimum_required(VERSION 3.24)
+project(stamp_contract NONE)
+set(CUTEAFD_CUDA_ARCHITECTURES 120)
+set(CUTEAFD_ENABLE_GLMF_AOT ON)
+set(CUTEAFD_CONTEXT_SPLIT_AOT OFF)
+set(CUTEAFD_DSV4_DECODE_ROWS 64)
+set(CUTEAFD_DSV4_PREFILL_ROWS 4096)
+set(CUTEAFD_DSV4_MAX_CONTEXT 1048576)
+add_custom_target(cuteafd_verify_sparkinfer_source)
+include("{module}")
+""")
+    build = tmp_path / "build"
+    stamps = {}
+    for kind in ("development", "release"):
+        for rows in (128, 0):
+            result = subprocess.run(
+                ["cmake", "-S", str(source), "-B", str(build),
+                 f"-DCUTEAFD_BUILD_KIND={kind}", f"-DCUTEAFD_GLMF_WIDE_DECODE_ROWS={rows}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            stamp = (build / "dsv4_programs.stamp").read_text()
+            identity, arguments = stamp.strip().split("|", 1)
+            assert identity == kind
+            argv = arguments.split(";")
+            assert argv[argv.index("--glmf-wide-decode-rows") + 1] == str(rows)
+            assert argv[argv.index("--geometry") + 1].startswith("glmf,glmf2,")
+            stamps[kind, rows] = stamp
+    assert len(set(stamps.values())) == 4
 
 
 @pytest.mark.parametrize("family,heads,index_topk,pool,record_bytes", [
