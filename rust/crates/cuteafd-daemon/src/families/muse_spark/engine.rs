@@ -63,7 +63,7 @@ fn at(base: Buffer, offset: usize, bytes: usize) -> Buffer {
     Buffer { ptr: base.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..base }
 }
 
-fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
+pub(crate) fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
     // SAFETY: plain-old-data integers, read as their in-memory bytes.
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
 }
@@ -105,7 +105,8 @@ impl<'a> StepStorage<'a> {
             seq_first: rows_of("seq_first", 4), page_slots: rows_of("page_slots", 8), step_slots: rows_of("step_slots", 8),
             page_table: Buffer { bytes: meta.page_table.len() * 4, ..planes["page_table"] },
             table_stride: meta.table_stride, prefill, wave,
-            trace: crate::shared::activation_trace::RowTrace::select(&meta.positions, prefill)? };
+            trace: crate::shared::activation_trace::RowTrace::select(&meta.positions, prefill)?,
+            segments: meta.segments.clone() };
         step.check(meta)?;
         Ok(step)
     }

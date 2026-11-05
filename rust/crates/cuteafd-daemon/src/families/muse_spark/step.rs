@@ -43,6 +43,8 @@ pub(crate) struct StepMetadata {
     pub page_table: Vec<i32>,
     /// Query-row stride in page ids; zero makes every prefill query share row 0.
     pub table_stride: usize,
+    /// Packed prefill members: local query range and its private shared table.
+    pub segments: Vec<(std::ops::Range<usize>, Vec<i32>)>,
 }
 
 impl StepMetadata {
@@ -54,14 +56,13 @@ impl StepMetadata {
     pub(crate) fn build(sequences: &[StepSequence<'_>], ring_rows: usize, slots: usize, step_capacity: usize,
         shared_table: bool) -> Result<Self> {
         ensure!(!sequences.is_empty() && ring_rows > 0, "Muse step without sequences or rings");
-        ensure!(!shared_table || sequences.len() == 1, "Muse prefill route runs one sequence per launch");
         let rows = sequences.iter().try_fold(0usize, |n, s| n.checked_add(s.rows)).context("Muse step rows")?;
         ensure!((1..=step_capacity).contains(&rows), "Muse step of {rows} rows outside 1..={step_capacity}");
         let stride = sequences.iter().map(|s| s.pages.len()).max().unwrap_or(0).max(1);
         let mut seen = std::collections::HashSet::new();
         let mut out = Self { positions: Vec::with_capacity(rows), ring_slots: Vec::with_capacity(rows),
             seq_first: Vec::with_capacity(rows), page_slots: Vec::with_capacity(rows), page_table: Vec::new(),
-            table_stride: if shared_table { 0 } else { stride } };
+            table_stride: if shared_table { 0 } else { stride }, segments: Vec::new() };
         for sequence in sequences {
             ensure!(sequence.rows > 0 && sequence.slot < slots && seen.insert(sequence.slot),
                 "Muse step sequence slot {} invalid or repeated", sequence.slot);
@@ -81,11 +82,14 @@ impl StepMetadata {
             for p in sequence.start..end {
                 out.positions.push(i64::try_from(p)?);
                 out.ring_slots.push(base + (p % ring_rows) as i64);
-                out.seq_first.push(first);
+                out.seq_first.push(if shared_table && sequences.len() > 1 { 0 } else { first });
                 out.page_slots.push(i64::from(sequence.pages[p / PAGE_ROWS]) * PAGE_ROWS as i64 + (p % PAGE_ROWS) as i64);
                 if !shared_table { out.page_table.extend_from_slice(&table); }
             }
-            if shared_table { out.page_table = table; }
+            if shared_table {
+                if sequences.len() > 1 { out.segments.push((first as usize..out.positions.len(), table.clone())); }
+                if out.page_table.is_empty() { out.page_table = table; }
+            }
         }
         Ok(out)
     }
@@ -170,6 +174,54 @@ mod tests {
     }
 
     #[test]
+    fn packed_members_rebase_swa_records_but_keep_private_tables_rings_and_marks() -> Result<()> {
+        use crate::shared::prefill_packing::{plan, Limits};
+        use cuteafd_loader::families::muse_spark::cache::StateAt;
+        let cfg = cuteafd_loader::families::muse_spark::MuseSparkConfig::from_hf(
+            &cuteafd_loader::plan::testing::muse_spark_config())?;
+        for ranks in [1, 2] {
+            let cache = MuseCacheLayout::new(&cfg, ranks)?;
+            let state = MuseStateLayout::new(&cfg, &cache, 4)?;
+            let ring = state.ring.rows as usize;
+            let a = (10..60).collect::<Vec<_>>();
+            let b = vec![91, 97];
+            let sequences = [StepSequence { slot: 1, start: ring + 63, rows: 65, pages: &a },
+                StepSequence { slot: 3, start: 7, rows: 29, pages: &b }];
+            let segments = plan(&sequences.iter().map(|s| (s.start, s.rows)).collect::<Vec<_>>(),
+                &Limits { rows: 128, chunk_rows: 128, max_context: 8192, taps: Some(128) })?;
+            let packed = StepMetadata::build(&sequences, ring, 4, 128, true)?;
+            assert_eq!(packed.segments.len(), 2);
+            assert_ne!(packed.segments[0].1, packed.segments[1].1, "tables must not alias or be reused on host");
+            assert_eq!(segments[1].tap_offset, segments[0].tap_rows);
+            for (i, sequence) in sequences.iter().enumerate() {
+                let (range, table) = &packed.segments[i];
+                let alone = StepMetadata::build(&[sequence.clone()], ring, 4, 128, true)?;
+                assert_eq!(&packed.positions[range.clone()], alone.positions);
+                assert_eq!(&packed.ring_slots[range.clone()], alone.ring_slots);
+                assert_eq!(&packed.page_slots[range.clone()], alone.page_slots);
+                assert_eq!(&table[..sequence.pages.len()], alone.page_table);
+                assert!(packed.seq_first[range.clone()].iter().all(|&first| first == 0));
+                for local in 0..range.len() {
+                    let position = packed.positions[range.start + local];
+                    let step_key = position - sequence.start as i64;
+                    assert_eq!(range.start + step_key as usize, range.start + local);
+                }
+                let mark_slot = (i + 5) as u64;
+                for copy in state.capture(sequence.slot as u64, (sequence.start + sequence.rows) as u64, mark_slot)? {
+                    let (StateAt::Ring(source), StateAt::Mark(destination)) = (copy.source, copy.destination)
+                        else { panic!("capture direction") };
+                    assert!(destination >= mark_slot * state.mark_bytes());
+                    assert!(destination + copy.bytes <= (mark_slot + 1) * state.mark_bytes());
+                    let layer = source / (4 * ring as u64 * state.row_bytes);
+                    let base = state.ring_offset(layer as usize, sequence.slot as u64);
+                    assert!(source >= base && source + copy.bytes <= base + ring as u64 * state.row_bytes);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn malformed_steps_refuse_before_any_launch() {
         let pages: Vec<u32> = vec![0];
         let one = |slot, start, rows| StepSequence { slot, start, rows, pages: &pages };
@@ -181,7 +233,7 @@ mod tests {
         let many: Vec<u32> = (0..2).collect();
         assert!(StepMetadata::build(&[StepSequence { slot: 0, start: 0, rows: 65, pages: &many }], 2112, 4, 4096, false)
             .is_err(), "a verify step past the rollback step");
-        assert!(StepMetadata::build(&[one(0, 0, 1), one(1, 0, 1)], 2112, 4, 64, true).is_err(), "prefill is one sequence");
+        assert!(StepMetadata::build(&[one(0, 0, 1), one(1, 0, 1)], 2112, 4, 64, true).is_ok());
     }
 
     /// Records written through `kv_slots` land where the attention reads them:

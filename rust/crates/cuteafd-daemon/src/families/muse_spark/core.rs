@@ -12,6 +12,7 @@ use cuteafd_loader::families::muse_spark::weight_layout::{projection_key, Projec
 use std::{collections::BTreeMap, ffi::c_void};
 
 pub(crate) struct CorePrograms<'a> {
+    exact_cap: usize,
     projections: BTreeMap<(ProjectionKey, ProjectionOutput), Projection<'a>>,
     pub(crate) scratch: Option<ProjectionScratch<'a>>,
 }
@@ -67,8 +68,16 @@ impl<'a> CorePrograms<'a> {
             }
             _ => anyhow::bail!("Muse K6 programs and admitted scratch disagree on presence"),
         };
-        Ok(Self { projections, scratch })
+        let exact_cap = crate::shared::prefill_packing::coordinator_row_cap(programs,
+            projections.values().flat_map(|projection| {
+                let policy = projection.program.policy();
+                [&policy.native_input, &policy.native, &policy.output_program].into_iter()
+                    .map(|name| (name.as_str(), crate::shared::prefill_packing::ProgramRows::PackedRows))
+            }), usize::MAX)?;
+        Ok(Self { projections, scratch, exact_cap })
     }
+
+    pub(crate) fn packed_cap(&self) -> usize { self.exact_cap }
 
     fn projection(&self, weights: &CoreWeights<'_>, output: ProjectionOutput) -> Result<&Projection<'a>> {
         let key = projection_key(&cuteafd_loader::formats::trellis_core::CoreWeightLayout {

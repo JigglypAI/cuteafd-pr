@@ -949,12 +949,20 @@ def test_fixture_and_spark_argument_refusals(env, capsys, extra, match):
     assert not runs(env)
 
 
-@pytest.mark.parametrize('family', ['kimi', 'muse'])
+@pytest.mark.parametrize('family', ['kimi'])
 def test_raw_family_requires_raw_mode(env, capsys, family):
     write_slot(env['home'], 'i1')
     argv = ['--task', 'gr', '--family', family, '--model', 'org/model', '--arm', 'a=i1:s1', '--', '--x']
     assert golden.main(argv) == 2
     assert 'has no golden subcommand' in capsys.readouterr().err
+
+
+def test_muse_golden_routes_packing_and_worker_arguments():
+    args = ['--snapshot', '{snapshot}', '--golden', '/reference', '--packed-check', '4',
+            '--prefill-packing', 'unrestricted', '--peers', '{peers}']
+    assert golden.golden_args('muse', args, sparks=True) == ['muse-golden', *args]
+    with pytest.raises(ValueError, match='Spark peers come from'):
+        golden.golden_args('muse', args, sparks=False)
 
 
 def test_muse_command_runs_from_sealed_slot_without_sparks(env):

@@ -18,7 +18,7 @@ pub(crate) const FAMILIES: &[(&str, &str, Option<&str>)] = &[
     ("qwen3_5", "serve-qwen35", Some("qwen35-golden")),
     ("kimi_k3", "serve-kimi", Some("kimi-golden")),
     ("step5", "serve-step5", Some("step5-golden")),
-    ("muse_spark", "serve-muse", None),
+    ("muse_spark", "serve-muse", Some("muse-golden")),
 ];
 
 #[derive(Debug, clap::Args)]

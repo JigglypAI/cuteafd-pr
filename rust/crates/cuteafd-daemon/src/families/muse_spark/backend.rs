@@ -119,8 +119,8 @@ impl scheduler::DraftState for DraftState {
 }
 
 pub(crate) struct MuseBackend<'r, 'a> {
-    cfg: &'r MuseSparkConfig,
-    ranks: &'r [RankResources<'a>],
+    pub(crate) cfg: &'r MuseSparkConfig,
+    pub(crate) ranks: &'r [RankResources<'a>],
     streams: Vec<*mut c_void>,
     table: &'r TokenEmbedding<'a>,
     experts: RefCell<&'r mut dyn SparkExperts>,
@@ -129,7 +129,9 @@ pub(crate) struct MuseBackend<'r, 'a> {
     profile: RefCell<[f64; 2]>,
     media_binding: super::media::Binding,
     /// Prefill units: rows and waves in flight; the sequence slots, context, pool pages.
-    unit_rows: usize,
+    pub(crate) unit_rows: usize,
+    packed_row_cap: Option<usize>,
+    pub(crate) packed_fallback_reason: String,
     waves: usize,
     slots: usize,
     context: usize,
@@ -151,7 +153,7 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         table: &'r TokenEmbedding<'a>, experts: &'r mut dyn SparkExperts, peer: Option<&'r super::peer::MusePeer<'a>>,
         unit_rows: usize, waves: usize, slots: usize, context: usize, pages: usize,
         local: Vec<super::onboard::OnboardedExperts<'a>>, draft: Option<super::draft::MuseDraft<'a>>,
-        pricing: Option<DraftPricing>, media_binding: super::media::Binding) -> Result<Self> {
+        pricing: Option<DraftPricing>, media_binding: super::media::Binding, packing: crate::shared::prefill_packing::PackingMode) -> Result<Self> {
         ensure!(draft.is_some() == pricing.is_some(), "Muse drafter and its policy pricing come together");
         // Every Muse layer is MoE; the probe rings the head rank's route ids per layer.
         let head = ranks.last().context("Muse backend without ranks")?.device;
@@ -163,12 +165,32 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
             && (local.is_empty() || local.len() == ranks.len()) && table.vocab() == cfg.vocab_size && table.hidden() == cfg.hidden,
             "Muse backend geometry differs from its ranks, embedding or layers");
         let ring_rows = usize::try_from(cuteafd_loader::placement::families::muse_spark::ring_rows(cfg)?)?;
+        let (packed_row_cap, packed_fallback_reason) = if packing == crate::shared::prefill_packing::PackingMode::Exact {
+            let mut cap = unit_rows;
+            for rank in ranks { cap = cap.min(rank.programs.packed_cap()).min(rank.core.packed_cap()); }
+            let mut reasons = Vec::new();
+            if cap == 0 { reasons.push("coordinator program has no exact_row_cap attestation"); }
+            // As in GLM, grouping/capacity does not attest native EXL3 arithmetic.
+            if !local.is_empty() { reasons.push("onboarded EXL3 TP2/whole backend has no arithmetic-route attestation"); }
+            reasons.push("Spark EXL3 backend has no arithmetic-route attestation");
+            let reason = reasons.join("; ");
+            tracing::info!(reason = %reason, "exact Muse packed prefill disabled; requests run alone");
+            (Some(0), reason)
+        } else { (None, String::new()) };
         Ok(Self { cfg, ranks, streams, table, experts: RefCell::new(experts), peer, library: ranks[0].device.library,
-            profile: RefCell::new([0.0; 2]), media_binding, unit_rows, waves, slots, context, pages, ring_rows,
+            profile: RefCell::new([0.0; 2]), media_binding, unit_rows, packed_row_cap, packed_fallback_reason, waves, slots, context, pages, ring_rows,
             local: RefCell::new(local), draft, pricing, probe: RefCell::new(probe) })
     }
 
     fn head_rank(&self) -> usize { self.ranks.len() - 1 }
+
+    pub(super) fn diagnostic_sync(&self) -> Result<()> {
+        for (rank, &stream) in self.ranks.iter().zip(&self.streams) {
+            // SAFETY: the backend retains these streams and all their producers.
+            rank.device.run(|| unsafe { self.library.cuda_stream_synchronize(stream) })?;
+        }
+        Ok(())
+    }
 
     fn shutdown(&self) -> Result<()> {
         let result = super::engine::shutdown(&mut **self.experts.borrow_mut(), self.peer, self.ranks, &self.streams);
@@ -297,6 +319,68 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
     }
     fn log_table_stats(&self, _phase: &str) {}
 
+    fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
+        Some(crate::shared::prefill_packing::Limits {
+            // Exact mode is narrowed by the loaded coordinator/expert attestation.
+            rows: self.unit_rows, chunk_rows: self.unit_rows, max_context: self.context,
+            taps: self.draft.as_ref().map(|_| crate::shared::speculation::dflash::TAP_ROWS),
+        })
+    }
+    fn coordinator_packed_cap(&self) -> Result<Option<usize>> {
+        Ok(self.packed_row_cap)
+    }
+    fn prefill_packed(&self, sequences: &mut [scheduler::PrefillSeq<'_, Placement, DraftState>],
+        _pool: &RefPagePool,
+        on_logits: &mut dyn FnMut(usize, DeviceLogits) -> crate::shared::prefill_packing::MemberOutcome)
+        -> Result<Vec<Result<()>>> {
+        use crate::shared::prefill_packing;
+        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown(), || {
+            let limits = self.checked_packed_limits()?.context("Muse packing limits")?;
+            let chunks = sequences.iter().map(|s| (s.placement.len, s.tokens.len())).collect::<Vec<_>>();
+            let segments = prefill_packing::plan(&chunks, &limits)?;
+            let mut tokens = Vec::new();
+            let mut packed = Vec::new();
+            for (sequence, &segment) in sequences.iter().zip(&segments) {
+                ensure!(sequence.start == sequence.placement.len && sequence.placement.media.as_ref()
+                    .is_none_or(|media| media.spans().is_empty()), "Muse packed member frontier/media");
+                tokens.extend_from_slice(sequence.tokens);
+                packed.push((super::step::StepSequence { slot: sequence.placement.slot, start: segment.start,
+                    rows: segment.rows, pages: &sequence.placement.pages }, segment));
+            }
+            let units = vec![crate::shared::prefill_pipeline::Unit { index: 0, sequence: 0, segments: Vec::new(),
+                rows: 0..tokens.len(), layers: 0..self.cfg.layers, slot: 0, barrier: false }];
+            let mut ends = self.peer.map(|peer| (0..2).map(|rank| peer.rank(rank)).collect::<Vec<_>>()).unwrap_or_default();
+            let peers = ends.iter_mut().map(|end| end as &mut dyn super::device::PeerExchange).collect();
+            let mut experts = self.experts.borrow_mut();
+            let mut local = self.local.borrow_mut();
+            let call = PrefillCall { packed, request: 0, slot: 0, start: 0, tokens: &tokens, pages: &[],
+                ring_rows: self.ring_rows, slots: self.slots, logit_rows: 0, media: None };
+            let mut hooks = MusePrefill::new(self.cfg, self.ranks, self.streams.clone(), self.table, &mut **experts,
+                peers, call, &mut local, self.draft.as_ref(), 1)?;
+            // Eager launches only: changing segment geometry never captures a graph.
+            crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &units, self.waves)?;
+            drop(hooks);
+            for (sequence, segment) in sequences.iter_mut().zip(&segments) {
+                sequence.placement.len = segment.start + segment.rows;
+                if sequence.neural {
+                    let draft = self.draft.as_ref().context("Muse packed drafter not admitted")?;
+                    draft.update_rows(sequence.placement.slot, segment.tap_offset,
+                        segment.start + segment.rows - segment.tap_rows, segment.tap_rows)?;
+                    if !sequence.draft.ready && sequence.draft.valid_from > segment.start { sequence.draft.valid_from = segment.start; }
+                    if segment.start == 0 { sequence.draft.valid_from = 0; }
+                    sequence.draft.ready = true;
+                    sequence.draft.anchor = sequence.next;
+                }
+            }
+            prefill_packing::finish_members(segments.len(), |i| {
+                let rank = &self.ranks[self.head_rank()];
+                let row = segments[i].end_row() - 1;
+                let logits = rank.device.run(|| forward::head(self.cfg, rank, &rank.lane.views,
+                    row..row + 1, self.streams[self.head_rank()]))?;
+                Ok(self.logits(logits, 1))
+            }, on_logits)
+        })
+    }
     fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize, _pool: &RefPagePool)
         -> Result<Option<DeviceLogits>> {
         crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown(), || {
@@ -315,7 +399,7 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
             let peers = ends.iter_mut().map(|end| end as &mut dyn super::device::PeerExchange).collect();
             let mut experts = self.experts.borrow_mut();
             let mut local = self.local.borrow_mut();
-            let call = PrefillCall { request: placement.slot as u64 + 1, slot: placement.slot, start: placement.len, tokens,
+            let call = PrefillCall { packed: Vec::new(), request: placement.slot as u64 + 1, slot: placement.slot, start: placement.len, tokens,
                 pages: &placement.pages, ring_rows: self.ring_rows, slots: self.slots, media: placement.media.as_ref(), logit_rows };
             let mut hooks = MusePrefill::new(self.cfg, self.ranks, self.streams.clone(), self.table, &mut **experts, peers,
                 call, &mut local, self.draft.as_ref(), units.len())?;
@@ -447,6 +531,21 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn packed_member_callback_failure_does_not_abort_its_partners() -> Result<()> {
+        use crate::shared::{prefill_packing::finish_members, token_io::DeviceLogits};
+        let mut consumed = Vec::new();
+        let outcomes = finish_members(3, |_| Ok(DeviceLogits {
+            ptr: std::ptr::null(), rows: 1, vocab: 1, stride: 1, stream: std::ptr::null_mut(), greedy: None,
+        }), &mut |member, _| {
+            consumed.push(member);
+            Ok(if member == 1 { Err(anyhow::anyhow!("client cancelled")) } else { Ok(()) })
+        })?;
+        assert_eq!(consumed, [0, 1, 2]);
+        assert!(outcomes[0].is_ok() && outcomes[1].is_err() && outcomes[2].is_ok());
+        Ok(())
+    }
 
     #[test]
     fn step_media_packs_partial_image_and_audio_spans_at_sequence_offsets() -> Result<()> {

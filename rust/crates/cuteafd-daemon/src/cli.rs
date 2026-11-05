@@ -133,6 +133,9 @@ pub(crate) enum Commands {
     /// execution engine is not built yet, so startup stops after admission.
     #[command(hide = true)]
     ServeMuse(crate::families::muse_spark::serve::ServeArgs),
+    /// Qualify Muse packed prefill against the immutable official reference.
+    #[command(hide = true)]
+    MuseGolden(crate::families::muse_spark::packed_check::GoldenArgs),
     /// Serve dense Qwen BF16 through the shared Qwen scheduler.
     #[command(hide = true)]
     ServeQwen35(crate::families::qwen3_5::serve::ServeArgs),

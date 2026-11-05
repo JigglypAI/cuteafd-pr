@@ -685,10 +685,15 @@ def test_muse_dflash2_resolves_one_snapshot_for_plan_and_serve(tmp_path: Path, d
     assert "--draft-fp8" not in serve.split()
 
 
+@pytest.mark.parametrize("mode", ["unrestricted", "exact"])
+def test_muse_forwards_supported_packing_modes(tmp_path: Path, mode: str) -> None:
+    serve = _line(_muse(tmp_path, f"PREFILL_PACKING={mode}\n"), "cuteafd serve-muse --snapshot")
+    assert _flag(serve, "--prefill-packing") == mode
+
+
 @pytest.mark.parametrize("keys,diagnostic", [
     ("ATTENTION_PLACEMENT=layers\n", "supports only ATTENTION_PLACEMENT=auto"),
     ("SPECULATOR=mtp\n", "SPECULATOR=mtp does not apply to muse_spark"),
-    ("PREFILL_PACKING=unrestricted\n", "Muse Spark has no packed prefill yet (#923)"),
     ("SPECULATOR=dflash2\nSPECULATOR_MODEL_ID=RadixArk/Muse-Spark-Open-DFlash2\nDRAFT_KV_CACHE=fp16\n",
      "DRAFT_KV_CACHE must be bf16 or fp8"),
 ])
