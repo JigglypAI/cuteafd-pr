@@ -274,22 +274,18 @@ fn glm53_max_deployment_runs_three_2752_row_units() {
 
     options.layout.as_mut().unwrap().host_memory = Some((20 << 30, 15 << 30));
     let capped = input.plan_spark_count(&options, 6, Some(6)).unwrap();
-    assert!(capped.executable(), "{}", cuteafd_loader::plan::render(&capped));
-    assert_eq!(capped.prefill_waves, Some(3));
-    assert!(capped.prefill_unit_rows.is_some_and(|rows| rows > 0 && rows < 2752));
-    assert!(capped.prefill_reserve_rows.is_some_and(|rows| rows > 0 && rows < 8192));
-    let host = capped.host_ledger.as_ref().unwrap();
-    assert_eq!((host.total_bytes, host.available_bytes), (20 << 30, 15 << 30));
-    assert_eq!(host.shortfall_bytes, 0);
-    release_accepts_prefill(&serde_json::to_vec(
-        &DeploymentSpec::from_report(&capped, &launch).unwrap()).unwrap());
+    // Whole-process load RSS plus physical headroom cannot fit, even with tiny
+    // prefill units. The former workspace-only host ledger missed this owner.
+    assert!(!capped.executable());
+    assert!(capped.hints.iter().any(|hint| hint.what.contains("coordinator host RAM")
+        && hint.what.contains("checkpoint loading")), "{:?}", capped.hints);
+    assert!(!DeploymentSpec::from_report(&capped, &launch).unwrap().executable);
 
     options.layout.as_mut().unwrap().prefill_rows = 2752;
     let refused = input.plan_spark_count(&options, 6, Some(6)).unwrap();
     assert_eq!(refused.prefill_unit_rows, Some(2752));
     assert!(!refused.executable());
-    assert!(refused.host_ledger.as_ref().unwrap().shortfall_bytes > 0);
-    assert!(refused.hints.iter().any(|hint| hint.what.contains("coordinator host memory shortfall")));
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("coordinator host RAM")));
 }
 
 fn installed_example_snapshot(model_id: &str, revision: Option<&str>, hf_home: &std::path::Path)

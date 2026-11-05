@@ -462,59 +462,36 @@ fn mimo_split_links_charge_decode_and_each_prefill_return_slot() {
 
 #[test]
 fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
-    use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
-    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
-    let input = PlanInput::open(dir.path()).unwrap();
-    let mut report = input.plan(&sparks(4)).unwrap();
-    let spec = report.spec.as_ref().unwrap();
-    let moe = spec.moe.as_ref().unwrap();
-    let geometry = ExpertGeometry { hidden: spec.hidden as u32, experts: moe.experts as u32,
-        topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: spec.layers.len() as u32 };
-    let vocab = spec.vocab as u64;
-    let mut options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-        host_cache_bytes: Some(0), full_prefill_logits: true, prefill_lanes: 1,
-        prefill_rows: 4096, ..Default::default() };
-    report.prefill_transports = Some(1);
-    for native in [false, true] {
-        for (unit, waves, span) in [(4096, 1, 4096), (4096, 2, 8192), (2752, 3, 8256), (2048, 4, 8192), (2048, 2, 4096)] {
-            options.prefill_rows = span;
-            options.prefill_unit_rows = Some(unit);
-            options.prefill_waves = waves;
-            report.prefill_span_rows = Some(span);
-            for family in ["glm5", "glm5_flash"] {
-                report.family = Some(family.into());
-                layout::charge_host(&mut report, &options, &input, native).unwrap();
-                assert_eq!(report.prefill_span_rows, Some(span));
-                let host = report.host_ledger.as_ref().unwrap();
-                let bytes = |name: &str| host.items.iter().find(|i| i.group == name).unwrap().bytes;
-                if family == "mimo_v2" {
-                    let cfg = MimoV2Config::from_hf(&input.checkpoint().config).unwrap();
-                    let expected = crate::families::mimo_v2::admission::future_host_workspaces(&cfg,
-                        unit as usize, waves as usize, 1, 0, options.context_tokens.max(1) as usize,
-                        4, options.mimo_expert_input, crate::families::mimo_v2::MimoKvFormats::default(),
-                        crate::families::mimo_v2::MimoPrefillOutput::AllRows, true, unit.min(256) as usize, 0).unwrap();
-                    for (name, expected) in expected { assert_eq!(bytes(&name), expected, "{name}"); }
-                    assert_eq!(bytes("scoring/full-logits"), span * vocab * 4);
-                    continue;
+    use cuteafd_core::{SparkIngress, SparkRings};
+    use crate::placement::{families::glm5::admission::production_links,
+        planner::{Location, PrefillShape}, SparkWaveStaging};
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&glm5_config()).unwrap();
+    let rings = SparkRings { max_frame_bytes: 128 << 20, depth: 8,
+        slot_bytes: 8 << 20, alignment: 4096 };
+    for ingress in [SparkIngress::Bf16, SparkIngress::Fp8K32] {
+        for (rows, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4), (2048, 2)] {
+            let (decode, prefill) = production_links(&cfg, 4, PrefillShape { rows, waves },
+                ingress, rings, Default::default()).unwrap();
+            for (link, rows, waves) in [(decode.unwrap(), 64, 1), (prefill.unwrap(), rows, waves)] {
+                let geometry = link.geometry();
+                assert_eq!((geometry.intake.rows, geometry.intake.waves), (rows, waves as usize));
+                let expected_rings = geometry.endpoints.endpoint.ring_bytes(
+                    geometry.endpoints.geometry, rings).unwrap() as u64 * 4;
+                let expected_return = cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
+                    rows * waves * cfg.hidden as u64 * 2).unwrap();
+                let expected_slot = geometry.endpoints.geometry.compact_wire_bytes(rows as u32,
+                    ingress == SparkIngress::Bf16).unwrap().0 as u64;
+                assert!(matches!(geometry.waves.staging, SparkWaveStaging::Registered { slot_bytes }
+                    if slot_bytes == expected_slot));
+                for candidate in link.candidates() {
+                    let rings: u64 = candidate.owners.iter().filter(|a|
+                        a.group == "Spark endpoint rings").map(|a| a.bytes).sum();
+                    assert_eq!(rings, expected_rings);
+                    let returns: Vec<_> = candidate.owners.iter().filter(|a|
+                        a.location == Location::coordinator(0) && a.group == "Spark intake").collect();
+                    assert_eq!(returns.len(), 4);
+                    assert!(returns.iter().all(|a| a.bytes == expected_return));
                 }
-                let endpoints = layout::spark_endpoints(family, 1) as u64;
-                let ingress = if !native && family == "glm5" { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
-                let endpoint = SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress, partial_reply_bytes: None };
-                let (frame_request, response) = endpoint.wire_bytes(geometry).unwrap();
-                let request = geometry.compact_wire_bytes(unit as u32,
-                    !native && input.checkpoint().spark_input_is_bf16()).unwrap().0;
-                let rings = SparkRings { max_frame_bytes: (64 << 20).max(frame_request).max(response),
-                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
-                assert_eq!(bytes("transport/rdma-rings"), endpoint.ring_bytes(geometry, rings).unwrap() as u64
-                    * endpoints * 4, "{family} {unit}x{waves}");
-                assert_eq!(bytes("transport/egress"), request as u64 * waves * endpoints);
-                assert_eq!(bytes("spark-intake"), unit * waves * geometry.hidden as u64
-                    * if native { 4 } else { 2 } * endpoints * 4);
-                if family == "glm5" {
-                    assert!(!host.items.iter().any(|item| item.group == "workspace/router"));
-                }
-                assert_eq!(bytes("staging/tables-and-sync"), (unit + 64) * geometry.hidden as u64 * 8 + (2 << 20));
-                assert_eq!(bytes("scoring/full-logits"), span * vocab * 4);
             }
         }
     }
