@@ -58,7 +58,7 @@ fn qualify(mut args: GoldenArgs) -> Result<()> {
         packed_check::check::<_, DraftState>(backend.library(), &prompts, packed, alone, limits, neural,
             args.engine.prefill_packing == PackingMode::Exact,
             |s| singleton(backend, s, cache.pool()),
-            |s, callback| packed(backend, s, cache.pool(), callback),
+            |s, callback| packed_unit(backend, s, cache.pool(), callback),
             |p| snapshot_and_restore(backend, &family, p, 2 * members, cache.pool(), &continuation))?;
         if args.engine.prefill_packing == PackingMode::Exact {
             println!("exact Muse packing fails closed on EXL3 at this pin: {}", backend.packed_fallback_reason);
@@ -79,7 +79,7 @@ fn qualify(mut args: GoldenArgs) -> Result<()> {
             &serde_json::json!([]), "meta-models/Muse-Spark-Open-816B-A42B", None)?;
         packed_check::reference::<_, DraftState>(backend.library(), &selected, placements, controls, limits, neural, &precision,
             |s| singleton(backend, s, cache.pool()),
-            |s, callback| packed(backend, s, cache.pool(), callback))
+            |s, callback| packed_unit(backend, s, cache.pool(), callback))
     })
 }
 
@@ -91,7 +91,7 @@ fn singleton(backend: &MuseBackend<'_, '_>, s: &mut PrefillSeq<'_, Placement, Dr
     Ok(logits)
 }
 
-fn packed(backend: &MuseBackend<'_, '_>, sequences: &mut [PrefillSeq<'_, Placement, DraftState>],
+fn packed_unit(backend: &MuseBackend<'_, '_>, sequences: &mut [PrefillSeq<'_, Placement, DraftState>],
     pool: &RefPagePool,
     callback: &mut dyn FnMut(usize, crate::shared::token_io::DeviceLogits)
         -> crate::shared::prefill_packing::MemberOutcome) -> Result<Vec<Result<()>>> {
