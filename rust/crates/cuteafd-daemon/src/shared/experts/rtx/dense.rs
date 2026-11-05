@@ -460,6 +460,7 @@ pub(crate) mod testing {
 
     #[test]
     fn streamed_overlap_reverse_and_random_slots_keep_real_arena_within_charge() -> Result<()> {
+        use anyhow::Context;
         use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
         use std::path::PathBuf;
         let root = PathBuf::from(std::env::var_os("HOME").context("HOME")?)
@@ -494,19 +495,30 @@ pub(crate) mod testing {
             let mut arena = super::DenseArena::new(device, layout, expected)?;
             let payload = vec![0u8; bytes / 2];
             let mut state = 0x517cc1b727220a95u64;
-            for slots in fragments.chunks_mut(cuteafd_ffi::push_ring::DEFAULT_SLOTS) {
-                if random {
-                    for i in (1..slots.len()).rev() {
-                        state ^= state << 13; state ^= state >> 7; state ^= state << 17;
-                        slots.swap(i, state as usize % (i + 1));
-                    }
-                } else { slots.reverse(); }
-                for &(_, offset) in slots.iter() {
+            let per_slot = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / payload.len();
+            let slots = fragments.chunks(per_slot).collect::<Vec<_>>();
+            let mut deliver = |slot: usize| -> Result<()> {
+                for &(_, offset) in slots[slot] {
                     super::PushDestination::copy_validation(&mut arena, offset, &payload)?;
                     assert_eq!(arena.held, arena.staged + arena.pool.iter().map(|p| p.buffer.bytes as u64).sum::<u64>());
                     assert!(arena.held <= charged, "open plus reusable pool exceeds admitted charge");
                 }
+                Ok(())
+            };
+            // Delay one actual 1 MiB slot across every refill. The remaining
+            // 127 slots keep cycling; the hole's partial windows stay open.
+            let delayed = 1;
+            let mut pending = (0..slots.len()).filter(|&i| i != delayed).collect::<Vec<_>>();
+            for batch in pending.chunks_mut(cuteafd_ffi::push_ring::DEFAULT_SLOTS - 1) {
+                if random {
+                    for i in (1..batch.len()).rev() {
+                        state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+                        batch.swap(i, state as usize % (i + 1));
+                    }
+                } else { batch.reverse(); }
+                for &slot in batch.iter() { deliver(slot)?; }
             }
+            deliver(delayed)?;
             assert_eq!(arena.run, count);
             super::PushDestination::done(arena)?;
             PEAKS.with(|p| { p.take(); });
