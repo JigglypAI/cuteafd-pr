@@ -226,6 +226,12 @@ impl<'a> GlmEngine<'a> {
             weight.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input)
     }
 
+    /// Remote routed output already includes the complete shared down-core
+    /// egress on rank 0. Rank 1 has no second BF16 contribution in this case.
+    pub(super) fn shared_zero_elided(&self, index: usize, layer: &GlmLayer<'_>) -> bool {
+        !layer.dense && Self::core_split(layer, "down") && !self.tp2_layer(index)
+    }
+
     /// Native cores occupy a disjoint partition of each existing receive slot:
     /// the following routed/BF16 publication must not overwrite a live core.
     fn core_received(&self, rank: usize, slot: usize, rows: usize) -> Result<Buffer> {
@@ -280,7 +286,13 @@ impl<'a> GlmEngine<'a> {
         layer: &GlmLayer<'_>, weight: *mut c_void, rows: Scalar,
         first: *mut c_void, second: *mut c_void) -> Result<()> {
         if layer.dense { self.projection_norm(rank, index, lane, w, layer, "down", weight, rows, first, second) }
-        else { self.norm_full(rank, w, weight, 2, rows, first, second) }
+        else {
+            // A BF16 delta plus +0 is redundant on real model data. Elision
+            // preserves -0 instead of canonicalizing it and can preserve NaN
+            // payloads differently; native goldens gate byte-exact real data.
+            let deltas = if self.shared_zero_elided(index, layer) { 1 } else { 2 };
+            self.norm_full(rank, w, weight, deltas, rows, first, second)
+        }
     }
 
     pub(super) fn meet_shared_core(&self, rank: usize, index: usize, w: &Workspace<'_>,
@@ -291,6 +303,10 @@ impl<'a> GlmEngine<'a> {
         self.exchange()?.wait(rank, slot(index, true, w.lane))?;
         if rank == 0 {
             self.reduce_projection(rank, index, w.lane, w, layer, "down", rows, w.shared.buffer)
+        } else if self.shared_zero_elided(index, layer) {
+            // The later routed-result wait (also on the terminal layer) orders
+            // retained-core reuse after rank 0's reader. No zero buffer is read.
+            Ok(())
         } else {
             // SAFETY: only rank 0 contributes shared; this rank's combine reads
             // its zeroed BF16 buffer after this operation on the same stream.

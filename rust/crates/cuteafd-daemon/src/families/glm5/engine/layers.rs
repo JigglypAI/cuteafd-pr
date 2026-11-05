@@ -227,7 +227,9 @@ impl Bindings<'_, '_, '_, '_, '_> {
         for rank in 0..2 {
             let w = self.work[rank];
             self.segment(rank, index, GlmOwnedPhase::FfnJoin, || {
-                e.exchange()?.wait(rank, slot(index, true, self.lane))?;
+                if rank == 1 || !e.shared_zero_elided(index, self.layer(rank, index)) {
+                    e.exchange()?.wait(rank, slot(index, true, self.lane))?;
+                }
                 let weight = if let Some(next) = e.weights.layers.get(index + 1) { next.ptr("input_norm")? }
                     else { e.weights.norm.buffer.ptr };
                 // The terminal norm has only rank-0 weights; the residual itself
@@ -393,6 +395,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
                 let w = self.work[rank];
                 let layer = self.layer(rank, index);
                 if layer.dense { e.publish_projection(rank, index, self.lane, w, layer, "down", self.rows())?; }
+                else if rank == 1 && e.shared_zero_elided(index, layer) { continue; }
                 else {
                     let out = if rank == 0 { w.delta.buffer.ptr } else { w.shared.buffer.ptr };
                     e.exchange()?.push(rank, slot(index, true, self.lane), out, bytes)?;
@@ -559,12 +562,13 @@ mod tests {
             let mut schedule = self.trace.schedule.borrow_mut();
             let at = slot(layer, true, self.lane);
             let dense_core = self.trace.k6 && layer % 3 == 0;
+            let zero_elided = self.trace.k6 && layer % 3 == 2;
             if layer % 3 != 1 {
-                for rank in 0..2 {
+                for rank in 0..if zero_elided { 1 } else { 2 } {
                     schedule.push_to(rank, "main", at, usize::from(dense_core), "FFN publication");
                 }
             }
-            for rank in 0..2 {
+            for rank in if zero_elided { 1 } else { 0 }..2 {
                 schedule.wait_for(rank, "main", at, usize::from(dense_core), "FFN join");
             }
             schedule.sync(0, "layer diagnostic download");

@@ -1575,7 +1575,7 @@ impl<'a> GlmEngine<'a> {
                     self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes)?;
                 }
                 self.peer_post(index, 0, w1, rows, bytes)?;
-                self.exchange()?.wait(0, ffn)?;
+                if !self.shared_zero_elided(index, &layers[index]) { self.exchange()?.wait(0, ffn)?; }
                 if self.tp2_layer(index) { self.tp2_norm(0, w, weight, index, 0, rows)?; }
                 else { self.ffn_norm(0, index, 0, w, layer, weight, rows,
                     w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
@@ -1731,7 +1731,8 @@ impl<'a> GlmEngine<'a> {
             self.publish_projection(1, index, lane, w1, layer, "down", scalar_rows(rows)?)
         } else {
             self.shared_on(1, index, w1, layer, rows, cap)?;
-            if self.tp2_layer(index) { Ok(()) } else { exchange.push(1, ffn, w1.shared.buffer.ptr, bytes) }
+            if self.tp2_layer(index) || self.shared_zero_elided(index, layer) { Ok(()) }
+            else { exchange.push(1, ffn, w1.shared.buffer.ptr, bytes) }
         }
     }
 
@@ -1850,7 +1851,7 @@ impl<'a> GlmEngine<'a> {
                             && (layer.is_some() || Self::core_split(&layers[before], "down")) {
                             self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes)?;
                         }
-                        self.exchange()?.wait(0, ffn)?;
+                        if !self.shared_zero_elided(before, &layers[before]) { self.exchange()?.wait(0, ffn)?; }
                         if self.tp2_layer(before) { self.tp2_norm(0, w, weight, before, 0, rows)?; }
                         else { self.ffn_norm(0, before, 0, w, &layers[before], weight, rows,
                             w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
@@ -1993,7 +1994,7 @@ impl<'a> GlmEngine<'a> {
             if self.tp2_layer(index) { Ok(()) }
             else if layer.dense { self.publish_projection(1, index, 0, w1, layer, "down", t) }
             else {
-                exchange.push(1, ffn, out, bytes)?;
+                if !self.shared_zero_elided(index, layer) { exchange.push(1, ffn, out, bytes)?; }
                 if index + 1 == peer.layers.len() && Self::core_split(layer, "down") {
                     exchange.wait(1, ffn)?;
                 }
@@ -2512,7 +2513,7 @@ impl<'a> GlmEngine<'a> {
                 }
                 self.peer_post(index, slot, peer_workspaces.as_ref().context("peer workspaces")?.get(slot)?,
                     rows, bytes_of_unit(unit))?;
-                self.exchange()?.wait(0, ffn)?;
+                if !self.shared_zero_elided(index, &layers[index]) { self.exchange()?.wait(0, ffn)?; }
                 if self.tp2_layer(index) { self.tp2_norm(0, w, weight, index, slot, rows)?; }
                 else { self.ffn_norm(0, index, slot, w, &layers[index], weight, rows,
                     w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
@@ -3319,7 +3320,7 @@ mod native_decode_order_tests {
             s.push(1, "main", slot(layer, false, 0), format!("rank1 attention push L{layer}"));
             s.wait(1, "main", slot(layer, false, 0), format!("rank1 attention wait L{layer}"));
             if native && layer >= 3 { meet(s, 1, layer); }
-            if layer < 3 || layer >= local_end {
+            if layer < 3 || (!native && layer >= local_end) {
                 s.push(1, "main", slot(layer, true, 0), format!("rank1 output push L{layer}"));
             }
             if native && layer == 77 && layer >= local_end {
@@ -3333,7 +3334,9 @@ mod native_decode_order_tests {
                 if layer > local_end && (native || layer < 78) {
                     s.push(0, "main", slot(layer - 1, true, 0), format!("rank0 routed push L{}", layer - 1));
                 }
-                s.wait(0, "main", slot(layer - 1, true, 0), format!("rank0 previous wait L{layer}"));
+                if !native || layer <= local_end {
+                    s.wait(0, "main", slot(layer - 1, true, 0), format!("rank0 previous wait L{layer}"));
+                }
             }
             if layer == 78 { break; }
             s.push(0, "main", slot(layer, false, 0), format!("rank0 attention push L{layer}"));
