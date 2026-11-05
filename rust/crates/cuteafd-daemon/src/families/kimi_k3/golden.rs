@@ -64,6 +64,7 @@ pub(crate) struct GoldenArgs {
     /// the C1 serving verify shape, with the prompt prefilled up to score_from.
     #[arg(long, requires = "nll", value_parser = clap::value_parser!(u16).range(2..=64))] verify_rows: Option<u16>,
     /// With --verify-rows: replay startup verify graphs (on) or run eagerly (off).
+    /// Explicit context placement always needs startup graphs, including prefill scoring.
     #[arg(long, requires = "verify_rows", default_value = "on", value_parser = ["on", "off"])] graphs: String,
     /// Grouped K6 KDA q/k/v/g input launch (on) or the four standalone launches
     /// (off; eager scoring only, since startup graphs capture the grouped launch).
@@ -80,11 +81,17 @@ impl GoldenArgs {
         else { cuteafd_ffi::KimiFfnMode::default() }
     }
 
+    fn startup_graphs(&self) -> Result<bool> {
+        let context = self.attention_placement == "context";
+        ensure!(!context || self.graphs == "on", "Kimi context cannot score without startup decode graphs");
+        Ok((context || self.verify_rows.is_some()) && self.graphs == "on")
+    }
+
     fn provenance(&self) -> Value {
         serde_json::json!({"schema": "cuteafd.kimi.run/1", "ffn_mode": self.ffn_mode().name(), "kv_cache": self.kv_cache.label(),
             "gate_up_programs": ([3072, 16896].map(|width| self.ffn_mode().gate_up_stem(width))),
             "rtx_expert_layers":self.rtx_expert_layers, "attention_placement": self.attention_placement, "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll,
-            "verify_rows": self.verify_rows, "graphs": self.verify_rows.map(|_| &self.graphs), "grouped_kda": self.grouped_kda,
+            "verify_rows": self.verify_rows, "graphs": (self.verify_rows.is_some() || self.attention_placement == "context").then_some(&self.graphs), "grouped_kda": self.grouped_kda,
             "verify_limit": self.verify_limit, "prefill_rows": self.prefill_rows, "prefill_waves": self.prefill_waves})
     }
 }
@@ -444,7 +451,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     })?;
     let rows = usize::try_from(prefill.span_rows)?;
     let verify = args.verify_rows.map(usize::from);
-    let graphs = verify.is_some() && args.graphs == "on";
+    let graphs = args.startup_graphs()?;
     ensure!(args.device >= 0 && args.split_device.is_none_or(|peer| peer >= 0 && peer != args.device),
         "Kimi golden devices must name distinct physical owners");
     let super::startup::Loaded { engine, admission_free, admitted_bytes } = match args.split_device {
@@ -457,7 +464,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     // Diagnostic A/B: the four standalone launches; refused once graphs are captured.
     if args.grouped_kda == "off" { engine.set_grouped_kda(false)?; }
     use cuteafd_engine::prefix::PrefixFamily;
-    let pages = engine.prefix_family()?.layout().pages;
+    let layout = engine.prefix_family()?.layout();
     let loaded = RuntimeInventory::measure(&library, &devices, InventoryPhase::PostLoad, |_| Ok(()))?;
     loaded.record(if scoring.is_some() { "kimi_k3-full-loaded" } else { "kimi_k3-prefix-loaded" }, &admission_free);
     for (rank, sample) in loaded.gpus.iter().enumerate() {
@@ -465,7 +472,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
             measured_growth_bytes = admission_free[rank].saturating_sub(sample.free_bytes),
             "Kimi diagnostic loaded usage against admission");
     }
-    let mut pool = cuteafd_engine::prefix::RefPagePool::new(pages, cuteafd_ffi::MLA_PAGE_ROWS);
+    let mut pool = super::prefix::diagnostic_pool(layout);
     let actual = if let Some(windows) = scoring {
         if let Some(verify) = verify {
             score_verify(args, &engine, &mut pool, windows, rows, verify, graphs)?;
@@ -627,6 +634,28 @@ mod tests {
         for bad in [&["--verify-rows", "1"][..], &["--verify-rows", "65"], &["--graphs", "off"], &["--verify-limit", "4"],
             &["--grouped-kda", "maybe"]] {
             assert!(crate::cli::Cli::try_parse_from(args.into_iter().chain(bad.iter().copied())).is_err(), "{bad:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn context_golden_requires_graphs_even_without_verify_scoring() -> Result<()> {
+        use clap::Parser;
+        let argv = ["cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--nll",
+            "--golden", "/reference", "--save-logits", "/output"];
+        for mode in ["auto", "heads", "layers", "context"] {
+            let crate::cli::Commands::KimiGolden(args) = crate::cli::Cli::try_parse_from(argv.into_iter()
+                .chain(["--attention-placement", mode]))?.command else { panic!("Kimi command"); };
+            assert_eq!(args.startup_graphs()?, mode == "context");
+            assert_eq!(args.provenance()["graphs"], if mode == "context" { serde_json::json!("on") }
+                else { serde_json::Value::Null });
+            for graphs in ["on", "off"] {
+                let crate::cli::Commands::KimiGolden(args) = crate::cli::Cli::try_parse_from(argv.into_iter()
+                    .chain(["--attention-placement", mode, "--verify-rows", "8", "--graphs", graphs]))?.command
+                    else { panic!("Kimi command"); };
+                if mode == "context" && graphs == "off" { assert!(args.startup_graphs().is_err()); }
+                else { assert_eq!(args.startup_graphs()?, graphs == "on"); }
+            }
         }
         Ok(())
     }

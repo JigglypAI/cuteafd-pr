@@ -55,10 +55,6 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     cfg: &KimiK3Config, options: Options<'_, RANKS>) -> Result<Loaded<'a>> {
     ensure!(matches!(RANKS, 1 | 2), "Kimi startup requires one or two physical devices");
     check_attention(options.attention, RANKS, options.graphs)?;
-    // Admission and binding can be CPU-gated independently, but no request may
-    // mix parity decode with the still-unbound whole-owned prefill path.
-    ensure!(options.attention != Some(cuteafd_loader::placement::AttentionPlacement::Context),
-        "Kimi context requires the gathered multiquery prefill binding; auto remains layers");
     ensure!(options.draft.as_ref().is_none_or(|draft| draft.cache_format == options.cache_format),
         "Kimi target/draft cache records differ");
     let spark_ranks = options.peers.len();

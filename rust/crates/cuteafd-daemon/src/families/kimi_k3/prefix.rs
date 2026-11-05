@@ -8,6 +8,14 @@ use cuteafd_hostcache::copy::DeviceRange;
 use cuteafd_loader::families::kimi_k3::config::{KimiAttention, KimiK3Config};
 use std::{cell::RefCell, rc::Rc};
 
+pub(super) fn diagnostic_pool(layout: FamilyLayout) -> cuteafd_engine::prefix::RefPagePool {
+    use cuteafd_engine::prefix::{PageOwners, RefPagePool};
+    match layout.page_owners {
+        PageOwners::Uniform => RefPagePool::with_reserved(layout.pages, layout.page_rows, layout.mark_store.reserved()),
+        PageOwners::Parity => RefPagePool::parity(layout.pages, layout.page_rows, 0),
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Placement {
     pub units: Vec<u32>,
@@ -395,6 +403,32 @@ mod tests {
     use crate::shared::memory::device::{Device, Stream};
     use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
     use cuteafd_loader::placement::AttentionPlacement;
+
+    #[test]
+    fn diagnostic_pool_matches_prefix_cache_ownership_and_reservations() -> Result<()> {
+        use cuteafd_engine::prefix::PageOwners;
+        for (page_owners, mark_store) in [(PageOwners::Uniform, MarkStore::Arena),
+            (PageOwners::Uniform, MarkStore::Pool { pages: 2, reserved: 2 }),
+            (PageOwners::Parity, MarkStore::Arena)] {
+            let layout = FamilyLayout { pages: 16, page_rows: MLA_PAGE_ROWS, page_bytes: 128,
+                mark_bytes: 64, draft_bytes: 0, rule: PREFIX_REUSE, mark_store, page_owners };
+            let mut pool = diagnostic_pool(layout);
+            assert_eq!(pool.is_parity(), page_owners == PageOwners::Parity);
+            assert_eq!(pool.page_rows(), layout.page_rows);
+            let units = pool.alloc(5)?;
+            assert!(units.iter().all(|&id| id as usize >= mark_store.reserved()));
+            if pool.is_parity() {
+                assert!(units.iter().enumerate().all(|(logical, &id)| id as usize % 2 == logical % 2));
+            }
+            pool.release(&units);
+            let reused = pool.alloc(5)?;
+            assert!(reused.iter().all(|id| units.contains(id)));
+            if pool.is_parity() {
+                assert!(reused.iter().enumerate().all(|(logical, &id)| id as usize % 2 == logical % 2));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn planner_equals_daemon_owned_and_head_split_host_layout() -> Result<()> {
