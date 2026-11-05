@@ -673,7 +673,7 @@ impl<'a> LocalLane<'a> {
             match key.op {
                 Op::Residual(site) => { self.residual(site, key.rows)?; }
                 Op::Ffn(layer) => { self.ffn(layer, key.rows)?; }
-                Op::Context { .. } => bail!("Kimi context phase binding is not installed"),
+                Op::Context { layer, speculative } => self.context_step(layer, key.rows, speculative)?,
                 Op::Attention { layer, sequences, speculative } => {
                     self.attention = Some(AttentionShape { rows: key.rows, sequences });
                     self.attention(layer, key.rows, speculative)?;
@@ -817,52 +817,82 @@ impl<'a> LocalLane<'a> {
             attention_scratch: self.lane.buffer("MLA attention scratch")?, output_scratch: self.lane.buffer("MLA output scratch")? })
     }
 
-    fn context_decode_phase(&mut self, layer: usize, rows: usize, speculative: bool,
-        phase: cuteafd_loader::families::kimi_k3::context::GraphPhase) -> Result<()> {
-        use cuteafd_loader::families::kimi_k3::context::GraphPhase;
-        if self.replay(rows, super::graphs::Op::Context { layer, speculative, phase })? { return Ok(()); }
-        // Only startup capture may submit decode arithmetic without an executable.
-        ensure!(self.graphs.is_none(), "Kimi context decode phase was not captured at startup");
+    fn context_partial(&self, layer: usize, rows: usize, speculative: bool, heads_rank: usize) -> Result<()> {
+        ensure!(heads_rank < 2, "Kimi context partial head rank");
         let batch = self.context_batch(layer, rows, speculative)?;
         let (context, programs) = self.context.as_ref().context("Kimi context not bound")?;
         let owner = &context.ranks[self.rank];
         let slot = self.context_slot(layer)?;
         let stream = self.stream();
-        match phase {
-            GraphPhase::Produce => self.mla_produce(layer, batch),
-            GraphPhase::Partial { heads_rank, splits } => {
-                ensure!(heads_rank < 2 && super::context::SPLIT_BUCKETS.contains(&splits), "Kimi context partial variant");
-                let partial = owner.partial(heads_rank != self.rank, rows)?;
-                let buffer = |ptr, bytes| CuteafdDeviceBuffer { ptr, bytes, device_id: stream.device.id, flags: 0 };
-                stream.device.run(|| {
-                    programs.partial[heads_rank].launch(cuteafd_ffi::KimiMlaPartialBatch {
-                        rows, active_splits: splits, cache_pages: batch.cache_pages, page_table_width: batch.page_table_width,
-                        query: buffer(slot.query, rows * 96 * 576 * 2), cache: batch.cache,
-                        page_table: batch.page_table, lengths: batch.lengths, query_offsets: batch.query_offsets,
-                        attention: buffer(partial.values, rows * 48 * 512 * 2), lse: buffer(partial.lse, rows * 48 * 4),
-                        scratch: owner.buffer("partial scratch")? }, stream.raw)?;
-                    Ok(())
-                })
+        let partial = owner.partial(heads_rank != self.rank, rows)?;
+        let buffer = |ptr, bytes| CuteafdDeviceBuffer { ptr, bytes, device_id: stream.device.id, flags: 0 };
+        stream.device.run(|| programs.partial[heads_rank].launch(cuteafd_ffi::KimiMlaPartialBatch {
+            rows, active_splits: owner.metadata("active splits", self.lane.metadata_bank)?,
+            cache_pages: batch.cache_pages, page_table_width: batch.page_table_width,
+            query: buffer(slot.query, rows * 96 * 576 * 2), cache: batch.cache,
+            page_table: batch.page_table, lengths: batch.lengths, query_offsets: batch.query_offsets,
+            attention: buffer(partial.values, rows * 48 * 512 * 2), lse: buffer(partial.lse, rows * 48 * 4),
+            scratch: owner.buffer("partial scratch")? }, stream.raw))
+    }
+
+    fn context_combine(&self, layer: usize, rows: usize, speculative: bool) -> Result<()> {
+        let batch = self.context_batch(layer, rows, speculative)?;
+        let (context, programs) = self.context.as_ref().context("Kimi context not bound")?;
+        let slot = self.context_slot(layer)?;
+        let own = context.ranks[self.rank].partial(false, rows)?;
+        let received = crate::shared::peer_split::attention::Partial { values: slot.partial, lse: slot.lse };
+        let [first, second] = crate::shared::peer_split::context::combine_order(self.rank, own, received);
+        let stream = self.stream();
+        stream.device.run(|| {
+            // SAFETY: startup validated the no-sink h48 ABI. Fixed owners
+            // retain both partials and output through this exact stream.
+            unsafe { programs.combine.launch(&[first.values, first.lse, second.values, second.lse,
+                batch.attention.ptr, batch.attention.ptr], &[cuteafd_ffi::programs::Scalar::I32(rows as i32)], stream.raw) }
+        })?;
+        self.mla_output(layer, batch)
+    }
+
+    /// Capture the shared protocol as one executable, including its device flags.
+    /// This is invoked only during startup capture, never as an eager live fallback.
+    fn context_step(&mut self, layer: usize, rows: usize, speculative: bool) -> Result<()> {
+        use crate::shared::peer_split::attention::{Candidates, ContextKernels, Partial, Query};
+        ensure!(self.graphs.is_none(), "Kimi context step may only be submitted during startup capture");
+        let context = self.context.as_ref().context("Kimi context not bound")?.0.clone();
+        struct Bindings<'b, 'a> { local: &'b mut LocalLane<'a>, layer: usize, rows: usize, speculative: bool }
+        impl ContextKernels for Bindings<'_, '_> {
+            fn produce(&mut self) -> Result<Query> {
+                let batch = self.local.context_batch(self.layer, self.rows, self.speculative)?;
+                self.local.mla_produce(self.layer, batch)?;
+                Ok(Query { values: self.local.lane.buffer("MLA query")?.ptr, row_pitch: 48 * 576 * 2, width: None })
             }
-            GraphPhase::CombineOutput => {
-                let own = owner.partial(false, rows)?;
-                let received = crate::shared::peer_split::attention::Partial { values: slot.partial, lse: slot.lse };
-                let [first, second] = crate::shared::peer_split::context::combine_order(self.rank, own, received);
-                stream.device.run(|| {
-                    // SAFETY: startup validated the no-sink h48 ABI. Fixed owners
-                    // retain both partials and output through this exact stream.
-                    unsafe { programs.combine.launch(&[first.values, first.lse, second.values, second.lse,
-                        batch.attention.ptr, batch.attention.ptr], &[cuteafd_ffi::programs::Scalar::I32(rows as i32)], stream.raw) }
-                })?;
-                self.mla_output(layer, batch)
+            fn score(&mut self) -> Result<Option<Candidates>> { Ok(None) }
+            fn merge(&mut self, _: *mut std::ffi::c_void, _: *mut std::ffi::c_void) -> Result<()> {
+                bail!("Kimi MLA has no indexer candidates")
             }
-            _ => bail!("Kimi gathered prefill phase used as decode"),
+            fn partial(&mut self, query: *mut std::ffi::c_void, heads_rank: usize) -> Result<Partial> {
+                ensure!(query == self.local.context_slot(self.layer)?.query, "Kimi context query pointer changed");
+                self.local.context_partial(self.layer, self.rows, self.speculative, heads_rank)?;
+                self.local.context.as_ref().unwrap().0.ranks[self.local.rank].partial(heads_rank != self.local.rank, self.rows)
+            }
+            fn combine(&mut self, partials: [Partial; 2]) -> Result<()> {
+                let slot = self.local.context_slot(self.layer)?;
+                let own = self.local.context.as_ref().unwrap().0.ranks[self.local.rank].partial(false, self.rows)?;
+                let expected = crate::shared::peer_split::context::combine_order(self.local.rank, own,
+                    Partial { values: slot.partial, lse: slot.lse });
+                ensure!(partials.iter().zip(expected).all(|(a, b)| a.values == b.values && a.lse == b.lse),
+                    "Kimi context fixed combine operands changed");
+                self.local.context_combine(self.layer, self.rows, self.speculative)
+            }
         }
+        let rank = self.rank;
+        let lane = self.lane_index;
+        let ordinal = self.cfg.attention[..layer].iter().filter(|&&kind|
+            kind == cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla).count();
+        crate::shared::peer_split::attention::context_decode(&context.exchange, rank, ordinal, lane, rows,
+            &mut Bindings { local: self, layer, rows, speculative })
     }
 
     pub(crate) fn context_decode(&mut self, layer: usize, rows: usize, speculative: bool) -> Result<()> {
-        use crate::shared::peer_split::attention::{Candidates, ContextKernels, Partial, Query};
-        use cuteafd_loader::families::kimi_k3::context::GraphPhase;
         ensure!(self.lane.window.is_none() && self.lane.metadata_bank == 0,
             "Kimi context decode needs its fixed metadata bank");
         ensure!(self.graphs.is_some() && self.replay_enabled, "Kimi context decode requires startup graphs");
@@ -881,39 +911,11 @@ impl<'a> LocalLane<'a> {
             }
         })?;
         let splits = super::context::split_bucket(self.context_pages[0], bucket,
-            self.context.as_ref().unwrap().1.sms)?;
-        struct Bindings<'b, 'a> { local: &'b mut LocalLane<'a>, layer: usize, rows: usize, speculative: bool, splits: usize }
-        impl ContextKernels for Bindings<'_, '_> {
-            fn produce(&mut self) -> Result<Query> {
-                self.local.context_decode_phase(self.layer, self.rows, self.speculative, GraphPhase::Produce)?;
-                Ok(Query { values: self.local.lane.buffer("MLA query")?.ptr, row_pitch: 48 * 576 * 2, width: None })
-            }
-            fn score(&mut self) -> Result<Option<Candidates>> { Ok(None) }
-            fn merge(&mut self, _: *mut std::ffi::c_void, _: *mut std::ffi::c_void) -> Result<()> {
-                bail!("Kimi MLA has no indexer candidates")
-            }
-            fn partial(&mut self, query: *mut std::ffi::c_void, heads_rank: usize) -> Result<Partial> {
-                ensure!(query == self.local.context_slot(self.layer)?.query, "Kimi context query pointer changed");
-                self.local.context_decode_phase(self.layer, self.rows, self.speculative,
-                    GraphPhase::Partial { heads_rank, splits: self.splits })?;
-                self.local.context.as_ref().unwrap().0.ranks[self.local.rank].partial(heads_rank != self.local.rank, self.rows)
-            }
-            fn combine(&mut self, partials: [Partial; 2]) -> Result<()> {
-                let slot = self.local.context_slot(self.layer)?;
-                let own = self.local.context.as_ref().unwrap().0.ranks[self.local.rank].partial(false, self.rows)?;
-                let expected = crate::shared::peer_split::context::combine_order(self.local.rank, own,
-                    Partial { values: slot.partial, lse: slot.lse });
-                ensure!(partials.iter().zip(expected).all(|(a, b)| a.values == b.values && a.lse == b.lse),
-                    "Kimi context fixed combine operands changed");
-                self.local.context_decode_phase(self.layer, self.rows, self.speculative, GraphPhase::CombineOutput)
-            }
-        }
+            self.context.as_ref().unwrap().1.sms)? as i32;
+        context.ranks[self.rank].upload("active splits", 0, &splits.to_le_bytes(), &stream)?;
+        ensure!(self.replay(bucket, super::graphs::Op::Context { layer, speculative })?,
+            "Kimi context whole-step graph missing");
         let rank = self.rank;
-        let lane = self.lane_index;
-        let ordinal = self.cfg.attention[..layer].iter().filter(|&&kind|
-            kind == cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla).count();
-        crate::shared::peer_split::attention::context_decode(&context.exchange, rank, ordinal, lane, bucket,
-            &mut Bindings { local: self, layer, rows: bucket, speculative, splits })?;
         let output = context.ranks[rank].buffer("decode output")?;
         let destination = self.attention_result(layer, rows)?;
         stream.device.run(|| {

@@ -605,6 +605,7 @@ def test_kimi_context_exports_native_partial_ranges_and_shared_primitives(export
             assert args[0].kv_cache == params["kv_cache"]
             assert params["head_begin"] in (0, 48) and params["head_count"] == 48
             assert params["num_splits"] == 16
+            assert params["device_splits"] is True
         else:
             assert module == "context_split"
             assert fn == f"compile_{op}_aot"

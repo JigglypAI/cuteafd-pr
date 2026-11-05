@@ -3,31 +3,8 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::MlaCacheFormat;
 use crate::placement::ContextBuffers;
 
-/// All live dispatch values are captured before readiness; never resolve a
-/// new executable from the current history length.
+/// Runtime split choices share one captured executable and fixed device scalar.
 pub const SPLIT_BUCKETS: [usize; 4] = [2, 4, 8, 16];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum GraphPhase {
-    Produce,
-    Partial { heads_rank: usize, splits: usize },
-    CombineOutput,
-    GatheredAttention,
-    Output,
-}
-
-pub fn graph_phases(rows: usize) -> Vec<GraphPhase> {
-    let mut phases = vec![GraphPhase::Produce];
-    if rows <= 64 {
-        for heads_rank in 0..2 { for splits in SPLIT_BUCKETS {
-            phases.push(GraphPhase::Partial { heads_rank, splits });
-        }}
-    } else {
-        phases.push(GraphPhase::GatheredAttention);
-    }
-    phases.push(if rows <= 64 { GraphPhase::CombineOutput } else { GraphPhase::Output });
-    phases
-}
 
 /// Context-only padding inventory. Native route edges come from the package,
 /// which exports the very constants used by the K6 dispatcher.
@@ -90,7 +67,7 @@ impl DecodeBuckets {
 
 const ROWS: usize = 64;
 const HEADS: usize = 48;
-const METADATA: [&str; 6] = ["context slots", "compact page tables", "shard lengths", "context offsets", "gather tables", "commit blocks"];
+const METADATA: [&str; 7] = ["context slots", "compact page tables", "shard lengths", "context offsets", "gather tables", "commit blocks", "active splits"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextLayout {
@@ -128,6 +105,7 @@ impl ContextLayout {
                 let bytes = usize::try_from(bytes).context("Kimi context scratch extent overflow")?;
                 let geometry = &entries[0]["geometry"];
                 ensure!(geometry["num_splits"] == 16 && geometry["runtime_splits"] == true
+                    && geometry["device_splits"] == true && geometry["fixed_split_grid"] == 16
                     && geometry["lse_base"] == 2,
                     "Kimi context {name} requires runtime splits (capacity 16) and base-2 LSE");
                 let expected = (ROWS * HEADS * 16 * 512 * 2).next_multiple_of(1024)
@@ -142,7 +120,7 @@ impl ContextLayout {
             ("decode input", ROWS * 7168 * 2), ("decode output", ROWS * 7168 * 2)];
         for (name, bytes) in METADATA.into_iter().zip([unit_rows * 8,
             ROWS * half_pages * 4, ROWS * 4, (ROWS + 1) * 4, 2 * half_pages * 4,
-            3 * (unit_rows.div_ceil(ROWS) + 1) * 8]) {
+            3 * (unit_rows.div_ceil(ROWS) + 1) * 8, 4]) {
             let stride = bytes.max(256).next_multiple_of(256);
             workspace.push((name, stride.checked_mul(metadata_banks).context("Kimi context metadata banks overflow")?));
         }
@@ -181,7 +159,7 @@ pub(crate) fn add_manifest_programs(manifest: &mut serde_json::Value) {
             let programs = manifest["programs"].as_array_mut().unwrap();
             if !programs.iter().any(|p| p["name"] == name) {
                 programs.push(serde_json::json!({"name":name,"scratch_bytes_at_capacity":{"scratch":bytes},
-                    "geometry":{"num_splits":16,"runtime_splits":true,"lse_base":2}}));
+                    "geometry":{"num_splits":16,"runtime_splits":true,"device_splits":true,"fixed_split_grid":16,"lse_base":2}}));
             }
         }
     }

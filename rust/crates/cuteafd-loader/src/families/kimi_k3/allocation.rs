@@ -319,7 +319,7 @@ pub fn graphs_with_context(cfg: &KimiK3Config, lanes: usize, capacity: usize, sl
                 let variants = u64::from(decode.plain().contains(&rows))
                     + u64::from(verify_graph_rows(verify, capacity).contains(&rows));
                 *count += (0..cfg.layers).filter(|&layer| context(layer) && resident(rank, layer)).count() as u64
-                    * super::context::graph_phases(rows).len() as u64 * variants;
+                    * variants;
             }
         }
         *count *= lanes as u64;

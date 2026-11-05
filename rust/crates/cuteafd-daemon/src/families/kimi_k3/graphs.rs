@@ -1,5 +1,5 @@
-//! Exact startup-only rank-local arithmetic graphs. Transport and event joins
-//! remain in the shared layer executor, outside these captured segments.
+//! Startup-only rank-local graphs. Context steps include same-stream device
+//! exchange; ordinary hidden/event joins remain in the shared layer executor.
 use super::block::MixSite;
 use crate::shared::{decode_graph::{GraphBank, GraphDecision, GraphOwner, GraphPolicy},
     memory::device::Stream};
@@ -11,7 +11,7 @@ use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config},
 pub(crate) enum Op {
     Residual(MixSite),
     Attention { layer: usize, sequences: usize, speculative: bool },
-    Context { layer: usize, speculative: bool, phase: cuteafd_loader::families::kimi_k3::context::GraphPhase },
+    Context { layer: usize, speculative: bool },
     Ffn(usize),
 }
 
@@ -75,9 +75,7 @@ pub(crate) fn inventory_with_context(cfg: &KimiK3Config, lanes: usize, capacity:
                         for speculative in [false, true] {
                             if if speculative { verify_graph_rows(verify, capacity).contains(&rows) }
                                 else { decode.plain().contains(&rows) } {
-                                for phase in cuteafd_loader::families::kimi_k3::context::graph_phases(rows) {
-                                    keys.push(Key { lane, rank, rows, op: Op::Context { layer, speculative, phase } });
-                                }
+                                keys.push(Key { lane, rank, rows, op: Op::Context { layer, speculative } });
                             }
                         }
                     }
@@ -112,12 +110,11 @@ pub(crate) fn check_placement_for_ranks(cfg: &KimiK3Config, placement: &cuteafd_
     ensure!(placement.layers.len() == cfg.layers, "Kimi graph placement layer count");
     let inventory: std::collections::HashSet<_> = keys.iter().copied().collect();
     for key in keys {
-        if let Op::Context { layer, speculative, phase } = key.op {
+        if let Op::Context { layer, speculative } = key.op {
             ensure!(ranks == 2 && cfg.attention.get(layer) == Some(&KimiAttention::Mla)
                 && placement.layers.get(layer).is_some_and(|a| a.mode == LayerMode::ContextSplit)
-                && (!speculative || (2..=64).contains(&key.rows))
-                && cuteafd_loader::families::kimi_k3::context::graph_phases(key.rows).contains(&phase),
-                "Kimi context graph differs from accepted placement/phase");
+                && (1..=64).contains(&key.rows) && (!speculative || key.rows >= 2),
+                "Kimi context graph differs from accepted placement");
         }
         if let Op::Attention { layer, .. } = key.op {
             let mode = placement.layers.get(layer).ok_or_else(|| anyhow::anyhow!("Kimi graph layer"))?.mode;
@@ -139,10 +136,9 @@ pub(crate) fn check_placement_for_ranks(cfg: &KimiK3Config, placement: &cuteafd_
                 for key in keys.iter().filter(|key| key.rank == rank && matches!(key.op,
                     Op::Context { layer: captured, .. } if captured == layer)) {
                     let Op::Context { speculative, .. } = key.op else { unreachable!() };
-                    for phase in cuteafd_loader::families::kimi_k3::context::graph_phases(key.rows) {
-                        ensure!(inventory.contains(&Key { op: Op::Context { layer, speculative, phase }, ..*key }),
-                            "Kimi context graph phase inventory is incomplete");
-                    }
+                    ensure!(inventory.contains(&Key { rank: 1 - rank,
+                        op: Op::Context { layer, speculative }, ..*key }),
+                        "Kimi context peer graph inventory is incomplete");
                 }
             }
         }
@@ -157,8 +153,8 @@ impl<'a> Graphs<'a> {
         mut arithmetic: impl FnMut(Key) -> Result<()>) -> Result<Self> {
         let mut bank = GraphBank::with_policy(GraphPolicy::FixedStartup);
         bank.warm(keys, |&key| stream.device.run(|| {
-            // SAFETY: startup is exclusive; only rank-local arithmetic enters
-            // capture. The containing LocalLane pins every operand and drains
+            // SAFETY: startup is exclusive; arithmetic and initialized context
+            // exchange kernels use this exact stream. LocalLane pins operands and drains
             // its exact stream before releasing this bank or its allocations.
             unsafe { stream.device.library.cuda_graph_begin_capture(stream.raw)?; }
             let submitted = arithmetic(key);
@@ -199,7 +195,7 @@ impl<'a> Graphs<'a> {
                 Ok(true)
             }
             GraphDecision::Eager if matches!(key.op, Op::Context { .. }) =>
-                anyhow::bail!("Kimi context requires a startup-captured phase graph"),
+                anyhow::bail!("Kimi context requires a startup-captured whole-step graph"),
             GraphDecision::Eager => Ok(false),
             GraphDecision::Capture => anyhow::bail!("Kimi live submission attempted graph capture"),
         }
@@ -216,9 +212,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn context_phases_match_admission_and_capture_every_live_split_bucket() -> Result<()> {
-        use cuteafd_loader::{families::kimi_k3::context::{graph_phases, GraphPhase, SPLIT_BUCKETS},
-            placement::LayerMode};
+    fn context_whole_steps_match_admission_and_capture_each_native_row_bucket() -> Result<()> {
+        use cuteafd_loader::placement::LayerMode;
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let inputs = super::super::admission::tests::inputs(&cfg);
         let mut placement = super::super::admission::admit(inputs)?.placement;
@@ -239,16 +234,14 @@ mod tests {
                     set.keys.iter().filter(|key| key.rank == rank).count() as u64);
             }
             let layer = cfg.attention.iter().position(|kind| *kind == KimiAttention::Mla).unwrap();
-            for heads_rank in 0..2 { for splits in SPLIT_BUCKETS {
-                assert!(unique.contains(&Key { lane: 0, rank: 0, rows: 16,
-                    op: Op::Context { layer, speculative: false, phase: GraphPhase::Partial { heads_rank, splits } } }));
-            }}
+            assert!(unique.contains(&Key { lane: 0, rank: 0, rows: 16,
+                op: Op::Context { layer, speculative: false } }));
             assert!(!set.keys.iter().any(|key| matches!(key.op,
                 Op::Attention { layer, .. } if cfg.attention[layer] == KimiAttention::Mla)));
             for rank in 0..2 {
                 let plain = set.keys.iter().filter(|key| key.rank == rank && matches!(key.op,
                     Op::Context { layer: captured, speculative: false, .. } if captured == layer)).count();
-                assert_eq!(plain, 7 * 10);
+                assert_eq!(plain, 7);
                 for rows in [8, 32, 48] {
                     assert!(!set.keys.iter().any(|key| key.rank == rank && key.rows == rows
                         && matches!(key.op, Op::Ffn(_) | Op::Residual(_)))
@@ -256,10 +249,8 @@ mod tests {
                 }
             }
             assert!(!set.keys.iter().any(|key| key.rows > 64 && matches!(key.op, Op::Context { .. })));
-            assert_eq!(graph_phases(64).len(), 10);
-            assert_eq!(graph_phases(4096), [GraphPhase::Produce, GraphPhase::GatheredAttention, GraphPhase::Output]);
-            let missing = set.keys.iter().copied().filter(|key| !matches!(key.op,
-                Op::Context { phase: GraphPhase::Partial { splits: 8, .. }, .. })).collect::<Vec<_>>();
+            let missing = set.keys.iter().copied().filter(|key| !(key.rank == 1 && key.rows == 16
+                && matches!(key.op, Op::Context { .. }))).collect::<Vec<_>>();
             assert!(check_placement(&cfg, &placement, &missing).is_err());
         }}
         assert!(inventory_with_context(&cfg, 1, 64, 16, 0, 1, |_, _| true,

@@ -243,7 +243,8 @@ pub struct KimiMlaPartial<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct KimiMlaPartialBatch {
     pub rows: usize,
-    pub active_splits: usize,
+    /// Fixed device scalar, updated outside capture; contents must be in 2..=16.
+    pub active_splits: Buffer,
     pub cache_pages: usize,
     pub page_table_width: usize,
     pub query: Buffer,
@@ -260,7 +261,8 @@ pub struct KimiMlaPartialBatch {
 impl<'a> KimiMlaPartial<'a> {
     pub fn load(programs: &'a Programs<'a>, name: &str, head_begin: usize, rows: usize,
         format: MlaCacheFormat) -> Result<Self> {
-        let program = programs.program(name, ATTENTION)?;
+        let program = programs.program(name, &["query", "kv_cache", "page_table", "cache_seqlens",
+            "cu_seqlens_q", "attn", "lse", "scratch", "active_splits"])?;
         let (context, scratch) = validate_partial_manifest(program.spec(), head_begin, rows, format)?;
         Ok(Self { program, rows, context, scratch, record_bytes: format.record_bytes() })
     }
@@ -271,8 +273,7 @@ impl<'a> KimiMlaPartial<'a> {
     pub fn launch(&self, b: KimiMlaPartialBatch, stream: *mut c_void) -> Result<()> {
         if b.rows == 0 || b.rows > self.rows || b.page_table_width == 0
             || b.page_table_width > self.context.div_ceil(MLA_PAGE_ROWS)
-            || b.cache_pages == 0 || b.cache_pages > i32::MAX as usize
-            || !(2..=16).contains(&b.active_splits) {
+            || b.cache_pages == 0 || b.cache_pages > i32::MAX as usize {
             return Err(KimiMlaError::Invalid("context partial batch geometry"));
         }
         let cache = b.cache_pages.checked_mul(MLA_PAGE_ROWS * self.record_bytes)
@@ -280,14 +281,17 @@ impl<'a> KimiMlaPartial<'a> {
         let operands = [(b.query, b.rows * 96 * 576 * 2), (b.cache, cache),
             (b.page_table, b.rows * b.page_table_width * 4), (b.lengths, b.rows * 4),
             (b.query_offsets, (b.rows + 1) * 4), (b.attention, b.rows * 48 * 512 * 2),
-            (b.lse, b.rows * 48 * 4), (b.scratch, self.scratch)];
+            (b.lse, b.rows * 48 * 4), (b.scratch, self.scratch), (b.active_splits, 4)];
         validate_buffers(&operands, b.query.device_id)?;
         for (buffer, bytes) in operands {
             if buffer.flags != 0 || (buffer.ptr as usize).checked_add(bytes).is_none() {
                 return Err(KimiMlaError::Invalid("context partial flags/address overflow"));
             }
         }
-        for writer in 5..8 { for other in 0..8 {
+        if !(b.active_splits.ptr as usize).is_multiple_of(4) {
+            return Err(KimiMlaError::Invalid("context partial split scalar alignment"));
+        }
+        for writer in 5..8 { for other in 0..9 {
             if writer != other {
                 reject_overlap(operands[writer], operands[other])
                     .map_err(|_| KimiMlaError::Invalid("context partial operands overlap"))?;
@@ -297,9 +301,8 @@ impl<'a> KimiMlaPartial<'a> {
         // devices and write aliases are checked. The caller owns the stream,
         // causal table contents and buffers through queued work/graph replay.
         unsafe { self.program.launch(&[b.query.ptr, b.cache.ptr, b.page_table.ptr, b.lengths.ptr,
-            b.query_offsets.ptr, b.attention.ptr, b.lse.ptr, b.scratch.ptr],
-            &[Scalar::I32(b.rows as i32), Scalar::I64(b.page_table_width as i64),
-              Scalar::I32(b.active_splits as i32)], stream)?; }
+            b.query_offsets.ptr, b.attention.ptr, b.lse.ptr, b.scratch.ptr, b.active_splits.ptr],
+            &[Scalar::I32(b.rows as i32), Scalar::I64(b.page_table_width as i64)], stream)?; }
         Ok(())
     }
 }
@@ -308,7 +311,7 @@ fn validate_partial_manifest(spec: &ProgramSpec, begin: usize, rows: usize, form
     -> Result<(usize, usize)> {
     let g = &spec.geometry;
     if !matches!(begin, 0 | 48) || !(1..=4096).contains(&rows)
-        || spec.capacity_rows as usize != rows || spec.scalar_kinds != b"ili"
+        || spec.capacity_rows as usize != rows || spec.scalar_kinds != b"il"
         || g["kv_cache"].as_str() != Some(format.label())
         || g["head_begin"].as_u64() != Some(begin as u64)
         || g["norm_eps"].as_f64() != Some(1e-6)
@@ -325,6 +328,7 @@ fn validate_partial_manifest(spec: &ProgramSpec, begin: usize, rows: usize, form
     let n = rows * 48 * splits;
     let scratch = (n * 512 * 2).div_ceil(1024) * 1024 + n * 4;
     if g["runtime_splits"].as_bool() != Some(true)
+        || g["device_splits"].as_bool() != Some(true) || g["fixed_split_grid"] != 16
         || spec.scratch.get("scratch").copied() != Some(scratch as u64) {
         return Err(KimiMlaError::Invalid("context partial manifest traversal/scratch"));
     }
@@ -1197,8 +1201,10 @@ mod tests {
         for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
             for begin in [0, 48] {
                 let mut spec = specs(96, 64, KimiMlaMode::Decode)[1].clone();
-                spec.scalar_kinds = b"ili".to_vec();
+                spec.scalar_kinds = b"il".to_vec();
                 spec.geometry["runtime_splits"] = true.into();
+                spec.geometry["device_splits"] = true.into();
+                spec.geometry["fixed_split_grid"] = 16.into();
                 spec.geometry["kv_cache"] = format.label().into();
                 spec.geometry["head_begin"] = begin.into();
                 spec.geometry["head_count"] = 48.into();
@@ -1207,7 +1213,8 @@ mod tests {
                 spec.scratch.insert("scratch".into(), (64 * 48 * 16 * (512 * 2 + 4)) as u64);
                 assert!(validate_partial_manifest(&spec, begin, 64, format).is_ok());
                 for (key, bad) in [("lse_base", 0), ("heads", 48), ("head_count", 96),
-                    ("num_splits", 1), ("runtime_splits", 0), ("max_context", 0)] {
+                    ("num_splits", 1), ("runtime_splits", 0), ("device_splits", 0),
+                    ("fixed_split_grid", 8), ("max_context", 0)] {
                     let mut wrong = spec.clone();
                     wrong.geometry[key] = bad.into();
                     assert!(validate_partial_manifest(&wrong, begin, 64, format).is_err(), "{key}");

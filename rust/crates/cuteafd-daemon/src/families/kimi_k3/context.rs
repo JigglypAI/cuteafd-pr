@@ -81,7 +81,7 @@ impl<'a> Rank<'a> {
         let (_, stride) = owner.layout.metadata_extent("context slots", 0)?;
         let banks = owner.buffer("context slots")?.bytes / stride;
         for bank in 0..banks {
-            for name in ["context slots", "compact page tables", "shard lengths", "context offsets", "gather tables", "commit blocks"] {
+            for name in ["context slots", "compact page tables", "shard lengths", "context offsets", "gather tables", "commit blocks", "active splits"] {
                 let buffer = owner.metadata(name, bank)?;
                 for stream in &owner.streams {
                     stream.device.run(|| {
@@ -199,7 +199,7 @@ impl<'a> ContextOwner<'a> {
     }
 }
 
-/// Startup-captured buckets; live history changes dispatch, not program resolution.
+/// Bounded runtime splits; live history updates metadata, not graph selection.
 pub(crate) use cuteafd_loader::families::kimi_k3::context::SPLIT_BUCKETS;
 
 pub(crate) fn split_bucket(owned_pages: usize, rows: usize, sms: usize) -> Result<usize> {
@@ -375,7 +375,7 @@ mod tests {
             let tag = format.program_suffix();
             let programs = [0, 48].map(|head| serde_json::json!({
                 "name":format!("kimik3_mla_partial{tag}_h{head}_m64"),
-                "geometry":{"num_splits":16,"runtime_splits":true,"lse_base":2},
+                "geometry":{"num_splits":16,"runtime_splits":true,"device_splits":true,"fixed_split_grid":16,"lse_base":2},
                 "scratch_bytes_at_capacity":{"scratch":64*48*16*(512*2+4)}}));
             let mut programs = programs.to_vec();
             programs.extend([serde_json::json!({"name":"kimik3_lse_combine2"}),
