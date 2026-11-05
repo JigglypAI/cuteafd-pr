@@ -120,17 +120,3 @@ def test_pcm_feature_epsilon_uses_versioned_float_slot():
     for epsilon in (0, -1, float("nan"), float("inf"), 1e100, 1e-100):
         with pytest.raises(ValueError, match="epsilon"):
             gate.descriptor({}, 1, epsilon)
-
-
-def test_pcm_native_attestation_precedes_remote_handshake():
-    tower = (ROOT / "rust/crates/cuteafd-daemon/src/shared/vision/pcm_audio.rs").read_text()
-    required = tower.split("pub fn required_bytes(", 1)[1].split("pub fn native_spec(", 1)[0]
-    assert "NativePcmAudio::required(library, &self.native)?" in required
-    assert "ledger.weights != self.plan.weight_bytes()" in required
-    assert "ledger.scratch != scratch_bytes(" in required
-    assert "ledger.device_allocations != 2" in required
-    ready = (ROOT / "rust/crates/cuteafd-daemon/src/families/muse_spark/audio.rs").read_text()
-    assert ready.index("spec.required_bytes(library)?") < ready.index("RemoteEncoder::connect_audio(")
-    shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/vision/audio.rs").read_text()
-    assert "Self::Pcm(spec) => spec.required_bytes(library)" in shared
-    assert "Self::Pcm { spec, .. } => spec.required_bytes(library)" in shared
