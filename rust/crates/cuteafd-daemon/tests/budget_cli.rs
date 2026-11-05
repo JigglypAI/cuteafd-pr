@@ -569,7 +569,22 @@ fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
             .collect::<std::collections::BTreeMap<_, _>>();
         let name = example.file_name().unwrap().to_str().unwrap();
         let revision = config.get("MODEL_REVISION").copied();
-        let _snapshot = require_installed_snapshot(name, config["MODEL_ID"], revision, &hf_home);
+        let snapshot = require_installed_snapshot(name, config["MODEL_ID"], revision, &hf_home);
+        if ["glm53-exl3-min.config", "glm53-exl3-max.config",
+            "glm53-exlr8-min.config", "glm53-exlr8-max.config"].contains(&name) {
+            let temporary = tempfile::tempdir().unwrap();
+            let interpreter = std::env::var_os("CUTEAFD_TEST_PYTHON")
+                .expect("CUTEAFD_TEST_PYTHON must name the gate's venv Python for launcher checks");
+            let output = Command::new(interpreter).args(["-I", "-c", r#"
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
+from test_run_family_dispatch import capture_glm_real_planner_launch
+capture_glm_real_planner_launch(*map(Path, sys.argv[2:]))
+"#]).arg(root).arg(&snapshot).arg(&example).arg(env!("CARGO_BIN_EXE_cuteafd"))
+                .arg(&programs).arg(&hf_home).arg(temporary.path()).output().unwrap();
+            assert!(output.status.success(), "{name} real launcher: {}", String::from_utf8_lossy(&output.stderr));
+        }
         let mut command = Command::new("timeout");
         command.args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan", config["MODEL_ID"],
             "--deployment", "--config"]).arg(&example)

@@ -618,7 +618,7 @@ pub fn production_links(cfg: &GlmDsaConfig, ranks: usize, prefill: PrefillShape,
 pub fn production_request(context: u64, pool: Option<u64>, onboard: crate::placement::Onboard,
     prefill: PrefillShape, operation: Operation, resident_weight_limit: crate::placement::ResidentWeights,
     spark_reply_formats: SparkReplyFormats) -> Request {
-    Request { context, pool: pool.filter(|&n| n > 0).map_or(Pin::Auto, Pin::Exact),
+    Request { context, pool: crate::placement::PoolPolicy::normalize_request(pool).map_or(Pin::Auto, Pin::Exact),
         onboard: match onboard { crate::placement::Onboard::Auto => Pin::Auto,
             crate::placement::Onboard::Layers(n) => Pin::Exact(n as u64) },
         prefill: Pin::Exact(prefill), operation, resident_weight_limit: Some(resident_weight_limit), spark_reply_formats }

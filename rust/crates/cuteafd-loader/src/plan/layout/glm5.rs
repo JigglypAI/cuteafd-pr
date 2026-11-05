@@ -514,8 +514,8 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         }.into());
     }
     let page_tokens = if attention == crate::placement::AttentionPlacement::Context { 128 } else { 64 };
-    let maximum_pool_tokens = options.pool_tokens.unwrap_or_else(|| crate::placement::PoolPolicy::resolve(
-        &options.rtx_bytes[..gpus], context, None, page_tokens, spark_ranks == 0).target);
+    let maximum_pool_tokens = crate::placement::PoolPolicy::resolve(
+        &options.rtx_bytes[..gpus], context, options.pool_tokens, page_tokens, spark_ranks == 0).maximum_tokens();
     let maximum_pages = maximum_pool_tokens.div_ceil(page_tokens);
     let prefill = PrefillShape { rows, waves: lanes };
     let operation = if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
@@ -692,8 +692,8 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         LocalPhysicalSource::read(&cfg, &catalog, local, &physical, Some(metadata))
     }).transpose()?;
     let page_tokens = if attention == crate::placement::AttentionPlacement::Context { 2 * glm::PAGE_ROWS } else { glm::PAGE_ROWS };
-    let maximum_pool_tokens = options.pool_tokens.filter(|&n| n > 0).unwrap_or_else(||
-        crate::placement::PoolPolicy::resolve(&options.rtx_bytes, context, None, page_tokens, spark_ranks == 0).target);
+    let maximum_pool_tokens = crate::placement::PoolPolicy::resolve(
+        &options.rtx_bytes, context, options.pool_tokens, page_tokens, spark_ranks == 0).maximum_tokens();
     let (draft, additional, prefix_quota) = production_serving(options, checkpoint, &cfg,
         context, attention, gpu_count, maximum_pool_tokens.div_ceil(page_tokens))?;
     let geometry = cuteafd_core::ExpertGeometry { hidden: cfg.hidden as u32, experts: cfg.experts as u32,

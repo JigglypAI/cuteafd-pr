@@ -1116,10 +1116,10 @@ impl Opened {
             cuteafd_loader::placement::AttentionPlacement::Context
         } else { cuteafd_loader::placement::AttentionPlacement::Heads });
         let page_tokens = if attention == cuteafd_loader::placement::AttentionPlacement::Context { 128 } else { 64 };
-        let requested_pool = (args.pool_tokens > 0).then_some(args.pool_tokens as u64);
-        let maximum_pool_tokens = requested_pool.unwrap_or_else(|| cuteafd_loader::placement::PoolPolicy::resolve(
+        let requested_pool = cuteafd_loader::placement::PoolPolicy::normalize_request(Some(args.pool_tokens as u64));
+        let maximum_pool_tokens = cuteafd_loader::placement::PoolPolicy::resolve(
             &cards.iter().map(|&(_, ceiling)| ceiling).collect::<Vec<_>>(), args.max_context as u64,
-            None, page_tokens, spark_ranks == 0).target);
+            requested_pool, page_tokens, spark_ranks == 0).maximum_tokens();
         let maximum_pages = maximum_pool_tokens.div_ceil(page_tokens);
         let prefill = PrefillShape { rows: args.prefill_rows as u64, waves: prefill_lanes as u64 };
         let operation = if args.full_prefill_logits { Operation::Scoring } else { Operation::Serving };

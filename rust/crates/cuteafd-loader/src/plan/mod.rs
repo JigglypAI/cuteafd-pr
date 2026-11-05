@@ -1528,7 +1528,10 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             placement: ExpertPlacement::from_spark_ranks(ranks), ..options.clone()
         };
         let mut report = input.plan(&candidate)?;
-        if ranks == 0 || candidate.layout.is_none() {
+        // Shared Recipe families admit one fixed prefill shape. Preserve their
+        // typed refusal instead of retrying smaller reserves in a second solve.
+        if ranks == 0 || candidate.layout.is_none()
+            || matches!(report.family.as_deref(), Some("glm5" | "mistral_large4")) {
             return Ok(report);
         }
         // The prefill reserve is sized first (TJ 2026-10-27): the largest
