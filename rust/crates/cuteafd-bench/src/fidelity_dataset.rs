@@ -1070,7 +1070,7 @@ mod tests {
         if commit == MINIMAX_M3_REVISION && config == MINIMAX_M3_CONFIG {
             assert_eq!(reference.checkpoint, "MiniMaxAI/MiniMax-M3.1-Flash");
             assert_eq!(reference.windows.len(), 72);
-            assert_eq!(identity["qualification"], "reference-only qualified");
+            assert_eq!(identity["qualification"], "reference");
             assert_eq!(identity["text_checkpoint"], "MiniMaxAI/MiniMax-M3.1-Flash");
             let balance = standard_balance(&reference);
             assert_eq!(balance["decode"]["generated_positions"], 12679);
