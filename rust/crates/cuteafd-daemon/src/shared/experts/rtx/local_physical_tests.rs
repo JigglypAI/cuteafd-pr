@@ -37,7 +37,11 @@ fn modules<'a>(fixture: &cuteafd_ffi::native_library_lifetime_fixture::Fixture,
         let mut words = [0; 16];
         words[..7].copy_from_slice(&[meta["native_info_version"].as_u64().unwrap_or(2) as u32,
             value("hidden")?, value("intermediate")?, value("experts")?, value("capacity")?, value("top_k")?, bits.len() as u32]);
-        words[7..11].copy_from_slice(&[1, 1, 1, 1]);
+        for (index, (object, slots)) in [(0, "pointer_slots"), (0, "scalar_slots"),
+            (1, "pointer_slots"), (1, "scalar_slots")].into_iter().enumerate() {
+            words[7 + index] = u32::try_from(meta["objects"][object][slots].as_array()
+                .with_context(|| format!("missing EXL3 object {object} {slots}"))?.len())?;
+        }
         for (index, bit) in bits.iter().enumerate() { words[11 + index] = bit.as_u64().context("EXL3 bit")? as u32; }
         words[15] = 4;
         fixture.configure_exl3(device.library, &words)?;
@@ -73,17 +77,18 @@ fn installed_glm_local_physical_equals_serving() -> Result<()> {
     fixture.extent_only(&library)?;
     fixture.quiet_events(&library, true)?;
     for rank in 0..2 { fixture.configure_memory(&library, rank, 96usize << 30)?; }
-    let manifest = PathBuf::from(std::env::var_os("CUTEAFD_PLAN_WORKSPACE_MANIFEST").unwrap_or_else(||
-        root.parent().unwrap().join("placement-inputs/current/PROGRAMS.json").into_os_string()));
-    let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest)
-        .with_context(|| format!("required installed PROGRAMS missing: {}", manifest.display()))?)?;
-    fixture.register_programs(&library, metadata["programs"].as_array().context("installed programs missing")?)?;
-    let programs = library.programs()?.with_manifest(&manifest)?;
     let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
     let streams = [Stream::new(devices[0])?, Stream::new(devices[1])?];
     let ranks = [0, 1].map(|rank| RankDevice { device: rank as i32, stream: streams[rank].raw });
     for (repo, native) in [("kindlingai/glm-5.3-exlr8-k2-k3-k4", true),
         ("wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6", false)] {
+        let variable = if native { "CUTEAFD_PLAN_WORKSPACE_MANIFEST" } else { "CUTEAFD_GLM_EXL3_WORKSPACE_MANIFEST" };
+        let manifest = PathBuf::from(std::env::var_os(variable).unwrap_or_else(||
+            root.parent().unwrap().join("placement-inputs/current/PROGRAMS.json").into_os_string()));
+        let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest)
+            .with_context(|| format!("required installed PROGRAMS missing: {}", manifest.display()))?)?;
+        fixture.register_programs(&library, metadata["programs"].as_array().context("installed programs missing")?)?;
+        let programs = library.programs()?.with_manifest(&manifest)?;
         let snapshot = installed_snapshot(repo)?;
         let cfg = GlmDsaConfig::read(&snapshot)?;
         let input = plan::PlanInput::open(&snapshot)?;
@@ -141,7 +146,7 @@ fn installed_glm_local_physical_equals_serving() -> Result<()> {
                 let packages = [&*local.package, &*local.package];
                 let owners = if storage == LocalStorage::Mount {
                     let (weights, records) = dense::recording(|| exl3::Exl3Tp2::load_pair_weights(devices, catalog, ExpertGeometry::GLM5,
-                        packages, selected.layers.clone(), rows, budgets, RtxSelectionPolicy::FirstCapacity))?;
+                        packages, selected.layers.clone(), rows, budgets, RtxSelectionPolicy::CanonicalDecode))?;
                     ensure!(!records.operands.is_empty(), "EXL3 payload recording did not run"); weights
                 } else {
                     let weights = [0, 1].map(|rank| -> Result<Vec<Exl3Weights<'_>>> {
@@ -154,7 +159,7 @@ fn installed_glm_local_physical_equals_serving() -> Result<()> {
                     });
                     let [left, right] = weights;
                     exl3::Exl3Tp2::pushed_pair_weights(devices, catalog, ExpertGeometry::GLM5, packages,
-                        selected.layers.clone(), rows, budgets, RtxSelectionPolicy::FirstCapacity, [left?, right?])?
+                        selected.layers.clone(), rows, budgets, RtxSelectionPolicy::CanonicalDecode, [left?, right?])?
                 };
                 [Box::new(owners[0].execution_with_modules(Some(modules(&fixture, devices[0], &local.package, rows)?))?),
                     Box::new(owners[1].execution_with_modules(Some(modules(&fixture, devices[1], &local.package, rows)?))?)]
