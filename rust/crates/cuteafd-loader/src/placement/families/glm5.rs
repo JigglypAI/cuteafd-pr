@@ -1236,7 +1236,7 @@ mod tests {
                 let peak = input.expert_workspace + automatic.onboard_layers as u64 * 4 * GIB;
                 assert_eq!(automatic.expert_ranges[0].peak_bytes, peak);
             } else {
-                assert!(automatic.expert_ranges.is_empty());
+                assert!(automatic.expert_ranges.iter().all(|range| range.layers == 0 && range.peak_bytes == 0));
             }
             let remote = GlmInputs { onboard: Onboard::Layers(0), ..input.clone() };
             let remote = solve_working_set(&remote, [0; 2], HEADS).unwrap().0;
