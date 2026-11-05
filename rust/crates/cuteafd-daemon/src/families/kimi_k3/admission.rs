@@ -843,7 +843,8 @@ fn request<const RANKS: usize>(i: Inputs<'_, RANKS>) -> Result<PlacementRequest>
                     weights, Basis::Exact).with_resident_weights(ResidentWeights(weights)));
             }
             let whole = if mla {
-                LayerLayout::pair_with_core(cfg, layer, MODES[1], &i.core)?[0].attention_bytes()? as u64
+                LayerLayout::pair_with_core(cfg, layer,
+                    LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, &i.core)?[0].attention_bytes()? as u64
             } else { 0 };
             (whole, attention)
         };
