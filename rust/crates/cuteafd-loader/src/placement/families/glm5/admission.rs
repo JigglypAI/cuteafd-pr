@@ -77,6 +77,126 @@ pub enum ReplyPhase {
     Prefill(PrefillShape),
 }
 
+impl GlmRecipe<'_> {
+    /// Mechanical executor output. Backend bytes come from the selected local
+    /// physical inventory, not the report's route/payload/check/view totals.
+    pub fn execution(&self, solved: &ResolvedPlan, backend_bytes: [u64; 2])
+        -> Result<(crate::placement::Placement, crate::placement::SparkWorkingSet), Refusal> {
+        use crate::placement::{AttentionClass, ExpertHome, ExpertRange, FfnMode, HopSpec,
+            HopStorage, LayerAssignment, Placement, PoolLimits, SparkWorkingSet, TerminalHome,
+            Tp2Range, plan_hops, residual_homes};
+        if !(1..=2).contains(&self.gpus) || solved.decisions.attention != self.attention
+            || self.attention.is_empty() || self.attention.len() > self.cfg.layers
+            || solved.decisions.onboard_layers.len() != self.gpus
+            || !self.prefill.contains(&solved.decisions.prefill)
+            || !self.lanes.contains(&solved.decisions.lanes)
+            || solved.decisions.embedding.is_none_or(|home| !self.embedding.contains(&home))
+        {
+            return Err(invalid("resolved execution differs from prepared geometry"));
+        }
+        let modes = &solved.decisions.attention;
+        let attention = if modes.iter().all(|mode| *mode == LayerMode::ContextSplit) {
+            AttentionPlacement::Context
+        } else if modes.iter().all(|mode| *mode == LayerMode::HeadSplit)
+            || self.gpus == 1 && modes.iter().all(|mode|
+                *mode == LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner })
+        {
+            AttentionPlacement::Heads
+        } else if modes.iter().all(|mode| matches!(mode, LayerMode::Whole { .. })) {
+            AttentionPlacement::Layers
+        } else {
+            return Err(invalid("executor cannot report mixed GLM attention modes"));
+        };
+        let mut local = Vec::new();
+        let mut remote = Vec::new();
+        let mut local_by_rank = vec![Vec::new(); self.gpus];
+        let mut ranks = None;
+        let mut assignments = Vec::with_capacity(modes.len());
+        for (layer, &mode) in modes.iter().enumerate() {
+            let experts = match solved.decisions.expert_homes.get(&layer) {
+                None if self.experts.is_none() || layer < self.cfg.first_moe_layer => ExpertHome::Dense,
+                None => return Err(invalid("resolved routed layer has no expert home")),
+                Some(_) if self.experts.is_none() || layer < self.cfg.first_moe_layer =>
+                    return Err(invalid("resolved expert home names a dense layer")),
+                Some(ExpertDestination::Coordinator { gpus }) => {
+                    if self.experts.as_ref().is_none_or(|profile| *gpus != profile.destination) {
+                        return Err(invalid("resolved local home differs from prepared destination"));
+                    }
+                    let home = match gpus.as_slice() {
+                        [0, 1] if self.gpus == 2 => ExpertHome::RtxTp2,
+                        [gpu] if usize::from(*gpu) < self.gpus => ExpertHome::RtxWhole { gpu: *gpu },
+                        _ => return Err(invalid("executor cannot bind resolved local expert home")),
+                    };
+                    for &gpu in gpus { local_by_rank[usize::from(gpu)].push(layer); }
+                    local.push(layer);
+                    home
+                }
+                Some(ExpertDestination::Sparks { ranks: selected }) => {
+                    if selected.is_empty() || selected.len() > 8
+                        || selected.iter().enumerate().any(|(rank, &value)| usize::from(value) != rank)
+                    {
+                        return Err(invalid("executor requires a Spark rank prefix starting at logical rank 0; non-prefix rank sets cannot be renumbered"));
+                    }
+                    if self.experts.as_ref().is_none_or(|profile| !profile.rank_sets.contains(selected))
+                        || ranks.as_ref().is_some_and(|ranks| ranks != selected)
+                    {
+                        return Err(invalid("resolved Spark layers do not share a prepared rank set"));
+                    }
+                    ranks = Some(selected.clone());
+                    remote.push(layer);
+                    ExpertHome::Spark
+                }
+            };
+            assignments.push(LayerAssignment { mode, experts });
+        }
+        if solved.decisions.expert_homes.keys().any(|&layer| layer >= modes.len())
+            || local_by_rank != solved.decisions.onboard_layers
+            || local.iter().copied().ne(self.cfg.first_moe_layer..self.cfg.first_moe_layer + local.len())
+            || self.experts.as_ref().is_some_and(|profile| !profile.counts.contains(&local.len()))
+            || backend_bytes.iter().enumerate().any(|(rank, &bytes)|
+                (rank >= self.gpus || local_by_rank[rank].is_empty()) && bytes != 0)
+        {
+            return Err(invalid("resolved onboarding is not the declared ordered prefix"));
+        }
+        let whole = local.iter().any(|&layer| matches!(assignments[layer].experts, ExpertHome::RtxWhole { .. }));
+        let tp2 = if !local.is_empty() && !whole {
+            Some(Tp2Range { first: local[0], layers: local.len(), peak_bytes: backend_bytes })
+        } else { None };
+        let ranges = local_by_rank.iter().enumerate().map(|(rank, layers)| {
+            if tp2.is_some() || layers.is_empty() { ExpertRange { first: 0, layers: 0, peak_bytes: 0 } }
+            else { ExpertRange { first: layers[0], layers: layers.len(), peak_bytes: backend_bytes[rank] } }
+        }).collect();
+        let hop_spec = HopSpec { storage: HopStorage::ReceiveSlots,
+            row_bytes: (self.cfg.hidden as u64).checked_mul(2).ok_or(Refusal::Overflow("GLM hop rows"))?,
+            rows: solved.decisions.prefill.rows.max(super::DECODE_ROWS),
+            lanes: solved.decisions.prefill.waves, entry_gpu: 0, head_gpu: 0,
+            terminal: if self.gpus == 2 { TerminalHome::Replicated } else { TerminalHome::AttentionOwner } };
+        let residual = residual_homes(modes, &hop_spec).map_err(|error| invalid(&error.to_string()))?;
+        let hops = plan_hops(modes, &hop_spec).map_err(|error| invalid(&error.to_string()))?;
+        let context = super::context_buffers(self.cfg, self.context, solved.decisions.prefill.rows,
+            solved.decisions.prefill.waves, super::GlmContext::default());
+        let mut peer_row_bytes = 0u64;
+        for (layer, mode) in modes.iter().enumerate() {
+            if *mode != LayerMode::ContextSplit { continue; }
+            peer_row_bytes = peer_row_bytes.checked_add(context.query_row_bytes)
+                .and_then(|bytes| bytes.checked_add(context.partial_row_bytes))
+                .and_then(|bytes| bytes.checked_add(if self.cfg.indexers[layer] == crate::families::glm5::GlmIndexer::Full {
+                    context.candidate_row_bytes
+                } else { 0 })).ok_or(Refusal::Overflow("GLM context peer rows"))?;
+        }
+        let placement = Placement { pool_tokens: solved.pool_tokens, pool_limits: PoolLimits(vec![]),
+            attention_placement: attention, attention_by_kind: vec![(AttentionClass::Dsa, attention)],
+            peer_row_bytes, onboard_layers: local.len(), max_pool_tokens_no_onboard: None,
+            layers: assignments, movables: vec![], expert_ranges: ranges, residual, hops, tp2,
+            items: (0..self.gpus).map(|rank| solved.items(Location::coordinator(rank as u8)))
+                .collect::<Result<_, _>>()? };
+        super::super::GLM5.check(&placement).map_err(|error| invalid(&error.to_string()))?;
+        let working = SparkWorkingSet { rtx_layers: local, spark_layers: remote,
+            spark_ranks: ranks.map_or(0, |ranks| ranks.len()), prefill_lanes: solved.decisions.prefill.waves };
+        Ok((placement, working))
+    }
+}
+
 /// Device return reserves only. Transport staging and registrations have their
 /// own owners; compressed replies reuse these BF16 fallback backings.
 #[derive(Debug, Clone)]
