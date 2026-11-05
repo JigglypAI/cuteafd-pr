@@ -363,14 +363,14 @@ mod tests {
 
     #[test]
     fn step5_context_uses_registered_native_attention_placement() {
-        for extra in [vec![], vec!["--split-device", "1"]] {
+        for (extra, resolved) in [(vec![], "heads"), (vec!["--split-device", "1"], "layers")] {
             let argv = ["cuteafd", "serve-step5", "--snapshot", "/s", "--native-lib", "/l", "--peers", "127.0.0.1:19000"]
                 .into_iter().chain(extra).collect::<Vec<_>>();
             let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
             let context = serve_context(&matches, None).unwrap().expect("Step-5 serve context");
             assert_eq!(context.family, None);
             let placement = context.settings.iter().find(|s| s.name == "attention-placement").unwrap();
-            assert_eq!(placement.value.as_deref(), Some("layers"));
+            assert_eq!(placement.value.as_deref(), Some(resolved));
             assert_eq!(placement.default.as_deref(), Some("layers"));
             assert!(attention_mode("step5", matches.subcommand().unwrap().1, "context").is_err());
         }
