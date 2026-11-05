@@ -45,6 +45,9 @@ int32_t cuteafd_audio_create(const cuteafd_audio_spec*, int32_t device,
 int32_t cuteafd_audio_upload(void*, const void* weights, uint64_t weight_bytes,
                             const float* hann, const float* mel_filterbank,
                             const float* codec_rotary, const float* patch_rotary);
+/* Deferred push uses the same admitted arena; external writes drain before commit. */
+int32_t cuteafd_audio_weight_arena(void*, void**);
+int32_t cuteafd_audio_commit_weights(void*);
 /* Host PCM24000Hz mono finiteF32,481..max_samples. Host outputs: F32 LM rows,
  * optional int32 RVQ[frames,20]. Extents are exact; no encode-time CUDA
  * allocation, library-plan creation, graph capture or kernel resolution. */

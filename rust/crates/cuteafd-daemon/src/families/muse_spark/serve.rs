@@ -189,7 +189,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
         pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
         "Muse Spark admitted TP experts with coordinator-combined partials");
-    let media = super::media::Ready::load(args, &library, built.media.as_ref().context("Muse media admission missing")?)?;
+    let mut media = super::media::Ready::load(args, &library, built.media.as_ref().context("Muse media admission missing")?)?;
     let prefill = args.prefill()?;
     let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_formats(args.expert_partial_bf16_max_rows,
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, cuteafd_core::spark_reply::requested())?;
@@ -260,8 +260,9 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
             };
             Ok((embedding, ranks, draft))
         };
-        let ((embedding, ranks, draft), records) = if push.is_some() { dense::recording(load)? }
+        let ((embedding, ranks, draft), mut records) = if push.is_some() { dense::recording(load)? }
             else { (load()?, dense::Records::default()) };
+        records.extend(media.push.records());
         let pushed = match push {
             Some(push) => {
                 let summary = records.summary();
@@ -274,6 +275,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
             }
             None => None,
         };
+        std::mem::take(&mut media.push).commit()?;
         let local = match &package {
             None => {
                 ensure!(pushed.as_ref().is_none_or(|ranks| ranks.iter().all(|rank| rank.len() == 0)),
@@ -320,7 +322,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     initialized: impl FnOnce(super::media::ApiReady) -> Result<()>) -> Result<()> {
     use crate::shared::qwen::scheduler::{self, Backend as _};
     with_backend(args, |backend, sequences, ready| {
-        let super::media::Ready { encoder, image, audio, cache_bytes, prefix } = ready;
+        let super::media::Ready { encoder, image, audio, cache_bytes, prefix, .. } = ready;
         let api = super::media::ApiReady { context: backend.geometry().max_context, image, audio,
             image_health: encoder.health_handle_for(false), audio_health: encoder.health_handle_for(true) };
         let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(cache_bytes),

@@ -1960,6 +1960,11 @@ impl Opened {
     /// the engine serves (`engine.mark_slots`).
     pub fn with_engine<'s, T>(&'s self, args: &EngineArgs, body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>)
         -> Result<T> {
+        self.with_engine_media(args, Default::default(), body)
+    }
+    pub(super) fn with_engine_media<'s, T>(&'s self, args: &EngineArgs,
+        media: crate::shared::experts::rtx::dense::Records,
+        body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>) -> Result<T> {
         // A head split whose GPUs lack peer access serves from --device alone, decided before any load or
         // admission. The arena is counted after both decisions (below), on the layout this engine serves:
         // each admitted GPU reserves its part of every mark (a lone GPU, the whole mark), as the prefix
@@ -2256,6 +2261,7 @@ impl Opened {
                     }))
             })?;
             records.extend(load.sink.as_ref().context("push sink")?.take_all());
+            records.extend(media.clone());
             let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records, &devices, sparks)?;
             Ok((embedding, model, dense))
         };
@@ -2335,11 +2341,12 @@ impl Opened {
         };
         let plan_native = |sparks: usize| -> Result<_> {
             let native = native_admission.as_ref().context("native Flash admission")?;
-            let (owners, records) = crate::shared::experts::rtx::dense::recording(|| {
+            let (owners, mut records) = crate::shared::experts::rtx::dense::recording(|| {
                 let loaded = native.load(&self.library, &programs, &loader, &self.cfg, &execution, embedding_device.id)?;
                 let shared = native.load_shared(args, &self.cfg, &self.library, &programs)?;
                 Ok((loaded, shared))
             })?;
+            records.extend(media.clone());
             let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records, &devices, sparks)?;
             Ok((owners, dense))
         };

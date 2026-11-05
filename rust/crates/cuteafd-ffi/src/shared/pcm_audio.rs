@@ -83,10 +83,30 @@ impl NativePcmAudio {
         admitted: u64,
         weights: &[u8],
     ) -> Result<Self, AudioError> {
+        Self::load_inner(path, spec, device, admitted, Some(weights))
+    }
+    pub fn prepare(path: &Path, spec: &PcmSpec, device: i32, admitted: u64) -> Result<Self, AudioError> {
+        Self::load_inner(path, spec, device, admitted, None)
+    }
+    pub fn weight_arena(&self) -> Result<usize, AudioError> {
+        // SAFETY: exact header ABI, live owner; caller retains it through external writes.
+        unsafe {
+            let get = self._library.get::<unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32>(b"cuteafd_pcm_weight_arena")?;
+            let mut arena = std::ptr::null_mut();
+            check(get(self.owner, &mut arena))?;
+            Ok(arena as usize)
+        }
+    }
+    /// Call only after the existing push group drains all external writes.
+    pub fn commit_weights(&mut self) -> Result<(), AudioError> {
+        // SAFETY: exact header ABI and live thread-confined owner.
+        unsafe { check(self._library.get::<unsafe extern "C" fn(*mut c_void) -> i32>(b"cuteafd_pcm_commit_weights")?(self.owner)) }
+    }
+    fn load_inner(path: &Path, spec: &PcmSpec, device: i32, admitted: u64, weights: Option<&[u8]>) -> Result<Self, AudioError> {
         if spec.abi_version != 2 || !spec.feature_norm_eps.is_finite() || spec.feature_norm_eps <= 0.0 {
             return Err(AudioError::InvalidInput("PCM ABI 2 and positive finite feature epsilon required"));
         }
-        if weights.len() as u64 != spec.weight_bytes {
+        if weights.is_some_and(|w| w.len() as u64 != spec.weight_bytes) {
             return Err(AudioError::InvalidInput("PCM weight arena length"));
         }
         // SAFETY: symbols have the versioned C header ABI, and Library is held
@@ -112,9 +132,11 @@ impl NativePcmAudio {
             }
             let mut owner = std::ptr::null_mut();
             check(create(spec, device, admitted, &mut owner))?;
-            if let Err(error) = check(upload(owner, 0, weights.as_ptr(), weights.len() as u64)) {
-                destroy(owner);
-                return Err(error);
+            if let Some(weights) = weights {
+                if let Err(error) = check(upload(owner, 0, weights.as_ptr(), weights.len() as u64)) {
+                    destroy(owner);
+                    return Err(error);
+                }
             }
             Ok(Self {
                 _library: library,

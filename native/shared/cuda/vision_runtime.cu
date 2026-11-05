@@ -270,6 +270,18 @@ extern "C" int32_t cuteafd_vision_upload(void* owner, uint64_t offset, const voi
   if(!e && offset==0 && bytes==o->spec.weight_bytes)o->uploaded=true;
   return e;
 }
+extern "C" int32_t cuteafd_vision_weight_arena(void* owner, void** arena) {
+  if(!owner || !arena)return cudaErrorInvalidValue;auto* o=static_cast<Owner*>(owner);
+  if(o->uploaded)return cudaErrorInvalidValue;
+  int e=device_ok(o);if(e)return e;
+  e=drain(o,cudaMemsetAsync(o->weights,0,o->spec.weight_bytes,o->stream));
+  if(!e)*arena=o->weights;return e;
+}
+extern "C" int32_t cuteafd_vision_commit_weights(void* owner) {
+  if(!owner)return cudaErrorInvalidValue;auto* o=static_cast<Owner*>(owner);
+  int e=device_ok(o);if(e)return e;e=drain(o,0);
+  if(!e)o->uploaded=true;return e;
+}
 extern "C" int32_t cuteafd_vision_get_ledger(void* owner, cuteafd_vision_ledger* out) {
   if(!owner || !out)return cudaErrorInvalidValue; *out=static_cast<Owner*>(owner)->ledger;return 0;
 }

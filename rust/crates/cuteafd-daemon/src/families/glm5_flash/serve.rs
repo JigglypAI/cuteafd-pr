@@ -274,17 +274,19 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
             return Ok(());
         }
     };
-    let (vision, prefix) = match super::media::ReadyVision::load(&args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
+    let (mut vision, prefix) = match super::media::ReadyVision::load(&args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
         Ok(vision) => vision,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };
+    let media_push = vision.as_mut().map(|vision| std::mem::take(&mut vision.push)).unwrap_or_default();
     let preparer = vision.as_ref().map(|vision| vision.preparer.clone());
     let (encoder, bytes) = vision.map_or((super::media::Encoder::Off, 0), |vision|
         (vision.encoder, vision.cache_bytes));
     let health = encoder.health_handle();
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
-    let result = opened.with_engine(&args, |engine| {
+    let result = opened.with_engine_media(&args, media_push.records(), |engine| {
+        media_push.commit()?;
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-glmf needs every layer");
         anyhow::ensure!(engine.has_expert_homes(), "serve-glmf needs an admitted home for every routed layer");
         anyhow::ensure!(preparer.is_none() || media.encoder().available(), "vision encoder unavailable before readiness");

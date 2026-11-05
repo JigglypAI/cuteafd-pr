@@ -294,6 +294,7 @@ pub(super) fn inventory(snapshot: &Path, vision: cuteafd_loader::plan::MediaMode
 }
 
 pub(super) struct Ready {
+    pub push: crate::shared::vision::push::Contribution,
     pub encoder: crate::shared::qwen::Encoder,
     pub image: Option<std::sync::Arc<cuteafd_api::openai::media::MediaPreparer>>,
     pub audio: Option<std::sync::Arc<cuteafd_api::openai::media::audio::AudioPreparer>>,
@@ -342,7 +343,7 @@ impl Ready {
             else { (args.prefix.clone(), 0) };
         if !image_on && !audio_on {
             ensure!(args.vision_peers.is_empty() && args.audio_peers.is_empty(), "disabled media cannot have encoder peers");
-            return Ok(Self { encoder: Encoder::Off, image: None, audio: None, cache_bytes, prefix });
+            return Ok(Self { push: Default::default(), encoder: Encoder::Off, image: None, audio: None, cache_bytes, prefix });
         }
         let processor = if image_on { ProcessorConfig::from_snapshot(&args.snapshot, ImageFamily::Muse)? }
             // The audio-only adapter never reads image normalization or patch fields.
@@ -393,18 +394,23 @@ impl Ready {
         let audio = ready_audio.as_ref().map(|audio| audio.preparer.clone());
         let mut audio_encoder = ready_audio.as_mut().and_then(|audio| audio.remote.take()).map(Encoder::Remote).unwrap_or(Encoder::Off);
         let mut local_audio = ready_audio.and_then(|audio| audio.local);
+        let mut push = vision::push::Contribution::default();
         let shared_local = local_image.is_some() && local_audio.is_some() && image_gpu == audio_gpu;
         if let Some(spec) = local_image.take() {
-            let service = EncoderService::start_with_audio(spec, args.native_lib.clone(), image_gpu.context("vision GPU")?,
-                admitted.vision.admitted_bytes(), if shared_local { local_audio.take() } else { None })?;
+            let (service, contribution) = EncoderService::start_coordinator(&args.snapshot,
+                Some((spec, admitted.vision.admitted_bytes())), args.native_lib.clone(), image_gpu.context("vision GPU")?,
+                if shared_local { local_audio.take() } else { None })?;
+            push.extend(contribution);
             image_encoder = Encoder::Local(LocalEncoder::new(service, &processor, 8192, 4096));
         }
         if let Some(audio) = local_audio {
-            let service = EncoderService::start_audio(args.native_lib.clone(), audio_gpu.context("audio GPU")?, audio)?;
+            let (service, contribution) = EncoderService::start_coordinator(&args.snapshot, None,
+                args.native_lib.clone(), audio_gpu.context("audio GPU")?, Some(audio))?;
+            push.extend(contribution);
             audio_encoder = Encoder::Local(LocalEncoder::new(service, &processor, 8192, 4096));
         }
         let encoder = if shared_local { image_encoder } else { Encoder::split(image_encoder, audio_encoder) };
-        Ok(Self { encoder, image, audio, cache_bytes, prefix })
+        Ok(Self { push, encoder, image, audio, cache_bytes, prefix })
     }
 }
 
