@@ -760,6 +760,11 @@ impl Bench {
                         r.panels[index].partial = None;
                     }
                     Err(error) => {
+                        // Fast failures may finish between ticker updates. Persist their
+                        // last evidence synchronously before saving the failed panel.
+                        if let Some(partial) = progress.get().partial {
+                            Self::apply_partial(&mut r, progress, panel.id(), &partial);
+                        }
                         if error.downcast_ref::<crate::client::Cancelled>().is_some() || self.stopping.get().is_some() {
                             if let Some(reason) = self.interrupted() { r.panels[index].error = Some(reason); }
                             r.panels[index].status = PanelStatus::Cancelled;

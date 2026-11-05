@@ -5,7 +5,7 @@ use crate::report::StreamTiming;
 use anyhow::{bail, Context, Result};
 use cuteafd_api::openai::probe::{self, ProbeRecord, ProbeSpec};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -258,7 +258,12 @@ impl Client {
         let response = match self.authorize(request).send_string(&body.to_string()) {
             Ok(response) => response,
             Err(ureq::Error::Status(code, response)) => {
-                let text = response.into_string().unwrap_or_default();
+                let mut bytes = Vec::new();
+                let _ = response.into_reader().take(4097).read_to_end(&mut bytes);
+                let truncated = bytes.len() > 4096;
+                bytes.truncate(4096);
+                let mut text = String::from_utf8_lossy(&bytes).into_owned();
+                if truncated { text.push_str(" [truncated]"); }
                 return Err(UpstreamHttpError { code, body: text }.into());
             }
             Err(error) => return Err(error).context("chat request"),

@@ -138,6 +138,15 @@ fn occupancy(client: &Client) -> Value {
     client.pool_observation()
 }
 
+fn request_error(error: &anyhow::Error, phase: &str, request: usize) -> Value {
+    let mut value = json!({"phase": phase, "request": request, "error": format!("{error:#}")});
+    if let Some(http) = error.downcast_ref::<crate::client::UpstreamHttpError>() {
+        value["http_status"] = json!(http.code);
+        value["response_body"] = json!(http.body);
+    }
+    value
+}
+
 /// Observe pool use without adding stats reads to the request hot path. The
 /// condition variable ends the sampler immediately when the wave completes.
 /// The wave runs a retained base, which re-renders the model's own answer.
@@ -298,8 +307,10 @@ impl ContextLoad {
                 Ok(chat) => chat,
                 Err(error) => {
                     for &c in &options.levels {
-                        points.push(json!({"context": length, "c": c, "status": "failed", "reason": format!("base prefill: {error:#}")}));
+                        points.push(json!({"context": length, "requested_context": requested, "c": c, "status": "failed", "reason": format!("base prefill: {error:#}"),
+                            "request_errors": [request_error(&error, "base prefill", 0)]}));
                     }
+                    ctx.progress.partial(record(&bases, &points));
                     continue;
                 }
             };
@@ -346,6 +357,8 @@ impl ContextLoad {
                     .filter_map(|r| r.as_ref().err().map(|e| format!("{e:#}")))
                     .collect();
                 point["warm_errors"] = json!(warm_errors);
+                point["request_errors"] = json!(warm.iter().enumerate().filter_map(|(i, r)|
+                    r.as_ref().err().map(|e| request_error(e, "warm", i))).collect::<Vec<_>>());
                 let warm_reused = warm.iter().all(|r| {
                     r.as_ref().is_ok_and(|r| {
                         r.chat.timing.cached_tokens >= actual.saturating_sub(page.max(actual / 50))
@@ -363,6 +376,7 @@ impl ContextLoad {
                     point["reason"] =
                         json!("warm batch rejected requests or did not reuse the base");
                     points.push(point);
+                    ctx.progress.partial(record(&bases, &points));
                     continue;
                 }
                 // Never retry failures sequentially: that would pretend a queued
@@ -373,6 +387,8 @@ impl ContextLoad {
                     .iter()
                     .filter_map(|r| r.as_ref().err().map(|e| format!("{e:#}")))
                     .collect();
+                point["request_errors"] = json!(results.iter().enumerate().filter_map(|(i, r)|
+                    r.as_ref().err().map(|e| request_error(e, "timed", i))).collect::<Vec<_>>());
                 let ok: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
                 let reused = ok.iter().all(|r| {
                     r.chat.timing.cached_tokens >= actual.saturating_sub(page.max(actual / 50))
@@ -427,6 +443,7 @@ impl ContextLoad {
             }
         }
         let result = record(&bases, &points);
+        ctx.progress.partial(result.clone());
         validate_suffix(&result, options.suffix_tokens).map_err(anyhow::Error::msg)?;
         Ok(result)
     }
