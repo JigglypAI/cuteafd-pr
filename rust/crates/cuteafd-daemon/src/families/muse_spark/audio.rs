@@ -35,7 +35,7 @@ impl ReadyAudio {
             return Ok(None);
         }
         let spec = PcmTowerSpec::from_snapshot(snapshot, MAX_CLIP_SAMPLES)?;
-        let bytes = spec.required_bytes()?;
+        let bytes = spec.required_bytes(library)?;
         let geometry = cuteafd_core::media::AudioTokenGeometry::PcmPatches {
             samples_per_token: 1920,
         };

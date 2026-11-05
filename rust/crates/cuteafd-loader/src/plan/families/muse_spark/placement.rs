@@ -116,7 +116,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             Ok(drafter) => drafter,
             Err(error) => {
                 report.refuse_placement(format!("Muse DFlash2 drafter refused: {error:#}"),
-                    "Use a drafter trained for this target (RadixArk/Muse-Spark-Open-DFlash2) or drop --draft.");
+                    "Use a drafter trained for this target (nvidia/Muse-Spark-Open-816B-A42B-DFlash2) or drop --draft.");
                 return memory;
             }
         },
