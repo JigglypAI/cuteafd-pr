@@ -181,6 +181,51 @@ pub(crate) mod tests {
         assert_eq!(checked.totals.rank_bytes, vec![source]);
         assert_eq!(checked.totals.file_bytes.iter().sum::<u64>(), source);
     }
+    fn seed_payloads<'a>(reads: impl IntoIterator<Item = (&'a std::path::Path, &'a cuteafd_loader::SafetensorsTensorMetadata)>) {
+        use std::os::unix::fs::FileExt;
+        // Signed zero, infinities, NaN payloads and finite BF16 values must survive bitwise.
+        let pattern: Vec<u8> = [0u16, 0x8000, 0x3f80, 0xbf80, 0x7f80, 0xff80, 0x7fc1, 0x0001]
+            .into_iter().flat_map(u16::to_le_bytes).collect();
+        for (path, metadata) in reads {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            let count = pattern.len().min(metadata.byte_length as usize);
+            file.write_all_at(&pattern[..count], metadata.byte_offset).unwrap();
+            file.write_all_at(&pattern[..count], metadata.byte_offset + metadata.byte_length - count as u64).unwrap();
+        }
+    }
+
+    fn assert_replayed_arena(snapshot: &std::path::Path, mounted: &[u8], constants: Option<(usize, &[u8])>,
+        prepare: impl FnOnce(usize) -> Result<Records>) -> Result<()> {
+        use crate::shared::{experts::rtx::dense, memory::{device::Device, DeviceAllocation}};
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        let root = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME")?)
+            .join(".cache/cuteafd/builds/media-tower-arena-replay-fixture");
+        let fixture = Fixture::build_in(&root)?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 16usize << 30)?;
+        fixture.immediate_copies(&library)?;
+        fixture.quiet_events(&library, true)?;
+        let device = Device { library: &library, id: 0 };
+        let allocation = DeviceAllocation::new(&library, mounted.len())?;
+        let mut actual = vec![0; mounted.len()];
+        library.copy_h2d(allocation.buffer, &actual)?;
+        // The real vision prepare initializes this region independently of pushed payloads.
+        if let Some((at, bytes)) = constants {
+            let mut dst = allocation.buffer;
+            dst.ptr = dst.ptr.wrapping_byte_add(at);
+            dst.bytes = bytes.len();
+            library.copy_h2d(dst, bytes)?;
+        }
+        let records = prepare(allocation.buffer.ptr as usize)?;
+        let layout = dense::RankLayout::new(records.operands, records.steps, 0)?;
+        dense::testing::replay(device, layout, snapshot, 1, 0)?;
+        library.copy_d2h(&mut actual, allocation.buffer)?;
+        assert_eq!(actual.len(), mounted.len());
+        assert!(actual == mounted, "pushed arena differs at byte {:?}",
+            actual.iter().zip(mounted).position(|(a, b)| a != b));
+        Ok(())
+    }
+
     #[test]
     fn muse_vision_pcm_share_a_checked_group_without_changing_resident_bytes() {
         let root = tempfile::tempdir().unwrap();
@@ -196,6 +241,23 @@ pub(crate) mod tests {
             * if read.vector { 2 } else { 1 }).sum::<usize>()
             + pcm.push_reads().map(|read| read.metadata.byte_length as usize).sum::<usize>();
         assert_records(root.path(), records, source, resident);
+    }
+    #[test]
+    fn pushed_vision_and_pcm_arenas_match_mounted_bytes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_muse_media_snapshot(root.path(), &[0]);
+        let vision = TowerSpec::muse(root.path(), 4096)?;
+        seed_payloads(vision.reads.iter().map(|read| (read.path.as_path(), &read.metadata)));
+        let constants = vision.frequency_bytes();
+        assert_replayed_arena(root.path(), &vision.load_weights()?,
+            Some((vision.native.inv_freq as usize, &constants)), |address|
+                Ok(Contribution::prepare(0, Some((&vision, address)), None, None, None)?.records()))?;
+        let pcm = PcmTowerSpec::from_snapshot(root.path(), 19200)?;
+        seed_payloads(pcm.push_reads().map(|read| (read.path.as_path(), &read.metadata)));
+        let plan = cuteafd_loader::media::pcm_audio::PcmAudioPlan::from_snapshot(root.path())?;
+        assert_replayed_arena(root.path(), &plan.read_weights(plan.weight_bytes())?, None, |address|
+            Ok(Contribution::prepare(0, None, Some((&pcm, address)), None, None)?.records()))?;
+        Ok(())
     }
     #[test]
     fn vision_push_rejects_native_constant_and_record_overlaps() {
@@ -293,6 +355,10 @@ pub(crate) mod tests {
             * if read.metadata.dtype == cuteafd_core::DType::Bf16 { 2 } else { 1 }).sum();
         assert_records(root.path(), records, source, resident);
         assert_eq!(spec.native().weight_bytes,before);
+        seed_payloads(spec.plan().reads().values().map(|read| (read.path.as_path(), &read.metadata)));
+        let mounted = spec.plan().load_weights(before).unwrap();
+        assert_replayed_arena(root.path(), &mounted, None, |address|
+            Ok(Contribution::prepare(0, None, None, Some((&spec, address)), None)?.records())).unwrap();
     }
     #[test]
     fn widening_is_bounded_and_rejects_invalid_extents() {
