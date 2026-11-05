@@ -284,7 +284,10 @@ fn production_rejects_misindexed_hooks_and_spark_free_multiwave() {
 #[test]
 fn production_whole_local_has_no_pair_owners_and_rejects_wrong_world() {
     use super::super::local_physical::{LocalPhysicalInput, LocalPhysicalSource, LocalStorage};
-    let cfg = cfg();
+    let mut cfg = cfg();
+    // Keep a remote suffix: full onboarding is deliberately unavailable at three waves.
+    cfg.layers += 1;
+    cfg.indexers.push(crate::families::glm5::GlmIndexer::Shared);
     let prefill = PrefillShape { rows: 128, waves: 3 };
     let source = LocalPhysicalSource::test_source(1, cfg.first_moe_layer..cfg.layers, 128);
     let physical = LocalPhysicalInput { layers: (cfg.first_moe_layer..cfg.layers).collect(),
