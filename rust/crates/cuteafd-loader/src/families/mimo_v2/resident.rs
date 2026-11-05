@@ -26,9 +26,9 @@ pub struct MimoResidentOptions {
 pub struct MimoResidentLayout {
     pub ranks: Vec<Vec<MemoryReservation>>,
     /// Maximum extra source storage on each physical rank while target weights
-    /// load, before target KV exists. BF16 TP2 slices a whole output matrix on
-    /// the lead; selected FP8 packing stages at most1024 source rows per rank.
-    /// A checkpoint-native FP8 upload needs no device source staging.
+    /// load, before target KV exists. Native BF16 column shares land directly
+    /// in final owners; selected FP8 packing stages at most1024 source rows per
+    /// rank. Checkpoint-native BF16/FP8 uploads need no device source staging.
     pub loading_temporary_rank_bytes: Vec<u64>,
 }
 
