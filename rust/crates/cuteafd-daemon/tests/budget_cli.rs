@@ -190,7 +190,7 @@ fn release_accepts_prefill(deployment: &[u8]) -> serde_json::Value {
     assert!(value.get("prefill_slots").is_none(), "{value}");
     // Exercise the launcher's actual consumer, not a copied jq predicate or a
     // fabricated plan. Sourcing the whole launcher would start containers.
-    let source = include_str!("../../../../scripts/launch/run-family.sh");
+    let source = include_str!("../../../../scripts/lib/family-keys.sh");
     let function = |name: &str| {
         let start = source.find(&format!("{name}() {{\n")).unwrap();
         let end = source[start..].find("\n}\n").unwrap() + start + 3;
