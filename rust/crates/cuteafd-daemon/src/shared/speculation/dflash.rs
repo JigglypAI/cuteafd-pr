@@ -2016,6 +2016,8 @@ impl<'a> DflashDrafter<'a> {
         let rows = sequences * c.block;
         let drafted = sequences * c.drafts();
         let physical = self.physical.as_ref().context("GQA draft has no physical layout")?;
+        ensure!(physical.owner_bytes("workspace.head")? == VOCABULARY_HEAD_WORKSPACE,
+            "native vocabulary head scratch differs from layout");
         ensure!(self.library.glm_dflash_topk_workspace(drafted)?.max(256) == physical.owner_bytes("workspace.dflash.topk")?, "native DFlash selector scratch differs from layout");
         let alloc = |id: &str| DeviceAllocation::new(self.library, physical.owner_bytes(&format!("workspace.{id}"))?);
         let head_workspace = alloc("head")?;

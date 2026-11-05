@@ -405,11 +405,14 @@ static void *upload_events[128];
 static size_t upload_event_count;
 
 int cuteafd_cuda_event_create_ordering(void **out) {
-    if (upload_event_count == 128) return 1;
-    *out = calloc(1, sizeof(struct upload_event));
-    if (!*out) return 1;
     pthread_mutex_lock(&upload_mutex);
-    upload_events[upload_event_count++] = *out;
+    size_t slot = 0;
+    while (slot < upload_event_count && upload_events[slot]) ++slot;
+    if (slot == 128) { pthread_mutex_unlock(&upload_mutex); return 1; }
+    *out = calloc(1, sizeof(struct upload_event));
+    if (!*out) { pthread_mutex_unlock(&upload_mutex); return 1; }
+    upload_events[slot] = *out;
+    if (slot == upload_event_count) ++upload_event_count;
     pthread_mutex_unlock(&upload_mutex);
     event('C');
     return 0;

@@ -83,6 +83,16 @@ fn installed_standard_dflash_physical_layout_equals_serving_receipts() -> Result
                     ensure!(!records.operands.is_empty(), "real weight load did not run");
                     ensure!(representation == GlmDraftRepresentation::Bf16Only || !records.steps.is_empty(),
                         "real FP8 packing destinations did not run");
+                    // Serving retains one admitted-maximum workspace, including for C1 probes.
+                    for rejected in [0, sequences.saturating_sub(1), sequences + 1] {
+                        let error = match drafter.workspace(rejected) {
+                            Err(error) => error,
+                            Ok(_) => anyhow::bail!("accepted non-admitted workspace capacity {rejected}"),
+                        };
+                        ensure!(error.to_string().contains("must use admitted capacity"), "{error}");
+                    }
+                    let missing = forecast.owner_bytes("missing-owner").unwrap_err();
+                    ensure!(missing.to_string().contains("missing-owner"), "{missing}");
                     *drafter.workspace.borrow_mut() = Some(drafter.workspace(sequences)?);
                     drafter.prime_metadata()?;
                     let actual: BTreeMap<_, _> = drafter.allocation_receipts(CoordinatorDevices::new(&[0])?, "draft")?

@@ -145,7 +145,8 @@ impl GlmDflashPhysicalLayout {
     pub fn owners(&self) -> &[Allocation] { &self.owners }
 
     pub fn owner_bytes(&self, id: &str) -> Result<usize> {
-        self.owners.iter().find(|owner| owner.id == id).context("unknown GQA draft owner")?
+        self.owners.iter().find(|owner| owner.id == id)
+            .with_context(|| format!("unknown GQA draft owner {id}"))?
             .bytes.try_into().context("GQA draft owner extent exceeds usize")
     }
 
