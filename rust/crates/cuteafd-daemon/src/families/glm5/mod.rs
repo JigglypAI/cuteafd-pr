@@ -484,6 +484,24 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn golden_layer_dump_round_trips_bf16_rows() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let output = root.path().join("layers");
+        let stream: Vec<u8> = [1.0f32, -2.5, 0.0, 16.0].into_iter()
+            .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes()).collect();
+        dump_golden_layer(&output, 3, &stream)?;
+        let loaded = std::fs::read(output.join("layer03.bin"))?;
+        assert_eq!(loaded, stream);
+        assert_eq!(bf16s(&loaded), vec![1.0, -2.5, 0.0, 16.0]);
+        let (cosine, relative) = similarity(&bf16s(&loaded), &bf16s(&stream));
+        assert!(cosine > 0.999999);
+        assert_eq!(relative, 0.0);
+        assert!(dump_golden_layer(&output, 4, &[0]).is_err());
+        assert!(!output.join("layer04.bin").exists());
+        Ok(())
+    }
+
+    #[test]
     fn golden_rejects_invalid_unit_geometry_before_opening_checkpoint() {
         #[derive(Parser)]
         struct Golden { #[command(flatten)] args: GoldenArgs }
@@ -690,6 +708,9 @@ pub(crate) struct GoldenArgs {
     /// python/reference/families/glm5/golden.py.
     #[arg(long)]
     pub golden: PathBuf,
+    /// Write each prefill layer's BF16 residual rows as layerNN.bin for --golden comparisons.
+    #[arg(long)]
+    pub layer_dump: Option<PathBuf>,
     /// Prefill only the first N tokens, then feed the rest through decode
     /// steps of --step-rows rows (teacher-forced), comparing their rows.
     #[arg(long)]
@@ -1722,6 +1743,13 @@ impl Opened {
     }
 }
 
+fn dump_golden_layer(dir: &std::path::Path, layer: usize, stream: &[u8]) -> Result<()> {
+    ensure!(stream.len() % 2 == 0, "golden layer dump must contain complete BF16 elements");
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join(format!("layer{layer:02}.bin")), stream)?;
+    Ok(())
+}
+
 fn bf16s(bytes: &[u8]) -> Vec<f32> {
     bytes.chunks_exact(2).map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)).collect()
 }
@@ -2178,7 +2206,10 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
     };
     let mut worst = Vec::new();
     let logits = engine.prefill(&mut placement, &tokens[..prefill], transport.as_deref_mut().map(|t| (t, runtime)),
-        Some(&mut |layer, stream| compare(layer, 0, stream, &mut worst)))?;
+        Some(&mut |layer, stream| {
+            if let Some(dir) = &args.layer_dump { dump_golden_layer(dir, layer, stream)?; }
+            compare(layer, 0, stream, &mut worst)
+        }))?;
     let prefill_seconds = started.elapsed().as_secs_f64();
     let started = Instant::now();
     let mut decode_worst = Vec::new();
