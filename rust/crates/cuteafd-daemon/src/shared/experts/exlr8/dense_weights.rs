@@ -6,29 +6,6 @@ use cuteafd_loader::plan::exlr8::dense::{DenseComponent, DenseEncoding, DensePla
     allocation, DenseSelection, DenseSlice, DenseTransform, KvBLayout, ShardSide};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// Shared MLA/KDA projection roles, independent of the checkpoint's root prefix.
-const PROJECTIONS: [(&str, &str); 19] = [
-    ("q_a", "self_attn.q_a_proj"),
-    ("kv_a", "self_attn.kv_a_proj_with_mqa"),
-    ("q_b", "self_attn.q_b_proj"),
-    ("o", "self_attn.o_proj"),
-    ("index_q", "self_attn.indexer.wq_b"),
-    ("index_k", "self_attn.indexer.wk"),
-    ("index_w", "self_attn.indexer.weights_proj"),
-    ("gate", "mlp.gate_proj"),
-    ("up", "mlp.up_proj"),
-    ("down", "mlp.down_proj"),
-    ("router", "mlp.gate"),
-    ("q", "self_attn.q_proj"),
-    ("k", "self_attn.k_proj"),
-    ("v", "self_attn.v_proj"),
-    ("beta", "self_attn.b_proj"),
-    ("f_a", "self_attn.f_a_proj"),
-    ("g_a", "self_attn.g_a_proj"),
-    ("f_b", "self_attn.f_b_proj"),
-    ("g_b", "self_attn.g_b_proj"),
-];
-
 /// How one native projection runs: its encoding and this rank's slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeProjection {
@@ -79,7 +56,7 @@ impl NativeDenseRecords {
             let prefix = selection.layer_prefix(layer)?;
             let mut projections = HashMap::new();
             let mut projected = HashSet::new();
-            for (stem, path) in PROJECTIONS {
+            for (stem, path) in DenseSelection::PROJECTIONS {
                 let tensor = format!("{prefix}.{path}.weight");
                 let Some(full) = record(&tensor) else { continue };
                 // The shared plan already excludes rank-zero and whole-MLA
@@ -161,7 +138,11 @@ fn widen_steps(name: &str, component: &DenseComponent, device: i32, dst: Cuteafd
 /// landed unchanged or staged load-only for the existing lossless Widen job.
 pub(crate) fn landed<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, name: &str, component: &DenseComponent,
     transform: DenseTransform, stream: *mut std::ffi::c_void) -> Result<DeviceAllocation<'a>> {
-    let allocation = DeviceAllocation::new(library, transform.allocation_bytes(component)?)?;
+    let bytes = transform.allocation_bytes(component)?;
+    let device = library.cuda_get_device()?;
+    let allocation = DeviceAllocation::new(library, bytes)?;
+    ensure!(allocation.buffer.bytes == bytes && allocation.buffer.device_id == device && !allocation.buffer.ptr.is_null(),
+        "{name}: native actual allocation differs from request");
     land_into(library, load, name, component, transform, allocation.buffer, stream)?;
     Ok(allocation)
 }
@@ -225,8 +206,20 @@ pub(crate) fn load_layer<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, r
     load_layer_packed(library, load, records, &[], stream)
 }
 
-pub(crate) fn load_layer_packed<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, records: &LayerRecords,
-    packs: &[PlainPack], stream: *mut std::ffi::c_void) -> Result<HashMap<String, DeviceAllocation<'a>>> {
+pub(crate) enum LayerOperation<'a> {
+    Land { name: String, component: &'a DenseComponent, transform: DenseTransform },
+    Pack { pack: &'a PlainPack, offsets: Vec<usize> },
+    Absorb { record: &'a DenseRecord, layout: &'a KvBLayout },
+}
+
+pub(crate) struct LayerRequest<'a> {
+    pub owners: Vec<(String, usize)>,
+    pub operation: LayerOperation<'a>,
+}
+
+/// The native reader and CPU replay traverse the identical allocation dispatch.
+pub(crate) fn layer_requests<'a>(records: &'a LayerRecords, packs: &'a [PlainPack],
+    mut receive: impl FnMut(LayerRequest<'a>) -> Result<()>) -> Result<()> {
     let mut consumed = HashSet::new();
     let mut outputs = HashSet::new();
     let layouts = packs.iter().map(|pack| {
@@ -235,37 +228,69 @@ pub(crate) fn load_layer_packed<'a>(library: &'a NativeLibrary, load: &DenseLoad
         for name in &pack.components { ensure!(consumed.insert(name.as_str()), "native plain record packed twice"); }
         packed_plain_layout(records, pack)
     }).collect::<Result<Vec<_>>>()?;
-    let mut out = HashMap::new();
     for (stem, (projection, slice)) in &records.projections {
         ensure!(!matches!(projection.encoding, DenseEncoding::F32 | DenseEncoding::F16 | DenseEncoding::RowFp8),
             "{}: no native dense kernel for {:?}", slice.tensor, projection.encoding);
         for component in &slice.components {
-            let name = format!("{}.{}", slice.tensor, component.suffix);
-            out.insert(key(stem, &component.suffix), landed(library, load, &name, component, slice.transform, stream)?);
+            receive(LayerRequest { owners: vec![(key(stem, &component.suffix), slice.transform.allocation_bytes(component)?)],
+                operation: LayerOperation::Land { name: format!("{}.{}", slice.tensor, component.suffix), component,
+                    transform: slice.transform } })?;
         }
     }
     for (tensor, (component, transform)) in &records.plain {
         if !consumed.contains(tensor.as_str()) {
-            out.insert(tensor.clone(), landed(library, load, tensor, component, *transform, stream)?);
+            receive(LayerRequest { owners: vec![(tensor.clone(), transform.allocation_bytes(component)?)],
+                operation: LayerOperation::Land { name: tensor.clone(), component, transform: *transform } })?;
         }
     }
     for (pack, (bytes, offsets)) in packs.iter().zip(layouts) {
-        let allocation = DeviceAllocation::new(library, bytes)?;
-        for (name, offset) in pack.components.iter().zip(offsets) {
-            let (component, transform) = &records.plain[name];
-            let extent = transform.resident_bytes(component)?;
-            ensure!(offset.checked_add(extent).is_some_and(|end| end <= allocation.buffer.bytes),
-                "native packed component outside allocation");
-            let destination = CuteafdDeviceBuffer {
-                // SAFETY: checked disjoint component subrange in this live allocation.
-                ptr: unsafe { allocation.buffer.ptr.cast::<u8>().add(offset) }.cast(),
-                bytes: extent, ..allocation.buffer };
-            land_into(library, load, name, component, *transform, destination, stream)?;
-        }
-        out.insert(pack.name.clone(), allocation);
+        receive(LayerRequest { owners: vec![(pack.name.clone(), bytes)], operation: LayerOperation::Pack { pack, offsets } })?;
     }
-    // kv_b: whole heads per step, staged rows and the whole grid.
-    let Some((kv_b, layout)) = &records.kv_b else { return Ok(out) };
+    if let Some((record, layout)) = &records.kv_b {
+        let owners = ["w_uk_fp8", "w_uk_scale", "w_uv_fp8", "w_uv_scale"].into_iter()
+            .zip(allocate_absorbed(layout, Ok)?).map(|(name, bytes)| (name.into(), bytes)).collect();
+        receive(LayerRequest { owners, operation: LayerOperation::Absorb { record, layout } })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn load_layer_packed<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, records: &LayerRecords,
+    packs: &[PlainPack], stream: *mut std::ffi::c_void) -> Result<HashMap<String, DeviceAllocation<'a>>> {
+    let mut out = HashMap::new();
+    let device = library.cuda_get_device()?;
+    layer_requests(records, packs, |request| {
+        let buffers = match request.operation {
+            LayerOperation::Land { name, component, transform } => vec![landed(library, load, &name, component, transform, stream)?],
+            LayerOperation::Pack { pack, offsets } => {
+                let allocation = DeviceAllocation::new(library, request.owners[0].1)?;
+                for (name, offset) in pack.components.iter().zip(offsets) {
+                    let (component, transform) = &records.plain[name];
+                    let extent = transform.resident_bytes(component)?;
+                    ensure!(offset.checked_add(extent).is_some_and(|end| end <= allocation.buffer.bytes),
+                        "native packed component outside allocation");
+                    let destination = CuteafdDeviceBuffer {
+                        // SAFETY: checked disjoint component subrange in this live allocation.
+                        ptr: unsafe { allocation.buffer.ptr.cast::<u8>().add(offset) }.cast(),
+                        bytes: extent, ..allocation.buffer };
+                    land_into(library, load, name, component, *transform, destination, stream)?;
+                }
+                vec![allocation]
+            }
+            LayerOperation::Absorb { record, layout } => absorb(library, load, record, layout, stream)?.into_iter().collect(),
+        };
+        ensure!(buffers.len() == request.owners.len(), "native request owner count differs");
+        for ((name, bytes), buffer) in request.owners.into_iter().zip(buffers) {
+            ensure!(buffer.buffer.bytes == bytes && buffer.buffer.device_id == device && !buffer.buffer.ptr.is_null(),
+                "{name}: native actual allocation differs from request");
+            ensure!(out.insert(name, buffer).is_none(), "duplicate native owner");
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+fn absorb<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, kv_b: &DenseRecord,
+    layout: &KvBLayout, stream: *mut std::ffi::c_void) -> Result<[DeviceAllocation<'a>; 4]> {
     let geometry = layout.geometry;
     let (heads_total, nope, v, lat) = (geometry.heads, geometry.nope, geometry.values, geometry.latent);
     let (h0, heads) = (layout.first_head, layout.heads);
@@ -297,11 +322,7 @@ pub(crate) fn load_layer_packed<'a>(library: &'a NativeLibrary, load: &DenseLoad
         load.step(Step { device, rects: vec![staged, whole_grid], jobs: vec![job] }, stream)?;
         h += count;
     }
-    out.insert("w_uk_fp8".into(), uk);
-    out.insert("w_uk_scale".into(), uk_scale);
-    out.insert("w_uv_fp8".into(), uv);
-    out.insert("w_uv_scale".into(), uv_scale);
-    Ok(out)
+    Ok([uk, uk_scale, uv, uv_scale])
 }
 
 #[cfg(test)]
@@ -376,6 +397,62 @@ pub(crate) mod tests {
             for value in record { file.write_all(&value.to_le_bytes()).unwrap(); }
         }
         root
+    }
+
+    #[test]
+    fn compact_native_reader_dispatch_matches_real_allocations() -> Result<()> {
+        use cuteafd_loader::plan::exlr8::dense::{DenseAxis, DenseWindow};
+        let root = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME")?)
+            .join(".cache/cuteafd/builds/glm-weight-inventory-fixtures");
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_in(&root)?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        let root = tempfile::tempdir_in(fixture.directory())?;
+        let component = |name: &str, suffix: &str, dtype: &str, shape: Vec<usize>, bytes: usize| -> Result<DenseComponent> {
+            let path = root.path().join(name);
+            std::fs::write(&path, vec![0u8; bytes])?;
+            Ok(DenseComponent { suffix: suffix.into(), dtype: dtype.into(), shape,
+                source: cuteafd_loader::plan::exlr8::dense::DenseRange { path, offset: 0, bytes }, window: None })
+        };
+        let mut projections = HashMap::new();
+        for (i, (encoding, components)) in [
+            (DenseEncoding::Trellis { bits: 4 }, vec![("trellis", "U8", 8192), ("suh", "F16", 256), ("svh", "F16", 256)]),
+            (DenseEncoding::Int4G32, vec![("q4", "U8", 8192), ("s4", "F16", 1024)]),
+            (DenseEncoding::Mxfp8, vec![("fp8", "U8", 16384), ("e8m0", "U8", 512)]),
+            (DenseEncoding::Bf16, vec![("bf16", "BF16", 32768)]),
+        ].into_iter().enumerate() {
+            let stem = ["q_a", "kv_a", "q_b", "o"][i];
+            let components = components.into_iter().map(|(suffix, dtype, bytes)| component(
+                &format!("{stem}.{suffix}"), suffix, dtype, vec![bytes], bytes)).collect::<Result<Vec<_>>>()?;
+            let slice = DenseSlice { tensor: format!("model.layers.0.{stem}.weight"), absorbed: None,
+                transform: DenseTransform::Identity, axis: DenseAxis::Output, first_channel: 0, channels: 128,
+                side: ShardSide::Output, components, units: Vec::new() };
+            projections.insert(stem, (NativeProjection { encoding, shape: [128, 128], side: ShardSide::Output,
+                rotation_id: 0 }, slice));
+        }
+        let mut plain = HashMap::new();
+        let mut widened = component("wide", "weight", "BF16", vec![128], 256)?;
+        widened.window = Some(DenseWindow { row_bytes: 2, rows: 0..128, cols: 0..2 });
+        plain.insert("wide".into(), (widened, DenseTransform::WidenBf16));
+        plain.insert("norm".into(), (component("norm", "weight", "BF16", vec![128], 256)?, DenseTransform::Identity));
+        for name in ["packed_a", "packed_b"] {
+            plain.insert(name.into(), (component(name, "weight", "BF16", vec![128], 256)?, DenseTransform::Identity));
+        }
+        let geometry = KvBGeometry { heads: 2, nope: 64, values: 128, latent: 128 };
+        let kv = DenseRecord { tensor: "model.layers.0.self_attn.kv_b_proj.weight".into(),
+            encoding: DenseEncoding::BlockFp8, shape: vec![384, 128], side: ShardSide::Replicated,
+            ownership: DenseOwnership::new(DenseExecution::AbsorbHeads(geometry)), channels_per_shard: 128,
+            rotation_id: 0, rotation: None, hessian_solved: false, native_blocks: 0,
+            components: vec![component("kv.fp8", "fp8", "U8", vec![384, 128], 384 * 128)?,
+                component("kv.scale", "scale", "F32", vec![3, 1], 12)?] };
+        let records = LayerRecords { layer: 0, projections, plain, kv_b: Some((kv, geometry.layout(1, 0)?)) };
+        let packs = [PlainPack { name: "packed".into(), components: vec!["packed_a".into(), "packed_b".into()] }];
+        let mut requests = BTreeMap::new();
+        layer_requests(&records, &packs, |r| { for (name, bytes) in r.owners { assert!(requests.insert(name, bytes).is_none()); } Ok(()) })?;
+        let load = DenseLoad::mount(&library);
+        let actual = load_layer_packed(&library, &load, &records, &packs, std::ptr::null_mut())?;
+        assert_eq!(requests, actual.into_iter().map(|(name, owner)| (name, owner.buffer.bytes)).collect());
+        Ok(())
     }
 
     #[test]

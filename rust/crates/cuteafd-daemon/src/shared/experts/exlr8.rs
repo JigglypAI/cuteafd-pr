@@ -136,6 +136,16 @@ impl<'a> Exlr8Weights<'a> {
         )
     }
 
+    pub(crate) fn shared_request(layout: &Residency) -> Result<cuteafd_loader::placement::planner::Allocation> {
+        use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location};
+        ensure!(layout.set == cuteafd_loader::plan::exlr8::residency::ExpertSet::Shared
+            && matches!(layout.world, 1 | 2) && layout.rank < layout.world && layout.resident_bytes > 0,
+            "invalid native shared allocation request");
+        Ok(Allocation::buffer(format!("glm.weights.gpu.{}.shared.layer.{}.backing", layout.rank, layout.layer),
+            Location::coordinator(layout.rank as u8), layout.resident_bytes as u64, Lifetime::RESIDENT,
+            cuteafd_core::memory_layout::Category::Weights, "GLM target weights"))
+    }
+
     /// `available` excludes all caller-owned workspace/graph reservations. Admit
     /// pinned bytes against host/UMA headroom before calling this device loader.
     pub(crate) fn load(
@@ -145,8 +155,16 @@ impl<'a> Exlr8Weights<'a> {
     ) -> Result<Self> {
         let budget = Self::plan(&layout)?;
         layout.check_budget(available, &[])?;
+        let shared = if layout.set == cuteafd_loader::plan::exlr8::residency::ExpertSet::Shared {
+            Some(Self::shared_request(&layout)?)
+        } else { None };
+        let device = library.cuda_get_device()?;
         let arena =
             DeviceAllocation::named(library, layout.resident_bytes, "experts/weights/exlr8")?;
+        if let Some(request) = shared {
+            ensure!(arena.buffer.bytes as u64 == request.bytes && arena.buffer.device_id == device
+                && !arena.buffer.ptr.is_null(), "native shared allocation differs from request");
+        }
         let (pointers, bits) = layout.descriptors(arena.buffer.ptr as u64)?;
         // Synchronous uploads finish before the bounded pinned banks are reused.
         for (offset, bytes) in layout.signs_offsets.iter().zip(&layout.signs) {

@@ -1,0 +1,829 @@
+//! Installed-header replay and compact real uploads share production dispatch.
+use super::*;
+use crate::shared::token_io::{EmbedPlacement, EmbedSource, TokenEmbedding};
+use cuteafd_core::memory_layout::Category;
+use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+use cuteafd_loader::placement::families::glm5::weights::WeightInventory;
+use cuteafd_loader::placement::planner::{Allocation, CoordinatorDevices, EmbeddingHome, Lifetime};
+use cuteafd_loader::plan::testing as fixture;
+use std::{collections::BTreeMap, path::PathBuf};
+
+fn installed(model: &str, revision: &str) -> Result<PathBuf> {
+    let home = std::env::var_os("HF_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/huggingface")
+        });
+    let root = home
+        .join("hub")
+        .join(format!("models--{model}"))
+        .join("snapshots")
+        .join(revision);
+    ensure!(
+        root.join("config.json").is_file(),
+        "required checkpoint missing: {}",
+        root.display()
+    );
+    Ok(root)
+}
+
+fn signatures(
+    owners: impl IntoIterator<Item = Allocation>,
+) -> BTreeMap<String, (cuteafd_loader::placement::planner::Location, u64, String)> {
+    let mut out = BTreeMap::new();
+    for owner in owners {
+        assert!(
+            out.insert(
+                owner.id.clone(),
+                (owner.location, owner.bytes, format!("{:?}", owner.category))
+            )
+            .is_none(),
+            "duplicate {}",
+            owner.id
+        );
+    }
+    out
+}
+
+fn replay(
+    catalog: &OfficialV41Catalog,
+    cfg: &GlmDsaConfig,
+    checkpoint: &cuteafd_loader::plan::Checkpoint,
+    ranks: usize,
+    owners: Option<&[u8]>,
+    native_bf16: bool,
+    home: EmbeddingHome,
+) -> Result<Vec<Allocation>> {
+    let core = CoreInventory::from_checkpoint(cfg, checkpoint)?;
+    let mut requests = Vec::new();
+    for layer in 0..cfg.layers {
+        routes::layer_routes(
+            catalog,
+            cfg,
+            layer,
+            checkpoint,
+            &core,
+            ranks,
+            owners.map(|o| o[layer]),
+            false,
+            native_bf16,
+            |route| {
+                requests.extend(route.requests);
+                Ok(())
+            },
+        )?;
+    }
+    routes::global_routes(catalog, cfg, &core, |route| {
+        requests.extend(route.requests);
+        Ok(())
+    })?;
+    let tensor = catalog.tensor(cfg.embedding())?;
+    let source = EmbedSource::new(
+        catalog.snapshot(),
+        &tensor.shard,
+        &tensor.metadata,
+        cfg.hidden,
+    )?;
+    requests.push(source.allocation_request("glm.weights.embedding", home)?);
+    Ok(requests)
+}
+
+#[test]
+fn installed_variant_weight_inventory_equals_production_requests() -> Result<()> {
+    for (model, revision) in [
+        (
+            "zai-org--GLM-5.3",
+            "aca966e4e02791568aa6a4ced368624b3d897f42",
+        ),
+        (
+            "nvidia--GLM-5.3-NVFP4",
+            "e3b8f9f2fad29727dfa95e766c5cac18ea1414bf",
+        ),
+        (
+            "wrldsuksgo2mars--GLM-5.3-EXL3-K4-Core-K6",
+            "5a4e83a09a11f3145332ed632d28a9894ea88225",
+        ),
+        (
+            "wrldsuksgo2mars--Mistral-Large-4-EXL3-K4-Core-K6",
+            "03c80aebaa483d55760703ae5bc0c9734c9d67d6",
+        ),
+    ] {
+        let root = installed(model, revision)?;
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open(&root)?;
+        let catalog = cuteafd_loader::read_expert_catalog(&root)?;
+        let cfg = GlmDsaConfig::read(&root)?;
+        for ranks in [1, 2] {
+            for whole in [false, true] {
+                if whole && ranks == 1 {
+                    continue;
+                }
+                let owners = (0..cfg.layers).map(|l| (l % 2) as u8).collect::<Vec<_>>();
+                let owners = whole.then_some(owners.as_slice());
+                for native_bf16 in [false, true] {
+                    for home in [EmbeddingHome::Device(0), EmbeddingHome::HostPinned] {
+                        let expected = WeightInventory::from_checkpoint(
+                            &checkpoint,
+                            ranks,
+                            cfg.layers,
+                            owners,
+                            native_bf16,
+                            false,
+                            home,
+                        )?;
+                        let actual = replay(
+                            &catalog,
+                            &cfg,
+                            &checkpoint,
+                            ranks,
+                            owners,
+                            native_bf16,
+                            home,
+                        )?;
+                        assert_eq!(
+                            signatures(expected.owners.into_iter().map(|o| o.allocation)),
+                            signatures(actual),
+                            "{model} ranks={ranks} whole={whole} bf16={native_bf16} home={home:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn official_ml4_fp8_is_refused_by_inventory_and_expert_catalog() -> Result<()> {
+    let root = installed(
+        "mistralai--Mistral-Large-4-1T-A52B",
+        "f12dabdc0c1e99e7f7924461a6f308859b05af4d",
+    )?;
+    let checkpoint = cuteafd_loader::plan::Checkpoint::open(&root)?;
+    let cfg = GlmDsaConfig::read(&root)?;
+    let inventory = WeightInventory::from_checkpoint(
+        &checkpoint,
+        1,
+        cfg.layers,
+        None,
+        false,
+        false,
+        EmbeddingHome::Device(0),
+    )
+    .unwrap_err();
+    let loader = cuteafd_loader::read_expert_catalog(&root).unwrap_err();
+    type Refusal = cuteafd_loader::families::glm5::core::UnsupportedAttentionFormat;
+    let refusal = inventory
+        .downcast_ref::<Refusal>()
+        .context("typed inventory refusal")?;
+    assert!(!refusal.tensors.is_empty() && refusal.found.contains("F8E4M3"));
+    assert!(loader.to_string().contains("no Spark expert package"));
+    Ok(())
+}
+
+fn compact_dso() -> Result<(Fixture, NativeLibrary)> {
+    let root = PathBuf::from(std::env::var_os("HOME").context("HOME")?)
+        .join(".cache/cuteafd/builds/glm-weight-inventory-fixtures");
+    let fixture = Fixture::build_in(&root)?;
+    let library = fixture.load()?;
+    for device in [0, 1] {
+        fixture.configure_memory(&library, device, 1 << 30)?;
+    }
+    fixture.quiet_events(&library, true)?;
+    Ok((fixture, library))
+}
+
+#[test]
+fn whole_attention_owner1_allocates_on_its_physical_device() -> Result<()> {
+    compact_real_load(Some(&[1, 0]), false, EmbedPlacement::Gpu)
+}
+
+#[test]
+fn compact_layer_global_and_embedding_uploads_equal_inventory() -> Result<()> {
+    compact_real_load(None, false, EmbedPlacement::Gpu)?;
+    compact_real_load(None, false, EmbedPlacement::Host)
+}
+
+fn compact_real_load(owners: Option<&[u8]>, core: bool, placement: EmbedPlacement) -> Result<()> {
+    let (dso, library) = compact_dso()?;
+    let root = tempfile::tempdir_in(dso.directory())?;
+    let (mut config, mut tensors) = fixture::glm5_compact_weights();
+    if !core && bf16_programs() {
+        tensors.retain(|t| !t.0.ends_with("_scale_inv"));
+        for (_, dtype, _) in &mut tensors {
+            if *dtype == "F8_E4M3" {
+                *dtype = "BF16";
+            }
+        }
+    } else if !core {
+        // Exercise retained calibrated activation scales on the dense MLP.
+        config["quantization_config"]["producer"] = serde_json::json!({"name":"modelopt"});
+        config["quantization_config"]["quant_algo"] = serde_json::json!("MIXED_PRECISION");
+        let mut declared = serde_json::Map::new();
+        for op in ["gate", "up", "down"] {
+            let stem = format!("model.layers.0.mlp.{op}_proj");
+            tensors.retain(|t| t.0 != format!("{stem}.weight_scale_inv"));
+            tensors.push(fixture::t(format!("{stem}.weight_scale"), "F32", &[]));
+            tensors.push(fixture::t(format!("{stem}.input_scale"), "F32", &[]));
+            declared.insert(stem, serde_json::json!({"quant_algo":"FP8"}));
+        }
+        config["quantization_config"]["quantized_layers"] = declared.into();
+    }
+    if core {
+        config["vocab_size"] = serde_json::json!(256);
+        for (name, _, shape) in &mut tensors {
+            if name == "lm_head.weight" || name == "model.embed_tokens.weight" {
+                shape[0] = 256;
+            }
+        }
+        let cfg = GlmDsaConfig::from_hf(&config)?;
+        tensors = tensors
+            .into_iter()
+            .filter(|t| !t.0.ends_with("_scale_inv"))
+            .flat_map(|(name, dtype, shape)| {
+                if let Some(stem) = name.strip_suffix(".weight").filter(|stem| {
+                    cuteafd_loader::families::glm5::core::split(&cfg, stem).is_some()
+                }) {
+                    fixture::exl3(
+                        stem,
+                        if stem.ends_with("kv_a_proj_with_mqa") {
+                            shape[0].next_multiple_of(128)
+                        } else {
+                            shape[0]
+                        },
+                        shape[1],
+                        6,
+                    )
+                } else {
+                    vec![(name, if dtype == "F8_E4M3" { "BF16" } else { dtype }, shape)]
+                }
+            })
+            .collect();
+    }
+    fixture::write_snapshot(root.path(), &config, &tensors, None);
+    if core {
+        use std::io::{Seek, SeekFrom, Write};
+        let headers = cuteafd_loader::plan::Checkpoint::open(root.path())?;
+        for tensor in &headers.tensors {
+            if tensor.meta.name.ends_with(".mcg") {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(root.path().join(&tensor.shard))?;
+                file.seek(SeekFrom::Start(tensor.meta.byte_offset))?;
+                file.write_all(&0xcbac1fedu32.to_le_bytes())?;
+            }
+        }
+    }
+    let mut catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
+    let cfg = GlmDsaConfig::read(root.path())?;
+    let checkpoint = cuteafd_loader::plan::Checkpoint::open(root.path())?;
+    let loader = GlmLoader {
+        library: &library,
+        catalog: &catalog,
+        stream: std::ptr::null_mut(),
+        device: 0,
+        peers: vec![crate::shared::peer_split::RankDevice {
+            device: 1,
+            stream: std::ptr::null_mut(),
+        }],
+        push: None,
+    };
+    let source = catalog.tensor(cfg.embedding())?;
+    let source = EmbedSource::new(root.path(), &source.shard, &source.metadata, cfg.hidden)?;
+    let (embedding, (weights, peers)) = TokenEmbedding::load(&library, source, placement, || {
+        loader.model(&cfg, cfg.layers, owners, false)
+    })?;
+    let devices = CoordinatorDevices::new(&[0, 1])?;
+    let mut inventory = crate::shared::memory::receipts::Inventory::new(
+        devices,
+        "glm.weights",
+        Lifetime::RESIDENT,
+        Category::Weights,
+        "target weights",
+    );
+    for (rank, layers) in std::iter::once(&weights.layers)
+        .chain(peers.iter())
+        .enumerate()
+    {
+        for (layer, weights) in layers.iter().enumerate() {
+            for (name, buffer) in weights.allocation_buffers() {
+                inventory.device(&format!("gpu.{rank}.layer.{layer}.{name}"), buffer)?;
+            }
+        }
+    }
+    inventory.device("gpu.0.norm", weights.norm.buffer)?;
+    match &weights.head {
+        GlmHead::Bf16(head) => inventory.device("gpu.0.head", head.buffer)?,
+        GlmHead::K6(head) => {
+            for (name, buffer) in [
+                ("payload", head.payload.buffer),
+                ("suh", head.suh.buffer),
+                ("svh", head.svh.buffer),
+            ] {
+                inventory.device(&format!("gpu.0.core.head.{name}"), buffer)?;
+            }
+        }
+        _ => anyhow::bail!("unexpected native vocabulary"),
+    }
+    let mut actual = inventory
+        .receipts
+        .into_iter()
+        .map(|r| r.allocation)
+        .collect::<Vec<_>>();
+    actual.push(
+        embedding
+            .table_receipt(devices, "glm.weights", "embedding")?
+            .allocation,
+    );
+    let expected = WeightInventory::from_checkpoint(
+        &checkpoint,
+        2,
+        cfg.layers,
+        owners,
+        bf16_programs(),
+        false,
+        if placement == EmbedPlacement::Host {
+            EmbeddingHome::HostPinned
+        } else {
+            EmbeddingHome::Device(0)
+        },
+    )?;
+    assert_eq!(
+        signatures(expected.owners.into_iter().map(|o| o.allocation)),
+        signatures(actual)
+    );
+    Ok(())
+}
+
+#[test]
+fn compact_k6_payload_vectors_and_head_equal_inventory() -> Result<()> {
+    compact_real_load(None, true, EmbedPlacement::Gpu)
+}
+
+#[test]
+fn mixed_mlp_arithmetic_is_refused_before_upload() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (mut config, tensors) = fixture::glm5_compact_weights();
+    config["quantization_config"] = serde_json::json!({"quant_method":"fp8", "producer":{"name":"modelopt"},
+        "quant_algo":"MIXED_PRECISION", "quantized_layers":{
+            "model.layers.0.mlp.up_proj":{"quant_algo":"FP8"}
+    }});
+    fixture::write_snapshot(root.path(), &config, &tensors, None);
+    let checkpoint = cuteafd_loader::plan::Checkpoint::open(root.path())?;
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    let cfg = GlmDsaConfig::read(root.path())?;
+    let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+    let mut published = 0;
+    let result = routes::layer_routes(
+        &catalog,
+        &cfg,
+        0,
+        &checkpoint,
+        &core,
+        2,
+        None,
+        false,
+        false,
+        |_| {
+            published += 1;
+            Ok(())
+        },
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("mixed declared MLP arithmetic")
+    );
+    assert_eq!(published, 0);
+    Ok(())
+}
+
+#[test]
+fn ml4_non_native_index_query_is_refused_before_upload() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (mut config, tensors) = fixture::glm5_compact_weights();
+    // Native contract stays identical; the variant selects ML4's no-conversion rule.
+    let official = installed(
+        "mistralai--Mistral-Large-4-1T-A52B",
+        "f12dabdc0c1e99e7f7924461a6f308859b05af4d",
+    )?;
+    let ml4 = GlmDsaConfig::read(&official)?.variant;
+    config["vocab_size"] = serde_json::json!(64);
+    let mut cfg = GlmDsaConfig::from_hf(&config)?;
+    cfg.variant = ml4;
+    let glm = GlmDsaConfig::from_hf(&config)?;
+    let mut renamed = Vec::new();
+    for layer in 0..cfg.layers {
+        for (key, old) in glm.plain_owners(layer) {
+            if let Some((_, new)) = cfg.plain_owners(layer).into_iter().find(|(k, _)| *k == key) {
+                if let Some((_, dtype, shape)) = tensors.iter().find(|t| t.0 == old) {
+                    renamed.push(fixture::t(new, dtype, shape));
+                }
+            }
+        }
+        for op in [Op::QueryScaleS, Op::QueryScaleB] {
+            renamed.push(fixture::t(
+                cfg.weight(layer, op).unwrap(),
+                "BF16",
+                &[cfg.heads],
+            ));
+        }
+        for op in [Op::KvA, Op::QB, Op::O] {
+            let old = glm.weight(layer, op).unwrap();
+            let shape = &tensors.iter().find(|t| t.0 == old).unwrap().2;
+            renamed.extend(fixture::exl3(
+                &cfg.stem(layer, op).unwrap(),
+                shape[0].next_multiple_of(128),
+                shape[1],
+                6,
+            ));
+        }
+        let kv = cfg.weight(layer, Op::KvB).unwrap();
+        renamed.push(fixture::t(
+            kv,
+            "BF16",
+            &[
+                cfg.heads * (cfg.nope_dim(layer) + cfg.v_head_dim),
+                cfg.kv_lora_rank,
+            ],
+        ));
+        if cfg.indexers[layer] == GlmIndexer::Full {
+            renamed.push(fixture::t(
+                cfg.weight(layer, Op::IndexQ).unwrap(),
+                "BF16",
+                &[256, 256],
+            ));
+        }
+    }
+    // Inventory validates core shapes from config, so construct its complete core
+    // descriptors with the same config rather than admitting an incomplete group.
+    for (name, shape) in cuteafd_loader::families::glm5::core::expected(&cfg) {
+        if name.contains(".attention.") && !name.contains("indexer") {
+            let stem = name.strip_suffix(".weight").unwrap();
+            renamed.retain(|t| !t.0.starts_with(&format!("{stem}.")));
+            renamed.extend(fixture::exl3(
+                stem,
+                shape[0].next_multiple_of(128),
+                shape[1],
+                6,
+            ));
+        }
+    }
+    // The native core object is independent of the catalog's missing future routes.
+    renamed.extend(tensors);
+    fixture::write_snapshot(root.path(), &config, &renamed, None);
+    let checkpoint = cuteafd_loader::plan::Checkpoint::open(root.path())?;
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+    let result = routes::layer_routes(
+        &catalog,
+        &cfg,
+        0,
+        &checkpoint,
+        &core,
+        1,
+        None,
+        false,
+        false,
+        |_| Ok(()),
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("shipped FP8 block-128 form only")
+    );
+    Ok(())
+}
+
+#[test]
+fn compact_ml4_query_vectors_and_native_index_equal_real_layer_requests() -> Result<()> {
+    let (dso, library) = compact_dso()?;
+    let root = tempfile::tempdir_in(dso.directory())?;
+    let (config, mut tensors) = fixture::glm5_compact_weights();
+    let glm = GlmDsaConfig::from_hf(&config)?;
+    let mut cfg = glm.clone();
+    cfg.variant = GlmDsaConfig::from_hf(&fixture::mistral_large4_config())?.variant;
+    for layer in 0..cfg.layers {
+        for (key, name) in cfg.plain_owners(layer) {
+            let old = glm
+                .plain_owners(layer)
+                .into_iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, n)| n);
+            let shape = old
+                .and_then(|old| tensors.iter().find(|t| t.0 == old).map(|t| t.2.clone()))
+                .unwrap_or_else(|| {
+                    vec![if key.starts_with("query_scale") {
+                        cfg.heads
+                    } else if key.starts_with("index_scale") {
+                        cfg.index_heads
+                    } else {
+                        cfg.hidden
+                    }]
+                });
+            tensors.push(fixture::t(name, "BF16", &shape));
+        }
+        for op in [
+            Op::Gate,
+            Op::Up,
+            Op::Down,
+            Op::IndexK,
+            Op::IndexWeights,
+            Op::Router,
+        ] {
+            let (Some(old), Some(new)) = (glm.weight(layer, op), cfg.weight(layer, op)) else {
+                continue;
+            };
+            let copies = tensors
+                .iter()
+                .filter(|t| t.0 == old || t.0 == format!("{old}_scale_inv"))
+                .map(|(name, dtype, shape)| (name.replacen(&old, &new, 1), *dtype, shape.clone()))
+                .collect::<Vec<_>>();
+            tensors.extend(copies);
+        }
+        tensors.push(fixture::t(
+            cfg.weight(layer, Op::KvB).unwrap(),
+            "BF16",
+            &[
+                cfg.heads * (cfg.nope_dim(layer) + cfg.v_head_dim),
+                cfg.kv_lora_rank,
+            ],
+        ));
+        if cfg.indexers[layer] == GlmIndexer::Full {
+            tensors.extend(fixture::fp8(
+                &cfg.stem(layer, Op::IndexQ).unwrap(),
+                cfg.index_heads * cfg.index_head_dim,
+                cfg.hidden,
+                None,
+            ));
+        }
+    }
+    for (name, shape) in cuteafd_loader::families::glm5::core::expected(&cfg) {
+        if name.contains(".attention.") && !name.contains("indexer") {
+            tensors.extend(fixture::exl3(
+                name.strip_suffix(".weight").unwrap(),
+                shape[0].next_multiple_of(128),
+                shape[1],
+                6,
+            ));
+        }
+    }
+    fixture::write_snapshot(root.path(), &config, &tensors, None);
+    let checkpoint = cuteafd_loader::plan::Checkpoint::open(root.path())?;
+    use std::os::unix::fs::FileExt;
+    for tensor in &checkpoint.tensors {
+        if tensor.meta.name.ends_with(".mcg") {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(root.path().join(&tensor.shard))?
+                .write_all_at(&0xcbac1fedu32.to_le_bytes(), tensor.meta.byte_offset)?;
+        }
+    }
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+    let loader = GlmLoader {
+        library: &library,
+        catalog: &catalog,
+        stream: std::ptr::null_mut(),
+        device: 0,
+        peers: vec![crate::shared::peer_split::RankDevice {
+            device: 1,
+            stream: std::ptr::null_mut(),
+        }],
+        push: None,
+    };
+    let layers = loader.layer(&cfg, 0, &checkpoint, &core, None, false)?;
+    let mut requests = Vec::new();
+    routes::layer_routes(
+        &catalog,
+        &cfg,
+        0,
+        &checkpoint,
+        &core,
+        2,
+        None,
+        false,
+        bf16_programs(),
+        |r| {
+            requests.extend(r.requests);
+            Ok(())
+        },
+    )?;
+    let mut actual = crate::shared::memory::receipts::Inventory::new(
+        CoordinatorDevices::new(&[0, 1])?,
+        "glm.weights",
+        Lifetime::RESIDENT,
+        Category::Weights,
+        "target weights",
+    );
+    for (rank, layer) in layers.iter().enumerate() {
+        for (name, buffer) in layer.allocation_buffers() {
+            actual.device(&format!("gpu.{rank}.layer.0.{name}"), buffer)?;
+        }
+    }
+    assert_eq!(
+        signatures(requests),
+        signatures(actual.receipts.into_iter().map(|r| r.allocation))
+    );
+    Ok(())
+}
+
+#[test]
+fn installed_native_dense_shared_and_vocabulary_equal_reader_requests() -> Result<()> {
+    use crate::shared::experts::exlr8::{Exlr8Weights, dense_weights};
+    use cuteafd_loader::placement::planner::Location;
+    use cuteafd_loader::plan::exlr8::{
+        dense::{DensePlan, DenseRecord, DenseSelection},
+        residency::{ExpertSet, MetadataInput},
+    };
+    let root = installed(
+        "kindlingai--glm-5.3-exlr8-k2-k3-k4",
+        "a2b599e06c59f2ccb01aaa44e6f182ba21e39f80",
+    )?;
+    let cfg = GlmDsaConfig::read(&root)?;
+    let config = serde_json::from_slice(&std::fs::read(root.join("config.json"))?)?;
+    let selection = DenseSelection::from_hf(&config)?;
+    let records = DenseRecord::inventory(&root)?;
+    let shared = MetadataInput::open(&root, "up1")?;
+    for world in [1, 2] {
+        let dense = (0..world)
+            .map(|rank| {
+                dense_weights::NativeDenseRecords::new(
+                    &root,
+                    cfg.layers,
+                    world,
+                    rank,
+                    &BTreeMap::new(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut expected = WeightInventory::from_native(
+            &selection,
+            cfg.layers,
+            &dense.iter().map(|r| r.plan.clone()).collect::<Vec<_>>(),
+        )?;
+        let mut actual = Vec::new();
+        let mut add = |rank: usize, name: String, bytes: usize| {
+            actual.push(Allocation::buffer(
+                format!("glm.weights.gpu.{rank}.{name}"),
+                Location::coordinator(rank as u8),
+                bytes as u64,
+                Lifetime::RESIDENT,
+                if name.starts_with("vocabulary.embedding.") {
+                    Category::Embedding
+                } else {
+                    Category::Weights
+                },
+                "target weights",
+            ))
+        };
+        for (rank, records) in dense.iter().enumerate() {
+            for (layer, record) in records.layers.iter().enumerate() {
+                dense_weights::layer_requests(record, &[], |request| {
+                    for (name, bytes) in request.owners {
+                        let key = if name.starts_with("w_") {
+                            format!("operand.{name}")
+                        } else if name == dense_weights::key("router", "bf16") {
+                            "operand.gate".into()
+                        } else if let Some((key, _)) = cfg
+                            .plain_owners(layer)
+                            .into_iter()
+                            .find(|(_, tensor)| *tensor == name)
+                        {
+                            format!("operand.{key}")
+                        } else {
+                            format!("native.{name}")
+                        };
+                        add(rank, format!("layer.{layer}.{key}"), bytes);
+                    }
+                    Ok(())
+                })?;
+            }
+            if rank == 0 {
+                add(
+                    rank,
+                    "norm".into(),
+                    cuteafd_loader::plan::exlr8::dense::DenseTransform::Identity
+                        .allocation_bytes(&records.norm)?,
+                );
+            }
+        }
+        let selected = records
+            .iter()
+            .filter(|record| selection.vocabulary_names().contains(&record.tensor))
+            .cloned()
+            .collect::<Vec<_>>();
+        let vocab = (0..world)
+            .map(|rank| DensePlan::for_rank(&selected, world, rank).map_err(anyhow::Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        expected.extend_native(&selection, cfg.layers, &vocab.iter().collect::<Vec<_>>())?;
+        for (rank, plan) in vocab.iter().enumerate() {
+            for slice in &plan.tensors {
+                let table = if slice.tensor == cfg.embedding() {
+                    "embedding"
+                } else {
+                    "head"
+                };
+                for (suffix, bytes) in crate::shared::token_io::native::row_requests(slice)? {
+                    add(rank, format!("vocabulary.{table}.{suffix}"), bytes);
+                }
+            }
+        }
+        actual.push(EmbedSource::placeholder_request(
+            "glm.weights.embedding",
+            0,
+        )?);
+        let plans = (0..world)
+            .map(|rank| {
+                (cfg.first_moe_layer..cfg.layers)
+                    .map(|layer| {
+                        shared
+                            .plan(layer, world, rank, ExpertSet::Shared)
+                            .map_err(anyhow::Error::from)
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        expected.extend_shared(&plans)?;
+        let before = expected.owners.len();
+        assert!(expected.extend_shared(&plans).is_err());
+        assert_eq!(expected.owners.len(), before, "duplicate append is atomic");
+        if world == 2 {
+            let mut peer = expected.clone();
+            peer.add_peer_routers(&[cfg.first_moe_layer])?;
+            for key in ["gate", "gate.bias"] {
+                let source = expected.owners.iter().find(|o| {
+                    o.allocation.id
+                        == format!(
+                            "glm.weights.gpu.0.layer.{}.operand.{key}",
+                            cfg.first_moe_layer
+                        )
+                });
+                if let Some(source) = source {
+                    let target = peer
+                        .owners
+                        .iter()
+                        .find(|o| {
+                            o.allocation.id
+                                == format!(
+                                    "glm.weights.gpu.1.layer.{}.operand.{key}",
+                                    cfg.first_moe_layer
+                                )
+                        })
+                        .context("native peer router")?;
+                    assert_eq!(source.allocation.bytes, target.allocation.bytes);
+                }
+            }
+        }
+        for plan in plans.iter().flatten() {
+            actual.push(Exlr8Weights::shared_request(plan)?);
+        }
+        assert_eq!(
+            signatures(expected.owners.into_iter().map(|o| o.allocation)),
+            signatures(actual),
+            "native world={world}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn compact_native_shared_arenas_equal_requests() -> Result<()> {
+    use crate::shared::experts::exlr8::Exlr8Weights;
+    use cuteafd_loader::plan::exlr8::residency::{ExpertSet, Residency};
+    let (dso, library) = compact_dso()?;
+    let root = tempfile::tempdir_in(dso.directory())?;
+    fixture::exlr8::fixture(root.path(), false);
+    for world in [1, 2] {
+        for rank in 0..world {
+            let plan = Residency::plan(root.path(), "mixed", 3, world, rank, ExpertSet::Shared)?;
+            let request = Exlr8Weights::shared_request(&plan)?;
+            Device {
+                library: &library,
+                id: rank as i32,
+            }
+            .run(|| -> Result<()> {
+                let weights = Exlr8Weights::load(&library, plan, 1 << 30)?;
+                let devices = CoordinatorDevices::new(&[0, 1])?;
+                let mut inventory = crate::shared::memory::receipts::Inventory::new(
+                    devices,
+                    &format!("glm.weights.gpu.{rank}.shared"),
+                    Lifetime::RESIDENT,
+                    Category::Weights,
+                    "shared weights",
+                );
+                weights.allocation_receipts(&mut inventory, "layer.3")?;
+                let actual = inventory
+                    .receipts
+                    .into_iter()
+                    .find(|r| r.allocation.view.is_none())
+                    .context("shared backing receipt")?;
+                assert_eq!(signatures([request]), signatures([actual.allocation]));
+                Ok(())
+            })?;
+        }
+    }
+    Ok(())
+}
