@@ -700,10 +700,29 @@ impl<'a> MimoLoader<'a> {
         ensure!(shape[0].checked_mul(shape[1]).and_then(|n| n.checked_mul(2))
             .is_some_and(|bytes| bytes as u64 == tensor.meta.byte_length),
             "{name}: BF16 bytes disagree with output projection shape");
-        (0..ranks).map(|rank| {
-            let rect = self.rect(name, None, Some(rank * cols * 2..(rank + 1) * cols * 2))?;
-            self.landed(rank, vec![(rect, 0)], rows * cols * 2, &[])
-        }).collect()
+        let allocations = (0..ranks).map(|rank| self.on_rank(rank, |_| {
+            DeviceAllocation::new(self.library, (rows * cols * 2).max(256))
+        })).collect::<Result<Vec<_>>>()?;
+        let per = cuteafd_loader::shared::dense_read::ReadBatch::new(
+            rows, shape[1] * 2, cols * 2, crate::shared::experts::rtx::dense::STEP_BYTES)?.rows;
+        // Adjacent rank shares reuse the same full-row cache before it advances.
+        for first in (0..rows).step_by(per) {
+            let end = (first + per).min(rows);
+            for (rank, allocation) in allocations.iter().enumerate() {
+                let rect = self.rect(name, Some(first..end), Some(rank * cols * 2..(rank + 1) * cols * 2))?;
+                let offset = first * cols * 2;
+                let bytes = (end - first) * cols * 2;
+                // SAFETY: this row window is wholly inside the final rank allocation.
+                let buffer = CuteafdDeviceBuffer { ptr: unsafe {
+                    allocation.buffer.ptr.cast::<u8>().add(offset).cast()
+                }, bytes, ..allocation.buffer };
+                let (device, _) = self.rank_device(rank)?;
+                self.on_rank(rank, |_| self.dense.operand(crate::shared::experts::rtx::dense::Operand {
+                    device, buffer, lands: vec![(rect, 0)], bytes,
+                }))?;
+            }
+        }
+        Ok(allocations)
     }
 
     /// The FP8 checkpoint weights `names` concatenated by rows (as

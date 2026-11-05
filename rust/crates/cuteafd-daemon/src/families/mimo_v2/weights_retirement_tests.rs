@@ -240,19 +240,24 @@ fn bf16_output_projection_records_column_shares_and_replays_mount_bytes() -> Res
     let library = fixture.load()?;
     fixture.immediate_copies(&library)?;
     for device in 0..2 { fixture.configure_memory(&library, device, 1 << 30)?; }
-    let checkpoint = checkpoint(&fixture, &[("weight", DType::Bf16, &[8, 256])])?;
+    for shape in [[8, 256], [4096, 8448]] {
+    let checkpoint = checkpoint(&fixture, &[("weight", DType::Bf16, &shape)])?;
     let path = checkpoint.snapshot.join("weights.bin");
-    let payload: Vec<_> = (0..8 * 256 * 2).map(|i| (i % 251) as u8).collect();
+    let payload: Vec<_> = (0..shape[0] * shape[1] * 2).map(|i| (i % 251) as u8).collect();
     std::fs::write(&path, &payload)?;
     let formats = BTreeMap::new();
     for ranks in [1, 2] {
+        let timing = crate::shared::memory::load_timing::Split::start();
         let mounted = loader(&library, &checkpoint, &formats).o_proj("weight", ranks)?;
+        assert_eq!(timing.read_bytes(), payload.len() as u64, "each source byte is read once");
         std::fs::write(&path, [])?;
         let load = std::rc::Rc::new(dense::DenseLoad::push(&library));
         let planning = MimoLoader { dense: load.clone(), ..loader(&library, &checkpoint, &formats) };
         let (pushed, mut records) = dense::recording(|| planning.o_proj("weight", ranks))?;
         records.extend(load.sink.as_ref().unwrap().take_all());
-        assert_eq!(records.operands.len(), ranks);
+        let per = cuteafd_loader::shared::dense_read::ReadBatch::new(
+            shape[0], shape[1] * 2, shape[1] * 2 / ranks, dense::STEP_BYTES)?.rows;
+        assert_eq!(records.operands.len(), ranks * shape[0].div_ceil(per));
         assert!(records.steps.is_empty() && records.finishes.is_empty());
         std::fs::write(&path, &payload)?;
         let sockets = tempfile::tempdir_in(fixture.directory())?;
@@ -260,14 +265,15 @@ fn bf16_output_projection_records_column_shares_and_replays_mount_bytes() -> Res
             crate::shared::experts::rtx::push::tests::receive_pushed(
                 Device { library: &library, id: rank as i32 }, None, &checkpoint.snapshot,
                 sockets.path(), &records, None, 0, rank)?;
-            let expected: Vec<_> = payload.chunks_exact(256 * 2).flat_map(|row|
-                row[rank * 256 * 2 / ranks..(rank + 1) * 256 * 2 / ranks].iter().copied()).collect();
+            let expected: Vec<_> = payload.chunks_exact(shape[1] * 2).flat_map(|row|
+                row[rank * shape[1] * 2 / ranks..(rank + 1) * shape[1] * 2 / ranks].iter().copied()).collect();
             for allocation in [&mounted[rank], &pushed[rank]] {
                 let mut actual = vec![0; expected.len()];
                 library.copy_d2h(&mut actual, allocation.buffer)?;
                 assert_eq!(actual, expected);
             }
         }
+    }
     }
     Ok(())
 }
