@@ -112,7 +112,7 @@ mod tests {
                 let demands = buffers.demands().unwrap();
                 for gpu in 0..2 {
                     let charge = |name: &str| demands.iter().find(|d| d.gpu == gpu && d.group == name).unwrap().bytes;
-                    assert_eq!(charge("context workspace"), layout.workspace().iter().map(|(_, n)| *n as u64).sum());
+                    assert_eq!(charge("context workspace"), layout.workspace().iter().map(|(_, n)| *n as u64).sum::<u64>());
                     assert_eq!(charge("context staging"), 2 * extent as u64 * format.record_bytes() as u64);
                     assert_eq!(charge("context exchange"), crate::placement::ContextExchangeLayout::new(&buffers).bytes().unwrap());
                 }
