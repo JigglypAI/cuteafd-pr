@@ -22,3 +22,19 @@ impl PeerStorageLayout {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn charges_flags_once_and_diagnostics_only_when_enabled() {
+        let plain = PeerStorageLayout::new(8, 3, false).unwrap();
+        assert_eq!((plain.receive_bytes, plain.control_bytes, plain.progress_bytes), (256, 256, 0));
+        let diagnostic = PeerStorageLayout::new(32, 4096, true).unwrap();
+        assert_eq!(diagnostic.control_bytes, 33 * 16);
+        assert_eq!(diagnostic.progress_bytes, (33 * std::mem::size_of::<cuteafd_ffi::peer_exchange::PeerProgress>()).max(256));
+        assert!(PeerStorageLayout::new(0, 1, false).is_err());
+        assert!(PeerStorageLayout::new(1, 0, false).is_err());
+        assert!(PeerStorageLayout::new(usize::MAX, 1, true).is_err());
+    }
+}

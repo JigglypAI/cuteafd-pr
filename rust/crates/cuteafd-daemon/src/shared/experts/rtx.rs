@@ -29,6 +29,8 @@ pub(crate) mod native;
 pub(crate) mod pair;
 pub(crate) mod push;
 pub(crate) mod routes;
+#[cfg(test)]
+mod local_physical_tests;
 
 pub(crate) use combine::{Combine, ExchangeDtype, FusedCombine};
 pub(crate) use landed::Tp2Weights;

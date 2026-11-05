@@ -30,8 +30,19 @@ void fixture_extent_only(void) { extent_only = 1; immediate_copies = 1; }
 struct fixture_program_info {
     char name[64]; uint32_t pointers, scalars; char scalar_kinds[16];
 };
-static struct fixture_program_info draft_programs[32];
+static struct fixture_program_info draft_programs[2048];
 static uint32_t draft_program_count;
+int fixture_register_program(uint32_t index, const char *name, uint32_t pointers,
+                             const char *scalar_kinds, uint32_t scalars) {
+    if (!extent_only || index >= 2048 || strlen(name) >= 64 || scalars > 16) return 1;
+    struct fixture_program_info *info = &draft_programs[index];
+    memset(info, 0, sizeof(*info));
+    memcpy(info->name, name, strlen(name));
+    info->pointers = pointers; info->scalars = scalars;
+    memcpy(info->scalar_kinds, scalar_kinds, scalars);
+    draft_program_count = index + 1;
+    return 0;
+}
 int fixture_draft_projection(uint32_t index, uint32_t k, uint32_t n) {
     if (!extent_only || index >= 32) return 1;
     struct fixture_program_info *info = &draft_programs[index];
@@ -49,6 +60,33 @@ int cuteafd_dsv4_program_info(uint32_t index, void *out) {
 int cuteafd_dsv4_program_load(uint32_t index) { return index >= draft_program_count; }
 int cuteafd_dsv4_program_launch(uint32_t index, void **ptrs, const uint64_t *scalars, void *stream) {
     (void)index; (void)ptrs; (void)scalars; (void)stream; return 1;
+}
+int cuteafd_rtx_tp2_partial_async(const float *routed, const uint16_t *shared,
+    void *out, uint64_t count, uint32_t dtype, void *stream) {
+    (void)routed; (void)shared; (void)out; (void)count; (void)dtype; (void)stream; return 1;
+}
+int cuteafd_rtx_tp2_sum_async(const void *left, const void *right, uint16_t *out,
+    uint64_t count, uint32_t dtype, void *stream) {
+    (void)left; (void)right; (void)out; (void)count; (void)dtype; (void)stream; return 1;
+}
+/* Allocation-only expert construction resolves these ABIs but never launches. */
+int64_t cuteafd_l2_cache_bytes(void) { return 96 * 1024 * 1024; }
+int cuteafd_peer_copy_initialize(void) { return extent_only ? 0 : 1; }
+int cuteafd_peer_copy_async(void *dst, const void *src, uint64_t bytes, void *stream) {
+    (void)dst; (void)src; (void)bytes; (void)stream; return 1;
+}
+int cuteafd_peer_copy_rows_async(void *dst, const void *src, uint64_t bytes,
+    uint64_t rows, uint64_t dst_pitch, uint64_t src_pitch, void *stream) {
+    (void)dst; (void)src; (void)bytes; (void)rows;
+    (void)dst_pitch; (void)src_pitch; (void)stream; return 1;
+}
+int cuteafd_peer_abort_initialize(void) { return extent_only ? 0 : 1; }
+int cuteafd_peer_wait_abortable(const uint32_t *flag, uint32_t *state,
+    const uint32_t *aborted, void *stream) {
+    (void)flag; (void)state; (void)aborted; (void)stream; return 1;
+}
+int cuteafd_peer_abort_publish(uint32_t *aborted, void *stream) {
+    (void)aborted; (void)stream; return 1;
 }
 static int trace_stream_queries;
 void fixture_trace_stream_queries(void) { trace_stream_queries = 1; }
@@ -743,10 +781,12 @@ static void exl3_destroy(void *handle, char marker) {
     event(marker);
     free(context);
 }
+static uint32_t exl3_words[16] = {2,5120,1152,6,1,6,2,1,1,1,1,3,4,0,0,4};
+void fixture_configure_exl3(const uint32_t *words) { memcpy(exl3_words, words, sizeof(exl3_words)); }
 int cuteafd_exl3_info(uint32_t *out, uint32_t count) {
-    const uint32_t words[16] = {2,5120,1152,6,1,6,2,1,1,1,1,3,4,0,0,4};
+    const uint32_t *words = exl3_words;
     if (count != 16) return 1;
-    memcpy(out, words, sizeof(words));
+    memcpy(out, words, sizeof(exl3_words));
     return 0;
 }
 int cuteafd_exl3_create(void **out) { return exl3_create(out, 4096, 'K'); }

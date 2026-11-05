@@ -15,6 +15,8 @@ mod deepseek;
 pub mod step5;
 mod spark_intake;
 pub mod prefill_waves;
+mod fp8moe_workspace;
+pub use fp8moe_workspace::fp8moe_tp2_workspace;
 mod weight_storage;
 pub use weight_storage::PackedWeightRegions;
 mod peer_storage;

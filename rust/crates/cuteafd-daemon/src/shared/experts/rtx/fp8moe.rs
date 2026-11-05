@@ -52,14 +52,7 @@ fn validate_installed(layers: &[usize], installed: impl Iterator<Item = usize>) 
     Ok(())
 }
 
-fn workspace(scratch: usize, hidden: usize, rows: usize) -> Result<(usize, usize, usize)> {
-    ensure!(rows > 0 && hidden > 0, "invalid FP8 MoE TP2 output geometry");
-    let output = rows.checked_mul(hidden).and_then(|n| n.checked_mul(2))
-        .context("FP8 MoE TP2 output size overflow")?;
-    let scratch = scratch.max(256);
-    let total = scratch.checked_add(output).context("FP8 MoE TP2 workspace size overflow")?;
-    Ok((scratch, output, total))
-}
+use cuteafd_loader::serving_capacity::fp8moe_tp2_workspace as workspace;
 
 /// One serialized rank stream shares the package scratch and BF16 output.
 /// Graph owners must be destroyed before this owner, as with NativeTp2.

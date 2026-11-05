@@ -127,12 +127,15 @@ impl LocalPhysicalSource {
                 GlmLocalFormat::Nvfp4 { .. } => {
                     let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
                         local.package.parent().context("NVFP4 package parent missing")?.join("manifest.json"))?)?;
-                    let capacities = manifest["layouts"]["tp2"]["capacities"].as_array().context("NVFP4 capacities missing")?;
-                    let scratch = capacities.iter().find(|c| c["capacity"].as_u64()
-                        .is_some_and(|rows| rows >= input.max_rows as u64))
-                        .and_then(|c| c["scratch_bytes"].as_u64()).context("NVFP4 scratch capacity missing")?;
-                    source.backend.add(format!("{prefix}.scratch"), location, usize::try_from(scratch)?.max(256), Category::Experts)?;
-                    source.backend.add(format!("{prefix}.output"), location, product(input.max_rows, cfg.hidden, 2)?, Category::Experts)?;
+                    let tensors = catalog.fp8().context("NVFP4 local headers missing")?.for_coordinator();
+                    let (directory, _) = crate::formats::fp8_experts::exact_layout_directory(&local.package, &tensors, 2, rank);
+                    let layout = directory.file_name().and_then(|name| name.to_str()).context("NVFP4 layout name missing")?;
+                    let scratch = crate::placement::inventory::fp8moe_scratch_bytes(&manifest, layout, input.max_rows as u64)
+                        .context("NVFP4 scratch extent missing")?;
+                    let (scratch, output, _) = crate::serving_capacity::fp8moe_tp2_workspace(
+                        usize::try_from(scratch)?, cfg.hidden, input.max_rows)?;
+                    source.backend.add(format!("{prefix}.scratch"), location, scratch, Category::Experts)?;
+                    source.backend.add(format!("{prefix}.output"), location, output, Category::Experts)?;
                 }
             }
         }
@@ -151,7 +154,7 @@ impl LocalPhysicalSource {
             let layers = input.layers.iter().map(|layer| self.weights[rank].get(layer)
                 .with_context(|| format!("GLM local physical layer {layer} not parsed"))).collect::<Result<Vec<_>>>()?;
             let packed = PackedWeightRegions::new(layers.iter().map(|layer| layer.bytes))?;
-            let mut rank_backing = None;
+            let mut rank_backing: Option<String> = None;
             for ((&layer, weight), region) in input.layers.iter().zip(layers).zip(packed.regions) {
                 let name = format!("{prefix}.weight.{layer}");
                 match input.storage {
@@ -163,7 +166,7 @@ impl LocalPhysicalSource {
                             let backing = if weight.mount.len() == 1 && weight.mount[0].0 == "0" {
                                 format!("{name}.0.backing")
                             } else { format!("{}.backing", suffix_name(&name, suffix)) };
-                            let offset = if weight.mount.len() > 1 { 0 } else { *offset };
+                            let offset = if suffix.starts_with("plane.") { 0 } else { *offset };
                             out.add_view(suffix_name(&name, suffix), location, *bytes, backing, offset)?;
                         }
                     }

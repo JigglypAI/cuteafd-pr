@@ -21,3 +21,17 @@ impl PackedWeightRegions {
         Ok(Self { regions, bytes })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn preserves_plane_order_alignment_and_final_extent() {
+        let layout = PackedWeightRegions::new([3, 0, 257, 16]).unwrap();
+        assert_eq!(layout.regions, [0..3, 256..256, 256..513, 768..784]);
+        assert_eq!(layout.bytes, 784);
+        assert_eq!(PackedWeightRegions::new([]).unwrap().bytes, 0);
+        assert!(PackedWeightRegions::new([usize::MAX, 1]).is_err());
+        assert!(PackedWeightRegions::new([256, usize::MAX]).is_err());
+    }
+}
