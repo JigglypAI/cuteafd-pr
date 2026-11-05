@@ -1623,6 +1623,52 @@ mod tests {
         }
     }
 
+    struct ContextSchedule(RefCell<super::super::order::Schedule>);
+
+    impl ContextProtocol for ContextSchedule {
+        fn push_query(&self, rank: usize, slot: usize, _: Query, _: usize) -> Result<()> {
+            self.0.borrow_mut().push(rank, "query", slot, "context query push"); Ok(())
+        }
+        fn push_candidates(&self, rank: usize, slot: usize, _: Candidates, _: usize) -> Result<()> {
+            self.0.borrow_mut().push(rank, "candidates", slot, "context candidates push"); Ok(())
+        }
+        fn wait_candidates(&self, rank: usize, slot: usize) -> Result<(*mut c_void, *mut c_void)> {
+            self.0.borrow_mut().wait(rank, "candidates", slot, "context candidates wait");
+            Ok((std::ptr::null_mut(), std::ptr::null_mut()))
+        }
+        fn wait_query(&self, rank: usize, slot: usize) -> Result<*mut c_void> {
+            self.0.borrow_mut().wait(rank, "query", slot, "context query wait"); Ok(std::ptr::null_mut())
+        }
+        fn push_partial(&self, rank: usize, slot: usize, _: Partial, _: usize) -> Result<()> {
+            self.0.borrow_mut().push(rank, "partial", slot, "context partial push"); Ok(())
+        }
+        fn wait_partial(&self, rank: usize, slot: usize) -> Result<Partial> {
+            self.0.borrow_mut().wait(rank, "partial", slot, "context partial wait");
+            Ok(Partial { values: std::ptr::null_mut(), lse: std::ptr::null_mut() })
+        }
+    }
+
+    #[test]
+    fn context_compute_stream_protocol_is_acyclic_for_both_ranks_and_slot_reuse() -> Result<()> {
+        use super::super::order::{check, check_submission_faults, Schedule};
+        for indexer in [false, true] { for rank_order in [[0, 1], [1, 0]] { for rows in [1, 16, 64] {
+            let exchange = ContextSchedule(RefCell::new(Schedule::default()));
+            for _request in 0..3 {
+                // Kimi's single lane, then both lanes supported by the shared
+                // protocol. Context ordinals reuse both slots across layers.
+                for lane in 0..2 { for context_index in 0..4 { for rank in rank_order {
+                    let kernels = Recorder { calls: RefCell::new(Vec::new()), indexer };
+                    context_decode_with(&exchange, rank, context_index, lane, rows, &mut &kernels)?;
+                }}}
+                exchange.0.borrow_mut().end_request();
+            }
+            let schedule = exchange.0.into_inner();
+            check(&schedule).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            check_submission_faults(&schedule).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }}}
+        Ok(())
+    }
+
     #[test]
     fn split_protocol_pushes_before_waits_and_combines_in_gpu_order() {
         for rank in 0..2 {
