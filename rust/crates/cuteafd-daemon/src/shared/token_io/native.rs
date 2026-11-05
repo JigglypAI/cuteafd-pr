@@ -97,10 +97,7 @@ impl VocabularyPlan {
         }
         let dense = DensePlan::for_rank(&selected, world, rank)?;
         // Vocabulary streams native units, not Mount's component batches and row cache.
-        let staging_bytes = dense.tensors.iter().flat_map(|slice| &slice.units)
-            .try_fold(0usize, |peak, unit| -> Result<usize> {
-                Ok(peak.max(unit.staging_bytes()?))
-            })?;
+        let staging_bytes = dense.unit_staging_bytes()?;
         Ok(Self {
             dense,
             staging_bytes,
@@ -113,6 +110,8 @@ impl VocabularyPlan {
         -> Result<Vec<(String, String, u64)>> {
         Ok(cuteafd_loader::plan::exlr8::dense::resident_native(selection, layers, &self.dense)?)
     }
+
+    pub(crate) fn dense_plan(&self) -> &DensePlan { &self.dense }
 
     pub(crate) fn resident_bytes(&self) -> usize {
         self.dense.resident_bytes

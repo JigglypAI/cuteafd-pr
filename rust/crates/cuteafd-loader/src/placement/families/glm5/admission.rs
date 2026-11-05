@@ -1,5 +1,4 @@
-//! Finite GLM component composition. This is not yet wired to live admission:
-//! expert/serving owners and startup history must join before Ready is allowed.
+//! GLM physical component composition and the common plan/serve assembler.
 //! Loading provenance never changes an owner's charge or its activation.
 use super::{PAGE_ROWS, weights::WeightInventory};
 use super::{buffers::TargetBuffers, exchanges::ExchangeBuffers, hooks::HookBuffers};
@@ -201,6 +200,542 @@ impl GlmRecipe<'_> {
     }
 }
 
+/// Native readers share one Mount bank across dense ranks. Shared expert loads
+/// serialize by layer/rank, but each invocation owns all 32 async reader banks.
+#[derive(Debug, Clone, Default)]
+pub struct NativeLoad {
+    pub gpus: usize,
+    pub sync_upload_bytes: u64,
+    pub coarse_overcharge_bytes: u64,
+    groups: Vec<Sequential>,
+}
+
+impl NativeLoad {
+    pub fn new(dense: &[&crate::plan::exlr8::dense::DensePlan],
+        vocabulary: &crate::plan::exlr8::dense::DensePlan,
+        shared: &[Vec<crate::plan::exlr8::residency::Residency>],
+        storage: super::local_physical::LocalStorage) -> anyhow::Result<Self> {
+        use crate::plan::exlr8::{dense::DensePlan, residency::{ExpertSet, Residency}};
+        use cuteafd_core::memory_layout::Category;
+        use anyhow::{ensure, Context};
+        let gpus = dense.len();
+        let (mount, _) = DensePlan::mount_staging_bytes(dense)?;
+        ensure!(vocabulary.world == gpus && vocabulary.rank == 0 && shared.len() == gpus,
+            "native load rank identity");
+        let mut out = Self { gpus, ..Self::default() };
+        let lifetime = Lifetime { first: Phase::Load, last: Phase::Load };
+        let owner = |id: String, bytes: usize| Allocation::buffer(id, Location::PINNED,
+            bytes as u64, lifetime, Category::Staging, "GLM native load pinned banks");
+        let mut native = Sequential { id: "glm.load.native.readers".into(), members: vec![] };
+        let vocabulary = vocabulary.unit_staging_bytes()?;
+        if vocabulary > 0 {
+            native.members.push(owner("glm.load.native.vocabulary".into(), vocabulary));
+        }
+        if storage == super::local_physical::LocalStorage::Mount && mount > 0 {
+            native.members.push(owner("glm.load.native.mount".into(), mount));
+        }
+        let native_peak = native.peak();
+        if !native.members.is_empty() { out.groups.push(native); }
+        let mut lanes = (0..Residency::LOAD_BANKS).flat_map(|bank|
+            (0..Residency::LOAD_LANES).map(move |lane| Sequential {
+                id: format!("glm.load.shared.bank.{bank}.lane.{lane}"), members: vec![],
+            })).collect::<Vec<_>>();
+        for (rank, plans) in shared.iter().enumerate() {
+            let mut layers = BTreeSet::new();
+            for plan in plans {
+                ensure!(plan.world == gpus && plan.rank == rank && plan.set == ExpertSet::Shared
+                    && layers.insert(plan.layer), "native shared load identity");
+                out.sync_upload_bytes = out.sync_upload_bytes.max(plan.sync_upload_bytes()? as u64);
+                let per_lane = plan.staging_bytes.max(16);
+                ensure!(plan.mount_pinned_bytes()? == per_lane.checked_mul(lanes.len())
+                    .context("native shared reader banks overflow")?, "native shared bank geometry");
+                for (index, group) in lanes.iter_mut().enumerate() {
+                    let bank = index / Residency::LOAD_LANES;
+                    let lane = index % Residency::LOAD_LANES;
+                    group.members.push(owner(format!("glm.load.shared.rank.{rank}.layer.{}.bank.{bank}.lane.{lane}",
+                        plan.layer), per_lane));
+                }
+            }
+        }
+        let shared_peak = lanes.iter().try_fold(0u64, |bytes, group|
+            bytes.checked_add(group.peak()).context("native shared load peak overflow"))?;
+        // Coarse Load charges native_peak + shared_peak instead of their true
+        // serialized max. The exact overcharge in bytes is retained and reported;
+        // every bank identity remains available for independent reconciliation.
+        out.coarse_overcharge_bytes = native_peak.checked_add(shared_peak)
+            .context("native load peak overflow")? - native_peak.max(shared_peak);
+        out.groups.extend(lanes.into_iter().filter(|group| !group.members.is_empty()));
+        Ok(out)
+    }
+
+    fn components(&self, maximum_pages: u64) -> Vec<Component> {
+        self.groups.iter().cloned().map(|group| Component {
+            activation: Activation::always(), bytes: ByteCurve::fixed(group.peak(), maximum_pages),
+            kind: ComponentKind::Sequential(group),
+        }).collect()
+    }
+}
+
+/// Target owners assembled from the same physical plans consumed by the loaders.
+/// These facts contain no sampled-free subtraction or admission decision.
+#[derive(Debug, Clone)]
+pub struct TargetFacts {
+    pub weights: Vec<(EmbeddingHome, WeightInventory)>,
+    pub hooks: Vec<HookBuffers>,
+    pub embedding_read: Option<crate::shared::dense_read::ReadBatch>,
+    pub native_load: Option<NativeLoad>,
+}
+
+impl TargetFacts {
+    pub fn checkpoint(checkpoint: &crate::plan::Checkpoint, layers: usize, gpus: usize,
+        attention_owners: Option<&[u8]>, native_bf16: bool, embedding: &[EmbeddingHome],
+        core: Option<&crate::families::glm5::core::CoreCharges>) -> anyhow::Result<Self> {
+        use anyhow::{ensure, Context};
+        ensure!((1..=2).contains(&gpus) && !embedding.is_empty()
+            && embedding.iter().enumerate().all(|(i, home)| !embedding[..i].contains(home))
+            && core.is_none_or(|core| core.ranks.len() == gpus), "GLM target fact identity");
+        let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
+        let weights = embedding.iter().map(|&home| Ok((home, WeightInventory::from_checkpoint(
+            checkpoint, gpus, layers, attention_owners, native_bf16, false, home)?)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let hooks = (0..gpus).map(|rank| HookBuffers { device: rank as u8,
+            maximum_pages: 1, native: None, core: core.map(|core| core.ranks[rank].clone()),
+            shared_workspace: None }).collect();
+        let row = cfg.hidden.checked_mul(2).context("GLM embedding row overflow")?;
+        let embedding_read = Some(crate::shared::dense_read::ReadBatch::new(
+            cfg.vocab_size, row, row, crate::shared::dense_read::STEP_BYTES)?);
+        Ok(Self { weights, hooks, embedding_read, native_load: None })
+    }
+
+    pub fn native(selection: &crate::plan::exlr8::dense::DenseSelection, layers: usize,
+        dense: &[crate::plan::exlr8::dense::DensePlan],
+        vocabulary: &[crate::plan::exlr8::dense::DensePlan],
+        shared: &[Vec<crate::plan::exlr8::residency::Residency>],
+        scratch: &[[crate::families::glm5::native::ScratchLayout; 2]],
+        workspace: &crate::plan::exlr8::ExecutionWorkspace,
+        storage: super::local_physical::LocalStorage) -> anyhow::Result<Self> {
+        use anyhow::ensure;
+        let gpus = dense.len();
+        ensure!((1..=2).contains(&gpus) && vocabulary.len() == gpus
+            && shared.len() == gpus && scratch.len() == gpus, "GLM native target fact identity");
+        let mut weights = WeightInventory::from_native(selection, layers, dense)?;
+        weights.extend_native(selection, layers, &vocabulary.iter().collect::<Vec<_>>())?;
+        weights.extend_shared(shared)?;
+        let load = NativeLoad::new(&dense.iter().collect::<Vec<_>>(), &vocabulary[0], shared, storage)?;
+        let hooks = scratch.iter().enumerate().map(|(rank, layouts)| HookBuffers {
+            device: rank as u8, maximum_pages: 1, native: Some(layouts.clone()), core: None,
+            shared_workspace: Some(workspace.clone()),
+        }).collect();
+        Ok(Self { weights: vec![(EmbeddingHome::Device(0), weights)], hooks,
+            embedding_read: None, native_load: Some(load) })
+    }
+}
+
+/// Itemized drafter owners. The library-wide synchronous upload bank is handed
+/// back to the target assembler so all its users combine by max, not addition.
+#[derive(Debug, Clone, Default)]
+pub struct DraftFacts {
+    owners: Vec<Allocation>,
+    weights: Vec<ResidentWeight>,
+    loading: Vec<Sequential>,
+    prefetch: Option<DflashPrefetch>,
+    pub sync_upload_bytes: u64,
+}
+
+impl DraftFacts {
+    pub fn gqa(snapshot: &std::path::Path,
+        representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
+        capacity: crate::families::glm5::draft_representation::GlmDraftCapacity,
+        sm_count: usize, fp8_mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache)
+        -> anyhow::Result<Self> {
+        let layout = crate::families::glm5::draft_physical::GlmDflashPhysicalLayout::read(
+            snapshot, representation, capacity, sm_count, fp8_mode, kv_cache)?;
+        let mut facts = Self::from_gqa(&layout)?;
+        facts.prefetch = Some(DflashPrefetch::from_snapshot(snapshot)?);
+        Ok(facts)
+    }
+
+    fn from_gqa(layout: &crate::families::glm5::draft_physical::GlmDflashPhysicalLayout)
+        -> anyhow::Result<Self> {
+        use anyhow::Context;
+        use cuteafd_core::memory_layout::Category;
+        let mut facts = Self { owners: layout.allocations("glm.draft", Location::coordinator(0)),
+            ..Self::default() };
+        let mut source = Sequential { id: "glm.draft.load.sources".into(), members: vec![] };
+        for owner in layout.weight_owners() {
+            let mut weight = ResidentWeight::from_allocation(owner, crate::placement::ResidentWeights(owner.bytes));
+            weight.id = format!("glm.draft.{}", owner.id);
+            facts.weights.push(weight);
+            facts.sync_upload_bytes = facts.sync_upload_bytes.max(owner.bytes);
+            if let Some(matrix) = owner.id.strip_suffix(".values") {
+                let bytes = owner.bytes.checked_mul(2).context("GLM draft BF16 source overflow")?.max(256);
+                facts.sync_upload_bytes = facts.sync_upload_bytes.max(bytes);
+                source.members.push(Allocation::buffer(format!("glm.draft.load.{matrix}.source"),
+                    Location::coordinator(0), bytes,
+                    Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad }, Category::Staging,
+                    "prefetched GQA draft FP8 conversion source"));
+            }
+        }
+        if !source.members.is_empty() { facts.loading.push(source); }
+        Ok(facts)
+    }
+
+    /// ML4 owns a different native representation, not the standard GQA layout.
+    /// Lazy diagnostic inputs are absent from normal device-input serving.
+    pub fn ml4(layout: &crate::formats::dflash::MlaDraftRuntimeLayout) -> anyhow::Result<Self> {
+        use crate::formats::dflash::{MlaDraftDomain, MlaDraftDtype, MlaDraftPacking};
+        use anyhow::{ensure, Context};
+        use cuteafd_core::memory_layout::Category;
+        ensure!(layout.kind() == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark,
+            "GLM ML4 facts require the bundled mtp_dspark layout");
+        let mut facts = Self::default();
+        for owner in layout.owners().iter().filter(|owner| !owner.on_use) {
+            if owner.shared_key.as_deref() == Some("library/sync-h2d") {
+                facts.sync_upload_bytes = facts.sync_upload_bytes.max(owner.bytes as u64);
+                continue;
+            }
+            let mut allocation = Allocation::buffer(format!("glm.draft.{}", owner.id),
+                match owner.domain { MlaDraftDomain::Device => Location::coordinator(0),
+                    MlaDraftDomain::HostPinned => Location::PINNED }, owner.bytes as u64,
+                Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, Category::Drafter, "ML4 draft owners");
+            allocation.alignment = owner.alignment as u64;
+            allocation.dtype = match owner.dtype { MlaDraftDtype::Bytes => "bytes", MlaDraftDtype::Bf16 => "bf16",
+                MlaDraftDtype::F32 => "f32", MlaDraftDtype::I32 => "i32", MlaDraftDtype::U32 => "u32",
+                MlaDraftDtype::I64 => "i64" }.into();
+            allocation.shape = owner.shape.iter().map(|&n| n as u64).collect();
+            if owner.resident_weights.0 > 0 {
+                facts.weights.push(ResidentWeight::from_allocation(&allocation, owner.resident_weights));
+            }
+            facts.owners.push(allocation);
+        }
+        // One DenseLoad::Mount is reused for all bundled weight destinations.
+        let mut pinned = 0;
+        for weight in layout.weight_destinations() {
+            if matches!(weight.packing, MlaDraftPacking::UnitScale | MlaDraftPacking::Uv) { continue; }
+            if weight.packing == MlaDraftPacking::Uk {
+                let heads = weight.shape[0];
+                let shape = &weight.sources.first().context("ML4 Uk source")?.1;
+                ensure!(heads > 0 && shape.len() == 2 && shape[0] % heads == 0, "ML4 absorption source geometry");
+                let head = (shape[0] / heads).checked_mul(shape[1]).and_then(|n| n.checked_mul(2))
+                    .context("ML4 absorption head overflow")?;
+                let per = crate::shared::dense_read::STEP_BYTES / head;
+                ensure!(per > 0, "ML4 absorption head exceeds Mount bank");
+                pinned = pinned.max((per.min(heads) * head).max(crate::shared::dense_read::PINNED_FLOOR_BYTES));
+            } else {
+                for (_, shape) in &weight.sources {
+                    let (rows, columns) = if shape.len() >= 2 { (shape[0], &shape[1..]) } else { (1, &shape[..]) };
+                    let row = columns.iter().try_fold(2usize, |bytes, &n| bytes.checked_mul(n))
+                        .context("ML4 draft read row overflow")?;
+                    pinned = pinned.max(crate::shared::dense_read::ReadBatch::new(rows, row, row,
+                        crate::shared::dense_read::STEP_BYTES)?.pinned_bytes());
+                }
+            }
+        }
+        if pinned > 0 {
+            facts.owners.push(Allocation::buffer("glm.draft.load.mount", Location::PINNED, pinned as u64,
+                Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad }, Category::Staging,
+                "ML4 bundled draft Mount bank"));
+        }
+        Ok(facts)
+    }
+
+    pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        if maximum_pages == 0 { return Err(invalid("zero draft fact pool extent")); }
+        let mut out = physical_components(self.owners.clone(), maximum_pages);
+        out.extend(self.weights.iter().cloned().map(|weight| {
+            let bytes = ByteCurve::fixed(weight.weights.0, maximum_pages);
+            Component::resident_weight(weight, bytes)
+        }));
+        out.extend(self.loading.iter().cloned().map(|group| Component { activation: Activation::always(),
+            bytes: ByteCurve::fixed(group.peak(), maximum_pages), kind: ComponentKind::Sequential(group) }));
+        if let Some(prefetch) = &self.prefetch { out.extend(prefetch.components(maximum_pages)?); }
+        Ok(out)
+    }
+}
+
+/// Immutable physical facts shared by offline planning and serving admission.
+/// Topology, programs and the host availability sample are resolved before this
+/// assembler runs; none of them may be changed by a failed allocation.
+pub struct ProductionInput<'a> {
+    pub cfg: &'a GlmDsaConfig,
+    pub layers: usize,
+    pub context: u64,
+    pub maximum_pool_tokens: u64,
+    pub attention: AttentionPlacement,
+    pub gpus: usize,
+    pub prefill: PrefillShape,
+    pub weights: Vec<(EmbeddingHome, WeightInventory)>,
+    pub scratch: [super::GlmScratch; 2],
+    pub hooks: Vec<HookBuffers>,
+    pub context_scratch: Option<super::GlmContext>,
+    pub exchange_element_bytes: u64,
+    pub peer_diagnostics: bool,
+    pub local: Option<(&'a super::local_physical::LocalPhysicalSource,
+        super::local_physical::LocalPhysicalInput)>,
+    pub spark_ranks: usize,
+    pub decode_link: Option<crate::placement::PreparedSparkLink>,
+    pub prefill_link: Option<crate::placement::PreparedSparkLink>,
+    pub skip_routed_experts: bool,
+    pub operation: Operation,
+    /// Exact filler row window from the checkpoint reader. None for mapped or
+    /// native vocabulary paths, which do not create a separate Mount bank.
+    pub embedding_read: Option<crate::shared::dense_read::ReadBatch>,
+    /// Largest known upload among draft/workspace users of the library-wide
+    /// synchronous H2D bank; target inventory and filler maxima join by max.
+    pub sync_upload_bytes: u64,
+    pub native_load: Option<NativeLoad>,
+    pub owners: Vec<Component>,
+    pub budgets: Vec<Budget>,
+}
+
+/// Prepared physical alternatives, retained until the one shared solve selects
+/// them. Enumerating finite owner geometries is not a family-private fit loop.
+pub struct PreparedGlm<'a> {
+    pub recipe: GlmRecipe<'a>,
+    pub budgets: Vec<Budget>,
+    local: BTreeMap<usize, super::local_physical::LocalPhysicalInventory>,
+    decode_link: Option<crate::placement::PreparedSparkLink>,
+    prefill_link: Option<crate::placement::PreparedSparkLink>,
+    pub runtime: RuntimeFigures,
+}
+
+pub struct AdmittedGlm {
+    pub placement: crate::placement::Placement,
+    pub spark: crate::placement::SparkWorkingSet,
+    pub solved: ResolvedPlan,
+    pub local: super::local_physical::LocalPhysicalInventory,
+    pub decode_link: Option<crate::placement::PreparedSparkLink>,
+    pub prefill_link: Option<crate::placement::PreparedSparkLink>,
+    pub graphs: StartupGraphs,
+    pub runtime: RuntimeFigures,
+    pub host: HostFigures,
+}
+
+fn physical_components(owners: impl IntoIterator<Item = Allocation>, maximum: u64)
+    -> Vec<Component> {
+    owners.into_iter().filter(|owner| owner.bytes > 0).map(|owner| {
+        let bytes = ByteCurve::fixed(owner.bytes, maximum);
+        Component::allocation(owner, bytes, false, maximum)
+    }).collect()
+}
+
+fn production_counts(routed: usize, local: bool, waves: u64, skip: bool) -> Vec<usize> {
+    if skip || routed == 0 || !local { return vec![0]; }
+    (0..=routed).filter(|&count| count < routed || waves == 1).collect()
+}
+
+impl<'a> ProductionInput<'a> {
+    pub fn prepare(self) -> Result<PreparedGlm<'a>, Refusal> {
+        use super::local_physical::LocalPhysicalInventory;
+        use crate::placement::{FfnMode, SparkIntakeMode, SparkIntakeOwners};
+        if !(1..=2).contains(&self.gpus) || self.layers == 0 || self.layers > self.cfg.layers
+            || self.context == 0 || self.maximum_pool_tokens < self.context
+            || self.spark_ranks > 8 || self.weights.is_empty()
+            || self.hooks.len() != self.gpus
+            || self.hooks.iter().enumerate().any(|(rank, hook)| usize::from(hook.device) != rank)
+            || self.local.is_some() && self.gpus != 2
+            || self.native_load.as_ref().is_some_and(|load| load.gpus != self.gpus)
+            || (self.spark_ranks == 0) != self.decode_link.is_none()
+            || (self.spark_ranks == 0) != self.prefill_link.is_none()
+            || self.skip_routed_experts && (self.local.is_some() || self.spark_ranks > 0)
+            || self.spark_ranks == 0 && self.prefill.waves != 1
+        {
+            return Err(invalid("incomplete production geometry"));
+        }
+        let partitioned = self.attention == AttentionPlacement::Context;
+        if self.attention != AttentionPlacement::Heads && self.gpus != 2
+            || partitioned != self.context_scratch.is_some()
+            || ![2, 4].contains(&self.exchange_element_bytes)
+        {
+            return Err(invalid("production attention or exchange geometry"));
+        }
+        let page_tokens = if partitioned { 2 * PAGE_ROWS } else { PAGE_ROWS };
+        let maximum_pages = self.maximum_pool_tokens.div_ceil(page_tokens);
+        let owners = (self.attention == AttentionPlacement::Layers)
+            .then(|| super::attention_owners(self.cfg, self.layers))
+            .transpose().map_err(|error| invalid(&error.to_string()))?;
+        let attention = (0..self.layers).map(|layer| match self.attention {
+            AttentionPlacement::Context => LayerMode::ContextSplit,
+            AttentionPlacement::Heads if self.gpus == 2 => LayerMode::HeadSplit,
+            AttentionPlacement::Heads => LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner },
+            AttentionPlacement::Layers => LayerMode::Whole { gpu: owners.as_ref().unwrap()[layer],
+                ffn: FfnMode::Split },
+        }).collect::<Vec<_>>();
+        let routed = self.layers.saturating_sub(self.cfg.first_moe_layer);
+        // The current executor accepts full onboarding only in a one-wave
+        // deployment; multiwave Spark layouts do not change shape after solve.
+        let counts = production_counts(routed, self.local.is_some(), self.prefill.waves,
+            self.skip_routed_experts);
+        let experts = (!self.skip_routed_experts && routed > 0).then(|| ExpertProfile {
+            layers: (self.cfg.first_moe_layer..self.layers).collect(),
+            destination: (0..self.gpus as u8).collect(), counts: if self.spark_ranks == 0 {
+                vec![routed]
+            } else { counts.clone() },
+            rank_sets: if self.spark_ranks == 0 { vec![] }
+                else { vec![(0..self.spark_ranks as u8).collect()] },
+        });
+        if experts.as_ref().is_some_and(|profile| profile.rank_sets.is_empty()) && self.local.is_none() {
+            return Err(invalid("no executable local package or Spark destination"));
+        }
+        let counts = experts.as_ref().map_or(vec![0], |profile| profile.counts.clone());
+        // Source-reference bytes are fixed before admission. Classification
+        // against the canonical resolved layout happens after the single solve.
+        let reference = if self.gpus == 1 { MIN_LAYOUT } else { MAX_LAYOUT };
+        let runtime = RuntimeFigures::new(self.gpus, reference)?;
+        let host = HostFigures::for_layout(self.gpus, reference)?;
+        let mut recipe = GlmRecipe { cfg: self.cfg, context: self.context, page_tokens,
+            maximum_pages, attention, gpus: self.gpus, spark_links: self.spark_ranks > 0,
+            prefill: vec![self.prefill], lanes: vec![1],
+            embedding: self.weights.iter().map(|(home, _)| *home).collect(), experts,
+            targets: vec![], hooks: vec![], exchanges: vec![], weights: vec![], graphs: vec![],
+            host: Some(host), returns: vec![], owners: vec![], };
+        recipe.owners.push(Case { when: vec![], value: self.owners });
+        recipe.owners.push(Case { when: vec![], value: runtime.components(maximum_pages)? });
+        if let Some(load) = &self.native_load {
+            recipe.owners.push(Case { when: vec![], value: load.components(maximum_pages) });
+        }
+        for (home, weights) in &self.weights {
+            recipe.weights.push(Case { when: vec![When::Embedding(*home)], value: weights.clone() });
+            let filler = self.embedding_read.filter(|_| *home == EmbeddingHome::Device(0));
+            let sync = self.sync_upload_bytes
+                .max(self.native_load.as_ref().map_or(0, |load| load.sync_upload_bytes))
+                .max(weights.core_loading.sync_upload_bytes)
+                .max(weights.kv_b_loading.sync_upload_bytes)
+                .max(weights.row_loading.sync_upload_bytes)
+                .max(filler.map_or(0, |batch| batch.packed_bytes as u64));
+            let lifetime = Lifetime { first: Phase::Load, last: Phase::PostTargetKv };
+            let owners = [
+                ("glm.load.sync_h2d", sync),
+                ("glm.load.embedding.read", filler.map_or(0, |batch| batch.pinned_bytes() as u64)),
+            ].into_iter().filter(|(_, bytes)| *bytes > 0).map(|(id, bytes)|
+                Allocation::buffer(id, Location::PINNED, bytes, lifetime,
+                    cuteafd_core::memory_layout::Category::Staging, "GLM load pinned banks"));
+            recipe.owners.push(Case { when: vec![When::Embedding(*home)],
+                value: physical_components(owners, maximum_pages) });
+        }
+        for mut hook in self.hooks {
+            hook.maximum_pages = maximum_pages;
+            recipe.hooks.push(Case { when: vec![], value: hook });
+        }
+        if self.gpus == 2 {
+            let core_rows = recipe.hooks.iter().any(|hook| hook.value.core.is_some());
+            let width = self.cfg.hidden as u64 * (self.exchange_element_bytes + if core_rows { 2 } else { 0 });
+            let receive = self.prefill.rows.max(super::DECODE_ROWS).checked_mul(width)
+                .ok_or(Refusal::Overflow("GLM peer receive slots"))?;
+            recipe.exchanges.push(Case { when: vec![When::Prefill(self.prefill)], value: ExchangeBuffers {
+                physical_devices: [0, 1], maximum_pages,
+                receive_bytes: vec![receive; (4 * self.prefill.waves) as usize],
+                terminal_abort: true, diagnostics: self.peer_diagnostics,
+                context: self.context_scratch.map(|scratch| super::exchanges::ContextOwners {
+                    extent: self.context, prefill: self.prefill, scratch }),
+            } });
+        }
+        let mut local = BTreeMap::new();
+        for &count in &counts {
+            let when = if recipe.experts.is_some() {
+                vec![When::Onboard { first: count, last: count }]
+            } else { vec![] };
+            let inventory = match &self.local {
+                Some((source, input)) => {
+                    let mut input = input.clone();
+                    input.layers = (self.cfg.first_moe_layer..self.cfg.first_moe_layer + count).collect();
+                    if input.max_rows as u64 != self.prefill.rows.max(super::DECODE_ROWS)
+                        || input.lanes as u64 != self.prefill.waves {
+                        return Err(invalid("local owners differ from selected prefill geometry"));
+                    }
+                    source.inventory(&input).map_err(|error| invalid(&error.to_string()))?
+                }
+                None => LocalPhysicalInventory::default(),
+            };
+            let mut components = physical_components(inventory.owners.iter().chain(&inventory.views).cloned(), maximum_pages);
+            // Checkpoint resource facts follow weight backings, never backend,
+            // route or workspace bytes. Push views retain the weight identity.
+            for owner in inventory.owners.iter().filter(|owner| owner.id.contains(".weight.")) {
+                components.push(Component::resident_weight(ResidentWeight::from_allocation(owner,
+                    crate::placement::ResidentWeights(owner.bytes)), ByteCurve::fixed(owner.bytes, maximum_pages)));
+            }
+            recipe.owners.push(Case { when: when.clone(), value: components });
+            if count > 0 {
+                for (home, weights) in &self.weights {
+                    let mut replicated = weights.clone();
+                    let start = replicated.owners.len();
+                    replicated.add_peer_routers(&(self.cfg.first_moe_layer..self.cfg.first_moe_layer + count)
+                        .collect::<Vec<_>>()).map_err(|error| invalid(&error.to_string()))?;
+                    replicated.owners.drain(..start);
+                    replicated.core_loading = Default::default();
+                    replicated.kv_b_loading = Default::default();
+                    replicated.row_loading = Default::default();
+                    let mut condition = when.clone();
+                    condition.push(When::Embedding(*home));
+                    recipe.weights.push(Case { when: condition, value: replicated });
+                }
+            }
+            for device in 0..self.gpus as u8 {
+                recipe.targets.push(Case { when: {
+                    let mut condition = when.clone(); condition.push(When::Prefill(self.prefill)); condition
+                }, value: TargetBuffers { device, lead: device == 0, page_tokens, maximum_pages,
+                    context: self.context, partitioned,
+                    owned_layers: recipe.attention.iter().map(|mode| match mode {
+                        LayerMode::Whole { gpu, .. } => *gpu == device, _ => true,
+                    }).collect(), split_heads: self.gpus == 2 && owners.is_none(),
+                    router: count > 0 && device == 1,
+                    native_head: recipe.hooks[device as usize].value.core.as_ref()
+                        .is_some_and(|core| core.target_head.is_some()),
+                    decode: Some(self.scratch[0]), prefill: Some((self.prefill, self.scratch[1])),
+                    full_prefill_logits: self.operation == Operation::Scoring,
+                    payload_row_bytes: if count > 0 { self.cfg.hidden as u64 * self.exchange_element_bytes } else { 0 },
+                    core_rows: recipe.hooks[device as usize].value.core.is_some(),
+                } });
+            }
+            let layers = (0..self.layers).map(|layer| GlmGraphLayer {
+                dense: layer < self.cfg.first_moe_layer,
+                local: (self.cfg.first_moe_layer..self.cfg.first_moe_layer + count).contains(&layer),
+                attention_owner: owners.as_ref().map(|owners| owners[layer]),
+            }).collect::<Vec<_>>();
+            let return_ranks = if self.skip_routed_experts { super::SKIP_RANKS as usize }
+                else if count < routed { self.spark_ranks } else { 0 };
+            recipe.graphs.push(Case { when, value: StartupGraphs::new(self.context,
+                self.attention, self.gpus, &layers, return_ranks)? });
+            local.insert(count, inventory);
+        }
+        if self.skip_routed_experts {
+            let owners = SparkIntakeOwners { gpu: 0, ranks: super::SKIP_RANKS,
+                rows: self.prefill.rows.max(super::DECODE_ROWS), row_bytes: self.cfg.hidden as u64 * 2,
+                waves: 1, mode: SparkIntakeMode::Host }.allocations("glm.diagnostic", Lifetime::TARGET)?;
+            recipe.owners.push(Case { when: vec![], value: physical_components(owners, maximum_pages) });
+        }
+        for link in [&self.decode_link, &self.prefill_link].into_iter().flatten() {
+            if link.geometry().intake.ranks != self.spark_ranks {
+                return Err(invalid("prepared link rank count differs from deployment"));
+            }
+            if let Some(last) = counts.iter().copied().filter(|&count| count < routed).max() {
+                recipe.owners.push(Case { when: vec![When::Onboard { first: 0, last }],
+                    value: link.components(maximum_pages)? });
+            }
+        }
+        Ok(PreparedGlm { recipe, budgets: self.budgets, local, runtime,
+            decode_link: self.decode_link, prefill_link: self.prefill_link })
+    }
+}
+
+impl PreparedGlm<'_> {
+    pub fn admit(mut self, request: Request) -> Result<AdmittedGlm, Refusal> {
+        let solved = crate::placement::planner::solve(request, self.budgets, &self.recipe)?;
+        let count = solved.decisions.onboard_layers.iter().flatten().copied()
+            .collect::<BTreeSet<_>>().len();
+        let local = self.local.remove(&count).ok_or_else(|| invalid("selected local inventory was not prepared"))?;
+        let (placement, spark) = self.recipe.execution(&solved, &local)?;
+        let graph = self.recipe.graphs.into_iter().find(|case| case.when.iter().all(|condition|
+            matches!(condition, When::Onboard { first, last } if *first <= count && count <= *last)))
+            .ok_or_else(|| invalid("selected startup graph set was not prepared"))?.value;
+        let remote = !spark.spark_layers.is_empty();
+        Ok(AdmittedGlm { placement, spark, solved, local,
+            decode_link: self.decode_link.filter(|_| remote),
+            prefill_link: self.prefill_link.filter(|_| remote),
+            graphs: graph, runtime: self.runtime, host: self.recipe.host.unwrap() })
+    }
+}
+
 /// Device return reserves only. Transport staging and registrations have their
 /// own owners; compressed replies reuse these BF16 fallback backings.
 #[derive(Debug, Clone)]
@@ -364,11 +899,25 @@ pub const GLM_MAX_RUNTIME_UNATTRIBUTED: [MemoryFigure; 2] = [
         "#1242 glm53-exl3-max-census-r1/runtime-unattributed-peak/rank1"),
 ];
 
+/// Recorded Load..Warmup residual peaks, including graphs-before-serving after
+/// subtracting signed instantiate bytes. Unknown FP8 conversion/upload device
+/// temporaries are covered opaquely, not enumerated owners; samples do not bound
+/// unobserved intra-operation peaks. Other layouts require a census.
+pub const GLM_MIN_LOAD_UNATTRIBUTED: MemoryFigure = measured(552_230_080, MIN_GRAPHS, MIN_LAYOUT,
+    "4a56925e7986a57e3194c0cca6df256838386519", "#1242 glm53-exl3-min-census-r1/load-through-warmup-unattributed-peak");
+pub const GLM_MAX_LOAD_UNATTRIBUTED: [MemoryFigure; 2] = [
+    measured(843_024_212, MAX_GRAPHS[0], MAX_LAYOUT, "5d180b5c8d76636d5937336638dfd71c15a8d226",
+        "#1242 glm53-exl3-max-census-r1/load-through-warmup-unattributed-peak/rank0"),
+    measured(509_750_804, MAX_GRAPHS[1], MAX_LAYOUT, "5d180b5c8d76636d5937336638dfd71c15a8d226",
+        "#1242 glm53-exl3-max-census-r1/load-through-warmup-unattributed-peak/rank1"),
+];
+
 /// Opaque non-graph runtime parameters, charged independently of physical
 /// weights, payloads, pinned storage and graph instantiate bytes.
 #[derive(Debug, Clone)]
 pub struct RuntimeFigures {
     context: Vec<MemoryFigure>,
+    load: Vec<MemoryFigure>,
     unattributed: Vec<MemoryFigure>,
 }
 
@@ -392,24 +941,32 @@ impl RuntimeFigures {
         Ok(Self {
             context: derive(context,
                 "unchanged measured min/max preweight context; different layout, no finer context measurement")?,
+            load: derive(if gpus == 1 { vec![GLM_MIN_LOAD_UNATTRIBUTED] }
+                else { GLM_MAX_LOAD_UNATTRIBUTED.to_vec() },
+                "unchanged measured min/max Load..Warmup residual peak; unmodelled FP8 conversion/upload device temporaries, no finer load census")?,
             unattributed: derive(unattributed,
                 "unchanged measured min/max recorded runtime-unattributed peak; different layout, no finer runtime measurement")?,
         })
     }
 
     pub fn context(&self) -> &[MemoryFigure] { &self.context }
+    pub fn load(&self) -> &[MemoryFigure] { &self.load }
     pub fn unattributed(&self) -> &[MemoryFigure] { &self.unattributed }
 
     pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
         if maximum_pages == 0 { return Err(invalid("zero runtime figure pool extent")); }
-        Ok([("context and selected modules", &self.context),
-            ("runtime unattributed", &self.unattributed)].into_iter().flat_map(|(name, figures)| {
+        Ok([("context and selected modules", &self.context, Lifetime::RESIDENT),
+            ("load unattributed (FP8 conversion/upload device temporaries; sampled, not fully modelled)",
+                &self.load, Lifetime { first: Phase::Load, last: Phase::Warmup }),
+            ("runtime unattributed", &self.unattributed,
+                Lifetime { first: Phase::Ready, last: Phase::Growth })]
+            .into_iter().flat_map(|(name, figures, lifetime)| {
                 figures.iter().enumerate().map(move |(rank, figure)| Component {
                     activation: Activation::always(),
                     bytes: ByteCurve::fixed(figure.bytes, maximum_pages),
                     kind: ComponentKind::Allowance(Allowance {
                         location: Location::coordinator(rank as u8), bytes: figure.bytes,
-                        lifetime: Lifetime::RESIDENT,
+                        lifetime,
                         source: format!("GLM {name}: {:?}; {}; producer {}",
                             figure.attribution, figure.evidence, figure.producing_commit),
                         assumed: matches!(figure.attribution, FigureAttribution::Estimated { .. }),
@@ -972,16 +1529,14 @@ impl Recipe for GlmRecipe<'_> {
                     vec![0]
                 };
                 for count in counts {
-                    let mut tp2 = vec![false; self.attention.len()];
+                    let mut local = vec![false; self.attention.len()];
                     if let Some((_, profile)) = onboard {
-                        if profile.destination == [0, 1] {
-                            for &layer in &profile.layers[..count] {
-                                tp2[layer] = true;
-                            }
+                        for &layer in &profile.layers[..count] {
+                            local[layer] = true;
                         }
                     }
-                    if !graph.layers.iter().map(|layer| layer.tp2).eq(tp2) {
-                        return Err(invalid("startup graph TP2 declaration differs from activation"));
+                    if !graph.layers.iter().map(|layer| layer.local).eq(local) {
+                        return Err(invalid("startup graph local declaration differs from activation"));
                     }
                 }
             }

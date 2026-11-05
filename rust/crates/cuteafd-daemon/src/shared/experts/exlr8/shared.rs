@@ -71,6 +71,8 @@ impl NativePlan {
         })
     }
 
+    pub(crate) fn residency(&self) -> &[Residency] { &self.plans }
+
     pub(crate) fn admit_host(&self) -> Result<()> {
         let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
         let available = usize::try_from(available)?;

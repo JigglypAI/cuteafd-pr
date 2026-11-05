@@ -6,6 +6,149 @@ fn cfg() -> GlmDsaConfig {
     GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap()
 }
 
+fn production_link(cfg: &GlmDsaConfig, ranks: usize, shape: PrefillShape, prefill: bool)
+    -> crate::placement::PreparedSparkLink {
+    use crate::placement::{PreparedSparkLink, SparkEndpointOwners, SparkIntakeCandidates};
+    let geometry = cuteafd_core::ExpertGeometry { hidden: cfg.hidden as u32,
+        experts: cfg.experts as u32, topk: cfg.topk as u32,
+        intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
+    PreparedSparkLink::endpoint(if prefill { "test.prefill" } else { "test.decode" }, 0,
+        SparkEndpointOwners { ranks, geometry,
+            endpoint: cuteafd_core::SparkEndpoint { capacity: shape.rows as u32,
+                ingress: cuteafd_core::SparkIngress::Bf16, ring_depth: None, partial_reply_bytes: None },
+            rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8,
+                slot_bytes: 8 << 20, alignment: 4096 } },
+        shape.waves as usize, prefill, true, SparkIntakeCandidates::Probed,
+        cuteafd_core::SparkReplyFormat::Bf16, Lifetime::TARGET).unwrap()
+}
+
+fn production_input(cfg: &GlmDsaConfig, gpus: usize, ranks: usize, prefill: PrefillShape)
+    -> ProductionInput<'_> {
+    ProductionInput { cfg, layers: cfg.layers, context: 4096, maximum_pool_tokens: 8192,
+        attention: if gpus == 2 { AttentionPlacement::Context } else { AttentionPlacement::Heads },
+        gpus, prefill,
+        weights: vec![(EmbeddingHome::Device(0), WeightInventory { ranks: gpus, owners: vec![],
+            core_loading: Default::default(), kv_b_loading: Default::default(), row_loading: Default::default() })],
+        scratch: Default::default(),
+        hooks: (0..gpus).map(|rank| HookBuffers { device: rank as u8, maximum_pages: 1,
+            native: None, core: None, shared_workspace: None }).collect(),
+        context_scratch: (gpus == 2).then(super::super::GlmContext::default),
+        exchange_element_bytes: 2, peer_diagnostics: false, local: None, spark_ranks: ranks,
+        decode_link: (ranks > 0).then(|| production_link(cfg, ranks, PrefillShape { rows: 64, waves: 1 }, false)),
+        prefill_link: (ranks > 0).then(|| production_link(cfg, ranks, prefill, true)),
+        skip_routed_experts: false, operation: Operation::Serving, embedding_read: None,
+        sync_upload_bytes: 0, native_load: None, owners: vec![], budgets: budgets() }
+}
+
+#[test]
+fn native_load_keeps_exact_banks_and_serializes_ranks_without_host_cache_double_charge() {
+    use crate::plan::exlr8::{dense::DensePlan, residency::{ExpertSet, Residency}};
+    use super::super::local_physical::LocalStorage;
+    let dense = (0..2).map(|rank| DensePlan { rank, world: 2, tensors: vec![],
+        resident_bytes: 0, pinned_staging_bytes: (rank + 1) * 1_048_576,
+        cached_rows_bytes: (rank + 1) * 8_388_608,
+        read_staging_bytes: (rank + 1) * 9_437_184 }).collect::<Vec<_>>();
+    let vocabulary = DensePlan { rank: 0, world: 2, tensors: vec![], resident_bytes: 0,
+        pinned_staging_bytes: 32 << 20, cached_rows_bytes: 0, read_staging_bytes: 32 << 20 };
+    let plans = (0..2).map(|rank| (1..3).map(|layer| Residency {
+        layer, world: 2, rank, hidden: 64, experts: 1, units: 2, set: ExpertSet::Shared,
+        set_id: String::new(), manifest: String::new(), loads: vec![], signs: [vec![], vec![]],
+        signs_offsets: [0, 0], pointers_offset: 0, bits_offset: 0, compact_offsets: [0; 2],
+        resident_bytes: 4096, payload_bytes: 0, staging_bytes: (rank + layer) * 32,
+    }).collect::<Vec<_>>()).collect::<Vec<_>>();
+    let refs = dense.iter().collect::<Vec<_>>();
+    assert_eq!(DensePlan::mount_staging_bytes(&refs).unwrap(), (2 << 20, 16 << 20));
+    assert!(DensePlan::mount_staging_bytes(&[&dense[1], &dense[0]]).is_err());
+    let mount = NativeLoad::new(&refs, &vocabulary, &plans, LocalStorage::Mount).unwrap();
+    assert_eq!(mount.groups.len(), 33);
+    assert_eq!(mount.groups[0].members.len(), 1);
+    assert_eq!(mount.groups[0].peak(), 2 << 20,
+        "one reused Mount bank, not two ranks or the mixed-domain aggregate");
+    assert_eq!(mount.sync_upload_bytes, 1 * 2 * 3 * 3 * 8);
+    assert_eq!(mount.coarse_overcharge_bytes, 32 * 96);
+    let mut ids = BTreeSet::new();
+    for group in &mount.groups[1..] {
+        assert_eq!(group.members.len(), 4);
+        assert_eq!(group.peak(), 96);
+        for owner in &group.members {
+            assert!(ids.insert(owner.id.clone()));
+            assert_eq!(owner.location, Location::PINNED);
+            assert_eq!(owner.lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
+        }
+    }
+    assert_eq!(ids.len(), 128);
+    let push = NativeLoad::new(&refs, &vocabulary, &plans, LocalStorage::Push).unwrap();
+    assert_eq!(push.groups.len(), 32,
+        "Push does not also create the native Mount bank; shared experts still load separately");
+    assert_eq!(push.coarse_overcharge_bytes, 0);
+    let components = mount.components(1);
+    assert_eq!(components.iter().filter(|component|
+        matches!(component.kind, ComponentKind::Sequential(_))).count(), 33);
+}
+
+#[test]
+fn production_native_sync_bank_is_one_maximum_not_one_copy_per_rank_or_layer() {
+    let cfg = cfg();
+    let prefill = PrefillShape { rows: 128, waves: 3 };
+    let mut input = production_input(&cfg, 2, 4, prefill);
+    input.sync_upload_bytes = 4096;
+    input.native_load = Some(NativeLoad { gpus: 2, sync_upload_bytes: 8192,
+        coarse_overcharge_bytes: 0, groups: vec![] });
+    let prepared = input.prepare().unwrap();
+    let solved = prepared.admit(request()).unwrap().solved;
+    let banks = solved.facts.allocations.iter().filter(|owner| owner.id == "glm.load.sync_h2d")
+        .collect::<Vec<_>>();
+    assert_eq!(banks.len(), 1);
+    assert_eq!(banks[0].bytes, 8192);
+}
+
+#[test]
+fn production_min_and_max_keep_devs_spark_prefill_shape() {
+    use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
+    let cfg = cfg();
+    // Both example cards leave rows/waves unpinned. The launcher's shared depth
+    // resolver selects three waves; the old solver never transitions to one.
+    for (gpus, ranks) in [(1, 4), (2, 6)] {
+        let dev = prefill_shape(ranks, PrefillLimits::default(), PrefillOverrides::default()).unwrap();
+        assert_eq!((dev.unit_rows, dev.waves), (2752, 3));
+        let prefill = PrefillShape { rows: dev.unit_rows, waves: dev.waves };
+        let prepared = production_input(&cfg, gpus, ranks, prefill).prepare().unwrap();
+        assert_eq!(prepared.recipe.prefill, vec![prefill]);
+        let admitted = prepared.admit(request()).unwrap();
+        assert_eq!(admitted.solved.decisions.prefill, prefill);
+        assert_eq!(admitted.spark.prefill_lanes, dev.waves);
+        assert_eq!(admitted.spark.spark_ranks, ranks);
+        assert!(admitted.decode_link.is_some() && admitted.prefill_link.is_some());
+    }
+}
+
+#[test]
+fn production_count_domain_preserves_executable_wave_capabilities() {
+    assert_eq!(production_counts(3, false, 3, false), [0]);
+    assert_eq!(production_counts(3, true, 1, false), [0, 1, 2, 3]);
+    assert_eq!(production_counts(3, true, 3, false), [0, 1, 2]);
+    assert_eq!(production_counts(0, true, 3, false), [0]);
+    assert_eq!(production_counts(3, true, 3, true), [0]);
+    let cfg = cfg();
+    let prefill = PrefillShape { rows: 128, waves: 3 };
+    let mut prepared = production_input(&cfg, 2, 4, prefill).prepare().unwrap();
+    prepared.recipe.experts.as_mut().unwrap().counts = production_counts(1, true, 3, false);
+    let mut exact = request();
+    exact.onboard = Pin::Exact(1);
+    assert!(planner::solve(exact, prepared.budgets, &prepared.recipe).is_err(),
+        "an unavailable full count must refuse, not clamp or change shape");
+}
+
+#[test]
+fn production_rejects_misindexed_hooks_and_spark_free_multiwave() {
+    let cfg = cfg();
+    let mut input = production_input(&cfg, 2, 4, PrefillShape { rows: 128, waves: 3 });
+    input.hooks.swap(0, 1);
+    assert!(input.prepare().is_err());
+    let input = production_input(&cfg, 2, 0, PrefillShape { rows: 128, waves: 3 });
+    assert!(input.prepare().is_err());
+}
+
 #[test]
 fn glm_zero_demand_omits_charge_and_positive_demand_has_one_exact_item() {
     let cfg = cfg();
@@ -834,7 +977,7 @@ fn shared_serving_owners_compose_without_family_private_geometry_or_policy() {
 
 fn graph_layers(owners: &[u8], tp2: &[bool]) -> Vec<GlmGraphLayer> {
     owners.iter().zip(tp2).enumerate().map(|(index, (&owner, &tp2))| GlmGraphLayer {
-        dense: index == 0, tp2, attention_owner: Some(owner),
+        dense: index == 0, local: tp2, attention_owner: Some(owner),
     }).collect()
 }
 
@@ -891,10 +1034,10 @@ fn maintained_graph_figures_cover_every_placement_without_an_automatic_growth_ma
 #[test]
 fn measured_reference_figures_match_independently_declared_min_max_sets() {
     let min_layers: Vec<_> = (0..78).map(|layer| GlmGraphLayer {
-        dense: layer < 3, tp2: false, attention_owner: None,
+        dense: layer < 3, local: false, attention_owner: None,
     }).collect();
     let mut max_layers = min_layers.clone();
-    for layer in &mut max_layers[3..9] { layer.tp2 = true; }
+    for layer in &mut max_layers[3..9] { layer.local = true; }
     let min = StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 1, &min_layers, 4).unwrap();
     let max = StartupGraphs::new(1 << 20, AttentionPlacement::Context, 2, &max_layers, 6).unwrap();
     assert_eq!(min.declared()[0].fingerprint(0).unwrap(), MIN_GRAPHS);
@@ -931,27 +1074,33 @@ fn runtime_figures_preserve_recorded_peaks_without_double_charging_or_margins() 
         assert_eq!(figures.unattributed().iter().map(|f| f.bytes).collect::<Vec<_>>(), unattributed);
         assert!(figures.context().iter().chain(figures.unattributed())
             .all(|f| f.attribution == FigureAttribution::Measured));
+        let load = if ranks == 1 { vec![552_230_080] } else { vec![843_024_212, 509_750_804] };
+        assert_eq!(figures.load().iter().map(|f| f.bytes).collect::<Vec<_>>(), load);
         for maximum in [1, 32768] {
             let components = figures.components(maximum).unwrap();
-            assert_eq!(components.len(), ranks * 2);
+            assert_eq!(components.len(), ranks * 3);
             for (index, component) in components.iter().enumerate() {
                 let ComponentKind::Allowance(owner) = &component.kind else {
                     panic!("opaque runtime has no invented allocation owner")
                 };
                 let rank = index % ranks;
-                let bytes = if index < ranks { context[rank] } else { unattributed[rank] };
+                let (bytes, lifetime) = match index / ranks {
+                    0 => (context[rank], Lifetime::RESIDENT),
+                    1 => (load[rank], Lifetime { first: Phase::Load, last: Phase::Warmup }),
+                    _ => (unattributed[rank], Lifetime { first: Phase::Ready, last: Phase::Growth }),
+                };
                 assert_eq!(owner.location, Location::coordinator(rank as u8));
                 assert_eq!(owner.bytes, bytes);
                 assert!(!owner.assumed);
-                assert_eq!(owner.lifetime, Lifetime::RESIDENT);
+                assert_eq!(owner.lifetime, lifetime);
                 assert_eq!(component.activation, Activation::always());
                 assert_eq!(component.bytes.at(1).unwrap(), bytes);
                 assert_eq!(component.bytes.at(maximum).unwrap(), bytes);
             }
         }
         let estimated = RuntimeFigures::new(ranks, "different complete layout").unwrap();
-        for (source, derived) in figures.context().iter().chain(figures.unattributed())
-            .zip(estimated.context().iter().chain(estimated.unattributed())) {
+        for (source, derived) in figures.context().iter().chain(figures.load()).chain(figures.unattributed())
+            .zip(estimated.context().iter().chain(estimated.load()).chain(estimated.unattributed())) {
             assert_eq!(derived.bytes, source.bytes, "uncovered is not permission to add a margin");
             assert_eq!(derived.evidence, source.evidence);
             assert_eq!(derived.producing_commit, source.producing_commit);
@@ -963,6 +1112,38 @@ fn runtime_figures_preserve_recorded_peaks_without_double_charging_or_margins() 
     }
     for ranks in [0, 3, usize::MAX] { assert!(RuntimeFigures::new(ranks, MIN_LAYOUT).is_err()); }
     assert!(RuntimeFigures::new(1, " ").is_err());
+}
+
+#[test]
+fn load_allowances_cover_each_reference_sample_and_do_not_overlap_ready() {
+    // #1242 raw untracked samples: target, draft, pool, transport, warmed graph.
+    // The final sample has signed instantiate bytes removed; no other graph
+    // bytes are subtracted before instantiate actually happened.
+    for (gpus, layout, rank, raw, context, graph) in [
+        (1, MIN_LAYOUT, 0, [742_390_144, 865_686_208, 988_469_184, 1_078_613_952, 3_711_851_712],
+            598_999_040, 2_560_622_592),
+        (2, MAX_LAYOUT, 0, [863_806_848, 940_924_096, 1_267_960_148, 1_437_828_948, 4_480_796_500],
+            594_804_736, 3_042_967_552),
+        (2, MAX_LAYOUT, 1, [743_268_224, 743_268_224, 1_082_881_044, 1_110_846_996, 4_084_608_532],
+            603_193_344, 2_971_664_384),
+    ] {
+        let figures = RuntimeFigures::new(gpus, layout).unwrap();
+        let peak = raw.into_iter().enumerate().map(|(i, bytes)|
+            bytes - context - if i == 4 { graph } else { 0 }).max().unwrap();
+        assert_eq!(figures.load()[rank].bytes, peak);
+        let components = figures.components(32768).unwrap();
+        for phase in PhaseOrder::DRAFT_THEN_TARGET.phases() {
+            let opaque = components.iter().filter_map(|component| match &component.kind {
+                ComponentKind::Allowance(owner) if owner.location == Location::coordinator(rank as u8)
+                    && owner.lifetime.contains(*phase, PhaseOrder::DRAFT_THEN_TARGET) => Some(owner.bytes),
+                _ => None,
+            }).collect::<Vec<_>>();
+            assert_eq!(opaque.len(), 2, "context plus exactly one residual in {phase}");
+            assert_eq!(opaque.iter().sum::<u64>(), context + if matches!(phase, Phase::Ready | Phase::Growth) {
+                figures.unattributed()[rank].bytes
+            } else { peak });
+        }
+    }
 }
 
 #[test]

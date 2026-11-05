@@ -25,7 +25,8 @@ pub struct GlmGraphKey {
 #[derive(Debug, Clone, Copy)]
 pub struct GlmGraphLayer {
     pub dense: bool,
-    pub tp2: bool,
+    /// Whole or paired coordinator-local FFN; both produce a reduced delta.
+    pub local: bool,
     pub attention_owner: Option<u8>,
 }
 
@@ -36,7 +37,7 @@ pub fn glm_declared_graphs(shapes: &[GlmGraphShape], attention: AttentionPlaceme
     layers: &[GlmGraphLayer], return_ranks: usize) -> Result<Vec<DeclaredGraphSet<GlmGraphKey>>, String> {
     if !(1..=2).contains(&gpus) || layers.is_empty()
         || (attention != AttentionPlacement::Heads && gpus != 2)
-        || layers.iter().any(|layer| (layer.tp2 && (gpus != 2 || layer.dense))
+        || layers.iter().any(|layer| (layer.local && layer.dense)
             || match attention {
                 AttentionPlacement::Layers => layer.attention_owner.is_none_or(|owner| owner >= 2),
                 _ => layer.attention_owner.is_some(),
@@ -49,7 +50,7 @@ pub fn glm_declared_graphs(shapes: &[GlmGraphShape], attention: AttentionPlaceme
     let mut keys = vec![Vec::new(); gpus];
     if attention == AttentionPlacement::Layers {
         let owners: Vec<_> = layers.iter().map(|layer| layer.attention_owner.unwrap()).collect();
-        let tp2: Vec<_> = layers.iter().map(|layer| layer.tp2).collect();
+        let tp2: Vec<_> = layers.iter().map(|layer| layer.local).collect();
         for segment in glm_owned_segments(&owners, &tp2)? {
             for shape in shapes {
                 keys[segment.rank].push(GlmGraphKey { layer: segment.phase.key(segment.layer), rows: shape.rows,
@@ -65,7 +66,7 @@ pub fn glm_declared_graphs(shapes: &[GlmGraphShape], attention: AttentionPlaceme
                 for layer in 0..layers.len() + usize::from(rank == 0) {
                     let previous = match layer.checked_sub(1).map(|index| layers[index]) {
                         None => GlmGraphPrevious::First,
-                        Some(before) if before.dense || before.tp2 => GlmGraphPrevious::Delta,
+                        Some(before) if before.dense || before.local => GlmGraphPrevious::Delta,
                         Some(_) => GlmGraphPrevious::Planes(if rank == 0 { return_ranks } else { 0 }),
                     };
                     keys.push(GlmGraphKey { layer, rows: shape.rows, table_width: width, table_stride: width,
@@ -151,9 +152,9 @@ mod tests {
     #[test]
     fn split_declarations_match_rank_local_segments_and_terminal_head() {
         let layers = [
-            GlmGraphLayer { dense: true, tp2: false, attention_owner: None },
-            GlmGraphLayer { dense: false, tp2: true, attention_owner: None },
-            GlmGraphLayer { dense: false, tp2: false, attention_owner: None },
+            GlmGraphLayer { dense: true, local: false, attention_owner: None },
+            GlmGraphLayer { dense: false, local: true, attention_owner: None },
+            GlmGraphLayer { dense: false, local: false, attention_owner: None },
         ];
         let shapes = [GlmGraphShape { rows: 4, table_width: 17 }];
         for attention in [AttentionPlacement::Heads, AttentionPlacement::Context] {
@@ -173,7 +174,7 @@ mod tests {
             }
         }
         let mut remote = layers;
-        remote[1].tp2 = false;
+        remote[1].local = false;
         let declared = glm_declared_graphs(&shapes, AttentionPlacement::Heads, 2, &remote, 4).unwrap();
         for (rank, planes) in [(0, 4), (1, 0)] {
             assert!(declared[rank].contains(&GlmGraphKey { layer: 2, rows: 4,
@@ -186,13 +187,37 @@ mod tests {
     }
 
     #[test]
+    fn whole_local_graphs_use_delta_without_a_pair_or_return_planes() {
+        let shapes = [GlmGraphShape { rows: 4, table_width: 17 }];
+        let mut layers = [
+            GlmGraphLayer { dense: true, local: false, attention_owner: None },
+            GlmGraphLayer { dense: false, local: true, attention_owner: None },
+            GlmGraphLayer { dense: false, local: false, attention_owner: None },
+        ];
+        let declared = glm_declared_graphs(&shapes, AttentionPlacement::Heads, 1, &layers, 4).unwrap();
+        let actual = [GlmGraphPrevious::First, GlmGraphPrevious::Delta,
+            GlmGraphPrevious::Delta, GlmGraphPrevious::Planes(4)].into_iter().enumerate()
+            .map(|(layer, previous)| GlmGraphKey { layer, rows: 4, table_width: 17,
+                table_stride: 17, previous, head: layer == layers.len() }).collect::<Vec<_>>();
+        declared[0].verify(actual.iter()).unwrap();
+        layers[1].local = false;
+        let remote = glm_declared_graphs(&shapes, AttentionPlacement::Heads, 1, &layers, 4).unwrap();
+        assert!(remote[0].verify(actual.iter()).is_err());
+        layers[1].local = true;
+        layers[2].local = true;
+        let all_local = glm_declared_graphs(&shapes, AttentionPlacement::Heads, 1, &layers, 0).unwrap();
+        assert!(all_local[0].contains(&GlmGraphKey { layer: 3, previous: GlmGraphPrevious::Delta,
+            ..actual[3] }));
+    }
+
+    #[test]
     fn declarations_reproduce_min_max_counts_without_observed_nodes_or_bytes() {
         let shapes = glm_graph_shapes(1 << 20, 32768);
         assert_eq!(shapes.len(), 213);
         let min: Vec<_> = (0..78).map(|layer| GlmGraphLayer {
-            dense: layer < 3, tp2: false, attention_owner: None }).collect();
+            dense: layer < 3, local: false, attention_owner: None }).collect();
         let mut max = min.clone();
-        for layer in &mut max[3..9] { layer.tp2 = true; }
+        for layer in &mut max[3..9] { layer.local = true; }
         let min = glm_declared_graphs(&shapes, AttentionPlacement::Heads, 1, &min, 4).unwrap();
         let max = glm_declared_graphs(&shapes, AttentionPlacement::Context, 2, &max, 6).unwrap();
         assert_eq!(min[0].len(), 16_827);
@@ -223,7 +248,7 @@ mod tests {
             let context = 1 << 20;
             let pages = pool_tokens / super::super::GLM_PAGE_ROWS;
             let layers: Vec<_> = (0..78).map(|layer| GlmGraphLayer {
-                dense: layer < 3, tp2: (3..3 + onboard).contains(&layer), attention_owner: None,
+                dense: layer < 3, local: (3..3 + onboard).contains(&layer), attention_owner: None,
             }).collect();
             let declared = glm_declared_graphs(&glm_graph_shapes(context, pages), attention,
                 gpus, &layers, ranks).unwrap();
@@ -257,8 +282,8 @@ mod tests {
     fn owned_declaration_covers_exact_phases_and_changes_with_ownership() {
         let shapes = glm_graph_shapes(131072, 4096);
         let layers = [
-            GlmGraphLayer { dense: true, tp2: false, attention_owner: Some(0) },
-            GlmGraphLayer { dense: false, tp2: true, attention_owner: Some(1) },
+            GlmGraphLayer { dense: true, local: false, attention_owner: Some(0) },
+            GlmGraphLayer { dense: false, local: true, attention_owner: Some(1) },
         ];
         let declared = glm_declared_graphs(&shapes, AttentionPlacement::Layers, 2, &layers, 4).unwrap();
         for (rank, phases) in [
@@ -282,7 +307,7 @@ mod tests {
     #[test]
     fn invalid_or_duplicate_graph_declarations_fail_closed() {
         let shape = GlmGraphShape { rows: 1, table_width: 16 };
-        let mut layer = GlmGraphLayer { dense: true, tp2: false, attention_owner: None };
+        let mut layer = GlmGraphLayer { dense: true, local: false, attention_owner: None };
         for gpus in [0, 3] {
             assert!(glm_declared_graphs(&[shape], AttentionPlacement::Heads, gpus, &[layer], 0).is_err());
         }
@@ -293,9 +318,9 @@ mod tests {
         assert!(glm_declared_graphs(&[shape, shape], AttentionPlacement::Heads, 1, &[layer], 0).is_err());
         assert!(glm_declared_graphs(&[GlmGraphShape { rows: 0, ..shape }], AttentionPlacement::Heads, 1, &[layer], 0).is_err());
         assert!(glm_declared_graphs(&[GlmGraphShape { table_width: 0, ..shape }], AttentionPlacement::Heads, 1, &[layer], 0).is_err());
-        layer.tp2 = true;
+        layer.local = true;
         assert!(glm_declared_graphs(&[shape], AttentionPlacement::Heads, 2, &[layer], 0).is_err());
-        layer.tp2 = false;
+        layer.local = false;
         layer.attention_owner = Some(2);
         assert!(glm_declared_graphs(&[shape], AttentionPlacement::Layers, 2, &[layer], 0).is_err());
         layer.attention_owner = Some(0);

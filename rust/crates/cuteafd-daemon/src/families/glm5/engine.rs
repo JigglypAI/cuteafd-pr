@@ -1406,7 +1406,7 @@ impl<'a> GlmEngine<'a> {
         let attention = if self.layers_kv() { AttentionPlacement::Layers }
             else if self.context_kv() { AttentionPlacement::Context } else { AttentionPlacement::Heads };
         let layers: Vec<_> = self.weights.layers.iter().enumerate().map(|(index, layer)| GlmGraphLayer {
-            dense: layer.dense, tp2: self.tp2_layer(index), attention_owner: layer.attention_owner }).collect();
+            dense: layer.dense, local: self.tp2_layer(index), attention_owner: layer.attention_owner }).collect();
         let return_ranks = if self.skip.is_some() { SKIP_RANKS }
             else if let Some((link, _)) = experts.as_mut() { link.exchange()?.ranks() } else { 0 };
         let shapes = glm_graph_shapes(self.max_context, self.pages);

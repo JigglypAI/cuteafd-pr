@@ -412,6 +412,21 @@ fn read_u64(source: Range, index: &[u8]) -> anyhow::Result<u64> {
 }
 
 impl Residency {
+    pub const LOAD_BANKS: usize = 2;
+    pub const LOAD_LANES: usize = 16;
+
+    /// The async unit-reader banks, excluding the library-wide synchronous H2D bank.
+    pub fn mount_pinned_bytes(&self) -> anyhow::Result<usize> {
+        self.staging_bytes.max(16).checked_mul(Self::LOAD_LANES * Self::LOAD_BANKS)
+            .context("EXLR8 pinned unit banks overflow")
+    }
+
+    /// Descriptor and sign uploads share one library-owned reusable pinned bank.
+    pub fn sync_upload_bytes(&self) -> anyhow::Result<usize> {
+        self.experts.checked_mul(self.units).and_then(|n| n.checked_mul(3 * 3 * 8))
+            .map(|bytes| bytes.max(self.hidden)).context("EXLR8 descriptor upload overflow")
+    }
+
     pub fn plan(
         snapshot: &Path,
         selected: &str,
