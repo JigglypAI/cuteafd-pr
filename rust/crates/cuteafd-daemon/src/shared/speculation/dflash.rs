@@ -33,7 +33,7 @@ use cuteafd_ffi::programs::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{read_safetensors_metadata, SafetensorsTensorMetadata};
 use cuteafd_loader::families::glm5::draft_representation::{
-    GlmDraftCapacity, GlmDraftGeometry, GlmDraftRepresentation, GlmDraftRuntimeLayout,
+    GlmDraftCapacity, GlmDraftRepresentation,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -44,6 +44,9 @@ type Dev<'a> = DeviceAllocation<'a>;
 
 #[path = "dflash_allocation.rs"]
 mod allocation;
+#[cfg(test)]
+#[path = "dflash_physical_tests.rs"]
+mod physical_tests;
 
 /// The drafters' exact vocabulary head (`--draft-head exact`) of `rows` rows: 2..=24 rows on the
 /// few-row FP32 kernel (one read of the head per 8 rows), others on the pedantic cuBLAS head;
@@ -165,176 +168,7 @@ mod draft_head_tests {
 }
 
 
-/// Context entries each draft layer attends to (the checkpoint's sliding window).
-pub(crate) const RING: usize = 2048;
-/// Tapped rows one target step keeps (a prefill chunk's tail, or a verify step).
-pub(crate) const TAP_ROWS: usize = RING;
-#[derive(Debug, Clone, serde::Deserialize)]
-struct RawConfig {
-    hidden_size: usize,
-    intermediate_size: usize,
-    num_hidden_layers: usize,
-    num_attention_heads: usize,
-    num_key_value_heads: usize,
-    head_dim: usize,
-    rms_norm_eps: f64,
-    sliding_window: usize,
-    vocab_size: usize,
-    /// Newer configs nest the base in `rope_parameters`; others keep a flat `rope_theta`.
-    #[serde(default)]
-    rope_parameters: Option<RawRope>,
-    #[serde(default)]
-    rope_theta: Option<f64>,
-    dflash_config: RawDflash,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct RawRope {
-    rope_theta: f64,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct RawDflash {
-    block_size: usize,
-    conv_group_size: usize,
-    conv_kernel_size: usize,
-    mask_token_id: u32,
-    selector_rank: usize,
-    selector_top_k: usize,
-    target_layer_ids: Vec<usize>,
-}
-
-/// The drafter geometry the kernels are written for, read from `config.json`.
-#[derive(Debug, Clone)]
-pub(crate) struct DflashConfig {
-    pub hidden: usize,
-    pub intermediate: usize,
-    pub layers: usize,
-    pub heads: usize,
-    pub kv_heads: usize,
-    pub head_dim: usize,
-    pub eps: f32,
-    pub theta: f32,
-    pub block: usize,
-    pub group: usize,
-    pub mask_token: u32,
-    pub rank: usize,
-    pub taps: Vec<usize>,
-    pub vocab: usize,
-    /// The sliding window (the ring's length).
-    pub window: usize,
-    /// Mask each block row's context to its own window (upstream's
-    /// `|p - q| < window`); off, every block row sees the last `window`
-    /// context entries (the GLM 5.3 port's measured behavior).
-    pub row_window: bool,
-    /// Every block row is a prediction (dSpark's anchor-as-first: `block`
-    /// drafts); off, the anchor row only carries context (`block - 1`).
-    pub sample_from_anchor: bool,
-}
-
-impl DflashConfig {
-    pub fn read(snapshot: &Path) -> Result<Self> {
-        let raw: RawConfig = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)
-            .context("parsing the DFlash2 config.json")?;
-        let d = &raw.dflash_config;
-        ensure!(matches!(raw.head_dim, 128 | 64) && raw.num_key_value_heads > 0
-            && raw.num_attention_heads % raw.num_key_value_heads == 0
-            && raw.num_attention_heads / raw.num_key_value_heads * d.block_size <= 64,
-            "DFlash2 kernels take 128- or 64-wide heads and at most 64 queries per kv head and block \
-             (got {} heads, {} kv, block {})", raw.num_attention_heads, raw.num_key_value_heads, d.block_size);
-        ensure!(d.conv_kernel_size == 2 && d.selector_rank == 256 && d.selector_top_k == 16,
-            "DFlash2 kernels take two-tap convolutions and a rank-256 top-16 selector");
-        ensure!(raw.sliding_window == RING, "DFlash2 window {} (the ring holds {RING})", raw.sliding_window);
-        Ok(Self {
-            hidden: raw.hidden_size,
-            intermediate: raw.intermediate_size,
-            layers: raw.num_hidden_layers,
-            heads: raw.num_attention_heads,
-            kv_heads: raw.num_key_value_heads,
-            head_dim: raw.head_dim,
-            eps: raw.rms_norm_eps as f32,
-            theta: raw.rope_parameters.as_ref().map(|r| r.rope_theta).or(raw.rope_theta)
-                .context("DFlash2 config lacks rope_parameters.rope_theta and rope_theta")? as f32,
-            block: d.block_size,
-            group: d.conv_group_size,
-            mask_token: d.mask_token_id,
-            rank: d.selector_rank,
-            taps: d.target_layer_ids.clone(),
-            vocab: raw.vocab_size,
-            window: raw.sliding_window,
-            row_window: false,
-            sample_from_anchor: false,
-        })
-    }
-
-    fn mla(cfg: &cuteafd_loader::formats::dflash::MlaDflashConfig) -> Self {
-        Self { hidden: cfg.mla.hidden, intermediate: cfg.intermediate, layers: cfg.windows.len(),
-            heads: cfg.mla.heads, kv_heads: cfg.mla.heads, head_dim: cfg.mla.nope + cfg.mla.rope,
-            eps: cfg.eps as f32, theta: 0.0, block: cfg.block, group: cfg.group,
-            mask_token: cfg.mask_token, rank: cfg.selector_rank, taps: cfg.taps.clone(), vocab: cfg.vocab,
-            window: 0, row_window: false, sample_from_anchor: cfg.drafts() == cfg.block }
-    }
-
-    pub fn drafts(&self) -> usize {
-        if self.sample_from_anchor { self.block } else { self.block - 1 }
-    }
-
-    fn kv_width(&self) -> usize {
-        self.kv_heads * self.head_dim
-    }
-
-    fn qkv_width(&self) -> usize {
-        (self.heads + 2 * self.kv_heads) * self.head_dim
-    }
-
-    fn conv_width(&self) -> usize {
-        4 * self.hidden / self.group
-    }
-
-    pub(crate) fn tensor_shapes(&self) -> Vec<(String, Vec<usize>)> {
-        let (h, kv, inter) = (self.hidden, self.kv_width(), self.intermediate);
-        let mut shapes = vec![
-            ("fc.weight".into(), vec![h, self.taps.len() * h]),
-            ("hidden_norm.weight".into(), vec![h]),
-            ("norm.weight".into(), vec![h]),
-            ("candidate_selector.hidden_projection.weight".into(), vec![self.rank, h]),
-            ("candidate_selector.predecessor_codebook".into(), vec![self.vocab, self.rank]),
-            ("candidate_selector.successor_codebook".into(), vec![self.vocab, self.rank]),
-        ];
-        for l in 0..self.layers {
-            let p = format!("layers.{l}");
-            let a = format!("{p}.self_attn");
-            shapes.extend([
-                (format!("{p}.input_layernorm.weight"), vec![h]),
-                (format!("{p}.post_attention_layernorm.weight"), vec![h]),
-                (format!("{p}.attention_conv.kernel_projection.weight"), vec![self.conv_width(), h]),
-                (format!("{p}.attention_conv.base_kernel"), vec![2, 2, h]),
-                (format!("{p}.mlp_conv.kernel_projection.weight"), vec![self.conv_width(), h]),
-                (format!("{p}.mlp_conv.base_kernel"), vec![2, 2, h]),
-                (format!("{a}.q_proj.weight"), vec![self.heads * self.head_dim, h]),
-                (format!("{a}.k_proj.weight"), vec![kv, h]),
-                (format!("{a}.v_proj.weight"), vec![kv, h]),
-                (format!("{a}.q_norm.weight"), vec![self.head_dim]),
-                (format!("{a}.k_norm.weight"), vec![self.head_dim]),
-                (format!("{a}.o_proj.weight"), vec![h, self.heads * self.head_dim]),
-                (format!("{p}.mlp.gate_proj.weight"), vec![inter, h]),
-                (format!("{p}.mlp.up_proj.weight"), vec![inter, h]),
-                (format!("{p}.mlp.down_proj.weight"), vec![h, inter]),
-            ]);
-        }
-        shapes
-    }
-
-    pub(crate) fn runtime_layout(&self, mode: GlmDraftRepresentation, capacity: GlmDraftCapacity)
-        -> Result<GlmDraftRuntimeLayout> {
-        Ok(GlmDraftRuntimeLayout::new(GlmDraftGeometry {
-            hidden: self.hidden as u64, intermediate: self.intermediate as u64, layers: self.layers as u64,
-            heads: self.heads as u64, kv_heads: self.kv_heads as u64, head_dim: self.head_dim as u64,
-            taps: self.taps.len() as u64, vocab: self.vocab as u64, conv_group: self.group as u64,
-            selector_rank: self.rank as u64,
-        }, mode, capacity, TAP_ROWS)?)
-    }
-}
+pub(crate) use cuteafd_loader::families::glm5::draft_physical::{GlmDflashConfig as DflashConfig, RING, TAP_ROWS};
 
 /// Exactly one immutable resident representation of a GEMM.
 use super::weights::Weight as DraftWeight;
@@ -949,6 +783,7 @@ pub(crate) struct DflashDrafter<'a> {
     fc: DraftWeight<'a>,
     projections: cuteafd_ffi::draft_projection::DraftProjections<'a>,
     context_fc: Option<cuteafd_ffi::mla_draft::Ml4ContextProjection<'a>>,
+    physical: Option<cuteafd_loader::families::glm5::draft_physical::GlmDflashPhysicalLayout>,
     hidden_norm: Dev<'a>,
     norm: Dev<'a>,
     head_ops: DraftHeadOps<'a>,
@@ -1186,6 +1021,8 @@ impl<'a> DflashDrafter<'a> {
         let projections = Self::load_projections(programs, &cfg, representation, false, false, max_sequences)?;
         let capacity = GlmDraftCapacity::new(slots, max_sequences, cfg.block)?;
         let layout = cfg.runtime_layout(representation, capacity)?;
+        let physical = cuteafd_loader::families::glm5::draft_physical::GlmDflashPhysicalLayout::read(
+            snapshot, representation, capacity, library.sm_count()?, fp8_rows.code() as u8, kv_cache)?;
         let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
         let residency = cuteafd_loader::families::glm5::draft_representation::draft_resident_bytes_with_mode(
             &config, slots, max_sequences, library.sm_count()? as u64, representation, fp8_rows.code() as u8, kv_cache)?;
@@ -1194,8 +1031,8 @@ impl<'a> DflashDrafter<'a> {
         ensure!(mask_row.len() == cfg.hidden * 2, "DFlash BF16 mask row has wrong hidden width");
         let checkpoint = super::weights::Load::with_prefetched(library, snapshot, file)?;
         checkpoint.validate(cfg.tensor_shapes())?;
-        let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+        let zeroed = |id: &str| -> Result<Dev<'a>> {
+            let allocation = DeviceAllocation::new(library, physical.owner_bytes(id)?)?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -1226,8 +1063,8 @@ impl<'a> DflashDrafter<'a> {
                     q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
                     k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
                     o: matrix(&[(&format!("{a}.o_proj.weight"), h)], cfg.heads * cfg.head_dim)?,
-                    k_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
-                    v_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
+                    k_ring: zeroed(&format!("layer.{l}.k_ring"))?,
+                    v_ring: zeroed(&format!("layer.{l}.v_ring"))?,
                 }),
                 gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
                     (&format!("{p}.mlp.up_proj.weight"), inter)], h)?,
@@ -1253,12 +1090,12 @@ impl<'a> DflashDrafter<'a> {
                 successor: tensor("candidate_selector.successor_codebook", &[cfg.vocab, cfg.rank])?,
             },
             layers,
-            taps: zeroed(TAP_ROWS * taps * 2)?,
-            fused: zeroed(TAP_ROWS * h * 2)?,
-            fused_norm: zeroed(TAP_ROWS * h * 2)?,
-            context_positions: zeroed(TAP_ROWS * 8)?,
+            taps: zeroed("taps")?,
+            fused: zeroed("fused")?,
+            fused_norm: zeroed("fused_norm")?,
+            context_positions: zeroed("context_positions")?,
             context: DraftContext::Gqa(GqaContext {
-                kv: zeroed(TAP_ROWS * 2 * kv * 2)?, slots: zeroed(TAP_ROWS * 4)?,
+                kv: zeroed("context.kv")?, slots: zeroed("context.slots")?,
             }),
             mask_row,
             mask_rows: None,
@@ -1274,6 +1111,7 @@ impl<'a> DflashDrafter<'a> {
             head_mode: Cell::new(DraftHead::Exact),
             fp8_rows: Cell::new(fp8_rows),
             fp8_admitted: fp8_rows,
+            physical: Some(physical),
             cfg,
         })
     }
@@ -1348,7 +1186,7 @@ impl<'a> DflashDrafter<'a> {
             native.rotary.inv_freq.len() * 4)?, bytes_of(&native.rotary.inv_freq))?;
         let result = Self { kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, library, stream, slots: layout.capacity().context_slots,
             max_sequences: layout.capacity().max_batch_sequences,
-            fc: matrix(&[("fc.weight", h)], cfg.taps.len() * h)?, context_fc: None, projections,
+            fc: matrix(&[("fc.weight", h)], cfg.taps.len() * h)?, context_fc: None, physical: None, projections,
             hidden_norm: tensor("hidden_norm.weight", &[h])?, norm: tensor("norm.weight", &[h])?,
             head_ops: DraftHeadOps::Selector {
                 projection: matrix(&[("candidate_selector.hidden_projection.weight", cfg.rank)], h)?,
@@ -1456,7 +1294,7 @@ impl<'a> DflashDrafter<'a> {
         let result = Self { kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, library, stream,
             slots: layout.capacity().context_slots, max_sequences: layout.capacity().max_batch_sequences,
             fc: DraftWeight::Bf16(tensor(&mut owners, "backbone.target_projection.weight", &[h, cfg.taps.len() * h])?),
-            context_fc: Some(context_fc), projections,
+            context_fc: Some(context_fc), physical: None, projections,
             hidden_norm: tensor(&mut owners, "backbone.target_norm.weight", &[h])?,
             norm: tensor(&mut owners, "backbone.final_norm.weight", &[h])?,
             head_ops: DraftHeadOps::RnnMarkov { softcap,
@@ -2174,42 +2012,49 @@ impl<'a> DflashDrafter<'a> {
     fn workspace(&self, sequences: usize) -> Result<Workspace<'a>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter/workspace");
         let c = &self.cfg;
+        ensure!(sequences == self.max_sequences, "GQA draft workspace must use admitted capacity");
         let rows = sequences * c.block;
         let drafted = sequences * c.drafts();
-        let alloc = |bytes: usize| DeviceAllocation::new(self.library, bytes.max(256));
-        let head_workspace = alloc(VOCABULARY_HEAD_WORKSPACE)?;
+        let physical = self.physical.as_ref().context("GQA draft has no physical layout")?;
+        ensure!(physical.owner_bytes("workspace.head")? == VOCABULARY_HEAD_WORKSPACE,
+            "native vocabulary head scratch differs from layout");
+        ensure!(self.library.glm_dflash_topk_workspace(drafted)?.max(256) == physical.owner_bytes("workspace.dflash.topk")?, "native DFlash selector scratch differs from layout");
+        let alloc = |id: &str| DeviceAllocation::new(self.library, physical.owner_bytes(&format!("workspace.{id}"))?);
+        let head_workspace = alloc("head")?;
         let attention_workspace = {
             let _scope = cuteafd_ffi::memory_ledger::scope("workspace/draft-attention");
-            alloc(self.library.glm_dflash_attention_workspace(sequences, c.kv_heads, RING + c.block, c.head_dim)?)?
+            let bytes = self.library.glm_dflash_attention_workspace(sequences, c.kv_heads, RING + c.block, c.head_dim)?;
+            ensure!(bytes.max(256) == physical.owner_bytes("workspace.attention.scratch")?, "native DFlash attention scratch differs from layout");
+            alloc("attention.scratch")?
         };
         Ok(Workspace {
             sequences,
-            h: alloc(rows * c.hidden * 2)?,
-            n: alloc(rows * c.hidden * 2)?,
+            h: alloc("h")?,
+            n: alloc("n")?,
             dflash: Some(DflashWorkspace {
-                conv: alloc(rows * c.hidden * 2)?, dynamic: alloc(rows * c.conv_width() * 2)?,
-                unary: alloc(drafted * 16 * 4)?, candidates: alloc(drafted * 16 * 4)?,
-                projected: alloc(rows * c.rank * 2)?, features: alloc(drafted * 16)?,
-                topk_workspace: alloc(self.library.glm_dflash_topk_workspace(drafted)?)?,
+                conv: alloc("dflash.conv")?, dynamic: alloc("dflash.dynamic")?,
+                unary: alloc("dflash.unary")?, candidates: alloc("dflash.candidates")?,
+                projected: alloc("dflash.projected")?, features: alloc("dflash.features")?,
+                topk_workspace: alloc("dflash.topk")?,
             }),
             attention: AttentionWorkspace::Gqa(GqaWorkspace {
-                qkv: alloc(rows * c.qkv_width() * 2)?,
-                q: alloc(rows * c.heads * c.head_dim * 2)?,
-                k: alloc(rows * c.kv_width() * 2)?,
-                v: alloc(rows * c.kv_width() * 2)?,
-                attn: alloc(rows * c.heads * c.head_dim * 2)?,
-                tables: alloc(3 * sequences * 4)?,
+                qkv: alloc("attention.qkv")?,
+                q: alloc("attention.q")?,
+                k: alloc("attention.k")?,
+                v: alloc("attention.v")?,
+                attn: alloc("attention.attn")?,
+                tables: alloc("attention.tables")?,
                 scratch: attention_workspace,
             }),
-            delta: alloc(rows * c.hidden * 2)?,
-            gate_up: alloc(rows * 2 * c.intermediate * 2)?,
-            act: alloc(rows * c.intermediate * 2)?,
-            logits: alloc(rows * c.vocab * 4)?,
-            anchors: alloc(sequences * 4)?,
-            ids: alloc(rows * 4)?,
-            tokens: alloc(drafted * 4)?,
-            landing: crate::shared::memory::HostAllocation::new(self.library, drafted * 20)?,
-            positions: alloc(rows * 8)?,
+            delta: alloc("delta")?,
+            gate_up: alloc("gate_up")?,
+            act: alloc("act")?,
+            logits: alloc("logits")?,
+            anchors: alloc("anchors")?,
+            ids: alloc("ids")?,
+            tokens: alloc("tokens")?,
+            landing: crate::shared::memory::HostAllocation::new(self.library, physical.owner_bytes("workspace.landing")?)?,
+            positions: alloc("positions")?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
                 rows as u32, c.vocab as u32)? },

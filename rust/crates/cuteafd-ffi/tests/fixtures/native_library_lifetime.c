@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <sys/mman.h>
 #include "../../../../../native/shared/cuda/expert_pack_layout.h"
 #include "cuteafd_mxfp4_layouts.h"
 
@@ -21,6 +22,34 @@ static int bind_after = -1, bind_calls;
 void fixture_configure_bind_after(int after) { bind_after = after; bind_calls = 0; }
 static size_t memory_total[8], memory_used[8], graph_bytes;
 static int immediate_copies;
+/* Untouched, per-owner virtual extents: allocation tests never launch math. */
+static int extent_only;
+static size_t mapped_bytes;
+size_t fixture_mapped_bytes(void) { return mapped_bytes; }
+void fixture_extent_only(void) { extent_only = 1; immediate_copies = 1; }
+struct fixture_program_info {
+    char name[64]; uint32_t pointers, scalars; char scalar_kinds[16];
+};
+static struct fixture_program_info draft_programs[32];
+static uint32_t draft_program_count;
+int fixture_draft_projection(uint32_t index, uint32_t k, uint32_t n) {
+    if (!extent_only || index >= 32) return 1;
+    struct fixture_program_info *info = &draft_programs[index];
+    memset(info, 0, sizeof(*info));
+    snprintf(info->name, sizeof(info->name), "draft_bf16_k%u_n%u", k, n);
+    info->pointers = 3; info->scalars = 1; info->scalar_kinds[0] = 'i';
+    draft_program_count = index + 1;
+    return 0;
+}
+uint32_t cuteafd_dsv4_program_count(void) { return draft_program_count; }
+int cuteafd_dsv4_program_info(uint32_t index, void *out) {
+    if (index >= draft_program_count || !out) return 1;
+    memcpy(out, &draft_programs[index], sizeof(draft_programs[index])); return 0;
+}
+int cuteafd_dsv4_program_load(uint32_t index) { return index >= draft_program_count; }
+int cuteafd_dsv4_program_launch(uint32_t index, void **ptrs, const uint64_t *scalars, void *stream) {
+    (void)index; (void)ptrs; (void)scalars; (void)stream; return 1;
+}
 static int trace_stream_queries;
 void fixture_trace_stream_queries(void) { trace_stream_queries = 1; }
 static int queued_experts;
@@ -203,9 +232,16 @@ int cuteafd_cuda_dmabuf_allocation_granularity(size_t *out) {
 }
 
 int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out) {
-    if (posix_memalign(&out->ptr, 256, bytes)) return 1;
-    /* Zeroed so operand digests never read unspecified padding. */
-    memset(out->ptr, 0, bytes);
+    if (extent_only) {
+        out->ptr = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (out->ptr == MAP_FAILED) return 1;
+        mapped_bytes += bytes;
+    } else {
+        if (posix_memalign(&out->ptr, 256, bytes)) return 1;
+        /* Operand digests must not read unspecified padding. */
+        memset(out->ptr, 0, bytes);
+    }
     out->bytes = bytes;
     out->device_id = current_device;
     out->flags = 1;
@@ -217,7 +253,10 @@ int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out) {
 int cuteafd_free_device_buffer(struct device_buffer *buffer) {
     event('d');
     if (buffer->flags == 1) memory_used[buffer->device_id] -= buffer->bytes;
-    free(buffer->ptr);
+    if (extent_only && buffer->flags == 1) {
+        if (munmap(buffer->ptr, buffer->bytes)) return 1;
+        mapped_bytes -= buffer->bytes;
+    } else { free(buffer->ptr); }
     memset(buffer, 0, sizeof(*buffer));
     return 0;
 }
@@ -366,11 +405,14 @@ static void *upload_events[128];
 static size_t upload_event_count;
 
 int cuteafd_cuda_event_create_ordering(void **out) {
-    if (upload_event_count == 128) return 1;
-    *out = calloc(1, sizeof(struct upload_event));
-    if (!*out) return 1;
     pthread_mutex_lock(&upload_mutex);
-    upload_events[upload_event_count++] = *out;
+    size_t slot = 0;
+    while (slot < upload_event_count && upload_events[slot]) ++slot;
+    if (slot == 128) { pthread_mutex_unlock(&upload_mutex); return 1; }
+    *out = calloc(1, sizeof(struct upload_event));
+    if (!*out) { pthread_mutex_unlock(&upload_mutex); return 1; }
+    upload_events[slot] = *out;
+    if (slot == upload_event_count) ++upload_event_count;
     pthread_mutex_unlock(&upload_mutex);
     event('C');
     return 0;
@@ -390,7 +432,7 @@ int cuteafd_cuda_stream_wait_event(void *stream, void *handle) {
 
 int cuteafd_cuda_zero_bytes_async(void *dst, size_t bytes, void *stream) {
     (void)stream;
-    memset(dst, 0, bytes);
+    if (!extent_only) memset(dst, 0, bytes);
     return 0;
 }
 
@@ -425,6 +467,7 @@ int cuteafd_copy_h2d_async(struct device_buffer dst, const void *source,
                          size_t bytes, void *stream) {
     (void)stream;
     if (bytes > dst.bytes) return 1;
+    if (extent_only) return 0;
     if (queued_experts) return enqueue((struct queued_op){ .stream = stream,
         .dst = dst.ptr, .src = source, .bytes = bytes, .rows = 1 });
     if (immediate_copies) {
@@ -557,6 +600,7 @@ int cuteafd_cuda_set_device(int device) {
 
 int cuteafd_copy_h2d(struct device_buffer dst, const void *source, size_t bytes) {
     if (bytes > dst.bytes) return 1;
+    if (extent_only) return 0;
     memcpy(dst.ptr, source, bytes);
     event('H');
     return 0;
@@ -566,7 +610,7 @@ int cuteafd_copy_d2d(struct device_buffer dst, struct device_buffer src, size_t 
     if (bytes > dst.bytes || bytes > src.bytes) return 1;
     memcpy(dst.ptr, src.ptr, bytes); return 0;
 }
-int cuteafd_cuda_zero_bytes(void *dst, size_t bytes) { memset(dst, 0, bytes); return 0; }
+int cuteafd_cuda_zero_bytes(void *dst, size_t bytes) { if (!extent_only) memset(dst, 0, bytes); return 0; }
 int cuteafd_zero_pitched_async(void *dst, uint64_t bytes, uint64_t pitch,
     uint64_t width, uint64_t rows, void *stream) {
     (void)stream;

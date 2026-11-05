@@ -198,6 +198,29 @@ impl Fixture {
         Ok(fs::read_to_string(&self.events)?)
     }
 
+    /// Reserve untouched virtual device extents per owner and skip copies/zeroes.
+    /// Only allocation/receipt tests may enable this; launching math is unsupported.
+    pub fn extent_only(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: this export belongs to the private CPU fixture and has no arguments.
+        unsafe { library.lib.get::<unsafe extern "C" fn()>(b"fixture_extent_only")?(); }
+        Ok(())
+    }
+
+    pub fn mapped_bytes(&self, library: &NativeLibrary) -> Result<usize> {
+        // SAFETY: this private fixture export reads its allocation counter.
+        Ok(unsafe { library.lib.get::<unsafe extern "C" fn() -> usize>(b"fixture_mapped_bytes")?() })
+    }
+
+    /// Admit a BF16 projection in the allocation-only catalog; launches still fail.
+    pub fn draft_projection(&self, library: &NativeLibrary, index: u32, k: u32, n: u32) -> Result<()> {
+        // SAFETY: the private fixture validates the index and copies only scalar metadata.
+        let status = unsafe {
+            library.lib.get::<unsafe extern "C" fn(u32, u32, u32) -> i32>(b"fixture_draft_projection")?(index, k, n)
+        };
+        anyhow::ensure!(status == 0, "fixture draft projection {index} rejected");
+        Ok(())
+    }
+
     /// CPU byte-roundtrip mode; ordinary lifetime fixtures retain deferred uploads.
     pub fn immediate_copies(&self, library: &NativeLibrary) -> Result<()> {
         // SAFETY: this export belongs only to the CPU fixture loaded above.
