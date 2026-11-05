@@ -110,6 +110,7 @@ pub(crate) fn check_placement_for_ranks(cfg: &KimiK3Config, placement: &cuteafd_
     ensure!(matches!(ranks, 1 | 2) && keys.iter().all(|key| key.rank < ranks),
         "Kimi graph physical rank count");
     ensure!(placement.layers.len() == cfg.layers, "Kimi graph placement layer count");
+    let inventory: std::collections::HashSet<_> = keys.iter().copied().collect();
     for key in keys {
         if let Op::Context { layer, speculative, phase } = key.op {
             ensure!(ranks == 2 && cfg.attention.get(layer) == Some(&KimiAttention::Mla)
@@ -139,7 +140,7 @@ pub(crate) fn check_placement_for_ranks(cfg: &KimiK3Config, placement: &cuteafd_
                     Op::Context { layer: captured, .. } if captured == layer)) {
                     let Op::Context { speculative, .. } = key.op else { unreachable!() };
                     for phase in cuteafd_loader::families::kimi_k3::context::graph_phases(key.rows) {
-                        ensure!(keys.contains(&Key { op: Op::Context { layer, speculative, phase }, ..*key }),
+                        ensure!(inventory.contains(&Key { op: Op::Context { layer, speculative, phase }, ..*key }),
                             "Kimi context graph phase inventory is incomplete");
                     }
                 }

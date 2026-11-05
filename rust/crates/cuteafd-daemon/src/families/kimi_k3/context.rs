@@ -371,8 +371,6 @@ mod tests {
         let root = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME")?)
             .join(".cache/cuteafd/builds/kimi-context-owner-fixtures");
         let fixture = Fixture::build_in(&root)?;
-        let library = fixture.load()?;
-        fixture.extent_only(&library)?;
         for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
             let tag = format.program_suffix();
             let programs = [0, 48].map(|head| serde_json::json!({
@@ -384,6 +382,10 @@ mod tests {
                 serde_json::json!({"name":format!("kimik3_paged_staging_gather{tag}")} )]);
             let manifest = serde_json::json!({"programs":programs});
             for extent in [8192, 1_048_576] {
+                // Ordered upload reservations live with the library, not the owner.
+                // Isolate cases so the fixture's bounded event pool does not accumulate.
+                let library = fixture.load()?;
+                fixture.extent_only(&library)?;
                 let layout = ContextLayout::from_manifest(&manifest, format, extent, 2752, 3)?;
                 let streams = [0, 1].map(|id| Rc::new(Stream::new(
                     crate::shared::memory::device::Device { library: &library, id }).unwrap()));
