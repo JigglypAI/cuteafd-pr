@@ -251,7 +251,8 @@ Family pages hold supported checkpoints, engineering notes and known limits:
 [DeepSeek V4 Flash/Pro](docs/models/deepseek_v4.md),
 [GLM 5.3](docs/models/glm5.md), [GLM 5.3 Flash](docs/models/glm5_flash.md),
 [MiMo V2 Flash / V2.6 Pro](docs/models/mimo_v2.md),
-[Qwen 3.8 Flash Next](docs/models/qwen4.md).
+[Qwen 3.8 Flash Next](docs/models/qwen4.md). Every launch key and CLI option,
+with defaults and per-family support: [Options](docs/options.md).
 
 ## Storage
 
@@ -299,9 +300,10 @@ restores the saved originals. Details: [Host tuning](docs/host-tuning.md).
    which samples concrete CUDA owners before allocating the pool.
 2. Pick or adapt a config under [`examples/configs/`](examples/configs/) or
    edit `cuteafd.config` for your own topology (coordinator GPUs, Spark
-   ranks, TP/EP layout). `POOL_TOKENS=auto` selects planner admission for
-   V4, V4.1 and Qwen; the engine spelling is `--pool-tokens 0`. V4.1 keeps
-   its existing pool policy when this option is omitted.
+   ranks, TP/EP layout). Every launch key, its default and which families
+   accept it: [Options](docs/options.md). `POOL_TOKENS=auto` selects planner
+   admission for V4, V4.1 and Qwen; the engine spelling is `--pool-tokens 0`.
+   V4.1 keeps its existing pool policy when this option is omitted.
 3. `./run.sh` launches the release images named in the config,
    `ghcr.io/tpurtell/cuteafd-coordinator:v3.0.0` on the RTX host and
    `ghcr.io/tpurtell/cuteafd-spark-expert:v3.0.0` on each Spark; `docker pull`

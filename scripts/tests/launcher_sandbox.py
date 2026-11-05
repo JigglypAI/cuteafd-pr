@@ -23,7 +23,12 @@ def copy_input(source, destination):
     if destination.is_dir():
         destination /= source.name
     if source.name == "release-common.sh":
-        copy_launcher_shared_inputs(source.resolve().parents[2], destination.parent.parent.parent)
+        root = source.resolve().parents[2]
+        copy_launcher_shared_inputs(root, destination.parent.parent.parent)
+        # run-family.sh sources the per-family key registry beside release-common.
+        key_registry = destination.parent / "family-keys.sh"
+        if not key_registry.exists():
+            copy_input(root / "scripts" / "lib" / "family-keys.sh", key_registry)
     if _ROOT is None:
         return shutil.copy(source, destination)
     key = source.resolve()
