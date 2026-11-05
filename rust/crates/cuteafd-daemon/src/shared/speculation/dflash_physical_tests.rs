@@ -25,35 +25,54 @@ fn installed_standard_dflash_physical_layout_equals_serving_receipts() -> Result
     fixture.extent_only(&library)?;
     fixture.quiet_events(&library, true)?;
     fixture.configure_memory(&library, 0, 96usize << 30)?;
-    let programs = library.programs()?;
     for repo in ["incoai/GLM-5.3-DFlash2", "incoai/GLM-5.3-Flash-DFlash2"] {
         let snapshot = installed_snapshot(repo)?;
         let cfg = DflashConfig::read(&snapshot)?;
+        let shapes: std::collections::BTreeSet<_> = [
+            (cfg.hidden, 2 * cfg.intermediate), (cfg.intermediate, cfg.hidden),
+            (cfg.hidden * cfg.taps.len(), cfg.hidden), (cfg.hidden, cfg.conv_width()),
+            (cfg.hidden, cfg.rank), (cfg.hidden, cfg.qkv_width()),
+            (cfg.hidden, 2 * cfg.kv_width()), (cfg.heads * cfg.head_dim, cfg.hidden),
+        ].into_iter().collect();
+        let entries = shapes.into_iter().enumerate().map(|(index, (k, n))| {
+            fixture.draft_projection(&library, index.try_into()?, k.try_into()?, n.try_into()?)?;
+            Ok(serde_json::json!({"name": format!("draft_bf16_k{k}_n{n}"),
+                "pointers": [{"name":"x"},{"name":"w"},{"name":"out"}], "capacity_rows": TAP_ROWS,
+                "geometry": {"width":k,"outputs":n,"output_dtype":"torch.bfloat16",
+                    "reduction":"ordered_k16","tiles_by_rows":[[16,1,4,16,64,6]]}}))
+        }).collect::<Result<Vec<_>>>()?;
+        let manifest = fixture.directory().join("draft-programs.json");
+        std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries}))?)?;
+        let programs = library.programs()?.with_manifest(&manifest)?;
         for (slots, sequences) in [(2, 1), (20, 16)] {
             for kv in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
+                for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
                 for mode in [fp8_linear::Fp8Rows::W8a16, fp8_linear::Fp8Rows::Wide, fp8_linear::Fp8Rows::W8a8] {
                     let capacity = GlmDraftCapacity::new(slots, sequences, cfg.block)?;
-                    let forecast = GlmDflashPhysicalLayout::read(&snapshot, GlmDraftRepresentation::Fp8Only,
+                    let forecast = GlmDflashPhysicalLayout::read(&snapshot, representation,
                         capacity, library.sm_count()?, mode.code() as u8, kv)?;
                     // Real loader, matrix pack destinations and workspace constructor; recording
                     // suppresses checkpoint payload reads, not any device owner allocations.
                     let (drafter, records) = crate::shared::experts::rtx::dense::recording(|| {
                         DflashDrafter::load(&library, &programs, &snapshot, Vec::new(), std::ptr::null_mut(),
-                            slots, sequences, vec![0; cfg.hidden * 2], false, GlmDraftRepresentation::Fp8Only,
+                            slots, sequences, vec![0; cfg.hidden * 2], false, representation,
                             fp8_linear::Fp8Scales::Amax, mode, kv)
                     })?;
-                    ensure!(!records.operands.is_empty() && !records.steps.is_empty(), "real weight load did not run");
+                    ensure!(!records.operands.is_empty(), "real weight load did not run");
+                    ensure!(representation == GlmDraftRepresentation::Bf16Only || !records.steps.is_empty(),
+                        "real FP8 packing destinations did not run");
                     *drafter.workspace.borrow_mut() = Some(drafter.workspace(sequences)?);
                     drafter.prime_metadata()?;
                     let actual: BTreeMap<_, _> = drafter.allocation_receipts(CoordinatorDevices::new(&[0])?, "draft")?
                         .into_iter().map(|receipt| (receipt.allocation.id.clone(), receipt.allocation)).collect();
                     let expected: BTreeMap<_, _> = forecast.allocations("draft", Location::coordinator(0))
                         .into_iter().map(|allocation| (allocation.id.clone(), allocation)).collect();
-                    assert_eq!(actual, expected, "{repo}, slots={slots}, C={sequences}, {kv}, {mode:?}");
+                    assert_eq!(actual, expected, "{repo}, slots={slots}, C={sequences}, {kv}, {mode:?}, {representation:?}");
                     assert!(forecast.resident_weights().0 > 0);
                     assert!(forecast.weight_owners().all(|owner| owner.location == Location::coordinator(0)));
                     drop(drafter);
                     fixture.finish_ordered_uploads(&library)?;
+                }
                 }
             }
         }

@@ -24,9 +24,26 @@ static int immediate_copies;
 /* Extent-only device owners for header-driven allocation tests: never launch math. */
 static int extent_only;
 void fixture_extent_only(void) { extent_only = 1; immediate_copies = 1; }
-uint32_t cuteafd_dsv4_program_count(void) { return 0; }
-int cuteafd_dsv4_program_info(uint32_t index, void *out) { (void)index; (void)out; return 1; }
-int cuteafd_dsv4_program_load(uint32_t index) { (void)index; return 1; }
+struct fixture_program_info {
+    char name[64]; uint32_t pointers, scalars; char scalar_kinds[16];
+};
+static struct fixture_program_info draft_programs[32];
+static uint32_t draft_program_count;
+int fixture_draft_projection(uint32_t index, uint32_t k, uint32_t n) {
+    if (!extent_only || index >= 32) return 1;
+    struct fixture_program_info *info = &draft_programs[index];
+    memset(info, 0, sizeof(*info));
+    snprintf(info->name, sizeof(info->name), "draft_bf16_k%u_n%u", k, n);
+    info->pointers = 3; info->scalars = 1; info->scalar_kinds[0] = 'i';
+    draft_program_count = index + 1;
+    return 0;
+}
+uint32_t cuteafd_dsv4_program_count(void) { return draft_program_count; }
+int cuteafd_dsv4_program_info(uint32_t index, void *out) {
+    if (index >= draft_program_count || !out) return 1;
+    memcpy(out, &draft_programs[index], sizeof(draft_programs[index])); return 0;
+}
+int cuteafd_dsv4_program_load(uint32_t index) { return index >= draft_program_count; }
 int cuteafd_dsv4_program_launch(uint32_t index, void **ptrs, const uint64_t *scalars, void *stream) {
     (void)index; (void)ptrs; (void)scalars; (void)stream; return 1;
 }

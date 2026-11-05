@@ -168,7 +168,7 @@ mod draft_head_tests {
 }
 
 
-use cuteafd_loader::families::glm5::draft_physical::{GlmDflashConfig as DflashConfig, RING, TAP_ROWS};
+pub(crate) use cuteafd_loader::families::glm5::draft_physical::{GlmDflashConfig as DflashConfig, RING, TAP_ROWS};
 
 /// Exactly one immutable resident representation of a GEMM.
 use super::weights::Weight as DraftWeight;
