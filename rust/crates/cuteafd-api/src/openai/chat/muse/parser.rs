@@ -383,14 +383,20 @@ impl MuseOutputParser {
                 StreamState::SeekParam => {
                     let trimmed = rest.trim_start();
                     let skipped = rest.len() - trimmed.len();
-                    let mut best: Option<(usize, u8)> = None;
-                    for (found, kind) in [(trimmed.find(PARAMETER), 0u8), (trimmed.find(INVOKE_END), 1),
-                        (trimmed.find(CALLS_END), 2)] {
-                        if let Some(index) = found {
-                            if best.is_none_or(|(at, _)| index < at) { best = Some((index, kind)); }
-                        }
-                    }
-                    let Some((at, kind)) = best else { return; };
+                    // Hold mode requires the next tag at the cursor: text before
+                    // it is content, not a call. A tag still arriving is a
+                    // prefix of one of the three, so wait for more bytes.
+                    let kind = if trimmed.starts_with(PARAMETER) { 0u8 }
+                        else if trimmed.starts_with(INVOKE_END) { 1 }
+                        else if trimmed.starts_with(CALLS_END) { 2 }
+                        else if PARAMETER.starts_with(trimmed) || INVOKE_END.starts_with(trimmed)
+                            || CALLS_END.starts_with(trimmed) { return; }
+                        else {
+                            self.stream_failed = true;
+                            self.stream_state = StreamState::Done;
+                            return;
+                        };
+                    let at = 0;
                     match kind {
                         0 => {
                             let after = &trimmed[at + PARAMETER.len()..];

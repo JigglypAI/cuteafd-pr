@@ -435,6 +435,23 @@ mod streamed_args {
         assert_eq!(assembled(&streamed), "");
     }
 
+    /// Text before a parameter tag is content in hold mode; the streamed call
+    /// must not skip it and emit a valid empty-argument call.
+    #[test]
+    fn text_before_a_parameter_is_not_a_call() {
+        let text = concat!(" to=get_weather<|message|><atem:function_calls>\n",
+            "<atem:invoke name=\"get_weather\">\n",
+            "<atem:parameter>Oslo</atem:parameter>\n",
+            "</atem:invoke>\n</atem:function_calls>");
+        let (hold, hold_calls) = parse_streaming(text, false);
+        assert_eq!(hold_calls, 0);
+        assert!(hold.iter().any(|chunk| matches!(chunk, OutputChunk::Raw { .. })));
+        let (streamed, streamed_calls) = parse_streaming(text, true);
+        assert_eq!(streamed_calls, 1);
+        assert!(serde_json::from_str::<Value>(&assembled(&streamed)).is_err(),
+            "the streamed arguments must stay incomplete");
+    }
+
     /// Attribute names (keys) are XML-unescaped in both modes.
     #[test]
     fn escaped_keys_are_unescaped_in_both_modes() {
