@@ -489,8 +489,10 @@ pub enum Refusal {
     InvalidPin(&'static str),
     #[error("pool pin {tokens} is not aligned to {page_rows} rows")]
     MisalignedPool { tokens: u64, page_rows: u64 },
-    #[error("pool {tokens} cannot hold selected context {context}")]
+    #[error("pool {tokens} cannot hold selected context {context}; pass a lower explicit context no greater than {tokens} tokens")]
     PoolBelowContext { tokens: u64, context: u64 },
+    #[error("selected context {context} cannot fit: maximum feasible pool is {tokens} tokens; limiting constraint: {limiting}; pass a lower explicit context no greater than {tokens} tokens (or add memory if zero)")]
+    FullContextShortfall { context: u64, tokens: u64, limiting: Box<Refusal> },
     #[error("no supported candidate satisfies the exact pins")]
     PinConflict,
     #[error("no supported candidate")]

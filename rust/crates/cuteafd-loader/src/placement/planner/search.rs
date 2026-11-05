@@ -788,13 +788,26 @@ pub fn solve(
     };
     let pages = if search.feasible(domains.clone(), wanted)? {
         wanted
-    } else if matches!(request.pool, Pin::Exact(_)) || minimum == wanted {
+    } else if matches!(request.pool, Pin::Exact(_)) {
         return Err(search.last);
     } else {
         let mut maximum = None;
-        search.maximum(domains.clone(), minimum, wanted - 1, &mut maximum)?;
-        maximum.ok_or_else(|| search.last.clone())?
+        if wanted > 1 {
+            search.maximum(domains.clone(), 1, wanted - 1, &mut maximum)?;
+        }
+        maximum.unwrap_or(0)
     };
+    if pages < minimum {
+        // Reuse this search's validated facts and domains; never publish a
+        // reduced-context plan or rebuild the family recipe with another context.
+        search.feasible(domains.clone(), pages + 1)?;
+        if !matches!(search.last, Refusal::Capacity { .. }) {
+            return Err(search.last);
+        }
+        return Err(Refusal::FullContextShortfall { context: request.context,
+            tokens: pages.checked_mul(page).ok_or(Refusal::Overflow("feasible pool tokens"))?,
+            limiting: Box::new(search.last) });
+    }
     let mut best = None;
     search.complete(domains, pages, &mut best)?;
     tracing::trace!(target: "cuteafd::planner", surviving_assignments = search.assignments,

@@ -1415,6 +1415,7 @@ fn host_figures_subsume_only_ordinary_heap_and_preserve_pinned_device_and_weight
     for (id, location, bytes, deferred) in [
         ("test.host.retained", Location::HOST, 512, false),
         ("test.host.deferred", Location::HOST, 256, true),
+        ("glm.media.cache", Location::HOST, 4096, false),
         ("test.pinned.retained", Location::PINNED, 1024, false),
         ("test.device.retained", Location::coordinator(1), 2048, false),
     ] {
@@ -1465,8 +1466,11 @@ fn host_figures_subsume_only_ordinary_heap_and_preserve_pinned_device_and_weight
             assert!(before.facts.allowances.iter().any(|a|
                 a.source.contains("serialized target payload heap subset")));
             assert!(before.facts.allowances.iter().any(|a| a.source.contains("DFlash whole-file")));
-            assert!(after.facts.allocations.iter().chain(&after.facts.deferred)
-                .all(|a| a.location != Location::HOST));
+            let retained_host = after.facts.allocations.iter().chain(&after.facts.deferred)
+                .filter(|a| a.location == Location::HOST).collect::<Vec<_>>();
+            assert_eq!(retained_host.len(), 1);
+            assert_eq!((retained_host[0].id.as_str(), retained_host[0].bytes), ("glm.media.cache", 4096),
+                "future media capacity is not covered by the text-only RSS census");
             assert!(after.facts.sequential.iter().all(|g| g.members[0].location != Location::HOST));
             assert!(after.facts.reservations.iter().all(|r| r.location != Location::HOST));
             let allowances: Vec<_> = after.facts.allowances.iter()
@@ -1744,7 +1748,7 @@ fn full_context_graph_boundary_keeps_original_pool_domain_and_exact_pins() {
     request.pool = Pin::Auto;
     assert!(matches!(
         planner::solve(request.clone(), limits, &recipe),
-        Err(Refusal::Capacity { .. })
+        Err(Refusal::FullContextShortfall { .. })
     ));
     request.context -= 64;
     assert!(matches!(

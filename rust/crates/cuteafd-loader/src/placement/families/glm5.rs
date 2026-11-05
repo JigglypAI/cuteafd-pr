@@ -577,21 +577,14 @@ pub fn local_inventory_selected(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41
             && value["output_dtype"].as_str() == Some("fp32")
             && value["bits"] == serde_json::json!(exl3.decoder_tiers()),
             "GLM TP2 EXL3 capacity/geometry/tiers/output mismatch in {}", directory.display());
-        let library = directory.join("libcuteafd_exl3.so");
-        anyhow::ensure!(library.is_file(), "GLM TP2 missing binary {}", library.display());
-        let lut = value["trellis_lut"]["file"].as_str()
+        value["trellis_lut"]["file"].as_str()
             .ok_or_else(|| anyhow::anyhow!("GLM TP2 missing trellis LUT asset name"))?;
-        anyhow::ensure!(directory.join(lut).is_file(), "GLM TP2 missing trellis LUT in {}", directory.display());
         if value["direct"].as_bool() != Some(true) {
-            let route = value["route_preparation"]["manifest"].as_str()
+            value["route_preparation"]["manifest"].as_str()
                 .ok_or_else(|| anyhow::anyhow!("GLM TP2 missing packed route export manifest"))?;
-            let route_manifest = directory.join(route);
-            // Match Exl3Execution: route assets live beside the declared manifest.
-            for asset in [route_manifest.clone(), route_manifest.parent().unwrap().join("libv41_exl3_routes.so")] {
-                anyhow::ensure!(asset.is_file(), "GLM TP2 missing route asset {}", asset.display());
-            }
         }
-        // Runtime separately attests ELF geometry and LUT hashes before execution.
+        // Header-only planning needs geometry, not binaries. Exl3Execution opens
+        // the libraries and attests ELF geometry and LUT hashes before execution.
         Ok(value)
     }).collect::<anyhow::Result<Vec<_>>>()?;
     let backend_workspace = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)?
@@ -731,8 +724,8 @@ pub(crate) fn exlr8_inventory_with_metadata(snapshot: &std::path::Path, manifest
     let programs = crate::plan::checkpoint::read_json(manifest)?;
     let mut unit_limit = 0;
     for layer in cfg.first_moe_layer..selected_layers { for rank in 0..world {
-        unit_limit = unit_limit.max(input.plan(layer, world, rank,
-            crate::plan::exlr8::residency::ExpertSet::Routed)?.compact_unit_limit());
+        unit_limit = unit_limit.max(input.admission_geometry(layer, world, rank,
+            crate::plan::exlr8::residency::ExpertSet::Routed)?.1);
     } }
     let backend_workspace = crate::plan::exlr8::routed_workspace(&programs,
         cuteafd_ffi::exlr8::KernelFamily::Glm, rows, unit_limit, activations)?;
@@ -997,7 +990,7 @@ mod tests {
             .unwrap().is_none());
         assert!(select_local_inventory(&cfg, &catalog, &manifest, 2, 1, 64, 3, false, Onboard::Layers(1), false, None).is_err());
         let package = dir.path().join("exl3/exl3-glm-k45/rtx-tp2");
-        std::fs::remove_file(package.join("m16/libcuteafd_exl3.so")).unwrap();
+        std::fs::remove_file(package.join("m16/v41_exl3.json")).unwrap();
         assert!(select_local_inventory(&cfg, &catalog, &manifest, 2, 2, 64, 3, false, Onboard::Auto, false, None).is_err(),
             "present but incomplete exports must fail closed");
         std::fs::remove_dir_all(package).unwrap();
@@ -1078,11 +1071,10 @@ mod tests {
             assert!(error.to_string().contains("capacity/geometry/tiers/output mismatch"), "{field}: {error:#}");
         }
         std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
-        for asset in ["libcuteafd_exl3.so", "lut.bin", "routes/v41_exl3_routes.json", "routes/libv41_exl3_routes.so"] {
+        for asset in ["libcuteafd_exl3.so", "lut.bin", "routes/libv41_exl3_routes.so", "routes/v41_exl3_routes.json"] {
             std::fs::remove_file(package.join(asset)).unwrap();
-            let error = local_inventory(&cfg, &catalog, &manifest, 2, 64, 3, false).unwrap_err();
-            assert!(error.to_string().contains("missing"), "{asset}: {error:#}");
-            std::fs::write(package.join(asset), b"").unwrap();
+            assert!(local_inventory(&cfg, &catalog, &manifest, 2, 64, 3, false).is_ok(),
+                "header-only planning does not load {asset}");
         }
         std::fs::remove_dir_all(dir.path().join("exl3")).unwrap();
         let error = local_inventory(&cfg, &catalog, &manifest, 2, 64, 3, false).unwrap_err();

@@ -609,8 +609,11 @@ impl<'a> ProductionInput<'a> {
     pub fn prepare(self) -> Result<PreparedGlm<'a>, Refusal> {
         use super::local_physical::LocalPhysicalInventory;
         use crate::placement::{FfnMode, SparkIntakeMode, SparkIntakeOwners};
+        if self.maximum_pool_tokens < self.context {
+            return Err(Refusal::PoolBelowContext { tokens: self.maximum_pool_tokens, context: self.context });
+        }
         if !(1..=2).contains(&self.gpus) || self.layers == 0 || self.layers > self.cfg.layers
-            || self.context == 0 || self.maximum_pool_tokens < self.context
+            || self.context == 0
             || self.spark_ranks > 8 || self.target.weights.is_empty()
             || self.target.weights.iter().any(|(_, weights)| weights.ranks != self.gpus)
             || self.target.hooks.len() != self.gpus
@@ -1137,9 +1140,11 @@ impl HostFigures {
 
 /// Whole ordinary RSS already includes these physical heap subsets. Resource
 /// facts remain independent, and pinned memory never belongs to this envelope.
+/// The text-only census excludes the media cache's future embedding capacity.
 fn ordinary_heap_subset(component: &Component) -> bool {
     match &component.kind {
-        ComponentKind::Allocation { template, .. } => template.location == Location::HOST,
+        ComponentKind::Allocation { template, .. } => template.location == Location::HOST
+            && template.id != "glm.media.cache",
         ComponentKind::Sequential(group) => !group.members.is_empty()
             && group.members.iter().all(|owner| owner.location == Location::HOST),
         ComponentKind::Allowance(allowance) => allowance.location == Location::HOST,

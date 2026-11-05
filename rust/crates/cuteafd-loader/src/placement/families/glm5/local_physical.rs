@@ -101,15 +101,13 @@ impl LocalPhysicalSource {
                                 (index.to_string(), offset, spec.bytes.max(16))).collect() }
                     }
                     GlmLocalFormat::Exlr8 => {
-                        let plan = exlr8.context("EXLR8 selected metadata missing")?
-                            .plan(layer, local.world, rank, ExpertSet::Routed)?;
-                        let units = plan.compact_unit_limit();
+                        let (bytes, units) = exlr8.context("EXLR8 selected metadata missing")?
+                            .admission_geometry(layer, local.world, rank, ExpertSet::Routed)?;
                         ensure!(unit_limit.is_none_or(|previous| previous == units),
                             "EXLR8 local layers have inconsistent unit limits");
                         unit_limit = Some(units);
-                        LayerStorage { bytes: plan.resident_bytes,
-                            mount: vec![(String::new(), plan.resident_bytes)],
-                            views: vec![(String::new(), 0, plan.resident_bytes)] }
+                        LayerStorage { bytes, mount: vec![(String::new(), bytes)],
+                            views: vec![(String::new(), 0, bytes)] }
                     }
                     GlmLocalFormat::Nvfp4 { w4a4: true } => {
                         use crate::formats::fp8_experts::Fp8Projection;

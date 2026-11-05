@@ -701,7 +701,9 @@ fn embedding_and_remote_rank_domains_share_pool_first_constraints_and_exact_prof
     assert_eq!((smaller.pool_tokens, smaller.decisions.onboard()), (128, 2));
     let mut restricted = contract.clone();
     restricted.requires.push(Requires { when: Choice { variable: 3, option: 1 }, any_of: vec![] });
-    assert!(matches!(solve(req, budgets.clone(), &Prepared(restricted)), Err(Refusal::Capacity { .. })));
+    assert!(matches!(solve(req, budgets.clone(), &Prepared(restricted)),
+        Err(Refusal::FullContextShortfall { tokens: 0, limiting, .. })
+            if matches!(*limiting, Refusal::Capacity { .. })));
     // Resolved local homes override remote fallback independent of variable order.
     let mut reversed = contract.clone();
     reversed.variables.swap(3, 4);
@@ -1149,7 +1151,8 @@ fn capacity_shaving_keeps_resource_failure_distinct_from_pin_conflict() {
     }
     assert!(matches!(
         solve(request(), two_gpus(64, 64), &Prepared(contract.clone())),
-        Err(Refusal::Capacity { .. })
+        Err(Refusal::FullContextShortfall { tokens: 0, limiting, .. })
+            if matches!(*limiting, Refusal::Capacity { .. })
     ));
     assert_eq!(
         solve(
@@ -1445,17 +1448,17 @@ fn pool_pins_are_exact_and_context_is_never_clamped() {
         (automatic.request.context, automatic.pool_tokens),
         (129, 192)
     );
-    assert!(matches!(
-        solve(
-            Request {
-                context: 193,
-                ..request()
-            },
-            vec![budget(192)],
-            &recipe
-        ),
-        Err(Refusal::Capacity { .. })
-    ));
+    for (available, context, tokens) in [(192, 193, 192), (192, 2 << 20, 192), (63, 64, 0)] {
+        let refusal = solve(Request { context, ..request() }, vec![budget(available)], &recipe).unwrap_err();
+        let text = refusal.to_string();
+        assert!(text.contains(&format!("maximum feasible pool is {tokens} tokens")), "{text}");
+        assert!(text.contains("lower explicit context"), "{text}");
+        let Refusal::FullContextShortfall { context: actual, tokens: maximum, limiting } = refusal else {
+            panic!("expected a full-context refusal");
+        };
+        assert_eq!((actual, maximum), (context, tokens));
+        assert!(matches!(*limiting, Refusal::Capacity { phase: Phase::PostTargetKv, .. }));
+    }
 }
 
 #[test]

@@ -305,9 +305,8 @@ fn tp2_onboarding_inventory_reads_the_checkpoint_geometry_package_and_router() {
 /// programs): wherever it resolves to an RTX (`--vision rtx`, or auto when no
 /// Spark holds tower + scratch + 1 GiB, as at n=5) it is reserved before the
 /// pool and onboard solve and the plan holds, never a refused encoder; where a
-/// Spark holds it (auto at n=6..8) the RTX working set is untouched. That the
-/// reserved bytes shed onboarded layers is the solver's own contract
-/// (`placement::families::glm5` `reserved_tower_sheds_onboarded_layers`); this
+/// Spark holds it (auto at n=6..8) the RTX working set is untouched. Either
+/// placement charges the embedding cache against coordinator host RAM. This
 /// manifest carries no local expert package, so nothing onboards here.
 #[test]
 fn vision_on_two_rtx_reserves_the_tower_before_the_solve() {
@@ -361,12 +360,19 @@ fn vision_on_two_rtx_reserves_the_tower_before_the_solve() {
             if on_rtx {
                 // Reserved first: the pool gave way, the tower was not refused.
                 assert!(memory.devices.iter().any(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx
-                    && d.items.iter().any(|i| i.group == "vision tower")));
+                    && d.items.iter().any(|i| i.group == "bundled encoder weights")));
                 assert!(memory.pool_tokens <= off.memory_layout.as_ref().unwrap().pool_tokens);
             } else {
                 assert!(matches!(encoder.kind, EncoderKind::Spark { .. }), "n={ranks}: {:?}", encoder.kind);
                 assert_eq!(rtx_used(&report), rtx_used(&off), "n={ranks}: a Spark-hosted tower leaves the RTX set");
             }
+            let host_ready = |report: &plan::PlanReport| report.phase_ledger.as_ref().unwrap().phases.iter()
+                .find(|phase| phase.budget == "coordinator host RAM"
+                    && phase.phase == crate::placement::planner::Phase::Ready).unwrap().owned;
+            let host_total = report.phase_ledger.as_ref().unwrap().budgets.iter()
+                .find(|budget| budget.id == "coordinator host RAM").unwrap().physical_bytes;
+            assert_eq!(host_ready(&report) - host_ready(&off), (8u64 << 30).min(host_total / 20),
+                "both local and remote towers charge their coordinator embedding cache");
             println!("ml4 n={ranks} 2 RTX {vision:?}: encoder {:?}, pool {} (off {})", encoder.kind,
                 memory.pool_tokens, off.memory_layout.as_ref().unwrap().pool_tokens);
         }
