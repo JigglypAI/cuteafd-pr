@@ -51,6 +51,13 @@ ARITHMETIC = {
 # The release ships its own numerics; there is no vendor BF16 master to score against.
 ROOT_PRECISION = "official NVFP4 W4A4 experts + MXFP8 dense, BF16 embedding and head (no vendor BF16 master)"
 BF16_CACHE = "BF16 K/V and index keys; no cache quantization"
+TRANSFORMERS_SOURCE_BASIS = {
+    "repository": "https://github.com/huggingface/transformers",
+    "reason": "Preserve Hugh Madden's pinned upstream text-decoder arithmetic basis from "
+              "hughmadden/cuteafd@2cbf6873e. This independent native-QDQ oracle does not import "
+              "Transformers or track the serving fork; its source revision intentionally differs "
+              "from third_party/transformers. Vision and cache-management APIs are out of scope.",
+}
 
 
 def digest(path):
@@ -115,6 +122,7 @@ def write_reference_meta(out: Path, snapshot: Path, run_platform: dict | None = 
         native_fp32_parameters="checkpoint F32 tensors (router gate and score-correction bias) kept F32",
         root_arithmetic={"precision": ROOT_PRECISION,
                          "source": "independent MiniMax M3 decoder with its Transformers and vLLM source pins",
+                         "transformers_source_basis": identity["transformers"],
                          "arithmetic": "Independent MiniMax M3 text decoder (families/minimax_m3/model.py), layer by "
                                        f"layer over the release checkpoint. Weights: {ARITHMETIC['weights']}. Activations: "
                                        f"{ARITHMETIC['served_activations']}. Boundaries: {ARITHMETIC['boundaries']}. "
@@ -128,7 +136,8 @@ def write_reference_meta(out: Path, snapshot: Path, run_platform: dict | None = 
 
 
 def source_identity():
-    return {"transformers": {"revision": model.TRANSFORMERS_REVISION, "sha256": model.SOURCE_PINS},
+    return {"transformers": {**TRANSFORMERS_SOURCE_BASIS,
+                             "revision": model.TRANSFORMERS_REVISION, "sha256": model.SOURCE_PINS},
             "vllm": {"revision": VLLM_REVISION,
                      "files": {p: {"sha256": pin, "lines": lines} for p, (pin, lines) in VLLM_SOURCE_PINS.items()}},
             # Cache QDQ is implemented here, independently of any serving kernel.

@@ -351,6 +351,34 @@ def test_projection_gate_up_uses_shared_min_input_scale(snapshot):
 
 
 
+def test_publication_metadata_retains_the_run_upstream_source_basis(snapshot, tmp_path):
+    import numpy as np
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from families.minimax_m3 import golden
+    from fidelity_windows import canonical, verify_snapshot, write_scored_logits
+
+    Tokenizer(WordLevel({str(i): i for i in range(64)}, unk_token="0")).save(
+        str(snapshot / "tokenizer.json"))
+    manifest = panel([1, 7, 3, 9, 11, 5, 2])
+    out = tmp_path / "golden"
+    out.mkdir()
+    (out / "windows.json").write_bytes(canonical(manifest))
+    entry = write_scored_logits(out, manifest["windows"][0], np.zeros((4, 64), dtype=np.float32))
+    identity = golden.source_identity()
+    # Backfilling must preserve the run's provenance rather than today's code metadata.
+    identity["transformers"]["reason"] = "recorded upstream basis for this run"
+    meta = dict(activation="served", snapshot_identity=verify_snapshot(manifest, snapshot),
+                windows=[entry], source_identity=identity, platform={"device": "cpu"})
+    (out / "meta.json").write_bytes(canonical(meta))
+    golden.write_reference_meta(out, snapshot)
+    saved = json.loads((out / "meta.json").read_text())
+    assert saved["root_arithmetic"]["transformers_source_basis"] == identity["transformers"]
+    assert saved["source_pin"]["transformers_revision"] == identity["transformers"]["revision"]
+    assert saved["transformers"] == "not used"
+    assert saved["scored_tokens"] == 4
+    assert saved["nll"] == pytest.approx(math.log(64))
+
 
 def test_one_token_dense_forward_matches_hand_computed_native_qdq(snapshot):
     cfg = model.Config.from_dict(tiny_config())
