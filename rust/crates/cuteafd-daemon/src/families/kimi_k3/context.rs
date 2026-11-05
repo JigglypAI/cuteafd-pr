@@ -7,7 +7,8 @@ use cuteafd_loader::families::kimi_k3::context::ContextLayout;
 use std::{collections::BTreeMap, rc::Rc};
 
 pub(crate) struct Programs<'a> {
-    pub partial: [cuteafd_ffi::KimiMlaPartial<'a>; 2],
+    partial: [[cuteafd_ffi::KimiMlaPartial<'a>; 2]; 2],
+    tiles: cuteafd_loader::families::kimi_k3::context::TilePolicy,
     pub combine: cuteafd_ffi::programs::BoundProgram<'a>,
     pub gather: cuteafd_ffi::programs::BoundProgram<'a>,
     pub sms: usize,
@@ -24,15 +25,32 @@ impl<'a> Programs<'a> {
         ensure!(gather.scalar_kinds == b"iii" && gather.geometry["row_bytes"] == format.record_bytes()
             && gather.geometry["page_rows"] == 64 && gather.geometry["page_bytes"] == 64 * format.record_bytes(),
             "Kimi context gather ABI differs");
+        let mut tiles = None;
+        let partial = [8, 16].map(|tile| -> Result<_> {
+            let ranges = [0, 48].map(|begin| -> Result<_> {
+                let name = format!("kimik3_mla_partial{tag}_h{begin}_t{tile}_m64");
+                let geometry = &programs.spec(&name)?.geometry;
+                ensure!(geometry["heads_per_tile"] == tile, "Kimi context partial tile differs");
+                let policy = cuteafd_loader::families::kimi_k3::context::TilePolicy::from_geometry(geometry)?;
+                ensure!(tiles.as_ref().is_none_or(|expected| *expected == policy),
+                    "Kimi context partial tile policies differ");
+                tiles = Some(policy);
+                Ok(cuteafd_ffi::KimiMlaPartial::load(programs, &name, begin, 64, format)?)
+            });
+            let [first, second] = ranges;
+            Ok([first?, second?])
+        });
+        let [first, second] = partial;
         Ok(Self {
-            partial: [cuteafd_ffi::KimiMlaPartial::load(programs,
-                &format!("kimik3_mla_partial{tag}_h0_m64"), 0, 64, format)?,
-                cuteafd_ffi::KimiMlaPartial::load(programs,
-                &format!("kimik3_mla_partial{tag}_h48_m64"), 48, 64, format)?],
+            partial: [first?, second?], tiles: tiles.context("Kimi context partial tile policy missing")?,
             combine: programs.bound("kimik3_lse_combine2", &["o0", "l0", "o1", "l1", "sink", "out"] )?,
             gather: programs.bound(&format!("kimik3_paged_staging_gather{tag}"), &["pool", "table", "staging"] )?,
             sms: programs.library().sm_count()?,
         })
+    }
+
+    pub(crate) fn partial(&self, rows: usize, rank: usize) -> Result<&cuteafd_ffi::KimiMlaPartial<'a>> {
+        self.partial[self.tiles.index(rows)?].get(rank).context("Kimi context partial head rank")
     }
 
     pub(crate) fn layout(programs: &cuteafd_ffi::programs::Programs<'_>,
@@ -393,11 +411,14 @@ mod tests {
         let fixture = Fixture::build_in(&root)?;
         for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
             let tag = format.program_suffix();
-            let programs = [0, 48].map(|head| serde_json::json!({
-                "name":format!("kimik3_mla_partial{tag}_h{head}_m64"),
-                "geometry":{"num_splits":16,"runtime_splits":true,"device_splits":true,"fixed_split_grid":16,"lse_base":2},
-                "scratch_bytes_at_capacity":{"scratch":64*48*16*(512*2+4)}}));
-            let mut programs = programs.to_vec();
+            let mut programs = Vec::new();
+            for head in [0, 48] { for tile in [8, 16] {
+                programs.push(serde_json::json!({
+                    "name":format!("kimik3_mla_partial{tag}_h{head}_t{tile}_m64"),
+                    "geometry":{"num_splits":16,"runtime_splits":true,"device_splits":true,"fixed_split_grid":16,"lse_base":2,
+                        "heads_per_tile":tile,"context_heads_per_tile":(1..=64).map(|rows| if rows < 4 {8} else {16}).collect::<Vec<_>>()},
+                    "scratch_bytes_at_capacity":{"scratch":64*48*16*(512*2+4)}}));
+            }}
             programs.extend([serde_json::json!({"name":"kimik3_lse_combine2"}),
                 serde_json::json!({"name":format!("kimik3_paged_staging_gather{tag}")} )]);
             let manifest = serde_json::json!({"programs":programs});

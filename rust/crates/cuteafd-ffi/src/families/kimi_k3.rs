@@ -311,6 +311,7 @@ fn validate_partial_manifest(spec: &ProgramSpec, begin: usize, rows: usize, form
     -> Result<(usize, usize)> {
     let g = &spec.geometry;
     if !matches!(begin, 0 | 48) || !(1..=4096).contains(&rows)
+        || !matches!(g["heads_per_tile"].as_u64(), Some(8 | 16))
         || spec.capacity_rows as usize != rows || spec.scalar_kinds != b"il"
         || g["kv_cache"].as_str() != Some(format.label())
         || g["head_begin"].as_u64() != Some(begin as u64)
@@ -1208,13 +1209,17 @@ mod tests {
                 spec.geometry["kv_cache"] = format.label().into();
                 spec.geometry["head_begin"] = begin.into();
                 spec.geometry["head_count"] = 48.into();
+                spec.geometry["heads_per_tile"] = 16.into();
                 spec.geometry["max_rows"] = 64.into();
                 spec.geometry["lse_base"] = 2.into();
                 spec.scratch.insert("scratch".into(), (64 * 48 * 16 * (512 * 2 + 4)) as u64);
                 assert!(validate_partial_manifest(&spec, begin, 64, format).is_ok());
+                let mut tile8 = spec.clone();
+                tile8.geometry["heads_per_tile"] = 8.into();
+                assert!(validate_partial_manifest(&tile8, begin, 64, format).is_ok());
                 for (key, bad) in [("lse_base", 0), ("heads", 48), ("head_count", 96),
                     ("num_splits", 1), ("runtime_splits", 0), ("device_splits", 0),
-                    ("fixed_split_grid", 8), ("max_context", 0)] {
+                    ("fixed_split_grid", 8), ("max_context", 0), ("heads_per_tile", 4)] {
                     let mut wrong = spec.clone();
                     wrong.geometry[key] = bad.into();
                     assert!(validate_partial_manifest(&wrong, begin, 64, format).is_err(), "{key}");

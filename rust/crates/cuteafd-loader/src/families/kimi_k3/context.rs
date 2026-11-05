@@ -65,6 +65,33 @@ impl DecodeBuckets {
     }
 }
 
+/// Fork-derived tile choice for each exact row width, including verify graphs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TilePolicy(Vec<usize>);
+
+impl TilePolicy {
+    pub fn from_geometry(geometry: &serde_json::Value) -> Result<Self> {
+        let routes = geometry["context_heads_per_tile"].as_array()
+            .context("Kimi context tile policy missing")?;
+        ensure!(routes.len() == ROWS, "Kimi context tile policy must cover rows 1..64");
+        let routes = routes.iter().map(|value| -> Result<usize> {
+            let tile = value.as_u64().context("Kimi context tile policy value is not an integer")?;
+            ensure!(matches!(tile, 8 | 16), "Kimi context tile policy requires an unexported tile");
+            Ok(tile as usize)
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(Self(routes))
+    }
+
+    pub fn tile(&self, rows: usize) -> Result<usize> {
+        ensure!((1..=ROWS).contains(&rows), "Kimi context tile row outside policy");
+        Ok(self.0[rows - 1])
+    }
+
+    pub fn index(&self, rows: usize) -> Result<usize> {
+        Ok(usize::from(self.tile(rows)? == 16))
+    }
+}
+
 const ROWS: usize = 64;
 const HEADS: usize = 48;
 const METADATA: [&str; 7] = ["context slots", "compact page tables", "shard lengths", "context offsets", "gather tables", "commit blocks", "active splits"];
@@ -75,15 +102,16 @@ pub struct ContextLayout {
     workspace: Vec<(&'static str, usize)>,
     metadata_banks: usize,
     decode: DecodeBuckets,
+    tiles: TilePolicy,
 }
 
 /// Required names are format-specific: a BF16 package cannot admit FP8 context.
 pub fn program_names(format: MlaCacheFormat) -> Vec<String> {
     let tag = if format == MlaCacheFormat::Fp8 { "_fp8" } else { "" };
     let mut names = vec!["kimik3_lse_combine2".into(), format!("kimik3_paged_staging_gather{tag}")];
-    for head in [0, HEADS] {
-        names.push(format!("kimik3_mla_partial{tag}_h{head}_m64"));
-    }
+    for head in [0, HEADS] { for tile in [8, 16] {
+        names.push(format!("kimik3_mla_partial{tag}_h{head}_t{tile}_m64"));
+    }}
     names
 }
 
@@ -96,6 +124,7 @@ impl ContextLayout {
             "Kimi context allocation capacity outside supported geometry");
         let programs = manifest["programs"].as_array().context("Kimi context program inventory missing")?;
         let mut scratch = 0;
+        let mut tiles = None;
         for name in program_names(format) {
             let entries = programs.iter().filter(|p| p["name"].as_str() == Some(&name)).collect::<Vec<_>>();
             ensure!(entries.len() == 1, "Kimi context requires one {name} program");
@@ -104,6 +133,12 @@ impl ContextLayout {
                     .with_context(|| format!("Kimi context missing {name} scratch extent"))?;
                 let bytes = usize::try_from(bytes).context("Kimi context scratch extent overflow")?;
                 let geometry = &entries[0]["geometry"];
+                let tile = if name.contains("_t8_") { 8 } else { 16 };
+                ensure!(geometry["heads_per_tile"] == tile, "Kimi context {name} tile geometry differs");
+                let policy = TilePolicy::from_geometry(geometry)?;
+                ensure!(tiles.as_ref().is_none_or(|expected| *expected == policy),
+                    "Kimi context tile policies differ between programs");
+                tiles = Some(policy);
                 ensure!(geometry["num_splits"] == 16 && geometry["runtime_splits"] == true
                     && geometry["device_splits"] == true && geometry["fixed_split_grid"] == 16
                     && geometry["lse_base"] == 2,
@@ -131,10 +166,12 @@ impl ContextLayout {
             query_row_bytes: (HEADS * 576 * 2) as u64, partial_row_bytes: (HEADS * (512 * 2 + 4)) as u64,
             decode_rows: ROWS as u64, lanes: 1, workspace_bytes, ..Default::default() };
         buffers.demands()?;
-        Ok(Self { buffers, workspace, metadata_banks, decode: DecodeBuckets::from_manifest(manifest)? })
+        Ok(Self { buffers, workspace, metadata_banks, decode: DecodeBuckets::from_manifest(manifest)?,
+            tiles: tiles.context("Kimi context tile policy missing")? })
     }
 
     pub fn decode(&self) -> &DecodeBuckets { &self.decode }
+    pub fn tiles(&self) -> &TilePolicy { &self.tiles }
     pub fn buffers(&self) -> ContextBuffers { self.buffers }
     pub fn workspace(&self) -> Vec<(&'static str, usize)> { self.workspace.clone() }
 
@@ -159,7 +196,9 @@ pub(crate) fn add_manifest_programs(manifest: &mut serde_json::Value) {
             let programs = manifest["programs"].as_array_mut().unwrap();
             if !programs.iter().any(|p| p["name"] == name) {
                 programs.push(serde_json::json!({"name":name,"scratch_bytes_at_capacity":{"scratch":bytes},
-                    "geometry":{"num_splits":16,"runtime_splits":true,"device_splits":true,"fixed_split_grid":16,"lse_base":2}}));
+                    "geometry":{"num_splits":16,"runtime_splits":true,"device_splits":true,"fixed_split_grid":16,"lse_base":2,
+                        "heads_per_tile":if name.contains("_t8_") {8} else {16},
+                        "context_heads_per_tile":(1..=64).map(|rows| if rows < 4 {8} else {16}).collect::<Vec<_>>()}}));
             }
         }
     }
@@ -206,6 +245,41 @@ mod tests {
     }
 
     #[test]
+    fn context_tiles_follow_complete_package_policy_without_changing_graphs_or_storage() -> Result<()> {
+        let mut manifest = native_manifest(serde_json::json!([8, 16, 32, 48]));
+        add_manifest_programs(&mut manifest);
+        let baseline = ContextLayout::from_manifest(&manifest, MlaCacheFormat::Bf16, 8192, 128, 3)?;
+        for (rows, tile) in [(1, 8), (2, 8), (3, 8), (4, 16), (8, 16), (16, 16), (32, 16), (48, 16), (64, 16)] {
+            assert_eq!(baseline.tiles().tile(rows)?, tile);
+            assert_eq!(baseline.tiles().index(rows)?, usize::from(tile == 16));
+        }
+        assert!(baseline.tiles().tile(0).is_err());
+        assert!(baseline.tiles().tile(65).is_err());
+        let routes = (1..=64).map(|rows| if rows % 3 == 0 {8} else {16}).collect::<Vec<_>>();
+        for program in manifest["programs"].as_array_mut().unwrap().iter_mut()
+            .filter(|program| program["name"].as_str().unwrap().contains("_partial")) {
+            program["geometry"]["context_heads_per_tile"] = serde_json::json!(routes);
+        }
+        let changed = ContextLayout::from_manifest(&manifest, MlaCacheFormat::Bf16, 8192, 128, 3)?;
+        for rows in 1..=64 { assert_eq!(changed.tiles().tile(rows)?, routes[rows - 1]); }
+        assert_eq!(baseline.decode(), changed.decode());
+        assert_eq!(baseline.workspace(), changed.workspace());
+        assert_eq!(baseline.buffers(), changed.buffers());
+        let index = manifest["programs"].as_array().unwrap().iter()
+            .position(|p| p["name"] == "kimik3_mla_partial_h0_t8_m64").unwrap();
+        for bad in [serde_json::Value::Null, serde_json::json!([]), serde_json::json!(vec![8; 63]),
+            serde_json::json!(vec![4; 64]), serde_json::json!(vec!["8"; 64]), serde_json::json!(vec![8; 64])] {
+            let mut broken = manifest.clone();
+            broken["programs"][index]["geometry"]["context_heads_per_tile"] = bad;
+            assert!(ContextLayout::from_manifest(&broken, MlaCacheFormat::Bf16, 8192, 128, 3).is_err());
+        }
+        let mut broken = manifest;
+        broken["programs"][index]["geometry"]["heads_per_tile"] = 16.into();
+        assert!(ContextLayout::from_manifest(&broken, MlaCacheFormat::Bf16, 8192, 128, 3).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn named_runtime_allocations_equal_planner_context_charges() {
         let mut manifest = serde_json::json!({"programs":[]});
         add_manifest_programs(&mut manifest);
@@ -245,7 +319,7 @@ mod tests {
                 .unwrap_err().to_string().contains(&name));
         }
         let mut bad = manifest.clone();
-        bad["programs"].as_array_mut().unwrap().iter_mut().find(|p| p["name"] == "kimik3_mla_partial_fp8_h0_m64")
+        bad["programs"].as_array_mut().unwrap().iter_mut().find(|p| p["name"] == "kimik3_mla_partial_fp8_h0_t8_m64")
             .unwrap()["scratch_bytes_at_capacity"]["scratch"] = 1.into();
         assert!(ContextLayout::from_manifest(&bad, MlaCacheFormat::Fp8, 1024, 64, 1).is_err());
         assert!(ContextLayout::from_manifest(&manifest, MlaCacheFormat::Fp8, usize::MAX, 64, 1).is_err());

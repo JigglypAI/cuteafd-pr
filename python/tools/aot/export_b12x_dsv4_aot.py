@@ -846,18 +846,30 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
 def kimi_context_programs(decode_rows: int, max_context: int):
     """Kimi h96-query owned-page partials, h48 combine and format-native gathers."""
     from b12x.integration.cuteafd import context_split, kimi_mla
+    tiles = (8, 16)
+    routes = [kimi_mla.kimi_context_heads_per_tile(rows=rows) for rows in range(1, decode_rows + 1)]
+    if any(tile not in tiles for tile in routes):
+        raise ValueError("Kimi context tile policy requires an unexported tile")
+
+    def partial(g, begin, tile):
+        program = kimi_mla.compile_kimi_mla_partial_aot(
+            g, max_rows=decode_rows, max_context=max_context, head_begin=begin,
+            head_count=48, num_splits=16, device_splits=True, heads_per_tile=tile)
+        return dataclasses.replace(program, geometry={**program.geometry,
+            "context_heads_per_tile": routes})
+
     out = [("lse_combine2", "lse_combine2", {"heads": 48, "has_sink": False},
             lambda: context_split.compile_lse_combine2_aot(heads=48, has_sink=False))]
     for cache in ("bf16", "fp8"):
         g = kimi_mla.KimiMlaGeometry(kv_cache=cache)
         suffix = "" if cache == "bf16" else "_fp8"
         for begin in (0, 48):
-            out.append((f"mla_partial{suffix}_h{begin}_m{decode_rows}", "mla_partial",
-                        {"max_rows": decode_rows, "max_context": max_context, "head_begin": begin,
-                         "head_count": 48, "num_splits": 16, "device_splits": True, "kv_cache": cache},
-                        lambda g=g, begin=begin: kimi_mla.compile_kimi_mla_partial_aot(
-                            g, max_rows=decode_rows, max_context=max_context,
-                            head_begin=begin, head_count=48, num_splits=16, device_splits=True)))
+            for tile in tiles:
+                out.append((f"mla_partial{suffix}_h{begin}_t{tile}_m{decode_rows}", "mla_partial",
+                            {"max_rows": decode_rows, "max_context": max_context, "head_begin": begin,
+                             "head_count": 48, "num_splits": 16, "device_splits": True,
+                             "heads_per_tile": tile, "kv_cache": cache},
+                            lambda g=g, begin=begin, tile=tile: partial(g, begin, tile)))
         out.append((f"paged_staging_gather{suffix}", "paged_staging_gather",
                     {"row_bytes": g.record_bytes, "page_rows": PAGE_ROWS},
                     lambda g=g: context_split.compile_paged_staging_gather_aot(

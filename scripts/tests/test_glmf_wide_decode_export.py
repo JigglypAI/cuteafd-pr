@@ -50,6 +50,13 @@ def exporter(monkeypatch):
         def record_bytes(self):
             return 656 if self.kv_cache == "fp8" else 1152
     package.kimi_mla.KimiMlaGeometry = lambda **kw: KimiGeometry(**kw)
+    package.kimi_mla.kimi_context_heads_per_tile = lambda *, rows: 8 if rows < 4 else 16
+    @dataclasses.dataclass(frozen=True)
+    class PartialProgram:
+        call: tuple
+        geometry: dict
+    package.kimi_mla.compile_kimi_mla_partial_aot = lambda *args, **kw: PartialProgram(
+        ("kimi_mla", "compile_kimi_mla_partial_aot", args, kw), dict(kw))
     package.glmf.mhc_geometry = lambda g: ("mhc geometry", g)
     package.dsv4_mhc.mhc_post_pre_route = lambda rows: "decode" if rows < 96 else "block_m"
     # The real planner's shape at 32 heads: more splits for fewer rows (188 SMs: s32/s11/s4).
@@ -594,12 +601,22 @@ def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_
                 assert params == {"mode": mode, "max_rows": rows, "heads": heads, "kv_cache": cache}
 
 
-def test_kimi_context_exports_native_partial_ranges_and_shared_primitives(exporter):
+def test_kimi_context_exports_native_partial_ranges_and_shared_primitives(exporter, monkeypatch):
+    package = sys.modules["b12x.integration.cuteafd"]
+    # Deliberately change the fork rule: exporter/runtime metadata must not copy its threshold.
+    monkeypatch.setattr(package.kimi_mla, "kimi_context_heads_per_tile",
+                        lambda *, rows: 8 if rows in (1, 5, 11) else 16)
     programs = exporter.kimi_context_programs(64, 1048576)
-    assert len(programs) == 7
+    assert len(programs) == 11
     for stem, op, params, thunk in programs:
-        module, fn, args, kw = thunk()
+        result = thunk()
+        module, fn, args, kw = result.call if op == "mla_partial" else result
         if op == "mla_partial":
+            assert result.geometry["context_heads_per_tile"] == [
+                8 if rows in (1, 5, 11) else 16 for rows in range(1, 65)]
+            assert result.geometry["heads_per_tile"] == params["heads_per_tile"]
+            assert f'_t{params["heads_per_tile"]}_' in stem
+            assert params["heads_per_tile"] in (8, 16)
             assert module == "kimi_mla" and fn == "compile_kimi_mla_partial_aot"
             assert kw == {k: v for k, v in params.items() if k != "kv_cache"}
             assert args[0].kv_cache == params["kv_cache"]
