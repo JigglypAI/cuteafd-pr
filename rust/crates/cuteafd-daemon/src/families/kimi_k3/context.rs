@@ -148,6 +148,7 @@ pub(crate) struct ContextOwner<'a> {
     pub(crate) ranks: [Rc<Rank<'a>>; 2],
     // Must drop before the engine's peer abort words.
     pub(crate) exchange: ContextExchange<'a>,
+    caches: Option<[Rc<super::mla::CacheBank<'a>>; 2]>,
 }
 
 impl Drop for ContextOwner<'_> {
@@ -174,9 +175,27 @@ impl<'a> ContextOwner<'a> {
             ContextExchange::new(library, ranks, &layout.buffers(), abort))?;
         let [r0, r1] = compute_streams;
         let owner = Self { ranks: [Rc::new(Rank::allocate(layout, vec![r0])?),
-            Rc::new(Rank::allocate(layout, vec![r1])?)], exchange };
+            Rc::new(Rank::allocate(layout, vec![r1])?)], exchange, caches: None };
         owner.check_charges(layout)?;
         Ok(owner)
+    }
+
+    pub(crate) fn retain_caches(&mut self, caches: [Rc<super::mla::CacheBank<'a>>; 2]) -> Result<()> {
+        ensure!(self.caches.is_none(), "Kimi context caches already bound");
+        for rank in 0..2 {
+            ensure!(caches[rank].parity() && caches[rank].format() == caches[0].format()
+                && caches[rank].pages() == caches[0].pages(), "Kimi context cache ownership differs");
+            caches[rank].check_reader(0, &self.ranks[rank].streams[0])?;
+        }
+        // Drop drains both exact reader streams before either remote source bank
+        // can disappear, including when its local lane has already been dropped.
+        self.caches = Some(caches);
+        Ok(())
+    }
+
+    pub(crate) fn cache(&self, rank: usize, layer: usize) -> Result<CuteafdDeviceBuffer> {
+        self.caches.as_ref().context("Kimi context cache readers not retained")?
+            .get(rank).context("Kimi context cache rank")?.layer(layer)
     }
 
     /// Check actual native buffer extents, never a second estimate of the formula.
@@ -213,6 +232,7 @@ pub(crate) fn split_bucket(owned_pages: usize, rows: usize, sms: usize) -> Resul
 
 /// Per-query causal tables contain only local page indices. Even a row whose
 /// current token belongs to the peer still attends its own earlier history.
+#[derive(Clone)]
 pub(crate) struct DecodeRows {
     pub rows: usize,
     pub width: usize,
@@ -390,7 +410,7 @@ mod tests {
                 let streams = [0, 1].map(|id| Rc::new(Stream::new(
                     crate::shared::memory::device::Device { library: &library, id }).unwrap()));
                 let before = fixture.mapped_bytes(&library)?;
-                let owner = ContextOwner::new(&library, &layout, streams.clone(), None)?;
+                let mut owner = ContextOwner::new(&library, &layout, streams.clone(), None)?;
                 for rank in 0..2 {
                     assert_eq!(owner.ranks[rank].streams.len(), 1);
                     assert!(Rc::ptr_eq(&owner.ranks[rank].streams[0], &streams[rank]));
@@ -401,7 +421,40 @@ mod tests {
                 let charged: u64 = layout.buffers().demands()?.iter().map(|d| d.bytes).sum();
                 assert_eq!((fixture.mapped_bytes(&library)? - before) as u64, charged,
                     "native allocator extents include exactly both rank charges");
+                let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(
+                    &cuteafd_loader::plan::testing::kimi_k3_config())?;
+                let mut placement = super::super::admission::admit(
+                    super::super::admission::tests::inputs(&cfg))?.placement;
+                placement.pool_tokens = 256;
+                for (kind, layer) in cfg.attention.iter().zip(&mut placement.layers) {
+                    if *kind == cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla {
+                        layer.mode = cuteafd_loader::placement::LayerMode::ContextSplit;
+                    }
+                }
+                let caches = [0, 1].map(|rank| -> Result<_> {
+                    Ok(Rc::new(super::super::mla::CacheLayout::new(&cfg, &placement, rank, format)?
+                        .allocate(streams[rank].device, vec![streams[rank].clone()])?))
+                }).into_iter().collect::<Result<Vec<_>>>()?;
+                let caches: [Rc<super::super::mla::CacheBank<'_>>; 2] = caches.try_into()
+                    .map_err(|_| anyhow::anyhow!("expected two Kimi cache banks"))?;
+                let retained = caches.each_ref().map(Rc::downgrade);
+                assert!(owner.retain_caches([caches[1].clone(), caches[0].clone()]).is_err());
+                owner.retain_caches(caches.clone())?;
+                assert!(owner.retain_caches(caches.clone()).is_err());
+                let mla_layer = cfg.attention.iter().position(|kind|
+                    *kind == cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla).unwrap();
+                for rank in 0..2 {
+                    assert_eq!(owner.cache(rank, mla_layer)?.ptr, caches[rank].layer(mla_layer)?.ptr);
+                }
+                assert!(owner.cache(2, mla_layer).is_err());
+                drop(caches);
+                assert!(retained.iter().all(|bank| bank.upgrade().is_some()));
+                let events = fixture.events()?.len();
                 drop(owner);
+                let released = fixture.events()?;
+                assert!(released[events..].starts_with("SS"),
+                    "both exact rank readers must drain before any remote storage release: {}", &released[events..]);
+                assert!(retained.iter().all(|bank| bank.upgrade().is_none()));
                 assert_eq!(fixture.mapped_bytes(&library)?, before);
             }
         }

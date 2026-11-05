@@ -101,6 +101,7 @@ pub(crate) struct CommitPlane {
 
 /// Staging-to-pool copies, one `[source | destination | bytes]` list per plane.
 /// All lists are zero-padded to `limit`, and counts may differ between planes.
+#[derive(Clone)]
 pub(crate) struct CommitBlocks {
     pub table: Vec<u64>,
     pub counts: Vec<usize>,
@@ -159,6 +160,7 @@ pub(crate) struct GatheredPrefill {
     pub extent: usize,
 }
 
+#[derive(Clone)]
 pub(crate) struct GatheredUnit {
     /// Compact owner tables; gather scatters them at stride two, offset owner.
     pub tables: [Vec<u32>; 2],
@@ -183,6 +185,24 @@ impl GatheredPrefill {
             unit_bytes: page_bytes }], commit_limit)?;
         Ok(GatheredUnit { tables, history_pages, commit })
     }
+}
+
+/// Eager multiquery arithmetic on logical staging; persistent pages stay owned.
+/// Families bind kernels, while the recording backend uses this same sequence.
+pub(crate) trait GatheredKernels {
+    fn gather(&mut self, owner: usize) -> Result<()>;
+    fn produce(&mut self) -> Result<()>;
+    fn attention(&mut self) -> Result<()>;
+    fn commit(&mut self) -> Result<()>;
+    fn output(&mut self) -> Result<()>;
+}
+
+pub(crate) fn gathered_prefill_with(kernels: &mut impl GatheredKernels) -> Result<()> {
+    for owner in 0..2 { kernels.gather(owner)?; }
+    kernels.produce()?;
+    kernels.attention()?;
+    kernels.commit()?;
+    kernels.output()
 }
 
 /// Partial value width (the latent's 512 BF16 values per head).
@@ -639,6 +659,34 @@ mod tests {
             assert!(empty.tables.iter().all(Vec::is_empty));
             assert_eq!(empty.commit.counts, [0]);
         }
+    }
+
+    #[test]
+    fn gathered_callbacks_stop_at_the_first_failed_operation() -> Result<()> {
+        struct Recording { steps: Vec<usize>, fail: Option<usize> }
+        impl Recording {
+            fn step(&mut self, step: usize) -> Result<()> {
+                self.steps.push(step);
+                ensure!(self.fail != Some(step), "injected gathered failure");
+                Ok(())
+            }
+        }
+        impl GatheredKernels for Recording {
+            fn gather(&mut self, owner: usize) -> Result<()> { self.step(owner) }
+            fn produce(&mut self) -> Result<()> { self.step(2) }
+            fn attention(&mut self) -> Result<()> { self.step(3) }
+            fn commit(&mut self) -> Result<()> { self.step(4) }
+            fn output(&mut self) -> Result<()> { self.step(5) }
+        }
+        for fail in 0..6 {
+            let mut recording = Recording { steps: Vec::new(), fail: Some(fail) };
+            assert!(gathered_prefill_with(&mut recording).is_err());
+            assert_eq!(recording.steps, (0..=fail).collect::<Vec<_>>());
+        }
+        let mut recording = Recording { steps: Vec::new(), fail: None };
+        gathered_prefill_with(&mut recording)?;
+        assert_eq!(recording.steps, (0..6).collect::<Vec<_>>());
+        Ok(())
     }
 
     #[test]

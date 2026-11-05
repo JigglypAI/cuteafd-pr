@@ -345,7 +345,7 @@ fn validate_rank_geometry(modes: &[LayerMode], spec: cuteafd_loader::placement::
             && modes.iter().all(|mode| *mode == LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }),
             "single-device Kimi requires one whole attention/FFN owner and a local head"),
         2 => ensure!(spec.head_gpu == 1 && spec.terminal == TerminalHome::Replicated
-            && modes.iter().all(|mode| matches!(mode, LayerMode::HeadSplit
+            && modes.iter().all(|mode| matches!(mode, LayerMode::HeadSplit | LayerMode::ContextSplit
                 | LayerMode::Whole { ffn: FfnMode::Split, .. })), "Kimi TP2 requires split FFNs"),
         _ => anyhow::bail!("Kimi needs one or two physical ranks"),
     }
@@ -433,12 +433,24 @@ mod tests {
                 Ok(())
             }
             fn attention_commit(&mut self, rank: usize) -> Result<()> {
+                use crate::shared::peer_split::context::{gathered_prefill_with, GatheredKernels};
                 self.calls.push(("attention", rank, rank));
-                self.streams[rank].push(Step::Gather(self.unit)); Ok(())
+                struct Gathered<'a> { stream: &'a mut Vec<Step>, unit: usize }
+                impl GatheredKernels for Gathered<'_> {
+                    fn gather(&mut self, _: usize) -> Result<()> {
+                        self.stream.push(Step::Gather(self.unit)); Ok(())
+                    }
+                    fn produce(&mut self) -> Result<()> { Ok(()) }
+                    fn attention(&mut self) -> Result<()> { Ok(()) }
+                    fn commit(&mut self) -> Result<()> {
+                        self.stream.push(Step::Commit(self.unit)); Ok(())
+                    }
+                    fn output(&mut self) -> Result<()> { Ok(()) }
+                }
+                gathered_prefill_with(&mut Gathered { stream: &mut self.streams[rank], unit: self.unit })
             }
             fn record_commit(&mut self, rank: usize) -> Result<()> {
-                self.calls.push(("record", rank, rank));
-                self.streams[rank].push(Step::Commit(self.unit)); Ok(())
+                self.calls.push(("record", rank, rank)); Ok(())
             }
         }
         let mut recording = Recording { streams: std::array::from_fn(|_| Vec::new()),
@@ -856,8 +868,6 @@ impl LayerKernels for Bindings<'_, '_, '_> {
         }
     }
     fn context(&mut self, layer: usize, _: usize) -> Result<()> {
-        ensure!(self.packed.is_none() && self.rows <= 64,
-            "Kimi gathered context prefill is not bound");
         self.before_attention(layer)?;
         struct Pair<'b, 'e, 'a, 's> { binding: &'b mut Bindings<'e, 'a, 's>, layer: usize }
         impl ContextRankKernels for Pair<'_, '_, '_, '_> {
@@ -875,7 +885,11 @@ impl LayerKernels for Bindings<'_, '_, '_> {
                 Ok(())
             }
             fn attention_commit(&mut self, rank: usize) -> Result<()> {
-                self.binding.local[rank].context_decode(self.layer, self.binding.rows, self.binding.speculative)
+                if let Some(members) = &self.binding.packed {
+                    self.binding.local[rank].attention_packed(self.layer, members)
+                } else {
+                    self.binding.local[rank].context_attention(self.layer, self.binding.rows, self.binding.speculative)
+                }
             }
             fn record_commit(&mut self, rank: usize) -> Result<()> {
                 let execution = self.binding.protocol.execution;

@@ -486,6 +486,14 @@ pub(crate) struct LocalLane<'a> {
     replay_enabled: bool,
     context: Option<(Rc<super::context::ContextOwner<'a>>, Rc<super::context::Programs<'a>>)>,
     context_pages: Vec<usize>,
+    context_units: Vec<Option<ContextUnit>>,
+}
+
+#[derive(Clone, Copy)]
+struct ContextUnit {
+    shards: [usize; 2],
+    commits: usize,
+    commit_limit: usize,
 }
 
 impl Drop for LocalLane<'_> {
@@ -512,7 +520,7 @@ impl<'a> LocalLane<'a> {
         mla.check_reader(lane_index, &lane.stream)?;
         let banks = lane.layout.metadata_banks();
         Ok(Self { lane, programs, cfg, layers, global, lane_index, rank, kda, mla, attention: None, graphs: None,
-            replay_enabled: true, context: None, context_pages: vec![0; banks] })
+            replay_enabled: true, context: None, context_pages: vec![0; banks], context_units: vec![None; banks] })
     }
 
     pub(crate) fn bind_context(&mut self, owner: Rc<super::context::ContextOwner<'a>>,
@@ -600,12 +608,53 @@ impl<'a> LocalLane<'a> {
         pool: &cuteafd_engine::prefix::RefPagePool) -> Result<()> {
         self.attention = None;
         self.lane.metadata_bank = 0;
-        ensure!(!pool.is_parity() && pool.capacity().checked_add(pool.reserved()) == Some(self.mla.pages()),
-            "Kimi metadata page pool differs from admitted MLA bank");
+        self.check_page_pool(pool)?;
         let metadata = AttentionRows::new(sequences, self.lane.layout.unit, self.kda.slots(),
             self.lane.layout.max_context, pool)?;
-        self.lane.upload_attention(&metadata)?;
+        self.upload_attention(&metadata)?;
         self.attention = Some(AttentionShape { rows: metadata.rows, sequences: metadata.sequences });
+        Ok(())
+    }
+
+    fn check_page_pool(&self, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<()> {
+        let reserved = pool.reserved().checked_mul(if pool.is_parity() { 2 } else { 1 });
+        ensure!(pool.is_parity() == self.mla.parity()
+            && reserved.and_then(|n| pool.capacity().checked_add(n)) == Some(self.mla.pages()),
+            "Kimi page pool differs from admitted MLA ownership/extent");
+        ensure!(!pool.is_parity() || self.context.is_some(), "Kimi parity metadata needs admitted context binding");
+        Ok(())
+    }
+
+    fn upload_attention(&mut self, metadata: &AttentionRows) -> Result<()> {
+        self.lane.upload_attention(metadata)?;
+        let bank = self.lane.metadata_bank;
+        self.context_units[bank] = None;
+        self.context_pages[bank] = 0;
+        if let Some(metadata) = &metadata.context {
+            let owner = &self.context.as_ref().context("Kimi parity metadata without context")?.0.ranks[self.rank];
+            if let Some(decode) = &metadata.decode {
+                let mut decode = decode[self.rank].clone();
+                decode.pad(owner.decode().bucket(decode.rows)?)?;
+                for (name, bytes) in decode.uploads() { owner.upload(name, bank, bytes, self.stream())?; }
+                self.context_pages[bank] = decode.owned_pages;
+            }
+            if let Some(gathered) = &metadata.gathered {
+                let unit = &gathered[self.rank];
+                let width = owner.compact_width();
+                let mut tables = vec![0u8; 2 * width * 4];
+                for rank in 0..2 {
+                    for (column, page) in unit.tables[rank].iter().enumerate() {
+                        let offset = (rank * width + column) * 4;
+                        tables[offset..offset + 4].copy_from_slice(&page.to_le_bytes());
+                    }
+                }
+                let commits = metadata.commit_bytes(self.rank, self.mla.format())?;
+                owner.upload("gather tables", bank, &tables, self.stream())?;
+                owner.upload("commit blocks", bank, &commits, self.stream())?;
+                self.context_units[bank] = Some(ContextUnit { shards: unit.tables.each_ref().map(Vec::len),
+                    commits: unit.commit.counts[0], commit_limit: metadata.commit_limit });
+            }
+        }
         Ok(())
     }
 
@@ -613,8 +662,7 @@ impl<'a> LocalLane<'a> {
     /// the packed shape; recurrent slots and MLA page tables never cross members.
     pub(crate) fn packed_attention(&self, sequences: &[SequenceRows<'_>],
         pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Vec<AttentionRows>> {
-        ensure!(!pool.is_parity() && pool.capacity().checked_add(pool.reserved()) == Some(self.mla.pages()),
-            "Kimi packed page pool differs from admitted MLA bank");
+        self.check_page_pool(pool)?;
         AttentionRows::packed(sequences, self.lane.layout.unit, self.kda.slots(), self.max_context(), pool)
     }
 
@@ -627,9 +675,12 @@ impl<'a> LocalLane<'a> {
             for metadata in members {
                 self.select_subwave(Some(first..first + metadata.rows))?;
                 self.lane.metadata_bank = 0;
-                self.lane.upload_attention(metadata)?;
+                self.upload_attention(metadata)?;
                 self.attention = Some(AttentionShape { rows: metadata.rows, sequences: 1 });
-                self.attention(layer, metadata.rows, false)?;
+                if self.context.is_some() && self.cfg.attention[layer]
+                    == cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla {
+                    self.context_gathered(layer, metadata.rows)?;
+                } else { self.attention(layer, metadata.rows, false)?; }
                 first += metadata.rows;
             }
             Ok(())
@@ -646,17 +697,16 @@ impl<'a> LocalLane<'a> {
         sequence: &SequenceRows<'_>, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<()> {
         ensure!(!units.is_empty() && units.len() <= self.lane.layout.metadata_banks(),
             "Kimi attention units exceed admitted metadata banks");
-        ensure!(!pool.is_parity() && pool.capacity().checked_add(pool.reserved()) == Some(self.mla.pages()),
-            "Kimi metadata page pool differs from admitted MLA bank");
+        self.check_page_pool(pool)?;
         crate::shared::prefill_pipeline::with_cleanup(self, |local| {
             for (bank, unit) in units.iter().enumerate() {
                 ensure!(unit.index == bank && unit.sequence == 0 && unit.rows.start < unit.rows.end
                     && unit.rows.end <= sequence.rows, "Kimi attention unit metadata extent");
-                let metadata = AttentionRows::new(&[SequenceRows { slot: sequence.slot,
+                let metadata = AttentionRows::build(&[SequenceRows { slot: sequence.slot,
                     start: sequence.start + unit.rows.start, rows: unit.rows.len(), pages: sequence.pages }],
-                    local.lane.layout.unit, local.kda.slots(), local.lane.layout.max_context, pool)?;
+                    local.lane.layout.unit, local.kda.slots(), local.lane.layout.max_context, pool, pool.is_parity())?;
                 local.lane.metadata_bank = bank;
-                local.lane.upload_attention(&metadata)?;
+                local.upload_attention(&metadata)?;
             }
             Ok(())
         }, |local| { local.lane.metadata_bank = 0; local.attention = None; Ok(()) })
@@ -923,6 +973,80 @@ impl<'a> LocalLane<'a> {
             // output and retained lane destination are disjoint and stream-ordered.
             unsafe { stream.device.library.copy_d2d_async(destination, output, rows * 7168 * 2, stream.raw) }
         })
+    }
+
+    pub(crate) fn context_attention(&mut self, layer: usize, rows: usize, speculative: bool) -> Result<()> {
+        if self.context_units[self.lane.metadata_bank].is_some() {
+            ensure!(!speculative, "Kimi speculative context must use exact decode graphs");
+            self.context_gathered(layer, rows)
+        } else { self.context_decode(layer, rows, speculative) }
+    }
+
+    fn context_gathered(&self, layer: usize, rows: usize) -> Result<()> {
+        use crate::shared::peer_split::context::{gathered_prefill_with, GatheredKernels};
+        let unit = self.context_units[self.lane.metadata_bank].context("Kimi gathered metadata not staged")?;
+        let (context, programs) = self.context.as_ref().context("Kimi context not bound")?;
+        let owner = &context.ranks[self.rank];
+        let ordinal = self.cfg.attention[..layer].iter().filter(|&&kind|
+            kind == cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla).count();
+        let staging = owner.staging(ordinal % 2)?;
+        let attention = &self.programs.mla[0].extend;
+        let batch = cuteafd_ffi::KimiMlaBatch { rows, requests: 1,
+            page_table_width: self.max_context().div_ceil(64), cache_pages: self.max_context().div_ceil(64),
+            active_splits: attention.splits(), x: self.plane("normalized", rows, 7168)?,
+            slots: self.lane.buffer("MLA slots")?, cache: staging, page_table: self.lane.buffer("MLA page table")?,
+            lengths: self.lane.buffer("MLA lengths")?, query_offsets: self.lane.buffer("MLA query offsets")?,
+            query: self.lane.buffer("MLA query")?, q_resid: self.lane.buffer("MLA q residual")?,
+            attention: self.lane.buffer("MLA attention")?, lse: self.lane.buffer("MLA LSE")?,
+            output: self.attention_result(layer, rows)?, producer_scratch: self.lane.buffer("MLA producer scratch")?,
+            attention_scratch: self.lane.buffer("MLA attention scratch")?, output_scratch: self.lane.buffer("MLA output scratch")? };
+        struct Bindings<'b, 'a> {
+            local: &'b LocalLane<'a>, context: &'b super::context::ContextOwner<'a>,
+            programs: &'b super::context::Programs<'a>, unit: ContextUnit, layer: usize,
+            batch: cuteafd_ffi::KimiMlaBatch,
+        }
+        impl GatheredKernels for Bindings<'_, '_> {
+            fn gather(&mut self, rank: usize) -> Result<()> {
+                let pages = self.unit.shards[rank];
+                if pages == 0 { return Ok(()); }
+                let owner = &self.context.ranks[self.local.rank];
+                let table = view(owner.metadata("gather tables", self.local.lane.metadata_bank)?,
+                    rank * owner.compact_width() * 4, pages * 4)?;
+                let pool = self.context.cache(rank, self.layer)?;
+                let stream = self.local.stream();
+                stream.device.run(|| {
+                    // SAFETY: both banks and the exact remote reader streams are
+                    // retained by ContextOwner; prior owner commits were joined.
+                    unsafe { self.programs.gather.launch(&[pool.ptr, table.ptr, self.batch.cache.ptr],
+                        &[cuteafd_ffi::programs::Scalar::I32((pages * 64) as i32),
+                            cuteafd_ffi::programs::Scalar::I32(2), cuteafd_ffi::programs::Scalar::I32(rank as i32)], stream.raw) }
+                })
+            }
+            fn produce(&mut self) -> Result<()> { self.local.mla_produce(self.layer, self.batch) }
+            fn attention(&mut self) -> Result<()> {
+                let stream = self.local.stream();
+                stream.device.run(|| self.local.programs.mla[0].extend.attention(self.layer, self.batch, stream.raw))
+            }
+            fn commit(&mut self) -> Result<()> {
+                let count = self.unit.commits;
+                if count == 0 { return Ok(()); }
+                let blocks = self.context.ranks[self.local.rank]
+                    .metadata("commit blocks", self.local.lane.metadata_bank)?;
+                let list = |part: usize| -> Result<_> {
+                    Ok(view(blocks, part * self.unit.commit_limit * 8, count * 8)?.ptr.cast_const())
+                };
+                let pool = self.context.cache(self.local.rank, self.layer)?;
+                let stream = self.local.stream();
+                stream.device.run(|| {
+                    // SAFETY: shared GatheredPrefill validated owner-only new-row
+                    // blocks; admitted lists, staging and cache survive this stream.
+                    unsafe { stream.device.library.cuda_kv_cache_write_blocks_async(self.batch.cache.ptr, pool.ptr,
+                        list(0)?, list(1)?, list(2)?, count, stream.raw) }
+                })
+            }
+            fn output(&mut self) -> Result<()> { self.local.mla_output(self.layer, self.batch) }
+        }
+        gathered_prefill_with(&mut Bindings { local: self, context, programs, unit, layer, batch })
     }
 
     fn mla_program(&self, layer: usize, rows: usize, speculative: bool) -> Result<&super::mla::Mla<'a>> {
@@ -1258,6 +1382,27 @@ pub(crate) struct AttentionRows {
     page_table: Vec<u8>,
     lengths: Vec<u8>,
     offsets: Vec<u8>,
+    context: Option<ContextRows>,
+}
+
+struct ContextRows {
+    decode: Option<[super::context::DecodeRows; 2]>,
+    gathered: Option<[crate::shared::peer_split::context::GatheredUnit; 2]>,
+    commit_limit: usize,
+}
+
+impl ContextRows {
+    fn commit_bytes(&self, rank: usize, format: cuteafd_core::MlaCacheFormat) -> Result<Vec<u8>> {
+        let unit = self.gathered.as_ref().and_then(|units| units.get(rank))
+            .context("Kimi commit needs gathered rank metadata")?;
+        let mut bytes = Vec::with_capacity(unit.commit.table.len() * 8);
+        for rows in &unit.commit.table {
+            let offset = rows.checked_mul(format.record_bytes() as u64)
+                .context("Kimi context commit byte offset overflow")?;
+            bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+        Ok(bytes)
+    }
 }
 
 /// Shared safety boundary for uniform and parity MLA metadata. A context
@@ -1310,7 +1455,7 @@ impl AttentionRows {
             ensure!(used.insert(sequence.slot), "Kimi packed recurrent slot repeats");
             total = total.checked_add(sequence.rows).context("Kimi packed rows overflow")?;
             ensure!(total <= capacity, "Kimi packed rows exceed admitted unit");
-            let metadata = Self::new(std::slice::from_ref(sequence), capacity, slots, max_context, pool)?;
+            let metadata = Self::build(std::slice::from_ref(sequence), capacity, slots, max_context, pool, pool.is_parity())?;
             for (index, &page) in sequence.pages[..(sequence.start + sequence.rows).div_ceil(64)].iter().enumerate() {
                 let writable = index >= sequence.start / 64;
                 if let Some(previous) = pages.insert(page, writable) {
@@ -1326,14 +1471,35 @@ impl AttentionRows {
         pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Self> {
         ensure!((1..=4096).contains(&capacity) && (1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots)
             && (1..=1_048_576).contains(&max_context), "Kimi row descriptor capacity");
-        ensure!(!pool.is_parity() && pool.page_rows() == 64, "Kimi rows require shared uniform 64-row pages");
+        Self::build(sequences, capacity, slots, max_context, pool, false)
+    }
+
+    fn build(sequences: &[SequenceRows<'_>], capacity: usize, slots: usize, max_context: usize,
+        pool: &cuteafd_engine::prefix::RefPagePool, gathered: bool) -> Result<Self> {
+        ensure!(pool.page_rows() == 64 && (!gathered || pool.is_parity()), "Kimi row ownership mode differs");
         let rows = validate_sequence_pages(sequences, capacity, slots, max_context, pool)?;
+        let gathered = pool.is_parity() && (gathered || rows > 64);
+        ensure!(!gathered || sequences.len() == 1, "Kimi gathered prefill isolates one member");
+        let per_query = rows <= 64 && !gathered;
         let width = max_context.div_ceil(64);
-        let requests = if rows <= 64 { rows } else { 1 };
+        let requests = if per_query { rows } else { 1 };
+        let commit_limit = capacity.div_ceil(64) + 1;
+        let context = if !pool.is_parity() { None } else if gathered {
+            let sequence = &sequences[0];
+            let geometry = crate::shared::peer_split::context::GatheredPrefill {
+                page_rows: 64, row_bytes: 1, extent: max_context };
+            // Record width is bound when staging, not guessed by page metadata.
+            let units = [geometry.unit(0, sequence.pages, sequence.start, sequence.start, rows, commit_limit)?,
+                geometry.unit(1, sequence.pages, sequence.start, sequence.start, rows, commit_limit)?];
+            Some(ContextRows { decode: None, gathered: Some(units), commit_limit })
+        } else {
+            Some(ContextRows { decode: Some([super::context::DecodeRows::new(0, sequences, max_context, slots, pool)?,
+                super::context::DecodeRows::new(1, sequences, max_context, slots, pool)?]), gathered: None, commit_limit })
+        };
         let mut metadata = Self { rows, sequences: sequences.len(), width,
             kda_slots: Vec::with_capacity(rows * 4), kda_first: Vec::with_capacity(rows * 4),
             mla_slots: Vec::with_capacity(rows * 8), page_table: vec![0; requests * width * 4],
-            lengths: Vec::with_capacity(requests * 4), offsets: Vec::with_capacity((requests + 1) * 4) };
+            lengths: Vec::with_capacity(requests * 4), offsets: Vec::with_capacity((requests + 1) * 4), context };
         let mut row = 0;
         metadata.offsets.extend_from_slice(&0i32.to_le_bytes());
         for sequence in sequences {
@@ -1344,22 +1510,25 @@ impl AttentionRows {
                 metadata.kda_slots.extend_from_slice(&(sequence.slot as i32).to_le_bytes());
                 metadata.kda_first.extend_from_slice(&(first as i32).to_le_bytes());
                 let position = sequence.start + offset;
-                let physical = i64::from(pages[position / 64]) * 64 + (position % 64) as i64;
+                let physical = if pool.is_parity() { position as i64 }
+                    else { i64::from(pages[position / 64]) * 64 + (position % 64) as i64 };
                 metadata.mla_slots.extend_from_slice(&physical.to_le_bytes());
-                if rows <= 64 {
+                if per_query {
                     metadata.lengths.extend_from_slice(&((position + 1) as i32).to_le_bytes());
                     metadata.offsets.extend_from_slice(&((row + 1) as i32).to_le_bytes());
                     for (j, page) in pages.iter().enumerate() {
                         let at = (row * width + j) * 4;
+                        let page = if pool.is_parity() { j as u32 } else { *page };
                         metadata.page_table[at..at + 4].copy_from_slice(&page.to_le_bytes());
                     }
                 }
                 row += 1;
             }
-            if rows > 64 {
+            if !per_query {
                 metadata.lengths.extend_from_slice(&(end as i32).to_le_bytes());
                 metadata.offsets.extend_from_slice(&(rows as i32).to_le_bytes());
                 for (j, page) in pages.iter().enumerate() {
+                    let page = if pool.is_parity() { j as u32 } else { *page };
                     metadata.page_table[j * 4..j * 4 + 4].copy_from_slice(&page.to_le_bytes());
                 }
             }
@@ -1822,6 +1991,82 @@ mod tests {
         let aliased = [SequenceRows { slot: 0, start: 64, rows: 1, pages: &a },
             SequenceRows { slot: 1, start: 64, rows: 1, pages: &a }];
         assert!(AttentionRows::new(&aliased, 64, 2, 128, &pool).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn parity_rows_separate_logical_gathered_history_from_compact_decode() -> Result<()> {
+        let mut pool = cuteafd_engine::prefix::RefPagePool::parity(16, 64, 0);
+        pool.alloc_for(0..16)?;
+        let pages = [14, 9, 4, 3, 12, 5, 6, 7];
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let lane = LaneLayout::new(&cfg, 384, 128, 512, NativeScratch { kda: 16, mla: [16; 3] })?;
+        for start in [0, 63, 64, 127, 255] { for rows in [1, 4, 64, 65, 128] {
+            let sequences = [SequenceRows { slot: 1, start, rows, pages: &pages }];
+            let metadata = AttentionRows::build(&sequences, 128, 2, 512, &pool, true)?;
+            metadata.check_layout(&lane)?;
+            assert_eq!(i32_metadata(&metadata.lengths), [(start + rows) as i32]);
+            assert_eq!(i32_metadata(&metadata.offsets), [0, rows as i32]);
+            assert_eq!(i32_metadata(&metadata.kda_slots), vec![1; rows]);
+            assert_eq!(i32_metadata(&metadata.kda_first), vec![0; rows]);
+            let logical = metadata.mla_slots.chunks_exact(8).map(|b|
+                i64::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+            assert_eq!(logical, (start as i64..(start + rows) as i64).collect::<Vec<_>>());
+            let visible_pages = (start + rows).div_ceil(64);
+            assert_eq!(&i32_metadata(&metadata.page_table)[..visible_pages],
+                &(0..visible_pages as i32).collect::<Vec<_>>());
+            let context = metadata.context.as_ref().unwrap();
+            assert!(context.decode.is_none());
+            let gathered = context.gathered.as_ref().unwrap();
+            for rank in 0..2 {
+                let unit = &gathered[rank];
+                assert_eq!(unit.history_pages, start.div_ceil(64));
+                for owner in 0..2 {
+                    let expected = pages[..start.div_ceil(64)].iter().skip(owner).step_by(2)
+                        .map(|page| page >> 1).collect::<Vec<_>>();
+                    assert_eq!(unit.tables[owner], expected);
+                }
+                let count = unit.commit.counts[0];
+                let limit = context.commit_limit;
+                let mut copied = 0;
+                for block in 0..count {
+                    let first = unit.commit.table[block] as usize;
+                    let destination = unit.commit.table[limit + block] as usize;
+                    let count = unit.commit.table[2 * limit + block] as usize;
+                    assert!(first >= start && first + count <= start + rows);
+                    assert_eq!(first / 64 % 2, rank);
+                    assert_eq!(destination, (pages[first / 64] >> 1) as usize * 64 + first % 64);
+                    copied += count;
+                }
+                assert_eq!(copied, (start..start + rows).filter(|position| position / 64 % 2 == rank).count());
+                for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
+                    let scaled = context.commit_bytes(rank, format)?;
+                    assert_eq!(scaled.len(), 3 * limit * 8);
+                    for (actual, expected) in scaled.chunks_exact(8).zip(&unit.commit.table) {
+                        assert_eq!(u64::from_le_bytes(actual.try_into().unwrap()),
+                            expected * format.record_bytes() as u64);
+                    }
+                }
+            }
+            if rows <= 64 {
+                let decode = AttentionRows::new(&sequences, 128, 2, 512, &pool)?;
+                assert!(decode.context.as_ref().unwrap().gathered.is_none());
+                assert!(decode.context.as_ref().unwrap().decode.is_some());
+                assert_eq!(i32_metadata(&decode.lengths).len(), rows);
+            }
+        }}
+        let packed = AttentionRows::packed(&[
+            SequenceRows { slot: 0, start: 62, rows: 3, pages: &pages },
+            SequenceRows { slot: 1, start: 64, rows: 1, pages: &[0, 1] },
+        ], 128, 2, 512, &pool)?;
+        for member in packed {
+            assert!(member.context.as_ref().unwrap().gathered.is_some());
+            assert_eq!(i32_metadata(&member.offsets), [0, member.rows as i32]);
+        }
+        assert!(AttentionRows::packed(&[
+            SequenceRows { slot: 0, start: 62, rows: 3, pages: &pages },
+            SequenceRows { slot: 1, start: 64, rows: 1, pages: &pages },
+        ], 128, 2, 512, &pool).is_err());
         Ok(())
     }
 

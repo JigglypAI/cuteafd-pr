@@ -235,12 +235,14 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         options.peers.clone(), cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() }, expert_modules)?;
     if let Some(set) = graph_set {
         let before = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;
+        let capture_started = std::time::Instant::now();
         engine.warm_graphs(&set.keys)?;
+        let capture_elapsed_ms = capture_started.elapsed().as_millis() as u64;
         let after = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;
         for rank in 0..RANKS {
             let bytes = before.gpus[rank].free_bytes.saturating_sub(after.gpus[rank].free_bytes);
             let count = set.inventory.ranks[rank].executables;
-            tracing::info!(rank, executables = count, measured_bytes = bytes,
+            tracing::info!(rank, executables = count, measured_bytes = bytes, capture_elapsed_ms,
                 bytes_per_executable = bytes.div_ceil(count.max(1)),
                 reserved_bytes = set.inventory.bytes(rank), reserve = "estimated",
                 "Kimi startup graph census");

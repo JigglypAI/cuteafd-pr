@@ -175,8 +175,13 @@ impl<'a> Admission<'a> {
                 && charges[0].category == demand.category && charges[0].basis == demand.basis,
                 "Kimi context allocation differs from accepted {} charge", demand.group);
         }
+        let caches = [0, 1].map(|rank| self.mla_owners[rank].upgrade()
+            .context("Kimi context requires both admitted cache owners"))
+            .into_iter().collect::<Result<Vec<_>>>()?;
         self.context_allocated = true;
-        super::context::ContextOwner::new(library, layout, streams, Some(abort)).map(Rc::new)
+        let mut owner = super::context::ContextOwner::new(library, layout, streams, Some(abort))?;
+        owner.retain_caches([caches[0].clone(), caches[1].clone()])?;
+        Ok(Rc::new(owner))
     }
 
     /// Construct the final shared owner once, inside its admitted device scope.
