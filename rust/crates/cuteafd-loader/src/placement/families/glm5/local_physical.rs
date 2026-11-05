@@ -12,6 +12,17 @@ use std::{collections::BTreeMap, path::Path};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalStorage { Mount, Push }
 
+impl LocalStorage {
+    pub fn for_snapshot(snapshot: &Path) -> Result<Self> {
+        match crate::push_load::namespace(snapshot) {
+            Ok(_) => Ok(Self::Push),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                && error.raw_os_error().is_none() && snapshot.exists() => Ok(Self::Mount),
+            Err(error) => Err(error).context("discovering checkpoint storage namespace"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalPhysicalInput {
     pub layers: Vec<usize>,

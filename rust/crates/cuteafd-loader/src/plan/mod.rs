@@ -1253,7 +1253,9 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         }
         let refused = !report.placement_supported && memory.devices.is_empty();
         report.memory_layout = Some(memory);
-        if !refused { layout::charge_host(&mut report, &layout_options, input, false)?; }
+        if !refused && family.id() != "glm5" {
+            layout::charge_host(&mut report, &layout_options, input, false)?;
+        }
     }
     if !report.unclassified.is_empty() {
         report.hints.push(Hint {

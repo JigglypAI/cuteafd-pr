@@ -255,7 +255,7 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
     let health = encoder.health_handle();
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
-    let result = opened.with_resolved_engine_media(&resolved, media_push.records(), |engine, transport, runtime| {
+    let result = opened.with_resolved_engine_media(&resolved, media_push.records(), Some((&prefix, max_sequences)), |engine, transport, runtime| {
         media_push.commit()?;
         anyhow::ensure!(transport.is_some() || engine.skip_routed() || engine.has_local(), "serve-glm needs Spark peers, local TP2 or --skip-routed-experts");
         let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
@@ -497,10 +497,11 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs, concurrenc
     } else if engine.ranks() > 1 {
         // SAFETY of the registration: the engine (and its pools) outlives the cache, which
         // `schedule` drops first.
-        args.host_config(family.layout(), engine.max_context, concurrency)?.map(|config|
+        engine.admitted_host_config.clone().map(|config|
             CudaCopyEngine::registered(engine.library, &family.buffers()).map(|copy| (config, copy))).transpose()?
     } else {
-        args.host_tier(engine.library, template, family.layout(), engine.max_context, concurrency)?
+        engine.admitted_host_config.clone().map(|config|
+            CudaCopyEngine::new(engine.library, template).map(|copy| (config, copy))).transpose()?
     };
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();

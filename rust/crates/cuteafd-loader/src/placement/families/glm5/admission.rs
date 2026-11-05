@@ -507,6 +507,34 @@ pub struct AdmittedGlm {
     pub host: HostFigures,
 }
 
+impl AdmittedGlm {
+    /// Classify only selected figures after admission; never change charged bytes.
+    pub fn census_recommendation(&self, identity: FigureIdentity<'_>) -> Result<Option<String>, Refusal> {
+        use crate::placement::inventory::{FigureUse, census_recommendation};
+        let layout = format!("{}; attention/{:?}; pool/{}; onboard/{:?}; sparks/{}; prefill/{:?}; embedding/{:?}",
+            identity.layout, self.placement.attention_placement, self.solved.pool_tokens,
+            self.solved.decisions.onboard_layers, self.spark.spark_ranks,
+            self.solved.decisions.prefill, self.solved.decisions.embedding);
+        let graphs = self.graphs.declared().iter().enumerate().map(|(rank, set)|
+            set.fingerprint(rank as u8).map_err(Refusal::InvalidFact)).collect::<Result<Vec<_>, _>>()?;
+        let host_graphs = graphs.join(",");
+        let identity = FigureIdentity { layout: &layout, ..identity };
+        let mut uses = Vec::new();
+        for (rank, graph) in graphs.iter().enumerate() {
+            let current = FigureIdentity { declared_graphs: graph, ..identity };
+            for (name, figure) in [("graph instantiate", self.graphs.figures()[rank]),
+                ("context/modules", self.runtime.context()[rank]), ("load residual", self.runtime.load()[rank]),
+                ("runtime residual", self.runtime.unattributed()[rank])] {
+                uses.push(FigureUse { name, figure, current });
+            }
+        }
+        let current = FigureIdentity { declared_graphs: &host_graphs, ..identity };
+        uses.extend([FigureUse { name: "host load", figure: self.host.load(), current },
+            FigureUse { name: "host steady", figure: self.host.steady(), current }]);
+        Ok(census_recommendation(uses))
+    }
+}
+
 /// Physical capacity and operator ceiling are independent inputs. Runtime
 /// preweight samples are evidence, not another subtraction of these owners.
 pub fn production_budgets(cards: &[(u64, u64)], headroom: u64, host: (u64, u64),

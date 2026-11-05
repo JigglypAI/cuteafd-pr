@@ -498,7 +498,8 @@ fn production_serving(options: &LayoutOptions, checkpoint: &Checkpoint, cfg: &Gl
         page_bytes: cache.ranks[0].persistent_unit_bytes, mark_bytes, draft_bytes: 0 };
     let quota = if options.mimo_prefix_entries == 0 || options.host_cache_bytes == Some(0)
         || gpus == 2 && attention == crate::placement::AttentionPlacement::Heads { 0 }
-        else { geometry.resolve(options.host_cache_bytes, context, concurrency as u64, host.0, geometry.chunk_bytes())? };
+        else { geometry.resolve(options.host_cache_bytes, context, concurrency as u64, host.0, geometry.chunk_bytes())
+            .context("invalid GLM host prefix geometry or quota")? };
     let serving = ServingOwners { selector: SelectorOwners { location: Location::coordinator(0),
         capacity: 64, vocab: cfg.vocab_size, device_sampling: true },
         prefix: HostPrefixOwners { quota_bytes: quota, chunk_bytes: geometry.chunk_bytes().min(quota) } };
@@ -568,8 +569,9 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let embedding = if options.host_embedding { EmbeddingHome::HostPinned } else { EmbeddingHome::Device(0) };
     let target = TargetFacts::checkpoint(checkpoint, cfg.layers, gpus, owners.as_deref(), false, &[embedding], core)?;
     let physical = LocalPhysicalInput { layers: (cfg.first_moe_layer..cfg.layers).collect(),
-        max_rows: rows.max(glm::DECODE_ROWS) as usize, lanes: lanes as usize, storage: LocalStorage::Mount,
-        route_checks: false, peer_diagnostics: false, activations: options.exlr8_prefill_activations };
+        max_rows: rows.max(glm::DECODE_ROWS) as usize, lanes: lanes as usize,
+        storage: LocalStorage::for_snapshot(&checkpoint.snapshot)?,
+        route_checks: true, peer_diagnostics: false, activations: options.exlr8_prefill_activations };
     let source = local.as_ref().map(|local| LocalPhysicalSource::read(&cfg, &catalog, local, &physical, None)).transpose()?;
     let (draft, mut additional, prefix_quota) = production_serving(options, checkpoint, &cfg,
         context, attention, gpus, maximum_pages)?;
