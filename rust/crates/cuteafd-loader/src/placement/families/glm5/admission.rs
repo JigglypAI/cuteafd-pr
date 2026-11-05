@@ -507,6 +507,57 @@ pub struct AdmittedGlm {
     pub host: HostFigures,
 }
 
+/// Physical capacity and operator ceiling are independent inputs. Runtime
+/// preweight samples are evidence, not another subtraction of these owners.
+pub fn production_budgets(cards: &[(u64, u64)], headroom: u64, host: (u64, u64),
+    host_headroom: u64, spark_bytes: &[u64]) -> Result<Vec<Budget>, Refusal> {
+    if !(1..=2).contains(&cards.len()) || host.1 > host.0 || host.0 == 0 {
+        return Err(invalid("invalid production physical capacities"));
+    }
+    let forecast = || Baseline::Forecast { occupied: 0,
+        source: "physical capacity; all GLM owners and maintained runtime figures charged in recipe".into(),
+        assumed: false };
+    let mut budgets = cards.iter().enumerate().map(|(rank, &(physical, logical))| Budget {
+        id: format!("rtx{rank}"), locations: vec![Location::coordinator(rank as u8)],
+        physical_bytes: physical, logical_bytes: logical, baseline: forecast(), headroom,
+    }).collect::<Vec<_>>();
+    budgets.push(Budget { id: "coordinator host RAM".into(), locations: vec![Location::HOST, Location::PINNED],
+        physical_bytes: host.0, logical_bytes: host.0,
+        baseline: Baseline::Sampled { free: host.1, phase: Phase::Load,
+            source: "independent host MemAvailable before target allocation".into() }, headroom: host_headroom });
+    budgets.extend(spark_bytes.iter().enumerate().map(|(rank, &bytes)| Budget {
+        id: format!("spark{rank}"), locations: vec![Location { device: Device::Spark(rank as u8), domain: Domain::Managed }],
+        physical_bytes: bytes, logical_bytes: bytes, baseline: forecast(), headroom: 0,
+    }));
+    Ok(budgets)
+}
+
+pub fn production_links(cfg: &GlmDsaConfig, ranks: usize, prefill: PrefillShape,
+    ingress: cuteafd_core::SparkIngress, rings: cuteafd_core::SparkRings,
+    replies: SparkReplyFormats) -> Result<(Option<crate::placement::PreparedSparkLink>,
+        Option<crate::placement::PreparedSparkLink>), Refusal> {
+    use crate::placement::{PreparedSparkLink, SparkEndpointOwners, SparkIntakeCandidates};
+    if ranks == 0 { return Ok((None, None)); }
+    let geometry = cuteafd_core::ExpertGeometry { hidden: cfg.hidden as u32, experts: cfg.experts as u32,
+        topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
+    let endpoint = |name, shape: PrefillShape, prefill, reply| PreparedSparkLink::endpoint(name, 0,
+        SparkEndpointOwners { ranks, geometry, endpoint: cuteafd_core::SparkEndpoint {
+            capacity: u32::try_from(shape.rows).map_err(|_| Refusal::Overflow("GLM transport rows"))?,
+            ingress, ring_depth: None, partial_reply_bytes: None }, rings },
+        shape.waves as usize, prefill, true, SparkIntakeCandidates::Probed, reply, Lifetime::TARGET);
+    Ok((Some(endpoint("glm.decode", PrefillShape { rows: super::DECODE_ROWS, waves: 1 }, false, replies.decode())?),
+        Some(endpoint("glm.prefill", prefill, true, replies.prefill(geometry.partial_replies()))?)))
+}
+
+pub fn production_request(context: u64, pool: Option<u64>, onboard: crate::placement::Onboard,
+    prefill: PrefillShape, operation: Operation, resident_weight_limit: crate::placement::ResidentWeights,
+    spark_reply_formats: SparkReplyFormats) -> Request {
+    Request { context, pool: pool.filter(|&n| n > 0).map_or(Pin::Auto, Pin::Exact),
+        onboard: match onboard { crate::placement::Onboard::Auto => Pin::Auto,
+            crate::placement::Onboard::Layers(n) => Pin::Exact(n as u64) },
+        prefill: Pin::Exact(prefill), operation, resident_weight_limit: Some(resident_weight_limit), spark_reply_formats }
+}
+
 fn physical_components(owners: impl IntoIterator<Item = Allocation>, maximum: u64)
     -> Vec<Component> {
     owners.into_iter().filter(|owner| owner.bytes > 0).map(|owner| {

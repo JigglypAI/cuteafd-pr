@@ -141,19 +141,22 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut local_layers = 0;
     match core.and_then(|core| placement(report, input, options, &devices[..ranks], shape.manifest.as_deref(),
         shape.prefill_rows, shape.context_tokens, core.as_ref(), context_programs)) {
-        Ok((placement, selected)) => {
+        Ok((admitted, prefix_quota)) => {
+            report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
+            report.host_budget_bytes = prefix_quota;
+            let placement = admitted.placement;
             report.solver_placement = Some(placement.clone());
             // The solver resolved auto against this build's programs.
             report.attention_placement = placement.attention_placement;
             if let Some(note) = notes.iter_mut().find(|n| n.starts_with("attention placement ")) {
                 *note = format!("attention placement {}", placement.attention_placement);
             }
-            working = selected.spark.clone();
+            working = admitted.spark;
             if working.spark_layers.is_empty() { sparks.clear(); }
             notes.push(format!("GLM selected working set: {} Spark layers, {} ranks, {} prefill lanes",
                 working.spark_layers.len(), working.spark_ranks, working.prefill_lanes));
             for (device, items) in devices.iter_mut().zip(&placement.items) {
-                device.items.extend(items.iter().cloned());
+                device.items = items.clone();
                 device.kv_tokens = placement.pool_tokens;
             }
             local_layers = placement.onboard_layers;
@@ -451,12 +454,71 @@ fn drafter_admission(options: &LayoutOptions, checkpoint: &Checkpoint)
     Ok(admitted)
 }
 
+fn production_serving(options: &LayoutOptions, checkpoint: &Checkpoint, cfg: &GlmDsaConfig,
+    context: u64, attention: crate::placement::AttentionPlacement, gpus: usize, maximum_pages: u64)
+    -> anyhow::Result<(crate::placement::families::glm5::admission::DraftFacts,
+        Vec<crate::placement::planner::Component>, u64)> {
+    use crate::placement::{families::glm5::{self as glm, admission::DraftFacts}, planner::*};
+    use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation, serving_draft_context_slots};
+    use crate::placement::planner::serving::{HostPrefixOwners, SelectorOwners, ServingOwners};
+    let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
+        "sm_120", options.rtx_bytes[0]).sms) as usize;
+    let concurrency = options.resolved_concurrency(cfg.family_id()) as usize;
+    let sequences = options.glm_draft_sequences() as usize;
+    let slots = serving_draft_context_slots(sequences, concurrency, options.draft_context_slots.map(|n| n as usize));
+    let mut mark_bytes = 0;
+    let mut mark_slots = 0;
+    let draft = if options.glm5_drafter_disabled { DraftFacts::default() }
+        else if checkpoint.model_type() == Some("mistral_large4") {
+            let layout = glm::ml4_draft_layout(&checkpoint.snapshot, slots, sequences, context as usize, sms)?;
+            mark_bytes = glm::draft_window_mark_bytes(&layout)? as u64;
+            if options.mimo_prefix_entries > 0 {
+                mark_slots = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
+                    concurrency as u64, options.mimo_prefix_entries, mark_bytes, options.mimo_prefix_mark_bytes,
+                    options.host_cache_bytes != Some(0)));
+            }
+            DraftFacts::ml4(&layout)?
+        } else {
+            let snapshot = options.glm5_drafter_snapshot.clone().or_else(|| {
+                let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("/mnt/sparknest/hf-home"));
+                crate::resolve_snapshot_at_revision("incoai/GLM-5.3-DFlash2", Some(&home), None).ok()
+                    .and_then(|resolved| resolved.snapshot_path)
+            }).context("GLM shared admission needs the drafter's physical checkpoint headers; disable speculation or supply its snapshot")?;
+            let draft = crate::families::glm5::draft_physical::GlmDflashConfig::read(&snapshot)?;
+            DraftFacts::gqa(&snapshot, if options.glm5_draft_bf16 { GlmDraftRepresentation::Bf16Only }
+                else { GlmDraftRepresentation::Fp8Only }, GlmDraftCapacity::new(slots, sequences, draft.block)?,
+                sms, 0, options.draft_kv_cache)?
+        };
+    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory)?;
+    let cache = if let Some(ml4) = cfg.variant.ml4() {
+        crate::serving_capacity::mistral_large4_cache_geometry(ml4, 1)?
+    } else { crate::serving_capacity::glm_cache_geometry(cfg, cfg.layers, 1)? };
+    let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: cache.logical_unit_rows,
+        page_bytes: cache.ranks[0].persistent_unit_bytes, mark_bytes, draft_bytes: 0 };
+    let quota = if options.mimo_prefix_entries == 0 || options.host_cache_bytes == Some(0)
+        || gpus == 2 && attention == crate::placement::AttentionPlacement::Heads { 0 }
+        else { geometry.resolve(options.host_cache_bytes, context, concurrency as u64, host.0, geometry.chunk_bytes())? };
+    let serving = ServingOwners { selector: SelectorOwners { location: Location::coordinator(0),
+        capacity: 64, vocab: cfg.vocab_size, device_sampling: true },
+        prefix: HostPrefixOwners { quota_bytes: quota, chunk_bytes: geometry.chunk_bytes().min(quota) } };
+    let mut owners = serving.components(maximum_pages)?;
+    if mark_slots > 0 && mark_bytes > 0 {
+        let bytes = mark_slots.checked_mul(mark_bytes).context("GLM draft mark extent overflow")?;
+        let owner = Allocation::buffer("glm.draft.window_marks", Location::coordinator(0), bytes,
+            Lifetime::TARGET, Category::Prefix, "GLM draft window marks");
+        owners.push(crate::placement::planner::Component::allocation(owner, ByteCurve::fixed(bytes, maximum_pages), false, maximum_pages));
+    }
+    Ok((draft, owners, quota))
+}
+
 fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &LayoutOptions,
     devices: &[DeviceLayout], manifest: Option<&serde_json::Value>, rows: u64, context: u64,
     core: Option<&crate::families::glm5::core::CoreCharges>,
     context_programs: Option<crate::placement::families::glm5::GlmContext>)
-    -> anyhow::Result<(crate::placement::Placement, crate::placement::families::glm5::GlmWorkingSet)> {
-    use crate::placement::{families::glm5 as glm, Baseline};
+    -> anyhow::Result<(crate::placement::families::glm5::admission::AdmittedGlm, u64)> {
+    use crate::placement::{families::glm5 as glm, planner::*};
+    use glm::{admission::*, local_physical::*};
     let checkpoint = input.checkpoint();
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
@@ -483,8 +545,17 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         }
         Ok(scratch)
     }).transpose()?;
-    let gpus = devices.iter().zip(&options.rtx_bytes).map(|(d, &capacity)| (capacity,
-        Baseline::Planned { context_bytes: 0, loaded_bytes: d.used_bytes() })).collect();
+    let gpus = devices.len();
+    let attention = glm::resolve_context_attention(&cfg, report.requested_attention, gpus,
+        context_programs.is_some(), true)?.unwrap_or(if gpus == 2 {
+            crate::placement::AttentionPlacement::Context
+        } else { crate::placement::AttentionPlacement::Heads });
+    let page_tokens = if attention == crate::placement::AttentionPlacement::Context { 128 } else { 64 };
+    let maximum_pool_tokens = options.pool_tokens.unwrap_or_else(|| crate::placement::PoolPolicy::resolve(
+        &options.rtx_bytes[..gpus], context, None, page_tokens, spark_ranks == 0).target);
+    let maximum_pages = maximum_pool_tokens.div_ceil(page_tokens);
+    let prefill = PrefillShape { rows, waves: lanes };
+    let operation = if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
     let onboard = options.resolve_onboard(cfg.layers.saturating_sub(cfg.first_moe_layer)).unwrap_or_else(glm::default_onboard);
     let exchange_f32 = glm::local_exchange_f32()?;
     let manifest_path = options.workspace_manifest.as_deref().unwrap_or_else(||
@@ -492,30 +563,50 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let catalog = input.expert_catalog()?;
     let local = glm::select_local_inventory(&cfg, &catalog, manifest_path, cfg.layers, devices.len(),
         rows, lanes, exchange_f32, onboard, false, None)?;
-    let tp2_workspace = local.as_ref().map_or([0; 2], |l| l.workspace());
-    let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&cfg, rows, 1, exchange_f32));
-    let owners = (report.requested_attention == Some(crate::placement::AttentionPlacement::Layers))
+    let owners = (attention == crate::placement::AttentionPlacement::Layers)
         .then(|| glm::attention_owners(&cfg, cfg.layers)).transpose()?;
-    let mut loaded_weights = device_bytes(checkpoint, devices.len(), cfg.layers, options.host_embedding, owners.as_deref())?
-        .into_iter().map(crate::placement::ResidentWeights).collect::<Vec<_>>();
+    let embedding = if options.host_embedding { EmbeddingHome::HostPinned } else { EmbeddingHome::Device(0) };
+    let target = TargetFacts::checkpoint(checkpoint, cfg.layers, gpus, owners.as_deref(), false, &[embedding], core)?;
+    let physical = LocalPhysicalInput { layers: (cfg.first_moe_layer..cfg.layers).collect(),
+        max_rows: rows.max(glm::DECODE_ROWS) as usize, lanes: lanes as usize, storage: LocalStorage::Mount,
+        route_checks: false, peer_diagnostics: false, activations: options.exlr8_prefill_activations };
+    let source = local.as_ref().map(|local| LocalPhysicalSource::read(&cfg, &catalog, local, &physical, None)).transpose()?;
+    let (draft, mut additional, prefix_quota) = production_serving(options, checkpoint, &cfg,
+        context, attention, gpus, maximum_pages)?;
     if let Some(encoder) = &report.encoder {
         if let crate::plan::encoder::EncoderKind::Rtx { gpu } = encoder.kind {
-            loaded_weights[gpu] = loaded_weights[gpu].checked_add(crate::placement::ResidentWeights(encoder.weights))?;
+            let location = Location::coordinator(gpu as u8);
+            let owner = Allocation::buffer("glm.encoder.weights", location, encoder.weights,
+                Lifetime::RESIDENT, Category::Weights, "bundled encoder weights");
+            additional.push(crate::placement::planner::Component::resident_weight(ResidentWeight::from_allocation(
+                &owner, crate::placement::ResidentWeights(encoder.weights)), ByteCurve::fixed(encoder.weights, maximum_pages)));
+            additional.push(crate::placement::planner::Component::allocation(owner,
+                ByteCurve::fixed(encoder.weights, maximum_pages), false, maximum_pages));
+            for item in devices[gpu].items.iter().filter(|item| !matches!(item.category,
+                Category::Weights | Category::Embedding | Category::Runtime)) {
+                let owner = Allocation::buffer(format!("glm.encoder.{}", item.group), location, item.bytes,
+                    Lifetime::RESIDENT, item.category, item.group.clone());
+                additional.push(crate::placement::planner::Component::allocation(owner,
+                    ByteCurve::fixed(item.bytes, maximum_pages), false, maximum_pages));
+            }
         }
     }
-    let inputs = glm::GlmInputs {
-        loaded_weights, drafter_weights,
-        resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), cfg: &cfg, layers: cfg.layers, gpus,
-        headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: false, native_workspace: 0,
-        native_dense: core.map(|c| c.bytes(cfg.hidden)).transpose()?.unwrap_or_default(),
-        native_head: core.is_some_and(|c| c.ranks[0].target_head.is_some()), skip_routed_experts: false, prefill_rows: rows, prefill_lanes: lanes,
-        max_context: context, automatic_context: options.context_tokens == 0, scratch, drafter_bytes: draft, drafter_staging: draft_staging, pending_code: Vec::new(),
-        experts: local.as_ref().map_or_else(Vec::new, |l| l.experts.clone()), expert_workspace: 0,
-        tp2_workspace, requested_pool: options.pool_tokens,
-        onboard, full_prefill_logits: options.full_prefill_logits,
-        context: context_programs };
-    // Auto resolves in the solver (context where the build carries its programs), as at runtime.
-    Ok(glm::solve_working_set(&inputs, serial_workspace, report.requested_attention)?)
+    let (decode_link, prefill_link) = production_links(&cfg, spark_ranks, prefill,
+        if checkpoint.spark_input_is_bf16() { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 },
+        cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+        options.spark_reply_formats)?;
+    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory)?;
+    let budgets = production_budgets(&options.rtx_bytes[..gpus].iter().map(|&n| (n, n)).collect::<Vec<_>>(),
+        options.headroom_bytes, host, (8 << 30).max(host.0 / 10), &vec![options.spark_bytes; spark_ranks])?;
+    let request = production_request(context, options.pool_tokens, onboard, prefill, operation,
+        crate::placement::ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
+    let admitted = ProductionInput { cfg: &cfg, layers: cfg.layers, context, maximum_pool_tokens,
+        attention, gpus, prefill, target, draft, scratch: scratch.unwrap_or_default(), context_scratch: context_programs,
+        exchange_element_bytes: if exchange_f32 { 4 } else { 2 }, peer_diagnostics: false,
+        local: source.as_ref().map(|source| (source, physical)), spark_ranks, decode_link, prefill_link,
+        skip_routed_experts: false, operation, sync_upload_bytes: 0, owners: additional, budgets,
+    }.prepare()?.admit(request)?;
+    Ok((admitted, prefix_quota))
 }
 
 /// Native EXLR8 uses the ordinary GLM solver and coordinator shared ownership.
