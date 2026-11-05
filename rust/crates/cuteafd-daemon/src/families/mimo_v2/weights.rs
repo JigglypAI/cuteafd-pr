@@ -688,8 +688,6 @@ impl<'a> MimoLoader<'a> {
     /// The BF16 o_proj `[H, heads * v_head]` sliced by columns over `ranks`
     /// (rank `r`'s heads). The final operands own BF16 values only.
     fn o_proj(&self, name: &str, ranks: usize) -> Result<Vec<DeviceAllocation<'a>>> {
-        ensure!(!self.dense.pushing() && !crate::shared::experts::rtx::dense::is_recording(),
-            "{}: this representation loads through the mount", name);
         let tensor = self.tensor(name)?;
         if ranks == 1 && tensor.meta.dtype != DType::Bf16 {
             return Ok(vec![self.rows(&[name.to_string()])?]);
@@ -699,54 +697,13 @@ impl<'a> MimoLoader<'a> {
             "{name}: a head split takes o_proj as BF16 [H, K] with K a multiple of {}, found {:?} {shape:?}",
             ranks * 128, tensor.meta.dtype);
         let (rows, cols) = (shape[0], shape[1] / ranks);
-        // The whole weight goes up once to rank 0; each rank's columns are a pitched
-        // device copy from it (over peer memory for the others).
-        let whole = crate::shared::memory::staging::with_staging(tensor.meta.byte_length as usize, |bytes| {
-            self.read_into(name, bytes, 0)?;
-            self.upload(bytes)
-        })?;
-        let mut whole = Some(whole);
-        let mut completed = Vec::with_capacity(ranks);
-        for rank in 0..ranks {
-            let operand = self.on_rank(rank, |stream| {
-                if ranks == 1 {
-                    // One GPU: the uploaded weight itself.
-                    let out = whole.take().context("o_proj")?;
-                    return Ok(out);
-                }
-                let source_allocation = whole.as_ref().context("o_proj")?;
-                let out = DeviceAllocation::new(self.library, rows * cols * 2)?;
-                let source = CuteafdDeviceBuffer {
-                    // SAFETY: column block `rank` of every row lies inside the whole weight.
-                    ptr: unsafe { source_allocation.buffer.ptr.cast::<u8>().add(rank * cols * 2) }.cast(),
-                    bytes: source_allocation.buffer.bytes - rank * cols * 2,
-                    ..source_allocation.buffer
-                };
-                // SAFETY: both buffers are live and sized for these pitched spans; peer access to
-                // rank 0 is enabled on every rank (the engine's split setup), drained below.
-                let queued = unsafe {
-                    self.library.copy_d2d_2d_async(out.buffer, cols * 2, source, shape[1] * 2, cols * 2, rows, stream)
-                };
-                // SAFETY: the loader owns this stream; the copy reads `whole`, which drops after.
-                if let Err(drain) = unsafe { self.library.cuda_stream_synchronize(stream) } {
-                    self.library.quarantine_module_after_failed_drain();
-                    std::mem::forget(out);
-                    std::mem::forget(whole.take());
-                    // cudaFree of a completed rank's independent output can still
-                    // synchronize with this pending peer copy. Retain every split
-                    // output on the unproved path so error return cannot block on
-                    // unrelated allocation destruction.
-                    std::mem::forget(std::mem::take(&mut completed));
-                    return Err(queued.err().unwrap_or_else(|| anyhow::anyhow!("split projection completion failed"))
-                        .context(format!("split projection owners and native module quarantined after failed drain: {drain}")));
-                }
-                queued?;
-                Ok(out)
-            })?;
-            completed.push(operand);
-        }
-        drop(whole);
-        Ok(completed)
+        ensure!(shape[0].checked_mul(shape[1]).and_then(|n| n.checked_mul(2))
+            .is_some_and(|bytes| bytes as u64 == tensor.meta.byte_length),
+            "{name}: BF16 bytes disagree with output projection shape");
+        (0..ranks).map(|rank| {
+            let rect = self.rect(name, None, Some(rank * cols * 2..(rank + 1) * cols * 2))?;
+            self.landed(rank, vec![(rect, 0)], rows * cols * 2, &[])
+        }).collect()
     }
 
     /// The FP8 checkpoint weights `names` concatenated by rows (as

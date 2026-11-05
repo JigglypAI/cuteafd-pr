@@ -234,28 +234,39 @@ fn later_tensor_error_cannot_release_an_earlier_queued_dequant() -> Result<()> {
 
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
-fn split_copy_failure_drains_before_releasing_source_or_destination() -> Result<()> {
-    for drain in [0, 1] {
-        let fixture = Fixture::build()?;
-        let library = fixture.load()?;
-        fixture.configure_pack(&library, 1, drain)?;
-        let checkpoint = checkpoint(&fixture, &[("weight", DType::Bf16, &[8, 256])])?;
-        let formats = BTreeMap::new();
-        let result = loader(&library, &checkpoint, &formats).o_proj("weight", 2);
-        assert!(result.is_err());
-        drop(result);
-        drop(library);
-        let events = fixture.events()?;
-        assert_eq!(count(&events, 'C'), 1, "{events}");
-        assert_eq!(count(&events, 'S'), 1, "{events}");
-        if drain == 0 {
-            assert_eq!(count(&events, 'd'), 2, "{events}");
-            assert!(events.find('S') < events.find('d'), "{events}");
-            assert!(events.ends_with("FU"), "{events}");
-            assert!(!fixture.resident()?);
-        } else {
-            assert!(!events.contains(['d', 'F', 'U']), "{events}");
-            assert!(fixture.resident()?);
+fn bf16_output_projection_records_column_shares_and_replays_mount_bytes() -> Result<()> {
+    use crate::shared::{experts::rtx::dense, memory::device::Device};
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    fixture.immediate_copies(&library)?;
+    for device in 0..2 { fixture.configure_memory(&library, device, 1 << 30)?; }
+    let checkpoint = checkpoint(&fixture, &[("weight", DType::Bf16, &[8, 256])])?;
+    let path = checkpoint.snapshot.join("weights.bin");
+    let payload: Vec<_> = (0..8 * 256 * 2).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &payload)?;
+    let formats = BTreeMap::new();
+    for ranks in [1, 2] {
+        let mounted = loader(&library, &checkpoint, &formats).o_proj("weight", ranks)?;
+        std::fs::write(&path, [])?;
+        let load = std::rc::Rc::new(dense::DenseLoad::push(&library));
+        let planning = MimoLoader { dense: load.clone(), ..loader(&library, &checkpoint, &formats) };
+        let (pushed, mut records) = dense::recording(|| planning.o_proj("weight", ranks))?;
+        records.extend(load.sink.as_ref().unwrap().take_all());
+        assert_eq!(records.operands.len(), ranks);
+        assert!(records.steps.is_empty() && records.finishes.is_empty());
+        std::fs::write(&path, &payload)?;
+        let sockets = tempfile::tempdir_in(fixture.directory())?;
+        for rank in 0..ranks {
+            crate::shared::experts::rtx::push::tests::receive_pushed(
+                Device { library: &library, id: rank as i32 }, None, &checkpoint.snapshot,
+                sockets.path(), &records, None, 0, rank)?;
+            let expected: Vec<_> = payload.chunks_exact(256 * 2).flat_map(|row|
+                row[rank * 256 * 2 / ranks..(rank + 1) * 256 * 2 / ranks].iter().copied()).collect();
+            for allocation in [&mounted[rank], &pushed[rank]] {
+                let mut actual = vec![0; expected.len()];
+                library.copy_d2h(&mut actual, allocation.buffer)?;
+                assert_eq!(actual, expected);
+            }
         }
     }
     Ok(())
@@ -263,36 +274,8 @@ fn split_copy_failure_drains_before_releasing_source_or_destination() -> Result<
 
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
-fn failed_peer_copy_drain_retains_all_split_outputs_without_calling_free() -> Result<()> {
-    let fixture = Fixture::build()?;
-    let library = fixture.load()?;
-    fixture.configure_pack(&library, 0, 1)?;
-    fixture.configure_drain_after(&library, 1)?;
-    let checkpoint = checkpoint(&fixture, &[("weight", DType::Bf16, &[8, 256])])?;
-    let formats = BTreeMap::new();
-    // A preceding layer's unrelated owners also unwind after a loader error.
-    // Their frees must not synchronize with the failed peer's queued work.
-    let preceding_layer = DeviceAllocation::new(&library, 512)?;
-    let preceding_pin = crate::shared::memory::HostAllocation::new(&library, 512)?;
-    let result = loader(&library, &checkpoint, &formats).o_proj("weight", 2);
-    assert!(result.is_err());
-    drop(result);
-    drop(preceding_layer);
-    drop(preceding_pin);
-    drop(library);
-    let events = fixture.events()?;
-    assert_eq!((count(&events, 'D'), count(&events, 'C'), count(&events, 'S')), (4, 2, 2), "{events}");
-    assert_eq!(count(&events, 'd'), 0,
-        "even a completed rank's cudaFree can synchronize with pending peer work: {events}");
-    assert!(!events.contains(['F', 'U']), "{events}");
-    assert!(fixture.resident()?);
-    Ok(())
-}
-
-#[test]
-#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn successful_loaders_reclaim_storage_and_unload_normally() -> Result<()> {
-    for path in 0..3 {
+    for path in 0..2 {
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
         let checkpoint = if path == 0 {
@@ -305,7 +288,6 @@ fn successful_loaders_reclaim_storage_and_unload_normally() -> Result<()> {
         let preceding_pin = crate::shared::memory::HostAllocation::new(&library, 512)?;
         match path {
             0 => drop(loader.rows(&["weight".into()])?),
-            1 => drop(loader.o_proj("weight", 2)?),
             _ => drop(loader.fp8_projection("weight", 1, false)?),
         }
         drop(preceding_layer);
