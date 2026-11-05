@@ -19,9 +19,7 @@ pub fn program_names(format: MlaCacheFormat) -> Vec<String> {
     let tag = if format == MlaCacheFormat::Fp8 { "_fp8" } else { "" };
     let mut names = vec!["kimik3_lse_combine2".into(), format!("kimik3_paged_staging_gather{tag}")];
     for head in [0, HEADS] {
-        for splits in [2, 16] {
-            names.push(format!("kimik3_mla_partial{tag}_h{head}_s{splits}_m64"));
-        }
+        names.push(format!("kimik3_mla_partial{tag}_h{head}_m64"));
     }
     names
 }
@@ -42,9 +40,12 @@ impl ContextLayout {
                 let bytes = entries[0]["scratch_bytes_at_capacity"]["scratch"].as_u64()
                     .with_context(|| format!("Kimi context missing {name} scratch extent"))?;
                 let bytes = usize::try_from(bytes).context("Kimi context scratch extent overflow")?;
-                let splits = if name.contains("_s16_") { 16 } else { 2 };
-                let expected = (ROWS * HEADS * splits * 512 * 2).next_multiple_of(1024)
-                    + ROWS * HEADS * splits * 4;
+                let geometry = &entries[0]["geometry"];
+                ensure!(geometry["num_splits"] == 16 && geometry["runtime_splits"] == true
+                    && geometry["lse_base2"] == true,
+                    "Kimi context {name} requires runtime splits (capacity 16) and base-2 LSE");
+                let expected = (ROWS * HEADS * 16 * 512 * 2).next_multiple_of(1024)
+                    + ROWS * HEADS * 16 * 4;
                 ensure!(bytes == expected, "Kimi context {name} scratch extent {bytes} differs from native {expected}");
                 scratch = scratch.max(bytes);
             }
@@ -84,14 +85,15 @@ impl ContextLayout {
 pub(crate) fn add_manifest_programs(manifest: &mut serde_json::Value) {
     for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
         for name in program_names(format) {
-            let splits = if name.contains("_s16_") { 16 } else { 2 };
+            let splits = 16;
             let bytes = if name.contains("_partial") {
                 (ROWS * HEADS * splits * 512 * 2).next_multiple_of(1024) + ROWS * HEADS * splits * 4
             } else { 0 };
             // Combine is shared by the two record formats.
             let programs = manifest["programs"].as_array_mut().unwrap();
             if !programs.iter().any(|p| p["name"] == name) {
-                programs.push(serde_json::json!({"name":name,"scratch_bytes_at_capacity":{"scratch":bytes}}));
+                programs.push(serde_json::json!({"name":name,"scratch_bytes_at_capacity":{"scratch":bytes},
+                    "geometry":{"num_splits":16,"runtime_splits":true,"lse_base2":true}}));
             }
         }
     }
@@ -141,7 +143,7 @@ mod tests {
                 .unwrap_err().to_string().contains(&name));
         }
         let mut bad = manifest.clone();
-        bad["programs"].as_array_mut().unwrap().iter_mut().find(|p| p["name"] == "kimik3_mla_partial_fp8_h0_s16_m64")
+        bad["programs"].as_array_mut().unwrap().iter_mut().find(|p| p["name"] == "kimik3_mla_partial_fp8_h0_m64")
             .unwrap()["scratch_bytes_at_capacity"]["scratch"] = 1.into();
         assert!(ContextLayout::from_manifest(&bad, MlaCacheFormat::Fp8, 1024, 64, 1).is_err());
         assert!(ContextLayout::from_manifest(&manifest, MlaCacheFormat::Fp8, usize::MAX, 64, 1).is_err());

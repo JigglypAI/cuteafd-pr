@@ -765,7 +765,7 @@ fn k6_max_context_plan_charges_parity_pool_and_each_shared_allocation() -> Resul
         for demand in demands.iter().filter(|d| u32::from(d.gpu) == device.index) {
             assert_eq!(device.items.iter().filter(|i| i.group == demand.group).map(|i| i.bytes).sum::<u64>(), demand.bytes);
         }
-        let kv = device.items.iter().filter(|i| i.category == Category::Kv && i.group.contains("MLA"))
+        let kv = device.items.iter().filter(|i| i.category == Category::Kv && i.group == "records")
             .map(|i| i.bytes).sum::<u64>();
         assert_eq!(kv, placed.pool_tokens * model.cfg.mla_layers() as u64 * MlaCacheFormat::Fp8.record_bytes() as u64 / 2);
     }
