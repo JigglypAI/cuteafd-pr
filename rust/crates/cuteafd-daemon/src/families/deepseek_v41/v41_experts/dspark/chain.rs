@@ -18,6 +18,27 @@ pub(crate) fn is_device_failure(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<cuteafd_ffi::NativeStatusError>())
 }
 
+/// Keep the device-tagged cause when only one side has it, and carry the other
+/// as context so neither failure is lost.
+pub(crate) fn prefer_device(first: anyhow::Error, second: anyhow::Error) -> anyhow::Error {
+    if is_device_failure(&second) && !is_device_failure(&first) {
+        second.context(format!("first failure: {first:#}"))
+    } else {
+        first.context(format!("second failure: {second:#}"))
+    }
+}
+
+/// Combine a launch result with the drain or capture result that follows it.
+/// Both are inspected: a plain launch error must not hide a tagged device error
+/// from the drain, which is what the liveness gate classifies on.
+fn settle(launched: Result<()>, drained: Result<()>) -> Result<()> {
+    match (launched, drained) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(first), Err(second)) => Err(prefer_device(first, second)),
+    }
+}
+
 /// A sticky terminal failure for a draft chain. A CUDA or replay error is not
 /// recoverable in-process, so the lane must fail the round instead of falling
 /// back to anchors forever with the error masked. Host-side invariant failures
@@ -426,7 +447,7 @@ impl DsparkChain<'_, '_> {
         self.upload(&reads, bindings)?;
         let launched = unsafe { self.enqueue(&reads, bindings[0].len()) };
         let drained = self.synchronize();
-        if let Err(error) = launched.and(drained) {
+        if let Err(error) = settle(launched, drained) {
             self.invalidate();
             return Err(error);
         }
@@ -481,7 +502,8 @@ impl DsparkChain<'_, '_> {
                 }
                 Err(error)
             }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(launched), Err(captured)) => Err(prefer_device(launched, captured)),
         }
     }
     /// # Safety
@@ -506,7 +528,7 @@ impl DsparkChain<'_, '_> {
                 .cuda_graph_launch(graph, self.stream.raw)
         };
         let drained = self.synchronize();
-        launched.and(drained)?;
+        settle(launched, drained)?;
         self.ready = Some(count);
         self.output()
     }

@@ -8,7 +8,9 @@ impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
     pub(crate) fn capture_startup(&mut self) -> Result<()> {
         ensure!(self.requests.is_empty() && self.pending.iter().all(Option::is_none),
             "draft startup requires no admitted requests");
-        for chain in &mut self.chains { chain.capture_startup(self.windows.each_ref())?; }
+        ensure!(self.windows.len() == 3, "distributed draft needs exactly three windows");
+        let windows = [&self.windows[0], &self.windows[1], &self.windows[2]];
+        for chain in &mut self.chains { chain.capture_startup(windows)?; }
         Ok(())
     }
     /// The returned owner scopes destruction to GPU1. Synchronous runtime methods
