@@ -1137,8 +1137,12 @@ pub(super) mod tests {
             let expected_kv = cfg.mla_layers() as u64 * admitted.placement.pool_tokens / 2 * format.record_bytes() as u64;
             for rank in 0..2 {
                 assert_eq!(admitted.mla_layouts[rank].bytes() as u64, expected_kv);
-                assert_eq!(admitted.placement.items[rank].iter().filter(|item| item.category == Category::Kv)
+                assert_eq!(admitted.placement.items[rank].iter().filter(|item| item.group == "records")
                     .map(|item| item.bytes).sum::<u64>(), expected_kv);
+                let kda_kv = admitted.kda_layout.demands(rank as u8)?.into_iter()
+                    .filter(|demand| demand.category == Category::Kv).map(|demand| demand.bytes).sum::<u64>();
+                assert_eq!(admitted.placement.items[rank].iter().filter(|item| item.category == Category::Kv)
+                    .map(|item| item.bytes).sum::<u64>(), expected_kv + kda_kv);
             }
             for demand in layout.buffers().demands()? {
                 assert_eq!(admitted.placement.items[demand.gpu as usize].iter().filter(|item| item.group == demand.group)
