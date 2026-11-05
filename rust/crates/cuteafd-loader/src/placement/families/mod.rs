@@ -59,9 +59,9 @@ pub const MIMO_V2: ExecutorModes = ExecutorModes { family: "mimo_v2", modes: &[L
 pub const QWEN4: ExecutorModes = ExecutorModes { family: "qwen4", modes: &[WHOLE0, WHOLE1],
     hops: true, attention: AttentionPlacement::Layers };
 
-/// Kimi: TP2 KDA, alternating whole MLA owners and split dense/shared FFNs.
+/// Kimi: TP2 KDA, whole-owned or context-split MLA and split dense/shared FFNs.
 pub const KIMI_K3: ExecutorModes = ExecutorModes { family: "kimi_k3",
-    modes: &[LayerMode::HeadSplit,
+    modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit,
         LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
         LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }],
     hops: true, attention: AttentionPlacement::Layers };
