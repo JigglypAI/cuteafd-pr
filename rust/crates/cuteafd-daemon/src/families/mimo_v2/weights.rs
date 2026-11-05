@@ -345,9 +345,28 @@ impl<'a> MimoLoader<'a> {
 
     /// The row-concatenation of 2-D `names` as one BF16 operand.
     fn rows(&self, names: &[String]) -> Result<DeviceAllocation<'a>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
+        let headers = names.iter().map(|name| self.tensor(name)).collect::<Result<Vec<_>>>()?;
+        if !headers.is_empty() && headers.iter().all(|t| t.meta.dtype == DType::Bf16) {
+            let mut lands = Vec::new();
+            let (mut bytes, mut cols) = (0usize, None);
+            for (name, tensor) in names.iter().zip(headers) {
+                let shape = &tensor.meta.shape;
+                ensure!(shape.len() == 2 && shape[0] > 0 && shape[1] > 0
+                    && cols.is_none_or(|width| width == shape[1]),
+                    "{names:?}: BF16 row operands require nonempty matrices sharing columns");
+                cols = Some(shape[1]);
+                let size = shape[0].checked_mul(shape[1]).and_then(|n| n.checked_mul(2))
+                    .context("row operand storage overflow")?;
+                ensure!(u64::try_from(size)? == tensor.meta.byte_length,
+                    "{name}: BF16 bytes disagree with row shape");
+                lands.push((self.rect(name, None, None)?, bytes));
+                bytes = bytes.checked_add(size).context("row operand storage overflow")?;
+            }
+            return self.landed(0, lands, bytes, &[]);
+        }
         ensure!(!self.dense.pushing() && !crate::shared::experts::rtx::dense::is_recording(),
             "{}: this representation loads through the mount", format!("{names:?}"));
-        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let tensors = names.iter().map(|n| self.raw(n).map(|t| (n, t))).collect::<Result<Vec<_>>>()?;
         ensure!(!tensors.is_empty() && tensors.iter().all(|(_, (_, _, s))| s.len() == 2 && s[0] > 0 && s[1] > 0),
             "{names:?}: row operands require nonempty two-dimensional tensors");

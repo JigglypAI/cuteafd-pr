@@ -98,17 +98,20 @@ fn predictor_and_embedding_record_before_commit_and_replay_mount_bytes() -> Resu
         Ok(out)
     };
     let expected = digests(&mounted[0])?;
+    let (mounted_target, _) = mounted_loader.model(&cfg, 0)?;
+    let MimoHead::Bf16(mounted_head) = &mounted_target.head else { unreachable!() };
+    let expected_head = super::super::coordinator_golden_tests::digest(&library, mounted_head.buffer)?;
     let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == "model.embed_tokens.weight").unwrap();
     let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, 256)?;
     let (mounted_embedding, ()) = TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Gpu, || Ok(()))?;
     assert_eq!(mounted_embedding.verify_resident()?, 256 * 256 * 2);
     // Recording must succeed with missing payload bytes, on either target layout.
     std::fs::write(&path, [])?;
-    for peers in [0, 1] {
+    for (peers, fp8_head) in [(0, false), (1, false), (0, true), (1, true)] {
         let load = std::rc::Rc::new(dense::DenseLoad::push(&library));
         let mut planning = loader(&library, &checkpoint, &formats);
         planning.peers.truncate(peers);
-        planning.fp8_head = true;
+        planning.fp8_head = fp8_head;
         planning.dense = load.clone();
         let empty = planning.mtp_weights(&cfg, 0)?;
         assert!(empty.is_empty());
@@ -141,6 +144,13 @@ fn predictor_and_embedding_record_before_commit_and_replay_mount_bytes() -> Resu
             Device { library: &library, id: 0 }, None, &checkpoint.snapshot, sockets.path(), &records, None, 0, 0)?;
         planning.release_transient();
         assert_eq!(digests(&predictors[0])?, expected);
+        if !fp8_head {
+            let MimoHead::Bf16(head) = &target.0.head else { panic!("Flash must retain its BF16 head") };
+            assert_eq!(super::super::coordinator_golden_tests::digest(&library, head.buffer)?, expected_head);
+            assert!(records.operands.iter().any(|o| o.buffer.ptr == head.buffer.ptr
+                && o.lands.iter().any(|(rect, _)| rect.name == "lm_head.weight")),
+                "BF16 head must land directly through the committed push group");
+        }
         assert_eq!(embedding.verify_resident()?, 256 * 256 * 2);
         std::fs::write(&path, [])?;
     }
