@@ -182,7 +182,12 @@ fn size_draft_window_marks(resolved: &mut super::ResolvedEngineArgs, prefix: &Pr
     if args.dspark && prefix.prefix_cache_entries > 0 {
         let layout = cuteafd_loader::placement::families::glm5::ml4_draft_layout(&args.snapshot,
             args.draft_context_slots.unwrap_or(20), args.draft_sequences, args.max_context, 1)?;
-        args.draft_window_marks = prefix.mark_rule(max_sequences)
+        let mut rule = prefix.mark_rule(max_sequences);
+        let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement)
+            .map_err(anyhow::Error::msg)?.unwrap_or(cuteafd_loader::placement::AttentionPlacement::Context);
+        rule.host = cuteafd_loader::families::glm5::host_prefix_enabled(
+            if args.split_device.is_some() { 2 } else { 1 }, attention, rule.host, rule.entries as u64);
+        args.draft_window_marks = rule
             .slots(cuteafd_loader::placement::families::glm5::draft_window_mark_bytes(&layout)?);
     }
     Ok(())
@@ -481,8 +486,6 @@ impl Trace {
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator).
 fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs, _concurrency: usize)
     -> Result<(GlmPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
-    let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_capacity() } else { 64 },
-        engine.prefill_rows, engine.cfg.vocab_size)?;
     let entries = args.prefix_cache_entries;
     let family = GlmPrefix::new(engine, args.prefix_partial == Toggle::On, engine.draft_window_marks)?;
     let template = engine.paged_buffers().iter().find_map(|(records, _)| records.map(|(buffer, _)| buffer))
@@ -1511,7 +1514,8 @@ mod draft_tests {
         for context in [0usize, 1_048_576] {
             let mut args = Cli::try_parse_from(["test", "--snapshot", dir.path().to_str().unwrap(),
                 "--native-lib", "/unused", "--manifest", manifest.to_str().unwrap(),
-                "--max-context", &context.to_string(), "--dspark", "--max-sequences", "16"])?.args;
+                "--max-context", &context.to_string(), "--dspark", "--max-sequences", "16",
+                "--host-cache-bytes", "auto"])?.args;
             args.prefix.resolve_entries(args.max_sequences.unwrap());
             let mut resolved = super::super::ResolvedEngineArgs::new(&args.engine)?;
             assert_eq!(resolved.args.max_context, 1_048_576);
@@ -1522,6 +1526,18 @@ mod draft_tests {
             size_draft_window_marks(&mut resolved, &args.prefix, args.max_sequences.unwrap())?;
             assert!(resolved.args.draft_window_marks > 0);
             census.push((resolved.args.max_context, resolved.args.draft_window_marks));
+            resolved.args.split_device = Some(1);
+            resolved.args.attention_placement = "heads".into();
+            size_draft_window_marks(&mut resolved, &args.prefix, args.max_sequences.unwrap())?;
+            let layout = cuteafd_loader::placement::families::glm5::ml4_draft_layout(&resolved.args.snapshot,
+                resolved.args.draft_context_slots.unwrap_or(20), resolved.args.draft_sequences,
+                resolved.args.max_context, 1)?;
+            let mut rule = args.prefix.mark_rule(args.max_sequences.unwrap());
+            rule.host = false;
+            assert_eq!(resolved.args.draft_window_marks, rule.slots(
+                cuteafd_loader::placement::families::glm5::draft_window_mark_bytes(&layout)?));
+            assert!(resolved.args.draft_window_marks > census.last().unwrap().1);
+
             let pool_context = crate::shared::context::pool_context("glm5", resolved.args.max_context,
                 resolved.automatic_context, 524_288, 256);
             if context == 0 { assert_eq!(pool_context?, 524_032); }

@@ -65,6 +65,7 @@ fn request() -> Request {
 }
 fn decisions(onboard: u64) -> Decisions {
     Decisions {
+        encoder: None,
         spark_reply_formats: None,
         attention: vec![LayerMode::Whole {
             gpu: 0,
@@ -143,6 +144,7 @@ fn plan(allocations: Vec<Allocation>) -> ResolvedPlan {
     let facts = facts(allocations);
     let phases = evaluate(&facts, &budgets).unwrap();
     ResolvedPlan {
+        encoder_diagnostics: vec![],
         request: request(),
         decisions: decisions(0),
         pool_tokens: 64,
@@ -2386,4 +2388,36 @@ fn analytical_weight_cap_rejects_alias_duplicate_unknown_home_and_overflow() {
     overflow.components.push(resource("loaded.a", 0, u64::MAX, overflow.maximum_pages));
     overflow.components.push(resource("loaded.b", 0, 1, overflow.maximum_pages));
     assert!(matches!(solve(request(), vec![budget(1 << 30)], &Prepared(overflow)), Err(Refusal::Overflow(_))));
+}
+
+#[test]
+fn encoder_priority_follows_pool_and_onboarding_before_slack() {
+    struct WithEncoder;
+    impl Recipe for WithEncoder {
+        fn prepare(&self, request: &Request) -> Result<Contract, Refusal> {
+            let mut base = Linear::new();
+            base.maximum = 128;
+            base.onboard = 1;
+            let mut contract = base.prepare(request)?;
+            let variable = contract.variables.len();
+            contract.variables.push(Variable::Encoder(vec![0, 1]));
+            let mut tower = Component::allocation(allocation("tower", 64),
+                ByteCurve::fixed(64, 2), false, 2);
+            tower.activation = Activation::choice(variable, 0);
+            contract.components.push(tower);
+            Ok(contract)
+        }
+    }
+    let roomy = solve(request(), vec![budget(256)], &WithEncoder).unwrap();
+    assert_eq!(roomy.pool_tokens, 128);
+    assert_eq!(roomy.decisions.onboard_layers, vec![vec![0]]);
+    assert_eq!(roomy.decisions.encoder, Some(0), "encoder wins over extra slack");
+    let tight = solve(request(), vec![budget(192)], &WithEncoder).unwrap();
+    assert_eq!(tight.pool_tokens, 128);
+    assert_eq!(tight.decisions.onboard_layers, vec![vec![0]]);
+    assert_eq!(tight.decisions.encoder, Some(1), "onboarding wins over optional encoder");
+    assert_eq!(tight.encoder_diagnostics[0].1, 64);
+    let tighter = solve(request(), vec![budget(128)], &WithEncoder).unwrap();
+    assert_eq!(tighter.pool_tokens, 128, "pool wins over optional encoder");
+    assert_eq!(tighter.decisions.encoder, Some(1));
 }

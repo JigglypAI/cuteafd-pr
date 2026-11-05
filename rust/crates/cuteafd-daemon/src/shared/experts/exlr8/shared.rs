@@ -103,6 +103,16 @@ impl<'a> NativeExperts<'a> {
 
     pub(crate) fn load(library: &'a NativeLibrary, plan: NativePlan) -> Result<Self> {
         plan.admit_host()?;
+        Self::load_inner(library, plan)
+    }
+
+    pub(crate) fn load_admitted(library: &'a NativeLibrary, plan: NativePlan,
+        admission: &cuteafd_loader::placement::families::glm5::admission::NativeLoad) -> Result<Self> {
+        admission.validate_shared(plan.residency())?;
+        Self::load_inner(library, plan)
+    }
+
+    fn load_inner(library: &'a NativeLibrary, plan: NativePlan) -> Result<Self> {
         let NativePlan {
             plans,
             family,

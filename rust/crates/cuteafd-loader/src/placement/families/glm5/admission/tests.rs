@@ -192,6 +192,15 @@ fn native_load_keeps_exact_banks_and_serializes_ranks_without_host_cache_double_
     assert_eq!(DensePlan::mount_staging_bytes(&refs).unwrap(), (2 << 20, 16 << 20));
     assert!(DensePlan::mount_staging_bytes(&[&dense[1], &dense[0]]).is_err());
     let mount = NativeLoad::new(&refs, &vocabulary, &plans, LocalStorage::Mount).unwrap();
+    mount.validate_vocabulary(0).unwrap();
+    assert!(mount.validate_vocabulary(1).is_err());
+    for plan in &plans { mount.validate_shared(plan).unwrap(); }
+    let mut changed = plans[0].clone();
+    changed[0].staging_bytes += 1;
+    assert!(mount.validate_shared(&changed).is_err());
+    changed[0].staging_bytes -= 1;
+    changed[0].world = 1;
+    assert!(mount.validate_shared(&changed).is_err());
     assert_eq!(mount.groups.len(), 33);
     assert_eq!(mount.groups[0].members.len(), 1);
     assert_eq!(mount.groups[0].peak(), 2 << 20,
@@ -473,6 +482,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
         spark_links: true,
         prefill,
         lanes: vec![1],
+        encoders: vec![], media_cache_bytes: 0,
         embedding: vec![EmbeddingHome::Device(0), EmbeddingHome::HostPinned],
         experts: Some(ExpertProfile {
             layers: vec![1],
@@ -486,7 +496,6 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
         weights: vec![],
         graphs: vec![],
         host: None,
-        returns: vec![],
         owners: vec![],
     };
     for &shape in &recipe.prefill {
@@ -1177,7 +1186,9 @@ fn maintained_graph_figures_cover_every_placement_without_an_automatic_growth_ma
                 let source = if gpus == 1 { GLM_MIN_GRAPH } else { GLM_MAX_GRAPH[rank] };
                 let keys = if rank == 0 { 16_827u128 } else { 16_614 };
                 assert_eq!(u128::from(figure.bytes),
-                    (u128::from(source.bytes) * graphs.declared()[rank].len() as u128).div_ceil(keys));
+                    (u128::from(source.bytes) * if attention == AttentionPlacement::Layers {
+                        (layers.len() * glm_graph_shapes(context as usize, floor).len()) as u128
+                    } else { graphs.declared()[rank].len() as u128 }).div_ceil(keys));
                 for pages in [1, floor as u64, 32768] {
                     assert_eq!(component.bytes.at(pages).unwrap(), figure.bytes);
                 }
@@ -1217,6 +1228,15 @@ fn measured_reference_figures_match_independently_declared_min_max_sets() {
         };
         assert!(!allowance.assumed);
         assert_eq!(allowance.bytes, GLM_MAX_GRAPH[rank].bytes);
+    }
+    let mut owned = max_layers.clone();
+    for (layer, spec) in owned.iter_mut().enumerate() { spec.attention_owner = Some((layer % 2) as u8); }
+    let layers = StartupGraphs::new(1 << 20, AttentionPlacement::Layers, 2, &owned, 6).unwrap();
+    for rank in 0..2 {
+        assert!(layers.declared()[rank].len() > max.declared()[rank].len() * 2);
+        assert!(layers.figures()[rank].bytes <= GLM_MAX_GRAPH[rank].bytes);
+        assert!(layers.figures()[rank].bytes > GLM_MAX_GRAPH[rank].bytes * 9 / 10);
+        assert!(matches!(layers.figures()[rank].attribution, FigureAttribution::Estimated { .. }));
     }
     // Equal counts are not graph-set identity: heads and context have different tables.
     let heads = StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 2, &max_layers, 6).unwrap();
@@ -1865,172 +1885,6 @@ fn composition_refuses_mismatched_geometry_domains_and_non_target_experts() {
 }
 
 #[test]
-fn phase_returns_compose_per_physical_link_and_retain_bf16_fallback() {
-    use cuteafd_core::SparkReplyFormat::{Bf16, Fp8, Nvfp4};
-    let cfg = cfg();
-    let mut recipe = recipe(&cfg);
-    for (link, ranks) in [vec![0, 1], vec![2, 3]].into_iter().enumerate() {
-        recipe.returns.push(Case {
-            when: vec![],
-            value: ReplyReturns {
-                id: format!("returns.decode.{link}"),
-                device: 0,
-                ranks: ranks.clone(),
-                phase: ReplyPhase::Decode,
-            },
-        });
-        for &shape in &recipe.prefill {
-            recipe.returns.push(Case {
-                when: vec![When::Prefill(shape)],
-                value: ReplyReturns {
-                    id: format!("returns.prefill.{link}"),
-                    device: 0,
-                    ranks: ranks.clone(),
-                    phase: ReplyPhase::Prefill(shape),
-                },
-            });
-        }
-    }
-    for prefill in [Bf16, Fp8, Nvfp4] {
-        for decode in [Bf16, Fp8, Nvfp4] {
-            for &shape in &recipe.prefill {
-                let request = Request {
-                    onboard: Pin::Exact(1),
-                    prefill: Pin::Exact(shape),
-                    spark_reply_formats: SparkReplyFormats {
-                        prefill: Some(prefill),
-                        decode: Some(decode),
-                    },
-                    ..request()
-                };
-                let plan = planner::solve(request, budgets(), &recipe).unwrap();
-                assert_eq!(
-                    plan.decisions.spark_reply_formats,
-                    Some(SparkReplyFormats {
-                        prefill: Some(prefill),
-                        decode: Some(decode)
-                    })
-                );
-                let returns: Vec<_> = plan
-                    .facts
-                    .allocations
-                    .iter()
-                    .filter(|a| a.id.starts_with("returns."))
-                    .collect();
-                assert_eq!(
-                    returns.len(),
-                    8,
-                    "two links per phase, two rank reserves per link"
-                );
-                for phase in ["decode", "prefill"] {
-                    let rows = if phase == "decode" {
-                        64
-                    } else {
-                        shape.rows * shape.waves
-                    };
-                    let expected = cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
-                        rows * cfg.hidden as u64 * 2,
-                    )
-                    .unwrap();
-                    let owners: Vec<_> = returns
-                        .iter()
-                        .filter(|a| a.id.starts_with(&format!("returns.{phase}.")))
-                        .collect();
-                    assert_eq!(owners.len(), 4);
-                    assert!(owners.iter().all(|a| a.bytes == expected
-                        && a.location == Location::coordinator(0)
-                        && a.view.is_none()));
-                    assert_eq!(owners.iter().map(|a| a.bytes).sum::<u64>(), 4 * expected);
-                }
-                assert_eq!(plan.decisions.onboard_layers, vec![vec![1], vec![1]]);
-                assert!(
-                    !plan
-                        .facts
-                        .allocations
-                        .iter()
-                        .any(|a| a.id.contains("codec"))
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn return_owners_refuse_wrong_domains_links_and_duplicate_backings() {
-    let cfg = cfg();
-    let mut recipe = recipe(&cfg);
-    let shape = recipe.prefill[0];
-    let good = Case {
-        when: vec![When::Prefill(shape)],
-        value: ReplyReturns {
-            id: "returns.prefill".into(),
-            device: 0,
-            ranks: vec![0, 1],
-            phase: ReplyPhase::Prefill(shape),
-        },
-    };
-    for bad in [
-        Case {
-            when: vec![],
-            ..good.clone()
-        },
-        Case {
-            value: ReplyReturns {
-                device: 2,
-                ..good.value.clone()
-            },
-            ..good.clone()
-        },
-        Case {
-            value: ReplyReturns {
-                ranks: vec![1, 1],
-                ..good.value.clone()
-            },
-            ..good.clone()
-        },
-        Case {
-            value: ReplyReturns {
-                ranks: vec![8],
-                ..good.value.clone()
-            },
-            ..good.clone()
-        },
-        Case {
-            value: ReplyReturns {
-                ranks: vec![],
-                ..good.value.clone()
-            },
-            ..good.clone()
-        },
-        Case {
-            value: ReplyReturns {
-                id: String::new(),
-                ..good.value.clone()
-            },
-            ..good.clone()
-        },
-    ] {
-        recipe.returns = vec![bad];
-        assert!(matches!(
-            recipe.prepare(&request()),
-            Err(Refusal::InvalidFact(_))
-        ));
-    }
-    recipe.returns = vec![good.clone()];
-    recipe.spark_links = false;
-    assert!(matches!(
-        recipe.prepare(&request()),
-        Err(Refusal::InvalidFact(_))
-    ));
-    recipe.spark_links = true;
-    recipe.returns = vec![good.clone(), good];
-    assert!(matches!(
-        planner::solve(request(), budgets(), &recipe),
-        Err(Refusal::InvalidFact(_))
-    ));
-}
-
-#[test]
 fn resident_cap_counts_target_draft_and_asymmetric_expert_owners_not_storage() {
     use crate::placement::ResidentWeights;
     let cfg = cfg();
@@ -2124,4 +1978,66 @@ fn resident_cap_counts_target_draft_and_asymmetric_expert_owners_not_storage() {
             limit: 28671
         })
     ));
+}
+
+#[test]
+fn bf16_target_receipt_matches_selected_physical_representation() {
+    use crate::plan::{testing, Checkpoint};
+    let (config, tensors) = testing::glm5_compact_weights();
+    let tensors = tensors.into_iter().filter(|t| !t.0.ends_with("_scale_inv"))
+        .map(|(name, dtype, shape)| (name, if dtype == "F8_E4M3" { "BF16" } else { dtype }, shape)).collect::<Vec<_>>();
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_snapshot(dir.path(), &config, &tensors, None);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let mut totals = Vec::new();
+    for bf16 in [false, true] {
+        let target = TargetFacts::checkpoint(&checkpoint, 2, 2, None, bf16,
+            &[EmbeddingHome::Device(0), EmbeddingHome::HostPinned], None).unwrap();
+        let device = target.device_weight_bytes(EmbeddingHome::Device(0)).unwrap();
+        let host = target.device_weight_bytes(EmbeddingHome::HostPinned).unwrap();
+        assert_eq!(device[0] - host[0], 64 * 256 * 2);
+        assert_eq!(device[1], host[1]);
+        assert!(target.device_weight_bytes(EmbeddingHome::Device(1)).is_err());
+        let groups = target.weights[0].1.resident_groups().unwrap();
+        assert_eq!(device, groups.iter().map(|rank| rank.iter().map(|entry| entry.2).sum()).collect::<Vec<u64>>());
+        totals.push(device.into_iter().sum::<u64>());
+    }
+    assert!(totals[1] > totals[0], "native BF16 must not use the FP8 admission");
+}
+
+#[test]
+fn scoring_host_output_is_additional_to_text_only_rss() {
+    let cfg = cfg();
+    let shape = PrefillShape { rows: 128, waves: 3 };
+    let mut input = production_input(&cfg, 2, 4, shape);
+    input.operation = Operation::Scoring;
+    let mut scoring = request();
+    scoring.operation = Operation::Scoring;
+    let admitted = input.prepare().unwrap().admit(scoring).unwrap();
+    let owner = admitted.solved.facts.allocations.iter().find(|owner| owner.id == "glm.scoring.host_logits").unwrap();
+    assert_eq!(owner.location, Location::HOST);
+    assert_eq!(owner.bytes, cuteafd_core::memory_layout::host_logits_bytes(128, 128, cfg.vocab_size as u64).unwrap());
+}
+
+#[test]
+fn optional_encoder_is_selected_jointly_and_never_uses_absent_spark_workers() {
+    use crate::plan::encoder::{EncoderKind, EncoderPlacement};
+    let cfg = cfg();
+    let mut recipe = recipe(&cfg);
+    let off = EncoderPlacement { kind: EncoderKind::Off, weights: 0, scratch: 0, replicas: vec![], reason: "off".into(), shortfall: 0 };
+    recipe.encoders = vec![EncoderPlacement { kind: EncoderKind::Rtx { gpu: 1 }, weights: 1 << 50, scratch: 0,
+        ..off.clone() }, off.clone()];
+    let solved = planner::solve(request(), budgets(), &recipe).unwrap();
+    assert_eq!(solved.decisions.encoder, Some(1));
+    assert_eq!(solved.encoder_diagnostics.len(), 1);
+    assert!(solved.encoder_diagnostics[0].0.contains(&format!("during {}", Phase::Load)), "{:?}", solved.encoder_diagnostics);
+    assert!(solved.encoder_diagnostics[0].1 > 0);
+    assert!(!solved.facts.allocations.iter().any(|owner| owner.id.starts_with("glm.encoder")));
+    recipe.encoders.pop();
+    assert!(planner::solve(request(), budgets(), &recipe).is_err(), "explicit oversized encoder must refuse");
+    recipe.encoders = vec![EncoderPlacement { kind: EncoderKind::Spark { rank: 0 }, weights: 256, ..off.clone() }, off];
+    let mut pinned = request();
+    pinned.onboard = Pin::Exact(recipe.experts.as_ref().unwrap().layers.len() as u64);
+    let solved = planner::solve(pinned, budgets(), &recipe).unwrap();
+    assert_eq!(solved.decisions.encoder, Some(1));
 }

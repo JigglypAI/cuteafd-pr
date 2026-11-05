@@ -317,6 +317,7 @@ pub struct Decisions {
     pub onboard_layers: Vec<Vec<usize>>,
     pub expert_homes: BTreeMap<usize, ExpertDestination>,
     pub embedding: Option<EmbeddingHome>,
+    pub encoder: Option<usize>,
     pub prefill: PrefillShape,
     pub lanes: u64,
     /// Resolved at preparation; None means this contract has no Spark link.
@@ -437,6 +438,8 @@ pub struct PhaseBudget {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedPlan {
+    /// Rejected earlier encoder choices at the admitted pool and onboarding.
+    pub encoder_diagnostics: Vec<(String, u64)>,
     pub request: Request,
     pub decisions: Decisions,
     pub pool_tokens: u64,

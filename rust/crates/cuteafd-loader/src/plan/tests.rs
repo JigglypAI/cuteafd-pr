@@ -5572,3 +5572,21 @@ fn release_smoke_prefix_working_set_geometry_ceilings() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn glm_tied_embedding_keeps_device_owner_in_shared_admission() {
+    use cuteafd_core::memory_layout::Category;
+    let mut config = glm5_config();
+    config["tie_word_embeddings"] = json!(true);
+    let dir = snapshot(config, &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![96 << 30], context_tokens: 65536, glm5_drafter_disabled: true,
+        host_embedding: true, host_memory: Some((128 << 30, 128 << 30)), ..Default::default()
+    }), ..sparks(4) }).unwrap();
+    assert!(!report.fits);
+    assert!(report.placement_supported, "{:?}", report.hints);
+    let memory = report.memory_layout.unwrap();
+    assert!(memory.notes.iter().any(|note| note.contains("GPU residency retained")));
+    assert!(memory.devices[0].by_category()[&Category::Embedding] > 0);
+    assert!(report.host_ledger.is_none());
+}

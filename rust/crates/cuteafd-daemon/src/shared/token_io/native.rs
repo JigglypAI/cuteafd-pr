@@ -253,6 +253,19 @@ impl<'a> NativeVocabulary<'a> {
         library: &'a NativeLibrary, programs: &'a Programs<'a>, plan: VocabularyPlan,
         host_available: usize, device_reserved: usize, host_reserved: usize, embedding_device: i32,
     ) -> Result<Option<Self>> {
+        Self::load_inner(library, programs, plan, embedding_device,
+            Some((host_available, device_reserved, host_reserved)))
+    }
+
+    pub(crate) fn load_admitted(library: &'a NativeLibrary, programs: &'a Programs<'a>,
+        plan: VocabularyPlan, admission: &cuteafd_loader::placement::families::glm5::admission::NativeLoad,
+    ) -> Result<Option<Self>> {
+        admission.validate_vocabulary(plan.staging_bytes() as u64)?;
+        Self::load_inner(library, programs, plan, library.cuda_get_device()?, None)
+    }
+
+    fn load_inner(library: &'a NativeLibrary, programs: &'a Programs<'a>, plan: VocabularyPlan,
+        embedding_device: i32, available: Option<(usize, usize, usize)>) -> Result<Option<Self>> {
         use crate::shared::memory::device::Device;
         ensure!(
             std::ptr::eq(library, programs.library()),
@@ -287,13 +300,15 @@ impl<'a> NativeVocabulary<'a> {
                 "native vocabulary checkpoint differs from compiled geometry"
             );
         }
-        let host_available = cuteafd_ffi::cgroup_memory_headroom(host_available)?;
-        let head_device = library.cuda_get_device()?;
-        let embedding_available = if embedding_device == head_device { None } else {
-            Some(Device { library, id: embedding_device }.run(|| library.cuda_memory_info())?.0)
-        };
-        plan.admit_devices(library.cuda_memory_info()?.0, embedding_available,
-            host_available, device_reserved, host_reserved)?;
+        if let Some((host_available, device_reserved, host_reserved)) = available {
+            let host_available = cuteafd_ffi::cgroup_memory_headroom(host_available)?;
+            let head_device = library.cuda_get_device()?;
+            let embedding_available = if embedding_device == head_device { None } else {
+                Some(Device { library, id: embedding_device }.run(|| library.cuda_memory_info())?.0)
+            };
+            plan.admit_devices(library.cuda_memory_info()?.0, embedding_available,
+                host_available, device_reserved, host_reserved)?;
+        }
         let mut staging =
             HostAllocation::named(library, plan.staging_bytes(), "native-vocabulary-staging")?;
         let embedding = Device { library, id: embedding_device }

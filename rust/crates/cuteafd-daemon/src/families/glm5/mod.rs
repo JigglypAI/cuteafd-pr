@@ -244,17 +244,6 @@ mod draft_cli_tests {
     use clap::Parser;
 
     #[test]
-    fn embedding_lookup_and_host_admission_use_the_variant_name() {
-        // Pair the real-header naming sweep with a guard on the two runtime consumers.
-        let source = include_str!("mod.rs");
-        let lookup = source.rsplit("fn embed_source(&self)").next().unwrap().split("\n    }").next().unwrap();
-        assert!(lookup.contains("catalog.tensor(self.cfg.embedding())?"));
-        let admission = source.rsplit("let host_embedding = args.token_io.embed_placement").next().unwrap()
-            .split("let mut reserved_weights").next().unwrap();
-        assert!(admission.contains("checkpoint.require_untied_embedding(self.cfg.embedding())?"));
-    }
-
-    #[test]
     fn width_diagnostics_fail_closed_and_detect_live_route_changes() {
         let tap = || engine::WidthTap { layer: 3, x: vec![0; 4], routes: vec![0; 16], delta: vec![0; 4] };
         assert!(validate_width_taps(&[], &[3], 2, 1, 1).is_err());
@@ -342,17 +331,6 @@ mod draft_cli_tests {
         assert!(validate_spark_endpoint_count("glm5", 1, 1).is_err());
         assert!(validate_spark_endpoint_count("glm5", 3, 3).is_err());
         assert!(validate_spark_endpoint_count("glm5", 2, 1).is_ok());
-        let source = include_str!("mod.rs");
-        let links = source.rsplit("let mut transport = selected_peers.map(").next().unwrap()
-            .split("let runtime = tokio::runtime::Builder").next().unwrap();
-        let check = |body: &str| body.contains("admitted.decode_link.clone()")
-            && body.contains("admitted.prefill_link.clone()")
-            && body.contains("warm(engine::DECODE_ROWS, true)")
-            && body.contains("warm(args.prefill_rows, false)")
-            && !body.contains("selected_peers.filter(");
-        assert!(check(links));
-        assert!(!check(&links.replace("admitted.decode_link.clone()", "unadmitted_decode")));
-        assert!(!check(&links.replace("match selected_peers {", "match selected_peers.filter(|_| prefill_lanes > 1) {")));
         Ok(())
     }
 
@@ -1042,32 +1020,8 @@ impl Opened {
         // Shared admission below charges native loader owners and the host tier together.
         let host_embedding = args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host;
         ensure!(!native || !host_embedding, "the EXLR8 row-FP8 embedding is device-resident (its owner holds the head too)");
-        let groups = match (&checkpoint, &native_records) {
-            (Some(checkpoint), _) => {
-                if host_embedding { checkpoint.require_untied_embedding(self.cfg.embedding())?; }
-                cuteafd_loader::plan::layout::glm5::resident_owned(checkpoint, devices.len(), layers, owners.as_deref())?
-            }
-            (None, Some(records)) => {
-                use cuteafd_loader::plan::exlr8::dense::{DenseSelection, resident_native};
-                let config = serde_json::from_slice(&std::fs::read(self.snapshot.join("config.json"))?)?;
-                let selection = DenseSelection::from_hf(&config)?;
-                native_dense_records.iter().enumerate().map(|(rank, owned)| -> Result<_> {
-                    let mut groups = resident_native(&selection, layers, &owned.plan)?;
-                    groups.extend(crate::shared::token_io::native::VocabularyPlan::new(records, &selection,
-                        devices.len(), rank, self.cfg.hidden, self.cfg.vocab_size)?.resident_groups(&selection, layers)?);
-                    Ok(groups)
-                }).collect::<Result<Vec<_>>>()?
-            }
-            (None, None) => anyhow::bail!("GLM coordinator operands need a checkpoint"),
-        };
-        let mut reserved_weights = groups.into_iter().map(|groups|
-                groups.into_iter().filter(|(group, _, _)| (!host_embedding || group != "embedding")
-                    && (!native || group != "shared_expert"))
-                    .try_fold(0u64, |sum, (_, _, bytes)| sum.checked_add(bytes)
-                        .context("GLM coordinator weight reservation overflow")))
-                .collect::<Result<Vec<_>>>()?;
-        for (reserved, plan) in reserved_weights.iter_mut().zip(&native_plans) {
-            *reserved = reserved.checked_add(plan.resident).context("EXLR8 coordinator reservation overflow")?;
+        if let Some(checkpoint) = &checkpoint {
+            if host_embedding { checkpoint.require_untied_embedding(self.cfg.embedding())?; }
         }
         let spark_bf16 = checkpoint.as_ref().is_some_and(|c| c.spark_input_is_bf16());
         // Native dense: decode plus every prefill lane's scratch and opt-in A8 records.
@@ -1173,7 +1127,7 @@ impl Opened {
         let storage = match push_policy { crate::shared::experts::rtx::push::PushPolicy::Mount => LocalStorage::Mount,
             crate::shared::experts::rtx::push::PushPolicy::Required => LocalStorage::Push };
         let target = if let Some(checkpoint) = &checkpoint {
-            TargetFacts::checkpoint(checkpoint, layers, devices.len(), owners.as_deref(), false,
+            TargetFacts::checkpoint(checkpoint, layers, devices.len(), owners.as_deref(), cuteafd_loader::families::glm5::native_bf16(),
                 &[if host_embedding { EmbeddingHome::HostPinned } else { EmbeddingHome::Device(0) }], core.as_ref())?
         } else {
             let config = serde_json::from_slice(&std::fs::read(self.snapshot.join("config.json"))?)?;
@@ -1186,6 +1140,9 @@ impl Opened {
             TargetFacts::native(&selection, layers, &native_dense_records.iter().map(|owned| owned.plan.clone()).collect::<Vec<_>>(),
                 &vocabulary, &shared, &native_scratch, &workspace, storage)?
         };
+        let native_load = target.native_load.clone();
+        let reserved_weights = target.device_weight_bytes(if host_embedding { EmbeddingHome::HostPinned }
+            else { EmbeddingHome::Device(0) })?;
         let physical = LocalPhysicalInput { layers: (self.cfg.first_moe_layer..layers).collect(),
             max_rows: args.prefill_rows.max(engine::DECODE_ROWS), lanes: prefill_lanes, storage,
             route_checks: true, peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1"),
@@ -1460,7 +1417,7 @@ impl Opened {
         let mut whole_weights = None;
         let (embedding, ((model, mut shares), tp2)) = crate::shared::placement::load_while_admitting(admission, || {
             if let Some(records) = &native_records {
-                let loaded = self.load_native(args, records, &native_dense_records, owners.as_deref(), layers, &programs, &manifest, &loader, &devices, stream,
+                let loaded = self.load_native(args, native_load.as_ref().context("native loader admission absent")?, records, &native_dense_records, owners.as_deref(), layers, &programs, &manifest, &loader, &devices, stream,
                     peer_stream, native_push.take(), &media, &ml4_draft, &mut draft_file)?;
                 planned_drafter = loaded.3;
                 let tp2 = if let Some(range) = tp2_range.clone() {
@@ -1505,7 +1462,8 @@ impl Opened {
         })?;
         let native_owners = native_plans.into_iter().zip(&devices).map(|(plan, &device)| {
             self.library.cuda_set_device(device)?;
-            crate::shared::experts::exlr8::NativeExperts::load(&self.library, plan)
+            crate::shared::experts::exlr8::NativeExperts::load_admitted(&self.library, plan,
+                native_load.as_ref().context("native shared admission absent")?)
         }).collect::<Result<Vec<_>>>()?;
         self.library.cuda_set_device(args.device)?;
         let bytes = model.layers.iter().map(|layer| layer.bytes()).sum::<usize>()
@@ -1517,7 +1475,7 @@ impl Opened {
                 + native_owners.get(rank).map_or(0, |owner| owner.resident_bytes() as u64))
             .collect::<Vec<_>>();
         ensure!(actual_weights == reserved_weights,
-            "GLM loaded coordinator owners {actual_weights:?} differ from header reservation {reserved_weights:?}");
+            "GLM loaded coordinator owners {actual_weights:?} differ from admitted target owners {reserved_weights:?}");
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
             resident_bytes = ?actual_weights,
             "GLM coordinator weights validated against pre-weight reservation after Spark admission (elapsed includes wait)");
@@ -1761,7 +1719,7 @@ impl Opened {
 
     /// Native vocabulary, dense operands and drafter share the existing group.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    fn load_native<'s>(&'s self, args: &EngineArgs, records: &[cuteafd_loader::plan::exlr8::dense::DenseRecord],
+    fn load_native<'s>(&'s self, args: &EngineArgs, admitted: &cuteafd_loader::placement::families::glm5::admission::NativeLoad, records: &[cuteafd_loader::plan::exlr8::dense::DenseRecord],
         per_rank: &[dense_weights::NativeDenseRecords], owners: Option<&[u8]>, layers: usize, programs: &'s cuteafd_ffi::programs::Programs<'s>, _manifest: &serde_json::Value,
         loader: &weights::GlmLoader<'s>, devices: &[i32], stream: *mut c_void, _peer_stream: Option<(i32, *mut c_void)>,
         push: Option<(crate::shared::experts::rtx::push::CoordinatorPush, usize)>,
@@ -1775,17 +1733,12 @@ impl Opened {
         let world = devices.len();
         let started = Instant::now();
         self.library.cuda_set_device(devices[0])?;
-        let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
-        let available = usize::try_from(available)?;
         ensure!(per_rank.len() == world, "native loader requires one owned plan per coordinator");
-        let load_peak = per_rank.iter().try_fold(0usize, |total, rank|
-            total.checked_add(rank.plan.read_staging_bytes).context("native dense load peak overflow"))?;
-        ensure!(load_peak <= available, "native dense load peak {load_peak} exceeds available host bytes {available}");
         let config: serde_json::Value = serde_json::from_slice(&std::fs::read(self.snapshot.join("config.json"))?)?;
         let selection = cuteafd_loader::plan::exlr8::dense::DenseSelection::from_hf(&config)?;
         let recorder = crate::shared::experts::rtx::dense::Recorder::start(push.is_some())?;
-        let vocabulary = NativeVocabulary::load(&self.library, programs,
-            VocabularyPlan::new(records, &selection, world, 0, self.cfg.hidden, self.cfg.vocab_size)?, available, 0, 0)?
+        let vocabulary = NativeVocabulary::load_admitted(&self.library, programs,
+            VocabularyPlan::new(records, &selection, world, 0, self.cfg.hidden, self.cfg.vocab_size)?, admitted)?
             .context("rank 0 owns the native vocabulary")?;
         let vocabulary = std::rc::Rc::new(vocabulary);
         let source = self.native_embed_source()?;

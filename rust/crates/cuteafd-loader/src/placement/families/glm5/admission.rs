@@ -55,6 +55,8 @@ pub struct GlmRecipe<'a> {
     pub prefill: Vec<PrefillShape>,
     pub lanes: Vec<u64>,
     pub embedding: Vec<EmbeddingHome>,
+    pub encoders: Vec<crate::plan::encoder::EncoderPlacement>,
+    pub media_cache_bytes: u64,
     pub experts: Option<ExpertProfile>,
     pub targets: Vec<Case<TargetBuffers>>,
     pub hooks: Vec<Case<HookBuffers>>,
@@ -63,17 +65,9 @@ pub struct GlmRecipe<'a> {
     pub graphs: Vec<Case<StartupGraphs>>,
     /// Process-wide ordinary RSS; subsumes heap subsets, never pinned storage.
     pub host: Option<HostFigures>,
-    /// Separate physical decode/prefill links; each rank retains one return reserve.
-    pub returns: Vec<Case<ReplyReturns>>,
     /// Expert, drafter, serving, code and temporary physical components.
     /// Their constructors remain responsible for independent actual receipts.
     pub owners: Vec<Case<Vec<Component>>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReplyPhase {
-    Decode,
-    Prefill(PrefillShape),
 }
 
 impl GlmRecipe<'_> {
@@ -211,6 +205,27 @@ pub struct NativeLoad {
 }
 
 impl NativeLoad {
+    pub fn validate_vocabulary(&self, bytes: u64) -> anyhow::Result<()> {
+        let admitted = self.groups.iter().flat_map(|group| &group.members)
+            .find(|owner| owner.id == "glm.load.native.vocabulary").map_or(0, |owner| owner.bytes);
+        anyhow::ensure!(bytes == admitted, "native vocabulary staging differs from admission: {bytes} != {admitted}");
+        Ok(())
+    }
+
+    pub fn validate_shared(&self, plans: &[crate::plan::exlr8::residency::Residency]) -> anyhow::Result<()> {
+        for plan in plans {
+            anyhow::ensure!(plan.world == self.gpus, "shared loader rank extent differs from admission");
+            let prefix = format!("glm.load.shared.rank.{}.layer.{}.", plan.rank, plan.layer);
+            let owners = self.groups.iter().flat_map(|group| &group.members)
+                .filter(|owner| owner.id.starts_with(&prefix)).collect::<Vec<_>>();
+            anyhow::ensure!(owners.len() == crate::plan::exlr8::residency::Residency::LOAD_BANKS
+                * crate::plan::exlr8::residency::Residency::LOAD_LANES
+                && owners.iter().all(|owner| owner.bytes == plan.staging_bytes.max(16) as u64),
+                "shared loader banks differ from admission");
+        }
+        Ok(())
+    }
+
     pub fn new(dense: &[&crate::plan::exlr8::dense::DensePlan],
         vocabulary: &crate::plan::exlr8::dense::DensePlan,
         shared: &[Vec<crate::plan::exlr8::residency::Residency>],
@@ -287,6 +302,23 @@ pub struct TargetFacts {
 }
 
 impl TargetFacts {
+    /// Exact target allocation bytes charged by the selected inventory, excluding host embedding.
+    pub fn device_weight_bytes(&self, home: EmbeddingHome) -> anyhow::Result<Vec<u64>> {
+        use anyhow::Context;
+        let (_, inventory) = self.weights.iter().find(|(candidate, _)| *candidate == home)
+            .context("target embedding inventory absent")?;
+        let mut bytes = vec![0u64; inventory.ranks];
+        for owner in &inventory.owners {
+            if let Device::Coordinator(rank) = owner.allocation.location.device {
+                if owner.allocation.location == Location::coordinator(rank) {
+                    bytes[rank as usize] = bytes[rank as usize].checked_add(owner.allocation.bytes)
+                        .context("target resident byte overflow")?;
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
     pub fn checkpoint(checkpoint: &crate::plan::Checkpoint, layers: usize, gpus: usize,
         attention_owners: Option<&[u8]>, native_bf16: bool, embedding: &[EmbeddingHome],
         core: Option<&crate::families::glm5::core::CoreCharges>) -> anyhow::Result<Self> {
@@ -672,9 +704,9 @@ impl<'a> ProductionInput<'a> {
         let mut recipe = GlmRecipe { cfg: self.cfg, context: self.context, page_tokens,
             maximum_pages, attention, gpus: self.gpus, spark_links: self.spark_ranks > 0,
             prefill: vec![self.prefill], lanes: vec![1],
-            embedding: weights.iter().map(|(home, _)| *home).collect(), experts,
+            embedding: weights.iter().map(|(home, _)| *home).collect(), encoders: vec![], media_cache_bytes: 0, experts,
             targets: vec![], hooks: vec![], exchanges: vec![], weights: vec![], graphs: vec![],
-            host: Some(host), returns: vec![], owners: vec![], };
+            host: Some(host), owners: vec![], };
         recipe.owners.push(Case { when: vec![], value: self.owners });
         recipe.owners.push(Case { when: vec![], value: runtime.components(maximum_pages)? });
         recipe.owners.push(Case { when: vec![], value: self.draft.components(maximum_pages)? });
@@ -824,69 +856,6 @@ impl PreparedGlm<'_> {
             prefill_link: self.prefill_link.filter(|_| remote),
             graphs: graph, runtime: self.runtime, host: self.recipe.host.unwrap(),
             load_overcharge_bytes: self.load_overcharge_bytes })
-    }
-}
-
-/// Device return reserves only. Transport staging and registrations have their
-/// own owners; compressed replies reuse these BF16 fallback backings.
-#[derive(Debug, Clone)]
-pub struct ReplyReturns {
-    pub id: String,
-    pub device: u8,
-    pub ranks: Vec<u8>,
-    pub phase: ReplyPhase,
-}
-
-impl ReplyReturns {
-    fn components(
-        &self,
-        cfg: &GlmDsaConfig,
-        maximum_pages: u64,
-        formats: SparkReplyFormats,
-    ) -> Result<Vec<Component>, Refusal> {
-        if self.id.is_empty()
-            || self.ranks.is_empty()
-            || self.ranks.iter().any(|&rank| rank >= 8)
-            || self.ranks.windows(2).any(|pair| pair[0] >= pair[1])
-        {
-            return Err(invalid("invalid Spark return identity or rank set"));
-        }
-        let (rows, waves, format) = match self.phase {
-            ReplyPhase::Decode => (super::DECODE_ROWS, 1, formats.decode()),
-            ReplyPhase::Prefill(shape) => (
-                shape.rows,
-                shape.waves,
-                formats.prefill(cuteafd_core::ExpertGeometry::GLM5.partial_replies()),
-            ),
-        };
-        let bytes = crate::serving_capacity::prefill_return_bytes_with_format(
-            waves,
-            rows,
-            1,
-            cfg.hidden as u64,
-            format,
-        )
-        .map_err(|error| Refusal::InvalidFact(format!("GLM Spark return: {error}")))?;
-        Ok(self
-            .ranks
-            .iter()
-            .map(|rank| {
-                let owner = Allocation::buffer(
-                    format!("{}.rank.{rank}", self.id),
-                    Location::coordinator(self.device),
-                    bytes,
-                    Lifetime::TARGET,
-                    cuteafd_core::memory_layout::Category::Transport,
-                    "GLM Spark returns",
-                );
-                Component::allocation(
-                    owner,
-                    ByteCurve::fixed(bytes, maximum_pages),
-                    false,
-                    maximum_pages,
-                )
-            })
-            .collect())
     }
 }
 
@@ -1144,7 +1113,7 @@ impl HostFigures {
 fn ordinary_heap_subset(component: &Component) -> bool {
     match &component.kind {
         ComponentKind::Allocation { template, .. } => template.location == Location::HOST
-            && template.id != "glm.media.cache",
+            && !matches!(template.id.as_str(), "glm.media.cache" | "glm.scoring.host_logits"),
         ComponentKind::Sequential(group) => !group.members.is_empty()
             && group.members.iter().all(|owner| owner.location == Location::HOST),
         ComponentKind::Allowance(allowance) => allowance.location == Location::HOST,
@@ -1175,10 +1144,14 @@ impl StartupGraphs {
             let source = if gpus == 1 { GLM_MIN_GRAPH } else { GLM_MAX_GRAPH[rank] };
             let identity = keys.fingerprint(rank as u8).map_err(Refusal::InvalidFact)?;
             figures.push(if identity == source.identity.declared_graphs { source } else {
-                // Estimated, not measured: a new declaration changes the graph
-                // set. Scale the named whole min/max set by exact key counts.
-                source.scaled(keys.len() as u64, if rank == 0 { 16_827 } else { 16_614 },
-                    "whole measured min/max instantiate bytes * declared keys / measured declared keys; different graph layout, not per-executable calibration")
+                // Layers splits a layer into phase executables, not multiple whole
+                // layers. Retain their real declarations but scale the whole-set
+                // census by layer/shape equivalents, not phase-segment count.
+                let equivalents = if attention == AttentionPlacement::Layers {
+                    layers.len() * glm_graph_shapes(extent, extent.div_ceil(PAGE_ROWS as usize)).len()
+                } else { keys.len() };
+                source.scaled(equivalents as u64, if rank == 0 { 16_827 } else { 16_614 },
+                    "whole measured min/max instantiate bytes * whole-layer shape equivalents / measured declared keys; phase segmentation is not per-executable calibration")
                     .map_err(|error| invalid(error))?
             });
         }
@@ -1488,6 +1461,63 @@ impl Recipe for GlmRecipe<'_> {
                 variable
             })
         });
+        if !self.encoders.is_empty() {
+            use crate::plan::encoder::EncoderKind;
+            let variable = contract.variables.len();
+            contract.variables.push(Variable::Encoder((0..self.encoders.len()).collect()));
+            for (option, encoder) in self.encoders.iter().enumerate() {
+                let when = Choice { variable, option };
+                let locations = match &encoder.kind {
+                    EncoderKind::Off => vec![],
+                    EncoderKind::Rtx { gpu } if *gpu < self.gpus => vec![Location::coordinator(*gpu as u8)],
+                    EncoderKind::Spark { .. } => {
+                        let (onboard_var, profile) = onboard.ok_or_else(|| invalid("encoder Spark without experts"))?;
+                        let active = profile.counts.iter().enumerate().filter_map(|(option, &count)|
+                            (count < profile.layers.len()).then_some(Choice { variable: onboard_var, option })).collect();
+                        contract.requires.push(Requires { when, any_of: active });
+                        encoder.spark_ranks().into_iter().map(|rank| Location {
+                            device: Device::Spark(rank as u8), domain: Domain::Managed }).collect()
+                    }
+                    _ => return Err(invalid("encoder device absent from executable topology")),
+                };
+                let mut components = Vec::new();
+                for (copy, location) in locations.iter().copied().enumerate() {
+                    for (part, bytes, category) in [("weights", encoder.weights, cuteafd_core::memory_layout::Category::Weights),
+                        ("scratch", encoder.scratch, cuteafd_core::memory_layout::Category::Workspace)] {
+                        if bytes == 0 { continue; }
+                        let owner = Allocation::buffer(format!("glm.encoder.{option}.{copy}.{part}"), location,
+                            bytes, Lifetime::RESIDENT, category, format!("bundled encoder {part}"));
+                        if part == "weights" {
+                            components.push(Component::resident_weight(ResidentWeight::from_allocation(
+                                &owner, crate::placement::ResidentWeights(bytes)), ByteCurve::fixed(bytes, self.maximum_pages)));
+                        }
+                        components.push(Component::allocation(owner, ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages));
+                    }
+                }
+                if !locations.is_empty() && self.media_cache_bytes > 0 {
+                    let owner = Allocation::buffer("glm.media.cache", Location::HOST, self.media_cache_bytes,
+                        Lifetime::TARGET, cuteafd_core::memory_layout::Category::Embedding, "media embedding cache");
+                    components.push(Component::allocation(owner, ByteCurve::fixed(self.media_cache_bytes, self.maximum_pages), false, self.maximum_pages));
+                }
+                for mut component in components {
+                    component.activation = Activation::choice(variable, option);
+                    contract.components.push(component);
+                }
+            }
+        }
+        if request.operation == Operation::Scoring {
+            for (option, shape) in self.prefill.iter().enumerate() {
+                // Scoring's serial-lane calls download one unit directly; the
+                // normal multi-wave prefill gather is not used by this path.
+                let bytes = cuteafd_core::memory_layout::host_logits_bytes(shape.rows, shape.rows, self.cfg.vocab_size as u64)
+                    .ok_or(Refusal::Overflow("scoring host logits"))?;
+                let owner = Allocation::buffer("glm.scoring.host_logits", Location::HOST, bytes,
+                    Lifetime::TARGET, cuteafd_core::memory_layout::Category::Workspace, "scoring host logits");
+                let mut component = Component::allocation(owner, ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages);
+                component.activation = Activation::choice(prefill, option);
+                contract.components.push(component);
+            }
+        }
         let domains = Domains {
             prefill: (prefill, &self.prefill),
             lanes: (lanes, &self.lanes),
@@ -1561,23 +1591,6 @@ impl Recipe for GlmRecipe<'_> {
                 return Err(invalid("exchange geometry differs from contract"));
             }
             domains.append(&mut contract, &case.when, case.value.components(self.cfg)?)?;
-        }
-        for case in &self.returns {
-            let formats = contract
-                .spark_reply_formats
-                .ok_or_else(|| invalid("Spark returns without a physical link"))?;
-            if usize::from(case.value.device) >= self.gpus
-                || matches!(case.value.phase, ReplyPhase::Prefill(shape)
-                    if !case.when.iter().any(|when| matches!(when, When::Prefill(value) if *value == shape)))
-            {
-                return Err(invalid("Spark return geometry differs from contract"));
-            }
-            domains.append(
-                &mut contract,
-                &case.when,
-                case.value
-                    .components(self.cfg, self.maximum_pages, formats)?,
-            )?;
         }
         for case in &self.weights {
             if case.value.ranks != self.gpus {
