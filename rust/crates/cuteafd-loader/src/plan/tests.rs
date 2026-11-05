@@ -8,6 +8,105 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 #[test]
+fn solved_phase_ledger_preserves_chronology_and_renders_each_physical_peak() {
+    use crate::placement::planner::{self, Allocation, Allowance, Baseline, Budget, Contract,
+        Facts, Lifetime, Location, Operation, Phase, PhaseOrder, Pin, PrefillShape, Recipe,
+        Refusal, Request, Reservation, Sequential, Variable};
+    use cuteafd_core::memory_layout::Category;
+    struct Fixed(Facts);
+    impl Recipe for Fixed {
+        fn prepare(&self, _: &Request) -> Result<Contract, Refusal> {
+            let mut contract = Contract::fixed(64, 1, 2, self.0.clone());
+            contract.variables = vec![
+                Variable::Attention { layer: 0, values: vec![crate::placement::LayerMode::ContextSplit] },
+                Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]),
+                Variable::Lanes(vec![1]),
+            ];
+            Ok(contract)
+        }
+    }
+    let at = |phase| Lifetime { first: phase, last: phase };
+    let owner = |id, location, bytes, lifetime| Allocation::buffer(id, location, bytes,
+        lifetime, Category::Workspace, id);
+    let facts = Facts { phase_order: PhaseOrder::DRAFT_THEN_TARGET,
+        resident_weights: vec![], deferred: vec![],
+        allocations: vec![
+            owner("gpu0.load", Location::coordinator(0), 700, at(Phase::Load)),
+            owner("gpu0.resident", Location::coordinator(0), 100, Lifetime::TARGET),
+            owner("gpu1.warm", Location::coordinator(1), 200, at(Phase::Warmup)),
+            owner("gpu1.resident", Location::coordinator(1), 50, Lifetime::TARGET),
+            owner("prefix", Location::PINNED, 200,
+                Lifetime { first: Phase::Warmup, last: Phase::Growth }),
+        ],
+        sequential: vec![Sequential { id: "load slices".into(), members: vec![
+            owner("slice0", Location::PINNED, 400, at(Phase::Load)),
+            owner("slice1", Location::PINNED, 600, at(Phase::Load)),
+        ] }],
+        reservations: vec![Reservation { id: "draft pool".into(), location: Location::PINNED,
+            bytes: 300, lifetime: at(Phase::DraftLoad), source: "bounded load pool".into() }],
+        allowances: vec![
+            Allowance { location: Location::coordinator(0), bytes: 20, lifetime: Lifetime::RESIDENT,
+                source: "gpu0 runtime".into(), assumed: false },
+            Allowance { location: Location::coordinator(1), bytes: 10, lifetime: Lifetime::RESIDENT,
+                source: "gpu1 runtime".into(), assumed: true },
+            Allowance { location: Location::HOST, bytes: 1000,
+                lifetime: Lifetime { first: Phase::Load, last: Phase::Warmup },
+                source: "load RSS".into(), assumed: false },
+            Allowance { location: Location::HOST, bytes: 800,
+                lifetime: Lifetime { first: Phase::Ready, last: Phase::Growth },
+                source: "steady RSS".into(), assumed: true },
+        ],
+    };
+    let budgets = vec![
+        Budget { id: "gpu.0".into(), locations: vec![Location::coordinator(0)],
+            physical_bytes: 4096, logical_bytes: 2048, headroom: 32,
+            baseline: Baseline::Forecast { occupied: 16, source: "maintained baseline".into(), assumed: false } },
+        Budget { id: "gpu.1".into(), locations: vec![Location::coordinator(1)],
+            physical_bytes: 4096, logical_bytes: 2048, headroom: 32,
+            baseline: Baseline::Sampled { free: 4080, phase: Phase::Load, source: "preload sample".into() } },
+        Budget { id: "host".into(), locations: vec![Location::HOST, Location::PINNED],
+            physical_bytes: 8192, logical_bytes: 4096, headroom: 64,
+            baseline: Baseline::Forecast { occupied: 128, source: "host baseline".into(), assumed: true } },
+    ];
+    let solved = planner::solve(Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
+        prefill: Pin::Auto, operation: Operation::Serving, resident_weight_limit: None,
+        spark_reply_formats: Default::default() }, budgets, &Fixed(facts)).unwrap();
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    let mut report = empty_report(&input, &PlanOptions::default()).unwrap();
+    assert!(serde_json::to_value(&report).unwrap().get("phase_ledger").is_none());
+    report.phase_ledger = Some(SolvedPhaseLedger::from(&solved));
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["phase_ledger"]["budgets"], serde_json::to_value(&solved.budgets).unwrap());
+    assert_eq!(json["phase_ledger"]["phases"], serde_json::to_value(&solved.phases).unwrap());
+    assert_eq!(solved.phases.len(), 18);
+    assert_eq!(solved.phases[1].phase, Phase::DraftLoad);
+    assert!(report.memory_layout.is_none(), "startup peaks never become Ready items");
+    assert_eq!(solved.items(Location::coordinator(0)).unwrap().iter().map(|item| item.bytes).sum::<u64>(), 120);
+    let text = render(&report);
+    for expected in [
+        "memory peak gpu.0 [coordinator GPU 0 device]: checkpoint loading; 720 bytes (owned 700, opaque 20); available 2000 bytes",
+        "memory peak gpu.1 [coordinator GPU 1 device]: decode warm-up; 260 bytes (owned 250, opaque 10); available 2000 bytes",
+        "memory peak host [host RAM ordinary + host RAM pinned]: checkpoint loading; 1600 bytes (owned 600, opaque 1000); available 3904 bytes",
+        "baseline 16 bytes (calibrated: maintained baseline); headroom 32 bytes",
+        "baseline 16 bytes (sampled: preload sample); headroom 32 bytes",
+        "baseline 128 bytes (estimated: host baseline); headroom 64 bytes",
+    ] { assert!(text.contains(expected), "missing {expected}: {text}"); }
+    assert_eq!(text.matches("memory peak ").count(), 3);
+
+    let mut refused = empty_report(&input, &PlanOptions::default()).unwrap();
+    let error = Refusal::Capacity { budget: "host RAM (ordinary + pinned)".into(),
+        phase: Phase::DraftLoad, required: 4097, available: 4096, owners: vec![] };
+    refused.refuse_placement(error.to_string(), "Increase the host RAM budget or reduce an explicit allocation.");
+    assert!(!refused.fits && !refused.placement_supported);
+    let text = render(&refused);
+    assert!(text.contains("memory budget 'host RAM (ordinary + pinned)' during draft loading needs 4097 bytes, has 4096 bytes available"), "{text}");
+    assert!(text.contains("Increase the host RAM budget"), "{text}");
+    assert!(!text.contains("memory peak "));
+    assert!(serde_json::to_value(&refused).unwrap().get("phase_ledger").is_none());
+}
+
+#[test]
 fn glm5_native_head_members_classify_and_validate_as_one_operand() {
     let mut config = glm5_config();
     config["vocab_size"] = json!(128);

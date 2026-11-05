@@ -16,6 +16,19 @@ pub enum Phase {
     Growth,
 }
 
+impl std::fmt::Display for Phase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Load => "checkpoint loading",
+            Self::PostTargetKv => "target KV allocation",
+            Self::DraftLoad => "draft loading",
+            Self::Warmup => "decode warm-up",
+            Self::Ready => "ready",
+            Self::Growth => "post-ready growth",
+        })
+    }
+}
+
 /// A family's real allocation chronology, not the declaration order of Phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "[Phase; 6]", into = "[Phase; 6]")]
@@ -448,10 +461,17 @@ impl ResolvedPlan {
                 .checked_add(allocation.bytes)
                 .ok_or(Refusal::Overflow("layout items"))?;
         }
-        Ok(groups
+        let mut items: Vec<_> = groups
             .into_iter()
             .map(|((group, category), bytes)| Item::new(category, group, "", bytes, Basis::Exact))
-            .collect())
+            .collect();
+        items.extend(self.facts.allowances.iter().filter(|allowance|
+            allowance.location == location
+                && allowance.bytes != 0
+                && allowance.lifetime.contains(Phase::Ready, self.facts.phase_order))
+            .map(|allowance| Item::new(Category::Runtime, &allowance.source, "", allowance.bytes,
+                if allowance.assumed { Basis::Estimated } else { Basis::Calibrated })));
+        Ok(items)
     }
     pub fn remaining(&self, budget: &str, phase: Phase) -> Option<u64> {
         self.phases
@@ -482,7 +502,7 @@ pub enum Refusal {
         context: u64,
         detail: String,
     },
-    #[error("{budget} at {phase:?} needs {required} bytes, has {available}; owners {owners:?}")]
+    #[error("memory budget '{budget}' during {phase} needs {required} bytes, has {available} bytes available; owners {owners:?}")]
     Capacity {
         budget: String,
         phase: Phase,

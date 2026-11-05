@@ -151,6 +151,57 @@ fn plan(allocations: Vec<Allocation>) -> ResolvedPlan {
         phases,
     }
 }
+#[test]
+fn ready_items_include_opaque_attribution_but_not_startup_peaks_or_views() {
+    let owner = allocation("owner", 100);
+    let mut view = allocation("view", 16);
+    view.view = Some(View { backing: owner.id.clone(), offset: 0 });
+    let mut startup = allocation("startup", 500);
+    startup.lifetime = Lifetime { first: Phase::Load, last: Phase::Load };
+    let mut p = plan(vec![owner, view, startup]);
+    p.facts.allowances = vec![
+        Allowance { location: Location::coordinator(0), bytes: 37,
+            lifetime: Lifetime::RESIDENT, source: "measured context".into(), assumed: false },
+        Allowance { location: Location::coordinator(0), bytes: 19,
+            lifetime: Lifetime::TARGET, source: "estimated runtime".into(), assumed: true },
+        Allowance { location: Location::coordinator(0), bytes: 11,
+            lifetime: Lifetime { first: Phase::Load, last: Phase::Warmup },
+            source: "load only".into(), assumed: true },
+        Allowance { location: Location::coordinator(0), bytes: 13,
+            lifetime: Lifetime { first: Phase::Growth, last: Phase::Growth },
+            source: "growth only".into(), assumed: false },
+        Allowance { location: Location::coordinator(0), bytes: 0,
+            lifetime: Lifetime::RESIDENT, source: "empty".into(), assumed: true },
+    ];
+    p.phases = evaluate(&p.facts, &p.budgets).unwrap();
+    let items = p.items(Location::coordinator(0)).unwrap();
+    assert_eq!(items.len(), 3);
+    assert_eq!(items.iter().map(|item| item.bytes).sum::<u64>(), 156);
+    assert!(items.iter().all(|item|
+        item.lifetime == cuteafd_core::memory_layout::ItemLifetime::ReadyResident));
+    for (name, bytes, basis) in [("measured context", 37, Basis::Calibrated),
+        ("estimated runtime", 19, Basis::Estimated)]
+    {
+        let item = items.iter().find(|item| item.group == name).unwrap();
+        assert_eq!((item.bytes, item.category, item.basis), (bytes, Category::Runtime, basis));
+    }
+    assert_eq!(items.iter().filter(|item| item.basis == Basis::Exact)
+        .map(|item| item.bytes).sum::<u64>(), 100);
+    let ready = p.phases.iter().find(|row| row.phase == Phase::Ready).unwrap();
+    assert_eq!(ready.owned + ready.opaque, 156);
+    let load = p.phases.iter().find(|row| row.phase == Phase::Load).unwrap();
+    assert_eq!(load.owned + load.opaque, 548);
+}
+
+#[test]
+fn capacity_refusal_names_binding_budget_phase_and_exact_bytes() {
+    let refusal = Refusal::Capacity { budget: "coordinator GPU 0".into(),
+        phase: Phase::Warmup, required: 1025, available: 1024, owners: vec![] };
+    let text = refusal.to_string();
+    assert!(text.contains("memory budget 'coordinator GPU 0' during decode warm-up"), "{text}");
+    assert!(text.contains("needs 1025 bytes, has 1024 bytes available"), "{text}");
+}
+
 fn receipts(plan: &ResolvedPlan) -> Vec<Receipt> {
     plan.facts
         .allocations
