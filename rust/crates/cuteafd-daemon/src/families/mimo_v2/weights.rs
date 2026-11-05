@@ -238,33 +238,24 @@ impl<'a> MimoLoader<'a> {
             "{name}: FP8-only projection needs checkpoint FP32 block scales");
         ensure!(grid.meta.byte_length == (grid.meta.shape[0] * grid.meta.shape[1] * 4) as u64,
             "{name}: checkpoint scale bytes disagree with its grid");
-        use crate::shared::experts::rtx::dense::{Job, Step, TRANSFORM_BYTES};
-        let index = scale_rows(name, rows, grid.meta.shape[0])?;
-        let kb = cols / 128;
-        ensure!(kb > 0 && kb <= TRANSFORM_BYTES / 4, "{name}: scale row exceeds bounded staging");
-        let per = TRANSFORM_BYTES / (kb * 4);
+        let index = std::sync::Arc::new(scale_rows(name, rows, grid.meta.shape[0])?.into_iter()
+            .map(u32::try_from).collect::<std::result::Result<Vec<_>, _>>()?);
+        let grid_cols = grid.meta.shape[1];
         (0..ranks).map(|rank| {
             let values = self.landed(rank, vec![(self.rect(name, None,
                 Some(rank * cols..(rank + 1) * cols))?, 0)], usize::try_from(layout.values)?, &[])?;
-            let (device, stream) = self.rank_device(rank)?;
+            let grid = self.landed(rank, vec![(self.rect(&scale_name, None, None)?, 0)],
+                usize::try_from(grid.meta.byte_length)?, &[])?;
+            let (_, stream) = self.rank_device(rank)?;
             let (scale, kscale) = self.on_rank(rank, |_| Ok((
-                DeviceAllocation::new(self.library, rows * kb * 4)?,
-                kmajor_scale.then(|| DeviceAllocation::new(self.library, rows * kb * 4)).transpose()?)))?;
-            for first in (0..rows).step_by(per) {
-                let end = (first + per).min(rows);
-                let grid_first = index[first];
-                let grid_end = index[end - 1] + 1;
-                let rect = self.rect(&scale_name, Some(grid_first..grid_end),
-                    Some(rank * kb * 4..(rank + 1) * kb * 4))?;
-                let row_major = CuteafdDeviceBuffer {
-                    ptr: scale.buffer.ptr.cast::<u8>().wrapping_add(first * kb * 4).cast(),
-                    bytes: (end - first) * kb * 4, ..scale.buffer };
-                let index = std::sync::Arc::new(index[first..end].iter().map(|&row| u32::try_from(row - grid_first))
-                    .collect::<std::result::Result<Vec<_>, _>>()?);
-                self.on_rank(rank, |_| self.dense.step(Step { device, rects: vec![rect], jobs: vec![
-                    Job::ExpandScales { index, kb, row_major, k_major: kscale.as_ref().map(|a| a.buffer),
-                        first, total_rows: rows }] }, stream))?;
-            }
+                DeviceAllocation::new(self.library, rows * (cols / 128) * 4)?,
+                kmajor_scale.then(|| DeviceAllocation::new(self.library, rows * (cols / 128) * 4)).transpose()?)))?;
+            let grid_buffer = grid.buffer;
+            self.transient.borrow_mut().push(grid);
+            self.on_rank(rank, |_| self.dense.finish(crate::shared::experts::rtx::dense::Finish::ScaleGather {
+                grid: grid_buffer, index: index.clone(), kb: cols / 128, grid_cols, col0: rank * (cols / 128),
+                row_major: Some(scale.buffer), k_major: kscale.as_ref().map(|a| a.buffer),
+            }, stream))?;
             Ok((values, scale, kscale))
         }).collect()
     }

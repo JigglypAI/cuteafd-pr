@@ -61,15 +61,9 @@ fn native_fp8_projections_record_without_reads_and_replay_exact_bytes() -> Resul
                     let operands = planning.fp8_projection("weight", ranks, kmajor_scale)?;
                     if pushing {
                         let records = load.sink.as_ref().unwrap().take_all();
-                        assert_eq!(records.steps.len(), ranks);
-                        assert_eq!(records.operands.len(), ranks);
-                        assert!(records.finishes.is_empty());
-                        assert!(planning.transient.borrow().is_empty());
-                        for rank in 0..ranks {
-                            let layout = dense::RankLayout::new(records.operands.clone(), records.steps.clone(), rank as i32)?;
-                            assert_eq!(layout.host_staging.table_bytes, rows * (cols / ranks / 128
-                                + usize::from(kmajor_scale)) * 4);
-                        }
+                        assert!(records.steps.is_empty());
+                        assert_eq!(records.operands.len(), 2 * ranks);
+                        assert_eq!(records.finishes.len(), ranks);
                         std::fs::write(&path, &payload)?;
                         let sockets = tempfile::tempdir_in(fixture.directory())?;
                         for rank in 0..ranks {
