@@ -1196,9 +1196,9 @@ def main() -> None:
     parser.add_argument("--max-context", type=int, default=DEFAULT_MAX_CONTEXT)
     parser.add_argument("--only", help="comma-separated stem suffixes (diagnostics)")
     parser.add_argument("--context-split-only", action="store_true",
-                        help="export K1 primitives for flash/pro/glm/glmf, no engine wiring")
+                        help="export K1 primitives for flash/pro/glm/glmf/kimik3, no engine wiring")
     parser.add_argument("--context-split", choices=("off", "on", "only"), default="off",
-                        help="token-split attention primitives for flash/pro/glm/glmf: on appends them after "
+                        help="token-split attention primitives for flash/pro/glm/glmf/kimik3: on appends them after "
                              "every other program (existing stems unchanged); only exports nothing else")
     args = parser.parse_args()
     if args.context_split_only:
@@ -1224,8 +1224,8 @@ def main() -> None:
                                           "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
                          "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split and/or kimik3")
-    if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
-        raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
+    if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf", "kimik3") for name in geometries):
+        raise SystemExit("--context-split-only takes flash, pro, glm, glmf and/or kimik3")
     kimi_kda = None
     if "kimik3" in geometries:
         from b12x.integration.cuteafd import KDAGeometry
@@ -1401,9 +1401,11 @@ def main() -> None:
             norm_dtype = torch.float32 if name == "qwen35" else torch.bfloat16
             family_work = qwen_dense_programs(g, args.decode_rows, args.prefill_rows, extent,
                                               norm_dtype=norm_dtype)
+        elif args.context_split_only:
+            family_work = (kimi_context_programs(args.decode_rows, extent) if name == "kimik3" else
+                           context_split_programs(g, args.decode_rows, extent))
         else:
-            family_work = (context_split_programs(g, args.decode_rows, extent) if args.context_split_only else
-                           make(g, args.decode_rows, args.prefill_rows, extent))
+            family_work = make(g, args.decode_rows, args.prefill_rows, extent)
         work += [(family, *item) for item in family_work]
     if "glmf" in geometries and not args.context_split_only:
         # Last, so every program above compiles exactly as before.

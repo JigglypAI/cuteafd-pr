@@ -1109,8 +1109,13 @@ pub(super) mod tests {
     fn context_layout(format: cuteafd_core::MlaCacheFormat) -> Result<cuteafd_loader::families::kimi_k3::context::ContextLayout> {
         let scratch = (64usize * 48 * 16 * 512 * 2).next_multiple_of(1024) + 64 * 48 * 16 * 4;
         let programs = cuteafd_loader::families::kimi_k3::context::program_names(format).into_iter()
-            .map(|name| serde_json::json!({"name": name, "scratch_bytes_at_capacity": {"scratch": scratch},
-                "geometry": {"num_splits":16,"runtime_splits":true,"device_splits":true,"fixed_split_grid":16,"lse_base":2}}))
+            .map(|name| {
+                let tile = if name.contains("_t8_") { 8 } else { 16 };
+                serde_json::json!({"name": name, "scratch_bytes_at_capacity": {"scratch": scratch},
+                    "geometry": {"num_splits":16,"runtime_splits":true,"device_splits":true,
+                        "fixed_split_grid":16,"lse_base":2,"heads_per_tile":tile,
+                        "context_heads_per_tile": (1..=64).map(|rows| if rows < 4 { 8 } else { 16 }).collect::<Vec<_>>()}})
+            })
             .collect::<Vec<_>>();
         cuteafd_loader::families::kimi_k3::context::ContextLayout::from_manifest(
             &serde_json::json!({"programs": programs}), format, 1_048_576, 2048, 2)
