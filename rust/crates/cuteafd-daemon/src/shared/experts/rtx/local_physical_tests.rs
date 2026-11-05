@@ -69,7 +69,6 @@ fn installed_glm_local_physical_equals_serving() -> Result<()> {
             .and_then(|value| value.split_whitespace().next()).context("missing RSS high-water mark")?
             .parse::<u64>().map_err(Into::into)
     };
-    let baseline_rss = peak_rss()?;
     cuteafd_core::set_expert_geometry(ExpertGeometry::GLM5).map_err(|g| anyhow::anyhow!("unexpected geometry {g:?}"))?;
     let root = PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/cuteafd/builds/glm-local-expert-physical");
     let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_in(&root.join("fixtures"))?;
@@ -121,6 +120,7 @@ fn installed_glm_local_physical_equals_serving() -> Result<()> {
         let mut invalid = selected.clone();
         invalid.layers.push(cfg.layers);
         ensure!(source.inventory(&invalid).is_err(), "source accepted an unparsed layer");
+        let baseline_rss = peak_rss()?;
         for storage in [LocalStorage::Mount, LocalStorage::Push] {
             selected.storage = storage;
             let expected = source.inventory(&selected)?;
@@ -179,8 +179,8 @@ fn installed_glm_local_physical_equals_serving() -> Result<()> {
             drop(pair);
             fixture.finish_ordered_uploads(&library)?;
             assert_eq!(fixture.mapped_bytes(&library)?, 0, "virtual extents leaked");
-            ensure!(peak_rss()?.saturating_sub(baseline_rss) < 256 * 1024,
-                "allocation equality RSS grew by more than 256 MiB");
+            ensure!(peak_rss()?.saturating_sub(baseline_rss) < 128 * 1024,
+                "allocation equality RSS grew by more than 128 MiB");
             println!("{repo} {storage:?}: onboard={count}, rows={rows}, lanes={lanes}, {} equal owners/views", actual.len());
         }
     }
