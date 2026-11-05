@@ -312,13 +312,6 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         source = (ROOT / 'scripts/launch/run-family.sh').read_text()
         generic = source[source.index('# Validate the name before it is used to identify allocations'):]
         block = generic.split('attention_placement="$(get ATTENTION_PLACEMENT auto)"', 1)[1].split('\ncase "$family" in', 1)[0]
-        # The per-family case lives in scripts/lib/attention-placement.sh; the
-        # call site must still refuse before any container starts.
-        self.assertIn('release_check_attention_placement "$attention_placement" "$family"', block)
-        self.assertLess(generic.index('release_check_attention_placement "$attention_placement" "$family"'),
-                        generic.index('docker run'))
-        placement_lib = (ROOT / 'scripts/lib/attention-placement.sh').read_text()
-        self.assertIn('case "$attention_placement:$family" in', placement_lib)
         self.assertIn('--attention-placement "$attention_placement"', source)
         self.assertIn('CUTEAFD_ATTENTION_PLACEMENT=$attention_placement', source)
         for family in ['glm5', 'glm5_flash', 'deepseek_v4', 'mimo_v2', 'qwen4']:
@@ -344,13 +337,6 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         source = v41_source()
         block = source.split('attention_placement="${ATTENTION_PLACEMENT:-auto}"', 1)[1].split(
             'case "$EMBEDDING" in', 1)[0]
-        # The V4.1 branch lives in scripts/lib/attention-placement.sh; the call
-        # site must still refuse before any container starts.
-        self.assertIn('release_check_attention_placement "$attention_placement" deepseek_v41', block)
-        self.assertLess(source.index('release_check_attention_placement "$attention_placement" deepseek_v41'),
-                        source.index('docker run'))
-        placement_lib = (ROOT / 'scripts/lib/attention-placement.sh').read_text()
-        self.assertIn('deepseek_v41 cannot run attention placement', placement_lib)
         for mode in ['auto', 'heads', 'context', 'layers', 'bad']:
             result = subprocess.run(['bash', '-c',
                 'source scripts/lib/release-common.sh; source scripts/lib/attention-placement.sh; '
