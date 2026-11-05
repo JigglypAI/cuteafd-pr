@@ -62,6 +62,11 @@ pub(super) enum Ticket {
     Lane,
 }
 
+fn peer_ffn_front(dense: bool, ffn_on: impl FnOnce() -> Result<()>,
+    shared_on: impl FnOnce() -> Result<()>) -> Result<()> {
+    if dense { ffn_on() } else { shared_on() }
+}
+
 fn validate_owned_kv(cfg: &GlmDsaConfig, index: usize, pages: usize, owned: bool, bytes: usize) -> Result<()> {
     ensure!(bytes == if owned { (pages + 1) * PAGE_ROWS * cfg.record_bytes(index) } else { 256 },
         "GLM layer {index} KV ownership differs from placement");
@@ -327,12 +332,10 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
             return Ok(Ticket::Complete);
         }
         self.segment(1, index, GlmOwnedPhase::FfnFront, || {
-            if layer.dense {
-                e.ffn_on(1, w1, self.layer(1, index), e.cfg.dense_intermediate,
-                    self.cap(), w1.delta.buffer.ptr, rows)
-            } else {
-                e.shared_on(1, index, w1, self.layer(1, index), rows, self.cap())
-            }
+            peer_ffn_front(layer.dense,
+                || e.ffn_on(1, w1, self.layer(1, index), e.cfg.dense_intermediate,
+                    self.cap(), w1.delta.buffer.ptr, rows),
+                || e.shared_on(1, index, w1, self.layer(1, index), rows, self.cap()))
         })?;
         if self.tables[0].decode && !layer.dense {
             if let Some(l2) = &e.peer()?.l2 {
@@ -423,6 +426,36 @@ mod tests {
         order::{self, host::{check_host, HostSchedule}}}};
     use cuteafd_loader::placement::{plan_hops, residual_homes, AttentionPlacement, ExpertHome,
         HopSpec, LayerAssignment, TerminalHome};
+
+    #[test]
+    fn non_tp2_peer_ffn_dispatches_native_shared_once() -> Result<()> {
+        struct NativeExperts {
+            calls: Cell<usize>,
+            output: Cell<usize>,
+        }
+        let native_experts = NativeExperts { calls: Cell::new(0), output: Cell::new(0) };
+        let ffn_calls = Cell::new(0);
+        peer_ffn_front(false,
+            || { ffn_calls.set(ffn_calls.get() + 1); anyhow::bail!("native shared weights are not layer FFN operands") },
+            || {
+                native_experts.calls.set(native_experts.calls.get() + 1);
+                native_experts.output.set(42);
+                Ok(())
+            })?;
+        assert_eq!(native_experts.calls.get(), 1);
+        assert_eq!(native_experts.output.get(), 42);
+        assert_eq!(ffn_calls.get(), 0);
+        peer_ffn_front(true,
+            || { ffn_calls.set(ffn_calls.get() + 1); Ok(()) },
+            || anyhow::bail!("dense layer must not use native shared experts"))?;
+        assert_eq!(ffn_calls.get(), 1);
+        assert_eq!(native_experts.calls.get(), 1);
+        let failure = peer_ffn_front(false,
+            || anyhow::bail!("unselected dense path"),
+            || anyhow::bail!("native shared failure")).unwrap_err();
+        assert_eq!(failure.to_string(), "native shared failure");
+        Ok(())
+    }
 
     #[test]
     fn ml4_binding_validates_local_kv_while_execution_reads_the_latent_source() -> Result<()> {

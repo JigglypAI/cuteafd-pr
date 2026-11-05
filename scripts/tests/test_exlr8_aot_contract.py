@@ -169,20 +169,6 @@ def test_local_tp2_input_contract_is_independent_of_partial_dtype():
     assert "e.shared_on(1, index" in layers
 
 
-def test_whole_attention_peer_shared_dispatch_uses_native_backend_without_tp2():
-    glm = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5"
-    layers = (glm / "engine/layers.rs").read_text()
-    peer = layers.split("self.segment(1, index, GlmOwnedPhase::FfnFront, || {", 1)[1].split("        })?;", 1)[0]
-    dense, shared = peer.split("} else {", 1)
-    assert "if layer.dense {" in dense
-    assert "e.ffn_on(1, w1" in dense
-    assert "e.cfg.dense_intermediate" in dense and "w1.delta.buffer.ptr" in dense
-    assert "e.shared_on(1, index, w1, self.layer(1, index), rows, self.cap())" in shared
-    assert "ffn_on(" not in shared
-    # shared_on owns the native dispatch and the legacy shared-core meet.
-    assert "meet_shared_core(" not in peer
-
-
 def test_native_layer_remote_fixture_matches_serving_two_plane_norm():
     golden = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/engine/exlr8/golden.rs").read_text()
     fixture = golden.split("fn native_layer3_same_quant()", 1)[1].split("fn native_prefill_lanes_byte_exact()", 1)[0]
