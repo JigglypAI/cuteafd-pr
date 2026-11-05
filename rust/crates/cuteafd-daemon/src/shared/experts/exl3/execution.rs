@@ -1092,6 +1092,26 @@ mod tests {
             let path = root.path().join("v41_exl3.json");
             std::fs::write(&path, serde_json::to_vec(&metadata)?)?;
             Exl3Execution::validate_planned_residency(root.path(), &layout, geometry)?;
+            // Exercise the worker's full capacity preflight with only metadata:
+            // no native library, weight files, or device arenas exist here.
+            let worker = root.path().join("worker");
+            let capacities = cuteafd_core::Exl3RowPolicy::active().capacities(16)?;
+            for capacity in &capacities {
+                let directory = worker.join(format!("m{capacity}"));
+                std::fs::create_dir_all(&directory)?;
+                std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&metadata)?)?;
+            }
+            super::super::worker::Exl3Worker::validate_planned_residency(
+                &worker, 16, Exl3Schedule::Default, &layout, geometry)?;
+            for capacity in &capacities {
+                let path = worker.join(format!("m{capacity}/v41_exl3.json"));
+                let mut changed = metadata.clone();
+                changed["hidden"] = serde_json::json!(128);
+                std::fs::write(&path, serde_json::to_vec(&changed)?)?;
+                assert!(super::super::worker::Exl3Worker::validate_planned_residency(
+                    &worker, 16, Exl3Schedule::Default, &layout, geometry).is_err(), "m{capacity}");
+                std::fs::write(&path, serde_json::to_vec(&metadata)?)?;
+            }
             for (field, value) in [("intermediate", serde_json::json!(256)),
                 ("hidden", serde_json::json!(128)), ("experts", serde_json::json!(1)),
                 ("bits", serde_json::json!([3,4])), ("top_k", serde_json::json!(1)),

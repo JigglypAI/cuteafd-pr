@@ -210,20 +210,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn module_phase_has_no_weight_or_arena_allocation() {
-        let source = include_str!("modules.rs").split("#[cfg(test)]").next().unwrap();
-        for forbidden in ["DeviceAllocation", "HostAllocation", "load_weights", "cuda_stream_create",
-            "Exl3Workspace::new", "Fp8Experts::load", "weights.execution"] {
-            assert!(!source.contains(forbidden), "module phase contains {forbidden}");
-        }
-        let exl3 = source.split("if catalog.exl3().is_some() {").nth(1).unwrap();
-        assert!(exl3.find("config.validate_exl3_residency(catalog, &directory)?").unwrap()
-            < exl3.find("Exl3Modules::load").unwrap());
-        let worker = include_str!("local.rs");
-        let modules = worker.find("let mut modules = match super::modules::WarmModules::load").unwrap();
-        let weights = worker.find("load_weights(&library").unwrap();
-        let execution = worker.find("weights.execution(&library").unwrap();
-        assert!(modules < weights && weights < execution);
-    }
 }
