@@ -100,7 +100,7 @@ pub(crate) struct Operand {
     pub bytes: usize,
 }
 
-/// One GPU transform of a step's staged bytes (byte offsets are into the staging).
+/// One transform of a step's staged bytes (byte offsets are into the staging).
 #[derive(Clone)]
 pub(crate) enum Job {
     /// Staged bytes `at..at + bytes` copied unchanged to `dst`.
@@ -112,6 +112,11 @@ pub(crate) enum Job {
     /// BF16 gate parameters converted by the checkpoint's host coefficient
     /// contract (no device transcendental rounding changes).
     ResidualGate { temperature: f32, alpha: CuteafdDeviceBuffer, beta: CuteafdDeviceBuffer },
+    /// FP32 block-grid bytes expanded exactly on the host, without device
+    /// scratch. `index` selects each output row from the staged [*, kb] grid.
+    /// K-major writes this window at `first` in each of `total_rows`-wide blocks.
+    ExpandScales { index: std::sync::Arc<Vec<u32>>, kb: usize, row_major: CuteafdDeviceBuffer,
+        k_major: Option<CuteafdDeviceBuffer>, first: usize, total_rows: usize },
     /// BF16 `at..at + bytes` widened to F32 into `dst`.
     Widen { at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
     /// F32 `at..at + bytes` narrowed to BF16 (round to nearest even, NaN
@@ -354,6 +359,28 @@ impl Step {
                         library.copy_h2d(beta, &b)
                     })?;
                 }
+                Job::ExpandScales { ref index, kb, row_major, k_major, first, total_rows } => {
+                    let bytes = index.len().checked_mul(kb).and_then(|n| n.checked_mul(4))
+                        .context("expanded scale window overflow")?;
+                    ensure!(!index.is_empty() && kb > 0 && bytes <= TRANSFORM_BYTES
+                        && bytes <= row_major.bytes && first.checked_add(index.len()).is_some_and(|end| end <= total_rows)
+                        && k_major.is_none_or(|dst| total_rows.checked_mul(kb).and_then(|n| n.checked_mul(4))
+                            .is_some_and(|n| n <= dst.bytes)), "expanded scales outside their operands");
+                    let expanded = expand_scale_bytes(&staged[..self.bytes()], index, kb)?;
+                    load_timing::upload(bytes, || library.copy_h2d(CuteafdDeviceBuffer { bytes, ..row_major }, &expanded))?;
+                    if let Some(dst) = k_major {
+                        let mut block = vec![0u8; index.len() * 4];
+                        for k in 0..kb {
+                            for (r, value) in block.chunks_exact_mut(4).enumerate() {
+                                value.copy_from_slice(&expanded[(r * kb + k) * 4..(r * kb + k + 1) * 4]);
+                            }
+                            let offset = (k * total_rows + first) * 4;
+                            let target = CuteafdDeviceBuffer { ptr: dst.ptr.cast::<u8>().wrapping_add(offset).cast(),
+                                bytes: block.len(), ..dst };
+                            load_timing::upload(block.len(), || library.copy_h2d(target, &block))?;
+                        }
+                    }
+                }
                 Job::Upload { at, bytes, dst } => {
                     ensure!(at + bytes <= staged.len() && bytes <= dst.bytes, "upload outside its step");
                     load_timing::upload(bytes, || library.copy_h2d(CuteafdDeviceBuffer { bytes, ..dst },
@@ -510,6 +537,20 @@ impl Step {
         }
         Ok(())
     }
+}
+
+fn expand_scale_bytes(staged: &[u8], index: &[u32], kb: usize) -> Result<Vec<u8>> {
+    let width = kb.checked_mul(4).context("scale row width overflow")?;
+    let bytes = index.len().checked_mul(width).context("expanded scale window overflow")?;
+    ensure!(width > 0 && !index.is_empty() && bytes <= TRANSFORM_BYTES,
+        "expanded scales exceed bounded host scratch");
+    let mut expanded = vec![0u8; bytes];
+    for (row, &source) in expanded.chunks_exact_mut(width).zip(index) {
+        let start = (source as usize).checked_mul(width).context("scale source offset overflow")?;
+        row.copy_from_slice(staged.get(start..start.checked_add(width).context("scale source extent overflow")?)
+            .context("scale row outside staging")?);
+    }
+    Ok(expanded)
 }
 
 pub(crate) fn residual_gate_bytes(bytes: &[u8], temperature: f32) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -924,6 +965,30 @@ pub(crate) fn fill_records_by_mount(library: &NativeLibrary, records: &Records,
 #[cfg(test)]
 mod window_tests {
     use super::*;
+
+    #[test]
+    fn scale_expansion_preserves_bits_and_charges_bounded_host_scratch() -> Result<()> {
+        // Include signed zero, infinities and NaN payloads: this is a byte copy, not arithmetic.
+        let source = [0x80000000u32, 0x7f800000, 0x7fc01234, 0xff800000]
+            .into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let index = std::sync::Arc::new(vec![1, 0, 1]);
+        let expanded = expand_scale_bytes(&source, &index, 2)?;
+        assert_eq!(expanded, [&source[8..], &source[..8], &source[8..]].concat());
+        assert!(expand_scale_bytes(&source, &[2], 2).is_err());
+        assert!(expand_scale_bytes(&source, &[], 2).is_err());
+        assert!(expand_scale_bytes(&source, &[0], 0).is_err());
+        assert!(expand_scale_bytes(&source, &vec![0; TRANSFORM_BYTES / 8 + 1], 2).is_err());
+        for k_major in [false, true] {
+            let buffer = CuteafdDeviceBuffer { bytes: 24, ..Default::default() };
+            let step = Step { device: 0, rects: vec![rect("scales", 0, 2, 8)], jobs: vec![
+                Job::ExpandScales { index: index.clone(), kb: 2, row_major: buffer,
+                    k_major: k_major.then_some(buffer), first: 0, total_rows: 3 }] };
+            let layout = super::super::RankLayout::new(Vec::new(), vec![step], 0)?;
+            assert_eq!(layout.host_staging.table_bytes, 24 + if k_major { 12 } else { 0 });
+            assert!(layout.host_staging.bytes()? >= 16 + layout.host_staging.table_bytes);
+        }
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
