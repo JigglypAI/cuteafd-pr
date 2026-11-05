@@ -14,6 +14,7 @@ const HIDDEN: usize = 7168;
 pub(crate) struct Options<'a, const RANKS: usize = 2> {
     pub cache_format: cuteafd_core::MlaCacheFormat,
     pub devices: [i32; RANKS],
+    pub attention: Option<cuteafd_loader::placement::AttentionPlacement>,
     pub native_lib: &'a Path,
     pub peers: Vec<SocketAddr>,
     pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
@@ -53,6 +54,11 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     checkpoint: &cuteafd_loader::plan::Checkpoint, full: &KimiK3Config,
     cfg: &KimiK3Config, options: Options<'_, RANKS>) -> Result<Loaded<'a>> {
     ensure!(matches!(RANKS, 1 | 2), "Kimi startup requires one or two physical devices");
+    check_attention(options.attention, RANKS, options.graphs)?;
+    // Admission and binding can be CPU-gated independently, but no request may
+    // mix parity decode with the still-unbound whole-owned prefill path.
+    ensure!(options.attention != Some(cuteafd_loader::placement::AttentionPlacement::Context),
+        "Kimi context requires the gathered multiquery prefill binding; auto remains layers");
     ensure!(options.draft.as_ref().is_none_or(|draft| draft.cache_format == options.cache_format),
         "Kimi target/draft cache records differ");
     let spark_ranks = options.peers.len();
@@ -116,6 +122,12 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     }).transpose()).collect::<Result<Vec<_>>>()?;
     let expert_modules: [_; RANKS] = expert_modules.try_into()
         .map_err(|_| anyhow::anyhow!("Kimi expert module physical rank inventory"))?;
+    let context_programs = devices.iter().map(|device|
+        (options.attention == Some(cuteafd_loader::placement::AttentionPlacement::Context))
+            .then(|| device.run(|| super::context::Programs::load(programs, options.cache_format).map(Rc::new)))
+            .transpose()).collect::<Result<Vec<_>>>()?;
+    let context_programs = context_programs.try_into()
+        .map_err(|_| anyhow::anyhow!("Kimi context program rank inventory"))?;
     let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
     let inventory = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PreWeight, |_| {
         if RANKS == 2 {
@@ -130,12 +142,19 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let lane_layouts: [_; RANKS] = native.iter().enumerate().map(|(rank, native)|
         native.lane_layout(full, rank, rows, unit, options.max_context)).collect::<Result<Vec<_>>>()?
         .try_into().map_err(|_| anyhow::anyhow!("Kimi lane physical rank inventory"))?;
+    let context_layout = (options.attention == Some(cuteafd_loader::placement::AttentionPlacement::Context))
+        .then(|| super::context::Programs::layout(programs, options.cache_format,
+            options.max_context, unit, lane_layouts[0].metadata_banks())).transpose()?;
     let lane_layouts = vec![lane_layouts];
     let verify_rows = match options.verify_rows {
         0 => options.draft.as_ref().map(super::draft::Options::verify_rows).transpose()?.unwrap_or(0),
         rows => rows,
     };
-    let graph_set = options.graphs.then(|| if RANKS == 1 {
+    let graph_set = options.graphs.then(|| if let Some(layout) = &context_layout {
+        super::graphs::inventory_with_context(cfg, 1, unit, options.slots, verify_rows, RANKS,
+            |_, _| true, |layer| cfg.attention[layer] == cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla,
+            Some(layout.decode()))
+    } else if RANKS == 1 || options.attention == Some(cuteafd_loader::placement::AttentionPlacement::Heads) {
         super::graphs::inventory_for_ranks(cfg, 1, unit, options.slots, verify_rows, RANKS, |_, _| true)
     } else { super::graphs::owned_inventory(cfg, 1, unit, options.slots, verify_rows) }).transpose()?;
     let mut fixed = if RANKS == 2 { exchange_demands(unit, diagnostics)? } else { vec![] };
@@ -166,7 +185,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
     let mut admitted = admission::admit(admission::Inputs { cfg, core,
         resident_weight_limit: crate::shared::memory::budget::resident_weight_limit(), cache_format: options.cache_format, gpus, devices: options.devices,
-        peer_access: RANKS == 2, spark_ranks, attention: None, requested_pool: options.pool_tokens,
+        peer_access: RANKS == 2, spark_ranks, attention: options.attention, context: context_layout, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, waves: options.waves,
         unit_rows: options.prefill_rows, lane_layouts, fixed,
         startup: graph_set.as_ref().map_or_else(Vec::new, |set|
@@ -212,7 +231,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let draft = options.draft.as_ref().zip(draft_layout.as_ref()).map(|(options, layout)|
         super::draft::NativeDraft::load_for_ranks(&mut admitted, programs, options, lane_streams.to_vec(), layout)).transpose()?;
     let draft_records = recorder.map(|recorder| recorder.finish()).unwrap_or_default();
-    let engine = Engine::load_admitted(library, streams, lane_streams, draft, draft_records, admitted, checkpoint, native, peer, hops,
+    let engine = Engine::load_admitted(library, streams, lane_streams, draft, draft_records, admitted, checkpoint, native, context_programs, peer, hops,
         options.peers.clone(), cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() }, expert_modules)?;
     if let Some(set) = graph_set {
         let before = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;
@@ -231,6 +250,14 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     Ok(Loaded { engine, admission_free, admitted_bytes })
 }
 
+fn check_attention(attention: Option<cuteafd_loader::placement::AttentionPlacement>, ranks: usize, graphs: bool) -> Result<()> {
+    use cuteafd_loader::placement::AttentionPlacement;
+    if attention == Some(AttentionPlacement::Context) {
+        ensure!(ranks == 2 && graphs, "Kimi context requires two ranks and startup decode graphs");
+    }
+    Ok(())
+}
+
 pub(super) fn code_demand(rank: usize, pending: u64, cublas_bytes: u64, lanes: usize) -> Result<Demand> {
     cuteafd_loader::families::kimi_k3::allocation::code_demand(rank, pending, cublas_bytes, lanes)
 }
@@ -247,6 +274,17 @@ pub(super) fn exchange_demands(rows: usize, diagnostics: bool) -> Result<Vec<Dem
 mod tests {
     use super::*;
     use cuteafd_loader::families::kimi_k3::core::{CoreInventory,CoreProjection,CoreSplit};
+
+    #[test]
+    fn context_cannot_fall_back_to_single_rank_or_eager_decode() {
+        use cuteafd_loader::placement::AttentionPlacement;
+        assert!(check_attention(Some(AttentionPlacement::Context), 2, true).is_ok());
+        assert!(check_attention(Some(AttentionPlacement::Context), 1, true).is_err());
+        assert!(check_attention(Some(AttentionPlacement::Context), 2, false).is_err());
+        for mode in [None, Some(AttentionPlacement::Heads), Some(AttentionPlacement::Layers)] {
+            assert!(check_attention(mode, 2, false).is_ok());
+        }
+    }
 
     fn projection(stem:&str)->CoreProjection {
         CoreProjection {stem:stem.into(),bits:6,codebook:cuteafd_loader::formats::exl3_storage::Exl3Codebook::Mcg,

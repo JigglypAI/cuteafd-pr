@@ -47,6 +47,8 @@ pub(crate) struct GoldenArgs {
     #[arg(long, default_value_t = 0)] device: i32,
     /// Optional distinct physical peer; absent scores on the primary device alone.
     #[arg(long)] split_device: Option<i32>,
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto",
+        value_parser = ["auto", "heads", "context", "layers"])] attention_placement: String,
     #[arg(long)] check_headers: bool,
     /// Routed layers split across both coordinator GPUs (rtx-tp2).
     #[arg(long, default_value_t = 0)] rtx_expert_layers: usize,
@@ -81,7 +83,7 @@ impl GoldenArgs {
     fn provenance(&self) -> Value {
         serde_json::json!({"schema": "cuteafd.kimi.run/1", "ffn_mode": self.ffn_mode().name(), "kv_cache": self.kv_cache.label(),
             "gate_up_programs": ([3072, 16896].map(|width| self.ffn_mode().gate_up_stem(width))),
-            "rtx_expert_layers":self.rtx_expert_layers, "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll,
+            "rtx_expert_layers":self.rtx_expert_layers, "attention_placement": self.attention_placement, "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll,
             "verify_rows": self.verify_rows, "graphs": self.verify_rows.map(|_| &self.graphs), "grouped_kda": self.grouped_kda,
             "verify_limit": self.verify_limit, "prefill_rows": self.prefill_rows, "prefill_waves": self.prefill_waves})
     }
@@ -414,6 +416,7 @@ fn load_target<'a, const RANKS: usize>(args: &GoldenArgs, library: &'a Arc<cutea
     -> Result<super::startup::Loaded<'a>> {
     super::startup::load(library, programs, checkpoint, full, cfg, super::startup::Options {
         cache_format: args.kv_cache, devices,
+        attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
         native_lib: args.native_lib.as_deref().context("--native-lib required")?,
         peers: args.peers.clone(), rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(args.rtx_expert_layers),
         spark_budget_gib: args.spark_budget_gib,
@@ -825,7 +828,7 @@ mod tests {
             resident_weight_limit: cuteafd_loader::placement::ResidentWeights::DEFAULT_LIMIT, cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {
             capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
-            devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None,
+            devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None, context: None,
             requested_pool: Some(1_048_576), state_slots: slots, prefix_marks: marks, rows, lanes: 1, waves: 2, unit_rows: None,
             lane_layouts: vec![std::array::from_fn(|_| super::super::device::LaneLayout::new(&cfg, rows, (rows).min(4096),
                 1048576, native_scratch).unwrap())], fixed,

@@ -565,6 +565,7 @@ mod tests {
         let peer = args.split_device.context("two-GPU packing gate requires --split-device")?;
         let loaded = super::super::startup::load(&library, &programs, &checkpoint, &cfg, &cfg,
             super::super::startup::Options { cache_format: args.kv_cache, devices: [args.device, peer],
+                attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
                 native_lib: &args.native_lib, peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
                 spark_budget_gib: args.spark_budget_gib, rows: usize::try_from(prefill.span_rows)?,
                 waves: usize::try_from(prefill.waves)?, prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
