@@ -947,8 +947,7 @@ impl<'a> LocalLane<'a> {
             "Kimi context decode needs its fixed metadata bank");
         ensure!(self.graphs.is_some() && self.replay_enabled, "Kimi context decode requires startup graphs");
         let context = self.context.as_ref().context("Kimi context not bound")?.0.clone();
-        let padded = context.ranks[self.rank].decode().bucket(rows)?;
-        let bucket = if speculative { rows } else { padded };
+        let bucket = context.ranks[self.rank].decode().dispatch_rows(rows, speculative)?;
         let input = context.ranks[self.rank].buffer("decode input")?;
         let source = self.plane("normalized", rows, 7168)?;
         let stream = self.stream().clone();

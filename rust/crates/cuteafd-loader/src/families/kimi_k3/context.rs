@@ -55,9 +55,15 @@ impl DecodeBuckets {
         Ok(bucket)
     }
 
-    pub fn graph_rows(&self, verify: usize, capacity: usize) -> Vec<usize> {
+    pub fn dispatch_rows(&self, rows: usize, speculative: bool) -> Result<usize> {
+        let padded = self.bucket(rows)?;
+        ensure!(!speculative || rows >= 2, "Kimi context speculative batch needs a draft row");
+        Ok(if speculative { rows } else { padded })
+    }
+
+    pub fn graph_rows(&self, verify: usize, slots: usize, capacity: usize) -> Vec<usize> {
         let mut rows = self.plain.iter().copied()
-            .chain(super::allocation::verify_graph_rows(verify, capacity))
+            .chain(super::allocation::verify_graph_rows(verify, slots, capacity))
             .filter(|&rows| rows <= capacity).collect::<Vec<_>>();
         rows.sort_unstable();
         rows.dedup();
@@ -230,7 +236,12 @@ mod tests {
         }
         let decode = DecodeBuckets::from_manifest(&native_manifest(serde_json::json!([8, 16, 32, 48])))?;
         assert_eq!(decode.plain(), [1, 4, 8, 16, 32, 48, 64]);
-        assert_eq!(decode.graph_rows(8, 64), [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 48, 64]);
+        assert_eq!(decode.graph_rows(8, 1, 64), [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 48, 64]);
+        assert_eq!(decode.graph_rows(8, 16, 64), (1..=64).collect::<Vec<_>>());
+        assert_eq!(decode.graph_rows(0, 16, 64), decode.plain());
+        assert_eq!(decode.dispatch_rows(13, true)?, 13);
+        assert_eq!(decode.dispatch_rows(13, false)?, 16);
+        assert!(decode.dispatch_rows(1, true).is_err());
         for routes in [serde_json::Value::Null, serde_json::json!([]), serde_json::json!([8, 8]),
             serde_json::json!([16, 8]), serde_json::json!([0]), serde_json::json!([64]), serde_json::json!(["8"])] {
             assert!(DecodeBuckets::from_manifest(&native_manifest(routes)).is_err());

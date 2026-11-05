@@ -24,8 +24,8 @@ use cuteafd_loader::families::kimi_k3::allocation::{graph_rows, verify_graph_row
 
 /// An estimated reserve until the first real serving census qualifies its bytes.
 /// The exact same key set is charged by admission and sealed by each binding.
-/// `verify` (the drafter's block, 0 without one) adds every exact verify width
-/// with its speculative single-sequence attention, the C1 verify shape.
+/// `verify` (the drafter's block, 0 without one) and `slots` determine every
+/// flattened speculative batch width, including mixed-width multi-request steps.
 pub(crate) fn inventory(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
     resident: impl Fn(usize, usize) -> bool) -> Result<StartupGraphs<Key>> {
     inventory_for_ranks(cfg, lanes, capacity, slots, verify, 2, resident)
@@ -60,7 +60,7 @@ pub(crate) fn inventory_with_context(cfg: &KimiK3Config, lanes: usize, capacity:
                                 keys.push(Key { lane, rank, rows, op: Op::Attention { layer, sequences: rows, speculative: false } });
                             }
                         }
-                        if verify_graph_rows(verify, capacity).contains(&rows) {
+                        if verify_graph_rows(verify, 1, capacity).contains(&rows) {
                             // Keep ordinary and speculative keys distinct even
                             // when they share a plain row bucket.
                             keys.push(Key { lane, rank, rows, op: Op::Attention { layer, sequences: 1, speculative: true } });
@@ -70,10 +70,10 @@ pub(crate) fn inventory_with_context(cfg: &KimiK3Config, lanes: usize, capacity:
                 if rank == ranks - 1 { keys.push(Key { lane, rank, rows, op: Op::Residual(MixSite::Output) }); }
             }
             if let Some(decode) = decode {
-                for rows in decode.graph_rows(verify, capacity) {
+                for rows in decode.graph_rows(verify, slots, capacity) {
                     for layer in (0..cfg.layers).filter(|&layer| context(layer) && resident(rank, layer)) {
                         for speculative in [false, true] {
-                            if if speculative { verify_graph_rows(verify, capacity).contains(&rows) }
+                            if if speculative { verify_graph_rows(verify, slots, capacity).contains(&rows) }
                                 else { decode.plain().contains(&rows) } {
                                 keys.push(Key { lane, rank, rows, op: Op::Context { layer, speculative } });
                             }
@@ -223,8 +223,8 @@ mod tests {
         let decode = cuteafd_loader::families::kimi_k3::context::DecodeBuckets::from_manifest(
             &serde_json::json!({"programs":[{"name":"dense_trellis_k6_trellis_mla_q_a_mcg",
                 "geometry":{"bits":6,"decode_route_thresholds":[8,16,32,48]}}]}))?;
-        for capacity in [64, 2752, 4096] { for verify in [0, 8, 64] {
-            let set = inventory_with_context(&cfg, 1, capacity, 16, verify, 2, |_, _| true,
+        for slots in [1, 4, 16] { for capacity in [64, 2752, 4096] { for verify in [0, 8, 64] {
+            let set = inventory_with_context(&cfg, 1, capacity, slots, verify, 2, |_, _| true,
                 |layer| cfg.attention[layer] == KimiAttention::Mla, Some(&decode))?;
             let unique = set.keys.iter().collect::<std::collections::HashSet<_>>();
             assert_eq!(unique.len(), set.keys.len());
@@ -245,16 +245,56 @@ mod tests {
                 for rows in [8, 32, 48] {
                     assert!(!set.keys.iter().any(|key| key.rank == rank && key.rows == rows
                         && matches!(key.op, Op::Ffn(_) | Op::Residual(_)))
-                        || verify_graph_rows(verify, capacity).contains(&rows));
+                        || verify_graph_rows(verify, 1, capacity).contains(&rows));
                 }
             }
             assert!(!set.keys.iter().any(|key| key.rows > 64 && matches!(key.op, Op::Context { .. })));
             let missing = set.keys.iter().copied().filter(|key| !(key.rank == 1 && key.rows == 16
                 && matches!(key.op, Op::Context { .. }))).collect::<Vec<_>>();
             assert!(check_placement(&cfg, &placement, &missing).is_err());
-        }}
+        }}}
         assert!(inventory_with_context(&cfg, 1, 64, 16, 0, 1, |_, _| true,
             |layer| cfg.attention[layer] == KimiAttention::Mla, Some(&decode)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn context_startup_covers_every_c1_to_c16_mixed_verify_batch() -> Result<()> {
+        let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        // One MLA layer is sufficient for the exhaustive row/slot geometry;
+        // the full-family test checks every real layer and graph accounting.
+        cfg.layers = 1;
+        cfg.attention = vec![KimiAttention::Mla];
+        let decode = cuteafd_loader::families::kimi_k3::context::DecodeBuckets::from_manifest(
+            &serde_json::json!({"programs":[{"name":"dense_trellis_k6_trellis_mla_q_a_mcg",
+                "geometry":{"bits":6,"decode_route_thresholds":[8,16,32,48]}}]}))?;
+        for slots in 1..=16 { for verify in 2..=64 {
+            let set = inventory_with_context(&cfg, 1, 2752, slots, verify, 2, |_, _| true,
+                |layer| cfg.attention[layer] == KimiAttention::Mla, Some(&decode))?;
+            let declared = set.keys.iter().copied().collect::<std::collections::HashSet<_>>();
+            for active in 1..=slots {
+                for speculative in [false, true] {
+                    // Independently enumerate the scheduler's flattened batch:
+                    // each active request supplies an anchor and 0..verify-1 drafts.
+                    let reachable = if speculative { active.max(2)..=(active * verify).min(64) }
+                        else { active..=active };
+                    for rows in reachable {
+                        let bucket = decode.dispatch_rows(rows, speculative)?;
+                        for rank in 0..2 {
+                            for layer in (0..cfg.layers).filter(|&layer| cfg.attention[layer] == KimiAttention::Mla) {
+                                assert!(declared.contains(&Key { lane: 0, rank, rows: bucket,
+                                    op: Op::Context { layer, speculative } }),
+                                    "missing Context graph: slots={slots} verify={verify} active={active} rows={rows}");
+                            }
+                        }
+                    }
+                }
+            }
+            for rank in 0..2 {
+                assert_eq!(set.inventory.ranks[rank].executables,
+                    set.keys.iter().filter(|key| key.rank == rank).count() as u64);
+            }
+        }}
         Ok(())
     }
 

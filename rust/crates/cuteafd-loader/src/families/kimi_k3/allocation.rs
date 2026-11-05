@@ -261,18 +261,19 @@ impl NativeScratch {
 pub const GRAPH_RESERVE: &str = "Kimi startup graph reserve";
 pub const GRAPH_ROWS: [usize; 5] = [1, 4, 16, 64, 4096];
 
-/// Speculative verify rows replay at their exact width (no padding: every
-/// row writes KDA replay records and MLA cache slots). `verify` is the
-/// drafter's block (anchor + drafts), 0 without speculation.
-pub fn verify_graph_rows(verify: usize, capacity: usize) -> std::ops::RangeInclusive<usize> {
-    2..=verify.min(64).min(capacity)
+/// Speculative verify rows replay at their exact flattened batch width (no
+/// padding: every row writes KDA replay records and MLA cache slots). Each of
+/// `slots` requests can supply `verify` rows, capped by the native 64-row step.
+/// Zero disables speculation; one slot retains the diagnostic verify widths.
+pub fn verify_graph_rows(verify: usize, slots: usize, capacity: usize) -> std::ops::RangeInclusive<usize> {
+    2..=verify.saturating_mul(slots).min(64).min(capacity)
 }
 
 /// Every captured row count: the plain buckets plus each exact verify width.
 /// Plain attention (and multi-sequence KDA) keys stay on the plain buckets; the
 /// added widths capture speculative single-sequence attention, residual and FFN.
 pub fn graph_rows(verify: usize, capacity: usize) -> Vec<usize> {
-    let mut rows = GRAPH_ROWS.into_iter().chain(verify_graph_rows(verify, capacity))
+    let mut rows = GRAPH_ROWS.into_iter().chain(verify_graph_rows(verify, 1, capacity))
         .filter(|&r| r <= capacity).collect::<Vec<_>>();
     rows.sort_unstable();
     rows.dedup();
@@ -310,14 +311,14 @@ pub fn graphs_with_context(cfg: &KimiK3Config, lanes: usize, capacity: usize, sl
                         *count += 1 + u64::from(cfg.attention[layer] == KimiAttention::Kda
                             && (2..=slots).contains(&rows));
                     }
-                    if verify_graph_rows(verify, capacity).contains(&rows) { *count += 1; }
+                    if verify_graph_rows(verify, 1, capacity).contains(&rows) { *count += 1; }
                 }
             }
         }
         if let Some(decode) = decode {
-            for rows in decode.graph_rows(verify, capacity) {
+            for rows in decode.graph_rows(verify, slots, capacity) {
                 let variants = u64::from(decode.plain().contains(&rows))
-                    + u64::from(verify_graph_rows(verify, capacity).contains(&rows));
+                    + u64::from(verify_graph_rows(verify, slots, capacity).contains(&rows));
                 *count += (0..cfg.layers).filter(|&layer| context(layer) && resident(rank, layer)).count() as u64
                     * variants;
             }
