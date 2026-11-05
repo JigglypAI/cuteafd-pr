@@ -522,20 +522,23 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
 pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_bytes: &[u64],
     workspace: u64, spark_ranks: usize, manifest: &serde_json::Value, selected: Option<&str>)
     -> anyhow::Result<(MemoryLayout, crate::placement::Placement)> {
-    native_layout_with_metadata(checkpoint, options, shared_bytes, workspace, spark_ranks, manifest, selected, None)
+    native_layout_with_metadata(checkpoint, options, shared_bytes, workspace, spark_ranks, manifest, selected, None, None)
 }
 
 pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &LayoutOptions, shared_bytes: &[u64],
     workspace: u64, spark_ranks: usize, manifest: &serde_json::Value, selected: Option<&str>,
-    metadata: Option<&crate::plan::exlr8::residency::MetadataInput>)
+    metadata: Option<&crate::plan::exlr8::residency::MetadataInput>, requested: Option<crate::placement::AttentionPlacement>)
     -> anyhow::Result<(MemoryLayout, crate::placement::Placement)> {
     use crate::placement::{families::glm5 as glm, Baseline};
     let gpu_count = options.rtx_bytes.len();
     anyhow::ensure!((1..=2).contains(&gpu_count) && shared_bytes.len() == gpu_count,
         "EXLR8 requires 1..=2 RTX shared owners matching coordinator GPUs");
     let split = gpu_count == 2;
-    let attention = if split { crate::placement::AttentionPlacement::Context }
-        else { crate::placement::AttentionPlacement::Heads };
+    let attention = requested.unwrap_or(if split { crate::placement::AttentionPlacement::Context }
+        else { crate::placement::AttentionPlacement::Heads });
+    anyhow::ensure!(attention == crate::placement::AttentionPlacement::Heads
+        || (split && attention == crate::placement::AttentionPlacement::Context),
+        "GLM EXLR8 requires heads or two-GPU context attention");
     let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
     let rows = if options.prefill_rows == 0 { 4096 } else { options.prefill_rows };
     let context = if options.context_tokens == 0 { 1 << 20 } else { options.context_tokens };
@@ -547,12 +550,13 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         |name| cuteafd_core::coordinator_programs::CoordinatorPrograms {
             family: "glm", split_family: Some("glm2") }.contains(name))?;
     let scratch = glm::manifest_scratch(&cfg, split, &manifest)?;
-    let context_programs = if split { Some(glm::manifest_context(&cfg, &manifest,
-        options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
-            "sm_120", options.rtx_bytes[0]).sms) as usize, &plan)
-        .ok_or_else(|| crate::placement::PlacementError::MissingContextPrograms { family: cfg.family_id(),
-            programs: glm::context_program_list(&cfg) })?) }
-        else { None };
+    let context_programs = if attention == crate::placement::AttentionPlacement::Context {
+        let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
+            "sm_120", options.rtx_bytes[0]).sms) as usize;
+        Some(glm::manifest_context_for_cards(&cfg, &manifest, &[sms], plan)?
+            .ok_or_else(|| crate::placement::PlacementError::MissingContextPrograms { family: cfg.family_id(),
+                programs: glm::context_program_list(&cfg) })?)
+    } else { None };
     let native = crate::plan::exlr8::recognizes(&checkpoint.snapshot)?;
     let mut dense_scratch = Vec::new();
     let resident = if native {
@@ -649,6 +653,42 @@ mod tests {
     use crate::plan::testing::{fp8, glm5_config, glm5_tensors, write_snapshot};
 
     fn native_manifest() -> serde_json::Value { crate::plan::testing::glm5_native_programs() }
+
+    #[test]
+    fn native_heads_uses_replicated_records_without_context_exports() {
+        use crate::placement::{AttentionPlacement, LayerMode};
+        let dir = tempfile::tempdir().unwrap();
+        crate::plan::testing::exlr8::glm_snapshot(dir.path());
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let manifest = native_manifest();
+        let options = LayoutOptions { rtx_bytes: vec![96 << 30; 2], context_tokens: 65536,
+            pool_tokens: Some(131072), onboard: Some(crate::placement::OnboardSetting::Layers(0)),
+            glm5_drafter_disabled: true, host_memory: Some((128 << 30, 128 << 30)),
+            host_cache_bytes: Some(0), ..Default::default() };
+        let solve = |manifest: &serde_json::Value, attention| native_layout_with_metadata(&checkpoint,
+            &options, &[256; 2], 256, 6, manifest, None, None, attention);
+        let (context_memory, context) = solve(&manifest, None).unwrap();
+        assert_eq!(context.attention_placement, AttentionPlacement::Context);
+        let (heads_memory, heads) = solve(&manifest, Some(AttentionPlacement::Heads)).unwrap();
+        assert_eq!(heads.attention_placement, AttentionPlacement::Heads);
+        assert!(heads.layers.iter().all(|layer| layer.mode == LayerMode::HeadSplit));
+        let records = |memory: &MemoryLayout, rank: usize| memory.devices[rank].items.iter()
+            .filter(|item| item.group == "records").map(|item| item.bytes).sum::<u64>();
+        for rank in 0..2 {
+            assert_eq!(records(&heads_memory, rank), 2 * records(&context_memory, rank));
+            assert_eq!(heads_memory.devices[rank].items.iter().filter(|item| item.category == Category::Weights)
+                .map(|item| item.bytes).sum::<u64>(), context_memory.devices[rank].items.iter()
+                .filter(|item| item.category == Category::Weights).map(|item| item.bytes).sum::<u64>());
+        }
+        let mut missing = manifest.clone();
+        missing["programs"].as_array_mut().unwrap().retain(|p|
+            !p["name"].as_str().unwrap().contains("_partial_h") && p["name"] != "glm_dsa_candidate_merge");
+        let (_, without_context) = solve(&missing, Some(AttentionPlacement::Heads)).unwrap();
+        assert_eq!(heads, without_context);
+        assert!(matches!(solve(&missing, None).unwrap_err().downcast_ref::<crate::placement::PlacementError>(),
+            Some(crate::placement::PlacementError::MissingContextPrograms { .. })));
+        assert!(solve(&manifest, Some(AttentionPlacement::Layers)).is_err());
+    }
 
     #[test]
     fn auto_recipe_mismatch_charges_the_same_owned_operands_as_explicit_layers() {

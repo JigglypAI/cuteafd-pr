@@ -116,8 +116,9 @@ fn native_options(selected: &str, options: &super::PlanOptions, speculator: &str
     let attention = options.attention_placement.unwrap_or(default_attention);
     if family == "glm5" {
         ensure!(world > 0, "GLM EXLR8 native deployment requires canonical Sparks with 1..=8 ranks");
-        ensure!(attention == default_attention,
-            "EXLR8 native deployment with {gpu_count} RTX GPUs requires {default_attention} attention");
+        ensure!(attention == crate::placement::AttentionPlacement::Heads
+            || (gpu_count == 2 && attention == crate::placement::AttentionPlacement::Context),
+            "GLM EXLR8 native deployment requires heads or two-GPU context attention");
     } else {
         ensure!(gpu_count == 2 || attention == crate::placement::AttentionPlacement::Heads,
             "Flash EXLR8 {attention} attention requires two RTX GPUs");
@@ -170,7 +171,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
             (memory, placement)
         } else {
             super::layout::glm5::native_layout_with_metadata(checkpoint, &resolved_layout, &facts.shared_bytes,
-                workspace, world, &programs, Some(selected), Some(&metadata))?
+                workspace, world, &programs, Some(selected), Some(&metadata), Some(attention))?
         }
     };
     let layout = &resolved_layout;
@@ -1313,11 +1314,10 @@ mod tests {
             for attention in [None, Some(crate::placement::AttentionPlacement::Heads),
                 Some(crate::placement::AttentionPlacement::Context), Some(crate::placement::AttentionPlacement::Layers)] {
                 options.attention_placement = attention;
-                let expected = if gpus == 2 { crate::placement::AttentionPlacement::Context }
-                    else { crate::placement::AttentionPlacement::Heads };
-                // Family-specific attention refusal follows detection, not a hardcoded GLM default.
+                // GLM supports explicit replicated Heads as well as the Context default.
                 assert_eq!(native_options("up1", &options, "off", "glm5").is_ok(),
-                    attention.is_none_or(|a| a == expected));
+                    attention.is_none_or(|a| a == crate::placement::AttentionPlacement::Heads
+                        || (gpus == 2 && a == crate::placement::AttentionPlacement::Context)));
                 assert_eq!(native_options("k4", &options, "off", "glm5_flash").is_ok(),
                     gpus == 2 || attention.is_none_or(|a| a == crate::placement::AttentionPlacement::Heads));
             }

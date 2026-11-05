@@ -181,9 +181,9 @@ fn native_activation(args: &EngineArgs, first_moe: usize, layers: usize, serving
         "EXLR8 full execution requires one or two distinct coordinators, 1..=8 Spark ranks and all backbone layers");
     let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement)
         .map_err(anyhow::Error::msg)?;
-    let expected = if args.split_device.is_some() { AttentionPlacement::Context } else { AttentionPlacement::Heads };
-    ensure!(attention.is_none_or(|placement| placement == expected),
-        "EXLR8 full execution requires {expected} attention placement for the selected coordinators");
+    ensure!(attention.is_none_or(|placement| placement == AttentionPlacement::Heads
+        || (args.split_device.is_some() && placement == AttentionPlacement::Context)),
+        "EXLR8 full execution requires heads or two-GPU context attention placement");
     Ok(())
 }
 
@@ -596,8 +596,11 @@ mod draft_cli_tests {
             let mut candidate = args.clone();
             candidate.exlr8_manifest = Some(manifest.into());
             assert!(native_activation(&candidate, 3, 78, true).is_ok());
-            candidate.attention_placement = "auto".into();
-            assert!(native_activation(&candidate, 3, 78, false).is_ok());
+            for mode in ["auto", "heads"] {
+                candidate.attention_placement = mode.into();
+                assert!(native_activation(&candidate, 3, 78, true).is_ok());
+                assert!(native_activation(&candidate, 3, 78, false).is_ok());
+            }
         }
         for mode in ["heads", "auto"] {
             let mut one = args.clone();
@@ -625,7 +628,7 @@ mod draft_cli_tests {
                 2 => candidate.split_device = Some(0),
                 3 => candidate.peers = Some("a:1,b:1,c:1,d:1,e:1,f:1,g:1,h:1,i:1".into()),
                 4 => candidate.layers = Some(4),
-                5 => candidate.attention_placement = "heads".into(),
+                5 => candidate.attention_placement = "layers".into(),
                 6 => candidate.exlr8_manifest = None,
                 _ => candidate.skip_routed_experts = true,
             }
@@ -1158,9 +1161,6 @@ impl Opened {
             cuteafd_loader::plan::families::glm::GLM5.exlr8_execution()
                 .check(devices.len(), placement.onboard_layers > 0)?;
         }
-        ensure!(!native || devices.len() != 2
-            || placement.attention_placement == cuteafd_loader::placement::AttentionPlacement::Context,
-            "EXLR8 two-coordinator admission requires context attention programs");
         let prefill_lanes = usize::try_from(working.spark.prefill_lanes)?;
         let selected_peers = if working.spark.spark_ranks > 0 { args.peers.as_deref() } else { None };
         cuteafd_loader::placement::families::GLM5.check(&placement)?;
