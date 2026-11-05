@@ -1015,6 +1015,72 @@ fn host_figures_subsume_only_ordinary_heap_and_preserve_pinned_device_and_weight
     assert!(matches!(with.prepare(&request()), Err(Refusal::InvalidFact(_))));
 }
 
+#[test]
+fn fixed_prefix_quota_uses_joint_host_ram_after_steady_and_pinned_owners() {
+    use crate::placement::planner::serving::{HostPrefixOwners, ServingOwners};
+    use cuteafd_core::prefix::HostCacheGeometry;
+
+    let cfg = cfg();
+    let mut recipe = recipe(&cfg);
+    let host = HostFigures::for_layout(2, MAX_LAYOUT).unwrap();
+    recipe.host = Some(host.clone());
+    let request = Request { onboard: Pin::Exact(0), prefill: Pin::Exact(recipe.prefill[0]),
+        ..request() };
+    let without_prefix = planner::solve(request.clone(), budgets(), &recipe).unwrap();
+    let steady = without_prefix.phases.iter().find(|phase|
+        phase.budget == "physical.2" && phase.phase == Phase::Ready).unwrap();
+    assert_eq!(steady.opaque, host.steady().bytes);
+    let pinned: u64 = without_prefix.facts.allocations.iter().filter(|owner|
+        owner.location == Location::PINNED && owner.view.is_none()
+            && owner.lifetime.contains(Phase::Ready, without_prefix.facts.phase_order))
+        .map(|owner| owner.bytes).sum();
+    assert!(pinned > 0);
+    assert_eq!(steady.owned, pinned);
+
+    // Use the existing resolver, not a new cutover default or free-RAM clamp.
+    let geometry = HostCacheGeometry { unit_rows: 64, page_bytes: 1 << 20,
+        mark_bytes: 0, draft_bytes: 0 };
+    let chunk = geometry.chunk_bytes();
+    let host_total = 128 << 30;
+    for explicit in [None, Some(40 << 30)] {
+        let quota = geometry.resolve(explicit, 1 << 20, 16, host_total, chunk).unwrap();
+        assert_eq!(quota, explicit.unwrap_or(32 << 30));
+        let mut with_prefix = recipe.clone();
+        let prefix = HostPrefixOwners { quota_bytes: quota, chunk_bytes: chunk }
+            .allocations("glm.host.prefix", ServingOwners::LIFETIME).unwrap();
+        assert_eq!(prefix.iter().map(|owner| owner.bytes).sum::<u64>(), quota);
+        with_prefix.owners.push(Case { when: vec![], value: prefix.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, with_prefix.maximum_pages);
+            Component::allocation(owner, bytes, false, with_prefix.maximum_pages)
+        }).collect() });
+        let mut joint = budgets();
+        let occupied = 128 << 20;
+        let headroom = 256 << 20;
+        let available = host.steady().bytes + pinned + quota;
+        joint[2] = Budget { id: "physical.2".into(),
+            locations: vec![Location::HOST, Location::PINNED],
+            physical_bytes: available + occupied + headroom,
+            logical_bytes: available + occupied + headroom,
+            baseline: Baseline::Forecast { occupied, source: "external host consumers".into(),
+                assumed: false }, headroom };
+        assert_eq!(joint[2].available().unwrap() - host.steady().bytes - pinned, quota);
+        let admitted = planner::solve(request.clone(), joint.clone(), &with_prefix).unwrap();
+        let ready = admitted.phases.iter().find(|phase|
+            phase.budget == "physical.2" && phase.phase == Phase::Ready).unwrap();
+        assert_eq!(ready.opaque, host.steady().bytes);
+        assert_eq!(ready.owned, pinned + quota);
+        assert_eq!(admitted.pool_tokens, without_prefix.pool_tokens);
+        assert_eq!(admitted.decisions, without_prefix.decisions);
+        assert_eq!(admitted.facts.allocations.iter().filter(|owner|
+            owner.id.starts_with("glm.host.prefix.")).map(|owner| owner.bytes).sum::<u64>(), quota);
+        joint[2].logical_bytes -= 1;
+        assert!(matches!(planner::solve(request.clone(), joint, &with_prefix),
+            Err(Refusal::Capacity { budget, required, available: free, .. })
+                if budget == "physical.2" && required == available && free == available - 1),
+            "a fixed quota refuses instead of silently shrinking into remaining RAM");
+    }
+}
+
 fn owned_graph_recipe(cfg: &GlmDsaConfig, context: u64) -> GlmRecipe<'_> {
     let mut recipe = recipe(cfg);
     recipe.context = context;
