@@ -55,12 +55,23 @@ pub(crate) enum LayerKv {
 pub(crate) struct RankPrograms<'a> {
     bound: BTreeMap<String, Program<'a>>,
     prefix: &'static str,
+    exact_cap: usize,
 }
 
 impl<'a> RankPrograms<'a> {
     pub(crate) fn bind(programs: &'a Programs<'a>, ranks: usize) -> Result<Self> {
-        Ok(Self { bound: programs::bind(programs, ranks)?.into_iter().collect(), prefix: programs::prefix(ranks)? })
+        use crate::shared::prefill_packing::{coordinator_row_cap, ProgramRows};
+        let inventory = programs::required(ranks)?;
+        let exact_cap = coordinator_row_cap(programs, inventory.iter().map(|(name, _)| {
+            let role = if name.contains("attention_full_") || name.contains("attention_swa_") || name.ends_with("swa_commit") {
+                ProgramRows::SequenceLocal
+            } else { ProgramRows::PackedRows };
+            (name.as_str(), role)
+        }), usize::MAX)?;
+        Ok(Self { bound: programs::bind(programs, ranks)?.into_iter().collect(), prefix: programs::prefix(ranks)?, exact_cap })
     }
+
+    pub(crate) fn packed_cap(&self) -> usize { self.exact_cap }
 
     /// A geometry-free (`muse_`) or per-heads (`muse_`/`muse2_`) program.
     fn get(&self, stem: &str) -> Result<&Program<'a>> {
@@ -117,6 +128,7 @@ pub(crate) struct StepPlanes {
     /// The step's requests and kind (each Spark wave's reply regions).
     pub wave: super::experts::WaveStep,
     pub trace: Option<crate::shared::activation_trace::RowTrace>,
+    pub segments: Vec<(std::ops::Range<usize>, Vec<i32>)>,
 }
 
 impl StepPlanes {
@@ -208,23 +220,42 @@ impl RankDevice<'_, '_> {
         let out = lane.rows("attention", rows)?;
         let scratch = lane.plane("router_logits")?;
         let route = if step.prefill { "prefill" } else { "decode" };
-        // SAFETY: as `project`; `scratch` (1 KiB used) is the idle router plane, rewritten later this layer.
-        unsafe {
-            match self.kv[layer] {
-                LayerKv::Paged { cache } => {
-                    let mut scalars = vec![rows_i32(rows)?, Scalar::I32(i32::try_from(step.table_stride)?)];
-                    if !step.prefill { scalars.push(Scalar::I32(1)); }
-                    self.programs.launch(&format!("attention_full_{route}"), &[q, cache, step.positions,
-                        step.page_table, out, scratch], &scalars, self.stream)?;
+        let segments = if step.segments.is_empty() { vec![(0..rows, Vec::new())] } else { step.segments.clone() };
+        for (range, table) in &segments {
+            let slice = |buffer: Buffer, stride: usize| Buffer {
+                ptr: buffer.ptr.cast::<u8>().wrapping_add(range.start * stride).cast(),
+                bytes: range.len() * stride, ..buffer };
+            let q = slice(q, q.bytes / rows);
+            let out = slice(out, out.bytes / rows);
+            let positions = slice(step.positions, 8);
+            let ring_slots = slice(step.ring_slots, 8);
+            let seq_first = slice(step.seq_first, 4);
+            // SAFETY: ordered H2D owns pinned staging and fences its prior copy
+            // before reuse; table is copied, not borrowed by the async transfer.
+            unsafe {
+                if !table.is_empty() && full {
+                    self.library.copy_h2d_ordered(step.page_table, super::engine::bytes_of(table), self.stream)?;
                 }
-                LayerKv::Ring { ring } => {
-                    let kv_step = lane.rows("kv_step", rows)?;
-                    self.programs.launch(&format!("attention_swa_{route}"), &[q, kv_step, ring, step.positions,
-                        step.ring_slots, step.seq_first, out, scratch], &[rows_i32(rows)?], self.stream)?;
-                    self.programs.launch("swa_commit", &[kv_step, ring, step.ring_slots, step.seq_first],
-                        &[rows_i32(rows)?], self.stream)?;
+                match self.kv[layer] {
+                    LayerKv::Paged { cache } => {
+                        let mut scalars = vec![rows_i32(range.len())?, Scalar::I32(i32::try_from(step.table_stride)?)];
+                        if !step.prefill { scalars.push(Scalar::I32(1)); }
+                        self.programs.launch(&format!("attention_full_{route}"), &[q, cache, positions,
+                            step.page_table, out, scratch], &scalars, self.stream)?;
+                    }
+                    LayerKv::Ring { ring } => {
+                        let records = lane.rows("kv_step", rows)?;
+                        let kv_step = slice(records, records.bytes / rows);
+                        self.programs.launch(&format!("attention_swa_{route}"), &[q, kv_step, ring, positions,
+                            ring_slots, seq_first, out, scratch], &[rows_i32(range.len())?], self.stream)?;
+                        self.programs.launch("swa_commit", &[kv_step, ring, ring_slots, seq_first],
+                            &[rows_i32(range.len())?], self.stream)?;
+                    }
                 }
             }
+        }
+        // SAFETY: member writes precede the packed rowwise gate on this stream.
+        unsafe {
             self.programs.launch("attention_output", &[out, lane.rows("gate", rows)?, lane.rows("gated", rows)?],
                 &[rows_i32(rows)?], self.stream)?;
         }

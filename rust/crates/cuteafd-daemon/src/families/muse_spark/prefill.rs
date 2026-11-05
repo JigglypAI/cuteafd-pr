@@ -22,6 +22,7 @@ use std::ffi::c_void;
 
 /// One sequence's prefill call: its tokens from `start`, ring slot and pages.
 pub(crate) struct PrefillCall<'c> {
+    pub packed: Vec<(StepSequence<'c>, crate::shared::prefill_packing::Segment)>,
     pub request: u64,
     pub slot: usize,
     pub start: usize,
@@ -114,6 +115,14 @@ impl MusePrefill<'_, '_, '_> {
     /// from the head rank's `hidden` (the unit's slot view), at their window offset.
     fn tap(&self, layer: usize, unit: &Unit) -> Result<()> {
         let Some(draft) = self.draft else { return Ok(()) };
+        if !self.call.packed.is_empty() {
+            let state = self.units[unit.index].as_ref().context("Muse packed unit not begun")?;
+            let hidden = state.lanes[self.ranks.len() - 1].plane("hidden")?;
+            for (_, segment) in &self.call.packed {
+                draft.tap(layer, hidden, segment.end_row() - segment.tap_rows, segment.tap_rows, segment.tap_offset)?;
+            }
+            return Ok(());
+        }
         let window = self.tap_window();
         let (from, to) = (unit.rows.start.max(window.start), unit.rows.end.min(window.end));
         if from >= to { return Ok(()); }
@@ -137,8 +146,12 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
         let tokens = &self.call.tokens[unit.rows.clone()];
         let sequence = StepSequence { slot: self.call.slot, start: self.call.start + unit.rows.start, rows,
             pages: self.call.pages };
-        let meta = StepMetadata::build(&[sequence], self.call.ring_rows, self.call.slots, self.ranks[0].lane.views.rows, true)?;
-        let wave = WaveStep { segments: vec![WaveSegment { request: self.call.request, rows }],
+        let sequences = if self.call.packed.is_empty() { vec![sequence] }
+            else { self.call.packed.iter().map(|(sequence, _)| sequence.clone()).collect() };
+        let meta = StepMetadata::build(&sequences, self.call.ring_rows, self.call.slots, self.ranks[0].lane.views.rows, true)?;
+        let segments = if self.call.packed.is_empty() { vec![WaveSegment { request: self.call.request, rows }] }
+            else { sequences.iter().map(|s| WaveSegment { request: s.slot as u64 + 1, rows: s.rows }).collect() };
+        let wave = WaveStep { segments,
             kind: cuteafd_transport::ExpertV2SourceKind::Prefill };
         let mut media = cuteafd_engine::media::MediaChunk::default();
         if let Some(request) = self.call.media {

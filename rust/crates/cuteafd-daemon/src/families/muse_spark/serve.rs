@@ -55,6 +55,8 @@ pub(crate) struct ServeArgs {
     pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Prefill unit rows, at most 4096; unset follows the shared wave policy.
     #[arg(long)] pub prefill_rows: Option<usize>,
+    #[arg(long, default_value = "unrestricted")]
+    pub prefill_packing: crate::shared::prefill_packing::PackingMode,
     /// Admit all-row prefill logits for fidelity scoring before KV sizing.
     #[arg(long)] pub full_prefill_logits: bool,
     /// Prefill units in flight on the one Spark transport; unset follows the shared policy.
@@ -138,7 +140,7 @@ impl ServeArgs {
 }
 
 /// Bring the engine up and hand `run` the backend and its admitted sequences.
-fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBackend<'_, '_>, usize, super::media::Ready) -> Result<T>)
+pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBackend<'_, '_>, usize, super::media::Ready) -> Result<T>)
     -> Result<T> {
     ensure!(args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu,
         "Muse Spark keeps its embedding on the entry GPU");
@@ -301,7 +303,7 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
     tracing::info!(drafter = ?args.draft, onboarded = onboarded.len(), "Muse Spark drafter");
     let backend = super::backend::MuseBackend::new(&cfg, &ranks, streams, &embedding, &mut engine.link,
         engine.peer.as_ref(), usize::try_from(prefill.unit_rows)?, usize::try_from(prefill.waves)?, sequences,
-        served_context, pages, local, draft, pricing, super::media::Binding::from_snapshot(&args.snapshot, cfg.vocab_size)?)?;
+        served_context, pages, local, draft, pricing, super::media::Binding::from_snapshot(&args.snapshot, cfg.vocab_size)?, args.prefill_packing)?;
     // Engine teardown may block while joining exchange workers; preserve the
     // original scheduler error before any backend or native owners unwind.
     // Scheduler-owned selection, cache copies and timing live beside the target head.
@@ -643,6 +645,14 @@ mod tests {
         let capped = args(&["--peers", PEERS, "--max-output-tokens", "4096"])?;
         assert_eq!(capped.prefix.reserve.limits(1 << 20)?.output(), 4096);
         assert!(args(&["--peers", PEERS, "--max-output", "4096"]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn packing_defaults_to_unrestricted_and_exact_remains_explicit() -> Result<()> {
+        use crate::shared::prefill_packing::PackingMode;
+        assert_eq!(args(&["--peers", PEERS])?.prefill_packing, PackingMode::Unrestricted);
+        assert_eq!(args(&["--peers", PEERS, "--prefill-packing", "exact"])?.prefill_packing, PackingMode::Exact);
         Ok(())
     }
 
