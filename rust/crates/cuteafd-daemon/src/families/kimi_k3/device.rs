@@ -826,13 +826,13 @@ impl<'a> LocalLane<'a> {
         let stream = self.stream();
         let partial = owner.partial(heads_rank != self.rank, rows)?;
         let buffer = |ptr, bytes| CuteafdDeviceBuffer { ptr, bytes, device_id: stream.device.id, flags: 0 };
-        stream.device.run(|| programs.partial[heads_rank].launch(cuteafd_ffi::KimiMlaPartialBatch {
+        stream.device.run(|| Ok(programs.partial[heads_rank].launch(cuteafd_ffi::KimiMlaPartialBatch {
             rows, active_splits: owner.metadata("active splits", self.lane.metadata_bank)?,
             cache_pages: batch.cache_pages, page_table_width: batch.page_table_width,
             query: buffer(slot.query, rows * 96 * 576 * 2), cache: batch.cache,
             page_table: batch.page_table, lengths: batch.lengths, query_offsets: batch.query_offsets,
             attention: buffer(partial.values, rows * 48 * 512 * 2), lse: buffer(partial.lse, rows * 48 * 4),
-            scratch: owner.buffer("partial scratch")? }, stream.raw))
+            scratch: owner.buffer("partial scratch")? }, stream.raw)?))
     }
 
     fn context_combine(&self, layer: usize, rows: usize, speculative: bool) -> Result<()> {
