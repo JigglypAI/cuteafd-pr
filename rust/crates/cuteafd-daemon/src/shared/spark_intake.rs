@@ -56,6 +56,12 @@ pub(crate) enum IntakeMode {
 }
 
 impl IntakeMode {
+    fn planner_mode(self) -> cuteafd_loader::placement::SparkIntakeMode {
+        use cuteafd_loader::placement::SparkIntakeMode;
+        match self { Self::Host => SparkIntakeMode::Host, Self::Pinned => SparkIntakeMode::Pinned,
+            Self::Gpu => SparkIntakeMode::Gpu }
+    }
+
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Host => "host",
@@ -1592,6 +1598,7 @@ pub(crate) struct SparkLink<'a> {
     world: cuteafd_transport::expert::SparkWorld,
     world_size: usize,
     capacity: u32,
+    admitted: Option<cuteafd_loader::placement::PreparedSparkLink>,
 }
 
 impl<'a> SparkLink<'a> {
@@ -1664,6 +1671,30 @@ impl<'a> SparkLink<'a> {
         Self::with_egress_waves(library, transport, row_bytes, IntakePreference::Probed, true, true, waves, wave_rows, timing)
     }
 
+    /// Construct exactly the endpoint geometry already admitted. The existing
+    /// receive probe still runs inside with_egress_waves, never in preparation.
+    pub(crate) fn prepared(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld,
+        peers: &[std::net::SocketAddr], config: cuteafd_transport::TcpTransportConfig,
+        admitted: cuteafd_loader::placement::PreparedSparkLink) -> Result<Self> {
+        use cuteafd_loader::placement::SparkWaveStaging;
+        let spec = admitted.geometry();
+        ensure!(spec.intake.ranks == peers.len() && spec.endpoints.endpoint.capacity as u64 == spec.intake.rows
+            && config.max_frame_bytes == spec.endpoints.rings.max_frame_bytes,
+            "Spark construction differs from admitted endpoint geometry");
+        let timing = config.timing;
+        let capacity = spec.endpoints.endpoint.capacity;
+        let mut transport = SparkExperts::new_world(world, peers, capacity, config, 0)?;
+        transport.set_max_waves(spec.intake.waves)?;
+        let enable_egress = matches!(spec.waves.staging, SparkWaveStaging::Registered { .. })
+            || spec.unused_egress_bytes.is_some();
+        let mut link = Self::with_egress_waves(library, transport, usize::try_from(spec.intake.row_bytes)?,
+            IntakePreference::Probed, enable_egress, spec.prefill, spec.intake.waves, capacity, timing)?;
+        ensure!(admitted.candidates().iter().any(|candidate| candidate.mode == link.intake.mode.planner_mode()),
+            "probed Spark intake mode was not admitted");
+        link.admitted = Some(admitted);
+        Ok(link)
+    }
+
     /// Return slots.
     pub(crate) fn waves(&self) -> usize { self.intake.waves() }
     pub(crate) fn slots(&self) -> usize { self.intake.slots() }
@@ -1711,7 +1742,7 @@ impl<'a> SparkLink<'a> {
         let world = transport.world();
         Ok(Self { prefill, intake: std::rc::Rc::new(intake), egress_bytes: 0, egress_enabled: enable_egress,
             terminal_library: None, terminal_released: false, exchange: None, transport: Some(transport),
-            staging_bytes: 0, bootstrap: None, timing, world, world_size: ranks, capacity })
+            staging_bytes: 0, bootstrap: None, timing, world, world_size: ranks, capacity, admitted: None })
     }
 
     /// The transport while no exchange runs (setup and teardown only).
@@ -1739,6 +1770,31 @@ impl<'a> SparkLink<'a> {
         let staging = crate::shared::experts::staging::RouteStaging::new(request.header.row_count as usize,
             usize::try_from(request.header.route_count / request.header.row_count.max(1))?.max(1),
             request.hidden_payload.len() / (request.header.row_count as usize).max(1))?.bytes;
+        if let Some(admitted) = &self.admitted {
+            let spec = admitted.geometry();
+            let endpoint = spec.endpoints.endpoint;
+            let bf16 = matches!(endpoint.ingress, cuteafd_core::SparkIngress::Bf16 | cuteafd_core::SparkIngress::Native);
+            ensure!(request.header.row_count == endpoint.capacity
+                && request.header.hidden_dim == spec.endpoints.geometry.hidden
+                && request.header.route_count.checked_div(request.header.row_count)
+                    == Some(spec.endpoints.geometry.topk)
+                && (request.header.hidden_dtype == cuteafd_transport::ExpertV2Dtype::Bf16) == bf16,
+                "Spark bootstrap differs from admitted request geometry");
+            let expected = match spec.waves.staging {
+                cuteafd_loader::placement::SparkWaveStaging::Registered { slot_bytes }
+                | cuteafd_loader::placement::SparkWaveStaging::Standalone { slot_bytes } => slot_bytes,
+            };
+            ensure!(staging.max(256) as u64 <= expected, "Spark request staging exceeds admission");
+            if self.egress_enabled {
+                let expected = match spec.waves.staging {
+                    cuteafd_loader::placement::SparkWaveStaging::Registered { slot_bytes } => slot_bytes,
+                    _ => spec.unused_egress_bytes.context("registered egress missing from admission")?
+                        / spec.intake.waves as u64,
+                };
+                ensure!(registered_egress_bytes(request)? as u64 == expected,
+                    "Spark registered egress differs from admission");
+            }
+        }
         let (egress_enabled, egress_bytes, waves) = (self.egress_enabled, self.egress_bytes, self.slots());
         let transport = self.idle_transport()?;
         let mut registered = egress_bytes;
@@ -1795,6 +1851,38 @@ impl<'a> SparkLink<'a> {
             Ok(storage) => storage,
             Err(error) => { self.transport = Some(transport); return Err(error); }
         };
+        if let Some(admitted) = &self.admitted {
+            let check = (|| -> Result<()> {
+                use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Location, PhaseOrder};
+                use cuteafd_core::memory_layout::Category;
+                let physical = [intake.device()];
+                let devices = CoordinatorDevices::new(&physical)?;
+                let mut inventory = crate::shared::memory::receipts::Inventory::new(devices,
+                    "spark-construction", Lifetime::TARGET, Category::Transport, "Spark construction");
+                intake.allocation_receipts(&mut inventory, "intake")?;
+                for (slot, arena) in arenas.iter().enumerate() {
+                    inventory.backed_pinned(&format!("staging.{slot}"), arena.host(), arena.allocation_buffer())?;
+                }
+                // Reuse the passive retained-owner receipt path before the worker
+                // takes the transport. No extra probe, synchronization or device work.
+                let mut census = crate::shared::memory::receipts::Census::default();
+                census.owners(inventory.receipts);
+                let mut transport_owners = transport.allocation_census();
+                transport_owners.resolve_recycled_frames();
+                census.transport("transport", transport_owners, devices, Lifetime::TARGET)?;
+                census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
+                let rank = admitted.geometry().intake.gpu;
+                let owners = census.receipts.into_iter().map(|receipt| {
+                    let mut owner = receipt.allocation;
+                    if owner.location == Location::coordinator(0) { owner.location = Location::coordinator(rank); }
+                    owner
+                }).collect::<Vec<_>>();
+                let all = if intake.ranks() == 8 { u8::MAX } else { (1u8 << intake.ranks()) - 1 };
+                admitted.check_owners(intake.mode.planner_mode(), geometry.landing & all != all, &owners)?;
+                Ok(())
+            })();
+            if let Err(error) = check { self.transport = Some(transport); return Err(error); }
+        }
         self.exchange = Some(crate::shared::spark_waves::Waves::start(intake.library, geometry, transport, grouping,
             arenas, self.timing, storage)?);
         Ok(())
