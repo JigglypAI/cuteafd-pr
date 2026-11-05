@@ -49,7 +49,13 @@ impl Contribution {
         if let Some((commit, acknowledgement, owner)) = completion {
             out.completions.push(Completion { commit, acknowledgement, _owner: owner });
         }
+        let mut reserved = Vec::new();
         if let Some((spec, address)) = vision {
+            let start = usize::try_from(spec.native.inv_freq)?;
+            let end = start.checked_add(spec.frequency_bytes().len()).context("vision constants overflow")?;
+            ensure!(end <= spec.native.weight_bytes as usize, "vision constants outside admitted arena");
+            reserved.push((device, address.checked_add(start).context("vision constants address overflow")?,
+                address.checked_add(end).context("vision constants address overflow")?));
             for read in &spec.reads {
                 append(&mut out.records, device, address, spec.native.weight_bytes as usize,
                     &read.path, &read.metadata, read.destination, read.vector)?;
@@ -68,6 +74,7 @@ impl Contribution {
                     read.metadata.dtype == cuteafd_core::DType::Bf16)?;
             }
         }
+        check_destinations(&out.records, reserved)?;
         Ok(out)
     }
     pub(crate) fn extend(&mut self, mut other: Self) {
@@ -81,6 +88,8 @@ impl Contribution {
             let completion = self.completions.remove(0);
             completion.commit.send(true).context("media owner disappeared before push commit")
                 .map_err(PushStartupError::Delivery)?;
+            // Timeout fails startup, not the native commit: the service retains its owner,
+            // whose drop joins the thread before releasing its arenas/library.
             completion.acknowledgement.recv_timeout(std::time::Duration::from_secs(120)).context("media owner commit acknowledgement")
                 .and_then(|result| result.map_err(Into::into)).map_err(PushStartupError::Delivery)?;
         }
@@ -91,6 +100,29 @@ impl Drop for Contribution {
     fn drop(&mut self) {
         for completion in &self.completions { let _ = completion.commit.send(false); }
     }
+}
+
+/// Include native-initialized regions so push records cannot overwrite them or each other.
+fn check_destinations(records: &Records, mut ranges: Vec<(i32, usize, usize)>) -> Result<()> {
+    let mut add = |buffer: &CuteafdDeviceBuffer| -> Result<()> {
+        let start = buffer.ptr as usize;
+        let end = start.checked_add(buffer.bytes).context("media destination overflow")?;
+        ranges.push((buffer.device_id, start, end));
+        Ok(())
+    };
+    for operand in &records.operands { add(&operand.buffer)?; }
+    for step in &records.steps {
+        for job in &step.jobs {
+            match job {
+                Job::Widen { dst, .. } => add(dst)?,
+                _ => anyhow::bail!("unexpected media transform"),
+            }
+        }
+    }
+    ranges.sort_unstable();
+    ensure!(ranges.windows(2).all(|pair| pair[0].0 != pair[1].0 || pair[0].2 <= pair[1].1),
+        "overlapping media destinations or native constants");
+    Ok(())
 }
 
 fn append(records: &mut Records, device: i32, address: usize, arena_bytes: usize,
@@ -164,6 +196,29 @@ pub(crate) mod tests {
             * if read.vector { 2 } else { 1 }).sum::<usize>()
             + pcm.push_reads().map(|read| read.metadata.byte_length as usize).sum::<usize>();
         assert_records(root.path(), records, source, resident);
+    }
+    #[test]
+    fn vision_push_rejects_native_constant_and_record_overlaps() {
+        let root = tempfile::tempdir().unwrap();
+        cuteafd_loader::plan::testing::write_muse_media_snapshot(root.path(), &[0]);
+        let spec = TowerSpec::muse(root.path(), 4096).unwrap();
+        let prepare = |spec: &TowerSpec| Contribution::prepare(0, Some((spec, 4096)), None, None, None);
+        assert!(prepare(&spec).is_ok());
+        let mut constants = spec.clone();
+        // Isolate the vector so only its widened tail can intersect native constants.
+        let mut vector = constants.reads.iter().find(|read| read.vector).unwrap().clone();
+        vector.destination = constants.native.inv_freq as usize - vector.metadata.byte_length as usize * 2 + 1;
+        constants.reads = vec![vector];
+        assert!(prepare(&constants).err().unwrap().to_string().contains("overlapping"));
+        let mut duplicate = spec.clone();
+        duplicate.reads.push(duplicate.reads[0].clone());
+        assert!(prepare(&duplicate).err().unwrap().to_string().contains("overlapping"));
+        let records = prepare(&spec).unwrap().records();
+        let first = &records.operands[0].buffer;
+        let start = first.ptr as usize;
+        assert!(check_destinations(&records, vec![(first.device_id + 1, start, start + first.bytes)]).is_ok());
+        assert!(check_destinations(&records, vec![(first.device_id, start + first.bytes - 1,
+            start + first.bytes + 1)]).is_err());
     }
     #[test]
     fn mimo_fp32_audio_plan_pushes_codebooks_and_widens_bounded_matrices() {
