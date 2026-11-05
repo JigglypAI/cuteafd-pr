@@ -24,6 +24,14 @@ fn production_link(cfg: &GlmDsaConfig, ranks: usize, shape: PrefillShape, prefil
 
 fn production_input(cfg: &GlmDsaConfig, gpus: usize, ranks: usize, prefill: PrefillShape)
     -> ProductionInput<'_> {
+    let mut budgets = budgets();
+    for rank in 2..ranks {
+        budgets.push(Budget { id: format!("spark.{rank}"),
+            locations: vec![Location { device: Device::Spark(rank as u8), domain: Domain::Managed }],
+            physical_bytes: 1 << 40, logical_bytes: 1 << 40,
+            baseline: Baseline::Forecast { occupied: 0, source: "test physical witness".into(), assumed: false },
+            headroom: 0 });
+    }
     ProductionInput { cfg, layers: cfg.layers, context: 4096, maximum_pool_tokens: 8192,
         attention: if gpus == 2 { AttentionPlacement::Context } else { AttentionPlacement::Heads },
         gpus, prefill,
@@ -40,7 +48,7 @@ fn production_input(cfg: &GlmDsaConfig, gpus: usize, ranks: usize, prefill: Pref
         decode_link: (ranks > 0).then(|| production_link(cfg, ranks, PrefillShape { rows: 64, waves: 1 }, false)),
         prefill_link: (ranks > 0).then(|| production_link(cfg, ranks, prefill, true)),
         skip_routed_experts: false, operation: Operation::Serving,
-        sync_upload_bytes: 0, owners: vec![], budgets: budgets() }
+        sync_upload_bytes: 0, owners: vec![], budgets }
 }
 
 #[test]
