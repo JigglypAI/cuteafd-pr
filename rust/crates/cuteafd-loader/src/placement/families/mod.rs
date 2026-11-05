@@ -61,9 +61,9 @@ pub const QWEN4: ExecutorModes = ExecutorModes { family: "qwen4", modes: &[WHOLE
 
 /// Kimi: TP2 KDA, whole-owned or context-split MLA and split dense/shared FFNs.
 pub const KIMI_K3: ExecutorModes = ExecutorModes { family: "kimi_k3",
-    modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit,
+    modes: &[LayerMode::HeadSplit,
         LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
-        LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }],
+        LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }, LayerMode::ContextSplit],
     hops: true, attention: AttentionPlacement::Layers };
 
 /// Step-5: SWA head-split on a pair, alternating whole-owned CSA layers;
