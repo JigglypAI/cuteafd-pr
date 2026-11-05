@@ -391,6 +391,8 @@ def check_inventory(root, role, wanted, symbols=None):
                     require(symbol in symbols, f'missing native expert package {item} ({symbol})')
             if entry['audio']:
                 require('cuteafd_audio_required' in symbols, 'missing audio tower package (cuteafd_audio_required)')
+                if entry['family'] == 'muse_spark':
+                    require('cuteafd_pcm_required' in symbols, 'missing Muse audio tower package (cuteafd_pcm_required)')
         except (ValueError, KeyError, TypeError) as error:
             raise ValueError(f'entry {entry["name"]} ({role}): {error}') from error
 

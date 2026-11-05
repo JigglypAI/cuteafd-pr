@@ -171,6 +171,8 @@ def family_scopes(cards, config_reader):
             # whole or TP2 on onboarded RTX layers: one package on both roles.
             env['CUTEAFD_WIP_' + PROGRAM_SWITCHES[family] + '_AOT'] = 'ON'
             scopes.add('muse:exl3-k45')
+            if values.get('AUDIO', 'auto') != 'off':
+                env['CUTEAFD_WIP_AUDIO_AOT'] = 'ON'
             if count:
                 counts.add(f"muse={int(values.get('SPARK_TP', count))}")
         if family == 'mistral_large4':

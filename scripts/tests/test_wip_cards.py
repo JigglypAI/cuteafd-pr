@@ -1208,6 +1208,24 @@ def test_slot_check_reads_host_root_without_any_container(tmp_path, monkeypatch)
         cards.slot_check(arm, 'raptor')
 
 
+@pytest.mark.parametrize('pcm_audio', [False, True])
+def test_slot_check_attests_pcm_symbol_independently(tmp_path, monkeypatch, pcm_audio):
+    root = tmp_path / 'wip-inst'
+    _sealed_slot(root)
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    symbols = '0000 T cuteafd_audio_required\n'
+    if pcm_audio:
+        symbols += '0001 T cuteafd_pcm_required\n'
+    nm = bin_dir / 'nm'
+    nm.write_text('#!/bin/sh\ncat <<\'SYMBOLS\'\n' + symbols + 'SYMBOLS\n')
+    nm.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{bin_dir}:{os.environ["PATH"]}')
+    meta = json.loads(cards.slot_check(dict(instance='inst', slot='s', root=str(root)), 'raptor'))
+    assert meta['contents']['audio'] is True
+    assert meta['contents']['pcm_audio'] is pcm_audio
+
+
 def _kit(tmp_path, *entries):
     kit = tmp_path / 'kit'
     kit.mkdir(exist_ok=True)
@@ -1450,6 +1468,17 @@ def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_
                                       'tp_role': None, 'nvfp4': False}
 
 
+@pytest.mark.parametrize('audio,enabled', [(None, True), ('auto', True), ('on', True), ('off', False)])
+def test_muse_audio_scope_matches_card_request(tmp_path, audio, enabled):
+    cfg = tmp_path / 'muse.config'
+    cfg.write_text('FAMILY=muse_spark\nSPARK_COUNT=4\n')
+    card = dict(family='muse_spark', config=str(cfg), gpus=[0], sparks=['ostrich', 'dodo', 'emu', 'kiwi'],
+                set={} if audio is None else dict(AUDIO=audio))
+    scopes = cards.build_scopes([card])
+    assert (scopes.get('CUTEAFD_WIP_AUDIO_AOT') == 'ON') == enabled
+    assert cards.slot_needs(card)['audio'] == enabled
+
+
 @pytest.mark.parametrize('size,gpus,count', [('min', [0], 4), ('max', [0, 1], 6)])
 def test_gate_muse_cards_use_real_hosts_and_native_defaults(size, gpus, count):
     kit = ROOT / 'scripts/bench/kits/gate'
@@ -1526,9 +1555,9 @@ def test_build_staging_follows_card_coordinator_gpu(tmp_path, monkeypatch):
         cards.build_arms({'base': 'HEAD'}, cards.arms_from(['base=x:a']), [card], tmp_path / 'bad', 'task', True)
 
 
-def _fake_slot(packages=(), audio=True):
+def _fake_slot(packages=(), audio=True, pcm_audio=True):
     return lambda arm, host: json.dumps(dict(slot=arm['slot'], seal_sha256='seal', artifact_manifest_sha256='art',
-                                             contents=dict(packages=list(packages), audio=audio)))
+                                             contents=dict(packages=list(packages), audio=audio, pcm_audio=pcm_audio)))
 
 
 def _run_main(monkeypatch, argv, slot=None, rc_for=lambda job: 0, results=None, smoke_envs=None):
@@ -1625,6 +1654,20 @@ def test_preflight_refuses_missing_packages_and_audio_before_any_launch(tmp_path
     rc, launched = _run_main(monkeypatch, argv + ['--resume'], slot=_fake_slot(
         packages=['fp8/fp8-mimof', 'exl3/exl3-glmf-k34', 'fp8/fp8-glmf'], audio=True))
     assert rc == 0 and sorted(launched) == ['glmf-exl3-max/c', 'mimo26-flash-max/c']
+
+
+@pytest.mark.parametrize('pcm_audio', [False, None])
+def test_muse_preflight_refuses_missing_pcm_before_any_launch(tmp_path, monkeypatch, pcm_audio):
+    argv = ['--kit', str(ROOT / 'scripts/bench/kits/gate'), '--cards', 'muse-spark-exl3-max',
+            '--matrix', '--arm', 'c=x:s', '--state', str(tmp_path / 'state')]
+    with pytest.raises(ValueError, match='cuteafd_pcm_required'):
+        _run_main(monkeypatch, argv, slot=_fake_slot(packages=['exl3/exl3-muse-k45'],
+                                                   audio=True, pcm_audio=pcm_audio))
+    assert not list((tmp_path / 'state').glob('*/exit'))
+    assert json.loads((tmp_path / 'state' / 'preflight.json').read_text())['status'] == 'failed'
+    rc, launched = _run_main(monkeypatch, argv + ['--resume'], slot=_fake_slot(
+        packages=['exl3/exl3-muse-k45'], audio=True, pcm_audio=True))
+    assert rc == 0 and launched == ['muse-spark-exl3-max/c']
 
 
 def test_preflight_only_and_grant_hook(tmp_path, monkeypatch, capsys):
