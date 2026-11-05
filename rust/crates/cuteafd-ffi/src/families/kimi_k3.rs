@@ -93,6 +93,29 @@ impl<'a> KimiMla<'a> {
         Ok(())
     }
 
+    /// Rank-local projection and owner-only cache writes. Slots are local to
+    /// this rank's compact cache; -1 suppresses writes owned by the peer.
+    pub fn produce(&self, weights: KimiMlaWeights, b: KimiMlaBatch, stream: *mut c_void) -> Result<()> {
+        validate_producer(weights, b, self.heads, self.rows, self.scratch[0], self.cache_format.record_bytes())?;
+        // SAFETY: phase-local extents, devices and writer aliases are checked;
+        // caller retains the compact cache, fixed query and exact stream.
+        unsafe { self.producer.launch(&[b.x.ptr, b.slots.ptr, weights.qkv_a.ptr, weights.q_a_norm.ptr,
+            weights.kv_a_norm.ptr, weights.q_b.ptr, weights.uk.ptr, b.cache.ptr, b.query.ptr,
+            b.q_resid.ptr, b.producer_scratch.ptr], &[Scalar::I32(b.rows as i32)], stream)?; }
+        Ok(())
+    }
+
+    /// UV/gate/output after the fixed-order two-owner LSE combination. This
+    /// phase does not read the cache, query or local partial scratch.
+    pub fn output(&self, weights: KimiMlaWeights, b: KimiMlaBatch, stream: *mut c_void) -> Result<()> {
+        validate_output(weights, b, self.heads, self.rows, self.scratch[2])?;
+        // SAFETY: phase-local operands are validated; the combine precedes this
+        // launch on the same retained compute stream.
+        unsafe { self.output.launch(&[b.attention.ptr, b.x.ptr, weights.uv.ptr, weights.gate.ptr,
+            weights.output.ptr, b.output.ptr, b.output_scratch.ptr], &[Scalar::I32(b.rows as i32)], stream)?; }
+        Ok(())
+    }
+
     /// Enqueue without allocation of device storage, synchronization or lazy
     /// kernel loading. The owning engine serializes accesses and retains all
     /// buffers through completion and every replay of a captured graph.
@@ -136,6 +159,44 @@ impl<'a> KimiMla<'a> {
         }
         Ok(())
     }
+}
+
+fn validate_phase(operands: &[(Buffer, usize)], writers: std::ops::Range<usize>, device: i32) -> Result<()> {
+    validate_buffers(operands, device)?;
+    for &(buffer, bytes) in operands {
+        if buffer.flags != 0 || (buffer.ptr as usize).checked_add(bytes).is_none() {
+            return Err(KimiMlaError::Invalid("phase flags/address overflow"));
+        }
+    }
+    for writer in writers { for other in 0..operands.len() {
+        if writer != other { reject_overlap(operands[writer], operands[other])
+            .map_err(|_| KimiMlaError::Invalid("phase operands overlap"))?; }
+    }}
+    Ok(())
+}
+
+fn validate_producer(w: KimiMlaWeights, b: KimiMlaBatch, heads: usize, rows: usize,
+    scratch: usize, record_bytes: usize) -> Result<()> {
+    if b.rows == 0 || b.rows > rows || b.cache_pages == 0 || b.cache_pages > i32::MAX as usize {
+        return Err(KimiMlaError::Invalid("producer batch/cache geometry"));
+    }
+    let cache = b.cache_pages.checked_mul(MLA_PAGE_ROWS * record_bytes)
+        .ok_or(KimiMlaError::Invalid("producer cache overflow"))?;
+    let r = b.rows;
+    validate_phase(&[(b.x, r * 7168 * 2), (b.slots, r * 8),
+        (w.qkv_a, 2112 * 7168 * 2), (w.q_a_norm, 1536 * 2), (w.kv_a_norm, 512 * 2),
+        (w.q_b, heads * 192 * 1536 * 2), (w.uk, heads * 512 * 128 * 2),
+        (b.cache, cache), (b.query, r * heads * 576 * 2), (b.q_resid, r * 1536 * 2),
+        (b.producer_scratch, scratch)], 7..11, b.x.device_id)
+}
+
+fn validate_output(w: KimiMlaWeights, b: KimiMlaBatch, heads: usize, rows: usize, scratch: usize) -> Result<()> {
+    if b.rows == 0 || b.rows > rows { return Err(KimiMlaError::Invalid("output batch geometry")); }
+    let r = b.rows;
+    validate_phase(&[(b.attention, r * heads * 512 * 2), (b.x, r * 7168 * 2),
+        (w.uv, heads * 128 * 512 * 2), (w.gate, heads * 128 * 7168 * 2),
+        (w.output, 7168 * heads * 128 * 2), (b.output, r * 7168 * 2),
+        (b.output_scratch, scratch)], 5..7, b.x.device_id)
 }
 
 fn validate_projected_attention(b:KimiMlaBatch,heads:usize,rows:usize,context:usize,splits:usize,scratch:usize,
@@ -1063,6 +1124,43 @@ mod tests {
                 "page_rows": 64, "norm_eps": 1e-6, "kv_cache": "bf16", "max_context": context,
                 "num_splits": splits, "chunks_per_split": context.div_ceil(64).div_ceil(splits), "mode": mode.name()}),
         })
+    }
+
+    #[test]
+    fn context_producer_and_output_validate_only_their_phase_operands() {
+        let buffer = |index| Buffer { ptr: (index * 0x10000000usize) as *mut c_void,
+            bytes: 0x10000000, device_id: 0, flags: 0 };
+        let absent = Buffer { ptr: std::ptr::null_mut(), bytes: 0, device_id: 0, flags: 0 };
+        let b = KimiMlaBatch { rows: 8, requests: 0, page_table_width: 0, cache_pages: 2, active_splits: 0,
+            x: buffer(1), slots: buffer(2), cache: buffer(3), page_table: absent, lengths: absent,
+            query_offsets: absent, query: buffer(4), q_resid: buffer(5), attention: buffer(6), lse: absent,
+            output: buffer(7), producer_scratch: buffer(8), attention_scratch: absent, output_scratch: buffer(9) };
+        let w = KimiMlaWeights { qkv_a: buffer(10), q_a_norm: buffer(11), kv_a_norm: buffer(12),
+            q_b: buffer(13), uk: buffer(14), uv: buffer(15), gate: buffer(16), output: buffer(17) };
+        let producer = |b| validate_producer(w, b, 48, 64, 4096, MLA_RECORD_BYTES);
+        let output = |b| validate_output(w, b, 48, 64, 4096);
+        producer(b).unwrap();
+        output(b).unwrap();
+        // No phase demands the exchange's h96 assembled query, full history,
+        // attention tables, or another phase's scratch before enqueueing.
+        producer(KimiMlaBatch { attention: absent, output: absent, output_scratch: absent, ..b }).unwrap();
+        output(KimiMlaBatch { slots: absent, cache: absent, query: absent, q_resid: absent,
+            producer_scratch: absent, cache_pages: 0, ..b }).unwrap();
+        for bad in [KimiMlaBatch { rows: 0, ..b }, KimiMlaBatch { rows: 65, ..b }] {
+            assert!(producer(bad).is_err()); assert!(output(bad).is_err());
+        }
+        assert!(producer(KimiMlaBatch { cache_pages: usize::MAX, ..b }).is_err());
+        for reader in [b.x, b.slots, w.qkv_a, w.q_a_norm, w.kv_a_norm, w.q_b, w.uk] {
+            assert!(producer(KimiMlaBatch { query: Buffer { ptr: reader.ptr, ..b.query }, ..b }).is_err());
+        }
+        for reader in [b.attention, b.x, w.uv, w.gate, w.output] {
+            assert!(output(KimiMlaBatch { output: Buffer { ptr: reader.ptr, ..b.output }, ..b }).is_err());
+        }
+        for bad in [Buffer { flags: 1, ..b.query }, Buffer { bytes: 1, ..b.query },
+            Buffer { device_id: 1, ..b.query }, Buffer { ptr: (usize::MAX - 15) as *mut c_void, ..b.query }] {
+            assert!(producer(KimiMlaBatch { query: bad, ..b }).is_err());
+            assert!(output(KimiMlaBatch { output: bad, ..b }).is_err());
+        }
     }
 
     #[test]

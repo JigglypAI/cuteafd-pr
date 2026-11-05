@@ -659,6 +659,7 @@ impl<'a> LocalLane<'a> {
             match key.op {
                 Op::Residual(site) => { self.residual(site, key.rows)?; }
                 Op::Ffn(layer) => { self.ffn(layer, key.rows)?; }
+                Op::Context { .. } => bail!("Kimi context phase binding is not installed"),
                 Op::Attention { layer, sequences, speculative } => {
                     self.attention = Some(AttentionShape { rows: key.rows, sequences });
                     self.attention(layer, key.rows, speculative)?;
@@ -1056,6 +1057,44 @@ pub(crate) struct AttentionRows {
     offsets: Vec<u8>,
 }
 
+/// Shared safety boundary for uniform and parity MLA metadata. A context
+/// descriptor may compact addresses only after page ownership and COW checks.
+pub(crate) fn validate_sequence_pages(sequences: &[SequenceRows<'_>], capacity: usize,
+    slots: usize, max_context: usize, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<usize> {
+    ensure!((1..=4096).contains(&capacity) && slots > 0 && (1..=1_048_576).contains(&max_context)
+        && pool.page_rows() == 64, "Kimi row descriptor capacity/pages");
+    ensure!(!sequences.is_empty() && sequences.len() <= slots, "Kimi row descriptor sequence count");
+    let rows = sequences.iter().try_fold(0usize, |n, sequence|
+        n.checked_add(sequence.rows).context("Kimi row descriptor overflow"))?;
+    ensure!(rows > 0 && rows <= capacity && (rows <= 64 || sequences.len() == 1),
+        "Kimi wide prefill requires one sequence and admitted rows");
+    let reserved = pool.reserved() * if pool.is_parity() { 2 } else { 1 };
+    let limit = pool.capacity().checked_add(reserved).context("Kimi pool extent overflow")?;
+    let mut used_slots = std::collections::BTreeSet::new();
+    let mut page_users = BTreeMap::<u32, bool>::new();
+    for sequence in sequences {
+        ensure!(sequence.rows > 0 && sequence.slot < slots && used_slots.insert(sequence.slot),
+            "Kimi sequence slots repeat or exceed admission");
+        let end = sequence.start.checked_add(sequence.rows).context("Kimi row position overflow")?;
+        ensure!(end <= max_context && sequence.pages.len() >= end.div_ceil(64),
+            "Kimi sequence context/pages too short");
+        let mut unique = std::collections::BTreeSet::new();
+        for (position, &page) in sequence.pages[..end.div_ceil(64)].iter().enumerate() {
+            ensure!((page as usize) < limit && page as usize >= reserved && unique.insert(page),
+                "Kimi sequence page outside pool or repeated");
+            ensure!(!pool.is_parity() || page as usize % 2 == position % 2,
+                "Kimi sequence page parity differs from logical owner");
+            let writable = position >= sequence.start / 64;
+            ensure!(pool.refs(page) > 0 && (!writable || pool.refs(page) == 1),
+                "Kimi write requires an allocated private page (copy shared tails first)");
+            if let Some(previous_writable) = page_users.insert(page, writable) {
+                ensure!(!writable && !previous_writable, "Kimi requests alias a writable page");
+            }
+        }
+    }
+    Ok(rows)
+}
+
 impl AttentionRows {
     fn packed(sequences: &[SequenceRows<'_>], capacity: usize, slots: usize, max_context: usize,
         pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Vec<Self>> {
@@ -1085,41 +1124,18 @@ impl AttentionRows {
         ensure!((1..=4096).contains(&capacity) && (1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots)
             && (1..=1_048_576).contains(&max_context), "Kimi row descriptor capacity");
         ensure!(!pool.is_parity() && pool.page_rows() == 64, "Kimi rows require shared uniform 64-row pages");
-        ensure!(!sequences.is_empty() && sequences.len() <= slots, "Kimi row descriptor sequence count");
-        let rows = sequences.iter().try_fold(0usize, |n, sequence| n.checked_add(sequence.rows)
-            .ok_or_else(|| anyhow::anyhow!("Kimi row descriptor overflow")))?;
-        ensure!(rows > 0 && rows <= capacity && (rows <= 64 || sequences.len() == 1),
-            "Kimi wide prefill requires one sequence and admitted rows");
+        let rows = validate_sequence_pages(sequences, capacity, slots, max_context, pool)?;
         let width = max_context.div_ceil(64);
         let requests = if rows <= 64 { rows } else { 1 };
         let mut metadata = Self { rows, sequences: sequences.len(), width,
             kda_slots: Vec::with_capacity(rows * 4), kda_first: Vec::with_capacity(rows * 4),
             mla_slots: Vec::with_capacity(rows * 8), page_table: vec![0; requests * width * 4],
             lengths: Vec::with_capacity(requests * 4), offsets: Vec::with_capacity((requests + 1) * 4) };
-        let mut used_slots = std::collections::BTreeSet::new();
-        let mut page_users = BTreeMap::<u32, (usize, bool)>::new();
         let mut row = 0;
         metadata.offsets.extend_from_slice(&0i32.to_le_bytes());
-        for (index, sequence) in sequences.iter().enumerate() {
-            ensure!(sequence.rows > 0 && sequence.slot < slots && used_slots.insert(sequence.slot),
-                "Kimi sequence slots repeat or exceed admission");
-            let end = sequence.start.checked_add(sequence.rows).ok_or_else(|| anyhow::anyhow!("Kimi row position overflow"))?;
-            ensure!(end <= max_context && sequence.pages.len() >= end.div_ceil(64),
-                "Kimi sequence context/pages too short");
+        for sequence in sequences {
+            let end = sequence.start + sequence.rows;
             let pages = &sequence.pages[..end.div_ceil(64)];
-            let mut unique = std::collections::BTreeSet::new();
-            for (position, &page) in pages.iter().enumerate() {
-                ensure!((page as usize) < pool.capacity() + pool.reserved() && page as usize >= pool.reserved()
-                    && unique.insert(page), "Kimi sequence page outside pool or repeated");
-                let writable = position >= sequence.start / 64;
-                ensure!(pool.refs(page) > 0 && (!writable || pool.refs(page) == 1),
-                    "Kimi write requires an allocated private page (copy shared tails first)");
-                if let Some(&(previous, previous_writable)) = page_users.get(&page) {
-                    ensure!(previous == index || (!writable && !previous_writable),
-                        "Kimi requests alias a writable page");
-                }
-                page_users.insert(page, (index, writable));
-            }
             let first = row;
             for offset in 0..sequence.rows {
                 metadata.kda_slots.extend_from_slice(&(sequence.slot as i32).to_le_bytes());

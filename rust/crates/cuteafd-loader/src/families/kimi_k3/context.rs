@@ -3,6 +3,32 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::MlaCacheFormat;
 use crate::placement::ContextBuffers;
 
+/// All live dispatch values are captured before readiness; never resolve a
+/// new executable from the current history length.
+pub const SPLIT_BUCKETS: [usize; 4] = [2, 4, 8, 16];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GraphPhase {
+    Produce,
+    Partial { heads_rank: usize, splits: usize },
+    CombineOutput,
+    GatheredAttention,
+    Output,
+}
+
+pub fn graph_phases(rows: usize) -> Vec<GraphPhase> {
+    let mut phases = vec![GraphPhase::Produce];
+    if rows <= 64 {
+        for heads_rank in 0..2 { for splits in SPLIT_BUCKETS {
+            phases.push(GraphPhase::Partial { heads_rank, splits });
+        }}
+    } else {
+        phases.push(GraphPhase::GatheredAttention);
+    }
+    phases.push(if rows <= 64 { GraphPhase::CombineOutput } else { GraphPhase::Output });
+    phases
+}
+
 const ROWS: usize = 64;
 const HEADS: usize = 48;
 const METADATA: [&str; 5] = ["context slots", "compact page tables", "shard lengths", "gather tables", "commit blocks"];

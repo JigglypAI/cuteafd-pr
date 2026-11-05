@@ -123,9 +123,8 @@ impl<'a> Rank<'a> {
 
 pub(crate) struct ContextOwner<'a> {
     pub(crate) ranks: [Rc<Rank<'a>>; 2],
-    // Must drop before the engine's peer abort words and exchange streams.
+    // Must drop before the engine's peer abort words.
     pub(crate) exchange: ContextExchange<'a>,
-    exchange_streams: [Rc<Stream<'a>>; 2],
 }
 
 impl Drop for ContextOwner<'_> {
@@ -133,25 +132,26 @@ impl Drop for ContextOwner<'_> {
         for rank in &self.ranks {
             for stream in &rank.streams { stream.drain_or_abort("Kimi context compute readers"); }
         }
-        for stream in &self.exchange_streams { stream.drain_or_abort("Kimi context exchange readers"); }
     }
 }
 
 impl<'a> ContextOwner<'a> {
+    /// Arithmetic and peer flags share each exact rank compute stream, as in
+    /// GLM/V4. Joining both computes onto Kimi's ordinary exchange stream from
+    /// serial rank callbacks would introduce a cross-rank event cycle.
     pub(crate) fn new(library: &'a NativeLibrary, layout: &ContextLayout,
-        exchange_streams: [Rc<Stream<'a>>; 2], readers: [Vec<Rc<Stream<'a>>>; 2],
-        abort: Option<[*const u32; 2]>) -> Result<Self> {
-        let ranks = std::array::from_fn(|rank| RankDevice {
-            device: exchange_streams[rank].device.id, stream: exchange_streams[rank].raw });
-        ensure!(exchange_streams.iter().enumerate().all(|(rank, stream)|
-            std::ptr::eq(stream.device.library, library) && !readers[rank].is_empty()
-                && readers[rank].iter().all(|reader| reader.device.id == stream.device.id
-                    && std::ptr::eq(reader.device.library, library))),
-            "Kimi context reader/exchange device mismatch");
-        let exchange = exchange_streams[0].device.run(||
+        compute_streams: [Rc<Stream<'a>>; 2], abort: Option<[*const u32; 2]>) -> Result<Self> {
+        ensure!(compute_streams.iter().all(|stream| std::ptr::eq(stream.device.library, library)),
+            "Kimi context compute library mismatch");
+        ensure!(compute_streams[0].device.id != compute_streams[1].device.id,
+            "Kimi context needs distinct rank devices");
+        let ranks = compute_streams.each_ref().map(|stream| RankDevice {
+            device: stream.device.id, stream: stream.raw });
+        let exchange = compute_streams[0].device.run(||
             ContextExchange::new(library, ranks, &layout.buffers(), abort))?;
-        let [r0, r1] = readers;
-        let owner = Self { ranks: [Rc::new(Rank::allocate(layout, r0)?), Rc::new(Rank::allocate(layout, r1)?)], exchange, exchange_streams };
+        let [r0, r1] = compute_streams;
+        let owner = Self { ranks: [Rc::new(Rank::allocate(layout, vec![r0])?),
+            Rc::new(Rank::allocate(layout, vec![r1])?)], exchange };
         owner.check_charges(layout)?;
         Ok(owner)
     }
@@ -177,7 +177,7 @@ impl<'a> ContextOwner<'a> {
 }
 
 /// Startup-captured buckets; live history changes dispatch, not program resolution.
-pub(crate) const SPLIT_BUCKETS: [usize; 4] = [2, 4, 8, 16];
+pub(crate) use cuteafd_loader::families::kimi_k3::context::SPLIT_BUCKETS;
 
 pub(crate) fn split_bucket(owned_pages: usize, rows: usize, sms: usize) -> Result<usize> {
     ensure!((1..=64).contains(&rows) && sms > 0, "invalid Kimi split work geometry");
@@ -200,12 +200,11 @@ pub(crate) struct DecodeRows {
 }
 
 impl DecodeRows {
-    pub(crate) fn new(rank: usize, sequences: &[super::device::SequenceRows<'_>], extent: usize) -> Result<Self> {
+    pub(crate) fn new(rank: usize, sequences: &[super::device::SequenceRows<'_>], extent: usize,
+        slots: usize, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Self> {
         use crate::shared::peer_split::context::{local_pages, shard_rows};
-        ensure!(rank < 2 && extent > 0 && extent <= 1_048_576, "Kimi compact metadata geometry");
-        let rows = sequences.iter().try_fold(0usize, |n, s|
-            n.checked_add(s.rows).context("Kimi compact row count overflow"))?;
-        ensure!(!sequences.is_empty() && (1..=64).contains(&rows), "Kimi compact decode row capacity");
+        ensure!(rank < 2 && pool.is_parity(), "Kimi compact metadata needs two-rank parity pages");
+        let rows = super::device::validate_sequence_pages(sequences, 64, slots, extent, pool)?;
         let width = extent.div_ceil(64).div_ceil(2);
         let mut result = Self { rows, width, owned_pages: 0, slots: Vec::with_capacity(rows * 8),
             tables: vec![0; rows * width * 4], lengths: Vec::with_capacity(rows * 4) };
@@ -249,26 +248,34 @@ mod tests {
     #[test]
     fn compact_decode_metadata_is_causal_and_writes_only_its_owner() -> Result<()> {
         use super::super::device::SequenceRows;
+        let mut pool = cuteafd_engine::prefix::RefPagePool::parity(16, 64, 0);
+        pool.alloc_for(0..16)?;
         let pages = [14, 9, 4, 3, 12];
+        let second = [4, 3, 12, 5];
         let sequences = [SequenceRows { slot: 0, start: 62, rows: 4, pages: &pages },
-            SequenceRows { slot: 1, start: 190, rows: 4, pages: &pages }];
+            SequenceRows { slot: 1, start: 190, rows: 4, pages: &second }];
         let decode_i64 = |bytes: &[u8]| bytes.chunks_exact(8)
             .map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
         let decode_i32 = |bytes: &[u8]| bytes.chunks_exact(4)
             .map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
-        let a = DecodeRows::new(0, &sequences, 320)?;
-        let b = DecodeRows::new(1, &sequences, 320)?;
+        let a = DecodeRows::new(0, &sequences, 320, 2, &pool)?;
+        let b = DecodeRows::new(1, &sequences, 320, 2, &pool)?;
         assert_eq!(a.width, 3);
-        assert_eq!(decode_i64(&a.slots), [510, 511, -1, -1, 190, 191, -1, -1]);
-        assert_eq!(decode_i64(&b.slots), [-1, -1, 256, 257, -1, -1, 64, 65]);
+        assert_eq!(decode_i64(&a.slots), [510, 511, -1, -1, 446, 447, -1, -1]);
+        assert_eq!(decode_i64(&b.slots), [-1, -1, 256, 257, -1, -1, 128, 129]);
         assert_eq!(decode_i32(&a.lengths), [63, 64, 64, 64, 127, 128, 128, 128]);
         assert_eq!(decode_i32(&b.lengths), [0, 0, 1, 2, 64, 64, 65, 66]);
-        assert_eq!(&decode_i32(&a.tables)[12..15], [7, 2, 0]);
-        assert_eq!(&decode_i32(&b.tables)[18..21], [4, 1, 0]);
-        let empty_peer = DecodeRows::new(1, &[SequenceRows { slot: 0, start: 0, rows: 1, pages: &pages }], 320)?;
+        assert_eq!(&decode_i32(&a.tables)[12..15], [2, 6, 0]);
+        assert_eq!(&decode_i32(&b.tables)[18..21], [1, 2, 0]);
+        let empty_peer = DecodeRows::new(1, &[SequenceRows { slot: 0, start: 0, rows: 1, pages: &pages }], 320, 2, &pool)?;
         assert_eq!(decode_i32(&empty_peer.lengths), [0]);
         assert!(empty_peer.tables.iter().all(|&b| b == 0));
-        assert!(DecodeRows::new(0, &[SequenceRows { slot: 0, start: 0, rows: 1, pages: &[1] }], 320).is_err());
+        assert!(DecodeRows::new(0, &[SequenceRows { slot: 0, start: 0, rows: 1, pages: &[1] }], 320, 2, &pool).is_err());
+        let aliases = [SequenceRows { slot: 0, start: 62, rows: 4, pages: &pages },
+            SequenceRows { slot: 1, start: 62, rows: 4, pages: &pages }];
+        assert!(DecodeRows::new(0, &aliases, 320, 2, &pool).is_err());
+        pool.release(&[14]);
+        assert!(DecodeRows::new(0, &sequences, 320, 2, &pool).is_err());
         Ok(())
     }
 
@@ -311,8 +318,13 @@ mod tests {
                 let streams = [0, 1].map(|id| Rc::new(Stream::new(
                     crate::shared::memory::device::Device { library: &library, id }).unwrap()));
                 let before = fixture.mapped_bytes(&library)?;
-                let owner = ContextOwner::new(&library, &layout, streams.clone(),
-                    streams.map(|s| vec![s]), None)?;
+                let owner = ContextOwner::new(&library, &layout, streams.clone(), None)?;
+                for rank in 0..2 {
+                    assert_eq!(owner.ranks[rank].streams.len(), 1);
+                    assert!(Rc::ptr_eq(&owner.ranks[rank].streams[0], &streams[rank]));
+                }
+                let other = Stream::new(streams[0].device)?;
+                assert!(owner.ranks[0].upload("context slots", 0, &[0; 8], &other).is_err());
                 owner.check_charges(&layout)?;
                 let charged: u64 = layout.buffers().demands()?.iter().map(|d| d.bytes).sum();
                 assert_eq!((fixture.mapped_bytes(&library)? - before) as u64, charged,

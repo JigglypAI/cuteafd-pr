@@ -286,19 +286,29 @@ pub fn graphs(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, v
 
 pub fn graphs_for_ranks(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
     ranks: usize, resident: impl Fn(usize, usize) -> bool) -> Result<GraphSet> {
+    graphs_with_context(cfg, lanes, capacity, slots, verify, ranks, resident, |_| false)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn graphs_with_context(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
+    ranks: usize, resident: impl Fn(usize, usize) -> bool, context: impl Fn(usize) -> bool) -> Result<GraphSet> {
     ensure!(matches!(ranks, 1 | 2) && (1..=2).contains(&lanes) && (1..=UNIT_ROWS_MAX).contains(&capacity)
         && (1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots) && verify <= 64, "Kimi graph geometry");
+    ensure!((0..cfg.layers).all(|layer| !context(layer)
+        || (ranks == 2 && cfg.attention[layer] == KimiAttention::Mla && (0..2).all(|rank| resident(rank, layer)))),
+        "Kimi context graph residency differs from two-rank MLA");
     let mut counts = vec![0; ranks];
     for (rank, count) in counts.iter_mut().enumerate() {
         for rows in graph_rows(verify, capacity) {
             *count += (3 * cfg.layers + usize::from(rank == ranks - 1)) as u64;
             for layer in 0..cfg.layers {
                 if resident(rank, layer) {
+                    let phases = if context(layer) { super::context::graph_phases(rows).len() as u64 } else { 1 };
                     if GRAPH_ROWS.contains(&rows) {
-                        *count += 1 + u64::from(cfg.attention[layer] == KimiAttention::Kda
+                        *count += phases + u64::from(cfg.attention[layer] == KimiAttention::Kda
                             && (2..=slots).contains(&rows));
                     }
-                    *count += u64::from(verify_graph_rows(verify, capacity).contains(&rows));
+                    if verify_graph_rows(verify, capacity).contains(&rows) { *count += phases; }
                 }
             }
         }

@@ -444,9 +444,11 @@ mod tests {
         use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, SnapshotKind};
         use cuteafd_hostcache::{config::Config, copy::Stream as CopyStream};
 
-        for (ranks, heads, context, cache_format) in [(1, false, 262_144), (2, false, 262_144), (2, true, 524_288)].into_iter()
-            .flat_map(|(ranks, heads, context)| [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8]
-                .map(|format| (ranks, heads, context, format))) {
+        for (ranks, attention, context, cache_format) in [
+            (1, AttentionPlacement::Layers, 262_144), (2, AttentionPlacement::Layers, 262_144),
+            (2, AttentionPlacement::Heads, 524_288), (2, AttentionPlacement::Context, 1_048_576)].into_iter()
+            .flat_map(|(ranks, attention, context)| [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8]
+                .map(|format| (ranks, attention, context, format))) {
             let fixture = Fixture::build()?;
             let library = fixture.load()?;
             fixture.immediate_copies(&library)?;
@@ -455,7 +457,7 @@ mod tests {
             cfg.attention = vec![KimiAttention::Kda, KimiAttention::Mla, KimiAttention::Mla];
             cfg.dense.truncate(3);
             let mut inputs = super::super::admission::tests::inputs(&cfg);
-            inputs.attention = heads.then_some(AttentionPlacement::Heads);
+            inputs.attention = (attention == AttentionPlacement::Heads).then_some(AttentionPlacement::Heads);
             inputs.cache_format = cache_format;
             for layouts in &mut inputs.lane_layouts {
                 for layout in layouts {
@@ -466,6 +468,13 @@ mod tests {
             }
             let mut placement = super::super::admission::admit(inputs)?.placement;
             placement.pool_tokens = 512;
+            if attention == AttentionPlacement::Context {
+                for (kind, assignment) in cfg.attention.iter().zip(&mut placement.layers) {
+                    if *kind == KimiAttention::Mla {
+                        assignment.mode = cuteafd_loader::placement::LayerMode::ContextSplit;
+                    }
+                }
+            }
             if ranks == 1 {
                 for layer in &mut placement.layers {
                     layer.mode = cuteafd_loader::placement::LayerMode::Whole {
