@@ -264,13 +264,21 @@ Attention placement (`ATTENTION_PLACEMENT`; the default is the planner's
 | Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ heads² | ✓ layers | ✓ layers | ✓ heads |
-| `heads` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ |
+| `heads` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗⁴ | ✗ | ✗ |
 | `context` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `layers` | ✗ | ✗ | ✓ (explicit; auto stays context) | ✓ (explicit; auto stays context) | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ |
+| `layers` | ✗ | ✗ | ✓ (explicit; auto stays context)³ | ✓ (explicit; auto stays context) | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ |
 
-¹ V4.1 is `layers` on two GPUs and `heads` on one. ² Dense Qwen is a
-single-device executor: `auto` resolves to `heads`, and an explicit `heads`
-is refused until a multi-GPU executor is qualified.
+`✓` means the launch path accepts the value; `✗` means it stops with the
+family's attention-placement error.
+
+¹ V4.1 is `layers` on two GPUs and `heads` on one; an explicit `heads` is
+accepted on either. ² Dense Qwen is a single-device executor: `auto` resolves
+to `heads`, and an explicit `heads` is refused until a multi-GPU executor is
+qualified. ³ Native GLM 5.3 EXLR8 runs `context` (the auto default) and
+explicit `heads` or two-GPU `layers` (#1305, #1308); the planner refuses a
+mode whose image lacks its programs. ⁴ Kimi K3's engine and
+planner take explicit `heads` for MLA layers (the #795 comparison), but the
+launch key serves only `auto` until the launcher allows it.
 
 Speculator (`SPECULATOR`):
 
@@ -304,7 +312,8 @@ Media:
 Native EXLR8 (`EXLR8_MANIFEST`): V4, GLM 5.3/ML4 and GLM Flash, MiMo (dense core
 only) and Qwen4. Placement is 1–2 RTX plus 1–8 Sparks; GLM Flash TP2 also
 allows 0 Sparks. The speculator must be `off` or `dflash2`. GLM needs its
-attention heads or a two-GPU context placement.
+attention heads or a two-GPU context/layers placement; native GLM EXLR8 takes
+context (auto), heads and two-GPU layers (#1305, #1308).
 
 ## Family support: launch keys
 

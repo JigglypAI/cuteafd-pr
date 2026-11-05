@@ -112,6 +112,7 @@ key() {
   else printf '%s' "${3:-}"; fi
 }
 source "$repo_root/scripts/lib/family-keys.sh"
+source "$repo_root/scripts/lib/attention-placement.sh"
 vision="$(get VISION auto)"
 audio="$(get AUDIO auto)"
 vision_replicas="$(get VISION_REPLICAS 1)"
@@ -502,11 +503,7 @@ v41_budget_args=()
 [[ -z "$v41_requested_budget" ]] || v41_budget_args=(--spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$v41_requested_budget")")
 # V4.1 serves its established ranges until its runtime consumes solver placement.
 attention_placement="${ATTENTION_PLACEMENT:-auto}"
-case "$attention_placement" in
-  auto|heads) ;;
-  context|layers) release_die "deepseek_v41 cannot run attention placement $attention_placement: runtime solver placement not implemented; existing ranges stay unchanged" ;;
-  *) release_die "ATTENTION_PLACEMENT must be auto, context, layers or heads" ;;
-esac
+release_check_attention_placement "$attention_placement" deepseek_v41
 case "$EMBEDDING" in host|gpu) ;; *) release_die "EMBEDDING must be host or gpu" ;; esac
 if [[ -n "$wip_slot" ]]; then
   [[ "$wip_slot" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || release_die "invalid WIP slot name: $wip_slot"
@@ -1309,21 +1306,9 @@ if [[ -n "$(get RTX_EXPERT_LAYERS)" ]]; then
   cfg[RTX_EXPERT_LAYERS]="$(release_onboard "$(get RTX_EXPERT_LAYERS)" "$model" "$revision")" || exit 2
 fi
 attention_placement="$(get ATTENTION_PLACEMENT auto)"
-# auto is the family's recorded default (GLM 5.3 and GLM 5.3 Flash: context where the image
-# carries its programs); the planner and the server resolve it. Explicit modes run only where an
-# executor exists.
-case "$attention_placement:$family" in
-  # Kimi K3 and Step-5 run only their recorded automatic placement.
-  auto:kimi_k3|auto:step5|auto:muse_spark) ;;
-  *:kimi_k3|*:step5|*:muse_spark) release_die "$family supports only ATTENTION_PLACEMENT=auto" ;;
-  auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|layers:qwen4) ;;
-  # K4/P7 qualified explicit layers; context remains the recorded auto default.
-  # The planner still requires the selected image's executor and native programs.
-  layers:glm5|layers:glm5_flash)
-    echo "note: $family attention placement layers explicitly selected; auto remains context on two GPUs" >&2 ;;
-  context:*|layers:*) release_die "$family cannot run attention placement $attention_placement: executor not implemented; only heads is qualified" ;;
-  *) release_die "ATTENTION_PLACEMENT must be auto, context, layers or heads" ;;
-esac
+# Per-family acceptance lives in scripts/lib/attention-placement.sh, which the
+# options page test drives for every family x value.
+release_check_attention_placement "$attention_placement" "$family"
 case "$family" in
   deepseek_v4) serve=serve-dsv4 ;;
   glm5) serve=serve-glm ;;
@@ -1352,7 +1337,6 @@ if ((text_family)); then
   esac
 fi
 if [[ "$family" == qwen3_5 ]]; then
-  [[ "$attention_placement" == auto ]] || release_die "dense Qwen currently supports only single-GPU automatic attention placement"
   case "$vision:$audio" in
     auto:auto|auto:off|off:auto|off:off) vision=off; audio=off ;;
     *) release_die "dense Qwen bundled media execution is not qualified" ;;

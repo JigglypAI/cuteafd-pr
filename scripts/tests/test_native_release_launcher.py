@@ -312,14 +312,21 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         source = (ROOT / 'scripts/launch/run-family.sh').read_text()
         generic = source[source.index('# Validate the name before it is used to identify allocations'):]
         block = generic.split('attention_placement="$(get ATTENTION_PLACEMENT auto)"', 1)[1].split('\ncase "$family" in', 1)[0]
-        self.assertLess(generic.index('case "$attention_placement:$family" in'), generic.index('docker run'))
+        # The per-family case lives in scripts/lib/attention-placement.sh; the
+        # call site must still refuse before any container starts.
+        self.assertIn('release_check_attention_placement "$attention_placement" "$family"', block)
+        self.assertLess(generic.index('release_check_attention_placement "$attention_placement" "$family"'),
+                        generic.index('docker run'))
+        placement_lib = (ROOT / 'scripts/lib/attention-placement.sh').read_text()
+        self.assertIn('case "$attention_placement:$family" in', placement_lib)
         self.assertIn('--attention-placement "$attention_placement"', source)
         self.assertIn('CUTEAFD_ATTENTION_PLACEMENT=$attention_placement', source)
         for family in ['glm5', 'glm5_flash', 'deepseek_v4', 'mimo_v2', 'qwen4']:
             for mode in ['auto', 'heads', 'context', 'layers', 'bad']:
                 for wip_slot in ['', 'slot-test']:
                     result = subprocess.run(['bash', '-c',
-                        'source scripts/lib/release-common.sh; release_known_key ATTENTION_PLACEMENT; '
+                        'source scripts/lib/release-common.sh; source scripts/lib/attention-placement.sh; '
+                        'release_known_key ATTENTION_PLACEMENT; '
                         'family="$1"; attention_placement="$2"; wip_slot="$3"; ' + block,
                         'test', family, mode, wip_slot], cwd=ROOT, text=True, capture_output=True)
                     # GLM and V4 run context; Qwen layers requires a Spark-free pair (checked later).
@@ -337,10 +344,17 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         source = v41_source()
         block = source.split('attention_placement="${ATTENTION_PLACEMENT:-auto}"', 1)[1].split(
             'case "$EMBEDDING" in', 1)[0]
-        self.assertLess(source.index('case "$attention_placement" in'), source.index('docker run'))
+        # The V4.1 branch lives in scripts/lib/attention-placement.sh; the call
+        # site must still refuse before any container starts.
+        self.assertIn('release_check_attention_placement "$attention_placement" deepseek_v41', block)
+        self.assertLess(source.index('release_check_attention_placement "$attention_placement" deepseek_v41'),
+                        source.index('docker run'))
+        placement_lib = (ROOT / 'scripts/lib/attention-placement.sh').read_text()
+        self.assertIn('deepseek_v41 cannot run attention placement', placement_lib)
         for mode in ['auto', 'heads', 'context', 'layers', 'bad']:
             result = subprocess.run(['bash', '-c',
-                'source scripts/lib/release-common.sh; attention_placement="$1"; ' + block,
+                'source scripts/lib/release-common.sh; source scripts/lib/attention-placement.sh; '
+                'attention_placement="$1"; ' + block,
                 'test', mode], cwd=ROOT, text=True, capture_output=True)
             self.assertEqual(result.returncode == 0, mode in ['auto', 'heads'], result.stderr)
             if mode in ['context', 'layers']:

@@ -25,10 +25,12 @@ def copy_input(source, destination):
     if source.name == "release-common.sh":
         root = source.resolve().parents[2]
         copy_launcher_shared_inputs(root, destination.parent.parent.parent)
-        # run-family.sh sources the per-family key registry beside release-common.
-        key_registry = destination.parent / "family-keys.sh"
-        if not key_registry.exists():
-            copy_input(root / "scripts" / "lib" / "family-keys.sh", key_registry)
+        # run-family.sh sources the per-family key registries and the attention
+        # validation beside release-common.
+        for shared in ("family-keys.sh", "attention-placement.sh"):
+            staged = destination.parent / shared
+            if not staged.exists():
+                copy_input(root / "scripts" / "lib" / shared, staged)
     if _ROOT is None:
         return shutil.copy(source, destination)
     key = source.resolve()

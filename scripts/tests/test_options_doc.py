@@ -38,6 +38,7 @@ BASH_PRELUDE = """
 set -euo pipefail
 source scripts/lib/release-common.sh
 source scripts/lib/family-keys.sh
+source scripts/lib/attention-placement.sh
 allowed_keys() {
   if [[ "$1" == deepseek_v41 ]]; then _v41_allowed_keys; else _family_allowed_keys "$1"; fi
 }
@@ -126,6 +127,36 @@ def expand(key: str) -> list[str]:
 MATRIX, DOCUMENTED = parse_doc()
 UNION = set().union(*(family_keys(family) for family in FAMILIES.values()))
 
+ATTENTION_VALUES = {"auto", "heads", "context", "layers"}
+
+
+def label(cell: str) -> str:
+    """`auto` (default) -> auto."""
+    match = re.search(r"`([^`]+)`", cell)
+    return match.group(1) if match else cell
+
+
+def parse_attention() -> dict[str, dict[str, str]]:
+    """The value table whose rows are the ATTENTION_PLACEMENT values."""
+    for section, header, rows in tables(DOC.read_text().splitlines()):
+        if section != "Family support: option values" or header[1:] != COLUMNS:
+            continue
+        if {label(row[0]) for row in rows} != ATTENTION_VALUES:
+            continue
+        table: dict[str, dict[str, str]] = {}
+        for row in rows:
+            cells = row[1:]
+            assert len(cells) == len(COLUMNS), f"short attention row: {row}"
+            assert all(cell[:1] in {"✓", "✗"} for cell in cells), row
+            table[label(row[0])] = {
+                column: cell[:1] for column, cell in zip(COLUMNS, cells)
+            }
+        return table
+    raise AssertionError("docs/options.md has no ATTENTION_PLACEMENT value table")
+
+
+ATTENTION = parse_attention()
+
 
 def test_area_tables_cover_every_matrix_key():
     for key in MATRIX:
@@ -204,6 +235,44 @@ done
             status, message = words[2], words[3]
             assert status == "2", line
             assert f"unused configuration key: {key}" in message, line
+    assert seen == set(expected), f"{family}: {sorted(set(expected) - seen)} not exercised"
+
+
+@pytest.mark.parametrize("column", COLUMNS)
+def test_attention_value_table_matches_launcher(column: str):
+    """Drive the launcher's ATTENTION_PLACEMENT validation for every cell."""
+    family = FAMILIES[column]
+    expected = {value: cells[column] for value, cells in ATTENTION.items()}
+    script = r"""
+family="$1"
+shift
+for placement in "$@"; do
+  if output=$( ( release_check_attention_placement "$placement" "$family" ) 2>&1 ); then
+    printf 'accept %s\n' "$placement"
+  else
+    status=$?
+    printf 'refuse %s %s %s\n' "$placement" "$status" "$output"
+  fi
+done
+"""
+    result = subprocess.run(
+        ["bash", "-c", BASH_PRELUDE + script, "_", family, *sorted(expected)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    seen = set()
+    for line in result.stdout.splitlines():
+        words = line.split(" ", 3)
+        verdict, value = words[0], words[1]
+        seen.add(value)
+        if expected[value] == "✓":
+            assert verdict == "accept", f"{family} {value}: doc says accepted, launcher refused: {line}"
+        else:
+            assert verdict == "refuse", f"{family} {value}: doc says refused, launcher accepted"
+            assert words[2] == "2", line
+            assert "attention" in words[3].lower(), line
     assert seen == set(expected), f"{family}: {sorted(set(expected) - seen)} not exercised"
 
 
