@@ -1376,7 +1376,13 @@ mod tests {
             assert_eq!(glm.ownership(&format!("model.layers.0.self_attn.{leaf}.weight")).unwrap().execution, expected);
         }
         let root = tempfile::tempdir().unwrap();
-        trellis(root.path(), 1, 128, 0);
+        // Each FFN rank retains two complete 128-channel native blocks.
+        write(root.path(), [1, 512, 256, 4, 1, 128, 0, 1], vec![
+            ("trellis", "U8", vec![4, 16384], vec![0; 4 * 16384]),
+            ("suh", "F16", vec![256], vec![17; 512]),
+            ("svh", "F16", vec![512], vec![23; 1024]),
+            ("checksum", "U64", vec![4], vec![0; 32]),
+        ]);
         let mut attention = DenseRecord::inventory(root.path()).unwrap().remove(0);
         attention.tensor = "model.layers.0.self_attn.q_b_proj.weight".into();
         attention.ownership = glm.ownership(&attention.tensor).unwrap();
@@ -1390,8 +1396,8 @@ mod tests {
                 &std::collections::BTreeMap::from([(0, 1)])).unwrap();
             let query = plan.tensors.iter().find(|slice| slice.tensor == attention.tensor);
             assert_eq!(query.is_some(), rank == 1);
-            if let Some(query) = query { assert_eq!(query.channels, 128); }
-            assert_eq!(plan.tensors.iter().find(|slice| slice.tensor == ffn.tensor).unwrap().channels, 64);
+            if let Some(query) = query { assert_eq!(query.channels, 512); }
+            assert_eq!(plan.tensors.iter().find(|slice| slice.tensor == ffn.tensor).unwrap().channels, 256);
         }
         let flash = ownership::DenseFamily::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let root = tempfile::tempdir().unwrap();
