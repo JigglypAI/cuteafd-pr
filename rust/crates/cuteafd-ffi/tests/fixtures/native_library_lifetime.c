@@ -31,12 +31,15 @@ struct fixture_program_info {
     char name[64]; uint32_t pointers, scalars; char scalar_kinds[16];
 };
 static struct fixture_program_info draft_programs[2048];
+static struct { uint32_t ready; char event; } program_replies[2048];
 static uint32_t draft_program_count;
+static void event(char value);
 int fixture_register_program(uint32_t index, const char *name, uint32_t pointers,
                              const char *scalar_kinds, uint32_t scalars) {
-    if (!extent_only || index >= 2048 || strlen(name) >= 64 || scalars > 16) return 1;
+    if (index >= 2048 || strlen(name) >= 64 || scalars > 16) return 1;
     struct fixture_program_info *info = &draft_programs[index];
     memset(info, 0, sizeof(*info));
+    memset(&program_replies[index], 0, sizeof(program_replies[index]));
     memcpy(info->name, name, strlen(name));
     info->pointers = pointers; info->scalars = scalars;
     memcpy(info->scalar_kinds, scalar_kinds, scalars);
@@ -58,8 +61,18 @@ int cuteafd_dsv4_program_info(uint32_t index, void *out) {
     memcpy(out, &draft_programs[index], sizeof(draft_programs[index])); return 0;
 }
 int cuteafd_dsv4_program_load(uint32_t index) { return index >= draft_program_count; }
+int fixture_register_reply(uint32_t index, uint32_t ready, char dispatch_event) {
+    if (index >= draft_program_count || !ready || !dispatch_event) return 1;
+    program_replies[index].ready = ready;
+    program_replies[index].event = dispatch_event;
+    return 0;
+}
 int cuteafd_dsv4_program_launch(uint32_t index, void **ptrs, const uint64_t *scalars, void *stream) {
-    (void)index; (void)ptrs; (void)scalars; (void)stream; return 1;
+    (void)stream;
+    if (index >= draft_program_count || !program_replies[index].ready || !ptrs || !ptrs[0]
+            || !scalars || !scalars[0] || *(uint32_t *)ptrs[0] != program_replies[index].ready) return 1;
+    event(program_replies[index].event);
+    return 0;
 }
 int cuteafd_rtx_tp2_partial_async(const float *routed, const uint16_t *shared,
     void *out, uint64_t count, uint32_t dtype, void *stream) {
@@ -256,22 +269,6 @@ int cuteafd_fp8moe_launch_core(void *ctx, uint32_t capacity, void **ptrs, int ro
 int cuteafd_fp8moe_launch_segments_core(void *ctx, void **ptrs, int rows, void *stream) {
     (void)ctx; (void)stream;
     return reply_core(ptrs, rows, 1);
-}
-struct fixture_program_info { char name[64]; uint32_t pointers, scalars; char kinds[16]; };
-uint32_t cuteafd_dsv4_program_count(void) { return 4; }
-int cuteafd_dsv4_program_info(uint32_t i, struct fixture_program_info *out) {
-    if (i >= 4) return 1;
-    memset(out, 0, sizeof(*out));
-    snprintf(out->name, sizeof(out->name), "expert_reply_fp8_h%u_k%u_%u%s",
-        fp8_words[1], fp8_words[4], i % 2 + 1, i >= 2 ? "_segmented" : "");
-    out->pointers = 4; out->scalars = 1; out->kinds[0] = 'i'; return 0;
-}
-int cuteafd_dsv4_program_load(uint32_t i) { return i >= 4; }
-int cuteafd_dsv4_program_launch(uint32_t i, void **ptrs, const uint64_t *scalars, void *stream) {
-    (void)stream;
-    if (i >= 4 || !scalars[0] || *(uint32_t *)ptrs[0] != 0x1166) return 1;
-    event((char)('1' + i));
-    return 0;
 }
 
 int cuteafd_alloc_host_buffer(size_t bytes, struct host_buffer *out) {

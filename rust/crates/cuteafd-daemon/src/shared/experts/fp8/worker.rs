@@ -643,6 +643,14 @@ mod tests {
             2, 16, 4096, 0, 0, 0, 0];
         let scratch_bytes = (1 << 20) + 2 * 769 * geometry.topk as u64 * geometry.hidden as u64 * 2;
         fixture.configure_fp8(&library, &words, &[scratch_bytes, scratch_bytes, 0, 0, 0, 0])?;
+        let replies = (0..4).map(|index| serde_json::json!({
+            "name": format!("expert_reply_fp8_h{}_k{}_{}{}", geometry.hidden, geometry.topk,
+                index % 2 + 1, if index >= 2 { "_segmented" } else { "" }),
+            "pointers": ["y", "positions", "routes", "reply"],
+            "scalars": [{"type": "int32"}]
+        })).collect::<Vec<_>>();
+        fixture.register_programs(&library, &replies)?;
+        for index in 0..4 { fixture.register_reply(&library, index, 0x1166, b'1' + index as u8)?; }
         fixture.configure_fp8_segments(&library)?;
         // SAFETY: this test built the CPU-only ABI and owns its buffers below.
         let module = unsafe { Fp8MoeModule::load(fixture.directory())? };
