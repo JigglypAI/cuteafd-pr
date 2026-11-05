@@ -15,7 +15,11 @@ pub(crate) struct Source {
 
 impl Source {
     pub fn open(snapshot: &Path) -> Result<Self> {
-        let path = snapshot.join("model.safetensors");
+        Self::open_file(&snapshot.join("model.safetensors"))
+    }
+
+    pub fn open_file(path: &Path) -> Result<Self> {
+        let path = path.canonicalize()?;
         let tensors = read_safetensors_metadata(&path)?.into_iter().map(|t| (t.name.clone(), t)).collect();
         let file_bytes = std::fs::metadata(&path)?.len();
         Ok(Self { path, tensors, file_bytes })
@@ -77,7 +81,11 @@ impl<'a> Load<'a> {
 
     /// Preserve the existing overlapped mount read when no Recorder is active.
     pub fn with_prefetched(library: &'a NativeLibrary, snapshot: &Path, bytes: Vec<u8>) -> Result<Self> {
-        let mut load = Self::open(library, snapshot)?;
+        Self::with_prefetched_file(library, &snapshot.join("model.safetensors"), bytes)
+    }
+
+    pub fn with_prefetched_file(library: &'a NativeLibrary, path: &Path, bytes: Vec<u8>) -> Result<Self> {
+        let mut load = Self { library, source: Source::open_file(path)?, dense: DenseLoad::mount(library), prefetched: None };
         if !crate::shared::experts::rtx::dense::is_recording() { load.prefetched = Some(Prefetched::File(bytes)); }
         Ok(load)
     }
