@@ -674,8 +674,13 @@ mod tests {
         assert!(heads.layers.iter().all(|layer| layer.mode == LayerMode::HeadSplit));
         let records = |memory: &MemoryLayout, rank: usize| memory.devices[rank].items.iter()
             .filter(|item| item.group == "records").map(|item| item.bytes).sum::<u64>();
+        assert_eq!(heads.pool_tokens, context.pool_tokens);
+        // Page tables remain per-rank in both modes; only latent/index records halve.
+        let tables = heads.pool_tokens / crate::placement::families::glm5::PAGE_ROWS
+            * (crate::placement::families::glm5::DECODE_ROWS + options.prefill_waves) * 4;
         for rank in 0..2 {
-            assert_eq!(records(&heads_memory, rank), 2 * records(&context_memory, rank));
+            assert_eq!(records(&heads_memory, rank) - tables,
+                2 * (records(&context_memory, rank) - tables));
             assert_eq!(heads_memory.devices[rank].items.iter().filter(|item| item.category == Category::Weights)
                 .map(|item| item.bytes).sum::<u64>(), context_memory.devices[rank].items.iter()
                 .filter(|item| item.category == Category::Weights).map(|item| item.bytes).sum::<u64>());
