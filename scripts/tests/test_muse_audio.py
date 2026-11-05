@@ -130,7 +130,7 @@ def test_pcm_native_attestation_precedes_remote_handshake():
     assert "ledger.scratch != scratch_bytes(" in required
     assert "ledger.device_allocations != 2" in required
     ready = (ROOT / "rust/crates/cuteafd-daemon/src/families/muse_spark/audio.rs").read_text()
-    assert ready.index("spec.required_bytes(library)?") < ready.index("RemoteEncoder::connect(")
+    assert ready.index("spec.required_bytes(library)?") < ready.index("RemoteEncoder::connect_audio(")
     shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/vision/audio.rs").read_text()
     assert "Self::Pcm(spec) => spec.required_bytes(library)" in shared
     assert "Self::Pcm { spec, .. } => spec.required_bytes(library)" in shared
