@@ -15,9 +15,9 @@ async fn chat(Json(body): Json<Value>) -> axum::response::Response {
     }
     let prompt = body["messages"].to_string().len() / 4;
     let delta = if body["max_tokens"] == 1 {
-        json!({"choices": [{"delta": {"reasoning_content": "Let me check"}}]})
+        json!({"choices": [{"delta": {}, "finish_reason": "length"}]})
     } else {
-        json!({"choices": [{"delta": {"content": "OK"}}]})
+        json!({"choices": [{"delta": {"content": "OK", "reasoning_content": "Let me check"}, "finish_reason": "stop"}]})
     };
     let usage = json!({"choices": [], "usage": {"prompt_tokens": prompt, "completion_tokens": 2,
         "prompt_tokens_details": {"cached_tokens": prompt}}});
@@ -63,11 +63,19 @@ async fn retained_http_rejection_is_exported_with_point_and_body() {
     let panel = report["panels"].as_array().unwrap().iter().find(|p| p["id"] == "shared_prefix").unwrap();
     assert_eq!(panel["status"], "failed", "{report:#}");
     let error = panel["error"].as_str().unwrap();
-    assert!(error.contains("32768 tokens C4") && error.contains("HTTP 400") && error.contains("assistant content is empty"), "{error}");
+    assert!(error.contains("tokens C4") && error.contains("HTTP 400") && error.contains("assistant content is empty"), "{error}");
+    let base = &panel["partial"]["retained"]["bases"][0];
+    assert_eq!(base["cold_response"]["raw_choices"][0], json!({"delta": {}, "finish_reason": "length"}));
+    assert_eq!(base["attempted_assistant"], json!({"role": "assistant", "content": ""}));
+    assert_eq!(base["assistant_replay"], json!({"role": "assistant", "content": "OK", "reasoning_content": "Let me check"}));
+    assert_eq!(base["completed_response"]["timing"]["finish_reason"], "stop");
     let points = panel["partial"]["retained"]["points"].as_array().unwrap();
     assert_eq!(points[0]["status"], "ok");
     let failed = &points[1];
-    assert_eq!((failed["context"].as_u64(), failed["c"].as_u64()), (Some(32768), Some(4)));
+    assert_eq!(failed["requested_context"], 32768);
+    assert_eq!(failed["c"], 4);
+    assert_eq!(failed["context"], base["retained_prefix_tokens"]);
+    assert_eq!(failed["base_tokens"], base["retained_prefix_tokens"]);
     assert_eq!(failed["status"], "failed");
     assert_eq!(failed["request_errors"][0]["phase"], "warm");
     assert_eq!(failed["request_errors"][0]["http_status"], 400);

@@ -48,6 +48,8 @@ pub struct Chat {
     pub tool_calls: Vec<Value>,
     pub usage: Value,
     pub probe: Option<ProbeRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw_choices: Vec<Value>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -239,7 +241,15 @@ impl Client {
 
     /// A streamed chat completion. `body` needs no `model` or `stream`;
     /// `probe` registers benchmark diagnostics for this request.
-    pub fn chat(&self, mut body: Value, probe: Option<ProbeSpec>) -> Result<Chat> {
+    pub fn chat(&self, body: Value, probe: Option<ProbeSpec>) -> Result<Chat> {
+        self.chat_inner(body, probe, false)
+    }
+
+    pub(crate) fn chat_diagnostic(&self, body: Value) -> Result<Chat> {
+        self.chat_inner(body, None, true)
+    }
+
+    fn chat_inner(&self, mut body: Value, probe: Option<ProbeSpec>, capture_choices: bool) -> Result<Chat> {
         self.check()?;
         crate::request::validate(&self.configuration, &body)?;
         body["model"] = json!(self.model);
@@ -291,6 +301,7 @@ impl Client {
                 chat.usage = usage.clone();
             }
             let Some(choice) = event["choices"].get(0) else { continue };
+            if capture_choices { chat.raw_choices.push(choice.clone()); }
             let delta = &choice["delta"];
             let mut produced = false;
             if let Some(text) = delta["reasoning_content"].as_str().filter(|t| !t.is_empty()) {
