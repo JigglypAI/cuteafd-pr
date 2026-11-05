@@ -31,6 +31,7 @@ async fn retained_http_rejection_is_exported_with_point_and_body() {
         .route("/v1/console/snapshot", get(|| async { Json(json!({})) }));
     let dir = tempfile::tempdir().unwrap();
     let bench = Bench::new(Store::open(dir.path()).unwrap());
+    bench.set_api_key(cuteafd_api::openai::auth::ApiKey::new("integration-test-key").unwrap());
     let app = cuteafd_bench::http::mount(router, bench.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     cuteafd_bench::ready(&listener);
@@ -38,20 +39,20 @@ async fn retained_http_rejection_is_exported_with_point_and_body() {
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
     let (id, report) = tokio::task::spawn_blocking(move || {
         let agent = ureq::agent();
-        let started: Value = agent.post(&format!("{base}/v1/bench/runs"))
+        let started: Value = agent.post(&format!("{base}/v1/bench/runs")).set("Authorization", "Bearer integration-test-key")
             .send_json(json!({"panels": ["shared_prefix"], "baseline": false, "fabric": false}))
             .unwrap().into_json().unwrap();
         let id = started["id"].as_str().unwrap().to_owned();
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let report: Value = agent.get(&format!("{base}/v1/bench/runs/{id}/report.json"))
+            let report: Value = agent.get(&format!("{base}/v1/bench/runs/{id}/report.json")).set("Authorization", "Bearer integration-test-key")
                 .call().unwrap().into_json().unwrap();
             if report["status"] != "running" { return (id, report); }
             assert!(Instant::now() < deadline, "benchmark did not finish");
             std::thread::sleep(Duration::from_millis(20));
         }
     }).await.unwrap();
-    let panel = &report["panels"][0];
+    let panel = report["panels"].as_array().unwrap().iter().find(|p| p["id"] == "shared_prefix").unwrap();
     assert_eq!(panel["status"], "failed", "{report:#}");
     let error = panel["error"].as_str().unwrap();
     assert!(error.contains("32768 tokens C4") && error.contains("HTTP 400") && error.contains("assistant content is empty"), "{error}");
@@ -64,6 +65,8 @@ async fn retained_http_rejection_is_exported_with_point_and_body() {
     assert_eq!(failed["request_errors"][0]["http_status"], 400);
     assert_eq!(failed["request_errors"][0]["response_body"], "mock retained C4 rejection: assistant content is empty");
     let stored = bench.store(|s| s.load(&id)).unwrap().unwrap();
-    assert_eq!(serde_json::to_value(stored).unwrap()["panels"][0]["partial"], panel["partial"]);
+    let stored = serde_json::to_value(stored).unwrap();
+    let stored_panel = stored["panels"].as_array().unwrap().iter().find(|p| p["id"] == "shared_prefix").unwrap();
+    assert_eq!(stored_panel["partial"], panel["partial"]);
     server.abort();
 }
