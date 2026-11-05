@@ -180,6 +180,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
         exchanges: vec![],
         weights: vec![],
         graphs: vec![],
+        host: None,
         returns: vec![],
         owners: vec![],
     };
@@ -831,6 +832,187 @@ fn runtime_figures_preserve_recorded_peaks_without_double_charging_or_margins() 
     }
     for ranks in [0, 3, usize::MAX] { assert!(RuntimeFigures::new(ranks, MIN_LAYOUT).is_err()); }
     assert!(RuntimeFigures::new(1, " ").is_err());
+}
+
+#[test]
+fn host_figures_keep_reference_receipts_and_estimate_uncovered_layouts_without_scaling() {
+    use crate::placement::inventory::{FigureUse, census_recommendation};
+    for (gpus, layout, load, steady) in [
+        (1, MIN_LAYOUT, GLM_MIN_HOST_LOAD, GLM_MIN_HOST_STEADY),
+        (2, MAX_LAYOUT, GLM_MAX_HOST_LOAD, GLM_MAX_HOST_STEADY),
+    ] {
+        let figures = HostFigures::for_layout(gpus, layout).unwrap();
+        assert_eq!(figures.load(), load);
+        assert_eq!(figures.steady(), steady);
+        assert_eq!(load.attribution, FigureAttribution::Measured);
+        let recommendation = census_recommendation([
+            FigureUse { name: "host load", figure: load, current: load.identity },
+            FigureUse { name: "host steady", figure: steady, current: steady.identity },
+        ]);
+        if gpus == 1 {
+            assert_eq!(load.bytes, 5_759_569_920);
+            assert_eq!(steady.bytes, 40_403_427_328 - 36_902_883_328);
+            let FigureAttribution::Estimated { derivation } = steady.attribution else {
+                panic!("incomplete min Ready must never become a measured receipt")
+            };
+            assert!(derivation.contains("ordinary_rss_bytes missing and complete=false"));
+            let recommendation = recommendation.unwrap();
+            assert!(recommendation.contains("census recommended"));
+            assert!(recommendation.contains("host steady"));
+            assert!(!recommendation.contains("host load"));
+        } else {
+            assert_eq!(load.bytes, 8_439_906_304);
+            assert_eq!(steady.bytes, 8_439_906_304);
+            assert_eq!(steady.attribution, FigureAttribution::Measured);
+            assert!(recommendation.is_none());
+        }
+        for sparks in [0, 1, 4, 6, 8] {
+            let uncovered = HostFigures::for_layout(gpus, &format!("other layout; sparks/{sparks}")).unwrap();
+            for (source, derived) in [(load, uncovered.load()), (steady, uncovered.steady())] {
+                assert_eq!(derived.bytes, source.bytes);
+                assert_eq!(derived.evidence, source.evidence);
+                assert_eq!(derived.identity, source.identity);
+                assert_eq!(derived.producing_commit, source.producing_commit);
+                let FigureAttribution::Estimated { derivation } = derived.attribution else {
+                    panic!("an uncovered layout is estimated")
+                };
+                assert!(derivation.contains("no Spark-count scaling"));
+                assert!(derivation.contains(if gpus == 1 {
+                    "glm53-exl3-min-census-r1"
+                } else { "glm53-exl3-max-census-r1" }));
+                assert!(derivation.contains("#1242 retained coordinator log"));
+            }
+        }
+        assert!(figures.components(0).is_err());
+    }
+    for gpus in [0, 3, usize::MAX] {
+        assert!(HostFigures::for_layout(gpus, MIN_LAYOUT).is_err());
+    }
+    assert!(HostFigures::for_layout(1, " ").is_err());
+}
+
+#[test]
+fn host_envelopes_cover_every_startup_phase_exactly_once_including_warmup() {
+    let order = PhaseOrder::DRAFT_THEN_TARGET;
+    let phases = order.phases();
+    let ready = phases.iter().position(|phase| *phase == Phase::Ready).unwrap();
+    assert_eq!(phases[ready - 1], Phase::Warmup);
+    for (gpus, layout) in [(1, MIN_LAYOUT), (2, MAX_LAYOUT)] {
+        let figures = HostFigures::for_layout(gpus, layout).unwrap();
+        for maximum in [1, 32768] {
+            let components = figures.components(maximum).unwrap();
+            assert_eq!(components.len(), 2, "process RSS is never multiplied by GPU count");
+            for &phase in phases {
+                let active: Vec<_> = components.iter().filter_map(|component| {
+                    assert_eq!(component.activation, Activation::always());
+                    let ComponentKind::Allowance(allowance) = &component.kind else {
+                        panic!("RSS is opaque, not an invented allocation owner")
+                    };
+                    assert_eq!(allowance.location, Location::HOST);
+                    assert_eq!(component.bytes.at(1).unwrap(), allowance.bytes);
+                    assert_eq!(component.bytes.at(maximum).unwrap(), allowance.bytes);
+                    allowance.lifetime.contains(phase, order).then_some(allowance)
+                }).collect();
+                assert_eq!(active.len(), 1, "{gpus} GPUs, phase {phase:?}");
+                let expected = if order.at_or_before(phase, Phase::Warmup) {
+                    figures.load()
+                } else { figures.steady() };
+                assert_eq!(active[0].bytes, expected.bytes);
+                assert_eq!(active[0].assumed,
+                    matches!(expected.attribution, FigureAttribution::Estimated { .. }));
+            }
+        }
+    }
+}
+
+#[test]
+fn host_figures_subsume_only_ordinary_heap_and_preserve_pinned_device_and_weight_facts() {
+    let cfg = cfg();
+    let mut without = recipe(&cfg);
+    for case in &mut without.weights {
+        case.value.core_loading.heap_payload_bytes = 54321;
+    }
+    let maximum = without.maximum_pages;
+    fn owner(id: impl Into<String>, location: Location, bytes: u64, lifetime: Lifetime) -> Allocation {
+        Allocation::buffer(id, location, bytes, lifetime, Category::Staging, "domain preservation")
+    }
+    let heap = owner("test.host.retained", Location::HOST, 512, Lifetime::RESIDENT);
+    let mut components = DflashPrefetch { file_bytes: 98765 }.components(maximum).unwrap();
+    for (id, location, bytes, deferred) in [
+        ("test.host.retained", Location::HOST, 512, false),
+        ("test.host.deferred", Location::HOST, 256, true),
+        ("test.pinned.retained", Location::PINNED, 1024, false),
+        ("test.device.retained", Location::coordinator(1), 2048, false),
+    ] {
+        components.push(Component::allocation(owner(id, location, bytes, Lifetime::RESIDENT),
+            ByteCurve::fixed(bytes, maximum), deferred, maximum));
+    }
+    components.push(Component::resident_weight(
+        ResidentWeight::from_allocation(&heap, crate::placement::ResidentWeights(heap.bytes)),
+        ByteCurve::fixed(heap.bytes, maximum)));
+    for (name, location) in [("host", Location::HOST), ("pinned", Location::PINNED),
+        ("device", Location::coordinator(0))] {
+        let group = Sequential { id: format!("test.{name}.sequential"),
+            members: [64, 128].into_iter().enumerate().map(|(index, bytes)| owner(
+                format!("test.{name}.sequential.{index}"), location, bytes,
+                Lifetime { first: Phase::Load, last: Phase::Load })).collect() };
+        components.push(Component { activation: Activation::always(),
+            bytes: ByteCurve::fixed(group.peak(), maximum), kind: ComponentKind::Sequential(group) });
+    }
+    components.push(Component { activation: Activation::always(),
+        bytes: ByteCurve::fixed(4096, maximum), kind: ComponentKind::Reservation(Reservation {
+            id: "test.pinned.load.reserve".into(), location: Location::PINNED, bytes: 4096,
+            lifetime: Lifetime { first: Phase::Load, last: Phase::Load },
+            source: "synthetic bounded pinned load pool".into(),
+        }) });
+    without.owners.push(Case { when: vec![], value: components });
+    let mut with = without.clone();
+    let host = HostFigures::for_layout(2, MAX_LAYOUT).unwrap();
+    with.host = Some(host.clone());
+    for shape in without.prefill.clone() {
+        for count in [0, 1] {
+            let request = Request { onboard: Pin::Exact(count), prefill: Pin::Exact(shape), ..request() };
+            let before = planner::solve(request.clone(), budgets(), &without).unwrap();
+            let after = planner::solve(request, budgets(), &with).unwrap();
+            assert_eq!(after.decisions, before.decisions);
+            assert_eq!(after.pool_tokens, before.pool_tokens);
+            assert_eq!(after.facts.resident_weights, before.facts.resident_weights);
+            assert!(after.facts.resident_weights.iter().any(|fact| fact.id == heap.id));
+            let nonhost = |facts: &Facts| {
+                let mut facts = facts.clone();
+                facts.allocations.retain(|a| a.location != Location::HOST);
+                facts.deferred.retain(|a| a.location != Location::HOST);
+                facts.sequential.retain(|g| g.members[0].location != Location::HOST);
+                facts.allowances.retain(|a| a.location != Location::HOST);
+                facts
+            };
+            assert_eq!(nonhost(&after.facts), nonhost(&before.facts),
+                "every PINNED/device owner, view, reservation and byte total is unchanged");
+            assert!(before.facts.allowances.iter().any(|a|
+                a.source.contains("serialized target payload heap subset")));
+            assert!(before.facts.allowances.iter().any(|a| a.source.contains("DFlash whole-file")));
+            assert!(after.facts.allocations.iter().chain(&after.facts.deferred)
+                .all(|a| a.location != Location::HOST));
+            assert!(after.facts.sequential.iter().all(|g| g.members[0].location != Location::HOST));
+            assert!(after.facts.reservations.iter().all(|r| r.location != Location::HOST));
+            let allowances: Vec<_> = after.facts.allowances.iter()
+                .filter(|a| a.location == Location::HOST).collect();
+            assert_eq!(allowances.len(), 2);
+            assert_eq!(allowances.iter().map(|a| a.bytes).sum::<u64>(),
+                host.load().bytes + host.steady().bytes);
+            for phase in after.facts.phase_order.phases() {
+                let active: Vec<_> = allowances.iter().filter(|a|
+                    a.lifetime.contains(*phase, after.facts.phase_order)).collect();
+                assert_eq!(active.len(), 1);
+                let expected = if after.facts.phase_order.at_or_before(*phase, Phase::Warmup) {
+                    host.load().bytes
+                } else { host.steady().bytes };
+                assert_eq!(active[0].bytes, expected);
+            }
+        }
+    }
+    with.host = Some(HostFigures::for_layout(1, MIN_LAYOUT).unwrap());
+    assert!(matches!(with.prepare(&request()), Err(Refusal::InvalidFact(_))));
 }
 
 fn owned_graph_recipe(cfg: &GlmDsaConfig, context: u64) -> GlmRecipe<'_> {

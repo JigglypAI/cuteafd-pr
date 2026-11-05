@@ -62,6 +62,8 @@ pub struct GlmRecipe<'a> {
     pub exchanges: Vec<Case<ExchangeBuffers>>,
     pub weights: Vec<Case<WeightInventory>>,
     pub graphs: Vec<Case<StartupGraphs>>,
+    /// Process-wide ordinary RSS; subsumes heap subsets, never pinned storage.
+    pub host: Option<HostFigures>,
     /// Separate physical decode/prefill links; each rank retains one return reserve.
     pub returns: Vec<Case<ReplyReturns>>,
     /// Expert, drafter, serving, code and temporary physical components.
@@ -290,6 +292,89 @@ impl RuntimeFigures {
                     }),
                 })
             }).collect())
+    }
+}
+
+/// Process-wide ordinary RSS from #1242, not one charge per coordinator GPU.
+/// Warm-up samples are included in the load peak. Max uses its larger Ready
+/// sample conservatively before Ready as well; these are sampled envelopes,
+/// not independently qualified bounds on unobserved intra-phase peaks.
+pub const GLM_MIN_HOST_LOAD: MemoryFigure = measured(5_759_569_920, MIN_GRAPHS, MIN_LAYOUT,
+    "4a56925e7986a57e3194c0cca6df256838386519",
+    "#1242 glm53-exl3-min-census-r1/glm/weights-before-draft-pool/ordinary_rss_bytes");
+pub const GLM_MIN_HOST_STEADY: MemoryFigure = MemoryFigure {
+    attribution: FigureAttribution::Estimated {
+        derivation: "Ready smaps_rss_bytes 40403427328 - file_mapping_resident_bytes 36902883328 = 3500544000 B; ordinary_rss_bytes missing and complete=false, not a raw Ready ordinary-RSS receipt",
+    },
+    ..measured(3_500_544_000, MIN_GRAPHS, MIN_LAYOUT,
+        "4a56925e7986a57e3194c0cca6df256838386519",
+        "#1242 glm53-exl3-min-census-r1/glm/ready/incomplete-host-reconstruction")
+};
+const MAX_HOST_GRAPHS: &str = "b3acfa6e5d560b9f0440af62250a9f3b32424f9186deeb769f1a1ed0d5311543,7f4662ddadd8137dc854f960c69c41469d82662e9e51073d7747ff4b31a61ccf";
+pub const GLM_MAX_HOST_LOAD: MemoryFigure = measured(8_439_906_304, MAX_HOST_GRAPHS, MAX_LAYOUT,
+    "5d180b5c8d76636d5937336638dfd71c15a8d226",
+    "#1242 glm53-exl3-max-census-r1/glm/ready/ordinary_rss_bytes; maximum including startup warm-up");
+pub const GLM_MAX_HOST_STEADY: MemoryFigure = measured(8_439_906_304, MAX_HOST_GRAPHS, MAX_LAYOUT,
+    "5d180b5c8d76636d5937336638dfd71c15a8d226",
+    "#1242 glm53-exl3-max-census-r1/glm/ready/ordinary_rss_bytes");
+
+#[derive(Debug, Clone)]
+pub struct HostFigures {
+    gpus: usize,
+    load: MemoryFigure,
+    steady: MemoryFigure,
+}
+
+impl HostFigures {
+    /// Other one-/two-coordinator layouts use the matching reference unchanged.
+    /// Spark count does not scale process RSS; uncovered layouts stay estimated.
+    pub fn for_layout(gpus: usize, layout: &str) -> Result<Self, Refusal> {
+        if !(1..=2).contains(&gpus) || layout.trim().is_empty() {
+            return Err(invalid("invalid host figure layout or rank count"));
+        }
+        let (load, steady, derivation) = if gpus == 1 {
+            (GLM_MIN_HOST_LOAD, GLM_MIN_HOST_STEADY,
+                "unchanged one-coordinator host envelope from source layout glm53-exl3-min-census-r1 (heads/1, sparks/4, onboard/0), #1242 retained coordinator log; no Spark-count scaling; min Ready remains an incomplete smaps-minus-file estimate")
+        } else {
+            (GLM_MAX_HOST_LOAD, GLM_MAX_HOST_STEADY,
+                "unchanged two-coordinator host envelope from source layout glm53-exl3-max-census-r1 (context/2, sparks/6, onboard/3..9/tp2), #1242 retained coordinator log; no Spark-count scaling")
+        };
+        let derive = |figure: MemoryFigure| {
+            if layout == figure.identity.layout { Ok(figure) }
+            else { figure.scaled(1, 1, derivation).map_err(invalid) }
+        };
+        Ok(Self { gpus, load: derive(load)?, steady: derive(steady)? })
+    }
+
+    pub fn load(&self) -> MemoryFigure { self.load }
+    pub fn steady(&self) -> MemoryFigure { self.steady }
+
+    pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        if maximum_pages == 0 { return Err(invalid("zero host figure pool extent")); }
+        Ok([("load", self.load, Lifetime { first: Phase::Load, last: Phase::Warmup }),
+            ("steady", self.steady, Lifetime { first: Phase::Ready, last: Phase::Growth })]
+            .into_iter().map(|(name, figure, lifetime)| Component {
+                activation: Activation::always(),
+                bytes: ByteCurve::fixed(figure.bytes, maximum_pages),
+                kind: ComponentKind::Allowance(Allowance {
+                    location: Location::HOST, bytes: figure.bytes, lifetime,
+                    source: format!("GLM process ordinary RSS {name}: {:?}; {}; source layout {}; producer {}",
+                        figure.attribution, figure.evidence, figure.identity.layout, figure.producing_commit),
+                    assumed: matches!(figure.attribution, FigureAttribution::Estimated { .. }),
+                }),
+            }).collect())
+    }
+}
+
+/// Whole ordinary RSS already includes these physical heap subsets. Resource
+/// facts remain independent, and pinned memory never belongs to this envelope.
+fn ordinary_heap_subset(component: &Component) -> bool {
+    match &component.kind {
+        ComponentKind::Allocation { template, .. } => template.location == Location::HOST,
+        ComponentKind::Sequential(group) => !group.members.is_empty()
+            && group.members.iter().all(|owner| owner.location == Location::HOST),
+        ComponentKind::Allowance(allowance) => allowance.location == Location::HOST,
+        ComponentKind::Reservation(_) | ComponentKind::ResidentWeight(_) => false,
     }
 }
 
@@ -784,6 +869,13 @@ impl Recipe for GlmRecipe<'_> {
         }
         for case in &self.owners {
             domains.append(&mut contract, &case.when, case.value.clone())?;
+        }
+        if let Some(host) = &self.host {
+            if host.gpus != self.gpus {
+                return Err(invalid("host figure rank count differs from contract"));
+            }
+            contract.components.retain(|component| !ordinary_heap_subset(component));
+            contract.components.extend(host.components(self.maximum_pages)?);
         }
         Ok(contract)
     }
