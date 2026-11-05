@@ -249,6 +249,7 @@ pub(crate) fn mask_embedding(dir: &Path, hidden: usize) -> Result<Vec<u8>> {
 fn mask_source(dir: &Path, hidden: usize) -> Result<(Vec<u8>, Rect)> {
     let path = dir.join("mask_embedding.pt");
     let bytes = std::fs::read(&path).map_err(|source| MaskEmbeddingReadError { path: path.clone(), source })?;
+    let path = path.canonicalize()?;
     let u16_at = |o: usize| -> Result<usize> {
         Ok(usize::from(u16::from_le_bytes(bytes.get(o..o + 2).context("truncated zip")?.try_into().unwrap())))
     };
@@ -336,6 +337,46 @@ mod mask_tests {
             let grouped = groups(&c).iter().flatten().map(|(_, s)| s.iter().product::<usize>() * 2).sum::<usize>();
             assert_eq!(bytes, grouped);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_and_external_drafters_select_their_own_namespace_and_normalize_aliases() -> Result<()> {
+        use crate::shared::experts::rtx::push::PushPolicy;
+        use cuteafd_loader::plan::testing::{t, write_safetensors};
+        use std::os::unix::{ffi::OsStrExt, fs::symlink};
+        let root = tempfile::tempdir()?;
+        let namespace = root.path().join("namespace");
+        let bundled = namespace.join("target/dflash");
+        let local = root.path().join("local-draft");
+        std::fs::create_dir_all(&bundled)?;
+        std::fs::create_dir_all(&local)?;
+        let path = std::ffi::CString::new(namespace.as_os_str().as_bytes())?;
+        let value = br#"{"me":"raptor"}"#;
+        // SAFETY: the test-owned directory and xattr bytes remain live for setxattr.
+        ensure!(unsafe { libc::setxattr(path.as_ptr(), c"user.sparknest.cluster".as_ptr(),
+            value.as_ptr().cast(), value.len(), 0) } == 0, "setxattr: {}", std::io::Error::last_os_error());
+        assert_eq!(PushPolicy::for_snapshot(&namespace.join("target"))?, PushPolicy::Required);
+        assert_eq!(PushPolicy::for_snapshot(&bundled)?, PushPolicy::Required);
+        assert_eq!(PushPolicy::for_snapshot(&local)?, PushPolicy::Mount);
+        let alias = root.path().join("hf-hub-alias");
+        symlink(&bundled, &alias)?;
+        assert_eq!(PushPolicy::for_snapshot(&alias)?, PushPolicy::Required);
+        write_safetensors(&bundled.join(WEIGHTS), &[t("norm.weight", "BF16", &[128])]);
+        write_mask(&bundled, &[0; 256]);
+        let source = crate::shared::speculation::weights::Source::open_file(&alias.join(WEIGHTS))?;
+        let rect = source.rect("norm.weight", &[128])?;
+        assert_eq!(rect.path, bundled.join(WEIGHTS).canonicalize()?);
+        let (_, mask) = mask_source(&alias, 128)?;
+        assert_eq!(mask.path, bundled.join("mask_embedding.pt").canonicalize()?);
+        let operand = |rect: Rect| Operand { device: 0,
+            buffer: CuteafdDeviceBuffer { bytes: rect.bytes(), ..Default::default() },
+            bytes: rect.bytes(), lands: vec![(rect, 0)] };
+        let rank = crate::shared::experts::rtx::dense::RankLayout::new(
+            vec![operand(rect), operand(mask)], Vec::new(), 0)?;
+        let plan = rank.checked(&namespace.canonicalize()?, 1, 0)?;
+        assert_eq!(plan.plan.files.len(), 2);
+        assert_eq!(plan.totals.rank_bytes[0], 512);
         Ok(())
     }
 

@@ -19,7 +19,7 @@ impl Source {
     }
 
     pub fn open_file(path: &Path) -> Result<Self> {
-        let path = path.to_path_buf();
+        let path = path.canonicalize()?;
         let tensors = read_safetensors_metadata(&path)?.into_iter().map(|t| (t.name.clone(), t)).collect();
         let file_bytes = std::fs::metadata(&path)?.len();
         Ok(Self { path, tensors, file_bytes })

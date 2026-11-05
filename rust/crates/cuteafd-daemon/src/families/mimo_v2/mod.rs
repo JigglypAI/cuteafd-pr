@@ -1030,7 +1030,9 @@ impl Opened {
         let args = &resolved;
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
         let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;
-        let draft_file = if push_policy == PushPolicy::Mount { draft_dir.as_deref().map(dflash::prefetch) } else { None };
+        let draft_file = draft_dir.as_deref().map(|dir| -> Result<_> {
+            Ok(if PushPolicy::for_snapshot(dir)? == PushPolicy::Mount { Some(dflash::prefetch(dir)) } else { None })
+        }).transpose()?.flatten();
         let stream = self.library.cuda_stream_create()?;
 
         let peer_stream = match split_device {
@@ -1214,7 +1216,7 @@ impl Opened {
                 let capacity = args.draft_capacity(cfg.block)?;
                 let representation = self.weight_formats.draft;
                 let device = crate::shared::memory::device::Device { library: &self.library, id: args.device };
-                let drafter = crate::shared::experts::rtx::push::load_alone(&args.snapshot, &[device], ||
+                let drafter = crate::shared::experts::rtx::push::load_alone(dir, &[device], ||
                     dflash::MimoDrafter::load(&self.library, &programs, dir, file, stream, capacity.context_slots,
                         capacity.max_batch_sequences, representation, args.fp8_scales, args.draft_kv_cache))?;
                 engine.drafter = Some(drafter);
