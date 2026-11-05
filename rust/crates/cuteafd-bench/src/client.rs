@@ -346,6 +346,20 @@ impl Client {
     }
 }
 
+impl Chat {
+    /// Replay the model's actual turn, including reasoning-only length cuts.
+    pub(crate) fn assistant_message(&self) -> Value {
+        let mut message = json!({"role": "assistant", "content": self.content});
+        if !self.reasoning.is_empty() {
+            message["reasoning_content"] = json!(self.reasoning);
+        }
+        if !self.tool_calls.is_empty() {
+            message["tool_calls"] = json!(self.tool_calls);
+        }
+        message
+    }
+}
+
 /// Streamed tool-call deltas assembled by index.
 fn merge_tool_calls(calls: &mut Vec<Value>, deltas: &[Value]) {
     for delta in deltas {
@@ -371,6 +385,21 @@ fn merge_tool_calls(calls: &mut Vec<Value>, deltas: &[Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assistant_replay_preserves_reasoning_and_tool_calls_without_inventing_text() {
+        let mut chat = Chat::default();
+        chat.reasoning = "Let me check".into();
+        assert_eq!(chat.assistant_message(), json!({"role": "assistant", "content": "", "reasoning_content": "Let me check"}));
+        chat.content = "OK".into();
+        chat.tool_calls = vec![json!({"id": "call", "type": "function", "function": {"name": "lookup", "arguments": "{}"}})];
+        let replay = chat.assistant_message();
+        assert_eq!(replay["content"], "OK");
+        assert_eq!(replay["reasoning_content"], "Let me check");
+        assert_eq!(replay["tool_calls"], json!(chat.tool_calls));
+        assert_eq!(Chat { content: "OK".into(), ..Default::default() }.assistant_message(),
+            json!({"role": "assistant", "content": "OK"}));
+    }
 
     #[test]
     fn fabric_mark_waits_for_new_peers_to_advance() {

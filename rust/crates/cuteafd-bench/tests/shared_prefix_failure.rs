@@ -6,11 +6,19 @@ use std::time::{Duration, Instant};
 
 async fn chat(Json(body): Json<Value>) -> axum::response::Response {
     if body["messages"].as_array().unwrap().iter().any(|m|
+        m["role"] == "assistant" && m["content"] == "" && m["reasoning_content"] != "Let me check") {
+        return (StatusCode::BAD_REQUEST, "empty assistant turn: reasoning was lost").into_response();
+    }
+    if body["messages"].as_array().unwrap().iter().any(|m|
         m["content"].as_str().is_some_and(|s| s.contains("-warm-C4-"))) {
         return (StatusCode::BAD_REQUEST, "mock retained C4 rejection: assistant content is empty").into_response();
     }
     let prompt = body["messages"].to_string().len() / 4;
-    let delta = json!({"choices": [{"delta": {"content": "OK"}}]});
+    let delta = if body["max_tokens"] == 1 {
+        json!({"choices": [{"delta": {"reasoning_content": "Let me check"}}]})
+    } else {
+        json!({"choices": [{"delta": {"content": "OK"}}]})
+    };
     let usage = json!({"choices": [], "usage": {"prompt_tokens": prompt, "completion_tokens": 2,
         "prompt_tokens_details": {"cached_tokens": prompt}}});
     ([("content-type", "text/event-stream")],

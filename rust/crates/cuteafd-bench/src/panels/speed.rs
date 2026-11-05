@@ -380,7 +380,7 @@ impl Panel for PrefixCache {
                 "source": common::prefix_source(&chat),
                 "cold_ttft_s": supported.then_some(cold.timing.ttft_s), "fabric": fabric,
                 "cold_fabric": ctx.client.fabric_since(fabric_mark, &format!("prefix_cache/{turn}/cold"), true)}));
-            history.push(json!({"role": "assistant", "content": chat.content}));
+            history.push(chat.assistant_message());
             ctx.progress.partial(json!({"turns": turns}));
         }
         let tiers = common::prefix_tier_interval(tiers_before.as_ref(), common::prefix_tier_counters(ctx.client).as_ref());

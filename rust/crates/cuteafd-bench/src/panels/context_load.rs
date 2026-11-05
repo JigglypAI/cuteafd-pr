@@ -318,7 +318,7 @@ impl ContextLoad {
             bases.push(json!({"context": length, "requested_context": requested, "prompt_tokens": actual,
                 "cold_ttft_s": cold.timing.ttft_s, "cached_tokens": cold.timing.cached_tokens, "pool_after": occupancy(ctx.client)}));
             let mut retained = messages.as_array().unwrap().clone();
-            retained.push(json!({"role": "assistant", "content": cold.content}));
+            retained.push(cold.assistant_message());
             let retained = json!(retained);
             let mut cache_failed = false;
             for &c in &options.levels {

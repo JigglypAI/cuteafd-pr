@@ -21,6 +21,17 @@ fn own_template_matches_transformers_and_mistral_common_goldens() {
 }
 
 #[test]
+fn reasoning_only_retained_turn_obeys_official_v15_nonempty_constraint() {
+    let mut body = json!({"messages": [{"role": "user", "content": "Reply OK"},
+        {"role": "assistant", "content": ""}, {"role": "user", "content": "Next"}]});
+    // mistral_common 1.13.1 InstructTokenizerV15 rejects the same empty turn.
+    assert!(encoding().render(&body, &options(&body)).unwrap_err().contains("Assistant message must have"));
+    body["messages"][1]["reasoning_content"] = json!("Let me check");
+    assert_eq!(encoding().render(&body, &options(&body)).unwrap(),
+        "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST]Reply OK[/INST][THINK]Let me check[/THINK]</s>[INST]Next[/INST]");
+}
+
+#[test]
 fn served_snapshot_is_recognized_and_matches_the_fixture_when_present() {
     let snapshot = std::path::Path::new("/mnt/sparknest/hf-home/hub/models--mistralai--Mistral-Large-4-1T-A52B/snapshots/f12dabdc0c1e99e7f7924461a6f308859b05af4d");
     if !snapshot.exists() { return; }
