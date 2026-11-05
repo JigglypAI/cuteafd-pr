@@ -1004,8 +1004,21 @@ impl<'a> GlmLoader<'a> {
         ensure!(owners.is_none_or(|o| o.len() == layers && self.ranks() == 2 && o.iter().all(|&r| r < 2)),
             "whole attention needs one owner per layer and two ranks");
         let split = crate::shared::memory::load_timing::Split::start();
-        let checkpoint = cuteafd_loader::plan::checkpoint::Checkpoint::inventory(self.catalog.snapshot())?;
+        let mut checkpoint = cuteafd_loader::plan::checkpoint::Checkpoint::inventory(self.catalog.snapshot())?;
         let core = CoreInventory::from_checkpoint(cfg, &checkpoint)?;
+        // Inventory is header-light. Reuse only the native core headers already
+        // opened by the catalog; recorded recipes need their exact rectangles.
+        for projection in core.projections.values() {
+            for suffix in ["trellis", "suh", "svh", projection.codebook.marker()] {
+                let name = format!("{}.{suffix}", projection.stem);
+                if !checkpoint.tensors.iter().any(|tensor| tensor.meta.name == name) {
+                    let tensor = self.catalog.tensor(&name)?;
+                    checkpoint.tensors.push(cuteafd_loader::plan::checkpoint::CheckpointTensor {
+                        shard: tensor.shard.clone(), meta: tensor.metadata.clone() });
+                }
+            }
+        }
+        checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         let mut shares: Vec<Vec<GlmLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         for layer in 0..layers.min(cfg.layers) {
             for (share, part) in shares.iter_mut().zip(self.layer(cfg, layer, &checkpoint, &core, owners.map(|o| o[layer]), native_shared)?) {
