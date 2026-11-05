@@ -220,8 +220,12 @@ fn ml4_target_caches_preserve_nope_and_shared_latent_geometry() {
                 Facts { phase_order: planner::PhaseOrder::DRAFT_THEN_TARGET,
                     allocations: vec![], deferred: vec![], sequential: vec![],
                     reservations: vec![], allowances: vec![], resident_weights: vec![] });
+            contract.variables = vec![
+                Variable::Prefill(vec![target.prefill.as_ref().unwrap().0]),
+                Variable::Lanes(vec![1]),
+            ];
             contract.components = components.clone();
-            let facts = contract.facts(&[], pages).unwrap();
+            let facts = contract.facts(&[0, 0], pages).unwrap();
             for (layer, &owned) in target.owned_layers.iter().enumerate() {
                 let get = |suffix: &str| facts.allocations.iter().find(|owner|
                     owner.id == format!("glm.target.gpu.0.{suffix}.{layer}"));
