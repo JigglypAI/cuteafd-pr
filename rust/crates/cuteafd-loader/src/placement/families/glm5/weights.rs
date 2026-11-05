@@ -1,7 +1,7 @@
 //! Header-native weights and serialized K6/KV-B/row-reader loading subsets.
 //! Other loading temporaries and serving arenas join separately; this inventory
 //! alone cannot authorize family Ready.
-use crate::families::glm5::{GlmDsaConfig, GlmIndexer, core::CoreInventory};
+use crate::families::glm5::{GlmDsaConfig, GlmIndexer, core::CoreInventory, names::Operand as Op};
 use crate::formats::trellis_core::CoreWeightLayout;
 use crate::placement::planner::{
     Activation, Allocation, Allowance, ByteCurve, Component, ComponentKind, EmbeddingHome,
@@ -254,7 +254,11 @@ impl WeightInventory {
                     .owners
                     .iter()
                     .find(|owner| owner.allocation.id == id)
-                    .with_context(|| format!("GLM peer router source {id}"))?;
+                    ;
+                let Some(owner) = owner else {
+                    ensure!(key == "gate.bias", "GLM peer router source {id}");
+                    continue;
+                };
                 replicas.push((
                     format!("layer.{layer}.operand.{key}"),
                     owner.allocation.bytes,
@@ -346,20 +350,19 @@ impl WeightInventory {
             row_loading: RowLoading::default(),
         };
         for layer in 0..layers {
-            let root = format!("model.layers.{layer}");
-            let attn = format!("{root}.self_attn");
-            let qkv = [
-                format!("{attn}.q_a_proj.weight"),
-                format!("{attn}.kv_a_proj_with_mqa.weight"),
-            ];
-            let attention = [
-                qkv[0].clone(),
-                qkv[1].clone(),
-                format!("{attn}.q_b_proj.weight"),
-                format!("{attn}.kv_b_proj.weight"),
-                format!("{attn}.o_proj.weight"),
-            ];
-            let core_attention = core.get_weight(&qkv[0]).is_some();
+            let weight = |op| cfg.weight(layer, op).context("missing GLM variant operand");
+            let qkv = [Op::QA, Op::KvA].into_iter().filter_map(|op| cfg.weight(layer, op)).collect::<Vec<_>>();
+            let attention = [Op::QA, Op::KvA, Op::QB, Op::KvB, Op::O].into_iter()
+                .filter_map(|op| cfg.weight(layer, op)).collect::<Vec<_>>();
+            let first = cfg.weight(layer, Op::QA).or_else(|| cfg.weight(layer, Op::QB))
+                .context("GLM query projection")?;
+            let core_attention = core.get_weight(&first).is_some();
+            if !cfg.variant.is_glm() && !core_attention {
+                let found = [Op::KvA, Op::QB, Op::O].into_iter().filter_map(|op| cfg.weight(layer, op))
+                    .map(|name| headers.get(&name).map(|header| format!("{name} {:?}", header.dtype)))
+                    .collect::<Result<Vec<_>>>()?.join(", ");
+                crate::families::glm5::core::validate_attention_format(&cfg, layer, core_attention, found)?;
+            }
             let bf16 = core_attention || native_bf16 && headers.all_bf16(&attention)?;
             let layouts =
                 core.layer_weights(&cfg, layer, ranks, owners.map(|owners| owners[layer]))?;
@@ -372,7 +375,7 @@ impl WeightInventory {
                 ])?;
             }
             if bf16 {
-                let name = format!("{attn}.kv_b_proj.weight");
+                let name = weight(Op::KvB)?;
                 let header = headers.get(&name)?;
                 let shape = headers.matrix(&name)?;
                 let uk = product(&[cfg.heads as u64, cfg.kv_lora_rank as u64,
@@ -389,37 +392,41 @@ impl WeightInventory {
             }
             for rank in 0..ranks {
                 let prefix = format!("layer.{layer}.operand");
-                for (key, tensor) in [
-                    ("input_norm", "input_layernorm.weight"),
-                    ("post_norm", "post_attention_layernorm.weight"),
-                ] {
+                for (key, op) in [("input_norm", Op::InputNorm), ("post_norm", Op::PostAttentionNorm)] {
                     out.add(
                         rank,
                         &format!("{prefix}.{key}"),
                         "norm",
                         "bf16",
                         headers
-                            .get(&format!("{root}.{tensor}"))?
+                            .get(&weight(op)?)?
                             .byte_length
                             .max(256),
                     )?;
                 }
                 if owners.is_none_or(|owners| usize::from(owners[layer]) == rank) {
                     let parts = if owners.is_some() { 1 } else { ranks };
-                    for (key, tensor) in [
-                        ("q_a_norm", "q_a_layernorm.weight"),
-                        ("kv_a_norm", "kv_a_layernorm.weight"),
-                    ] {
+                    for (key, op) in [("q_a_norm", Op::QANorm), ("kv_a_norm", Op::KvANorm)] {
+                        let Some(name) = cfg.weight(layer, op) else { continue; };
                         out.add(
                             rank,
                             &format!("{prefix}.{key}"),
                             "norm",
                             "bf16",
                             headers
-                                .get(&format!("{attn}.{tensor}"))?
+                                .get(&name)?
                                 .byte_length
                                 .max(256),
                         )?;
+                    }
+                    for (key, op) in [("query_scale_s", Op::QueryScaleS), ("query_scale_b", Op::QueryScaleB)] {
+                        if let Some(name) = cfg.weight(layer, op) {
+                            let header = headers.get(&name)?;
+                            ensure!(header.dtype == DType::Bf16 && header.shape == [cfg.heads],
+                                "GLM per-head query scale {name}");
+                            out.add(rank, &format!("{prefix}.{key}"), "attention", "bf16",
+                                (header.byte_length / parts as u64).max(256))?;
+                        }
                     }
                     if !core_attention {
                         headers.projection(
@@ -446,16 +453,13 @@ impl WeightInventory {
                                 product(&[rows, k.div_ceil(128), 4])?.max(256),
                             )?;
                         }
-                        for (key, tensor, input) in [
-                            ("w_q_b", "q_b_proj.weight", false),
-                            ("w_o", "o_proj.weight", true),
-                        ] {
+                        for (key, op, input) in [("w_q_b", Op::QB, false), ("w_o", Op::O, true)] {
                             headers.projection(
                                 &mut out,
                                 rank,
                                 &format!("{prefix}.{key}"),
                                 "attention",
-                                &[format!("{attn}.{tensor}")],
+                                &[weight(op)?],
                                 parts,
                                 input,
                                 bf16,
@@ -464,12 +468,12 @@ impl WeightInventory {
                     }
                     if bf16 {
                         ensure!(
-                            headers.get(&format!("{attn}.kv_b_proj.weight"))?.dtype == DType::Bf16,
+                            headers.get(&weight(Op::KvB)?)?.dtype == DType::Bf16,
                             "GLM BF16 kv_b source"
                         );
                     }
                     ensure!(cfg.heads % parts == 0, "GLM heads do not divide ranks");
-                    for (key, width) in [("w_uk", cfg.qk_nope_head_dim), ("w_uv", cfg.v_head_dim)] {
+                    for (key, width) in [("w_uk", cfg.nope_dim(layer)), ("w_uv", cfg.v_head_dim)] {
                         let values = product(&[
                             (cfg.heads / parts) as u64,
                             cfg.kv_lora_rank as u64,
@@ -501,8 +505,9 @@ impl WeightInventory {
                         }
                     }
                     if cfg.indexers[layer] == GlmIndexer::Full {
-                        let iq = [format!("{attn}.indexer.wq_b.weight")];
-                        let index_bf16 = core_attention || native_bf16 && headers.all_bf16(&iq)?;
+                        let iq = [weight(Op::IndexQ)?];
+                        if core.get_weight(&iq[0]).is_none() {
+                        let index_bf16 = cfg.variant.is_glm() && (core_attention || native_bf16 && headers.all_bf16(&iq)?);
                         headers.projection(
                             &mut out,
                             rank,
@@ -513,25 +518,35 @@ impl WeightInventory {
                             false,
                             index_bf16,
                         )?;
-                        let ik = sum(["wk.weight", "weights_proj.weight"]
+                        }
+                        let ik = sum([Op::IndexK, Op::IndexWeights]
                             .into_iter()
-                            .map(|suffix| {
-                                let shape = headers.matrix(&format!("{attn}.indexer.{suffix}"))?;
+                            .map(|op| {
+                                let shape = headers.matrix(&weight(op)?)?;
                                 product(&[shape[0], shape[1], 2])
                             })
                             .collect::<Result<Vec<_>>>()?)?;
                         // rows() requests the exact concatenated extent, unlike upload().
                         out.add(rank, &format!("{prefix}.w_ik"), "indexer", "bf16", ik)?;
-                        for (key, tensor) in
-                            [("k_norm_w", "k_norm.weight"), ("k_norm_b", "k_norm.bias")]
-                        {
+                        let mut index_norms = Vec::new();
+                        for (w, b, op) in [("k_norm_w", "k_norm_b", Op::IndexKNorm),
+                            ("index_q_norm_w", "index_q_norm_b", Op::IndexQNorm)] {
+                            if let Some(stem) = cfg.stem(layer, op) {
+                                index_norms.push((w, format!("{stem}.weight")));
+                                index_norms.push((b, format!("{stem}.bias")));
+                            }
+                        }
+                        for (key, op) in [("index_scale_s", Op::IndexQueryScaleS), ("index_scale_b", Op::IndexQueryScaleB)] {
+                            if let Some(name) = cfg.weight(layer, op) { index_norms.push((key, name)); }
+                        }
+                        for (key, name) in index_norms {
                             out.add(
                                 rank,
                                 &format!("{prefix}.{key}"),
                                 "indexer",
                                 "bf16",
                                 headers
-                                    .get(&format!("{attn}.indexer.{tensor}"))?
+                                    .get(&name)?
                                     .byte_length
                                     .max(256),
                             )?;
@@ -539,16 +554,7 @@ impl WeightInventory {
                     }
                 }
                 let dense = layer < cfg.first_moe_layer;
-                let mlp = if dense {
-                    format!("{root}.mlp")
-                } else {
-                    format!("{root}.mlp.shared_experts")
-                };
-                let names = [
-                    format!("{mlp}.gate_proj.weight"),
-                    format!("{mlp}.up_proj.weight"),
-                    format!("{mlp}.down_proj.weight"),
-                ];
+                let names = [weight(Op::Gate)?, weight(Op::Up)?, weight(Op::Down)?];
                 let group = if dense { "dense" } else { "shared_expert" };
                 if (dense || !native_shared) && core.get_weight(&names[0]).is_none() {
                     let shared_bf16 = !dense && native_bf16 && headers.all_bf16(&names)?;
@@ -588,10 +594,9 @@ impl WeightInventory {
                     }
                 }
                 if !dense && rank == 0 {
-                    for (key, tensor) in
-                        [("gate", "weight"), ("gate.bias", "e_score_correction_bias")]
-                    {
-                        let header = headers.get(&format!("{root}.mlp.gate.{tensor}"))?;
+                    for (key, op) in [("gate", Op::Router), ("gate.bias", Op::RouterBias)] {
+                        let Some(name) = cfg.weight(layer, op) else { continue; };
+                        let header = headers.get(&name)?;
                         out.add(
                             rank,
                             &format!("{prefix}.{key}"),
@@ -609,7 +614,7 @@ impl WeightInventory {
                     out.core(
                         rank,
                         &format!("layer.{layer}.core.{name}"),
-                        if ["q_a", "kv_a", "q_b", "o"].contains(name) {
+                        if ["q_a", "kv_a", "q_b", "o", "index_q"].contains(name) {
                             "attention"
                         } else {
                             group
@@ -620,9 +625,9 @@ impl WeightInventory {
                 }
             }
         }
-        let norm = headers.get("model.norm.weight")?;
+        let norm = headers.get(cfg.final_norm())?;
         out.add(0, "norm", "norm", "bf16", norm.byte_length.max(256))?;
-        if let Some(projection) = core.get_weight("lm_head") {
+        if let Some(projection) = core.get_weight(cfg.head()) {
             let layout = CoreWeightLayout::new(
                 projection,
                 crate::formats::dense_trellis::TrellisSide::Output,
@@ -631,14 +636,15 @@ impl WeightInventory {
             )?;
             out.core(0, "core.head", "lm_head", &layout, projection.source_bytes)?;
         } else {
-            let head = headers.get("lm_head.weight")?;
+            let head_name = format!("{}.weight", cfg.head());
+            let head = headers.get(&head_name)?;
             if head.dtype == DType::F8E4M3 {
-                out.row_loading.include(&headers, &["lm_head.weight".into()])?;
+                out.row_loading.include(&headers, &[head_name.clone()])?;
             }
             let bytes = if head.dtype == DType::F8E4M3 {
                 product(&[
-                    headers.matrix("lm_head.weight")?[0],
-                    headers.matrix("lm_head.weight")?[1],
+                    headers.matrix(&head_name)?[0],
+                    headers.matrix(&head_name)?[1],
                     2,
                 ])?
             } else {
@@ -646,13 +652,36 @@ impl WeightInventory {
             };
             out.add(0, "head", "lm_head", "bf16", bytes)?;
         }
-        let table = headers.get("model.embed_tokens.weight")?;
+        let table = headers.get(cfg.embedding())?;
         ensure!(
             table.dtype == DType::Bf16,
             "GLM token embedding requires BF16 source"
         );
         out.embedding(embedding, table.byte_length, "bf16")?;
         Ok(out)
+    }
+
+    /// Shared experts have their own native arenas; they are not dense records.
+    /// These are the exact per-layer Residency plans consumed by NativeExperts.
+    pub fn extend_shared(&mut self, plans: &[Vec<crate::plan::exlr8::residency::Residency>]) -> Result<()> {
+        use crate::plan::exlr8::residency::ExpertSet;
+        ensure!(plans.len() == self.ranks, "GLM native shared rank count");
+        let mut owners = Self {
+            ranks: self.ranks, owners: Vec::new(), core_loading: CoreLoading::default(),
+            kv_b_loading: KvBLoading::default(), row_loading: RowLoading::default(),
+        };
+        for (rank, layers) in plans.iter().enumerate() {
+            for plan in layers {
+                ensure!(plan.rank == rank && plan.world == self.ranks && plan.set == ExpertSet::Shared,
+                    "GLM native shared plan identity");
+                owners.add(rank, &format!("shared.layer.{}.backing", plan.layer), "shared_expert", "exlr8",
+                    plan.resident_bytes as u64)?;
+            }
+        }
+        ensure!(owners.owners.iter().all(|new| self.owners.iter().all(|old|
+            old.allocation.id != new.allocation.id)), "duplicate GLM native shared owner");
+        self.owners.extend(owners.owners);
+        Ok(())
     }
 
     /// Consume the same native plan used by the reader: storage sides and lossless
@@ -705,15 +734,7 @@ impl WeightInventory {
             let before = sum(out.owners.iter().map(|owner| owner.allocation.bytes))?;
             for slice in &plan.tensors {
                 let group = selection.resident_group(&slice.tensor, layers)?;
-                let layer = slice
-                    .tensor
-                    .strip_prefix("model.layers.")
-                    .map(|rest| -> Result<_> {
-                        let (index, leaf) =
-                            rest.split_once('.').context("GLM native layer tensor")?;
-                        Ok((index.parse::<usize>()?, leaf))
-                    })
-                    .transpose()?;
+                let layer = selection.layer_tensor(&slice.tensor)?;
                 if let Some(layout) = &slice.absorbed {
                     let (layer, _) = layer.context("GLM native absorbed layer")?;
                     for (name, bytes) in ["w_uk_fp8", "w_uk_scale", "w_uv_fp8", "w_uv_scale"]
@@ -746,7 +767,7 @@ impl WeightInventory {
                                 };
                                 format!("layer.{layer}.{key}")
                             } else {
-                                let key = native_plain(leaf).with_context(|| {
+                                let key = selection.plain_owner(layer, &slice.tensor).with_context(|| {
                                     format!("unknown GLM native plain owner {}", slice.tensor)
                                 })?;
                                 format!("layer.{layer}.operand.{key}")
@@ -803,19 +824,6 @@ impl WeightInventory {
         self.owners.extend(out.owners);
         Ok(())
     }
-}
-
-fn native_plain(leaf: &str) -> Option<&'static str> {
-    Some(match leaf {
-        "input_layernorm.weight" => "input_norm",
-        "post_attention_layernorm.weight" => "post_norm",
-        "self_attn.q_a_layernorm.weight" => "q_a_norm",
-        "self_attn.kv_a_layernorm.weight" => "kv_a_norm",
-        "self_attn.indexer.k_norm.weight" => "k_norm_w",
-        "self_attn.indexer.k_norm.bias" => "k_norm_b",
-        "mlp.gate.e_score_correction_bias" => "gate.bias",
-        _ => return None,
-    })
 }
 
 fn product(values: &[u64]) -> Result<u64> {

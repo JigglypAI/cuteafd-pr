@@ -24,6 +24,26 @@ fn core_operands(cfg: &GlmDsaConfig, layer: usize) -> Vec<(&'static str, Op, Cor
     operands
 }
 
+/// The planner and reader refuse the same unsupported attention publication.
+#[derive(Debug, thiserror::Error)]
+#[error("{tensors:?}: unsupported attention format {found}; expected {expected}")]
+pub struct UnsupportedAttentionFormat {
+    pub tensors: Vec<String>,
+    pub found: String,
+    pub expected: &'static str,
+}
+
+pub fn validate_attention_format(cfg: &GlmDsaConfig, layer: usize, core: bool,
+    found: String) -> std::result::Result<(), UnsupportedAttentionFormat> {
+    if cfg.variant.is_glm() || core { return Ok(()); }
+    Err(UnsupportedAttentionFormat {
+        tensors: [Op::QA, Op::KvA, Op::QB, Op::O].into_iter()
+            .filter_map(|op| cfg.weight(layer, op)).collect(),
+        found,
+        expected: "Mistral Large 4 K6 core publication (EXL3 K6)",
+    })
+}
+
 pub fn split(cfg: &GlmDsaConfig, stem: &str) -> Option<CoreSplit> {
     if stem == cfg.head() { return Some(CoreSplit::Whole); }
     let layer = stem.strip_prefix(if cfg.variant.is_glm() { "model.layers." } else { "layers." })?
