@@ -474,24 +474,30 @@ fn poll_prefill_quarantine<'w, 'a, P: ServingTarget<'w, 'a>>(
         let slot = requests.prefill_quarantine[index].slot;
         let (pass, transport) = &mut prefill_slots.slots[slot];
         let ready = pass.poll_cache_commit()?;
+        // A decode-side pass (`ScorePath::Decode`) quarantines without beginning
+        // a draft commit, and `poll_commit` requires one: only touch the draft
+        // when this entry actually registered a commit on it.
+        let has_draft = !requests.prefill_quarantine[index].drafts.is_empty();
         let draft_ready = match draft.as_deref() {
-            Some(d) => d.poll_queued_commit(0)?,
-            None => true,
+            Some(d) if has_draft => d.poll_queued_commit(0)?,
+            _ => true,
         };
         if !(ready && draft_ready) { index += 1; continue; }
         let mut entry = requests.prefill_quarantine.swap_remove(index);
         let published = match draft.as_deref_mut() {
-            Some(d) => d.finish_queued_commit(0, pass, requests, &mut entry.batch, &entry.accepted),
-            None => pass.commit(requests, &mut entry.batch, &entry.accepted),
+            Some(d) if has_draft => d.finish_queued_commit(0, pass, requests, &mut entry.batch, &entry.accepted),
+            _ => pass.commit(requests, &mut entry.batch, &entry.accepted),
         };
         if let Err(error) = published {
             tracing::error!(%error, slot, "quarantined prefill commit failed to publish; aborting");
             if let Err(cleanup) = pass.abort_cache_commit(requests) {
                 tracing::error!(%cleanup, slot, "aborting a failed quarantined prefill commit");
             }
-            if let Some(d) = draft.as_deref_mut() {
-                if let Err(cleanup) = d.abort_queued_commit(0, requests, &mut entry.batch) {
-                    tracing::error!(%cleanup, slot, "aborting a failed quarantined prefill draft commit");
+            if has_draft {
+                if let Some(d) = draft.as_deref_mut() {
+                    if let Err(cleanup) = d.abort_queued_commit(0, requests, &mut entry.batch) {
+                        tracing::error!(%cleanup, slot, "aborting a failed quarantined prefill draft commit");
+                    }
                 }
             }
         }
@@ -3845,6 +3851,11 @@ mod prefill_quarantine_tests {
         let poll = &poll[..poll.find("pub(super) fn serve<").unwrap()];
         assert!(poll.contains("pass.poll_cache_commit()?"));
         assert!(poll.contains("pass.commit(requests, &mut entry.batch, &entry.accepted)"));
+        // A decode-side pass quarantines without a draft commit, and
+        // `poll_commit` requires one: the poller must gate on `drafts`.
+        assert!(poll.contains("let has_draft = !requests.prefill_quarantine[index].drafts.is_empty();"));
+        assert!(poll.contains("Some(d) if has_draft => d.poll_queued_commit(0)?"));
+        assert!(poll.contains("Some(d) if has_draft => d.finish_queued_commit(0, pass, requests,"));
         assert!(poll.contains("pass.abort_cache_commit(requests)"));
         assert!(poll.contains("P::settle_quarantined_encoder(pass, transport)"));
         assert!(poll.contains("requests.unquarantine_lease(lease);"));
