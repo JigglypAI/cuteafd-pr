@@ -8,6 +8,49 @@ use cuteafd_loader::{plan::testing::{qwen4_config, qwen4_exl3, write_snapshot},
 use std::{fs::File, net::TcpStream, os::unix::fs::FileExt, time::Duration};
 
 #[test]
+fn join_stage_errors_name_rank_device_stage_and_requested_bytes() {
+    for (stage, bytes) in [("expert arena", 8 << 30), ("host-ring registration", 128 << 20)] {
+        let error = join_stage::<()>(7, 6, 0, stage, bytes,
+            || anyhow::bail!("injected allocation refusal")).unwrap_err();
+        let typed = error.downcast_ref::<RankJoinError>().unwrap();
+        assert_eq!((typed.rank, typed.device, typed.stage, typed.bytes), (6, 0, stage, bytes));
+        assert!(error.to_string().contains("injected allocation refusal"));
+    }
+}
+
+#[test]
+fn stalled_sparknest_join_times_out_with_rank_and_ring_bytes() -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let root = tempfile::tempdir()?;
+    let socket = root.path().join("join.sock").to_string_lossy().into_owned();
+    let listener = Listener::bind(&socket)?;
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let server_socket = socket.clone();
+    let server = std::thread::spawn(move || -> Result<()> {
+        let conn = crate::shared::memory::push_testing::accept_within(&listener, &server_socket, Duration::from_secs(2))?;
+        conn.set_timeout(Some(Duration::from_secs(2)))?;
+        assert!(matches!(conn.next_request()?.context("Join request")?.0, Request::Join { rank: 6, .. }));
+        let _ = released.recv_timeout(Duration::from_secs(2));
+        Ok(())
+    });
+    let client = PushClient::at(socket, Duration::from_millis(50))?;
+    let ring = tempfile::tempfile()?;
+    let started = std::time::Instant::now();
+    let result = join_stage(7, 6, 0, "SparkNest client.join", 128 << 20, || {
+        Ok(client.join(cuteafd_loader::push_load::JoinArgs { group: 7, token: 11, rank: 6,
+            ring_fd: ring.as_raw_fd(), slots: 128, slot_bytes: 1 << 20 })?)
+    });
+    drop(release);
+    server.join().unwrap()?;
+    let error = result.err().context("stalled join must fail")?;
+    let typed = error.downcast_ref::<RankJoinError>().context("typed join boundary")?;
+    assert_eq!((typed.rank, typed.bytes), (6, 128 << 20));
+    assert_eq!(typed.source.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    Ok(())
+}
+
+#[test]
 fn whole_binding_requires_exact_selected_inventory_and_admission() -> Result<()> {
     use crate::shared::experts::layer::ExpertLayer::BackboneFull;
     let expected = [(BackboneFull { layer: 0 }, 256), (BackboneFull { layer: 1 }, 512)];
