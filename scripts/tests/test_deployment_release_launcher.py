@@ -271,7 +271,7 @@ def test_exlr8_launcher_preserves_explicit_prefill_waves(waves: str) -> None:
     assert "CUTEAFD_GLM_PREFILL_LANES" not in coordinator["env"]
 
 
-@pytest.mark.parametrize("gpus,attention", [("1", "auto"), ("1", "heads"), ("2", "auto"), ("2", "context")])
+@pytest.mark.parametrize("gpus,attention", [("1", "auto"), ("1", "heads"), ("2", "auto"), ("2", "context"), ("2", "heads")])
 @pytest.mark.parametrize("ranks", range(1, 7))
 def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int, gpus: str, attention: str) -> None:
     entry = exlr8_entry()
@@ -290,11 +290,11 @@ def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int, gpus: str, at
 @pytest.mark.parametrize("overrides,reason", [
     ({"RTX_GPUS": "0"}, "RTX GPUs"),
     ({"RTX_GPUS": "3"}, "RTX GPUs"),
-    ({"RTX_GPUS": "1"}, "heads attention"),
-    ({"RTX_GPUS": "1", "ATTENTION_PLACEMENT": "layers"}, "heads attention"),
+    ({"RTX_GPUS": "1"}, "heads or two-GPU context attention"),
+    ({"RTX_GPUS": "1", "ATTENTION_PLACEMENT": "layers"}, "heads or two-GPU context attention"),
     ({"SPARK_COUNT": "9"}, "canonical Spark ranks"),
     ({"SPECULATOR": "mtp"}, "SPECULATOR=off or dflash2"),
-    ({"ATTENTION_PLACEMENT": "heads"}, "context attention"),
+    ({"ATTENTION_PLACEMENT": "layers"}, "heads or two-GPU context attention"),
 ])
 def test_exlr8_launcher_refuses_unsupported_route(overrides: dict, reason: str) -> None:
     entry = exlr8_entry()
