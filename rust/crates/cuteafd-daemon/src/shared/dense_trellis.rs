@@ -61,7 +61,7 @@ impl CoreWeightLayout {
     /// The shared native K6 recipe, used unchanged by mount and push loads.
     pub(crate) fn load_recorded<'a>(&self, device: Device<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint,
         dense: &crate::shared::experts::rtx::dense::DenseLoad<'a>, stream: *mut c_void) -> Result<CoreWeights<'a>> {
-        use crate::shared::experts::rtx::dense::{Job, Operand, Rect, Step, TRANSFORM_BYTES};
+        use crate::shared::experts::rtx::dense::{Job, Operand, Rect, Step};
         let metadata = |name: &str| -> Result<&cuteafd_loader::SafetensorsTensorMetadata> {
             let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
                 .map_err(|_| anyhow::anyhow!("checkpoint lacks {name}"))?;
@@ -97,22 +97,11 @@ impl CoreWeightLayout {
             && local_n % 128 == 0 && local_k % 128 == 0, "{stem}: K6 shard geometry");
         let tile_bytes = 32 * module.bits;
         let payload = allocate(local_n * local_k * module.bits / 8)?;
-        let trellis = format!("{stem}.trellis");
-        // Checkpoint [K16][N16][tile]: rows are K16, this shard's tiles are a
-        // contiguous N16 column window of each row.
-        let row_bytes = (n / 16) * tile_bytes;
-        let cols = (n0 / 16) * tile_bytes..(n0 + local_n) / 16 * tile_bytes;
-        let width = cols.len();
         let k16 = local_k / 16;
-        let per = (TRANSFORM_BYTES / width).max(1);
-        let mut kr = 0;
-        while kr < k16 {
-            let rows = per.min(k16 - kr);
-            let source = Rect::tensor(checkpoint, &trellis, Some(k0 / 16 + kr..k0 / 16 + kr + rows), Some(cols.clone()))?;
-            ensure!(source.row_bytes == row_bytes, "{trellis}: trellis row extent");
+        for (kr, source) in self.payload_rects(checkpoint, n)? {
+            let rows = source.rows.len();
             dense.step(Step { device: device.id, rects: vec![source], jobs: vec![Job::TrellisTiles { rows, k0: kr, tiles: local_n / 16, tile_bytes,
                 k16, input: self.side == TrellisSide::Input, dst: payload.buffer }] }, stream)?;
-            kr += rows;
         }
         let vector = |suffix: &str, start: usize, count: usize| -> Result<Allocation<'a>> {
             let name = format!("{stem}.{suffix}");
@@ -125,6 +114,29 @@ impl CoreWeightLayout {
         ensure!(payload.buffer.bytes + suh.buffer.bytes + svh.buffer.bytes == self.bytes,
             "{stem}: K6 shard differs from admitted bytes");
         Ok(CoreWeights { payload, suh, svh, shape: self.shape, side: self.side, bits: self.bits, codebook: self.codebook })
+    }
+
+    /// Header-only source windows shared by recorded loading and admission tests.
+    pub(crate) fn payload_rects(&self, checkpoint: &cuteafd_loader::plan::Checkpoint, outputs: usize)
+        -> Result<Vec<(usize, crate::shared::experts::rtx::dense::Rect)>> {
+        use crate::shared::experts::rtx::dense::{Rect, TRANSFORM_BYTES};
+        let [local_n, local_k] = self.shape;
+        let (n0, k0) = match self.side {
+            TrellisSide::Output => (self.rank * local_n, 0),
+            TrellisSide::Input => (0, self.rank * local_k),
+        };
+        let tile_bytes = 32 * self.bits;
+        let trellis = format!("{}.trellis", self.stem);
+        // Checkpoint [K16][N16][tile]: each shard is a column window of K16 rows.
+        let cols = (n0 / 16) * tile_bytes..(n0 + local_n) / 16 * tile_bytes;
+        let per = (TRANSFORM_BYTES / cols.len()).max(1);
+        (0..local_k / 16).step_by(per).map(|kr| {
+            let rows = per.min(local_k / 16 - kr);
+            let source = Rect::tensor(checkpoint, &trellis,
+                Some(k0 / 16 + kr..k0 / 16 + kr + rows), Some(cols.clone()))?;
+            ensure!(source.row_bytes == (outputs / 16) * tile_bytes, "{trellis}: trellis row extent");
+            Ok((kr, source))
+        }).collect()
     }
 
     pub(crate) fn demand(&self, device: u8) -> Demand {

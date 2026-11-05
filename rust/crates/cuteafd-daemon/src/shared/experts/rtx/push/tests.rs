@@ -121,6 +121,18 @@ fn staging_uses_actual_sizes_and_charges_disconnected_transforms_in_full() -> Re
     assert_eq!(HostStaging::for_steps(mixed.iter().map(Vec::as_slice), 0)?.staging_bytes, 1024 * 8192);
     let overlapping = vec![vec![rect(0, 4096)]; 1024];
     assert_eq!(HostStaging::for_steps(overlapping.iter().map(Vec::as_slice), 0)?.staging_bytes, 1024 * 4096);
+    // TP column slices have overlapping source envelopes, but successive row
+    // windows only overlap their neighbours, not an entire projection at once.
+    let streamed = (0..8192).map(|i| vec![Rect { name: "K6 TP".into(), path: "shard".into(),
+        base: 0, row_bytes: 192 * 384, rows: i * 32..i * 32 + 48,
+        cols: 0..192 * 192 }]).collect::<Vec<_>>();
+    let bound = HostStaging::for_steps(streamed.iter().map(Vec::as_slice), 0)?;
+    let bytes = 48 * 192 * 192;
+    assert_eq!(bound.staging_bytes, 2 * 128 * ((1 << 20) + 2 * bytes) + 2 * bytes);
+    assert!(bound.staging_bytes < streamed.len() * bytes / 8);
+    // A missing slot may leave both overlapping windows open. Their entire
+    // buffers, not just the overlapping source bytes, are covered.
+    assert!(bound.staging_bytes >= 2 * bytes);
     Ok(())
 }
 

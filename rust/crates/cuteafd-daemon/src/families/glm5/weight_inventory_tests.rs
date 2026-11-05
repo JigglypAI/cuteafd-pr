@@ -153,6 +153,46 @@ fn installed_variant_weight_inventory_equals_production_requests() -> Result<()>
 }
 
 #[test]
+fn installed_k6_max_streaming_staging_covers_measured_pools() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{HostStaging, Rect};
+    for (model, revision, observed, old_dense) in [
+        ("wrldsuksgo2mars--GLM-5.3-EXL3-K4-Core-K6", "5a4e83a09a11f3145332ed632d28a9894ea88225",
+            [240060416usize, 27942912], 11891580928usize),
+        ("wrldsuksgo2mars--Mistral-Large-4-EXL3-K4-Core-K6", "03c80aebaa483d55760703ae5bc0c9734c9d67d6",
+            [33546240, 16048128], 4750802944),
+    ] {
+        let root = installed(model, revision)?;
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open(&root)?;
+        let cfg = GlmDsaConfig::read(&root)?;
+        let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        let mut rects: [Vec<Vec<Rect>>; 2] = Default::default();
+        let mut add = |rank: usize, layout: cuteafd_loader::formats::trellis_core::CoreWeightLayout| -> Result<()> {
+            let outputs = core.get_weight(&layout.stem).context("native projection")?.stored_outputs;
+            let layout = CoreWeightLayout::from_shared(layout);
+            rects[rank].extend(layout.payload_rects(&checkpoint, outputs)?.into_iter().map(|(_, rect)| vec![rect]));
+            Ok(())
+        };
+        for layer in 0..cfg.layers {
+            for (rank, layouts) in core.layer_weights(&cfg, layer, 2, None)?.into_iter().enumerate() {
+                for layout in layouts.into_values() { add(rank, layout)?; }
+            }
+        }
+        if let Some(head) = core.get_weight(cfg.head()) {
+            add(0, cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(head,
+                cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?)?;
+        }
+        let charges = rects.iter().map(|steps| HostStaging::for_steps(steps.iter().map(Vec::as_slice), 0)
+            .and_then(HostStaging::bytes)).collect::<Result<Vec<_>>>()?;
+        for rank in 0..2 {
+            ensure!(charges[rank] >= observed[rank], "{model} rank {rank}: {} < measured {}", charges[rank], observed[rank]);
+        }
+        ensure!(charges.iter().sum::<usize>() < old_dense / 2, "{model}: streaming bound must improve substantially");
+        eprintln!("{model} native K6 max streaming staging bytes {charges:?}; measured pools {observed:?}; old full dense bound {old_dense}");
+    }
+    Ok(())
+}
+
+#[test]
 fn official_ml4_fp8_is_refused_by_inventory_and_expert_catalog() -> Result<()> {
     let root = installed(
         "mistralai--Mistral-Large-4-1T-A52B",

@@ -45,14 +45,12 @@ pub(crate) struct HostStaging {
 }
 
 impl HostStaging {
-    /// Bound retained transforms from the receiver ring, not the source's send
-    /// concurrency. A missing slot retains its payload plus at most two boundary
-    /// steps. Each file may additionally hold one step at its stream frontier.
-    /// Mixed-file or overlapping source intervals cannot use this argument;
-    /// charge their entire footprint separately.
+    /// Bound open transforms and their reusable pool from the receiver ring.
+    /// Overlapping source windows multiply the ring/frontier bound by their
+    /// simultaneous fanout, not the footprint of a transitively overlapping chain.
+    /// Disconnected rectangles still charge their entire footprint separately.
     pub fn for_steps<'s>(steps: impl IntoIterator<Item = &'s [Rect]>, table_bytes: usize) -> Result<Self> {
-        use std::collections::{BTreeMap, BTreeSet};
-        let mut files = BTreeSet::new();
+        use std::collections::BTreeMap;
         let mut extents = BTreeMap::<std::path::PathBuf, Vec<(u64, u64, usize)>>::new();
         let (mut total, mut fallback, mut largest) = (0usize, 0usize, 0usize);
         for rects in steps {
@@ -73,34 +71,39 @@ impl HostStaging {
             }
             if contiguous {
                 let rect = &rects[0];
-                files.insert(rect.path.clone());
                 let first = rect.base + (rect.rows.start * rect.row_bytes + rect.cols.start) as u64;
                 extents.entry(rect.path.clone()).or_default().push((first, end, bytes));
             } else {
                 fallback = fallback.checked_add(bytes).context("dense fallback staging overflow")?;
             }
         }
-        // Any overlapping intervals are conservatively charged in full. Such
-        // steps may remain open while all later source rows are delivered.
-        for entries in extents.values_mut() {
-            entries.sort_unstable_by_key(|entry| entry.0);
-            let (mut end, mut group_bytes, mut count) = (0, 0usize, 0usize);
-            for &(first, last, bytes) in entries.iter() {
-                if first >= end {
-                    if count > 1 { fallback = fallback.checked_add(group_bytes).context("dense overlap staging overflow")?; }
-                    group_bytes = 0;
-                    count = 0;
-                }
-                group_bytes = group_bytes.checked_add(bytes).context("dense overlap footprint overflow")?;
-                count += 1;
-                end = end.max(last);
+        let (mut fanout, mut frontiers) = (0usize, 0usize);
+        for entries in extents.values() {
+            // End events precede starts: touching half-open windows do not overlap.
+            let mut events = Vec::with_capacity(entries.len() * 2);
+            for &(first, last, bytes) in entries {
+                events.push((first, true, bytes));
+                events.push((last, false, bytes));
             }
-            if count > 1 { fallback = fallback.checked_add(group_bytes).context("dense overlap staging overflow")?; }
+            events.sort_unstable();
+            let (mut active, mut bytes, mut peak) = (0usize, 0usize, 0usize);
+            for (_, start, size) in events {
+                if start {
+                    active += 1;
+                    bytes = bytes.checked_add(size).context("dense overlap staging overflow")?;
+                    fanout = fanout.max(active);
+                    peak = peak.max(bytes);
+                } else { active -= 1; bytes -= size; }
+            }
+            frontiers = frontiers.checked_add(peak).context("dense frontier staging overflow")?;
         }
+        // A delayed ring slot can strand windows on either side of its source
+        // interval for each overlapping recipe. Completed buffers stay in the
+        // pool only while the same bound has room; allocation evicts them first.
         let window = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES.checked_add(largest.checked_mul(2)
             .context("dense boundary staging overflow")?).and_then(|bytes|
-                bytes.checked_mul(cuteafd_ffi::push_ring::DEFAULT_SLOTS)).context("dense ring staging overflow")?;
-        let frontiers = files.len().checked_mul(largest).context("dense frontier staging overflow")?;
+                bytes.checked_mul(cuteafd_ffi::push_ring::DEFAULT_SLOTS)).and_then(|bytes|
+                bytes.checked_mul(fanout)).context("dense ring staging overflow")?;
         let staging_bytes = fallback.checked_add(window).and_then(|bytes| bytes.checked_add(frontiers))
             .context("dense pinned staging overflow")?.min(total);
         let bound = Self { staging_bytes, largest_step: largest, table_bytes };
