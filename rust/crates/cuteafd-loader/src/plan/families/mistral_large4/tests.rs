@@ -162,7 +162,9 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
     let dir = snapshot(true, None);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     for (ranks, gpus) in [(5, 1), (6, 2), (7, 2), (8, 2)] {
-        let report = input.plan(&layout_options(ranks, gpus)).unwrap();
+        let mut options = layout_options(ranks, gpus);
+        options.layout.as_mut().unwrap().workspace_manifest = Some(dir.path().join("absent.json"));
+        let report = input.plan(&options).unwrap();
         let memory = report.memory_layout.as_ref().expect("a memory layout");
         assert!(!memory.devices.is_empty(), "{ranks}+{gpus}: {:?}", report.hints);
         assert_eq!(report.prefill_waves, Some(3), "{ranks}+{gpus}");
@@ -175,8 +177,8 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
             assert_eq!(spark.worker_budget_bytes, 108 << 30, "{ranks}+{gpus}");
             assert!(spark.worker_budget_bytes <= spark.capacity_bytes, "{ranks}+{gpus}");
         }
-        // auto: one GPU's heads, or the qualified context placement on two GPUs.
-        assert_eq!(report.attention_placement, if gpus == 2 { crate::placement::AttentionPlacement::Context }
+        // No build manifest: two GPUs own whole MLA layers rather than replicate KV.
+        assert_eq!(report.attention_placement, if gpus == 2 { crate::placement::AttentionPlacement::Layers }
             else { crate::placement::AttentionPlacement::Heads }, "{ranks}+{gpus}");
         let groups: std::collections::BTreeSet<_> = memory.devices[0].items.iter().map(|item| item.group.clone()).collect();
         for group in ["attention", "indexer", "embedding", "lm_head"] {
@@ -341,6 +343,8 @@ fn vision_on_two_rtx_reserves_the_tower_before_the_solve() {
     for ranks in 5..=8 {
         let off = plan(ranks, MediaMode::Off);
         assert!(off.placement_supported, "n={ranks}: {:?}", off.hints);
+        assert_eq!(off.attention_placement, crate::placement::AttentionPlacement::Context,
+            "complete ML4 programs must keep Auto on Context, n={ranks}");
         let rtx_used = |report: &plan::PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
             .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).map(|d| d.used_bytes()).sum::<u64>();
         for vision in [MediaMode::Rtx(None), MediaMode::Auto] {

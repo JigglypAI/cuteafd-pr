@@ -868,6 +868,16 @@ mod tests {
     }
 
     #[test]
+    fn executor_metadata_matches_installed_csa_owners_and_swa_heads() -> Result<()> {
+        assert_eq!(EXECUTOR.attention_default(), AttentionPlacement::Layers);
+        let admitted = run(&inputs(2))?;
+        assert_eq!(admitted.placement.attention_placement, AttentionPlacement::Layers);
+        assert!(admitted.placement.attention_by_kind.contains(&(AttentionClass::Csa, AttentionPlacement::Layers)));
+        assert!(admitted.placement.attention_by_kind.contains(&(AttentionClass::Swa, AttentionPlacement::Heads)));
+        Ok(())
+    }
+
+    #[test]
     fn reused_header_contract_preserves_every_candidate_and_resolved_plan() -> Result<()> {
         use super::super::{coordinator::{CoordinatorContract, RankWeightLayout}, native};
         let fixture = super::super::tests::exl3_snapshot();

@@ -582,7 +582,7 @@ pub fn dual_request(inputs: &QwenDualInputs<'_>, graph_bytes: [u64; 2]) -> anyho
         hops: HopSpec { storage: crate::placement::HopStorage::ReceiveSlots, row_bytes: a.cfg.hc_width() as u64 * 2, rows: a.prefill_rows.max(64), lanes: 1,
             entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner },
         executor: ExecutorModes { family: "qwen4", modes: &DUAL_WHOLE, hops: true,
-            attention: AttentionPlacement::Heads },
+            attention: AttentionPlacement::Layers },
     })
 }
 
@@ -968,6 +968,8 @@ mod tests {
                 assert_eq!(graph.bytes, LAZY_GRAPH_BYTES);
             }
             let req = dual_request(&inputs, [256 << 20; 2]).unwrap();
+            assert_eq!(req.executor.attention_default(), AttentionPlacement::Layers);
+            assert_eq!(lazy.attention_placement, AttentionPlacement::Layers);
             assert_eq!(req.movables.len(), usize::from(mtp));
             if mtp {
                 assert_eq!(req.movables[0].allowed, [0]);

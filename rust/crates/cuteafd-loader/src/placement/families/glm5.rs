@@ -67,8 +67,8 @@ pub fn context_program_list(cfg: &GlmDsaConfig) -> String {
 }
 
 /// `cfg`'s `context` programs and scratch `lookup` (name -> scratch bytes) finds,
-/// or None when this build lacks any of them (a `context` request then fails
-/// closed; `heads` is the build's only attention executor).
+/// or None when this build lacks any of them (explicit `context` fails closed;
+/// standard auto uses whole-layer owners without replicating the records).
 pub fn context_programs<'n>(cfg: &GlmDsaConfig, names: impl IntoIterator<Item = &'n str> + Clone,
     lookup: impl Fn(&str) -> Option<u64>) -> Option<GlmContext> {
     let family = cfg.program_family();
@@ -151,6 +151,27 @@ pub fn manifest_context(cfg: &GlmDsaConfig, manifest: &serde_json::Value, sms: u
             lookup(&name)
         }).collect::<Option<Vec<_>>>()?.into_iter().max()?;
     Some(context)
+}
+
+/// Resolve context recipes and scratch on every participating card before choosing operand owners.
+pub fn manifest_context_for_cards(cfg: &GlmDsaConfig, manifest: &serde_json::Value, sms: &[usize],
+    plan: cuteafd_core::coordinator_programs::AttentionReductionPlan) -> anyhow::Result<Option<GlmContext>> {
+    let mut context: Option<GlmContext> = None;
+    for &sm_count in sms {
+        let mut selected = manifest.clone();
+        cuteafd_core::coordinator_programs::select_card_plans(&mut selected, sm_count.try_into()?)?;
+        let family = cuteafd_core::coordinator_programs::CoordinatorPrograms {
+            family: cfg.program_family(), split_family: cfg.split_program_family() };
+        cuteafd_core::coordinator_programs::select_attention_plans(&mut selected, plan,
+            |name| family.contains(name))?;
+        let Some(card) = manifest_context(cfg, &selected, sm_count, &plan) else { return Ok(None) };
+        context = Some(match context {
+            Some(previous) => GlmContext { topk_scratch: previous.topk_scratch.max(card.topk_scratch),
+                partial_scratch: previous.partial_scratch.max(card.partial_scratch) },
+            None => card,
+        });
+    }
+    Ok(context)
 }
 
 /// [`context_workspace`]'s bytes with the engine's allocation floor.
@@ -602,16 +623,32 @@ pub fn resolve_attention(cfg: &GlmDsaConfig, requested: Option<AttentionPlacemen
     } else { requested }
 }
 
+/// Resolve auto before choosing owner-local operands; explicit requests never fall back.
+pub fn resolve_context_attention(cfg: &GlmDsaConfig, requested: Option<AttentionPlacement>, gpus: usize,
+    context_available: bool, layers_supported: bool) -> Result<Option<AttentionPlacement>, PlacementError> {
+    if gpus == 2 && requested.is_none() && !context_available && cfg.split_program_family().is_some() {
+        let programs = context_program_list(cfg);
+        if !layers_supported {
+            return Err(PlacementError::MissingContextPrograms { family: cfg.family_id(), programs });
+        }
+        tracing::warn!(family = cfg.family_id(), %programs, fallback = "layers",
+            "auto context programs missing; falling back to whole-layer attention without KV replication");
+        return Ok(Some(AttentionPlacement::Layers));
+    }
+    Ok(resolve_attention(cfg, requested, gpus))
+}
+
 /// Evaluate each executable local prefix with its own intake, lane and TP2 costs.
 /// An empty Spark suffix is a candidate, never a subtraction after admission.
 pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
     attention: Option<AttentionPlacement>) -> Result<(Placement, GlmWorkingSet), PlacementError> {
     request(inputs)?;
+    let attention = resolve_context_attention(inputs.cfg, attention, inputs.gpus.len(),
+        inputs.context.is_some(), !inputs.native_experts)?;
     // `context` is the auto default on a two-GPU pair, and the requested mode
     // when asked for. A build whose manifest lacks its context programs cannot
-    // run it: fail closed with what to rebuild rather than silently
-    // downgrading the executor to heads (issue #202). Explicit heads is
-    // unaffected.
+    // run it when explicit; auto uses whole-layer owners where supported.
+    // Explicit heads is unaffected.
     let context_chosen = attention.map_or(inputs.gpus.len() == 2 && inputs.cfg.split_program_family().is_some(),
         |mode| mode == AttentionPlacement::Context);
     if inputs.cfg.split_program_family().is_none() && inputs.gpus.len() == 2
@@ -2504,6 +2541,37 @@ mod tests {
     const CONTEXT_SCRATCH: GlmContext = GlmContext { topk_scratch: 3 << 20, partial_scratch: 9 << 20 };
 
     #[test]
+    fn standard_auto_falls_back_to_layers_and_explicit_heads_ignores_context_availability() {
+        let ml4 = GlmDsaConfig::from_hf(&crate::families::mistral_large4::config::tests::official()).unwrap();
+        for cfg in [config(), ml4] {
+            let mut i = inputs(&cfg, &[96 * GIB; 2]);
+            i.spark_ranks = 6;
+            i.prefill_lanes = 2;
+            i.requested_pool = Some(131072);
+            let mut heads = None;
+            for context in [None, Some(CONTEXT_SCRATCH)] {
+                i.context = context;
+                let (placed, _) = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Heads)).unwrap();
+                assert!(placed.layers.iter().all(|layer| layer.mode == LayerMode::HeadSplit));
+                if let Some(expected) = &heads { assert_eq!(&placed, expected); }
+                heads = Some(placed);
+                let (auto, _) = solve_working_set(&i, [0; 2], None).unwrap();
+                assert_eq!(auto.attention_placement, if context.is_some() {
+                    AttentionPlacement::Context
+                } else { AttentionPlacement::Layers });
+                if context.is_none() {
+                    assert!(auto.layers.iter().all(|layer| matches!(layer.mode,
+                        LayerMode::Whole { ffn: FfnMode::Split, .. })));
+                    let error = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Context)).unwrap_err();
+                    assert!(matches!(error, PlacementError::MissingContextPrograms { .. }));
+                }
+            }
+            assert!(matches!(resolve_context_attention(&cfg, None, 2, false, false),
+                Err(PlacementError::MissingContextPrograms { .. })));
+        }
+    }
+
+    #[test]
     fn context_is_the_default_where_its_programs_exist_and_charges_what_the_engine_allocates() {
         let cfg = config();
         let mut i = inputs(&cfg, &[96 * GIB; 2]);
@@ -2605,6 +2673,40 @@ mod tests {
         for missing in names[..5].iter().chain(&names[5..6]) {
             let kept: Vec<_> = names.iter().copied().filter(|n| n != missing).collect();
             assert_eq!(context_programs(&cfg, kept.iter().copied(), |n| kept.contains(&n).then_some(1)), None, "{missing}");
+        }
+    }
+
+    #[test]
+    fn mismatched_card_recipes_fall_back_before_owner_selection() {
+        let ml4 = GlmDsaConfig::from_hf(&crate::families::mistral_large4::config::tests::official()).unwrap();
+        let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(64, None, None).unwrap();
+        for cfg in [config(), ml4] {
+            let mut programs: Vec<_> = CONTEXT_PROGRAMS.iter().map(|suffix|
+                serde_json::json!({"name": format!("{}_{suffix}", cfg.program_family())})).collect();
+            for kind in cfg.attention_kinds() {
+                programs.push(serde_json::json!({"name": context_gather(&cfg, kind)}));
+                for begin in [0, cfg.heads / 2] {
+                    for splits in [2, 4] {
+                        programs.push(serde_json::json!({"name": format!("{}_{kind}_partial_h{begin}_s{splits}_m64", cfg.program_family()),
+                            "params": {"device_sm_counts": [170], "row_caps": {"170": [64]}},
+                            "scratch_bytes_at_capacity": {"scratch": splits * 100}}));
+                    }
+                }
+            }
+            let manifest = serde_json::json!({"programs": programs});
+            assert!(manifest_context_for_cards(&cfg, &manifest, &[170], plan).unwrap().is_some());
+            let context = manifest_context_for_cards(&cfg, &manifest, &[170, 188], plan).unwrap();
+            assert!(context.is_none());
+            let resolved = resolve_context_attention(&cfg, None, 2, context.is_some(), true).unwrap();
+            assert_eq!(resolved, Some(AttentionPlacement::Layers));
+            let mut i = inputs(&cfg, &[96 * GIB; 2]);
+            i.context = context;
+            i.requested_pool = Some(131072);
+            let placement = solve_working_set(&i, [0; 2], resolved).unwrap().0;
+            assert!(placement.layers.iter().all(|layer| matches!(layer.mode, LayerMode::Whole { .. })));
+            assert!(matches!(solve_working_set(&i, [0; 2], Some(AttentionPlacement::Context)),
+                Err(PlacementError::MissingContextPrograms { .. })));
+            assert!(solve_working_set(&i, [0; 2], Some(AttentionPlacement::Heads)).is_ok());
         }
     }
 
