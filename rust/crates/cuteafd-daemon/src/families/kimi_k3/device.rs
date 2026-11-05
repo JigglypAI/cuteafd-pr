@@ -132,6 +132,13 @@ fn packing_inventory(core: Option<&serde_json::Value>) -> Result<Vec<(String, cr
             }
         }
     }
+    add("kimik3_lse_combine2".into(), SequenceLocal)?;
+    for cache in ["", "_fp8"] {
+        add(format!("kimik3_paged_staging_gather{cache}"), SequenceLocal)?;
+        for head in [0, 48] {
+            add(format!("kimik3_mla_partial{cache}_h{head}_m64"), SequenceLocal)?;
+        }
+    }
     // The drafter consumes each member's private context after packed target work.
     add("kimik3_mla_draft_output_m64".into(), SequenceLocal)?;
     for cache in ["", "_fp8"] {
@@ -1376,7 +1383,8 @@ mod packing_inventory_tests {
         }
         for name in ["kimik3_kda_m64", "kimik3_kda_m4096", "kda_core_h48_m4096",
             "kimik3_dense_mla_extend_h96_fp8_m4096", "mla_rank_norm_h48_kv640_fp8_m64",
-            "mla_query_h96_m4096", "kimik3_mla_draft_attention_full_m64"] {
+            "mla_query_h96_m4096", "kimik3_mla_draft_attention_full_m64",
+            "kimik3_lse_combine2", "kimik3_mla_partial_fp8_h48_m64", "kimik3_paged_staging_gather"] {
             assert_eq!(roles[name], SequenceLocal, "{name}");
         }
         for name in ["kimik3_new_projection", "dense_trellis_k6_new_projection", "mla_query_new"] {
