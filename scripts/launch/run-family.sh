@@ -1965,9 +1965,9 @@ if [[ -n "$exlr8_manifest" ]]; then
        ( "$family" == glm5_flash && "$exlr8_gpu_count" == 2 && "$ranks" == 0 ) ) ]] || release_die "EXLR8 requires 1..2 RTX GPUs and 1..8 canonical Spark ranks (Flash TP2 also supports 0 Sparks)"
   [[ "$(get SPECULATOR dflash2)" == off || "$(get SPECULATOR dflash2)" == dflash2 ]] || release_die "EXLR8 supports SPECULATOR=off or dflash2"
   if [[ "$family" != glm5_flash ]]; then
-    exlr8_attention=heads
-    [[ "$exlr8_gpu_count" != 2 ]] || exlr8_attention=context
-    [[ "$attention_placement" == auto || "$attention_placement" == "$exlr8_attention" ]] || release_die "EXLR8 requires $exlr8_attention attention for $exlr8_gpu_count RTX GPUs"
+    [[ "$attention_placement" == auto || "$attention_placement" == heads ||
+       ( "$exlr8_gpu_count" == 2 && "$attention_placement" == context ) ]] ||
+      release_die "GLM EXLR8 requires heads or two-GPU context attention"
   fi
   exlr8_plan_args=(--exlr8-manifest "$exlr8_manifest")
   spark_worker_args+=" --exlr8-manifest $exlr8_manifest"
