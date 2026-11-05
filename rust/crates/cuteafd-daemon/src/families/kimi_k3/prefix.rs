@@ -493,10 +493,12 @@ mod tests {
             let mut inputs = super::super::admission::tests::inputs(&cfg);
             inputs.attention = (attention == AttentionPlacement::Heads).then_some(AttentionPlacement::Heads);
             inputs.cache_format = cache_format;
+            let unit = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(
+                inputs.rows, inputs.waves, inputs.unit_rows)?.unit_rows as usize;
             for layouts in &mut inputs.lane_layouts {
                 for layout in layouts {
                     *layout = super::super::device::LaneLayout::new(
-                        &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?, inputs.rows, (inputs.rows).min(4096), context,
+                        &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?, inputs.rows, unit, context,
                         super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] })?;
                 }
             }
