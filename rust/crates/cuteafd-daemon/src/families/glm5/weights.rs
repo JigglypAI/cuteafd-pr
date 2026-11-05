@@ -813,21 +813,19 @@ impl<'a> GlmLoader<'a> {
     }
 
     fn core_weights(&self, layout: cuteafd_loader::formats::trellis_core::CoreWeightLayout,
-        rank: usize) -> Result<CoreWeights<'a>> {
+        checkpoint: &cuteafd_loader::plan::Checkpoint, rank: usize) -> Result<CoreWeights<'a>> {
+        use crate::shared::experts::rtx::dense::DenseLoad;
         let layout = CoreWeightLayout::from_shared(layout);
-        let loaded = layout.read(|name| {
-            let (bytes, dtype, shape) = self.raw(name)?;
-            let tensor = self.catalog.tensor(name)?;
-            Ok(cuteafd_loader::LoadedTensor {
-                info: cuteafd_core::TensorInfo { name: name.into(), file: tensor.shard.clone(), dtype, shape,
-                    byte_offset: tensor.metadata.byte_offset, byte_length: tensor.metadata.byte_length,
-                    role: cuteafd_core::TensorRole::Other, layer_id: None, expert_id: None,
-                    is_quantization_metadata: false }, source_path: self.catalog.snapshot().join(&tensor.shard),
-                bytes, elapsed_micros: 0, sha256: String::new(),
-            })
-        })?;
-        self.on_rank(rank, |_| layout.upload(Device { library: self.library,
-            id: self.library.cuda_get_device()? }, loaded))
+        let dense = if self.push.is_some() { DenseLoad::push(self.library) }
+            else { DenseLoad::mount(self.library) };
+        let weights = self.on_rank(rank, |stream| layout.load_recorded(Device { library: self.library,
+            id: self.library.cuda_get_device()? }, checkpoint, &dense, stream))?;
+        if let Some(push) = &self.push {
+            let (operands, steps) = dense.sink.as_ref().context("K6 push sink")?.take();
+            for operand in operands { push.dense.operand(operand)?; }
+            for step in steps { push.dense.step(step)?; }
+        }
+        Ok(weights)
     }
 
     fn packed_fp8(&self, qkv_a: &[String]) -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
@@ -885,7 +883,7 @@ impl<'a> GlmLoader<'a> {
             let mut loaded = Vec::<(usize, &'static str, DeviceAllocation<'a>)>::new();
             if let Operation::Core(layout) = route.operation {
                 let rank = route.ranks[0];
-                let weights = self.core_weights(layout, rank)?;
+                let weights = self.core_weights(layout, checkpoint, rank)?;
                 let actual = [("payload", weights.payload.buffer), ("suh", weights.suh.buffer), ("svh", weights.svh.buffer)]
                     .into_iter().map(|(suffix, buffer)| (format!("glm.weights.gpu.{rank}.layer.{layer}.core.{}.{suffix}", route.key), buffer)).collect::<Vec<_>>();
                 self.check_weight_requests(&route.requests, &actual)?;
@@ -1025,7 +1023,7 @@ impl<'a> GlmLoader<'a> {
                     actual
                 }
                 routes::Operation::Core(layout) => {
-                    let weights = self.core_weights(layout, 0)?;
+                    let weights = self.core_weights(layout, &checkpoint, 0)?;
                     let actual = [("payload", weights.payload.buffer), ("suh", weights.suh.buffer), ("svh", weights.svh.buffer)]
                         .into_iter().map(|(suffix, buffer)| (format!("glm.weights.gpu.0.core.head.{suffix}"), buffer)).collect();
                     head = Some(GlmHead::K6(weights));

@@ -361,6 +361,88 @@ fn compact_k6_payload_vectors_and_head_equal_inventory() -> Result<()> {
 }
 
 #[test]
+fn glm_and_ml4_k6_min_max_push_plans_preserve_packed_bytes() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{self, Job, RankLayout};
+    use cuteafd_loader::formats::{dense_trellis::TrellisSide, trellis_core::CoreWeightLayout as SharedLayout};
+    use std::os::unix::fs::FileExt;
+    let (dso, library) = compact_dso()?;
+    for ml4 in [false, true] {
+        let root = tempfile::tempdir_in(dso.directory())?;
+        let (config, mut tensors) = fixture::glm5_compact_weights();
+        let mut cfg = GlmDsaConfig::from_hf(&config)?;
+        cfg.vocab_size = 256;
+        if ml4 {
+            cfg.variant = GlmDsaConfig::from_hf(&fixture::mistral_large4_config())?.variant;
+            cfg.q_lora_rank = 0;
+        }
+        for (name, shape) in cuteafd_loader::families::glm5::core::expected(&cfg) {
+            let stem = name.strip_suffix(".weight").context("core stem")?;
+            tensors.retain(|t| t.0 != name && t.0 != format!("{name}_scale_inv"));
+            tensors.extend(fixture::exl3(stem, shape[0].next_multiple_of(128), shape[1], 6));
+        }
+        fixture::write_snapshot(root.path(), &config, &tensors, None);
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open(root.path())?;
+        for tensor in &checkpoint.tensors {
+            if tensor.meta.name.ends_with(".mcg") || tensor.meta.name.ends_with(".trellis")
+                || tensor.meta.name.ends_with(".suh") || tensor.meta.name.ends_with(".svh") {
+                let bytes = if tensor.meta.name.ends_with(".mcg") { 0xcbac1fedu32.to_le_bytes().to_vec() }
+                    else { (0..tensor.meta.byte_length).map(|i| (i as u8).wrapping_mul(31).wrapping_add(7)).collect() };
+                std::fs::OpenOptions::new().write(true).open(root.path().join(&tensor.shard))?
+                    .write_all_at(&bytes, tensor.meta.byte_offset)?;
+            }
+        }
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        for ranks in [1, 2] {
+            let sink = std::rc::Rc::new(super::landing::PushSink::default());
+            let loader = GlmLoader { library: &library, catalog: &catalog, device: 0,
+                stream: std::ptr::null_mut(), peers: (1..ranks).map(|rank| crate::shared::peer_split::RankDevice {
+                    device: rank as i32, stream: std::ptr::null_mut() }).collect(), push: Some(sink.clone()) };
+            let mut layouts = Vec::new();
+            for layer in 0..cfg.layers {
+                for (rank, weights) in core.layer_weights(&cfg, layer, ranks, None)?.into_iter().enumerate() {
+                    layouts.extend(weights.into_values().map(|layout| (rank, layout)));
+                }
+            }
+            layouts.push((0, SharedLayout::new(core.get_weight(cfg.head()).context("K6 head")?, TrellisSide::Output, 0, 1)?));
+            let mut weights = Vec::new();
+            let mut expected = Vec::new();
+            for (rank, layout) in &layouts {
+                let packed = CoreWeightLayout::from_shared(layout.clone()).read(|name|
+                    crate::shared::checkpoint_read::read_tensor(&checkpoint, name))?;
+                expected.push(packed.shard);
+                weights.push(loader.core_weights(layout.clone(), &checkpoint, *rank)?);
+            }
+            let (records, deferred) = sink.take();
+            assert!(deferred.is_empty());
+            assert_eq!(records.operands.len(), layouts.len() * 2);
+            assert_eq!(records.steps.iter().flat_map(|s| &s.jobs).filter(|j| matches!(j, Job::TrellisTiles { .. })).count(), layouts.len());
+            // Building the push ranks must retain both payload transforms and vector lands.
+            for rank in 0..ranks {
+                let layout = RankLayout::new(records.operands.clone(), records.steps.clone(), rank as i32)?;
+                let checked = layout.checked(root.path(), ranks + 6, rank + 6)?;
+                assert!(checked.totals.rank_bytes[rank + 6] > 0);
+                assert!(!layout.steps.is_empty() && !layout.operands.is_empty());
+                assert!(layout.host_staging.bytes()? > 0);
+            }
+            // Replay the actual recorded recipes through the mount fallback. This also
+            // catches an eager upload: the original packer is the independent oracle.
+            dense::fill_records_by_mount(&library, &records, |_| std::ptr::null_mut())?;
+            for ((weights, expected), (_, layout)) in weights.iter().zip(&expected).zip(&layouts) {
+                assert_eq!(weights.payload.buffer.bytes + weights.suh.buffer.bytes + weights.svh.buffer.bytes, layout.bytes);
+                for (buffer, bytes) in [(weights.payload.buffer, &expected.payload),
+                    (weights.suh.buffer, &expected.suh), (weights.svh.buffer, &expected.svh)] {
+                    let mut actual = vec![0; buffer.bytes];
+                    library.copy_d2h(&mut actual, buffer)?;
+                    assert_eq!(&actual, bytes, "{} ranks={ranks} ml4={ml4}", layout.stem);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn mixed_mlp_arithmetic_is_refused_before_upload() -> Result<()> {
     let root = tempfile::tempdir()?;
     let (mut config, tensors) = fixture::glm5_compact_weights();
