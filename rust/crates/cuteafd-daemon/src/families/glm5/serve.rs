@@ -244,17 +244,19 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
         }
     };
     // The tower loads before the LM so its admitted bytes are in the LM's live baseline.
-    let (vision, prefix) = match ml4_media::ReadyVision::load(args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
+    let (mut vision, prefix) = match ml4_media::ReadyVision::load(args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
         Ok(vision) => vision,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };
+    let media_push = vision.as_mut().map(|v| std::mem::take(&mut v.push)).unwrap_or_default();
     let preparer = vision.as_ref().map(|v| v.preparer.clone());
     let expander = vision.as_ref().map(|v| v.expander);
     let (encoder, bytes) = vision.map_or((ml4_media::Encoder::Off, 0), |v| (v.encoder, v.cache_bytes));
     let health = encoder.health_handle();
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
-    let result = opened.with_resolved_engine(&resolved, |engine, transport, runtime| {
+    let result = opened.with_resolved_engine_media(&resolved, media_push.records(), |engine, transport, runtime| {
+        media_push.commit()?;
         anyhow::ensure!(transport.is_some() || engine.skip_routed() || engine.has_local(), "serve-glm needs Spark peers, local TP2 or --skip-routed-experts");
         let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
         let spark = transport.is_some();

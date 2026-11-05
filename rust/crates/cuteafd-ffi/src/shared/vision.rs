@@ -258,6 +258,28 @@ impl NativeVision {
             Ok(ledger)
         }
     }
+    pub fn prepare(path: &Path, spec: &VisionSpec, device: i32, admitted: u64) -> Result<Self, VisionError> {
+        Self::load_inner(path, spec, device, admitted, None)
+    }
+    /// Existing admitted arena; the caller retains this owner until external writes drain.
+    pub fn weight_arena(&self) -> Result<usize, VisionError> {
+        // SAFETY: exact header ABI; the owner is live and confined to this thread.
+        unsafe {
+            let get = self._library.get::<unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32>(b"cuteafd_vision_weight_arena")?;
+            let mut arena = std::ptr::null_mut();
+            check(get(self.owner, &mut arena))?;
+            Ok(arena as usize)
+        }
+    }
+    pub fn upload_range(&self, offset: u64, bytes: &[u8]) -> Result<(), VisionError> {
+        // SAFETY: native checks the range and drains the host upload before return.
+        unsafe { check(self._library.get::<Upload>(b"cuteafd_vision_upload")?(self.owner, offset, bytes.as_ptr(), bytes.len() as u64)) }
+    }
+    /// External push streams must already be drained by the group receiver.
+    pub fn commit_weights(&mut self) -> Result<(), VisionError> {
+        // SAFETY: exact header ABI and live thread-confined owner.
+        unsafe { check(self._library.get::<unsafe extern "C" fn(*mut c_void) -> i32>(b"cuteafd_vision_commit_weights")?(self.owner)) }
+    }
     /// Check admission before native weights, scratch or cuBLAS allocations.
     /// `weights` must be the complete initialized arena described by `spec`.
     pub fn load(
@@ -267,7 +289,10 @@ impl NativeVision {
         admitted_bytes: u64,
         weights: &[u8],
     ) -> Result<Self, VisionError> {
-        if weights.len() as u64 != spec.weight_bytes {
+        Self::load_inner(path, spec, device, admitted_bytes, Some(weights))
+    }
+    fn load_inner(path: &Path, spec: &VisionSpec, device: i32, admitted_bytes: u64, weights: Option<&[u8]>) -> Result<Self, VisionError> {
+        if weights.is_some_and(|w| w.len() as u64 != spec.weight_bytes) {
             return Err(VisionError::InvalidInput(
                 "vision weight arena length mismatch",
             ));
@@ -302,12 +327,9 @@ impl NativeVision {
             if result.owner.is_null() {
                 return Err(VisionError::InvalidInput("null vision owner"));
             }
-            check(upload(
-                result.owner,
-                0,
-                weights.as_ptr(),
-                weights.len() as u64,
-            ))?;
+            if let Some(weights) = weights {
+                check(upload(result.owner, 0, weights.as_ptr(), weights.len() as u64))?;
+            }
             Ok(result)
         }
     }

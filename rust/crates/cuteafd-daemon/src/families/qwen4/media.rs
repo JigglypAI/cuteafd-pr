@@ -54,6 +54,7 @@ fn warn_cache_capacity(cache_bytes: usize, max_tokens: usize, width: usize) -> R
 }
 
 pub(super) struct ReadyVision {
+    pub push: crate::shared::vision::push::Contribution,
     pub encoder: Encoder,
     pub preparer: Arc<MediaPreparer>,
     pub cache_bytes: usize,
@@ -84,7 +85,7 @@ impl ReadyVision {
             let encoder = crate::shared::vision::remote::RemoteEncoder::connect(remote.addresses, expected,
                 std::time::Duration::from_secs(60))?;
             tracing::info!(cache_bytes, "Qwen remote vision encoder ready");
-            return Ok((Some(Self { encoder: Encoder::Remote(encoder), preparer, cache_bytes, weights: None }), prefix));
+            return Ok((Some(Self { push: Default::default(), encoder: Encoder::Remote(encoder), preparer, cache_bytes, weights: None }), prefix));
         }
         let gpu = match mode {
             MediaMode::Rtx(gpu) => gpu.map(|gpu| i32::try_from(gpu)).transpose()?.unwrap_or(args.device),
@@ -114,13 +115,18 @@ impl ReadyVision {
                 total_bytes: total as u64, baseline_free_bytes: free as u64 },
             &[cuteafd_core::serving_capacity::MemoryReservation { name: "vision.resident_weights_scratch".into(), bytes: admitted }])?;
         // Start before LM preflight: its live baseline already includes the admitted tower.
-        Ok(crate::shared::vision::EncoderService::start(spec, args.native_lib.clone(), gpu, admitted)?)
+        if args.split_device.is_some() {
+            // Dual Qwen has no dense push group yet; retain its existing load path.
+            Ok((crate::shared::vision::EncoderService::start(spec, args.native_lib.clone(), gpu, admitted)?, Default::default()))
+        } else {
+            Ok(crate::shared::vision::EncoderService::start_coordinator(&args.snapshot, Some((spec, admitted)), args.native_lib.clone(), gpu, None)?)
+        }
         })();
         let restored = library.cuda_set_device(args.device);
-        let service = loaded?;
+        let (service, push) = loaded?;
         restored?;
-        tracing::info!(gpu, admitted_bytes = admitted, cache_bytes, sm, "Qwen resident vision encoder ready");
-        Ok((Some(Self { encoder: Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor, width, max_tokens)),
+        tracing::info!(gpu, admitted_bytes = admitted, cache_bytes, sm, "Qwen resident vision encoder allocated");
+        Ok((Some(Self { push, encoder: Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor, width, max_tokens)),
             preparer, cache_bytes, weights: Some((gpu, weights)) }), prefix))
     }
 }

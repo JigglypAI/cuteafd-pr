@@ -336,6 +336,7 @@ mod tests {
             cuteafd_loader::media::ImageFamily::GlmFlash
         );
         super::super::tests::assert_ctypes_spec(dir.path(), "glm5_flash", &spec);
+        super::super::push::tests::assert_vision_plan(dir.path(), &spec);
         assert_eq!(spec.reads.len(), 347);
         assert_eq!(spec.native.reserved, 3);
         for i in 0..24 {

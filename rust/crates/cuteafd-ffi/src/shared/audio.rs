@@ -234,13 +234,36 @@ impl NativeAudio {
         weights: &[u8],
         tables: AudioTables<'_>,
     ) -> Result<Self, AudioError> {
+        Self::load_inner(path, spec, device, admitted_bytes, Some(weights), tables)
+    }
+    pub fn prepare(path: &Path, spec: &AudioSpec, device: i32, admitted: u64) -> Result<Self, AudioError> {
+        Self::load_inner(path, spec, device, admitted, None, AudioTables {
+            hann: &[], mel_filterbank: &[], codec_rotary: &[], patch_rotary: &[],
+        })
+    }
+    pub fn weight_arena(&self) -> Result<usize, AudioError> {
+        // SAFETY: exact header ABI; the owner stays live until external push writes drain.
+        unsafe {
+            let get = self._library.get::<unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32>(b"cuteafd_audio_weight_arena")?;
+            let mut arena = std::ptr::null_mut();
+            check(get(self.owner, &mut arena))?;
+            Ok(arena as usize)
+        }
+    }
+    /// External push streams must be drained before deriving RVQ tables and publishing.
+    pub fn commit_weights(&mut self) -> Result<(), AudioError> {
+        // SAFETY: exact header ABI and live thread-confined owner.
+        unsafe { check(self._library.get::<unsafe extern "C" fn(*mut c_void) -> i32>(b"cuteafd_audio_commit_weights")?(self.owner)) }
+    }
+    fn load_inner(path: &Path, spec: &AudioSpec, device: i32, admitted_bytes: u64,
+        weights: Option<&[u8]>, tables: AudioTables<'_>) -> Result<Self, AudioError> {
         audio_geometry(spec.max_samples as usize)?;
         let mel_capacity = 6000.min(spec.max_samples as usize / 240 + 1);
         let embedded = tables.hann.is_empty()
             && tables.mel_filterbank.is_empty()
             && tables.codec_rotary.is_empty()
             && tables.patch_rotary.is_empty();
-        if weights.len() as u64 != spec.weight_bytes
+        if weights.is_some_and(|weights| weights.len() as u64 != spec.weight_bytes)
             || (!embedded
                 && (tables.hann.len() != 960
                     || tables.mel_filterbank.len() != 481 * 128
@@ -292,6 +315,7 @@ impl NativeAudio {
             if result.owner.is_null() {
                 return Err(AudioError::InvalidInput("null audio owner"));
             }
+            if let Some(weights) = weights {
             check(upload(
                 result.owner,
                 weights.as_ptr(),
@@ -317,6 +341,7 @@ impl NativeAudio {
                     tables.patch_rotary.as_ptr()
                 },
             ))?;
+            }
             Ok(result)
         }
     }

@@ -74,6 +74,7 @@ fn checkpoint_weights(vision: Option<cuteafd_ffi::vision::VisionLedger>,
 }
 
 pub(super) struct ReadyVision {
+    pub push: crate::shared::vision::push::Contribution,
     pub encoder: Encoder,
     pub preparer: Option<Arc<MediaPreparer>>,
     pub audio_preparer: Option<Arc<cuteafd_api::openai::media::audio::AudioPreparer>>,
@@ -84,6 +85,7 @@ impl ReadyVision {
     pub fn load(args: &super::EngineArgs, library: &cuteafd_ffi::NativeLibrary, mode: MediaMode,
         audio_mode: MediaMode, prefix: &super::serve::PrefixArgs, cache_bytes: Option<u64>,
         remote: Option<RemoteVision>, remote_audio: Option<RemoteAudio>) -> Result<(Option<Self>, super::serve::PrefixArgs)> {
+        let mut push = crate::shared::vision::push::Contribution::default();
         let config = vision_config(mode, &args.snapshot)?;
         let audio_on = audio_mode != MediaMode::Off;
         if config.is_none() && !audio_on { return Ok((None, prefix.clone())); }
@@ -183,16 +185,15 @@ impl ReadyVision {
                         total_bytes: total as u64, baseline_free_bytes: free as u64 },
                     &[cuteafd_core::serving_capacity::MemoryReservation { name: "vision.resident_weights_scratch".into(), bytes: vision_bytes },
                       cuteafd_core::serving_capacity::MemoryReservation { name: "audio.resident_weights_scratch".into(), bytes: audio_bytes }])?;
-                let service = match spec {
-                    Some(spec) => crate::shared::vision::EncoderService::start_with_audio(spec, args.native_lib.clone(), gpu, vision_bytes, audio)?,
-                    None => crate::shared::vision::EncoderService::start_audio(args.native_lib.clone(), gpu, audio.context("audio owner config")?)?,
-                };
+                let (service, contribution) = crate::shared::vision::EncoderService::start_coordinator(&args.snapshot,
+                    spec.map(|spec| (spec, vision_bytes)), args.native_lib.clone(), gpu, audio)?;
+                push.extend(contribution);
                 Ok(Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor, width, 4096)))
             })();
             let restored = library.cuda_set_device(args.device);
             let encoder = loaded?;
             restored?;
-            tracing::info!(gpu, vision_bytes, audio_bytes, sm, "MiMo resident media encoder ready");
+            tracing::info!(gpu, vision_bytes, audio_bytes, sm, "MiMo resident media encoder allocated");
             Some(encoder)
         } else { None };
         let encoder = match (has_local_image, has_local_audio, local) {
@@ -202,7 +203,7 @@ impl ReadyVision {
             (_, _, None) => Encoder::split(image_encoder, audio_encoder),
             _ => unreachable!(),
         };
-        Ok((Some(Self { encoder, preparer, audio_preparer, cache_bytes, weights }), prefix))
+        Ok((Some(Self { push, encoder, preparer, audio_preparer, cache_bytes, weights }), prefix))
     }
 }
 

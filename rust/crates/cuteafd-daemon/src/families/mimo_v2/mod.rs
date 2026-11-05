@@ -943,6 +943,12 @@ impl Opened {
     pub fn with_engine_reserved<T>(&self, args: &EngineArgs,
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>, prefill_output: MimoPrefillOutput,
         body: impl FnOnce(&engine::MimoEngine<'_>, Option<cuteafd_hostcache::config::Config>) -> Result<T>) -> Result<T> {
+        self.with_engine_reserved_media(args, serving, Default::default(), prefill_output, body)
+    }
+    pub(super) fn with_engine_reserved_media<T>(&self, args: &EngineArgs,
+        serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>, media: crate::shared::experts::rtx::dense::Records,
+        prefill_output: MimoPrefillOutput,
+        body: impl FnOnce(&engine::MimoEngine<'_>, Option<cuteafd_hostcache::config::Config>) -> Result<T>) -> Result<T> {
         let automatic_context = args.max_context == 0;
         let shape = admission::resolved_prefill_shape(usize::from(args.peers.is_some()),
             args.prefill_rows, args.prefill_waves)?;
@@ -1065,6 +1071,7 @@ impl Opened {
             let (loaded, mut records) = crate::shared::experts::rtx::dense::recording(||
                 planning.with_embedding(&self.cfg, layers, args.mtp, self.embed_source()?, embed_placement))?;
             records.extend(load.sink.as_ref().context("push sink")?.take_all());
+            records.extend(media.clone());
             let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records, &devices, sparks)?;
             let experts = if let Some(tp2) = preflight.placement.tp2 {
                 let tensors = self.catalog.as_ref().and_then(|c| c.fp8()).context("MiMo expert headers")?;

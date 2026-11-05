@@ -873,6 +873,11 @@ impl Opened {
     fn with_resolved_engine<T>(&self, resolved: &ResolvedEngineArgs,
         body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut SparkLink<'_>>, &tokio::runtime::Runtime) -> Result<T>)
         -> Result<T> {
+        self.with_resolved_engine_media(resolved, Default::default(), body)
+    }
+    fn with_resolved_engine_media<T>(&self, resolved: &ResolvedEngineArgs,
+        media: crate::shared::experts::rtx::dense::Records,
+        body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut SparkLink<'_>>, &tokio::runtime::Runtime) -> Result<T>) -> Result<T> {
         let ResolvedEngineArgs { args, automatic_context } = resolved;
         let automatic_context = *automatic_context;
         let native = self.native;
@@ -1229,6 +1234,7 @@ impl Opened {
             })?;
             let (dense_records, deferred) = sink.take();
             records.extend(dense_records);
+            records.extend(media.clone());
             let dense = push::plan_ranks(&self.snapshot, records.clone(), &dense_devices, sparks)?;
             Ok((embedding, model, drafter, records, deferred, dense))
         };
@@ -1335,7 +1341,7 @@ impl Opened {
         let (embedding, ((model, mut shares), tp2)) = crate::shared::placement::load_while_admitting(admission, || {
             if let Some(records) = &native_records {
                 let loaded = self.load_native(args, records, &native_dense_records, layers, &programs, &manifest, &loader, &devices, stream,
-                    peer_stream, native_push.take(), &ml4_draft, &mut draft_file)?;
+                    peer_stream, native_push.take(), &media, &ml4_draft, &mut draft_file)?;
                 planned_drafter = loaded.3;
                 let tp2 = if let Some(range) = tp2_range.clone() {
                     Some(tp2_weights(range, loaded.2)?)
@@ -1638,6 +1644,7 @@ impl Opened {
         per_rank: &[dense_weights::NativeDenseRecords], layers: usize, programs: &'s cuteafd_ffi::programs::Programs<'s>, _manifest: &serde_json::Value,
         loader: &weights::GlmLoader<'s>, devices: &[i32], stream: *mut c_void, _peer_stream: Option<(i32, *mut c_void)>,
         push: Option<(crate::shared::experts::rtx::push::CoordinatorPush, usize)>,
+        media: &crate::shared::experts::rtx::dense::Records,
         ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
         draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>)
         -> Result<(crate::shared::token_io::TokenEmbedding<'s>, (weights::GlmWeights<'s>, Vec<Vec<weights::GlmLayer<'s>>>),
@@ -1670,6 +1677,7 @@ impl Opened {
                 planned_drafter = Some(self.load_drafter(args, programs, &embedding, stream, ml4_draft, draft_file)?);
                 let mut records = recorder.context("native push recorder")?.finish();
                 records.extend(load.sink.as_ref().context("push sink")?.take_all());
+                records.extend(media.clone());
                 let dense_devices: Vec<_> = devices.iter().map(|&id| crate::shared::memory::device::Device {
                     library: &self.library, id }).collect();
                 let planned = crate::shared::experts::rtx::dense::plan_records(&self.snapshot, records.clone(),
