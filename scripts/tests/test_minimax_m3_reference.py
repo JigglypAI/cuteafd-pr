@@ -354,7 +354,7 @@ def test_projection_gate_up_uses_shared_min_input_scale(snapshot):
 
 def test_one_token_dense_forward_matches_hand_computed_native_qdq(snapshot):
     cfg = model.Config.from_dict(tiny_config())
-    cfg.text["rms_norm_eps"] = 0.
+    cfg.text["rms_norm_eps"] = 1e-6
     weights = model.Weights(snapshot).load_layer(0, cfg)
     for name, value in weights.items():
         if name.endswith("weight_scale_inv"):
