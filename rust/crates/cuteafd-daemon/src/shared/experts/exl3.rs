@@ -218,6 +218,33 @@ impl<'a> Exl3Weights<'a> {
             }
             pinned_admitted = pinned_admitted.max(pinned);
         }
+        if super::rtx::dense::is_recording() {
+            use super::rtx::dense::{DenseLoad, Operand, Rect};
+            for rank in 0..2 {
+                let load = DenseLoad::mount(devices[rank].library);
+                for weight in weights[rank].iter() {
+                    for job in &weight.layout.loads {
+                        let tensor = catalog.tensor(&job.tensor)?;
+                        let slice = catalog.exl3_tensor_slice(&job.tensor, 2, rank)?;
+                        let rect = Rect { name: job.tensor.clone(), path: catalog.snapshot().join(&tensor.shard),
+                            base: tensor.metadata.byte_offset, row_bytes: slice.source_row_bytes,
+                            rows: 0..slice.rows, cols: slice.column_start_bytes..slice.column_start_bytes + slice.selected_row_bytes };
+                        ensure!(rect.bytes() == job.bytes, "recorded EXL3 slice differs from upload");
+                        for &(buffer, offset) in &job.destinations {
+                            let mut destination = weight.buffers[buffer].buffer;
+                            ensure!(offset.checked_add(job.bytes).is_some_and(|end| end <= destination.bytes),
+                                "recorded EXL3 upload exceeds destination");
+                            // SAFETY: checked subregion belongs to this retained weight owner.
+                            destination.ptr = unsafe { destination.ptr.cast::<u8>().add(offset).cast() };
+                            destination.bytes = job.bytes;
+                            load.operand(Operand { device: devices[rank].id, buffer: destination,
+                                lands: vec![(rect.clone(), 0)], bytes: job.bytes })?;
+                        }
+                    }
+                }
+            }
+            return Ok(weights);
+        }
         let mut hosts = paired_load::banks(devices[0], EXPERT_READ_LANES, full_bytes, pinned_admitted)?;
         let mut fences = Fences::new(devices)?;
         // Drain before pinned banks and GPU arenas on every error/unwind path.

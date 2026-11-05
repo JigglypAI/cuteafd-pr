@@ -211,6 +211,36 @@ impl Fixture {
         Ok(unsafe { library.lib.get::<unsafe extern "C" fn() -> usize>(b"fixture_mapped_bytes")?() })
     }
 
+    pub fn module_path(&self) -> &std::path::Path { &self.module }
+
+    /// Register unmodified installed program ABI metadata; launches still fail.
+    pub fn register_programs(&self, library: &NativeLibrary, entries: &[serde_json::Value]) -> Result<()> {
+        for (index, entry) in entries.iter().enumerate() {
+            let name = CString::new(entry["name"].as_str().context("fixture program name missing")?)?;
+            let pointers = u32::try_from(entry["pointers"].as_array().context("fixture pointers missing")?.len())?;
+            let kinds = entry["scalars"].as_array().context("fixture scalars missing")?.iter().map(|scalar| {
+                match scalar["type"].as_str() {
+                    Some("int32") => Ok(b'i'), Some("int64") => Ok(b'l'), Some("float32") => Ok(b'f'),
+                    _ => anyhow::bail!("fixture program scalar type missing"),
+                }
+            }).collect::<Result<Vec<_>>>()?;
+            // SAFETY: fixture copies the bounded name/scalar metadata before returning.
+            let status = unsafe {
+                library.lib.get::<unsafe extern "C" fn(u32, *const c_char, u32, *const u8, u32) -> i32>(
+                    b"fixture_register_program")?(u32::try_from(index)?, name.as_ptr(), pointers,
+                        kinds.as_ptr(), u32::try_from(kinds.len())?)
+            };
+            anyhow::ensure!(status == 0, "fixture rejected installed program {index}");
+        }
+        Ok(())
+    }
+
+    pub fn configure_exl3(&self, library: &NativeLibrary, words: &[u32; 16]) -> Result<()> {
+        // SAFETY: CPU fixture copies this complete fixed-size ABI record synchronously.
+        unsafe { library.lib.get::<unsafe extern "C" fn(*const u32)>(b"fixture_configure_exl3")?(words.as_ptr()); }
+        Ok(())
+    }
+
     /// Admit a BF16 projection in the allocation-only catalog; launches still fail.
     pub fn draft_projection(&self, library: &NativeLibrary, index: u32, k: u32, n: u32) -> Result<()> {
         // SAFETY: the private fixture validates the index and copies only scalar metadata.

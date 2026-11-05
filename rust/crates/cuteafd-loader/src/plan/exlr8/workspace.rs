@@ -152,6 +152,14 @@ pub(super) fn program_spec(programs: &Value, name: &str) -> Result<ProgramSpec> 
         geometry: entry["geometry"].clone() })
 }
 
+/// Header-native execution layout, identical to the ProgramSpec runtime path.
+pub fn execution_workspace_from_manifest(programs: &Value, family: KernelFamily, rows: usize,
+    variant: ExecutionVariant, unit_limit: usize, activations: PrefillActivations)
+    -> Result<ExecutionWorkspace> {
+    let spec = program_spec(programs, variant.program(family, activations))?;
+    execution_workspace(&spec, rows, ExpertSet::Routed, variant, unit_limit, activations)
+}
+
 /// Admit the shared expert from the same validated geometry and arena as runtime.
 pub fn shared_workspace(programs: &Value, family: KernelFamily) -> Result<u64> {
     let variant = ExecutionVariant::SharedDecode;

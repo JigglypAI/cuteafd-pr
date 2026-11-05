@@ -15,22 +15,11 @@ pub(crate) struct RegionLayout {
 }
 impl RegionLayout {
     fn packed(sizes: impl IntoIterator<Item = usize>) -> Result<Self> {
-        let mut cursor = 0usize;
-        let mut admitted = 0usize;
-        let mut regions = Vec::new();
-        for size in sizes {
-            admitted = admitted
-                .checked_add(size)
-                .ok_or_else(|| anyhow::anyhow!("resident plane admission overflow"))?;
-            cursor = cursor
-                .checked_add(255)
-                .ok_or_else(|| anyhow::anyhow!("plane alignment overflow"))?
-                & !255;
-            regions.push((cursor, size));
-            cursor = cursor
-                .checked_add(size)
-                .ok_or_else(|| anyhow::anyhow!("plane extent overflow"))?;
-        }
+        let layout = cuteafd_loader::serving_capacity::PackedWeightRegions::new(sizes)?;
+        let admitted = layout.regions.iter().try_fold(0usize, |sum, region|
+            sum.checked_add(region.len()).ok_or_else(|| anyhow::anyhow!("resident plane admission overflow")))?;
+        let cursor = layout.bytes;
+        let regions = layout.regions.into_iter().map(|region| (region.start, region.len())).collect();
         let padding = cursor - admitted;
         ensure!(
             padding <= 1024 * 1024,

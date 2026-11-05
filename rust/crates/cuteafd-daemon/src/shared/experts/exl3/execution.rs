@@ -318,17 +318,16 @@ impl<'a> Exl3Workspace<'a> {
         self.allocations.values().map(|allocation| allocation.buffer.bytes).sum()
     }
     fn layout(directories: &[PathBuf], epilogue: Exl3Epilogue) -> Result<BTreeMap<String, (usize, String)>> {
-        ensure!(!directories.is_empty(), "empty EXL3 capacity workspace");
-        let mut layout: BTreeMap<String, (usize, String)> = BTreeMap::new();
-        for directory in directories {
-            let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
-            for (name, spec) in meta.buffers {
-                if name != spec.allocation || spec.zero_on_create || !epilogue.allocates(&name) { continue; }
-                let entry = layout.entry(name).or_insert((0, spec.dtype.clone()));
-                ensure!(entry.1 == spec.dtype, "EXL3 shared scratch dtype mismatch");
-                entry.0 = entry.0.max(spec.bytes.max(16));
-            }
-        }
+        let manifests = directories.iter().map(|directory| -> Result<serde_json::Value> {
+            Ok(serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?)
+        }).collect::<Result<Vec<_>>>()?;
+        let physical = cuteafd_loader::serving_capacity::Exl3WorkspaceLayout::from_manifests(
+            &manifests, false, epilogue)?;
+        let layout = physical.owners.into_iter().filter_map(|owner| {
+            owner.name.strip_prefix("shared.").map(|name| {
+                Ok((name.to_owned(), (usize::try_from(owner.bytes)?, owner.dtype.clone())))
+            })
+        }).collect::<Result<BTreeMap<_, _>>>()?;
         Ok(layout)
     }
     /// Total allocation payload for all specializations sharing one lane arena.
@@ -476,15 +475,41 @@ struct LoadedModules<'a> {
     routes: Option<V41Exl3Routes>,
     wire: Option<cuteafd_ffi::V41Exl3Wire<'a>>,
 }
+pub(crate) struct Exl3ModulePaths {
+    pub core: PathBuf,
+    pub routes: Option<PathBuf>,
+}
+
 impl<'a> Exl3Modules<'a> {
     /// # Safety
     /// The directory contains trusted native code for the current CUDA device.
     pub(crate) unsafe fn load(
         library: &'a NativeLibrary, directory: &Path, format: Exl3InputFormat,
     ) -> Result<Self> {
+        let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        let paths = Exl3ModulePaths {
+            core: directory.join("libcuteafd_exl3.so"),
+            routes: meta.route_preparation.as_ref().map(|route| directory.join(&route.manifest)
+                .parent().unwrap().join("libv41_exl3_routes.so")),
+        };
+        // SAFETY: same trusted-package contract, with its installed library paths.
+        unsafe { Self::load_manifest(library, directory, format, paths, meta) }
+    }
+
+    /// # Safety
+    /// The supplied native modules implement the installed manifest's ABI and
+    /// are trusted for the current device. Assets always come from `directory`.
+    pub(crate) unsafe fn load_from(library: &'a NativeLibrary, directory: &Path,
+        format: Exl3InputFormat, paths: Exl3ModulePaths) -> Result<Self> {
+        let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        // SAFETY: caller supplies the trusted module ABI; only parsing is factored out.
+        unsafe { Self::load_manifest(library, directory, format, paths, meta) }
+    }
+
+    unsafe fn load_manifest(library: &'a NativeLibrary, directory: &Path,
+        format: Exl3InputFormat, paths: Exl3ModulePaths, meta: Manifest) -> Result<Self> {
         let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
         let owner = device.own(|| {
-            let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
             meta.group_rows()?;
             let core_reads_wire = meta.wire_input()?;
             ensure!(!core_reads_wire || format == Exl3InputFormat::Fp8K32,
@@ -501,7 +526,7 @@ impl<'a> Exl3Modules<'a> {
 
             meta.validate_native_contract()?;
             // SAFETY: the caller trusts this native package; the device owner scopes destruction.
-            let kernel = unsafe { V41Exl3Kernel::load(directory.join("libcuteafd_exl3.so"))? };
+            let kernel = unsafe { V41Exl3Kernel::load(&paths.core)? };
             let info = kernel.info();
             ensure!(
                 info.version == meta.native_info_version.unwrap_or(2)
@@ -536,7 +561,7 @@ impl<'a> Exl3Modules<'a> {
                 ensure!(format!("{:x}", Sha256::digest(&bytes)) == route.sha256,
                     "EXL3 route export hash mismatch");
                 // SAFETY: the caller trusts this package and its referenced route library.
-                Some(unsafe { V41Exl3Routes::load(path.parent().unwrap().join("libv41_exl3_routes.so"))? })
+                Some(unsafe { V41Exl3Routes::load(paths.routes.as_ref().context("missing EXL3 route module path")?)? })
             };
             let wire = if format == Exl3InputFormat::Fp8K32 && !core_reads_wire {
                 Some(library.v41_exl3_wire()?)
