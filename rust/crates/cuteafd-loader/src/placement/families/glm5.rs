@@ -14,6 +14,7 @@ pub mod admission;
 pub mod buffers;
 pub mod exchanges;
 pub mod hooks;
+pub mod local_physical;
 pub mod weights;
 
 pub const PAGE_ROWS: u64 = 64;

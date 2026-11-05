@@ -259,6 +259,7 @@ impl<'a> PeerExchange<'a> {
         let slots = sizes.len();
         validate_slot_sizes(ranks.map(|rank| rank.device), sizes)?;
         let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
+        let storage = cuteafd_loader::serving_capacity::PeerStorageLayout::new(slots, *sizes.iter().max().context("empty peer slots")?, diagnostics)?;
         let end = |rank: usize| -> Result<End<'a>> {
             on_device(library, ranks[rank].device, || {
                 library.cuda_enable_peer(ranks[1 - rank].device)?;
@@ -280,8 +281,8 @@ impl<'a> PeerExchange<'a> {
                     recv: sizes.iter()
                         .map(|&bytes| zeroed(bytes))
                         .collect::<Result<_>>()?,
-                    control: zeroed((slots + 1) * 16)?,
-                    progress: if diagnostics { Some(zeroed((slots + 1) * std::mem::size_of::<PeerProgress>())?) } else { None },
+                    control: zeroed(storage.control_bytes)?,
+                    progress: if diagnostics { Some(zeroed(storage.progress_bytes)?) } else { None },
                 })
             })
         };

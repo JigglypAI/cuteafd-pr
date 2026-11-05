@@ -16,22 +16,11 @@ pub(crate) struct ArenaLayout {
 impl ArenaLayout {
     /// Keep each existing layer layout intact, including its own padding.
     pub fn new(sizes: impl IntoIterator<Item = usize>, admitted: usize) -> Result<Self> {
-        let mut regions = Vec::new();
-        let mut bytes = 0usize;
-        for size in sizes {
-            ensure!(size > 0, "empty rank weight region");
-            bytes = bytes
-                .checked_add(255)
-                .context("rank arena alignment overflow")?
-                & !255;
-            let end = bytes
-                .checked_add(size)
-                .context("rank arena extent overflow")?;
-            regions.push(bytes..end);
-            bytes = end;
-        }
+        let layout = cuteafd_loader::serving_capacity::PackedWeightRegions::new(sizes)?;
+        let regions = layout.regions;
+        let bytes = layout.bytes;
         ensure!(
-            !regions.is_empty() && bytes <= admitted,
+            !regions.is_empty() && regions.iter().all(|region| !region.is_empty()) && bytes <= admitted,
             "rank weight arena needs {bytes} bytes, admitted {admitted}"
         );
         Ok(Self {

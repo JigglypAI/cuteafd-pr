@@ -318,17 +318,16 @@ impl<'a> Exl3Workspace<'a> {
         self.allocations.values().map(|allocation| allocation.buffer.bytes).sum()
     }
     fn layout(directories: &[PathBuf], epilogue: Exl3Epilogue) -> Result<BTreeMap<String, (usize, String)>> {
-        ensure!(!directories.is_empty(), "empty EXL3 capacity workspace");
-        let mut layout: BTreeMap<String, (usize, String)> = BTreeMap::new();
-        for directory in directories {
-            let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
-            for (name, spec) in meta.buffers {
-                if name != spec.allocation || spec.zero_on_create || !epilogue.allocates(&name) { continue; }
-                let entry = layout.entry(name).or_insert((0, spec.dtype.clone()));
-                ensure!(entry.1 == spec.dtype, "EXL3 shared scratch dtype mismatch");
-                entry.0 = entry.0.max(spec.bytes.max(16));
-            }
-        }
+        let manifests = directories.iter().map(|directory| -> Result<serde_json::Value> {
+            Ok(serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?)
+        }).collect::<Result<Vec<_>>>()?;
+        let physical = cuteafd_loader::serving_capacity::Exl3WorkspaceLayout::from_manifests(
+            &manifests, false, epilogue)?;
+        let layout = physical.owners.into_iter().filter_map(|owner| {
+            owner.name.strip_prefix("shared.").map(|name| {
+                Ok((name.to_owned(), (usize::try_from(owner.bytes)?, owner.dtype.clone())))
+            })
+        }).collect::<Result<BTreeMap<_, _>>>()?;
         Ok(layout)
     }
     /// Total allocation payload for all specializations sharing one lane arena.

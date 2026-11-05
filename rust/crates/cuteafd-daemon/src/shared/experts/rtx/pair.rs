@@ -186,27 +186,7 @@ pub(crate) fn submit_scoped<T>(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PackedRoutes {
-    pub section: usize,
-    pub weights: usize,
-    pub bytes: usize,
-}
-impl PackedRoutes {
-    pub(crate) fn with_input_bytes(rows: usize, topk: usize, input_row_bytes: usize) -> usize {
-        Self::new(rows, topk).bytes + rows * input_row_bytes
-    }
-
-    pub(crate) fn new(rows: usize, topk: usize) -> Self {
-        let section = rows * topk * 4;
-        let weights = section.next_multiple_of(16);
-        Self {
-            section,
-            weights,
-            bytes: (weights + section).next_multiple_of(16),
-        }
-    }
-}
+pub(crate) use cuteafd_loader::placement::families::glm5::local_physical::PackedRoutes;
 
 /// Who publishes a layer's canonical routes (and, for a source-only router,
 /// its FP8 K32 wire rows) to the peer.
@@ -403,7 +383,7 @@ impl<'a> Pair<'a> {
         ensure!(self.active.borrow().iter().all(Option::is_none), "undrained TP2 route diagnostics");
         let storage = (0..self.lanes).map(|_| self.layers.iter().map(|&layer| {
             let hosts = (0..2).map(|rank| self.routes.on(rank, ||
-                HostAllocation::new(self.library, self.max_rows * self.topk * 8))).collect::<Result<Vec<_>>>()?;
+                HostAllocation::new(self.library, cuteafd_loader::placement::families::glm5::local_physical::route_check_bytes(self.max_rows, self.topk)?))).collect::<Result<Vec<_>>>()?;
             Ok((layer, hosts.try_into().map_err(|_| anyhow::anyhow!("two ranks"))?))
         }).collect::<Result<BTreeMap<_, _>>>()).collect::<Result<Vec<_>>>()?;
         *checks = Some(SlotRouteChecks::new(storage, force)?);
