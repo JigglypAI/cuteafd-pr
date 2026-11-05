@@ -1375,6 +1375,24 @@ mod tests {
         ] {
             assert_eq!(glm.ownership(&format!("model.layers.0.self_attn.{leaf}.weight")).unwrap().execution, expected);
         }
+        let root = tempfile::tempdir().unwrap();
+        trellis(root.path(), 1, 128, 0);
+        let mut attention = DenseRecord::inventory(root.path()).unwrap().remove(0);
+        attention.tensor = "model.layers.0.self_attn.q_b_proj.weight".into();
+        attention.ownership = glm.ownership(&attention.tensor).unwrap();
+        assert_eq!(attention.ownership.whole_mla, Some(0));
+        let mut ffn = attention.clone();
+        ffn.tensor = "model.layers.0.mlp.gate_proj.weight".into();
+        ffn.ownership = glm.ownership(&ffn.tensor).unwrap();
+        assert_eq!(ffn.ownership.whole_mla, None);
+        for rank in 0..2 {
+            let plan = DensePlan::for_rank_owned(&[attention.clone(), ffn.clone()], 2, rank,
+                &std::collections::BTreeMap::from([(0, 1)])).unwrap();
+            let query = plan.tensors.iter().find(|slice| slice.tensor == attention.tensor);
+            assert_eq!(query.is_some(), rank == 1);
+            if let Some(query) = query { assert_eq!(query.channels, 128); }
+            assert_eq!(plan.tensors.iter().find(|slice| slice.tensor == ffn.tensor).unwrap().channels, 64);
+        }
         let flash = ownership::DenseFamily::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let root = tempfile::tempdir().unwrap();
         trellis(root.path(), 1, 128, 0);

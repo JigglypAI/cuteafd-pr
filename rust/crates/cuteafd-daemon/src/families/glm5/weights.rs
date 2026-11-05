@@ -1069,16 +1069,21 @@ impl<'a> GlmLoader<'a> {
     /// Routed experts and the shared expert stay on their native owners.
     #[allow(clippy::type_complexity)]
     pub fn native_model(&self, cfg: &GlmDsaConfig, layers: usize,
-        records: &[crate::shared::experts::exlr8::dense_weights::NativeDenseRecords], load: &crate::shared::experts::rtx::dense::DenseLoad<'a>,
+        records: &[crate::shared::experts::exlr8::dense_weights::NativeDenseRecords], owners: Option<&[u8]>, load: &crate::shared::experts::rtx::dense::DenseLoad<'a>,
         vocabulary: std::rc::Rc<crate::shared::token_io::native::NativeVocabulary<'a>>)
         -> Result<(GlmWeights<'a>, Vec<Vec<GlmLayer<'a>>>)> {
         let ranks = self.ranks();
         ensure!(records.len() == ranks && cfg.heads % ranks == 0, "native GLM records per coordinator rank");
+        ensure!(owners.is_none_or(|owners| ranks == 2 && owners.len() == layers
+            && owners.iter().all(|&owner| usize::from(owner) < ranks)), "native GLM attention owners");
         let split = crate::shared::memory::load_timing::Split::start();
         let mut shares: Vec<Vec<GlmLayer<'a>>> = (0..ranks).map(|_| Vec::new()).collect();
         for layer in 0..layers.min(cfg.layers) {
             for (rank, share) in shares.iter_mut().enumerate() {
                 let layer_records = records[rank].layers.get(layer).context("native layer records")?;
+                let owner = owners.map(|owners| owners[layer]);
+                let attention_resident = owner.is_none_or(|owner| usize::from(owner) == rank);
+                ensure!(layer_records.kv_b.is_some() == attention_resident, "native GLM attention record ownership");
                 let part = self.on_rank(rank, |stream| -> Result<GlmLayer<'a>> {
                     let _memory_format = cuteafd_ffi::memory_ledger::format("native");
                     let mut native = crate::shared::experts::exlr8::dense_weights::load_layer(self.library, load, layer_records, stream)?;
@@ -1086,7 +1091,9 @@ impl<'a> GlmLoader<'a> {
                     let mut operands: HashMap<&'static str, DeviceAllocation<'a>> = HashMap::new();
                     for (key, name) in [("w_uk_fp8", "w_uk_fp8"), ("w_uk_scale", "w_uk_scale"), ("w_uv_fp8", "w_uv_fp8"),
                         ("w_uv_scale", "w_uv_scale")] {
-                        operands.insert(key, native.remove(name).context("native kv_b split")?);
+                        if attention_resident {
+                            operands.insert(key, native.remove(name).context("native kv_b owner")?);
+                        }
                     }
                     for (key, tensor) in cfg.plain_owners(layer) {
                         if let Some(allocation) = native.remove(&tensor) { operands.insert(key, allocation); }
@@ -1101,8 +1108,8 @@ impl<'a> GlmLoader<'a> {
                         "{p}: native layer operands incomplete on rank {rank}");
                     Ok(GlmLayer { dense, full_indexer: cfg.indexers[layer] == GlmIndexer::Full,
                         mlp_numerics: cuteafd_loader::plan::checkpoint::ModuleNumerics::CheckpointPrecision,
-                        split: ranks > 1, attention_split: ranks > 1, attention_owner: None,
-                        attention_resident: true, operands, native,
+                        split: ranks > 1, attention_split: ranks > 1 && owner.is_none(), attention_owner: owner,
+                        attention_resident, operands, native,
                         native_projections: layer_records.projections.iter().map(|(&stem, (p, _))| (stem, p.clone())).collect(),
                         core: Default::default() })
                 })?;

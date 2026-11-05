@@ -305,7 +305,7 @@ impl DenseFamily {
             DenseTransform::WidenBf16
         } else { DenseTransform::Identity };
         Ok(DenseOwnership { execution, transform,
-            whole_mla: (flash && mla && leaf.starts_with("self_attn.")).then_some(layer) })
+            whole_mla: (mla && leaf.starts_with("self_attn.")).then_some(layer) })
     }
 }
 

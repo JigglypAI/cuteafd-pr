@@ -72,10 +72,10 @@ def test_glm_native_attention_reaches_plan_and_coordinator(tmp_path, gpus, atten
             f"ATTENTION_PLACEMENT={attention}\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
     result = _family_launch_result(tmp_path, config, "test/exlr8-attention", keys,
                                   extra_args=("--wip", "heads-test") if wip else ())
-    supported = attention in ("auto", "heads") or (gpus == 2 and attention == "context")
+    supported = attention in ("auto", "heads") or (gpus == 2 and attention in ("context", "layers"))
     if not supported:
         assert result.returncode != 0
-        assert "GLM EXLR8 requires heads or two-GPU context attention" in result.stderr
+        assert "GLM EXLR8 requires heads or two-GPU context/layers attention" in result.stderr
         assert "cuteafd serve-glm --snapshot" not in result.stderr
         return
     assert result.returncode == 0, result.stderr
