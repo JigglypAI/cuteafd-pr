@@ -1450,6 +1450,27 @@ def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_
                                       'tp_role': None, 'nvfp4': False}
 
 
+@pytest.mark.parametrize('size,gpus,count', [('min', [0], 4), ('max', [0, 1], 6)])
+def test_gate_muse_cards_use_real_hosts_and_native_defaults(size, gpus, count):
+    kit = ROOT / 'scripts/bench/kits/gate'
+    card = cards.load_cards(kit, [f'muse-spark-exl3-{size}'])[0]
+    values = {**cards.config(card['config']), **card['set']}
+    hosts = ['ostrich', 'dodo', 'emu', 'kiwi', 'rhea', 'moa'][:count]
+    assert card['family'] == 'muse_spark' and card['gpus'] == gpus
+    assert card['sparks'] == hosts and values['SPARK_COUNT'] == str(count)
+    assert values['MODEL_ID'] == 'wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6'
+    assert values['MODEL_REVISION'] == '89998fb177acd9a862ac8bd4fb79bfd50e940c97'
+    assert values['SPECULATOR'] == 'dflash2' and values['POOL_TOKENS'] == 'auto'
+    assert values['VISION'] == values['AUDIO'] == 'auto'
+    for rank, host in enumerate(hosts):
+        assert values[f'SPARK_{rank}_HOST'] == host
+        assert values[f'SPARK_{rank}_LANE_A'] == f'10.55.0.{rank + 1}'
+    entries = [entry for matrix in kit.glob('matrix-*.json')
+               for entry in json.loads(matrix.read_text())['entries']]
+    for key in ('ADDR', 'EXPERT_PORT'):
+        assert sum(entry.get('set', {}).get(key) == values[key] for entry in entries) == 1
+
+
 def test_gate_glm53_max_uses_current_k4_core_k6_checkpoint():
     card = cards.load_cards(ROOT / 'scripts/bench/kits/gate', ['glm53-exl3-max'])[0]
     values = {**cards.config(ROOT / card['config']), **card['set']}
