@@ -345,12 +345,13 @@ mod draft_cli_tests {
         let source = include_str!("mod.rs");
         let links = source.rsplit("let mut transport = selected_peers.map(").next().unwrap()
             .split("let runtime = tokio::runtime::Builder").next().unwrap();
-        let check = |body: &str| body.contains("engine::DECODE_ROWS as u32, config.clone(), row_bytes")
+        let check = |body: &str| body.contains("admitted.decode_link.clone()")
+            && body.contains("admitted.prefill_link.clone()")
             && body.contains("warm(engine::DECODE_ROWS, true)")
             && body.contains("warm(args.prefill_rows, false)")
             && !body.contains("selected_peers.filter(");
         assert!(check(links));
-        assert!(!check(&links.replace("engine::DECODE_ROWS as u32", "4096")));
+        assert!(!check(&links.replace("admitted.decode_link.clone()", "unadmitted_decode")));
         assert!(!check(&links.replace("match selected_peers {", "match selected_peers.filter(|_| prefill_lanes > 1) {")));
         Ok(())
     }
@@ -545,10 +546,10 @@ mod draft_cli_tests {
     #[test]
     fn planner_charge_equals_admission_charge_for_the_same_geometry() {
         use cuteafd_loader::plan::exlr8::PrefillActivations;
-        const GROUP: &str = "native dense scratch and prefill staging";
+        const GROUP: &str = "GLM target hooks";
         let dir = tempfile::tempdir().unwrap();
-        cuteafd_loader::plan::testing::exlr8::glm_snapshot(dir.path());
-        let manifest = cuteafd_loader::plan::testing::glm5_native_programs();
+        cuteafd_loader::plan::testing::exlr8::glm_admission_snapshot(dir.path());
+        let manifest = cuteafd_loader::plan::testing::exlr8::glm_admission_programs();
         let checkpoint = cuteafd_loader::plan::Checkpoint::open(dir.path()).unwrap();
         let cfg = GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
         let records = cuteafd_loader::plan::exlr8::dense::DenseRecord::inventory(dir.path()).unwrap();
@@ -575,7 +576,7 @@ mod draft_cli_tests {
                         onboard: Some(cuteafd_loader::placement::OnboardSetting::Layers(0)), glm5_drafter_disabled: true,
                         host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0), ..Default::default() };
                     let (memory, _) = cuteafd_loader::plan::layout::glm5::native_layout(&checkpoint, &layout,
-                        &vec![256; gpus], 256, peers.split(',').count(), &manifest, None).unwrap();
+                        peers.split(',').count(), &manifest, "k4").unwrap();
                     assert_eq!(memory.devices.len(), gpus);
                     for (rank, device) in memory.devices.iter().enumerate() {
                         let planned: u64 = device.items.iter().filter(|item| item.group == GROUP).map(|item| item.bytes).sum();
@@ -901,11 +902,12 @@ impl Opened {
     fn with_resolved_engine<T>(&self, resolved: &ResolvedEngineArgs,
         body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut SparkLink<'_>>, &tokio::runtime::Runtime) -> Result<T>)
         -> Result<T> {
-        self.with_resolved_engine_media(resolved, Default::default(), None, body)
+        self.with_resolved_engine_media(resolved, Default::default(), None, (None, 0), body)
     }
     fn with_resolved_engine_media<T>(&self, resolved: &ResolvedEngineArgs,
         media: crate::shared::experts::rtx::dense::Records,
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>,
+        media_owners: (Option<(i32, u64, u64)>, u64),
         body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut SparkLink<'_>>, &tokio::runtime::Runtime) -> Result<T>) -> Result<T> {
         let ResolvedEngineArgs { args, automatic_context } = resolved;
         let automatic_context = *automatic_context;
@@ -1192,7 +1194,7 @@ impl Opened {
             cuteafd_loader::plan::exlr8::residency::MetadataInput::open(&self.snapshot, selected)).transpose()?;
         let source = local.as_ref().map(|local| LocalPhysicalSource::read(&self.cfg, &self.catalog, local,
             &physical, metadata.as_ref())).transpose()?;
-        let host = cuteafd_loader::formats::mapped_preload::host_memory()?;
+        let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
         let cache = if let Some(ml4) = self.cfg.variant.ml4() {
             cuteafd_loader::serving_capacity::mistral_large4_cache_geometry(ml4, 1)?
         } else { cuteafd_loader::serving_capacity::glm_cache_geometry(&self.cfg, layers, 1)? };
@@ -1206,6 +1208,26 @@ impl Opened {
                     cuteafd_engine::prefix::PageOwners::Parity } else { cuteafd_engine::prefix::PageOwners::Uniform },
             }, args.max_context, concurrency)).transpose()?.flatten() };
         let mut additional = Vec::new();
+        if let Some((device, weights, total)) = media_owners.0 {
+            let rank = devices.iter().position(|&id| id == device).context("vision device absent from GLM placement")?;
+            let location = Location::coordinator(rank as u8);
+            let owner = Allocation::buffer("glm.encoder.weights", location, weights,
+                Lifetime::RESIDENT, cuteafd_core::memory_layout::Category::Weights, "bundled encoder weights");
+            additional.push(Component::resident_weight(ResidentWeight::from_allocation(&owner,
+                cuteafd_loader::placement::ResidentWeights(weights)), ByteCurve::fixed(weights, maximum_pages)));
+            additional.push(Component::allocation(owner, ByteCurve::fixed(weights, maximum_pages), false, maximum_pages));
+            let scratch = total.checked_sub(weights).context("vision receipt smaller than weights")?;
+            if scratch > 0 {
+                let owner = Allocation::buffer("glm.encoder.scratch", location, scratch,
+                    Lifetime::RESIDENT, cuteafd_core::memory_layout::Category::Workspace, "bundled encoder scratch");
+                additional.push(Component::allocation(owner, ByteCurve::fixed(scratch, maximum_pages), false, maximum_pages));
+            }
+        }
+        if media_owners.1 > 0 {
+            let owner = Allocation::buffer("glm.media.cache", Location::HOST, media_owners.1,
+                Lifetime::TARGET, cuteafd_core::memory_layout::Category::Embedding, "media embedding cache");
+            additional.push(Component::allocation(owner, ByteCurve::fixed(media_owners.1, maximum_pages), false, maximum_pages));
+        }
         if serving.is_some() {
             use cuteafd_loader::placement::planner::serving::{ServingOwners, SelectorOwners, HostPrefixOwners};
             additional.extend(ServingOwners { selector: SelectorOwners { location: Location::coordinator(0),
@@ -1223,7 +1245,7 @@ impl Opened {
         let frame_bytes = if native { cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5,
             u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?)? } else { 64 << 20 };
         let (decode_link, prefill_link) = production_links(&self.cfg, spark_ranks, prefill,
-            if native || spark_bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 },
+            if !native && spark_bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 },
             cuteafd_core::SparkRings { max_frame_bytes: frame_bytes, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
             cuteafd_core::spark_reply::requested())?;
         let budgets = production_budgets(&cards, 2 << 30, host,
@@ -1260,6 +1282,7 @@ impl Opened {
                 toolchain: env!("CUTEAFD_BUILD_TOOLCHAIN"), gpu_class: &gpu_classes, driver: &drivers, layout: &layout,
             })? { tracing::warn!("{recommendation}"); }
         }
+        if let Some(note) = admitted.load_overlap_note() { tracing::info!("{note}"); }
         let placement = admitted.placement.clone();
         let working = &admitted.spark;
         if native {
@@ -1580,7 +1603,6 @@ impl Opened {
         };
         let config = cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(),
             timeout: std::time::Duration::from_secs(120), max_frame_bytes: if native { cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?)? } else { 64 << 20 } };
-        let row_bytes = self.cfg.hidden * 2;
         crate::shared::memory_report::release_load_staging(&self.library)?;
         self.startup_probe(&devices, "glm/pool-before-transport", None, false)?;
         // Connect every rank and register full-size buffers now: the first

@@ -90,9 +90,36 @@ pub fn host_memory() -> Result<(u64, u64)> {
     cuteafd_ffi::host_memory()
 }
 
+/// Remove this process from the sampled occupied baseline when a recipe charges
+/// its complete RSS envelope. This is an accounting identity, not extra headroom.
+pub fn host_memory_before_process() -> Result<(u64, u64)> {
+    let memory = host_memory()?;
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    normalize_process_rss(memory, &status)
+}
+
+fn normalize_process_rss((total, available): (u64, u64), status: &str) -> Result<(u64, u64)> {
+    use anyhow::{Context, ensure};
+    ensure!(available <= total, "host available exceeds total");
+    let mut value = status.lines().find_map(|line| line.strip_prefix("VmRSS:"))
+        .context("process status missing VmRSS")?.split_whitespace();
+    let rss = value.next().context("process RSS missing value")?.parse::<u64>()?
+        .checked_mul(1024).context("process RSS overflow")?;
+    ensure!(value.next() == Some("kB") && value.next().is_none(), "invalid process RSS units");
+    let external_occupied = total.saturating_sub(available).saturating_sub(rss);
+    Ok((total, total - external_occupied))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn whole_process_recipe_normalizes_only_its_existing_rss() {
+        assert_eq!(normalize_process_rss((16384, 4096), "VmRSS: 4 kB\n").unwrap(), (16384, 8192));
+        assert_eq!(normalize_process_rss((16384, 12288), "VmRSS: 8 kB\n").unwrap(), (16384, 16384));
+        assert!(normalize_process_rss((16384, 4096), "VmRSS: 4 bytes\n").is_err());
+        assert!(normalize_process_rss((16384, 4096), "VmHWM: 4 kB\n").is_err());
+    }
     #[test]
     fn all_or_nothing_cap_and_host_admission() {
         let bytes = 6 << 30;

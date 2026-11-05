@@ -479,12 +479,8 @@ fn local_extra_workspace(h: u64, experts: u64, topk: u64, rows: u64, lanes: u64,
         ("FP32 exchange widening", [wide_exchange; 2]),
         ("peer local router rows", [0, peer_routes])];
     let mut extra = [0; 2];
-    for (name, bytes) in rows {
-        for (rank, bytes) in bytes.into_iter().enumerate() {
-            let row = GlmBufferRow::new(GlmComponent::RtxExperts,
-                Demand::new(rank as u8, Category::Workspace, name, bytes, Basis::Formula));
-            extra[rank] += row.demand.bytes;
-        }
+    for (_, bytes) in rows {
+        for (rank, bytes) in bytes.into_iter().enumerate() { extra[rank] += bytes; }
     }
     extra
 }

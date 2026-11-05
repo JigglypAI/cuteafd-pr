@@ -142,6 +142,12 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     match core.and_then(|core| placement(report, input, options, &devices[..ranks], shape.manifest.as_deref(),
         shape.prefill_rows, shape.context_tokens, core.as_ref(), context_programs)) {
         Ok((admitted, prefix_quota)) => {
+            if let Some(note) = admitted.load_overlap_note() { notes.push(note); }
+            match figure_recommendation(&admitted, options, checkpoint, shape.manifest.as_deref()) {
+                Ok(Some(note)) => notes.push(note),
+                Ok(None) => {},
+                Err(error) => notes.push(format!("GLM census identity unavailable: {error:#}; admission unchanged")),
+            }
             report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
             report.host_budget_bytes = prefix_quota;
             let placement = admitted.placement;
@@ -454,6 +460,24 @@ fn drafter_admission(options: &LayoutOptions, checkpoint: &Checkpoint)
     Ok(admitted)
 }
 
+fn figure_recommendation(admitted: &crate::placement::families::glm5::admission::AdmittedGlm,
+    options: &LayoutOptions, checkpoint: &Checkpoint, manifest: Option<&serde_json::Value>) -> anyhow::Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    let hash = match options.workspace_manifest.as_deref() {
+        Some(path) => format!("{:x}", Sha256::digest(std::fs::read(path)?)),
+        None => manifest.map(|value| serde_json::to_vec(value).map(|bytes| format!("{:x}", Sha256::digest(bytes))))
+            .transpose()?.unwrap_or_else(|| "unavailable".into()),
+    };
+    let layout = format!("snapshot/{}; context/{}; concurrency/{:?}; draft/{:?}; replies/{:?}",
+        checkpoint.snapshot.display(), options.context_tokens, options.concurrency,
+        options.glm5_drafter_snapshot, options.spark_reply_formats);
+    Ok(admitted.census_recommendation(crate::placement::inventory::FigureIdentity {
+        declared_graphs: "", programs_sha256: &hash, native_sha256: "unavailable in header-only plan",
+        toolchain: "unavailable in header-only plan", gpu_class: "requested physical card capacities",
+        driver: "unavailable in header-only plan", layout: &layout,
+    })?)
+}
+
 fn production_serving(options: &LayoutOptions, checkpoint: &Checkpoint, cfg: &GlmDsaConfig,
     context: u64, attention: crate::placement::AttentionPlacement, gpus: usize, maximum_pages: u64)
     -> anyhow::Result<(crate::placement::families::glm5::admission::DraftFacts,
@@ -490,7 +514,7 @@ fn production_serving(options: &LayoutOptions, checkpoint: &Checkpoint, cfg: &Gl
                 else { GlmDraftRepresentation::Fp8Only }, GlmDraftCapacity::new(slots, sequences, draft.block)?,
                 sms, 0, options.draft_kv_cache)?
         };
-    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory)?;
+    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
     let cache = if let Some(ml4) = cfg.variant.ml4() {
         crate::serving_capacity::mistral_large4_cache_geometry(ml4, 1)?
     } else { crate::serving_capacity::glm_cache_geometry(cfg, cfg.layers, 1)? };
@@ -527,7 +551,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     anyhow::ensure!(report.requested_attention != Some(crate::placement::AttentionPlacement::Layers)
         || lanes <= crate::placement::LAYER_PIPELINE_MAX_LANES,
         "layer-owned prefill lacks capacity for {lanes} waves");
-    let (draft, draft_staging, active_drafts, _, drafter_weights) = drafter_admission(options, checkpoint)?;
+    let (_, _, active_drafts, _, _) = drafter_admission(options, checkpoint)?;
     let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         glm::DECODE_ROWS as usize, active_drafts, options.glm5_attention_plan_rows)?;
     let selected_manifest = manifest.map(|m| -> anyhow::Result<_> {
@@ -551,6 +575,11 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         context_programs.is_some(), true)?.unwrap_or(if gpus == 2 {
             crate::placement::AttentionPlacement::Context
         } else { crate::placement::AttentionPlacement::Heads });
+    if attention == crate::placement::AttentionPlacement::Context && context_programs.is_none() {
+        return Err(crate::placement::PlacementError::MissingContextPrograms {
+            family: cfg.family_id(), programs: glm::context_program_list(&cfg),
+        }.into());
+    }
     let page_tokens = if attention == crate::placement::AttentionPlacement::Context { 128 } else { 64 };
     let maximum_pool_tokens = options.pool_tokens.unwrap_or_else(|| crate::placement::PoolPolicy::resolve(
         &options.rtx_bytes[..gpus], context, None, page_tokens, spark_ranks == 0).target);
@@ -584,12 +613,11 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
                 &owner, crate::placement::ResidentWeights(encoder.weights)), ByteCurve::fixed(encoder.weights, maximum_pages)));
             additional.push(crate::placement::planner::Component::allocation(owner,
                 ByteCurve::fixed(encoder.weights, maximum_pages), false, maximum_pages));
-            for item in devices[gpu].items.iter().filter(|item| !matches!(item.category,
-                Category::Weights | Category::Embedding | Category::Runtime)) {
-                let owner = Allocation::buffer(format!("glm.encoder.{}", item.group), location, item.bytes,
-                    Lifetime::RESIDENT, item.category, item.group.clone());
+            if encoder.scratch > 0 {
+                let owner = Allocation::buffer("glm.encoder.scratch", location, encoder.scratch,
+                    Lifetime::RESIDENT, Category::Workspace, "bundled encoder scratch");
                 additional.push(crate::placement::planner::Component::allocation(owner,
-                    ByteCurve::fixed(item.bytes, maximum_pages), false, maximum_pages));
+                    ByteCurve::fixed(encoder.scratch, maximum_pages), false, maximum_pages));
             }
         }
     }
@@ -597,7 +625,16 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         if checkpoint.spark_input_is_bf16() { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 },
         cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
         options.spark_reply_formats)?;
-    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory)?;
+    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
+    if report.encoder.as_ref().is_some_and(|encoder| encoder.kind != crate::plan::encoder::EncoderKind::Off) {
+        let bytes = options.media_cache_bytes.unwrap_or((8u64 << 30).min(host.0 / 20));
+        if bytes > 0 {
+            let owner = Allocation::buffer("glm.media.cache", Location::HOST, bytes,
+                Lifetime::TARGET, Category::Embedding, "media embedding cache");
+            additional.push(crate::placement::planner::Component::allocation(owner,
+                ByteCurve::fixed(bytes, maximum_pages), false, maximum_pages));
+        }
+    }
     let budgets = production_budgets(&options.rtx_bytes[..gpus].iter().map(|&n| (n, n)).collect::<Vec<_>>(),
         options.headroom_bytes, host, (8 << 30).max(host.0 / 10), &vec![options.spark_bytes; spark_ranks])?;
     let request = production_request(context, options.pool_tokens, onboard, prefill, operation,
@@ -686,7 +723,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         .collect::<anyhow::Result<Vec<_>>>()?;
     let workspace = crate::plan::exlr8::shared_execution_workspace(&manifest, cuteafd_ffi::exlr8::KernelFamily::Glm)?;
     let target = TargetFacts::native(&selection, cfg.layers, &dense, &vocabulary,
-        &shared, &native_scratch, &workspace, LocalStorage::Mount)?;
+        &shared, &native_scratch, &workspace, LocalStorage::for_snapshot(&checkpoint.snapshot)?)?;
     let lanes = options.prefill_waves;
     let prefill = PrefillShape { rows, waves: lanes };
     let onboard = options.resolve_onboard(cfg.layers.saturating_sub(cfg.first_moe_layer)).unwrap_or_else(glm::default_onboard);
@@ -698,8 +735,8 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
                 gpu_count, rows, lanes, glm::local_exchange_f32()?, options.exlr8_prefill_activations, metadata)?)
         };
     let physical = LocalPhysicalInput { layers: (cfg.first_moe_layer..cfg.layers).collect(),
-        max_rows: rows.max(glm::DECODE_ROWS) as usize, lanes: lanes as usize, storage: LocalStorage::Mount,
-        route_checks: false, peer_diagnostics: false, activations: options.exlr8_prefill_activations };
+        max_rows: rows.max(glm::DECODE_ROWS) as usize, lanes: lanes as usize, storage: LocalStorage::for_snapshot(&checkpoint.snapshot)?,
+        route_checks: true, peer_diagnostics: false, activations: options.exlr8_prefill_activations };
     let source = local.as_ref().map(|local| {
         let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
         LocalPhysicalSource::read(&cfg, &catalog, local, &physical, Some(metadata))
@@ -716,7 +753,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
     let (decode_link, prefill_link) = production_links(&cfg, spark_ranks, prefill,
         cuteafd_core::SparkIngress::Fp8K32, rings, options.spark_reply_formats)?;
-    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory)?;
+    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
     let budgets = production_budgets(&options.rtx_bytes.iter().map(|&n| (n, n)).collect::<Vec<_>>(),
         options.headroom_bytes, host, (8 << 30).max(host.0 / 10), &vec![options.spark_bytes; spark_ranks])?;
     let operation = if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
@@ -732,14 +769,17 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
         report.host_budget_bytes = prefix_quota;
     }
+    let mut notes = admitted.load_overlap_note().into_iter().collect::<Vec<_>>();
+    if let Some(note) = figure_recommendation(&admitted, options, checkpoint, Some(&manifest))? { notes.push(note); }
     let placement = admitted.placement;
+    notes.push(format!("EXLR8 native {gpu_count} shared owners; {attention} attention; context {context}; {}", placement.summary()));
     let devices = placement.items.iter().enumerate().map(|(rank, items)| DeviceLayout {
         kind: DeviceKind::Rtx, index: rank as u32,
         capacity_bytes: options.rtx_bytes[rank].saturating_sub(options.headroom_bytes),
         worker_budget_bytes: 0, items: items.clone(), kv_tokens: placement.pool_tokens,
     }).collect();
     Ok((MemoryLayout { devices, pool_tokens: placement.pool_tokens, waste: vec![],
-        notes: vec![format!("EXLR8 native {gpu_count} shared owners; {attention} attention; context {context}; {}", placement.summary())] }, placement))
+        notes }, placement))
 }
 
 /// The planner's packed owners, excluding a host-mapped embedding when selected.

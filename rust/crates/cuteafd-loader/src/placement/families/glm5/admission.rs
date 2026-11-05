@@ -493,6 +493,7 @@ pub struct PreparedGlm<'a> {
     decode_link: Option<crate::placement::PreparedSparkLink>,
     prefill_link: Option<crate::placement::PreparedSparkLink>,
     pub runtime: RuntimeFigures,
+    pub load_overcharge_bytes: u64,
 }
 
 pub struct AdmittedGlm {
@@ -505,9 +506,14 @@ pub struct AdmittedGlm {
     pub graphs: StartupGraphs,
     pub runtime: RuntimeFigures,
     pub host: HostFigures,
+    pub load_overcharge_bytes: u64,
 }
 
 impl AdmittedGlm {
+    pub fn load_overlap_note(&self) -> Option<String> {
+        (self.load_overcharge_bytes > 0).then(|| format!("estimated native Load overlap: {} bytes conservatively added by charging native reader peak + shared reader peak instead of their serialized maximum; exact overcharge = min(native peak, shared peak)", self.load_overcharge_bytes))
+    }
+
     /// Classify only selected figures after admission; never change charged bytes.
     pub fn census_recommendation(&self, identity: FigureIdentity<'_>) -> Result<Option<String>, Refusal> {
         use crate::placement::inventory::{FigureUse, census_recommendation};
@@ -552,7 +558,7 @@ pub fn production_budgets(cards: &[(u64, u64)], headroom: u64, host: (u64, u64),
     budgets.push(Budget { id: "coordinator host RAM".into(), locations: vec![Location::HOST, Location::PINNED],
         physical_bytes: host.0, logical_bytes: host.0,
         baseline: Baseline::Sampled { free: host.1, phase: Phase::Load,
-            source: "independent host MemAvailable before target allocation".into() }, headroom: host_headroom });
+            source: "host MemAvailable normalized to external occupancy before whole-process recipe".into() }, headroom: host_headroom });
     budgets.extend(spark_bytes.iter().enumerate().map(|(rank, &bytes)| Budget {
         id: format!("spark{rank}"), locations: vec![Location { device: Device::Spark(rank as u8), domain: Domain::Managed }],
         physical_bytes: bytes, logical_bytes: bytes, baseline: forecast(), headroom: 0,
@@ -794,6 +800,7 @@ impl<'a> ProductionInput<'a> {
             }
         }
         Ok(PreparedGlm { recipe, budgets: self.budgets, local, runtime,
+            load_overcharge_bytes: native_load.as_ref().map_or(0, |load| load.coarse_overcharge_bytes),
             decode_link: self.decode_link, prefill_link: self.prefill_link })
     }
 }
@@ -812,7 +819,8 @@ impl PreparedGlm<'_> {
         Ok(AdmittedGlm { placement, spark, solved, local,
             decode_link: self.decode_link.filter(|_| remote),
             prefill_link: self.prefill_link.filter(|_| remote),
-            graphs: graph, runtime: self.runtime, host: self.recipe.host.unwrap() })
+            graphs: graph, runtime: self.runtime, host: self.recipe.host.unwrap(),
+            load_overcharge_bytes: self.load_overcharge_bytes })
     }
 }
 

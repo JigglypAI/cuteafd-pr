@@ -243,11 +243,12 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
             return Ok(());
         }
     };
-    // The tower loads before the LM so its admitted bytes are in the LM's live baseline.
+    // Retain the early tower allocation receipt for the joint LM recipe.
     let (mut vision, prefix) = match ml4_media::ReadyVision::load(args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
         Ok(vision) => vision,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };
+    let media_owner = vision.as_ref().and_then(|v| v.device_owner);
     let media_push = vision.as_mut().map(|v| std::mem::take(&mut v.push)).unwrap_or_default();
     let preparer = vision.as_ref().map(|v| v.preparer.clone());
     let expander = vision.as_ref().map(|v| v.expander);
@@ -255,7 +256,7 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
     let health = encoder.health_handle();
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
-    let result = opened.with_resolved_engine_media(&resolved, media_push.records(), Some((&prefix, max_sequences)), |engine, transport, runtime| {
+    let result = opened.with_resolved_engine_media(&resolved, media_push.records(), Some((&prefix, max_sequences)), (media_owner, bytes as u64), |engine, transport, runtime| {
         media_push.commit()?;
         anyhow::ensure!(transport.is_some() || engine.skip_routed() || engine.has_local(), "serve-glm needs Spark peers, local TP2 or --skip-routed-experts");
         let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
@@ -478,7 +479,7 @@ impl Trace {
 }
 
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator).
-fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs, concurrency: usize)
+fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs, _concurrency: usize)
     -> Result<(GlmPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_capacity() } else { 64 },
         engine.prefill_rows, engine.cfg.vocab_size)?;
