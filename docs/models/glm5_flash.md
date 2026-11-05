@@ -15,6 +15,13 @@ Attention (KDA), a minority run MLA + DSA.
 - NVIDIA ModelOpt NVFP4 (`nvidia/GLM-5.3-Flash-NVFP4`) — routed experts and
   dense MLPs both run natively in NVFP4.
 
+- `kindlingai/glm-5.3-flash-exlr8-k2-k3-k4`: native EXLR8 K4 text recipe
+  (#1030), with automatic placement and pool. DFlash2 on
+  [1 RTX + 1 Spark](../../examples/configs/glm53-flash-exlr8-k4-min.config) or
+  [2 RTX, no Sparks](../../examples/configs/glm53-flash-exlr8-k4-max.config).
+  Use a matching WIP build until the next release; bundled vision and full
+  prefix-continuation exactness remain unqualified for this checkpoint.
+
 **Starting configs** (current primary-only recipes, natural minimum and maximum; replace the
 placeholder Spark hosts and addresses): Official FP8 [min](../../examples/configs/glm53-flash-fp8-min.config) · [max](../../examples/configs/glm53-flash-fp8-max.config); EXL3 K3.25 [min](../../examples/configs/glm53-flash-exl3-min.config) · [max](../../examples/configs/glm53-flash-exl3-max.config); EXL3 K4 + Core K6 [min](../../examples/configs/glm53-flash-exl3-k6-min.config) · [max](../../examples/configs/glm53-flash-exl3-k6-max.config); NVFP4 [min](../../examples/configs/glm53-flash-nvfp4-min.config) · [max](../../examples/configs/glm53-flash-nvfp4-max.config); tr3 4bpw [min](../../examples/configs/glm53-flash-tr3-min.config) · [max](../../examples/configs/glm53-flash-tr3-max.config).
 

@@ -69,6 +69,7 @@ CHECKPOINTS = {
     "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1": {**QWEN, "quantization_config": {"quant_method": "exl3"}},
     "nvidia/Qwen3.8-Flash-Next-NVFP4": {**QWEN, "quantization_config": {"quant_method": "modelopt", **NVFP4_GROUPS}},
     "kindlingai/glm-5.3-exlr8-k2-k3-k4": GLM5,
+    "kindlingai/glm-5.3-flash-exlr8-k2-k3-k4": GLMF,
     "Qwen/Qwen3.5-9B": {"model_type": "qwen3_5", "text_config": {
         "hidden_size": 4096, "num_hidden_layers": 32,
         "layer_types": ["linear_attention"] * 31 + ["full_attention"]}},
@@ -231,7 +232,7 @@ def test_one_starting_config_per_release_card() -> None:
     expected = {f"{model}-{profile}.config" for model in (
         "deepseek-v41-mxfp4", "v41-flash-strided", "deepseek-v4-flash-mxfp4", "deepseek-v4-pro-exl3",
         "glm53-exl3", "glm53-exl3-k6core", "glm53-nvfp4", "glm53-flash-fp8", "glm53-flash-exl3", "glm53-flash-exl3-k6", "glm53-flash-nvfp4",
-        "glm53-flash-tr3", "mimo-v26-flash-mxfp4", "mimo-v26-pro-mxfp4") for profile in ("min", "max")}
+        "glm53-flash-tr3", "glm53-flash-exlr8-k4", "mimo-v26-flash-mxfp4", "mimo-v26-pro-mxfp4") for profile in ("min", "max")}
     # Qwen fits one RTX: the 2x RTX column is n/a, so only min exists.
     expected |= {"qwen38-exl3-min.config", "qwen38-nvfp4-min.config"}
     assert names == expected
@@ -243,7 +244,7 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
     matrix = json.loads((ROOT / "scripts/bench/release-smoke.example.json").read_text())
     assert matrix["profile"] == "smoke"
     entries = matrix["entries"]
-    assert len(entries) == 28
+    assert len(entries) == 30
     assert len({entry["name"] for entry in entries}) == len(entries)
     defaults = matrix["defaults"]["set"]
     stale = {"CONCURRENCY", "MAX_CONTEXT_TOKENS", "HOST_CACHE_BYTES", "BENCH_SIMULATED",
@@ -279,7 +280,7 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
             assert values[key] not in ports
             ports.add(values[key])
         models.setdefault(values["MODEL_ID"], set()).add(len(entry["gpus"]))
-    assert len(models) == 14
+    assert len(models) == 15
     assert all(columns == {1, 2} for columns in models.values())
 
 
@@ -778,3 +779,42 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
         else:
             candidates = [d for p, d in reports if d["profile"] == "smoke" and p.parent.name.endswith("-" + entry["name"])]
         assert report["created"] == max(d["created"] for d in candidates)
+
+
+@pytest.mark.parametrize("filename", ["scripts/bench/release-smoke.example.json",
+                                    "scripts/bench/release-smoke-v4.json",
+                                    "scripts/bench/kits/gate/matrix-gate.json"])
+def test_glmf_exlr8_k4_cards_preserve_qualified_native_recipes(filename: str) -> None:
+    matrix = json.loads((ROOT / filename).read_text())
+    entries = {entry["name"]: entry for entry in matrix["entries"]}
+    pins = keys(ROOT / "cuteafd.config")
+    for size, gpus, sparks in (("min", [1], 1), ("max", [0, 1], 0)):
+        entry = entries[f"glmf-exlr8-k4-{size}"]
+        config = keys(ROOT / entry["config"])
+        values = {**config, **matrix.get("defaults", {}).get("set", {}), **entry["set"]}
+        assert config["MODEL_ID"] == "kindlingai/glm-5.3-flash-exlr8-k2-k3-k4"
+        assert config["MODEL_REVISION"] == "867580abd28d142bb4c56218bb81a752b7dea988"
+        assert config["SERVED_MODEL_ID"] == "zai-org/GLM-5.3-Flash"
+        assert config["EXLR8_MANIFEST"] == "k4"
+        assert config["EXLR8_PREFILL_ACTIVATIONS"] == "a16"
+        assert config["SPECULATOR"] == "dflash2"
+        assert config["SPECULATOR_MODEL_ID"] == "incoai/GLM-5.3-Flash-DFlash2"
+        assert config["POOL_TOKENS"] == config["ATTENTION_PLACEMENT"] == "auto"
+        assert config["VISION"] == config["AUDIO"] == "off"
+        assert config["EXPERT_BACKEND"] == ("spark" if sparks else "local")
+        for key in ("RTX_EXPERT_LAYERS", "EXLR8_DENSE_FROM", "SPARK_TP", "SPARK_EP"):
+            assert key not in values
+        for image in ("COORDINATOR_DOCKER_INFERENCE", "SPARK_EXPERT_DOCKER_INFERENCE"):
+            assert config[image] == pins[image]
+        assert entry["family"] == "glm5_flash"
+        assert entry["gpus"] == gpus and len(entry["sparks"]) == sparks
+        assert values["RTX_GPUS"] == str(len(gpus))
+        assert values["COORDINATOR_GPUS"] == ",".join(map(str, gpus))
+        assert values["SPARK_COUNT"] == str(sparks)
+        for rank, host in enumerate(entry["sparks"]):
+            assert values[f"SPARK_{rank}_HOST"] == host
+        for key in ("ADDR", "EXPERT_PORT"):
+            assert sum(other.get("set", {}).get(key) == entry["set"][key]
+                       for other in entries.values()) == 1
+    if "matrix-gate" in filename:
+        assert entries["glmf-exlr8-k4-max"]["prefill_lengths"] == [65536]
