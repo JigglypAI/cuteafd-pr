@@ -528,6 +528,22 @@ def test_requested_panels_preflight_and_report(entry, tmp_path):
 
 
 
+@pytest.mark.parametrize('status', ['fail', 'failed'])
+def test_failed_panel_fails_zero_exit_done_report(entry, tmp_path, status):
+    job = make({**entry, 'profile': 'panels:shared_prefix', 'baseline': False}, tmp_path)
+    report_dir = Path(job['state']) / 'reports' / 'one'
+    report_dir.mkdir(parents=True)
+    panel = {'id': 'shared_prefix', 'status': status, 'error': 'retained 32768 tokens C1: HTTP 400: empty assistant'}
+    report = {'status': 'done', 'panels': [panel]}
+    (report_dir / 'report.json').write_text(json.dumps(report))
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'failed' and row['failure_kind'] == 'measurement'
+    assert row['error'] == 'panel shared_prefix: ' + panel['error']
+    panel.update(status='done', error=None)
+    (report_dir / 'report.json').write_text(json.dumps(report))
+    assert cards.summarize_job(job, 0)['status'] == 'pass'
+
+
 def test_summary_reads_c8_from_the_concurrency_sweep(entry, tmp_path):
     job = make(entry, tmp_path)
     report_dir = Path(job['state']) / 'reports' / 'one'

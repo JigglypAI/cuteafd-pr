@@ -1530,6 +1530,9 @@ def summarize_job(job, exit_code):
             fail(row, 'quality: ' + '; '.join(bad)[:400], 'quality')
         elif report.get('status') in failed or quality.get('status') in failed:
             fail(row, 'report ' + str(report.get('status')) + ': ' + str(report.get('error') or '')[:300])
+        for panel in report.get('panels', []):
+            if panel.get('status') in failed:
+                fail(row, f"panel {panel['id']}: {panel.get('error') or panel['status']}", 'measurement')
         context_panel = next((p for p in report.get('panels', []) if p.get('id') == 'context_load'), None)
         if context_panel:
             records = context_panel.get('passes', [])

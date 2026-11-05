@@ -380,7 +380,7 @@ impl Panel for PrefixCache {
                 "source": common::prefix_source(&chat),
                 "cold_ttft_s": supported.then_some(cold.timing.ttft_s), "fabric": fabric,
                 "cold_fabric": ctx.client.fabric_since(fabric_mark, &format!("prefix_cache/{turn}/cold"), true)}));
-            history.push(json!({"role": "assistant", "content": chat.content}));
+            history.push(chat.assistant_message());
             ctx.progress.partial(json!({"turns": turns}));
         }
         let tiers = common::prefix_tier_interval(tiers_before.as_ref(), common::prefix_tier_counters(ctx.client).as_ref());
@@ -459,10 +459,18 @@ impl Panel for SharedPrefix {
         let options = prefix_card_options(limit);
         let retained_ctx = Ctx { context_load: &options, ..*ctx };
         let retained = super::context_load::CONTEXT_LOAD.run_with_output(&retained_ctx, 512)?;
-        anyhow::ensure!(retained["points"].as_array().is_some_and(|points|
-            !points.is_empty() && points.iter().all(|p| p["status"] == "ok")),
-            "shared-prefix release guard requires successful retained-prefix points");
-        Ok(prefix_card_record(&identical, retained))
+        let record = prefix_card_record(&identical, retained);
+        ctx.progress.partial(record.clone());
+        let points = record["retained"]["points"].as_array();
+        if let Some(point) = points.and_then(|points| points.iter().find(|p| p["status"] != "ok")) {
+            let error = point["request_errors"][0]["error"].as_str()
+                .or_else(|| point["reason"].as_str()).unwrap_or("retained prefix was not reused");
+            anyhow::bail!("shared-prefix release guard: retained {} tokens C{} ({}): {error}",
+                point["context"], point["c"], point["status"]);
+        }
+        anyhow::ensure!(points.is_some_and(|points| !points.is_empty()),
+            "shared-prefix release guard requires successful retained-prefix points: no points recorded");
+        Ok(record)
     }
 }
 
