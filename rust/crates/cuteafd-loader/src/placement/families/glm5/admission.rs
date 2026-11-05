@@ -530,7 +530,7 @@ impl<'a> ProductionInput<'a> {
             || self.target.weights.iter().any(|(_, weights)| weights.ranks != self.gpus)
             || self.target.hooks.len() != self.gpus
             || self.target.hooks.iter().enumerate().any(|(rank, hook)| usize::from(hook.device) != rank)
-            || self.local.is_some() && self.gpus != 2
+            || self.local.as_ref().is_some_and(|(source, _)| source.world() != self.gpus)
             || self.target.native_load.as_ref().is_some_and(|load| load.gpus != self.gpus)
             || (self.spark_ranks == 0) != self.decode_link.is_none()
             || (self.spark_ranks == 0) != self.prefill_link.is_none()
@@ -654,7 +654,7 @@ impl<'a> ProductionInput<'a> {
                     crate::placement::ResidentWeights(owner.bytes)), ByteCurve::fixed(owner.bytes, maximum_pages)));
             }
             recipe.owners.push(Case { when: when.clone(), value: components });
-            if count > 0 {
+            if count > 0 && self.gpus == 2 {
                 for (home, weights) in &weights {
                     let mut replicated = weights.clone();
                     let start = replicated.owners.len();
@@ -682,7 +682,9 @@ impl<'a> ProductionInput<'a> {
                         .is_some_and(|core| core.target_head.is_some()),
                     decode: Some(self.scratch[0]), prefill: Some((self.prefill, self.scratch[1])),
                     full_prefill_logits: self.operation == Operation::Scoring,
-                    payload_row_bytes: if count > 0 { self.cfg.hidden as u64 * self.exchange_element_bytes } else { 0 },
+                    payload_row_bytes: if count > 0 && self.gpus == 2 {
+                        self.cfg.hidden as u64 * self.exchange_element_bytes
+                    } else { 0 },
                     core_rows: recipe.hooks[device as usize].value.core.is_some(),
                 } });
             }

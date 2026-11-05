@@ -282,6 +282,33 @@ fn production_rejects_misindexed_hooks_and_spark_free_multiwave() {
 }
 
 #[test]
+fn production_whole_local_has_no_pair_owners_and_rejects_wrong_world() {
+    use super::super::local_physical::{LocalPhysicalInput, LocalPhysicalSource, LocalStorage};
+    let cfg = cfg();
+    let prefill = PrefillShape { rows: 128, waves: 3 };
+    let source = LocalPhysicalSource::test_source(1, cfg.first_moe_layer..cfg.layers, 128);
+    let physical = LocalPhysicalInput { layers: (cfg.first_moe_layer..cfg.layers).collect(),
+        max_rows: 128, lanes: 3, storage: LocalStorage::Mount, route_checks: true,
+        peer_diagnostics: true, activations: crate::plan::exlr8::PrefillActivations::A16 };
+    let mut input = production_input(&cfg, 1, 4, prefill);
+    input.local = Some((&source, physical.clone()));
+    let mut req = request();
+    req.onboard = Pin::Exact(1);
+    let admitted = input.prepare().unwrap().admit(req).unwrap();
+    assert_eq!(admitted.placement.onboard_layers, 1);
+    assert!(admitted.solved.facts.allocations.iter().any(|owner|
+        owner.id == format!("glm.expert.routed.rank.0.weight.{}.backing", cfg.first_moe_layer)));
+    assert!(admitted.solved.facts.allocations.iter().all(|owner|
+        owner.location != Location::coordinator(1)
+            && !owner.id.contains(".peer.") && !owner.id.contains(".checks.")
+            && !owner.id.ends_with(".rows.payload")));
+    assert!(admitted.graphs.layers[cfg.first_moe_layer].local);
+    let mut input = production_input(&cfg, 2, 4, prefill);
+    input.local = Some((&source, physical));
+    assert!(matches!(input.prepare(), Err(Refusal::InvalidFact(_))));
+}
+
+#[test]
 fn glm_zero_demand_omits_charge_and_positive_demand_has_one_exact_item() {
     let cfg = cfg();
     for bytes in [0, 768] {

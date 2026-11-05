@@ -1,4 +1,4 @@
-//! Physical local TP2 owners. Payload rows and peer routers are target-owned.
+//! Physical local expert owners. Pair payload rows and routers are target-owned.
 use super::{GlmLocalFormat, LocalInventory};
 use crate::{families::glm5::GlmDsaConfig, OfficialV41Catalog, V41Exl3Layer};
 use crate::placement::planner::{Allocation, Lifetime, Location, View};
@@ -52,9 +52,23 @@ pub struct LocalPhysicalSource {
 }
 
 impl LocalPhysicalSource {
+    pub fn world(&self) -> usize { self.world }
+
+    #[cfg(test)]
+    pub(super) fn test_source(world: usize, layers: std::ops::Range<usize>, rows: usize) -> Self {
+        Self { weights: std::array::from_fn(|rank| if rank < world {
+            layers.clone().map(|layer| (layer, LayerStorage { bytes: 4096,
+                mount: vec![(String::new(), 4096)], views: vec![(String::new(), 0, 4096)] })).collect()
+        } else { BTreeMap::new() }), backend: LocalPhysicalInventory::default(),
+            rows, activations: PrefillActivations::A16, topk: 8, world }
+    }
+
     pub fn read(cfg: &GlmDsaConfig, catalog: &OfficialV41Catalog, local: &LocalInventory,
         input: &LocalPhysicalInput, exlr8: Option<&MetadataInput>) -> Result<Self> {
         validate_input(cfg, input)?;
+        ensure!((1..=2).contains(&local.world)
+            && (local.world == 2 || local.format == GlmLocalFormat::Exlr8),
+            "GLM local physical source has no executor for this format/world");
         let mut source = Self { weights: Default::default(), backend: Default::default(),
             rows: input.max_rows, activations: input.activations, topk: cfg.topk, world: local.world };
         if input.layers.is_empty() { return Ok(source); }

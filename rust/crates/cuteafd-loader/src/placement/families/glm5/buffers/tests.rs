@@ -109,11 +109,11 @@ fn prefix_backings_charge_tail_and_window_marks_but_no_target_or_draft_aliases()
                 let spec = PrefixBuffers { device, draft_windows: windows, mark_slots: slots };
                 let owners = spec.allocations(life).unwrap();
                 assert_eq!(owners.len(), 1 + usize::from(windows.is_some() && slots > 0));
-                assert_eq!(owners[0].id, format!("glm.prefix.gpu.{device}.tail-scratch"));
+                assert_eq!(owners[0].id, "glm.prefix.scratch");
                 assert_eq!(owners[0].bytes, 256);
                 if let Some(windows) = windows.filter(|_| slots > 0) {
                     assert_eq!(owners[1].bytes, if windows == 0 {256} else {((windows + 16) * slots).max(256)});
-                    assert_eq!(owners[1].id, format!("glm.prefix.gpu.{device}.draft-marks"));
+                    assert_eq!(owners[1].id, "glm.prefix.draft_marks");
                 }
                 assert!(owners.iter().all(|a| a.view.is_none() && a.lifetime == life
                     && a.location == Location::coordinator(device) && a.category == Category::Prefix));

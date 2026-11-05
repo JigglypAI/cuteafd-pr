@@ -43,8 +43,9 @@ impl PrefixBuffers {
         if self.device > 1 {
             return Err(Refusal::InvalidFact("invalid GLM prefix device".into()));
         }
-        let prefix = format!("glm.prefix.gpu.{}", self.device);
-        let mut owners = vec![Allocation::buffer(format!("{prefix}.tail-scratch"),
+        // NativePrefix owns one scratch and optional mark arena on its lead,
+        // not one copy per attention rank. Match its receipt identities.
+        let mut owners = vec![Allocation::buffer("glm.prefix.scratch",
             Location::coordinator(self.device), FLOOR, lifetime, Category::Prefix, "GLM prefix storage")];
         if let Some(windows) = self.draft_windows.filter(|_| self.mark_slots > 0) {
             let mark = if windows == 0 { 0 } else {
@@ -53,7 +54,7 @@ impl PrefixBuffers {
             };
             let bytes = mul(mark, self.mark_slots)?.max(FLOOR);
             usize::try_from(bytes).map_err(|_| Refusal::Overflow("GLM prefix marks"))?;
-            owners.push(Allocation::buffer(format!("{prefix}.draft-marks"),
+            owners.push(Allocation::buffer("glm.prefix.draft_marks",
                 Location::coordinator(self.device), bytes, lifetime, Category::Prefix, "GLM prefix storage"));
         }
         Ok(owners)
