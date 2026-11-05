@@ -370,8 +370,8 @@ mod tests {
             let context = serve_context(&matches, None).unwrap().expect("Step-5 serve context");
             assert_eq!(context.family, None);
             let placement = context.settings.iter().find(|s| s.name == "attention-placement").unwrap();
-            assert_eq!(placement.value.as_deref(), Some("heads"));
-            assert_eq!(placement.default.as_deref(), Some("heads"));
+            assert_eq!(placement.value.as_deref(), Some("layers"));
+            assert_eq!(placement.default.as_deref(), Some("layers"));
             assert!(attention_mode("step5", matches.subcommand().unwrap().1, "context").is_err());
         }
     }

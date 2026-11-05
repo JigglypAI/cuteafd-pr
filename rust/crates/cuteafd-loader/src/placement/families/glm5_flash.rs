@@ -2009,6 +2009,8 @@ mod tests {
             if let Some(expected) = &reference { assert_eq!(&placed, expected); }
             reference = Some(placed);
             i.attention = resolve_attention(None, 2, programs).unwrap();
+            i.index = if i.attention.mode == Context { cache::GlmfIndexCache::Compact }
+                else { cache::GlmfIndexCache::Keys };
             let placed = solve(&request(&i).unwrap()).unwrap();
             assert_eq!(placed.attention_placement, if programs.is_some() { Context } else { Layers });
         }

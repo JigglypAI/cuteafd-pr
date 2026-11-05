@@ -1035,7 +1035,11 @@ fn auto_cannot_flip_to_an_unqualified_executor_mode() {
     for executor in families::EXECUTORS {
         let mut req = request(2, 20 * GIB, 2, 4, Onboard::Auto);
         req.executor = executor;
-        req.hops.terminal = if executor.runs(LayerMode::HeadSplit) { TerminalHome::Replicated } else { TerminalHome::AttentionOwner };
+        let terminal = |mode| if !executor.runs(LayerMode::HeadSplit)
+            || (mode == AttentionPlacement::Layers && !executor.runs(S0)) {
+            TerminalHome::AttentionOwner
+        } else { TerminalHome::Replicated };
+        req.hops.terminal = terminal(executor.attention_default());
         for layer in &mut req.layers {
             layer.modes = vec![LayerMode::HeadSplit, LayerMode::ContextSplit, S0, S1, W0, W1];
             layer.kv_unit = KvDemand { unit_bytes_whole: UNIT, unit_bytes_split: [UNIT; 2], unit_bytes_context: Some([UNIT / 2; 2]) };
@@ -1043,7 +1047,9 @@ fn auto_cannot_flip_to_an_unqualified_executor_mode() {
         req.pool_overhead = vec![0; 2];
         let auto = solve(&req).unwrap();
         req.attention_placement = Some(AttentionPlacement::Heads);
+        req.hops.terminal = terminal(AttentionPlacement::Heads);
         let heads = solve(&req).unwrap();
+        req.hops.terminal = terminal(executor.attention_default());
         req.policy.attention.clear();
         if executor.attention_default() != AttentionPlacement::Heads {
             // A recorded non-heads default is not a flip: auto runs it outright.
