@@ -179,18 +179,25 @@ impl ToolConstraints {
     fn validate(&self, calls: &BTreeMap<u64, Call>, reason: &str) -> Result<()> {
         if !matches!(reason, "stop" | "tool_calls") {
             // A call cut at `max_tokens` (finish `length`) may have streamed
-            // argument deltas that cannot be retracted. Reject only a call
-            // whose arguments are incomplete; a complete call followed by more
-            // text is accepted, as in BASE.
-            for call in calls.values() {
-                ensure!(unique_json(&call.arguments).is_ok(),
-                    "native tool arguments are not a complete JSON object");
-            }
-            return Ok(());
+            // argument deltas that cannot be retracted. Such a call is dropped
+            // rather than failing the response: the client sees
+            // `finish_reason: "length"` and no call. Complete calls are still
+            // held to the index, schema and parallel rules below.
+            let complete: BTreeMap<u64, Call> = calls.iter()
+                .filter(|(_, call)| unique_json(&call.arguments).is_ok())
+                .map(|(index, call)| (*index, Call { name: call.name.clone(), arguments: call.arguments.clone() }))
+                .collect();
+            // A truncated response is not a protocol violation: an omitted or
+            // partial call is expected, so `required` does not apply here.
+            if complete.is_empty() { return Ok(()); }
+            return self.validate_complete(&complete, reason, false);
         }
+        self.validate_complete(calls, reason, true)
+    }
+    fn validate_complete(&self, calls: &BTreeMap<u64, Call>, reason: &str, required: bool) -> Result<()> {
         if calls.is_empty() {
             ensure!(reason != "tool_calls", "native response claimed tool_calls without a call");
-            ensure!(!self.required, "native response omitted a required tool call");
+            ensure!(!(required && self.required), "native response omitted a required tool call");
             return Ok(());
         }
         ensure!(self.parallel || calls.len() <= 1, "native response violated parallel_tool_calls=false");
@@ -427,7 +434,19 @@ mod tests {
                     if !valid && streaming {
                         crate::openai::tests::terminal_sse_error(&bytes.unwrap());
                     }
-                    else { assert!(bytes.is_ok(),"{name}/{thinking}: {bytes:?}"); }
+                    else {
+                        let bytes = bytes.unwrap_or_else(|error| panic!("{name}/{thinking}: {error}"));
+                        if truncated {
+                            // A truncated response is a 200 whose stream ends with
+                            // `length`; an SSE `error` inside it would still pass a
+                            // status-only check, so assert on the body.
+                            let text = String::from_utf8_lossy(&bytes);
+                            assert!(!text.contains("\"error\""),
+                                "{name}/{thinking}: a truncated response must not stream an error: {text}");
+                            assert!(text.contains("\"finish_reason\":\"length\""),
+                                "{name}/{thinking}: a truncated response must finish with length: {text}");
+                        }
+                    }
                     worker.await.unwrap();
                 }
             }
