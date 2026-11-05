@@ -36,7 +36,7 @@ pub const DEEPSEEK_V41: ExecutorModes = ExecutorModes { family: "deepseek_v41", 
 /// `context` is its recorded default (K3, TJ: GLM 5.3 must not replicate KV; pool first
 /// is not C1-gated): at max it admits 2,097,152 tokens against heads' 1,321,216, C8 1.015x,
 /// 8K prefill 1.027x; C1 parity after the per-row-bucket split plans (7689c8c3: 1.043x). A build without the context programs
-/// fails an explicit `context` closed (`glm5::solve_working_set`, #202); standard auto
+/// fails an explicit `context` closed before shared Recipe admission (#202); standard auto
 /// falls back to whole-layer owners, while native EXLR8 fails closed until qualified.
 /// `heads` stays an explicit option.
 pub const GLM5: ExecutorModes = ExecutorModes { family: "glm5",

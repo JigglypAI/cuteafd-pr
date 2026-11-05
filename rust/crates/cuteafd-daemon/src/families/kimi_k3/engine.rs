@@ -257,7 +257,7 @@ impl<'a> Engine<'a> {
         let prefill = PrefillUnits { unit_rows: admission.unit_rows(), waves: admission.waves() };
         let mut engine = Self::bind(exchange_streams.into(), plan, peer, hops,
             local, routed, io, experts, prefill, coordinator_packing_cap)?;
-        engine.max_pool_tokens_no_onboard = Some(admission.placement.max_pool_tokens_no_onboard);
+        engine.max_pool_tokens_no_onboard = admission.placement.max_pool_tokens_no_onboard;
         engine.draft = draft.map(Rc::new);
         *engine.draft_probe.borrow_mut() = draft_probe;
         Ok(engine)
