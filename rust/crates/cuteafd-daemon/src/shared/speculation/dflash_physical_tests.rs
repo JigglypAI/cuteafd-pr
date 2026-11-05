@@ -17,6 +17,28 @@ fn installed_snapshot(repo: &str) -> Result<PathBuf> {
 
 #[test]
 fn installed_standard_dflash_physical_layout_equals_serving_receipts() -> Result<()> {
+    // Isolate the RSS contract from other CPU gate tests running in parallel.
+    const CHILD: &str = "CUTEAFD_DFLASH_PHYSICAL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["shared::speculation::dflash::physical_tests::installed_standard_dflash_physical_layout_equals_serving_receipts",
+                "--exact", "--nocapture"])
+            .env(CHILD, "1").output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        ensure!(output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "isolated physical equality failed: {stdout}\n{stderr}");
+        println!("{stdout}");
+        return Ok(());
+    }
+    let peak_rss = || -> Result<u64> {
+        let status = std::fs::read_to_string("/proc/self/status")?;
+        status.lines().find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|value| value.split_whitespace().next()).context("missing RSS high-water mark")?
+            .parse::<u64>().map_err(Into::into)
+    };
+    let baseline_rss = peak_rss()?;
+    let mut arms = 0;
     let root = std::env::var_os("CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR").map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").expect("HOME"))
             .join(".cache/cuteafd/builds/glm-dflash-physical-components/fixtures"));
@@ -72,10 +94,17 @@ fn installed_standard_dflash_physical_layout_equals_serving_receipts() -> Result
                     assert!(forecast.weight_owners().all(|owner| owner.location == Location::coordinator(0)));
                     drop(drafter);
                     fixture.finish_ordered_uploads(&library)?;
+                    assert_eq!(fixture.mapped_bytes(&library)?, 0, "virtual device mapping leaked");
+                    ensure!(peak_rss()?.saturating_sub(baseline_rss) < 128 * 1024,
+                        "allocation equality RSS grew by more than 128 MiB");
+                    arms += 1;
                 }
                 }
             }
         }
     }
+    assert_eq!(arms, 48);
+    println!("{arms} real-load arms; peak RSS growth {} KiB; no retained virtual mappings",
+        peak_rss()?.saturating_sub(baseline_rss));
     Ok(())
 }

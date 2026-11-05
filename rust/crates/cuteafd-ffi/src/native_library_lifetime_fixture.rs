@@ -198,12 +198,17 @@ impl Fixture {
         Ok(fs::read_to_string(&self.events)?)
     }
 
-    /// Keep logical device extents, but allocate only a small sentinel and skip copies/zeroes.
+    /// Reserve untouched virtual device extents per owner and skip copies/zeroes.
     /// Only allocation/receipt tests may enable this; launching math is unsupported.
     pub fn extent_only(&self, library: &NativeLibrary) -> Result<()> {
         // SAFETY: this export belongs to the private CPU fixture and has no arguments.
         unsafe { library.lib.get::<unsafe extern "C" fn()>(b"fixture_extent_only")?(); }
         Ok(())
+    }
+
+    pub fn mapped_bytes(&self, library: &NativeLibrary) -> Result<usize> {
+        // SAFETY: this private fixture export reads its allocation counter.
+        Ok(unsafe { library.lib.get::<unsafe extern "C" fn() -> usize>(b"fixture_mapped_bytes")?() })
     }
 
     /// Admit a BF16 projection in the allocation-only catalog; launches still fail.

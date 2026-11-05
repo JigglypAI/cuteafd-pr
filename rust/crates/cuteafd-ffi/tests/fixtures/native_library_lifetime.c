@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <sys/mman.h>
 #include "../../../../../native/shared/cuda/expert_pack_layout.h"
 #include "cuteafd_mxfp4_layouts.h"
 
@@ -21,8 +22,10 @@ static int bind_after = -1, bind_calls;
 void fixture_configure_bind_after(int after) { bind_after = after; bind_calls = 0; }
 static size_t memory_total[8], memory_used[8], graph_bytes;
 static int immediate_copies;
-/* Extent-only device owners for header-driven allocation tests: never launch math. */
+/* Untouched, per-owner virtual extents: allocation tests never launch math. */
 static int extent_only;
+static size_t mapped_bytes;
+size_t fixture_mapped_bytes(void) { return mapped_bytes; }
 void fixture_extent_only(void) { extent_only = 1; immediate_copies = 1; }
 struct fixture_program_info {
     char name[64]; uint32_t pointers, scalars; char scalar_kinds[16];
@@ -229,9 +232,16 @@ int cuteafd_cuda_dmabuf_allocation_granularity(size_t *out) {
 }
 
 int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out) {
-    if (posix_memalign(&out->ptr, 256, extent_only ? 256 : bytes)) return 1;
-    /* Zeroed so operand digests never read unspecified padding. */
-    memset(out->ptr, 0, extent_only ? 256 : bytes);
+    if (extent_only) {
+        out->ptr = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (out->ptr == MAP_FAILED) return 1;
+        mapped_bytes += bytes;
+    } else {
+        if (posix_memalign(&out->ptr, 256, bytes)) return 1;
+        /* Operand digests must not read unspecified padding. */
+        memset(out->ptr, 0, bytes);
+    }
     out->bytes = bytes;
     out->device_id = current_device;
     out->flags = 1;
@@ -243,7 +253,10 @@ int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out) {
 int cuteafd_free_device_buffer(struct device_buffer *buffer) {
     event('d');
     if (buffer->flags == 1) memory_used[buffer->device_id] -= buffer->bytes;
-    free(buffer->ptr);
+    if (extent_only && buffer->flags == 1) {
+        if (munmap(buffer->ptr, buffer->bytes)) return 1;
+        mapped_bytes -= buffer->bytes;
+    } else { free(buffer->ptr); }
     memset(buffer, 0, sizeof(*buffer));
     return 0;
 }
