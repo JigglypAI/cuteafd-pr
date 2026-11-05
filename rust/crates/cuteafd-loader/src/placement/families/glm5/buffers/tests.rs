@@ -205,6 +205,38 @@ fn named_target_buffers_match_independent_pool_geometry_and_aliases() {
 }
 
 #[test]
+fn ml4_target_caches_preserve_nope_and_shared_latent_geometry() {
+    let cfg = GlmDsaConfig::from_hf(&crate::plan::testing::mistral_large4_config()).unwrap();
+    assert!((0..cfg.layers).any(|layer| !cfg.owns_kv(layer)));
+    assert!((0..cfg.layers).any(|layer| !cfg.rope(layer) && cfg.owns_kv(layer)));
+    for partitioned in [false, true] {
+        let mut target = target(0);
+        target.partitioned = partitioned;
+        target.page_tokens = if partitioned { 128 } else { 64 };
+        target.owned_layers = (0..cfg.layers).map(|layer| layer % 3 != 2).collect();
+        let components = target.components(&cfg).unwrap();
+        for pages in [1, 17, 128] {
+            let mut contract = Contract::fixed(target.page_tokens, target.maximum_pages, 2,
+                Facts { phase_order: planner::PhaseOrder::DRAFT_THEN_TARGET,
+                    allocations: vec![], deferred: vec![], sequential: vec![],
+                    reservations: vec![], allowances: vec![], resident_weights: vec![] });
+            contract.components = components.clone();
+            let facts = contract.facts(&[], pages).unwrap();
+            for (layer, &owned) in target.owned_layers.iter().enumerate() {
+                let get = |suffix: &str| facts.allocations.iter().find(|owner|
+                    owner.id == format!("glm.target.gpu.0.{suffix}.{layer}"));
+                let bytes = if owned && cfg.owns_kv(layer) {
+                    (pages + 1) * 64 * if cfg.rope(layer) { 656 } else { 528 }
+                } else { 256 };
+                assert_eq!(get("kv").unwrap().bytes, bytes, "layer {layer}");
+                assert_eq!(get("index").map(|owner| owner.bytes),
+                    (owned && cfg.indexers[layer] == GlmIndexer::Full).then_some((pages + 1) * 8448));
+            }
+        }
+    }
+}
+
+#[test]
 fn target_buffer_curves_cover_floor_breaks_and_reject_invalid_geometry() {
     let mut target = target(1);
     target.partitioned = false;

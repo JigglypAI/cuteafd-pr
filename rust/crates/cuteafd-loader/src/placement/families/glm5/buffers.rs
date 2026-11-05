@@ -1,7 +1,7 @@
 //! Physical target buffers, not a placement policy or a complete family admission.
 //! Native dense/K6 hook scratch, experts, exchanges, graphs and serving owners
 //! join these components separately before the family can authorize Ready.
-use super::{GlmScratch, DECODE_ROWS, INDEX_PAGE_BYTES, PAGE_ROWS, RECORD_PAGE_BYTES};
+use super::{GlmScratch, DECODE_ROWS, INDEX_PAGE_BYTES, PAGE_ROWS};
 use crate::families::glm5::{GlmDsaConfig, GlmIndexer};
 use crate::placement::planner::{
     Allocation, ByteCurve, BytePiece, Component, Lifetime, Location, Phase, PrefillShape, Refusal,
@@ -379,11 +379,12 @@ impl TargetBuffers {
             out: Vec::new(),
         };
         for (layer, &owned) in self.owned_layers.iter().enumerate() {
-            let kv = if owned {
-                let stride = mul(local_pages, RECORD_PAGE_BYTES)?;
+            let kv = if owned && cfg.owns_kv(layer) {
+                let page = mul(PAGE_ROWS, cfg.record_bytes(layer) as u64)?;
+                let stride = mul(local_pages, page)?;
                 ByteCurve::linear(
                     stride
-                        .checked_add(RECORD_PAGE_BYTES)
+                        .checked_add(page)
                         .ok_or(Refusal::Overflow("GLM KV scratch page"))?,
                     stride,
                     self.maximum_pages,
