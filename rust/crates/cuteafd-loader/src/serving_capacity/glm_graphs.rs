@@ -202,6 +202,58 @@ mod tests {
     }
 
     #[test]
+    fn min_max_declarations_cover_every_reachable_verify_shape_and_depth() {
+        use crate::serving_capacity::{glm_decode_row_bucket, glm_decode_table_width};
+        // verify_device_hooked accepts a total of 1..=64 rows. Every speculative
+        // depth and batch partition is a member of this domain, not a new key.
+        let mut totals = HashSet::new();
+        for depth in 1..=64 {
+            for batch in 1..=64 / depth {
+                for tail in 0..depth {
+                    let rows = batch * depth + tail;
+                    if rows <= 64 { totals.insert(rows); }
+                }
+            }
+        }
+        assert_eq!(totals.len(), 64);
+        for (attention, gpus, ranks, pool_tokens, onboard) in [
+            (AttentionPlacement::Heads, 1, 4, 1_257_856usize, 0),
+            (AttentionPlacement::Context, 2, 6, 2_097_152, 6),
+        ] {
+            let context = 1 << 20;
+            let pages = pool_tokens / super::super::GLM_PAGE_ROWS;
+            let layers: Vec<_> = (0..78).map(|layer| GlmGraphLayer {
+                dense: layer < 3, tp2: (3..3 + onboard).contains(&layer), attention_owner: None,
+            }).collect();
+            let declared = glm_declared_graphs(&glm_graph_shapes(context, pages), attention,
+                gpus, &layers, ranks).unwrap();
+            // Enumerate real page demands rather than trusting the warm inventory
+            // to enumerate itself. Normalize exactly as decode dispatch does.
+            let mut reachable = HashSet::new();
+            for needed in 1..=context / super::super::GLM_PAGE_ROWS {
+                let width = glm_decode_table_width(needed, context, pages);
+                for &rows in &totals {
+                    reachable.insert((glm_decode_row_bucket(rows, width).unwrap(), width));
+                }
+            }
+            assert_eq!(reachable.len(), 213);
+            for (rows, width) in reachable {
+                let width = if attention == AttentionPlacement::Context { width.div_ceil(2) } else { width };
+                for (rank, inventory) in declared.iter().enumerate() {
+                    for layer in 0..layers.len() + usize::from(rank == 0) {
+                        let previous = if layer == 0 { GlmGraphPrevious::First }
+                            else if layer <= 3 || (3..3 + onboard).contains(&(layer - 1)) { GlmGraphPrevious::Delta }
+                            else { GlmGraphPrevious::Planes(if rank == 0 { ranks } else { 0 }) };
+                        let key = GlmGraphKey { layer, rows, table_width: width, table_stride: width,
+                            previous, head: rank == 0 && layer == layers.len() };
+                        assert!(inventory.contains(&key), "reachable rank {rank} key is undeclared: {key:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn owned_declaration_covers_exact_phases_and_changes_with_ownership() {
         let shapes = glm_graph_shapes(131072, 4096);
         let layers = [

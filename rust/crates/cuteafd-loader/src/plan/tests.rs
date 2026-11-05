@@ -4670,11 +4670,19 @@ fn memory_constrained_spark_refuses_by_typed_owner_charge_not_waves() {
     assert!(tight.hints.iter().any(|hint| hint.what.starts_with("spark0") && hint.what.contains("shortfall 1 bytes")),
         "{:?}", tight.hints);
     let placement = roomy.solver_placement.as_ref().unwrap();
-    assert!(placement.max_pool_tokens_no_onboard >= placement.pool_tokens);
-    assert!(render(&roomy).contains(&format!("max_pool_tokens_no_onboard {}", placement.max_pool_tokens_no_onboard)));
+    let maximum = placement.max_pool_tokens_no_onboard.expect("legacy solve computes the counterfactual");
+    assert!(maximum >= placement.pool_tokens);
+    assert!(render(&roomy).contains(&format!("max_pool_tokens_no_onboard {maximum}")));
     let json = serde_json::to_value(&roomy).unwrap();
-    assert_eq!(json["max_pool_tokens_no_onboard"], placement.max_pool_tokens_no_onboard);
+    assert_eq!(json["max_pool_tokens_no_onboard"], maximum);
     assert_eq!(json["onboard_layers"], placement.onboard_layers);
+    let mut without_counterfactual = roomy.clone();
+    without_counterfactual.max_pool_tokens_no_onboard = None;
+    without_counterfactual.solver_placement.as_mut().unwrap().max_pool_tokens_no_onboard = None;
+    let text = render(&without_counterfactual);
+    assert!(text.contains(&format!("{} tokens admitted with {} RTX expert layers", roomy.memory_layout.as_ref().unwrap().pool_tokens, placement.onboard_layers)));
+    assert!(!text.contains("max_pool_tokens_no_onboard") && !text.contains("null tokens"));
+    assert!(serde_json::to_value(&without_counterfactual).unwrap().get("max_pool_tokens_no_onboard").is_none());
     // One wave fits the same budget: the k units divide the reserve, they
     // never add a second prefill scratch (only per-unit staging differs).
     let one = spark(&plan_at(121 << 30, 1));

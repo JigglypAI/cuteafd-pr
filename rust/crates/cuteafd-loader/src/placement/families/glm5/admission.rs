@@ -225,6 +225,74 @@ pub const GLM_MAX_GRAPH: [MemoryFigure; 2] = [
         "#1242 glm53-exl3-max-census-r1/instantiate/rank1"),
 ];
 
+/// Measured #1242 peak over recorded startup phases after subtracting the
+/// normalized preweight context, exact native backings and signed instantiate
+/// bytes. Ready was the largest recorded remainder on all three ranks. These
+/// are observed peaks, not independently qualified bounds or attributed owners.
+pub const GLM_MIN_RUNTIME_UNATTRIBUTED: MemoryFigure = measured(621_275_328, MIN_GRAPHS, MIN_LAYOUT,
+    "4a56925e7986a57e3194c0cca6df256838386519", "#1242 glm53-exl3-min-census-r1/runtime-unattributed-peak");
+pub const GLM_MAX_RUNTIME_UNATTRIBUTED: [MemoryFigure; 2] = [
+    measured(912_069_460, MAX_GRAPHS[0], MAX_LAYOUT, "5d180b5c8d76636d5937336638dfd71c15a8d226",
+        "#1242 glm53-exl3-max-census-r1/runtime-unattributed-peak/rank0"),
+    measured(581_053_972, MAX_GRAPHS[1], MAX_LAYOUT, "5d180b5c8d76636d5937336638dfd71c15a8d226",
+        "#1242 glm53-exl3-max-census-r1/runtime-unattributed-peak/rank1"),
+];
+
+/// Opaque non-graph runtime parameters, charged independently of physical
+/// weights, payloads, pinned storage and graph instantiate bytes.
+#[derive(Debug, Clone)]
+pub struct RuntimeFigures {
+    context: Vec<MemoryFigure>,
+    unattributed: Vec<MemoryFigure>,
+}
+
+impl RuntimeFigures {
+    /// `layout` is the complete selected layout identity, not a graph count or
+    /// placement name. Uncovered layouts keep the measured bytes unchanged and
+    /// explicitly record the one-to-one derivation; staleness never adds bytes.
+    pub fn new(gpus: usize, layout: &str) -> Result<Self, Refusal> {
+        if !(1..=2).contains(&gpus) || layout.trim().is_empty() {
+            return Err(invalid("invalid runtime figure layout or rank count"));
+        }
+        let context = if gpus == 1 { vec![GLM_MIN_CONTEXT] } else { GLM_MAX_CONTEXT.to_vec() };
+        let unattributed = if gpus == 1 { vec![GLM_MIN_RUNTIME_UNATTRIBUTED] }
+            else { GLM_MAX_RUNTIME_UNATTRIBUTED.to_vec() };
+        let derive = |figures: Vec<MemoryFigure>, derivation| -> Result<_, Refusal> {
+            figures.into_iter().map(|figure| {
+                if layout == figure.identity.layout { Ok(figure) }
+                else { figure.scaled(1, 1, derivation).map_err(invalid) }
+            }).collect::<Result<Vec<_>, _>>()
+        };
+        Ok(Self {
+            context: derive(context,
+                "unchanged measured min/max preweight context; different layout, no finer context measurement")?,
+            unattributed: derive(unattributed,
+                "unchanged measured min/max recorded runtime-unattributed peak; different layout, no finer runtime measurement")?,
+        })
+    }
+
+    pub fn context(&self) -> &[MemoryFigure] { &self.context }
+    pub fn unattributed(&self) -> &[MemoryFigure] { &self.unattributed }
+
+    pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        if maximum_pages == 0 { return Err(invalid("zero runtime figure pool extent")); }
+        Ok([("context and selected modules", &self.context),
+            ("runtime unattributed", &self.unattributed)].into_iter().flat_map(|(name, figures)| {
+                figures.iter().enumerate().map(move |(rank, figure)| Component {
+                    activation: Activation::always(),
+                    bytes: ByteCurve::fixed(figure.bytes, maximum_pages),
+                    kind: ComponentKind::Allowance(Allowance {
+                        location: Location::coordinator(rank as u8), bytes: figure.bytes,
+                        lifetime: Lifetime::RESIDENT,
+                        source: format!("GLM {name}: {:?}; {}; producer {}",
+                            figure.attribution, figure.evidence, figure.producing_commit),
+                        assumed: matches!(figure.attribution, FigureAttribution::Estimated { .. }),
+                    }),
+                })
+            }).collect())
+    }
+}
+
 /// Independently declared full-context keys plus maintained whole-set figures.
 /// No per-executable calibration, margin or invented post-Ready reserve.
 #[derive(Debug, Clone)]

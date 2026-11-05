@@ -1176,7 +1176,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         }
         if let Some(placement) = &report.solver_placement {
             report.onboard_layers = Some(placement.onboard_layers);
-            report.max_pool_tokens_no_onboard = Some(placement.max_pool_tokens_no_onboard);
+            report.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;
         }
         if layout_options.host_embedding {
             for note in memory.notes.iter().filter(|n| n.starts_with("host embedding ineligible:")) {
@@ -1604,9 +1604,11 @@ pub fn render(report: &PlanReport) -> String {
             let _ = writeln!(out, "host item  {}: {} bytes ({:?})", item.group, item.bytes, item.basis);
         }
     }
-    if let (Some(layers), Some(maximum)) = (report.onboard_layers, report.max_pool_tokens_no_onboard) {
+    if let Some(layers) = report.onboard_layers {
         let pool = report.memory_layout.as_ref().map_or(0, |memory| memory.pool_tokens);
-        let _ = writeln!(out, "pool       {pool} tokens admitted with {layers} RTX expert layers; max_pool_tokens_no_onboard {maximum}");
+        let maximum = report.max_pool_tokens_no_onboard
+            .map(|maximum| format!("; max_pool_tokens_no_onboard {maximum}")).unwrap_or_default();
+        let _ = writeln!(out, "pool       {pool} tokens admitted with {layers} RTX expert layers{maximum}");
     }
     if let Some(warning) = &report.spark_count_warning { let _ = writeln!(out, "warning: {warning}"); }
     if report.disabled_media_bytes > 0 { out.push_str(&format!("media disabled: {} bytes saved\n", report.disabled_media_bytes)); }

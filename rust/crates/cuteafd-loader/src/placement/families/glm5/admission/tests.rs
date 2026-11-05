@@ -788,6 +788,51 @@ fn measured_reference_figures_match_independently_declared_min_max_sets() {
     }
 }
 
+#[test]
+fn runtime_figures_preserve_recorded_peaks_without_double_charging_or_margins() {
+    for (ranks, layout, context, unattributed) in [
+        (1, MIN_LAYOUT, vec![598_999_040], vec![621_275_328]),
+        (2, MAX_LAYOUT, vec![594_804_736, 603_193_344], vec![912_069_460, 581_053_972]),
+    ] {
+        let figures = RuntimeFigures::new(ranks, layout).unwrap();
+        assert_eq!(figures.context().iter().map(|f| f.bytes).collect::<Vec<_>>(), context);
+        assert_eq!(figures.unattributed().iter().map(|f| f.bytes).collect::<Vec<_>>(), unattributed);
+        assert!(figures.context().iter().chain(figures.unattributed())
+            .all(|f| f.attribution == FigureAttribution::Measured));
+        for maximum in [1, 32768] {
+            let components = figures.components(maximum).unwrap();
+            assert_eq!(components.len(), ranks * 2);
+            for (index, component) in components.iter().enumerate() {
+                let ComponentKind::Allowance(owner) = &component.kind else {
+                    panic!("opaque runtime has no invented allocation owner")
+                };
+                let rank = index % ranks;
+                let bytes = if index < ranks { context[rank] } else { unattributed[rank] };
+                assert_eq!(owner.location, Location::coordinator(rank as u8));
+                assert_eq!(owner.bytes, bytes);
+                assert!(!owner.assumed);
+                assert_eq!(owner.lifetime, Lifetime::RESIDENT);
+                assert_eq!(component.activation, Activation::always());
+                assert_eq!(component.bytes.at(1).unwrap(), bytes);
+                assert_eq!(component.bytes.at(maximum).unwrap(), bytes);
+            }
+        }
+        let estimated = RuntimeFigures::new(ranks, "different complete layout").unwrap();
+        for (source, derived) in figures.context().iter().chain(figures.unattributed())
+            .zip(estimated.context().iter().chain(estimated.unattributed())) {
+            assert_eq!(derived.bytes, source.bytes, "uncovered is not permission to add a margin");
+            assert_eq!(derived.evidence, source.evidence);
+            assert_eq!(derived.producing_commit, source.producing_commit);
+            assert!(matches!(derived.attribution, FigureAttribution::Estimated { .. }));
+        }
+        assert!(estimated.components(32768).unwrap().iter().all(|component|
+            matches!(&component.kind, ComponentKind::Allowance(a) if a.assumed)));
+        assert!(figures.components(0).is_err());
+    }
+    for ranks in [0, 3, usize::MAX] { assert!(RuntimeFigures::new(ranks, MIN_LAYOUT).is_err()); }
+    assert!(RuntimeFigures::new(1, " ").is_err());
+}
+
 fn owned_graph_recipe(cfg: &GlmDsaConfig, context: u64) -> GlmRecipe<'_> {
     let mut recipe = recipe(cfg);
     recipe.context = context;

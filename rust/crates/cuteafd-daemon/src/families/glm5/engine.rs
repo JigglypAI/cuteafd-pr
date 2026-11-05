@@ -85,6 +85,18 @@ impl Drop for GraphExec<'_> {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("GLM rank {rank} decode key {key:?} is absent from the sealed startup graph inventory")]
+struct UndeclaredDecodeGraph {
+    rank: usize,
+    key: GraphKey,
+}
+
+fn startup_capture_allowed(warmed: bool, warming: bool, rank: usize, key: GraphKey)
+    -> std::result::Result<bool, UndeclaredDecodeGraph> {
+    if warmed { Err(UndeclaredDecodeGraph { rank, key }) } else { Ok(warming) }
+}
+
 /// Host tables of one step.
 #[derive(Clone)]
 struct StepTables {
@@ -2005,31 +2017,24 @@ impl<'a> GlmEngine<'a> {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
         }
-        if self.graphs_warmed.get() {
-            let misses = self.graph_misses.get().saturating_add(1);
-            self.graph_misses.set(misses);
-            tracing::warn!(rank, ?key, graph_misses = misses,
-                "GLM startup graph coverage gap; running segment uncaptured");
-            return segment();
-        }
+        // Only the explicit startup warm-up may capture. Disabled, partial and
+        // transport-free warm paths stay eager, including before Ready.
+        let capture = startup_capture_allowed(self.graphs_warmed.get(), self.graphs_warming.get(), rank, key)
+            .map_err(|error| {
+                let misses = self.graph_misses.get().saturating_add(1);
+                self.graph_misses.set(misses);
+                tracing::error!(rank, ?key, graph_misses = misses, %error,
+                    "GLM sealed startup graph inventory violation");
+                error
+            })?;
+        if !capture { return segment(); }
         // SAFETY: capture records launches on that rank's stream; nothing in the
         // segment synchronizes the host.
         self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
         let captured = segment();
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
         captured?;
-        let exec = match exec {
-            Ok(exec) => exec,
-            Err(error) if !self.graphs_warming.get() => {
-                let misses = self.graph_misses.get().saturating_add(1);
-                self.graph_misses.set(misses);
-                tracing::warn!(rank, ?key, graph_misses = misses, %error,
-                    "GLM decode graph capture failed; running segment uncaptured");
-                return segment();
-            }
-            Err(error) => return Err(error),
-        };
-        let graph = GraphExec(exec, self.library);
+        let graph = GraphExec(exec?, self.library);
         self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) })?;
         graphs.borrow_mut().insert(key, graph);
         Ok(())
@@ -3185,6 +3190,22 @@ fn prefill_logits_plan(counts: &[usize], wanted: usize) -> Result<PrefillLogitsP
 #[cfg(test)]
 mod long_graph_tests {
     use super::*;
+
+    #[test]
+    fn graph_capture_is_startup_only_and_sealed_misses_are_typed_errors() {
+        let key = GraphKey { layer: 7, rows: 64, table_width: 16384, table_stride: 16384,
+            previous: Previous::Planes(6), head: false };
+        // Skipped/disabled/partial warm-up never acquires capture permission.
+        assert!(!startup_capture_allowed(false, false, 0, key).unwrap());
+        assert!(startup_capture_allowed(false, true, 0, key).unwrap());
+        for warming in [false, true] {
+            let error = startup_capture_allowed(true, warming, 1, key).unwrap_err();
+            assert_eq!(error.rank, 1);
+            assert_eq!(error.key, key);
+            let message = error.to_string();
+            assert!(message.contains("rank 1") && message.contains(&format!("{key:?}")));
+        }
+    }
 
     #[test]
     fn native_expert_request_preserves_fp8_rows_and_bf16_response_contract() -> Result<()> {
