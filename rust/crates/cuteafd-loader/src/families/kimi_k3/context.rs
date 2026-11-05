@@ -42,7 +42,7 @@ impl ContextLayout {
                 let bytes = usize::try_from(bytes).context("Kimi context scratch extent overflow")?;
                 let geometry = &entries[0]["geometry"];
                 ensure!(geometry["num_splits"] == 16 && geometry["runtime_splits"] == true
-                    && geometry["lse_base2"] == true,
+                    && geometry["lse_base"] == 2,
                     "Kimi context {name} requires runtime splits (capacity 16) and base-2 LSE");
                 let expected = (ROWS * HEADS * 16 * 512 * 2).next_multiple_of(1024)
                     + ROWS * HEADS * 16 * 4;
@@ -93,7 +93,7 @@ pub(crate) fn add_manifest_programs(manifest: &mut serde_json::Value) {
             let programs = manifest["programs"].as_array_mut().unwrap();
             if !programs.iter().any(|p| p["name"] == name) {
                 programs.push(serde_json::json!({"name":name,"scratch_bytes_at_capacity":{"scratch":bytes},
-                    "geometry":{"num_splits":16,"runtime_splits":true,"lse_base2":true}}));
+                    "geometry":{"num_splits":16,"runtime_splits":true,"lse_base":2}}));
             }
         }
     }
