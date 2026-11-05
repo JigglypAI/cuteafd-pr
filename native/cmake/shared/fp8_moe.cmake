@@ -101,7 +101,7 @@ or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, calibrated W4A4 at all row counts
     endif()
   endif()
   set(stamp "${CMAKE_CURRENT_BINARY_DIR}/fp8_moe_${geometry}.stamp")
-  file(GENERATE OUTPUT "${stamp}" CONTENT "abi=5|role=${CUTEAFD_FP8_MOE_ROLE}|capacities=${CUTEAFD_FP8_MOE_CAPACITIES}|${exact_slices}|${requested_layouts}\n")
+  file(GENERATE OUTPUT "${stamp}" CONTENT "abi=5|build=${CUTEAFD_BUILD_KIND}|role=${CUTEAFD_FP8_MOE_ROLE}|capacities=${CUTEAFD_FP8_MOE_CAPACITIES}|${exact_slices}|${requested_layouts}\n")
   add_custom_command(
     OUTPUT "${package}/manifest.json"
     COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}

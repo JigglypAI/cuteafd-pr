@@ -71,9 +71,15 @@ def tmp_root(tmp_path_factory):
     return root
 
 
-@pytest.mark.parametrize("case", CASES)
+SHOWCASE_BASELINES = {
+    f"deepseek-v41-mxfp4-max-{codec}-reply": "deepseek-v41-mxfp4-max"
+    for codec in ("fp8", "nvfp4")
+}
+
+
+@pytest.mark.parametrize("case", (*CASES, *SHOWCASE_BASELINES))
 def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> None:
-    golden = json.loads((FIXTURES / f"{case}.json").read_text())
+    golden = json.loads((FIXTURES / f"{SHOWCASE_BASELINES.get(case, case)}.json").read_text())
     current = capture(ROOT, case)
     assert [c["host"] for c in current["containers"]] == [c["host"] for c in golden["containers"]]
     for old, new in zip(golden["containers"], current["containers"]):
@@ -111,7 +117,12 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         link = added.pop("CUTEAFD_CONSOLE_LINK_COMMAND", None)
         if role == "coordinator":
             assert link and link.startswith('echo "http://') and "$(cat ~/.cache/cuteafd/console/secret)" in link, where
-        assert added == INTENDED[role], where
+        expected_added = dict(INTENDED[role])
+        if case in SHOWCASE_BASELINES and role == "coordinator":
+            codec = case.removeprefix("deepseek-v41-mxfp4-max-").removesuffix("-reply")
+            expected_added.update({f"CUTEAFD_SPARK_{phase}_REPLY_FORMAT": codec
+                                   for phase in ("PREFILL", "DECODE")})
+        assert added == expected_added, where
         # The fingerprint now also covers the shared executor's prefill waves.
         fingerprinted = {key: value for key, value in before["env"].items() if key != "CUTEAFD_RELEASE_CONFIG_SHA256"}
         assert {key: after["env"][key] for key in fingerprinted} == fingerprinted, where
@@ -229,7 +240,9 @@ def test_dspark_draft_limit_reaches_plan_and_serve(tmp_root, monkeypatch, limit)
 
 def test_goldens_cover_every_v41_example_and_gate_card() -> None:
     examples = {p.stem for p in (ROOT / "examples" / "configs").glob("deepseek-v41-*.config")}
-    assert examples <= set(CASES)
+    assert examples <= set(CASES) | set(SHOWCASE_BASELINES)
+    assert set(SHOWCASE_BASELINES) <= examples
+    assert set(SHOWCASE_BASELINES.values()) <= set(CASES)
     kit = json.loads((ROOT / "scripts/bench/kits/gate/matrix-gate.json").read_text())
     assert {e["name"] for e in kit["entries"] if e.get("family") == "deepseek_v41"} <= set(KIT_CARDS)
     assert {p.stem for p in FIXTURES.glob("*.json")} == set(CASES)

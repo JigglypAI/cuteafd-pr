@@ -41,6 +41,26 @@ impl fmt::Display for ProgramCapacityError {
 
 impl std::error::Error for ProgramCapacityError {}
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("missing compressed Spark reply export {export}; release builds include this export (development builds provide BF16 replies only)")]
+pub struct MissingReplyExport {
+    pub export: String,
+}
+
+/// Validate an explicitly requested codec before loading weights or allocating workspaces.
+pub fn require_reply_export(name: &str, present: bool) -> std::result::Result<(), MissingReplyExport> {
+    if present { Ok(()) } else { Err(MissingReplyExport { export: name.to_owned() }) }
+}
+
+pub fn admit_reply_export(formats: cuteafd_core::spark_reply::SparkReplyFormats,
+    format: cuteafd_core::SparkReplyFormat, name: &str, present: bool)
+    -> std::result::Result<(), MissingReplyExport> {
+    if formats.prefill == Some(format) || formats.decode == Some(format) {
+        require_reply_export(name, present)?;
+    }
+    Ok(())
+}
+
 impl ProgramCapacities {
     fn from_manifest(manifest: &serde_json::Value) -> std::result::Result<Self, ProgramCapacityError> {
         let capacities = &manifest["capacities"];
@@ -287,6 +307,16 @@ impl<'a> Programs<'a> {
         Ok((loaded, skipped))
     }
 
+    pub fn contains(&self, name: &str) -> bool {
+        self.programs.contains_key(name)
+    }
+
+    pub fn reply_bound(&self, name: &str, pointers: &[&str], format: cuteafd_core::SparkReplyFormat)
+        -> Result<Option<BoundProgram<'a>>> {
+        admit_reply_export(cuteafd_core::spark_reply::requested(), format, name, self.contains(name))?;
+        self.contains(name).then(|| self.bound(name, pointers)).transpose()
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.programs.keys().map(String::as_str)
     }
@@ -431,12 +461,13 @@ fn validate_exlr8_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result
 
 fn validate_exlr8_scalars(kind: super::exlr8::KernelKind, entry: &serde_json::Value) -> Result<()> {
     use super::exlr8::KernelKind::*;
-    let expected: &[(&str, &str)] = match kind {
+    let expected: &[(&str, &str)] = match kind.arithmetic_kind() {
         GroupedA16 | GroupedA8 | GroupedDecode => &[
             ("rows", "int32"), ("cta_limit", "int32"), ("unit_limit", "int32"), ("l2_bytes", "int32"),
         ],
-        Routed | Shared | Group | SharedGroup | GroupedGroup => &[("rows", "int32"), ("cta_limit", "int32")],
+        Routed | Shared | Group | SharedGroup | GroupedGroup | ReplyFp8 | ReplyNvfp4 => &[("rows", "int32"), ("cta_limit", "int32")],
         Decode => &[("rows", "int32"), ("groups", "int32"), ("cta_limit", "int32")],
+        _ => unreachable!("reply arithmetic kinds normalize to their BF16 sibling"),
     };
     let scalars = entry["scalars"].as_array().context("EXLR8 scalar ABI missing")?;
     ensure!(scalars.len() == expected.len() && scalars.iter().zip(expected).all(
@@ -453,6 +484,33 @@ fn c_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn development_admits_bf16_but_refuses_either_explicit_compressed_phase() {
+        use cuteafd_core::{SparkReplyFormat as F, spark_reply::SparkReplyFormats};
+        for prefill in [None, Some(F::Bf16), Some(F::Fp8), Some(F::Nvfp4)] {
+            for decode in [None, Some(F::Bf16), Some(F::Fp8), Some(F::Nvfp4)] {
+                let formats = SparkReplyFormats { prefill, decode };
+                for codec in [F::Fp8, F::Nvfp4] {
+                    let requested = prefill == Some(codec) || decode == Some(codec);
+                    let error = admit_reply_export(formats, codec, "producer", false).err();
+                    assert_eq!(error.is_some(), requested);
+                    if let Some(error) = error { assert_eq!(error.export, "producer"); }
+                    assert!(admit_reply_export(formats, codec, "producer", true).is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_reply_export_is_typed_and_names_release_support() {
+        let name = "expert_reply_native_h4096_1";
+        let error: anyhow::Error = require_reply_export(name, false).unwrap_err().into();
+        assert_eq!(error.downcast_ref::<MissingReplyExport>().unwrap().export, name);
+        let message = error.to_string();
+        assert!(message.contains(name) && message.contains("release builds include"));
+        assert!(require_reply_export(name, true).is_ok());
+    }
 
     #[test]
     fn exported_glm_stage_manifest_passes_runtime_dispatch() {
@@ -500,6 +558,127 @@ mod tests {
             assert!(validate_glm_stage_entry(&wrong_name, entry).is_err(), "{}: name", spec.name);
         }
         assert_eq!(swiglu, 4);
+    }
+
+    #[test]
+    fn manifest_loader_accepts_all_nine_reply_exports_for_both_exlr8_families() {
+        use super::super::exlr8::KernelFamily;
+        let original: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/exlr8_grouped_programs_sm121.json")).unwrap();
+        let mut entries = Vec::new();
+        for family in [KernelFamily::Glm, KernelFamily::GlmFlash] {
+            let prefix = if family == KernelFamily::Glm { "exlr8" } else { "exlr8_glmf" };
+            let hidden = family.geometry().hidden;
+            let mut base = original["programs"].as_array().unwrap().clone();
+            if family == KernelFamily::GlmFlash {
+                for entry in &mut base {
+                    entry["name"] = entry["name"].as_str().unwrap().replacen("exlr8_", "exlr8_glmf_", 1).into();
+                    entry["geometry"]["hidden"] = hidden.into();
+                    entry["geometry"]["fc1_splits"] = 4.into();
+                    entry["geometry"]["swiglu_limit"] = 10.0.into();
+                    for pointer in entry["pointers"].as_array_mut().unwrap() {
+                        pointer["shape"] = pointer["shape"].as_str().unwrap()
+                            .replace("6144", "4096").replace(",6,", ",4,").into();
+                    }
+                    for name in ["fc1", "fc2"] {
+                        entry["scratch_bytes_at_capacity"][name] =
+                            (entry["scratch_bytes_at_capacity"][name].as_u64().unwrap() / 3 * 2).into();
+                    }
+                }
+            }
+            let mut core = base.iter().find(|e| e["name"].as_str().unwrap().ends_with("_grouped64")).unwrap().clone();
+            core["name"] = format!("{prefix}_a16_serving_core").into();
+            for key in ["group_rows", "fc2_partials"] { core["geometry"].as_object_mut().unwrap().remove(key); }
+            core["geometry"]["core_only"] = true.into();
+            core["geometry"]["serving_variant"] = "k1_k23_coalesced".into();
+            core["pointers"].as_array_mut().unwrap().truncate(13);
+            core["scalars"].as_array_mut().unwrap().truncate(2);
+            entries.push(core);
+            for format in [1, 2] {
+                let stride = if format == 1 { hidden * 33 / 32 } else { hidden * 9 / 16 };
+                entries.push(serde_json::json!({"name":format!("{prefix}_reply_{format}"),
+                    "capacity_rows":64,"scratch_bytes_at_capacity":{},
+                    "geometry":{"hidden":hidden,"top_k":8,"format":format,"row_bytes":stride,
+                        "variant":"k1_k23_coalesced"},
+                    "pointers":[
+                        {"name":"route_group_lane","dtype":"int32","shape":"[rows,8]","role":"in"},
+                        {"name":"route_weights","dtype":"float32","shape":"[rows,8]","role":"in"},
+                        {"name":"fc2","dtype":"float32","shape":"[fc2_scratch]","role":"in"},
+                        {"name":"signs_out","dtype":"int8","shape":format!("[{hidden}]"),"role":"in"},
+                        {"name":"output","dtype":"uint8","shape":format!("[rows,{stride}]"),"role":"out"},
+                        {"name":"group_count","dtype":"int32","shape":"[1]","role":"in"}],
+                    "scalars":[{"name":"rows","type":"int32"},{"name":"cta_limit","type":"int32"}]}));
+                for entry in &base {
+                    let mut reply = entry.clone();
+                    reply["name"] = format!("{}_reply{format}", entry["name"].as_str().unwrap()).into();
+                    reply["geometry"]["reply_format"] = format.into();
+                    reply["pointers"][11]["dtype"] = "uint8".into();
+                    reply["pointers"][11]["shape"] = format!("[rows,{stride}]").into();
+                    entries.push(reply);
+                }
+            }
+        }
+        assert_eq!(entries.len(), 18);
+        let root = std::path::PathBuf::from(std::env::var_os("CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR")
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+                .join(".cache/cuteafd/builds/manifest-loader").into_os_string()))
+            .join(format!("reply-manifest-{}", std::process::id()));
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        assert!(std::process::Command::new("python3").arg(repo.join("scripts/build/assert-build-filesystem.py"))
+            .arg(&root).status().unwrap().success());
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("PROGRAMS.json");
+        let source = root.join("mock.c");
+        let shared = root.join("mock.so");
+        let names = entries.iter().map(|e| format!("\"{}\"", e["name"].as_str().unwrap())).collect::<Vec<_>>().join(",");
+        let pointers = entries.iter().map(|e| e["pointers"].as_array().unwrap().len().to_string()).collect::<Vec<_>>().join(",");
+        let scalars = entries.iter().map(|e| e["scalars"].as_array().unwrap().len().to_string()).collect::<Vec<_>>().join(",");
+        std::fs::write(&source, format!(r#"
+#include <stdint.h>
+#include <string.h>
+struct Info {{ char name[64]; uint32_t pointers, scalars; char kinds[16]; }};
+static const char *names[] = {{{names}}};
+static const unsigned pointers[] = {{{pointers}}}, scalars[] = {{{scalars}}};
+int cuteafd_rdma_rc_endpoint_try_poll(void) {{ return 0; }}
+int cuteafd_set_expert_hidden(unsigned hidden) {{ return 0; }}
+unsigned cuteafd_dsv4_program_count(void) {{ return 18; }}
+int cuteafd_dsv4_program_info(unsigned i, struct Info *p) {{
+  if (i >= 18) return 1;
+  memset(p, 0, sizeof(*p)); strcpy(p->name, names[i]);
+  p->pointers = pointers[i]; p->scalars = scalars[i]; memset(p->kinds, 'i', scalars[i]); return 0;
+}}
+int cuteafd_dsv4_program_load(unsigned i) {{ return 0; }}
+int cuteafd_dsv4_program_launch(unsigned i, void **p, uint64_t *s, void *stream) {{ return 0; }}
+"#)).unwrap();
+        let output = std::process::Command::new("cc").args(["-shared", "-fPIC"])
+            .arg(&source).arg("-o").arg(&shared).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries})).unwrap()).unwrap();
+        // SAFETY: this test compiles the library above; its table functions only
+        // read static CPU data and no CUDA entry point is invoked.
+        let library = unsafe { NativeLibrary::load(&shared).unwrap() };
+        let loaded = library.programs().unwrap().with_manifest(&manifest).unwrap();
+        assert_eq!(loaded.names().count(), 18);
+        let missing = "expert_reply_native_h4096_1";
+        assert!(!loaded.contains(missing));
+        assert!(admit_reply_export(Default::default(), cuteafd_core::SparkReplyFormat::Fp8,
+            missing, loaded.contains(missing)).is_ok());
+        for formats in [
+            cuteafd_core::spark_reply::SparkReplyFormats { prefill: Some(cuteafd_core::SparkReplyFormat::Fp8), decode: None },
+            cuteafd_core::spark_reply::SparkReplyFormats { prefill: None, decode: Some(cuteafd_core::SparkReplyFormat::Fp8) },
+        ] {
+            let error = admit_reply_export(formats, cuteafd_core::SparkReplyFormat::Fp8,
+                missing, loaded.contains(missing)).unwrap_err();
+            assert_eq!(error.export, missing);
+            assert!(error.to_string().contains("release builds include"));
+        }
+
+        drop(loaded);
+        for entry in &mut entries { entry["geometry"]["reply_format"] = 99.into(); }
+        std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries})).unwrap()).unwrap();
+        assert!(library.programs().unwrap().with_manifest(&manifest).is_err());
+        drop(library);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

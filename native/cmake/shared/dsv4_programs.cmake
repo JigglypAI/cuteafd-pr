@@ -208,7 +208,7 @@ if(CUTEAFD_ENABLE_EXLR8_AOT)
     --exlr8-family "${exlr8_families}")
 endif()
 set(stamp "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs.stamp")
-file(GENERATE OUTPUT "${stamp}" CONTENT "${CUTEAFD_DSV4_EXPORT_ARGS}\n")
+file(GENERATE OUTPUT "${stamp}" CONTENT "${CUTEAFD_BUILD_KIND}|${CUTEAFD_DSV4_EXPORT_ARGS}\n")
 # The program list lives in the exporter; objects are collected into one
 # archive so CMake need not know each stem.
 set(CUTEAFD_DSV4_ARCHIVE "${CUTEAFD_DSV4_DIR}/libcuteafd_dsv4_programs.a")

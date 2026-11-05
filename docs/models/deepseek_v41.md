@@ -16,6 +16,11 @@ A core CuteAFD reference family. Releases are checked against this engine's own 
 
 **Starting configs** (v2.0.0 release cards, natural minimum and maximum; replace the
 placeholder Spark hosts and addresses): Official MXFP4 [min](../../examples/configs/deepseek-v41-mxfp4-min.config) · [max](../../examples/configs/deepseek-v41-mxfp4-max.config).
+Release-only limited-bandwidth showcases keep the same max topology and checkpoint:
+[FP8/FP8 replies](../../examples/configs/deepseek-v41-mxfp4-max-fp8-reply.config) and
+[NVFP4/NVFP4 replies](../../examples/configs/deepseek-v41-mxfp4-max-nvfp4-reply.config)
+(prefill/decode). The standard configs keep BF16 replies; development artifacts
+omit these optional combined compressed producers and reject explicit selection.
 Byte-identical StridedPLE storage: [min](../../examples/configs/v41-flash-strided-min.config) · [max](../../examples/configs/v41-flash-strided-max.config).
 Its U8 rows contain 256 FP8 weight bytes followed by eight UE8M0 scale bytes.
 Three row-range parts per layer form one shared mapped row space;

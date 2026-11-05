@@ -286,7 +286,8 @@ class ExampleConfigTest(unittest.TestCase):
         # covered by test_example_configs.py; this set is the V4.1 TP x EP layouts.
         self.assertEqual(
             sorted(path.name for path in EXAMPLES.glob("*.config")
-                   if not path.name.endswith(("-min.config", "-max.config"))),
+                   if not path.name.endswith(("-min.config", "-max.config", "-max-fp8-reply.config",
+                                              "-max-nvfp4-reply.config"))),
             sorted(expected),
         )
         for name, geometry in expected.items():

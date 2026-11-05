@@ -21,6 +21,30 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use crate::shared::memory::weight_arena::ReadyArena;
 
+pub(crate) fn validate_reply_formats(format: ExpertFormat,
+    replies: cuteafd_core::spark_reply::SparkReplyFormats) -> Result<()> {
+    ensure!(format != ExpertFormat::Nvfp4 || !replies.can_compress(),
+        "NVFP4-weight Spark packages support only BF16 replies; compressed prefill/decode replies are unsupported; select bf16 for both reply formats");
+    Ok(())
+}
+
+#[test]
+fn nvfp4_weights_reject_compressed_reply_selection_at_startup() {
+    use cuteafd_core::{spark_reply::SparkReplyFormats, SparkReplyFormat::*};
+    use cuteafd_loader::formats::fp8_experts::ExpertFormat;
+    for prefill in [None, Some(Bf16), Some(Fp8), Some(Nvfp4)] {
+        for decode in [None, Some(Bf16), Some(Fp8), Some(Nvfp4)] {
+            let replies = SparkReplyFormats { prefill, decode };
+            let result = validate_reply_formats(ExpertFormat::Nvfp4, replies);
+            assert_eq!(result.is_err(), replies.can_compress());
+            if let Err(error) = result { assert!(error.to_string().contains("only BF16 replies")); }
+            for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4, ExpertFormat::Bf16] {
+                validate_reply_formats(format, replies).unwrap();
+            }
+        }
+    }
+}
+
 pub(super) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8ExpertTensors, layers: &[usize],
     tp: usize, rank: usize, slicing: Slicing) -> Result<()> {
     let shape = tensors.shape();
@@ -64,7 +88,21 @@ pub(super) fn package_metadata(directory: &Path, tensors: &Fp8ExpertTensors, lay
     let metadata = unsafe { Fp8MoeMetadata::read(directory) }
         .with_context(|| format!("expert package {}", directory.display()))?;
     validate_checkpoint_contract(&metadata.info, tensors, layers, tp, rank, slicing)?;
+
     Ok(metadata)
+}
+
+pub(super) fn validate_reply_exports(directory: &Path, format: ExpertFormat) -> Result<()> {
+    if cuteafd_core::spark_reply::requested().can_compress() {
+        validate_reply_formats(format, cuteafd_core::spark_reply::requested())?;
+        let root = directory.parent().context("expert package has no root")?;
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+        let layout = directory.file_name().and_then(|name| name.to_str()).context("expert layout name")?;
+        let available = manifest["layouts"][layout]["reply_producers"].as_array().is_some_and(|names| !names.is_empty());
+        cuteafd_ffi::programs::require_reply_export(
+            &format!("{}/libcuteafd_fp8moe.so:core-only producers", directory.display()), available)?;
+    }
+    Ok(())
 }
 
 fn traffic_contract(contract: cuteafd_ffi::fp8_moe::Fp8MoeTrafficContract)
@@ -848,6 +886,27 @@ impl<'a, W: std::borrow::Borrow<Fp8Weights<'a>>> Fp8Experts<'a, W> {
         // SAFETY: caller retains all operands and the owner retains scratch/weights.
         unsafe { self.module.launch_segments(&[input, ids, weights, w1, s1, w3, s3, w2, s2, output,
             self.scratch.buffer.ptr], rows, stream) }
+    }
+
+    /// Execute the same selected arithmetic without its BF16 token combine.
+    /// # Safety
+    /// All inputs and the exclusive output remain live through the epilogue fence.
+    pub(crate) unsafe fn run_reply(&self, reply: &super::reply::Fp8Reply<'_>, index: usize,
+        rows: usize, pointers: [cuteafd_ffi::CuteafdDeviceBuffer; 4], bf16: bool, segmented: bool,
+        dtype: cuteafd_transport::ExpertV2Dtype, stream: *mut c_void) -> Result<()> {
+        let module = if bf16 && self.wire_input() {
+            self.bf16_module.as_ref().context("missing BF16-input reply package")?
+        } else { &self.module };
+        let sources = module.reply_sources(self.scratch.buffer, rows, segmented)?;
+        let [input, ids, weights, output] = pointers;
+        let [w1, s1, w3, s3, w2, s2] = self.layers.get(index).context("reply layer outside weights")?.pointers();
+        // SAFETY: same retained scratch/weights as run; the consuming epilogue
+        // immediately follows the core on this owner stream, before scratch reuse.
+        unsafe {
+            module.launch_core(&[input.ptr, ids.ptr, weights.ptr, w1, s1, w3, s3, w2, s2, output.ptr,
+                self.scratch.buffer.ptr], rows, segmented, stream)?;
+            reply.launch(dtype, sources, weights, output, rows, segmented, stream)
+        }
     }
 
     /// `run` over BF16 input rows through the BF16-input package.

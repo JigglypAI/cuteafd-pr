@@ -58,6 +58,9 @@ pub(crate) fn require_supported(
     topology: Option<SparkTopology>,
     catalog: &OfficialV41Catalog,
 ) -> Result<()> {
+    if let Some(tensors) = catalog.fp8() {
+        super::experts::fp8::validate_reply_formats(tensors.format(), cuteafd_core::spark_reply::requested())?;
+    }
     if let Some(topology) = topology {
         ensure!(catalog.fp8().is_none(),
             "generic expert programs require canonical Spark wire");

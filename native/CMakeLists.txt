@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.24)
 project(cuteafd_native LANGUAGES C CXX)
 
+# Internal script identity, not CMAKE_BUILD_TYPE (WIP also optimizes kernels).
+if(NOT DEFINED CUTEAFD_BUILD_KIND)
+  set(CUTEAFD_BUILD_KIND "development")
+endif()
+set(CUTEAFD_BUILD_KIND "${CUTEAFD_BUILD_KIND}" CACHE INTERNAL "Artifact build identity")
+if(NOT CUTEAFD_BUILD_KIND MATCHES "^(development|release)$")
+  message(FATAL_ERROR "Invalid internal artifact build identity")
+endif()
+
 # Read target and drafter row budgets from the same source used by Rust.
 set(CUTEAFD_V41_CAPACITY_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../rust/crates/cuteafd-core/src/dspark_verify.rs")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CUTEAFD_V41_CAPACITY_SOURCE}")
@@ -303,6 +312,7 @@ if(CUTEAFD_BUILD_SPARKINFER_AOT)
     --lock "${CUTEAFD_SPARKINFER_LOCK_FILE}"
   )
   set(CUTEAFD_SPARKINFER_PYTHON_ENV
+    "CUTEAFD_BUILD_KIND=${CUTEAFD_BUILD_KIND}"
     "CUTEAFD_SPARKINFER_SOURCE_DIR=${CUTEAFD_SPARKINFER_SOURCE_DIR}"
     "CUTEAFD_SPARKINFER_LOCK_FILE=${CUTEAFD_SPARKINFER_LOCK_FILE}"
     # Persisted objects are executable-only ExternalBinaryModules. AOT export

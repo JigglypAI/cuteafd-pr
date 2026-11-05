@@ -517,3 +517,28 @@ def test_shared_input_staging_can_precede_explicit_copy(tmp_path):
     launcher_sandbox.copy_input(REPO / 'scripts/lib/checkpoint-family.py', path)
     assert path.read_bytes() == other.read_bytes() == (REPO / 'scripts/lib/checkpoint-family.py').read_bytes()
     assert path.stat().st_ino == other.stat().st_ino
+
+
+@pytest.mark.parametrize("matrix", ["release-smoke.example.json", "release-smoke-v4.json"])
+def test_release_matrix_showcases_both_compressed_v41_reply_formats(matrix):
+    document = json.loads((REPO / "scripts/bench" / matrix).read_text())
+    base = next(entry for entry in document["entries"] if entry["name"] == "v41-flash-max")
+    assert "SPARK_PREFILL_REPLY_FORMAT" not in base["set"]
+    assert "SPARK_DECODE_REPLY_FORMAT" not in base["set"]
+    assert not document["defaults"].get("run_args")
+    for codec in ("fp8", "nvfp4"):
+        entry = next(entry for entry in document["entries"] if entry["name"] == f"v41-flash-max-{codec}-reply")
+        assert entry["gpus"] == base["gpus"] and entry["sparks"] == base["sparks"]
+        assert not entry.get("run_args")
+        assert entry["set"]["SPARK_PREFILL_REPLY_FORMAT"] == codec
+        assert entry["set"]["SPARK_DECODE_REPLY_FORMAT"] == codec
+        def config_values(path):
+            return dict(line.split("=", 1) for line in path.read_text().splitlines()
+                        if line and not line.startswith("#"))
+
+        config = config_values(REPO / entry["config"])
+        baseline = config_values(REPO / base["config"])
+        assert config == {**baseline, "SPARK_PREFILL_REPLY_FORMAT": codec,
+                          "SPARK_DECODE_REPLY_FORMAT": codec}
+        assert config["COORDINATOR_DOCKER_INFERENCE"].startswith("ghcr.io/")
+        assert config["SPARK_EXPERT_DOCKER_INFERENCE"].startswith("ghcr.io/")

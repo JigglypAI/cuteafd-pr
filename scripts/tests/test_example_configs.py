@@ -18,7 +18,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES = ROOT / "examples" / "configs"
-STARTING = re.compile(r"^(?P<model>[a-z0-9.-]+)-(?P<profile>min|max)\.config$")
+STARTING = re.compile(r"^(?P<model>[a-z0-9.-]+)-(?P<profile>min|max)(?:-(?:fp8|nvfp4)-reply)?\.config$")
 TP_EP = {"tp2ep2-native.config", "tp2ep3-native.config", "tp3ep1-native.config",
          "tp3ep2-native.config", "tp4ep1-explicit-native.config", "tp6ep1-native.config"}
 # WIP qualification configs for families without a release card yet (#273, #274):
@@ -235,6 +235,7 @@ def test_one_starting_config_per_release_card() -> None:
         "glm53-flash-tr3", "glm53-flash-exlr8-k4", "mimo-v26-flash-mxfp4", "mimo-v26-pro-mxfp4") for profile in ("min", "max")}
     # Qwen fits one RTX: the 2x RTX column is n/a, so only min exists.
     expected |= {"qwen38-exl3-min.config", "qwen38-nvfp4-min.config"}
+    expected |= {f"deepseek-v41-mxfp4-max-{codec}-reply.config" for codec in ("fp8", "nvfp4")}
     assert names == expected
     for path in starting_configs():
         assert STARTING.match(path.name), path.name
@@ -244,7 +245,7 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
     matrix = json.loads((ROOT / "scripts/bench/release-smoke.example.json").read_text())
     assert matrix["profile"] == "smoke"
     entries = matrix["entries"]
-    assert len(entries) == 28
+    assert len(entries) == 30
     assert len({entry["name"] for entry in entries}) == len(entries)
     defaults = matrix["defaults"]["set"]
     stale = {"CONCURRENCY", "MAX_CONTEXT_TOKENS", "HOST_CACHE_BYTES", "BENCH_SIMULATED",
