@@ -11,7 +11,9 @@ serve instead.
 Status: under qualification. The plan, the coordinator engine on one RTX or a
 head-split pair, the Spark expert path, RTX onboarding, the prefix cache, the
 chat encoding with constrained tool calls and both DFlash2 drafters are in
-place; serving is text only until the bundled towers are bound (#936).
+place. The starting configs also serve the checkpoint's bundled vision and
+PCM audio towers by default; qualification and caveats are recorded below
+and on #923.
 
 ## Architecture
 
@@ -86,11 +88,14 @@ transformers on the goldens). The model replies in recipient-addressed
 messages: `to=self` is private reasoning, `to=commentary` and `to=user` are
 visible content, any other recipient is a tool call in an
 `<atem:function_calls>` block. `reasoning_effort` maps onto the template's
-`low`/`medium`/`high`/`xhigh` (`minimal` to low, `max` to xhigh); turning
-thinking off is refused, as the template always reasons. Strict or required
-tool calls, tool-decoding assistance and structured `response_format` run
-under a native grammar (`muse_tool_schema`): reasoning first, then the calls
-or a `to=user` answer in the requested format.
+`low`/`medium`/`high`/`xhigh` (`minimal` to low, `max` to xhigh). Thinking
+off pre-fills the final `to=user` recipient, skips private reasoning and
+ignores reasoning effort; requests with tools are refused in this mode.
+With thinking on, strict or required tool calls, tool-decoding assistance
+and structured `response_format` run under a native grammar
+(`muse_tool_schema`): reasoning first, then the calls or a `to=user` answer
+in the requested format. Thinking-off structured output uses the ordinary
+response grammar directly on the final answer.
 
 ## Layouts
 
