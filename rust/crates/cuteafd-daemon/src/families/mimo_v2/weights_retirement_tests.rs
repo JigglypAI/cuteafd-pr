@@ -34,6 +34,74 @@ fn count(events: &str, tag: char) -> usize { events.chars().filter(|&c| c == tag
 
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn native_fp8_projections_record_without_reads_and_replay_exact_bytes() -> Result<()> {
+    use crate::shared::{experts::rtx::dense, memory::device::Device};
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    fixture.immediate_copies(&library)?;
+    for device in 0..2 { fixture.configure_memory(&library, device, 1 << 30)?; }
+    for (rows, grid_rows) in [(256usize, 2usize), (384, 4)] {
+        let cols = 512;
+        let checkpoint = checkpoint(&fixture, &[("weight", DType::F8E4M3, &[rows, cols]),
+            ("weight_scale_inv", DType::F32, &[grid_rows, cols / 128])])?;
+        let values = (0..rows * cols).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        let grid = (0..grid_rows * (cols / 128)).map(|i| f32::from_bits(0x3e800000 + i as u32 * 1024))
+            .collect::<Vec<_>>();
+        let mut payload = values.clone();
+        payload.extend(f32_bytes(&grid));
+        let path = checkpoint.snapshot.join("weights.bin");
+        let formats = BTreeMap::new();
+        for ranks in [1, 2] {
+            for kmajor_scale in [false, true] {
+                for pushing in [false, true] {
+                    std::fs::write(&path, if pushing { &[][..] } else { &payload })?;
+                    let load = std::rc::Rc::new(if pushing { dense::DenseLoad::push(&library) }
+                        else { dense::DenseLoad::mount(&library) });
+                    let planning = MimoLoader { dense: load.clone(), ..loader(&library, &checkpoint, &formats) };
+                    let operands = planning.fp8_projection("weight", ranks, kmajor_scale)?;
+                    if pushing {
+                        let records = load.sink.as_ref().unwrap().take_all();
+                        assert!(records.steps.is_empty());
+                        assert_eq!(records.operands.len(), 2 * ranks);
+                        assert_eq!(records.finishes.len(), ranks);
+                        std::fs::write(&path, &payload)?;
+                        let sockets = tempfile::tempdir_in(fixture.directory())?;
+                        for rank in 0..ranks {
+                            crate::shared::experts::rtx::push::tests::receive_pushed(
+                                Device { library: &library, id: rank as i32 }, None, &checkpoint.snapshot,
+                                sockets.path(), &records, None, 0, rank)?;
+                        }
+                    }
+                    planning.release_transient();
+                    for (rank, (q, scale, kscale)) in operands.iter().enumerate() {
+                        let width = cols / ranks;
+                        let expected = crate::shared::peer_split::slice_2d(&values, rows, cols, 1, Axis::Cols, rank, ranks);
+                        let mut actual = vec![0; q.buffer.bytes];
+                        library.copy_d2h(&mut actual, q.buffer)?;
+                        assert_eq!(actual, expected);
+                        let index = scale_rows("weight", rows, grid_rows)?;
+                        let row_scales = index.iter().flat_map(|&r|
+                            grid[r * (cols / 128) + rank * (width / 128)..r * (cols / 128) + (rank + 1) * (width / 128)]
+                                .iter().copied()).collect::<Vec<_>>();
+                        let mut actual = vec![0; scale.buffer.bytes];
+                        library.copy_d2h(&mut actual, scale.buffer)?;
+                        assert_eq!(actual, f32_bytes(&row_scales));
+                        if let Some(kscale) = kscale {
+                            let mut actual = vec![0; kscale.buffer.bytes];
+                            library.copy_d2h(&mut actual, kscale.buffer)?;
+                            assert_eq!(actual, kmajor(&row_scales, width / 128));
+                        }
+                        assert_eq!(kscale.is_some(), kmajor_scale);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn predictor_and_embedding_record_before_commit_and_replay_mount_bytes() -> Result<()> {
     use crate::shared::{experts::rtx::dense, memory::device::Device,
         token_io::{EmbedPlacement, EmbedSource, TokenEmbedding}};

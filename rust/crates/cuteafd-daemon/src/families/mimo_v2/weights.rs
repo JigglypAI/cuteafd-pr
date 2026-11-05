@@ -23,7 +23,7 @@
 //! products, a BF16 one (V2.6 Pro) is `w_router` as stored.
 use crate::shared::memory::DeviceAllocation;
 use super::head::MimoHead;
-use cuteafd_loader::families::mimo_v2::projection::{MimoProjectionLayout, MimoProjectionRepresentation, MIMO_PROJECTION_STAGING_ROWS};
+use cuteafd_loader::families::mimo_v2::projection::{MimoProjectionLayout, MimoProjectionRepresentation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -32,7 +32,7 @@ use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
-use crate::shared::peer_split::{slice_2d, Axis, RankDevice};
+use crate::shared::peer_split::{Axis, RankDevice};
 
 #[cfg(test)]
 #[path = "weights_retirement_tests.rs"]
@@ -161,6 +161,7 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 }
 
 /// Row-major `[N, KB]` FP32 scales as K-block-major `[KB, N]` bytes.
+#[cfg(test)]
 fn kmajor(row_scales: &[f32], k_blocks: usize) -> Vec<u8> {
     let n = row_scales.len() / k_blocks;
     let mut out = vec![0u8; row_scales.len() * 4];
@@ -218,85 +219,45 @@ impl<'a> MimoLoader<'a> {
         if self.tensor(name)?.meta.dtype == DType::Bf16 {
             return self.fp8_projection_bf16(name, ranks, kmajor_scale);
         }
-        ensure!(!self.dense.pushing() && !crate::shared::experts::rtx::dense::is_recording(),
-            "{name}: FP8-source projections load through the mount");
-        let (bytes, dtype, shape) = self.raw(name)?;
-        ensure!(shape.len() == 2 && shape[1] % (ranks *128) == 0,
-            "{name}: FP8-only projection requires [N,K] with K divisible by128 per rank");
-        ensure!(matches!(dtype, DType::Bf16 | DType::F8E4M3),
-            "{name}: FP8-only projection needs BF16 or E4M3 checkpoint values, found {dtype:?}");
-        let (rows, cols) = (shape[0], shape[1] /ranks);
+        let tensor = self.tensor(name)?;
+        let shape = &tensor.meta.shape;
+        ensure!(ranks > 0 && shape.len() == 2 && shape[1] % (ranks * 128) == 0,
+            "{name}: FP8-only projection requires [N,K] with K divisible by 128 per rank");
+        ensure!(tensor.meta.dtype == DType::F8E4M3,
+            "{name}: FP8-only projection needs BF16 or E4M3 checkpoint values, found {:?}", tensor.meta.dtype);
+        let (rows, cols) = (shape[0], shape[1] / ranks);
         let layout = MimoProjectionLayout::new(rows as u64, cols as u64, MimoProjectionRepresentation::Fp8,
             if kmajor_scale { 2 } else { 1 })?;
-        ensure!(bytes.len() as u64 == layout.values.checked_mul(ranks as u64)
-            .and_then(|n| n.checked_mul(if dtype == DType::Bf16 { 2 } else { 1 })).context("projection source extent overflow")?,
+        ensure!(tensor.meta.byte_length == layout.values.checked_mul(ranks as u64)
+            .context("projection source extent overflow")?,
             "{name}: checkpoint projection bytes disagree with its shape");
-        let grid = if dtype == DType::F8E4M3 {
-            let (bytes, dtype, shape) = self.raw(&format!("{name}_scale_inv"))?;
-            ensure!(dtype == DType::F32 && shape.len() == 2 && shape[1] == cols /128 *ranks,
-                "{name}: FP8-only projection needs checkpoint FP32 block scales");
-            ensure!(bytes.len() == shape[0] *shape[1] *4, "{name}: checkpoint scale bytes disagree with its grid");
-            Some((bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>(),
-                scale_rows(name, rows, shape[0])?))
-        } else { None };
-        (0..ranks).map(|rank| self.on_rank(rank, |stream| {
-            let values = DeviceAllocation::new(self.library, usize::try_from(layout.values)?)?;
-            let scales = DeviceAllocation::new(self.library, rows * (cols /128) *4)?;
-            let region = |buffer: CuteafdDeviceBuffer, offset: usize, count: usize| CuteafdDeviceBuffer {
-                ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes: count, ..buffer
-            };
-            let row_scales = if let Some((grid, grid_rows)) = &grid {
-                let values_host = slice_2d(&bytes, rows, shape[1], 1, Axis::Cols, rank, ranks);
-                self.library.copy_h2d(values.buffer, &values_host)?;
-                let kb = cols /128;
-                let row_scales: Vec<f32> = grid_rows.iter().flat_map(|&r|
-                    grid[r *kb *ranks + rank *kb..r *kb *ranks + (rank +1) *kb].iter().copied()).collect();
-                self.library.copy_h2d(scales.buffer, &f32_bytes(&row_scales))?;
-                row_scales
-            } else {
-                let staging = DeviceAllocation::new(self.library, usize::try_from(layout.max_load_staging)?)?;
-                let queued = (|| -> Result<()> {
-                    let mut block = vec![0u8; staging.buffer.bytes];
-                    for first in (0..rows).step_by(MIMO_PROJECTION_STAGING_ROWS as usize) {
-                        let n = (MIMO_PROJECTION_STAGING_ROWS as usize).min(rows -first);
-                        for r in 0..n {
-                            let offset = ((first +r) *shape[1] +rank *cols) *2;
-                            block[r *cols *2..(r +1) *cols *2].copy_from_slice(&bytes[offset..offset +cols *2]);
-                        }
-                        self.library.copy_h2d(region(staging.buffer, 0, n *cols *2), &block[..n *cols *2])?;
-                        // SAFETY: live source block and checked destinations;
-                        // every block drains before the source buffer is reused.
-                        unsafe {
-                            self.library.fp8_quant_rule(staging.buffer.ptr,
-                                region(values.buffer, first *cols, n *cols).ptr,
-                                region(scales.buffer, first *cols /128 *4, n *cols /128 *4).ptr,
-                                n, cols, true, self.fp8_scales.code(), stream)?;
-                            self.library.cuda_stream_synchronize(stream)?;
-                        }
-                    }
-                    Ok(())
-                })();
-                // SAFETY: all queued sources/destinations are still owned here,
-                // including when a native launch returned an error.
-                if let Err(drain) = unsafe { self.library.cuda_stream_synchronize(stream) } {
-                    self.library.quarantine_module_after_failed_drain();
-                    std::mem::forget(staging);
-                    std::mem::forget(values);
-                    std::mem::forget(scales);
-                    return Err(queued.err().unwrap_or_else(|| anyhow::anyhow!("FP8-only projection completion failed"))
-                        .context(format!("FP8-only projection owners and native module quarantined after failed packing drain: {drain}")));
-                }
-                queued?;
-                drop(staging);
-                if kmajor_scale {
-                    let mut bytes = vec![0u8; scales.buffer.bytes];
-                    self.library.copy_d2h(&mut bytes, scales.buffer)?;
-                    bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
-                } else { Vec::new() }
-            };
-            let kscale = if kmajor_scale { Some(self.upload(&kmajor(&row_scales, cols /128))?) } else { None };
-            Ok((values, scales, kscale))
-        })).collect()
+        let scale_name = format!("{name}_scale_inv");
+        let grid = self.tensor(&scale_name)?;
+        ensure!(grid.meta.dtype == DType::F32 && grid.meta.shape.len() == 2
+            && grid.meta.shape[1] == shape[1] / 128,
+            "{name}: FP8-only projection needs checkpoint FP32 block scales");
+        ensure!(grid.meta.byte_length == (grid.meta.shape[0] * grid.meta.shape[1] * 4) as u64,
+            "{name}: checkpoint scale bytes disagree with its grid");
+        let index = std::sync::Arc::new(scale_rows(name, rows, grid.meta.shape[0])?.into_iter()
+            .map(u32::try_from).collect::<std::result::Result<Vec<_>, _>>()?);
+        let grid_cols = grid.meta.shape[1];
+        (0..ranks).map(|rank| {
+            let values = self.landed(rank, vec![(self.rect(name, None,
+                Some(rank * cols..(rank + 1) * cols))?, 0)], usize::try_from(layout.values)?, &[])?;
+            let grid = self.landed(rank, vec![(self.rect(&scale_name, None, None)?, 0)],
+                usize::try_from(grid.meta.byte_length)?, &[])?;
+            let (_, stream) = self.rank_device(rank)?;
+            let (scale, kscale) = self.on_rank(rank, |_| Ok((
+                DeviceAllocation::new(self.library, rows * (cols / 128) * 4)?,
+                kmajor_scale.then(|| DeviceAllocation::new(self.library, rows * (cols / 128) * 4)).transpose()?)))?;
+            let grid_buffer = grid.buffer;
+            self.transient.borrow_mut().push(grid);
+            self.on_rank(rank, |_| self.dense.finish(crate::shared::experts::rtx::dense::Finish::ScaleGather {
+                grid: grid_buffer, index: index.clone(), kb: cols / 128, grid_cols, col0: rank * (cols / 128),
+                row_major: Some(scale.buffer), k_major: kscale.as_ref().map(|a| a.buffer),
+            }, stream))?;
+            Ok((values, scale, kscale))
+        }).collect()
     }
 
     /// [`Self::fp8_projection`] of a BF16 checkpoint weight: each rank's
