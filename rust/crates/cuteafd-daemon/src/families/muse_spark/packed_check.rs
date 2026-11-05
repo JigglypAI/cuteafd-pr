@@ -6,6 +6,8 @@ use cuteafd_engine::prefix::{MarkSlot, PrefixFamily, RefPagePool};
 use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
 use sha2::{Digest, Sha256};
 
+const CONTINUATION_ROWS: usize = 16;
+
 #[derive(Debug, clap::Args)]
 pub(crate) struct GoldenArgs {
     #[command(flatten)] pub engine: ServeArgs,
@@ -43,19 +45,21 @@ fn qualify(mut args: GoldenArgs) -> Result<()> {
         let (family, mut cache) = backend.prefix_cache(&args.engine.prefix, slots)?;
         let prompts = packed_check::prompts(&selected[0].tokens, members)?;
         let mut allocate = |lengths: Vec<usize>, first_slot: usize| -> Result<Vec<Placement>> {
-            lengths.into_iter().enumerate().map(|(i, len)| Ok(cache.admit_cold(&family, len, len + 1,
+            lengths.into_iter().enumerate().map(|(i, len)| Ok(cache.admit_cold(&family, len, len + CONTINUATION_ROWS + 1,
                 |pages| Placement { pages, slot: first_slot + i, ..Default::default() })?.placement)).collect()
         };
         let packed = allocate(prompts.iter().map(Vec::len).collect(), 0)?;
         let alone = allocate(prompts.iter().map(Vec::len).collect(), members)?;
         let limits = backend.checked_packed_limits()?.context("Muse packed limits")?;
         let neural = args.engine.draft.is_some();
+        let continuation = selected[0].tokens.iter().copied().take(CONTINUATION_ROWS).collect::<Vec<_>>();
+        ensure!(continuation.len() == CONTINUATION_ROWS, "Muse cache check needs 16 continuation tokens");
         ensure!(family.slots() >= 2, "Muse packing restore gate requires two admitted prefix mark slots");
         packed_check::check::<_, DraftState>(backend.library(), &prompts, packed, alone, limits, neural,
             args.engine.prefill_packing == PackingMode::Exact,
             |s| singleton(backend, s, cache.pool()),
             |s, callback| backend.prefill_packed(s, cache.pool(), callback),
-            |p| snapshot_and_restore(backend, &family, p, 2 * members))?;
+            |p| snapshot_and_restore(backend, &family, p, 2 * members, cache.pool(), &continuation))?;
         if args.engine.prefill_packing == PackingMode::Exact {
             println!("exact Muse packing fails closed on EXL3 at this pin: {}", backend.packed_fallback_reason);
             return Ok(());
@@ -115,10 +119,10 @@ fn view(buffer: Buffer, offset: usize, bytes: usize) -> Buffer {
     Buffer { ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..buffer }
 }
 
-/// Compare initialized full records and whole rings, and round-trip each packed
-/// prompt's exact visible state through a mark into a different private slot.
+/// Compare each path's live continuation with its own restored prompt-end state.
+/// Packed/singleton arithmetic drift remains the shared pooled gate's concern.
 fn snapshot_and_restore(backend: &MuseBackend<'_, '_>, family: &super::prefix::MusePrefix<'_, '_>,
-    placement: &Placement, restore_slot: usize) -> Result<Vec<u8>> {
+    placement: &Placement, restore_slot: usize, pool: &RefPagePool, continuation: &[u32]) -> Result<Vec<u8>> {
     let boxed = |error: cuteafd_engine::prefix::BoxError| anyhow::anyhow!(error.to_string());
     backend.diagnostic_sync()?;
     family.capture(MarkSlot(0), placement, placement.len).map_err(boxed)?;
@@ -165,7 +169,54 @@ fn snapshot_and_restore(backend: &MuseBackend<'_, '_>, family: &super::prefix::M
             Ok(())
         })?;
     }
-    println!("Muse prompt-end restore: slot {} -> {}, {} rows, full-page ownership and visible SWA marks byte-identical",
-        placement.slot, restore_slot, placement.len);
+    // Preserve prompt-end evidence before either continuation mutates rings/pages.
+    // Full pages alias only the saved prefix; each replay overwrites its own new rows
+    // before attention reads them, including a partial tail page.
+    let mut live = placement.clone();
+    let live_bits = continuation_bits(backend, &mut live, continuation, pool)?;
+    backend.diagnostic_sync()?;
+    restored.len = 0;
+    family.restore(Some(MarkSlot(0)), &mut restored, placement.len).map_err(boxed)?;
+    family.drain().map_err(boxed)?;
+    let restored_bits = continuation_bits(backend, &mut restored, continuation, pool)?;
+    ensure!(same_logit_bits(&live_bits, &restored_bits),
+        "Muse cache continuation differs from its own live prefill: slot {} -> {}, {} rows, {} decode tokens",
+        placement.slot, restore_slot, placement.len, continuation.len());
+    println!("Muse prompt-end restore: slot {} -> {}, {} rows, visible SWA marks and {}-token continuation logits byte-identical",
+        placement.slot, restore_slot, placement.len, continuation.len());
     Ok(snapshot)
+}
+
+fn continuation_bits(backend: &MuseBackend<'_, '_>, placement: &mut Placement, tokens: &[u32], pool: &RefPagePool)
+    -> Result<Vec<u32>> {
+    let mut bits = Vec::new();
+    for token in tokens {
+        let logits = backend.verify_device(&mut [(&mut *placement, std::slice::from_ref(token))], false, pool)?
+            .context("Muse cache continuation produced no logits")?.row_host(backend.library(), 0)?;
+        bits.extend(logits.iter().map(|value| value.to_bits()));
+    }
+    Ok(bits)
+}
+
+fn same_logit_bits(live: &[u32], restored: &[u32]) -> bool {
+    !live.is_empty() && live == restored
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_logit_bits;
+
+    #[test]
+    fn cache_continuation_checks_every_float_bit_and_row() {
+        let bits = [1.0f32.to_bits(), 0.0f32.to_bits(), (-3.0f32).to_bits()];
+        assert!(same_logit_bits(&bits, &bits));
+        for at in 0..bits.len() {
+            let mut changed = bits;
+            changed[at] ^= 1;
+            assert!(!same_logit_bits(&bits, &changed));
+        }
+        assert!(!same_logit_bits(&[0.0f32.to_bits()], &[(-0.0f32).to_bits()]));
+        assert!(!same_logit_bits(&bits, &bits[..2]));
+        assert!(!same_logit_bits(&[], &[]));
+    }
 }
