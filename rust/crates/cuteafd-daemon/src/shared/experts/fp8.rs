@@ -84,7 +84,21 @@ pub(super) fn package_metadata(directory: &Path, tensors: &Fp8ExpertTensors, lay
     let metadata = unsafe { Fp8MoeMetadata::read(directory) }
         .with_context(|| format!("expert package {}", directory.display()))?;
     validate_checkpoint_contract(&metadata.info, tensors, layers, tp, rank, slicing)?;
+
     Ok(metadata)
+}
+
+pub(super) fn validate_reply_exports(directory: &Path, format: ExpertFormat) -> Result<()> {
+    if cuteafd_core::spark_reply::requested().can_compress() {
+        validate_reply_formats(format, cuteafd_core::spark_reply::requested())?;
+        let root = directory.parent().context("expert package has no root")?;
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+        let layout = directory.file_name().and_then(|name| name.to_str()).context("expert layout name")?;
+        let available = manifest["layouts"][layout]["reply_producers"].as_array().is_some_and(|names| !names.is_empty());
+        cuteafd_ffi::programs::require_reply_export(
+            &format!("{}/libcuteafd_fp8moe.so:core-only producers", directory.display()), available)?;
+    }
+    Ok(())
 }
 
 fn traffic_contract(contract: cuteafd_ffi::fp8_moe::Fp8MoeTrafficContract)

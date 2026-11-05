@@ -98,9 +98,9 @@ FORMS = ("auto", "w8a16", "w8a8")
 SEGMENT_MAX_ROWS = 4 * 4096
 
 
-def core_variants(role: str, weights: str) -> tuple[bool, ...]:
-    """Deprecated NVFP4-weight packages retain only their BF16 reply path."""
-    return (False, True) if role == "spark" and weights != "nvfp4" else (False,)
+def core_variants(role: str, weights: str, build_kind: str = "development") -> tuple[bool, ...]:
+    """Only release packages include optional compressed-reply producers."""
+    return (False, True) if build_kind == "release" and role == "spark" and weights != "nvfp4" else (False,)
 
 
 def digest(path: Path) -> str:
@@ -582,7 +582,8 @@ def build(args: argparse.Namespace) -> None:
             # Preserve a distinct bridge (and its TP info word) per destination.
             compile_key = (g.slice, g.kind, wire, tuple(capacities), g.hidden, g.experts, g.top_k,
                            g.activation, g.projection, g.swiglu_limit, ABI_VERSION,
-                           _pinned_sparkinfer.REVISION, props.major, props.minor, props.multi_processor_count)
+                           _pinned_sparkinfer.REVISION, props.major, props.minor, props.multi_processor_count,
+                           os.environ.get("CUTEAFD_BUILD_KIND", "development"))
             identity = hashlib.sha256(json.dumps(compile_key).encode()).hexdigest()[:20]
             reused = compiled_widths.get(compile_key)
             raw = args.build_dir / args.geometry / f"width{g.slice}-{identity}"
@@ -598,7 +599,7 @@ def build(args: argparse.Namespace) -> None:
             if args.role == "spark" and wire and g.weights in ("fp8", "mxfp4"):
                 exports += [(SEGMENT_MAX_ROWS, form, True) for form in FORMS]
             exports = [(c, f, s, core) for c, f, s in exports
-                       for core in core_variants(args.role, g.weights)]
+                       for core in core_variants(args.role, g.weights, os.environ.get("CUTEAFD_BUILD_KIND", "development"))]
             for capacity, form, segmented, core_only in ([] if reused else exports):
                 stem = (f"fp8moe_{args.geometry}_w{g.slice}_m{capacity}"
                         f"{'' if form == 'auto' else '_' + form}{'_segments' if segmented else ''}{'_core' if core_only else ''}")
@@ -655,6 +656,7 @@ def build(args: argparse.Namespace) -> None:
                                           **p["weight_read_grouping"]} for p in programs if not p["segmented"] and not p.get("core_only", False)],
                 "segments": [{k: p[k] for k in ("capacity", "form", "minimum_rows", "act_row_bytes")}
                              for p in programs if p["segmented"] and not p.get("core_only", False)],
+                "reply_producers": [p["stem"] for p in programs if p.get("core_only", False)],
                 "capacities": capacity_scratch(programs),
                 "prefill_forms": {form: [p["capacity"] for p in programs if p["form"] == form and not p["segmented"] and not p.get("core_only", False)]
                                   for form in FORMS[1:]}}

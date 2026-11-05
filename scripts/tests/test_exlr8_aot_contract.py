@@ -185,3 +185,43 @@ def test_no_changes_to_existing_export_builders():
     spec.loader.exec_module(module)
     assert "exlr8" not in module.GEOMETRIES
     assert "exlr8" not in module.EXL3_GEOMETRIES
+
+
+@pytest.mark.parametrize("build_kind", ["development", "release"])
+def test_engine_build_kind_selects_reply_producers(monkeypatch, build_kind):
+    import os
+    tree = ast.parse((ROOT / "python/tools/aot/export_b12x_exlr8_aot.py").read_text())
+    builder = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "programs")
+    builder.body = [n for n in builder.body if not isinstance(n, ast.ImportFrom)]
+    names = ["a16_serving", "group", "a16_grouped", "a8_grouped", "grouped_group", "a16_grouped64",
+             "a16_serving_core", "reply_1", "reply_2", "a16_grouped_reply1", "a8_grouped_reply1",
+             "a16_grouped64_reply1", "a16_grouped_reply2", "a8_grouped_reply2", "a16_grouped64_reply2"]
+    inventory = [(name, "kind", {}, lambda: None) for name in names]
+    namespace = {"os": os, "exlr8_export_programs": lambda *args, **kwargs: inventory}
+    monkeypatch.setenv("CUTEAFD_BUILD_KIND", build_kind)
+    exec(compile(ast.Module(body=[builder], type_ignores=[]), "engine_exlr8_policy", "exec"), namespace)
+    assert [item[0] for item in namespace["programs"](role="spark")] == (
+        names if build_kind == "release" else names[:6])
+
+
+def test_build_kind_is_internal_and_script_identity_driven():
+    cmake = (ROOT / "native/CMakeLists.txt").read_text()
+    assert 'set(CUTEAFD_BUILD_KIND "development")' in cmake
+    assert 'set(CUTEAFD_BUILD_KIND "${CUTEAFD_BUILD_KIND}" CACHE INTERNAL' in cmake
+    assert '"CUTEAFD_BUILD_KIND=${CUTEAFD_BUILD_KIND}"' in cmake
+    for script, kind in [("build-release-artifacts.sh", "release"), ("build-wip-artifacts.sh", "development")]:
+        assert f"-DCUTEAFD_BUILD_KIND={kind}" in (ROOT / "scripts/build" / script).read_text()
+    for script in ["dsv4_programs.cmake", "fp8_moe.cmake"]:
+        assert "${CUTEAFD_BUILD_KIND}|" in (ROOT / "native/cmake/shared" / script).read_text()
+
+
+@pytest.mark.parametrize("build_kind", [None, "development", "release"])
+def test_cmake_build_identity_preserves_release_argument(tmp_path, build_kind):
+    import subprocess
+    cmake = (ROOT / "native/CMakeLists.txt").read_text()
+    policy = cmake[cmake.index("if(NOT DEFINED CUTEAFD_BUILD_KIND)"):cmake.index("# Read target")]
+    script = tmp_path / "identity.cmake"
+    script.write_text(policy + '\nmessage(STATUS "identity=${CUTEAFD_BUILD_KIND}")\n')
+    args = ["cmake", *([] if build_kind is None else [f"-DCUTEAFD_BUILD_KIND={build_kind}"]), "-P", str(script)]
+    result = subprocess.run(args, capture_output=True, text=True, check=True)
+    assert f"identity={build_kind or 'development'}" in result.stdout

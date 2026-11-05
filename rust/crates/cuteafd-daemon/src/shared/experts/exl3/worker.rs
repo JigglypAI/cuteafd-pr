@@ -139,7 +139,7 @@ pub(crate) struct Exl3Worker<'a> {
     /// Per-expert partial replies (models with a per-expert output norm): the
     /// epilogue that replaces the weighted top-k sum for flagged requests.
     partial: Option<super::partial::PartialEpilogue<'a>>,
-    reply_fused: super::super::reply::Exl3Reply<'a>,
+    reply_fused: Option<super::super::reply::Exl3Reply<'a>>,
 }
 
 impl<'a> Exl3Worker<'a> {
@@ -338,7 +338,7 @@ impl<'a> Exl3Worker<'a> {
             deferred: false,
             pending: super::super::execution::timing::PendingUnits::new(library, 1)?,
             partial: None,
-            reply_fused: super::super::reply::Exl3Reply::load(library)?,
+            reply_fused: (epilogue == Exl3Epilogue::Sum).then(|| super::super::reply::Exl3Reply::load(library)).transpose()?,
         })
     }
 
@@ -559,7 +559,7 @@ impl<'a> Exl3Worker<'a> {
             match (destination, partial.as_ref()) {
                 (Some(output), None) if compressed => {
                     let sources = execution.launch_layer_core(self.layer, inputs, request.rows() as usize, self.stream.raw)?;
-                    self.reply_fused.launch(request, sources, inputs, output, request.rows() as usize, self.stream.raw)?;
+                    self.reply_fused.as_ref().context("combined reply reached a partial-only worker")?.launch(request, sources, inputs, output, request.rows() as usize, self.stream.raw)?;
                     output
                 }
                 // Partial replies: the core, then the per-region epilogue into the reply slot.

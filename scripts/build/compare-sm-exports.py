@@ -420,7 +420,9 @@ def routed_core_variants(package, role, weights):
     namespace = {}
     exec(compile(ast.Module(body=[policy], type_ignores=[]), str(path), "exec"), namespace)
     select = namespace["core_variants"]
-    variants = select(role, weights) if len(policy.args.args) > 1 else select(role)
+    variants = (select(role, weights, os.environ.get("CUTEAFD_BUILD_KIND", "development"))
+                if len(policy.args.args) > 2 else
+                select(role, weights) if len(policy.args.args) > 1 else select(role))
     if not variants or any(type(value) is not bool for value in variants) or len(set(variants)) != len(variants):
         raise ValueError(f"{path}: invalid production core-variant policy")
     return variants
@@ -688,6 +690,7 @@ def worker(payload):
                "sparkinfer_revision": _pinned_sparkinfer.REVISION,
                "source_tree_sha256": _pinned_sparkinfer.LOCK_DATA["source_tree_sha256"],
                "exporter": payload["exporter"], "args": payload["args"], "toolchain": toolchain,
+               "build_kind": os.environ.get("CUTEAFD_BUILD_KIND", "development"),
                "environment": {key: os.environ[key] for key in ("CUTEAFD_EXPORT_NARROW_AOT", "CUTEAFD_EXPORT_HC_LAGGED")},
                "exporter_sha256": sha(path.read_bytes()), "comparison_script_sha256": sha(Path(__file__).read_bytes()),
                "export_sources_sha256": {str(source.relative_to(ROOT)): sha(source.read_bytes())

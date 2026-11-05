@@ -307,7 +307,8 @@ impl<'a> Exlr8Execution<'a> {
         let (k1_name, group_name) = program_names(family, set, variant, activations);
         let k1 = programs.program(k1_name, &pointers(set, variant))?;
         let prefix = match family { KernelFamily::Glm => "exlr8", KernelFamily::GlmFlash => "exlr8_glmf" };
-        let (reply, reply_core, reply_epilogue) = if set == ExpertSet::Routed {
+        let (reply, reply_core, reply_epilogue) = if set == ExpertSet::Routed
+            && programs.contains(&format!("{prefix}_a16_serving_core")) {
             if variant == Variant::DecodeCompact {
                 let core = programs.program(&format!("{prefix}_a16_serving_core"), &pointers(set, variant))?;
                 ensure!(core.spec().scratch == k1.spec().scratch && core.spec().scalar_kinds == k1.spec().scalar_kinds,

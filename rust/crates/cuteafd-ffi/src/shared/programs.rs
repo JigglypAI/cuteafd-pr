@@ -41,6 +41,26 @@ impl fmt::Display for ProgramCapacityError {
 
 impl std::error::Error for ProgramCapacityError {}
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("missing compressed Spark reply export {export}; release builds include this export (development builds provide BF16 replies only)")]
+pub struct MissingReplyExport {
+    pub export: String,
+}
+
+/// Validate an explicitly requested codec before loading weights or allocating workspaces.
+pub fn require_reply_export(name: &str, present: bool) -> std::result::Result<(), MissingReplyExport> {
+    if present { Ok(()) } else { Err(MissingReplyExport { export: name.to_owned() }) }
+}
+
+pub fn admit_reply_export(formats: cuteafd_core::spark_reply::SparkReplyFormats,
+    format: cuteafd_core::SparkReplyFormat, name: &str, present: bool)
+    -> std::result::Result<(), MissingReplyExport> {
+    if formats.prefill == Some(format) || formats.decode == Some(format) {
+        require_reply_export(name, present)?;
+    }
+    Ok(())
+}
+
 impl ProgramCapacities {
     fn from_manifest(manifest: &serde_json::Value) -> std::result::Result<Self, ProgramCapacityError> {
         let capacities = &manifest["capacities"];
@@ -287,6 +307,16 @@ impl<'a> Programs<'a> {
         Ok((loaded, skipped))
     }
 
+    pub fn contains(&self, name: &str) -> bool {
+        self.programs.contains_key(name)
+    }
+
+    pub fn reply_bound(&self, name: &str, pointers: &[&str], format: cuteafd_core::SparkReplyFormat)
+        -> Result<Option<BoundProgram<'a>>> {
+        admit_reply_export(cuteafd_core::spark_reply::requested(), format, name, self.contains(name))?;
+        self.contains(name).then(|| self.bound(name, pointers)).transpose()
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.programs.keys().map(String::as_str)
     }
@@ -456,6 +486,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn development_admits_bf16_but_refuses_either_explicit_compressed_phase() {
+        use cuteafd_core::{SparkReplyFormat as F, spark_reply::SparkReplyFormats};
+        for prefill in [None, Some(F::Bf16), Some(F::Fp8), Some(F::Nvfp4)] {
+            for decode in [None, Some(F::Bf16), Some(F::Fp8), Some(F::Nvfp4)] {
+                let formats = SparkReplyFormats { prefill, decode };
+                for codec in [F::Fp8, F::Nvfp4] {
+                    let requested = prefill == Some(codec) || decode == Some(codec);
+                    let error = admit_reply_export(formats, codec, "producer", false).err();
+                    assert_eq!(error.is_some(), requested);
+                    if let Some(error) = error { assert_eq!(error.export, "producer"); }
+                    assert!(admit_reply_export(formats, codec, "producer", true).is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_reply_export_is_typed_and_names_release_support() {
+        let name = "expert_reply_native_h4096_1";
+        let error: anyhow::Error = require_reply_export(name, false).unwrap_err().into();
+        assert_eq!(error.downcast_ref::<MissingReplyExport>().unwrap().export, name);
+        let message = error.to_string();
+        assert!(message.contains(name) && message.contains("release builds include"));
+        assert!(require_reply_export(name, true).is_ok());
+    }
+
+    #[test]
     fn exported_glm_stage_manifest_passes_runtime_dispatch() {
         // Real exporter output; the Python catalogue test also rebuilds its ABI
         // from the pinned fork's manifest builders to catch fixture drift.
@@ -602,6 +659,20 @@ int cuteafd_dsv4_program_launch(unsigned i, void **p, uint64_t *s, void *stream)
         let library = unsafe { NativeLibrary::load(&shared).unwrap() };
         let loaded = library.programs().unwrap().with_manifest(&manifest).unwrap();
         assert_eq!(loaded.names().count(), 18);
+        let missing = "expert_reply_native_h4096_1";
+        assert!(!loaded.contains(missing));
+        assert!(admit_reply_export(Default::default(), cuteafd_core::SparkReplyFormat::Fp8,
+            missing, loaded.contains(missing)).is_ok());
+        for formats in [
+            cuteafd_core::spark_reply::SparkReplyFormats { prefill: Some(cuteafd_core::SparkReplyFormat::Fp8), decode: None },
+            cuteafd_core::spark_reply::SparkReplyFormats { prefill: None, decode: Some(cuteafd_core::SparkReplyFormat::Fp8) },
+        ] {
+            let error = admit_reply_export(formats, cuteafd_core::SparkReplyFormat::Fp8,
+                missing, loaded.contains(missing)).unwrap_err();
+            assert_eq!(error.export, missing);
+            assert!(error.to_string().contains("release builds include"));
+        }
+
         drop(loaded);
         for entry in &mut entries { entry["geometry"]["reply_format"] = 99.into(); }
         std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries})).unwrap()).unwrap();

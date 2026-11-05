@@ -1160,13 +1160,15 @@ def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, mon
 
 @pytest.mark.parametrize("role", ["spark", "coordinator"])
 @pytest.mark.parametrize("weights", ["nvfp4", "fp8", "mxfp4", "bf16"])
-def test_routed_core_policy_is_the_packages_source_policy(tmp_path, role, weights):
+@pytest.mark.parametrize("build_kind", ["development", "release"])
+def test_routed_core_policy_is_the_packages_source_policy(tmp_path, monkeypatch, role, weights, build_kind):
+    monkeypatch.setenv("CUTEAFD_BUILD_KIND", build_kind)
     package = compare_sm.load_file("core_policy_package", ROOT / "python/tools/aot/package_fp8_moe_aot.py")
-    expected = (False, True) if role == "spark" and weights != "nvfp4" else (False,)
-    assert package.core_variants(role, weights) == expected
+    expected = (False, True) if build_kind == "release" and role == "spark" and weights != "nvfp4" else (False,)
+    assert package.core_variants(role, weights, build_kind) == expected
     assert compare_sm.routed_core_variants(package, role, weights) == expected
     source = Path(package.__file__).read_text()
-    assert "for core in core_variants(args.role, g.weights)" in source
+    assert 'for core in core_variants(args.role, g.weights, os.environ.get("CUTEAFD_BUILD_KIND", "development"))' in source
     # A source comparison must follow a changed policy, not a cached candidate list.
     path = tmp_path / "package.py"
     path.write_text("def core_variants(role):\n    return (True,) if role == 'spark' else (False, True)\n")
@@ -1176,7 +1178,9 @@ def test_routed_core_policy_is_the_packages_source_policy(tmp_path, role, weight
 
 @pytest.mark.parametrize("wire", [False, True])
 @pytest.mark.parametrize("weights", ["nvfp4", "fp8", "mxfp4", "bf16"])
-def test_spark_routed_object_set_matches_production_including_core(tmp_path, monkeypatch, wire, weights):
+@pytest.mark.parametrize("build_kind", ["development", "release"])
+def test_spark_routed_object_set_matches_production_including_core(tmp_path, monkeypatch, wire, weights, build_kind):
+    monkeypatch.setenv("CUTEAFD_BUILD_KIND", build_kind)
     from contextlib import nullcontext
     package = compare_sm.load_file("core_set_package", ROOT / "python/tools/aot/package_fp8_moe_aot.py")
     geometry = SimpleNamespace(weights=weights)
@@ -1220,7 +1224,7 @@ def test_spark_routed_object_set_matches_production_including_core(tmp_path, mon
     expected = {(rows, form, segmented, core) for rows, form, segmented, core in env["exports"]}
     actual = {(c["max_rows"], c["prefill"], c.get("row_addresses", False), c.get("core_only", False)) for c in calls}
     assert actual == expected
-    assert any(core for _, _, _, core in actual) == (weights != "nvfp4")
+    assert any(core for _, _, _, core in actual) == (build_kind == "release" and weights != "nvfp4")
     records = json.loads((tmp_path / "routed.json").read_text())["programs"]
     assert len(records) == len(expected)
     assert all(r["name"].endswith("_core") == r.get("core_only", False) for r in records)
@@ -1283,7 +1287,7 @@ def test_combined_exl3_reply_exports_cover_supported_geometries_without_sm_sizin
     assert 'Scalar(n) for n in ("weight_num_experts", "route_num_experts", "active_m")' in source
     worker = (ROOT / "rust/crates/cuteafd-daemon/src/shared/experts/exl3/worker.rs").read_text()
     assert "(Some(output), None) if compressed" in worker
-    assert "self.reply_fused.launch(request, sources, inputs, output" in worker
+    assert 'self.reply_fused.as_ref().context("combined reply reached a partial-only worker")?.launch(request, sources, inputs, output' in worker
     assert "reply_codec" not in worker
 
 

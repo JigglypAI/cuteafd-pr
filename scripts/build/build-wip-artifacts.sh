@@ -284,6 +284,7 @@ cmake \
   -B "$build_dir/native" \
   -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
+  -DCUTEAFD_BUILD_KIND=development \
   -DCUTEAFD_ENABLE_CUDA=ON \
   -DCUTEAFD_ENABLE_VISION_ATTENTION_AOT="${CUTEAFD_WIP_VISION_ATTENTION_AOT:-ON}" \
   -DCUTEAFD_ENABLE_AUDIO_AOT="$audio_aot" \

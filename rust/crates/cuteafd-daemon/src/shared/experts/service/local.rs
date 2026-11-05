@@ -357,7 +357,8 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     let epilogue = Exl3Epilogue::for_catalog(&catalog);
     let partial_replies = epilogue == Exl3Epilogue::PartialReplies;
     let programs = (|| -> Result<_> {
-        if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 || partial_replies {
+        if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 || partial_replies
+            || cuteafd_core::spark_reply::requested().can_compress() {
             let path = config.library.parent().context("native library directory")?
                 .join("../share/PROGRAMS.json");
             Ok(Some(library.programs()?.with_manifest(&path)?))

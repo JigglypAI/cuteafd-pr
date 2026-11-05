@@ -1,7 +1,7 @@
 //! Initialize only installed code; keep owners alive through execution teardown.
 use super::*;
 use crate::shared::experts::{
-    exl3::{execution::{Exl3InputFormat, Exl3Modules}, worker::Exl3Worker},
+    exl3::{execution::{Exl3Epilogue, Exl3InputFormat, Exl3Modules}, worker::Exl3Worker},
     fp8::{self, Fp8Modules},
 };
 
@@ -48,12 +48,14 @@ impl Fp8Group {
                 cuteafd_loader::plan::experts::spark_recipe(&format!("{family}:{format}"),
                     tensors.shape().intermediate, config.world)?.rank_for_layer(config.rank, layer), slicing,
                 tensors.rank_width(config.world, config.rank, slicing)?)?;
+            fp8::validate_reply_exports(&directory, tensors.format())?;
             let metadata = fp8::package_metadata(&directory, &tensors, &layers, config.world, config.rank, slicing)?;
             let capacity = config.capacity as usize;
             let mut scratch = cuteafd_ffi::fp8_moe::fp8_slot_scratch_bytes(metadata.scratch_layout(), capacity)?;
             let bf16_directory = metadata.info.wire_input.then(|| fp8::bf16_sibling(&directory))
                 .flatten().filter(|path| path.is_dir());
             if let Some(path) = &bf16_directory {
+                fp8::validate_reply_exports(path, tensors.format())?;
                 let sibling = fp8::package_metadata(path, &tensors, &layers, config.world, config.rank, slicing)?;
                 fp8::validate_bf16_package(&metadata.info, &sibling.info, capacity)?;
                 scratch = scratch.max(cuteafd_ffi::fp8_moe::fp8_slot_scratch_bytes(sibling.scratch_layout(), capacity)?);
@@ -77,6 +79,21 @@ impl<'a> WarmModules<'a> {
     pub(super) fn load(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         config: &NativeExpertServiceConfig,
         programs: Option<&'a cuteafd_ffi::programs::Programs<'a>>) -> Result<Self> {
+        let partial_replies = Exl3Epilogue::for_catalog(catalog) == Exl3Epilogue::PartialReplies;
+        if partial_replies {
+            let programs = programs.context("partial Spark replies require a program table")?;
+            crate::shared::experts::reply::validate_exports(programs, "partial")?;
+        } else if cuteafd_core::spark_reply::requested().can_compress() {
+            if let Some(tensors) = catalog.fp8() {
+                fp8::validate_reply_formats(tensors.format(), cuteafd_core::spark_reply::requested())?;
+            }
+            let programs = programs.context("compressed Spark reply admission requires a program table")?;
+            let kind = if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+                if cuteafd_core::expert_geometry().hidden == 4096 { "exlr8_glmf" } else { "exlr8" }
+            } else if catalog.fp8().is_some() { "fp8" }
+            else if catalog.exl3().is_some() { "exl3" } else { "native" };
+            crate::shared::experts::reply::validate_exports(programs, kind)?;
+        }
         if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
             let programs = programs.context("EXLR8 module owner requires validated programs")?;
             let geometry = catalog.routed_experts().geometry()?;
