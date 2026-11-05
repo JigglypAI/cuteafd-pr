@@ -55,7 +55,7 @@ pub(crate) struct ServeArgs {
     pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Prefill unit rows, at most 4096; unset follows the shared wave policy.
     #[arg(long)] pub prefill_rows: Option<usize>,
-    #[arg(long, default_value = "exact")]
+    #[arg(long, default_value = "unrestricted")]
     pub prefill_packing: crate::shared::prefill_packing::PackingMode,
     /// Admit all-row prefill logits for fidelity scoring before KV sizing.
     #[arg(long)] pub full_prefill_logits: bool,
@@ -645,6 +645,14 @@ mod tests {
         let capped = args(&["--peers", PEERS, "--max-output-tokens", "4096"])?;
         assert_eq!(capped.prefix.reserve.limits(1 << 20)?.output(), 4096);
         assert!(args(&["--peers", PEERS, "--max-output", "4096"]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn packing_defaults_to_unrestricted_and_exact_remains_explicit() -> Result<()> {
+        use crate::shared::prefill_packing::PackingMode;
+        assert_eq!(args(&["--peers", PEERS])?.prefill_packing, PackingMode::Unrestricted);
+        assert_eq!(args(&["--peers", PEERS, "--prefill-packing", "exact"])?.prefill_packing, PackingMode::Exact);
         Ok(())
     }
 
