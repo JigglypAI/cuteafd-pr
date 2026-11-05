@@ -464,9 +464,9 @@ pub struct ProductionInput<'a> {
     pub attention: AttentionPlacement,
     pub gpus: usize,
     pub prefill: PrefillShape,
-    pub weights: Vec<(EmbeddingHome, WeightInventory)>,
+    pub target: TargetFacts,
+    pub draft: DraftFacts,
     pub scratch: [super::GlmScratch; 2],
-    pub hooks: Vec<HookBuffers>,
     pub context_scratch: Option<super::GlmContext>,
     pub exchange_element_bytes: u64,
     pub peer_diagnostics: bool,
@@ -477,13 +477,9 @@ pub struct ProductionInput<'a> {
     pub prefill_link: Option<crate::placement::PreparedSparkLink>,
     pub skip_routed_experts: bool,
     pub operation: Operation,
-    /// Exact filler row window from the checkpoint reader. None for mapped or
-    /// native vocabulary paths, which do not create a separate Mount bank.
-    pub embedding_read: Option<crate::shared::dense_read::ReadBatch>,
-    /// Largest known upload among draft/workspace users of the library-wide
-    /// synchronous H2D bank; target inventory and filler maxima join by max.
+    /// Largest synchronous upload from additional serving/media owners. Target
+    /// and draft users join the same library-wide bank by max, not addition.
     pub sync_upload_bytes: u64,
-    pub native_load: Option<NativeLoad>,
     pub owners: Vec<Component>,
     pub budgets: Vec<Budget>,
 }
@@ -530,11 +526,12 @@ impl<'a> ProductionInput<'a> {
         use crate::placement::{FfnMode, SparkIntakeMode, SparkIntakeOwners};
         if !(1..=2).contains(&self.gpus) || self.layers == 0 || self.layers > self.cfg.layers
             || self.context == 0 || self.maximum_pool_tokens < self.context
-            || self.spark_ranks > 8 || self.weights.is_empty()
-            || self.hooks.len() != self.gpus
-            || self.hooks.iter().enumerate().any(|(rank, hook)| usize::from(hook.device) != rank)
+            || self.spark_ranks > 8 || self.target.weights.is_empty()
+            || self.target.weights.iter().any(|(_, weights)| weights.ranks != self.gpus)
+            || self.target.hooks.len() != self.gpus
+            || self.target.hooks.iter().enumerate().any(|(rank, hook)| usize::from(hook.device) != rank)
             || self.local.is_some() && self.gpus != 2
-            || self.native_load.as_ref().is_some_and(|load| load.gpus != self.gpus)
+            || self.target.native_load.as_ref().is_some_and(|load| load.gpus != self.gpus)
             || (self.spark_ranks == 0) != self.decode_link.is_none()
             || (self.spark_ranks == 0) != self.prefill_link.is_none()
             || self.skip_routed_experts && (self.local.is_some() || self.spark_ranks > 0)
@@ -542,6 +539,7 @@ impl<'a> ProductionInput<'a> {
         {
             return Err(invalid("incomplete production geometry"));
         }
+        let TargetFacts { weights, hooks, embedding_read, native_load } = self.target;
         let partitioned = self.attention == AttentionPlacement::Context;
         if self.attention != AttentionPlacement::Heads && self.gpus != 2
             || partitioned != self.context_scratch.is_some()
@@ -586,19 +584,20 @@ impl<'a> ProductionInput<'a> {
         let mut recipe = GlmRecipe { cfg: self.cfg, context: self.context, page_tokens,
             maximum_pages, attention, gpus: self.gpus, spark_links: self.spark_ranks > 0,
             prefill: vec![self.prefill], lanes: vec![1],
-            embedding: self.weights.iter().map(|(home, _)| *home).collect(), experts,
+            embedding: weights.iter().map(|(home, _)| *home).collect(), experts,
             targets: vec![], hooks: vec![], exchanges: vec![], weights: vec![], graphs: vec![],
             host: Some(host), returns: vec![], owners: vec![], };
         recipe.owners.push(Case { when: vec![], value: self.owners });
         recipe.owners.push(Case { when: vec![], value: runtime.components(maximum_pages)? });
-        if let Some(load) = &self.native_load {
+        recipe.owners.push(Case { when: vec![], value: self.draft.components(maximum_pages)? });
+        if let Some(load) = &native_load {
             recipe.owners.push(Case { when: vec![], value: load.components(maximum_pages) });
         }
-        for (home, weights) in &self.weights {
+        for (home, weights) in &weights {
             recipe.weights.push(Case { when: vec![When::Embedding(*home)], value: weights.clone() });
-            let filler = self.embedding_read.filter(|_| *home == EmbeddingHome::Device(0));
-            let sync = self.sync_upload_bytes
-                .max(self.native_load.as_ref().map_or(0, |load| load.sync_upload_bytes))
+            let filler = embedding_read.filter(|_| *home == EmbeddingHome::Device(0));
+            let sync = self.sync_upload_bytes.max(self.draft.sync_upload_bytes)
+                .max(native_load.as_ref().map_or(0, |load| load.sync_upload_bytes))
                 .max(weights.core_loading.sync_upload_bytes)
                 .max(weights.kv_b_loading.sync_upload_bytes)
                 .max(weights.row_loading.sync_upload_bytes)
@@ -613,7 +612,7 @@ impl<'a> ProductionInput<'a> {
             recipe.owners.push(Case { when: vec![When::Embedding(*home)],
                 value: physical_components(owners, maximum_pages) });
         }
-        for mut hook in self.hooks {
+        for mut hook in hooks {
             hook.maximum_pages = maximum_pages;
             recipe.hooks.push(Case { when: vec![], value: hook });
         }
@@ -656,7 +655,7 @@ impl<'a> ProductionInput<'a> {
             }
             recipe.owners.push(Case { when: when.clone(), value: components });
             if count > 0 {
-                for (home, weights) in &self.weights {
+                for (home, weights) in &weights {
                     let mut replicated = weights.clone();
                     let start = replicated.owners.len();
                     replicated.add_peer_routers(&(self.cfg.first_moe_layer..self.cfg.first_moe_layer + count)

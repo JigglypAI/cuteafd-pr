@@ -27,17 +27,141 @@ fn production_input(cfg: &GlmDsaConfig, gpus: usize, ranks: usize, prefill: Pref
     ProductionInput { cfg, layers: cfg.layers, context: 4096, maximum_pool_tokens: 8192,
         attention: if gpus == 2 { AttentionPlacement::Context } else { AttentionPlacement::Heads },
         gpus, prefill,
-        weights: vec![(EmbeddingHome::Device(0), WeightInventory { ranks: gpus, owners: vec![],
-            core_loading: Default::default(), kv_b_loading: Default::default(), row_loading: Default::default() })],
-        scratch: Default::default(),
-        hooks: (0..gpus).map(|rank| HookBuffers { device: rank as u8, maximum_pages: 1,
-            native: None, core: None, shared_workspace: None }).collect(),
+        target: TargetFacts {
+            weights: vec![(EmbeddingHome::Device(0), WeightInventory { ranks: gpus, owners: vec![],
+                core_loading: Default::default(), kv_b_loading: Default::default(), row_loading: Default::default() })],
+            hooks: (0..gpus).map(|rank| HookBuffers { device: rank as u8, maximum_pages: 1,
+                native: None, core: None, shared_workspace: None }).collect(),
+            embedding_read: None, native_load: None,
+        },
+        draft: DraftFacts::default(), scratch: Default::default(),
         context_scratch: (gpus == 2).then(super::super::GlmContext::default),
         exchange_element_bytes: 2, peer_diagnostics: false, local: None, spark_ranks: ranks,
         decode_link: (ranks > 0).then(|| production_link(cfg, ranks, PrefillShape { rows: 64, waves: 1 }, false)),
         prefill_link: (ranks > 0).then(|| production_link(cfg, ranks, prefill, true)),
-        skip_routed_experts: false, operation: Operation::Serving, embedding_read: None,
-        sync_upload_bytes: 0, native_load: None, owners: vec![], budgets: budgets() }
+        skip_routed_experts: false, operation: Operation::Serving,
+        sync_upload_bytes: 0, owners: vec![], budgets: budgets() }
+}
+
+#[test]
+fn target_checkpoint_facts_use_exact_inventory_and_preserve_embedding_alternatives() {
+    use crate::plan::{testing, Checkpoint};
+    let dir = tempfile::tempdir().unwrap();
+    let (config, tensors) = testing::glm5_compact_weights();
+    testing::write_snapshot(dir.path(), &config, &tensors, None);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = GlmDsaConfig::from_hf(&config).unwrap();
+    let homes = [EmbeddingHome::Device(0), EmbeddingHome::HostPinned];
+    let target = TargetFacts::checkpoint(&checkpoint, cfg.layers, 2, None, false, &homes, None).unwrap();
+    assert_eq!(target.weights.len(), homes.len());
+    for ((home, actual), expected_home) in target.weights.iter().zip(homes) {
+        assert_eq!(*home, expected_home);
+        let expected = WeightInventory::from_checkpoint(&checkpoint, 2, cfg.layers, None,
+            false, false, expected_home).unwrap();
+        assert_eq!(actual.owners.iter().map(|owner| &owner.allocation).collect::<Vec<_>>(),
+            expected.owners.iter().map(|owner| &owner.allocation).collect::<Vec<_>>());
+        assert_eq!(actual.core_loading, expected.core_loading);
+        assert_eq!(actual.kv_b_loading, expected.kv_b_loading);
+        assert_eq!(actual.row_loading, expected.row_loading);
+    }
+    assert_eq!(target.hooks.iter().map(|hook| hook.device).collect::<Vec<_>>(), [0, 1]);
+    assert_eq!(target.embedding_read.unwrap().pinned_bytes(),
+        crate::shared::dense_read::ReadBatch::new(cfg.vocab_size, cfg.hidden * 2, cfg.hidden * 2,
+            crate::shared::dense_read::STEP_BYTES).unwrap().pinned_bytes());
+    assert!(target.native_load.is_none());
+    for homes in [vec![], vec![EmbeddingHome::Device(0); 2]] {
+        assert!(TargetFacts::checkpoint(&checkpoint, cfg.layers, 2, None, false, &homes, None).is_err());
+    }
+}
+
+fn gqa_layout(representation: crate::families::glm5::draft_representation::GlmDraftRepresentation)
+    -> crate::families::glm5::draft_physical::GlmDflashPhysicalLayout {
+    use crate::families::glm5::{draft_physical::{GlmDflashConfig, GlmDflashPhysicalLayout},
+        draft_representation::GlmDraftCapacity};
+    let cfg = GlmDflashConfig { hidden: 256, intermediate: 512, layers: 2, heads: 4,
+        kv_heads: 2, head_dim: 64, eps: 1e-5, theta: 10000., block: 4, group: 2,
+        mask_token: 0, rank: 256, taps: vec![0, 1], vocab: 64, window: 2048,
+        row_window: false, sample_from_anchor: false };
+    GlmDflashPhysicalLayout::new(&cfg, representation, GlmDraftCapacity::new(20, 16, cfg.block).unwrap(),
+        188, 0, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap()
+}
+
+#[test]
+fn draft_facts_preserve_owner_ids_resources_and_serial_fp8_sources() {
+    use crate::families::glm5::draft_representation::GlmDraftRepresentation::{Bf16Only, Fp8Only};
+    for representation in [Bf16Only, Fp8Only] {
+        let layout = gqa_layout(representation);
+        let facts = DraftFacts::from_gqa(&layout).unwrap();
+        assert_eq!(facts.owners, layout.allocations("glm.draft", Location::coordinator(0)));
+        let ids = facts.owners.iter().map(|owner| owner.id.as_str()).collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), facts.owners.len());
+        for weight in &facts.weights {
+            let owner = facts.owners.iter().find(|owner| owner.id == weight.id).unwrap();
+            assert_eq!(weight.location, owner.location);
+            assert_eq!(weight.weights.0, owner.bytes);
+        }
+        assert_eq!(facts.weights.len(), layout.weight_owners().count());
+        let values = layout.weight_owners().filter(|owner| owner.id.ends_with(".values"))
+            .collect::<Vec<_>>();
+        if representation == Bf16Only {
+            assert!(facts.loading.is_empty());
+        } else {
+            assert_eq!(facts.loading.len(), 1);
+            assert_eq!(facts.loading[0].members.len(), values.len());
+            assert_eq!(facts.loading[0].peak(), values.iter().map(|owner| owner.bytes * 2).max().unwrap());
+            assert!(facts.loading[0].members.iter().all(|owner| owner.location == Location::coordinator(0)
+                && owner.lifetime == Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad }));
+        }
+        assert!(facts.components(0).is_err());
+        let cfg = cfg();
+        let mut input = production_input(&cfg, 1, 4, PrefillShape { rows: 128, waves: 3 });
+        input.draft = facts.clone();
+        let solved = input.prepare().unwrap().admit(request()).unwrap().solved;
+        for weight in &facts.weights {
+            assert!(solved.facts.resident_weights.contains(weight));
+        }
+        for owner in facts.owners.iter().filter(|owner| owner.location != Location::HOST) {
+            assert!(solved.facts.allocations.contains(owner));
+        }
+        assert_eq!(solved.facts.allocations.iter().find(|owner| owner.id == "glm.load.sync_h2d").unwrap().bytes,
+            facts.sync_upload_bytes);
+        assert_eq!(solved.facts.sequential.iter().filter(|group| group.id == "glm.draft.load.sources").count(),
+            usize::from(representation == Fp8Only));
+    }
+}
+
+#[test]
+fn ml4_draft_facts_preserve_native_owners_and_share_the_library_upload_bank() {
+    use crate::formats::{block_dspark::DsparkRotaryPlan, dflash::MlaDflashConfig, mla::MlaGeometry};
+    use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation::Bf16Only};
+    let cfg = MlaDflashConfig { mla: MlaGeometry { hidden: 6144, heads: 64, q_rank: 0,
+        kv_rank: 512, nope: 64, rope: 64, value: 128 }, intermediate: 24576, eps: 1e-5,
+        block: 3, group: 0, selector_rank: 512, selector_top_k: 0, taps: vec![1, 18, 36, 54, 71],
+        vocab: 204800, mask_token: 0, max_context: 1 << 20, windows: vec![Some(2048); 3],
+        rotary: DsparkRotaryPlan { inv_freq: vec![1.; 32], attention_factor: 1., softmax_factor: 1. },
+        kind: cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark, markov_rank: 512 };
+    let layout = cfg.runtime_layout(Bf16Only, GlmDraftCapacity::new(20, 16, 3).unwrap(),
+        1 << 20, 1 << 21, 188, 0, cuteafd_core::MlaCacheFormat::Fp8).unwrap();
+    let facts = DraftFacts::ml4(&layout).unwrap();
+    let retained = layout.owners().iter().filter(|owner|
+        !owner.on_use && owner.shared_key.as_deref() != Some("library/sync-h2d")).collect::<Vec<_>>();
+    assert_eq!(facts.owners.len(), retained.len() + 1);
+    for expected in retained {
+        let owner = facts.owners.iter().find(|owner| owner.id == format!("glm.draft.{}", expected.id)).unwrap();
+        assert_eq!(owner.bytes, expected.bytes as u64);
+        assert_eq!(owner.alignment, expected.alignment as u64);
+        assert_eq!(owner.shape, expected.shape.iter().map(|&n| n as u64).collect::<Vec<_>>());
+    }
+    assert_eq!(facts.weights.iter().map(|owner| owner.weights.0).sum::<u64>(),
+        layout.weights().resident_bytes().unwrap());
+    assert_eq!(facts.sync_upload_bytes, layout.owners().iter()
+        .filter(|owner| owner.shared_key.as_deref() == Some("library/sync-h2d"))
+        .map(|owner| owner.bytes as u64).max().unwrap());
+    let mount = facts.owners.iter().find(|owner| owner.id == "glm.draft.load.mount").unwrap();
+    assert_eq!(mount.location, Location::PINNED);
+    assert_eq!(mount.bytes, crate::shared::dense_read::STEP_BYTES as u64);
+    assert_eq!(mount.lifetime, Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad });
+    assert!(facts.loading.is_empty(), "ML4 BF16 storage must not invent GQA FP8 source matrices");
 }
 
 #[test]
@@ -92,7 +216,7 @@ fn production_native_sync_bank_is_one_maximum_not_one_copy_per_rank_or_layer() {
     let prefill = PrefillShape { rows: 128, waves: 3 };
     let mut input = production_input(&cfg, 2, 4, prefill);
     input.sync_upload_bytes = 4096;
-    input.native_load = Some(NativeLoad { gpus: 2, sync_upload_bytes: 8192,
+    input.target.native_load = Some(NativeLoad { gpus: 2, sync_upload_bytes: 8192,
         coarse_overcharge_bytes: 0, groups: vec![] });
     let prepared = input.prepare().unwrap();
     let solved = prepared.admit(request()).unwrap().solved;
@@ -143,7 +267,7 @@ fn production_count_domain_preserves_executable_wave_capabilities() {
 fn production_rejects_misindexed_hooks_and_spark_free_multiwave() {
     let cfg = cfg();
     let mut input = production_input(&cfg, 2, 4, PrefillShape { rows: 128, waves: 3 });
-    input.hooks.swap(0, 1);
+    input.target.hooks.swap(0, 1);
     assert!(input.prepare().is_err());
     let input = production_input(&cfg, 2, 0, PrefillShape { rows: 128, waves: 3 });
     assert!(input.prepare().is_err());
