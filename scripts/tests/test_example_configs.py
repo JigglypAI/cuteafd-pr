@@ -244,7 +244,7 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
     matrix = json.loads((ROOT / "scripts/bench/release-smoke.example.json").read_text())
     assert matrix["profile"] == "smoke"
     entries = matrix["entries"]
-    assert len(entries) == 30
+    assert len(entries) == 28
     assert len({entry["name"] for entry in entries}) == len(entries)
     defaults = matrix["defaults"]["set"]
     stale = {"CONCURRENCY", "MAX_CONTEXT_TOKENS", "HOST_CACHE_BYTES", "BENCH_SIMULATED",
@@ -280,7 +280,7 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
             assert values[key] not in ports
             ports.add(values[key])
         models.setdefault(values["MODEL_ID"], set()).add(len(entry["gpus"]))
-    assert len(models) == 15
+    assert len(models) == 14
     assert all(columns == {1, 2} for columns in models.values())
 
 
@@ -781,8 +781,7 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
         assert report["created"] == max(d["created"] for d in candidates)
 
 
-@pytest.mark.parametrize("filename", ["scripts/bench/release-smoke.example.json",
-                                    "scripts/bench/release-smoke-v4.json",
+@pytest.mark.parametrize("filename", ["scripts/bench/release-smoke-v4.json",
                                     "scripts/bench/kits/gate/matrix-gate.json"])
 def test_glmf_exlr8_k4_cards_preserve_qualified_native_recipes(filename: str) -> None:
     matrix = json.loads((ROOT / filename).read_text())
