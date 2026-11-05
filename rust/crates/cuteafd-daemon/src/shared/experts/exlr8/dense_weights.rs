@@ -400,6 +400,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn glm_whole_attention_records_and_scratch_follow_owners() -> Result<()> {
+        use cuteafd_loader::families::glm5::{GlmDsaConfig, native};
+        let root = fixture("glm");
+        let config = serde_json::from_slice(&std::fs::read(root.path().join("config.json"))?)?;
+        let cfg = GlmDsaConfig::from_hf(&config)?;
+        let records = DenseRecord::inventory(root.path())?;
+        let whole_mla = BTreeMap::from([(0, 1)]);
+        for rank in 0..2 {
+            let owned = NativeDenseRecords::new(root.path(), 1, 2, rank, &whole_mla)?;
+            assert_eq!(owned.layers[0].kv_b.is_some(), rank == 1);
+            if rank == 0 {
+                assert!(owned.plan.tensors.iter().all(|slice| !slice.tensor.contains(".self_attn.")));
+            } else {
+                assert_eq!(owned.layers[0].kv_b.as_ref().unwrap().1.heads, cfg.heads);
+                let layouts = native::scratch_layouts(&cfg, &records, &owned.plan, 64, 4096, false)?;
+                for (rows, layout) in [64, 4096].into_iter().zip(layouts) {
+                    assert_eq!(layout.stages["q"], rows * cfg.heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim) * 2);
+                    assert_eq!(layout.stages["values"], rows * cfg.heads * cfg.v_head_dim * 2);
+                    assert_eq!(layout.stages["gate"], rows * (cfg.dense_intermediate / 2) * 2);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn compact_native_reader_dispatch_matches_real_allocations() -> Result<()> {
         use cuteafd_loader::plan::exlr8::dense::{DenseAxis, DenseWindow};
         let root = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME")?)

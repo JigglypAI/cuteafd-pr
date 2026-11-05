@@ -182,8 +182,8 @@ fn native_activation(args: &EngineArgs, first_moe: usize, layers: usize, serving
     let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement)
         .map_err(anyhow::Error::msg)?;
     ensure!(attention.is_none_or(|placement| placement == AttentionPlacement::Heads
-        || (args.split_device.is_some() && placement == AttentionPlacement::Context)),
-        "EXLR8 full execution requires heads or two-GPU context attention placement");
+        || (args.split_device.is_some() && matches!(placement, AttentionPlacement::Context | AttentionPlacement::Layers))),
+        "EXLR8 full execution requires heads or two-GPU context/layers attention placement");
     Ok(())
 }
 
@@ -484,6 +484,24 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn golden_layer_dump_round_trips_bf16_rows() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let output = root.path().join("layers");
+        let stream: Vec<u8> = [1.0f32, -2.5, 0.0, 16.0].into_iter()
+            .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes()).collect();
+        dump_golden_layer(&output, 3, &stream)?;
+        let loaded = std::fs::read(output.join("layer03.bin"))?;
+        assert_eq!(loaded, stream);
+        assert_eq!(bf16s(&loaded), vec![1.0, -2.5, 0.0, 16.0]);
+        let (cosine, relative) = similarity(&bf16s(&loaded), &bf16s(&stream));
+        assert!(cosine > 0.999999);
+        assert_eq!(relative, 0.0);
+        assert!(dump_golden_layer(&output, 4, &[0]).is_err());
+        assert!(!output.join("layer04.bin").exists());
+        Ok(())
+    }
+
+    #[test]
     fn golden_rejects_invalid_unit_geometry_before_opening_checkpoint() {
         #[derive(Parser)]
         struct Golden { #[command(flatten)] args: GoldenArgs }
@@ -596,7 +614,7 @@ mod draft_cli_tests {
             let mut candidate = args.clone();
             candidate.exlr8_manifest = Some(manifest.into());
             assert!(native_activation(&candidate, 3, 78, true).is_ok());
-            for mode in ["auto", "heads"] {
+            for mode in ["auto", "heads", "layers"] {
                 candidate.attention_placement = mode.into();
                 assert!(native_activation(&candidate, 3, 78, true).is_ok());
                 assert!(native_activation(&candidate, 3, 78, false).is_ok());
@@ -609,6 +627,10 @@ mod draft_cli_tests {
             assert!(native_activation(&one, 3, 78, true).is_ok());
             assert!(native_activation(&one, 3, 78, false).is_ok());
         }
+        let mut one_layers = args.clone();
+        one_layers.split_device = None;
+        one_layers.attention_placement = "layers".into();
+        assert!(native_activation(&one_layers, 3, 78, true).is_err());
         for ranks in 1..=8 {
             let mut candidate = args.clone();
             candidate.peers = Some((0..ranks).map(|rank| format!("worker{rank}:1")).collect::<Vec<_>>().join(","));
@@ -628,7 +650,7 @@ mod draft_cli_tests {
                 2 => candidate.split_device = Some(0),
                 3 => candidate.peers = Some("a:1,b:1,c:1,d:1,e:1,f:1,g:1,h:1,i:1".into()),
                 4 => candidate.layers = Some(4),
-                5 => candidate.attention_placement = "layers".into(),
+                5 => candidate.attention_placement = "invalid".into(),
                 6 => candidate.exlr8_manifest = None,
                 _ => candidate.skip_routed_experts = true,
             }
@@ -686,6 +708,9 @@ pub(crate) struct GoldenArgs {
     /// python/reference/families/glm5/golden.py.
     #[arg(long)]
     pub golden: PathBuf,
+    /// Write each prefill layer's BF16 residual rows as layerNN.bin for --golden comparisons.
+    #[arg(long)]
+    pub layer_dump: Option<PathBuf>,
     /// Prefill only the first N tokens, then feed the rest through decode
     /// steps of --step-rows rows (teacher-forced), comparing their rows.
     #[arg(long)]
@@ -949,10 +974,27 @@ impl Opened {
         use cuteafd_loader::families::glm5::DensePrograms;
         let dense_programs = if native { DensePrograms::Exlr8 } else { DensePrograms::Fp8 };
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
+        let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement)
+            .map_err(anyhow::Error::msg)?;
+        let context = if devices.len() == 2 && !matches!(requested,
+            Some(cuteafd_loader::placement::AttentionPlacement::Heads | cuteafd_loader::placement::AttentionPlacement::Layers)) {
+            let sms = devices.iter().map(|&device| crate::shared::peer_split::on_device(
+                &self.library, device, || self.library.sm_count())).collect::<Result<Vec<_>>>()?;
+            cuteafd_loader::placement::families::glm5::manifest_context_for_cards(
+                &self.cfg, &manifest, &sms, attention_plan)?
+        } else { None };
+        let requested = cuteafd_loader::placement::families::glm5::resolve_context_attention(
+            &self.cfg, requested, devices.len(), context.is_some(), !native)?;
+        ensure!(requested != Some(cuteafd_loader::placement::AttentionPlacement::Layers) || devices.len() == 2,
+            "GLM layers attention requires two coordinator GPUs");
+        let owners = (requested == Some(cuteafd_loader::placement::AttentionPlacement::Layers))
+            .then(|| cuteafd_loader::placement::families::glm5::attention_owners(&self.cfg, layers)).transpose()?;
+        let whole_mla = owners.as_ref().map(|owners| owners.iter().enumerate()
+            .map(|(layer, &rank)| (layer, usize::from(rank))).collect()).unwrap_or_default();
         let native_records = native.then(|| cuteafd_loader::plan::exlr8::dense::DenseRecord::inventory(&self.snapshot)).transpose()?;
         let native_dense_records = if native {
             (0..devices.len()).map(|rank| dense_weights::NativeDenseRecords::new(
-                &self.snapshot, layers, devices.len(), rank, &std::collections::BTreeMap::new()))
+                &self.snapshot, layers, devices.len(), rank, &whole_mla))
                 .collect::<Result<Vec<_>>>()?
         } else { Vec::new() };
         let native_selected = if let Some(records) = &native_records {
@@ -982,26 +1024,10 @@ impl Opened {
         })?;
         self.startup_probe(&devices, "glm/programs-before-weights", None, false)?;
         let mut draft_file = None;
-        let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement)
-            .map_err(anyhow::Error::msg)?;
-        let context = if devices.len() == 2 && !matches!(requested,
-            Some(cuteafd_loader::placement::AttentionPlacement::Heads | cuteafd_loader::placement::AttentionPlacement::Layers)) {
-            let sms = devices.iter().map(|&device| crate::shared::peer_split::on_device(
-                &self.library, device, || self.library.sm_count())).collect::<Result<Vec<_>>>()?;
-            cuteafd_loader::placement::families::glm5::manifest_context_for_cards(
-                &self.cfg, &manifest, &sms, attention_plan)?
-        } else { None };
-        let requested = cuteafd_loader::placement::families::glm5::resolve_context_attention(
-            &self.cfg, requested, devices.len(), context.is_some(), !native)?;
-        ensure!(requested != Some(cuteafd_loader::placement::AttentionPlacement::Layers) || devices.len() == 2,
-            "GLM layers attention requires two coordinator GPUs");
-        let owners = (requested == Some(cuteafd_loader::placement::AttentionPlacement::Layers))
-            .then(|| cuteafd_loader::placement::families::glm5::attention_owners(&self.cfg, layers)).transpose()?;
         use cuteafd_loader::placement::{families::glm5 as glm, Baseline};
         let checkpoint = (!native).then(|| cuteafd_loader::plan::Checkpoint::coordinator(dense_catalog.snapshot(), false, false))
             .transpose()?;
         // The EXLR8 checkpoint's own dense records, per coordinator rank.
-        ensure!(!native || owners.is_none(), "EXLR8 native dense runs head or context attention, not whole-layer owners");
         let native_plans = if native {
             (0..devices.len()).map(|rank| crate::shared::experts::exlr8::NativePlan::new(&self.snapshot,
                 args.exlr8_manifest.as_deref().context("EXLR8 manifest")?,
@@ -1340,7 +1366,7 @@ impl Opened {
         let mut whole_weights = None;
         let (embedding, ((model, mut shares), tp2)) = crate::shared::placement::load_while_admitting(admission, || {
             if let Some(records) = &native_records {
-                let loaded = self.load_native(args, records, &native_dense_records, layers, &programs, &manifest, &loader, &devices, stream,
+                let loaded = self.load_native(args, records, &native_dense_records, owners.as_deref(), layers, &programs, &manifest, &loader, &devices, stream,
                     peer_stream, native_push.take(), &media, &ml4_draft, &mut draft_file)?;
                 planned_drafter = loaded.3;
                 let tp2 = if let Some(range) = tp2_range.clone() {
@@ -1641,7 +1667,7 @@ impl Opened {
     /// Native vocabulary, dense operands and drafter share the existing group.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn load_native<'s>(&'s self, args: &EngineArgs, records: &[cuteafd_loader::plan::exlr8::dense::DenseRecord],
-        per_rank: &[dense_weights::NativeDenseRecords], layers: usize, programs: &'s cuteafd_ffi::programs::Programs<'s>, _manifest: &serde_json::Value,
+        per_rank: &[dense_weights::NativeDenseRecords], owners: Option<&[u8]>, layers: usize, programs: &'s cuteafd_ffi::programs::Programs<'s>, _manifest: &serde_json::Value,
         loader: &weights::GlmLoader<'s>, devices: &[i32], stream: *mut c_void, _peer_stream: Option<(i32, *mut c_void)>,
         push: Option<(crate::shared::experts::rtx::push::CoordinatorPush, usize)>,
         media: &crate::shared::experts::rtx::dense::Records,
@@ -1673,7 +1699,7 @@ impl Opened {
         let ((model, shares), pushed) = match push {
             Some((push, sparks)) => {
                 let load = crate::shared::experts::rtx::dense::DenseLoad::push(&self.library);
-                let model = loader.native_model(&self.cfg, layers, &per_rank, &load, vocabulary.clone())?;
+                let model = loader.native_model(&self.cfg, layers, &per_rank, owners, &load, vocabulary.clone())?;
                 planned_drafter = Some(self.load_drafter(args, programs, &embedding, stream, ml4_draft, draft_file)?);
                 let mut records = recorder.context("native push recorder")?.finish();
                 records.extend(load.sink.as_ref().context("push sink")?.take_all());
@@ -1691,7 +1717,7 @@ impl Opened {
             }
             None => {
                 let load = crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library);
-                (loader.native_model(&self.cfg, layers, &per_rank, &load, vocabulary.clone())?, None)
+                (loader.native_model(&self.cfg, layers, &per_rank, owners, &load, vocabulary.clone())?, None)
             }
         };
         self.library.cuda_set_device(args.device)?;
@@ -1715,6 +1741,13 @@ impl Opened {
         crate::shared::token_io::EmbedSource::new(catalog.snapshot(), &tensor.shard, &tensor.metadata,
             self.cfg.hidden)
     }
+}
+
+fn dump_golden_layer(dir: &std::path::Path, layer: usize, stream: &[u8]) -> Result<()> {
+    ensure!(stream.len() % 2 == 0, "golden layer dump must contain complete BF16 elements");
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join(format!("layer{layer:02}.bin")), stream)?;
+    Ok(())
 }
 
 fn bf16s(bytes: &[u8]) -> Vec<f32> {
@@ -2173,7 +2206,10 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
     };
     let mut worst = Vec::new();
     let logits = engine.prefill(&mut placement, &tokens[..prefill], transport.as_deref_mut().map(|t| (t, runtime)),
-        Some(&mut |layer, stream| compare(layer, 0, stream, &mut worst)))?;
+        Some(&mut |layer, stream| {
+            if let Some(dir) = &args.layer_dump { dump_golden_layer(dir, layer, stream)?; }
+            compare(layer, 0, stream, &mut worst)
+        }))?;
     let prefill_seconds = started.elapsed().as_secs_f64();
     let started = Instant::now();
     let mut decode_worst = Vec::new();

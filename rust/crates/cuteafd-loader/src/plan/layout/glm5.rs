@@ -537,8 +537,8 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let attention = requested.unwrap_or(if split { crate::placement::AttentionPlacement::Context }
         else { crate::placement::AttentionPlacement::Heads });
     anyhow::ensure!(attention == crate::placement::AttentionPlacement::Heads
-        || (split && attention == crate::placement::AttentionPlacement::Context),
-        "GLM EXLR8 requires heads or two-GPU context attention");
+        || (split && matches!(attention, crate::placement::AttentionPlacement::Context | crate::placement::AttentionPlacement::Layers)),
+        "GLM EXLR8 requires heads or two-GPU context/layers attention");
     let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
     let rows = if options.prefill_rows == 0 { 4096 } else { options.prefill_rows };
     let context = if options.context_tokens == 0 { 1 << 20 } else { options.context_tokens };
@@ -549,7 +549,16 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     cuteafd_core::coordinator_programs::select_attention_plans(&mut manifest, plan,
         |name| cuteafd_core::coordinator_programs::CoordinatorPrograms {
             family: "glm", split_family: Some("glm2") }.contains(name))?;
-    let scratch = glm::manifest_scratch(&cfg, split, &manifest)?;
+    let owners = (attention == crate::placement::AttentionPlacement::Layers)
+        .then(|| glm::attention_owners(&cfg, cfg.layers)).transpose()?;
+    let whole_mla = owners.as_ref().map(|owners| owners.iter().enumerate()
+        .map(|(layer, &rank)| (layer, usize::from(rank))).collect()).unwrap_or_default();
+    let mut scratch = glm::manifest_scratch(&cfg, split, &manifest)?;
+    if owners.is_some() {
+        for (split, whole) in scratch.iter_mut().zip(glm::manifest_scratch(&cfg, false, &manifest)?) {
+            split.programs = split.programs.max(whole.programs);
+        }
+    }
     let context_programs = if attention == crate::placement::AttentionPlacement::Context {
         let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
             "sm_120", options.rtx_bytes[0]).sms) as usize;
@@ -568,15 +577,15 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         }).collect::<anyhow::Result<Vec<_>>>()?;
         let backbone = selection.backbone(&selected, cfg.layers)?;
         (0..gpu_count).map(|rank| -> anyhow::Result<_> {
-            let plan = DensePlan::for_rank(&selected, gpu_count, rank)?;
-            let scratch_plan = DensePlan::for_rank(&backbone, gpu_count, rank)?;
+            let plan = DensePlan::for_rank_owned(&selected, gpu_count, rank, &whole_mla)?;
+            let scratch_plan = DensePlan::for_rank_owned(&backbone, gpu_count, rank, &whole_mla)?;
             let layouts = crate::families::glm5::native::scratch_layouts(&cfg, &backbone, &scratch_plan,
                 glm::DECODE_ROWS as usize, rows as usize,
                 options.exlr8_prefill_activations == crate::plan::exlr8::PrefillActivations::A8)?;
             dense_scratch.push(crate::families::glm5::native::scratch_bytes(&layouts)?);
             Ok(resident_native(&selection, cfg.layers, &plan)?)
         }).collect::<anyhow::Result<Vec<_>>>()?
-    } else { resident_owned(checkpoint, gpu_count, cfg.layers, None)? };
+    } else { resident_owned(checkpoint, gpu_count, cfg.layers, owners.as_deref())? };
     let lanes = options.prefill_waves;
     let mut devices = Vec::new();
     let mut loaded_weights = Vec::new();
@@ -694,7 +703,10 @@ mod tests {
         assert_eq!(heads, without_context);
         assert!(matches!(solve(&missing, None).unwrap_err().downcast_ref::<crate::placement::PlacementError>(),
             Some(crate::placement::PlacementError::MissingContextPrograms { .. })));
-        assert!(solve(&manifest, Some(AttentionPlacement::Layers)).is_err());
+        let (_, layers) = solve(&missing, Some(AttentionPlacement::Layers)).unwrap();
+        assert_eq!(layers.attention_placement, AttentionPlacement::Layers);
+        assert!(layers.layers.iter().all(|layer| matches!(layer.mode,
+            LayerMode::Whole { ffn: crate::placement::FfnMode::Split, .. })));
     }
 
     #[test]
