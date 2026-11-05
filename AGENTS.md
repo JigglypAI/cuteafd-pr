@@ -317,6 +317,10 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   allocation; zero steady-state graph captures per request.
 - Rust: typed errors inside crates, `anyhow` at edges, `tracing`, no
   `unsafe` outside FFI and verbs layers, each block with a safety comment.
+- A change that adds, removes or changes a user-facing launch key, a
+  `./run.sh` option, a default, or a family's accepted values updates
+  `docs/options.md` in the same PR; `scripts/tests/test_options_doc.py`
+  checks the family and attention tables against the launcher.
 - Keep weights, build artifacts, benchmark runs and local config out of Git
   (published reports under `benchmarks/` are the exception).
 
