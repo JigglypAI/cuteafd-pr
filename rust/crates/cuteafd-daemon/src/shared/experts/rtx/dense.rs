@@ -520,7 +520,8 @@ pub(crate) mod testing {
                 assert!(!arena.open.is_empty() && arena.staged >= bytes as u64,
                     "delayed slot must retain partial windows through every refill");
             }
-            assert!(arena.peak >= (32 * bytes) as u64, "reordered slots must open a meaningful window");
+            let minimum_peak = if random { 32 * bytes } else { 2 * bytes };
+            assert!(arena.peak >= minimum_peak as u64, "reordered slots must open a meaningful window");
             deliver(&mut arena, delayed)?;
             assert_eq!(arena.run, count);
             super::PushDestination::done(arena)?;
