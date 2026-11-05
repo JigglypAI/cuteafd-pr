@@ -213,7 +213,7 @@ impl Fixture {
 
     pub fn module_path(&self) -> &std::path::Path { &self.module }
 
-    /// Register unmodified installed program ABI metadata; launches still fail.
+    /// Register program ABI metadata; launches fail unless a reply behavior is registered.
     pub fn register_programs(&self, library: &NativeLibrary, entries: &[serde_json::Value]) -> Result<()> {
         for (index, entry) in entries.iter().enumerate() {
             let name = CString::new(entry["name"].as_str().context("fixture program name missing")?)?;
@@ -232,6 +232,17 @@ impl Fixture {
             };
             anyhow::ensure!(status == 0, "fixture rejected installed program {index}");
         }
+        Ok(())
+    }
+
+    /// Attach an explicit readiness check and dispatch marker to a registered reply program.
+    pub fn register_reply(&self, library: &NativeLibrary, index: u32, ready: u32, event: u8) -> Result<()> {
+        // SAFETY: the fixture validates the index and copies these scalar values.
+        let status = unsafe {
+            library.lib.get::<unsafe extern "C" fn(u32, u32, c_char) -> i32>(
+                b"fixture_register_reply")?(index, ready, event as c_char)
+        };
+        anyhow::ensure!(status == 0, "fixture rejected reply program {index}");
         Ok(())
     }
 
