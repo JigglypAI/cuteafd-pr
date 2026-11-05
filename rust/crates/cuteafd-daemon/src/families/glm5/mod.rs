@@ -1139,7 +1139,7 @@ impl Opened {
                 glm::GlmLocalFormat::Nvfp4 { .. } => {
                     let tensors = self.catalog.fp8().context("NVFP4 tensors")?;
                     for rank in 0..2 {
-                        let plan = crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::plan(tensors, &local.package, rank, max_rows)?;
+                        let plan = crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::plan(tensors, &local.package, &[tensors.shape().first_layer], rank, max_rows)?;
                         ensure!(plan.workspace_bytes as u64 == local.backend_workspace,
                             "GLM NVFP4 planner/runtime backend workspace mismatch");
                     }
@@ -1210,7 +1210,7 @@ impl Opened {
                     glm::GlmLocalFormat::Exl3 => crate::shared::experts::rtx::exl3::Exl3Tp2::workspace_bytes_for(
                         &local.package, self.cfg.hidden, max_rows)?,
                     glm::GlmLocalFormat::Nvfp4 { .. } => crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::plan(
-                        self.catalog.fp8().context("NVFP4 tensors")?, &local.package, 0, max_rows)?.workspace_bytes,
+                        self.catalog.fp8().context("NVFP4 tensors")?, &local.package, &range.clone().collect::<Vec<_>>(), 0, max_rows)?.workspace_bytes,
                     glm::GlmLocalFormat::Exlr8 => anyhow::bail!("EXLR8 experts require native dense planning"),
                 };
                 Ok(crate::shared::experts::rtx::push::CoordinatorExperts::Tp2 {

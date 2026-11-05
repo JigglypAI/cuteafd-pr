@@ -206,8 +206,8 @@ pub(super) fn dual_experts(args: &EngineArgs, catalog: &cuteafd_loader::Official
         let tensors = catalog.fp8().context("Qwen dual experts need EXL3/FP8/NVFP4")?;
         let directory = args.fp8_package.clone().unwrap_or_else(||
             crate::shared::experts::fp8::package_directory(&args.native_lib, 2, tensors.format()));
-        let plans = [Fp8MoeTp2::plan(tensors, &directory, 0, rows)?,
-            Fp8MoeTp2::plan(tensors, &directory, 1, rows)?];
+        let plans = [Fp8MoeTp2::plan(tensors, &directory, &[tensors.shape().first_layer], 0, rows)?,
+            Fp8MoeTp2::plan(tensors, &directory, &[tensors.shape().first_layer], 1, rows)?];
         for rank in 0..2 {
             ensure!(plans[rank].slicing == Slicing::Blocks(128),
                 "Qwen dual experts require complete-H128 exact rank packages; padded TP2 is unsupported");

@@ -269,7 +269,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 unit_bytes_context: None },
             fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false, colocate: None,
             experts: (!cfg.dense[layer]).then_some(ExpertCost { whole: if gpus == 1 { costs[layer][0] } else { Bytes2::default() },
-                half: costs[layer], tp2: gpus == 2, spark_ok: true }), modes: if gpus == 1 { vec![WHOLE] } else if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } })
+                half: costs[layer], tp2: gpus == 2, whole_supported: true, spark_ok: true }), modes: if gpus == 1 { vec![WHOLE] } else if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } })
     }).collect() })();
     let layers = match layers { Ok(value) => value, Err(error) => {
         report.refuse_placement(format!("Kimi packed layer inventory refused: {error:#}"), "Check checkpoint layer geometry."); return memory;

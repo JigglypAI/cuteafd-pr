@@ -20,7 +20,7 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
         layers: (0..layers).map(|_| LayerDemand { kind: AttentionClass::Csa, weights: ModeBytes::default(),
             kv_unit: ModeBytes::default().into(), colocate: None,
             fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false,
-            experts: Some(ExpertCost { whole: Bytes2 { resident: GIB, staging: GIB / 4 }, half: [Bytes2::default(); 2], tp2: false, spark_ok: true }),
+            experts: Some(ExpertCost { whole: Bytes2 { resident: GIB, staging: GIB / 4 }, half: [Bytes2::default(); 2], tp2: false, whole_supported: true, spark_ok: true }),
             modes: vec![LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] }).collect(),
         pool_bounded: Vec::new(),
         pool_overhead: vec![UNIT; gpus],
@@ -42,6 +42,30 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
 /// V4 as `deepseek_v4::request` builds it without the C4 context programs: heads or GPU0 only.
 const V4_HEADS: ExecutorModes = ExecutorModes { modes: &[LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
     attention: AttentionPlacement::Heads, ..families::DEEPSEEK_V4 };
+
+#[test]
+fn unsupported_native_format_stops_tp1_and_tp2_prefixes() {
+    for gpus in [1, 2] {
+        for alternating in [false, true] {
+            for tp2 in [false, true] {
+                if tp2 && (gpus == 1 || alternating) { continue; }
+                let mut req = request(gpus, 64 * GIB, 4, 4, Onboard::Auto);
+                if alternating { req.policy.expert_ownership = ExpertOwnership::AlternatingWhole; }
+                for (layer, demand) in req.layers.iter_mut().enumerate() {
+                    let cost = demand.experts.as_mut().unwrap();
+                    cost.half = [Bytes2 { resident: GIB / 2, staging: 0 }; 2];
+                    cost.tp2 = tp2 && layer < 2;
+                    cost.whole_supported = layer < 2;
+                }
+                let placed = solve(&req).unwrap();
+                assert_eq!(placed.onboard_layers, 2);
+                assert!(placed.layers[2..].iter().all(|layer| layer.experts == ExpertHome::Spark));
+                req.onboard = Onboard::Layers(3);
+                assert!(solve(&req).is_err());
+            }
+        }
+    }
+}
 
 #[test]
 fn resident_weight_cap_counts_loaded_facts_independently_of_allocation_and_category() {
@@ -914,7 +938,7 @@ fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
             layer.fixed_bytes = ModeBytes::replicated(state_unit);
             layer.modes = vec![LayerMode::HeadSplit, LayerMode::ContextSplit, S0, S1];
             layer.experts = (i >= 2).then_some(ExpertCost { whole: Bytes2::default(),
-                half: [Bytes2 { resident: half, staging: 0 }; 2], tp2: true, spark_ok: true });
+                half: [Bytes2 { resident: half, staging: 0 }; 2], tp2: true, whole_supported: true, spark_ok: true });
         }
         assert_eq!(req.layers.iter().filter(|l| l.context_indexer).count(), c4);
         let records = req.layers.iter().map(|l| l.kv_unit.unit_bytes_whole).sum::<u64>() * 8192;
@@ -955,7 +979,7 @@ fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
         layer.modes = if mla { vec![LayerMode::HeadSplit, LayerMode::ContextSplit, S0, S1] }
             else { vec![LayerMode::HeadSplit] };
         layer.experts = (i >= 3).then_some(ExpertCost { whole: Bytes2::default(),
-            half: [Bytes2 { resident: (115.59 * GIB as f64 / 42.0 / 2.0) as u64, staging: 0 }; 2], tp2: true, spark_ok: true });
+            half: [Bytes2 { resident: (115.59 * GIB as f64 / 42.0 / 2.0) as u64, staging: 0 }; 2], tp2: true, whole_supported: true, spark_ok: true });
     }
     req.fixed = [20_100_569_073, 15_815_582_073].into_iter().enumerate().map(|(gpu, bytes)|
         Demand::new(gpu as u8, Category::Workspace, "P2 fixed", bytes, Basis::Estimated)).collect();
@@ -1431,7 +1455,7 @@ fn layer_switch_balances_mandatory_unequal_tp2_not_optional_residency() {
     for layer in &mut req.layers {
         layer.experts = Some(ExpertCost { whole: Bytes2::default(),
             half: [Bytes2 { resident: 3 * GIB, staging: 0 }, Bytes2 { resident: 2 * GIB, staging: 0 }],
-            tp2: true, spark_ok: true });
+            tp2: true, whole_supported: true, spark_ok: true });
     }
     req.pool.target = 128 << 20;
     // No optional expert fits after this large automatic pool.
@@ -2051,7 +2075,7 @@ fn fixed_expert_refusal_includes_experts_after_conditional_draft() {
     req.pool.ceiling = 128 << 20;
     for layer in &mut req.layers { layer.modes = vec![S0]; }
     req.layers[0].experts = Some(ExpertCost { whole: Bytes2 { resident: GIB, staging: 0 },
-        half: [Bytes2 { resident: GIB / 2, staging: 0 }; 2], tp2: true, spark_ok: true });
+        half: [Bytes2 { resident: GIB / 2, staging: 0 }; 2], tp2: true, whole_supported: true, spark_ok: true });
     req.expert_gpus = 2;
     req.tp2_workspace = [GIB / 4; 2];
     let plain = solve(&req).unwrap_err();

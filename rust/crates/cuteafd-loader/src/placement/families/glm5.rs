@@ -491,7 +491,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         // explicit local requests must fail, not turn these into dense layers.
         experts: if inputs.skip_routed_experts { None } else {
             layer.checked_sub(cfg.first_moe_layer).map(|i| inputs.experts.get(i).copied().unwrap_or(ExpertCost {
-                whole: Bytes2::default(), half: [Bytes2::default(); 2], tp2: false, spark_ok: true }))
+                whole: Bytes2::default(), half: [Bytes2::default(); 2], tp2: false, whole_supported: true, spark_ok: true }))
         },
         modes: match (gpus, inputs.context) {
             // Whole-attention variants: the layers request adds the owner modes.
@@ -980,7 +980,7 @@ pub fn local_inventory_selected(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41
             }
         }
         experts.push(ExpertCost { whole: Bytes2 { resident: whole, staging: 0 }, half,
-            tp2: true, spark_ok: true });
+            tp2: true, whole_supported: true, spark_ok: true });
     }
     Ok(LocalInventory { package, format: GlmLocalFormat::Exl3, experts, backend_workspace,
         extra_workspace: local_extra_workspace(shape.hidden as u64, shape.experts as u64,
@@ -1040,17 +1040,17 @@ fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Pa
     anyhow::ensure!(library.is_file(), "GLM TP2 missing binary {}", library.display());
     let backend_workspace = scratch.checked_add(max_rows * shape.hidden as u64 * 2)
         .ok_or_else(|| anyhow::anyhow!("GLM TP2 NVFP4 workspace overflow"))?;
-    let resident = |tp, rank| native_layer_resident(tensors, tp, rank, Slicing::Blocks(128));
-    let whole = Bytes2 { resident: resident(1, 0)?, staging: 0 };
-    let halves = [resident(2, 0)?, resident(2, 1)?];
     let experts = (shape.first_layer..selected_layers).map(|layer| -> anyhow::Result<ExpertCost> {
-        tensors.validate_layer(layer)?;
-        let mut half = halves.map(|resident| Bytes2 { resident, staging: 0 });
+        let view = tensors.for_coordinator().for_layer(layer)?;
+        let supported = view.format() == tensors.format();
+        let resident = |tp, rank| native_layer_resident(&view, tp, rank, Slicing::Blocks(128));
+        let whole = Bytes2 { resident: resident(1, 0)?, staging: 0 };
+        let mut half = [resident(2, 0)?, resident(2, 1)?].map(|resident| Bytes2 { resident, staging: 0 });
         for suffix in ["weight", "e_score_correction_bias"] {
             half[1].resident += catalog.tensor(&format!("model.layers.{layer}.mlp.gate.{suffix}"))?
                 .metadata.byte_length.max(FLOOR);
         }
-        Ok(ExpertCost { whole, half, tp2: true, spark_ok: true })
+        Ok(ExpertCost { whole, half, tp2: supported, whole_supported: supported, spark_ok: true })
     }).collect::<anyhow::Result<Vec<_>>>()?;
     Ok(LocalInventory { package, format: GlmLocalFormat::Nvfp4 { w4a4 }, experts, backend_workspace,
         extra_workspace: local_extra_workspace(shape.hidden as u64, shape.experts as u64,
@@ -1181,7 +1181,7 @@ mod tests {
             drafter_bytes: 3 * GIB, drafter_staging: 0, pending_code: vec![],
             experts: (cfg.first_moe_layer..cfg.layers).map(|_| ExpertCost {
                 whole: Bytes2 { resident: 4 * GIB, staging: 0 }, half: [Bytes2 { resident: 2 * GIB, staging: 0 }; 2],
-                tp2: cards.len() == 2, spark_ok: true }).collect(),
+                tp2: cards.len() == 2, whole_supported: true, spark_ok: true }).collect(),
             expert_workspace: 128 << 20, tp2_workspace: [128 << 20; 2], requested_pool: None,
             onboard: default_onboard(), full_prefill_logits: false, context: None }
     }

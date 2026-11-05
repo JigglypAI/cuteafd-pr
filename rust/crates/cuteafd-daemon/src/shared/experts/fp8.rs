@@ -24,21 +24,25 @@ use crate::shared::memory::weight_arena::ReadyArena;
 pub(super) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8ExpertTensors, layers: &[usize],
     tp: usize, rank: usize, slicing: Slicing) -> Result<()> {
     let shape = tensors.shape();
-    let weights = match tensors.format() {
-        ExpertFormat::Bf16 => Fp8MoeWeights::Bf16,
-        ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
-        ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
-        ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4,
-    };
     ensure!(info.hidden == shape.hidden && info.experts == shape.experts && info.topk == shape.topk
-        && info.intermediate == shape.intermediate && info.tp == tp && info.weights == weights
-        && layers.iter().all(|&layer| tensors.for_layer(layer)
-            .and_then(|view| view.rank_width(tp, rank, slicing)).is_ok_and(|width| width == info.slice)),
-        "expert package does not serve checkpoint geometry/storage at TP{tp}: {info:?}");
-    ensure!(!matches!(weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4) || !info.wire_input,
-        "native BF16/NVFP4 weights require BF16 input");
+        && info.intermediate == shape.intermediate && info.tp == tp,
+        "expert package does not serve checkpoint geometry at TP{tp}: {info:?}");
     for &layer in layers {
-        tensors.validate_layer(layer)?;
+        let view = tensors.for_layer_metadata(layer)?;
+        let weights = match view.format() {
+            ExpertFormat::Bf16 => Fp8MoeWeights::Bf16,
+            ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
+            ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
+            ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4,
+        };
+        ensure!(info.weights == weights,
+            "expert layer {layer}: checkpoint dtype/layout {:?} has no matching RTX package (selected {:?})",
+            view.format(), info.weights);
+        ensure!(view.rank_width(tp, rank, slicing)? == info.slice,
+            "expert layer {layer}: package slice {} differs from checkpoint TP{tp} rank {rank}", info.slice);
+        ensure!(!matches!(weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4) || !info.wire_input,
+            "expert layer {layer}: native BF16/NVFP4 weights require BF16 input");
+        view.validate_layer(layer)?;
         let activation = tensors.activation(layer).unwrap_or(shape.geometry()?.activation());
         let (mode, limit) = match activation {
             cuteafd_core::FfnActivation::SiluBf16Product { limit } =>

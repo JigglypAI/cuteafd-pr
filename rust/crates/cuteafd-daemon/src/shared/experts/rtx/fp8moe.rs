@@ -20,21 +20,11 @@ pub(crate) struct Fp8MoeTp2Plan {
     pub workspace_bytes: usize,
 }
 
-fn validate_info(info: &Fp8MoeInfo, tensors: &Fp8ExpertTensors, rank: usize, slicing: Slicing,
+fn validate_info(info: &Fp8MoeInfo, tensors: &Fp8ExpertTensors, layers: &[usize], rank: usize, slicing: Slicing,
     max_rows: usize) -> Result<()> {
     ensure!(rank < 2 && max_rows > 0, "invalid FP8 MoE TP2 rank/capacity");
-    let shape = tensors.shape();
-    let weights_match = matches!((tensors.format(), info.weights),
-        (ExpertFormat::Fp8Block128, Fp8MoeWeights::Fp8)
-        | (ExpertFormat::Bf16, Fp8MoeWeights::Bf16)
-        | (ExpertFormat::Mxfp4, Fp8MoeWeights::Mxfp4)
-        | (ExpertFormat::Nvfp4, Fp8MoeWeights::Nvfp4));
-    ensure!(!info.wire_input && info.tp == 2 && info.hidden == shape.hidden
-        && info.intermediate == shape.intermediate && info.experts == shape.experts
-        && info.topk == shape.topk && info.slice == tensors.rank_width(2, rank, slicing)? && weights_match,
-        "FP8 MoE TP2 package does not serve this checkpoint with BF16 input: {info:?}");
-    let layers = (shape.first_layer..shape.layers).filter(|&layer| tensors.has_layer(layer)).collect::<Vec<_>>();
-    super::super::fp8::validate_checkpoint_contract(info, tensors, &layers, 2, rank, slicing)?;
+    ensure!(!info.wire_input, "FP8 MoE TP2 package requires BF16 input");
+    super::super::fp8::validate_checkpoint_contract(info, tensors, layers, 2, rank, slicing)?;
     ensure!(info.capacity_for(max_rows).is_some(), "FP8 MoE TP2 package has no capacity for {max_rows} rows");
     Ok(())
 }
@@ -75,16 +65,16 @@ impl<'a> Fp8MoeTp2<'a> {
 
     /// Static package ABI only: no CUDA initialization or device allocation.
     /// The directory is the padded tp2 layout; exact_layout selects its sibling.
-    pub(crate) fn plan(tensors: &Fp8ExpertTensors, directory: &Path, rank: usize,
+    pub(crate) fn plan(tensors: &Fp8ExpertTensors, directory: &Path, layers: &[usize], rank: usize,
         max_rows: usize) -> Result<Fp8MoeTp2Plan> {
-        ensure!(rank < 2, "invalid FP8 MoE TP2 rank");
-        let coordinator = tensors.for_coordinator();
+        validate_layers(layers, tensors.shape(), rank)?;
+        let coordinator = tensors.for_coordinator().for_layer_metadata(layers[0])?;
         let tensors = &coordinator;
         let (directory, slicing) = exact_layout(directory, tensors, 2, rank);
         // SAFETY: the engine selects a trusted, generated package; the read
         // calls only its static geometry and scratch ABI, not CUDA creation.
         let metadata = unsafe { Fp8MoeMetadata::read(&directory) }?;
-        validate_info(&metadata.info, tensors, rank, slicing, max_rows)?;
+        validate_info(&metadata.info, tensors, layers, rank, slicing, max_rows)?;
         let resident_layer_bytes = Fp8Layer::bytes_for(tensors, 2, rank, slicing)?;
         let (scratch_bytes, output_bytes, workspace_bytes) =
             workspace(metadata.scratch_for(max_rows)?, tensors.shape().hidden, max_rows)?;
@@ -104,7 +94,7 @@ impl<'a> Fp8MoeTp2<'a> {
             "invalid pushed FP8 MoE TP2 device pair");
         validate_layers(&layers, tensors.shape(), 0)?;
         for rank in 0..2 {
-            let plan = Self::plan(tensors, directory, rank, max_rows)?;
+            let plan = Self::plan(tensors, directory, &layers, rank, max_rows)?;
             let required = plan.resident_layer_bytes.checked_mul(layers.len())
                 .and_then(|bytes| bytes.checked_add(plan.workspace_bytes)).context("FP8 TP2 admission overflow")?;
             ensure!(required <= budgets[rank], "pushed FP8 TP2 rank {rank} exceeds admitted budget");
@@ -117,10 +107,10 @@ impl<'a> Fp8MoeTp2<'a> {
     #[allow(clippy::too_many_arguments)]
     fn bind_rank(device: Device<'a>, tensors: &Fp8ExpertTensors, directory: &Path,
         layers: Vec<usize>, rank: usize, max_rows: usize, budget: usize, pushed: Option<Vec<Fp8Layer<'a>>>) -> Result<Self> {
-        let coordinator = tensors.for_coordinator();
-        let tensors = &coordinator;
         validate_layers(&layers, tensors.shape(), rank)?;
-        let plan = Self::plan(tensors, directory, rank, max_rows)?;
+        let coordinator = tensors.for_coordinator().for_layer_metadata(layers[0])?;
+        let tensors = &coordinator;
+        let plan = Self::plan(tensors, directory, &layers, rank, max_rows)?;
         let resident = plan.resident_layer_bytes.checked_mul(layers.len())
             .context("FP8 MoE TP2 resident size overflow")?;
         ensure!(resident.checked_add(plan.workspace_bytes).context("FP8 MoE TP2 allocation size overflow")? <= budget,
@@ -152,12 +142,12 @@ impl<'a> Fp8MoeTp2<'a> {
         layers: Vec<usize>, max_rows: usize, budgets: [usize; 2]) -> Result<[Self; 2]> {
         ensure!(devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
             "invalid FP8 MoE TP2 device pair");
-        let coordinator = tensors.for_coordinator();
-        let tensors = &coordinator;
         validate_layers(&layers, tensors.shape(), 0)?;
+        let coordinator = tensors.for_coordinator().for_layer_metadata(layers[0])?;
+        let tensors = &coordinator;
         let started = std::time::Instant::now();
         let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 FP8 expert layer halves");
-        let plans = [Self::plan(tensors, directory, 0, max_rows)?, Self::plan(tensors, directory, 1, max_rows)?];
+        let plans = [Self::plan(tensors, directory, &layers, 0, max_rows)?, Self::plan(tensors, directory, &layers, 1, max_rows)?];
         for rank in 0..2 {
             let required = plans[rank].resident_layer_bytes.checked_mul(layers.len())
                 .and_then(|n| n.checked_add(plans[rank].workspace_bytes)).context("FP8 MoE TP2 allocation overflow")?;
@@ -285,6 +275,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn selected_fp8_push_ignores_unselected_bf16_expert_layer() -> Result<()> {
+        use cuteafd_loader::plan::testing::{fp8, t, write_snapshot};
+        let root = tempfile::tempdir()?;
+        let mut weights = Vec::new();
+        for layer in 0..2 {
+            for expert in 0..8 {
+                for (projection, n, k) in [("gate", 256, 4096), ("up", 256, 4096), ("down", 4096, 256)] {
+                    let name = format!("model.layers.{layer}.mlp.experts.{expert}.{projection}_proj");
+                    weights.extend(if layer == 0 { fp8(&name, n, k, None) }
+                        else { vec![t(format!("{name}.weight"), "BF16", &[n, k])] });
+                }
+            }
+        }
+        write_snapshot(root.path(), &serde_json::json!({}), &weights, None);
+        let tensors = Fp8ExpertTensors::read(root.path(), cuteafd_loader::RoutedExpertShape {
+            layers: 2, first_layer: 0, experts: 8, topk: 8, hidden: 4096, intermediate: 256,
+            draft_stages: 0, draft_experts: 0 })?;
+        let info = Fp8MoeInfo { hidden: 4096, intermediate: 256, slice: 128, experts: 8, topk: 8,
+            tp: 2, wire_input: false, swiglu_limit: 10.0,
+            activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product,
+            projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16,
+            capacities: vec![1, 16], weights: Fp8MoeWeights::Fp8 };
+        validate_info(&info, &tensors, &[0], 0, Slicing::Blocks(128), 16)?;
+        let error = validate_info(&info, &tensors, &[1], 0, Slicing::Blocks(128), 16).unwrap_err();
+        assert!(error.to_string().contains("layer 1") && error.to_string().contains("Bf16"), "{error:#}");
+        let mut bf16 = info.clone();
+        bf16.weights = Fp8MoeWeights::Bf16;
+        validate_info(&bf16, &tensors, &[1], 0, Slicing::Blocks(128), 16)?;
+        for selected in [vec![(0, Slicing::Blocks(128))], vec![(0, Slicing::Blocks(128)), (1, Slicing::Blocks(128))]] {
+            crate::shared::memory::push_fp8::RankPlan::from_tensors(&tensors, &selected, 2, 0, usize::MAX)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_push_refuses_unadmitted_single_expert_plane_padding() -> Result<()> {
+        use cuteafd_loader::plan::testing::{fp8, write_snapshot};
+        let root = tempfile::tempdir()?;
+        let mut weights = Vec::new();
+        for (projection, n, k) in [("gate", 256, 4096), ("up", 256, 4096), ("down", 4096, 256)] {
+            weights.extend(fp8(&format!("model.layers.0.mlp.experts.0.{projection}_proj"), n, k, None));
+        }
+        write_snapshot(root.path(), &serde_json::json!({}), &weights, None);
+        let tensors = Fp8ExpertTensors::read(root.path(), cuteafd_loader::RoutedExpertShape {
+            layers: 1, first_layer: 0, experts: 1, topk: 1, hidden: 4096, intermediate: 256,
+            draft_stages: 0, draft_experts: 0 })?;
+        assert_eq!(tensors.scale_region_bytes_with(cuteafd_loader::formats::fp8_experts::Fp8Projection::Gate,
+            2, 0, Slicing::Blocks(128))?, 128);
+        let error = crate::shared::memory::push_fp8::RankPlan::from_tensors(&tensors,
+            &[(0, Slicing::Blocks(128))], 2, 0, usize::MAX).err().expect("unaligned scale plane must be refused");
+        assert!(error.to_string().contains("native push plane alignment exceeds mount admission"), "{error:#}");
+        Ok(())
+    }
+
+    #[test]
     fn sparse_backbone_inventory_preserves_ids_and_rejects_gaps() -> Result<()> {
         let shape = cuteafd_loader::RoutedExpertShape { layers: 18, first_layer: 3,
             experts: 1, topk: 1, hidden: 256, intermediate: 256, draft_stages: 1, draft_experts: 1 };
@@ -338,17 +383,17 @@ mod tests {
                         ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
                         ExpertFormat::Bf16 => Fp8MoeWeights::Bf16,
                         ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4 } };
-                validate_info(&info, &tensors, rank, Slicing::Blocks(128), 4096)?;
-                assert!(validate_info(&info, &tensors, 2, Slicing::Blocks(128), 16).is_err());
-                assert!(validate_info(&info, &tensors, rank, Slicing::Blocks(128), 4097).is_err());
+                validate_info(&info, &tensors, &[0], rank, Slicing::Blocks(128), 4096)?;
+                assert!(validate_info(&info, &tensors, &[0], 2, Slicing::Blocks(128), 16).is_err());
+                assert!(validate_info(&info, &tensors, &[0], rank, Slicing::Blocks(128), 4097).is_err());
                 info.wire_input = true;
-                assert!(validate_info(&info, &tensors, rank, Slicing::Blocks(128), 16).is_err());
+                assert!(validate_info(&info, &tensors, &[0], rank, Slicing::Blocks(128), 16).is_err());
                 info.wire_input = false;
                 info.tp = 1;
-                assert!(validate_info(&info, &tensors, rank, Slicing::Blocks(128), 16).is_err());
+                assert!(validate_info(&info, &tensors, &[0], rank, Slicing::Blocks(128), 16).is_err());
                 info.tp = 2;
                 info.slice += 128;
-                assert!(validate_info(&info, &tensors, rank, Slicing::Blocks(128), 16).is_err());
+                assert!(validate_info(&info, &tensors, &[0], rank, Slicing::Blocks(128), 16).is_err());
             }
         }
         Ok(())

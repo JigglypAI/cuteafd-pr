@@ -950,6 +950,39 @@ fn routed_catalog_preserves_native_formats_activation_and_target_bounds() {
 }
 
 #[test]
+fn mixed_native_onboarding_prices_actual_formats_and_excludes_other_packages() -> anyhow::Result<()> {
+    use crate::formats::fp8_experts::{ExpertFormat, Fp8Projection, Slicing};
+    let check = |path: &std::path::Path| -> anyhow::Result<()> {
+        let catalog = crate::read_expert_catalog(path)?;
+        let tensors = catalog.fp8().unwrap();
+        for tp2 in [false, true] {
+            let costs = crate::placement::rtx_onboard::expert_costs(&catalog, tp2)?;
+            for layer in 3..91 {
+                let view = tensors.for_coordinator().for_layer(layer)?;
+                let expected = |tp, rank| -> anyhow::Result<u64> {
+                    Fp8Projection::ALL.iter().try_fold(0u64, |sum, &p| {
+                        let (w, _) = view.slice_bytes_with(p, tp, rank, Slicing::Blocks(128))?;
+                        Ok(sum + (w * view.shape().experts).max(256) as u64
+                            + view.scale_region_bytes_with(p, tp, rank, Slicing::Blocks(128))?.max(256) as u64)
+                    })
+                };
+                let cost = costs[layer - 3];
+                assert_eq!(cost.whole.resident, expected(1, 0)?, "layer {layer}");
+                assert_eq!(cost.whole_supported, layer < 88, "layer {layer}");
+                assert_eq!(cost.tp2, tp2 && layer < 88, "layer {layer}");
+                if tp2 { for rank in 0..2 { assert_eq!(cost.half[rank].resident, expected(2, rank)?); } }
+                if layer >= 88 { assert_eq!(view.format(), ExpertFormat::Bf16); }
+            }
+            assert!(costs[85].whole.resident > costs[0].whole.resident);
+        }
+        Ok(())
+    };
+    check(snapshot("fp8").path())?;
+    if let Some(path) = std::env::var_os("CUTEAFD_STEP5_HEADER_SNAPSHOT") { check(std::path::Path::new(&path))?; }
+    Ok(())
+}
+
+#[test]
 fn mixed_native_assignment_matches_each_worker_groups_exact_units() {
     use crate::formats::fp8_experts::Slicing;
     use crate::placement::{SparkAssignment, SparkResidentLayout, SparkWorkingSet};

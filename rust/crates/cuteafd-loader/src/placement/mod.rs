@@ -285,6 +285,8 @@ pub struct ExpertCost {
     /// Half-width TP2 layers exist for this build (placement PR 4): on two
     /// RTX with peer access the layer's RTX home is `RtxTp2`, never `RtxWhole`.
     pub tp2: bool,
+    /// The selected homogeneous RTX package can execute this whole layer.
+    pub whole_supported: bool,
     pub spark_ok: bool,
 }
 

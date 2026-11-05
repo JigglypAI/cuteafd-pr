@@ -854,7 +854,7 @@ fn request<const RANKS: usize>(i: Inputs<'_, RANKS>) -> Result<PlacementRequest>
             fixed_bytes: ModeBytes::default(), extra: vec![], context_indexer: false, colocate: None,
             // admit() installs the checkpoint's TP2 rank-slice costs before solve.
             experts: (!cfg.dense[layer]).then_some(ExpertCost { whole: Bytes2::default(),
-                half: [Bytes2::default(); 2], tp2: false, spark_ok: true }),
+                half: [Bytes2::default(); 2], tp2: false, whole_supported: true, spark_ok: true }),
             modes: if RANKS == 1 { vec![WHOLE] } else if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } });
     }
     let mut pool = PoolPolicy::resolve(&i.gpus.map(|gpu| gpu.capacity_bytes), context as u64,
