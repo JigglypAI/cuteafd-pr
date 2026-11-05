@@ -398,24 +398,36 @@ fn record_rows(slice: &DenseSlice, buffers: [CuteafdDeviceBuffer; 2],
     Ok(())
 }
 
+pub(crate) fn row_requests(slice: &DenseSlice) -> Result<Vec<(String, usize)>> {
+    row_lands(slice)?;
+    slice.components.iter().map(|component| Ok((component.suffix.clone(),
+        cuteafd_loader::plan::exlr8::dense::DenseTransform::Identity.allocation_bytes(component)?))).collect()
+}
+
 fn load_rows<'a>(
     library: &'a NativeLibrary,
     slice: &DenseSlice,
     staging: &mut HostAllocation<'a>,
 ) -> Result<RowFp8Weights<'a>> {
+    let requests = row_requests(slice)?;
+    let device = library.cuda_get_device()?;
     let weights = RowFp8Weights {
         payload: DeviceAllocation::named(
             library,
-            slice.components[0].source.bytes,
+            requests[0].1,
             "native-vocabulary-payload",
         )?,
         scales: DeviceAllocation::named(
             library,
-            slice.components[1].source.bytes,
+            requests[1].1,
             "native-vocabulary-scales",
         )?,
         source: [slice.components[0].source.clone(), slice.components[1].source.clone()],
     };
+    for ((name, bytes), buffer) in requests.iter().zip([weights.payload(), weights.scales()]) {
+        ensure!(buffer.bytes == *bytes && buffer.device_id == device && !buffer.ptr.is_null(),
+            "{name}: native vocabulary allocation differs from request");
+    }
     if dense::is_recording() {
         let load = DenseLoad::mount(library);
         record_rows(slice, [weights.payload(), weights.scales()], |operand| load.operand(operand))?;
@@ -445,6 +457,25 @@ fn load_rows<'a>(
 mod tests {
     use super::*;
     use cuteafd_loader::plan::exlr8::dense::{DenseComponent, DenseRange};
+
+    #[test]
+    fn compact_native_row_uploads_match_component_requests() -> Result<()> {
+        let root = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME")?)
+            .join(".cache/cuteafd/builds/glm-weight-inventory-fixtures");
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_in(&root)?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        let root = tempfile::tempdir_in(fixture.directory())?;
+        let record = record(root.path(), EMBEDDING);
+        let plan = DensePlan::for_rank(&[record], 1, 0)?;
+        let slice = &plan.tensors[0];
+        let requests = row_requests(slice)?;
+        let mut staging = HostAllocation::new(&library, plan.read_staging_bytes.max(256))?;
+        let weights = load_rows(&library, slice, &mut staging)?;
+        let expected = requests.into_iter().map(|(_, bytes)| bytes).collect::<Vec<_>>();
+        assert_eq!(expected, [weights.payload().bytes, weights.scales().bytes]);
+        Ok(())
+    }
 
     fn selection(flash: bool) -> DenseSelection {
         let configs: serde_json::Value = serde_json::from_str(include_str!(

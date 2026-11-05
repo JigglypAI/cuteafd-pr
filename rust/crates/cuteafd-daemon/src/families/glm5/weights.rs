@@ -898,7 +898,7 @@ impl<'a> GlmLoader<'a> {
             let local = GlmLoader { device, stream, peers: Vec::new(), ..self.clone() };
             let loader = if route.ranks.len() == ranks { self } else { &local };
             let parts = route.ranks.len();
-            loader.on_rank(0, |_| {
+            self.on_rank(first, |_| {
                 let mut put = |key, buffers: Vec<DeviceAllocation<'a>>| -> Result<()> {
                     ensure!(buffers.len() == parts, "weight operation returned wrong rank count");
                     loaded.extend(route.ranks.iter().copied().zip(buffers).map(|(rank, buffer)| (rank, key, buffer)));
@@ -1014,16 +1014,32 @@ impl<'a> GlmLoader<'a> {
                 share.push(part);
             }
         }
+        let (mut norm, mut head) = (None, None);
+        routes::global_routes(self.catalog, cfg, &core, |route| {
+            let actual = match route.operation {
+                routes::Operation::Tensor(name) => {
+                    let allocation = self.one(&name)?;
+                    let actual = vec![(format!("glm.weights.gpu.0.{}", route.key), allocation.buffer)];
+                    if route.key == "norm" { norm = Some(allocation); }
+                    else { head = Some(GlmHead::Bf16(allocation)); }
+                    actual
+                }
+                routes::Operation::Core(layout) => {
+                    let weights = self.core_weights(layout, 0)?;
+                    let actual = [("payload", weights.payload.buffer), ("suh", weights.suh.buffer), ("svh", weights.svh.buffer)]
+                        .into_iter().map(|(suffix, buffer)| (format!("glm.weights.gpu.0.core.head.{suffix}"), buffer)).collect();
+                    head = Some(GlmHead::K6(weights));
+                    actual
+                }
+                _ => anyhow::bail!("invalid global weight operation"),
+            };
+            self.check_weight_requests(&route.requests, &actual)
+        })?;
         let mut shares = shares.into_iter();
         let weights = GlmWeights {
             layers: shares.next().context("rank 0")?,
-            norm: self.one(cfg.final_norm())?,
-            head: match core.get_weight(cfg.head()) {
-                Some(projection) => GlmHead::K6(self.core_weights(
-                    cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(projection,
-                        cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?, 0)?),
-                None => GlmHead::Bf16(self.one(&format!("{}.weight", cfg.head()))?),
-            },
+            norm: norm.context("global norm route")?,
+            head: head.context("global head route")?,
             rope_alpha: cfg.variant.ml4().map(|_| -> Result<Vec<f32>> {
                 let (bytes, dtype, shape) = self.raw("lerope.alpha")?;
                 ensure!(dtype == DType::Bf16 && shape == [cfg.qk_rope_head_dim / 2], "lerope.alpha must be BF16 [rope/2]");
@@ -1082,17 +1098,11 @@ impl<'a> GlmLoader<'a> {
                 share.push(part);
             }
         }
-        let norm = {
-            let component = &records[0].norm;
-            let allocation = DeviceAllocation::new(self.library,
-                cuteafd_loader::plan::exlr8::dense::DenseTransform::Identity.allocation_bytes(component)?)?;
-            load.operand(crate::shared::experts::rtx::dense::Operand { device: self.library.cuda_get_device()?,
-                buffer: allocation.buffer, bytes: component.source.bytes,
-                lands: vec![(crate::shared::experts::rtx::dense::Rect { name: "model.norm.weight".into(),
-                    path: component.source.path.clone(), base: component.source.offset, row_bytes: component.source.bytes,
-                    rows: 0..1, cols: 0..component.source.bytes }, 0)] })?;
-            allocation
-        };
+        let norm = self.on_rank(0, |stream| {
+            crate::shared::experts::exlr8::dense_weights::landed(self.library, load,
+                cfg.final_norm(), &records[0].norm,
+                cuteafd_loader::plan::exlr8::dense::DenseTransform::Identity, stream)
+        })?;
         let mut shares = shares.into_iter();
         let weights = GlmWeights { layers: shares.next().context("rank 0")?, norm, head: GlmHead::RowFp8(vocabulary),
             rope_alpha: None };
@@ -1114,3 +1124,7 @@ pub(crate) fn bf16_programs() -> bool {
 #[cfg(test)]
 #[path = "weights_tests.rs"]
 mod operand_tests;
+
+#[cfg(test)]
+#[path = "weight_inventory_tests.rs"]
+mod inventory_tests;

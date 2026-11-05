@@ -94,6 +94,30 @@ impl EmbedSource {
     fn bytes(&self) -> usize {
         self.vocab * self.hidden * 2
     }
+
+    pub(crate) fn allocation_request(&self, id: &str, home: cuteafd_loader::placement::planner::EmbeddingHome)
+        -> Result<cuteafd_loader::placement::planner::Allocation> {
+        let bytes = self.vocab.checked_mul(self.hidden).and_then(|n| n.checked_mul(2))
+            .context("embedding allocation extent overflow")?;
+        Self::request(id, home, bytes)
+    }
+
+    pub(crate) fn placeholder_request(id: &str, rank: u8)
+        -> Result<cuteafd_loader::placement::planner::Allocation> {
+        Self::request(id, cuteafd_loader::placement::planner::EmbeddingHome::Device(rank), 256)
+    }
+
+    fn request(id: &str, home: cuteafd_loader::placement::planner::EmbeddingHome, bytes: usize)
+        -> Result<cuteafd_loader::placement::planner::Allocation> {
+        use cuteafd_loader::placement::planner::{Allocation, EmbeddingHome, Lifetime, Location};
+        ensure!(bytes > 0, "empty embedding allocation");
+        let location = match home {
+            EmbeddingHome::Device(rank) => Location::coordinator(rank),
+            EmbeddingHome::HostPinned => Location::PINNED,
+        };
+        Ok(Allocation::buffer(id, location, bytes as u64, Lifetime::RESIDENT,
+            cuteafd_core::memory_layout::Category::Embedding, "token embedding"))
+    }
 }
 
 /// The token embedding table: one device-local or mapped pinned copy.
@@ -128,6 +152,18 @@ impl<'a> TokenEmbedding<'a> {
         Ok(inventory.receipts)
     }
 
+    pub(crate) fn table_receipt(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>,
+        prefix: &str, name: &str) -> Result<cuteafd_loader::placement::planner::Receipt> {
+        use cuteafd_loader::placement::planner::Lifetime;
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, prefix,
+            Lifetime::RESIDENT, cuteafd_core::memory_layout::Category::Embedding, "token embedding");
+        match &self.table {
+            ResidentWeight::Device(owner) => inventory.device(name, owner.buffer)?,
+            ResidentWeight::Host { storage, .. } => inventory.pinned(name, storage.buffer)?,
+        }
+        inventory.receipts.pop().context("embedding table receipt")
+    }
+
     pub(crate) fn allocation_aliases(&self, census: &mut crate::shared::memory::receipts::Census,
         devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>, prefix: &str) -> Result<()> {
         if let ResidentWeight::Host { alias, .. } = &self.table {
@@ -154,8 +190,15 @@ impl<'a> TokenEmbedding<'a> {
                     .require_untied_embedding(&source.tensor_name)?;
             }
         }
-        let mut table = ResidentWeight::new(library, source.bytes(), placement == EmbedPlacement::Host)?;
+        let home = if placement == EmbedPlacement::Host {
+            cuteafd_loader::placement::planner::EmbeddingHome::HostPinned
+        } else { cuteafd_loader::placement::planner::EmbeddingHome::Device(0) };
+        let request = source.allocation_request("embedding.table", home)?;
+        let mut table = ResidentWeight::new(library, usize::try_from(request.bytes)?, placement == EmbedPlacement::Host)?;
         let device = library.cuda_get_device()?;
+        ensure!(table.buffer().bytes as u64 == request.bytes
+            && table.is_host() == (placement == EmbedPlacement::Host)
+            && (table.is_host() || table.buffer().device_id == device), "embedding allocation differs from request");
         let (address, started) = (table.buffer().ptr as usize, std::time::Instant::now());
         // The recorder is thread-local: record the GPU destination before the
         // caller's weights, on this thread, without starting a mount reader.
@@ -193,7 +236,11 @@ impl<'a> TokenEmbedding<'a> {
             && owner.embedding.scales().bytes == source.vocab * 4
             && owner.embedding.payload().device_id == owner.embedding.scales().device_id,
             "row-FP8 embedding payload/scales differ from [{}, {}] on one device", source.vocab, source.hidden);
-        let table = ResidentWeight::new(library, 256, false)?;
+        let request = EmbedSource::placeholder_request("embedding.table", 0)?;
+        let table = ResidentWeight::new(library, usize::try_from(request.bytes)?, false)?;
+        ensure!(table.buffer().bytes as u64 == request.bytes
+            && table.buffer().device_id == library.cuda_get_device()? && !table.buffer().ptr.is_null(),
+            "native embedding placeholder differs from request");
         tracing::info!(vocab = source.vocab, hidden = source.hidden, "token embedding: checkpoint row-FP8 (single residency)");
         Ok(Self { library, source, file, table, row_fp8: Some(owner) })
     }

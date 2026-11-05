@@ -102,7 +102,7 @@ impl RowLoading {
             source = sum([source, header.byte_length])?;
             upload = upload.max(header.byte_length);
             if header.dtype == DType::F8E4M3 {
-                let scale = headers.get(&format!("{name}_scale_inv"))?;
+                let scale = headers.block_grid(name).with_context(|| format!("missing row block grid {name}"))?;
                 let shape = [n.div_ceil(128), k.div_ceil(128)];
                 ensure!(scale.dtype == DType::F32
                     && scale.shape == shape.map(|n| n as usize)
@@ -507,17 +507,25 @@ impl WeightInventory {
                     if cfg.indexers[layer] == GlmIndexer::Full {
                         let iq = [weight(Op::IndexQ)?];
                         if core.get_weight(&iq[0]).is_none() {
-                        let index_bf16 = cfg.variant.is_glm() && (core_attention || native_bf16 && headers.all_bf16(&iq)?);
-                        headers.projection(
-                            &mut out,
-                            rank,
-                            &format!("{prefix}.w_iq"),
-                            "indexer",
-                            &iq,
-                            1,
-                            false,
-                            index_bf16,
-                        )?;
+                            if !cfg.variant.is_glm() {
+                                let shape = headers.matrix(&iq[0])?;
+                                let grid = headers.block_grid(&iq[0]);
+                                ensure!(headers.get(&iq[0])?.dtype == DType::F8E4M3
+                                    && grid.is_some_and(|grid| grid.dtype == DType::F32
+                                        && grid.shape == shape.map(|n| n.div_ceil(128) as usize)),
+                                    "{}: Mistral Large 4 serves the indexer wq_b from the K6 core or its shipped FP8 block-128 form only", iq[0]);
+                            }
+                            let index_bf16 = cfg.variant.is_glm() && (core_attention || native_bf16 && headers.all_bf16(&iq)?);
+                            headers.projection(
+                                &mut out,
+                                rank,
+                                &format!("{prefix}.w_iq"),
+                                "indexer",
+                                &iq,
+                                1,
+                                false,
+                                index_bf16,
+                            )?;
                         }
                         let ik = sum([Op::IndexK, Op::IndexWeights]
                             .into_iter()
@@ -846,6 +854,11 @@ impl Headers<'_> {
             .copied()
             .with_context(|| format!("missing GLM operand {name}"))
     }
+    fn block_grid(&self, name: &str) -> Option<&crate::SafetensorsTensorMetadata> {
+        self.0.get(format!("{name}_scale_inv").as_str()).copied().or_else(|| {
+            self.0.get(format!("{}.qscale_weight", name.strip_suffix(".weight")?).as_str()).copied()
+        })
+    }
     fn matrix(&self, name: &str) -> Result<[u64; 2]> {
         let shape = &self.get(name)?.shape;
         ensure!(
@@ -935,7 +948,7 @@ impl Headers<'_> {
                 native = false;
                 continue;
             }
-            if let Some(grid) = self.0.get(format!("{name}_scale_inv").as_str()) {
+            if let Some(grid) = self.block_grid(name) {
                 ensure!(
                     grid.dtype == DType::F32
                         && grid.shape
