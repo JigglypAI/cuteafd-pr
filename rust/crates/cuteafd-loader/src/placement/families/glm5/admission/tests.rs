@@ -394,9 +394,17 @@ fn execution_adapter_uses_resolved_homes_and_unique_tp2_prefix_and_backend_bytes
         assert_eq!(placement.residual, vec![ResidualHome::Owned(0), ResidualHome::Replicated, ResidualHome::Replicated]);
         let geometry = super::super::context_buffers(&cfg, recipe.context,
             resolved.decisions.prefill.rows, resolved.decisions.prefill.waves, Default::default());
-        assert_eq!(placement.peer_row_bytes, cfg.layers as u64 *
-            (geometry.query_row_bytes + geometry.partial_row_bytes + geometry.candidate_row_bytes));
+        assert_eq!(cfg.indexers, vec![crate::families::glm5::GlmIndexer::Full,
+            crate::families::glm5::GlmIndexer::Shared]);
+        // Shared layers reuse indices: candidates cross the peer only for the full indexer.
+        assert_eq!(placement.peer_row_bytes, 2 * (geometry.query_row_bytes + geometry.partial_row_bytes)
+            + geometry.candidate_row_bytes);
         for rank in 0..2 {
+            // Traffic is per layer; candidate storage is one reusable owner per rank.
+            let candidates = resolved.facts.allocations.iter().filter(|owner|
+                owner.id == format!("glm.exchange.rank.{rank}.context.candidates")).collect::<Vec<_>>();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].bytes, super::super::DECODE_ROWS * geometry.candidate_row_bytes);
             assert_eq!(placement.items[rank], resolved.items(Location::coordinator(rank as u8)).unwrap());
             assert_eq!(placement.expert_ranges[rank].layers, 0);
             assert_eq!(placement.expert_ranges[rank].peak_bytes, 0);
