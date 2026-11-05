@@ -206,8 +206,11 @@ pub(crate) mod tests {
         assert!(prepare(&spec).is_ok());
         let mut constants = spec.clone();
         // Isolate the vector so only its widened tail can intersect native constants.
-        let mut vector = constants.reads.iter().find(|read| read.vector).unwrap().clone();
-        vector.destination = constants.native.inv_freq as usize - vector.metadata.byte_length as usize * 2 + 1;
+        let mut vector = constants.reads[0].clone();
+        vector.vector = true;
+        vector.metadata.byte_length = 2;
+        vector.metadata.shape = vec![1];
+        vector.destination = constants.native.inv_freq as usize - 3;
         constants.reads = vec![vector];
         assert!(prepare(&constants).err().unwrap().to_string().contains("overlapping"));
         let mut duplicate = spec.clone();
