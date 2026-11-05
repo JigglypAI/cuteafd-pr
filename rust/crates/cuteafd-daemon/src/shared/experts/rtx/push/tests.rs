@@ -66,6 +66,31 @@ fn whole_owners_preserve_checkpoint_shards_on_either_dense_rank() -> Result<()> 
 }
 
 #[test]
+fn exlr8_coordinator_plan_uses_actual_world_and_committed_native_inventory() -> Result<()> {
+    use cuteafd_loader::plan::exlr8::residency::{ExpertSet, Residency};
+    let root = tempfile::tempdir()?;
+    cuteafd_loader::plan::testing::exlr8::fixture(root.path(), false);
+    let catalog = crate::shared::memory::push_exlr8::tests::fixture_catalog(root.path())?;
+    for world in [1, 2] {
+        let budgets = (0..world).map(|rank| Residency::plan(root.path(), "mixed", 3,
+            world, rank, ExpertSet::Routed).map(|layout| layout.resident_bytes)).collect::<Result<Vec<_>>>()?;
+        let experts = CoordinatorExperts::Exlr8 { manifest: "mixed".into(), layers: vec![3], budgets: budgets.clone() };
+        experts.validate_ranks(world)?;
+        assert!(experts.validate_ranks(3 - world).is_err());
+        for (rank, budget) in budgets.into_iter().enumerate() {
+            let plan = experts.plan(&catalog, rank)?.context("native expert owner")?;
+            assert_eq!((plan.world, plan.gpu, plan.layout.bytes()), (world, rank, budget));
+            assert_eq!((plan.exlr8[0].world, plan.exlr8[0].rank), (world, rank));
+            assert_eq!(plan.exlr8[0].compact_unit_limit(), 3usize.div_ceil(world));
+            let checked = plan.checked(&catalog, root.path(), world + 4, rank + 4)?;
+            assert!(!checked.plan.entries.is_empty());
+            assert!(checked.plan.entries.iter().all(|entry| entry.rank as usize == rank + 4));
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn coordinator_host_admission_charges_every_concurrent_receive_ring() -> Result<()> {
     for gpus in [1, 2] {
         let plans = (0..gpus).map(|_| None).collect::<Vec<_>>();

@@ -131,7 +131,7 @@ fn installed_local_physical_equals_serving(native: bool, manifest: PathBuf,
     let catalog = input.expert_catalog()?;
     let exlr8 = if native { Some(MetadataInput::open(&snapshot, "up1")?) } else { None };
     let local = if native { glm5::exlr8_inventory(&snapshot, "up1", &manifest, cfg.first_moe_layer + count,
-        rows as u64, lanes as u64, false, PrefillActivations::A16)? } else {
+        2, rows as u64, lanes as u64, false, PrefillActivations::A16)? } else {
         glm5::local_inventory(&cfg, catalog, &manifest, cfg.first_moe_layer + count, rows as u64, lanes as u64, false)? };
     let mut selected = LocalPhysicalInput { layers: (cfg.first_moe_layer..cfg.first_moe_layer + count).collect(),
         max_rows: rows, lanes, storage: LocalStorage::Mount, route_checks: true, peer_diagnostics: false,

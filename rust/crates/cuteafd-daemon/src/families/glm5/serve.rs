@@ -255,7 +255,7 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
     let result = opened.with_resolved_engine(&resolved, |engine, transport, runtime| {
-        anyhow::ensure!(transport.is_some() || engine.skip_routed() || engine.has_tp2(), "serve-glm needs Spark peers, local TP2 or --skip-routed-experts");
+        anyhow::ensure!(transport.is_some() || engine.skip_routed() || engine.has_local(), "serve-glm needs Spark peers, local TP2 or --skip-routed-experts");
         let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
         let spark = transport.is_some();
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
@@ -636,7 +636,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     use crate::shared::draft::{resource, runtime::SharedPolicy};
     let mut shared = drafter.map(|d| {
-        let tp2 = engine.tp2_layers();
+        let tp2 = engine.local_layers();
         let remote = if engine.weights.layers.iter().enumerate().any(|(layer, weights)|
             !weights.dense && !tp2.as_ref().is_some_and(|layers| layers.contains(&layer))) {
             transport.as_ref().context("GLM installed Spark transport missing")?.installed_grouping()?
@@ -644,7 +644,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         let catalog = cuteafd_loader::read_expert_catalog(&opened.snapshot)?;
         let homes = resource::layer_homes(engine.weights.layers.iter().enumerate().map(|(layer, weights)| {
             let local = tp2.as_ref().is_some_and(|layers| layers.contains(&layer));
-            (weights.dense, local, if local { 2 } else { remote.len() })
+            (weights.dense, local, if local { engine.ranks() } else { remote.len() })
         }), catalog.exl3(), |layer| engine.draft_weight_read_bytes(layer, &remote))?;
         let geometry = resource::geometry_with_grouping(&homes, engine.cfg.experts, engine.cfg.topk, DECODE_ROWS,
             d.cfg.drafts(), resource::COPY_EXTENSION, |layer, rows| engine.draft_group_rows(layer, rows, &remote))?;
