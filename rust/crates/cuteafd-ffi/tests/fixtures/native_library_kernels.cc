@@ -5,6 +5,7 @@
 #include "../../../../../native/shared/cuda/fp8_load_quant.h"
 
 #include <cmath>
+#include <algorithm>
 
 // Preserve the warp's accumulation/reduction order for deferred-load tests.
 static int32_t markov_norms(const void* source, void* output, int32_t rows, int32_t cols, bool slack) {
@@ -156,3 +157,33 @@ extern "C" int32_t cuteafd_load_scale_gather(const void* grid, const void* index
     }
   return 0;
 }
+
+// Allocation-only workspace contracts (one synthetic SM); no draft math runs.
+static uint64_t fixture_align256(uint64_t n) { return (n + 255) / 256 * 256; }
+extern "C" size_t cuteafd_fp8_linear_workspace(int32_t rows, int32_t k, int32_t n, int32_t mode) {
+  if (n < 16 || k < 128 || mode < 0 || mode > 2) return 0;
+  const int tiles = n / 16, blocks = k / 128;
+  const int wanted = std::min(std::max((16 + tiles - 1) / tiles, 1), blocks);
+  const int per_split = (blocks + wanted - 1) / wanted;
+  const int splits = (blocks + per_split - 1) / per_split;
+  const int cap = mode == 0 ? 64 : 128;
+  return fixture_align256(2 * cap * 4) + fixture_align256((k + 255) / 256 * cap * 4)
+      + fixture_align256(uint64_t(k) * cap * 2)
+      + (mode == 2 ? fixture_align256(k / 128 * cap * 4) : 0)
+      + (splits > 1 ? fixture_align256(uint64_t(splits) * std::min(rows, cap) * n * 4) : 0);
+}
+extern "C" size_t cuteafd_fp8_w8a16_workspace(int32_t rows, int32_t k, int32_t n) {
+  return cuteafd_fp8_linear_workspace(rows, k, n, 0);
+}
+static uint64_t fixture_draft_attention(int sequences, int kv_heads, int max_keys, int dim) {
+  const int partitions = std::min((max_keys + 31) / 32, (2 + kv_heads * 2 - 1) / (kv_heads * 2));
+  const int scalar = (std::min(max_keys, 1040) + 127) / 128 * (dim == 64 ? 32 : 16);
+  return uint64_t(sequences) * kv_heads * std::max(2 * partitions * 32, scalar) * (dim + 2) * 4;
+}
+extern "C" uint64_t cuteafd_glm_dflash_attention_workspace(int32_t sequences, int32_t kv_heads, int32_t max_keys) {
+  return fixture_draft_attention(sequences, kv_heads, max_keys, 128);
+}
+extern "C" uint64_t cuteafd_glm_dflash_attention_workspace_d64(int32_t sequences, int32_t kv_heads, int32_t max_keys) {
+  return fixture_draft_attention(sequences, kv_heads, max_keys, 64);
+}
+extern "C" uint64_t cuteafd_glm_dflash_topk_workspace(int32_t rows) { return uint64_t(rows) * 64 * 16 * 8; }

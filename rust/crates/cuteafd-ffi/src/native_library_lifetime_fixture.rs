@@ -199,6 +199,14 @@ impl Fixture {
     }
 
     /// CPU byte-roundtrip mode; ordinary lifetime fixtures retain deferred uploads.
+    /// Keep logical device extents, but allocate only a small sentinel and skip copies/zeroes.
+    /// Only allocation/receipt tests may enable this; launching math is unsupported.
+    pub fn extent_only(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: this export belongs to the private CPU fixture and has no arguments.
+        unsafe { library.lib.get::<unsafe extern "C" fn()>(b"fixture_extent_only")?(); }
+        Ok(())
+    }
+
     pub fn immediate_copies(&self, library: &NativeLibrary) -> Result<()> {
         // SAFETY: this export belongs only to the CPU fixture loaded above.
         unsafe {

@@ -3,6 +3,8 @@ pub mod config;
 pub mod core;
 pub mod names;
 pub mod draft_representation;
+pub mod draft_physical;
+mod draft_physical_layout;
 pub mod native;
 pub use config::{GlmDsaConfig, GlmIndexer, GlmVariant};
 
