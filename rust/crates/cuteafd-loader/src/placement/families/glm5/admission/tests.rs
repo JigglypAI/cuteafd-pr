@@ -1024,6 +1024,10 @@ fn fixed_prefix_quota_uses_joint_host_ram_after_steady_and_pinned_owners() {
     let mut recipe = recipe(&cfg);
     let host = HostFigures::for_layout(2, MAX_LAYOUT).unwrap();
     recipe.host = Some(host.clone());
+    // Fix embedding placement so the shortage cannot move its backing to a GPU.
+    recipe.embedding = vec![EmbeddingHome::HostPinned];
+    recipe.weights.retain(|case|
+        matches!(case.when.as_slice(), [When::Embedding(EmbeddingHome::HostPinned)]));
     let request = Request { onboard: Pin::Exact(0), prefill: Pin::Exact(recipe.prefill[0]),
         ..request() };
     let without_prefix = planner::solve(request.clone(), budgets(), &recipe).unwrap();
@@ -1078,6 +1082,64 @@ fn fixed_prefix_quota_uses_joint_host_ram_after_steady_and_pinned_owners() {
             Err(Refusal::Capacity { budget, required, available: free, .. })
                 if budget == "physical.2" && required == available && free == available - 1),
             "a fixed quota refuses instead of silently shrinking into remaining RAM");
+    }
+}
+
+#[test]
+fn auto_embedding_can_move_without_shrinking_fixed_prefix_quota_or_pool() {
+    use crate::placement::planner::serving::{HostPrefixOwners, ServingOwners};
+    use cuteafd_core::prefix::HostCacheGeometry;
+
+    let cfg = cfg();
+    let mut recipe = recipe(&cfg);
+    let host = HostFigures::for_layout(2, MAX_LAYOUT).unwrap();
+    recipe.host = Some(host.clone());
+    let request = Request { onboard: Pin::Exact(0), prefill: Pin::Exact(recipe.prefill[0]),
+        ..request() };
+    let without_prefix = planner::solve(request.clone(), budgets(), &recipe).unwrap();
+    assert_eq!(without_prefix.decisions.embedding, Some(EmbeddingHome::HostPinned));
+    let embedding = without_prefix.facts.allocations.iter()
+        .find(|owner| owner.id == "glm.weights.embedding").unwrap();
+    assert_eq!(embedding.location, Location::PINNED);
+    assert_eq!(embedding.bytes, 8192);
+    let pinned = without_prefix.phases.iter().find(|phase|
+        phase.budget == "physical.2" && phase.phase == Phase::Ready).unwrap().owned;
+    let geometry = HostCacheGeometry { unit_rows: 64, page_bytes: 1 << 20,
+        mark_bytes: 0, draft_bytes: 0 };
+    let chunk = geometry.chunk_bytes();
+    for explicit in [None, Some(40 << 30)] {
+        let quota = geometry.resolve(explicit, 1 << 20, 16, 128 << 30, chunk).unwrap();
+        let mut with_prefix = recipe.clone();
+        let prefix = HostPrefixOwners { quota_bytes: quota, chunk_bytes: chunk }
+            .allocations("glm.host.prefix", ServingOwners::LIFETIME).unwrap();
+        with_prefix.owners.push(Case { when: vec![], value: prefix.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, with_prefix.maximum_pages);
+            Component::allocation(owner, bytes, false, with_prefix.maximum_pages)
+        }).collect() });
+        let available = host.steady().bytes + pinned + quota;
+        let mut joint = budgets();
+        joint[2].physical_bytes = available;
+        joint[2].logical_bytes = available;
+        let exact = planner::solve(request.clone(), joint.clone(), &with_prefix).unwrap();
+        assert_eq!(exact.decisions, without_prefix.decisions);
+        joint[2].logical_bytes -= 1;
+        let moved = planner::solve(request.clone(), joint, &with_prefix).unwrap();
+        assert_eq!(moved.decisions.embedding, Some(EmbeddingHome::Device(0)));
+        let mut expected = exact.decisions.clone();
+        expected.embedding = Some(EmbeddingHome::Device(0));
+        assert_eq!(moved.decisions, expected);
+        assert_eq!(moved.pool_tokens, without_prefix.pool_tokens);
+        assert_eq!(moved.facts.allocations.iter().filter(|owner|
+            owner.id.starts_with("glm.host.prefix.")).map(|owner| owner.bytes).sum::<u64>(), quota);
+        let ready = moved.phases.iter().find(|phase|
+            phase.budget == "physical.2" && phase.phase == Phase::Ready).unwrap();
+        assert_eq!(ready.opaque, host.steady().bytes);
+        assert_eq!(ready.owned, pinned + quota - embedding.bytes);
+        assert_eq!(ready.available - ready.owned - ready.opaque, embedding.bytes - 1);
+        let relocated = moved.facts.allocations.iter()
+            .find(|owner| owner.id == embedding.id).unwrap();
+        assert_eq!(relocated.location, Location::coordinator(0));
+        assert_eq!(relocated.bytes, embedding.bytes);
     }
 }
 
