@@ -327,11 +327,12 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
             return Ok(Ticket::Complete);
         }
         self.segment(1, index, GlmOwnedPhase::FfnFront, || {
-            e.ffn_on(1, w1, self.layer(1, index),
-                if layer.dense { e.cfg.dense_intermediate } else { e.cfg.moe_intermediate }, self.cap(),
-                if layer.dense { w1.delta.buffer.ptr } else { w1.shared.buffer.ptr }, rows)?;
-            if !layer.dense { e.meet_shared_core(1, index, w1, self.layer(1, index), self.rows())?; }
-            Ok(())
+            if layer.dense {
+                e.ffn_on(1, w1, self.layer(1, index), e.cfg.dense_intermediate,
+                    self.cap(), w1.delta.buffer.ptr, rows)
+            } else {
+                e.shared_on(1, index, w1, self.layer(1, index), rows, self.cap())
+            }
         })?;
         if self.tables[0].decode && !layer.dense {
             if let Some(l2) = &e.peer()?.l2 {
