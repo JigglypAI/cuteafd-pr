@@ -120,7 +120,7 @@ impl ToolConstraints {
                     "begin":format!(" to={}<|message|><atem:function_calls>\n<atem:invoke name=\"{}\">\n",
                         muse_header(&tool.name), muse_attribute(&tool.name)),
                     "content":{"type":"muse_tool_schema", "strict":strict, "json_schema":schema},
-                    "end":"\n</atem:invoke>\n</atem:function_calls>"}),
+                    "end":"</atem:invoke>\n</atem:function_calls>"}),
             });
         }
         if !(assistance || strict_requested || required) {
@@ -284,6 +284,47 @@ mod tests {
     use crate::openai::*;
     use axum::{body::{Body, to_bytes}, http::{Request, StatusCode}};
     use tower::ServiceExt;
+
+    #[test]
+    fn muse_zero_argument_constraint_matches_rendered_template_bytes() {
+        let tool = ToolDefinition { name: "refresh".into(), description: None,
+            parameters: json!({"type":"object","properties":{},"additionalProperties":false}), strict: Some(true) };
+        let constraints = ToolConstraints::new(&[tool], ToolChoice::Auto, true, false, true,
+            ToolSyntax::MuseAtem).unwrap().unwrap();
+        let tag = &constraints.format.as_ref().unwrap()["tags"][0];
+        let bytes = format!("{}{}", tag["begin"].as_str().unwrap(), tag["end"].as_str().unwrap());
+        let template = crate::openai::chat::glm5::template::ChatTemplate::new(include_str!(
+            "chat/muse/fixtures/muse_spark.jinja")).unwrap();
+        let rendered = template.render(&json!({"bos_token":"", "add_generation_prompt":false,
+            "messages":[{"role":"assistant","tool_calls":[{"function":{"name":"refresh","arguments":{}}}]}]})).unwrap();
+        let rendered = rendered.split_once("<|start|>assistant").unwrap().1;
+        let rendered = rendered.split_once("<|eot|>").unwrap().0;
+        assert_eq!(bytes.as_bytes(), rendered.as_bytes());
+        assert_eq!(bytes.as_bytes(), b" to=refresh<|message|><atem:function_calls>\n<atem:invoke name=\"refresh\">\n</atem:invoke>\n</atem:function_calls>");
+    }
+
+    #[test]
+    fn zero_argument_tags_keep_other_family_delimiters() {
+        for (syntax, begin, end) in [
+            (ToolSyntax::Dsml, "<｜DSML｜ invoke name=\"refresh\">", "</｜DSML｜ invoke>"),
+            (ToolSyntax::GlmXml, "<tool_call>refresh", "</tool_call>"),
+            (ToolSyntax::QwenXml, "<tool_call>\n<function=refresh>\n", "\n</function>\n</tool_call>"),
+            (ToolSyntax::KimiXtml, "<|open|>call tool=\"refresh\" index=\"", "<|close|>call<|sep|>"),
+            (ToolSyntax::MistralCalls, "[TOOL_CALLS]refresh[ARGS]", ""),
+        ] {
+            let tool = ToolDefinition { name:"refresh".into(), description:None,
+                parameters:json!({"type":"object","properties":{},"additionalProperties":false}), strict:Some(true) };
+            let constraints = ToolConstraints::new(&[tool], ToolChoice::Auto, true, false, true, syntax).unwrap().unwrap();
+            let format = constraints.format.as_ref().unwrap();
+            let tags = match syntax {
+                ToolSyntax::Dsml => &format["content"]["elements"][1]["tags"],
+                ToolSyntax::KimiXtml => &format["content"]["tags"],
+                _ => &format["tags"],
+            };
+            assert_eq!(tags[0]["begin"].as_str().unwrap().as_bytes(), begin.as_bytes(), "{syntax:?}");
+            assert_eq!(tags[0]["end"].as_str().unwrap().as_bytes(), end.as_bytes(), "{syntax:?}");
+        }
+    }
 
     #[test]
     fn arguments_reject_duplicate_and_escaped_alias_keys_recursively() {
