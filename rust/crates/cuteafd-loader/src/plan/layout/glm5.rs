@@ -601,17 +601,19 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
         let manifest_path = options.workspace_manifest.as_deref()
             .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
-        if let Some(metadata) = metadata.filter(|_| gpu_count == 2
+        if let Some(metadata) = metadata.filter(|_| (1..=2).contains(&gpu_count)
             && onboard.layers(cfg.layers.saturating_sub(catalog.routed_experts().first_layer)) != Some(0)
             && cfg.layers > catalog.routed_experts().first_layer) {
-            Some(glm::exlr8_inventory_with_metadata(&checkpoint.snapshot, manifest_path, cfg.layers, rows, lanes,
+            Some(glm::exlr8_inventory_with_metadata(&checkpoint.snapshot, manifest_path, cfg.layers, gpu_count, rows, lanes,
                 glm::local_exchange_f32()?, options.exlr8_prefill_activations, metadata)?)
         } else {
             glm::select_local_inventory(&cfg, &catalog, manifest_path, cfg.layers, gpu_count, rows, lanes,
                 glm::local_exchange_f32()?, onboard, false, Some((selected, options.exlr8_prefill_activations)))?
         }
     } else { None };
-    let tp2_workspace = local.as_ref().map_or([0; 2], |local| local.workspace());
+    let expert_workspace = local.as_ref().filter(|local| local.world == 1)
+        .map_or(0, |local| local.backend_workspace);
+    let tp2_workspace = local.as_ref().filter(|local| local.world == 2).map_or([0; 2], |local| local.workspace());
     let serial_workspace = local.as_ref().map_or([0; 2], |local| local.workspace_for(&cfg, rows, 1, false));
     let inputs = glm::GlmInputs {
         loaded_weights, drafter_weights,
@@ -622,7 +624,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         native_workspace: workspace, native_dense: dense_scratch, native_head: false, skip_routed_experts: false, prefill_rows: rows,
         prefill_lanes: lanes,
         max_context: context, automatic_context: options.context_tokens == 0, scratch: Some(scratch), drafter_bytes: draft,
-        drafter_staging: draft_staging, pending_code: Vec::new(), experts: local.as_ref().map_or_else(Vec::new, |local| local.experts.clone()), expert_workspace: 0,
+        drafter_staging: draft_staging, pending_code: Vec::new(), experts: local.as_ref().map_or_else(Vec::new, |local| local.experts.clone()), expert_workspace,
         tp2_workspace, requested_pool: options.pool_tokens, onboard,
         full_prefill_logits: options.full_prefill_logits, context: context_programs };
     let (placement, _) = glm::solve_working_set(&inputs, serial_workspace, Some(attention))?;

@@ -28,7 +28,7 @@ pub struct Glm {
 /// GLM 5.x: serve-glm / glm-golden on the glm coordinator programs.
 pub static GLM5: Glm =
     Glm { id: "glm5", architecture: "GlmMoeDsaForCausalLM", runtime: RuntimeStatus::Serving, media_cache_headroom: false,
-        exlr8: Exlr8Execution { dense_worlds: &[1, 2], onboard_worlds: &[2] },
+        exlr8: Exlr8Execution { dense_worlds: &[1, 2], onboard_worlds: &[1, 2] },
         decode_rows: crate::placement::families::glm5::DECODE_ROWS as u32,
         decode_lanes: crate::plan::decode_lanes::LaneSupport::One {
             reason: "a second lane needs its own graph set, about 3 GiB per GPU today (213 shapes), more than one onboarded layer (2.26 GiB per GPU), and the big dense core leaves little round trip to hide (predicted loss, #705, #744)" } };

@@ -48,6 +48,7 @@ pub struct LocalPhysicalSource {
     rows: usize,
     activations: PrefillActivations,
     topk: usize,
+    world: usize,
 }
 
 impl LocalPhysicalSource {
@@ -55,12 +56,12 @@ impl LocalPhysicalSource {
         input: &LocalPhysicalInput, exlr8: Option<&MetadataInput>) -> Result<Self> {
         validate_input(cfg, input)?;
         let mut source = Self { weights: Default::default(), backend: Default::default(),
-            rows: input.max_rows, activations: input.activations, topk: cfg.topk };
+            rows: input.max_rows, activations: input.activations, topk: cfg.topk, world: local.world };
         if input.layers.is_empty() { return Ok(source); }
         let programs = if local.format == GlmLocalFormat::Exlr8 {
             Some(serde_json::from_slice::<serde_json::Value>(&std::fs::read(&local.package)?)?)
         } else { None };
-        for rank in 0..2 {
+        for rank in 0..source.world {
             let prefix = format!("glm.expert.routed.rank.{rank}");
             let location = Location::coordinator(rank as u8);
             let mut unit_limit = None;
@@ -76,7 +77,7 @@ impl LocalPhysicalSource {
                     }
                     GlmLocalFormat::Exlr8 => {
                         let plan = exlr8.context("EXLR8 selected metadata missing")?
-                            .plan(layer, 2, rank, ExpertSet::Routed)?;
+                            .plan(layer, local.world, rank, ExpertSet::Routed)?;
                         let units = plan.compact_unit_limit();
                         ensure!(unit_limit.is_none_or(|previous| previous == units),
                             "EXLR8 local layers have inconsistent unit limits");
@@ -148,7 +149,7 @@ impl LocalPhysicalSource {
             "GLM local physical source differs from requested geometry");
         if input.layers.is_empty() { return Ok(LocalPhysicalInventory::default()); }
         let mut out = LocalPhysicalInventory::default();
-        for rank in 0..2 {
+        for rank in 0..self.world {
             let prefix = format!("glm.expert.routed.rank.{rank}");
             let location = Location::coordinator(rank as u8);
             let layers = input.layers.iter().map(|layer| self.weights[rank].get(layer)
@@ -187,6 +188,7 @@ impl LocalPhysicalSource {
         }
         out.owners.extend(self.backend.owners.iter().cloned());
         out.views.extend(self.backend.views.iter().cloned());
+        if self.world == 1 { return Ok(out); }
         let routes = PackedRoutes::new(input.max_rows, self.topk);
         let peer = crate::serving_capacity::PeerStorageLayout::new(2 * input.lanes, routes.bytes, input.peer_diagnostics)?;
         for rank in 0..2 {

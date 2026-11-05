@@ -841,7 +841,7 @@ pub enum GlmLocalFormat {
     Nvfp4 { w4a4: bool },
 }
 
-/// Header-only TP2 inventory. Runtime must attest the native ABI before execution.
+/// Header-only local inventory. Runtime must attest the native ABI before execution.
 #[derive(Debug, Clone)]
 pub struct LocalInventory {
     pub package: std::path::PathBuf,
@@ -849,15 +849,20 @@ pub struct LocalInventory {
     pub experts: Vec<ExpertCost>,
     pub backend_workspace: u64,
     pub extra_workspace: [u64; 2],
+    pub world: usize,
+    pub unit_limit: usize,
 }
 
 impl LocalInventory {
     pub fn workspace(&self) -> [u64; 2] {
-        self.extra_workspace.map(|bytes| bytes + self.backend_workspace)
+        std::array::from_fn(|rank| if rank < self.world {
+            self.extra_workspace[rank] + self.backend_workspace
+        } else { 0 })
     }
 
     pub fn workspace_for(&self, cfg: &GlmDsaConfig, rows: u64, lanes: u64,
         exchange_f32: bool) -> [u64; 2] {
+        if self.world == 1 { return [self.backend_workspace, 0]; }
         local_extra_workspace(cfg.hidden as u64, cfg.experts as u64, cfg.topk as u64,
             rows, lanes, exchange_f32).map(|bytes| bytes + self.backend_workspace)
     }
@@ -1019,7 +1024,7 @@ pub fn local_inventory_selected(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41
         experts.push(ExpertCost { whole: Bytes2 { resident: whole, staging: 0 }, half,
             tp2: true, whole_supported: true, spark_ok: true });
     }
-    Ok(LocalInventory { package, format: GlmLocalFormat::Exl3, experts, backend_workspace,
+    Ok(LocalInventory { package, format: GlmLocalFormat::Exl3, experts, backend_workspace, world: 2, unit_limit: 0,
         extra_workspace: local_extra_workspace(shape.hidden as u64, shape.experts as u64,
             shape.topk as u64, rows, lanes, exchange_f32) })
 }
@@ -1089,7 +1094,7 @@ fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Pa
         }
         Ok(ExpertCost { whole, half, tp2: supported, whole_supported: supported, spark_ok: true })
     }).collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(LocalInventory { package, format: GlmLocalFormat::Nvfp4 { w4a4 }, experts, backend_workspace,
+    Ok(LocalInventory { package, format: GlmLocalFormat::Nvfp4 { w4a4 }, experts, backend_workspace, world: 2, unit_limit: 0,
         extra_workspace: local_extra_workspace(shape.hidden as u64, shape.experts as u64,
             shape.topk as u64, rows, lanes, false) })
 }
@@ -1118,24 +1123,31 @@ fn exlr8_expert_costs_of(input: &crate::plan::exlr8::residency::MetadataInput, f
 
 /// Native manifest selection is mandatory; never route EXLR8 through EXL3.
 pub fn exlr8_inventory(snapshot: &std::path::Path, selected: &str, manifest: &std::path::Path,
-    selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool,
+    selected_layers: usize, world: usize, rows: u64, lanes: u64, exchange_f32: bool,
     activations: crate::plan::exlr8::PrefillActivations) -> anyhow::Result<LocalInventory> {
     let input = crate::plan::exlr8::residency::MetadataInput::open(snapshot, selected)?;
-    exlr8_inventory_with_metadata(snapshot, manifest, selected_layers, rows, lanes, exchange_f32, activations, &input)
+    exlr8_inventory_with_metadata(snapshot, manifest, selected_layers, world, rows, lanes, exchange_f32, activations, &input)
 }
 
 pub(crate) fn exlr8_inventory_with_metadata(snapshot: &std::path::Path, manifest: &std::path::Path,
-    selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool,
+    selected_layers: usize, world: usize, rows: u64, lanes: u64, exchange_f32: bool,
     activations: crate::plan::exlr8::PrefillActivations, input: &crate::plan::exlr8::residency::MetadataInput)
     -> anyhow::Result<LocalInventory> {
-    anyhow::ensure!(!exchange_f32, "GLM EXLR8 TP2 emits BF16 routed partials; use BF16 exchange");
+    anyhow::ensure!((1..=2).contains(&world) && !exchange_f32,
+        "GLM EXLR8 uses one or two ranks and BF16 routed output");
     let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
     let cfg = GlmDsaConfig::from_hf(&config)?;
     anyhow::ensure!(cfg.hidden == 6144 && cfg.moe_intermediate == 2048 && cfg.experts == 256
         && cfg.topk == 8 && (cfg.first_moe_layer..=cfg.layers).contains(&selected_layers)
         && (1..=4).contains(&lanes), "GLM EXLR8 TP2 geometry/layer extent");
     let programs = crate::plan::checkpoint::read_json(manifest)?;
-    let backend_workspace = crate::plan::exlr8::routed_workspace(&programs, cuteafd_ffi::exlr8::KernelFamily::Glm, rows, 8, activations)?;
+    let mut unit_limit = 0;
+    for layer in cfg.first_moe_layer..selected_layers { for rank in 0..world {
+        unit_limit = unit_limit.max(input.plan(layer, world, rank,
+            crate::plan::exlr8::residency::ExpertSet::Routed)?.compact_unit_limit());
+    } }
+    let backend_workspace = crate::plan::exlr8::routed_workspace(&programs,
+        cuteafd_ffi::exlr8::KernelFamily::Glm, rows, unit_limit, activations)?;
     let records = crate::plan::exlr8::dense::DenseRecord::inventory(snapshot)?;
     for layer in cfg.first_moe_layer..selected_layers {
         for suffix in ["weight", "e_score_correction_bias"] {
@@ -1144,8 +1156,11 @@ pub(crate) fn exlr8_inventory_with_metadata(snapshot: &std::path::Path, manifest
         }
     }
     let experts = exlr8_expert_costs_of(input, cfg.first_moe_layer, selected_layers, &records)?;
-    Ok(LocalInventory { package: manifest.to_path_buf(), format: GlmLocalFormat::Exlr8, experts, backend_workspace,
-        extra_workspace: local_extra_workspace(cfg.hidden as u64, cfg.experts as u64, cfg.topk as u64, rows, lanes, false) })
+    Ok(LocalInventory { package: manifest.to_path_buf(), format: GlmLocalFormat::Exlr8, experts,
+        backend_workspace, world, unit_limit,
+        extra_workspace: if world == 1 { [0; 2] } else {
+            local_extra_workspace(cfg.hidden as u64, cfg.experts as u64, cfg.topk as u64, rows, lanes, false)
+        } })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1160,14 +1175,14 @@ pub fn select_local_inventory(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41Ca
     -> anyhow::Result<Option<LocalInventory>> {
     if skip || onboard.layers(layers.saturating_sub(catalog.routed_experts().first_layer)) == Some(0)
         || layers <= catalog.routed_experts().first_layer { return Ok(None); }
+    if catalog.format() == crate::plan::checkpoint::CheckpointFormat::Exlr8 {
+        let (selected, activations) = exlr8.ok_or_else(|| anyhow::anyhow!("EXLR8 local inventory requires the selected native manifest"))?;
+        return exlr8_inventory(catalog.snapshot(), selected, manifest, layers, gpus, rows, lanes, exchange_f32, activations).map(Some);
+    }
     if gpus != 2 {
         anyhow::ensure!(onboard == Onboard::Auto,
             "GLM local experts require a two-GPU TP2 executor");
         return Ok(None);
-    }
-    if catalog.format() == crate::plan::checkpoint::CheckpointFormat::Exlr8 {
-        let (selected, activations) = exlr8.ok_or_else(|| anyhow::anyhow!("EXLR8 local inventory requires the selected native manifest"))?;
-        return exlr8_inventory(catalog.snapshot(), selected, manifest, layers, rows, lanes, exchange_f32, activations).map(Some);
     }
     anyhow::ensure!(exlr8.is_none(), "EXLR8 manifest supplied for non-native checkpoint");
     let automatic = onboard == Onboard::Auto;
@@ -1227,6 +1242,50 @@ mod tests {
     /// solve must request `heads` explicitly: auto resolves to `context`,
     /// which fails closed without its programs (issue #202).
     const HEADS: Option<AttentionPlacement> = Some(AttentionPlacement::Heads);
+
+    #[test]
+    fn whole_workspace_has_no_pair_routes_payloads_or_peer_router_rows() {
+        let cfg = config();
+        let local = LocalInventory { package: Default::default(), format: GlmLocalFormat::Exlr8,
+            experts: Vec::new(), backend_workspace: 17 << 20, extra_workspace: [0; 2], world: 1, unit_limit: 16 };
+        assert_eq!(local.workspace(), [17 << 20, 0]);
+        for rows in [1, 64, 2752, 4096] { for lanes in 1..=4 {
+            assert_eq!(local.workspace_for(&cfg, rows, lanes, false), [17 << 20, 0]);
+        } }
+    }
+
+    #[test]
+    fn one_rank_onboarding_preserves_pool_first_and_exact_whole_peak() {
+        let cfg = config();
+        let mut input = inputs(&cfg, &[96 * GIB]);
+        input.max_context = 65536;
+        input.expert_workspace = 700 << 20;
+        input.tp2_workspace = [0; 2];
+        for requested_pool in [None, Some(65536)] {
+            input.requested_pool = requested_pool;
+            let (automatic, working) = solve_working_set(&input, [0; 2], HEADS).unwrap();
+            assert!(automatic.tp2.is_none());
+            assert_eq!(working.spark.rtx_layers.len(), automatic.onboard_layers);
+            // An unconstrained pool can consume all headroom; the explicit pool
+            // also exercises a nonempty Whole owner without changing that policy.
+            if requested_pool.is_some() { assert!(automatic.onboard_layers > 0); }
+            if automatic.onboard_layers > 0 {
+                let peak = input.expert_workspace + automatic.onboard_layers as u64 * 4 * GIB;
+                assert_eq!(automatic.expert_ranges[0].peak_bytes, peak);
+            } else {
+                assert!(automatic.expert_ranges.iter().all(|range| range.layers == 0 && range.peak_bytes == 0));
+            }
+            let remote = GlmInputs { onboard: Onboard::Layers(0), ..input.clone() };
+            let remote = solve_working_set(&remote, [0; 2], HEADS).unwrap().0;
+            assert_eq!(automatic.pool_tokens, remote.pool_tokens, "experts must use only post-pool headroom");
+            let score = |placement: &Placement| (placement.pool_tokens, placement.onboard_layers);
+            let best = (0..=cfg.layers - cfg.first_moe_layer).filter_map(|count| {
+                solve_working_set(&GlmInputs { onboard: Onboard::Layers(count), ..input.clone() }, [0; 2], HEADS)
+                    .ok().map(|(placement, _)| score(&placement))
+            }).max().unwrap();
+            assert_eq!(score(&automatic), best);
+        }
+    }
 
     #[test]
     fn exlr8_costs_use_rotated_native_residency_and_peer_router_records() {
@@ -1461,7 +1520,7 @@ mod tests {
                         input.native_head = native_head;
                         input.onboard = Onboard::Layers(1);
                         let local = LocalInventory { package: Default::default(), format: GlmLocalFormat::Exl3,
-                            experts: input.experts.clone(), backend_workspace: 17 << 20,
+                            experts: input.experts.clone(), backend_workspace: 17 << 20, world: 2, unit_limit: 0,
                             extra_workspace: local_extra_workspace(cfg.hidden as u64, cfg.experts as u64,
                                 cfg.topk as u64, unit, slots, exchange_f32) };
                         input.tp2_workspace = local.workspace();

@@ -1123,8 +1123,9 @@ impl Opened {
                     &local.package, self.cfg.hidden, max_rows)? as u64 == local.backend_workspace,
                     "GLM EXL3 planner/runtime backend workspace mismatch"),
                 glm::GlmLocalFormat::Exlr8 => ensure!(
-                    crate::shared::experts::rtx::exlr8::Exlr8RtxWeights::workspace_bytes(
-                        &programs, cuteafd_ffi::exlr8::KernelFamily::Glm, max_rows, args.exlr8_prefill_activations)? as u64 == local.backend_workspace,
+                    crate::shared::experts::rtx::exlr8::Exlr8RtxWeights::workspace_bytes_with_limit(
+                        &programs, cuteafd_ffi::exlr8::KernelFamily::Glm, max_rows, local.unit_limit,
+                        args.exlr8_prefill_activations)? as u64 == local.backend_workspace,
                     "GLM EXLR8 planner/runtime backend workspace mismatch"),
                 glm::GlmLocalFormat::Nvfp4 { .. } => {
                     let tensors = self.catalog.fp8().context("NVFP4 tensors")?;
@@ -1136,7 +1137,9 @@ impl Opened {
                 }
             }
         }
-        let tp2_workspace = local.as_ref().map_or([0; 2], |l| l.workspace());
+        let expert_workspace = local.as_ref().filter(|local| local.world == 1)
+            .map_or(0, |local| local.backend_workspace);
+        let tp2_workspace = local.as_ref().filter(|local| local.world == 2).map_or([0; 2], |l| l.workspace());
         let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&self.cfg,
             args.prefill_rows as u64, 1, exchange_f32));
         let inputs = glm::GlmInputs {
@@ -1149,7 +1152,7 @@ impl Opened {
             max_context: args.max_context as u64, automatic_context, scratch: Some([scratch(true)?, scratch(false)?]),
             drafter_bytes, drafter_staging, pending_code,
             experts: local.as_ref().map_or_else(Vec::new, |l| l.experts.clone()),
-            expert_workspace: 0, tp2_workspace, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
+            expert_workspace, tp2_workspace, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
             onboard: if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) }
                 else { onboard }, full_prefill_logits: args.full_prefill_logits, context };
         let (placement, working) = glm::solve_working_set(&inputs, serial_workspace, requested)?;
@@ -1166,6 +1169,8 @@ impl Opened {
         cuteafd_loader::placement::families::GLM5.check(&placement)?;
         tracing::info!(placement = %placement.summary(), "GLM admission");
         let tp2_range = placement.tp2.map(|p| p.first..p.first + p.layers);
+        let whole_range = (devices.len() == 1).then(|| placement.expert_ranges.first().copied())
+            .flatten().filter(|range| range.layers > 0);
         let max_rows = args.prefill_rows.max(engine::DECODE_ROWS);
         let tp2_devices = || -> Result<[crate::shared::memory::device::Device<'_>; 2]> {
             Ok([crate::shared::memory::device::Device { library: &self.library, id: args.device },
@@ -1182,13 +1187,15 @@ impl Opened {
         let mut coordinator_push = None;
         let mut native_push = None;
         let native_push_experts = || -> Result<_> {
-            tp2_range.as_ref().map(|range| -> Result<_> {
-                let workspace = crate::shared::experts::rtx::exlr8::Exlr8RtxWeights::workspace_bytes(
-                    &programs, cuteafd_ffi::exlr8::KernelFamily::Glm, max_rows, args.exlr8_prefill_activations)?;
-                let budgets = tp2_budgets()?.map(|b| b.saturating_sub(workspace));
+            let selected = if let Some(range) = &tp2_range {
+                Some((range.clone().collect::<Vec<_>>(), tp2_budgets()?.to_vec()))
+            } else { whole_range.map(|range| ((range.first..range.first + range.layers).collect(),
+                vec![range.peak_bytes as usize])) };
+            selected.map(|(layers, budgets)| -> Result<_> {
+                let workspace = usize::try_from(local.as_ref().context("native local inventory")?.backend_workspace)?;
                 Ok(crate::shared::experts::rtx::push::CoordinatorExperts::Exlr8 {
-                    manifest: args.exlr8_manifest.clone().context("EXLR8 manifest")?,
-                    layers: range.clone().collect(), budgets: budgets.to_vec() })
+                    manifest: args.exlr8_manifest.clone().context("EXLR8 manifest")?, layers,
+                    budgets: budgets.into_iter().map(|bytes| bytes.saturating_sub(workspace)).collect() })
             }).transpose()
         };
         let dense_devices = devices.iter().map(|&id| crate::shared::memory::device::Device {
@@ -1324,12 +1331,25 @@ impl Opened {
                 }),
             })
         };
+        let mut whole_weights = None;
         let (embedding, ((model, mut shares), tp2)) = crate::shared::placement::load_while_admitting(admission, || {
             if let Some(records) = &native_records {
                 let loaded = self.load_native(args, records, &native_dense_records, layers, &programs, &manifest, &loader, &devices, stream,
                     peer_stream, native_push.take(), &ml4_draft, &mut draft_file)?;
                 planned_drafter = loaded.3;
-                let tp2 = tp2_range.clone().map(|range| tp2_weights(range, loaded.2)).transpose()?;
+                let tp2 = if let Some(range) = tp2_range.clone() {
+                    Some(tp2_weights(range, loaded.2)?)
+                } else {
+                    if let Some(range) = whole_range {
+                        let mut pushed = loaded.2.context("whole EXLR8 requires a committed push group")?;
+                        ensure!(pushed.len() == 1, "one EXLR8 coordinator GPU required");
+                        whole_weights = Some(crate::shared::experts::rtx::exlr8::Exlr8RtxWeights::pushed_rank(
+                            dense_devices[0], &programs, (range.first..range.first + range.layers).collect(),
+                            max_rows, usize::try_from(range.peak_bytes)?, args.exlr8_prefill_activations,
+                            1, 0, pushed.pop().unwrap().exlr8()?)?);
+                    }
+                    None
+                };
                 return Ok((loaded.0, (loaded.1, tp2)));
             }
             let (embedding, model, pushed) = if let Some((push, sparks, (embedding, model, drafter, records, deferred, dense))) = coordinator_push.take() {
@@ -1426,6 +1446,13 @@ impl Opened {
             for rank in &ranks { ensure!(rank.workspace_bytes() as u64 == local.backend_workspace,
                 "GLM loaded TP2 workspace differs from admission"); }
             engine.install_tp2(ranks)?;
+        }
+        if let Some(weights) = whole_weights {
+            let backend = weights.execution()?;
+            ensure!(crate::shared::experts::rtx::RtxExpertLayer::workspace_bytes(&backend) as u64
+                == local.as_ref().context("whole local inventory")?.backend_workspace,
+                "GLM whole backend workspace differs from admission");
+            engine.install_whole(Box::new(backend))?;
         }
         if context_kv {
             // The solver charged staging over the compiled extent it was given.
@@ -1524,7 +1551,7 @@ impl Opened {
         // Every decode graph shape serving replays, captured now (CUTEAFD_GLM_WARM_GRAPHS=0 skips it).
         if engine.weights.layers.len() == self.cfg.layers
             && std::env::var("CUTEAFD_GLM_WARM_GRAPHS").map_or(true, |v| v != "0")
-            && (transport.is_some() || args.skip_routed_experts || engine.has_tp2()) {
+            && (transport.is_some() || args.skip_routed_experts || engine.has_local()) {
             engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)))?;
         }
         engine.check_tp2_routes(transport.as_mut().map(|t| (t, &runtime)))?;
@@ -1839,7 +1866,7 @@ fn width_invariance(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
         "--width-invariance takes widths 1..={}", engine::DECODE_ROWS);
     ensure!(transport.is_some() || engine.skip_routed()
         || engine.weights.layers.iter().enumerate().all(|(i, layer)| layer.dense
-            || engine.tp2_layers().is_some_and(|layers| layers.contains(&i))),
+            || engine.local_layers().is_some_and(|layers| layers.contains(&i))),
         "--width-invariance needs Spark peers, local experts, or --skip-routed-experts");
     let prefill = args.prefill.unwrap_or(512);
     let tokens: Vec<u32> = tokens.iter().copied().cycle().take(prefill + max_rows).collect();
@@ -2098,7 +2125,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
         return draft_run(args, opened, engine, transport, runtime);
     }
     if args.nll || args.bench_prefill > 0 {
-        ensure!(transport.is_some() || engine.skip_routed() || engine.has_tp2(),
+        ensure!(transport.is_some() || engine.skip_routed() || engine.has_local(),
             "--nll and --bench-prefill need Spark peers, local TP2 or --skip-routed-experts");
         if args.nll {
             nll_run(args, opened, engine, transport.as_deref_mut(), runtime)?;
