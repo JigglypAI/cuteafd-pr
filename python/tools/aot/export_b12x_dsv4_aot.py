@@ -852,13 +852,12 @@ def kimi_context_programs(decode_rows: int, max_context: int):
         g = kimi_mla.KimiMlaGeometry(kv_cache=cache)
         suffix = "" if cache == "bf16" else "_fp8"
         for begin in (0, 48):
-            for splits in (2, 16):
-                out.append((f"mla_partial{suffix}_h{begin}_s{splits}_m{decode_rows}", "mla_partial",
-                            {"max_rows": decode_rows, "max_context": max_context, "head_begin": begin,
-                             "head_count": 48, "num_splits": splits, "kv_cache": cache},
-                            lambda g=g, begin=begin, splits=splits: kimi_mla.compile_kimi_mla_partial_aot(
-                                g, max_rows=decode_rows, max_context=max_context,
-                                head_begin=begin, head_count=48, num_splits=splits)))
+            out.append((f"mla_partial{suffix}_h{begin}_m{decode_rows}", "mla_partial",
+                        {"max_rows": decode_rows, "max_context": max_context, "head_begin": begin,
+                         "head_count": 48, "num_splits": 16, "kv_cache": cache},
+                        lambda g=g, begin=begin: kimi_mla.compile_kimi_mla_partial_aot(
+                            g, max_rows=decode_rows, max_context=max_context,
+                            head_begin=begin, head_count=48, num_splits=16)))
         out.append((f"paged_staging_gather{suffix}", "paged_staging_gather",
                     {"row_bytes": g.record_bytes, "page_rows": PAGE_ROWS},
                     lambda g=g: context_split.compile_paged_staging_gather_aot(

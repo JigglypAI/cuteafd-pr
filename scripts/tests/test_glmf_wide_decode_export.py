@@ -596,7 +596,7 @@ def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_
 
 def test_kimi_context_exports_native_partial_ranges_and_shared_primitives(exporter):
     programs = exporter.kimi_context_programs(64, 1048576)
-    assert len(programs) == 11
+    assert len(programs) == 7
     for stem, op, params, thunk in programs:
         module, fn, args, kw = thunk()
         if op == "mla_partial":
@@ -604,7 +604,7 @@ def test_kimi_context_exports_native_partial_ranges_and_shared_primitives(export
             assert kw == {k: v for k, v in params.items() if k != "kv_cache"}
             assert args[0].kv_cache == params["kv_cache"]
             assert params["head_begin"] in (0, 48) and params["head_count"] == 48
-            assert params["num_splits"] in (2, 16)
+            assert params["num_splits"] == 16
         else:
             assert module == "context_split"
             assert fn == f"compile_{op}_aot"
