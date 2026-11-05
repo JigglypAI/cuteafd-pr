@@ -286,30 +286,40 @@ pub fn graphs(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, v
 
 pub fn graphs_for_ranks(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
     ranks: usize, resident: impl Fn(usize, usize) -> bool) -> Result<GraphSet> {
-    graphs_with_context(cfg, lanes, capacity, slots, verify, ranks, resident, |_| false)
+    graphs_with_context(cfg, lanes, capacity, slots, verify, ranks, resident, |_| false, None)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn graphs_with_context(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
-    ranks: usize, resident: impl Fn(usize, usize) -> bool, context: impl Fn(usize) -> bool) -> Result<GraphSet> {
+    ranks: usize, resident: impl Fn(usize, usize) -> bool, context: impl Fn(usize) -> bool,
+    decode: Option<&super::context::DecodeBuckets>) -> Result<GraphSet> {
     ensure!(matches!(ranks, 1 | 2) && (1..=2).contains(&lanes) && (1..=UNIT_ROWS_MAX).contains(&capacity)
         && (1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots) && verify <= 64, "Kimi graph geometry");
     ensure!((0..cfg.layers).all(|layer| !context(layer)
         || (ranks == 2 && cfg.attention[layer] == KimiAttention::Mla && (0..2).all(|rank| resident(rank, layer)))),
         "Kimi context graph residency differs from two-rank MLA");
+    ensure!(!(0..cfg.layers).any(&context) || decode.is_some(),
+        "Kimi context graph inventory needs package-derived decode buckets");
     let mut counts = vec![0; ranks];
     for (rank, count) in counts.iter_mut().enumerate() {
         for rows in graph_rows(verify, capacity) {
             *count += (3 * cfg.layers + usize::from(rank == ranks - 1)) as u64;
             for layer in 0..cfg.layers {
-                if resident(rank, layer) {
-                    let phases = if context(layer) { super::context::graph_phases(rows).len() as u64 } else { 1 };
+                if resident(rank, layer) && !context(layer) {
                     if GRAPH_ROWS.contains(&rows) {
-                        *count += phases + u64::from(cfg.attention[layer] == KimiAttention::Kda
+                        *count += 1 + u64::from(cfg.attention[layer] == KimiAttention::Kda
                             && (2..=slots).contains(&rows));
                     }
-                    if verify_graph_rows(verify, capacity).contains(&rows) { *count += phases; }
+                    if verify_graph_rows(verify, capacity).contains(&rows) { *count += 1; }
                 }
+            }
+        }
+        if let Some(decode) = decode {
+            for rows in decode.graph_rows(verify, capacity) {
+                let variants = u64::from(decode.plain().contains(&rows))
+                    + u64::from(verify_graph_rows(verify, capacity).contains(&rows));
+                *count += (0..cfg.layers).filter(|&layer| context(layer) && resident(rank, layer)).count() as u64
+                    * super::context::graph_phases(rows).len() as u64 * variants;
             }
         }
         *count *= lanes as u64;

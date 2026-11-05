@@ -31,6 +31,20 @@ impl<'a> Mla<'a> {
     pub(crate) fn max_context(&self) -> usize { self.native.max_context() }
     pub(crate) fn splits(&self) -> usize { self.native.splits() }
 
+    pub(crate) fn produce(&self, layer: usize, weights: KimiMlaWeights,
+        batch: KimiMlaBatch, stream: *mut c_void) -> Result<()> {
+        ensure!(self.layers.get(layer) == Some(&KimiAttention::Mla), "layer {layer} is not Kimi MLA");
+        self.native.produce(weights, batch, stream)?;
+        Ok(())
+    }
+
+    pub(crate) fn output(&self, layer: usize, weights: KimiMlaWeights,
+        batch: KimiMlaBatch, stream: *mut c_void) -> Result<()> {
+        ensure!(self.layers.get(layer) == Some(&KimiAttention::Mla), "layer {layer} is not Kimi MLA");
+        self.native.output(weights, batch, stream)?;
+        Ok(())
+    }
+
     pub(crate) fn attention(&self,layer:usize,batch:KimiMlaBatch,stream:*mut c_void)->Result<()> {
         ensure!(self.layers.get(layer)==Some(&KimiAttention::Mla),"layer {layer} is not Kimi MLA");
         self.native.attention(batch,stream)?;Ok(())

@@ -484,6 +484,8 @@ pub(crate) struct LocalLane<'a> {
     attention: Option<AttentionShape>,
     graphs: Option<super::graphs::Graphs<'a>>,
     replay_enabled: bool,
+    context: Option<(Rc<super::context::ContextOwner<'a>>, Rc<super::context::Programs<'a>>)>,
+    context_pages: Vec<usize>,
 }
 
 impl Drop for LocalLane<'_> {
@@ -508,7 +510,19 @@ impl<'a> LocalLane<'a> {
         global.check_device(device)?;
         kda.check_reader(lane_index, &lane.stream)?;
         mla.check_reader(lane_index, &lane.stream)?;
-        Ok(Self { lane, programs, cfg, layers, global, lane_index, rank, kda, mla, attention: None, graphs: None, replay_enabled: true })
+        let banks = lane.layout.metadata_banks();
+        Ok(Self { lane, programs, cfg, layers, global, lane_index, rank, kda, mla, attention: None, graphs: None,
+            replay_enabled: true, context: None, context_pages: vec![0; banks] })
+    }
+
+    pub(crate) fn bind_context(&mut self, owner: Rc<super::context::ContextOwner<'a>>,
+        programs: Rc<super::context::Programs<'a>>) -> Result<()> {
+        ensure!(self.context.is_none() && self.graphs.is_none() && self.mla.parity(),
+            "Kimi context binding requires admitted parity cache before capture");
+        owner.ranks[self.rank].check_reader(self.stream())?;
+        ensure!(owner.ranks[self.rank].extent() == self.max_context(), "Kimi context binding extent differs");
+        self.context = Some((owner, programs));
+        Ok(())
     }
 
     fn layer(&self, layer: usize) -> Result<&super::weights::LayerWeights<'a>> {
@@ -778,6 +792,193 @@ impl<'a> LocalLane<'a> {
             None => bail!("Kimi attention layer outside inventory"),
         }
         Ok(output)
+    }
+
+    fn context_slot(&self, layer: usize) -> Result<crate::shared::peer_split::context::SlotBuffers> {
+        use cuteafd_loader::families::kimi_k3::config::KimiAttention;
+        ensure!(self.cfg.attention.get(layer) == Some(&KimiAttention::Mla), "Kimi context requires MLA");
+        let ordinal = self.cfg.attention[..layer].iter().filter(|&&kind| kind == KimiAttention::Mla).count();
+        let owner = &self.context.as_ref().context("Kimi context not bound")?.0;
+        owner.exchange.buffers(self.rank, crate::shared::peer_split::context::slot(ordinal, self.lane_index))
+    }
+
+    fn context_batch(&self, layer: usize, rows: usize, speculative: bool) -> Result<cuteafd_ffi::KimiMlaBatch> {
+        ensure!((1..=64).contains(&rows), "Kimi context decode batch rows");
+        let owner = &self.context.as_ref().context("Kimi context not bound")?.0.ranks[self.rank];
+        let bank = self.lane.metadata_bank;
+        Ok(cuteafd_ffi::KimiMlaBatch { rows, requests: rows, page_table_width: owner.compact_width(),
+            cache_pages: self.mla.local_pages(), active_splits: self.mla_program(layer, rows, speculative)?.splits(),
+            x: owner.buffer("decode input")?, slots: owner.metadata("context slots", bank)?,
+            cache: self.mla.layer(layer)?, page_table: owner.metadata("compact page tables", bank)?,
+            lengths: owner.metadata("shard lengths", bank)?, query_offsets: owner.metadata("context offsets", bank)?,
+            query: self.lane.buffer("MLA query")?, q_resid: self.lane.buffer("MLA q residual")?,
+            attention: self.lane.buffer("MLA attention")?, lse: self.lane.buffer("MLA LSE")?,
+            output: owner.buffer("decode output")?, producer_scratch: self.lane.buffer("MLA producer scratch")?,
+            attention_scratch: self.lane.buffer("MLA attention scratch")?, output_scratch: self.lane.buffer("MLA output scratch")? })
+    }
+
+    fn context_decode_phase(&mut self, layer: usize, rows: usize, speculative: bool,
+        phase: cuteafd_loader::families::kimi_k3::context::GraphPhase) -> Result<()> {
+        use cuteafd_loader::families::kimi_k3::context::GraphPhase;
+        if self.replay(rows, super::graphs::Op::Context { layer, speculative, phase })? { return Ok(()); }
+        // Only startup capture may submit decode arithmetic without an executable.
+        ensure!(self.graphs.is_none(), "Kimi context decode phase was not captured at startup");
+        let batch = self.context_batch(layer, rows, speculative)?;
+        let (context, programs) = self.context.as_ref().context("Kimi context not bound")?;
+        let owner = &context.ranks[self.rank];
+        let slot = self.context_slot(layer)?;
+        let stream = self.stream();
+        match phase {
+            GraphPhase::Produce => self.mla_produce(layer, batch),
+            GraphPhase::Partial { heads_rank, splits } => {
+                ensure!(heads_rank < 2 && super::context::SPLIT_BUCKETS.contains(&splits), "Kimi context partial variant");
+                let partial = owner.partial(heads_rank != self.rank, rows)?;
+                let buffer = |ptr, bytes| CuteafdDeviceBuffer { ptr, bytes, device_id: stream.device.id, flags: 0 };
+                stream.device.run(|| {
+                    programs.partial[heads_rank].launch(cuteafd_ffi::KimiMlaPartialBatch {
+                        rows, active_splits: splits, cache_pages: batch.cache_pages, page_table_width: batch.page_table_width,
+                        query: buffer(slot.query, rows * 96 * 576 * 2), cache: batch.cache,
+                        page_table: batch.page_table, lengths: batch.lengths, query_offsets: batch.query_offsets,
+                        attention: buffer(partial.values, rows * 48 * 512 * 2), lse: buffer(partial.lse, rows * 48 * 4),
+                        scratch: owner.buffer("partial scratch")? }, stream.raw)?;
+                    Ok(())
+                })
+            }
+            GraphPhase::CombineOutput => {
+                let own = owner.partial(false, rows)?;
+                let received = crate::shared::peer_split::attention::Partial { values: slot.partial, lse: slot.lse };
+                let [first, second] = crate::shared::peer_split::context::combine_order(self.rank, own, received);
+                stream.device.run(|| {
+                    // SAFETY: startup validated the no-sink h48 ABI. Fixed owners
+                    // retain both partials and output through this exact stream.
+                    unsafe { programs.combine.launch(&[first.values, first.lse, second.values, second.lse,
+                        batch.attention.ptr, batch.attention.ptr], &[cuteafd_ffi::programs::Scalar::I32(rows as i32)], stream.raw) }
+                })?;
+                self.mla_output(layer, batch)
+            }
+            _ => bail!("Kimi gathered prefill phase used as decode"),
+        }
+    }
+
+    pub(crate) fn context_decode(&mut self, layer: usize, rows: usize, speculative: bool) -> Result<()> {
+        use crate::shared::peer_split::attention::{Candidates, ContextKernels, Partial, Query};
+        use cuteafd_loader::families::kimi_k3::context::GraphPhase;
+        ensure!(self.lane.window.is_none() && self.lane.metadata_bank == 0,
+            "Kimi context decode needs its fixed metadata bank");
+        ensure!(self.graphs.is_some() && self.replay_enabled, "Kimi context decode requires startup graphs");
+        let context = self.context.as_ref().context("Kimi context not bound")?.0.clone();
+        let padded = context.ranks[self.rank].decode().bucket(rows)?;
+        let bucket = if speculative { rows } else { padded };
+        let input = context.ranks[self.rank].buffer("decode input")?;
+        let source = self.plane("normalized", rows, 7168)?;
+        let stream = self.stream().clone();
+        stream.device.run(|| {
+            // SAFETY: fixed decode storage does not alias live normalized rows;
+            // zeroing masks padded projections without touching KDA state.
+            unsafe {
+                stream.device.library.cuda_zero_bytes_async(input, input.bytes, stream.raw)?;
+                stream.device.library.copy_d2d_async(input, source, rows * 7168 * 2, stream.raw)
+            }
+        })?;
+        let splits = super::context::split_bucket(self.context_pages[0], bucket,
+            self.context.as_ref().unwrap().1.sms)?;
+        struct Bindings<'b, 'a> { local: &'b mut LocalLane<'a>, layer: usize, rows: usize, speculative: bool, splits: usize }
+        impl ContextKernels for Bindings<'_, '_> {
+            fn produce(&mut self) -> Result<Query> {
+                self.local.context_decode_phase(self.layer, self.rows, self.speculative, GraphPhase::Produce)?;
+                Ok(Query { values: self.local.lane.buffer("MLA query")?.ptr, row_pitch: 48 * 576 * 2, width: None })
+            }
+            fn score(&mut self) -> Result<Option<Candidates>> { Ok(None) }
+            fn merge(&mut self, _: *mut std::ffi::c_void, _: *mut std::ffi::c_void) -> Result<()> {
+                bail!("Kimi MLA has no indexer candidates")
+            }
+            fn partial(&mut self, query: *mut std::ffi::c_void, heads_rank: usize) -> Result<Partial> {
+                ensure!(query == self.local.context_slot(self.layer)?.query, "Kimi context query pointer changed");
+                self.local.context_decode_phase(self.layer, self.rows, self.speculative,
+                    GraphPhase::Partial { heads_rank, splits: self.splits })?;
+                self.local.context.as_ref().unwrap().0.ranks[self.local.rank].partial(heads_rank != self.local.rank, self.rows)
+            }
+            fn combine(&mut self, partials: [Partial; 2]) -> Result<()> {
+                let slot = self.local.context_slot(self.layer)?;
+                let own = self.local.context.as_ref().unwrap().0.ranks[self.local.rank].partial(false, self.rows)?;
+                let expected = crate::shared::peer_split::context::combine_order(self.local.rank, own,
+                    Partial { values: slot.partial, lse: slot.lse });
+                ensure!(partials.iter().zip(expected).all(|(a, b)| a.values == b.values && a.lse == b.lse),
+                    "Kimi context fixed combine operands changed");
+                self.local.context_decode_phase(self.layer, self.rows, self.speculative, GraphPhase::CombineOutput)
+            }
+        }
+        let rank = self.rank;
+        let lane = self.lane_index;
+        let ordinal = self.cfg.attention[..layer].iter().filter(|&&kind|
+            kind == cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla).count();
+        crate::shared::peer_split::attention::context_decode(&context.exchange, rank, ordinal, lane, bucket,
+            &mut Bindings { local: self, layer, rows: bucket, speculative, splits })?;
+        let output = context.ranks[rank].buffer("decode output")?;
+        let destination = self.attention_result(layer, rows)?;
+        stream.device.run(|| {
+            // SAFETY: only live rows leave padded context storage. The fixed
+            // output and retained lane destination are disjoint and stream-ordered.
+            unsafe { stream.device.library.copy_d2d_async(destination, output, rows * 7168 * 2, stream.raw) }
+        })
+    }
+
+    fn mla_program(&self, layer: usize, rows: usize, speculative: bool) -> Result<&super::mla::Mla<'a>> {
+        let programs = &self.programs.mla[usize::from(self.layer(layer)?.attention
+            == crate::shared::placement::layers::AttentionShare::Whole)];
+        Ok(if rows > 64 { &programs.extend } else if speculative { &programs.verify } else { &programs.decode })
+    }
+
+    fn mla_produce(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch) -> Result<()> {
+        let weights = self.layer(layer)?;
+        let stream = self.stream();
+        stream.device.run(|| {
+            if !self.native_attention(layer)? {
+                return self.mla_program(layer, batch.rows, false)?.produce(layer, weights.mla()?, batch, stream.raw);
+            }
+            let programs = self.programs.core.as_ref().context("K6 programs not resolved")?;
+            let scratch = self.lane.core.as_ref().context("K6 scratch not admitted")?;
+            let projected = |name| programs.projected(weights.core(name)?, scratch);
+            let heads = if weights.attention == crate::shared::placement::layers::AttentionShare::Whole { 96 } else { 48 };
+            let split = programs.mla.get(&(heads, weights.core("mla.kv_a")?.shape[0],
+                if batch.rows > 64 { 4096 } else { 64 })).context("K6 MLA split shape not resolved")?;
+            super::core_runtime::mla_rank_projected(split, projected("mla.q_a")?, projected("mla.kv_a")?, batch.x,
+                cuteafd_ffi::KimiMlaRankBatch { rows: batch.rows, cache_pages: batch.cache_pages,
+                    q_a: self.lane.buffer("K6 q_a")?, kv_a: self.lane.buffer("K6 kv_a")?,
+                    q_norm: weights.buffer("mla.q_norm")?, kv_norm: weights.buffer("mla.kv_norm")?,
+                    slots: batch.slots, q_resid: batch.q_resid, cache: batch.cache,
+                    scratch: self.lane.buffer(if self.lane.layout.operands.contains_key("K6 MLA scratch") {
+                        "K6 MLA scratch" } else { "MLA producer scratch" })? }, stream.raw)?;
+            super::core_runtime::mla_query_projected(split, projected("mla.q_b")?, batch.rows, batch.q_resid,
+                self.lane.buffer("K6 q_b")?, weights.buffer("mla.uk")?, batch.query, stream.raw)
+        })
+    }
+
+    fn mla_output(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch) -> Result<()> {
+        let weights = self.layer(layer)?;
+        let stream = self.stream();
+        stream.device.run(|| {
+            if !self.native_attention(layer)? {
+                return self.mla_program(layer, batch.rows, false)?.output(layer, weights.mla()?, batch, stream.raw);
+            }
+            let programs = self.programs.core.as_ref().context("K6 programs not resolved")?;
+            let scratch = self.lane.core.as_ref().context("K6 scratch not admitted")?;
+            let heads = if weights.attention == crate::shared::placement::layers::AttentionShare::Whole { 96 } else { 48 };
+            let split = programs.mla.get(&(heads, weights.core("mla.kv_a")?.shape[0],
+                if batch.rows > 64 { 4096 } else { 64 })).context("K6 MLA split shape not resolved")?;
+            let normalized = self.lane.buffer("K6 normalized")?;
+            super::core_runtime::mla_gate_projected(split, programs.projected(weights.core("mla.gate")?, scratch)?,
+                batch.rows, batch.x, batch.attention, weights.buffer("mla.uv")?,
+                self.lane.buffer("K6 gate")?, normalized, stream.raw)?;
+            let weight = weights.core("mla.output")?;
+            let projection = programs.projection(weight)?;
+            if heads == 96 { projection.local(batch.rows, normalized, weight, scratch, batch.output, stream.raw) }
+            else {
+                let partial = projection.core(batch.rows, normalized, weight, scratch, stream.raw)?;
+                crate::shared::dense_trellis::retain_partial(&programs.narrow, partial, batch.output,
+                    batch.rows * 7168, stream.raw)
+            }
+        })
     }
 
     pub(crate) fn native_attention(&self,layer:usize)->Result<bool> {

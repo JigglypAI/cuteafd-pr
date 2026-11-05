@@ -29,15 +29,75 @@ pub fn graph_phases(rows: usize) -> Vec<GraphPhase> {
     phases
 }
 
+/// Context-only padding inventory. Native route edges come from the package,
+/// which exports the very constants used by the K6 dispatcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeBuckets {
+    thresholds: Vec<usize>,
+    plain: Vec<usize>,
+}
+
+impl DecodeBuckets {
+    pub fn from_manifest(manifest: &serde_json::Value) -> Result<Self> {
+        let programs = manifest["programs"].as_array().context("Kimi context program inventory missing")?;
+        let mut thresholds: Option<Vec<usize>> = None;
+        for program in programs.iter().filter(|p| p["name"].as_str().is_some_and(|name|
+            name.starts_with("dense_trellis_k6_trellis_")) && p["geometry"]["bits"] == 6) {
+            let geometry = &program["geometry"];
+            let routes = geometry["decode_route_thresholds"].as_array()
+                .context("Kimi context native K6 decode route thresholds missing")?;
+            let routes = routes.iter().map(|v| -> Result<usize> {
+                usize::try_from(v.as_u64().context("Kimi context invalid native decode route threshold")?)
+                    .context("Kimi context decode route threshold overflow")
+            }).collect::<Result<Vec<_>>>()?;
+            ensure!(!routes.is_empty() && routes.iter().all(|&edge| (1..64).contains(&edge))
+                && routes.windows(2).all(|pair| pair[0] < pair[1]),
+                "Kimi context native decode routes must be sorted unique edges below 64");
+            ensure!(thresholds.as_ref().is_none_or(|expected| *expected == routes),
+                "Kimi context native decode routes differ between programs");
+            thresholds = Some(routes);
+        }
+        let thresholds = thresholds.unwrap_or_default();
+        let mut plain = if thresholds.is_empty() { vec![1, 4, 16, 64] } else { vec![1, 4, 64] };
+        plain.extend(&thresholds);
+        plain.sort_unstable();
+        plain.dedup();
+        let buckets = Self { thresholds, plain };
+        for rows in 1..=64 { buckets.bucket(rows)?; }
+        Ok(buckets)
+    }
+
+    pub fn plain(&self) -> &[usize] { &self.plain }
+
+    pub fn bucket(&self, rows: usize) -> Result<usize> {
+        ensure!((1..=64).contains(&rows), "Kimi context decode rows");
+        let bucket = *self.plain.iter().find(|&&bucket| rows <= bucket)
+            .context("Kimi context decode bucket absent")?;
+        ensure!(self.thresholds.iter().all(|&edge| (rows <= edge) == (bucket <= edge)),
+            "Kimi context padding crosses a native arithmetic boundary");
+        Ok(bucket)
+    }
+
+    pub fn graph_rows(&self, verify: usize, capacity: usize) -> Vec<usize> {
+        let mut rows = self.plain.iter().copied()
+            .chain(super::allocation::verify_graph_rows(verify, capacity))
+            .filter(|&rows| rows <= capacity).collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+}
+
 const ROWS: usize = 64;
 const HEADS: usize = 48;
-const METADATA: [&str; 5] = ["context slots", "compact page tables", "shard lengths", "gather tables", "commit blocks"];
+const METADATA: [&str; 6] = ["context slots", "compact page tables", "shard lengths", "context offsets", "gather tables", "commit blocks"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextLayout {
     buffers: ContextBuffers,
     workspace: Vec<(&'static str, usize)>,
     metadata_banks: usize,
+    decode: DecodeBuckets,
 }
 
 /// Required names are format-specific: a BF16 package cannot admit FP8 context.
@@ -78,9 +138,10 @@ impl ContextLayout {
         }
         let half_pages = max_context.div_ceil(ROWS).div_ceil(2);
         let partial = ROWS * HEADS * (512 * 2 + 4);
-        let mut workspace = vec![("own-head partial", partial), ("peer-head partial", partial), ("partial scratch", scratch)];
+        let mut workspace = vec![("own-head partial", partial), ("peer-head partial", partial), ("partial scratch", scratch),
+            ("decode input", ROWS * 7168 * 2), ("decode output", ROWS * 7168 * 2)];
         for (name, bytes) in METADATA.into_iter().zip([unit_rows * 8,
-            ROWS * half_pages * 4, ROWS * 4, 2 * half_pages * 4,
+            ROWS * half_pages * 4, ROWS * 4, (ROWS + 1) * 4, 2 * half_pages * 4,
             3 * (unit_rows.div_ceil(ROWS) + 1) * 8]) {
             let stride = bytes.max(256).next_multiple_of(256);
             workspace.push((name, stride.checked_mul(metadata_banks).context("Kimi context metadata banks overflow")?));
@@ -92,9 +153,10 @@ impl ContextLayout {
             query_row_bytes: (HEADS * 576 * 2) as u64, partial_row_bytes: (HEADS * (512 * 2 + 4)) as u64,
             decode_rows: ROWS as u64, lanes: 1, workspace_bytes, ..Default::default() };
         buffers.demands()?;
-        Ok(Self { buffers, workspace, metadata_banks })
+        Ok(Self { buffers, workspace, metadata_banks, decode: DecodeBuckets::from_manifest(manifest)? })
     }
 
+    pub fn decode(&self) -> &DecodeBuckets { &self.decode }
     pub fn buffers(&self) -> ContextBuffers { self.buffers }
     pub fn workspace(&self) -> Vec<(&'static str, usize)> { self.workspace.clone() }
 
@@ -128,6 +190,42 @@ pub(crate) fn add_manifest_programs(manifest: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn native_manifest(routes: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"programs": [{"name":"dense_trellis_k6_trellis_mla_q_a_mcg",
+            "geometry":{"bits":6,"decode_route_thresholds":routes}}]})
+    }
+
+    #[test]
+    fn context_buckets_derive_from_native_routes_without_spanning_a_boundary() -> Result<()> {
+        // Vary the dispatcher geometry: the engine must not know its edges.
+        for routes in [vec![8, 16, 32, 48], vec![3, 9, 25, 51]] {
+            let manifest = native_manifest(serde_json::json!(routes));
+            let decode = DecodeBuckets::from_manifest(&manifest)?;
+            for rows in 1..=64 {
+                let bucket = decode.bucket(rows)?;
+                assert!(bucket >= rows);
+                assert!(routes.iter().all(|&edge| (rows <= edge) == (bucket <= edge)));
+            }
+            for &edge in &routes { assert!(decode.plain().contains(&edge)); }
+            assert!(decode.bucket(0).is_err());
+            assert!(decode.bucket(65).is_err());
+        }
+        let decode = DecodeBuckets::from_manifest(&native_manifest(serde_json::json!([8, 16, 32, 48])))?;
+        assert_eq!(decode.plain(), [1, 4, 8, 16, 32, 48, 64]);
+        assert_eq!(decode.graph_rows(8, 64), [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 48, 64]);
+        for routes in [serde_json::Value::Null, serde_json::json!([]), serde_json::json!([8, 8]),
+            serde_json::json!([16, 8]), serde_json::json!([0]), serde_json::json!([64]), serde_json::json!(["8"])] {
+            assert!(DecodeBuckets::from_manifest(&native_manifest(routes)).is_err());
+        }
+        let mut inconsistent = native_manifest(serde_json::json!([8, 16, 32, 48]));
+        let mut second = inconsistent["programs"][0].clone();
+        second["name"] = "dense_trellis_k6_trellis_mla_kv_a_mul1".into();
+        second["geometry"]["decode_route_thresholds"] = serde_json::json!([8, 16, 32]);
+        inconsistent["programs"].as_array_mut().unwrap().push(second);
+        assert!(DecodeBuckets::from_manifest(&inconsistent).is_err());
+        Ok(())
+    }
 
     #[test]
     fn named_runtime_allocations_equal_planner_context_charges() {

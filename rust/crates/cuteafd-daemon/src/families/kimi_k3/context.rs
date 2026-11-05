@@ -10,6 +10,7 @@ pub(crate) struct Programs<'a> {
     pub partial: [cuteafd_ffi::KimiMlaPartial<'a>; 2],
     pub combine: cuteafd_ffi::programs::BoundProgram<'a>,
     pub gather: cuteafd_ffi::programs::BoundProgram<'a>,
+    pub sms: usize,
 }
 
 impl<'a> Programs<'a> {
@@ -30,17 +31,20 @@ impl<'a> Programs<'a> {
                 &format!("kimik3_mla_partial{tag}_h48_m64"), 48, 64, format)?],
             combine: programs.bound("kimik3_lse_combine2", &["o0", "l0", "o1", "l1", "sink", "out"] )?,
             gather: programs.bound(&format!("kimik3_paged_staging_gather{tag}"), &["pool", "table", "staging"] )?,
+            sms: programs.library().sm_count()?,
         })
     }
 
     pub(crate) fn layout(programs: &cuteafd_ffi::programs::Programs<'_>,
         format: cuteafd_core::MlaCacheFormat, extent: usize, rows: usize, banks: usize) -> Result<ContextLayout> {
-        let entries = cuteafd_loader::families::kimi_k3::context::program_names(format).iter()
-            .map(|name| -> Result<_> {
-                let spec = programs.spec(name)?;
-                Ok(serde_json::json!({"name": name, "geometry": spec.geometry,
-                    "scratch_bytes_at_capacity": spec.scratch}))
-            }).collect::<Result<Vec<_>>>()?;
+        let mut names = cuteafd_loader::families::kimi_k3::context::program_names(format);
+        names.extend(programs.names().filter(|name| name.starts_with("dense_trellis_k6_trellis_"))
+            .map(str::to_owned));
+        let entries = names.iter().map(|name| -> Result<_> {
+            let spec = programs.spec(name)?;
+            Ok(serde_json::json!({"name": name, "geometry": spec.geometry,
+                "scratch_bytes_at_capacity": spec.scratch}))
+        }).collect::<Result<Vec<_>>>()?;
         ContextLayout::from_manifest(&serde_json::json!({"programs": entries}), format, extent, rows, banks)
     }
 }
@@ -77,7 +81,7 @@ impl<'a> Rank<'a> {
         let (_, stride) = owner.layout.metadata_extent("context slots", 0)?;
         let banks = owner.buffer("context slots")?.bytes / stride;
         for bank in 0..banks {
-            for name in ["context slots", "compact page tables", "shard lengths", "gather tables", "commit blocks"] {
+            for name in ["context slots", "compact page tables", "shard lengths", "context offsets", "gather tables", "commit blocks"] {
                 let buffer = owner.metadata(name, bank)?;
                 for stream in &owner.streams {
                     stream.device.run(|| {
@@ -110,6 +114,25 @@ impl<'a> Rank<'a> {
             // drains queued readers; ordered staging retains the host source.
             unsafe { stream.device.library.copy_h2d_ordered(destination, bytes, stream.raw) }
         })
+    }
+
+    pub(crate) fn decode(&self) -> &cuteafd_loader::families::kimi_k3::context::DecodeBuckets { self.layout.decode() }
+
+    pub(crate) fn extent(&self) -> usize { self.layout.buffers().compiled_extent as usize }
+
+    pub(crate) fn compact_width(&self) -> usize { self.extent().div_ceil(64).div_ceil(2) }
+
+    pub(crate) fn check_reader(&self, stream: &Rc<Stream<'a>>) -> Result<()> {
+        ensure!(self.streams.iter().any(|reader| Rc::ptr_eq(reader, stream)),
+            "Kimi context binding differs from retained compute stream");
+        Ok(())
+    }
+
+    pub(crate) fn partial(&self, peer: bool, rows: usize) -> Result<crate::shared::peer_split::attention::Partial> {
+        ensure!((1..=64).contains(&rows), "Kimi partial output rows");
+        let buffer = self.buffer(if peer { "peer-head partial" } else { "own-head partial" })?;
+        Ok(crate::shared::peer_split::attention::Partial { values: buffer.ptr,
+            lse: crate::shared::prefix::view(buffer, 64 * 48 * 512 * 2, rows * 48 * 4)?.ptr })
     }
 
     pub(crate) fn staging(&self, slot: usize) -> Result<CuteafdDeviceBuffer> {
@@ -197,6 +220,7 @@ pub(crate) struct DecodeRows {
     slots: Vec<u8>,
     tables: Vec<u8>,
     lengths: Vec<u8>,
+    offsets: Vec<u8>,
 }
 
 impl DecodeRows {
@@ -207,7 +231,8 @@ impl DecodeRows {
         let rows = super::device::validate_sequence_pages(sequences, 64, slots, extent, pool)?;
         let width = extent.div_ceil(64).div_ceil(2);
         let mut result = Self { rows, width, owned_pages: 0, slots: Vec::with_capacity(rows * 8),
-            tables: vec![0; rows * width * 4], lengths: Vec::with_capacity(rows * 4) };
+            tables: vec![0; rows * width * 4], lengths: Vec::with_capacity(rows * 4),
+            offsets: (0..=rows as i32).flat_map(i32::to_le_bytes).collect() };
         let mut row = 0;
         for sequence in sequences {
             let end = sequence.start.checked_add(sequence.rows).context("Kimi compact frontier overflow")?;
@@ -236,8 +261,18 @@ impl DecodeRows {
         Ok(result)
     }
 
-    pub(crate) fn uploads(&self) -> [(&'static str, &[u8]); 3] {
-        [("context slots", &self.slots), ("compact page tables", &self.tables), ("shard lengths", &self.lengths)]
+    pub(crate) fn pad(&mut self, bucket: usize) -> Result<()> {
+        ensure!((self.lengths.len() / 4..=64).contains(&bucket), "Kimi context decode padding extent");
+        self.slots.resize(bucket * 8, 0xff);
+        self.tables.resize(bucket * self.width * 4, 0);
+        self.lengths.resize(bucket * 4, 0);
+        self.offsets = (0..=bucket as i32).flat_map(i32::to_le_bytes).collect();
+        Ok(())
+    }
+
+    pub(crate) fn uploads(&self) -> [(&'static str, &[u8]); 4] {
+        [("context slots", &self.slots), ("compact page tables", &self.tables), ("shard lengths", &self.lengths),
+            ("context offsets", &self.offsets)]
     }
 }
 
@@ -276,6 +311,41 @@ mod tests {
         assert!(DecodeRows::new(0, &aliases, 320, 2, &pool).is_err());
         pool.release(&[14]);
         assert!(DecodeRows::new(0, &sequences, 320, 2, &pool).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn padded_decode_rows_preserve_live_metadata_and_mask_inactive_rows() -> Result<()> {
+        use super::super::device::SequenceRows;
+        let mut pool = cuteafd_engine::prefix::RefPagePool::parity(4, 64, 0);
+        pool.alloc_for(0..4)?;
+        let decode = cuteafd_loader::families::kimi_k3::context::DecodeBuckets::from_manifest(
+            &serde_json::json!({"programs":[{"name":"dense_trellis_k6_trellis_mla_q_a_mcg",
+                "geometry":{"bits":6,"decode_route_thresholds":[8,16,32,48]}}]}))?;
+        for rank in 0..2 { for rows in 1..=64 {
+            let bucket = decode.bucket(rows)?;
+            assert!(bucket >= rows && decode.plain().contains(&bucket));
+            let mut metadata = DecodeRows::new(rank,
+                &[SequenceRows { slot: 0, start: 0, rows, pages: &[0] }], 256, 1, &pool)?;
+            let original = [metadata.slots.clone(), metadata.tables.clone(), metadata.lengths.clone()];
+            let owned = metadata.owned_pages;
+            metadata.pad(bucket)?;
+            assert_eq!(metadata.rows, rows);
+            assert_eq!(metadata.owned_pages, owned);
+            for ((_, padded), live) in metadata.uploads().into_iter().zip(&original) {
+                assert_eq!(&padded[..live.len()], live);
+            }
+            assert!(metadata.slots[rows * 8..].iter().all(|&byte| byte == 0xff));
+            assert!(metadata.tables[rows * metadata.width * 4..].iter().all(|&byte| byte == 0));
+            assert!(metadata.lengths[rows * 4..].iter().all(|&byte| byte == 0));
+            assert_eq!(metadata.offsets.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+                .collect::<Vec<_>>(), (0..=bucket as i32).collect::<Vec<_>>());
+            metadata.pad(bucket)?;
+            if bucket > rows { assert!(metadata.pad(rows).is_err()); }
+            assert!(metadata.pad(65).is_err());
+        }}
+        assert!(decode.bucket(0).is_err());
+        assert!(decode.bucket(65).is_err());
         Ok(())
     }
 
