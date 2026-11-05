@@ -168,6 +168,106 @@ fn validate_projected_attention(b:KimiMlaBatch,heads:usize,rows:usize,context:us
     Ok(())
 }
 
+/// A resolved owned-page partial; h96 queries produce compact h48 outputs.
+/// The caller supplies one already-causal local length/table per query row.
+/// LSE stays base2 through the partial and shared two-owner combine.
+pub struct KimiMlaPartial<'a> {
+    program: Program<'a>,
+    rows: usize,
+    context: usize,
+    scratch: usize,
+    record_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct KimiMlaPartialBatch {
+    pub rows: usize,
+    pub cache_pages: usize,
+    pub page_table_width: usize,
+    pub query: Buffer,
+    pub cache: Buffer,
+    pub page_table: Buffer,
+    pub lengths: Buffer,
+    /// Identity cumulative query offsets [0, 1, ..., rows].
+    pub query_offsets: Buffer,
+    pub attention: Buffer,
+    pub lse: Buffer,
+    pub scratch: Buffer,
+}
+
+impl<'a> KimiMlaPartial<'a> {
+    pub fn load(programs: &'a Programs<'a>, name: &str, head_begin: usize, rows: usize,
+        format: MlaCacheFormat) -> Result<Self> {
+        let program = programs.program(name, ATTENTION)?;
+        let (context, scratch) = validate_partial_manifest(program.spec(), head_begin, rows, format)?;
+        Ok(Self { program, rows, context, scratch, record_bytes: format.record_bytes() })
+    }
+
+    pub fn scratch_bytes(&self) -> usize { self.scratch }
+    pub fn max_context(&self) -> usize { self.context }
+
+    pub fn launch(&self, b: KimiMlaPartialBatch, stream: *mut c_void) -> Result<()> {
+        if b.rows == 0 || b.rows > self.rows || b.page_table_width == 0
+            || b.page_table_width > self.context.div_ceil(MLA_PAGE_ROWS)
+            || b.cache_pages == 0 || b.cache_pages > i32::MAX as usize {
+            return Err(KimiMlaError::Invalid("context partial batch geometry"));
+        }
+        let cache = b.cache_pages.checked_mul(MLA_PAGE_ROWS * self.record_bytes)
+            .ok_or(KimiMlaError::Invalid("context partial cache overflow"))?;
+        let operands = [(b.query, b.rows * 96 * 576 * 2), (b.cache, cache),
+            (b.page_table, b.rows * b.page_table_width * 4), (b.lengths, b.rows * 4),
+            (b.query_offsets, (b.rows + 1) * 4), (b.attention, b.rows * 48 * 512 * 2),
+            (b.lse, b.rows * 48 * 4), (b.scratch, self.scratch)];
+        validate_buffers(&operands, b.query.device_id)?;
+        for (buffer, bytes) in operands {
+            if buffer.flags != 0 || (buffer.ptr as usize).checked_add(bytes).is_none() {
+                return Err(KimiMlaError::Invalid("context partial flags/address overflow"));
+            }
+        }
+        for writer in 5..8 { for other in 0..8 {
+            if writer != other {
+                reject_overlap(operands[writer], operands[other])
+                    .map_err(|_| KimiMlaError::Invalid("context partial operands overlap"))?;
+            }
+        }}
+        // SAFETY: startup validates the base2 h96->h48 ABI; live extents,
+        // devices and write aliases are checked. The caller owns the stream,
+        // causal table contents and buffers through queued work/graph replay.
+        unsafe { self.program.launch(&[b.query.ptr, b.cache.ptr, b.page_table.ptr, b.lengths.ptr,
+            b.query_offsets.ptr, b.attention.ptr, b.lse.ptr, b.scratch.ptr],
+            &[Scalar::I32(b.rows as i32), Scalar::I64(b.page_table_width as i64)], stream)?; }
+        Ok(())
+    }
+}
+
+fn validate_partial_manifest(spec: &ProgramSpec, begin: usize, rows: usize, format: MlaCacheFormat)
+    -> Result<(usize, usize)> {
+    let g = &spec.geometry;
+    if !matches!(begin, 0 | 48) || !(1..=4096).contains(&rows)
+        || spec.capacity_rows as usize != rows || spec.scalar_kinds != b"il"
+        || g["kv_cache"].as_str() != Some(format.label())
+        || g["head_begin"].as_u64() != Some(begin as u64)
+        || g["norm_eps"].as_f64() != Some(1e-6)
+        || [("heads", 96), ("head_count", 48), ("hidden", 7168), ("q_lora_rank", 1536),
+            ("kv_lora_rank", 512), ("qk_nope_dim", 128), ("qk_rope_dim", 64),
+            ("v_head_dim", 128), ("page_rows", 64), ("lse_base", 2), ("max_rows", rows)]
+            .iter().any(|&(key, n)| g[key].as_u64() != Some(n as u64)) {
+        return Err(KimiMlaError::Invalid("context partial manifest geometry/scalars"));
+    }
+    let context = g["max_context"].as_u64().filter(|&n| (1..=1048576).contains(&n))
+        .ok_or(KimiMlaError::Invalid("context partial manifest context"))? as usize;
+    let splits = g["num_splits"].as_u64().filter(|&n| (2..=16).contains(&n))
+        .ok_or(KimiMlaError::Invalid("context partial manifest splits"))? as usize;
+    let chunks = context.div_ceil(64).div_ceil(splits);
+    let n = rows * 48 * splits;
+    let scratch = (n * 512 * 2).div_ceil(1024) * 1024 + n * 4;
+    if g["chunks_per_split"].as_u64() != Some(chunks as u64)
+        || spec.scratch.get("scratch").copied() != Some(scratch as u64) {
+        return Err(KimiMlaError::Invalid("context partial manifest traversal/scratch"));
+    }
+    Ok((context, scratch))
+}
+
 fn validate_manifest(specs: [&ProgramSpec; 3], heads: usize, rows: usize, mode: KimiMlaMode, cache_format: MlaCacheFormat)
     -> Result<(usize, usize, [usize; 3])> {
     for (i, spec) in specs.iter().enumerate() {
@@ -990,6 +1090,36 @@ mod tests {
             assert!(validate(KimiMlaBatch{query,..b}).is_err());
         }
         assert!(validate(KimiMlaBatch{lse:Buffer{ptr:b.attention.ptr,..b.lse},..b}).is_err());
+    }
+
+    #[test]
+    fn context_partial_manifest_rejects_lse_base_and_owned_traversal_drift() {
+        for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+            for begin in [0, 48] {
+                let mut spec = specs(96, 64, KimiMlaMode::Decode)[1].clone();
+                spec.scalar_kinds = b"il".to_vec();
+                spec.geometry["kv_cache"] = format.label().into();
+                spec.geometry["head_begin"] = begin.into();
+                spec.geometry["head_count"] = 48.into();
+                spec.geometry["max_rows"] = 64.into();
+                spec.geometry["lse_base"] = 2.into();
+                spec.scratch.insert("scratch".into(), (64 * 48 * 16 * (512 * 2 + 4)) as u64);
+                assert!(validate_partial_manifest(&spec, begin, 64, format).is_ok());
+                for (key, bad) in [("lse_base", 0), ("heads", 48), ("head_count", 96),
+                    ("num_splits", 1), ("chunks_per_split", 0), ("max_context", 0)] {
+                    let mut wrong = spec.clone();
+                    wrong.geometry[key] = bad.into();
+                    assert!(validate_partial_manifest(&wrong, begin, 64, format).is_err(), "{key}");
+                }
+                let mut wrong = spec.clone();
+                wrong.scratch.clear();
+                assert!(validate_partial_manifest(&wrong, begin, 64, format).is_err());
+                wrong = spec.clone();
+                wrong.scalar_kinds = b"iili".to_vec();
+                assert!(validate_partial_manifest(&wrong, begin, 64, format).is_err());
+                assert!(validate_partial_manifest(&spec, 1, 64, format).is_err());
+            }
+        }
     }
 
     #[test]

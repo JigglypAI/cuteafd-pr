@@ -45,7 +45,11 @@ def exporter(monkeypatch):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
-    package.kimi_mla.KimiMlaGeometry = lambda **kw: types.SimpleNamespace(**kw)
+    class KimiGeometry(types.SimpleNamespace):
+        @property
+        def record_bytes(self):
+            return 656 if self.kv_cache == "fp8" else 1152
+    package.kimi_mla.KimiMlaGeometry = lambda **kw: KimiGeometry(**kw)
     package.glmf.mhc_geometry = lambda g: ("mhc geometry", g)
     package.dsv4_mhc.mhc_post_pre_route = lambda rows: "decode" if rows < 96 else "block_m"
     # The real planner's shape at 32 heads: more splits for fewer rows (188 SMs: s32/s11/s4).
@@ -588,6 +592,25 @@ def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_
                 assert vars(args[0]) == {"heads": heads, "kv_cache": cache}
                 assert kwargs == {"max_rows": rows, "max_context": 1048576, "mode": mode}
                 assert params == {"mode": mode, "max_rows": rows, "heads": heads, "kv_cache": cache}
+
+
+def test_kimi_context_exports_native_partial_ranges_and_shared_primitives(exporter):
+    programs = exporter.kimi_context_programs(64, 1048576)
+    assert len(programs) == 11
+    for stem, op, params, thunk in programs:
+        module, fn, args, kw = thunk()
+        if op == "mla_partial":
+            assert module == "kimi_mla" and fn == "compile_kimi_mla_partial_aot"
+            assert kw == {k: v for k, v in params.items() if k != "kv_cache"}
+            assert args[0].kv_cache == params["kv_cache"]
+            assert params["head_begin"] in (0, 48) and params["head_count"] == 48
+            assert params["num_splits"] in (2, 16)
+        else:
+            assert module == "context_split"
+            assert fn == f"compile_{op}_aot"
+            assert kw == params
+    catalog = {stem for stem, *_ in exporter.kimi_kda_programs(GEOMETRY, 64, 4096, 1048576)}
+    assert {stem for stem, *_ in programs} <= catalog
 
 
 @pytest.mark.parametrize("namespace", ["kimik3"])

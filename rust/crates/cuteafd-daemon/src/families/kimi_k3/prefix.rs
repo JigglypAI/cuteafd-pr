@@ -85,8 +85,11 @@ impl<'a> KimiPrefix<'a> {
                 else if mla[rank].layer(layer).is_ok() { resident[rank] += 1; }
             }
         }
+        let parity = mla[0].parity();
+        ensure!(mla.iter().all(|bank| bank.parity() == parity), "Kimi prefix page ownership differs between ranks");
         let geometry = cuteafd_loader::families::kimi_k3::kda::cache_geometry_for_ranks(cfg, &resident, mla[0].format())?;
-        let page_bytes = geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes as usize).sum();
+        let resident_page_bytes: usize = geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes as usize).sum();
+        let page_bytes = if parity { resident_page_bytes / 2 } else { resident_page_bytes };
         let mark_bytes = geometry.ranks.iter().map(|rank| rank.retained_mark_bytes as usize).sum();
         ensure!(mark_bytes == kda.iter().map(|bank| bank.mark_bytes()).sum::<usize>(), "Kimi prefix KDA shard geometry differs");
         ensure!(page_bytes > 0, "Kimi prefix has no resident MLA pages");
@@ -94,7 +97,8 @@ impl<'a> KimiPrefix<'a> {
             .map(|reader| Reader { device: reader.device.id, stream: reader.raw }).collect()).collect())?;
         let layout = FamilyLayout { page_rows: MLA_PAGE_ROWS, pages: mla[0].pages(), page_bytes,
             mark_bytes, draft_bytes: 0,
-            rule: PREFIX_REUSE, mark_store: MarkStore::Arena, page_owners: Default::default() };
+            rule: PREFIX_REUSE, mark_store: MarkStore::Arena,
+            page_owners: if parity { cuteafd_engine::prefix::PageOwners::Parity } else { Default::default() } };
         let live = RefCell::new(vec![None; kda[0].slots()]);
         Ok(Self(Rc::new(Inner { kda, mla, cfg: cfg.clone(), context, layout, copies, live, draft: None })))
     }
@@ -125,8 +129,9 @@ impl<'a> KimiPrefix<'a> {
         ensure!(placement.slot < self.0.kda[0].slots() && len <= self.0.context
             && len.div_ceil(MLA_PAGE_ROWS) <= placement.units.len(), "Kimi prefix slot/context/pages");
         let mut unique = std::collections::BTreeSet::new();
-        ensure!(placement.units.iter().all(|&page| (page as usize) < self.0.layout.pages && unique.insert(page)),
-            "Kimi prefix pages outside pool or repeated");
+        ensure!(placement.units.iter().enumerate().all(|(index, &page)| (page as usize) < self.0.layout.pages
+            && unique.insert(page) && (!self.0.mla[0].parity() || page as usize % 2 == index % 2)),
+            "Kimi prefix pages outside pool, repeated or of the wrong parity");
         Ok(())
     }
 
@@ -197,6 +202,7 @@ impl<'a> KimiPrefix<'a> {
     fn page_buffers(&self, rank: usize, page: u32, rows: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
         ensure!((page as usize) < self.0.layout.pages && (1..=MLA_PAGE_ROWS).contains(&rows),
             "Kimi prefix page copy outside admission");
+        if !self.0.mla[rank].owns_page(page) { return Ok(Vec::new()); }
         self.0.cfg.attention.iter().enumerate().filter(|(layer, kind)|
             **kind == KimiAttention::Mla && self.0.mla[rank].layer(*layer).is_ok())
             .map(|(layer, _)| self.0.mla[rank].page(layer, page as usize, rows)).collect()
@@ -355,8 +361,9 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
         Ok(())
     }
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
-        if copy.owner.is_some() || copy.from == copy.to {
-            return Err("Kimi prefix COW requires distinct uniform pages".into());
+        let owner = self.page_device(copy.from);
+        if copy.owner != owner || self.page_device(copy.to) != owner || copy.from == copy.to {
+            return Err("Kimi prefix COW requires distinct pages with the same admitted owner".into());
         }
         let plans = (0..self.0.kda.len()).map(|rank| Ok((self.page_buffers(rank, copy.from, copy.rows)?,
             self.page_buffers(rank, copy.to, copy.rows)?))).collect::<Result<Vec<_>>>()?;
@@ -368,6 +375,9 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
     fn drain(&self) -> Result<(), BoxError> {
         if let Some(draft) = &self.0.draft { draft.drain()?; }
         Ok(self.0.copies.drain()?)
+    }
+    fn page_device(&self, page: u32) -> Option<u8> {
+        self.0.mla[0].parity().then_some((page & 1) as u8)
     }
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
         (0..self.0.kda.len()).flat_map(|rank| self.page_buffers(rank, page, MLA_PAGE_ROWS).unwrap_or_default()).map(range).collect()
