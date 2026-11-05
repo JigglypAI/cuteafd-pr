@@ -1029,7 +1029,8 @@ impl Opened {
         resolved.prefill_waves = usize::try_from(preflight.working_set.prefill_lanes)?;
         let args = &resolved;
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
-        let draft_file = draft_dir.as_deref().map(dflash::prefetch);
+        let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;
+        let draft_file = if push_policy == PushPolicy::Mount { draft_dir.as_deref().map(dflash::prefetch) } else { None };
         let stream = self.library.cuda_stream_create()?;
 
         let peer_stream = match split_device {
@@ -1054,7 +1055,6 @@ impl Opened {
             dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)),
             transient: Default::default() };
         use crate::shared::experts::rtx::push::{CoordinatorExperts, CoordinatorPush, PushPolicy};
-        let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;
         let mut pushed_experts = None;
         let embed_placement = args.token_io.embed_placement.context("MiMo embedding placement must resolve before admission")?;
         let prepare_push = |sparks: usize| -> Result<_> {
@@ -1207,13 +1207,16 @@ impl Opened {
                 let cfg = dflash::DflashConfig::read(dir)?;
                 ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
                     && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash drafter does not fit this target");
-                let mask = dflash::mask_embedding(dir, cfg.hidden)?;
-                let file = draft_file.context("drafter prefetch")?.join()
-                    .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
+                let file = match draft_file {
+                    Some(file) => file.join().map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??,
+                    None => Vec::new(),
+                };
                 let capacity = args.draft_capacity(cfg.block)?;
                 let representation = self.weight_formats.draft;
-                let drafter = dflash::MimoDrafter::load(&self.library, &programs, dir, file, stream, capacity.context_slots,
-                    capacity.max_batch_sequences, mask, representation, args.fp8_scales, args.draft_kv_cache)?;
+                let device = crate::shared::memory::device::Device { library: &self.library, id: args.device };
+                let drafter = crate::shared::experts::rtx::push::load_alone(&args.snapshot, &[device], ||
+                    dflash::MimoDrafter::load(&self.library, &programs, dir, file, stream, capacity.context_slots,
+                        capacity.max_batch_sequences, representation, args.fp8_scales, args.draft_kv_cache))?;
                 engine.drafter = Some(drafter);
                 tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
             }

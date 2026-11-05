@@ -14,19 +14,20 @@
 //! block rows 1..8. Semantics: python/reference/families/mimo_v2/mimo_dflash/reference.py
 //! (SGLang's DFlash path for MiMo). Drafts only steer speculation; verify
 //! steps keep output identical to plain greedy decoding.
-use crate::shared::fp8_linear::{self, Fp8Weight};
+use crate::shared::fp8_linear;
+use crate::shared::speculation::weights::{Load, Weight as DraftWeight};
+use crate::shared::experts::rtx::dense::{DenseLoad, Operand, Rect};
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::token_io::TokenEmbedding;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use super::head::BorrowedHead;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
-use cuteafd_loader::{read_safetensors_metadata, SafetensorsTensorMetadata};
+use cuteafd_loader::read_safetensors_metadata;
 use cuteafd_loader::families::mimo_v2::draft_representation::{
     MimoDraftCapacity, MimoDraftRepresentation, MimoDraftRuntimeLayout,
 };
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
@@ -51,12 +52,6 @@ fn draft_fp8_scratch<'a>(library: &'a NativeLibrary, layout: &MimoDraftRuntimeLa
 /// The drafter directory of a MiMo snapshot (`SNAP/dflash`), or `path` itself.
 pub(crate) fn drafter_dir(path: &Path) -> PathBuf {
     if path.join(WEIGHTS).exists() { path.to_path_buf() } else { path.join("dflash") }
-}
-
-/// A matrix owns exactly one immutable resident representation.
-enum DraftWeight<'a> {
-    Bf16(Dev<'a>),
-    Fp8(Fp8Weight<'a>),
 }
 
 struct DraftLayer<'a> {
@@ -191,11 +186,6 @@ fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
 }
 
-struct Checkpoint {
-    data: Vec<u8>,
-    tensors: HashMap<String, SafetensorsTensorMetadata>,
-}
-
 /// Read only the header before target/native admission. This loader currently
 /// supports BF16 drafter checkpoints; FP8 storage is an explicit load transform.
 pub(crate) fn checkpoint_representation(dir: &Path) -> Result<MimoDraftRepresentation> {
@@ -209,46 +199,29 @@ pub(crate) fn checkpoint_representation(dir: &Path) -> Result<MimoDraftRepresent
     Ok(MimoDraftRepresentation::Bf16Only)
 }
 
-impl Checkpoint {
-    fn bytes(&self, name: &str, shape: &[usize]) -> Result<&[u8]> {
-        let t = self.tensors.get(name).with_context(|| format!("DFlash checkpoint has no {name}"))?;
-        let expected = shape.iter().try_fold(2usize, |bytes, dim| bytes.checked_mul(*dim))
-            .with_context(|| format!("{name}: BF16 tensor byte count overflow"))?;
-        ensure!(t.dtype == cuteafd_core::DType::Bf16 && t.shape == shape && t.byte_length as usize == expected,
-            "{name}: shape {:?}, expected BF16 {shape:?}", t.shape);
-        let start = usize::try_from(t.byte_offset).with_context(|| format!("{name}: tensor offset overflow"))?;
-        let end = t.byte_offset.checked_add(t.byte_length).and_then(|end| usize::try_from(end).ok())
-            .with_context(|| format!("{name}: tensor range overflow"))?;
-        let range = start..end;
-        self.data.get(range).with_context(|| format!("{name} lies past the file"))
-    }
-
-    /// Check every source header/range before any device weight is allocated.
-    fn validate(&self, c: &DflashConfig) -> Result<()> {
-        let (h, kv, inter) = (c.hidden, c.kv_width(), c.intermediate);
-        self.bytes("fc.weight", &[h, c.taps.len() * h])?;
-        self.bytes("hidden_norm.weight", &[h])?;
-        self.bytes("norm.weight", &[h])?;
-        for l in 0..c.layers {
-            let p = format!("layers.{l}");
-            for norm in ["input_layernorm", "post_attention_layernorm"] {
-                self.bytes(&format!("{p}.{norm}.weight"), &[h])?;
-            }
-            let a = format!("{p}.self_attn");
-            for (projection, rows, cols) in [("q_proj", c.heads * c.head_dim, h),
-                ("k_proj", kv, h), ("v_proj", kv, h), ("o_proj", h, c.heads * c.head_dim)] {
-                self.bytes(&format!("{a}.{projection}.weight"), &[rows, cols])?;
-            }
-            for norm in ["q_norm", "k_norm"] {
-                self.bytes(&format!("{a}.{norm}.weight"), &[c.head_dim])?;
-            }
-            if c.sinks { self.bytes(&format!("{a}.attention_sink_bias"), &[c.heads])?; }
-            for (projection, rows, cols) in [("gate_proj", inter, h), ("up_proj", inter, h), ("down_proj", h, inter)] {
-                self.bytes(&format!("{p}.mlp.{projection}.weight"), &[rows, cols])?;
-            }
+fn tensor_shapes(c: &DflashConfig) -> Vec<(String, Vec<usize>)> {
+    let (h, kv, inter) = (c.hidden, c.kv_width(), c.intermediate);
+    let mut shapes = vec![("fc.weight".into(), vec![h, c.taps.len() * h]),
+        ("hidden_norm.weight".into(), vec![h]), ("norm.weight".into(), vec![h])];
+    for l in 0..c.layers {
+        let p = format!("layers.{l}");
+        for norm in ["input_layernorm", "post_attention_layernorm"] {
+            shapes.push((format!("{p}.{norm}.weight"), vec![h]));
         }
-        Ok(())
+        let a = format!("{p}.self_attn");
+        for (projection, rows, cols) in [("q_proj", c.heads * c.head_dim, h),
+            ("k_proj", kv, h), ("v_proj", kv, h), ("o_proj", h, c.heads * c.head_dim)] {
+            shapes.push((format!("{a}.{projection}.weight"), vec![rows, cols]));
+        }
+        for norm in ["q_norm", "k_norm"] {
+            shapes.push((format!("{a}.{norm}.weight"), vec![c.head_dim]));
+        }
+        if c.sinks { shapes.push((format!("{a}.attention_sink_bias"), vec![c.heads])); }
+        for (projection, rows, cols) in [("gate_proj", inter, h), ("up_proj", inter, h), ("down_proj", h, inter)] {
+            shapes.push((format!("{p}.mlp.{projection}.weight"), vec![rows, cols]));
+        }
     }
+    shapes
 }
 
 /// Reads the drafter's safetensors file on a thread (while the target loads).
@@ -268,7 +241,12 @@ pub(crate) struct MaskEmbeddingReadError {
     pub source: std::io::Error,
 }
 
+#[cfg(test)]
 pub(crate) fn mask_embedding(dir: &Path, hidden: usize) -> Result<Vec<u8>> {
+    mask_source(dir, hidden).map(|(row, _)| row)
+}
+
+fn mask_source(dir: &Path, hidden: usize) -> Result<(Vec<u8>, Rect)> {
     let path = dir.join("mask_embedding.pt");
     let bytes = std::fs::read(&path).map_err(|source| MaskEmbeddingReadError { path: path.clone(), source })?;
     let u16_at = |o: usize| -> Result<usize> {
@@ -291,7 +269,8 @@ pub(crate) fn mask_embedding(dir: &Path, hidden: usize) -> Result<Vec<u8>> {
             ensure!(method == 0 && size == hidden * 2 && data + size <= bytes.len(),
                 "{}: expected {} stored bytes in {name}, found method {method} size {size}", path.display(), hidden * 2);
             tracing::info!(path = %path.display(), mask_source = "trained mask_embedding.pt", "drafter mask source");
-            return Ok(bytes[data..data + size].to_vec());
+            return Ok((bytes[data..data + size].to_vec(), Rect { name: "mask_embedding".into(),
+                path, base: data as u64, row_bytes: size, rows: 0..1, cols: 0..size }));
         }
         at += 46 + name_len + extra_len + comment_len;
     }
@@ -316,6 +295,129 @@ mod mask_tests {
         assert!(mask_embedding(dir.path(), 2).unwrap_err().to_string().contains("not a zip"));
     }
 
+    fn cfg() -> DflashConfig {
+        DflashConfig { hidden: 128, intermediate: 256, layers: 2, heads: 2, kv_heads: 1,
+            head_dim: 128, rope_dim: 64, theta: 10000., eps: 1e-6, block: 8,
+            mask_token: 0, taps: vec![0, 1], vocab: 256, window: RING, v_scale: 0.612, sinks: true }
+    }
+
+    fn groups(c: &DflashConfig) -> Vec<Vec<(String, Vec<usize>)>> {
+        let mut groups = tensor_shapes(c).into_iter().map(|shape| vec![shape]).collect::<Vec<_>>();
+        for l in 0..c.layers {
+            for suffixes in [vec!["self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"],
+                vec!["mlp.gate_proj.weight", "mlp.up_proj.weight"]] {
+                let mut fused = Vec::new();
+                for suffix in suffixes {
+                    let name = format!("layers.{l}.{suffix}");
+                    let at = groups.iter().position(|g| g[0].0 == name).unwrap();
+                    fused.extend(groups.remove(at));
+                }
+                groups.push(fused);
+            }
+        }
+        groups
+    }
+
+    #[test]
+    fn bundled_drafter_headers_cover_every_bf16_class_and_sink_choice() -> Result<()> {
+        use cuteafd_loader::plan::testing::{t, write_safetensors};
+        for sinks in [false, true] {
+            let c = DflashConfig { sinks, ..cfg() };
+            let root = tempfile::tempdir()?;
+            let shapes = tensor_shapes(&c);
+            let tensors = shapes.iter().map(|(name, shape)| t(name.clone(), "BF16", shape)).collect::<Vec<_>>();
+            let path = root.path().join(WEIGHTS);
+            write_safetensors(&path, &tensors);
+            let source = crate::shared::speculation::weights::Source::open_file(&path)?;
+            for (name, shape) in &shapes { source.rect(name, shape)?; }
+            assert_eq!(shapes.len(), 3 + c.layers * (11 + usize::from(sinks)));
+            assert_eq!(checkpoint_representation(root.path())?, MimoDraftRepresentation::Bf16Only);
+            let bytes = shapes.iter().map(|(_, s)| s.iter().product::<usize>() * 2).sum::<usize>();
+            let grouped = groups(&c).iter().flatten().map(|(_, s)| s.iter().product::<usize>() * 2).sum::<usize>();
+            assert_eq!(bytes, grouped);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn bundled_bf16_drafter_records_without_payload_and_replays_mount_bytes() -> Result<()> {
+        use crate::shared::{experts::rtx::dense, memory::device::Device};
+        use cuteafd_loader::plan::testing::{t, write_safetensors};
+        use std::os::unix::fs::FileExt;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        let root = tempfile::tempdir_in(fixture.directory())?;
+        let snapshot = root.path().join("models--mimo/snapshots/test");
+        let dir = snapshot.join("dflash");
+        std::fs::create_dir_all(&dir)?;
+        let cfg = cfg();
+        let shapes = tensor_shapes(&cfg);
+        let tensors = shapes.iter().map(|(name, shape)| t(name.clone(), "BF16", shape)).collect::<Vec<_>>();
+        let path = dir.join(WEIGHTS);
+        write_safetensors(&path, &tensors);
+        let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        for tensor in read_safetensors_metadata(&path)? {
+            let seed = tensor.name.bytes().fold(0u8, |a, b| a.wrapping_add(b));
+            let bytes = (0..tensor.byte_length).map(|i| (i as u8).wrapping_mul(29) ^ seed).collect::<Vec<_>>();
+            file.write_all_at(&bytes, tensor.byte_offset)?;
+        }
+        let mask = (0..cfg.hidden * 2).map(|i| i as u8).collect::<Vec<_>>();
+        write_mask(&dir, &mask);
+        let device = Device { library: &library, id: 0 };
+        let groups = groups(&cfg);
+        let load = || device.run(|| {
+            let recording = dense::is_recording();
+            let bytes = if recording { Vec::new() } else { std::fs::read(&path)? };
+            let load = Load::with_prefetched_file(&library, &path, bytes)?;
+            load.validate(shapes.clone())?;
+            // No payload can be opened after header validation while recording.
+            let hidden = path.with_extension("hidden");
+            if recording { std::fs::rename(&path, &hidden)?; }
+            let owners = groups.iter().map(|group| {
+                if group.len() == 1 { return load.tensor(&group[0].0, &group[0].1); }
+                let parts = group.iter().map(|(name, shape)| (name.as_str(), shape[0])).collect::<Vec<_>>();
+                let DraftWeight::Bf16(owner) = load.matrix(&parts, group[0].1[1], false,
+                    fp8_linear::Fp8Scales::Amax, std::ptr::null_mut())? else { unreachable!() };
+                Ok(owner)
+            }).collect::<Result<Vec<_>>>();
+            if recording { std::fs::rename(hidden, &path)?; }
+            let mut owners = owners?;
+            let (row, source) = mask_source(&dir, cfg.hidden)?;
+            let owner = DeviceAllocation::new(&library, row.len().max(256))?;
+            DenseLoad::mount(&library).operand(Operand { device: 0, buffer: owner.buffer,
+                bytes: row.len(), lands: vec![(source, 0)] })?;
+            owners.push(owner);
+            Ok(owners)
+        });
+        let mounted = load()?;
+        let (pushed, records) = dense::recording(load)?;
+        assert_eq!(records.operands.len(), shapes.len() - 3 * cfg.layers + 1);
+        assert_eq!(records.operands.iter().map(|o| o.lands.len()).sum::<usize>(), shapes.len() + 1);
+        assert!(records.steps.is_empty() && records.finishes.is_empty());
+        let source_bytes = shapes.iter().map(|(_, s)| s.iter().product::<usize>() * 2).sum::<usize>();
+        let rank = dense::RankLayout::new(records.operands.clone(), Vec::new(), 0)?;
+        let plan = rank.checked(root.path(), 7, 6)?;
+        assert_eq!(plan.totals.rank_bytes[6], (source_bytes + mask.len()) as u64);
+        assert_eq!(plan.plan.files.len(), 2);
+        assert!(plan.plan.files.iter().any(|p| p.ends_with("dflash/dflash_draft_model.safetensors")));
+        assert!(plan.plan.files.iter().any(|p| p.ends_with("dflash/mask_embedding.pt")));
+        let sockets = tempfile::tempdir_in(fixture.directory())?;
+        crate::shared::experts::rtx::push::tests::receive_pushed(device, None, root.path(), sockets.path(),
+            &records, None, 6, 1)?;
+        for ((expected, actual), operand) in mounted.iter().zip(&pushed).zip(&records.operands) {
+            let read = |owner: &Dev<'_>| {
+                let mut bytes = vec![0; operand.bytes];
+                library.copy_d2h(&mut bytes, owner.buffer)?;
+                Ok::<_, anyhow::Error>(bytes)
+            };
+            assert_eq!(read(expected)?, read(actual)?);
+        }
+        Ok(())
+    }
+
     #[derive(Clone)]
     struct LogWriter(Arc<Mutex<Vec<u8>>>);
     impl Write for LogWriter {
@@ -326,11 +428,8 @@ mod mask_tests {
         fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
     }
 
-    #[test]
-    fn trained_mask_loads_and_logs_its_source() {
-        let dir = tempfile::tempdir().unwrap();
+    fn write_mask(dir: &Path, data: &[u8]) {
         let name = b"mask_embedding/data/0";
-        let data = [0u8, 0x3f, 0u8, 0x40];
         let mut bytes = vec![0u8; 30];
         bytes[..4].copy_from_slice(&0x0403_4b50u32.to_le_bytes());
         bytes[26..28].copy_from_slice(&(name.len() as u16).to_le_bytes());
@@ -348,7 +447,14 @@ mod mask_tests {
         end[10..12].copy_from_slice(&1u16.to_le_bytes());
         end[16..20].copy_from_slice(&central.to_le_bytes());
         bytes.extend_from_slice(&end);
-        std::fs::write(dir.path().join("mask_embedding.pt"), bytes).unwrap();
+        std::fs::write(dir.join("mask_embedding.pt"), bytes).unwrap();
+    }
+
+    #[test]
+    fn trained_mask_loads_and_logs_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = [0u8, 0x3f, 0u8, 0x40];
+        write_mask(dir.path(), &data);
         let log = Arc::new(Mutex::new(Vec::new()));
         let sink = log.clone();
         let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
@@ -377,9 +483,9 @@ impl<'a> MimoDrafter<'a> {
 
     /// Loads the drafter's weights from `file` (its safetensors bytes, see
     /// [`prefetch`]) and allocates `slots` ring contexts; draft steps take up
-    /// to `max_sequences` sequences. `mask_row` is the mask token's embedding.
+    /// to `max_sequences` sequences. The trained mask keeps its host fallback row.
     pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, dir: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
-        max_sequences: usize, mask_row: Vec<u8>, representation: MimoDraftRepresentation,
+        max_sequences: usize, representation: MimoDraftRepresentation,
         scales: fp8_linear::Fp8Scales, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DflashConfig::read(dir)?;
@@ -397,17 +503,9 @@ impl<'a> MimoDrafter<'a> {
         capacity.kv_cache = kv_cache;
         let runtime_layout = cfg.runtime_layout(representation, capacity)?;
         let weight_layout = runtime_layout.weights;
-        ensure!(mask_row.len() == cfg.hidden * 2, "mask row of {} bytes", mask_row.len());
-        let checkpoint = Checkpoint {
-            data: file,
-            tensors: read_safetensors_metadata(&dir.join(WEIGHTS))?.into_iter().map(|t| (t.name.clone(), t)).collect(),
-        };
-        checkpoint.validate(&cfg)?;
-        let upload = |bytes: &[u8]| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, bytes.len().max(256))?;
-            library.copy_h2d(allocation.buffer, bytes)?;
-            Ok(allocation)
-        };
+        let (mask_row, mask_source) = mask_source(dir, cfg.hidden)?;
+        let checkpoint = Load::with_prefetched_file(library, &dir.join(WEIGHTS), file)?;
+        checkpoint.validate(tensor_shapes(&cfg))?;
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
@@ -417,55 +515,24 @@ impl<'a> MimoDrafter<'a> {
         let fp8_workspace = if representation == MimoDraftRepresentation::Fp8Only {
             draft_fp8_scratch(library, &runtime_layout)?
         } else { None };
-        let tensor = |name: &str, shape: &[usize]| checkpoint.bytes(name, shape).and_then(upload);
-        let concat = |parts: &[(&str, usize)], cols: usize| -> Result<Dev<'a>> {
-            let total: usize = parts.iter().map(|(_, rows)| rows * cols * 2).sum();
-            let allocation = DeviceAllocation::new(library, total)?;
-            let mut offset = 0;
-            for (name, rows) in parts {
-                let bytes = checkpoint.bytes(name, &[*rows, cols])?;
-                library.copy_h2d(CuteafdDeviceBuffer { ptr: at(&allocation, offset), bytes: bytes.len(),
-                    ..allocation.buffer }, bytes)?;
-                offset += bytes.len();
-            }
-            Ok(allocation)
-        };
-        let matrix = |source: Dev<'a>, n: usize, k: usize, _context_weight: bool| -> Result<DraftWeight<'a>> {
-            match representation {
-                MimoDraftRepresentation::Bf16Only => Ok(DraftWeight::Bf16(source)),
-                MimoDraftRepresentation::Fp8Only => {
-                    let packed = Fp8Weight::pack(library, source.buffer.ptr, n, k, scales, stream);
-                    // SAFETY: packing reads this live BF16 source on `stream`.
-                    // Drain even on packing failure before the source leaves scope.
-                    let drained = unsafe { library.cuda_stream_synchronize(stream) };
-                    if let Err(error) = drained {
-                        // Packing may still read source or write its result.
-                        // Quarantine both owners; neither follows ordinary Drop.
-                        std::mem::forget(source);
-                        if let Ok(weight) = packed { weight.quarantine(); }
-                        return Err(error.context("DFlash source/destination quarantined after failed packing drain"));
-                    }
-                    let packed = packed?;
-                    drop(source);
-                    Ok(DraftWeight::Fp8(packed))
-                }
-            }
-        };
+        let tensor = |name: &str, shape: &[usize]| checkpoint.tensor(name, shape);
+        let matrix = |parts: &[(&str, usize)], cols: usize| checkpoint.matrix(parts, cols,
+            representation == MimoDraftRepresentation::Fp8Only, scales, stream);
         let layers = (0..cfg.layers).map(|l| -> Result<DraftLayer<'a>> {
             let p = format!("layers.{l}");
             let a = format!("{p}.self_attn");
             Ok(DraftLayer {
                 input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
                 post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
-                qkv: matrix(concat(&[(&format!("{a}.q_proj.weight"), cfg.heads * cfg.head_dim),
-                    (&format!("{a}.k_proj.weight"), kv), (&format!("{a}.v_proj.weight"), kv)], h)?, cfg.qkv_width(), h, true)?,
+                qkv: matrix(&[(&format!("{a}.q_proj.weight"), cfg.heads * cfg.head_dim),
+                    (&format!("{a}.k_proj.weight"), kv), (&format!("{a}.v_proj.weight"), kv)], h)?,
                 q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
                 k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
                 sinks: if cfg.sinks { Some(tensor(&format!("{a}.attention_sink_bias"), &[cfg.heads])?) } else { None },
-                o: matrix(tensor(&format!("{a}.o_proj.weight"), &[h, cfg.heads * cfg.head_dim])?, h, cfg.heads * cfg.head_dim, false)?,
-                gate_up: matrix(concat(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
-                    (&format!("{p}.mlp.up_proj.weight"), inter)], h)?, 2 * inter, h, false)?,
-                down: matrix(tensor(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?, h, inter, false)?,
+                o: matrix(&[(&format!("{a}.o_proj.weight"), h)], cfg.heads * cfg.head_dim)?,
+                gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
+                    (&format!("{p}.mlp.up_proj.weight"), inter)], h)?,
+                down: matrix(&[(&format!("{p}.mlp.down_proj.weight"), h)], inter)?,
                 k_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
                 v_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
             })
@@ -481,7 +548,7 @@ impl<'a> MimoDrafter<'a> {
             round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
             slots,
             max_sequences,
-            fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps, true)?,
+            fc: matrix(&[("fc.weight", h)], taps)?,
             hidden_norm: tensor("hidden_norm.weight", &[h])?,
             norm: tensor("norm.weight", &[h])?,
             layers,
@@ -491,7 +558,12 @@ impl<'a> MimoDrafter<'a> {
             context_kv: zeroed(TAP_ROWS * 2 * kv * 2)?,
             context_positions: zeroed(TAP_ROWS * 8)?,
             context_slots: zeroed(TAP_ROWS * 4)?,
-            mask_device: upload(&mask_row)?,
+            mask_device: {
+                let owner = DeviceAllocation::new(library, mask_row.len().max(256))?;
+                DenseLoad::mount(library).operand(Operand { device: owner.buffer.device_id,
+                    buffer: owner.buffer, bytes: mask_row.len(), lands: vec![(mask_source, 0)] })?;
+                owner
+            },
             mask_row,
             workspace: RefCell::new(None),
             representation,
