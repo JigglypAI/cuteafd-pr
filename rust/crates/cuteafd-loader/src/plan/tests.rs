@@ -4319,22 +4319,27 @@ fn v41_small_card_graph_envelope_preserves_pro_allowance() {
 
 #[test]
 fn v41_host_ledger_charges_the_router_route_ring() {
-    // The route ring is the storage expert usage reads; it is a pinned host
-    // allocation (40 layers x capacity rows x 24 B per backbone lane), not a
-    // GPU workspace, so the plan must charge it in the host ledger.
+    // The route ring is the storage expert usage reads: one pinned host ring per
+    // backbone lane (40 layers x that lane's capacity rows x 24 B). A coordinator
+    // GPU runs two decode lanes at the decode width plus one lane per prefill
+    // slot at the unit width, so the charge is rank-correct:
+    // `gpus * (2*decode_rows + waves*capacity)` rows.
     let dir = strict_v41_snapshot(false);
-    let options = PlanOptions {
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30],
-            prefill_rows: 256, prefill_unit_rows: Some(256), prefill_waves: 1,
-            onboard: Some(crate::placement::OnboardSetting::Layers(0)),
-            pool_tokens: Some(262_144), workspace_manifest: v41_workspace(dir.path()), ..Default::default() }),
-        ..sparks(4)
-    };
-    let report = plan(dir.path(), &options).unwrap();
-    let host = report.host_ledger.as_ref().unwrap();
-    let ring = host.items.iter().find(|item| item.group == "v41/route-ring").unwrap();
-    let waves = report.prefill_waves.unwrap_or(1);
-    assert_eq!(ring.bytes, 40 * (2 * 64 + 2 * waves * 256) * 24);
+    for gpus in [1usize, 2] {
+        let options = PlanOptions {
+            layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                rtx_bytes: vec![96 << 30; gpus],
+                prefill_rows: 256, prefill_unit_rows: Some(256), prefill_waves: 1,
+                onboard: Some(crate::placement::OnboardSetting::Layers(0)),
+                pool_tokens: Some(262_144), workspace_manifest: v41_workspace(dir.path()), ..Default::default() }),
+            ..sparks(4)
+        };
+        let report = plan(dir.path(), &options).unwrap();
+        let host = report.host_ledger.as_ref().unwrap();
+        let ring = host.items.iter().find(|item| item.group == "v41/route-ring").unwrap();
+        let waves = report.prefill_waves.unwrap_or(1);
+        assert_eq!(ring.bytes, 40 * gpus as u64 * (2 * 64 + waves * 256) * 24, "{gpus} coordinator GPU(s)");
+    }
 }
 
 #[test]

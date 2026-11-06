@@ -136,7 +136,7 @@ impl<'a> BackboneRouterWeights<'a> {
             // Route ids (24 B per row); also the non-deferred mask staging.
             request_staging: HostAllocation::new(self.library, capacity as usize * 24)?,
             mask_staging: HostAllocation::new(self.library, capacity as usize)?,
-            route_ring: Some(HostAllocation::new(self.library, 40 * capacity as usize * 24)?),
+            route_ring: Some(HostAllocation::named(self.library, 40 * capacity as usize * 24, "v41/route-ring")?),
             ring_capture: false,
             ring_pending: Vec::with_capacity(40),
             weights: self,
