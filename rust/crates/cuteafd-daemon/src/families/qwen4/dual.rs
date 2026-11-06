@@ -85,6 +85,7 @@ impl Opened {
             onboard: args.onboard.map(|setting| setting.resolve(catalog.routed_experts().routed_layers()))
                 .unwrap_or(Onboard::Auto),
             startup_graph_modes: args.planner_graph_modes.filter(|_| enabled),
+            expert_usage: crate::shared::expert_usage::enabled(),
         })?;
         inventory.record("qwen4", &inventory.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
         cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);

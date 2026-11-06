@@ -48,7 +48,7 @@ fn production_input(cfg: &GlmDsaConfig, gpus: usize, ranks: usize, prefill: Pref
         decode_link: (ranks > 0).then(|| production_link(cfg, ranks, PrefillShape { rows: 64, waves: 1 }, false)),
         prefill_link: (ranks > 0).then(|| production_link(cfg, ranks, prefill, true)),
         skip_routed_experts: false, operation: Operation::Serving,
-        sync_upload_bytes: 0, owners: vec![], budgets }
+        sync_upload_bytes: 0, owners: vec![], budgets, expert_usage: false }
 }
 
 #[test]
@@ -536,6 +536,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
                         full_prefill_logits: false,
                         payload_row_bytes: if local { cfg.hidden as u64 * 4 } else { 0 },
                         core_rows: false,
+                        expert_usage: false,
                     },
                 });
             }

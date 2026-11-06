@@ -90,6 +90,9 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glmf_kda_state: args.kda_state.into(),
                 glmf_index: args.index_cache.into(),
                 headroom_bytes: budget_bytes("--headroom-gib", args.headroom_gib)?,
+                // The one place the process switch is read: `plan` has no serve
+                // flag, so the launcher's environment variable is its trigger.
+                expert_usage: cuteafd_loader::placement::expert_usage_enabled(),
                 graph_budget_bytes: args.graph_budget_mib.map(|mib| mib << 20),
                 glmf_pool_marks: args.prefix_marks == crate::families::glm5_flash::prefix::PrefixMarks::Pool,
                 glmf_shared_replay: args.replay_records == crate::families::glm5_flash::engine::ReplayRecords::Shared,

@@ -129,6 +129,9 @@ pub struct LayoutOptions {
     pub mla_kv: cuteafd_core::MlaCacheFormat,
     /// Keep this much of every GPU free for runtime growth.
     pub headroom_bytes: u64,
+    /// Expert usage is on: charge the shared route probe's owner-local ring.
+    /// An explicit planner input, never a process-wide switch read per family.
+    pub expert_usage: bool,
     /// Concurrent sequences; automatic active state slots equal concurrency.
     pub concurrency: u64,
     /// Exact diagnostic engine slots when they differ from active concurrency.
@@ -289,6 +292,7 @@ impl Default for LayoutOptions {
             kimi_draft_fp8: false,
             mla_kv: Default::default(),
             headroom_bytes: 2 * GIB,
+            expert_usage: false,
             concurrency: 0,
             state_slots: None,
             glmf_mark_lanes: None,

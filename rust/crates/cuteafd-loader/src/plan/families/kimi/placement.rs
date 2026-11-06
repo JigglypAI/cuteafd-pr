@@ -260,7 +260,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         }
     };
     let record = opts.mla_kv.record_bytes() as u64 * PAGE;
-    if draft.is_none() && crate::placement::expert_usage_enabled() {
+    if draft.is_none() && opts.expert_usage {
         // Expert usage captures routes without a drafter: one probe per rank, so
         // each rank rings its own layers on its own device (no P2P copy). This
         // matches `kimi_k3/startup.rs`, which allocates both ranks' probes.

@@ -88,6 +88,8 @@ pub struct V4Inputs<'a> {
     pub context: Option<V4Context>,
     /// `--attention-placement`: `None` is auto (the family's recorded default).
     pub attention: Option<AttentionPlacement>,
+    /// Expert usage is on: charge the shared route probe's owner-local ring.
+    pub expert_usage: bool,
 }
 
 /// Native C4 context kernel scratch, read from the selected AOT manifest.
@@ -212,7 +214,7 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
             deepseek_v4_expert_exchange_bytes(hidden, topk, inputs.prefill_rows, inputs.decode_rows, rank, inputs.prefill_waves)
                 .map_err(|_| PlacementError::Overflow("V4 expert exchange"))?
         } else { 0 };
-        let probe = if rank == 0 && (!inputs.draft.is_empty() || crate::placement::expert_usage_enabled()) {
+        let probe = if rank == 0 && (!inputs.draft.is_empty() || inputs.expert_usage) {
             draft_probe_bytes(inputs.cfg, inputs.decode_rows)? } else { 0 };
         let workspace = inputs.workspace.as_ref().and_then(|w| w.get(rank)).map(|w| w.fixed_device_bytes)
             .unwrap_or(WORKSPACE_BYTES[role] * inputs.prefill_rows / 4096) + intake + probe;
@@ -418,6 +420,7 @@ mod default_tests {
                     tp2_workspace: [0; 2], exchange_f32: false, expert_workspace: 0,
                     first_routed: 0, requested_pool: Some(262144), onboard: Onboard::Layers(0),
                     full_prefill_logits: 0, code_bytes: Vec::new(), context: None, attention: None,
+                    expert_usage: false,
                 };
                 let baseline = fixed_demands(&input).unwrap().0;
                 for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
@@ -488,7 +491,7 @@ mod default_tests {
             workspace: None, experts: Vec::new(), draft: Vec::new(), experts_half: Vec::new(),
             tp2_workspace: [0; 2], exchange_f32: false, expert_workspace: 0, first_routed: 0,
             requested_pool: Some(262144), onboard: Onboard::Layers(0), full_prefill_logits: 0,
-            code_bytes: Vec::new(), context: None, attention: None,
+            code_bytes: Vec::new(), context: None, attention: None, expert_usage: false,
         }
     }
 

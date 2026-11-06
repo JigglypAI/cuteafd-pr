@@ -39,6 +39,8 @@ pub struct QwenInputs<'a> {
     pub spark_ranks: usize,
     /// None means lazy diagnostic graphs, not the serving startup set.
     pub startup_graph_modes: Option<(usize, bool)>,
+    /// Expert usage is on: charge the shared route probe's owner-local ring.
+    pub expert_usage: bool,
 }
 
 pub fn request(inputs: &QwenInputs<'_>, graph_bytes: u64) -> anyhow::Result<PlacementRequest> {
@@ -70,7 +72,7 @@ pub fn request(inputs: &QwenInputs<'_>, graph_bytes: u64) -> anyhow::Result<Plac
     fixed.push(Demand::new(0, Category::Weights, "loaded checkpoint owners", 0, Basis::Exact)
         .with_resident_weights(inputs.loaded_weights));
     fixed.push(Demand::new(0, Category::Runtime, "startup graphs", graph_bytes, Basis::Formula));
-    if crate::placement::expert_usage_enabled() {
+    if inputs.expert_usage {
         // The shared route probe's owner-local ring (one GPU here).
         let bytes = (inputs.admission.layers as u64).checked_mul(crate::families::qwen4::VERIFY_ROWS as u64)
             .and_then(|n| n.checked_mul(inputs.admission.cfg.topk as u64))
@@ -501,6 +503,8 @@ pub struct QwenDualInputs<'a> {
     pub spark_ranks: usize,
     pub onboard: Onboard,
     pub startup_graph_modes: Option<(usize, bool)>,
+    /// Expert usage is on: charge one shared route probe per owner GPU.
+    pub expert_usage: bool,
 }
 
 const DUAL_WHOLE: [LayerMode; 2] = [LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner },
@@ -556,7 +560,7 @@ pub fn dual_request(inputs: &QwenDualInputs<'_>, graph_bytes: [u64; 2]) -> anyho
         fixed.push(Demand::new(gpu as u8, Category::Runtime, "startup graphs", graph_bytes[gpu], Basis::Formula));
         fixed.push(Demand::new(gpu as u8, Category::Runtime, "loaded code", inputs.pending_code_bytes[gpu], Basis::Formula));
     }
-    if crate::placement::expert_usage_enabled() {
+    if inputs.expert_usage {
         // One shared route probe per owner GPU.
         let bytes = (a.layers as u64).checked_mul(crate::families::qwen4::VERIFY_ROWS as u64)
             .and_then(|n| n.checked_mul(a.cfg.topk as u64))
@@ -737,7 +741,7 @@ mod tests {
                 ple: None, future_expert_bytes: 0, headroom: 0 },
             capacity_bytes: 96 << 30, baseline: Baseline::Measured { free_bytes: 96 << 30 },
             pending_code_bytes: 0, max_context: 131072, requested_pool: Some(2 << 20), spark_ranks: 0,
-            startup_graph_modes: None,
+            startup_graph_modes: None, expert_usage: false,
         };
         let mut req = request(&inputs, 0).unwrap();
         req.inventory.gpus = vec![req.inventory.gpus[0]; 2];
@@ -978,7 +982,7 @@ mod tests {
                 layer_weights: &weights, layer_experts: &experts, layer_extra: &layer_extra, fixed,
                 tp2_workspace: [128 << 20; 2], pending_code_bytes: [64 << 20; 2], mark_slots: 0,
                 max_context: 131072, requested_pool: None, spark_ranks: 0, onboard: Onboard::Auto,
-                startup_graph_modes: None };
+                startup_graph_modes: None, expert_usage: false };
             let lazy = dual_placement(&inputs).unwrap();
             for rank in &lazy.items {
                 let graph = rank.iter().find(|item| item.group == "graph growth").unwrap();
@@ -1043,7 +1047,7 @@ mod tests {
                 fixed: fixed.clone(),
                 tp2_workspace: [128 << 20, 96 << 20], pending_code_bytes: [64 << 20; 2], mark_slots: 18,
                 max_context: 131072, requested_pool: Some(2 << 20), spark_ranks: 0, onboard: Onboard::Auto,
-                startup_graph_modes: Some((16, true)),
+                startup_graph_modes: Some((16, true)), expert_usage: false,
             };
             let planned = dual_placement(&inputs(false)).unwrap();
             let measured = dual_placement(&inputs(true)).unwrap();
@@ -1113,6 +1117,7 @@ mod tests {
                             ple: Some((160, true)), future_expert_bytes: 0, headroom: 3 << 30 },
                         capacity_bytes: total, baseline, pending_code_bytes: 0, max_context: context,
                         requested_pool: requested, spark_ranks: 0, startup_graph_modes: Some((16, true)),
+                        expert_usage: false,
                     };
                     let planned = inputs(Baseline::Planned { context_bytes, loaded_bytes: expert_bytes });
                     let measured = inputs(Baseline::Measured {
@@ -1154,7 +1159,7 @@ mod tests {
                     mark_bytes: 0, full_prefill_logits: 0, ple: Some((160, true)),
                     future_expert_bytes: 0, headroom: 0 },
                 capacity_bytes: total, baseline, pending_code_bytes: 0, max_context: 1048576,
-                requested_pool: None, spark_ranks: 4, startup_graph_modes: None };
+                requested_pool: None, spark_ranks: 4, startup_graph_modes: None, expert_usage: false };
             let planned = request(&inputs(Baseline::Planned { context_bytes, loaded_bytes }), 0).unwrap();
             let intake = planned.fixed.iter().find(|d| d.group == "Spark intake planes").unwrap().clone();
             // Fused reduction reads packed replies in the BF16 fallback planes.
@@ -1197,7 +1202,7 @@ mod tests {
                     ple: None, future_expert_bytes: 10 << 30, headroom: 3 << 30 },
                 capacity_bytes: 96 << 30, baseline: Baseline::Measured { free_bytes: 70 << 30 },
                 pending_code_bytes: 780_221_844, max_context: 131072, requested_pool: None,
-                spark_ranks: 0, startup_graph_modes: None,
+                spark_ranks: 0, startup_graph_modes: None, expert_usage: false,
             };
             let lazy = placement(&inputs).unwrap();
             let graph = lazy.items[0].iter().find(|item| item.group == "graph growth").unwrap();

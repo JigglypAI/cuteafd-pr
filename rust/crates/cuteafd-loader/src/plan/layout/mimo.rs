@@ -440,6 +440,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
         context, requested_pool: options.pool_tokens,
         pool_ceiling_at_target: options.pool_ceiling_at_target, onboard,
         experts, expert_workspace, tp2_workspace, rows, lanes: lanes as u64,
+        expert_usage: options.expert_usage,
     };
     let solution = match crate::placement::families::mimo_v2::solve_working_set(&inputs, &no_spark.steady) {
         Ok(solution) => solution,
@@ -480,7 +481,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     for (rank, device) in devices.iter_mut().enumerate() {
         device.items.extend(crate::placement::families::mimo_v2::expert_items(&selected, &placement, rank)?);
     }
-    if crate::placement::expert_usage_enabled() {
+    if options.expert_usage {
         // The solver budgets the shared route probe's owner-local ring on GPU0;
         // show it in the plan's device items too.
         let bytes = (cfg.layers as u64)
@@ -712,7 +713,7 @@ mod tests {
                             (total, Baseline::Measured { free_bytes: total - baseline[rank] })).collect(),
                         headroom_floor: opts.headroom_bytes, spark_ranks: sparks, startup_probe_bytes: 64 << 20,
                         context, requested_pool: opts.pool_tokens, pool_ceiling_at_target: false, onboard, experts, expert_workspace,
-                        tp2_workspace, rows: 4096, lanes: lanes as u64 };
+                        tp2_workspace, rows: 4096, lanes: lanes as u64, expert_usage: false };
                     let no_spark = profile(&checkpoint, &opts, ranks, 0, 4096, 16, context, None).unwrap();
                     let solution = solve_working_set(&inputs, &no_spark.steady).unwrap();
                     let selected = inputs.selected(&no_spark.steady, &solution.working_set);

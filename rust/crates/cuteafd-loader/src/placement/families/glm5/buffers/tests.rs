@@ -31,6 +31,7 @@ pub(super) fn target(device: u8) -> TargetBuffers {
         full_prefill_logits: false,
         payload_row_bytes: 0,
         core_rows: false,
+        expert_usage: false,
     }
 }
 

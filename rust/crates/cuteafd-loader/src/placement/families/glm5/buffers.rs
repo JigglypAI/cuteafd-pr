@@ -91,6 +91,8 @@ pub struct TargetBuffers {
     /// Optional TP2 payload and K6 row arenas; their hook-local owners are separate.
     pub payload_row_bytes: u64,
     pub core_rows: bool,
+    /// Expert usage is on: charge the shared route probe's owner-local ring.
+    pub expert_usage: bool,
 }
 
 fn mul(a: u64, b: u64) -> Result<u64, Refusal> {
@@ -439,7 +441,7 @@ impl TargetBuffers {
         if let Some((shape, scratch)) = self.prefill {
             b.workspace(cfg, self, false, shape, scratch, tables)?;
         }
-        if self.device == 0 && crate::placement::expert_usage_enabled() {
+        if self.device == 0 && self.expert_usage {
             // The shared route probe's owner-local ring (GPU0 only): one
             // `[layer][row][slot]` u32 arena at the decode row count.
             let bytes = mul(mul(cfg.layers as u64, DECODE_ROWS)?, cfg.topk as u64)?

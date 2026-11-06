@@ -582,6 +582,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         exchange_element_bytes: if exchange_f32 { 4 } else { 2 }, peer_diagnostics: false,
         local: source.as_ref().map(|source| (source, physical)), spark_ranks, decode_link, prefill_link,
         skip_routed_experts: false, operation, sync_upload_bytes: 0, owners: additional, budgets,
+        expert_usage: options.expert_usage,
     }.prepare()?;
     prepared.recipe.encoders = encoders.clone();
     prepared.recipe.media_cache_bytes = options.media_cache_bytes.unwrap_or((8u64 << 30).min(host.0 / 20));
@@ -714,6 +715,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         exchange_element_bytes: if glm::local_exchange_f32()? { 4 } else { 2 }, peer_diagnostics: false,
         local: source.as_ref().map(|source| (source, physical)), spark_ranks, decode_link, prefill_link,
         skip_routed_experts: false, operation, sync_upload_bytes: 0, owners: additional, budgets,
+        expert_usage: options.expert_usage,
     }.prepare()?.admit(request)?;
     if let Some(report) = report {
         report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));

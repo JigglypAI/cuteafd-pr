@@ -213,6 +213,8 @@ pub struct GlmfInputs<'a> {
     pub requested_pool: Option<u64>,
     pub onboard: Onboard,
     pub full_prefill_logits: u64,
+    /// Expert usage is on: charge the shared route probe's owner-local ring.
+    pub expert_usage: bool,
 }
 
 pub fn default_onboard() -> Onboard { Onboard::Auto }
@@ -386,7 +388,7 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
         let index_replay = if tails > 0 { local_mla * i.decode_rows * 512 } else { 0 };
         let gpu = rank as u8;
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Runtime, "pending code", i.pending_code.get(rank).copied().unwrap_or(0), Basis::Calibrated));
-        if rank == 0 && crate::placement::expert_usage_enabled() {
+        if rank == 0 && i.expert_usage {
             // The shared route probe's owner-local ring (GPU0 only).
             let bytes = (i.layers as u64).checked_mul(i.decode_rows)
                 .and_then(|n| n.checked_mul(i.cfg.topk as u64))
@@ -798,6 +800,7 @@ mod tests {
                 half: [Bytes2 { resident: 1 << 30, staging: 0 }; 2], tp2: ranks == 2, whole_supported: true, spark_ok: true }).collect(),
             expert_workspace: 128 << 20, tp2_workspace: [128 << 20; 2], drafter_bytes: 3 << 30, drafter_weights: ResidentWeights(2 << 30),
             drafter_scratch: vec![0; ranks], drafter_bridge: None, requested_pool: None, onboard: default_onboard(), full_prefill_logits: 0,
+            expert_usage: false,
         }
     }
 

@@ -1219,7 +1219,7 @@ impl Opened {
             exchange_element_bytes: if exchange_f32 { 4 } else { 2 }, peer_diagnostics: physical.peer_diagnostics,
             local: source.as_ref().map(|source| (source, physical)), spark_ranks, decode_link, prefill_link,
             skip_routed_experts: args.skip_routed_experts, operation, sync_upload_bytes: 0,
-            owners: additional, budgets }.prepare()?.admit(request)?;
+            owners: additional, budgets, expert_usage: crate::shared::expert_usage::enabled() }.prepare()?.admit(request)?;
         {
             use sha2::{Digest, Sha256};
             let hash = |path: &std::path::Path| -> Result<String> {

@@ -175,6 +175,8 @@ fn serve_loop(
     prefix: PrefixArgs,
     packing: crate::shared::prefill_packing::PackingMode,
 ) -> Result<()> {
+    // Before admission: the planner charges the probe this switch allocates.
+    crate::shared::expert_usage::enable_from_flag(args.expert_usage.expert_usage);
     let loaded = match super::load(&args) {
         Ok(loaded) => loaded,
         Err(error) => {
@@ -182,7 +184,6 @@ fn serve_loop(
             return Ok(());
         }
     };
-    crate::shared::expert_usage::enable_from_flag(args.expert_usage.expert_usage);
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(&args.snapshot)?;
     let eos = eos_token(&args.snapshot)?;
     let mut ready = Some(ready);

@@ -53,6 +53,8 @@ pub struct MimoInputs<'a> {
     pub tp2_workspace: [u64; 2],
     pub rows: u64,
     pub lanes: u64,
+    /// Expert usage is on: charge the shared route probe's owner-local ring.
+    pub expert_usage: bool,
 }
 
 pub struct MimoSolution {
@@ -267,7 +269,8 @@ mod tests {
                 headroom_floor: 0, spark_ranks: 6, startup_probe_bytes: 64 << 20, context: 256 << 10,
                 requested_pool: Some(2 << 20), pool_ceiling_at_target: false, onboard: Onboard::Auto,
                 experts: vec![None, Some(cost), Some(cost), Some(cost)], expert_workspace: if ranks == 1 { 1 << 20 } else { 0 },
-                tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] }, rows: 4096, lanes: 3 };
+                tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] }, rows: 4096, lanes: 3,
+                expert_usage: false };
             let all = solve_working_set(&inputs, &local).unwrap();
             assert_eq!(all.placement.onboard_layers, 3);
             assert_eq!(all.working_set, SparkWorkingSet { rtx_layers: vec![1, 2, 3],
@@ -381,7 +384,8 @@ mod tests {
                     requested_pool: None, pool_ceiling_at_target: false, onboard,
                     experts: vec![None, Some(cost), Some(cost), Some(cost)],
                     expert_workspace: if ranks == 1 { 1 << 20 } else { 0 },
-                    tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] }, rows: 4096, lanes: 3 };
+                    tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] }, rows: 4096, lanes: 3,
+                    expert_usage: false };
                 let req = request(&inputs).unwrap();
                 assert_eq!(req.movables.len(), 1);
                 assert!(req.fixed.iter().all(|d| !d.group.starts_with("draft.")));
@@ -477,7 +481,7 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
         }
         pool_overhead.push(costs.pool_unit_bytes.checked_sub(cache.ranks[rank].persistent_unit_bytes)
             .ok_or(PlacementError::Inventory("MiMo pool tables omit layer records"))?);
-        if rank == 0 && crate::placement::expert_usage_enabled() {
+        if rank == 0 && inputs.expert_usage {
             // The shared route probe's owner-local ring (GPU0 only).
             let bytes = (layers as u64).checked_mul(crate::families::mimo_v2::decode_graph::MIMO_DECODE_ROWS as u64)
                 .and_then(|n| n.checked_mul(inputs.cfg.topk as u64))

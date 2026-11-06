@@ -514,6 +514,8 @@ pub struct ProductionInput<'a> {
     pub sync_upload_bytes: u64,
     pub owners: Vec<Component>,
     pub budgets: Vec<Budget>,
+    /// Expert usage is on: charge the shared route probe's owner-local ring.
+    pub expert_usage: bool,
 }
 
 /// Prepared physical alternatives, retained until the one shared solve selects
@@ -806,6 +808,7 @@ impl<'a> ProductionInput<'a> {
                         self.cfg.hidden as u64 * self.exchange_element_bytes
                     } else { 0 },
                     core_rows: recipe.hooks[device as usize].value.core.is_some(),
+                    expert_usage: self.expert_usage,
                 } });
             }
             let layers = (0..self.layers).map(|layer| GlmGraphLayer {

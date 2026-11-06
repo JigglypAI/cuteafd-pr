@@ -1923,7 +1923,7 @@ impl Opened {
             kda_state_bytes: args.kda_state.bytes() as u64, shared_replay: args.replay_records == engine::ReplayRecords::Shared,
             representation, resident, workspace, local_workspace, graphs, experts, expert_workspace, tp2_workspace,
             drafter_bytes, drafter_weights, drafter_scratch, drafter_bridge, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
-            full_prefill_logits: 0 };
+            full_prefill_logits: 0, expert_usage: crate::shared::expert_usage::enabled() };
         let target = placement::PoolPolicy::resolve(&inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(),
             args.max_context as u64, inputs.requested_pool, 256, spark_ranks == 0).target;
         let (placement, graphs, working) = admission::solve_attention_working_set_with_graphs(&inputs,

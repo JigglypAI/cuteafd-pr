@@ -172,6 +172,8 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>,
     loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
     args.planner_graph_modes = Some((max_sequences, !matches!(draft, Drafts::None)));
+    // Before admission: the planner charges the probe this switch allocates.
+    crate::shared::expert_usage::enable_from_flag(args.expert_usage.expert_usage);
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {
@@ -179,7 +181,6 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
             return Ok(());
         }
     };
-    crate::shared::expert_usage::enable_from_flag(args.expert_usage.expert_usage);
     let (mut vision, prefix) = match super::media::ReadyVision::load(&args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
         Ok(vision) => vision,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }

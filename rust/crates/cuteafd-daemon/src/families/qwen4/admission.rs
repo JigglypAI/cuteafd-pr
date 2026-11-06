@@ -174,7 +174,8 @@ fn placement_inputs<'a>(args: &EngineArgs, admission: QwenAdmissionInputs<'a>, s
         baseline: Baseline::Measured { free_bytes: available }, pending_code_bytes: pending,
         max_context: args.max_context as u64, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         spark_ranks: source.spark_ranks(),
-        startup_graph_modes: args.planner_graph_modes.filter(|_| graphs_enabled) }
+        startup_graph_modes: args.planner_graph_modes.filter(|_| graphs_enabled),
+        expert_usage: crate::shared::expert_usage::enabled() }
 }
 
 /// Static rank packages, selected before either device allocates experts. The
@@ -508,7 +509,7 @@ mod tests {
                     layer_weights: &weights, layer_experts: &experts, layer_extra: &extra,
                     fixed: Vec::new(), tp2_workspace: [0; 2], pending_code_bytes: [0; 2], mark_slots: 18,
                     max_context: 131072, requested_pool: Some(2 << 20), spark_ranks: 0, onboard,
-                    startup_graph_modes: None,
+                    startup_graph_modes: None, expert_usage: false,
                 };
                 let mapped = qwen4::dual_request(&inputs, [0; 2])?;
                 assert!(mapped.movables.is_empty());
@@ -751,7 +752,8 @@ mod tests {
                 layer_weights: &weights.resident.layer_bytes, layer_experts: &experts.costs,
                 layer_extra: &weights.layer_extra, fixed, tp2_workspace: experts.workspace,
                 pending_code_bytes: [0; 2], mark_slots: 0, max_context: 131072, requested_pool: None,
-                spark_ranks: 0, onboard: Onboard::Auto, startup_graph_modes: args.planner_graph_modes })?;
+                spark_ranks: 0, onboard: Onboard::Auto, startup_graph_modes: args.planner_graph_modes,
+                expert_usage: false })?;
             assert_eq!(runtime.pool_tokens, if capacities.iter().any(|&bytes| bytes <= 32 << 30) { 1 << 20 } else { 2 << 20 });
             assert_eq!(runtime.pool_tokens, layout.pool_tokens);
             assert_eq!(runtime.tp2.unwrap().layers, 4);
@@ -828,7 +830,7 @@ mod tests {
                     spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, admission: inputs, capacity_bytes: capacity,
                     baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
                     max_context: context, requested_pool: pool, spark_ranks: 0,
-                    startup_graph_modes: args.planner_graph_modes })?;
+                    startup_graph_modes: args.planner_graph_modes, expert_usage: false })?;
                 assert_eq!(placement.pool_tokens, layout.pool_tokens);
                 let pool = layout.pool_tokens as usize;
                 let executables = super::super::engine::serving_graph_count(context as usize, pool,
@@ -845,7 +847,7 @@ mod tests {
                     spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, admission: inputs, capacity_bytes: capacity,
                     baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
                     max_context: context, requested_pool: Some(layout.pool_tokens), spark_ranks: 0,
-                    startup_graph_modes: Some((65, true)) };
+                    startup_graph_modes: Some((65, true)), expert_usage: false };
                 let error = qwen4::placement(&invalid).unwrap_err();
                 let error = error.downcast_ref::<cuteafd_core::concurrency::ConcurrencyError>().unwrap();
                 assert_eq!((error.requested, error.capacity), (65, 64));

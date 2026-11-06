@@ -2158,16 +2158,19 @@ fn owner_search_matches_exhaustive_frozen_pool_with_bounded_draft_storage() {
 }
 
 /// The serve command's `--expert-usage` flag sets a process switch the planner
-/// reads, so a bare CLI launch charges the probe it allocates (the launcher also
-/// exports the environment variable, which stays an independent trigger).
+/// boundary reads, so a bare CLI launch charges the probe it allocates (the
+/// launcher also exports the environment variable, which stays an independent
+/// trigger). The planner itself takes the decision as an explicit input, so no
+/// plan or family reads this switch.
 #[test]
 fn expert_usage_flag_sets_the_planner_switch() {
     // The environment variable is process-wide and other plan tests read it, so
     // this test only exercises the flag switch and leaves the environment alone.
+    let environment = std::env::var_os("CUTEAFD_EXPERT_USAGE").is_some_and(|value| value != "0");
     set_expert_usage(false);
-    assert!(!expert_usage_enabled());
+    assert_eq!(expert_usage_enabled(), environment);
     set_expert_usage(true);
     assert!(expert_usage_enabled());
     set_expert_usage(false);
-    assert!(!expert_usage_enabled());
+    assert_eq!(expert_usage_enabled(), environment);
 }

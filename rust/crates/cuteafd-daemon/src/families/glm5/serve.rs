@@ -241,6 +241,8 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
     remote: Option<crate::families::glm5_flash::media::RemoteVision>,
     loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
     let args = &resolved.args;
+    // Before admission: the planner charges the probe this switch allocates.
+    crate::shared::expert_usage::enable_from_flag(args.expert_usage.expert_usage);
     let opened = match open(args) {
         Ok(opened) => opened,
         Err(error) => {
@@ -248,7 +250,6 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
             return Ok(());
         }
     };
-    crate::shared::expert_usage::enable_from_flag(args.expert_usage.expert_usage);
     // Retain the early tower allocation receipt for the joint LM recipe.
     let (mut vision, prefix) = match ml4_media::ReadyVision::load(args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
         Ok(vision) => vision,

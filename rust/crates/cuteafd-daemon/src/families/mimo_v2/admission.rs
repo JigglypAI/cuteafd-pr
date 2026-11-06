@@ -520,6 +520,7 @@ fn preflight_shape(
         onboard: args.onboard.resolve(cfg.dense.iter().take(layers).filter(|&&dense| !dense).count()),
         experts: expert_costs, expert_workspace, tp2_workspace,
         rows: args.prefill_rows.max(64) as u64, lanes: transport_lanes as u64,
+        expert_usage: crate::shared::expert_usage::enabled(),
     };
     let solution = solve_working_set(&inputs, &no_spark_profiles.steady)
         .with_context(|| format!("MiMo shared placement; configured-Spark reservation contract {report}"))?;

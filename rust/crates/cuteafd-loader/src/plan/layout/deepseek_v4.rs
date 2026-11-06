@@ -283,7 +283,7 @@ fn request(report: &PlanReport, input: &super::super::PlanInput, options: &Layou
         requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
         full_prefill_logits: 0, code_bytes: v4::code_bytes(cfg.dim, v4::code_experts(catalog), devices.len()),
         context,
-        attention: report.requested_attention };
+        attention: report.requested_attention, expert_usage: options.expert_usage };
     let request = v4::request(&inputs)?;
     let reserves = request.inventory.gpus.iter().map(|g| g.headroom_bytes).collect();
     Ok((request, reserves, inputs.weights.startup))
