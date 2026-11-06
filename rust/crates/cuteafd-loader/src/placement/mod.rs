@@ -127,6 +127,24 @@ impl PlacementRequest {
     }
 }
 
+/// Process-wide expert-usage switch set by the serve command's `--expert-usage`
+/// flag. The environment variable alone is not enough: a bare CLI flag never
+/// sets it, so the planner would allocate the probe without charging it.
+static EXPERT_USAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record the serve command's `--expert-usage` decision for the planner.
+pub fn set_expert_usage(enabled: bool) {
+    EXPERT_USAGE.store(enabled, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether expert usage is enabled for this process. The serve flag sets the
+/// process switch and the launcher also exports the environment variable, so
+/// `plan` charges the probe the runtime allocates either way.
+pub fn expert_usage_enabled() -> bool {
+    EXPERT_USAGE.load(std::sync::atomic::Ordering::Acquire)
+        || std::env::var_os("CUTEAFD_EXPERT_USAGE").is_some_and(|value| value != "0")
+}
+
 /// Descend through pool-dependent inventories until both capacity and the
 /// selected execution layout agree. A repeated layout is a refusal, not a
 /// license to choose a family-private fallback or change a pinned pool.

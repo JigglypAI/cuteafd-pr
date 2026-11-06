@@ -463,12 +463,29 @@ pub fn publish_host_heap(value: Value) {
     *HOST_HEAP.write().unwrap_or_else(|e| e.into_inner()) = value;
 }
 
+/// A process-wide provider for the `expert_usage` stats object. The daemon
+/// registers it once at serve start; `/v1/stats` calls it on read, so the
+/// per-layer x per-expert matrix is never built on the serving hot path.
+static EXPERT_USAGE_PROVIDER: std::sync::RwLock<Option<fn() -> Value>> = std::sync::RwLock::new(None);
+
+pub fn set_expert_usage_provider(provider: fn() -> Value) {
+    *EXPERT_USAGE_PROVIDER.write().unwrap_or_else(|e| e.into_inner()) = Some(provider);
+}
+
+fn expert_usage_value() -> Value {
+    match *EXPERT_USAGE_PROVIDER.read().unwrap_or_else(|e| e.into_inner()) {
+        Some(provider) => provider(),
+        None => json!({ "enabled": false }),
+    }
+}
+
 async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
     let mut value = state.stats.lock().map(|stats| stats.clone()).unwrap_or(Value::Null);
     if !value.is_object() { value = json!({}); }
     refresh_mapped_tables(&mut value, &state.tables);
     let object = value.as_object_mut().unwrap();
     object.insert("host_heap".into(), HOST_HEAP.read().unwrap_or_else(|e| e.into_inner()).clone());
+    object.insert("expert_usage".into(), expert_usage_value());
     object.extend(state.admission.metrics().as_object().unwrap().clone());
     object.insert("http_queue_len".into(), json!(state.queue.max_capacity() - state.queue.capacity()));
     let thermal = cuteafd_core::thermal::current();

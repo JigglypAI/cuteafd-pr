@@ -2156,3 +2156,18 @@ fn owner_search_matches_exhaustive_frozen_pool_with_bounded_draft_storage() {
     assert_eq!(attention::owner_score(&accepted), best);
     assert_eq!(solve_frozen(&req, &accepted).unwrap(), accepted);
 }
+
+/// The serve command's `--expert-usage` flag sets a process switch the planner
+/// reads, so a bare CLI launch charges the probe it allocates (the launcher also
+/// exports the environment variable, which stays an independent trigger).
+#[test]
+fn expert_usage_flag_sets_the_planner_switch() {
+    // The environment variable is process-wide and other plan tests read it, so
+    // this test only exercises the flag switch and leaves the environment alone.
+    set_expert_usage(false);
+    assert!(!expert_usage_enabled());
+    set_expert_usage(true);
+    assert!(expert_usage_enabled());
+    set_expert_usage(false);
+    assert!(!expert_usage_enabled());
+}
