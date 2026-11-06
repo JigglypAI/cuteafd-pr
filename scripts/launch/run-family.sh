@@ -576,6 +576,11 @@ v41_l2_prefetch="$(get L2_PREFETCH)"
 # a smaller cap that holds the scales (about 6 GiB) preloads those alone.
 v41_engram_warm="$(get ENGRAM_WARM off)"
 case "$v41_engram_warm" in on|off) ;; *) release_die "ENGRAM_WARM must be on or off" ;; esac
+# EXPERT_USAGE (on|off; default off): count per-layer x per-expert route hits
+# (serve-native --expert-usage). Enabling it turns on route capture, so it is off
+# until the C1/C16 cost measurement proves it perf-neutral.
+v41_expert_usage="$(get EXPERT_USAGE off)"
+case "$v41_expert_usage" in on|off) ;; *) release_die "EXPERT_USAGE must be on or off" ;; esac
 case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
 [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" == all || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
   release_die "DeepSeek V4.1 RTX_EXPERT_LAYERS must be auto, all or a non-negative layer count"
@@ -1120,6 +1125,7 @@ fi
 [[ "$TP2_DSPARK_EXPERTS" != on ]] || args+=(--tp2-dspark-experts)
 [[ -z "$v41_l2_prefetch" ]] || args+=(--l2-prefetch "$v41_l2_prefetch")
 [[ "$v41_engram_warm" != on ]] || args+=(--engram-warm)
+[[ "$v41_expert_usage" != on ]] || args+=(--expert-usage)
 # Explicit replicated topology is described to the coordinator once, and each
 # worker derives group=rank/TP and tp_rank=rank%TP from the same two flags.
 if ((topology_explicit)); then
@@ -1628,6 +1634,22 @@ for pair in 'LOOP_ABORT_RUN:--loop-abort-run' 'LOOP_ABORT_COPIES:--loop-abort-co
   value="$(get "$key_name")"
   [[ -z "$value" ]] || family_args+=("$flag" "$value")
 done
+# EXPERT_USAGE (on|off; default off): count per-layer x per-expert route hits.
+# The same environment variable reaches the planner, so it charges the probe.
+# Only families whose serve command captures routes offer the switch: dense
+# Qwen 3.5 has no routed experts, Step-5 has no route capture yet, and Muse
+# Spark's serve command has no such argument.
+expert_usage_family() {
+  case "$1" in
+    glm5|glm5_flash|mimo_v2|qwen4|kimi_k3|deepseek_v4) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+case "$(get EXPERT_USAGE off)" in
+  on) if expert_usage_family "$family"; then family_args+=(--expert-usage); fi ;;
+  off) ;;
+  *) echo "EXPERT_USAGE must be on or off" >&2; exit 2 ;;
+esac
 chat_template_mounts=()
 # Vision-only override: no template inference and no changes to text-only prompts.
 # Without it, VISION=auto serves a GLM Flash checkpoint whose own chat template cannot mark images
@@ -2297,6 +2319,7 @@ fi
 # Match persistent connections owned by the selected family's transport, not
 # the Spark world size. Forward the resolved lane policy to the coordinator.
 lane_env_args=()
+[[ "$(get EXPERT_USAGE off)" != on ]] || lane_env_args+=(-e CUTEAFD_EXPERT_USAGE=1)
 case "$family" in
   deepseek_v4)
     [[ -z "$(get PREFILL_SPAN_ROWS)" ]] || lane_env_args+=(-e "CUTEAFD_PREFILL_SPAN_ROWS=$(get PREFILL_SPAN_ROWS)")

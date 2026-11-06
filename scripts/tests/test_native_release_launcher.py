@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import subprocess
 import json
@@ -332,6 +333,52 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
                         self.assertIn('layers explicitly selected; auto remains context on two GPUs', result.stderr)
                     elif mode in ['context', 'layers'] and not runs:
                         self.assertIn(f'{family} cannot run attention placement {mode}', result.stderr)
+
+    def test_expert_usage_reaches_every_family_and_the_planner(self) -> None:
+        """EXPERT_USAGE=on adds --expert-usage only for families whose serve
+        command actually captures routes, and exports CUTEAFD_EXPERT_USAGE so the
+        planner charges the probe; off or unset passes nothing; other values fail
+        before any container. The family list is checked against the Rust serve
+        arguments, so a family without the flag (Muse, Step-5) is never passed it."""
+        source = FAMILY.read_text()
+        block = source.split('expert_usage_family() {', 1)[1].split('\nchat_template_mounts=()', 1)[0]
+        block = 'expert_usage_family() {' + block
+        self.assertIn('get EXPERT_USAGE off', block)
+        # The launcher's family -> serve command mapping.
+        mapping = dict(re.findall(r'^\s*(\w+)\) (serve=serve-[\w-]+) ;;', source, re.MULTILINE))
+        self.assertIn('muse_spark', mapping)
+        self.assertIn('step5', mapping)
+        for family in mapping:
+            result = subprocess.run(['bash', '-c',
+                'get() { printf %s "$TEST_VALUE"; }; family="$TEST_FAMILY"; family_args=(); '
+                + block + '\nprintf "%s" "${family_args[*]}"',
+                'test'], cwd=ROOT, text=True, capture_output=True,
+                env={**os.environ, 'TEST_VALUE': 'on', 'TEST_FAMILY': family})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            launcher_offers = result.stdout == '--expert-usage'
+            # The family's serve command declares the flag iff its ServeArgs
+            # flatten ExpertUsageArgs.
+            family_dir = ROOT / 'rust/crates/cuteafd-daemon/src/families' / family
+            rust_offers = any('ExpertUsageArgs' in path.read_text()
+                for path in family_dir.rglob('*.rs')) if family_dir.is_dir() else False
+            self.assertEqual(launcher_offers, rust_offers,
+                f'{family}: launcher offers {launcher_offers}, serve command offers {rust_offers}')
+        for value, expected in [('on', '--expert-usage'), ('off', '')]:
+            result = subprocess.run(['bash', '-c',
+                'get() { printf %s "$TEST_VALUE"; }; family=glm5; family_args=(); '
+                + block + '\nprintf "%s" "${family_args[*]}"',
+                'test'], cwd=ROOT, text=True, capture_output=True,
+                env={**os.environ, 'TEST_VALUE': value})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, expected, value)
+        bad = subprocess.run(['bash', '-c',
+            'get() { printf %s "$TEST_VALUE"; }; family=glm5; family_args=(); ' + block,
+            'test'], cwd=ROOT, text=True, capture_output=True,
+            env={**os.environ, 'TEST_VALUE': 'yes'})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn('EXPERT_USAGE must be on or off', bad.stderr)
+        # The planner sees the same switch through the environment.
+        self.assertIn('lane_env_args+=(-e CUTEAFD_EXPERT_USAGE=1)', source)
 
     def test_v41_layers_refuses_before_runtime_consumes_solver_placement(self) -> None:
         source = v41_source()
