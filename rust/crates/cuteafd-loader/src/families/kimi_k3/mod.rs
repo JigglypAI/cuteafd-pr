@@ -100,14 +100,16 @@ mod bridge_tests {
     }
 }
 
-/// The shared probe retains one GPU0 route arena; its pinned mirror is host memory.
-pub fn draft_probe_demand(layers: usize, topk: usize, rows: usize) -> anyhow::Result<crate::placement::Demand> {
+/// One probe's route arena on `rank`; its pinned mirror is host memory. A draft
+/// policy keeps one on GPU0; expert usage without a drafter keeps one per rank.
+pub fn draft_probe_demand(rank: u8, layers: usize, topk: usize, rows: usize)
+    -> anyhow::Result<crate::placement::Demand> {
     use anyhow::Context;
     use crate::placement::Demand;
     use cuteafd_core::memory_layout::{Basis, Category};
     let bytes = layers.checked_mul(topk).and_then(|n| n.checked_mul(rows))
         .and_then(|n| n.checked_mul(4)).context("Kimi draft probe extent overflow")?;
-    Ok(Demand::new(0, Category::Workspace, "draft policy route arena", bytes.max(256) as u64, Basis::Formula))
+    Ok(Demand::new(rank, Category::Workspace, "draft policy route arena", bytes.max(256) as u64, Basis::Formula))
 }
 
 /// Validate sealed role artifacts at runtime, never during checkpoint planning.

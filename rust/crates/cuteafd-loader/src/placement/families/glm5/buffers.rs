@@ -439,6 +439,22 @@ impl TargetBuffers {
         if let Some((shape, scratch)) = self.prefill {
             b.workspace(cfg, self, false, shape, scratch, tables)?;
         }
+        if self.device == 0 && crate::placement::expert_usage_enabled() {
+            // The shared route probe's owner-local ring (GPU0 only): one
+            // `[layer][row][slot]` u32 arena at the decode row count.
+            let bytes = mul(mul(cfg.layers as u64, DECODE_ROWS)?, cfg.topk as u64)?
+                .checked_mul(4)
+                .ok_or(Refusal::Overflow("GLM expert usage probe"))?;
+            b.fixed(
+                "expert_usage.ring",
+                bytes.max(FLOOR),
+                Lifetime {
+                    first: Phase::Warmup,
+                    last: Phase::Growth,
+                },
+                Category::Workspace,
+            )?;
+        }
         Ok(b.out)
     }
 }

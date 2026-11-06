@@ -4318,6 +4318,26 @@ fn v41_small_card_graph_envelope_preserves_pro_allowance() {
 }
 
 #[test]
+fn v41_host_ledger_charges_the_router_route_ring() {
+    // The route ring is the storage expert usage reads; it is a pinned host
+    // allocation (40 layers x capacity rows x 24 B per backbone lane), not a
+    // GPU workspace, so the plan must charge it in the host ledger.
+    let dir = strict_v41_snapshot(false);
+    let options = PlanOptions {
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30],
+            prefill_rows: 256, prefill_unit_rows: Some(256), prefill_waves: 1,
+            onboard: Some(crate::placement::OnboardSetting::Layers(0)),
+            pool_tokens: Some(262_144), workspace_manifest: v41_workspace(dir.path()), ..Default::default() }),
+        ..sparks(4)
+    };
+    let report = plan(dir.path(), &options).unwrap();
+    let host = report.host_ledger.as_ref().unwrap();
+    let ring = host.items.iter().find(|item| item.group == "v41/route-ring").unwrap();
+    let waves = report.prefill_waves.unwrap_or(1);
+    assert_eq!(ring.bytes, 40 * (2 * 64 + 2 * waves * 256) * 24);
+}
+
+#[test]
 fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     use cuteafd_core::memory_layout::Category;
     let dir = strict_v41_snapshot(false);

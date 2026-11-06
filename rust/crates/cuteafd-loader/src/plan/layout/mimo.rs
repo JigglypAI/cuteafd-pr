@@ -480,6 +480,16 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     for (rank, device) in devices.iter_mut().enumerate() {
         device.items.extend(crate::placement::families::mimo_v2::expert_items(&selected, &placement, rank)?);
     }
+    if crate::placement::expert_usage_enabled() {
+        // The solver budgets the shared route probe's owner-local ring on GPU0;
+        // show it in the plan's device items too.
+        let bytes = (cfg.layers as u64)
+            .checked_mul(crate::families::mimo_v2::decode_graph::MIMO_DECODE_ROWS as u64)
+            .and_then(|n| n.checked_mul(cfg.topk as u64))
+            .and_then(|n| n.checked_mul(4))
+            .context("MiMo expert usage probe overflow")?;
+        devices[0].items.push(Item::new(Category::Workspace, "expert usage route arena", "", bytes.max(256), Basis::Formula));
+    }
     Ok((placement, working))
 }
 

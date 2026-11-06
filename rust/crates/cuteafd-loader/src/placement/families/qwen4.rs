@@ -70,6 +70,14 @@ pub fn request(inputs: &QwenInputs<'_>, graph_bytes: u64) -> anyhow::Result<Plac
     fixed.push(Demand::new(0, Category::Weights, "loaded checkpoint owners", 0, Basis::Exact)
         .with_resident_weights(inputs.loaded_weights));
     fixed.push(Demand::new(0, Category::Runtime, "startup graphs", graph_bytes, Basis::Formula));
+    if crate::placement::expert_usage_enabled() {
+        // The shared route probe's owner-local ring (one GPU here).
+        let bytes = (inputs.admission.layers as u64).checked_mul(crate::families::qwen4::VERIFY_ROWS as u64)
+            .and_then(|n| n.checked_mul(inputs.admission.cfg.topk as u64))
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| anyhow::anyhow!("Qwen expert usage probe overflow"))?;
+        fixed.push(Demand::new(0, Category::Workspace, "expert usage route arena", bytes.max(256), Basis::Formula));
+    }
     if inputs.spark_ranks > 0 && matches!(inputs.baseline, Baseline::Planned { .. }) {
         // Runtime creates SparkLink before sampling free memory. Only the
         // header-only planner still needs to reserve its return planes and codec.
@@ -547,6 +555,16 @@ pub fn dual_request(inputs: &QwenDualInputs<'_>, graph_bytes: [u64; 2]) -> anyho
         fixed.push(Demand::new(gpu as u8, Category::Kv, "owner commit tables", 3 * 64 * 4, Basis::Formula));
         fixed.push(Demand::new(gpu as u8, Category::Runtime, "startup graphs", graph_bytes[gpu], Basis::Formula));
         fixed.push(Demand::new(gpu as u8, Category::Runtime, "loaded code", inputs.pending_code_bytes[gpu], Basis::Formula));
+    }
+    if crate::placement::expert_usage_enabled() {
+        // One shared route probe per owner GPU.
+        let bytes = (a.layers as u64).checked_mul(crate::families::qwen4::VERIFY_ROWS as u64)
+            .and_then(|n| n.checked_mul(a.cfg.topk as u64))
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| anyhow::anyhow!("Qwen dual expert usage probe overflow"))?;
+        for gpu in 0..2u8 {
+            fixed.push(Demand::new(gpu, Category::Workspace, "expert usage route arena", bytes.max(256), Basis::Formula));
+        }
     }
     let pending = (complete.active_state_per_sequence_bytes - previous.active_state_per_sequence_bytes)
         .checked_mul(a.slots).and_then(|n| n.checked_add(complete.fixed_state_bytes - 3 * 64 * 4))

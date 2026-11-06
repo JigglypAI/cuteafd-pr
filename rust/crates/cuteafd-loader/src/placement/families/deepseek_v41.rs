@@ -482,6 +482,10 @@ pub fn request(
 ) -> PlacementRequest {
     let gpus = inventory.gpus.len();
     assert!(experts.len() <= 40, "V4.1 has exactly 40 backbone layers");
+    // V4.1's route capture lives in the router's pinned host `route_ring`, not a
+    // GPU workspace: it is charged in the coordinator host ledger (`charge_host`),
+    // and both callers replace `fixed` wholesale, so a GPU demand here is lost.
+    let fixed = Vec::new();
     PlacementRequest {
         resident_weight_limit: None,
         inventory,
@@ -491,7 +495,7 @@ pub fn request(
         pool,
         pool_bounded: Vec::new(),
         pool_overhead: unit_bytes,
-        fixed: vec![],
+        fixed,
         startup: Vec::new(),
         movables: vec![],
         layers: (0..40)

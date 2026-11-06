@@ -231,7 +231,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let layout = draft.runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
             usize::try_from(context)?, slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?, opts.physical_sms.unwrap_or(188) as usize, 0, opts.mla_kv)?;
         fixed.extend(crate::families::kimi_k3::draft_bridge_demands_for_ranks(&layout, rows, gpus)?);
-        fixed.push(crate::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
+        fixed.push(crate::families::kimi_k3::draft_probe_demand(0, cfg.layers, cfg.topk, 64)?);
         // A K6 vocabulary head has no BF16 operand to borrow: the drafter owns
         // a head-only K6 scratch on the head rank.
         if let Some(manifest) = &manifest {
@@ -260,6 +260,21 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         }
     };
     let record = opts.mla_kv.record_bytes() as u64 * PAGE;
+    if draft.is_none() && crate::placement::expert_usage_enabled() {
+        // Expert usage captures routes without a drafter: one probe per rank, so
+        // each rank rings its own layers on its own device (no P2P copy). This
+        // matches `kimi_k3/startup.rs`, which allocates both ranks' probes.
+        for rank in 0..gpus as u8 {
+            match crate::families::kimi_k3::draft_probe_demand(rank, cfg.layers, cfg.topk, rows.min(64)) {
+                Ok(demand) => fixed.push(demand),
+                Err(error) => {
+                    report.refuse_placement(format!("Kimi expert usage probe refused: {error:#}"),
+                        "Reduce the probe extent or disable EXPERT_USAGE.");
+                    return memory;
+                }
+            }
+        }
+    }
     let layers = (|| -> anyhow::Result<Vec<LayerDemand>> { (0..cfg.layers).map(|layer| {
         let mla = cfg.attention[layer] == crate::families::kimi_k3::config::KimiAttention::Mla;
         let mut weights = ModeBytes { whole: model.mla[layer].split + model.mla[layer].replicated,

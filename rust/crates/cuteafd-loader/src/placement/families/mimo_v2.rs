@@ -477,6 +477,14 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
         }
         pool_overhead.push(costs.pool_unit_bytes.checked_sub(cache.ranks[rank].persistent_unit_bytes)
             .ok_or(PlacementError::Inventory("MiMo pool tables omit layer records"))?);
+        if rank == 0 && crate::placement::expert_usage_enabled() {
+            // The shared route probe's owner-local ring (GPU0 only).
+            let bytes = (layers as u64).checked_mul(crate::families::mimo_v2::decode_graph::MIMO_DECODE_ROWS as u64)
+                .and_then(|n| n.checked_mul(inputs.cfg.topk as u64))
+                .and_then(|n| n.checked_mul(4))
+                .ok_or(PlacementError::Overflow("MiMo expert usage probe"))?;
+            fixed.push(Demand::new(0, Category::Workspace, "expert usage route arena", bytes.max(256), Basis::Formula));
+        }
     }
     fixed.extend(inputs.resident_weights.iter().enumerate().map(|(rank, &weights)|
         Demand::new(rank as u8, Category::Weights, "MiMo selected checkpoint owners", 0, Basis::Exact)

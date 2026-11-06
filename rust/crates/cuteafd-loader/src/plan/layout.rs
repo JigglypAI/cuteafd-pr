@@ -1738,6 +1738,20 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, inpu
             shape.decode_host_workspace_bytes() as u64, Basis::Formula);
         push(Category::Workspace, "v41/engram-row-cache", "two layers' bounded row caches",
             shape.cache_bytes(engram_row_bytes(checkpoint)?) as u64, Basis::Formula);
+        // The router's pinned host route ring: 40 layers x capacity rows x 24 B
+        // per backbone lane. Two decode lanes at the decode width, plus two
+        // lanes per prefill slot at the unit width. This is the storage expert
+        // usage reads; it is allocated whether or not usage is enabled.
+        let decode_rows = crate::placement::families::deepseek_v41::owners::DECODE_LANE_ROWS;
+        let waves = report.prefill_waves.unwrap_or(options.prefill_waves);
+        // The runtime's prefill capacity is `v41_live_rows(chunk)`, at least 256.
+        let capacity = unit_rows.max(256);
+        let ring_rows = 2u64.checked_mul(decode_rows)
+            .and_then(|n| n.checked_add(2u64.checked_mul(waves)?.checked_mul(capacity)?))
+            .context("V4.1 route ring rows overflow")?;
+        let ring = 40u64.checked_mul(ring_rows).and_then(|n| n.checked_mul(24))
+            .context("V4.1 route ring overflow")?;
+        push(Category::Workspace, "v41/route-ring", "pinned host route ids", ring, Basis::Formula);
     }
 
     if family == "qwen4" {

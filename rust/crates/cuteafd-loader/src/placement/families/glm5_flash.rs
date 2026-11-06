@@ -386,6 +386,15 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
         let index_replay = if tails > 0 { local_mla * i.decode_rows * 512 } else { 0 };
         let gpu = rank as u8;
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Runtime, "pending code", i.pending_code.get(rank).copied().unwrap_or(0), Basis::Calibrated));
+        if rank == 0 && crate::placement::expert_usage_enabled() {
+            // The shared route probe's owner-local ring (GPU0 only).
+            let bytes = (i.layers as u64).checked_mul(i.decode_rows)
+                .and_then(|n| n.checked_mul(i.cfg.topk as u64))
+                .and_then(|n| n.checked_mul(4))
+                .ok_or(PlacementError::Overflow("GLM Flash expert usage probe"))?;
+            fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Workspace,
+                "expert usage route arena", bytes.max(256), Basis::Formula));
+        }
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Embedding, "embedding", i.resident[rank].embedding, Basis::Exact)
             .with_resident_weights(ResidentWeights(i.resident[rank].embedding)));
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Weights, "target weights", i.resident[rank].weights, Basis::Exact)
