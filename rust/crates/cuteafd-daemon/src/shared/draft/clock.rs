@@ -53,7 +53,7 @@ impl<'a> LayerClock<'a> {
         let entry = events.pop().expect("entry event");
         Ok(Self { library, events, recorded: vec![false; layers], entry, entry_layer: None })
     }
-    pub fn layers(&self) -> usize { self.events.len() }
+    pub fn layers(&self) -> usize { self.recorded.len() }
     /// Forget the previous pass's marks.
     pub fn reset(&mut self) {
         self.recorded.fill(false);
@@ -162,12 +162,9 @@ impl Drop for HostSpan {
         static MICROS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
         let index = self.stage as usize;
         let micros = self.start.elapsed().as_micros() as u64;
-        let total = MICROS[index].fetch_add(micros, Ordering::Relaxed) + micros;
-        let samples = SAMPLES[index].fetch_add(1, Ordering::Relaxed) + 1;
-        if samples % 64 == 0 {
-            let stage = match self.stage { HostStage::Routes => "routes", HostStage::Observe => "observe", HostStage::Select => "select", HostStage::Publish => "publish" };
-            tracing::info!(stage, samples, mean_us = total as f64 / samples as f64, "draft policy host timing");
-        }
+        // Accumulate only: no per-sample log line on the serving hot path.
+        MICROS[index].fetch_add(micros, Ordering::Relaxed);
+        SAMPLES[index].fetch_add(1, Ordering::Relaxed);
     }
 }
 

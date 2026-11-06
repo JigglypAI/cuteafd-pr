@@ -168,6 +168,7 @@ pub(crate) fn configured_needs_timing() -> bool {
 
 pub(crate) fn configured_needs_routes() -> bool {
     super::draft_mode() == cuteafd_core::DraftMode::Shared || replay_trace().is_some()
+        || crate::shared::expert_usage::enabled()
 }
 
 /// The simple rule's round: the cutoff with its row price and token cost,

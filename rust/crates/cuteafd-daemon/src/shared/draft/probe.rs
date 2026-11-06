@@ -160,12 +160,20 @@ impl<'a> RoundProbe<'a> {
     /// Preserve `layer`'s `rows * topk` router ids with a D2D on `stream`,
     /// behind the router and before its reusable output is overwritten.
     ///
+    /// `extent` is how many rows the source buffer holds (the family's padded
+    /// bucket); the ring itself is laid out at the round's own row count, which
+    /// is what `settle` reads, so a padded bucket never shifts a layer's slot.
+    ///
     /// # Safety
     /// `ids` holds this step's ids of `layer` in stream order on `stream`, the
     /// engine's live stream; the ring is read only after the step's sync.
-    pub unsafe fn ring(&mut self, library: &NativeLibrary, layer: usize, ids: CuteafdDeviceBuffer, rows: usize,
+    pub unsafe fn ring(&mut self, library: &NativeLibrary, layer: usize, ids: CuteafdDeviceBuffer, extent: usize,
         stream: *mut c_void) -> Result<()> {
-        if !self.active || !self.collect_routes || layer >= self.ringed.len() || rows > self.capacity { return Ok(()); }
+        let rows = self.routes.rows();
+        if !self.active || !self.collect_routes || layer >= self.ringed.len() || rows == 0 || rows > self.capacity
+            || rows > extent {
+            return Ok(());
+        }
         let bytes = rows * self.topk * 4;
         let offset = layer * rows * self.topk * 4;
         let arena = self.device_ring.buffer;
@@ -185,6 +193,17 @@ impl<'a> RoundProbe<'a> {
     /// routes (checking it against the staging where both exist) and read the
     /// layer clock. `None` when the round's routes are incomplete or invalid.
     pub fn finish(&mut self) -> Option<(&RoundRoutes, Vec<Option<f64>>)> {
+        self.finish_inner(true)
+    }
+
+    /// As [`finish`](Self::finish), but a layer this probe did not capture is
+    /// left unfilled instead of failing the round. Expert usage records the
+    /// filled layers; a Kimi 2-GPU round splits its layers across two probes.
+    pub fn finish_partial(&mut self) -> Option<(&RoundRoutes, Vec<Option<f64>>)> {
+        self.finish_inner(false)
+    }
+
+    fn finish_inner(&mut self, require_complete: bool) -> Option<(&RoundRoutes, Vec<Option<f64>>)> {
         let _timing = super::clock::HostSpan::new(super::clock::HostStage::Routes);
         self.active = false;
         if !std::mem::take(&mut self.pending) { return None; }
@@ -197,8 +216,8 @@ impl<'a> RoundProbe<'a> {
         }
         if self.error.is_none() {
             let rows = self.routes.rows();
-            if let Err(error) = complete_routes(&mut self.routes, self.ring.bytes(), rows, self.topk, &self.ringed,
-                &self.staged, &mut self.ring_check) {
+            if let Err(error) = settle_routes(&mut self.routes, self.ring.bytes(), rows, self.topk, &self.ringed,
+                &self.staged, &mut self.ring_check, require_complete) {
                 self.error = Some(error);
             }
         }
@@ -211,10 +230,10 @@ impl<'a> RoundProbe<'a> {
 }
 
 /// A policy observation is valid only after both local rings and remote staging settle.
-fn complete_routes(routes: &mut RoundRoutes, ring: &[u8], rows: usize, topk: usize,
-    ringed: &[bool], staged: &[bool], check: &mut RingCheck) -> Result<(), RouteError> {
+fn settle_routes(routes: &mut RoundRoutes, ring: &[u8], rows: usize, topk: usize,
+    ringed: &[bool], staged: &[bool], check: &mut RingCheck, require_complete: bool) -> Result<(), RouteError> {
     settle(routes, ring, rows, topk, ringed, staged, check)?;
-    routes.complete()
+    if require_complete { routes.complete() } else { Ok(()) }
 }
 
 /// Decode the ringed layers of a round (`ring`: layer-major slots of
@@ -416,11 +435,11 @@ mod tests {
         }
         let mut ringed = vec![false; layers];
         let bytes = ring(layers, rows, topk, &local.clone().map(|layer| (layer, ids.clone())).collect::<Vec<_>>());
-        assert_eq!(complete_routes(&mut routes, &bytes, rows, topk, &ringed, &staged,
-            &mut RingCheck::default()), Err(RouteError::Missing(3)));
+        assert_eq!(settle_routes(&mut routes, &bytes, rows, topk, &ringed, &staged,
+            &mut RingCheck::default(), true), Err(RouteError::Missing(3)));
         ringed[local].fill(true);
-        let observation = complete_routes(&mut routes, &bytes, rows, topk, &ringed, &staged,
-            &mut RingCheck::default()).ok().map(|()| {
+        let observation = settle_routes(&mut routes, &bytes, rows, topk, &ringed, &staged,
+            &mut RingCheck::default(), true).ok().map(|()| {
                 let prior = [0.8; 5];
                 let request = [resource::Verified { id: 1, rows, accepted: 4, source: DraftSource::Neural,
                     prior: Some(&prior), features: None, censor: None }];
@@ -458,9 +477,9 @@ mod tests {
             let bytes = ring(layers, rows, topk, &slots);
             let mut missing = ringed.clone();
             missing[2] = false;
-            assert_eq!(complete_routes(&mut routes, &bytes, rows, topk, &missing, &staged,
-                &mut RingCheck::default()), Err(RouteError::Missing(2)));
-            complete_routes(&mut routes, &bytes, rows, topk, &ringed, &staged, &mut RingCheck::default()).unwrap();
+            assert_eq!(settle_routes(&mut routes, &bytes, rows, topk, &missing, &staged,
+                &mut RingCheck::default(), true), Err(RouteError::Missing(2)));
+            settle_routes(&mut routes, &bytes, rows, topk, &ringed, &staged, &mut RingCheck::default(), true).unwrap();
             let geometry = PolicyGeometry {
                 layers: (0..layers).map(|layer| LayerResource { class: Some(if local.contains(&layer) { 0 } else { 1 }),
                     slice_bytes: if local.contains(&layer) { 9e6 } else { 3e6 }, group_rows: 16, timed: layer > 0 }).collect(),
@@ -497,5 +516,47 @@ mod tests {
         let bytes = ring(1, 4, 2, &[(0, vec![70_000, 1])]);
         assert_eq!(settle(&mut routes, &bytes, 4, 2, &[true], &[false], &mut RingCheck::default()),
             Err(RouteError::Id(70_000)));
+    }
+
+    /// The ring is laid out at the round's own row count, not the family's
+    /// padded bucket: a 3-row round in a 64-row probe settles at a 3-row stride.
+    /// A ring written at the padded-bucket stride would shift every layer after
+    /// the first, which is the GLM 5 bug this pins.
+    #[test]
+    fn ring_stride_is_the_round_row_count_not_the_padded_bucket() {
+        let (layers, topk, rows, capacity) = (3usize, 8usize, 3usize, 64usize);
+        let ids: Vec<u32> = (0..rows * topk).map(|i| 100 + i as u32).collect();
+        // What `RoundProbe::ring` writes: layer-major at the round's row stride.
+        let mut round_stride = vec![0u8; layers * rows * topk * 4];
+        for layer in 0..layers {
+            let offset = layer * rows * topk * 4;
+            for (i, id) in ids.iter().enumerate() {
+                round_stride[offset + i * 4..][..4].copy_from_slice(&id.to_le_bytes());
+            }
+        }
+        let mut routes = RoundRoutes::new(layers, topk);
+        routes.begin(rows);
+        settle(&mut routes, &round_stride, rows, topk, &[true; 3], &[false; 3], &mut RingCheck::default()).unwrap();
+        routes.complete().unwrap();
+        for layer in 0..layers {
+            assert_eq!(&routes.flat()[layer * rows * topk..][..rows * topk],
+                ids.iter().map(|&i| i as u16).collect::<Vec<_>>(), "layer {layer}");
+        }
+        // A ring written at the padded-bucket stride is read at the wrong offset
+        // for every layer after the first: the round stride is the only layout
+        // that round-trips.
+        let mut padded = vec![0u8; layers * capacity * topk * 4];
+        for layer in 0..layers {
+            let offset = layer * capacity * topk * 4;
+            for (i, id) in ids.iter().enumerate() {
+                padded[offset + i * 4..][..4].copy_from_slice(&id.to_le_bytes());
+            }
+        }
+        let mut wrong = RoundRoutes::new(layers, topk);
+        wrong.begin(rows);
+        settle(&mut wrong, &padded, rows, topk, &[true; 3], &[false; 3], &mut RingCheck::default()).unwrap();
+        assert_ne!(&wrong.flat()[rows * topk..][..rows * topk],
+            ids.iter().map(|&i| i as u16).collect::<Vec<_>>(),
+            "a padded-bucket ring must not settle as if it were round-strided");
     }
 }
