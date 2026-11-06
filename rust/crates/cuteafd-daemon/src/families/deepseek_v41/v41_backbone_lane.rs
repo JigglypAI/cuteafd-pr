@@ -1396,9 +1396,12 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         self.capture_timing = false;
         self.router.set_ring_capture(false);
     }
-    /// Before a pass: route ids for pricing or replay, timing only for pricing
-    /// or explicit profiling. Always clears the previous pass's marks, so an
-    /// untimed pass reports no layer times rather than stale ones.
+    /// Before a pass: route ids for pricing, replay or expert usage; timing only
+    /// for pricing or explicit profiling. Route capture and layer timing are
+    /// independent: usage-only capture records routes without per-layer CUDA
+    /// events, elapsed queries or retained small graph shapes. Always clears the
+    /// previous pass's marks, so an untimed pass reports no layer times rather
+    /// than stale ones.
     pub fn set_capture(&mut self, capture: Capture) {
         let Capture { routes, timing } = capture;
         self.capture_routes = routes;
@@ -1533,7 +1536,7 @@ mod tests {
         for profiling in [false, true] {
             clock.reset();
             let before = fixture.events()?;
-            let capture = round_capture(Some(&policy), true, true, profiling);
+            let capture = round_capture(Some(&policy), true, true, profiling, false);
             assert!(capture.routes);
             // SAFETY: the CPU fixture accepts a synthetic stream and owns all events.
             unsafe {

@@ -70,6 +70,8 @@ pub(crate) struct EngineArgs {
     pub snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     pub native_lib: PathBuf,
+    #[command(flatten)]
+    pub expert_usage: crate::shared::expert_usage::ExpertUsageArgs,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
     pub manifest: PathBuf,
     /// A manifest published inside the native EXLR8 checkpoint (k2, k3 or k4).

@@ -986,7 +986,7 @@ pub(super) mod tests {
                 for rank in 0..2 { i.fixed.push(startup::code_demand(rank, 71_303_168, 71_303_168, 1)?); }
                 if enabled {
                     i.fixed.extend(super::super::draft::bridge_demands(&draft, i.rows)?);
-                    i.fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
+                    i.fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(0, cfg.layers, cfg.topk, 64)?);
                     i.draft = Some(draft.with_pool_tokens(1 << 20)?);
                 }
                 Ok(i)

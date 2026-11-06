@@ -850,6 +850,35 @@ mod tests {
     }
 
     #[test]
+    fn expert_usage_is_an_opt_in_serve_switch_on_every_family() {
+        use clap::{CommandFactory, Parser};
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        for (flags, usage) in [(vec![], false), (vec!["--expert-usage"], true)] {
+            let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base.into_iter().chain(flags))
+                .unwrap().command else { panic!("expected native serve"); };
+            assert_eq!(args.expert_usage, usage);
+        }
+        // A switch, not a value.
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--expert-usage", "on"])).is_err());
+        // Every family whose serve command captures routes exposes it. Dense
+        // Qwen 3.5 (no routed experts), Step-5 (no route capture yet) and Muse
+        // Spark (no such argument) do not, and `plan` does not (serve switch).
+        let mut cli = super::Cli::command();
+        for name in ["serve-native", "serve-dsv4", "serve-glm", "serve-glmf", "serve-mimo",
+            "serve-qwen4", "serve-kimi"] {
+            let command = cli.find_subcommand_mut(name).unwrap_or_else(|| panic!("missing {name}"));
+            assert!(command.get_arguments().any(|arg| arg.get_long() == Some("expert-usage")), "{name}");
+        }
+        for name in ["serve-qwen35", "serve-step5", "serve-muse"] {
+            let command = cli.find_subcommand_mut(name).unwrap_or_else(|| panic!("missing {name}"));
+            assert!(!command.get_arguments().any(|arg| arg.get_long() == Some("expert-usage")),
+                "{name} must not offer --expert-usage");
+        }
+        let plan = cli.find_subcommand_mut("plan").unwrap();
+        assert!(!plan.get_arguments().any(|arg| arg.get_long() == Some("expert-usage")));
+    }
+
+    #[test]
     fn plan_mimo_prefix_marks_stay_experimental_and_off() {
         use clap::{CommandFactory, Parser};
         let super::Commands::Plan(args) = super::Cli::try_parse_from(
@@ -1242,6 +1271,9 @@ pub(crate) struct NativeServeArgs {
     /// 16 GiB). For checkpoint stores with slow random reads.
     #[arg(long)]
     pub engram_warm: bool,
+    /// Count per-layer x per-expert route hits (turns on route capture).
+    #[arg(long, env = "CUTEAFD_EXPERT_USAGE")]
+    pub expert_usage: bool,
     /// Checked Spark vision replicas; omitted for local RTX fallback.
     #[arg(long)]
     pub vision_peers: Option<String>,

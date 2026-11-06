@@ -450,6 +450,21 @@ fn ngram_history(eos: u32, ngram_size: usize, tokens: &[u32]) -> NgramHistory {
     NgramHistory(history.split_off(history.len() - context))
 }
 
+/// Merge one owner's probe part into the round. `owners` is each layer's owner;
+/// a part only fills its owner's layers. Usage-only capture has no per-layer
+/// timing, so `elapsed` may be empty (never index it directly).
+fn merge_owner_part(routes: &mut crate::shared::draft::routes::RoundRoutes,
+    times: &mut [Option<f64>], owner: usize, owners: &[usize],
+    part: &crate::shared::draft::routes::RoundRoutes, elapsed: &[Option<f64>], topk: usize) -> Option<()> {
+    if owner == 0 { routes.begin(part.rows()); }
+    for (index, _) in owners.iter().enumerate().filter(|(_, &owner_of)| owner_of == owner) {
+        let words = part.rows() * topk;
+        routes.push_narrow(index, &part.flat()[index * words..][..words]).ok()?;
+        times[index] = elapsed.get(index).copied().flatten();
+    }
+    Some(())
+}
+
 #[cfg(test)]
 mod tests {
     use cuteafd_loader::families::qwen4::NgramHasher;
@@ -477,6 +492,34 @@ mod tests {
         assert!(negative.iter().map(|depth| depth + 1).sum::<usize>() > DECODE_ROWS);
         assert!(trim_budget(&mut negative, DECODE_ROWS));
         Ok(())
+    }
+
+    /// A 2-GPU round with usage-only capture has no per-layer timing: each
+    /// owner's `elapsed` is empty and the merge must not index it.
+    #[test]
+    fn two_gpu_untimed_merge_uses_empty_elapsed() {
+        use crate::shared::draft::routes::RoundRoutes;
+        let (layers, topk, rows) = (4usize, 10usize, 2usize);
+        let owners = [0usize, 1, 0, 1];
+        let mut zero = RoundRoutes::new(layers, topk);
+        zero.begin(rows);
+        zero.push_rows(0, &[[1; 10], [2; 10]], u32::MAX).unwrap();
+        zero.push_rows(2, &[[3; 10], [4; 10]], u32::MAX).unwrap();
+        let mut one = RoundRoutes::new(layers, topk);
+        one.begin(rows);
+        one.push_rows(1, &[[5; 10], [6; 10]], u32::MAX).unwrap();
+        one.push_rows(3, &[[7; 10], [8; 10]], u32::MAX).unwrap();
+        let empty: [Option<f64>; 0] = [];
+        let mut merged = RoundRoutes::new(layers, topk);
+        let mut times = vec![None; layers];
+        super::merge_owner_part(&mut merged, &mut times, 0, &owners, &zero, &empty, topk).expect("owner 0");
+        super::merge_owner_part(&mut merged, &mut times, 1, &owners, &one, &empty, topk).expect("owner 1");
+        assert_eq!(merged.rows(), rows);
+        assert_eq!(times, vec![None; layers]);
+        assert_eq!(merged.flat()[0], 1);
+        assert_eq!(merged.flat()[1 * rows * topk], 5);
+        assert_eq!(merged.flat()[2 * rows * topk], 3);
+        assert_eq!(merged.flat()[3 * rows * topk], 7);
     }
 
     #[test]
@@ -1840,18 +1883,14 @@ impl<'a> Qwen4Engine<'a> {
             let (routes, times) = probe.finish()?;
             return Some(observe(routes, &times));
         }
+        let owners: Vec<usize> = self.state_map.layers.iter().map(|layer| layer.owner).collect();
         let mut routes = crate::shared::draft::routes::RoundRoutes::new(self.cfg.layers, self.cfg.topk);
         let mut times = vec![None; self.cfg.layers];
         for (owner, probe) in probes.iter_mut().enumerate() {
             let device = probe.device;
             let _scope = device.enter().ok()?;
             let (part, elapsed) = probe.finish()?;
-            if owner == 0 { routes.begin(part.rows()); }
-            for (index, _) in self.state_map.layers.iter().enumerate().filter(|(_, layer)| layer.owner == owner) {
-                let words = part.rows() * self.cfg.topk;
-                routes.push_narrow(index, &part.flat()[index * words..][..words]).ok()?;
-                times[index] = elapsed[index];
-            }
+            merge_owner_part(&mut routes, &mut times, owner, &owners, part, &elapsed, self.cfg.topk)?;
         }
         Some(observe(&routes, &times))
     }

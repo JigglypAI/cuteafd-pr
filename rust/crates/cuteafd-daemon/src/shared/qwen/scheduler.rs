@@ -783,6 +783,10 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         let prefills = decode_share.queue::<Prefill<'_, B::Placement, B::Draft>>()?;
         Ok((family, cache, markers, grammars, tokenizer, selector, shared, trace, prefills))
     }, initialized)?;
+    // Expert usage needs route capture even without a draft policy.
+    if shared.is_none() && crate::shared::expert_usage::enabled() {
+        engine.arm_draft_probe()?;
+    }
     let mut free_slots: Vec<i32> = (0..geometry.slots as i32).rev().collect();
     let mut active: Vec<Active<'_, B::Placement, B::Draft>> = Vec::new();
     // Decoding requests waiting for KV pages: they keep their slot and units, skip rounds.
@@ -1518,11 +1522,18 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
                 prior: Some(neural_confidence[i].as_slice()), features: None, censor }
         }).collect();
         let times = round_clock.observe();
-        if let Some(Err(error)) = engine.probe_finish(|routes, layer_us| resource::observe_drafted(shared,
-            &requests, routes, layer_us, times, drafted_width, predicted, Some(drafted_requests))) {
+        if let Some(Err(error)) = engine.probe_finish(|routes, layer_us| {
+            if crate::shared::expert_usage::enabled() {
+                crate::shared::expert_usage::record_committed(routes, &requests);
+            }
+            resource::observe_drafted(shared, &requests, routes, layer_us, times, drafted_width, predicted, Some(drafted_requests))
+        }) {
             tracing::debug!(%error, "Qwen draft round not observed");
         }
         resource::publish(shared, shared.stats().rounds, 0, None);
+    } else if crate::shared::expert_usage::enabled() {
+        // No draft policy: still count this successful round's routes.
+        let _ = engine.probe_finish(|routes, _| crate::shared::expert_usage::record(routes));
     }
     for (i, request) in active.iter().enumerate() {
         tally.member(&request.ticket, &proposals[i], sequences[i].len() - 1, &request.history[before[i]..],

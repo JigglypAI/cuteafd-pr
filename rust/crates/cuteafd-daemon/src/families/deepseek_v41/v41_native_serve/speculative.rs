@@ -172,7 +172,8 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     /// What a verification round records: see [`round_capture`].
     pub fn capture(&self) -> Capture {
         round_capture(self.policy.as_ref(), super::console::live().is_some(),
-            crate::shared::draft::binding::replay_trace().is_some(), crate::shared::draft::timing_profile())
+            crate::shared::draft::binding::replay_trace().is_some(), crate::shared::draft::timing_profile(),
+            crate::shared::expert_usage::enabled())
     }
     fn wants_confidence(&self) -> bool {
         self.policy.is_some() || tracing::enabled!(target: "cuteafd::draft_policy", tracing::Level::DEBUG)
@@ -680,10 +681,12 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
 
 /// Observers use host round timestamps. Replay routes are read after the pass;
 /// only resource pricing or an explicit timing profile requests layer events.
+/// Expert usage captures routes without timing: it must not force per-layer
+/// CUDA events or retained graph shapes.
 pub(crate) fn round_capture(policy: Option<&cuteafd_core::DraftPolicy>, _console_live: bool,
-    replay: bool, profiling: bool) -> Capture {
-    let Some(policy) = policy else { return Capture { routes: false, timing: profiling } };
-    Capture { routes: policy.needs_routes() || replay, timing: policy.needs_routes() || profiling }
+    replay: bool, profiling: bool, usage: bool) -> Capture {
+    let Some(policy) = policy else { return Capture { routes: usage, timing: profiling } };
+    Capture { routes: policy.needs_routes() || replay || usage, timing: policy.needs_routes() || profiling }
 }
 
 #[cfg(test)]
@@ -701,15 +704,21 @@ mod restored_prefix_tests {
             for watched in [false, true] {
                 for replay in [false, true] {
                     for profiling in [false, true] {
-                        assert_eq!(round_capture(Some(&policy), watched, replay, profiling),
+                        assert_eq!(round_capture(Some(&policy), watched, replay, profiling, false),
                             Capture { routes: priced || replay, timing: priced || profiling },
                             "{mode:?} fixed={fixed} watched={watched} replay={replay} profiling={profiling}");
+                        // Usage forces routes but not timing on an unpriced policy.
+                        assert_eq!(round_capture(Some(&policy), watched, replay, profiling, true),
+                            Capture { routes: true, timing: priced || profiling },
+                            "{mode:?} fixed={fixed} usage watched={watched} replay={replay} profiling={profiling}");
                     }
                 }
             }
         }
-        assert_eq!(round_capture(None, true, false, false), Capture::default());
-        assert_eq!(round_capture(None, true, false, true), Capture { routes: false, timing: true });
+        assert_eq!(round_capture(None, true, false, false, false), Capture::default());
+        assert_eq!(round_capture(None, true, false, true, false), Capture { routes: false, timing: true });
+        // Expert usage captures routes without layer timing.
+        assert_eq!(round_capture(None, false, false, false, true), Capture { routes: true, timing: false });
     }
     #[tokio::test]
     async fn console_subscriber_keeps_capture_timing_off_unless_profiled() {
@@ -724,8 +733,8 @@ mod restored_prefix_tests {
             .uri("/v1/console/events").body(axum::body::Body::empty()).unwrap()).await.unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         assert_eq!(hub.viewers(), 1, "a real console subscriber must be counted");
-        assert!(!round_capture(None, hub.viewers() > 0, false, false).timing);
-        assert!(round_capture(None, hub.viewers() > 0, false, true).timing);
+        assert!(!round_capture(None, hub.viewers() > 0, false, false, false).timing);
+        assert!(round_capture(None, hub.viewers() > 0, false, true, false).timing);
         drop(response);
         assert_eq!(hub.viewers(), 0);
     }

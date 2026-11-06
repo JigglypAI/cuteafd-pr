@@ -156,13 +156,19 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let mut fixed = if RANKS == 2 { exchange_demands(unit, diagnostics)? } else { vec![] };
     if let Some(layout) = &draft_layout {
         fixed.extend(cuteafd_loader::families::kimi_k3::draft_bridge_demands_for_ranks(layout, rows, RANKS)?);
-        fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, rows.min(64))?);
+        fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(0, cfg.layers, cfg.topk, rows.min(64))?);
         if core.projections.contains_key("language_model.lm_head") {
             if let Some(mut demand) = cuteafd_loader::families::kimi_k3::core::draft_head_demand(&core,
                 layout.capacity().block_rows, programs.family_metadata("dense_trellis_k6")?)? {
                 demand.gpu = head as u8;
                 fixed.push(demand);
             }
+        }
+    } else if crate::shared::expert_usage::enabled() {
+        // Expert usage captures routes without a drafter: one probe per rank, so
+        // each rank rings its own layers on its own device (no P2P copy).
+        for rank in 0..RANKS as u8 {
+            fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(rank, cfg.layers, cfg.topk, rows.min(64))?);
         }
     }
     let selected = cuteafd_loader::placement::ProgramSet::from_names(

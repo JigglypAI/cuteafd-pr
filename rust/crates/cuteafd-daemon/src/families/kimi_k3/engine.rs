@@ -18,8 +18,7 @@ struct Lanes<'a> {
 pub(crate) struct Engine<'a> {
     pub max_pool_tokens_no_onboard: Option<u64>,
     draft: Option<Rc<super::draft::NativeDraft<'a>>>,
-    draft_probe: RefCell<Option<crate::shared::memory::device::DeviceOwner<'a,
-        crate::shared::draft::probe::RoundProbe<'a>>>>,
+    draft_probe: super::layers::DraftProbes<'a>,
     execution: Execution<'a>,
     lanes: RefCell<Lanes<'a>>,
     prefix: RefCell<Option<super::prefix::KimiPrefix<'a>>>,
@@ -243,9 +242,16 @@ impl<'a> Engine<'a> {
                 std::array::from_fn::<_, RANKS, _>(|rank| owners[rank].as_ref().map_or(&[][..], |e| e.layers())))?;
         }
         // Admission charged this arena before allocation; retain its exact device owner.
-        let draft_probe = draft.as_ref().map(|_| devices[0].own(||
-            crate::shared::draft::probe::RoundProbe::new(devices[0].library,
-                local[0][0].config().dense.clone(), local[0][0].config().topk, 64))).transpose()?;
+        // Expert usage captures routes without a drafter, so allocate it here too
+        // (before bind) rather than lazily after the engine is bound. Usage-only
+        // keeps one probe per rank so each rings its own layers (no P2P copy).
+        let usage_only = draft.is_none() && crate::shared::expert_usage::enabled();
+        let probe_on = |device: crate::shared::memory::device::Device<'a>| device.own(||
+            crate::shared::draft::probe::RoundProbe::new(device.library,
+                local[0][0].config().dense.clone(), local[0][0].config().topk, 64));
+        let main = (draft.is_some() || usage_only).then(|| probe_on(devices[0])).transpose()?;
+        let peer_probe = usage_only.then(|| probe_on(devices[1])).transpose()?;
+        let draft_probe = super::layers::DraftProbes { main: RefCell::new(main), peer: RefCell::new(peer_probe) };
         // Weak admission registries must not outlive these strong startup owners
         // until every persistent local binding has acquired the same operands.
         if let Some(draft) = draft.as_mut() { draft.bind_target_ranks(weights.global.clone(), programs[RANKS - 1].clone())?; }
@@ -259,7 +265,7 @@ impl<'a> Engine<'a> {
             local, routed, io, experts, prefill, coordinator_packing_cap)?;
         engine.max_pool_tokens_no_onboard = admission.placement.max_pool_tokens_no_onboard;
         engine.draft = draft.map(Rc::new);
-        *engine.draft_probe.borrow_mut() = draft_probe;
+        engine.draft_probe = draft_probe;
         Ok(engine)
     }
 
@@ -289,7 +295,7 @@ impl<'a> Engine<'a> {
         let streams = local.iter().map(|ranks| ranks.iter().map(|local| local.stream().clone()).collect()).collect();
         let execution = Execution::new(plan, peer.as_ref(), hops.as_ref(), exchange_streams.clone(), streams)?;
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill.waves, prefill.unit_rows)?;
-        Ok(Self { max_pool_tokens_no_onboard: None, depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
+        Ok(Self { max_pool_tokens_no_onboard: None, depth, draft: None, draft_probe: super::layers::DraftProbes::default(), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
             prefix: RefCell::new(None), startup_captures: Cell::new(None), provisional: RefCell::new(None),
             hops, peer, terminal: Cell::new(TerminalState::Active), exchange_streams, prefill, packed_row_cap: Cell::new(None), coordinator_packing_cap })
     }
@@ -408,22 +414,48 @@ impl<'a> Engine<'a> {
 
     pub(crate) fn arm_draft_probe(&self) -> Result<()> {
         self.require_live()?;
-        ensure!(self.draft_probe.borrow().is_some(), "Kimi draft policy probe was not admitted");
+        // The probe (draft policy or expert usage) is allocated at load, before bind.
+        ensure!(self.draft_probe.main.borrow().is_some(), "Kimi draft policy probe was not admitted");
         Ok(())
     }
     pub(crate) fn probe_begin(&self, rows: usize) {
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.begin(rows); }
+        if let Some(probe) = self.draft_probe.main.borrow_mut().as_mut() { probe.begin(rows); }
+        if let Some(probe) = self.draft_probe.peer.borrow_mut().as_mut() { probe.begin(rows); }
     }
     pub(crate) fn probe_end(&self) {
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.end(); }
+        if let Some(probe) = self.draft_probe.main.borrow_mut().as_mut() { probe.end(); }
+        if let Some(probe) = self.draft_probe.peer.borrow_mut().as_mut() { probe.end(); }
     }
     pub(crate) fn probe_finish<T>(&self, observe: impl FnOnce(&crate::shared::draft::routes::RoundRoutes,
         &[Option<f64>]) -> T) -> Option<T> {
-        let mut probe = self.draft_probe.borrow_mut();
-        let probe = probe.as_mut()?;
-        let device = probe.device;
-        device.run(|| Ok(probe.finish().map(|(routes, times)| observe(routes, &times))))
-            .unwrap_or_else(|error| { tracing::debug!(%error, "Kimi draft probe read failed"); None })
+        use crate::shared::draft::routes::RoundRoutes;
+        let probes = &self.draft_probe;
+        let has_peer = probes.peer.borrow().is_some();
+        let mut main = probes.main.borrow_mut();
+        let main = main.as_mut()?;
+        let device = main.device;
+        let (main_routes, times) = device.run(|| Ok(if has_peer { main.finish_partial() } else { main.finish() }))
+            .unwrap_or_else(|error| { tracing::debug!(%error, "Kimi draft probe read failed"); None })?;
+        if !has_peer { return Some(observe(main_routes, &times)); }
+        let mut peer = probes.peer.borrow_mut();
+        let peer = peer.as_mut()?;
+        let peer_device = peer.device;
+        let (peer_routes, _) = peer_device.run(|| Ok(peer.finish_partial()))
+            .unwrap_or_else(|error| { tracing::debug!(%error, "Kimi peer draft probe read failed"); None })?;
+        // Each probe filled its own rank's layers; merge them into one round.
+        let mut merged = RoundRoutes::new(main_routes.layers(), main_routes.topk());
+        merged.begin(main_routes.rows());
+        for layer in 0..main_routes.layers() {
+            if main_routes.is_dense(layer) { let _ = merged.dense(layer); }
+            else if main_routes.is_filled(layer) {
+                let words = main_routes.rows() * main_routes.topk();
+                let _ = merged.push_narrow(layer, &main_routes.flat()[layer * words..][..words]);
+            } else if peer_routes.is_filled(layer) {
+                let words = peer_routes.rows() * peer_routes.topk();
+                let _ = merged.push_narrow(layer, &peer_routes.flat()[layer * words..][..words]);
+            }
+        }
+        Some(observe(&merged, &times))
     }
 
     pub(crate) fn native_draft(&self) -> Option<&super::draft::NativeDraft<'a>> { self.draft.as_deref() }

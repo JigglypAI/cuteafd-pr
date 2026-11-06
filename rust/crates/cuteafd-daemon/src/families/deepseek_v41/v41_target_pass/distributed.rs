@@ -338,13 +338,16 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             device.run(|| { lane.set_capture(capture); Ok(()) })?;
         }
         self.resources.capture_routes = capture.routes;
-        if enabled {
+        if capture.routes {
+            for rows in &mut self.resources.route_capture { rows.clear(); }
+        }
+        if capture.timing {
             // Match the single-GPU pass: adaptive row changes must retain the
             // index projection and selection graphs on both owning devices.
+            // Usage-only capture (routes without timing) must not retain them.
             for index in self.resources.indices.iter_mut().flatten() {
                 index.get_mut().enable_small_graph_shapes();
             }
-            for rows in &mut self.resources.route_capture { rows.clear(); }
         }
         Ok(())
     }

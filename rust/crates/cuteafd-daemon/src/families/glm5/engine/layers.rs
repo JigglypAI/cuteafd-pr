@@ -347,6 +347,9 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
             return Ok(Ticket::Complete);
         }
         self.segment(0, index, GlmOwnedPhase::FfnFront, || e.moe_front(w, layer, self.rows()))?;
+        // The router ran inside the (possibly replayed) segment: preserve its ids
+        // outside the graph, before the next layer's router reuses the output.
+        e.probe_ring(index, w, self.rows())?;
         let real = self.tables[0].exchange_rows;
         if e.skip.is_some() { return Ok(Ticket::Skip(e.moe_skip(w, index, layer, real, self.cap())?)); }
         let decode = self.tables[0].decode;

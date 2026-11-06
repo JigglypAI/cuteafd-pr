@@ -760,6 +760,17 @@ impl<'a> GlmEngine<'a> {
         Ok(())
     }
 
+    /// Queue layer `index`'s router ids into the draft probe's ring right
+    /// behind the router. Spark layers ring too: their routes reach the host
+    /// only on the exchange worker, after the post.
+    fn probe_ring(&self, index: usize, w: &Workspace<'_>, t: usize) -> Result<()> {
+        let mut probe = self.draft_probe.borrow_mut();
+        let Some(probe) = probe.as_mut().filter(|probe| probe.wants_ring(false)) else { return Ok(()) };
+        // SAFETY: the router just wrote `t` rows of ids into `route_ids` on this stream;
+        // the ring is read after the step's sync.
+        unsafe { probe.ring(self.library, index, w.route_ids.buffer, t, self.stream) }
+    }
+
     pub(crate) fn probe_begin(&self, rows: usize) {
         if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.begin(rows); }
     }
@@ -1892,6 +1903,11 @@ impl<'a> GlmEngine<'a> {
             let key = GraphKey { layer: index, rows: t, table_width: tables.table_width,
                 table_stride: tables.table_stride, previous, head: head && layer.is_none() };
             self.replay_on(0, key, segment)?;
+            // The router ran inside the replayed segment: preserve its ids outside
+            // the graph, before the next layer's router reuses the output. Local
+            // layers (TP2 and whole owners) ring once in `local_ffn`
+            // (`ring_local_routes`), so skip the duplicate D2D here.
+            if layer.is_some_and(|layer| !layer.dense && !self.local_layer(index)) { self.probe_ring(index, w, t)?; }
             if let (Previous::Planes(_), None, Some((transport, _))) = (previous, &self.skip, experts.as_mut()) {
                 // The segment just queued reduced the previous layer's planes.
                 transport.exchange()?.consumed(0, self.stream)?;
@@ -2137,6 +2153,9 @@ impl<'a> GlmEngine<'a> {
         }
         if self.spark_bf16 && !self.tp2.as_ref().is_some_and(|p| p.uses_fp8_input())
             && !self.whole.as_ref().is_some_and(|owner| owner.uses_fp8_input()) { return Ok(()); }
+        // Routes are rung by the caller, outside any captured segment: a ring
+        // inside a replayed graph closure never runs on replay. See
+        // `decode_layers` and `Bindings::begin_ffn`.
         let grid = self.quantize_grid.blocks(t, h);
         self.run_on(rank, &self.family_program("expert_input_quant"), &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
             // SAFETY: the scale rows follow the payload inside each wire row.

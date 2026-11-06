@@ -835,6 +835,12 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     }
     let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
     let _stall_watch = stall::spawn();
+    // Opt-in per-layer x per-expert route counters.
+    crate::shared::expert_usage::install_stats_provider();
+    if args.expert_usage {
+        let geometry = cuteafd_core::expert_geometry();
+        crate::shared::expert_usage::enable(geometry.experts, geometry.layers);
+    }
     let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency).map(|_| None).collect();
     let mut compiler = crate::shared::constraints::Compiler::new(lib, args.snapshot.join("tokenizer.json"), VOCAB);
     let mut id = 0u64;
@@ -2067,7 +2073,9 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     let started = Instant::now();
     ensure!(!members.is_empty() && members.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS, "invalid single decode lane");
     let speculative = draft.is_some();
-    let capture = draft.as_deref().map(DraftRuntime::capture).unwrap_or_default();
+    let usage = crate::shared::expert_usage::enabled();
+    let capture = draft.as_deref().map(DraftRuntime::capture)
+        .unwrap_or(Capture { routes: usage, timing: false });
     // Speculative rows vary every round: keep each decode shape's graphs,
     // whether or not this policy captures routes.
     if draft.as_deref().is_some_and(DraftRuntime::has_policy) { pass.retain_small_graph_shapes(); }
@@ -2146,6 +2154,9 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         let (accepted, emitted, emissions, accepted_inputs) = commit_lane(lib, lane, pass, requests,
             active, members, &inputs, &mut batch, &next, draft.as_deref_mut(), 0,
             Some(&round), retain_enabled)?;
+        // Only a successful round's committed rows describe anything.
+        if usage { crate::shared::expert_usage::record_capture_committed(pass.captured_routes(),
+            &inputs, &accepted_inputs); }
         let live = console::live();
         // A loop abort can cut a round's emission short: count only what was
         // actually emitted, not the accepted-but-unemitted tail.
@@ -2195,6 +2206,9 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         let (accepted, emitted, emissions, accepted_inputs) = commit_lane(lib, lane, pass, requests,
             active, members, &inputs, &mut batch, &next, draft.as_deref_mut(),
             executed_us-prepared_us, None, retain_enabled)?;
+        // Only a successful round's committed rows describe anything.
+        if usage { crate::shared::expert_usage::record_capture_committed(pass.captured_routes(),
+            &inputs, &accepted_inputs); }
         let live = console::live();
         // A loop abort can cut a round's emission short: count only what was
         // actually emitted, not the accepted-but-unemitted tail.

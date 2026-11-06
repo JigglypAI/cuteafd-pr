@@ -42,6 +42,8 @@ pub(crate) struct EngineArgs {
     pub exlr8_prefill_activations: Exlr8PrefillActivations,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     pub native_lib: PathBuf,
+    #[command(flatten)]
+    pub expert_usage: crate::shared::expert_usage::ExpertUsageArgs,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
     pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)]

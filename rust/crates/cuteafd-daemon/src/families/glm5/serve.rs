@@ -248,6 +248,7 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
             return Ok(());
         }
     };
+    crate::shared::expert_usage::enable_from_flag(args.expert_usage.expert_usage);
     // Retain the early tower allocation receipt for the joint LM recipe.
     let (mut vision, prefix) = match ml4_media::ReadyVision::load(args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
         Ok(vision) => vision,
@@ -660,6 +661,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             else { resource::Prior::Selector(d.selector_fit("glm5", false)?) };
         SharedPolicy::with_geometry(geometry, prior, draft_seed())
     }).transpose()?;
+    // Expert usage needs route capture even without a draft policy.
+    if shared.is_none() && crate::shared::expert_usage::enabled() {
+        engine.arm_draft_probe()?;
+    }
     let mut active: Vec<Active<'_>> = Vec::new();
     // Decoding requests waiting for KV pages: they keep their slot and pages, skip rounds.
     let mut stalled: Vec<Active<'_>> = Vec::new();
@@ -1381,13 +1386,20 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
                 censor }
         }).collect();
         let times = round_clock.observe();
-        if let Some(Err(error)) = engine.probe_finish(|routes, layer_us| resource::observe_drafted(
-            &mut shared.policy, &requests, routes, layer_us, times, drafted_width, predicted, Some(drafted_requests))) {
+        if let Some(Err(error)) = engine.probe_finish(|routes, layer_us| {
+            if crate::shared::expert_usage::enabled() {
+                crate::shared::expert_usage::record_committed(routes, &requests);
+            }
+            resource::observe_drafted(&mut shared.policy, &requests, routes, layer_us, times, drafted_width, predicted, Some(drafted_requests))
+        }) {
             tracing::debug!(%error, "GLM draft round not observed");
         }
         if shared.policy.stats().rounds % 32 == 1 {
             resource::publish(&shared.policy, shared.policy.stats().rounds, 0, None);
         }
+    } else if crate::shared::expert_usage::enabled() {
+        // No draft policy: still count this successful round's routes.
+        let _ = engine.probe_finish(|routes, _| crate::shared::expert_usage::record(routes));
     }
     for (i, request) in active.iter().enumerate() {
         let proposal = &sequences[i][1..];

@@ -266,6 +266,9 @@ fn with_backend<T>(args: &ServeArgs,
     let format = super::experts::StepExperts::from_catalog(&catalog)?;
     cuteafd_core::set_expert_geometry(ExpertGeometry::STEP5)
         .map_err(|_| anyhow::anyhow!("Step-5 serving requires an isolated process"))?;
+    // Step-5 has no route capture yet: expose the stats object but never enable
+    // the matrix (it would report `enabled: true` with a matrix that stays zero).
+    crate::shared::expert_usage::install_stats_provider();
     let metadata = cuteafd_loader::plan::checkpoint::read_json(&format.package_manifest(&args.native_lib)?)?;
     let exports = format.exports(&metadata)?;
     // SAFETY: this owner outlives all programs, native lanes, transports and allocations.

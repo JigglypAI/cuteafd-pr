@@ -12,6 +12,8 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "fp8")] pub kv_cache: cuteafd_core::MlaCacheFormat,
     #[arg(long)] pub snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
+    #[command(flatten)]
+    pub expert_usage: crate::shared::expert_usage::ExpertUsageArgs,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)] pub device: i32,
     /// Optional distinct physical peer; absent serves the full model on --device.
@@ -138,6 +140,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         let result = (|| -> Result<()> {
             cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
                 .map_err(|_| anyhow::anyhow!("Kimi serving needs an isolated process"))?;
+            crate::shared::expert_usage::enable_from_flag(worker_args.expert_usage.expert_usage);
             let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&worker_args.snapshot, false, false)?;
             let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
             cfg.release_geometry()?;
