@@ -109,6 +109,7 @@ pub(crate) fn routed_ffn(kernels: &Kernels<'_>, owner: &UnitOwner<'_>, target: &
     unsafe { kernels.quant.launch(&[owner.buffer("projection_input")?.ptr, wire.ptr,
         wire.ptr.cast::<u8>().wrapping_add(cfg.hidden).cast(), wire.ptr],
         &[cuteafd_ffi::programs::Scalar::I32(rows as i32), cuteafd_ffi::programs::Scalar::I32(grid as i32)], owner.stream.raw)?; }
+    owner.tap("expert_wire", wire)?;
     experts.enqueue(owner.buffer("expert_wire")?, owner.buffer("route_ids")?, owner.buffer("route_weights")?,
         owner.buffer("expert_output")?, rows, &owner.stream)
 }
