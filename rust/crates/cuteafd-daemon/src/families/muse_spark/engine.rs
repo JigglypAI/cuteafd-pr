@@ -154,7 +154,7 @@ impl<'a> RankResources<'a> {
         let has_head = globals.head.is_some() || globals.head_bf16.is_some() || globals.head_native.is_some();
         let head = if has_head {
             let (stored, trimmed) = cuteafd_loader::families::muse_spark::lane::head_planes(
-                actual_core.head_outputs(cfg), cfg.vocab_size)?;
+                globals.stored_head_outputs(cfg.vocab_size), cfg.vocab_size)?;
             Some((Allocation::new(device, stored, Tag::workspace("muse/head-logits"))?,
                 Allocation::new(device, trimmed, Tag::workspace("muse/head-logits"))?))
         } else { None };

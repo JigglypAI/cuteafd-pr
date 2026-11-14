@@ -385,6 +385,14 @@ mod tests {
         let weights = GlobalWeights { final_norm:Allocation::new(device,256,crate::shared::memory::TEST)?,
             head:None,head_bf16:None,head_native:Some(native) };
         assert_eq!(weights.stored_head_outputs(cfg.vocab_size),202112);
+        let mut core = cuteafd_loader::families::muse_spark::core::CoreInventory::default();
+        core.native.insert("lm_head".into(), cuteafd_loader::formats::native_attention::NativeProjection {
+            shape: [202112, cfg.hidden], fp8: true, split: CoreSplit::Whole });
+        let global = cuteafd_loader::families::muse_spark::weight_layout::GlobalLayout::new(&cfg, &core)?;
+        assert_eq!(global.stored_head_outputs(cfg.vocab_size), weights.stored_head_outputs(cfg.vocab_size));
+        assert_eq!(core.head_outputs(&cfg), weights.stored_head_outputs(cfg.vocab_size));
+        let admitted = cuteafd_loader::families::muse_spark::lane::head_planes(
+            global.stored_head_outputs(cfg.vocab_size), cfg.vocab_size)?;
         for name in ["radixark.json","nvidia.json"] {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("src/families/muse_spark/fixtures/drafters").join(name);
@@ -404,6 +412,10 @@ mod tests {
             assert_eq!(staged.bytes, rows * 202112 * 4);
             assert_eq!(trimmed.bytes, rows * cfg.vocab_size * 4);
             assert_eq!(logits.bytes, trimmed.bytes);
+            if rows == cuteafd_loader::families::muse_spark::lane::HEAD_ROWS {
+                assert_eq!((staged.bytes, trimmed.bytes), admitted,
+                    "admitted head planes must equal runtime owner bytes");
+            }
             assert!(super::super::forward::head_planes(&cfg, &weights, rows,
                 owner(rows * cfg.vocab_size * 4), trimmed_owner).unwrap_err()
                 .to_string().contains("owner too small"));
