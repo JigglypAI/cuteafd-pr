@@ -54,6 +54,11 @@ fn strip_model_prefix(name: &str) -> Option<&str> {
 
 impl Family for Glm {
     fn eager_native_core_headers(&self) -> bool { true }
+    fn fp8_prefill_groups(&self) -> &'static [crate::plan::fp8_prefill::Group] {
+        use crate::plan::fp8_prefill::GLMF_GROUPS;
+        if self.id == "glm5_flash" { GLMF_GROUPS }
+        else { &[] }
+    }
     fn native_head_widths(&self) -> &'static [usize] {
         if self.id == "glm5_flash" { crate::families::glm5_flash::core::NATIVE_CORE_WIDTHS }
         else { crate::families::glm5::core::NATIVE_CORE_WIDTHS }
