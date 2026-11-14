@@ -433,6 +433,8 @@ historical recipe; new release launches use the v5 matrix.
 
 ## Qwen 3.5 / 3.8 dense
 
+- 2026-11-15 · Two-RTX qualification, target-only / dSpark · Qwen/Qwen3.8-27B BF16, FP8 KV, C16, 0 Sparks · 1× / 2× RTX PRO 6000, unchanged gpu-powerd policy · build 9f13fc5f8 · [1 RTX target-only](qwen3_5/2026-11-15-tp2-qualification-1rtx-nospec/report.svg), [2 RTX target-only](qwen3_5/2026-11-15-tp2-qualification-2rtx-nospec/report.svg), [1 RTX dSpark](qwen3_5/2026-11-15-tp2-qualification-1rtx-dspark/report.svg), [2 RTX dSpark](qwen3_5/2026-11-15-tp2-qualification-2rtx-dspark/report.svg). Compare each speculation mode independently: prompt hashes match 132/132 target-only and 135/135 dSpark; the four-way grouping refusal is tracked in #2139. Requested C1/C16/exact-8192 sweep phases have no reclaim or memory PSI; some dSpark baseline phases are reclaim-contaminated (PR #2134). No thermal slowdown; power-cap slowdown is recorded in each sweep. Defaults remain one RTX.
+
 - 2026-11-10 · Release smoke · Qwen/Qwen3.8-27B-FP8 · 1× RTX PRO 6000 @ gpu-powerd 500 W (450–600) · build v5.0.0-rc1 · [report](qwen3_5/2026-11-10-smoke-qwen3-8-27b-fp8-1rtx-qwen38-27b-fp8-min/report.svg)
 - 2026-11-10 · Release smoke · Qwen/Qwen3.8-27B · 1× RTX PRO 6000 @ gpu-powerd 505 W (450–600) · build v5.0.0-rc1 · [report](qwen3_5/2026-11-10-smoke-qwen3-8-27b-1rtx-qwen38-27b-bf16-min/report.svg)
 - 2026-11-10 · Release smoke · Qwen/Qwen3.5-9B · 1× RTX PRO 6000 @ gpu-powerd 480 W (450–600) · build v5.0.0-rc1 · [report](qwen3_5/2026-11-10-smoke-qwen3-5-9b-1rtx-qwen35-9b-bf16-min/report.svg)

@@ -1,0 +1,1964 @@
+{
+  "prompt_content": "realistic-v1",
+  "points": [
+    {
+      "c": 1,
+      "phase": "levels",
+      "aggregate_tok_s": 77.54795141339235,
+      "per_request_tok_s": 77.54795141339235,
+      "ttft_s": 0.081650034,
+      "errors": 0,
+      "thermal": {
+        "from_s": 308.959,
+        "to_s": 312.381,
+        "seconds": 3.422,
+        "gpus": [
+          {
+            "index": 0,
+            "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+            "pci_bus_id": "00000000:11:00.0",
+            "governor_bound": "max",
+            "samples": 4,
+            "source": "gpu-powerd",
+            "covered_s": 2.999,
+            "throttle_s": {
+              "sw_power_cap": 0.0,
+              "sw_thermal": 0.0,
+              "hw_thermal": 0.0,
+              "hw_power_brake": 0.0
+            },
+            "reason_fraction": {
+              "sw_power_cap": 0.0,
+              "sw_thermal": 0.0,
+              "hw_thermal": 0.0,
+              "hw_power_brake": 0.0
+            },
+            "sm_clock_mhz": {
+              "min": 2737.0,
+              "mean": 2757.8
+            },
+            "busy": {
+              "fraction": 1.0,
+              "sm_clock_min_mhz": 2737.0,
+              "sm_clock_mean_mhz": 2757.8
+            },
+            "temperature_c": {
+              "max": 72.0,
+              "mean": 72.0
+            },
+            "tlimit_margin_c": {
+              "min": 23.0,
+              "mean": 23.0
+            },
+            "power_w": {
+              "mean": 425.0,
+              "max": 459.6
+            },
+            "power_limit_w": {
+              "min": 450.0,
+              "max": 450.0,
+              "mean": 450.0
+            }
+          }
+        ],
+        "governor": {
+          "version": 1,
+          "updated": 1794697868.5358334,
+          "host": "raptor",
+          "pid": 8408,
+          "running": true,
+          "period_s": 1.0,
+          "budget_w": 850.0,
+          "reason": "GPU 1 400 W: idle: base plus spare budget, 400 W of 850 W",
+          "config_error": null,
+          "gpus": [
+            {
+              "index": 0,
+              "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+              "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+              "pci": "00000000:11:00.0",
+              "limit_w": 450,
+              "base_w": 150.0,
+              "max_w": 450.0,
+              "fallback_w": 325.0,
+              "sensor_fail_w": 150.0,
+              "throttle_start_c": 75.0,
+              "target_c": 80.0,
+              "hard_c": 85.0,
+              "reading": {
+                "temperature_c": 72.0,
+                "power_w": 449.788,
+                "utilization_pct": 98.0,
+                "mem_utilization_pct": 91.0,
+                "limit_w": 450.0,
+                "sm_clock_mhz": 2737.0,
+                "mem_clock_mhz": 13365.0,
+                "throttle_mask": 0,
+                "fan_pct": 100.0,
+                "tlimit_c": 23.0,
+                "power_capped": false,
+                "mem_total_mib": 97887.0,
+                "mem_used_mib": 96883.25,
+                "mem_free_mib": 366.25,
+                "mem_reserved_mib": 637.5
+              },
+              "processes": null,
+              "throttle_reasons": [],
+              "plan": {
+                "limit_w": 450.0,
+                "target_w": 450.0,
+                "bound": "max",
+                "reason": "max",
+                "sensor_ok": true,
+                "sensor_error": null,
+                "temperature_smoothed_c": 72.4333161177056,
+                "power_smoothed_w": 428.2167575050008,
+                "pi_w": 450.0,
+                "model_w": null,
+                "correction_w": 0.0,
+                "predicted_c": null,
+                "model_gain": 1.0,
+                "thermal_cap_w": 450.0,
+                "demand_w": 450.0,
+                "share_w": 450.0,
+                "pinned": true,
+                "idle": false
+              },
+              "model": {
+                "r_self_c_per_w": 0.08021882914575762,
+                "r_c_per_w": [
+                  0.08021882914575762,
+                  0.0014650867783778606
+                ],
+                "tau_s": 16.59067713664635,
+                "t_amb_c": 37.74423735147314,
+                "samples": 507730,
+                "power_std_w": 92.66702301317709,
+                "residual_c": 3.1996853753602954,
+                "fan_mean_pct": 57.5041893539408,
+                "confidence": 1.0,
+                "plausible": true,
+                "confident": false
+              },
+              "model_active": false
+            },
+            {
+              "index": 1,
+              "uuid": "GPU-95f8f212-9131-df99-fd53-7535965197d7",
+              "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+              "pci": "00000000:E1:00.0",
+              "limit_w": 400,
+              "base_w": 150.0,
+              "max_w": 450.0,
+              "fallback_w": 325.0,
+              "sensor_fail_w": 150.0,
+              "throttle_start_c": 75.0,
+              "target_c": 80.0,
+              "hard_c": 85.0,
+              "reading": {
+                "temperature_c": 51.0,
+                "power_w": 20.454,
+                "utilization_pct": 0.0,
+                "mem_utilization_pct": 22.0,
+                "limit_w": 400.0,
+                "sm_clock_mhz": 180.0,
+                "mem_clock_mhz": 405.0,
+                "throttle_mask": 0,
+                "fan_pct": 57.0,
+                "tlimit_c": 43.0,
+                "power_capped": false,
+                "mem_total_mib": 97887.0,
+                "mem_used_mib": 9.0625,
+                "mem_free_mib": 97237.4375,
+                "mem_reserved_mib": 640.5
+              },
+              "processes": null,
+              "throttle_reasons": [],
+              "plan": {
+                "limit_w": 400.00000000000006,
+                "target_w": 400.00000000000006,
+                "bound": "budget",
+                "reason": "idle: base plus spare budget, 400 W of 850 W",
+                "sensor_ok": true,
+                "sensor_error": null,
+                "temperature_smoothed_c": 50.74275303607728,
+                "power_smoothed_w": 20.29877665806389,
+                "pi_w": 450.0,
+                "model_w": null,
+                "correction_w": 0.0,
+                "predicted_c": null,
+                "model_gain": 1.0,
+                "thermal_cap_w": 450.0,
+                "demand_w": 150.0,
+                "share_w": 400.00000000000006,
+                "pinned": false,
+                "idle": true
+              },
+              "model": {
+                "r_self_c_per_w": 0.07704109734120364,
+                "r_c_per_w": [
+                  0.01363355960609112,
+                  0.07704109734120364
+                ],
+                "tau_s": 16.053539774647742,
+                "t_amb_c": 40.5964848856248,
+                "samples": 507730,
+                "power_std_w": 82.52155774286462,
+                "residual_c": 1.8808092269580092,
+                "fan_mean_pct": 65.51905321999536,
+                "confidence": 1.0,
+                "plausible": true,
+                "confident": false
+              },
+              "model_active": false
+            }
+          ]
+        },
+        "governor_name": "gpu-powerd",
+        "source": "gpu-powerd",
+        "governor_budget_w": 850.0
+      },
+      "fabric": {
+        "name": "levels/c1",
+        "timed": true,
+        "ports": [
+          {
+            "host": "coordinator",
+            "hostname": "raptor",
+            "device": "mlx5_0",
+            "port": 1,
+            "state": "4: ACTIVE",
+            "link_gbps": 400.0,
+            "mtu": 9000,
+            "health": {
+              "verdict": "idle",
+              "reasons": [
+                "too little traffic to judge retransmits",
+                "retransmits unknown of packets, too little traffic to judge (warning above 0.5%)"
+              ],
+              "seconds": 3.001831388000028,
+              "moved_gb": 0.0,
+              "utilization": 0.0,
+              "ecn_marked_packets": 0,
+              "cnp_handled": 0,
+              "ecn_active": false,
+              "retransmit_counters": {
+                "local_ack_timeout_err": 0,
+                "out_of_sequence": 0,
+                "packet_seq_err": 0,
+                "rnr_nak_retry_err": 0,
+                "roce_adp_retrans": 0
+              },
+              "retransmit_events": 0,
+              "retransmit_pct": null,
+              "retransmit_warn_pct": 0.5,
+              "retransmit_judged": false,
+              "roce_mtu": 4096,
+              "missing_or_reset": [],
+              "pause": "unavailable",
+              "pause_counters": {}
+            },
+            "health_since_start": {
+              "verdict": "idle",
+              "reasons": [
+                "too little traffic to judge retransmits",
+                "retransmits unknown of packets, too little traffic to judge (warning above 0.5%)"
+              ],
+              "seconds": 260.017144764,
+              "moved_gb": 0.0,
+              "utilization": 0.0,
+              "ecn_marked_packets": 0,
+              "cnp_handled": 0,
+              "ecn_active": false,
+              "retransmit_counters": {
+                "local_ack_timeout_err": 0,
+                "out_of_sequence": 0,
+                "packet_seq_err": 0,
+                "rnr_nak_retry_err": 0,
+                "roce_adp_retrans": 0
+              },
+              "retransmit_events": 0,
+              "retransmit_pct": null,
+              "retransmit_warn_pct": 0.5,
+              "retransmit_judged": false,
+              "roce_mtu": 4096,
+              "missing_or_reset": [],
+              "pause": "unavailable",
+              "pause_counters": {}
+            },
+            "seconds": 3.001831388000028,
+            "sampled_start_s": 257.029286271,
+            "sampled_end_s": 260.031117659,
+            "sent_bytes": 0,
+            "received_bytes": 0,
+            "engine_sent_bytes": 0,
+            "engine_received_bytes": 0,
+            "sparknest_sent_bytes": 0,
+            "sparknest_received_bytes": 0,
+            "sparknest_status": "available",
+            "estimated_header_sent_bytes": 0,
+            "estimated_header_received_bytes": 0,
+            "engine_header_sent_bytes": 0,
+            "engine_header_received_bytes": 0,
+            "sparknest_header_sent_bytes": 0,
+            "sparknest_header_received_bytes": 0,
+            "residual_kind": "unattributed (headers/ACK/skew or foreign)",
+            "foreign_sent_bytes": 0,
+            "foreign_received_bytes": 0,
+            "xmit_gbps": 0.0,
+            "rcv_gbps": 0.0,
+            "utilization": 0.0,
+            "counters": {
+              "VL15_dropped": 0,
+              "excessive_buffer_overrun_errors": 0,
+              "hw_counters/duplicate_request": 0,
+              "hw_counters/implied_nak_seq_err": 0,
+              "hw_counters/lifespan": 0,
+              "hw_counters/local_ack_timeout_err": 0,
+              "hw_counters/np_cnp_sent": 0,
+              "hw_counters/np_ecn_marked_roce_packets": 0,
+              "hw_counters/out_of_buffer": 0,
+              "hw_counters/out_of_sequence": 0,
+              "hw_counters/packet_seq_err": 0,
+              "hw_counters/req_cqe_error": 0,
+              "hw_counters/req_cqe_flush_error": 0,
+              "hw_counters/req_remote_access_errors": 0,
+              "hw_counters/req_remote_invalid_request": 0,
+              "hw_counters/req_rnr_retries_exceeded": 0,
+              "hw_counters/req_transport_retries_exceeded": 0,
+              "hw_counters/resp_cqe_error": 0,
+              "hw_counters/resp_cqe_flush_error": 0,
+              "hw_counters/resp_local_length_error": 0,
+              "hw_counters/resp_remote_access_errors": 0,
+              "hw_counters/rnr_nak_retry_err": 0,
+              "hw_counters/roce_adp_retrans": 0,
+              "hw_counters/roce_adp_retrans_to": 0,
+              "hw_counters/roce_slow_restart": 0,
+              "hw_counters/roce_slow_restart_cnps": 0,
+              "hw_counters/roce_slow_restart_trans": 0,
+              "hw_counters/rp_cnp_handled": 0,
+              "hw_counters/rp_cnp_ignored": 0,
+              "hw_counters/rx_atomic_requests": 0,
+              "hw_counters/rx_dct_connect": 0,
+              "hw_counters/rx_icrc_encapsulated": 0,
+              "hw_counters/rx_read_requests": 0,
+              "hw_counters/rx_write_requests": 0,
+              "link_downed": 0,
+              "link_error_recovery": 0,
+              "local_link_integrity_errors": 0,
+              "multicast_rcv_packets": 0,
+              "multicast_xmit_packets": 0,
+              "port_rcv_constraint_errors": 0,
+              "port_rcv_data": 0,
+              "port_rcv_errors": 0,
+              "port_rcv_packets": 0,
+              "port_rcv_remote_physical_errors": 0,
+              "port_rcv_switch_relay_errors": 0,
+              "port_xmit_constraint_errors": 0,
+              "port_xmit_data": 0,
+              "port_xmit_discards": 0,
+              "port_xmit_packets": 0,
+              "port_xmit_wait": 0,
+              "symbol_error": 0,
+              "unicast_rcv_packets": 0,
+              "unicast_xmit_packets": 0
+            },
+            "xmit_wait_ticks_per_s": 0.0,
+            "idle_xmit_wait_ticks_per_s": 0.0,
+            "peers": []
+          }
+        ],
+        "assessments": [],
+        "health": {
+          "coordinator": "idle"
+        },
+        "host_load": {
+          "cpu_some_avg10": 1.26,
+          "memory_some_avg10": 0.0,
+          "pgscan_pages_per_s": 0.0,
+          "load1": 6.1,
+          "seconds": 3.001831388000028
+        }
+      }
+    },
+    {
+      "c": 16,
+      "phase": "levels",
+      "aggregate_tok_s": 674.092174305131,
+      "per_request_tok_s": 42.17107644840323,
+      "ttft_s": 0.708547191,
+      "errors": 0,
+      "thermal": {
+        "from_s": 317.623,
+        "to_s": 324.401,
+        "seconds": 6.778,
+        "gpus": [
+          {
+            "index": 0,
+            "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+            "pci_bus_id": "00000000:11:00.0",
+            "governor_bound": "max",
+            "samples": 7,
+            "source": "gpu-powerd",
+            "covered_s": 6.0,
+            "throttle_s": {
+              "sw_power_cap": 0.996,
+              "sw_thermal": 0.0,
+              "hw_thermal": 0.0,
+              "hw_power_brake": 0.0
+            },
+            "reason_fraction": {
+              "sw_power_cap": 0.143,
+              "sw_thermal": 0.0,
+              "hw_thermal": 0.0,
+              "hw_power_brake": 0.0
+            },
+            "sm_clock_mhz": {
+              "min": 2587.0,
+              "mean": 2638.7
+            },
+            "busy": {
+              "fraction": 1.0,
+              "sm_clock_min_mhz": 2587.0,
+              "sm_clock_mean_mhz": 2638.7
+            },
+            "temperature_c": {
+              "max": 74.0,
+              "mean": 73.1
+            },
+            "tlimit_margin_c": {
+              "min": 21.0,
+              "mean": 21.3
+            },
+            "power_w": {
+              "mean": 420.8,
+              "max": 451.4
+            },
+            "power_limit_w": {
+              "min": 450.0,
+              "max": 450.0,
+              "mean": 450.0
+            }
+          }
+        ],
+        "governor": {
+          "version": 1,
+          "updated": 1794697880.5358646,
+          "host": "raptor",
+          "pid": 8408,
+          "running": true,
+          "period_s": 1.0,
+          "budget_w": 850.0,
+          "reason": "GPU 1 400 W: idle: base plus spare budget, 400 W of 850 W",
+          "config_error": null,
+          "gpus": [
+            {
+              "index": 0,
+              "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+              "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+              "pci": "00000000:11:00.0",
+              "limit_w": 450,
+              "base_w": 150.0,
+              "max_w": 450.0,
+              "fallback_w": 325.0,
+              "sensor_fail_w": 150.0,
+              "throttle_start_c": 75.0,
+              "target_c": 80.0,
+              "hard_c": 85.0,
+              "reading": {
+                "temperature_c": 73.0,
+                "power_w": 451.443,
+                "utilization_pct": 99.0,
+                "mem_utilization_pct": 81.0,
+                "limit_w": 450.0,
+                "sm_clock_mhz": 2602.0,
+                "mem_clock_mhz": 13365.0,
+                "throttle_mask": 0,
+                "fan_pct": 100.0,
+                "tlimit_c": 21.0,
+                "power_capped": false,
+                "mem_total_mib": 97887.0,
+                "mem_used_mib": 96927.25,
+                "mem_free_mib": 322.25,
+                "mem_reserved_mib": 637.5
+              },
+              "processes": null,
+              "throttle_reasons": [],
+              "plan": {
+                "limit_w": 450.0,
+                "target_w": 450.0,
+                "bound": "max",
+                "reason": "max",
+                "sensor_ok": true,
+                "sensor_error": null,
+                "temperature_smoothed_c": 73.09556644596188,
+                "power_smoothed_w": 437.77369668349064,
+                "pi_w": 450.0,
+                "model_w": null,
+                "correction_w": 0.0,
+                "predicted_c": null,
+                "model_gain": 1.0,
+                "thermal_cap_w": 450.0,
+                "demand_w": 450.0,
+                "share_w": 450.0,
+                "pinned": true,
+                "idle": false
+              },
+              "model": {
+                "r_self_c_per_w": 0.08035845278344653,
+                "r_c_per_w": [
+                  0.08035845278344653,
+                  0.001403444800233618
+                ],
+                "tau_s": 16.619516657896476,
+                "t_amb_c": 37.74160624413765,
+                "samples": 507733,
+                "power_std_w": 93.53001632105384,
+                "residual_c": 3.123459559148616,
+                "fan_mean_pct": 57.75865460805589,
+                "confidence": 1.0,
+                "plausible": true,
+                "confident": false
+              },
+              "model_active": false
+            },
+            {
+              "index": 1,
+              "uuid": "GPU-95f8f212-9131-df99-fd53-7535965197d7",
+              "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+              "pci": "00000000:E1:00.0",
+              "limit_w": 400,
+              "base_w": 150.0,
+              "max_w": 450.0,
+              "fallback_w": 325.0,
+              "sensor_fail_w": 150.0,
+              "throttle_start_c": 75.0,
+              "target_c": 80.0,
+              "hard_c": 85.0,
+              "reading": {
+                "temperature_c": 51.0,
+                "power_w": 20.472,
+                "utilization_pct": 0.0,
+                "mem_utilization_pct": 15.0,
+                "limit_w": 400.0,
+                "sm_clock_mhz": 180.0,
+                "mem_clock_mhz": 405.0,
+                "throttle_mask": 0,
+                "fan_pct": 57.0,
+                "tlimit_c": 42.0,
+                "power_capped": false,
+                "mem_total_mib": 97887.0,
+                "mem_used_mib": 9.0625,
+                "mem_free_mib": 97237.4375,
+                "mem_reserved_mib": 640.5
+              },
+              "processes": null,
+              "throttle_reasons": [],
+              "plan": {
+                "limit_w": 400.00000000000006,
+                "target_w": 400.00000000000006,
+                "bound": "budget",
+                "reason": "idle: base plus spare budget, 400 W of 850 W",
+                "sensor_ok": true,
+                "sensor_error": null,
+                "temperature_smoothed_c": 50.75112104156075,
+                "power_smoothed_w": 20.522204898588992,
+                "pi_w": 450.0,
+                "model_w": null,
+                "correction_w": 0.0,
+                "predicted_c": null,
+                "model_gain": 1.0,
+                "thermal_cap_w": 450.0,
+                "demand_w": 150.0,
+                "share_w": 400.00000000000006,
+                "pinned": false,
+                "idle": true
+              },
+              "model": {
+                "r_self_c_per_w": 0.07694762295333488,
+                "r_c_per_w": [
+                  0.013871437596096103,
+                  0.07694762295333488
+                ],
+                "tau_s": 16.081764381709124,
+                "t_amb_c": 40.59057854380451,
+                "samples": 507733,
+                "power_std_w": 82.51180158693654,
+                "residual_c": 1.8412966922081289,
+                "fan_mean_pct": 65.46804106116159,
+                "confidence": 1.0,
+                "plausible": true,
+                "confident": false
+              },
+              "model_active": false
+            }
+          ]
+        },
+        "governor_name": "gpu-powerd",
+        "source": "gpu-powerd",
+        "governor_budget_w": 850.0
+      },
+      "fabric": {
+        "name": "levels/c16",
+        "timed": true,
+        "ports": [
+          {
+            "host": "coordinator",
+            "hostname": "raptor",
+            "device": "mlx5_0",
+            "port": 1,
+            "state": "4: ACTIVE",
+            "link_gbps": 400.0,
+            "mtu": 9000,
+            "health": {
+              "verdict": "idle",
+              "reasons": [
+                "too little traffic to judge retransmits",
+                "retransmits unknown of packets, too little traffic to judge (warning above 0.5%)"
+              ],
+              "seconds": 6.000638594999998,
+              "moved_gb": 0.0,
+              "utilization": 0.0,
+              "ecn_marked_packets": 0,
+              "cnp_handled": 0,
+              "ecn_active": false,
+              "retransmit_counters": {
+                "local_ack_timeout_err": 0,
+                "out_of_sequence": 0,
+                "packet_seq_err": 0,
+                "rnr_nak_retry_err": 0,
+                "roce_adp_retrans": 0
+              },
+              "retransmit_events": 0,
+              "retransmit_pct": null,
+              "retransmit_warn_pct": 0.5,
+              "retransmit_judged": false,
+              "roce_mtu": 4096,
+              "missing_or_reset": [],
+              "pause": "unavailable",
+              "pause_counters": {}
+            },
+            "health_since_start": {
+              "verdict": "idle",
+              "reasons": [
+                "too little traffic to judge retransmits",
+                "retransmits unknown of packets, too little traffic to judge (warning above 0.5%)"
+              ],
+              "seconds": 272.018129615,
+              "moved_gb": 0.0,
+              "utilization": 0.0,
+              "ecn_marked_packets": 0,
+              "cnp_handled": 0,
+              "ecn_active": false,
+              "retransmit_counters": {
+                "local_ack_timeout_err": 0,
+                "out_of_sequence": 0,
+                "packet_seq_err": 0,
+                "rnr_nak_retry_err": 0,
+                "roce_adp_retrans": 0
+              },
+              "retransmit_events": 0,
+              "retransmit_pct": null,
+              "retransmit_warn_pct": 0.5,
+              "retransmit_judged": false,
+              "roce_mtu": 4096,
+              "missing_or_reset": [],
+              "pause": "unavailable",
+              "pause_counters": {}
+            },
+            "seconds": 6.000638594999998,
+            "sampled_start_s": 266.031463915,
+            "sampled_end_s": 272.03210251,
+            "sent_bytes": 0,
+            "received_bytes": 0,
+            "engine_sent_bytes": 0,
+            "engine_received_bytes": 0,
+            "sparknest_sent_bytes": 0,
+            "sparknest_received_bytes": 0,
+            "sparknest_status": "available",
+            "estimated_header_sent_bytes": 0,
+            "estimated_header_received_bytes": 0,
+            "engine_header_sent_bytes": 0,
+            "engine_header_received_bytes": 0,
+            "sparknest_header_sent_bytes": 0,
+            "sparknest_header_received_bytes": 0,
+            "residual_kind": "unattributed (headers/ACK/skew or foreign)",
+            "foreign_sent_bytes": 0,
+            "foreign_received_bytes": 0,
+            "xmit_gbps": 0.0,
+            "rcv_gbps": 0.0,
+            "utilization": 0.0,
+            "counters": {
+              "VL15_dropped": 0,
+              "excessive_buffer_overrun_errors": 0,
+              "hw_counters/duplicate_request": 0,
+              "hw_counters/implied_nak_seq_err": 0,
+              "hw_counters/lifespan": 0,
+              "hw_counters/local_ack_timeout_err": 0,
+              "hw_counters/np_cnp_sent": 0,
+              "hw_counters/np_ecn_marked_roce_packets": 0,
+              "hw_counters/out_of_buffer": 0,
+              "hw_counters/out_of_sequence": 0,
+              "hw_counters/packet_seq_err": 0,
+              "hw_counters/req_cqe_error": 0,
+              "hw_counters/req_cqe_flush_error": 0,
+              "hw_counters/req_remote_access_errors": 0,
+              "hw_counters/req_remote_invalid_request": 0,
+              "hw_counters/req_rnr_retries_exceeded": 0,
+              "hw_counters/req_transport_retries_exceeded": 0,
+              "hw_counters/resp_cqe_error": 0,
+              "hw_counters/resp_cqe_flush_error": 0,
+              "hw_counters/resp_local_length_error": 0,
+              "hw_counters/resp_remote_access_errors": 0,
+              "hw_counters/rnr_nak_retry_err": 0,
+              "hw_counters/roce_adp_retrans": 0,
+              "hw_counters/roce_adp_retrans_to": 0,
+              "hw_counters/roce_slow_restart": 0,
+              "hw_counters/roce_slow_restart_cnps": 0,
+              "hw_counters/roce_slow_restart_trans": 0,
+              "hw_counters/rp_cnp_handled": 0,
+              "hw_counters/rp_cnp_ignored": 0,
+              "hw_counters/rx_atomic_requests": 0,
+              "hw_counters/rx_dct_connect": 0,
+              "hw_counters/rx_icrc_encapsulated": 0,
+              "hw_counters/rx_read_requests": 0,
+              "hw_counters/rx_write_requests": 0,
+              "link_downed": 0,
+              "link_error_recovery": 0,
+              "local_link_integrity_errors": 0,
+              "multicast_rcv_packets": 0,
+              "multicast_xmit_packets": 0,
+              "port_rcv_constraint_errors": 0,
+              "port_rcv_data": 0,
+              "port_rcv_errors": 0,
+              "port_rcv_packets": 0,
+              "port_rcv_remote_physical_errors": 0,
+              "port_rcv_switch_relay_errors": 0,
+              "port_xmit_constraint_errors": 0,
+              "port_xmit_data": 0,
+              "port_xmit_discards": 0,
+              "port_xmit_packets": 0,
+              "port_xmit_wait": 0,
+              "symbol_error": 0,
+              "unicast_rcv_packets": 0,
+              "unicast_xmit_packets": 0
+            },
+            "xmit_wait_ticks_per_s": 0.0,
+            "idle_xmit_wait_ticks_per_s": 0.0,
+            "peers": []
+          }
+        ],
+        "assessments": [],
+        "health": {
+          "coordinator": "idle"
+        },
+        "host_load": {
+          "cpu_some_avg10": 0.81,
+          "memory_some_avg10": 0.0,
+          "pgscan_pages_per_s": 0.0,
+          "load1": 10.57,
+          "seconds": 6.000638594999998
+        }
+      }
+    }
+  ],
+  "prefill": [
+    {
+      "length": 8192,
+      "shape": {
+        "unit_rows": 2048,
+        "full_units": 4,
+        "tail_rows": 0
+      },
+      "prompt_tokens": 8192,
+      "tok_s": 3527.1085540063973,
+      "ttft_s": 2.322582329,
+      "idle_seconds": 0.0,
+      "thermal": {
+        "from_s": 298.56,
+        "to_s": 301.706,
+        "seconds": 3.146,
+        "gpus": [
+          {
+            "index": 0,
+            "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+            "pci_bus_id": "00000000:11:00.0",
+            "governor_bound": "max",
+            "samples": 3,
+            "source": "gpu-powerd",
+            "covered_s": 2.0,
+            "throttle_s": {
+              "sw_power_cap": 2.0,
+              "sw_thermal": 0.0,
+              "hw_thermal": 0.0,
+              "hw_power_brake": 0.0
+            },
+            "reason_fraction": {
+              "sw_power_cap": 0.667,
+              "sw_thermal": 0.0,
+              "hw_thermal": 0.0,
+              "hw_power_brake": 0.0
+            },
+            "sm_clock_mhz": {
+              "min": 1530.0,
+              "mean": 1975.0
+            },
+            "busy": {
+              "fraction": 1.0,
+              "sm_clock_min_mhz": 1530.0,
+              "sm_clock_mean_mhz": 1975.0
+            },
+            "temperature_c": {
+              "max": 76.0,
+              "mean": 74.0
+            },
+            "tlimit_margin_c": {
+              "min": 17.0,
+              "mean": 17.0
+            },
+            "power_w": {
+              "mean": 373.5,
+              "max": 452.0
+            },
+            "power_limit_w": {
+              "min": 450.0,
+              "max": 450.0,
+              "mean": 450.0
+            }
+          }
+        ],
+        "governor": {
+          "version": 1,
+          "updated": 1794697857.5358784,
+          "host": "raptor",
+          "pid": 8408,
+          "running": true,
+          "period_s": 1.0,
+          "budget_w": 850.0,
+          "reason": "GPU 1 400 W: idle: base plus spare budget, 400 W of 850 W",
+          "config_error": null,
+          "gpus": [
+            {
+              "index": 0,
+              "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+              "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+              "pci": "00000000:11:00.0",
+              "limit_w": 450,
+              "base_w": 150.0,
+              "max_w": 450.0,
+              "fallback_w": 325.0,
+              "sensor_fail_w": 150.0,
+              "throttle_start_c": 75.0,
+              "target_c": 80.0,
+              "hard_c": 85.0,
+              "reading": {
+                "temperature_c": 76.0,
+                "power_w": 452.014,
+                "utilization_pct": 100.0,
+                "mem_utilization_pct": 19.0,
+                "limit_w": 450.0,
+                "sm_clock_mhz": 1530.0,
+                "mem_clock_mhz": 13365.0,
+                "throttle_mask": 4,
+                "fan_pct": 100.0,
+                "tlimit_c": 17.0,
+                "power_capped": true,
+                "mem_total_mib": 97887.0,
+                "mem_used_mib": 96883.25,
+                "mem_free_mib": 366.25,
+                "mem_reserved_mib": 637.5
+              },
+              "processes": null,
+              "throttle_reasons": [
+                "sw_power_cap"
+              ],
+              "plan": {
+                "limit_w": 450.0,
+                "target_w": 450.0,
+                "bound": "max",
+                "reason": "max",
+                "sensor_ok": true,
+                "sensor_error": null,
+                "temperature_smoothed_c": 74.17193280093618,
+                "power_smoothed_w": 381.8860101639437,
+                "pi_w": 450.0,
+                "model_w": null,
+                "correction_w": 0.0,
+                "predicted_c": null,
+                "model_gain": 1.0,
+                "thermal_cap_w": 450.0,
+                "demand_w": 450.0,
+                "share_w": 450.0,
+                "pinned": true,
+                "idle": false
+              },
+              "model": {
+                "r_self_c_per_w": 0.08043186452227342,
+                "r_c_per_w": [
+                  0.08043186452227342,
+                  0.0013793028246786004
+                ],
+                "tau_s": 16.676379807003403,
+                "t_amb_c": 37.7390698400711,
+                "samples": 507729,
+                "power_std_w": 92.42900456967098,
+                "residual_c": 3.214241742486002,
+                "fan_mean_pct": 57.41902740875832,
+                "confidence": 1.0,
+                "plausible": true,
+                "confident": false
+              },
+              "model_active": false
+            },
+            {
+              "index": 1,
+              "uuid": "GPU-95f8f212-9131-df99-fd53-7535965197d7",
+              "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+              "pci": "00000000:E1:00.0",
+              "limit_w": 400,
+              "base_w": 150.0,
+              "max_w": 450.0,
+              "fallback_w": 325.0,
+              "sensor_fail_w": 150.0,
+              "throttle_start_c": 75.0,
+              "target_c": 80.0,
+              "hard_c": 85.0,
+              "reading": {
+                "temperature_c": 50.0,
+                "power_w": 20.198,
+                "utilization_pct": 0.0,
+                "mem_utilization_pct": 14.0,
+                "limit_w": 400.0,
+                "sm_clock_mhz": 172.0,
+                "mem_clock_mhz": 405.0,
+                "throttle_mask": 0,
+                "fan_pct": 56.0,
+                "tlimit_c": 42.0,
+                "power_capped": false,
+                "mem_total_mib": 97887.0,
+                "mem_used_mib": 9.0625,
+                "mem_free_mib": 97237.4375,
+                "mem_reserved_mib": 640.5
+              },
+              "processes": null,
+              "throttle_reasons": [],
+              "plan": {
+                "limit_w": 400.00000000000006,
+                "target_w": 400.00000000000006,
+                "bound": "budget",
+                "reason": "idle: base plus spare budget, 400 W of 850 W",
+                "sensor_ok": true,
+                "sensor_error": null,
+                "temperature_smoothed_c": 50.19542458303569,
+                "power_smoothed_w": 20.10631842446592,
+                "pi_w": 450.0,
+                "model_w": null,
+                "correction_w": 0.0,
+                "predicted_c": null,
+                "model_gain": 1.0,
+                "thermal_cap_w": 450.0,
+                "demand_w": 150.0,
+                "share_w": 400.00000000000006,
+                "pinned": false,
+                "idle": true
+              },
+              "model": {
+                "r_self_c_per_w": 0.07706193728830744,
+                "r_c_per_w": [
+                  0.013583322991800366,
+                  0.07706193728830744
+                ],
+                "tau_s": 16.046686347139396,
+                "t_amb_c": 40.59749848557486,
+                "samples": 507729,
+                "power_std_w": 82.52457933359564,
+                "residual_c": 1.8975950614613848,
+                "fan_mean_pct": 65.53746147628125,
+                "confidence": 1.0,
+                "plausible": true,
+                "confident": false
+              },
+              "model_active": false
+            }
+          ]
+        },
+        "governor_name": "gpu-powerd",
+        "source": "gpu-powerd",
+        "governor_budget_w": 850.0
+      },
+      "fabric": {
+        "name": "prefill/8192",
+        "timed": true,
+        "ports": [
+          {
+            "host": "coordinator",
+            "hostname": "raptor",
+            "device": "mlx5_0",
+            "port": 1,
+            "state": "4: ACTIVE",
+            "link_gbps": 400.0,
+            "mtu": 9000,
+            "health": {
+              "verdict": "idle",
+              "reasons": [
+                "too little traffic to judge retransmits",
+                "retransmits unknown of packets, too little traffic to judge (warning above 0.5%)"
+              ],
+              "seconds": 2.99970054100001,
+              "moved_gb": 0.0,
+              "utilization": 0.0,
+              "ecn_marked_packets": 0,
+              "cnp_handled": 0,
+              "ecn_active": false,
+              "retransmit_counters": {
+                "local_ack_timeout_err": 0,
+                "out_of_sequence": 0,
+                "packet_seq_err": 0,
+                "rnr_nak_retry_err": 0,
+                "roce_adp_retrans": 0
+              },
+              "retransmit_events": 0,
+              "retransmit_pct": null,
+              "retransmit_warn_pct": 0.5,
+              "retransmit_judged": false,
+              "roce_mtu": 4096,
+              "missing_or_reset": [],
+              "pause": "unavailable",
+              "pause_counters": {}
+            },
+            "health_since_start": {
+              "verdict": "idle",
+              "reasons": [
+                "too little traffic to judge retransmits",
+                "retransmits unknown of packets, too little traffic to judge (warning above 0.5%)"
+              ],
+              "seconds": 250.014693595,
+              "moved_gb": 0.0,
+              "utilization": 0.0,
+              "ecn_marked_packets": 0,
+              "cnp_handled": 0,
+              "ecn_active": false,
+              "retransmit_counters": {
+                "local_ack_timeout_err": 0,
+                "out_of_sequence": 0,
+                "packet_seq_err": 0,
+                "rnr_nak_retry_err": 0,
+                "roce_adp_retrans": 0
+              },
+              "retransmit_events": 0,
+              "retransmit_pct": null,
+              "retransmit_warn_pct": 0.5,
+              "retransmit_judged": false,
+              "roce_mtu": 4096,
+              "missing_or_reset": [],
+              "pause": "unavailable",
+              "pause_counters": {}
+            },
+            "seconds": 2.99970054100001,
+            "sampled_start_s": 247.028965949,
+            "sampled_end_s": 250.02866649,
+            "sent_bytes": 0,
+            "received_bytes": 0,
+            "engine_sent_bytes": 0,
+            "engine_received_bytes": 0,
+            "sparknest_sent_bytes": 0,
+            "sparknest_received_bytes": 0,
+            "sparknest_status": "available",
+            "estimated_header_sent_bytes": 0,
+            "estimated_header_received_bytes": 0,
+            "engine_header_sent_bytes": 0,
+            "engine_header_received_bytes": 0,
+            "sparknest_header_sent_bytes": 0,
+            "sparknest_header_received_bytes": 0,
+            "residual_kind": "unattributed (headers/ACK/skew or foreign)",
+            "foreign_sent_bytes": 0,
+            "foreign_received_bytes": 0,
+            "xmit_gbps": 0.0,
+            "rcv_gbps": 0.0,
+            "utilization": 0.0,
+            "counters": {
+              "VL15_dropped": 0,
+              "excessive_buffer_overrun_errors": 0,
+              "hw_counters/duplicate_request": 0,
+              "hw_counters/implied_nak_seq_err": 0,
+              "hw_counters/lifespan": 0,
+              "hw_counters/local_ack_timeout_err": 0,
+              "hw_counters/np_cnp_sent": 0,
+              "hw_counters/np_ecn_marked_roce_packets": 0,
+              "hw_counters/out_of_buffer": 0,
+              "hw_counters/out_of_sequence": 0,
+              "hw_counters/packet_seq_err": 0,
+              "hw_counters/req_cqe_error": 0,
+              "hw_counters/req_cqe_flush_error": 0,
+              "hw_counters/req_remote_access_errors": 0,
+              "hw_counters/req_remote_invalid_request": 0,
+              "hw_counters/req_rnr_retries_exceeded": 0,
+              "hw_counters/req_transport_retries_exceeded": 0,
+              "hw_counters/resp_cqe_error": 0,
+              "hw_counters/resp_cqe_flush_error": 0,
+              "hw_counters/resp_local_length_error": 0,
+              "hw_counters/resp_remote_access_errors": 0,
+              "hw_counters/rnr_nak_retry_err": 0,
+              "hw_counters/roce_adp_retrans": 0,
+              "hw_counters/roce_adp_retrans_to": 0,
+              "hw_counters/roce_slow_restart": 0,
+              "hw_counters/roce_slow_restart_cnps": 0,
+              "hw_counters/roce_slow_restart_trans": 0,
+              "hw_counters/rp_cnp_handled": 0,
+              "hw_counters/rp_cnp_ignored": 0,
+              "hw_counters/rx_atomic_requests": 0,
+              "hw_counters/rx_dct_connect": 0,
+              "hw_counters/rx_icrc_encapsulated": 0,
+              "hw_counters/rx_read_requests": 0,
+              "hw_counters/rx_write_requests": 0,
+              "link_downed": 0,
+              "link_error_recovery": 0,
+              "local_link_integrity_errors": 0,
+              "multicast_rcv_packets": 0,
+              "multicast_xmit_packets": 0,
+              "port_rcv_constraint_errors": 0,
+              "port_rcv_data": 0,
+              "port_rcv_errors": 0,
+              "port_rcv_packets": 0,
+              "port_rcv_remote_physical_errors": 0,
+              "port_rcv_switch_relay_errors": 0,
+              "port_xmit_constraint_errors": 0,
+              "port_xmit_data": 0,
+              "port_xmit_discards": 0,
+              "port_xmit_packets": 0,
+              "port_xmit_wait": 0,
+              "symbol_error": 0,
+              "unicast_rcv_packets": 0,
+              "unicast_xmit_packets": 0
+            },
+            "xmit_wait_ticks_per_s": 0.0,
+            "idle_xmit_wait_ticks_per_s": 0.0,
+            "peers": []
+          }
+        ],
+        "assessments": [],
+        "health": {
+          "coordinator": "idle"
+        },
+        "host_load": {
+          "cpu_some_avg10": 0.0,
+          "memory_some_avg10": 0.0,
+          "pgscan_pages_per_s": 0.0,
+          "load1": 5.94,
+          "seconds": 2.99970054100001
+        }
+      }
+    },
+    {
+      "length": 6184,
+      "label": "8K w/tail",
+      "shape": {
+        "unit_rows": 2048,
+        "full_units": 3,
+        "tail_rows": 40
+      },
+      "prompt_tokens": 6184,
+      "tok_s": 3506.988621613413,
+      "ttft_s": 1.7633362030000002,
+      "idle_seconds": 0.0,
+      "thermal": {
+        "from_s": 304.294,
+        "to_s": 306.171,
+        "seconds": 1.877,
+        "gpus": [
+          {
+            "index": 0,
+            "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+            "pci_bus_id": "00000000:11:00.0",
+            "governor_bound": "max",
+            "samples": 2,
+            "source": "gpu-powerd",
+            "covered_s": 1.009,
+            "throttle_s": {
+              "sw_power_cap": 2.009,
+              "sw_thermal": 0.0,
+              "hw_thermal": 0.0,
+              "hw_power_brake": 0.0
+            },
+            "reason_fraction": {
+              "sw_power_cap": 1.0,
+              "sw_thermal": 0.0,
+              "hw_thermal": 0.0,
+              "hw_power_brake": 0.0
+            },
+            "sm_clock_mhz": {
+              "min": 1530.0,
+              "mean": 1912.5
+            },
+            "busy": {
+              "fraction": 1.0,
+              "sm_clock_min_mhz": 1530.0,
+              "sm_clock_mean_mhz": 1912.5
+            },
+            "temperature_c": {
+              "max": 76.0,
+              "mean": 75.5
+            },
+            "tlimit_margin_c": {
+              "min": 17.0,
+              "mean": 17.0
+            },
+            "power_w": {
+              "mean": 443.3,
+              "max": 452.6
+            },
+            "power_limit_w": {
+              "min": 450.0,
+              "max": 450.0,
+              "mean": 450.0
+            }
+          }
+        ],
+        "governor": {
+          "version": 1,
+          "updated": 1794697862.544663,
+          "host": "raptor",
+          "pid": 8408,
+          "running": true,
+          "period_s": 1.0,
+          "budget_w": 850.0,
+          "reason": "GPU 1 400 W: idle: base plus spare budget, 400 W of 850 W",
+          "config_error": null,
+          "gpus": [
+            {
+              "index": 0,
+              "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+              "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+              "pci": "00000000:11:00.0",
+              "limit_w": 450,
+              "base_w": 150.0,
+              "max_w": 450.0,
+              "fallback_w": 325.0,
+              "sensor_fail_w": 150.0,
+              "throttle_start_c": 75.0,
+              "target_c": 80.0,
+              "hard_c": 85.0,
+              "reading": {
+                "temperature_c": 76.0,
+                "power_w": 452.625,
+                "utilization_pct": 100.0,
+                "mem_utilization_pct": 19.0,
+                "limit_w": 450.0,
+                "sm_clock_mhz": 1530.0,
+                "mem_clock_mhz": 13365.0,
+                "throttle_mask": 4,
+                "fan_pct": 100.0,
+                "tlimit_c": 17.0,
+                "power_capped": true,
+                "mem_total_mib": 97887.0,
+                "mem_used_mib": 96883.25,
+                "mem_free_mib": 366.25,
+                "mem_reserved_mib": 637.5
+              },
+              "processes": null,
+              "throttle_reasons": [
+                "sw_power_cap"
+              ],
+              "plan": {
+                "limit_w": 450.0,
+                "target_w": 450.0,
+                "bound": "max",
+                "reason": "max",
+                "sensor_ok": true,
+                "sensor_error": null,
+                "temperature_smoothed_c": 75.20178986090794,
+                "power_smoothed_w": 409.3230155554906,
+                "pi_w": 450.0,
+                "model_w": null,
+                "correction_w": 0.0,
+                "predicted_c": null,
+                "model_gain": 1.0,
+                "thermal_cap_w": 450.0,
+                "demand_w": 450.0,
+                "share_w": 450.0,
+                "pinned": true,
+                "idle": false
+              },
+              "model": {
+                "r_self_c_per_w": 0.08043186452227342,
+                "r_c_per_w": [
+                  0.08043186452227342,
+                  0.0013793028246786004
+                ],
+                "tau_s": 16.676379807003403,
+                "t_amb_c": 37.7390698400711,
+                "samples": 507729,
+                "power_std_w": 92.42900456967098,
+                "residual_c": 3.214241742486002,
+                "fan_mean_pct": 57.41902740875832,
+                "confidence": 1.0,
+                "plausible": true,
+                "confident": false
+              },
+              "model_active": false
+            },
+            {
+              "index": 1,
+              "uuid": "GPU-95f8f212-9131-df99-fd53-7535965197d7",
+              "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+              "pci": "00000000:E1:00.0",
+              "limit_w": 400,
+              "base_w": 150.0,
+              "max_w": 450.0,
+              "fallback_w": 325.0,
+              "sensor_fail_w": 150.0,
+              "throttle_start_c": 75.0,
+              "target_c": 80.0,
+              "hard_c": 85.0,
+              "reading": {
+                "temperature_c": 51.0,
+                "power_w": 20.129,
+                "utilization_pct": 0.0,
+                "mem_utilization_pct": 13.0,
+                "limit_w": 400.0,
+                "sm_clock_mhz": 180.0,
+                "mem_clock_mhz": 405.0,
+                "throttle_mask": 0,
+                "fan_pct": 57.0,
+                "tlimit_c": 43.0,
+                "power_capped": false,
+                "mem_total_mib": 97887.0,
+                "mem_used_mib": 9.0625,
+                "mem_free_mib": 97237.4375,
+                "mem_reserved_mib": 640.5
+              },
+              "processes": null,
+              "throttle_reasons": [],
+              "plan": {
+                "limit_w": 400.00000000000006,
+                "target_w": 400.00000000000006,
+                "bound": "budget",
+                "reason": "idle: base plus spare budget, 400 W of 850 W",
+                "sensor_ok": true,
+                "sensor_error": null,
+                "temperature_smoothed_c": 50.570200232786135,
+                "power_smoothed_w": 20.12775999818757,
+                "pi_w": 450.0,
+                "model_w": null,
+                "correction_w": 0.0,
+                "predicted_c": null,
+                "model_gain": 1.0,
+                "thermal_cap_w": 450.0,
+                "demand_w": 150.0,
+                "share_w": 400.00000000000006,
+                "pinned": false,
+                "idle": true
+              },
+              "model": {
+                "r_self_c_per_w": 0.07706193728830744,
+                "r_c_per_w": [
+                  0.013583322991800366,
+                  0.07706193728830744
+                ],
+                "tau_s": 16.046686347139396,
+                "t_amb_c": 40.59749848557486,
+                "samples": 507729,
+                "power_std_w": 82.52457933359564,
+                "residual_c": 1.8975950614613848,
+                "fan_mean_pct": 65.53746147628125,
+                "confidence": 1.0,
+                "plausible": true,
+                "confident": false
+              },
+              "model_active": false
+            }
+          ]
+        },
+        "governor_name": "gpu-powerd",
+        "source": "gpu-powerd",
+        "governor_budget_w": 850.0
+      },
+      "fabric": {
+        "name": "prefill/6184",
+        "timed": true,
+        "ports": [
+          {
+            "host": "coordinator",
+            "hostname": "raptor",
+            "device": "mlx5_0",
+            "port": 1,
+            "state": "4: ACTIVE",
+            "link_gbps": 400.0,
+            "mtu": 9000,
+            "health": {
+              "verdict": "idle",
+              "reasons": [
+                "too little traffic to judge retransmits",
+                "retransmits unknown of packets, too little traffic to judge (warning above 0.5%)"
+              ],
+              "seconds": 2.000022221999984,
+              "moved_gb": 0.0,
+              "utilization": 0.0,
+              "ecn_marked_packets": 0,
+              "cnp_handled": 0,
+              "ecn_active": false,
+              "retransmit_counters": {
+                "local_ack_timeout_err": 0,
+                "out_of_sequence": 0,
+                "packet_seq_err": 0,
+                "rnr_nak_retry_err": 0,
+                "roce_adp_retrans": 0
+              },
+              "retransmit_events": 0,
+              "retransmit_pct": null,
+              "retransmit_warn_pct": 0.5,
+              "retransmit_judged": false,
+              "roce_mtu": 4096,
+              "missing_or_reset": [],
+              "pause": "unavailable",
+              "pause_counters": {}
+            },
+            "health_since_start": {
+              "verdict": "idle",
+              "reasons": [
+                "too little traffic to judge retransmits",
+                "retransmits unknown of packets, too little traffic to judge (warning above 0.5%)"
+              ],
+              "seconds": 254.015158862,
+              "moved_gb": 0.0,
+              "utilization": 0.0,
+              "ecn_marked_packets": 0,
+              "cnp_handled": 0,
+              "ecn_active": false,
+              "retransmit_counters": {
+                "local_ack_timeout_err": 0,
+                "out_of_sequence": 0,
+                "packet_seq_err": 0,
+                "rnr_nak_retry_err": 0,
+                "roce_adp_retrans": 0
+              },
+              "retransmit_events": 0,
+              "retransmit_pct": null,
+              "retransmit_warn_pct": 0.5,
+              "retransmit_judged": false,
+              "roce_mtu": 4096,
+              "missing_or_reset": [],
+              "pause": "unavailable",
+              "pause_counters": {}
+            },
+            "seconds": 2.000022221999984,
+            "sampled_start_s": 252.029109535,
+            "sampled_end_s": 254.029131757,
+            "sent_bytes": 0,
+            "received_bytes": 0,
+            "engine_sent_bytes": 0,
+            "engine_received_bytes": 0,
+            "sparknest_sent_bytes": 0,
+            "sparknest_received_bytes": 0,
+            "sparknest_status": "available",
+            "estimated_header_sent_bytes": 0,
+            "estimated_header_received_bytes": 0,
+            "engine_header_sent_bytes": 0,
+            "engine_header_received_bytes": 0,
+            "sparknest_header_sent_bytes": 0,
+            "sparknest_header_received_bytes": 0,
+            "residual_kind": "unattributed (headers/ACK/skew or foreign)",
+            "foreign_sent_bytes": 0,
+            "foreign_received_bytes": 0,
+            "xmit_gbps": 0.0,
+            "rcv_gbps": 0.0,
+            "utilization": 0.0,
+            "counters": {
+              "VL15_dropped": 0,
+              "excessive_buffer_overrun_errors": 0,
+              "hw_counters/duplicate_request": 0,
+              "hw_counters/implied_nak_seq_err": 0,
+              "hw_counters/lifespan": 0,
+              "hw_counters/local_ack_timeout_err": 0,
+              "hw_counters/np_cnp_sent": 0,
+              "hw_counters/np_ecn_marked_roce_packets": 0,
+              "hw_counters/out_of_buffer": 0,
+              "hw_counters/out_of_sequence": 0,
+              "hw_counters/packet_seq_err": 0,
+              "hw_counters/req_cqe_error": 0,
+              "hw_counters/req_cqe_flush_error": 0,
+              "hw_counters/req_remote_access_errors": 0,
+              "hw_counters/req_remote_invalid_request": 0,
+              "hw_counters/req_rnr_retries_exceeded": 0,
+              "hw_counters/req_transport_retries_exceeded": 0,
+              "hw_counters/resp_cqe_error": 0,
+              "hw_counters/resp_cqe_flush_error": 0,
+              "hw_counters/resp_local_length_error": 0,
+              "hw_counters/resp_remote_access_errors": 0,
+              "hw_counters/rnr_nak_retry_err": 0,
+              "hw_counters/roce_adp_retrans": 0,
+              "hw_counters/roce_adp_retrans_to": 0,
+              "hw_counters/roce_slow_restart": 0,
+              "hw_counters/roce_slow_restart_cnps": 0,
+              "hw_counters/roce_slow_restart_trans": 0,
+              "hw_counters/rp_cnp_handled": 0,
+              "hw_counters/rp_cnp_ignored": 0,
+              "hw_counters/rx_atomic_requests": 0,
+              "hw_counters/rx_dct_connect": 0,
+              "hw_counters/rx_icrc_encapsulated": 0,
+              "hw_counters/rx_read_requests": 0,
+              "hw_counters/rx_write_requests": 0,
+              "link_downed": 0,
+              "link_error_recovery": 0,
+              "local_link_integrity_errors": 0,
+              "multicast_rcv_packets": 0,
+              "multicast_xmit_packets": 0,
+              "port_rcv_constraint_errors": 0,
+              "port_rcv_data": 0,
+              "port_rcv_errors": 0,
+              "port_rcv_packets": 0,
+              "port_rcv_remote_physical_errors": 0,
+              "port_rcv_switch_relay_errors": 0,
+              "port_xmit_constraint_errors": 0,
+              "port_xmit_data": 0,
+              "port_xmit_discards": 0,
+              "port_xmit_packets": 0,
+              "port_xmit_wait": 0,
+              "symbol_error": 0,
+              "unicast_rcv_packets": 0,
+              "unicast_xmit_packets": 0
+            },
+            "xmit_wait_ticks_per_s": 0.0,
+            "idle_xmit_wait_ticks_per_s": 0.0,
+            "peers": []
+          }
+        ],
+        "assessments": [],
+        "health": {
+          "coordinator": "idle"
+        },
+        "host_load": {
+          "cpu_some_avg10": 0.0,
+          "memory_some_avg10": 0.0,
+          "pgscan_pages_per_s": 0.0,
+          "load1": 6.02,
+          "seconds": 2.000022221999984
+        }
+      }
+    }
+  ],
+  "thermal": {
+    "prefill": {
+      "from_s": 295.54,
+      "to_s": 306.377,
+      "seconds": 10.837,
+      "gpus": [
+        {
+          "index": 0,
+          "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+          "pci_bus_id": "00000000:11:00.0",
+          "governor_bound": "max",
+          "samples": 11,
+          "source": "gpu-powerd",
+          "covered_s": 9.991,
+          "throttle_s": {
+            "sw_power_cap": 9.991,
+            "sw_thermal": 0.0,
+            "hw_thermal": 0.0,
+            "hw_power_brake": 0.0
+          },
+          "reason_fraction": {
+            "sw_power_cap": 0.909,
+            "sw_thermal": 0.0,
+            "hw_thermal": 0.0,
+            "hw_power_brake": 0.0
+          },
+          "sm_clock_mhz": {
+            "min": 1530.0,
+            "mean": 2041.2
+          },
+          "busy": {
+            "fraction": 1.0,
+            "sm_clock_min_mhz": 1530.0,
+            "sm_clock_mean_mhz": 2041.2
+          },
+          "temperature_c": {
+            "max": 76.0,
+            "mean": 74.8
+          },
+          "tlimit_margin_c": {
+            "min": 17.0,
+            "mean": 17.7
+          },
+          "power_w": {
+            "mean": 376.6,
+            "max": 460.6
+          },
+          "power_limit_w": {
+            "min": 425.0,
+            "max": 450.0,
+            "mean": 447.8
+          }
+        }
+      ],
+      "governor": {
+        "version": 1,
+        "updated": 1794697862.544663,
+        "host": "raptor",
+        "pid": 8408,
+        "running": true,
+        "period_s": 1.0,
+        "budget_w": 850.0,
+        "reason": "GPU 1 400 W: idle: base plus spare budget, 400 W of 850 W",
+        "config_error": null,
+        "gpus": [
+          {
+            "index": 0,
+            "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+            "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+            "pci": "00000000:11:00.0",
+            "limit_w": 450,
+            "base_w": 150.0,
+            "max_w": 450.0,
+            "fallback_w": 325.0,
+            "sensor_fail_w": 150.0,
+            "throttle_start_c": 75.0,
+            "target_c": 80.0,
+            "hard_c": 85.0,
+            "reading": {
+              "temperature_c": 76.0,
+              "power_w": 452.625,
+              "utilization_pct": 100.0,
+              "mem_utilization_pct": 19.0,
+              "limit_w": 450.0,
+              "sm_clock_mhz": 1530.0,
+              "mem_clock_mhz": 13365.0,
+              "throttle_mask": 4,
+              "fan_pct": 100.0,
+              "tlimit_c": 17.0,
+              "power_capped": true,
+              "mem_total_mib": 97887.0,
+              "mem_used_mib": 96883.25,
+              "mem_free_mib": 366.25,
+              "mem_reserved_mib": 637.5
+            },
+            "processes": null,
+            "throttle_reasons": [
+              "sw_power_cap"
+            ],
+            "plan": {
+              "limit_w": 450.0,
+              "target_w": 450.0,
+              "bound": "max",
+              "reason": "max",
+              "sensor_ok": true,
+              "sensor_error": null,
+              "temperature_smoothed_c": 75.20178986090794,
+              "power_smoothed_w": 409.3230155554906,
+              "pi_w": 450.0,
+              "model_w": null,
+              "correction_w": 0.0,
+              "predicted_c": null,
+              "model_gain": 1.0,
+              "thermal_cap_w": 450.0,
+              "demand_w": 450.0,
+              "share_w": 450.0,
+              "pinned": true,
+              "idle": false
+            },
+            "model": {
+              "r_self_c_per_w": 0.08043186452227342,
+              "r_c_per_w": [
+                0.08043186452227342,
+                0.0013793028246786004
+              ],
+              "tau_s": 16.676379807003403,
+              "t_amb_c": 37.7390698400711,
+              "samples": 507729,
+              "power_std_w": 92.42900456967098,
+              "residual_c": 3.214241742486002,
+              "fan_mean_pct": 57.41902740875832,
+              "confidence": 1.0,
+              "plausible": true,
+              "confident": false
+            },
+            "model_active": false
+          },
+          {
+            "index": 1,
+            "uuid": "GPU-95f8f212-9131-df99-fd53-7535965197d7",
+            "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+            "pci": "00000000:E1:00.0",
+            "limit_w": 400,
+            "base_w": 150.0,
+            "max_w": 450.0,
+            "fallback_w": 325.0,
+            "sensor_fail_w": 150.0,
+            "throttle_start_c": 75.0,
+            "target_c": 80.0,
+            "hard_c": 85.0,
+            "reading": {
+              "temperature_c": 51.0,
+              "power_w": 20.129,
+              "utilization_pct": 0.0,
+              "mem_utilization_pct": 13.0,
+              "limit_w": 400.0,
+              "sm_clock_mhz": 180.0,
+              "mem_clock_mhz": 405.0,
+              "throttle_mask": 0,
+              "fan_pct": 57.0,
+              "tlimit_c": 43.0,
+              "power_capped": false,
+              "mem_total_mib": 97887.0,
+              "mem_used_mib": 9.0625,
+              "mem_free_mib": 97237.4375,
+              "mem_reserved_mib": 640.5
+            },
+            "processes": null,
+            "throttle_reasons": [],
+            "plan": {
+              "limit_w": 400.00000000000006,
+              "target_w": 400.00000000000006,
+              "bound": "budget",
+              "reason": "idle: base plus spare budget, 400 W of 850 W",
+              "sensor_ok": true,
+              "sensor_error": null,
+              "temperature_smoothed_c": 50.570200232786135,
+              "power_smoothed_w": 20.12775999818757,
+              "pi_w": 450.0,
+              "model_w": null,
+              "correction_w": 0.0,
+              "predicted_c": null,
+              "model_gain": 1.0,
+              "thermal_cap_w": 450.0,
+              "demand_w": 150.0,
+              "share_w": 400.00000000000006,
+              "pinned": false,
+              "idle": true
+            },
+            "model": {
+              "r_self_c_per_w": 0.07706193728830744,
+              "r_c_per_w": [
+                0.013583322991800366,
+                0.07706193728830744
+              ],
+              "tau_s": 16.046686347139396,
+              "t_amb_c": 40.59749848557486,
+              "samples": 507729,
+              "power_std_w": 82.52457933359564,
+              "residual_c": 1.8975950614613848,
+              "fan_mean_pct": 65.53746147628125,
+              "confidence": 1.0,
+              "plausible": true,
+              "confident": false
+            },
+            "model_active": false
+          }
+        ]
+      },
+      "governor_name": "gpu-powerd",
+      "source": "gpu-powerd",
+      "governor_budget_w": 850.0
+    },
+    "decode": {
+      "from_s": 306.378,
+      "to_s": 324.401,
+      "seconds": 18.024,
+      "gpus": [
+        {
+          "index": 0,
+          "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+          "pci_bus_id": "00000000:11:00.0",
+          "governor_bound": "max",
+          "samples": 18,
+          "source": "gpu-powerd",
+          "covered_s": 17.0,
+          "throttle_s": {
+            "sw_power_cap": 1.996,
+            "sw_thermal": 0.0,
+            "hw_thermal": 0.0,
+            "hw_power_brake": 0.0
+          },
+          "reason_fraction": {
+            "sw_power_cap": 0.111,
+            "sw_thermal": 0.0,
+            "hw_thermal": 0.0,
+            "hw_power_brake": 0.0
+          },
+          "sm_clock_mhz": {
+            "min": 2587.0,
+            "mean": 2684.7
+          },
+          "busy": {
+            "fraction": 1.0,
+            "sm_clock_min_mhz": 2587.0,
+            "sm_clock_mean_mhz": 2684.7
+          },
+          "temperature_c": {
+            "max": 74.0,
+            "mean": 72.8
+          },
+          "tlimit_margin_c": {
+            "min": 17.0,
+            "mean": 21.7
+          },
+          "power_w": {
+            "mean": 423.9,
+            "max": 459.6
+          },
+          "power_limit_w": {
+            "min": 450.0,
+            "max": 450.0,
+            "mean": 450.0
+          }
+        }
+      ],
+      "governor": {
+        "version": 1,
+        "updated": 1794697880.5358646,
+        "host": "raptor",
+        "pid": 8408,
+        "running": true,
+        "period_s": 1.0,
+        "budget_w": 850.0,
+        "reason": "GPU 1 400 W: idle: base plus spare budget, 400 W of 850 W",
+        "config_error": null,
+        "gpus": [
+          {
+            "index": 0,
+            "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+            "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+            "pci": "00000000:11:00.0",
+            "limit_w": 450,
+            "base_w": 150.0,
+            "max_w": 450.0,
+            "fallback_w": 325.0,
+            "sensor_fail_w": 150.0,
+            "throttle_start_c": 75.0,
+            "target_c": 80.0,
+            "hard_c": 85.0,
+            "reading": {
+              "temperature_c": 73.0,
+              "power_w": 451.443,
+              "utilization_pct": 99.0,
+              "mem_utilization_pct": 81.0,
+              "limit_w": 450.0,
+              "sm_clock_mhz": 2602.0,
+              "mem_clock_mhz": 13365.0,
+              "throttle_mask": 0,
+              "fan_pct": 100.0,
+              "tlimit_c": 21.0,
+              "power_capped": false,
+              "mem_total_mib": 97887.0,
+              "mem_used_mib": 96927.25,
+              "mem_free_mib": 322.25,
+              "mem_reserved_mib": 637.5
+            },
+            "processes": null,
+            "throttle_reasons": [],
+            "plan": {
+              "limit_w": 450.0,
+              "target_w": 450.0,
+              "bound": "max",
+              "reason": "max",
+              "sensor_ok": true,
+              "sensor_error": null,
+              "temperature_smoothed_c": 73.09556644596188,
+              "power_smoothed_w": 437.77369668349064,
+              "pi_w": 450.0,
+              "model_w": null,
+              "correction_w": 0.0,
+              "predicted_c": null,
+              "model_gain": 1.0,
+              "thermal_cap_w": 450.0,
+              "demand_w": 450.0,
+              "share_w": 450.0,
+              "pinned": true,
+              "idle": false
+            },
+            "model": {
+              "r_self_c_per_w": 0.08035845278344653,
+              "r_c_per_w": [
+                0.08035845278344653,
+                0.001403444800233618
+              ],
+              "tau_s": 16.619516657896476,
+              "t_amb_c": 37.74160624413765,
+              "samples": 507733,
+              "power_std_w": 93.53001632105384,
+              "residual_c": 3.123459559148616,
+              "fan_mean_pct": 57.75865460805589,
+              "confidence": 1.0,
+              "plausible": true,
+              "confident": false
+            },
+            "model_active": false
+          },
+          {
+            "index": 1,
+            "uuid": "GPU-95f8f212-9131-df99-fd53-7535965197d7",
+            "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+            "pci": "00000000:E1:00.0",
+            "limit_w": 400,
+            "base_w": 150.0,
+            "max_w": 450.0,
+            "fallback_w": 325.0,
+            "sensor_fail_w": 150.0,
+            "throttle_start_c": 75.0,
+            "target_c": 80.0,
+            "hard_c": 85.0,
+            "reading": {
+              "temperature_c": 51.0,
+              "power_w": 20.472,
+              "utilization_pct": 0.0,
+              "mem_utilization_pct": 15.0,
+              "limit_w": 400.0,
+              "sm_clock_mhz": 180.0,
+              "mem_clock_mhz": 405.0,
+              "throttle_mask": 0,
+              "fan_pct": 57.0,
+              "tlimit_c": 42.0,
+              "power_capped": false,
+              "mem_total_mib": 97887.0,
+              "mem_used_mib": 9.0625,
+              "mem_free_mib": 97237.4375,
+              "mem_reserved_mib": 640.5
+            },
+            "processes": null,
+            "throttle_reasons": [],
+            "plan": {
+              "limit_w": 400.00000000000006,
+              "target_w": 400.00000000000006,
+              "bound": "budget",
+              "reason": "idle: base plus spare budget, 400 W of 850 W",
+              "sensor_ok": true,
+              "sensor_error": null,
+              "temperature_smoothed_c": 50.75112104156075,
+              "power_smoothed_w": 20.522204898588992,
+              "pi_w": 450.0,
+              "model_w": null,
+              "correction_w": 0.0,
+              "predicted_c": null,
+              "model_gain": 1.0,
+              "thermal_cap_w": 450.0,
+              "demand_w": 150.0,
+              "share_w": 400.00000000000006,
+              "pinned": false,
+              "idle": true
+            },
+            "model": {
+              "r_self_c_per_w": 0.07694762295333488,
+              "r_c_per_w": [
+                0.013871437596096103,
+                0.07694762295333488
+              ],
+              "tau_s": 16.081764381709124,
+              "t_amb_c": 40.59057854380451,
+              "samples": 507733,
+              "power_std_w": 82.51180158693654,
+              "residual_c": 1.8412966922081289,
+              "fan_mean_pct": 65.46804106116159,
+              "confidence": 1.0,
+              "plausible": true,
+              "confident": false
+            },
+            "model_active": false
+          }
+        ]
+      },
+      "governor_name": "gpu-powerd",
+      "source": "gpu-powerd",
+      "governor_budget_w": 850.0
+    }
+  }
+}
