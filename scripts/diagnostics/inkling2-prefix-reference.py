@@ -18,6 +18,10 @@ import torch.nn.functional as F
 from families.inkling2.model import Config, Weights, TEXT, REVISION, rms_norm, layer_forward, output_norm, head_forward
 
 
+def is_partial(last_layer, layers):
+    return last_layer + 1 != layers
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--snapshot', type=Path, required=True)
@@ -64,7 +68,7 @@ def main():
         args.out.mkdir(parents=True)
         logits.float().cpu().numpy().tofile(args.out/'logits.bin')
         (args.out/'tokens.bin').write_bytes(b''.join(int(t).to_bytes(4,'little') for t in tokens))
-        (args.out/'result.json').write_text(json.dumps(dict(partial=True, last_layer=args.last_layer,
+        (args.out/'result.json').write_text(json.dumps(dict(partial=is_partial(args.last_layer,cfg.num_hidden_layers), last_layer=args.last_layer,
             mean_nll=nll, vocab=cfg.unpadded_vocab_size, rows=len(tokens)-1,
             oracle='python/reference/families/inkling2/model.py #1915'), indent=2)+'\n')
         print(f'Inkling partial reference mean NLL={nll:.8f}', flush=True)

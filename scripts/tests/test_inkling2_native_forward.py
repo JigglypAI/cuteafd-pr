@@ -49,3 +49,18 @@ def test_owner_reconciliation_is_per_id_and_stream_slabs_are_allowances():
     assert 'admission::reconcile_native(&plan, devices, &receipts)' in golden
     assert 'measured == admitted' in golden
     assert 'measured <= admitted' not in golden
+
+
+def test_reference_full_depth_metadata_and_no_stage_hooks_in_arithmetic():
+    import ast
+    path=ROOT/'scripts/diagnostics/inkling2-prefix-reference.py'
+    tree=ast.parse(path.read_text())
+    node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='is_partial')
+    scope={}
+    exec(compile(ast.Module(body=[node],type_ignores=[]),str(path),'exec'),scope)
+    assert scope['is_partial'](0,48)
+    assert scope['is_partial'](35,48)
+    assert not scope['is_partial'](47,48)
+    assert 'partial=is_partial(args.last_layer,cfg.num_hidden_layers)' in path.read_text()
+    assert 'owner.tap(' not in (FAMILY/'layers.rs').read_text()
+    assert 'diagnostics' not in (FAMILY/'owners.rs').read_text()
