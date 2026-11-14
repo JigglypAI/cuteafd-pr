@@ -107,12 +107,22 @@ fn run(args: GoldenArgs) -> Result<()> {
             }
             Ok(())
         })?;
+        if args.tap_layers.contains(&index) {
+            stream.drain()?;
+            let out = args.save_logits.join(format!("layer-{index}"));
+            std::fs::create_dir(&out)?;
+            for (name, source) in [("input_partial", "partial"), ("input_arena", "residual_arena")] {
+                let buffer = owner.buffer(source)?;
+                let mut bytes = vec![0u8; buffer.bytes];
+                device.run(|| library.copy_d2h(&mut bytes, buffer))?;
+                std::fs::write(out.join(format!("{name}.bin")), bytes)?;
+            }
+        }
         let experts = device.run(|| Mxfp8::load(Rc::clone(&stream), layout, &metadata, &package, &cfg, rows))?;
         device.run(|| super::prefill::layer(&kernels, &owner, &weights, &experts, &cfg, index, rows))?;
         stream.drain()?;
         if args.tap_layers.contains(&index) {
             let out = args.save_logits.join(format!("layer-{index}"));
-            std::fs::create_dir(&out)?;
             for name in ["partial", "mixed", "projection_input", "route_ids", "route_weights", "route_logits"] {
                 let buffer = owner.buffer(name)?;
                 let mut bytes = vec![0u8; buffer.bytes];
@@ -120,7 +130,9 @@ fn run(args: GoldenArgs) -> Result<()> {
                 std::fs::write(out.join(format!("{name}.bin")), bytes)?;
             }
             std::fs::write(out.join("meta.json"), serde_json::to_vec_pretty(&serde_json::json!({
-                "rows":rows,"hidden":cfg.hidden,"experts":cfg.experts,"topk":cfg.topk,"local":cfg.local[index]}))?)?;
+                "rows":rows,"arena_rows":owner.layout.rows,"arena_candidates":owner.layout.blocks,
+                "completed_blocks":index.div_ceil(cfg.res_block),"hidden":cfg.hidden,"experts":cfg.experts,
+                "topk":cfg.topk,"local":cfg.local[index],"provenance":"exact native F32 input partial and residual arena, copied before layer"}))?)?;
         }
         let physical = [args.device];
         let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
