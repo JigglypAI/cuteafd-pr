@@ -26,6 +26,7 @@ pub(crate) struct GoldenArgs {
     #[arg(long)] check_headers: bool,
     /// Diagnostic native hidden/routes/logits at selected zero-based layers.
     #[arg(long, value_delimiter=',')] tap_layers: Vec<usize>,
+    #[arg(long, requires="tap_layers")] tap_stages: bool,
 }
 
 pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
@@ -118,9 +119,15 @@ fn run(args: GoldenArgs) -> Result<()> {
                 std::fs::write(out.join(format!("{name}.bin")), bytes)?;
             }
         }
+        if args.tap_stages && args.tap_layers.contains(&index) {
+            let folder=args.save_logits.join(format!("layer-{index}/stages"));
+            std::fs::create_dir(&folder)?;
+            *owner.diagnostics.borrow_mut()=Some(folder);
+        }
         let experts = device.run(|| Mxfp8::load(Rc::clone(&stream), layout, &metadata, &package, &cfg, rows))?;
         device.run(|| super::prefill::layer(&kernels, &owner, &weights, &experts, &cfg, index, rows))?;
         stream.drain()?;
+        *owner.diagnostics.borrow_mut()=None;
         if args.tap_layers.contains(&index) {
             let out = args.save_logits.join(format!("layer-{index}"));
             for name in ["partial", "mixed", "projection_input", "route_ids", "route_weights", "route_logits"] {

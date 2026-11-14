@@ -10,6 +10,7 @@ use std::{collections::BTreeMap, rc::Rc};
 pub(crate) struct UnitOwner<'a> {
     pub stream: Rc<Stream<'a>>,
     pub layout: UnitLayout,
+    pub diagnostics: std::cell::RefCell<Option<std::path::PathBuf>>,
     buffers: BTreeMap<String, Allocation<'a>>,
 }
 impl<'a> UnitOwner<'a> {
@@ -18,12 +19,20 @@ impl<'a> UnitOwner<'a> {
         let buffers = layout.buffers.iter().map(|(name, bytes)| Ok((name.clone(),
             Allocation::new(stream.device, *bytes, Tag::workspace("inkling2/unit"))?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
-        let owner = Self { stream, layout, buffers };
+        let owner = Self { stream, layout, buffers, diagnostics: Default::default() };
         owner.zero()?;
         Ok(owner)
     }
     pub fn buffer(&self, name: &str) -> Result<cuteafd_ffi::CuteafdDeviceBuffer> {
         Ok(self.buffers.get(name).with_context(|| format!("Inkling unit lacks owner {name}"))?.buffer)
+    }
+    pub fn tap(&self, stage: &str, buffer: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
+        let Some(root) = self.diagnostics.borrow().clone() else { return Ok(()); };
+        self.stream.drain()?;
+        let mut bytes = vec![0u8; buffer.bytes];
+        self.stream.device.run(|| self.stream.device.library.copy_d2h(&mut bytes, buffer))?;
+        std::fs::write(root.join(format!("{stage}.bin")), bytes)?;
+        Ok(())
     }
     pub fn zero(&self) -> Result<()> {
         self.stream.device.run(|| {

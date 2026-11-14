@@ -133,9 +133,11 @@ pub(crate) fn attention(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetW
     let b = |name: &str| owner.buffer(name);
     let norm = if local { "attn_norm.weight" } else { "q_input_norm.weight" };
     k.norm(owner, input, weight(norm)?, b("projection_input")?, false, Precision::Bf16, rows)?;
+    owner.tap("pre_norm", b("projection_input")?)?;
     for (name, out, n) in [("wq_du", "q", 6144), ("wr_du", "r", 768),
         ("gate_attn", "gate", 6144), ("attn_sink_proj", "sinks", 48)] {
         k.project(owner, b("projection_input")?, weight(&format!("attn.{name}.weight"))?, b(out)?, rows, 4608, n)?;
+        owner.tap(out, b(out)?)?;
     }
     for (branch, proj, out, convolved, history) in [("k", "wk_dv", "k", "conv_k", "k_conv_history"),
         ("v", "wv_dv", "v", "conv_v", "v_conv_history")] {
@@ -146,6 +148,7 @@ pub(crate) fn attention(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetW
                 false, Precision::Bf16, rows)?;
         }
         k.project(owner, b("projection_input")?, weight(&format!("attn.{proj}.weight"))?, b(out)?, rows, 4608, 1024)?;
+        owner.tap(out, b(out)?)?;
         let dynamic = if local { b(out)? } else {
             let name = format!("{branch}_dynamic");
             k.project(owner, b("projection_input")?, weight(&format!("attn.{branch}_sconv.weight_proj"))?,
@@ -191,6 +194,7 @@ pub(crate) fn attention(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetW
         k.producer(Op::KvPack { precision: Precision::F32 })?.launch(&[b("k_clipped")?, b("v_norm")?,
             b("cache_slots")?, if local { b("kv_step")? } else { b("global_cache")? }], rows, None, owner.stream.raw)?;
     }
+    for name in ["q_bf16", "relative", "kv_step"] { owner.tap(name, b(name)?)?; }
     let batch = Batch { rows, q: b("q_bf16")?, kv: if local { b("kv_step")? } else { b("global_cache")? },
         positions: b("positions")?, relative: b("relative")?, sinks: b("sinks")?, output: b("attended")?, scratch: b("attention_scratch")? };
     if local {
@@ -199,6 +203,7 @@ pub(crate) fn attention(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetW
         k.global.global(batch, Global { pages: b("global_cache")?.bytes/(64*4096), page_table: b("page_table")?,
             table_width: owner.layout.buffers["page_table"]/4, splits: 1 }, owner.stream.raw)?;
     }
+    owner.tap("attended", b("attended")?)?;
     // F32 gate producer consumes F32 attended values. Widen BF16 through a
     // zeroed F32 destination before gating; no host data path.
     // SAFETY: q has6144 F32 values per row and is no longer read by attention;
@@ -210,7 +215,9 @@ pub(crate) fn attention(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetW
             b("q_clipped")?], rows, None, owner.stream.raw)?;
         k.narrow.launch(b("q_clipped")?.ptr, b("gated")?.ptr, rows*6144, owner.stream.raw)?;
     }
+    owner.tap("gated", b("gated")?)?;
     k.project(owner, b("gated")?, weight("attn.wo_ud.weight")?, b("branch")?, rows, 6144, 4608)?;
+    owner.tap("wo", b("branch")?)?;
     k.convolution(owner, b("branch")?, weight("attn_sconv.weight")?, b("branch")?, b("attention")?,
         "attn_conv_history", 4608, false, rows)
 }
@@ -265,7 +272,9 @@ pub(crate) fn finish_layer(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &Targ
     let arena = b("residual_arena")?;
     let stride = owner.layout.rows*cfg.hidden*4;
     let partial = b("partial")?;
+    owner.tap("mlp_norm", b("projection_input")?)?;
     routed_ffn(k, owner, target, experts, cfg, index, rows)?;
+    for name in ["route_logits", "route_ids", "route_weights", "expert_output"] { owner.tap(name, b(name)?)?; }
     // SAFETY: expert BF16 output widens into an independently zeroed F32
     // plane; no extra weight representation or host synchronization is used.
     unsafe {
