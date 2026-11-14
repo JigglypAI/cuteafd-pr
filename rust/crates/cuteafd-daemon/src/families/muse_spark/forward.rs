@@ -43,16 +43,33 @@ pub(crate) fn inject_media(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane
         lane.rows("hidden", rows)?, rows, cfg.hidden, 1, stream)?))
 }
 
+/// Views of admitted owners at the selected physical head width, never enlarging an owner.
+pub(crate) fn head_planes(cfg: &MuseSparkConfig, globals: &super::weights::GlobalWeights<'_>,
+    rows: usize, stored_owner: Buffer, trimmed_owner: Buffer) -> Result<(Buffer, Buffer, Buffer)> {
+    let stored = globals.stored_head_outputs(cfg.vocab_size);
+    ensure!(rows > 0 && stored >= cfg.vocab_size, "Muse head plane geometry");
+    let bytes = |width: usize| rows.checked_mul(width).and_then(|n| n.checked_mul(4))
+        .context("Muse head plane size overflow");
+    let (stored_bytes, logical_bytes) = (bytes(stored)?, bytes(cfg.vocab_size)?);
+    ensure!(stored_owner.bytes >= stored_bytes && trimmed_owner.bytes >= logical_bytes,
+        "Muse head plane owner too small: stored {}/{stored_bytes}, trimmed {}/{logical_bytes}",
+        stored_owner.bytes, trimmed_owner.bytes);
+    Ok((Buffer { bytes: stored_bytes, ..stored_owner },
+        Buffer { bytes: logical_bytes, ..trimmed_owner },
+        Buffer { bytes: logical_bytes, ..stored_owner }))
+}
+
 /// The head over `rows` (a contiguous range of the step's rows) on the head rank.
 pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super::lane::LaneViews,
     rows: std::ops::Range<usize>, stream: *mut c_void) -> Result<Buffer> {
     rank.check_head_stream(stream)?;
     let (stored_plane, trimmed) = rank.head.as_ref().context("Muse head rank without logits planes")?;
-    let (h, vocab, stored) = (cfg.hidden, cfg.vocab_size, rank.globals.head.as_ref().map_or(cfg.vocab_size, |weights| weights.shape[0]));
+    let h = cfg.hidden;
     let device = rank.device_with(cfg, stream, lane);
     let count = rows.len();
     ensure!(count > 0 && count <= HEAD_ROWS && rows.end <= lane.rows,
         "Muse head rows {rows:?} outside the step or its {HEAD_ROWS}-row capacity");
+    let (staged, trimmed, logits) = head_planes(cfg, &rank.globals, count, stored_plane.buffer, trimmed.buffer)?;
     let hidden = view(lane.plane("hidden")?, rows.start * h * 2, count * h * 2);
     let normed = view(lane.plane("normed")?, rows.start * h * 2, count * h * 2);
     // SAFETY: lane planes and the final norm weight are live on this device, ordered on `stream`.
@@ -62,9 +79,6 @@ pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super
     }
     // One launch scores at most HEAD_ROWS rows (the head program's capacity and its
     // planes); the backend scores wider steps in calls of at most that many.
-    let staged = Buffer { bytes: count * stored * 4, ..stored_plane.buffer };
-    let trimmed = Buffer { bytes: count * vocab * 4, ..trimmed.buffer };
-    let logits = Buffer { bytes: count * vocab * 4, ..stored_plane.buffer };
     project_head(cfg, rank, count, normed, staged, trimmed, logits, stream)?;
     Ok(logits)
 }

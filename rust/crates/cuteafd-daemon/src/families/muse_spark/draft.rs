@@ -146,8 +146,7 @@ impl<'a> MuseDraft<'a> {
     pub(crate) fn draft(&self, cfg: &MuseSparkConfig, head: &RankResources<'a>,
         table: &crate::shared::token_io::TokenEmbedding<'_>, sequences: &[DraftSeq]) -> Result<Vec<Draft>> {
         ensure!(sequences.len() * self.block <= self.rows, "Muse draft batch beyond its admitted rows");
-        let (vocab, stored) = (cfg.vocab_size,
-            head.globals.stored_head_outputs(cfg.vocab_size));
+        let vocab = cfg.vocab_size;
         let (stored_plane, trimmed_plane, ids) = (self.stored.buffer, self.trimmed.buffer, self.ids.buffer);
         let input = |tokens: &[u32], output: Buffer, stream: *mut c_void| -> Result<()> {
             ensure!(stream == self.stream, "Muse draft input on another stream");
@@ -157,8 +156,7 @@ impl<'a> MuseDraft<'a> {
             ensure!(stream == self.stream && rows <= self.rows, "Muse draft head on another stream or too wide");
             let device = self.device.id;
             let input = Buffer { ptr: x.cast_mut(), bytes: rows * cfg.hidden * 2, device_id: device, flags: 0 };
-            let staged = Buffer { bytes: rows * stored * 4, ..stored_plane };
-            let trimmed = Buffer { bytes: rows * vocab * 4, ..trimmed_plane };
+            let (staged, trimmed, _) = super::forward::head_planes(cfg, &head.globals, rows, stored_plane, trimmed_plane)?;
             let out = Buffer { ptr: logits.cast(), bytes: rows * vocab * 4, device_id: device, flags: 0 };
             super::forward::project_head(cfg, head, rows, input, staged, trimmed, out, stream)
         };

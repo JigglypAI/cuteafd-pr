@@ -394,9 +394,26 @@ mod tests {
             let rows=admitted.sequences*admitted.block;
             assert_eq!(admitted.head_scratch,(rows*(weights.stored_head_outputs(cfg.vocab_size)+cfg.vocab_size)*4) as u64);
         }
+        for rows in [1, 64, 128] {
+            let owner = |bytes| cuteafd_ffi::CuteafdDeviceBuffer {
+                ptr: std::ptr::null_mut(), bytes, device_id: 0, flags: 0 };
+            let stored_owner = owner(rows * 202112 * 4);
+            let trimmed_owner = owner(rows * cfg.vocab_size * 4);
+            let (staged, trimmed, logits) = super::super::forward::head_planes(
+                &cfg, &weights, rows, stored_owner, trimmed_owner)?;
+            assert_eq!(staged.bytes, rows * 202112 * 4);
+            assert_eq!(trimmed.bytes, rows * cfg.vocab_size * 4);
+            assert_eq!(logits.bytes, trimmed.bytes);
+            assert!(super::super::forward::head_planes(&cfg, &weights, rows,
+                owner(rows * cfg.vocab_size * 4), trimmed_owner).unwrap_err()
+                .to_string().contains("owner too small"));
+            assert!(super::super::forward::head_planes(&cfg, &weights, rows,
+                stored_owner, owner(trimmed_owner.bytes - 4)).is_err());
+        }
         let draft=include_str!("draft.rs");
-        assert_eq!(draft.matches("head.globals.stored_head_outputs(cfg.vocab_size)").count(),2,
-            "both drafter allocation and launch must use the selected head width");
+        assert!(draft.contains("super::forward::head_planes(cfg, &head.globals, rows, stored_plane, trimmed_plane)?"));
+        assert!(include_str!("forward.rs").contains(
+            "head_planes(cfg, &rank.globals, count, stored_plane.buffer, trimmed.buffer)?"));
         Ok(())
     }
 
