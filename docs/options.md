@@ -94,9 +94,13 @@ On one RTX, `ATTENTION_PLACEMENT=auto|heads` selects whole ownership. On two RTX
 `auto|heads` selects native head splitting with half KV and replicated index.
 Explicit `layers` keeps contiguous attention and FP32 split FFNs. Boot-C16 split
 router, FFN and fold/publication sections replay through the shared graph cache;
-attention and peer receive waits stay eager. Explicit two-RTX `heads` selects
-half KV with replicated index and native FP32 partials; context remains unsupported.
-`SPECULATOR=off`, `VISION=off` and `AUDIO=off` are required for this increment.
+attention and peer receive waits stay eager. Context placement remains unsupported.
+`SPECULATOR=off` remains the default (`auto` also resolves off until qualification).
+Explicit `SPECULATOR=dspark` enables the checkpoint's bundled native mixed
+BF16/MXFP8 drafter through the shared scheduler; it requires a matching WIP build
+and remains under strict lossless, prefix, memory and throughput qualification.
+`DRAFT_LENGTH` caps the seven-token native block; `SPECULATION_TRACE` records
+shared draft/verify evidence. `VISION=off` and `AUDIO=off` remain required.
 
 Shared launch keys keep their usual meanings. MiniMax accepts
 `RTX_EXPERT_LAYERS=auto|all|N`, `PREFILL_ROWS`, `PREFILL_WAVES`,
