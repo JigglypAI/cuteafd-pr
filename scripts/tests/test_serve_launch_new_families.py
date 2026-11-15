@@ -79,6 +79,41 @@ def test_minimax_qualified_card_opens_one_rtx_three_sparks_public_launch(tmp_pat
     assert entry["config"] == "examples/configs/minimax-m31-flash-nvfp4-min.config"
 
 
+@pytest.mark.parametrize("gpus,placement", [(1, "auto"), (2, "layers"), (2, "heads")])
+@pytest.mark.parametrize("selection", [None, "auto", "dspark", "off"])
+def test_minimax_dspark_default_and_explicit_off_match_plan_and_serve(tmp_path, gpus, placement, selection):
+    config = {"model_type": "minimax_m3_vl", "text_config": {
+        "num_hidden_layers": 60, "moe_layer_freq": [0] * 3 + [1] * 57}}
+    ranks = 3 if gpus == 1 else 4
+    hosts = "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(ranks))
+    keys = (f"SPARK_COUNT={ranks}\nRTX_GPUS={gpus}\nATTENTION_PLACEMENT={placement}\n"
+            "VISION=off\nAUDIO=off\n") + hosts
+    if selection is not None:
+        keys += f"SPECULATOR={selection}\n"
+    result = _family_launch_result(tmp_path, config, "MiniMaxAI/MiniMax-M3.1-Flash", keys,
+        encoder_plan=PLANNED)
+    serve = _line(result, "serve-minimax --snapshot")
+    plan = _line(result, "cuteafd plan ")
+    enabled = selection != "off"
+    assert ("--dspark" in shlex.split(serve)) == enabled
+    assert ("--dspark=false" in shlex.split(serve)) == (not enabled)
+    assert _flag(plan, "--speculator") == ("dspark" if enabled else "off")
+    if gpus == 2:
+        assert _flag(serve, "--split-device") == "1"
+
+
+@pytest.mark.parametrize("mode", ["simple", "shared", "simple-rc", "simple-derived"])
+def test_minimax_preserves_explicit_draft_policy(tmp_path, mode):
+    config = {"model_type": "minimax_m3_vl", "text_config": {
+        "num_hidden_layers": 60, "moe_layer_freq": [0] * 3 + [1] * 57}}
+    hosts = "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(3))
+    result = _family_launch_result(tmp_path, config, "MiniMaxAI/MiniMax-M3.1-Flash",
+        f"SPARK_COUNT=3\nRTX_GPUS=1\nDRAFT_POLICY={mode}\nVISION=off\nAUDIO=off\n" + hosts,
+        encoder_plan=PLANNED)
+    serve = _line(result, "serve-minimax --snapshot")
+    assert f"CUTEAFD_DRAFT_POLICY={mode}" in serve
+
+
 @pytest.mark.parametrize("filter", ["", "info,cuteafd::shared::mapped_table=debug"])
 def test_generic_log_filter_reaches_coordinator_and_workers(tmp_path: Path, filter: str) -> None:
     result = _kimi(tmp_path, extra_env={"RUST_LOG": filter})

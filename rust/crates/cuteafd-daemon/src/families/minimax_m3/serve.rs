@@ -28,8 +28,10 @@ pub(crate) struct ServeArgs {
     pub max_sequences: u8,
     #[arg(long, default_value = "0.0.0.0:8000")] pub listen: String,
     #[arg(long)] pub model_id: Option<String>,
-    /// Explicit bundled native DSpark; remains off until qualification passes.
-    #[arg(long,default_value_t=false)] pub dspark: bool,
+    /// Bundled native DSpark; --dspark=false disables it.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+        num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub dspark: bool,
     #[command(flatten)] pub draft_length: crate::shared::draft::length::DraftLength,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
         num_args = 0..=1, default_missing_value = "true", require_equals = true)]
@@ -72,6 +74,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     use cuteafd_api::openai::{ModelProfile, NativeRequest};
     use std::sync::Mutex;
     cuteafd_core::concurrency::validate("minimax_m3", u64::from(args.max_sequences))?;
+    // Probes and selection must resolve the same policy before either is initialized.
+    crate::shared::draft::draft_mode_with_default(cuteafd_core::DraftMode::Shared);
     ensure!(matches!(args.token_io.embed_placement, crate::shared::token_io::EmbedPlacement::Gpu)
         && args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device,
         "MiniMax serving requires admitted GPU embedding and device selection");
@@ -179,6 +183,36 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bundled_dspark_defaults_on_for_all_placements_and_has_explicit_off() -> Result<()> {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-minimax", "--snapshot", "/fixture", "--native-lib", "/native"];
+        for placement in ["auto", "heads", "layers"] {
+            for peer in [None, Some("1")] {
+                for (flag, enabled) in [(None, true), (Some("--dspark"), true),
+                    (Some("--dspark=false"), false), (Some("--dspark=true"), true)] {
+                    let mut argv = base.to_vec();
+                    argv.extend(["--attention-placement", placement]);
+                    if let Some(peer) = peer { argv.extend(["--split-device", peer]); }
+                    if let Some(flag) = flag { argv.push(flag); }
+                    let crate::cli::Commands::ServeMinimax(args) = crate::cli::Cli::try_parse_from(argv)?.command
+                        else { unreachable!() };
+                    assert_eq!(args.dspark, enabled);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_policy_fallback_is_selected_before_probes_and_native_startup() {
+        let source = include_str!("serve.rs").split_once("pub(crate) async fn run(").unwrap().1
+            .split_once("#[cfg(test)]").unwrap().0;
+        let policy = source.find("draft_mode_with_default(cuteafd_core::DraftMode::Shared)").unwrap();
+        assert!(policy < source.find("cuteafd_ffi::NativeLibrary::load(").unwrap());
+        assert!(policy < source.find("super::startup::load(").unwrap());
+    }
+
     #[test]
     fn serve_fixes_expert_geometry_before_any_native_library_load() {
         let source = include_str!("serve.rs").split_once("pub(crate) async fn run(").unwrap().1

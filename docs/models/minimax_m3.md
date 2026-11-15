@@ -13,11 +13,16 @@ MiniMax exports. The existing [minimum config](../../examples/configs/minimax-m3
 has the qualified geometry; its old WIP-only comments are historical. Set your
 own endpoints and use images built from the qualified source, not the config's
 older image tags. Shared settings are in [MiniMax Serving](../options.md#minimax-serving).
-Keep `SPECULATOR=off` for qualified serving; `auto` remains off. A matching WIP
-build accepts explicit `SPECULATOR=dspark` for bundled native drafter qualification
-through shared speculation and exact window snapshots; this is not yet a qualified
-default. Keep `VISION=off` and `AUDIO=off`; remaining gates are tracked in
-[#1856](https://github.com/tpurtell/cuteafd/issues/1856).
+Bundled native DSpark defaults on for one RTX, two-RTX Layers and two-RTX Heads:
+unset/`SPECULATOR=auto` selects `dspark`; `SPECULATOR=off` disables it. Direct
+`cuteafd serve --family minimax_m3` uses the same default, with `--dspark=false`
+as its explicit disable. MiniMax alone uses the shared concurrency-aware draft
+policy by default; explicit `DRAFT_POLICY` values still win, and `DRAFT_LENGTH`
+keeps its fixed-length override. Other families are unchanged (#2220).
+The example's explicit `SPECULATOR=off` stays in force until its separate line
+change joins the next placement-input publication batch; remove that line or set
+`dspark` to use the family default now. Keep `VISION=off` and `AUDIO=off`;
+remaining gates are tracked in [#1856](https://github.com/tpurtell/cuteafd/issues/1856).
 
 `ATTENTION_PLACEMENT=auto|heads` retains whole-layer ownership on one RTX
 (the API calls its single-rank mode `heads`). On two RTX, `auto|heads` selects
@@ -65,6 +70,41 @@ prefix cache, 2.02 GiB RDMA rings, 97.44 MiB Spark intake and 4.42 MiB sync-H2D
 staging are identical. Replicated KV/index buffers are on-device. Startup
 non-file RSS is about 2.23 MiB higher for Heads; whole-host anonymous growth
 in the timed windows is not process-attributable from the retained probes.
+
+### Native DSpark Qualification (#2165)
+
+The bundled drafter verifies causal query rows through native captured decode;
+zero-proposal rounds retain target taps and publish only after the shared commit.
+Strict sequential and true-concurrent boot-C4 checks pass 10/10 on one RTX and
+Heads, including identical emitted IDs/raw-logit hashes. The native oracle compares
+logits, taps, physical KV/index pages and full draft windows/frontiers byte-for-byte
+against independent plain native decode, including a following proposal-bearing
+verify/commit. No new compiled program or kernel export is needed.
+
+Retained same-seal measurements (2026-11-15, `694026976`, RTX PRO 6000, three/four
+Sparks, boot C16, one warmed launch per arm) give DSpark-on/off emitted tok/s ratios:
+
+| Layout | C1 | C4 | C16 | Explicit 8K prefill |
+| --- | ---: | ---: | ---: | ---: |
+| 1 RTX + 3 Sparks | 1.755 | 1.295 | 1.122 | 0.996 |
+| 2 RTX Layers + 4 Sparks | 1.869 | 1.182 | 1.031 reversed | 0.974 |
+| 2 RTX Heads + 4 Sparks | 1.587 | 1.396 | 1.126 | 0.975 reversed |
+
+The first Layers C16 pair was 0.936; the targeted reverse-order pair is
+260.07 on / 252.31 off. Heads explicit 8K was initially 0.936; reversed it is
+2291.15 on / 2349.07 off. The prefill cost is not hidden, and reversed values
+are not presented as a repeated-session average. Shared policy's per-layer timing
+is enabled in both arms; these are the measured policy's actual costs. Quality
+passes on all three cards; one-RTX admitted KV pool is 1,138,688 off / 1,073,152 on,
+while both two-RTX layouts keep 2,097,152 tokens.
+
+Sweep windows show zero power-cap or thermal slowdown. Initial maximum temperature
+is 58-61 C, minimum T.Limit headroom 33-38 C, available busy clocks 2767-2856 MHz
+(one-RTX on lacks busy-clock samples). Reversed windows peak at 54 C with at least
+40 C headroom; available busy clocks are 2782-2853 MHz. Retained receipts report
+no host/fabric caveats. Receipts are `v51-minimax-native-default-ab`,
+`v51-minimax-layers-c16-reversed` and `v51-minimax-heads-8192-reversed` under the
+local build cache; no measurements were rerun for the default-only landing.
 
 ## Qualification
 
