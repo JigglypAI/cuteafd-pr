@@ -341,7 +341,7 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
 
     fn write_inkling_release_text_snapshot(snapshot: &std::path::Path, format: &str,
         source: &std::path::Path) -> Result<()> {
-        use cuteafd_loader::{families::inkling2::Inkling2Config, plan::testing::{t, write_snapshot}};
+        use cuteafd_loader::{families::inkling2::Inkling2Config, plan::testing::{self, t, write_snapshot}};
         let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(source.join(
             "rust/crates/cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
         config.as_object_mut().unwrap().remove("vision_config");
