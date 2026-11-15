@@ -440,3 +440,16 @@ def test_qwen_pool_first_onboarding_documents_whole_and_hybrid_tp2():
     assert "`RTX_EXPERT_LAYERS=auto` is pool-first on one or two RTX devices" in text
     assert "Spark-backed layouts: whole routed layers on one RTX, TP2 halves on two" in text
     assert "`--rtx-expert-layers` does not require `--split-device`" in text
+
+
+def test_mc_mtp_docs_distinguish_original_core_from_unchanged_experts():
+    text = DOC.read_text()
+    assert "projections stay K4 in every view" not in text
+    assert "restore native BF16 MTP core matrices in `original`" in text
+    assert "MTP routed experts are unchanged" in text
+    assert "neither loaded nor charged" in text
+    assert "not converted by `fp8-compact`" in text
+    for family in ["glm5", "glm5_flash", "step5"]:
+        doc = (ROOT / "docs" / "models" / f"{family}.md").read_text()
+        core = doc.split("## Core views", 1)[1].split("\n## ", 1)[0]
+        assert "MTP core" in core and "BF16" in core and "K4 MTP" in core

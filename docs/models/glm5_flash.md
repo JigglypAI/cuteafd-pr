@@ -41,11 +41,16 @@ placeholder Spark hosts and addresses): Official FP8 [min](../../examples/config
 `wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC` follows the
 [MC contract](../mc-checkpoints.md): `CORE_VIEW=original` retains every
 source-native BF16 core projection; `k8-compact` and `k6-compact` select
-complete trellis cores. Plain checkpoints have no implicit compact views.
+complete trellis cores. Repaired revisions include BF16 MTP core in `original`,
+while stored compact views retain their existing K4 MTP core. MTP routed
+experts remain quantized and unchanged. Native MTP is unused with the shipped
+external drafters: MTP core and experts retain speculator ownership, are not
+loaded or charged, and are not converted by `fp8-compact`.
+Plain checkpoints have no implicit compact views.
 FP8 conversion retains the family's existing runtime scope; no tower,
 router, embedding or routed expert is converted by core selection.
 
-`fp8-compact` converts the selected original attention, dense/shared FFN
+`fp8-compact` converts the selected target-owned original attention, dense/shared FFN
 and vocabulary-head matrices to block FP8. It leaves native keep tensors,
 routers, embeddings, the vision tower and routed experts unchanged.
 Max K8/K6/FP8 comparisons are supplementary to the original-view card.

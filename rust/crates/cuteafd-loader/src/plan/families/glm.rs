@@ -52,6 +52,15 @@ fn strip_model_prefix(name: &str) -> Option<&str> {
     name.strip_prefix("model.language_model.").or_else(|| name.strip_prefix("model."))
 }
 
+/// Native MTP is unused with these families' external drafters.
+pub(crate) fn native_mtp_role(layers: usize, name: &str) -> Option<TensorRole> {
+    let (layer, rest) = indexed(strip_model_prefix(name)?, "layers.")?;
+    if layer < layers { return None; }
+    Some(if let Some((expert, _)) = indexed(rest, "mlp.experts.") {
+        TensorRole::expert(Component::SpeculatorExpert, layer, expert)
+    } else { TensorRole::layer(Component::Speculator, layer) })
+}
+
 impl Family for Glm {
     fn eager_native_core_headers(&self) -> bool { true }
     fn fp8_prefill_groups(&self) -> &'static [crate::plan::fp8_prefill::Group] {
@@ -106,6 +115,7 @@ impl Family for Glm {
         if name.starts_with("model.visual.") || name.starts_with("visual.") || name.starts_with("model.vision") {
             return Some(TensorRole::new(Vision));
         }
+        if let Some(role) = native_mtp_role(spec.layers.len(), name) { return Some(role); }
         let name = strip_model_prefix(name)?;
         match name {
             "embed_tokens.weight" => return Some(TensorRole::new(Embedding)),
@@ -113,13 +123,6 @@ impl Family for Glm {
             _ => {}
         }
         let (layer, rest) = indexed(name, "layers.")?;
-        // The layer after the backbone is the native MTP layer.
-        if layer >= spec.layers.len() {
-            if let Some((expert, _)) = indexed(rest, "mlp.experts.") {
-                return Some(TensorRole::expert(SpeculatorExpert, layer, expert));
-            }
-            return Some(TensorRole::layer(Speculator, layer));
-        }
         if let Some((expert, _)) = indexed(rest, "mlp.experts.") {
             return Some(TensorRole::expert(RoutedExpert, layer, expert));
         }

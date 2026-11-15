@@ -644,6 +644,63 @@ mod tests {
     }
 
     #[test]
+    fn repaired_mc_original_mtp_is_not_loaded_or_charged_to_target() -> Result<()> {
+        use crate::plan::{checkpoint::{CheckpointView, CoreView, ProjectionStorage}, testing,
+            family::Family, families::glm::GLM5, files::{required_tensors, ReadRole}, Component};
+        let mut cfg = GlmDsaConfig::from_hf(&testing::glm5_config())?;
+        cfg.mtp_layers = 1;
+        let cp = checkpoint(&cfg);
+        let mut config = cp.config.clone();
+        config["num_nextn_predict_layers"] = serde_json::json!(1);
+        let target = expected(&cfg);
+        let root = format!("model.layers.{}", cfg.layers);
+        let mut mtp = BTreeMap::new();
+        for (leaf, n, k) in [("self_attn.q_a_proj", cfg.q_lora_rank, cfg.hidden),
+            ("self_attn.kv_a_proj_with_mqa", cfg.kv_lora_rank + cfg.qk_rope_head_dim, cfg.hidden),
+            ("self_attn.q_b_proj", cfg.heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), cfg.q_lora_rank),
+            ("self_attn.o_proj", cfg.hidden, cfg.heads * cfg.v_head_dim),
+            ("mlp.shared_experts.gate_proj", cfg.moe_intermediate, cfg.hidden),
+            ("mlp.shared_experts.up_proj", cfg.moe_intermediate, cfg.hidden),
+            ("mlp.shared_experts.down_proj", cfg.hidden, cfg.moe_intermediate),
+            ("eh_proj", cfg.hidden, 2 * cfg.hidden)] {
+            mtp.insert(format!("{root}.{leaf}.weight"), vec![n,k]);
+        }
+        let tensors = testing::exl3(&format!("{root}.mlp.experts.0.gate_proj"), cfg.moe_intermediate, cfg.hidden, 4);
+        let dir = tempfile::tempdir()?;
+        testing::write_mc_snapshot_with_mtp(dir.path(), &config, &tensors, &target, &mtp);
+        let mut target_bytes = None;
+        for mode in [CoreView::Original, CoreView::K6Compact, CoreView::K8Compact] {
+            let view = CheckpointView::select(dir.path(), mode)?;
+            let cp = crate::plan::Checkpoint::open_view(&view)?;
+            let model = GLM5.open(&cp)?;
+            let required = required_tensors(&cp, ReadRole::Coordinator { local_experts: false, speculator: true })?;
+            assert!(!required.iter().any(|name| name.starts_with(&root)));
+            let inventory = CoreInventory::from_checkpoint(&cfg, &cp)?;
+            assert!(!inventory.native.keys().chain(inventory.projections.keys()).any(|name| name.starts_with(&root)));
+            for name in mtp.keys() {
+                assert_eq!(GLM5.classify(model.spec(), name).unwrap().component, Component::Speculator);
+                let projection = cp.projection(name.strip_suffix(".weight").unwrap())?;
+                if mode == CoreView::Original {
+                    assert!(matches!(projection.storage, ProjectionStorage::Native { dtype: cuteafd_core::DType::Bf16, .. }));
+                } else { assert_eq!(projection.storage, ProjectionStorage::Exl3); }
+            }
+            let expert = format!("{root}.mlp.experts.0.gate_proj.trellis");
+            assert_eq!(GLM5.classify(model.spec(), &expert).unwrap().component, Component::SpeculatorExpert);
+            assert_eq!(cp.header(&expert).unwrap().shape[2], 64);
+            if mode == CoreView::Original {
+                target_bytes = Some(inventory.native.values().map(|projection|
+                    projection.shape.iter().product::<usize>() * 2).sum::<usize>());
+            }
+        }
+        assert!(target_bytes.unwrap() > 0);
+        // Whole-core GLM FP8 remains a separate executor qualification, not a silent skip.
+        let fp8 = crate::plan::Checkpoint::open_view(&CheckpointView::select(dir.path(), CoreView::Fp8Compact)?)?;
+        assert!(mtp.keys().all(|name| !fp8.converts_to_fp8(name)));
+        assert!(CoreInventory::from_checkpoint(&cfg, &fp8).unwrap_err().to_string().contains("cannot execute block FP8"));
+        Ok(())
+    }
+
+    #[test]
     fn declared_native_attention_checks_mtp_without_making_it_a_runtime_owner() -> Result<()> {
         use crate::plan::checkpoint::CheckpointTensor;
         use cuteafd_core::DType;

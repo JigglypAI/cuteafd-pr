@@ -19,8 +19,10 @@ views run through the shared dense trellis programs. Gate and up stay separate
 projections, and the head-split
 o_proj reduces its F32 partials before one output rotation. Head-wise
 attention gates, the sparse indexer, routers, norms, embeddings and the vision
-tower stay BF16/F32 exactly as shipped. The three MTP stages are K4
-throughout, including each stage's own vocabulary head.
+tower stay BF16/F32 exactly as shipped. At the pinned revision, the three MTP stages are K4
+throughout, including each stage's own vocabulary head. Repaired revisions
+restore their source BF16 non-routed matrices in the original view; stored
+compact views retain their existing K4 MTP matrices.
 
 Everything is read from `config.json` and the safetensors headers;
 `quantize_config.json` is only cross-checked. `cuteafd plan` finds the
@@ -42,9 +44,13 @@ fidelity views are measured ([#1906](https://github.com/tpurtell/cuteafd/issues/
 ## Core views
 
 The published MC follows the [MC contract](../mc-checkpoints.md):
-`CORE_VIEW=original` (default) restores the BF16 target core; `k8-compact`
-and `k6-compact` select complete native trellis cores. Routed experts,
-non-core tensors and the independently owned K4 MTP stages stay unchanged.
+`CORE_VIEW=original` (default) restores the BF16 target core and, in repaired
+revisions, the BF16 MTP core (attention, FFN, EH and private vocabulary heads).
+`k8-compact` and `k6-compact` retain their existing target encodes and K4 MTP
+core. Routed expert encodes and non-core tensors stay unchanged. The selected
+MTP matrices load natively into `step5/mtp/gpuN`, one independently retired
+packed arena; admission charges its physical bytes and single allocation tail,
+not a second payload copy. BF16 original MTP therefore costs more than K4.
 Plain checkpoints refuse compact selectors. Release cards select `original`;
 max-layout compact comparisons use the separate
 `scripts/bench/release-smoke-v51-mc-core-comparison.json` matrix.

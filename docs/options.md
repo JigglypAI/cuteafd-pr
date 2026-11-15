@@ -41,8 +41,12 @@ Stored `k8-compact` and `k6-compact` views are offered by
 `wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC` and
 `wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC`; `cuteafd-mc.json` declares the
 views actually present at the selected revision. Step-5 and GLM 5.3 also execute
-header-native K6/K8 target cores (including vocabulary heads); Step-5 shared MTP
-projections stay K4 in every view. ML4 stays K6-only for quantized core storage;
+header-native K6/K8 target cores (including vocabulary heads). Repaired MC
+revisions restore native BF16 MTP core matrices in `original`; stored compact
+views retain their existing K4 MTP core. MTP routed experts are unchanged.
+GLM 5.3 and GLM Flash use external drafters: their unused native MTP core and
+experts are neither loaded nor charged, and are not converted by `fp8-compact`.
+Step-5 executes its selected MTP core in one separately charged packed arena. ML4 stays K6-only for quantized core storage;
 its FP8 original has no quantized core. Plain checkpoints support only
 `original`, including checkpoints that previously accepted Flash `fp8-compact`.
 GLM 5.3 MC (`c39486376dee84e5faa4904e014e07d7b6e76405`) and Step-5 MC

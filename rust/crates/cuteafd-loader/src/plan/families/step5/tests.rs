@@ -2024,3 +2024,60 @@ fn mc_target_views_preserve_fixed_k4_mtp_contract() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn repaired_mc_original_mtp_has_one_native_bf16_arena_charge() -> anyhow::Result<()> {
+    use crate::plan::checkpoint::{CheckpointView, CoreView};
+    let source = exl3_core_snapshot();
+    let cp = Checkpoint::open(source.path())?;
+    let cfg = Config::parse(&cp)?;
+    let tensors = cp.tensors.iter().map(|t| (t.meta.name.clone(),
+        match t.meta.dtype { DType::Bf16 => "BF16", DType::F16 => "F16", DType::F32 => "F32",
+            DType::I16 => "I16", DType::I32 => "I32", DType::U8 => "U8", DType::F8E4M3 => "F8_E4M3",
+            _ => panic!("fixture dtype") }, t.meta.shape.clone())).collect::<Vec<_>>();
+    let (mtp, target) = exl3::expected(&cfg).into_iter().partition(|(name, _)|
+        name.strip_prefix("model.layers.").and_then(|rest| rest.split('.').next())
+            .and_then(|layer| layer.parse::<usize>().ok()).is_some_and(|layer| layer >= cfg.layers));
+    let dir = tempfile::tempdir()?;
+    testing::write_mc_snapshot_with_mtp(dir.path(), &cp.config, &tensors, &target, &mtp);
+    let mut original_charge = 0;
+    let mut compact_charge = 0;
+    let mut experts = None;
+    for view in [CoreView::Original, CoreView::K6Compact, CoreView::K8Compact] {
+        let checkpoint = Checkpoint::open_view(&CheckpointView::select(dir.path(), view)?)?;
+        let contract = coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?;
+        let layout = coordinator::RankWeightLayout::mtp_from_contract(&checkpoint, &contract, 3)?;
+        let arena = layout.mtp_arena(0)?;
+        assert_eq!(arena.id(), "step5/mtp/gpu0");
+        assert_eq!(arena.padding_bytes() as u64 + layout.resident_bytes, arena.bytes() as u64);
+        let charged = coordinator::RankWeightLayout::mtp_weight_charge(&checkpoint, &contract, 3)?;
+        assert_eq!(charged, arena.bytes() as u64 + crate::placement::planner::allocation_granularity_forecast(&[arena.bytes() as u64])?);
+        let target = coordinator::RankWeightLayout::from_checkpoint(&checkpoint, 0, 1)?;
+        assert!(!target.operands.iter().any(|operand| operand.name.starts_with("model.layers.92.")));
+        for stage in 0..3 {
+            let stage = coordinator::RankWeightLayout::mtp_stage_from_contract(&checkpoint, &contract, stage)?;
+            if view == CoreView::Original {
+                assert!(stage.core.is_empty());
+                assert_eq!(stage.operands.len(), 16);
+                assert!(stage.operands.iter().all(|operand| matches!(operand.dtype, DType::Bf16 | DType::F32)));
+                for operand in stage.operands.iter().filter(|operand| operand.dtype == DType::Bf16) {
+                    assert_eq!(operand.allocation_bytes, (operand.shape.iter().product::<usize>() * 2).max(256) as u64);
+                    assert!(operand.sources.iter().all(|source| source.meta.dtype == DType::Bf16));
+                }
+            } else {
+                assert_eq!(stage.core.len(), 9);
+                assert!(stage.core.values().all(|projection| projection.bits == 4));
+            }
+        }
+        let headers = checkpoint.tensors.iter().filter(|tensor| tensor.meta.name.contains(".moe.experts."))
+            .map(|tensor| (tensor.meta.name.clone(), tensor.shard.clone(), tensor.meta.dtype.clone(),
+                tensor.meta.shape.clone(), tensor.meta.byte_length)).collect::<Vec<_>>();
+        if let Some(expected) = &experts { assert_eq!(expected, &headers); } else { experts = Some(headers); }
+        if view == CoreView::Original { original_charge = charged; }
+        else if view == CoreView::K6Compact { compact_charge = charged; }
+        else { assert_eq!(compact_charge, charged); }
+    }
+    assert!(original_charge > compact_charge);
+    eprintln!("Step-5 MTP physical charge: K4={compact_charge}, original BF16={original_charge}, delta={}", original_charge - compact_charge);
+    Ok(())
+}

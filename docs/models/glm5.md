@@ -37,7 +37,11 @@ The published MC follows the [MC contract](../mc-checkpoints.md).
 `CORE_VIEW=original` (default) restores the source-native BF16 core;
 `k8-compact` and `k6-compact` select complete native trellis cores, including
 attention, dense/shared FFNs and the vocabulary head. Experts and non-core
-tensors are shared unchanged. Plain checkpoints refuse compact selectors.
+tensors are shared unchanged. Repaired revisions also restore native BF16
+MTP core matrices in `original`; stored compact views keep their K4 MTP core.
+MTP routed experts remain quantized and unchanged. Native MTP is unused with
+the shipped external drafters: both MTP core and MTP experts retain speculator
+ownership, are not loaded or charged, and are not converted by `fp8-compact`. Plain checkpoints refuse compact selectors.
 Selected metadata and fingerprints are immutable across planning and serving.
 
 The MC min/max configs above pin `MODEL_ID`, `MODEL_REVISION` and
