@@ -491,6 +491,12 @@ mod tests {
             assert_eq!(owner.scratch, expected);
             assert_eq!(owner.io, 4096*(4608+144+64));
         }
+        for (width, expected) in [(384, 541_249_596), (512, 566_415_420), (640, 591_581_244)] {
+            assert_eq!(recorded_exl3_owner_bytes(&rows, "inkling2", geometry, width, true,
+                extent(4096,4096))?.scratch, expected);
+        }
+        assert!(recorded_exl3_owner_bytes(&rows, "inkling2", geometry, 256, true, extent(4096,4096)).is_err(),
+            "same width's noncompact export is not compact ABI evidence");
         assert!(recorded_exl3_owner_bytes(&rows, "inkling2", geometry, 320, false, extent(4096,4096)).is_err());
         Ok(())
     }
