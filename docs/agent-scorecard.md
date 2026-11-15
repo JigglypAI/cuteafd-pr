@@ -56,15 +56,18 @@ adoption decision; fork #216/#318/#320/#321 remain open.
 
 DeepSeek's final 88-case suite passes both architectures, with every scalar
 numerical receipt identical to base; all six final SM120 timing cells lose
-generic. Carbon's final SM121 88 cases likewise pass with base-identical
-receipts. Its final SM120 oracle and screen are pending the fair queue after
-a grant-time memory-pressure refusal; no SM120 final result is inferred.
+generic. Carbon's final 88 cases also pass both architectures with
+base-identical scalar receipts (SM120 221.39s, SM121 209.87s); all six final
+SM120 timing cells lose generic at both activation widths. Carbon's SM120
+points have zero SW/HW thermal slowdown, max67C/minT.Limit27C, busy SM
+2610-2857MHz. Power-cap counter increments are 0.017080s for Flash256,
+0.016938s for Flash512 and zero for Pro320. These are per-point windows,
+not per-arm attribution; they do not make the large generic losses a tie.
 All measured prefix/poison/live/graph checks pass; raw JSON retains bitwise
 flags and comparison hashes without conflating A8 and A16 arithmetic.
 
 Scores from independently checked work: DeepSeek Correct 5, Judgement 4,
-Quality 4, Creative 4; Carbon Correct 5 for completed gates (final SM120
-pending), Judgement 4, Quality 4, Creative 4. DeepSeek R1 sealed in about
+Quality 4, Creative 4; Carbon Correct 5, Judgement 4, Quality 4, Creative 4. DeepSeek R1 sealed in about
 10 minutes, with bounded selector refinements in R2/R3. Carbon round wall
 was 31m55s / 23m15s / 18m54s; driver steers were 4 / 1 / 2, with two R1
 deadline interrupts and none in R2/R3; no 503s. The gentler R2-on deadline
@@ -86,8 +89,9 @@ so it remains off. This accepted V4.1 result is independent of MiMo adoption.
 Evidence: cuteafd #2129; fork #318/#320/#321/#323; task-root
 `carbon-r3-pro-band.json`, `ds-r3-pro-band.json`,
 `final-pro-comparison.json` and `receipts/` under
-`~/.cache/cuteafd/builds/mxfp4-duel/`. Final Carbon SM120 results will be
-appended before this scorecard PR is marked ready.
+`~/.cache/cuteafd/builds/mxfp4-duel/`. Final SM120 screens are in
+`carbon-r3-sm120.json` and `ds-r3-sm120.json`. The measured duel is complete;
+no additional round, MiMo descriptor, default change or landing is authorized.
 
 ### 2026-11-14 Native FP8 Decode Duel: Fable Final Null
 
