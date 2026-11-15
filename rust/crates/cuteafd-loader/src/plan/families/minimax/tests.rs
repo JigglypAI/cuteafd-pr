@@ -1679,15 +1679,13 @@ fn heads_recipe_matches_native_cache_units_peer_slots_and_one_tail_per_backing()
 }
 
 #[test]
-fn heads_planning_does_not_qualify_serving_and_auto_keeps_layers() {
-    use crate::placement::families::minimax_m3::{self as shared, ServingRefusal};
+fn explicit_heads_qualifies_serving_and_auto_keeps_layers() {
+    use crate::placement::families::minimax_m3 as shared;
     use crate::placement::{AttentionPlacement, planner::Operation};
     let heads = heads_recipe_inputs();
     let request = shared::request(heads.context, Some(1 << 20), crate::placement::Onboard::Auto,
         heads.prefill, Operation::Serving, None, Default::default());
-    let error = heads.admit_serving(request.clone()).unwrap_err();
-    assert!(matches!(error, ServingRefusal::NarrowHeadsNotQualified));
-    assert_eq!(error.to_string(), "narrow-head MiniMax kernels not qualified");
+    assert!(heads.admit_serving(request.clone()).is_ok());
     assert!(heads.admit(request).is_ok(), "explicit planning remains available");
     let layers = recipe_inputs(2, 4);
     assert_eq!(layers.attention, AttentionPlacement::Layers);

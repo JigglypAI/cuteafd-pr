@@ -132,7 +132,7 @@ impl Owner {
 }
 
 /// One RTX keeps Whole execution. Two RTX use contiguous whole attention and
-/// split FFNs; explicit heads has its own unqualified planning descriptor.
+/// split FFNs; explicit heads has its own native execution descriptor.
 pub const MINIMAX_M3: ExecutorModes = ExecutorModes { family: "minimax_m3",
     modes: &[WHOLE, LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner },
         LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }], hops: true,
@@ -141,11 +141,9 @@ pub const MINIMAX_M3: ExecutorModes = ExecutorModes { family: "minimax_m3",
 const HEADS_PLAN: ExecutorModes = ExecutorModes { family: "minimax_m3",
     modes: &[LayerMode::HeadSplit], hops: false, attention: AttentionPlacement::Heads };
 
-/// Planning facts may describe unqualified geometry; serving must reject it.
+/// Serving requires an explicitly qualified split wire precision.
 #[derive(Debug, thiserror::Error)]
 pub enum ServingRefusal {
-    #[error("narrow-head MiniMax kernels not qualified")]
-    NarrowHeadsNotQualified,
     #[error("MiniMax split FFN wire precision not qualified/selected")]
     SplitWireNotQualified,
     #[error(transparent)]
@@ -523,7 +521,6 @@ impl MiniMaxInputs {
 
     pub fn admit_serving(&self, request: Request) -> Result<AdmittedMiniMax, ServingRefusal> {
         self.validate_attention()?;
-        if self.heads() { return Err(ServingRefusal::NarrowHeadsNotQualified); }
         if self.split() && self.split_wire.is_none() { return Err(ServingRefusal::SplitWireNotQualified); }
         Ok(self.admit(request)?)
     }

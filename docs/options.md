@@ -162,8 +162,8 @@ normalizes the broadcast FP32 residual locally; the FP32 meeting preserves the
 BF16 whole-FFN boundary before the replicated residual add. GPU0 owns the sole
 Spark endpoint and router; onboarded TP2 routes reach GPU1 as exact IDs/weights
 on the split exchange control sequence, without GPU1 router weights or logits.
-Serve admission refuses heads with
-"narrow-head MiniMax kernels not qualified" until native qualification completes.
+Explicit two-RTX `heads` is supported with native FP32 O/FFN partial reductions
+and eager peer exchange; `auto` stays `layers` pending serving performance gates.
 Golden requires `--nll --golden DATASET --save-logits NEW_DIR`, a checkpoint snapshot,
 native library and program manifest, and four real Spark `--peers` endpoints.
 `--window ID[,ID...]` selects unique sealed quick-subset windows. `--prefill-rows` defaults
@@ -171,7 +171,7 @@ to 1024 (page-aligned 256..4096); `--prefill-waves` defaults to 3 (1..4).
 `--check-headers` validates the immutable reference and checkpoint/export geometry
 without CUDA or workers. Scores use the shared top1024-plus-tail estimator.
 `--split-device ID` selects a distinct physical peer for the diagnostic serving
-split path, with `--attention-placement auto|layers`; `heads` remains refused.
+split path, with `--attention-placement auto|layers|heads`.
 The peer diagnostic requires explicit `--wire bf16|fp32`; omitting it refuses,
 and it does not select a serving default or qualify that precision. `--decode`
 uses real one-row serving decode after the prompt instead of scoring all rows
