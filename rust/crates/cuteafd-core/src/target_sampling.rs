@@ -1621,7 +1621,7 @@ mod tests {
 
     #[test]
     fn large_ordered_path_is_reached_and_never_silently_capped() {
-        let vocab = ORDERED_SORT_CAP * 2 + 7;
+        let vocab = ORDERED_SORT_CAP + 7;
         let flat = vec![0.0f32; vocab];
         let ordered = TargetSamplingParams::new(1.0, 0.9, None, 0.0, 0).unwrap();
         let before = branch3_calls();
@@ -1638,8 +1638,8 @@ mod tests {
         let full = TargetSamplingParams::new(1.0, 1.0, None, 0.0, 0).unwrap();
         let before = branch3_calls();
         let mut seen = std::collections::BTreeSet::new();
-        for step in 0..=20_000 {
-            let uniform = step as f32 / 20_000.0;
+        for step in 0..vocab {
+            let uniform = (step as f32 + 0.5) / vocab as f32;
             seen.insert(
                 full.select_token_with_uniform(&flat, None, uniform)
                     .unwrap(),

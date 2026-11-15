@@ -311,13 +311,13 @@ def test_build_runner_resolves_evidence_and_remote_dir_to_absolute_paths(tmp_pat
     inside the source clone, so a relative --evidence must be pinned to the
     caller's cwd before any `cd`."""
     source = make_source(tmp_path)
-    repo_runs = REPO / "runs" / "v11-release-helper-selftest"
+    repo_runs = tmp_path / "runs" / "selftest"
     shutil.rmtree(repo_runs, ignore_errors=True)
     try:
         result = run_build_runner(
             tmp_path, "--config", str(V10_CONFIG), "--source", str(source),
-            "--evidence", "runs/v11-release-helper-selftest", "--label", "abs",
-            cwd=REPO,
+            "--evidence", "runs/selftest", "--label", "abs",
+            cwd=tmp_path,
         )
         assert result.returncode == 0, (result.stdout, result.stderr)
         log = (repo_runs / "abs-build.log").read_text(encoding="utf-8")

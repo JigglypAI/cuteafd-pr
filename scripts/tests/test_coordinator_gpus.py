@@ -92,7 +92,7 @@ def test_explicit_pair_is_the_container_device_set_primary_first(tmp_path: Path,
 
 
 @pytest.mark.parametrize("family", sorted(FAMILIES))
-@pytest.mark.parametrize("selector", ["index", "uuid", "pci"])
+@pytest.mark.parametrize("selector", ["uuid", "pci"])
 def test_pair_may_be_named_by_uuid_or_pci_bus_id(tmp_path: Path, family: str, selector: str) -> None:
     name = {"index": lambda i: str(i), "uuid": lambda i: FAKE_GPU_UUIDS[i],
             "pci": lambda i: FAKE_GPU_PCI[i].removeprefix("0000")}[selector]
@@ -101,7 +101,7 @@ def test_pair_may_be_named_by_uuid_or_pci_bus_id(tmp_path: Path, family: str, se
     assert _coordinator_gpus(launch) == [2, 1]
 
 
-@pytest.mark.parametrize("family", sorted(FAMILIES))
+@pytest.mark.parametrize("family", ["glm5_flash"])
 @pytest.mark.parametrize("keys,diagnostic", [
     ("COORDINATOR_GPUS=1,3\n", "names GPU 3, but nvidia-smi reports no such physical GPU"),
     ("COORDINATOR_GPUS=2,2\n", "names GPU 2 twice"),

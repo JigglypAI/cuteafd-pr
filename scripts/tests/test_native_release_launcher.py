@@ -338,23 +338,23 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
                 self.assertTrue(env[key].startswith('/tmp/cuteafd-home'))
 
     def test_storage_run_mount_is_optional_readonly_and_host_local(self) -> None:
-        for present in (True, False):
-            result = subprocess.run(['bash', '-c', r"""
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "control"
+            directory.mkdir()
+            for present in (True, False):
+                selected = directory if present else Path(temporary) / "absent"
+                result = subprocess.run(['bash', '-c', r"""
 set -euo pipefail
 source scripts/lib/release-common.sh
-# Simulate the dedicated directory, even while its socket is absent on restart.
-body=$(declare -f release_serving_docker_args)
-body=${body/\[\[ -d \/srv\/sparknest\/run \]\]/$TEST_RUN_DIR}
-eval "$body"
 release_serving_docker_args
 printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
-"""], cwd=ROOT, capture_output=True, env={**os.environ,'TEST_RUN_DIR': 'true' if present else 'false'})
-            self.assertEqual(result.returncode,0,result.stderr)
-            args=result.stdout.decode().rstrip('\0').split('\0')
-            mount='type=bind,src=/srv/sparknest/run,dst=/srv/sparknest/run,readonly'
-            self.assertEqual(mount in args,present)
-            self.assertNotIn('type=bind,src=/srv/sparknest,dst=/srv/sparknest,readonly',args)
-            self.assertFalse(any('rdma-counters.sock' in arg for arg in args))
+"""], cwd=ROOT, capture_output=True, env={**os.environ, 'CUTEAFD_SPARKNEST_RUN_DIR': str(selected)})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = result.stdout.decode().rstrip('\0').split('\0')
+                mount = f'type=bind,src={selected},dst=/srv/sparknest/run,readonly'
+                self.assertEqual(mount in args, present)
+                self.assertNotIn('type=bind,src=/srv/sparknest,dst=/srv/sparknest,readonly', args)
+                self.assertFalse(any('rdma-counters.sock' in arg for arg in args))
 
     def test_all_serving_launchers_use_shared_identity_and_nonroot_mounts(self) -> None:
         for source in [v41_source(), FAMILY.read_text()]:

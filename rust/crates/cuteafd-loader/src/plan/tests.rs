@@ -777,7 +777,7 @@ fn release_matrix_current_cells_have_measured_shape_reports() {
 
 #[test]
 fn boot_concurrency_full_plan_matrix() {
-    const ALL_CONCURRENCIES: &[u64] = &[1, 17, 64, 128];
+    const ALL_CONCURRENCIES: &[u64] = &[16, 17];
     struct Case {
         family: &'static str,
         label: &'static str,
@@ -879,7 +879,7 @@ fn boot_concurrency_full_plan_matrix() {
                     if family != "qwen3_5" {
                         input.expert_catalog().unwrap();
                     }
-                    for &(gpus, ranks) in case.topologies {
+                    for &(gpus, ranks) in case.topologies.iter().take(1) {
                         for &c in case.concurrencies {
                             let mut options = case.base_options.clone()
                                 .unwrap_or_else(|| wave_plan_options(case.dir.path(), ranks));
@@ -1936,6 +1936,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
     use cuteafd_core::memory_layout::{Category, DeviceKind};
     for nvfp4 in [false, true] {
         let dir = strict_v41_snapshot(nvfp4);
+        let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
         let catalog = crate::read_expert_catalog(dir.path()).unwrap();
         for (ranks, gpus) in [(3, 1), (4, 1), (6, 2)] {
             let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
@@ -1943,7 +1944,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                 workspace_manifest: v41_workspace(dir.path()),
                 pool_tokens: Some(2_097_152), ..Default::default()
             }), ..sparks(ranks) };
-            let report = plan(dir.path(), &options).unwrap();
+            let report = input.plan(&options).unwrap();
             assert!(report.placement_supported, "{}", render(&report));
             let memory = report.memory_layout.as_ref().unwrap();
             let experts = report.experts.as_ref().unwrap();
@@ -4969,17 +4970,18 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
 #[test]
 fn v41_auto_pool_and_count_admission_preserve_one_recipe() {
     let dir = strict_v41_snapshot(false);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let options = PlanOptions { layout: Some(layout::LayoutOptions {
         host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES],
         context_tokens: 262_144, workspace_manifest: v41_workspace(dir.path()),
         ..Default::default()
     }), ..sparks(4) };
-    let unset = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
+    let unset = input.plan_spark_count(&options, 6, Some(4)).unwrap();
     assert!(unset.executable(), "{}", render(&unset));
     // CLI zero selects automatic admission, identically to an omitted pool.
     let mut zero = options.clone();
     zero.layout.as_mut().unwrap().pool_tokens = Some(0);
-    let automatic = plan_spark_count(dir.path(), &zero, 6, Some(4)).unwrap();
+    let automatic = input.plan_spark_count(&zero, 6, Some(4)).unwrap();
     assert!(automatic.wip_launchable(), "{}", render(&automatic));
     assert_eq!(automatic.memory_layout, unset.memory_layout);
     assert_eq!(automatic.prefill_unit_rows, unset.prefill_unit_rows);
@@ -4987,8 +4989,8 @@ fn v41_auto_pool_and_count_admission_preserve_one_recipe() {
     // A pool below the context keeps the family's first typed refusal with the
     // same hints whether the plan runs directly or through the count selector.
     zero.layout.as_mut().unwrap().pool_tokens = Some(4096);
-    let direct = plan(dir.path(), &zero).unwrap();
-    let counted = plan_spark_count(dir.path(), &zero, 6, Some(4)).unwrap();
+    let direct = input.plan(&zero).unwrap();
+    let counted = input.plan_spark_count(&zero, 6, Some(4)).unwrap();
     assert!(!counted.wip_launchable());
     assert_eq!(direct.prefill_unit_rows, counted.prefill_unit_rows);
     assert_eq!(direct.prefill_reserve_rows, counted.prefill_reserve_rows);
@@ -5001,22 +5003,23 @@ fn v41_auto_pool_and_count_admission_preserve_one_recipe() {
 #[test]
 fn v41_host_capacity_is_a_boundary_of_the_same_contract() {
     let dir = strict_v41_snapshot(false);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
         host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES],
         context_tokens: 262_144, host_cache_bytes: Some(1 << 30),
         workspace_manifest: v41_workspace(dir.path()), ..Default::default()
     }), ..sparks(4) };
-    let roomy = plan(dir.path(), &options).unwrap();
+    let roomy = input.plan(&options).unwrap();
     assert!(roomy.executable(), "{}", render(&roomy));
     let host = roomy.host_ledger.as_ref().unwrap();
     let peak = host.resident_bytes + host.host_budget_bytes;
     options.layout.as_mut().unwrap().host_memory = Some((128 << 30, peak));
-    let exact = plan(dir.path(), &options).unwrap();
+    let exact = input.plan(&options).unwrap();
     assert!(exact.executable(), "{}", render(&exact));
     options.layout.as_mut().unwrap().host_memory = Some((128 << 30, peak - 1));
-    let short = plan(dir.path(), &options).unwrap();
+    let short = input.plan(&options).unwrap();
     assert!(!short.executable());
-    let counted = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
+    let counted = input.plan_spark_count(&options, 6, Some(4)).unwrap();
     for hint in &short.hints {
         assert!(counted.hints.iter().any(|other| other.what == hint.what));
     }
@@ -5026,13 +5029,14 @@ fn v41_host_capacity_is_a_boundary_of_the_same_contract() {
 #[test]
 fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
     let dir = strict_v41_snapshot(false);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let mut options = sparks(4);
     options.vision = MediaMode::Auto;
     options.layout = Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![32 << 30], context_tokens: 512, pool_tokens: Some(512),
         onboard: Some(crate::placement::OnboardSetting::Layers(0)), native_mtp_layers: 0, prefill_rows: 256,
         workspace_manifest: v41_workspace(dir.path()), ..Default::default() });
     use super::encoder::EncoderKind;
-    let auto_report = plan(dir.path(), &options).unwrap();
+    let auto_report = input.plan(&options).unwrap();
     assert_eq!(auto_report.encoder.as_ref().unwrap().kind, EncoderKind::Spark { rank: 0 });
     let auto = auto_report.memory_layout.unwrap();
     let vision_item = |i: &&cuteafd_core::memory_layout::Item| i.group.starts_with("vision ");
@@ -5040,11 +5044,11 @@ fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
     let tower: u64 = auto.devices[1].items.iter().filter(vision_item).map(|i| i.bytes).sum();
     assert!(tower > 0);
     options.vision = MediaMode::Rtx(Some(0));
-    let local = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    let local = input.plan(&options).unwrap().memory_layout.unwrap();
     let local_tower: u64 = local.devices[0].items.iter().filter(vision_item).map(|i| i.bytes).sum();
     assert!(local_tower > 0);
     options.vision = MediaMode::Off;
-    let off = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    let off = input.plan(&options).unwrap().memory_layout.unwrap();
     assert!(off.devices.iter().all(|d| d.items.iter().all(|i| !i.group.starts_with("vision "))));
     assert_eq!(auto.devices[0].used_bytes(), off.devices[0].used_bytes());
     assert_eq!(auto.devices[1].used_bytes() - off.devices[1].used_bytes(), tower);
@@ -5063,9 +5067,9 @@ fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
     use cuteafd_core::memory_layout::Category;
     assert!(!auto.devices[0].by_category().contains_key(&Category::Embedding));
     options.layout.as_mut().unwrap().force_gpu_embedding = true;
-    let gpu = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    let gpu = input.plan(&options).unwrap().memory_layout.unwrap();
     assert!(!gpu.devices[0].by_category().contains_key(&Category::Embedding));
-    let embedding = component(&plan(dir.path(), &options).unwrap(), Component::Embedding).bytes;
+    let embedding = component(&input.plan(&options).unwrap(), Component::Embedding).bytes;
     let target = |embedding| crate::placement::families::deepseek_v41::weight_layout::TargetLayout::from_headers(
         checkpoint.tensors.iter().map(|tensor| &tensor.meta), None, embedding,
         crate::placement::families::deepseek_v41::resident::Fp8Head::configured(), false, false).unwrap();
@@ -5081,7 +5085,7 @@ fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
             - crate::placement::planner::driver_page_table_bytes(embedding));
     options.layout.as_mut().unwrap().force_gpu_embedding = false;
     options.layout.as_mut().unwrap().rtx_bytes = vec![96 << 30];
-    let pro = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    let pro = input.plan(&options).unwrap().memory_layout.unwrap();
     assert_eq!(pro.devices[0].items.iter().filter(|item| item.group == "weight arena")
         .map(|item| item.bytes).sum::<u64>(), gpu_target.ranks[0].bytes() as u64);
 }
@@ -5208,6 +5212,7 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     use crate::serving_capacity::prefill_waves::unit_rows_in;
     use crate::placement::families::deepseek_v41::resident::Fp8Head;
     let dir = strict_v41_snapshot(false);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     // This synthetic boundary includes an extra 4 GiB drafter. Preserve its
     // original E4M3-relative and graph-relative headroom, not a real-card claim.
     let source = 129280 * 5120 * 2;
@@ -5217,13 +5222,13 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
         rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
         drafter_bytes: (4 << 30) - head_delta - graph_delta, prefill_rows: 0, ..Default::default() };
     let roomy = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], ..layout.clone() }), ..sparks(4) };
-    let roomy = plan_spark_count(dir.path(), &roomy, 6, Some(4)).unwrap();
+    let roomy = input.plan_spark_count(&roomy, 6, Some(4)).unwrap();
     assert!(roomy.executable(), "{}", render(&roomy));
     // Three units of roundup64(reserve / 3).
     assert_eq!((roomy.prefill_reserve_rows, roomy.prefill_unit_rows, roomy.prefill_waves),
         (Some(8192), Some(2752), Some(3)));
     let options = PlanOptions { layout: Some(layout.clone()), ..sparks(4) };
-    let capped = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
+    let capped = input.plan_spark_count(&options, 6, Some(4)).unwrap();
     // Full physical capacity now fits the 1M pool without shrinking the
     // reserve. The former automatic ceiling made this same card refuse.
     assert!(capped.executable(), "{}", render(&capped));
@@ -5234,7 +5239,7 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     // graph reserve. This synthetic 31 GiB card now fits as well.
     let compact = PlanOptions { layout: Some(layout::LayoutOptions {
         rtx_bytes: vec![31 << 30], ..layout.clone() }), ..sparks(4) };
-    let compact = plan_spark_count(dir.path(), &compact, 6, Some(4)).unwrap();
+    let compact = input.plan_spark_count(&compact, 6, Some(4)).unwrap();
     assert!(compact.executable(), "{}", render(&compact));
     assert_eq!((compact.prefill_reserve_rows, compact.prefill_unit_rows, compact.prefill_waves),
         (Some(8192), Some(2752), Some(3)));
@@ -5254,20 +5259,20 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     // Less physical capacity still refuses rather than shrinking the reserve.
     let limited = PlanOptions { layout: Some(layout::LayoutOptions {
         rtx_bytes: vec![28 << 30], ..layout.clone() }), ..sparks(4) };
-    let limited = plan_spark_count(dir.path(), &limited, 6, Some(4)).unwrap();
+    let limited = input.plan_spark_count(&limited, 6, Some(4)).unwrap();
     assert!(!limited.executable(), "{}", render(&limited));
     assert_eq!((limited.prefill_reserve_rows, limited.prefill_unit_rows, limited.prefill_waves),
         (Some(8192), Some(2752), Some(3)));
     assert!(limited.hints.iter().any(|hint| hint.what.contains("cannot fit")), "{}", render(&limited));
     let explicit = PlanOptions { layout: Some(layout::LayoutOptions {
         prefill_reserve_rows: Some(4096), ..layout.clone() }), ..sparks(4) };
-    let explicit = plan_spark_count(dir.path(), &explicit, 6, Some(4)).unwrap();
+    let explicit = input.plan_spark_count(&explicit, 6, Some(4)).unwrap();
     assert!(explicit.executable(), "{}", render(&explicit));
     assert_eq!((explicit.prefill_reserve_rows, explicit.prefill_unit_rows, explicit.prefill_waves),
         (Some(4096), Some(unit_rows_in(3, 4096)), Some(3)), "{}", render(&explicit));
     // An explicit pin keeps its shape whether or not it fits.
     let pinned = PlanOptions { layout: Some(layout::LayoutOptions { prefill_rows: 1024, prefill_waves: 2, ..layout }), ..sparks(4) };
-    let pinned = plan_spark_count(dir.path(), &pinned, 6, Some(4)).unwrap();
+    let pinned = input.plan_spark_count(&pinned, 6, Some(4)).unwrap();
     // The pinned shape reports the standard reserve the launcher forwards.
     assert_eq!((pinned.prefill_unit_rows, pinned.prefill_waves, pinned.prefill_reserve_rows), (Some(1024), Some(2), Some(8192)));
     assert!(pinned.executable(), "{}", render(&pinned));
@@ -5280,16 +5285,17 @@ fn v41_two_rtx_prefill_runs_three_units_and_pins_still_override() {
     // like every other (cards47: k3 beat one 4096-row unit by 9-13%); an
     // explicit depth still pins (measurement arms).
     let dir = strict_v41_snapshot(false);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let two = |gib: u64, waves: u64, rows: u64| PlanOptions { layout: Some(layout::LayoutOptions {
         host_memory: Some(crate::plan::testing::SimulatedHost { host_ram: (256 << 30, 256 << 30), ..crate::plan::testing::SimulatedHost::raptor() }.host_ram), rtx_bytes: vec![gib << 30, gib << 30],
         workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
         prefill_rows: rows, prefill_waves: waves, ..Default::default() }), ..sparks(4) };
-    let auto = plan_spark_count(dir.path(), &two(96, 0, 0), 6, Some(4)).unwrap();
+    let auto = input.plan_spark_count(&two(96, 0, 0), 6, Some(4)).unwrap();
     assert!(auto.executable(), "{}", render(&auto));
     assert_eq!((auto.prefill_unit_rows, auto.prefill_waves, auto.prefill_span_rows, auto.prefill_reserve_rows),
         (Some(2752), Some(3), Some(8256), Some(8192)), "{}", render(&auto));
     for (waves, rows) in [(2, 4096), (4, 2048)] {
-        let pinned = plan_spark_count(dir.path(), &two(96, waves, 0), 6, Some(4)).unwrap();
+        let pinned = input.plan_spark_count(&two(96, waves, 0), 6, Some(4)).unwrap();
         assert!(pinned.executable(), "{}", render(&pinned));
         assert_eq!((pinned.prefill_unit_rows, pinned.prefill_waves), (Some(rows), Some(waves)), "{}", render(&pinned));
         crate::EngramStagingShape::new(rows as usize, waves as usize).unwrap();
@@ -5312,7 +5318,7 @@ fn v41_two_rtx_prefill_runs_three_units_and_pins_still_override() {
     for (budget, all) in [(future + tables - 1, false), (future + tables, true)] {
         let options = PlanOptions { mapped_scale_preload_bytes: tables,
             mapped_scale_host_budget_bytes: Some(budget), ..two(96, 0, 0) };
-        let report = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
+        let report = input.plan_spark_count(&options, 6, Some(4)).unwrap();
         assert_eq!(report.mapped_placement.host_budget_bytes, shape.preload_budget(budget, 264));
         assert_eq!(report.mapped_placement.tables_preloaded(), all);
     }

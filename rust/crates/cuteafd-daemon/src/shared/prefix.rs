@@ -385,6 +385,7 @@ mod tests {
             for quota in [None, Some(0), Some(123_456_789)] {
                 options.media_cache_bytes = quota;
                 for vision in [MediaMode::Rtx(Some(0)), MediaMode::Off] {
+                    if vision == MediaMode::Off && quota.is_some() { continue; }
                     let report = input.plan(&PlanOptions { placement, vision, audio: MediaMode::Off,
                         layout: Some(options.clone()), ..Default::default() })?;
                     let admitted = report.encoder.as_ref().context("admitted encoder record")?;

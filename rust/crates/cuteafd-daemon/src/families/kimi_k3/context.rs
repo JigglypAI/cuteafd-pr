@@ -803,7 +803,7 @@ mod tests {
         use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
         let root = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME")?)
             .join(".cache/cuteafd/builds/kimi-context-owner-fixtures");
-        let fixture = Fixture::build_in(&root)?;
+        let fixture = Fixture::build_for_tests()?;
         for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
             let tag = format.program_suffix();
             let mut programs = Vec::new();

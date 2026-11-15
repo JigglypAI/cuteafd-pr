@@ -147,6 +147,15 @@ def hermetic_launcher_host(tmp_path_factory):
     patch = pytest.MonkeyPatch()
     patch.setenv("CUTEAFD_GPU_POWERD_DIR", str(powerd))
     patch.setenv("CUTEAFD_CDI_SPECS", str(spec))
+    fuse = tmp_path_factory.mktemp("fuse-connections")
+    nest = tmp_path_factory.mktemp("sparknest-run")
+    patch.setenv("CUTEAFD_FUSE_SYSFS_ROOT", str(fuse))
+    patch.setenv("CUTEAFD_SPARKNEST_RUN_DIR", str(nest))
+    tools = tmp_path_factory.mktemp("host-tools")
+    hostname = tools / "hostname"
+    hostname.write_text("#!/bin/sh\nprintf 'coordinator-test\\n'\n")
+    hostname.chmod(0o755)
+    patch.setenv("PATH", str(tools) + os.pathsep + os.environ["PATH"])
     yield
     patch.undo()
 

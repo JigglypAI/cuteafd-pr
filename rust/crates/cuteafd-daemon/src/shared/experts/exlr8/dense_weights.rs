@@ -386,7 +386,7 @@ pub(crate) mod tests {
         use cuteafd_loader::plan::exlr8::dense::{DenseAxis, DenseWindow};
         let root = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME")?)
             .join(".cache/cuteafd/builds/glm-weight-inventory-fixtures");
-        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_in(&root)?;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
         let library = fixture.load()?;
         fixture.configure_memory(&library, 0, 1 << 30)?;
         fixture.immediate_copies(&library)?;

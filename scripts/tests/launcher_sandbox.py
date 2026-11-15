@@ -194,6 +194,9 @@ def fake_gpus(count=2, total_mib=98304, free_mib=97000, busy=(), apps=()):
 def fake_nvidia_smi(bin_dir):
     """Write the shared nvidia-smi stub; callers set FAKE_GPUS (json of `fake_gpus`)."""
     import sys
+    hostname = Path(bin_dir) / "hostname"
+    hostname.write_text("#!/bin/sh\nprintf 'coordinator-test\\n'\n")
+    hostname.chmod(0o755)
     path = Path(bin_dir) / "nvidia-smi"
     path.write_text("#!" + sys.executable + "\n" + FAKE_NVIDIA_SMI)
     path.chmod(0o755)

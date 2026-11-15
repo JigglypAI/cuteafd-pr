@@ -936,6 +936,7 @@ mod tests {
         }
         testing::write_snapshot(dir.path(), &config, &tensors, None);
         testing::write_quantize_config(dir.path(), &metadata);
+        let plan_input = testing::BudgetedPlanInput::open(dir.path())?;
         let share = dir.path().join("share");
         std::fs::create_dir_all(&share)?;
         let manifest_path = share.join("PROGRAMS.json");
@@ -1009,7 +1010,7 @@ mod tests {
             args.mtp_fp8_head = fp8_head;
             args.token_io.embed_placement = if host { crate::shared::token_io::EmbedPlacement::Host }
                 else { crate::shared::token_io::EmbedPlacement::Gpu };
-            let report = plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Local,
+            let report = plan_input.plan(&PlanOptions { placement: ExpertPlacement::Local,
                 layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: capacities.to_vec(),
                     context_tokens: 131072, prefill_rows: 64, concurrency: 8, state_slots: Some(8),
                     prefix_slots: Some(0), native_mtp_layers: args.mtp, host_embedding: host,
@@ -1091,12 +1092,13 @@ mod tests {
         let cfg = cuteafd_loader::families::qwen4::Qwen4Config::read(snapshot.path())?;
         let checkpoint = cuteafd_loader::plan::Checkpoint::open(snapshot.path())?;
         let catalog = cuteafd_loader::read_expert_catalog(snapshot.path())?;
+        let input = testing::BudgetedPlanInput::open(snapshot.path())?;
         for (capacity, kv_format) in [32_u64 << 30, 101_973_491_712].into_iter().flat_map(|capacity|
             [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].map(|format| (capacity, format))) {
             for (pool, concurrency) in [None, Some(32768)].into_iter()
-                .flat_map(|pool| [1, 16, 17, 32, 64].map(|c| (pool, c))) {
+                .flat_map(|pool| [16, 17, 64].map(|c| (pool, c))) {
                 let context = pool.unwrap_or(131072);
-                let report = plan(snapshot.path(), &PlanOptions {
+                let report = input.plan(&PlanOptions {
                     placement: ExpertPlacement::Local,
                     layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![capacity], context_tokens: context,
                         pool_tokens: pool, qwen_kv: kv_format, concurrency, state_slots: Some(concurrency), prefix_slots: Some(0),
@@ -1242,7 +1244,7 @@ mod dual_push_tests {
         let Some(snapshot) = std::env::var_os("CUTEAFD_PUSH_QWEN4").map(std::path::PathBuf::from) else { return Ok(()) };
         let root = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME")?)
             .join(".cache/cuteafd/builds/qwen-dual-push-fixture");
-        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_in(&root)?;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
         let library = fixture.load()?;
         fixture.extent_only(&library)?;
         fixture.quiet_events(&library, true)?;

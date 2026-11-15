@@ -47,7 +47,7 @@ async fn runs_allow_console_text_and_clear_it_on_finish_and_cancel() {
             agent.get(&format!("{base}/v1/bench/runs/{id}")).set("Authorization", "Bearer integration-test-key").call().unwrap().into_json().unwrap()
         };
         let start = || -> String {
-            let started: Value = agent.post(&format!("{base}/v1/bench/runs")).set("Authorization", "Bearer integration-test-key").send_json(json!({"profile": "share"}))
+            let started: Value = agent.post(&format!("{base}/v1/bench/runs")).set("Authorization", "Bearer integration-test-key").send_json(json!({"panels": ["structured"], "baseline": false}))
                 .unwrap().into_json().unwrap();
             let id = started["id"].as_str().unwrap().to_string();
             let report = status(&id);

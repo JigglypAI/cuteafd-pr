@@ -108,10 +108,10 @@ fn stop_tokens_add_turn_markers_and_disabled_tool_markers() {
 
 #[test]
 fn served_snapshots_match_the_fixture_when_present() {
-    let hub = std::path::Path::new("/mnt/sparknest/hf-home/hub");
+    let hub = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required")).join("hub");
     for model in ["Qwen--Qwen3.8-Flash-Next-FP8", "wrldsuksgo2mars--Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1"] {
-        let Ok(mut snapshots) = std::fs::read_dir(hub.join(format!("models--{model}/snapshots"))) else { continue };
-        let Some(Ok(snapshot)) = snapshots.next() else { continue };
+        let mut snapshots = std::fs::read_dir(hub.join(format!("models--{model}/snapshots"))).expect("installed Qwen snapshots");
+        let snapshot = snapshots.next().expect("installed Qwen snapshot").expect("read installed Qwen snapshot");
         let snapshot = snapshot.path();
         assert_eq!(std::fs::read_to_string(snapshot.join("chat_template.jinja")).unwrap(), TEMPLATE, "{model}");
         assert_eq!(QwenEncoding::from_snapshot(&snapshot).unwrap().tokens(), &QwenTokenIds::qwen38(), "{model}");

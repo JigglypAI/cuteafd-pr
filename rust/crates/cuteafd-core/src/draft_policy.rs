@@ -2320,6 +2320,7 @@ mod tests {
         // The drafter reports 0.95 at every position; position 1 is truly 0.95,
         // position 6 only 0.8.
         let confidence = [0.95; 7];
+        let routes = flat(&routes);
         let mut state = 99u64;
         let mut uniform = || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             (state >> 11) as f64 / (1u64 << 53) as f64 };
@@ -2332,7 +2333,7 @@ mod tests {
             let truth = [0.95, 0.95, 0.95, 0.95, 0.95, 0.8, 0.8];
             let accepted = truth.iter().take_while(|&&p| uniform() < p).count();
             let requests = [ObservedDraftRequest { id: 1, rows: 8, accepted: accepted + 1, confidence: Some(&confidence) }];
-            policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
+            policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &routes,
                 layer_us: &[None; 40], total_us: f64::NAN, predicted_us: None, draft_us: f64::NAN, drafted_requests: None, wide: false }).unwrap();
         }
         assert!((policy.calibrated(0, 0, 0.95) - 0.95).abs() < 0.02, "{:?}", policy.calibration(1));
@@ -3030,14 +3031,15 @@ mod tests {
     fn c1_costs_survive_a_c16_phase_while_request_routes_follow_the_request() {
         let mut policy = DraftPolicy::seeded(placement(5), seed()).unwrap();
         let mut token = 0;
+        let truth = physics();
         // C1 has its own fixed surcharge (attention split, exchange latency)
         // that the C16 phase does not.
-        for round in 0..400 { truth_round(&mut policy, &physics(), &mut token, 1 + round % 7, 1, 0., 6000.); }
+        for round in 0..400 { truth_round(&mut policy, &truth, &mut token, 1 + round % 7, 1, 0., 6000.); }
         let fresh = policy.clone();
         let before = policy.cost_snapshot(false, 1);
         let history = policy.history[&1].clone();
         for round in 0..1200 {
-            truth_round(&mut policy, &physics(), &mut token, 16 * (1 + round % 4), 16, 0., 0.);
+            truth_round(&mut policy, &truth, &mut token, 16 * (1 + round % 4), 16, 0., 0.);
         }
         let after = policy.cost_snapshot(false, 1);
         // The C1 evidence is untouched by C16 rounds: it forgets only when C1 is observed.
@@ -3054,7 +3056,7 @@ mod tests {
         // C1 total predictions stay accurate after the wide phase.
         for rows in [2usize, 6] {
             let predicted = policy.predict(false, &[1], &[rows - 1], 5).unwrap() - policy.draft_cost(false, 1, 5);
-            let actual = truth_round(&mut policy, &physics(), &mut token, rows, 1, 0., 6000.);
+            let actual = truth_round(&mut policy, &truth, &mut token, rows, 1, 0., 6000.);
             assert!((predicted - actual).abs() / actual < 0.06, "{rows}: {predicted} vs {actual}");
         }
     }

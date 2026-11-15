@@ -74,7 +74,7 @@ fn installed_flash_drafters_push_byte_identical_to_mount_within_admitted_staging
     let real = std::env::var_os("CUTEAFD_NATIVE_LIB").is_some();
     let fixture = (!real).then(|| {
         let root = PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/cuteafd/builds/glmf-draft-push-fixture");
-        cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_in(&root)
+        cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()
     }).transpose()?;
     let library = library(&fixture)?;
     // The byte-copying CPU fixture has no BF16 projection programs (those need its

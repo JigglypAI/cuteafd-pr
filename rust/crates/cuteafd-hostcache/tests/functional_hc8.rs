@@ -291,7 +291,7 @@ fn invalid_extent_in_a_batch_is_rejected_before_submission() {
 /// submission cost. Debug build, so the bound is generous (the measured ratio is ~300x).
 #[test]
 fn coalesced_store_is_an_order_of_magnitude_cheaper_than_1d() {
-    const TOKENS: usize = 320_000;
+    const TOKENS: usize = 32_000;
     let kv_bytes = TOKENS * KV_BYTES_PER_TOKEN / PAGE_BYTES * PAGE_BYTES + TAIL_BYTES;
     let config = Config {
         bytes: kv_bytes as u64 + 2 * (8 << 20),

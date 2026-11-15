@@ -21,3 +21,4 @@ cuteafd-core = { path = "../cuteafd-core" }
 
 [dev-dependencies]
 cuteafd-ffi = { path = ".", features = ["test-support"] }
+tempfile.workspace = true
