@@ -42,7 +42,9 @@ def fixture(tmp_path,monkeypatch):
     wm={n:'mixed.safetensors' for n in vals if n!='head.weight'}
     original=wm|{'head.weight':'original.safetensors'}
     compact=wm|{'head.trellis':'compact.safetensors'}
-    q=dict(tensor_storage={module:dict(bits_per_weight=4,stored_tensors={}), 'expert':dict(bits_per_weight=4)},
+    q=dict(tensor_storage={module:dict(bits_per_weight=4,stored_tensors={n:dict(
+               torch_dtype=package.DTYPES[d],shape=shape) for n,(d,shape) in packed.items()}),
+               'expert':dict(bits_per_weight=4)},
            module_include=['.*'],mtp_bits=4,lm_head=False,kept_tensors={})
     cfg=dict(quantization_config=dict(mtp_bits=4),text_config=dict(quantization_config=dict(mtp_bits=4)))
     for view,mapping,core in [('original',original,['head.weight']),('k6-compact',compact,['head.trellis']),('k8-compact',compact,['head.trellis'])]:
@@ -117,3 +119,68 @@ def test_hardlink_reuse_has_no_second_payload_read(tmp_path,monkeypatch):
     r=repair.prepare('glmf',p,s,second,reuse=o)
     assert (second/'original-mtp-0001.safetensors').stat().st_ino==(o/'original-mtp-0001.safetensors').stat().st_ino
     assert len(r['added_tensors'])==1
+
+
+def refresh_manifest(parent):
+    old=json.loads((parent/'cuteafd-mc.json').read_text())
+    updated=package.mc_manifest.build(parent,source_repo=old['source']['repo'],
+        source_revision=old['source']['revision'],
+        core_tensors={v['name']:v['core_tensors'] for v in old['variants']})
+    (parent/'cuteafd-mc.json').write_text(json.dumps(updated))
+
+
+@pytest.mark.parametrize('shard',['../outside.safetensors','sub/weights.safetensors',
+                                 'sub\\weights.safetensors','/tmp/weights.safetensors','other.bin'])
+def test_rejects_source_shard_traversal_before_payload_copy(tmp_path,monkeypatch,shard):
+    p,s,o,module,_=fixture(tmp_path,monkeypatch)
+    (s/'model.safetensors.index.json').write_text(json.dumps(dict(weight_map={module+'.weight':shard})))
+    monkeypatch.setattr(package,'_assemble_proved_shard',lambda *a,**k:pytest.fail('payload copy before preflight'))
+    with pytest.raises(ValueError,match='safetensors basename'):
+        repair.prepare('glmf',p,s,o)
+    assert not o.exists()
+
+
+def test_source_dtype_shape_extent_must_match_before_payload_copy(tmp_path,monkeypatch):
+    p,s,o,module,raw=fixture(tmp_path,monkeypatch)
+    save(s,'source.safetensors',{module+'.weight':('BF16',[128,128],raw[:-2])})
+    monkeypatch.setattr(package,'_assemble_proved_shard',lambda *a,**k:pytest.fail('payload copy before preflight'))
+    with pytest.raises(ValueError,match='shape/dtype extent differs'):
+        repair.prepare('glmf',p,s,o)
+    assert not o.exists()
+
+
+@pytest.mark.parametrize('bad',['missing','bits','stored_tensors'])
+def test_bad_quant_metadata_fails_before_output_or_payload_copy(tmp_path,monkeypatch,bad):
+    p,s,o,module,_=fixture(tmp_path,monkeypatch)
+    q=json.loads((p/'quantize_config.json').read_text())
+    if bad=='missing':q['tensor_storage'].pop(module)
+    elif bad=='bits':q['tensor_storage'][module]['bits_per_weight']=3
+    else:q['tensor_storage'][module]['stored_tensors']={}
+    (p/'quantize_config.json').write_text(json.dumps(q));refresh_manifest(p)
+    monkeypatch.setattr(package,'_assemble_proved_shard',lambda *a,**k:pytest.fail('payload copy before preflight'))
+    with pytest.raises(ValueError,match='MTP quantization metadata differs'):
+        repair.prepare('glmf',p,s,o)
+    assert not o.exists()
+
+
+@pytest.mark.parametrize('bad',['missing','status','source','groups','sha','tensor_proof','file_changed'])
+def test_bad_reuse_fails_before_any_output_link(tmp_path,monkeypatch,bad):
+    p,s,donor,module,_=fixture(tmp_path,monkeypatch)
+    repair.prepare('glmf',p,s,donor)
+    report=donor/'original-mtp-repair.json'
+    row=json.loads(report.read_text());filename='original-mtp-0001.safetensors'
+    if bad=='missing':report.unlink()
+    elif bad=='status':row['status']='partial'
+    elif bad=='source':row['identity']['source']['revision']='another-source'
+    elif bad=='groups':row['new_shards']['original-mtp-9999.safetensors']=row['new_shards'][filename]
+    elif bad=='sha':row['new_shards'][filename]['sha256']='bad'
+    elif bad=='tensor_proof':row['new_shards'][filename]['original_tensor_proofs'][module+'.weight']['source_name']='wrong.weight'
+    elif bad=='file_changed':
+        path=donor/filename
+        path.write_bytes(path.read_bytes()+b'x')
+    if bad!='missing':report.write_text(json.dumps(row))
+    output=tmp_path/'reused'
+    monkeypatch.setattr(package,'_assemble_proved_shard',lambda *a,**k:pytest.fail('unexpected source copy'))
+    with pytest.raises(ValueError):
+        repair.prepare('glmf',p,s,output,reuse=donor)
+    assert not output.exists()

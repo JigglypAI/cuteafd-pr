@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 
 import mc_package as package
 from core_export import packed_specs
@@ -41,6 +42,54 @@ def clear_mtp_bits(config):
             clear_mtp_bits(value)
 
 
+def shard_path(root, mapping, tensor):
+    name = mapping[tensor]
+    if (not isinstance(name, str) or Path(name).name != name or '\\' in name
+            or name.startswith('.') or not name.endswith('.safetensors')):
+        raise ValueError('tensor shard must be a safetensors basename')
+    return root / name
+
+
+def reuse_receipts(donor, output, groups, specs, source, source_index, manifest, modules):
+    """Check all donor receipts and headers before creating any output links."""
+    donor = Path(donor).resolve()
+    if output == donor or output in donor.parents or donor in output.parents:
+        raise ValueError('delta must be disjoint from reused repair')
+    try:
+        row = package.load_json(donor / 'original-mtp-repair.json')
+        if (row['status'] != 'validated-delta-headers-and-streamed-source-bytes'
+                or row['identity']['source'] != manifest['source']
+                or row['identity']['modules'] != sorted(modules)
+                or set(row['new_shards']) != set(groups)):
+            raise ValueError('reuse source/MTP selection or shard groups differs')
+        receipts = deepcopy(row['new_shards'])
+        for filename, names in groups.items():
+            receipt = receipts[filename]
+            path = donor / filename
+            if file_identity(path) != receipt['file_identity']:
+                raise ValueError('reused final shard changed')
+            if not re.fullmatch('[0-9a-f]{64}', receipt['sha256']):
+                raise ValueError('reused shard SHA proof is malformed')
+            if (row['new_files'][filename]['sha256'] != receipt['sha256']
+                    or row['new_files'][filename]['file_identity'] != receipt['file_identity']):
+                raise ValueError('reused shard inventory differs from receipt')
+            header, _ = read_header(path)
+            if (set(header) - {'__metadata__'} != set(names)
+                    or any((header[n]['dtype'], header[n]['shape']) != specs[n] for n in names)
+                    or set(receipt['original_tensor_proofs']) != set(names)):
+                raise ValueError('reused shard tensor inventory differs')
+            for name in names:
+                proof = receipt['original_tensor_proofs'][name]
+                origin = shard_path(source, source_index, name)
+                if (proof['source_name'] != name or proof['source_path'] != str(origin.resolve())
+                        or proof['source_file_identity'] != file_identity(origin)
+                        or not re.fullmatch('[0-9a-f]{64}', proof['sha256'])):
+                    raise ValueError('reused original source proof changed')
+        return donor, receipts
+    except (OSError, KeyError, TypeError) as error:
+        raise ValueError('reused repair is missing or malformed') from error
+
+
 def prepare(family, parent, source, output, *, shard_target=2_000_000_000, reuse=None, source_identity=None):
     repo, revision = REVISIONS[family]
     recipe, modules = mtp_modules(family)
@@ -67,7 +116,7 @@ def prepare(family, parent, source, output, *, shard_target=2_000_000_000, reuse
     headers, sizes, specs = {}, {}, {}
     for root, mapping, names in ((parent, weights, removed), (source, source_index, native)):
         for n in sorted(names):
-            p = root / mapping[n]
+            p = shard_path(root, mapping, n)
             if p not in headers:
                 headers[p] = read_header(p)[0]
             h = headers[p][n]
@@ -99,6 +148,27 @@ def prepare(family, parent, source, output, *, shard_target=2_000_000_000, reuse
             alias, cached = source / row['shard'], Path(row['cached_path'])
             if not alias.samefile(cached) or alias.stat().st_size != row['bytes']:
                 raise ValueError('source alias no longer matches verified managed source')
+    # Metadata and every donor shard must pass before any source payload copy.
+    quant = package.load_json(parent / 'quantize_config.json')
+    config = package.load_json(parent / 'config.json')
+    storage = quant.get('tensor_storage')
+    if not isinstance(storage, dict):
+        raise ValueError('parent quantization storage is malformed')
+    for module, geometry in modules.items():
+        entry = storage.get(module)
+        required = {name: dict(shape=shape, torch_dtype=package.DTYPES[dtype])
+                    for name, (dtype, shape) in packed_specs(module, dict(geometry, bits=4)).items()}
+        if (not isinstance(entry, dict) or entry.get('bits_per_weight') != 4
+                or entry.get('stored_tensors') != required):
+            raise ValueError('parent MTP quantization metadata differs from headers')
+    q, c = package.view_metadata(quant, config, modules, {n:specs[n] for n in native},
+                                bits=None, quantize_file='quantize_config.json')
+    q.pop('mtp_bits', None)
+    clear_mtp_bits(c)
+    groups = {f'original-mtp-{i:04d}.safetensors': names
+              for i, names in enumerate(package.shard_groups(native, sizes, shard_target), 1)}
+    donor, donor_receipts = (None, {}) if reuse is None else reuse_receipts(
+        reuse, output, groups, specs, source, source_index, manifest, modules)
     identity = dict(schema='cuteafd-original-mtp-repair-v1', repo=repo, parent_revision=revision,
                     source=manifest['source'], modules=sorted(modules),
                     input_metadata_sha256={f: sha256_file(parent / f) for f in
@@ -107,16 +177,11 @@ def prepare(family, parent, source, output, *, shard_target=2_000_000_000, reuse
         raise FileExistsError('use a fresh delta directory; never silently reuse a partial repair')
     output.mkdir(parents=True)
     receipts, native_map = {}, {}
-    for i, names in enumerate(package.shard_groups(native, sizes, shard_target), 1):
-        filename = f'original-mtp-{i:04d}.safetensors'
+    for filename, names in groups.items():
         if reuse is None:
             receipt = package._assemble_proved_shard({n: (source / source_index[n], n) for n in names}, output / filename)
         else:
-            donor = Path(reuse)
-            row = package.load_json(donor / 'original-mtp-repair.json')
-            if row['identity']['source'] != manifest['source'] or row['identity']['modules'] != sorted(modules):
-                raise ValueError('reuse source/MTP selection differs')
-            receipt = deepcopy(row['new_shards'][filename])
+            receipt = donor_receipts[filename]
             if file_identity(donor / filename) != receipt['file_identity']:
                 raise ValueError('reused final shard changed')
             os.link(donor / filename, output / filename)
@@ -129,12 +194,6 @@ def prepare(family, parent, source, output, *, shard_target=2_000_000_000, reuse
     new_index['weight_map'] = dict(sorted({n: s for n, s in weights.items() if n not in removed}.items() | native_map.items()))
     new_index['metadata']['total_size'] += sum(sizes[n] for n in native) - sum(sizes[n] for n in removed)
     atomic_json(output / 'model.safetensors.index.json', new_index)
-    quant = package.load_json(parent / 'quantize_config.json')
-    config = package.load_json(parent / 'config.json')
-    q, c = package.view_metadata(quant, config, modules, {n:specs[n] for n in native},
-                                bits=None, quantize_file='quantize_config.json')
-    q.pop('mtp_bits', None)
-    clear_mtp_bits(c)
     atomic_json(output / 'quantize_config.json', q)
     atomic_json(output / 'config.json', c)
     core = {v['name']: sorted(set(v['core_tensors']) | (native if v['name']=='original' else removed))
