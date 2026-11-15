@@ -776,7 +776,8 @@ impl WeightInventory {
             let source = headers.matrix(&format!("{}.weight",cfg.head()))?;
             out.attention_mount.merge(native_attention_mount(&crate::formats::native_attention::NativeLayout {
                 stem:cfg.head().into(),shape:head.shape,fp8:true,rank:0,ranks:1,
-                split:crate::formats::trellis_core::CoreSplit::Whole },source,true)?);
+                split:crate::formats::trellis_core::CoreSplit::Whole },
+                [usize::try_from(source[0])?,usize::try_from(source[1])?],true)?);
         } else {
             let head_name = format!("{}.weight", cfg.head());
             let head = headers.get(&head_name)?;
