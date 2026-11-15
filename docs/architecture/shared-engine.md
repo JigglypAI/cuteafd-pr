@@ -607,9 +607,10 @@ One ARC controller per physical device owns capture admission and eviction
 typed banks retain executables and their resources
 ([bank.rs](../../rust/crates/cuteafd-daemon/src/shared/decode_graph/bank.rs)).
 Prewarm is best effort, with trace-qualified hot geometries pinned. A miss
-captures within budget or runs eagerly; it never refuses a request. Estimates
-choose capture and victims, while completed-boundary measurements decide charge.
-An underestimate logs overshoot and blocks further growth, not serving.
+captures within measured limits or runs eagerly; it never refuses a request.
+Physical measurements decide charge and the terminal hard stop. A frozen measured
+bytes-per-native-node ratio controls soft ARC capacity, not per-record byte
+shares or fitted rates. An overshoot blocks new capture, not serving.
 
 Admission charges one canonical `graph reserve` per device before KV sizing.
 The default total is the trace-derived working-set base plus its 2 MiB tail,
@@ -625,8 +626,13 @@ an explicit total for the same rank. `GPU_RESERVE` cannot erase graph ownership
 Driver graph storage is a monotone measured high-water: destruction can release
 ARC live capacity without freeing visible physical bytes. Cancelled captures
 still require observation, since failed instantiation can grow driver storage.
-Successful bank commits measure device memory after every capture, before another
-capture can hide its allocation; other outstanding tickets remain reserved.
+Successful bank commits measure device memory after every capture and explicit
+asynchronous upload, without synchronizing a peer capture stream. Other tickets
+remain outstanding; below the soft crossing they are not assigned a byte-model
+admission budget, so hard-stop overshoot may include the already-admitted batch.
+The native node count arrives after capture; above soft, known incoming geometry
+reserves node capacity before ticket issuance and excludes its new owner from
+that settle's victim set. Unknown geometry remains measured-only and LRU-evictable.
 Once measured `charged` reaches the admitted reserve, every new capture ticket
 stops, nominal reuse included; existing graphs keep replaying and misses run
 eagerly. Destruction cannot clear that terminal hard stop. A representative
@@ -653,7 +659,13 @@ including pinned owners in `resident_bytes`. These share/estimate weights do
 not decide admission or pressure: the soft policy uses measured memory and the
 frozen native-node ratio, never a constant `charged - reserve` eviction target.
 `live_bytes` and `resident_bytes` are diagnostics; neither decides pressure or
-physical admission. No estimate is added to the physical charge.
+physical admission. If a commit's physical query fails, the owner stays alive for
+the caller's first launch and drained teardown, future captures stop, and its
+estimate is conservatively charged until later observed growth consumes that
+credit exactly once. Boundary query failure degrades capture to eager rather
+than aborting the serving step. Stats inventories are maintained counters;
+bounded rankings refresh at completed boundaries at most every 30 seconds and
+report `rankings_age_ms`, so an HTTP poll never walks the graph inventory.
 Reconciliation uses the settled current level while retaining high-water for
 admission. Bounded physical memory is mandatory; eager fallback or churn is
 preferable to admitting unbounded growth.
