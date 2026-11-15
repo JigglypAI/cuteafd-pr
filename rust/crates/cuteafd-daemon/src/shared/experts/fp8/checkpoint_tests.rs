@@ -352,20 +352,24 @@ fn nvfp4_merged_waves_are_byte_identical_to_singleton_units() -> Result<()> {
         ExpertProtocolV2Request, ExpertProtocolV2RequestView, ExpertProtocolV2RowDescriptor,
         ExpertProtocolV2RouteEntry, ExpertV2Dtype, ExpertV2SourceKind, ProtocolV2RequestDevicePayload,
         EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN};
+    let directory = PathBuf::from(std::env::var("CUTEAFD_NVFP4_SEGMENT_PACKAGE")?);
+    // The process geometry is fixed before anything reads it (library load and
+    // package metadata do): the family whose routed shape the package's own
+    // manifest (one directory up) declares for this layout.
+    let layout = directory.file_name().and_then(|n| n.to_str()).context("package layout directory")?.to_owned();
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("../manifest.json"))?)?;
+    let declared = &manifest["layouts"][layout.as_str()];
+    let field = |key: &str| declared[key].as_u64().map(|v| v as u32).with_context(|| format!("manifest {key}"));
+    use cuteafd_core::ExpertGeometry as G;
+    let (hidden, experts, topk, intermediate) = (field("hidden")?, field("experts")?, field("top_k")?, field("intermediate")?);
+    let shape = [G::MINIMAX_M3, G::GLM5_FLASH, G::GLM5, G::QWEN4, G::STEP5, G::INKLING2].into_iter()
+        .find(|g| (g.hidden, g.experts, g.topk, g.intermediate) == (hidden, experts, topk, intermediate))
+        .context("package shape is no known family")?;
+    cuteafd_core::set_expert_geometry(shape)
+        .map_err(|set| anyhow::anyhow!("process geometry already {set:?}; run this test alone"))?;
     // SAFETY: this opt-in test accepts only operator-selected trusted build artifacts.
     let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
     library.cuda_set_device(0)?;
-    let directory = PathBuf::from(std::env::var("CUTEAFD_NVFP4_SEGMENT_PACKAGE")?);
-    // The process geometry is fixed before anything reads it: the family whose
-    // routed shape the package was exported for.
-    // SAFETY: static package metadata only; no CUDA state or allocation.
-    let metadata = unsafe { Fp8MoeMetadata::read(&directory) }?;
-    use cuteafd_core::ExpertGeometry as G;
-    let shape = [G::MINIMAX_M3, G::GLM5_FLASH, G::GLM5, G::QWEN4, G::STEP5, G::INKLING2].into_iter().find(|g| g.hidden as usize == metadata.info.hidden
-        && g.experts as usize == metadata.info.experts && g.topk as usize == metadata.info.topk
-        && g.intermediate as usize == metadata.info.intermediate).context("package shape is no known family")?;
-    cuteafd_core::set_expert_geometry(shape)
-        .map_err(|set| anyhow::anyhow!("process geometry already {set:?}; run this test alone"))?;
     // SAFETY: the selected native package targets the current CUDA device.
     let module = unsafe { Fp8MoeModule::load(&directory)? };
     let info = module.info().clone();
