@@ -136,7 +136,11 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
             cuteafd_loader::placement::planner::EmbeddingHome::Device(0))?
             .into_iter().map(|rank| rank.target).collect::<Vec<_>>()
     } else { CoordinatorWeights::plan(checkpoint, cfg, 1, &vec![0; cfg.layers])? };
-    let capacity = RequestCapacity::new(options.sequences, options.prefill.rows)?;
+    let queries = if options.draft {
+        let draft = cuteafd_loader::formats::block_dspark::BlockDsparkConfig::read(&checkpoint.snapshot.join("dspark"))?;
+        options.sequences.checked_mul((draft.block + 1) as u64).context("MiniMax query rows overflow")?.min(64)
+    } else { options.sequences };
+    let capacity = RequestCapacity::with_queries(options.sequences, options.prefill.rows, queries)?;
     let context = if options.context_tokens == 0 { cfg.max_position as u64 } else { options.context_tokens };
     let mut names = targets.iter().map(|target| program_names(cfg, target, &manifest, capacity, u32::try_from(context)?, heads))
         .collect::<Result<Vec<_>>>()?.into_iter().flatten().collect::<BTreeSet<_>>();

@@ -220,7 +220,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
             submitted.push(Submitted { identity: self.identity(placement)?, placement: (**placement).clone(),
                 tokens: tokens.to_vec() });
         }
-        ensure!(!submitted.is_empty() && submitted.len() <= state.capacity.decode.requests as usize,
+        ensure!(!submitted.is_empty() && submitted.len() <= state.capacity.requests as usize,
             "MiniMax request count exceeds admitted concurrency");
         Ok(submitted)
     }
@@ -248,41 +248,22 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         self.completed(published)
     }
 
-    fn verify_staged(&self,sequences:&mut [(&mut Placement,&[u32])],pool:&RefPagePool) -> Result<Option<DeviceLogits>> {
-        ensure!(self.pending.borrow().is_none(),"MiniMax verify overlaps an unaccepted round");
-        let submitted=self.validate(sequences,pool)?;
-        let retained=self.owners.storage.verify_logits.as_ref().context("MiniMax retained verify logits missing")?;
-        let rows=submitted.iter().map(|request| request.tokens.len()).sum::<usize>();
-        ensure!(rows <= self.geometry().decode_rows,"MiniMax verify rows exceed admission");
-        let mut placements=submitted.iter().map(|request| request.placement.clone()).collect::<Vec<_>>();
-        let mut requests=placements.iter_mut().zip(&submitted).map(|(placement,request)| ServingRequest {
-            identity:request.identity,kind:ExpertV2SourceKind::Decode,start:request.placement.len,
-            tokens:&request.tokens,heads:request.placement.len..request.placement.len + request.tokens.len(),placement
-        }).collect::<Vec<_>>();
-        let mut offsets=Vec::new();let mut offset=0;
-        for request in &submitted { offsets.push(offset);offset+=request.tokens.len(); }
-        let library=self.library();
-        let result=self.execution.borrow_mut().execute(&self.owners.storage,self.cfg,&self.schedule,&mut requests,false,
-            |index,span,logits| {
-                let first=offsets[index] + span.start - submitted[index].placement.len;
-                retain_logit_tile(library,retained.buffer,first,self.cfg.vocab_size,logits)
-            });
-        self.completed(result)?;
-        *self.pending.borrow_mut()=Some(submitted);
-        let stream=self.owners.storage.ranks.last().context("MiniMax head rank missing")?.decode.borrow().stream.raw;
-        Ok(Some(DeviceLogits { ptr:retained.buffer.ptr,rows,vocab:self.cfg.vocab_size,
-            stride:self.cfg.vocab_size,stream,greedy:None }))
-    }
-
     fn decode(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool,
         retain_receipt: bool, captured: bool) -> Result<Option<DeviceLogits>> {
         ensure!(self.pending.borrow().is_none(), "MiniMax decode overlaps an unaccepted round");
         let submitted = self.validate(sequences, pool)?;
-        let mut placements = submitted.iter().map(|request| request.placement.clone()).collect::<Vec<_>>();
-        let requests = placements.iter_mut().zip(&submitted).map(|(placement, request)| ServingRequest {
-            identity: request.identity, kind: ExpertV2SourceKind::Decode, start: request.placement.len,
-            heads: request.placement.len..request.placement.len + request.tokens.len(),
-            tokens: &request.tokens, placement }).collect::<Vec<_>>();
+        let queries = submitted.iter().enumerate().flat_map(|(sequence, request)|
+            (0..request.tokens.len()).map(move |row| (sequence, row))).collect::<Vec<_>>();
+        ensure!(queries.len() <= self.geometry().decode_rows, "MiniMax verify queries exceed admission");
+        let mut placements = queries.iter().map(|&(sequence, row)| Placement {
+            len: submitted[sequence].placement.len + row, ..submitted[sequence].placement.clone()
+        }).collect::<Vec<_>>();
+        let requests = placements.iter_mut().zip(&queries).map(|(placement, &(sequence, row))| {
+            let request = &submitted[sequence];
+            ServingRequest { identity: request.identity, kind: ExpertV2SourceKind::Decode,
+                start: placement.len, heads: placement.len..placement.len + 1,
+                tokens: &request.tokens[row..row + 1], placement }
+        }).collect::<Vec<_>>();
         let mut graphs = self.owners.graphs.borrow_mut();
         let result = self.execution.borrow_mut().decode(&self.owners.storage, self.cfg, &self.schedule,
             &requests, &mut graphs, captured);
@@ -303,7 +284,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
                 let owner = self.owners.storage.ranks.last().context("MiniMax tap rank missing")?.decode.borrow();
                 let source = owner.target_taps().context("MiniMax admitted decode taps missing")?.output();
                 let target = self.owners.storage.verify_taps.as_ref().context("MiniMax retained verify taps missing")?;
-                retain_decode_taps(self.library(), source, target.buffer, submitted.len(),
+                retain_decode_taps(self.library(), source, target.buffer, queries.len(),
                     draft.drafter.cfg.taps.len() * self.cfg.hidden * 2, owner.stream.raw)
             })();
             self.completed(staged)?;
@@ -340,7 +321,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     fn geometry(&self) -> scheduler::Geometry {
         let state = self.owners.storage.requests.borrow();
         scheduler::Geometry { family: "minimax_m3", vocab_size: self.cfg.vocab_size, max_context: self.context,
-            slots: state.capacity.decode.requests as usize, prefill_rows: state.capacity.prefill.rows as usize,
+            slots: state.capacity.requests as usize, prefill_rows: state.capacity.prefill.rows as usize,
             decode_rows: self.owners.storage.verify_logits.as_ref().map_or(state.capacity.decode.rows as usize,
                 |owner| owner.buffer.bytes / (self.cfg.vocab_size * 4)), }
     }
@@ -458,12 +439,12 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        if speculative { self.verify_staged(sequences,pool) }
-        else { self.decode(sequences, pool, true, true) }
+        let _ = speculative;
+        self.decode(sequences, pool, true, true)
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        if speculative { return self.verify_staged(sequences,pool); }
+        let _ = speculative;
         if kind == scheduler::UngraphedKind::Decode { return self.decode(sequences, pool, true, false); }
         let total: usize = sequences.iter().map(|(_, tokens)| tokens.len()).sum();
         ensure!(sequences.len() == 1 && total <= self.geometry().decode_rows,
@@ -762,7 +743,7 @@ mod tests {
                     let input=members.iter().map(|&slot| tokens[slot+prompt]).collect::<Vec<_>>();
                     let mut rows=placements.iter_mut().zip(&input).map(|(p,t)| (p,std::slice::from_ref(t))).collect::<Vec<_>>();
                     let logits=if route == "native" { backend.verify_device(&mut rows,false,&pool)? }
-                        else { backend.verify_staged(&mut rows,&pool)? }.context("batch discriminator logits")?;
+                        else { backend.decode(&mut rows,&pool,true,false)? }.context("batch discriminator logits")?;
                     let bytes=logits.to_host(&library)?.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
                     drop(rows);
                     let taps=read(backend.owners.storage.verify_taps.as_ref().unwrap().buffer,members.len()*tap_pitch)?;
@@ -875,7 +856,7 @@ mod tests {
                     } else {
                         let mut rows = placements.iter_mut().zip(&input).map(|(p,t)| (p,std::slice::from_ref(t))).collect::<Vec<_>>();
                         if arm == "staged" { backend.verify_device(&mut rows,false,&pool)? }
-                        else { backend.verify_staged(&mut rows,&pool)? }.context("proof logits missing")?
+                        else { backend.decode(&mut rows,&pool,true,false)? }.context("proof logits missing")?
                     };
                     let bytes = logits.to_host(&library)?.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
                     ensure!(values(&bytes).iter().all(|v| v.is_finite()),"nonfinite proof logits");
@@ -1022,7 +1003,7 @@ mod tests {
         let source = include_str!("backend.rs");
         let verify = source.split_once("    fn verify_device(").unwrap().1
             .split_once("    fn verify_device_ungraphed(").unwrap().0;
-        assert!(verify.contains("if speculative { self.verify_staged(sequences,pool) }"));
+        assert!(!verify.contains("verify_staged"));
         assert!(verify.contains("self.decode(sequences, pool, true, true)"));
         assert!(!verify.contains("draft_prefix.is_some()"));
         let decode = source.split_once("    fn decode(").unwrap().1

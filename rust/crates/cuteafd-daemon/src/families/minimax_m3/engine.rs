@@ -29,7 +29,7 @@ pub(crate) struct Requests {
 
 impl Requests {
     pub fn new(capacity: RequestCapacity, context: usize, layers: usize, waves: usize) -> Result<Self> {
-        ensure!(RequestCapacity::new(u64::from(capacity.decode.rows), u64::from(capacity.prefill.rows))? == capacity,
+        ensure!(capacity.validate()? == capacity,
             "MiniMax request capacity differs from admission");
         ensure!(context > 0 && layers > 0, "MiniMax request geometry must be positive");
         super::admission::serve_admission::validate_prefill(cuteafd_loader::placement::planner::PrefillShape {
@@ -39,11 +39,11 @@ impl Requests {
     }
 
     fn validate(&self, requests: &[RequestRows]) -> Result<()> {
-        ensure!(!requests.is_empty() && requests.len() <= self.capacity.decode.requests as usize,
+        ensure!(!requests.is_empty() && requests.len() <= self.capacity.requests as usize,
             "MiniMax request batch exceeds admitted concurrency");
         let mut slots = BTreeSet::new();
         for request in requests {
-            ensure!(request.slot < self.capacity.decode.requests as usize && slots.insert(request.slot),
+            ensure!(request.slot < self.capacity.requests as usize && slots.insert(request.slot),
                 "MiniMax duplicate or unadmitted request slot");
             ensure!(request.rows > 0 && request.start.checked_add(request.rows)
                 .is_some_and(|end| end <= self.context), "MiniMax request exceeds admitted context");
@@ -52,11 +52,14 @@ impl Requests {
     }
 
     pub fn decode_rows(&self, requests: &[RequestRows]) -> Result<usize> {
-        self.validate(requests)?;
-        ensure!(requests.iter().all(|request| request.rows == 1),
-            "MiniMax native decode requires one row per request");
-        ensure!(requests.len() <= self.capacity.execution_rows() as usize,
-            "MiniMax native decode exceeds admitted execution rows");
+        ensure!(!requests.is_empty() && requests.len() <= self.capacity.decode.rows as usize,
+            "MiniMax native queries exceed admitted row capacity");
+        let mut positions = BTreeSet::new();
+        for request in requests {
+            ensure!(request.slot < self.capacity.requests as usize && request.rows == 1
+                && request.start < self.context && positions.insert((request.slot, request.start)),
+                "MiniMax native query slot/position is invalid or duplicated");
+        }
         Ok(requests.len())
     }
 
@@ -806,6 +809,13 @@ impl<'t, 'a, A: SlotArithmetic> PrefillHooks for ServingHooks<'_, '_, 't, 'a, A>
     }
 }
 
+fn query_cycle(requests: &[ServingRequest<'_>]) -> crate::shared::decode_graph::device::Cycle {
+    let mut slots = BTreeSet::new();
+    if requests.iter().any(|request| !slots.insert(request.placement.slot)) {
+        crate::shared::decode_graph::device::Cycle::Verify
+    } else { crate::shared::decode_graph::device::Cycle::Decode }
+}
+
 fn decode_section(captured: bool, bucket: usize, live: usize,
     graph: impl FnOnce(usize) -> Result<()>, eager: impl FnOnce(usize) -> Result<()>) -> Result<()> {
     if captured { graph(bucket) } else { eager(live) }
@@ -917,14 +927,14 @@ impl<'a> ServingPrefill<'a> {
         let graphs = &mut graphs[0];
         let rank = &storage.ranks[0];
         let graph_rows = if captured { graphs.row_key(rows)? } else { rows };
-        graphs.cycle(crate::shared::decode_graph::device::Cycle::Decode);
+        graphs.cycle(query_cycle(requests));
         let result = (|| {
             let mut state = storage.requests.borrow_mut();
             ensure!(state.capacity == schedule.capacity, "MiniMax decode capacity differs from storage");
             let mut identities = BTreeSet::new();
             for request in requests {
                 ensure!(request.start == request.placement.len && request.identity != 0
-                    && identities.insert(request.identity), "MiniMax decode identity/frontier differs");
+                    && identities.insert((request.identity, request.start)), "MiniMax decode identity/frontier differs");
             }
             let placements = requests.iter().map(|request| &*request.placement).collect::<Vec<_>>();
             let cache = &mut state.ranks[0];
@@ -1206,14 +1216,14 @@ impl<'a> ServingPrefill<'a> {
         let graph_rows = if captured { graphs[0].row_key(rows)? } else { rows };
         ensure!(graphs.iter().all(|graph| graph.row_key(rows).ok() == Some(graph_rows)) || !captured,
             "MiniMax split graph row buckets differ between ranks");
-        for graph in graphs.iter_mut() { graph.cycle(crate::shared::decode_graph::device::Cycle::Decode); }
+        for graph in graphs.iter_mut() { graph.cycle(query_cycle(requests)); }
         let result = (|| {
             let mut state = storage.requests.borrow_mut();
             ensure!(state.capacity == schedule.capacity, "MiniMax split decode capacity differs");
             let mut identities = BTreeSet::new();
             for request in requests {
                 ensure!(request.start == request.placement.len && request.identity != 0
-                    && identities.insert(request.identity), "MiniMax split decode identity/frontier differs");
+                    && identities.insert((request.identity, request.start)), "MiniMax split decode identity/frontier differs");
             }
             let placements = requests.iter().map(|request| &*request.placement).collect::<Vec<_>>();
             for cache in &mut state.ranks { cache.bank.prepare_decode(&mut cache.decode, &placements)?; }

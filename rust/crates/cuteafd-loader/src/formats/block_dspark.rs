@@ -65,15 +65,15 @@ impl NativeDsparkLayout {
         add("workspace.attention".into(),usize::try_from(crate::serving_capacity::draft_attention_workspace_bytes(
             slots as u64,cfg.kv_heads as u64,(cfg.heads / cfg.kv_heads * cfg.block).div_ceil(32) as u64,
             (window + cfg.block) as u64,cfg.head_dim as u64,sms as u64)?)?);
-        let verify_rows = slots.checked_mul(cfg.block + 1).context("native verify rows overflow")?;
+        let verify_rows = slots.checked_mul(cfg.block + 1).context("native verify rows overflow")?.min(64);
         add("verify.logits".into(),verify_rows * cfg.vocab * 4);
         add("verify.taps".into(),verify_rows * taps * h * 2);
         for slot in 0..waves {
             add(format!("unit.{slot}.target_taps.narrow"),prefill_rows * h * 2);
             add(format!("unit.{slot}.target_taps.output"),prefill_rows * taps * h * 2);
         }
-        add("decode.target_taps.narrow".into(),slots * h * 2);
-        add("decode.target_taps.output".into(),slots * taps * h * 2);
+        add("decode.target_taps.narrow".into(),verify_rows * h * 2);
+        add("decode.target_taps.output".into(),verify_rows * taps * h * 2);
         let mark_bytes = (16 + cfg.layers * 2 * window * kv * 2).div_ceil(256) * 256;
         let marks = cuteafd_core::prefix::mark_slots_with_host(slots as u64,prefix_entries as u64,
             mark_bytes as u64,mark_budget,host_prefix) as usize;

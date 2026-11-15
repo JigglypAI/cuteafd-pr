@@ -39,13 +39,12 @@ pub const PAGE_ROWS: u64 = 64;
 pub const LANES: u64 = 1;
 const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
 
-/// Shared constructor/admission capacities. Native decode consumes one token
-/// per request; multi-token verification uses packed prefill units instead.
-/// Verify never launches more than one prefill unit's rows; the constructor
-/// must partition, preserve causal sequence order and consume head tiles before
-/// reusing a unit. Speculative batch totals are not dispatcher extents.
+/// Real request slots and native causal query rows are independent capacities.
+/// A speculative request contributes its anchor plus the checkpoint's draft
+/// width, without inventing additional logical cache or prefix slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestCapacity {
+    pub requests: u32,
     pub decode: UnitMetadata,
     pub prefill: UnitMetadata,
 }
@@ -54,8 +53,26 @@ impl RequestCapacity {
         cuteafd_core::concurrency::validate("minimax_m3", concurrency).map_err(invalid)?;
         let requests = u32::try_from(concurrency).map_err(|_| Refusal::Overflow("MiniMax requests"))?;
         let rows = u32::try_from(unit_rows).map_err(|_| Refusal::Overflow("MiniMax unit rows"))?;
-        Ok(Self { decode: UnitMetadata::for_requests(requests, requests)?,
+        Ok(Self { requests, decode: UnitMetadata::for_requests(requests, requests)?,
             prefill: UnitMetadata::for_requests(rows, requests.min(rows))? })
+    }
+
+    pub fn with_queries(concurrency: u64, unit_rows: u64, queries: u64) -> Result<Self, Refusal> {
+        let mut capacity = Self::new(concurrency, unit_rows)?;
+        let queries = u32::try_from(queries).map_err(|_| Refusal::Overflow("MiniMax query rows"))?;
+        if queries < capacity.requests || queries > 64 {
+            return Err(invalid("query rows must cover actual requests within native capacity"));
+        }
+        capacity.decode = UnitMetadata::for_requests(queries, queries)?;
+        Ok(capacity)
+    }
+
+    pub fn validate(self) -> Result<Self, Refusal> {
+        if Self::with_queries(u64::from(self.requests), u64::from(self.prefill.rows),
+            u64::from(self.decode.rows))? != self {
+            return Err(invalid("request/query metadata differs from admission"));
+        }
+        Ok(self)
     }
 
     /// Native expert workspace and serial dispatch capacity for either mode.
@@ -75,7 +92,7 @@ impl RequestCapacity {
 
     /// Globals only; the constructor derives the physical per-layer pool separately.
     pub fn cache(self, context: u32) -> Result<MsaCache, Refusal> {
-        MsaCache::new(1, 1, self.decode.requests, context)
+        MsaCache::new(1, 1, self.requests, context)
     }
 }
 
@@ -478,7 +495,8 @@ impl MiniMaxInputs {
     pub fn maximum_pages(&self) -> u64 { self.maximum_pool_tokens.div_ceil(PAGE_ROWS) }
 
     pub fn request_capacity(&self) -> Result<RequestCapacity, Refusal> {
-        RequestCapacity::new(self.sequences, self.prefill.rows)
+        RequestCapacity::with_queries(self.sequences, self.prefill.rows,
+            self.drafter.as_ref().map_or(self.sequences, |draft| (draft.native.verify_rows as u64).min(64)))
     }
 
     pub fn heads(&self) -> bool { self.gpus == 2 && self.attention == AttentionPlacement::Heads }
@@ -638,7 +656,7 @@ impl MiniMaxInputs {
         let mut out = Vec::new();
         // Host decode IDs enter only the embedding rank; peers receive residuals.
         let token_ids = Owner::DecodeTokenIds { gpu: 0 }.id();
-        let token_bytes = self.sequences.checked_mul(4).ok_or(Refusal::Overflow("MiniMax decode token IDs"))?;
+        let token_bytes = u64::from(self.request_capacity()?.decode.rows).checked_mul(4).ok_or(Refusal::Overflow("MiniMax decode token IDs"))?;
         out.extend(buffer(token_ids.clone(), Location::coordinator(0), token_bytes, Lifetime::TARGET,
             Category::Workspace, "decode token IDs", maximum));
         out.extend(buffer(format!("{token_ids}.upload"), Location::PINNED, token_bytes, Lifetime::TARGET,
@@ -683,8 +701,8 @@ impl MiniMaxInputs {
         // The native cache descriptor is the physical source of page strides.
         let cache = if self.heads() {
             MsaCache::for_heads(&HeadsLayout::new(cfg, gpu as u8, rows)?, 1,
-                capacity.decode.requests, context)?
-        } else { MsaCache::new(1, 1, capacity.decode.requests, context)? };
+                capacity.requests, context)?
+        } else { MsaCache::new(1, 1, capacity.requests, context)? };
         let buffers = cache.buffers()?;
         for layer in 0..cfg.layers {
             if !self.heads() && usize::from(self.owners[layer]) != gpu { continue; }
@@ -700,14 +718,15 @@ impl MiniMaxInputs {
             }
         }
         // Page tables and lengths for every admitted sequence, at the compiled context.
-        for (name, bytes) in cache.buffers()?.into_iter().filter(|(name, _)| !name.starts_with("layer.")) {
+        for (name, mut bytes) in cache.buffers()?.into_iter().filter(|(name, _)| !name.starts_with("layer.")) {
+            if name == "decode_table" { bytes = u64::from(decode_rows) * u64::from(cache.table_width) * 4; }
             out.extend(buffer(format!("{}.{name}", Owner::Cache { gpu }.id()), location, bytes, Lifetime::TARGET,
                 Category::Kv, "MSA page tables", maximum));
         }
         // Compact decode tables have their own retained full-table upload,
         // separate from prefix restores into individual page-table slots.
         out.extend(buffer(format!("{}.upload", Owner::DecodeTable { gpu }.id()), Location::PINNED,
-            u64::from(cache.requests) * u64::from(cache.table_width) * 4, Lifetime::TARGET,
+            u64::from(decode_rows) * u64::from(cache.table_width) * 4, Lifetime::TARGET,
             Category::Staging, "decode page table ordered H2D staging", maximum));
         // Ordered H2D staging is keyed by destination and copy stream, not a
         // ring: each retained request table and length has its own pinned owner.
