@@ -174,6 +174,12 @@ impl InklingOutputParser {
             // JSON string is a known limit: decoded special markers are structural.
             match (self.mode, marker.as_str()) {
                 (Mode::Boundary | Mode::Header, MODEL) => { self.mode = Mode::Header; self.recipient.clear(); }
+                (Mode::Call, EOS) => {
+                    self.complete_call(&mut out)?;
+                    self.mode = Mode::Done;
+                    self.stop = Some(GlmStop::Marker(EOS.into()));
+                    self.pending.clear();
+                }
                 (Mode::Boundary | Mode::Header | Mode::Text | Mode::Thinking, EOS) => {
                     self.mode = Mode::Done;
                     self.stop = Some(GlmStop::Marker(EOS.into()));

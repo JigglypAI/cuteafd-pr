@@ -240,6 +240,18 @@ fn complete_call_cut_before_end_message_is_retained_but_incomplete_json_is_not()
     }
     let result = parsed(&[wire], options());
     assert_eq!(result.2, vec![("read_file".into(), json!({"path":"README.md"}))]);
+    let eos = format!("{wire}{EOS}");
+    for streaming in [false, true] {
+        for index in 0..=eos.len() {
+            let mut parser = InklingOutputParser::with_stream_args(options(), streaming);
+            parser.push(&eos[..index]).unwrap();
+            parser.push(&eos[index..]).unwrap();
+            parser.finish().unwrap();
+            assert_eq!(parser.tool_calls(), 1, "EOS split {index}");
+            assert_eq!(parser.stop(), Some(&crate::openai::chat::glm5::parser::GlmStop::Marker(EOS.into())));
+        }
+    }
+    assert_eq!(parsed(&[&eos], options()), result);
     let mut parser = InklingOutputParser::new(options());
     parser.push(wire.strip_suffix('}').unwrap()).unwrap();
     assert!(matches!(parser.finish(), Err(InklingParseError::Truncated("tool call"))));
