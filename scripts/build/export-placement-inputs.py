@@ -210,7 +210,7 @@ def merge_program_shards(catalog, directories, output):
 def compile_program_shards(job, staging, previous, lock, timeout, backend_cache, verify_skips, pool, workers):
     name, exporter, extra = job
     output = staging / name
-    output.mkdir(parents=True)
+    output.mkdir(parents=True, exist_ok=True)
     scratch = staging / ".program-shards"
     scratch.mkdir()
     catalog_dir = scratch / "catalog"
@@ -345,7 +345,8 @@ def check_job_sm170(job, staging, previous, timeout, env, verify_all=False):
     return {"sm170_seconds": round(time.monotonic() - started, 3), "sm170_programs": len(selected)}
 
 
-def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verify_skips=False):
+def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verify_skips=False,
+                program_pool=None, workers=1):
     name, exporter, extra = job
     output = staging / name
     output.mkdir(parents=True)
@@ -371,6 +372,12 @@ def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verif
             summary["execution_stats"] = {"stage0_skipped": True, "verified_skip": False,
                                           "backend_hits": 0, "backend_misses": 0}
             return summary
+    if program_pool is not None and workers > 1:
+        summary = compile_program_shards(job, staging, previous, lock, timeout, backend_cache,
+                                         verify_skips, program_pool, workers)
+        if skipped:
+            verify_job_metadata(prior_directory, output, lock, name)
+        return summary
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(ROOT),
                CUTEAFD_SPARKINFER_SOURCE_DIR=str(ROOT / "third_party/sparkinfer"),
                CUTEAFD_SPARKINFER_LOCK_FILE=str(ROOT / "third_party/sparkinfer.lock.json"))
@@ -413,8 +420,8 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
     with ThreadPoolExecutor(max_workers=workers) as pool:
         if workers > 1 and jobs[0][0] == "programs" and "--geometry" in jobs[0][2]:
             pending = [pool.submit(compile_one, job) for job in jobs[1:]]
-            programs = compile_program_shards(jobs[0], staging, previous, lock, timeout,
-                                              backend_cache, verify_skips, pool, workers)
+            programs = compile_job(jobs[0], staging, previous, lock, timeout,
+                                   backend_cache, verify_skips, program_pool=pool, workers=workers)
             summaries = [programs, *[future.result() for future in pending]]
         else:
             summaries = list(pool.map(compile_one, jobs))
