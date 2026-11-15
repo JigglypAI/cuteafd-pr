@@ -95,7 +95,7 @@ impl<'a> Kernels<'a> {
 }
 
 /// Route/MLP stage has no knowledge of checkpoint expert format or transport.
-pub(crate) fn routed_ffn<'a>(kernels: &Kernels<'_>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+pub(crate) fn routed_ffn<'a>(kernels: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
     experts: &dyn Dispatcher, cfg: &Inkling2Config, layer: usize, rows: usize) -> Result<()> {
     ensure!(layer < cfg.layers && rows > 0 && rows <= owner.layout().rows, "Inkling FFN layer/rows differ");
     let prefix = format!("model.llm.layers.{layer}");
@@ -124,7 +124,7 @@ fn slice(buffer: Buffer, offset: usize, bytes: usize) -> Result<Buffer> {
 
 /// Cold one-sequence attention: every cache row is produced before the native
 /// ring/paged attention program, without host synchronization on the layer path.
-pub(crate) fn attention<'a>(k: &Kernels<'_>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+pub(crate) fn attention<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
     cfg: &Inkling2Config, layer: usize, rows: usize, input: Buffer) -> Result<()> {
     use cuteafd_ffi::inkling2::{Batch, Global, Local};
     let local = cfg.local[layer];
@@ -217,7 +217,7 @@ pub(crate) fn attention<'a>(k: &Kernels<'_>, owner: &impl UnitBuffers<'a>, targe
 
 /// Complete layer over a cold, contiguous one-sequence unit. Embedding and
 /// completed six-layer block values remain F32 throughout residual mixing.
-pub(crate) fn begin_layer<'a>(k: &Kernels<'_>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+pub(crate) fn begin_layer<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
     cfg: &Inkling2Config, index: usize, rows: usize) -> Result<()> {
     let site = residual_site(cfg, index)?;
     let b = |name: &str| owner.buffer(name);
@@ -257,7 +257,7 @@ pub(crate) fn begin_layer<'a>(k: &Kernels<'_>, owner: &impl UnitBuffers<'a>, tar
         b("projection_input")?, false, Precision::Bf16, rows)
 }
 
-pub(crate) fn finish_layer<'a>(k: &Kernels<'_>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+pub(crate) fn finish_layer<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
     experts: &dyn Dispatcher, cfg: &Inkling2Config, index: usize, rows: usize) -> Result<()> {
     let site = residual_site(cfg, index)?;
     let b = |name: &str| owner.buffer(name);

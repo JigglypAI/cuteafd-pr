@@ -95,9 +95,14 @@ impl<'a> CacheBank<'a> {
         unsafe { self.copies.copy_d2d(&[(0, dst, src)]) }
     }
     pub fn copy_page(&self, from: usize, to: usize) -> Result<()> {
-        ensure!(from != to, "Inkling page tail copy aliases itself");
+        self.copy_page_rows(from, to, 64)
+    }
+    pub fn copy_page_rows(&self, from: usize, to: usize, rows: usize) -> Result<()> {
+        ensure!(from != to && (1..=64).contains(&rows), "Inkling page tail copy aliases or exceeds page");
+        let bytes = self.layout.page_bytes / 64 * rows;
         let copies = self.layout.global_layers.iter().map(|&layer|
-            Ok((0, self.page(layer, to)?, self.page(layer, from)?))).collect::<Result<Vec<_>>>()?;
+            Ok((0, view(self.page(layer, to)?, 0, bytes)?, view(self.page(layer, from)?, 0, bytes)?)))
+            .collect::<Result<Vec<_>>>()?;
         // SAFETY: physical page IDs are distinct; the retained bank owns every
         // source/destination until the shared prefix fence drains.
         unsafe { self.copies.copy_d2d(&copies) }
@@ -110,6 +115,96 @@ impl<'a> CacheBank<'a> {
         self.copies.allocation_receipts(inventory, "inkling2.cache.copies")
     }
 }
+/// Logical pages and frontiers belong to the shared scheduler. Mutable model
+/// bytes stay in the bank and are never reconstructed from a continuation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Placement {
+    pub units: Vec<u32>,
+    pub slot: usize,
+    pub len: usize,
+    pub state_len: usize,
+}
+impl crate::shared::qwen::scheduler::Placement for Placement {
+    fn len(&self) -> usize { self.len }
+    fn set_len(&mut self, len: usize) { self.len = len; }
+    fn units(&self) -> &[u32] { &self.units }
+    fn slot(&self) -> i32 { self.slot as i32 }
+    fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
+}
+
+#[derive(Clone)]
+pub(crate) struct InklingPrefix<'a>(Rc<CacheBank<'a>>);
+impl<'a> InklingPrefix<'a> {
+    pub fn new(bank: Rc<CacheBank<'a>>) -> Self { Self(bank) }
+    fn validate(&self, placement: &Placement, len: usize) -> Result<()> {
+        ensure!(placement.slot < self.0.layout.sequences && len.div_ceil(64) <= placement.units.len()
+            && placement.units.iter().all(|&page| (page as usize) < self.0.layout.pool_pages),
+            "Inkling prefix placement outside admitted state/pages");
+        ensure!(placement.units.iter().copied().collect::<std::collections::BTreeSet<_>>().len()
+            == placement.units.len(), "Inkling prefix placement aliases physical pages");
+        Ok(())
+    }
+}
+impl cuteafd_engine::prefix::PrefixFamily for InklingPrefix<'_> {
+    type Placement = Placement;
+    fn record_format(&self) -> &'static str { "inkling2_bf16_kv_f32_conv_whole_v1" }
+    fn layout(&self) -> cuteafd_engine::prefix::FamilyLayout {
+        use cuteafd_engine::prefix::{FamilyLayout, MarkStore, ReuseRule};
+        FamilyLayout { page_rows: 64, pages: self.0.layout.pool_pages,
+            page_bytes: self.0.layout.page_bytes * self.0.layout.global_layers.len(),
+            mark_bytes: self.0.layout.sequence_bytes, draft_bytes: 0,
+            rule: ReuseRule::EXACT, mark_store: MarkStore::Arena, page_owners: Default::default() }
+    }
+    fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.units }
+    fn bind(&self, placement: &mut Placement) -> Result<(), cuteafd_engine::prefix::BoxError> {
+        self.validate(placement, placement.len)?;
+        self.0.reset(placement.slot)?;
+        placement.state_len = 0;
+        Ok(())
+    }
+    fn discard(&self, placement: &mut Placement) -> Result<(), cuteafd_engine::prefix::BoxError> {
+        self.0.reset(placement.slot)?;
+        placement.state_len = 0;
+        Ok(())
+    }
+    fn extend_pages(&self, placement: &mut Placement, pages: &[u32]) -> Result<(), cuteafd_engine::prefix::BoxError> {
+        let mut extended = placement.clone();
+        extended.units.extend_from_slice(pages);
+        self.validate(&extended, extended.len)?;
+        placement.units = extended.units;
+        Ok(())
+    }
+    fn commit_point(&self, placement: &Placement) -> usize { placement.len.min(placement.state_len) }
+    fn capture(&self, slot: cuteafd_engine::prefix::MarkSlot, placement: &Placement, len: usize)
+        -> Result<(), cuteafd_engine::prefix::BoxError> {
+        self.validate(placement, len)?;
+        ensure!(len == placement.len && len == placement.state_len,
+            "Inkling snapshot frontier does not match committed causal state");
+        Ok(self.0.capture(placement.slot, slot.0 as usize)?)
+    }
+    fn restore(&self, mark: Option<cuteafd_engine::prefix::MarkSlot>, placement: &mut Placement, len: usize)
+        -> Result<(), cuteafd_engine::prefix::BoxError> {
+        self.validate(placement, len)?;
+        let slot = mark.context("Inkling exact restore requires its SWA/convolution mark")?;
+        self.0.restore(slot.0 as usize, placement.slot)?;
+        placement.len = len;
+        placement.state_len = len;
+        Ok(())
+    }
+    fn copy_rows(&self, copy: cuteafd_engine::prefix::TailCopy) -> Result<(), cuteafd_engine::prefix::BoxError> {
+        ensure!(copy.owner.is_none(), "Inkling whole-rank pages have no parity owner");
+        Ok(self.0.copy_page_rows(copy.from as usize, copy.to as usize, copy.rows)?)
+    }
+    fn drain(&self) -> Result<(), cuteafd_engine::prefix::BoxError> { Ok(self.0.drain()?) }
+    fn page_segments(&self, page: u32) -> Vec<cuteafd_hostcache::copy::DeviceRange> {
+        self.0.layout.global_layers.iter().filter_map(|&layer| self.0.page(layer, page as usize).ok())
+            .map(crate::shared::prefix::cuda_copy::range).collect()
+    }
+    fn mark_segments(&self, slot: cuteafd_engine::prefix::MarkSlot) -> Vec<cuteafd_hostcache::copy::DeviceRange> {
+        self.0.mark(slot.0 as usize).ok().into_iter().map(crate::shared::prefix::cuda_copy::range).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +255,35 @@ mod tests {
         assert!(cache.field(0, 1, "ring").is_err());
         assert!(cache.copy_page(0, 0).is_err());
         assert!(cache.copy_page(0, 3).is_err());
+        use cuteafd_engine::prefix::{MarkSlot, PrefixFamily, TailCopy};
+        let cache = Rc::new(cache);
+        let family = InklingPrefix::new(cache.clone());
+        let mut source = Placement { units: vec![0, 1], slot: 0, len: 65, state_len: 65 };
+        library.copy_h2d(cache.sequence(0)?, &pattern)?;
+        family.capture(MarkSlot(0), &source, 65).map_err(|e| anyhow::anyhow!("{e}"))?;
+        source.state_len = 64;
+        assert!(family.capture(MarkSlot(0), &source, 65).is_err());
+        let mut destination = Placement { units: vec![0, 2], slot: 1, len: 0, state_len: 0 };
+        family.bind(&mut destination).map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert!(family.restore(None, &mut destination, 65).is_err());
+        family.restore(Some(MarkSlot(0)), &mut destination, 65).map_err(|e| anyhow::anyhow!("{e}"))?;
+        family.drain().map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!((destination.len, destination.state_len), (65, 65));
+        library.copy_d2h(&mut restored, cache.sequence(1)?)?;
+        assert_eq!(restored, pattern);
+        let sentinel = vec![0x33; page.bytes];
+        library.copy_h2d(cache.page(1, 2)?, &sentinel)?;
+        family.copy_rows(TailCopy { from: 0, to: 2, rows: 1, owner: None })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        family.drain().map_err(|e| anyhow::anyhow!("{e}"))?;
+        library.copy_d2h(&mut restored_page, cache.page(1, 2)?)?;
+        assert_eq!(&restored_page[..4096], &page_pattern[..4096]);
+        assert_eq!(&restored_page[4096..], &sentinel[4096..]);
+        assert_eq!(family.page_segments(0).len(), 1);
+        assert_eq!(family.mark_segments(MarkSlot(0)).len(), 1);
+        assert!(family.extend_pages(&mut destination, &[0]).is_err());
+        family.discard(&mut destination).map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(destination.state_len, 0);
         Ok(())
     }
 }
