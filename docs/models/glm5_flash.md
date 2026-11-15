@@ -42,7 +42,12 @@ complete trellis cores. Plain checkpoints have no implicit compact views.
 FP8 conversion retains the family's existing runtime scope; no tower,
 router, embedding or routed expert is converted by core selection.
 
-`fp8-compact` refuses for this MC original; whole-core FP8 is pending.
+`fp8-compact` converts the selected original attention, dense/shared FFN
+and vocabulary-head matrices to block FP8. It leaves native keep tensors,
+routers, embeddings, the vision tower and routed experts unchanged.
+Max K8/K6/FP8 comparisons are supplementary to the original-view card.
+The original max baseline still uses FP8-QK MLA attention and must be
+re-run when BF16 attention lands (#2146).
 
 ## Engineering summary
 

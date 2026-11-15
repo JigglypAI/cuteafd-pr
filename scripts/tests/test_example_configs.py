@@ -1065,7 +1065,7 @@ def test_glmf_exlr8_k4_cards_preserve_qualified_native_recipes(filename: str) ->
 def test_glmf_mc_comparison_keeps_compact_modes_supplementary() -> None:
     comparisons = json.loads((ROOT / "scripts/bench/release-smoke-v51-mc-core-comparison.json").read_text())
     compact = [entry for entry in comparisons["entries"] if entry["family"] == "glm5_flash"]
-    assert {entry["set"]["CORE_VIEW"] for entry in compact} == {"k8-compact", "k6-compact"}
+    assert {entry["set"]["CORE_VIEW"] for entry in compact} == {"k8-compact", "k6-compact", "fp8-compact"}
     for entry in compact:
         config = keys(ROOT / entry["config"])
         assert config["MODEL_ID"] == entry["set"]["MODEL_ID"] == "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC"
@@ -1074,10 +1074,7 @@ def test_glmf_mc_comparison_keeps_compact_modes_supplementary() -> None:
         assert entry["gpus"] == [0, 1] and entry["sparks"] == []
         assert entry["set"]["EXPERT_BACKEND"] == "local"
         assert entry["set"]["SPARK_COUNT"] == "0"
-    unsupported = [entry for entry in comparisons["unsupported"] if entry["family"] == "glm5_flash"]
-    assert len(unsupported) == 1
-    assert unsupported[0]["core_view"] == "fp8-compact"
-    assert unsupported[0]["status"] == "na" and unsupported[0]["reason"]
+    assert not any(entry["family"] == "glm5_flash" for entry in comparisons["unsupported"])
 
 
 @pytest.mark.parametrize("family,model,revision,sparks", [
