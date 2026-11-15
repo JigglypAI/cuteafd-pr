@@ -415,6 +415,15 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             let arenas = contract.components.iter().filter(|c| matches!(&c.kind, ComponentKind::Allocation { template, .. }
                 if template.group == "weight arena" && template.location == Location::coordinator(gpu as u8))).count();
             assert_eq!(arenas, 1, "rtx{gpu}");
+            let execution = targets[gpu].execution_arena().unwrap();
+            for &layer in &targets[gpu].layers {
+                assert_eq!(execution.view(&format!("{TEXT}layers.{layer}.attn.rel_logits_proj.padded")).unwrap().bytes(),
+                    1024*64*2);
+            }
+            let backing = contract.components.iter().find(|component| matches!(&component.kind,
+                ComponentKind::Allocation { template, .. } if template.group == "weight arena"
+                    && template.location == Location::coordinator(gpu as u8))).unwrap();
+            assert_eq!(backing.bytes.at(1).unwrap(), execution.bytes() as u64);
         }
         // KV pages exist for the global layer only: on its owner under `layers`, on both ranks under a split.
         for (layer, owner) in owners.iter().enumerate() {

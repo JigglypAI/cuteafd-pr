@@ -310,7 +310,7 @@ impl InklingInputs {
         // a replicated residual on both ranks (no hop).
         let terminal = if self.modes.iter().all(|mode| matches!(mode, LayerMode::Whole { .. })) {
             TerminalHome::AttentionOwner } else { TerminalHome::Replicated };
-        HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: rows * self.cfg.hidden as u64 * 2,
+        HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: rows * self.cfg.hidden as u64 * 4,
             rows: self.prefill.rows.max(u64::from(DECODE_ROWS)), lanes: LANES, entry_gpu: 0,
             head_gpu: self.head_gpu(), terminal }
     }
@@ -500,8 +500,9 @@ impl InklingInputs {
         let head = self.head_gpu();
         let cfg = &self.cfg;
         let rows = u64::from(DECODE_ROWS);
-        let buffers: [(&str, u64); 3] = [("tokens", rows * 4), ("normalized", rows * cfg.hidden as u64 * 2),
-            ("logits", rows * cfg.vocab_size as u64 * 4)];
+        let buffers: [(&str, u64); 4] = [("tokens", rows * 4), ("normalized", rows * cfg.hidden as u64 * 2),
+            ("logits", rows * cfg.unpadded_vocab_size as u64 * 4),
+            ("workspace", cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64)];
         let mut out = Vec::new();
         for (name, bytes) in buffers {
             out.extend(buffer(format!("inkling2.head.{name}"), Location::coordinator(head), bytes, Lifetime::TARGET,

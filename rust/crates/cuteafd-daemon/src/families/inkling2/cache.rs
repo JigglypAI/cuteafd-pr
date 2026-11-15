@@ -109,10 +109,13 @@ impl<'a> CacheBank<'a> {
     }
     pub fn drain(&self) -> Result<()> { self.copies.drain() }
     pub fn inventory(&self, inventory: &mut Inventory<'_>) -> Result<()> {
-        self.active.inventory(inventory, "inkling2.cache.active")?;
-        if let Some(marks) = &self.marks { marks.inventory(inventory, "inkling2.cache.marks")?; }
-        for (layer, owner) in &self.pages { owner.inventory(inventory, &format!("inkling2.cache.layer.{layer}.pages"))?; }
-        self.copies.allocation_receipts(inventory, "inkling2.cache.copies")
+        let location = inventory.location(self.readers[0].device.id)?;
+        let cuteafd_loader::placement::planner::Device::Coordinator(gpu) = location.device
+            else { anyhow::bail!("Inkling cache is not coordinator-owned"); };
+        self.active.inventory(inventory, &format!("inkling2.cache.{gpu}.active"))?;
+        if let Some(marks) = &self.marks { marks.inventory(inventory, &format!("inkling2.cache.{gpu}.marks"))?; }
+        for (layer, owner) in &self.pages { owner.inventory(inventory, &format!("inkling2.kv.{layer}.{gpu}.records"))?; }
+        self.copies.allocation_receipts(inventory, &format!("inkling2.cache.{gpu}.copies"))
     }
 }
 /// Logical pages and frontiers belong to the shared scheduler. Mutable model

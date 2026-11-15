@@ -117,13 +117,24 @@ impl CoordinatorWeights {
         Ok(load)
     }
 
+    /// Native ordered-K16 relative projection consumes a padded transpose in
+    /// the same target backing, in addition to the unchanged checkpoint view.
+    pub fn execution_arena(&self) -> Result<WeightArenaLayout> {
+        let mut tensors = self.arena.views().iter().map(|(name, view)| (name.clone(), view.bytes())).collect::<Vec<_>>();
+        for &layer in &self.layers {
+            tensors.push((format!("{TEXT}layers.{layer}.attn.rel_logits_proj.padded"), 1024*64*2));
+        }
+        WeightArenaLayout::new(self.arena.id(), tensors)
+    }
+
     /// Charge one arena backing and its one driver-allocation tail. Tensor
     /// views are aliases, not additional resident-weight charges.
     pub fn weight_components(&self, maximum_pages: u64)
         -> std::result::Result<Vec<crate::placement::planner::Component>, crate::placement::planner::Refusal> {
         use crate::placement::planner::{weight_arena_components, Lifetime, Location, Refusal};
         let rank = u8::try_from(self.rank).map_err(|_| Refusal::Overflow("Inkling 2 coordinator rank"))?;
-        weight_arena_components(&self.arena, Location::coordinator(rank), Lifetime::RESIDENT,
+        let arena = self.execution_arena().map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+        weight_arena_components(&arena, Location::coordinator(rank), Lifetime::RESIDENT,
             maximum_pages, cuteafd_core::memory_layout::MemoryKind::Weights)
     }
 }

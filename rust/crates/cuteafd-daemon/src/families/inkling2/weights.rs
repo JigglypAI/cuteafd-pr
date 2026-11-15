@@ -16,11 +16,7 @@ pub(crate) struct TargetWeights<'a> {
 }
 
 pub(crate) fn execution_arena(layout: &CoordinatorWeights) -> Result<WeightArenaLayout> {
-    let mut tensors = layout.arena.views().iter().map(|(name, view)| (name.clone(), view.bytes())).collect::<Vec<_>>();
-    for &layer in &layout.layers {
-        tensors.push((format!("model.llm.layers.{layer}.attn.rel_logits_proj.padded"), 1024*64*2));
-    }
-    WeightArenaLayout::new(layout.arena.id(), tensors)
+    layout.execution_arena()
 }
 
 fn transpose_relative(source: &[u8]) -> Result<Vec<u8>> {
