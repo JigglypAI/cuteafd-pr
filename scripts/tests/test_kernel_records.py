@@ -810,3 +810,20 @@ def test_profile_cache_keeps_changing_module_bindings(tmp_path):
     module.__file__ = str(second)
     recorder._record_dependencies([module])
     assert recorder.frames == {"first.py", "second.py"}
+
+
+def test_exported_record_is_owned_by_each_name(tmp_path, fake_cutlass):
+    output = tmp_path / "output"
+    output.mkdir()
+    recorder = records.Recorder(tmp_path, output).install()
+    try:
+        ir = fake_cutlass.generate_original_ir(None)[0]
+        executor = fake_cutlass.compile_and_cache(None, ir)
+        executor.export_to_c(output, "first", "prefix_first")
+        executor.export_to_c(output, "second", "prefix_second")
+        assert recorder.exports["first.o"]["export_prefix"] == "prefix_first"
+        assert recorder.exports["second.o"]["export_prefix"] == "prefix_second"
+        recorder.exports["second.o"]["source_reads_sha256"]["only_second"] = "hash"
+        assert "only_second" not in recorder.exports["first.o"]["source_reads_sha256"]
+    finally:
+        stop_recorder(recorder)
