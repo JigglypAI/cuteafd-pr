@@ -1798,26 +1798,26 @@ mod tests {
                     }
                     }
                     drafter.put(&drafter.context_positions, &17i64.to_le_bytes())?;
-                    assert_eq!(library.cuda_get_device()?, 0, "ordered put restores caller device");
-                    let staging = library.ordered_h2d_staging_buffer(drafter.context_positions.buffer,
+                    assert_eq!(device.library.cuda_get_device()?, 0, "ordered put restores caller device");
+                    let staging = device.library.ordered_h2d_staging_buffer(drafter.context_positions.buffer,
                         drafter.stream)?.context("ordered upload staging missing on retained device")?;
                     assert!(staging.bytes >= 8);
                     drafter.on_device(|| {
-                        assert_eq!(library.cuda_get_device()?, device.id);
-                        let event = library.cuda_event_create()?;
+                        assert_eq!(device.library.cuda_get_device()?, device.id);
+                        let event = device.library.cuda_event_create()?;
                         // SAFETY: this fixture retains the owner stream/buffer;
                         // explicit event and enqueue run on the scoped device.
                         unsafe {
-                            library.cuda_zero_bytes_async(drafter.context_slots.buffer, 4, drafter.stream)?;
-                            library.cuda_event_record(event, drafter.stream)?;
-                            library.cuda_event_synchronize(event)?;
-                            library.cuda_event_destroy(event)?;
+                            device.library.cuda_zero_bytes_async(drafter.context_slots.buffer, 4, drafter.stream)?;
+                            device.library.cuda_event_record(event, drafter.stream)?;
+                            device.library.cuda_event_synchronize(event)?;
+                            device.library.cuda_event_destroy(event)?;
                         }
                         Ok(())
                     })?;
-                    assert_eq!(library.cuda_get_device()?, 0, "enqueue restores caller device");
+                    assert_eq!(device.library.cuda_get_device()?, 0, "enqueue restores caller device");
                     drafter.reset_context(0, 0)?;
-                    assert_eq!(library.cuda_get_device()?, 0, "reset restores caller device");
+                    assert_eq!(device.library.cuda_get_device()?, 0, "reset restores caller device");
                     let source = include_str!("block_dspark.rs");
                     assert!(source.contains("self.on_device(|| self.update_on_device(rows))"));
                     assert!(source.contains("self.on_device(|| self.draft_on_device(sequences, input, head, serving))"));
