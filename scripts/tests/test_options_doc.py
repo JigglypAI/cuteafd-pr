@@ -175,7 +175,7 @@ def parse_levers() -> list[dict[str, object]]:
             families = [family.strip() for family in row[1].split(",") if family.strip()]
             assert families, f"lever row {keys} names no family"
             assert all(cell for cell in row[2:]), f"lever row {keys} has an empty cell"
-            levers.append({"keys": keys, "families": families})
+            levers.append({"keys": keys, "families": families, "enable": row[2]})
         assert levers, f"{LEVERS_SECTION} lists no levers"
         return levers
     raise AssertionError(f"docs/options.md has no {LEVERS_SECTION} section")
@@ -394,6 +394,22 @@ def test_optional_levers_are_default_off_and_documented():
             assert key in MATRIX, f"lever {key} is absent from the family support table"
             assert key in DEFAULTS, f"lever {key} has no documented default"
             default = DEFAULTS[key]
+            if key == "SPECULATOR":
+                # MiniMax is documented separately from the legacy family matrix;
+                # its default is off even though other families default to drafting.
+                assert lever["families"] == ["MiniMax M3.1 Flash"]
+                assert "`SPECULATOR=dspark` (unset/auto = off)" in lever["enable"]
+                assert key in family_keys("minimax_m3")
+                launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
+                selection = launcher.split('speculator="$(get SPECULATOR)"', 1)[1].split(
+                    'case "$family:$speculator" in', 1)[0]
+                for value in ("", "auto", "off", "dspark"):
+                    script = 'speculator="$1"; family=minimax_m3; ' + selection
+                    result = subprocess.run(["bash", "-c", script + '\nprintf "%s" "$speculator"', "_", value],
+                        capture_output=True, text=True)
+                    assert result.returncode == 0, result.stderr
+                    assert result.stdout == (value if value in {"off", "dspark"} else "off")
+                continue
             if key == "KV_CACHE":
                 assert lever["families"] == ["Muse"]
                 assert default == "family default"

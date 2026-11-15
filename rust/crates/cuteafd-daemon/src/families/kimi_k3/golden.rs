@@ -392,7 +392,7 @@ fn compare(actual: &[f32], expected: &[f32]) -> Result<(f64, f64)> {
     Ok((ab / (aa.sqrt() * bb.sqrt()), (dd / bb).sqrt()))
 }
 
-fn hosted_layers(value: &str) -> Result<Vec<usize>> {
+pub(super) fn hosted_layers(value: &str) -> Result<Vec<usize>> {
     if value.is_empty() { return Ok(vec![]); }
     value.split(',').map(|s| s.parse::<usize>().context("Kimi hosted layer ID")).collect()
 }
@@ -437,7 +437,6 @@ fn run(args: GoldenArgs) -> Result<()> {
         .context("Kimi golden requires the immutable selected checkpoint view")?));
     let full = KimiK3Config::from_hf(&checkpoint.config)?;
     full.release_geometry()?;
-    full.validate_attention_role(true)?;
     let cfg = admission::prefix(&full, last.checked_add(1).context("Kimi last-layer overflow")?)?;
     args.hosted(&cfg)?;
     if args.check_headers {
@@ -604,7 +603,6 @@ fn full_run(args: GoldenArgs) -> Result<()> {
     let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator_view(&view, false, false)?;
     let full = KimiK3Config::from_hf(&checkpoint.config)?;
     full.release_geometry()?;
-    full.validate_attention_role(true)?;
     let cfg = match args.last_layer {
         Some(last) => admission::prefix(&full, last.checked_add(1).context("Kimi last-layer overflow")?)?,
         None => full.clone(),
@@ -901,6 +899,7 @@ fn load_target<'a, const RANKS: usize>(args: &GoldenArgs, library: &'a Arc<cutea
         context: cuteafd_loader::placement::planner::Context::pinned(cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT as u64), slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT,
         pool_tokens: Some(1_048_576), graphs, draft: None, ffn_mode: args.ffn_mode(),
         hosted_layers: args.hosted(cfg)?, verify_rows: verify, prefix: None,
+        #[cfg(test)] prove_serve_admission: false,
     })
 }
 
@@ -922,7 +921,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     let graphs = args.startup_graphs()?;
     ensure!(args.device >= 0 && args.split_device.is_none_or(|peer| peer >= 0 && peer != args.device),
         "Kimi golden devices must name distinct physical owners");
-    let super::startup::Loaded { engine, admission_free, admitted_bytes, ownership } = match args.split_device {
+    let super::startup::Loaded { engine, admission_free, admitted_bytes, ownership, .. } = match args.split_device {
         Some(peer) => load_target(args, &library, &programs, checkpoint, full, cfg,
             [args.device, peer], prefill, graphs, verify.unwrap_or(0))?,
         None => load_target(args, &library, &programs, checkpoint, full, cfg,

@@ -1729,6 +1729,7 @@ impl<'a> MimoEngine<'a> {
         };
         // Norms/router/wire quant always use full-width exports on both ranks.
         add("mimo_norm".into(), false, PackedRows);
+        if self.peer.is_some() { add("mimo_norm_head_split".into(), false, PackedRows); }
         for layers in std::iter::once(&self.weights.layers)
             .chain(self.peer.as_ref().map(|p| &p.layers)) {
             for layer in layers {
@@ -2778,7 +2779,7 @@ impl<'a> MimoEngine<'a> {
         self.norm_full(0, w, weight, deltas, rows, w.delta.buffer.ptr, w.delta.buffer.ptr)
     }
 
-    /// On rank `rank`: `h += bf16(delta + second)` when `deltas` is 2 (the local
+    /// On rank `rank`: `h = bf16(h + (delta + second))` when `deltas` is 2 (the local
     /// `delta` first, so both GPUs of a head split sum identically), `h += delta`
     /// when 1, then `x = weight * RMSNorm(h)`.
     #[allow(clippy::too_many_arguments)]
@@ -2790,7 +2791,8 @@ impl<'a> MimoEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn norm_full(&self, rank: usize, w: &Workspace<'_>, weight: *mut c_void, deltas: i32, rows: Scalar,
         first: *mut c_void, second: *mut c_void) -> Result<()> {
-        self.run_on(rank, false, "mimo_norm", &[("residual", w.h.buffer.ptr), ("delta0", first), ("delta1", second),
+        let program = if deltas == 2 { "mimo_norm_head_split" } else { "mimo_norm" };
+        self.run_on(rank, false, program, &[("residual", w.h.buffer.ptr), ("delta0", first), ("delta1", second),
             ("weight", weight), ("out", w.x.buffer.ptr)], &[rows, Scalar::I32(deltas)])
     }
 
