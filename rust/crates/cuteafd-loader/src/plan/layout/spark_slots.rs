@@ -149,8 +149,43 @@ pub(crate) fn native_catalog_owner_bytes(catalog: &crate::OfficialV41Catalog, fa
 pub(crate) fn catalog_owner_bytes(catalog: &crate::OfficialV41Catalog, family: &str,
     working: &SparkWorkingSet, rank: usize, extent: cuteafd_core::OwnerExtent)
     -> anyhow::Result<cuteafd_core::OwnerBytes> {
-    if catalog.fp8().is_some() { native_catalog_owner_bytes(catalog, family, working, rank, extent) }
-    else { exl3_owner_bytes(family, catalog.routed_experts().geometry()?, extent) }
+    if catalog.fp8().is_some() { return native_catalog_owner_bytes(catalog, family, working, rank, extent); }
+    let geometry = catalog.routed_experts().geometry()?;
+    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!("spark_slot_census.json"))?;
+    if !rows.iter().any(|row| row["family"] == family && row["format"] == "exl3" && row["width"].is_number()) {
+        return exl3_owner_bytes(family, geometry, extent);
+    }
+    let mut widths = Vec::new();
+    for &layer in &working.spark_layers {
+        let residency = catalog.exl3_spark_residency(crate::V41Exl3Layer::Backbone(layer), working.spark_ranks, rank)?;
+        let width = u32::try_from(residency.intermediate)?;
+        if !widths.contains(&width) { widths.push(width); }
+    }
+    anyhow::ensure!(widths.len() == 1, "EXL3 worker requires one retained rank width, found {widths:?}");
+    recorded_exl3_owner_bytes(&rows, family, geometry, widths[0], extent)
+}
+
+fn recorded_exl3_owner_bytes(rows: &[serde_json::Value], family: &str,
+    geometry: cuteafd_core::ExpertGeometry, width: u32, extent: cuteafd_core::OwnerExtent)
+    -> anyhow::Result<cuteafd_core::OwnerBytes> {
+    let row = rows.iter().find(|row| row["family"] == family && row["format"] == "exl3"
+        && row["width"].as_u64() == Some(u64::from(width)))
+        .with_context(|| format!("no EXL3 owner census for {family} width{width}"))?;
+    let capacities = cuteafd_core::Exl3RowPolicy::for_geometry(geometry).capacities(extent.capacity as usize)?;
+    anyhow::ensure!(capacities.last() == Some(&extent.compiled), "EXL3 retained exports differ from owner extent");
+    let recorded = row["manifests"].as_array().context("EXL3 census manifests absent")?;
+    let manifests = capacities.iter().map(|&capacity| recorded.iter()
+        .find(|manifest| manifest["capacity"].as_u64() == Some(u64::from(capacity)))
+        .cloned().with_context(|| format!("EXL3 census lacks width{width}/m{capacity}")))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(manifests.iter().all(|manifest| manifest["hidden"].as_u64() == Some(u64::from(geometry.hidden))
+        && manifest["experts"].as_u64() == Some(u64::from(geometry.experts))
+        && manifest["top_k"].as_u64() == Some(u64::from(geometry.topk))), "EXL3 census/checkpoint geometry mismatch");
+    let scratch = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)?;
+    let io = u64::from(extent.capacity).checked_mul(u64::from(geometry.hidden) * 33 / 32
+        + u64::from(geometry.topk) * 8).context("EXL3 owner I/O overflow")?;
+    Ok(cuteafd_core::OwnerBytes { scratch, io,
+        pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 })
 }
 
 /// One native NVFP4 owner on the shared FP8-family worker: the installed
@@ -440,6 +475,20 @@ mod tests {
             assert!(group_scratch("inkling2", format, 320, 4096).is_err(),
                 "an unrecorded width cannot borrow a neighbour or a margin");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn recorded_exl3_widths_keep_aliases_and_private_capacity_owners_exact() -> anyhow::Result<()> {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!("spark_slot_census.json"))?;
+        let geometry = cuteafd_core::ExpertGeometry::INKLING2;
+        for (width, expected) in [(256, 516_083_772), (384, 541_249_596), (512, 566_415_420),
+            (640, 591_581_244), (768, 616_747_068), (1152, 692_244_540), (2304, 918_736_956)] {
+            let owner = recorded_exl3_owner_bytes(&rows, "inkling2", geometry, width, extent(4096,4096))?;
+            assert_eq!(owner.scratch, expected);
+            assert_eq!(owner.io, 4096*(4608+144+64));
+        }
+        assert!(recorded_exl3_owner_bytes(&rows, "inkling2", geometry, 320, extent(4096,4096)).is_err());
         Ok(())
     }
 
