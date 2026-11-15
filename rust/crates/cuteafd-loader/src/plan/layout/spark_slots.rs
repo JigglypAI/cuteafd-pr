@@ -539,7 +539,8 @@ mod tests {
             let family = row["family"].as_str().unwrap();
             let format = match row["format"].as_str().unwrap() {
                 "fp8" => ExpertFormat::Fp8Block128, "mxfp4" => ExpertFormat::Mxfp4,
-                "nvfp4" => ExpertFormat::Nvfp4, "bf16" => ExpertFormat::Bf16, _ => unreachable!(),
+                "nvfp4" => ExpertFormat::Nvfp4, "bf16" => ExpertFormat::Bf16,
+                "mxfp8" => ExpertFormat::Mxfp8, _ => unreachable!(),
             };
             let hidden = row["hidden"].as_u64().unwrap();
             let topk = row["topk"].as_u64().unwrap();
@@ -549,7 +550,8 @@ mod tests {
             for (index, compiled) in CENSUS_CAPACITIES.into_iter().enumerate() {
                 let rows = u64::from(compiled);
                 let exact = row["scratch"][index].as_u64().unwrap() + rows * (input + 8 * topk + 2 * hidden);
-                let owner = fp8_owner_bytes(family, geometry, &[(format, 128)], extent(compiled, compiled)).unwrap();
+                let width = row["width"].as_u64().unwrap_or(128) as u32;
+                let owner = fp8_owner_bytes(family, geometry, &[(format, width)], extent(compiled, compiled)).unwrap();
                 assert!(owner.scratch + owner.io >= exact, "{package} m{compiled}: planner < census {exact}");
                 assert_eq!(owner.pinned_staging, rows * topk * 8, "each unit retains packed route planes");
             }
