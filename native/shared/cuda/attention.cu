@@ -542,67 +542,6 @@ __global__ void sparse_mla_nvfp4_gather_fp8_kernel(
   }
 }
 
-__global__ void mla_nvfp4_expand_fp8_paged_kernel(
-    const uint8_t* nvfp4_kv, const uint32_t* physical_pages,
-    const int32_t* active_rows, uint8_t* fp8_kv, size_t max_tokens,
-    size_t page_size, size_t nvfp4_row_stride_bytes) {
-  const int32_t active = max(0, min(*active_rows, static_cast<int32_t>(max_tokens)));
-  const size_t warp = threadIdx.x >> 5;
-  const size_t lane = threadIdx.x & 31;
-  __shared__ float group_scales[4];
-
-  for (size_t logical_row = blockIdx.x;
-       logical_row < static_cast<size_t>(active); logical_row += gridDim.x) {
-    const size_t logical_page = logical_row / page_size;
-    const size_t page_offset = logical_row - logical_page * page_size;
-    const size_t physical_row =
-        static_cast<size_t>(physical_pages[logical_page]) * page_size + page_offset;
-    if (physical_row >= max_tokens) {
-      continue;
-    }
-    const uint8_t* src = nvfp4_kv + physical_row * nvfp4_row_stride_bytes;
-    uint8_t* dst = fp8_kv + physical_row * kSparseMlaFp8RowBytes;
-
-    if (warp < 4) {
-      const size_t source_scale = warp * 4;
-      uint8_t max_scale = src[kSparseMlaNvfp4CodeBytes + source_scale];
-#pragma unroll
-      for (size_t item = 1; item < 4; ++item) {
-        max_scale =
-            max(max_scale, src[kSparseMlaNvfp4CodeBytes + source_scale + item]);
-      }
-      // A 2^-6 factor maps the largest source E2M1 value (6) below the
-      // E4M3 maximum (448), while retaining an exact power-of-two scale.
-      const float group_scale =
-          ldexpf(1.0f, static_cast<int>(max_scale) - 127 - 6);
-      if (lane == 0) {
-        group_scales[warp] = group_scale;
-        reinterpret_cast<float*>(dst + kSparseMlaFp8ScaleOffset)[warp] =
-            group_scale;
-      }
-    }
-    __syncthreads();
-
-    if (warp < 4) {
-      const size_t group_offset = warp * 128;
-      const float group_scale = group_scales[warp];
-#pragma unroll
-      for (size_t item = 0; item < 4; ++item) {
-        const size_t col = group_offset + lane + item * 32;
-        dst[col] = __nv_cvt_float_to_fp8(
-            sparse_mla_nvfp4_value(src, col) / group_scale, __NV_SATFINITE,
-            __NV_E4M3);
-      }
-    }
-    if (threadIdx.x < kSparseMlaNvfp4RopeDim) {
-      reinterpret_cast<uint16_t*>(dst + kSparseMlaFp8RopeOffset)[threadIdx.x] =
-          reinterpret_cast<const uint16_t*>(src + kSparseMlaNvfp4RopeOffset)
-              [threadIdx.x];
-    }
-    __syncthreads();
-  }
-}
-
 __device__ __forceinline__ float sparse_mla_nvfp4_value(
     const uint8_t* row_bytes, size_t col) {
   const uint8_t packed = row_bytes[col / 2];
@@ -2196,26 +2135,6 @@ extern "C" cuteafd_status_t cuteafd_cuda_sparse_mla_nvfp4_gather_fp8_async(
   sparse_mla_nvfp4_gather_fp8_kernel<<<static_cast<int>(rows), 128, 0, stream>>>(
       nvfp4_kv, selected_indices, topk_lengths, fp8_kv, fp8_indices,
       query_rows, selected_index_stride, staged_topk,
-      nvfp4_row_stride_bytes);
-  return status_from_cuda(cudaGetLastError());
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_mla_nvfp4_expand_fp8_paged_async(
-    const uint8_t* nvfp4_kv, const uint32_t* physical_pages,
-    const int32_t* active_rows, uint8_t* fp8_kv, size_t max_tokens,
-    size_t page_size, size_t nvfp4_row_stride_bytes, void* cuda_stream) {
-  if (nvfp4_kv == nullptr || physical_pages == nullptr ||
-      active_rows == nullptr || fp8_kv == nullptr || max_tokens == 0 ||
-      max_tokens > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
-      page_size == 0 || max_tokens % page_size != 0 ||
-      nvfp4_row_stride_bytes < kSparseMlaNvfp4MinRowBytes) {
-    return CUTEAFD_STATUS_INVALID_ARGUMENT;
-  }
-  constexpr size_t kExpansionBlocks = 4096;
-  const size_t blocks = min(max_tokens, kExpansionBlocks);
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  mla_nvfp4_expand_fp8_paged_kernel<<<static_cast<int>(blocks), 128, 0, stream>>>(
-      nvfp4_kv, physical_pages, active_rows, fp8_kv, max_tokens, page_size,
       nvfp4_row_stride_bytes);
   return status_from_cuda(cudaGetLastError());
 }

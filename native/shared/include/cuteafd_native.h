@@ -1316,10 +1316,6 @@ cuteafd_status_t cuteafd_cuda_sparse_mla_nvfp4_gather_fp8_async(
     const int32_t* topk_lengths, uint8_t* fp8_kv, int32_t* fp8_indices,
     size_t query_rows, size_t selected_index_stride, size_t staged_topk,
     size_t nvfp4_row_stride_bytes, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_mla_nvfp4_expand_fp8_paged_async(
-    const uint8_t* nvfp4_kv, const uint32_t* physical_pages,
-    const int32_t* active_rows, uint8_t* fp8_kv, size_t max_tokens,
-    size_t page_size, size_t nvfp4_row_stride_bytes, void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_mla_merge_state_bf16(
     uint16_t* accumulator, float* accumulator_lse, const uint16_t* partial,
     const float* partial_lse, size_t heads, size_t kv_lora_rank);

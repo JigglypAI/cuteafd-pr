@@ -412,7 +412,7 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
 
 
 // ---------------------------------------------------------------------------
-// E4M3 tensor-core kernel (kernel 2, two-term P, is the engine default): QK and
+// E4M3 tensor-core kernel (kernel 1, the engine default): QK and
 // PV on mma.m16n8k32.e4m3 (twice the F16 rate on SM120), the records' codes
 // copied as stored (cp.async, no dequantization), RoPE on BF16 tensor cores.
 //
@@ -424,15 +424,15 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
 // [32][512] (16-byte units swizzled by token & 7), group scales [32][4], RoPE
 // rows [32][64] BF16 (swizzled likewise), and the next tile's slots.
 //   QK: the query enters as E4M3 scaled per head by a power of two (its
-//   largest latent |q| lands in (224, 448]); kQTerms = 2 adds a second E4M3
+//   largest latent |q| lands in (224, 448]) plus a second E4M3
 //   term for the remainder (q ~ hi + lo, about 7 significant bits). Warp w's
 //   partial is scaled in FP32 by each record's group scale w, then takes its
 //   16 RoPE dims (BF16 query times the same power of two, exact) on BF16
 //   tensor cores; the four partials meet in shared memory and the online
 //   softmax runs in FP32, each thread on four records of one head.
 //   PV: out[h, c] = sum_t p[h, t] codes[t, c] scale[t, group(c)]: the softmax
-//   threads write P times each group's scales as four E4M3 copies (kPTerms =
-//   2: hi + lo, about 7 significant bits), each copy scaled by a power of two
+//   threads write P times each group's scales as four E4M3 copies (two
+//   terms each: hi + lo, about 7 significant bits), each copy scaled by a power of two
 //   that only decreases along the row (the largest group scale seen times it
 //   stays at most 448); warp w multiplies its copy by the codes, read with
 //   ldmatrix.trans and byte-permuted into k32 fragments (the tile's record
@@ -513,18 +513,18 @@ __device__ __forceinline__ uint32_t to_e4m3x2(float a, float b) {
   return __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
 }
 
-// E4M3 pair (hi) of (a, b), and with kTerms = 2 the pair of the remainders (lo).
-template <int kTerms>
+// Query and P each enter their products as two E4M3 terms, hi + lo (about 7
+// significant bits). One term (3 mantissa bits) put 5-9% relative error into
+// the output on the selftest; those kernels are gone.
+constexpr int kTerms = 2;
+
+// E4M3 pair (hi) of (a, b) and the pair of the remainders (lo).
 __device__ __forceinline__ void quant2(float a, float b, uint32_t& hi, uint32_t& lo) {
   hi = to_e4m3x2(a, b);
-  if (kTerms == 2) {
-    // The remainder in F16 (exact for hi; x rounded to 11 bits, well past lo's 4).
-    const __half2 x = __floats2half2_rn(a, b);
-    const __half2 back(__nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(hi), __NV_E4M3));
-    lo = __nv_cvt_halfraw2_to_fp8x2(__hsub2(x, back), __NV_SATFINITE, __NV_E4M3);
-  } else {
-    lo = 0;
-  }
+  // The remainder in F16 (exact for hi; x rounded to 11 bits, well past lo's 4).
+  const __half2 x = __floats2half2_rn(a, b);
+  const __half2 back(__nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(hi), __NV_E4M3));
+  lo = __nv_cvt_halfraw2_to_fp8x2(__hsub2(x, back), __NV_SATFINITE, __NV_E4M3);
 }
 
 __device__ __forceinline__ float pow2(int e) { return __int_as_float((127 + e) << 23); }
@@ -536,7 +536,7 @@ __device__ __forceinline__ int e4m3_exponent(float m) {
   return min(max(8 - e, -120), 120);
 }
 
-template <bool kHasRope, int kGroups, int kQTerms, int kPTerms>
+template <bool kHasRope, int kGroups>
 __global__ void __launch_bounds__(128 * kGroups, 1)
 mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, const int32_t* __restrict__ indices,
                    const int32_t* __restrict__ lengths, bf16* __restrict__ out, int heads, int topk, int rec,
@@ -626,7 +626,7 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
 
   const float qd_lo = pow2(-s.qexp[group * 16 + g]), qd_hi = pow2(-s.qexp[group * 16 + g + 8]);
   // A fragments: 16 heads x this warp's 128 latent channels (4 k32 steps), E4M3 x 2^qexp.
-  uint32_t qa[kQTerms][4][4];
+  uint32_t qa[kTerms][4][4];
   {
     const float up_lo = 1.0f / qd_lo, up_hi = 1.0f / qd_hi;
     const bf16* q_lo = q + (int64_t(row) * heads + head0 + g) * kQk;
@@ -639,10 +639,10 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
         const uint2 v = *reinterpret_cast<const uint2*>((f & 1 ? q_hi : q_lo) + c);
         const float up = f & 1 ? up_hi : up_lo;
         uint32_t h0, l0, h1, l1;
-        quant2<kQTerms>(bf16_bits(uint16_t(v.x & 0xFFFF)) * up, bf16_bits(uint16_t(v.x >> 16)) * up, h0, l0);
-        quant2<kQTerms>(bf16_bits(uint16_t(v.y & 0xFFFF)) * up, bf16_bits(uint16_t(v.y >> 16)) * up, h1, l1);
+        quant2(bf16_bits(uint16_t(v.x & 0xFFFF)) * up, bf16_bits(uint16_t(v.x >> 16)) * up, h0, l0);
+        quant2(bf16_bits(uint16_t(v.y & 0xFFFF)) * up, bf16_bits(uint16_t(v.y >> 16)) * up, h1, l1);
         qa[0][ks][f] = h0 | (h1 << 16);
-        if (kQTerms == 2) qa[kQTerms - 1][ks][f] = l0 | (l1 << 16);
+        qa[1][ks][f] = l0 | (l1 << 16);
       }
     }
   }
@@ -677,7 +677,7 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
   const float* group_part = reinterpret_cast<const float*>(group_bytes);
   // No CTA barrier per tile: the four head groups drift apart (one's softmax overlaps another's
   // MMAs), bounded by the stage ring: tile i + 1 is copied into the stage of tile i - 2.
-  // P copies (alias the group's partials once they are summed): [4 scale groups][kPTerms][8 g][4
+  // P copies (alias the group's partials once they are summed): [4 scale groups][kTerms][8 g][4
   // t4][4 registers a0..a3 x 4 bytes]: one 16-byte A fragment per PV thread.
   uint8_t* pbuf = group_bytes;
 
@@ -711,7 +711,7 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
         uint32_t b[4];
         ldsm_x4(b, codes + token * kD + swz(token, unit) * 16);
 #pragma unroll
-        for (int qt = 0; qt < kQTerms; ++qt) {
+        for (int qt = 0; qt < kTerms; ++qt) {
           mma_e4m3(sn[j], qa[qt][ks], b[0], b[1]);
           mma_e4m3(sn[j + 1], qa[qt][ks], b[2], b[3]);
         }
@@ -802,11 +802,11 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
       for (int k = 0; k < 4; ++k) {
         const float f = pow2(pexp[k]);
         uint32_t h01, l01, h89, l89;
-        quant2<kPTerms>(e[0] * (s0[k] * f), e[1] * (s1[k] * f), h01, l01);
-        quant2<kPTerms>(e[2] * (s2[k] * f), e[3] * (s3[k] * f), h89, l89);
-        uint8_t* p = pbuf + k * kPTerms * 512 + (g * 4 + t4) * 16 + 4 * cw;
+        quant2(e[0] * (s0[k] * f), e[1] * (s1[k] * f), h01, l01);
+        quant2(e[2] * (s2[k] * f), e[3] * (s3[k] * f), h89, l89);
+        uint8_t* p = pbuf + k * kTerms * 512 + (g * 4 + t4) * 16 + 4 * cw;
         *reinterpret_cast<uint32_t*>(p) = h01 | h89 << 16;
-        if (kPTerms == 2) *reinterpret_cast<uint32_t*>(p + 512) = l01 | l89 << 16;
+        *reinterpret_cast<uint32_t*>(p + 512) = l01 | l89 << 16;
       }
     }
     if (acc_shift) {
@@ -825,10 +825,10 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
     }
     group_barrier(group);
     {
-      uint32_t pa[kPTerms][4];
+      uint32_t pa[kTerms][4];
 #pragma unroll
-      for (int pt = 0; pt < kPTerms; ++pt) {
-        const uint4 a = *reinterpret_cast<const uint4*>(pbuf + (cw * kPTerms + pt) * 512 + (g * 4 + t4) * 16);
+      for (int pt = 0; pt < kTerms; ++pt) {
+        const uint4 a = *reinterpret_cast<const uint4*>(pbuf + (cw * kTerms + pt) * 512 + (g * 4 + t4) * 16);
         pa[pt][0] = a.x;
         pa[pt][1] = a.y;
         pa[pt][2] = a.z;
@@ -844,7 +844,7 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
         const uint32_t even0 = prmt(b[0], b[1], 0x6420), even1 = prmt(b[2], b[3], 0x6420);
         const uint32_t odd0 = prmt(b[0], b[1], 0x7531), odd1 = prmt(b[2], b[3], 0x7531);
 #pragma unroll
-        for (int pt = 0; pt < kPTerms; ++pt) {
+        for (int pt = 0; pt < kTerms; ++pt) {
           mma_e4m3(acc[2 * u], pa[pt], even0, even1);
           mma_e4m3(acc[2 * u + 1], pa[pt], odd0, odd1);
         }
@@ -881,10 +881,10 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
 
 }  // namespace e4m3
 
-template <bool kHasRope, int kGroups, int kQTerms, int kPTerms>
+template <bool kHasRope, int kGroups>
 int launch_e4m3(const void* q, const void* kv, const void* indices, const void* lengths, void* out, int rows,
                 int heads, int topk, int record_bytes, float scale_log2, cudaStream_t s) {
-  auto kernel = e4m3::mla_prefill_kernel<kHasRope, kGroups, kQTerms, kPTerms>;
+  auto kernel = e4m3::mla_prefill_kernel<kHasRope, kGroups>;
   constexpr int bytes = e4m3::smem_bytes<kHasRope, kGroups>();
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
   kernel<<<dim3(rows, heads / (16 * kGroups)), 128 * kGroups, bytes, s>>>(
@@ -893,24 +893,19 @@ int launch_e4m3(const void* q, const void* kv, const void* indices, const void* 
   return cudaGetLastError();
 }
 
-template <bool kHasRope, int kQTerms, int kPTerms>
+template <bool kHasRope>
 int launch_e4m3_heads(const void* q, const void* kv, const void* indices, const void* lengths, void* out, int rows,
                       int heads, int topk, int record_bytes, float scale_log2, cudaStream_t s) {
   return heads % 64 == 0
-             ? launch_e4m3<kHasRope, 4, kQTerms, kPTerms>(q, kv, indices, lengths, out, rows, heads, topk,
-                                                          record_bytes, scale_log2, s)
-             : launch_e4m3<kHasRope, 2, kQTerms, kPTerms>(q, kv, indices, lengths, out, rows, heads, topk,
-                                                          record_bytes, scale_log2, s);
+             ? launch_e4m3<kHasRope, 4>(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2, s)
+             : launch_e4m3<kHasRope, 2>(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2, s);
 }
 
-template <int kQTerms, int kPTerms>
 int launch_e4m3_records(const void* q, const void* kv, const void* indices, const void* lengths, void* out, int rows,
                         int heads, int topk, int record_bytes, float scale_log2, cudaStream_t s) {
   return record_bytes == 656
-             ? launch_e4m3_heads<true, kQTerms, kPTerms>(q, kv, indices, lengths, out, rows, heads, topk, record_bytes,
-                                                          scale_log2, s)
-             : launch_e4m3_heads<false, kQTerms, kPTerms>(q, kv, indices, lengths, out, rows, heads, topk,
-                                                           record_bytes, scale_log2, s);
+             ? launch_e4m3_heads<true>(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2, s)
+             : launch_e4m3_heads<false>(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2, s);
 }
 
 }  // namespace
@@ -919,27 +914,17 @@ int launch_e4m3_records(const void* q, const void* kv, const void* indices, cons
 // over the records kv (slot * record_bytes; 656 with RoPE, 528 without) at
 // indices [rows, topk] (the first lengths[r] entries; negative ones masked).
 // scale_log2 = softmax scale * log2(e). heads must be a multiple of 32.
-// kernel: 0 the F16 kernel; E4M3 kernels 1 (one-term query and P), 2 (two-term
-// P), 3 (two-term query), 4 (two-term query and P).
+// kernel: 0 the F16 kernel, 1 the E4M3 kernel (two-term query and P).
 extern "C" int32_t cuteafd_glm_mla_prefill(const void* q, const void* kv, const void* indices, const void* lengths,
                                            void* out, int32_t rows, int32_t heads, int32_t topk,
                                            int32_t record_bytes, float scale_log2, int32_t kernel, void* stream) {
   if (rows < 1 || heads % kHeads || topk < 1 || (record_bytes != 656 && record_bytes != 528) || kernel < 0 ||
-      kernel > 4) {
+      kernel > 1) {
     return cudaErrorInvalidValue;
   }
   auto s = static_cast<cudaStream_t>(stream);
-  switch (kernel) {
-    case 1:
-      return launch_e4m3_records<1, 1>(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2, s);
-    case 2:
-      return launch_e4m3_records<1, 2>(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2, s);
-    case 3:
-      return launch_e4m3_records<2, 1>(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2, s);
-    case 4:
-      return launch_e4m3_records<2, 2>(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2, s);
-    default:
-      break;
+  if (kernel == 1) {
+    return launch_e4m3_records(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2, s);
   }
   const bool rope = record_bytes == 656;
   const int bytes = rope ? smem_bytes<true>() : smem_bytes<false>();
@@ -983,9 +968,9 @@ __global__ void diff_stats(const bf16* __restrict__ a, const bf16* __restrict__ 
 
 }  // namespace
 
-// Diagnostics (CUTEAFD_MLA_PREFILL_CHECK): runs every kernel on the same inputs and writes, per
-// kernel k = 0..4, stats[3 k ..] = {relative L2, max abs difference, relative L2 of the output
-// itself (1)} against kernel 4 (two-term E4M3: the closest to exact). Synchronizes the stream;
+// Diagnostics (CUTEAFD_MLA_PREFILL_CHECK): runs both kernels on the same inputs and writes, per
+// kernel k = 0..1, stats[3 k ..] = {relative L2, max abs difference, RMS of the reference}
+// against kernel 1 (E4M3). Synchronizes the stream;
 // allocates its own buffers.
 extern "C" int32_t cuteafd_glm_mla_prefill_check(const void* q, const void* kv, const void* indices,
                                                  const void* lengths, int32_t rows, int32_t heads, int32_t topk,
@@ -1000,9 +985,9 @@ extern "C" int32_t cuteafd_glm_mla_prefill_check(const void* q, const void* kv, 
   if (e == cudaSuccess) e = CUTEAFD_TRACK_ALLOC("cudaMalloc", &dev, 3 * sizeof(double), 0, CUTEAFD_MEMORY_KIND_WORKSPACE, "glm/mla-prefill-check", cudaMalloc(&dev, 3 * sizeof(double)));
   if (e == cudaSuccess) {
     e = cudaError_t(cuteafd_glm_mla_prefill(q, kv, indices, lengths, ref, rows, heads, topk, record_bytes, scale_log2,
-                                            4, stream));
+                                            1, stream));
   }
-  for (int k = 0; k < 5 && e == cudaSuccess; ++k) {
+  for (int k = 0; k < 2 && e == cudaSuccess; ++k) {
     e = cudaError_t(cuteafd_glm_mla_prefill(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2,
                                             k, stream));
     double h[3] = {0, 0, 0};
