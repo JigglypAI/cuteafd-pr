@@ -552,7 +552,11 @@ mod tests {
                 let exact = row["scratch"][index].as_u64().unwrap() + rows * (input + 8 * topk + 2 * hidden);
                 let width = row["width"].as_u64().unwrap_or(128) as u32;
                 let owner = fp8_owner_bytes(family, geometry, &[(format, width)], extent(compiled, compiled)).unwrap();
-                assert!(owner.scratch + owner.io >= exact, "{package} m{compiled}: planner < census {exact}");
+                if row["width"].is_number() {
+                    assert_eq!(owner.scratch + owner.io, exact, "{package} m{compiled}: width-qualified owner differs");
+                } else {
+                    assert!(owner.scratch + owner.io >= exact, "{package} m{compiled}: planner < census {exact}");
+                }
                 assert_eq!(owner.pinned_staging, rows * topk * 8, "each unit retains packed route planes");
             }
         }
