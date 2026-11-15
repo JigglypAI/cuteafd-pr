@@ -10,12 +10,15 @@ enum Fixture { Mxfp8, Mixed, Exl3 }
 /// appear). Expert storage follows `fixture` per layer, as the three target
 /// checkpoints store them.
 fn fixture(kind: Fixture) -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
+    fixture_with_experts(kind, 4, 2)
+}
+fn fixture_with_experts(kind: Fixture, experts: usize, topk: usize) -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
     let dir = tempfile::tempdir().unwrap();
     let mut small = crate::families::inkling2::config::tests::release_config();
     small["text_config"]["num_hidden_layers"] = 4.into();
     small["text_config"]["local_layer_ids"] = serde_json::json!([0, 1, 2]);
-    small["text_config"]["n_routed_experts"] = 4.into();
-    small["text_config"]["num_experts_per_tok"] = 2.into();
+    small["text_config"]["n_routed_experts"] = experts.into();
+    small["text_config"]["num_experts_per_tok"] = topk.into();
     small["text_config"]["n_layers_per_attn_res_block"] = 2.into();
     small["mtp_config"]["target_layer_ids"] = serde_json::json!([1, 4]);
     let c = Inkling2Config::from_hf(&small).unwrap();
@@ -173,6 +176,48 @@ fn exl3_checkpoint_accepts_per_expert_k4_modules_split_by_row_parity() {
 }
 
 #[test]
+fn installed_exl3_onboarding_keeps_descriptor_arenas_and_each_workspace_request() -> anyhow::Result<()> {
+    use crate::families::inkling2::admission::local_package;
+    use crate::placement::families::inkling2::LocalPackage;
+    let (dir, _, _) = fixture_with_experts(Fixture::Exl3, 384, 8);
+    let catalog = crate::read_expert_catalog(dir.path())?;
+    let install = tempfile::tempdir()?;
+    let share = install.path().join("share");
+    std::fs::create_dir_all(&share)?;
+    let manifest = share.join("PROGRAMS.json");
+    for tp in [1, 2] {
+        let root = install.path().join(format!("lib/exl3/exl3-inkling2-k45/rtx-tp{tp}/m1"));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
+            "capacity": 1, "hidden": 4608, "intermediate":2304/tp, "experts":384,
+            "input_format":"e4m3_k32", "trellis_lut":{"bytes":1234},
+            "buffers":{"scratch":{"bytes":2345678,"allocation":"scratch","dtype":"f32","zero_on_create":false},
+                "state":{"bytes":64,"allocation":"state","dtype":"i32","zero_on_create":true}}
+        }))?)?;
+        let package = local_package(&catalog, Some(&manifest), tp, 1);
+        let LocalPackage::Installed { backings } = package
+            else { anyhow::bail!("EXL3 installed requests missing: {package:?}") };
+        for (count, groups) in backings.iter().enumerate().skip(1) {
+            assert_eq!(groups.len(), tp);
+            for backing in groups {
+                let runtime_regions = (0..count).map(|layer| {
+                    let resident = catalog.exl3().unwrap().residency(crate::V41Exl3Layer::Backbone(layer), tp, backing.gpu)?;
+                    let name = if tp == 1 { format!("BackboneFull {{ layer: {layer} }}.0") }
+                        else { format!("BackboneTp2 {{ layer: {layer}, rank: {} }}.0", backing.gpu) };
+                    Ok((name, resident.device_arena_layout()?.1))
+                }).collect::<anyhow::Result<Vec<_>>>()?;
+                let id = crate::serving_capacity::expert_weight_arena_id("exl3", backing.gpu as i32, &runtime_regions)?;
+                assert_eq!(backing.arena, crate::serving_capacity::WeightArenaLayout::new(id, runtime_regions)?);
+                let expected = crate::placement::rtx_onboard::expert_workspace_requests(&catalog, Some(&manifest), 1, tp, "inkling2")?;
+                assert_eq!(backing.workspace.iter().map(|(_, bytes)| *bytes).collect::<Vec<_>>(), expected);
+                assert_eq!(backing.workspace.last().unwrap(), &("output".into(), 4608*4));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn installed_local_native_owners_use_shared_workspace_requests_once() -> anyhow::Result<()> {
     use crate::families::inkling2::admission::local_package;
     use crate::placement::families::inkling2::LocalPackage;
@@ -193,10 +238,27 @@ fn installed_local_native_owners_use_shared_workspace_requests_once() -> anyhow:
                 "activation":"situ","projection":"bf16","swiglu_alpha":1.0,"swiglu_beta":0.0,
                 "swiglu_limit":0.0,"capacities":[{"capacity":80,"scratch_bytes":scratch}]}}}))?)?;
     }
-    let LocalPackage::Installed { workspace } = local_package(&catalog, Some(&manifest), 2, rows)
+    let LocalPackage::Installed { backings } = local_package(&catalog, Some(&manifest), 2, rows)
         else { anyhow::bail!("complete native package owners were not admitted") };
     let output = rows * catalog.routed_experts().hidden as u64 * 2;
-    assert_eq!(workspace, [12345 + 23456 + 2 * output; 2]);
+    assert_eq!(backings.len(), 5);
+    assert!(backings[0].is_empty());
+    assert_eq!(backings[1].len(), 2, "one homogeneous group per physical rank");
+    assert_eq!(backings[4].len(), 4, "mixed formats retain two independently retired backends per rank");
+    for gpu in 0..2 {
+        let workspace = backings[4].iter().filter(|backing| backing.gpu == gpu)
+            .flat_map(|backing| &backing.workspace).map(|(_, bytes)| bytes).sum::<u64>();
+        assert_eq!(workspace, 12345 + 23456 + 2*output);
+        for backing in backings[4].iter().filter(|backing| backing.gpu == gpu) {
+            let tensors = catalog.fp8().unwrap().for_coordinator().for_layer_metadata(backing.layers[0])?;
+            let regions = crate::serving_capacity::fp8_expert_regions(&tensors, &backing.layers, 2, gpu,
+                crate::formats::fp8_experts::Slicing::Blocks(128))?;
+            let id = crate::serving_capacity::expert_weight_arena_id("fp8", gpu as i32, &regions)?;
+            let runtime = crate::serving_capacity::WeightArenaLayout::new(id, regions)?;
+            assert_eq!(backing.arena, runtime, "planner backing must be the shared runtime arena");
+            assert_eq!(backing.workspace[1], ("output".into(), output));
+        }
+    }
     // Each native group is independently retained; no TP2 output from the
     // shared request list is charged again beside each backend's output.
     assert!(matches!(local_package(&catalog, Some(&manifest), 2, 81), LocalPackage::Missing(_)));
@@ -360,10 +422,22 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
         let budgets = (0..gpus).map(|gpu| shared::planned_budget(gpu as u8, 96 << 30, 96 << 30, 1 << 30))
             .chain((0..ranks).map(|rank| shared::spark_budget(rank as u8, 100 << 30)))
             .chain([crate::placement::families::kimi::host_budget(512 << 30, 480 << 30)]).collect();
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let local = LocalPackage::Installed { backings: (0..=routed.len()).map(|count| {
+            if count == 0 { return vec![]; }
+            (0..gpus).map(|gpu| {
+                let layers = routed[..count].to_vec();
+                let regions = crate::serving_capacity::fp8_expert_regions(&catalog.fp8().unwrap().for_coordinator(),
+                    &layers, gpus, gpu, crate::formats::fp8_experts::Slicing::Blocks(128)).unwrap();
+                let id = crate::serving_capacity::expert_weight_arena_id("fp8", gpu as i32, &regions).unwrap();
+                shared::LocalBacking { gpu, layers, arena: crate::serving_capacity::WeightArenaLayout::new(id, regions).unwrap(),
+                    workspace: vec![("scratch".into(), (64 << 20) - 1024*4608*2), ("output".into(), 1024*4608*2)] }
+            }).collect()
+        }).collect() };
         let inputs = InklingInputs { cfg: cfg.clone(), gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
             maximum_pool_tokens: 4 << 20, prefill, sequences: 16, prefix_entries: 8, prefix_mark_budget: 2 << 30, targets: targets.clone(), placement, modes: modes.clone(),
             routed: routed.clone(), experts,
-            local: LocalPackage::Installed { workspace: [64 << 20, if gpus == 2 { 64 << 20 } else { 0 }] },
+            local,
             spark: (0..=routed.len()).map(charge).collect(),
             links: shared::spark_link((gpus - 1) as u8, ranks, prefill, Default::default(), cuteafd_core::SparkIngress::Fp8K32).unwrap(),
             spark_reply_formats: Default::default(), drafter: None, vision: None, budgets,
@@ -385,6 +459,31 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
                 assert!(seen.insert((template.id.clone(), format!("{:?}", component.activation))), "{} twice", template.id);
             }
         }
+        // Each prefix uses shared runtime weight arenas plus independent
+        // scratch/output requests. No aggregate expert CUDA allocation exists.
+        assert!(!contract.components.iter().any(|component| matches!(&component.kind,
+            ComponentKind::Allocation { template, .. } if template.id.starts_with("inkling2.experts."))));
+        let LocalPackage::Installed { backings } = &inputs.local else { unreachable!() };
+        for (count, groups) in backings.iter().enumerate().skip(1).take(routed.len()-1) {
+            for (group, backing) in groups.iter().enumerate() {
+                let arena = contract.components.iter().find(|component| matches!(&component.kind,
+                    ComponentKind::Allocation { template, .. } if template.id == backing.arena.id())
+                    && component.activation == crate::placement::planner::Activation::choice(cfg.layers + 2, count)).unwrap();
+                assert_eq!(arena.bytes.at(1).unwrap(), backing.arena.bytes() as u64);
+                for (name, bytes) in &backing.workspace {
+                    let id = format!("inkling2.expert_workspace.{}.{}.{}.{}", backing.gpu, count, group, name);
+                    let component = contract.components.iter().find(|component| matches!(&component.kind,
+                        ComponentKind::Allocation { template, .. } if template.id == id)).unwrap();
+                    assert_eq!(component.bytes.at(1).unwrap(), *bytes, "{id}");
+                }
+            }
+        }
+        let all_local = shared::request(inputs.context, None, crate::placement::Onboard::Layers(routed.len()), prefill,
+            crate::placement::planner::Operation::Serving, None, Default::default());
+        assert!(inputs.admit(all_local).is_err(), "a linked-world recipe must refuse the all-local prefix");
+        assert!(contract.requires.iter().any(|required|
+            required.when == crate::placement::planner::Choice { variable: cfg.layers + 2, option: routed.len() }
+                && required.any_of.is_empty()), "the full local prefix is explicitly impossible");
         // The planner inventories the exact allocator recipe, per owner, not
         // a BF16 approximation of the native FP32 forward planes.
         for gpu in 0..gpus {
@@ -413,7 +512,8 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
         // One target arena backing per rank.
         for gpu in 0..gpus {
             let arenas = contract.components.iter().filter(|c| matches!(&c.kind, ComponentKind::Allocation { template, .. }
-                if template.group == "weight arena" && template.location == Location::coordinator(gpu as u8))).count();
+                if template.group == "weight arena" && template.id == targets[gpu].arena.id()
+                    && template.location == Location::coordinator(gpu as u8))).count();
             assert_eq!(arenas, 1, "rtx{gpu}");
             let execution = targets[gpu].execution_arena().unwrap();
             for &layer in &targets[gpu].layers {
@@ -422,6 +522,7 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             }
             let backing = contract.components.iter().find(|component| matches!(&component.kind,
                 ComponentKind::Allocation { template, .. } if template.group == "weight arena"
+                    && template.id == targets[gpu].arena.id()
                     && template.location == Location::coordinator(gpu as u8))).unwrap();
             assert_eq!(backing.bytes.at(1).unwrap(), execution.bytes() as u64);
         }
