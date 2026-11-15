@@ -228,6 +228,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         self.cache_topology(ticket.id, nodes, width, spans_devices);
         self.cache_insert(key, exec, ticket.id, ticket.pinned);
         ticket.committed = true;
+        ticket.cache.lock().unwrap_or_else(|p| p.into_inner()).completed_capture(ticket.id);
     }
 
     /// Cancel a failed capture, backing off allocation failures by exact key.
