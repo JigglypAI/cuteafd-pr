@@ -144,6 +144,18 @@ fn mixed_native_checkpoint_reads_each_layers_storage_from_its_headers() {
     assert!(groups[0].0.dynamic_nvfp4());
     assert_eq!(groups[1].1, [3]);
     assert_eq!(groups[1].0.format(), crate::formats::fp8_experts::ExpertFormat::Mxfp8);
+    use crate::formats::fp8_experts::Slicing;
+    for (layer, expert) in experts.iter().enumerate() {
+        let tensors = tensors.for_layer_metadata(layer).unwrap().for_coordinator();
+        for world in [1, 2] {
+            for rank in 0..world {
+                let regions = crate::serving_capacity::fp8_expert_regions(&tensors, &[layer], world,
+                    rank, Slicing::Blocks(128)).unwrap();
+                let arena = crate::serving_capacity::WeightArenaLayout::new("native-fixture", regions).unwrap();
+                assert_eq!(arena.bytes() as u64, if world == 1 { expert.whole } else { expert.half[rank] });
+            }
+        }
+    }
 }
 
 #[test]

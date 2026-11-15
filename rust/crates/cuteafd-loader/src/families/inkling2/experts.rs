@@ -7,9 +7,8 @@
 //! intermediate columns of down over whole 128-row blocks, the shared H128
 //! coordinator slicing every RTX expert package uses.
 //!
-//! This reader is stage-1 planning only. Stage 3 lands `ExpertFormat::Mxfp8`
-//! on the shared FP8-family catalog (#1934 S1) and the fused-tensor reader in
-//! `Fp8ExpertTensors`; the per-layer byte facts stay identical.
+//! Residency uses the shared native package's planar operands and alignment;
+//! checkpoint source bytes remain a separate fact for fused native tensors.
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 
@@ -98,8 +97,22 @@ fn layer_bytes(checkpoint: &Checkpoint, cfg: &Inkling2Config, layer: usize) -> R
                 let scales = 2 * rows * (h / group) + h * (rows / group);
                 codes + scales
             };
-            let whole = e * per_expert(i) + extras;
-            let half = [0usize, 1].map(|rank| e * per_expert(half_rows(cfg.intermediate, rank) as u64) + extras);
+            let resident = |rows: u64| -> Result<u64> {
+                if storage == ExpertStorage::Mxfp8 { return Ok(e * per_expert(rows)); }
+                // The package holds gate/up in distinct planes. Their original
+                // fused amax/denominator bytes are shared on disk but retained
+                // in each scale operand, with ordinary arena alignment gaps.
+                let globals = (e + 1) * 4;
+                let sizes = [e * rows * h / pack, e * rows * h / group + globals,
+                    e * rows * h / pack, e * rows * h / group + globals,
+                    e * h * rows / pack, e * h * rows / group + globals];
+                let layout = crate::serving_capacity::PackedWeightRegions::new(sizes.into_iter()
+                    .map(usize::try_from).collect::<std::result::Result<Vec<_>, _>>()?)?;
+                Ok(layout.bytes as u64)
+            };
+            let whole = resident(i)?;
+            let half = [resident(half_rows(cfg.intermediate, 0) as u64)?,
+                resident(half_rows(cfg.intermediate, 1) as u64)?];
             Ok(LayerExperts { storage: Some(storage), whole, half, source })
         }
         ExpertStorage::Exl3 { bits } => {
