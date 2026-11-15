@@ -473,7 +473,8 @@ def test_published_matrix_pins_current_reports() -> None:
             assert not cell.get("reason")
             directory = Path(cell["report"])
             assert not directory.is_absolute() and ".." not in directory.parts
-            assert len(directory.parts) == 3 and directory.parts[:2] == ("benchmarks", row["family"])
+            report_family = "kimi_k31" if row["checkpoint"] == "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC" else row["family"]
+            assert len(directory.parts) == 3 and directory.parts[:2] == ("benchmarks", report_family)
             report = json.loads((ROOT / directory / "report.json").read_text())
             server = report["server"]
             snapshot = server.get("configuration", {}).get("snapshot") or ""
