@@ -637,7 +637,8 @@ def test_muse_dispatches_to_serve_muse_with_its_own_defaults(tmp_path: Path) -> 
     assert _flag(serve, "--prefix-cache-entries") == "20"
     assert _flag(serve, "--vision") == _flag(serve, "--audio") == "off"
     assert _flag(serve, "--max-context-tokens") == "auto"
-    for absent in ("--pool-tokens", "--draft", "--mtp", "--kv-cache",
+    assert _flag(serve, "--kv-cache") == "bf16"
+    for absent in ("--pool-tokens", "--draft", "--mtp",
                    "--prefill-packing", "--expert-partial-bf16-max-rows", "--spark-prefill-reply-format", "--spark-decode-reply-format"):
         assert absent not in serve.split(), absent
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
@@ -649,6 +650,21 @@ def test_muse_dispatches_to_serve_muse_with_its_own_defaults(tmp_path: Path) -> 
     lines = result.stderr.splitlines()
     probe = next(i for i, line in enumerate(lines) if "dst=/opt/cuteafd-serve-probe" in line)
     assert lines[probe].endswith("serve-muse --help ")
+
+
+@pytest.mark.parametrize("selection,expected", [("", "bf16"), ("bf16", "bf16"), ("fp8", "fp8")])
+def test_muse_target_kv_reaches_plan_and_serve(tmp_path: Path, selection: str, expected: str) -> None:
+    keys = f"KV_CACHE={selection}\n" if selection else ""
+    result = _muse(tmp_path, keys)
+    serve, plan = _line(result, "serve-muse --snapshot"), _line(result, "cuteafd plan")
+    assert _flag(serve, "--kv-cache") == _flag(plan, "--kv-cache") == expected
+
+
+def test_muse_invalid_target_kv_is_refused_before_launch(tmp_path: Path) -> None:
+    result = _muse(tmp_path, "KV_CACHE=int8\n")
+    assert result.returncode == 2
+    assert "KV_CACHE must be bf16 or fp8" in result.stderr
+    assert "serve-muse --snapshot" not in result.stderr
 
 
 @pytest.mark.parametrize("mode", [None, "dflash2", "off"])
