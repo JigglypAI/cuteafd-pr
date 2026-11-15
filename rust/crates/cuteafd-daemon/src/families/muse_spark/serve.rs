@@ -162,6 +162,10 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
     cuteafd_bench::context::set_family(cfg.family_id());
+    cuteafd_bench::context::set_resolved("kv-cache", match args.kv_cache {
+        cuteafd_loader::families::muse_spark::cache::MuseKvCache::Bf16 => "bf16",
+        cuteafd_loader::families::muse_spark::cache::MuseKvCache::Fp8 => "fp8",
+    });
     crate::cli::publish_core_view(&view);
     let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
     let device_ids = args.devices();
@@ -426,10 +430,16 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         }
         let mut census = Census::default();
         census.owners(owners.receipts);
+        for (rank, resources) in ranks.iter().enumerate() {
+            let mut kv = Inventory::new(devices, &format!("muse.kv.rank{rank}"), Lifetime::RESIDENT,
+                cuteafd_core::memory_layout::Category::Kv, "Muse target KV backing");
+            resources.kv.inventory(&mut kv, &cfg, ranks.len())?;
+            census.owners(kv.receipts);
+        }
         census.owners(embedding.allocation_receipts(devices, "muse.target.embedding")?);
         census.owners(draft_receipts);
         census.normalize(PhaseOrder::TARGET_THEN_DRAFT)?;
-        tracing::info!("Muse startup named census covers target weights and drafter; other owners remain in native-live records");
+        tracing::info!("Muse startup named census covers target weights, target KV/scales and drafter; other owners remain in native-live records");
         Some(census)
     } else { None };
     crate::shared::inventory::startup_probe(&library, &device_ids, "muse-backend-ready",

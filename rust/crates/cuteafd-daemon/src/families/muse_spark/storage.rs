@@ -48,6 +48,27 @@ pub(crate) struct RankKv<'a> {
 }
 
 impl<'a> RankKv<'a> {
+    /// Observe the two physical backings and each strided FP32 scale subplane.
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        cfg: &MuseSparkConfig, ranks: usize) -> Result<()> {
+        inventory.device("pool", self.pool.buffer)?;
+        inventory.device("rings", self.rings.buffer)?;
+        if self.format == cuteafd_loader::families::muse_spark::cache::MuseKvCache::Fp8 {
+            let heads = cfg.kv_heads / ranks;
+            let payload = self.format.payload_bytes(heads, cfg.head_dim);
+            let stride = self.format.record_bytes(heads, cfg.head_dim);
+            for (name, buffer) in [("pool", self.pool.buffer), ("rings", self.rings.buffer)] {
+                inventory.view(&format!("{name}.scales"), view(buffer, payload, buffer.bytes - payload), name, buffer)?;
+                let receipt = inventory.receipts.last_mut().context("Muse scale alias")?;
+                receipt.allocation.dtype = "f32".into();
+                receipt.allocation.shape = vec![(buffer.bytes / stride) as u64, 2, heads as u64];
+                receipt.allocation.group = format!("Muse KV FP32 scale plane (record stride {stride} B)");
+                receipt.allocation.alignment = 16;
+            }
+        }
+        Ok(())
+    }
+
     /// `charged`: this rank's placement items, to check the extents against.
     pub(crate) fn allocate(device: Device<'a>, cfg: &MuseSparkConfig, cache: &MuseCacheLayout, placement: &Placement,
         rank: usize, slots: u64) -> Result<Self> {

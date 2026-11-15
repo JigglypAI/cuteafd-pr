@@ -72,7 +72,7 @@ pub(crate) fn required_with_format(ranks: usize,
                 && (stem.starts_with("qk_norm_") || stem.starts_with("attention_full_")
                     || stem.starts_with("attention_swa_") || *stem == "swa_commit") { "_kv_fp8" } else { "" };
             (format!("{head}_{stem}{suffix}"), *pointers)
-        })))
+        }))
         .collect())
 }
 
@@ -101,6 +101,25 @@ mod tests {
 
     /// Every bound program's pointer order is the exported manifest's (the
     /// fixture comes from the pinned exporters' SM188 export).
+    #[test]
+    fn scaled_kv_replaces_only_producers_attention_and_commit() {
+        use cuteafd_loader::families::muse_spark::cache::MuseKvCache;
+        for ranks in [1, 2] {
+            let bf16 = required_with_format(ranks, MuseKvCache::Bf16).unwrap();
+            let fp8 = required_with_format(ranks, MuseKvCache::Fp8).unwrap();
+            assert_eq!(bf16.len(), fp8.len());
+            let mut replaced = 0;
+            for ((old, old_pointers), (new, new_pointers)) in bf16.iter().zip(&fp8) {
+                assert_eq!(old_pointers, new_pointers);
+                if old != new {
+                    replaced += 1;
+                    assert_eq!(new, &format!("{old}_kv_fp8"));
+                }
+            }
+            assert_eq!(replaced, 7);
+        }
+    }
+
     #[test]
     fn bound_pointers_match_the_exported_manifests() {
         let abi = exported();

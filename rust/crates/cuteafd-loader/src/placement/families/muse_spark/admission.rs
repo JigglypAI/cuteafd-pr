@@ -330,6 +330,23 @@ fn tower_options(media: &MediaOptions, gpus: usize, sparks: usize)
         .collect())
 }
 
+/// Strided inline descales alias their record backing. `bytes` is the address
+/// envelope, not a second charge; shape names only the FP32 scale elements.
+fn scale_alias(id: String, backing: String, location: Location, lifetime: Lifetime,
+    payload: u64, record: u64, heads: usize, bytes: ByteCurve, rows: ByteCurve, maximum: u64) -> Component {
+    let mut owner = Allocation::buffer(id, location, bytes.at(1).expect("validated scale extent"), lifetime,
+        Category::Kv, format!("Muse KV FP32 scale plane (record stride {record} B)"));
+    owner.view = Some(View { backing, offset: payload });
+    owner.dtype = "f32".into();
+    owner.alignment = 16;
+    owner.shape = vec![1, 2, heads as u64];
+    let mut component = Component::allocation(owner, bytes, false, maximum);
+    if let ComponentKind::Allocation { shape, .. } = &mut component.kind {
+        *shape = vec![rows, ByteCurve::fixed(2, maximum), ByteCurve::fixed(heads as u64, maximum)];
+    }
+    component
+}
+
 impl<'a> ProductionInput<'a> {
     pub fn prepare(self) -> Result<PreparedMuse<'a>, Refusal> {
         let ProductionInput { kv_cache, cfg, core, projections, catalog, mut budgets, host, prefill, bf16_target_head, slots, mark_slots,
@@ -442,6 +459,16 @@ impl<'a> ProductionInput<'a> {
             components.extend(buffer(format!("muse.rings.{gpu}"), location, rings * slots / gpus as u64,
                 Lifetime::RESIDENT, Category::Kv,
                 &format!("sliding rings, {slots} sequences x {} layers", cfg.sliding_layers()), maximum_pages));
+            if kv_cache == crate::families::muse_spark::cache::MuseKvCache::Fp8 {
+                let payload = kv_cache.payload_bytes(cfg.kv_heads / gpus, cfg.head_dim) as u64;
+                let rank_record = record / gpus as u64;
+                let rows = cfg.sliding_layers() as u64 * ring_rows(cfg).map_err(anyhow_refusal)? * slots;
+                components.push(scale_alias(format!("muse.rings.{gpu}.scales"),
+                    format!("muse.rings.{gpu}"), location, Lifetime::RESIDENT,
+                    payload, rank_record, cfg.kv_heads / gpus,
+                    ByteCurve::fixed(rows * rank_record - payload, maximum_pages),
+                    ByteCurve::fixed(rows, maximum_pages), maximum_pages));
+            }
             if mark_slots > 0 {
                 components.extend(buffer(format!("muse.marks.{gpu}"), location, marks * mark_slots / gpus as u64,
                     Lifetime::RESIDENT, Category::Prefix,
@@ -472,7 +499,7 @@ impl<'a> ProductionInput<'a> {
             }
             components.extend(buffer(format!("muse.rope.{gpu}"), location, rope, Lifetime::RESIDENT,
                 Category::Workspace, "Muse RoPE tables", maximum_pages));
-            // Full layers page BF16 K+V records: the pool's only slope, split
+            // Full layers page complete payload+scale records: the only pool slope, split
             // across a head-split pair like every other per-layer owner.
             let slope = record.checked_mul(PAGE_ROWS).ok_or(Refusal::Overflow("Muse full-layer KV"))?
                 / gpus as u64;
@@ -482,6 +509,15 @@ impl<'a> ProductionInput<'a> {
                     Allocation::buffer(format!("muse.kv.{gpu}.{layer}"), location, slope, Lifetime::TARGET,
                         Category::Kv, "full-layer KV (paged K+V records)"),
                     ByteCurve::linear(slope, slope, maximum_pages), false, maximum_pages));
+                if kv_cache == crate::families::muse_spark::cache::MuseKvCache::Fp8 {
+                    let payload = kv_cache.payload_bytes(cfg.kv_heads / gpus, cfg.head_dim) as u64;
+                    let rank_record = record / gpus as u64;
+                    components.push(scale_alias(format!("muse.kv.{gpu}.{layer}.scales"),
+                        format!("muse.kv.{gpu}.{layer}"), location, Lifetime::TARGET,
+                        payload, rank_record, cfg.kv_heads / gpus,
+                        ByteCurve::linear(slope - payload, slope, maximum_pages),
+                        ByteCurve::linear(PAGE_ROWS, PAGE_ROWS, maximum_pages), maximum_pages));
+                }
             }
         }
         components.extend(buffer("muse.combine".into(), Location::coordinator(0), combine, Lifetime::RESIDENT,
@@ -1040,6 +1076,26 @@ impl PreparedMuse<'_> {
 #[cfg(test)]
 mod contract_tests {
     use super::*;
+
+    #[test]
+    fn inline_scale_alias_is_aligned_exact_and_never_a_second_charge() {
+        for (heads, record) in [(16usize, 2176u64), (8, 1088)] {
+            let payload = (heads * 128) as u64;
+            let slope = record * PAGE_ROWS;
+            let alias = scale_alias("kv.scales".into(), "kv".into(), Location::coordinator(0),
+                Lifetime::TARGET, payload, record, heads,
+                ByteCurve::linear(slope - payload, slope, 8), ByteCurve::linear(PAGE_ROWS, PAGE_ROWS, 8), 8);
+            let ComponentKind::Allocation { template, offset, shape, .. } = alias.kind else { panic!("scale alias") };
+            assert_eq!(template.view.unwrap(), View { backing: "kv".into(), offset: payload });
+            assert_eq!(payload % template.alignment, 0);
+            for pages in [1u64, 2, 8] {
+                assert_eq!(offset.as_ref().unwrap().at(pages).unwrap() + alias.bytes.at(pages).unwrap(), pages * slope);
+                assert_eq!(shape[0].at(pages).unwrap(), pages * PAGE_ROWS);
+                assert_eq!(shape[1].at(pages).unwrap() * shape[2].at(pages).unwrap() * 4,
+                    record - payload);
+            }
+        }
+    }
 
     #[test]
     fn blas_joint_towers_share_only_their_selected_process_thread() {
