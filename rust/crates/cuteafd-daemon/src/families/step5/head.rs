@@ -353,7 +353,7 @@ pub(super) mod tests {
         let planes = HeadPlan::plane_bytes(rows).unwrap();
         HeadPlan {
             layout: RankWeightLayout { rank: 0, ranks: 1, operands: vec![], core: Default::default(), resident_bytes: 0 },
-            weights: vec![], native: None, planes, rows, epsilon: 1e-5, predictor: false, kernel_rows: rows.min(4096),
+            weights: vec![], native: None, fp8: false, planes, rows, epsilon: 1e-5, predictor: false, kernel_rows: rows.min(4096),
             bytes: ((H * 4 + V * H * 2) as u64) + planes.iter().map(|&n| n as u64).sum::<u64>(),
         }
     }
@@ -461,7 +461,7 @@ pub(super) mod tests {
             let bytes = HeadPlan::owner_bytes(&weights, Some(&native), &planes, unit)?;
             let plan = HeadPlan { layout: RankWeightLayout { rank: 0, ranks: 1, operands: vec![],
                 core: [("lm_head.weight".into(), native.clone())].into(), resident_bytes: 0 },
-                weights, native: Some("lm_head.weight".into()), planes, rows: logits,
+                weights, native: Some("lm_head.weight".into()), fp8: false, planes, rows: logits,
                 epsilon: 1e-5, bytes, predictor: false, kernel_rows: unit };
             let owner_layout = cuteafd_loader::formats::head::native_private_scratch(native.shape, unit)?;
             assert_eq!(owner_layout.rows, unit);
