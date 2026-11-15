@@ -14,9 +14,56 @@ pub(crate) fn retain_context_chunk(window: Option<usize>, positions: std::ops::R
     !positions.is_empty() && window.is_none_or(|window| positions.end > end.saturating_sub(window))
 }
 
+/// Planned marks split the discard horizon before the final prompt frontier.
+pub(crate) fn next_context_frontier(prompt_end: usize, points: &[usize], start: usize) -> usize {
+    points.iter().copied().filter(|&point| point > start).min().unwrap_or(prompt_end).min(prompt_end)
+}
+
+/// The latest skipped position is dead only once a full window follows it.
+pub(crate) fn context_window_complete(window: usize, skipped_end: usize, frontier: usize) -> bool {
+    skipped_end <= frontier.saturating_sub(window)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::retain_context_chunk;
+    use super::*;
+
+    #[test]
+    fn planned_marks_and_disconnects_publish_only_complete_windows() {
+        let (window, end) = (4096, 16384);
+        let points = [8192, 12288];
+        let (mut full, mut candidate) = (vec![0usize; window], vec![0usize; window]);
+        let mut skipped_end = 0;
+        let mut withheld = 0;
+        let mut retained = 0;
+        for start in (0..end).step_by(128) {
+            let frontier = next_context_frontier(end, &points, start);
+            let keep = retain_context_chunk(Some(window), start..start + 128, frontier);
+            if !keep { skipped_end = start + 128; }
+            for position in start..start + 128 {
+                full[position % window] = position + 1;
+                if keep { candidate[position % window] = position + 1; }
+            }
+            // An unexpected disconnect may park only after all holes died.
+            if context_window_complete(window, skipped_end, start + 128) {
+                assert_eq!(full, candidate);
+                retained += 1;
+            } else { withheld += 1; }
+            if points.contains(&(start + 128)) || start + 128 == end {
+                assert!(context_window_complete(window, skipped_end, start + 128));
+                assert_eq!(full, candidate, "planned prompt/intermediate mark");
+                let restored = candidate.clone();
+                assert_eq!(restored, full, "restored mark equals cold prefill");
+            }
+        }
+        assert!(withheld > 0 && retained > 0);
+        // A turn continues from the exact prompt ring without a new discard horizon.
+        for position in end..end + 17 {
+            full[position % window] = position + 1;
+            candidate[position % window] = position + 1;
+        }
+        assert_eq!(full, candidate, "turn-end mark");
+    }
 
     #[test]
     fn whole_chunk_ingest_matches_full_ring_and_preserves_shapes() {

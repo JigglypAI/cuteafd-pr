@@ -132,6 +132,8 @@ pub(crate) trait Backend<'a> {
         draft.restored(frontier);
         Ok(())
     }
+    /// Plan all frontiers before prefill so windowed drafters can skip dead chunks.
+    fn plan_draft_context(&self, _placement: &Self::Placement, _end: usize, _points: &[usize]) -> Result<()> { Ok(()) }
     fn needs_snapshot_filter(&self, _neural: bool) -> bool { false }
     fn snapshot_compatible(&self, _saved: &Self::Meta, _frontier: usize, _neural: bool) -> bool { true }
     /// Start reading a prompt's token-table rows ahead of its prefill:
@@ -1055,6 +1057,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             let plan = if let Some(probe) = job.probe.as_ref().filter(|p| !p.spec.cold_steps.is_empty()) {
                 PointPlan { chunks: probe.spec.cold_steps.iter().map(|step| step.end).collect(), points: Vec::new() }
             } else if logits.is_some() { PointPlan::default() } else { plan };
+            engine.plan_draft_context(&placement, tokens.len(),
+                &plan.points.iter().map(|&(_, point)| point).collect::<Vec<_>>())?;
             // Family table rows for the whole prompt are read from admission
             // on, in the plan's chunks, overlapping earlier members' work.
             let ahead = if logits.is_none() { engine.read_ahead(&placement, &tokens, resume, &plan.chunks) } else { None };

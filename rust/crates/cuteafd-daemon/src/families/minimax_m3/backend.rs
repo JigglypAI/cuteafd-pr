@@ -383,6 +383,13 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         }
         Ok(())
     }
+    fn plan_draft_context(&self, placement: &Placement, end: usize, points: &[usize]) -> Result<()> {
+        if let Some(draft) = &self.owners.storage.draft_prefix {
+            draft.prompt_ends.borrow_mut()[placement.slot] = end;
+            draft.points.borrow_mut()[placement.slot] = points.to_vec();
+        }
+        Ok(())
+    }
     fn history(&self, placement: &Placement) -> u64 { self.identities.borrow().get(&placement.slot).copied().unwrap_or(0) }
     fn restore_draft(&self, placement:&Placement, frontier:usize, tokens:&[u32], state:&mut DraftState) -> Result<()> {
         let draft=self.owners.storage.draft_prefix.as_ref().context("MiniMax drafter was not admitted")?;

@@ -1733,6 +1733,7 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
     let memory_before = first_prefill_sample(&first_prefill_seen, media_index != 0, prefill_memory_sample);
     let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
         let start = p.placement.len;
+        let draft_end = draft_context_end(p, start);
         let logits = if cold_replay_decode(&p.job.probe, p.chunks) {
             // Text replay must use serving's captured/fused decode, not eager scoring arithmetic.
             if p.media.spans().is_empty() {
@@ -1741,7 +1742,7 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
                 engine.verify_media_device(&mut [(&mut p.placement, chunk.len())], chunk, &p.media)?
             }
         } else {
-            engine.prefill_draft_chunk(&mut p.placement, chunk, Some(&p.media), p.tokens.len())?
+            engine.prefill_draft_chunk(&mut p.placement, chunk, Some(&p.media), draft_end)?
         };
         if end == p.tokens.len() {
             // The first token, while this prompt's logits are the workspace's.
@@ -1761,7 +1762,7 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
         if let (Some(drafter), Some(slot)) = (drafter, p.slot) {
             let n = chunk.len().min(TAP_ROWS);
             let first = start + chunk.len() - n;
-            if drafter.retain_context_chunk(first..first + n, p.tokens.len()) {
+            if drafter.retain_context_chunk(first..first + n, draft_context_end(p, start)) {
                 drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot, position: first + r })
                     .collect::<Vec<_>>())?;
             }
@@ -1785,6 +1786,11 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
     capture_points(family, cache, p);
     p.chunks += 1;
     Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
+}
+
+fn draft_context_end(p: &Prefill<'_>, start: usize) -> usize {
+    crate::shared::speculation::next_context_frontier(p.tokens.len(),
+        &p.plan.points.iter().map(|&(_, point)| point).collect::<Vec<_>>(), start)
 }
 
 /// Intermediate snapshot points prompt `p`'s current chunk ends at (off unless configured).
@@ -1840,6 +1846,7 @@ fn prefill_group<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
     let rows: usize = group.iter().zip(&ends).map(|(p, &end)| end - p.done).sum();
     let memory_before = first_prefill_sample(cx.first_prefill_seen, false, prefill_memory_sample);
     let (result, phases) = isolated_phases(&engine.profile, || -> Result<Vec<Result<()>>> {
+        let draft_ends = group.iter().map(|p| draft_context_end(p, p.done)).collect::<Vec<_>>();
         let mut sequences = Vec::with_capacity(group.len());
         let mut firsts = Vec::with_capacity(group.len());
         for (p, &end) in group.iter_mut().zip(&ends) {
@@ -1848,7 +1855,6 @@ fn prefill_group<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
             sequences.push((placement, &tokens[*done..end]));
             firsts.push((&*job, constraint, first, prompt_row, *resume, len, end));
         }
-        let draft_ends = firsts.iter().map(|(_, _, _, _, _, len, _)| *len).collect::<Vec<_>>();
         let (segments, outcomes) = engine.prefill_packed_draft_ends(&mut sequences, &draft_ends, &mut |i, logits| {
             let (job, constraint, first, prompt_row, resume, len, end) = &mut firsts[i];
             if *end < *len {
@@ -1877,7 +1883,7 @@ fn prefill_group<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
             for (((p, segment), &end), outcome) in group.iter().zip(&segments).zip(&ends).zip(&outcomes) {
                 if let (Some(slot), true) = (p.slot, outcome.is_ok()) {
                     let n = segment.tap_rows;
-                    if drafter.retain_context_chunk(end - n..end, p.tokens.len()) {
+                    if drafter.retain_context_chunk(end - n..end, draft_context_end(p, p.done)) {
                         drafter.update(&(0..n).map(|r| ContextRow { tap_row: segment.tap_offset + r, slot,
                             position: end - n + r }).collect::<Vec<_>>())?;
                     }

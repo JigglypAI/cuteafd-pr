@@ -24,11 +24,21 @@ pub(crate) struct DraftPrefix<'a> {
     pub marks: crate::shared::speculation::block_dspark::WindowSnapshots<'a>,
     pub frontiers: std::cell::RefCell<Vec<usize>>,
     pub prompt_ends: std::cell::RefCell<Vec<usize>>,
+    pub points: std::cell::RefCell<Vec<Vec<usize>>>,
+    pub skipped_ends: std::cell::RefCell<Vec<usize>>,
     pub slots: usize,
 }
 impl DraftPrefix<'_> {
     pub fn frontier(&self,slot:usize) -> Result<usize> {
         self.frontiers.borrow().get(slot).copied().ok_or_else(|| anyhow::anyhow!("MiniMax draft slot outside admission"))
+    }
+    pub fn ingest_end(&self, slot: usize, start: usize, fallback: usize) -> usize {
+        crate::shared::speculation::next_context_frontier(self.prompt_ends.borrow()[slot].max(fallback),
+            &self.points.borrow()[slot], start)
+    }
+    pub fn complete(&self, slot: usize, frontier: usize) -> bool {
+        self.drafter.cfg.window.is_none_or(|window| crate::shared::speculation::context_window_complete(
+            window, self.skipped_ends.borrow()[slot], frontier))
     }
     pub fn advance(&self,slot:usize,start:usize,rows:usize) -> Result<()> {
         let mut frontiers=self.frontiers.borrow_mut();
@@ -140,6 +150,7 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
             if let Some(draft)=&self.0.draft {
                 draft.drafter.reset_context(placement.slot,0)?;
                 draft.frontiers.borrow_mut()[placement.slot]=0;
+                draft.skipped_ends.borrow_mut()[placement.slot]=0;
             }
         }
         Ok(self.install(placement)?)
@@ -159,6 +170,7 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
         if len != placement.len { return Err("MiniMax capture is not at the committed frontier".into()); }
         if let Some(draft) = &self.0.draft {
             if draft.frontier(placement.slot)? != len { return Err("MiniMax draft snapshot frontier differs".into()); }
+            if !draft.complete(placement.slot, len) { return Err("MiniMax incomplete draft window cannot be snapshotted".into()); }
             let planes=draft.drafter.window_planes(placement.slot)?;
             // SAFETY: retained drafter owns the planes and both producer/copy streams.
             unsafe { draft.marks.capture(mark.0 as usize,&planes,0,len)?; }
@@ -174,10 +186,12 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
                     let (origin,end)=unsafe { draft.marks.restore(mark.0 as usize,&planes,len)? };
                     if origin != 0 { return Err("MiniMax draft snapshot has a cold reconstructed origin".into()); }
                     draft.frontiers.borrow_mut()[placement.slot]=end;
+                    draft.skipped_ends.borrow_mut()[placement.slot]=0;
                 }
                 None => {
                     if len != 0 { return Err("MiniMax speculative prefix restore requires an exact window mark".into()); }
                     draft.frontiers.borrow_mut()[placement.slot]=0;
+                draft.skipped_ends.borrow_mut()[placement.slot]=0;
                     draft.drafter.reset_context(placement.slot,0)?;
                 }
             }

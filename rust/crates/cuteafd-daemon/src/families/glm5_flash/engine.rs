@@ -565,6 +565,7 @@ struct StepTables {
     segments: Vec<packing::Segment>,
     /// Complete extension ends, not the current unit/chunk ends (one per sequence).
     draft_ends: Vec<usize>,
+    draft_chunk: Option<std::ops::Range<usize>>,
 }
 
 /// A prefill step's sequence units (its pool table: one unit per pool page); empty for decode.
@@ -3609,6 +3610,10 @@ impl<'a> GlmfEngine<'a> {
                 pool_table: self.columns(&placement.pool_pages, self.table_pool_pages),
                 draft_ends: vec![end], ..Default::default() };
             self.rows(placement, start + first..start + first + n, 0, &mut tables)?;
+            // Every unit fills the same tail tap chunk; judge the complete
+            // producer shape, never an individual unit's contribution to it.
+            let tail_start = start + t.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS);
+            tables.draft_chunk = Some(tail_start..start + t);
             steps.push((tables, &tokens[first..first + n]));
             first += n;
         }

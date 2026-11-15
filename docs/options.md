@@ -143,6 +143,11 @@ two-RTX Layers and two-RTX Heads. The checkpoint's bundled native mixed BF16/MXF
 drafter uses shared speculation and exact window snapshots; `SPECULATOR=off`
 disables it. Direct `cuteafd serve --family minimax_m3` likewise defaults on;
 `--dspark=false` disables it. Plan and serve admit the same drafter owners.
+Windowed block dSpark drafters (MiniMax and GLM Flash) ingest only original tap
+chunks overlapping the final context window, retaining a straddling chunk whole
+to preserve projection shapes and bytes. Each planned intermediate prefix mark
+gets its own window; MiniMax withholds an unexpected partial-prefill snapshot
+until its window is complete. Full-context paged drafters are unchanged.
 `DRAFT_LENGTH` caps the seven-token native block; `SPECULATION_TRACE` records
 shared draft/verify evidence. MiniMax alone defaults to `DRAFT_POLICY=shared`,
 the existing cost-based concurrency-bucket policy, including native zero-proposal

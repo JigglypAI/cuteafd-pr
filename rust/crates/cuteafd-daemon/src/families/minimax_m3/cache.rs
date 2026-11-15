@@ -1357,7 +1357,7 @@ mod tests {
     }
 }
 
-fn rotary_bytes(positions: usize, theta: f32) -> Vec<u8> {
+pub(crate) fn rotary_bytes(positions: usize, theta: f32) -> Vec<u8> {
     let frequencies = std::array::from_fn::<_, 32, _>(|lane| 1.0 / theta.powf((2 * lane) as f32 / 64.0));
     let mut table = Vec::with_capacity(positions * 256);
     for position in 0..positions {

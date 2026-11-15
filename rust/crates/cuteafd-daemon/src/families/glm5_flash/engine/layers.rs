@@ -240,7 +240,12 @@ impl Bindings<'_, '_, '_> {
     fn tap(&self, layer: usize) -> Result<()> {
         if let Some(drafter) = &self.engine.drafter {
             let (first, rows, offset) = self.tap;
-            if rows > 0 { drafter.tap_streams_at(layer, self.work[0].streams[0].buffer.ptr, HC, first, rows, offset)?; }
+            let start = self.tables[0].positions.get(first).copied().unwrap_or(0) as usize;
+            let chunk = self.tables[0].draft_chunk.clone().unwrap_or(start..start + rows);
+            let end = self.tables[0].draft_ends.first().copied().unwrap_or(chunk.end);
+            if rows > 0 && drafter.retain_context_chunk(chunk, end) {
+                drafter.tap_streams_at(layer, self.work[0].streams[0].buffer.ptr, HC, first, rows, offset)?;
+            }
         }
         Ok(())
     }
