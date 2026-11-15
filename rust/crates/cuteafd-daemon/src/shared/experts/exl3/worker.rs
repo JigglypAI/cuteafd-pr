@@ -149,6 +149,9 @@ pub(crate) struct Exl3Worker<'a> {
     segments: Option<Exl3Execution<'a>>,
     /// Staged wire rows of every buffered unit (owner of `waves`' plane).
     staged_plane: Option<DeviceAllocation<'a>>,
+    /// Per queued unit while waves are prepared: whether it publishes a
+    /// worker timing span (a merged wave records one span for all members).
+    timing_units: std::collections::VecDeque<bool>,
 }
 
 /// EXL3's pinned per-unit route staging as wave-staging route planes.
@@ -184,6 +187,7 @@ impl<'a> super::super::execution::waves::UnitRoutes<'a> for Exl3Routes<'_, 'a> {
 fn launch_exl3_wave<'a>(executions: &mut [Exl3Execution<'a>], segments: &mut Option<Exl3Execution<'a>>,
     reduction: &Exl3ReductionPlan, row_policy: Exl3RowPolicy, stream: *mut std::ffi::c_void,
     worker_timing: &Option<super::super::execution::timing::WorkerTiming<'a>>,
+    timing_units: &mut std::collections::VecDeque<bool>,
     wave: &super::super::execution::waves::Wave<'_>) -> Result<()> {
     // SAFETY: every member's slice and reply, the routes and tables stay
     // retained through the member fences recorded after this launch.
@@ -200,6 +204,8 @@ fn launch_exl3_wave<'a>(executions: &mut [Exl3Execution<'a>], segments: &mut Opt
         }
         if let Some(timing) = worker_timing { timing.record(1, stream)?; }
     }
+    // One timing span per wave: its first member publishes it, the rest skip.
+    timing_units.extend((0..wave.members.len()).map(|index| index == 0));
     Ok(())
 }
 
@@ -405,6 +411,7 @@ impl<'a> Exl3Worker<'a> {
             waves: None,
             segments: None,
             staged_plane: None,
+            timing_units: Default::default(),
         })
     }
 
@@ -428,7 +435,8 @@ impl<'a> Exl3Worker<'a> {
     /// while later units remain queued on the same stream.
     pub(crate) fn complete(&mut self) -> Result<Option<super::super::execution::timing::UnitPace>> {
         let Some(((request_id, layer, rows, executor_id), pace)) = self.pending.pop()? else { return Ok(None) };
-        if let Some(timing) = &mut self.worker_timing {
+        let timed = self.timing_units.pop_front().unwrap_or(true);
+        if let Some(timing) = self.worker_timing.as_mut().filter(|_| timed) {
             // SAFETY: the unit's completed fence follows both timing records.
             unsafe { timing.publish(request_id, layer, rows, executor_id, "exl3")?; }
         }
@@ -485,6 +493,7 @@ impl<'a> Exl3Worker<'a> {
         // EXL3 has no recipe floor: any prefill unit may join a wave.
         self.waves = super::super::execution::waves::WaveStaging::new(self.library, extent, plane.buffer, row, 1)?;
         self.staged_plane = Some(plane);
+        self.timing_units = std::collections::VecDeque::with_capacity(extent.buffered_units as usize);
         Ok(())
     }
 
@@ -500,11 +509,11 @@ impl<'a> Exl3Worker<'a> {
     pub(crate) fn flush_staged(&mut self) -> Result<()> {
         let Some(waves) = &mut self.waves else { return Ok(()) };
         let routes = Exl3Routes { staging: &self.staging, weights_offset: self.weights_offset, library: self.library };
-        let (executions, segments, reduction, policy, timing) = (&mut self.executions, &mut self.segments,
-            &self.reduction_plan, self.row_policy, &self.worker_timing);
+        let (executions, segments, reduction, policy, timing, timing_units) = (&mut self.executions,
+            &mut self.segments, &self.reduction_plan, self.row_policy, &self.worker_timing, &mut self.timing_units);
         let stream = self.stream.raw;
         waves.flush(&mut self.pending, &routes, stream,
-            &mut |wave| launch_exl3_wave(executions, segments, reduction, policy, stream, timing, wave))
+            &mut |wave| launch_exl3_wave(executions, segments, reduction, policy, stream, timing, timing_units, wave))
     }
 
     /// Stage a mapped FP8 K32 prefill unit with a BF16 combined reply; other
@@ -523,11 +532,11 @@ impl<'a> Exl3Worker<'a> {
             return Ok(false)
         }
         let mut routes = Exl3Routes { staging: &self.staging, weights_offset: self.weights_offset, library: self.library };
-        let (executions, segments, reduction, policy, timing) = (&mut self.executions, &mut self.segments,
-            &self.reduction_plan, self.row_policy, &self.worker_timing);
+        let (executions, segments, reduction, policy, timing, timing_units) = (&mut self.executions,
+            &mut self.segments, &self.reduction_plan, self.row_policy, &self.worker_timing, &mut self.timing_units);
         let stream = self.stream.raw;
         waves.stage(Arrival { request, input, output, layer: self.layer, executor_id }, &mut self.pending,
-            &mut routes, stream, &mut |wave| launch_exl3_wave(executions, segments, reduction, policy, stream, timing, wave))
+            &mut routes, stream, &mut |wave| launch_exl3_wave(executions, segments, reduction, policy, stream, timing, timing_units, wave))
     }
 
     /// Whether every request queued on this execution's stream has completed.
@@ -761,6 +770,7 @@ impl<'a> Exl3Worker<'a> {
         if self.deferred && destination.is_some() {
             // SAFETY: all input copies, math and output writes precede this unit fence.
             unsafe { self.pending.record((request.request_id(), request.layer(), request.rows(), executor_id), self.stream.raw)?; }
+            if self.waves.is_some() { self.timing_units.push_back(true); }
             return Ok(());
         }
         match self.host_path {

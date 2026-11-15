@@ -231,6 +231,20 @@ fn deferred_exl3_requests_publish_their_timing_at_completion() {
     assert!(backend.contains("Self::Exl3(execution) => execution.complete(),"));
 }
 
+/// A merged wave records one worker timing span for all its members: only the
+/// first member publishes it, so later members never read unrecorded events.
+#[test]
+fn merged_exl3_waves_publish_one_timing_span() {
+    let source = include_str!("../worker.rs");
+    let launch = &source[source.find("fn launch_exl3_wave").unwrap()..];
+    let launch = &launch[..launch.find("\n}\n").unwrap()];
+    assert!(launch.contains("timing_units.extend((0..wave.members.len()).map(|index| index == 0));"));
+    let complete = &source[source.find("pub(crate) fn complete(&mut self)").unwrap()..];
+    let complete = &complete[..complete.find("\n    }\n").unwrap()];
+    assert!(complete.contains("self.timing_units.pop_front().unwrap_or(true)") && complete.contains(".filter(|_| timed)"));
+    assert!(source.contains("if self.waves.is_some() { self.timing_units.push_back(true); }"));
+}
+
 /// Merged-wave correctness of EXL3 staging over a real installed Spark
 /// layout and its row-addressed segments program (#2191 EXL3): one layer of
 /// real checkpoint weights for this TP rank; mapped FP8 K32 frames staged
@@ -257,6 +271,13 @@ fn exl3_merged_waves_are_byte_identical_to_singleton_units() -> Result<()> {
         "layout {} ships no m8192-segments program", directory.display());
     let weights = Rc::new(vec![Exl3Weights::load(&library, &catalog,
         ExpertLayer::BackboneExl3Tp { layer, rank: 0, world }, usize::MAX)?]);
+    // Expert timing on (as the expert-timing card profile runs it): a merged
+    // wave records one span, published once, never from unrecorded events.
+    let timing_dir = std::env::temp_dir().join(format!("exl3-wave-timing-{}", std::process::id()));
+    std::fs::create_dir_all(&timing_dir)?;
+    std::env::set_var("CUTEAFD_EXPERT_TIMING", "1");
+    std::env::set_var("CUTEAFD_PROFILE_DIR", &timing_dir);
+    std::env::set_var("CUTEAFD_PROFILE_HOST", "oracle");
     let unit = 2752usize;
     let extent = cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill,
         capacity: unit as u32, compiled: 4096, staging_rows: unit as u32, buffered_units: 3 };
@@ -344,5 +365,15 @@ fn exl3_merged_waves_are_byte_identical_to_singleton_units() -> Result<()> {
             pair.iter().map(|&m| rows[m]).sum::<u32>());
     }
     ensure!(worker.waves.as_ref().unwrap().merged - merged_before == 6, "every pair must flush as one merged launch");
+    drop(worker);
+    let samples = std::fs::read_to_string(timing_dir.join("expert-timing-oracle-rank0.jsonl"))?;
+    let samples = samples.lines().map(serde_json::from_str::<serde_json::Value>).collect::<Result<Vec<_>, _>>()?;
+    let published = samples.iter().map(|sample| sample["request_id"].as_u64().unwrap_or(u64::MAX)).collect::<Vec<_>>();
+    ensure!(published == [700, 701, 702, 703, 704, 700, 701, 702, 703, 700, 704],
+        "expected one timing span per singleton and per merged wave, got {published:?}");
+    ensure!(samples.iter().all(|sample| sample["compute_us"].as_f64().is_some_and(|us| us > 0.0)),
+        "timing span without measured compute");
+    std::fs::remove_dir_all(&timing_dir)?;
+    eprintln!("EXL3 merged waves with expert timing: {} spans for 5 singletons + 6 waves", samples.len());
     Ok(())
 }
