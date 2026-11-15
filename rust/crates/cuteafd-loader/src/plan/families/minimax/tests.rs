@@ -1816,7 +1816,7 @@ fn measured_context_changes_only_the_named_owner_with_a_pinned_pool() {
 fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pages() {
     use crate::families::minimax_m3::admission::{gather, Coordinator, FactsRequest};
     use crate::placement::{AttentionPlacement, CoordinatorCard, ResidentWeights};
-    let (dir, expected) = heads_recipe_fixture();
+    let (dir, expected) = heads_recipe_fixture_with_experts(128);
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = MiniMaxM3Config::from_hf(&checkpoint.config).unwrap();
     let catalog = crate::read_expert_catalog(dir.path()).unwrap();
