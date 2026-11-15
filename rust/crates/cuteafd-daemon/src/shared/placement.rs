@@ -711,7 +711,7 @@ mod tests {
         use crate::shared::{experts::{exl3::Exl3Weights, layer::ExpertLayer}, memory::push_exl3};
         use cuteafd_transport::worker_selection::push::Offer;
         let root = tempfile::tempdir()?;
-        cuteafd_loader::plan::testing::write_kimi_snapshot(root.path(), false);
+        cuteafd_loader::plan::testing::write_kimi_snapshot(root.path(), true);
         let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
         let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6, prefill_lanes: 1,
             ..Default::default() };

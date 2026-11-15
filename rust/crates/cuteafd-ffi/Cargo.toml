@@ -20,5 +20,5 @@ thiserror.workspace = true
 cuteafd-core = { path = "../cuteafd-core" }
 
 [dev-dependencies]
-tempfile.workspace = true
 cuteafd-ffi = { path = ".", features = ["test-support"] }
+tempfile.workspace = true

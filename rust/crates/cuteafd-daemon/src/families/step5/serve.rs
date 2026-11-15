@@ -1489,7 +1489,7 @@ mod push_admission_tests {
             memory::push_coordinator::CoordinatorExpertPlan};
         let root = tempfile::tempdir()?;
         let snapshot = root.path().join("snapshot");
-        cuteafd_loader::plan::testing::write_step5_exl3_snapshot_layers(&snapshot, &[3]);
+        cuteafd_loader::plan::testing::write_step5_exl3_snapshot(&snapshot);
         let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
         let manifest = root.path().join("PROGRAMS.json");
         let package = root.path().join("exl3/exl3-step5-k46/rtx-tp1");

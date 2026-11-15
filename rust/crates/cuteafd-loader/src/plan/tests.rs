@@ -6400,8 +6400,9 @@ fn glm_tied_embedding_keeps_device_owner_in_shared_admission() {
 
 #[test]
 fn step5_auto_pool_and_count_admission_preserve_one_recipe() {
-    let dir = families::step5::tests::snapshot("fp8");
+    let dir = families::step5::tests::exl3_snapshot();
     let manifest = testing::step5_native_manifest(dir.path());
+    testing::install_step5_exl3_rtx_package(&manifest);
     let options = PlanOptions { draft_ownership: Some(spec::DraftOwnership::None),
         layout: Some(layout::LayoutOptions {
             rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], context_tokens: 262_144, prefix_slots: None,
