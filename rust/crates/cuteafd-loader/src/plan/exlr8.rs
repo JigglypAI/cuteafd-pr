@@ -1415,7 +1415,7 @@ mod tests {
     #[test]
     fn native_refuses_unqualified_combinations_before_checkpoint_reads() {
         let mut options = super::super::PlanOptions { placement: super::super::ExpertPlacement::Sparks { ranks: 4 },
-            layout: Some(super::super::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            layout: Some(super::super::layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
                 rtx_bytes: vec![96 << 30; 2], ..Default::default() }), ..Default::default() };
         let missing = Path::new("/no-native-checkpoint");
         let error = |o: &super::super::PlanOptions, manifest, draft| native_plan(missing, manifest, o, draft)
@@ -1685,7 +1685,7 @@ mod mounted_tests {
                 attention_placement: Some(if gpus == 2 { crate::placement::AttentionPlacement::Context }
                     else { crate::placement::AttentionPlacement::Heads }),
                 layout: Some(LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
-                    host_memory: Some((256 << 30, 256 << 30)), host_cache_bytes: Some(32 << 30),
+                    host_memory: Some(crate::plan::testing::SimulatedHost { host_ram: (256 << 30, 256 << 30), ..crate::plan::testing::SimulatedHost::raptor() }.host_ram), host_cache_bytes: Some(32 << 30),
                     workspace_manifest: Some(programs.clone()), glm5_drafter_disabled: true, ..Default::default() }),
                 ..Default::default()
             };

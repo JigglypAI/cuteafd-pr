@@ -46,7 +46,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
             }
             Ok(cuteafd_loader::plan::layout::LayoutOptions {
                 #[cfg(test)]
-                host_memory: Some((128 << 30, 128 << 30)),
+                host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
                 host_cache_bytes: match args.host_cache_bytes {
                     crate::shared::prefix::HostBudget::Auto => None,
                     crate::shared::prefix::HostBudget::Bytes(bytes) => Some(bytes),
@@ -1438,7 +1438,7 @@ mod tests {
         std::fs::write(snapshot.path().join("dflash/dflash_draft_model.safetensors"), "").unwrap();
         for speculator in ["off", "mtp", "dflash2"] {
             let mut layout = cuteafd_loader::plan::layout::LayoutOptions {
-                host_memory: Some((128 << 30, 128 << 30)), native_mtp_layers: 0,
+                host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), native_mtp_layers: 0,
                 host_cache_bytes: Some(0), ..Default::default() };
             resolve_mimo_drafter(&mut layout, speculator);
             assert_eq!(layout.mimo_drafter_disabled, speculator != "dflash2");
@@ -2055,7 +2055,7 @@ mod tests {
     #[test]
     fn v41_prefix_and_worker_layout_match_launch_arguments() {
         let mut args = args(std::path::Path::new("/not-read"), 4, false);
-        let mut layout = cuteafd_loader::plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };
+        let mut layout = cuteafd_loader::plan::layout::LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() };
         for entries in [0, 1, 20, 128] {
             args.prefix_cache_entries = Some(entries);
             for (rows, capacity) in [(0, 4096), (80, 256), (256, 256), (1024, 1024), (2048, 4096)] {
@@ -2096,7 +2096,7 @@ mod tests {
             let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan") };
             args.memory = cli.memory;
             let mut selected = options(&args).unwrap();
-            selected.layout.as_mut().unwrap().host_memory = Some((128 << 30, 128 << 30));
+            selected.layout.as_mut().unwrap().host_memory = Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram);
             selected
         };
         let expected = parse(false);

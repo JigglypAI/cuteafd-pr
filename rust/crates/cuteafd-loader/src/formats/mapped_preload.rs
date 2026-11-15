@@ -87,6 +87,7 @@ pub fn host_budget_bytes() -> Result<u64> {
 
 /// Live host/cgroup capacity before coordinator allocations.
 pub fn host_memory() -> Result<(u64, u64)> {
+    if let Some(memory) = crate::plan::testing::injected_host_memory()? { return Ok(memory); }
     cuteafd_ffi::host_memory()
 }
 
@@ -94,6 +95,7 @@ pub fn host_memory() -> Result<(u64, u64)> {
 /// File-backed RSS may already be reclaimable in MemAvailable; shared memory is
 /// conservatively left in the occupied baseline.
 pub fn host_memory_before_process() -> Result<(u64, u64)> {
+    if let Some(memory) = crate::plan::testing::injected_host_memory()? { return Ok(memory); }
     let memory = host_memory()?;
     let status = std::fs::read_to_string("/proc/self/status")?;
     normalize_process_rss(memory, &status)
@@ -114,6 +116,30 @@ fn normalize_process_rss((total, available): (u64, u64), status: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn live_host_probe_without_test_override() {
+        const CHILD: &str = "CUTEAFD_HOST_PROBE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let (total, available) = host_memory().expect("live host/cgroup probe");
+            assert!(available <= total);
+            let (total, available) = host_memory_before_process().expect("live whole-process probe");
+            assert!(available <= total);
+            return;
+        }
+        // Isolate environment changes from parallel tests. A non-test-support build
+        // must also ignore even malformed injection rather than parsing it.
+        for injected in [false, true] {
+            if injected && cfg!(feature = "test-support") { continue; }
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "formats::mapped_preload::tests::live_host_probe_without_test_override"])
+                .env(CHILD, "1").env_remove("CUTEAFD_TEST_HOST");
+            if injected { command.env("CUTEAFD_TEST_HOST", "invalid and ignored outside test-support"); }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+    }
+
     #[test]
     fn whole_process_recipe_credits_only_existing_anonymous_rss() {
         let mixed = "VmRSS: 12 kB\nRssAnon: 4 kB\nRssFile: 6 kB\nRssShmem: 2 kB\n";

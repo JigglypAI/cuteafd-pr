@@ -774,7 +774,7 @@ mod tests {
         LayoutOptions { rtx_bytes: vec![96 << 30; gpus], context_tokens: 65536,
             pool_tokens: Some(131072), prefill_rows: 1024, prefill_waves: 3,
             onboard: Some(crate::placement::OnboardSetting::Layers(0)),
-            glm5_drafter_disabled: true, host_memory: Some((128 << 30, 128 << 30)),
+            glm5_drafter_disabled: true, host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             host_cache_bytes: Some(0), ..Default::default() }
     }
 
@@ -919,7 +919,7 @@ mod tests {
         let options = LayoutOptions { rtx_bytes: vec![96 << 30; 2], physical_sms: Some(188),
             workspace_manifest: Some(path), context_tokens: 65536, pool_tokens: Some(131072),
             onboard: Some(crate::placement::OnboardSetting::Layers(0)), glm5_drafter_disabled: true,
-            host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0), ..Default::default() };
+            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0), ..Default::default() };
         let plan = |attention| input.plan(&PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
             attention_placement: attention, layout: Some(options.clone()), ..Default::default() }).unwrap();
         let auto = plan(None);
@@ -959,7 +959,7 @@ mod tests {
         let mut off = options(0, 2 << 30);
         off.glm5_drafter_snapshot = None;
         let cfg = GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
-        off.host_memory = Some((128 << 30, 128 << 30));
+        off.host_memory = Some(crate::plan::testing::SimulatedHost::raptor().host_ram);
         let mark_owner = |options: &LayoutOptions, attention, gpus| {
             let (draft, _, _) = production_serving(options, &checkpoint, &cfg, 1 << 20, attention, gpus, 32768).unwrap();
             draft.owners().iter().filter(|owner| owner.id == "glm.draft.window_marks")

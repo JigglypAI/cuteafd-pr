@@ -1,6 +1,10 @@
 //! CPU-only end-to-end budget parsing and deployment/launcher contracts.
 use std::process::Command;
 
+fn test_command(binary: impl AsRef<std::ffi::OsStr>) -> Command {
+    cuteafd_loader::plan::testing::SimulatedHost::raptor().plan_command(binary)
+}
+
 #[test]
 fn plan_accepts_the_global_memory_policy_and_refuses_removed_budget_flags() {
     for (flag, value, accepted) in [
@@ -12,7 +16,7 @@ fn plan_accepts_the_global_memory_policy_and_refuses_removed_budget_flags() {
         ("--rtx-budget-gib", "31.8", false), ("--rtx-gib", "31.8", false), ("--headroom-gib", "2", false),
         ("--graph-budget-mib", "512", false), ("--spark-budget-gib", "100", false),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
+        let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
             .args(["plan", "/budget-cli-missing-snapshot", "--layout", flag, value])
             .output().unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();
@@ -46,7 +50,7 @@ fn direct_family_concurrency_matches_logical_capacity_and_explicit_launcher_inpu
         for gib in [30u64, 32, 96] {
             let expected = cuteafd_core::serving_capacity::default_concurrency(gib << 30);
             for explicit in [None, Some(expected), Some(4)] {
-                let mut command = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
+                let mut command = test_command(env!("CARGO_BIN_EXE_cuteafd"));
                 command.args([family, "--snapshot", snapshot.path().to_str().unwrap(), "--native-lib", "/unused",
                     "--gpu-memory-cap", &format!("{gib}GiB"), "--vision", "off", "--audio", "off"]);
                 if let Some(value) = explicit { command.args(["--max-sequences", &value.to_string()]); }
@@ -67,7 +71,7 @@ fn direct_family_concurrency_matches_logical_capacity_and_explicit_launcher_inpu
 fn global_resident_weight_limit_survives_real_binary_family_forwarding() {
     for command in ["serve", "golden"] {
         for inner in [false, true] {
-            let mut process = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
+            let mut process = test_command(env!("CARGO_BIN_EXE_cuteafd"));
             process.args(["--coordinator-weight-budget-gib", if inner { "73" } else { "0" },
                 "--vision", "off", "--audio", "off", command, "--family", "qwen3_5",
                 "--snapshot", "/budget-cli-missing-snapshot", "--native-lib", "/budget-cli-missing-native.so"]);
@@ -91,7 +95,7 @@ fn global_resident_weight_flag_reaches_plan_admission() {
     let package = tempfile::tempdir().unwrap();
     let manifest = testing::write_kimi_installed_inventory(package.path(), false);
     for (gib, accepted) in [("80", true), ("1", false)] {
-        let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
+        let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
             .args(["--coordinator-weight-budget-gib", gib, "plan"])
             .arg(snapshot.path()).arg("--workspace-manifest").arg(&manifest)
             .args(["--layout", "--rtx", "2", "--spark-ranks", "6", "--spark-memory-cap", "256GiB",
@@ -116,6 +120,32 @@ fn global_resident_weight_flag_reaches_plan_admission() {
 }
 
 #[test]
+fn simulated_host_reaches_the_real_plan_binary() {
+    use cuteafd_loader::plan::testing::{self, SimulatedHost};
+    let snapshot = tempfile::tempdir().unwrap();
+    testing::write_kimi_snapshot(snapshot.path(), true);
+    let package = tempfile::tempdir().unwrap();
+    let manifest = testing::write_kimi_installed_inventory(package.path(), false);
+    for (host, accepted) in [(SimulatedHost::raptor(), true),
+        (SimulatedHost { host_ram: (1 << 30, 0), ..SimulatedHost::raptor() }, false)] {
+        let output = host.plan_command(env!("CARGO_BIN_EXE_cuteafd"))
+            .arg("plan").arg(snapshot.path()).arg("--workspace-manifest").arg(&manifest)
+            .args(["--layout", "--rtx", "2", "--spark-ranks", "6", "--spark-memory-cap", "256GiB",
+                "--speculator", "off", "--attention-placement", "heads", "--rtx-expert-layers", "0",
+                "--max-context-tokens", "262144", "--pool-tokens", "262144", "--concurrency", "2",
+                "--prefix-slots", "0", "--host-cache-bytes", "0", "--prefill-rows", "2048", "--prefill-waves", "2",
+                "--vision", "off", "--audio", "off", "--json", "--require-ready"])
+            .env("HF_HOME", snapshot.path()).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("invalid plan JSON: {error}; {stderr}"));
+        assert_eq!(report["fits"], accepted, "test binary ignored simulated host {host:?}: {stderr}; {report}");
+        assert_eq!(output.status.success(), accepted, "{stderr}");
+        if !accepted { assert!(stderr.contains("host"), "{stderr}"); }
+    }
+}
+
+#[test]
 fn global_gpu_storage_flag_reaches_inventory_and_full_layout_admission() {
     use cuteafd_loader::plan::testing;
     let snapshot = tempfile::tempdir().unwrap();
@@ -126,7 +156,7 @@ fn global_gpu_storage_flag_reaches_inventory_and_full_layout_admission() {
     // 2 GiB boundary now fits.
     for layout in [false, true] {
         for (gib, accepted) in [("95.5", true), ("1", false)] {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
+            let mut command = test_command(env!("CARGO_BIN_EXE_cuteafd"));
             command.args(["--gpu-memory-cap", &format!("{gib}GiB"),
                 "--coordinator-weight-budget-gib", "80", "plan"]).arg(snapshot.path())
                 .args(["--spark-ranks", "4", "--spark-memory-cap", "100GiB", "--speculator", "off",
@@ -155,7 +185,7 @@ fn plan_json_keeps_info_tracing_on_stderr() {
     let snapshot = tempfile::tempdir().unwrap();
     std::fs::write(snapshot.path().join("config.json"), br#"{"model_type":"unknown"}"#).unwrap();
     std::fs::write(snapshot.path().join("model.safetensors.index.json"), br#"{"weight_map":{}}"#).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
+    let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
         .arg("plan").arg(snapshot.path()).arg("--json")
         .env("RUST_LOG", "info").env("HF_HOME", snapshot.path())
         .output().unwrap();
@@ -176,7 +206,7 @@ fn deployment_rejects_conflicting_modes_and_retired_topology_flags() {
         vec!["--deployment", "--spark-ep", "2"],
         vec!["--deployment-peers", "worker:9200"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
+        let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
             .args(["plan", "/deployment-cli-missing-snapshot"])
             .args(&flags).output().unwrap();
         assert_eq!(output.status.code(), Some(2), "{flags:?}: {}",
@@ -187,7 +217,7 @@ fn deployment_rejects_conflicting_modes_and_retired_topology_flags() {
 #[test]
 fn deployment_validates_admission_before_checkpoint_access() {
     for (flag, invalid) in [("--kv-pool-size", "-1GiB"), ("--gpu-memory-cap", "101%")] {
-        let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
+        let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
             .args(["plan", "/deployment-cli-missing-snapshot", "--deployment"])
             .arg(format!("{flag}={invalid}")).output().unwrap();
         assert!(!output.status.success());
@@ -215,7 +245,7 @@ fn release_accepts_prefill(deployment: &[u8]) -> serde_json::Value {
         function("family_prefill_mode"), function("release_prefill_shape"));
     let file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(file.path(), deployment).unwrap();
-    let result = Command::new("bash").args(["-c", &script, "prefill-contract"])
+    let result = test_command("bash").args(["-c", &script, "prefill-contract"])
         .arg(file.path()).arg(value["family"].as_str().unwrap()).output().unwrap();
     assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     assert!(String::from_utf8_lossy(&result.stdout).ends_with(&format!("{} {}\n",
@@ -240,7 +270,7 @@ fn mimo_pro_max_plan_deployment_is_accepted_by_release_prefill_shape() {
     let options = PlanOptions {
         vision: MediaMode::Off, audio: MediaMode::Off,
         layout: Some(LayoutOptions {
-            host_memory: Some((128 << 30, 128 << 30)),
+            host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
             rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; gpus],
             prefill_rows: 2752, workspace_manifest: Some(manifest), ..Default::default()
         }), ..Default::default()
@@ -272,7 +302,7 @@ fn glm53_max_deployment_runs_three_2752_row_units() {
         vision: MediaMode::Off, audio: MediaMode::Off,
         layout: Some(LayoutOptions {
             // Shape contracts must not depend on the test runner's live cgroup.
-            host_memory: Some((128 << 30, 128 << 30)),
+            host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
             rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; 2],
             head_split: true, workspace_manifest: Some(manifest), ..Default::default()
         }), ..Default::default()
@@ -388,7 +418,7 @@ fn run_installed_glm_exlr8_worker_budget(hf_home: Option<std::ffi::OsString>,
         let snapshot = require_installed_snapshot(
             name, config["MODEL_ID"], Some(config["MODEL_REVISION"]), &hf_home);
         for explicit in [None, Some("104")] {
-            let mut command = Command::new("timeout");
+            let mut command = test_command("timeout");
             command.args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
                 .arg(&snapshot).args(["--deployment", "--config"]).arg(&example)
                 .args(["--rtx", gpus, "--spark-ranks", &ranks.to_string(),
@@ -422,7 +452,7 @@ fn run_installed_glm_exlr8_worker_budget(hf_home: Option<std::ffi::OsString>,
             std::fs::write(&path, &output.stdout).unwrap();
             let interpreter = std::env::var_os("CUTEAFD_TEST_PYTHON")
                 .expect("CUTEAFD_TEST_PYTHON must name the gate's venv Python for launcher checks");
-            let python = Command::new(interpreter).args(["-I", "-c", r#"
+            let python = test_command(interpreter).args(["-I", "-c", r#"
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
@@ -447,7 +477,7 @@ fn installed_flash_exlr8_bounded_spark_plans_preserve_worker_budget_and_capabili
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     for (name, gpus, ranks) in [("bounded-1rtx-4spark", "1", 4), ("bounded-2rtx-6spark", "2", 6)] {
         for explicit in [None, Some("104")] {
-            let mut command = Command::new("timeout");
+            let mut command = test_command("timeout");
             command.args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"]).arg(&snapshot)
                 // Keep a Spark suffix for this wire-budget proof; automatic TP2 can onboard every layer.
                 .args(["--deployment", "--rtx", gpus, "--spark-ranks", &ranks.to_string(),
@@ -478,7 +508,7 @@ fn installed_flash_exlr8_bounded_spark_plans_preserve_worker_budget_and_capabili
             std::fs::write(&path, &output.stdout).unwrap();
             let interpreter = std::env::var_os("CUTEAFD_TEST_PYTHON")
                 .expect("CUTEAFD_TEST_PYTHON must name the gate's venv Python for launcher checks");
-            let python = Command::new(interpreter).args(["-I", "-c", r#"
+            let python = test_command(interpreter).args(["-I", "-c", r#"
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
@@ -496,7 +526,7 @@ fn installed_flash_exlr8_automatic_tp2_plan(ranks: &str) -> serde_json::Value {
     let programs = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
         .expect("explicit current exporter manifest required"));
     assert!(snapshot.join("config.json").is_file() && programs.is_file());
-    let output = Command::new("timeout").args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
+    let output = test_command("timeout").args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
         .arg(&snapshot).args(["--deployment", "--rtx", "2", "--spark-ranks", ranks,
             "--vision", "off", "--audio", "off", "--speculator", "off", "--exlr8-manifest", "k4",
             "--workspace-manifest"]).arg(&programs)
@@ -585,7 +615,7 @@ fn installed_qwen_hybrid_min_sim_and_dual_publish_exact_layer_homes() {
             vision: MediaMode::Off, audio: MediaMode::Off,
             layout: Some(LayoutOptions { rtx_bytes: vec![capacity; gpus], head_split: gpus == 2,
                 onboard: Some(onboard), native_mtp_layers: 0, host_cache_bytes: Some(0),
-                host_memory: Some((128 << 30, 128 << 30)), workspace_manifest: Some(programs.clone()),
+                host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), workspace_manifest: Some(programs.clone()),
                 ..Default::default() }), ..Default::default() }).unwrap();
         assert!(report.executable(), "{}", cuteafd_loader::plan::render(&report));
         let placement = report.solver_placement.as_ref().expect("admitted layer homes");
@@ -615,7 +645,7 @@ fn installed_real_planner_launch(root: &std::path::Path, capture: &str, snapshot
     let temporary = tempfile::tempdir().unwrap();
     let interpreter = std::env::var_os("CUTEAFD_TEST_PYTHON")
         .expect("CUTEAFD_TEST_PYTHON must name the gate's venv Python for launcher checks");
-    let output = Command::new(interpreter).args(["-I", "-c", r#"
+    let output = test_command(interpreter).args(["-I", "-c", r#"
 import importlib, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
@@ -632,7 +662,7 @@ fn installed_mimo_min_onboarding_matches_smoke(root: &std::path::Path,
     snapshot: &std::path::Path, example: &std::path::Path, programs: &std::path::Path) {
     let manifest = root.join("rust/crates/cuteafd-loader/tests/fixtures/mimo-flash-min-native-manifest.json");
     assert!(manifest.is_file(), "required MiMo native manifest fixture missing: {}", manifest.display());
-    let output = Command::new("timeout").args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
+    let output = test_command("timeout").args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
         .arg(snapshot).args(["--deployment", "--config"]).arg(example)
         .args(["--rtx", "1", "--spark-ranks", "2", "--pool-tokens", "0", "--native-mtp-layers", "0",
             "--speculator", "dflash2", "--vision", "auto", "--audio", "auto", "--workspace-manifest"])
@@ -762,7 +792,7 @@ fn assert_v41_sim5090_head_pools(root: &std::path::Path, snapshot: &std::path::P
     let concurrency = cuteafd_core::serving_capacity::default_concurrency(
         cap.parse::<cuteafd_core::memory_policy::Size>().unwrap().0).to_string();
     for head in ["all", "packed"] {
-        let output = Command::new("timeout").args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
+        let output = test_command("timeout").args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
             .arg(snapshot).arg("--config").arg(&path).arg("--workspace-manifest").arg(programs)
             .arg("--hf-home").arg(hf_home)
             .args(["--layout", "--json", "--require-ready", "--gpu-memory-cap", cap,
@@ -818,7 +848,7 @@ fn installed_mimo_min_onboarding_is_eligible() {
         .collect::<std::collections::BTreeMap<_, _>>();
     let snapshot = require_installed_snapshot("MiMo min", config["MODEL_ID"],
         config.get("MODEL_REVISION").copied(), &hf_home);
-    let output = Command::new("timeout").args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
+    let output = test_command("timeout").args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
         .arg(snapshot).args(["--deployment", "--config"]).arg(example)
         .args(["--rtx", "1", "--spark-ranks", "2", "--pool-tokens", "0", "--native-mtp-layers", "0",
             "--speculator", "dflash2", "--vision", "auto", "--audio", "auto", "--workspace-manifest"])
@@ -832,7 +862,7 @@ fn installed_mimo_min_onboarding_is_eligible() {
 
 fn installed_launcher_memory_args(root: &std::path::Path, configured_cap: &str) -> Vec<String> {
     // Use the launcher's resolver and GiB conversion, not the direct CLI's 80 GiB default.
-    let output = Command::new("timeout").args(["10", "bash", "-c", r#"
+    let output = test_command("timeout").args(["10", "bash", "-c", r#"
 repo_root="$1"
 source "$repo_root/scripts/lib/release-common.sh"
 profile="$(release_coordinator_profile "$2" "$3")" || exit
@@ -917,7 +947,7 @@ fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
             let temporary = tempfile::tempdir().unwrap();
             let interpreter = std::env::var_os("CUTEAFD_TEST_PYTHON")
                 .expect("CUTEAFD_TEST_PYTHON must name the gate's venv Python for launcher checks");
-            let output = Command::new(interpreter).args(["-I", "-c", r#"
+            let output = test_command(interpreter).args(["-I", "-c", r#"
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
@@ -931,7 +961,7 @@ capture_v41_real_planner_launch(*map(Path, sys.argv[2:]))
             let temporary = tempfile::tempdir().unwrap();
             let interpreter = std::env::var_os("CUTEAFD_TEST_PYTHON")
                 .expect("CUTEAFD_TEST_PYTHON must name the gate's venv Python for launcher checks");
-            let output = Command::new(interpreter).args(["-I", "-c", r#"
+            let output = test_command(interpreter).args(["-I", "-c", r#"
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
@@ -945,7 +975,7 @@ capture_kimi_real_planner_launch(*map(Path, sys.argv[2:]))
             let temporary = tempfile::tempdir().unwrap();
             let interpreter = std::env::var_os("CUTEAFD_TEST_PYTHON")
                 .expect("CUTEAFD_TEST_PYTHON must name the gate's venv Python for launcher checks");
-            let output = Command::new(interpreter).args(["-I", "-c", r#"
+            let output = test_command(interpreter).args(["-I", "-c", r#"
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
@@ -959,7 +989,7 @@ if args[1].name == "qwen38-exl3-min.config":
                 .arg(&programs).arg(&hf_home).arg(temporary.path()).output().unwrap();
             assert!(output.status.success(), "{name} real launcher: {}", String::from_utf8_lossy(&output.stderr));
         }
-        let mut command = Command::new("timeout");
+        let mut command = test_command("timeout");
         command.args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan", config["MODEL_ID"],
             "--deployment", "--config"]).arg(&example)
             .args(["--rtx", config["RTX_GPUS"], "--vision", "off", "--audio", "off",
@@ -1168,7 +1198,7 @@ fn installed_mc_views_cover_executable_projection_manifests() {
         let snapshot = require_installed_snapshot("MC projection coverage",
             &format!("wrldsuksgo2mars/{model}"), Some(revision), &hf_home);
         for view in ["original", "k6-compact", "k8-compact"] {
-            let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
+            let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
                 .arg("plan").arg(&snapshot).args(["--core-view", view,
                     "--layout", "--rtx", "2", "--spark-ranks", "6", "--concurrency", "16",
                     "--max-context-tokens", "auto", "--no-speculator", "--vision", "off", "--audio", "off",
@@ -1223,7 +1253,7 @@ fn installed_test_entrypoints_fail_instead_of_skipping_absent_inputs() {
         "installed_release_matrix_recipe_ids_parse_from_checkpoint_headers"];
     for name in tests {
         for input in ["hf-home", "programs-or-checkpoint"] {
-            let mut command = Command::new(std::env::current_exe().unwrap());
+            let mut command = test_command(std::env::current_exe().unwrap());
             command.args(["--exact", name, "--nocapture"])
                 .env_remove("CUTEAFD_DEPLOYMENT_TEST_HF_HOME")
                 .env("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS", home.path().join("missing/PROGRAMS.json"));
@@ -1268,7 +1298,7 @@ fn installed_checkpoint_runners_fail_on_missing_hf_home_checkpoints_or_programs(
 
 #[test]
 fn bench_panels_json_cli_matches_fixture_and_selectable_panel_ids() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
+    let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
         .args(["bench", "panels", "--json"])
         .output()
         .unwrap();
@@ -1285,7 +1315,7 @@ fn bench_panels_json_cli_matches_fixture_and_selectable_panel_ids() {
 fn installed_kimi_tp1_automatic_plan_finishes_within_ten_seconds() {
     let required = |key| std::env::var_os(key).unwrap_or_else(|| panic!("{key} required"));
     let start = std::time::Instant::now();
-    let output = Command::new("timeout")
+    let output = test_command("timeout")
         .args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
         .arg(required("CUTEAFD_KIMI_SNAPSHOT"))
         .args(["--deployment", "--rtx", "1", "--spark-ranks", "6", "--spark-memory-cap", "110GiB",
@@ -1330,7 +1360,7 @@ fn installed_dense_qwen_one_and_two_rtx_publish_exact_native_owners() {
             vision: MediaMode::Off, audio: MediaMode::Off,
             layout: Some(LayoutOptions { rtx_bytes: vec![95 << 30; ranks], head_split: ranks == 2,
                 concurrency: 16, native_mtp_layers: 0, host_cache_bytes: Some(0),
-                host_memory: Some((256 << 30, 256 << 30)), workspace_manifest: Some(programs.clone()),
+                host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost { host_ram: (256 << 30, 256 << 30), ..cuteafd_loader::plan::testing::SimulatedHost::raptor() }.host_ram), workspace_manifest: Some(programs.clone()),
                 ..Default::default() }), ..Default::default() }).unwrap();
         assert!(report.executable(), "{}", cuteafd_loader::plan::render(&report));
         let memory = report.memory_layout.as_ref().unwrap();

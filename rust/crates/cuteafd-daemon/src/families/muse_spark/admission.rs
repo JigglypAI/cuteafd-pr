@@ -56,7 +56,7 @@ mod tests {
         let input = testing::BudgetedPlanInput::open(dir.path())?;
         let total = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
         let report = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(6),
-            layout: Some(LayoutOptions { host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![total; 2],
+            layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost { host_ram: (256 << 30, 256 << 30), ..cuteafd_loader::plan::testing::SimulatedHost::raptor() }.host_ram), rtx_bytes: vec![total; 2],
                 head_split: true, ..Default::default() }), ..Default::default() })?;
         let placement = report.solver_placement.clone().context("placed")?;
         let prefill = PrefillPlan { unit_rows: 2752, waves: 3, span_rows: 8256 };

@@ -1984,7 +1984,7 @@ mod tests {
             let report = testing::plan(fixture.path(), &PlanOptions {
                 placement: ExpertPlacement::from_spark_ranks(sparks),
                 draft_ownership: Some(plan::spec::DraftOwnership::NativeMtp),
-                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
                     rtx_bytes: vec![96 << 30; ranks], workspace_manifest: Some(manifest.clone()),
                     context_tokens: 1 << 20, ..Default::default() }), ..Default::default()
             })?;
@@ -2074,7 +2074,7 @@ mod tests {
             let report = testing::plan(fixture.path(), &PlanOptions {
                 placement: ExpertPlacement::from_spark_ranks(sparks),
                 draft_ownership: Some(plan::spec::DraftOwnership::NativeMtp),
-                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
                     rtx_bytes: vec![96 << 30; ranks], workspace_manifest: Some(manifest.clone()),
                     context_tokens: 1 << 20, ..Default::default() }), ..Default::default()
             })?;
@@ -2176,7 +2176,7 @@ mod tests {
                 placement: ExpertPlacement::from_spark_ranks(sparks),
                 draft_ownership: Some(if native_mtp { plan::spec::DraftOwnership::NativeMtp }
                     else { plan::spec::DraftOwnership::None }),
-                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
                     rtx_bytes: vec![96 << 30; gpus], workspace_manifest: Some(manifest.clone()),
                     pool_tokens: pool, context_tokens: pool.unwrap_or(1 << 20),
                     ..Default::default() }), ..Default::default()

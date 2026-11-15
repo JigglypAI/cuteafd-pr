@@ -767,7 +767,7 @@ mod draft_prefix_tests {
                 "selector_top_k":16, "target_layer_ids":[0,1], "mask_token_id":163592}});
         std::fs::write(draft.path().join("config.json"), config.to_string())?;
         for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
-            let mut options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
+            let mut options = LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
                 mla_kv: format, prefix_slots: Some(2), host_cache_bytes: Some(0),
                 onboard: Some(crate::placement::OnboardSetting::Layers(5)), ..Default::default() };
             let mut report = plan::plan(target.path(), &PlanOptions {
@@ -1604,7 +1604,7 @@ pub(crate) fn recipe_host_memory(options: &LayoutOptions) -> anyhow::Result<(u64
         Some(memory) => Ok(memory),
         None => {
             #[cfg(test)]
-            { Ok((128 << 30, 128 << 30)) }
+            { Ok(crate::plan::testing::SimulatedHost::raptor().host_ram) }
             #[cfg(not(test))]
             { crate::formats::mapped_preload::host_memory_before_process() }
         }

@@ -650,7 +650,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         write_snapshot(dir.path(), &mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
         let input = PlanInput::from_checkpoint(Checkpoint::open(dir.path())?);
-        let options = LayoutOptions { native_mtp_layers: 0, host_memory: Some((128 << 30, 128 << 30)),
+        let options = LayoutOptions { native_mtp_layers: 0, host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             rtx_bytes: vec![95 * GIB; 2], concurrency: 4, pool_tokens: Some(32768), ..Default::default() };
         let solve = || {
             let mut devices = (0..2).map(|index| DeviceLayout { kind: DeviceKind::Rtx, index,
@@ -694,7 +694,7 @@ mod tests {
                     for (graphs, expert_input) in [false, true].into_iter().flat_map(|graphs|
                         [MimoExpertInput::Fp8, MimoExpertInput::Bf16, MimoExpertInput::Bf16Decode]
                             .map(|input| (graphs, input))) {
-                        let opts = LayoutOptions { native_mtp_layers: 0, host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![95 * GIB; ranks], concurrency: 4,
+                        let opts = LayoutOptions { native_mtp_layers: 0, host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![95 * GIB; ranks], concurrency: 4,
                             pool_tokens: Some(32768), mimo_decode_graphs: graphs, mimo_swa_kv: swa,
                             mimo_expert_input: expert_input, ..Default::default() };
                         let planned = profile(&checkpoint, &opts, ranks, 4, 4096, 4, 32768, None).unwrap();
@@ -801,7 +801,7 @@ mod tests {
         let source = |name: &str| checkpoint.tensors.iter().find(|tensor| tensor.meta.name == name)
             .map(|tensor| if tensor.meta.dtype == cuteafd_core::DType::Bf16 && !qualified { R::Bf16 } else { R::Fp8 });
         for native in [0, 1] {
-            let options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            let options = LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
                 rtx_bytes: vec![95 * GIB; 2], head_split: true, tp2_dflash: true,
                 native_mtp_layers: native, concurrency: 4, pool_tokens: Some(32768),
                 onboard: Some(crate::placement::OnboardSetting::Layers(0)), ..Default::default() };
@@ -925,7 +925,7 @@ mod tests {
         let input = PlanInput::from_checkpoint(Checkpoint::open(dir.path()).unwrap());
         for rows in [1024, 2048, 2752] {
             let mut options = LayoutOptions { native_mtp_layers: 0, rtx_bytes: vec![95 * GIB], pool_tokens: Some(32768),
-                host_memory: Some((128 << 30, 128 << 30)), prefill_rows: rows, prefill_unit_rows: Some(rows), prefill_waves: 3, prefill_lanes: 3,
+                host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), prefill_rows: rows, prefill_unit_rows: Some(rows), prefill_waves: 3, prefill_lanes: 3,
                 concurrency: 4, ..Default::default() };
             let initial = vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
                 capacity_bytes: 95 * GIB, worker_budget_bytes: 0, items: vec![], kv_tokens: 0 }];
@@ -955,7 +955,7 @@ mod tests {
         for (total, baseline) in [(101_973_491_712u64, 586_416_128u64),
             (101_970_345_984, 586_416_128), (34_144_990_003, 596_901_888)] {
             let baseline = baseline + 35_651_584;
-            let opts = LayoutOptions { native_mtp_layers: 0, host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![total], concurrency: 4, ..Default::default() };
+            let opts = LayoutOptions { native_mtp_layers: 0, host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![total], concurrency: 4, ..Default::default() };
             let mut profile = profile(&checkpoint, &opts, 1, 2, 4096, 4, 1 << 20, None).unwrap();
             let cublas = crate::placement::inventory::ArchContext::for_device("sm_120", total).cublas_bytes;
             profile.steady.devices[0].reservations.push(cuteafd_core::serving_capacity::MemoryReservation {
@@ -989,7 +989,7 @@ mod tests {
         let checkpoint = input.checkpoint();
         let catalog = crate::read_expert_catalog(&checkpoint.snapshot).unwrap();
         let tensors = catalog.fp8().unwrap();
-        let options = LayoutOptions { native_mtp_layers: 0, host_memory: Some((128 << 30, 128 << 30)), workspace_manifest: Some(dir.path().join("share/PROGRAMS.json")),
+        let options = LayoutOptions { native_mtp_layers: 0, host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), workspace_manifest: Some(dir.path().join("share/PROGRAMS.json")),
             ..Default::default() };
         assert!(!crate::placement::inventory::image_lib(options.workspace_manifest.as_deref()).exists());
         let recipe = super::super::super::experts::spark_recipe("mimop:fp8", 2048, 6).unwrap();
@@ -1036,7 +1036,7 @@ mod tests {
             let cfg = MimoV2Config::from_hf(&config).unwrap();
             for ranks in [1, 2] {
                 let manifest = dir.path().join(format!("spark-free-tp{ranks}.json"));
-                let mut options = LayoutOptions { native_mtp_layers: 0, host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![32 * GIB; ranks],
+                let mut options = LayoutOptions { native_mtp_layers: 0, host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![32 * GIB; ranks],
                     head_split: ranks == 2, concurrency: 4,
                     mimo_expert_manifest: Some(manifest.clone()), ..Default::default() };
                 let devices = || (0..ranks).map(|rank| DeviceLayout {
@@ -1093,7 +1093,7 @@ mod tests {
         write_snapshot(dir.path(), &cfg, &tensors, Some(1));
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
         let mut options = LayoutOptions { native_mtp_layers: 0, mimo_drafter_disabled: true,
-            host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };
+            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() };
         let target = profile(&checkpoint, &options, 1, 4, 2752, 4, 32768, None).unwrap();
         options.native_mtp_layers = 1;
         let native = profile(&checkpoint, &options, 1, 4, 2752, 4, 32768, None).unwrap();
@@ -1110,7 +1110,7 @@ mod tests {
         write_snapshot(dir.path(), &mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
         let report = crate::plan::plan(dir.path(), &crate::plan::PlanOptions {
             placement: crate::plan::ExpertPlacement::Sparks { ranks: 2 },
-            layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
+            layout: Some(LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() }),
             ..Default::default() }).unwrap();
         let tails = report.memory_layout.as_ref().unwrap().devices[0].items.iter()
             .filter(|item| item.group == crate::placement::planner::ALLOCATION_GRANULARITY_GROUP)
@@ -1150,7 +1150,7 @@ mod tests {
                 placement: crate::plan::ExpertPlacement::Sparks { ranks: sparks },
                 layout: Some(LayoutOptions {
                     rtx_bytes: vec![95 * GIB; gpus], head_split: gpus == 2,
-                    host_memory: Some((128 << 30, 128 << 30)), ..Default::default()
+                    host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default()
                 }),
                 ..Default::default()
             }).unwrap();

@@ -16,7 +16,7 @@ fn snapshot(all: bool) -> tempfile::TempDir {
 
 fn with_layout(ranks: usize, budget: Option<u64>) -> PlanOptions {
     PlanOptions { attention_placement: Some(crate::placement::AttentionPlacement::Layers), placement: ExpertPlacement::from_spark_ranks(ranks), spark_budget_bytes: budget,
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
             // The text card retains device snapshots; host spilling is disabled.
             host_cache_bytes: Some(0), spark_allocation_budget_bytes: budget, ..Default::default() }), ..Default::default() }
 }
@@ -47,7 +47,7 @@ fn planner_publishes_kimi_runtime_default_and_explicit_units() {
         let layout = options.layout.as_mut().unwrap();
         layout.prefill_rows = unit;
         layout.prefill_lanes = waves;
-        layout.host_memory = Some((128 << 30, 128 << 30));
+        layout.host_memory = Some(crate::plan::testing::SimulatedHost::raptor().host_ram);
         let report = input.plan(&options).unwrap();
         assert_eq!((report.prefill_unit_rows.unwrap(), report.prefill_waves.unwrap(), report.prefill_span_rows.unwrap()), expected);
         assert_eq!(report.prefill_transports, Some(1));
@@ -378,7 +378,7 @@ fn release_headers_classify_native_text_without_installed_artifacts() {
 #[test]
 fn planned_headers_supply_range_geometry_without_claiming_fit() {
     let dir = snapshot(false);
-    let columns = PlanInput::open(dir.path()).unwrap().spark_ranges(&PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }), ..Default::default() }).unwrap();
+    let columns = PlanInput::open(dir.path()).unwrap().spark_ranges(&PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() }), ..Default::default() }).unwrap();
     assert_eq!(columns.len(), 2);
     for column in columns {
         assert_eq!(column.package, PACKAGE);
@@ -466,7 +466,7 @@ fn direct_layout_uses_shared_host_mark_rule_and_preserves_overrides() {
         layout.pool_tokens = Some(524_288);
         layout.concurrency = 8;
         layout.host_cache_bytes = host;
-        layout.host_memory = Some((128 << 30, 128 << 30));
+        layout.host_memory = Some(crate::plan::testing::SimulatedHost::raptor().host_ram);
         layout.mimo_prefix_entries = entries;
         layout.prefix_slots = explicit;
         let expected = explicit.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
@@ -488,7 +488,7 @@ fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
     let mut options = with_layout(6, Some(108 << 30));
     let layout = options.layout.as_mut().unwrap();
     layout.host_cache_bytes = None;
-    layout.host_memory = Some((128 << 30, 128 << 30));
+    layout.host_memory = Some(crate::plan::testing::SimulatedHost::raptor().host_ram);
     layout.concurrency = 8;
     layout.pool_tokens = Some(1_048_576);
     layout.prefix_slots = Some(2);
@@ -772,11 +772,11 @@ fn automatic_context_uses_model_maximum_for_every_core() -> Result<()> {
         let expected = Model::open(&checkpoint)?.cfg.max_position;
         // The planner's unset context selects the same extent; an explicit one wins.
         let report = testing::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
-            layout: Some(plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], ..Default::default() }), ..Default::default() })?;
+            layout: Some(plan::layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2], ..Default::default() }), ..Default::default() })?;
         let notes = report.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();
         assert!(notes.contains(&format!("Kimi API max context: {expected} tokens")), "{notes}");
         let explicit = testing::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
-            layout: Some(plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], context_tokens: 262_144, ..Default::default() }),
+            layout: Some(plan::layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2], context_tokens: 262_144, ..Default::default() }),
             ..Default::default() })?;
         let notes = explicit.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();
         assert!(notes.contains("Kimi API max context: 262144 tokens"), "{notes}");
