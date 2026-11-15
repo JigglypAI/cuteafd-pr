@@ -309,6 +309,11 @@ fn compact_core_headers_preserve_native_keeps_and_plan_exact_trellis_arenas() ->
         testing::write_snapshot(dir.path(), &config, &compact, None);
         let checkpoint = Checkpoint::open(dir.path())?;
         let cfg = Inkling2Config::from_hf(&config)?;
+        let model = Model::open(&checkpoint)?;
+        assert_eq!(model.core.len(), 4 * 6 + 1);
+        let report = plan::plan(dir.path(), &PlanOptions::default())?;
+        assert!(report.config_error.is_none(), "{:?}", report.config_error);
+        assert!(report.components.iter().all(|component| component.rejected == 0), "{:?}", report.components);
         for (ranks, attention) in [(1, AttentionPlacement::Heads), (2, AttentionPlacement::Heads),
             (2, AttentionPlacement::Layers)] {
             let modes = layer_modes(&cfg, ranks, attention);
