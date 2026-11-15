@@ -85,17 +85,35 @@ pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: Option<&Path
         anyhow::ensure!((1..=2).contains(&gpus), "Inkling local package requires one or two ranks");
         let routed = catalog.routed_experts();
         let layers = (routed.first_layer..routed.layers).collect::<Vec<_>>();
+        let exl3_requests = if catalog.exl3().is_some() { Some(crate::placement::rtx_onboard::expert_workspace_requests(
+            catalog, manifest, rows, gpus, "inkling2")?) } else { None };
+        // Residency constructs descriptor/load tables; compute every physical
+        // layer/rank once, not once for every onboarding prefix containing it.
+        let exl3_regions = if let Some(exl3) = catalog.exl3() {
+            (0..gpus).map(|gpu| layers.iter().map(|&layer| {
+                let layout = exl3.residency(crate::V41Exl3Layer::Backbone(layer), gpus, gpu)?;
+                let name = if gpus == 1 { format!("BackboneFull {{ layer: {layer} }}.0") }
+                    else { format!("BackboneTp2 {{ layer: {layer}, rank: {gpu} }}.0") };
+                Ok((name, layout.device_arena_layout()?.1))
+            }).collect::<anyhow::Result<Vec<_>>>()).collect::<anyhow::Result<Vec<_>>>()?
+        } else { Vec::new() };
+        let mut native_requests = std::collections::BTreeMap::<String, (usize, usize)>::new();
         let mut backings = vec![Vec::new()];
         for count in 1..=layers.len() {
             let selected = &layers[..count];
             let mut owners = Vec::new();
             if let Some(tensors) = catalog.fp8() {
                 for (view, group_layers) in tensors.homogeneous_layers(selected)? {
-                    let requests = crate::placement::rtx_onboard::fp8_workspace_requests(&view,
-                        manifest, rows, gpus, "inkling2")?;
-                    let scratch = *requests.first().context("native package scratch absent")?;
-                    let (scratch, output, _) = crate::serving_capacity::fp8moe_tp2_workspace(usize::try_from(scratch)?,
-                        routed.hidden, usize::try_from(rows)?)?;
+                    let key = format!("{:?}", view.format());
+                    let (scratch, output) = if let Some(&requests) = native_requests.get(&key) { requests } else {
+                        let requests = crate::placement::rtx_onboard::fp8_workspace_requests(&view,
+                            manifest, rows, gpus, "inkling2")?;
+                        let scratch = *requests.first().context("native package scratch absent")?;
+                        let (scratch, output, _) = crate::serving_capacity::fp8moe_tp2_workspace(usize::try_from(scratch)?,
+                            routed.hidden, usize::try_from(rows)?)?;
+                        native_requests.insert(key, (scratch, output));
+                        (scratch, output)
+                    };
                     for gpu in 0..gpus {
                         let regions = crate::serving_capacity::fp8_expert_regions(&view.for_coordinator(),
                             &group_layers, gpus, gpu, crate::formats::fp8_experts::Slicing::Blocks(128))?;
@@ -106,16 +124,9 @@ pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: Option<&Path
                     }
                 }
             } else {
-                let requests = crate::placement::rtx_onboard::expert_workspace_requests(catalog,
-                    manifest, rows, gpus, "inkling2")?;
+                let requests = exl3_requests.as_ref().context("Inkling EXL3 workspace absent")?;
                 for gpu in 0..gpus {
-                    let regions = selected.iter().map(|&layer| {
-                        let layout = catalog.exl3().context("Inkling EXL3 manifest absent")?
-                            .residency(crate::V41Exl3Layer::Backbone(layer), gpus, gpu)?;
-                        let name = if gpus == 1 { format!("BackboneFull {{ layer: {layer} }}.0") }
-                            else { format!("BackboneTp2 {{ layer: {layer}, rank: {gpu} }}.0") };
-                        Ok((name, layout.device_arena_layout()?.1))
-                    }).collect::<anyhow::Result<Vec<_>>>()?;
+                    let regions = exl3_regions[gpu][..count].to_vec();
                     let id = crate::serving_capacity::expert_weight_arena_id("exl3", gpu as i32, &regions)?;
                     let last = requests.len().checked_sub(1).context("EXL3 output owner absent")?;
                     let workspace = requests.iter().enumerate().map(|(index, &bytes)|

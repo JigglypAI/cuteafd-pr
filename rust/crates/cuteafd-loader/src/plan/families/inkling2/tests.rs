@@ -173,6 +173,47 @@ fn exl3_checkpoint_accepts_per_expert_k4_modules_split_by_row_parity() {
 }
 
 #[test]
+fn installed_exl3_onboarding_keeps_descriptor_arenas_and_each_workspace_request() -> anyhow::Result<()> {
+    use crate::families::inkling2::admission::local_package;
+    use crate::placement::families::inkling2::LocalPackage;
+    let (dir, _, _) = fixture(Fixture::Exl3);
+    let catalog = crate::read_expert_catalog(dir.path())?;
+    let install = tempfile::tempdir()?;
+    let share = install.path().join("share");
+    std::fs::create_dir_all(&share)?;
+    let manifest = share.join("PROGRAMS.json");
+    for tp in [1, 2] {
+        let root = install.path().join(format!("lib/exl3/exl3-inkling2-k45/rtx-tp{tp}/m1"));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
+            "capacity": 1, "hidden": 4608, "intermediate":2304/tp, "experts":4,
+            "input_format":"e4m3_k32", "trellis_lut":{"bytes":1234},
+            "buffers":{"scratch":{"bytes":2345678,"allocation":"scratch","dtype":"f32","zero_on_create":false},
+                "state":{"bytes":64,"allocation":"state","dtype":"i32","zero_on_create":true}}
+        }))?)?;
+        let LocalPackage::Installed { backings } = local_package(&catalog, Some(&manifest), tp, 1)
+            else { anyhow::bail!("EXL3 installed requests missing") };
+        for (count, groups) in backings.iter().enumerate().skip(1) {
+            assert_eq!(groups.len(), tp);
+            for backing in groups {
+                let runtime_regions = (0..count).map(|layer| {
+                    let resident = catalog.exl3().unwrap().residency(crate::V41Exl3Layer::Backbone(layer), tp, backing.gpu)?;
+                    let name = if tp == 1 { format!("BackboneFull {{ layer: {layer} }}.0") }
+                        else { format!("BackboneTp2 {{ layer: {layer}, rank: {} }}.0", backing.gpu) };
+                    Ok((name, resident.device_arena_layout()?.1))
+                }).collect::<anyhow::Result<Vec<_>>>()?;
+                let id = crate::serving_capacity::expert_weight_arena_id("exl3", backing.gpu as i32, &runtime_regions)?;
+                assert_eq!(backing.arena, crate::serving_capacity::WeightArenaLayout::new(id, runtime_regions)?);
+                let expected = crate::placement::rtx_onboard::expert_workspace_requests(&catalog, Some(&manifest), 1, tp, "inkling2")?;
+                assert_eq!(backing.workspace.iter().map(|(_, bytes)| *bytes).collect::<Vec<_>>(), expected);
+                assert_eq!(backing.workspace.last().unwrap(), &("output".into(), 4608*4));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn installed_local_native_owners_use_shared_workspace_requests_once() -> anyhow::Result<()> {
     use crate::families::inkling2::admission::local_package;
     use crate::placement::families::inkling2::LocalPackage;
@@ -412,6 +453,25 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
         for component in &contract.components {
             if let ComponentKind::Allocation { template, .. } = &component.kind {
                 assert!(seen.insert((template.id.clone(), format!("{:?}", component.activation))), "{} twice", template.id);
+            }
+        }
+        // Each prefix uses shared runtime weight arenas plus independent
+        // scratch/output requests. No aggregate expert CUDA allocation exists.
+        assert!(!contract.components.iter().any(|component| matches!(&component.kind,
+            ComponentKind::Allocation { template, .. } if template.id.starts_with("inkling2.experts."))));
+        let LocalPackage::Installed { backings } = &inputs.local else { unreachable!() };
+        for (count, groups) in backings.iter().enumerate().skip(1).take(routed.len()-1) {
+            for (group, backing) in groups.iter().enumerate() {
+                let arena = contract.components.iter().find(|component| matches!(&component.kind,
+                    ComponentKind::Allocation { template, .. } if template.id == backing.arena.id())
+                    && component.activation == crate::placement::planner::Activation::choice(cfg.layers + 2, count)).unwrap();
+                assert_eq!(arena.bytes.at(1).unwrap(), backing.arena.bytes() as u64);
+                for (name, bytes) in &backing.workspace {
+                    let id = format!("inkling2.expert_workspace.{}.{}.{}.{}", backing.gpu, count, group, name);
+                    let component = contract.components.iter().find(|component| matches!(&component.kind,
+                        ComponentKind::Allocation { template, .. } if template.id == id)).unwrap();
+                    assert_eq!(component.bytes.at(1).unwrap(), *bytes, "{id}");
+                }
             }
         }
         // The planner inventories the exact allocator recipe, per owner, not
