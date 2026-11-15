@@ -2001,6 +2001,25 @@ mod tests {
     }
 
     #[test]
+    fn cycle_fast_owner_keeps_one_lagged_chunk_behind_slow_peer() {
+        let mut cache = epoch_fixture();
+        cache.soft.limit = 1000;
+        cache.begin_lane(0);
+        cache.begin_lane(1);
+        for _ in 0..4 {
+            let id = cache.mark_victim(false).unwrap();
+            cache.complete_lane(0);
+            cache.begin_lane(0);
+            cache.destroyed(&[id], ReleaseMeasurement { released: 0 });
+            assert_eq!(cache.lagged.len(), 1, "all fast-lane retirements wait on the same peer cycle");
+        }
+        assert_eq!(cache.epochs.uncredited_nodes, 40);
+        cache.complete_lane(1);
+        assert!(cache.lagged.is_empty());
+        assert_eq!(cache.pools.live_nodes, 0);
+    }
+
+    #[test]
     fn cycle_credited_reuse_preserves_physical_high_water_and_reports_driver_growth() {
         let mut cache = epoch_fixture();
         cache.begin_lane(0);
