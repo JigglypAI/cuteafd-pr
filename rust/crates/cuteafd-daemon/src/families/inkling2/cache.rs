@@ -292,6 +292,13 @@ mod tests {
     }
 }
 
+impl crate::shared::prefix::cuda_copy::SnapshotOwner for CacheBank<'_> {
+    fn snapshot_buffers(&self) -> Result<Vec<Buffer>> {
+        Ok(std::iter::once(self.active.buffer).chain(self.marks.iter().map(|owner| owner.buffer))
+            .chain(self.pages.values().map(|owner| owner.buffer)).collect())
+    }
+}
+
 impl Drop for CacheBank<'_> {
     fn drop(&mut self) {
         crate::shared::decode_graph::fatal_drain(self.copies.drain(), "Inkling persistent cache retirement");
