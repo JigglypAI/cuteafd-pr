@@ -109,6 +109,9 @@ fn fp8_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, formats
     for &(format, width) in formats {
         scratch = scratch.max(group_scratch(family, format, width, extent.compiled)?);
         io += group_io_bytes(family, format, geometry, extent.capacity);
+        // Inkling's NVFP4 is dynamic-amax, not the static NVFP4 row-addressed
+        // recipe. Its wave staging stays parked until a served card exists.
+        if family == "inkling2" { continue; }
         // Installed row-addressed recipes and their smallest member units.
         let (minimum, arithmetic) = match format {
             // Every installed form is retained; W8A16 is the largest stream arena.
