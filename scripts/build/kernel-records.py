@@ -556,7 +556,7 @@ class Recorder:
                 if found is None or found[0]() is not executor:
                     raise ValueError(f"{file_name}: export has no recorded compiler IR")
                 path = (Path(file_path) / (file_name + ".o")).relative_to(self.output).as_posix()
-                self.exports[path] = found[1]
+                self.exports[path] = json.loads(json.dumps(found[1]))
                 self.exports[path]["export_prefix"] = function_prefix or file_name
                 return result
             return wrapped
