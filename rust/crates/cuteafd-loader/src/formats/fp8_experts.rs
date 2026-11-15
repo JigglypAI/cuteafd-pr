@@ -920,7 +920,9 @@ impl Fp8ExpertTensors {
     /// Rows of one slice block: the 128x128 scale block (FP8), the 32-wide
     /// UE8M0 block (MXFP4) or the 16-wide E4M3 block (NVFP4).
     pub fn block(&self) -> usize {
-        self.format.group()
+        // MXFP8 scale groups stay K32, while shared exact packages own H128
+        // intermediate units. H128 boundaries never split a scale group.
+        if self.format == ExpertFormat::Mxfp8 { 128 } else { self.format.group() }
     }
 
     /// The stored intermediate slice width of every rank of `tp`: the widest
@@ -1391,6 +1393,40 @@ mod tests {
                     assert_eq!(&pushed[w.len()..], s);
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mxfp8_h128_ownership_matches_exporter_widths_without_splitting_k32_scales() -> Result<()> {
+        let mut tensors = catalog(ExpertFormat::Mxfp8, 2304);
+        tensors.shape.hidden = 4608;
+        tensors.shape.experts = 384;
+        assert_eq!(tensors.format.group(), 32);
+        assert_eq!(tensors.block(), 128);
+        let exporter = include_str!("../../../../../python/tools/aot/package_fp8_moe_aot.py");
+        assert!(exporter.contains("def exact_widths(intermediate: int, tp: int, unit: int = 128)"));
+        for world in 2..=8 {
+            let recipe = crate::plan::experts::spark_recipe("inkling2:mxfp8", 2304, world)?;
+            assert_eq!(recipe.slicing, Slicing::Blocks(128));
+            let mut covered = vec![false; 2304];
+            let mut widths = Vec::new();
+            for rank in 0..world {
+                let (first, width) = tensors.rank_range_with(world, rank, recipe.slicing)?;
+                let blocks = 2304 / 128;
+                let exported = (blocks / world + usize::from(rank < blocks % world)) * 128;
+                widths.push(width);
+                assert_eq!(width, exported);
+                assert_eq!(first % 128, 0);
+                assert_eq!(first % 32, 0);
+                assert_eq!(width % 32, 0);
+                for value in &mut covered[first..first + width] { assert!(!*value); *value = true; }
+                let scale = tensors.projection_slices(Fp8Projection::Down, world, rank, recipe.slicing)?[1];
+                assert_eq!(scale.source_offset, first / 32);
+                assert_eq!(scale.width, width / 32);
+            }
+            assert_eq!(widths, recipe.widths);
+            assert!(covered.into_iter().all(|value| value));
         }
         Ok(())
     }

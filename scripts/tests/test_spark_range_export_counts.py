@@ -40,7 +40,7 @@ def test_every_planner_width_covered_world_has_a_package_alias():
         exl3 = format == 'exl3'
         native = family in ('v41', 'dsv4f', 'dsv4p') and not exl3
         nvfp4 = format in ('nvfp4', 'nvfp4a4')
-        unit = 16 if nvfp4 else 32 if native or family in ('mimof', 'mimop') or format == 'mxfp8' else 128
+        unit = 16 if nvfp4 else 32 if native or family in ('mimof', 'mimop') else 128
         intermediate = entry['intermediate']
         options = dict(exl3=exl3, native=native, nvfp4=nvfp4)
         available = set().union(*(packages.width_keys(intermediate, unit, n, **options)
@@ -73,6 +73,16 @@ def test_inkling_native_and_two_tier_exl3_profiles_cover_tp3_tp6():
                   for destination in destinations if destination.startswith(f'tp{world}-rank')}
         assert len(widths) == world and sum(widths.values()) == 2304
     assert packages.geometry_worlds('inkling2_mxfp8') == packages.package_worlds('inkling2', 'mxfp8')
+    native = module('inkling_native_width_metadata', ROOT / 'python/tools/aot/package_fp8_moe_aot.py')
+    for world in range(2, 9):
+        widths = native.exact_widths(2304, world)
+        assert sum(widths) == 2304
+        assert packages.width_keys(2304, 128, world) == {(False, width) for width in widths}
+        first = 0
+        for width in widths:
+            assert first % 128 == width % 128 == 0
+            assert first % 32 == width % 32 == 0  # No K32 scale group straddles ranks.
+            first += width
 
 
 def test_minimax_native_nvfp4_worlds_cover_the_padded_vendor_slices():
