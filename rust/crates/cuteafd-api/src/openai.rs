@@ -2112,6 +2112,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inkling_dispatch_renders_native_effort_and_parses_channels_and_parallel_calls() {
+        for streaming in [false, true] {
+            for effort in [json!("none"), json!("max"), json!(0.15)] {
+                let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+                let expected = if effort == "none" { "0" } else if effort == "max" { "0.99" } else { "0.15" };
+                let worker = tokio::spawn(async move {
+                    let job = rx.recv().await.unwrap();
+                    assert!(job.prompt.contains(&format!("Thinking effort level: {expected}<|end_message|>")), "{}", job.prompt);
+                    assert!(job.prompt.ends_with("<|message_user|><|content_text|>Read files<|end_message|>"));
+                    assert_eq!(job.stop_token_ids, vec![200006]);
+                    let wire = concat!("<|message_model|><|content_thinking|>Plan\n<|end_message|>",
+                        "<|message_model|><|content_text|>Opening files.\n<|end_message|>",
+                        "<|message_model|>read_file<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{\"path\":\"README.md\"}}<|end_message|>",
+                        "<|message_model|>read_file<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{\"path\":\"lib.rs\"}}<|end_message|>");
+                    // Real engines commonly strip the sampled EOS token, but no channel marker.
+                    for byte in wire.as_bytes() {
+                        job.events.send(Ok(InferenceChunk::Text { content: char::from(*byte).to_string(), content_tokens: 1 })).unwrap();
+                    }
+                    job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop })).unwrap();
+                });
+                let profile = ModelProfile::new("inkling-test", ModelEncoding::Inkling(Arc::new(inkling2::fixtures::encoding())));
+                assert!(profile.encoding.supports_thinking_off());
+                assert_eq!(engine::system_placement(&profile), engine::SystemPlacement::Anywhere);
+                let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                    std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+                let body = json!({"model":"inkling-test", "messages":[{"role":"user", "content":"Read files"}],
+                    "reasoning_effort":effort, "max_tokens":1024, "stream":streaming,
+                    "tools":[{"type":"function", "function":{"name":"read_file", "parameters":{
+                        "type":"object", "properties":{"path":{"type":"string"}}}}}]});
+                let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+                if streaming {
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    assert!(text.contains("reasoning_content") && text.contains("read_file") && text.contains("tool_calls"));
+                } else {
+                    let result: Value = serde_json::from_slice(&bytes).unwrap();
+                    let choice = &result["choices"][0];
+                    assert_eq!(choice["message"]["reasoning_content"], "Plan\n");
+                    assert_eq!(choice["message"]["content"], "Opening files.\n");
+                    assert_eq!(choice["finish_reason"], "tool_calls");
+                    assert_eq!(choice["message"]["tool_calls"].as_array().unwrap().len(), 2);
+                    for (index, path) in ["README.md", "lib.rs"].into_iter().enumerate() {
+                        assert_eq!(choice["message"]["tool_calls"][index]["function"]["name"], "read_file");
+                        let args: Value = serde_json::from_str(choice["message"]["tool_calls"][index]["function"]["arguments"].as_str().unwrap()).unwrap();
+                        assert_eq!(args, json!({"path":path}));
+                    }
+                }
+                worker.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn inkling_malformed_or_truncated_output_is_an_error_not_a_partial_call() {
+        for streaming in [false, true] {
+            for wire in ["<|message_model|>read_file<|content_invoke_tool_json|>{bad}<|end_message|>",
+                "<|message_model|>read_file<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{}"] {
+                let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+                let worker = tokio::spawn(async move {
+                    let job = rx.recv().await.unwrap();
+                    job.events.send(Ok(InferenceChunk::Text { content: wire.into(), content_tokens: 5 })).unwrap();
+                    let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
+                });
+                let profile = ModelProfile::new("inkling-test", ModelEncoding::Inkling(Arc::new(inkling2::fixtures::encoding())));
+                let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                    std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+                let body = json!({"model":"inkling-test", "messages":[{"role":"user", "content":"Read"}],
+                    "stream":streaming, "tools":[{"type":"function", "function":{"name":"read_file", "parameters":{"type":"object"}}}]});
+                let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                if streaming {
+                    assert_eq!(status, StatusCode::OK);
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    assert!(text.contains("native_v41_error") && text.contains("Inkling"), "{text}");
+                    assert!(!text.contains("data: [DONE]") && !text.contains("\"tool_calls\""), "{text}");
+                } else {
+                    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{}", String::from_utf8_lossy(&bytes));
+                    let value: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert!(value["error"]["message"].as_str().unwrap().contains("Inkling"));
+                }
+                worker.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn minimax_dispatch_renders_checkpoint_prompt_and_parses_reasoning_and_calls() {
         for streaming in [false, true] {
             let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);

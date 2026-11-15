@@ -66,10 +66,9 @@ fn off_switches_match_native_none_effort_and_invalid_requests_do_not_panic() {
 fn native_snapshot_headers_and_stops_do_not_depend_on_live_checkpoint() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("chat_template.jinja"), fixtures::TEMPLATE).unwrap();
-    let markers = [(MODEL, 200001), (THINK, 200008), (TEXT, 200004), (CALL, 200049), (END, 200010), (EOS, 200006)];
-    let decoder: serde_json::Map<String, Value> = markers.into_iter().map(|(marker, id)|
-        (id.to_string(), json!({"content":marker}))).collect();
-    let mut config = json!({"added_tokens_decoder":decoder});
+    let mut config: Value = serde_json::from_str(include_str!("fixtures/tokenizer_config.json")).unwrap();
+    assert_eq!(config["added_tokens_decoder"]["200006"]["content"], EOS);
+    assert_eq!(config["added_tokens_decoder"]["200010"]["content"], END);
     let path = directory.path().join("tokenizer_config.json");
     std::fs::write(&path, config.to_string()).unwrap();
     let loaded = InklingEncoding::from_snapshot(directory.path()).unwrap();
@@ -105,6 +104,7 @@ fn official_completion_spans_round_trip_through_parser_at_every_character_split(
     let prefix = cases.iter().find(|case| case["name"] == "official_tools_high").unwrap()["prompt"].as_str().unwrap();
     for case in cases.iter().filter(|case| case["name"].as_str().unwrap().starts_with("official_completion_")) {
         let span = case["prompt"].as_str().unwrap().strip_prefix(prefix).unwrap();
+        assert!(span.ends_with(EOS), "{} must stop on ID 200006", case["name"]);
         let expected = parsed(&[span], options());
         for (index, _) in span.char_indices().chain(std::iter::once((span.len(), '\0'))) {
             assert_eq!(parsed(&[&span[..index], &span[index..]], options()), expected, "{} at {index}", case["name"]);

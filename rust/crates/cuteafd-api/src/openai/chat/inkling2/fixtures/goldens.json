@@ -309,15 +309,6 @@
                 }
               }
             ]
-          },
-          {
-            "role": "tool",
-            "tool_call_id": "call0",
-            "content": "# Project\n"
-          },
-          {
-            "role": "user",
-            "content": "Explain that title."
           }
         ],
         "reasoning_effort": "high",
@@ -445,15 +436,6 @@
                 }
               }
             ]
-          },
-          {
-            "role": "tool",
-            "tool_call_id": "call0",
-            "content": "# Project\n"
-          },
-          {
-            "role": "user",
-            "content": "Explain that title."
           }
         ],
         "reasoning_effort": "high",
