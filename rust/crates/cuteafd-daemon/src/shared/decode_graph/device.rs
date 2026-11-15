@@ -2336,6 +2336,41 @@ mod tests {
     }
 
     #[test]
+    fn inventory_counters_match_owner_lifetimes_and_rankings_are_cached() {
+        let mut cache = test_cache(-1010, 64 * GRAPH_CHUNK);
+        let verify = |cache: &DeviceCache| {
+            let expected = cache.records.values().fold(Inventory::default(), |mut total, r| {
+                total.nodes += r.accounted.nodes; total.execs += r.accounted.execs;
+                total.unknown += r.accounted.unknown; total.resident += r.accounted.resident;
+                total.pinned += r.accounted.pinned; total
+            });
+            assert_eq!((cache.inventory.nodes, cache.inventory.execs, cache.inventory.unknown,
+                cache.inventory.resident, cache.inventory.pinned),
+                (expected.nodes, expected.execs, expected.unknown, expected.resident, expected.pinned));
+        };
+        let a = capture(&mut cache, 1, true);
+        cache.captured_topology(a, 11, 1, false);
+        let b = capture(&mut cache, 2, false);
+        cache.captured_topology(b, 17, 1, false);
+        verify(&cache);
+        assert_eq!(cache.native_pools().live_nodes, 28);
+        cache.hit(b);
+        cache.boundary();
+        let ranking = cache.snapshot().top_hits[0].hits;
+        cache.hit(b);
+        assert_eq!(cache.snapshot().top_hits[0].hits, ranking, "stats reads reuse cached rankings");
+        assert_eq!(cache.snapshot().native_pools.live_nodes, 28);
+        cache.mark_victim(false);
+        verify(&cache);
+        cache.destroyed(&[b], ReleaseMeasurement { released: 0 });
+        verify(&cache);
+        assert_eq!(cache.native_pools().live_nodes, 11);
+        cache.remove_bank(1);
+        verify(&cache);
+        assert_eq!(cache.native_pools().live_execs, 0);
+    }
+
+    #[test]
     fn stats_top_lists_are_bounded_sorted_and_available_without_trace() {
         let mut cache = test_cache(-216, 1000);
         assert!(cache.trace.is_none());
@@ -2343,6 +2378,7 @@ mod tests {
             let id = capture(&mut cache, n, false);
             cache.pinned_hits(id, Cycle::Decode, n + 1);
         }
+        cache.refresh_rankings();
         let snapshot = cache.snapshot();
         assert_eq!(snapshot.top_hits.len(), 16);
         assert_eq!(snapshot.top_hits[0].hits, 30);
@@ -2350,6 +2386,7 @@ mod tests {
         while let Some(id) = cache.mark_victim(false) {
             cache.destroyed(&[id], ReleaseMeasurement { released: 0 });
         }
+        cache.refresh_rankings();
         assert_eq!(cache.snapshot().top_churn.len(), 16);
         cache.remove_bank(1);
         assert_eq!(cache.snapshot().telemetry_bytes, 0);
