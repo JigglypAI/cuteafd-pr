@@ -90,7 +90,7 @@
       },
       "1rtx": {
         "status": "na",
-        "reason": "original BF16 core doesn't fit: checkpoint load needs 121.96 GB vs 101.87 GB available"
+        "reason": "original BF16 core doesn't fit: RTX load needs 121.96 GB vs 101.87 GB available; K6 Spark 0 load needs 121.86 GB vs 115.96 GB available"
       },
       "2rtx": {
         "status": "pending",
