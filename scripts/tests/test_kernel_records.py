@@ -783,3 +783,30 @@ def test_identity_and_reports_are_deterministic():
     assert records.stable_hash({"ir": "a", "target": [12, 0]}) == records.stable_hash({"target": [12, 0], "ir": "a"})
     assert records.stable_hash({"ir": "a"}) != records.stable_hash({"ir": "b"})
     assert records.change_report({"k": {}}, {"k": {}})["changed"] == []
+
+
+def test_recorded_hash_snapshot_rejects_mutation_before_publication(tmp_path):
+    source = tmp_path / "recipe.py"
+    source.write_text("TILE = 64\n")
+    recorder = records.Recorder(tmp_path, tmp_path / "output")
+    recorder.frames.add("recipe.py")
+    before = recorder.reads()
+    assert recorder.reads() == before
+    source.write_text("TILE = 128\n")
+    assert recorder.reads() == before
+    with pytest.raises(ValueError, match="recorded source changed.*recipe.py"):
+        recorder.validate_sources()
+
+
+def test_profile_cache_keeps_changing_module_bindings(tmp_path):
+    import types
+    recorder = records.Recorder(tmp_path, tmp_path / "output")
+    module = types.ModuleType("policy")
+    first, second = tmp_path / "first.py", tmp_path / "second.py"
+    first.write_text("TILE = 64\n")
+    second.write_text("TILE = 128\n")
+    module.__file__ = str(first)
+    recorder._record_dependencies([module])
+    module.__file__ = str(second)
+    recorder._record_dependencies([module])
+    assert recorder.frames == {"first.py", "second.py"}
