@@ -123,22 +123,6 @@ pub fn spark_charges(catalog: &crate::OfficialV41Catalog, experts: &[LayerExpert
         slot_bytes: rings.slot_bytes, alignment: rings.alignment };
     let runtime = cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0).context("Spark runtime residual")?;
     let geometry = cuteafd_core::ExpertGeometry::INKLING2;
-    let mut per_layer = vec![vec![0u64; routed.len()]; ranks];
-    for (index, &layer) in routed.iter().enumerate() {
-        let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: vec![layer],
-            spark_ranks: ranks, prefill_lanes: shared::LANES };
-        for rank in 0..ranks {
-            let layout = if let Some(tensors) = catalog.fp8() {
-                let view = tensors.for_layer_metadata(layer)?;
-                let format = if view.dynamic_nvfp4() { "nvfp4a4" } else { "mxfp8" };
-                let recipe = crate::plan::experts::spark_recipe(&format!("inkling2:{format}"),
-                    catalog.routed_experts().intermediate, ranks)?;
-                crate::placement::SparkResidentLayout::Fp8 { world: ranks, rank, slicing: recipe.slicing }
-            } else { crate::placement::SparkResidentLayout::Exl3 { world: ranks, rank } };
-            per_layer[rank][index] = crate::placement::SparkAssignment::resident_from_catalog(catalog,
-                &working, rank, layout)?.resident_bytes;
-        }
-    }
     (0..=routed.len()).map(|count| {
         let working = SparkWorkingSet { rtx_layers: routed[..count].to_vec(), spark_layers: routed[count..].to_vec(),
             spark_ranks: ranks, prefill_lanes: shared::LANES };
@@ -150,7 +134,25 @@ pub fn spark_charges(catalog: &crate::OfficialV41Catalog, experts: &[LayerExpert
                 .and_then(|bytes| bytes.total()).context("Inkling 2 Spark owner sum overflow")?;
             let owners = [io.intake, io.host_exchange, io.row_indices, io.mapped_rings, io.endpoint_staging, owners]
                 .into_iter().try_fold(0u64, |sum, bytes| sum.checked_add(bytes)).context("Inkling 2 Spark owners")?;
-            Ok(SparkCharge { experts: per_layer[rank][count..].iter().sum(), owners, runtime })
+            let resident = if let Some(tensors) = catalog.fp8() {
+                // Preserve the worker's independently retained homogeneous
+                // package arenas. Shared packing accounts inter-plane gaps once.
+                tensors.homogeneous_layers(&working.spark_layers)?.into_iter()
+                    .try_fold(0u64, |sum, (view, layers)| -> anyhow::Result<u64> {
+                        let format = if view.dynamic_nvfp4() { "nvfp4a4" } else { "mxfp8" };
+                        let recipe = crate::plan::experts::spark_recipe(&format!("inkling2:{format}"),
+                            catalog.routed_experts().intermediate, ranks)?;
+                        let group = SparkWorkingSet { spark_layers: layers, ..working.clone() };
+                        let bytes = crate::placement::SparkAssignment::resident_from_catalog(catalog, &group,
+                            rank, crate::placement::SparkResidentLayout::Fp8 { world: ranks, rank,
+                                slicing: recipe.slicing })?.resident_bytes;
+                        sum.checked_add(bytes).context("native Spark group arenas overflow")
+                    })?
+            } else {
+                crate::placement::SparkAssignment::resident_from_catalog(catalog, &working, rank,
+                    crate::placement::SparkResidentLayout::Exl3 { world: ranks, rank })?.resident_bytes
+            };
+            Ok(SparkCharge { experts: resident, owners, runtime })
         }).collect()
     }).collect()
 }
