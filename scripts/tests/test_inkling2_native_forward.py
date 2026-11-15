@@ -38,6 +38,16 @@ def test_persistent_layer_state_is_borrowed_and_metadata_uses_retained_uploads()
     layer = (FAMILY/'layers.rs').read_text()
     assert "owner: &impl UnitBuffers<'a>" in layer
     assert 'Allocation::new' not in layer
+    head = (FAMILY/'head.rs').read_text()
+    assert 'self.rows <= 64' in head
+    assert 'probe::head_spans(rows, self.rows)' in head
+    assert 'scoring.record(' in head
+    assert 'ScoreLogits::Recorded' in head
+    prefill = (FAMILY/'prefill.rs').read_text()
+    assert 'for member in members(unit)' in prefill
+    assert 'owner.segment_metadata(' in prefill
+    assert 'unit.reply_origins()' in prefill
+    assert 'layers::routed_ffn(self.kernels, owner,' in prefill
 
 
 def test_arenas_are_single_backings_and_head_is_shared():

@@ -1,5 +1,5 @@
 //! Trimmed vocabulary and final softcap use the shared target-head route.
-use super::{layers::Kernels, owners::UnitOwner, weights::TargetWeights};
+use super::{layers::Kernels, owners::{UnitBuffers, UnitOwner}, weights::TargetWeights};
 use crate::shared::{memory::device::{Allocation, Stream}, target_head::{self, TargetHead}};
 use anyhow::{ensure, Result};
 use cuteafd_core::memory_layout::Tag;
@@ -63,9 +63,11 @@ impl<'a> Head<'a> {
                 owner.buffer("partial")?, false, Precision::F32, tokens.len())
         })
     }
-    pub fn project(&self, k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetWeights<'_>,
+    pub fn project(&self, k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
         cfg: &Inkling2Config, rows: usize, candidates: usize) -> Result<Buffer> {
-        ensure!(rows>0 && rows<=self.rows, "Inkling head rows exceed admitted owner");
+        ensure!(rows>0 && rows<=self.rows && owner.stream().raw == self.stream.raw
+            && owner.stream().device.id == self.stream.device.id,
+            "Inkling head rows/producer stream differ from admitted owner");
         k.residual(owner, target.operand("model.llm.attn_res.output_query")?.buffer,
             owner.buffer("partial")?, owner.buffer("mixed")?, rows, 1, candidates, false)?;
         k.norm(owner, owner.buffer("mixed")?, target.operand("model.llm.norm.weight")?.buffer,
@@ -79,6 +81,29 @@ impl<'a> Head<'a> {
                 cfg.unpadded_vocab_size, cfg.unpadded_vocab_size, cfg.final_softcap as f32, self.stream.raw)?;
         }
         Ok(self.logits.buffer)
+    }
+    /// Vocabulary storage remains <=64 rows regardless of prompt length. The
+    /// shared consumer finishes each tile before the next overwrites it.
+    pub fn project_spans(&self, k: &Kernels<'a>, owner: &UnitOwner<'a>, cache: &super::cache::CacheBank<'a>,
+        sequence: usize, target: &TargetWeights<'_>, cfg: &Inkling2Config, rows: usize, candidates: usize,
+        consume: &mut dyn FnMut(usize, crate::shared::token_io::DeviceLogits) -> Result<()>) -> Result<()> {
+        ensure!(self.rows <= 64 && rows <= owner.layout.rows && rows > 0,
+            "Inkling serving head must be bounded to <=64 rows");
+        for span in crate::shared::probe::head_spans(rows, self.rows)? {
+            let segment = owner.segment(cache, sequence, cfg.layers-1, span.clone())?;
+            let logits = self.project(k, &segment, target, cfg, span.len(), candidates)?;
+            consume(span.start, crate::shared::token_io::DeviceLogits { ptr: logits.ptr, rows: span.len(),
+                vocab: cfg.unpadded_vocab_size, stride: cfg.unpadded_vocab_size,
+                stream: self.stream.raw, greedy: None })?;
+        }
+        Ok(())
+    }
+    pub fn project_scoring(&self, k: &Kernels<'a>, owner: &UnitOwner<'a>, cache: &super::cache::CacheBank<'a>,
+        sequence: usize, target: &TargetWeights<'_>, cfg: &Inkling2Config, rows: usize, candidates: usize,
+        scoring: crate::shared::probe::ScoringRows<'_>) -> Result<crate::shared::probe::ScoreLogits> {
+        self.project_spans(k, owner, cache, sequence, target, cfg, rows, candidates,
+            &mut |offset, logits| scoring.record(self.stream.device.library, offset, &logits))?;
+        Ok(crate::shared::probe::ScoreLogits::Recorded)
     }
 }
 impl Drop for Head<'_> {
