@@ -28,7 +28,8 @@ fn validate_layers(layers: &[usize], shape: &cuteafd_loader::RoutedExpertShape) 
 fn validate_info(info: &Fp8MoeInfo, tensors: &Fp8ExpertTensors, layers: &[usize],
     slicing: Slicing, max_rows: usize) -> Result<()> {
     validate_layers(layers, tensors.shape())?;
-    ensure!(max_rows > 0 && !info.wire_input, "whole FP8-family experts require BF16 input and nonzero capacity");
+    ensure!(max_rows > 0 && (!info.wire_input || info.weights == cuteafd_ffi::fp8_moe::Fp8MoeWeights::Mxfp8),
+        "whole experts require BF16 or native MXFP8 input and nonzero capacity");
     fp8::validate_checkpoint_contract(info, tensors, layers, 1, 0, slicing)?;
     ensure!(info.capacity_for(max_rows).is_some(), "whole expert package cannot hold {max_rows} rows");
     Ok(())
@@ -125,10 +126,14 @@ impl<'a> Whole<'a> {
         stream: *mut c_void) -> Result<()> {
         ensure!((1..=self.max_rows).contains(&rows), "whole expert rows exceed admitted capacity");
         let index = super::resident_index(&self.layers, layer)?;
-        let ExpertInput::Bf16(input) = input else { bail!("whole FP8-family experts require BF16 input") };
+        let input = match (self.experts.wire_input(), input) {
+            (true, ExpertInput::Fp8K32(input)) | (false, ExpertInput::Bf16(input)) => input,
+            _ => bail!("whole expert input differs from admitted native package"),
+        };
         self.device.run(|| {
-            // SAFETY: caller retains rank-local input/routes and serializes scratch/output reuse.
-            unsafe { self.experts.run_bf16(index, rows, input, routes.ids, routes.weights, self.output(), stream) }
+            // SAFETY: caller retains rank-local, package-typed input/routes and
+            // serializes scratch/output reuse through completion.
+            unsafe { self.experts.run(index, rows, input, routes.ids, routes.weights, self.output(), stream) }
         })
     }
 }
@@ -140,12 +145,12 @@ impl RtxExpertLayer for Whole<'_> {
     }
     fn shard(&self) -> RtxShard { RtxShard::Whole }
     fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }
-    fn uses_fp8_input(&self) -> bool { false }
+    fn uses_fp8_input(&self) -> bool { self.experts.wire_input() }
     fn layers(&self) -> &[usize] { &self.layers }
     fn device(&self) -> i32 { self.device.id }
     fn workspace_bytes(&self) -> usize { self.workspace_bytes }
     fn output(&self) -> *mut c_void { self.output.buffer.ptr }
-    fn group_rows(&self, rows: usize) -> Result<usize> { Ok(self.experts.weight_read_group(rows, true)?.0) }
+    fn group_rows(&self, rows: usize) -> Result<usize> { Ok(self.experts.weight_read_group(rows, !self.experts.wire_input())?.0) }
     fn weight_read_bytes(&self) -> Result<usize> { Ok(self.experts.weight_read_bytes()) }
 
     unsafe fn prime(&mut self, input: ExpertInput, routes: Routes, stream: *mut c_void) -> Result<()> {
@@ -193,6 +198,7 @@ mod tests {
                 weights.extend(match format {
                     ExpertFormat::Fp8Block128 => fp8(&name, n, k, None),
                     ExpertFormat::Mxfp4 => mxfp4(&name, n, k),
+                    ExpertFormat::Mxfp8 => cuteafd_loader::plan::testing::mxfp8(&name, n, k),
                     ExpertFormat::Nvfp4 => nvfp4(&name, n, k),
                     ExpertFormat::Bf16 => unreachable!(),
                 });
@@ -206,6 +212,7 @@ mod tests {
                 projection: Fp8MoeProjection::Bf16, capacities: vec![1, 16, 4096], scale_convention: cuteafd_ffi::fp8_moe::Fp8MoeScaleConvention::Multiplier, weights: match format {
                     ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
                     ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
+                    ExpertFormat::Mxfp8 => Fp8MoeWeights::Mxfp8,
                     ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4,
                     ExpertFormat::Bf16 => unreachable!(),
                 } };

@@ -79,7 +79,7 @@ fn project(tensors: &Fp8ExpertTensors, layer: usize, expert: usize, projection: 
                 }
                 ExpertFormat::Nvfp4 => e2m1((weights[at / 2] >> (4 * (at % 2))) & 15)
                     * e4m3(scales[row * (k / 16) + column / 16]),
-                ExpertFormat::Mxfp4 => anyhow::bail!("MXFP4 is outside this qualification"),
+                ExpertFormat::Mxfp4 | ExpertFormat::Mxfp8 => anyhow::bail!("MX formats are outside this qualification"),
             };
             sum += f64::from(activation) * f64::from(weight);
         }

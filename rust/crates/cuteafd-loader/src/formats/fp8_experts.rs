@@ -340,7 +340,9 @@ impl Fp8ExpertTensors {
         } else if self.compressed_nvfp4 {
             format!("{}.weight_scale", weight.strip_suffix(".weight_packed").expect("packed weight name"))
         } else {
-            format!("{weight}{}", if self.tensors.get(weight).map_or(self.format.packed_fp4(), |t| matches!(t.dtype, DType::U8 | DType::I8)) { "_scale" } else { "_scale_inv" })
+            format!("{weight}{}", if self.tensors.contains_key(&format!("{weight}_scale"))
+                || self.tensors.get(weight).map_or(self.format.packed_fp4(), |t| matches!(t.dtype, DType::U8 | DType::I8))
+                { "_scale" } else { "_scale_inv" })
         }
     }
 
@@ -1919,6 +1921,7 @@ mod tests {
                     let mut tensors = match format {
                         ExpertFormat::Fp8Block128 => fp8(&name, n, k, None),
                         ExpertFormat::Mxfp4 => mxfp4(&name, n, k),
+                        ExpertFormat::Mxfp8 => crate::plan::testing::mxfp8(&name, n, k),
                         ExpertFormat::Nvfp4 => nvfp4(&name, n, k),
                         ExpertFormat::Bf16 => vec![crate::plan::testing::t(format!("{name}.weight"), "BF16", &[n,k])],
                     };

@@ -1315,6 +1315,7 @@ mod tests {
                         let name = format!("model.layers.{layer}.mlp.experts.{expert}.{projection}_proj");
                         headers.extend(match format {
                             ExpertFormat::Mxfp4 => mxfp4(&name, n, k),
+                            ExpertFormat::Mxfp8 => cuteafd_loader::plan::testing::mxfp8(&name, n, k),
                             ExpertFormat::Fp8Block128 => fp8(&name, n, k, None),
                             ExpertFormat::Nvfp4 => nvfp4(&name, n, k),
                             ExpertFormat::Bf16 => vec![t(format!("{name}.weight"), "BF16", &[n, k])],

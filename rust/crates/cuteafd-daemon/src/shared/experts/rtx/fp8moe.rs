@@ -24,7 +24,8 @@ pub(crate) struct Fp8MoeTp2Plan {
 fn validate_info(info: &Fp8MoeInfo, tensors: &Fp8ExpertTensors, layers: &[usize], rank: usize, slicing: Slicing,
     max_rows: usize) -> Result<()> {
     ensure!(rank < 2 && max_rows > 0, "invalid FP8 MoE TP2 rank/capacity");
-    ensure!(!info.wire_input, "FP8 MoE TP2 package requires BF16 input");
+    ensure!(!info.wire_input || info.weights == Fp8MoeWeights::Mxfp8,
+        "FP8 MoE TP2 package requires BF16 or native MXFP8 input");
     super::super::fp8::validate_checkpoint_contract(info, tensors, layers, 2, rank, slicing)?;
     ensure!(info.capacity_for(max_rows).is_some(), "FP8 MoE TP2 package has no capacity for {max_rows} rows");
     Ok(())
@@ -225,7 +226,7 @@ impl<'a> Fp8MoeTp2<'a> {
 
     pub(crate) fn weight_read_group(&self, rows: usize)
         -> Result<(usize, cuteafd_transport::worker_selection::ExpertTrafficContract)> {
-        self.experts.weight_read_group(rows, true)
+        self.experts.weight_read_group(rows, !self.experts.wire_input())
     }
 
     /// Force first-use CUDA loading of each serving capacity before any device
@@ -264,7 +265,7 @@ impl RtxExpertLayer for Fp8MoeTp2<'_> {
 
     fn shard(&self) -> RtxShard { RtxShard::Tp2 { rank: self.rank } }
     fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }
-    fn uses_fp8_input(&self) -> bool { false }
+    fn uses_fp8_input(&self) -> bool { self.experts.wire_input() }
     fn layers(&self) -> &[usize] { &self.layers }
     fn device(&self) -> i32 { self.device.id }
     fn workspace_bytes(&self) -> usize { self.workspace_bytes }
@@ -282,7 +283,10 @@ impl RtxExpertLayer for Fp8MoeTp2<'_> {
         let result = (|| {
             ensure!(self.layers.contains(&layer) && (1..=self.max_rows).contains(&rows),
                 "FP8 MoE TP2 layer/row range exceeded");
-            let ExpertInput::Bf16(input) = input else { bail!("FP8 MoE TP2 requires BF16 input rows") };
+            let input = match (self.experts.wire_input(), input) {
+                (true, ExpertInput::Fp8K32(input)) | (false, ExpertInput::Bf16(input)) => input,
+                _ => bail!("FP8 MoE TP2 input differs from admitted native package"),
+            };
             let index = self.experts.index_of(layer)?;
             self.device.run(|| {
                 // SAFETY: caller retains rank-local input, routes and stream through
@@ -392,6 +396,7 @@ mod tests {
                 weights.extend(match format {
                     ExpertFormat::Fp8Block128 => fp8(&name, n, k, None),
                     ExpertFormat::Mxfp4 => mxfp4(&name, n, k),
+                    ExpertFormat::Mxfp8 => cuteafd_loader::plan::testing::mxfp8(&name, n, k),
                     ExpertFormat::Bf16 => vec![cuteafd_loader::plan::testing::t(format!("{name}.weight"), "BF16", &[n,k])],
                     ExpertFormat::Nvfp4 => nvfp4(&name, n, k),
                 });
@@ -405,6 +410,7 @@ mod tests {
                     swiglu_limit: tensors.shape().geometry()?.swiglu_limit().unwrap_or(0.0), swiglu_alpha: 1.0, swiglu_beta: 0.0, activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product, projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16, capacities: vec![1, 16, 4096],
                     scale_convention: cuteafd_ffi::fp8_moe::Fp8MoeScaleConvention::Multiplier, weights: match format { ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
                         ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
+                        ExpertFormat::Mxfp8 => Fp8MoeWeights::Mxfp8,
                         ExpertFormat::Bf16 => Fp8MoeWeights::Bf16,
                         ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4 } };
                 validate_info(&info, &tensors, &[0], rank, Slicing::Blocks(128), 4096)?;

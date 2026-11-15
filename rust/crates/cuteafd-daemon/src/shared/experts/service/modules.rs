@@ -49,7 +49,8 @@ impl Fp8Group {
             }
             let family = fp8::package_family(cuteafd_core::expert_geometry().family(), tensors.format());
             let format = match tensors.format() {
-                ExpertFormat::Nvfp4 => "nvfp4", ExpertFormat::Bf16 => "bf16", _ => "fp8",
+                ExpertFormat::Nvfp4 => "nvfp4", ExpertFormat::Bf16 => "bf16",
+                ExpertFormat::Mxfp8 => "mxfp8", _ => "fp8",
             };
             super::backend::validate_fp8_recipe(&format!("{family}:{format}"), tensors.shape().intermediate,
                 config.world, &directory,
