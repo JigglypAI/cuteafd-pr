@@ -1350,6 +1350,49 @@ mod tests {
         id
     }
     #[test]
+    fn high_water_overshoot_does_not_churn_a_bounded_hot_set() {
+        let mut cache = DeviceCache::new(-996, 1000);
+        let mut hot = Vec::new();
+        for n in 0..36 { hot.push(capture(&mut cache, n, false)); }
+        // Retired/transient growth left the permanent arena over reserve.
+        cache.charged = 1010;
+        for round in 0..8 {
+            for n in 0..36 {
+                let id = hot[n as usize];
+                if matches!(cache.records[&id].list, Some(List::Recent | List::Frequent))
+                    && !cache.pending(id) { cache.hit(id); }
+                else { let _ = cache.miss(key(n), site(Preference::Capture), None, false); }
+            }
+            cache.measured_capture(0);
+            let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy)
+                .map(|(&id, _)| id).collect();
+            cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
+            assert_eq!(cache.counters[&Cycle::Decode].evictions, 0, "hot round {round}");
+            assert_eq!(cache.charged, 1010, "destroy must not credit physical release");
+        }
+        assert!(matches!(cache.miss(key(36), site(Preference::Capture), None, false), Miss::Capture(_)),
+            "the old physical peak must not permanently block new captures");
+    }
+
+    #[test]
+    fn thirty_six_percent_measured_live_set_does_not_evict() {
+        let mut cache = DeviceCache::new(-997, 1000);
+        for n in 0..36 { capture(&mut cache, n, false); }
+        cache.charged = 1010;
+        cache.measured_capture(0);
+        assert_eq!(cache.pending_destroy, 0, "36% live is not over reserve");
+    }
+
+    #[test]
+    fn estimate_only_records_do_not_count_as_measured_live_bytes() {
+        let mut cache = DeviceCache::new(-998, 1000);
+        let Miss::Capture(id) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
+        cache.measured_capture(0);
+        assert_eq!(cache.records[&id].bytes, 0);
+        assert_eq!(cache.charged, 0);
+    }
+
+    #[test]
     fn rejected_small_graph_trace_has_no_executable_or_permanent_bytes() {
         for basis in [Basis::Bytes, Basis::Nodes { node_rate: 2560, graph_rate: 65536 }] {
             for nodes in 0..=2 {
