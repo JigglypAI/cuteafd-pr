@@ -116,22 +116,52 @@ pub(crate) fn spark_checkpoint(checkpoint: &crate::plan::Checkpoint, catalog: &c
     Ok(Some(full))
 }
 
+/// The Spark expert ingress, decided from the checkpoint's own tensors: the
+/// exact NVFP4 wire ([`cuteafd_core::SparkIngress::Nvfp4`]) when every routed
+/// layer's experts share one gate/up `input_global_scale` (MiniMax M3.1 Flash:
+/// all 1.0) and the installed coordinator manifest carries the wire quantizer;
+/// BF16 otherwise. Per-layer raw scales are returned for the quantizer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SparkIngressPlan {
+    pub ingress: cuteafd_core::SparkIngress,
+    /// Raw FP32 shared input scale per decoder layer (`None`: dense layer or BF16 ingress).
+    pub scales: Vec<Option<f32>>,
+}
+
+pub fn spark_ingress(catalog: &crate::OfficialV41Catalog, cfg: &MiniMaxM3Config, routed: &[usize],
+    manifest: &serde_json::Value) -> anyhow::Result<SparkIngressPlan> {
+    let bf16 = SparkIngressPlan { ingress: cuteafd_core::SparkIngress::Bf16, scales: vec![None; cfg.layers] };
+    let quantizer = manifest["programs"].as_array().is_some_and(|programs| programs.iter()
+        .any(|entry| entry["name"] == cuteafd_ffi::minimax_m3::wire::NAME));
+    if !quantizer || routed.is_empty() { return Ok(bf16); }
+    let tensors = catalog.fp8().context("MiniMax Spark ingress requires native expert headers")?;
+    let mut scales = vec![None; cfg.layers];
+    for &layer in routed {
+        match tensors.for_layer_metadata(layer)?.uniform_input_scale(layer)? {
+            Some(scale) => scales[layer] = Some(scale),
+            None => return Ok(bf16),
+        }
+    }
+    Ok(SparkIngressPlan { ingress: cuteafd_core::SparkIngress::Nvfp4, scales })
+}
+
 /// Spark charges per onboarding count and rank: header-exact native NVFP4
 /// slices, endpoint I/O, typed execution owners (installed TP scratch census)
 /// and the shared worker runtime residual.
 pub fn spark_charges(checkpoint: &crate::plan::Checkpoint, catalog: &crate::OfficialV41Catalog, routed: &[usize],
-    ranks: usize, prefill: PrefillShape) -> anyhow::Result<Vec<Vec<SparkCharge>>> {
-    spark_charges_for_rows(checkpoint,catalog,routed,ranks,prefill,64)
+    ranks: usize, prefill: PrefillShape, ingress: cuteafd_core::SparkIngress) -> anyhow::Result<Vec<Vec<SparkCharge>>> {
+    spark_charges_for_rows(checkpoint, catalog, routed, ranks, prefill, 64, ingress)
 }
 
 pub fn spark_charges_for_rows(checkpoint:&crate::plan::Checkpoint,catalog:&crate::OfficialV41Catalog,routed:&[usize],
-    ranks:usize,prefill:PrefillShape,decode_rows:u32) -> anyhow::Result<Vec<Vec<SparkCharge>>> {
+    ranks:usize,prefill:PrefillShape,decode_rows:u32, ingress: cuteafd_core::SparkIngress)
+    -> anyhow::Result<Vec<Vec<SparkCharge>>> {
     if ranks == 0 { return Ok(vec![Vec::new(); routed.len() + 1]); }
     let canonical = spark_checkpoint(checkpoint, catalog, routed)?;
     let recipe = crate::plan::experts::checkpoint_spark_recipe(canonical.as_ref().unwrap_or(checkpoint), ranks, routed)?;
     let executions = shared::spark_executions_for_rows(prefill,decode_rows)?;
     let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: u32::try_from(prefill.rows)?,
-        ingress: cuteafd_core::SparkIngress::Bf16, partial_reply_bytes: None };
+        ingress, partial_reply_bytes: None };
     let rings = crate::plan::layout::spark_ring_geometry(shared::LANES as usize);
     let rings = cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
         slot_bytes: rings.slot_bytes, alignment: rings.alignment };
@@ -158,7 +188,8 @@ pub fn spark_charges_for_rows(checkpoint:&crate::plan::Checkpoint,catalog:&crate
             if count == routed.len() { return Ok(SparkCharge { experts: 0, owners: 0, runtime: 0 }); }
             let io = working.rank_endpoints_io(rank, geometry, &[endpoint], rings)?;
             let width = u32::try_from(*widths.get(rank).context("Spark recipe stored width")?)?;
-            let bytes = |extent| crate::plan::layout::spark_slots::nvfp4_owner_bytes("minimax_m3", geometry, width, extent);
+            let bytes = |extent| crate::plan::layout::spark_slots::nvfp4_owner_bytes_for("minimax_m3", geometry, width, extent,
+                ingress == cuteafd_core::SparkIngress::Nvfp4);
             let owners = executions.workspace_bytes(bytes)?.and_then(|bytes| bytes.total())
                 .context("MiniMax Spark owner sum overflow")?;
             let owners = [io.intake, io.host_exchange, io.row_indices, io.mapped_rings, io.endpoint_staging, owners]
@@ -316,15 +347,18 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
     }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(
         format!("MiniMax push host inventory refused: {error:#}"), "Provide complete native push source headers."))?;
     let local = local_package(request.catalog, request.manifest_path, capacity, gpus);
+    let ingress = spark_ingress(request.catalog, cfg, &routed, &request.manifest)
+        .map_err(|error| refused(format!("MiniMax Spark ingress inventory refused: {error:#}"),
+            "Provide every routed expert's input_global_scale header and value."))?;
     let decode_rows=match &request.drafter {
         Some(draft) => u32::try_from(draft.verify_rows).map_err(|_| refused("MiniMax verify rows overflow","Use supported concurrency/draft width."))?,
         None => shared::spark_verify_rows(request.sequences,0).map_err(|error| refused(error.to_string(),"Use supported concurrency."))?,
     };
-    let spark = spark_charges_for_rows(request.checkpoint, request.catalog, &routed, ranks, shape,decode_rows)
+    let spark = spark_charges_for_rows(request.checkpoint, request.catalog, &routed, ranks, shape,decode_rows, ingress.ingress)
         .map_err(|error| refused(format!("MiniMax Spark inventory refused: {error:#}"),
             format!("Use a Spark world with a minimax:nvfp4 package ({:?}).",
                 crate::plan::experts::spark_worlds("minimax:nvfp4a4", cfg.moe_intermediate))))?;
-    let links = shared::spark_link(0, ranks, shape, request.replies)
+    let links = shared::spark_link(0, ranks, shape, request.replies, ingress.ingress)
         .map_err(|error| refused(format!("MiniMax Spark transport owners refused: {error}"), "Use a supported unit."))?;
     let programs = crate::placement::ProgramSet::from_manifest(&request.manifest, &["minimax", "exlr8"]);
     let mut code = Vec::new();
@@ -373,6 +407,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
         maximum_pool_tokens, prefill: shape, sequences: request.sequences, targets, owners,
         manifest: request.manifest.clone(), routed: routed.clone(), expert_backings, local, spark, links,
+        spark_ingress: ingress,
         spark_reply_formats: request.replies, drafter: request.drafter.as_ref().map(|native| shared::Drafter {
             arena:native.weights.clone(),native:native.clone(),scratch:Vec::new(),state_per_page:0 }),
         vision: None, budgets, code, measured_context, graph_reserve,

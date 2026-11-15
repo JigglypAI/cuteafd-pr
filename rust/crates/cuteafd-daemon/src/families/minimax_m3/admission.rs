@@ -408,7 +408,7 @@ mod tests {
         assert_eq!(added, (0..4).map(|rank| (format!("spark.intake.rank.{rank}.storage.tail"),
             (2 << 20) - 4096)).collect::<Vec<_>>());
         let serving_links = cuteafd_loader::placement::families::minimax_m3::spark_link(0, 4,
-            PrefillShape { rows: 1024, waves: 3 }, Default::default())?;
+            PrefillShape { rows: 1024, waves: 3 }, Default::default(), cuteafd_core::SparkIngress::Bf16)?;
         let mut serving = serving_links[0].components(maximum)?;
         fixed_request_tails(&mut serving, maximum, &[])?;
         for rank in 0..4 {

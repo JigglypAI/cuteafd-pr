@@ -99,7 +99,7 @@ fn validate_canonical_body(
     ensure!(
         header.hidden_dim == cuteafd_core::expert_geometry().hidden
             && matches!(header.hidden_dtype,
-                ExpertV2Dtype::Bf16 | ExpertV2Dtype::Fp8E4m3Ue8m0K32)
+                ExpertV2Dtype::Bf16 | ExpertV2Dtype::Fp8E4m3Ue8m0K32 | ExpertV2Dtype::Nvfp4E2m1E4m3K16Amax)
             && header.hidden_row_stride_bytes as usize
                 == header
                     .hidden_dtype
@@ -790,6 +790,33 @@ mod tests {
         assert_eq!(dtype.row_bytes(5120).unwrap(), 5280);
         for width in [0, 31, 33, usize::MAX, usize::MAX - 31] {
             assert!(dtype.row_bytes(width).is_err());
+        }
+    }
+
+    /// Exact NVFP4 W4A4 rows (`SparkIngress::Nvfp4`) cross the wire and pass
+    /// the worker's canonical backbone validation unchanged.
+    #[test]
+    fn nvfp4_wire_roundtrip_preserves_rows_and_reaches_the_worker() {
+        let stride = cuteafd_core::nvfp4_wire_row_bytes(5120);
+        assert_eq!(stride, 5120 / 2 + 5120 / 16 + 16);
+        for rows in [1, 16, 80] {
+            let base = request(rows);
+            let payload = (0..rows as usize * stride).map(|i| (i * 31 % 251) as u8).collect::<Vec<_>>();
+            let mut input = ExpertProtocolV2Request::new(base.header.request_id, base.header.placement_version,
+                base.header.layer_id, 5120, ExpertV2Dtype::Nvfp4E2m1E4m3K16Amax, base.rows, base.routes,
+                payload.clone()).unwrap();
+            input.header.flags = base.header.flags;
+            let frame = input.with_debug_checksum().encode().unwrap();
+            let owned = ExpertProtocolV2Request::decode(&frame).unwrap();
+            assert_eq!(owned.header.hidden_dtype, ExpertV2Dtype::Nvfp4E2m1E4m3K16Amax);
+            assert_eq!(owned.header.hidden_row_stride_bytes as usize, stride);
+            let native = BackboneRequest::parse(&frame, rows).unwrap();
+            assert!(native.require_input_dtype(1).is_err() && native.require_input_dtype(7).is_err());
+            native.require_input_dtype(8).unwrap();
+            assert_eq!(native.hidden(), payload);
+        }
+        for width in [0, 16, 5121] {
+            assert!(ExpertV2Dtype::Nvfp4E2m1E4m3K16Amax.row_bytes(width).is_err());
         }
     }
 

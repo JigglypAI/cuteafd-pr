@@ -383,6 +383,17 @@ def minimax_forward_programs(prefill_rows: int):
     return result
 
 
+def minimax_wire_programs(prefill_rows: int):
+    """The exact NVFP4 expert-input wire quantizer (Spark ``SparkIngress::Nvfp4``): the
+    calibrated W4A4 row quantizer of the Spark's ``fp8-minimax-nvfp4a4`` package, run once
+    per token on the coordinator with the layer's one shared ``input_global_scale``."""
+    from functools import partial
+    from b12x.integration.cuteafd.nvfp4_wire import compile_nvfp4_wire_rows_aot
+
+    params = dict(hidden=6144, max_rows=prefill_rows, mode="calibrated", scale_convention="divisor")
+    return [("nvfp4_wire_rows", "nvfp4_wire_rows", params, partial(compile_nvfp4_wire_rows_aot, **params))]
+
+
 def inkling2_attention_programs(decode_rows: int, prefill_rows: int):
     """Inkling 2 Small biased-sink GQA attention: local (window 1024 ring) and global (paged) layers."""
     from functools import partial
@@ -1942,6 +1953,7 @@ def main() -> None:
             args.decode_rows, args.prefill_rows, args.max_context)]
         work += [("minimax", *item) for item in minimax_producer_programs(args.prefill_rows)]
         work += [("minimax", *item) for item in minimax_forward_programs(args.prefill_rows)]
+        work += [("minimax", *item) for item in minimax_wire_programs(args.prefill_rows)]
     if "inkling2" in geometries:
         from b12x.integration.cuteafd import INKLING2_SMALL
         manifest["families"]["inkling2"] = dataclasses.asdict(INKLING2_SMALL)

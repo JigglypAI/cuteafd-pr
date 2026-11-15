@@ -76,6 +76,28 @@ pub enum SparkIngress {
     Native,
     /// Decode rows are unquantized; prefill uses FP8 K32 on the same QP.
     Bf16Decode { rows: u32 },
+    /// NVFP4 W4A4 experts whose activation quantization is the same for every
+    /// expert of a layer (one shared static input scale, or per-token dynamic
+    /// amax): the coordinator sends each token's exact W4A4 activation once
+    /// ([`nvfp4_wire_row_bytes`]), the Spark skips its own quantize step.
+    Nvfp4,
+}
+
+/// One pre-quantized NVFP4 activation row: packed E2M1 (`H/2`), E4M3 block
+/// scales per 16 (`H/16`), the F32 row amax (0 for calibrated scales) and 12
+/// zero bytes, so rows stay 16-byte aligned. Bit-identical to the chunk rows
+/// a BF16-input W4A4 program quantizes on the Spark.
+pub const fn nvfp4_wire_row_bytes(hidden: usize) -> usize { hidden / 2 + hidden / 16 + 16 }
+
+impl SparkIngress {
+    /// The widest request row this ingress admits, in bytes.
+    pub const fn request_row_bytes(self, hidden: usize) -> usize {
+        match self {
+            Self::Bf16 | Self::Native => hidden * 2,
+            Self::Fp8K32 | Self::Bf16Decode { .. } => hidden + hidden / 32,
+            Self::Nvfp4 => nvfp4_wire_row_bytes(hidden),
+        }
+    }
 }
 
 /// Header-derived resident slice. EXL3 counts retain gate/up/down tier geometry.
@@ -235,8 +257,8 @@ impl SparkEndpoint {
 
     pub fn wire_bytes(self, geometry: ExpertGeometry) -> Option<(usize, usize)> {
         if !(1..=4096).contains(&self.capacity) { return None; }
-        let (request, response) = geometry.compact_wire_bytes(self.capacity,
-            matches!(self.ingress, SparkIngress::Bf16 | SparkIngress::Native))?;
+        let (request, response) = geometry.compact_wire_bytes_for(self.capacity,
+            self.ingress.request_row_bytes(geometry.hidden as usize))?;
         let request = match self.ingress {
             SparkIngress::Bf16Decode { rows } => {
                 if rows == 0 || rows > self.capacity { return None; }
@@ -327,11 +349,17 @@ impl ExpertGeometry {
 
     /// FP8 K32 request and row-indexed compact BF16 response frame upper bounds.
     pub fn compact_wire_bytes(&self, capacity: u32, bf16: bool) -> Option<(usize, usize)> {
+        let hidden = self.hidden as usize;
+        self.compact_wire_bytes_for(capacity, if bf16 { hidden * 2 } else { hidden + hidden / 32 })
+    }
+
+    /// Request and compact BF16 response frame bounds for `row_bytes`-wide input rows.
+    pub fn compact_wire_bytes_for(&self, capacity: u32, row_bytes: usize) -> Option<(usize, usize)> {
         let rows = capacity as usize;
         let hidden = self.hidden as usize;
         let prefix = expert_request_payload_offset(96, rows.checked_mul(40)?,
             rows.checked_mul(self.topk as usize)?.checked_mul(12)?)?;
-        let request = prefix.checked_add(rows.checked_mul(if bf16 { hidden * 2 } else { hidden + hidden / 32 })?)?;
+        let request = prefix.checked_add(rows.checked_mul(row_bytes)?)?;
         let response = rows.checked_mul(4 + hidden * 2)?.checked_add(96)?;
         Some((request, response))
     }
@@ -353,7 +381,15 @@ impl ExpertGeometry {
     /// Persistent request/response mapped rings, shared by admission and planning.
     pub fn compact_ring_bytes(&self, capacity: u32, max_frame: usize, depth: usize,
         slot: usize, alignment: usize, endpoints: usize, bf16: bool) -> Option<usize> {
-        let (request, response) = self.compact_wire_bytes(capacity, bf16)?;
+        let hidden = self.hidden as usize;
+        self.compact_ring_bytes_for(capacity, max_frame, depth, slot, alignment, endpoints,
+            if bf16 { hidden * 2 } else { hidden + hidden / 32 })
+    }
+
+    /// [`Self::compact_ring_bytes`] for `row_bytes`-wide request rows.
+    pub fn compact_ring_bytes_for(&self, capacity: u32, max_frame: usize, depth: usize,
+        slot: usize, alignment: usize, endpoints: usize, row_bytes: usize) -> Option<usize> {
+        let (request, response) = self.compact_wire_bytes_for(capacity, row_bytes)?;
         self.ring_bytes_for_wire(request, response, SparkRings {
             max_frame_bytes: max_frame, depth, slot_bytes: slot, alignment }, endpoints)
     }
@@ -726,5 +762,25 @@ mod tests {
         assert_eq!(muse.activation(), crate::FfnActivation::SiluBf16Product { limit: None });
         // Rows on the wire are the 4096-wide pre-expert stream, not the 8192 residual.
         assert_eq!(muse.row_bytes(), 8192);
+    }
+
+    #[test]
+    fn nvfp4_ingress_sizes_exact_wire_rows_everywhere() {
+        use super::*;
+        assert_eq!(nvfp4_wire_row_bytes(6144), 3472);
+        assert_eq!(nvfp4_wire_row_bytes(4608), 2608);
+        assert_eq!(SparkIngress::Nvfp4.request_row_bytes(6144) % 16, 0);
+        let geometry = ExpertGeometry::MINIMAX_M3;
+        let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 3, slot_bytes: 1, alignment: 4096 };
+        for capacity in [1, 16, 1024, 4096] {
+            let at = |ingress| SparkEndpoint { capacity, ingress, ring_depth: None, partial_reply_bytes: None };
+            let (bf16, response) = at(SparkIngress::Bf16).wire_bytes(geometry).unwrap();
+            let (nvfp4, same) = at(SparkIngress::Nvfp4).wire_bytes(geometry).unwrap();
+            assert_eq!(response, same, "replies keep their format");
+            assert_eq!(bf16 - nvfp4, capacity as usize * (12288 - 3472));
+            assert_eq!(geometry.compact_wire_bytes_for(capacity, 3472).unwrap().0, nvfp4);
+            assert!(at(SparkIngress::Nvfp4).ring_bytes(geometry, rings).unwrap()
+                <= at(SparkIngress::Bf16).ring_bytes(geometry, rings).unwrap());
+        }
     }
 }

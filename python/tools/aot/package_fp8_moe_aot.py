@@ -29,7 +29,8 @@ Library ABI (``native/shared/include/cuteafd_fp8_moe.h``)::
         Activation: 1 pre-SiLU clamp/BF16 intermediate, 2 post-SiLU clamp/FP32
         product. Projection: 1 BF16 gate/up and down. All bytes are mandatory.
         [1] hidden, [2] slice, [3] experts, [4] top-k,
-        [5] intermediate, [6] tp, [7] input dtype (7 = FP8 K32 wire rows, 1 = BF16 rows),
+        [5] intermediate, [6] tp, [7] input dtype (7 = FP8 K32 wire rows, 1 = BF16 rows,
+        8 = pre-quantized NVFP4 rows: E2M1 [H/2], E4M3 [H/16], F32 amax, 12 zero bytes),
         [8] SwiGLU limit (FP32 bits, 0 = none), [9] capacities n, [10..16) capacities
         [16] alpha (FP32 bits), [17] beta (FP32 bits); neutral 1/0 for SiLU.
     int32_t cuteafd_fp8moe_scratch_bytes(uint32_t capacity, uint64_t* bytes);
@@ -91,6 +92,11 @@ def input_kind(role: str, weights: str, requested: str | None = None) -> str:
         if requested not in (None, "wire"):
             raise ValueError("MXFP8 W8A8 requires FP8 K32 wire input")
         return "wire"
+    if requested == "nvfp4" and weights != "nvfp4":
+        raise ValueError("exact NVFP4 input requires NVFP4 W4A4 weights")
+    if weights == "nvfp4" and requested == "nvfp4":
+        # Exact pre-quantized W4A4 rows (the coordinator ran the same quantizer).
+        return "nvfp4"
     if weights in ("nvfp4", "bf16"):
         if requested not in (None, "bf16"):
             raise ValueError(f"{weights.upper()} requires BF16 input; FP8 K32 wire loses checkpoint numerics")
@@ -551,7 +557,9 @@ def static_scale_metadata(g) -> dict:
             if g.weights == "nvfp4" and not getattr(g, "dynamic_nvfp4", False) else {})
 
 
-def info_words(g, capacities: list[int], wire: bool) -> list[int]:
+def info_words(g, capacities: list[int], wire: bool, nvfp4_input: bool = False) -> list[int]:
+    if nvfp4_input and (wire or g.kind not in ("nvfp4a4", "nvfp4dyn")):
+        raise ValueError("pre-quantized NVFP4 input requires NVFP4 W4A4 weights")
     limit = struct.unpack("<I", struct.pack("<f", float(g.swiglu_limit)))[0]
     import math
 
@@ -572,7 +580,8 @@ def info_words(g, capacities: list[int], wire: bool) -> list[int]:
         raise ValueError("invalid NVFP4 checkpoint scale convention")
     storage = 8 if convention == "divisor" else STORAGE[g.kind]
     contract = ABI_VERSION | storage << 8 | ACTIVATION[g.activation] << 16 | PROJECTION[g.projection] << 24
-    words = [contract, g.hidden, g.slice, g.experts, g.top_k, g.intermediate, g.tp, 7 if wire else 1, limit,
+    words = [contract, g.hidden, g.slice, g.experts, g.top_k, g.intermediate, g.tp,
+             8 if nvfp4_input else 7 if wire else 1, limit,
              len(capacities), *capacities]
     if len(words) > 16:
         raise ValueError("at most 6 capacities per package")
@@ -628,7 +637,10 @@ def build(args: argparse.Namespace) -> None:
             if f"tp{tp}" in layouts and base.intermediate // 128 % tp:
                 layouts += [f"tp{tp}-w{width}" for width in sorted(set(exact_widths(base.intermediate, tp, 32)), reverse=True)
                             if f"tp{tp}-w{width}" not in layouts]
-    wire = input_kind(args.role, base.weights, args.input) == "wire"
+    kind = input_kind(args.role, base.weights, args.input)
+    wire, nvfp4_input = kind == "wire", kind == "nvfp4"
+    # Exact NVFP4 wire input (fp8_moe ``input_kind``); None keeps the legacy wire bool.
+    fork_kind = "nvfp4" if nvfp4_input else None
     if args.output.exists():
         raise SystemExit(f"{args.output} exists; remove it or choose another --output")
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -642,7 +654,7 @@ def build(args: argparse.Namespace) -> None:
             tp, g = layout_geometry(base, layout)
             # TP is inspection metadata; kernels, routes and scratch use slice.
             # Preserve a distinct bridge (and its TP info word) per destination.
-            compile_key = (g.slice, g.kind, wire, tuple(capacities), g.hidden, g.experts, g.top_k,
+            compile_key = (g.slice, g.kind, wire, *(("nvfp4",) if nvfp4_input else ()), tuple(capacities), g.hidden, g.experts, g.top_k,
                            g.activation, g.projection, g.swiglu_limit, getattr(g, "scale_convention", "multiplier"),
                            *activation_params(g.activation, g.weights, getattr(g, "swiglu_alpha", None),
                                               getattr(g, "swiglu_beta", None), g.swiglu_limit), ABI_VERSION,
@@ -669,14 +681,17 @@ def build(args: argparse.Namespace) -> None:
                         f"{'' if form == 'auto' else '_' + form}{'_segments' if segmented else ''}{'_core' if core_only else ''}")
                 with exportable_compilation():
                     program = compile_fp8_moe_aot(g, route="stream" if segmented else "auto",
-                                                  max_rows=capacity, wire=wire, prefill=form, row_addresses=segmented, core_only=core_only)
+                                                  max_rows=capacity, wire=wire, prefill=form, row_addresses=segmented, core_only=core_only,
+                                                  **({"input_kind": fork_kind} if fork_kind else {}))
                 program.export_to_c(str(raw), stem, "cuteafd_" + stem)
                 checked = validate_exported_header(program, raw / f"{stem}.h", "cuteafd_" + stem)
                 if checked["argument_count"] != POINTERS + 2:
                     raise ValueError(f"{stem}: unexpected ABI arity {checked['argument_count']}")
                 programs.append({"stem": stem, "capacity": capacity, "entry": checked["symbol"], "form": form,
-                                 "scratch": (fp8_moe_segment_scratch_bytes(g, capacity, capacity, form, wire=wire) if segmented
-                                             else fp8_moe_scratch_bytes(g, "auto", capacity, wire, form)),
+                                 "scratch": (fp8_moe_segment_scratch_bytes(g, capacity, capacity, form, wire=wire,
+                                                                         **({"input_kind": fork_kind} if fork_kind else {})) if segmented
+                                             else fp8_moe_scratch_bytes(g, "auto", capacity, wire, form,
+                                                                       **({"input_kind": fork_kind} if fork_kind else {}))),
                                  "segmented": segmented, "core_only": core_only,
                                  "minimum_rows": auto_large_rows(wire, g.kind, form) + 1 if segmented else 0,
                                  "act_row_bytes": ((g.slice + g.slice // 32 + 15) // 16 * 16
@@ -690,7 +705,8 @@ def build(args: argparse.Namespace) -> None:
                             [v["end_rows"] for v in program.geometry["arithmetic_routes"]])
                     for end in ends:
                         reply_layout = fp8_moe_reply_layout(g, route="stream" if segmented else "auto",
-                            rows=end, max_rows=capacity, wire=wire, prefill=form, row_addresses=segmented)
+                            rows=end, max_rows=capacity, wire=wire, prefill=form, row_addresses=segmented,
+                            **({"input_kind": fork_kind} if fork_kind else {}))
                         # pair_row is the first region following the metadata reservation.
                         pair_rows = (end * g.top_k if reply_layout["route"] in ("decode", "stream") else
                                      64 * ((end * g.top_k + 63) // 64 + min(g.experts, end * g.top_k)))
@@ -704,7 +720,7 @@ def build(args: argparse.Namespace) -> None:
             else:
                 object_root = raw
                 compiled_widths[compile_key] = (programs, raw)
-            (raw / "fp8moe_bridge.cc").write_text(bridge_source(programs, info_words(g, capacities, wire)))
+            (raw / "fp8moe_bridge.cc").write_text(bridge_source(programs, info_words(g, capacities, wire, nvfp4_input)))
             target = stage / layout / LIBRARY
             target.parent.mkdir(parents=True)
             subprocess.run([args.cxx, "-shared", "-fPIC", "-std=c++17", f"-I{args.cuda_include}", f"-I{object_root}",
@@ -713,7 +729,7 @@ def build(args: argparse.Namespace) -> None:
                             "-Wl,-z,defs", "-o", str(target)], check=True)
             manifest["layouts"][layout] = {
                 "tp": tp, "hidden": g.hidden, "slice": g.slice, "experts": g.experts, "top_k": g.top_k,
-                "intermediate": g.intermediate, "swiglu_limit": g.swiglu_limit, "input": "wire" if wire else "bf16",
+                "intermediate": g.intermediate, "swiglu_limit": g.swiglu_limit, "input": kind,
                 "weights": g.weights, "activation": g.activation, "projection": g.projection, "abi_version": ABI_VERSION,
                 **static_scale_metadata(g),
                 **dict(zip(("swiglu_alpha", "swiglu_beta"), activation_params(g.activation, g.weights,
@@ -768,8 +784,10 @@ def verify(package: Path, *, revision: str | None = None, role: str | None = Non
             raise ValueError(f"{package}/{name}: MXFP4 supports only the pre-SiLU activation contract")
         if info.get("weights") == "mxfp8" and info.get("input") != "wire":
             raise ValueError(f"{package}/{name}: MXFP8 W8A8 requires FP8 K32 wire input")
-        if info.get("weights") in ("nvfp4", "bf16") and info.get("input") != "bf16":
-            raise ValueError(f"{package}/{name}: {info['weights'].upper()} requires BF16 input")
+        if info.get("weights") == "bf16" and info.get("input") != "bf16":
+            raise ValueError(f"{package}/{name}: BF16 requires BF16 input")
+        if info.get("weights") == "nvfp4" and info.get("input") not in ("bf16", "nvfp4"):
+            raise ValueError(f"{package}/{name}: NVFP4 requires BF16 or exact pre-quantized NVFP4 input")
         if input_kind is not None and info.get("input") != input_kind:
             raise ValueError(f"{package}/{name}: input {info.get('input')} differs from {input_kind}")
         if min_capacity is not None and not any(c["capacity"] >= min_capacity for c in info["capacities"]):
@@ -805,8 +823,9 @@ def main() -> None:
     create.add_argument("--exact-slices", action="store_true",
                         help="also build tp<n>-w<width> layouts: ranks own whole 128-row blocks, each stored at its "
                         "own width (no zero padding; the worker prefers them when every width is present)")
-    create.add_argument("--input", choices=("wire", "bf16"),
-                        help="expert input rows (NVFP4: bf16; otherwise wire for spark, bf16 for coordinator)")
+    create.add_argument("--input", choices=("wire", "bf16", "nvfp4"),
+                        help="expert input rows (NVFP4: bf16, or nvfp4 for the exact pre-quantized wire; "
+                        "otherwise wire for spark, bf16 for coordinator)")
     create.add_argument("--cross-sm121", action="store_true", help="build a Spark package on an SM120 host")
     create.add_argument("--build-dir", type=Path, required=True)
     create.add_argument("--output", type=Path, required=True)
@@ -818,7 +837,7 @@ def main() -> None:
     check.add_argument("--package", type=Path, required=True)
     check.add_argument("--sparkinfer-revision")
     check.add_argument("--role", choices=("coordinator", "spark", "expert"))
-    check.add_argument("--input", choices=("wire", "bf16"))
+    check.add_argument("--input", choices=("wire", "bf16", "nvfp4"))
     check.add_argument("--layout")
     check.add_argument("--min-capacity", type=int)
     args = parser.parse_args()

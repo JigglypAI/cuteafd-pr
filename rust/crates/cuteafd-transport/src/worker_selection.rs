@@ -974,6 +974,7 @@ fn validate_endpoint_shape(selection: &WorkerSelection, index: usize,
             ExpertV2Dtype::Bf16 | ExpertV2Dtype::Fp8E4m3Ue8m0K32),
         SparkIngress::Bf16Decode { rows } => header.hidden_dtype == ExpertV2Dtype::Fp8E4m3Ue8m0K32
             || (header.hidden_dtype == ExpertV2Dtype::Bf16 && header.row_count <= rows),
+        SparkIngress::Nvfp4 => header.hidden_dtype == ExpertV2Dtype::Nvfp4E2m1E4m3K16Amax,
     };
     ensure!(ingress, "endpoint {} rejects {:?} ingress at {} rows", index, header.hidden_dtype, header.row_count);
     let geometry = selection.geometry();

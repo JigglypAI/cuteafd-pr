@@ -812,3 +812,34 @@ def test_dynamic_nvfp4_manifest_omits_static_scale_convention():
     assert package_tool.static_scale_metadata(g) == {}
     # Build's manifest serialization must use the same tested helper.
     assert "**static_scale_metadata(g)," in TOOL.read_text()
+
+
+def test_exact_nvfp4_wire_input_package_contract(tmp_path):
+    """The NVFP4-wire sibling (`--input nvfp4`) keeps the W4A4 package's words except input dtype 8,
+    and only NVFP4 W4A4 weights accept it; manifests verify only with bf16 or nvfp4 input."""
+    from types import SimpleNamespace
+    g = SimpleNamespace(kind="nvfp4a4", weights="nvfp4", activation="swigluoai", projection="bf16",
+                        swiglu_limit=7.0, swiglu_alpha=1.702, swiglu_beta=1.0, scale_convention="divisor",
+                        hidden=6144, slice=1024, experts=128, top_k=4, intermediate=3072, tp=3)
+    bf16 = package_tool.info_words(g, [1, 16, 80, 256, 1024, 4096], False)
+    wire = package_tool.info_words(g, [1, 16, 80, 256, 1024, 4096], False, True)
+    assert wire[7] == 8 and bf16[7] == 1
+    assert wire[:7] + wire[8:] == bf16[:7] + bf16[8:]
+    assert package_tool.input_kind("spark", "nvfp4", "nvfp4") == "nvfp4"
+    assert package_tool.input_kind("spark", "nvfp4") == "bf16"
+    with pytest.raises(ValueError, match="NVFP4 W4A4"):
+        package_tool.info_words(SimpleNamespace(**{**vars(g), "kind": "fp8", "weights": "fp8"}), [16], False, True)
+    with pytest.raises(ValueError, match="NVFP4 W4A4"):
+        package_tool.info_words(g, [16], True, True)
+    with pytest.raises(ValueError, match="NVFP4 W4A4"):
+        package_tool.input_kind("spark", "fp8", "nvfp4")
+    path = write_package(tmp_path / "package", weights="nvfp4")
+    manifest = json.loads((path / "manifest.json").read_text())
+    for value, ok in [("nvfp4", True), ("bf16", True), ("wire", False)]:
+        manifest["layouts"]["tp4"]["input"] = value
+        (path / "manifest.json").write_text(json.dumps(manifest))
+        if ok:
+            package_tool.verify(path, input_kind=value)
+        else:
+            with pytest.raises(ValueError, match="NVFP4 requires"):
+                package_tool.verify(path)

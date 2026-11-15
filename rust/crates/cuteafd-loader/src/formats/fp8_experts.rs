@@ -864,6 +864,32 @@ impl Fp8ExpertTensors {
         Ok(())
     }
 
+    /// The layer's one shared W4A4 activation scale, when the checkpoint's own
+    /// tensors prove the activation quantization is expert-independent: every
+    /// routed expert's gate and up `input_scale` (compressed-tensors
+    /// `input_global_scale`) carries the same FP32 bits. `None` when any two
+    /// differ (one wire row then cannot serve every expert: keep BF16 ingress)
+    /// or the layer is not NVFP4. The down scale stays Spark-internal (the
+    /// SwiGLU activation is quantized there) and may vary.
+    pub fn uniform_input_scale(&self, layer: usize) -> Result<Option<f32>> {
+        if self.format != ExpertFormat::Nvfp4 { return Ok(None); }
+        let mut shared = None;
+        for expert in 0..self.shape.experts {
+            for projection in [Fp8Projection::Gate, Fp8Projection::Up] {
+                let name = self.activation_scale_name(&self.name(layer, expert, projection));
+                let bytes = self.read_scalar_bytes(&name)?;
+                match shared {
+                    None => shared = Some(bytes),
+                    Some(first) if first != bytes => return Ok(None),
+                    Some(_) => {}
+                }
+            }
+        }
+        let bytes = shared.context("NVFP4 layer has no routed experts")?;
+        self.nvfp4_scale_convention().validate(f32::from_le_bytes(bytes)).map(Some)
+            .with_context(|| format!("layer {layer} shared input scale"))
+    }
+
     fn read_scalar(&self, name: &str) -> Result<f32> {
         if self.format != ExpertFormat::Nvfp4 {
             return Ok(1.0);
@@ -1494,6 +1520,56 @@ mod tests {
                 file.write_all_at(&scales(expert, projection).to_le_bytes(), at).unwrap();
             }
         }
+    }
+
+    /// The exact NVFP4 wire is admitted only from the checkpoint's own scalars:
+    /// every expert's gate and up input scale must carry identical FP32 bits.
+    #[test]
+    fn uniform_input_scale_requires_identical_gate_up_bits_across_experts() {
+        use crate::plan::testing::{t, write_snapshot};
+        let dir = tempfile::tempdir().unwrap();
+        let mut headers = Vec::new();
+        for expert in 0..3 {
+            for stem in ["w1", "w3", "w2"] {
+                let name = format!("language_model.model.layers.0.block_sparse_moe.experts.{expert}.{stem}");
+                headers.extend([t(format!("{name}.weight_packed"), "U8", &[128, 64]),
+                    t(format!("{name}.weight_scale"), "F8_E4M3", &[128, 8]),
+                    t(format!("{name}.weight_global_scale"), "F32", &[]),
+                    t(format!("{name}.input_global_scale"), "F32", &[])]);
+            }
+        }
+        let config = serde_json::json!({"quantization_config":{
+            "quant_method":"mxfp8", "activation_scheme":"dynamic", "weight_block_size":[1,32],
+            "moe_quant_algo":"NVFP4", "moe_quant_format":"nvfp4-pack-quantized", "group_size":16}});
+        write_snapshot(dir.path(), &config, &headers, None);
+        let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 3, topk: 1,
+            hidden: 128, intermediate: 128, draft_stages: 0, draft_experts: 0 };
+        let tensors = Fp8ExpertTensors::read(dir.path(), shape).unwrap();
+        let write = |expert: usize, projection: Fp8Projection, value: f32| {
+            let name = tensors.activation_scale_name(&tensors.name(0, expert, projection));
+            let loc = tensors.located(&name).unwrap();
+            std::fs::File::options().write(true).open(dir.path().join(&loc.shard)).unwrap()
+                .write_all_at(&value.to_le_bytes(), loc.offset).unwrap();
+        };
+        for expert in 0..3 {
+            for projection in Fp8Projection::ALL { write(expert, projection, 1.0); }
+        }
+        // The down scale is Spark-internal: varying it keeps the wire exact.
+        write(1, Fp8Projection::Down, 0.25);
+        assert_eq!(tensors.uniform_input_scale(0).unwrap(), Some(1.0));
+        write(2, Fp8Projection::Up, f32::from_bits(1.0f32.to_bits() + 1));
+        assert_eq!(tensors.uniform_input_scale(0).unwrap(), None, "one ulp on one expert keeps BF16 ingress");
+        for expert in 0..3 {
+            for projection in [Fp8Projection::Gate, Fp8Projection::Up] { write(expert, projection, 0.37); }
+        }
+        assert_eq!(tensors.uniform_input_scale(0).unwrap(), Some(0.37));
+        write(0, Fp8Projection::Gate, 0.0);
+        write(0, Fp8Projection::Up, 0.0);
+        write(1, Fp8Projection::Gate, 0.0);
+        write(1, Fp8Projection::Up, 0.0);
+        write(2, Fp8Projection::Gate, 0.0);
+        write(2, Fp8Projection::Up, 0.0);
+        assert!(tensors.uniform_input_scale(0).is_err(), "a shared invalid scale is a checkpoint error");
     }
 
     #[test]

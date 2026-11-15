@@ -767,7 +767,9 @@ pub(super) mod tests {
             spark: (0..=routed.len()).map(|count| vec![if count == routed.len() {
                 SparkCharge { experts: 0, owners: 0, runtime: 0 }
             } else { SparkCharge { experts: 1 << 30, owners: 1 << 30, runtime: 1 << 30 } }; 2]).collect(),
-            links: canonical::spark_link(0, 2, prefill, Default::default())?,
+            links: canonical::spark_link(0, 2, prefill, Default::default(), cuteafd_core::SparkIngress::Bf16)?,
+            spark_ingress: cuteafd_loader::families::minimax_m3::admission::SparkIngressPlan {
+                ingress: cuteafd_core::SparkIngress::Bf16, scales: vec![None; cfg.layers] },
             spark_reply_formats: Default::default(), drafter: None, vision: None, code: vec![64 << 20; gpus],
             measured_context: vec![0; gpus], graph_reserve: vec![500 << 20; gpus], head: serving::BlasHead::Gemm,
             host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, device_sampling: true,

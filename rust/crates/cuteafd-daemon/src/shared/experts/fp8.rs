@@ -222,6 +222,17 @@ pub(crate) fn exact_layout(directory: &Path, tensors: &Fp8ExpertTensors, tp: usi
     cuteafd_loader::formats::fp8_experts::exact_layout_directory(directory, tensors, tp, rank)
 }
 
+/// The exact pre-quantized NVFP4 input sibling of an NVFP4 W4A4 package:
+/// `.../fp8-<family>-nvfp4a4/tp<n>` -> `.../fp8-<family>-nvfp4a4-nvfp4w/tp<n>`.
+/// Same slices, scratch and arithmetic; its programs read the coordinator's
+/// wire rows (`SparkIngress::Nvfp4`) instead of quantizing BF16 rows.
+pub(crate) fn nvfp4_wire_sibling(directory: &Path) -> Option<PathBuf> {
+    let layout = directory.file_name()?;
+    let package = directory.parent()?;
+    let name = package.file_name()?.to_str()?;
+    name.ends_with("-nvfp4a4").then(|| package.with_file_name(format!("{name}-nvfp4w")).join(layout))
+}
+
 /// The BF16-input sibling of an FP8 package directory:
 /// `.../fp8-<family>/tp<n>` -> `.../fp8-<family>-bf16/tp<n>`.
 pub(crate) fn bf16_sibling(directory: &Path) -> Option<PathBuf> {
@@ -420,14 +431,13 @@ impl Fp8Modules {
     }
 
     pub(crate) fn workspace_bytes(&self, capacity: usize) -> Result<(usize, usize)> {
-        use cuteafd_ffi::fp8_moe::{fp8_slot_io_bytes, fp8_slot_scratch_bytes};
+        use cuteafd_ffi::fp8_moe::fp8_slot_scratch_bytes;
         let mut scratch = fp8_slot_scratch_bytes(self.module.scratch_layout(), capacity)?;
         if let Some(module) = &self.bf16 {
             scratch = scratch.max(fp8_slot_scratch_bytes(module.scratch_layout(), capacity)?);
         }
         let info = self.module.info();
-        Ok((scratch, fp8_slot_io_bytes(info.hidden, info.topk, info.wire_input,
-            self.bf16.is_some(), capacity)?))
+        Ok((scratch, worker::Fp8Worker::io_bytes(info, self.bf16.is_some(), capacity)?))
     }
 
     pub(crate) fn load(directory: &Path, bf16_directory: Option<&Path>, policy: &cuteafd_loader::plan::fp8_prefill::Policy) -> Result<Self> {
@@ -1360,7 +1370,7 @@ mod tests {
         write_snapshot(dir.path(),&source["config"],&fixture,None);
         let tensors = Fp8ExpertTensors::read(dir.path(),shape).unwrap();
         let info = Fp8MoeInfo {hidden:128,slice:256,experts:2,topk:1,intermediate:1536,tp:6,
-            wire_input:false,swiglu_limit:7.0, swiglu_alpha: 1.0, swiglu_beta: 0.0,activation:Fp8MoeActivation::SiluPostClampFp32Product,
+            wire_input:false, nvfp4_input: false,swiglu_limit:7.0, swiglu_alpha: 1.0, swiglu_beta: 0.0,activation:Fp8MoeActivation::SiluPostClampFp32Product,
             projection:Fp8MoeProjection::Bf16,capacities:vec![16],scale_convention: cuteafd_ffi::fp8_moe::Fp8MoeScaleConvention::Multiplier, weights:Fp8MoeWeights::Bf16};
         super::validate_checkpoint_contract(&info,&tensors,&[0],6,0,Slicing::Padded).unwrap();
         for mutation in 0..4 {
@@ -1517,7 +1527,7 @@ mod tests {
     #[test]
     fn bf16_sibling_must_share_weight_layout_arithmetic_and_capacity() {
         let primary = Fp8MoeInfo { hidden: 6144, slice: 512, experts: 256, topk: 8, intermediate: 2048, tp: 4,
-            wire_input: true, swiglu_limit: 10.0, swiglu_alpha: 1.0, swiglu_beta: 0.0, activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product, projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16, capacities: vec![64, 4096], scale_convention: cuteafd_ffi::fp8_moe::Fp8MoeScaleConvention::Multiplier, weights: Fp8MoeWeights::Fp8 };
+            wire_input: true, nvfp4_input: false, swiglu_limit: 10.0, swiglu_alpha: 1.0, swiglu_beta: 0.0, activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product, projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16, capacities: vec![64, 4096], scale_convention: cuteafd_ffi::fp8_moe::Fp8MoeScaleConvention::Multiplier, weights: Fp8MoeWeights::Fp8 };
         let mut bf16 = primary.clone();
         bf16.wire_input = false;
         // A sibling may compile different capacities; its own scratch uses its own top.

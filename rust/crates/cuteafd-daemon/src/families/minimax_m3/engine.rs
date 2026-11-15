@@ -830,6 +830,10 @@ impl<'a> ServingPrefill<'a> {
             "MiniMax routed bindings differ from admitted layers/owners");
         Ok(Self { dispatchers, bindings, next_identity: 1, version, terminal: false })
     }
+    /// Whether routed rows carry the exact NVFP4 Spark wire scratch.
+    fn nvfp4_wire(&self) -> bool {
+        self.dispatchers.iter().any(Dispatcher::nvfp4_wire)
+    }
     pub fn execute(&mut self, storage: &Storage<'a>, cfg: &MiniMaxM3Config,
         schedule: &Requests, requests: &mut [ServingRequest<'_>], publish: bool,
         consume: impl FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>) -> Result<()> {
@@ -863,7 +867,7 @@ impl<'a> ServingPrefill<'a> {
             }
         }
         let sources = units.iter().map(|unit|
-            storage.ranks[0].prefill[unit.slot].borrow().routed_rows(unit.rows.len())).collect::<Result<Vec<_>>>()?;
+            storage.ranks[0].prefill[unit.slot].borrow().routed_rows_for(unit.rows.len(), self.nvfp4_wire())).collect::<Result<Vec<_>>>()?;
         let mut arithmetic = NativeSlots { storage, cfg, consume, publish, taps };
         let result = run_prefill_units(&mut ServingHooks { arithmetic: &mut arithmetic, sources: &sources,
             dispatchers: &self.dispatchers, bindings: &self.bindings, requests,
@@ -934,7 +938,7 @@ impl<'a> ServingPrefill<'a> {
                     &storage.embedding, rows, &owner.stream, ids, owner.dense.producer_destination(),
                     owner.plane("residual")?)?; }
             }
-            let source = rank.decode.borrow().routed_rows(rows)?;
+            let source = rank.decode.borrow().routed_rows_for(rows, self.nvfp4_wire())?;
             for layer in 0..cfg.layers {
                 let cache = &state.ranks[0];
                 let request = cache.bank.decode_request(&cache.decode, layer)?;
@@ -1221,7 +1225,7 @@ impl<'a> ServingPrefill<'a> {
                     &storage.embedding, rows, &owner.stream, ids, owner.dense.producer_destination(),
                     owner.plane("residual")?)?; }
             }
-            let source = storage.ranks[0].decode.borrow().routed_rows(rows)?;
+            let source = storage.ranks[0].decode.borrow().routed_rows_for(rows, self.nvfp4_wire())?;
             for layer in 0..cfg.layers {
                 let gpu = split.owner(layer)?;
                 let rank = &storage.ranks[gpu];
@@ -1630,7 +1634,7 @@ mod tests {
             .split_once("    pub fn drain(").unwrap().0;
         assert!(decode.contains("graphs[0].row_key(rows)?"));
         assert!(decode.contains("rows: graph_rows, op: Op::Router"));
-        assert!(decode.contains("routed_rows(rows)?"));
+        assert!(decode.contains("routed_rows_for(rows, self.nvfp4_wire())?"));
         assert!(decode.contains("decode_stage(storage, graphs, layer, graph_rows"));
         assert!(decode.contains("decode_meet(storage, graphs, layer, graph_rows"));
         assert!(decode.contains("project_device(&rank.weights, residual, rows)"));
