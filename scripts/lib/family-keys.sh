@@ -34,7 +34,7 @@ _spark_slot_keys() {
 _family_allowed_keys() {
   local checkpoint_family="${2:-$1}" registry_dir
   registry_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-  printf '%s\n' CORE_VIEW FP8_PREFILL
+  printf '%s\n' CORE_VIEW FP8_PREFILL ATTENTION_PREFILL_PRECISION
   cat <<'EOF'
 VISION
 AUDIO
@@ -464,6 +464,7 @@ ADDR
 API_KEY_FILE
 ATTENTION_PLACEMENT
 ATTENTION_PLAN_ROWS
+ATTENTION_PREFILL_PRECISION
 AUDIO
 MEDIA_FEATURES_DIR
 AUDIO_FEATURES_DIR

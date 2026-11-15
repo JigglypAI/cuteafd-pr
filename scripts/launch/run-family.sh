@@ -771,6 +771,9 @@ count_args+=(--config /run/cuteafd-plan.config)
 v41_decode_lanes="$(get DECODE_LANES)"
 [[ -z "$v41_decode_lanes" || "$v41_decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
 [[ -z "$v41_decode_lanes" ]] || count_args+=(--decode-lanes "$v41_decode_lanes")
+# The planner resolves auto per family and core view and refuses a mode with no exported program.
+case "${ATTENTION_PREFILL_PRECISION:=auto}" in auto|bf16|fp8) ;; *) release_die "ATTENTION_PREFILL_PRECISION must be auto, bf16 or fp8" ;; esac
+[[ "$ATTENTION_PREFILL_PRECISION" == auto ]] || count_args+=(--attention-prefill-precision "$ATTENTION_PREFILL_PRECISION")
 ((RELEASE_SPARK_COUNT_EXPLICIT == 0)) || count_args+=(--spark-ranks "$SPARK_COUNT")
 # Keep checkpoint paths unchanged inside the full namespace mount.
 count_mounts=(-e "HF_HOME=$container_hf_home" ${v41_fp8_head_args[@]+"${v41_fp8_head_args[@]}"} "${namespace_mount_args[@]}"
@@ -1664,6 +1667,9 @@ fi
 case "$embedding" in host|gpu) ;; *) echo "EMBEDDING must be host or gpu" >&2; exit 2 ;; esac
 [[ "$family" != qwen3_5 || "$embedding" == gpu ]] || release_die "dense Qwen requires device token embedding"
 ((standalone_family == 0)) || [[ "$embedding" == gpu ]] || release_die "$family serves GPU token embeddings only (EMBEDDING=gpu)"
+# The planner resolves auto per family and core view and refuses a mode with no exported program.
+attention_prefill_precision="$(get ATTENTION_PREFILL_PRECISION auto)"
+case "$attention_prefill_precision" in auto|bf16|fp8) ;; *) release_die "ATTENTION_PREFILL_PRECISION must be auto, bf16 or fp8" ;; esac
 decode_lanes="$(get DECODE_LANES)"
 if [[ -n "$decode_lanes" ]]; then
   [[ "$decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
@@ -2372,6 +2378,7 @@ audio_encoder_hash=""
     plan_draft_args+=(--tp2-dflash "$tp2_dflash_bool")
   fi
   [[ -z "$decode_lanes" ]] || plan_draft_args+=(--decode-lanes "$decode_lanes")
+  [[ "$attention_prefill_precision" == auto ]] || plan_draft_args+=(--attention-prefill-precision "$attention_prefill_precision")
   if [[ "$family:$speculator" == qwen3_5:dspark ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
   fi

@@ -181,6 +181,10 @@ pub trait Family: Sync {
     fn decode_lanes(&self) -> super::decode_lanes::LaneSupport {
         super::decode_lanes::LaneSupport::One { reason: super::decode_lanes::DRAFTER }
     }
+    /// Prefill attention modes with an exported program (`ATTENTION_PREFILL_PRECISION`).
+    fn attention_prefill_precision(&self) -> super::attention_precision::PrefillPrecisionSupport {
+        super::attention_precision::BF16_ONLY
+    }
     /// Spark decode compute owners: one per decode lane, each admitting the
     /// family's decode rows (its covering export comes from the backend ladder).
     /// `None` for families without Spark experts.

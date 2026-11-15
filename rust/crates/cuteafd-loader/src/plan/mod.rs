@@ -1,5 +1,6 @@
 //! `cuteafd plan`: what a checkpoint is, where each part would live, and what
 //! this build can or cannot run - with hints a code agent can act on.
+pub mod attention_precision;
 pub mod checkpoint;
 pub mod decode_lanes;
 pub mod deployment;
@@ -176,6 +177,8 @@ pub enum PlanError {
     InvalidOption { option: &'static str, reason: String },
     #[error("unsupported {option}={value} for {family}: {reason}")]
     UnsupportedOption { option: &'static str, value: u8, family: String, reason: &'static str },
+    #[error("unsupported {option}={value} for {family}: {reason}")]
+    UnsupportedValue { option: &'static str, value: String, family: String, reason: String },
     #[error(transparent)]
     Checkpoint(#[from] anyhow::Error),
 }
@@ -342,6 +345,9 @@ pub struct PlanReport {
     pub max_pool_tokens_no_onboard: Option<u64>,
     /// Resolved decode views, independent of prefill units in flight.
     pub decode_lanes: u8,
+    /// Resolved prefill attention precision (`ATTENTION_PREFILL_PRECISION`); absent without a family.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attention_prefill_precision: Option<attention_precision::Resolved>,
     /// This layout captures CUDA graphs whose kernel nodes run on more than
     /// one coordinator GPU (a fork onto the peer's stream inside one capture).
     /// Declared by the family layout that builds such graphs. Launch tooling
@@ -446,6 +452,7 @@ pub struct PlanOptions {
     pub fp8_prefill: fp8_prefill::Policy,
     /// None preserves each family's qualified decode-view default.
     pub decode_lanes: Option<u8>,
+    pub attention_prefill_precision: attention_precision::Requested,
     /// Host RAM cap for mapped tables: every table (rows and scales) when all fit,
     /// else the separate per-row scales when they fit; 0 keeps all mapped.
     pub mapped_scale_preload_bytes: u64,
@@ -477,6 +484,7 @@ impl Default for PlanOptions {
         Self {
             fp8_prefill: Default::default(),
             decode_lanes: None,
+            attention_prefill_precision: Default::default(),
             mapped_scale_preload_bytes: crate::formats::mapped_preload::DEFAULT_CAP_BYTES,
             mapped_scale_host_budget_bytes: None,
             draft_ownership: None,
@@ -1042,6 +1050,7 @@ pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::
         onboard_layers: None,
         max_pool_tokens_no_onboard: None,
         decode_lanes: 1,
+        attention_prefill_precision: None,
         cross_device_graph_kernels: false,
         prefill_transports: None,
         prefill_reserve_rows: None,
@@ -1187,6 +1196,8 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     report.family = Some(family.id().into());
     report.decode_lanes = resolve_decode_lanes(family.id(), options.decode_lanes,
         options.layout.as_ref().map_or(2, |layout| layout.concurrency))?;
+    report.attention_prefill_precision = Some(attention_precision::resolve(family, options.attention_prefill_precision,
+        checkpoint.view.as_ref().is_some_and(|view| view.mode() == checkpoint::CoreView::Fp8Compact))?);
     report.precision_optimizations = precision_optimizations(family.id(), options);
     report.numerics_deviations = numerics_deviations(family.id(), &report.module_numerics);
     // Dense native admission owns geometry-specific missing-export hints and
@@ -1825,6 +1836,9 @@ pub fn render(report: &PlanReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "decode     {} lane(s)", report.decode_lanes);
+    if let Some(precision) = &report.attention_prefill_precision {
+        let _ = writeln!(out, "attention  prefill {} ({})", precision.mode.name(), precision.reason);
+    }
     match report.family.as_deref() {
         Some("deepseek_v41") => if let (Some(unit), Some(waves)) = (report.prefill_unit_rows, report.prefill_waves) {
             let reserve = report.prefill_reserve_rows.map_or("pinned".into(), |rows| format!("{rows}-row"));
