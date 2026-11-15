@@ -112,7 +112,7 @@ pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: Option<&Path
 /// sized by the shared segment formulas at the covering export, and the
 /// shared worker runtime residual. The per-package scratch census joins with
 /// the package (stage 3); until then the scratch term is the formula bound.
-pub fn spark_charges(cfg: &Inkling2Config, experts: &[LayerExperts], routed: &[usize], ranks: usize,
+pub fn spark_charges(catalog: &crate::OfficialV41Catalog, experts: &[LayerExperts], routed: &[usize], ranks: usize,
     prefill: PrefillShape, ingress: cuteafd_core::SparkIngress) -> anyhow::Result<Vec<Vec<SparkCharge>>> {
     if ranks == 0 { return Ok(vec![Vec::new(); routed.len() + 1]); }
     anyhow::ensure!((2..=8).contains(&ranks), "Inkling 2 Spark worlds are 2..=8 ranks, not {ranks}");
@@ -125,27 +125,34 @@ pub fn spark_charges(cfg: &Inkling2Config, experts: &[LayerExperts], routed: &[u
         slot_bytes: rings.slot_bytes, alignment: rings.alignment };
     let runtime = cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0).context("Spark runtime residual")?;
     let geometry = cuteafd_core::ExpertGeometry::INKLING2;
-    // Equal intermediate slices over whole 128-row blocks: 2304 / 128 = 18
-    // blocks, so worlds 2..=6 and 9 split exactly and 7/8 take the ceiling.
-    let blocks = cfg.intermediate / 128;
-    let widest_blocks = blocks.div_ceil(ranks);
-    let per_layer = experts.iter().map(|layer| {
-        // The widest rank's share of the layer's checkpoint bytes.
-        layer.source.checked_mul(widest_blocks as u64).and_then(|b| b.checked_div(blocks as u64))
-            .context("Inkling 2 Spark slice overflow")
-    }).collect::<anyhow::Result<Vec<_>>>()?;
+    let mut per_layer = vec![vec![0u64; routed.len()]; ranks];
+    for (index, &layer) in routed.iter().enumerate() {
+        let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: vec![layer],
+            spark_ranks: ranks, prefill_lanes: shared::LANES };
+        for rank in 0..ranks {
+            let layout = if let Some(tensors) = catalog.fp8() {
+                let view = tensors.for_layer_metadata(layer)?;
+                let format = if view.dynamic_nvfp4() { "nvfp4a4" } else { "mxfp8" };
+                let recipe = crate::plan::experts::spark_recipe(&format!("inkling2:{format}"),
+                    catalog.routed_experts().intermediate, ranks)?;
+                crate::placement::SparkResidentLayout::Fp8 { world: ranks, rank, slicing: recipe.slicing }
+            } else { crate::placement::SparkResidentLayout::Exl3 { world: ranks, rank } };
+            per_layer[rank][index] = crate::placement::SparkAssignment::resident_from_catalog(catalog,
+                &working, rank, layout)?.resident_bytes;
+        }
+    }
     (0..=routed.len()).map(|count| {
         let working = SparkWorkingSet { rtx_layers: routed[..count].to_vec(), spark_layers: routed[count..].to_vec(),
             spark_ranks: ranks, prefill_lanes: shared::LANES };
         (0..ranks).map(|rank| {
             if count == routed.len() { return Ok(SparkCharge { experts: 0, owners: 0, runtime: 0 }); }
             let io = working.rank_endpoints_io(rank, geometry, &[endpoint], rings)?;
-            let width = u32::try_from(widest_blocks * 128)?;
+            let width = u32::try_from(catalog.routed_experts().intermediate.div_ceil(128 * ranks) * 128)?;
             let owners = executions.workspace_bytes(|extent| owner_bytes(geometry, width, extent, ingress))?
                 .and_then(|bytes| bytes.total()).context("Inkling 2 Spark owner sum overflow")?;
             let owners = [io.intake, io.host_exchange, io.row_indices, io.mapped_rings, io.endpoint_staging, owners]
                 .into_iter().try_fold(0u64, |sum, bytes| sum.checked_add(bytes)).context("Inkling 2 Spark owners")?;
-            Ok(SparkCharge { experts: per_layer[count..].iter().sum(), owners, runtime })
+            Ok(SparkCharge { experts: per_layer[rank][count..].iter().sum(), owners, runtime })
         }).collect()
     }).collect()
 }
@@ -206,7 +213,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let ingress = if storage.iter().all(|s| *s == ExpertStorage::Mxfp8) { cuteafd_core::SparkIngress::Fp8K32 }
         else if storage.iter().any(|s| *s == ExpertStorage::Mxfp8) { cuteafd_core::SparkIngress::Native }
         else { cuteafd_core::SparkIngress::Bf16 };
-    let spark = spark_charges(cfg, &experts, &routed, ranks, shape, ingress)
+    let spark = spark_charges(&catalog, &experts, &routed, ranks, shape, ingress)
         .map_err(|error| refused(format!("Inkling 2 Spark inventory refused: {error:#}"),
             "Use a Spark world of 2..=8 ranks."))?;
     let links = shared::spark_link((gpus - 1) as u8, ranks, shape, request.replies, ingress)
