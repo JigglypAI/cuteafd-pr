@@ -17,6 +17,29 @@
 //! each member's completion fence on the backend's owner queue.
 use crate::shared::experts::execution::timing::PendingUnits;
 use crate::shared::experts::service::routes::RouteStaging;
+
+/// Per-slot packed route staging a backend owns: ids then FP32 gate weights
+/// for each queued unit, retained until that unit's fence.
+pub(crate) trait UnitRoutes<'a> {
+    /// Pack `request`'s routes into staging slot `slot`.
+    fn pack(&mut self, slot: usize, request: &BackboneRequest<'_>) -> Result<()>;
+    /// Queue the upload of `count` packed routes of `slot` into `ids`/`weights`.
+    /// # Safety
+    /// The slot and both destinations stay owned until the unit's fence.
+    unsafe fn upload(&self, slot: usize, count: usize, ids: CuteafdDeviceBuffer, weights: CuteafdDeviceBuffer,
+        stream: *mut c_void) -> Result<()>;
+}
+
+impl<'a> UnitRoutes<'a> for RouteStaging<'a> {
+    fn pack(&mut self, slot: usize, request: &BackboneRequest<'_>) -> Result<()> {
+        RouteStaging::pack(self, slot, request)
+    }
+    unsafe fn upload(&self, slot: usize, count: usize, ids: CuteafdDeviceBuffer, weights: CuteafdDeviceBuffer,
+        stream: *mut c_void) -> Result<()> {
+        // SAFETY: forwarded caller contract.
+        unsafe { RouteStaging::upload(self, slot, 0, count, ids, weights, stream) }
+    }
+}
 use crate::shared::memory::{device, DeviceAllocation, HostAllocation, LoadStream, Tag};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::spark_executions::MAX_MERGED_UNITS;
@@ -91,6 +114,27 @@ pub(crate) struct WaveStaging<'a> {
     pub(crate) flushes: u64,
     /// Flushes that launched two or more members through row addresses.
     pub(crate) merged: u64,
+    /// Prefill units that ran as singletons without staging, by reason.
+    pub(crate) bypassed: u64,
+}
+
+/// Why a prefill unit ran alone without staging (flush telemetry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bypass {
+    /// The backend has no row-addressed program for this ingress dtype.
+    Ingress,
+    /// Rows exceed one staged slice or the stride is not addressable.
+    Extent,
+    /// Per-expert partial replies (the merged epilogue writes combined rows).
+    PartialReply,
+    /// Compressed (FP8/NVFP4) combined replies the row-addressed program refuses.
+    CompressedReply,
+}
+impl Bypass {
+    fn name(self) -> &'static str {
+        match self { Self::Ingress => "ingress", Self::Extent => "incompatible_input_or_capacity",
+            Self::PartialReply => "partial_reply", Self::CompressedReply => "compressed_reply" }
+    }
 }
 
 fn device_part(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
@@ -132,7 +176,7 @@ impl<'a> WaveStaging<'a> {
             copied: (0..units).map(|_| device::Event::new(device)).collect::<Result<_>>()?,
             plane, row_bytes, unit_rows, rows, minimum_rows: minimum_rows.max(1), topk, descriptors,
             device: [table(rows * 8)?, table(rows * topk * 4)?, table(rows * topk * 4)?, table(rows * 8)?],
-            staged: Vec::with_capacity(units), staged_units: 0, flushes: 0, merged: 0,
+            staged: Vec::with_capacity(units), staged_units: 0, flushes: 0, merged: 0, bypassed: 0,
         }))
     }
 
@@ -159,6 +203,13 @@ impl<'a> WaveStaging<'a> {
 
     pub(crate) fn has_staged(&self) -> bool { !self.staged.is_empty() }
 
+    /// Record a prefill unit the backend runs alone without staging.
+    pub(crate) fn bypass(&mut self, rows: u32, reason: Bypass) {
+        self.bypassed += 1;
+        tracing::debug!(target: "cuteafd::spark_coalesce", rows, reason = reason.name(), bypassed = self.bypassed,
+            "Spark staging bypass");
+    }
+
     /// The request's ingress row stride when it can stage here: its rows fit
     /// one unit slice at a 16-byte-aligned stride. The backend has already
     /// matched its dtype to a row-addressed program.
@@ -183,7 +234,7 @@ impl<'a> WaveStaging<'a> {
 
     /// Launch every staged unit as one wave on `stream`; each member keeps
     /// its own completion fence. `launch` queues the expert math only.
-    pub(crate) fn flush(&mut self, pending: &mut PendingUnits<'a>, routes: &RouteStaging<'a>, stream: *mut c_void,
+    pub(crate) fn flush(&mut self, pending: &mut PendingUnits<'a>, routes: &dyn UnitRoutes<'a>, stream: *mut c_void,
         launch: &mut dyn FnMut(&Wave<'_>) -> Result<()>) -> Result<()> {
         if self.staged.is_empty() { return Ok(()) }
         let rows: usize = self.staged.iter().map(|unit| unit.identity.2 as usize).sum();
@@ -206,7 +257,7 @@ impl<'a> WaveStaging<'a> {
             // its fence below; the tables are overwritten only in stream order.
             unsafe {
                 self.library.cuda_stream_wait_event(stream, self.copied[unit.slot].raw)?;
-                routes.upload(unit.slot, 0, count * topk,
+                routes.upload(unit.slot, count * topk,
                     device_part(self.device[1].buffer, first * topk * 4, count * topk * 4)?,
                     device_part(self.device[2].buffer, first * topk * 4, count * topk * 4)?, stream)?;
                 if segmented {
@@ -237,12 +288,12 @@ impl<'a> WaveStaging<'a> {
     /// Stage `arrival` (copy it now, launch later) and return whether it was
     /// taken. Ineligible requests return `false` after nothing was queued.
     pub(crate) fn stage(&mut self, arrival: Arrival<'_, '_>, pending: &mut PendingUnits<'a>,
-        routes: &mut RouteStaging<'a>, stream: *mut c_void, launch: &mut dyn FnMut(&Wave<'_>) -> Result<()>)
+        routes: &mut dyn UnitRoutes<'a>, stream: *mut c_void, launch: &mut dyn FnMut(&Wave<'_>) -> Result<()>)
         -> Result<bool> {
         let request = arrival.request;
         let rows = request.rows() as usize;
         let Some(stride) = self.stride(request) else {
-            tracing::debug!(target: "cuteafd::spark_coalesce", rows, reason = "incompatible_input_or_capacity", "Spark staging bypass");
+            self.bypass(request.rows(), Bypass::Extent);
             return Ok(false)
         };
         let (input_dtype, output_dtype) = (request.input_dtype(), request.output_dtype());

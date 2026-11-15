@@ -371,27 +371,40 @@ pub(super) enum Execution<'w, 'a> {
     Exlr8(super::exlr8::Worker<'w, 'a>),
 }
 impl<'w, 'a> Execution<'w, 'a> {
+    /// Launch every staged unit (shared wave staging, `execution::waves`).
     pub(super) fn flush_staged(&mut self) -> Result<()> {
-        if let Self::Fp8(groups) = self {
-            for worker in &mut groups.workers { worker.flush_staged()?; }
+        match self {
+            Self::Fp8(groups) => {
+                for worker in &mut groups.workers { worker.flush_staged()?; }
+                Ok(())
+            }
+            Self::Exl3(execution) => execution.flush_staged(),
+            Self::Full(_) | Self::Exlr8(_) => Ok(()),
         }
-        Ok(())
     }
     pub(super) fn has_staged(&self) -> bool {
-        matches!(self, Self::Fp8(groups) if groups.workers.iter().any(|worker| worker.has_staged()))
+        match self {
+            Self::Fp8(groups) => groups.workers.iter().any(|worker| worker.has_staged()),
+            Self::Exl3(execution) => execution.has_staged(),
+            Self::Full(_) | Self::Exlr8(_) => false,
+        }
     }
     pub(super) fn cancel_staged(&mut self, input_address: usize) -> Result<bool> {
-        if let Self::Fp8(groups) = self {
-            for (index, worker) in groups.workers.iter_mut().enumerate() {
-                if worker.cancel_staged(input_address)? {
-                    let position = groups.pending_groups.iter().position(|&(group, address)| group == index && address == input_address)
-                        .context("staged group has no owner FIFO entry")?;
-                    groups.pending_groups.remove(position);
-                    return Ok(true);
+        match self {
+            Self::Fp8(groups) => {
+                for (index, worker) in groups.workers.iter_mut().enumerate() {
+                    if worker.cancel_staged(input_address)? {
+                        let position = groups.pending_groups.iter().position(|&(group, address)| group == index && address == input_address)
+                            .context("staged group has no owner FIFO entry")?;
+                        groups.pending_groups.remove(position);
+                        return Ok(true);
+                    }
                 }
+                Ok(false)
             }
+            Self::Exl3(execution) => execution.cancel_staged(input_address),
+            Self::Full(_) | Self::Exlr8(_) => Ok(false),
         }
-        Ok(false)
     }
 
     pub(super) fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,

@@ -377,6 +377,12 @@ impl<'a> Exl3Worker<'a> {
         Ok(())
     }
 
+    /// Merged-wave staging (`execution::waves`): EXL3 stages once its
+    /// row-addressed program is loaded; until then every unit runs alone.
+    pub(crate) fn has_staged(&self) -> bool { false }
+    pub(crate) fn flush_staged(&mut self) -> Result<()> { Ok(()) }
+    pub(crate) fn cancel_staged(&mut self, _input_address: usize) -> Result<bool> { Ok(false) }
+
     /// Whether every request queued on this execution's stream has completed.
     pub(crate) fn stream_idle(&self) -> Result<bool> {
         // SAFETY: the owned stream is live for the worker's lifetime.

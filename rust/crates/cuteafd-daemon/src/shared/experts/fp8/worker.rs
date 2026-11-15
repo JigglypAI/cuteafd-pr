@@ -151,7 +151,7 @@ impl<'a> Fp8Worker<'a> {
         ensure!(request.output_dtype() == ExpertV2Dtype::Bf16 || request.partial_plan()?.is_none(),
             "fused FP8 reply requires whole combined rows");
         if request.input_dtype() != segment_input_dtype(self.experts.module.info()) {
-            tracing::debug!(target: "cuteafd::spark_coalesce", rows = request.rows(), reason = "incompatible_input_or_capacity", "Spark staging bypass");
+            waves.bypass(request.rows(), super::super::execution::waves::Bypass::Ingress);
             return Ok(false)
         }
         ensure!(executor_id == self.executor_id && request.layer() as usize == self.experts.layers[self.layer].layer,
