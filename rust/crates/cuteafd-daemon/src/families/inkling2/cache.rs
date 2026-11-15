@@ -110,6 +110,60 @@ impl<'a> CacheBank<'a> {
         self.copies.allocation_receipts(inventory, "inkling2.cache.copies")
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::memory::device::Device;
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+    use cuteafd_loader::families::inkling2::{execution::UnitLayout, Inkling2Config};
+
+    #[test]
+    fn persistent_cache_marks_copy_exact_bytes_and_fence_only_registered_readers() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 0 };
+        let reader = Rc::new(Stream::new(device)?);
+        let mut cfg = Inkling2Config::from_hf(&serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
+        cfg.layers = 2;
+        cfg.local = vec![true, false];
+        let cache = CacheBank::new(vec![reader.clone()], CacheLayout::new(&cfg, 2, 3)?, 1)?;
+        let state = cache.sequence(0)?;
+        let pattern = (0..state.bytes).map(|byte| (byte.wrapping_mul(17) % 251) as u8).collect::<Vec<_>>();
+        library.copy_h2d(state, &pattern)?;
+        cache.capture(0, 0)?;
+        cache.reset(0)?;
+        cache.restore(0, 1)?;
+        cache.drain()?;
+        let mut restored = vec![0; pattern.len()];
+        library.copy_d2h(&mut restored, cache.sequence(1)?)?;
+        assert_eq!(restored, pattern);
+        library.copy_d2h(&mut restored, cache.sequence(0)?)?;
+        assert!(restored.iter().all(|&byte| byte == 0));
+        let page = cache.page(1, 0)?;
+        let page_pattern = vec![0x5a; page.bytes];
+        library.copy_h2d(page, &page_pattern)?;
+        cache.copy_page(0, 2)?;
+        cache.drain()?;
+        let mut restored_page = vec![0; page.bytes];
+        library.copy_d2h(&mut restored_page, cache.page(1, 2)?)?;
+        assert_eq!(restored_page, page_pattern);
+        let unit = super::super::owners::UnitOwner::new(reader, UnitLayout::serving(&cfg, 64, 256)?)?;
+        assert!(unit.bind(&cache, 1, 0).is_ok());
+        assert!(unit.bind(&cache, 2, 0).is_err());
+        assert!(unit.bind(&cache, 0, 2).is_err());
+        let stranger = Rc::new(Stream::new(device)?);
+        assert!(cache.require_reader(&stranger).is_err());
+        let unit = super::super::owners::UnitOwner::new(stranger, UnitLayout::serving(&cfg, 64, 256)?)?;
+        assert!(unit.bind(&cache, 0, 0).is_err());
+        assert!(cache.field(0, 1, "ring").is_err());
+        assert!(cache.copy_page(0, 0).is_err());
+        assert!(cache.copy_page(0, 3).is_err());
+        Ok(())
+    }
+}
+
 impl Drop for CacheBank<'_> {
     fn drop(&mut self) {
         crate::shared::decode_graph::fatal_drain(self.copies.drain(), "Inkling persistent cache retirement");

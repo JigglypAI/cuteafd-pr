@@ -13,7 +13,7 @@ def test_native_golden_uses_shared_executor_and_native_expert_dispatch():
     layer = (FAMILY/'layers.rs').read_text()
     assert 'experts: &dyn Dispatcher' in layer
     assert 'DraftProjections::load_with_output' in layer
-    attention = layer.split('pub(crate) fn attention(')[1].split('/// Complete layer')[0]
+    attention = layer.split("pub(crate) fn attention<'a>(")[1].split('/// Complete layer')[0]
     assert 'cuda_stream_synchronize' not in attention and '.drain(' not in attention
     golden = (FAMILY/'golden.rs').read_text()
     assert 'super::prefill::layer(' in golden
@@ -36,7 +36,7 @@ def test_persistent_layer_state_is_borrowed_and_metadata_uses_retained_uploads()
     assert 'self.copies.copy_d2d(' in cache
     assert 'fatal_drain(self.copies.drain()' in cache
     layer = (FAMILY/'layers.rs').read_text()
-    assert "owner: &impl UnitBuffers<'_>" in layer
+    assert "owner: &impl UnitBuffers<'a>" in layer
     assert 'Allocation::new' not in layer
 
 

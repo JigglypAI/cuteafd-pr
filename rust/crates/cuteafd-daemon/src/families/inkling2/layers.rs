@@ -55,14 +55,14 @@ impl<'a> Kernels<'a> {
     fn producer(&self, op: Op) -> Result<&Producer<'a>> {
         self.producers.get(&op.name()?).context("Inkling producer not bound at startup")
     }
-    pub fn norm(&self, owner: &impl UnitBuffers<'_>, input: Buffer, weight: Buffer, output: Buffer,
+    pub fn norm(&self, owner: &impl UnitBuffers<'a>, input: Buffer, weight: Buffer, output: Buffer,
         value: bool, precision: Precision, rows: usize) -> Result<()> {
         // SAFETY: the family supplies disjoint admitted typed input/output views;
         // retained unit stream orders the producer and all consuming projections.
         unsafe { self.producer(Op::Norm { value, precision })?.launch(&[input, weight, output],
             rows, None, owner.stream().raw) }
     }
-    pub fn convolution(&self, owner: &impl UnitBuffers<'_>, input: Buffer, weight: Buffer, dynamic: Buffer,
+    pub fn convolution(&self, owner: &impl UnitBuffers<'a>, input: Buffer, weight: Buffer, dynamic: Buffer,
         output: Buffer, history: &str, width: usize, global: bool, rows: usize) -> Result<()> {
         // SAFETY: native F32 planes and BF16 taps are retained by unit/weights;
         // metadata addresses the unit's exclusive history and valid packed rows.
@@ -70,7 +70,7 @@ impl<'a> Kernels<'a> {
             .launch(&[input, weight, dynamic, owner.buffer(history)?, owner.buffer("first")?,
                 owner.buffer("conv_slots")?, output], rows, None, owner.stream().raw) }
     }
-    pub fn residual(&self, owner: &impl UnitBuffers<'_>, query: Buffer, addend: Buffer, output: Buffer,
+    pub fn residual(&self, owner: &impl UnitBuffers<'a>, query: Buffer, addend: Buffer, output: Buffer,
         rows: usize, queries: usize, candidates: usize, add: bool) -> Result<()> {
         // SAFETY: caller initialized each candidate in the F32 arena; the query
         // and optional addend are retained through the mix on the unit stream.
@@ -78,12 +78,12 @@ impl<'a> Kernels<'a> {
             owner.buffer("residual_arena")?, addend, query, output], rows,
             Some((owner.layout().rows, candidates)), owner.stream().raw) }
     }
-    pub fn route(&self, owner: &impl UnitBuffers<'_>, logits: Buffer, bias: Buffer, rows: usize) -> Result<()> {
+    pub fn route(&self, owner: &impl UnitBuffers<'a>, logits: Buffer, bias: Buffer, rows: usize) -> Result<()> {
         // SAFETY: native F32 logits/bias and output routes have admitted extents.
         unsafe { self.producer(Op::Router)?.launch(&[logits, bias, owner.buffer("route_ids")?,
             owner.buffer("route_weights")?], rows, None, owner.stream().raw) }
     }
-    pub fn project(&self, owner: &impl UnitBuffers<'_>, input: Buffer, weight: Buffer, output: Buffer,
+    pub fn project(&self, owner: &impl UnitBuffers<'a>, input: Buffer, weight: Buffer, output: Buffer,
         rows: usize, k: usize, n: usize) -> Result<()> {
         ensure!(input.bytes >= rows*k*2 && weight.bytes >= n*k*2 && output.bytes >= rows*n*4,
             "Inkling projection exceeds admitted views");
@@ -95,7 +95,7 @@ impl<'a> Kernels<'a> {
 }
 
 /// Route/MLP stage has no knowledge of checkpoint expert format or transport.
-pub(crate) fn routed_ffn(kernels: &Kernels<'_>, owner: &impl UnitBuffers<'_>, target: &TargetWeights<'_>,
+pub(crate) fn routed_ffn<'a>(kernels: &Kernels<'_>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
     experts: &dyn Dispatcher, cfg: &Inkling2Config, layer: usize, rows: usize) -> Result<()> {
     ensure!(layer < cfg.layers && rows > 0 && rows <= owner.layout().rows, "Inkling FFN layer/rows differ");
     let prefix = format!("model.llm.layers.{layer}");
@@ -124,7 +124,7 @@ fn slice(buffer: Buffer, offset: usize, bytes: usize) -> Result<Buffer> {
 
 /// Cold one-sequence attention: every cache row is produced before the native
 /// ring/paged attention program, without host synchronization on the layer path.
-pub(crate) fn attention(k: &Kernels<'_>, owner: &impl UnitBuffers<'_>, target: &TargetWeights<'_>,
+pub(crate) fn attention<'a>(k: &Kernels<'_>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
     cfg: &Inkling2Config, layer: usize, rows: usize, input: Buffer) -> Result<()> {
     use cuteafd_ffi::inkling2::{Batch, Global, Local};
     let local = cfg.local[layer];
@@ -217,7 +217,7 @@ pub(crate) fn attention(k: &Kernels<'_>, owner: &impl UnitBuffers<'_>, target: &
 
 /// Complete layer over a cold, contiguous one-sequence unit. Embedding and
 /// completed six-layer block values remain F32 throughout residual mixing.
-pub(crate) fn begin_layer(k: &Kernels<'_>, owner: &impl UnitBuffers<'_>, target: &TargetWeights<'_>,
+pub(crate) fn begin_layer<'a>(k: &Kernels<'_>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
     cfg: &Inkling2Config, index: usize, rows: usize) -> Result<()> {
     let site = residual_site(cfg, index)?;
     let b = |name: &str| owner.buffer(name);
@@ -257,7 +257,7 @@ pub(crate) fn begin_layer(k: &Kernels<'_>, owner: &impl UnitBuffers<'_>, target:
         b("projection_input")?, false, Precision::Bf16, rows)
 }
 
-pub(crate) fn finish_layer(k: &Kernels<'_>, owner: &impl UnitBuffers<'_>, target: &TargetWeights<'_>,
+pub(crate) fn finish_layer<'a>(k: &Kernels<'_>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
     experts: &dyn Dispatcher, cfg: &Inkling2Config, index: usize, rows: usize) -> Result<()> {
     let site = residual_site(cfg, index)?;
     let b = |name: &str| owner.buffer(name);
