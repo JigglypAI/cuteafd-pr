@@ -191,8 +191,9 @@ fn installed_exl3_onboarding_keeps_descriptor_arenas_and_each_workspace_request(
             "buffers":{"scratch":{"bytes":2345678,"allocation":"scratch","dtype":"f32","zero_on_create":false},
                 "state":{"bytes":64,"allocation":"state","dtype":"i32","zero_on_create":true}}
         }))?)?;
-        let LocalPackage::Installed { backings } = local_package(&catalog, Some(&manifest), tp, 1)
-            else { anyhow::bail!("EXL3 installed requests missing") };
+        let package = local_package(&catalog, Some(&manifest), tp, 1);
+        let LocalPackage::Installed { backings } = package
+            else { anyhow::bail!("EXL3 installed requests missing: {package:?}") };
         for (count, groups) in backings.iter().enumerate().skip(1) {
             assert_eq!(groups.len(), tp);
             for backing in groups {
@@ -474,6 +475,12 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
                 }
             }
         }
+        let all_local = shared::request(inputs.context, None, crate::placement::Onboard::Layers(routed.len()), prefill,
+            crate::placement::planner::Operation::Serving, None, Default::default());
+        assert!(inputs.admit(all_local).is_err(), "a linked-world recipe must refuse the all-local prefix");
+        assert!(contract.requires.iter().any(|required|
+            required.when == crate::placement::planner::Choice { variable: cfg.layers + 2, option: routed.len() }
+                && required.any_of.is_empty()), "the full local prefix is explicitly impossible");
         // The planner inventories the exact allocator recipe, per owner, not
         // a BF16 approximation of the native FP32 forward planes.
         for gpu in 0..gpus {
@@ -502,7 +509,8 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
         // One target arena backing per rank.
         for gpu in 0..gpus {
             let arenas = contract.components.iter().filter(|c| matches!(&c.kind, ComponentKind::Allocation { template, .. }
-                if template.group == "weight arena" && template.location == Location::coordinator(gpu as u8))).count();
+                if template.group == "weight arena" && template.id == targets[gpu].arena.id()
+                    && template.location == Location::coordinator(gpu as u8))).count();
             assert_eq!(arenas, 1, "rtx{gpu}");
             let execution = targets[gpu].execution_arena().unwrap();
             for &layer in &targets[gpu].layers {
@@ -511,6 +519,7 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             }
             let backing = contract.components.iter().find(|component| matches!(&component.kind,
                 ComponentKind::Allocation { template, .. } if template.group == "weight arena"
+                    && template.id == targets[gpu].arena.id()
                     && template.location == Location::coordinator(gpu as u8))).unwrap();
             assert_eq!(backing.bytes.at(1).unwrap(), execution.bytes() as u64);
         }
