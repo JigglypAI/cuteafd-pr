@@ -219,6 +219,7 @@ impl CoreInventory {
         let shapes = expected(cfg);
         for layer in 0..cfg.layers {
             let operands = core_operands(cfg, layer).into_iter()
+                .filter(|(_,op,_)| matches!(op,Op::QA | Op::KvA | Op::QB | Op::O | Op::Gate | Op::Up | Op::Down))
                 .filter_map(|(_, op, split)| cfg.stem(layer, op).map(|stem| (stem, op, split)))
                 .collect::<Vec<_>>();
             let attention = |op| matches!(op, Op::QA | Op::KvA | Op::QB | Op::O);
