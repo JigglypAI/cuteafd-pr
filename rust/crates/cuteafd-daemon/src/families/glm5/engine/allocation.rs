@@ -420,6 +420,10 @@ impl GlmEngine<'_> {
                 ensure!(self.embedding.shares_vocabulary(owner), "head and embedding do not share vocabulary owner");
                 owner.head.inventory(&mut inventory, "head")?;
             }
+            super::super::weights::GlmHead::BlockFp8(owner) => {
+                owner.values.inventory(&mut inventory,"head.values")?;
+                owner.scales.as_ref().context("FP8 head scales")?.inventory(&mut inventory,"head.scales")?;
+            }
             super::super::weights::GlmHead::K6(owner) => {
                 for (name, allocation) in [("payload", &owner.payload), ("suh", &owner.suh), ("svh", &owner.svh)] {
                     allocation.inventory(&mut inventory, &format!("head.{name}"))?;
@@ -519,12 +523,11 @@ impl GlmEngine<'_> {
                     ),
                 ] {
                     if let Some(head) = head {
-                        census.projection(
-                            &format!("core.{name}"),
-                            head.allocation_scratch(),
-                            Lifetime::TARGET,
-                            category,
-                        )?;
+                        if let Some(scratch) = head.allocation_scratch() {
+                            census.projection(&format!("core.{name}"),scratch,Lifetime::TARGET,category)?;
+                        } else if let Some(scratch) = head.fp8_scratch() {
+                            census.buffer(&format!("core.{name}.fp8_scratch"),scratch,Lifetime::TARGET,category)?;
+                        }
                     }
                 }
                 for w in decode.borrow().iter().chain(prefill.borrow().iter()) {

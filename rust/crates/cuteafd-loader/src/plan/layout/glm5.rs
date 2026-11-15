@@ -587,7 +587,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         crate::placement::ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
     let mut prepared = ProductionInput { expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, maximum_pool_tokens,
         attention, gpus, prefill,
-        blas_head: if core.is_some_and(|core| core.ranks[0].target_head.is_some()) { serving::BlasHead::Native }
+        blas_head: if core.is_some_and(|core| core.ranks[0].target_head.is_some() || core.ranks[0].fp8_head_scratch.is_some()) { serving::BlasHead::Native }
             else { options.bf16_target_head }, blas: vec![], target, draft, scratch: scratch.unwrap_or_default(), context_scratch: context_programs,
         exchange_element_bytes: if exchange_f32 { 4 } else { 2 }, peer_diagnostics: false,
         prefix_host: crate::families::glm5::host_prefix_enabled(gpus, attention,

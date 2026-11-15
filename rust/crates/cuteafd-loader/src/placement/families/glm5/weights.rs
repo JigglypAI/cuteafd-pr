@@ -769,6 +769,14 @@ impl WeightInventory {
                 1,
             )?;
             out.core(0, "core.head", "lm_head", &layout, projection.source_bytes)?;
+        } else if let Some(head) = core.native.get(cfg.head()) {
+            let [n,k] = head.shape;
+            out.add(0,"native.head.values","lm_head","fp8",product(&[n as u64,k as u64])?.max(256))?;
+            out.add(0,"native.head.scales","lm_head","fp8-scale",product(&[(n/128) as u64,(k/128) as u64,4])?.max(256))?;
+            let source = headers.matrix(&format!("{}.weight",cfg.head()))?;
+            out.attention_mount.merge(native_attention_mount(&crate::formats::native_attention::NativeLayout {
+                stem:cfg.head().into(),shape:head.shape,fp8:true,rank:0,ranks:1,
+                split:crate::formats::trellis_core::CoreSplit::Whole },source,true)?);
         } else {
             let head_name = format!("{}.weight", cfg.head());
             let head = headers.get(&head_name)?;

@@ -1302,7 +1302,7 @@ impl Opened {
         let mut admitted = ProductionInput { expert_usage, cfg: &self.cfg, layers, context: args.max_context as u64,
             maximum_pool_tokens, attention, gpus: devices.len(), prefill,
             blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!native
-                && !core.as_ref().is_some_and(|core| core.ranks[0].target_head.is_some())), blas, target,
+                && !core.as_ref().is_some_and(|core| core.ranks[0].target_head.is_some() || core.ranks[0].fp8_head_scratch.is_some())), blas, target,
             draft: draft_facts.clone().with_window_marks(mark_bytes.checked_mul(args.draft_window_marks)
                 .context("GLM draft marks overflow")? as u64),
             scratch: [scratch(true)?, scratch(false)?], context_scratch: context,

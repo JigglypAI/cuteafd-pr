@@ -188,15 +188,14 @@ pub fn native_output(layout: &NativeLayout) -> cuteafd_ffi::draft_projection::Pr
     else { ProjectionOutput::Bf16 }
 }
 
-/// Executable selected body roles; the head stays gated until its shared
-/// executor, owner and drafter scratch are all wired.
+/// Executable metadata-selected roles, with explicit block padding.
 pub fn fp8_role(cfg: &GlmDsaConfig, name: &str) -> crate::formats::native_attention::Fp8Role {
     use crate::formats::native_attention::Fp8Role;
     let stem = name.strip_suffix(".weight").unwrap_or(name);
-    let supported = cfg.variant.is_glm() && stem != cfg.head() && split(cfg, stem).is_some();
+    let supported = cfg.variant.is_glm() && split(cfg, stem).is_some();
     let role = if stem == cfg.head() { "vocabulary head" }
         else if stem.contains(".self_attn.") { "attention projection" } else { "FFN projection" };
-    if (0..cfg.layers).any(|layer| cfg.stem(layer, Op::KvA).as_deref() == Some(stem)) {
+    if stem == cfg.head() || (0..cfg.layers).any(|layer| cfg.stem(layer, Op::KvA).as_deref() == Some(stem)) {
         Fp8Role::padded(role, supported, 128)
     } else { Fp8Role::exact(role, supported) }
 }
@@ -251,6 +250,17 @@ impl CoreInventory {
                 inventory.native.insert(stem.clone(), NativeProjection { shape: stored, split,
                     fp8: *dtype == cuteafd_core::DType::F8E4M3 || converted });
             }
+        }
+        let head_name = format!("{}.weight", cfg.head());
+        if checkpoint.converts_to_fp8(&head_name) {
+            let selected = checkpoint.projection(cfg.head())?;
+            let crate::plan::checkpoint::ProjectionStorage::Native { dtype, shape } = &selected.storage
+                else { anyhow::bail!("selected FP8 head is not native"); };
+            ensure!(*dtype == cuteafd_core::DType::Bf16 && *shape == [cfg.vocab_size,cfg.hidden],
+                "selected FP8 vocabulary header differs from logical head");
+            inventory.native.insert(cfg.head().into(), NativeProjection {
+                shape: fp8_role(cfg, &head_name).stored_shape([shape[0],shape[1]])?,
+                fp8: true, split: CoreSplit::Whole });
         }
         inventory.validate_groups(cfg)?;
         Ok(inventory)
@@ -341,6 +351,9 @@ pub struct CoreRankLayout {
     /// Decode and prefill target launches are serialized on the rank-0 stream.
     pub target_head: Option<ProjectionScratchLayout>,
     pub draft_head: Option<ProjectionScratchLayout>,
+    /// Independent target/drafter scratch for the shared block-FP8 head executor.
+    pub fp8_head_scratch: Option<usize>,
+    pub fp8_draft_head_scratch: Option<usize>,
     pub retained_rows: usize,
     pub receive_suffix: usize,
 }
@@ -356,6 +369,7 @@ impl CoreRankLayout {
         }
         if let Some(stages) = &self.stages { for stage in stages { add(stage.bytes()?)?; } }
         for bytes in self.native_scratch { add(bytes)?; }
+        for bytes in self.fp8_head_scratch.iter().chain(&self.fp8_draft_head_scratch) { add(*bytes)?; }
         // Native attention keeps F32 partials; K6 down keeps its BF16 wire ABI.
         add(self.retained_rows.checked_mul(hidden).and_then(|n| n.checked_mul(self.attention_partial_bytes + self.down_partial_bytes + 4))
             .context("GLM K6 retained plane extent overflow")?)?;
@@ -407,6 +421,7 @@ impl CoreCharges {
             }
         }
         let head = core.get_weight(cfg.head()).map(|p| CoreWeightLayout::new(p, TrellisSide::Output, 0, 1)).transpose()?;
+        let fp8_head = core.native.get(cfg.head());
         let mut programs = std::collections::BTreeSet::new();
         let mut geometries = std::collections::BTreeSet::new();
         for weight in bodies.iter().flatten().chain(head.iter()) {
@@ -416,8 +431,16 @@ impl CoreCharges {
             }
         }
         use crate::placement::planner::native_attention::{NativeProgram, NativePrograms};
-        let native_manifest = native.iter().any(|weights| !weights.is_empty())
+        let native_manifest = (native.iter().any(|weights| !weights.is_empty()) || fp8_head.is_some())
             .then(|| crate::placement::inventory::ProgramsManifest::from_manifest(manifest)).transpose()?;
+        let fp8_head_scratch = fp8_head.map(|head| -> Result<usize> {
+            let layout = NativeLayout { stem: cfg.head().into(), shape: head.shape, fp8:true,
+                rank:0,ranks:1,split:CoreSplit::Whole };
+            let selected = NativePrograms::resolve(&[NativeProgram { layout:&layout,
+                output:cuteafd_ffi::draft_projection::ProjectionOutput::F32 }],64,native_manifest.as_ref())?;
+            programs.extend(selected.programs);
+            Ok(usize::try_from(selected.fp8_scratch_bytes)?)
+        }).transpose()?;
         let mut native_scratch = vec![[0usize; 2]; ranks];
         for (rank, weights) in native.iter().enumerate() {
             let requests = weights.iter().map(|layout| NativeProgram { layout,
@@ -532,6 +555,8 @@ impl CoreCharges {
                     .and_then(|n| n.checked_mul(unit.max(64))).and_then(|n| n.checked_mul(cfg.hidden))
                     .and_then(|n| n.checked_mul(attention_partial_bytes)).context("GLM K6 receive suffix overflow")? } else { 0 },
                 native: native[rank].clone(), native_scratch: native_scratch[rank], attention_partial_bytes,
+                fp8_head_scratch: if rank == 0 { fp8_head_scratch } else { None },
+                fp8_draft_head_scratch: if rank == 0 && draft_rows.is_some() { fp8_head_scratch } else { None },
                 body, target_head, draft_head, down_partial_bytes,
             });
         }
@@ -750,7 +775,8 @@ mod tests {
         // Whole-core GLM FP8 remains a separate executor qualification, not a silent skip.
         let fp8 = crate::plan::Checkpoint::open_view(&CheckpointView::select(dir.path(), CoreView::Fp8Compact)?)?;
         assert!(mtp.keys().all(|name| !fp8.converts_to_fp8(name)));
-        assert!(CoreInventory::from_checkpoint(&cfg, &fp8).unwrap_err().to_string().contains("cannot execute block FP8"));
+        let core = CoreInventory::from_checkpoint(&cfg, &fp8)?;
+        assert!(core.native.get(cfg.head()).is_some_and(|head| head.fp8));
         Ok(())
     }
 

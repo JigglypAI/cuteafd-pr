@@ -218,13 +218,15 @@ pub(crate) enum GlmHead<'a> {
     /// Shared with the token embedding (one rank-0 owner of both tables).
     RowFp8(std::rc::Rc<crate::shared::token_io::native::NativeVocabulary<'a>>),
     K6(CoreWeights<'a>),
+    BlockFp8(crate::shared::memory::device::DeviceOwner<'a, crate::shared::native_attention::NativeAttentionWeights<'a>>),
 }
 
 impl<'a> GlmHead<'a> {
     /// Device bytes of the head only; TokenEmbedding charges the embedding table.
     pub fn bytes(&self) -> usize {
         match self { Self::Bf16(head) => head.buffer.bytes, Self::RowFp8(owner) => owner.head.residency().bytes,
-            Self::K6(head) => head.payload.buffer.bytes + head.suh.buffer.bytes + head.svh.buffer.bytes }
+            Self::K6(head) => head.payload.buffer.bytes + head.suh.buffer.bytes + head.svh.buffer.bytes,
+            Self::BlockFp8(head) => head.values.buffer.bytes + head.scales.as_ref().map_or(0,|s|s.buffer.bytes) }
     }
 
     /// All resident head components, in read order; rank 1 never calls this.
@@ -234,6 +236,8 @@ impl<'a> GlmHead<'a> {
             Self::RowFp8(owner) => [owner.head.payload(), owner.head.scales()]
                 .map(|b| (b.ptr.cast_const(), b.bytes)).to_vec(),
             Self::K6(head) => trellis_ranges(head.payload.buffer, head.suh.buffer, head.svh.buffer),
+            Self::BlockFp8(head) => std::iter::once(&head.values).chain(head.scales.iter())
+                .map(|owner|(owner.buffer.ptr.cast_const(),owner.buffer.bytes)).collect(),
         }
     }
 
@@ -241,7 +245,7 @@ impl<'a> GlmHead<'a> {
     pub fn bf16(&self) -> Result<&DeviceAllocation<'a>> {
         match self { Self::Bf16(head) => Ok(head),
             Self::RowFp8(_) => anyhow::bail!("this diagnostic reads a BF16 head; the EXLR8 checkpoint's head is row-FP8"),
-            Self::K6(_) => anyhow::bail!("this diagnostic reads a BF16 head; the checkpoint's head is native K6") }
+            Self::K6(_) | Self::BlockFp8(_) => anyhow::bail!("this diagnostic requires a BF16 target head") }
     }
 
     /// The head the DFlash2 drafter borrows (its only resident copy).
@@ -253,7 +257,7 @@ impl<'a> GlmHead<'a> {
             Self::RowFp8(owner) => TargetHead::Launch(Box::new(move |x, logits, rows, stream| unsafe {
                 owner.head_logits(x, logits, rows, stream)
             })),
-            Self::K6(_) => anyhow::bail!("native K6 target head needs the drafter's admitted projection scratch"),
+            Self::K6(_) | Self::BlockFp8(_) => anyhow::bail!("native target head needs the drafter's admitted projection scratch"),
         })
     }
 }
@@ -1182,6 +1186,37 @@ impl<'a> GlmLoader<'a> {
                     let actual = [("payload", weights.payload.buffer), ("suh", weights.suh.buffer), ("svh", weights.svh.buffer)]
                         .into_iter().map(|(suffix, buffer)| (format!("glm.weights.gpu.0.core.head.{suffix}"), buffer)).collect();
                     head = Some(GlmHead::K6(weights));
+                    actual
+                }
+                routes::Operation::NativeAttention(layout) => {
+                    use crate::shared::native_attention::{attention_records, AttentionRecord, NativeAttentionWeights};
+                    let device = Device { library:self.library,id:self.device };
+                    let owner = device.own(|| {
+                        let values = self.allocate("native.head.values",layout.shape[0]*layout.shape[1])?;
+                        let scales = self.allocate("native.head.scales",(layout.shape[0]/128*layout.shape[1]/128*4).max(256))?;
+                        let selected = checkpoint.projection(&layout.stem)?;
+                        let dense = crate::shared::experts::rtx::dense::DenseLoad::mount(self.library);
+                        let cuteafd_loader::plan::checkpoint::ProjectionStorage::Native { shape, .. } = &selected.storage
+                            else { anyhow::bail!("FP8 target head source is not native"); };
+                        dense.admit_mount(cuteafd_loader::placement::families::glm5::weights::native_attention_mount(
+                            &layout,[shape[0],shape[1]],true)?)?;
+                        for record in attention_records(self.catalog.snapshot(),&selected,checkpoint.projection_view(&layout.stem),
+                            &layout,cuteafd_loader::families::glm5::core::fp8_role(cfg,&format!("{}.weight",layout.stem)),
+                            crate::shared::fp8_linear::Fp8Scales::Amax,values.buffer,Some(scales.buffer))? {
+                            match (&self.push,record) {
+                                (Some(push),AttentionRecord::Operand(record)) => push.dense.operand(record)?,
+                                (Some(push),AttentionRecord::Step(record)) => push.dense.step(record)?,
+                                (None,AttentionRecord::Operand(record)) => dense.operand(record)?,
+                                (None,AttentionRecord::Step(record)) => dense.step(record,self.stream)?,
+                            }
+                        }
+                        // SAFETY: final arena owners remain live until all load work drains.
+                        unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+                        Ok(NativeAttentionWeights { layout,values,scales:Some(scales) })
+                    })?;
+                    let actual = vec![("glm.weights.gpu.0.native.head.values".into(),owner.values.buffer),
+                        ("glm.weights.gpu.0.native.head.scales".into(),owner.scales.as_ref().unwrap().buffer)];
+                    head = Some(GlmHead::BlockFp8(owner));
                     actual
                 }
                 _ => anyhow::bail!("invalid global weight operation"),
