@@ -239,7 +239,7 @@ pub(crate) mod tests {
         use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
         let root = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME")?)
             .join(".cache/cuteafd/builds/media-tower-arena-replay-fixture");
-        let fixture = Fixture::build_in(&root)?;
+        let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
         fixture.configure_memory(&library, 0, 16usize << 30)?;
         fixture.immediate_copies(&library)?;
@@ -284,18 +284,38 @@ pub(crate) mod tests {
     #[test]
     fn pushed_vision_and_pcm_arenas_match_mounted_bytes() -> Result<()> {
         let root = tempfile::tempdir()?;
-        cuteafd_loader::plan::testing::write_muse_media_snapshot(root.path(), &[0]);
-        let vision = TowerSpec::muse(root.path(), 4096)?;
+        let shard = root.path().join("tower.safetensors");
+        cuteafd_loader::plan::testing::write_safetensors(&shard, &[
+            cuteafd_loader::plan::testing::t("matrix", "BF16", &[8, 16]),
+            cuteafd_loader::plan::testing::t("vector", "BF16", &[8]),
+        ]);
+        let headers = cuteafd_loader::read_safetensors_metadata(&shard)?;
+        let reads = headers.into_iter().enumerate().map(|(index, metadata)| super::super::TensorRead {
+            path: shard.clone(), metadata, destination: index * 256, vector: index == 1,
+        }).collect::<Vec<_>>();
+        let vision = TowerSpec { native: cuteafd_ffi::vision::VisionSpec {
+            abi_version: 2, head_dim: 8, inv_freq: 512, weight_bytes: 520, ..Default::default()
+        }, reads };
         seed_payloads(vision.reads.iter().map(|read| (read.path.as_path(), &read.metadata)));
         let constants = vision.frequency_bytes();
         assert_replayed_arena(root.path(), &vision.load_weights()?,
             Some((vision.native.inv_freq as usize, &constants)), |address|
                 Ok(Contribution::prepare(0, Some((&vision, address)), None, None, None)?.records()))?;
-        let pcm = PcmTowerSpec::from_snapshot(root.path(), 19200)?;
-        seed_payloads(pcm.push_reads().map(|read| (read.path.as_path(), &read.metadata)));
-        let plan = cuteafd_loader::media::pcm_audio::PcmAudioPlan::from_snapshot(root.path())?;
-        assert_replayed_arena(root.path(), &plan.read_weights(plan.weight_bytes())?, None, |address|
-            Ok(Contribution::prepare(0, None, Some((&pcm, address)), None, None)?.records()))?;
+        // The PCM branch is direct-copy-only; the full-shape ledger test above
+        // already validates every real PCM source and owner. Replay a private
+        // miniature of those exact records instead of a second 236 MiB buffer.
+        let mut pcm = vision.clone();
+        for read in &mut pcm.reads { read.vector = false; }
+        let expected = pcm.load_weights()?;
+        assert_replayed_arena(root.path(), &expected,
+            Some((pcm.native.inv_freq as usize, &pcm.frequency_bytes())), |address| {
+                let mut records = Records::default();
+                for read in &pcm.reads {
+                    append(&mut records, 0, address, pcm.native.weight_bytes as usize,
+                        &read.path, &read.metadata, read.destination, false)?;
+                }
+                Ok(records)
+            })?;
         Ok(())
     }
     #[test]

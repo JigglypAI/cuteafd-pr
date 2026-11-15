@@ -81,6 +81,11 @@ LIVE_PLANNERS = ('families::deepseek_v4::placement_tests::planner_equals_runtime
                  'families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4_measured',
                  'serving_capacity::v4_placement::tp2_tests::real_tp2_costs_match_catalog_reference')
 INSTALLED_PLANNERS = (
+    'openai::chat::mistral::tests::served_snapshot_is_recognized_and_matches_the_fixture_when_present',
+    'openai::chat::qwen4::tests::served_snapshots_match_the_fixture_when_present',
+    'openai::chat::muse::tests::served_snapshot_matches_the_fixture_when_present',
+    'openai::chat::glm5::tests::served_snapshot_template_matches_the_fixture_when_present',
+    'openai::chat::glm5::tests::vision_template::installed_official_and_mc_templates_follow_vision_policy_when_present',
     'installed_mc_views_cover_executable_projection_manifests',
     'installed_qwen_hybrid_min_sim_and_dual_publish_exact_layer_homes',
     'installed_dense_qwen_one_and_two_rtx_publish_exact_native_owners',

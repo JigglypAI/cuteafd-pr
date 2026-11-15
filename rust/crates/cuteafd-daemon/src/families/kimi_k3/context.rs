@@ -578,6 +578,7 @@ mod tests {
                     rows: 256, waves: 1, prefill_rows: Some(256), slots: 2, marks: 2, max_context: 8192,
                     context: cuteafd_loader::placement::planner::Context::pinned(8192), pool_tokens: Some(8192),
                     graphs: true, ffn_mode: Default::default(), hosted_layers: None, draft: None, verify_rows: 0, prefix: None,
+                    prove_serve_admission: false,
                 })?;
             let engine = loaded.engine;
             let family = engine.prefix_family()?;
@@ -803,7 +804,7 @@ mod tests {
         use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
         let root = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME")?)
             .join(".cache/cuteafd/builds/kimi-context-owner-fixtures");
-        let fixture = Fixture::build_in(&root)?;
+        let fixture = Fixture::build_for_tests()?;
         for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
             let tag = format.program_suffix();
             let mut programs = Vec::new();

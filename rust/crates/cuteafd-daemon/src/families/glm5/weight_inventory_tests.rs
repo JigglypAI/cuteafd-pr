@@ -489,7 +489,7 @@ fn original_ml4_native_inventory_equals_routes_and_single_arena_charges() -> Res
 fn compact_dso() -> Result<(Fixture, NativeLibrary)> {
     let root = PathBuf::from(std::env::var_os("HOME").context("HOME")?)
         .join(".cache/cuteafd/builds/glm-weight-inventory-fixtures");
-    let fixture = Fixture::build_in(&root)?;
+    let fixture = Fixture::build_for_tests()?;
     let library = fixture.load()?;
     for device in [0, 1] {
         fixture.configure_memory(&library, device, 1 << 30)?;

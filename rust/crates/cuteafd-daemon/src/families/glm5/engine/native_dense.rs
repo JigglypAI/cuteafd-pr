@@ -295,6 +295,10 @@ impl<'a> GlmEngine<'a> {
         if Self::core_split(layer, key) {
             self.reduce_projection(rank, index, lane, w, layer, key, scalar_rows(rows)?, w.delta.buffer)?;
             self.norm_full(rank, w, weight, 1, rows, w.delta.buffer.ptr, w.delta.buffer.ptr)
+        } else if self.cfg.variant.is_glm() {
+            self.run_on(rank, "glm_norm_head_split", &[("residual", w.h.buffer.ptr),
+                ("delta0", first), ("delta1", second), ("weight", weight), ("out", w.x.buffer.ptr)],
+                &[rows, Scalar::I32(2)])
         } else { self.norm_full(rank, w, weight, 2, rows, first, second) }
     }
 

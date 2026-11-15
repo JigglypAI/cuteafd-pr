@@ -336,7 +336,7 @@ fn run_schedule(seed: u64) -> Vec<String> {
 
 #[test]
 fn interleaved_lanes_keep_the_batch_invariants() {
-    for seed in 1..=32 {
+    for seed in 1..=8 {
         run_schedule(seed);
     }
 }

@@ -97,11 +97,16 @@ mod tests {
 
     #[test]
     fn production_reconciliation_registers_tp2_and_spark_owner_rows() -> Result<()> {
-        let status = std::process::Command::new(std::env::current_exe()?)
-            .args(["--exact", "families::step5::admission::tests::public_max_card_planner_equals_measured_daemon_before_allocation", "--nocapture"])
-            .env("CUTEAFD_TEST_STEP5_RECONCILIATION", "1").status()?;
-        ensure!(status.success(), "isolated Step-5 production publication regression failed");
-        Ok(())
+        const CHILD: &str = "CUTEAFD_TEST_STEP5_RECONCILIATION";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "families::step5::admission::tests::production_reconciliation_registers_tp2_and_spark_owner_rows", "--nocapture"])
+                .env(CHILD, "1").output()?;
+            ensure!(output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "isolated Step-5 reconciliation: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return Ok(());
+        }
+        planner_equals_measured_daemon(false)
     }
 
     #[test]
@@ -220,6 +225,7 @@ mod tests {
         // 96 GiB card; FP8 KV does. The contract refuses with the feasible
         // context instead of clamping the pool and serving a smaller one.
         let full_context_fits = !nvfp4;
+        let plan_input = testing::BudgetedPlanInput::open(dir.path())?;
         for ((context, pool, launchable, host, entries), kv_format) in [
             (262_144, Some(262_144), true, None, 20),
             (1_048_576, None, full_context_fits, None, 20),
@@ -229,6 +235,10 @@ mod tests {
         ].into_iter().flat_map(|case| [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8]
             .into_iter().map(move |format| (case, format))) {
+            if std::env::var_os("CUTEAFD_TEST_STEP5_RECONCILIATION").is_some()
+                && !(context == 262_144 && kv_format == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8) {
+                continue;
+            }
             let opts = LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
                 step5_kv: kv_format,
                 rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; ranks],
@@ -239,8 +249,7 @@ mod tests {
                 mimo_prefix_entries: entries,
                 ..Default::default()
             };
-            let report = plan::plan(
-                dir.path(),
+            let report = plan_input.plan(
                 &PlanOptions {
                     placement: ExpertPlacement::Sparks { ranks: sparks },
                     draft_ownership: Some(plan::spec::DraftOwnership::None),

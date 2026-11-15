@@ -17,11 +17,11 @@ spec.loader.exec_module(compare_sm)
 
 
 @pytest.mark.parametrize("scope", ["all", "suspects"])
-def test_minimax_adapter_groups_select_only_existing_four_head_programs(scope):
+def test_minimax_adapter_groups_cover_whole_and_half_head_programs(scope):
     jobs = {name: (script, args) for name, script, args in compare_sm.jobs(scope)}
     for label, selectors in {
-        "attention": "attention_decode,attention_extend",
-        "kv-pack": "kv_pack",
+        "attention": "attention_decode,attention_extend,attention_decode_h32,attention_extend_h32",
+        "kv-pack": "kv_pack,kv_pack_h2",
         "index-producer": "index_producer",
         "indexer": "index_decode,index_prefill",
     }.items():
@@ -121,9 +121,12 @@ def test_native_attention_groups_cover_checkpoint_shapes_and_f32_partials():
                                                         (6144,12288),(6144,3072)}
     assert exporter.native_attention_bf16_f32_shapes() == {(7168,6144),(4096,6144),(8192,4096),(6144,8192),(8192,2048)}
     programs = exporter.native_attention_programs()
+    muse_core = {(4096,8192),(1024,8192),(512,8192),(2048,8192),(8192,2048)}
     expected = {f"n{n}_k{k}_m{rows}{suffix}"
-                for n,k in set().union(*shapes.values()) for rows in (64,4096)
-                for suffix in (("", "_f32") if (n,k) in exporter.native_attention_f32_shapes() else ("",))}
+                for n,k in set().union(*shapes.values()) | muse_core for rows in (64,4096)
+                for suffix in (("", "_f32") if (n,k) in exporter.native_attention_f32_shapes() | {(8192,2048)} else ("",))}
+    expected.add("n202112_k8192_m64_f32")
+    assert "n202112_k8192_m4096_f32" not in expected, "head is microbatched at64rows"
     assert len(programs) == len(expected) and {p[0] for p in programs} == expected
     jobs = {job[0]: job[1:] for job in compare_sm.jobs("all")}
     assert jobs["native-attention-fp8"] == ("export_b12x_dsv4_aot.py",
@@ -669,6 +672,36 @@ def test_expected_removals_main_gates_exact_aggregate_and_baseline(tmp_path, mon
     with pytest.raises(SystemExit) as error:
         compare_sm.main()
     assert error.value.code == 2
+
+
+def test_main_reports_additions_without_changing_source_gate(tmp_path, monkeypatch, capsys):
+    group = tmp_path / "group"
+    group.mkdir()
+    left, right = exports(group)
+    baseline = tmp_path / "source"
+    (baseline / "third_party").mkdir(parents=True)
+    (baseline / "third_party/sparkinfer.lock.json").write_text("{}")
+    left.rename(group / "baseline")
+    right = right.rename(group / "candidate")
+    context_path = right / "comparison-context.json"
+    context = json.loads(context_path.read_text())
+    context["sms"] = 188
+    context_path.write_text(json.dumps(context))
+    (right / "added.o").write_bytes(b"host" + cuda_elf())
+    (right / "added.h").write_text("additive ABI\n")
+    monkeypatch.setattr(compare_sm, "jobs", lambda _: [("group", "export.py", [])])
+    real_load = compare_sm.load_file
+    monkeypatch.setattr(compare_sm, "load_file", lambda name, path:
+        SimpleNamespace(check_path=lambda _: None) if name == "cuteafd_build_filesystem" else real_load(name, path))
+    argv = ["compare-sm-exports.py", "--compare-only", "--require-identical", "--output-dir", str(tmp_path),
+            "--baseline-source", str(baseline)]
+    monkeypatch.setattr(compare_sm.sys, "argv", argv)
+    assert compare_sm.main() == 0
+    assert "1 added/removed." in capsys.readouterr().out
+    report = json.loads((tmp_path / "comparison.json").read_text())
+    assert not report["failures"]
+    assert report["groups"][0]["added_programs"] == ["added.o"]
+    assert report["groups"][0]["removed_programs"] == []
 
 
 def test_missing_cubins_fail_closed(tmp_path):

@@ -13,7 +13,7 @@ import pytest
 from test_run_family_dispatch import GLMF_TWO_LAYER, _family_launch_result
 
 ROOT = Path(__file__).resolve().parents[2]
-HOST = socket.gethostname().split('.')[0]
+HOST = 'coordinator-test'
 SPEC = importlib.util.spec_from_file_location('wip_cards_spark_profiling', ROOT / 'scripts/bench/wip-cards.py')
 cards = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cards)

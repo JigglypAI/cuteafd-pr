@@ -33,11 +33,11 @@ fn reasoning_only_retained_turn_obeys_official_v15_nonempty_constraint() {
 
 #[test]
 fn served_snapshot_is_recognized_and_matches_the_fixture_when_present() {
-    let snapshot = std::path::Path::new("/mnt/sparknest/hf-home/hub/models--mistralai--Mistral-Large-4-1T-A52B/snapshots/f12dabdc0c1e99e7f7924461a6f308859b05af4d");
-    if !snapshot.exists() { return; }
-    assert!(MistralEncoding::recognizes(snapshot).unwrap());
+    let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required")).join("hub/models--mistralai--Mistral-Large-4-1T-A52B/snapshots/f12dabdc0c1e99e7f7924461a6f308859b05af4d");
+    assert!(snapshot.exists(), "required installed snapshot missing: {}", snapshot.display());
+    assert!(MistralEncoding::recognizes(&snapshot).unwrap());
     assert_eq!(std::fs::read_to_string(snapshot.join("chat_template.jinja")).unwrap(), fixtures::TEMPLATE);
-    assert_eq!(MistralEncoding::from_snapshot(snapshot).unwrap().tokens(), encoding().tokens());
+    assert_eq!(MistralEncoding::from_snapshot(&snapshot).unwrap().tokens(), encoding().tokens());
 }
 
 #[test]

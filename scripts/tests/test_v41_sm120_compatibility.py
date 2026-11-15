@@ -11,7 +11,9 @@ import tempfile
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-BUILD_ROOT = Path(os.environ.get("CUTEAFD_TEST_BUILD_ROOT", Path.home() / ".cache/cuteafd/builds/plat1-sm120/native-host-tests"))
+@pytest.fixture(autouse=True)
+def build_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "BUILD_ROOT", tmp_path / "native-host-tests", raising=False)
 
 CUDA = r"""
 #pragma once

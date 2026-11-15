@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 /// worker. Use the checked-in renderer fixture rather than guessing its overhead.
 pub fn with_fake_token_count(router: axum::Router) -> axum::Router {
     async fn count(axum::Json(body): axum::Json<serde_json::Value>) -> axum::Json<serde_json::Value> {
+        static OVERHEAD: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../cuteafd-api/tests/fixtures/v41-encoding/deepseek-v4.1-flash.json")).unwrap();
         let case = fixture["cases"].as_array().unwrap().iter().find(|case| {
@@ -16,9 +17,11 @@ pub fn with_fake_token_count(router: axum::Router) -> axum::Router {
                 && messages[0]["role"] == "user" && messages[0]["content"] == "hello")
                 && case["request"]["thinking"]["type"] == "disabled"
         }).expect("single-user thinking-off template fixture");
+            case["prompt"].as_str().unwrap().chars().count() - "hello".chars().count()
+        });
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
         assert_eq!(body["thinking"]["type"], "disabled");
-        let overhead = case["prompt"].as_str().unwrap().chars().count() - "hello".chars().count();
+        let overhead = *OVERHEAD;
         axum::Json(serde_json::json!({"input_tokens": overhead + body["messages"][0]["content"].as_str().unwrap().chars().count(),
             "exact_token_count": true}))
     }
