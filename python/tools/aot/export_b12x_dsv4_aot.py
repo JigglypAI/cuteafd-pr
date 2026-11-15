@@ -1861,6 +1861,18 @@ def main() -> None:
         from b12x.integration.cuteafd import INKLING2_SMALL
         manifest["families"]["inkling2"] = dataclasses.asdict(INKLING2_SMALL)
         work += [("inkling2", *item) for item in inkling2_attention_programs(args.decode_rows, args.prefill_rows)]
+    if globals().get("_catalog_only"):
+        catalog = []
+        for family, suffix, op, params, _ in work:
+            if selected is not None and suffix not in selected:
+                continue
+            stem = (suffix if family == "kimi_split" else
+                    f"exlr8_dense_{suffix}" if family == "minimax" and op in ("dense_mxfp8", "dense_mxfp8_quant")
+                    else f"{family}_{suffix}")
+            sms = (170, 188) if props.minor == 0 and op == "sparse_mla" and params.get("route") == "decode" else (None,)
+            catalog.append({"name": stem, "labels": [stem if n is None else f"{stem}_sm{n}" for n in sms]})
+        (output / "program-catalog.json").write_text(json.dumps({"manifest": manifest, "programs": catalog}, indent=2) + "\n")
+        return
     # Per-program reuse (python/tools/lib/_export_cache.py): only under the export
     # cache's recorder. Programs compile independently of which others the
     # geometry list requests; their recipes read every argument except these.

@@ -810,3 +810,34 @@ def test_profile_cache_keeps_changing_module_bindings(tmp_path):
     module.__file__ = str(second)
     recorder._record_dependencies([module])
     assert recorder.frames == {"first.py", "second.py"}
+
+
+def test_scoped_recorder_rearms_code_and_excludes_previous_program(tmp_path):
+    first = load_recipe(tmp_path / "first.py", "def recipe():\n    return 1\n")
+    second = load_recipe(tmp_path / "second.py", "def recipe():\n    return 2\n")
+    recorder = records.Recorder(tmp_path, tmp_path / "output")
+    recorder.scoped = True
+    recorder.start_monitoring()
+    try:
+        recorder.construct(first.recipe)
+        assert "first.py" in recorder.reads()
+        recorder.construct(second.recipe)
+        assert "second.py" in recorder.reads()
+        assert "first.py" not in recorder.reads()
+        recorder.construct(first.recipe)
+        assert "first.py" in recorder.reads()
+        assert "second.py" not in recorder.reads()
+    finally:
+        recorder.stop_monitoring()
+
+
+def test_program_shards_keep_card_plans_together_and_reject_duplicates():
+    spec = importlib.util.spec_from_file_location("shards_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    catalog = {"programs": [{"name": "a", "labels": ["a_sm170", "a_sm188"]},
+                            {"name": "b", "labels": ["b"]}, {"name": "c", "labels": ["c"]}]}
+    assert publisher.program_shards(catalog, 2) == [["a_sm170", "a_sm188", "c"], ["b"]]
+    catalog["programs"].append(catalog["programs"][0])
+    with pytest.raises(ValueError, match="duplicate"):
+        publisher.program_shards(catalog, 2)

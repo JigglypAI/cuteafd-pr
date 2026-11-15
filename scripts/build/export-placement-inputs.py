@@ -131,10 +131,118 @@ def worker_command(payload, staging):
     WIP builds and republishes then reuse each other's programs (export-cache.py):
     keys are what each program read and captured, not which tool asked for it.
     """
+    payload = {**payload, "host_admission": True}
     worker = [sys.executable, str(ROOT / "scripts/build/compare-sm-exports.py"), "--_worker", json.dumps(payload)]
     if os.environ.get("CUTEAFD_EXPORT_CACHE", "off") in ("", "off"):
         return worker
     return [sys.executable, str(ROOT / "scripts/build/export-cache.py"), "run", "--build-dir", str(staging), "--", *worker]
+
+
+def default_workers():
+    sys.path.insert(0, str(ROOT / "python/tools/lib"))
+    from _export_jobs import export_jobs as admitted_jobs, host_context_cap
+    return max(1, min(admitted_jobs(), host_context_cap()))
+
+
+def program_shards(catalog, workers):
+    programs = catalog["programs"]
+    names = [program["name"] for program in programs]
+    labels = [label for program in programs for label in program["labels"]]
+    if len(set(names)) != len(names) or len(set(labels)) != len(labels):
+        raise ValueError("program catalog contains duplicate names or labels")
+    count = min(workers, len(programs))
+    return [[label for program in programs[index::count] for label in program["labels"]]
+            for index in range(count)]
+
+
+def merge_program_shards(catalog, directories, output):
+    manifest = catalog["manifest"]
+    programs, records, plans = {}, {}, {}
+    headers, includes = {}, {}
+    contexts = []
+    for directory in directories:
+        part = json.loads((directory / "dsv4_programs.json").read_text())
+        if {key: value for key, value in part.items() if key != "programs"} != {key: value for key, value in manifest.items() if key != "programs"}:
+            raise ValueError("shard manifest differs from catalog")
+        for program in part["programs"]:
+            if program["name"] in programs:
+                raise ValueError("duplicate shard program")
+            programs[program["name"]] = program
+        for name, target in (("program-records.json", records), ("comparison-plans.json", plans)):
+            data = json.loads((directory / name).read_text())
+            if target.keys() & data.keys():
+                raise ValueError(f"duplicate shard metadata: {name}")
+            target.update(data)
+        lines = (directory / "dsv4_programs.h").read_text().splitlines()
+        for line in lines:
+            if line.startswith('#include "'):
+                includes[line.split('"')[1].removesuffix('.h')] = line
+            elif line.startswith("#define CUTEAFD_DSV4_PROGRAMS "):
+                for entry in line.removeprefix("#define CUTEAFD_DSV4_PROGRAMS ").split("}, "):
+                    entry = entry if entry.endswith("}") else entry + "}"
+                    headers[entry.split('"')[1]] = entry
+        contexts.append(json.loads((directory / "comparison-context.json").read_text()))
+        for path in directory.iterdir():
+            if path.suffix in (".o", ".h") and path.name != "dsv4_programs.h":
+                if (output / path.name).exists():
+                    raise ValueError(f"duplicate shard artifact: {path.name}")
+                shutil.copy2(path, output / path.name)
+    names = [program["name"] for program in catalog["programs"]]
+    labels = [label for program in catalog["programs"] for label in program["labels"]]
+    if set(programs) != set(names) or set(records) != {label + ".o" for label in labels} or set(plans) != set(labels):
+        raise ValueError("shards do not cover catalog exactly")
+    manifest = {**manifest, "programs": [programs[name] for name in names]}
+    (output / "dsv4_programs.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    (output / "dsv4_programs.h").write_text("\n".join([
+        "#pragma once", *[includes[label] for label in labels],
+        f"#define CUTEAFD_DSV4_CC_MINOR {manifest['capability'][1]}",
+        "#define CUTEAFD_DSV4_PROGRAMS " + ", ".join(headers[name] for name in names), ""]))
+    for name, data in (("program-records.json", records), ("comparison-plans.json", {label: plans[label] for label in labels})):
+        (output / name).write_text(json.dumps(data, indent=2, sort_keys=name == "program-records.json") + "\n")
+    context = contexts[0]
+    context["source_reads_sha256"] = {name: value for part in contexts for name, value in part["source_reads_sha256"].items()}
+    context["seconds"] = sum(part["seconds"] for part in contexts)
+    context["backend_reuse"] = {key: sum(part.get("backend_reuse", {}).get(key, 0) for part in contexts) for key in ("hits", "misses")}
+    (output / "comparison-context.json").write_text(json.dumps(context, indent=2) + "\n")
+    return context
+
+
+def compile_program_shards(job, staging, previous, lock, timeout, backend_cache, verify_skips, pool, workers):
+    name, exporter, extra = job
+    output = staging / name
+    output.mkdir(parents=True)
+    scratch = staging / ".program-shards"
+    scratch.mkdir()
+    catalog_dir = scratch / "catalog"
+    catalog_dir.mkdir()
+    payload = dict(sms=188, exporter=exporter, args=extra, program_records=True)
+    if backend_cache:
+        payload["backend_cache"] = str(backend_cache)
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(ROOT))
+    started = time.monotonic()
+    with (catalog_dir / "export.log").open("w") as log:
+        subprocess.run(worker_command({**payload, "output": str(catalog_dir), "catalog_only": True}, staging),
+                       env=env, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=timeout)
+    catalog = json.loads((catalog_dir / "program-catalog.json").read_text())
+    setup = time.monotonic() - started
+    shards = program_shards(catalog, workers)
+
+    def compile_shard(item):
+        index, labels = item
+        directory = scratch / str(index)
+        directory.mkdir()
+        with (directory / "export.log").open("w") as log:
+            subprocess.run(worker_command({**payload, "output": str(directory), "selected_objects": labels}, staging),
+                           env=env, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=timeout)
+        return directory
+
+    directories = list(pool.map(compile_shard, enumerate(shards)))
+    summary = merge_program_shards(catalog, directories, output)
+    sm170 = check_job_sm170(job, staging, previous, timeout, env, verify_all=verify_skips)
+    summary["execution_stats"] = {"stage0_skipped": False, "verified_skip": False,
+                                  "catalog_seconds": setup, "shards": len(shards),
+                                  "wall_seconds": time.monotonic() - started, **sm170}
+    return summary
 
 
 def verified_job_files(previous, name):
@@ -189,8 +297,8 @@ def verified_metadata_bytes(path, lock):
 
 
 def verify_job_metadata(previous, current, lock, name):
-    old = {path.relative_to(previous): path for path in previous.rglob("*.json")}
-    new = {path.relative_to(current): path for path in current.rglob("*.json")}
+    old = {path.relative_to(previous): path for path in previous.rglob("*.json") if path.name != "program-timings.json"}
+    new = {path.relative_to(current): path for path in current.rglob("*.json") if path.name != "program-timings.json"}
     changed = sorted(str(path) for path in old.keys() | new.keys()
                      if path not in old or path not in new
                      or verified_metadata_bytes(old[path], lock) != verified_metadata_bytes(new[path], lock))
@@ -303,7 +411,13 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
 
     report_previous = previous
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        summaries = list(pool.map(compile_one, jobs))
+        if workers > 1 and jobs[0][0] == "programs" and "--geometry" in jobs[0][2]:
+            pending = [pool.submit(compile_one, job) for job in jobs[1:]]
+            programs = compile_program_shards(jobs[0], staging, previous, lock, timeout,
+                                              backend_cache, verify_skips, pool, workers)
+            summaries = [programs, *[future.result() for future in pending]]
+        else:
+            summaries = list(pool.map(compile_one, jobs))
     if sources != source_hashes() or lock != json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text()):
         raise ValueError("placement export sources changed during compilation")
     if any(summary.get("sparkinfer_revision") != lock["revision"]
@@ -346,7 +460,7 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
     # Preserve only the exact metadata needed to replay a job, not heavy objects.
     for name, _, _ in jobs:
         for source in (staging / name).rglob("*.json"):
-            if source.name == "export.log":
+            if source.name in ("export.log", "program-timings.json"):
                 continue
             target = destination / ".workers" / name / source.relative_to(staging / name)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -464,7 +578,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--staging", type=Path, help="staging directory on NVMe (required unless syncing an existing publication with --rsync-host)")
     parser.add_argument("--timeout", type=int, default=7200)
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=default_workers(),
+                        help="CPU export workers (default: host-admitted export jobs)")
     parser.add_argument("--previous", type=Path, help="previous publication to compare; writes CHANGES.json and CHANGES.md")
     parser.add_argument("--expect", type=Path, help="JSON list of export job groups expected to change")
     parser.add_argument("--backend-cache", type=Path, help="content-addressed lowered-MLIR cache on NVMe")

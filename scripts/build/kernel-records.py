@@ -368,6 +368,8 @@ class Recorder:
         self.read_counts = []
         self.dependency_paths = {}
         self.source_hashes = {}
+        self.scoped = False
+        self.job_paths = set()
 
     def source(self, path):
         if path not in self.dependency_paths:
@@ -407,6 +409,10 @@ class Recorder:
     def construct(self, function, *args, **kwargs):
         """Trace the entire recipe, including launch construction and scratch."""
         started = time.monotonic()
+        if self.scoped:
+            self.job_paths.update(self.opened | self.frames)
+            self.opened, self.frames = set(), set()
+            sys.monitoring.restart_events()
         self.latest = []
         self.construction = True
         try:
@@ -461,11 +467,12 @@ class Recorder:
     def reads(self):
         started = time.monotonic()
         paths = self.opened | self.frames
-        for name in set(sys.modules) - self.imported:
-            module = sys.modules.get(name)
-            path = self.source(getattr(module, "__file__", None))
-            if path:
-                paths.add(path)
+        if not self.scoped:
+            for name in set(sys.modules) - self.imported:
+                module = sys.modules.get(name)
+                path = self.source(getattr(module, "__file__", None))
+                if path:
+                    paths.add(path)
         active = self.active
         self.active = False
         try:
@@ -594,6 +601,7 @@ class Recorder:
             "programs": {key: value for key, value in self.timings.items() if isinstance(key, str)},
         }, indent=2, sort_keys=True) + "\n")
         (self.output / "program-records.json").write_text(json.dumps(records, indent=2, sort_keys=True) + "\n")
+        self.frames.update(self.job_paths)
         return records
 
 
