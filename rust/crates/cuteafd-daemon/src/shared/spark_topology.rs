@@ -517,7 +517,7 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                 "glmf" => { let cfg = testing::glm5_flash_config(3); testing::write_snapshot(root.path(), &cfg, &testing::glm5_flash_tensors(&cfg), None); ("fp8", 2048) }
                 "qwen4" => { let (tensors, _) = testing::qwen4_exl3(3, 4); testing::write_snapshot(root.path(), &testing::qwen4_config(3), &tensors, None); ("exl3-k4", 640) }
                 "dsv4p" => { testing::write_v4_pro_exl3_snapshot(root.path()); ("exl3-k23", 3072) }
-                "kimik3" => { testing::write_kimi_snapshot(root.path(), false); ("exl3-k23", 3072) }
+                "kimik3" => { testing::write_kimi_snapshot(root.path(), true); ("exl3-k23", 3072) }
                 _ => unreachable!(),
             };
             let catalog = cuteafd_loader::read_expert_catalog(root.path())?;

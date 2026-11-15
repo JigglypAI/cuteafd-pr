@@ -1874,7 +1874,7 @@ fn fp8_tp5_uses_width_recipe_but_still_requires_memory() {
 }
 
 fn native_outputs_snapshot() -> tempfile::TempDir {
-    let dir = exl3_core_snapshot();
+    let dir = exl3_snapshot();
     let root = dir.path();
     let mut index: Value = serde_json::from_slice(&std::fs::read(root.join("model.safetensors.index.json")).unwrap()).unwrap();
     let mut quant: Value = serde_json::from_slice(&std::fs::read(root.join("quantize_config.json")).unwrap()).unwrap();
