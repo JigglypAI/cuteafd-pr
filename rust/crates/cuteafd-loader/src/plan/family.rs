@@ -161,6 +161,8 @@ pub enum WholeExpertCombine {
 }
 
 pub trait Family: Sync {
+    /// Activation routes over already-resident FP8 weights; never weight conversion.
+    fn fp8_prefill_groups(&self) -> &'static [super::fp8_prefill::Group] { &[] }
     fn whole_expert_combine(&self) -> WholeExpertCombine { WholeExpertCombine::SumThenRound }
     fn id(&self) -> &'static str;
     /// Core inventory resolves native projections before role ownership is known.
