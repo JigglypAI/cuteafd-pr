@@ -2833,7 +2833,7 @@ impl<'a> GlmfEngine<'a> {
 
     /// One masked row of the native MLA prefill on rank `rank` (loads its kernel there).
     fn warm_mla_prefill(&self, rank: usize) -> Result<()> {
-        let Some(kernel) = crate::families::glm5::engine::native_mla_prefill() else { return Ok(()) };
+        let Some(kernel) = crate::families::glm5::engine::native_mla_prefill()? else { return Ok(()) };
         let layers = if rank == 0 { &self.weights.layers } else { &self.peer()?.layers };
         for heads in mla_prefill_head_widths(self.cfg.heads,
             layers.iter().map(|layer| (layer.attention, layer.attention_share))) {
@@ -5108,7 +5108,7 @@ impl<'a> GlmfEngine<'a> {
             let kv = caches.kv[index].as_ref().context("MLA trace without a record pool")?;
             std::fs::write(dir.join("mla_kv.bin"), self.download(kv, kv.buffer.bytes)?)?;
         }
-        if let (false, Some(kernel)) = (tables.decode, crate::families::glm5::engine::native_mla_prefill()) {
+        if let (false, Some(kernel)) = (tables.decode, crate::families::glm5::engine::native_mla_prefill()?) {
             let scale = (self.cfg.qk_nope_dim as f32).powf(-0.5);
             let stream = self.stream_of(rank);
             let launch = || self.on(rank, || {

@@ -3142,7 +3142,7 @@ impl<'a> GlmEngine<'a> {
                 &[rows, Scalar::I32(tables.table_width as i32), Scalar::I32(tables.table_stride as i32)])?;
         }
         // Shared-indexer layers read the previous full layer's `indices`.
-        if let (false, Some(kernel)) = (tables.decode, native_mla_prefill()) {
+        if let (false, Some(kernel)) = (tables.decode, native_mla_prefill()?) {
             let scale = ((self.cfg.qk_nope_head_dim + self.cfg.qk_rope_head_dim) as f32).powf(-0.5);
             // SAFETY: query, cache, indices, lengths and the attention output are
             // live buffers of the step's rows on this rank's stream.
@@ -3381,37 +3381,47 @@ pub(crate) fn tensor_fp8_prefill() -> bool {
 }
 
 /// Prefill sparse MLA kernel of glm_mla_prefill.cu (its `kernel` argument), or None for the
-/// b12x program: CUTEAFD_MLA_PREFILL=e4m3-p2 (2, the default: E4M3 query, two-term E4M3 P),
-/// e4m3 (1: one-term P), e4m3-q2 (3: two-term query), e4m3-q2p2 (4), f16 (0: the F16 kernel)
-/// or b12x.
-pub(crate) fn native_mla_prefill() -> Option<i32> {
-    static KERNEL: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
-    *KERNEL.get_or_init(|| match std::env::var("CUTEAFD_MLA_PREFILL").as_deref() {
-        Ok("b12x") => None,
-        Ok("f16") => Some(0),
-        Ok("e4m3") => Some(1),
-        Ok("e4m3-p2") | Err(_) => Some(2),
-        Ok("e4m3-q2") => Some(3),
-        Ok("e4m3-q2p2") => Some(4),
-        Ok(other) => {
-            tracing::warn!(value = other, "unknown CUTEAFD_MLA_PREFILL; using e4m3-p2");
-            Some(2)
-        }
-    })
+/// b12x program: CUTEAFD_MLA_PREFILL=e4m3-q2p2 (1, the default: two-term E4M3 query and P,
+/// about 7 significant bits each), f16 (0: the F16 reference kernel) or b12x. Any other value
+/// is an error.
+pub(crate) fn native_mla_prefill() -> Result<Option<i32>> {
+    static KERNEL: std::sync::OnceLock<std::result::Result<Option<i32>, String>> = std::sync::OnceLock::new();
+    KERNEL.get_or_init(|| mla_prefill_kernel(std::env::var("CUTEAFD_MLA_PREFILL").ok().as_deref()))
+        .clone().map_err(anyhow::Error::msg)
 }
 
-/// CUTEAFD_MLA_PREFILL_CHECK=1: after each prefill MLA, run every native kernel on its inputs and
-/// print their differences from the two-term E4M3 kernel (diagnostics; synchronizes, allocates).
+fn mla_prefill_kernel(value: Option<&str>) -> std::result::Result<Option<i32>, String> {
+    match value {
+        Some("b12x") => Ok(None),
+        Some("f16") => Ok(Some(0)),
+        Some("e4m3-q2p2") | None => Ok(Some(1)),
+        Some(other) => Err(format!("unknown CUTEAFD_MLA_PREFILL={other:?}: expected e4m3-q2p2, f16 or b12x")),
+    }
+}
+
+#[cfg(test)]
+mod mla_prefill_kernel_tests {
+    #[test]
+    fn the_default_is_the_two_term_kernel_and_removed_values_are_errors() {
+        use super::mla_prefill_kernel as kernel;
+        assert_eq!((kernel(None), kernel(Some("e4m3-q2p2")), kernel(Some("f16")), kernel(Some("b12x"))),
+            (Ok(Some(1)), Ok(Some(1)), Ok(Some(0)), Ok(None)));
+        for removed in ["e4m3", "e4m3-p2", "e4m3-q2", ""] {
+            assert!(kernel(Some(removed)).unwrap_err().contains("unknown CUTEAFD_MLA_PREFILL"), "{removed}");
+        }
+    }
+}
+
+/// CUTEAFD_MLA_PREFILL_CHECK=1: after each prefill MLA, run both native kernels on its inputs and
+/// print the F16 kernel's difference from the E4M3 kernel (diagnostics; synchronizes, allocates).
 pub(crate) fn mla_prefill_check() -> bool {
     static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CHECK.get_or_init(|| std::env::var("CUTEAFD_MLA_PREFILL_CHECK").is_ok_and(|v| v == "1"))
 }
 
-pub(crate) fn print_mla_check(layer: usize, stats: &[[f64; 3]; 5]) {
-    let names = ["f16", "e4m3", "e4m3-p2", "e4m3-q2", "e4m3-q2p2"];
-    println!("mla check layer {layer:2} (vs e4m3-q2p2, rms {:.3e}): {}", stats[4][2], (0..4)
-        .map(|k| format!("{} rel {:.2e} max {:.2e}", names[k], stats[k][0], stats[k][1]))
-        .collect::<Vec<_>>().join(" | "));
+pub(crate) fn print_mla_check(layer: usize, stats: &[[f64; 3]; 2]) {
+    println!("mla check layer {layer:2} (vs e4m3-q2p2, rms {:.3e}): f16 rel {:.2e} max {:.2e}",
+        stats[1][2], stats[0][0], stats[0][1]);
 }
 
 /// GLM's per-unit hooks over the unchanged lane arithmetic. Unit `u` holds

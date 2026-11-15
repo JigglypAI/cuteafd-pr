@@ -1747,7 +1747,7 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    wave is bound by bytes (FC1 BF16 input gathers per N tile, FC2 partial
    round trip ~2 ms, top-k sum 1.6 ms) and the FC1 rotation, not MMA rate.
    Coordinator GPU-only 8K prefill is 2.7 s, half of it the sparse MLA prefill
-   kernel. E4M3 MLA prefill (`work/glm-mla-fp8`, merged, default e4m3-p2;
+   kernel. E4M3 MLA prefill (`work/glm-mla-fp8`, merged; default since 2026-11-15 the two-term query and P kernel, the one-term kernels deleted;
    real-expert TP4 gate: KL vs golden 0.0364 -> 0.0379, NLL 2.4680 -> 2.4717,
    deterministic) cuts the GPU-only 8K prefill 2.89 -> 2.57 s, but 8K with
    Sparks stays 2.95 s (GPU wait 2.11 -> 1.45 s, Spark wait up): the GB10

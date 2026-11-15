@@ -1,6 +1,6 @@
 // Sparse MLA prefill kernels (glm_mla_prefill.cu) against an FP64 host reference on
 // synthetic FP8 latent records, and their times.
-//   glm_mla_prefill_selftest [rows] [record_bytes 656|528] [heads] [iterations] [kernels, e.g. 013]
+//   glm_mla_prefill_selftest [rows] [record_bytes 656|528] [heads] [iterations] [kernels, e.g. 01]
 // Records: latent rows N(0, 1) times per-channel and per-record magnitudes, E4M3 codes with
 // one FP32 scale (amax / 448) per 128 channels; queries mix noise with the latents of a few
 // of the row's selected records (peaked heads) at per-head magnitudes. Each kernel's error
@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
   const int rec = argc > 2 ? std::atoi(argv[2]) : 656;
   const int heads = argc > 3 ? std::atoi(argv[3]) : 64;
   const int iterations = argc > 4 ? std::atoi(argv[4]) : 10;
-  const char* kernels = argc > 5 ? argv[5] : "01234";
+  const char* kernels = argc > 5 ? argv[5] : "01";
   const int topk = 2048, slots = 12288, dq = rec == 656 ? 576 : 512;
   const bool rope = rec == 656;
   const float scale = 1.0f / std::sqrt(rope ? 256.0f : 256.0f);
@@ -181,9 +181,9 @@ int main(int argc, char** argv) {
   cudaEvent_t a, b;
   CHECK(cudaEventCreate(&a));
   CHECK(cudaEventCreate(&b));
-  const char* names[] = {"f16", "e4m3", "e4m3 P2", "e4m3 Q2", "e4m3 Q2P2"};
+  const char* names[] = {"f16", "e4m3-q2p2"};
   int failures = 0;
-  for (int kernel = 0; kernel < 5; ++kernel) {
+  for (int kernel = 0; kernel < 2; ++kernel) {
     if (!std::strchr(kernels, '0' + kernel)) continue;
     CHECK(cudaMemset(dout, 0xFF, out_elems * 2));
     CHECK(cudaError_t(cuteafd_glm_mla_prefill(dq_, dkv, dind, dlen, dout, rows, heads, topk, rec, scale_log2,
