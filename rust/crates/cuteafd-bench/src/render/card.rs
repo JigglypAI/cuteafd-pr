@@ -186,7 +186,15 @@ pub fn card_svg(report: &Report) -> String {
     }
     let (badge, status) = match baseline {
         Some(b) => (b.quality.badge(), b.quality.status),
-        None => ("quality not verified".to_string(), crate::report::CheckStatus::Pending),
+        None => {
+            // New MC reports retain explicit metadata even when no baseline ran.
+            // Do not infer a new label for historical reports without that field.
+            let quality = crate::report::Quality {
+                core_dtype: r.server.setting("core-original-dtype").and_then(|_| r.server.mc_core_dtype()),
+                ..Default::default()
+            };
+            (quality.badge(), quality.status)
+        },
     };
     if let Some(precision) = baseline.and_then(|b| b.quality.check("fidelity"))
         .and_then(|c| c.metrics.get("precision"))

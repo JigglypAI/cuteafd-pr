@@ -73,11 +73,32 @@ mod tests {
             report.baseline.as_mut().unwrap().quality.core_dtype = Some(dtype.into());
             let svg = super::card::card_svg(&report);
             assert!(svg.contains(&format!("Core {dtype} · KL")), "{dtype}");
-            let badge = svg.lines().find(|line| line.contains("height=\"34\""))
+            let badge = svg.split("<rect ").find(|rect| rect.contains("height=\"34\""))
                 .expect("quality chip");
             let width: f64 = badge.split("width=\"").nth(1).unwrap()
                 .split('"').next().unwrap().parse().unwrap();
             assert!(width <= 520.0);
+        }
+    }
+
+    #[test]
+    fn mc_card_without_baseline_labels_core_without_claiming_quality() {
+        let mut report = crate::sample::full_report();
+        report.baseline = None;
+        let old = super::card::card_svg(&report);
+        assert!(old.contains("quality not verified") && !old.contains("Core "));
+        report.server.configuration.settings.push(crate::report::Setting {
+            name: "core-original-dtype".into(), value: Some("BF16".into()),
+            ..Default::default()
+        });
+        for (view, dtype) in [("original", "BF16"), ("k8-compact", "K8"),
+            ("k6-compact", "K6"), ("fp8-compact", "FP8")] {
+            report.server.configuration.settings.retain(|s| s.name != "core-view");
+            report.server.configuration.settings.push(crate::report::Setting {
+                name: "core-view".into(), value: Some(view.into()), ..Default::default()
+            });
+            let svg = super::card::card_svg(&report);
+            assert!(svg.contains(&format!("Core {dtype} · quality not verified")));
         }
     }
 

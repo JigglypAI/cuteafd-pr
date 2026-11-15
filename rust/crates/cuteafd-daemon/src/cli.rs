@@ -327,8 +327,8 @@ impl CoreViewArgs {
     }
 }
 
-/// The served core identity a card and fidelity pairing read: `core-view`, its fingerprint and
-/// the FP8 recipe (`none` unless fp8-compact), published only when the checkpoint declares views
+/// The served core identity a card and fidelity pairing read: `core-view`, its fingerprint,
+/// the FP8 recipe and original dtype, published only when the checkpoint declares views
 /// (MC). A plain checkpoint has only its own core, so every such record, the `--core-view`
 /// launch default included, is withdrawn rather than reported as `original`.
 pub(crate) fn publish_core_view(view: &cuteafd_loader::plan::checkpoint::CheckpointView) {

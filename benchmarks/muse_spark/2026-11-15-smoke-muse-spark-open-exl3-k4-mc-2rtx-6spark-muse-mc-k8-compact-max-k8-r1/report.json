@@ -1267,7 +1267,7 @@
         "host_cache_bytes": 34342961152
       }
     },
-    "quality": {
+    "quality": {"core_dtype":"K8",
       "status": "pass",
       "checks": [
         {
