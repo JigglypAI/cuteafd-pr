@@ -474,6 +474,16 @@ def inkling2_producer_programs(prefill_rows: int):
     return result
 
 
+def inkling2_load_programs():
+    """Static-weight load transform; no request capacity or device geometry."""
+    import torch
+    from functools import partial
+    from b12x.integration.cuteafd.inkling2_glue import compile_padded_transpose_aot
+    return [("padded_transpose_bf16_r16_c1024_p64", "padded_transpose",
+             {"dtype": "bfloat16", "rows": 16, "cols": 1024, "padded_cols": 64},
+             partial(compile_padded_transpose_aot, dtype=torch.bfloat16, rows=16, cols=1024, padded_cols=64))]
+
+
 def inkling2_input_quant_program():
     """Reuse the native group32 quantizer with no foreign-family amax floor."""
     import torch
@@ -1982,6 +1992,7 @@ def main() -> None:
         manifest["families"]["inkling2"] = dataclasses.asdict(INKLING2_SMALL)
         work += [("inkling2", *item) for item in inkling2_attention_programs(args.decode_rows, args.prefill_rows)]
         work += [("inkling2", *item) for item in inkling2_producer_programs(args.prefill_rows)]
+        work += [("inkling2", *item) for item in inkling2_load_programs()]
         work.append(("inkling2", "expert_input_quant", "expert_input_quant", {"max_rows": 4096},
                      inkling2_input_quant_program))
         # Share DraftProjections unchanged. The D16 relative bias projection

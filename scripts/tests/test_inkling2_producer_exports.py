@@ -53,6 +53,25 @@ def test_predeclared_inkling_producer_stems(monkeypatch):
             assert runtime['route_scale'] == 8.
 
 
+def test_padded_relative_load_export_is_static_and_has_one_declared_stem(monkeypatch):
+    torch = types.ModuleType('torch')
+    torch.bfloat16 = object()
+    monkeypatch.setitem(sys.modules, 'torch', torch)
+    glue = types.ModuleType('b12x.integration.cuteafd.inkling2_glue')
+    glue.compile_padded_transpose_aot = lambda **kwargs: kwargs
+    monkeypatch.setitem(sys.modules, glue.__name__, glue)
+    tree = ast.parse((ROOT/'python/tools/aot/export_b12x_dsv4_aot.py').read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'inkling2_load_programs')
+    scope = {}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), '<load>', 'exec'), scope)
+    programs = scope['inkling2_load_programs']()
+    assert len(programs) == 1
+    stem, op, params, compile_program = programs[0]
+    assert stem == 'padded_transpose_bf16_r16_c1024_p64' and op == 'padded_transpose'
+    assert params == {'dtype': 'bfloat16', 'rows': 16, 'cols': 1024, 'padded_cols': 64}
+    assert compile_program() == {'dtype': torch.bfloat16, 'rows': 16, 'cols': 1024, 'padded_cols': 64}
+
+
 def test_inkling_projection_and_wire_quantization_inventory():
     tree = ast.parse((ROOT/'python/tools/aot/export_b12x_dsv4_aot.py').read_text())
     shape = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name=='inkling2_projection_shapes')
