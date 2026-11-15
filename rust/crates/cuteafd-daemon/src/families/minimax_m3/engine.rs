@@ -1113,13 +1113,15 @@ impl<'a> ServingPrefill<'a> {
                 } else { None };
                 let shared = ticket.is_some();
                 for (gpu, rank) in storage.ranks.iter().enumerate() {
-                    rank.decode.borrow().ffn_boundary(shared)?;
-                    let work = || rank.decode.borrow_mut().ffn_enqueue(&rank.kernels, &rank.weights,
-                        &rank.layout, layer, graph_rows, shared);
-                    let submitted = if captured {
-                        // SAFETY: fixed live rows and retained half-FFN operands; host lease transition stays eager.
-                        unsafe { graphs[gpu].run(Key { rank: gpu, layer, rows: graph_rows, op: Op::Ffn }, None, work) }
-                    } else { work() };
+                    let submitted = (|| {
+                        rank.decode.borrow().ffn_boundary(shared)?;
+                        let work = || rank.decode.borrow_mut().ffn_enqueue(&rank.kernels, &rank.weights,
+                            &rank.layout, layer, graph_rows, shared);
+                        if captured {
+                            // SAFETY: fixed live rows and retained half-FFN operands; host lease transition stays eager.
+                            unsafe { graphs[gpu].run(Key { rank: gpu, layer, rows: graph_rows, op: Op::Ffn }, None, work) }
+                        } else { work() }
+                    })();
                     if let Err(error) = submitted {
                         crate::shared::decode_graph::fatal_drain(heads.publish_abort(), "MiniMax Heads partial before ticket drop");
                         return Err(error);
