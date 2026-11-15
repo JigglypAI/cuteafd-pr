@@ -197,7 +197,7 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
         ExpertV2Dtype::Fp8E4m3Ue8m0K32)?;
     session.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
     device.run(|| link.bootstrap(&session))?;
-    let execution = super::engine::Execution::new(link, requests, head, target, kernels, local, cfg.clone())?;
+    let execution = super::engine::Execution::new(link, requests, head, target, kernels, local, cfg.clone(), inputs.graph_reserve[0])?;
     let physical = [options.device];
     let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
     let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "retained",
