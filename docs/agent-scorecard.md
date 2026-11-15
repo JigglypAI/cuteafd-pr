@@ -27,6 +27,62 @@ Rubric, each 1–5 (5 best), plus wall time:
 
 ## Log
 
+### 2026-11-15 Muse Scaled FP8 KV Attention Duel: Owner Retained
+
+Owner `69f63362` (harness `ec1182cb`, merged as fork #343 `c3402908`)
+beats both entrants overall; no new kernel lands. All measurements use the
+same borrowed sealed slot, SM120 GPU1, warmed CUDA graphs and exact same-scale
+BF16-QDQ outputs. The fixed token/head FP32 scales and per-element BF16
+rounding before MMA never change. Folding scales after QK or into P is a
+principled null: an independently reproduced finite counterexample changes
+Muse's rounded score. Power/thermal slowdown and clock-reason masks are zero
+in the decisive screens, at a reported 425 W limit. The final owner/Carbon
+session peaks at 47 C. High-clock endpoints are 2,610-2,880 MHz; separate
+idle/low-clock endpoints are 495 MHz (owner) and 1,860 MHz (Carbon). Endpoint
+sampling does not establish a busy-window clock average.
+
+Carbon High, driven by DeepSeek Flash, first submits `05ef750f` (fork #346):
+async K/scales, overlapping warp-specialized V conversion, hardcoded swizzle
+and a named barrier. It compiles but fails the first attention QDQ case after
+32 packer passes. Repair `b4a3e981` replaces the risky aliasing/swizzle with
+layout-native addressing and CTA barriers; all 46 exactness cases pass in
+15.42 s. It loses all 20 short/8K/64K timing cells: owner/Carbon is
+0.882-0.981, or Carbon 1.9-13.4% slower. No further round. Final scores:
+Correct 4, Judgement 3, Quality 3, Creative 4. Worker launch to repair commit
+is about 53 min; driver reports about 1 h 53 min to verified close, including
+waiting. Seven submitted messages, zero retries/503s, peak context unknown;
+the external worker is stopped. All register/bandwidth predictions remain
+explicitly unmeasured. A wholesale conservative repair is correct, not a win.
+
+DeepSeek Flash submits two exact-green versions, 46 cases each. R1
+`3a353e7e` (fork #344) moves global-to-BF16 conversion to QK/PV phase
+boundaries: BF16/R1 is 0.649-0.804 at history 2050, a clear loss. R2
+`6357a590` (fork #347), based on the owner's version, pre-resolves the next
+tile using existing barriers. At histories 2050/8192 it gains 1.4-3.6% at
+C1 and 2.0-4.2% at TP2 C16, but loses 2.8-4.9% at TP1 C16. At 64K it gains
+1.5-3.5%; the short-history regressions still rule it out. It concedes and
+leaves R3 unspent. Final scores: Correct 5, Judgement 4, Quality 4,
+Creative 3. R1 takes about 8 min; R2 about 3 min after measured feedback.
+Minus: the organizer corrects overstrong power-of-two-scale claims and an
+incorrect TP2 regression statement; both PRs record the corrections. The
+throughput/latency explanation remains a hypothesis, not profiling evidence.
+
+Owner BF16/FP8 full-attention ratios remain below 0.95 at 8K and 64K:
+TP1 C1/C16 0.837/0.889 and 0.871/0.849; TP2 0.833/0.835 and 0.903/0.881.
+The owner, not this microbenchmark, decides the default from served min/max
+C1/C16 emitted tok/s, KV-pool size and quality after combined publication.
+BF16 remains default during the duel. One initial DeepSeek oracle invocation
+accidentally imported the harness tree through pytest's path handling; its
+46-pass receipt is explicitly discarded and replaced by a candidate-local
+run with verified module paths. No false result enters the comparison.
+
+Evidence: fork #343/#344/#346/#347 and compact JSON receipts under
+`~/.cache/cuteafd/builds/musekv-duel-timing/`: `provenance.json`,
+`r1-screen.json`, `r1-long-screen.json`, `ds-r2-screen.json`,
+`ds-r2-64k.json` and `carbon-final.json`. The final common screen is
+`musekv-duel-carbon-final`; winner row curves are `musekv-duel-winner-curve`.
+Borrowed `v5x-wm-b:base` stays untouched; only task-owned sources are retired.
+
 ### 2026-11-15 MiniMax Scaled FP8 KV Attention Duel: Carbon R1 Wins
 
 Carbon High, driven by DeepSeek Flash, seals `93450d8c` on fork #339:
