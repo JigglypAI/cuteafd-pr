@@ -107,6 +107,7 @@ mod tests {
                 ("dsv4p", "exl3") => testing::write_v4_pro_exl3_snapshot(&snapshot),
                 ("kimik3", _) => testing::write_kimi_snapshot(&snapshot, true),
                 ("minimax", "nvfp4") => write_minimax_release_text_snapshot(&snapshot, &source)?,
+                ("inkling2", _) => write_inkling_release_text_snapshot(&snapshot, format, &source)?,
                 ("muse", _) => testing::write_muse_spark_snapshot(&snapshot, &(0..62).collect::<Vec<_>>()),
                 ("mimo", _) => testing::write_snapshot(&snapshot, &testing::mimo_flash_config(), &testing::mimo_flash_tensors(), None),
                 ("mimof", _) => testing::write_snapshot(&snapshot, &testing::mimo_flash_mopd_config(), &testing::mimo_flash_mopd_tensors(), Some(4)),
@@ -137,7 +138,7 @@ mod tests {
                 ("ml4", _) => testing::write_mistral_large4_snapshot(&snapshot, None, true),
                 _ => anyhow::bail!("missing full launch fixture for covered {key}"),
             }
-            if !matches!(family, "v41" | "kimik3" | "muse" | "ml4" | "minimax") {
+            if !matches!(family, "v41" | "kimik3" | "muse" | "ml4" | "minimax" | "inkling2") {
                 expand_eight_rank_fixture(&snapshot)?;
             }
             let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
@@ -335,6 +336,70 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
         }
         assert!(!tested.is_empty());
         eprintln!("N8 real config -> launch -> clap -> topology -> intake: {}", tested.join(", "));
+        Ok(())
+    }
+
+    fn write_inkling_release_text_snapshot(snapshot: &std::path::Path, format: &str,
+        source: &std::path::Path) -> Result<()> {
+        use cuteafd_loader::{families::inkling2::Inkling2Config, plan::testing::{t, write_snapshot}};
+        let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(source.join(
+            "rust/crates/cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
+        config.as_object_mut().unwrap().remove("vision_config");
+        config.as_object_mut().unwrap().remove("mtp_config");
+        if format == "exl3" { config["quantization_config"] = testing::exl3_compact(4); }
+        let cfg = Inkling2Config::from_hf(&config)?;
+        let mut tensors = vec![t("model.llm.embed.weight", "BF16", &[cfg.vocab_size, cfg.hidden]),
+            t("model.llm.unembed.weight", "BF16", &[cfg.vocab_size, cfg.hidden]),
+            t("model.llm.embed_norm.weight", "BF16", &[cfg.hidden]), t("model.llm.norm.weight", "BF16", &[cfg.hidden]),
+            t("model.llm.attn_res.output_query", "F32", &[cfg.hidden])];
+        for layer in 0..cfg.layers {
+            let p = format!("model.llm.layers.{layer}");
+            for (name, n) in [("wq_du", 6144), ("wr_du", 768), ("wk_dv", 1024), ("wv_dv", 1024),
+                ("gate_attn", 6144), ("attn_sink_proj", 48)] {
+                tensors.push(t(format!("{p}.attn.{name}.weight"), "BF16", &[n, 4608]));
+            }
+            tensors.push(t(format!("{p}.attn.wo_ud.weight"), "BF16", &[4608, 6144]));
+            tensors.push(t(format!("{p}.attn.q_l2_clip.scale"), "BF16", &[48, 128]));
+            tensors.push(t(format!("{p}.attn.rel_l2_clip.scale"), "BF16", &[48, 16]));
+            tensors.push(t(format!("{p}.attn.rel_logits_proj.proj"), "BF16", &[16, 1024]));
+            for branch in ["k", "v"] {
+                if cfg.local[layer] { tensors.push(t(format!("{p}.attn.{branch}_sconv.weight"), "BF16", &[1024, 1, 4])); }
+                else {
+                    tensors.push(t(format!("{p}.attn.{branch}_sconv.static_w"), "BF16", &[4, 1024]));
+                    tensors.push(t(format!("{p}.attn.{branch}_sconv.weight_proj"), "BF16", &[32, 4608]));
+                }
+            }
+            for name in ["attn_sconv", "mlp_sconv"] { tensors.push(t(format!("{p}.{name}.weight"), "BF16", &[4608, 1, 4])); }
+            for name in if cfg.local[layer] { vec!["attn_norm", "mlp_norm"] }
+                else { vec!["q_input_norm", "k_input_norm", "v_input_norm", "mlp_norm"] } {
+                tensors.push(t(format!("{p}.{name}.weight"), "BF16", &[4608]));
+            }
+            tensors.push(t(format!("{p}.mlp.gate.weight"), "BF16", &[384, 4608]));
+            tensors.push(t(format!("{p}.mlp.gate.bias"), "F32", &[384]));
+            tensors.push(t(format!("model.llm.attn_res.mlp_queries.{layer}"), "F32", &[4608]));
+            if layer > 0 { tensors.push(t(format!("model.llm.attn_res.attn_queries.{}", layer-1), "F32",
+                if cfg.local[layer] { &[4608] } else { &[3, 4608] })); }
+            if format == "exl3" {
+                for expert in 0..384 {
+                    for (name, n, k) in [("gate_proj", 2304, 4608), ("up_proj", 2304, 4608), ("down_proj", 4608, 2304)] {
+                        tensors.extend(testing::exl3(&format!("{p}.mlp.experts.{expert}.{name}"), n, k, 4));
+                    }
+                }
+            } else {
+                let nvfp4 = format == "nvfp4" && layer < 40;
+                for (name, n, k) in [("w13", 4608, 4608), ("w2", 4608, 2304)] {
+                    tensors.push(t(format!("{p}.mlp.experts.{name}_weight"), if nvfp4 { "U8" } else { "F8_E4M3" },
+                        &[384, n, k / if nvfp4 { 2 } else { 1 }]));
+                    tensors.push(t(format!("{p}.mlp.experts.{name}_weight_scale"), if nvfp4 { "F8_E4M3" } else { "U8" },
+                        &[384, n, k / if nvfp4 { 16 } else { 32 }]));
+                    if nvfp4 {
+                        tensors.push(t(format!("{p}.mlp.experts.{name}_weight_amax"), "F32", &[384]));
+                        tensors.push(t(format!("{p}.mlp.experts.{name}_weight_outer_scale_denominator"), "F32", &[1]));
+                    }
+                }
+            }
+        }
+        write_snapshot(snapshot, &config, &tensors, None);
         Ok(())
     }
 
