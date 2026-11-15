@@ -50,14 +50,29 @@ per-row max/best is 1.0399, without an adjacent jump above 10%.
 
 Carbon's broader sparse helper is not inline-scale-only: the generic extend
 planner can set `msa_block_sparse=True`. Both arms pass the 48 existing sparse
-and end-to-end tests; semantic digest completion, Carbon row/resource gates
-and the targeted whole/half-head export audit are pending at this checkpoint.
-Initial sparse LSE hashes included unconsumed padding and fake-launch output;
-receipts now exclude those undefined bytes, without kernel/tolerance changes.
-The engine audit group gains explicit half-head stems in a separate tested
-commit. No whole-tree export comparison is scheduled.
+and end-to-end tests. All 58 eager output digests match; three initial LSE
+hash differences include unconsumed padding or fake-launch output, not a
+consumed kernel result. Receipts now hash live rows and omit fake-launch
+numerics, without kernel/tolerance changes; both arms pass the three affected
+tests and both live output/LSE records match. The targeted source export audit
+compares 68 programs: 62 Step-5 objects are byte-identical and exactly six
+MiniMax whole/half-head attention/packer stems change, with none added/removed.
+Engine commit `f79c8e09d` includes half-head stems in the existing groups;
+two scope regression tests pass. Same-candidate SM188/SM170 objects, headers,
+cubins, SASS and metadata are identical for all six MiniMax stems. Carbon's
+required extend curve has per-row max/best 1.0430 and maximum adjacent ratio
+1.0378, below the 10% cliff bar. The wide arms are power-capped (baseline
+7.577 s, Carbon 6.251 s), with zero thermal slowdown, max 65/69 C, minimum
+T.Limit 26/23 C and busy SM clocks 2,092/2,370 MHz; do not infer a final wide
+speed delta from that clock difference. NCU C16 finds 155 registers, zero
+spills, 65,536 B dynamic SMEM and the same one-CTA shared-memory limit.
+Scalar global loads fall from fixed-scaled 157,440 to 26,368 (shipping 84,224),
+and long-scoreboard samples fall from 1,413 to 688 (shipping 691). No whole-tree
+comparison runs. All organizer gates are green; the winner is handed to the
+KV-scales owner as fork commit `42372b32` in #335, with engine #2174 owning
+prefix/fidelity/performance integration. Real 5090 timing remains unmeasured.
 
-Provisional scores: Carbon Correct 5, Judgement 4, Quality 4, Creative 5;
+Final scores: Carbon Correct 5, Judgement 4, Quality 4, Creative 5;
 DeepSeek Correct 5, Judgement 4, Quality 4, Creative 3. Carbon takes 24m00s
 from GO to commit, 33m36s from launch to seal, three driver steers, zero
 503/retries and unknown peak context. DeepSeek seals in 1m57s after GO;
@@ -66,7 +81,8 @@ no credible hypothesis beating Carbon. Driver inventory/occupancy overclaims
 require organizer corrections; DeepSeek's speculative bar-relaxation and
 page-table-defect framing are also corrected. Neither entrant runs GPU tests
 or changes the benchmark/oracles. Stop after R1 rather than chasing beyond
-the satisfied bar. Final landing remains gated by the pending checks.
+the satisfied bar. All duel gates pass; the external worker is stopped and
+its private transcript retained. Final engine integration belongs to #2174.
 
 Evidence: fork #335/#337/#338/#339, engine #2174; organizer `baseline.json`,
 `carbon-round1-timing.json`, `carbon-round1-oracle.json`, `ds-round1-oracle.json`,
