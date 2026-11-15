@@ -10,11 +10,9 @@ use cuteafd_loader::plan::testing as fixture;
 use std::{collections::BTreeMap, path::PathBuf};
 
 fn installed(model: &str, revision: &str) -> Result<PathBuf> {
-    let home = std::env::var_os("HF_HOME")
+    let home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/huggingface")
-        });
+        .expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required");
     let root = home
         .join("hub")
         .join(format!("models--{model}"))

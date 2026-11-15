@@ -43,6 +43,7 @@ def test_native_shape_disagreement_stops_before_payload_read():
         weights.validate_module(module, "language_model.model.layers.0")
 
 
+@pytest.mark.container_torch
 @pytest.mark.parametrize("bad_tail", [None, 1., -0., float("nan")])
 def test_native_a_log_padding_is_bit_exact_and_audited(bad_tail):
     torch = pytest.importorskip("torch")
@@ -76,6 +77,7 @@ def test_a_log_padding_exception_is_narrow(heads, name, shape, expected):
     assert not weights.padded_a_log(name, shape, expected)
 
 
+@pytest.mark.container_torch
 def test_module_loader_checks_and_narrows_only_zero_a_log():
     torch = pytest.importorskip("torch")
     weights = model.LayerWeights.__new__(model.LayerWeights)
@@ -99,6 +101,7 @@ def test_module_loader_checks_and_narrows_only_zero_a_log():
         weights.load_module(module, "language_model.model.layers.0")
 
 
+@pytest.mark.container_torch
 def test_diagnostic_hooks_distinguish_local_error_from_propagation(monkeypatch):
     torch = pytest.importorskip("torch")
     from families.kimi_k3.diagnostic import Trace, first_difference
@@ -128,6 +131,7 @@ def test_diagnostic_hooks_distinguish_local_error_from_propagation(monkeypatch):
     assert all(not module._forward_hooks and not module._forward_pre_hooks for module in layer.modules())
 
 
+@pytest.mark.container_torch
 def test_diagnostic_function_boundaries_restore_originals(monkeypatch):
     torch = pytest.importorskip("torch")
     import torch.nn.functional as F
@@ -179,6 +183,7 @@ def test_diagnostic_function_boundaries_restore_originals(monkeypatch):
     assert "moe_infer" not in layer.block_sparse_moe.__dict__
 
 
+@pytest.mark.container_torch
 def test_diagnostic_linear_variants_preserve_native_output_geometry():
     torch = pytest.importorskip("torch")
     from families.kimi_k3.diagnostic import Trace, linear_variants
@@ -200,6 +205,7 @@ def test_diagnostic_linear_variants_preserve_native_output_geometry():
     assert all(report["compared"] == 1 and report["over_1e-5"] == 0 for report in reports.values())
 
 
+@pytest.mark.container_torch
 def test_noise_probe_preserves_independent_batch_geometry():
     torch = pytest.importorskip("torch")
     from families.kimi_k3.diagnostic import duplicate_probe
@@ -227,6 +233,7 @@ def test_noise_metrics_are_diagnostic_not_a_gate():
         logit_metrics(native, np.full_like(native, np.nan))
 
 
+@pytest.mark.container_torch
 def test_official_noise_streams_native_b2_and_resumes(tmp_path, monkeypatch, request):
     torch = pytest.importorskip("torch")
     original_dtype, original_rng = torch.get_default_dtype(), torch.get_rng_state()
@@ -312,6 +319,7 @@ def test_official_noise_streams_native_b2_and_resumes(tmp_path, monkeypatch, req
     assert golden.digest(retained.root / "latest.json") == report["binding"]["parent_probe_manifest_sha256"]
 
 
+@pytest.mark.container_torch
 def test_diagnostic_hooks_are_removed_after_failure():
     torch = pytest.importorskip("torch")
     from families.kimi_k3.diagnostic import Trace
@@ -327,6 +335,7 @@ def test_diagnostic_hooks_are_removed_after_failure():
     assert all(not module._forward_hooks and not module._forward_pre_hooks for module in layer.modules())
 
 
+@pytest.mark.container_torch
 def test_route_capture_records_actual_logits_choices_and_restores_after_failure():
     torch = pytest.importorskip("torch")
     import torch.nn.functional as F
@@ -369,6 +378,7 @@ def test_route_capture_records_actual_logits_choices_and_restores_after_failure(
         route_comparison(gate, left, right)
 
 
+@pytest.mark.container_torch
 def test_bounded_routes_skip_dense_then_stop_at_first_moe_flip(tmp_path, monkeypatch):
     torch = pytest.importorskip("torch")
     from contextlib import contextmanager
@@ -469,6 +479,7 @@ def test_bounded_routes_skip_dense_then_stop_at_first_moe_flip(tmp_path, monkeyp
     assert report["qualification"].startswith("diagnostic only")
 
 
+@pytest.mark.container_torch
 def test_route_comparison_reports_exact_cutoff_tie():
     torch = pytest.importorskip("torch")
     from families.kimi_k3.diagnostic import route_comparison
@@ -577,6 +588,7 @@ def test_resume_rejects_escaping_paths(tmp_path):
         state.contained("../outside")
 
 
+@pytest.mark.container_torch
 def test_block_residual_files_survive_old_layer_removal(tmp_path):
     torch = pytest.importorskip("torch")
     state = golden.LayerState(tmp_path, {})
@@ -594,6 +606,7 @@ def test_block_residual_files_survive_old_layer_removal(tmp_path):
                           original.view(torch.uint16).numpy().ravel())
 
 
+@pytest.mark.container_torch
 def test_bounded_attention_preserves_native_math_and_prefix():
     torch = pytest.importorskip("torch")
     torch.manual_seed(0)
@@ -613,6 +626,7 @@ def test_bounded_attention_preserves_native_math_and_prefix():
     torch.testing.assert_close(extended, unchanged, atol=1e-14, rtol=1e-14)
 
 
+@pytest.mark.container_torch
 def test_geometry_restored_on_failure():
     torch = pytest.importorskip("torch")
     import torch.nn.functional as F
@@ -626,6 +640,7 @@ def test_geometry_restored_on_failure():
     assert (F.linear, torch.einsum, reference.eager_attention_forward) == (*original, eager)
 
 
+@pytest.mark.container_torch
 def test_native_mxfp4_packing_and_scale_values():
     torch = pytest.importorskip("torch")
     pytest.importorskip("compressed_tensors")
@@ -654,6 +669,7 @@ def test_official_forward_gate_rejects_disagreement(tmp_path):
     assert json.loads((tmp_path / "official-forward.json").read_text())["passed"] is False
 
 
+@pytest.mark.container_torch
 @pytest.mark.parametrize("scale", [0, 1, 119, 127, 134, 252])
 def test_direct_f32_mxfp4_exact_codes_and_exponents(scale):
     import math
@@ -670,6 +686,7 @@ def test_direct_f32_mxfp4_exact_codes_and_exponents(scale):
         model.decompress_f32(packed, torch.full_like(scales, 255))
 
 
+@pytest.mark.container_torch
 def test_f32_expert_matrix_materializes_only_during_native_call():
     torch = pytest.importorskip("torch")
     weights = model.LayerWeights.__new__(model.LayerWeights)
@@ -688,6 +705,7 @@ def test_f32_expert_matrix_materializes_only_during_native_call():
     assert layer.weight.device.type == "meta"
 
 
+@pytest.mark.container_torch
 def test_f32_resume_preserves_non_bf16_values_and_signed_zero(tmp_path, monkeypatch):
     torch = pytest.importorskip("torch")
     monkeypatch.setattr(torch.Tensor, "cuda", lambda value: value)
@@ -704,6 +722,7 @@ def test_f32_resume_preserves_non_bf16_values_and_signed_zero(tmp_path, monkeypa
         state.save(state.begin(0), "probe", values.bfloat16())
 
 
+@pytest.mark.container_torch
 def test_strict_f32_configures_torch_and_explicit_kda_dot(monkeypatch, request):
     import os
     torch = pytest.importorskip("torch")

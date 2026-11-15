@@ -504,12 +504,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         }
     }
     let sparks = vec![spark_budget.budget; ranks];
-    let (host_total, host_available) = match opts.host_memory {
-        Some(memory) => memory,
-        None => match crate::formats::mapped_preload::host_memory() {
-            Ok(memory) => memory,
-            Err(error) => { report.refuse_placement(format!("Kimi host inventory refused: {error:#}"), "Supply host memory capacity."); return memory; }
-        },
+    let (host_total, host_available) = match crate::plan::layout::planner_host_memory(
+        opts.host_memory, crate::plan::layout::HostMemorySample::Raw) {
+        Ok(host) => host,
+        Err(error) => { report.refuse_placement(format!("Kimi host inventory refused: {error:#}"), "Supply host memory capacity."); return memory; }
     };
     let host_quota = (|| -> anyhow::Result<u64> {
         if opts.host_cache_bytes == Some(0) || opts.mimo_prefix_entries == 0 { return Ok(0); }

@@ -27,6 +27,7 @@ def test_glm_golden_every_constructed_layer_enters_eval():
         assert node.value.func.attr == "eval"
 
 
+@pytest.mark.container_torch
 def test_glm_golden_eval_recurses_to_attention_on_cpu():
     torch = pytest.importorskip("torch")
     tree = ast.parse(GLM_GOLDEN.read_text())
@@ -85,6 +86,7 @@ def test_reference_does_not_use_inherited_spec_generate():
     assert 'drafter.window is not None' in ORACLE.read_text()
 
 
+@pytest.mark.container_torch
 def test_markov_chain_confidence_and_dense_taps(tmp_path):
     torch = pytest.importorskip("torch")
     pytest.importorskip("safetensors")
@@ -109,6 +111,7 @@ def test_markov_chain_confidence_and_dense_taps(tmp_path):
     assert torch.equal(oracle.golden_taps(tmp_path, [4], 2, "cpu"), values)
 
 
+@pytest.mark.container_torch
 def test_scored_logits_offset_is_not_a_target_position(tmp_path):
     pytest.importorskip("torch")
     pytest.importorskip("safetensors")
@@ -118,6 +121,7 @@ def test_scored_logits_offset_is_not_a_target_position(tmp_path):
     assert oracle.greedy_picks(tmp_path, 6, 2) == [-1, -1, -1, 1, 0, -1]
 
 
+@pytest.mark.container_torch
 @pytest.mark.parametrize("wrong_proposals", [False, True])
 def test_live_replay_counts_bonus_and_discards_rejected_suffix(wrong_proposals):
     torch = pytest.importorskip("torch")
@@ -151,6 +155,7 @@ def test_live_replay_counts_bonus_and_discards_rejected_suffix(wrong_proposals):
     assert single["spec_accept_length"] == 1
 
 
+@pytest.mark.container_torch
 def test_gqa_block_and_yarn_match_bundled_attention():
     torch = pytest.importorskip("torch")
     pytest.importorskip("safetensors")

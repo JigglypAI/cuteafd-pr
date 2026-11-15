@@ -576,7 +576,7 @@ mod draft_cli_tests {
                         prefill_lanes: u64::from(engine.prefill_waves), prefill_waves: u64::from(engine.prefill_waves),
                         exlr8_prefill_activations: activations.parse::<PrefillActivations>().unwrap(), context_tokens: 65536,
                         onboard: Some(cuteafd_loader::placement::OnboardSetting::Layers(0)), glm5_drafter_disabled: true,
-                        host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0), ..Default::default() };
+                        host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0), ..Default::default() };
                     let (memory, _) = cuteafd_loader::plan::layout::glm5::native_layout(&checkpoint, &layout,
                         peers.split(',').count(), &manifest, "k4").unwrap();
                     assert_eq!(memory.devices.len(), gpus);

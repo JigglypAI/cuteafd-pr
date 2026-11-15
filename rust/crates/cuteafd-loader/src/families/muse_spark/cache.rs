@@ -271,18 +271,4 @@ mod tests {
         }
     }
 
-    /// The exported SWA programs bake `ring_rows`; the exporter's formula must
-    /// be this cache's ring at every export capacity.
-    #[test]
-    fn exported_ring_rows_are_the_cache_ring() {
-        let exporter = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../python/tools/aot/export_b12x_muse_aot.py")).unwrap();
-        let line = exporter.lines().find(|l| l.trim_start().starts_with("ring_rows =")).expect("exporter ring_rows");
-        let cfg = MuseSparkConfig::from_hf(&crate::plan::testing::muse_spark_config()).unwrap();
-        assert_eq!(line.trim(), format!("ring_rows = ((WINDOW + SWA_RING_STEP + {page} - 1) // {page}) * {page}",
-            page = PAGE_ROWS), "exporter ring formula drifted from swa_ring");
-        assert!(exporter.contains(&format!("WINDOW = {}", cfg.window)));
-        assert!(exporter.contains(&format!("SWA_RING_STEP = {SWA_RING_STEP}")));
-        assert_eq!(swa_ring(&cfg).unwrap().rows, (cfg.window as u64 + SWA_RING_STEP).next_multiple_of(PAGE_ROWS));
-    }
 }

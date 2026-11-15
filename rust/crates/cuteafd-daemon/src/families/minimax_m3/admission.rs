@@ -196,7 +196,7 @@ mod tests {
     use cuteafd_loader::serving_capacity::WeightArenaLayout;
 
     #[test]
-    fn explicit_heads_serve_admission_preserves_typed_unqualified_reason() -> Result<()> {
+    fn explicit_heads_serve_admission_validates_shape_before_programs() -> Result<()> {
         use cuteafd_loader::families::minimax_m3::admission::{Coordinator, FactsRequest};
         use cuteafd_loader::placement::{AttentionPlacement, CoordinatorCard, Onboard, ResidentWeights};
         use cuteafd_loader::placement::families::minimax_m3::ServingRefusal;
@@ -269,8 +269,8 @@ mod tests {
 
         let sample = serve_admission::Sample { total: 96 << 30, cap: 96 << 30, free: 94 << 30, pending_code: 0 };
         let error = serve_admission::admit(request(1024), &[sample; 2], Onboard::Layers(0)).unwrap_err();
-        assert!(matches!(error.downcast_ref::<ServingRefusal>(), Some(ServingRefusal::NarrowHeadsNotQualified)), "{error:#}");
-        assert!(format!("{error:#}").contains("narrow-head MiniMax kernels not qualified"));
+        assert!(matches!(error.downcast_ref::<ServingRefusal>(), Some(ServingRefusal::Plan(_))), "{error:#}");
+        assert!(format!("{error:#}").contains("not the MiniMax-M3.1-Flash release"));
         Ok(())
     }
 

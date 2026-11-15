@@ -352,6 +352,9 @@ pub(crate) fn core_view_settings(view: &cuteafd_loader::plan::checkpoint::Checkp
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {
+    #[cfg(test)]
+    #[arg(skip)]
+    pub(crate) test_host_memory: Option<(u64, u64)>,
     /// Activation precision over already-resident FP8 projections: auto, off or group list.
     #[arg(long, env = "CUTEAFD_FP8_PREFILL", default_value = "auto")]
     pub fp8_prefill: cuteafd_loader::plan::fp8_prefill::Policy,
@@ -1083,6 +1086,10 @@ mod tests {
         let super::Commands::Plan(args) = super::Cli::try_parse_from(
             ["cuteafd", "plan", "/model"]).unwrap().command else { panic!("expected plan"); };
         assert!(!args.mimo_prefix_draft);
+        let super::Commands::ServeNative(served) = super::Cli::try_parse_from(
+            ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"])
+            .unwrap().command else { panic!("expected native serve"); };
+        assert!(!served.prefix.mimo_prefix_draft);
         let mut cli = super::Cli::command();
         let help = cli.find_subcommand_mut("plan").unwrap().render_long_help().to_string();
         assert!(help.contains("Experimental MiMo warm DFlash"), "{help}");

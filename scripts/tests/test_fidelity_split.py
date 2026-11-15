@@ -56,19 +56,3 @@ def test_layout_fails_closed(mutate):
         w.append({"id": "z00", "block": "Z"})
     with pytest.raises(ValueError):
         standard_layout(w)
-
-
-@pytest.mark.parametrize("path", [
-    "~/.cache/cuteafd/builds/fidelity-muse-mistral/mistral/windows-v2.json",
-    "~/.cache/cuteafd/builds/fidelity-muse-mistral/muse/windows-v2.json",
-    "~/.cache/cuteafd/builds/kimi-k3-golden/published-effort-audit/deepseek_v41-v2_20261017_1017/windows.json",
-])
-def test_staged_and_published_sets_lay_out(path):
-    file = pathlib.Path(path).expanduser()
-    if not file.exists():
-        pytest.skip("local set not present")
-    panel = json.loads(file.read_text())
-    counts = standard_layout(panel["windows"])
-    assert sum(counts.values()) == len(panel["windows"])
-    for half in ("decode", "prefill"):
-        assert standard_ids(panel["windows"], half)

@@ -218,8 +218,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     let drafter = if options.dense_qwen_mtp {
         Some(qwen3_5::DrafterBytes::native_mtp(input.checkpoint(), cfg)?)
     } else { drafter };
-    let host = options.host_memory.map(Ok)
-        .unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
+    let host = crate::plan::layout::recipe_host_memory(options)?;
     let mut budgets = qwen3_5::forecast_budgets(physical, capacity, set.module_bytes(), host)?;
     if ranks == 2 {
         let mut peer = qwen3_5::forecast_budgets(ArchContext::for_device("sm_120", options.rtx_bytes[1]),

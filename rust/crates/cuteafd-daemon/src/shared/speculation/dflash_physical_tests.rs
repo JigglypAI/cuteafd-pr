@@ -5,7 +5,7 @@ use cuteafd_loader::{families::glm5::draft_physical::GlmDflashPhysicalLayout,
 use std::{collections::BTreeMap, path::PathBuf};
 
 fn installed_snapshot(repo: &str) -> Result<PathBuf> {
-    let home = std::env::var_os("HF_HOME").map(PathBuf::from)
+    let home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface"));
     let model = home.join("hub").join(format!("models--{}", repo.replace('/', "--")));
     let revision = std::fs::read_to_string(model.join("refs/main"))

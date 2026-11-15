@@ -159,6 +159,9 @@ pub struct Entry {
     /// Opt-in full-vocabulary row dumps for selected lossless cases (needs PROBE_DUMP_ROOT).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lossless_dump: Option<crate::panels::lossless::RowDump>,
+    /// `spec_lossless_set` cases in flight at once per arm (default 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lossless_concurrency: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_lengths: Option<Vec<u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -524,6 +527,7 @@ impl Entry {
             window: self.window.clone().or_else(|| defaults.window.clone()),
             lossless_set: self.lossless_set.clone().or_else(|| defaults.lossless_set.clone()),
             lossless_dump: self.lossless_dump.clone().or_else(|| defaults.lossless_dump.clone()),
+            lossless_concurrency: self.lossless_concurrency.or(defaults.lossless_concurrency),
             context_lengths: self.context_lengths.clone().or_else(|| defaults.context_lengths.clone()),
             context_levels: self.context_levels.clone().or_else(|| defaults.context_levels.clone()),
             context_suffix: self.context_suffix.or(defaults.context_suffix),
@@ -1611,7 +1615,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             api_key: api_key.clone(), quiet: true,
             deadline: Some(Duration::from_secs(entry.run_timeout_s.unwrap_or(900))),
             lossless_set: entry.lossless_set.as_ref().map(|p| crate::panels::lossless::CaseSet::load(&repo.join(p)))
-                .transpose()?, lossless_dump: entry.lossless_dump.clone(), context_lengths: entry.context_lengths.clone(), context_levels: entry.context_levels.clone(), context_suffix: entry.context_suffix };
+                .transpose()?, lossless_dump: entry.lossless_dump.clone(), lossless_concurrency: entry.lossless_concurrency, context_lengths: entry.context_lengths.clone(), context_levels: entry.context_levels.clone(), context_suffix: entry.context_suffix };
         let (mut report, dir) = crate::cli::run(&options)?;
         // Publication markers are runner metadata, not serving defaults. This
         // also works against images built before these markers existed.

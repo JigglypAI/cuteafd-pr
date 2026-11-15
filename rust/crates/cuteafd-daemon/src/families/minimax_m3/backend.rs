@@ -105,7 +105,8 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         packing: crate::shared::prefill_packing::PackingMode) -> Result<Self> {
         let storage = &owners.storage;
         ensure!(matches!(storage.ranks.len(), 1 | 2)
-            && (storage.ranks.len() == 2) == storage.split.is_some(),
+            && (storage.ranks.len() == 2) == (storage.split.is_some() || storage.heads.is_some())
+            && !(storage.split.is_some() && storage.heads.is_some()),
             "MiniMax backend rank count differs from admitted split execution");
         let state = storage.requests.borrow();
         let bank = &state.ranks[0].bank;
@@ -464,9 +465,11 @@ mod tests {
     #[test]
     fn message_start_is_the_served_checkpoints_single_added_token() -> Result<()> {
         assert_eq!(MESSAGE_STARTS, &["]~b]"]);
-        let snapshot = Path::new("/mnt/sparknest/hf-home/hub/models--MiniMaxAI--MiniMax-M3.1-Flash/snapshots/54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e");
-        if !snapshot.join("tokenizer.json").is_file() { return Ok(()); }
-        assert_eq!(crate::shared::prefix::marker_ids(snapshot, MESSAGE_STARTS)?, vec![200_019]);
+        let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME")
+            .expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required"))
+            .join("hub/models--MiniMaxAI--MiniMax-M3.1-Flash/snapshots/54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e");
+        ensure!(snapshot.join("tokenizer.json").is_file(), "required MiniMax tokenizer missing");
+        assert_eq!(crate::shared::prefix::marker_ids(&snapshot, MESSAGE_STARTS)?, vec![200_019]);
         Ok(())
     }
 

@@ -311,7 +311,7 @@ mod tests {
                 prefill: Pin::Auto, operation: Operation::Serving, resident_weight_limit: None,
                 spark_reply_formats: Default::default() };
             let plan = qwen3_5::admit(request, qwen3_5::forecast_budgets(&cuteafd_loader::placement::ARCH_CONTEXTS[1],
-                96 << 30, 0, (128 << 30, 128 << 30))?, DenseFacts { graph_variant: "fixture".into(), graphs_enabled: true, cfg: &cfg, weights: &weights,
+                96 << 30, 0, cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram)?, DenseFacts { graph_variant: "fixture".into(), graphs_enabled: true, cfg: &cfg, weights: &weights,
                 target_arena: &target, buffers: &buffers, slots: 1, record_bytes: 1024, drafter: Some(draft),
                 blas_head: cuteafd_loader::placement::planner::serving::BlasHead::TensorLt,
                 serving: None, host_prefix: cuteafd_loader::placement::planner::serving::HostPrefixOwners {
@@ -376,7 +376,7 @@ mod tests {
             placement: cuteafd_loader::plan::ExpertPlacement::Local,
             vision: cuteafd_loader::plan::MediaMode::Off, audio: cuteafd_loader::plan::MediaMode::Off,
             layout: Some(cuteafd_loader::plan::layout::LayoutOptions {
-                rtx_bytes: vec![96 << 30], host_memory: Some((128 << 30, 128 << 30)), concurrency: 1,
+                rtx_bytes: vec![96 << 30], host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), concurrency: 1,
                 state_slots: Some(1), prefix_slots: Some(0), host_cache_bytes: Some(0), native_mtp_layers: 0,
                 pool_tokens: Some(262144), workspace_manifest: Some(programs.into()),
                 dense_qwen_kv: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, ..Default::default()
@@ -421,7 +421,7 @@ mod tests {
                 prefill: Pin::Auto, operation: Operation::Serving, resident_weight_limit: None,
                 spark_reply_formats: Default::default() };
             let plan = qwen3_5::admit(request, qwen3_5::forecast_budgets(&cuteafd_loader::placement::ARCH_CONTEXTS[1],
-                96 << 30, 0, (128 << 30, 128 << 30))?, DenseFacts { graph_variant: "fixture".into(), graphs_enabled: true, cfg: &cfg, weights: &weights,
+                96 << 30, 0, cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram)?, DenseFacts { graph_variant: "fixture".into(), graphs_enabled: true, cfg: &cfg, weights: &weights,
                 target_arena: &target, buffers: &buffers, slots: 1, record_bytes: 4096, drafter,
                 blas_head: cuteafd_loader::placement::planner::serving::BlasHead::TensorLt,
                 serving: None, host_prefix: cuteafd_loader::placement::planner::serving::HostPrefixOwners {

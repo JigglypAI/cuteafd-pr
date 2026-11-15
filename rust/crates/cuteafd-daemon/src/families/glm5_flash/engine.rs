@@ -5816,7 +5816,9 @@ mod prefill_lane_tests {
             // receipt changes only kimik3_* / draft_bf16_*: all GLM objects are identical.
             // Fork #317 adds opt-in channel-scale expanded-prefill siblings;
             // the default row128 routes and existing program metadata stay unchanged.
-            ("integration/cuteafd/glmf.py", 0x7b6b_c5eb_62ca_13ac_u64),
+            // Fork #331 rounds only chunked-prefill beta to BF16; the scoped KDA
+            // audit confirms every decode and commit object remains byte-identical.
+            ("integration/cuteafd/glmf.py", 0x992f_e789_43e2_8915_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             // Hugh Madden fork #30 (TMA fences before consumer_release): fence-only change.
             // Fork #136 adds only an optional weight TMA cache policy; MMA and K order are unchanged.

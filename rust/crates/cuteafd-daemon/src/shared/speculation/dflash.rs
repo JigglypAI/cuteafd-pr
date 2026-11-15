@@ -3367,14 +3367,10 @@ mod checkpoint_header_tests {
 
     #[test]
     fn installed_glm_k6_index_resolves_a_dflash_target_head() {
-        let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from).unwrap_or_else(||
-            std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/huggingface"));
+        let home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").map(std::path::PathBuf::from).expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required");
         let snapshot = home.join("hub/models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-Core-K6/snapshots")
             .join("5a4e83a09a11f3145332ed632d28a9894ea88225");
-        if !snapshot.join("model.safetensors.index.json").is_file() {
-            eprintln!("K6 checkpoint not installed; indexed native head fixture still runs");
-            return;
-        }
+        assert!(snapshot.join("model.safetensors.index.json").is_file(), "required installed K6 index missing");
         let index = cuteafd_loader::plan::checkpoint::read_json(&snapshot.join("model.safetensors.index.json")).unwrap();
         assert!(index["weight_map"].get("lm_head.weight").is_none());
         assert!(index["weight_map"].get("lm_head.trellis").is_some());

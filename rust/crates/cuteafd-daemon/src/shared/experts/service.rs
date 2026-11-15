@@ -523,7 +523,7 @@ mod tests {
                 cuteafd_loader::families::mimo_v2::MimoExpertInput::Bf16] {
                 let report = cuteafd_loader::plan::plan(dir.path(), &PlanOptions {
                     placement: ExpertPlacement::Sparks { ranks },
-                    layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), pool_tokens: Some(32768), context_tokens: 32768, concurrency: 4, mimo_expert_input: input,
+                    layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), pool_tokens: Some(32768), context_tokens: 32768, concurrency: 4, mimo_expert_input: input,
                         onboard: Some(cuteafd_loader::placement::OnboardSetting::Layers(0)), ..Default::default() }),
                     ..Default::default() }).unwrap();
                 let capacity = u32::try_from(report.prefill_unit_rows.unwrap()).unwrap();
@@ -1502,4 +1502,12 @@ impl NativeExpertServiceConfig {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_push_peak(resident: usize, validation: usize, scratch: usize,
+    headroom: usize, peak: usize) -> Result<()> {
+    assert_eq!(push::admit_peak(resident, validation, scratch, headroom, peak)?, peak);
+    assert!(push::admit_peak(resident, validation, scratch, headroom, peak - 1).is_err());
+    Ok(())
 }

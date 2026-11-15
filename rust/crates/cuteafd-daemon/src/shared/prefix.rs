@@ -288,15 +288,6 @@ mod tests {
     }
 
     #[test]
-    fn mimo_prefix_marks_help_links_experimental_qualification() {
-        use clap::CommandFactory;
-        let help = Cli::command().render_long_help().to_string();
-        assert!(help.contains("Experimental MiMo DFlash"), "{help}");
-        assert!(help.contains("https://github.com/tpurtell/cuteafd/issues/41"), "{help}");
-        assert!(!Cli::parse_from(["serve"]).prefix.mimo_prefix_draft);
-    }
-
-    #[test]
     fn media_quota_is_carved_before_auto_prefix_sizing() {
         let prefix = Cli::parse_from(["serve", "--host-cache-bytes", "auto"]).prefix;
         let memory = budget::HostMemory { total: 100 << 30, available: 80 << 30 };

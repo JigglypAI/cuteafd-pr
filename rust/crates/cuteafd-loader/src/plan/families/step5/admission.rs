@@ -234,7 +234,11 @@ pub struct HostInputs {
 }
 impl Default for HostInputs {
     fn default() -> Self {
-        Self { memory: (128 << 30, 128 << 30), cache_bytes: Some(0), headroom: 8 << 30,
+        Self {
+            #[cfg(test)]
+            memory: crate::plan::testing::SimulatedHost::raptor().host_ram,
+            #[cfg(not(test))]
+            memory: (128 << 30, 128 << 30), cache_bytes: Some(0), headroom: 8 << 30,
             retained_sync_h2d_bytes: 0, attention_mount_load: Default::default(), push: None }
     }
 }
@@ -780,6 +784,41 @@ mod tests {
     }
 
     #[test]
+    fn reused_header_contract_preserves_boundary_candidates() -> Result<()> {
+        use super::super::{coordinator::{CoordinatorContract, RankWeightLayout}, native};
+        let fixture = super::super::tests::exl3_snapshot();
+        let checkpoint = Checkpoint::open(fixture.path())?;
+        let cfg = Config::parse(&checkpoint)?;
+        let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
+        let mut inputs = inputs(2);
+        inputs.requested_pool = None;
+        inputs.context = EXTENT;
+        inputs.serving_context = crate::placement::planner::Context::pinned(EXTENT);
+        inputs.inventory.spark_ranks = 6;
+        inputs.kv_format = crate::families::qwen4::Qwen4KvCache::Fp8;
+        let mut recipes = Vec::new();
+        for boundary in [0, 48, 92] {
+            let owners = (0..cfg.layers).map(|layer| u8::from(layer >= boundary)).collect::<Vec<_>>();
+            let ownership = inputs.ownership_for(&cfg, &owners)?;
+            let mut legacy = Vec::new();
+            let mut reused = Vec::new();
+            for rank in 0..2 {
+                // Reproduce the old independent header builds, not the optimized wrapper.
+                let old_contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
+                let old_layout = RankWeightLayout::for_execution(&checkpoint, rank, &ownership)?;
+                legacy.push(native::rank_admission_for_layout(&old_contract, &cfg, &old_layout,
+                    &ownership, rank, inputs.unit_rows(), inputs.rows, inputs.logit_rows())?);
+                reused.push(native::rank_admission_from_contract(&contract, &cfg, &ownership, rank,
+                    inputs.unit_rows(), inputs.rows, inputs.logit_rows())?);
+            }
+            assert_eq!(legacy, reused, "CSA boundary {boundary}");
+            recipes.push((ownership.execution().modes().to_vec(), legacy, reused));
+        }
+        assert_eq!(recipes.len(), 3);
+        Ok(())
+    }
+
+    #[test]
     fn reused_header_contract_preserves_every_candidate_and_resolved_plan() -> Result<()> {
         use super::super::{coordinator::{CoordinatorContract, RankWeightLayout}, native};
         let fixture = super::super::tests::exl3_snapshot();
@@ -1158,7 +1197,7 @@ mod tests {
         let error = run(&inputs).expect_err("host quota must be admitted");
         assert!(error.downcast_ref::<crate::placement::planner::Refusal>().is_some(), "{error:#}");
         assert!(format!("{error:#}").contains("host"), "{error:#}");
-        inputs.host.memory = (128 << 30, 128 << 30);
+        inputs.host.memory = crate::plan::testing::SimulatedHost::raptor().host_ram;
         inputs.host.push = Some(crate::push_load::PushHostEnvelope::new(vec![1024], vec![2048], 128, 1 << 20)?);
         let admitted = run(&inputs)?;
         assert_eq!(admitted.host_cache_bytes, 64 << 30);
@@ -1175,7 +1214,7 @@ mod tests {
             let mut input = inputs(ranks);
             input.marks.host = true;
             input.host.cache_bytes = Some(32_941_696_000);
-            input.host.memory = (128 << 30, 128 << 30);
+            input.host.memory = crate::plan::testing::SimulatedHost::raptor().host_ram;
             let admitted = run(&input)?;
             let facts = &admitted.solved.facts;
             let prefix = facts.deferred.iter().find(|owner| owner.id == "step5.host.prefix").unwrap();

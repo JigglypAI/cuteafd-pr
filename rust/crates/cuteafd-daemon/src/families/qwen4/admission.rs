@@ -595,7 +595,7 @@ mod tests {
                     placement: ExpertPlacement::Sparks { ranks: 4 },
                     layout: Some(LayoutOptions { rtx_bytes: vec![32 << 30], prefill_rows: rows,
                         prefill_waves: waves, prefill_lanes: waves, context_tokens: 32768, prefix_slots: Some(0),
-                        host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)),
+                        host_cache_bytes: Some(0), host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
                         ..Default::default() }), ..Default::default()
                 })?;
                 assert!(report.solver_placement.is_some(), "{}", cuteafd_loader::plan::render(&report));
@@ -1010,7 +1010,7 @@ mod tests {
             args.token_io.embed_placement = if host { crate::shared::token_io::EmbedPlacement::Host }
                 else { crate::shared::token_io::EmbedPlacement::Gpu };
             let report = plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Local,
-                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: capacities.to_vec(),
+                layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: capacities.to_vec(),
                     context_tokens: 131072, prefill_rows: 64, concurrency: 8, state_slots: Some(8),
                     prefix_slots: Some(0), native_mtp_layers: args.mtp, host_embedding: host,
                     qwen_attention_plan_rows: attention_rows,
@@ -1039,7 +1039,7 @@ mod tests {
                 pending_code_bytes: [0; 2], mark_slots: 0, max_context: 131072, requested_pool: None,
                 spark_ranks: 0, onboard: Onboard::Auto,
                 host: super::host_owners_with_memory(&args, &cfg, 4, mtp, 2, 0, false, None,
-                    host_embedding, Vec::new(), (128 << 30, 128 << 30))?, encoders: Default::default() })?;
+                    host_embedding, Vec::new(), cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram)?, encoders: Default::default() })?;
             assert_eq!(runtime.pool_tokens, if capacities.iter().any(|&bytes| bytes <= 32 << 30) { 1 << 20 } else { 2 << 20 });
             assert_eq!(runtime.pool_tokens, layout.pool_tokens);
             assert_eq!(runtime.tp2.unwrap().layers, 4);
@@ -1098,7 +1098,7 @@ mod tests {
                 let context = pool.unwrap_or(131072);
                 let report = plan(snapshot.path(), &PlanOptions {
                     placement: ExpertPlacement::Local,
-                    layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![capacity], context_tokens: context,
+                    layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![capacity], context_tokens: context,
                         pool_tokens: pool, qwen_kv: kv_format, concurrency, state_slots: Some(concurrency), prefix_slots: Some(0),
                         ..Default::default() }), ..Default::default()
                 })?;

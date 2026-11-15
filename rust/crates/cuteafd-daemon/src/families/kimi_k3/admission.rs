@@ -2022,7 +2022,7 @@ pub(super) mod tests {
         let spark_bytes = 110 << 30;
         let options = PlanOptions {
             placement: ExpertPlacement::Sparks { ranks: 6 }, coordinator_budget_bytes: capacity,
-            layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
                 rtx_bytes: vec![capacity], head_split: false, concurrency: slots as u64,
                 state_slots: Some(slots as u64), prefix_slots: Some(marks as u64),
                 host_cache_bytes: Some(0), context_tokens: context as u64,
@@ -2193,7 +2193,7 @@ pub(super) mod tests {
         let automatic = plan_input.plan_spark_count(&PlanOptions {
             attention_placement: Some(AttentionPlacement::Layers),
             placement: ExpertPlacement::Sparks { ranks: 6 },
-            layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
                 rtx_bytes: vec![capacity; 2], concurrency: 16,
                 workspace_manifest: Some(manifest_path.clone()),
                 spark_allocation_budget_bytes: Some(spark_bytes), ..Default::default() }),
@@ -2244,7 +2244,7 @@ pub(super) mod tests {
             let marks = prefix_slots.unwrap_or_else(|| rule.slots(usize::try_from(mark_bytes).unwrap()) as u64);
             assert_eq!(marks, if entries == 0 { 0 } else if rule.host { 2 } else { 1 });
             let options = PlanOptions { attention_placement: Some(AttentionPlacement::Layers), placement: ExpertPlacement::Sparks { ranks: 6 },
-                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![capacity; 2], prefill_rows: unit as u64, prefill_lanes: waves as u64,
+                layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![capacity; 2], prefill_rows: unit as u64, prefill_lanes: waves as u64,
                     concurrency: slots, state_slots: Some(slots), prefix_slots,
                     mimo_prefix_entries: entries as u64, mimo_prefix_mark_bytes: rule.budget_bytes,
                     context_tokens: context as u64, pool_tokens: requested_pool, host_cache_bytes, mla_kv: format,
@@ -2420,7 +2420,7 @@ pub(super) mod tests {
                 }
                 let admitted = admit(i)?;
                 let mut options = PlanOptions { attention_placement: Some(AttentionPlacement::Layers), placement: ExpertPlacement::Sparks { ranks: 6 },
-                    layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
+                    layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
                         mla_kv: format, context_tokens: context, pool_tokens: Some(context), prefix_slots: Some(2),
                         host_cache_bytes: Some(0), onboard: Some(OnboardSetting::Auto), ..Default::default() }),
                     ..Default::default() };
@@ -2476,7 +2476,7 @@ pub(super) mod tests {
             let report = plan_input.plan(&PlanOptions {
                 attention_placement: Some(AttentionPlacement::Layers),
                 placement: ExpertPlacement::Sparks { ranks: 6 },
-                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
+                layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
                     mla_kv: format, prefix_slots: Some(2), host_cache_bytes: Some(0),
                     onboard: Some(OnboardSetting::Auto), ..Default::default() }),
                 ..Default::default()

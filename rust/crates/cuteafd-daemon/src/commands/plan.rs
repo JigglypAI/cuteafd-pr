@@ -2,7 +2,7 @@
 use anyhow::{Context, Result};
 use cuteafd_loader::plan::{budget_bytes, render, ExpertPlacement, PlanError, PlanOptions};
 #[cfg(test)]
-use cuteafd_loader::plan::plan;
+use cuteafd_loader::plan::testing::plan;
 use cuteafd_loader::{default_hf_home, resolve_snapshot_at_revision};
 use std::path::PathBuf;
 
@@ -46,7 +46,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
             }
             Ok(cuteafd_loader::plan::layout::LayoutOptions {
                 #[cfg(test)]
-                host_memory: Some((128 << 30, 128 << 30)),
+                host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
                 host_cache_bytes: match args.host_cache_bytes {
                     crate::shared::prefix::HostBudget::Auto => None,
                     crate::shared::prefix::HostBudget::Bytes(bytes) => Some(bytes),
@@ -137,7 +137,10 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 ..Default::default()
             })
         }).transpose()?,
+        ..Default::default()
     };
+    #[cfg(test)]
+    { options.inventory_host_memory = args.test_host_memory; }
     options.apply_spark_budget();
     options.validate()?;
     Ok(options)
@@ -247,7 +250,16 @@ fn validate_glmf_precision(args: &PlanArgs, family: &str) -> Result<(), PlanErro
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
+    args.test_host_memory = Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram);
+    run_plan_with_host(args)
+}
+
+#[cfg(not(test))]
+pub(crate) fn run_plan(args: PlanArgs) -> Result<()> { run_plan_with_host(args) }
+
+fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
     if args.spark_range { args.layout = true; }
     if args.deployment {
         args.layout = true;
@@ -866,6 +878,19 @@ fn transfer(snapshot: &std::path::Path, manifest: &cuteafd_loader::plan::files::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_unit_options_carry_an_explicit_non_cli_host() {
+        use clap::Parser;
+        let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(
+            ["cuteafd", "plan", "/unused"]).unwrap().command else { panic!("plan") };
+        request.test_host_memory = Some((20 << 30, 3 << 30));
+        let options = options(&request).unwrap();
+        assert!(options.layout.is_none());
+        assert_eq!(options.inventory_host_memory, request.test_host_memory);
+        assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/unused",
+            "--test-host-memory", "20GiB"]).is_err());
+    }
     use cuteafd_loader::plan::testing::{mimo_flash_config, mimo_flash_tensors, mimo_pro_config, mimo_pro_tensors,
         write_snapshot};
 
@@ -899,13 +924,10 @@ mod tests {
             .join("../../../examples/configs/kimi-k3-exl3-k6-min.config");
         let cfg = launch_config(Some(&config))?;
         let hf_home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").map(PathBuf::from)
-            .unwrap_or_else(default_hf_home);
+            .expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required");
         let snapshot = cuteafd_loader::model_cache_dir(&hf_home, &cfg["MODEL_ID"])
             .join("snapshots").join(&cfg["MODEL_REVISION"]);
-        if !snapshot.is_dir() {
-            eprintln!("installed Kimi minimum checkpoint absent; skipping installed context check");
-            return Ok(());
-        }
+        anyhow::ensure!(snapshot.is_dir(), "required installed Kimi checkpoint missing: {}", snapshot.display());
         let manifest = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap())
                 .join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json"));
@@ -1329,6 +1351,7 @@ mod tests {
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            test_host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
             fp8_prefill: Default::default(),
             attention: Default::default(),
             draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
@@ -1438,7 +1461,7 @@ mod tests {
         std::fs::write(snapshot.path().join("dflash/dflash_draft_model.safetensors"), "").unwrap();
         for speculator in ["off", "mtp", "dflash2"] {
             let mut layout = cuteafd_loader::plan::layout::LayoutOptions {
-                host_memory: Some((128 << 30, 128 << 30)), native_mtp_layers: 0,
+                host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), native_mtp_layers: 0,
                 host_cache_bytes: Some(0), ..Default::default() };
             resolve_mimo_drafter(&mut layout, speculator);
             assert_eq!(layout.mimo_drafter_disabled, speculator != "dflash2");
@@ -2055,7 +2078,7 @@ mod tests {
     #[test]
     fn v41_prefix_and_worker_layout_match_launch_arguments() {
         let mut args = args(std::path::Path::new("/not-read"), 4, false);
-        let mut layout = cuteafd_loader::plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };
+        let mut layout = cuteafd_loader::plan::layout::LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() };
         for entries in [0, 1, 20, 128] {
             args.prefix_cache_entries = Some(entries);
             for (rows, capacity) in [(0, 4096), (80, 256), (256, 256), (1024, 1024), (2048, 4096)] {
@@ -2096,7 +2119,7 @@ mod tests {
             let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan") };
             args.memory = cli.memory;
             let mut selected = options(&args).unwrap();
-            selected.layout.as_mut().unwrap().host_memory = Some((128 << 30, 128 << 30));
+            selected.layout.as_mut().unwrap().host_memory = Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram);
             selected
         };
         let expected = parse(false);

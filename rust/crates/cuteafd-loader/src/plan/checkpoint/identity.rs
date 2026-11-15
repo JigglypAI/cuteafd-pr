@@ -252,10 +252,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicit installed-checkpoint input"]
     fn exlr8_native_bootstrap_mounted_checkpoint_when_supplied() {
-        let Some(snapshot) = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT") else {
-            return;
-        };
+        let snapshot = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT").expect("set CUTEAFD_EXLR8_TEST_SNAPSHOT for this installed test");
         let root = Path::new(&snapshot);
         let mut catalog = crate::read_expert_catalog(root).unwrap();
         assert_eq!(catalog.format(), CheckpointFormat::Exlr8);

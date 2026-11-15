@@ -42,6 +42,7 @@ pub(crate) struct Storage<'a> {
     pub embedding: TokenEmbedding<'a>,
     pub usage: Option<ExpertUsage<'a>>,
     pub split: Option<super::engine::SplitExecution<'a>>,
+    pub heads: Option<super::heads::Heads<'a>>,
     devices: Vec<i32>,
 }
 impl Drop for Storage<'_> {
@@ -140,7 +141,7 @@ impl<'a> Owners<'a> {
             Category::Weights, "checkpoint-native target");
         for (gpu, rank) in loaded.iter().enumerate() {
             let target = &inputs.targets[gpu];
-            if inputs.split() { validate_split_streams(&rank.streams)?; }
+            if inputs.split() || inputs.heads() { validate_split_streams(&rank.streams)?; }
             let device = rank.streams.decode.device;
             ensure!(target.rank == gpu && rank.weights.rank == gpu && rank.weights.layers == target.layers
                 && std::ptr::eq(device.library, library) && rank.streams.prefill.len() == waves
@@ -161,11 +162,13 @@ impl<'a> Owners<'a> {
         let mut streams = Vec::with_capacity(loaded.len());
         for (gpu, rank) in loaded.into_iter().enumerate() {
             let layout = inputs.targets[gpu].clone();
-            let bind = if inputs.split() { Kernels::bind_split } else { Kernels::bind };
+            let bind = if inputs.heads() { Kernels::bind_heads }
+                else if inputs.split() { Kernels::bind_split } else { Kernels::bind };
             let kernels = bind(rank.streams.decode.device, programs, &inputs.manifest,
                 &inputs.cfg, &layout, capacity.execution_rows(), u32::try_from(inputs.context.maximum)?)?;
             let make_unit = |stream: Rc<_>, rows, prefill| -> Result<_> {
-                if inputs.split() {
+                if inputs.heads() { UnitOwner::new_heads(&kernels, stream, &inputs.cfg, &layout, rows, prefill) }
+                else if inputs.split() {
                     let roles = (0..inputs.cfg.layers).map(|layer| inputs.roles(layer, gpu, rows))
                         .collect::<std::result::Result<Vec<_>, _>>()?;
                     ensure!(roles.iter().all(|roles| roles.iter().any(|role|
@@ -209,18 +212,21 @@ impl<'a> Owners<'a> {
         }).transpose()?;
         let split = if inputs.split() { Some(super::engine::SplitExecution::new(inputs, admitted, &ranks)?) }
             else { None };
+        let heads = if inputs.heads() { Some(super::heads::Heads::new(&ranks, capacity.decode.rows, capacity.prefill.rows)?) }
+            else { None };
         let storage = Rc::new(Storage { ranks, requests: RefCell::new(requests), prefix, head,
-            embedding, usage, split, devices });
+            embedding, usage, split, heads, devices });
         let census = storage.inventory()?;
         reconcile(&census, &admitted.solved.facts, &contract.components, pages, retained_owner)?;
         let mut graphs = Vec::with_capacity(inputs.gpus);
         for (gpu, rank) in storage.ranks.iter().enumerate() {
-            let layers = if inputs.split() { (0..inputs.cfg.layers).collect::<Vec<_>>() }
+            let layers = if inputs.split() || inputs.heads() { (0..inputs.cfg.layers).collect::<Vec<_>>() }
                 else { rank.layout.layers.clone() };
             let sites = layers.iter().flat_map(|&layer| {
                 let mut sites = vec![(layer, Op::Ffn)];
-                if inputs.split() || inputs.cfg.moe[layer] { sites.push((layer, Op::JoinRouted)); }
-                if inputs.cfg.moe[layer] && (!inputs.split() || gpu == 0) { sites.push((layer, Op::Router)); }
+                if inputs.heads() { sites.extend([(layer, Op::Projection), (layer, Op::OutputProjection)]); }
+                if !inputs.heads() && (inputs.split() || inputs.cfg.moe[layer]) { sites.push((layer, Op::JoinRouted)); }
+                if inputs.cfg.moe[layer] && (inputs.gpus == 1 || gpu == 0) { sites.push((layer, Op::Router)); }
                 sites
             }).collect::<Vec<_>>();
             graphs.push(Graphs::new(Rc::clone(&rank.decode.borrow().stream), Rc::clone(&storage),
@@ -235,6 +241,7 @@ impl Owners<'_> {
     /// Initialize only persistent section scratch. No synthetic KV page or
     /// request enters the logical prefix cache, transport or usage counters.
     pub fn prewarm(&self, cfg: &cuteafd_loader::families::minimax_m3::MiniMaxM3Config) -> Result<()> {
+        if self.storage.heads.is_some() { return self.prewarm_heads(cfg); }
         if self.storage.split.is_some() { return self.prewarm_split(cfg); }
         ensure!(self.storage.ranks.len() == 1, "MiniMax whole graph prewarm requires one rank");
         let rank = &self.storage.ranks[0];
@@ -269,10 +276,43 @@ impl Owners<'_> {
                     owner.join_routed_enqueue(&rank.kernels, key.rows)?;
                     owner.post_fold_tap_enqueue(key.layer, key.rows)
                 },
+                Op::Projection | Op::OutputProjection => anyhow::bail!("MiniMax whole projection has no admitted graph site"),
                 Op::Attention => anyhow::bail!("MiniMax attention is not a context-invariant graph section"),
             }
         })?; }
         stream.drain()?;
+        Ok(())
+    }
+
+    fn prewarm_heads(&self, cfg: &cuteafd_loader::families::minimax_m3::MiniMaxM3Config) -> Result<()> {
+        let mut banks = self.graphs.borrow_mut();
+        for (gpu, rank) in self.storage.ranks.iter().enumerate() {
+            {
+                let unit = rank.decode.borrow();
+                for buffer in [unit.plane("residual")?, unit.plane("routed")?, unit.plane("ffn")?,
+                    unit.plane("reduction")?, unit.dense.producer_destination()] {
+                    unit.stream.device.run(|| {
+                        // SAFETY: private startup scratch; no KV pages, request metadata or peer publication.
+                        unsafe { unit.stream.device.library.cuda_zero_bytes_async(buffer, buffer.bytes, unit.stream.raw) }
+                    })?;
+                }
+                unit.stream.drain()?;
+            }
+            let bank = &mut banks[gpu];
+            let keys = bank.bootstrap()?;
+            // SAFETY: each section retains fixed-row operands and private scratch. Attention,
+            // peer exchange and host lease transitions are absent from these bodies.
+            unsafe { bank.prewarm(&keys, |_| None, |key| match key.op {
+                Op::Projection => rank.decode.borrow_mut().decode_projection_enqueue(&rank.kernels,
+                    &rank.weights, &rank.layout, key.layer, key.rows),
+                Op::OutputProjection => rank.decode.borrow_mut().finish_attention(&rank.kernels,
+                    &rank.weights, &rank.layout, key.layer, key.rows),
+                Op::Router => rank.decode.borrow().router_enqueue(&rank.kernels, &rank.weights, key.layer, key.rows),
+                Op::Ffn => rank.decode.borrow_mut().ffn_enqueue(&rank.kernels, &rank.weights,
+                    &rank.layout, key.layer, key.rows, cfg.moe[key.layer]),
+                _ => anyhow::bail!("MiniMax Heads graph site includes an eager exchange/attention section"),
+            })?; }
+        }
         Ok(())
     }
 
@@ -386,6 +426,12 @@ impl Storage<'_> {
             split.inventory(&mut transport)?;
             census.owners(transport.receipts);
         }
+        if let Some(heads) = &self.heads {
+            let mut transport = Inventory::new(devices, "minimax", Lifetime::TARGET,
+                Category::Transport, "serialized shared Heads exchange");
+            heads.inventory(&mut transport)?;
+            census.owners(transport.receipts);
+        }
         if let Some(usage) = &self.usage {
             let mut observed = Inventory::new(devices, "expert-usage", Lifetime::TARGET,
                 Category::Workspace, "retained expert telemetry");
@@ -421,7 +467,7 @@ fn validate_split_streams(streams: &RequestStreams<'_>) -> Result<()> {
 /// allowances before signalling readiness.
 fn retained_owner(id: &str) -> bool {
     ["minimax/target/", "minimax.kv.", "minimax.cache.", "minimax.rope.", "minimax.decode.",
-        "minimax.unit.", "minimax.prefix.h2d.", "minimax.head.", "minimax.hops.", "expert-usage.gpu"]
+        "minimax.unit.", "minimax.prefix.h2d.", "minimax.head.", "minimax.hops.", "minimax.heads.peer.", "expert-usage.gpu"]
         .iter().any(|prefix| id.starts_with(prefix))
 }
 

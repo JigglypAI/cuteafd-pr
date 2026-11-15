@@ -34,6 +34,8 @@ pub struct RunOptions {
     pub lossless_set: Option<crate::panels::lossless::CaseSet>,
     /// Opt-in row dumps for selected `spec_lossless_set` cases.
     pub lossless_dump: Option<crate::panels::lossless::RowDump>,
+    /// `spec_lossless_set` cases in flight at once per arm (`None`: 1).
+    pub lossless_concurrency: Option<usize>,
     pub context_lengths: Option<Vec<u64>>,
     pub context_levels: Option<Vec<usize>>,
     pub context_suffix: Option<u64>,
@@ -150,6 +152,7 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
         body["lossless_set"] = json!(crate::panels::lossless::SetRequest::of(set));
     }
     if let Some(dump) = &options.lossless_dump { body["lossless_dump"] = json!(dump); }
+    if let Some(n) = options.lossless_concurrency { body["lossless_concurrency"] = json!(n); }
     if let Some(lengths) = &options.context_lengths { body["context_lengths"] = json!(lengths); }
     if let Some(levels) = &options.context_levels { body["context_levels"] = json!(levels); }
     if let Some(suffix) = options.context_suffix { body["context_suffix"] = json!(suffix); }

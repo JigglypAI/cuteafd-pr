@@ -346,7 +346,7 @@ fn report_census_reuses_only_checkpoint_facts_across_options() {
                 audio: if media == MediaMode::Auto { MediaMode::Auto } else { MediaMode::Off },
                 draft_ownership: Some(draft),
                 mapped_scale_host_budget_bytes: Some(64 << 30), mapped_scale_preload_bytes: reserve,
-                layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
                     host_cache_bytes: Some(0), pool_tokens: Some(4096), prefill_reserve_rows: Some(reserve),
                     glm5_drafter_disabled: true, glmf_drafter_disabled: true, ..Default::default() }),
                 ..sparks(ranks) };
@@ -456,7 +456,7 @@ fn planner_rejects_unsupported_decode_views_before_family_layout() {
     }
     for (requested, concurrency, expected) in [(None, 16, 1), (Some(1), 16, 1), (Some(1), 1, 1)] {
         let options = PlanOptions { decode_lanes: requested,
-            layout: Some(layout::LayoutOptions { concurrency, host_memory: Some((128 << 30, 128 << 30)),
+            layout: Some(layout::LayoutOptions { concurrency, host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
                 ..Default::default() }), ..Default::default() };
         let report = plan(mimo.path(), &options).unwrap();
         assert_eq!(report.decode_lanes, expected);
@@ -511,7 +511,7 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
     report.memory_layout = Some(MemoryLayout { devices: vec![DeviceLayout {
         kind: DeviceKind::Rtx, index: 0, capacity_bytes: 96 << 30, worker_budget_bytes: 0, items: vec![], kv_tokens: 0,
     }], pool_tokens: 0, waste: vec![], notes: vec![] });
-    let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let options = layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         host_cache_bytes: Some(0), prefill_unit_rows: Some(4096), ..Default::default() };
     let spec = report.spec.as_ref().unwrap();
     let moe = spec.moe.as_ref().unwrap();
@@ -884,7 +884,9 @@ fn boot_concurrency_full_plan_matrix() {
                             let mut options = case.base_options.clone()
                                 .unwrap_or_else(|| wave_plan_options(case.dir.path(), ranks));
                             options.placement = ExpertPlacement::from_spark_ranks(ranks);
-                            if family == "qwen4" && gpus == 2 {
+                            if matches!(family, "qwen4" | "minimax_m3") && gpus == 2 {
+                                // MiniMax's reduced four-layer fixture exercises explicit split-wire
+                                // costs; release-geometry auto Heads has its own runtime parity oracle.
                                 options.attention_placement = Some(AttentionPlacement::Layers);
                             }
                             if family == "step5" {
@@ -1024,7 +1026,7 @@ fn wave_plan_options(path: &Path, ranks: usize) -> PlanOptions {
     PlanOptions { layout: Some(layout::LayoutOptions {
         rtx_bytes: vec![96 << 30], context_tokens: 32768, pool_tokens: Some(32768),
         prefix_slots: Some(0), host_cache_bytes: Some(0),
-        host_memory: Some((128 << 30, 128 << 30)),
+        host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         workspace_manifest: Some(path.join("absent.json")),
         glm5_drafter_disabled: true, glmf_drafter_disabled: true,
         ..Default::default()
@@ -1273,7 +1275,7 @@ fn qwen_incomplete_coordinator_headers_refuse_instead_of_charging_a_partial_payl
     assert!(incomplete.len() < complete.len());
     let options = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30],
         context_tokens: 32768, prefix_slots: Some(0), host_cache_bytes: Some(0),
-        host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }), ..sparks(4) };
+        host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() }), ..sparks(4) };
     let hint = "Qwen resident weights: checkpoint headers do not describe the serve-qwen4 resident layout";
     let resident_item = |report: &PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
         .flat_map(|d| &d.items).any(|item| item.group == "weight arena" && item.category == cuteafd_core::memory_layout::Category::Weights);
@@ -1301,7 +1303,7 @@ fn qwen_prefill_publishes_unit_waves_and_span_before_host_admission() {
                 prefill_rows: unit, prefill_lanes: waves, context_tokens: 32768,
                 onboard: Some(crate::placement::OnboardSetting::Layers(0)),
                 prefix_slots: Some(0), host_cache_bytes: Some(0),
-                host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
+                host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() }),
             ..sparks(4)
         }).unwrap();
         assert!(report.solver_placement.is_some(), "{}", render(&report));
@@ -1356,7 +1358,7 @@ fn qwen_mapped_ple_host_staging_matches_runtime_allocations() {
                         head_split: gpus == 2, prefill_rows: unit as u64, prefill_lanes: k as u64,
                         context_tokens: 32768, prefix_slots: Some(0), host_cache_bytes: Some(0),
                         workspace_manifest: Some(manifest.clone()),
-                        host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
+                        host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() }),
                     ..sparks(ranks)
                 }).unwrap();
                 assert!(report.solver_placement.is_some(), "{}", render(&report));
@@ -1394,7 +1396,7 @@ fn qwen_local_and_dual_publish_whole_step_geometry_without_a_transport() {
                 layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
                     workspace_manifest: Some(manifest.clone()), prefill_rows: requested,
                     context_tokens: 32768, prefix_slots: Some(0), host_cache_bytes: Some(0),
-                    host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
+                    host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() }),
                 placement: ExpertPlacement::Local, ..Default::default()
             }).unwrap();
             assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows,
@@ -1403,7 +1405,7 @@ fn qwen_local_and_dual_publish_whole_step_geometry_without_a_transport() {
         let report = plan(dir.path(), &PlanOptions {
             layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
                 prefill_waves: 2, context_tokens: 32768, prefix_slots: Some(0),
-                host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
+                host_cache_bytes: Some(0), host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() }),
             placement: ExpertPlacement::Local, ..Default::default()
         }).unwrap();
         assert!(!report.placement_supported);
@@ -1420,7 +1422,7 @@ fn spark_host_layout_requires_explicit_family_unit_even_for_one_wave() {
         for waves in [1, 2] {
             let mut report = input.plan(&sparks(4)).unwrap();
             report.prefill_span_rows = Some(2048 * waves);
-            let mut options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            let mut options = layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
                 host_cache_bytes: Some(0), prefill_rows: 4096, prefill_waves: waves, ..Default::default() };
             let error = layout::charge_host(&mut report, &options, &input, native).unwrap_err();
             assert!(error.to_string().contains("requires family-resolved prefill_unit_rows"), "{error:#}");
@@ -1440,7 +1442,7 @@ fn real_layout_charges_host_and_names_unsupported_snapshot_geometry() {
     config.as_object_mut().unwrap().remove("max_position_embeddings");
     let dir = snapshot(config, &mimo_flash_tensors());
     let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
-        host_memory: Some((128 << 30, 128 << 30)), ..Default::default()
+        host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default()
     }), ..sparks(4) };
     let report = plan(dir.path(), &options).unwrap();
     assert!(report.spec.is_some() && report.host_ledger.is_none());
@@ -1467,7 +1469,7 @@ fn host_automatic_quota_depends_on_concurrency_not_device_entries() {
         let expected = cuteafd_core::prefix::host_cache_required_bytes(1 << 20, concurrency,
             rows, page, mark.max(1), 0, chunk).unwrap().min(32 << 30);
         for entries in [1, 2000] {
-            let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            let options = layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
                 context_tokens: 1 << 20, concurrency, mimo_prefix_entries: entries,
                 prefill_unit_rows: Some(4096), ..Default::default() };
             layout::charge_host(&mut report, &options, &input, false).unwrap();
@@ -1564,7 +1566,7 @@ fn family_native_placement_bypasses_legacy_layout_and_refuses_closed() {
     // An unknown family has no adapter of its own. The sentinel can only
     // come from the hook, independent of any registered family's dispatch.
     report.family = Some("test_native_placement".into());
-    let mut options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };
+    let mut options = layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() };
     let memory = family_layout(&native, &input, &mut report, &mut options, ExpertPlacement::Local).unwrap();
     assert_eq!(memory.pool_tokens, 123456);
     assert_eq!(memory.notes, ["native hook sentinel"]);
@@ -1589,7 +1591,7 @@ fn declared_numerics_report_preserves_optimizations_and_names_pending_kernel() {
     let defaults = precision_optimizations("glm5_flash", &options);
     assert!(!defaults.iter().any(|text| text.contains("KDA")));
     assert!(defaults.iter().any(|text| text.contains("head:")));
-    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation {
             kda_fp8: false, head: crate::families::glm5_flash::resident::GlmfHeadFormat::Bf16, output_shard: false },
         glmf_drafter_disabled: true, ..Default::default() }), ..Default::default() };
@@ -1936,7 +1938,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
         let dir = strict_v41_snapshot(nvfp4);
         let catalog = crate::read_expert_catalog(dir.path()).unwrap();
         for (ranks, gpus) in [(3, 1), (4, 1), (6, 2)] {
-            let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
                 rtx_bytes: vec![96 << 30; gpus], onboard: Some(crate::placement::OnboardSetting::Layers(1)),
                 workspace_manifest: v41_workspace(dir.path()),
                 pool_tokens: Some(2_097_152), ..Default::default()
@@ -2013,7 +2015,7 @@ fn v41_rejects_an_unsupported_expert_format_with_a_hint() {
 #[test]
 fn unknown_architecture_is_reported_not_fatal() {
     let dir = snapshot(json!({"architectures": ["SomethingNew"], "model_type": "new"}), &[t("w", "BF16", &[2])]);
-    for layout in [None, Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() })] {
+    for layout in [None, Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() })] {
         let report = plan(dir.path(), &PlanOptions { layout, ..Default::default() }).unwrap();
         assert!(report.family.is_none());
         assert!(!report.fits);
@@ -2094,7 +2096,7 @@ fn glm5_layout_explicit_span_matches_the_admitted_shape() {
     let plan_with = |span| {
         let options = layout::LayoutOptions { rtx_bytes: vec![96 << 30], context_tokens: 65536,
             prefill_rows: 4096, prefill_lanes: 2, prefill_span_rows: span, glm5_drafter_disabled: true,
-            host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };
+            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() };
         plan(dir.path(), &PlanOptions { layout: Some(options),
             attention_placement: Some(crate::placement::AttentionPlacement::Heads), ..sparks(4) }).unwrap()
     };
@@ -2139,7 +2141,7 @@ fn glm5_attention_auto_requires_complete_context_programs() {
         let manifest = json!({"capacities": {"max_context": 65536}, "programs": programs});
         std::fs::write(&path, manifest.to_string()).unwrap();
         for gpus in [1, 2] {
-            let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
                 rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
                 context_tokens: 65536, pool_tokens: Some(65536), glm5_drafter_disabled: true,
                 workspace_manifest: Some(if omitted == Some("no-manifest") { dir.path().join("absent.json") }
@@ -2218,7 +2220,7 @@ fn glm5_heads_pool_refusal_reports_heads_not_context() {
         json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 4096}})).collect();
     std::fs::write(dir.path().join("PROGRAMS.json"),
         json!({"capacities": {"max_context": 1_048_576}, "programs": programs}).to_string()).unwrap();
-    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
         context_tokens: 1_048_576, pool_tokens: Some(1 << 40), glm5_drafter_disabled: true,
         workspace_manifest: Some(dir.path().join("PROGRAMS.json")), ..Default::default()
@@ -2416,7 +2418,7 @@ fn routed_exl3_multitier_is_unsupported_and_names_tensors() {
 
 #[test]
 fn glm5_flash_mixed_exl3_tiers_share_one_package() {
-    let quant_options = |ranks| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20, ..Default::default() }), ..sparks(ranks) };
+    let quant_options = |ranks| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20, ..Default::default() }), ..sparks(ranks) };
     let mut tensors = glm5_flash_tensors(&glm5_flash_config(2));
     tensors.retain(|(name, ..)| !name.contains(".mlp.experts."));
     let mut projections = Vec::new();
@@ -2464,7 +2466,7 @@ fn glm5_flash_mixed_exl3_tiers_share_one_package() {
 /// tier; its BF16 coordinator block projections are quantized to FP8 blocks at load.
 #[test]
 fn glm5_flash_standard_exllamav3_checkpoint_is_ready() {
-    let quant_options = |ranks| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20, ..Default::default() }), ..sparks(ranks) };
+    let quant_options = |ranks| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20, ..Default::default() }), ..sparks(ranks) };
     let mut tensors = glm5_flash_tensors(&glm5_flash_config(2));
     tensors.retain(|(name, ..)| !name.contains(".mlp.experts."));
     for expert in 0..288 {
@@ -2616,7 +2618,7 @@ fn glm5_flash_native_block_projection_rejects_wrong_scale_dtype_grid_or_missing_
 fn glm5_flash_modelopt_nvfp4_experts_are_ready() {
     let dense = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(dense.path(), json!({"layouts": {"tp1": {"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities": [{"capacity":4096,"scratch_bytes":1024}]}}}).to_string()).unwrap();
-    let quant_options = |ranks| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20, glmf_dense_manifest: Some(dense.path().to_path_buf()), ..Default::default() }), ..sparks(ranks) };
+    let quant_options = |ranks| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20, glmf_dense_manifest: Some(dense.path().to_path_buf()), ..Default::default() }), ..sparks(ranks) };
     let mut tensors = glm5_flash_tensors(&glm5_flash_config(2));
     tensors.retain(|(name, ..)| !name.contains(".mlp.experts.") && !name.starts_with("model.language_model.layers.0.mlp."));
     for (proj, n, k) in [("gate_proj", 12288, 4096), ("up_proj", 12288, 4096), ("down_proj", 4096, 12288)] {
@@ -2827,7 +2829,7 @@ fn mounted_mimo_audio_inventory_is_independently_admitted() {
         assert_eq!(resolve_audio(PlanOptions::default().audio, &snapshot).unwrap(), MediaMode::Auto);
         assert_eq!(resolve_audio(MediaMode::Off, &snapshot).unwrap(), MediaMode::Off);
         let options = PlanOptions { vision: MediaMode::Auto,
-            layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 * GIB; gpus], spark_bytes: 121 * GIB,
+            layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 * GIB; gpus], spark_bytes: 121 * GIB,
                 ..Default::default() }), ..sparks(ranks) };
         let on = plan(&snapshot, &options).unwrap();
         let audio = on.audio_encoder.as_ref().unwrap();
@@ -2844,7 +2846,7 @@ fn mounted_mimo_audio_inventory_is_independently_admitted() {
         assert!(off.audio_encoder.is_none());
         assert_eq!(on.bytes_by_owner.get("rtx"), off.bytes_by_owner.get("rtx"), "Spark audio must not charge RTX weights");
         assert_ne!(on.encoder_plan_hash, off.encoder_plan_hash);
-        let constrained = PlanOptions { vision: MediaMode::Off, layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        let constrained = PlanOptions { vision: MediaMode::Off, layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             rtx_bytes: vec![1; gpus], spark_bytes: 1, ..Default::default()
         }), ..sparks(ranks) };
         let fallback = plan(&snapshot, &constrained).unwrap();
@@ -3055,7 +3057,7 @@ fn v4_actual_plan_preserves_exact_resident_weight_refusal_with_and_without_layou
         let options = PlanOptions { coordinator_budget_bytes: required,
             layout: full_layout.then(|| layout::LayoutOptions {
                 rtx_bytes: vec![96 << 30], context_tokens: 32768, pool_tokens: Some(32768),
-                onboard: Some(OnboardSetting::Layers(0)), host_memory: Some((128 << 30, 128 << 30)),
+                onboard: Some(OnboardSetting::Layers(0)), host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
                 host_cache_bytes: Some(0), ..Default::default()
             }), ..sparks(4) };
         let accepted = plan(dir.path(), &options).unwrap();
@@ -3091,7 +3093,7 @@ fn glm5_actual_plan_preserves_exact_resident_weight_refusal_with_and_without_lay
             layout: full_layout.then(|| layout::LayoutOptions {
                 rtx_bytes: vec![96 << 30], context_tokens: 32768, pool_tokens: Some(32768),
                 onboard: Some(OnboardSetting::Layers(0)), glm5_drafter_disabled: true,
-                host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+                host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0),
                 ..Default::default()
             }), ..sparks(4) };
         let accepted = plan(dir.path(), &options).unwrap();
@@ -3132,7 +3134,7 @@ fn native_display_suffix_does_not_skip_v41_or_v4_resident_census() {
     for v41 in [true, false] {
         let dir = if v41 { strict_v41_snapshot(false) } else { v4_snapshot() };
         let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
-            host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0),
             rtx_bytes: vec![96 << 30], onboard: Some(crate::placement::OnboardSetting::Layers(1)),
             workspace_manifest: v41.then(|| dir.path().join("share/PROGRAMS.json")),
             context_tokens: 262_144, pool_tokens: Some(262_144), prefill_rows: 256, ..Default::default()
@@ -3168,7 +3170,7 @@ fn v4_plan_shared_span_matches_unit_rows_and_waves() {
     for (unit, waves) in [(2048, 1), (2048, 2), (2048, 3), (4096, 1), (4096, 2), (2752, 3)] {
         let reports: Vec<_> = [None, Some(unit * waves)].into_iter().map(|span| {
             let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
-                host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+                host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0),
                 prefill_rows: unit, prefill_unit_rows: Some(unit), prefill_lanes: waves,
                 prefill_span_rows: span, pool_tokens: Some(32768), ..Default::default()
             }), ..sparks(4) }).unwrap();
@@ -3186,7 +3188,7 @@ fn v4_plan_resolves_serving_wave_default_and_explicit_requests() {
     // With actual remote experts, unset follows k3 (#785); pins override it.
     for (requested, expected, unit) in [(0, 3, 2752), (1, 1, 4096), (2, 2, 4096), (3, 3, 2752), (4, 4, 2048)] {
         let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
-            host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0),
             prefill_lanes: requested, prefill_waves: requested.max(1),
             onboard: Some(crate::placement::OnboardSetting::Layers(0)),
             pool_tokens: Some(32768), ..Default::default()
@@ -3201,7 +3203,7 @@ fn v4_prefill_shape_follows_solved_experts_not_available_sparks() {
     use crate::placement::{ExpertHome, OnboardSetting};
     let dir = v4_snapshot();
     let options = PlanOptions { layout: Some(layout::LayoutOptions {
-        host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+        host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0),
         rtx_bytes: vec![96 << 30], pool_tokens: Some(32768), ..Default::default()
     }), ..sparks(4) };
     let local = plan_spark_count(dir.path(), &options, 4, Some(4)).unwrap();
@@ -3238,7 +3240,7 @@ fn v4_contract_owns_exact_host_tier_and_refuses_host_shortfall() {
     let options = |host: (u64, u64), cache: Option<u64>| PlanOptions { layout: Some(layout::LayoutOptions {
         host_memory: Some(host), host_cache_bytes: cache, pool_tokens: Some(32768), ..Default::default() }),
         ..sparks(4) };
-    let planned = plan(dir.path(), &options((128 << 30, 128 << 30), Some(0))).unwrap();
+    let planned = plan(dir.path(), &options(crate::plan::testing::SimulatedHost::raptor().host_ram, Some(0))).unwrap();
     assert!(planned.placement_supported, "{}", render(&planned));
     // The contract declares the host tier; no generic estimate runs beside it.
     assert!(planned.host_ledger.is_none());
@@ -3256,7 +3258,7 @@ fn v4_contract_owns_exact_host_tier_and_refuses_host_shortfall() {
         device.items.iter().all(|item| item.group != "Spark egress")));
     // A retained prefix quota is a host owner resolved before admission.
     let quota = 4 << 30;
-    let prefixed = plan(dir.path(), &options((128 << 30, 128 << 30), Some(quota))).unwrap();
+    let prefixed = plan(dir.path(), &options(crate::plan::testing::SimulatedHost::raptor().host_ram, Some(quota))).unwrap();
     assert!(prefixed.placement_supported, "{}", render(&prefixed));
     assert_eq!(prefixed.host_budget_bytes, quota);
     let ready = owned(prefixed.phase_ledger.as_ref().unwrap(), Phase::Ready);
@@ -3291,7 +3293,7 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
         for context in [16384, 32512, 32768] {
             // Pin the 4096 x 2 shape the runtime geometry above is built for;
             // unpinned, the descriptor estimate selects k3.
-            let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
                 rtx_bytes: vec![total], context_tokens: context, pool_tokens: Some(32768),
                 prefill_lanes: 2, prefill_waves: 2,
                 workspace_manifest: Some(path.clone()), ..Default::default()
@@ -3340,7 +3342,7 @@ fn v4_missing_workspace_manifest_keeps_only_the_named_reserve() {
     use cuteafd_core::serving_capacity::GpuMemoryBudget;
     let dir = v4_snapshot();
     let total = GpuMemoryBudget::from_gib(31.8).unwrap().0;
-    let solve = || plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let solve = || plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         rtx_bytes: vec![total], workspace_manifest: Some(dir.path().join("absent.json")),
         ..Default::default()
     }), ..sparks(2) }).unwrap().memory_layout.unwrap().devices.remove(0);
@@ -3357,7 +3359,7 @@ fn v4_missing_workspace_manifest_keeps_only_the_named_reserve() {
 fn v4_pool_first_defaults_and_explicit_layer_failure() {
     let dir = v4_snapshot();
     let solve = |bytes, pool_tokens, layers: Option<usize>| plan(dir.path(), &PlanOptions {
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![bytes], pool_tokens,
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![bytes], pool_tokens,
             onboard: Some(layers.map_or(crate::placement::OnboardSetting::Auto, crate::placement::OnboardSetting::Layers)), ..Default::default() }),
         ..sparks(2)
     }).unwrap();
@@ -3384,7 +3386,7 @@ fn v4_pool_first_defaults_and_explicit_layer_failure() {
         "{:?}", beyond.memory_layout.as_ref().unwrap().notes);
     // A fixed onboard leaves the automatic pool at the card's target (1M below
     // the small-card threshold); the memory beyond it stays free by contract.
-    let fixed = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![24 << 30],
+    let fixed = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![24 << 30],
         onboard: Some(crate::placement::OnboardSetting::Layers(1)), ..Default::default() }), ..sparks(2) }).unwrap();
     assert!(fixed.placement_supported);
     assert_eq!(fixed.memory_layout.unwrap().pool_tokens, 1 << 20);
@@ -3451,7 +3453,7 @@ fn spark_rank_options_follow_transport_and_packages() {
         }
         if ranks == 0 { assert!(mimo.hints.iter().any(|h| h.what.contains("BF16 package manifest"))); }
         assert_eq!(plan(qwen.path(), &options).unwrap().placement_supported, matches!(ranks, 0..=4), "qwen {ranks}");
-        let v41_options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        let v41_options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             workspace_manifest: v41_workspace(dsv41.path()), ..Default::default()
         }), ..options.clone() };
         let v41 = plan(dsv41.path(), &v41_options).unwrap();
@@ -3538,7 +3540,7 @@ fn qwen_nvfp4_preserves_shipped_six_and_refuses_seven_and_eight() {
     let recipe = experts::spark_recipe("qwen4:nvfp4", 640, 6).unwrap();
     assert_eq!(recipe.slicing, crate::formats::fp8_experts::Slicing::Padded);
     assert_eq!(recipe.widths, [128; 6]);
-    let columns = PlanInput::open(dir.path()).unwrap().spark_ranges(&PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }), ..Default::default() }).unwrap();
+    let columns = PlanInput::open(dir.path()).unwrap().spark_ranges(&PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() }), ..Default::default() }).unwrap();
     assert_eq!(columns.len(), 2);
     if let Some(single) = &columns[0].range {
         assert!(columns[1].range.as_ref().unwrap().minimum <= single.minimum);
@@ -3579,7 +3581,7 @@ fn invalid_budgets_are_typed_option_errors() {
 fn explicit_spark_ceiling_updates_all_layout_budgets_without_changing_defaults() {
     assert_eq!(DEFAULT_SPARK_BUDGET_BYTES, 100 << 30);
     assert_eq!(super::families::kimi::SPARK_BUDGET_BYTES, 108 << 30);
-    let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }), ..Default::default() };
+    let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() }), ..Default::default() };
     options.apply_spark_budget();
     assert_eq!(options.spark_budget_bytes, None);
     assert_eq!(options.layout.as_ref().unwrap().spark_bytes, 108 << 30);
@@ -3627,7 +3629,7 @@ fn qwen_spark_encoder_candidate_enforces_its_physical_budget() {
     let mut options = PlanOptions {
         vision: MediaMode::Spark(Some(0)),
         layout: Some(layout::LayoutOptions {
-            host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0),
             rtx_bytes: vec![96 << 30], pool_tokens: Some(32768), target_pool_tokens: 32768,
             onboard: Some(crate::placement::OnboardSetting::Layers(1)), ..Default::default()
         }), ..sparks(1)
@@ -3693,7 +3695,7 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     let lookup = glmf_manifest_scratch(&manifest);
     // Per-slot native scratch supports every admitted wave count and unit width.
     for (lanes, rows, headroom) in [(2u64, 4096u64, 2u64 << 30), (3, 2752, 1 << 30), (4, 2048, 1 << 30)] {
-        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20, rtx_bytes: vec![32 << 30], prefill_lanes: lanes,
+        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20, rtx_bytes: vec![32 << 30], prefill_lanes: lanes,
             prefill_rows: rows, context_tokens: 131_072, workspace_manifest: Some(path.clone()),
             ..Default::default() }), ..sparks(4) };
         let memory = cuteafd_core::memory_policy::MemoryPolicy { family_reserve: Some(headroom), ..Default::default() }
@@ -3714,7 +3716,7 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     }
     // A 32 GiB plan must use the selected precision, including state and marks.
     let planned = |state, fp8, manifest_path: &std::path::Path| {
-        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             rtx_bytes: vec![32 << 30], drafter_bytes: 256 << 20, context_tokens: 131_072,
             workspace_manifest: Some(manifest_path.to_path_buf()),
             glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation {
@@ -3757,7 +3759,7 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     assert!(planned(GlmfKdaState::F32, true, &missing_path).notes.iter()
         .any(|n| n.contains("lacks the requested step scratch")));
     // Without a manifest: the one-GPU allowance, never below the default lanes' rows in flight.
-    let options = |lanes: u64, rows: u64| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20, rtx_bytes: vec![32 << 30],
+    let options = |lanes: u64, rows: u64| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20, rtx_bytes: vec![32 << 30],
         prefill_lanes: lanes, prefill_rows: rows, workspace_manifest: Some(dir.path().join("absent.json")),
         ..Default::default() }), ..sparks(4) };
     let steps = |lanes, rows| plan(dir.path(), &options(lanes, rows)).unwrap().memory_layout.unwrap().devices[0].items
@@ -3781,7 +3783,7 @@ fn glm5_flash_layout_charges_the_packed_head_on_one_gpu() {
     let config = glm5_flash_config(2);
     let dir = snapshot(config.clone(), &glm5_flash_tensors(&config));
     let planned = |head, gpus: usize| {
-        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             rtx_bytes: vec![32 << 30; gpus], head_split: gpus == 2, drafter_bytes: 256 << 20, context_tokens: 131_072,
             glmf_representation: GlmfRepresentation { head, ..Default::default() }, ..Default::default() }), ..sparks(4) };
         plan(dir.path(), &options).unwrap()
@@ -3884,7 +3886,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         (0, crate::placement::OnboardSetting::Auto, 3)] {
         let lanes = if expected_rtx == 3 { 1 } else { 2 };
         let onboard = setting.resolve(cfg.dense.iter().filter(|dense| !**dense).count());
-        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             rtx_bytes: vec![placement::inventory::PRO_TOTAL_BYTES; 2], head_split: true,
             context_tokens: 262144, pool_tokens: Some(2 << 20), onboard: Some(setting),
             prefill_rows: 4096, prefill_lanes: lanes, state_slots: Some(8), prefix_slots: Some(8),
@@ -4061,7 +4063,7 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
     let (wide_path, manifest) = write("wide.json", &[base.clone(), wide.to_vec()].concat());
     let cfg = GlmNextConfig::from_hf(&config).unwrap();
     let lookup = glmf_manifest_scratch(&manifest);
-    let options = |decode_rows: u64, path: &std::path::Path, gpus: usize| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20,
+    let options = |decode_rows: u64, path: &std::path::Path, gpus: usize| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20,
         rtx_bytes: vec![32 << 30; gpus], context_tokens: 131_072, workspace_manifest: Some(path.to_path_buf()),
         glmf_decode_rows: decode_rows, ..Default::default() }), ..sparks(4) };
     let item = |report: &PlanReport, group: &str| {
@@ -4179,7 +4181,7 @@ fn glm5_flash_index_layout_pool_matches_runtime_geometry() {
             for rows in if gpus == 1 { vec![64, 128] } else { vec![64] } {
                 for pool_marks in [false, true] {
                     for shared in [false, true] {
-                        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20,
+                        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20,
                             rtx_bytes: vec![24 << 30; gpus], context_tokens: 131_072,
                             glmf_index: index, glmf_decode_rows: rows, glmf_pool_marks: pool_marks,
                             glmf_shared_replay: shared, state_slots: Some(8), ..Default::default()
@@ -4264,7 +4266,7 @@ fn glm5_flash_layout_moves_shared_replay_records_into_the_prefill_scratch() {
     let records = glm_flash_kda_replay_bytes(&cfg, 2, 1).unwrap();
     assert_eq!(records, 9_453_568);
     let report = |path: &std::path::Path, shared: bool, pool: Option<u64>| {
-        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20, rtx_bytes: vec![32 << 30],
+        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20, rtx_bytes: vec![32 << 30],
             context_tokens: 131_072, workspace_manifest: Some(path.to_path_buf()), glmf_shared_replay: shared,
             pool_tokens: pool, ..Default::default() }), ..sparks(4) };
         plan(dir.path(), &options).unwrap()
@@ -4298,7 +4300,7 @@ fn glm5_flash_layout_moves_shared_replay_records_into_the_prefill_scratch() {
     assert_eq!(report(&path, true, None).replay_records, Some("shared"));
     assert_eq!(report(&path, false, None).replay_records, Some("own"));
     let auto_report = |placement: ExpertPlacement, pool: Option<u64>, onboard: Option<crate::placement::OnboardSetting>| {
-        let options = PlanOptions { placement, layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        let options = PlanOptions { placement, layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             drafter_bytes: 256 << 20, rtx_bytes: vec![96 << 30], context_tokens: 131_072,
             workspace_manifest: Some(path.clone()), glmf_auto_replay: true, pool_tokens: pool,
             onboard, ..Default::default() }), ..Default::default() };
@@ -4318,7 +4320,7 @@ fn glm5_flash_layout_moves_shared_replay_records_into_the_prefill_scratch() {
 fn glm5_flash_spark_count_refusal_preserves_pool_and_replay_constraints() {
     let config = glm5_flash_config(2);
     let dir = snapshot(config.clone(), &glm5_flash_tensors(&config));
-    let options = |gpus, pool| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let options = |gpus, pool| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         drafter_bytes: 256 << 20, rtx_bytes: vec![32 << 30; gpus],
         context_tokens: 131_072, glmf_shared_replay: true,
         pool_tokens: Some(pool), ..Default::default()
@@ -4361,7 +4363,7 @@ fn glm5_flash_two_gpu_auto_without_context_programs_uses_layers() {
         "programs": programs});
     let path = dir.path().join("PROGRAMS.json");
     std::fs::write(&path, manifest.to_string()).unwrap();
-    let options = |attention| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20,
+    let options = |attention| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20,
         rtx_bytes: vec![96 << 30; 2], context_tokens: 131_072, head_split: true,
         prefill_rows: 4096, prefill_lanes: 2, workspace_manifest: Some(path.clone()),
         // The fixture manifest is the plain program set: no W8 KDA, no expanded prefill, no
@@ -4412,7 +4414,7 @@ fn glmf_tp2_auto_preserves_selected_prefill_options() {
     for ranks in [0, 4] {
         let mut options = PlanOptions { attention_placement: Some(AttentionPlacement::Heads),
             layout: Some(layout::LayoutOptions {
-                host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2],
+                host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2],
                 head_split: true, context_tokens: 32768, pool_tokens: Some(32768),
                 glmf_tp2_dflash_auto: true, glmf_drafter_snapshot: Some(draft.path().into()),
                 workspace_manifest: Some(manifest.clone()), ..Default::default()
@@ -4438,7 +4440,7 @@ fn glmf_tp2_auto_manual_budget_and_spark_range_keep_whole_single_gpu() {
     let manifest = write_glm5_flash_workspaces(dir.path());
     let options = PlanOptions { attention_placement: Some(AttentionPlacement::Heads),
         layout: Some(layout::LayoutOptions {
-            host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2],
+            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2],
             pool_tokens: Some(32768), context_tokens: 32768, drafter_bytes: 256 << 20,
             tp2_dflash: true, glmf_tp2_dflash_auto: true,
             workspace_manifest: Some(manifest), ..Default::default()
@@ -4469,7 +4471,7 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
     std::fs::write(draft.path().join("config.json"), config.to_string()).unwrap();
     for draft_kv_cache in [crate::families::qwen4::Qwen4KvCache::Bf16,
         crate::families::qwen4::Qwen4KvCache::Fp8] {
-        let mut options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![32 << 30, 96 << 30], concurrency:8,
+        let mut options = layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![32 << 30, 96 << 30], concurrency:8,
             draft_sequences:Some(8), draft_context_slots:Some(8), draft_kv_cache, glmf_draft_fp8_mode:2, glmf_drafter_snapshot:Some(draft.path().into()),
             context_tokens:131_072, ..Default::default() };
         let run = |options: &layout::LayoutOptions| {
@@ -4519,7 +4521,7 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
         &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
     let mut plans = serde_json::Map::new();
     for (name, gpus, ranks) in [("min", 1, 4), ("max", 2, 4), ("two-rtx-no-spark", 2, 0)] {
-        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             rtx_bytes: vec![96 << 30; gpus], pool_tokens: Some(2_097_152),
             context_tokens: 1_048_576, ..Default::default()
         }), ..sparks(ranks) };
@@ -4583,7 +4585,7 @@ fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
     let dir = snapshot(glm5_flash_config(2), &glm5_flash_tensors(&glm5_flash_config(2)));
     for head in [GlmfHeadFormat::Auto, GlmfHeadFormat::Bf16, GlmfHeadFormat::Fp8, GlmfHeadFormat::Packed] {
     let bf16 = head.resolve(false, 1) == GlmfHeadFormat::Bf16;
-    let options = |disabled| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20,
+    let options = |disabled| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20,
         glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation {
             head, ..Default::default() },
         glmf_drafter_disabled: disabled, context_tokens: 131_072, ..Default::default() }), ..sparks(4) };
@@ -4660,7 +4662,7 @@ fn layout_places_every_device_and_names_compact_spark_slices() {
     write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
     let gib = 1u64 << 30;
     let options = PlanOptions {
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 * gib, 96 * gib], ..Default::default() }),
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 * gib, 96 * gib], ..Default::default() }),
         ..sparks(6)
     };
     let report = plan(dir.path(), &options).unwrap();
@@ -4710,7 +4712,7 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     }
     write_snapshot(dir.path(), &config, &tensors, Some(8));
     let mut options = PlanOptions {
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![24 << 30, 96 << 30], force_gpu_embedding: true,
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![24 << 30, 96 << 30], force_gpu_embedding: true,
             context_tokens: 4096, pool_tokens: Some(4096),
             onboard: Some(crate::placement::OnboardSetting::Layers(0)), ..Default::default() }),
         ..sparks(6)
@@ -4762,7 +4764,7 @@ fn mimo_small_card_auto_embedding_and_full_context() {
     config["max_position_embeddings"] = json!(1_048_576);
     config["tie_word_embeddings"] = json!(false);
     write_snapshot(dir.path(), &config, &mimo_pro_tensors(), Some(8));
-    let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         rtx_bytes: vec![32 << 30], ..Default::default()
     }), ..sparks(4) };
     let base = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
@@ -4788,7 +4790,7 @@ fn mimo_logical_capacity_concurrency_matches_serving_and_rings_follow_overrides(
     write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
     for gib in [32, 96] {
         let expected = cuteafd_core::serving_capacity::default_concurrency(gib << 30);
-        let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             rtx_bytes: vec![gib << 30], ..Default::default()
         }), ..sparks(4) };
         let automatic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
@@ -4818,7 +4820,7 @@ fn all_family_concurrency_defaults_match_explicit_logical_capacity() {
         snapshot(mimo_pro_config(), &mimo_pro_tensors())];
     for dir in snapshots {
         for bytes in [32u64 << 30, (32u64 << 30) + 1, 96u64 << 30] {
-            let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
                 rtx_bytes: vec![bytes; 2], head_split: true, workspace_manifest: Some(dir.path().join("absent.json")),
                 glm5_drafter_disabled: true, glmf_drafter_disabled: true, ..Default::default()
             }), ..sparks(4) };
@@ -4840,7 +4842,7 @@ fn mimo_draft_prefix_ledger_is_opt_in_and_checked() {
     ] {
         let dir = tempfile::tempdir().unwrap();
         write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
-        let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             concurrency: 16, draft_kv_cache, ..Default::default()
         }), ..sparks(4) };
         let base = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
@@ -4886,7 +4888,7 @@ fn qwen_default_attention_follows_spark_free_coordinator_layout() {
         (2, true, 1, AttentionPlacement::Layers),
         (2, true, 4, AttentionPlacement::Layers),
     ] {
-        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             rtx_bytes: vec![96 << 30; gpus], head_split: peer, ..Default::default()
         }), ..sparks(ranks) };
         let report = plan(dir.path(), &options).unwrap();
@@ -4904,7 +4906,7 @@ fn qwen_split_off_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle
     let dir = snapshot(config, &tensors);
     write_quantize_config(dir.path(), &manifest);
     let options = PlanOptions {
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             rtx_bytes: vec![12 << 30, 96 << 30], head_split: false, pool_tokens: Some(0),
             context_tokens: 32768, ..Default::default()
         }), ..sparks(0)
@@ -4929,7 +4931,7 @@ fn v41_graph_reserve_is_one_card_size_independent_arena() {
     let dir = strict_v41_snapshot(false);
     for gib in [32, 96] {
         let options = PlanOptions {
-            layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![gib << 30], prefill_rows: 256, onboard: Some(crate::placement::OnboardSetting::Layers(0)),
+            layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![gib << 30], prefill_rows: 256, onboard: Some(crate::placement::OnboardSetting::Layers(0)),
                 context_tokens: 262_144, pool_tokens: Some(262_144), workspace_manifest: v41_workspace(dir.path()), ..Default::default() }),
             ..sparks(4)
         };
@@ -4946,7 +4948,7 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     use cuteafd_core::memory_layout::Category;
     let dir = strict_v41_snapshot(false);
     let mut options = sparks(4);
-    options.layout = Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30], context_tokens: 512, pool_tokens: Some(0),
+    options.layout = Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30], context_tokens: 512, pool_tokens: Some(0),
         prefix_slots: Some(0), native_mtp_layers: 0, workspace_manifest: v41_workspace(dir.path()), ..Default::default() });
     let automatic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert_eq!(automatic.devices[0].capacity_bytes, 96u64 << 30);
@@ -4968,7 +4970,7 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
 fn v41_auto_pool_and_count_admission_preserve_one_recipe() {
     let dir = strict_v41_snapshot(false);
     let options = PlanOptions { layout: Some(layout::LayoutOptions {
-        host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30],
+        host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30],
         context_tokens: 262_144, workspace_manifest: v41_workspace(dir.path()),
         ..Default::default()
     }), ..sparks(4) };
@@ -5000,7 +5002,7 @@ fn v41_auto_pool_and_count_admission_preserve_one_recipe() {
 fn v41_host_capacity_is_a_boundary_of_the_same_contract() {
     let dir = strict_v41_snapshot(false);
     let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
-        host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30],
+        host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30],
         context_tokens: 262_144, host_cache_bytes: Some(1 << 30),
         workspace_manifest: v41_workspace(dir.path()), ..Default::default()
     }), ..sparks(4) };
@@ -5026,7 +5028,7 @@ fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
     let dir = strict_v41_snapshot(false);
     let mut options = sparks(4);
     options.vision = MediaMode::Auto;
-    options.layout = Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![32 << 30], context_tokens: 512, pool_tokens: Some(512),
+    options.layout = Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![32 << 30], context_tokens: 512, pool_tokens: Some(512),
         onboard: Some(crate::placement::OnboardSetting::Layers(0)), native_mtp_layers: 0, prefill_rows: 256,
         workspace_manifest: v41_workspace(dir.path()), ..Default::default() });
     use super::encoder::EncoderKind;
@@ -5087,7 +5089,7 @@ fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
 #[test]
 fn prefill_scoring_has_no_separate_span_output_reservation() {
     let dir = qwen_snapshot(4);
-    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         rtx_bytes: vec![96 << 30], prefill_rows: 128, pool_tokens: Some(256), ..Default::default() }), ..sparks(0) };
     let memory = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert!(memory.devices.iter().all(|device| device.items.iter().all(|item| item.group != "probe prefill logits")));
@@ -5098,7 +5100,7 @@ fn layout_charges_local_routed_experts_to_the_coordinator() {
     use cuteafd_core::memory_layout::Category;
     let dir = qwen_snapshot(4);
     let report = plan(dir.path(), &PlanOptions {
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), pool_tokens: Some(256), ..Default::default() }), ..sparks(0)
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), pool_tokens: Some(256), ..Default::default() }), ..sparks(0)
     }).unwrap();
     let routed = component(&report, Component::RoutedExpert).bytes;
     assert!(routed > 0);
@@ -5123,7 +5125,7 @@ fn default_uses_all_sparks_and_explicit_unsupported_count_refuses() {
     let dir = qwen_snapshot(4);
     let options = PlanOptions {
         // This single linear-layer package has no paged KV host tier.
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), pool_tokens: Some(32768), host_cache_bytes: Some(0), ..Default::default() }),
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), pool_tokens: Some(32768), host_cache_bytes: Some(0), ..Default::default() }),
         ..sparks(6)
     };
     let all = plan_spark_count(dir.path(), &options, 4, None).unwrap();
@@ -5144,7 +5146,7 @@ fn default_uses_all_sparks_and_explicit_unsupported_count_refuses() {
 fn v41_32gib_counts_share_pool_and_local_layer_admission() {
     let dir = strict_v41_snapshot(false);
     for ranks in 2..=6 {
-        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), context_tokens: 262_144, pool_tokens: Some(262_144), prefill_rows: 256,
             ..Default::default()
         }), ..sparks(ranks) };
@@ -5158,14 +5160,14 @@ fn v41_32gib_counts_share_pool_and_local_layer_admission() {
             assert!(report.executable(), "{}", render(&report));
             assert_eq!(report.memory_layout.as_ref().unwrap().pool_tokens, 262_144);
         }
-        let too_large = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        let too_large = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             pool_tokens: Some(1 << 40), ..options.layout.unwrap()
         }), ..sparks(ranks) };
         let refused = plan_spark_count(dir.path(), &too_large, 6, Some(ranks)).unwrap();
         assert!(!refused.executable());
         assert!(refused.hints.last().unwrap().what.contains("refused:"));
     }
-    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), context_tokens: 262_144, pool_tokens: Some(262_144), prefill_rows: 256,
         ..Default::default()
     }), ..sparks(6) };
@@ -5173,7 +5175,7 @@ fn v41_32gib_counts_share_pool_and_local_layer_admission() {
     assert!(all.executable(), "{}", render(&all));
     assert_eq!(all.spark_ranks, 6);
     assert!(all.spark_count_warning.is_none());
-    let fixed = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let fixed = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         onboard: Some(crate::placement::OnboardSetting::Layers(1)),
         ..options.layout.as_ref().unwrap().clone()
     }), ..options.clone() };
@@ -5181,12 +5183,12 @@ fn v41_32gib_counts_share_pool_and_local_layer_admission() {
     assert!(local.executable(), "{}", render(&local));
     assert!(local.memory_layout.as_ref().unwrap().notes.iter()
         .any(|note| note == "1 routed backbone layers resident on RTX"));
-    let default_prefill = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let default_prefill = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         prefill_rows: 0, ..options.layout.as_ref().unwrap().clone()
     }), ..options.clone() };
     // The default is the fixed depth: three units of 2752 rows; the same
     // admission as passing that unit explicitly.
-    let explicit_prefill = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let explicit_prefill = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         prefill_unit_rows: Some(2752), ..default_prefill.layout.as_ref().unwrap().clone()
     }), ..options.clone() };
     let default_report = plan(dir.path(), &default_prefill).unwrap();
@@ -5211,7 +5213,7 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     let source = 129280 * 5120 * 2;
     let head_delta = Fp8Head::configured().resident(source).0 - Fp8Head::All.resident(source).0;
     let graph_delta = crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0).unwrap().bytes - 1_048_576_000;
-    let layout = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let layout = layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
         drafter_bytes: (4 << 30) - head_delta - graph_delta, prefill_rows: 0, ..Default::default() };
     let roomy = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30], ..layout.clone() }), ..sparks(4) };
@@ -5279,7 +5281,7 @@ fn v41_two_rtx_prefill_runs_three_units_and_pins_still_override() {
     // explicit depth still pins (measurement arms).
     let dir = strict_v41_snapshot(false);
     let two = |gib: u64, waves: u64, rows: u64| PlanOptions { layout: Some(layout::LayoutOptions {
-        host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![gib << 30, gib << 30],
+        host_memory: Some(crate::plan::testing::SimulatedHost { host_ram: (256 << 30, 256 << 30), ..crate::plan::testing::SimulatedHost::raptor() }.host_ram), rtx_bytes: vec![gib << 30, gib << 30],
         workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
         prefill_rows: rows, prefill_waves: waves, ..Default::default() }), ..sparks(4) };
     let auto = plan_spark_count(dir.path(), &two(96, 0, 0), 6, Some(4)).unwrap();
@@ -5345,7 +5347,7 @@ fn v4_pro_exl3_tp6_and_explicit_refusal_keep_default_fallback_reason() {
     let dir = tempfile::tempdir().unwrap();
     write_v4_pro_exl3_snapshot(dir.path());
     let options = PlanOptions { layout: Some(layout::LayoutOptions {
-        host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+        host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0),
         rtx_bytes: vec![96 << 30], pool_tokens: Some(262_144), prefill_rows: 256,
         ..Default::default()
     }), ..sparks(6) };
@@ -5374,7 +5376,7 @@ fn qwen_small_card_one_spark_buffers_three_waves_with_one_compute_slot() {
     let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
         onboard: Some(crate::placement::OnboardSetting::Layers(0)),
         rtx_bytes: vec![32 << 30], pool_tokens: Some(262_144), context_tokens: 262_144,
-        host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)),
+        host_cache_bytes: Some(0), host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         ..Default::default()
     }), ..sparks(1) }).unwrap();
     assert!(report.executable(), "{}", render(&report));
@@ -5405,7 +5407,7 @@ fn memory_constrained_spark_refuses_by_typed_owner_charge_not_waves() {
     let plan_at = |spark_bytes: u64, waves: u64| plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
         rtx_bytes: vec![32 << 30], pool_tokens: Some(262_144), context_tokens: 262_144, spark_bytes,
         prefill_lanes: waves, prefill_waves: waves,
-        host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)), ..Default::default()
+        host_cache_bytes: Some(0), host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default()
     }), ..sparks(1) }).unwrap();
     let spark = |report: &PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
         .find(|d| d.kind == DeviceKind::Spark).unwrap().clone();
@@ -5452,7 +5454,7 @@ fn qwen_spark_layout_keeps_only_native_mtp_experts_on_coordinator() {
     tensors.extend(qwen4_coordinator(&config, true));
     let dir = snapshot(config, &tensors);
     let manifest = write_qwen4_exl3_capacities(dir.path(), "45");
-    let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         onboard: Some(crate::placement::OnboardSetting::Layers(0)),
         rtx_bytes: vec![32 << 30], pool_tokens: Some(32768), native_mtp_layers: 1,
         workspace_manifest: Some(manifest), ..Default::default()
@@ -5474,7 +5476,7 @@ fn split_off_local_qwen_memory_layout_charges_experts_to_the_lead_gpu() {
     use cuteafd_core::memory_layout::Category;
     let dir = qwen_snapshot(4);
     let report = plan(dir.path(), &PlanOptions {
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             rtx_bytes: vec![96 << 30, 96 << 30], head_split: false, pool_tokens: Some(32768), ..Default::default()
         }),
         ..sparks(0)
@@ -5487,7 +5489,7 @@ fn split_off_local_qwen_memory_layout_charges_experts_to_the_lead_gpu() {
     assert_eq!(layout.devices[1].kv_tokens, 0);
     assert!(!layout.notes.iter().any(|n| n.contains("only one coordinator")));
     let one = plan(dir.path(), &PlanOptions {
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), pool_tokens: Some(32768), ..Default::default() }),
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), pool_tokens: Some(32768), ..Default::default() }),
         ..sparks(0)
     }).unwrap();
     assert_eq!(layout.devices[0].by_category(), one.memory_layout.as_ref().unwrap().devices[0].by_category());
@@ -5512,7 +5514,7 @@ fn v41_encoder_preserves_experts_and_falls_back_at_runtime_budget() {
     use super::encoder::EncoderKind;
     use cuteafd_core::memory_layout::{Category, DeviceKind};
     let dir = strict_v41_snapshot(false);
-    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         rtx_bytes: vec![96 << 30], onboard: Some(crate::placement::OnboardSetting::Layers(0)), context_tokens: 32768, pool_tokens: Some(32768),
         prefill_rows: 256, workspace_manifest: v41_workspace(dir.path()),
         spark_allocation_budget_bytes: Some(100 << 30), ..Default::default()
@@ -5546,7 +5548,7 @@ fn encoder_plan_g9_charges_before_pool_and_hashes_off() {
     let mut tensors = mimo_flash_tensors();
     tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
     let dir = snapshot_tp(cfg, &tensors, Some(1));
-    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96<<30], target_pool_tokens: 32_768, ..Default::default() }), ..Default::default() };
+    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96<<30], target_pool_tokens: 32_768, ..Default::default() }), ..Default::default() };
     let spark = plan(dir.path(), &options).unwrap();
     assert!(matches!(spark.encoder.as_ref().unwrap().kind, EncoderKind::Spark { .. }));
     let local = plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(Some(0)), ..options.clone() }).unwrap();
@@ -5585,7 +5587,7 @@ fn glm_flash_vision_plan_matches_resident_admission_and_mimo_shape() {
     let dir = snapshot_tp(cfg.clone(), &tensors, Some(4));
     let manifest = write_glm5_flash_workspaces(dir.path());
     let base = PlanOptions { attention_placement: Some(AttentionPlacement::Heads),
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             workspace_manifest: Some(manifest), drafter_bytes: 256 << 20,
             context_tokens: 32768, pool_tokens: Some(32768), ..Default::default() }),
         ..Default::default() };
@@ -5679,7 +5681,7 @@ fn mimo_local_media_weights_share_the_native_cap_without_charging_scratch() {
         }).unwrap();
     let target = owners.ranks[0].iter().map(|owner| owner.bytes).sum::<u64>();
     let options = PlanOptions { vision: MediaMode::Rtx(Some(0)),
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             pool_tokens: Some(32768), context_tokens: 32768, concurrency: 4,
             onboard: Some(OnboardSetting::Layers(0)), ..Default::default() }), ..sparks(4) };
     let roomy = plan(dir.path(), &options).unwrap();
@@ -5759,7 +5761,7 @@ fn mimo_spark_tower_sees_rank_io_under_a_tight_spark_budget() {
     tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
     let dir = snapshot_tp(config, &tensors, Some(4));
     let options = |budget: u64| PlanOptions { vision: super::MediaMode::Spark(None), spark_budget_bytes: Some(budget),
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), pool_tokens: Some(32768),
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), pool_tokens: Some(32768),
             context_tokens: 32768, concurrency: 4,
             spark_allocation_budget_bytes: Some(budget),
             onboard: Some(crate::placement::OnboardSetting::Layers(0)), ..Default::default() }), ..sparks(4) };
@@ -5821,7 +5823,7 @@ fn glm5_flash_auto_vision_preserves_pool_floor_but_explicit_rtx_is_strict() {
     let options = PlanOptions { vision: MediaMode::Off,
         layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30], context_tokens: 262144,
             workspace_manifest: Some(manifest),
-            pool_tokens: Some(262144), host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
+            pool_tokens: Some(262144), host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() }),
         ..sparks(0) };
     let reference = plan(dir.path(), &options).unwrap();
     assert!(reference.fits, "{}", render(&reference));
@@ -5858,7 +5860,7 @@ fn glm_flash_all_onboarded_preserves_tower_only_spark() {
     let mut tensors = glm5_flash_tensors(&cfg);
     tensors.extend(glm5_flash_vision_tensors());
     let dir = snapshot_tp(cfg, &tensors, Some(4));
-    let base = PlanOptions { attention_placement: Some(AttentionPlacement::Heads), layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let base = PlanOptions { attention_placement: Some(AttentionPlacement::Heads), layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         rtx_bytes: vec![96 << 30; 2], pool_tokens: Some(32768),
         workspace_manifest: Some(write_glm5_flash_workspaces(dir.path())),
         drafter_bytes: 256 << 20, context_tokens: 32768,
@@ -5914,7 +5916,7 @@ fn explicit_encoder_failure_and_small_pool_admission() {
     let mut tensors = mimo_flash_tensors();
     tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
     let dir = snapshot_tp(cfg, &tensors, Some(1));
-    let options = PlanOptions { vision: MediaMode::Rtx(Some(0)), layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let options = PlanOptions { vision: MediaMode::Rtx(Some(0)), layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         rtx_bytes: vec![32<<30], context_tokens: 32768, pool_tokens: Some(32768), ..Default::default()
     }), ..Default::default() };
     let local = plan(dir.path(), &options).unwrap();
@@ -5943,7 +5945,7 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
         t("model.visual.blocks.0.norm1.bias", "BF16", &[1152])]);
     let dir = snapshot(cfg.clone(), &tensors);
     write_quantize_config(dir.path(), &manifest);
-    let options = PlanOptions { placement: ExpertPlacement::Local, layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let options = PlanOptions { placement: ExpertPlacement::Local, layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         rtx_bytes: vec![96<<30], pool_tokens: Some(32768), target_pool_tokens: 32768,
         ..Default::default()
     }), ..Default::default() };
@@ -5997,7 +5999,7 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     use cuteafd_core::memory_layout::Category;
     let marks = |memory: &cuteafd_core::memory_layout::MemoryLayout| memory.devices[0].by_category()
         .get(&Category::Prefix).copied().unwrap_or(0);
-    let layout = |rtx: u64, concurrency: u64| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20,
+    let layout = |rtx: u64, concurrency: u64| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20,
         rtx_bytes: vec![rtx], concurrency, pool_tokens: Some(0), host_cache_bytes: Some(0), ..Default::default() }), ..sparks(4) };
     // GLM 5.3 Flash: 34 KDA layers, 147.6 MB marks: 14 fit independently of C.
     let mut config = glm5_flash_config(45);
@@ -6042,7 +6044,7 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     // 1,971 MiB holds 14 marks at 5 sequences and 6 entries, one or two GPUs (each its half of
     // every mark under a head split, which keeps the token keys planned here; heads is requested,
     // since a two-GPU build with no manifest refuses `context`, #202); no entries, none.
-    let knobs = |rtx: usize, entries: u64| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20,
+    let knobs = |rtx: usize, entries: u64| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20,
         rtx_bytes: vec![96 << 30; rtx], concurrency: 5, pool_tokens: Some(0), mimo_prefix_entries: entries,
         mimo_prefix_mark_bytes: 1971 << 20, host_cache_bytes: Some(0), ..Default::default() }),
         attention_placement: Some(AttentionPlacement::Heads), ..sparks(4) };
@@ -6071,7 +6073,7 @@ fn glm_flash_pool_marks_charge_their_reserved_unit_beside_the_pool() {
     let tensors = glm5_flash_tensors(&config);
     let dir = snapshot(config, &tensors);
     let layout = |pool_marks: bool, prefix_slots: Option<u64>| plan(dir.path(), &PlanOptions {
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20, rtx_bytes: vec![48 << 30], concurrency: 16, pool_tokens: Some(0),
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20, rtx_bytes: vec![48 << 30], concurrency: 16, pool_tokens: Some(0),
             glmf_pool_marks: pool_marks, prefix_slots, host_cache_bytes: Some(0), ..Default::default() }), ..sparks(4) })
         .unwrap().memory_layout.unwrap();
     let item = |memory: &cuteafd_core::memory_layout::MemoryLayout, group: &str| memory.devices[0].items.iter()
@@ -6079,7 +6081,7 @@ fn glm_flash_pool_marks_charge_their_reserved_unit_beside_the_pool() {
     let (pool, none) = (layout(true, None), layout(false, Some(0)));
     assert_eq!((item(&pool, "marks"), item(&pool, "reserved units")), (0, GLMF_POOL_MARK_RESERVED_UNITS * unit));
     // No entries, no marks: pool marks keep no unit back, as serve-glmf then keeps none.
-    let off = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20, rtx_bytes: vec![48 << 30],
+    let off = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20, rtx_bytes: vec![48 << 30],
         concurrency: 16, pool_tokens: Some(0), glmf_pool_marks: true, mimo_prefix_entries: 0, ..Default::default() }),
         ..sparks(4) }).unwrap().memory_layout.unwrap();
     assert_eq!((item(&off, "marks"), item(&off, "reserved units")), (0, 0));
@@ -6111,7 +6113,7 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
         snapshot(mimo_flash_config(), &mimo_flash_tensors()), snapshot(mimo_pro_config(), &mimo_pro_tensors())];
     for dir in snapshots {
         for gpus in [1, 2] {
-            let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
                 rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
                 workspace_manifest: Some(dir.path().join("absent.json")), glm5_drafter_disabled: true,
                 ..Default::default()
@@ -6367,7 +6369,7 @@ fn glm_tied_embedding_keeps_device_owner_in_shared_admission() {
     let dir = snapshot(config, &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
     let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
         rtx_bytes: vec![96 << 30], context_tokens: 65536, glm5_drafter_disabled: true,
-        host_embedding: true, host_memory: Some((128 << 30, 128 << 30)), ..Default::default()
+        host_embedding: true, host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default()
     }), ..sparks(4) }).unwrap();
     assert!(!report.fits);
     assert!(report.placement_supported, "{:?}", report.hints);
@@ -6398,7 +6400,7 @@ fn step5_auto_pool_and_count_admission_preserve_one_recipe() {
     let options = PlanOptions { draft_ownership: Some(spec::DraftOwnership::None),
         layout: Some(layout::LayoutOptions {
             rtx_bytes: vec![96 << 30], context_tokens: 262_144, prefix_slots: None,
-            host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)),
+            host_cache_bytes: Some(0), host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             workspace_manifest: Some(manifest), ..Default::default()
         }), ..sparks(3) };
     let unset = plan_spark_count(dir.path(), &options, 3, Some(3)).unwrap();
@@ -6426,7 +6428,7 @@ fn glm_auto_pool_and_count_admission_preserve_one_recipe() {
     let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
     let options = PlanOptions { layout: Some(layout::LayoutOptions {
         rtx_bytes: vec![96 << 30], context_tokens: 65536, glm5_drafter_disabled: true,
-        host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+        host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0),
         ..Default::default()
     }), ..sparks(4) };
     let unset = plan_spark_count(dir.path(), &options, 4, Some(4)).unwrap();
@@ -6490,7 +6492,7 @@ fn mimo_auto_pool_and_count_admission_preserve_one_recipe() {
     let dir = snapshot_tp(mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
     let options = PlanOptions { layout: Some(layout::LayoutOptions {
         rtx_bytes: vec![96 << 30], context_tokens: 65536,
-        host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+        host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0),
         ..Default::default()
     }), ..sparks(4) };
     let unset = plan_spark_count(dir.path(), &options, 4, Some(4)).unwrap();
@@ -6524,7 +6526,7 @@ fn qwen_auto_pool_is_one_recipe_and_keeps_its_typed_refusal() {
     let (dir, manifest) = qwen4_matrix_snapshot();
     let options = PlanOptions { layout: Some(layout::LayoutOptions {
         rtx_bytes: vec![96 << 30], context_tokens: 65536, prefix_slots: Some(0),
-        host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)),
+        host_cache_bytes: Some(0), host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         workspace_manifest: Some(manifest), ..Default::default()
     }), placement: ExpertPlacement::Local, ..Default::default() };
     let unset = plan(dir.path(), &options).unwrap();
@@ -6553,7 +6555,7 @@ fn v4_auto_pool_and_count_admission_preserve_one_recipe() {
     let dir = v4_snapshot();
     let options = PlanOptions { layout: Some(layout::LayoutOptions {
         rtx_bytes: vec![96 << 30], context_tokens: 65536,
-        host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+        host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0),
         ..Default::default()
     }), ..sparks(4) };
     let unset = plan_spark_count(dir.path(), &options, 4, Some(4)).unwrap();
@@ -6588,7 +6590,7 @@ fn qwen_auto_mtp_matches_explicit_memory_and_deployment() {
     let dir = snapshot(config, &[t("mtp.layers.0.enorm.weight", "BF16", &[2560])]);
     for ranks in [0, 2] {
         let options = PlanOptions { qwen_auto_mtp: true,
-            layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
                 host_cache_bytes: Some(0), ..Default::default() }), ..sparks(ranks) };
         let auto = plan(dir.path(), &options).unwrap();
         let selected = if ranks == 0 { "mtp" } else { "off" };
@@ -6635,7 +6637,7 @@ fn qwen_auto_mtp_real_inventory_selects_local_without_losing_mtp() {
         vision: MediaMode::Off, audio: MediaMode::Off,
         layout: Some(layout::LayoutOptions { workspace_manifest: Some(manifest),
             context_tokens: 32768,
-            host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0),
             prefix_slots: Some(0), ..Default::default() }), ..sparks(2) };
     let input = PlanInput::open(dir.path()).unwrap();
     // Keep this arm genuinely remote: Auto may onboard the complete small
@@ -6733,7 +6735,7 @@ fn mimo_and_qwen_all_onboarded_preserve_media_only_spark_and_refuse_unavailable_
     let mimo_base = PlanOptions {
         vision: MediaMode::Spark(Some(0)),
         layout: Some(layout::LayoutOptions {
-            host_memory: Some((128 << 30, 128 << 30)),
+            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             rtx_bytes: vec![96 << 30],
             pool_tokens: Some(32768),
             context_tokens: 32768,
@@ -6770,7 +6772,7 @@ fn mimo_and_qwen_all_onboarded_preserve_media_only_spark_and_refuse_unavailable_
     let qwen4_base = PlanOptions {
         vision: MediaMode::Spark(Some(0)),
         layout: Some(layout::LayoutOptions {
-            host_memory: Some((128 << 30, 128 << 30)),
+            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             host_cache_bytes: Some(0),
             rtx_bytes: vec![96 << 30],
             pool_tokens: Some(32768),
@@ -6834,7 +6836,7 @@ fn kimi_and_muse_refuse_host_embedding_before_placement() {
         else { write_muse_spark_snapshot(dir.path(), &[]); }
         let mut options = sparks(6);
         options.layout = Some(layout::LayoutOptions { host_embedding: true,
-            host_memory: Some((128 << 30, 128 << 30)), ..Default::default() });
+            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() });
         let report = plan(dir.path(), &options).unwrap();
         assert!(!report.fits);
         assert!(report.hints.iter().any(|hint| hint.what ==

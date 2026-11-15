@@ -637,7 +637,7 @@ pub fn spark_world_admitted_view(view: &crate::plan::checkpoint::CheckpointView,
     let report = crate::plan::PlanInput::open_view(view)?.plan(&crate::plan::PlanOptions {
         placement: crate::plan::ExpertPlacement::from_spark_ranks(ranks),
         draft_ownership: Some(crate::plan::spec::DraftOwnership::None),
-        layout: Some(crate::plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        layout: Some(crate::plan::layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             workspace_manifest: Some(programs.to_path_buf()), ..Default::default() }),
         ..Default::default() })?;
     let spark_over = report.memory_layout.as_ref().map_or(Vec::new(), |memory| memory.devices.iter()

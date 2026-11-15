@@ -218,7 +218,7 @@ mod tests {
         let target = crate::families::qwen3_5::weight_layout::target_arena(&checkpoint, &cfg,
             cuteafd_core::DType::F32, crate::families::qwen3_5::weight_layout::DenseFormat::Bf16).unwrap();
         let mut budgets = forecast_budgets(&crate::placement::ARCH_CONTEXTS[1], 96 << 30, 0,
-            (128 << 30, 128 << 30)).unwrap();
+            crate::plan::testing::SimulatedHost::raptor().host_ram).unwrap();
         let mut peer = budgets[0].clone();
         peer.id = "rtx1".into(); peer.locations = vec![Location::coordinator(1)]; budgets.insert(1, peer);
         let request = Request { context: (262144).into(), pool: Pin::Exact(262144),

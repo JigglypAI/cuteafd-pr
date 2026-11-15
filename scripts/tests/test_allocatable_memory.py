@@ -149,3 +149,21 @@ def test_rust_logical_admission_keeps_allocatable_sampling():
     method = text.split('pub fn cuda_memory_info(&self)', 1)[1].split('fn admit_gpu_allocation', 1)[0]
     assert 'self.cuda_allocatable_memory_info()?' in method
     assert 'budget.apply(sample)?' in method
+
+
+def test_planner_host_probes_have_one_injectable_boundary():
+    import re
+    plan = ROOT / 'rust/crates/cuteafd-loader/src/plan'
+    layout = plan / 'layout.rs'
+    source = layout.read_text()
+    accessor = source.split('pub(crate) fn planner_host_memory(', 1)[1].split(
+        '/// Host capacity for a recipe', 1)[0]
+    probes = re.compile(r'mapped_preload::(?:host_memory(?:_before_process)?|host_budget_bytes)')
+    assert len(probes.findall(accessor)) == 2
+    assert 'planner tests must inject LayoutOptions.host_memory' in accessor
+    for path in plan.rglob('*.rs'):
+        text = path.read_text()
+        if path == layout:
+            text = text.replace(accessor, '')
+        assert not probes.search(text), f'{path}: bypasses planner_host_memory'
+        assert not re.search(r'cuteafd_ffi::host_memory|cudaMemGetInfo|["\']/proc/', text), path

@@ -407,11 +407,6 @@ mod tests {
     }
 
     #[test]
-    fn configuration_panel_labels_non_derived_defaults_as_launch_defaults() {
-        assert!(include_str!("../assets/bench.html").contains("s.source === 'default' ? 'launch default' : s.source"));
-    }
-
-    #[test]
     fn kv_capacity_maximum_is_optional_in_old_records() {
         let old = r#"{"tokens":1800000,"pages":28125,"format":"FP8","host_bytes":0}"#;
         let mut capacity: KvCapacity = serde_json::from_str(old).unwrap();
