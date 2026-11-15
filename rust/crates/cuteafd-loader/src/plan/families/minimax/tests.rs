@@ -1555,7 +1555,7 @@ fn heads_recipe_fixture_with_experts(experts: usize) -> (tempfile::TempDir, crat
             let layout = cuteafd_ffi::minimax_m3::Layout::for_heads(mode, rows, extent).unwrap();
             entry["name"] = layout.name().into();
             if index { entry["geometry"]["heads"] = 2.into(); }
-            else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); entry["geometry"]["record_bytes"] = 272.into(); entry["geometry"]["scale_offset"] = 256.into(); }
+            else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); entry["geometry"]["record_bytes"] = 272.into(); entry["geometry"]["scale_offset"] = 16384.into(); entry["geometry"]["scale_stride"] = 16.into(); }
             entry["scratch_bytes_at_capacity"]["scratch"] = layout.scratch.into();
             for pointer in entry["pointers"].as_array_mut().unwrap() {
                 let shape = pointer["shape"].as_str().unwrap();
@@ -1584,7 +1584,7 @@ fn heads_recipe_fixture_with_experts(experts: usize) -> (tempfile::TempDir, crat
             entry["name"] = "minimax_kv_pack_h2".into();
             entry["geometry"]["heads"] = 2.into();
             entry["geometry"]["record_bytes"] = 272.into();
-            entry["geometry"]["scale_offset"] = 256.into();
+            entry["geometry"]["scale_offset"] = 16384.into(); entry["geometry"]["scale_stride"] = 16.into();
             for pointer in entry["pointers"].as_array_mut().unwrap() {
                 pointer["shape"] = pointer["shape"].as_str().unwrap().replace(",4", ",2").replace(",528]", ",272]").into();
             }

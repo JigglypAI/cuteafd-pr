@@ -887,7 +887,8 @@ mod tests {
         let value = read_buffer(owner, request.value_cache)?;
         let record = cuteafd_ffi::minimax_m3::kv_plane_record_bytes(4);
         let scale = |bytes: &[u8], row: usize, head: usize| f32::from_le_bytes(
-            bytes[row * record + 512 + head * 4..row * record + 516 + head * 4].try_into().unwrap());
+            bytes[(row / 64) * record * 64 + 32768 + (row % 64) * 16 + head * 4..
+                (row / 64) * record * 64 + 32768 + (row % 64) * 16 + head * 4 + 4].try_into().unwrap());
         let mut outputs = Vec::new();
         for (route, diagnostic) in [("extend", extend), ("decode", decode)] {
             let mut reference = vec![0.0f32; 8192];
@@ -898,7 +899,7 @@ mod tests {
                 for (token, score) in scores.iter_mut().enumerate() {
                     if diagnostic.selections[kv_head].contains(&((token / 128) as i32)) {
                         let row = usize::try_from(pages[token / 64])? * 64 + token % 64;
-                        let base = row * record + kv_head * 128;
+                        let base = (row / 64) * record * 64 + (row % 64) * 512 + kv_head * 128;
                         let mut dot = 0.0f32;
                         for column in 0..128 {
                             dot += diagnostic.query[head * 128 + column] * (e4m3(key[base + column]) * scale(&key, row, kv_head));
@@ -913,7 +914,7 @@ mod tests {
                 for (token, score) in scores.into_iter().enumerate() {
                     let probability = score / denominator;
                     let row = usize::try_from(pages[token / 64])? * 64 + token % 64;
-                        let base = row * record + kv_head * 128;
+                        let base = (row / 64) * record * 64 + (row % 64) * 512 + kv_head * 128;
                     for column in 0..128 {
                         reference[head * 128 + column] += probability * (e4m3(value[base + column]) * scale(&value, row, kv_head));
                     }

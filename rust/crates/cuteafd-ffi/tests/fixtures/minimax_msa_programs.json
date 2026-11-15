@@ -190,7 +190,8 @@
         "mode": "decode",
         "softmax_scale": 0.08838834764831845,
         "record_bytes": 528,
-        "scale_offset": 512
+        "scale_offset": 32768,
+        "scale_stride": 16
       },
       "pointers": [
         {
@@ -298,7 +299,8 @@
         "mode": "extend",
         "softmax_scale": 0.08838834764831845,
         "record_bytes": 528,
-        "scale_offset": 512
+        "scale_offset": 32768,
+        "scale_stride": 16
       },
       "pointers": [
         {

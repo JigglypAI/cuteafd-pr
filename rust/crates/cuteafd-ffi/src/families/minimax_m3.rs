@@ -329,7 +329,8 @@ impl Layout {
                 ("query_heads", 16 * kv_heads),
                 ("kv_heads", kv_heads),
                 ("record_bytes", kv_plane_record_bytes(kv_heads as usize) as u32),
-                ("scale_offset", kv_heads * 128),
+                ("scale_offset", kv_heads * 128 * 64),
+                ("scale_stride", kv_plane_record_bytes(kv_heads as usize) as u32 - kv_heads * 128),
                 ("head_dim", 128),
                 ("block_tokens", 128),
                 ("topk", 16),
@@ -726,7 +727,8 @@ mod tests {
             }
             geometry["softmax_scale"] = json!(0.08838834764831845);
             geometry["record_bytes"] = json!(528);
-            geometry["scale_offset"] = json!(512);
+            geometry["scale_offset"] = json!(32768);
+            geometry["scale_stride"] = json!(16);
         }
         let operands = layout.operands();
         let spec = ProgramSpec {
@@ -804,7 +806,8 @@ mod tests {
                 spec.geometry["query_heads"] = json!(32);
                 spec.geometry["kv_heads"] = json!(2);
                 spec.geometry["record_bytes"] = json!(272);
-                spec.geometry["scale_offset"] = json!(256);
+                spec.geometry["scale_offset"] = json!(16384);
+                spec.geometry["scale_stride"] = json!(16);
             }
             spec.scratch.insert("scratch".into(), layout.scratch);
             let entry = json!({"op":if mode.index() { "minimax_index" } else { "minimax_attention" },

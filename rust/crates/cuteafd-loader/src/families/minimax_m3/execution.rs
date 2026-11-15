@@ -952,7 +952,7 @@ mod tests {
             let layout = Layout::for_heads(mode, rows, extent).unwrap();
             entry["name"] = layout.name().into();
             if index { entry["geometry"]["heads"] = 2.into(); }
-            else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); entry["geometry"]["record_bytes"] = 272.into(); entry["geometry"]["scale_offset"] = 256.into(); }
+            else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); entry["geometry"]["record_bytes"] = 272.into(); entry["geometry"]["scale_offset"] = 16384.into(); entry["geometry"]["scale_stride"] = 16.into(); }
             entry["scratch_bytes_at_capacity"]["scratch"] = layout.scratch.into();
             for p in entry["pointers"].as_array_mut().unwrap() {
                 let shape = p["shape"].as_str().unwrap();

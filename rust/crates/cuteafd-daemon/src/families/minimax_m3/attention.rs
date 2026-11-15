@@ -376,7 +376,7 @@ mod tests {
                     entry["capacity_rows"].as_u64().unwrap() as u32, extent as u32).unwrap();
                 entry["name"] = layout.name().into();
                 if index { entry["geometry"]["heads"] = 2.into(); }
-                else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); entry["geometry"]["record_bytes"] = 272.into(); entry["geometry"]["scale_offset"] = 256.into(); }
+                else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); entry["geometry"]["record_bytes"] = 272.into(); entry["geometry"]["scale_offset"] = 16384.into(); entry["geometry"]["scale_stride"] = 16.into(); }
                 entry["scratch_bytes_at_capacity"]["scratch"] = layout.scratch.into();
                 for pointer in entry["pointers"].as_array_mut().unwrap() {
                     let shape = pointer["shape"].as_str().unwrap();
@@ -422,7 +422,7 @@ mod tests {
                 entry["name"] = "minimax_kv_pack_h2".into();
                 entry["geometry"]["heads"] = 2.into();
                 entry["geometry"]["record_bytes"] = 272.into();
-                entry["geometry"]["scale_offset"] = 256.into();
+                entry["geometry"]["scale_offset"] = 16384.into(); entry["geometry"]["scale_stride"] = 16.into();
                 for pointer in entry["pointers"].as_array_mut().unwrap() {
                     pointer["shape"] = pointer["shape"].as_str().unwrap().replace(",4", ",2").replace(",528]", ",272]").into();
                 }
@@ -568,12 +568,12 @@ mod tests {
                     }
                     for value in record[8192..].chunks_exact_mut(4) { value.copy_from_slice(&1f32.to_le_bytes()); }
                 } else {
-                    for (row, token) in record.chunks_exact_mut(record_bytes).enumerate() {
+                    for (row, token) in record[..32768].chunks_exact_mut(512).enumerate() {
                         for (at, value) in token[..512].iter_mut().enumerate() {
                             *value = [0x28, 0xb0, 0x38, 0xa8][(page * 7 + row + at * 3 + at / 128) % 4];
                         }
-                        for value in token[512..528].chunks_exact_mut(4) { value.copy_from_slice(&1f32.to_le_bytes()); }
                     }
+                    for value in record[32768..].chunks_exact_mut(4) { value.copy_from_slice(&1f32.to_le_bytes()); }
                 }
             }
             device.run(|| {

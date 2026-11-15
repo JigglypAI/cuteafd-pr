@@ -45,7 +45,8 @@ impl ForwardLayout {
             Kind::RouterScores => g["hidden"] == 6144 && g["experts"] == 128,
             Kind::KvPack | Kind::KvPackHeads => g["heads"] == kind.kv_heads().unwrap() && g["head_dim"] == 128 && g["page_rows"] == 64
                 && g["record_bytes"] == kv_plane_record_bytes(kind.kv_heads().unwrap() as usize)
-                && g["scale_offset"] == kind.kv_heads().unwrap() * 128,
+                && g["scale_offset"] == kind.kv_heads().unwrap() * 128 * 64
+                && g["scale_stride"] == kv_plane_record_bytes(kind.kv_heads().unwrap() as usize) - kind.kv_heads().unwrap() as usize * 128,
         };
         if !geometry || spec.capacity_rows == 0 || spec.capacity_rows > 4096
             || spec.scalar_kinds != b"i" || !spec.scratch.is_empty()
@@ -177,7 +178,7 @@ mod tests {
                 "zero_centered":true,"subtract_mean":false,"bias":false,"rotary":0}),
             Kind::RouterScores => serde_json::json!({"hidden":6144,"experts":128}),
             Kind::KvPack | Kind::KvPackHeads => serde_json::json!({"heads":kind.kv_heads().unwrap(),"head_dim":128,"page_rows":64,
-                "record_bytes":kv_plane_record_bytes(kind.kv_heads().unwrap() as usize),"scale_offset":kind.kv_heads().unwrap()*128}),
+                "record_bytes":kv_plane_record_bytes(kind.kv_heads().unwrap() as usize),"scale_offset":kind.kv_heads().unwrap()*128*64,"scale_stride":kv_plane_record_bytes(kind.kv_heads().unwrap() as usize)-kind.kv_heads().unwrap() as usize*128}),
         };
         ProgramSpec { name: kind.name().into(), pointers: kind.names().iter().map(|s| (*s).into()).collect(),
             scalar_kinds: b"i".to_vec(), scratch: Default::default(), capacity_rows: 4096, geometry }
@@ -251,7 +252,7 @@ mod tests {
         entry["name"] = "minimax_kv_pack_h2".into();
         entry["geometry"]["heads"] = 2.into();
         entry["geometry"]["record_bytes"] = 272.into();
-        entry["geometry"]["scale_offset"] = 256.into();
+        entry["geometry"]["scale_offset"] = 16384.into(); entry["geometry"]["scale_stride"] = 16.into();
         for p in entry["pointers"].as_array_mut().unwrap() {
             p["shape"] = p["shape"].as_str().unwrap().replace(",4", ",2").replace(",528]", ",272]").into();
         }

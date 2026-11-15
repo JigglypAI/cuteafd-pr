@@ -122,7 +122,8 @@
         "head_dim": 128,
         "page_rows": 64,
         "record_bytes": 528,
-        "scale_offset": 512
+        "scale_offset": 32768,
+        "scale_stride": 16
       },
       "pointers": [
         {
