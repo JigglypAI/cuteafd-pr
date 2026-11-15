@@ -287,7 +287,8 @@ pub(crate) struct SoftState {
 
 impl SoftState {
     fn new(hard: u64) -> Self {
-        Self { limit: hard.saturating_sub(GRAPH_CHUNK), margin: GRAPH_CHUNK,
+        let margin = GRAPH_CHUNK.min(hard / 2);
+        Self { limit: hard.saturating_sub(margin), margin,
             measured_bytes: None, measured_nodes: None, granule: GRAPH_CHUNK }
     }
     fn fits(&self, nodes: u64) -> bool {
@@ -613,6 +614,7 @@ pub(crate) struct DeviceCache {
     floor_resample_pending: bool,
     floor_resample_used: bool,
     soft: SoftState,
+    margin_clamp_warned: bool,
     measurement_failed: bool,
     failed_measurement_credit: u64,
     pending_bytes: u64,
@@ -676,7 +678,7 @@ pub(crate) fn seal_cross_device_capture_on_this_thread(sealed: bool) {
 impl DeviceCache {
     fn new(device: i32, reserve: u64) -> Self {
         Self { device, reserve, reserve_policy: None, charged: 0, live_bytes: 0, inventory: Inventory::default(), ranked_hits: Vec::new(), ranked_churn: Vec::new(), ranked_at: Instant::now() - Duration::from_secs(30), level: None, pending_bytes: 0, next_id: 0, next_bank: 0, identity_generation: 0, recovery_generation: 0,
-            soft: SoftState::new(reserve), measurement_failed: false, failed_measurement_credit: 0, physical_floor: 0, physical_sample: None, physical_floor_warned: false,
+            soft: SoftState::new(reserve), margin_clamp_warned: false, measurement_failed: false, failed_measurement_credit: 0, physical_floor: 0, physical_sample: None, physical_floor_warned: false,
             floor_resample_pending: false, floor_resample_used: false,
             recent_target: 0, records: HashMap::new(), identities: HashMap::new(),
             queues: std::array::from_fn(|_| Queue::default()), classes: HashMap::new(),
@@ -1232,7 +1234,14 @@ impl DeviceCache {
         if self.charged >= self.reserve { return }
         let native = self.native_pools();
         if self.soft.measured_bytes.is_none() {
-            self.soft.margin = self.soft.margin.max(growth.div_ceil(self.soft.granule).saturating_mul(self.soft.granule));
+            let requested = self.soft.margin.max(growth.saturating_mul(2).div_ceil(self.soft.granule).saturating_mul(self.soft.granule));
+            let maximum = self.reserve / 2;
+            if requested > maximum && !self.margin_clamp_warned {
+                tracing::warn!(device = self.device, hard = self.reserve, requested_margin = requested,
+                    clamped_margin = maximum, "graph margin clamped to preserve half the reserve as soft capacity");
+                self.margin_clamp_warned = true;
+            }
+            self.soft.margin = requested.min(maximum);
             self.soft.limit = self.reserve.saturating_sub(self.soft.margin);
             if self.charged < self.soft.limit || native.live_nodes == 0 || self.unmeasured { return }
             let pinned_nodes = self.records.values().filter(|r| r.pinned)
@@ -1393,7 +1402,7 @@ impl DeviceCache {
     fn trace_snapshot(&self) -> TraceSnapshot {
         let records = self.records.values().map(RawRecord::copy).collect();
         TraceSnapshot { cache: Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor,
-            reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed, native_pools: self.native_pools(), soft: self.soft, level: self.level,
+            reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed || self.soft.limit == 0, native_pools: self.native_pools(), soft: self.soft, level: self.level,
             pinned: self.inventory.pinned,
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(),
             basis: self.basis, sampled_at_ms: self.started.elapsed().as_millis() as u64,
@@ -1435,7 +1444,7 @@ impl DeviceCache {
 
     fn snapshot(&self) -> Snapshot {
         let now = self.started.elapsed().as_millis() as u64;
-        Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed, native_pools: self.native_pools(), soft: self.soft,
+        Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed || self.soft.limit == 0, native_pools: self.native_pools(), soft: self.soft,
             level: self.level,
             pinned: self.inventory.pinned,
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(), basis: self.basis,
@@ -1745,23 +1754,25 @@ mod tests {
     #[test]
     fn zero_soft_disables_capture_and_unknown_nodes_do_not_disable_known_pressure() {
         let mut empty = DeviceCache::new(-1008, GRAPH_CHUNK);
-        assert!(matches!(empty.miss(key(1), site(Preference::Capture), None, false), Miss::Eager));
+        assert!(matches!(empty.miss(key(1), site(Preference::Capture), None, false), Miss::Capture(_)));
+        assert_eq!(empty.soft.limit, GRAPH_CHUNK / 2);
         let mut cache = test_cache(-1009, 16 * GRAPH_CHUNK);
         let capture_site = Site { bootstrap: 1, ..site(Preference::Capture) };
         let Miss::Capture(unknown) = cache.miss(key(1), capture_site, None, false) else { panic!() };
         cache.captured_topology(unknown, 0, 0, false);
         cache.measured_capture(GRAPH_CHUNK);
-        for n in 2..16 {
-            if cache.charged >= cache.reserve { break }
-            if let Miss::Capture(id) = cache.miss(key(n), capture_site, None, false) {
-                cache.captured_topology(id, 10, 1, false);
-                cache.measured_capture(GRAPH_CHUNK);
-                let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy).map(|(&id, _)| id).collect();
-                cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
-            }
+        for n in 2..15 {
+            let Miss::Capture(id) = cache.miss(key(n), capture_site, None, false) else { panic!() };
+            cache.captured_topology(id, 10, 1, false);
+            cache.measured_capture(GRAPH_CHUNK);
         }
         assert!(cache.soft.measured_bytes.is_some());
-        assert!(!cache.pending(unknown), "unknown owner remains measured-only, not a zero-node victim");
+        assert!(matches!(cache.miss(key(15), capture_site, None, false), Miss::Eager));
+        assert!(cache.pending(unknown));
+        let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy).map(|(&id, _)| id).collect();
+        assert_eq!(victims.len(), 2, "unknown owner plus one known owner release a graph's capacity");
+        cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
+        assert_eq!(cache.records[&unknown].list, Some(List::RecentGhost));
     }
 
     #[test]
@@ -1786,24 +1797,54 @@ mod tests {
     }
 
     #[test]
+    fn doubled_measured_growth_margin_rounds_once_and_preserves_small_reserve_capture() {
+        let mut cache = test_cache(-1018, 32 * GRAPH_CHUNK);
+        let id = capture(&mut cache, 1, false);
+        cache.captured_topology(id, 7, 1, false);
+        cache.apply_soft_pressure(GRAPH_CHUNK + 1, Some(id));
+        assert_eq!(cache.soft.margin, 3 * GRAPH_CHUNK, "round 2x raw growth, not twice rounded growth");
+        assert_eq!(cache.soft.limit, 29 * GRAPH_CHUNK);
+        assert!(cache.soft.measured_bytes.is_none());
+
+        let mut small = DeviceCache::new(-1019, 4 * GRAPH_CHUNK);
+        let capture_site = Site { bootstrap: 1, ..site(Preference::Capture) };
+        let Miss::Capture(a) = small.miss(key(1), capture_site, None, false) else { panic!() };
+        small.captured_topology(a, 10, 1, false);
+        small.measured_capture(3 * GRAPH_CHUNK / 2);
+        assert_eq!(small.soft.margin, 2 * GRAPH_CHUNK);
+        assert_eq!(small.soft.limit, 2 * GRAPH_CHUNK);
+        assert!(small.margin_clamp_warned);
+        assert!(!small.snapshot().hard_stopped);
+        let Miss::Capture(b) = small.miss(key(2), capture_site, None, false) else { panic!("large slab must not lock out capture below hard") };
+        small.captured_topology(b, 10, 1, false);
+        small.measured_capture(0);
+        assert_eq!(small.charged, 3 * GRAPH_CHUNK / 2);
+        assert_eq!(small.native_pools().live_execs, 2);
+        assert!(!small.snapshot().hard_stopped);
+        let snapshot = serde_json::to_value(small.snapshot()).unwrap();
+        assert_eq!(snapshot["soft"]["margin"], 2 * GRAPH_CHUNK);
+        assert_eq!(snapshot["soft"]["limit"], 2 * GRAPH_CHUNK);
+    }
+
+    #[test]
     fn soft_ratio_and_margin_freeze_from_measured_crossing_and_ignore_reuse_shares() {
-        let mut cache = test_cache(-1004, 16 * GRAPH_CHUNK);
+        let mut cache = test_cache(-1004, 22 * GRAPH_CHUNK);
         let capture_site = Site { bootstrap: 1, ..site(Preference::Capture) };
         let mut owners = Vec::new();
-        for n in 0..4 {
+        for n in 0..5 {
             let Miss::Capture(id) = cache.miss(key(n), capture_site, None, false) else { panic!() };
             cache.captured_topology(id, 10, 1, false);
             cache.measured_capture(3 * GRAPH_CHUNK);
             owners.push(id);
         }
         assert!(cache.soft.measured_bytes.is_none());
-        let Miss::Capture(id) = cache.miss(key(4), capture_site, None, false) else { panic!() };
+        let Miss::Capture(id) = cache.miss(key(5), capture_site, None, false) else { panic!() };
         cache.captured_topology(id, 10, 1, false);
-        cache.measured_capture(2 * GRAPH_CHUNK);
-        assert_eq!(cache.soft.margin, 3 * GRAPH_CHUNK);
-        assert_eq!(cache.soft.limit, 13 * GRAPH_CHUNK);
-        assert_eq!(cache.soft.measured_bytes, Some(14 * GRAPH_CHUNK));
-        assert_eq!(cache.soft.measured_nodes, Some(50));
+        cache.measured_capture(3 * GRAPH_CHUNK);
+        assert_eq!(cache.soft.margin, 6 * GRAPH_CHUNK);
+        assert_eq!(cache.soft.limit, 16 * GRAPH_CHUNK);
+        assert_eq!(cache.soft.measured_bytes, Some(18 * GRAPH_CHUNK));
+        assert_eq!(cache.soft.measured_nodes, Some(60));
         assert_eq!(cache.pending_destroy, 1);
         let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy).map(|(&id, _)| id).collect();
         cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
@@ -1817,11 +1858,11 @@ mod tests {
             assert_eq!(cache.pending_destroy, 0, "fitting hot set must settle above soft");
             assert_eq!((cache.soft.margin, cache.soft.measured_bytes, cache.soft.measured_nodes), frozen);
         }
-        assert!(matches!(cache.miss(key(5), capture_site, None, false), Miss::Eager));
+        assert!(matches!(cache.miss(key(6), capture_site, None, false), Miss::Eager));
         let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy).map(|(&id, _)| id).collect();
         assert_eq!(victims.len(), 1, "incoming node reservation makes room before capture");
         cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
-        let Miss::Capture(reuse) = cache.miss(key(5), capture_site, None, false) else { panic!() };
+        let Miss::Capture(reuse) = cache.miss(key(6), capture_site, None, false) else { panic!() };
         cache.captured_topology(reuse, 10, 1, false);
         cache.measured_capture(0);
         assert_eq!(cache.records[&reuse].bytes, 0);
@@ -1855,7 +1896,7 @@ mod tests {
             if cache.soft.measured_bytes.is_some() { assert!(cache.soft.fits(cache.native_pools().live_nodes)); }
         }
         assert_eq!(cache.counters[&Cycle::Decode].captures, 200);
-        assert_eq!(cache.charged, 13 * unit, "equality reservation makes room before another slab is needed");
+        assert_eq!(cache.charged, 10 * unit, "double-growth margin and equality reservation makes room before another slab is needed");
         cache.charged = cache.reserve;
         assert!(matches!(cache.miss(key(200), capture_site, None, false), Miss::Eager));
     }
@@ -1983,7 +2024,7 @@ mod tests {
 
     #[test]
     fn below_soft_estimates_do_not_evict_and_pinned_soft_excess_terminates() {
-        let mut cache = test_cache(-1001, 16 * GRAPH_CHUNK);
+        let mut cache = test_cache(-1001, 32 * GRAPH_CHUNK);
         let capture_site = Site { bootstrap: 1, ..site(Preference::Capture) };
         let Miss::Capture(id) = cache.miss(key(1), capture_site, None, true) else { panic!() };
         cache.captured_topology(id, 10, 1, false);
@@ -2402,7 +2443,7 @@ mod tests {
 
     #[test]
     fn canceled_capture_and_cold_ghost_are_not_recaptures() {
-        let mut cache = test_cache(-214, 20);
+        let mut cache = test_cache(-214, 100);
         capture(&mut cache, 1, true);
         assert!(matches!(cache.miss(key(2), site(Preference::Eager), None, false), Miss::Eager));
         assert!(matches!(cache.miss(key(2), site(Preference::Eager), None, false), Miss::Eager));
@@ -2582,7 +2623,7 @@ mod tests {
     }
     #[test]
     fn destruction_never_reduces_arena_and_both_pools_allow_reuse() {
-        let mut cache = test_cache(-203, 20);
+        let mut cache = test_cache(-203, 100);
         let a = capture(&mut cache, 1, false);
         cache.mark_victim(false);
         cache.destroyed(&[a], ReleaseMeasurement { released: 999 });
@@ -2632,7 +2673,7 @@ mod tests {
 
     #[test]
     fn canceled_tickets_never_prove_pool_reuse() {
-        let mut cache = test_cache(-208, 20);
+        let mut cache = test_cache(-208, 100);
         let Miss::Capture(id) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
         assert_eq!(cache.pools.node_high_water, 0);
         cache.cancel_capture(id);

@@ -645,8 +645,13 @@ SM120 experiment retained 224 MiB after destroying 1024 48-node executables,
 synchronizing and calling `cudaDeviceGraphMemTrim`; same- and different-shape
 recapture reused it with zero growth (#2154). There is no drain/trim reset path.
 
-Before the first soft crossing, the margin is the largest measured capture
-growth rounded up to 2 MiB, with a one-chunk minimum; soft is hard minus margin.
+Before the first soft crossing, the margin is twice the largest measured
+single-capture growth, rounded once up to 2 MiB with a one-chunk minimum, then
+clamped to at most half the hard reserve. The clamp emits one warning and keeps
+soft at least half of hard even after a large slab allocation on a small reserve.
+Margin and ratio freeze together at the first soft crossing and are reported
+in the soft snapshot. Soft is hard minus margin; no owner retirement or lane
+scheduling mechanism is changed by this margin policy.
 At measured `charged >= soft`, known native live nodes freeze the ratio
 `charged / live_nodes` and margin for that device lifetime, including executable
 overhead. No fit, seed or per-family rate is used. Only while measured memory is
