@@ -507,6 +507,29 @@ mod device_tests {
     }
 
     #[test]
+    fn cycle_k1_pending_owner_retires_at_its_serial_boundary() -> anyhow::Result<()> {
+        use super::super::device;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        // The DSO memory table is per-library inode; the Rust graph registry
+        // is process-global. Ordinal 5 is unused by other graph-cache fixtures.
+        fixture.configure_memory_usage(&library, 5, 128 << 20, 0)?;
+        let mut bank = GraphBank::<usize, usize>::new();
+        bank.attach_device(&library, 5, 64 << 20, site())?;
+        let ticket = bank.cache_ticket(&1, false, None).unwrap();
+        bank.cache_commit(1, 1, ticket, 10, 1, false);
+        bank.cache_measured(10);
+        let cache = bank.device.as_ref().unwrap().cache.clone();
+        cache.lock().unwrap().mark_victim(false).unwrap();
+        // SAFETY: fixture integers own no captured allocations or native work.
+        unsafe { device::observe_completed(&library,
+            |visit| visit(5, "bank-test", false, &mut bank)) }?;
+        assert_eq!(bank.len(), 0, "the serial boundary must not strand pending owners");
+        assert!(!cache.lock().unwrap().has_pending_victims());
+        Ok(())
+    }
+
+    #[test]
     fn cycle_owner_only_destroys_at_next_start_and_peer_retains_credit() -> anyhow::Result<()> {
         use super::super::{CacheAttached, device};
         use std::{cell::Cell, rc::Rc};

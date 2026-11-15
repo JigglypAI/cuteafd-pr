@@ -927,6 +927,7 @@ impl DeviceCache {
     }
     pub fn has_pending_victims(&self) -> bool { self.pending_destroy > 0 }
     pub fn pending(&self, id: u64) -> bool { self.records.get(&id).is_some_and(|r| r.pending_destroy) }
+    /// Call refresh_cycles once before inspecting a batch of victims.
     pub fn persistent_victim_ready(&self, id: u64) -> bool {
         self.records.get(&id).is_some_and(|record| {
             let lane = self.bank_lane(record.identity.bank);
@@ -1272,16 +1273,27 @@ impl DeviceCache {
                 if !self.unmeasured { self.captured_since_observation = false; }
                 return self.floor_skip(old, site.cycle);
             }
-            let hard_room = self.soft.measured_bytes.is_none()
+            let new_nodes = metadata.nodes.filter(|nodes| *nodes > 0)
+                .or_else(|| old.and_then(|id| self.records[&id].stats.native_nodes).filter(|n| *n > 0))
+                .or_else(|| self.records.values().filter(|r| r.identity.site == site.name)
+                    .filter_map(|r| r.stats.native_nodes).max());
+            // Historical physical shares are slab-sized, not the cost of a
+            // replacement graph. Known native nodes that fit the frozen soft
+            // capacity after retirement reuse the arena; pending/uncredited
+            // nodes remain charged until their frontier completes.
+            let native_reuse = chain && self.soft.measured_bytes.is_some() && new_nodes.is_some_and(|incoming| {
+                let reclaimable = self.records.values().filter(|r| !r.pending_capture && !r.pinned
+                    && (r.pending_destroy || matches!(r.list, Some(List::Recent | List::Frequent))))
+                    .map(|r| r.stats.native_nodes.unwrap_or(0)).sum::<u64>();
+                self.soft.fits(self.native_pools().live_nodes.saturating_add(self.epochs.uncredited_nodes)
+                    .saturating_sub(reclaimable).saturating_add(incoming))
+            });
+            let hard_room = self.soft.measured_bytes.is_none() || native_reuse
                 || self.charged.saturating_add(projected) <= self.reserve;
             projected_hard_stop = !hard_room;
             let selected_before = self.pending_destroy;
             let room = if !hard_room { false } else if self.soft.measured_bytes.is_none() { true }
                 else {
-                let new_nodes = metadata.nodes.filter(|nodes| *nodes > 0).or_else(|| old.and_then(|id| self.records[&id].stats.native_nodes).filter(|n| *n > 0))
-                    .or_else(|| self.records.values().filter(|r| r.identity.site == site.name)
-                        .filter_map(|r| r.stats.native_nodes).max())
-                    ;
                 if let Some(nodes) = new_nodes {
                     self.make_soft_room(nodes, None)
                 } else { true }
@@ -1304,7 +1316,7 @@ impl DeviceCache {
             record.nodes = nodes; record.node_rate = metadata.node_rate;
             record.graph_rate = metadata.graph_rate; record.parallel_width = metadata.parallel_width;
             record.spans_devices |= site.spans_devices;
-            if projected == 0 { self.reuse_captures.insert(id); }
+            if projected == 0 || native_reuse { self.reuse_captures.insert(id); }
             self.pending_growth = self.pending_growth.max(projected);
             self.unmeasured = true;
             self.pools.live_nodes = next_nodes;
@@ -1600,7 +1612,8 @@ impl DeviceCache {
             });
             if let Some(record) = self.records.get(&id).filter(|r| r.pending_destroy) {
                 let lane = self.bank_lane(record.identity.bank);
-                self.pending_lanes[lane] -= 1;
+                self.pending_lanes[lane] = self.pending_lanes[lane].checked_sub(1)
+                    .expect("graph pending lane retirement mismatch");
                 self.clocks[lane].pending.fetch_sub(1, Ordering::AcqRel);
             }
             let Some(record) = self.records.get_mut(&id) else { continue };
@@ -1678,7 +1691,8 @@ impl DeviceCache {
             let Some(record) = self.records.get(&id) else { continue };
             if record.pending_destroy {
                 let lane = self.bank_lane(record.identity.bank);
-                self.pending_lanes[lane] -= 1;
+                self.pending_lanes[lane] = self.pending_lanes[lane].checked_sub(1)
+                    .expect("graph pending lane retirement mismatch");
                 self.clocks[lane].pending.fetch_sub(1, Ordering::AcqRel);
             }
             if record.pending_capture {
@@ -2119,7 +2133,8 @@ mod tests {
         cache.destroyed(&[id], ReleaseMeasurement { released: 0 });
         cache.soft.limit = 1000;
         cache.classes.clear();
-        assert!(matches!(cache.miss(key(4), site(Preference::Capture), None, false), Miss::Eager));
+        let too_large = Site { name: "new-large-site", bootstrap: 1000, ..site(Preference::Capture) };
+        assert!(matches!(cache.miss(key(4), too_large, None, false), Miss::Eager));
         assert_eq!(cache.charged, 100);
         assert!(!cache.unmeasured);
     }
