@@ -160,19 +160,20 @@ pub(crate) fn catalog_owner_bytes(catalog: &crate::OfficialV41Catalog, family: &
     let mut widths = Vec::new();
     for &layer in &working.spark_layers {
         let residency = catalog.exl3_spark_residency(crate::V41Exl3Layer::Backbone(layer), working.spark_ranks, rank)?;
-        let width = u32::try_from(residency.intermediate)?;
-        if !widths.contains(&width) { widths.push(width); }
+        let key = (u32::try_from(residency.intermediate)?, residency.unit_map.is_some());
+        if !widths.contains(&key) { widths.push(key); }
     }
-    anyhow::ensure!(widths.len() == 1, "EXL3 worker requires one retained rank width, found {widths:?}");
-    recorded_exl3_owner_bytes(rows, family, geometry, widths[0], extent)
+    anyhow::ensure!(widths.len() == 1, "EXL3 worker requires one retained width/ABI, found {widths:?}");
+    recorded_exl3_owner_bytes(rows, family, geometry, widths[0].0, widths[0].1, extent)
 }
 
 fn recorded_exl3_owner_bytes(rows: &[serde_json::Value], family: &str,
-    geometry: cuteafd_core::ExpertGeometry, width: u32, extent: cuteafd_core::OwnerExtent)
+    geometry: cuteafd_core::ExpertGeometry, width: u32, compact: bool, extent: cuteafd_core::OwnerExtent)
     -> anyhow::Result<cuteafd_core::OwnerBytes> {
     let row = rows.iter().find(|row| row["family"] == family && row["format"] == "exl3"
-        && row["width"].as_u64() == Some(u64::from(width)))
-        .with_context(|| format!("no EXL3 owner census for {family} width{width}"))?;
+        && row["width"].as_u64() == Some(u64::from(width))
+        && row["compact"].as_bool().unwrap_or(false) == compact)
+        .with_context(|| format!("no EXL3 owner census for {family} width{width} compact={compact}"))?;
     let capacities = cuteafd_core::Exl3RowPolicy::for_geometry(geometry).capacities(extent.capacity as usize)?;
     anyhow::ensure!(capacities.last() == Some(&extent.compiled), "EXL3 retained exports differ from owner extent");
     let recorded = row["manifests"].as_array().context("EXL3 census manifests absent")?;
@@ -486,11 +487,11 @@ mod tests {
         let geometry = cuteafd_core::ExpertGeometry::INKLING2;
         for (width, expected) in [(256, 516_083_772), (384, 541_249_596), (512, 566_415_420),
             (640, 591_581_244), (768, 616_747_068), (1152, 692_244_540), (2304, 918_736_956)] {
-            let owner = recorded_exl3_owner_bytes(&rows, "inkling2", geometry, width, extent(4096,4096))?;
+            let owner = recorded_exl3_owner_bytes(&rows, "inkling2", geometry, width, false, extent(4096,4096))?;
             assert_eq!(owner.scratch, expected);
             assert_eq!(owner.io, 4096*(4608+144+64));
         }
-        assert!(recorded_exl3_owner_bytes(&rows, "inkling2", geometry, 320, extent(4096,4096)).is_err());
+        assert!(recorded_exl3_owner_bytes(&rows, "inkling2", geometry, 320, false, extent(4096,4096)).is_err());
         Ok(())
     }
 
