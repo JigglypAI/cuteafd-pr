@@ -499,7 +499,7 @@ mod device_tests {
             unsafe { cycles.begin(|_| panic!("reused bank lost its lane handle")) }?;
             cycles.complete();
         }
-        assert_eq!(cache.lock().unwrap().snapshot().charged, 10);
+        assert_eq!(device::snapshots().into_iter().find(|row| row.device == -321).unwrap().charged, 10);
         Ok(())
     }
 
@@ -541,7 +541,7 @@ mod device_tests {
         }
         assert_eq!(drops[owner].get(), 1);
         assert_eq!(drops[peer].get(), 0);
-        assert_eq!(cache.lock().unwrap().snapshot().charged, 20);
+        assert_eq!(device::snapshots().into_iter().find(|row| row.device == -320).unwrap().charged, 20);
         for lane in 0..2 {
             unsafe { device::lane_cycle(lane, false, |visit| visit(-320, "bank-test", false, &mut banks[lane]))?; }
         }

@@ -1104,6 +1104,8 @@ impl DeviceCache {
         self.records.get_mut(&id).unwrap().frequent = frequent;
         self.records.get_mut(&id).unwrap().pending_destroy = true;
         self.pending_destroy += 1;
+        // A selected executable can still be replayed by its owner before
+        // retirement. Include every subsequently started cycle when destroying.
         self.selected_epochs.insert(id, self.lanes.each_ref().map(|lane| if lane.active { lane.index } else { lane.completed }));
         let lane = self.bank_lane(self.records[&id].identity.bank);
         self.epochs.selections[lane] += 1;
@@ -1563,7 +1565,12 @@ impl DeviceCache {
         if ids.iter().any(|id| self.records.contains_key(id)) { self.recovery_generation += 1; }
         for &id in ids {
             self.unlink(id);
-            let until = self.selected_epochs.remove(&id);
+            let until = self.selected_epochs.remove(&id).map(|mut until| {
+                for (epoch, lane) in until.iter_mut().zip(&self.lanes) {
+                    if lane.active { *epoch = (*epoch).max(lane.index); }
+                }
+                until
+            });
             if let Some(record) = self.records.get(&id).filter(|r| r.pending_destroy) {
                 let lane = self.bank_lane(record.identity.bank);
                 self.pending_lanes[lane] -= 1;
@@ -1919,6 +1926,23 @@ mod tests {
         cache.soft.limit = 100;
         cache.charged = 100;
         cache
+    }
+
+    #[test]
+    #[ignore = "CPU lane boundary microbenchmark; run explicitly with --nocapture"]
+    fn cycle_hit_only_boundary_microseconds() -> anyhow::Result<()> {
+        let mut cycles = LaneCycles { lane: 0,
+            clocks: vec![Arc::new(std::array::from_fn(|_| EpochClock::default()))] };
+        let iterations = 1_000_000;
+        let started = Instant::now();
+        for _ in 0..iterations {
+            // SAFETY: this clock-only fixture has no captured storage or native work.
+            unsafe { cycles.begin(|_| unreachable!("no pending banks")) }?;
+            cycles.complete();
+        }
+        let ns = started.elapsed().as_nanos() as f64 / f64::from(iterations);
+        println!("cycle_hit_only_boundary: {ns:.1} ns/round, 1 device, {iterations} rounds");
+        Ok(())
     }
 
     #[test]
