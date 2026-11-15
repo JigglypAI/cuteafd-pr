@@ -199,8 +199,10 @@ fn load_weights<'a>(
         let staging = (staging_rows as usize).checked_mul(cuteafd_core::expert_geometry().topk as usize * 8)
             .context("native Spark route staging overflow")?;
         let geometry = cuteafd_core::expert_geometry();
-        let waves = cuteafd_core::spark_executions::wave_staging_layout(extent, geometry.hidden * 33 / 32,
-            geometry.topk, 1).context("native staging layout overflow")?;
+        let waves = if nvfp4 { Default::default() } else {
+            cuteafd_core::spark_executions::wave_staging_layout(extent, geometry.hidden * 33 / 32,
+                geometry.topk, 1).context("native staging layout overflow")?
+        };
         Ok((scratch, device - scratch + usize::try_from(waves.plane_bytes + waves.table_bytes)?,
             staging + usize::try_from(waves.pinned_per_unit)?))
     })?;

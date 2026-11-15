@@ -210,7 +210,9 @@ impl<'a> Weights<'a> {
         modules: &mut super::modules::WarmModules<'a>,
         epilogue: Exl3Epilogue,
     ) -> Result<Execution<'_, 'a>> {
-        let remaining = if matches!(self, Self::Full(_) | Self::Exlr8(_)) {
+        let staged = match self { Self::Full(weights) => weights.first().is_some_and(|weight| !weight.is_nvfp4()),
+            Self::Exlr8(_) => true, _ => false };
+        let remaining = if staged {
             let geometry = cuteafd_core::expert_geometry();
             let waves = cuteafd_core::spark_executions::wave_staging_layout(extent, geometry.hidden * 33 / 32,
                 geometry.topk, 1).context("singleton staging layout overflow")?;

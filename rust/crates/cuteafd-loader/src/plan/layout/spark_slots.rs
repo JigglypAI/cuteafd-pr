@@ -917,7 +917,7 @@ mod tests {
                 charge_executions(&mut device, &input, &working, "deepseek_v41", &executions)?;
                 let find = |group| device.items.iter().find(|item| item.group == group).unwrap().bytes;
                 assert_eq!(find("execution owners"), prefill.scratch + prefill.io + 2 * (decode.scratch + decode.io));
-                assert_eq!(find("execution staging"), 2 * 64 * 6 * 8 + unit * waves * (6 * 8 + 16));
+                assert_eq!(find("execution staging"), 2 * decode.pinned_staging + waves * prefill.pinned_staging);
             }
         }
         Ok(())

@@ -536,7 +536,7 @@ mod tests {
         let source = include_str!("exlr8.rs").split("#[cfg(test)]").next().unwrap();
         let sync = ["cuda_stream_", "synchronize("].concat();
         let execute = &source[source.find("fn execute(&mut self").unwrap()..source.find("fn execute_host(").unwrap()];
-        let chunk_loop = &execute[execute.find("for (first, rows) in chunks(").unwrap()..execute.find("Ok(())").unwrap()];
+        let chunk_loop = execute.split("for (first, rows) in chunks(").nth(1).unwrap().split("Ok(())").next().unwrap();
         assert!(!chunk_loop.contains(&sync), "no drain between mapped chunks");
         assert!(!chunk_loop.contains("copy_h2d(") && !chunk_loop.contains("copy_d2h("), "mapped chunks only queue stream copies");
         let after = &execute[execute.find("self.pending.record(identity,").unwrap()..];

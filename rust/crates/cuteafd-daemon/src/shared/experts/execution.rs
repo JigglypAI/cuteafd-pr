@@ -579,6 +579,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     }
 
     pub(crate) fn prepare_waves(&mut self, extent: cuteafd_core::OwnerExtent) -> Result<()> {
+        if self._weights.is_nvfp4() { return Ok(()); }
         let geometry = cuteafd_core::expert_geometry();
         let row = self.kernel.info().input_row_bytes()?;
         let layout = cuteafd_core::spark_executions::wave_staging_layout(extent, row.try_into()?, geometry.topk, 1)
@@ -611,13 +612,12 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         if request.output_dtype() != cuteafd_transport::ExpertV2Dtype::Bf16 {
             waves.bypass(request.rows(), waves::Bypass::CompressedReply); return Ok(false);
         }
-        let (kernel, slots, scratch) = Self::select_state(request.rows(), &self.kernel, &self.slots, &self.scratch,
+        let (kernel, slots, _) = Self::select_state(request.rows(), &self.kernel, &self.slots, &self.scratch,
             &self.decode, &self.small, &self.reduction_plan)?;
         let stream = self.stream.as_ref().context("native staged worker needs an owned stream")?.raw;
         let reducer = self.compact_reducer.as_ref().context("native staged worker needs compact output")?;
         let timing = &self.worker_timing;
         let timing_units = &mut self.timing_units;
-        let _ = scratch;
         waves.stage(waves::Arrival { request, input, output, layer: request.layer() as usize, executor_id },
             &mut self.pending, &mut self.route_staging, stream,
             &mut |wave| {
