@@ -1298,11 +1298,12 @@ def main():
     different = sum(not row["object_identical"] for report in reports for row in report["programs"])
     total = sum(len(report["programs"]) for report in reports)
     inventory_delta = sum(len(report[key]) for report in reports
-                          for key in (("removed_programs",) if baseline_source
-                                      else ("added_programs", "removed_programs")))
+                          for key in ("added_programs", "removed_programs"))
+    # Source comparisons permit additive programs, but still report their inventory.
+    gated_delta = sum(len(report["removed_programs"]) for report in reports) if baseline_source else inventory_delta
     print(f"Compared {total} common programs: {total - different} identical objects, {different} different, "
           f"{inventory_delta} added/removed. Report: {output / 'comparison.json'}")
-    return int(args.require_identical and (different > 0 or (inventory_delta > 0 and expected_removals is None)))
+    return int(args.require_identical and (different > 0 or (gated_delta > 0 and expected_removals is None)))
 
 
 if __name__ == "__main__":

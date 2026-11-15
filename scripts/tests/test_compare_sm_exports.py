@@ -671,6 +671,36 @@ def test_expected_removals_main_gates_exact_aggregate_and_baseline(tmp_path, mon
     assert error.value.code == 2
 
 
+def test_main_reports_additions_without_changing_source_gate(tmp_path, monkeypatch, capsys):
+    group = tmp_path / "group"
+    group.mkdir()
+    left, right = exports(group)
+    baseline = tmp_path / "source"
+    (baseline / "third_party").mkdir(parents=True)
+    (baseline / "third_party/sparkinfer.lock.json").write_text("{}")
+    left.rename(group / "baseline")
+    right = right.rename(group / "candidate")
+    context_path = right / "comparison-context.json"
+    context = json.loads(context_path.read_text())
+    context["sms"] = 188
+    context_path.write_text(json.dumps(context))
+    (right / "added.o").write_bytes(b"host" + cuda_elf())
+    (right / "added.h").write_text("additive ABI\n")
+    monkeypatch.setattr(compare_sm, "jobs", lambda _: [("group", "export.py", [])])
+    real_load = compare_sm.load_file
+    monkeypatch.setattr(compare_sm, "load_file", lambda name, path:
+        SimpleNamespace(check_path=lambda _: None) if name == "cuteafd_build_filesystem" else real_load(name, path))
+    argv = ["compare-sm-exports.py", "--compare-only", "--require-identical", "--output-dir", str(tmp_path),
+            "--baseline-source", str(baseline)]
+    monkeypatch.setattr(compare_sm.sys, "argv", argv)
+    assert compare_sm.main() == 0
+    assert "1 added/removed." in capsys.readouterr().out
+    report = json.loads((tmp_path / "comparison.json").read_text())
+    assert not report["failures"]
+    assert report["groups"][0]["added_programs"] == ["added.o"]
+    assert report["groups"][0]["removed_programs"] == []
+
+
 def test_missing_cubins_fail_closed(tmp_path):
     left, right = exports(tmp_path)
     (left / "test.o").write_bytes(b"no CUDA image")

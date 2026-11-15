@@ -968,7 +968,8 @@ def test_glm_official_catalog_stays_fused(exporter):
     geometry = types.SimpleNamespace(moe_inter=2048, dense_inter=12288)
     entries = exporter.glm_programs(geometry, 64, 4096, 1048576)
     names = {name for name, _, _, _ in entries}
-    assert len(names) == len(entries) == 29
+    assert len(names) == len(entries) == 30
+    assert {"norm", "norm_head_split"} <= names
     for rows in (64, 4096):
         for stem in ("producer", "index_producer", "o"):
             assert f"{stem}_m{rows}" in names
@@ -1099,9 +1100,9 @@ def _rust_methods(source, names):
 
 @pytest.mark.parametrize("family,methods,launches,inventory_names", [
     ("mimo_v2", {"norm_full", "attention_part", "dense_ffn", "moe_front_on", "moe_front_on_accounted"},
-     {"mimo_norm", "mimo_{k}_producer{kv}_{cap}", "mimo_{k}_attention{}_{mode}_{cap}",
+     {"mimo_norm", "mimo_norm_head_split", "mimo_{k}_producer{kv}_{cap}", "mimo_{k}_attention{}_{mode}_{cap}",
       "mimo_o_w8_{cap}", "mimo_o_{cap}", "mimo_ffn_{cap}", "mimo_router_scores", "mimo_expert_input_quant"},
-     {"mimo_norm", "mimo_{k}_producer{kv}_m4096", "mimo_{k}_attention{kv}_prefill_m4096",
+     {"mimo_norm", "mimo_norm_head_split", "mimo_{k}_producer{kv}_m4096", "mimo_{k}_attention{kv}_prefill_m4096",
       "mimo_o{}_m4096", "mimo_ffn_m4096", "mimo_router_scores", "mimo_expert_input_quant"}),
     ("glm5_flash", {"pre_at", "post_pre_at", "mhc_post_at", "kda_on", "kda_w8", "ffn_on",
                    "mla_producer_into", "index_producer_part", "mla_output", "mla_over", "moe_front", "moe_experts"},
@@ -1121,6 +1122,8 @@ def test_packed_program_catalogue_and_explicit_inventory_stay_in_sync(family, me
     actual = set()
     for method in selected.values():
         for line in method.splitlines():
+            if "let program = if " in line:
+                actual.update(re.findall(r'"([a-z][a-z0-9_{}]*)"', line))
             if re.search(r"self\.run(?:_on)?\(", line) or "let name = format!(" in line or "let name = if " in line:
                 if "self.run" in line:
                     line = re.split(r",\s*&\[", line[line.index("self.run"):])[0]
@@ -1145,6 +1148,20 @@ def test_packed_program_catalogue_and_explicit_inventory_stay_in_sync(family, me
         assert 'add("head".into(), PackedRows)' in inventory
         units = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine/units.rs").read_text()
         assert 'e.run("head"' in units
+
+
+def test_projection_norm_mode_does_not_change_moe_or_ml4():
+    source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/engine/native_dense.rs").read_text()
+    methods = _rust_methods(source, {"projection_norm", "ffn_norm"})
+    projection = methods["projection_norm"]
+    assert 'else if self.cfg.variant.is_glm()' in projection
+    assert 'self.run_on(rank, "glm_norm_head_split"' in projection
+    assert 'else { self.norm_full(rank, w, weight, 2, rows, first, second) }' in projection
+    moe = methods["ffn_norm"].split("else {", 1)[1]
+    assert "norm_head_split" not in moe and "self.norm_full(" in moe
+    mimo = (ROOT / "rust/crates/cuteafd-daemon/src/families/mimo_v2/engine.rs").read_text()
+    norm = _rust_methods(mimo, {"norm_full"})["norm_full"]
+    assert 'if deltas == 2 { "mimo_norm_head_split" } else { "mimo_norm" }' in norm
 
 
 def test_projected_operand_data_contract_matches_exporter_declarations():

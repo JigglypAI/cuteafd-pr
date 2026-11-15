@@ -5830,7 +5830,9 @@ mod prefill_lane_tests {
             // Fork #269 forwards optional wide_min_rows, default None; GLM retains
             // its existing wide floor and byte-identical exported objects.
             // Fork #278 adds an opt-in UE8M0 index-scale route for K3.1; the default FP32 route and GLM/GLM Flash exports are unchanged (678/678 objects identical).
-            ("integration/cuteafd/_glm_kernels.py", 0x2087_8fca_2f4a_b67c),
+            // Fork #333 adds opt-in head-split residual reduction; default MoE order stays.
+            // Eight-family audit: all 1,136 common objects identical, including glmf/glmf2.
+            ("integration/cuteafd/_glm_kernels.py", 0xc022_54f8_2997_fe5a),
             // Fork #146 adds `fp8_gemv_tuning`/`fp8_gemv_wide`/`fp8_gemv_wide_kernel` and the
             // `NcMmaFp8Gemv` load path. Selected shapes keep the shipped `warps`; every change is a
             // grid partition (groups, cta_tiles). The (5120, 17408) wide tile's `nc` load path
