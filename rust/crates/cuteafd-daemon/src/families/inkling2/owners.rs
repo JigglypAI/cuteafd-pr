@@ -133,6 +133,83 @@ impl<'a> UnitOwner<'a> {
         Ok(())
     }
 }
+/// Runtime construction is driven by an already solved shared recipe. No
+/// family pool/onboarding policy or allocation-before-admission lives here.
+pub(crate) struct RequestOwners<'a> {
+    pub decode_uploads: crate::shared::token_table::RetainedUploads<'a>,
+    pub prefill_uploads: Vec<crate::shared::token_table::RetainedUploads<'a>>,
+    pub decode: UnitOwner<'a>,
+    pub prefill: Vec<UnitOwner<'a>>,
+    pub cache: Rc<super::cache::CacheBank<'a>>,
+}
+impl<'a> RequestOwners<'a> {
+    pub fn allocation_receipts(&self, inventory: &mut Inventory<'_>,
+        census: &mut crate::shared::memory::receipts::Census,
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>) -> Result<()> {
+        self.cache.inventory(inventory)?;
+        self.decode.inventory(inventory, "inkling2.decode.0")?;
+        self.decode_uploads.allocation_receipts(inventory, "inkling2.decode.0.uploads")?;
+        for (slot, (owner, uploads)) in self.prefill.iter().zip(&self.prefill_uploads).enumerate() {
+            let prefix = format!("inkling2.unit.0.{slot}");
+            owner.inventory(inventory, &prefix)?;
+            uploads.allocation_receipts(inventory, &format!("{prefix}.uploads"))?;
+        }
+        for (name, uploads) in std::iter::once(("inkling2.decode.0.uploads".to_owned(), &self.decode_uploads))
+            .chain(self.prefill_uploads.iter().enumerate().map(|(slot, uploads)| (format!("inkling2.unit.0.{slot}.uploads"), uploads))) {
+            let backing = inventory.receipts.iter().find(|receipt| receipt.allocation.id.ends_with(&format!(".{name}"))
+                && receipt.allocation.bytes == uploads.mapped_alias().bytes as u64
+                && receipt.allocation.location == cuteafd_loader::placement::planner::Location::PINNED)
+                .with_context(|| format!("Inkling upload alias has no pinned owner {name}"))?.allocation.id.clone();
+            census.mapped(format!("{name}.mapped"), backing, uploads.mapped_alias(), devices)?;
+        }
+        Ok(())
+    }
+    pub fn whole(stream: Rc<Stream<'a>>, inputs: &cuteafd_loader::placement::families::inkling2::InklingInputs,
+        admitted: &cuteafd_loader::placement::families::inkling2::AdmittedInkling) -> Result<Self> {
+        use cuteafd_loader::placement::{LayerMode, planner::Location};
+        ensure!(inputs.gpus == 1 && admitted.placement.layers.iter().all(|layer|
+            matches!(layer.mode, LayerMode::Whole { gpu: 0, .. })), "Inkling request owner requires admitted whole rank");
+        let cfg = &inputs.cfg;
+        let sequences = usize::try_from(inputs.sequences)?;
+        let context = usize::try_from(inputs.context.maximum)?;
+        let pages = usize::try_from(admitted.solved.pool_tokens.div_ceil(64))?;
+        let cache_layout = cuteafd_loader::families::inkling2::execution::CacheLayout::new(cfg, sequences, pages)?;
+        let mark_slots = usize::try_from(cuteafd_core::prefix::mark_slots_with_host(inputs.sequences, inputs.prefix_entries,
+            cache_layout.sequence_bytes as u64, inputs.prefix_mark_budget, inputs.host_prefix.quota_bytes > 0))?;
+        let decode_layout = UnitLayout::serving(cfg, 64, context)?;
+        let prefill_layout = UnitLayout::serving(cfg, usize::try_from(inputs.prefill.rows)?, context)?;
+        let owner = |id: &str, bytes: usize, location| -> Result<()> {
+            let allocation = admitted.solved.facts.allocations.iter().find(|allocation| allocation.id == id)
+                .with_context(|| format!("Inkling unadmitted runtime owner {id}"))?;
+            ensure!(allocation.location == location && allocation.bytes == bytes as u64,
+                "Inkling runtime owner differs from admission: {id} {bytes}/{}", allocation.bytes);
+            Ok(())
+        };
+        let device = Location::coordinator(0);
+        owner("inkling2.cache.0.active", cache_layout.active_bytes()?, device)?;
+        if mark_slots > 0 { owner("inkling2.cache.0.marks", cache_layout.retained_bytes(mark_slots)?, device)?; }
+        for &layer in &cache_layout.global_layers {
+            let bytes = usize::try_from(cuteafd_loader::placement::planner::sm120_request_backing(cache_layout.layer_page_bytes()? as u64)?)?;
+            owner(&format!("inkling2.kv.{layer}.0.records"), bytes, device)?;
+        }
+        for (prefix, layout) in std::iter::once(("inkling2.decode.0".to_owned(), &decode_layout))
+            .chain((0..inputs.prefill.waves).map(|slot| (format!("inkling2.unit.0.{slot}"), &prefill_layout))) {
+            for (name, bytes) in &layout.buffers { owner(&format!("{prefix}.{name}"), *bytes, device)?; }
+            let uploads = layout.upload_shape(cfg, sequences.min(layout.rows))?;
+            owner(&format!("{prefix}.uploads"), uploads.capacity_bytes()?, Location::PINNED)?;
+        }
+        // Every extent was checked before the first allocation.
+        let cache = Rc::new(super::cache::CacheBank::new(vec![stream.clone()], cache_layout, mark_slots)?);
+        let decode = UnitOwner::new(stream.clone(), decode_layout)?;
+        let prefill = (0..inputs.prefill.waves).map(|_| UnitOwner::new(stream.clone(), prefill_layout.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let decode_uploads = decode.uploads(cfg, sequences.min(decode.layout.rows))?;
+        let prefill_uploads = prefill.iter().map(|owner| owner.uploads(cfg, sequences.min(owner.layout.rows)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { decode_uploads, prefill_uploads, decode, prefill, cache })
+    }
+}
+
 impl<'a> UnitBuffers<'a> for UnitOwner<'a> {
     fn stream(&self) -> &Stream<'a> { &self.stream }
     fn layout(&self) -> &UnitLayout { &self.layout }
