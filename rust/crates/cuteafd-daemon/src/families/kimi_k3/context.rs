@@ -578,6 +578,7 @@ mod tests {
                     rows: 256, waves: 1, prefill_rows: Some(256), slots: 2, marks: 2, max_context: 8192,
                     context: cuteafd_loader::placement::planner::Context::pinned(8192), pool_tokens: Some(8192),
                     graphs: true, ffn_mode: Default::default(), hosted_layers: None, draft: None, verify_rows: 0, prefix: None,
+                    prove_serve_admission: false,
                 })?;
             let engine = loaded.engine;
             let family = engine.prefix_family()?;
