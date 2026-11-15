@@ -9,6 +9,12 @@ pub(super) fn run<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(runtime: &to
     active: &mut [Option<Active<'a>>], draft: Option<&mut DraftRuntime<'_, 'a, C>>,
     prefixes: &mut PrefixCache<'a>, receive: &mpsc::Receiver<NativeRequest>, wake: admission::Wake<'_>,
 ) -> Result<()> {
+    first.visit_lane_graphs(&mut |_, _, _, bank| { bank.lane_owner(0); Ok(()) })?;
+    second.visit_lane_graphs(&mut |_, _, _, bank| { bank.lane_owner(1); Ok(()) })?;
+    let mut draft = draft;
+    if let Some(draft) = draft.as_deref_mut() {
+        for lane in 0..2 { draft.visit_lane_graphs(lane, &mut |_, _, _, bank| { bank.lane_owner(lane); Ok(()) })?; }
+    }
     let requests = RefCell::new(requests);
     let active = RefCell::new(active);
     let draft = RefCell::new(draft);
@@ -165,6 +171,13 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 }
                 if short { lease.stop(); return Ok(()); }
             }
+            // SAFETY: the previous round's target/drafter commit has drained;
+            // this visitor contains only this lane's persistent-storage banks.
+            unsafe { crate::shared::decode_graph::device::lane_cycle(lane, true, |visit| {
+                pass.visit_lane_graphs(visit)?;
+                if let Some(draft) = draft.borrow_mut().as_deref_mut() { draft.visit_lane_graphs(lane, visit)?; }
+                Ok(())
+            }) }?;
             let _capture_watch = crate::shared::decode_graph::CaptureWatch::round();
             let started = Instant::now();
             // Reserve target capacity and snapshot this lane's seeds, then release
@@ -397,6 +410,13 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 // commit must drain/discard this lane before the outer reset.
                 pass.discard(batch)
             } else { Ok(()) };
+            // SAFETY: operation and discard have settled this lane's submitted
+            // work; completion credits capacity, never destroys a peer's bank.
+            unsafe { crate::shared::decode_graph::device::lane_cycle(lane, false, |visit| {
+                pass.visit_lane_graphs(visit)?;
+                if let Some(draft) = draft.borrow_mut().as_deref_mut() { draft.visit_lane_graphs(lane, visit)?; }
+                Ok(())
+            }) }?;
             operation?;
             stopped_capture?;
             discarded?;

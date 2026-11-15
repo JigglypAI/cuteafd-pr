@@ -1,7 +1,7 @@
 //! Device-wide ARC policy. Native owners stay in GraphBank: this controller
 //! marks victims; banks with persistent captured storage destroy them without
 //! synchronization. Per-graph storage requires explicit drained retirement.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -90,6 +90,7 @@ pub(crate) struct Counters {
     pub evictions: u64,
     pub physical_floor_skips: u64,
     pub eager_awaiting_destroy: u64,
+    pub eager_vampire: u64,
     pub eager_soft_room: u64,
     pub eager_hard_stop: u64,
     pub eager_sealed: u64,
@@ -128,6 +129,31 @@ pub(crate) struct Snapshot {
     pub top_hits: Vec<TraceRow>,
     pub top_churn: Vec<TraceRow>,
     pub rankings_age_ms: u64,
+    pub epochs: EpochStats,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub(crate) struct EpochStats {
+    pub cycles: [u64; 2],
+    pub completed: [u64; 2],
+    pub selections: [u64; 2],
+    pub uncredited_nodes: u64,
+    pub reuse_growth_bytes: u64,
+}
+
+#[derive(Default)]
+struct LaneEpoch {
+    index: u64,
+    completed: u64,
+    active: bool,
+    vampires: HashSet<Identity>,
+}
+
+struct LaggedCredit {
+    until: [u64; 2],
+    nodes: u64,
+    pool_nodes: u64,
+    execs: u64,
 }
 
 /// Release observations are deliberately independent of cudaMemGetInfo. An
@@ -587,14 +613,41 @@ pub(crate) unsafe fn observe_completed(library: &cuteafd_ffi::NativeLibrary,
     mut visit: impl FnMut(&mut GraphVisitor<'_>) -> anyhow::Result<()>) -> anyhow::Result<()> {
     let mut devices = std::collections::BTreeSet::new();
     visit(&mut |device, _, _, bank| { bank.tick(); devices.insert(device); Ok(()) })?;
-    for device in devices { observe_device(library, device)?; }
+    for &device in &devices { observe_device(library, device)?; }
     visit(&mut |_, _, _, bank| {
         // SAFETY: serving banks retain only borrowed handles of persistent engine
         // buffers (or ()); their containing pipelines order buffer reuse.
         unsafe { bank.evict_persistent(); }
         Ok(())
-    })
+    })?;
+    for device in devices {
+        if let Some(cache) = existing_cache(device) { cache.lock().unwrap_or_else(|p| p.into_inner()).serial_boundary(); }
+    }
+    Ok(())
+}
 
+/// Start/finish one independently scheduled cycle, visiting only its own banks.
+/// # Safety
+/// The visitor contains only this lane's persistent-storage banks. At start,
+/// every launch from its previous cycle and commit has completed.
+pub(crate) unsafe fn lane_cycle(lane: usize, begin: bool,
+    mut visit: impl FnMut(&mut GraphVisitor<'_>) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    let mut devices = std::collections::BTreeSet::new();
+    visit(&mut |device, _, _, bank| { bank.lane_owner(lane); devices.insert(device); Ok(()) })?;
+    for device in devices {
+        if let Some(cache) = existing_cache(device) {
+            let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+            if begin { cache.begin_lane(lane); } else { cache.complete_lane(lane); }
+        }
+    }
+    if begin {
+        visit(&mut |_, _, _, bank| {
+            // SAFETY: forwarded lane-local persistent-storage contract.
+            unsafe { bank.evict_persistent(); }
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 pub(crate) struct DeviceCache {
@@ -633,6 +686,12 @@ pub(crate) struct DeviceCache {
     chain_only: bool,
     unmeasured: bool,
     pending_destroy: usize,
+    bank_lanes: HashMap<u64, usize>,
+    lanes: [LaneEpoch; 2],
+    lagged: Vec<LaggedCredit>,
+    epochs: EpochStats,
+    reuse_captures: HashSet<u64>,
+    selected_epochs: HashMap<u64, [u64; 2]>,
     observer: GrowthObserver,
     memory_query: Option<cuteafd_ffi::PhysicalMemoryQuery>,
     captured_since_observation: bool,
@@ -684,6 +743,8 @@ impl DeviceCache {
             queues: std::array::from_fn(|_| Queue::default()), classes: HashMap::new(),
             pending_growth: 0, pools: Pools::default(), basis: Basis::Bytes,
             chain_only: true, unmeasured: false, pending_destroy: 0,
+            bank_lanes: HashMap::new(), lanes: std::array::from_fn(|_| LaneEpoch::default()),
+            lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(),
             observer: GrowthObserver::default(), memory_query: None, captured_since_observation: false,
             counters: HashMap::new(), started: Instant::now(), clock_ms: 0, last_report: Instant::now(),
             interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").and_then(|path| {
@@ -694,6 +755,50 @@ impl DeviceCache {
     }
 
     pub fn bank(&mut self) -> u64 { self.next_bank += 1; self.next_bank }
+    pub fn assign_bank_lane(&mut self, bank: u64, lane: usize) {
+        assert!(lane < self.lanes.len());
+        self.bank_lanes.insert(bank, lane);
+    }
+
+    fn bank_lane(&self, bank: u64) -> usize { self.bank_lanes.get(&bank).copied().unwrap_or(0) }
+
+    fn begin_lane(&mut self, lane: usize) {
+        let epoch = &mut self.lanes[lane];
+        assert!(!epoch.active, "graph lane cycle already active");
+        epoch.index = epoch.index.checked_add(1).expect("graph cycle exhausted");
+        epoch.active = true;
+        epoch.vampires.clear();
+        self.epochs.cycles[lane] = epoch.index;
+        self.credit_completed();
+    }
+
+    fn complete_lane(&mut self, lane: usize) {
+        let epoch = &mut self.lanes[lane];
+        epoch.completed = epoch.index;
+        epoch.active = false;
+        epoch.vampires.clear();
+        self.epochs.completed[lane] = epoch.completed;
+        self.credit_completed();
+    }
+
+    fn credit_completed(&mut self) {
+        self.lagged.retain(|credit| {
+            let ready = self.lanes.iter().zip(credit.until).all(|(lane, until)| lane.completed >= until);
+            if ready {
+                self.pools.live_nodes = self.pools.live_nodes.saturating_sub(credit.pool_nodes);
+                self.pools.live_execs = self.pools.live_execs.saturating_sub(credit.execs);
+            }
+            !ready
+        });
+        self.epochs.uncredited_nodes = self.lagged.iter().map(|credit| credit.nodes).sum();
+    }
+
+    pub(super) fn serial_boundary(&mut self) {
+        if self.lanes.iter().any(|lane| lane.active) { return }
+        self.complete_lane(0);
+        self.lanes[0].index = self.lanes[0].index.checked_add(1).expect("graph cycle exhausted");
+        self.epochs.cycles[0] = self.lanes[0].index;
+    }
     pub fn reserve(&self) -> u64 { self.reserve }
     pub fn identity_generation(&self) -> u64 { self.identity_generation }
     pub fn retains_identity(&self, identity: &Identity) -> bool { self.identities.contains_key(identity) }
@@ -702,6 +807,13 @@ impl DeviceCache {
     }
     pub fn has_pending_victims(&self) -> bool { self.pending_destroy > 0 }
     pub fn pending(&self, id: u64) -> bool { self.records.get(&id).is_some_and(|r| r.pending_destroy) }
+    pub fn persistent_victim_ready(&self, id: u64) -> bool {
+        self.records.get(&id).is_some_and(|record| {
+            let lane = self.bank_lane(record.identity.bank);
+            record.pending_destroy && self.selected_epochs.get(&id).is_none_or(|until|
+                self.lanes[lane].completed >= until[lane])
+        })
+    }
 
     fn sample_physical(&mut self, free: u64, tracked: u64) {
         self.physical_sample = Some((Instant::now(), free, tracked));
@@ -888,6 +1000,9 @@ impl DeviceCache {
         self.records.get_mut(&id).unwrap().frequent = frequent;
         self.records.get_mut(&id).unwrap().pending_destroy = true;
         self.pending_destroy += 1;
+        self.selected_epochs.insert(id, self.lanes.each_ref().map(|lane| lane.index));
+        let lane = self.bank_lane(self.records[&id].identity.bank);
+        self.epochs.selections[lane] += 1;
         Some(id)
     }
 
@@ -919,6 +1034,8 @@ impl DeviceCache {
             self.counters.entry(site.cycle).or_default().eager_runs += 1;
             return Miss::Eager;
         }
+        let lane = self.bank_lane(identity.bank);
+        let vampire = self.lanes[lane].vampires.contains(&identity);
         let old = self.identities.get(&identity).copied();
         // A bank must retire its old executable before recapturing this identity.
         // Re-entering would replace its ticket while the native owner stays live.
@@ -1000,7 +1117,7 @@ impl DeviceCache {
         // key, so a GRAPH_TRACE run still lists it for the layout's prewarm set.
         let sealed = site.spans_devices && cross_device_capture_sealed();
         let allowed = site.preference != Preference::Eager && estimate > 0 && !sealed;
-        if allowed {
+        if allowed && !vampire {
             // No CUDA query or ticket for a planned physical-headroom miss.
             if !self.physical_room(estimate, headroom) {
                 return self.floor_skip(old, site.cycle);
@@ -1024,17 +1141,23 @@ impl DeviceCache {
                 if !self.unmeasured { self.captured_since_observation = false; }
                 return self.floor_skip(old, site.cycle);
             }
-            let room = if self.soft.measured_bytes.is_none() { self.pending_destroy == 0 }
+            let selected_before = self.pending_destroy;
+            let room = if self.soft.measured_bytes.is_none() { true }
                 else {
                 let new_nodes = metadata.nodes.filter(|nodes| *nodes > 0).or_else(|| old.and_then(|id| self.records[&id].stats.native_nodes).filter(|n| *n > 0))
                     .or_else(|| self.records.values().filter(|r| r.identity.site == site.name)
                         .filter_map(|r| r.stats.native_nodes).max())
                     ;
                 if let Some(nodes) = new_nodes {
-                    self.make_soft_room(nodes, None) && self.pending_destroy == 0
-                } else { self.pending_destroy == 0 }
+                    self.make_soft_room(nodes, None)
+                } else { true }
             };
-            if room {
+            let evicted = self.pending_destroy > selected_before;
+            if evicted { self.lanes[lane].vampires.insert(identity.clone()); }
+            // Selected owners and lagged chunks still consume capacity. Only
+            // their owner's next cycle can destroy them; no device-wide gate.
+            let hard_room = self.charged.saturating_add(projected) <= self.reserve;
+            if room && !evicted && hard_room {
             let id = if let Some(id) = old { self.unlink(id); id } else {
                 self.next_id += 1;
                 let id = self.next_id;
@@ -1048,6 +1171,7 @@ impl DeviceCache {
             record.nodes = nodes; record.node_rate = metadata.node_rate;
             record.graph_rate = metadata.graph_rate; record.parallel_width = metadata.parallel_width;
             record.spans_devices |= site.spans_devices;
+            if projected == 0 { self.reuse_captures.insert(id); }
             self.pending_growth = self.pending_growth.max(projected);
             self.unmeasured = true;
             self.pools.live_nodes = next_nodes;
@@ -1092,7 +1216,7 @@ impl DeviceCache {
         counters.eager_runs += 1;
         if sealed { counters.eager_sealed += 1; }
         else if site.preference == Preference::Eager { counters.eager_preference += 1; }
-        else if self.pending_destroy > 0 { counters.eager_awaiting_destroy += 1; }
+        else if vampire { counters.eager_vampire += 1; }
         else if self.soft.measured_bytes.is_some() { counters.eager_soft_room += 1; }
         else { counters.eager_other += 1; }
         Miss::Eager
@@ -1221,13 +1345,15 @@ impl DeviceCache {
         let reclaimable = self.records.iter().filter(|(&id, r)| Some(id) != excluded && !r.pending_capture
             && matches!(r.list, Some(List::Recent | List::Frequent)))
             .map(|(_, r)| r.stats.native_nodes.unwrap_or(0)).sum::<u64>();
-        let mut nodes = native.live_nodes.saturating_sub(selected);
+        let uncredited = self.epochs.uncredited_nodes;
+        let mut nodes = native.live_nodes.saturating_add(uncredited).saturating_sub(selected);
         if !self.soft.fits(nodes.saturating_sub(reclaimable).saturating_add(incoming_nodes)) { return false }
         while !self.soft.fits(nodes.saturating_add(incoming_nodes)) {
             let Some(id) = self.select_victim(excluded) else { return false };
             nodes = nodes.saturating_sub(self.records[&id].stats.native_nodes.unwrap_or(0));
         }
-        true
+        // Victim selection is not capacity credit.
+        self.soft.fits(native.live_nodes.saturating_add(uncredited).saturating_add(incoming_nodes))
     }
 
     fn apply_soft_pressure(&mut self, growth: u64, completed: Option<u64>) {
@@ -1256,7 +1382,14 @@ impl DeviceCache {
             self.soft.measured_nodes = Some(native.live_nodes);
         }
         if self.charged < self.soft.limit { return }
+        let before = self.pending_destroy;
         self.make_soft_room(0, completed);
+        if self.pending_destroy > before {
+            if let Some(identity) = completed.and_then(|id| self.records.get(&id)).map(|r| r.identity.clone()) {
+                let lane = self.bank_lane(identity.bank);
+                self.lanes[lane].vampires.insert(identity);
+            }
+        }
     }
 
     /// Called once per device after the complete multi-rank step has drained.
@@ -1283,6 +1416,10 @@ impl DeviceCache {
             self.unlink(id);
             let record = self.records.get_mut(&id).unwrap();
             record.pending_capture = false;
+            if self.reuse_captures.remove(&id) && share > 0 {
+                self.epochs.reuse_growth_bytes = self.epochs.reuse_growth_bytes.saturating_add(share);
+                tracing::warn!(device = self.device, id, share, "graph capture grew driver arena despite credited native capacity");
+            }
             record.stats.capture_bytes = Some(share);
             record.stats.captures += 1;
             if record.stats.evicted_since_capture { record.stats.recaptures += 1; }
@@ -1314,6 +1451,7 @@ impl DeviceCache {
         if ids.iter().any(|id| self.records.contains_key(id)) { self.recovery_generation += 1; }
         for &id in ids {
             self.unlink(id);
+            let until = self.selected_epochs.remove(&id);
             let Some(record) = self.records.get_mut(&id) else { continue };
             let evicted = record.pending_destroy;
             self.live_bytes = self.live_bytes.saturating_sub(record.bytes);
@@ -1321,8 +1459,21 @@ impl DeviceCache {
             record.pending_destroy = false;
             record.pinned = false;
             if evicted { self.pending_destroy -= 1; }
-            self.pools.live_nodes = self.pools.live_nodes.saturating_sub(record.nodes);
-            self.pools.live_execs = self.pools.live_execs.saturating_sub(1);
+            if let Some(until) = until.filter(|until| self.lanes.iter().zip(*until).any(|(lane, epoch)| lane.completed < epoch)) {
+                // Coalesce by in-flight frontier: at most K independently
+                // advancing cycles retain capacity, rather than one chunk/key.
+                if let Some(chunk) = self.lagged.iter_mut().find(|chunk| chunk.until == until) {
+                    chunk.nodes += record.stats.native_nodes.unwrap_or(0);
+                    chunk.pool_nodes += record.nodes;
+                    chunk.execs += 1;
+                } else {
+                    self.lagged.push(LaggedCredit { until, nodes: record.stats.native_nodes.unwrap_or(0),
+                        pool_nodes: record.nodes, execs: 1 });
+                }
+            } else {
+                self.pools.live_nodes = self.pools.live_nodes.saturating_sub(record.nodes);
+                self.pools.live_execs = self.pools.live_execs.saturating_sub(1);
+            }
             if evicted {
                 record.stats.evictions += 1;
                 record.stats.evicted_since_capture = true;
@@ -1335,6 +1486,7 @@ impl DeviceCache {
             self.records.get_mut(&id).unwrap().bytes = 0;
             self.sync_inventory(id);
         }
+        self.credit_completed();
         self.trim_ghosts();
     }
 
@@ -1365,6 +1517,8 @@ impl DeviceCache {
             self.recovery_generation += 1;
         }
         for &id in ids {
+            self.selected_epochs.remove(&id);
+            self.reuse_captures.remove(&id);
             let Some(record) = self.records.get(&id) else { continue };
             if record.pending_capture {
                 self.pending_bytes = self.pending_bytes.saturating_sub(record.estimate);
@@ -1407,7 +1561,7 @@ impl DeviceCache {
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(),
             basis: self.basis, sampled_at_ms: self.started.elapsed().as_millis() as u64,
             telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(),
-            top_hits: Vec::new(), top_churn: Vec::new(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64 },
+            top_hits: Vec::new(), top_churn: Vec::new(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64, epochs: self.epochs.clone() },
             records, classes: self.classes.clone() }
     }
 
@@ -1448,7 +1602,7 @@ impl DeviceCache {
             level: self.level,
             pinned: self.inventory.pinned,
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(), basis: self.basis,
-            sampled_at_ms: now, telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(), top_hits: self.ranked_hits.clone(), top_churn: self.ranked_churn.clone(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64 }
+            sampled_at_ms: now, telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(), top_hits: self.ranked_hits.clone(), top_churn: self.ranked_churn.clone(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64, epochs: self.epochs.clone() }
     }
 
     fn row(&self, record: &Record, now: u64) -> TraceRow {

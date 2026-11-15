@@ -577,14 +577,26 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         for chain in &mut self.chains { chain.visit_graph_banks(f)?; }
         Ok(())
     }
-    fn graph_cycle(&mut self) -> Result<()> {
+    pub(crate) fn visit_lane_graphs(&mut self, lane: usize,
+        f: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()> {
+        if let Some(main) = self.mains.get_mut(lane) { main.visit_graph_banks(f)?; }
+        if let Some(chain) = self.chains.get_mut(lane) { chain.visit_graph_banks(f)?; }
+        Ok(())
+    }
+    fn graph_cycle(&mut self, lane: usize) -> Result<()> {
         crate::families::deepseek_v41::graph_policy::cycle(
-            crate::shared::decode_graph::device::Cycle::Verify, |f| self.visit_graph_banks(f))
+            crate::shared::decode_graph::device::Cycle::Verify, |f| self.visit_lane_graphs(lane, f))
     }
     fn graph_completed(&mut self) -> Result<()> {
         let library = self.windows[0].device().library;
         unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
             crate::shared::decode_graph::device::observe_completed(library, |f| self.visit_graph_banks(f)) }
+    }
+    fn graph_lane_completed(&mut self, lane: usize) -> Result<()> {
+        let library = self.windows[0].device().library;
+        // SAFETY: this completed draft owns only persistent captured storage.
+        unsafe { crate::shared::decode_graph::device::observe_completed(library,
+            |f| self.visit_lane_graphs(lane, f)) }
     }
     pub fn poll_propose(&mut self, lane: usize,
         inputs: &[(u64, u32, u64, usize)],
@@ -615,7 +627,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
                     return Err(error);
                 },
             };
-            self.graph_completed()?;
+            self.graph_lane_completed(lane)?;
             let (packed, values) = completed;
             let active: Vec<_> = inputs.iter().enumerate()
                 .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();
@@ -672,7 +684,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             self.chains[lane].note_failure(&error);
             return Err(error);
         }
-        self.graph_cycle()?;
+        self.graph_cycle(lane)?;
         let windows = self.windows.each_ref();
         let bindings = bindings.each_ref().map(|rows| rows.as_slice());
         // SAFETY: admitted leases and windows stay owned by the runtime through completion/cancellation.
@@ -760,7 +772,7 @@ impl<'w, 'a, C: ProposeChain<'a>> DraftRuntime<'w, 'a, C> {
             self.chains[lane].note_failure(&error);
             return Err(error);
         }
-        self.graph_cycle()?;
+        self.graph_cycle(lane)?;
         let windows = self.windows.each_ref();
         let bindings = bindings.each_ref().map(|rows| rows.as_slice());
         if !self.chains[lane].has_graph(count) {
@@ -775,7 +787,7 @@ impl<'w, 'a, C: ProposeChain<'a>> DraftRuntime<'w, 'a, C> {
             self.chains[lane].note_failure(&error);
             return Err(error);
         }
-        self.graph_completed()?;
+        self.graph_lane_completed(lane)?;
         let buffer = match self.chains[lane].draft_output() {
             Ok(output) => output[0],
             Err(error) => { self.chains[lane].note_failure(&error); return Err(error); }
