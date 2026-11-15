@@ -15,7 +15,7 @@ fn check_writable(placement: &Placement, rows: usize, context: usize, pool: &Ref
     let mut writable = BTreeSet::new();
     for position in placement.len..end {
         let page = placement.units[position/64];
-        ensure!(pool.refs(page) == 1 && writable.insert((page, position%64)),
+        ensure!((page as usize) < pool.capacity() && pool.refs(page) == 1 && writable.insert((page, position%64)),
             "Inkling append requires private nonaliased COW pages");
     }
     Ok(())
@@ -292,6 +292,8 @@ mod tests {
         assert!(check_writable(&alias, 128, 128, &pool).is_err());
         assert!(check_writable(&placement, 66, 128, &pool).is_err());
         assert!(check_writable(&placement, 0, 128, &pool).is_err());
+        let invalid = Placement { units: vec![99], len: 0, state_len: 0, ..placement };
+        assert!(check_writable(&invalid, 1, 128, &pool).is_err());
         Ok(())
     }
     #[test]
