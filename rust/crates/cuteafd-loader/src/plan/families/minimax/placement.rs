@@ -38,9 +38,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     report.prefill_reserve_rows = Some(prefill.span_rows);
     let shape = PrefillShape { rows: prefill.unit_rows, waves: prefill.waves };
-    let attention = report.requested_attention.unwrap_or(if gpus == 2 {
-        AttentionPlacement::Layers
-    } else { AttentionPlacement::Heads });
+    let attention = report.requested_attention.unwrap_or(AttentionPlacement::Heads);
     report.attention_placement = attention;
     if attention == AttentionPlacement::Context || (gpus == 1 && attention != AttentionPlacement::Heads) {
         report.refuse_placement(format!("MiniMax {attention} attention is not implemented on {gpus} RTX"),

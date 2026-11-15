@@ -332,7 +332,9 @@ fn cache_geometry_preserves_native_fp8_pages_and_physical_layer_owners() {
     assert_eq!(single.placement, KvPlacement::SingleDevice);
     assert_eq!(single.ranks[0].persistent_unit_bytes, cfg.layers as u64 * (2 * kv + index));
     for gpus in [1, 2] {
-        let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: gpus, ..Default::default() }).unwrap().unwrap();
+        let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: gpus,
+            attention_placement: Some(if gpus == 2 { AttentionPlacement::Layers } else { AttentionPlacement::Heads }),
+            ..Default::default() }).unwrap().unwrap();
         let owners = crate::placement::families::minimax_m3::layer_owners(cfg.layers, gpus);
         let native = crate::families::minimax_m3::execution::MsaCache::new(cfg.layers as u32, 1, 1, 64).unwrap();
         let native = native.buffers().unwrap();
@@ -1678,7 +1680,7 @@ fn heads_recipe_matches_native_cache_units_peer_slots_and_one_tail_per_backing()
 }
 
 #[test]
-fn explicit_heads_qualifies_serving_and_auto_keeps_layers() {
+fn explicit_heads_and_layers_both_qualify_serving() {
     use crate::placement::families::minimax_m3 as shared;
     use crate::placement::{AttentionPlacement, planner::Operation};
     let heads = heads_recipe_inputs();
@@ -1707,6 +1709,8 @@ fn heads_cache_geometry_keeps_one_replicated_index_per_rank() {
     let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: 2,
         attention_placement: Some(AttentionPlacement::Heads), ..Default::default() }).unwrap().unwrap();
     assert_eq!(geometry.placement, KvPlacement::PartitionedHeads);
+    let automatic = model.cache_geometry(CacheOptions { coordinator_ranks: 2, ..Default::default() }).unwrap().unwrap();
+    assert_eq!(automatic, geometry);
     for rank in geometry.ranks {
         assert_eq!(rank.persistent_unit_bytes, 4 * (16384 + 16384 + 8448));
     }
@@ -1851,6 +1855,26 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
     assert!(gather(&request).unwrap_err().what.contains("sampled free bytes exceed physical capacity"));
     request.coordinator = planned;
     request.attention = None;
+    let automatic = gather(&request).unwrap();
+    assert!(automatic.heads());
+    assert_eq!(automatic.targets, heads.targets);
+    let solve = crate::placement::families::minimax_m3::request(automatic.context, Some(32768),
+        crate::placement::Onboard::Layers(0), automatic.prefill,
+        crate::placement::planner::Operation::Serving, None, Default::default());
+    let planned = automatic.admit_serving(solve.clone()).unwrap();
+    let mut measured = automatic.clone();
+    for budget in &mut measured.budgets[..2] {
+        let crate::placement::planner::Baseline::Forecast { occupied, .. } = budget.baseline else { panic!("forecast baseline") };
+        budget.baseline = crate::placement::planner::Baseline::Sampled {
+            free: budget.physical_bytes - occupied, phase: crate::placement::planner::Phase::Load,
+            source: "same automatic Heads baseline".into() };
+    }
+    let runtime = measured.admit_serving(solve).unwrap();
+    assert_eq!(planned.solved.pool_tokens, runtime.solved.pool_tokens);
+    assert_eq!(planned.solved.decisions, runtime.solved.decisions);
+    assert_eq!(planned.solved.facts, runtime.solved.facts);
+    assert_eq!(planned.placement, runtime.placement);
+    request.attention = Some(AttentionPlacement::Layers);
     request.split_wire = Some(crate::families::minimax_m3::execution::WirePrecision::Bf16);
     let layers = gather(&request).unwrap();
     assert_eq!(layers.attention, AttentionPlacement::Layers);
@@ -1879,19 +1903,18 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
 
 
 #[test]
-fn explicit_heads_public_layout_is_executable_and_auto_selects_layers() {
+fn explicit_and_auto_heads_public_layouts_are_executable() {
     use crate::placement::{AttentionPlacement, OnboardSetting};
     let (dir, inputs) = heads_recipe_fixture_with_experts(128);
     let manifest = dir.path().join("PROGRAMS.json");
-    // Auto now selects the qualified split path; this dual-placement fixture
-    // needs both the Heads and canonical split producer/dense inventories.
+    // Auto selects Heads; explicit Layers still needs its canonical producer/dense inventory.
     let split = recipe_inputs(2, 4);
     let programs = inputs.manifest["programs"].as_array().unwrap().iter()
         .chain(split.manifest["programs"].as_array().unwrap())
         .map(|entry| (entry["name"].as_str().unwrap().to_owned(), entry.clone()))
         .collect::<std::collections::BTreeMap<_, _>>();
     std::fs::write(&manifest, serde_json::json!({"programs": programs.into_values().collect::<Vec<_>> ()}).to_string()).unwrap();
-    for attention in [Some(AttentionPlacement::Heads), None] {
+    for attention in [Some(AttentionPlacement::Heads), None, Some(AttentionPlacement::Layers)] {
         let options = PlanOptions { attention_placement: attention,
             placement: plan::ExpertPlacement::Sparks { ranks: 4 },
             layout: Some(plan::layout::LayoutOptions {
@@ -1908,7 +1931,7 @@ fn explicit_heads_public_layout_is_executable_and_auto_selects_layers() {
         assert!(report.placement_supported);
         assert!(report.executable());
         assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
-        assert_eq!(report.attention_placement, attention.unwrap_or(AttentionPlacement::Layers));
+        assert_eq!(report.attention_placement, attention.unwrap_or(AttentionPlacement::Heads));
         let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("qualified default wire produces a shared solved plan: {report:#?}"));
         assert_eq!(placed.attention_placement, report.attention_placement);
         assert_eq!(plan::layout::LayoutOptions::default().minimax_split_wire,

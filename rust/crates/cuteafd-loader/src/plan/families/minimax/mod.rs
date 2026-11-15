@@ -335,9 +335,7 @@ impl FamilyModel for Model {
         use crate::placement::AttentionPlacement;
         use crate::serving_capacity::{CacheGeometryError, FamilyCacheGeometry, KvPlacement, RankCacheGeometry};
         let ranks = options.coordinator_ranks;
-        let attention = options.attention_placement.unwrap_or(if ranks == 1 {
-            AttentionPlacement::Heads
-        } else { AttentionPlacement::Layers });
+        let attention = options.attention_placement.unwrap_or(AttentionPlacement::Heads);
         let heads = ranks == 2 && attention == AttentionPlacement::Heads;
         if !(1..=2).contains(&ranks) || options.native_mtp_layers != 0
             || attention == AttentionPlacement::Context

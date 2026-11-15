@@ -43,6 +43,15 @@ pub(crate) struct ServeArgs {
     #[command(flatten)] pub api: crate::shared::api::ApiArgs,
 }
 
+fn attention_placement(peer: Option<i32>, requested: &str) -> Result<cuteafd_loader::placement::AttentionPlacement> {
+    use cuteafd_loader::placement::AttentionPlacement;
+    match (peer, requested) {
+        (_, "auto" | "heads") => Ok(AttentionPlacement::Heads),
+        (Some(_), "layers") => Ok(AttentionPlacement::Layers),
+        _ => anyhow::bail!("MiniMax layers attention requires two coordinator GPUs"),
+    }
+}
+
 impl ServeArgs {
     fn prefill(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
@@ -109,11 +118,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 device: worker_args.device, split_device: worker_args.split_device,
                 peers: &worker_args.peers, native_lib: &worker_args.native_lib,
                 manifest_path: &worker_args.manifest,
-                attention_placement: match (worker_args.split_device, worker_args.attention_placement.as_str()) {
-                    (Some(_), "heads") | (None, "auto" | "heads") => cuteafd_loader::placement::AttentionPlacement::Heads,
-                    (Some(_), "auto" | "layers") => cuteafd_loader::placement::AttentionPlacement::Layers,
-                    _ => anyhow::bail!("MiniMax layers attention requires two coordinator GPUs"),
-                },
+                attention_placement: attention_placement(worker_args.split_device, &worker_args.attention_placement)?,
                 split_wire: match worker_args.split_wire.as_str() {
                     "bf16" => super::dense::PartialPrecision::Bf16,
                     _ => super::dense::PartialPrecision::DEFAULT,
@@ -178,6 +183,18 @@ mod tests {
         assert!(fixed < native, "native loading syncs expert hidden size and fixes the process default");
         assert_eq!(source.matches("set_expert_geometry(").count(), 1);
         assert!(source.contains("super::startup::load("), "constructor still validates the same fixed geometry");
+    }
+
+    #[test]
+    fn auto_attention_matches_native_planner_on_one_and_two_rtx() -> Result<()> {
+        use cuteafd_loader::placement::AttentionPlacement;
+        for peer in [None, Some(1)] {
+            assert_eq!(attention_placement(peer, "auto")?, AttentionPlacement::Heads);
+            assert_eq!(attention_placement(peer, "heads")?, AttentionPlacement::Heads);
+        }
+        assert_eq!(attention_placement(Some(1), "layers")?, AttentionPlacement::Layers);
+        assert!(attention_placement(None, "layers").is_err());
+        Ok(())
     }
 
     #[test]

@@ -321,8 +321,8 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
         placement::{AttentionPlacement, Onboard, ResidentWeights, planner::{Context as ModelContext, Operation, PrefillShape}}};
     use cuteafd_api::openai::probe::{Probe, ProbeSpec};
     let (devices, wire) = split_selection(&args)?.context("MiniMax split golden peer missing")?;
-    let attention = if args.attention_placement == "heads" { AttentionPlacement::Heads }
-        else { AttentionPlacement::Layers };
+    let attention = if args.attention_placement == "layers" { AttentionPlacement::Layers }
+        else { AttentionPlacement::Heads };
     ensure!(!args.decode || args.tap_layers.is_empty(), "MiniMax split layer taps require prefill scoring");
     let manifest: Arc<serde_json::Value> = Arc::new(serde_json::from_slice(&std::fs::read(&args.manifest)?)?);
     let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;

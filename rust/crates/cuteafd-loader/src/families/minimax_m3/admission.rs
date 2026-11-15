@@ -257,9 +257,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
         .map_err(|error| refused(format!("MiniMax request capacities refused: {error}"),
             "Use concurrency 1..64 and prefill unit rows 1..4096."))?;
     let routed = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
-    let attention = request.attention.unwrap_or(if gpus == 2 {
-        crate::placement::AttentionPlacement::Layers
-    } else { crate::placement::AttentionPlacement::Heads });
+    let attention = request.attention.unwrap_or(crate::placement::AttentionPlacement::Heads);
     let heads = gpus == 2 && attention == crate::placement::AttentionPlacement::Heads;
     if attention == crate::placement::AttentionPlacement::Context
         || (gpus == 1 && attention != crate::placement::AttentionPlacement::Heads) {

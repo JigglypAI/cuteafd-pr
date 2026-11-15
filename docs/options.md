@@ -91,7 +91,8 @@ trace-free serving cards (#1856).
 Use a build containing MiniMax native exports: MXFP8 dense math, NVFP4 W4A4
 experts, FP8 MSA KV/index, GPU embedding and device token selection.
 On one RTX, `ATTENTION_PLACEMENT=auto|heads` selects whole ownership. On two RTX,
-`auto|layers` selects contiguous attention and FP32 split FFNs. Boot-C16 split
+`auto|heads` selects native head splitting with half KV and replicated index.
+Explicit `layers` keeps contiguous attention and FP32 split FFNs. Boot-C16 split
 router, FFN and fold/publication sections replay through the shared graph cache;
 attention and peer receive waits stay eager. Explicit two-RTX `heads` selects
 half KV with replicated index and native FP32 partials; context remains unsupported.
@@ -119,12 +120,31 @@ sections), plus one2MiB allocation tail each. The shared extra rule charges
 168/132MiB by default; Layers stays128/88MiB. Attention and exchange stay eager.
 Native512-row graph/eager logits and repeats are byte-identical. Quick generated
 fidelity uses the same Mid bars; layout-dependent reduction order can change
-quantization thresholds. Auto stays Layers pending a clean serving measurement.
+quantization thresholds. Two-RTX auto selects Heads (TJ, 2026-11-15); one RTX
+retains whole-layer execution, represented by the single-rank `heads` API value.
 The first short run measured Layers versus Heads-graphs C1/C16/8K at
 33.98/157.26/2215 versus 37.57/155.70/2336 tok/s, but host page reclaim
 contaminated the timing and the external cold-prefill probe aborted (#2132).
-These are not qualified default-selection figures. Quick generated KL was
+TJ selected Heads as the two-RTX default after reviewing both orders; the
+reclaim flags remain recorded, not erased. Quick generated KL was
 0.02346 versus 0.02469 and top-1 95.23% versus 94.94%; both pass the Mid bars.
+
+| Metric | Layers | Heads | Heads / Layers |
+| --- | ---: | ---: | ---: |
+| C1 code decode (tok/s) | 34.015 | 37.820 | 1.112 |
+| 8K prefill (tok/s) | 2218.95 | 2336.01 | 1.053 |
+| C16 confirm, Heads first (tok/s) | 235.400 | 284.182 | 1.207 |
+| C16 earlier, reclaim-contaminated (tok/s) | 226.723 | 218.695 | 0.965 |
+
+Both orders started at CPU/memory PSI 0/0; the confirm also started with zero
+page scans. Heads C16 still recorded host reclaim (13,693 pages/s confirm,
+31,090 earlier); these are observations with a user-approved default, not a
+reclaim-clean speed qualification. Power-cap and thermal slowdown were zero;
+max temperature 63 C, minimum T.Limit headroom 32 C. Named host allocations
+differ only by 120 KiB of expert-usage telemetry; both keep the same 32 GiB
+prefix host cache and identical pinned staging/RDMA rings. Replicated KV/index
+buffers live on-device. Startup non-file RSS differs by about 2.23 MiB;
+whole-host anonymous growth cannot be attributed to this process from these logs.
 
 `./run.sh` options:
 
@@ -175,7 +195,7 @@ Explicit two-RTX `heads` is supported with native FP32 O/FFN partial reductions
 and eager peer exchange. Decode Q/K/V/index projections, O projections, router
 and half-FFNs use the shared graph cache; context-sensitive attention and peer
 publish/wait/merge stay eager. `GPU_GRAPH_RESERVE=0` selects fully eager decode.
-`auto` stays `layers` pending serving performance gates.
+`auto` selects `heads` on two RTX; explicit `layers` remains available.
 Golden requires `--nll --golden DATASET --save-logits NEW_DIR`, a checkpoint snapshot,
 native library and program manifest, and four real Spark `--peers` endpoints.
 `--window ID[,ID...]` selects unique sealed quick-subset windows. `--prefill-rows` defaults
