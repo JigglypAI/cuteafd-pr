@@ -1716,10 +1716,11 @@ fn heads_cache_geometry_keeps_one_replicated_index_per_rank() {
     assert_eq!(automatic, geometry);
     for (gpu, rank) in geometry.ranks.into_iter().enumerate() {
         use crate::families::minimax_m3::execution::{HeadsLayout, MsaCache};
-        let native = MsaCache::for_heads(&HeadsLayout::new(&cfg, gpu as u8, 16).unwrap(),
+        let release = MiniMaxM3Config::from_hf(&serde_json::from_str(include_str!(
+            "../../../families/minimax_m3/fixtures/config.json")).unwrap()).unwrap();
+        let native = MsaCache::for_heads(&HeadsLayout::new(&release, gpu as u8, 16).unwrap(),
             1, 1, 64).unwrap();
-        let bytes = native.buffers().unwrap().into_iter().filter(|(name, _)| name.starts_with("layer."))
-            .map(|(_, bytes)| bytes).sum::<u64>();
+        let bytes = native.page_planes().into_iter().map(|(_, bytes)| bytes).sum::<u64>() * cfg.layers as u64;
         assert_eq!(rank.persistent_unit_bytes, bytes, "planner must charge the native scaled records");
         assert_eq!(bytes, 4 * (17408 + 17408 + 8448));
     }
