@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
-use crate::openai::chat::{glm5, qwen4};
+use crate::openai::chat::{glm5, inkling2, qwen4};
 use crate::openai::{router_for_model, ConsoleHub, ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
 
 const GOLDEN: &[(&str, &str)] = &[
@@ -23,6 +23,7 @@ const GOLDEN: &[(&str, &str)] = &[
     ("test-dsv4", "19aabcbc9ad50e7b3696841bcb44e05d7fea3eb7290a93813fc26e37082baa93"),
     ("test-glm", "e2b1abc92c411f08459fdda575486fafcc37cca4ea252423855d3b13887f261b"),
     ("test-qwen", "49c07547dd60c7ca8f1d27752215ba2c4253443b1183bc17dc2be34d3ba2dcd4"),
+    ("test-inkling", "08573b9a548a9c759f79a2d0f2149ac2c2017bb997e3df598b5dca045e89f09d"),
 ];
 
 fn profiles() -> Vec<ModelProfile> {
@@ -31,6 +32,7 @@ fn profiles() -> Vec<ModelProfile> {
         ModelProfile::new("test-dsv4", ModelEncoding::DeepseekV4),
         ModelProfile::new("test-glm", ModelEncoding::Glm(Arc::new(glm5::fixtures::encoding()))),
         ModelProfile::new("test-qwen", ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding()))),
+        ModelProfile::new("test-inkling", ModelEncoding::Inkling(Arc::new(inkling2::fixtures::encoding()))),
     ]
 }
 
@@ -118,11 +120,22 @@ async fn run(profile: &ModelProfile, body: &Value) -> String {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<NativeRequest>(1);
     let seen = Arc::new(Mutex::new(String::from("<not admitted>")));
     let witness = seen.clone();
+    let inkling = matches!(profile.encoding, ModelEncoding::Inkling(_));
     let worker = tokio::spawn(async move {
         if let Some(job) = rx.recv().await {
             job.prefix_cache_source.set(4, false);
             *witness.lock().unwrap() = describe(&job);
-            for chunk in chunks() { let _ = job.events.send(Ok(chunk)); }
+            for chunk in chunks() {
+                let chunk = match chunk {
+                    InferenceChunk::Text { content, content_tokens } if inkling => {
+                        let content = if content == "The answer" { format!("<|message_model|><|content_text|>{content}") }
+                            else { format!("{content}<|end_message|>") };
+                        InferenceChunk::Text { content, content_tokens }
+                    }
+                    chunk => chunk,
+                };
+                let _ = job.events.send(Ok(chunk));
+            }
         }
     });
     let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),

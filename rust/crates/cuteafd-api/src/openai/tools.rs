@@ -150,7 +150,7 @@ impl ToolConstraints {
                 ToolSyntax::InklingJson => json!({"type":"tag",
                     "begin":format!("<|message_model|>{}<|content_invoke_tool_json|>", tool.name),
                     "content":{"type":"ds41_json_schema", "strict":true, "json_schema":{
-                        "type":"object", "properties":{"name":{"const":tool.name}, "args":schema},
+                        "type":"object", "properties":{"name":{"const":tool.name}, "args":{"allOf":[{"type":"object"}, schema]}},
                         "required":["name", "args"], "additionalProperties":false}},
                     "end":"<|end_message|>"}),
                 ToolSyntax::MiniMaxXml => json!({"type":"tag",

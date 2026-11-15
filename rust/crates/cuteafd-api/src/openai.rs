@@ -1098,10 +1098,10 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             let options = inkling2::InklingPromptOptions {
                 tool_names: converted.conversation.tools.iter().map(|tool| tool.name.clone()).collect() };
             let prompt = encoding.render(&raw, &options).map_err(Rejection::bad)?;
-            let parser = inkling2::InklingOutputParser::new(inkling2::InklingParserOptions {
+            let parser = inkling2::InklingOutputParser::with_stream_args(inkling2::InklingParserOptions {
                 tools: (tools_declared && converted.conversation.tool_choice != deepseek_recipe_core::tools::ToolChoice::None)
                     .then(|| converted.conversation.tools.clone()),
-                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+                stop_sequences: converted.parsing_options.stop_sequences.clone() }, stream_args);
             (prompt, Vec::new(), OutputProcessor::Inkling(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::MiniMax(encoding), raw, _thinking)) => {
@@ -2168,6 +2168,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inkling_length_cuts_and_boundary_noise_preserve_http_finish_reason() {
+        for streaming in [false, true] {
+            for (wire, backend_finish, finish, text, reasoning) in [
+                ("<|message_model|><|content_text|>The hist", InferenceFinishReason::Length, "length", "The hist", ""),
+                ("<|message_model|><|content_thinking|>The hist", InferenceFinishReason::Length, "length", "", "The hist"),
+                ("\n<|content_text|>Hi<|end_message|>\n<|message_model|><|content_text|>there<|content_model_end_sampling|>",
+                    InferenceFinishReason::Stop, "stop", "Hithere", ""),
+            ] {
+                let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+                let worker = tokio::spawn(async move {
+                    let job = rx.recv().await.unwrap();
+                    job.events.send(Ok(InferenceChunk::Text { content: wire.into(), content_tokens: 8 })).unwrap();
+                    let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: backend_finish }));
+                });
+                let profile = ModelProfile::new("inkling-test", ModelEncoding::Inkling(Arc::new(inkling2::fixtures::encoding())));
+                let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                    std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+                let body = json!({"model":"inkling-test", "messages":[{"role":"user", "content":"Hi"}],
+                    "stream":streaming, "max_tokens":8});
+                let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+                if streaming {
+                    let response = std::str::from_utf8(&bytes).unwrap();
+                    assert!(response.contains("data: [DONE]"), "{response}");
+                    let events: Vec<Value> = response.split("\n\n").filter_map(|frame| frame.strip_prefix("data: "))
+                        .filter_map(|data| serde_json::from_str(data).ok()).collect();
+                    let content: String = events.iter().filter_map(|event| event["choices"][0]["delta"]["content"].as_str()).collect();
+                    let thought: String = events.iter().filter_map(|event| event["choices"][0]["delta"]["reasoning_content"].as_str()).collect();
+                    assert_eq!((content.as_str(), thought.as_str()), (text, reasoning));
+                    assert!(events.iter().any(|event| event["choices"][0]["finish_reason"] == finish));
+                } else {
+                    let value: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(value["choices"][0]["finish_reason"], finish);
+                    assert_eq!(value["choices"][0]["message"]["content"].as_str().unwrap_or(""), text);
+                    assert_eq!(value["choices"][0]["message"]["reasoning_content"].as_str().unwrap_or(""), reasoning);
+                }
+                worker.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn inkling_malformed_or_truncated_output_is_an_error_not_a_partial_call() {
         for streaming in [false, true] {
             for wire in ["<|message_model|>read_file<|content_invoke_tool_json|>{bad}<|end_message|>",
@@ -2191,7 +2236,7 @@ mod tests {
                     assert_eq!(status, StatusCode::OK);
                     let text = std::str::from_utf8(&bytes).unwrap();
                     assert!(text.contains("native_v41_error") && text.contains("Inkling"), "{text}");
-                    assert!(!text.contains("data: [DONE]") && !text.contains("\"tool_calls\""), "{text}");
+                    assert!(!text.contains("data: [DONE]") && !text.contains("\"finish_reason\":\"tool_calls\""), "{text}");
                 } else {
                     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{}", String::from_utf8_lossy(&bytes));
                     let value: Value = serde_json::from_slice(&bytes).unwrap();

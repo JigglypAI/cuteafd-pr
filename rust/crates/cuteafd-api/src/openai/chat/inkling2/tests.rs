@@ -128,8 +128,7 @@ fn channels_stream_before_close_and_stops_only_match_visible_text() {
 
 #[test]
 fn malformed_and_truncated_native_output_return_typed_errors_without_calls() {
-    for wire in ["plain text", "<|message_user|>", "<|message_model|><|content_unknown|>",
-        "<|content_invoke_tool_json|>not JSON<|end_message|>",
+    for wire in ["<|content_invoke_tool_json|>not JSON<|end_message|>",
         "<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":[]}<|end_message|>",
         "<|content_invoke_tool_json|>{\"name\":\"unknown\",\"args\":{}}<|end_message|>",
         "<|message_model|>wrong<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{}}<|end_message|>"] {
@@ -137,8 +136,7 @@ fn malformed_and_truncated_native_output_return_typed_errors_without_calls() {
         assert!(parser.push(wire).is_err(), "{wire}");
         assert!(parser.error().is_some()); assert_eq!(parser.tool_calls(), 0);
     }
-    for wire in ["<|message_mod", "<|message_model|>read_file", "<|content_text|>cut",
-        "<|content_thinking|>cut", "<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{}"] {
+    for wire in ["<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{}"] {
         let mut parser = InklingOutputParser::new(options());
         parser.push(wire).unwrap();
         assert!(matches!(parser.finish(), Err(InklingParseError::Truncated(_))), "{wire}");
@@ -157,4 +155,74 @@ fn constraints_use_only_inkling_channels_and_json_arguments() {
     assert!(wire.contains("ds41_json_schema"));
     assert!(!wire.contains("<tool_call>"));
     assert!(inkling_response_constraint(None, None).unwrap().is_none());
+}
+
+#[test]
+fn ordinary_channel_cuts_flush_and_boundary_noise_is_ignored_at_every_split() {
+    for (wire, text, reasoning) in [
+        ("<|message_model|><|content_text|>The hist", "The hist", ""),
+        ("<|message_model|><|content_thinking|>The hist", "", "The hist"),
+        ("\n<|message_model|><|content_text|>Hi<|end_message|>\n<|message_model|><|content_text|>there<|end_message|>", "Hithere", ""),
+        ("noise<|unknown|>\n<|content_text|>Hi<|content_model_end_sampling|>", "Hi", ""),
+        ("<|content_thinking|>Plan<|content_model_end_sampling|>", "", "Plan"),
+        ("<|content_text|>partial<|end_mes", "partial<|end_mes", ""),
+    ] {
+        for index in 0..=wire.len() {
+            let result = parsed(&[&wire[..index], &wire[index..]], options());
+            assert_eq!((result.0.as_str(), result.1.as_str()), (text, reasoning), "{wire} at {index}");
+        }
+    }
+}
+
+#[test]
+fn tool_arguments_stream_before_close_and_match_buffered_bytes_at_every_split() {
+    let wire = concat!("<|message_model|>read_file<|content_invoke_tool_json|>",
+        "{\"name\":\"read_file\",\"args\": {\"path\": \"README.md\", \"nested\": {\"z\": [1, true], \"quote\": \"}\\\"\"}}}",
+        "<|end_message|><|content_model_end_sampling|>");
+    fn collect(parts: &[&str], streaming: bool) -> Vec<(String, String)> {
+        let mut parser = InklingOutputParser::with_stream_args(options(), streaming);
+        let mut calls: Vec<(String, String)> = Vec::new();
+        let mut outputs = Vec::new();
+        for part in parts { outputs.extend(parser.push(part).unwrap()); }
+        outputs.extend(parser.finish().unwrap());
+        for output in outputs {
+            match output {
+                OutputChunk::ToolCall { tool_name, arguments } => calls.push((tool_name, arguments)),
+                OutputChunk::ToolArgumentsDelta { content } => calls.last_mut().unwrap().1.push_str(&content),
+                OutputChunk::ToolCallBegin => {}
+                _ => panic!("unexpected chunk"),
+            }
+        }
+        assert_eq!(parser.tool_calls(), calls.len());
+        calls
+    }
+    let expected = collect(&[wire], false);
+    assert_eq!(expected.len(), 1);
+    let parallel = format!("{}{}", wire.strip_suffix(EOS).unwrap(), wire);
+    assert_eq!(collect(&[&parallel], true), collect(&[&parallel], false));
+    let reordered = "<|content_invoke_tool_json|>{\"args\":{\"path\":\"README.md\"},\"name\":\"read_file\"}<|end_message|>";
+    assert_eq!(collect(&[reordered], true), collect(&[reordered], false));
+    for index in 0..=wire.len() {
+        assert_eq!(collect(&[&wire[..index], &wire[index..]], true), expected, "split {index}");
+    }
+    let parts: Vec<_> = (0..wire.len()).map(|index| &wire[index..index + 1]).collect();
+    assert_eq!(collect(&parts, true), expected);
+    let mut parser = InklingOutputParser::with_stream_args(options(), true);
+    let prefix = wire.split("README.md").next().unwrap();
+    let outputs = parser.push(prefix).unwrap();
+    assert!(outputs.iter().any(|output| matches!(output, OutputChunk::ToolArgumentsDelta { content } if content.contains("path"))));
+    assert!(matches!(parser.finish(), Err(InklingParseError::Truncated("tool call"))));
+}
+
+#[test]
+fn strict_parameterless_tool_schema_still_requires_object_arguments() {
+    use crate::openai::tools::{ToolConstraints, ToolSyntax};
+    use deepseek_recipe_core::tools::ToolChoice;
+    let mut empty = tool(); empty.parameters = json!({}); empty.strict = Some(true);
+    let constraints = ToolConstraints::new(&[empty], ToolChoice::Auto, true, true, true, ToolSyntax::InklingJson).unwrap().unwrap();
+    let schema = &constraints.format.as_ref().unwrap()["tags"][0]["content"]["json_schema"];
+    let validator = jsonschema::JSONSchema::compile(schema).unwrap();
+    assert!(validator.is_valid(&json!({"name":"read_file", "args":{}})));
+    assert!(!validator.is_valid(&json!({"name":"read_file", "args":[]})));
+    assert!(!validator.is_valid(&json!({"name":"read_file", "args":"bad"})));
 }

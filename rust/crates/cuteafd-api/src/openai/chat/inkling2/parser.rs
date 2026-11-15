@@ -3,7 +3,7 @@ use deepseek_recipe::stream::OutputChunk;
 use deepseek_recipe_core::tools::ToolDefinition;
 use serde_json::Value;
 use crate::openai::chat::glm5::{parser::GlmStop, TextParser};
-use crate::openai::chat::stream_args::held_prefix;
+use crate::openai::chat::stream_args::{ArgStream, held_prefix};
 use super::{CALL, END, EOS, MODEL, TEXT, THINK};
 
 #[derive(Debug, Clone, Default)]
@@ -25,6 +25,41 @@ pub enum InklingParseError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode { Boundary, Header, Thinking, Text, Call, Done }
 
+#[derive(Debug, Default)]
+struct Arguments {
+    start: usize,
+    scanned: usize,
+    depth: usize,
+    in_string: bool,
+    escape: bool,
+    closed: bool,
+}
+
+impl Arguments {
+    fn advance(&mut self, call: &str) -> usize {
+        if self.closed { return self.scanned; }
+        for byte in call.as_bytes()[self.scanned..].iter().copied() {
+            self.scanned += 1;
+            if self.in_string {
+                if self.escape { self.escape = false; }
+                else if byte == b'\\' { self.escape = true; }
+                else if byte == b'"' { self.in_string = false; }
+            } else {
+                match byte {
+                    b'"' => self.in_string = true,
+                    b'{' => self.depth += 1,
+                    b'}' => {
+                        self.depth = self.depth.saturating_sub(1);
+                        if self.depth == 0 { self.closed = true; break; }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.scanned
+    }
+}
+
 #[derive(Debug)]
 pub struct InklingOutputParser {
     options: InklingParserOptions,
@@ -35,13 +70,18 @@ pub struct InklingOutputParser {
     calls: usize,
     stop: Option<GlmStop>,
     error: Option<InklingParseError>,
+    stream_args: ArgStream,
+    arguments: Option<Arguments>,
 }
 
 impl InklingOutputParser {
-    pub fn new(mut options: InklingParserOptions) -> Self {
+    pub fn new(options: InklingParserOptions) -> Self { Self::with_stream_args(options, false) }
+
+    pub fn with_stream_args(mut options: InklingParserOptions, stream_args: bool) -> Self {
         options.stop_sequences.retain(|text| !text.is_empty());
         Self { options, mode: Mode::Boundary, pending: String::new(), recipient: String::new(),
-            call: String::new(), calls: 0, stop: None, error: None }
+            call: String::new(), calls: 0, stop: None, error: None,
+            stream_args: ArgStream::new(stream_args), arguments: None }
     }
 
     pub fn push(&mut self, text: &str) -> Result<Vec<OutputChunk>, InklingParseError> {
@@ -53,16 +93,17 @@ impl InklingOutputParser {
         result
     }
 
-    /// EOS is often removed by the backend; a complete channel boundary is sufficient.
+    /// Length/EOF may end ordinary text or reasoning mid-channel. Only an
+    /// incomplete tool call is a protocol error; never publish it as valid JSON.
     pub fn finish(&mut self) -> Result<Vec<OutputChunk>, InklingParseError> {
         if let Some(error) = &self.error { return Err(error.clone()); }
-        let result = self.drain(true).and_then(|outputs| {
-            if self.mode != Mode::Done && (self.mode != Mode::Boundary || !self.pending.is_empty()) {
-                return Err(InklingParseError::Truncated(match self.mode {
-                    Mode::Call => "tool call", Mode::Thinking | Mode::Text => "content channel",
-                    _ => "message header",
-                }));
+        let result = self.drain(true).and_then(|mut outputs| {
+            if self.mode == Mode::Call { return Err(InklingParseError::Truncated("tool call")); }
+            if matches!(self.mode, Mode::Text | Mode::Thinking) {
+                let tail = std::mem::take(&mut self.pending);
+                self.emit(tail, &mut outputs);
             }
+            self.pending.clear();
             Ok(outputs)
         });
         if let Err(error) = &result { self.error = Some(error.clone()); }
@@ -109,15 +150,21 @@ impl InklingOutputParser {
                 self.recipient.push_str(&self.pending[..index]);
                 self.pending.drain(..index);
             } else if marker_at != Some(0) {
-                if !final_chunk && "<|".starts_with(&self.pending) { break; }
-                return Err(InklingParseError::Unexpected("expected a model/channel marker".into()));
+                // response_template ignores text outside recognized channels.
+                let drop = marker_at.unwrap_or_else(|| self.pending.len() -
+                    if final_chunk { 0 } else { held_prefix(&self.pending, "<|") });
+                self.pending.drain(..drop);
+                if drop == 0 { break; }
+                continue;
             }
             let Some(end) = self.pending.find("|>") else { break };
             let marker = self.pending[..end + 2].to_owned();
             self.pending.drain(..end + 2);
+            // Like the checkpoint response_template, native marker text inside a
+            // JSON string is a known limit: decoded special markers are structural.
             match (self.mode, marker.as_str()) {
-                (Mode::Boundary, MODEL) => { self.mode = Mode::Header; self.recipient.clear(); }
-                (Mode::Boundary, EOS) => {
+                (Mode::Boundary | Mode::Header, MODEL) => { self.mode = Mode::Header; self.recipient.clear(); }
+                (Mode::Boundary | Mode::Header | Mode::Text | Mode::Thinking, EOS) => {
                     self.mode = Mode::Done;
                     self.stop = Some(GlmStop::Marker(EOS.into()));
                     self.pending.clear();
@@ -126,13 +173,16 @@ impl InklingOutputParser {
                 (Mode::Boundary | Mode::Header, TEXT | "<|content_tool_error|>" | "<|content_invoke_tool_text|>") => {
                     self.mode = Mode::Text;
                 }
-                (Mode::Boundary | Mode::Header, CALL) => { self.mode = Mode::Call; self.call.clear(); }
+                (Mode::Boundary | Mode::Header, CALL) => {
+                    self.mode = Mode::Call; self.call.clear(); self.arguments = None;
+                }
                 (Mode::Thinking | Mode::Text, END) => { self.mode = Mode::Boundary; self.recipient.clear(); }
                 (Mode::Call, END) => {
-                    out.push(self.complete_call()?);
+                    self.complete_call(&mut out)?;
                     self.mode = Mode::Boundary;
                     self.recipient.clear();
                 }
+                (Mode::Boundary | Mode::Header, _) => { self.mode = Mode::Boundary; self.recipient.clear(); }
                 _ => return Err(InklingParseError::Unexpected(marker)),
             }
         }
@@ -144,22 +194,70 @@ impl InklingOutputParser {
         match self.mode {
             Mode::Text => out.push(OutputChunk::Raw { content }),
             Mode::Thinking => out.push(OutputChunk::Reasoning { content }),
-            Mode::Call => self.call.push_str(&content),
+            Mode::Call => {
+                self.call.push_str(&content);
+                if !self.stream_args.enabled() { return; }
+                if self.arguments.is_none() {
+                    if let Some((name, start)) = arguments_prefix(&self.call) {
+                        if self.valid_name(&name).is_err() { return; }
+                        self.stream_args.begin(out);
+                        self.stream_args.call(&name, out);
+                        self.arguments = Some(Arguments { start, scanned: start, ..Arguments::default() });
+                    }
+                }
+                if let Some(arguments) = self.arguments.as_mut() {
+                    let start = arguments.scanned;
+                    let end = arguments.advance(&self.call);
+                    self.stream_args.delta(&self.call[start..end], out);
+                }
+            }
             _ => {}
         }
     }
 
-    fn complete_call(&mut self) -> Result<OutputChunk, InklingParseError> {
+    fn valid_name(&self, name: &str) -> Result<(), InklingParseError> {
         let invalid = |message: &str| InklingParseError::ToolCall(message.into());
-        let value: Value = serde_json::from_str(&self.call).map_err(|error| invalid(&error.to_string()))?;
-        let name = value["name"].as_str().filter(|name| !name.is_empty()).ok_or_else(|| invalid("name must be a nonempty string"))?;
-        let args = value.get("args").filter(|value| value.is_object()).ok_or_else(|| invalid("args must be an object"))?;
+        if name.is_empty() { return Err(invalid("name must be a nonempty string")); }
         if !self.recipient.is_empty() && self.recipient != name { return Err(invalid("header and JSON names disagree")); }
         if !self.options.tools.as_ref().is_some_and(|tools| tools.iter().any(|tool| tool.name == name)) {
             return Err(invalid("undeclared tool"));
         }
+        Ok(())
+    }
+
+    fn complete_call(&mut self, out: &mut Vec<OutputChunk>) -> Result<(), InklingParseError> {
+        let invalid = |message: &str| InklingParseError::ToolCall(message.into());
+        let value: Value = serde_json::from_str(&self.call).map_err(|error| invalid(&error.to_string()))?;
+        let name = value["name"].as_str().ok_or_else(|| invalid("name must be a string"))?;
+        let args = value.get("args").filter(|value| value.is_object()).ok_or_else(|| invalid("args must be an object"))?;
+        self.valid_name(name)?;
+        if self.arguments.is_none() {
+            // Noncanonical key order can put args before name; buffer that case.
+            let arguments = if let Some((_, start)) = arguments_prefix(&self.call) {
+                let mut scan = Arguments { start, scanned: start, ..Arguments::default() };
+                let end = scan.advance(&self.call);
+                self.call[scan.start..end].to_owned()
+            } else { args.to_string() };
+            out.push(OutputChunk::ToolCall { tool_name: name.to_owned(), arguments });
+        }
         self.calls += 1;
-        Ok(OutputChunk::ToolCall { tool_name: name.to_owned(), arguments: args.to_string() })
+        Ok(())
+    }
+}
+
+/// Locate args after a complete name without parsing the unfinished argument
+/// object. Once found, Arguments scans each arriving byte exactly once.
+fn arguments_prefix(call: &str) -> Option<(String, usize)> {
+    let mut parser = jiter::Jiter::new(call.as_bytes());
+    let mut key = parser.next_object().ok()??.to_owned();
+    let mut name = None;
+    loop {
+        if key == "name" { name = Some(parser.next_str().ok()?.to_owned()); }
+        else if key == "args" {
+            if parser.peek().ok()? != jiter::Peek::Object { return None; }
+            return Some((name?, parser.current_index()));
+        } else { parser.next_skip().ok()?; }
+        key = parser.next_key().ok()??.to_owned();
     }
 }
 
