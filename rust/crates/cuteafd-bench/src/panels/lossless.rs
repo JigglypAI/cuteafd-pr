@@ -20,6 +20,8 @@ pub const TOKENS: u64 = 128;
 pub const DEFAULT_NAME: &str = "spec-lossless-set-v1";
 const DEFAULT: &str = include_str!("../../../../../scripts/bench/fixtures/spec-lossless-set-v1.json");
 const MAX_CASES: usize = 64;
+/// Most cases in flight at once per arm.
+pub const MAX_CONCURRENCY: usize = 64;
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
 const MAX_NONCE_CHARS: usize = 128;
 
@@ -352,30 +354,68 @@ fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Resul
         std::fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
         Ok(dir)
     }).transpose()?;
+    let n = ctx.lossless_concurrency.max(1);
+    let arm_spec = |case: &Case, off: bool| {
+        let mut spec = spec(off);
+        if let (Some((d, _)), Some(dir)) = (dump.filter(|(d, _)| d.cases.contains(&case.id)), &run_dir) {
+            spec.dump_rows = Some(dir.join(&case.id).join(if off { "off" } else { "on" }));
+            spec.dump_window = Some([d.start, d.end]);
+        }
+        spec
+    };
+    // All drafts-on requests in waves of `n`, then all drafts-off ones: the arms never overlap.
+    let total = set.cases.len();
+    let mut waves = Vec::new();
+    let mut arms: [Vec<Option<ProbeRecord>>; 2] = [vec![None; total], vec![None; total]];
+    // N = 1 keeps today's order (each case's on then off); N > 1 runs the arms apart.
+    let mut schedule: Vec<(bool, std::ops::Range<usize>)> = Vec::new();
+    if n == 1 {
+        schedule.extend((0..total).flat_map(|i| [(false, i..i + 1), (true, i..i + 1)]));
+    } else {
+        for off in [false, true] {
+            schedule.extend((0..total).step_by(n).map(|i| (off, i..(i + n).min(total))));
+        }
+    }
+    {
+        for (w, (off, range)) in schedule.into_iter().enumerate() {
+            let label = if off { "off" } else { "on" };
+            let wave = &set.cases[range.clone()];
+            ctx.progress.step(w as f64 / (2.0 * total as f64 / wave.len() as f64).max(1.0),
+                format!("lossless {label} {}-{}/{total}", range.start + 1, range.end));
+            let in_flight = std::sync::atomic::AtomicUsize::new(0);
+            let max = std::sync::atomic::AtomicUsize::new(0);
+            let results: Vec<Result<ProbeRecord>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = wave.iter().map(|case| {
+                    let (in_flight, max, spec) = (&in_flight, &max, arm_spec(case, off));
+                    scope.spawn(move || -> Result<ProbeRecord> {
+                        use std::sync::atomic::Ordering::SeqCst;
+                        max.fetch_max(in_flight.fetch_add(1, SeqCst) + 1, SeqCst);
+                        let reply = ctx.client.chat(plain(ctx.client, &case.text(), TOKENS), Some(spec));
+                        in_flight.fetch_sub(1, SeqCst);
+                        let reply = reply.with_context(|| format!("{} drafts {label}", case.id))?;
+                        Ok(probe_of(&reply)?.clone())
+                    })
+                }).collect();
+                handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("request thread panicked")))).collect()
+            });
+            for (i, result) in range.clone().zip(results) {
+                let record = result?;
+                if !off {
+                    anyhow::ensure!(honoured(&record), "this engine does not run benchmark probes");
+                }
+                arms[off as usize][i] = Some(record);
+            }
+            waves.push(json!({"arm": label, "wave": w, "cases": wave.len(),
+                "max_in_flight": max.load(std::sync::atomic::Ordering::SeqCst)}));
+        }
+    }
     let mut dumped = Vec::new();
     let mut verdicts = Vec::new();
     let mut kept = serde_json::Map::new();
     for (i, case) in set.cases.iter().enumerate() {
-        ctx.progress.step(i as f64 / set.cases.len() as f64, format!("lossless {} ({}/{})", case.id, i + 1,
-            set.cases.len()));
-        let text = case.text();
         let selected = dump.filter(|(d, _)| d.cases.contains(&case.id)).map(|(d, _)| d);
-        let arm = |off: bool| {
-            let mut spec = spec(off);
-            if let (Some(d), Some(dir)) = (selected, &run_dir) {
-                spec.dump_rows = Some(dir.join(&case.id).join(if off { "off" } else { "on" }));
-                spec.dump_window = Some([d.start, d.end]);
-            }
-            spec
-        };
-        let on = ctx.client.chat(plain(ctx.client, &text, TOKENS), Some(arm(false)))
-            .with_context(|| format!("{} drafts on", case.id))?;
-        let on = probe_of(&on)?.clone();
-        anyhow::ensure!(honoured(&on), "this engine does not run benchmark probes");
-        let off = ctx.client.chat(plain(ctx.client, &text, TOKENS), Some(arm(true)))
-            .with_context(|| format!("{} drafts off", case.id))?;
-        let off = probe_of(&off)?.clone();
-        let mut verdict = judge(&case.id, &on, &off);
+        let (on, off) = (arms[0][i].as_ref().unwrap(), arms[1][i].as_ref().unwrap());
+        let mut verdict = judge(&case.id, on, off);
         if verdict.pass && !(on.cold && off.cold && off.no_speculation && !on.no_speculation) {
             verdict.pass = false;
             verdict.reason = "the engine did not honour cold / drafts-off as asked".into();
@@ -384,18 +424,21 @@ fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Resul
             dumped.push(json!({"id": case.id, "nonce": case.nonce, "prompt_tokens": off.prompt_ids.len(),
                 "first_token_divergence": verdict.first_token_divergence,
                 "first_row_divergence": verdict.first_row_divergence,
-                "on": dumped_arm(&format!("{}/on", case.id), &on, d),
-                "off": dumped_arm(&format!("{}/off", case.id), &off, d)}));
+                "on": dumped_arm(&format!("{}/on", case.id), on, d),
+                "off": dumped_arm(&format!("{}/off", case.id), off, d)}));
             let manifest = json!({"set": {"name": set.name, "sha256": set.sha256}, "speculator": speculator,
                 "window": {"start": d.start, "end": d.end}, "hash": "FNV-1a 64 of the raw f32 logits row",
                 "cases": dumped});
             std::fs::write(dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
         }
-        kept.insert(case.id.clone(), evidence(&ctx.info.configuration, case, &on, &off));
+        kept.insert(case.id.clone(), evidence(&ctx.info.configuration, case, on, off));
         verdicts.push(verdict);
         ctx.progress.partial(aggregate(set, &speculator, &verdicts, serde_json::Map::new()));
     }
     let mut value = aggregate(set, &speculator, &verdicts, kept);
+    if n > 1 {
+        value["concurrency"] = json!({"n": n, "waves": waves});
+    }
     if let Some(dir) = run_dir {
         value["row_dump"] = json!({"dir": dir, "manifest": dir.join("manifest.json")});
     }
@@ -457,7 +500,12 @@ mod tests {
 
     fn run_fake(set: &CaseSet, dump: Option<(&RowDump, &std::path::Path)>) -> (Value, Vec<ProbeSpec>) {
         let (base, engine) = fake_engine(set.cases.len() * 2);
-        let mut client = crate::client::Client::new(&base, None, std::sync::Arc::new(Default::default())).with_local_probes();
+        let value = run_against(&base, set, dump, 1);
+        (value, engine.join().unwrap())
+    }
+
+    fn run_against(base: &str, set: &CaseSet, dump: Option<(&RowDump, &std::path::Path)>, concurrency: usize) -> Value {
+        let mut client = crate::client::Client::new(base, None, std::sync::Arc::new(Default::default())).with_local_probes();
         client.model = "fake".into();
         let mut info = ServerInfo::default();
         info.configuration.speculator = Some("dflash".into());
@@ -465,9 +513,77 @@ mod tests {
         let context_load = crate::panels::context_load::Options::default();
         let ctx = Ctx { client: &client, info: &info, baseline: None, rates: Rates::default(), progress: &progress,
             pass: 1, history: &[], max_context: 8192, max_output: 4096, lossless_set: Some(set),
-            lossless_dump: dump.map(|(d, _)| d), context_load: &context_load };
-        let value = run_cases(&ctx, dump).unwrap();
-        (value, engine.join().unwrap())
+            lossless_dump: dump.map(|(d, _)| d), lossless_concurrency: concurrency, context_load: &context_load };
+        run_cases(&ctx, dump).unwrap()
+    }
+
+    /// A threaded fake engine that holds each request until `hold` are in flight (or a timeout), so
+    /// overlap is observable; records the peak and, per request, the arm and the order of arrival.
+    fn overlapping_engine(requests: usize, hold: usize)
+        -> (String, std::thread::JoinHandle<(usize, Vec<bool>)>) {
+        use std::io::{BufRead, Read, Write};
+        use std::sync::{atomic::{AtomicUsize, Ordering::SeqCst}, Arc, Mutex};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (live, peak, arms) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(Vec::new())));
+        let (p2, a2) = (peak.clone(), arms.clone());
+        let join = std::thread::spawn(move || {
+          let handles: Vec<_> = (0..requests).map(|_| listener.accept().unwrap().0).map(|mut socket| {
+            let (live, peak, arms) = (live.clone(), peak.clone(), arms.clone());
+            std::thread::spawn(move || {
+                let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+                let (mut id, mut length) = (String::new(), 0usize);
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" { break; }
+                    let lower = line.to_lowercase();
+                    if let Some(v) = lower.strip_prefix(&format!("{}:", cuteafd_api::openai::probe::HEADER)) { id = v.trim().into(); }
+                    if let Some(v) = lower.strip_prefix("content-length:") { length = v.trim().parse().unwrap(); }
+                }
+                reader.read_exact(&mut vec![0; length]).unwrap();
+                let probe = cuteafd_api::openai::probe::registry().claim(&id).expect("registered probe");
+                peak.fetch_max(live.fetch_add(1, SeqCst) + 1, SeqCst);
+                arms.lock().unwrap().push(probe.spec.no_speculation);
+                let start = std::time::Instant::now();
+                while live.load(SeqCst) < hold && start.elapsed() < std::time::Duration::from_millis(1500) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                probe.admitted("fake", &[9; 10], 0);
+                for i in 0..TOKENS as usize {
+                    probe.row(10 + i, &[2.0, 1.0, 0.5, i as f32 * 1e-3]);
+                    probe.token(0);
+                }
+                live.fetch_sub(1, SeqCst);
+                let event = json!({"choices": [{"delta": {"content": "x"}, "finish_reason": "stop"}]});
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                    data: {event}\n\ndata: [DONE]\n\n").unwrap();
+            })
+        }).collect();
+          for h in handles { h.join().unwrap(); }
+          (p2.load(SeqCst), a2.lock().unwrap().clone())
+        });
+        (base, join)
+    }
+
+    #[test]
+    fn concurrency_overlaps_requests_per_arm_and_still_compares_each_case() {
+        let s = set(8);
+        let (base, engine) = overlapping_engine(s.cases.len() * 2, 4);
+        let value = run_against(&base, &s, None, 4);
+        let (peak, arms) = engine.join().unwrap();
+        assert_eq!(peak, 4);
+        assert_eq!(value["gate"], "pass");
+        assert_eq!(value["total"], 8);
+        assert_eq!(value["concurrency"]["n"], 4);
+        let waves = value["concurrency"]["waves"].as_array().unwrap();
+        assert_eq!(waves.len(), 4);
+        assert!(waves.iter().all(|w| w["max_in_flight"] == 4 && w["cases"] == 4), "{waves:?}");
+        assert_eq!(waves.iter().map(|w| w["arm"].as_str().unwrap()).collect::<Vec<_>>(), ["on", "on", "off", "off"]);
+        // ON never runs alongside OFF: every on request arrives before any off one.
+        assert_eq!(arms, [vec![false; 8], vec![true; 8]].concat());
+        assert_eq!(value["rows"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect::<Vec<_>>(),
+            (0..8).map(|i| format!("c{i}")).collect::<Vec<_>>());
     }
 
     #[test]

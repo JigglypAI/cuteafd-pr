@@ -120,6 +120,8 @@ pub struct Ctx<'a> {
     pub lossless_set: Option<&'a lossless::CaseSet>,
     /// Opt-in full-vocabulary row dumps for selected lossless cases.
     pub lossless_dump: Option<&'a lossless::RowDump>,
+    /// Cases in flight at once per arm in `spec_lossless_set` (1: one at a time).
+    pub lossless_concurrency: usize,
     pub context_load: &'a context_load::Options,
 }
 
