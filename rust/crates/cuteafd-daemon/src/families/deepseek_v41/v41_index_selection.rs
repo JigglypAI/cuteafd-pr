@@ -1195,7 +1195,7 @@ mod graph_tests {
         let query = IndexQueryGeometry { layer: 2, packed: buffer(0x1000, 2048),
             scales: buffer(0x2000, 128), head_weights: buffer(0x3000, 64) };
         let mut bank = GraphBank::<Vec<usize>, ()>::new();
-        bank.attach_device_for_test(-164_404, 48, Site { name: "index_selection", cycle: Cycle::Decode,
+        bank.attach_device_for_test(-164_404, 64 << 20, Site { name: "index_selection", cycle: Cycle::Decode,
             preference: Preference::Capture, bootstrap: 16, basis: Basis::Bytes, spans_devices: false })?;
         let key = |length: usize| selection_fingerprint(&query, &[], None, 1,
             length.div_ceil(tile_width(length, DECODE_WIDTH_BUCKET)).max(1),
@@ -1214,7 +1214,8 @@ mod graph_tests {
         let ticket = bank.cache_ticket(&short, false, None).context("remaining reserve")?;
         bank.cache_commit(short.clone(), (), ticket, 3, 1, false);
         bank.cache_measured(16);
-        assert!(bank.cache_ticket(&key(1024)?, false, None).is_none(), "full reserve chooses eager");
+        let pending = bank.cache_ticket(&key(1024)?, false, None).context("below measured hard remains capturable")?;
+        drop(pending);
         // SAFETY: these fixture owners contain no pointers or captured allocations.
         unsafe { bank.cache_evict_persistent(); }
         assert!(bank.cache_ticket(&key(1024)?, false, None).is_some());

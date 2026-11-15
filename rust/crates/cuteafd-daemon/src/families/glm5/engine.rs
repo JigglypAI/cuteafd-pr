@@ -1744,21 +1744,18 @@ impl<'a> GlmEngine<'a> {
             .map(|(free, _)| free as u64))).collect()
     }
 
-    fn graph_boundary(&self, before: &[u64]) -> Result<()> {
-        let needs = self.graphs.borrow().cache_needs_boundary()
-            || self.peer.as_ref().is_some_and(|peer| peer.graphs.borrow().cache_needs_boundary());
-        if !needs { return Ok(()) }
-        // All rank submissions are queued now. A per-segment sync deadlocks
-        // cross-rank waits; this completed step is the measurement boundary.
-        let after = self.graph_memory_samples()?;
+    fn graph_boundary(&self, _before: &[u64]) -> Result<()> {
         for rank in 0..self.ranks() {
-            let graphs = if rank == 0 { &self.graphs } else { &self.peer()?.graphs };
-            graphs.borrow_mut().cache_measured(before[rank].saturating_sub(after[rank].free));
-            self.on(rank, || graphs.borrow_mut().cache_drain(|| Ok(()), || {
-                let (free, _) = self.library.cuda_physical_memory_info()?;
-                Ok(crate::shared::decode_graph::device::ReleaseMeasurement {
-                    released: (free as u64).saturating_sub(after[rank].free) })
-            }))?;
+            let stream = self.stream_of(rank);
+            // SAFETY: the complete multi-rank step has queued all consumers.
+            self.on(rank, || unsafe { self.library.cuda_stream_synchronize(stream) })?;
+        }
+        for rank in 0..self.ranks() {
+            let graphs = if rank == 0 { &self.graphs } else { &self.peer.as_ref().unwrap().graphs };
+            graphs.borrow_mut().cache_tick();
+            crate::shared::decode_graph::device::observe_device(&self.library, self.peer.as_ref().filter(|_| rank == 1).map_or(self.device, |peer| peer.device))?;
+            self.on(rank, || graphs.borrow_mut().cache_drain(|| Ok(()), ||
+                Ok(crate::shared::decode_graph::device::ReleaseMeasurement { released: 0 })))?;
         }
         Ok(())
     }

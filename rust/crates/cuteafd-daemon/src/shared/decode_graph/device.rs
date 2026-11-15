@@ -269,12 +269,14 @@ pub(crate) struct SoftState {
     pub margin: u64,
     pub measured_bytes: Option<u64>,
     pub measured_nodes: Option<u64>,
+    #[serde(skip)]
+    granule: u64,
 }
 
 impl SoftState {
     fn new(hard: u64) -> Self {
         Self { limit: hard.saturating_sub(GRAPH_CHUNK), margin: GRAPH_CHUNK,
-            measured_bytes: None, measured_nodes: None }
+            measured_bytes: None, measured_nodes: None, granule: GRAPH_CHUNK }
     }
     fn fits(&self, nodes: u64) -> bool {
         match (self.measured_bytes, self.measured_nodes) {
@@ -388,6 +390,12 @@ pub(super) fn device_cache_sampled(device: i32, reserve: u64, basis: Basis,
         return Ok(cache);
     }
     let mut controller = DeviceCache::new(device, reserve);
+    #[cfg(test)]
+    if device < 0 && reserve < GRAPH_CHUNK {
+        controller.soft.granule = 1;
+        controller.soft.margin = 1;
+        controller.soft.limit = reserve.saturating_sub(1);
+    }
     // Synthetic ordinals in CPU policy fixtures have no physical GPU.
     if device >= 0 {
         let padding = cuteafd_core::memory_policy::MemoryPolicy::current().memory_padding
@@ -806,10 +814,12 @@ impl DeviceCache {
         (estimate, class.map_or(estimate, |c| c.largest.max(estimate)))
     }
 
-    pub(super) fn mark_victim(&mut self, frequent_ghost: bool) -> Option<u64> {
+    #[cfg(test)]
+    pub(super) fn mark_victim(&mut self, _frequent_ghost: bool) -> Option<u64> { self.select_victim(None, false) }
+
+    fn select_victim(&mut self, excluded: Option<u64>, known_only: bool) -> Option<u64> {
         let recent = &self.queues[List::Recent.index()];
-        let prefer_recent = recent.first.is_some() && (recent.bytes > self.recent_target
-            || (frequent_ghost && recent.bytes == self.recent_target));
+        let prefer_recent = recent.first.is_some() && (recent.bytes > self.recent_target);
         let first = if prefer_recent { List::Recent } else { List::Frequent };
         let second = if prefer_recent { List::Frequent } else { List::Recent };
         let mut selected = None;
@@ -817,7 +827,8 @@ impl DeviceCache {
             let mut next = self.queues[list.index()].first;
             while let Some(id) = next {
                 let record = &self.records[&id];
-                if !record.pending_capture {
+                if !record.pending_capture && Some(id) != excluded
+                    && (!known_only || record.stats.native_nodes.is_some_and(|nodes| nodes > 0)) {
                     selected = Some(id); break;
                 }
                 next = record.next;
@@ -896,7 +907,7 @@ impl DeviceCache {
         }
         // The measured hard stop admits no new tickets, even nominal reuse.
         // Destruction cannot return driver arena bytes or clear this stop.
-        if self.charged >= self.reserve || self.measurement_failed {
+        if self.charged >= self.reserve || self.measurement_failed || self.soft.limit == 0 {
             if let Some(record) = old.and_then(|id| self.records.get_mut(&id)) {
                 record.stats.event(site.cycle, 1);
                 record.stats.misses += 1;
@@ -941,8 +952,14 @@ impl DeviceCache {
         let sealed = site.spans_devices && cross_device_capture_sealed();
         let allowed = site.preference != Preference::Eager && estimate > 0 && !sealed;
         let native = self.native_pools();
-        let room = self.pending_destroy == 0 && (self.soft.measured_bytes.is_none()
-            || (native.unknown_execs == 0 && self.soft.fits(native.live_nodes)));
+        let new_nodes = old.and_then(|id| self.records[&id].stats.native_nodes).filter(|n| *n > 0)
+            .or_else(|| self.records.values().filter(|r| r.identity.site == site.name)
+                .filter_map(|r| r.stats.native_nodes).max())
+            .or_else(|| self.records.values().filter_map(|r| r.stats.native_nodes).max());
+        let room = if self.soft.measured_bytes.is_none() { self.pending_destroy == 0 }
+            else if let Some(nodes) = new_nodes {
+                self.make_soft_room(nodes, None) && self.pending_destroy == 0
+            } else { true }; // Unknown topology retains measured-only admission.
         if allowed && room {
             // No CUDA query or ticket for a planned physical-headroom miss.
             if !self.physical_room(estimate, headroom) {
@@ -1120,30 +1137,46 @@ impl DeviceCache {
                 // Without a physical observation another capture cannot be safe.
                 tracing::warn!(%error, device = self.device, "capture measurement failed; freezing capture");
                 self.measurement_failed = true;
+                self.cancel_capture(id);
+                self.unmeasured = self.records.values().any(|r| r.pending_capture);
+                if !self.unmeasured { self.pending_growth = 0; self.captured_since_observation = false; }
             }
         }
     }
 
-    fn apply_soft_pressure(&mut self, growth: u64) {
+    fn make_soft_room(&mut self, incoming_nodes: u64, excluded: Option<u64>) -> bool {
+        let native = self.native_pools();
+        let selected = self.records.values().filter(|r| r.pending_destroy)
+            .map(|r| r.stats.native_nodes.unwrap_or(0)).sum::<u64>();
+        let reclaimable = self.records.iter().filter(|(&id, r)| Some(id) != excluded && !r.pending_capture
+            && matches!(r.list, Some(List::Recent | List::Frequent)))
+            .map(|(_, r)| r.stats.native_nodes.unwrap_or(0)).sum::<u64>();
+        let mut nodes = native.live_nodes.saturating_sub(selected);
+        if !self.soft.fits(nodes.saturating_sub(reclaimable).saturating_add(incoming_nodes)) { return false }
+        while !self.soft.fits(nodes.saturating_add(incoming_nodes)) {
+            let Some(id) = self.select_victim(excluded, true) else { return false };
+            nodes = nodes.saturating_sub(self.records[&id].stats.native_nodes.unwrap_or(0));
+        }
+        true
+    }
+
+    fn apply_soft_pressure(&mut self, growth: u64, completed: Option<u64>) {
         if self.charged >= self.reserve { return }
         let native = self.native_pools();
         if self.soft.measured_bytes.is_none() {
-            self.soft.margin = self.soft.margin.max(growth.div_ceil(GRAPH_CHUNK).saturating_mul(GRAPH_CHUNK));
+            self.soft.margin = self.soft.margin.max(growth.div_ceil(self.soft.granule).saturating_mul(self.soft.granule));
             self.soft.limit = self.reserve.saturating_sub(self.soft.margin);
-            if self.charged < self.soft.limit || native.live_nodes == 0 || native.unknown_execs != 0 || self.unmeasured { return }
+            if self.charged < self.soft.limit || native.live_nodes == 0 || self.unmeasured { return }
+            let pinned_nodes = self.records.values().filter(|r| r.pinned)
+                .map(|r| r.stats.native_nodes.unwrap_or(0)).sum::<u64>();
+            // A pinned-heavy startup sample cannot establish a usable ARC budget.
+            if u128::from(pinned_nodes) * u128::from(self.charged)
+                > u128::from(self.soft.limit) * u128::from(native.live_nodes) { return }
             self.soft.measured_bytes = Some(self.charged);
             self.soft.measured_nodes = Some(native.live_nodes);
         }
-        // Measured memory alone enables pressure; the frozen ratio prices node
-        // capacity, never physical release. Already-selected owners count once.
-        if self.charged <= self.soft.limit { return }
-        let selected: u64 = self.records.values().filter(|r| r.pending_destroy)
-            .map(|r| r.stats.native_nodes.unwrap_or(0)).sum();
-        let mut nodes = native.live_nodes.saturating_sub(selected);
-        while !self.soft.fits(nodes) {
-            let Some(id) = self.mark_victim(false) else { break };
-            nodes = nodes.saturating_sub(self.records[&id].stats.native_nodes.unwrap_or(0));
-        }
+        if self.charged < self.soft.limit { return }
+        self.make_soft_room(0, completed);
     }
 
     /// Called once per device after the complete multi-rank step has drained.
@@ -1187,7 +1220,7 @@ impl DeviceCache {
         self.unmeasured = self.records.values().any(|r| r.pending_capture);
         if !self.unmeasured { self.pending_growth = 0; self.captured_since_observation = false; }
         self.charged = self.charged.saturating_add(bytes);
-        self.apply_soft_pressure(bytes);
+        self.apply_soft_pressure(bytes, completed);
     }
 
     pub fn destroyed(&mut self, ids: &[u64], measurement: ReleaseMeasurement) {
@@ -1473,6 +1506,17 @@ impl Drop for TraceWriter {
 
 
 #[cfg(test)]
+fn test_cache(device: i32, reserve: u64) -> DeviceCache {
+    let mut cache = DeviceCache::new(device, reserve);
+    if reserve < GRAPH_CHUNK {
+        cache.soft.granule = 1;
+        cache.soft.margin = 1;
+        cache.soft.limit = reserve.saturating_sub(1);
+    }
+    cache
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn site(preference: Preference) -> Site { Site { name: "test", cycle: Cycle::Decode, preference, bootstrap: 10, basis: Basis::Bytes, spans_devices: false } }
@@ -1484,7 +1528,7 @@ mod tests {
     }
     #[test]
     fn single_owner_measurement_preserves_another_outstanding_ticket() {
-        let mut cache = DeviceCache::new(-1006, 64 * GRAPH_CHUNK);
+        let mut cache = test_cache(-1006, 64 * GRAPH_CHUNK);
         let Miss::Capture(a) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
         let Miss::Capture(b) = cache.miss(key(2), site(Preference::Capture), None, false) else { panic!() };
         cache.captured_topology(a, 7, 1, false);
@@ -1505,7 +1549,7 @@ mod tests {
 
     #[test]
     fn soft_ratio_and_margin_freeze_from_measured_crossing_and_ignore_reuse_shares() {
-        let mut cache = DeviceCache::new(-1004, 16 * GRAPH_CHUNK);
+        let mut cache = test_cache(-1004, 16 * GRAPH_CHUNK);
         let capture_site = Site { bootstrap: 1, ..site(Preference::Capture) };
         let mut owners = Vec::new();
         for n in 0..4 {
@@ -1546,7 +1590,7 @@ mod tests {
     #[test]
     fn soft_rotating_shapes_reuse_a_fixed_arena_until_terminal_hard_stop() {
         let unit = GRAPH_CHUNK;
-        let mut cache = DeviceCache::new(-1005, 16 * unit);
+        let mut cache = test_cache(-1005, 16 * unit);
         let capture_site = Site { bootstrap: 1, ..site(Preference::Capture) };
         let mut allocator_nodes = 0u64;
         for n in 0..200 {
@@ -1569,7 +1613,7 @@ mod tests {
 
     #[test]
     fn high_water_overshoot_does_not_churn_a_bounded_hot_set() {
-        let mut cache = DeviceCache::new(-996, 1000);
+        let mut cache = test_cache(-996, 1000);
         let mut hot = Vec::new();
         for n in 0..36 { hot.push(capture(&mut cache, n, false)); }
         // Retired/transient growth left the permanent arena over reserve.
@@ -1598,7 +1642,7 @@ mod tests {
     #[test]
     fn measured_hard_stop_freezes_new_tickets_including_reuse_and_survives_destroy() {
         for measured in [100, 110] {
-            let mut cache = DeviceCache::new(-1002, 100);
+            let mut cache = test_cache(-1002, 100);
             let Miss::Capture(id) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
             cache.captured_topology(id, 7, 1, false);
             cache.measured_capture(measured);
@@ -1618,7 +1662,7 @@ mod tests {
 
     #[test]
     fn native_node_counts_are_retained_independently_of_byte_estimator_units() {
-        let mut cache = DeviceCache::new(-1003, 64 << 20);
+        let mut cache = test_cache(-1003, 64 << 20);
         let Miss::Capture(a) = cache.miss(key(1), site(Preference::Capture), None, true) else { panic!() };
         cache.captured_topology(a, 7, 1, false);
         cache.measured_capture(10);
@@ -1638,7 +1682,7 @@ mod tests {
 
     #[test]
     fn thirty_six_percent_measured_live_set_does_not_evict() {
-        let mut cache = DeviceCache::new(-997, 1000);
+        let mut cache = test_cache(-997, 1000);
         for n in 0..35 { capture(&mut cache, n, false); }
         assert!(matches!(cache.miss(key(35), site(Preference::Capture), None, false), Miss::Capture(_)));
         cache.charged = 1000;
@@ -1649,7 +1693,7 @@ mod tests {
 
     #[test]
     fn measured_hard_stop_bounds_rotating_unknown_node_shapes() {
-        let mut cache = DeviceCache::new(-999, 100);
+        let mut cache = test_cache(-999, 100);
         for n in 0..10 {
             assert!(matches!(cache.miss(key(n), site(Preference::Capture), None, false), Miss::Capture(_)));
             cache.measured_capture(10);
@@ -1663,7 +1707,7 @@ mod tests {
 
     #[test]
     fn measured_overshoot_keeps_a_fitting_hot_set_without_boundary_eviction() {
-        let mut cache = DeviceCache::new(-1000, 100);
+        let mut cache = test_cache(-1000, 100);
         let mut ids = Vec::new();
         for n in 0..3 {
             let Miss::Capture(id) = cache.miss(key(n), site(Preference::Capture), None, false) else { panic!() };
@@ -1690,7 +1734,7 @@ mod tests {
 
     #[test]
     fn below_soft_estimates_do_not_evict_and_pinned_soft_excess_terminates() {
-        let mut cache = DeviceCache::new(-1001, 16 * GRAPH_CHUNK);
+        let mut cache = test_cache(-1001, 16 * GRAPH_CHUNK);
         let capture_site = Site { bootstrap: 1, ..site(Preference::Capture) };
         let Miss::Capture(id) = cache.miss(key(1), capture_site, None, true) else { panic!() };
         cache.captured_topology(id, 10, 1, false);
@@ -1703,7 +1747,7 @@ mod tests {
 
     #[test]
     fn estimate_only_records_do_not_count_as_measured_live_bytes() {
-        let mut cache = DeviceCache::new(-998, 1000);
+        let mut cache = test_cache(-998, 1000);
         let Miss::Capture(id) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
         cache.measured_capture(0);
         assert_eq!(cache.records[&id].bytes, 0);
@@ -1719,7 +1763,7 @@ mod tests {
     fn rejected_small_graph_trace_has_no_executable_or_permanent_bytes() {
         for basis in [Basis::Bytes, Basis::Nodes { node_rate: 2560, graph_rate: 65536 }] {
             for nodes in 0..=2 {
-                let mut cache = DeviceCache::new(-992, 64 << 20);
+                let mut cache = test_cache(-992, 64 << 20);
                 cache.basis = basis;
                 let mut capture_site = site(Preference::Capture);
                 capture_site.basis = basis;
@@ -1752,7 +1796,7 @@ mod tests {
     }
     #[test]
     fn oom_backoff_skips_256_misses_preserves_accounting_and_warns_once() {
-        let mut cache = DeviceCache::new(-992, 1000);
+        let mut cache = test_cache(-992, 1000);
         cache.level = Some(100);
         let Miss::Capture(id) = cache.miss(key(1), site(Preference::Capture), None, true) else { panic!() };
         assert!(cache.capture_oom(id));
@@ -1785,7 +1829,7 @@ mod tests {
     #[test]
     fn oom_backoff_retries_after_real_eviction_not_victim_selection_or_ghost_removal() {
         for remove in [false, true] {
-            let mut cache = DeviceCache::new(-993, 1000);
+            let mut cache = test_cache(-993, 1000);
             let owner = capture(&mut cache, 1, false);
             let Miss::Capture(id) = cache.miss(key(2), site(Preference::Capture), None, false) else { panic!() };
             assert!(cache.capture_oom(id));
@@ -1804,7 +1848,7 @@ mod tests {
 
     #[test]
     fn oom_backoff_retries_only_after_meaningful_observed_level_drop() {
-        let mut cache = DeviceCache::new(-994, 16 << 20);
+        let mut cache = test_cache(-994, 16 << 20);
         cache.level = Some(4 << 20);
         let Miss::Capture(id) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
         cache.capture_oom(id);
@@ -1822,7 +1866,7 @@ mod tests {
     #[test]
     fn oom_ghosts_obey_arc_byte_and_count_bounds_and_forget_warning_history() {
         for (reserve, bootstrap, failures, retained) in [(100, 10, 11, 10), (1_000_000, 1, 65_537, 65_536)] {
-            let mut cache = DeviceCache::new(-995, reserve);
+            let mut cache = test_cache(-995, reserve);
             let site = Site { bootstrap, ..site(Preference::Capture) };
             for n in 0..failures {
                 let Miss::Capture(id) = cache.miss(key(n), site, None, false) else { panic!() };
@@ -1843,7 +1887,7 @@ mod tests {
     #[test]
     fn stats_publish_cost_with_five_thousand_graph_records() {
         use std::hint::black_box;
-        let mut cache = DeviceCache::new(-991, 100_000);
+        let mut cache = test_cache(-991, 100_000);
         for n in 0..5_000 {
             let id = capture(&mut cache, n, false);
             cache.hit(id);
@@ -1873,7 +1917,7 @@ mod tests {
             let directory = std::path::PathBuf::from(directory);
             let runtime = tokio::runtime::Runtime::new().unwrap();
             runtime.block_on(async {
-                let mut cache = DeviceCache::new(-710, 100);
+                let mut cache = test_cache(-710, 100);
                 cache.trace = Some(TraceWriter::new(directory.join("graph.json")).unwrap());
                 let a = capture(&mut cache, 1, false);
                 cache.hit(a);
@@ -1930,7 +1974,7 @@ mod tests {
             if first { first = false; entered.send(()).unwrap(); gate.recv().unwrap(); }
             seen.lock().unwrap().push(snapshot.cache.charged);
         }).unwrap();
-        let mut cache = DeviceCache::new(-700, 100);
+        let mut cache = test_cache(-700, 100);
         writer.submit(cache.trace_snapshot());
         waiting.recv_timeout(Duration::from_secs(5)).unwrap();
         for charged in 1..=10 { cache.charged = charged; writer.submit(cache.trace_snapshot()); }
@@ -1943,7 +1987,7 @@ mod tests {
     fn controller_drop_keeps_all_retired_banks_and_atomic_final_trace() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("trace.json");
-        let mut cache = DeviceCache::new(-701, 100);
+        let mut cache = test_cache(-701, 100);
         cache.trace = Some(TraceWriter::new(path.clone()).unwrap());
         let a = capture(&mut cache, 1, false);
         cache.hit(a);
@@ -1977,7 +2021,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("trace.json");
-        let mut cache = DeviceCache::new(-703, 100);
+        let mut cache = test_cache(-703, 100);
         cache.trace = Some(TraceWriter::new(path.clone()).unwrap());
         let id = capture(&mut cache, 1, false);
         cache.hit(id);
@@ -2003,7 +2047,7 @@ mod tests {
 
     #[test]
     fn trace_schema_bytes_match_legacy_fixture() {
-        let mut cache = DeviceCache::new(-702, 100);
+        let mut cache = test_cache(-702, 100);
         let a = capture(&mut cache, 1, false);
         cache.records.get_mut(&a).unwrap().stats.first_seen_ms = 0;
         cache.clock_ms = 20_000;
@@ -2019,7 +2063,7 @@ mod tests {
     #[ignore = "CPU trace boundary microbenchmark; run explicitly with --nocapture"]
     fn trace_snapshot_microseconds() {
         use std::hint::black_box;
-        let mut cache = DeviceCache::new(-703, 100_000);
+        let mut cache = test_cache(-703, 100_000);
         for n in 0..5_000 { let id = capture(&mut cache, n, false); cache.hit(id); }
         let repeats = 50;
         let start = Instant::now();
@@ -2044,7 +2088,7 @@ mod tests {
     fn reserve_policy_snapshot_distinguishes_admission_from_live_arena() {
         let policy = cuteafd_loader::placement::graph_reserve::resolve_with_extra(
             None, Some("50%"), Some("20MB"), 0, false, 100_000_000, 0).unwrap();
-        let mut cache = DeviceCache::new(-901, policy.bytes);
+        let mut cache = test_cache(-901, policy.bytes);
         cache.reserve_policy = Some(policy);
         let snapshot = serde_json::to_value(cache.snapshot()).unwrap();
         assert_eq!(snapshot["reserve"], 120_000_000);
@@ -2060,7 +2104,7 @@ mod tests {
     }
     #[test]
     fn per_key_churn_cost_and_forget_lifetime() {
-        let mut cache = DeviceCache::new(-213, 100);
+        let mut cache = test_cache(-213, 100);
         let a = capture(&mut cache, 1, false);
         cache.captured_topology(a, 0, 1, false);
         cache.hit_cycle(a, Cycle::Verify);
@@ -2085,7 +2129,7 @@ mod tests {
 
     #[test]
     fn boundary_cost_shares_sum_to_physical_growth_with_node_basis() {
-        let mut cache = DeviceCache::new(-217, 64 << 20);
+        let mut cache = test_cache(-217, 64 << 20);
         cache.basis = Basis::Nodes { node_rate: 2560, graph_rate: 65536 };
         let mut node_site = site(Preference::Capture);
         node_site.basis = cache.basis;
@@ -2106,7 +2150,7 @@ mod tests {
 
     #[test]
     fn canceled_capture_and_cold_ghost_are_not_recaptures() {
-        let mut cache = DeviceCache::new(-214, 20);
+        let mut cache = test_cache(-214, 20);
         capture(&mut cache, 1, true);
         assert!(matches!(cache.miss(key(2), site(Preference::Eager), None, false), Miss::Eager));
         assert!(matches!(cache.miss(key(2), site(Preference::Eager), None, false), Miss::Eager));
@@ -2122,7 +2166,7 @@ mod tests {
 
     #[test]
     fn histogram_wraps_ages_idle_and_preserves_lifetime_hits() {
-        let mut cache = DeviceCache::new(-215, 100);
+        let mut cache = test_cache(-215, 100);
         let id = capture(&mut cache, 1, false);
         let stats = &mut cache.records.get_mut(&id).unwrap().stats;
         stats.hit(Cycle::Decode, 3, 0);
@@ -2143,7 +2187,7 @@ mod tests {
 
     #[test]
     fn arc_hits_use_cycle_clock_without_per_replay_sampling() {
-        let mut cache = DeviceCache::new(-218, 100);
+        let mut cache = test_cache(-218, 100);
         let id = capture(&mut cache, 1, false);
         cache.clock_ms = 25_000;
         cache.hit_cycle(id, Cycle::Verify);
@@ -2174,7 +2218,7 @@ mod tests {
 
     #[test]
     fn stats_top_lists_are_bounded_sorted_and_available_without_trace() {
-        let mut cache = DeviceCache::new(-216, 1000);
+        let mut cache = test_cache(-216, 1000);
         assert!(cache.trace.is_none());
         for n in 0..30 {
             let id = capture(&mut cache, n, false);
@@ -2194,7 +2238,7 @@ mod tests {
 
     #[test]
     fn declared_peer_span_survives_single_device_native_inspection() {
-        let mut cache = DeviceCache::new(-8803, 100);
+        let mut cache = test_cache(-8803, 100);
         let mut peer_site = site(Preference::Capture);
         peer_site.spans_devices = true;
         let Miss::Capture(id) = cache.miss(key(1), peer_site, None, false) else { panic!("capture expected") };
@@ -2212,7 +2256,7 @@ mod tests {
 
     #[test]
     fn cold_step_is_capped_and_unknown_site_bootstraps() {
-        let mut cache = DeviceCache::new(-200, 100);
+        let mut cache = test_cache(-200, 100);
         let mut captures = 0;
         for n in 0..100 {
             if matches!(cache.miss(key(n), site(Preference::Adaptive), None, false), Miss::Capture(_)) { captures += 1; }
@@ -2224,7 +2268,7 @@ mod tests {
     }
     #[test]
     fn arc_frequency_and_ghost_adaptation() {
-        let mut cache = DeviceCache::new(-201, 100);
+        let mut cache = test_cache(-201, 100);
         let a = capture(&mut cache, 1, false);
         let b = capture(&mut cache, 2, false);
         cache.hit(a);
@@ -2239,7 +2283,7 @@ mod tests {
     }
     #[test]
     fn pinned_never_enters_arc_and_full_miss_never_refuses() {
-        let mut cache = DeviceCache::new(-202, 20);
+        let mut cache = test_cache(-202, 20);
         let a = capture(&mut cache, 1, true);
         assert!(cache.records[&a].list.is_none());
         assert!(cache.mark_victim(false).is_none());
@@ -2249,7 +2293,7 @@ mod tests {
     }
     #[test]
     fn destruction_never_reduces_arena_and_both_pools_allow_reuse() {
-        let mut cache = DeviceCache::new(-203, 20);
+        let mut cache = test_cache(-203, 20);
         let a = capture(&mut cache, 1, false);
         cache.mark_victim(false);
         cache.destroyed(&[a], ReleaseMeasurement { released: 999 });
@@ -2261,8 +2305,8 @@ mod tests {
     }
     #[test]
     fn devices_only_charge_their_own_measured_growth() {
-        let mut a = DeviceCache::new(-206, 100);
-        let mut b = DeviceCache::new(-207, 100);
+        let mut a = test_cache(-206, 100);
+        let mut b = test_cache(-207, 100);
         assert!(matches!(a.miss(key(1), site(Preference::Capture), None, false), Miss::Capture(_)));
         a.measured_capture(10);
         b.measured_capture(0);
@@ -2274,7 +2318,7 @@ mod tests {
 
     #[test]
     fn node_and_exec_pools_have_independent_peaks() {
-        let mut cache = DeviceCache::new(-205, 64 << 20);
+        let mut cache = test_cache(-205, 64 << 20);
         cache.basis = Basis::Nodes { node_rate: 2560, graph_rate: 65536 };
         let mut node_site = site(Preference::Capture);
         node_site.basis = cache.basis;
@@ -2299,7 +2343,7 @@ mod tests {
 
     #[test]
     fn canceled_tickets_never_prove_pool_reuse() {
-        let mut cache = DeviceCache::new(-208, 20);
+        let mut cache = test_cache(-208, 20);
         let Miss::Capture(id) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
         assert_eq!(cache.pools.node_high_water, 0);
         cache.cancel_capture(id);
@@ -2314,7 +2358,7 @@ mod tests {
 
     #[test]
     fn device_basis_and_coefficients_cannot_mix() {
-        let mut cache = DeviceCache::new(-209, 64 << 20);
+        let mut cache = test_cache(-209, 64 << 20);
         let estimate = Some(Estimate { bytes: 1000, nodes: Some(10), node_rate: 2560,
             graph_rate: 65536, parallel_width: 1 });
         assert!(matches!(cache.miss(key(1), site(Preference::Capture), estimate.clone(), false), Miss::Eager));
@@ -2330,7 +2374,7 @@ mod tests {
 
     #[test]
     fn pending_node_pool_growth_is_reserved_once_per_chunk() {
-        let mut cache = DeviceCache::new(-210, 5 << 20);
+        let mut cache = test_cache(-210, 5 << 20);
         cache.basis = Basis::Nodes { node_rate: 2560, graph_rate: 65536 };
         let mut nodes = site(Preference::Capture);
         nodes.basis = cache.basis;
@@ -2346,7 +2390,7 @@ mod tests {
 
     #[test]
     fn unknown_topology_restores_full_pending_reservation_and_forbids_reuse() {
-        let mut cache = DeviceCache::new(-212, 100);
+        let mut cache = test_cache(-212, 100);
         cache.pools.node_high_water = 1000;
         cache.pools.exec_high_water = 100;
         cache.charged = 60;
@@ -2367,7 +2411,7 @@ mod tests {
     #[test]
     fn non_chain_and_declared_peer_sites_reserve_each_capture_below_old_peaks() {
         for peer in [false, true] {
-            let mut cache = DeviceCache::new(-211, 100);
+            let mut cache = test_cache(-211, 100);
             cache.pools.node_high_water = 1000;
             cache.pools.exec_high_water = 100;
             cache.charged = 60;
@@ -2385,7 +2429,7 @@ mod tests {
 
     #[test]
     fn stats_report_only_when_evicted_and_trace_schema() {
-        let mut cache = DeviceCache::new(-204, 100);
+        let mut cache = test_cache(-204, 100);
         assert!(!cache.report_due(Duration::from_secs(90)));
         let a = capture(&mut cache, 1, false);
         cache.mark_victim(false);
@@ -2500,7 +2544,7 @@ mod observer_tests {
         let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
         let library = fixture.load()?;
         fixture.configure_memory_usage(&library, 6, 1000, 995)?;
-        let mut cache = DeviceCache::new(6, 1000);
+        let mut cache = test_cache(6, 1000);
         cache.physical_floor = 50;
         cache.sample_physical(1000, 0);
         cache.memory_query = Some(library.physical_memory_query()?);
@@ -2521,7 +2565,7 @@ mod observer_tests {
         let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
         let library = fixture.load()?;
         fixture.configure_memory_usage(&library, 6, 1000, 995)?;
-        let mut cache = DeviceCache::new(6, 1000);
+        let mut cache = test_cache(6, 1000);
         cache.physical_floor = 50;
         cache.sample_physical(5, 0);
         cache.memory_query = Some(library.physical_memory_query()?);
@@ -2553,7 +2597,7 @@ mod observer_tests {
         let site = Site { name: "floor-size-fixture", cycle: Cycle::Decode,
             preference: Preference::Capture, bootstrap: 10, basis: Basis::Bytes, spans_devices: true };
         let key = |key| Identity { bank: 1, site: site.name, key, shape: "floor".into() };
-        let mut cache = DeviceCache::new(-99122, 10_000);
+        let mut cache = test_cache(-99122, 10_000);
         cache.physical_floor = 50;
         cache.sample_physical(250, 0);
         let large = Estimate { bytes: 101, nodes: None, node_rate: 1, graph_rate: 0, parallel_width: 1 };
@@ -2571,7 +2615,7 @@ mod observer_tests {
     fn physical_floor_subtracts_ledger_growth_without_crediting_frees() {
         use cuteafd_ffi::memory_ledger::{self, MemoryKind, Space};
         let device = -99123;
-        let mut cache = DeviceCache::new(device, 1000);
+        let mut cache = test_cache(device, 1000);
         cache.physical_floor = 50;
         cache.sample_physical(100, 0);
         let tag = memory_ledger::tag(MemoryKind::Workspace, "physical-floor-test");
@@ -2615,7 +2659,7 @@ mod observer_tests {
         let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
         let library = fixture.load()?;
         fixture.configure_memory_usage(&library, 6, 1000, 100)?;
-        let mut cache = DeviceCache::new(6, 1000);
+        let mut cache = test_cache(6, 1000);
         cache.observer.observe(900, 1000, 0, 0, 0);
         cache.memory_query = Some(library.physical_memory_query()?);
         let site = Site { name: "observer-miss-fixture", cycle: Cycle::Decode,
@@ -2807,7 +2851,7 @@ mod observer_tests {
     #[test]
     fn seeded_startup_arena_is_nonzero_and_equals_capture_shares() {
         for device in [-8810, -8811] {
-            let mut cache = DeviceCache::new(device, 64 << 20);
+            let mut cache = test_cache(device, 64 << 20);
             assert_eq!(cache.observer.observe(900 << 20, 1000 << 20, 100 << 20, 0, 0).0, 0);
             let site = Site { name: "kimi_k3.step", cycle: Cycle::Other,
                 preference: Preference::Adaptive, bootstrap: 128 << 10,

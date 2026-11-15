@@ -176,6 +176,7 @@ int cudaGraphInstantiate(void** exec, void*, int) {
   if (!status || partial_exec) { *exec = reinterpret_cast<void*>(0x2000); ++live_execs; }
   return status;
 }
+int cudaGraphUpload(void*, void*) { return 0; }
 int cudaGraphDestroy(void*) { assert(live_graphs > 0); --live_graphs; return outcome(4); }
 int cudaGraphExecDestroy(void*) { assert(live_execs > 0); --live_execs; return outcome(5); }
 int cudaGraphGetNodes(void*, void**, size_t* nodes) { *nodes = graph_nodes; return 0; }

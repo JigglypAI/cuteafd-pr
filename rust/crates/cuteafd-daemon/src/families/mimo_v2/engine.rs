@@ -2462,20 +2462,18 @@ impl<'a> MimoEngine<'a> {
     /// The completed multi-rank step is the only measurement boundary: every
     /// rank's captures are drained together, then untracked device growth is
     /// charged to pending captures, excluding separately owned lazy storage.
-    fn graph_boundary(&self, before: &[GraphMemorySample]) -> Result<()> {
-        if !self.graphs.borrow().cache_needs_boundary()
-            && self.peer.as_ref().is_none_or(|peer| !peer.graphs.borrow().cache_needs_boundary()) {
-            return Ok(());
-        }
-        let after = self.graph_memory_samples()?;
+    fn graph_boundary(&self, _before: &[GraphMemorySample]) -> Result<()> {
         for rank in 0..self.ranks() {
-            let graphs = match (rank, &self.peer) { (1, Some(peer)) => &peer.graphs, _ => &self.graphs };
-            graphs.borrow_mut().cache_measured(graph_capture_growth(before[rank], after[rank]));
-            self.on(rank, || graphs.borrow_mut().cache_drain(|| Ok(()), || {
-                let (free, _) = self.library.cuda_physical_memory_info()?;
-                Ok(crate::shared::decode_graph::device::ReleaseMeasurement {
-                    released: (free as u64).saturating_sub(after[rank].free) })
-            }))?;
+            let stream = self.stream_of(rank);
+            // SAFETY: the complete multi-rank step has queued all consumers.
+            self.on(rank, || unsafe { self.library.cuda_stream_synchronize(stream) })?;
+        }
+        for rank in 0..self.ranks() {
+            let graphs = if rank == 0 { &self.graphs } else { &self.peer.as_ref().unwrap().graphs };
+            graphs.borrow_mut().cache_tick();
+            crate::shared::decode_graph::device::observe_device(&self.library, self.peer.as_ref().filter(|_| rank == 1).map_or(self.device, |peer| peer.device))?;
+            self.on(rank, || graphs.borrow_mut().cache_drain(|| Ok(()), ||
+                Ok(crate::shared::decode_graph::device::ReleaseMeasurement { released: 0 })))?;
         }
         Ok(())
     }
@@ -3548,7 +3546,8 @@ mod tests {
             let snapshots = crate::shared::decode_graph::device::snapshots();
             let cache = snapshots.iter().find(|cache| cache.device == 7).unwrap();
             assert_eq!(cache.reserve_policy, Some(engine.graph_layout.as_ref().unwrap().policies[0]));
-            assert!(cache.pending_capture > 0, "engine bank retains pending growth across lane rebuilds");
+            assert_eq!(cache.pending_capture, 0, "successful commit was already measured exactly once");
+            assert!(cache.cycles.values().any(|cycle| cycle.captures > 0));
             assert_eq!(engine.graph_before.borrow().as_ref().unwrap()[0].free, before_free);
         }
         engine.graph_end_of_step()?;
@@ -3592,8 +3591,9 @@ mod tests {
         assert!(!sample.contains("cuda_stream_synchronize"));
         let boundary = source.split_once("fn graph_boundary(").unwrap().1
             .split_once("fn graph_end_of_step(").unwrap().0;
-        assert!(boundary.contains("self.graph_memory_samples()?"));
-        assert!(boundary.contains("cache_measured(graph_capture_growth(before[rank], after[rank]))"));
+        assert!(boundary.contains("cuda_stream_synchronize"));
+        assert!(boundary.contains("device::observe_device"));
+        assert!(!boundary.contains("cache_measured"));
     }
 
     #[test]
