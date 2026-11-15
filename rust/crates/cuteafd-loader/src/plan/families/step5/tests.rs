@@ -2128,8 +2128,12 @@ fn mc_whole_fp8_core_selects_target_and_mtp_without_expert_conversion() -> anyho
     let selected=native::NativeSelection::resolve(&contract,&cfg,2,3,2048,None)?;
     assert!(selected.resolved.programs.iter().any(|name|name=="native_attention_n128896_k4096_m64_f32"));
     assert!(!selected.resolved.programs.iter().any(|name|name=="native_attention_n128896_k4096_m4096_f32"));
+    let modes=(0..cfg.layers).map(|layer|if cfg.full[layer] {
+        crate::placement::LayerMode::Whole {gpu:0,ffn:crate::placement::FfnMode::Owner}
+    } else {crate::placement::LayerMode::HeadSplit}).collect::<Vec<_>>();
+    let ownership=ownership::ExecutionOwnership::new(&cfg,2,ownership::plan(&modes,0,0))?;
     for rank in 0..2 {
-        let layout=coordinator::RankWeightLayout::from_contract(&contract,&cfg,rank,2,None)?;
+        let layout=coordinator::RankWeightLayout::from_contract(&contract,&cfg,rank,2,Some(&ownership))?;
         selected.validate_layout(&layout,2048)?;
         assert!(layout.core.is_empty());
         assert!(!layout.operands.iter().any(|owner|owner.name.ends_with(".gate_up_proj.weight")));
