@@ -20,6 +20,7 @@ default-off performance lever adds its row here in the same PR (AGENTS.md).
 
 | Lever | Families | Enable | Effect | Cost |
 | --- | --- | --- | --- | --- |
+| `SPECULATOR` (bundled DSpark) | MiniMax M3.1 Flash | `SPECULATOR=dspark` (unset/auto = off) | Informational only, not a qualified A/B: C1 about +50%, C16 about -20% on 1 RTX PRO 6000 + 3 Sparks; three runs, all reclaim-flagged ([#2113 measurement summary](https://github.com/tpurtell/cuteafd/pull/2113)). Latest matched sweep off/simple/shared: C1 31.33/47.57/47.48 and C16 201.39/157.48/162.58 emitted tok/s; no thermal slowdown. Local receipt: `~/.cache/cuteafd/builds/v51-minimax-dspark-three-arm/summary.json`. | Extra native BF16/MXFP8 drafter weights, retained taps and exact window state; no target-weight conversion. Strict C1 and boot-C4 10/10, concurrent greedy, exact prefix and memory gates pass. Quality is unchanged across arms (KL 0.0247, top-1 95.7%). Remains opt-in pending clean throughput qualification. |
 | `L2_PREFETCH` | V4.1, MiMo, Qwen4 | `L2_PREFETCH=auto` or a MiB count (unset = off; GLM 5.3 and GLM Flash already default it to `auto`) | Pulls the next layer's weights into L2 while a one-lane decode step waits on its Spark exchange. V4.1 1× RTX 5090 + 4 Sparks: every C1 cell +1.7–3.9%, C4/C8 and 8K prefill unchanged (#623); GLM 5.3 weighted +4.4%, GLM Flash C1 +6–15% (2026-09-30). | None in values (outputs byte-identical); only extra L2 traffic. |
 | `QWEN_FP8_DECODE` | Qwen4 | `QWEN_FP8_DECODE=on` (unset = checkpoint BF16) | Holds the GDN/attention projections as one resident E4M3 copy; with `QWEN_FP8_HEAD=on`, 1× RTX code C1 222→247 tok/s, C4 441→489, 8K prefill 6100→6177 (2026-10-03). | Converts target projections to FP8 at load: golden KL 0.036→0.046, top-1 88.5%→86.7%; fails the KL gate, so opt-in only. |
 | `CORE_VIEW` | GLM 5.3 / ML4, GLM Flash, Kimi K3, Step-5, Muse | `CORE_VIEW=k8-compact`, `k6-compact` or `fp8-compact` (unset = original) | Stored MC core or generic load-time block FP8 of exactly the original variant's `core_tensors`; BF16 index only. GLM Flash K4 MC, 2 RTX PRO 6000 / 0 Sparks, DFlash2, fixed 425/425 W (2026-11-12): FP8 vs original C1/C16/8K prefill 171.12/741.93/7837.57 to 196.74/772.56/7741.92 tok/s (+15.0%/+4.1%/-1.2%); pool 1628160 to 2097152. K6 is non-inferior on both measured Standard-v2 paths, with +22.8% C1 and -12.5% 8K prefill vs original. Muse K4 MC `fp8-compact` is measured below (+15.2% C1, C16 flat, -5.1% 8K prefill; larger pool). Other checkpoints unmeasured. | K8/K6 and FP8 quantize target weights. FP8 uses E4M3 + FP32 128x128 block scales. Matched Standard-v2 generated positions: FP8-minus-original KL to official BF16 ancestry +0.00289 decode/+0.00325 prefill, top-1 -0.013/-0.526 percentage points; absolute ancestry gates pass, paired decode non-inferiority passes but prefill fails (0.005 margin). Those figures ran W8A8 prefill over every group; W8A16 prefill (`FP8_PREFILL=off`) also fails prefill non-inferiority (top-1 loss 0.00263, upper95 0.00614). FP8 stays opt-in. Unsupported executor roles refuse by tensor name, never skip. Plain checkpoints refuse every compact selector, including the former plain Flash FP8 path. |
@@ -131,9 +132,15 @@ On one RTX, `ATTENTION_PLACEMENT=auto|heads` selects whole ownership. On two RTX
 `auto|heads` selects native head splitting with half KV and replicated index.
 Explicit `layers` keeps contiguous attention and FP32 split FFNs. Boot-C16 split
 router, FFN and fold/publication sections replay through the shared graph cache;
-attention and peer receive waits stay eager. Explicit two-RTX `heads` selects
-half KV with replicated index and native FP32 partials; context remains unsupported.
-`SPECULATOR=off`, `VISION=off` and `AUDIO=off` are required for this increment.
+attention and peer receive waits stay eager. Context placement remains unsupported.
+`SPECULATOR=off` remains the default (`auto` also resolves off until qualification).
+Explicit `SPECULATOR=dspark` enables the checkpoint's bundled native mixed
+BF16/MXFP8 drafter through the shared scheduler; it requires a matching WIP build
+and remains under strict lossless, prefix, memory and throughput qualification.
+`DRAFT_LENGTH` caps the seven-token native block; `SPECULATION_TRACE` records
+shared draft/verify evidence. `DRAFT_POLICY=shared` explicitly selects the existing
+cost-based concurrency-bucket policy; unset retains the global `simple` default.
+`VISION=off` and `AUDIO=off` remain required.
 
 Shared launch keys keep their usual meanings. MiniMax accepts
 `RTX_EXPERT_LAYERS=auto|all|N`, `PREFILL_ROWS`, `PREFILL_WAVES`,
