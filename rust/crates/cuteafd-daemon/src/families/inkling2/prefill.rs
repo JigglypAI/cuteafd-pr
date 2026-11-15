@@ -156,9 +156,13 @@ impl PrefillHooks for Stateful<'_, '_> {
         let (source, start, version) = (unit.sequence as u64 + 1, unit.rows.start, self.placement_version);
         let staging = RouteStaging::new(rows, self.cfg.topk, self.cfg.hidden + self.cfg.hidden/32)?;
         let kind = self.kind;
-        let origins = unit.reply_origins()?;
+        // Explicit singleton members can carry a nonzero restored frontier;
+        // preserve their request-local position too, not only multi-member packs.
+        let origins = members(unit).iter().flat_map(|member| member.tokens.clone().map(move |position|
+            (member.sequence as u64+1, position as u64))).collect::<Vec<_>>();
+        let packed = unit.reply_origins()?;
         let combined = if kind == ExpertV2SourceKind::Prefill {
-            origins.as_ref().map_or_else(|| spark_waves::single_reply_eligible(rows, kind), |origins| origins.combined_reply_eligible())
+            packed.as_ref().map_or_else(|| spark_waves::single_reply_eligible(rows, kind), |origins| origins.combined_reply_eligible())
         } else { spark_waves::single_reply_eligible(rows, kind) };
         owner.stream.device.run(|| {
             // SAFETY: admitted unit owns routes/wire and the issuing stream;
@@ -167,9 +171,10 @@ impl PrefillHooks for Stateful<'_, '_> {
                 [owner.buffer("route_ids")?, owner.buffer("route_weights")?, owner.buffer("expert_wire")?],
                 owner.stream.raw, combined, Box::new(move |routes, wire| {
                     let mut request = request(identity, version, layer, source, start, rows, routes, wire)?;
-                    if let Some(origins) = origins { origins.apply(&mut request)?; }
-                    if kind != ExpertV2SourceKind::Prefill {
-                        for row in &mut request.rows { row.source_kind = kind; }
+                    if let Some(packed) = packed { packed.apply(&mut request)?; }
+                    ensure!(origins.len() == request.rows.len(), "Inkling Spark origin count differs");
+                    for (row, &(source, position)) in request.rows.iter_mut().zip(&origins) {
+                        row.source_request_id = source; row.token_position = position; row.source_kind = kind;
                     }
                     Ok(request)
                 })) }

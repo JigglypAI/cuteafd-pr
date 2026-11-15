@@ -29,8 +29,8 @@ impl<'a> Execution<'a> {
         Ok(Self { link, requests, head, target, kernels, local, cfg, next_identity: 1, terminal: false })
     }
 
-    /// Tokens are complete request-local streams; unit members provide the
-    /// causal spans. Every scratch head is consumed before another overwrites it.
+    /// Tokens are submitted suffixes; placement frontiers define their origins
+    /// while unit members retain absolute request-local causal spans. Every scratch head is consumed before another overwrites it.
     pub fn prefill(&mut self, placements: &mut [Placement], tokens: &[&[u32]], units: &[Unit],
         version: u64, on_logits: &mut dyn FnMut(usize, usize, DeviceLogits) -> Result<()>) -> Result<()> {
         ensure!(!self.terminal && placements.len() == tokens.len(), "Inkling execution terminal or request count differs");
