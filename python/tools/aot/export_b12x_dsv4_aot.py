@@ -156,18 +156,39 @@ def compile_native_attention_projection(n, k, max_rows, output="bf16"):
             reduction="canonical_fp8_gemv64_w8a16"))
 
 
+def mc_fp8_core_shapes():
+    """Additional coordinator-only [N,K] MC roles; never Spark geometries."""
+    return {
+        "glm": {(2048, 6144), (640, 6144), (12288, 6144), (6144, 6144),
+                (6144, 12288), (1024, 6144), (6144, 2048), (6144, 1024)},
+        "step5": {(12288, 4096), (6144, 4096), (768, 4096), (384, 4096),
+                  (1536, 4096), (4096, 1536), (13824, 4096), (4096, 13824),
+                  (4096, 8192)},
+    }
+
+
+def mc_fp8_f32_shapes():
+    # GLM shared down is K-split; dense down F32 shapes already exist.
+    return {(6144, 2048), (6144, 1024)}
+
+
+def native_fp8_head_shapes():
+    return {(202112, 8192), (154880, 6144), (128896, 4096)}
+
+
 def native_attention_programs():
     from functools import partial
     out = []
     muse_core = {(4096, 8192), (1024, 8192), (512, 8192), (2048, 8192), (8192, 2048)}
-    for n, k in sorted(set().union(*native_attention_shapes().values()) | muse_core):
-        for output in (("bf16", "f32") if (n, k) in native_attention_f32_shapes() | {(8192, 2048)} else ("bf16",)):
+    for n, k in sorted(set().union(*native_attention_shapes().values(), *mc_fp8_core_shapes().values()) | muse_core):
+        for output in (("bf16", "f32") if (n, k) in native_attention_f32_shapes() | mc_fp8_f32_shapes() | {(8192, 2048)} else ("bf16",)):
             for rows in (64, 4096):
                 suffix = "_f32" if output == "f32" else ""
                 out.append((f"n{n}_k{k}_m{rows}{suffix}", "attention_projection",
                     dict(max_rows=rows), partial(compile_native_attention_projection, n, k, rows, output)))
-    out.append(("n202112_k8192_m64_f32", "attention_projection", dict(max_rows=64),
-        partial(compile_native_attention_projection, 202112, 8192, 64, "f32")))
+    for n, k in sorted(native_fp8_head_shapes()):
+        out.append((f"n{n}_k{k}_m64_f32", "attention_projection", dict(max_rows=64),
+            partial(compile_native_attention_projection, n, k, 64, "f32")))
     return out
 
 

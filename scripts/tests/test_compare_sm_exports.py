@@ -123,10 +123,15 @@ def test_native_attention_groups_cover_checkpoint_shapes_and_f32_partials():
     programs = exporter.native_attention_programs()
     muse_core = {(4096,8192),(1024,8192),(512,8192),(2048,8192),(8192,2048)}
     expected = {f"n{n}_k{k}_m{rows}{suffix}"
-                for n,k in set().union(*shapes.values()) | muse_core for rows in (64,4096)
-                for suffix in (("", "_f32") if (n,k) in exporter.native_attention_f32_shapes() | {(8192,2048)} else ("",))}
-    expected.add("n202112_k8192_m64_f32")
-    assert "n202112_k8192_m4096_f32" not in expected, "head is microbatched at64rows"
+                for n,k in set().union(*shapes.values(), *exporter.mc_fp8_core_shapes().values()) | muse_core for rows in (64,4096)
+                for suffix in (("", "_f32") if (n,k) in exporter.native_attention_f32_shapes() | exporter.mc_fp8_f32_shapes() | {(8192,2048)} else ("",))}
+    assert exporter.native_fp8_head_shapes() == {(202112,8192),(154880,6144),(128896,4096)}
+    for n,k in exporter.native_fp8_head_shapes():
+        expected.add(f"n{n}_k{k}_m64_f32")
+        assert f"n{n}_k{k}_m4096_f32" not in expected, "head is microbatched at64rows"
+    assert exporter.mc_fp8_core_shapes()["glm"] >= {(640,6144),(1024,6144),(6144,1024),(6144,2048)}
+    assert exporter.mc_fp8_core_shapes()["step5"] >= {(384,4096),(768,4096),(4096,8192),(4096,13824)}
+    assert exporter.mc_fp8_f32_shapes() == {(6144,1024),(6144,2048)}
     assert len(programs) == len(expected) and {p[0] for p in programs} == expected
     jobs = {job[0]: job[1:] for job in compare_sm.jobs("all")}
     assert jobs["native-attention-fp8"] == ("export_b12x_dsv4_aot.py",
