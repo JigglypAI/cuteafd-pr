@@ -117,6 +117,61 @@ pub enum SegmentArithmetic {
     Nvfp4A4 { slice: u32 },
 }
 
+/// One EXL3 warp-specialized row-addressed (merged-wave) program's arena
+/// geometry, as its package manifest records it (`segment_geometry`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Exl3SegmentGeometry {
+    pub maximum: u32,
+    pub hidden: u32,
+    pub intermediate: u32,
+    pub topk: u32,
+    pub experts: u32,
+    pub block: u32,
+    pub max_m_blocks: u32,
+    /// The export's workspace SM capacity (never the running device's).
+    pub workspace_sms: u32,
+}
+
+/// Region names of an EXL3 WS segment arena, in arena order.
+pub const EXL3_SEGMENT_REGIONS: [&str; 12] = ["block_expert_ids", "packed_route_indices", "packed_route_count",
+    "expert_offsets", "expert_counts", "rotation_gate", "fc1", "activated", "output", "fc1_scratch",
+    "fc2_scratch", "workspace"];
+
+impl Exl3SegmentGeometry {
+    /// Byte sizes of every region at `rows` live rows, in arena order (fork
+    /// `exl3_ws_segment_scratch_regions`). Each region starts on 256 bytes.
+    /// The block-expert table keeps the compiled maximum, fixing later offsets
+    /// only by live rows; `None` on an invalid extent.
+    pub fn regions(self, rows: u32) -> Option<[u64; 12]> {
+        if rows == 0 || rows > self.maximum || self.maximum > SEGMENT_MAX_ROWS
+            || [self.hidden, self.intermediate, self.topk, self.experts, self.workspace_sms].contains(&0)
+            || !matches!(self.block, 16 | 32 | 64) { return None; }
+        let slots = |routes: u64| {
+            let bound = routes + u64::from(self.experts) * (u64::from(self.block) - 1);
+            if routes < u64::from(self.experts) { (routes * u64::from(self.block)).min(bound) } else { bound }
+        };
+        let routes = u64::from(rows) * u64::from(self.topk);
+        let maximum_slots = slots(u64::from(self.maximum) * u64::from(self.topk));
+        if u64::from(self.max_m_blocks) < maximum_slots.div_ceil(u64::from(self.block)) { return None; }
+        let (h, i, e) = (u64::from(self.hidden), u64::from(self.intermediate), u64::from(self.experts));
+        Some([4 * u64::from(self.max_m_blocks), 4 * slots(routes), 4, 4 * (e + 1), 4 * e,
+            2 * routes * h, 4 * routes * i, 2 * routes * i, 8 * u64::from(rows), 4, 4,
+            4 * (4 * u64::from(self.workspace_sms) + 2)])
+    }
+
+    /// Each region's offset and the arena's total bytes at `rows`.
+    pub fn layout(self, rows: u32) -> Option<([u64; 12], u64)> {
+        let regions = self.regions(rows)?;
+        let mut offsets = [0u64; 12];
+        let mut at = 0u64;
+        for (offset, bytes) in offsets.iter_mut().zip(regions) {
+            *offset = at;
+            at = at.checked_add(bytes.div_ceil(256) * 256)?;
+        }
+        Some((offsets, at))
+    }
+}
+
 /// Exact streamed intermediate arena with the compiled tile-table offset.
 /// This does not include row descriptors, wire frames or singleton scratch.
 pub fn segment_scratch_bytes(hidden: u32, experts: u32, topk: u32, arithmetic: SegmentArithmetic,
@@ -290,6 +345,24 @@ mod tests {
         assert!(segment_scratch_bytes(4096, 256, 8, stream, SEGMENT_MAX_ROWS + 1, SEGMENT_MAX_ROWS).is_none());
         assert!(segment_scratch_bytes(4096, 256, 8, stream, 0, SEGMENT_MAX_ROWS).is_none());
         assert!(segment_scratch_bytes(4096, 256, 8, stream, 4096, 16384).is_none(), "code bound above 2 units");
+    }
+
+    #[test]
+    fn exl3_ws_segment_arena_matches_the_fork_formula_at_live_rows() {
+        // GLM 5.3 TP4 rank width 512, K4/K5, block 64, SM121 workspace 48: the
+        // fork's `exl3_ws_segment_scratch_bytes` (sparkinfer #342) at each size,
+        // and the exported compiled-maximum arena (8192 rows).
+        let glm = Exl3SegmentGeometry { maximum: 8192, hidden: 6144, intermediate: 512, topk: 8,
+            experts: 256, block: 64, max_m_blocks: 1276, workspace_sms: 48 };
+        for (rows, bytes) in [(2048, 251_813_888), (2752, 338_349_568), (4096, 503_554_048),
+            (5504, 676_625_408), (8192, 1_007_034_368)] {
+            assert_eq!(glm.layout(rows).unwrap().1, bytes, "rows {rows}");
+        }
+        let (offsets, _) = glm.layout(8192).unwrap();
+        assert_eq!(offsets[5], 334_336, "rotation_gate follows the compiled block table");
+        assert_eq!(offsets[8], 1_006_967_296, "output-address table offset");
+        assert!(glm.layout(8193).is_none() && glm.layout(0).is_none());
+        assert!(Exl3SegmentGeometry { max_m_blocks: 1, ..glm }.layout(1).is_none(), "undersized block table");
     }
 
     #[test]
