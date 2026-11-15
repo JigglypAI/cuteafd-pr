@@ -820,6 +820,10 @@ impl<'a> DsparkDrafter<'a> {
         })
     }
 
+    fn on_device<T>(&self, enqueue: impl FnOnce() -> Result<T>) -> Result<T> {
+        device::Device { library: self.library, id: self.hidden_norm.buffer.device_id }.run(enqueue)
+    }
+
     /// Retained owners including canonical K/V and prepared request scratch.
     pub fn runtime_receipts(&self, devices:cuteafd_loader::placement::planner::CoordinatorDevices<'_>,
         prefix:&str) -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
@@ -936,10 +940,12 @@ impl<'a> DsparkDrafter<'a> {
         let (h, width) = (self.cfg.hidden, self.cfg.taps.len() * self.cfg.hidden);
         ensure!(to + n <= TAP_ROWS, "tap rows {to}..{} exceed {TAP_ROWS}", to + n);
         // SAFETY: `streams` holds first + n rows of hc streams; the tap buffer TAP_ROWS rows.
-        unsafe {
-            self.library.glm_dflash_tap_mean(streams.cast::<u8>().add(first * hc * h * 2).cast(),
-                self.taps.buffer.ptr.cast::<u8>().add(to * width * 2).cast(), n, h, hc, width, index * h, self.stream)
-        }
+        self.on_device(|| {
+            // SAFETY: caller retains target streams and this owner retains the
+            // tap destination/stream; all launches use the owner's device.
+            unsafe { self.library.glm_dflash_tap_mean(streams.cast::<u8>().add(first * hc * h * 2).cast(),
+                self.taps.buffer.ptr.cast::<u8>().add(to * width * 2).cast(), n, h, hc, width, index * h, self.stream) }
+        })
     }
 
     /// Copy a row span already concatenated in checkpoint tap order. The
@@ -959,7 +965,11 @@ impl<'a> DsparkDrafter<'a> {
         let input = CuteafdDeviceBuffer { ptr:source.ptr.wrapping_byte_add(first * pitch),bytes:rows * pitch,..source };
         let output = CuteafdDeviceBuffer { ptr:at(&self.taps,to * pitch),bytes:rows * pitch,..self.taps.buffer };
         // SAFETY: caller retains the checked disjoint source; this owner retains taps.
-        unsafe { self.library.copy_d2d_async(output,input,rows * pitch,self.stream) }
+        self.on_device(|| {
+            // SAFETY: caller retains the checked disjoint source and this
+            // drafter retains its destination and stream on the scoped device.
+            unsafe { self.library.copy_d2d_async(output,input,rows * pitch,self.stream) }
+        })
     }
 
     /// Copies ordered, strided target taps without a host transfer. Reads use
@@ -979,7 +989,12 @@ impl<'a> DsparkDrafter<'a> {
         // Validate the complete set before enqueueing any transfer.
         validate_target_taps(taps, &self.cfg.taps, self.cfg.hidden, self.stream, end, n)?;
         if n == 0 { return Ok(()); }
-        let device_id = self.library.cuda_get_device()?;
+        let device_id = self.hidden_norm.buffer.device_id;
+        self.on_device(|| self.capture_target_taps_on_device(taps, first, n, to, width_bytes, pitch, device_id))
+    }
+
+    fn capture_target_taps_on_device(&self, taps: &[super::target::HiddenTap], first: usize,
+        n: usize, to: usize, width_bytes: usize, pitch: usize, device_id: i32) -> Result<()> {
         for (index, tap) in taps.iter().enumerate() {
             let source_pitch = tap.stride.checked_mul(2).context("target tap pitch overflow")?;
             let offset = first.checked_mul(source_pitch).context("target tap offset overflow")?;
@@ -1001,6 +1016,10 @@ impl<'a> DsparkDrafter<'a> {
 
     /// Writes the context K/V of committed tapped rows (in tap-row order).
     pub fn update(&self, rows: &[ContextRow]) -> Result<()> {
+        self.on_device(|| self.update_on_device(rows))
+    }
+
+    fn update_on_device(&self, rows: &[ContextRow]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -1096,6 +1115,10 @@ impl<'a> DsparkDrafter<'a> {
     }
 
     pub(crate) fn reset_context(&self, slot: usize, origin: usize) -> Result<()> {
+        self.on_device(|| self.reset_context_on_device(slot, origin))
+    }
+
+    fn reset_context_on_device(&self, slot: usize, origin: usize) -> Result<()> {
         ensure!(slot < self.slots && origin <= self.context_capacity, "block dSpark reset outside admission");
         if let Some(context) = &self.paged {
             // SAFETY: retire the previous request before releasing its page ownership.
@@ -1114,6 +1137,10 @@ impl<'a> DsparkDrafter<'a> {
     }
 
     pub(crate) fn discard_context(&self, slot: usize) -> Result<()> {
+        self.on_device(|| self.discard_context_on_device(slot))
+    }
+
+    fn discard_context_on_device(&self, slot: usize) -> Result<()> {
         ensure!(slot < self.slots, "block dSpark discard outside admission");
         if let Some(context) = &self.paged {
             // SAFETY: cancellation cannot recycle destinations still read by queued work.
@@ -1280,8 +1307,13 @@ impl<'a> DsparkDrafter<'a> {
 
     fn put(&self, dev: &Dev<'_>, bytes: &[u8]) -> Result<()> {
         ensure!(bytes.len() <= dev.buffer.bytes, "table exceeds its buffer");
-        // SAFETY: metadata and its consumers share this drafter's owned stream.
-        unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, self.stream) }
+        ensure!(dev.buffer.device_id == self.hidden_norm.buffer.device_id,
+            "block dSpark upload destination is not on its owner device");
+        self.on_device(|| {
+            // SAFETY: destination and stream share this retained device; the
+            // ordered uploader creates and records its event in this scope.
+            unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, self.stream) }
+        })
     }
 
     /// Explicit serving startup admission; other callers retain lazy allocation.
@@ -1368,6 +1400,11 @@ impl<'a> DsparkDrafter<'a> {
     }
 
     fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadRef<'_>, serving: bool)
+        -> Result<Vec<Draft>> {
+        self.on_device(|| self.draft_on_device(sequences, input, head, serving))
+    }
+
+    fn draft_on_device(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadRef<'_>, serving: bool)
         -> Result<Vec<Draft>> {
         ensure!(!matches!(head, HeadRef::Bf16(p) if p.is_null()), "dSpark has no borrowed target head");
         let c = &self.cfg;
@@ -1760,6 +1797,30 @@ mod tests {
                         assert_eq!(owner.buffer.device_id, device.id, "workspace owner follows drafter, not caller");
                     }
                     }
+                    drafter.put(&drafter.context_positions, &17i64.to_le_bytes())?;
+                    assert_eq!(library.cuda_get_device()?, 0, "ordered put restores caller device");
+                    let staging = library.ordered_h2d_staging_buffer(drafter.context_positions.buffer,
+                        drafter.stream)?.context("ordered upload staging missing on retained device")?;
+                    assert!(staging.bytes >= 8);
+                    drafter.on_device(|| {
+                        assert_eq!(library.cuda_get_device()?, device.id);
+                        let event = library.cuda_event_create()?;
+                        // SAFETY: this fixture retains the owner stream/buffer;
+                        // explicit event and enqueue run on the scoped device.
+                        unsafe {
+                            library.cuda_zero_bytes_async(drafter.context_slots.buffer, 4, drafter.stream)?;
+                            library.cuda_event_record(event, drafter.stream)?;
+                            library.cuda_event_synchronize(event)?;
+                            library.cuda_event_destroy(event)?;
+                        }
+                        Ok(())
+                    })?;
+                    assert_eq!(library.cuda_get_device()?, 0, "enqueue restores caller device");
+                    drafter.reset_context(0, 0)?;
+                    assert_eq!(library.cuda_get_device()?, 0, "reset restores caller device");
+                    let source = include_str!("block_dspark.rs");
+                    assert!(source.contains("self.on_device(|| self.update_on_device(rows))"));
+                    assert!(source.contains("self.on_device(|| self.draft_on_device(sequences, input, head, serving))"));
                     Ok(drafter)
                 }
                 let baseline = run(device,&programs,&snapshot,representation,None,&expected)?;
