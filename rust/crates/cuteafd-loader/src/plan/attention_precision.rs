@@ -2,8 +2,10 @@
 //! kernel's own QK and PV products at prefill (`ATTENTION_PREFILL_PRECISION`).
 //!
 //! It is not a weight format (`CORE_VIEW`), a projection activation format or
-//! the KV cache storage format. Decode attention has no key. A family states
-//! the modes its exported prefill programs run; `auto` takes the first, or the
+//! the KV cache storage format. Decode attention has no key. `bf16` is BF16
+//! Q, V and P with exact keys: an FP8 key enters the QK product as its exact
+//! BF16 widening and its group scale applies to the FP32 partial. A family
+//! states the modes its prefill programs run; `auto` takes the first, or the
 //! family's measured choice for an FP8 core view.
 use super::PlanError;
 
@@ -14,12 +16,12 @@ pub const OPTION: &str = "--attention-prefill-precision";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AttentionPrecision {
-    /// BF16 Q, K, V and P.
+    /// BF16 Q, V and P; keys exact (see the module note).
     Bf16,
     /// BF16 Q and K; E4M3 P and V. Not a requestable value: the mode the
     /// DeepSeek prefill programs run until their BF16 PV export lands.
     Bf16QkFp8Pv,
-    /// E4M3 Q, K, V and P.
+    /// E4M3 Q, K, V and P (GLM's native kernel: two-term E4M3 Q and P).
     Fp8,
 }
 
