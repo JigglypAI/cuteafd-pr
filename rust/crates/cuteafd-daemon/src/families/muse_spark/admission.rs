@@ -44,7 +44,6 @@ pub(crate) fn spark_plan(placement: &Placement, prefill: PrefillPlan, cutoff: Cu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cuteafd_loader::plan::{layout::LayoutOptions, testing, ExpertPlacement, PlanOptions};
 
     /// The coordinator transport accepts the sealed frame at every wide format
     /// (the native budget admits partial-reply frames up to the all-BF16 bound).
