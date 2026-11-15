@@ -5,18 +5,22 @@ import argparse
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import importlib.metadata
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import sys
+import tempfile
 
 if __package__ in (None, ''):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kimi_k3.uniform_k2.storage import atomic_json, canonical, file_identity, verify_receipt
+from kimi_k3.uniform_k2.storage import atomic_json, canonical, file_identity, fsync_directory, verify_receipt
 
 TARGET_REPO = 'wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC'
 MAX_METADATA_BYTES = 64 << 20
+LFS_ATTRIBUTES = b'*.safetensors filter=lfs diff=lfs merge=lfs -text\n'
 
 
 def load(path):
@@ -52,15 +56,58 @@ def manifest_digest(files):
                                      for n, v in sorted(files.items())}).encode()).hexdigest()
 
 
-def publication_inventory(output):
-    """Use validated streaming receipts for weights; read only small metadata."""
-    output = Path(output).resolve(strict=True)
-    state, validation = (load(output / n) for n in ('package-state.json', 'package-validation.json'))
+def _validated_package(output):
+    state, validation = (load(regular(output / n)) for n in ('package-state.json', 'package-validation.json'))
     if (state.get('identity') != validation.get('identity') or state.get('copies') != {}
             or state['identity'].get('family') != 'inkling2' or 'direct_core_selection' not in state
             or validation.get('status') != 'validated-headers-and-byte-exactness'):
         raise ValueError('publication requires validated independent Inkling MC package')
+    return state, validation
+
+
+def prepare_publication_metadata(output, root):
+    """Supply Hub protocol metadata without rewriting the sealed numerical package."""
+    output, root = Path(output).absolute(), Path(root)
+    state, _ = _validated_package(output)
+    if '.gitattributes' in state['new_files']:
+        return  # Already sealed: publication_inventory verifies its original hash.
+    path = output / '.gitattributes'
+    if not path.exists() and not path.is_symlink():
+        fd, temporary = tempfile.mkstemp(prefix='.gitattributes.', suffix='.tmp', dir=output)
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(LFS_ATTRIBUTES)
+                stream.flush()
+                os.fchmod(stream.fileno(), 0o644)
+                os.fsync(stream.fileno())
+            try:
+                os.link(temporary, path)  # Publish once; never overwrite an existing asset.
+            except FileExistsError:
+                pass
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+    if regular(path).read_bytes() != LFS_ATTRIBUTES:
+        raise ValueError('unsealed publication attributes differ from canonical LFS rules')
+    fsync_directory(output)
+    record = dict(schema='cuteafd-inkling2-publication-metadata-v1',
+        role='publication-only-protocol-metadata', filename=path.name,
+        package_identity=state['identity'], file_identity=file_identity(path), **metadata_identity(path))
+    marker = root / 'publication-metadata.json'
+    if marker.exists() and load(marker) != record:
+        raise ValueError('publication metadata recovery receipt differs')
+    if not marker.exists():
+        atomic_json(marker, record)
+
+
+def publication_inventory(output):
+    """Use validated streaming receipts for weights; read only small metadata."""
+    output = Path(output).resolve(strict=True)
+    state, validation = _validated_package(output)
     names = set(state['new_files']) | {'package-validation.json', 'package-provenance.json'}
+    if '.gitattributes' not in names:
+        if regular(output / '.gitattributes').read_bytes() != LFS_ATTRIBUTES:
+            raise ValueError('unsealed publication attributes differ from canonical LFS rules')
+        names.add('.gitattributes')
     required = {'README.md', '.gitattributes', 'cuteafd-mc.json', 'config.json', 'config.k8.json',
         'config.k6.json', 'quantize_config.json', 'quantize_config.k8.json', 'quantize_config.k6.json',
         'model.safetensors.index.json', 'model.k8.safetensors.index.json', 'model.k6.safetensors.index.json'}
@@ -157,11 +204,53 @@ def _check_sources(files):
             raise ValueError('publication source changed since receipt')
 
 
+def _upload_with_writer_hashes(api, arguments, files):
+    """Keep the native folder pipeline, supplying its lazy SHA fields from receipts."""
+    if importlib.metadata.version('huggingface_hub') != '2.2.0':
+        raise ValueError('receipt-backed native folder upload requires qualified huggingface_hub 2.2.0')
+    builder = getattr(api, '_prepare_upload_folder_additions', None)
+    if not callable(builder):
+        raise ValueError('native folder operation builder is unavailable')
+    name = '_prepare_upload_folder_additions'
+    missing = object()
+    prior = vars(api).get(name, missing)
+
+    def prepared(*args, **kwargs):
+        operations = builder(*args, **kwargs)
+        names = [operation.path_in_repo for operation in operations]
+        if len(names) != len(set(names)) or set(names) != set(files):
+            raise ValueError('native upload operations differ from publication inventory')
+        _check_sources(files)
+        for operation in operations:
+            row = files[operation.path_in_repo]
+            info = operation.upload_info
+            if (not isinstance(operation.path_or_fileobj, (str, Path))
+                    or Path(operation.path_or_fileobj).absolute() != Path(row['path'])
+                    or info.size != row['bytes']):
+                raise ValueError('native upload source differs from sealed receipt')
+            digest = bytes.fromhex(row['sha256'])
+            if info.is_hashed and info.sha256 != digest:
+                raise ValueError('native upload digest differs from writer receipt')
+            info.sha256 = digest  # Never mark uploaded/committed: the SDK owns those states.
+        return operations
+
+    # Only this task-owned client is adapted, for this synchronous upload call.
+    setattr(api, name, prepared)
+    try:
+        return api.upload_folder(**arguments,
+            commit_message='Publish calibrated Inkling 2 K4 MC checkpoint')
+    finally:
+        if prior is missing:
+            delattr(api, name)
+        else:
+            setattr(api, name, prior)
+
+
 def publish(output, root, *, api=None, anonymous_api=None, fetch_metadata=None):
     """Resume native Hub upload, then seal a metadata-verified publication receipt.
 
-    Call only after numerical completion. The SDK's native upload cache handles
-    interrupted uploads; no parent repository or CommitOperationCopy is used.
+    Call only after numerical completion. Native folder/Xet upload handles
+    interrupted transfers; no parent repository or CommitOperationCopy is used.
     """
     from huggingface_hub import HfApi, hf_hub_download
     from huggingface_hub.errors import RepositoryNotFoundError
@@ -185,6 +274,7 @@ def publish(output, root, *, api=None, anonymous_api=None, fetch_metadata=None):
                 raise ValueError('publication completion receipt differs')
             verify_hub(anonymous_api, saved['revision'], saved['files'])
             return saved  # Completed jobs stay complete even after standalone cleanup.
+        prepare_publication_metadata(output, root)
         packet = publication_inventory(output)
         plan_path = root / 'publication-plan.json'
         if plan_path.exists() and load(plan_path) != packet:
@@ -214,10 +304,7 @@ def publish(output, root, *, api=None, anonymous_api=None, fetch_metadata=None):
         _check_sources(packet['files'])
         arguments = dict(repo_id=TARGET_REPO, repo_type='model', folder_path=str(output),
                          allow_patterns=sorted(packet['files']))
-        if hasattr(api, 'upload_large_folder'):
-            api.upload_large_folder(**arguments, num_workers=4, print_report=True, print_report_every=1800)
-        else:
-            api.upload_folder(**arguments, commit_message='Publish calibrated Inkling 2 K4 MC checkpoint')
+        _upload_with_writer_hashes(api, arguments, packet['files'])
         _check_sources(packet['files'])
         head = api.model_info(TARGET_REPO, files_metadata=True)
         revision = _field(head, 'sha')

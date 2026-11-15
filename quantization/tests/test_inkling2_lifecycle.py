@@ -17,7 +17,7 @@ from inkling2.export import DirectMCWriter
 REVISION = '1' * 40
 
 
-def completed_export(tmp_path):
+def completed_export(tmp_path, *, attributes=True):
     args, entries, final = export_fixture(tmp_path)
     assets = tmp_path / 'assets'
     assets.mkdir()
@@ -25,7 +25,8 @@ def completed_export(tmp_path):
     (assets / '.gitattributes').write_text('*.safetensors filter=lfs diff=lfs merge=lfs -text\n')
     writer = DirectMCWriter(**args)
     writer.write_group('layer-000', **entries)
-    writer.finalize(**final, assets={n: assets / n for n in ('README.md', '.gitattributes')})
+    writer.finalize(**final, assets={n: assets / n for n in
+        (('README.md', '.gitattributes') if attributes else ('README.md',))})
     return args['output']
 
 
@@ -48,9 +49,19 @@ class Hub:
                 lfs=SimpleNamespace(sha256=v['sha256']) if n.endswith('.safetensors') else None)
                 for n, v in self.remote.items()])
 
+    def _prepare_upload_folder_additions(self, folder_path, path_in_repo='', **kwargs):
+        from huggingface_hub import CommitOperationAdd
+        return [CommitOperationAdd(name, Path(folder_path) / name)
+                for name in kwargs['allow_patterns']]
+
     def upload_folder(self, **kwargs):
         self.uploads += 1
         assert set(kwargs['allow_patterns']) == set(self.files)
+        for operation in self._prepare_upload_folder_additions(
+                kwargs['folder_path'], allow_patterns=kwargs['allow_patterns']):
+            assert operation.upload_info.is_hashed
+            assert operation.upload_info.sha256.hex() == self.files[operation.path_in_repo]['sha256']
+            assert operation._is_uploaded is False
         assert 'delete_patterns' not in kwargs
         assert 'parent_repo' not in kwargs
         self.revision = REVISION
@@ -85,6 +96,90 @@ def test_publication_uses_streaming_receipts_and_metadata_only(tmp_path, monkeyp
     shutil.rmtree(output)
     assert publish.publish(output, root, api=api, anonymous_api=api) == receipt
     assert api.uploads == 1
+
+
+def test_publish_supplies_missing_protocol_metadata_without_rewriting_sealed_package(tmp_path, monkeypatch):
+    # Match Runner.seal: it supplies README/tokenizer assets, not .gitattributes.
+    output = completed_export(tmp_path, attributes=False)
+    sealed = {name: (output / name).read_bytes() for name in
+              ('package-state.json', 'package-validation.json', 'package-provenance.json')}
+    assert '.gitattributes' not in publish.load(output / 'package-state.json')['new_files']
+    real_open = Path.open
+
+    def no_weight_reads(path, *args, **kwargs):
+        if str(path).endswith('.safetensors'):
+            pytest.fail('publication metadata recovery reread weights')
+        return real_open(path, *args, **kwargs)
+
+    class PreparedHub(Hub):
+        def upload_folder(self, **kwargs):
+            self.files = publish.publication_inventory(output)['files']
+            return super().upload_folder(**kwargs)
+
+    monkeypatch.setattr(Path, 'open', no_weight_reads)
+    api, root = PreparedHub({}), tmp_path / 'publication'
+    saved = publish.publish(output, root, api=api, anonymous_api=api)
+    assert saved['status'] == 'passed'
+    assert (output / '.gitattributes').read_bytes() == publish.LFS_ATTRIBUTES
+    assert all((output / name).read_bytes() == raw for name, raw in sealed.items())
+    assert publish.load(root / 'publication-metadata.json')['role'] == 'publication-only-protocol-metadata'
+    before = file_identity(output / '.gitattributes')
+    publish.prepare_publication_metadata(output, root)
+    assert file_identity(output / '.gitattributes') == before
+    assert not list(output.glob('.gitattributes.*.tmp'))
+
+
+@pytest.mark.parametrize('kind', ['conflict', 'symlink'])
+def test_unsealed_publication_attributes_are_never_overwritten(tmp_path, kind):
+    output = completed_export(tmp_path, attributes=False)
+    path = output / '.gitattributes'
+    if kind == 'conflict':
+        path.write_bytes(b'foreign rules\n')
+    else:
+        path.symlink_to(output / 'README.md')
+    with pytest.raises(ValueError, match='attributes|symlink'):
+        publish.prepare_publication_metadata(output, tmp_path / 'publication')
+    assert path.is_symlink() if kind == 'symlink' else path.read_bytes() == b'foreign rules\n'
+
+
+def test_native_folder_pipeline_gets_known_sha_and_restores_client_builder(tmp_path, monkeypatch):
+    from huggingface_hub import HfApi
+    import huggingface_hub._upload_pipeline as pipeline
+    import huggingface_hub.lfs as lfs
+    output = completed_export(tmp_path)
+    files = publish.publication_inventory(output)['files']
+    api = HfApi(token=False)
+    monkeypatch.setattr(api, '_validate_yaml', lambda *a, **kw: None)
+    monkeypatch.setattr(api, '_prepare_folder_deletions', lambda **kw: [])
+
+    def no_extra_hash(*args, **kwargs):
+        pytest.fail('SDK attempted an extra payload SHA pass')
+
+    monkeypatch.setattr(lfs, 'sha_fileobj', no_extra_hash)
+
+    def native(client, **kwargs):
+        assert client is api and not kwargs['delete_operations']
+        operations = kwargs['add_operations']
+        assert {op.path_in_repo for op in operations} == set(files)
+        for op in operations:
+            assert op.upload_info.is_hashed
+            assert op.upload_info.sha256.hex() == files[op.path_in_repo]['sha256']
+            assert op._is_uploaded is False
+        return 'native-pipeline'
+
+    monkeypatch.setattr(pipeline, 'pipelined_upload', native)
+    arguments = dict(repo_id=publish.TARGET_REPO, repo_type='model', folder_path=str(output),
+                     allow_patterns=sorted(files))
+    assert publish._upload_with_writer_hashes(api, arguments, files) == 'native-pipeline'
+    assert '_prepare_upload_folder_additions' not in vars(api)
+
+    def interrupted(client, **kwargs):
+        raise OSError('native transfer interrupted')
+
+    monkeypatch.setattr(pipeline, 'pipelined_upload', interrupted)
+    with pytest.raises(OSError, match='interrupted'):
+        publish._upload_with_writer_hashes(api, arguments, files)
+    assert '_prepare_upload_folder_additions' not in vars(api)
 
 
 def test_partial_native_upload_resumes_exact_allowlist(tmp_path):
