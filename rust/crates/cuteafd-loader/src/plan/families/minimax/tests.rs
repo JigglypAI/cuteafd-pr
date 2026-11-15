@@ -1858,7 +1858,7 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
     let automatic = gather(&request).unwrap();
     assert!(automatic.heads());
     assert_eq!(automatic.targets, heads.targets);
-    let solve = crate::placement::families::minimax_m3::request(automatic.context, Some(32768),
+    let solve = crate::placement::families::minimax_m3::request(automatic.context, Some(1 << 20),
         crate::placement::Onboard::Layers(0), automatic.prefill,
         crate::placement::planner::Operation::Serving, None, Default::default());
     let planned = automatic.admit_serving(solve.clone()).unwrap();
