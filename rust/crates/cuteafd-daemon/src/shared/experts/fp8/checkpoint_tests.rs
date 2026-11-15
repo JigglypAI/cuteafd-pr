@@ -319,3 +319,149 @@ fn step5_checkpoint_mixed_native_execution_and_graph_replay() -> Result<()> {
     }
     Ok(())
 }
+
+/// Deterministic NVFP4 operand for `experts` x `[n, k]`: packed E2M1 codes,
+/// positive E4M3 block scales, then FP32 alpha and input-scale per expert,
+/// laid out as the installed package reads it (fork `_nvfp4_moe_a4`).
+fn nvfp4_operand(experts: usize, n: usize, k: usize, salt: usize, divisor: bool) -> (Vec<u8>, Vec<u8>) {
+    let packed = (0..experts * n * k / 2).map(|at| ((at * 37 + salt * 11) % 251) as u8).collect::<Vec<_>>();
+    let mut scales = (0..experts * n * k / 16).map(|at| (4 + (at * 7 + salt) % 7) as u8 * 8 + ((at + salt) % 8) as u8)
+        .collect::<Vec<_>>();
+    for expert in 0..experts {
+        let alpha = 1e-3f32 + (expert % 5) as f32 * 4e-4;
+        scales.extend((if divisor { 1.0 / alpha } else { alpha }).to_le_bytes());
+    }
+    for expert in 0..experts {
+        let input = (5.0f32 / (6.0 * 448.0)) * 2f32.powi((expert % 7) as i32 - 3);
+        scales.extend((if divisor { 1.0 / input } else { input }).to_le_bytes());
+    }
+    (packed, scales)
+}
+
+/// Merged-wave correctness of the shared Spark staging over a real installed
+/// row-addressed NVFP4 A4 package: units staged from mapped frames and flushed
+/// as one wave must write every member's reply byte-identical to that unit run
+/// alone through the same worker (#2191). One Spark; the package is any
+/// `fp8-<family>-nvfp4a4/<layout>` Spark export with a segmented program.
+#[test]
+#[ignore = "requires an SM121 Spark, CUTEAFD_NATIVE_LIB and a Spark NVFP4 A4 CUTEAFD_NVFP4_SEGMENT_PACKAGE"]
+fn nvfp4_merged_waves_are_byte_identical_to_singleton_units() -> Result<()> {
+    use crate::shared::experts::execution::HostExpertExchange;
+    use crate::shared::memory::HostAllocation;
+    use cuteafd_transport::{expert::{BackboneRequest, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
+        ExpertProtocolV2Request, ExpertProtocolV2RequestView, ExpertProtocolV2RowDescriptor,
+        ExpertProtocolV2RouteEntry, ExpertV2Dtype, ExpertV2SourceKind, ProtocolV2RequestDevicePayload,
+        EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN};
+    // SAFETY: this opt-in test accepts only operator-selected trusted build artifacts.
+    let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+    library.cuda_set_device(0)?;
+    let directory = PathBuf::from(std::env::var("CUTEAFD_NVFP4_SEGMENT_PACKAGE")?);
+    // SAFETY: the selected native package targets the current CUDA device.
+    let module = unsafe { Fp8MoeModule::load(&directory)? };
+    let info = module.info().clone();
+    ensure!(info.weights == Fp8MoeWeights::Nvfp4 && !info.wire_input && module.segment_recipe().is_some(),
+        "merged-wave oracle requires a BF16-input NVFP4 package with a row-addressed program");
+    cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry { hidden: info.hidden as u32,
+        experts: info.experts as u32, topk: info.topk as u32, intermediate: info.intermediate as u32, layers: 1 })
+        .map_err(|_| anyhow::anyhow!("geometry already set in this process; run this test alone"))?;
+    let (hidden, topk, experts) = (info.hidden, info.topk, info.experts);
+    let divisor = info.scale_convention == cuteafd_ffi::fp8_moe::Fp8MoeScaleConvention::Divisor;
+    let mut regions = Vec::new();
+    for (salt, (n, k)) in [(info.slice, hidden), (info.slice, hidden), (hidden, info.slice)].into_iter().enumerate() {
+        let (packed, scales) = nvfp4_operand(experts, n, k, salt, divisor);
+        regions.push(Some(upload(&library, &packed)?.into()));
+        regions.push(Some(upload(&library, &scales)?.into()));
+    }
+    let weights = Rc::new(Fp8Weights { layers: vec![Fp8Layer { layer: 3,
+        slice: cuteafd_core::SparkSlice { unit_map: None, layer: 3, first: 0, width: info.slice as u32,
+            stored_width: info.slice as u32, tiers: vec![], projection_counts: vec![] }, regions }],
+        module, bf16_module: None, tp: info.tp, rank: 0, weight_read_bytes: 1 });
+    // The serving unit (2752 rows), three buffered; one merged launch holds two units.
+    let unit = 2752usize;
+    let capacity = info.capacity_for(unit).context("package lacks a covering capacity")?;
+    let extent = cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill,
+        capacity: unit as u32, compiled: capacity as u32, staging_rows: unit as u32, buffered_units: 3 };
+    let scratch = Rc::new(DeviceAllocation::new(&library, weights.owner_scratch_bytes(extent)?, crate::shared::memory::TEST)?);
+    let mut worker = worker::Fp8Worker::with_extent(&library, weights.clone(), unit as u32, Some(scratch), Some(extent))?;
+    worker.prepare_waves(extent)?;
+    worker.defer(3, unit, cuteafd_core::ExecutionOwner::Prefill)?;
+    worker.bind_layer(0)?;
+    let executor = worker.executor_id();
+    let prefix = EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
+    // Members: full units, uneven units and a short tail; hot experts make
+    // multi-chunk groups whose rows interleave across members.
+    let rows = [2752u32, 2752, 2487, 1900, 333];
+    let mut frames = Vec::new();
+    let mut replies = Vec::new();
+    for (unit_index, &count) in rows.iter().enumerate() {
+        let ids = (0..count as usize * topk).map(|route| {
+            let row = route / topk;
+            let hot = if route % topk < 2 { (route % topk) as u32 } else {
+                ((row * 13 + unit_index * 29 + (route % topk) * 7) % experts) as u32 };
+            hot.max(if route % topk == 1 { 1 } else { 0 })
+        }).collect::<Vec<_>>();
+        let mut owned = ExpertProtocolV2Request::new(500 + unit_index as u64, 17, 3, hidden as u32,
+            ExpertV2Dtype::Bf16,
+            (0..count).map(|row| ExpertProtocolV2RowDescriptor { row_id: u64::from(row),
+                source_kind: ExpertV2SourceKind::Prefill, source_request_id: unit_index as u64,
+                token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32 }).collect(),
+            ids.iter().enumerate().map(|(route, &expert_id)| ExpertProtocolV2RouteEntry {
+                row_index: (route / topk) as u32, expert_id,
+                gate_weight: ((route % topk + 1 + unit_index) as f32) / 16.0 }).collect(),
+            (0..count as usize * hidden).flat_map(|at| {
+                let value = bf16((((at * 31 + unit_index * 977) % 509) as f32 - 254.0) / (64.0 + unit_index as f32 * 8.0));
+                ((value.to_bits() >> 16) as u16).to_le_bytes()
+            }).collect())?;
+        owned.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        let encoded = owned.encode()?;
+        let mut frame = HostAllocation::new(&library, encoded.len(), crate::shared::memory::TEST)?;
+        frame.bytes_mut().copy_from_slice(&encoded);
+        frames.push(frame);
+        replies.push(HostAllocation::new(&library, prefix + count as usize * hidden * 2 + 64, crate::shared::memory::TEST)?);
+    }
+    let mut exchange = HostExpertExchange::new(unit as u32)?;
+    // Submit `members` back to back (the worker stages them while nothing
+    // launches), then force one flush and drain.
+    let mut run = |members: &[usize], worker: &mut worker::Fp8Worker<'_>| -> Result<Vec<Vec<u8>>> {
+        for &member in members {
+            replies[member].bytes_mut().fill(0xa5);
+            let view = ExpertProtocolV2RequestView::parse(frames[member].bytes())?;
+            let request = BackboneRequest::parse(frames[member].bytes(), unit as u32)?;
+            let alias = library.cuda_host_buffer_device_alias(frames[member].buffer)?;
+            let mapped = ProtocolV2RequestDevicePayload {
+                hidden_payload: cuteafd_ffi::CuteafdDeviceBuffer { ptr: view.hidden_payload().as_ptr().cast_mut().cast(),
+                    bytes: view.hidden_payload().len(), ..alias }, execution_lane: 0,
+                response_slot: Some(library.cuda_host_buffer_device_alias(replies[member].buffer)?) };
+            // SAFETY: every frame and reply outlives the drain below.
+            unsafe { worker.execute_mapped_payload(&request, executor, &mut exchange, mapped)?; }
+        }
+        worker.flush_staged()?;
+        worker.synchronize()?;
+        while !worker.pending_is_empty() { ensure!(worker.unit_ready()?, "drained unit not ready"); worker.complete()?; }
+        Ok(members.iter().map(|&member| {
+            let end = prefix + rows[member] as usize * hidden * 2;
+            let bytes = replies[member].bytes();
+            assert!(bytes[end..].iter().all(|&b| b == 0xa5), "reply guard overwritten");
+            bytes[prefix..end].to_vec()
+        }).collect())
+    };
+    let singles = (0..rows.len()).map(|member| run(&[member], &mut worker).map(|mut out| out.remove(0)))
+        .collect::<Result<Vec<_>>>()?;
+    for single in &singles {
+        ensure!(single.chunks_exact(2).any(|w| w != [0, 0]), "zero singleton reply");
+    }
+    let flushes_before = worker.wave_flushes();
+    // Pairs at 2 x unit (5504), uneven pairs, and a full unit with a tail.
+    for pair in [[0usize, 1], [1, 2], [2, 3], [3, 0], [0, 4], [4, 2]] {
+        let merged = run(&pair, &mut worker)?;
+        for (position, &member) in pair.iter().enumerate() {
+            let different = merged[position].iter().zip(&singles[member]).filter(|(a, b)| a != b).count();
+            ensure!(different == 0, "members {pair:?}: member {member} differs in {different} bytes from its singleton");
+        }
+        eprintln!("merged wave {:?} ({} rows): byte-identical to singletons", pair,
+            pair.iter().map(|&m| rows[m]).sum::<u32>());
+    }
+    ensure!(worker.wave_flushes() - flushes_before == 6 && worker.merged_waves() >= 6,
+        "every pair must flush as one merged launch");
+    Ok(())
+}

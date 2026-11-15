@@ -123,6 +123,15 @@ impl<'a> Fp8Worker<'a> {
         self.waves.as_ref().is_some_and(WaveStaging::has_staged)
     }
 
+    #[cfg(test)]
+    pub(crate) fn executor_id(&self) -> u64 { self.executor_id }
+    #[cfg(test)]
+    pub(crate) fn pending_is_empty(&self) -> bool { self.pending.is_empty() }
+    #[cfg(test)]
+    pub(crate) fn wave_flushes(&self) -> u64 { self.waves.as_ref().map_or(0, |waves| waves.flushes) }
+    #[cfg(test)]
+    pub(crate) fn merged_waves(&self) -> u64 { self.waves.as_ref().map_or(0, |waves| waves.merged) }
+
     pub(crate) fn cancel_staged(&mut self, input_address: usize) -> Result<bool> {
         let Some(waves) = &mut self.waves else { return Ok(false) };
         waves.cancel(&mut self.pending, input_address)

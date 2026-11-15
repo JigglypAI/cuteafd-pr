@@ -89,6 +89,8 @@ pub(crate) struct WaveStaging<'a> {
     pub(crate) staged: Vec<StagedUnit>,
     pub(crate) staged_units: u64,
     pub(crate) flushes: u64,
+    /// Flushes that launched two or more members through row addresses.
+    pub(crate) merged: u64,
 }
 
 fn device_part(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
@@ -130,7 +132,7 @@ impl<'a> WaveStaging<'a> {
             copied: (0..units).map(|_| device::Event::new(device)).collect::<Result<_>>()?,
             plane, row_bytes, unit_rows, rows, minimum_rows: minimum_rows.max(1), topk, descriptors,
             device: [table(rows * 8)?, table(rows * topk * 4)?, table(rows * topk * 4)?, table(rows * 8)?],
-            staged: Vec::with_capacity(units), staged_units: 0, flushes: 0,
+            staged: Vec::with_capacity(units), staged_units: 0, flushes: 0, merged: 0,
         }))
     }
 
@@ -193,6 +195,7 @@ impl<'a> WaveStaging<'a> {
         let first_unit = &self.staged[0];
         let (layer, input_dtype, output_dtype) = (first_unit.layer, first_unit.input_dtype, first_unit.output_dtype);
         let segmented = self.staged.len() > 1;
+        self.merged += u64::from(segmented);
         let topk = self.topk;
         let mut first = 0;
         for unit in &self.staged {
