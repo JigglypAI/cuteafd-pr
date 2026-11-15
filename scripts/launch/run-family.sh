@@ -290,9 +290,6 @@ attention_plan_rows="$(get ATTENTION_PLAN_ROWS auto)"
 if [[ $attention_plan_rows != auto && ! $attention_plan_rows =~ ^[1-9][0-9]*$ ]]; then
   release_die "ATTENTION_PLAN_ROWS must be auto or a positive integer"
 fi
-# The planner resolves auto per family and core view and refuses a mode with no exported program.
-attention_prefill_precision="$(get ATTENTION_PREFILL_PRECISION auto)"
-case "$attention_prefill_precision" in auto|bf16|fp8) ;; *) release_die "ATTENTION_PREFILL_PRECISION must be auto, bf16 or fp8" ;; esac
 shared_env_args=(-e "HF_HOME=$container_hf_home" -e "CUTEAFD_SPARK_INTAKE=$intake"
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)"
   -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_PREFILL=$fp8_prefill"
@@ -774,7 +771,9 @@ count_args+=(--config /run/cuteafd-plan.config)
 v41_decode_lanes="$(get DECODE_LANES)"
 [[ -z "$v41_decode_lanes" || "$v41_decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
 [[ -z "$v41_decode_lanes" ]] || count_args+=(--decode-lanes "$v41_decode_lanes")
-[[ "$attention_prefill_precision" == auto ]] || count_args+=(--attention-prefill-precision "$attention_prefill_precision")
+# The planner resolves auto per family and core view and refuses a mode with no exported program.
+case "${ATTENTION_PREFILL_PRECISION:=auto}" in auto|bf16|fp8) ;; *) release_die "ATTENTION_PREFILL_PRECISION must be auto, bf16 or fp8" ;; esac
+[[ "$ATTENTION_PREFILL_PRECISION" == auto ]] || count_args+=(--attention-prefill-precision "$ATTENTION_PREFILL_PRECISION")
 ((RELEASE_SPARK_COUNT_EXPLICIT == 0)) || count_args+=(--spark-ranks "$SPARK_COUNT")
 # Keep checkpoint paths unchanged inside the full namespace mount.
 count_mounts=(-e "HF_HOME=$container_hf_home" ${v41_fp8_head_args[@]+"${v41_fp8_head_args[@]}"} "${namespace_mount_args[@]}"
@@ -1668,6 +1667,9 @@ fi
 case "$embedding" in host|gpu) ;; *) echo "EMBEDDING must be host or gpu" >&2; exit 2 ;; esac
 [[ "$family" != qwen3_5 || "$embedding" == gpu ]] || release_die "dense Qwen requires device token embedding"
 ((standalone_family == 0)) || [[ "$embedding" == gpu ]] || release_die "$family serves GPU token embeddings only (EMBEDDING=gpu)"
+# The planner resolves auto per family and core view and refuses a mode with no exported program.
+attention_prefill_precision="$(get ATTENTION_PREFILL_PRECISION auto)"
+case "$attention_prefill_precision" in auto|bf16|fp8) ;; *) release_die "ATTENTION_PREFILL_PRECISION must be auto, bf16 or fp8" ;; esac
 decode_lanes="$(get DECODE_LANES)"
 if [[ -n "$decode_lanes" ]]; then
   [[ "$decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
