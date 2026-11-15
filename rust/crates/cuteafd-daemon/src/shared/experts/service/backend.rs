@@ -165,10 +165,14 @@ impl<'a> Weights<'a> {
             Self::Exlr8(_) => unreachable!("validated above"),
             Self::Fp8(experts) => (
                 experts.iter().all(|group| group.wire_input()),
-                experts.iter().all(|group| !group.wire_input() || group.bf16_module.is_some())),
+                experts.iter().all(|group| !group.module.info().nvfp4_input
+                    && (!group.wire_input() || group.bf16_module.is_some()))),
         };
+        let nvfp4 = matches!(self, Self::Fp8(experts) if !experts.is_empty()
+            && experts.iter().all(|group| group.module.info().nvfp4_input));
         for endpoint in &model.endpoints {
-            let supported = if endpoint.ingress == cuteafd_core::SparkIngress::Native {
+            let supported = if endpoint.ingress == cuteafd_core::SparkIngress::Nvfp4 { nvfp4 }
+            else if endpoint.ingress == cuteafd_core::SparkIngress::Native {
                 match self {
                     Self::Fp8(experts) => !experts.is_empty() && experts.iter().all(|group| {
                         use cuteafd_ffi::fp8_moe::Fp8MoeWeights;
@@ -560,6 +564,8 @@ fn supports_ingress(ingress: cuteafd_core::SparkIngress, fp8: bool, bf16: bool) 
         cuteafd_core::SparkIngress::Native => fp8 || bf16,
         // FP8 remains legal at every row count, including the BF16 decode extent.
         cuteafd_core::SparkIngress::Bf16Decode { .. } => fp8 && bf16,
+        // Exact NVFP4 rows need the NVFP4-wire package (checked by the caller).
+        cuteafd_core::SparkIngress::Nvfp4 => false,
     }
 }
 

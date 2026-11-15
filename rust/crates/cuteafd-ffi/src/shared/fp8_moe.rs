@@ -69,6 +69,9 @@ pub struct Fp8MoeInfo {
     pub tp: usize,
     /// Input rows are FP8 K32 wire rows (Spark) rather than BF16 (coordinator).
     pub wire_input: bool,
+    /// Input rows are the exact pre-quantized NVFP4 W4A4 activation
+    /// (`cuteafd_core::nvfp4_wire_row_bytes`), never BF16 or FP8 K32.
+    pub nvfp4_input: bool,
     pub swiglu_limit: f32,
     pub swiglu_alpha: f32,
     pub swiglu_beta: f32,
@@ -89,7 +92,7 @@ impl Fp8MoeInfo {
         ensure!(matches!(format, 1 | 2 | 4 | 5 | 8)
             && matches!(activation, 1 | 2 | 3) && !(format == 2 && activation != 1)
             && (activation != 3 || matches!(format, 4 | 8)) && projection == 1
-            && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
+            && matches!(words[7], 1 | 7 | 8) && (1..=6).contains(&count),
             "unsupported FP8 expert package ABI {words:?}");
         let info = Self {
             hidden: words[1] as usize,
@@ -99,6 +102,7 @@ impl Fp8MoeInfo {
             intermediate: words[5] as usize,
             tp: words[6] as usize,
             wire_input: words[7] == 7,
+            nvfp4_input: words[7] == 8,
             swiglu_limit: f32::from_bits(words[8]),
             swiglu_alpha: f32::from_bits(words[16]),
             swiglu_beta: f32::from_bits(words[17]),
@@ -133,7 +137,8 @@ impl Fp8MoeInfo {
             && info.swiglu_limit.is_finite() && info.swiglu_limit >= 0.0
             && info.capacities[0] > 0 && info.capacities.iter().all(|&c| c <= i32::MAX as usize)
             && info.capacities.windows(2).all(|w| w[0] < w[1])
-            && (!matches!(info.weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4) || !info.wire_input),
+            && (!matches!(info.weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4) || !info.wire_input)
+            && (!info.nvfp4_input || info.weights == Fp8MoeWeights::Nvfp4),
             "inconsistent FP8 expert package info {info:?}");
         ensure!(info.swiglu_alpha.is_finite() && info.swiglu_beta.is_finite()
             && if info.activation == Fp8MoeActivation::SwigluOai {
@@ -174,6 +179,12 @@ impl Fp8MoeInfo {
     /// Wire row bytes: hidden E4M3 values then hidden/32 UE8M0 scales.
     pub fn wire_row_bytes(&self) -> usize {
         self.hidden + self.hidden / 32
+    }
+
+    /// Bytes of one input row this package's programs read.
+    pub fn input_row_bytes(&self) -> usize {
+        if self.nvfp4_input { cuteafd_core::nvfp4_wire_row_bytes(self.hidden) }
+        else if self.wire_input { self.wire_row_bytes() } else { self.hidden * 2 }
     }
 
     /// Smallest compiled capacity that holds `rows`.
@@ -316,6 +327,13 @@ pub fn fp8_slot_io_bytes(hidden: usize, topk: usize, wire_input: bool, bf16_sibl
         "invalid native slot I/O geometry");
     let input = if !wire_input || bf16_sibling { hidden.checked_mul(2) }
         else { hidden.checked_add(hidden / 32) }.context("native slot input overflow")?;
+    fp8_slot_io_bytes_for_input(hidden, topk, input, capacity)
+}
+
+/// [`fp8_slot_io_bytes`] for an explicit `input` row size (any ingress).
+pub fn fp8_slot_io_bytes_for_input(hidden: usize, topk: usize, input: usize, capacity: usize) -> Result<usize> {
+    ensure!(hidden > 0 && hidden % 32 == 0 && topk > 0 && capacity > 0 && input > 0,
+        "invalid native slot I/O geometry");
     input.checked_add(topk.checked_mul(8).context("native slot routes overflow")?)
         .and_then(|bytes| hidden.checked_mul(2).and_then(|out| bytes.checked_add(out)))
         .and_then(|bytes| bytes.checked_mul(capacity)).context("native slot I/O size overflow")

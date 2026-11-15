@@ -52,6 +52,28 @@ pub(crate) struct GoldenArgs {
     #[arg(long)] check_headers: bool,
     /// Full-model scoring is the only supported MiniMax golden operation.
     #[arg(long, required = true)] nll: bool,
+    /// Diagnostic Spark expert ingress: `auto` decides from the checkpoint
+    /// headers and manifest as serving does; `bf16`/`nvfp4` force one arm
+    /// (`nvfp4` still requires the header-proven shared input scales).
+    #[arg(long, env = "CUTEAFD_SPARK_INGRESS", default_value = "auto",
+        value_parser = ["auto", "bf16", "nvfp4"])] expert_ingress: String,
+}
+
+/// The golden's Spark ingress: the serving header decision, optionally forced.
+fn golden_ingress(args: &GoldenArgs, catalog: &cuteafd_loader::OfficialV41Catalog, cfg: &MiniMaxM3Config,
+    manifest: &serde_json::Value) -> Result<cuteafd_loader::families::minimax_m3::admission::SparkIngressPlan> {
+    use cuteafd_loader::families::minimax_m3::admission::{spark_ingress, SparkIngressPlan};
+    let routed = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
+    let plan = spark_ingress(catalog, cfg, &routed, manifest)?;
+    Ok(match args.expert_ingress.as_str() {
+        "auto" => plan,
+        "bf16" => SparkIngressPlan { ingress: SparkIngress::Bf16, scales: vec![None; cfg.layers] },
+        _ => {
+            ensure!(plan.ingress == SparkIngress::Nvfp4,
+                "--expert-ingress nvfp4 needs uniform expert input scales and the installed wire quantizer");
+            plan
+        }
+    })
 }
 
 fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
@@ -143,7 +165,11 @@ fn run(args: GoldenArgs) -> Result<()> {
     let weights = CoordinatorWeights::plan(&checkpoint, &cfg, 1, &vec![0; cfg.layers])?
         .into_iter().next().context("MiniMax target layout missing")?;
     let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
-    let names = selected_programs(&cfg, &weights, &manifest, args.prefill_rows, tokens)?;
+    let mut names = selected_programs(&cfg, &weights, &manifest, args.prefill_rows, tokens)?;
+    if args.expert_ingress != "bf16" && manifest["programs"].as_array().is_some_and(|programs| programs.iter()
+        .any(|entry| entry["name"] == cuteafd_ffi::minimax_m3::wire::NAME)) {
+        names.insert(cuteafd_ffi::minimax_m3::wire::NAME.to_owned());
+    }
     println!("MiniMax native full golden: reference={} windows={} scored_rows={} programs={}",
         fidelity_dataset::MINIMAX_M3_MANIFEST_SHA256, windows.len(),
         windows.iter().map(|window| window.positions.len()).sum::<usize>(), names.len());
@@ -163,8 +189,9 @@ fn run(args: GoldenArgs) -> Result<()> {
     let sample = &runtime.gpus[0];
     let device = Device { library: &library, id: args.device };
     let config = TcpTransportConfig::default();
+    let ingress = golden_ingress(&args, &cuteafd_loader::read_expert_catalog_view(&view)?, &cfg, &manifest)?;
     let endpoint = SparkEndpoint { ring_depth: None, capacity: args.prefill_rows,
-        ingress: SparkIngress::Bf16, partial_reply_bytes: None };
+        ingress: ingress.ingress, partial_reply_bytes: None };
     let rings = spark_rings(config.max_frame_bytes)?;
     let waves = usize::from(args.prefill_waves);
     let link_layout = PreparedSparkLink::endpoint("spark", 0,
@@ -290,12 +317,15 @@ fn run(args: GoldenArgs) -> Result<()> {
     link.enable_terminal_ownership(Arc::clone(&library))?;
     // The link is declared after all compute owners. Every error, including
     // bootstrap, goes through this terminal block before their destructors run.
+    let nvfp4 = (ingress.ingress == SparkIngress::Nvfp4).then(|| device.run(|| Ok(super::experts::Nvfp4Wire::new(
+        cuteafd_ffi::minimax_m3::wire::WireQuantizer::bind(&programs)?, ingress.scales.clone())))).transpose()?;
     let result = (|| {
-        let mut shape = SparkSessionShape::new(args.prefill_rows, 6144, 4, ExpertV2Dtype::Bf16)?;
+        let mut shape = SparkSessionShape::new(args.prefill_rows, 6144, 4,
+            if nvfp4.is_some() { ExpertV2Dtype::Nvfp4E2m1E4m3K16Amax } else { ExpertV2Dtype::Bf16 })?;
         shape.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         device.run(|| link.bootstrap(&shape))?;
         score(&args, &view, &cfg, &weights, &target, embedding.as_ref(), &kernels, &cache, &head, &residual,
-            &mut owners, &mut metadata, &mut link)
+            &mut owners, &mut metadata, &mut link, nvfp4.as_ref())
     })();
     let terminal = link.terminal_quiesce().and_then(|_| link.terminal_drain_copies())
         .and_then(|_| stream.drain()).and_then(|_| link.terminal_release());
@@ -408,7 +438,7 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
     native_devices[0].run(|| link.bootstrap(&shape))?;
     let bindings = cfg.moe.iter().map(|&moe| moe.then_some(RoutedBinding {
         dispatcher: 0, route: crate::shared::prefill_pipeline::FfnRoute::Spark })).collect();
-    let mut execution = ServingPrefill::new(&cfg, vec![Dispatcher::spark(link)?], bindings, 17)?;
+    let mut execution = ServingPrefill::new(&cfg, vec![Dispatcher::spark(link, None)?], bindings, 17)?;
     let schedule = Requests::new(inputs.request_capacity()?, tokens as usize, cfg.layers, waves)?;
     let provenance = serde_json::json!({"family":"minimax_m3", "snapshot":view.snapshot(),
         "reference_manifest_sha256":fidelity_dataset::MINIMAX_M3_MANIFEST_SHA256,
@@ -503,7 +533,8 @@ fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
     admitted: &CoordinatorWeights, weights: &TargetWeights<'a>,
     embedding: Option<&crate::shared::token_io::TokenEmbedding<'a>>, kernels: &Kernels<'a>,
     cache: &Cache<'a>, head: &Head<'a>, residual: &Allocation<'a>, owners: &mut [UnitOwner<'a>],
-    metadata: &mut [super::cache::Metadata<'a>], link: &mut SparkLink<'a>) -> Result<()> {
+    metadata: &mut [super::cache::Metadata<'a>], link: &mut SparkLink<'a>,
+    nvfp4: Option<&super::experts::Nvfp4Wire<'a>>) -> Result<()> {
     use cuteafd_api::openai::probe::{Probe, ProbeSpec};
     let windows = reference(&args.golden, args.window.as_deref(), cfg.vocab_size)?;
     std::fs::create_dir(&args.save_logits)?;
@@ -511,7 +542,8 @@ fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
         "reference_manifest_sha256":fidelity_dataset::MINIMAX_M3_MANIFEST_SHA256,
         "native_lib":args.native_lib,"manifest_sha256":digest(&std::fs::read(&args.manifest)?),
         "prefill_rows":args.prefill_rows,"prefill_waves":args.prefill_waves,
-        "expert_ingress":"BF16; native calibrated NVFP4 W4A4 experts", "shared_prefill":true});
+        "expert_ingress": if nvfp4.is_some() { "NVFP4 exact wire (coordinator-quantized W4A4 rows)" }
+            else { "BF16; native calibrated NVFP4 W4A4 experts" }, "shared_prefill":true});
     let mut records = Vec::new();
     let mut next_identity = 1;
     for window in windows {
@@ -553,7 +585,7 @@ fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
         let units = sequence_units(count, args.prefill_rows as usize, owners.len(), cfg.layers)?;
         Prefill { cfg, admitted, weights, kernels, cache, owners, metadata, waves: link.exchange()?,
             residual: residual.buffer, placement_version: 17, next_identity: &mut next_identity,
-            taps: taps.as_mut() }.run(&units)?;
+            taps: taps.as_mut(), nvfp4 }.run(&units)?;
         for chunk in units {
             let first = chunk.rows.start;
             let rows = chunk.rows.len();
@@ -634,7 +666,7 @@ mod tests {
         let layers = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
         let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
         let charges = |checkpoint: &Checkpoint| cuteafd_loader::families::minimax_m3::admission::spark_charges(
-            checkpoint, &catalog, &layers, 4, cuteafd_loader::placement::planner::PrefillShape { rows: 1024, waves: 3 });
+            checkpoint, &catalog, &layers, 4, cuteafd_loader::placement::planner::PrefillShape { rows: 1024, waves: 3 }, cuteafd_core::SparkIngress::Bf16);
         assert_eq!(charges(&peer)?, charges(&whole)?);
         let scalar = "language_model.model.layers.2.block_sparse_moe.experts.0.w1.input_global_scale";
         assert!(peer.header(scalar).is_none(), "target load remains coordinator-scoped");
@@ -656,7 +688,7 @@ mod tests {
         let routed = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
         let prefill = cuteafd_loader::placement::planner::PrefillShape { rows: 1024, waves: 3 };
         let charges = |checkpoint: &Checkpoint| cuteafd_loader::families::minimax_m3::admission::spark_charges(
-            checkpoint, &catalog, &routed, 4, prefill);
+            checkpoint, &catalog, &routed, 4, prefill, cuteafd_core::SparkIngress::Bf16);
         assert_eq!(charges(&peer)?, charges(&whole)?);
         Ok(())
     }

@@ -1488,8 +1488,8 @@ fn registered_egress_bytes(request: &cuteafd_transport::SparkSessionShape) -> Re
     ensure!(request.row_count > 0 && request.route_count % request.row_count == 0,
         "egress bootstrap needs a uniform route geometry");
     geometry.topk = request.route_count / request.row_count;
-    geometry.compact_wire_bytes(request.row_count,
-        request.hidden_dtype == cuteafd_transport::ExpertV2Dtype::Bf16)
+    let row_bytes = request.hidden_dtype.row_bytes(request.hidden_dim as usize)?;
+    geometry.compact_wire_bytes_for(request.row_count, row_bytes)
         .map(|wire| wire.0).context("registered egress geometry overflow")
 }
 
@@ -1715,12 +1715,12 @@ impl<'a> SparkLink<'a> {
         egress_enabled: bool) -> Result<()> {
         let spec = admitted.geometry();
         let endpoint = spec.endpoints.endpoint;
-        let bf16 = matches!(endpoint.ingress, cuteafd_core::SparkIngress::Bf16 | cuteafd_core::SparkIngress::Native);
+        let widest = request.hidden_dtype.row_bytes(request.hidden_dim as usize)?;
         ensure!(request.row_count == endpoint.capacity
             && request.hidden_dim == spec.endpoints.geometry.hidden
             && request.route_count.checked_div(request.row_count)
                 == Some(spec.endpoints.geometry.topk)
-            && (request.hidden_dtype == cuteafd_transport::ExpertV2Dtype::Bf16) == bf16,
+            && widest == endpoint.ingress.request_row_bytes(request.hidden_dim as usize),
             "Spark bootstrap differs from admitted request geometry");
         let expected = match spec.waves.staging {
             cuteafd_loader::placement::SparkWaveStaging::Registered { slot_bytes }

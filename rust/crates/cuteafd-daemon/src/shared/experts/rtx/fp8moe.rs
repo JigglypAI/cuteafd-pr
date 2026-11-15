@@ -317,7 +317,7 @@ mod tests {
             layers: 2, first_layer: 0, experts: 8, topk: 8, hidden: 4096, intermediate: 256,
             draft_stages: 0, draft_experts: 0 })?;
         let info = Fp8MoeInfo { hidden: 4096, intermediate: 256, slice: 128, experts: 8, topk: 8,
-            tp: 2, wire_input: false, swiglu_limit: 10.0, swiglu_alpha: 1.0, swiglu_beta: 0.0,
+            tp: 2, wire_input: false, nvfp4_input: false, swiglu_limit: 10.0, swiglu_alpha: 1.0, swiglu_beta: 0.0,
             activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product,
             projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16,
             capacities: vec![1, 16], scale_convention: cuteafd_ffi::fp8_moe::Fp8MoeScaleConvention::Multiplier, weights: Fp8MoeWeights::Fp8 };
@@ -401,7 +401,7 @@ mod tests {
                 experts: 1, topk, hidden, intermediate, draft_stages: 0, draft_experts: 0 })?;
             for rank in 0..2 {
                 let mut info = Fp8MoeInfo { hidden, intermediate, slice: tensors.rank_width(2, rank, Slicing::Blocks(128))?,
-                    experts: 1, topk, tp: 2, wire_input: false,
+                    experts: 1, topk, tp: 2, wire_input: false, nvfp4_input: false,
                     swiglu_limit: tensors.shape().geometry()?.swiglu_limit().unwrap_or(0.0), swiglu_alpha: 1.0, swiglu_beta: 0.0, activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product, projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16, capacities: vec![1, 16, 4096],
                     scale_convention: cuteafd_ffi::fp8_moe::Fp8MoeScaleConvention::Multiplier, weights: match format { ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
                         ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,

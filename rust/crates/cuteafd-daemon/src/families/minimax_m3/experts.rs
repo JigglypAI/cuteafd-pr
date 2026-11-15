@@ -89,7 +89,40 @@ pub(crate) struct RoutedRows<'a> {
     stream: Rc<Stream<'a>>,
     boundary: Rc<Boundary<'a>>,
     rows: usize,
+    /// Exact NVFP4 ingress: transient wire rows written just before staging.
+    wire: Option<Rc<Allocation<'a>>>,
 }
+
+/// The exact NVFP4 W4A4 expert-input wire (`SparkIngress::Nvfp4`): the Spark
+/// package's own calibrated row quantizer, run once per token here with each
+/// layer's one shared checkpoint `input_global_scale` (header-proven uniform
+/// across the layer's experts at admission). Bit-identical to the Spark
+/// quantizing the same BF16 rows itself.
+pub(crate) struct Nvfp4Wire<'a> {
+    quantizer: cuteafd_ffi::minimax_m3::wire::WireQuantizer<'a>,
+    /// Raw FP32 `input_global_scale` per decoder layer; `None` for dense layers.
+    scales: Vec<Option<f32>>,
+}
+impl<'a> Nvfp4Wire<'a> {
+    pub(crate) fn new(quantizer: cuteafd_ffi::minimax_m3::wire::WireQuantizer<'a>, scales: Vec<Option<f32>>) -> Self {
+        Self { quantizer, scales }
+    }
+    fn scale(&self, layer: usize) -> Result<f32> {
+        self.scales.get(layer).copied().flatten()
+            .with_context(|| format!("MiniMax layer {layer} has no admitted shared NVFP4 input scale"))
+    }
+    /// # Safety
+    /// `input` (BF16 `[rows, 6144]`) and `output` (`[rows, NVFP4_ROW_BYTES]`)
+    /// are distinct live buffers retained on `stream` through queued work.
+    pub(crate) unsafe fn quantize(&self, layer: usize, rows: usize, input: CuteafdDeviceBuffer,
+        output: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
+        let scale = self.scale(layer)?;
+        // SAFETY: forwarded caller contract; the wrapper checks extents and aliases.
+        unsafe { self.quantizer.quantize(rows, input, output, scale, stream) }.map_err(anyhow::Error::from)
+    }
+}
+pub(crate) const NVFP4_ROW_BYTES: usize = cuteafd_ffi::minimax_m3::wire::ROW_BYTES;
+
 impl<'a> RoutedRows<'a> {
     pub(crate) fn new(activation: Rc<Allocation<'a>>, ids: Rc<Allocation<'a>>,
         weights: Rc<Allocation<'a>>, output: Rc<Allocation<'a>>, stream: Rc<Stream<'a>>,
@@ -106,13 +139,25 @@ impl<'a> RoutedRows<'a> {
         let pointers = [activation.buffer.ptr, ids.buffer.ptr, weights.buffer.ptr, output.buffer.ptr];
         ensure!((0..4).all(|i| (i+1..4).all(|j| pointers[i] != pointers[j])),
             "MiniMax routed inputs/output overlap");
-        Ok(Self { activation, ids, weights, output, stream, boundary, rows })
+        Ok(Self { activation, ids, weights, output, stream, boundary, rows, wire: None })
+    }
+    /// Quantize into `scratch` (a unit plane free until the shared FFN, which
+    /// is ordered after the staged copy) instead of staging BF16 rows.
+    pub(crate) fn with_wire(mut self, scratch: Rc<Allocation<'a>>) -> Result<Self> {
+        ensure!(self.rows.checked_mul(NVFP4_ROW_BYTES).is_some_and(|bytes| bytes <= scratch.buffer.bytes)
+            && scratch.device.id == self.stream.device.id
+            && [&self.activation, &self.ids, &self.weights, &self.output].iter()
+                .all(|owner| owner.buffer.ptr != scratch.buffer.ptr),
+            "MiniMax NVFP4 wire scratch geometry/device/alias differs");
+        self.wire = Some(scratch);
+        Ok(self)
     }
     fn routes(&self) -> Routes { Routes { ids: self.ids.buffer.ptr, weights: self.weights.buffer.ptr } }
     fn sources(&self, layout: RouteStaging) -> [CuteafdDeviceBuffer; 3] {
+        let input = self.wire.as_ref().map_or(self.activation.buffer, |wire| wire.buffer);
         [CuteafdDeviceBuffer { bytes: layout.route_bytes, ..self.ids.buffer },
             CuteafdDeviceBuffer { bytes: layout.route_bytes, ..self.weights.buffer },
-            CuteafdDeviceBuffer { bytes: layout.wire_bytes, ..self.activation.buffer }]
+            CuteafdDeviceBuffer { bytes: layout.wire_bytes, ..input }]
     }
 }
 
@@ -138,10 +183,10 @@ impl DispatchRows {
         spark_waves::combined_reply_eligible(self.rows.iter().map(|row|
             (row.source_request_id, row.source_kind == ExpertV2SourceKind::Prefill)))
     }
-    fn request(self, layer: usize, routes: Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>,
+    fn request(self, layer: usize, dtype: ExpertV2Dtype, routes: Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>,
         wire: bytes::Bytes) -> Result<ExpertProtocolV2Request> {
         let mut request = ExpertProtocolV2Request::new_bytes(self.request_id, self.placement_version,
-            u32::try_from(layer)?, 6144, ExpertV2Dtype::Bf16, self.rows, routes, wire)?;
+            u32::try_from(layer)?, 6144, dtype, self.rows, routes, wire)?;
         request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         Ok(request)
     }
@@ -149,7 +194,7 @@ impl DispatchRows {
 
 enum Backend<'a> {
     Closed,
-    Spark(SparkLink<'a>),
+    Spark(SparkLink<'a>, Option<Nvfp4Wire<'a>>),
     Whole(Box<dyn RtxExpertLayer + 'a>),
     Tp2 { owner: usize, executor: OwnerTp2<'a> },
 }
@@ -175,9 +220,13 @@ impl<'a> Dispatcher<'a> {
             pending: VecDeque::new(), last: None, owners: std::collections::BTreeMap::new() })) }
     }
     /// The caller supplies its prepared, bootstrapped, terminal-owned SparkLink.
-    pub(crate) fn spark(mut link: SparkLink<'a>) -> Result<Self> {
+    pub(crate) fn spark(mut link: SparkLink<'a>, wire: Option<Nvfp4Wire<'a>>) -> Result<Self> {
         link.exchange()?;
-        Ok(Self::new(Backend::Spark(link)))
+        Ok(Self::new(Backend::Spark(link, wire)))
+    }
+    /// Whether routed rows must carry NVFP4 wire scratch (`RoutedRows::with_wire`).
+    pub(crate) fn nvfp4_wire(&self) -> bool {
+        matches!(self.inner.borrow().backend, Backend::Spark(_, Some(_)))
     }
     pub(crate) fn whole(experts: Box<dyn RtxExpertLayer + 'a>) -> Result<Self> {
         ensure!(experts.shard() == RtxShard::Whole && experts.partial() == PartialDtype::Bf16
@@ -192,7 +241,7 @@ impl<'a> Dispatcher<'a> {
     pub(crate) fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
         match &self.inner.borrow().backend {
             Backend::Closed => Err(DispatchError::Terminal.into()),
-            Backend::Spark(link) => link.allocation_receipts(inventory, prefix),
+            Backend::Spark(link, _) => link.allocation_receipts(inventory, prefix),
             Backend::Whole(experts) => experts.allocation_receipts(inventory, prefix),
             Backend::Tp2 { executor, .. } => executor.allocation_receipts(inventory, prefix),
         }
@@ -207,7 +256,7 @@ impl<'a> Dispatcher<'a> {
         let id = {
             let mut inner = self.inner.borrow_mut();
             ensure!(!inner.terminal, DispatchError::Terminal);
-            ensure!(matches!(inner.backend, Backend::Spark(_)) || inner.pending.is_empty(), DispatchError::Busy);
+            ensure!(matches!(inner.backend, Backend::Spark(..)) || inner.pending.is_empty(), DispatchError::Busy);
             if let Some(previous) = &inner.last { previous.boundary.idle()?; }
             let device = rows.stream.device;
             if let Some(previous) = inner.owners.values().next() {
@@ -240,7 +289,7 @@ impl Inner<'_> {
         let result = (|| {
             match &mut self.backend {
                 Backend::Closed => (),
-                Backend::Spark(link) => link.terminal_quiesce()?,
+                Backend::Spark(link, _) => link.terminal_quiesce()?,
                 Backend::Tp2 { executor, .. } => {
                     use crate::shared::peer_split::TerminalState;
                     if executor.exchange.terminal_state() == TerminalState::Active {
@@ -253,7 +302,7 @@ impl Inner<'_> {
             for rows in self.owners.values() { rows.stream.drain()?; }
             match &mut self.backend {
                 Backend::Closed => (),
-                Backend::Spark(link) => { link.terminal_drain_copies()?; link.terminal_release()?; }
+                Backend::Spark(link, _) => { link.terminal_drain_copies()?; link.terminal_release()?; }
                 Backend::Tp2 { executor, .. } => executor.exchange.finish_terminal(true),
                 Backend::Whole(_) => (),
             }
@@ -292,17 +341,28 @@ impl Ticket<'_, '_> {
         let mut wave = None;
         let stream = match &mut inner.backend {
             Backend::Closed => return Err(DispatchError::Terminal.into()),
-            Backend::Spark(link) => {
+            Backend::Spark(link, nvfp4) => {
                 ensure!(link.device() == device.id, "MiniMax Spark owner device differs");
+                ensure!(nvfp4.is_some() == rows.wire.is_some(), "MiniMax routed rows lack the admitted wire scratch");
+                let (dtype, row_bytes) = if nvfp4.is_some() { (ExpertV2Dtype::Nvfp4E2m1E4m3K16Amax, NVFP4_ROW_BYTES) }
+                    else { (ExpertV2Dtype::Bf16, 6144 * 2) };
+                let layout = RouteStaging::new(rows.rows, 4, row_bytes)?;
+                if let (Some(nvfp4), Some(scratch)) = (nvfp4.as_ref(), rows.wire.as_ref()) {
+                    device.run(|| {
+                        // SAFETY: normalized activation and the transient wire plane
+                        // are retained distinct owners on this stream; the staged
+                        // copy below reads the wire rows in stream order.
+                        unsafe { nvfp4.quantize(layer, rows.rows, rows.activation.buffer, scratch.buffer, rows.stream.raw) }
+                    })?;
+                }
                 let exchange = link.exchange()?;
-                let layout = RouteStaging::new(rows.rows, 4, 6144 * 2)?;
                 let combined = identities.combined_reply();
                 wave = Some(device.run(|| {
                     // SAFETY: the borrowed handle retains all source owners;
                     // staging is before the source-ready event and shared FFN.
-                    unsafe { exchange.send(rows.rows, exchange.compact_payload(rows.rows), layout,
+                    unsafe { exchange.send(rows.rows, rows.rows * row_bytes, layout,
                         rows.sources(layout), rows.stream.raw, combined,
-                        Box::new(move |routes, wire| identities.request(layer, routes, wire))) }
+                        Box::new(move |routes, wire| identities.request(layer, dtype, routes, wire))) }
                 })?);
                 rows.stream.raw
             }
@@ -381,7 +441,7 @@ impl Inner<'_> {
             let device = rows.stream.device;
             match backend {
                 Backend::Closed => Err(DispatchError::Terminal.into()),
-                Backend::Spark(link) => {
+                Backend::Spark(link, _) => {
                     let exchange = link.exchange()?;
                     let wave = pending.wave.take().context("MiniMax Spark ticket lacks its retained wave")?;
                     let slot = wave.slot();
@@ -398,7 +458,7 @@ impl Inner<'_> {
                 Backend::Tp2 { owner, executor } => Ok(executor.exchange.stream(*owner)),
             }
         })?;
-        if !matches!(self.backend, Backend::Spark(_)) && last.is_some() { self.last = last; }
+        if !matches!(self.backend, Backend::Spark(..)) && last.is_some() { self.last = last; }
         Ok(())
     }
 }
@@ -632,7 +692,7 @@ mod tests {
         let expected = origins.rows.clone();
         let routes = (0..8).map(|index| cuteafd_transport::ExpertProtocolV2RouteEntry {
             row_index: index / 4, expert_id: index % 4, gate_weight: 0.25 }).collect();
-        let request = origins.request(2, routes, bytes::Bytes::from(vec![0; 2 * 6144 * 2]))?;
+        let request = origins.request(2, ExpertV2Dtype::Bf16, routes, bytes::Bytes::from(vec![0; 2 * 6144 * 2]))?;
         assert_eq!(request.rows, expected);
         let mut bad = identities(1);
         bad.rows[0].route_offset = 4;

@@ -129,8 +129,13 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
     } else { CoordinatorWeights::plan(checkpoint, cfg, 1, &vec![0; cfg.layers])? };
     let capacity = RequestCapacity::new(options.sequences, options.prefill.rows)?;
     let context = if options.context_tokens == 0 { cfg.max_position as u64 } else { options.context_tokens };
-    let names = targets.iter().map(|target| program_names(cfg, target, &manifest, capacity, u32::try_from(context)?))
+    let mut names = targets.iter().map(|target| program_names(cfg, target, &manifest, capacity, u32::try_from(context)?))
         .collect::<Result<Vec<_>>>()?.into_iter().flatten().collect::<BTreeSet<_>>();
+    // The exact NVFP4 wire quantizer is loaded wherever the manifest carries
+    // it; admission below decides from the checkpoint headers whether it runs.
+    let wire_program = manifest["programs"].as_array().is_some_and(|programs| programs.iter()
+        .any(|entry| entry["name"] == cuteafd_ffi::minimax_m3::wire::NAME));
+    if wire_program && !options.peers.is_empty() { names.insert(cuteafd_ffi::minimax_m3::wire::NAME.to_owned()); }
     let devices = physical.iter().map(|&id| Device { library, id }).collect::<Vec<_>>();
     let device = devices[0];
     let package = fp8::package_directory(options.native_lib, gpus,
@@ -181,8 +186,10 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
     cuteafd_bench::context::set_resolved("max-context-tokens", &admitted.solved.served_context().to_string());
     publish_deployment(options.device, options.split_device, options.peers);
     let config = TcpTransportConfig::default();
+    let ingress = inputs.spark_ingress.ingress;
+    ensure!(matches!(ingress, SparkIngress::Bf16 | SparkIngress::Nvfp4), "MiniMax Spark ingress {ingress:?}");
     let endpoint = SparkEndpoint { ring_depth: None, capacity: capacity.prefill.rows,
-        ingress: SparkIngress::Bf16, partial_reply_bytes: None };
+        ingress, partial_reply_bytes: None };
     let working = SparkWorkingSet { rtx_layers: inputs.routed[..admitted.onboard].to_vec(),
         spark_layers: inputs.routed[admitted.onboard..].to_vec(),
         spark_ranks: options.peers.len(), prefill_lanes: 1 };
@@ -247,13 +254,22 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         let mut link = device.run(|| SparkLink::prepared(library, SparkWorld::canonical(options.peers.len())?,
             options.peers, config, layout))?;
         link.enable_terminal_ownership(Arc::clone(library))?;
-        let mut shape = SparkSessionShape::new(capacity.prefill.rows, 6144, 4, ExpertV2Dtype::Bf16)?;
+        let nvfp4 = ingress == SparkIngress::Nvfp4;
+        let mut shape = SparkSessionShape::new(capacity.prefill.rows, 6144, 4,
+            if nvfp4 { ExpertV2Dtype::Nvfp4E2m1E4m3K16Amax } else { ExpertV2Dtype::Bf16 })?;
         shape.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         device.run(|| link.bootstrap(&shape))?;
         for &layer in &working.spark_layers {
             bindings[layer] = Some(RoutedBinding { dispatcher: dispatchers.len(), route: FfnRoute::Spark });
         }
-        dispatchers.push(Dispatcher::spark(link)?);
+        let wire = nvfp4.then(|| device.run(|| {
+            let quantizer = cuteafd_ffi::minimax_m3::wire::WireQuantizer::bind(programs)?;
+            ensure!(quantizer.layout.rows >= capacity.prefill.rows, "MiniMax NVFP4 wire quantizer capacity {} below unit {}",
+                quantizer.layout.rows, capacity.prefill.rows);
+            Ok(super::experts::Nvfp4Wire::new(quantizer, inputs.spark_ingress.scales.clone()))
+        })).transpose()?;
+        tracing::info!(ingress = ?ingress, row_bytes = ingress.request_row_bytes(6144), "MiniMax Spark expert ingress");
+        dispatchers.push(Dispatcher::spark(link, wire)?);
     }
     let execution = ServingPrefill::new(cfg, dispatchers, bindings, 1)?;
     let prewarm = crate::shared::memory::load_timing::Split::start();

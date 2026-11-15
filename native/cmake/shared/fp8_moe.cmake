@@ -137,6 +137,29 @@ or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, calibrated W4A4 at all row counts
     COMMENT "Building exact FP8 expert package fp8-${geometry} (${CUTEAFD_FP8_MOE_ROLE})"
     VERBATIM)
   list(APPEND CUTEAFD_FP8_MOE_MANIFESTS "${package}/manifest.json")
+  # Exact NVFP4 wire: checkpoints whose W4A4 activation quantization is
+  # expert-independent (MiniMax: one shared input_global_scale) send the
+  # coordinator's pre-quantized rows; this sibling skips the Spark's quantize.
+  if(CUTEAFD_FP8_MOE_ROLE STREQUAL "spark" AND geometry STREQUAL "minimax_nvfp4a4")
+    set(wire_package "${package}-nvfp4w")
+    add_custom_command(
+      OUTPUT "${wire_package}/manifest.json"
+      COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
+      COMMAND "${CMAKE_COMMAND}" -E rm -rf "${wire_package}"
+      COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
+        ${CUTEAFD_EXPORT_LAUNCHER} "${Python3_EXECUTABLE}" "${CUTEAFD_FP8_MOE_TOOL}" build
+        --role spark --input nvfp4 --geometry "${geometry}" --capacities "${CUTEAFD_FP8_MOE_CAPACITIES}" ${exact_slices} ${requested_layouts}
+        --build-dir "${CMAKE_CURRENT_BINARY_DIR}/fp8_moe_exports_nvfp4w/${geometry}" --output "${wire_package}"
+        --cxx "${CMAKE_CXX_COMPILER}" --cuda-include "${CUTEAFD_FP8_MOE_CUDA_INCLUDE}"
+        --cuda-libdir "$<TARGET_FILE_DIR:CUDA::cudart>" --runtime "${CUTEAFD_B12X_AOT_RUNTIME_LIBRARY}"
+      DEPENDS "${CUTEAFD_FP8_MOE_TOOL}" "${stamp}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/spark-package-ranges.json"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/spark_packages.py"
+        ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
+      COMMENT "Building exact FP8 expert package fp8-${geometry}-nvfp4w (spark, exact NVFP4 input)"
+      VERBATIM)
+    list(APPEND CUTEAFD_FP8_MOE_MANIFESTS "${wire_package}/manifest.json")
+  endif()
   if(CUTEAFD_FP8_MOE_ROLE STREQUAL "spark" AND geometry IN_LIST CUTEAFD_FP8_MOE_BF16_FAMILIES AND NOT entry MATCHES ":nvfp4")
     set(bf16_package "${package}-bf16")
     add_custom_command(

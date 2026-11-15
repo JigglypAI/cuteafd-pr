@@ -37,7 +37,16 @@ impl Fp8Group {
             tensors.slice(config.world)?;
             let directory = config.fp8_package.clone().unwrap_or_else(||
                 fp8::package_directory(&config.library, config.world, tensors.format()));
-            let (directory, slicing) = fp8::exact_layout(&directory, &tensors, config.world, config.rank);
+            let (mut directory, slicing) = fp8::exact_layout(&directory, &tensors, config.world, config.rank);
+            // Exact NVFP4 ingress: the admitted endpoints carry pre-quantized
+            // W4A4 rows, so the worker runs the sibling that skips quantization.
+            let nvfp4_wire = config.model_admission.as_ref().is_some_and(|model| !model.endpoints.is_empty()
+                && model.endpoints.iter().all(|endpoint| endpoint.ingress == cuteafd_core::SparkIngress::Nvfp4));
+            if nvfp4_wire {
+                ensure!(tensors.format() == ExpertFormat::Nvfp4, "NVFP4 wire ingress admitted for non-NVFP4 layer {layer}");
+                directory = fp8::nvfp4_wire_sibling(&directory).filter(|path| path.is_dir()).with_context(||
+                    format!("NVFP4 wire ingress needs the installed {}-nvfp4w sibling", directory.display()))?;
+            }
             let family = fp8::package_family(cuteafd_core::expert_geometry().family(), tensors.format());
             let format = match tensors.format() {
                 ExpertFormat::Nvfp4 => "nvfp4", ExpertFormat::Bf16 => "bf16", _ => "fp8",

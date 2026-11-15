@@ -123,6 +123,20 @@ pub(crate) fn nvfp4_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeom
     fp8_owner_bytes(family, geometry, &[(ExpertFormat::Nvfp4, width)], extent)
 }
 
+/// [`nvfp4_owner_bytes`] with the exact NVFP4 wire ingress: the same package
+/// scratch (the NVFP4-wire sibling's regions equal the BF16-input ones), and
+/// the device input plane holds wire rows instead of BF16 rows.
+pub(crate) fn nvfp4_owner_bytes_for(family: &str, geometry: cuteafd_core::ExpertGeometry, width: u32,
+    extent: cuteafd_core::OwnerExtent, nvfp4_wire: bool) -> anyhow::Result<cuteafd_core::OwnerBytes> {
+    let mut bytes = nvfp4_owner_bytes(family, geometry, width, extent)?;
+    if nvfp4_wire {
+        let hidden = geometry.hidden as usize;
+        let saved = (2 * hidden - cuteafd_core::nvfp4_wire_row_bytes(hidden)) as u64 * u64::from(extent.capacity);
+        bytes.io = bytes.io.checked_sub(saved).context("NVFP4 wire owner input below BF16")?;
+    }
+    Ok(bytes)
+}
+
 /// EXL3 owner bytes. Prefill-scale exports charge the calibrated retained
 /// arena maxima plus private capacity state (#762 census totals, which include
 /// 4096 rows of K32 wire/routes; those rows are re-charged as the owner's I/O

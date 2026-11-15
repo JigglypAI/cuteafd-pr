@@ -289,15 +289,13 @@ impl PreparedSparkLink {
         let endpoint = endpoints.endpoint;
         let geometry = endpoints.geometry;
         let rows = u64::from(endpoint.capacity);
-        let bf16 = matches!(endpoint.ingress, cuteafd_core::SparkIngress::Bf16 | cuteafd_core::SparkIngress::Native);
-        let row_bytes = if bf16 { u64::from(geometry.hidden).checked_mul(2) }
-            else { u64::from(geometry.hidden).checked_add(u64::from(geometry.hidden) / 32) }
-            .ok_or(Refusal::Overflow("Spark request row"))?;
+        let request_row = endpoint.ingress.request_row_bytes(geometry.hidden as usize);
+        let row_bytes = request_row as u64;
         let staging = rows.checked_mul(u64::from(geometry.topk)).and_then(|bytes| bytes.checked_mul(8))
             .and_then(|bytes| bytes.checked_add(rows.checked_mul(row_bytes)?))
             .ok_or(Refusal::Overflow("Spark request staging"))?.max(256);
         let egress = if registered_egress {
-            Some(geometry.compact_wire_bytes(endpoint.capacity, bf16)
+            Some(geometry.compact_wire_bytes_for(endpoint.capacity, request_row)
                 .ok_or_else(|| Refusal::InvalidFact("invalid Spark registered egress geometry".into()))?.0 as u64)
         } else { None };
         let (staging, unused_egress_bytes) = match egress {
@@ -496,9 +494,8 @@ impl SparkWorkingSet {
                 .ok_or(PlacementError::Inventory("invalid Spark endpoint ring depth"))?;
             let ring = SparkRingGeometry { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                 slot_bytes: rings.slot_bytes, alignment: rings.alignment, endpoints: 1 };
-            let bf16 = matches!(endpoint.ingress,
-                cuteafd_core::SparkIngress::Bf16 | cuteafd_core::SparkIngress::Native);
-            let io = self.rank_io(rank, geometry, endpoint.capacity, bf16, ring)?;
+            let io = self.rank_io_rows(rank, geometry, endpoint.capacity,
+                endpoint.ingress.request_row_bytes(geometry.hidden as usize), ring)?;
             bytes.intake = bytes.intake.max(io.intake);
             if let cuteafd_core::SparkIngress::Bf16Decode { rows } = endpoint.ingress {
                 let decode = self.rank_io(rank, geometry, rows, true, ring)?;
@@ -552,15 +549,22 @@ impl SparkWorkingSet {
     /// Unselected ranks (including every rank of an empty set) charge nothing.
     pub fn rank_io(&self, rank: usize, geometry: ExpertGeometry, capacity: u32,
         bf16: bool, rings: SparkRingGeometry) -> Result<SparkIoBytes, PlacementError> {
+        let hidden = geometry.hidden as usize;
+        self.rank_io_rows(rank, geometry, capacity, if bf16 { hidden * 2 } else { hidden + hidden / 32 }, rings)
+    }
+
+    /// [`Self::rank_io`] for `row_bytes`-wide request rows (any ingress).
+    pub fn rank_io_rows(&self, rank: usize, geometry: ExpertGeometry, capacity: u32,
+        row_bytes: usize, rings: SparkRingGeometry) -> Result<SparkIoBytes, PlacementError> {
         if !self.selected_ranks().contains(&rank) { return Ok(SparkIoBytes::default()); }
         let rows = capacity as u64;
         let hidden = geometry.hidden as u64;
         let routes = geometry.topk as u64 * 8;
-        let input = if bf16 { hidden * 2 } else { hidden + hidden / 32 };
+        let input = row_bytes as u64;
         let multiply = |stride: u64| rows.checked_mul(stride)
             .ok_or(PlacementError::Overflow("Spark intake/exchange"));
-        let mapped = geometry.compact_ring_bytes(capacity, rings.max_frame_bytes,
-            rings.depth, rings.slot_bytes, rings.alignment, rings.endpoints, bf16)
+        let mapped = geometry.compact_ring_bytes_for(capacity, rings.max_frame_bytes,
+            rings.depth, rings.slot_bytes, rings.alignment, rings.endpoints, row_bytes)
             .ok_or(PlacementError::Inventory("Spark ring geometry exceeds frame budget"))?;
         Ok(SparkIoBytes {
             intake: multiply(input + routes + hidden * 2)?,
@@ -1006,7 +1010,7 @@ mod tests {
         for ranks in [1, 6, 8] {
             for rows in [1, 64, 2752, 4096] {
                 for ingress in [SparkIngress::Fp8K32, SparkIngress::Bf16, SparkIngress::Native,
-                    SparkIngress::Bf16Decode { rows: rows.min(21) }] {
+                    SparkIngress::Bf16Decode { rows: rows.min(21) }, SparkIngress::Nvfp4] {
                     for (depth, partial) in [(None, None), (Some(3), None), (Some(4), Some(80 << 20))] {
                         let endpoint = SparkEndpoint { capacity: rows, ingress, ring_depth: depth, partial_reply_bytes: partial };
                         let spec = SparkEndpointOwners { ranks, geometry, endpoint, rings };
@@ -1021,6 +1025,8 @@ mod tests {
                             SparkIngress::Bf16 | SparkIngress::Native => wire_request(rows, true),
                             SparkIngress::Fp8K32 => wire_request(rows, false),
                             SparkIngress::Bf16Decode {rows: decode} => wire_request(rows, false).max(wire_request(decode, true)),
+                            SparkIngress::Nvfp4 => (96 + rows as usize * 40 + rows as usize * 8 * 12 + 15) / 16 * 16
+                                + rows as usize * (6144 / 2 + 6144 / 16 + 16),
                         };
                         let response = partial.map_or(96 + rows as usize * (4 + 6144 * 2), |bytes| bytes as usize + 128);
                         let frame = if partial.is_some() { rings.max_frame_bytes.max(request).max(response) }

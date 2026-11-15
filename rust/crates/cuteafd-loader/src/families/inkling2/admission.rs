@@ -151,9 +151,8 @@ fn owner_bytes(geometry: cuteafd_core::ExpertGeometry, width: u32, extent: cutea
     let scratch = cuteafd_core::spark_executions::segment_scratch_bytes(geometry.hidden, geometry.experts, geometry.topk,
         width.checked_mul(2).context("activation width overflow")?, rows, cuteafd_core::spark_executions::SEGMENT_MAX_ROWS)
         .context("Inkling 2 segment scratch overflow")?;
-    let bf16 = !matches!(ingress, cuteafd_core::SparkIngress::Fp8K32);
     let hidden = u64::from(geometry.hidden);
-    let input = u64::from(extent.capacity) * if bf16 { hidden * 2 } else { hidden + hidden / 32 };
+    let input = u64::from(extent.capacity) * ingress.request_row_bytes(geometry.hidden as usize) as u64;
     let io = input + u64::from(extent.capacity) * (8 * u64::from(geometry.topk) + 2 * hidden)
         + u64::from(rows) * (16 + u64::from(geometry.topk) * 8);
     Ok(cuteafd_core::OwnerBytes { scratch, io, pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 })
