@@ -27,7 +27,7 @@ Rubric, each 1–5 (5 best), plus wall time:
 
 ## Log
 
-### 2026-11-15 V4.1 BF16 Attention Duel: R1 Landed, R2 Active
+### 2026-11-15 V4.1 BF16 Attention Duel: R1 Landed, Final Dispatch Round Active
 
 Carbon High, driven by DeepSeek Flash, wins R1 with `497d1760`: decode each
 native mixed FP8/FP4 record once into swizzled BF16 SMEM, reuse it for QK/PV,
@@ -56,9 +56,30 @@ about 30 minutes to a sealed candidate; DeepSeek Correct 4, Judgement 2,
 Quality 3, Creative 3, about 10 minutes to its first candidate plus trace
 correction. The driver checks scope, commit, clean tree and offline evidence;
 organizer checks every numerical, timing and export claim. No entrant runs
-GPU measurements or changes the benchmark/oracle. R2 is active on top of the
-landed winner, targeting both register and SMEM budgets for two CTAs/SM;
-no R2 speed, residency or final-duel claim is established yet.
+GPU measurements or changes the benchmark/oracle.
+
+R2 Carbon `d1cc0f62` keeps the 16-head mapping and streams 64-dimension BF16
+slices while retaining raw records, aliasing Q/P storage in time. All 256
+output/LSE hashes are exact, 19 GPU tests pass, and CUDA queries on the actual
+captured graph functions report 58 registers, 48,768 B dynamic SMEM, no local
+storage and two resident CTAs/SM for both head counts. Median R1/R2 is 1.211x
+(64 heads) and 1.146x (32 heads), but the lowest rows regress up to 17%.
+Thermal/power counter deltas are zero. The CPU export audit preserves 592
+unrelated objects but exposes an unhandled missing-libcuda exception in the
+new device query, so R2 is not a landing recommendation. Carbon alone gets a
+bounded R3: runtime-SM/per-row-CTA-derived host launch dispatch between R1
+low rows and R2 wider rows, plus a CPU-export-safe query fallback.
+
+DeepSeek R2 `6e343240` is parked incorrect: three GPU tests fail with NaNs,
+16 pass, and no timing is accepted. Organizer review identifies unchanged
+16-head QK/PV helpers reading/writing an eight-head Q/P allocation; the entrant
+confirms the ownership error. Offline compilation and nominal 49,152 B / 152
+register budgets did not establish correctness. It initially claims the round
+has expired at only six minutes, corrected using the host clock, and initially
+claims no offline compiler API despite the canonical helper in its own fork.
+It then overgeneralizes its failed geometry as requiring swapped operands for
+all two-CTA designs; the organizer corrects this against Carbon's measured
+slice-streaming design. No third round is authorized for DeepSeek.
 
 Evidence: cuteafd #2158; fork #328/#329/#330; `baseline.json`,
 `ds-round1.json`, `carbon-round1.json`, `round1-table.txt` and
