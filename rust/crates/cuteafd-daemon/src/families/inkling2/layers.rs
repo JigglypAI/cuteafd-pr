@@ -97,6 +97,13 @@ impl<'a> Kernels<'a> {
 /// Route/MLP stage has no knowledge of checkpoint expert format or transport.
 pub(crate) fn routed_ffn<'a>(kernels: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
     experts: &dyn Dispatcher, cfg: &Inkling2Config, layer: usize, rows: usize) -> Result<()> {
+    prepare_routes(kernels, owner, target, cfg, layer, rows)?;
+    experts.enqueue(owner.buffer("expert_wire")?, owner.buffer("route_ids")?, owner.buffer("route_weights")?,
+        owner.buffer("expert_output")?, rows, owner.stream())
+}
+
+pub(crate) fn prepare_routes<'a>(kernels: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+    cfg: &Inkling2Config, layer: usize, rows: usize) -> Result<()> {
     ensure!(layer < cfg.layers && rows > 0 && rows <= owner.layout().rows, "Inkling FFN layer/rows differ");
     let prefix = format!("model.llm.layers.{layer}");
     kernels.project(owner, owner.buffer("projection_input")?, target.operand(&format!("{prefix}.mlp.gate.weight"))?.buffer,
@@ -109,8 +116,7 @@ pub(crate) fn routed_ffn<'a>(kernels: &Kernels<'a>, owner: &impl UnitBuffers<'a>
     unsafe { kernels.quant.launch(&[owner.buffer("projection_input")?.ptr, wire.ptr,
         wire.ptr.cast::<u8>().wrapping_add(cfg.hidden).cast(), wire.ptr],
         &[cuteafd_ffi::programs::Scalar::I32(rows as i32), cuteafd_ffi::programs::Scalar::I32(grid as i32)], owner.stream().raw)?; }
-    experts.enqueue(owner.buffer("expert_wire")?, owner.buffer("route_ids")?, owner.buffer("route_weights")?,
-        owner.buffer("expert_output")?, rows, owner.stream())
+    Ok(())
 }
 
 pub(crate) fn residual_site(cfg: &Inkling2Config, layer: usize) -> Result<ResidualSite> {
@@ -259,13 +265,18 @@ pub(crate) fn begin_layer<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, tar
 
 pub(crate) fn finish_layer<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
     experts: &dyn Dispatcher, cfg: &Inkling2Config, index: usize, rows: usize) -> Result<()> {
+    routed_ffn(k, owner, target, experts, cfg, index, rows)?;
+    join_experts(k, owner, target, cfg, index, rows)
+}
+
+pub(crate) fn join_experts<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+    cfg: &Inkling2Config, index: usize, rows: usize) -> Result<()> {
     let site = residual_site(cfg, index)?;
     let b = |name: &str| owner.buffer(name);
     let library = owner.stream().device.library;
     let arena = b("residual_arena")?;
     let stride = owner.layout().rows*cfg.hidden*4;
     let partial = b("partial")?;
-    routed_ffn(k, owner, target, experts, cfg, index, rows)?;
     // SAFETY: expert BF16 output widens into an independently zeroed F32
     // plane; no extra weight representation or host synchronization is used.
     unsafe {
