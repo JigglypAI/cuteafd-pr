@@ -27,6 +27,95 @@ Rubric, each 1–5 (5 best), plus wall time:
 
 ## Log
 
+### 2026-11-15 V4.1 BF16 Attention Duel: Carbon Wins, Merged
+
+Carbon High, driven by DeepSeek Flash, wins R1 with `497d1760`: decode each
+native mixed FP8/FP4 record once into swizzled BF16 SMEM, reuse it for QK/PV,
+and vectorize Q and scale loads. Organizer-only SM120 measurements cover both
+32/64 heads, every live row 1-64, spread/peaked scores, fixed capacity 64 and
+warmed graph replay. Output and LSE hashes are identical in all 256 cells;
+all 256 beat native FP8. Median old-BF16/new speedup is 1.517x (64 heads) and
+1.498x (32 heads), minimum 1.337x. Four focused attention files pass 19 GPU
+tests. The 13-group MLA source audit compares 594 programs: 592 objects are
+byte-identical, only the two V4.1 stems change, headers are identical and no
+programs are added/removed. Power and thermal counter deltas are zero, max
+62 C, minimum T.Limit 37 C. Clean kernel-only fork #330 lands as `ff198298`;
+benchmark-only harness remains separate in #327.
+
+DeepSeek's R1 `e6d9cdb6` hoists metadata, probability fragments and source
+flags. It also passes 19 GPU tests and all 256 exact output/LSE hashes, but
+old-BF16/new median is 0.955x for both head counts; no cell reaches FP8 speed.
+Organizer extraction finds producer registers 148 -> 168, stack 0 -> 8 B,
+LOCAL 0 in both, versus Carbon's 165 registers and no stack/local storage.
+Two initial CuTe trace failures require a corrective commit; the entrant
+amends/force-pushes a pushed message once (identical tree), acknowledges the
+process violation and makes subsequent corrections as follow-up commits.
+
+Provisional R1 scores: Carbon Correct 5, Judgement 4, Quality 4, Creative 5,
+about 30 minutes to a sealed candidate; DeepSeek Correct 4, Judgement 2,
+Quality 3, Creative 3, about 10 minutes to its first candidate plus trace
+correction. The driver checks scope, commit, clean tree and offline evidence;
+organizer checks every numerical, timing and export claim. No entrant runs
+GPU measurements or changes the benchmark/oracle.
+
+R2 Carbon `d1cc0f62` keeps the 16-head mapping and streams 64-dimension BF16
+slices while retaining raw records, aliasing Q/P storage in time. All 256
+output/LSE hashes are exact, 19 GPU tests pass, and CUDA queries on the actual
+captured graph functions report 58 registers, 48,768 B dynamic SMEM, no local
+storage and two resident CTAs/SM for both head counts. Median R1/R2 is 1.211x
+(64 heads) and 1.146x (32 heads), but the lowest rows regress up to 17%.
+Thermal/power counter deltas are zero. The CPU export audit preserves 592
+unrelated objects but exposes an unhandled missing-libcuda exception in the
+new device query, so R2 is not a landing recommendation. Carbon alone gets a
+bounded R3: runtime-SM/per-row-CTA-derived host launch dispatch between R1
+low rows and R2 wider rows, plus a CPU-export-safe query fallback.
+
+DeepSeek R2 `6e343240` is parked incorrect: three GPU tests fail with NaNs,
+16 pass, and no timing is accepted. Organizer review identifies unchanged
+16-head QK/PV helpers reading/writing an eight-head Q/P allocation; the entrant
+confirms the ownership error. Offline compilation and nominal 49,152 B / 152
+register budgets did not establish correctness. It initially claims the round
+has expired at only six minutes, corrected using the host clock, and initially
+claims no offline compiler API despite the canonical helper in its own fork.
+It then overgeneralizes its failed geometry as requiring swapped operands for
+all two-CTA designs; the organizer corrects this against Carbon's measured
+slice-streaming design. No third round is authorized for DeepSeek.
+
+Carbon R3 `085b33e5` fixes both issues with one exported AOT program carrying
+both device functions and a generated host launch branch. The threshold is
+ceil(runtime SM count / (head blocks * 10 splits)), cached per device after a
+runtime two-CTA eligibility check; query failure falls back to R1. The first
+R3 seal exported only the Python dispatcher's R1 fallback; organizer review
+rejects that incomplete production path before timing. The final gate invokes
+compile -> export_to_c -> generated C wrapper -> CUDA graph replay, not a
+Python selector. Output and LSE hashes are exact in 256/256 cells; no cell
+regresses R1 beyond summed observed sample ranges. Median R1/R3 is 1.215x
+(64 heads) and 1.148x (32 heads). Nineteen GPU tests pass in 7.72 s and the
+594-program audit again changes only two stems. Counter deltas remain zero,
+max 63 C, minimum T.Limit 36 C. Clean fork #336 merges as `c4b17e26`.
+
+The crossover has a known wave jump, not a false below-10% claim: 64 heads
+live 4 -> 5 is 10.29 -> 14.36 us (+39.6% raw, +11.6% per row); 32 heads live
+9 -> 10 is 10.26 -> 14.35 us (+39.9% raw, +25.9% per row). R1 alone jumps
+about 59%/58% at those same boundaries. Runtime rows * head blocks * splits
+crosses the SM count; R3 reduces that staircase. Main accepts this explicit
+row-curve explanation. Real RTX 5090 qualification is unmeasured; its threshold
+must use its own runtime SM count, not the PRO 6000's measured 5/10 rows.
+
+Final scores across the duel: Carbon Correct 5, Judgement 4, Quality 4,
+Creative 5; DeepSeek Correct 2, Judgement 2, Quality 2, Creative 3. Carbon seals
+R1 in about 30 min, R2 in 31 min and the final real-AOT correction about
+38 min into R3. DeepSeek R1 is numerically exact after trace corrections but
+slower; its R2 never qualifies. Both negative results are retained. No fourth
+round or unfinished DeepSeek spine is recommended. Superseded fork drafts
+#328/#329 are closed; benchmark-only harness #327 is separate.
+
+Evidence: cuteafd #2158/#2160; fork #330/#336; `baseline.json`,
+`ds-round1.json`, `carbon-round1.json`, `carbon-round2.json`,
+`carbon-round3.json`, `round1-table.txt`, `round2-table.txt`, `round3-table.txt`,
+`carbon-r2-target/occupancy.json` and the final audit comparison receipt under
+`~/.cache/cuteafd/builds/v41-attn-duel/`.
+
 ### 2026-11-15 Native MXFP4 Duel: Final Measured Dispositions
 
 Three rounds per entrant are complete. DeepSeek Flash's final `de8d3490`
