@@ -586,8 +586,8 @@ def test_v5_smoke_card_inventory() -> None:
                 "timeout_s": 30,
                 "required": True,
             }
-    assert len(cards) == 36
-    assert len({(family, model) for family, model, _ in cards}) == 19
+    assert len(cards) == 37
+    assert len({(family, model) for family, model, _ in cards}) == 20
     assert sum(column == "5090" for _, _, column in cards) == 6
     assert not names.intersection(entry["name"] for entry in smoke["retired"])
 
@@ -1146,6 +1146,38 @@ def test_glm53_step5_mc_rollout_pins_original_and_separates_comparisons(
     for page in ("docs/models/" + family + ".md", "docs/mc-checkpoints.md", "docs/options.md"):
         assert model in (ROOT / page).read_text()
         assert revision in (ROOT / page).read_text()
+
+
+def test_kimi_k31_mc_cards_keep_original_primary_and_k6_supplementary() -> None:
+    model = "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC"
+    revision = "1455b31b0acc53f36df916864fb541d9f536b3f8"
+    release = json.loads((ROOT / "scripts/bench/release-smoke-v5.json").read_text())
+    comparisons = json.loads((ROOT / "scripts/bench/release-smoke-v51-mc-core-comparison.json").read_text())
+    regular = [entry for entry in release["entries"] if entry["set"].get("MODEL_ID") == model]
+    assert [entry["name"] for entry in regular] == ["kimi-k31-mc-original-max"]
+    assert regular[0]["set"]["CORE_VIEW"] == "original"
+    compact = [entry for entry in comparisons["entries"] if entry["set"].get("MODEL_ID") == model]
+    assert compact and all(entry["set"]["CORE_VIEW"] == "k6-compact" for entry in compact)
+    assert "kimi-k31-mc-k6-compact-max" in {entry["name"] for entry in compact}
+    for entry in regular + compact:
+        values = keys(ROOT / entry["config"]) | entry["set"]
+        assert entry["family"] == "kimi_k3"
+        assert values["MODEL_REVISION"] == revision
+        assert values["SPECULATOR"] == "off"
+        assert values["POOL_TOKENS"] == "auto"
+        assert values["KV_CACHE"] == "fp8"
+        assert len(entry["sparks"]) == 6
+        assert len(entry["gpus"]) == int(values["RTX_GPUS"])
+    unsupported = [entry for entry in comparisons["unsupported"] if entry.get("checkpoint") == model]
+    assert {entry["core_view"] for entry in unsupported} == {"k8-compact", "fp8-compact"}
+    assert all(entry["status"] == "na" and "#1796" in entry["reason"] for entry in unsupported)
+    published = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
+    row, = [row for row in published["cells"] if row["checkpoint"] == model]
+    assert row["family"] == "kimi_k3"
+    assert row["5090"]["status"] == row["1rtx"]["status"] == "na"
+    assert "original BF16 core" in row["1rtx"]["reason"]
+    assert row["2rtx"]["status"] in {"pending", "current"}
+    assert any(row["checkpoint"] == "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6" for row in published["cells"])
 
 
 def test_launcher_capture_cache_keys_include_complete_config(launcher_capture):

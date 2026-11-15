@@ -82,6 +82,22 @@
       }
     },
     {
+      "family": "kimi_k3",
+      "checkpoint": "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC",
+      "5090": {
+        "status": "na",
+        "reason": "doesn't fit"
+      },
+      "1rtx": {
+        "status": "na",
+        "reason": "original BF16 core doesn't fit: checkpoint load needs 121.96 GB vs 101.87 GB available"
+      },
+      "2rtx": {
+        "status": "pending",
+        "reason": "original MC release smoke pending (#1777)"
+      }
+    },
+    {
       "family": "glm5",
       "checkpoint": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
       "5090": {
