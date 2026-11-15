@@ -360,7 +360,8 @@ impl Ticket<'_, '_> {
                 wave = Some(device.run(|| {
                     // SAFETY: the borrowed handle retains all source owners;
                     // staging is before the source-ready event and shared FFN.
-                    unsafe { exchange.send(rows.rows, rows.rows * row_bytes, layout,
+                    // The payload is the per-rank BF16 reply plane, whatever the request rows carry.
+                    unsafe { exchange.send(rows.rows, exchange.compact_payload(rows.rows), layout,
                         rows.sources(layout), rows.stream.raw, combined,
                         Box::new(move |routes, wire| identities.request(layer, dtype, routes, wire))) }
                 })?);

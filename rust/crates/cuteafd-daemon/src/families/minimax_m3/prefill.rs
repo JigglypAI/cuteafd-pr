@@ -203,7 +203,8 @@ impl PrefillHooks for Prefill<'_, '_> {
         let ticket = owner.stream.device.run(|| {
             // SAFETY: router ids/weights and the expert input rows are staged on
             // the same stream before shared FFN reuses the activation.
-            unsafe { self.waves.send(rows, rows * row_bytes, staging, sources, owner.stream.raw,
+            // The payload is the per-rank BF16 reply plane, not the request rows.
+            unsafe { self.waves.send(rows, rows * 6144 * 2, staging, sources, owner.stream.raw,
                 spark_waves::single_reply_eligible(rows, ExpertV2SourceKind::Prefill),
                 Box::new(move |routes, wire| request(identity, version, layer, start, rows, dtype, routes, wire))) }
         })?;
