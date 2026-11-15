@@ -661,10 +661,11 @@ metadata is counted explicitly, never treated as a zero-node executable.
 Measured `live_bytes` contains surviving capture-growth shares, not physical
 residency: allocator reuse can make a resident graph's share zero. ARC keeps
 reuse-backed owners evictable and weights them by max(measured share, estimate),
-including pinned owners in `resident_bytes`. These share/estimate weights do
+including pinned owners in `resident_estimated_bytes`, a nonphysical sum that can
+far exceed the arena when many owners carry bootstrap estimates. These share/estimate weights do
 not decide admission or pressure: the soft policy uses measured memory and the
 frozen native-node ratio, never a constant `charged - reserve` eviction target.
-`live_bytes` and `resident_bytes` are diagnostics; neither decides pressure or
+`live_bytes` and `resident_estimated_bytes` are diagnostics; neither decides pressure or
 physical admission. If a commit's physical query fails, the owner stays alive for
 the caller's first launch and drained teardown, future captures stop, and its
 estimate is conservatively charged until later observed growth consumes that

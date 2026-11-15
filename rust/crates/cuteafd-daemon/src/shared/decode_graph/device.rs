@@ -89,6 +89,12 @@ pub(crate) struct Counters {
     pub eager_runs: u64,
     pub evictions: u64,
     pub physical_floor_skips: u64,
+    pub eager_awaiting_destroy: u64,
+    pub eager_soft_room: u64,
+    pub eager_hard_stop: u64,
+    pub eager_sealed: u64,
+    pub eager_preference: u64,
+    pub eager_other: u64,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -101,8 +107,9 @@ pub(crate) struct Snapshot {
     /// Measured growth shares held by live executables, excluding estimates and
     /// ghosts. A lower bound after allocator reuse, not physical arena residency.
     pub live_bytes: u64,
-    /// ARC occupancy including reuse-backed owners and pinned graphs.
-    pub resident_bytes: u64,
+    /// Sum of ARC ordering estimates, NOT physical residency. Bootstrap slab
+    /// estimates can far exceed the arena when many owners share its backing.
+    pub resident_estimated_bytes: u64,
     pub hard_stopped: bool,
     pub native_pools: NativePools,
     pub soft: SoftState,
@@ -950,7 +957,9 @@ impl DeviceCache {
                 record.stats.event(site.cycle, 1);
                 record.stats.misses += 1;
             }
-            self.counters.entry(site.cycle).or_default().eager_runs += 1;
+            let counters = self.counters.entry(site.cycle).or_default();
+            counters.eager_runs += 1;
+            counters.eager_hard_stop += 1;
             return Miss::Eager;
         }
         let (estimate, headroom) = self.estimate(site, node_estimate.as_ref().map(|e| e.bytes));
@@ -1077,7 +1086,13 @@ impl DeviceCache {
             stats.misses += 1;
             stats.ghost_hits += u64::from(ghost.is_some());
         }
-        self.counters.entry(site.cycle).or_default().eager_runs += 1;
+        let counters = self.counters.entry(site.cycle).or_default();
+        counters.eager_runs += 1;
+        if sealed { counters.eager_sealed += 1; }
+        else if site.preference == Preference::Eager { counters.eager_preference += 1; }
+        else if self.pending_destroy > 0 { counters.eager_awaiting_destroy += 1; }
+        else if self.soft.measured_bytes.is_some() { counters.eager_soft_room += 1; }
+        else { counters.eager_other += 1; }
         Miss::Eager
     }
 
@@ -1378,7 +1393,7 @@ impl DeviceCache {
     fn trace_snapshot(&self) -> TraceSnapshot {
         let records = self.records.values().map(RawRecord::copy).collect();
         TraceSnapshot { cache: Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor,
-            reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed, native_pools: self.native_pools(), soft: self.soft, level: self.level,
+            reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed, native_pools: self.native_pools(), soft: self.soft, level: self.level,
             pinned: self.inventory.pinned,
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(),
             basis: self.basis, sampled_at_ms: self.started.elapsed().as_millis() as u64,
@@ -1420,7 +1435,7 @@ impl DeviceCache {
 
     fn snapshot(&self) -> Snapshot {
         let now = self.started.elapsed().as_millis() as u64;
-        Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed, native_pools: self.native_pools(), soft: self.soft,
+        Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed, native_pools: self.native_pools(), soft: self.soft,
             level: self.level,
             pinned: self.inventory.pinned,
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(), basis: self.basis,
