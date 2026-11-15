@@ -249,8 +249,8 @@ def jobs(scope):
         result.append((f"dsa-prefill-{geometry}", "export_b12x_dsv4_aot.py",
                        ["--geometry", geometry, "--prefill-rows", "4096", "--only", ",".join(names)]))
     for label, names in (
-        ("attention", "attention_decode,attention_extend"),
-        ("kv-pack", "kv_pack"),
+        ("attention", "attention_decode,attention_extend,attention_decode_h32,attention_extend_h32"),
+        ("kv-pack", "kv_pack,kv_pack_h2"),
         ("index-producer", "index_producer"),
         ("indexer", "index_decode,index_prefill"),
     ):
