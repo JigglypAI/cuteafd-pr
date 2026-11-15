@@ -2,7 +2,7 @@
 use anyhow::{Context, Result};
 use cuteafd_loader::plan::{budget_bytes, render, ExpertPlacement, PlanError, PlanOptions};
 #[cfg(test)]
-use cuteafd_loader::plan::plan;
+use cuteafd_loader::plan::testing::plan;
 use cuteafd_loader::{default_hf_home, resolve_snapshot_at_revision};
 use std::path::PathBuf;
 
@@ -137,7 +137,10 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 ..Default::default()
             })
         }).transpose()?,
+        ..Default::default()
     };
+    #[cfg(test)]
+    { options.inventory_host_memory = args.test_host_memory; }
     options.apply_spark_budget();
     options.validate()?;
     Ok(options)
@@ -247,7 +250,16 @@ fn validate_glmf_precision(args: &PlanArgs, family: &str) -> Result<(), PlanErro
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
+    args.test_host_memory = Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram);
+    run_plan_with_host(args)
+}
+
+#[cfg(not(test))]
+pub(crate) fn run_plan(args: PlanArgs) -> Result<()> { run_plan_with_host(args) }
+
+fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
     if args.spark_range { args.layout = true; }
     if args.deployment {
         args.layout = true;
@@ -866,6 +878,19 @@ fn transfer(snapshot: &std::path::Path, manifest: &cuteafd_loader::plan::files::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_unit_options_carry_an_explicit_non_cli_host() {
+        use clap::Parser;
+        let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(
+            ["cuteafd", "plan", "/unused"]).unwrap().command else { panic!("plan") };
+        request.test_host_memory = Some((20 << 30, 3 << 30));
+        let options = options(&request).unwrap();
+        assert!(options.layout.is_none());
+        assert_eq!(options.inventory_host_memory, request.test_host_memory);
+        assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/unused",
+            "--test-host-memory", "20GiB"]).is_err());
+    }
     use cuteafd_loader::plan::testing::{mimo_flash_config, mimo_flash_tensors, mimo_pro_config, mimo_pro_tensors,
         write_snapshot};
 
@@ -1329,6 +1354,7 @@ mod tests {
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            test_host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
             fp8_prefill: Default::default(),
             attention: Default::default(),
             draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,

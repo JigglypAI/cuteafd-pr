@@ -30,6 +30,26 @@ fn plan_accepts_the_global_memory_policy_and_refuses_removed_budget_flags() {
 }
 
 #[test]
+fn budgeted_inventory_plans_carry_their_host_across_crate_boundaries() {
+    use cuteafd_loader::plan::{self, testing::{self, BudgetedPlanInput, SimulatedHost}};
+    let snapshot = tempfile::tempdir().unwrap();
+    testing::write_snapshot(snapshot.path(), &testing::mimo_flash_config(), &testing::mimo_flash_tensors(), Some(1));
+    let options = plan::PlanOptions { vision: plan::MediaMode::Off, audio: plan::MediaMode::Off,
+        ..Default::default() };
+    assert!(options.layout.is_none());
+    for available in [0, 4 << 30] {
+        let host = SimulatedHost { host_ram: (20 << 30, available), ..SimulatedHost::raptor() };
+        let expected = available.saturating_sub(host.host_ram.0 / 10);
+        let report = BudgetedPlanInput::open_on(snapshot.path(), host).unwrap().plan(&options).unwrap();
+        assert_eq!(report.mapped_placement.host_budget_bytes, expected,
+            "inventory-only plan sampled live RAM instead of the owned fixture");
+    }
+    let report = BudgetedPlanInput::open(snapshot.path()).unwrap().plan(&options).unwrap();
+    let (total, available) = SimulatedHost::raptor().host_ram;
+    assert_eq!(report.mapped_placement.host_budget_bytes, available - total / 10);
+}
+
+#[test]
 fn direct_family_concurrency_matches_logical_capacity_and_explicit_launcher_input() {
     let snapshot = tempfile::tempdir().unwrap();
     std::fs::write(snapshot.path().join("model.safetensors.index.json"), r#"{"weight_map":{}}"#).unwrap();

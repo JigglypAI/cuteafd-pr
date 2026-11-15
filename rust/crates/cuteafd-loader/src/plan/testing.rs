@@ -61,15 +61,19 @@ pub(crate) fn injected_host_memory() -> anyhow::Result<Option<(u64, u64)>> {
 }
 
 /// Shared full-plan wall budget, including first-use metadata rather than only a warm report.
-pub struct BudgetedPlanInput { input: super::PlanInput }
+pub struct BudgetedPlanInput { input: super::PlanInput, host: SimulatedHost }
 
 impl BudgetedPlanInput {
     pub fn open(snapshot: &Path) -> anyhow::Result<Self> {
-        Ok(Self { input: super::PlanInput::open(snapshot)? })
+        Self::open_on(snapshot, SimulatedHost::raptor())
+    }
+
+    pub fn open_on(snapshot: &Path, host: SimulatedHost) -> anyhow::Result<Self> {
+        Ok(Self { input: super::PlanInput::open(snapshot)?, host })
     }
 
     pub fn from_checkpoint(checkpoint: super::Checkpoint) -> Self {
-        Self { input: super::PlanInput::from_checkpoint(checkpoint) }
+        Self { input: super::PlanInput::from_checkpoint(checkpoint), host: SimulatedHost::raptor() }
     }
 
     pub fn checkpoint(&self) -> &super::Checkpoint { self.input.checkpoint() }
@@ -84,7 +88,13 @@ impl BudgetedPlanInput {
 
     #[track_caller]
     pub fn plan(&self, options: &super::PlanOptions) -> Result<super::PlanReport, super::PlanError> {
-        let (result, phases) = self.input.plan_with_timings(options);
+        let mut options = options.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        { options.inventory_host_memory = Some(self.host.host_ram); }
+        if let Some(layout) = &mut options.layout {
+            layout.host_memory.get_or_insert(self.host.host_ram);
+        }
+        let (result, phases) = self.input.plan_with_timings(&options);
         eprintln!("full-plan {:?} ranks={} phases={phases:?}", self.checkpoint().snapshot, options.placement.spark_ranks());
         assert!(phases.total() < std::time::Duration::from_secs(30),
             "full plan exceeded 30s: snapshot={} ranks={} phases={phases:?} options={options:?}",

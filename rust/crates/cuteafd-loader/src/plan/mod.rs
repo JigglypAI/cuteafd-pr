@@ -449,6 +449,9 @@ impl PlanReport {
 
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
+    /// Test-support fact for inventory-only plans; never a CLI/config key.
+    #[cfg(any(test, feature = "test-support"))]
+    pub inventory_host_memory: Option<(u64, u64)>,
     pub fp8_prefill: fp8_prefill::Policy,
     /// None preserves each family's qualified decode-view default.
     pub decode_lanes: Option<u8>,
@@ -482,6 +485,8 @@ pub struct PlanOptions {
 impl Default for PlanOptions {
     fn default() -> Self {
         Self {
+            #[cfg(any(test, feature = "test-support"))]
+            inventory_host_memory: None,
             fp8_prefill: Default::default(),
             decode_lanes: None,
             attention_prefill_precision: Default::default(),
@@ -502,6 +507,14 @@ impl Default for PlanOptions {
 }
 
 impl PlanOptions {
+    fn inventory_layout(&self) -> layout::LayoutOptions {
+        #[allow(unused_mut)]
+        let mut layout = layout::LayoutOptions::default();
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(memory) = self.inventory_host_memory { layout.host_memory = Some(memory); }
+        layout
+    }
+
     /// An explicit Spark ceiling applies to the complete layout as well as
     /// weights. Unset keeps the separate historical device/family defaults.
     pub fn apply_spark_budget(&mut self) {
@@ -1301,7 +1314,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     let ReportCensus { mapped_names, scales, scale_bytes, table_bytes, .. } = *census;
     let host_budget = if scales == 0 && table_bytes == 0 { 0 } else {
         options.mapped_scale_host_budget_bytes.unwrap_or_else(|| {
-            let defaults = layout::LayoutOptions::default();
+            let defaults = options.inventory_layout();
             layout::planner_host_memory(options.layout.as_ref().unwrap_or(&defaults).host_memory,
                 layout::HostMemorySample::Raw)
                 .map_or(0, |(total, available)| available.saturating_sub(total / 10))
@@ -1438,7 +1451,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         let mut inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_gpu_budget_bytes], spark_bytes: options.spark_budget(),
             spark_allocation_budget_bytes: Some(options.spark_budget()), glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
-            weight_budget_bytes: options.coordinator_budget_bytes, inventory: true, ..Default::default() };
+            weight_budget_bytes: options.coordinator_budget_bytes, inventory: true, ..options.inventory_layout() };
         let _ = family_layout(model, input, &mut report, &mut inventory, options.placement)?;
         report.prefill_unit_rows = inventory.prefill_unit_rows;
         report.prefill_waves = Some(inventory.prefill_waves);
