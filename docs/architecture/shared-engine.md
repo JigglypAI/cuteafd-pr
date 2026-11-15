@@ -628,9 +628,14 @@ still require observation, since failed instantiation can grow driver storage.
 Qualified single-device chains reuse node/executable pools; fan-out and explicit
 peer-spanning captures do not receive chain discounts. Native width and span
 matter, not just node count (#1626). Fresh growth is admitted against the
-physical `charged` high-water plus pending growth and headroom. At that bound,
-new shapes can capture only through proven chain-pool reuse after executable
-retirement; failed or non-chain captures cannot manufacture physical credit.
+physical `charged` high-water plus pending growth and headroom. Once measured
+`charged` reaches the admitted reserve, every new capture ticket stops, including
+nominal reuse; existing graphs keep replaying and misses run eagerly. Destruction
+cannot clear that hard stop. Below the stop, qualified chain-pool reuse remains
+possible; failed or non-chain captures cannot manufacture physical credit.
+Native node and executable counts are reported separately from byte-estimator
+units (`native_pools`), including zero-growth reuse and pinned owners. Unknown
+metadata is counted explicitly, never treated as a zero-node executable.
 Measured `live_bytes` contains surviving capture-growth shares, not physical
 residency: allocator reuse can make a resident graph's share zero. ARC keeps
 reuse-backed owners evictable and weights them by max(measured share, estimate),

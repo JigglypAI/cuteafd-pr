@@ -103,6 +103,8 @@ pub(crate) struct Snapshot {
     pub live_bytes: u64,
     /// ARC occupancy including reuse-backed owners and pinned graphs.
     pub resident_bytes: u64,
+    pub hard_stopped: bool,
+    pub native_pools: NativePools,
     /// Current untracked level relative to the attach seed. Unlike `charged`
     /// (the physical arena high-water retained for admission), this can
     /// fall, so a transient peak that reverses releases its credit.
@@ -249,6 +251,13 @@ pub(crate) struct Pools {
     pub node_high_water: u64,
     pub live_execs: u64,
     pub exec_high_water: u64,
+}
+
+#[derive(Default, Clone, Debug, serde::Serialize)]
+pub(crate) struct NativePools {
+    pub live_nodes: u64,
+    pub live_execs: u64,
+    pub unknown_execs: u64,
 }
 
 fn may_capture(preference: Preference, estimate: u64, headroom: u64, reserve: u64,
@@ -741,6 +750,18 @@ impl DeviceCache {
         self.counters.get(&cycle).map_or(0, |counters| counters.hits)
     }
 
+    fn native_pools(&self) -> NativePools {
+        let mut pools = NativePools::default();
+        for record in self.records.values().filter(|r| !r.permanently_eager &&
+            (r.pending_capture || r.pinned || r.pending_destroy || matches!(r.list, Some(List::Recent | List::Frequent)))) {
+            pools.live_execs += 1;
+            if let Some(nodes) = record.stats.native_nodes {
+                pools.live_nodes = pools.live_nodes.saturating_add(nodes);
+            } else { pools.unknown_execs += 1; }
+        }
+        pools
+    }
+
     fn resident_bytes(&self) -> u64 {
         self.records.values().filter(|r| !r.pending_capture && (r.pinned || r.pending_destroy
             || matches!(r.list, Some(List::Recent | List::Frequent)))).fold(0u64,
@@ -842,6 +863,16 @@ impl DeviceCache {
                 record.oom = None;
             }
         }
+        // The measured hard stop admits no new tickets, even nominal reuse.
+        // Destruction cannot return driver arena bytes or clear this stop.
+        if self.charged >= self.reserve {
+            if let Some(record) = old.and_then(|id| self.records.get_mut(&id)) {
+                record.stats.event(site.cycle, 1);
+                record.stats.misses += 1;
+            }
+            self.counters.entry(site.cycle).or_default().eager_runs += 1;
+            return Miss::Eager;
+        }
         let (estimate, headroom) = self.estimate(site, node_estimate.as_ref().map(|e| e.bytes));
         let ghost = old.and_then(|id| self.records[&id].list)
             .filter(|list| matches!(list, List::RecentGhost | List::FrequentGhost));
@@ -927,6 +958,7 @@ impl DeviceCache {
             stats.event(site.cycle, 1);
             stats.misses += 1;
             stats.ghost_hits += u64::from(ghost.is_some());
+            stats.native_nodes = None;
             stats.declared_capture_streams = metadata.parallel_width;
             stats.spans_devices |= site.spans_devices;
             if metadata.parallel_width > 1 {
@@ -1213,7 +1245,7 @@ impl DeviceCache {
     fn trace_snapshot(&self) -> TraceSnapshot {
         let records = self.records.values().map(RawRecord::copy).collect();
         TraceSnapshot { cache: Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor,
-            reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_bytes: self.resident_bytes(), level: self.level,
+            reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve, native_pools: self.native_pools(), level: self.level,
             pinned: self.records.values().filter(|r| r.pinned).map(|r| r.bytes).sum(),
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(),
             basis: self.basis, sampled_at_ms: self.started.elapsed().as_millis() as u64,
@@ -1246,7 +1278,7 @@ impl DeviceCache {
             });
             records.into_iter().take(16).map(|record| self.row(record, now)).collect()
         };
-        Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_bytes: self.resident_bytes(),
+        Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve, native_pools: self.native_pools(),
             level: self.level,
             pinned: self.records.values().filter(|r| r.pinned).map(|r| r.bytes).sum(),
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(), basis: self.basis,
@@ -1431,11 +1463,49 @@ mod tests {
             assert_eq!(cache.charged, 1010, "destroy must not credit physical release");
         }
         assert!(matches!(cache.miss(key(36), site(Preference::Capture), None, false), Miss::Eager));
-        let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy).map(|(&id, _)| id).collect();
-        assert_eq!(victims.len(), 1);
-        cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
-        assert!(matches!(cache.miss(key(36), site(Preference::Capture), None, false), Miss::Capture(_)),
-            "the old peak must allow proven pool reuse, not permanent eager");
+        assert_eq!(cache.pending_destroy, 0, "hard stop never churns existing owners");
+
+    }
+
+    #[test]
+    fn measured_hard_stop_freezes_new_tickets_including_reuse_and_survives_destroy() {
+        for measured in [100, 110] {
+            let mut cache = DeviceCache::new(-1002, 100);
+            let Miss::Capture(id) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
+            cache.captured_topology(id, 7, 1, false);
+            cache.measured_capture(measured);
+            for _ in 0..16 {
+                cache.hit(id);
+                assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
+                assert_eq!(cache.pending_destroy, 0);
+                assert_eq!(cache.charged, measured);
+            }
+            cache.mark_victim(false);
+            cache.destroyed(&[id], ReleaseMeasurement { released: measured });
+            assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
+            assert_eq!(cache.charged, measured);
+            assert!(cache.snapshot().hard_stopped);
+        }
+    }
+
+    #[test]
+    fn native_node_counts_are_retained_independently_of_byte_estimator_units() {
+        let mut cache = DeviceCache::new(-1003, 1000);
+        let Miss::Capture(a) = cache.miss(key(1), site(Preference::Capture), None, true) else { panic!() };
+        cache.captured_topology(a, 7, 1, false);
+        cache.measured_capture(10);
+        let Miss::Capture(b) = cache.miss(key(2), site(Preference::Capture), None, false) else { panic!() };
+        cache.captured_topology(b, 13, 1, false);
+        cache.measured_capture(0);
+        assert_eq!((cache.native_pools().live_nodes, cache.native_pools().live_execs), (20, 2));
+        assert_eq!(cache.native_pools().unknown_execs, 0);
+        assert_eq!(cache.pools.live_nodes, 20, "byte-based prediction remains separate");
+        cache.mark_victim(false);
+        assert_eq!(cache.native_pools().live_nodes, 20, "selected victims still own native storage");
+        cache.destroyed(&[b], ReleaseMeasurement { released: 0 });
+        assert_eq!((cache.native_pools().live_nodes, cache.native_pools().live_execs), (7, 1));
+        cache.remove_bank(1);
+        assert_eq!(cache.native_pools().live_execs, 0);
     }
 
     #[test]
