@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import hashlib
 import importlib.util
+import inspect
 import json
 import multiprocessing
 import os
@@ -375,6 +376,12 @@ def jobs(scope):
     # Muse Spark: TP-resident K4/K5 experts; the generic partial epilogue is separate.
     result.append(("exl3-muse-k45", "package_exl3_aot.py",
                    ["--geometry", "muse", "--capacities", EXL3_CAPACITIES, "--bits", "4,5"]))
+    # Include ordinary Spark programs and their additive row-address siblings.
+    # Keep baseline packages free to use their own layout inventory and API.
+    result.extend((name + '-spark', exporter, [*args, '--role', 'spark', '--source-package-layouts'])
+                  for name, exporter, args in list(result)
+                  if exporter == 'package_exl3_aot.py' and not name.startswith('exl3-compact-')
+                  and args[args.index('--geometry') + 1] in ('glm', 'glmf'))
     result.extend((f"context-split-{geometry}", "export_b12x_dsv4_aot.py",
                    ["--geometry", geometry, "--context-split-only"])
                   for geometry in ("flash", "pro", "glm", "glmf"))
@@ -555,9 +562,20 @@ def export_routed(extra, output, selected_objects=None):
     role = extra[extra.index("--role") + 1] if "--role" in extra else "coordinator"
     requested_input = extra[extra.index("--input") + 1] if "--input" in extra else None
     wire = indirect or package.input_kind(role, base.weights, requested_input) == "wire"
-    segmented = indirect or (role == "spark" and wire and base.weights in ("fp8", "mxfp4"))
-    if segmented:
+    # Spark packages carry the row-addressed programs the exporter emits
+    # (`segmented_forms`); coordinator and --row-addresses runs need only the
+    # segment API, so a baseline fork without it still compares ordinary programs.
+    segment_forms = ()
+    if role == "spark" or indirect:
         from b12x.integration.cuteafd.fp8_moe import fp8_moe_segment_scratch_bytes
+    if role == "spark" and not indirect:
+        if hasattr(package, "segmented_forms"):
+            from b12x.integration.cuteafd.fp8_moe import nvfp4_a4_fused
+            segment_forms = package.segmented_forms(base, wire, nvfp4_a4_fused())
+        elif wire and base.weights in ("fp8", "mxfp4"):
+            # A baseline package that predates per-format segment programs
+            # exported every form of FP8/MXFP4 wire streams only.
+            segment_forms = package.FORMS
     records = []
     layout_metadata = {}
     for layout in dict.fromkeys(layouts):
@@ -575,8 +593,8 @@ def export_routed(extra, output, selected_objects=None):
         }
         forms = [(rows, "auto", indirect) for rows in capacities]
         forms += [(rows, form, indirect) for rows in capacities for form in prefill_forms(g, rows, wire)]
-        if segmented and not indirect:
-            forms += [(package.SEGMENT_MAX_ROWS, form, True) for form in package.FORMS]
+        if not indirect:
+            forms += [(package.SEGMENT_MAX_ROWS, form, True) for form in segment_forms]
         forms = [(rows, form, addresses, core) for rows, form, addresses in forms
                  for core in routed_core_variants(package, role, g.weights)]
         for rows, form, row_addresses, core_only in forms:
@@ -593,7 +611,8 @@ def export_routed(extra, output, selected_objects=None):
                         max_rows=package.SEGMENT_MAX_ROWS if row_addresses else rows, wire=wire, prefill=form,
                         **({"row_addresses": True} if row_addresses else {}),
                         **({"core_only": True} if core_only else {}))
-                scratch = (fp8_moe_segment_scratch_bytes(g, rows, package.SEGMENT_MAX_ROWS, form)
+                scratch = (fp8_moe_segment_scratch_bytes(g, rows, package.SEGMENT_MAX_ROWS, form,
+                               **({} if wire else {"wire": False}))
                            if row_addresses else fp8_moe_scratch_bytes(g, "auto", rows, wire, form))
                 return program, scratch
             program, scratch = recorded_construction(construct)
@@ -720,6 +739,13 @@ def _export_exl3(extra, output):
                 for schedule, schedule_options in package.decode_schedule_variants(geometry, role, profile, rows):
                     recorded_construction(export, output / profile / f"m{rows}-{schedule}", width, experts, rows, bits, "auto", topk,
                            dtype, **{**options, **schedule_options})
+        # Baselines before row-address support must still export ordinary cells.
+        if hasattr(package, 'segment_export_options') and 'row_addresses' in inspect.signature(export).parameters:
+            options = package.segment_export_options(geometry, role, width, compact=compact)
+            if options is not None:
+                recorded_construction(export, output / profile / f'm{package.SEGMENT_MAX_ROWS}-segments',
+                                      width, experts, package.SEGMENT_MAX_ROWS, bits, 'auto', topk,
+                                      'bf16', compile_only=True, **options)
 
 
 def export_exl3_routes(extra, output):
@@ -787,6 +813,7 @@ def worker(payload):
         records_module = load_file("placement_kernel_records", ROOT / "scripts/build/kernel-records.py")
         backend_cache = records_module.install_backend_cache(payload.get("backend_cache"))
         recorder = records_module.Recorder(ROOT, output).install()
+        recorder.scoped = payload["exporter"] == "export_b12x_dsv4_aot.py"
         PROGRAM_RECORDER = recorder
         # runpy exporters receive a worker-local hook, not a serving dependency.
     start = time.monotonic()
@@ -815,6 +842,8 @@ def worker(payload):
             runpy.run_path(str(path), run_name="__main__", init_globals={
                 "_record_construction": recorded_construction,
                 "_program_records": ProgramRecords(),
+                "_disable_program_cache": recorder is not None and recorder.scoped,
+                "_catalog_only": payload.get("catalog_only", False),
                 "_selected_object_labels": payload.get("selected_objects")})
     if torch.cuda.get_device_properties(0).multi_processor_count != payload["sms"]:
         raise RuntimeError("exporter changed the synthetic SM count")
@@ -835,7 +864,20 @@ def worker(payload):
     if recorder is not None:
         inspector = load_file("placement_cuda_images", ROOT / "scripts/qualify/deepseek_v41/inspect-cute-object.py")
         program_records = recorder.finish(inspector, summary, plans)
+        scoped = recorder.scoped
+        recorder.scoped = False
         summary["source_reads_sha256"] = recorder.reads()
+        if scoped:
+            # Worker import order and cache bookkeeping are not semantic inputs.
+            # A conservative job inventory makes its skip independent of shards.
+            inventory = [source for directory in ("python/tools", "third_party/sparkinfer/b12x")
+                         for source in (ROOT / directory).rglob("*.py")]
+            inventory += [ROOT / "rust/crates/cuteafd-core/src/dspark_verify.rs",
+                          ROOT / "scripts/build/verify-sparkinfer-source.py"]
+            summary["source_reads_sha256"].update({str(source.relative_to(ROOT)): sha(source.read_bytes())
+                                                 for source in inventory if source.is_file()})
+            summary["source_reads_sha256"] = dict(sorted(summary["source_reads_sha256"].items()))
+        recorder.scoped = scoped
         summary["stage0_inputs"] = records_module.stage0_inputs(ROOT, payload, capability)
         if backend_cache is not None:
             summary["backend_reuse"] = {"hits": backend_cache.hits, "misses": backend_cache.misses}
@@ -1139,6 +1181,8 @@ def v4_placement_inputs(destination, staging, timeout, workers, previous=None, b
                         shutil.copy2(source, copied)
     for name, _, _ in exports:
         for source in (staging / name).rglob("*.json"):
+            if source.name == "program-timings.json":
+                continue
             target = destination / ".workers" / name / source.relative_to(staging / name)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
@@ -1184,7 +1228,14 @@ def main():
     parser.add_argument("--_worker", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args._worker:
-        worker(json.loads(args._worker))
+        payload = json.loads(args._worker)
+        if payload.get("host_admission"):
+            sys.path.insert(0, str(ROOT / "python/tools/lib"))
+            from _export_jobs import export_slot
+            with export_slot():
+                worker(payload)
+        else:
+            worker(payload)
         return 0
     if args.v4_placement_inputs:
         if args.workers < 1 or args.timeout < 1:

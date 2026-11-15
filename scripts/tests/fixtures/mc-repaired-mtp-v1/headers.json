@@ -1,0 +1,91 @@
+{
+  "compact.safetensors": {
+    "head.trellis": {
+      "data_offsets": [
+        0,
+        2
+      ],
+      "dtype": "I16",
+      "shape": [
+        1
+      ]
+    }
+  },
+  "mixed.safetensors": {
+    "model.layers.1.mlp.experts.0.trellis": {
+      "data_offsets": [
+        8708,
+        8712
+      ],
+      "dtype": "I16",
+      "shape": [
+        2
+      ]
+    },
+    "model.layers.2.eh_proj.mcg": {
+      "data_offsets": [
+        8704,
+        8708
+      ],
+      "dtype": "I32",
+      "shape": []
+    },
+    "model.layers.2.eh_proj.suh": {
+      "data_offsets": [
+        8192,
+        8448
+      ],
+      "dtype": "F16",
+      "shape": [
+        128
+      ]
+    },
+    "model.layers.2.eh_proj.svh": {
+      "data_offsets": [
+        8448,
+        8704
+      ],
+      "dtype": "F16",
+      "shape": [
+        128
+      ]
+    },
+    "model.layers.2.eh_proj.trellis": {
+      "data_offsets": [
+        0,
+        8192
+      ],
+      "dtype": "I16",
+      "shape": [
+        8,
+        8,
+        64
+      ]
+    }
+  },
+  "original-mtp-0001.safetensors": {
+    "model.layers.2.eh_proj.weight": {
+      "data_offsets": [
+        0,
+        32768
+      ],
+      "dtype": "BF16",
+      "shape": [
+        128,
+        128
+      ]
+    }
+  },
+  "original.safetensors": {
+    "head.weight": {
+      "data_offsets": [
+        0,
+        2
+      ],
+      "dtype": "BF16",
+      "shape": [
+        1
+      ]
+    }
+  }
+}

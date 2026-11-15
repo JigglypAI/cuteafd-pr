@@ -7,9 +7,10 @@ use crate::{
 use std::ffi::c_void;
 pub mod producers;
 pub mod forward;
+pub mod wire;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EntryValidator { Producer, Forward }
+pub(crate) enum EntryValidator { Producer, Forward, Wire }
 
 /// Producer stems are family-owned; unrecognized MiniMax entries retain the
 /// strict MSA validator rather than being accepted by a prefix alone.
@@ -20,6 +21,8 @@ pub(crate) fn entry_validator(name: &str) -> Option<EntryValidator> {
     } else if forward::Kind::ALL.into_iter().chain(forward::Kind::HEADS)
         .any(|kind| kind.name() == name) {
         Some(EntryValidator::Forward)
+    } else if name == wire::NAME {
+        Some(EntryValidator::Wire)
     } else { None }
 }
 
@@ -28,6 +31,7 @@ impl EntryValidator {
         match self {
             Self::Producer => producers::validate_producer_entry(spec, entry).map(|_| ()),
             Self::Forward => forward::validate_entry(spec, entry).map(|_| ()),
+            Self::Wire => wire::validate_entry(spec, entry).map(|_| ()),
         }
     }
 }
@@ -660,6 +664,7 @@ mod tests {
                 match entry_validator(name) {
                     Some(EntryValidator::Producer) => "producer",
                     Some(EntryValidator::Forward) => "forward",
+                    Some(EntryValidator::Wire) => "wire",
                     None => "msa",
                 }
             };

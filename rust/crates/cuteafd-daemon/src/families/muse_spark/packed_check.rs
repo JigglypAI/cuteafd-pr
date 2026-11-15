@@ -146,7 +146,7 @@ fn snapshot_and_restore(backend: &MuseBackend<'_, '_>, family: &super::prefix::M
     family.restore(Some(MarkSlot(0)), &mut restored, placement.len).map_err(boxed)?;
     family.capture(MarkSlot(1), &restored, placement.len).map_err(boxed)?;
     family.drain().map_err(boxed)?;
-    let cache = cuteafd_loader::families::muse_spark::cache::MuseCacheLayout::new(backend.cfg, backend.ranks.len())?;
+    let cache = cuteafd_loader::families::muse_spark::cache::MuseCacheLayout::with_format(backend.cfg, backend.ranks.len(), backend.ranks[0].kv.format)?;
     let record = usize::try_from(cache.record_bytes)?;
     let ring_bytes = usize::try_from(cache.ring.rows)? * record;
     let before = family.mark_segments(MarkSlot(0));

@@ -67,6 +67,10 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                     cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
                     cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
                 }).unwrap_or_default(),
+                muse_kv: args.kv_format.map(|format| match format {
+                    cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::muse_spark::cache::MuseKvCache::Bf16,
+                    cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::muse_spark::cache::MuseKvCache::Fp8,
+                }).unwrap_or_default(),
                 mla_kv: args.kv_format.unwrap_or_default(),
                 qwen_representation: cuteafd_loader::families::qwen4::resident::Qwen4Representation {
                     fp8_projections: args.fp8_decode, fp8_head: args.mtp_fp8_head },
@@ -567,6 +571,7 @@ fn spark_hosts_count(cfg: &std::collections::BTreeMap<String, String>) -> Result
 fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
     let default = match family {
+        "minimax_m3" => "dspark",
         "glm5" | "glm5_flash" | "muse_spark" => "dflash2",
         "qwen3_5" if serde_json::from_slice::<serde_json::Value>(&std::fs::read(snapshot.join("config.json"))?)
             .is_ok_and(|config| config.get("text_config").unwrap_or(&config)["hidden_size"] == 5120) => "dspark",
@@ -1220,6 +1225,18 @@ mod tests {
     }
 
     #[test]
+    fn muse_plan_preserves_bf16_until_fp8_quality_qualification() {
+        use cuteafd_loader::families::muse_spark::cache::MuseKvCache;
+        let mut args = args(std::path::Path::new("/model"), 6, false);
+        assert_eq!(options(&args).unwrap().layout.unwrap().muse_kv, MuseKvCache::Bf16);
+        for (selected, format) in [(cuteafd_core::MlaCacheFormat::Bf16, MuseKvCache::Bf16),
+            (cuteafd_core::MlaCacheFormat::Fp8, MuseKvCache::Fp8)] {
+            args.kv_format = Some(selected);
+            assert_eq!(options(&args).unwrap().layout.unwrap().muse_kv, format);
+        }
+    }
+
+    #[test]
     fn kimi_plan_defaults_to_fp8_and_preserves_explicit_bf16() {
         use cuteafd_core::MlaCacheFormat;
         let mut args = args(std::path::Path::new("/model"), 6, false);
@@ -1493,6 +1510,34 @@ mod tests {
         assert_eq!(file_args(input.clone(), target.path()).unwrap().tp2_dflash, Some(false));
         std::fs::write(&config, "SPECULATOR=off\nTP2_DFLASH=auto\nVISION=off\nAUDIO=off\n").unwrap();
         assert!(file_args(input, target.path()).is_err());
+    }
+
+    #[test]
+    fn minimax_speculator_defaults_on_for_every_placement_and_preserves_off() {
+        use cuteafd_loader::plan::spec::DraftOwnership;
+        let target = tempfile::tempdir().unwrap();
+        for gpus in [1, 2] {
+            for placement in ["auto", "heads", "layers"] {
+                for configured in [None, Some("auto"), Some("off"), Some("dspark")] {
+                    for explicit in ["auto", "off", "dspark"] {
+                        let mut input = args(target.path(), 4, false);
+                        input.rtx = gpus;
+                        input.attention_placement = placement.into();
+                        input.speculator = explicit.into();
+                        let cfg = configured.map(|mode| ("SPECULATOR".into(), mode.into()))
+                            .into_iter().collect();
+                        resolve_speculator(&mut input, target.path(), "minimax_m3", &cfg).unwrap();
+                        let enabled = explicit != "off" && !(explicit == "auto" && configured == Some("off"));
+                        assert_eq!(input.speculator, if enabled { "dspark" } else { "off" });
+                        assert_eq!(DraftOwnership::selected("minimax_m3", &input.speculator),
+                            if enabled { DraftOwnership::BundledDspark } else { DraftOwnership::None });
+                        input.no_speculator = true;
+                        resolve_speculator(&mut input, target.path(), "minimax_m3", &cfg).unwrap();
+                        assert_eq!(input.speculator, "off");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

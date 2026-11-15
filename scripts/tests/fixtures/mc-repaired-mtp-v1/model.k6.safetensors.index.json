@@ -1,0 +1,1 @@
+{"metadata": {"total_size": 8714}, "weight_map": {"model.layers.2.eh_proj.trellis": "mixed.safetensors", "model.layers.2.eh_proj.suh": "mixed.safetensors", "model.layers.2.eh_proj.svh": "mixed.safetensors", "model.layers.2.eh_proj.mcg": "mixed.safetensors", "model.layers.1.mlp.experts.0.trellis": "mixed.safetensors", "head.trellis": "compact.safetensors"}}

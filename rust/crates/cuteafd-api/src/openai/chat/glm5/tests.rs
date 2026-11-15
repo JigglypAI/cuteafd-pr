@@ -427,7 +427,7 @@ mod vision_template {
     fn installed_official_and_mc_templates_follow_vision_policy_when_present() {
         let root = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required")).join("hub");
         let official = root.join("models--zai-org--GLM-5.3-Flash/snapshots/eb9eb208eb0d988989d07a6a12d0fdeb5f52574a");
-        let mc = root.join("models--wrldsuksgo2mars--GLM-5.3-Flash-EXL3-K4-MC/snapshots/91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d");
+        let mc = root.join("models--wrldsuksgo2mars--GLM-5.3-Flash-EXL3-K4-MC/snapshots/558931fe149f59b49d19b2376a692bd7a12fb8b7");
         assert!(official.is_dir() && mc.is_dir(), "required official and MC checkpoints missing");
         for snapshot in [&official, &mc] {
             let encoding = GlmEncoding::from_snapshot_for_vision(snapshot, None, None).unwrap();

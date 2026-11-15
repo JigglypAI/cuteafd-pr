@@ -39,13 +39,12 @@ pub const PAGE_ROWS: u64 = 64;
 pub const LANES: u64 = 1;
 const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
 
-/// Shared constructor/admission capacities. Native decode consumes one token
-/// per request; multi-token verification uses packed prefill units instead.
-/// Verify never launches more than one prefill unit's rows; the constructor
-/// must partition, preserve causal sequence order and consume head tiles before
-/// reusing a unit. Speculative batch totals are not dispatcher extents.
+/// Real request slots and native causal query rows are independent capacities.
+/// A speculative request contributes its anchor plus the checkpoint's draft
+/// width, without inventing additional logical cache or prefix slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestCapacity {
+    pub requests: u32,
     pub decode: UnitMetadata,
     pub prefill: UnitMetadata,
 }
@@ -54,8 +53,26 @@ impl RequestCapacity {
         cuteafd_core::concurrency::validate("minimax_m3", concurrency).map_err(invalid)?;
         let requests = u32::try_from(concurrency).map_err(|_| Refusal::Overflow("MiniMax requests"))?;
         let rows = u32::try_from(unit_rows).map_err(|_| Refusal::Overflow("MiniMax unit rows"))?;
-        Ok(Self { decode: UnitMetadata::for_requests(requests, requests)?,
+        Ok(Self { requests, decode: UnitMetadata::for_requests(requests, requests)?,
             prefill: UnitMetadata::for_requests(rows, requests.min(rows))? })
+    }
+
+    pub fn with_queries(concurrency: u64, unit_rows: u64, queries: u64) -> Result<Self, Refusal> {
+        let mut capacity = Self::new(concurrency, unit_rows)?;
+        let queries = u32::try_from(queries).map_err(|_| Refusal::Overflow("MiniMax query rows"))?;
+        if queries < capacity.requests || queries > 64 {
+            return Err(invalid("query rows must cover actual requests within native capacity"));
+        }
+        capacity.decode = UnitMetadata::for_requests(queries, queries)?;
+        Ok(capacity)
+    }
+
+    pub fn validate(self) -> Result<Self, Refusal> {
+        if Self::with_queries(u64::from(self.requests), u64::from(self.prefill.rows),
+            u64::from(self.decode.rows))? != self {
+            return Err(invalid("request/query metadata differs from admission"));
+        }
+        Ok(self)
     }
 
     /// Native expert workspace and serial dispatch capacity for either mode.
@@ -75,7 +92,7 @@ impl RequestCapacity {
 
     /// Globals only; the constructor derives the physical per-layer pool separately.
     pub fn cache(self, context: u32) -> Result<MsaCache, Refusal> {
-        MsaCache::new(1, 1, self.decode.requests, context)
+        MsaCache::new(1, 1, self.requests, context)
     }
 }
 
@@ -352,6 +369,8 @@ pub struct MiniMaxInputs {
     /// Remote charges per onboarding count, per rank (`spark[count][rank]`).
     pub spark: Vec<Vec<SparkCharge>>,
     pub links: Vec<crate::placement::PreparedSparkLink>,
+    /// The header-derived Spark ingress and its per-layer shared input scales.
+    pub spark_ingress: crate::families::minimax_m3::admission::SparkIngressPlan,
     pub spark_reply_formats: SparkReplyFormats,
     pub drafter: Option<Drafter>,
     pub vision: Option<Vision>,
@@ -398,9 +417,11 @@ pub fn request(context: Context, pool: Option<u64>, onboard: crate::placement::O
         prefill: Pin::Exact(prefill), operation, resident_weight_limit, spark_reply_formats: replies }
 }
 
-/// One Spark endpoint at the admitted unit: native BF16 ingress (NVFP4 W4A4
-/// experts quantize their own activations from the calibrated input scale).
-pub fn spark_link(gpu: u8, ranks: usize, prefill: PrefillShape, replies: SparkReplyFormats)
+/// One Spark endpoint at the admitted unit: BF16 ingress (NVFP4 W4A4 experts
+/// quantize their own activations from the calibrated input scale), or the
+/// exact NVFP4 wire when that quantization is expert-independent.
+pub fn spark_link(gpu: u8, ranks: usize, prefill: PrefillShape, replies: SparkReplyFormats,
+    ingress: cuteafd_core::SparkIngress)
     -> Result<Vec<crate::placement::PreparedSparkLink>, Refusal> {
     use crate::placement::{PreparedSparkLink, SparkEndpointOwners, SparkIntakeCandidates};
     if gpu != 0 { return Err(invalid("the sole minimax.spark endpoint belongs on GPU0")); }
@@ -410,7 +431,7 @@ pub fn spark_link(gpu: u8, ranks: usize, prefill: PrefillShape, replies: SparkRe
         geometry: cuteafd_core::ExpertGeometry::MINIMAX_M3,
         endpoint: cuteafd_core::SparkEndpoint { ring_depth: None,
             capacity: u32::try_from(prefill.rows).map_err(|_| Refusal::Overflow("MiniMax transport rows"))?,
-            ingress: cuteafd_core::SparkIngress::Bf16, partial_reply_bytes: None },
+            ingress, partial_reply_bytes: None },
         rings: cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
             slot_bytes: rings.slot_bytes, alignment: rings.alignment } },
         usize::try_from(prefill.waves).map_err(|_| Refusal::Overflow("MiniMax transport waves"))?,
@@ -427,7 +448,7 @@ pub fn spark_verify_rows(concurrency:u64, drafts:usize) -> anyhow::Result<u32> {
     anyhow::ensure!(concurrency > 0 && concurrency <= 64,"MiniMax Spark concurrency {concurrency} outside 1..=64");
     concurrency.checked_mul(u64::try_from(drafts)?.checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("MiniMax draft width overflow"))?)
-        .and_then(|rows| u32::try_from(rows).ok()).ok_or_else(|| anyhow::anyhow!("MiniMax Spark verify rows overflow"))
+        .and_then(|rows| u32::try_from(rows.min(64)).ok()).ok_or_else(|| anyhow::anyhow!("MiniMax Spark verify rows overflow"))
 }
 
 pub fn spark_executions_for_rows(prefill:PrefillShape,rows:u32) -> anyhow::Result<cuteafd_core::SparkExecutions> {
@@ -474,7 +495,8 @@ impl MiniMaxInputs {
     pub fn maximum_pages(&self) -> u64 { self.maximum_pool_tokens.div_ceil(PAGE_ROWS) }
 
     pub fn request_capacity(&self) -> Result<RequestCapacity, Refusal> {
-        RequestCapacity::new(self.sequences, self.prefill.rows)
+        RequestCapacity::with_queries(self.sequences, self.prefill.rows,
+            self.drafter.as_ref().map_or(self.sequences, |draft| (draft.native.verify_rows as u64).min(64)))
     }
 
     pub fn heads(&self) -> bool { self.gpus == 2 && self.attention == AttentionPlacement::Heads }
@@ -634,7 +656,7 @@ impl MiniMaxInputs {
         let mut out = Vec::new();
         // Host decode IDs enter only the embedding rank; peers receive residuals.
         let token_ids = Owner::DecodeTokenIds { gpu: 0 }.id();
-        let token_bytes = self.sequences.checked_mul(4).ok_or(Refusal::Overflow("MiniMax decode token IDs"))?;
+        let token_bytes = u64::from(self.request_capacity()?.decode.rows).checked_mul(4).ok_or(Refusal::Overflow("MiniMax decode token IDs"))?;
         out.extend(buffer(token_ids.clone(), Location::coordinator(0), token_bytes, Lifetime::TARGET,
             Category::Workspace, "decode token IDs", maximum));
         out.extend(buffer(format!("{token_ids}.upload"), Location::PINNED, token_bytes, Lifetime::TARGET,
@@ -679,8 +701,8 @@ impl MiniMaxInputs {
         // The native cache descriptor is the physical source of page strides.
         let cache = if self.heads() {
             MsaCache::for_heads(&HeadsLayout::new(cfg, gpu as u8, rows)?, 1,
-                capacity.decode.requests, context)?
-        } else { MsaCache::new(1, 1, capacity.decode.requests, context)? };
+                capacity.requests, context)?
+        } else { MsaCache::new(1, 1, capacity.requests, context)? };
         let buffers = cache.buffers()?;
         for layer in 0..cfg.layers {
             if !self.heads() && usize::from(self.owners[layer]) != gpu { continue; }
@@ -696,14 +718,15 @@ impl MiniMaxInputs {
             }
         }
         // Page tables and lengths for every admitted sequence, at the compiled context.
-        for (name, bytes) in cache.buffers()?.into_iter().filter(|(name, _)| !name.starts_with("layer.")) {
+        for (name, mut bytes) in cache.buffers()?.into_iter().filter(|(name, _)| !name.starts_with("layer.")) {
+            if name == "decode_table" { bytes = u64::from(decode_rows) * u64::from(cache.table_width) * 4; }
             out.extend(buffer(format!("{}.{name}", Owner::Cache { gpu }.id()), location, bytes, Lifetime::TARGET,
                 Category::Kv, "MSA page tables", maximum));
         }
         // Compact decode tables have their own retained full-table upload,
         // separate from prefix restores into individual page-table slots.
         out.extend(buffer(format!("{}.upload", Owner::DecodeTable { gpu }.id()), Location::PINNED,
-            u64::from(cache.requests) * u64::from(cache.table_width) * 4, Lifetime::TARGET,
+            u64::from(decode_rows) * u64::from(cache.table_width) * 4, Lifetime::TARGET,
             Category::Staging, "decode page table ordered H2D staging", maximum));
         // Ordered H2D staging is keyed by destination and copy stream, not a
         // ring: each retained request table and length has its own pinned owner.
@@ -1070,16 +1093,29 @@ mod tests {
     fn spark_decode_owner_covers_boot_concurrency_times_verify_width() {
         let shape=PrefillShape { rows:2752,waves:3 };
         let rows=spark_verify_rows(16,7).unwrap();
-        assert_eq!(rows,128);
+        assert_eq!(rows,64);
         let executions=spark_executions_for_rows(shape,rows).unwrap();
         assert_eq!(executions.decode.len(),1);
-        assert_eq!(executions.decode[0].capacity,128);
-        assert_eq!(executions.decode[0].compiled_capacity,256);
-        assert_eq!(executions.owner(Some(0),128).unwrap(),cuteafd_core::ExecutionOwner::Decode(0));
-        assert!(executions.owner(Some(0),129).is_err());
+        assert_eq!(executions.decode[0].capacity,64);
+        assert_eq!(executions.owner(Some(0),64).unwrap(),cuteafd_core::ExecutionOwner::Decode(0));
+        assert!(executions.owner(Some(0),65).is_err());
         assert_eq!(spark_verify_rows(16,0).unwrap(),16);
         let error=spark_executions_for_rows(shape,4097).unwrap_err();
         assert!(format!("{error:#}").contains("4097 verify rows"));
+    }
+
+    #[test]
+    fn native_queries_are_deployment_sized_without_growing_request_slots() {
+        for (requests, queries) in [(1, 8), (4, 32), (16, 64), (64, 64)] {
+            let capacity = RequestCapacity::with_queries(requests, 2752, queries).unwrap();
+            assert_eq!(capacity.requests as u64, requests);
+            assert_eq!(capacity.cache(4096).unwrap().requests as u64, requests);
+            assert_eq!(capacity.decode.rows as u64, queries);
+            assert_eq!(capacity.decode.requests as u64, queries);
+            assert_eq!(capacity.validate().unwrap(), capacity);
+        }
+        assert!(RequestCapacity::with_queries(1, 2752, 128).is_err());
+        assert!(RequestCapacity::with_queries(16, 2752, 8).is_err());
     }
 
     #[test]

@@ -204,6 +204,12 @@ pub fn t(name: impl Into<String>, dtype: &'static str, shape: &[usize]) -> Tenso
     (name.into(), dtype, shape.to_vec())
 }
 
+/// Native E4M3 expert codes with byte-exact UE8M0 K32 scales.
+pub fn mxfp8(name: &str, n: usize, k: usize) -> Vec<Tensor> {
+    vec![t(format!("{name}.weight"), "F8_E4M3", &[n, k]),
+        t(format!("{name}.weight_scale"), "U8", &[n, k / 32])]
+}
+
 fn width(dtype: &str) -> u64 {
     match dtype {
         "BF16" | "F16" | "I16" => 2,
@@ -1852,8 +1858,17 @@ pub fn write_mistral_large4_snapshot(dir: &Path, expert_layers: Option<&[usize]>
 /// Three complete indexed core views with private core shards and one shared backing.
 pub fn write_mc_snapshot(dir: &Path, config: &Value, tensors: &[Tensor],
     shapes: &std::collections::BTreeMap<String, Vec<usize>>) {
+    write_mc_snapshot_with_mtp(dir, config, tensors, shapes, &Default::default());
+}
+
+/// Repaired #2207 layout: BF16 original MTP core, unchanged shared K4 MTP
+/// in both compact views. Routed experts remain outside the core inventory.
+pub fn write_mc_snapshot_with_mtp(dir: &Path, config: &Value, tensors: &[Tensor],
+    target: &std::collections::BTreeMap<String, Vec<usize>>,
+    mtp: &std::collections::BTreeMap<String, Vec<usize>>) {
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
+    let shapes = target.iter().chain(mtp).map(|(name, shape)| (name.clone(), shape.clone())).collect::<BTreeMap<_, _>>();
     fs::create_dir_all(dir).unwrap();
     let core_stems = shapes.keys().map(|n| n.strip_suffix(".weight").unwrap()).collect::<Vec<_>>();
     let shared = tensors.iter().filter(|(name, ..)| !core_stems.iter().any(|stem|
@@ -1871,10 +1886,11 @@ pub fn write_mc_snapshot(dir: &Path, config: &Value, tensors: &[Tensor],
         let quant_name = format!("quantize_config{suffix}.json");
         let mut active = shared.clone();
         let mut core = Vec::new();
-        for (name, shape) in shapes {
+        for (name, shape) in &shapes {
             let stem = name.strip_suffix(".weight").unwrap();
             let generated = if bits == 16 { vec![t(name, "BF16", shape)] }
-                else { exl3(&format!("{stem}{suffix}"), shape[0].next_multiple_of(128), shape[1], bits) };
+                else { exl3(&format!("{stem}{suffix}"), shape[0].next_multiple_of(128), shape[1],
+                    if mtp.contains_key(name) { 4 } else { bits }) };
             for mut tensor in generated {
                 // Views select the canonical module names but use private shards
                 // for alternate payloads that share tensor names.
@@ -1885,9 +1901,17 @@ pub fn write_mc_snapshot(dir: &Path, config: &Value, tensors: &[Tensor],
         }
         let core_shard = format!("core{suffix}.safetensors");
         let core_set = core.iter().collect::<std::collections::BTreeSet<_>>();
-        write_safetensors(&dir.join(&core_shard), &active.iter().filter(|t| core_set.contains(&t.0)).cloned().collect::<Vec<_>>());
+        let compact_mtp = |name: &str| bits != 16 && mtp.keys().any(|weight|
+            name.starts_with(&format!("{}.", weight.strip_suffix(".weight").unwrap())));
+        write_safetensors(&dir.join(&core_shard), &active.iter().filter(|t|
+            core_set.contains(&t.0) && !compact_mtp(&t.0)).cloned().collect::<Vec<_>>());
+        if bits != 16 && !mtp.is_empty() {
+            write_safetensors(&dir.join("compact-mtp.safetensors"), &active.iter()
+                .filter(|t| compact_mtp(&t.0)).cloned().collect::<Vec<_>>());
+        }
         let weights: BTreeMap<_, _> = active.iter().map(|(name, ..)| (name.clone(),
-            if core_set.contains(name) { core_shard.as_str() } else { shard })).collect();
+            if compact_mtp(name) { "compact-mtp.safetensors" }
+            else if core_set.contains(name) { core_shard.as_str() } else { shard })).collect();
         let projections = active.iter().filter_map(|(name, _, shape)| name.strip_suffix(".trellis")
             .map(|stem| (stem.to_owned(), shape[2]/16, shape[0]*16, shape[1]*16))).collect::<Vec<_>>();
         let mut cfg = config.clone();
@@ -1896,6 +1920,7 @@ pub fn write_mc_snapshot(dir: &Path, config: &Value, tensors: &[Tensor],
             compact.as_object_mut().unwrap().extend(source.clone());
         }
         compact["per_module_metadata"] = json!(format!("{quant_name}:tensor_storage"));
+        if bits == 16 && !mtp.is_empty() { compact.as_object_mut().unwrap().remove("mtp_bits"); }
         cfg["quantization_config"] = compact.clone();
         cfg["transformers_weights"] = json!(index_name);
         let quant = exl3_manifest(&compact, &projections);

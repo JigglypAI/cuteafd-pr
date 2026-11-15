@@ -1582,6 +1582,8 @@ if [[ $family == deepseek_v4 ]]; then
   dsv4_dspark="$(python3 -c 'import json,sys; print(int(int(json.load(open(sys.argv[1])).get("dspark_block_size") or 0) > 0))' "$root/snapshots/$revision/$selected_config")"
 fi
 speculator="$(get SPECULATOR)"
+# MiniMax uses its bundled native drafter on whole, Layers and Heads placements.
+if [[ "$family" == minimax_m3 && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=dspark; fi
 # Qwen resolves auto only after expert admission, not from configured inventory.
 if [[ "$family" == qwen4 && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=auto; fi
 default_drafter=""
@@ -1624,8 +1626,6 @@ if [[ -z "$speculator" ]]; then
   fi
 
 fi
-# MiniMax keeps speculation default-off until native DSpark qualification.
-[[ "$family:$speculator" != minimax_m3:auto ]] || speculator=off
 case "$family:$speculator" in
   minimax_m3:dspark) ;;
   qwen4:mtp|qwen4:auto) ;;
@@ -1861,6 +1861,11 @@ if [[ $family == mimo_v2 ]]; then
     *) echo "DECODE_GRAPHS must be on or off" >&2; exit 2 ;;
   esac
 fi
+if [[ "$family" == muse_spark ]]; then
+  muse_kv_cache="$(get KV_CACHE bf16)"
+  case "$muse_kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
+  family_args+=(--kv-cache "$muse_kv_cache")
+fi
 if [[ "$family" == qwen3_5 ]]; then
   dense_qwen_kv_cache="$(get KV_CACHE fp8)"
   case "$dense_qwen_kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
@@ -1960,7 +1965,7 @@ fi
 if [[ $family == minimax_m3 ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
   family_args+=(--rtx-expert-layers "$local_layers" --split-wire fp32)
-  [[ "$speculator" != dspark ]] || family_args+=(--dspark)
+  if [[ "$speculator" == dspark ]]; then family_args+=(--dspark); else family_args+=(--dspark=false); fi
 fi
 if [[ $family == kimi_k3 ]]; then
   kv_cache="$(get KV_CACHE fp8)"
@@ -2482,6 +2487,7 @@ audio_encoder_hash=""
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
   fi
   if [[ "$family" == muse_spark ]]; then
+    plan_draft_args+=(--kv-cache "$muse_kv_cache")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
     # The serve command's partial-reply overrides and drafter rings, so plan == serve admission.

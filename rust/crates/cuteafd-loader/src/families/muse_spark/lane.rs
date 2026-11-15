@@ -104,6 +104,11 @@ impl LanePlanes {
     pub const SPAN: [&'static str; 5] = ["hidden", "residual", "route_ids", "route_weights", "expert_wire"];
 
     pub fn with_waves(cfg: &MuseSparkConfig, ranks: usize, rows: usize, waves: usize) -> Result<Self> {
+        Self::with_format(cfg, ranks, rows, waves, super::cache::MuseKvCache::Bf16)
+    }
+
+    pub fn with_format(cfg: &MuseSparkConfig, ranks: usize, rows: usize, waves: usize,
+        format: super::cache::MuseKvCache) -> Result<Self> {
         ensure!(matches!(ranks, 1 | 2) && (1..=4096).contains(&rows) && (1..=4).contains(&waves), "Muse lane geometry");
         let (h, e, d) = (cfg.hidden, cfg.expert_hidden, cfg.head_dim);
         let (q, kv) = (cfg.heads * d / ranks, cfg.kv_heads * d / ranks);
@@ -117,7 +122,7 @@ impl LanePlanes {
             // Attention: raw projections, normed/RoPEd q and k, the step's K|V records,
             // attention output, gate, gated output and the o_proj result.
             ("q_raw", bf16(q)), ("k_raw", bf16(kv)), ("q", bf16(q)),
-            ("kv_step", bf16(2 * kv)), ("attention", bf16(q)), ("gate", bf16(q)), ("gated", bf16(q)),
+            ("kv_step", rows * format.record_bytes(cfg.kv_heads / ranks, d)), ("attention", bf16(q)), ("gate", bf16(q)), ("gated", bf16(q)),
             ("attended", bf16(h)),
             // MoE: router logits, selected routes, the expert-width stream and its wire,
             // the combined experts and the post-projection.

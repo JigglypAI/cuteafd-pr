@@ -29,6 +29,19 @@ fn retain_logit_tile(library:&cuteafd_ffi::NativeLibrary, retained:cuteafd_ffi::
     unsafe { library.copy_d2d_async(target,source,bytes,logits.stream) }
 }
 
+fn retain_decode_taps(library: &cuteafd_ffi::NativeLibrary, source: cuteafd_ffi::CuteafdDeviceBuffer,
+    target: cuteafd_ffi::CuteafdDeviceBuffer, rows: usize, pitch: usize,
+    stream: *mut std::ffi::c_void) -> Result<()> {
+    ensure!(rows > 0 && pitch > 0 && source.device_id == target.device_id,
+        "MiniMax decode tap geometry/device differs");
+    let bytes = rows.checked_mul(pitch).context("MiniMax decode tap extent overflow")?;
+    let source = super::cache::view(source, 0, bytes)?;
+    let target = super::cache::view(target, 0, bytes)?;
+    // SAFETY: native decode initialized these live rows; disjoint retained
+    // verify storage and the producer stream survive the round's accept.
+    unsafe { library.copy_d2d_async(target, source, bytes, stream) }
+}
+
 fn packing_rows(mode: crate::shared::prefill_packing::PackingMode, admitted: usize) -> usize {
     match mode {
         crate::shared::prefill_packing::PackingMode::Unrestricted => admitted,
@@ -207,7 +220,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
             submitted.push(Submitted { identity: self.identity(placement)?, placement: (**placement).clone(),
                 tokens: tokens.to_vec() });
         }
-        ensure!(!submitted.is_empty() && submitted.len() <= state.capacity.decode.requests as usize,
+        ensure!(!submitted.is_empty() && submitted.len() <= state.capacity.requests as usize,
             "MiniMax request count exceeds admitted concurrency");
         Ok(submitted)
     }
@@ -235,40 +248,22 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         self.completed(published)
     }
 
-    fn verify_staged(&self,sequences:&mut [(&mut Placement,&[u32])],pool:&RefPagePool) -> Result<Option<DeviceLogits>> {
-        ensure!(self.pending.borrow().is_none(),"MiniMax verify overlaps an unaccepted round");
-        let submitted=self.validate(sequences,pool)?;
-        let retained=self.owners.storage.verify_logits.as_ref().context("MiniMax retained verify logits missing")?;
-        let rows=submitted.iter().map(|request| request.tokens.len()).sum::<usize>();
-        ensure!(rows <= self.geometry().decode_rows,"MiniMax verify rows exceed admission");
-        let mut placements=submitted.iter().map(|request| request.placement.clone()).collect::<Vec<_>>();
-        let mut requests=placements.iter_mut().zip(&submitted).map(|(placement,request)| ServingRequest {
-            identity:request.identity,kind:ExpertV2SourceKind::Decode,start:request.placement.len,
-            tokens:&request.tokens,heads:request.placement.len..request.placement.len + request.tokens.len(),placement
-        }).collect::<Vec<_>>();
-        let mut offsets=Vec::new();let mut offset=0;
-        for request in &submitted { offsets.push(offset);offset+=request.tokens.len(); }
-        let library=self.library();
-        let result=self.execution.borrow_mut().execute(&self.owners.storage,self.cfg,&self.schedule,&mut requests,false,
-            |index,span,logits| {
-                let first=offsets[index] + span.start - submitted[index].placement.len;
-                retain_logit_tile(library,retained.buffer,first,self.cfg.vocab_size,logits)
-            });
-        self.completed(result)?;
-        *self.pending.borrow_mut()=Some(submitted);
-        let stream=self.owners.storage.ranks.last().context("MiniMax head rank missing")?.decode.borrow().stream.raw;
-        Ok(Some(DeviceLogits { ptr:retained.buffer.ptr,rows,vocab:self.cfg.vocab_size,
-            stride:self.cfg.vocab_size,stream,greedy:None }))
-    }
-
     fn decode(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool,
         retain_receipt: bool, captured: bool) -> Result<Option<DeviceLogits>> {
+        ensure!(self.pending.borrow().is_none(), "MiniMax decode overlaps an unaccepted round");
         let submitted = self.validate(sequences, pool)?;
-        let mut placements = submitted.iter().map(|request| request.placement.clone()).collect::<Vec<_>>();
-        let requests = placements.iter_mut().zip(&submitted).map(|(placement, request)| ServingRequest {
-            identity: request.identity, kind: ExpertV2SourceKind::Decode, start: request.placement.len,
-            heads: request.placement.len..request.placement.len + request.tokens.len(),
-            tokens: &request.tokens, placement }).collect::<Vec<_>>();
+        let queries = submitted.iter().enumerate().flat_map(|(sequence, request)|
+            (0..request.tokens.len()).map(move |row| (sequence, row))).collect::<Vec<_>>();
+        ensure!(queries.len() <= self.geometry().decode_rows, "MiniMax verify queries exceed admission");
+        let mut placements = queries.iter().map(|&(sequence, row)| Placement {
+            len: submitted[sequence].placement.len + row, ..submitted[sequence].placement.clone()
+        }).collect::<Vec<_>>();
+        let requests = placements.iter_mut().zip(&queries).map(|(placement, &(sequence, row))| {
+            let request = &submitted[sequence];
+            ServingRequest { identity: request.identity, kind: ExpertV2SourceKind::Decode,
+                start: placement.len, heads: placement.len..placement.len + 1,
+                tokens: &request.tokens[row..row + 1], placement }
+        }).collect::<Vec<_>>();
         let mut graphs = self.owners.graphs.borrow_mut();
         let result = self.execution.borrow_mut().decode(&self.owners.storage, self.cfg, &self.schedule,
             &requests, &mut graphs, captured);
@@ -284,6 +279,20 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
             for graph in graphs.iter_mut() { graph.observed(); }
         }
         drop(graphs);
+        if let Some(draft) = &self.owners.storage.draft_prefix {
+            let staged = (|| {
+                let owner = self.owners.storage.ranks.last().context("MiniMax tap rank missing")?.decode.borrow();
+                let source = owner.target_taps().context("MiniMax admitted decode taps missing")?.output();
+                let target = self.owners.storage.verify_taps.as_ref().context("MiniMax retained verify taps missing")?;
+                retain_decode_taps(self.library(), source, target.buffer, queries.len(),
+                    draft.drafter.cfg.taps.len() * self.cfg.hidden * 2, owner.stream.raw)
+            })();
+            self.completed(staged)?;
+            // Keep native target writes and taps staged just like eager verify:
+            // accept advances target and draft frontiers together after selection.
+            *self.pending.borrow_mut() = Some(submitted);
+            return Ok(Some(logits));
+        }
         // Non-speculative input is committed even if selection later cancels.
         // A retained receipt validates the scheduler's optional accept callback;
         // publication itself never depends on that callback or UngraphedKind.
@@ -312,7 +321,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     fn geometry(&self) -> scheduler::Geometry {
         let state = self.owners.storage.requests.borrow();
         scheduler::Geometry { family: "minimax_m3", vocab_size: self.cfg.vocab_size, max_context: self.context,
-            slots: state.capacity.decode.requests as usize, prefill_rows: state.capacity.prefill.rows as usize,
+            slots: state.capacity.requests as usize, prefill_rows: state.capacity.prefill.rows as usize,
             decode_rows: self.owners.storage.verify_logits.as_ref().map_or(state.capacity.decode.rows as usize,
                 |owner| owner.buffer.bytes / (self.cfg.vocab_size * 4)), }
     }
@@ -430,14 +439,12 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        if speculative || self.owners.storage.draft_prefix.is_some() { self.verify_staged(sequences,pool) }
-        else { self.decode(sequences, pool, true, true) }
+        let _ = speculative;
+        self.decode(sequences, pool, true, true)
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        if speculative || (kind == scheduler::UngraphedKind::Decode && self.owners.storage.draft_prefix.is_some()) {
-            return self.verify_staged(sequences,pool);
-        }
+        let _ = speculative;
         if kind == scheduler::UngraphedKind::Decode { return self.decode(sequences, pool, true, false); }
         let total: usize = sequences.iter().map(|(_, tokens)| tokens.len()).sum();
         ensure!(sequences.len() == 1 && total <= self.geometry().decode_rows,
@@ -584,6 +591,353 @@ mod tests {
     use std::rc::Rc;
 
     #[test]
+    #[ignore = "requires sealed MiniMax model, native library and three/four Spark workers"]
+    fn native_zero_proposal_matches_plain_decode_state_and_continuation() -> Result<()> {
+        use clap::Parser;
+        use sha2::{Digest, Sha256};
+        use std::sync::Arc;
+        use cuteafd_loader::{plan::Checkpoint, placement::planner::PrefillShape};
+        cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::MINIMAX_M3)
+            .map_err(|previous| anyhow::anyhow!("MiniMax native proof needs an isolated process, found {previous:?}"))?;
+        let snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?;
+        let native = std::env::var("CUTEAFD_NATIVE_LIB")?;
+        let manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?;
+        let peers = std::env::var("CUTEAFD_GOLDEN_PEERS")?;
+        let mut argv = vec!["cuteafd", "serve-minimax", "--snapshot", &snapshot,
+            "--native-lib", &native, "--manifest", &manifest, "--peers", &peers,
+            "--max-sequences", "4", "--dspark"];
+        let split = std::env::var("CUTEAFD_MINIMAX_PROOF_SPLIT").unwrap_or_else(|_| "off".into());
+        if split == "on" { argv.extend(["--split-device", "1"]); }
+        let crate::cli::Commands::ServeMinimax(mut args) = crate::cli::Cli::try_parse_from(argv)?.command
+            else { unreachable!() };
+        args.prefix.resolve_entries(4);
+        let view = args.attention.select(&args.snapshot)?;
+        args.attention.validate_view(&view)?;
+        let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
+        let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
+        let prefill = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(args.peers.len(),
+            cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::minimax::MINIMAX_M3),
+            Default::default())?;
+        // SAFETY: the sealed native library outlives all admitted owners/streams.
+        let library = Arc::new(unsafe { NativeLibrary::load(&args.native_lib)? });
+        let programs = library.programs()?.with_manifest(&args.manifest)?;
+        let loaded = super::super::startup::load(&library, &programs, &view, &checkpoint, &cfg,
+            super::super::startup::Options {
+                device: args.device, split_device: args.split_device, peers: &args.peers,
+                native_lib: &args.native_lib, manifest_path: &args.manifest,
+                split_wire: super::super::dense::PartialPrecision::DEFAULT,
+                attention_placement: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?
+                    .unwrap_or(cuteafd_loader::placement::AttentionPlacement::Heads),
+                prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves },
+                sequences: 4, context_tokens: 0, pool_tokens: None,
+                onboard: args.rtx_expert_layers.resolve(cfg.moe.iter().filter(|&&moe| moe).count()),
+                prefix: &args.prefix, expert_usage: args.expert_usage,
+                usage_reader: args.expert_usage_reader.clone(),
+                resident_weights: crate::shared::memory::budget::resident_weight_limit(), draft: true,
+            })?;
+        let context = usize::try_from(loaded.admitted.solved.served_context())?;
+        let backend = MiniMaxBackend::new(&loaded.owners, &cfg, loaded.execution, context,
+            loaded.host_prefix, args.prefill_packing)?;
+        let family = &backend.owners.storage.prefix;
+        let layout = family.layout();
+        let mut pool = RefPagePool::new(layout.pages, layout.page_rows);
+        let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(&args.snapshot)?;
+        let text = "Write a Rust function that merges two sorted slices. Explain bounds, empty inputs, duplicate elements, and why the result stays sorted.\n";
+        let tokens = tokenizer.encode_ids(&text.repeat(32))?;
+        let prompt: usize = 64;
+        let steps: usize = 256;
+        ensure!(tokens.len() >= prompt + steps + 4 && context >= prompt + steps + 2,
+            "MiniMax width-exact prompt exceeds admitted context");
+        let draft = backend.owners.storage.draft_prefix.as_ref().context("missing proof draft")?;
+        let tap_pitch = draft.drafter.cfg.taps.len() * cfg.hidden * 2;
+        let banks = backend.owners.storage.requests.borrow().banks();
+        let read = |buffer: Buffer, bytes: usize| -> Result<Vec<u8>> {
+            backend.drain()?;
+            let buffer = super::super::cache::view(buffer, 0, bytes)?;
+            let mut output = vec![0; bytes];
+            library.cuda_set_device(buffer.device_id)?;
+            library.copy_d2h(&mut output, buffer)?;
+            Ok(output)
+        };
+        let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        let target_state = |placements: &[Placement], position: Option<usize>| -> Result<String> {
+            let mut digest = Sha256::new();
+            for bank in &banks {
+                for layer in bank.layers.clone() {
+                    for placement in placements {
+                        let pages = position.map_or_else(|| placement.units.clone(), |position|
+                            vec![placement.units[position / PAGE_ROWS]]);
+                        for page in pages {
+                            for (plane, _) in super::super::cache::PAGE_PLANES {
+                                let buffer = bank.page(layer, plane, page)?;
+                                digest.update(read(buffer, buffer.bytes)?);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(format!("{:x}", digest.finalize()))
+        };
+        let draft_state = |width: usize| -> Result<String> {
+            let mut digest = Sha256::new();
+            for slot in 0..width {
+                digest.update((draft.frontier(slot)? as u64).to_le_bytes());
+                for buffer in draft.drafter.window_planes(slot)? { digest.update(read(buffer, buffer.bytes)?); }
+            }
+            Ok(format!("{:x}", digest.finalize()))
+        };
+        let values = |bytes: &[u8]| bytes.chunks_exact(4)
+            .map(|word| f32::from_le_bytes(word.try_into().unwrap())).collect::<Vec<_>>();
+        let gap = |a: &[u8], b: &[u8]| -> Result<serde_json::Value> {
+            let (a, b) = (values(a), values(b));
+            ensure!(a.len() == b.len() && a.len() % cfg.vocab_size == 0
+                && a.iter().chain(&b).all(|v| v.is_finite()), "invalid diagnostic logits");
+            let (mut maximum, mut kl, mut agrees, mut count) = (0f64, 0f64, 0usize, 0usize);
+            for (a, b) in a.chunks_exact(cfg.vocab_size).zip(b.chunks_exact(cfg.vocab_size)) {
+                let top = |row: &[f32]| row.iter().enumerate().max_by(|x,y| x.1.total_cmp(y.1)).unwrap().0;
+                agrees += usize::from(top(a) == top(b)); count += 1;
+                let log_probs = |row: &[f32]| {
+                    let peak = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+                    let norm = row.iter().map(|v| (f64::from(*v)-peak).exp()).sum::<f64>().ln() + peak;
+                    row.iter().map(|v| f64::from(*v)-norm).collect::<Vec<_>>()
+                };
+                let (p,q) = (log_probs(a),log_probs(b));
+                kl += p.iter().zip(q).map(|(p,q)| p.exp() * (p-q)).sum::<f64>();
+                for (&x,&y) in a.iter().zip(b) { maximum = maximum.max((f64::from(x)-f64::from(y)).abs()); }
+            }
+            Ok(serde_json::json!({"position":64,"max_abs":maximum,"argmax_agreement":agrees as f64/count as f64,
+                "kl":kl/count as f64}))
+        };
+        if std::env::var("CUTEAFD_MINIMAX_PROOF_BATCH_ONLY").as_deref() == Ok("on") {
+            let pages = (0..4).map(|_| pool.alloc((prompt+8).div_ceil(PAGE_ROWS)))
+                .collect::<std::result::Result<Vec<_>,_>>()?;
+            let mut results = Vec::new();
+            let mut outputs = Vec::new();
+            for route in ["native", "eager"] {
+                let mut batch_rows = Vec::new();
+                let mut solo_rows = Vec::new();
+                for members in [vec![0usize,1,2,3],vec![0],vec![1],vec![2],vec![3]] {
+                    backend.drain()?;
+                    for bank in &banks {
+                        for layer in bank.layers.clone() {
+                            for &slot in &members {
+                                for &page in &pages[slot] {
+                                    for (plane,_) in super::super::cache::PAGE_PLANES {
+                                        let buffer=bank.page(layer,plane,page)?;
+                                        bank.stream.device.run(|| {
+                                            // SAFETY: exclusively owned proof pages and drained consumers.
+                                            unsafe { library.cuda_zero_bytes_async(buffer,buffer.bytes,bank.stream.raw) }
+                                        })?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let mut placements=members.iter().map(|&slot| -> Result<_> {
+                        let mut placement=Placement { units:pages[slot].clone(),slot,len:0 };
+                        family.bind(&mut placement).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                        backend.identities.borrow_mut().insert(slot,(slot+1) as u64);
+                        backend.prefill_device(&mut placement,&tokens[slot..slot+prompt],0,&pool)?;
+                        Ok(placement)
+                    }).collect::<Result<Vec<_>>>()?;
+                    let initial=placements.iter().map(|p| target_state(std::slice::from_ref(p),None))
+                        .collect::<Result<Vec<_>>>()?;
+                    let input=members.iter().map(|&slot| tokens[slot+prompt]).collect::<Vec<_>>();
+                    let mut rows=placements.iter_mut().zip(&input).map(|(p,t)| (p,std::slice::from_ref(t))).collect::<Vec<_>>();
+                    let logits=if route == "native" { backend.verify_device(&mut rows,false,&pool)? }
+                        else { backend.decode(&mut rows,&pool,true,false)? }.context("batch discriminator logits")?;
+                    let bytes=logits.to_host(&library)?.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+                    drop(rows);
+                    let taps=read(backend.owners.storage.verify_taps.as_ref().unwrap().buffer,members.len()*tap_pitch)?;
+                    for (row,&slot) in members.iter().enumerate() {
+                        let logits=bytes[row*cfg.vocab_size*4..(row+1)*cfg.vocab_size*4].to_vec();
+                        let tap=taps[row*tap_pitch..(row+1)*tap_pitch].to_vec();
+                        let state=target_state(std::slice::from_ref(&placements[row]),None)?;
+                        let record=(logits,tap,state,initial[row].clone());
+                        if members.len()==4 { batch_rows.push(record); }
+                        else { ensure!(slot==solo_rows.len(),"singleton row order");solo_rows.push(record); }
+                    }
+                    for placement in &mut placements {
+                        backend.cancel(placement)?;
+                        family.discard(placement).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    }
+                }
+                let mut rows=Vec::new();
+                for (row,(batch,solo)) in batch_rows.iter().zip(&solo_rows).enumerate() {
+                    ensure!(batch.3==solo.3,"batch/singleton initial prefill bytes differ row {row}");
+                    let diagnostic=gap(&solo.0,&batch.0)?;
+                    rows.push(serde_json::json!({"row":row,"logits_identical":batch.0==solo.0,
+                        "taps_identical":batch.1==solo.1,"kv_index_identical":batch.2==solo.2,
+                        "gap":diagnostic,"batch_logits_sha256":hash(&batch.0),"solo_logits_sha256":hash(&solo.0)}));
+                }
+                results.push(serde_json::json!({"route":route,"rows":rows}));
+                outputs.push((batch_rows,solo_rows));
+            }
+            let cross=(0..4).map(|row| -> Result<_> { Ok(serde_json::json!({"row":row,
+                "singleton_native_vs_eager":gap(&outputs[0].1[row].0,&outputs[1].1[row].0)?,
+                "batch_native_vs_eager":gap(&outputs[0].0[row].0,&outputs[1].0[row].0)?})) })
+                .collect::<Result<Vec<_>>>()?;
+            let report=serde_json::json!({"position":64,"reference":"same exact prefix alone at C1",
+                "hf_reference":"unavailable: synthetic proof prompts have no published fidelity rows",
+                "routes":results,"cross_route":cross});
+            println!("MiniMax batch route discriminator: {report}");
+            std::fs::write(Path::new(&std::env::var("CUTEAFD_GOLDEN_OUT")?).join("batch-route-discriminator.json"),
+                serde_json::to_vec_pretty(&report)?)?;
+            for pages in &pages { pool.release(pages); }
+            return Ok(());
+        }
+        let mut reports = Vec::new();
+        for width in [1usize, 4] {
+            let pages = (0..width).map(|_| pool.alloc((prompt+steps+8).div_ceil(PAGE_ROWS)))
+                .collect::<std::result::Result<Vec<_>,_>>()?;
+            let mut reference = Vec::new();
+            let mut first_plain = Vec::new();
+            let mut expected_proposals: Option<Vec<Vec<u32>>> = None;
+            let mut starting = None;
+            let mut diagnostic = serde_json::Value::Null;
+            for arm in ["plain", "staged", "eager-diagnostic"] {
+                // Reset both inactive physical bytes and the draft window. No
+                // arm can consume cache entries written by its predecessor.
+                backend.drain()?;
+                for bank in &banks {
+                    for layer in bank.layers.clone() {
+                        for page in pages.iter().flatten() {
+                            for (plane, _) in super::super::cache::PAGE_PLANES {
+                                let buffer = bank.page(layer, plane, *page)?;
+                                bank.stream.device.run(|| {
+                                    // SAFETY: proof owns every page; all readers drained above.
+                                    unsafe { library.cuda_zero_bytes_async(buffer, buffer.bytes, bank.stream.raw) }
+                                })?;
+                            }
+                        }
+                    }
+                }
+                let mut placements = pages.iter().enumerate().map(|(slot,pages)| -> Result<_> {
+                    let mut placement = Placement { units:pages.clone(),slot,len:0 };
+                    family.bind(&mut placement).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    backend.identities.borrow_mut().insert(slot,(slot+1) as u64);
+                    Ok(placement)
+                }).collect::<Result<Vec<_>>>()?;
+                let mut states = (0..width).map(|_| DraftState::default()).collect::<Vec<_>>();
+                for (slot, placement) in placements.iter_mut().enumerate() {
+                    backend.prefill_device(placement,&tokens[slot..slot+prompt],0,&pool)?;
+                }
+                let start = (target_state(&placements,None)?,draft_state(width)?);
+                if let Some(expected) = &starting { ensure!(&start == expected,"independent arm prefill state differs"); }
+                else { starting = Some(start); }
+                let zero_steps = if arm == "eager-diagnostic" { 1 } else { steps };
+                for step in 0..zero_steps {
+                    let position = prompt+step;
+                    let input = (0..width).map(|slot| tokens[slot+position]).collect::<Vec<_>>();
+                    let logits = if arm == "plain" {
+                        let submitted = placements.iter().zip(&input).enumerate().map(|(slot,(placement,token))|
+                            Submitted { identity:(slot+1) as u64,placement:placement.clone(),tokens:vec![*token] }).collect::<Vec<_>>();
+                        let mut copies = placements.clone();
+                        let requests = copies.iter_mut().zip(&submitted).map(|(placement,sent)| ServingRequest {
+                            identity:sent.identity,kind:ExpertV2SourceKind::Decode,start:position,
+                            heads:position..position+1,tokens:&sent.tokens,placement }).collect::<Vec<_>>();
+                        let logits = backend.execution.borrow_mut().decode(&backend.owners.storage,&cfg,&backend.schedule,
+                            &requests,&mut backend.owners.graphs.borrow_mut(),true)?;
+                        backend.drain()?;
+                        // The plain route publishes its input unconditionally;
+                        // emulate the normal committed tap consumer independently
+                        // of the new staged-copy/accept path.
+                        let owner = backend.owners.storage.ranks.last().unwrap().decode.borrow();
+                        let taps = owner.target_taps().context("plain target taps")?.output();
+                        for slot in 0..width {
+                            // SAFETY: completed plain decode initialized live retained taps.
+                            unsafe { draft.drafter.capture_concatenated(taps,slot,1,0,owner.stream.raw)?; }
+                            draft.drafter.update(&[crate::shared::speculation::dflash::ContextRow {
+                                tap_row:0,slot,position }])?;
+                            draft.advance(slot,position,1)?;
+                        }
+                        drop(owner);
+                        let mut rows = placements.iter_mut().zip(&input).map(|(p,t)| (p,std::slice::from_ref(t))).collect::<Vec<_>>();
+                        publish(family,&mut rows,&submitted)?;
+                        logits
+                    } else {
+                        let mut rows = placements.iter_mut().zip(&input).map(|(p,t)| (p,std::slice::from_ref(t))).collect::<Vec<_>>();
+                        if arm == "staged" { backend.verify_device(&mut rows,false,&pool)? }
+                        else { backend.decode(&mut rows,&pool,true,false)? }.context("proof logits missing")?
+                    };
+                    let bytes = logits.to_host(&library)?.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+                    ensure!(values(&bytes).iter().all(|v| v.is_finite()),"nonfinite proof logits");
+                    let tap_buffer = if arm == "plain" {
+                        backend.owners.storage.ranks.last().unwrap().decode.borrow().target_taps().unwrap().output()
+                    } else { backend.owners.storage.verify_taps.as_ref().unwrap().buffer };
+                    let taps = read(tap_buffer,width*tap_pitch)?;
+                    if arm != "plain" {
+                        let mut verified = placements.iter_mut().zip(&mut states).zip(&input).enumerate()
+                            .map(|(slot,((placement,state),token))| scheduler::Verified {
+                                placement,seq:state,start:position,history:(slot+1) as u64,
+                                rows:std::slice::from_ref(token),first_row:slot,kept:Some((1,*token)),
+                                finished:false,neural:true }).collect::<Vec<_>>();
+                        backend.accept(&mut verified,false)?;
+                    }
+                    ensure!(placements.iter().all(|p| p.len == position+1)
+                        && (0..width).all(|slot| draft.frontier(slot).ok() == Some(position+1)),"proof commit frontier differs");
+                    let record = (hash(&bytes),hash(&taps),target_state(&placements,Some(position))?,draft_state(width)?);
+                    if arm == "plain" {
+                        if step == 0 { first_plain = bytes; }
+                        reference.push(record);
+                    } else if arm == "staged" {
+                        ensure!(record == reference[step],"native staged/plain logits/taps/KV/index/draft differ C{width} step {step}");
+                    } else {
+                        diagnostic = gap(&first_plain,&bytes)?;
+                        diagnostic["target_state_identical"] = serde_json::json!(record.2 == reference[0].2);
+                        diagnostic["draft_state_identical"] = serde_json::json!(record.3 == reference[0].3);
+                    }
+                }
+                if arm != "eager-diagnostic" {
+                    // Verify one real proposal immediately after the final
+                    // zero-proposal step, from each independently built state.
+                    let position = prompt+steps;
+                    let seqs = (0..width).map(|slot| crate::shared::speculation::dflash::DraftSeq {
+                        slot,anchor:tokens[slot+position],position,valid_from:0 }).collect::<Vec<_>>();
+                    let head = backend.owners.storage.ranks.last().unwrap().weights.operand("language_model.lm_head.weight")?.buffer;
+                    let proposals = draft.drafter.draft_device(&seqs,&backend.owners.storage.embedding,
+                        crate::shared::speculation::dflash::TargetHead::Bf16Buffer(&head))?
+                        .into_iter().map(|p| p.tokens.into_iter().take(1).collect::<Vec<_>>()).collect::<Vec<_>>();
+                    ensure!(proposals.iter().all(|p| p.len() == 1),"missing continuation proposal");
+                    if let Some(expected) = &expected_proposals { ensure!(&proposals == expected,"following proposal ids differ"); }
+                    else { expected_proposals = Some(proposals.clone()); }
+                    let input = proposals.iter().enumerate().map(|(slot,p)| vec![tokens[slot+position],p[0]]).collect::<Vec<_>>();
+                    let mut rows = placements.iter_mut().zip(&input).map(|(p,t)| (p,t.as_slice())).collect::<Vec<_>>();
+                    let logits = backend.verify_device(&mut rows,true,&pool)?.context("continuation logits")?;
+                    let bytes = logits.to_host(&library)?.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+                    drop(rows);
+                    let taps = read(backend.owners.storage.verify_taps.as_ref().unwrap().buffer,width*2*tap_pitch)?;
+                    let mut verified = placements.iter_mut().zip(&mut states).zip(&input).enumerate()
+                        .map(|(slot,((placement,state),tokens))| scheduler::Verified {
+                            placement,seq:state,start:position,history:(slot+1) as u64,rows:tokens,
+                            first_row:slot*2,kept:Some((2,tokens[1])),finished:false,neural:true }).collect::<Vec<_>>();
+                    backend.accept(&mut verified,true)?;
+                    drop(verified);
+                    let record = (hash(&bytes),hash(&taps),target_state(&placements,None)?,draft_state(width)?);
+                    if arm == "plain" { reference.push(record); }
+                    else { ensure!(record == reference[steps],"following proposal verify logits/taps/target/draft state differ C{width}"); }
+                }
+                for placement in &mut placements {
+                    backend.cancel(placement)?;
+                    family.discard(placement).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                }
+            }
+            reports.push(serde_json::json!({"width":width,"zero_proposal_steps":steps,
+                "plain_decode_logits_taps_and_state_byte_identical":true,"following_proposal_verify_byte_identical":true,
+                "eager_verify_position64":diagnostic,"records":reference}));
+            for pages in &pages { pool.release(pages); }
+        }
+        let report = serde_json::json!({"reference":"plain native decode, identical independent prefill",
+            "target_state":"physical KV/index page bytes","draft_state":"full physical window plus frontier",
+            "widths":reports});
+        println!("MiniMax native zero-proposal exactness: {report}");
+        if let Ok(output) = std::env::var("CUTEAFD_GOLDEN_OUT") {
+            std::fs::write(Path::new(&output).join("native-zero-proposal.json"),serde_json::to_vec_pretty(&report)?)?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn policy_probe_observes_each_round_and_updates_only_live_concurrency_bucket() {
         use crate::shared::draft::{resource,clock::RoundTimes,evidence::DraftSource};
         let geometry=cuteafd_core::PolicyGeometry { layers:vec![cuteafd_core::LayerResource {
@@ -616,6 +970,52 @@ mod tests {
             for (n,before) in other { assert_eq!(policy.cost_snapshot(false,n),before); }
         }
         assert_eq!(observed,9);
+    }
+
+    #[test]
+    fn native_decode_taps_retain_only_live_rows_across_producer_reuse() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 0 };
+        let pitch = 5 * 6144 * 2;
+        let source = Allocation::new(device, 16 * pitch, Tag::workspace("test/decode-taps"))?;
+        let target = Allocation::new(device, 32 * pitch, Tag::workspace("test/verify-taps"))?;
+        for rows in [1, 4, 16] {
+            let bytes = (0..source.buffer.bytes).map(|i| (i / pitch * 37 + i % pitch) as u8).collect::<Vec<_>>();
+            library.copy_h2d(source.buffer, &bytes)?;
+            library.copy_h2d(target.buffer, &vec![197; target.buffer.bytes])?;
+            retain_decode_taps(&library, source.buffer, target.buffer, rows, pitch, std::ptr::null_mut())?;
+            library.copy_h2d(source.buffer, &vec![83; source.buffer.bytes])?;
+            let mut actual = vec![0; target.buffer.bytes];
+            library.copy_d2h(&mut actual, target.buffer)?;
+            assert_eq!(&actual[..rows * pitch], &bytes[..rows * pitch]);
+            assert!(actual[rows * pitch..].iter().all(|&byte| byte == 197));
+        }
+        for (rows, stride) in [(0, pitch), (17, pitch), (1, 0), (usize::MAX, 2)] {
+            assert!(retain_decode_taps(&library, source.buffer, target.buffer, rows, stride, std::ptr::null_mut()).is_err());
+        }
+        let wrong_device = Buffer { device_id: 1, ..target.buffer };
+        assert!(retain_decode_taps(&library, source.buffer, wrong_device, 1, pitch, std::ptr::null_mut()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn zero_proposal_rounds_use_native_decode_and_stage_before_publication() {
+        let source = include_str!("backend.rs");
+        let verify = source.split_once("    fn verify_device(").unwrap().1
+            .split_once("    fn verify_device_ungraphed(").unwrap().0;
+        assert!(!verify.contains("verify_staged"));
+        assert!(verify.contains("self.decode(sequences, pool, true, true)"));
+        assert!(!verify.contains("draft_prefix.is_some()"));
+        let decode = source.split_once("    fn decode(").unwrap().1
+            .split_once("impl Drop").unwrap().0;
+        let staged = decode.split_once("if let Some(draft)").unwrap().1
+            .split_once("// Non-speculative input").unwrap().0;
+        assert!(staged.contains("retain_decode_taps("));
+        assert!(staged.contains("Some(submitted)"));
+        assert!(staged.contains("return Ok(Some(logits))"));
+        assert!(!staged.contains("publish("));
     }
 
     #[test]

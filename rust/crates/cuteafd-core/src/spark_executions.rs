@@ -64,45 +64,153 @@ pub struct OwnerExtent {
     pub buffered_units: u8,
 }
 
-/// Segmented code can address four full wire units; allocations use only the
-/// admitted row sum, independently of this compile-time metadata bound.
-pub const SEGMENT_MAX_ROWS: u32 = 4 * 4096;
+/// Units one merged Spark wave launches together. Staging may retain every
+/// buffered unit, but one row-addressed launch holds at most this many.
+pub const MAX_MERGED_UNITS: u32 = 2;
+
+/// Code extent of a row-addressed (merged) program: two full 4096-row units.
+/// Allocations use only the admitted merged rows, not this compile-time bound.
+pub const SEGMENT_MAX_ROWS: u32 = MAX_MERGED_UNITS * 4096;
 
 impl OwnerExtent {
+    /// Rows of the widest merged wave (at most [`MAX_MERGED_UNITS`] units):
+    /// the extent of segmented scratch and of the row-address tables.
     pub fn segment_rows(self) -> Option<u32> {
         match self.owner {
             ExecutionOwner::Prefill if self.buffered_units > 1 =>
-                self.staging_rows.checked_mul(u32::from(self.buffered_units))
+                self.staging_rows.checked_mul(u32::from(self.buffered_units).min(MAX_MERGED_UNITS))
                     .filter(|&rows| rows <= SEGMENT_MAX_ROWS),
             _ => None,
         }
     }
+
+    /// Rows of every retained staged unit: the extent of the per-slot device
+    /// input slices (a unit can stage while an earlier pair is in flight).
+    pub fn staged_rows(self) -> Option<u32> {
+        self.segment_rows()?;
+        self.staging_rows.checked_mul(u32::from(self.buffered_units))
+    }
 }
 
-/// Device inputs for a segmented owner. BF16 fallback readers retain a separate
-/// plane: an asynchronous wire copy must never overwrite their pending reads.
-pub fn segment_input_bytes(capacity: u32, rows: u32, hidden: u32, bf16_sibling: bool) -> Option<u64> {
-    let wire = u64::from(rows).checked_mul(u64::from(hidden) + u64::from(hidden) / 32)?;
-    if bf16_sibling { wire.checked_add(u64::from(capacity) * u64::from(hidden) * 2) }
-    else { Some(wire.max(u64::from(capacity) * (u64::from(hidden) + u64::from(hidden) / 32))) }
+/// Device inputs for a segmented owner: per-slot staged rows of `row_bytes`
+/// (the ingress row: FP8 K32, BF16, or a packed wire), sharing the ordinary
+/// plane of `capacity` rows. A separate fallback plane (`sibling_row_bytes`,
+/// a BF16-input sibling package) stays disjoint: an asynchronous staged copy
+/// must never overwrite its pending reads.
+pub fn segment_input_bytes(capacity: u32, staged_rows: u32, row_bytes: u32, sibling_row_bytes: Option<u32>) -> Option<u64> {
+    let staged = u64::from(staged_rows).checked_mul(u64::from(row_bytes))?;
+    match sibling_row_bytes {
+        Some(sibling) => staged.checked_add(u64::from(capacity).checked_mul(u64::from(sibling))?),
+        None => Some(staged.max(u64::from(capacity).checked_mul(u64::from(row_bytes))?)),
+    }
+}
+
+/// The streamed arithmetic of a row-addressed program, which fixes its
+/// intermediate scratch regions (installed package metadata).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentArithmetic {
+    /// FP8/MXFP4/MXFP8 wire stream: one chunk-padded activation row of
+    /// `act_row_bytes` (BF16 or MXFP8 down input) per routed pair.
+    Stream { act_row_bytes: u32 },
+    /// Calibrated NVFP4 W4A4 (fused gate/up): packed E2M1 input and act rows
+    /// with their E4M3 block scales, `slice` the stored intermediate width.
+    Nvfp4A4 { slice: u32 },
+}
+
+/// One EXL3 warp-specialized row-addressed (merged-wave) program's arena
+/// geometry, as its package manifest records it (`segment_geometry`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Exl3SegmentGeometry {
+    pub maximum: u32,
+    pub hidden: u32,
+    pub intermediate: u32,
+    pub topk: u32,
+    pub experts: u32,
+    pub block: u32,
+    pub max_m_blocks: u32,
+    /// The export's workspace SM capacity (never the running device's).
+    pub workspace_sms: u32,
+}
+
+/// Region names of an EXL3 WS segment arena, in arena order.
+pub const EXL3_SEGMENT_REGIONS: [&str; 12] = ["block_expert_ids", "packed_route_indices", "packed_route_count",
+    "expert_offsets", "expert_counts", "rotation_gate", "fc1", "activated", "output", "fc1_scratch",
+    "fc2_scratch", "workspace"];
+
+impl Exl3SegmentGeometry {
+    /// The shipped Spark segments program for one rank's stored width: the
+    /// exporter's fixed WS policy (64-row route blocks, the SM121 AOT
+    /// workspace of 48 SMs, the compiled 8192-row maximum). The planner
+    /// derives it; the worker requires the installed package to equal it.
+    pub fn for_spark(hidden: u32, width: u32, topk: u32, experts: u32) -> Self {
+        const BLOCK: u32 = 64;
+        let routes = u64::from(SEGMENT_MAX_ROWS) * u64::from(topk);
+        let bound = routes + u64::from(experts) * u64::from(BLOCK - 1);
+        let slots = if routes < u64::from(experts) { (routes * u64::from(BLOCK)).min(bound) } else { bound };
+        Self { maximum: SEGMENT_MAX_ROWS, hidden, intermediate: width, topk, experts, block: BLOCK,
+            max_m_blocks: u32::try_from(slots.div_ceil(u64::from(BLOCK))).unwrap_or(u32::MAX), workspace_sms: 48 }
+    }
+
+    /// Byte sizes of every region at `rows` live rows, in arena order (fork
+    /// `exl3_ws_segment_scratch_regions`). Each region starts on 256 bytes.
+    /// The route tables (block-expert ids, packed route indices) keep the
+    /// compiled maximum: the route-pack program compiled at the maximum
+    /// validates and initializes its whole bucket. `None` on an invalid extent.
+    pub fn regions(self, rows: u32) -> Option<[u64; 12]> {
+        if rows == 0 || rows > self.maximum || self.maximum > SEGMENT_MAX_ROWS
+            || [self.hidden, self.intermediate, self.topk, self.experts, self.workspace_sms].contains(&0)
+            || !matches!(self.block, 16 | 32 | 64) { return None; }
+        let slots = |routes: u64| {
+            let bound = routes + u64::from(self.experts) * (u64::from(self.block) - 1);
+            if routes < u64::from(self.experts) { (routes * u64::from(self.block)).min(bound) } else { bound }
+        };
+        let routes = u64::from(rows) * u64::from(self.topk);
+        let maximum_slots = slots(u64::from(self.maximum) * u64::from(self.topk));
+        if u64::from(self.max_m_blocks) < maximum_slots.div_ceil(u64::from(self.block)) { return None; }
+        let (h, i, e) = (u64::from(self.hidden), u64::from(self.intermediate), u64::from(self.experts));
+        Some([4 * u64::from(self.max_m_blocks), 4 * maximum_slots, 4, 4 * (e + 1), 4 * e,
+            2 * routes * h, 4 * routes * i, 2 * routes * i, 8 * u64::from(rows), 4, 4,
+            4 * (4 * u64::from(self.workspace_sms) + 2)])
+    }
+
+    /// Each region's offset and the arena's total bytes at `rows`.
+    pub fn layout(self, rows: u32) -> Option<([u64; 12], u64)> {
+        let regions = self.regions(rows)?;
+        let mut offsets = [0u64; 12];
+        let mut at = 0u64;
+        for (offset, bytes) in offsets.iter_mut().zip(regions) {
+            *offset = at;
+            at = at.checked_add(bytes.div_ceil(256) * 256)?;
+        }
+        Some((offsets, at))
+    }
 }
 
 /// Exact streamed intermediate arena with the compiled tile-table offset.
-/// `act_row_bytes` is installed recipe metadata (BF16 or MXFP8 down input).
 /// This does not include row descriptors, wire frames or singleton scratch.
-pub fn segment_scratch_bytes(hidden: u32, experts: u32, topk: u32, act_row_bytes: u32,
+pub fn segment_scratch_bytes(hidden: u32, experts: u32, topk: u32, arithmetic: SegmentArithmetic,
     rows: u32, maximum: u32) -> Option<u64> {
-    if hidden == 0 || experts == 0 || topk == 0 || act_row_bytes == 0
+    let width = match arithmetic { SegmentArithmetic::Stream { act_row_bytes } => act_row_bytes,
+        SegmentArithmetic::Nvfp4A4 { slice } => slice };
+    if hidden == 0 || experts == 0 || topk == 0 || width == 0
         || rows == 0 || rows > maximum || maximum > SEGMENT_MAX_ROWS { return None; }
     let align = |n: u64| n.checked_add(1023).map(|n| n / 1024 * 1024);
     let tiles = |p: u64| p.div_ceil(128) + u64::from(experts).min(p);
     let pairs = u64::from(rows) * u64::from(topk);
     let bound = u64::from(maximum) * u64::from(topk);
+    let padded = tiles(pairs).checked_mul(128)?;
     let meta = align((4 + 3 * u64::from(experts) + tiles(bound)).checked_mul(4)?)?;
     let routes = align(pairs.checked_mul(4)?)?.checked_mul(2)?;
-    let act = align(tiles(pairs).checked_mul(128)?.checked_mul(u64::from(act_row_bytes))?)?;
+    let middle = match arithmetic {
+        SegmentArithmetic::Stream { act_row_bytes } => align(padded.checked_mul(u64::from(act_row_bytes))?)?,
+        SegmentArithmetic::Nvfp4A4 { slice } => {
+            let (h, i) = (u64::from(hidden), u64::from(slice));
+            align(padded.checked_mul(h / 2)?)?.checked_add(align(padded.checked_mul(h / 16)?)?)?
+                .checked_add(align(padded.checked_mul(i / 2)?)?)?.checked_add(align(padded.checked_mul(i / 16)?)?)?
+        }
+    };
     let output = align(pairs.checked_mul(u64::from(hidden))?.checked_mul(2)?)?;
-    meta.checked_add(routes)?.checked_add(act)?.checked_add(output)
+    meta.checked_add(routes)?.checked_add(middle)?.checked_add(output)
 }
 
 /// Bytes one owner holds at its extents, from the planner's census or the
@@ -240,12 +348,58 @@ mod tests {
         let plan = SparkExecutions::admit(&[64], 4096, 2752, 3, &LADDER).unwrap();
         let owners = plan.owners().collect::<Vec<_>>();
         assert_eq!(owners[0].segment_rows(), None);
-        assert_eq!(owners[1].segment_rows(), Some(8256));
-        let size = |rows| segment_scratch_bytes(4096, 256, 8, 768, rows, SEGMENT_MAX_ROWS).unwrap();
-        assert!(size(8256) < size(SEGMENT_MAX_ROWS));
-        assert_eq!(size(8256), 617_493_504);
-        assert!(segment_scratch_bytes(4096, 256, 8, 768, 16385, SEGMENT_MAX_ROWS).is_none());
-        assert!(segment_scratch_bytes(4096, 256, 8, 768, 0, SEGMENT_MAX_ROWS).is_none());
+        // One merged launch holds two units; all three stage.
+        assert_eq!(owners[1].segment_rows(), Some(5504));
+        assert_eq!(owners[1].staged_rows(), Some(8256));
+        assert_eq!(owners[0].staged_rows(), None);
+        let stream = SegmentArithmetic::Stream { act_row_bytes: 768 };
+        let size = |rows| segment_scratch_bytes(4096, 256, 8, stream, rows, SEGMENT_MAX_ROWS).unwrap();
+        assert!(size(5504) < size(SEGMENT_MAX_ROWS));
+        assert_eq!(size(5504), 420_051_968);
+        assert!(segment_scratch_bytes(4096, 256, 8, stream, SEGMENT_MAX_ROWS + 1, SEGMENT_MAX_ROWS).is_none());
+        assert!(segment_scratch_bytes(4096, 256, 8, stream, 0, SEGMENT_MAX_ROWS).is_none());
+        assert!(segment_scratch_bytes(4096, 256, 8, stream, 4096, 16384).is_none(), "code bound above 2 units");
+    }
+
+    #[test]
+    fn exl3_ws_segment_arena_matches_the_fork_formula_at_live_rows() {
+        // GLM 5.3 TP4 rank width 512, K4/K5, block 64, SM121 workspace 48: the
+        // fork's `exl3_ws_segment_scratch_bytes` (sparkinfer #342) at each size,
+        // and the exported compiled-maximum arena (8192 rows).
+        let glm = Exl3SegmentGeometry { maximum: 8192, hidden: 6144, intermediate: 512, topk: 8,
+            experts: 256, block: 64, max_m_blocks: 1276, workspace_sms: 48 };
+        for (rows, bytes) in [(2048, 252_010_496), (2752, 338_523_648), (4096, 503_685_120),
+            (5504, 676_711_424), (8192, 1_007_034_368)] {
+            assert_eq!(glm.layout(rows).unwrap().1, bytes, "rows {rows}");
+        }
+        let (offsets, _) = glm.layout(8192).unwrap();
+        assert_eq!(offsets[5], 334_336, "rotation_gate follows the compiled block table");
+        assert_eq!(offsets[8], 1_006_967_296, "output-address table offset");
+        assert!(glm.layout(8193).is_none() && glm.layout(0).is_none());
+        assert!(Exl3SegmentGeometry { max_m_blocks: 1, ..glm }.layout(1).is_none(), "undersized block table");
+        // The planner's derivation equals the exported GLM TP4 and GLM Flash TP2 programs.
+        assert_eq!(Exl3SegmentGeometry::for_spark(6144, 512, 8, 256), glm);
+        let flash = Exl3SegmentGeometry::for_spark(4096, 1024, 8, 288);
+        assert_eq!(flash.max_m_blocks, 1308);
+        assert_eq!(flash.layout(8192).unwrap().1, 939_934_208, "exported GLM Flash TP2 arena");
+    }
+
+    #[test]
+    fn nvfp4_a4_segment_scratch_matches_the_exporter_region_list() {
+        // MiniMax TP3 (H 6144, 128 experts, top-4, slice 1024) at the 2 x 2752
+        // merged wave: the fork's `_regions(stream, a4, fused)` with the
+        // compiled 8192-row tile table (test_cuteafd_expert_dispatch_policy).
+        let (h, e, k, i, rows) = (6144u64, 128u64, 4u64, 1024u64, 5504u64);
+        let align = |n: u64| n.div_ceil(1024) * 1024;
+        let pairs = rows * k;
+        let padded = (pairs.div_ceil(128) + e.min(pairs)) * 128;
+        let expected = align(4 * (4 + 3 * e + 8192 * k / 128 + e)) + 2 * align(pairs * 4)
+            + align(padded * h / 2) + align(padded * h / 16) + align(padded * i / 2) + align(padded * i / 16)
+            + align(pairs * h * 2);
+        let a4 = SegmentArithmetic::Nvfp4A4 { slice: 1024 };
+        assert_eq!(segment_scratch_bytes(6144, 128, 4, a4, 5504, SEGMENT_MAX_ROWS), Some(expected));
+        assert!(segment_scratch_bytes(6144, 128, 4, a4, 5504, SEGMENT_MAX_ROWS).unwrap()
+            < segment_scratch_bytes(6144, 128, 4, a4, 8192, SEGMENT_MAX_ROWS).unwrap());
     }
 
     #[test]
@@ -328,15 +482,18 @@ mod tests {
 mod segment_input_tests {
     use super::*;
     #[test]
-    fn input_planes_charge_admitted_wire_rows_and_keep_bf16_readers_disjoint() {
+    fn input_planes_charge_staged_ingress_rows_and_keep_bf16_readers_disjoint() {
         for (capacity, unit, count) in [(4096, 2752, 3), (4096, 769, 3), (1024, 1024, 2)] {
             let rows = unit * count;
-            let wire = u64::from(rows) * 4224;
-            assert_eq!(segment_input_bytes(capacity, rows, 4096, false),
-                Some(wire.max(u64::from(capacity) * 4224)));
-            let sibling = u64::from(capacity) * 8192;
-            assert_eq!(segment_input_bytes(capacity, rows, 4096, true), Some(sibling + wire));
-            assert!(sibling + wire > sibling.max(wire), "aliasing the BF16 plane would undercharge");
+            // FP8 K32 wire rows, BF16 rows (NVFP4 A4) and a packed NVFP4 wire row.
+            for row_bytes in [4224u32, 8192, 4096 * 9 / 16 + 16] {
+                let staged = u64::from(rows) * u64::from(row_bytes);
+                assert_eq!(segment_input_bytes(capacity, rows, row_bytes, None),
+                    Some(staged.max(u64::from(capacity) * u64::from(row_bytes))));
+                let sibling = u64::from(capacity) * 8192;
+                assert_eq!(segment_input_bytes(capacity, rows, row_bytes, Some(8192)), Some(sibling + staged));
+                assert!(sibling + staged > sibling.max(staged), "aliasing the BF16 plane would undercharge");
+            }
         }
     }
 }

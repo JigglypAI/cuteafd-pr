@@ -394,28 +394,34 @@ def test_optional_levers_are_default_off_and_documented():
             assert key in MATRIX, f"lever {key} is absent from the family support table"
             assert key in DEFAULTS, f"lever {key} has no documented default"
             default = DEFAULTS[key]
-            if key == "SPECULATOR":
-                # MiniMax is documented separately from the legacy family matrix;
-                # its default is off even though other families default to drafting.
-                assert lever["families"] == ["MiniMax M3.1 Flash"]
-                assert "`SPECULATOR=dspark` (unset/auto = off)" in lever["enable"]
-                assert key in family_keys("minimax_m3")
-                launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
-                selection = launcher.split('speculator="$(get SPECULATOR)"', 1)[1].split(
-                    'case "$family:$speculator" in', 1)[0]
-                for value in ("", "auto", "off", "dspark"):
-                    script = 'speculator="$1"; family=minimax_m3; ' + selection
-                    result = subprocess.run(["bash", "-c", script + '\nprintf "%s" "$speculator"', "_", value],
-                        capture_output=True, text=True)
-                    assert result.returncode == 0, result.stderr
-                    assert result.stdout == (value if value in {"off", "dspark"} else "off")
-                continue
-            assert default.startswith(("off", "unset")), \
-                f"lever {key} default is {default!r}, not off/unset"
+            if key == "KV_CACHE":
+                assert lever["families"] == ["Muse"]
+                assert default == "family default"
+                assert 'muse_kv_cache="$(get KV_CACHE bf16)"' in (ROOT / "scripts/launch/run-family.sh").read_text()
+            else:
+                assert default.startswith(("off", "unset")), \
+                    f"lever {key} default is {default!r}, not off/unset"
             for family in lever["families"]:
                 assert family in COLUMNS, f"lever {key} names unknown family column {family}"
                 assert MATRIX[key][family], f"lever {key} is not accepted by {family}"
     assert seen
+
+
+def test_minimax_bundled_dspark_is_a_family_default_not_an_optional_lever():
+    assert all("SPECULATOR" not in lever["keys"] for lever in LEVERS)
+    assert "SPECULATOR" in family_keys("minimax_m3")
+    text = DOC.read_text()
+    assert "`SPECULATOR=dspark` is the default" in text
+    assert "`SPECULATOR=off`" in text and "`--dspark=false`" in text
+    launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
+    selection = launcher.split('speculator="$(get SPECULATOR)"', 1)[1].split(
+        'case "$family:$speculator" in', 1)[0]
+    for value in ("", "auto", "off", "dspark"):
+        script = 'speculator="$1"; family=minimax_m3; ' + selection
+        result = subprocess.run(["bash", "-c", script + '\nprintf "%s" "$speculator"', "_", value],
+            capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == ("off" if value == "off" else "dspark")
 
 
 def test_optional_levers_section_is_near_the_top_and_linked():
@@ -440,3 +446,33 @@ def test_qwen_pool_first_onboarding_documents_whole_and_hybrid_tp2():
     assert "`RTX_EXPERT_LAYERS=auto` is pool-first on one or two RTX devices" in text
     assert "Spark-backed layouts: whole routed layers on one RTX, TP2 halves on two" in text
     assert "`--rtx-expert-layers` does not require `--split-device`" in text
+
+
+def test_muse_target_kv_precision_is_opt_in_and_draft_is_independent():
+    for _, header, rows in tables(DOC.read_text().splitlines()):
+        if header == ["Value", *COLUMNS] and any(label(row[0]) == "bf16" for row in rows):
+            precision = {label(row[0]): dict(zip(COLUMNS, row[1:])) for row in rows}
+            assert precision["bf16"]["Muse"] == "✓ (default)"
+            assert precision["fp8"]["Muse"] == "✓ (opt-in)"
+            break
+    else:
+        raise AssertionError("missing KV precision table")
+    assert "KV_CACHE" in family_keys("muse_spark")
+    assert "DRAFT_KV_CACHE" in family_keys("muse_spark")
+    launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
+    assert 'family_args+=(--kv-cache "$muse_kv_cache")' in launcher
+    assert 'plan_draft_args+=(--kv-cache "$muse_kv_cache")' in launcher
+    assert 'muse_draft_kv="$(get DRAFT_KV_CACHE fp8)"' in launcher
+
+
+def test_mc_mtp_docs_distinguish_original_core_from_unchanged_experts():
+    text = DOC.read_text()
+    assert "projections stay K4 in every view" not in text
+    assert "restore native BF16 MTP core matrices in `original`" in text
+    assert "MTP routed experts are unchanged" in text
+    assert "neither loaded nor charged" in text
+    assert "not converted by `fp8-compact`" in text
+    for family in ["glm5", "glm5_flash", "step5"]:
+        doc = (ROOT / "docs" / "models" / f"{family}.md").read_text()
+        core = doc.split("## Core views", 1)[1].split("\n## ", 1)[0]
+        assert "MTP core" in core and "BF16" in core and "K4 MTP" in core

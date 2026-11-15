@@ -70,6 +70,8 @@ pub enum ExpertFormat {
     Fp8Block128,
     /// Packed E2M1 with UE8M0 scales per 32 values along K (`weight_scale`).
     Mxfp4,
+    /// E4M3 codes and UE8M0 scales per output row / 32 input elements.
+    Mxfp8,
     /// ModelOpt NVFP4: packed E2M1, E4M3 scales per 16 values along K
     /// (`weight_scale`) and an FP32 per-tensor `weight_scale_2`.
     Nvfp4,
@@ -113,6 +115,7 @@ impl ExpertFormat {
     fn package_suffix(self) -> &'static str {
         match self {
             Self::Fp8Block128 | Self::Mxfp4 => "",
+            Self::Mxfp8 => "-mxfp8",
             Self::Nvfp4 => "-nvfp4a4",
             Self::Bf16 => "-bf16-weights",
         }
@@ -127,7 +130,7 @@ impl ExpertFormat {
     pub fn group(self) -> usize {
         match self {
             Self::Fp8Block128 => 128,
-            Self::Mxfp4 => 32,
+            Self::Mxfp4 | Self::Mxfp8 => 32,
             Self::Nvfp4 => 16,
             Self::Bf16 => 128,
         }
@@ -167,8 +170,12 @@ pub struct Fp8ExpertTensors {
     mtp_layers: bool,
     /// Compressed-tensors names and divisor globals, attested by config and headers.
     compressed_nvfp4: bool,
+    dynamic_nvfp4: bool,
     format: ExpertFormat,
     tensors: Arc<HashMap<String, Located>>,
+    /// Physical row pitch of fused/interleaved checkpoint views; ordinary
+    /// projection members are contiguous and absent from this map.
+    source_pitches: Arc<HashMap<String, usize>>,
     activations: Vec<cuteafd_core::FfnActivation>,
     slice_layer: usize,
     coordinator: bool,
@@ -270,6 +277,14 @@ fn stacked_projection<'a>(name: &'a str, prefix: &str) -> Option<(usize, Fp8Proj
         .then_some((layer.parse().ok()?, projection, suffix))
 }
 
+fn fused_native_projection<'a>(name: &'a str, prefix: &str) -> Option<(usize, &'a str, &'a str)> {
+    let (layer, rest) = name.strip_prefix(prefix)?.strip_prefix("layers.")?.split_once('.')?;
+    let (stem, suffix) = rest.strip_prefix("mlp.experts.")?.split_once('_')?;
+    (matches!(stem, "w13" | "w2") && matches!(suffix,
+        "weight" | "weight_scale" | "weight_amax" | "weight_outer_scale_denominator"))
+        .then_some((layer.parse().ok()?, stem, suffix))
+}
+
 impl Fp8ExpertTensors {
     pub(crate) fn shard_file(&self, shard: &str) -> std::io::Result<crate::expert_reader::ShardFile> {
         self.reader.open(&self.snapshot.join(shard))
@@ -280,10 +295,16 @@ impl Fp8ExpertTensors {
     /// Header-derived source range and dtype; performs no payload reads.
     pub fn push_source(&self, name: &str) -> Result<(crate::push_load::builder::Source, DType)> {
         let tensor = self.located(name)?;
+        let bytes = if let Some(&pitch) = self.source_pitches.get(name) {
+            let rows = tensor.shape[0];
+            let width = tensor.shape[1];
+            rows.saturating_sub(1).checked_mul(pitch).and_then(|v| v.checked_add(width))
+                .context("fused projection physical extent overflow")? as u64
+        } else { tensor.bytes };
         Ok((crate::push_load::builder::Source {
             path: self.snapshot.join(&tensor.shard),
             offset: tensor.offset,
-            bytes: tensor.bytes,
+            bytes,
         }, tensor.dtype.clone()))
     }
 
@@ -316,20 +337,26 @@ impl Fp8ExpertTensors {
     }
 
     fn scale_name(&self, weight: &str) -> String {
-        if self.compressed_nvfp4 {
+        if self.format == ExpertFormat::Mxfp8 || self.source_pitches.contains_key(weight) {
+            format!("{weight}_scale")
+        } else if self.compressed_nvfp4 {
             format!("{}.weight_scale", weight.strip_suffix(".weight_packed").expect("packed weight name"))
         } else {
-            format!("{weight}{}", if self.tensors.get(weight).map_or(self.format.packed_fp4(), |t| matches!(t.dtype, DType::U8 | DType::I8)) { "_scale" } else { "_scale_inv" })
+            format!("{weight}{}", if self.tensors.contains_key(&format!("{weight}_scale"))
+                || self.tensors.get(weight).map_or(self.format.packed_fp4(), |t| matches!(t.dtype, DType::U8 | DType::I8))
+                { "_scale" } else { "_scale_inv" })
         }
     }
 
     fn alpha_name(&self, weight: &str) -> String {
+        if self.dynamic_nvfp4 { return format!("{weight}_amax"); }
         if self.compressed_nvfp4 {
             format!("{}.weight_global_scale", weight.strip_suffix(".weight_packed").expect("packed weight name"))
         } else { format!("{weight}_scale_2") }
     }
 
     fn activation_scale_name(&self, weight: &str) -> String {
+        if self.dynamic_nvfp4 { return format!("{weight}_outer_scale_denominator"); }
         if self.compressed_nvfp4 {
             format!("{}.input_global_scale", weight.strip_suffix(".weight_packed").expect("packed weight name"))
         } else { input_scale_name(weight) }
@@ -374,7 +401,9 @@ impl Fp8ExpertTensors {
                 && q.get("group_size").and_then(serde_json::Value::as_u64) == Some(16),
                 "compressed expert format requires NVFP4 with group_size=16");
         }
-        let prefix = if weight_map.keys().any(|name| name.starts_with("language_model.model.layers.")) {
+        let prefix = if weight_map.keys().any(|name| name.starts_with("model.llm.layers.")) {
+            "model.llm."
+        } else if weight_map.keys().any(|name| name.starts_with("language_model.model.layers.")) {
             "language_model.model."
         } else if weight_map.keys().any(|name| name.starts_with("model.language_model.layers.")) {
             "model.language_model."
@@ -394,6 +423,7 @@ impl Fp8ExpertTensors {
             weight_map.iter().filter(|(name, _)| routed(name)).map(|(_, shard)| shard).collect();
         let mut tensors = HashMap::new();
         let mut source_names = HashMap::new();
+        let mut source_pitches = HashMap::new();
         for shard in shards {
             let needed = weight_map.iter().find(|(name, file)| *file == shard && routed(name))
                 .map(|(name, _)| name).context("selected expert shard has no requirement")?;
@@ -401,7 +431,63 @@ impl Fp8ExpertTensors {
                 .with_context(|| format!("expert role needs tensor {needed} in shard {shard} at snapshot {}", snapshot.display()))?
             {
                 if routed(&meta.name) && weight_map.get(&meta.name) == Some(shard) {
-                    if let Some((layer, projection, suffix)) = stacked_projection(&meta.name, prefix) {
+                    if let Some((layer, stem, suffix)) = fused_native_projection(&meta.name, prefix) {
+                        if matches!(suffix, "weight_amax" | "weight_outer_scale_denominator") {
+                            let amax = suffix == "weight_amax";
+                            ensure!(meta.dtype == DType::F32 && meta.byte_length == (if amax { shape.experts as u64 * 4 } else { 4 })
+                                && (if amax { meta.shape == [shape.experts] || meta.shape == [shape.experts, 1, 1] }
+                                    else { meta.shape.iter().product::<usize>() == 1 }),
+                                "{}: dynamic NVFP4 global shape differs", meta.name);
+                            let projections: &[Fp8Projection] = if stem == "w13" { &[Fp8Projection::Gate, Fp8Projection::Up] }
+                                else { &[Fp8Projection::Down] };
+                            for &projection in projections {
+                                for expert in 0..shape.experts {
+                                    let name = format!("{prefix}layers.{layer}.mlp.experts.{expert}.{}.{}", projection.stem(), suffix);
+                                    ensure!(tensors.insert(name.clone(), Located { shard: shard.clone(),
+                                        offset: meta.byte_offset + if amax { expert as u64 * 4 } else { 0 },
+                                        bytes: 4, dtype: DType::F32, shape: vec![] }).is_none(), "duplicate {name}");
+                                }
+                            }
+                            continue;
+                        }
+                        ensure!(shape.experts > 0 && meta.shape.len() == 3
+                            && meta.shape[0] == shape.experts,
+                            "{}: expected uniform fused expert axis", meta.name);
+                        let scales = suffix == "weight_scale";
+                        let dynamic = weight_map.contains_key(&format!("{prefix}layers.{layer}.mlp.experts.{stem}_weight_amax"));
+                        ensure!(!dynamic || weight_map.contains_key(&format!("{prefix}layers.{layer}.mlp.experts.{stem}_weight_outer_scale_denominator")),
+                            "{}: dynamic NVFP4 lacks outer scale denominator", meta.name);
+                        let group = if dynamic { 16 } else { 32 };
+                        let pack = if dynamic { 2 } else { 1 };
+                        let columns = shape.hidden / if scales { group } else { pack };
+                        let (projections, rows, columns) = if stem == "w13" {
+                            (vec![Fp8Projection::Gate, Fp8Projection::Up], 2 * shape.intermediate, columns)
+                        } else {
+                            (vec![Fp8Projection::Down], shape.hidden,
+                                shape.intermediate / if scales { group } else { pack })
+                        };
+                        let dtype = if scales != dynamic { DType::U8 } else { DType::F8E4M3 };
+                        ensure!(meta.dtype == dtype && meta.shape == [shape.experts, rows, columns]
+                            && meta.byte_length == (shape.experts * rows * columns) as u64,
+                            "{}: unsupported fused MXFP8 header {:?} {:?}", meta.name, meta.dtype, meta.shape);
+                        for projection in projections {
+                            let n = if projection == Fp8Projection::Down { rows } else { rows / 2 };
+                            let pitch = columns * if stem == "w13" { 2 } else { 1 };
+                            for expert in 0..shape.experts {
+                                let name = format!("{prefix}layers.{layer}.mlp.experts.{expert}.{}.{}",
+                                    projection.stem(), if scales { "weight_scale" } else { "weight" });
+                                let part = usize::from(projection == Fp8Projection::Up) * columns;
+                                let at = expert.checked_mul(rows).and_then(|v| v.checked_mul(columns))
+                                    .and_then(|v| v.checked_add(part)).context("fused expert offset overflow")?;
+                                ensure!(!tensors.contains_key(&name), "duplicate expert storage {name}");
+                                source_names.insert(name.clone(), meta.name.clone());
+                                source_pitches.insert(name.clone(), pitch);
+                                tensors.insert(name, Located { shard: shard.clone(),
+                                    offset: meta.byte_offset.checked_add(at as u64).context("fused expert offset overflow")?,
+                                    bytes: (n * columns) as u64, dtype: dtype.clone(), shape: vec![n, columns] });
+                            }
+                        }
+                    } else if let Some((layer, projection, suffix)) = stacked_projection(&meta.name, prefix) {
                         ensure!(shape.experts > 0 && meta.shape.first() == Some(&shape.experts),
                             "{}: expected expert axis {}, found {:?}", meta.name, shape.experts, meta.shape);
                         ensure!(meta.byte_length % shape.experts as u64 == 0,
@@ -434,27 +520,38 @@ impl Fp8ExpertTensors {
                 let cfg = crate::families::minimax_m3::config::MiniMaxM3Config::from_hf(&checkpoint.config)?;
                 vec![cfg.activation(); cfg.layers]
             }
+            Some(family) if family.id() == "inkling2" => {
+                let cfg = crate::families::inkling2::Inkling2Config::from_hf(&checkpoint.config)?;
+                vec![cuteafd_core::FfnActivation::Situ { beta: cfg.gate_softcap as f32,
+                    linear_beta: Some(cfg.up_softcap as f32) }; cfg.layers]
+            }
             _ => Vec::new(),
         };
-        let mut catalog = Self { reader: Default::default(), snapshot: snapshot.to_path_buf(), shape, prefix: prefix.to_string(), mtp_layers, compressed_nvfp4,
-            format: ExpertFormat::Fp8Block128, tensors: Arc::new(tensors), activations,
+        let mut catalog = Self { reader: Default::default(), snapshot: snapshot.to_path_buf(), shape, prefix: prefix.to_string(), mtp_layers, compressed_nvfp4, dynamic_nvfp4: false,
+            format: ExpertFormat::Fp8Block128, tensors: Arc::new(tensors), source_pitches: Arc::new(source_pitches), activations,
             slice_layer: first_selected_layer(shape, layers), coordinator: false };
         let first_layer = layers.and_then(|selected| selected.first().copied()).unwrap_or(shape.first_layer);
         let first = catalog.name(first_layer, 0, Fp8Projection::Gate);
         if catalog.located(&first)?.dtype == DType::Bf16 {
             catalog.format = ExpertFormat::Bf16;
+        } else if catalog.located(&first)?.dtype == DType::F8E4M3
+            && catalog.tensors.get(&catalog.scale_name(&first)).is_some_and(|scale|
+                scale.dtype == DType::U8 && scale.shape == [catalog.shape.intermediate, catalog.shape.hidden / 32]) {
+            catalog.format = ExpertFormat::Mxfp8;
         }
+        catalog.dynamic_nvfp4 = catalog.tensors.contains_key(&format!("{}_amax", first));
         if matches!(catalog.located(&first)?.dtype, DType::U8 | DType::I8) {
             // E4M3 scales with a second-level FP32 scale: ModelOpt NVFP4; UE8M0 ones: MXFP4.
             let nvfp4 = catalog.tensors.get(&catalog.scale_name(&first)).is_some_and(|s| s.dtype == DType::F8E4M3)
-                && catalog.tensors.contains_key(&catalog.alpha_name(&first));
+                && (catalog.dynamic_nvfp4 || catalog.tensors.contains_key(&catalog.alpha_name(&first)));
             catalog.format = if nvfp4 { ExpertFormat::Nvfp4 } else { ExpertFormat::Mxfp4 };
         }
         for name in catalog.tensors.keys().filter(|name| name.ends_with(".weight") || name.ends_with(".weight_packed")) {
             use crate::plan::checkpoint::ModuleNumerics;
             let source = source_names.get(name).map(String::as_str).unwrap_or(name);
             let numerics = checkpoint.module_numerics_with_header(source, catalog.tensors[name].dtype.clone())?;
-            let nvfp4 = catalog.tensors.contains_key(&catalog.alpha_name(name));
+            let nvfp4 = catalog.tensors.contains_key(&catalog.alpha_name(name))
+                || catalog.tensors.contains_key(&format!("{name}_amax"));
             match numerics {
                 ModuleNumerics::W4A4 => ensure!(nvfp4, "{name}: declared W4A4 needs native NVFP4 weights"),
                 ModuleNumerics::W8A8 => {
@@ -462,12 +559,12 @@ impl Fp8ExpertTensors {
                     let qwen = checkpoint.model_type() == Some("qwen4_exp")
                         || checkpoint.text_config().get("model_type").and_then(serde_json::Value::as_str)
                             == Some("qwen4_exp_text");
-                    ensure!(qwen && name.starts_with("mtp.layers."),
+                    ensure!(catalog.format == ExpertFormat::Mxfp8 || (qwen && name.starts_with("mtp.layers.")),
                         "{name}: declared expert W8A8 needs a both-projection native kernel");
                     // Qwen MTP is an explicitly reported, temporary deviation.
                 }
                 ModuleNumerics::CheckpointPrecision | ModuleNumerics::W8CheckpointActivations => {
-                    ensure!(!nvfp4 || checkpoint.quantization().is_none(),
+                    ensure!(!nvfp4 || checkpoint.quantization().is_none() || catalog.tensors.contains_key(&format!("{name}_amax")),
                         "{name}: NVFP4 storage disagrees with declared {numerics:?}");
                 }
             }
@@ -495,6 +592,20 @@ impl Fp8ExpertTensors {
 
     pub fn format(&self) -> ExpertFormat {
         self.format
+    }
+
+    pub fn dynamic_nvfp4(&self) -> bool { self.dynamic_nvfp4 }
+
+    /// Per-expert amax followed by one shared denominator, without converting
+    /// either into ModelOpt's calibrated alpha/input-scale contract.
+    pub fn dynamic_globals(&self, layer: usize, projection: Fp8Projection) -> Result<Vec<u8>> {
+        ensure!(self.dynamic_nvfp4, "expert package has no dynamic NVFP4 globals");
+        let mut bytes = Vec::with_capacity((self.shape.experts + 1) * 4);
+        for expert in 0..self.shape.experts {
+            bytes.extend_from_slice(&self.read_alpha(layer, expert, projection)?.to_le_bytes());
+        }
+        bytes.extend_from_slice(&self.read_input_scale(layer, 0, projection)?.to_le_bytes());
+        Ok(bytes)
     }
 
     /// Coordinator packages retain their fixed contiguous H128 rank ABI.
@@ -540,11 +651,14 @@ impl Fp8ExpertTensors {
     pub fn layer_format(&self, layer: usize) -> Result<ExpertFormat> {
         let first = self.name(layer, 0, Fp8Projection::Gate);
         match &self.located(&first)?.dtype {
-            DType::F8E4M3 => Ok(ExpertFormat::Fp8Block128),
+            DType::F8E4M3 => Ok(if self.tensors.get(&format!("{first}_scale"))
+                .is_some_and(|scale| scale.dtype == DType::U8) { ExpertFormat::Mxfp8 }
+                else { ExpertFormat::Fp8Block128 }),
             DType::U8 | DType::I8 => {
                 let nvfp4 = self.tensors.get(&self.scale_name(&first))
                     .is_some_and(|s| s.dtype == DType::F8E4M3)
-                    && self.tensors.contains_key(&self.alpha_name(&first));
+                    && (self.tensors.contains_key(&format!("{first}_amax"))
+                        || self.tensors.contains_key(&self.alpha_name(&first)));
                 Ok(if nvfp4 { ExpertFormat::Nvfp4 } else { ExpertFormat::Mxfp4 })
             }
             DType::Bf16 => Ok(ExpertFormat::Bf16),
@@ -566,6 +680,7 @@ impl Fp8ExpertTensors {
     pub fn for_layer_metadata(&self, layer: usize) -> Result<Self> {
         let mut view = self.clone();
         view.format = self.layer_format(layer)?;
+        view.dynamic_nvfp4 = self.tensors.contains_key(&format!("{}_amax", self.name(layer, 0, Fp8Projection::Gate)));
         view.slice_layer = layer;
         Ok(view)
     }
@@ -636,6 +751,15 @@ impl Fp8ExpertTensors {
             ensure!(!self.tensors.contains_key(&input), "{input}: native BF16 must not have quantization input scales");
             return Ok(());
         }
+        if self.format == ExpertFormat::Mxfp8 {
+            let scale = self.located(&self.scale_name(&name))?;
+            ensure!(cols % 32 == 0 && weight.dtype == DType::F8E4M3
+                && weight.shape == [rows, cols] && weight.bytes == (rows * cols) as u64
+                && scale.dtype == DType::U8 && scale.shape == [rows, cols / 32]
+                && scale.bytes == (rows * cols / 32) as u64,
+                "{name}: expected E4M3 codes / UE8M0 K32 scales");
+            return Ok(());
+        }
         if self.format == ExpertFormat::Nvfp4 {
             ensure!(weight.dtype == DType::U8 && weight.shape == [rows, cols / 2] && cols % 16 == 0,
                 "{name}: expected packed E2M1 U8 [{rows}, {}], found {:?} {:?}", cols / 2, weight.dtype, weight.shape);
@@ -702,6 +826,7 @@ impl Fp8ExpertTensors {
         let slice = self.rank_width(tp, rank, slicing)?;
         let (rows, cols) = if projection == Fp8Projection::Down { (rows, slice) } else { (slice, cols) };
         if self.format == ExpertFormat::Bf16 { return Ok((rows * cols * 2, 0)); }
+        if self.format == ExpertFormat::Mxfp8 { return Ok((rows * cols, rows * ((cols / 32).div_ceil(4) * 4))); }
         if self.format.packed_fp4() {
             let scale_cols = if self.format == ExpertFormat::Mxfp4 { (cols / 32).div_ceil(4) * 4 }
                 else { cols / self.format.group() };
@@ -714,7 +839,8 @@ impl Fp8ExpertTensors {
     pub fn scale_region_bytes_with(&self, projection: Fp8Projection, tp: usize, rank: usize, slicing: Slicing)
         -> Result<usize> {
         let experts = self.shape.experts;
-        let alphas = if self.format == ExpertFormat::Nvfp4 { experts * 8 } else { 0 };
+        let alphas = if self.dynamic_nvfp4 { (experts + 1) * 4 }
+            else if self.format == ExpertFormat::Nvfp4 { experts * 8 } else { 0 };
         Ok(experts * self.slice_bytes_with(projection, tp, rank, slicing)?.1 + alphas)
     }
 
@@ -750,7 +876,7 @@ impl Fp8ExpertTensors {
                     .checked_add(widened).context("FP8 reader grid overflow")?);
             }
         }
-        let gate_inputs = if self.format == ExpertFormat::Nvfp4 {
+        let gate_inputs = if self.format == ExpertFormat::Nvfp4 && !self.dynamic_nvfp4 {
             experts.checked_mul(4).context("NVFP4 gate input scales overflow")?
         } else { 0 };
         Ok(Fp8ProjectionLoad { weights, scales, readers, reader_staging,
@@ -779,8 +905,14 @@ impl Fp8ExpertTensors {
         Fp8Projection::ALL.iter().try_fold(0usize, |total, &projection| {
             let (weights, _) = self.slice_bytes_with(projection, tp, rank, slicing)?;
             let region = self.scale_region_bytes_with(projection, tp, rank, slicing)?;
-            ensure!(region % experts == 0, "expert scale read extent is not uniform");
-            total.checked_add(weights).and_then(|bytes| bytes.checked_add(region / experts))
+            let per_expert = if self.dynamic_nvfp4 {
+                self.slice_bytes_with(projection, tp, rank, slicing)?.1.checked_add(8)
+                    .context("dynamic expert scale read overflow")?
+            } else {
+                ensure!(region % experts == 0, "expert scale read extent is not uniform");
+                region / experts
+            };
+            total.checked_add(weights).and_then(|bytes| bytes.checked_add(per_expert))
                 .context("expert weight/scale read extent overflow")
         })
     }
@@ -788,7 +920,9 @@ impl Fp8ExpertTensors {
     /// Rows of one slice block: the 128x128 scale block (FP8), the 32-wide
     /// UE8M0 block (MXFP4) or the 16-wide E4M3 block (NVFP4).
     pub fn block(&self) -> usize {
-        self.format.group()
+        // MXFP8 scale groups stay K32, while shared exact packages own H128
+        // intermediate units. H128 boundaries never split a scale group.
+        if self.format == ExpertFormat::Mxfp8 { 128 } else { self.format.group() }
     }
 
     /// The stored intermediate slice width of every rank of `tp`: the widest
@@ -818,6 +952,7 @@ impl Fp8ExpertTensors {
         let slice = self.slice(tp)?;
         let (rows, cols) = if projection == Fp8Projection::Down { (rows, slice) } else { (slice, cols) };
         if self.format == ExpertFormat::Bf16 { return Ok((rows * cols * 2, 0)); }
+        if self.format == ExpertFormat::Mxfp8 { return Ok((rows * cols, rows * ((cols / 32).div_ceil(4) * 4))); }
         if self.format.packed_fp4() {
             let scale_cols = if self.format == ExpertFormat::Mxfp4 { (cols / 32).div_ceil(4) * 4 }
                 else { cols / self.format.group() };
@@ -830,7 +965,8 @@ impl Fp8ExpertTensors {
     /// grids, then (NVFP4) the experts' FP32 alphas and FP32 input scales.
     pub fn scale_region_bytes(&self, projection: Fp8Projection, tp: usize) -> Result<usize> {
         let experts = self.shape.experts;
-        let alphas = if self.format == ExpertFormat::Nvfp4 { experts * 8 } else { 0 };
+        let alphas = if self.dynamic_nvfp4 { (experts + 1) * 4 }
+            else if self.format == ExpertFormat::Nvfp4 { experts * 8 } else { 0 };
         Ok(experts * self.slice_bytes(projection, tp)?.1 + alphas)
     }
 
@@ -864,6 +1000,32 @@ impl Fp8ExpertTensors {
         Ok(())
     }
 
+    /// The layer's one shared W4A4 activation scale, when the checkpoint's own
+    /// tensors prove the activation quantization is expert-independent: every
+    /// routed expert's gate and up `input_scale` (compressed-tensors
+    /// `input_global_scale`) carries the same FP32 bits. `None` when any two
+    /// differ (one wire row then cannot serve every expert: keep BF16 ingress)
+    /// or the layer is not NVFP4. The down scale stays Spark-internal (the
+    /// SwiGLU activation is quantized there) and may vary.
+    pub fn uniform_input_scale(&self, layer: usize) -> Result<Option<f32>> {
+        if self.format != ExpertFormat::Nvfp4 { return Ok(None); }
+        let mut shared = None;
+        for expert in 0..self.shape.experts {
+            for projection in [Fp8Projection::Gate, Fp8Projection::Up] {
+                let name = self.activation_scale_name(&self.name(layer, expert, projection));
+                let bytes = self.read_scalar_bytes(&name)?;
+                match shared {
+                    None => shared = Some(bytes),
+                    Some(first) if first != bytes => return Ok(None),
+                    Some(_) => {}
+                }
+            }
+        }
+        let bytes = shared.context("NVFP4 layer has no routed experts")?;
+        self.nvfp4_scale_convention().validate(f32::from_le_bytes(bytes)).map(Some)
+            .with_context(|| format!("layer {layer} shared input scale"))
+    }
+
     fn read_scalar(&self, name: &str) -> Result<f32> {
         if self.format != ExpertFormat::Nvfp4 {
             return Ok(1.0);
@@ -887,6 +1049,7 @@ impl Fp8ExpertTensors {
     pub fn projection_bytes(&self, projection: Fp8Projection) -> (usize, usize) {
         let (rows, cols) = self.dims(projection);
         if self.format == ExpertFormat::Bf16 { return (rows * cols * 2, 0); }
+        if self.format == ExpertFormat::Mxfp8 { return (rows * cols, rows * cols / 32); }
         if self.format.packed_fp4() {
             (rows * cols / 2, rows * cols / self.format.group()
                 + usize::from(self.format == ExpertFormat::Nvfp4) * 8)
@@ -904,6 +1067,21 @@ impl Fp8ExpertTensors {
         let sizes = self.projection_bytes(projection);
         ensure!((weight.len(), scale.len()) == sizes, "{name}: shared projection buffers have the wrong size");
         let w = self.located(&name)?;
+        if self.format == ExpertFormat::Mxfp8 || self.dynamic_nvfp4 {
+            let (rows, cols) = self.dims(projection);
+            let grid = rows * cols / self.format.group();
+            for (member, out, width) in [(name.clone(), &mut *weight,
+                cols / if self.dynamic_nvfp4 { 2 } else { 1 }),
+                (self.scale_name(&name), &mut scale[..grid], cols / self.format.group())] {
+                self.read_image(&member, Fp8MatrixSlice { source_offset: 0, source_pitch: width,
+                    destination_pitch: width, width, rows, destination_bytes: out.len() }, out)?;
+            }
+            if self.dynamic_nvfp4 {
+                scale[grid..grid + 4].copy_from_slice(&self.read_alpha(layer, expert, projection)?.to_le_bytes());
+                scale[grid + 4..].copy_from_slice(&self.read_input_scale(layer, expert, projection)?.to_le_bytes());
+            }
+            return Ok(weight.len() + scale.len());
+        }
         if self.format == ExpertFormat::Bf16 {
             self.reader.open(&self.snapshot.join(&w.shard))?.read_exact_at(weight, w.offset)?;
             return Ok(weight.len());
@@ -953,6 +1131,10 @@ impl Fp8ExpertTensors {
         Ok(if self.format == ExpertFormat::Bf16 {
             [matrix(1, 1, 2, bytes.0), Fp8MatrixSlice { source_offset: 0, source_pitch: 0,
                 destination_pitch: 0, width: 0, rows: 0, destination_bytes: 0 }]
+        } else if self.format == ExpertFormat::Mxfp8 {
+            let mut scale = matrix(1, 32, 1, bytes.1);
+            if projection == Fp8Projection::Down { scale.destination_pitch = (stored / 32).div_ceil(4) * 4; }
+            [matrix(1, 1, 1, bytes.0), scale]
         } else if self.format.packed_fp4() {
             let mut scale = matrix(1, self.format.group(), 1, bytes.1);
             if self.format == ExpertFormat::Mxfp4 && projection == Fp8Projection::Down {
@@ -962,6 +1144,43 @@ impl Fp8ExpertTensors {
         } else {
             [matrix(1, 1, 1, bytes.0), matrix(128, 128, 4, bytes.1)]
         })
+    }
+
+    /// Physical source window for direct push loading; fused interleaved rows
+    /// use the checkpoint pitch while destinations retain planar kernel layout.
+    pub fn push_matrix_slice(&self, name: &str, mut image: Fp8MatrixSlice) -> Result<Fp8MatrixSlice> {
+        self.located(name)?;
+        if let Some(&pitch) = self.source_pitches.get(name) {
+            ensure!(image.source_pitch > 0, "fused expert row pitch is empty");
+            image.source_offset = (image.source_offset / image.source_pitch).checked_mul(pitch)
+                .and_then(|v| v.checked_add(image.source_offset % image.source_pitch))
+                .context("fused expert row offset overflow")?;
+            image.source_pitch = pitch;
+        }
+        Ok(image)
+    }
+
+    fn read_image(&self, name: &str, image: Fp8MatrixSlice, out: &mut [u8]) -> Result<()> {
+        let source = self.located(name)?;
+        ensure!(out.len() == image.destination_bytes, "expert matrix destination extent");
+        let image = self.push_matrix_slice(name, image)?;
+        let file = self.reader.open(&self.snapshot.join(&source.shard))?;
+        out.fill(0);
+        if image.width == image.source_pitch && image.width == image.destination_pitch {
+            let bytes = image.rows.checked_mul(image.width).context("expert contiguous extent overflow")?;
+            file.read_exact_at(&mut out[..bytes], source.offset.checked_add(image.source_offset as u64)
+                .context("expert source offset overflow")?)?;
+            return Ok(());
+        }
+        for row in 0..image.rows {
+            let at = image.source_offset.checked_add(row.checked_mul(image.source_pitch)
+                .context("expert source row overflow")?).context("expert source offset overflow")?;
+            let dst = row.checked_mul(image.destination_pitch).context("expert destination row overflow")?;
+            ensure!(dst.checked_add(image.width).is_some_and(|end| end <= out.len()), "expert row exceeds destination");
+            file.read_exact_at(&mut out[dst..dst + image.width], source.offset.checked_add(at as u64)
+                .context("expert source offset overflow")?)?;
+        }
+        Ok(())
     }
 
     /// `read_slice` for packed FP4 (MXFP4, NVFP4): rank rows `[first, first +
@@ -1038,6 +1257,12 @@ impl Fp8ExpertTensors {
             }
             return Ok(());
         }
+        if self.format == ExpertFormat::Mxfp8 || self.dynamic_nvfp4 {
+            let [w, s] = self.projection_slices(projection, tp, rank, slicing)?;
+            self.read_image(&name, w, weight)?;
+            self.read_image(&self.scale_name(&name), s, scale)?;
+            return Ok(());
+        }
         if self.format.packed_fp4() {
             return self.read_mxfp4_slice(&name, projection, tp, rank, slicing, weight, scale, staging);
         }
@@ -1091,6 +1316,180 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fused_mxfp8_interleaving_and_rank_windows_are_byte_exact() -> Result<()> {
+        use crate::plan::testing::{t, write_snapshot};
+        use crate::push_load::builder::{Builder, Destination};
+        let root = tempfile::tempdir()?;
+        let prefix = "model.llm.layers.0.mlp.experts";
+        let headers = [
+            t(format!("{prefix}.w13_weight"), "F8_E4M3", &[2, 512, 128]),
+            t(format!("{prefix}.w13_weight_scale"), "U8", &[2, 512, 4]),
+            t(format!("{prefix}.w2_weight"), "F8_E4M3", &[2, 128, 256]),
+            t(format!("{prefix}.w2_weight_scale"), "U8", &[2, 128, 8]),
+        ];
+        write_snapshot(root.path(), &serde_json::json!({"model_type":"unit_fixture"}), &headers, None);
+        let index: serde_json::Value = serde_json::from_slice(&std::fs::read(root.path().join("model.safetensors.index.json"))?)?;
+        let mut payloads = HashMap::new();
+        for (name, _, _) in &headers {
+            let shard = index["weight_map"][name].as_str().unwrap();
+            let meta = read_safetensors_metadata(&root.path().join(shard))?.into_iter()
+                .find(|meta| &meta.name == name).unwrap();
+            let payload = (0..meta.byte_length).map(|i| ((i / 7 + i / 128 * 13) % 251) as u8).collect::<Vec<_>>();
+            std::fs::OpenOptions::new().write(true).open(root.path().join(shard))?
+                .write_all_at(&payload, meta.byte_offset)?;
+            payloads.insert(name.clone(), payload);
+        }
+        let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 2, topk: 1,
+            hidden: 128, intermediate: 256, draft_stages: 0, draft_experts: 0 };
+        let tensors = Fp8ExpertTensors::read(root.path(), shape)?.for_coordinator();
+        assert_eq!(tensors.format(), ExpertFormat::Mxfp8);
+        assert_eq!(tensors.format().package_name("inkling2"), "fp8-inkling2-mxfp8");
+        for expert in 0..2 {
+            for projection in Fp8Projection::ALL {
+                let full = tensors.projection_bytes(projection);
+                let mut full_w = vec![0; full.0];
+                let mut full_s = vec![0; full.1];
+                tensors.read_projection_once(0, expert, projection, &mut full_w, &mut full_s)?;
+                let (stem, rows, width, part) = if projection == Fp8Projection::Down { ("w2", 128, 256, 0) }
+                    else { ("w13", 256, 128, usize::from(projection == Fp8Projection::Up)) };
+                for (plane, actual, columns) in [("weight", &full_w, width), ("weight_scale", &full_s, width / 32)] {
+                    let source = &payloads[&format!("{prefix}.{stem}_{plane}")];
+                    let pitch = columns * if stem == "w13" { 2 } else { 1 };
+                    let first = expert * rows * pitch + part * columns;
+                    let expected = (0..rows).flat_map(|row| source[first + row * pitch..][..columns].iter().copied())
+                        .collect::<Vec<_>>();
+                    assert_eq!(actual, &expected);
+                }
+                for rank in 0..2 {
+                    let slicing = Slicing::Blocks(128);
+                    let bytes = tensors.slice_bytes_with(projection, 2, rank, slicing)?;
+                    let mut w = vec![0; bytes.0];
+                    let mut s = vec![0; bytes.1];
+                    tensors.read_slice_with(0, expert, projection, 2, rank, slicing, &mut w, &mut s, &mut Vec::new())?;
+                    let [wi, si] = tensors.projection_slices(projection, 2, rank, slicing)?;
+                    for (image, source, actual) in [(wi, &full_w, &w), (si, &full_s, &s)] {
+                        let mut expected = vec![0; image.destination_bytes];
+                        for row in 0..image.rows {
+                            let at = image.source_offset + row * image.source_pitch;
+                            expected[row * image.destination_pitch..][..image.width].copy_from_slice(&source[at..][..image.width]);
+                        }
+                        assert_eq!(actual, &expected);
+                    }
+                    let mut builder = Builder::new(root.path(), vec![(w.len() + s.len()) as u64]);
+                    builder.fp8_projection(&tensors, 0, expert, projection, 2, rank, slicing,
+                        Destination { rank: 0, offset: 0, bytes: w.len() as u64 },
+                        Destination { rank: 0, offset: w.len() as u64, bytes: s.len() as u64 })?;
+                    let checked = builder.finish()?;
+                    let mut pushed = vec![0; w.len() + s.len()];
+                    for entry in &checked.plan.entries {
+                        let source = std::fs::File::open(root.path().join(&checked.plan.files[entry.file as usize]))?;
+                        let pattern = &checked.plan.patterns[entry.pattern as usize];
+                        for (src, dst) in pattern.runs() {
+                            let at = (entry.dst_base + dst) as usize;
+                            source.read_exact_at(&mut pushed[at..at + pattern.run as usize], entry.src_base + src)?;
+                        }
+                    }
+                    assert_eq!(&pushed[..w.len()], w);
+                    assert_eq!(&pushed[w.len()..], s);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mxfp8_h128_ownership_matches_exporter_widths_without_splitting_k32_scales() -> Result<()> {
+        let mut tensors = catalog(ExpertFormat::Mxfp8, 2304);
+        tensors.shape.hidden = 4608;
+        tensors.shape.experts = 384;
+        assert_eq!(tensors.format.group(), 32);
+        assert_eq!(tensors.block(), 128);
+        let exporter = include_str!("../../../../../python/tools/aot/package_fp8_moe_aot.py");
+        assert!(exporter.contains("def exact_widths(intermediate: int, tp: int, unit: int = 128)"));
+        for world in 2..=8 {
+            let recipe = crate::plan::experts::spark_recipe("inkling2:mxfp8", 2304, world)?;
+            assert_eq!(recipe.slicing, Slicing::Blocks(128));
+            let mut covered = vec![false; 2304];
+            let mut widths = Vec::new();
+            for rank in 0..world {
+                let (first, width) = tensors.rank_range_with(world, rank, recipe.slicing)?;
+                let blocks = 2304 / 128;
+                let exported = (blocks / world + usize::from(rank < blocks % world)) * 128;
+                widths.push(width);
+                assert_eq!(width, exported);
+                assert_eq!(first % 128, 0);
+                assert_eq!(first % 32, 0);
+                assert_eq!(width % 32, 0);
+                for value in &mut covered[first..first + width] { assert!(!*value); *value = true; }
+                let scale = tensors.projection_slices(Fp8Projection::Down, world, rank, recipe.slicing)?[1];
+                assert_eq!(scale.source_offset, first / 32);
+                assert_eq!(scale.width, width / 32);
+            }
+            assert_eq!(widths, recipe.widths);
+            assert!(covered.into_iter().all(|value| value));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_dynamic_nvfp4_globals_keep_amax_and_single_denominator_bytes() -> Result<()> {
+        use crate::plan::testing::{t, write_snapshot};
+        let root = tempfile::tempdir()?;
+        let prefix = "model.llm.layers.0.mlp.experts";
+        let mut headers = Vec::new();
+        for (stem, n, k) in [("w13", 512, 128), ("w2", 128, 256)] {
+            headers.extend([t(format!("{prefix}.{stem}_weight"), "U8", &[2, n, k / 2]),
+                t(format!("{prefix}.{stem}_weight_scale"), "F8_E4M3", &[2, n, k / 16]),
+                t(format!("{prefix}.{stem}_weight_amax"), "F32", &[2]),
+                t(format!("{prefix}.{stem}_weight_outer_scale_denominator"), "F32", &[1])]);
+        }
+        write_snapshot(root.path(), &serde_json::json!({}), &headers, None);
+        let index: serde_json::Value = serde_json::from_slice(&std::fs::read(root.path().join("model.safetensors.index.json"))?)?;
+        for (name, _, _) in &headers {
+            let shard = index["weight_map"][name].as_str().unwrap();
+            let meta = read_safetensors_metadata(&root.path().join(shard))?.into_iter()
+                .find(|meta| &meta.name == name).unwrap();
+            let payload = if name.ends_with("amax") { [1.25f32, 2.5].into_iter().flat_map(f32::to_le_bytes).collect() }
+                else if name.ends_with("denominator") { 3.5f32.to_le_bytes().to_vec() }
+                else { (0..meta.byte_length).map(|i| (i % 251) as u8).collect::<Vec<_>>() };
+            std::fs::OpenOptions::new().write(true).open(root.path().join(shard))?.write_all_at(&payload, meta.byte_offset)?;
+        }
+        let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 2, topk: 1,
+            hidden: 128, intermediate: 256, draft_stages: 0, draft_experts: 0 };
+        let tensors = Fp8ExpertTensors::read(root.path(), shape)?.for_coordinator();
+        assert_eq!(tensors.format(), ExpertFormat::Nvfp4);
+        assert!(tensors.dynamic_nvfp4());
+        let expected = [1.25f32, 2.5, 3.5].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
+        for projection in Fp8Projection::ALL {
+            assert_eq!(tensors.dynamic_globals(0, projection)?, expected);
+            for rank in 0..2 {
+                let slicing = Slicing::Blocks(128);
+                let (wbytes, sbytes) = tensors.slice_bytes_with(projection, 2, rank, slicing)?;
+                assert_eq!(tensors.scale_region_bytes_with(projection, 2, rank, slicing)?, 2 * sbytes + 12);
+                for expert in 0..2 {
+                    let full = tensors.projection_bytes(projection);
+                    let (mut w, mut s) = (vec![0; full.0], vec![0; full.1]);
+                    tensors.read_projection_once(0, expert, projection, &mut w, &mut s)?;
+                    assert_eq!(&s[s.len() - 8..s.len() - 4], &expected[expert * 4..expert * 4 + 4]);
+                    assert_eq!(&s[s.len() - 4..], &3.5f32.to_le_bytes());
+                    let (mut rw, mut rs) = (vec![0; wbytes], vec![0; sbytes]);
+                    tensors.read_slice_with(0, expert, projection, 2, rank, slicing, &mut rw, &mut rs, &mut Vec::new())?;
+                    let [wi, si] = tensors.projection_slices(projection, 2, rank, slicing)?;
+                    for (image, source, actual) in [(wi, &w, &rw), (si, &s, &rs)] {
+                        let mut expected = vec![0; image.destination_bytes];
+                        for row in 0..image.rows {
+                            expected[row * image.destination_pitch..][..image.width].copy_from_slice(
+                                &source[image.source_offset + row * image.source_pitch..][..image.width]);
+                        }
+                        assert_eq!(actual, &expected);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn package_names_follow_native_math_not_family() {
         for geometry in ["glm", "glmf", "qwen4", "step5", "future"] {
             assert_eq!(ExpertFormat::Nvfp4.package_name(geometry), format!("fp8-{geometry}-nvfp4a4"));
@@ -1103,8 +1502,8 @@ mod tests {
     fn catalog(format: ExpertFormat, intermediate: usize) -> Fp8ExpertTensors {
         let shape = RoutedExpertShape { layers: 78, first_layer: 3, experts: 256, topk: 8, hidden: 6144, intermediate,
             draft_stages: 0, draft_experts: 0 };
-        Fp8ExpertTensors { reader: Default::default(), snapshot: PathBuf::new(), shape, prefix: "model.".into(), mtp_layers: false, compressed_nvfp4: false, format,
-            tensors: Arc::new(HashMap::new()), activations: Vec::new(), slice_layer: 0, coordinator: false }
+        Fp8ExpertTensors { reader: Default::default(), snapshot: PathBuf::new(), shape, prefix: "model.".into(), mtp_layers: false, compressed_nvfp4: false, dynamic_nvfp4: false, format,
+            tensors: Arc::new(HashMap::new()), source_pitches: Default::default(), activations: Vec::new(), slice_layer: 0, coordinator: false }
     }
 
     fn ranges(tensors: &Fp8ExpertTensors, tp: usize) -> Vec<(usize, usize)> {
@@ -1496,6 +1895,56 @@ mod tests {
         }
     }
 
+    /// The exact NVFP4 wire is admitted only from the checkpoint's own scalars:
+    /// every expert's gate and up input scale must carry identical FP32 bits.
+    #[test]
+    fn uniform_input_scale_requires_identical_gate_up_bits_across_experts() {
+        use crate::plan::testing::{t, write_snapshot};
+        let dir = tempfile::tempdir().unwrap();
+        let mut headers = Vec::new();
+        for expert in 0..3 {
+            for stem in ["w1", "w3", "w2"] {
+                let name = format!("language_model.model.layers.0.block_sparse_moe.experts.{expert}.{stem}");
+                headers.extend([t(format!("{name}.weight_packed"), "U8", &[128, 64]),
+                    t(format!("{name}.weight_scale"), "F8_E4M3", &[128, 8]),
+                    t(format!("{name}.weight_global_scale"), "F32", &[]),
+                    t(format!("{name}.input_global_scale"), "F32", &[])]);
+            }
+        }
+        let config = serde_json::json!({"quantization_config":{
+            "quant_method":"mxfp8", "activation_scheme":"dynamic", "weight_block_size":[1,32],
+            "moe_quant_algo":"NVFP4", "moe_quant_format":"nvfp4-pack-quantized", "group_size":16}});
+        write_snapshot(dir.path(), &config, &headers, None);
+        let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 3, topk: 1,
+            hidden: 128, intermediate: 128, draft_stages: 0, draft_experts: 0 };
+        let tensors = Fp8ExpertTensors::read(dir.path(), shape).unwrap();
+        let write = |expert: usize, projection: Fp8Projection, value: f32| {
+            let name = tensors.activation_scale_name(&tensors.name(0, expert, projection));
+            let loc = tensors.located(&name).unwrap();
+            std::fs::File::options().write(true).open(dir.path().join(&loc.shard)).unwrap()
+                .write_all_at(&value.to_le_bytes(), loc.offset).unwrap();
+        };
+        for expert in 0..3 {
+            for projection in Fp8Projection::ALL { write(expert, projection, 1.0); }
+        }
+        // The down scale is Spark-internal: varying it keeps the wire exact.
+        write(1, Fp8Projection::Down, 0.25);
+        assert_eq!(tensors.uniform_input_scale(0).unwrap(), Some(1.0));
+        write(2, Fp8Projection::Up, f32::from_bits(1.0f32.to_bits() + 1));
+        assert_eq!(tensors.uniform_input_scale(0).unwrap(), None, "one ulp on one expert keeps BF16 ingress");
+        for expert in 0..3 {
+            for projection in [Fp8Projection::Gate, Fp8Projection::Up] { write(expert, projection, 0.37); }
+        }
+        assert_eq!(tensors.uniform_input_scale(0).unwrap(), Some(0.37));
+        write(0, Fp8Projection::Gate, 0.0);
+        write(0, Fp8Projection::Up, 0.0);
+        write(1, Fp8Projection::Gate, 0.0);
+        write(1, Fp8Projection::Up, 0.0);
+        write(2, Fp8Projection::Gate, 0.0);
+        write(2, Fp8Projection::Up, 0.0);
+        assert!(tensors.uniform_input_scale(0).is_err(), "a shared invalid scale is a checkpoint error");
+    }
+
     #[test]
     fn compressed_nvfp4_uses_checkpoint_names_and_divisor_globals() {
         use crate::plan::testing::{t, write_snapshot};
@@ -1631,6 +2080,7 @@ mod tests {
                     let mut tensors = match format {
                         ExpertFormat::Fp8Block128 => fp8(&name, n, k, None),
                         ExpertFormat::Mxfp4 => mxfp4(&name, n, k),
+                        ExpertFormat::Mxfp8 => crate::plan::testing::mxfp8(&name, n, k),
                         ExpertFormat::Nvfp4 => nvfp4(&name, n, k),
                         ExpertFormat::Bf16 => vec![crate::plan::testing::t(format!("{name}.weight"), "BF16", &[n,k])],
                     };

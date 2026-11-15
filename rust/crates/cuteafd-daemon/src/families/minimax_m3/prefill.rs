@@ -26,6 +26,8 @@ pub(crate) struct Prefill<'s, 'a> {
     /// Monotonic nonzero request identity, retained across scoring windows.
     pub next_identity: &'s mut u64,
     pub taps: Option<&'s mut LayerTaps>,
+    /// Exact NVFP4 Spark ingress (`SparkIngress::Nvfp4`); BF16 rows when absent.
+    pub nvfp4: Option<&'s super::experts::Nvfp4Wire<'a>>,
 }
 
 /// Diagnostic-only synchronous copies; never enabled by serving or ordinary golden.
@@ -181,14 +183,30 @@ impl PrefillHooks for Prefill<'_, '_> {
         *self.next_identity = identity.checked_add(1).context("MiniMax Spark request identity exhausted")?;
         let version = self.placement_version;
         let start = unit.rows.start;
-        let staging = RouteStaging::new(rows, 4, 6144 * 2)?;
-        let sources = [owner.plane("route_ids")?, owner.plane("route_weights")?, owner.dense.producer_destination()];
+        let (dtype, row_bytes) = if self.nvfp4.is_some() {
+            (ExpertV2Dtype::Nvfp4E2m1E4m3K16Amax, super::experts::NVFP4_ROW_BYTES)
+        } else { (ExpertV2Dtype::Bf16, 6144 * 2) };
+        let staging = RouteStaging::new(rows, 4, row_bytes)?;
+        let input = match self.nvfp4 {
+            // The gate plane is free until this unit's shared FFN, ordered after staging.
+            Some(nvfp4) => {
+                let wire = owner.plane("gate")?;
+                owner.stream.device.run(|| {
+                    // SAFETY: distinct retained activation and gate planes on this stream.
+                    unsafe { nvfp4.quantize(layer, rows, owner.dense.producer_destination(), wire, owner.stream.raw) }
+                })?;
+                wire
+            }
+            None => owner.dense.producer_destination(),
+        };
+        let sources = [owner.plane("route_ids")?, owner.plane("route_weights")?, input];
         let ticket = owner.stream.device.run(|| {
-            // SAFETY: router ids/weights and its normalized BF16 activation are
-            // staged on the same stream before shared FFN reuses the activation.
+            // SAFETY: router ids/weights and the expert input rows are staged on
+            // the same stream before shared FFN reuses the activation.
+            // The payload is the per-rank BF16 reply plane, not the request rows.
             unsafe { self.waves.send(rows, rows * 6144 * 2, staging, sources, owner.stream.raw,
                 spark_waves::single_reply_eligible(rows, ExpertV2SourceKind::Prefill),
-                Box::new(move |routes, wire| request(identity, version, layer, start, rows, routes, wire))) }
+                Box::new(move |routes, wire| request(identity, version, layer, start, rows, dtype, routes, wire))) }
         })?;
         owner.ffn(self.kernels, self.weights, self.admitted, layer, rows, true)?;
         Ok(ticket)
@@ -221,7 +239,7 @@ impl PrefillHooks for Prefill<'_, '_> {
     fn commit_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
 }
 
-fn request(identity: u64, version: u64, layer: usize, start: usize, rows: usize,
+fn request(identity: u64, version: u64, layer: usize, start: usize, rows: usize, dtype: ExpertV2Dtype,
     routes: Vec<ExpertProtocolV2RouteEntry>, wire: bytes::Bytes) -> Result<ExpertProtocolV2Request> {
     ensure!(identity != 0 && version != 0 && (3..60).contains(&layer), "MiniMax Spark request identity/layer");
     let descriptors = (0..rows).map(|row| ExpertProtocolV2RowDescriptor {
@@ -230,7 +248,7 @@ fn request(identity: u64, version: u64, layer: usize, start: usize, rows: usize,
         route_offset: (row * 4) as u32, route_count: 4,
     }).collect();
     let mut request = ExpertProtocolV2Request::new_bytes(identity, version, layer as u32, 6144,
-        ExpertV2Dtype::Bf16, descriptors, routes, wire)?;
+        dtype, descriptors, routes, wire)?;
     request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
     Ok(request)
 }
@@ -255,7 +273,11 @@ mod tests {
         let routes = (0..8).map(|route| ExpertProtocolV2RouteEntry {
             row_index: route / 4, expert_id: route % 128, gate_weight: 0.5,
         }).collect();
-        let request = request(8, 77, 3, 63, 2, routes, vec![0; 2 * 6144 * 2].into())?;
+        let wire = request(9, 77, 3, 63, 2, ExpertV2Dtype::Nvfp4E2m1E4m3K16Amax, (0..8).map(|route|
+            ExpertProtocolV2RouteEntry { row_index: route / 4, expert_id: route % 128, gate_weight: 0.5 }).collect(),
+            vec![0; 2 * super::super::experts::NVFP4_ROW_BYTES].into())?;
+        assert_eq!(wire.header.hidden_row_stride_bytes as usize, 3472);
+        let request = request(8, 77, 3, 63, 2, ExpertV2Dtype::Bf16, routes, vec![0; 2 * 6144 * 2].into())?;
         assert_eq!(request.header.hidden_dtype, ExpertV2Dtype::Bf16);
         assert_eq!(request.header.hidden_row_stride_bytes, 6144 * 2);
         assert_ne!(request.header.flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, 0);
@@ -269,6 +291,10 @@ mod tests {
         let source = include_str!("prefill.rs").split("#[cfg(test)]").next().unwrap();
         assert!(source.contains("run_prefill_units(self, units,"));
         assert!(source.contains("self.waves.send("));
+        // The wave payload is the BF16 reply plane even when requests carry NVFP4 rows.
+        assert!(source.contains("self.waves.send(rows, rows * 6144 * 2, staging,"));
+        let dispatch = include_str!("experts.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(dispatch.contains("exchange.send(rows.rows, exchange.compact_payload(rows.rows), layout,"));
         assert!(source.contains("self.waves.reduce("));
         assert!(!source.contains("for layer in"));
     }

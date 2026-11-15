@@ -44,9 +44,31 @@ pub(crate) struct RankKv<'a> {
     pub rings: Allocation<'a>,
     pub layers: Vec<LayerKv>,
     pub extents: KvExtents,
+    pub format: cuteafd_loader::families::muse_spark::cache::MuseKvCache,
 }
 
 impl<'a> RankKv<'a> {
+    /// Observe the two physical backings and each strided FP32 scale subplane.
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        cfg: &MuseSparkConfig, ranks: usize) -> Result<()> {
+        inventory.device("pool", self.pool.buffer)?;
+        inventory.device("rings", self.rings.buffer)?;
+        if self.format == cuteafd_loader::families::muse_spark::cache::MuseKvCache::Fp8 {
+            let heads = cfg.kv_heads / ranks;
+            let payload = self.format.payload_bytes(heads, cfg.head_dim);
+            let stride = self.format.record_bytes(heads, cfg.head_dim);
+            for (name, buffer) in [("pool", self.pool.buffer), ("rings", self.rings.buffer)] {
+                inventory.view(&format!("{name}.scales"), view(buffer, payload, buffer.bytes - payload), name, buffer)?;
+                let receipt = inventory.receipts.last_mut().context("Muse scale alias")?;
+                receipt.allocation.dtype = "f32".into();
+                receipt.allocation.shape = vec![(buffer.bytes / stride) as u64, 2, heads as u64];
+                receipt.allocation.group = format!("Muse KV FP32 scale plane (record stride {stride} B)");
+                receipt.allocation.alignment = 16;
+            }
+        }
+        Ok(())
+    }
+
     /// `charged`: this rank's placement items, to check the extents against.
     pub(crate) fn allocate(device: Device<'a>, cfg: &MuseSparkConfig, cache: &MuseCacheLayout, placement: &Placement,
         rank: usize, slots: u64) -> Result<Self> {
@@ -76,7 +98,7 @@ impl<'a> RankKv<'a> {
                 LayerKv::Ring { ring: view(rings.buffer, at, extents.layer_rings) }
             }
         }).collect();
-        Ok(Self { pool, rings, layers, extents })
+        Ok(Self { pool, rings, layers, extents, format: cache.format })
     }
 }
 
@@ -93,10 +115,12 @@ mod tests {
     #[test]
     fn ring_extents_equal_the_admitted_charge() -> Result<()> {
         let cfg = MuseSparkConfig::from_hf(&cuteafd_loader::plan::testing::muse_spark_config())?;
-        for ranks in [1usize, 2] {
-            let cache = MuseCacheLayout::new(&cfg, ranks)?;
+        for (ranks, format) in [1usize, 2].into_iter().flat_map(|rank|
+            [cuteafd_loader::families::muse_spark::cache::MuseKvCache::Bf16,
+             cuteafd_loader::families::muse_spark::cache::MuseKvCache::Fp8].into_iter().map(move |format| (rank, format))) {
+            let cache = MuseCacheLayout::with_format(&cfg, ranks, format)?;
             let extents = KvExtents::new(&cfg, &cache, 1 << 20, 16)?;
-            let record = cfg.kv_record_bytes() as u64;
+            let record = format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
             let rings = cfg.sliding_layers() as u64 * cuteafd_loader::placement::families::muse_spark::ring_rows(&cfg)?
                 * record * 16 / ranks as u64;
             assert_eq!(extents.ring_bytes() as u64, rings);

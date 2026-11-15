@@ -228,7 +228,8 @@ impl<'a> RequestState<'a> {
         let library = streams[0].decode.device.library;
         let mut devices = BTreeSet::new();
         for (rank, readers) in streams.iter().enumerate() {
-            for (name, bytes) in globals.buffers()?.into_iter().filter(|(name, _)| !name.starts_with("layer.")) {
+            for (name, mut bytes) in globals.buffers()?.into_iter().filter(|(name, _)| !name.starts_with("layer.")) {
+                if name == "decode_table" { bytes = u64::from(capacity.decode.rows) * u64::from(globals.table_width) * 4; }
                 let id = format!("{}.{name}", Owner::Cache { gpu: rank }.id());
                 let charged = solved.facts.allocations.iter().filter(|owner| owner.id == id).collect::<Vec<_>>();
                 ensure!(charged.len() == 1 && charged[0].view.is_none() && charged[0].bytes == bytes
@@ -264,8 +265,8 @@ impl<'a> RequestState<'a> {
             let range = owned[0]..owned[owned.len() - 1] + 1;
             let layout = if heads {
                 MsaCache::for_heads(&cuteafd_loader::families::minimax_m3::execution::HeadsLayout::new(
-                    cfg, rank as u8, capacity.execution_rows())?, pages, capacity.decode.requests, context)?
-            } else { MsaCache::new(u32::try_from(range.len())?, pages, capacity.decode.requests, context)? };
+                    cfg, rank as u8, capacity.execution_rows())?, pages, capacity.requests, context)?
+            } else { MsaCache::new(u32::try_from(range.len())?, pages, capacity.requests, context)? };
             let all = std::iter::once(Rc::clone(&readers.decode))
                 .chain(readers.prefill.iter().cloned()).collect();
             let bank = Rc::new(PageBank::new(all, cfg, capacity, layout, rope, range)?);
@@ -347,7 +348,8 @@ impl<'a> PageBank<'a> {
         ensure!(expected == layout && MsaRope::new(cfg, rope.positions)? == rope,
             "MiniMax page bank geometry differs from admission");
         let mut planes = BTreeMap::new();
-        for (local, bytes) in layout.buffers()? {
+        for (local, mut bytes) in layout.buffers()? {
+            if local == "decode_table" { bytes = u64::from(capacity.decode.rows) * u64::from(layout.table_width) * 4; }
             let name = if let Some(suffix) = local.strip_prefix("layer.") {
                 let (layer, plane) = suffix.split_once('.').context("MiniMax cache plane name")?;
                 format!("layer.{}.{}", layers.start + layer.parse::<usize>()?, plane)
@@ -473,7 +475,7 @@ impl<'a> PageBank<'a> {
         ensure!(metadata.mode == if decode { MetadataMode::Decode } else { MetadataMode::Prefill },
             "MiniMax metadata mode differs from execution");
         ensure!(!appends.is_empty() && appends.len() <= metadata.layout.requests as usize
-            && appends.len() <= self.layout.requests as usize
+            && (decode || appends.len() <= self.layout.requests as usize)
             && (!decode || Rc::ptr_eq(&metadata.stream, &self.stream)),
             "MiniMax metadata request count or decode stream differs from admission");
         let mut planes = metadata.layout.buffers().into_iter()
@@ -491,7 +493,7 @@ impl<'a> PageBank<'a> {
             ensure!(append.rows > 0 && append.first_row == next && (!decode || append.rows == 1),
                 "MiniMax segments must partition contiguous live arithmetic rows");
             next = next.checked_add(append.rows).context("MiniMax live rows overflow")?;
-            ensure!(next <= metadata.capacity && request_slots.insert(append.placement.slot),
+            ensure!(next <= metadata.capacity && (decode || request_slots.insert(append.placement.slot)),
                 "MiniMax metadata capacity or duplicate request slot");
             let end = append.placement.len.checked_add(append.rows).context("MiniMax append frontier overflow")?;
             self.validate(append.placement, end)?;
@@ -709,9 +711,7 @@ impl<'a> Metadata<'a> {
 }
 
 fn checked_capacity(capacity: RequestCapacity) -> Result<RequestCapacity> {
-    ensure!(RequestCapacity::new(u64::from(capacity.decode.rows), u64::from(capacity.prefill.rows))? == capacity,
-        "MiniMax request capacity differs from admitted descriptor");
-    Ok(capacity)
+    Ok(capacity.validate()?)
 }
 
 fn upload_inventory(inventory: &mut Inventory<'_>, name: &str, library: &cuteafd_ffi::NativeLibrary,
@@ -1213,7 +1213,7 @@ mod tests {
                         let first = rank * cfg.layers / ranks as usize;
                         let end = (rank + 1) * cfg.layers / ranks as usize;
                         let layout = MsaCache::new((end - first) as u32, pool_pages,
-                            capacity.decode.requests, context)?;
+                            capacity.requests, context)?;
                         let bank = Rc::new(PageBank::new(readers.clone(), &cfg, capacity, layout,
                             MsaRope::new(&cfg, context)?, first..end)?);
                         for layer in first..end {

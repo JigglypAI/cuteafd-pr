@@ -8,6 +8,7 @@ use cuteafd_ffi::{
 };
 use std::ffi::c_void;
 pub(crate) mod timing;
+pub(crate) mod waves;
 mod grouping;
 pub(crate) use grouping::{ExpertGroupingError, InstalledExpertGrouping};
 use timing::ExpertTiming;

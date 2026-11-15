@@ -383,12 +383,15 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
     module = types.ModuleType("b12x.integration.cuteafd.index_cache")
     module.compile_index_cache_gather_aot = lambda: {}
     monkeypatch.setitem(sys.modules, module.__name__, module)
+    module = types.ModuleType("b12x.integration.cuteafd.nvfp4_wire")
+    module.compile_nvfp4_wire_rows_aot = lambda **kwargs: kwargs
+    monkeypatch.setitem(sys.modules, module.__name__, module)
     namespace = {"geometries": ["minimax"], "manifest": {"families": {}, "family_capacities": {}},
                  "work": [], "CHECKPOINT_CONTEXTS": {},
                  "args": types.SimpleNamespace(decode_rows=64, prefill_rows=4096, max_context=1048576)}
     helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef)
                and node.name in ("geometry_context", "minimax_sparse_programs", "minimax_producer_programs",
-                                 "minimax_forward_programs")]
+                                 "minimax_forward_programs", "minimax_wire_programs")]
     exec(compile(ast.Module(body=helpers + [branch], type_ignores=[]), "dispatch", "exec"), namespace)
     assert namespace["manifest"]["families"] == {"minimax": {"abi_version": 1}}
     assert namespace["manifest"]["family_capacities"] == {"minimax": {"max_context": 1048576}}
@@ -456,10 +459,14 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
                                   "minimax_oai_split_i1536", "minimax_oai_split_i6144",
                                   "minimax_residual_norm",
                                   "minimax_router_scores", "minimax_kv_pack",
-                                  "minimax_index_cache_gather", "minimax_kv_pack_h2"]
+                                  "minimax_index_cache_gather", "minimax_kv_pack_h2",
+                                  "minimax_nvfp4_wire_rows"]
     assert len(names) == len(set(names))
     assert all(params == {"max_rows": 4096} and thunk() == {}
-               for _, _, _, params, thunk in namespace["work"][-5:-1])
+               for _, _, _, params, thunk in namespace["work"][-6:-2])
+    wire = dict(hidden=6144, max_rows=4096, mode="calibrated", scale_convention="divisor")
+    assert namespace["work"][-1][1:4] == ("nvfp4_wire_rows", "nvfp4_wire_rows", wire)
+    assert namespace["work"][-1][4]() == wire
     namespace.update(family="glmf", suffix="sentinel", op="attention")
     exec(compile(ast.Module(body=[stem], type_ignores=[]), "stem", "exec"), namespace)
     assert namespace["stem"] == "glmf_sentinel"
@@ -698,7 +705,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     _, scopes = aot.config_scopes(dict(FAMILY="inkling2", MODEL_ID="fixture/Inkling-2-Small-MXFP8", SPARK_COUNT="4"))
     assert scopes["CUTEAFD_WIP_INKLING2_AOT"] == "ON"
     assert scopes["CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES"] == "inkling2:mxfp8"
-    assert scopes["CUTEAFD_WIP_EXPERT_FAMILIES"] == ""
+    assert scopes["CUTEAFD_WIP_EXPERT_FAMILIES"] == "inkling2:mxfp8"
     assert cmake_flags("coordinator", scopes)["CUTEAFD_ENABLE_INKLING2_AOT"] == "ON"
 
     def load(name, relative):
@@ -718,7 +725,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     assert derived["CUTEAFD_RELEASE_EXPERT_FAMILIES"] == "inkling2:mxfp8"
     required = release.requirements(tmp_path, matrix, "inkling2")[0]
     assert required["programs"] == ["inkling2"] and required["experts"] == ["inkling2:mxfp8"]
-    assert required["spark_experts"] == []
+    assert required["spark_experts"] == ["inkling2:mxfp8"]
 
     placement = load("inkling2_placement_inputs", "scripts/build/export-placement-inputs.py")
     jobs = {name: (exporter, args) for name, exporter, args in placement.export_jobs()}

@@ -62,6 +62,31 @@ pub(super) fn mistral_response_constraint(format: Option<Value>, tools: Option<&
     Ok(Some(NativeConstraint(serde_json::to_string(&json!({"type":"structural_tag", "format":format}))?)))
 }
 
+/// Inkling starts at a message boundary, not inside another family's thinking
+/// prefix. Each reasoning/text/call channel closes independently; EOS ends the turn.
+pub(super) fn inkling_response_constraint(format: Option<Value>, tools: Option<&super::tools::ToolConstraints>)
+    -> Result<Option<NativeConstraint>> {
+    let answer = response_constraint(format, false, None, 0)?
+        .map(|constraint| serde_json::from_str::<Value>(&constraint.0).map(|mut v| v["format"].take()))
+        .transpose()?;
+    let tools = tools.filter(|tools| tools.format.is_some());
+    if answer.is_none() && tools.is_none() { return Ok(None); }
+    let text = |value: &str| json!({"type":"const_string", "value":value});
+    let channel = |kind: &str, content: Value| json!({"type":"tag",
+        "begin":format!("<|message_model|><|content_{kind}|>"), "content":content, "end":"<|end_message|>"});
+    let free = json!({"type":"any_text", "excludes":["<|end_message|>"]});
+    let reasoning = channel("thinking", free.clone());
+    let plain = channel("text", answer.unwrap_or(free.clone()));
+    let body = if let Some(tools) = tools {
+        let calls = json!({"type":"sequence", "elements":[
+            {"type":"star", "content":channel("text", free)}, tools.format]});
+        if tools.required { calls } else { json!({"type":"or", "elements":[plain, calls]}) }
+    } else { plain };
+    Ok(Some(NativeConstraint(json!({"type":"structural_tag", "format":{
+        "type":"sequence", "elements":[{"type":"star", "content":reasoning}, body,
+            {"type":"optional", "content":text("<|content_model_end_sampling|>")}]}}).to_string())))
+}
+
 /// MiniMax adaptively emits reasoning, a bare close prefix or neither.
 pub(super) fn minimax_response_constraint(format: Option<Value>, tools: Option<&super::tools::ToolConstraints>,
     think: [u32; 2]) -> Result<Option<NativeConstraint>> {

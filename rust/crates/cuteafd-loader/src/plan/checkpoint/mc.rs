@@ -201,6 +201,30 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn repaired_mtp_builder_golden_selects_variant_specific_core() -> Result<()> {
+        let root = fixture().with_file_name("mc-repaired-mtp-v1");
+        let headers: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("headers.json"))?)?;
+        let (manifest, _) = Manifest::read(&root)?.unwrap();
+        for mode in [CoreView::Original, CoreView::Fp8Compact, CoreView::K6Compact, CoreView::K8Compact] {
+            let view = CheckpointView::select(&root, mode)?;
+            let variant = manifest.select(mode)?;
+            let weights = view.weight_map().unwrap();
+            let expert = "model.layers.1.mlp.experts.0.trellis";
+            assert_eq!(weights[expert], "mixed.safetensors");
+            assert!(!variant.core_tensors.iter().any(|name| name == expert));
+            let native = matches!(mode, CoreView::Original | CoreView::Fp8Compact);
+            let name = format!("model.layers.2.eh_proj.{}", if native { "weight" } else { "trellis" });
+            assert!(variant.core_tensors.contains(&name));
+            let header = &headers[&weights[&name]][&name];
+            assert_eq!(header["dtype"], if native { "BF16" } else { "I16" });
+            assert_eq!(header["shape"], if native { serde_json::json!([128,128]) } else { serde_json::json!([8,8,64]) });
+            assert_eq!(view.config()?["quantization_config"].get("mtp_bits").is_none(), native);
+            assert_eq!(view.converts_to_fp8(&name), mode == CoreView::Fp8Compact);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn selected_view_needs_no_other_metadata_or_shards() -> Result<()> {
         let dir = copy_fixture();
         for view in [CoreView::Original, CoreView::K6Compact] {

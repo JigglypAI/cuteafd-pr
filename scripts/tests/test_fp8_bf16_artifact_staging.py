@@ -213,7 +213,7 @@ def test_capacity_scratch_reserves_largest_retained_form_like_runtime_abi():
         {"capacity": 1024, "scratch_bytes": 163779584},
         {"capacity": 4096, "scratch_bytes": 734346240},
     ]
-    programs.append({"capacity": 16384, "form": "auto", "scratch": 2000000000, "segmented": True})
+    programs.append({"capacity": 8192, "form": "auto", "scratch": 2000000000, "segmented": True})
     assert [item["capacity"] for item in package_tool.capacity_scratch(programs)] == [16, 1024, 4096]
     source = TOOL.read_text()
     assert '"capacities": capacity_scratch(programs)' in source
@@ -230,7 +230,20 @@ def test_bridge_rejects_invalid_core_scratch_layout(change):
                "entry": "mock_launch", "core_only": True, "segmented": False,
                "act_row_bytes": 2048, "reply_layouts": [layout]}
     with pytest.raises(ValueError, match="reply scratch"):
-        package_tool.bridge_source([program], [0] * 16)
+        package_tool.bridge_source([program], [1 << 8] + [0] * 15)
+
+
+@pytest.mark.parametrize("storage", [7, 8])
+def test_bridge_refuses_compressed_replies_without_a_known_down_output(storage):
+    """#2187: the bridge derives y only for storages it lays out; dynamic-amax (7) and
+    divisor-convention (8) NVFP4 have their own scratch and possibly unweighted combine."""
+    layout = {"end_rows": 80, "route": 3, "metadata_bytes": 2048, "a4_split": 0}
+    program = {"stem": "mock", "capacity": 80, "scratch": 65536, "form": "auto",
+               "entry": "mock_launch", "core_only": True, "segmented": False,
+               "act_row_bytes": 2048, "reply_layouts": [layout]}
+    with pytest.raises(ValueError, match="compressed replies are not supported"):
+        package_tool.bridge_source([program], [storage << 8] + [0] * 15)
+    assert storage not in package_tool.REPLY_LAYOUT_STORAGES
 
 
 @pytest.mark.parametrize("geometry", [
@@ -304,7 +317,7 @@ static void mock_launch(void** args, int) {{
                   {"end_rows": 16, "group_rows": 16}, {"end_rows": 80, "group_rows": 64}]})}]
     segmented = geometry in ("mimo", "mimof")
     if segmented:
-        programs.append({**programs[0], "capacity": 16384, "segmented": True,
+        programs.append({**programs[0], "capacity": 8192, "segmented": True,
                          "minimum_rows": 769, "act_row_bytes": 2048})
     core_programs = []
     align = lambda n: (n + 1023) // 1024 * 1024
@@ -332,21 +345,21 @@ static void mock_launch(void** args, int) {{
     lib = ctypes.CDLL(str(library))
     maximum, minimum, act = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
     assert lib.cuteafd_fp8moe_segment_info(0, ctypes.byref(maximum), ctypes.byref(minimum), ctypes.byref(act)) == 0
-    assert (maximum.value, minimum.value, act.value) == ((16384, 769, 2048) if segmented else (0, 0, 0))
+    assert (maximum.value, minimum.value, act.value) == ((8192, 769, 2048) if segmented else (0, 0, 0))
     scratch = ctypes.c_uint64()
     if segmented:
         align = lambda n: (n + 1023) // 1024 * 1024
-        pairs, bound, experts = 8256 * 8, 16384 * 8, 384
+        pairs, bound, experts = 5504 * 8, 8192 * 8, 384
         tiles = (pairs + 127) // 128 + experts
         expected = align(4 * (4 + 3 * experts + (bound + 127) // 128 + experts))
         expected += 2 * align(pairs * 4) + align(tiles * 128 * 2048) + align(pairs * 6144 * 2)
-        assert lib.cuteafd_fp8moe_segment_scratch_bytes(8256, ctypes.byref(scratch)) == 0
+        assert lib.cuteafd_fp8moe_segment_scratch_bytes(5504, ctypes.byref(scratch)) == 0
         assert scratch.value == expected
-        assert lib.cuteafd_fp8moe_segment_scratch_bytes(16384, ctypes.byref(scratch)) == 0
+        assert lib.cuteafd_fp8moe_segment_scratch_bytes(8192, ctypes.byref(scratch)) == 0
         assert scratch.value > expected
     else:
-        assert lib.cuteafd_fp8moe_segment_scratch_bytes(8256, ctypes.byref(scratch)) != 0
-    for rows in (0, 16385):
+        assert lib.cuteafd_fp8moe_segment_scratch_bytes(5504, ctypes.byref(scratch)) != 0
+    for rows in (0, 8193):
         assert lib.cuteafd_fp8moe_segment_scratch_bytes(rows, ctypes.byref(scratch)) != 0
     assert lib.cuteafd_fp8moe_segment_info(3, ctypes.byref(maximum), ctypes.byref(minimum), ctypes.byref(act)) != 0
     lib.cuteafd_fp8moe_destroy.argtypes = [ctypes.c_void_p]
@@ -408,10 +421,10 @@ static void mock_launch(void** args, int) {{
         (80, 3, 1, 0, 4), (80, 0, 1, 2, 4), (80, 0, 1, 0, 3), (81, 0, 1, 0, 4)]:
         assert query(capacity, form, rows, indirect, words, count) != 0
     if segmented:
-        assert query(16384, 2, 8256, 1, words, 4) == 0
-        assert words[3] == 8256 * 8 * 6144 * 2
+        assert query(8192, 2, 5504, 1, words, 4) == 0
+        assert words[3] == 5504 * 8 * 6144 * 2
     else:
-        assert query(16384, 0, 1, 1, words, 4) != 0
+        assert query(8192, 0, 1, 1, words, 4) != 0
     assert lib.mock_initialized() == 0  # The contract query must not initialize CUDA.
     contexts = []
     for rank in (0, 1):
@@ -427,12 +440,12 @@ static void mock_launch(void** args, int) {{
         assert lib.cuteafd_fp8moe_launch(contexts[rank], 80, pointers, 80, None) == 0
     lib.cuteafd_fp8moe_launch_segments.argtypes = [ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_void_p]
-    assert (lib.cuteafd_fp8moe_launch_segments(contexts[1], pointers, 8256, None) == 0) == segmented
-    assert lib.cuteafd_fp8moe_launch(contexts[1], 16384, pointers, 8256, None) != 0
+    assert (lib.cuteafd_fp8moe_launch_segments(contexts[1], pointers, 5504, None) == 0) == segmented
+    assert lib.cuteafd_fp8moe_launch(contexts[1], 8192, pointers, 5504, None) != 0
     lib.cuteafd_fp8moe_launch_core.argtypes = lib.cuteafd_fp8moe_launch.argtypes
     lib.cuteafd_fp8moe_launch_segments_core.argtypes = lib.cuteafd_fp8moe_launch_segments.argtypes
     assert lib.cuteafd_fp8moe_launch_core(contexts[1], 80, pointers, 80, None) == 0
-    assert (lib.cuteafd_fp8moe_launch_segments_core(contexts[1], pointers, 8256, None) == 0) == segmented
+    assert (lib.cuteafd_fp8moe_launch_segments_core(contexts[1], pointers, 5504, None) == 0) == segmented
     for index in range(11):
         pointers[index] = None
         status = lib.cuteafd_fp8moe_launch(contexts[1], 80, pointers, 80, None)
@@ -799,3 +812,34 @@ def test_dynamic_nvfp4_manifest_omits_static_scale_convention():
     assert package_tool.static_scale_metadata(g) == {}
     # Build's manifest serialization must use the same tested helper.
     assert "**static_scale_metadata(g)," in TOOL.read_text()
+
+
+def test_exact_nvfp4_wire_input_package_contract(tmp_path):
+    """The NVFP4-wire sibling (`--input nvfp4`) keeps the W4A4 package's words except input dtype 8,
+    and only NVFP4 W4A4 weights accept it; manifests verify only with bf16 or nvfp4 input."""
+    from types import SimpleNamespace
+    g = SimpleNamespace(kind="nvfp4a4", weights="nvfp4", activation="swigluoai", projection="bf16",
+                        swiglu_limit=7.0, swiglu_alpha=1.702, swiglu_beta=1.0, scale_convention="divisor",
+                        hidden=6144, slice=1024, experts=128, top_k=4, intermediate=3072, tp=3)
+    bf16 = package_tool.info_words(g, [1, 16, 80, 256, 1024, 4096], False)
+    wire = package_tool.info_words(g, [1, 16, 80, 256, 1024, 4096], False, True)
+    assert wire[7] == 8 and bf16[7] == 1
+    assert wire[:7] + wire[8:] == bf16[:7] + bf16[8:]
+    assert package_tool.input_kind("spark", "nvfp4", "nvfp4") == "nvfp4"
+    assert package_tool.input_kind("spark", "nvfp4") == "bf16"
+    with pytest.raises(ValueError, match="NVFP4 W4A4"):
+        package_tool.info_words(SimpleNamespace(**{**vars(g), "kind": "fp8", "weights": "fp8"}), [16], False, True)
+    with pytest.raises(ValueError, match="NVFP4 W4A4"):
+        package_tool.info_words(g, [16], True, True)
+    with pytest.raises(ValueError, match="NVFP4 W4A4"):
+        package_tool.input_kind("spark", "fp8", "nvfp4")
+    path = write_package(tmp_path / "package", weights="nvfp4")
+    manifest = json.loads((path / "manifest.json").read_text())
+    for value, ok in [("nvfp4", True), ("bf16", True), ("wire", False)]:
+        manifest["layouts"]["tp4"]["input"] = value
+        (path / "manifest.json").write_text(json.dumps(manifest))
+        if ok:
+            package_tool.verify(path, input_kind=value)
+        else:
+            with pytest.raises(ValueError, match="NVFP4 requires"):
+                package_tool.verify(path)

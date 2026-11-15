@@ -2,6 +2,7 @@
 """Content identities and measured inputs for CPU-only AOT publications."""
 from __future__ import annotations
 
+import ast
 import fnmatch
 import functools
 import hashlib
@@ -15,6 +16,7 @@ from pathlib import Path
 import struct
 import sys
 import types
+import time
 import weakref
 
 
@@ -359,6 +361,60 @@ class Recorder:
         self.construction = False
         self.latest = []
         self.monitoring_id = None
+        self.timings = {}
+        self.executor_timings = {}
+        self.frontend_seconds = 0.0
+        self.backend_seconds = 0.0
+        self.overheads = {name: 0.0 for name in ("reads_seconds", "profile_seconds", "audit_seconds", "construction_seconds")}
+        self.read_counts = []
+        self.dependency_paths = {}
+        self.source_hashes = {}
+        self.scoped = False
+        self.job_paths = set()
+        self.import_closures = {}
+
+    def import_closure(self, relative):
+        if relative in self.import_closures:
+            return self.import_closures[relative]
+        found = self.import_closures[relative] = set()
+        path = self.root / relative
+        if path.suffix != ".py":
+            return found
+        parts = Path(relative).with_suffix("").parts
+        if "b12x" not in parts:
+            return found
+        package = list(parts[parts.index("b12x"):-1])
+        tree = ast.parse(path.read_bytes())
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                base = package[:len(package) - node.level + 1] if node.level else []
+                module = ".".join([*base, *([node.module] if node.module else [])])
+                names = [module, *[module + "." + alias.name for alias in node.names]]
+            for name in names:
+                if not name.startswith("b12x"):
+                    continue
+                pieces = name.split(".")
+                for index in range(1, len(pieces) + 1):
+                    base = self.root / "third_party/sparkinfer" / Path(*pieces[:index])
+                    source = next((candidate for candidate in (base.with_suffix(".py"), base / "__init__.py")
+                                   if candidate.is_file()), None)
+                    if source:
+                        found.add(source.relative_to(self.root).as_posix())
+        return found
+
+    def source(self, path):
+        if path not in self.dependency_paths:
+            self.dependency_paths[path] = source_name(path, self.root)
+        return self.dependency_paths[path]
+
+    def validate_sources(self):
+        for path, checksum in self.source_hashes.items():
+            source = self.root / path
+            if not source.is_file() or digest(source.read_bytes()) != checksum:
+                raise ValueError(f"recorded source changed during export: {path}")
 
     def _start(self, code, offset):
         frame = sys._getframe(1)
@@ -386,27 +442,37 @@ class Recorder:
 
     def construct(self, function, *args, **kwargs):
         """Trace the entire recipe, including launch construction and scratch."""
+        started = time.monotonic()
+        if self.scoped:
+            self.job_paths.update(self.opened | self.frames)
+            self.opened, self.frames = set(), set()
+            sys.monitoring.restart_events()
         self.latest = []
         self.construction = True
         try:
             return function(*args, **kwargs)
         finally:
             reads = self.reads()
-            for record in self.latest:
-                record["source_reads_sha256"].update(reads)
+            if not self.scoped:
+                for record in self.latest:
+                    record["source_reads_sha256"].update(reads)
             self.construction = False
+            self.overheads["construction_seconds"] += time.monotonic() - started
 
     def _audit(self, event, args):
+        started = time.monotonic()
         if self.active and event == "open" and args and isinstance(args[0], (str, bytes, os.PathLike)):
-            path = source_name(args[0], self.root)
+            path = self.source(args[0])
             if path and not path.startswith(str(self.output)):
                 self.opened.add(path)
+        self.overheads["audit_seconds"] += time.monotonic() - started
 
     def _profile(self, frame, event, arg):
+        started = time.monotonic()
         if event == "call":
             filename = frame.f_code.co_filename
             if filename not in self.frame_paths:
-                self.frame_paths[filename] = source_name(filename, self.root)
+                self.frame_paths[filename] = self.source(filename)
             path = self.frame_paths[filename]
             if path:
                 self.frames.add(path)
@@ -419,6 +485,7 @@ class Recorder:
                          *frame.f_code.co_freevars, *frame.f_code.co_cellvars)
                 self._record_dependencies(frame.f_locals.get(name) for name in names)
                 self._record_dependencies(frame.f_globals.get(name) for name in frame.f_code.co_names)
+        self.overheads["profile_seconds"] += time.monotonic() - started
 
     def _record_dependencies(self, values):
         for value in values:
@@ -428,23 +495,41 @@ class Recorder:
             for dependency in (module, value):
                 filename = getattr(dependency, "__file__", None)
                 if filename is not None:
-                    source = source_name(filename, self.root)
+                    source = self.source(filename)
                     if source:
                         self.frames.add(source)
 
     def reads(self):
+        started = time.monotonic()
         paths = self.opened | self.frames
-        for name in set(sys.modules) - self.imported:
-            module = sys.modules.get(name)
-            path = source_name(getattr(module, "__file__", None), self.root)
-            if path:
-                paths.add(path)
+        if self.scoped:
+            pending = list(paths)
+            while pending:
+                for dependency in self.import_closure(pending.pop()):
+                    if dependency not in paths:
+                        paths.add(dependency)
+                        pending.append(dependency)
+        if self.scoped:
+            for name in ("runtime_patches.py", "compile_pool.py"):
+                runtime = "third_party/sparkinfer/b12x/_lib/" + name
+                if (self.root / runtime).is_file():
+                    paths.add(runtime)
+        if not self.scoped:
+            for name in set(sys.modules) - self.imported:
+                module = sys.modules.get(name)
+                path = self.source(getattr(module, "__file__", None))
+                if path:
+                    paths.add(path)
         active = self.active
         self.active = False
         try:
-            return {path: digest((self.root / path).read_bytes()) for path in sorted(paths)}
+            for path in paths - self.source_hashes.keys():
+                self.source_hashes[path] = digest((self.root / path).read_bytes())
+            return {path: self.source_hashes[path] for path in sorted(paths)}
         finally:
             self.active = active
+            self.overheads["reads_seconds"] += time.monotonic() - started
+            self.read_counts.append(len(paths))
 
     def patch(self, cls, method, replacement):
         original = getattr(cls, method)
@@ -467,14 +552,27 @@ class Recorder:
                     # Recipe locals/closures can change between capacities even
                     # when PY_START has already disabled this code object's event.
                     self._profile(frame, "call", None)
+                    if self.scoped and frame.f_code.co_name == "construct" and frame.f_code.co_filename == __file__:
+                        break
                     frame = frame.f_back
+                recipe_paths = (self.opened, self.frames)
+                if self.scoped:
+                    self.opened, self.frames = set(), set()
+                    sys.monitoring.restart_events()
+                started = time.monotonic()
                 result = original(dsl, *args, **kwargs)
+                elapsed = time.monotonic() - started
+                self.frontend_seconds += elapsed
                 module = result[0]
+                self.timings[id(module)] = {"stage0_seconds": elapsed}
                 # Do not normalize symbols or locations: both can carry semantics.
                 self.modules[id(module)] = {
                     "ir_kind": "original_mlir", "ir_sha256": digest(str(module).encode()),
                     "source_reads_sha256": self.reads(),
                 }
+                if self.scoped:
+                    self.opened.update(recipe_paths[0])
+                    self.frames.update(recipe_paths[1])
                 return result
             return wrapped
 
@@ -485,8 +583,12 @@ class Recorder:
                 if record is None:
                     record = {"ir_kind": "mlir", "ir_sha256": digest(str(module).encode()),
                               "source_reads_sha256": self.reads()}
+                started = time.monotonic()
                 result = (self.backend_cache.compile(dsl, original, module, args, kwargs, record["ir_sha256"])
                           if self.backend_cache is not None else original(dsl, module, *args, **kwargs))
+                elapsed = time.monotonic() - started
+                self.backend_seconds += elapsed
+                self.executor_timings[id(result)] = {**self.timings.pop(id(module), {}), "backend_seconds": elapsed}
                 self.executors[id(result)] = (weakref.ref(result), record)
                 if self.construction:
                     self.latest.append(record)
@@ -496,12 +598,17 @@ class Recorder:
         def exported(original):
             @functools.wraps(original)
             def wrapped(executor, file_path, file_name, function_prefix=""):
+                started = time.monotonic()
                 result = original(executor, file_path, file_name, function_prefix)
+                self.timings[file_name] = {**self.executor_timings.get(id(executor), {}),
+                                           "export_seconds": time.monotonic() - started}
                 found = self.executors.get(id(executor))
                 if found is None or found[0]() is not executor:
                     raise ValueError(f"{file_name}: export has no recorded compiler IR")
                 path = (Path(file_path) / (file_name + ".o")).relative_to(self.output).as_posix()
-                self.exports[path] = found[1]
+                self.exports[path] = json.loads(json.dumps(found[1]))
+                if self.scoped:
+                    self.exports[path]["source_reads_sha256"].update(self.reads())
                 self.exports[path]["export_prefix"] = function_prefix or file_name
                 return result
             return wrapped
@@ -512,6 +619,7 @@ class Recorder:
         return self
 
     def finish(self, inspector, context, plans):
+        started = time.monotonic()
         self.stop_monitoring()
         self.active = False
         for cls, method, original in reversed(self.restores):
@@ -543,7 +651,15 @@ class Recorder:
                                  "resources": resources, "abi_sha256": abi,
                                  "compile_key": stable_hash(key), "compile_inputs": key,
                                  "plan": plans.get(path.stem)}
+        self.validate_sources()
+        (self.output / "program-timings.json").write_text(json.dumps({
+            "stage0_seconds": self.frontend_seconds, "backend_seconds": self.backend_seconds,
+            "overheads": {**self.overheads, "finish_seconds": time.monotonic() - started},
+            "read_set_sizes": self.read_counts,
+            "programs": {key: value for key, value in self.timings.items() if isinstance(key, str)},
+        }, indent=2, sort_keys=True) + "\n")
         (self.output / "program-records.json").write_text(json.dumps(records, indent=2, sort_keys=True) + "\n")
+        self.frames.update(self.job_paths)
         return records
 
 

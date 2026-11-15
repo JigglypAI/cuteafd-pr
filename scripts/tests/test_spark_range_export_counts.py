@@ -57,6 +57,34 @@ def test_every_planner_width_covered_world_has_a_package_alias():
 
 
 
+def test_inkling_native_and_two_tier_exl3_profiles_cover_tp3_tp6():
+    packages = module('inkling_spark_package_coverage', ROOT / 'python/tools/lib/spark_packages.py')
+    assert pack.GEOMETRIES['inkling2'] == (4608, 2304, 384, 8)
+    assert pack.activation('inkling2') == 'situ'
+    assert pack.swiglu_limit('inkling2') is None
+    for kind in ['mxfp8', 'nvfp4', 'exl3']:
+        assert {3, 6} <= set(packages.package_worlds('inkling2', kind))
+        entry = packages.package_entry('inkling2', kind)
+        assert entry['basis'] == 'lower_bound'
+        assert entry['checkpoints'][0]['routed_expert_bytes'] > 0
+    profiles = pack.build_profiles('spark', 'inkling2')
+    for world in [3, 6]:
+        widths = {destination: width for _, width, _, _, _, destinations in profiles
+                  for destination in destinations if destination.startswith(f'tp{world}-rank')}
+        assert len(widths) == world and sum(widths.values()) == 2304
+    assert packages.geometry_worlds('inkling2_mxfp8') == packages.package_worlds('inkling2', 'mxfp8')
+    native = module('inkling_native_width_metadata', ROOT / 'python/tools/aot/package_fp8_moe_aot.py')
+    for world in range(2, 9):
+        widths = native.exact_widths(2304, world)
+        assert sum(widths) == 2304
+        assert packages.width_keys(2304, 128, world) == {(False, width) for width in widths}
+        first = 0
+        for width in widths:
+            assert first % 128 == width % 128 == 0
+            assert first % 32 == width % 32 == 0  # No K32 scale group straddles ranks.
+            first += width
+
+
 def test_minimax_native_nvfp4_worlds_cover_the_padded_vendor_slices():
     packages = module('minimax_spark_package_coverage', ROOT / 'python/tools/lib/spark_packages.py')
     assert packages.geometry_worlds('minimax_nvfp4a4') == list(range(2, 9))
@@ -71,7 +99,7 @@ def test_glmf_package_witness_is_the_live_mc_checkpoint():
     entries = json.loads((ROOT / 'scripts/build/spark-package-ranges.json').read_text())['entries']
     expected = {
         'model': 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC',
-        'revision': '91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d',
+        'revision': '558931fe149f59b49d19b2376a692bd7a12fb8b7',
         # Measured 42 layers, 288 experts, three K4 projections plus native auxiliaries.
         'routed_expert_bytes': 42 * 288 * 3 * (4096 * 2048 // 2 + 2 * (4096 + 2048) + 4),
     }

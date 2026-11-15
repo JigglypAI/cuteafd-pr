@@ -140,6 +140,73 @@ pub(crate) struct Exl3Worker<'a> {
     /// epilogue that replaces the weighted top-k sum for flagged requests.
     partial: Option<super::partial::PartialEpilogue<'a>>,
     reply_fused: Option<super::super::reply::Exl3Reply<'a>>,
+    /// The layer set and `<layout>/m8192-segments`, for a prefill owner's
+    /// merged-wave program (`prepare_waves`).
+    weights: Rc<Vec<Exl3Weights<'a>>>,
+    segments_directory: Option<std::path::PathBuf>,
+    /// Merged-wave staging and its row-addressed program (prefill owner only).
+    waves: Option<super::super::execution::waves::WaveStaging<'a>>,
+    segments: Option<Exl3Execution<'a>>,
+    /// Staged wire rows of every buffered unit (owner of `waves`' plane).
+    staged_plane: Option<DeviceAllocation<'a>>,
+    /// Per queued unit while waves are prepared: whether it publishes a
+    /// worker timing span (a merged wave records one span for all members).
+    timing_units: std::collections::VecDeque<bool>,
+}
+
+/// EXL3's pinned per-unit route staging as wave-staging route planes.
+struct Exl3Routes<'s, 'a> { staging: &'s [HostAllocation<'a>], weights_offset: usize, library: &'a NativeLibrary }
+impl<'a> super::super::execution::waves::UnitRoutes<'a> for Exl3Routes<'_, 'a> {
+    fn pack(&mut self, slot: usize, request: &BackboneRequest<'_>) -> Result<()> {
+        let routes = request.rows() as usize * cuteafd_core::expert_geometry().topk as usize;
+        ensure!(routes * 4 <= self.weights_offset, "EXL3 staged routes exceed capacity");
+        let base = self.staging.get(slot).context("EXL3 route staging slot")?.buffer.ptr.cast::<u8>();
+        // SAFETY: two disjoint typed planes inside the exclusively owned pinned slot.
+        unsafe {
+            request.copy_routes_into(std::slice::from_raw_parts_mut(base.cast::<i32>(), routes),
+                std::slice::from_raw_parts_mut(base.add(self.weights_offset).cast::<f32>(), routes))
+        }
+    }
+    unsafe fn upload(&self, slot: usize, count: usize, ids: CuteafdDeviceBuffer, weights: CuteafdDeviceBuffer,
+        stream: *mut std::ffi::c_void) -> Result<()> {
+        ensure!(count * 4 <= self.weights_offset, "EXL3 staged route upload exceeds the slot");
+        let staged = self.staging.get(slot).context("EXL3 route staging slot")?.buffer;
+        let ids_source = CuteafdHostBuffer { bytes: count * 4, ..staged };
+        // SAFETY: the weights plane starts inside the pinned slot.
+        let weight_source = CuteafdHostBuffer { ptr: unsafe { staged.ptr.cast::<u8>().add(self.weights_offset) }.cast(),
+            bytes: count * 4, ..staged };
+        // SAFETY: caller retains the slot and both destinations through the unit fence.
+        unsafe { self.library.copy_host_buffers_h2d_batch_async(&[ids, weights], &[ids_source, weight_source],
+            &[count * 4, count * 4], stream) }
+    }
+}
+
+/// Queue one EXL3 wave's expert math (no copies or fences): a lone member
+/// runs the ordinary program on its staged slice, a merged wave the
+/// row-addressed program.
+fn launch_exl3_wave<'a>(executions: &mut [Exl3Execution<'a>], segments: &mut Option<Exl3Execution<'a>>,
+    reduction: &Exl3ReductionPlan, row_policy: Exl3RowPolicy, stream: *mut std::ffi::c_void,
+    worker_timing: &Option<super::super::execution::timing::WorkerTiming<'a>>,
+    timing_units: &mut std::collections::VecDeque<bool>,
+    wave: &super::super::execution::waves::Wave<'_>) -> Result<()> {
+    // SAFETY: every member's slice and reply, the routes and tables stay
+    // retained through the member fences recorded after this launch.
+    unsafe {
+        if let Some(timing) = worker_timing { timing.record(0, stream)?; }
+        if wave.segmented {
+            segments.as_mut().context("EXL3 merged wave without its row-addressed program")?
+                .launch_layer_segments(wave.layer, [wave.input, wave.ids, wave.weights], wave.output, wave.rows, stream)?;
+        } else {
+            let required = row_policy.required_capacity(wave.rows);
+            let index = reduction.execution_index(wave.rows, required, executions.iter().map(|e| e.capacity()))?;
+            executions[index].launch_layer_into(wave.layer, [wave.input, wave.ids, wave.weights], wave.rows,
+                stream, wave.output)?;
+        }
+        if let Some(timing) = worker_timing { timing.record(1, stream)?; }
+    }
+    // One timing span per wave: its first member publishes it, the rest skip.
+    timing_units.extend((0..wave.members.len()).map(|index| index == 0));
+    Ok(())
 }
 
 impl<'a> Exl3Worker<'a> {
@@ -339,6 +406,12 @@ impl<'a> Exl3Worker<'a> {
             pending: super::super::execution::timing::PendingUnits::new(library, 1)?,
             partial: None,
             reply_fused: (epilogue == Exl3Epilogue::Sum).then(|| super::super::reply::Exl3Reply::load(library)).transpose()?,
+            segments_directory: Self::segments_directory(directory, epilogue),
+            weights,
+            waves: None,
+            segments: None,
+            staged_plane: None,
+            timing_units: Default::default(),
         })
     }
 
@@ -362,7 +435,8 @@ impl<'a> Exl3Worker<'a> {
     /// while later units remain queued on the same stream.
     pub(crate) fn complete(&mut self) -> Result<Option<super::super::execution::timing::UnitPace>> {
         let Some(((request_id, layer, rows, executor_id), pace)) = self.pending.pop()? else { return Ok(None) };
-        if let Some(timing) = &mut self.worker_timing {
+        let timed = self.timing_units.pop_front().unwrap_or(true);
+        if let Some(timing) = self.worker_timing.as_mut().filter(|_| timed) {
             // SAFETY: the unit's completed fence follows both timing records.
             unsafe { timing.publish(request_id, layer, rows, executor_id, "exl3")?; }
         }
@@ -373,8 +447,96 @@ impl<'a> Exl3Worker<'a> {
 
     pub(crate) fn synchronize(&self) -> Result<()> {
         // SAFETY: this owner retains its stream and every queued buffer.
-        unsafe { self.library.cuda_stream_synchronize(self.stream.raw)?; }
+        unsafe {
+            if let Some(waves) = &self.waves { self.library.cuda_stream_synchronize(waves.copy_stream())?; }
+            self.library.cuda_stream_synchronize(self.stream.raw)?;
+        }
         Ok(())
+    }
+
+    /// The layout's row-addressed merged-wave program, when its package ships
+    /// one (the weighted-sum epilogue only; partial replies never merge).
+    pub(crate) fn segments_directory(directory: &Path, epilogue: Exl3Epilogue) -> Option<std::path::PathBuf> {
+        (epilogue == Exl3Epilogue::Sum)
+            .then(|| directory.join(format!("m{}-segments", cuteafd_core::spark_executions::SEGMENT_MAX_ROWS)))
+            .filter(|path| path.join("v41_exl3.json").is_file())
+    }
+
+    /// Device bytes a prefill owner's merged waves add (planner and worker
+    /// share it): the row-addressed program's arena at the widest merged
+    /// wave, the staged wire slices of every buffered unit, and the address
+    /// and route tables. Zero when the package ships no segments program.
+    pub(crate) fn wave_bytes(segments: Option<&Path>, extent: cuteafd_core::OwnerExtent) -> Result<usize> {
+        let (Some(directory), Some(rows), Some(staged)) = (segments, extent.segment_rows(), extent.staged_rows())
+            else { return Ok(0) };
+        let geometry = Exl3Execution::segment_geometry(directory)?;
+        let arena = geometry.layout(rows).context("EXL3 merged rows exceed the segments program")?.1;
+        let tables = super::super::execution::waves::WaveStaging::table_bytes(extent, Self::topk())
+            .context("EXL3 wave table overflow")?;
+        Ok(usize::try_from(arena)? + staged as usize * Self::wire_row_bytes() + tables)
+    }
+
+    /// Allocate a prefill owner's merged-wave program and staging (after
+    /// `defer`); a decode owner, one buffered unit or a package without a
+    /// segments program keeps every unit a singleton.
+    pub(crate) fn prepare_waves(&mut self, extent: cuteafd_core::OwnerExtent) -> Result<()> {
+        let (Some(directory), Some(rows), Some(staged)) =
+            (self.segments_directory.clone(), extent.segment_rows(), extent.staged_rows()) else { return Ok(()) };
+        // SAFETY: the trusted package sits beside the worker's ordinary exports on this device.
+        let modules = unsafe { Exl3Modules::load(self.library, &directory, Exl3InputFormat::Fp8K32)? };
+        // SAFETY: this worker serializes the segments program on its own stream.
+        self.segments = Some(unsafe { Exl3Execution::with_segment_arena(self.library, self.weights.clone(),
+            modules, rows as usize)? });
+        let row = Self::wire_row_bytes();
+        let plane = DeviceAllocation::new(self.library, staged as usize * row,
+            crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/staged_units"))?;
+        // EXL3 has no recipe floor: any prefill unit may join a wave.
+        self.waves = super::super::execution::waves::WaveStaging::new(self.library, extent, plane.buffer, row, 1)?;
+        self.staged_plane = Some(plane);
+        self.timing_units = std::collections::VecDeque::with_capacity(extent.buffered_units as usize);
+        Ok(())
+    }
+
+    pub(crate) fn has_staged(&self) -> bool {
+        self.waves.as_ref().is_some_and(super::super::execution::waves::WaveStaging::has_staged)
+    }
+
+    pub(crate) fn cancel_staged(&mut self, input_address: usize) -> Result<bool> {
+        let Some(waves) = &mut self.waves else { return Ok(false) };
+        waves.cancel(&mut self.pending, input_address)
+    }
+
+    pub(crate) fn flush_staged(&mut self) -> Result<()> {
+        let Some(waves) = &mut self.waves else { return Ok(()) };
+        let routes = Exl3Routes { staging: &self.staging, weights_offset: self.weights_offset, library: self.library };
+        let (executions, segments, reduction, policy, timing, timing_units) = (&mut self.executions,
+            &mut self.segments, &self.reduction_plan, self.row_policy, &self.worker_timing, &mut self.timing_units);
+        let stream = self.stream.raw;
+        waves.flush(&mut self.pending, &routes, stream,
+            &mut |wave| launch_exl3_wave(executions, segments, reduction, policy, stream, timing, timing_units, wave))
+    }
+
+    /// Stage a mapped FP8 K32 prefill unit with a BF16 combined reply; other
+    /// replies run alone, counted by bypass reason.
+    fn stage(&mut self, request: &BackboneRequest<'_>, input: CuteafdDeviceBuffer, output: CuteafdDeviceBuffer,
+        executor_id: u64) -> Result<bool> {
+        use super::super::execution::waves::{Arrival, Bypass};
+        let Some(waves) = &mut self.waves else { return Ok(false) };
+        if request.partial_plan()?.is_some() { waves.bypass(request.rows(), Bypass::PartialReply); return Ok(false) }
+        if request.output_dtype() != ExpertV2Dtype::Bf16 {
+            waves.bypass(request.rows(), Bypass::CompressedReply);
+            return Ok(false)
+        }
+        if request.input_dtype() != ExpertV2Dtype::Fp8E4m3Ue8m0K32 {
+            waves.bypass(request.rows(), Bypass::Ingress);
+            return Ok(false)
+        }
+        let mut routes = Exl3Routes { staging: &self.staging, weights_offset: self.weights_offset, library: self.library };
+        let (executions, segments, reduction, policy, timing, timing_units) = (&mut self.executions,
+            &mut self.segments, &self.reduction_plan, self.row_policy, &self.worker_timing, &mut self.timing_units);
+        let stream = self.stream.raw;
+        waves.stage(Arrival { request, input, output, layer: self.layer, executor_id }, &mut self.pending,
+            &mut routes, stream, &mut |wave| launch_exl3_wave(executions, segments, reduction, policy, stream, timing, timing_units, wave))
     }
 
     /// Whether every request queued on this execution's stream has completed.
@@ -470,6 +632,13 @@ impl<'a> Exl3Worker<'a> {
             "EXL3 request exceeds capacity"
         );
         request.require_input_dtype(ExpertV2Dtype::Fp8E4m3Ue8m0K32 as u32)?;
+        if self.deferred {
+            if let (Some(input), Some(output)) = (hidden_view, destination) {
+                if self.stage(request, input, output, executor_id)? { return Ok(()) }
+            }
+        }
+        // A singleton queues behind any staged predecessor on this stream.
+        self.flush_staged()?;
         let bytes = request.plane_bytes()?;
         Self::validate_output_capacity(bytes, exchange.partials.len(), destination.map(|output| output.bytes))?;
         let started = self.timing.as_ref().map(|_| std::time::Instant::now());
@@ -601,6 +770,7 @@ impl<'a> Exl3Worker<'a> {
         if self.deferred && destination.is_some() {
             // SAFETY: all input copies, math and output writes precede this unit fence.
             unsafe { self.pending.record((request.request_id(), request.layer(), request.rows(), executor_id), self.stream.raw)?; }
+            if self.waves.is_some() { self.timing_units.push_back(true); }
             return Ok(());
         }
         match self.host_path {

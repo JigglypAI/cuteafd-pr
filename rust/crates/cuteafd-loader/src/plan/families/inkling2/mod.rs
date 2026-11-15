@@ -62,6 +62,7 @@ pub(super) struct Model {
     spec: ModelSpec,
     /// Logical weights by stem.
     contracts: BTreeMap<String, Contract>,
+    core: BTreeMap<String, crate::formats::trellis_core::CoreProjection>,
     /// Checkpoint bytes of every routed-expert tensor (headers only).
     pub(crate) routed_bytes: u64,
     /// Each routed layer's storage, from its own `w13` headers.
@@ -172,8 +173,20 @@ impl Model {
             .filter(|tensor| tensor.meta.name.contains(".mlp.experts."))
             .map(|tensor| tensor.meta.byte_length).sum();
         let expert_storage = (0..cfg.layers).map(|layer| expert_storage(checkpoint, layer)).collect::<Result<Vec<_>>>()?;
+        let expected = contracts.iter().filter(|(_, contract)| contract.shape.len() == 2
+            && matches!(contract.storage, Storage::Bf16)).map(|(stem, contract)|
+                (format!("{stem}.weight"), contract.shape.clone())).collect();
+        let core = crate::formats::trellis_core::read_projections(checkpoint, &expected,
+            |name| name.starts_with(TEXT) && !name.contains(".experts."),
+            |stem| {
+                let selected = stem == "model.llm.unembed" || ["wq_du", "wr_du", "wk_dv", "wv_dv", "gate_attn", "wo_ud"]
+                    .iter().any(|name| stem.ends_with(&format!(".attn.{name}")));
+                selected.then_some(crate::formats::trellis_core::CoreContract { family: "Inkling 2", widths: &[6, 8],
+                    split: crate::formats::trellis_core::CoreSplit::Whole,
+                    padded_outputs: stem == "model.llm.unembed", view_varying: true })
+            })?;
         let model = Self { spec: spec(&cfg, vision.is_some(), mtp.as_ref(), &expert_storage, checkpoint), cfg, contracts,
-            routed_bytes, expert_storage };
+            core, routed_bytes, expert_storage };
         // Open is structural: every contract member must be present by name, so
         // a missing tensor is a typed open error that names it. Exact dtype and
         // shape agreement and unknown tensors are `accepts` verdicts, reported
@@ -183,6 +196,7 @@ impl Model {
             // The bundled tower is optional: a text-only role (or a text-only
             // publication) omits every `model.visual.*` tensor together.
             if contract.role.component == Component::Vision && !tower_present { continue; }
+            if model.core.contains_key(stem) { continue; }
             match contract.storage {
                 Storage::Experts => {
                     let layer = contract.role.layer.expect("routed experts are per layer");
@@ -380,9 +394,9 @@ impl Family for Inkling2 {
     fn optional(&self, component: Component) -> bool {
         matches!(component, Component::Vision | Component::Speculator)
     }
-    /// The shared expert catalog gains fused `w13`/`w2` readers with the Spark
-    /// packages (stage 3); the stage-1 planner reads expert headers directly.
-    fn expert_catalog(&self) -> bool { false }
+    /// Native fused and EXL3 operands use the shared catalog; this capability
+    /// validates storage and package selection, not serving qualification.
+    fn expert_catalog(&self) -> bool { true }
 }
 
 impl FamilyModel for Model {
@@ -391,6 +405,12 @@ impl FamilyModel for Model {
     }
     fn spec(&self) -> &ModelSpec { &self.spec }
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
+        if let Some(projection) = self.core.get(stem) {
+            return super::require(operand.exl3_bits() == Some(projection.bits)
+                && operand.logical == [projection.stored_outputs, projection.shape[1]],
+                || format!("{stem}: expected selected header-native K{} [{},{}]", projection.bits,
+                    projection.stored_outputs, projection.shape[1]));
+        }
         // Per-expert EXL3 modules carry the expert id in their stem; the
         // contract is keyed by the fused per-layer stem.
         let (lookup, exl3_expert) = match role.expert {
@@ -448,7 +468,7 @@ impl FamilyModel for Model {
         } else if operand.is_inkling_nvfp4() {
             ("inkling2:nvfp4a4", 16)
         } else if operand.exl3_bits().is_some_and(|bits| bits == 4) {
-            ("inkling2:exl3-k4", 128)
+            ("inkling2:exl3-k45", 128)
         } else { return None; };
         Some(ExpertContract {
             package: package.into(), block,

@@ -338,11 +338,18 @@ impl<'a> UnitOwner<'a> {
     pub fn prefix_scratch(&self) -> Rc<Allocation<'a>> { Rc::clone(&self.planes["residual"]) }
     pub fn plane(&self, name: &str) -> Result<Buffer> { Ok(self.owner(name)?.buffer) }
     pub(crate) fn routed_rows(&self, rows: usize) -> Result<super::experts::RoutedRows<'a>> {
+        self.routed_rows_for(rows, false)
+    }
+    /// `nvfp4_wire`: the exact NVFP4 Spark ingress quantizes into this unit's
+    /// gate plane, which only the shared FFN (ordered after the staged copy)
+    /// writes. No additional owner: rows * 3472 B fits every gate plane.
+    pub(crate) fn routed_rows_for(&self, rows: usize, nvfp4_wire: bool) -> Result<super::experts::RoutedRows<'a>> {
         ensure!(rows <= self.rows as usize, "MiniMax routed rows exceed unit");
         let retained = |name| self.planes.get(name).cloned().with_context(|| format!("MiniMax rank has no {name} role"));
-        super::experts::RoutedRows::new(self.dense.activation.clone(), retained("route_ids")?,
+        let source = super::experts::RoutedRows::new(self.dense.activation.clone(), retained("route_ids")?,
             retained("route_weights")?, retained("routed")?, self.stream.clone(),
-            self.routed_boundary.clone(), rows)
+            self.routed_boundary.clone(), rows)?;
+        if nvfp4_wire { source.with_wire(retained("gate")?) } else { Ok(source) }
     }
     pub fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
         self.dense.inventory(inventory, &format!("{prefix}.dense"))?;

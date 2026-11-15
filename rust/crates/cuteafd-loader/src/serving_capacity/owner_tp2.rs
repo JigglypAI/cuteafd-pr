@@ -3,7 +3,8 @@ use crate::placement::Demand;
 use cuteafd_core::memory_layout::{Basis, Category};
 
 /// Exact TP2 row ABI shared by admission and the owner executor. EXL3 sends
-/// E4M3/K32 wire rows and produces FP32 partials; native packages use BF16.
+/// E4M3/K32 wire rows and produces FP32 partials; other native packages can
+/// independently select BF16 input or BF16 partials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OwnerTp2Rows {
     pub input: u64,
@@ -15,8 +16,45 @@ pub struct OwnerTp2Rows {
     pub exchange_slot_bytes: u64,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn independent_partial_precision_preserves_legacy_plans() -> anyhow::Result<()> {
+        for hidden in [32u64, 2560, 4096, 4608, 6144, 7168] {
+            for topk in [1u64, 4, 8, 10] {
+                for rows in [1u64, 16, 64, 80, 2048, 2752, 4096] {
+                    for wire in [false, true] {
+                        let legacy = OwnerTp2Rows::new(hidden, topk, rows, wire)?;
+                        assert_eq!(legacy, OwnerTp2Rows::with_partial(hidden, topk, rows, wire,
+                            if wire { 4 } else { 2 })?);
+                        let native = OwnerTp2Rows::with_partial(hidden, topk, rows, wire, 2)?;
+                        assert_eq!((native.input, native.ids, native.weights, native.bytes),
+                            (legacy.input, legacy.ids, legacy.weights, legacy.bytes));
+                        assert_eq!(native.partial_bytes, rows * hidden * 2);
+                        assert_eq!(native.reduction_bytes, legacy.reduction_bytes);
+                        assert!(native.exchange_slot_bytes >= native.bytes.max(native.partial_bytes));
+                    }
+                }
+            }
+        }
+        for bytes in [0, 1, 3, 8, u64::MAX] {
+            assert!(OwnerTp2Rows::with_partial(4608, 8, 64, true, bytes).is_err());
+        }
+        Ok(())
+    }
+}
+
 impl OwnerTp2Rows {
     pub fn new(hidden: u64, topk: u64, rows: u64, wire: bool) -> anyhow::Result<Self> {
+        Self::with_partial(hidden, topk, rows, wire, if wire { 4 } else { 2 })
+    }
+
+    /// Native input encoding and output partial precision are independent.
+    /// The legacy constructor retains every existing family's exact layout.
+    pub fn with_partial(hidden: u64, topk: u64, rows: u64, wire: bool, partial_bytes: u64) -> anyhow::Result<Self> {
+        anyhow::ensure!(matches!(partial_bytes, 2 | 4), "owner TP2 partial must be BF16 or F32");
         anyhow::ensure!(hidden > 0 && topk > 0 && rows > 0 && (!wire || hidden % 32 == 0),
             "invalid owner TP2 row geometry");
         let overflow = || anyhow::anyhow!("owner TP2 row extent overflow");
@@ -29,7 +67,7 @@ impl OwnerTp2Rows {
         let route_bytes = align(mul(mul(rows, topk)?, 4)?)?;
         let weights = ids.checked_add(route_bytes).ok_or_else(overflow)?;
         let bytes = weights.checked_add(route_bytes).ok_or_else(overflow)?;
-        let partial_bytes = mul(mul(rows, hidden)?, if wire { 4 } else { 2 })?;
+        let partial_bytes = mul(mul(rows, hidden)?, partial_bytes)?;
         Ok(Self { input, ids, weights, bytes, partial_bytes,
             reduction_bytes: mul(mul(rows, hidden)?, 2)?,
             exchange_slot_bytes: align(bytes.max(partial_bytes))? })

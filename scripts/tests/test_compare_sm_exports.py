@@ -123,17 +123,23 @@ def test_native_attention_groups_cover_checkpoint_shapes_and_f32_partials():
     programs = exporter.native_attention_programs()
     muse_core = {(4096,8192),(1024,8192),(512,8192),(2048,8192),(8192,2048)}
     expected = {f"n{n}_k{k}_m{rows}{suffix}"
-                for n,k in set().union(*shapes.values()) | muse_core for rows in (64,4096)
-                for suffix in (("", "_f32") if (n,k) in exporter.native_attention_f32_shapes() | {(8192,2048)} else ("",))}
-    expected.add("n202112_k8192_m64_f32")
-    assert "n202112_k8192_m4096_f32" not in expected, "head is microbatched at64rows"
+                for n,k in set().union(*shapes.values(), *exporter.mc_fp8_core_shapes().values()) | muse_core for rows in (64,4096)
+                for suffix in (("", "_f32") if (n,k) in exporter.native_attention_f32_shapes() | exporter.mc_fp8_f32_shapes() | {(8192,2048)} else ("",))}
+    assert exporter.native_fp8_head_shapes() == {(202112,8192),(154880,6144),(128896,4096)}
+    for n,k in exporter.native_fp8_head_shapes():
+        expected.add(f"n{n}_k{k}_m64_f32")
+        assert f"n{n}_k{k}_m4096_f32" not in expected, "head is microbatched at64rows"
+    assert exporter.mc_fp8_core_shapes()["glm"] >= {(640,6144),(1024,6144),(6144,1024),(6144,2048)}
+    assert exporter.mc_fp8_core_shapes()["step5"] >= {(384,4096),(768,4096),(4096,8192),(4096,13824)}
+    assert exporter.mc_fp8_f32_shapes() == {(6144,1024),(6144,2048)}
     assert len(programs) == len(expected) and {p[0] for p in programs} == expected
     jobs = {job[0]: job[1:] for job in compare_sm.jobs("all")}
     assert jobs["native-attention-fp8"] == ("export_b12x_dsv4_aot.py",
         ["--geometry", "native_attention", "--only", ",".join(p[0] for p in programs)])
     stems = {f"k{k}_n{n}" for family, family_shapes in shapes.items() if family != "ml4"
              for n,k in family_shapes}
-    stems |= {"k6144_n512", "k6144_n576", "k8192_n512", "k8192_n1024", "k8192_n4096", "k8192_n2048"}
+    stems |= {"k6144_n512", "k6144_n576", "k8192_n512", "k8192_n1024", "k8192_n4096", "k8192_n2048",
+              "k1024_n6144", "k6144_n6144", "k6144_n12288"}
     assert exporter.native_attention_bf16_shapes() == {
         (int(stem.split("_")[0][1:]), int(stem.split("_")[1][1:])) for stem in stems}
     assert all("native-core" in exporter.draft_bf16_shapes()[shape]
@@ -155,6 +161,7 @@ def test_native_attention_groups_cover_checkpoint_shapes_and_f32_partials():
     native_bf16 = {(k,n) for family, family_shapes in shapes.items() if family != "ml4"
                    for n,k in family_shapes}
     native_bf16.update((6144, n) for n in (512, 576))
+    native_bf16.update(((1024,6144),(6144,6144),(6144,12288)))
     native_bf16.update((8192, n) for n in (512, 1024, 2048, 4096))
     assert native_bf16 <= namespace["shapes"]().keys()
     assert namespace["F32_SHAPES"] == {(k,n) for n,k in exporter.native_attention_bf16_f32_shapes()}
@@ -1002,14 +1009,17 @@ def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compac
     build_root.mkdir()
     _, _, calls, _ = fixture.PackageProfileTests().build_fixture(
         build_root, role, bits, geometry=geometry,
-        capacities=capacities, compact=compact,
+        capacities=capacities, compact=compact, segments=True,
         profiles=() if compact else tuple(p[0] for p in package.profiles_for_role(role, geometry)))
     expected = [(call.args[1], call.args[3], call.kwargs) for call in calls
                 if bool(call.kwargs.get("compact_weights")) == compact]
     recorded = []
     monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
-    monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
-        export=lambda *values, **options: recorded.append((values, options))))
+    def record_export(*values, row_addresses=False, **options):
+        if row_addresses:
+            options['row_addresses'] = True
+        recorded.append((values, options))
+    monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(export=record_export))
     args = ["--geometry", geometry, "--bits", ",".join(map(str, bits)), "--role", role,
             "--capacities", ",".join(map(str, capacities))]
     if compact:
@@ -1031,6 +1041,46 @@ def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compac
         assert any(options.get("decode_schedule") == package.PURE_EVICT_FIRST for _, options in recorded)
     else:
         assert any(options.get("warp_specialized") for _, options in recorded)
+
+
+def test_spark_exl3_groups_include_only_glm_and_glmf_tier_families():
+    jobs = compare_sm.jobs('all')
+    ordinary = [(name, exporter, args) for name, exporter, args in jobs
+                if exporter == 'package_exl3_aot.py' and not name.startswith('exl3-compact-')
+                and not name.endswith('-spark')]
+    for name, exporter, args in ordinary:
+        expected = (name + '-spark', exporter, [*args, '--role', 'spark', '--source-package-layouts'])
+        assert (expected in jobs) == (args[args.index('--geometry') + 1] in ('glm', 'glmf'))
+
+
+@pytest.mark.parametrize('supports_segments', [False, True])
+def test_exl3_spark_segments_match_packager_and_keep_baseline_api(tmp_path, monkeypatch, supports_segments):
+    spec = importlib.util.spec_from_file_location('package_exl3_aot', ROOT / 'python/tools/aot/package_exl3_aot.py')
+    package = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(package)
+    monkeypatch.setitem(sys.modules, 'package_exl3_aot', package)
+    calls = []
+    if supports_segments:
+        def export(*args, row_addresses=False, **kwargs):
+            calls.append((args, dict(kwargs, row_addresses=row_addresses)))
+    else:
+        def export(*args, **kwargs):
+            assert 'row_addresses' not in kwargs
+            calls.append((args, kwargs))
+    monkeypatch.setitem(sys.modules, 'export_b12x_exl3_aot', SimpleNamespace(export=export))
+    monkeypatch.setattr(compare_sm, 'recorded_construction', lambda function, *args, **kwargs: function(*args, **kwargs))
+    compare_sm._export_exl3(['--geometry', 'glm', '--capacities', '80,2752', '--bits', '4,5',
+                            '--role', 'spark', '--source-package-layouts'], tmp_path)
+    profiles = package.build_profiles('spark', 'glm')
+    segments = [(args, options) for args, options in calls if args[0].name.endswith('-segments')]
+    assert len(segments) == (len(profiles) if supports_segments else 0)
+    assert len(calls) == len(profiles) * (3 if supports_segments else 2)
+    for args, options in segments:
+        assert args[3] == 8192 and args[7] == 'bf16'
+        assert options == dict(package.segment_export_options('glm', 'spark', args[1]), compile_only=True,
+                               row_addresses=True)
+    assert all('row_addresses' not in options or options['row_addresses'] is False
+               for args, options in calls if not args[0].name.endswith('-segments'))
 
 
 def test_exl3_routes_gate_covers_all_coordinator_route_blocks(tmp_path, monkeypatch):
@@ -1361,6 +1411,42 @@ def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, mon
     assert records[0]["scratch_bytes"] == (128 if indirect else 64)
 
 
+@pytest.mark.parametrize("weights,input_format,expected_segments", [
+    ("fp8", "wire", 3), ("mxfp4", "wire", 3), ("fp8", "bf16", 0), ("nvfp4", "bf16", 0)])
+def test_spark_baseline_package_without_segmented_forms_keeps_its_own_segment_set(
+        tmp_path, monkeypatch, weights, input_format, expected_segments):
+    """A --baseline-source package and fork that predate per-format segment
+    programs (no `segmented_forms`, no `nvfp4_a4_fused`) still compare: the
+    baseline exports its own FP8/MXFP4 wire segments at its own bound."""
+    from contextlib import nullcontext
+
+    geometry = SimpleNamespace(weights=weights, hidden=4096, slice=2048, experts=256, top_k=8, intermediate=2048,
+        activation="silu_bf16_product", projection="bf16", swiglu_limit=0.0)
+    calls = []
+
+    def compile_program(g, *, route, max_rows, wire, prefill, row_addresses=False):
+        calls.append((max_rows, prefill, row_addresses))
+        return SimpleNamespace(export_to_c=lambda *args: None)
+
+    module = SimpleNamespace(GEOMETRIES={"mimo": geometry}, compile_fp8_moe_aot=compile_program,
+        fp8_moe_scratch_bytes=lambda *args: 64, fp8_moe_segment_scratch_bytes=lambda *args: 128,
+        prefill_forms=lambda *args: [])
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(
+        exportable_compilation=nullcontext, validate_exported_header=lambda *args: {"argument_count": 13}))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.fp8_moe", module)
+    monkeypatch.setitem(sys.modules, "package_fp8_moe_aot", SimpleNamespace(
+        __file__=str(tmp_path / "baseline-package.py"), FORMS=("auto", "w8a16", "w8a8"),
+        layout_geometry=lambda base, layout: (1, base), POINTERS=11, SEGMENT_MAX_ROWS=16384,
+        ABI_VERSION=6, activation_params=lambda *args: (1.0, 0.0),
+        input_kind=lambda role, weights, requested: requested or ("wire" if role == "spark" else "bf16")))
+    (tmp_path / "baseline-package.py").write_text("# baseline without per-format segment programs\n")
+    compare_sm.export_routed(["--geometry", "mimo", "--role", "spark", "--input", input_format,
+                              "--capacities", "2752"], tmp_path)
+    segments = [call for call in calls if call[2]]
+    assert len(segments) == expected_segments
+    assert all(max_rows == 16384 for max_rows, _, _ in segments), "baseline segments keep the baseline bound"
+
+
 @pytest.mark.parametrize("role", ["spark", "coordinator"])
 @pytest.mark.parametrize("weights", ["nvfp4", "fp8", "mxfp4", "bf16"])
 @pytest.mark.parametrize("build_kind", ["development", "release"])
@@ -1394,8 +1480,8 @@ def test_spark_routed_object_set_matches_production_including_core(tmp_path, mon
         return SimpleNamespace(export_to_c=lambda *args: None)
     forms = lambda g, rows, wire: ["w8a16"] if rows > 16 else []
     module = SimpleNamespace(GEOMETRIES={"mimo": geometry}, compile_fp8_moe_aot=compile_program,
-        fp8_moe_scratch_bytes=lambda *args: 64, fp8_moe_segment_scratch_bytes=lambda *args: 128,
-        prefill_forms=forms)
+        fp8_moe_scratch_bytes=lambda *args: 64, fp8_moe_segment_scratch_bytes=lambda *args, **kwargs: 128,
+        prefill_forms=forms, nvfp4_a4_fused=lambda: True)
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(
         exportable_compilation=nullcontext, validate_exported_header=lambda *args: {"argument_count": 13}))
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.fp8_moe", module)
@@ -1423,6 +1509,7 @@ def test_spark_routed_object_set_matches_production_including_core(tmp_path, mon
     end = next(i for i, n in enumerate(loop.body) if isinstance(n, ast.For)
                and isinstance(n.target, ast.Tuple) and len(n.target.elts) == 4)
     env = {**vars(package), "capacities": [16, 4096], "prefill_forms": forms, "g": geometry, "wire": wire,
+           "nvfp4_a4_fused": lambda: True,
            "args": SimpleNamespace(role="spark")}
     exec(compile(ast.Module(body=loop.body[begin:end], type_ignores=[]), "production_recipes", "exec"), env)
     expected = {(rows, form, segmented, core) for rows, form, segmented, core in env["exports"]}

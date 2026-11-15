@@ -2336,10 +2336,10 @@ impl VerbsHostProtocolV2PersistentClientSession {
         let expected_response_wire_bytes = shape.response_wire_bytes;
         let (request_wire_bytes, expected_response_wire_bytes) = match capacity {
             Some(rows) => {
-                let ingress = if shape.hidden_dtype == ExpertV2Dtype::Bf16 {
-                    cuteafd_core::SparkIngress::Bf16
-                } else {
-                    cuteafd_core::SparkIngress::Fp8K32
+                let ingress = match shape.hidden_dtype {
+                    ExpertV2Dtype::Bf16 => cuteafd_core::SparkIngress::Bf16,
+                    ExpertV2Dtype::Nvfp4E2m1E4m3K16Amax => cuteafd_core::SparkIngress::Nvfp4,
+                    _ => cuteafd_core::SparkIngress::Fp8K32,
                 };
                 let (max_request, max_response) = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows, ingress, partial_reply_bytes: None }
                     .wire_bytes(cuteafd_core::expert_geometry()).context("invalid expert endpoint wire geometry")?;

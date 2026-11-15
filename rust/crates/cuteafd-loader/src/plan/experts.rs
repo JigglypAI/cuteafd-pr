@@ -216,7 +216,7 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     if !(exl3 || nvfp4 || mxfp4 || fp8 || bf16 || mxfp8) {
         return Err(SparkRecipeRefusal::UnknownPackage(package.into()));
     }
-    let block = if nvfp4 { 16 } else if mxfp8 { 32 } else if native && mxfp4 {
+    let block = if nvfp4 { 16 } else if mxfp8 { 128 } else if native && mxfp4 {
         cuteafd_core::mxfp4_layouts::ownership_unit(intermediate, world)
     } else if mxfp4 { 32 } else { 128 };
     if !(1..=8).contains(&world) || intermediate == 0 || intermediate % block != 0 || intermediate / block < world {

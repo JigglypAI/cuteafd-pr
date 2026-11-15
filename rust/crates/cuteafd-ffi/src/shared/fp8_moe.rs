@@ -76,6 +76,9 @@ pub struct Fp8MoeInfo {
     pub tp: usize,
     /// Input rows are FP8 K32 wire rows (Spark) rather than BF16 (coordinator).
     pub wire_input: bool,
+    /// Input rows are the exact pre-quantized NVFP4 W4A4 activation
+    /// (`cuteafd_core::nvfp4_wire_row_bytes`), never BF16 or FP8 K32.
+    pub nvfp4_input: bool,
     pub swiglu_limit: f32,
     pub swiglu_alpha: f32,
     pub swiglu_beta: f32,
@@ -97,7 +100,7 @@ impl Fp8MoeInfo {
             && matches!(activation, 1 | 2 | 3 | 4) && !(format == 2 && activation != 1)
             && (activation != 3 || matches!(format, 4 | 8))
             && (matches!(format, 6 | 7) == (activation == 4)) && projection == 1
-            && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
+            && matches!(words[7], 1 | 7 | 8) && (1..=6).contains(&count),
             "unsupported FP8 expert package ABI {words:?}");
         let info = Self {
             hidden: words[1] as usize,
@@ -107,6 +110,7 @@ impl Fp8MoeInfo {
             intermediate: words[5] as usize,
             tp: words[6] as usize,
             wire_input: words[7] == 7,
+            nvfp4_input: words[7] == 8,
             swiglu_limit: f32::from_bits(words[8]),
             swiglu_alpha: f32::from_bits(words[16]),
             swiglu_beta: f32::from_bits(words[17]),
@@ -145,7 +149,8 @@ impl Fp8MoeInfo {
             && info.capacities[0] > 0 && info.capacities.iter().all(|&c| c <= i32::MAX as usize)
             && info.capacities.windows(2).all(|w| w[0] < w[1])
             && (!matches!(info.weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4 | Fp8MoeWeights::Nvfp4Dynamic) || !info.wire_input)
-            && (info.weights != Fp8MoeWeights::Mxfp8 || info.wire_input),
+            && (info.weights != Fp8MoeWeights::Mxfp8 || info.wire_input)
+            && (!info.nvfp4_input || matches!(info.weights, Fp8MoeWeights::Nvfp4 | Fp8MoeWeights::Nvfp4Dynamic)),
             "inconsistent FP8 expert package info {info:?}");
         ensure!(info.swiglu_alpha.is_finite() && info.swiglu_beta.is_finite()
             && if info.activation == Fp8MoeActivation::SwigluOai {
@@ -188,6 +193,12 @@ impl Fp8MoeInfo {
     /// Wire row bytes: hidden E4M3 values then hidden/32 UE8M0 scales.
     pub fn wire_row_bytes(&self) -> usize {
         self.hidden + self.hidden / 32
+    }
+
+    /// Bytes of one input row this package's programs read.
+    pub fn input_row_bytes(&self) -> usize {
+        if self.nvfp4_input { cuteafd_core::nvfp4_wire_row_bytes(self.hidden) }
+        else if self.wire_input { self.wire_row_bytes() } else { self.hidden * 2 }
     }
 
     /// Smallest compiled capacity that holds `rows`.
@@ -300,10 +311,21 @@ pub struct Fp8MoeSegment {
     pub act_row_bytes: u32,
 }
 
+impl Fp8MoeInfo {
+    /// The streamed arithmetic of this package's row-addressed programs.
+    pub fn segment_arithmetic(&self, act_row_bytes: u32) -> Result<cuteafd_core::spark_executions::SegmentArithmetic> {
+        use cuteafd_core::spark_executions::SegmentArithmetic;
+        Ok(match self.weights {
+            Fp8MoeWeights::Nvfp4 => SegmentArithmetic::Nvfp4A4 { slice: self.slice.try_into()? },
+            _ => SegmentArithmetic::Stream { act_row_bytes },
+        })
+    }
+}
+
 fn segment_scratch(info: &Fp8MoeInfo, segments: &[Fp8MoeSegment], rows: u32) -> Result<usize> {
     segments.iter().map(|segment| {
         cuteafd_core::spark_executions::segment_scratch_bytes(info.hidden.try_into()?, info.experts.try_into()?,
-            info.topk.try_into()?, segment.act_row_bytes, rows, segment.maximum_rows)
+            info.topk.try_into()?, info.segment_arithmetic(segment.act_row_bytes)?, rows, segment.maximum_rows)
             .context("invalid segmented scratch extent").and_then(|bytes| Ok(usize::try_from(bytes)?))
     }).collect::<Result<Vec<_>>>()?.into_iter().max().context("package has no segmented stream")
 }
@@ -330,6 +352,13 @@ pub fn fp8_slot_io_bytes(hidden: usize, topk: usize, wire_input: bool, bf16_sibl
         "invalid native slot I/O geometry");
     let input = if !wire_input || bf16_sibling { hidden.checked_mul(2) }
         else { hidden.checked_add(hidden / 32) }.context("native slot input overflow")?;
+    fp8_slot_io_bytes_for_input(hidden, topk, input, capacity)
+}
+
+/// [`fp8_slot_io_bytes`] for an explicit `input` row size (any ingress).
+pub fn fp8_slot_io_bytes_for_input(hidden: usize, topk: usize, input: usize, capacity: usize) -> Result<usize> {
+    ensure!(hidden > 0 && hidden % 32 == 0 && topk > 0 && capacity > 0 && input > 0,
+        "invalid native slot I/O geometry");
     input.checked_add(topk.checked_mul(8).context("native slot routes overflow")?)
         .and_then(|bytes| hidden.checked_mul(2).and_then(|out| bytes.checked_add(out)))
         .and_then(|bytes| bytes.checked_mul(capacity)).context("native slot I/O size overflow")
@@ -382,15 +411,21 @@ impl Fp8MoeMetadata {
             ensure!(unsafe { segment_info(form.option(), &mut maximum, &mut minimum, &mut act_row_bytes) } == 0,
                 "FP8 segment info query failed");
             if maximum == 0 { continue; }
-            ensure!(metadata.info.wire_input && matches!(metadata.info.weights, Fp8MoeWeights::Fp8 | Fp8MoeWeights::Mxfp4 | Fp8MoeWeights::Mxfp8)
-                && maximum == cuteafd_core::spark_executions::SEGMENT_MAX_ROWS
+            // Wire FP8/MXFP4/MXFP8 streams, or calibrated NVFP4 W4A4 over BF16 rows.
+            let stream = match metadata.info.weights {
+                Fp8MoeWeights::Fp8 | Fp8MoeWeights::Mxfp4 | Fp8MoeWeights::Mxfp8 => metadata.info.wire_input,
+                Fp8MoeWeights::Nvfp4 => !metadata.info.wire_input,
+                // Dynamic (Inkling) NVFP4 has no row-addressed program yet.
+                Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4Dynamic => false,
+            };
+            ensure!(stream && maximum == cuteafd_core::spark_executions::SEGMENT_MAX_ROWS
                 && minimum > 0 && minimum <= 4096 && act_row_bytes > 0,
                 "invalid segmented stream metadata");
             metadata.segments.push(Fp8MoeSegment { form, maximum_rows: maximum, minimum_rows: minimum, act_row_bytes });
         }
         if !metadata.segments.is_empty() {
             ensure!(metadata.segments.len() == 3, "segmented package must describe every arithmetic form");
-            for rows in [1u32, 4096, 8256, cuteafd_core::spark_executions::SEGMENT_MAX_ROWS] {
+            for rows in [1u32, 4096, 5504, cuteafd_core::spark_executions::SEGMENT_MAX_ROWS] {
                 let mut bytes = 0u64;
                 // SAFETY: the static query writes one live u64; no allocation or CUDA work.
                 ensure!(unsafe { segment_bytes(rows, &mut bytes) } == 0,

@@ -239,6 +239,7 @@ mod load_order_tests {
                     tensors.extend(match format {
                         ExpertFormat::Fp8Block128 => fixture::fp8(&name, n, k, None),
                         ExpertFormat::Mxfp4 => fixture::mxfp4(&name, n, k),
+                        ExpertFormat::Mxfp8 => fixture::mxfp8(&name, n, k),
                         ExpertFormat::Nvfp4 => fixture::nvfp4(&name, n, k),
                         ExpertFormat::Bf16 => vec![fixture::t(format!("{name}.weight"), "BF16", &[n, k])],
                     });

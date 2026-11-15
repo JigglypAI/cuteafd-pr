@@ -426,6 +426,8 @@ for wip_family in "${wip_fp8_list[@]}"; do
       wip_packages+=("${wip_package}-bf16")
   fi
   [[ "$wip_family" == *:nvfp4 && "$wip_family" != step5:nvfp4 ]] && wip_packages+=("${wip_package}a4")
+  # Exact NVFP4 wire input sibling (fp8_moe.cmake): Spark ranks of MiniMax.
+  [[ "$role" == expert && "$wip_family" == minimax:nvfp4a4 ]] && wip_packages+=("${wip_package}-nvfp4w")
   # Local Qwen NVFP4 keeps its MTP experts in FP8: CMake builds the TP1 FP8 sibling on the
   # coordinator (fp8_moe.cmake); stage it as release images do.
   [[ "$role" == coordinator && "$wip_family" == qwen4:nvfp4* ]] && wip_packages+=("fp8-qwen4")
@@ -434,6 +436,7 @@ for wip_family in "${wip_fp8_list[@]}"; do
     cp -a "$build_dir/native/fp8/$wip_package" "$output_dir/fp8/$wip_package"
     fp8_input_args=()
     [[ "$wip_package" != *-bf16 ]] || fp8_input_args=(--input bf16)
+    [[ "$wip_package" != *-nvfp4w ]] || fp8_input_args=(--input nvfp4)
     python3 "$source_dir/python/tools/aot/package_fp8_moe_aot.py" verify \
       --package "$output_dir/fp8/$wip_package" --sparkinfer-revision "$fp8_revision" --role "$role" "${fp8_input_args[@]}"
   done

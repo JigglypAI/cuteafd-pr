@@ -21,10 +21,9 @@ impl Tp2Rows {
     fn new(hidden: usize, topk: usize, rows: usize, wire: bool,
         partial: crate::shared::experts::rtx::PartialDtype) -> Result<Self> {
         use crate::shared::experts::rtx::PartialDtype;
-        ensure!(matches!((wire, partial), (true, PartialDtype::F32) | (false, PartialDtype::Bf16)),
-            "owner TP2 wire and partial ABI disagree");
-        let layout = cuteafd_loader::serving_capacity::OwnerTp2Rows::new(
-            hidden as u64, topk as u64, rows as u64, wire)?;
+        let element_bytes = match partial { PartialDtype::F32 => 4, PartialDtype::Bf16 => 2 };
+        let layout = cuteafd_loader::serving_capacity::OwnerTp2Rows::with_partial(
+            hidden as u64, topk as u64, rows as u64, wire, element_bytes)?;
         Ok(Self { input: usize::try_from(layout.input)?, ids: usize::try_from(layout.ids)?,
             weights: usize::try_from(layout.weights)?, bytes: usize::try_from(layout.bytes)?,
             partial_bytes: usize::try_from(layout.partial_bytes)?,
@@ -318,8 +317,12 @@ mod tests {
         }
         assert!(Tp2Rows::new(usize::MAX, 10, 64, false, PartialDtype::F32).is_err());
         assert!(Tp2Rows::new(2561, 10, 64, true, PartialDtype::F32).is_err());
-        assert!(Tp2Rows::new(2560, 10, 64, false, PartialDtype::F32).is_err());
-        assert!(Tp2Rows::new(2560, 10, 64, true, PartialDtype::Bf16).is_err());
+        for (wire, partial, element) in [(false, PartialDtype::F32, 4), (true, PartialDtype::Bf16, 2)] {
+            let actual = Tp2Rows::new(2560, 10, 64, wire, partial)?;
+            let planned = cuteafd_loader::serving_capacity::OwnerTp2Rows::with_partial(2560, 10, 64, wire, element)?;
+            assert_eq!(actual.partial_bytes as u64, planned.partial_bytes);
+            assert_eq!(actual.exchange_slot_bytes as u64, planned.exchange_slot_bytes);
+        }
         Ok(())
     }
 

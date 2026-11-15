@@ -86,6 +86,12 @@ pub enum ExpertV2Dtype {
     /// Native V4.1 producers quantize BF16-rounded values with an amax floor
     /// of 1e-4; consumers must preserve the supplied payload and scales.
     Fp8E4m3Ue8m0K32 = 7,
+    /// Pre-quantized NVFP4 W4A4 expert input: per row the packed E2M1 values
+    /// (`H/2`), E4M3 scales per 16 values (`H/16`), the F32 row amax (zero for
+    /// a calibrated static scale) and 12 zero bytes
+    /// ([`cuteafd_core::nvfp4_wire_row_bytes`]). Bit-identical to the rows the
+    /// Spark's W4A4 program would quantize from BF16; consumers never requantize.
+    Nvfp4E2m1E4m3K16Amax = 8,
 }
 
 impl ExpertV2Dtype {
@@ -96,7 +102,8 @@ impl ExpertV2Dtype {
             Self::Fp8Debug
             | Self::Nvfp4E2m1Fp8E4m3
             | Self::Fp8E4m3RowScaled
-            | Self::Fp8E4m3Ue8m0K32 => 1,
+            | Self::Fp8E4m3Ue8m0K32
+            | Self::Nvfp4E2m1E4m3K16Amax => 1,
         }
     }
 
@@ -131,6 +138,12 @@ impl ExpertV2Dtype {
             Self::Fp8E4m3RowScaled => elements
                 .checked_add(std::mem::size_of::<f32>())
                 .context("row-scaled FP8 E4M3 row byte count overflow"),
+            Self::Nvfp4E2m1E4m3K16Amax => {
+                if elements == 0 || elements % 32 != 0 {
+                    bail!("pre-quantized NVFP4 row width must be a nonzero multiple of 32, got {elements}");
+                }
+                Ok(cuteafd_core::nvfp4_wire_row_bytes(elements))
+            }
         }
     }
 
@@ -143,6 +156,7 @@ impl ExpertV2Dtype {
             5 => Ok(Self::Fp8E4m3RowScaled),
             6 => Ok(Self::F32),
             7 => Ok(Self::Fp8E4m3Ue8m0K32),
+            8 => Ok(Self::Nvfp4E2m1E4m3K16Amax),
             other => bail!("unknown ExpertProtocolV2 dtype {other}"),
         }
     }

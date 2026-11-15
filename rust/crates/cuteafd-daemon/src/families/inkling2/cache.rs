@@ -1,0 +1,299 @@
+//! Persistent request state, separate from in-flight row scratch. Shared prefix
+//! copy fences join every reader before snapshots, restores and retirement.
+use crate::shared::{memory::{device::{Allocation, Stream}, receipts::Inventory},
+    prefix::{PrefixCopies, Reader}};
+use anyhow::{ensure, Context, Result};
+use cuteafd_core::memory_layout::Tag;
+use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
+use cuteafd_loader::families::inkling2::execution::CacheLayout;
+use std::{collections::BTreeMap, rc::Rc};
+
+pub(crate) fn view(buffer: Buffer, offset: usize, bytes: usize) -> Result<Buffer> {
+    ensure!(bytes > 0 && offset.checked_add(bytes).is_some_and(|end| end <= buffer.bytes),
+        "Inkling cache view exceeds backing");
+    Ok(Buffer { ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..buffer })
+}
+
+pub(crate) struct CacheBank<'a> {
+    // Copies drain while all readers and their storage still exist.
+    copies: PrefixCopies<'a>,
+    readers: Vec<Rc<Stream<'a>>>,
+    active: Allocation<'a>,
+    marks: Option<Allocation<'a>>,
+    pages: BTreeMap<usize, Allocation<'a>>,
+    pub layout: CacheLayout,
+    mark_slots: usize,
+}
+impl<'a> CacheBank<'a> {
+    pub fn require_reader(&self, stream: &Stream<'_>) -> Result<()> {
+        ensure!(self.readers.iter().any(|reader| reader.raw == stream.raw
+            && reader.device.id == stream.device.id
+            && std::ptr::eq(reader.device.library, stream.device.library)),
+            "Inkling arithmetic stream is not fenced by persistent cache");
+        Ok(())
+    }
+    /// All requests, including tails, are admitted before construction.
+    pub fn new(readers: Vec<Rc<Stream<'a>>>, layout: CacheLayout, mark_slots: usize) -> Result<Self> {
+        let first = readers.first().context("Inkling cache requires readers")?;
+        let device = first.device;
+        ensure!(readers.iter().all(|stream| stream.device.id == device.id
+            && std::ptr::eq(stream.device.library, device.library)), "Inkling cache reader devices differ");
+        let active = Allocation::new(device, layout.active_bytes()?, Tag::kv("inkling2/sequence-state"))?;
+        let marks = (mark_slots > 0).then(|| Allocation::new(device, layout.retained_bytes(mark_slots)?,
+            Tag::new(cuteafd_core::memory_layout::MemoryKind::Prefix, "inkling2/prefix-marks"))).transpose()?;
+        let pages = layout.global_layers.iter().map(|&layer| Ok((layer,
+            Allocation::new(device, layout.layer_page_bytes()?, Tag::kv("inkling2/global-pages"))?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let copies = PrefixCopies::new(device.library, vec![readers.iter().map(|stream|
+            Reader { device: stream.device.id, stream: stream.raw }).collect()])?;
+        let bank = Self { copies, readers, active, marks, pages, layout, mark_slots };
+        bank.copies.ordered(0, |stream| {
+            // SAFETY: all allocations succeeded before initialization; the bank
+            // retains every destination and joins readers on both sides.
+            unsafe { device.library.cuda_zero_bytes_async(bank.active.buffer, bank.active.buffer.bytes, stream)?; }
+            Ok(())
+        })?;
+        Ok(bank)
+    }
+    pub fn field(&self, sequence: usize, layer: usize, name: &str) -> Result<Buffer> {
+        let span = self.layout.field(sequence, layer, name)?;
+        view(self.active.buffer, span.start, span.len())
+    }
+    pub fn global(&self, layer: usize) -> Result<Buffer> {
+        self.pages.get(&layer).map(|owner| owner.buffer).context("Inkling layer has no global KV pages")
+    }
+    pub fn page(&self, layer: usize, page: usize) -> Result<Buffer> {
+        ensure!(page < self.layout.pool_pages, "Inkling physical page outside pool");
+        view(self.global(layer)?, page*self.layout.page_bytes, self.layout.page_bytes)
+    }
+    fn sequence(&self, sequence: usize) -> Result<Buffer> {
+        ensure!(sequence < self.layout.sequences, "Inkling sequence outside cache");
+        view(self.active.buffer, sequence*self.layout.sequence_bytes, self.layout.sequence_bytes)
+    }
+    pub fn mark(&self, slot: usize) -> Result<Buffer> {
+        ensure!(slot < self.mark_slots, "Inkling mark outside arena");
+        view(self.marks.as_ref().context("Inkling mark arena absent")?.buffer,
+            slot*self.layout.sequence_bytes, self.layout.sequence_bytes)
+    }
+    pub fn reset(&self, sequence: usize) -> Result<()> {
+        let dst = self.sequence(sequence)?;
+        self.copies.ordered(0, |stream| {
+            // SAFETY: copy fences join every arithmetic reader before overwrite.
+            unsafe { self.readers[0].device.library.cuda_zero_bytes_async(dst, dst.bytes, stream) }
+        })
+    }
+    pub fn capture(&self, sequence: usize, slot: usize) -> Result<()> {
+        self.copy(self.mark(slot)?, self.sequence(sequence)?)
+    }
+    pub fn restore(&self, slot: usize, sequence: usize) -> Result<()> {
+        self.copy(self.sequence(sequence)?, self.mark(slot)?)
+    }
+    fn copy(&self, dst: Buffer, src: Buffer) -> Result<()> {
+        ensure!(dst.bytes == src.bytes && dst.ptr != src.ptr, "Inkling cache copy extent/alias");
+        // SAFETY: checked disjoint sequence/mark regions survive all fenced
+        // copies; PrefixCopies orders every registered consumer on both sides.
+        unsafe { self.copies.copy_d2d(&[(0, dst, src)]) }
+    }
+    pub fn copy_page(&self, from: usize, to: usize) -> Result<()> {
+        self.copy_page_rows(from, to, 64)
+    }
+    pub fn copy_page_rows(&self, from: usize, to: usize, rows: usize) -> Result<()> {
+        ensure!(from != to && (1..=64).contains(&rows), "Inkling page tail copy aliases or exceeds page");
+        let bytes = self.layout.page_bytes / 64 * rows;
+        let copies = self.layout.global_layers.iter().map(|&layer|
+            Ok((0, view(self.page(layer, to)?, 0, bytes)?, view(self.page(layer, from)?, 0, bytes)?)))
+            .collect::<Result<Vec<_>>>()?;
+        // SAFETY: physical page IDs are distinct; the retained bank owns every
+        // source/destination until the shared prefix fence drains.
+        unsafe { self.copies.copy_d2d(&copies) }
+    }
+    pub fn drain(&self) -> Result<()> { self.copies.drain() }
+    pub fn inventory(&self, inventory: &mut Inventory<'_>) -> Result<()> {
+        let location = inventory.location(self.readers[0].device.id)?;
+        let cuteafd_loader::placement::planner::Device::Coordinator(gpu) = location.device
+            else { anyhow::bail!("Inkling cache is not coordinator-owned"); };
+        self.active.inventory(inventory, &format!("inkling2.cache.{gpu}.active"))?;
+        if let Some(marks) = &self.marks { marks.inventory(inventory, &format!("inkling2.cache.{gpu}.marks"))?; }
+        for (layer, owner) in &self.pages { owner.inventory(inventory, &format!("inkling2.kv.{layer}.{gpu}.records"))?; }
+        self.copies.allocation_receipts(inventory, &format!("inkling2.cache.{gpu}.copies"))
+    }
+}
+/// Logical pages and frontiers belong to the shared scheduler. Mutable model
+/// bytes stay in the bank and are never reconstructed from a continuation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Placement {
+    pub units: Vec<u32>,
+    pub slot: usize,
+    pub len: usize,
+    pub state_len: usize,
+}
+impl crate::shared::qwen::scheduler::Placement for Placement {
+    fn len(&self) -> usize { self.len }
+    fn set_len(&mut self, len: usize) { self.len = len; }
+    fn units(&self) -> &[u32] { &self.units }
+    fn slot(&self) -> i32 { self.slot as i32 }
+    fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
+}
+
+#[derive(Clone)]
+pub(crate) struct InklingPrefix<'a>(Rc<CacheBank<'a>>);
+impl<'a> InklingPrefix<'a> {
+    pub fn new(bank: Rc<CacheBank<'a>>) -> Self { Self(bank) }
+    fn validate(&self, placement: &Placement, len: usize) -> Result<()> {
+        ensure!(placement.slot < self.0.layout.sequences && len.div_ceil(64) <= placement.units.len()
+            && placement.units.iter().all(|&page| (page as usize) < self.0.layout.pool_pages),
+            "Inkling prefix placement outside admitted state/pages");
+        ensure!(placement.units.iter().copied().collect::<std::collections::BTreeSet<_>>().len()
+            == placement.units.len(), "Inkling prefix placement aliases physical pages");
+        Ok(())
+    }
+}
+impl cuteafd_engine::prefix::PrefixFamily for InklingPrefix<'_> {
+    type Placement = Placement;
+    fn record_format(&self) -> &'static str { "inkling2_bf16_kv_f32_conv_whole_v1" }
+    fn layout(&self) -> cuteafd_engine::prefix::FamilyLayout {
+        use cuteafd_engine::prefix::{FamilyLayout, MarkStore, ReuseRule};
+        FamilyLayout { page_rows: 64, pages: self.0.layout.pool_pages,
+            page_bytes: self.0.layout.page_bytes * self.0.layout.global_layers.len(),
+            mark_bytes: self.0.layout.sequence_bytes, draft_bytes: 0,
+            rule: ReuseRule::EXACT, mark_store: MarkStore::Arena, page_owners: Default::default() }
+    }
+    fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.units }
+    fn bind(&self, placement: &mut Placement) -> Result<(), cuteafd_engine::prefix::BoxError> {
+        self.validate(placement, placement.len)?;
+        self.0.reset(placement.slot)?;
+        placement.state_len = 0;
+        Ok(())
+    }
+    fn discard(&self, placement: &mut Placement) -> Result<(), cuteafd_engine::prefix::BoxError> {
+        self.0.reset(placement.slot)?;
+        placement.state_len = 0;
+        Ok(())
+    }
+    fn extend_pages(&self, placement: &mut Placement, pages: &[u32]) -> Result<(), cuteafd_engine::prefix::BoxError> {
+        let mut extended = placement.clone();
+        extended.units.extend_from_slice(pages);
+        self.validate(&extended, extended.len)?;
+        placement.units = extended.units;
+        Ok(())
+    }
+    fn commit_point(&self, placement: &Placement) -> usize { placement.len.min(placement.state_len) }
+    fn capture(&self, slot: cuteafd_engine::prefix::MarkSlot, placement: &Placement, len: usize)
+        -> Result<(), cuteafd_engine::prefix::BoxError> {
+        self.validate(placement, len)?;
+        if len != placement.len || len != placement.state_len {
+            return Err("Inkling snapshot frontier does not match committed causal state".into());
+        }
+        Ok(self.0.capture(placement.slot, slot.0 as usize)?)
+    }
+    fn restore(&self, mark: Option<cuteafd_engine::prefix::MarkSlot>, placement: &mut Placement, len: usize)
+        -> Result<(), cuteafd_engine::prefix::BoxError> {
+        self.validate(placement, len)?;
+        let slot = mark.context("Inkling exact restore requires its SWA/convolution mark")?;
+        self.0.restore(slot.0 as usize, placement.slot)?;
+        placement.len = len;
+        placement.state_len = len;
+        Ok(())
+    }
+    fn copy_rows(&self, copy: cuteafd_engine::prefix::TailCopy) -> Result<(), cuteafd_engine::prefix::BoxError> {
+        if copy.owner.is_some() { return Err("Inkling whole-rank pages have no parity owner".into()); }
+        Ok(self.0.copy_page_rows(copy.from as usize, copy.to as usize, copy.rows)?)
+    }
+    fn drain(&self) -> Result<(), cuteafd_engine::prefix::BoxError> { Ok(self.0.drain()?) }
+    fn page_segments(&self, page: u32) -> Vec<cuteafd_hostcache::copy::DeviceRange> {
+        self.0.layout.global_layers.iter().filter_map(|&layer| self.0.page(layer, page as usize).ok())
+            .map(crate::shared::prefix::cuda_copy::range).collect()
+    }
+    fn mark_segments(&self, slot: cuteafd_engine::prefix::MarkSlot) -> Vec<cuteafd_hostcache::copy::DeviceRange> {
+        self.0.mark(slot.0 as usize).ok().into_iter().map(crate::shared::prefix::cuda_copy::range).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::memory::device::Device;
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+    use cuteafd_loader::families::inkling2::{execution::UnitLayout, Inkling2Config};
+
+    #[test]
+    fn persistent_cache_marks_copy_exact_bytes_and_fence_only_registered_readers() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 0 };
+        let reader = Rc::new(Stream::new(device)?);
+        let mut cfg = Inkling2Config::from_hf(&serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/families/inkling2/fixtures/config.json"))?)?;
+        cfg.layers = 2;
+        cfg.local = vec![true, false];
+        let cache = CacheBank::new(vec![reader.clone()], CacheLayout::new(&cfg, 2, 3)?, 1)?;
+        let state = cache.sequence(0)?;
+        let pattern = (0..state.bytes).map(|byte| (byte.wrapping_mul(17) % 251) as u8).collect::<Vec<_>>();
+        library.copy_h2d(state, &pattern)?;
+        cache.capture(0, 0)?;
+        cache.reset(0)?;
+        cache.restore(0, 1)?;
+        cache.drain()?;
+        let mut restored = vec![0; pattern.len()];
+        library.copy_d2h(&mut restored, cache.sequence(1)?)?;
+        assert_eq!(restored, pattern);
+        library.copy_d2h(&mut restored, cache.sequence(0)?)?;
+        assert!(restored.iter().all(|&byte| byte == 0));
+        let page = cache.page(1, 0)?;
+        let page_pattern = vec![0x5a; page.bytes];
+        library.copy_h2d(page, &page_pattern)?;
+        cache.copy_page(0, 2)?;
+        cache.drain()?;
+        let mut restored_page = vec![0; page.bytes];
+        library.copy_d2h(&mut restored_page, cache.page(1, 2)?)?;
+        assert_eq!(restored_page, page_pattern);
+        let unit = super::super::owners::UnitOwner::new(reader, UnitLayout::serving(&cfg, 64, 256)?)?;
+        assert!(unit.bind(&cache, 1, 0).is_ok());
+        assert!(unit.bind(&cache, 2, 0).is_err());
+        assert!(unit.bind(&cache, 0, 2).is_err());
+        let stranger = Rc::new(Stream::new(device)?);
+        assert!(cache.require_reader(&stranger).is_err());
+        let unit = super::super::owners::UnitOwner::new(stranger, UnitLayout::serving(&cfg, 64, 256)?)?;
+        assert!(unit.bind(&cache, 0, 0).is_err());
+        assert!(cache.field(0, 1, "ring").is_err());
+        assert!(cache.copy_page(0, 0).is_err());
+        assert!(cache.copy_page(0, 3).is_err());
+        use cuteafd_engine::prefix::{MarkSlot, PrefixFamily, TailCopy};
+        let cache = Rc::new(cache);
+        let family = InklingPrefix::new(cache.clone());
+        let mut source = Placement { units: vec![0, 1], slot: 0, len: 65, state_len: 65 };
+        library.copy_h2d(cache.sequence(0)?, &pattern)?;
+        family.capture(MarkSlot(0), &source, 65).map_err(|e| anyhow::anyhow!("{e}"))?;
+        source.state_len = 64;
+        assert!(family.capture(MarkSlot(0), &source, 65).is_err());
+        let mut destination = Placement { units: vec![0, 2], slot: 1, len: 0, state_len: 0 };
+        family.bind(&mut destination).map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert!(family.restore(None, &mut destination, 65).is_err());
+        family.restore(Some(MarkSlot(0)), &mut destination, 65).map_err(|e| anyhow::anyhow!("{e}"))?;
+        family.drain().map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!((destination.len, destination.state_len), (65, 65));
+        library.copy_d2h(&mut restored, cache.sequence(1)?)?;
+        assert_eq!(restored, pattern);
+        let sentinel = vec![0x33; page.bytes];
+        library.copy_h2d(cache.page(1, 2)?, &sentinel)?;
+        family.copy_rows(TailCopy { from: 0, to: 2, rows: 1, owner: None })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        family.drain().map_err(|e| anyhow::anyhow!("{e}"))?;
+        library.copy_d2h(&mut restored_page, cache.page(1, 2)?)?;
+        assert_eq!(&restored_page[..4096], &page_pattern[..4096]);
+        assert_eq!(&restored_page[4096..], &sentinel[4096..]);
+        assert_eq!(family.page_segments(0).len(), 1);
+        assert_eq!(family.mark_segments(MarkSlot(0)).len(), 1);
+        assert!(family.extend_pages(&mut destination, &[0]).is_err());
+        family.discard(&mut destination).map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(destination.state_len, 0);
+        Ok(())
+    }
+}
+
+impl Drop for CacheBank<'_> {
+    fn drop(&mut self) {
+        crate::shared::decode_graph::fatal_drain(self.copies.drain(), "Inkling persistent cache retirement");
+    }
+}

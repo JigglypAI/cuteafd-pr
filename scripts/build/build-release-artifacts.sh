@@ -350,11 +350,14 @@ for release_family in "${release_family_list[@]}"; do
       release_packages+=("${release_package}-bf16")
   fi
   [[ "$release_family" == *:nvfp4 && "$release_family" != step5:nvfp4 ]] && release_packages+=("${release_package}a4")
+  # Exact NVFP4 wire input sibling (fp8_moe.cmake): Spark ranks of MiniMax.
+  [[ "$role" == expert && "$release_family" == minimax:nvfp4a4 ]] && release_packages+=("${release_package}-nvfp4w")
   for release_package in "${release_packages[@]}"; do
     rm -rf "$output_dir/fp8/$release_package"
     cp -a "$build_root/native/fp8/$release_package" "$output_dir/fp8/$release_package"
     fp8_input_args=()
     [[ "$release_package" != *-bf16 ]] || fp8_input_args=(--input bf16)
+    [[ "$release_package" != *-nvfp4w ]] || fp8_input_args=(--input nvfp4)
     python3 "$build_root/source/python/tools/aot/package_fp8_moe_aot.py" verify \
       --package "$output_dir/fp8/$release_package" --sparkinfer-revision "$fp8_revision" --role "$role" "${fp8_input_args[@]}"
   done

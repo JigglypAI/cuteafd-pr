@@ -54,6 +54,9 @@ def builders(heads=128, group="pointwise", max_rows=4096):
                       qk_norm_nope_full=partial(m.compile_qk_norm_rope_aot, heads=heads, kind="full"),
                       attention_output=partial(m.compile_attention_output_aot, heads=heads),
                       expert_input_quant=compile_expert_input_quant_aot)
+        result.update({name + "_kv_fp8": partial(m.compile_qk_norm_rope_aot,
+            heads=heads, kind=kind, kv_cache="fp8") for name, kind in
+            (("qk_norm_rope_swa", "swa"), ("qk_norm_nope_full", "full"))})
         return result
     if group == "tp-combine":
         from b12x.integration.cuteafd.muse_tp import compile_tp_combine_aot
@@ -72,6 +75,11 @@ def builders(heads=128, group="pointwise", max_rows=4096):
                   for kind in ("full", "swa") for route in ("prefill", "decode")}
         result["swa_commit"] = partial(a.compile_swa_commit_aot, heads=heads,
                                       max_rows=max_rows, ring_rows=ring_rows)
+        result.update({f"attention_{kind}_{route}_kv_fp8": partial(a.compile_attention_aot,
+            heads=heads, kind=kind, route=route, max_rows=max_rows, ring_rows=ring_rows, kv_cache="fp8")
+            for kind in ("full", "swa") for route in ("prefill", "decode")})
+        result["swa_commit_kv_fp8"] = partial(a.compile_swa_commit_aot, heads=heads,
+            max_rows=max_rows, ring_rows=ring_rows, kv_cache="fp8")
         return result
     raise ValueError(f"unknown Muse export group: {group}")
 

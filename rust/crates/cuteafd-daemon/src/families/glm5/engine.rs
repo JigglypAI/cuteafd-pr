@@ -619,7 +619,6 @@ pub(crate) struct GlmEngine<'a> {
     pub(super) usage_active: Cell<bool>,
     graphs_warmed: Cell<bool>,
     graphs_warming: Cell<bool>,
-    graph_before: RefCell<Option<Vec<u64>>>,
     graph_basis: Cell<Option<crate::shared::decode_graph::device::Basis>>,
     /// The DFlash2 drafter; every step taps its target layers.
     pub drafter: Option<super::drafter::GlmDrafter<'a>>,
@@ -792,7 +791,7 @@ impl<'a> GlmEngine<'a> {
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             pending_media: RefCell::new(None),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
-            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_before: RefCell::new(None), graph_basis: Cell::new(None), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
+            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_basis: Cell::new(None), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
     }
 
     pub(super) fn initialize_usage(&mut self, geometry: Option<cuteafd_core::expert_usage::Geometry>,
@@ -1739,26 +1738,13 @@ impl<'a> GlmEngine<'a> {
             nodes: Some(nodes), node_rate, graph_rate, parallel_width: 1 })
     }
 
-    fn graph_free_samples(&self) -> Result<Vec<u64>> {
-        (0..self.ranks()).map(|rank| self.on(rank, || self.library.cuda_physical_memory_info()
-            .map(|(free, _)| free as u64))).collect()
-    }
-
-    fn graph_boundary(&self, before: &[u64]) -> Result<()> {
-        let needs = self.graphs.borrow().cache_needs_boundary()
-            || self.peer.as_ref().is_some_and(|peer| peer.graphs.borrow().cache_needs_boundary());
-        if !needs { return Ok(()) }
-        // All rank submissions are queued now. A per-segment sync deadlocks
-        // cross-rank waits; this completed step is the measurement boundary.
-        let after = self.graph_memory_samples()?;
+    fn graph_boundary(&self) -> Result<()> {
         for rank in 0..self.ranks() {
-            let graphs = if rank == 0 { &self.graphs } else { &self.peer()?.graphs };
-            graphs.borrow_mut().cache_measured(before[rank].saturating_sub(after[rank].free));
-            self.on(rank, || graphs.borrow_mut().cache_drain(|| Ok(()), || {
-                let (free, _) = self.library.cuda_physical_memory_info()?;
-                Ok(crate::shared::decode_graph::device::ReleaseMeasurement {
-                    released: (free as u64).saturating_sub(after[rank].free) })
-            }))?;
+            let graphs = if rank == 0 { &self.graphs } else { &self.peer.as_ref().unwrap().graphs };
+            graphs.borrow_mut().cache_tick();
+            crate::shared::decode_graph::device::observe_device(&self.library, self.peer.as_ref().filter(|_| rank == 1).map_or(self.device, |peer| peer.device))?;
+            self.on(rank, || graphs.borrow_mut().cache_drain(|| Ok(()), ||
+                Ok(crate::shared::decode_graph::device::ReleaseMeasurement { released: 0 })))?;
         }
         Ok(())
     }
@@ -1797,11 +1783,9 @@ impl<'a> GlmEngine<'a> {
             },
             |scope| {
                 let result = self.step_inner(scope, tables, tokens, logit_rows, experts, on_layer)?;
-                let before = self.graph_before.borrow_mut().take();
-                if let Some(before) = before { self.graph_boundary(&before)?; }
-                else if self.graphs.borrow().cache_needs_boundary()
+                if self.graphs.borrow().cache_needs_boundary()
                     || self.peer.as_ref().is_some_and(|peer| peer.graphs.borrow().cache_needs_boundary()) {
-                    self.graph_boundary(&self.graph_free_samples()?)?;
+                    self.graph_boundary()?;
                 }
                 self.graphs.borrow_mut().cache_tick();
                 if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_tick(); }
@@ -2374,12 +2358,6 @@ impl<'a> GlmEngine<'a> {
         if !self.graphs_warmed.get() && !self.graphs_warming.get() { return segment(); }
         let pinned = self.prewarm_pins(&key);
         let Some(ticket) = graphs.borrow_mut().cache_ticket(&key, pinned, self.graph_estimate(&key)) else { return segment() };
-        if self.graph_before.borrow().is_none() {
-            match self.graph_free_samples() {
-                Ok(samples) => *self.graph_before.borrow_mut() = Some(samples),
-                Err(error) => { drop(ticket); return Err(error); }
-            }
-        }
         // No synchronization here: peer segments may not yet have been queued.
         // SAFETY: capture records launches on this rank's persistent stream.
         if let Err(error) = self.on(rank, || unsafe { crate::shared::decode_graph::begin_capture(&self.library, stream, &ticket) }) {

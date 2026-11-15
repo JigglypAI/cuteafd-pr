@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
@@ -155,18 +156,39 @@ def compile_native_attention_projection(n, k, max_rows, output="bf16"):
             reduction="canonical_fp8_gemv64_w8a16"))
 
 
+def mc_fp8_core_shapes():
+    """Additional coordinator-only [N,K] MC roles; never Spark geometries."""
+    return {
+        "glm": {(2048, 6144), (640, 6144), (12288, 6144), (6144, 6144),
+                (6144, 12288), (1024, 6144), (6144, 2048), (6144, 1024)},
+        "step5": {(12288, 4096), (6144, 4096), (768, 4096), (384, 4096),
+                  (1536, 4096), (4096, 1536), (13824, 4096), (4096, 13824),
+                  (4096, 8192)},
+    }
+
+
+def mc_fp8_f32_shapes():
+    # GLM shared down is K-split; dense down F32 shapes already exist.
+    return {(6144, 2048), (6144, 1024)}
+
+
+def native_fp8_head_shapes():
+    return {(202112, 8192), (154880, 6144), (128896, 4096)}
+
+
 def native_attention_programs():
     from functools import partial
     out = []
     muse_core = {(4096, 8192), (1024, 8192), (512, 8192), (2048, 8192), (8192, 2048)}
-    for n, k in sorted(set().union(*native_attention_shapes().values()) | muse_core):
-        for output in (("bf16", "f32") if (n, k) in native_attention_f32_shapes() | {(8192, 2048)} else ("bf16",)):
+    for n, k in sorted(set().union(*native_attention_shapes().values(), *mc_fp8_core_shapes().values()) | muse_core):
+        for output in (("bf16", "f32") if (n, k) in native_attention_f32_shapes() | mc_fp8_f32_shapes() | {(8192, 2048)} else ("bf16",)):
             for rows in (64, 4096):
                 suffix = "_f32" if output == "f32" else ""
                 out.append((f"n{n}_k{k}_m{rows}{suffix}", "attention_projection",
                     dict(max_rows=rows), partial(compile_native_attention_projection, n, k, rows, output)))
-    out.append(("n202112_k8192_m64_f32", "attention_projection", dict(max_rows=64),
-        partial(compile_native_attention_projection, 202112, 8192, 64, "f32")))
+    for n, k in sorted(native_fp8_head_shapes()):
+        out.append((f"n{n}_k{k}_m64_f32", "attention_projection", dict(max_rows=64),
+            partial(compile_native_attention_projection, n, k, 64, "f32")))
     return out
 
 
@@ -211,7 +233,9 @@ def native_attention_bf16_shapes():
     # Muse original K/V are separate projections, whole and TP2 output splits.
     shapes = {(k, n) for family, operands in native_attention_shapes().items()
               if family != "ml4" for n, k in operands}
-    return shapes | {(6144, 512), (6144, 576), (8192, 1024), (8192, 512), (8192, 4096), (8192, 2048)}
+    # Partial MC selection stages unselected GLM group members as BF16.
+    return shapes | {(6144, 512), (6144, 576), (8192, 1024), (8192, 512), (8192, 4096), (8192, 2048),
+                     (1024, 6144), (6144, 6144), (6144, 12288)}
 
 
 def draft_bf16_shapes():
@@ -380,6 +404,17 @@ def minimax_forward_programs(prefill_rows: int):
     result.append(("kv_pack_h2", "minimax_kv_pack", dict(heads=2, max_rows=prefill_rows),
                    partial(compile_minimax_kv_pack_aot, heads=2)))
     return result
+
+
+def minimax_wire_programs(prefill_rows: int):
+    """The exact NVFP4 expert-input wire quantizer (Spark ``SparkIngress::Nvfp4``): the
+    calibrated W4A4 row quantizer of the Spark's ``fp8-minimax-nvfp4a4`` package, run once
+    per token on the coordinator with the layer's one shared ``input_global_scale``."""
+    from functools import partial
+    from b12x.integration.cuteafd.nvfp4_wire import compile_nvfp4_wire_rows_aot
+
+    params = dict(hidden=6144, max_rows=prefill_rows, mode="calibrated", scale_convention="divisor")
+    return [("nvfp4_wire_rows", "nvfp4_wire_rows", params, partial(compile_nvfp4_wire_rows_aot, **params))]
 
 
 def inkling2_attention_programs(decode_rows: int, prefill_rows: int):
@@ -1609,6 +1644,7 @@ def dense_family_scopes(families, exlr8_family):
 
 
 def main() -> None:
+    setup_started = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--geometry", default="flash",
@@ -1940,6 +1976,7 @@ def main() -> None:
             args.decode_rows, args.prefill_rows, args.max_context)]
         work += [("minimax", *item) for item in minimax_producer_programs(args.prefill_rows)]
         work += [("minimax", *item) for item in minimax_forward_programs(args.prefill_rows)]
+        work += [("minimax", *item) for item in minimax_wire_programs(args.prefill_rows)]
     if "inkling2" in geometries:
         from b12x.integration.cuteafd import INKLING2_SMALL
         manifest["families"]["inkling2"] = dataclasses.asdict(INKLING2_SMALL)
@@ -1955,10 +1992,24 @@ def main() -> None:
             if suffix not in existing:
                 work.append(("draft_bf16", suffix, "bf16_projection", {"max_rows": 4096},
                              lambda k=k, n=n: compile_draft_bf16_projection(k, n, "f32")))
+    print(f"program worklist setup: {time.monotonic() - setup_started:.6f} seconds", flush=True)
+    if globals().get("_catalog_only"):
+        catalog = []
+        for family, suffix, op, params, _ in work:
+            if selected is not None and suffix not in selected:
+                continue
+            stem = (suffix if family == "kimi_split" else
+                    f"exlr8_dense_{suffix}" if family == "minimax" and op in ("dense_mxfp8", "dense_mxfp8_quant")
+                    else f"{family}_{suffix}")
+            sms = (170, 188) if props.minor == 0 and op == "sparse_mla" and params.get("route") == "decode" else (None,)
+            catalog.append({"name": stem, "labels": [stem if n is None else f"{stem}_sm{n}" for n in sms]})
+        (output / "program-catalog.json").write_text(json.dumps({"manifest": manifest, "programs": catalog}, indent=2) + "\n")
+        return
     # Per-program reuse (python/tools/lib/_export_cache.py): only under the export
     # cache's recorder. Programs compile independently of which others the
     # geometry list requests; their recipes read every argument except these.
-    program_cache = _export_cache.ProgramCache(output) if _export_cache else None
+    program_cache = (_export_cache.ProgramCache(output)
+                     if _export_cache and not globals().get("_disable_program_cache") else None)
     if program_cache is not None:
         program_cache.start()
     for family, suffix, op, params, thunk in work:

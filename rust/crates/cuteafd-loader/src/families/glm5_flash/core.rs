@@ -821,6 +821,71 @@ mod tests {
     }
 
     #[test]
+    fn repaired_mc_mtp_is_not_a_target_fp8_owner() -> Result<()> {
+        use crate::plan::{checkpoint::{CheckpointView, CoreView}, testing,
+            family::Family, families::glm::GLM5_FLASH, files::{required_tensors, ReadRole}, Component};
+        let (cfg, checkpoint) = fixture();
+        let mut config = checkpoint.config.clone();
+        config["text_config"]["num_nextn_predict_layers"] = serde_json::json!(1);
+        let target = expected(&cfg);
+        // #2207 moves only these non-routed MTP matrices into original core.
+        let root = format!("{PREFIX}{}", cfg.layers);
+        let mut mtp = BTreeMap::new();
+        for (leaf, n, k) in [("self_attn.q_a_proj", cfg.q_lora_rank, cfg.hidden),
+            ("self_attn.kv_a_proj_with_mqa", cfg.kv_lora_rank, cfg.hidden),
+            ("self_attn.q_b_proj", cfg.heads * cfg.qk_nope_dim, cfg.q_lora_rank),
+            ("self_attn.o_proj", cfg.hidden, cfg.heads * cfg.v_head_dim),
+            ("mlp.shared_experts.gate_proj", cfg.moe_intermediate, cfg.hidden),
+            ("mlp.shared_experts.up_proj", cfg.moe_intermediate, cfg.hidden),
+            ("mlp.shared_experts.down_proj", cfg.hidden, cfg.moe_intermediate),
+            ("eh_proj", cfg.hidden, 2 * cfg.hidden)] {
+            mtp.insert(format!("{root}.{leaf}.weight"), vec![n,k]);
+        }
+        let mut tensors = Vec::new();
+        for layer in [cfg.layers - 1, cfg.layers] {
+            for leaf in ["gate_proj", "up_proj", "down_proj"] {
+                tensors.extend(testing::exl3(&format!("{PREFIX}{layer}.mlp.experts.0.{leaf}"),
+                    cfg.hidden, cfg.hidden, 4));
+            }
+        }
+        let dir = tempfile::tempdir()?;
+        testing::write_mc_snapshot_with_mtp(dir.path(), &config, &tensors, &target, &mtp);
+        let mut expert_headers = None;
+        for mode in [CoreView::Original, CoreView::Fp8Compact, CoreView::K6Compact, CoreView::K8Compact] {
+            let view = CheckpointView::select(dir.path(), mode)?;
+            let cp = Checkpoint::open_view(&view)?;
+            let model = GLM5_FLASH.open(&cp)?;
+            let required = required_tensors(&cp, ReadRole::Coordinator { local_experts: false, speculator: true })?;
+            assert!(!required.iter().any(|name| name.starts_with(&root)));
+            let core = CoreInventory::from_checkpoint(&cfg, &cp)?;
+            assert!(!core.native.keys().chain(core.projections.keys()).any(|name| name.starts_with(&root)));
+            for name in mtp.keys() {
+                assert_eq!(GLM5_FLASH.classify(model.spec(), name).unwrap().component, Component::Speculator);
+                assert!(!cp.converts_to_fp8(name));
+                if matches!(mode, CoreView::Original | CoreView::Fp8Compact) {
+                    assert_eq!(cp.header(name).unwrap().dtype, DType::Bf16);
+                    assert!(!cp.config["quantization_config"].as_object().unwrap().contains_key("mtp_bits"));
+                } else {
+                    let stem = name.strip_suffix(".weight").unwrap();
+                    assert_eq!(cp.header(&format!("{stem}.trellis")).unwrap().shape[2], 64);
+                }
+            }
+            let expert = format!("{root}.mlp.experts.0.gate_proj.trellis");
+            assert_eq!(GLM5_FLASH.classify(model.spec(), &expert).unwrap().component, Component::SpeculatorExpert);
+            let header = cp.header(&expert).unwrap();
+            let actual = (cp.weight_map[&expert].clone(), header.dtype.clone(), header.shape.clone(), header.byte_length);
+            if let Some(expected) = &expert_headers { assert_eq!(expected, &actual); }
+            else { expert_headers = Some(actual); }
+            if mode == CoreView::Fp8Compact {
+                assert!(view.fp8_tensors().contains(mtp.keys().next().unwrap()));
+                assert!(cp.converts_to_fp8("lm_head.weight"));
+                assert!(core.native.values().all(|weight| weight.fp8));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn published_target_core_has_316_header_native_owners_and_no_kv_padding() -> Result<()> {
         let (cfg, checkpoint) = fixture();
         let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;

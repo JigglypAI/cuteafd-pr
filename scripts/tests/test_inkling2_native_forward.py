@@ -7,13 +7,13 @@ FAMILY = ROOT/'rust/crates/cuteafd-daemon/src/families/inkling2'
 
 def test_native_golden_uses_shared_executor_and_native_expert_dispatch():
     prefill = (FAMILY/'prefill.rs').read_text()
-    assert 'impl PrefillHooks for Hooks' in prefill
+    assert "impl<'a, O: UnitBuffers<'a>> PrefillHooks for Hooks" in prefill
     assert 'run_prefill_units(' in prefill
     assert 'FfnRoute::Local' in prefill
     layer = (FAMILY/'layers.rs').read_text()
     assert 'experts: &dyn Dispatcher' in layer
     assert 'DraftProjections::load_with_output' in layer
-    attention = layer.split('pub(crate) fn attention(')[1].split('/// Complete layer')[0]
+    attention = layer.split("pub(crate) fn attention<'a>(")[1].split('/// Complete layer')[0]
     assert 'cuda_stream_synchronize' not in attention and '.drain(' not in attention
     golden = (FAMILY/'golden.rs').read_text()
     assert 'super::prefill::layer(' in golden
@@ -21,6 +21,23 @@ def test_native_golden_uses_shared_executor_and_native_expert_dispatch():
     assert 'rms<=0.02 && cosine>=0.999' in golden
     assert '(nll-reference_nll).abs() <= 0.03' in golden
     assert 'python' not in golden.lower()
+
+
+def test_persistent_layer_state_is_borrowed_and_metadata_uses_retained_uploads():
+    owners = (FAMILY/'owners.rs').read_text()
+    cache = (FAMILY/'cache.rs').read_text()
+    assert "impl<'a> UnitBuffers<'a> for LayerUnit" in owners
+    assert 'self.cache.field(self.sequence, self.layer, name)' in owners
+    assert 'self.cache.global(self.layer)' in owners
+    assert 'cache.require_reader(&self.stream)' in owners
+    assert 'RetainedUploads' in owners and 'uploads.upload(' in owners
+    assert 'copy_h2d(' not in owners
+    assert 'reader.raw == stream.raw' in cache
+    assert 'self.copies.copy_d2d(' in cache
+    assert 'fatal_drain(self.copies.drain()' in cache
+    layer = (FAMILY/'layers.rs').read_text()
+    assert "owner: &impl UnitBuffers<'a>" in layer
+    assert 'Allocation::new' not in layer
 
 
 def test_arenas_are_single_backings_and_head_is_shared():

@@ -1,14 +1,16 @@
 //! Checkpoint-native target operands, packed once per physical coordinator.
 //! Layer ownership is supplied by placement; this module does not choose it.
-//! The original BF16 core is the stage-1 view; MC compact cores (K8/K6
-//! trellis attention projections and head) join through the shared
-//! `dense_trellis` inventory in stage 2.
+//! Native BF16 and selected MC K8/K6 projections use their own header-derived
+//! layouts; compressed payloads remain on the shared dense-trellis path.
 use super::Inkling2Config;
 use crate::placement::LayerMode;
 use crate::plan::families::inkling2::TEXT;
 use crate::{plan::checkpoint::Checkpoint, serving_capacity::WeightArenaLayout};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
+use crate::formats::{dense_trellis::TrellisSide,
+    trellis_core::{CoreContract, CoreSplit, CoreWeightLayout}};
+use std::collections::BTreeMap;
 
 /// A target core's immutable views. Expert onboarding, media and the bundled
 /// drafter are independently retired scopes and must not be added here.
@@ -17,6 +19,7 @@ pub struct CoordinatorWeights {
     pub rank: usize,
     pub layers: Vec<usize>,
     pub arena: WeightArenaLayout,
+    pub core: BTreeMap<String, CoreWeightLayout>,
 }
 
 impl CoordinatorWeights {
@@ -35,14 +38,14 @@ impl CoordinatorWeights {
                 LayerMode::Whole { gpu, .. } => (usize::from(*gpu) == rank).then_some(layer),
                 LayerMode::HeadSplit | LayerMode::ContextSplit => Some(layer),
             }).collect::<Vec<_>>();
-            let mut builder = Builder { checkpoint, tensors: Vec::new() };
+            let mut builder = Builder { checkpoint, tensors: Vec::new(), core: BTreeMap::new() };
             let (h, v) = (cfg.hidden, cfg.vocab_size);
             if rank == 0 {
                 builder.plain(format!("{TEXT}embed.weight"), DType::Bf16, &[v, h])?;
                 builder.plain(format!("{TEXT}embed_norm.weight"), DType::Bf16, &[h])?;
             }
             if rank + 1 == ranks {
-                builder.plain(format!("{TEXT}unembed.weight"), DType::Bf16, &[v, h])?;
+                builder.projection(format!("{TEXT}unembed.weight"), &[v, h], 0, None)?;
                 builder.plain(format!("{TEXT}norm.weight"), DType::Bf16, &[h])?;
                 builder.plain(format!("{TEXT}attn_res.output_query"), DType::F32, &[h])?;
             }
@@ -51,7 +54,8 @@ impl CoordinatorWeights {
                 ensure!(!split || ranks == 2, "Inkling 2 split attention needs two coordinator ranks");
                 builder.layer(cfg, layer, if split { Some(rank) } else { None })?;
             }
-            Ok(Self { rank, layers, arena: WeightArenaLayout::new(format!("inkling2/target/{rank}"), builder.tensors)? })
+            Ok(Self { rank, layers, arena: WeightArenaLayout::new(format!("inkling2/target/{rank}"), builder.tensors)?,
+                core: builder.core })
         }).collect()
     }
 
@@ -74,7 +78,11 @@ impl CoordinatorWeights {
             }
             true
         }).map(|(name, view)| (name.clone(), view.bytes())).collect::<Vec<_>>();
-        Ok(Self { rank: 0, layers: layers.to_vec(), arena: WeightArenaLayout::new("inkling2/golden/target", selected)? })
+        let core = whole.core.into_iter().filter(|(stem, _)| {
+            stem.strip_prefix(&format!("{TEXT}layers.")).and_then(|rest| rest.split('.').next())
+                .and_then(|layer| layer.parse::<usize>().ok()).is_none_or(|layer| layers.contains(&layer))
+        }).collect();
+        Ok(Self { rank: 0, layers: layers.to_vec(), arena: WeightArenaLayout::new("inkling2/golden/target", selected)?, core })
     }
 
     /// Raw checkpoint operands need only a bounded reused source buffer: no
@@ -83,6 +91,11 @@ impl CoordinatorWeights {
         use crate::shared::dense_read::{MountLoad, ReadBatch, STEP_BYTES};
         let mut load = MountLoad::default();
         for (view_name, view) in self.arena.views() {
+            if self.core.values().any(|layout| {
+                let prefix = if layout.ranks == 2 { format!("{}#rank{}.", layout.stem, layout.rank) }
+                    else { format!("{}.", layout.stem) };
+                view_name.starts_with(&prefix)
+            }) { continue; }
             let (name, share) = match view_name.split_once('#') { Some((name, _)) => (name, 2), None => (view_name.as_str(), 1) };
             let header = checkpoint.header(name).with_context(|| format!("Inkling 2 mount lacks {name}"))?;
             ensure!(header.byte_length == view.bytes() as u64 * share, "Inkling 2 mount {name}: admitted bytes differ");
@@ -92,7 +105,26 @@ impl CoordinatorWeights {
             let row_bytes = view.bytes() / rows;
             load.merge(MountLoad::read(ReadBatch::new(rows, row_bytes, row_bytes, STEP_BYTES)?));
         }
+        for layout in self.core.values() {
+            for suffix in ["trellis", "suh", "svh"] {
+                let header = checkpoint.header(&format!("{}.{}", layout.stem, suffix))
+                    .context("Inkling compact mount lacks validated member")?;
+                let rows = header.shape.first().copied().unwrap_or(1);
+                let width = usize::try_from(header.byte_length)? / rows;
+                load.merge(MountLoad::read(ReadBatch::new(rows, width, width, STEP_BYTES)?));
+            }
+        }
         Ok(load)
+    }
+
+    /// Native ordered-K16 relative projection consumes a padded transpose in
+    /// the same target backing, in addition to the unchanged checkpoint view.
+    pub fn execution_arena(&self) -> Result<WeightArenaLayout> {
+        let mut tensors = self.arena.views().iter().map(|(name, view)| (name.clone(), view.bytes())).collect::<Vec<_>>();
+        for &layer in &self.layers {
+            tensors.push((format!("{TEXT}layers.{layer}.attn.rel_logits_proj.padded"), 1024*64*2));
+        }
+        WeightArenaLayout::new(self.arena.id(), tensors)
     }
 
     /// Charge one arena backing and its one driver-allocation tail. Tensor
@@ -101,7 +133,8 @@ impl CoordinatorWeights {
         -> std::result::Result<Vec<crate::placement::planner::Component>, crate::placement::planner::Refusal> {
         use crate::placement::planner::{weight_arena_components, Lifetime, Location, Refusal};
         let rank = u8::try_from(self.rank).map_err(|_| Refusal::Overflow("Inkling 2 coordinator rank"))?;
-        weight_arena_components(&self.arena, Location::coordinator(rank), Lifetime::RESIDENT,
+        let arena = self.execution_arena().map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+        weight_arena_components(&arena, Location::coordinator(rank), Lifetime::RESIDENT,
             maximum_pages, cuteafd_core::memory_layout::MemoryKind::Weights)
     }
 }
@@ -109,9 +142,31 @@ impl CoordinatorWeights {
 struct Builder<'a> {
     checkpoint: &'a Checkpoint,
     tensors: Vec<(String, usize)>,
+    core: BTreeMap<String, CoreWeightLayout>,
 }
 
 impl Builder<'_> {
+    fn projection(&mut self, name: String, shape: &[usize], axis: usize, split: Option<usize>) -> Result<()> {
+        let stem = name.strip_suffix(".weight").context("Inkling projection suffix")?;
+        if !self.checkpoint.contains_tensor(&format!("{stem}.trellis")) {
+            return self.shard(name, DType::Bf16, shape, axis, split);
+        }
+        let expected = BTreeMap::from([(name.clone(), shape.to_vec())]);
+        let mut projections = crate::formats::trellis_core::read_projections(self.checkpoint, &expected,
+            |member| member.strip_prefix(stem).is_some_and(|rest| rest.starts_with('.')),
+            |candidate| (candidate == stem).then_some(CoreContract { family: "Inkling 2", widths: &[6, 8],
+                split: if split.is_none() { CoreSplit::Whole } else if axis == 0 { CoreSplit::Output } else { CoreSplit::Input },
+                padded_outputs: stem == "model.llm.unembed", view_varying: true }))?;
+        let projection = projections.remove(stem).context("Inkling core projection headers absent")?;
+        let layout = CoreWeightLayout::new(&projection,
+            if axis == 0 { TrellisSide::Output } else { TrellisSide::Input }, split.unwrap_or(0),
+            if split.is_some() { 2 } else { 1 })?;
+        let prefix = if let Some(rank) = split { format!("{stem}#rank{rank}") } else { stem.to_owned() };
+        self.tensors.extend(layout.arena_tensors(&prefix)?);
+        self.core.insert(stem.to_owned(), layout);
+        Ok(())
+    }
+
     fn plain(&mut self, name: String, dtype: DType, shape: &[usize]) -> Result<()> {
         let header = self.checkpoint.header(&name)
             .with_context(|| format!("Inkling 2 arena requires checkpoint header {name}"))?;
@@ -157,7 +212,7 @@ impl Builder<'_> {
         // rows of the projections, input columns of wo_ud).
         for (name, n, k, axis) in [("wq_du", q, h, 0), ("wr_du", r, h, 0), ("wk_dv", kv, h, 0), ("wv_dv", kv, h, 0),
             ("gate_attn", q, h, 0), ("attn_sink_proj", cfg.heads, h, 0), ("wo_ud", h, q, 1)] {
-            self.shard(format!("{a}.{name}.weight"), DType::Bf16, &[n, k], axis, split)?;
+            self.projection(format!("{a}.{name}.weight"), &[n, k], axis, split)?;
         }
         self.shard(format!("{a}.q_l2_clip.scale"), DType::Bf16, &[cfg.heads, d], 0, split)?;
         self.shard(format!("{a}.rel_l2_clip.scale"), DType::Bf16, &[cfg.heads, cfg.d_rel], 0, split)?;

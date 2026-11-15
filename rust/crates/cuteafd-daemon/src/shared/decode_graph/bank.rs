@@ -226,8 +226,14 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         assert!(std::sync::Arc::ptr_eq(&binding.cache, &ticket.cache), "graph ticket belongs to a different device cache");
         assert!(!ticket.committed, "graph capture ticket already settled");
         self.cache_topology(ticket.id, nodes, width, spans_devices);
-        self.cache_insert(key, exec, ticket.id, ticket.pinned);
+        self.cache_insert(key.clone(), exec, ticket.id, ticket.pinned);
         ticket.committed = true;
+        let retained = ticket.cache.lock().unwrap_or_else(|p| p.into_inner()).completed_capture(ticket.id);
+        if !retained {
+            // The caller may already hold the raw executable for its first
+            // launch. Retain its owner until ordinary drained bank teardown.
+            if let Some(entry) = self.entries.get_mut(&key) { entry.cached = None; }
+        }
     }
 
     /// Cancel a failed capture, backing off allocation failures by exact key.
@@ -396,6 +402,32 @@ mod device_tests {
     use super::super::device::{Cycle, Miss, Preference, ReleaseMeasurement, Site};
     fn site() -> Site { Site { name: "bank-test", cycle: Cycle::Decode, preference: Preference::Capture, bootstrap: 10, basis: super::super::device::Basis::Bytes, spans_devices: false } }
     #[test]
+    fn failed_commit_measurement_retains_owner_and_charges_until_drained_teardown() -> anyhow::Result<()> {
+        use std::{cell::Cell, rc::Rc};
+        struct Exec(Rc<Cell<usize>>);
+        impl Drop for Exec { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory_usage(&library, 6, 64 << 20, 0)?;
+        let mut bank = GraphBank::new();
+        bank.attach_device(&library, 6, 32 << 20, site())?;
+        let ticket = bank.cache_ticket(&1, false, None).unwrap();
+        let drops = Rc::new(Cell::new(0));
+        fixture.configure_memory(&library, 6, 0)?;
+        bank.cache_commit(1, Exec(drops.clone()), ticket, 7, 1, false);
+        assert_eq!(drops.get(), 0, "raw first launch may still use the retained executable");
+        assert!(bank.cached_launch(&1).is_some());
+        assert!(bank.cache_needs_boundary(), "fallback credit awaits a recoverable physical sample");
+        let snapshot = super::super::device::snapshots().into_iter().find(|row| row.device == 6).unwrap();
+        assert_eq!(snapshot.charged, 10, "retained owner is conservatively charged");
+        assert!(snapshot.hard_stopped);
+        assert!(bank.cache_ticket(&2, false, None).is_none());
+        bank.cache_clear_drained();
+        assert_eq!(drops.get(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn device_eviction_destroys_only_after_successful_drain() {
         use std::{cell::Cell, rc::Rc};
         struct Exec(Rc<Cell<usize>>);
@@ -406,10 +438,8 @@ mod device_tests {
         let Miss::Capture(id) = bank.cache_miss(&1, false, None) else { panic!() };
         bank.cache_insert(1, Exec(drops.clone()), id, false);
         bank.cache_measured(10);
-        // Same proven kind in another bank needs this graph's slot.
         let cache = bank.device.as_ref().unwrap().cache.clone();
-        let Miss::Eager = cache.lock().unwrap().miss(super::super::device::Identity {
-            bank: 99, site: "bank-test", key: 1, shape: "1".into() }, site(), None, false) else { panic!() };
+        assert_eq!(cache.lock().unwrap().mark_victim(false), Some(id));
         assert!(bank.cache_drain(|| anyhow::bail!("not drained"), || unreachable!()).is_err());
         assert_eq!(drops.get(), 0);
         bank.cache_drain(|| { assert_eq!(drops.get(), 0); Ok(()) }, || {
@@ -420,7 +450,7 @@ mod device_tests {
     #[test]
     fn persistent_eviction_without_victims_preserves_pending_capture() {
         let mut bank = GraphBank::new();
-        bank.attach_device_for_test(-319, 1000, site()).unwrap();
+        bank.attach_device_for_test(-319, 64 << 20, site()).unwrap();
         let ticket = bank.cache_ticket(&1, false, None).unwrap();
         bank.cache_commit(1, 42, ticket, 1, 1, false);
         let cache = bank.device.as_ref().unwrap().cache.clone();
@@ -443,12 +473,13 @@ mod device_tests {
         impl Drop for Exec { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
         let drops = Rc::new(Cell::new(0));
         let mut bank = GraphBank::new();
-        bank.attach_device_for_test(-318, 20, site()).unwrap();
+        bank.attach_device_for_test(-318, 64 << 20, site()).unwrap();
         let ticket = bank.cache_ticket(&1, false, None).unwrap();
         bank.cache_commit(1, Exec(drops.clone()), ticket, 1, 1, false);
         bank.cache_measured(10);
         for key in 2..20 {
-            assert!(bank.cache_ticket(&key, false, None).is_none());
+            let cache = bank.device.as_ref().unwrap().cache.clone();
+            assert!(cache.lock().unwrap().mark_victim(false).is_some());
             // SAFETY: fixture executables own no captured buffers or native work.
             unsafe { bank.cache_evict_persistent(); }
             assert_eq!(drops.get(), key - 1);
@@ -668,7 +699,7 @@ mod device_tests {
     #[test]
     fn transient_interned_keys_are_pruned_at_boundary() {
         let mut bank: GraphBank<u32, u32> = GraphBank::new();
-        bank.attach_device_for_test(-305, 1, site()).unwrap();
+        bank.attach_device_for_test(-305, 0, site()).unwrap();
         assert!(matches!(bank.cache_miss(&1, false, None), Miss::Eager));
         assert_eq!(bank.cache_keys.len(), 1);
         bank.cache_tick();

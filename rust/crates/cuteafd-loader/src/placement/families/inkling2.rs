@@ -89,10 +89,20 @@ fn refusal(error: anyhow::Error) -> Refusal { invalid(format!("{error:#}")) }
 /// The installed coordinator expert package for the checkpoint's storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalPackage {
-    /// Executor workspace per GPU at the admitted unit (TP1 or TP2 layout).
-    Installed { workspace: [u64; 2] },
+    /// One weight arena and distinct workspace requests per homogeneous backend,
+    /// for every admitted onboarding prefix, in logical coordinator-rank order.
+    Installed { backings: Vec<Vec<LocalBacking>> },
     /// No package beside the manifest: onboarding counts above zero are refused.
     Missing(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBacking {
+    pub gpu: usize,
+    pub layers: Vec<usize>,
+    pub arena: WeightArenaLayout,
+    /// Named physical requests, never an aggregate CUDA allocation.
+    pub workspace: Vec<(String, u64)>,
 }
 
 /// One Spark rank's charges at one onboarding count (layers `count..` remote).
@@ -135,6 +145,8 @@ pub struct InklingInputs {
     pub prefill: PrefillShape,
     /// Boot concurrency C: per-sequence rings, conv lags, page tables, selector.
     pub sequences: u64,
+    pub prefix_entries: u64,
+    pub prefix_mark_budget: u64,
     /// Per-rank target arenas (one per coordinator GPU).
     pub targets: Vec<CoordinatorWeights>,
     /// The resolved attention placement and every layer's mode under it.
@@ -185,13 +197,13 @@ pub fn request(context: Context, pool: Option<u64>, onboard: crate::placement::O
         prefill: Pin::Exact(prefill), operation, resident_weight_limit, spark_reply_formats: replies }
 }
 
-/// The Spark request wire for a layer's expert storage: MXFP8 experts
-/// consume the checkpoint's own group-32 E4M3 + UE8M0 activations (the K32
-/// frame the FP8 families already send), NVFP4 and EXL3 experts consume BF16
-/// rows and quantize or dequantize on the Spark.
+/// Installed backend input contract: native MXFP8 and shared EXL3 workers
+/// consume FP8 K32 transport rows; dynamic NVFP4 quantizes BF16 on the Spark.
+/// EXL3 weight payloads remain native trellis throughout.
 pub fn ingress(storage: Option<crate::plan::families::inkling2::ExpertStorage>) -> cuteafd_core::SparkIngress {
     match storage {
-        Some(crate::plan::families::inkling2::ExpertStorage::Mxfp8) => cuteafd_core::SparkIngress::Fp8K32,
+        Some(crate::plan::families::inkling2::ExpertStorage::Mxfp8
+            | crate::plan::families::inkling2::ExpertStorage::Exl3 { .. }) => cuteafd_core::SparkIngress::Fp8K32,
         _ => cuteafd_core::SparkIngress::Bf16,
     }
 }
@@ -237,15 +249,12 @@ pub struct SequenceState {
 
 impl SequenceState {
     pub fn new(cfg: &Inkling2Config, local: bool) -> Result<Self, Refusal> {
-        let kv_row = (cfg.kv_heads * cfg.head_dim * 2) as u64;
-        let ring = if local {
-            let ring = cuteafd_core::prefix::swa_ring(cfg.window as u64, u64::from(DECODE_ROWS), PAGE_ROWS)
-                .ok_or_else(|| invalid("sliding-window ring geometry"))?;
-            ring.rows.checked_mul(2 * kv_row).ok_or(Refusal::Overflow("Inkling 2 SWA ring"))?
-        } else { 0 };
-        let kv_lags = (cfg.sconv_kernel as u64 - 1) * 2 * kv_row;
-        let lags = kv_lags + (cfg.sconv_kernel as u64 - 1) * 2 * cfg.hidden as u64 * 2;
-        Ok(Self { ring_bytes: ring, lag_bytes: lags, kv_lag_bytes: kv_lags })
+        let layout = crate::families::inkling2::execution::SequenceLayout::new(cfg, local, 1)
+            .map_err(|error| invalid(error.to_string()))?;
+        let ring = layout.fields["ring"].len();
+        let kv_lags = layout.fields["k_conv_history"].len() + layout.fields["v_conv_history"].len();
+        Ok(Self { ring_bytes: ring as u64, lag_bytes: (layout.bytes - ring) as u64,
+            kv_lag_bytes: kv_lags as u64 })
     }
 }
 
@@ -269,6 +278,13 @@ fn with(mut components: Vec<Component>, activation: &Activation) -> Vec<Componen
 
 impl InklingInputs {
     pub fn maximum_pages(&self) -> u64 { self.maximum_pool_tokens.div_ceil(self.page_rows()) }
+
+    fn mark_bytes(&self) -> Result<u64, Refusal> {
+        (0..self.cfg.layers).try_fold(0u64, |bytes, layer| {
+            let state = SequenceState::new(&self.cfg, self.cfg.local[layer])?;
+            bytes.checked_add(state.ring_bytes + state.lag_bytes).ok_or(Refusal::Overflow("Inkling mark bytes"))
+        })
+    }
 
     fn modes(&self) -> Vec<LayerMode> { self.modes.clone() }
 
@@ -304,7 +320,7 @@ impl InklingInputs {
         // a replicated residual on both ranks (no hop).
         let terminal = if self.modes.iter().all(|mode| matches!(mode, LayerMode::Whole { .. })) {
             TerminalHome::AttentionOwner } else { TerminalHome::Replicated };
-        HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: rows * self.cfg.hidden as u64 * 2,
+        HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: rows * self.cfg.hidden as u64 * 4,
             rows: self.prefill.rows.max(u64::from(DECODE_ROWS)), lanes: LANES, entry_gpu: 0,
             head_gpu: self.head_gpu(), terminal }
     }
@@ -369,13 +385,15 @@ impl InklingInputs {
     fn arena_bytes(&self, count: usize) -> Result<[u64; 2], Refusal> {
         let mut out = [0u64; 2];
         if count == 0 { return Ok(out); }
-        let LocalPackage::Installed { workspace } = &self.local else {
+        let LocalPackage::Installed { backings } = &self.local else {
             return Err(invalid("onboarded layers need an installed Inkling 2 RTX expert package"));
         };
-        for gpu in 0..self.gpus {
-            let weights = self.experts[..count].iter().try_fold(0u64, |sum, layer| sum.checked_add(
-                if self.gpus == 2 { layer.half[gpu] } else { layer.whole })).ok_or(Refusal::Overflow("Inkling 2 expert arena"))?;
-            out[gpu] = weights.checked_add(workspace[gpu]).ok_or(Refusal::Overflow("Inkling 2 expert arena"))?;
+        for backing in backings.get(count).ok_or_else(|| invalid("missing onboarding owner prefix"))? {
+            if backing.gpu >= self.gpus { return Err(invalid("local backend rank outside placement")); }
+            let workspace = backing.workspace.iter().try_fold(0u64, |sum, (_, bytes)| sum.checked_add(*bytes))
+                .ok_or(Refusal::Overflow("Inkling expert workspace"))?;
+            out[backing.gpu] = out[backing.gpu].checked_add(backing.arena.bytes() as u64)
+                .and_then(|bytes| bytes.checked_add(workspace)).ok_or(Refusal::Overflow("Inkling local backend"))?;
         }
         Ok(out)
     }
@@ -385,35 +403,14 @@ impl InklingInputs {
     /// block stack, router scores and expert activation staging. Named per
     /// plane so the ledger reconciles them one by one.
     fn unit_owners(&self, prefix: &str, gpu: usize, rows: u32, maximum: u64) -> Result<Vec<Component>, Refusal> {
-        let cfg = &self.cfg;
         let location = Location::coordinator(gpu as u8);
-        let r = u64::from(rows);
-        let (h, d, heads, kv) = (cfg.hidden as u64, cfg.head_dim as u64, cfg.heads as u64, cfg.kv_heads as u64);
-        let planes: [(&str, u64); 14] = [
-            ("x", r * h * 2),                                   // mixed layer input (BF16)
-            ("q", r * heads * d * 2),
-            ("r", r * heads * cfg.d_rel as u64 * 2),
-            ("gate", r * heads * d * 2),
-            ("sinks", r * heads * 4),                           // F32 per (token, head)
-            ("k", r * kv * d * 2),
-            ("v", r * kv * d * 2),
-            ("rel_logits", r * heads * cfg.window.max(cfg.rel_extent) as u64 * 2), // the largest plane
-            ("attention", r * heads * d * 2),
-            ("conv_out", r * h * 2),                            // attn_sconv / mlp_sconv output
-            ("blocks", r * (cfg.residual_blocks() as u64 + 1) * h * 2), // completed blocks + partial
-            ("router", r * cfg.experts as u64 * 4),             // F32 scores
-            ("routes", r * cfg.topk as u64 * 8),                // ids + weights
-            ("expert_in", r * (h + h / 32)),                    // MXFP8 K32 request staging
-        ];
+        let context = usize::try_from(self.context.maximum).map_err(|_| Refusal::Overflow("Inkling context"))?;
+        let layout = crate::families::inkling2::execution::UnitLayout::serving(&self.cfg, rows as usize, context)
+            .map_err(refusal)?;
         let mut out = Vec::new();
-        for (name, bytes) in planes {
-            out.extend(buffer(format!("{prefix}.{name}"), location, bytes, Lifetime::TARGET, Category::Workspace,
-                "Inkling 2 row-unit planes (geometry formula)", maximum));
-        }
-        let metadata: [(&str, u64); 4] = [("positions", r * 8), ("slots", r * 8), ("batch_ids", r * 4), ("causal_lengths", r * 4)];
-        for (name, bytes) in metadata {
-            out.extend(buffer(format!("{prefix}.metadata.{name}"), location, bytes, Lifetime::TARGET, Category::Workspace,
-                "Inkling 2 unit metadata", maximum));
+        for (name, bytes) in layout.buffers {
+            out.extend(buffer(format!("{prefix}.{name}"), location, bytes as u64, Lifetime::TARGET, Category::Workspace,
+                "Inkling native forward UnitLayout owner", maximum));
         }
         Ok(out)
     }
@@ -428,8 +425,7 @@ impl InklingInputs {
         let mut out = Vec::new();
         let target = self.targets.get(gpu).ok_or_else(|| invalid("missing target arena"))?;
         out.extend(target.weight_components(maximum)?);
-        // Whole-owner global layers: K and V pages on the owner only, one
-        // physical backing per plane that scales with the pool. Local layers
+        // One interleaved K/V record backing per owned global layer. Local layers
         // keep no pool pages: their window lives in the per-sequence ring.
         let kv_row = (cfg.kv_heads * cfg.head_dim * 2) as u64;
         let page_rows = self.page_rows();
@@ -446,13 +442,11 @@ impl InklingInputs {
             if !cfg.local[layer] {
                 // One page of records on this rank: heads split the row; context
                 // parity interleaves whole pages (page_rows doubles, half land here).
-                let stride = page_rows * kv_row * num / den;
-                for name in ["keys", "values"] {
-                    out.push(Component::allocation(Allocation::buffer(format!("inkling2.kv.{layer}.{gpu}.{name}"), location,
-                        stride, Lifetime::TARGET, Category::Kv, "global-layer paged KV records"),
-                        ByteCurve::linear_rounded(stride, stride, maximum, SM120_ALLOCATION_GRANULARITY_BYTES),
-                        false, maximum));
-                }
+                let stride = page_rows * 2 * kv_row * num / den;
+                out.push(Component::allocation(Allocation::buffer(format!("inkling2.kv.{layer}.{gpu}.records"), location,
+                    stride, Lifetime::TARGET, Category::Kv, "global-layer interleaved BF16 KV records"),
+                    ByteCurve::linear_rounded(stride, stride, maximum, SM120_ALLOCATION_GRANULARITY_BYTES),
+                    false, maximum));
             }
             let state = SequenceState::new(cfg, cfg.local[layer])?;
             // Rings split by KV head; the hidden-stream conv lags are replicated
@@ -472,12 +466,14 @@ impl InklingInputs {
         // Sliding-window rings and short-conv lag rows for every admitted
         // sequence: the prefix-mark arena a snapshot copies (byte-identical
         // restores), sized by concurrency, not context.
-        out.extend(buffer(format!("inkling2.marks.{gpu}"), location, marks, Lifetime::TARGET, Category::Prefix,
-            "sliding-window rings and conv lag rows per sequence (geometry formula)", maximum));
-        // Page tables for every admitted sequence at the compiled context (global layers only).
-        let pages = u64::from(context).div_ceil(page_rows);
-        out.extend(buffer(format!("inkling2.cache.{gpu}.page_table"), location, sequences * pages * 4 + sequences * 8,
-            Lifetime::TARGET, Category::Kv, "global-layer page tables and lengths", maximum));
+        out.extend(buffer(format!("inkling2.cache.{gpu}.active"), location, marks, Lifetime::TARGET, Category::Kv,
+            "active SWA rings and FP32 convolution lags", maximum));
+        let per_sequence = marks / sequences;
+        let slots = cuteafd_core::prefix::mark_slots_with_host(self.sequences, self.prefix_entries,
+            self.mark_bytes()?, self.prefix_mark_budget, self.host_prefix.quota_bytes > 0);
+        let retained = per_sequence.checked_mul(slots).ok_or(Refusal::Overflow("Inkling prefix marks"))?;
+        out.extend(buffer(format!("inkling2.cache.{gpu}.marks"), location, retained, Lifetime::TARGET, Category::Prefix,
+            "exact retained SWA and FP32 convolution marks", maximum));
         // One decode lane on every rank (its layers' work), then one owner set
         // per in-flight prefill slot (PrefillHooks unit slots).
         out.extend(self.unit_owners(&format!("inkling2.decode.{gpu}"), gpu, DECODE_ROWS, maximum)?);
@@ -516,8 +512,9 @@ impl InklingInputs {
         let head = self.head_gpu();
         let cfg = &self.cfg;
         let rows = u64::from(DECODE_ROWS);
-        let buffers: [(&str, u64); 3] = [("tokens", rows * 4), ("normalized", rows * cfg.hidden as u64 * 2),
-            ("logits", rows * cfg.vocab_size as u64 * 4)];
+        let buffers: [(&str, u64); 4] = [("tokens", rows * 4), ("normalized", rows * cfg.hidden as u64 * 2),
+            ("logits", rows * cfg.unpadded_vocab_size as u64 * 4),
+            ("workspace", cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64)];
         let mut out = Vec::new();
         for (name, bytes) in buffers {
             out.extend(buffer(format!("inkling2.head.{name}"), Location::coordinator(head), bytes, Lifetime::TARGET,
@@ -602,23 +599,18 @@ impl Recipe for InklingInputs {
                 requires.push(Requires { when: Choice { variable: onboard, option }, any_of: vec![] });
                 continue;
             }
-            let arenas = self.arena_bytes(count)?;
-            for gpu in 0..self.gpus {
-                if arenas[gpu] == 0 { continue; }
-                let weights = arenas[gpu] - match &self.local {
-                    LocalPackage::Installed { workspace } => workspace[gpu], LocalPackage::Missing(_) => 0 };
-                let group = if pair { format!("TP2 expert layer halves 0..{count}") }
-                    else { format!("resident routed layers 0..{count}") };
-                let id = format!("inkling2.experts.{gpu}.{count}");
-                let location = Location::coordinator(gpu as u8);
-                let owner = Allocation::buffer(&id, location, arenas[gpu], Lifetime::RESIDENT, Category::Experts, group);
-                let mut resident = Component::resident_weight(
-                    ResidentWeight::from_allocation(&owner, ResidentWeights(weights)), ByteCurve::fixed(weights, maximum));
-                resident.activation = activation.clone();
-                components.push(resident);
-                let mut arena = Component::allocation(owner, ByteCurve::fixed(arenas[gpu], maximum), false, maximum);
-                arena.activation = activation.clone();
-                components.push(arena);
+            if count > 0 {
+                let LocalPackage::Installed { backings } = &self.local else { unreachable!() };
+                for (group, backing) in backings.get(count).ok_or_else(|| invalid("missing onboarding owner prefix"))?.iter().enumerate() {
+                    let location = Location::coordinator(backing.gpu as u8);
+                    components.extend(with(weight_arena_components(&backing.arena, location, Lifetime::RESIDENT,
+                        maximum, MemoryKind::Experts)?, &activation));
+                    for (name, bytes) in &backing.workspace {
+                        components.extend(with(buffer(format!("inkling2.expert_workspace.{}.{}.{}.{}", backing.gpu, count, group, name),
+                            location, *bytes, Lifetime::RESIDENT, Category::Workspace,
+                            "installed homogeneous expert backend request", maximum).into_iter().collect(), &activation));
+                    }
+                }
             }
             if count < self.routed.len() {
                 for (rank, charge) in self.spark[count].iter().enumerate() {
@@ -690,7 +682,7 @@ impl Recipe for InklingInputs {
                 decode: Some(request.spark_reply_formats.decode()) }),
             resident_weight_limit: request.resident_weight_limit, page_rows: self.page_rows(), pool_page_multiple: 1,
             maximum_pages: maximum, gpus: self.gpus, variables: contract_variables, requires, components };
-        // `page_rows` is the parity-doubled page under context; one backing per plane either way.
+        // Context uses parity-doubled pages; every global layer has one record backing.
         contract.add_driver_page_tables();
         Ok(contract)
     }
@@ -745,6 +737,14 @@ mod tests {
     }
 
     #[test]
+    fn ingress_matches_shared_exl3_and_native_package_inputs() {
+        use crate::plan::families::inkling2::ExpertStorage;
+        assert_eq!(ingress(Some(ExpertStorage::Mxfp8)), cuteafd_core::SparkIngress::Fp8K32);
+        assert_eq!(ingress(Some(ExpertStorage::Exl3 { bits: 4 })), cuteafd_core::SparkIngress::Fp8K32);
+        assert_eq!(ingress(Some(ExpertStorage::Nvfp4)), cuteafd_core::SparkIngress::Bf16);
+    }
+
+    #[test]
     fn spark_owners_cover_one_prefill_and_one_decode_lane() {
         for exl3 in [false, true] {
             let executions = spark_executions(PrefillShape { rows: 2752, waves: 3 }, exl3).unwrap();
@@ -760,11 +760,17 @@ mod tests {
         let local = SequenceState::new(&cfg, true).unwrap();
         // 1024 + 64 rows of K and V at 8 x 128 BF16 each.
         assert_eq!(local.ring_bytes, 1088 * 2 * 2048);
-        // 3 lag rows of K, V (1024 each) and the attention/MLP hidden streams (4608 each), BF16.
-        assert_eq!(local.lag_bytes, 3 * (2 * 2048 + 2 * 9216));
+        // Histories preserve F32 convolution inputs, not the BF16 KV records.
+        assert_eq!(local.lag_bytes, 3 * (2 * 4096 + 2 * 18432));
         let global = SequenceState::new(&cfg, false).unwrap();
         assert_eq!(global.ring_bytes, 0);
         assert_eq!(global.lag_bytes, local.lag_bytes);
-        assert_eq!(local.kv_lag_bytes, 3 * 2 * 2048);
+        assert_eq!(local.kv_lag_bytes, 3 * 2 * 4096);
+        for local_layer in [false, true] {
+            let whole = SequenceState::new(&cfg, local_layer).unwrap();
+            let split = crate::families::inkling2::execution::SequenceLayout::new(&cfg, local_layer, 2).unwrap();
+            assert_eq!(split.bytes as u64, whole.ring_bytes / 2 + whole.kv_lag_bytes / 2
+                + whole.lag_bytes - whole.kv_lag_bytes);
+        }
     }
 }

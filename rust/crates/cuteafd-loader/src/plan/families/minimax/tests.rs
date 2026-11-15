@@ -133,6 +133,49 @@ fn execution_inventory_is_exact_recipe_partition_before_shared_finalization() {
     }
 }
 
+/// The Spark ingress is decided once from the checkpoint's own scalars and
+/// the installed coordinator manifest, and planner charges follow it exactly.
+#[test]
+fn exact_nvfp4_ingress_needs_uniform_scales_and_the_quantizer_and_charges_wire_bytes() -> Result<()> {
+    use crate::families::minimax_m3::admission::{spark_charges, spark_ingress};
+    use crate::placement::planner::PrefillShape;
+    use cuteafd_core::SparkIngress;
+    use std::os::unix::fs::FileExt;
+    let (dir, config, _) = fixture_with_experts(4);
+    let cfg = MiniMaxM3Config::from_hf(&config)?;
+    let catalog = crate::read_expert_catalog(dir.path())?;
+    let full = Checkpoint::open(dir.path())?;
+    let routed = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
+    let write = |name: String, value: f32| {
+        let header = full.header(&name).unwrap();
+        std::fs::File::options().write(true).open(dir.path().join("model-00001-of-00001.safetensors")).unwrap()
+            .write_all_at(&value.to_le_bytes(), header.byte_offset).unwrap();
+    };
+    let scale = |expert: usize, w: &str| format!("{TEXT}layers.3.block_sparse_moe.experts.{expert}.{w}.input_global_scale");
+    for expert in 0..4 { for w in ["w1", "w3", "w2"] { write(scale(expert, w), 1.0); } }
+    let with = serde_json::json!({"programs": [{"name": cuteafd_ffi::minimax_m3::wire::NAME}]});
+    let without = serde_json::json!({"programs": []});
+    assert_eq!(spark_ingress(&catalog, &cfg, &routed, &without)?.ingress, SparkIngress::Bf16,
+        "no installed quantizer keeps BF16");
+    let plan = spark_ingress(&catalog, &cfg, &routed, &with)?;
+    assert_eq!(plan.ingress, SparkIngress::Nvfp4);
+    assert_eq!(plan.scales, (0..cfg.layers).map(|layer| (layer == 3).then_some(1.0)).collect::<Vec<_>>());
+    let shape = PrefillShape { rows: 1024, waves: 3 };
+    let bf16 = spark_charges(&full, &catalog, &routed, 3, shape, SparkIngress::Bf16)?;
+    let nvfp4 = spark_charges(&full, &catalog, &routed, 3, shape, SparkIngress::Nvfp4)?;
+    // Endpoint intake + mapped rings + owner input plane shrink; resident experts do not.
+    for (bf16, nvfp4) in bf16[0].iter().zip(&nvfp4[0]) {
+        assert_eq!((bf16.experts, bf16.runtime), (nvfp4.experts, nvfp4.runtime));
+        assert!(bf16.owners - nvfp4.owners >= 2 * 1024 * (12288 - 3472) as u64,
+            "intake and owner input planes both carry wire rows: {} -> {}", bf16.owners, nvfp4.owners);
+    }
+    // One expert's gate scale off by one ulp keeps BF16 (per-expert static scales).
+    write(scale(2, "w1"), f32::from_bits(1.0f32.to_bits() + 1));
+    write(scale(2, "w3"), f32::from_bits(1.0f32.to_bits() + 1));
+    assert_eq!(spark_ingress(&catalog, &cfg, &routed, &with)?.ingress, SparkIngress::Bf16);
+    Ok(())
+}
+
 #[test]
 fn coordinator_and_peer_spark_charges_use_the_canonical_operand_headers() -> Result<()> {
     use crate::families::minimax_m3::admission::{spark_checkpoint, spark_charges};
@@ -155,15 +198,15 @@ fn coordinator_and_peer_spark_charges_use_the_canonical_operand_headers() -> Res
     for world in 2..=8 {
         let recipe = |checkpoint: &Checkpoint| plan::experts::checkpoint_spark_recipe(checkpoint, world, &routed);
         assert_eq!(recipe(&canonical)?, recipe(&full)?);
-        assert_eq!(spark_charges(&coordinator, &catalog, &routed, world, shape)?,
-            spark_charges(&full, &catalog, &routed, world, shape)?);
+        assert_eq!(spark_charges(&coordinator, &catalog, &routed, world, shape, cuteafd_core::SparkIngress::Bf16)?,
+            spark_charges(&full, &catalog, &routed, world, shape, cuteafd_core::SparkIngress::Bf16)?);
     }
     // Original callers without a selected view use the same canonical HF source.
     let mut original = Checkpoint::coordinator_view(&view, false, false)?;
     original.view = None;
-    assert_eq!(spark_charges(&original, &catalog, &routed, 3, shape)?,
-        spark_charges(&full, &catalog, &routed, 3, shape)?);
-    assert_eq!(spark_charges(&coordinator, &catalog, &routed, 0, shape)?,
+    assert_eq!(spark_charges(&original, &catalog, &routed, 3, shape, cuteafd_core::SparkIngress::Bf16)?,
+        spark_charges(&full, &catalog, &routed, 3, shape, cuteafd_core::SparkIngress::Bf16)?);
+    assert_eq!(spark_charges(&coordinator, &catalog, &routed, 0, shape, cuteafd_core::SparkIngress::Bf16)?,
         vec![Vec::new(); routed.len() + 1]);
     Ok(())
 }
@@ -763,7 +806,9 @@ fn recipe_inputs(gpus: usize, ranks: usize) -> crate::placement::families::minim
         }).collect(),
         local: LocalPackage::Installed { scratch: 64 << 20, output: prefill.rows * cfg.hidden as u64 * 2 },
         spark: (0..=routed.len()).map(charge).collect(),
-        links: shared::spark_link(0, ranks, prefill, Default::default()).unwrap(),
+        links: shared::spark_link(0, ranks, prefill, Default::default(), cuteafd_core::SparkIngress::Bf16).unwrap(),
+        spark_ingress: crate::families::minimax_m3::admission::SparkIngressPlan {
+            ingress: cuteafd_core::SparkIngress::Bf16, scales: vec![None; cfg.layers] },
         spark_reply_formats: Default::default(), drafter: None, vision: None, budgets,
         code: vec![64 << 20; gpus], measured_context: vec![0; gpus],
         graph_reserve: vec![500 << 20; gpus], head: serving::BlasHead::Gemm,

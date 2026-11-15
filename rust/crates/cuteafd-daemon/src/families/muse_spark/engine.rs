@@ -136,15 +136,15 @@ impl<'a> RankResources<'a> {
         ensure!(built.projections[rank].native_head.as_ref() == expected_head,
             "Muse native head ownership differs from admission");
         // Programs before any allocation: a missing export refuses here.
-        let bound = device.run(|| RankPrograms::bind(programs, ranks))?;
+        let bound = device.run(|| RankPrograms::bind(programs, ranks, built.kv_cache))?;
         let core = CorePrograms::load(programs, device, built.projections.get(rank).context("Muse rank projections")?)?;
         let layers = load_rank(device, cfg, checkpoint, &built.layouts, rank, arena)?;
-        let kv = RankKv::allocate(device, cfg, &MuseCacheLayout::new(cfg, ranks)?, placement, rank, slots)?;
+        let kv = RankKv::allocate(device, cfg, &MuseCacheLayout::with_format(cfg, ranks, built.kv_cache)?, placement, rank, slots)?;
         let plan = shared::rope_tables(cfg, context)?;
         let recipe = *plan.recipes.first().context("Muse rotary plan has no recipe")?;
         let rotary = RotaryTables::load(device, programs, plan, "muse_", u64::MAX, &[])?;
         let rope = rotary.get(recipe)?;
-        let lane = Lane::allocate(device, &LanePlanes::with_waves(cfg, ranks, unit_rows, waves)?)?;
+        let lane = Lane::allocate(device, &LanePlanes::with_format(cfg, ranks, unit_rows, waves, built.kv_cache)?)?;
         let tp2 = (ranks == 2).then(|| -> Result<Tp2Ops<'a>> {
             Ok(Tp2Ops { add: library.f32_add()?, narrow: library.f32_bf16_narrow()? })
         }).transpose()?;

@@ -1058,11 +1058,12 @@ mod anchor_fallback_tests {
         for independent in [false, true] {
             let mut runtime = runtime(&lib, At::Never, false)?;
             let mut bank = GraphBank::new();
-            bank.attach_device(&lib, 0, 4096, Site { name: "draft_completion_fixture", cycle: Cycle::Other,
+            bank.attach_device(&lib, 0, 64 << 20, Site { name: "draft_completion_fixture", cycle: Cycle::Other,
                 preference: Preference::Adaptive, bootstrap: 16, basis: Basis::Bytes, spans_devices: false })?;
             let ticket = bank.cache_ticket(&1, false, None).context("fixture admission")?;
             bank.cache_commit(1, (), ticket, 1, 1, false);
-            assert!(bank.cache_needs_boundary());
+            assert!(!bank.cache_needs_boundary(), "commit already sampled physical growth");
+            let pending = bank.cache_ticket(&2, false, None).context("pending completion fixture")?;
             runtime.chains[1].graph_bank = Some(bank);
             let round = seeds(&[1, 2]);
             if independent {
@@ -1075,6 +1076,7 @@ mod anchor_fallback_tests {
             }
             assert!(!runtime.chains[1].graph_bank.as_ref().unwrap().cache_needs_boundary(),
                 "completed proposal must feed measured_capture, independent={independent}");
+            drop(pending);
             runtime.chains[1].graph_bank.as_mut().unwrap().cache_clear_drained();
         }
         Ok(())

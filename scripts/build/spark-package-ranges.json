@@ -12,6 +12,42 @@
   ],
   "spark_budget_bytes": 107374182400,
   "entries": {
+    "inkling2:mxfp8": {
+      "intermediate": 2304,
+      "minimum": 5,
+      "maximum": 8,
+      "basis": "lower_bound",
+      "worlds": [2, 3, 4, 5, 6, 7, 8],
+      "checkpoints": [{
+        "model": "thinkingmachines/Inkling-2-Small-MXFP8",
+        "revision": "3febc62259ee92ea36e2fb6e8303371c4eb3922c",
+        "routed_expert_bytes": 605414227968
+      }]
+    },
+    "inkling2:nvfp4": {
+      "intermediate": 2304,
+      "minimum": 3,
+      "maximum": 8,
+      "basis": "lower_bound",
+      "worlds": [2, 3, 4, 5, 6, 7, 8],
+      "checkpoints": [{
+        "model": "thinkingmachines/Inkling-2-Small",
+        "revision": "aac974122acd33ddb0d3e1f54433a9c5dd2249ce",
+        "routed_expert_bytes": 376090779968
+      }]
+    },
+    "inkling2:exl3": {
+      "intermediate": 2304,
+      "minimum": 2,
+      "maximum": 8,
+      "basis": "lower_bound",
+      "worlds": [2, 3, 4, 5, 6, 7, 8],
+      "checkpoints": [{
+        "model": "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC",
+        "revision": "be96d42000fa8cd7c76d1aaaa1dc9f7e3da9c963",
+        "routed_expert_bytes": 294298804224
+      }]
+    },
     "v41:mxfp4": {
       "intermediate": 2304,
       "minimum": 2,
@@ -100,7 +136,7 @@
         },
         {
           "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
-          "revision": "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d",
+          "revision": "558931fe149f59b49d19b2376a692bd7a12fb8b7",
           "routed_expert_bytes": 152648955648
         }
       ]
@@ -390,7 +426,7 @@
         },
         {
           "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
-          "revision": "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d",
+          "revision": "558931fe149f59b49d19b2376a692bd7a12fb8b7",
           "routed_expert_bytes": 152648955648
         }
       ]
