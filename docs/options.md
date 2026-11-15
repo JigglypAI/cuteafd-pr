@@ -20,6 +20,7 @@ default-off performance lever adds its row here in the same PR (AGENTS.md).
 
 | Lever | Families | Enable | Effect | Cost |
 | --- | --- | --- | --- | --- |
+| `ATTENTION_PLACEMENT=heads` | MiniMax, two RTX | Explicit `heads` (auto remains `layers`) | Unqualified timing: C1/C16/8K33.98/157.26/2215 to37.57/155.70/2336tok/s; host reclaim invalidates a default decision (#2132). | FP32 reduction-order changes can amplify checkpoint quantization thresholds; quick generated KL0.02346 to0.02469, top195.23% to94.94%; Mid bars pass. Replicated index and graph owners are charged per rank. |
 | `L2_PREFETCH` | V4.1, MiMo, Qwen4 | `L2_PREFETCH=auto` or a MiB count (unset = off; GLM 5.3 and GLM Flash already default it to `auto`) | Pulls the next layer's weights into L2 while a one-lane decode step waits on its Spark exchange. V4.1 1× RTX 5090 + 4 Sparks: every C1 cell +1.7–3.9%, C4/C8 and 8K prefill unchanged (#623); GLM 5.3 weighted +4.4%, GLM Flash C1 +6–15% (2026-09-30). | None in values (outputs byte-identical); only extra L2 traffic. |
 | `QWEN_FP8_DECODE` | Qwen4 | `QWEN_FP8_DECODE=on` (unset = checkpoint BF16) | Holds the GDN/attention projections as one resident E4M3 copy; with `QWEN_FP8_HEAD=on`, 1× RTX code C1 222→247 tok/s, C4 441→489, 8K prefill 6100→6177 (2026-10-03). | Converts target projections to FP8 at load: golden KL 0.036→0.046, top-1 88.5%→86.7%; fails the KL gate, so opt-in only. |
 | `CORE_VIEW` | GLM 5.3 / ML4, GLM Flash, Kimi K3, Step-5, Muse | `CORE_VIEW=k8-compact`, `k6-compact` or `fp8-compact` (unset = original) | Stored MC core or generic load-time block FP8 of exactly the original variant's `core_tensors`; BF16 index only. GLM Flash K4 MC, 2 RTX PRO 6000 / 0 Sparks, DFlash2, fixed 425/425 W (2026-11-12): FP8 vs original C1/C16/8K prefill 171.12/741.93/7837.57 to 196.74/772.56/7741.92 tok/s (+15.0%/+4.1%/-1.2%); pool 1628160 to 2097152. K6 is non-inferior on both measured Standard-v2 paths, with +22.8% C1 and -12.5% 8K prefill vs original. Other checkpoints unmeasured. | K8/K6 and FP8 quantize target weights. FP8 uses E4M3 + FP32 128x128 block scales. Matched Standard-v2 generated positions: FP8-minus-original KL to official BF16 ancestry +0.00289 decode/+0.00325 prefill, top-1 -0.013/-0.526 percentage points; absolute ancestry gates pass, paired decode non-inferiority passes but prefill fails (0.005 margin). Those figures ran W8A8 prefill over every group; W8A16 prefill (`FP8_PREFILL=off`) also fails prefill non-inferiority (top-1 loss 0.00263, upper95 0.00614). FP8 stays opt-in. Unsupported executor roles refuse by tensor name, never skip. Plain checkpoints refuse every compact selector, including the former plain Flash FP8 path. |
@@ -93,8 +94,8 @@ experts, FP8 MSA KV/index, GPU embedding and device token selection.
 On one RTX, `ATTENTION_PLACEMENT=auto|heads` selects whole ownership. On two RTX,
 `auto|layers` selects contiguous attention and FP32 split FFNs. Boot-C16 split
 router, FFN and fold/publication sections replay through the shared graph cache;
-attention and peer receive waits stay eager. Explicit context placement and
-two-RTX narrow-head serving remain refused.
+attention and peer receive waits stay eager. Explicit two-RTX `heads` selects
+half KV with replicated index and native FP32 partials; context remains unsupported.
 `SPECULATOR=off`, `VISION=off` and `AUDIO=off` are required for this increment.
 
 Shared launch keys keep their usual meanings. MiniMax accepts
@@ -114,8 +115,12 @@ The bounded rows 1/4/16 bootstrap records no steady C1/C16 captures or evictions
 only private arithmetic/peer scratch is padded, never KV or request rows.
 Untraced rank/concurrency shapes keep an unpinned bootstrap with no borrowed
 measured base.
-Narrow heads remain planning-only pending
-[#1856](https://github.com/tpurtell/cuteafd/issues/1856); planning still reports their owners.
+Heads boot-C16 rows1/4/16 measured82/64MiB graph owners per rank (711/540
+sections), plus one2MiB allocation tail each. The shared extra rule charges
+168/132MiB by default; Layers stays128/88MiB. Attention and exchange stay eager.
+Native512-row graph/eager logits and repeats are byte-identical. Quick generated
+fidelity uses the same Mid bars; layout-dependent reduction order can change
+quantization thresholds. Auto stays Layers pending a clean serving measurement.
 
 `./run.sh` options:
 

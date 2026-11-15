@@ -245,7 +245,7 @@ fn only_optional_bundled_components_keep_missing_execution_hints() {
 }
 
 #[test]
-fn qualified_whole_and_fp32_split_keep_narrow_heads_gated() {
+fn qualified_whole_fp32_split_and_narrow_heads_are_executable() {
     use crate::placement::OnboardSetting;
     let (dir, inputs) = heads_recipe_fixture_with_experts(128);
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
@@ -284,9 +284,8 @@ fn qualified_whole_and_fp32_split_keep_narrow_heads_gated() {
     assert!(supported.executable());
     assert_eq!(supported.runtime, Some(RuntimeStatus::Serving));
     pair.attention_placement = Some(crate::placement::AttentionPlacement::Heads);
-    let unsupported = plan::plan(dir.path(), &pair).unwrap();
-    assert!(!unsupported.native_serving_admitted && !unsupported.wip_launchable()
-        && !unsupported.executable());
+    let heads = plan::plan(dir.path(), &pair).unwrap();
+    assert!(heads.native_serving_admitted && heads.wip_launchable() && heads.executable());
 }
 
 #[test]
