@@ -203,6 +203,28 @@ mod tests {
     }
 
     #[test]
+    fn packed_members_keep_request_local_frontiers_and_shared_wire_origins() -> Result<()> {
+        use crate::shared::prefill_pipeline::UnitSegment;
+        let segments = vec![
+            UnitSegment { sequence: 2, rows: 0..2, tokens: 1087..1089, prompt_end: false, snapshot: false, head: false },
+            UnitSegment { sequence: 7, rows: 2..5, tokens: 63..66, prompt_end: true, snapshot: true, head: true },
+        ];
+        let unit = Unit { index: 0, sequence: 2, segments: segments.clone(), rows: 0..5,
+            layers: 0..48, slot: 0, barrier: false };
+        assert_eq!(members(&unit), segments);
+        let routes = (0..40).map(|route| ExpertProtocolV2RouteEntry {
+            row_index: route/8, expert_id: route%384, gate_weight: 0.125 }).collect();
+        let mut request = request(99, 3, 5, 3, 0, 5, routes, vec![0; 5*4752].into())?;
+        unit.reply_origins()?.unwrap().apply(&mut request)?;
+        assert_eq!(request.rows.iter().map(|row| row.source_request_id).collect::<Vec<_>>(), [3, 3, 8, 8, 8]);
+        assert_eq!(request.rows.iter().map(|row| row.token_position).collect::<Vec<_>>(), [1087, 1088, 63, 64, 65]);
+        let singleton = Unit { segments: vec![], rows: 63..66, ..unit };
+        assert_eq!(members(&singleton)[0].rows, 0..3);
+        assert_eq!(members(&singleton)[0].tokens, 63..66);
+        Ok(())
+    }
+
+    #[test]
     fn persistent_units_use_shared_waves_without_host_waits_or_a_private_scheduler() {
         let source = include_str!("prefill.rs").split("#[cfg(test)]").next().unwrap();
         assert!(source.contains("impl PrefillHooks for Stateful"));

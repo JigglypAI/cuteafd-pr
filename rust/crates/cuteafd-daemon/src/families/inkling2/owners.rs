@@ -100,29 +100,6 @@ impl<'a> UnitOwner<'a> {
             Ok(())
         })
     }
-    /// Queues metadata through the shared completion-held pinned arena. The
-    /// caller admits its shape and never changes the unit while consumers run.
-    pub fn metadata(&self, metadata: &cuteafd_loader::families::inkling2::execution::UnitMetadata,
-        uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
-        ensure!(metadata.rows() <= self.layout.rows && self.layout.buffers.contains_key("global_slots"),
-            "Inkling metadata does not fit serving unit");
-        self.stream.device.run(|| {
-            for (name, values) in [("positions", &metadata.positions), ("cache_slots", &metadata.local_slots),
-                ("global_slots", &metadata.global_slots), ("ring_slots", &metadata.ring_slots),
-                ("conv_slots", &metadata.conv_slots)] {
-                let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
-                // SAFETY: unit and upload arena remain owned until their drains;
-                // all writes and arithmetic consumers use this unit's stream.
-                unsafe { uploads.upload(self.buffer(name)?, &bytes, self.stream.raw)?; }
-            }
-            for (name, values) in [("first", &metadata.first), ("page_table", &metadata.page_table)] {
-                let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
-                // SAFETY: same retained-source and ordered-destination contract.
-                unsafe { uploads.upload(self.buffer(name)?, &bytes, self.stream.raw)?; }
-            }
-            Ok(())
-        })
-    }
     /// Caller admits each named physical request and its allocation tail first.
     pub fn new(stream: Rc<Stream<'a>>, layout: UnitLayout) -> Result<Self> {
         let buffers = layout.buffers.iter().map(|(name, bytes)| Ok((name.clone(),

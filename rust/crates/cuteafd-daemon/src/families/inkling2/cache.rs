@@ -308,6 +308,20 @@ mod tests {
         assert_eq!(restored_page, page_pattern);
         let unit = super::super::owners::UnitOwner::new(reader, UnitLayout::serving(&cfg, 64, 256)?)?;
         assert!(unit.bind(&cache, 1, 0).is_ok());
+        use super::super::owners::UnitBuffers;
+        let segment = unit.segment(&cache, 1, 0, 7..19)?;
+        for (name, stride) in [("partial", 4608*4), ("q", 6144*4), ("relative", 48*1024*2),
+            ("cache_slots", 8), ("first", 4), ("expert_output", 4608*2)] {
+            let whole = unit.buffer(name)?;
+            let sliced = segment.buffer(name)?;
+            assert_eq!(sliced.ptr as usize - whole.ptr as usize, 7*stride, "{name}");
+            assert_eq!(sliced.bytes, 12*stride, "{name}");
+        }
+        let arena = segment.buffer("residual_arena")?;
+        assert_eq!(arena.ptr as usize - unit.buffer("residual_arena")?.ptr as usize, 7*4608*4);
+        assert_eq!(segment.layout().rows, 64, "completed-block pitch must remain the admitted unit width");
+        assert_eq!(segment.buffer("ring")?.ptr, cache.field(1, 0, "ring")?.ptr);
+        assert!(unit.segment(&cache, 0, 0, 63..65).is_err());
         assert!(unit.bind(&cache, 2, 0).is_err());
         assert!(unit.bind(&cache, 0, 2).is_err());
         let stranger = Rc::new(Stream::new(device)?);
