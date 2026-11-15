@@ -219,6 +219,8 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
         on_logits: &mut dyn FnMut(usize, DeviceLogits) -> MemberOutcome) -> Result<Vec<Result<()>>> {
         ensure!(!sequences.is_empty(), "Inkling packed submission is empty");
         let limits = self.packed_limits().unwrap();
+        ensure!(sequences.iter().map(|sequence| sequence.placement.slot).collect::<BTreeSet<_>>().len() == sequences.len(),
+            "Inkling packed members alias a request state slot");
         let chunks = sequences.iter().map(|sequence| {
             ensure!(!sequence.neural && sequence.start == sequence.placement.len, "Inkling packed start/drafter differs");
             self.check(sequence.placement, sequence.tokens, pool)?;
