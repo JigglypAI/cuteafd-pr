@@ -21,23 +21,24 @@ pub(crate) trait Dispatcher {
 pub(crate) struct Resident<'a> {
     layer: usize,
     backend: Rc<std::cell::RefCell<Box<dyn crate::shared::experts::rtx::RtxExpertLayer + 'a>>>,
-    stream: Rc<std::cell::Cell<*mut std::ffi::c_void>>,
+    stream: Rc<Stream<'a>>,
 }
 impl<'a> Resident<'a> {
-    pub fn new(layer: usize, backend: Box<dyn crate::shared::experts::rtx::RtxExpertLayer + 'a>) -> Result<Self> {
+    pub fn new(layer: usize, backend: Box<dyn crate::shared::experts::rtx::RtxExpertLayer + 'a>,
+        stream: Rc<Stream<'a>>) -> Result<Self> {
         ensure!(backend.shard() == crate::shared::experts::rtx::RtxShard::Whole
-            && backend.uses_fp8_input() && backend.layers().contains(&layer),
+            && backend.uses_fp8_input() && backend.layers().contains(&layer) && backend.device() == stream.device.id,
             "Inkling resident adapter requires a whole native K32 backend");
-        Ok(Self { layer, backend: Rc::new(std::cell::RefCell::new(backend)),
-            stream: Rc::new(std::cell::Cell::new(std::ptr::null_mut())) })
+        Ok(Self { layer, backend: Rc::new(std::cell::RefCell::new(backend)), stream })
     }
     /// All admitted layers of one backend share its single physical scratch
     /// and output owner; handles never instantiate a backend per layer.
-    pub fn for_layers(backend: Box<dyn crate::shared::experts::rtx::RtxExpertLayer + 'a>) -> Result<Vec<Self>> {
+    pub fn for_layers(backend: Box<dyn crate::shared::experts::rtx::RtxExpertLayer + 'a>,
+        stream: Rc<Stream<'a>>) -> Result<Vec<Self>> {
         let layers = backend.layers().to_vec();
         ensure!(layers.windows(2).all(|pair| pair[0] < pair[1]), "Inkling resident layer inventory is not ordered");
         let first = *layers.first().context("Inkling resident backend has no layers")?;
-        let owner = Self::new(first, backend)?;
+        let owner = Self::new(first, backend, stream)?;
         Ok(layers.into_iter().map(|layer| Self { layer, backend: owner.backend.clone(), stream: owner.stream.clone() }).collect())
     }
 }
@@ -45,9 +46,8 @@ impl Dispatcher for Resident<'_> {
     fn enqueue(&self, input: Buffer, ids: Buffer, weights: Buffer, output: Buffer,
         rows: usize, stream: &Stream<'_>) -> Result<()> {
         use crate::shared::experts::rtx::{ExpertInput, PartialDtype, PartialLayout, Routes};
-        ensure!(self.stream.get().is_null() || self.stream.get() == stream.raw,
+        ensure!(self.stream.raw == stream.raw && std::ptr::eq(self.stream.device.library, stream.device.library),
             "Inkling resident workspace changed issuing stream");
-        self.stream.set(stream.raw);
         let mut backend = self.backend.borrow_mut();
         ensure!(rows > 0 && backend.device() == stream.device.id
             && backend.partial_layout(rows)? == PartialLayout::Tokens && output.bytes >= rows*4608*2,
@@ -72,6 +72,10 @@ impl Dispatcher for Resident<'_> {
             }
         })
     }
+}
+
+impl Drop for Resident<'_> {
+    fn drop(&mut self) { self.stream.drain_or_abort("Inkling resident backend retirement"); }
 }
 
 #[cfg(test)]
@@ -104,10 +108,10 @@ mod resident_tests {
         fixture.immediate_copies(&library)?;
         fixture.configure_device_flags(&library, 0)?;
         let device = Device { library: &library, id: 0 };
-        let stream = Stream::new(device)?;
+        let stream = Rc::new(Stream::new(device)?);
         let alloc = |bytes| Allocation::new(device, bytes, crate::shared::memory::TEST);
         let backend = Backend { output: alloc(2*4608*2)?, wire: true };
-        let resident = Resident::new(0, Box::new(backend))?;
+        let resident = Resident::new(0, Box::new(backend), stream.clone())?;
         let input = alloc(2*4752)?;
         let ids = alloc(2*8*4)?;
         let weights = alloc(2*8*4)?;
@@ -119,8 +123,8 @@ mod resident_tests {
         assert!(observed.iter().all(|&byte| byte == 0x4d));
         let other = Stream::new(device)?;
         assert!(resident.enqueue(input.buffer, ids.buffer, weights.buffer, output.buffer, 2, &other).is_err());
-        assert!(Resident::new(0, Box::new(Backend { output: alloc(32)?, wire: false })).is_err());
-        let handles = Resident::for_layers(Box::new(Backend { output: alloc(2*4608*2)?, wire: true }))?;
+        assert!(Resident::new(0, Box::new(Backend { output: alloc(32)?, wire: false }), stream.clone()).is_err());
+        let handles = Resident::for_layers(Box::new(Backend { output: alloc(2*4608*2)?, wire: true }), stream.clone())?;
         assert_eq!(handles.len(), 1);
         assert_eq!(handles[0].layer, 0);
         Ok(())
