@@ -6,8 +6,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, io::Read, path::{Path, PathBuf}, sync::Arc};
 
-/// Changing the converter invalidates only derived FP8 view identities.
-pub const FP8_RECIPE: &str = "row-major-e4m3-f32-block128-rne-amax448-v1";
+/// Changing the converter or target/MTP selection invalidates only derived FP8 identities.
+pub const FP8_RECIPE: &str = "row-major-e4m3-f32-block128-rne-amax448-native-mtp-v2";
 
 #[derive(Debug, Clone)]
 pub struct CheckpointView {
@@ -78,7 +78,15 @@ impl CheckpointView {
             ["quantize_config.json", "quantization_config.json", "hf_quant_config.json"].map(str::to_owned).to_vec()
         };
         let fp8_tensors = if mode == CoreView::Fp8Compact {
-            variant.context("fp8-compact requires MC original core_tensors")?.core_tensors.clone()
+            let metadata = super::Checkpoint { view: None, snapshot: snapshot.into(),
+                config: config.clone(), quantize_config: None, weight_map: BTreeMap::new(),
+                tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
+            let native_mtp = crate::plan::family::detect(&metadata)
+                .and_then(|family| family.fp8_native_mtp_layers(&config));
+            variant.context("fp8-compact requires MC original core_tensors")?.core_tensors.iter()
+                .filter(|name| !native_mtp.as_ref().is_some_and(|(prefix, layers)|
+                    crate::plan::names::indexed(name, prefix).is_some_and(|(layer, _)| layers.contains(&layer))))
+                .cloned().collect()
         } else { Vec::new() };
         let mut hash = Sha256::new();
         hash.update(b"cuteafd-core-view-v1\0");
@@ -126,7 +134,7 @@ impl CheckpointView {
             quantize_config, weight_map, fp8_tensors: Arc::new(fp8_tensors), metadata_digests, classification_headers: Arc::default() })
     }
 
-    /// The quant's original tensor IDs are the complete conversion definition.
+    /// Original core tensor IDs, retaining family-declared native MTP stages.
     pub fn fp8_tensors(&self) -> &[String] { &self.fp8_tensors }
     pub fn converts_to_fp8(&self, name: &str) -> bool {
         self.fp8_tensors.binary_search_by(|tensor| tensor.as_str().cmp(name)).is_ok()

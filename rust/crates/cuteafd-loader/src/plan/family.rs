@@ -168,6 +168,10 @@ pub trait Family: Sync {
     /// Core inventory resolves native projections before role ownership is known.
     /// Keep their headers for classification without charging their payload to the role.
     fn eager_native_core_headers(&self) -> bool { false }
+    /// Native MTP stages that stay at source precision in a derived FP8 target-core view.
+    /// This config-only boundary is separate from executable FP8 role validation.
+    fn fp8_native_mtp_layers(&self, _config: &serde_json::Value)
+        -> Option<(&'static str, std::ops::Range<usize>)> { None }
     /// Header-only routed storage evidence needed before opening a role. Names
     /// and formats remain family facts; the shared view owns the header pass.
     fn eager_expert_header(&self, _name: &str) -> bool { false }

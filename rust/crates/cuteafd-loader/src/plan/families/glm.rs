@@ -54,6 +54,14 @@ fn strip_model_prefix(name: &str) -> Option<&str> {
 
 impl Family for Glm {
     fn eager_native_core_headers(&self) -> bool { true }
+    fn fp8_native_mtp_layers(&self, config: &Value)
+        -> Option<(&'static str, std::ops::Range<usize>)> {
+        let text = config.get("text_config").unwrap_or(config);
+        let first = opt_usize_field(text, "num_hidden_layers")?;
+        let count = opt_usize_field(text, "num_nextn_predict_layers")?;
+        let prefix = if self.id == "glm5_flash" { "model.language_model.layers." } else { "model.layers." };
+        Some((prefix, first..first.checked_add(count)?))
+    }
     fn fp8_prefill_groups(&self) -> &'static [crate::plan::fp8_prefill::Group] {
         use crate::plan::fp8_prefill::GLMF_GROUPS;
         if self.id == "glm5_flash" { GLMF_GROUPS }
