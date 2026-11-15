@@ -29,6 +29,19 @@ fn retain_logit_tile(library:&cuteafd_ffi::NativeLibrary, retained:cuteafd_ffi::
     unsafe { library.copy_d2d_async(target,source,bytes,logits.stream) }
 }
 
+fn retain_decode_taps(library: &cuteafd_ffi::NativeLibrary, source: cuteafd_ffi::CuteafdDeviceBuffer,
+    target: cuteafd_ffi::CuteafdDeviceBuffer, rows: usize, pitch: usize,
+    stream: *mut std::ffi::c_void) -> Result<()> {
+    ensure!(rows > 0 && pitch > 0 && source.device_id == target.device_id,
+        "MiniMax decode tap geometry/device differs");
+    let bytes = rows.checked_mul(pitch).context("MiniMax decode tap extent overflow")?;
+    let source = super::cache::view(source, 0, bytes)?;
+    let target = super::cache::view(target, 0, bytes)?;
+    // SAFETY: native decode initialized these live rows; disjoint retained
+    // verify storage and the producer stream survive the round's accept.
+    unsafe { library.copy_d2d_async(target, source, bytes, stream) }
+}
+
 fn packing_rows(mode: crate::shared::prefill_packing::PackingMode, admitted: usize) -> usize {
     match mode {
         crate::shared::prefill_packing::PackingMode::Unrestricted => admitted,
@@ -263,6 +276,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
 
     fn decode(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool,
         retain_receipt: bool, captured: bool) -> Result<Option<DeviceLogits>> {
+        ensure!(self.pending.borrow().is_none(), "MiniMax decode overlaps an unaccepted round");
         let submitted = self.validate(sequences, pool)?;
         let mut placements = submitted.iter().map(|request| request.placement.clone()).collect::<Vec<_>>();
         let requests = placements.iter_mut().zip(&submitted).map(|(placement, request)| ServingRequest {
@@ -284,6 +298,20 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
             for graph in graphs.iter_mut() { graph.observed(); }
         }
         drop(graphs);
+        if let Some(draft) = &self.owners.storage.draft_prefix {
+            let staged = (|| {
+                let owner = self.owners.storage.ranks.last().context("MiniMax tap rank missing")?.decode.borrow();
+                let source = owner.target_taps().context("MiniMax admitted decode taps missing")?.output();
+                let target = self.owners.storage.verify_taps.as_ref().context("MiniMax retained verify taps missing")?;
+                retain_decode_taps(self.library(), source, target.buffer, submitted.len(),
+                    draft.drafter.cfg.taps.len() * self.cfg.hidden * 2, owner.stream.raw)
+            })();
+            self.completed(staged)?;
+            // Keep native target writes and taps staged just like eager verify:
+            // accept advances target and draft frontiers together after selection.
+            *self.pending.borrow_mut() = Some(submitted);
+            return Ok(Some(logits));
+        }
         // Non-speculative input is committed even if selection later cancels.
         // A retained receipt validates the scheduler's optional accept callback;
         // publication itself never depends on that callback or UngraphedKind.
@@ -430,14 +458,12 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        if speculative || self.owners.storage.draft_prefix.is_some() { self.verify_staged(sequences,pool) }
+        if speculative { self.verify_staged(sequences,pool) }
         else { self.decode(sequences, pool, true, true) }
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        if speculative || (kind == scheduler::UngraphedKind::Decode && self.owners.storage.draft_prefix.is_some()) {
-            return self.verify_staged(sequences,pool);
-        }
+        if speculative { return self.verify_staged(sequences,pool); }
         if kind == scheduler::UngraphedKind::Decode { return self.decode(sequences, pool, true, false); }
         let total: usize = sequences.iter().map(|(_, tokens)| tokens.len()).sum();
         ensure!(sequences.len() == 1 && total <= self.geometry().decode_rows,
@@ -616,6 +642,52 @@ mod tests {
             for (n,before) in other { assert_eq!(policy.cost_snapshot(false,n),before); }
         }
         assert_eq!(observed,9);
+    }
+
+    #[test]
+    fn native_decode_taps_retain_only_live_rows_across_producer_reuse() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 0 };
+        let pitch = 5 * 6144 * 2;
+        let source = Allocation::new(device, 16 * pitch, Tag::workspace("test/decode-taps"))?;
+        let target = Allocation::new(device, 32 * pitch, Tag::workspace("test/verify-taps"))?;
+        for rows in [1, 4, 16] {
+            let bytes = (0..source.buffer.bytes).map(|i| (i / pitch * 37 + i % pitch) as u8).collect::<Vec<_>>();
+            library.copy_h2d(source.buffer, &bytes)?;
+            library.copy_h2d(target.buffer, &vec![197; target.buffer.bytes])?;
+            retain_decode_taps(&library, source.buffer, target.buffer, rows, pitch, std::ptr::null_mut())?;
+            library.copy_h2d(source.buffer, &vec![83; source.buffer.bytes])?;
+            let mut actual = vec![0; target.buffer.bytes];
+            library.copy_d2h(&mut actual, target.buffer)?;
+            assert_eq!(&actual[..rows * pitch], &bytes[..rows * pitch]);
+            assert!(actual[rows * pitch..].iter().all(|&byte| byte == 197));
+        }
+        for (rows, stride) in [(0, pitch), (17, pitch), (1, 0), (usize::MAX, 2)] {
+            assert!(retain_decode_taps(&library, source.buffer, target.buffer, rows, stride, std::ptr::null_mut()).is_err());
+        }
+        let wrong_device = Buffer { device_id: 1, ..target.buffer };
+        assert!(retain_decode_taps(&library, source.buffer, wrong_device, 1, pitch, std::ptr::null_mut()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn zero_proposal_rounds_use_native_decode_and_stage_before_publication() {
+        let source = include_str!("backend.rs");
+        let verify = source.split_once("    fn verify_device(").unwrap().1
+            .split_once("    fn verify_device_ungraphed(").unwrap().0;
+        assert!(verify.contains("if speculative { self.verify_staged(sequences,pool) }"));
+        assert!(verify.contains("self.decode(sequences, pool, true, true)"));
+        assert!(!verify.contains("draft_prefix.is_some()"));
+        let decode = source.split_once("    fn decode(").unwrap().1
+            .split_once("impl Drop").unwrap().0;
+        let staged = decode.split_once("if let Some(draft)").unwrap().1
+            .split_once("// Non-speculative input").unwrap().0;
+        assert!(staged.contains("retain_decode_taps("));
+        assert!(staged.contains("Some(submitted)"));
+        assert!(staged.contains("return Ok(Some(logits))"));
+        assert!(!staged.contains("publish("));
     }
 
     #[test]
