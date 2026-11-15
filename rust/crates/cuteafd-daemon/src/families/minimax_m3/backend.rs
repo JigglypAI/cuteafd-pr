@@ -616,6 +616,8 @@ mod tests {
         use sha2::{Digest, Sha256};
         use std::sync::Arc;
         use cuteafd_loader::{plan::Checkpoint, placement::planner::PrefillShape};
+        cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::MINIMAX_M3)
+            .map_err(|previous| anyhow::anyhow!("MiniMax native proof needs an isolated process, found {previous:?}"))?;
         let snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?;
         let native = std::env::var("CUTEAFD_NATIVE_LIB")?;
         let manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?;

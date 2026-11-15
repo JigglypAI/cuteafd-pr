@@ -1349,79 +1349,6 @@ fn select_neural_round(policy: &mut cuteafd_core::DraftPolicy, candidates: &[res
     Ok(resource::select_drafted(policy, candidates, width, rows, drafted))
 }
 
-#[cfg(test)]
-mod draft_action_tests {
-    use super::*;
-    use crate::shared::draft::{clock::RoundTimes, evidence::DraftSource};
-
-    fn geometry() -> cuteafd_core::PolicyGeometry {
-        cuteafd_core::PolicyGeometry {
-            layers: vec![cuteafd_core::LayerResource { class: None, slice_bytes: 0., group_rows: 1,
-                timed: false }], group_rows_by_rows: vec![], experts: 0, topk: 0,
-            max_requests: 16, max_positions: 128, widths: vec![7],
-            classes: vec![cuteafd_core::ResourceClass::rtx()], regimes: 1,
-        }
-    }
-
-    fn warm(policy: &mut cuteafd_core::DraftPolicy, count: usize, draft_us: u64) {
-        let mut routes = RoundRoutes::new(1, 0);
-        for round in 0..160 {
-            let per = 1 + round % 4;
-            routes.begin(count * per);
-            routes.dense(0).unwrap();
-            let prior = [0.8; 7];
-            let requests = (0..count).map(|id| resource::Verified {
-                id: id as u64 + 1, rows: per, accepted: per, source: DraftSource::Neural,
-                prior: Some(&prior[..per - 1]), features: None, censor: None,
-            }).collect::<Vec<_>>();
-            resource::observe_drafted(policy, &requests, &routes, &[],
-                RoundTimes { total_us: 10_000 + 100 * (count * per) as u64 + draft_us,
-                    draft_us: Some(draft_us) }, 7, None, Some(count)).unwrap();
-        }
-        assert!(policy.engaged(false, count));
-    }
-
-    #[test]
-    fn skip_action_preserves_all_anchors_and_is_concurrency_local() {
-        let mut policy = cuteafd_core::DraftPolicy::seeded(geometry(), cuteafd_core::PolicySeed::weak(7)).unwrap();
-        policy.set_draft_mode(cuteafd_core::DraftMode::Shared);
-        warm(&mut policy, 1, 100);
-        warm(&mut policy, 16, 1_000_000);
-        for id in 1..=16 { policy.release(id); }
-        let prior = [0.8; 7];
-        let candidates = (0..16).map(|id| resource::Candidate { id: 100 + id, prior: &prior,
-            limit: 7, selector: false, cold: false }).collect::<Vec<_>>();
-        let mut direct = policy.clone();
-        let requests = (0..16).map(|id| (100 + id, 7)).collect::<Vec<_>>();
-        let expected = resource::choose_block(&mut direct, &requests, 7, 16, 128, false).unwrap();
-        assert!(!expected, "a million-microsecond block cannot pay for a cheap anchor-only step");
-        let selected = select_neural_round(&mut policy, &candidates, 7, 128).unwrap();
-        assert_eq!(selected.lengths, vec![0; 16]);
-        assert!(selected.predicted.is_none());
-        let selected = select_neural_round(&mut policy, &candidates[..1], 7, 128).unwrap();
-        assert!(selected.lengths[0] > 0, "C16 skip evidence must not suppress C1 drafting");
-    }
-
-    #[test]
-    fn fixed_and_simple_modes_keep_existing_lengths_and_empty_room_never_drafts() {
-        let prior = [0.8; 7];
-        let candidates = [resource::Candidate { id: 1, prior: &prior, limit: 7,
-            selector: false, cold: false }];
-        for fixed in [false, true] {
-            let mut policy = cuteafd_core::DraftPolicy::new(geometry(), cuteafd_core::PolicySeed::weak(7), fixed).unwrap();
-            if fixed { policy.set_fixed_length(3).unwrap(); }
-            else { policy.set_draft_mode(cuteafd_core::DraftMode::Simple); }
-            let mut direct = policy.clone();
-            let expected = resource::select_drafted(&mut direct, &candidates, 7, 128, 1);
-            let selected = select_neural_round(&mut policy, &candidates, 7, 128).unwrap();
-            assert_eq!(selected.lengths, expected.lengths);
-            assert_eq!(selected.predicted, expected.predicted);
-            let empty = [resource::Candidate { id: 1, prior: &[], limit: 7, selector: false, cold: false }];
-            assert_eq!(select_neural_round(&mut policy, &empty, 7, 128).unwrap().lengths, [0]);
-        }
-    }
-}
-
 /// One round of lane 0: draft, verify, select, emit and commit. `None` when
 /// the step failed and its requests were released.
 #[allow(clippy::too_many_arguments)]
@@ -2125,6 +2052,79 @@ mod loop_abort_tests {
             InferenceChunk::Finish { finish_reason } =>
                 assert_eq!(*finish_reason, InferenceFinishReason::Length),
             other => panic!("last chunk is not Finish: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod draft_action_tests {
+    use super::*;
+    use crate::shared::draft::{clock::RoundTimes, evidence::DraftSource};
+
+    fn geometry() -> cuteafd_core::PolicyGeometry {
+        cuteafd_core::PolicyGeometry {
+            layers: vec![cuteafd_core::LayerResource { class: None, slice_bytes: 0., group_rows: 1,
+                timed: false }], group_rows_by_rows: vec![], experts: 0, topk: 0,
+            max_requests: 16, max_positions: 128, widths: vec![7],
+            classes: vec![cuteafd_core::ResourceClass::rtx()], regimes: 1,
+        }
+    }
+
+    fn warm(policy: &mut cuteafd_core::DraftPolicy, count: usize, draft_us: u64) {
+        let mut routes = RoundRoutes::new(1, 0);
+        for round in 0..160 {
+            let per = 1 + round % 4;
+            routes.begin(count * per);
+            routes.dense(0).unwrap();
+            let prior = [0.8; 7];
+            let requests = (0..count).map(|id| resource::Verified {
+                id: id as u64 + 1, rows: per, accepted: per, source: DraftSource::Neural,
+                prior: Some(&prior[..per - 1]), features: None, censor: None,
+            }).collect::<Vec<_>>();
+            resource::observe_drafted(policy, &requests, &routes, &[],
+                RoundTimes { total_us: 10_000 + 100 * (count * per) as u64 + draft_us,
+                    draft_us: Some(draft_us) }, 7, None, Some(count)).unwrap();
+        }
+        assert!(policy.engaged(false, count));
+    }
+
+    #[test]
+    fn skip_action_preserves_all_anchors_and_is_concurrency_local() {
+        let mut policy = cuteafd_core::DraftPolicy::seeded(geometry(), cuteafd_core::PolicySeed::weak(7)).unwrap();
+        policy.set_draft_mode(cuteafd_core::DraftMode::Shared);
+        warm(&mut policy, 1, 100);
+        warm(&mut policy, 16, 1_000_000);
+        for id in 1..=16 { policy.release(id); }
+        let prior = [0.8; 7];
+        let candidates = (0..16).map(|id| resource::Candidate { id: 100 + id, prior: &prior,
+            limit: 7, selector: false, cold: false }).collect::<Vec<_>>();
+        let mut direct = policy.clone();
+        let requests = (0..16).map(|id| (100 + id, 7)).collect::<Vec<_>>();
+        let expected = resource::choose_block(&mut direct, &requests, 7, 16, 128, false).unwrap();
+        assert!(!expected, "a million-microsecond block cannot pay for a cheap anchor-only step");
+        let selected = select_neural_round(&mut policy, &candidates, 7, 128).unwrap();
+        assert_eq!(selected.lengths, vec![0; 16]);
+        assert!(selected.predicted.is_none());
+        let selected = select_neural_round(&mut policy, &candidates[..1], 7, 128).unwrap();
+        assert!(selected.lengths[0] > 0, "C16 skip evidence must not suppress C1 drafting");
+    }
+
+    #[test]
+    fn fixed_and_simple_modes_keep_existing_lengths_and_empty_room_never_drafts() {
+        let prior = [0.8; 7];
+        let candidates = [resource::Candidate { id: 1, prior: &prior, limit: 7,
+            selector: false, cold: false }];
+        for fixed in [false, true] {
+            let mut policy = cuteafd_core::DraftPolicy::new(geometry(), cuteafd_core::PolicySeed::weak(7), fixed).unwrap();
+            if fixed { policy.set_fixed_length(3).unwrap(); }
+            else { policy.set_draft_mode(cuteafd_core::DraftMode::Simple); }
+            let mut direct = policy.clone();
+            let expected = resource::select_drafted(&mut direct, &candidates, 7, 128, 1);
+            let selected = select_neural_round(&mut policy, &candidates, 7, 128).unwrap();
+            assert_eq!(selected.lengths, expected.lengths);
+            assert_eq!(selected.predicted, expected.predicted);
+            let empty = [resource::Candidate { id: 1, prior: &[], limit: 7, selector: false, cold: false }];
+            assert_eq!(select_neural_round(&mut policy, &empty, 7, 128).unwrap().lengths, [0]);
         }
     }
 }
