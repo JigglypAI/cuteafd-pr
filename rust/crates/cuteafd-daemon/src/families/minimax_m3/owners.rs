@@ -220,11 +220,12 @@ impl<'a> Owners<'a> {
         reconcile(&census, &admitted.solved.facts, &contract.components, pages, retained_owner)?;
         let mut graphs = Vec::with_capacity(inputs.gpus);
         for (gpu, rank) in storage.ranks.iter().enumerate() {
-            let layers = if inputs.split() { (0..inputs.cfg.layers).collect::<Vec<_>>() }
+            let layers = if inputs.split() || inputs.heads() { (0..inputs.cfg.layers).collect::<Vec<_>>() }
                 else { rank.layout.layers.clone() };
             let sites = layers.iter().flat_map(|&layer| {
                 let mut sites = vec![(layer, Op::Ffn)];
-                if inputs.split() || inputs.cfg.moe[layer] { sites.push((layer, Op::JoinRouted)); }
+                if inputs.heads() { sites.extend([(layer, Op::Projection), (layer, Op::OutputProjection)]); }
+                if !inputs.heads() && (inputs.split() || inputs.cfg.moe[layer]) { sites.push((layer, Op::JoinRouted)); }
                 if inputs.cfg.moe[layer] && (inputs.gpus == 1 || gpu == 0) { sites.push((layer, Op::Router)); }
                 sites
             }).collect::<Vec<_>>();
@@ -240,7 +241,7 @@ impl Owners<'_> {
     /// Initialize only persistent section scratch. No synthetic KV page or
     /// request enters the logical prefix cache, transport or usage counters.
     pub fn prewarm(&self, cfg: &cuteafd_loader::families::minimax_m3::MiniMaxM3Config) -> Result<()> {
-        if self.storage.heads.is_some() { return Ok(()); }
+        if self.storage.heads.is_some() { return self.prewarm_heads(cfg); }
         if self.storage.split.is_some() { return self.prewarm_split(cfg); }
         ensure!(self.storage.ranks.len() == 1, "MiniMax whole graph prewarm requires one rank");
         let rank = &self.storage.ranks[0];
@@ -275,10 +276,43 @@ impl Owners<'_> {
                     owner.join_routed_enqueue(&rank.kernels, key.rows)?;
                     owner.post_fold_tap_enqueue(key.layer, key.rows)
                 },
+                Op::Projection | Op::OutputProjection => anyhow::bail!("MiniMax whole projection has no admitted graph site"),
                 Op::Attention => anyhow::bail!("MiniMax attention is not a context-invariant graph section"),
             }
         })?; }
         stream.drain()?;
+        Ok(())
+    }
+
+    fn prewarm_heads(&self, cfg: &cuteafd_loader::families::minimax_m3::MiniMaxM3Config) -> Result<()> {
+        let mut banks = self.graphs.borrow_mut();
+        for (gpu, rank) in self.storage.ranks.iter().enumerate() {
+            {
+                let unit = rank.decode.borrow();
+                for buffer in [unit.plane("residual")?, unit.plane("routed")?, unit.plane("ffn")?,
+                    unit.plane("reduction")?, unit.dense.producer_destination()] {
+                    unit.stream.device.run(|| {
+                        // SAFETY: private startup scratch; no KV pages, request metadata or peer publication.
+                        unsafe { unit.stream.device.library.cuda_zero_bytes_async(buffer, buffer.bytes, unit.stream.raw) }
+                    })?;
+                }
+                unit.stream.drain()?;
+            }
+            let bank = &mut banks[gpu];
+            let keys = bank.bootstrap()?;
+            // SAFETY: each section retains fixed-row operands and private scratch. Attention,
+            // peer exchange and host lease transitions are absent from these bodies.
+            unsafe { bank.prewarm(&keys, |_| None, |key| match key.op {
+                Op::Projection => rank.decode.borrow_mut().decode_projection_enqueue(&rank.kernels,
+                    &rank.weights, &rank.layout, key.layer, key.rows),
+                Op::OutputProjection => rank.decode.borrow_mut().finish_attention(&rank.kernels,
+                    &rank.weights, &rank.layout, key.layer, key.rows),
+                Op::Router => rank.decode.borrow().router_enqueue(&rank.kernels, &rank.weights, key.layer, key.rows),
+                Op::Ffn => rank.decode.borrow_mut().ffn_enqueue(&rank.kernels, &rank.weights,
+                    &rank.layout, key.layer, key.rows, cfg.moe[key.layer]),
+                _ => anyhow::bail!("MiniMax Heads graph site includes an eager exchange/attention section"),
+            })?; }
+        }
         Ok(())
     }
 

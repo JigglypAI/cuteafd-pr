@@ -374,16 +374,33 @@ impl<'a> UnitOwner<'a> {
         ensure!(request.batch == request.request.rows, "MiniMax decode rows must equal batch");
         let rows = request.request.rows;
         self.project_attention(kernels, weights, admitted, layer, rows)?;
+        // SAFETY: forwarded decode metadata and persistent projection planes.
+        unsafe { self.decode_attention(kernels, weights, admitted, layer, request)?; }
+        self.finish_attention(kernels, weights, admitted, layer, rows)
+    }
+    /// CUDA-only projection body; callers check the host boundary on every replay.
+    pub fn decode_projection_enqueue(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
+        admitted: &CoordinatorWeights, layer: usize, rows: usize) -> Result<()> {
+        self.project_attention_enqueue(kernels, weights, admitted, layer, rows)
+    }
+    /// # Safety
+    /// Same live metadata contract as decode; Q/K/V projections are already enqueued.
+    pub unsafe fn decode_attention(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
+        admitted: &CoordinatorWeights, layer: usize, request: attention::DecodeRequest) -> Result<()> {
+        let rows = request.request.rows;
         let p = self.projections(weights, layer, 0, rows)?;
         // SAFETY: caller supplies batched metadata; producer planes are retained.
         let output = unsafe { self.attention.as_mut().context("MiniMax rank has no attention role")?.decode(
             kernels.attention.as_ref().context("MiniMax missing attention kernels")?, p, request, &self.stream)? };
-        self.copy_attention(output, 0, rows)?;
-        self.finish_attention(kernels, weights, admitted, layer, rows)
+        self.copy_attention(output, 0, rows)
     }
     fn project_attention(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
         admitted: &CoordinatorWeights, layer: usize, rows: usize) -> Result<()> {
         self.routed_boundary.idle()?;
+        self.project_attention_enqueue(kernels, weights, admitted, layer, rows)
+    }
+    fn project_attention_enqueue(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
+        admitted: &CoordinatorWeights, layer: usize, rows: usize) -> Result<()> {
         self.normalize(kernels, weights, layer, "input_layernorm.weight", rows)?;
         let names = [("self_attn.q_proj", "query"), ("self_attn.k_proj", "key"),
             ("self_attn.v_proj", "value"), ("self_attn.index_q_proj", "index_query"),
@@ -418,7 +435,7 @@ impl<'a> UnitOwner<'a> {
             unsafe { device.library.copy_d2d_async(destination, output, destination.bytes, self.stream.raw) }
         })
     }
-    fn finish_attention(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
+    pub fn finish_attention(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
         admitted: &CoordinatorWeights, layer: usize, rows: usize) -> Result<()> {
         let projection = Self::projection(admitted, layer, "self_attn.o_proj")?;
         let destination = self.planes.get(if self.heads() { "reduction" } else { "ffn" })

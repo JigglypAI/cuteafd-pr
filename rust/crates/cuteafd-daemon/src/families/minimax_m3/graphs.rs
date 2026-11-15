@@ -10,14 +10,14 @@ use anyhow::{ensure, Result};
 use std::{collections::HashSet, rc::Rc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Op { Attention, Router, Ffn, JoinRouted }
+pub(crate) enum Op { Attention, Projection, OutputProjection, Router, Ffn, JoinRouted }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Key { pub rank: usize, pub layer: usize, pub rows: usize, pub op: Op }
 
 impl std::fmt::Debug for Key {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let op = match self.op { Op::Attention => "attention", Op::Router => "router",
+        let op = match self.op { Op::Attention => "attention", Op::Projection => "projection", Op::OutputProjection => "output_projection", Op::Router => "router",
             Op::Ffn => "ffn", Op::JoinRouted => "join_routed" };
         write!(f, "rank={} layer={} rows={} op={op}", self.rank, self.layer, self.rows)
     }
@@ -102,7 +102,7 @@ impl<'a, P> Graphs<'a, P> {
     pub(crate) fn bootstrap(&self) -> Result<Vec<Key>> {
         let mut sites = self.sites.iter().copied().collect::<Vec<_>>();
         sites.sort_by_key(|&(layer, op)| (layer, match op {
-            Op::Attention => 0, Op::Router => 1, Op::Ffn => 2, Op::JoinRouted => 3 }));
+            Op::Attention => 0, Op::Projection => 4, Op::OutputProjection => 5, Op::Router => 1, Op::Ffn => 2, Op::JoinRouted => 3 }));
         bootstrap_keys(self.rank, self.capacity, &sites)
     }
     pub(crate) fn cycle(&mut self, cycle: Cycle) { self.bank.cache_cycle(cycle); }

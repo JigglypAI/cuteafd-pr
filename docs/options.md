@@ -148,7 +148,7 @@ the launcher derives from them.
 `cuteafd golden --family minimax_m3` (hidden alias `minimax-golden`) is a
 native full-model qualification path. Public one-RTX serving dispatches to the
 same `serve-minimax` command used by the qualified card.
-Explicit two-RTX heads planning is available with half KV and replicated index
+Explicit two-RTX heads serving is available with half KV and replicated index
 storage; `auto` stays contiguous whole attention with neuron-split FFNs on two RTX.
 The two-RTX layers recipe defaults to qualified FP32 split partials. The launcher
 fixes `--split-wire fp32` and the serve flag defaults to `fp32`; there is no
@@ -163,7 +163,10 @@ BF16 whole-FFN boundary before the replicated residual add. GPU0 owns the sole
 Spark endpoint and router; onboarded TP2 routes reach GPU1 as exact IDs/weights
 on the split exchange control sequence, without GPU1 router weights or logits.
 Explicit two-RTX `heads` is supported with native FP32 O/FFN partial reductions
-and eager peer exchange; `auto` stays `layers` pending serving performance gates.
+and eager peer exchange. Decode Q/K/V/index projections, O projections, router
+and half-FFNs use the shared graph cache; context-sensitive attention and peer
+publish/wait/merge stay eager. `GPU_GRAPH_RESERVE=0` selects fully eager decode.
+`auto` stays `layers` pending serving performance gates.
 Golden requires `--nll --golden DATASET --save-logits NEW_DIR`, a checkpoint snapshot,
 native library and program manifest, and four real Spark `--peers` endpoints.
 `--window ID[,ID...]` selects unique sealed quick-subset windows. `--prefill-rows` defaults
