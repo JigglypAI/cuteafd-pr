@@ -157,7 +157,7 @@ mod tests {
                     assert_eq!(layout.field(name).unwrap().len(), 3 * 4608 * 4);
                 }
                 let mut spans = layout.fields.values().cloned().collect::<Vec<_>>();
-                spans.sort_by_key(|span| span.start);
+                spans.sort_by_key(|span| (span.start, span.end));
                 let mut end = 0;
                 for span in spans { assert_eq!(span.start, end); end = span.end; }
                 assert_eq!(end, layout.bytes);
