@@ -196,11 +196,45 @@ fn k31_raw_and_streamed_scoring_match_ordinary_c16() -> Result<()> {
     ensure!(results.len() == 64, "paired Standard coverage incomplete");
     serde_json::to_writer(std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("proof.json"))?,
         &json!({"schema":"cuteafd.kimi.paired-scoring/1", "passed":true,
-            "view":engine.target_view(), "attention":args.attention_placement,
-            "concurrency":16, "state_slots":slots, "marks":marks, "prefill":prefill,
+            "view":crate::cli::core_view_settings(engine.target_view()), "attention":args.attention_placement,
+            "concurrency":16, "state_slots":slots, "marks":marks,
+            "prefill":{"unit_rows":prefill.unit_rows,"waves":prefill.waves,"span_rows":prefill.span_rows},
             "pool_pages":family.layout().pages, "context":geometry.max_context,
             "ownership":loaded.ownership, "reference_manifest_sha256":cuteafd_bench::fidelity_dataset::KIMI_K31_MANIFEST_SHA256,
             "windows":results}))?;
+    Ok(())
+}
+
+#[test]
+fn paired_row_comparison_rejects_missing_nonfinite_and_changed_rows() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let raw = root.path().join("raw");
+    let streamed = root.path().join("streamed");
+    std::fs::create_dir(&raw)?;
+    std::fs::create_dir(&streamed)?;
+    let metadata = b"{\"position\":7,\"vocab_size\":2,\"file\":\"row-00000000.safetensors\"}\n";
+    let image = |values: [f32; 2]| {
+        let mut bytes = 2u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"{}");
+        for value in values { bytes.extend_from_slice(&value.to_le_bytes()); }
+        bytes
+    };
+    for dir in [&raw, &streamed] {
+        std::fs::write(dir.join("manifest.jsonl"), metadata)?;
+        std::fs::write(dir.join("row-00000000.safetensors"), image([-1.0, -2.0]))?;
+    }
+    assert_eq!(compare_rows(&raw, &streamed, &[7], 2)?["rows"], 1);
+    assert!(compare_rows(&raw, &streamed, &[7, 8], 2).is_err());
+    assert!(compare_rows(&raw, &streamed, &[8], 2).is_err());
+    assert!(compare_rows(&raw, &streamed, &[7], 3).is_err());
+    std::fs::write(streamed.join("row-00000000.safetensors"), image([-1.0, -3.0]))?;
+    assert!(compare_rows(&raw, &streamed, &[7], 2).is_err());
+    for dir in [&raw, &streamed] {
+        std::fs::write(dir.join("row-00000000.safetensors"), image([f32::NAN, -2.0]))?;
+    }
+    assert!(compare_rows(&raw, &streamed, &[7], 2).is_err());
+    std::fs::write(streamed.join("manifest.jsonl"), b"")?;
+    assert!(compare_rows(&raw, &streamed, &[7], 2).is_err());
     Ok(())
 }
 
