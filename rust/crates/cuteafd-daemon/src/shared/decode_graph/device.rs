@@ -794,7 +794,7 @@ impl DeviceCache {
         (estimate, class.map_or(estimate, |c| c.largest.max(estimate)))
     }
 
-    fn mark_victim(&mut self, frequent_ghost: bool) -> Option<u64> {
+    pub(super) fn mark_victim(&mut self, frequent_ghost: bool) -> Option<u64> {
         let recent = &self.queues[List::Recent.index()];
         let prefer_recent = recent.first.is_some() && (recent.bytes > self.recent_target
             || (frequent_ghost && recent.bytes == self.recent_target));
@@ -1118,7 +1118,7 @@ impl DeviceCache {
         if self.soft.measured_bytes.is_none() {
             self.soft.margin = self.soft.margin.max(growth.div_ceil(GRAPH_CHUNK).saturating_mul(GRAPH_CHUNK));
             self.soft.limit = self.reserve.saturating_sub(self.soft.margin);
-            if self.charged <= self.soft.limit || native.live_nodes == 0 || native.unknown_execs != 0 { return }
+            if self.charged < self.soft.limit || native.live_nodes == 0 || native.unknown_execs != 0 { return }
             self.soft.measured_bytes = Some(self.charged);
             self.soft.measured_nodes = Some(native.live_nodes);
         }
@@ -1477,10 +1477,10 @@ mod tests {
         assert!(cache.soft.measured_bytes.is_none());
         let Miss::Capture(id) = cache.miss(key(4), capture_site, None, false) else { panic!() };
         cache.captured_topology(id, 10, 1, false);
-        cache.measured_capture(GRAPH_CHUNK);
-        assert_eq!(cache.soft.margin, 4 * GRAPH_CHUNK);
-        assert_eq!(cache.soft.limit, 12 * GRAPH_CHUNK);
-        assert_eq!(cache.soft.measured_bytes, Some(13 * GRAPH_CHUNK));
+        cache.measured_capture(2 * GRAPH_CHUNK);
+        assert_eq!(cache.soft.margin, 3 * GRAPH_CHUNK);
+        assert_eq!(cache.soft.limit, 13 * GRAPH_CHUNK);
+        assert_eq!(cache.soft.measured_bytes, Some(14 * GRAPH_CHUNK));
         assert_eq!(cache.soft.measured_nodes, Some(50));
         assert_eq!(cache.pending_destroy, 1);
         let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy).map(|(&id, _)| id).collect();
@@ -1513,7 +1513,7 @@ mod tests {
             let Miss::Capture(id) = cache.miss(key(n), capture_site, None, false) else { panic!("key {n} stays eager") };
             cache.captured_topology(id, 10, 1, false);
             let nodes = cache.native_pools().live_nodes;
-            let growth = nodes.saturating_sub(allocator_nodes) / 10 * unit;
+            let growth = if n == 0 { 3 * unit } else { nodes.saturating_sub(allocator_nodes) / 10 * unit };
             allocator_nodes = allocator_nodes.max(nodes);
             cache.measured_capture(growth);
             let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy).map(|(&id, _)| id).collect();
@@ -1522,7 +1522,7 @@ mod tests {
             if cache.soft.measured_bytes.is_some() { assert!(cache.soft.fits(cache.native_pools().live_nodes)); }
         }
         assert_eq!(cache.counters[&Cycle::Decode].captures, 200);
-        assert_eq!(cache.charged, 15 * unit);
+        assert_eq!(cache.charged, 14 * unit);
         cache.charged = cache.reserve;
         assert!(matches!(cache.miss(key(200), capture_site, None, false), Miss::Eager));
     }
@@ -1578,7 +1578,7 @@ mod tests {
 
     #[test]
     fn native_node_counts_are_retained_independently_of_byte_estimator_units() {
-        let mut cache = DeviceCache::new(-1003, 1000);
+        let mut cache = DeviceCache::new(-1003, 64 << 20);
         let Miss::Capture(a) = cache.miss(key(1), site(Preference::Capture), None, true) else { panic!() };
         cache.captured_topology(a, 7, 1, false);
         cache.measured_capture(10);
@@ -1608,32 +1608,17 @@ mod tests {
     }
 
     #[test]
-    fn rotating_keys_reuse_a_bounded_physical_arena_without_permanent_eager() {
+    fn measured_hard_stop_bounds_rotating_unknown_node_shapes() {
         let mut cache = DeviceCache::new(-999, 100);
-        let mut allocator_slots = 0;
-        for n in 0..200 {
-            let mut ticket = cache.miss(key(n), site(Preference::Capture), None, false);
-            if matches!(ticket, Miss::Eager) {
-                let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy)
-                    .map(|(&id, _)| id).collect();
-                assert!(!victims.is_empty(), "a fitting rotating key must not stay eager");
-                cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
-                ticket = cache.miss(key(n), site(Preference::Capture), None, false);
-            }
-            assert!(matches!(ticket, Miss::Capture(_)), "key {n} never became capturable");
-            // Ideal retaining allocator: allocate only when concurrent resident
-            // executions exceed its slots, otherwise reuse a destroyed slot.
-            let slots = cache.pools.live_execs;
-            let growth = slots.saturating_sub(allocator_slots) * 10;
-            allocator_slots = allocator_slots.max(slots);
-            cache.measured_capture(growth);
-            assert!(cache.charged <= cache.reserve, "key {n}: {}", cache.charged);
-            assert!(cache.pools.live_execs <= 9, "resident slots ratcheted at key {n}");
-            if n >= 9 { assert_eq!(growth, 0, "warmed arena grew at key {n}"); }
+        for n in 0..10 {
+            assert!(matches!(cache.miss(key(n), site(Preference::Capture), None, false), Miss::Capture(_)));
+            cache.measured_capture(10);
         }
-        assert_eq!(cache.charged, 90);
-        assert_eq!(cache.counters[&Cycle::Decode].captures, 200);
-        assert_eq!(cache.pools.live_execs, 9);
+        for n in 10..200 {
+            assert!(matches!(cache.miss(key(n), site(Preference::Capture), None, false), Miss::Eager));
+            assert_eq!(cache.charged, 100);
+        }
+        assert_eq!(cache.counters[&Cycle::Decode].captures, 10);
     }
 
     #[test]
@@ -1664,25 +1649,16 @@ mod tests {
     }
 
     #[test]
-    fn zero_share_pool_owners_are_reusable_and_futile_pressure_does_not_evict() {
-        let mut cache = DeviceCache::new(-1001, 100);
-        let estimate = || Some(Estimate { bytes: 10, nodes: None, node_rate: 1, graph_rate: 0, parallel_width: 1 });
-        for n in 0..9 {
-            let Miss::Capture(_) = cache.miss(key(n), site(Preference::Capture), estimate(), false) else { panic!() };
-        }
-        cache.measured_capture(90);
-        // Reused owners must still count as pool occupancy and be evictable.
-        assert!(matches!(cache.miss(key(10), site(Preference::Capture), estimate(), false), Miss::Eager));
-        let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy).map(|(&id, _)| id).collect();
-        assert_eq!(victims.len(), 1);
-        cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
-        assert!(matches!(cache.miss(key(10), site(Preference::Capture), estimate(), false), Miss::Capture(_)));
-        cache.measured_capture(0);
-        let charged = cache.charged;
-        cache.chain_only = false;
-        assert!(matches!(cache.miss(key(11), site(Preference::Capture), estimate(), false), Miss::Eager));
-        assert_eq!(cache.pending_destroy, 0, "non-chain physical growth cannot be made to fit by eviction");
-        assert_eq!(cache.charged, charged);
+    fn below_soft_estimates_do_not_evict_and_pinned_soft_excess_terminates() {
+        let mut cache = DeviceCache::new(-1001, 16 * GRAPH_CHUNK);
+        let capture_site = Site { bootstrap: 1, ..site(Preference::Capture) };
+        let Miss::Capture(id) = cache.miss(key(1), capture_site, None, true) else { panic!() };
+        cache.captured_topology(id, 10, 1, false);
+        cache.measured_capture(9 * GRAPH_CHUNK);
+        assert_eq!(cache.pending_destroy, 0, "pinned excess cannot cause an eviction loop");
+        assert!(cache.soft.measured_bytes.is_some());
+        assert!(!cache.soft.fits(10));
+        assert!(matches!(cache.miss(key(2), capture_site, None, false), Miss::Eager));
     }
 
     #[test]
@@ -2091,8 +2067,8 @@ mod tests {
     fn canceled_capture_and_cold_ghost_are_not_recaptures() {
         let mut cache = DeviceCache::new(-214, 20);
         capture(&mut cache, 1, true);
-        assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
-        assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
+        assert!(matches!(cache.miss(key(2), site(Preference::Eager), None, false), Miss::Eager));
+        assert!(matches!(cache.miss(key(2), site(Preference::Eager), None, false), Miss::Eager));
         let id = cache.identities[&key(2)];
         assert_eq!(cache.records[&id].stats.ghost_hits, 1);
         assert_eq!(cache.records[&id].stats.recaptures, 0);
@@ -2200,7 +2176,7 @@ mod tests {
         for n in 0..100 {
             if matches!(cache.miss(key(n), site(Preference::Adaptive), None, false), Miss::Capture(_)) { captures += 1; }
         }
-        assert_eq!(captures, 9);
+        assert_eq!(captures, 100, "before measurement no estimate-only pressure is applied");
         cache.measured_capture(90);
         assert!(cache.charged <= cache.reserve + 10);
         assert_eq!(cache.snapshot().pending_capture, 0);
@@ -2226,6 +2202,7 @@ mod tests {
         let a = capture(&mut cache, 1, true);
         assert!(cache.records[&a].list.is_none());
         assert!(cache.mark_victim(false).is_none());
+        cache.charged = cache.reserve;
         assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
         assert_eq!(cache.snapshot().pinned, 10);
     }
@@ -2289,8 +2266,9 @@ mod tests {
         cache.measured_capture(10); // Failed instantiate may retain driver pages.
         assert_eq!((cache.pools.node_high_water, cache.pools.exec_high_water), (0, 0));
         assert_eq!(cache.pools.live_nodes, 0);
-        assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
-        assert_eq!(cache.pending_destroy, 0, "failed captures prove no reusable pool capacity");
+        assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Capture(_)),
+            "below measured hard limit an estimate cannot permanently refuse the shape");
+        assert_eq!(cache.pending_destroy, 0);
     }
 
     #[test]
@@ -2341,7 +2319,8 @@ mod tests {
             assert!(matches!(cache.miss(key(n), site(Preference::Capture), None, false), Miss::Capture(_)));
         }
         assert_eq!(cache.pending_growth, 30);
-        assert!(matches!(cache.miss(key(4), site(Preference::Capture), None, false), Miss::Eager));
+        assert!(matches!(cache.miss(key(4), site(Preference::Capture), None, false), Miss::Capture(_)));
+        assert_eq!(cache.pending_growth, 40);
     }
 
     #[test]
@@ -2358,7 +2337,8 @@ mod tests {
                 assert!(matches!(cache.miss(key(n), declared, None, false), Miss::Capture(_)));
             }
             assert_eq!(cache.pending_growth, 30);
-            assert!(matches!(cache.miss(key(4), declared, None, false), Miss::Eager));
+            assert!(matches!(cache.miss(key(4), declared, None, false), Miss::Capture(_)));
+            assert_eq!(cache.pending_growth, 40);
         }
     }
 

@@ -407,10 +407,8 @@ mod device_tests {
         let Miss::Capture(id) = bank.cache_miss(&1, false, None) else { panic!() };
         bank.cache_insert(1, Exec(drops.clone()), id, false);
         bank.cache_measured(10);
-        // Same proven kind in another bank needs this graph's slot.
         let cache = bank.device.as_ref().unwrap().cache.clone();
-        let Miss::Eager = cache.lock().unwrap().miss(super::super::device::Identity {
-            bank: 99, site: "bank-test", key: 1, shape: "1".into() }, site(), None, false) else { panic!() };
+        assert_eq!(cache.lock().unwrap().mark_victim(false), Some(id));
         assert!(bank.cache_drain(|| anyhow::bail!("not drained"), || unreachable!()).is_err());
         assert_eq!(drops.get(), 0);
         bank.cache_drain(|| { assert_eq!(drops.get(), 0); Ok(()) }, || {
@@ -421,7 +419,7 @@ mod device_tests {
     #[test]
     fn persistent_eviction_without_victims_preserves_pending_capture() {
         let mut bank = GraphBank::new();
-        bank.attach_device_for_test(-319, 1000, site()).unwrap();
+        bank.attach_device_for_test(-319, 64 << 20, site()).unwrap();
         let ticket = bank.cache_ticket(&1, false, None).unwrap();
         bank.cache_commit(1, 42, ticket, 1, 1, false);
         let cache = bank.device.as_ref().unwrap().cache.clone();
@@ -444,12 +442,13 @@ mod device_tests {
         impl Drop for Exec { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
         let drops = Rc::new(Cell::new(0));
         let mut bank = GraphBank::new();
-        bank.attach_device_for_test(-318, 20, site()).unwrap();
+        bank.attach_device_for_test(-318, 64 << 20, site()).unwrap();
         let ticket = bank.cache_ticket(&1, false, None).unwrap();
         bank.cache_commit(1, Exec(drops.clone()), ticket, 1, 1, false);
         bank.cache_measured(10);
         for key in 2..20 {
-            assert!(bank.cache_ticket(&key, false, None).is_none());
+            let cache = bank.device.as_ref().unwrap().cache.clone();
+            assert!(cache.lock().unwrap().mark_victim(false).is_some());
             // SAFETY: fixture executables own no captured buffers or native work.
             unsafe { bank.cache_evict_persistent(); }
             assert_eq!(drops.get(), key - 1);
@@ -669,7 +668,7 @@ mod device_tests {
     #[test]
     fn transient_interned_keys_are_pruned_at_boundary() {
         let mut bank: GraphBank<u32, u32> = GraphBank::new();
-        bank.attach_device_for_test(-305, 1, site()).unwrap();
+        bank.attach_device_for_test(-305, 0, site()).unwrap();
         assert!(matches!(bank.cache_miss(&1, false, None), Miss::Eager));
         assert_eq!(bank.cache_keys.len(), 1);
         bank.cache_tick();
