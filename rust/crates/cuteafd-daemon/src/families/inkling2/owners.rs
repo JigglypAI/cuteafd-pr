@@ -92,6 +92,7 @@ impl<'a> UnitOwner<'a> {
                 unsafe { uploads.upload(segment.row_buffer(name)?, &bytes, self.stream.raw)?; }
             }
             for (name, values) in [("first", &metadata.first), ("page_table", &metadata.page_table)] {
+                if name == "page_table" && !cache.layout.global_layers.contains(&layer) { continue; }
                 let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
                 let destination = if name == "page_table" { self.buffer(name)? } else { segment.row_buffer(name)? };
                 // SAFETY: same retained source and issuing-stream ownership.
@@ -122,6 +123,10 @@ impl<'a> UnitOwner<'a> {
             }
             Ok(())
         })
+    }
+    pub fn uploads(&self, cfg: &cuteafd_loader::families::inkling2::Inkling2Config, members: usize)
+        -> Result<crate::shared::token_table::RetainedUploads<'a>> {
+        crate::shared::token_table::RetainedUploads::new(self.stream.device, self.layout.upload_shape(cfg, members)?)
     }
     pub fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
         for (name, owner) in &self.buffers { owner.inventory(inventory, &format!("{prefix}.{name}"))?; }

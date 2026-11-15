@@ -408,6 +408,11 @@ impl InklingInputs {
         let layout = crate::families::inkling2::execution::UnitLayout::serving(&self.cfg, rows as usize, context)
             .map_err(refusal)?;
         let mut out = Vec::new();
+        let uploads = layout.upload_shape(&self.cfg, usize::try_from(self.sequences).map_err(|_| Refusal::Overflow("Inkling upload members"))?
+            .min(rows as usize)).map_err(refusal)?;
+        out.extend(buffer(format!("{prefix}.uploads"), Location::PINNED,
+            uploads.capacity_bytes().map_err(refusal)? as u64, Lifetime::TARGET, Category::Staging,
+            "shared completion-held metadata and token sources", maximum));
         for (name, bytes) in layout.buffers {
             out.extend(buffer(format!("{prefix}.{name}"), location, bytes as u64, Lifetime::TARGET, Category::Workspace,
                 "Inkling native forward UnitLayout owner", maximum));
