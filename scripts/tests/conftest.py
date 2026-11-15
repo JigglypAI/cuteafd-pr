@@ -147,6 +147,15 @@ def hermetic_launcher_host(tmp_path_factory):
     patch = pytest.MonkeyPatch()
     patch.setenv("CUTEAFD_GPU_POWERD_DIR", str(powerd))
     patch.setenv("CUTEAFD_CDI_SPECS", str(spec))
+    fuse = tmp_path_factory.mktemp("fuse-connections")
+    nest = tmp_path_factory.mktemp("sparknest-run")
+    patch.setenv("CUTEAFD_FUSE_SYSFS_ROOT", str(fuse))
+    patch.setenv("CUTEAFD_SPARKNEST_RUN_DIR", str(nest))
+    tools = tmp_path_factory.mktemp("host-tools")
+    hostname = tools / "hostname"
+    hostname.write_text("#!/bin/sh\nprintf 'coordinator-test\\n'\n")
+    hostname.chmod(0o755)
+    patch.setenv("PATH", str(tools) + os.pathsep + os.environ["PATH"])
     yield
     patch.undo()
 
@@ -182,3 +191,82 @@ def pytest_collection_modifyitems(config, items):
     if removed:
         config.hook.pytest_deselected(items=removed)
         items[:] = [item for item in items if not item.get_closest_marker("container_torch")]
+
+
+@pytest.fixture(scope="session", autouse=True)
+def no_live_cache(tmp_path_factory):
+    """One worker-private HOME for all script subprocesses and cache defaults."""
+    root = tmp_path_factory.mktemp("simulated-home")
+    patch = pytest.MonkeyPatch()
+    patch.setenv("HOME", str(root))
+    patch.setenv("XDG_CACHE_HOME", str(root / ".cache"))
+    patch.setenv("CUTEAFD_BUILD_ROOT", str(root / "builds"))
+    patch.setenv("CUTEAFD_TEST_BUILD_ROOT", str(root / "builds"))
+    from launcher_sandbox import SimCluster, seed_checkpoint_metadata
+    patch.setenv("CUTEAFD_TEST_HOST", SimCluster().env()["CUTEAFD_TEST_HOST"])
+    hub = root / ".cache/huggingface"
+    seed_checkpoint_metadata(hub)
+    patch.setenv("HF_HOME", str(hub))
+    yield root
+    patch.undo()
+
+
+@pytest.fixture
+def tmp_build_root(tmp_path, monkeypatch):
+    root = tmp_path / "builds"
+    root.mkdir()
+    monkeypatch.setenv("CUTEAFD_BUILD_ROOT", str(root))
+    monkeypatch.setenv("CUTEAFD_TEST_BUILD_ROOT", str(root))
+    return root
+
+
+@pytest.fixture
+def fake_repo(tmp_path):
+    """Mutable Git history for ref-pinning and release tests, never the checkout."""
+    import subprocess
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    for key, value in [("user.name", "test"), ("user.email", "test@example.invalid")]:
+        subprocess.run(["git", "-C", str(root), "config", key, value], check=True)
+    for name in ["run.sh", "wip.sh"]:
+        path = root / name
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+    subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture"], check=True)
+    return root
+
+
+@pytest.fixture
+def sim_cluster():
+    from launcher_sandbox import SimCluster
+    return SimCluster()
+
+
+@pytest.fixture(scope="session")
+def host_tools():
+    import shutil
+    return {name: shutil.which(name) for name in ("c++", "cc", "cmake", "tmux", "node", "curl", "jq")}
+
+
+@pytest.fixture(scope="session")
+def launcher_capture():
+    """Memoize immutable subprocess results by complete caller-supplied config."""
+    import hashlib
+    import json
+    cache = {}
+    def capture(config, run):
+        key = hashlib.sha256(json.dumps(config, sort_keys=True, default=str).encode()).hexdigest()
+        if key not in cache:
+            result = run()
+            # Captures outlive a function's tmp_path on xdist workers. Normalize
+            # their private roots so later assertions never reference deleted dirs.
+            import re
+            root = re.search(r"(/[^\s]+/test_[^/\s]+[0-9]+(?:/example)?)/hf/", result.stderr)
+            if root:
+                result = type(result)(result.args, result.returncode,
+                    result.stdout.replace(root[1], "<root>"), result.stderr.replace(root[1], "<root>"))
+            cache[key] = result
+        return cache[key]
+    return capture

@@ -105,9 +105,17 @@ fn load_target<'a, const RANKS: usize>(args: &ServeArgs,
     cfg: &cuteafd_loader::families::kimi_k3::config::KimiK3Config, devices: [i32; RANKS],
     slots: usize, marks: usize, prefill: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan)
     -> Result<startup::Loaded<'a>> {
+    startup::load(library, programs, checkpoint, cfg, cfg,
+        startup_options(args, cfg, devices, slots, marks, prefill)?)
+}
+
+pub(super) fn startup_options<'a, const RANKS: usize>(args: &'a ServeArgs,
+    cfg: &cuteafd_loader::families::kimi_k3::config::KimiK3Config, devices: [i32; RANKS],
+    slots: usize, marks: usize, prefill: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan)
+    -> Result<startup::Options<'a, RANKS>> {
     let draft = args.draft.as_ref().map(|snapshot| super::draft::Options {
         snapshot: snapshot.clone(), fp8: args.draft_fp8, tp2_dflash: args.tp2_dflash, cache_format: args.kv_cache });
-    startup::load(library, programs, checkpoint, cfg, cfg, startup::Options { role: startup::Role::Serve,
+    Ok(startup::Options { role: startup::Role::Serve,
         expert_usage: args.expert_usage, expert_usage_reader: args.expert_usage_reader.clone(),
         cache_format: args.kv_cache, devices, native_lib: &args.native_lib, manifest: &args.manifest,
         attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
@@ -118,6 +126,7 @@ fn load_target<'a, const RANKS: usize>(args: &ServeArgs,
         context: cuteafd_loader::placement::planner::Context::resolve(cfg.max_position as u64, args.max_context.map(|n| n as u64)),
         pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
         ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0, prefix: Some(&args.prefix),
+        #[cfg(test)] prove_serve_admission: false,
     })
 }
 
@@ -352,7 +361,7 @@ mod tests {
                 Some(shape.unit_rows as usize))?, cuteafd_loader::serving_capacity::PrefillShape {
                     unit_rows: shape.unit_rows, waves: shape.waves });
             let options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
-                layout: Some(LayoutOptions { rtx_bytes: vec![96 << 30; 2], host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
+                layout: Some(LayoutOptions { rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; 2], host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
                     host_cache_bytes: Some(0), prefill_rows: args.prefill_rows.unwrap_or(0) as u64,
                     prefill_lanes: args.prefill_waves.map_or(0, u64::from), ..Default::default() }),
                 ..Default::default() };

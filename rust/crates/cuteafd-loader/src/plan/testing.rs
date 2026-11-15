@@ -2,6 +2,9 @@
 //! tests): headers with the real geometry of each family over sparse,
 //! all-zero payloads, so a fixture costs no disk.
 pub mod exlr8;
+pub mod env;
+mod header_templates;
+pub use env::SimCluster;
 
 use serde_json::{json, Value};
 use std::fs;
@@ -155,12 +158,16 @@ pub fn write_kimi_tokenizer(snapshot: &Path) {
 
 /// Real Kimi geometry with one sparse shard per layer, below the header limit.
 pub fn write_kimi_snapshot(dir: &Path, all: bool) {
-    write_kimi_tensors(dir, kimi_k3_tensors(all));
+    header_templates::snapshot(dir, &format!("kimi-headers-v1-{all}"), |root| write_kimi_tensors(root, kimi_k3_tensors(all)));
 }
 
 /// Sparse K6 header fixture only, not a numerically quantized checkpoint.
 /// The payload is intentionally unsuitable for layer-forward qualification.
 pub fn write_kimi_core_snapshot(dir: &Path, all: bool) {
+    header_templates::snapshot(dir, &format!("kimi-core-headers-v1-{all}"), |root| write_kimi_core_snapshot_uncached(root, all));
+}
+
+fn write_kimi_core_snapshot_uncached(dir: &Path, all: bool) {
     let mut tensors = Vec::new();
     for tensor in kimi_k3_tensors(all) {
         if let Some(stem) = tensor.0.strip_suffix(".weight").filter(|stem|
@@ -1141,6 +1148,11 @@ pub fn write_v41_workspaces(dir: &Path) -> std::path::PathBuf {
 }
 
 fn write_v41_snapshot_format(dir: &Path, nvfp4: bool, exl3_bits: Option<usize>) {
+    let key = format!("v41-headers-v1-{nvfp4}-{exl3_bits:?}");
+    header_templates::snapshot(dir, &key, |root| write_v41_snapshot_uncached(root, nvfp4, exl3_bits));
+}
+
+fn write_v41_snapshot_uncached(dir: &Path, nvfp4: bool, exl3_bits: Option<usize>) {
     let mut config: Value = serde_json::from_str(include_str!(
         "../families/deepseek_v41/official-v41-config.json")).unwrap();
     if nvfp4 {
@@ -1484,6 +1496,11 @@ pub fn write_muse_media_snapshot(dir: &Path, expert_layers: &[usize]) {
 }
 
 fn write_muse_snapshot(dir: &Path, expert_layers: &[usize], vision: bool, audio: bool) {
+    let key = format!("muse-headers-v1-{expert_layers:?}-{vision}-{audio}");
+    header_templates::snapshot(dir, &key, |root| write_muse_snapshot_uncached(root, expert_layers, vision, audio));
+}
+
+fn write_muse_snapshot_uncached(dir: &Path, expert_layers: &[usize], vision: bool, audio: bool) {
     let (mut tensors, mut projections) = muse_spark_tensors(expert_layers);
     tensors.retain(|tensor| !crate::media::muse_vision::is_tensor(&tensor.0)
         && !tensor.0.starts_with("model.audio_tower."));
@@ -1589,6 +1606,16 @@ pub fn step5_fixture(kind: &str) -> (Value, Vec<Tensor>) {
 
 /// Published K4 expert/K6 core headers, shared by loader and daemon regressions.
 pub fn write_step5_exl3_snapshot(dir: &Path) {
+    write_step5_exl3_snapshot_layers(dir, &(3..91).collect::<Vec<_>>());
+}
+
+/// Preserve the full core geometry while including only requested routed layers.
+pub fn write_step5_exl3_snapshot_layers(dir: &Path, expert_layers: &[usize]) {
+    let key = format!("step5-headers-v1-{expert_layers:?}");
+    header_templates::snapshot(dir, &key, |root| write_step5_exl3_snapshot_uncached(root, expert_layers));
+}
+
+fn write_step5_exl3_snapshot_uncached(dir: &Path, expert_layers: &[usize]) {
     fs::create_dir_all(dir).unwrap();
     let (mut config, tensors) = step5_fixture("bf16");
     let declaration = serde_json::json!({"quant_method": "exl3", "format": "exl3", "checkpoint_format": "exl3",
@@ -1623,6 +1650,7 @@ pub fn write_step5_exl3_snapshot(dir: &Path) {
     for (name, dtype, shape) in tensors {
         if let Some(stem) = name.strip_suffix(".weight").filter(|_| shape.len() == 3 && name.contains(".moe.")) {
             let layer: usize = stem.split('.').nth(2).unwrap().parse().unwrap();
+            if !expert_layers.contains(&layer) { continue; }
             let bits = if layer >= 88 { 6 } else { 4 };
             let (base, proj) = stem.rsplit_once('.').unwrap();
             for expert in 0..shape[0] {
@@ -1888,4 +1916,66 @@ pub fn write_mc_snapshot(dir: &Path, config: &Value, tensors: &[Tensor],
     fs::write(dir.join("cuteafd-mc.json"), json!({"schema":"cuteafd-mc-v1",
         "source":{"repo":"test/source", "revision":"0123456789012345678901234567890123456789"},
         "original_core_dtype":"BF16", "shared_inventory_sha256":shared_digest, "variants":variants}).to_string()).unwrap();
+}
+
+
+/// Complete headers and sparse zero payloads, privately cloned from a gate template.
+pub fn write_muse_spark_complete_headers(dir: &Path) {
+    write_muse_spark_snapshot(dir, &(0..62).collect::<Vec<_>>());
+}
+
+/// Full publication headers, with sparse payloads instead of real model resources.
+pub fn write_kimi_complete_headers(dir: &Path) { write_kimi_snapshot(dir, true); }
+
+pub fn write_step5_complete_headers(dir: &Path) { write_step5_exl3_snapshot(dir); }
+
+
+#[cfg(test)]
+mod template_measurements {
+    use super::*;
+
+    #[test]
+    #[ignore = "explicit fixture-generation vs planner phase measurement"]
+    fn complete_header_template_clones_preserve_plans_and_private_mutations() {
+        for (name, build, options) in [
+            ("muse", write_muse_spark_complete_headers as fn(&Path),
+                SimCluster::two_rtx_256g_host(6).plan_options()),
+            ("step5", write_step5_complete_headers as fn(&Path),
+                SimCluster::rtx_pro(2, 6).host_gib(128, 128).plan_options()),
+            ("kimi", write_kimi_complete_headers as fn(&Path),
+                SimCluster::two_rtx_256g_host(6).plan_options()),
+        ] {
+            let first = tempfile::tempdir().unwrap();
+            let second = tempfile::tempdir().unwrap();
+            let started = std::time::Instant::now();
+            build(first.path());
+            let generated = started.elapsed();
+            let started = std::time::Instant::now();
+            build(second.path());
+            let cloned = started.elapsed();
+            assert_eq!(std::fs::read(first.path().join("config.json")).unwrap(),
+                std::fs::read(second.path().join("config.json")).unwrap());
+            let started = std::time::Instant::now();
+            let input = BudgetedPlanInput::open(first.path()).unwrap();
+            let open = started.elapsed();
+            assert!(input.checkpoint().missing_shards.is_empty());
+            let mut options = options;
+            if name == "muse" {
+                options.layout.as_mut().unwrap().workspace_manifest = Some(write_muse_exl3_capacities(&first.path().join("image")));
+            } else if name == "step5" {
+                let manifest = step5_native_manifest(first.path());
+                install_step5_exl3_rtx_package(&manifest);
+                options.layout.as_mut().unwrap().workspace_manifest = Some(manifest);
+            } else {
+                options.layout.as_mut().unwrap().workspace_manifest = Some(write_kimi_installed_inventory(first.path(), false));
+            }
+            let started = std::time::Instant::now();
+            let report = input.plan(&options).unwrap();
+            let plan = started.elapsed();
+            assert!(report.missing_shards.is_empty());
+            eprintln!("complete-header-fixture {name}: initial={generated:?} clone={cloned:?} open={open:?} plan={plan:?}");
+            std::fs::write(first.path().join("config.json"), "changed").unwrap();
+            assert!(serde_json::from_slice::<Value>(&std::fs::read(second.path().join("config.json")).unwrap()).is_ok());
+        }
+    }
 }

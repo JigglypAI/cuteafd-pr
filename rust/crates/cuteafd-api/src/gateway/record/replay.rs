@@ -138,13 +138,15 @@ mod tests {
     }
     fn redacted(value: &Value) -> bool { value.is_null() || value == "[REDACTED]" }
     fn scan_text(text: &str) {
-        let protocol = regex::Regex::new(r#"openai-insecure-api-key\.([^\s\"\\,;]+)"#).unwrap();
+        static PROTOCOL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"openai-insecure-api-key\.([^\s\"\\,;]+)"#).unwrap());
+        let protocol = &*PROTOCOL;
         for capture in protocol.captures_iter(text) { assert_eq!(&capture[1],"[REDACTED]","unredacted websocket credential"); }
         if let Ok(inner) = serde_json::from_str::<Value>(text) { if inner.is_object() || inner.is_array() { scan_fields(&inner); } }
         for line in text.lines() {
             if let Some(data) = line.strip_prefix("data:") { if let Ok(inner) = serde_json::from_str::<Value>(data.trim()) { scan_fields(&inner); } }
         }
-        let query = regex::Regex::new(r#"(?:[?&]|^)([^=\s\"\\&]+)=([^&\s\"\\]*)"#).unwrap();
+        static QUERY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?:[?&]|^)([^=\s\"\\&]+)=([^&\s\"\\]*)"#).unwrap());
+        let query = &*QUERY;
         for capture in query.captures_iter(text) {
             let pair = format!("{}={}",&capture[1],&capture[2]);
             for (name,value) in url::form_urlencoded::parse(pair.as_bytes()) {

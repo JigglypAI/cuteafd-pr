@@ -970,8 +970,9 @@ async fn idle_preserves_deadline_for_silence_and_drains_buffer() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn idle_timeout_survives_silent_websocket_frames_and_commits_audio() {
+    tokio::time::resume();
     let s = server(Arc::new(Scripted::default())).await;
     let (mut c, _) = connect_async(&s.url).await.unwrap();
     let initial = recv(&mut c).await;
@@ -984,7 +985,10 @@ async fn idle_timeout_survives_silent_websocket_frames_and_commits_audio() {
             json!({"type":"input_audio_buffer.append","audio":STANDARD.encode(vec![0u8;4800])}),
         )
         .await;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        tokio::time::resume();
     }
     let timeout = recv(&mut c).await;
     assert_eq!(timeout["type"], "input_audio_buffer.timeout_triggered");
@@ -1053,8 +1057,9 @@ async fn pipecat_default_vad_silence_manual_commit_and_empty_warmup() {
     assert_eq!(backend.turns().len(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn session_update_cancels_old_idle_deadline_without_committing() {
+    tokio::time::resume();
     for turn_detection in [json!({"idle_timeout_ms":null}), Value::Null] {
         let s = server(Arc::new(Scripted::default())).await;
         let mut c = connect(&s, false).await;
@@ -1067,7 +1072,9 @@ async fn session_update_cancels_old_idle_deadline_without_committing() {
         .await;
         emit(&mut c,json!({"type":"session.update","session":{"audio":{"input":{"turn_detection":turn_detection}}}})).await;
         assert_eq!(recv(&mut c).await["type"], "session.updated");
-        tokio::time::sleep(std::time::Duration::from_millis(6200)).await;
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_millis(6200)).await;
+        tokio::time::resume();
         // A stale timeout would precede this explicit commit and consume the buffer.
         emit(&mut c, json!({"type":"input_audio_buffer.commit"})).await;
         assert_eq!(recv(&mut c).await["type"], "input_audio_buffer.committed");

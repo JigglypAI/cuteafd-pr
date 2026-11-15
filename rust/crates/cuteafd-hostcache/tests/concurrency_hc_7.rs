@@ -85,6 +85,81 @@ fn eviction_consultations(report: &RunReport) -> u64 {
 /// by the seeded tests, the floor test and the proptest.
 fn check_churn(seed: u64, report: &RunReport, metrics: &Metrics) {
     assert!(
+        report.steps >= 5_000,
+        "seed {seed:#x}: churn must run at least 5,000 scheduler steps, got {}",
+        report.steps
+    );
+    assert!(
+        report.host_hits > 0,
+        "seed {seed:#x}: more live sessions than the device banks hold must hit the host cache"
+    );
+    assert!(
+        report.restored_tokens > 0,
+        "seed {seed:#x}: host hits must restore tokens"
+    );
+    assert!(!report.schedule_log.is_empty(), "the schedule log is empty");
+
+    // The facade's counters must tell the same story as the report.
+    assert_eq!(
+        metrics.restores, report.host_hits,
+        "seed {seed:#x}: every host hit restored (restores == host_hits)"
+    );
+    assert_eq!(
+        metrics.restore_timeouts, 0,
+        "seed {seed:#x}: restore budgets never ran out"
+    );
+    assert_eq!(
+        metrics.restore_failures, 0,
+        "seed {seed:#x}: no restore failed"
+    );
+    assert_eq!(metrics.stores_failed, 0, "seed {seed:#x}: no store failed");
+    assert_eq!(
+        metrics.evict_drops_uncached, 0,
+        "seed {seed:#x}: the copy budget never dropped a snapshot uncached"
+    );
+    assert!(
+        metrics.bytes_used <= quota(),
+        "seed {seed:#x}: bytes_used {} exceeded the quota {}",
+        metrics.bytes_used,
+        quota()
+    );
+    assert!(
+        metrics.host_evictions > 0,
+        "seed {seed:#x}: the quota must force host eviction"
+    );
+    assert_eq!(
+        metrics.stores_completed,
+        metrics.resident_snapshots + metrics.host_evictions + metrics.stores_replaced,
+        "seed {seed:#x}: store counters do not balance"
+    );
+    // Restored bytes cover at least the restored tokens' KV bytes (pages round up, the tail
+    // adds more), so the report's restored_tokens and the facade's byte accounting agree.
+    assert!(
+        metrics.restore_bytes >= report.restored_tokens * KV_BYTES_PER_TOKEN as u64,
+        "seed {seed:#x}: restore_bytes {} shy of restored_tokens {}",
+        metrics.restore_bytes,
+        report.restored_tokens
+    );
+    // Restore latency: the stub model is exact — every restore is a serial chain on the
+    // restore stream of four segment copies per copied page plus one tail copy, each costing
+    // the per-copy latency plus its bytes at the modelled bandwidth. A wedged stream or a
+    // copy issuing twice would blow past this bound.
+    let copy_model = cuteafd_hostcache::copy::CopyModel::default();
+    if metrics.restores > 0 {
+        // Every restore moves whole slabs: pages of `PAGE_BYTES` plus one `TAIL_BYTES` tail.
+        let page_bytes = metrics.restore_bytes - metrics.restores * TAIL_BYTES as u64;
+        let copies = 4 * page_bytes / PAGE_BYTES as u64 + metrics.restores;
+        let latency_bound = copies * copy_model.per_copy_latency_ns
+            + (metrics.restore_bytes as f64 / copy_model.h2d_bytes_per_ns) as u64
+            + copies;
+        assert!(
+            metrics.restore_latency_sum_ns <= latency_bound,
+            "seed {seed:#x}: restore latency {} ns exceeds the stub model bound {latency_bound} ns",
+            metrics.restore_latency_sum_ns
+        );
+    }
+
+    assert!(
         report.invariant_failures.is_empty(),
         "seed {seed:#x}: interleaved run against the real cache must be clean, got {:?}; log tail: {:?}",
         report.invariant_failures,
@@ -163,6 +238,9 @@ fn seeded_schedule_reproduces_the_instrumentation() {
         let run = || sim(0xC0FFEE, order).run(&workload());
         let first = run();
         assert_eq!(first, run(), "the same seed must reproduce report and log ({order:?})");
+        assert!(first.schedule_log.iter().any(|line| line.contains("restore done")));
+        assert_eq!(first.schedule_log.iter().filter(|line| line.contains("admit")).take(8).count(), 8);
+
         // The log names the interleaving the counters must match: eviction consultations,
         // ticks, restores.
         assert!(
@@ -240,6 +318,12 @@ mod properties {
                 report.invariant_failures
             );
             let metrics: Metrics = sim.cache().cache().metrics();
+            prop_assert!(metrics.bytes_used <= quota);
+            prop_assert_eq!(metrics.stores_completed,
+                metrics.resident_snapshots + metrics.host_evictions + metrics.stores_replaced);
+            prop_assert_eq!(metrics.restore_failures, 0);
+            prop_assert_eq!(metrics.stores_failed, 0);
+
             prop_assert_eq!(
                 metrics.device_evictions,
                 eviction_consultations(&report),

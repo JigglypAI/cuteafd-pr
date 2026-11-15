@@ -376,7 +376,7 @@ mod tests {
             placement: cuteafd_loader::plan::ExpertPlacement::Local,
             vision: cuteafd_loader::plan::MediaMode::Off, audio: cuteafd_loader::plan::MediaMode::Off,
             layout: Some(cuteafd_loader::plan::layout::LayoutOptions {
-                rtx_bytes: vec![96 << 30], host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), concurrency: 1,
+                rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES], host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), concurrency: 1,
                 state_slots: Some(1), prefix_slots: Some(0), host_cache_bytes: Some(0), native_mtp_layers: 0,
                 pool_tokens: Some(262144), workspace_manifest: Some(programs.into()),
                 dense_qwen_kv: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, ..Default::default()

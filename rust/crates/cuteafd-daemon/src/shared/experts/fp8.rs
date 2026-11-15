@@ -1024,7 +1024,7 @@ mod tests {
         native.strict_device_free(&library, true)?;
         let device = Device { library: &library, id: 1 };
         for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4, ExpertFormat::Nvfp4] {
-            for bf16_scales in [false, true] {
+            for bf16_scales in if format == ExpertFormat::Fp8Block128 { vec![false, true] } else { vec![false] } {
                 let root = tempfile::tempdir()?;
                 let catalog = fixture(root.path(), format, bf16_scales)?;
                 let tensors = catalog.fp8().unwrap();

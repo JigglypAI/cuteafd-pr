@@ -64,6 +64,7 @@ pub(super) fn check_prefix(full: &KimiK3Config, selected: &KimiK3Config) -> Resu
 /// All demands are still future to the two post-module CUDA samples. The
 /// engine supplies its native programs' lane extents, exchange, graphs and
 /// page tables; global weights, token IO and state banks add their own demands.
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct Inputs<'a, const RANKS: usize = 2> {
     pub skip_routed_experts: bool,
     pub expert_usage: bool,
@@ -101,6 +102,7 @@ pub(crate) struct Inputs<'a, const RANKS: usize = 2> {
 }
 
 /// CPU-planned native residency; no backend owner allocates before solve.
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct RtxInventory {
     pub package: std::path::PathBuf,
     pub costs: Vec<Vec<Bytes2>>,
@@ -2420,7 +2422,7 @@ pub(super) mod tests {
                 }
                 let admitted = admit(i)?;
                 let mut options = PlanOptions { attention_placement: Some(AttentionPlacement::Layers), placement: ExpertPlacement::Sparks { ranks: 6 },
-                    layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
+                    layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; 2], concurrency: 2,
                         mla_kv: format, context_tokens: context, pool_tokens: Some(context), prefix_slots: Some(2),
                         host_cache_bytes: Some(0), onboard: Some(OnboardSetting::Auto), ..Default::default() }),
                     ..Default::default() };
@@ -2476,7 +2478,7 @@ pub(super) mod tests {
             let report = plan_input.plan(&PlanOptions {
                 attention_placement: Some(AttentionPlacement::Layers),
                 placement: ExpertPlacement::Sparks { ranks: 6 },
-                layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
+                layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; 2], concurrency: 2,
                     mla_kv: format, prefix_slots: Some(2), host_cache_bytes: Some(0),
                     onboard: Some(OnboardSetting::Auto), ..Default::default() }),
                 ..Default::default()

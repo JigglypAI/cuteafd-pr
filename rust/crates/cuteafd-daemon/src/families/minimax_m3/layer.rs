@@ -9,6 +9,55 @@ use cuteafd_loader::families::minimax_m3::{MiniMaxM3Config,
     weight_layout::{CoordinatorWeights, Mxfp8Projection}};
 use std::{collections::BTreeMap, rc::Rc};
 
+/// Device-only post-FFN taps. Every graph pins its UnitOwner, which retains
+/// these buffers; pointers and shape stay fixed from prewarm through retirement.
+pub(crate) struct TargetTapWriter<'a> {
+    stream: Rc<Stream<'a>>,
+    narrow: cuteafd_ffi::F32Bf16Narrow<'a>,
+    scratch: Allocation<'a>,
+    output: Allocation<'a>,
+    layers: Vec<usize>,
+    rows: usize,
+}
+impl<'a> TargetTapWriter<'a> {
+    pub fn bytes(rows: usize, taps: usize) -> Result<[usize; 2]> {
+        ensure!(rows > 0 && rows <= 4096 && taps > 0 && taps <= 60, "MiniMax target tap capacity");
+        let row = rows.checked_mul(6144 * 2).context("MiniMax tap extent overflow")?;
+        Ok([row,row.checked_mul(taps).context("MiniMax tap concatenation overflow")?])
+    }
+    pub fn new(stream: Rc<Stream<'a>>, rows: usize, layers: Vec<usize>) -> Result<Self> {
+        let [scratch,output] = Self::bytes(rows,layers.len())?;
+        ensure!(layers.iter().all(|&layer| layer < 60) && layers.windows(2).all(|pair| pair[0] < pair[1]),
+            "MiniMax target tap layers must be ordered and unique");
+        let device = stream.device;
+        Ok(Self { narrow:device.run(|| device.library.f32_bf16_narrow())?,
+            scratch:Allocation::new(device,scratch,Tag::drafter_workspace("minimax/target-tap/narrow"))?,
+            output:Allocation::new(device,output,Tag::drafter_workspace("minimax/target-tap/output"))?,
+            stream,layers,rows })
+    }
+    pub fn output(&self) -> Buffer { self.output.buffer }
+    pub fn layers(&self) -> &[usize] { &self.layers }
+    pub fn inventory(&self, inventory:&mut Inventory<'_>, name:&str) -> Result<()> {
+        self.scratch.inventory(inventory,&format!("{name}.narrow"))?;
+        self.output.inventory(inventory,&format!("{name}.output"))?;
+        inventory.host(&format!("{name}.layers"),&self.layers)
+    }
+    fn enqueue(&self, layer:usize, rows:usize, residual:Buffer) -> Result<()> {
+        let Some(column) = self.layers.iter().position(|&tap| tap == layer) else { return Ok(()) };
+        ensure!(rows > 0 && rows <= self.rows && residual.device_id == self.stream.device.id
+            && residual.bytes >= rows * 6144 * 4, "MiniMax target tap live extent");
+        self.stream.device.run(|| {
+            // SAFETY: the unit/graph retains all storage on this ordered stream;
+            // padded rows write private tap scratch and are never consumed as live state.
+            unsafe {
+                self.narrow.launch(residual.ptr,self.scratch.buffer.ptr,rows * 6144,self.stream.raw)?;
+                self.stream.device.library.glm_dflash_tap(self.scratch.buffer.ptr,self.output.buffer.ptr,
+                    rows,6144,self.layers.len() * 6144,column * 6144,self.stream.raw)
+            }
+        })
+    }
+}
+
 pub(crate) struct Kernels<'a> {
     device: Device<'a>,
     pub dense: dense::NativePrograms<'a>,
@@ -189,6 +238,7 @@ pub(crate) struct UnitOwner<'a> {
     rows: u32,
     planes: BTreeMap<String, Rc<Allocation<'a>>>,
     routed_boundary: Rc<super::experts::Boundary<'a>>,
+    target_taps: Option<TargetTapWriter<'a>>,
 }
 impl Drop for UnitOwner<'_> {
     fn drop(&mut self) { self.stream.drain_or_abort("MiniMax unit arithmetic owners"); }
@@ -216,7 +266,7 @@ impl<'a> UnitOwner<'a> {
             routed_boundary: Rc::new(super::experts::Boundary::new(kernels.device)?),
             attention: kernels.attention.as_ref().map(|attention| if prefill { attention::Workspace::new(attention) }
                 else { attention::Workspace::new_decode(attention) }).transpose()?,
-            split: None, stream, rows: layout.rows, planes })
+            split: None, stream, rows: layout.rows, planes, target_taps: None })
     }
     pub fn new_split(kernels: &Kernels<'a>, stream: Rc<Stream<'a>>, cfg: &MiniMaxM3Config,
         weights: &CoordinatorWeights, rows: u32, wire: WirePrecision, prefill: bool,
@@ -248,7 +298,7 @@ impl<'a> UnitOwner<'a> {
             routed_boundary: Rc::new(super::experts::Boundary::new(kernels.device)?),
             attention: kernels.attention.as_ref().map(|attention| if prefill { attention::Workspace::new(attention) }
                 else { attention::Workspace::new_decode(attention) }).transpose()?,
-            split: Some(split), stream, rows, planes })
+            split: Some(split), stream, rows, planes, target_taps: None })
     }
     pub fn new_heads(kernels: &Kernels<'a>, stream: Rc<Stream<'a>>, cfg: &MiniMaxM3Config,
         weights: &CoordinatorWeights, rows: u32, prefill: bool) -> Result<Self> {
@@ -263,10 +313,24 @@ impl<'a> UnitOwner<'a> {
             routed_boundary: Rc::new(super::experts::Boundary::new(kernels.device)?),
             attention: kernels.attention.as_ref().map(|attention| if prefill { attention::Workspace::new(attention) }
                 else { attention::Workspace::new_decode(attention) }).transpose()?,
-            split: None, stream, rows, planes })
+            split: None, stream, rows, planes, target_taps: None })
     }
     fn heads(&self) -> bool { self.planes.contains_key("reduction") }
     pub fn is_split(&self) -> bool { self.split.is_some() }
+    /// Install exactly once during admitted construction, before any graph prewarm.
+    pub fn install_target_taps(&mut self, writer: TargetTapWriter<'a>) -> Result<()> {
+        ensure!(self.target_taps.is_none() && Rc::ptr_eq(&writer.stream,&self.stream)
+            && writer.rows == self.rows as usize, "MiniMax tap writer differs from execution owner");
+        self.target_taps = Some(writer);
+        Ok(())
+    }
+    pub fn target_taps(&self) -> Option<&TargetTapWriter<'a>> { self.target_taps.as_ref() }
+    pub fn post_fold_tap_enqueue(&self, layer:usize, rows:usize) -> Result<()> {
+        match &self.target_taps {
+            Some(writer) => writer.enqueue(layer,rows,self.plane("residual")?),
+            None => Ok(()),
+        }
+    }
     fn owner(&self, name: &str) -> Result<&Allocation<'a>> {
         self.planes.get(name).map(Rc::as_ref).with_context(|| format!("MiniMax unit lacks admitted {name}"))
     }
@@ -289,6 +353,7 @@ impl<'a> UnitOwner<'a> {
     }
     pub fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
         self.dense.inventory(inventory, &format!("{prefix}.dense"))?;
+        if let Some(taps) = &self.target_taps { taps.inventory(inventory,&format!("{prefix}.target_taps"))?; }
         if let Some(attention) = &self.attention { attention.inventory(inventory, &format!("{prefix}.attention"))?; }
         if let Some(split) = &self.split { split.inventory(inventory, &format!("{prefix}.split"))?; }
         for (name, owner) in &self.planes {
@@ -302,9 +367,6 @@ impl<'a> UnitOwner<'a> {
         Ok(())
     }
     pub fn rows(&self) -> u32 { self.rows }
-    /// CUDA-only target-residual tap seam. The optional drafter owns and admits
-    /// its retained writer; ordinary serving allocates no tap buffers here.
-    pub(crate) fn post_fold_tap_enqueue(&self, _layer: usize, _rows: usize) -> Result<()> { Ok(()) }
     #[cfg(test)]
     pub fn validate_split(&self, inputs: &cuteafd_loader::placement::families::minimax_m3::MiniMaxInputs,
         gpu: usize) -> Result<()> {
@@ -889,12 +951,13 @@ mod tests {
     fn diagnose_attention(owner: &UnitOwner<'_>, request: attention::Request,
         extend: &AttentionDiagnostic, decode: &AttentionDiagnostic) -> Result<()> {
         let integers = |bytes: Vec<u8>| bytes.chunks_exact(4).map(|v| i32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
-        let floats = |bytes: Vec<u8>| bytes.chunks_exact(4).map(|v| f32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
         let pages = integers(read_buffer(owner, request.pages)?);
-        let kd = floats(read_buffer(owner, request.key_descale)?);
-        let vd = floats(read_buffer(owner, request.value_descale)?);
         let key = read_buffer(owner, request.key_cache)?;
         let value = read_buffer(owner, request.value_cache)?;
+        let record = cuteafd_ffi::minimax_m3::kv_plane_record_bytes(4);
+        let scale = |bytes: &[u8], row: usize, head: usize| f32::from_le_bytes(
+            bytes[(row / 64) * record * 64 + 32768 + (row % 64) * 16 + head * 4..
+                (row / 64) * record * 64 + 32768 + (row % 64) * 16 + head * 4 + 4].try_into().unwrap());
         let mut outputs = Vec::new();
         for (route, diagnostic) in [("extend", extend), ("decode", decode)] {
             let mut reference = vec![0.0f32; 8192];
@@ -904,10 +967,11 @@ mod tests {
                 let mut maximum = f32::NEG_INFINITY;
                 for (token, score) in scores.iter_mut().enumerate() {
                     if diagnostic.selections[kv_head].contains(&((token / 128) as i32)) {
-                        let base = (usize::try_from(pages[token / 64])? * 64 + token % 64) * 512 + kv_head * 128;
+                        let row = usize::try_from(pages[token / 64])? * 64 + token % 64;
+                        let base = (row / 64) * record * 64 + (row % 64) * 512 + kv_head * 128;
                         let mut dot = 0.0f32;
                         for column in 0..128 {
-                            dot += diagnostic.query[head * 128 + column] * (e4m3(key[base + column]) * kd[kv_head]);
+                            dot += diagnostic.query[head * 128 + column] * (e4m3(key[base + column]) * scale(&key, row, kv_head));
                         }
                         *score = dot * 128.0f32.sqrt().recip();
                         maximum = maximum.max(*score);
@@ -918,9 +982,10 @@ mod tests {
                 for score in &mut scores { *score = (*score - maximum).exp(); denominator += *score; }
                 for (token, score) in scores.into_iter().enumerate() {
                     let probability = score / denominator;
-                    let base = (usize::try_from(pages[token / 64])? * 64 + token % 64) * 512 + kv_head * 128;
+                    let row = usize::try_from(pages[token / 64])? * 64 + token % 64;
+                        let base = (row / 64) * record * 64 + (row % 64) * 512 + kv_head * 128;
                     for column in 0..128 {
-                        reference[head * 128 + column] += probability * (e4m3(value[base + column]) * vd[kv_head]);
+                        reference[head * 128 + column] += probability * (e4m3(value[base + column]) * scale(&value, row, kv_head));
                     }
                 }
             }

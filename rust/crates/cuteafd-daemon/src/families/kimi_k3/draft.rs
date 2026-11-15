@@ -635,6 +635,7 @@ mod tests {
             context: cuteafd_loader::placement::planner::Context::pinned(8192), slots: 2, marks: 0, max_context: 8192, pool_tokens: Some(16384), graphs: false,
             ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: Some(hosted_layers),
             draft: Some(Options { snapshot: drafter, fp8: true, tp2_dflash: false, cache_format }), verify_rows: 0, prefix: None,
+            prove_serve_admission: false,
         }))?;
         let engine = &loaded.engine;
         let backend = KimiBackend::new(engine)?;
@@ -724,6 +725,7 @@ mod tests {
             pool_tokens: Some(524_288), graphs: true, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
             hosted_layers: Some(hosted_layers),
             draft: Some(Options { snapshot: drafter, fp8: true, tp2_dflash, cache_format }), verify_rows: 0, prefix: None,
+            prove_serve_admission: false,
         })?;
         let engine = &loaded.engine;
         let backend = KimiBackend::new(engine)?;

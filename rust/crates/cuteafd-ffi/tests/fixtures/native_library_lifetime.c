@@ -237,6 +237,26 @@ int32_t cuteafd_cuda_residual_add_f32_async(const float *a, const float *b, floa
     (void)a; (void)b; (void)out; (void)count; (void)stream; return 1;
 }
 
+/* Metadata-only scratch sizing for drafter ownership tests; no attention math. */
+uint64_t cuteafd_block_dspark_attention_workspace(int32_t sequences, int32_t heads,
+        int32_t kv_heads, int32_t block, int32_t max_keys, int32_t dim) {
+    if (sequences < 1 || kv_heads < 1 || heads < kv_heads || heads % kv_heads ||
+        block < 1 || max_keys < block || (dim != 64 && dim != 128)) return 0;
+    uint64_t slices = ((uint64_t)(heads / kv_heads) * block + 31) / 32;
+    uint64_t base = kv_heads * slices;
+    uint64_t partitions = (max_keys + 31) / 32;
+    uint64_t limit = (2 + base - 1) / base; /* fixture SM count is one */
+    if (partitions > limit) partitions = limit;
+    uint64_t rows = slices * partitions * 32;
+    uint64_t keys = max_keys < 1040 ? max_keys : 1040;
+    uint64_t scalar_rows = ((keys + 127) / 128) * (dim == 64 ? 32 : 16);
+    if (rows < scalar_rows) rows = scalar_rows;
+    return (uint64_t)sequences * kv_heads * rows * (dim + 2) * 4;
+}
+uint64_t cuteafd_glmf_dspark_markov_workspace(int32_t sequences, int32_t block) {
+    return sequences > 0 && block > 0 ? (uint64_t)sequences * 296 * 8 + (uint64_t)sequences * block * 4 : 0;
+}
+
 /* Head fixture records the scratch selected by the real Rust handle binding. */
 struct fixture_head { void *workspace; int width, rows, vocab; };
 int cuteafd_vocabulary_head_create_vocab(void *workspace, uint64_t bytes,

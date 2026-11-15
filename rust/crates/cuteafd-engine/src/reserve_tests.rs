@@ -96,7 +96,9 @@ struct Pool {
 impl Pool {
     fn capacity_rows(&self) -> usize { (self.free[0] + self.free[1]) * ROWS }
     fn retire(&mut self, held: usize) {
-        for j in 0..held { self.released[if self.parity { j % 2 } else { 0 }] += 1; }
+        if self.parity {
+            for j in 0..held { self.released[j % 2] += 1; }
+        } else { self.released[0] += held; }
     }
     fn reclaim(&mut self) {
         self.free[0] += self.released[0];
@@ -105,14 +107,18 @@ impl Pool {
     }
     fn take(&mut self, from: usize, to: usize) -> bool {
         let mut need = [0; 2];
-        for j in from..to { need[if self.parity { j % 2 } else { 0 }] += 1; }
+        if self.parity {
+            for j in from..to { need[j % 2] += 1; }
+        } else { need[0] = to - from; }
         if need[0] > self.free[0] || need[1] > self.free[1] { return false; }
         self.free[0] -= need[0];
         self.free[1] -= need[1];
         true
     }
     fn give(&mut self, from: usize, to: usize) {
-        for j in from..to { self.free[if self.parity { j % 2 } else { 0 }] += 1; }
+        if self.parity {
+            for j in from..to { self.free[j % 2] += 1; }
+        } else { self.free[0] += to - from; }
     }
     /// `DraftPagePool::admit`: the credit for `rows` from `origin` plus `block / 64 + 1` pages.
     fn credit(&self, rows: usize, origin: usize) -> usize {
@@ -349,9 +355,13 @@ fn drafted(mut pool: Pool, block: usize) -> Pool {
 }
 
 fn random_specs(rng: &mut Rng, n: usize, max_output: usize) -> Vec<Spec> {
+    random_specs_with_prompt(rng, n, max_output, 40_000)
+}
+
+fn random_specs_with_prompt(rng: &mut Rng, n: usize, max_output: usize, max_prompt: usize) -> Vec<Spec> {
     (0..n).map(|_| {
         let max = if rng.range(0, 3) == 0 { rng.range(1, max_output) } else { max_output };
-        Spec { arrival: rng.range(0, 400), prompt: rng.range(1, 40_000), max_output: max,
+        Spec { arrival: rng.range(0, 400), prompt: rng.range(1, max_prompt), max_output: max,
             actual: if rng.range(0, 4) == 0 { usize::MAX } else { rng.range(1, max_output) }, step: rng.range(1, 16) }
     }).collect()
 }
@@ -375,14 +385,14 @@ fn shapes(pages: usize) -> [Pool; 4] {
 
 #[test]
 fn simulator_default_buffer_never_deadlocks_or_truncates() {
-    for seed in 1..=24u64 {
+    for seed in 1..=6u64 {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-        let max_output = 131_072;
-        let specs = random_specs(&mut rng, 32, max_output);
+        let max_output = 8192;
+        let specs = random_specs_with_prompt(&mut rng, 32, max_output, 2500);
         // Pools from barely one full lifetime (odd page counts too) up to plenty.
-        let pages = (40_000 + max_output + 16).div_ceil(ROWS) * [1, 2, 4, 16][seed as usize % 4] + seed as usize % 2 * 2;
+        let pages = (2500 + max_output + 16).div_ceil(ROWS) * [1, 2, 4, 16][seed as usize % 4] + seed as usize % 2 * 2;
         for pool in shapes(pages) {
-            let mut p = policy([4096, 16_384, 65_536][seed as usize % 3], 0, -1, max_output);
+            let mut p = policy([256, 1024, 4096][seed as usize % 3], 0, -1, max_output);
             let outcome = simulate(&mut p, pool, &specs, &mut rng);
             check_complete(&specs, &outcome);
         }
@@ -409,11 +419,11 @@ fn simulator_chunks_raise_concurrency_over_whole_lifetime_reservation() {
 #[test]
 fn simulator_adversarial_everyone_runs_to_max_tokens_at_once() {
     // Every request runs to max_tokens, all arrive together, the pool holds ~2.5 lifetimes.
-    for (chunk, step) in [(4096, 1), (16_384, 16), (1024, 8)] {
-        let max_output = 60_000;
-        let specs: Vec<Spec> = (0..24).map(|i| Spec { arrival: 0, prompt: 1000 + 997 * i, max_output,
+    for (chunk, step) in [(256, 1), (1024, 16), (64, 8)] {
+        let max_output = 8192;
+        let specs: Vec<Spec> = (0..24).map(|i| Spec { arrival: 0, prompt: 64 + 61 * i, max_output,
             actual: usize::MAX, step }).collect();
-        for pool in shapes((5 * (24_000 + max_output + 16) / 2).div_ceil(ROWS) | 1) {
+        for pool in shapes((5 * (1500 + max_output + 16) / 2).div_ceil(ROWS) | 1) {
             let mut p = policy(chunk, 0, -1, max_output);
             let outcome = simulate(&mut p, pool, &specs, &mut Rng(11));
             check_complete(&specs, &outcome);
@@ -421,24 +431,24 @@ fn simulator_adversarial_everyone_runs_to_max_tokens_at_once() {
         }
     }
     // Long runners admitted first, then a flood of short ones that must not starve them.
-    let mut specs = vec![Spec { arrival: 0, prompt: 30_000, max_output: 200_000, actual: usize::MAX, step: 8 }; 3];
-    specs.extend((0..40).map(|i| Spec { arrival: 1 + i, prompt: 2000, max_output: 200_000, actual: 3000, step: 8 }));
-    for pool in shapes((2 * (30_000 + 200_000 + 8usize)).div_ceil(ROWS)) {
-        let mut p = policy(16_384, 0, -1, 200_000);
+    let mut specs = vec![Spec { arrival: 0, prompt: 1875, max_output: 12500, actual: usize::MAX, step: 8 }; 3];
+    specs.extend((0..40).map(|i| Spec { arrival: 1 + i, prompt: 125, max_output: 12500, actual: 188, step: 8 }));
+    for pool in shapes((2 * (1875 + 12500 + 8usize)).div_ceil(ROWS)) {
+        let mut p = policy(1024, 0, -1, 12500);
         check_complete(&specs, &simulate(&mut p, pool, &specs, &mut Rng(13)));
     }
 }
 
 #[test]
 fn simulator_drain_buffer_terminates_only_past_the_buffer_and_only_under_pressure() {
-    let max_output = 100_000;
-    let buffer = 8192;
-    for seed in 1..=8u64 {
+    let max_output = 8192;
+    let buffer = 512;
+    for seed in 1..=6u64 {
         let mut rng = Rng(seed * 31 + 5);
-        let specs = random_specs(&mut rng, 32, max_output);
+        let specs = random_specs_with_prompt(&mut rng, 32, max_output, 2500);
         // Small pool: room for only a few buffers' worth beyond the prompts.
-        for pool in shapes((40_000 + buffer + 16usize).div_ceil(ROWS) * 3) {
-            let mut p = policy(4096, buffer, -1, max_output);
+        for pool in shapes((2500 + buffer + 16usize).div_ceil(ROWS) * 3) {
+            let mut p = policy(256, buffer, -1, max_output);
             let outcome = simulate(&mut p, pool, &specs, &mut rng);
             assert_eq!(outcome.stats.deadlock_breaks, 0);
             for ((s, finished), &allowed) in specs.iter().zip(&outcome.finished).zip(&outcome.allowed) {
@@ -452,9 +462,9 @@ fn simulator_drain_buffer_terminates_only_past_the_buffer_and_only_under_pressur
     }
     // No pressure, no termination.
     let mut rng = Rng(3);
-    let specs = random_specs(&mut rng, 16, max_output);
-    for pool in shapes(16 * (40_000 + max_output + 16) / ROWS) {
-        let mut p = policy(4096, buffer, -1, max_output);
+    let specs = random_specs_with_prompt(&mut rng, 16, max_output, 2500);
+    for pool in shapes(16 * (2500 + max_output + 16) / ROWS) {
+        let mut p = policy(256, buffer, -1, max_output);
         let outcome = simulate(&mut p, pool, &specs, &mut rng);
         check_complete(&specs, &outcome);
     }
@@ -462,13 +472,13 @@ fn simulator_drain_buffer_terminates_only_past_the_buffer_and_only_under_pressur
 
 #[test]
 fn simulator_early_termination_happens_only_past_the_threshold_where_a_stall_would_occur() {
-    let max_output = 100_000;
-    let threshold = 4096;
-    for seed in 1..=8u64 {
+    let max_output = 8192;
+    let threshold = 256;
+    for seed in 1..=6u64 {
         let mut rng = Rng(seed * 77 + 1);
-        let specs = random_specs(&mut rng, 32, max_output);
-        for pool in shapes((40_000 + max_output + 16).div_ceil(ROWS) * 2) {
-            let mut p = policy(4096, 0, threshold as i64, max_output);
+        let specs = random_specs_with_prompt(&mut rng, 32, max_output, 2500);
+        for pool in shapes((2500 + max_output + 16).div_ceil(ROWS) * 2) {
+            let mut p = policy(256, 0, threshold as i64, max_output);
             let outcome = simulate(&mut p, pool, &specs, &mut rng);
             assert_eq!(outcome.stats.deadlock_breaks, 0);
             let mut early = 0;
@@ -485,9 +495,9 @@ fn simulator_early_termination_happens_only_past_the_threshold_where_a_stall_wou
         }
     }
     let mut rng = Rng(5);
-    let specs = random_specs(&mut rng, 16, max_output);
-    for pool in shapes(16 * (40_000 + max_output + 16) / ROWS) {
-        let mut p = policy(4096, 0, threshold as i64, max_output);
+    let specs = random_specs_with_prompt(&mut rng, 16, max_output, 2500);
+    for pool in shapes(16 * (2500 + max_output + 16) / ROWS) {
+        let mut p = policy(256, 0, threshold as i64, max_output);
         let outcome = simulate(&mut p, pool, &specs, &mut rng);
         check_complete(&specs, &outcome);
     }

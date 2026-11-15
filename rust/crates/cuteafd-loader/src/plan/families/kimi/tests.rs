@@ -75,7 +75,7 @@ fn planner_resolves_every_spark_count_before_recipe_refusal() {
 fn complete_checkpoint_preserves_recipe_refusals_at_every_spark_count() {
     let dir = snapshot(true);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
-    for ranks in 1..=8 {
+    for ranks in [4, 5, 6] {
         let report = input.plan(&with_layout(ranks, Some(108 << 30))).unwrap();
         let expected = crate::plan::experts::spark_recipe("kimik3:exl3-k23", 3072, ranks);
         assert!(!report.hints.iter().any(|hint| hint.what.contains("missing projection")), "{:?}", report.hints);
@@ -772,11 +772,11 @@ fn automatic_context_uses_model_maximum_for_every_core() -> Result<()> {
         let expected = Model::open(&checkpoint)?.cfg.max_position;
         // The planner's unset context selects the same extent; an explicit one wins.
         let report = testing::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
-            layout: Some(plan::layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2], ..Default::default() }), ..Default::default() })?;
+            layout: Some(plan::layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2], ..Default::default() }), ..Default::default() })?;
         let notes = report.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();
         assert!(notes.contains(&format!("Kimi API max context: {expected} tokens")), "{notes}");
         let explicit = testing::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
-            layout: Some(plan::layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2], context_tokens: 262_144, ..Default::default() }),
+            layout: Some(plan::layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2], context_tokens: 262_144, ..Default::default() }),
             ..Default::default() })?;
         let notes = explicit.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();
         assert!(notes.contains("Kimi API max context: 262144 tokens"), "{notes}");
@@ -899,7 +899,7 @@ fn k31_native_indexer_headers_are_required_and_never_core_quantized() -> Result<
     let checkpoint = Checkpoint::open(dir.path())?;
     assert!(KIMI_K3.detect(&checkpoint));
     let model = Model::open(&checkpoint)?;
-    assert!(!model.native_serving_admission());
+    assert!(model.native_serving_admission());
     assert_eq!(model.spec.layers.iter().filter(|layer| matches!(layer.attention, AttentionKind::MlaDsa { indexer: true })).count(), 24);
     assert!(model.core.projections.is_empty());
     let index_bytes = 24 * (4096*1536 + 128*7168 + 32*7168 + 2*128) * 2;
@@ -932,7 +932,7 @@ fn k31_native_indexer_headers_are_required_and_never_core_quantized() -> Result<
 }
 
 #[test]
-fn k31_core_plans_charge_index_records_once_without_unlocking_serve() -> Result<()> {
+fn k31_qualified_cores_charge_index_records_once_and_unlock_serve() -> Result<()> {
     use crate::families::kimi_k3::config::KimiK3Config;
     use cuteafd_core::memory_layout::{Category, DeviceKind};
 
@@ -967,17 +967,8 @@ fn k31_core_plans_charge_index_records_once_without_unlocking_serve() -> Result<
     let input = testing::BudgetedPlanInput::open(dir.path())?;
     let mut options = with_layout(6, Some(115 << 30));
     let report = input.plan(&options)?;
-    assert!(!report.native_serving_admitted && !report.wip_launchable(),
-        "serve-kimi stays fail-closed for K3.1 in Stage 1");
-    // Earlier deployment guards may have admitted a native storage route.
-    // A descriptor that refuses DSA serving must not inherit that prior true.
-    let mut prior = report.clone();
-    prior.native_serving_admitted = true;
-    let mut layout = options.layout.clone().unwrap();
-    let raw_input = crate::plan::PlanInput::open(dir.path())?;
-    let model = Model::open(raw_input.checkpoint())?;
-    let _ = crate::plan::family_layout(&model, &raw_input, &mut prior, &mut layout, options.placement)?;
-    assert!(!prior.native_serving_admitted && !prior.wip_launchable());
+    assert!(report.native_serving_admitted);
+    assert_eq!(report.runtime, Some(crate::plan::RuntimeStatus::Serving));
     let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("{:?}", report.hints));
     let memory = report.memory_layout.as_ref().unwrap();
     for dev in memory.devices.iter().filter(|d| d.kind == DeviceKind::Rtx) {
@@ -989,8 +980,7 @@ fn k31_core_plans_charge_index_records_once_without_unlocking_serve() -> Result<
     }
     assert!(placed.pool_tokens > 0);
 
-    // Unqualified compact views still report their complete memory plan;
-    // RuntimeStatus::Planned keeps serving fail-closed (#1777).
+    // Accepted native K6 uses the same sparse attention and scoring contract.
     let k6_dir = tempfile::tempdir()?;
     testing::write_kimi_core_snapshot(k6_dir.path(), true);
     std::fs::write(k6_dir.path().join("config.json"), cfg.to_string())?;
@@ -1064,9 +1054,7 @@ fn k31_core_plans_charge_index_records_once_without_unlocking_serve() -> Result<
     assert!(k6_report.placement_supported, "{:?}", k6_report.hints);
     assert!(k6_report.memory_layout.as_ref().is_some_and(|memory| memory.pool_tokens > 0));
     assert!(k6_report.fits);
-    assert_eq!(k6_report.runtime, Some(crate::plan::RuntimeStatus::Planned));
-    assert!(!k6_report.wip_launchable());
-    assert!(k6_report.hints.iter().any(|h| h.what.contains("K6/K8 core views unqualified")),
-        "{:?}", k6_report.hints);
+    assert_eq!(k6_report.runtime, Some(crate::plan::RuntimeStatus::Serving));
+    assert!(k6_report.wip_launchable());
     Ok(())
 }

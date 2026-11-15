@@ -1729,6 +1729,7 @@ impl<'a> MimoEngine<'a> {
         };
         // Norms/router/wire quant always use full-width exports on both ranks.
         add("mimo_norm".into(), false, PackedRows);
+        if self.peer.is_some() { add("mimo_norm_head_split".into(), false, PackedRows); }
         for layers in std::iter::once(&self.weights.layers)
             .chain(self.peer.as_ref().map(|p| &p.layers)) {
             for layer in layers {
@@ -2778,7 +2779,7 @@ impl<'a> MimoEngine<'a> {
         self.norm_full(0, w, weight, deltas, rows, w.delta.buffer.ptr, w.delta.buffer.ptr)
     }
 
-    /// On rank `rank`: `h += bf16(delta + second)` when `deltas` is 2 (the local
+    /// On rank `rank`: `h = bf16(h + (delta + second))` when `deltas` is 2 (the local
     /// `delta` first, so both GPUs of a head split sum identically), `h += delta`
     /// when 1, then `x = weight * RMSNorm(h)`.
     #[allow(clippy::too_many_arguments)]
@@ -2790,7 +2791,8 @@ impl<'a> MimoEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn norm_full(&self, rank: usize, w: &Workspace<'_>, weight: *mut c_void, deltas: i32, rows: Scalar,
         first: *mut c_void, second: *mut c_void) -> Result<()> {
-        self.run_on(rank, false, "mimo_norm", &[("residual", w.h.buffer.ptr), ("delta0", first), ("delta1", second),
+        let program = if deltas == 2 { "mimo_norm_head_split" } else { "mimo_norm" };
+        self.run_on(rank, false, program, &[("residual", w.h.buffer.ptr), ("delta0", first), ("delta1", second),
             ("weight", weight), ("out", w.x.buffer.ptr)], &[rows, Scalar::I32(deltas)])
     }
 
@@ -4054,20 +4056,14 @@ mod tests {
                 // Independent reference: the original full-table generator.
                 let inv: Vec<f32> = (0..dim / 2).map(|i|
                     1.0 / (theta as f32).powf((2 * i) as f32 / dim as f32)).collect();
-                let mut table = vec![0f32; max_context * dim];
-                for p in 0..max_context {
-                    for (i, f) in inv.iter().enumerate() {
-                        let angle = p as f32 * f;
-                        table[p * dim + i] = angle.cos();
-                        table[p * dim + dim / 2 + i] = angle.sin();
-                    }
-                }
                 for (row, &p) in positions.iter().enumerate() {
                     assert_eq!(i64::from_ne_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap()), p);
                     let base = rows * 8 + (kind * rows + row) * dim * 4;
                     for i in 0..dim {
                         let actual = u32::from_ne_bytes(packed[base + i * 4..base + i * 4 + 4].try_into().unwrap());
-                        assert_eq!(actual, table[p as usize * dim + i].to_bits(), "theta={theta} p={p} i={i}");
+                        let angle = p as f32 * inv[i % (dim / 2)];
+                        let expected = if i < dim / 2 { angle.cos() } else { angle.sin() };
+                        assert_eq!(actual, expected.to_bits(), "theta={theta} p={p} i={i}");
                     }
                 }
             }

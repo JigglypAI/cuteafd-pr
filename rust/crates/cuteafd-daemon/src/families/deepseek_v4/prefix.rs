@@ -833,7 +833,7 @@ mod tests {
                     "dsv4f_paged_staging_gather_index", "dsv4f_sparse_mla_partial_h0_s4_m64",
                     "dsv4f_sparse_mla_partial_h32_s4_m64"].map(|name| serde_json::json!({"name": name}));
                 std::fs::write(&programs, serde_json::json!({"programs": names}).to_string()).unwrap();
-                let options = LayoutOptions { rtx_bytes: vec![96 << 30; 2], context_tokens: 4096,
+                let options = LayoutOptions { rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; 2], context_tokens: 4096,
                     pool_tokens: Some(8192), concurrency, native_mtp_layers: stages,
                     workspace_manifest: Some(programs),
                     host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() };

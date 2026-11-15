@@ -280,9 +280,15 @@ pub(crate) struct GlobalWeights<'a> {
     pub final_norm: Allocation<'a>,
     pub head: Option<CoreWeights<'a>>,
     pub head_bf16: Option<Allocation<'a>>,
+    pub head_native: Option<NativeWeights<'a>>,
 }
 
 impl<'a> GlobalWeights<'a> {
+    pub(crate) fn stored_head_outputs(&self, logical: usize) -> usize {
+        self.head.as_ref().map(|head| head.shape[0])
+            .or_else(|| self.head_native.as_ref().map(|head| head.layout.shape[0])).unwrap_or(logical)
+    }
+
     pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
         self.final_norm.inventory(inventory, "global.final_norm")?;
         if let Some(head) = &self.head {
@@ -291,6 +297,10 @@ impl<'a> GlobalWeights<'a> {
             }
         }
         if let Some(head) = &self.head_bf16 { head.inventory(inventory, "global.head")?; }
+        if let Some(head) = &self.head_native {
+            head.values.inventory(inventory, "global.head.values")?;
+            if let Some(scales) = &head.scales { scales.inventory(inventory, "global.head.scales")?; }
+        }
         Ok(())
     }
 
@@ -301,6 +311,9 @@ impl<'a> GlobalWeights<'a> {
         let root = PREFIX.trim_end_matches("layers.");
         let name = format!("{root}norm.weight");
         let dense = DenseLoad::mount(device.library);
+        let native_load = DenseLoad::mount(device.library);
+        native_load.admit_mount(cuteafd_loader::families::muse_spark::weight_layout::native_mount_load(
+            (rank + 1 == ranks).then_some(layout.head_native.as_ref()).flatten())?)?;
         let rect = checked_rect(checkpoint, &name, DType::Bf16, None, None)?;
         ensure!(rect.bytes() == layout.final_norm, "Muse final norm differs from admitted bytes");
         let final_norm = land(device, arena, "global.final_norm", &dense, rect)?;
@@ -309,13 +322,26 @@ impl<'a> GlobalWeights<'a> {
                 let core = CoreWeightLayout::from_shared(core.clone());
                 (Some(core.load_recorded_with(device, checkpoint, &dense, std::ptr::null_mut(),
                     |name, bytes| allocate(device, arena, name, bytes))?), None)
-            } else {
+            } else if layout.head_native.is_some() { (None, None) } else {
                 let rect = checked_rect(checkpoint, "lm_head.weight", DType::Bf16, None, None)?;
                 ensure!(rect.bytes() == layout.head_bf16, "Muse BF16 head differs from admitted bytes");
                 (None, Some(land(device, arena, "global.head", &dense, rect)?))
             }
         } else { (None, None) };
-        Ok(Self { final_norm, head, head_bf16 })
+        let head_native = if rank + 1 == ranks { layout.head_native.as_ref().map(|layout| -> Result<_> {
+            let weights = allocate_native(device, arena, layout)?;
+            let selected = checkpoint.projection(&layout.stem)?;
+            for record in attention_records(&checkpoint.snapshot, &selected, checkpoint.projection_view(&layout.stem),
+                layout, cuteafd_loader::families::muse_spark::core::fp8_role(
+                    &MuseSparkConfig::from_hf(&checkpoint.config)?, "lm_head.weight"),
+                crate::shared::fp8_linear::Fp8Scales::Amax, weights.values.buffer,
+                weights.scales.as_ref().map(|scales| scales.buffer))? {
+                match record { AttentionRecord::Operand(operand) => native_load.operand(operand)?,
+                    AttentionRecord::Step(step) => native_load.step(step, std::ptr::null_mut())? }
+            }
+            Ok(weights)
+        }).transpose()? } else { None };
+        Ok(Self { final_norm, head, head_bf16, head_native })
     }
 }
 
@@ -340,6 +366,68 @@ pub(crate) fn load_rank<'a>(device: Device<'a>, cfg: &MuseSparkConfig, checkpoin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn padded_native_head_width_matches_both_drafter_scratch_inventories() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::{formats::{native_attention::NativeLayout, trellis_core::CoreSplit},
+            families::muse_spark::MuseSparkConfig};
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library:&library,id:0 };
+        let cfg = MuseSparkConfig::from_hf(&cuteafd_loader::plan::testing::muse_spark_config())?;
+        let native = device.own(|| Ok(NativeAttentionWeights {
+            layout:NativeLayout { stem:"lm_head".into(),shape:[202112,8192],fp8:true,
+                rank:0,ranks:1,split:CoreSplit::Whole },
+            values:DeviceAllocation::new(&library,256,crate::shared::memory::TEST)?,
+            scales:Some(DeviceAllocation::new(&library,256,crate::shared::memory::TEST)?) }))?;
+        let weights = GlobalWeights { final_norm:Allocation::new(device,256,crate::shared::memory::TEST)?,
+            head:None,head_bf16:None,head_native:Some(native) };
+        assert_eq!(weights.stored_head_outputs(cfg.vocab_size),202112);
+        let mut core = cuteafd_loader::families::muse_spark::core::CoreInventory::default();
+        core.native.insert("lm_head".into(), cuteafd_loader::formats::native_attention::NativeProjection {
+            shape: [202112, cfg.hidden], fp8: true, split: CoreSplit::Whole });
+        let global = cuteafd_loader::families::muse_spark::weight_layout::GlobalLayout::new(&cfg, &core)?;
+        assert_eq!(global.stored_head_outputs(cfg.vocab_size), weights.stored_head_outputs(cfg.vocab_size));
+        assert_eq!(core.head_outputs(&cfg), weights.stored_head_outputs(cfg.vocab_size));
+        let admitted = cuteafd_loader::families::muse_spark::lane::head_planes(
+            global.stored_head_outputs(cfg.vocab_size), cfg.vocab_size)?;
+        for name in ["radixark.json","nvidia.json"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/families/muse_spark/fixtures/drafters").join(name);
+            let config:serde_json::Value=serde_json::from_slice(&std::fs::read(path)?)?;
+            let admitted=cuteafd_loader::placement::families::muse_spark::drafter_inventory(&cfg,&config,16,16,
+                202112,188,cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8)?;
+            let rows=admitted.sequences*admitted.block;
+            assert_eq!(admitted.head_scratch,(rows*(weights.stored_head_outputs(cfg.vocab_size)+cfg.vocab_size)*4) as u64);
+        }
+        for rows in [1, 64, 128] {
+            let owner = |bytes| cuteafd_ffi::CuteafdDeviceBuffer {
+                ptr: std::ptr::null_mut(), bytes, device_id: 0, flags: 0 };
+            let stored_owner = owner(rows * 202112 * 4);
+            let trimmed_owner = owner(rows * cfg.vocab_size * 4);
+            let (staged, trimmed, logits) = super::super::forward::head_planes(
+                &cfg, &weights, rows, stored_owner, trimmed_owner)?;
+            assert_eq!(staged.bytes, rows * 202112 * 4);
+            assert_eq!(trimmed.bytes, rows * cfg.vocab_size * 4);
+            assert_eq!(logits.bytes, trimmed.bytes);
+            if rows == cuteafd_loader::families::muse_spark::lane::HEAD_ROWS {
+                assert_eq!((staged.bytes, trimmed.bytes), admitted,
+                    "admitted head planes must equal runtime owner bytes");
+            }
+            assert!(super::super::forward::head_planes(&cfg, &weights, rows,
+                owner(rows * cfg.vocab_size * 4), trimmed_owner).unwrap_err()
+                .to_string().contains("owner too small"));
+            assert!(super::super::forward::head_planes(&cfg, &weights, rows,
+                stored_owner, owner(trimmed_owner.bytes - 4)).is_err());
+        }
+        let draft=include_str!("draft.rs");
+        assert!(draft.contains("super::forward::head_planes(cfg, &head.globals, rows, stored_plane, trimmed_plane)?"));
+        assert!(include_str!("forward.rs").contains(
+            "head_planes(cfg, &rank.globals, count, stored_plane.buffer, trimmed.buffer)?"));
+        Ok(())
+    }
 
     #[test]
     fn plain_push_recipes_match_host_packing_on_one_and_two_ranks() -> Result<()> {
@@ -536,7 +624,7 @@ mod tests {
                     let layer = LayerLayout { operands: BTreeMap::new(), core: cores, native };
                     let global = cuteafd_loader::families::muse_spark::weight_layout::GlobalLayout {
                         embedding: 512, final_norm: 512, head: Some(projection(head, CoreSplit::Whole,
-                            TrellisSide::Output, 0, 1)?), head_bf16: 0 };
+                            TrellisSide::Output, 0, 1)?), head_native: None, head_bf16: 0 };
                     let arena = DeviceWeightArena::new(device,
                         cuteafd_loader::families::muse_spark::weight_layout::coordinator_arena(rank, ranks, &global, &[&layer])?, crate::shared::memory::TEST_ARENA)?;
                     let dense = DenseLoad::mount(&library);

@@ -89,6 +89,12 @@ def test_resolved_core_identity_is_precision_only(family):
     assert not re.findall(r'set_resolved\("(core-[^"]+)"', source), family
     settings = cli.split("fn core_view_settings(")[1].split("\n}\n")[0]
     published = set(re.findall(r'\("(core-[^"]+)",', settings))
-    assert published == identity, published
-    assert published <= allowed, published - allowed
+    assert published == identity | {"core-original-dtype"}, published
+    assert identity <= allowed, identity - allowed
+    quant = re.search(r"const QUANT_SELECTION_SETTINGS:.*?= &\[(.*?)\];", bench, re.S)
+    assert quant is not None
+    checkpoint_identity = set(re.findall(r'"([^"]+)"', quant.group(1)))
+    assert "core-original-dtype" in checkpoint_identity
+    assert "core-original-dtype" not in allowed
+    assert "view.original_core_dtype()" in settings
     assert "declared_view()" in settings

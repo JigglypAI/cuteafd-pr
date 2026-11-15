@@ -580,7 +580,7 @@ async fn errors_before_first_event_and_mid_stream() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn initial_silence_keeps_stream_live_and_drop_cancels() {
     use futures::StreamExt;
     use gateway::backend::{Backend, BackendCapabilities, ModelInfo, TurnStream};

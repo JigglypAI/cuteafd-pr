@@ -468,6 +468,7 @@ historical recipe; new release launches use the v5 matrix.
 
 ## Muse Spark
 
+- 2026-11-15 · Release smoke + separate code-decode sweep (supplementary K8 core comparison) · wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC `k8-compact` · 2× RTX PRO 6000 @ gpu-powerd 425/425 W (410–435) + 6× DGX Spark · build ac64e40ee7c1 · [report](muse_spark/2026-11-15-smoke-muse-spark-open-exl3-k4-mc-2rtx-6spark-muse-mc-k8-compact-max-k8-r1/report.svg) · first card C1 memory PSI 0.45; C16/prefill/sweep PSI zero
 - 2026-11-14 · Release smoke · wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC · 2× RTX PRO 6000 @ gpu-powerd 425/425 W (400–450) + 6× DGX Spark · build ac64e40ee7c1 · [report](muse_spark/2026-11-14-smoke-muse-spark-open-exl3-k4-mc-2rtx-6spark-muse-spark-exl3-k4-mc-max-cand-r1/report.svg)
 - 2026-11-14 · Release smoke · wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC · 1× RTX PRO 6000 @ gpu-powerd 430 W (425–450) + 4× DGX Spark · build ac64e40ee7c1 · [report](muse_spark/2026-11-14-smoke-muse-spark-open-exl3-k4-mc-1rtx-4spark-muse-spark-exl3-k4-mc-min-cand-r1/report.svg)
 - 2026-11-10 · Release smoke · wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6-HQA · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (425–470) + 6× DGX Spark · build v5.0.0-rc1 · [report](muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-hqa-2rtx-6spark-muse-spark-exl3-max-fp8-compact/report.svg)

@@ -1476,9 +1476,7 @@ def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_
     # #72: a 4-Spark MiMo card was staged on six hosts with SPARK_TP=6 forced into
     # the build config, its --set overrides were ignored and untagged dev images
     # were used. Export scope comes from the card; TP never from the staging set.
-    kit = Path.home() / '.cache/cuteafd/builds/release-v2-rc3/kit'
-    if not (kit / 'matrix-main.json').exists():
-        pytest.skip('release-v2-rc3 kit absent')
+    kit = ROOT / 'scripts/bench/kits/gate'
     card = cards.load_cards(kit, ['mimo26-flash-max'])[0]
     card['set']['RTX_EXPERT_LAYERS'] = '0'
     arms = cards.arms_from(['baseline=x:a', 'candidate=y:b'])
@@ -1703,7 +1701,6 @@ def test_default_state_is_fresh_when_the_default_task_collides(entry, tmp_path, 
 
 
 def test_preflight_refuses_missing_packages_and_audio_before_any_launch(tmp_path, monkeypatch):
-    kit = Path.home() / '.cache/cuteafd/builds/release-v2-rc3/kit'
     gate = ROOT / 'scripts/bench/kits/gate'
     argv = ['--kit', str(gate), '--cards', 'mimo26-flash-max', 'glmf-exl3-max', '--matrix', '--arm', 'c=x:s',
             '--state', str(tmp_path / 'state')]
@@ -2411,10 +2408,14 @@ def test_arm_repo_overrides_arm_wip_and_unmapped_arm_falls_back_to_repo(entry, t
     assert sum(f'--repo {pinned} ' in line for line in smoke) == 1 and sum(f'--repo {fallback} ' in line for line in smoke) == 1
 
 
-def test_build_ref_is_pinned_once_across_build_and_launcher(entry, tmp_path, monkeypatch, capsys):
+def test_build_ref_is_pinned_once_across_build_and_launcher(entry, tmp_path, monkeypatch, capsys, fake_repo):
     # A symbolic --build ref is resolved once, before the builds; if work moves it while
     # the (hours-long) build runs, the build record and the launcher phase keep the commit
     # that was resolved first, never the moved ref (#315).
+    repo = fake_repo
+    monkeypatch.setattr(cards, 'REPO', repo)
+    monkeypatch.setattr(cards, 'toolchain_hash', lambda revision: 'fixture-toolchain')
+    subprocess.run(['git', '-C', str(repo), 'commit', '--allow-empty', '-qm', 'second fixture'], check=True)
     ref = 'refs/wip-cards-315-pin'
     def git(*args):
         return subprocess.run(['git', '-C', str(cards.REPO), *args], capture_output=True, text=True, check=True).stdout.strip()
