@@ -367,6 +367,18 @@ class Recorder:
         self.overheads = {name: 0.0 for name in ("reads_seconds", "profile_seconds", "audit_seconds", "construction_seconds")}
         self.read_counts = []
         self.dependency_paths = {}
+        self.source_hashes = {}
+
+    def source(self, path):
+        if path not in self.dependency_paths:
+            self.dependency_paths[path] = source_name(path, self.root)
+        return self.dependency_paths[path]
+
+    def validate_sources(self):
+        for path, checksum in self.source_hashes.items():
+            source = self.root / path
+            if not source.is_file() or digest(source.read_bytes()) != checksum:
+                raise ValueError(f"recorded source changed during export: {path}")
 
     def _start(self, code, offset):
         frame = sys._getframe(1)
@@ -409,7 +421,7 @@ class Recorder:
     def _audit(self, event, args):
         started = time.monotonic()
         if self.active and event == "open" and args and isinstance(args[0], (str, bytes, os.PathLike)):
-            path = source_name(args[0], self.root)
+            path = self.source(args[0])
             if path and not path.startswith(str(self.output)):
                 self.opened.add(path)
         self.overheads["audit_seconds"] += time.monotonic() - started
@@ -419,7 +431,7 @@ class Recorder:
         if event == "call":
             filename = frame.f_code.co_filename
             if filename not in self.frame_paths:
-                self.frame_paths[filename] = source_name(filename, self.root)
+                self.frame_paths[filename] = self.source(filename)
             path = self.frame_paths[filename]
             if path:
                 self.frames.add(path)
@@ -442,9 +454,7 @@ class Recorder:
             for dependency in (module, value):
                 filename = getattr(dependency, "__file__", None)
                 if filename is not None:
-                    if filename not in self.dependency_paths:
-                        self.dependency_paths[filename] = source_name(filename, self.root)
-                    source = self.dependency_paths[filename]
+                    source = self.source(filename)
                     if source:
                         self.frames.add(source)
 
@@ -453,13 +463,15 @@ class Recorder:
         paths = self.opened | self.frames
         for name in set(sys.modules) - self.imported:
             module = sys.modules.get(name)
-            path = source_name(getattr(module, "__file__", None), self.root)
+            path = self.source(getattr(module, "__file__", None))
             if path:
                 paths.add(path)
         active = self.active
         self.active = False
         try:
-            return {path: digest((self.root / path).read_bytes()) for path in sorted(paths)}
+            for path in paths - self.source_hashes.keys():
+                self.source_hashes[path] = digest((self.root / path).read_bytes())
+            return {path: self.source_hashes[path] for path in sorted(paths)}
         finally:
             self.active = active
             self.overheads["reads_seconds"] += time.monotonic() - started
@@ -574,6 +586,7 @@ class Recorder:
                                  "resources": resources, "abi_sha256": abi,
                                  "compile_key": stable_hash(key), "compile_inputs": key,
                                  "plan": plans.get(path.stem)}
+        self.validate_sources()
         (self.output / "program-timings.json").write_text(json.dumps({
             "stage0_seconds": self.frontend_seconds, "backend_seconds": self.backend_seconds,
             "overheads": {**self.overheads, "finish_seconds": time.monotonic() - started},
