@@ -841,3 +841,35 @@ def test_program_shards_keep_card_plans_together_and_reject_duplicates():
     catalog["programs"].append(catalog["programs"][0])
     with pytest.raises(ValueError, match="duplicate"):
         publisher.program_shards(catalog, 2)
+
+
+def test_shared_executor_keeps_kernel_inputs_for_every_family(tmp_path, fake_cutlass):
+    kernel = tmp_path / "kernel.py"
+    kernel.write_text("TILE = 64\n")
+    family_a = load_recipe(tmp_path / "family_a.py", "def recipe(fn):\n    return fn()\n")
+    family_b = load_recipe(tmp_path / "family_b.py", "def recipe(fn):\n    return fn()\n")
+    snapshots = []
+    for version in ("TILE = 64\n", "TILE = 128\n"):
+        kernel.write_text(version)
+        output = tmp_path / str(len(snapshots))
+        output.mkdir()
+        recorder = records.Recorder(tmp_path, output).install()
+        recorder.scoped = True
+        executor = None
+        def cached():
+            nonlocal executor
+            if executor is None:
+                ir = fake_cutlass.generate_original_ir(None)[0]
+                # Model the immutable source set produced by frontend tracing.
+                recorder.modules[id(ir)]["source_reads_sha256"]["kernel.py"] = records.digest(kernel.read_bytes())
+                executor = fake_cutlass.compile_and_cache(None, ir)
+            return executor
+        try:
+            for name, family in (("a", family_a), ("b", family_b)):
+                program = recorder.construct(family.recipe, cached)
+                program.export_to_c(output, name)
+            snapshots.append({name: recorder.exports[name + ".o"]["source_reads_sha256"] for name in ("a", "b")})
+            assert "family_a.py" not in snapshots[-1]["b"]
+        finally:
+            stop_recorder(recorder)
+    assert all(snapshots[0][name]["kernel.py"] != snapshots[1][name]["kernel.py"] for name in ("a", "b"))

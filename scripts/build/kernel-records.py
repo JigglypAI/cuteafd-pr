@@ -453,8 +453,9 @@ class Recorder:
             return function(*args, **kwargs)
         finally:
             reads = self.reads()
-            for record in self.latest:
-                record["source_reads_sha256"].update(reads)
+            if not self.scoped:
+                for record in self.latest:
+                    record["source_reads_sha256"].update(reads)
             self.construction = False
             self.overheads["construction_seconds"] += time.monotonic() - started
 
@@ -553,6 +554,10 @@ class Recorder:
                     if self.scoped and frame.f_code.co_name == "construct" and frame.f_code.co_filename == __file__:
                         break
                     frame = frame.f_back
+                recipe_paths = (self.opened, self.frames)
+                if self.scoped:
+                    self.opened, self.frames = set(), set()
+                    sys.monitoring.restart_events()
                 started = time.monotonic()
                 result = original(dsl, *args, **kwargs)
                 elapsed = time.monotonic() - started
@@ -564,6 +569,9 @@ class Recorder:
                     "ir_kind": "original_mlir", "ir_sha256": digest(str(module).encode()),
                     "source_reads_sha256": self.reads(),
                 }
+                if self.scoped:
+                    self.opened.update(recipe_paths[0])
+                    self.frames.update(recipe_paths[1])
                 return result
             return wrapped
 
@@ -598,6 +606,8 @@ class Recorder:
                     raise ValueError(f"{file_name}: export has no recorded compiler IR")
                 path = (Path(file_path) / (file_name + ".o")).relative_to(self.output).as_posix()
                 self.exports[path] = json.loads(json.dumps(found[1]))
+                if self.scoped:
+                    self.exports[path]["source_reads_sha256"].update(self.reads())
                 self.exports[path]["export_prefix"] = function_prefix or file_name
                 return result
             return wrapped
