@@ -199,7 +199,11 @@ def merge_program_shards(catalog, directories, output):
         "#define CUTEAFD_DSV4_PROGRAMS " + ", ".join(headers[name] for name in names), ""]))
     for name, data in (("program-records.json", records), ("comparison-plans.json", {label: plans[label] for label in labels})):
         (output / name).write_text(json.dumps(data, indent=2, sort_keys=name == "program-records.json") + "\n")
-    context = contexts[0]
+    context = dict(contexts[0])
+    for part in contexts[1:]:
+        if {key: value for key, value in part.items() if key not in ("seconds", "source_reads_sha256", "backend_reuse")} != {
+                key: value for key, value in context.items() if key not in ("seconds", "source_reads_sha256", "backend_reuse")}:
+            raise ValueError("shard worker provenance differs")
     context["source_reads_sha256"] = dict(sorted({name: value for part in contexts for name, value in part["source_reads_sha256"].items()}.items()))
     context["seconds"] = sum(part["seconds"] for part in contexts)
     context["backend_reuse"] = {key: sum(part.get("backend_reuse", {}).get(key, 0) for part in contexts) for key in ("hits", "misses")}

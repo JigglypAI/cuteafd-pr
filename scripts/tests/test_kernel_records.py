@@ -873,3 +873,60 @@ def test_shared_executor_keeps_kernel_inputs_for_every_family(tmp_path, fake_cut
         finally:
             stop_recorder(recorder)
     assert all(snapshots[0][name]["kernel.py"] != snapshots[1][name]["kernel.py"] for name in ("a", "b"))
+
+
+@pytest.mark.parametrize("order", [(0, 1), (1, 0)])
+def test_program_merge_matches_serial_bytes_and_checksums(tmp_path, order):
+    spec = importlib.util.spec_from_file_location("merge_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    manifest = {"schema": 1, "families": {"x": {}}, "capability": [12, 0], "programs": []}
+    catalog = {"manifest": manifest, "programs": [
+        {"name": "a", "labels": ["a_sm170", "a_sm188"]}, {"name": "b", "labels": ["b"]}]}
+    def write_part(directory, groups):
+        directory.mkdir()
+        labels = [label for group in groups for label in group["labels"]]
+        programs = [{"name": group["name"], "plans": group["labels"]} for group in groups]
+        (directory / "dsv4_programs.json").write_text(json.dumps({**manifest, "programs": programs}, indent=2) + "\n")
+        (directory / "program-records.json").write_text(json.dumps(
+            {label + ".o": {"object_sha256": label} for label in labels}, indent=2, sort_keys=True) + "\n")
+        (directory / "comparison-plans.json").write_text(json.dumps({label: {"geometry": {}} for label in labels}, indent=2) + "\n")
+        (directory / "comparison-context.json").write_text(json.dumps({"seconds": 1, "source_reads_sha256": {"x": "hash"}}))
+        (directory / "dsv4_programs.h").write_text("\n".join([
+            "#pragma once", *[f'#include "{label}.h"' for label in labels], "#define CUTEAFD_DSV4_CC_MINOR 0",
+            "#define CUTEAFD_DSV4_PROGRAMS " + ", ".join('{"' + group["name"] + '", entry}' for group in groups), ""]))
+        for label in labels:
+            (directory / (label + ".o")).write_bytes(label.encode())
+            (directory / (label + ".h")).write_text("header " + label)
+    serial, merged = tmp_path / "serial", tmp_path / "merged"
+    write_part(serial, catalog["programs"])
+    parts = [tmp_path / str(index) for index in range(2)]
+    for index, part in enumerate(parts):
+        write_part(part, catalog["programs"][index:index + 1])
+    merged.mkdir()
+    publisher.merge_program_shards(catalog, [parts[index] for index in order], merged)
+    for path in serial.iterdir():
+        if path.name != "comparison-context.json":
+            assert path.read_bytes() == (merged / path.name).read_bytes()
+            assert records.digest(path.read_bytes()) == records.digest((merged / path.name).read_bytes())
+    with pytest.raises(ValueError, match="cover catalog"):
+        missing = tmp_path / "missing"
+        missing.mkdir()
+        publisher.merge_program_shards(catalog, parts[:1], missing)
+
+
+def test_static_import_closure_is_independent_of_import_execution(tmp_path):
+    package = tmp_path / "third_party/sparkinfer/b12x"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "kernel.py").write_text("from .helper import TILE\n")
+    (package / "helper.py").write_text("TILE = 64\n")
+    recorder = records.Recorder(tmp_path, tmp_path / "output")
+    recorder.scoped = True
+    recorder.frames.add("third_party/sparkinfer/b12x/kernel.py")
+    reads = recorder.reads()
+    helper = "third_party/sparkinfer/b12x/helper.py"
+    assert reads[helper] == records.digest(b"TILE = 64\n")
+    (package / "helper.py").write_text("TILE = 128\n")
+    with pytest.raises(ValueError, match="recorded source changed"):
+        recorder.validate_sources()

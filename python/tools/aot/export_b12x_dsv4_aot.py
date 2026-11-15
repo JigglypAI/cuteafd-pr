@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
@@ -1530,6 +1531,7 @@ def dense_family_scopes(families, exlr8_family):
 
 
 def main() -> None:
+    setup_started = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--geometry", default="flash",
@@ -1861,6 +1863,7 @@ def main() -> None:
         from b12x.integration.cuteafd import INKLING2_SMALL
         manifest["families"]["inkling2"] = dataclasses.asdict(INKLING2_SMALL)
         work += [("inkling2", *item) for item in inkling2_attention_programs(args.decode_rows, args.prefill_rows)]
+    print(f"program worklist setup: {time.monotonic() - setup_started:.6f} seconds", flush=True)
     if globals().get("_catalog_only"):
         catalog = []
         for family, suffix, op, params, _ in work:
