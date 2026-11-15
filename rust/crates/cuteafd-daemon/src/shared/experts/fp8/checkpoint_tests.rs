@@ -405,12 +405,19 @@ fn nvfp4_merged_waves_are_byte_identical_to_singleton_units() -> Result<()> {
     let mut frames = Vec::new();
     let mut replies = Vec::new();
     for (unit_index, &count) in rows.iter().enumerate() {
+        // Slots 0 and 1 hit two hot experts (multi-chunk groups shared by
+        // every member); the rest walk distinct experts per row.
         let ids = (0..count as usize * topk).map(|route| {
-            let row = route / topk;
-            let hot = if route % topk < 2 { (route % topk) as u32 } else {
-                ((row * 13 + unit_index * 29 + (route % topk) * 7) % experts) as u32 };
-            hot.max(if route % topk == 1 { 1 } else { 0 })
+            let (row, slot) = (route / topk, route % topk);
+            if slot < 2 { slot as u32 } else {
+                (2 + (row * 13 + unit_index * 29 + (slot - 2) * ((experts - 2) / topk).max(1)) % (experts - 2)) as u32 }
         }).collect::<Vec<_>>();
+        for row in ids.chunks_exact(topk) {
+            let mut sorted = row.to_vec();
+            sorted.sort_unstable();
+            sorted.dedup();
+            ensure!(sorted.len() == topk, "oracle routes repeat an expert within a row");
+        }
         let mut owned = ExpertProtocolV2Request::new(500 + unit_index as u64, 17, 3, hidden as u32,
             ExpertV2Dtype::Bf16,
             (0..count).map(|row| ExpertProtocolV2RowDescriptor { row_id: u64::from(row),
