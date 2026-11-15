@@ -15,6 +15,64 @@ pub(crate) struct TargetWeights<'a> {
     operands: BTreeMap<String, Allocation<'a>>,
 }
 
+/// Unpublished target delivery; the only consumer requires the shared Spark
+/// validation barrier and whole-group committed receive before returning views.
+pub(crate) struct PendingTarget<'a> {
+    target: TargetWeights<'a>,
+    push: crate::shared::experts::rtx::push::CoordinatorPush,
+    dense: (Vec<crate::shared::experts::rtx::push::DensePlan>, Vec<crate::shared::experts::rtx::dense::DenseArena<'a>>),
+    device: Device<'a>,
+    sparks: usize,
+}
+
+impl<'a> PendingTarget<'a> {
+    pub fn prepare(device: Device<'a>, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+        checkpoint: &Checkpoint, catalog: &cuteafd_loader::OfficialV41Catalog,
+        inputs: &cuteafd_loader::placement::families::inkling2::InklingInputs,
+        admitted: &cuteafd_loader::placement::families::inkling2::AdmittedInkling)
+        -> Result<(Self, (Vec<std::net::TcpStream>, crate::shared::memory::push_exl3::CoordinatorRanks))> {
+        use crate::shared::experts::{layer::ExpertLayer, rtx::push::{CoordinatorExperts, CoordinatorPush, PushPolicy, WholeOwner}};
+        ensure!(inputs.gpus == 1 && inputs.spark_ranks > 0 && checkpoint.snapshot == view.snapshot()
+            && PushPolicy::for_snapshot(view.snapshot())? == PushPolicy::Required,
+            "Inkling target transaction requires admitted whole-rank SparkNest push");
+        let target_layout = inputs.targets.first().context("Inkling target layout absent")?.execution_arena()?;
+        let planned = admitted.solved.facts.allocations.iter().find(|owner| owner.id == target_layout.id())
+            .context("Inkling target arena absent from solved admission")?;
+        ensure!(planned.bytes == target_layout.bytes() as u64
+            && planned.location == cuteafd_loader::placement::planner::Location::coordinator(0),
+            "Inkling target backing differs from solved admission");
+        let envelope = inputs.push_host.get(admitted.onboard).and_then(Option::as_ref)
+            .context("Inkling target transaction has no admitted push host owners")?.clone();
+        let backings = match &inputs.local {
+            cuteafd_loader::placement::families::inkling2::LocalPackage::Installed { backings } =>
+                backings.get(admitted.onboard).context("Inkling selected expert prefix missing")?.as_slice(),
+            _ if admitted.onboard == 0 => &[],
+            _ => anyhow::bail!("Inkling selected local expert backend missing"),
+        };
+        let sets = backings.iter().map(|backing| CoordinatorExperts::Whole { owners: vec![WholeOwner {
+            rank: 0, budget: backing.arena.bytes(), selections: backing.layers.iter().map(|&layer|
+                ExpertLayer::BackboneFull { layer }).collect(),
+        }] }).collect::<Vec<_>>();
+        let experts = (!sets.is_empty()).then_some(CoordinatorExperts::Sets(sets));
+        let (target, records) = crate::shared::experts::rtx::dense::recording(||
+            TargetWeights::record_push(device, checkpoint, &inputs.targets[0]))?;
+        let dense = crate::shared::experts::rtx::dense::plan_records(view.snapshot(), records, &[device], inputs.spark_ranks)?;
+        let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(view, Some(catalog), 1, experts, envelope)?;
+        Ok((Self { target, push, dense, device, sparks: inputs.spark_ranks }, (streams, ranks)))
+    }
+    pub fn finish(self, catalog: &cuteafd_loader::OfficialV41Catalog,
+        pending: crate::shared::placement::PendingSparkAdmission)
+        -> Result<(TargetWeights<'a>, Vec<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>)> {
+        let Self { target, push, dense, device, sparks } = self;
+        crate::shared::placement::load_while_admitting(Some(pending), || {
+            let (received, ()) = push.receive_sets_with(vec![device], Some(catalog), sparks, Some(Ok(dense)), || ());
+            let experts = crate::shared::experts::rtx::push::PushPolicy::Required.committed(received)?
+                .context("Inkling target push group did not commit")?;
+            Ok((target, experts))
+        })
+    }
+}
+
 pub(crate) fn execution_arena(layout: &CoordinatorWeights) -> Result<WeightArenaLayout> {
     layout.execution_arena()
 }

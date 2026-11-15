@@ -248,6 +248,14 @@ fn installed_local_native_owners_use_shared_workspace_requests_once() -> anyhow:
     assert!(backings[0].is_empty());
     assert_eq!(backings[1].len(), 2, "one homogeneous group per physical rank");
     assert_eq!(backings[4].len(), 4, "mixed formats retain two independently retired backends per rank");
+    let host = crate::families::inkling2::weight_layout::push_host_envelope(&catalog, &backings[4], 2)?;
+    assert_eq!(host.dense_bytes, [0, 0], "raw dense delivery and device transpose need no staged host transform");
+    assert_eq!(host.retained_bytes, [0, 0]);
+    assert_eq!(host.slots, cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64);
+    assert_eq!(host.slot_bytes, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64);
+    assert!(host.expert_bytes.iter().all(|&bytes| bytes > 0), "native dynamic scalar validation is explicit");
+    let empty_host = crate::families::inkling2::weight_layout::push_host_envelope(&catalog, &backings[0], 2)?;
+    assert_eq!(empty_host.expert_bytes, [0, 0]);
     for gpu in 0..2 {
         let workspace = backings[4].iter().filter(|backing| backing.gpu == gpu)
             .flat_map(|backing| &backing.workspace).map(|(_, bytes)| bytes).sum::<u64>();

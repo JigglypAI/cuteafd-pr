@@ -542,7 +542,8 @@ impl Recipe for InklingInputs {
             || request.context.maximum != self.context.maximum || self.targets.len() != self.gpus
             || self.modes.len() != cfg.layers || self.graph_reserve.len() != self.gpus
             || self.code.len() != self.gpus || self.experts.len() != self.routed.len()
-            || self.spark.len() != self.routed.len() + 1 || self.prefill.rows == 0 || self.prefill.waves == 0
+            || self.spark.len() != self.routed.len() + 1 || self.push_host.len() != self.routed.len()+1
+            || self.prefill.rows == 0 || self.prefill.waves == 0
             || self.sequences == 0 {
             return Err(invalid("invalid extent or empty domain"));
         }
