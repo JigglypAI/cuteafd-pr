@@ -5814,7 +5814,9 @@ mod prefill_lane_tests {
             // Fork #269 makes Kimi BF16 wide prefill opt-in; GLM leaves bf16_wide off
             // and bf16_wide_min_rows None, preserving its routes. The pin-bump CHANGES
             // receipt changes only kimik3_* / draft_bf16_*: all GLM objects are identical.
-            ("integration/cuteafd/glmf.py", 0xe9850fac36cb38d5_u64),
+            // Fork #317 adds opt-in channel-scale expanded-prefill siblings;
+            // the default row128 routes and existing program metadata stay unchanged.
+            ("integration/cuteafd/glmf.py", 0x7b6b_c5eb_62ca_13ac_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             // Hugh Madden fork #30 (TMA fences before consumer_release): fence-only change.
             // Fork #136 adds only an optional weight TMA cache policy; MMA and K order are unchanged.
