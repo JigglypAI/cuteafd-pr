@@ -112,6 +112,34 @@ def write_bridge(output: Path, manifest: dict) -> None:
     (output / 'v41_exl3_bridge.cc').write_text('\n'.join(lines) + '\n')
 
 
+def segment_buffer_layouts(geometry: dict) -> tuple[dict, list[dict], int]:
+    """Describe the live arena using the fork's authoritative region formula."""
+    from b12x.moe._shared.kernels.w4a16.host import exl3_ws_segment_scratch_regions
+
+    sizes = exl3_ws_segment_scratch_regions(**geometry)
+    rows, routes = geometry['rows'], geometry['rows'] * geometry['topk']
+    shapes = {'rotation_gate': [routes, geometry['hidden']],
+              'fc1': [routes, 2 * geometry['intermediate']],
+              'activated': [routes, geometry['intermediate']], 'output': [rows]}
+    layouts, regions, offset = {}, [], 0
+    for name, size in sizes.items():
+        dtype, element = (('torch.float16', 2) if name in ('rotation_gate', 'fc1', 'activated')
+                          else ('torch.int64', 8) if name == 'output'
+                          else ('torch.float32', 4) if name.endswith('scratch')
+                          else ('torch.int32', 4))
+        aligned = (size + 255) & ~255
+        regions.append(dict(name=name, bytes=size, offset=offset, aligned_bytes=aligned))
+        layouts[name] = dict(shape=shapes.get(name, [size // element]), dtype=dtype,
+                             bytes=size, allocation=name, arena=True, arena_offset=offset,
+                             zero_on_create=name == 'workspace')
+        offset += aligned
+    for name in ('rotation_up', 'fc2'):
+        layouts[name] = dict(layouts['rotation_gate'], allocation='rotation_gate')
+    layouts['input'] = dict(shape=[rows], dtype='torch.int64', bytes=8 * rows,
+                            allocation='input', arena=False, external=True, zero_on_create=False)
+    return layouts, regions, offset
+
+
 def export(output: Path, intermediate: int, experts: int, capacity: int,
            bits: tuple[int, ...], routing: str, topk: int = 6, output_dtype: str = "bf16",
            blocks_per_sm: int | None = None,
@@ -121,7 +149,10 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
            wire_input: bool = False, ws_input_stages: int | None = None,
            ws_dynamic_tiles: bool = False, decode_schedule: str | None = None,
            compile_only: bool = False, activation: str = "silu",
-           compact_weights: bool = False) -> dict:
+           compact_weights: bool = False, row_addresses: bool = False) -> dict:
+    if row_addresses and (not warp_specialized or capacity != 8192
+                          or output_dtype != 'bf16' or compact_weights or routing == 'direct'):
+        raise ValueError('row addresses require noncompact warp-specialized packed capacity 8192 and BF16 output')
     if len(bits) != 2 or len(set(bits)) != len(bits) or any(b not in range(2, 7) for b in bits):
         raise ValueError("export requires two distinct K2..K6 decoder tiers")
     # The (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) tuple is b12x's own
@@ -205,6 +236,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     direct = _projection_mixed_direct_topk_routes(capacity, topk, direct_exl3=True)
     if routing != "auto":
         direct = routing == "direct"
+    if row_addresses:
+        direct = False
     block_m = 8 if direct else route_block
     route_slots = capacity * topk if direct else route_pack_capacity(capacity * topk, block_m, experts, topk=topk)[1]
     route_blocks = route_slots if direct else (route_slots + block_m - 1) // block_m
@@ -229,6 +262,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
             rotation["ws_input_stages"] = ws_input_stages
         if ws_dynamic_tiles:
             rotation["ws_dynamic_tiles"] = True
+    if row_addresses:
+        rotation['row_addresses'] = True
     if compact_weights:
         rotation["compact_weights"] = True
     schedule = {} if decode_schedule is None else {"decode_schedule": decode_schedule}
@@ -248,14 +283,19 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
             "object_sha256": hashlib.sha256((output / (label + '.o')).read_bytes()).hexdigest(),
             "header_sha256": hashlib.sha256(header.encode()).hexdigest()})
     # Compile-only qualification needs the same shapes/aliasing, not CUDA storage.
-    buffers = make_mixed_trellis_buffers(launch,
+    buffers = None if row_addresses else make_mixed_trellis_buffers(launch,
         device=torch.device("meta") if compile_only else torch.device("cuda", 0),
         sms=workspace_sms)
     lut_bytes = launch.trellis_lut.contiguous().view(torch.uint8).cpu().numpy().tobytes()
     (output / 'trellis_lut.bin').write_bytes(lut_bytes)
     layouts = {}
     owners = {}
-    for field in fields(buffers):
+    segment_geometry = dict(rows=capacity, maximum=capacity, hidden=hidden,
+                            intermediate=intermediate, topk=topk, experts=experts,
+                            block=block_m, max_m_blocks=route_blocks, sms=workspace_sms)
+    if row_addresses:
+        layouts, segment_regions, segment_bytes = segment_buffer_layouts(segment_geometry)
+    for field in (() if row_addresses else fields(buffers)):
         value = getattr(buffers, field.name)
         address = id(value) if compile_only else value.untyped_storage().data_ptr()
         owner = owners.setdefault(address, field.name)
@@ -267,7 +307,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # Its initialization kernels write that entire bucket, including padding.
     # Publish the canonical packer's larger metadata allocations; compute data
     # buffers still cover only the actual token capacity.
-    if not direct:
+    if not direct and not row_addresses:
         for name, count in (("packed_route_indices", route_slots), ("block_expert_ids", route_blocks)):
             spec = layouts[name]
             if spec['allocation'] != name or spec['dtype'] != 'torch.int32' or len(spec['shape']) != 1:
@@ -289,6 +329,11 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         "trellis_lut": {"file": "trellis_lut.bin", "bytes": len(lut_bytes),
             "sha256": hashlib.sha256(lut_bytes).hexdigest()},
         "native_execution_verified": False}
+    if row_addresses:
+        manifest.update(row_addresses=True, input_format='e4m3_k32' if wire_input else 'bf16',
+                        segment_geometry={**segment_geometry, 'workspace_sms': workspace_sms},
+                        segment_scratch_regions=segment_regions, segment_scratch_bytes=segment_bytes,
+                        unique_execution_buffer_bytes=segment_bytes)
     if compact_weights:
         manifest.update(descriptor_rows=7, native_info_version=3)
     if activation != "silu":
@@ -311,6 +356,10 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     if getattr(launch, "decode_schedule", None) is not None:
         manifest["decode_schedule"] = launch.decode_schedule
     write_bridge(output, manifest)
+    if row_addresses:
+        bindings = {'rotation_input_ptr': 'input', 'output_ptr': 'output', 'fc2_ptr': 'fc2'}
+        for obj in objects:
+            obj['pointer_bindings'] = [bindings.get(name, name) for name in obj.get('pointer_slots', [])]
     if not direct:
         from export_b12x_exl3_routes_aot import export as export_routes
         route_manifest = export_routes(output / 'routes', capacity, experts, topk, block_m)
@@ -347,6 +396,8 @@ def main() -> None:
                         help="Warp-specialized prefill kernels (packed 16+ row blocks)")
     parser.add_argument("--wire-input", action="store_true",
                         help="Warp-specialized FC1 reads E4M3 + UE8M0 K32 wire rows (no BF16 decode)")
+    parser.add_argument("--row-addresses", action="store_true",
+                        help="Row-addressed merged waves (WS, capacity 8192, BF16 output; native BF16 or wire ingress)")
     parser.add_argument("--ws-input-stages", type=int, choices=range(2, 7),
                         help="Warp-specialized input-row ring depth (default: kernel policy)")
     parser.add_argument("--ws-dynamic-tiles", action="store_true",
@@ -369,7 +420,8 @@ def main() -> None:
            ws_input_stages=args.ws_input_stages, ws_dynamic_tiles=args.ws_dynamic_tiles,
            swiglu_limit=None if args.swiglu_limit.lower() == "none" else float(args.swiglu_limit),
            activation=args.activation,
-           decode_schedule=args.decode_schedule, compact_weights=args.compact_weights)
+           decode_schedule=args.decode_schedule, compact_weights=args.compact_weights,
+           row_addresses=args.row_addresses)
 
 
 if __name__ == "__main__":

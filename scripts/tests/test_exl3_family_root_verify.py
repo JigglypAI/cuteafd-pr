@@ -222,6 +222,50 @@ def test_sm121_object_requires_actual_cuda_target(tmp_path):
         tool.verify_object_target(path, (12, 1))
 
 
+@pytest.mark.parametrize('geometry', ['glm', 'glmf', 'kimik3', 'step5', 'ml4', 'muse', 'qwen4', 'dsv4p'])
+def test_segments_follow_shipping_spark_layouts_and_native_ingress(geometry):
+    tool = load_tool()
+    for profile, width, *_ in tool.build_profiles('spark', geometry):
+        options = tool.segment_export_options(geometry, 'spark', width)
+        if geometry not in ('glm', 'glmf'):
+            assert options is None
+            continue
+        assert options['row_addresses'] and options['warp_specialized']
+        assert options.get('wire_input', False) == (tool.GEOMETRIES[geometry][0] % 512 == 0)
+        assert options['hidden'] == tool.GEOMETRIES[geometry][0]
+        assert options['route_block'] >= 16
+        assert width % options['tile'][1] == 0
+        assert tool.segment_export_options(geometry, 'spark', width, compact=True) is None
+        assert tool.segment_export_options(geometry, 'coordinator', width) is None
+    assert tool.SEGMENT_MAX_ROWS == 8192
+
+
+def test_segments_package_records_row_address_variant(tmp_path, monkeypatch):
+    tool = load_tool()
+    monkeypatch.setattr(tool, 'verify_object_target', lambda *args: None)
+    directory = 'tp4-rank0/m8192-segments'
+    variant = dict(directory=directory, capacity=8192, intermediate=512, experts=256,
+                   top_k=8, output_dtype='bf16', bits=[4, 5], row_addresses=True,
+                   warp_specialized=True, route_block=64, input_format='e4m3_k32')
+    meta = {**variant, 'hidden': 6144, 'compute': [12, 1],
+            'requires_route_preparation': False, 'sparkinfer_revision': 'test'}
+    destination = tmp_path / directory
+    destination.mkdir(parents=True)
+    (destination / 'v41_exl3.json').write_text(json.dumps(meta))
+    (destination / 'trellis_lut.bin').write_bytes(b'lut')
+    (destination / 'libcuteafd_exl3.so').write_bytes(b'library')
+    files = {str(path.relative_to(tmp_path)): dict(bytes=path.stat().st_size, sha256=tool.digest(path))
+             for path in destination.iterdir()}
+    manifest = dict(schema='cuteafd.exl3-package.v1', role='spark', geometry='glm',
+                    compute=[12, 1], sparkinfer_revision='test', variants=[variant], files=files)
+    (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
+    assert tool.verify(tmp_path) == manifest
+    variant['row_addresses'] = False
+    (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match='row-address mismatch'):
+        tool.verify(tmp_path)
+
+
 def test_worker_target_is_explicit_and_failures_are_observed_unordered():
     source = TOOL.read_text()
     assert 'args, target_compute, raw' in source
