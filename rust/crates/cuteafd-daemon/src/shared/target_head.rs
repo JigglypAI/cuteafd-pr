@@ -18,8 +18,8 @@
 //! The tensor route pins one cuBLASLt algorithm/tile with split-K disabled at load;
 //! decode and verify must not choose different reductions based on row count.
 
-use anyhow::{bail, Result};
-use cuteafd_ffi::programs::VocabularyHead;
+use anyhow::{bail, ensure, Context, Result};
+use cuteafd_ffi::{programs::{Programs, VocabularyHead}, CuteafdDeviceBuffer as Buffer};
 use std::ffi::c_void;
 
 /// How target logits run through a BF16 head.
@@ -92,6 +92,73 @@ pub(crate) unsafe fn launch(mode: TargetHead, head: &VocabularyHead<'_>, x: *con
         } else {
             head.launch(x.cast(), weight.cast(), logits, rows, stream)
         }
+    }
+}
+
+/// Typed head row views, shared by target and drafter calls at the stored
+/// vocabulary width. Validate the complete batch before launching any chunk.
+pub(crate) fn head_chunks(rows: usize, input: Buffer, output: Buffer, k: usize, n: usize,
+    mut launch: impl FnMut(usize, Buffer, Buffer) -> Result<()>) -> Result<()> {
+    let extent = |width: usize, element: usize| -> Result<usize> {
+        rows.checked_mul(width).and_then(|v| v.checked_mul(element)).filter(|&v| v > 0)
+            .context("head typed extent overflow or empty")
+    };
+    let (input_bytes, output_bytes) = (extent(k, 2)?, extent(n, 4)?);
+    ensure!(input.bytes >= input_bytes && output.bytes >= output_bytes,
+        "head input/output exceeds admitted extent");
+    let start = input.ptr as usize;
+    let end = start.checked_add(input_bytes).context("head input address overflow")?;
+    let out = output.ptr as usize;
+    let out_end = out.checked_add(output_bytes).context("head output address overflow")?;
+    ensure!(start != 0 && out != 0 && (end <= out || out_end <= start), "head input/output aliases or is null");
+    for first in (0..rows).step_by(64) {
+        let count = (rows - first).min(64);
+        let view = |buffer: Buffer, stride: usize| Buffer {
+            ptr: buffer.ptr.cast::<u8>().wrapping_add(first * stride).cast(), bytes: count * stride, ..buffer
+        };
+        launch(count, view(input, k * 2), view(output, n * 4))?;
+    }
+    Ok(())
+}
+
+/// Allocation-free block-FP8 vocabulary projection. Families retain the same
+/// admitted weight arena and serialized scratch; crop/softcap remain outside.
+pub(crate) struct BlockFp8Head<'a> {
+    registry: cuteafd_ffi::native_attention::Fp8Projections<'a>,
+    shape: [usize; 2],
+}
+
+impl<'a> BlockFp8Head<'a> {
+    pub(crate) fn load(programs: &'a Programs<'a>, shape: [usize; 2]) -> Result<Self> {
+        let [n, k] = shape;
+        Ok(Self { registry: cuteafd_ffi::native_attention::Fp8Projections::load(programs,
+            &[(k,n)], 64, cuteafd_ffi::draft_projection::ProjectionOutput::F32)?, shape })
+    }
+
+    pub(crate) fn scratch_bytes(&self) -> Result<usize> {
+        Ok(self.registry.scratch_bytes(self.shape[1], self.shape[0])?)
+    }
+
+    pub(crate) fn launch(&self, rows: usize, input: Buffer,
+        weights: &crate::shared::native_attention::NativeAttentionWeights<'_>,
+        output: Buffer, scratch: Buffer, stream: *mut c_void) -> Result<()> {
+        use cuteafd_loader::formats::trellis_core::CoreSplit;
+        ensure!(weights.layout.shape == self.shape && weights.layout.fp8
+            && weights.layout.ranks == 1 && weights.layout.rank == 0
+            && weights.layout.split == CoreSplit::Whole,
+            "block FP8 head differs from bound whole-owner shape");
+        let scales = weights.scales.as_ref().context("block FP8 head scales absent")?.buffer;
+        ensure!([input.device_id, weights.values.buffer.device_id, scales.device_id, scratch.device_id]
+            .into_iter().all(|device| device == output.device_id)
+            && scratch.bytes >= self.scratch_bytes()?, "block FP8 head device/scratch differs from admission");
+        let [n, k] = self.shape;
+        head_chunks(rows, input, output, k, n, |count, x, y| {
+            // SAFETY: typed disjoint row views, admitted weights and serialized
+            // scratch remain live on this device until the caller drains stream.
+            unsafe { self.registry.launch(x.ptr, weights.values.buffer.ptr, scales.ptr,
+                y, scratch, count, k, n, stream)?; }
+            Ok(())
+        })
     }
 }
 
