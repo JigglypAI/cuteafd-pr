@@ -345,11 +345,12 @@ impl FamilyModel for Model {
         }
         let overflow = || CacheGeometryError::Overflow("MiniMax MSA page geometry");
         let rows = crate::placement::families::minimax_m3::PAGE_ROWS;
-        let kv = rows.checked_mul(self.cfg.kv_heads as u64)
-            .and_then(|bytes| bytes.checked_mul(self.cfg.head_dim as u64)).ok_or_else(overflow)?;
+        let rank_heads = self.cfg.kv_heads / if heads { 2 } else { 1 };
+        let kv = rows.checked_mul(cuteafd_ffi::minimax_m3::kv_plane_record_bytes(rank_heads) as u64)
+            .ok_or_else(overflow)?;
         let index = (self.cfg.msa.index_dim as u64).checked_add(4)
             .and_then(|bytes| bytes.checked_mul(rows)).ok_or_else(overflow)?;
-        let page = kv.checked_mul(if heads { 1 } else { 2 }).and_then(|bytes| bytes.checked_add(index)).ok_or_else(overflow)?;
+        let page = kv.checked_mul(2).and_then(|bytes| bytes.checked_add(index)).ok_or_else(overflow)?;
         let owners = crate::placement::families::minimax_m3::layer_owners(self.cfg.layers, ranks);
         let ranks = (0..ranks).map(|rank| {
             let layers = if heads { self.cfg.layers as u64 } else {

@@ -20,9 +20,10 @@ default-off performance lever adds its row here in the same PR (AGENTS.md).
 
 | Lever | Families | Enable | Effect | Cost |
 | --- | --- | --- | --- | --- |
+| `SPECULATOR` (bundled DSpark) | MiniMax M3.1 Flash | `SPECULATOR=dspark` (unset/auto = off) | Informational only, not a qualified A/B: C1 about +50%, C16 about -20% on 1 RTX PRO 6000 + 3 Sparks; three runs, all reclaim-flagged ([#2113 measurement summary](https://github.com/tpurtell/cuteafd/pull/2113)). Latest matched sweep off/simple/shared: C1 31.33/47.57/47.48 and C16 201.39/157.48/162.58 emitted tok/s; no thermal slowdown. Local receipt: `~/.cache/cuteafd/builds/v51-minimax-dspark-three-arm/summary.json`. | Extra native BF16/MXFP8 drafter weights, retained taps and exact window state; no target-weight conversion. Strict C1 and boot-C4 10/10, concurrent greedy, exact prefix and memory gates pass. Quality is unchanged across arms (KL 0.0247, top-1 95.7%). Remains opt-in pending clean throughput qualification. |
 | `L2_PREFETCH` | V4.1, MiMo, Qwen4 | `L2_PREFETCH=auto` or a MiB count (unset = off; GLM 5.3 and GLM Flash already default it to `auto`) | Pulls the next layer's weights into L2 while a one-lane decode step waits on its Spark exchange. V4.1 1× RTX 5090 + 4 Sparks: every C1 cell +1.7–3.9%, C4/C8 and 8K prefill unchanged (#623); GLM 5.3 weighted +4.4%, GLM Flash C1 +6–15% (2026-09-30). | None in values (outputs byte-identical); only extra L2 traffic. |
 | `QWEN_FP8_DECODE` | Qwen4 | `QWEN_FP8_DECODE=on` (unset = checkpoint BF16) | Holds the GDN/attention projections as one resident E4M3 copy; with `QWEN_FP8_HEAD=on`, 1× RTX code C1 222→247 tok/s, C4 441→489, 8K prefill 6100→6177 (2026-10-03). | Converts target projections to FP8 at load: golden KL 0.036→0.046, top-1 88.5%→86.7%; fails the KL gate, so opt-in only. |
-| `CORE_VIEW` | GLM 5.3 / ML4, GLM Flash, Kimi K3, Step-5, Muse | `CORE_VIEW=k8-compact`, `k6-compact` or `fp8-compact` (unset = original) | Stored MC core or generic load-time block FP8 of exactly the original variant's `core_tensors`; BF16 index only. GLM Flash K4 MC, 2 RTX PRO 6000 / 0 Sparks, DFlash2, fixed 425/425 W (2026-11-12): FP8 vs original C1/C16/8K prefill 171.12/741.93/7837.57 to 196.74/772.56/7741.92 tok/s (+15.0%/+4.1%/-1.2%); pool 1628160 to 2097152. K6 is non-inferior on both measured Standard-v2 paths, with +22.8% C1 and -12.5% 8K prefill vs original. Other checkpoints unmeasured. | K8/K6 and FP8 quantize target weights. FP8 uses E4M3 + FP32 128x128 block scales. Matched Standard-v2 generated positions: FP8-minus-original KL to official BF16 ancestry +0.00289 decode/+0.00325 prefill, top-1 -0.013/-0.526 percentage points; absolute ancestry gates pass, paired decode non-inferiority passes but prefill fails (0.005 margin). Those figures ran W8A8 prefill over every group; W8A16 prefill (`FP8_PREFILL=off`) also fails prefill non-inferiority (top-1 loss 0.00263, upper95 0.00614). FP8 stays opt-in. Unsupported executor roles refuse by tensor name, never skip. Plain checkpoints refuse every compact selector, including the former plain Flash FP8 path. |
+| `CORE_VIEW` | GLM 5.3 / ML4, GLM Flash, Kimi K3, Step-5, Muse | `CORE_VIEW=k8-compact`, `k6-compact` or `fp8-compact` (unset = original) | Stored MC core or generic load-time block FP8 of exactly the original variant's `core_tensors`; BF16 index only. GLM Flash K4 MC, 2 RTX PRO 6000 / 0 Sparks, DFlash2, fixed 425/425 W (2026-11-12): FP8 vs original C1/C16/8K prefill 171.12/741.93/7837.57 to 196.74/772.56/7741.92 tok/s (+15.0%/+4.1%/-1.2%); pool 1628160 to 2097152. K6 is non-inferior on both measured Standard-v2 paths, with +22.8% C1 and -12.5% 8K prefill vs original. Muse K4 MC `fp8-compact` is measured below (+15.2% C1, C16 flat, -5.1% 8K prefill; larger pool). Other checkpoints unmeasured. | K8/K6 and FP8 quantize target weights. FP8 uses E4M3 + FP32 128x128 block scales. Matched Standard-v2 generated positions: FP8-minus-original KL to official BF16 ancestry +0.00289 decode/+0.00325 prefill, top-1 -0.013/-0.526 percentage points; absolute ancestry gates pass, paired decode non-inferiority passes but prefill fails (0.005 margin). Those figures ran W8A8 prefill over every group; W8A16 prefill (`FP8_PREFILL=off`) also fails prefill non-inferiority (top-1 loss 0.00263, upper95 0.00614). FP8 stays opt-in. Unsupported executor roles refuse by tensor name, never skip. Plain checkpoints refuse every compact selector, including the former plain Flash FP8 path. |
 | `CUTEAFD_GLM_BF16` | GLM 5.3 / ML4 | `CUTEAFD_GLM_BF16=fp8` (unset = native) | GLM 5.3 converts target BF16 MLA, indexer and dense/shared FFNs to block FP8. Unmeasured; no conversion of ML4's native mixed core. | Target-weight quantization; drafter and KV precision are independent. |
 | `QWEN_FP8_HEAD` | Qwen4 | `QWEN_FP8_HEAD=on` (unset = BF16) | Converts the shared target/MTP head to one E4M3 backing. Historical combined measurement is in the decode row; standalone effect unmeasured. | Changes target logits; the draft reads the same head, not a separate draft-only FP8 copy. |
 | `MIMO_FP8_HEAD`, `MIMO_FP8_O_PROJ` | MiMo | Set either to `on` (unset/auto = checkpoint) | Explicitly converts a BF16 target head or O projection; native FP8 stays FP8. Unmeasured. | Target-weight quantization, independent of drafter precision. |
@@ -54,8 +55,40 @@ Muse MC (`cc5dc2537083177e3f02ea0b2d9dfc179d40425c`) likewise offers
 `original`, `k8-compact` and `k6-compact`; separate
 `muse-spark-exl3-k4-mc-{min,max}.config` examples select `CORE_VIEW=original`.
 The standalone `muse-spark-exl3-{min,max}.config` examples keep serving Core-K6;
-only their regular benchmark cards retire. Muse's full `fp8-compact` view
-remains unsupported until its selected head and pre/post-expert roles execute.
+only their regular benchmark cards retire. Muse also executes the full
+`fp8-compact` view: selected q/k/v/o, optional gate, pre/post-expert projections
+and the vocabulary head. Enable it explicitly with `--set CORE_VIEW=fp8-compact`;
+the examples and default stay `original`. The head stores 202112 output rows,
+trims to the logical 202048 vocabulary, and shares that same head with the drafter.
+
+Muse K4 MC original versus `fp8-compact`, 2026-11-15: same frozen WIP
+`4e5e0dff0`, 2 RTX PRO 6000 + 6 Sparks, DFlash2, automatic pool/onboarding,
+one warmed launch per arm, no host-reclaim flags. This is the W8A16 prefill
+route over FP8 weights; the shared FP8-prefill resolver in #2119 is not in this
+measurement. Its A8-over-FP8 route is not measured here.
+
+| Metric | Original | FP8 compact | Change |
+| --- | ---: | ---: | ---: |
+| C1 code decode, tok/s | 61.77 | 71.18 | +15.2% |
+| C16 aggregate code decode, tok/s | 245.64 | 244.75 | -0.4% |
+| Post-load C1, tok/s | 76.44 | 75.57 | -1.1% |
+| Exact 8192-token prefill, tok/s | 3371.17 | 3199.81 | -5.1% |
+| Baseline 8K prefill, tok/s | 3327.74 | 3075.49 | -7.6% |
+| KV pool tokens | 2009152 | 2097152 | +88000 |
+| Resident target weights, GiB (both GPUs) | 40.345 | 26.214 | -14.131 |
+| Generated-row KL to official BF16 root | 0.007085 | 0.008094 | +0.001009 |
+| Generated-row top-1 | 97.60% | 97.33% | -0.27 pp |
+
+Both 1832-generated-row quick quality checks pass Mid (KL <= 0.05, top-1 >=
+93%). Prompt-end and turn-end restores plus cold recompute are byte-identical;
+short fresh continuation coverage is not established. Speculation emits the
+same 128 greedy tokens with drafts on/off. Neither arm thermally throttled.
+Baseline power-cap slowdown was 0/0 s on GPU0/GPU1 for original and 7.0/6.0 s
+for FP8; busy clocks were 2723/2832 versus 2720/2830 MHz, maximum temperatures
+65/70 versus 66/73 C, and minimum T.Limit headroom 30/24 versus 30/22 C.
+The exact-8192 prefill point had 0/0 versus 1/1 s power-cap slowdown, with
+busy clocks 2647/2726 versus 2693/2752 MHz and identical 2752-row unit shapes.
+The prefill cost is retained explicitly; no A8 speedup is claimed.
 
 MC `fp8-compact` converts exactly the original variant's `core_tensors`; published
 Flash MCs include KDA and the target head. Explicit KDA/head conversion keys apply
@@ -90,13 +123,24 @@ MiniMax M3.1 Flash supports public `cuteafd serve --family minimax_m3` and
 trace-free serving cards (#1856).
 Use a build containing MiniMax native exports: MXFP8 dense math, NVFP4 W4A4
 experts, FP8 MSA KV/index, GPU embedding and device token selection.
+MSA K/V use per-token, per-KV-head FP32 `amax/448` scales. Each 64-token
+page keeps aligned E4M3 payload rows followed by a 16-byte-aligned scale plane
+in the same backing; admission and exact prefix snapshots include both. K or V
+pages occupy 33,792 bytes for whole-head ownership and 17,408 bytes per Heads
+rank. There is no unscaled FP8 KV mode.
 On one RTX, `ATTENTION_PLACEMENT=auto|heads` selects whole ownership. On two RTX,
 `auto|heads` selects native head splitting with half KV and replicated index.
 Explicit `layers` keeps contiguous attention and FP32 split FFNs. Boot-C16 split
 router, FFN and fold/publication sections replay through the shared graph cache;
-attention and peer receive waits stay eager. Explicit two-RTX `heads` selects
-half KV with replicated index and native FP32 partials; context remains unsupported.
-`SPECULATOR=off`, `VISION=off` and `AUDIO=off` are required for this increment.
+attention and peer receive waits stay eager. Context placement remains unsupported.
+`SPECULATOR=off` remains the default (`auto` also resolves off until qualification).
+Explicit `SPECULATOR=dspark` enables the checkpoint's bundled native mixed
+BF16/MXFP8 drafter through the shared scheduler; it requires a matching WIP build
+and remains under strict lossless, prefix, memory and throughput qualification.
+`DRAFT_LENGTH` caps the seven-token native block; `SPECULATION_TRACE` records
+shared draft/verify evidence. `DRAFT_POLICY=shared` explicitly selects the existing
+cost-based concurrency-bucket policy; unset retains the global `simple` default.
+`VISION=off` and `AUDIO=off` remain required.
 
 Shared launch keys keep their usual meanings. MiniMax accepts
 `RTX_EXPERT_LAYERS=auto|all|N`, `PREFILL_ROWS`, `PREFILL_WAVES`,
@@ -429,7 +473,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
-| `CORE_VIEW` | unset (= `original`) | `original`, `k8-compact`, `k6-compact`, `fp8-compact` | Immutable MC dense-core view. Plain checkpoints support original only. FP8 converts exactly original `core_tensors` from its BF16 index with the shared block-128 recipe; no alternate index reads. Flash supports its full MC core. Muse supports q/k/v/o roles but refuses an MC that additionally selects head, gate or pre/post-expert roles; Kimi/GLM unsupported roles likewise refuse before payload loading. Step-5 admits executable O roles only. Already-FP8 sources refuse. |
+| `CORE_VIEW` | unset (= `original`) | `original`, `k8-compact`, `k6-compact`, `fp8-compact` | Immutable MC dense-core view. Plain checkpoints support original only. FP8 converts exactly original `core_tensors` from its BF16 index with the shared block-128 recipe; no alternate index reads. Flash supports its full MC core. Muse supports its full MC selection (q/k/v/o, optional gate, pre/post-expert projections and padded vocabulary head); it stays explicit, not default. Kimi/GLM unsupported roles refuse before payload loading. Step-5 admits executable O roles only. Already-FP8 sources refuse. |
 | `ATTENTION_PLACEMENT` | `auto` | `auto`, `context`, `layers`, `heads` | Per-family defaults and refusals are in the table below. |
 | `ATTENTION_PLAN_ROWS` | `auto` | `auto`, positive int | Decode/verify reduction plan rows. |
 | `ATTENTION_PREFILL_PRECISION` | `auto` | `auto`, `bf16`, `fp8` | Operand precision of the attention kernel's own QK and PV products at prefill (FP32 accumulate either way): `bf16` is BF16 Q, V and P with exact keys (an FP8 key enters the product as its exact BF16 widening and its group scale applies to the FP32 partial); `fp8` is E4M3 Q, K, V and P. Not a weight format (`CORE_VIEW`), a projection activation format (the `*_FP8_PREFILL` keys) or the KV cache format; decode attention has no key. `auto` is the family's mode for the checkpoint's core view, and `cuteafd plan` prints the resolved mode and its reason. Today `auto` is each family's existing prefill program: GLM 5.3, ML4 and GLM Flash `fp8`; V4.1 and V4 BF16 QK with FP8 PV (not a selectable value); every other family `bf16`. A mode with no exported program is refused by name at plan time. Plan and `./run.sh` use `--attention-prefill-precision`. |
@@ -503,14 +547,17 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `MEDIA_FEATURES_DIR`, `AUDIO_FEATURES_DIR` | unset | absolute dir | Encoder feature caches. |
 | `CHAT_TEMPLATE_FROM` | checkpoint | snapshot dir | GLM Flash template source when the checkpoint's template cannot mark images. |
 
-Kimi K3.1 (`kimi_k31`) is recognized by the shared Kimi family for CPU header
-and core-view inspection. Original and K6/K8 compact cores receive complete
-memory plans, including context-parity index caches and prefill workspaces.
-All remain `Planned`, not launchable, pending full-model and compact-core
-qualification (#1777); dense MLA is not a fallback. K3 DFlash2 hidden-state compatibility is unqualified,
-and requesting a drafter for K3.1 refuses explicitly. MC `original`,
-`k8-compact` and `k6-compact` retain native BF16 indexer weights;
-`fp8-compact` refuses until whole-core conversion is implemented.
+Kimi K3.1 (`kimi_k31`) uses the shared Kimi engine. MC `original` (BF16),
+MC `k6-compact` and standalone native Core-K6 are launchable with real Spark
+experts after accepted full-model fidelity and partial paired scoring proof
+(#1777/#2128: 77 exact windows, zero mismatches, explicitly accepted by TJ).
+The [max example](../examples/configs/kimi-k31-exl3-k2-mc-max.config) selects
+MC `CORE_VIEW=original`, 2 RTX + 6 Sparks and automatic pool/onboarding.
+The 1-RTX minimum stays blocked by #2082; no raised Spark cap or tiny-pool
+workaround is supplied. K8 compact remains `Planned` because fidelity is
+unmeasured; whole-core `fp8-compact` remains unsupported and unqualified.
+All accepted views retain native BF16 indexer weights. K3 DFlash2 hidden-state
+compatibility is independently unqualified: requesting a K3.1 drafter refuses.
 
 Kimi K3 and Step-5 are text-only; dense Qwen has media off. GLM 5.3 / ML4,
 GLM Flash, MiMo, Qwen4 and Muse carry their own towers. Native GLM Flash EXLR8

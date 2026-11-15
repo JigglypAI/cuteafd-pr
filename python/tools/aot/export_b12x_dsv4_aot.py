@@ -158,12 +158,15 @@ def compile_native_attention_projection(n, k, max_rows, output="bf16"):
 def native_attention_programs():
     from functools import partial
     out = []
-    for n, k in sorted(set().union(*native_attention_shapes().values())):
-        for output in (("bf16", "f32") if (n, k) in native_attention_f32_shapes() else ("bf16",)):
+    muse_core = {(4096, 8192), (1024, 8192), (512, 8192), (2048, 8192), (8192, 2048)}
+    for n, k in sorted(set().union(*native_attention_shapes().values()) | muse_core):
+        for output in (("bf16", "f32") if (n, k) in native_attention_f32_shapes() | {(8192, 2048)} else ("bf16",)):
             for rows in (64, 4096):
                 suffix = "_f32" if output == "f32" else ""
                 out.append((f"n{n}_k{k}_m{rows}{suffix}", "attention_projection",
                     dict(max_rows=rows), partial(compile_native_attention_projection, n, k, rows, output)))
+    out.append(("n202112_k8192_m64_f32", "attention_projection", dict(max_rows=64),
+        partial(compile_native_attention_projection, 202112, 8192, 64, "f32")))
     return out
 
 
@@ -249,6 +252,12 @@ def draft_bf16_shapes():
     for shape in native_attention_bf16_shapes():
         result.setdefault(shape, []).append("native-core")
     return result
+
+
+def inkling2_projection_shapes():
+    """(K,N) of released native core operands, including small sink/tap projections."""
+    return {(4608, 6144), (4608, 768), (4608, 1024), (4608, 48),
+            (4608, 32), (4608, 384), (6144, 4608), (64, 1024)}
 
 
 def compile_draft_bf16_projection(k, n, output="bf16"):
@@ -385,6 +394,65 @@ def inkling2_attention_programs(decode_rows: int, prefill_rows: int):
             result.append((f"{kind}_attention_{route}_m{rows}", "attention", params,
                            partial(compile_inkling2_attention_aot, **params)))
     return result
+
+
+def inkling2_producer_programs(prefill_rows: int):
+    """Predeclared producer stems; never widen another family's program group."""
+    from functools import partial
+    import torch
+    from b12x.integration.cuteafd.inkling2_convolution import compile_inkling2_convolution_aot
+    from b12x.integration.cuteafd.inkling2_clip import compile_inkling2_clip_aot
+    from b12x.integration.cuteafd.inkling2_residual import compile_inkling2_residual_aot
+    from b12x.integration.cuteafd.inkling2_router import compile_inkling2_router_aot, compile_inkling2_gate_aot
+    from b12x.integration.cuteafd.inkling2_glue import compile_inkling2_norm_aot, compile_inkling2_kv_pack_aot
+    result = []
+    def add(stem, op, compiler, **params):
+        params = {**params, "max_rows": prefill_rows}
+        serial = {key: str(value).removeprefix("torch.") if isinstance(value, torch.dtype) else value
+                  for key, value in params.items()}
+        result.append((stem, op, serial, partial(compiler, **params)))
+    for dtype, suffix in [(torch.bfloat16, "bf16"), (torch.float32, "f32")]:
+        for width, dynamic in [(4608, False), (1024, False), (1024, True)]:
+            kind = "dynamic" if dynamic else "static"
+            add(f"conv_{kind}_h{width}_{suffix}", "convolution", compile_inkling2_convolution_aot,
+                width=width, heads=8 if dynamic else 1, dynamic=dynamic, dtype=dtype)
+        for local in [True, False]:
+            for name, heads, dim, threshold, scaled in [("q", 48, 128, 128**.5*2, True),
+                    ("k", 8, 128, 128**.5*2, False), ("r", 48, 16, 8., True)]:
+                if name == "k" and not local:
+                    continue
+                kind = "local" if local else "global"
+                add(f"clip_{kind}_{name}_{suffix}", "l2_clip", compile_inkling2_clip_aot,
+                    heads=heads, dim=dim, threshold=threshold, scaled=scaled, dtype=dtype,
+                    log_floor=0 if local else 128000, log_alpha=0. if local else 0.1)
+        add(f"gate_h6144_{suffix}", "gate", compile_inkling2_gate_aot, width=6144, dtype=dtype)
+        add(f"situ_h2304_{suffix}", "situ", compile_inkling2_gate_aot, width=2304, situ=True, dtype=dtype)
+        add(f"norm_h4608_{suffix}", "rms_norm", compile_inkling2_norm_aot, output_dtype=dtype)
+        add(f"norm_v_h8_d128_{suffix}", "rms_norm", compile_inkling2_norm_aot,
+            width=128, heads=8, weighted=False, output_dtype=dtype)
+        add(f"kv_pack_{suffix}", "kv_pack", compile_inkling2_kv_pack_aot, input_dtype=dtype)
+    for queries in [1, 3]:
+        for addend in [False, True]:
+            add(f"residual_q{queries}_{'add' if addend else 'keep'}", "attn_res",
+                compile_inkling2_residual_aot, queries=queries, addend=addend)
+    add("router_e384_k8", "router", compile_inkling2_router_aot, route_scale=8.)
+    return result
+
+
+def inkling2_input_quant_program():
+    """Reuse the native group32 quantizer with no foreign-family amax floor."""
+    import torch
+    from b12x._lib.quant.mxfp8_rows import compile_mxfp8_rows_quant_aot
+    from b12x.integration.cuteafd._common import AotProgram, Operand, Scalar
+    compiled = compile_mxfp8_rows_quant_aot(size_k=4608, expected_m=80, amax_floor=0., wire_rows=True)
+    return AotProgram(name="inkling2_expert_input_quant", compiled=compiled,
+        operands=(Operand("source_ptr", torch.bfloat16, "[rows,4608]"),
+                  Operand("values_ptr", torch.uint32, "[rows,1188]", "out"),
+                  Operand("scale_rows_ptr", torch.uint8, "values_ptr+4608", "out", align=1),
+                  Operand("scale_mma_ptr", torch.uint8, "unused")),
+        scalars=(Scalar("m"), Scalar("grid_x")),
+        geometry=dict(hidden=4608, row_bytes=4752, expected_m=80, amax_floor=0.,
+                      exact_row_cap=2**31-1))
 
 
 def validate_table_residency(stem: str, geometry: dict, *, diagnostic: bool = False) -> None:
@@ -584,6 +652,7 @@ def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     index_pages = -(-max_context // PAGE_ROWS)
     out = [
         ("norm", "norm", {}, lambda: ffn.compile_glm_norm_aot(g)),
+        ("norm_head_split", "norm", {"head_split": True}, lambda: ffn.compile_glm_norm_aot(g, head_split=True)),
         ("router_scores", "router_scores", {}, lambda: ffn.compile_glm_router_scores_aot(g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: ffn.compile_glm_expert_input_quant_aot(g)),
     ]
@@ -660,6 +729,7 @@ def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
 
     out = [
         ("norm", "norm", {}, lambda: ffn.compile_mimo_norm_aot(g)),
+        ("norm_head_split", "norm", {"head_split": True}, lambda: ffn.compile_mimo_norm_aot(g, head_split=True)),
         ("router_scores", "router_scores", {}, lambda: ffn.compile_mimo_router_scores_aot(g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: ffn.compile_mimo_expert_input_quant_aot(g)),
         ("head_fp8", "head_fp8", {}, lambda: attn.compile_mimo_head_fp8_aot(g)),
@@ -937,6 +1007,15 @@ def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
         (f"kda_output_rows_expanded_m{prefill_rows}", "kda_output_rows", {"max_rows": prefill_rows, "prefill_expanded": True},
          lambda: glmf.compile_glmf_kda_output_rows_aot(g, max_rows=prefill_rows, fp8_only="prefill", prefill_expanded=True)),
     ])
+    # Channel is an explicit conversion contract, not inferred from K-major layout.
+    for stem, op, params, _ in tuple(programs):
+        if not params.get("prefill_expanded") or params.get("output_dtype") == "float32":
+            continue
+        channel = dict(params, scale_granularity="channel")
+        compiler = glmf.compile_glmf_kda_output_rows_aot if op == "kda_output_rows" else glmf.compile_glmf_kda_aot
+        programs.append((stem.replace("_expanded_", "_expanded_channel_"), op, channel,
+                         lambda c=compiler, kw=channel: c(g, fp8_only="prefill", **kw)
+                         if "fp8_only" not in kw else c(g, **kw)))
     return programs
 
 
@@ -1844,6 +1923,10 @@ def main() -> None:
         work += [("draft_bf16", f"k{k}_n{n}_f32", "bf16_projection", {"max_rows": 4096},
                   lambda k=k, n=n: compile_draft_bf16_projection(k, n, "f32"))
                  for n, k in sorted(native_attention_bf16_f32_shapes())]
+    elif "minimax" in geometries:
+        # Native decoder projections use MXFP8; only context fusion is BF16.
+        work.append(("draft_bf16", "k30720_n6144", "bf16_projection", {"max_rows": 2048},
+                     lambda: compile_draft_bf16_projection(30720, 6144)))
     if "native_attention" not in geometries and any(name in geometries for name in
             ("glm", "glm2", "kimik3", "kimik31", "step5", "step52", "muse", "muse2", "ml4")):
         work += [("native_attention", *item) for item in native_attention_programs()]
@@ -1861,6 +1944,17 @@ def main() -> None:
         from b12x.integration.cuteafd import INKLING2_SMALL
         manifest["families"]["inkling2"] = dataclasses.asdict(INKLING2_SMALL)
         work += [("inkling2", *item) for item in inkling2_attention_programs(args.decode_rows, args.prefill_rows)]
+        work += [("inkling2", *item) for item in inkling2_producer_programs(args.prefill_rows)]
+        work.append(("inkling2", "expert_input_quant", "expert_input_quant", {"max_rows": 4096},
+                     inkling2_input_quant_program))
+        # Share DraftProjections unchanged. The D16 relative bias projection
+        # uses zero-padded K64 inputs/weight columns (the same BF16 values).
+        existing = {suffix for family, suffix, *_ in work if family == "draft_bf16"}
+        for k, n in sorted(inkling2_projection_shapes()):
+            suffix = f"k{k}_n{n}_f32"
+            if suffix not in existing:
+                work.append(("draft_bf16", suffix, "bf16_projection", {"max_rows": 4096},
+                             lambda k=k, n=n: compile_draft_bf16_projection(k, n, "f32")))
     # Per-program reuse (python/tools/lib/_export_cache.py): only under the export
     # cache's recorder. Programs compile independently of which others the
     # geometry list requests; their recipes read every argument except these.

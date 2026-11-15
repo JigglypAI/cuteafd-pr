@@ -122,6 +122,11 @@
       "family": "kimi_k3"
     },
     {
+      "model": "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC",
+      "revision": "1455b31b0acc53f36df916864fb541d9f536b3f8",
+      "family": "kimi_k3"
+    },
+    {
       "model": "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4",
       "revision": "9c354cee78cd6feddb057549b8edde6e3b319822",
       "family": "mistral_large4"
