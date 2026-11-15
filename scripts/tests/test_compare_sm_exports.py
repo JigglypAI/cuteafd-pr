@@ -1361,6 +1361,42 @@ def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, mon
     assert records[0]["scratch_bytes"] == (128 if indirect else 64)
 
 
+@pytest.mark.parametrize("weights,input_format,expected_segments", [
+    ("fp8", "wire", 3), ("mxfp4", "wire", 3), ("fp8", "bf16", 0), ("nvfp4", "bf16", 0)])
+def test_spark_baseline_package_without_segmented_forms_keeps_its_own_segment_set(
+        tmp_path, monkeypatch, weights, input_format, expected_segments):
+    """A --baseline-source package and fork that predate per-format segment
+    programs (no `segmented_forms`, no `nvfp4_a4_fused`) still compare: the
+    baseline exports its own FP8/MXFP4 wire segments at its own bound."""
+    from contextlib import nullcontext
+
+    geometry = SimpleNamespace(weights=weights, hidden=4096, slice=2048, experts=256, top_k=8, intermediate=2048,
+        activation="silu_bf16_product", projection="bf16", swiglu_limit=0.0)
+    calls = []
+
+    def compile_program(g, *, route, max_rows, wire, prefill, row_addresses=False):
+        calls.append((max_rows, prefill, row_addresses))
+        return SimpleNamespace(export_to_c=lambda *args: None)
+
+    module = SimpleNamespace(GEOMETRIES={"mimo": geometry}, compile_fp8_moe_aot=compile_program,
+        fp8_moe_scratch_bytes=lambda *args: 64, fp8_moe_segment_scratch_bytes=lambda *args: 128,
+        prefill_forms=lambda *args: [])
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(
+        exportable_compilation=nullcontext, validate_exported_header=lambda *args: {"argument_count": 13}))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.fp8_moe", module)
+    monkeypatch.setitem(sys.modules, "package_fp8_moe_aot", SimpleNamespace(
+        __file__=str(tmp_path / "baseline-package.py"), FORMS=("auto", "w8a16", "w8a8"),
+        layout_geometry=lambda base, layout: (1, base), POINTERS=11, SEGMENT_MAX_ROWS=16384,
+        ABI_VERSION=6, activation_params=lambda *args: (1.0, 0.0),
+        input_kind=lambda role, weights, requested: requested or ("wire" if role == "spark" else "bf16")))
+    (tmp_path / "baseline-package.py").write_text("# baseline without per-format segment programs\n")
+    compare_sm.export_routed(["--geometry", "mimo", "--role", "spark", "--input", input_format,
+                              "--capacities", "2752"], tmp_path)
+    segments = [call for call in calls if call[2]]
+    assert len(segments) == expected_segments
+    assert all(max_rows == 16384 for max_rows, _, _ in segments), "baseline segments keep the baseline bound"
+
+
 @pytest.mark.parametrize("role", ["spark", "coordinator"])
 @pytest.mark.parametrize("weights", ["nvfp4", "fp8", "mxfp4", "bf16"])
 @pytest.mark.parametrize("build_kind", ["development", "release"])

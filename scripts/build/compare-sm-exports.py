@@ -562,8 +562,13 @@ def export_routed(extra, output, selected_objects=None):
     if role == "spark" or indirect:
         from b12x.integration.cuteafd.fp8_moe import fp8_moe_segment_scratch_bytes
     if role == "spark" and not indirect:
-        from b12x.integration.cuteafd.fp8_moe import nvfp4_a4_fused
-        segment_forms = package.segmented_forms(base, wire, nvfp4_a4_fused())
+        if hasattr(package, "segmented_forms"):
+            from b12x.integration.cuteafd.fp8_moe import nvfp4_a4_fused
+            segment_forms = package.segmented_forms(base, wire, nvfp4_a4_fused())
+        elif wire and base.weights in ("fp8", "mxfp4"):
+            # A baseline package that predates per-format segment programs
+            # exported every form of FP8/MXFP4 wire streams only.
+            segment_forms = package.FORMS
     records = []
     layout_metadata = {}
     for layout in dict.fromkeys(layouts):
