@@ -37,6 +37,7 @@ PARENTS = {
 
 
 def family_recipe(family):
+    """Return the completed numerical selection used by compact encodes."""
     if family == 'glmf':
         from glm5_flash.core_k6 import recipe
         selection = recipe.reviewed_core_modules(include_mtp=False, core_bits=8)
@@ -58,6 +59,20 @@ def family_recipe(family):
     else:
         raise ValueError('unknown package family')
     return recipe, selection
+
+
+def original_core_selection(family, recipe, compact_selection):
+    """Restore the whole native core, independently of compact calibration.
+
+    Historical GLM and Step compact encodes selected only the target core;
+    their MTP matrices already exist at K4 in the parent. Those matrices must
+    also be restored in the original view without requiring new K6/K8 work.
+    """
+    if family == 'glmf':
+        return recipe.reviewed_core_modules(include_mtp=True, core_bits=8)
+    if family in ('glm5', 'step5'):
+        return recipe.reviewed_core_modules(include_mtp=True)
+    return compact_selection
 
 
 def load_json(path):
@@ -247,6 +262,7 @@ def view_metadata(parent_quant, parent_config, selection, specs, *, bits, quanti
         else:
             quant[key] = bits
     if bits is None:
+        quant.pop('mtp_bits', None)
         if 'kept_tensors' in quant:
             quant['kept_tensors'].update({name: dict(shape=shape, torch_dtype=DTYPES[dtype])
                 for name, (dtype, shape) in specs.items()})
@@ -265,6 +281,8 @@ def view_metadata(parent_quant, parent_config, selection, specs, *, bits, quanti
                             child.pop(field, None)
                         else:
                             child[field] = bits
+                    if bits is None:
+                        child.pop('mtp_bits', None)
                 rewrite_inline(child)
         elif isinstance(value, list):
             for child in value:
@@ -325,6 +343,10 @@ def k8_diagnostics(root, selection, identity):
 def assemble(family, parent, source, output, *, k8=None, k8_evidence=None,
              parent_revision=None, shard_target=2_000_000_000):
     recipe, selection = family_recipe(family)
+    original_selection = original_core_selection(family, recipe, selection)
+    if not selection.keys() <= original_selection.keys():
+        raise ValueError('original core selection omits compact core modules')
+    inherited_core = {m: g for m, g in original_selection.items() if m not in selection}
     parent, source, output = [Path(p).resolve() for p in (parent, source, output)]
     inputs = [parent, source] + ([Path(k8).resolve()] if k8 else [])
     if any(output == p or output in p.parents or p in output.parents for p in inputs):
@@ -351,15 +373,21 @@ def assemble(family, parent, source, output, *, k8=None, k8_evidence=None,
         recipe.inventory(adapter)
     quant = load_json(parent / 'quantize_config.json')
     config = load_json(parent / 'config.json')
-    removed = {name for module in selection for name in packed_specs(module, dict(selection[module], bits=6))}
+    compact_removed = {name for module in selection for name in packed_specs(module, dict(selection[module], bits=6))}
+    inherited_packed = {name: spec for module, geometry in inherited_core.items()
+                        for name, spec in packed_specs(module, geometry).items()}
+    removed = compact_removed | inherited_packed.keys()
     for module, geometry in selection.items():
         for name, spec in packed_specs(module, dict(geometry, bits=6)).items():
             if parent_inv['specs'].get(name) != spec:
                 raise ValueError('parent K6 core does not match reviewed geometry: ' + name)
-    native = restored_names(family, selection)
+    for name, spec in inherited_packed.items():
+        if parent_inv['specs'].get(name) != spec:
+            raise ValueError('parent MTP core does not match reviewed geometry: ' + name)
+    native = restored_names(family, original_selection)
     if not native <= source_inv['mapping'].keys() or native & parent_inv['mapping'].keys():
         raise ValueError('native restore inventory missing or collides with shared parent')
-    for module, geometry in selection.items():
+    for module, geometry in original_selection.items():
         expected_dtype = 'F8_E4M3' if family == 'ml4' and len(recipe.source_names(module, geometry)) == 2 else 'BF16'
         if source_inv['specs'][module + '.weight'] != (expected_dtype, [geometry['out_features'], geometry['in_features']]):
             raise ValueError('native core source shape/dtype differs: ' + module)
@@ -451,7 +479,8 @@ def assemble(family, parent, source, output, *, k8=None, k8_evidence=None,
             receipts[filename] = write_shard(output, filename, {n: (k8 / shard, n) for n in names}, identity)
             new.append(filename)
             k8_map.update({n: filename for n in names})
-        views['k8-compact'] = (mapping | k8_map, sorted(k8_map), 8)
+        inherited_map = {name: parent_inv['mapping'][name] for name in inherited_packed}
+        views['k8-compact'] = (mapping | inherited_map | k8_map, sorted(k8_map.keys() | inherited_packed.keys()), 8)
         views['k6-compact'] = (dict(parent_inv['mapping']), sorted(removed), 6)
     # Keep tokenizer, license, bundled drafter assets and parent diagnostics.
     # Parent cards/provenance stay explicitly historical, not claims about MC.
@@ -479,7 +508,8 @@ def assemble(family, parent, source, output, *, k8=None, k8_evidence=None,
     metadata = []
     for view, (weights, core, bits) in views.items():
         index_file, config_file, quant_file, _ = mc_manifest.FILES[view]
-        q, c = view_metadata(quant, config, selection, native_specs,
+        metadata_selection = original_selection if bits is None else selection
+        q, c = view_metadata(quant, config, metadata_selection, native_specs,
                             bits=bits, quantize_file=quant_file)
         sizes = parent_inv['sizes'] | {n: source_inv['sizes'][n] for n in native}
         if bits == 8:
@@ -507,10 +537,11 @@ def assemble(family, parent, source, output, *, k8=None, k8_evidence=None,
     card = (front_matter + '# ' + recipe.BASE_REPO.split('/')[-1] + (' EXL3 K4 native core\n\n' if family == 'ml4' else ' EXL3 multi-core\n\n')
         + 'Derived from `' + recipe.BASE_REPO + '@' + recipe.BASE_REVISION + '`.\n\n'
         + ('This plain checkpoint keeps the original FP8/BF16 core and K4 experts. No quantized core payload is included.\n\n'
-           if family == 'ml4' else 'The default index selects the original BF16 core. `cuteafd-mc.json` discovers complete K8 and K6 alternate views; experts, media and drafters are shared.\n\n')
-        + ('Only target-core matrices change between views. The parent K4 MTP dense modules '
-           f'({27 if family == "step5" else 8} modules) remain shared unchanged across all three views; '
-           'they are neither restored to BF16 nor encoded at K8.\n\n' if family in ('step5', 'glm5') else '')
+           if family == 'ml4' else 'The default index selects the original BF16 core. `cuteafd-mc.json` discovers complete K8 and K6 alternate views; routed experts and unchanged native tensors are shared.\n\n')
+        + ('The original view restores the complete source core, including '
+           f'{len(inherited_core)} MTP matrices. Compact views preserve the existing K4 MTP '
+           'encodes; their K8/K6 labels describe the target core. Routed experts remain shared.\n\n'
+           if inherited_core else '')
         + (f"K8 encoder fork: `{complete['identity']['gptqmodel_commit']}`; "
            f"inherited K6 encoder fork: `{complete['identity']['encoder_delta']['k6_gptqmodel_commit']}`. "
            f"Delta: {complete['identity']['encoder_delta']['change']}. "
@@ -681,8 +712,15 @@ def validate(output, *, verification='full'):
     original_native_specs = original['specs']
     reviewed_selection = state.get('direct_core_selection')
     if reviewed_selection is None:
-        _, reviewed_selection = family_recipe(family)
+        recipe, compact_selection = family_recipe(family)
+        reviewed_selection = original_core_selection(family, recipe, compact_selection)
+    original_quant = load_json(output / 'quantize_config.json')
     for module, geometry in reviewed_selection.items():
+        if module in original_quant['tensor_storage']:
+            raise ValueError('original view still declares quantized core: ' + module)
+        if family != 'ml4' and original_native_specs.get(module + '.weight') != (
+                'BF16', [geometry['out_features'], geometry['in_features']]):
+            raise ValueError('original view omits native core or differs from source geometry: ' + module)
         if family == 'ml4':
             recipe, _ = family_recipe(family)
             names = recipe.source_names(module, geometry)
