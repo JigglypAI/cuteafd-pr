@@ -54,11 +54,13 @@ impl Requests {
     pub fn decode_rows(&self, requests: &[RequestRows]) -> Result<usize> {
         ensure!(!requests.is_empty() && requests.len() <= self.capacity.decode.rows as usize,
             "MiniMax native queries exceed admitted row capacity");
-        let mut positions = BTreeSet::new();
+        let mut frontiers = std::collections::BTreeMap::new();
         for request in requests {
+            let previous = frontiers.insert(request.slot, request.start);
             ensure!(request.slot < self.capacity.requests as usize && request.rows == 1
-                && request.start < self.context && positions.insert((request.slot, request.start)),
-                "MiniMax native query slot/position is invalid or duplicated");
+                && request.start < self.context
+                && previous.is_none_or(|start| start + 1 == request.start),
+                "MiniMax native queries require unique or contiguous causal positions per slot");
         }
         Ok(requests.len())
     }
@@ -1958,8 +1960,12 @@ mod tests {
         let schedule = Requests::new(capacity, 4096, 60, 3)?;
         let mut batch = requests(2, 1);
         batch[1].slot = batch[0].slot;
-        assert!(schedule.decode_rows(&batch).is_err());
+        assert_eq!(schedule.decode_rows(&batch)?, 2);
         assert!(schedule.verify_units(&batch).is_err());
+        batch[1].start = batch[0].start;
+        assert!(schedule.decode_rows(&batch).is_err());
+        batch[1].start = batch[0].start + 2;
+        assert!(schedule.decode_rows(&batch).is_err());
         batch[1].slot = 64;
         assert!(schedule.verify_units(&batch).is_err());
         batch[1].slot = 1;
