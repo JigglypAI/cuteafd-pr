@@ -273,6 +273,10 @@ mod tests {
         let routes = (0..8).map(|route| ExpertProtocolV2RouteEntry {
             row_index: route / 4, expert_id: route % 128, gate_weight: 0.5,
         }).collect();
+        let wire = request(9, 77, 3, 63, 2, ExpertV2Dtype::Nvfp4E2m1E4m3K16Amax, (0..8).map(|route|
+            ExpertProtocolV2RouteEntry { row_index: route / 4, expert_id: route % 128, gate_weight: 0.5 }).collect(),
+            vec![0; 2 * super::super::experts::NVFP4_ROW_BYTES].into())?;
+        assert_eq!(wire.header.hidden_row_stride_bytes as usize, 3472);
         let request = request(8, 77, 3, 63, 2, ExpertV2Dtype::Bf16, routes, vec![0; 2 * 6144 * 2].into())?;
         assert_eq!(request.header.hidden_dtype, ExpertV2Dtype::Bf16);
         assert_eq!(request.header.hidden_row_stride_bytes, 6144 * 2);
@@ -287,6 +291,10 @@ mod tests {
         let source = include_str!("prefill.rs").split("#[cfg(test)]").next().unwrap();
         assert!(source.contains("run_prefill_units(self, units,"));
         assert!(source.contains("self.waves.send("));
+        // The wave payload is the BF16 reply plane even when requests carry NVFP4 rows.
+        assert!(source.contains("self.waves.send(rows, rows * 6144 * 2, staging,"));
+        let dispatch = include_str!("experts.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(dispatch.contains("exchange.send(rows.rows, exchange.compact_payload(rows.rows), layout,"));
         assert!(source.contains("self.waves.reduce("));
         assert!(!source.contains("for layer in"));
     }
