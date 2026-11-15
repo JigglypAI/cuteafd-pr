@@ -55,10 +55,15 @@ Plain checkpoints refuse compact selectors. Release cards select `original`;
 max-layout compact comparisons use the separate
 `scripts/bench/release-smoke-v51-mc-core-comparison.json` matrix.
 
-`fp8-compact` is **not supported** for this MC. Step-5's block-FP8 executor
-supports O projections only; the MC's complete core also selects q/k/v,
-dense/shared FFNs and the head, so role validation refuses it by tensor name.
-The comparison is `na`; no partial conversion is presented as a whole-core view.
+`fp8-compact` is an explicit, quality-affecting opt-in over exactly the
+original view's selected q/k/v/o, dense/shared FFN, EH and vocabulary-head
+matrices, including the three MTP stages' non-routed core. Native E4M3 values
+and F32 block-128 scales occupy the existing target and independently retired
+MTP arenas; no resident BF16 shadow or expert conversion is introduced.
+Heads use the shared executor with private scratch. Unselected keep tensors
+and routed EXL3 experts retain their checkpoint formats. Performance and
+Standard quality remain unmeasured until max-card qualification; `original`
+remains the default. Requires the v52d coordinator projection exports.
 
 Standard fidelity (2026-11-13) uses the published 32 decode + 32 prefill
 windows rooted at `stepfun-ai/Step-5-Preview-BF16`, on the min card. Both paths use

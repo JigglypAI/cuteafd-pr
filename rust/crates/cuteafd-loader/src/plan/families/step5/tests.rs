@@ -2108,3 +2108,46 @@ fn repaired_mc_original_mtp_has_one_native_bf16_arena_charge() -> anyhow::Result
     eprintln!("Step-5 MTP physical charge: K4={compact_charge}, original BF16={original_charge}, delta={}", original_charge - compact_charge);
     Ok(())
 }
+
+#[test]
+fn mc_whole_fp8_core_selects_target_and_mtp_without_expert_conversion() -> anyhow::Result<()> {
+    use crate::plan::checkpoint::{CheckpointView,CoreView};
+    let source=exl3_snapshot();
+    let cp=Checkpoint::open(source.path())?;
+    let cfg=Config::parse(&cp)?;
+    let tensors=cp.tensors.iter().map(|t|(t.meta.name.clone(),match t.meta.dtype {
+        DType::Bf16=>"BF16",DType::F16=>"F16",DType::F32=>"F32",DType::I16=>"I16",DType::I32=>"I32",
+        _=>panic!("fixture dtype")},t.meta.shape.clone())).collect::<Vec<_>>();
+    let (mtp,target)=exl3::expected(&cfg).into_iter().partition(|(name,_)|
+        name.strip_prefix("model.layers.").and_then(|s|s.split('.').next())
+            .and_then(|s|s.parse::<usize>().ok()).is_some_and(|layer|layer>=cfg.layers));
+    let dir=tempfile::tempdir()?;
+    testing::write_mc_snapshot_with_mtp(dir.path(),&cp.config,&tensors,&target,&mtp);
+    let checkpoint=Checkpoint::open_view(&CheckpointView::select(dir.path(),CoreView::Fp8Compact)?)?;
+    let contract=coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?;
+    let selected=native::NativeSelection::resolve(&contract,&cfg,2,3,2048,None)?;
+    assert!(selected.resolved.programs.iter().any(|name|name=="native_attention_n128896_k4096_m64_f32"));
+    assert!(!selected.resolved.programs.iter().any(|name|name=="native_attention_n128896_k4096_m4096_f32"));
+    for rank in 0..2 {
+        let layout=coordinator::RankWeightLayout::from_contract(&contract,&cfg,rank,2,None)?;
+        selected.validate_layout(&layout,2048)?;
+        assert!(layout.core.is_empty());
+        assert!(!layout.operands.iter().any(|owner|owner.name.ends_with(".gate_up_proj.weight")));
+        for owner in &layout.operands {
+            let converted=contract.fp8_tensors.contains(&owner.name);
+            assert_eq!(owner.fp8(),converted,"{}",owner.name);
+            if converted {assert_eq!(owner.allocation_bytes,owner.native_layout(rank,2)?.bytes()?);}
+        }
+        let scratch=native::projection_scratch_layout(&layout,2048,|name|!coordinator::is_vocabulary_head(name))?.unwrap();
+        assert_eq!(scratch.extents,std::collections::BTreeMap::from([("fp8",256)]));
+        assert_eq!(scratch.packed_bytes()?,256);
+    }
+    let predictor=coordinator::RankWeightLayout::mtp_from_contract(&checkpoint,&contract,3)?;
+    selected.validate_layout(&predictor,2048)?;
+    assert_eq!(predictor.operands.iter().filter(|owner|owner.fp8()).count(),27);
+    let requests=native::mtp_native_scratch_requests(&checkpoint,&contract,3,2048)?;
+    assert_eq!(requests,vec![256;12]);
+    assert!(checkpoint.tensors.iter().filter(|tensor|tensor.meta.name.contains(".moe.experts.")).all(|tensor|
+        !checkpoint.converts_to_fp8(&tensor.meta.name)));
+    Ok(())
+}

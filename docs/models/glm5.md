@@ -50,9 +50,15 @@ explicitly: 1 RTX PRO 6000 + 4 Sparks and 2 RTX + 6 Sparks,
 with DFlash2. Compact comparisons run on max, separately from the release table,
 via `scripts/bench/release-smoke-v51-mc-core-comparison.json`.
 
-`fp8-compact` is **not supported** for this MC: the runtime rejects selected
-whole-core block-FP8 roles by tensor name. Its comparison is `na`, not a
-fallback to BF16 or an attention-only conversion.
+`fp8-compact` is an explicit, quality-affecting opt-in. Metadata-selected
+attention, dense/shared FFN and vocabulary-head matrices use native block FP8
+(E4M3 values plus F32 block-128 scales) in the final target arena. Selection is
+per projection: unselected group members, KvB and indexer tensors stay BF16.
+The native MTP layer remains unused. The head uses the shared Muse/GLM/Step
+executor with independent target/drafter scratch, not a BF16 shadow.
+Effect and quality are unmeasured until the max-card C1/C16/8K and Standard
+qualification completes; `original` remains the default. Requires the v52d
+coordinator projection exports.
 
 Standard fidelity (2026-11-13) uses the published 32 decode + 32 prefill
 windows rooted at `zai-org/GLM-5.3-BF16`, on the min card. Both paths use
