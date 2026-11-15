@@ -9,7 +9,7 @@ a top-8 sigmoid router, and a DFlash2 draft speculator.
   at full size; EXL3 and NVFP4 quants are the recommended way to run the
   full model (see `PLAN.md` quant scope).
 - `wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC` at
-  `c39486376dee84e5faa4904e014e07d7b6e76405` - EXL3 K4 routed experts
+  `2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e` - EXL3 K4 routed experts
   with original BF16, K8 and K6 core views. This replaces the standalone
   `GLM-5.3-EXL3-K4-v1` and `GLM-5.3-EXL3-K4-Core-K6` release rows;
   their historical reports remain archived. MC original min/max, all three
@@ -37,7 +37,11 @@ The published MC follows the [MC contract](../mc-checkpoints.md).
 `CORE_VIEW=original` (default) restores the source-native BF16 core;
 `k8-compact` and `k6-compact` select complete native trellis cores, including
 attention, dense/shared FFNs and the vocabulary head. Experts and non-core
-tensors are shared unchanged. Plain checkpoints refuse compact selectors.
+tensors are shared unchanged. Repaired revisions also restore native BF16
+MTP core matrices in `original`; stored compact views keep their K4 MTP core.
+MTP routed experts remain quantized and unchanged. Native MTP is unused with
+the shipped external drafters: both MTP core and MTP experts retain speculator
+ownership, are not loaded or charged, and are not converted by `fp8-compact`. Plain checkpoints refuse compact selectors.
 Selected metadata and fingerprints are immutable across planning and serving.
 
 The MC min/max configs above pin `MODEL_ID`, `MODEL_REVISION` and

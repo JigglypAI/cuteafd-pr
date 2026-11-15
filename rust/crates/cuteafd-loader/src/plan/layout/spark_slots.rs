@@ -133,14 +133,28 @@ pub(crate) fn nvfp4_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeom
     fp8_owner_bytes(family, geometry, &[(ExpertFormat::Nvfp4, width)], extent)
 }
 
+/// [`nvfp4_owner_bytes`] with the exact NVFP4 wire ingress: the same package
+/// scratch (the NVFP4-wire sibling's regions equal the BF16-input ones), and
+/// the device input plane holds wire rows instead of BF16 rows.
+pub(crate) fn nvfp4_owner_bytes_for(family: &str, geometry: cuteafd_core::ExpertGeometry, width: u32,
+    extent: cuteafd_core::OwnerExtent, nvfp4_wire: bool) -> anyhow::Result<cuteafd_core::OwnerBytes> {
+    let mut bytes = nvfp4_owner_bytes(family, geometry, width, extent)?;
+    if nvfp4_wire {
+        let hidden = geometry.hidden as usize;
+        let saved = (2 * hidden - cuteafd_core::nvfp4_wire_row_bytes(hidden)) as u64 * u64::from(extent.capacity);
+        bytes.io = bytes.io.checked_sub(saved).context("NVFP4 wire owner input below BF16")?;
+    }
+    Ok(bytes)
+}
+
 /// EXL3 owner bytes. Prefill-scale exports charge the calibrated retained
 /// arena maxima plus private capacity state (#762 census totals, which include
 /// 4096 rows of K32 wire/routes; those rows are re-charged as the owner's I/O
 /// at its own capacity). Decode exports (m80 and below) charge the m1/m16/m80
 /// retained set (installed SM121 exports, 2026-10-24: largest GLM tp1
 /// 50,445,548 B). Packed routes stage per queued unit.
-pub(crate) fn exl3_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, extent: cuteafd_core::OwnerExtent)
-    -> anyhow::Result<cuteafd_core::OwnerBytes> {
+pub(crate) fn exl3_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, extent: cuteafd_core::OwnerExtent,
+    segment_width: Option<u32>) -> anyhow::Result<cuteafd_core::OwnerBytes> {
     const DECODE_SET: u64 = 51 * (1 << 20);
     let hidden = u64::from(geometry.hidden);
     let topk = u64::from(geometry.topk);
@@ -155,8 +169,30 @@ pub(crate) fn exl3_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeome
         anyhow::ensure!(total > 0, "no calibrated Spark EXL3 scratch for {family}; add the package census (#776)");
         total.saturating_sub(4096 * row)
     };
-    Ok(cuteafd_core::OwnerBytes { scratch, io: u64::from(extent.capacity) * row,
-        pinned_staging: u64::from(extent.staging_rows) * topk * 8 })
+    let mut bytes = cuteafd_core::OwnerBytes { scratch, io: u64::from(extent.capacity) * row,
+        pinned_staging: u64::from(extent.staging_rows) * topk * 8 };
+    if let Some(width) = segment_width {
+        let waves = exl3_wave_bytes(geometry, width, extent).context("EXL3 merged-wave extent overflow")?;
+        bytes.io += waves.0;
+        bytes.pinned_staging += waves.1;
+    }
+    Ok(bytes)
+}
+
+/// A prefill owner's merged EXL3 waves on a layout that ships a segments
+/// program: (device bytes, pinned descriptor bytes per queued unit). The
+/// worker's `Exl3Worker::wave_bytes` charges the same terms from the same
+/// core layout: the arena at the widest merged wave, every staged unit's wire
+/// slice, the address and route tables.
+pub(crate) fn exl3_wave_bytes(geometry: cuteafd_core::ExpertGeometry, width: u32,
+    extent: cuteafd_core::OwnerExtent) -> Option<(u64, u64)> {
+    let (Some(rows), Some(staged)) = (extent.segment_rows(), extent.staged_rows()) else { return Some((0, 0)) };
+    let segment = cuteafd_core::spark_executions::Exl3SegmentGeometry::for_spark(geometry.hidden, width,
+        geometry.topk, geometry.experts);
+    let arena = segment.layout(rows)?.1;
+    let hidden = u64::from(geometry.hidden);
+    let tables = u64::from(rows) * (16 + 8 * u64::from(geometry.topk));
+    Some((arena + u64::from(staged) * (hidden + hidden / 32) + tables, u64::from(extent.staging_rows) * 16))
 }
 
 /// Muse retains the widest installed TP slice of this world, never a refused
@@ -280,6 +316,17 @@ pub(crate) fn owner_bytes(input: &super::super::PlanInput, working: &SparkWorkin
         Some(mxfp4_rank_artifacts(catalog, working, rank)?)
     } else { None };
     let coded = catalog.mxfp4_scale_codes();
+    // GLM 5.3 and GLM Flash Spark layouts ship a merged-wave segments program
+    // on every noncompact layout (`package_exl3_aot.segment_export_options`).
+    let segment_width = match (backend, family) {
+        // Noncompact exactly when whole 128-row blocks split evenly over the
+        // world (`balanced_residency`); each rank then stores intermediate/world.
+        (SparkBackend::Exl3(_), "glm5" | "glm5_flash") if working.selected_ranks().contains(&rank) && world > 0 => {
+            let intermediate = geometry.intermediate;
+            (intermediate % 128 == 0 && (intermediate / 128) % world as u32 == 0).then(|| intermediate / world as u32)
+        }
+        _ => None,
+    };
     let family = family.to_owned();
     Ok(move |extent| {
         if let Some(artifacts) = &artifacts {
@@ -289,7 +336,7 @@ pub(crate) fn owner_bytes(input: &super::super::PlanInput, working: &SparkWorkin
             (Some((geometry, formats)), SparkBackend::Fp8) => fp8_owner_bytes(&family, *geometry, formats, extent),
             (_, SparkBackend::Exl3(_)) if family == "muse_spark" => muse_owner_bytes(world, extent),
             (_, SparkBackend::Exl3(_)) if family == "mistral_large4" => ml4_owner_bytes(world, extent),
-            (_, SparkBackend::Exl3(_)) => exl3_owner_bytes(&family, geometry, extent),
+            (_, SparkBackend::Exl3(_)) => exl3_owner_bytes(&family, geometry, extent, segment_width),
             (_, SparkBackend::Native | SparkBackend::V41 | SparkBackend::Exlr8 | SparkBackend::Fp8) =>
                 Ok(legacy_owner_bytes(&family, geometry, extent)),
         }
@@ -654,7 +701,7 @@ mod tests {
             assert_eq!(retained + wire_routes, expected, "{family}");
             let geometry = cuteafd_core::ExpertGeometry { hidden: hidden as u32, topk: topk as u32,
                 experts: 1, intermediate: 1, layers: 1 };
-            let owner = exl3_owner_bytes(family, geometry, extent(4096, 4096)).unwrap();
+            let owner = exl3_owner_bytes(family, geometry, extent(4096, 4096), None).unwrap();
             assert!(owner.scratch + owner.io >= expected, "{family}");
         }
     }
@@ -663,7 +710,7 @@ mod tests {
     fn exl3_decode_owner_covers_every_installed_narrow_export_set() {
         // Largest retained m1/m16/m80 set among installed SM121 exports.
         let geometry = cuteafd_core::ExpertGeometry::GLM5;
-        let decode = exl3_owner_bytes("glm5_flash", geometry, extent(64, 80)).unwrap();
+        let decode = exl3_owner_bytes("glm5_flash", geometry, extent(64, 80), Some(1024)).unwrap();
         assert!(decode.scratch >= 50_445_548);
         assert_eq!(decode.pinned_staging, 64 * 8 * 8);
     }

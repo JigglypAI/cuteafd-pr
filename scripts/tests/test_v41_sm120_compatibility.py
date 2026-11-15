@@ -347,6 +347,112 @@ def test_exl3_export_forwards_pure_l2_schedule_before_cuda(monkeypatch, tmp_path
         assert observed[0]["compact_weights"] is True
 
 
+@pytest.mark.parametrize('options', [dict(warp_specialized=False), dict(capacity=4096),
+                                  dict(output_dtype='fp32'), dict(compact_weights=True),
+                                  dict(routing='direct')])
+def test_exl3_segments_refuse_invalid_contract_before_cuda(monkeypatch, tmp_path, options):
+    monkeypatch.setitem(sys.modules, '_pinned_sparkinfer', ModuleType('_pinned_sparkinfer'))
+    spec = importlib.util.spec_from_file_location(
+        'segment_test_exl3_export', ROOT / 'python/tools/aot/export_b12x_exl3_aot.py')
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    kwargs = dict(intermediate=512, experts=256, capacity=8192, bits=(4, 5),
+                  routing='packed', warp_specialized=True, row_addresses=True, route_block=64)
+    kwargs.update(options)
+    with pytest.raises(ValueError, match='row addresses require'):
+        exporter.export(tmp_path, **kwargs)
+
+
+@pytest.mark.parametrize('wire', [False, True])
+def test_exl3_segments_manifest_uses_fork_formula_without_allocating(monkeypatch, tmp_path, wire):
+    import ast
+    from types import SimpleNamespace
+
+    monkeypatch.setitem(sys.modules, '_pinned_sparkinfer', SimpleNamespace(
+        REVISION='qual', export_target=lambda props: 'SM121'))
+    spec = importlib.util.spec_from_file_location(
+        'segment_manifest_export', ROOT / 'python/tools/aot/export_b12x_exl3_aot.py')
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    # Execute the pure helpers from the pinned fork, not a duplicate sizing rule.
+    tree = ast.parse((ROOT / 'third_party/sparkinfer/b12x/moe/_shared/kernels/w4a16/host.py').read_text())
+    names = {'max_packed_route_slots', 'route_pack_capacity', 'route_pack_numel_capacity',
+             'route_pack_token_capacity', 'exl3_ws_segment_scratch_regions', 'exl3_ws_segment_scratch_bytes'}
+    helpers = ModuleType('b12x.moe._shared.kernels.w4a16.host')
+    exec(compile(ast.Module(body=[node for node in tree.body if isinstance(node, ast.FunctionDef)
+                                 and node.name in names], type_ignores=[]), '<fork-host>', 'exec'), helpers.__dict__)
+    monkeypatch.setitem(sys.modules, helpers.__name__, helpers)
+    observed = []
+
+    class Compiled:
+        def export_to_c(self, directory, label, symbol):
+            path = Path(directory)
+            (path / f'{label}.o').write_bytes(b'object')
+            (path / f'{label}.h').write_text(f'static inline int32_t cute_dsl_{label}_wrapper(void *input) {{')
+
+    class Lut:
+        def contiguous(self): return self
+        def view(self, dtype): return self
+        def cpu(self): return self
+        def numpy(self): return self
+        def tobytes(self): return b'lut'
+
+    def compile_kernel(**kwargs):
+        observed.append(kwargs)
+        return SimpleNamespace(compiled=Compiled(), topk_sum=SimpleNamespace(compiled=Compiled()),
+                               trellis_lut=Lut(), blocks_per_sm=1, shared_memory_bytes=0)
+
+    monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace(int32='int32', uint8='uint8',
+        cuda=SimpleNamespace(get_device_properties=lambda _: SimpleNamespace(
+            major=12, minor=1, multi_processor_count=48, shared_memory_per_block_optin=101376))))
+    monkeypatch.setitem(sys.modules, 'b12x.moe._shared.kernels.w4a16.mixed_trellis', SimpleNamespace(
+        EXL3_AOT_MAX_SMS={(12, 1): 48}, compile_mixed_trellis=compile_kernel,
+        make_mixed_trellis_buffers=lambda *a, **k: pytest.fail('segment export allocated CUDA buffers')))
+    monkeypatch.setitem(sys.modules, 'b12x.moe.fused_moe._impl', SimpleNamespace(
+        _projection_mixed_direct_topk_routes=lambda *a, **k: False,
+        _projection_mixed_tile_config=lambda *a, **k: (64, 256, 64, 256)))
+
+    def routes(output, *args):
+        output.mkdir()
+        (output / 'v41_exl3_routes.json').write_text('{}')
+        return dict(buffers={name: dict(bytes=0) for name in (
+            'packed_route_indices', 'block_expert_ids', 'packed_route_count', 'expert_offsets', 'expert_counts')})
+
+    monkeypatch.setitem(sys.modules, 'export_b12x_exl3_routes_aot', SimpleNamespace(export=routes))
+    def bridge(output, manifest):
+        manifest['objects'][0]['pointer_slots'] = ['rotation_input_ptr', 'rotation_gate', 'rotation_up', 'fc2']
+        manifest['objects'][1]['pointer_slots'] = ['fc2_ptr', 'output_ptr']
+    monkeypatch.setattr(exporter, 'write_bridge', bridge)
+    meta = exporter.export(tmp_path, 512, 256, 8192, (4, 5), 'packed', 8,
+                           hidden=6144, warp_specialized=True, wire_input=wire,
+                           row_addresses=True, route_block=64)
+    assert observed[0]['row_addresses'] is True
+    assert observed[0].get('input_format', 'bf16') == meta['input_format'] == ('e4m3_k32' if wire else 'bf16')
+    assert meta['row_addresses'] and meta['output_dtype'] == 'bf16'
+    geometry = dict(meta['segment_geometry'])
+    assert geometry.pop('workspace_sms') == geometry['sms'] == 48
+    expected = helpers.exl3_ws_segment_scratch_regions(**geometry)
+    assert {r['name']: r['bytes'] for r in meta['segment_scratch_regions']} == expected
+    total = helpers.exl3_ws_segment_scratch_bytes(**geometry)
+    assert total == meta['segment_scratch_bytes'] == meta['unique_execution_buffer_bytes']
+    offset = 0
+    for region in meta['segment_scratch_regions']:
+        assert region['offset'] == offset == meta['buffers'][region['name']]['arena_offset']
+        assert region['aligned_bytes'] % 256 == 0
+        offset += region['aligned_bytes']
+    for name in ('input', 'output'):
+        assert meta['buffers'][name]['dtype'] == 'torch.int64'
+        assert meta['buffers'][name]['shape'] == [8192]
+    assert meta['buffers']['input']['external'] and not meta['buffers']['input']['arena']
+    assert meta['buffers']['output']['arena']
+    for alias in ('rotation_up', 'fc2'):
+        assert meta['buffers'][alias]['allocation'] == 'rotation_gate'
+        assert meta['buffers'][alias]['arena_offset'] == meta['buffers']['rotation_gate']['arena_offset']
+    assert meta['requires_route_preparation'] and meta['route_preparation']
+    assert meta['objects'][0]['pointer_bindings'] == ['input', 'rotation_gate', 'rotation_up', 'fc2']
+    assert meta['objects'][1]['pointer_bindings'] == ['fc2', 'output']
+
+
 @pytest.mark.parametrize("blocks", [1, 2])
 @pytest.mark.parametrize("compact", [False, True])
 def test_exl3_generated_bridge_uses_runtime_sms_and_propagates_errors(monkeypatch, blocks, compact):

@@ -201,7 +201,7 @@ mod tests {
             let tensors = Fp8ExpertTensors::read(root.path(), RoutedExpertShape { layers: 10, first_layer: 3,
                 experts: 1, topk, hidden, intermediate, draft_stages: 0, draft_experts: 0 })?;
             let mut info = Fp8MoeInfo { hidden, intermediate, slice: intermediate, experts: 1, topk, tp: 1,
-                wire_input: false, swiglu_limit: tensors.shape().geometry()?.swiglu_limit().unwrap_or(0.0),
+                wire_input: false, nvfp4_input: false, swiglu_limit: tensors.shape().geometry()?.swiglu_limit().unwrap_or(0.0),
                 swiglu_alpha: 1.0, swiglu_beta: 0.0, activation: Fp8MoeActivation::SiluBf16Product,
                 projection: Fp8MoeProjection::Bf16, capacities: vec![1, 16, 4096], scale_convention: cuteafd_ffi::fp8_moe::Fp8MoeScaleConvention::Multiplier, weights: match format {
                     ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,

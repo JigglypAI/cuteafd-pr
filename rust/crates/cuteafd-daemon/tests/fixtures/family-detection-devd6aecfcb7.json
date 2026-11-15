@@ -160,6 +160,21 @@
       "model": "zai-org/GLM-5.3-Flash",
       "revision": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a",
       "family": "glm5_flash"
+    },
+    {
+      "model": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
+      "revision": "2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e",
+      "family": "glm5"
+    },
+    {
+      "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
+      "revision": "558931fe149f59b49d19b2376a692bd7a12fb8b7",
+      "family": "glm5_flash"
+    },
+    {
+      "model": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC",
+      "revision": "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4",
+      "family": "step5"
     }
   ],
   "not_installed": [

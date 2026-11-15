@@ -165,10 +165,14 @@ impl<'a> Weights<'a> {
             Self::Exlr8(_) => unreachable!("validated above"),
             Self::Fp8(experts) => (
                 experts.iter().all(|group| group.wire_input()),
-                experts.iter().all(|group| !group.wire_input() || group.bf16_module.is_some())),
+                experts.iter().all(|group| !group.module.info().nvfp4_input
+                    && (!group.wire_input() || group.bf16_module.is_some()))),
         };
+        let nvfp4 = matches!(self, Self::Fp8(experts) if !experts.is_empty()
+            && experts.iter().all(|group| group.module.info().nvfp4_input));
         for endpoint in &model.endpoints {
-            let supported = if endpoint.ingress == cuteafd_core::SparkIngress::Native {
+            let supported = if endpoint.ingress == cuteafd_core::SparkIngress::Nvfp4 { nvfp4 }
+            else if endpoint.ingress == cuteafd_core::SparkIngress::Native {
                 match self {
                     Self::Fp8(experts) => !experts.is_empty() && experts.iter().all(|group| {
                         use cuteafd_ffi::fp8_moe::Fp8MoeWeights;
@@ -371,27 +375,49 @@ pub(super) enum Execution<'w, 'a> {
     Exlr8(super::exlr8::Worker<'w, 'a>),
 }
 impl<'w, 'a> Execution<'w, 'a> {
-    pub(super) fn flush_staged(&mut self) -> Result<()> {
-        if let Self::Fp8(groups) = self {
-            for worker in &mut groups.workers { worker.flush_staged()?; }
+    /// Allocate a prefill owner's merged-wave staging after `defer` (FP8
+    /// prepares its own at construction; other backends do not merge yet).
+    pub(super) fn prepare_waves(&mut self, extent: cuteafd_core::OwnerExtent) -> Result<()> {
+        match self {
+            Self::Exl3(execution) => execution.prepare_waves(extent),
+            Self::Fp8(_) | Self::Full(_) | Self::Exlr8(_) => Ok(()),
         }
-        Ok(())
+    }
+
+    /// Launch every staged unit (shared wave staging, `execution::waves`).
+    pub(super) fn flush_staged(&mut self) -> Result<()> {
+        match self {
+            Self::Fp8(groups) => {
+                for worker in &mut groups.workers { worker.flush_staged()?; }
+                Ok(())
+            }
+            Self::Exl3(execution) => execution.flush_staged(),
+            Self::Full(_) | Self::Exlr8(_) => Ok(()),
+        }
     }
     pub(super) fn has_staged(&self) -> bool {
-        matches!(self, Self::Fp8(groups) if groups.workers.iter().any(|worker| worker.has_staged()))
+        match self {
+            Self::Fp8(groups) => groups.workers.iter().any(|worker| worker.has_staged()),
+            Self::Exl3(execution) => execution.has_staged(),
+            Self::Full(_) | Self::Exlr8(_) => false,
+        }
     }
     pub(super) fn cancel_staged(&mut self, input_address: usize) -> Result<bool> {
-        if let Self::Fp8(groups) = self {
-            for (index, worker) in groups.workers.iter_mut().enumerate() {
-                if worker.cancel_staged(input_address)? {
-                    let position = groups.pending_groups.iter().position(|&(group, address)| group == index && address == input_address)
-                        .context("staged group has no owner FIFO entry")?;
-                    groups.pending_groups.remove(position);
-                    return Ok(true);
+        match self {
+            Self::Fp8(groups) => {
+                for (index, worker) in groups.workers.iter_mut().enumerate() {
+                    if worker.cancel_staged(input_address)? {
+                        let position = groups.pending_groups.iter().position(|&(group, address)| group == index && address == input_address)
+                            .context("staged group has no owner FIFO entry")?;
+                        groups.pending_groups.remove(position);
+                        return Ok(true);
+                    }
                 }
+                Ok(false)
             }
+            Self::Exl3(execution) => execution.cancel_staged(input_address),
+            Self::Full(_) | Self::Exlr8(_) => Ok(false),
         }
-        Ok(false)
     }
 
     pub(super) fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
@@ -560,6 +586,8 @@ fn supports_ingress(ingress: cuteafd_core::SparkIngress, fp8: bool, bf16: bool) 
         cuteafd_core::SparkIngress::Native => fp8 || bf16,
         // FP8 remains legal at every row count, including the BF16 decode extent.
         cuteafd_core::SparkIngress::Bf16Decode { .. } => fp8 && bf16,
+        // Exact NVFP4 rows need the NVFP4-wire package (checked by the caller).
+        cuteafd_core::SparkIngress::Nvfp4 => false,
     }
 }
 
@@ -733,12 +761,17 @@ pub(super) fn load_exl3<'a>(
     config.validate_exl3_residency(catalog, &exl3_directory)?;
 
     let epilogue = Exl3Epilogue::for_catalog(catalog);
-    let workspace = spark_execution_workspace(config, |capacity, _, staging_rows, _| {
+    let segments = Exl3Worker::segments_directory(&exl3_directory, epilogue);
+    let workspace = spark_execution_workspace(config, |capacity, _, staging_rows, extent| {
         let device = Exl3Worker::plan(&exl3_directory, capacity, config.exl3_schedule, epilogue)
             .context("EXL3 checkpoint requires matching native AOT artifacts; set --exl3-aot-dir for a custom export")?;
         let staging = (staging_rows as usize).checked_mul(cuteafd_core::expert_geometry().topk as usize * 8)
             .context("EXL3 route staging overflow")?;
-        Ok((device, 0, staging))
+        // A prefill owner's merged waves: segments arena, staged slices and
+        // tables (device) plus row-address descriptors per queued unit.
+        let waves = Exl3Worker::wave_bytes(segments.as_deref(), extent)?;
+        let descriptors = if waves > 0 { super::super::execution::waves::WaveStaging::pinned_bytes(extent) } else { 0 };
+        Ok((device, waves, staging + descriptors))
     })?;
     let workspace = usize::try_from(workspace.total().context("EXL3 owner workspace overflow")?)?;
     let layers = config.resident_layers(catalog.routed_experts().layers)?;

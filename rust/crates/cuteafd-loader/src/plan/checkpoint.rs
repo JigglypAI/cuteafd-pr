@@ -152,7 +152,14 @@ impl Checkpoint {
     }
 
     pub fn converts_to_fp8(&self, name: &str) -> bool {
-        self.view.as_ref().is_some_and(|view| view.converts_to_fp8(name))
+        if !self.view.as_ref().is_some_and(|view| view.converts_to_fp8(name)) { return false; }
+        // External-drafter GLMs never own the original view's native MTP core.
+        // Keep the publication selection immutable, but do not convert unused weights.
+        let unused_mtp = super::family::detect(self).is_some_and(|family|
+            matches!(family.id(), "glm5" | "glm5_flash"))
+            && self.text_config()["num_hidden_layers"].as_u64().is_some_and(|layers|
+                super::families::glm::native_mtp_role(layers as usize, name).is_some());
+        !unused_mtp
     }
 
     /// Push conversion is selected per tensor, not by a family's global view mode.
@@ -164,7 +171,7 @@ impl Checkpoint {
     /// Families declare executable roles, never a second conversion selection.
     pub fn validate_fp8_roles(&self, family: &str,
         role: impl Fn(&str) -> crate::formats::native_attention::Fp8Role) -> Result<()> {
-        for name in self.view.iter().flat_map(|view| view.fp8_tensors()) {
+        for name in self.view.iter().flat_map(|view| view.fp8_tensors()).filter(|name| self.converts_to_fp8(name)) {
             let declaration = role(name);
             let (role, supported) = (declaration.name, declaration.supported);
             ensure!(supported, "{name}: role {role} cannot execute block FP8 in family {family}");

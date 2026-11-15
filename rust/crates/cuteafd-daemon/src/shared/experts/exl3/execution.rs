@@ -228,8 +228,23 @@ struct Manifest {
     /// BF16 decode pass); absent or `bf16`: BF16 rows.
     #[serde(default)]
     input_format: Option<String>,
+    /// A row-addressed (merged-wave) program: Int64 input and output address
+    /// tables, one live-row arena laid out by `segment_geometry`.
+    #[serde(default)]
+    row_addresses: bool,
+    #[serde(default)]
+    segment_geometry: Option<cuteafd_core::spark_executions::Exl3SegmentGeometry>,
+    #[serde(default)]
+    segment_scratch_regions: Vec<SegmentRegion>,
 }
 fn default_route_block() -> usize { 8 }
+
+#[derive(Deserialize)]
+struct SegmentRegion {
+    name: String,
+    bytes: u64,
+    offset: u64,
+}
 
 /// The exporter's activation name for a family's expert arithmetic.
 fn exl3_activation(activation: cuteafd_core::FfnActivation) -> &'static str {
@@ -242,6 +257,31 @@ fn exl3_activation(activation: cuteafd_core::FfnActivation) -> &'static str {
 }
 
 impl Manifest {
+    /// The segment arena geometry, after requiring the recorded region list
+    /// at the compiled maximum to equal the shared formula exactly (a drifted
+    /// formula or export refuses to load).
+    fn segment_geometry(&self) -> Result<cuteafd_core::spark_executions::Exl3SegmentGeometry> {
+        use cuteafd_core::spark_executions::EXL3_SEGMENT_REGIONS;
+        ensure!(self.row_addresses && self.wire_input()? && self.output_dtype == "bf16",
+            "EXL3 segment program must be row-addressed FP8 K32 input with BF16 output");
+        let geometry = self.segment_geometry.context("EXL3 segment program lacks its geometry")?;
+        ensure!(geometry == cuteafd_core::spark_executions::Exl3SegmentGeometry::for_spark(
+            geometry.hidden, geometry.intermediate, geometry.topk, geometry.experts),
+            "EXL3 segment program differs from the planner's Spark segment policy");
+        ensure!(geometry.maximum as usize == self.capacity && geometry.hidden as usize == self.hidden
+            && geometry.intermediate as usize == self.intermediate && geometry.topk as usize == self.top_k
+            && geometry.experts as usize == self.experts && geometry.block as usize == self.route_block
+            && geometry.workspace_sms as usize == self.sms, "EXL3 segment geometry disagrees with its program");
+        let regions = geometry.regions(geometry.maximum).context("invalid EXL3 segment geometry")?;
+        let (offsets, _) = geometry.layout(geometry.maximum).context("invalid EXL3 segment geometry")?;
+        ensure!(self.segment_scratch_regions.len() == EXL3_SEGMENT_REGIONS.len()
+            && self.segment_scratch_regions.iter().zip(EXL3_SEGMENT_REGIONS).zip(regions.iter().zip(offsets))
+                .all(|((recorded, name), (&bytes, offset))| recorded.name == name
+                    && recorded.bytes == bytes && recorded.offset == offset),
+            "EXL3 segment arena differs from the shared formula; re-export or update core");
+        Ok(geometry)
+    }
+
     fn group_rows(&self) -> Result<usize> {
         ensure!(matches!(self.route_block, 8 | 16 | 32 | 64), "unknown EXL3 route_block {}", self.route_block);
         ensure!(!self.direct || self.route_block == 8, "direct EXL3 requires route_block 8");
@@ -593,12 +633,18 @@ impl<'a> Exl3Modules<'a> {
                 _ => anyhow::bail!("unsupported EXL3 output precision"),
             };
             let output_spec = meta.buffers.get("output").context("missing EXL3 output")?;
-            ensure!(
-                meta.output_dtype == output_dtype.0
-                    && output_spec.dtype == output_dtype.1
-                    && output_spec.bytes == meta.capacity * meta.hidden * info.output_element_bytes,
-                "EXL3 output precision/size mismatch"
-            );
+            if meta.row_addresses {
+                meta.segment_geometry()?;
+                ensure!(meta.output_dtype == output_dtype.0 && output_spec.dtype == "torch.int64"
+                    && output_spec.bytes == meta.capacity * 8, "EXL3 segment output-address table mismatch");
+            } else {
+                ensure!(
+                    meta.output_dtype == output_dtype.0
+                        && output_spec.dtype == output_dtype.1
+                        && output_spec.bytes == meta.capacity * meta.hidden * info.output_element_bytes,
+                    "EXL3 output precision/size mismatch"
+                );
+            }
 
             let routes = if meta.direct { None } else {
                 let route = meta.route_preparation.as_ref().context("missing EXL3 packed route export")?;
@@ -618,7 +664,17 @@ impl<'a> Exl3Modules<'a> {
     }
 }
 
+/// Where an execution's scratch comes from.
+enum Scratch<'a> {
+    /// Per-execution allocations, or the lane's shared capacity arena.
+    Owned(Option<Rc<Exl3Workspace<'a>>>),
+    /// One live-row arena of a row-addressed program (region name → offset).
+    Segment { arena: DeviceAllocation<'a>, regions: BTreeMap<String, usize>, rows: usize },
+}
+
 pub(crate) struct Exl3Execution<'a> {
+    /// A row-addressed merged-wave program (`launch_layer_segments` only).
+    row_addresses: bool,
     modules: Exl3Modules<'a>,
     wire: Option<DeviceAllocation<'a>>,
     /// Inputs arrive as wire rows (decoded by `wire`, or read by the core).
@@ -660,6 +716,13 @@ impl<'a> Exl3Execution<'a> {
             }
         }
         Ok(())
+    }
+
+    /// A segments program's verified arena geometry, read from its manifest
+    /// without loading code (planner and worker admission).
+    pub(crate) fn segment_geometry(directory: &Path) -> Result<cuteafd_core::spark_executions::Exl3SegmentGeometry> {
+        let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        meta.segment_geometry()
     }
 
     pub(crate) fn validate_artifact(directory: &Path) -> Result<()> {
@@ -733,6 +796,40 @@ impl<'a> Exl3Execution<'a> {
         epilogue: Exl3Epilogue,
         shared: Option<Rc<Exl3Workspace<'a>>>,
     ) -> Result<Self> {
+        ensure!(!modules.owner.meta.row_addresses, "EXL3 segment programs bind through with_segment_arena");
+        // SAFETY: forwarded caller contract.
+        unsafe { Self::bind(library, weights, modules, epilogue, Scratch::Owned(shared)) }
+    }
+
+    /// A row-addressed (merged-wave) program over one arena laid out for
+    /// `rows` admitted live rows (`OwnerExtent::segment_rows`): every buffer is
+    /// a region view at the shared formula's offset, aliases included; the
+    /// Int64 input table is external (staging) and the output table is the
+    /// arena's `output` region, filled in place before each launch.
+    ///
+    /// # Safety
+    /// As `with_modules`.
+    pub(crate) unsafe fn with_segment_arena(library: &'a NativeLibrary, weights: Rc<Vec<Exl3Weights<'a>>>,
+        modules: Exl3Modules<'a>, rows: usize) -> Result<Self> {
+        let geometry = modules.owner.meta.segment_geometry()?;
+        let (offsets, bytes) = geometry.layout(u32::try_from(rows)?).context("EXL3 segment rows exceed the program")?;
+        let arena = DeviceAllocation::new(library, usize::try_from(bytes)?, Tag::workspace("experts/exl3-segment-arena"))?;
+        ensure!(arena.buffer.ptr as usize % 256 == 0, "EXL3 segment arena must be 256-byte aligned");
+        let regions = cuteafd_core::spark_executions::EXL3_SEGMENT_REGIONS.iter().zip(offsets)
+            .map(|(name, offset)| Ok(((*name).to_owned(), usize::try_from(offset)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        // SAFETY: forwarded caller contract; the arena outlives every binding.
+        unsafe { Self::bind(library, weights, modules, Exl3Epilogue::Sum,
+            Scratch::Segment { arena, regions, rows }) }
+    }
+
+    unsafe fn bind(
+        library: &'a NativeLibrary,
+        weights: Rc<Vec<Exl3Weights<'a>>>,
+        modules: Exl3Modules<'a>,
+        epilogue: Exl3Epilogue,
+        scratch: Scratch<'a>,
+    ) -> Result<Self> {
         ensure!(std::ptr::eq(library, modules.owner.device.library)
             && library.cuda_get_device()? == modules.owner.device.id,
             "EXL3 preload library/device mismatch");
@@ -758,10 +855,39 @@ impl<'a> Exl3Execution<'a> {
         let info = modules.owner.kernel.info();
         let mut storage = Vec::new();
         let mut pointers = BTreeMap::new();
+        let (shared, segment) = match scratch {
+            Scratch::Owned(shared) => (shared, None),
+            Scratch::Segment { arena, regions, rows } => (None, Some((arena, regions, rows))),
+        };
+        if let Some((arena, regions, rows)) = &segment {
+            let routes = rows * meta.top_k;
+            for (name, spec) in &meta.buffers {
+                if name != &spec.allocation || name == "input" { continue; }
+                let offset = *regions.get(name).with_context(|| format!("EXL3 segment buffer {name} has no region"))?;
+                // Live-row extents: route-scaled planes shrink with admitted rows.
+                let bytes = match name.as_str() {
+                    "rotation_gate" => routes * meta.hidden * 2,
+                    "fc1" => routes * meta.intermediate * 4,
+                    "activated" => routes * meta.intermediate * 2,
+                    "output" => rows * 8,
+                    _ => spec.bytes,
+                };
+                ensure!(offset + bytes <= arena.buffer.bytes, "EXL3 segment region exceeds the arena");
+                let buffer = CuteafdDeviceBuffer { ptr: arena.buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes,
+                    ..arena.buffer };
+                if spec.zero_on_create { library.copy_h2d(buffer, &vec![0; bytes])?; }
+                pointers.insert(name.clone(), buffer);
+            }
+            for (name, spec) in &meta.buffers {
+                if name == &spec.allocation || name == "input" { continue; }
+                let owner = *pointers.get(&spec.allocation).context("missing EXL3 segment alias owner")?;
+                pointers.insert(name.clone(), owner);
+            }
+        }
         // Never resize to the current device's SM count: compiled grid barriers
         // retain export-time offsets, even when the bridge caps the launch grid.
         for (name, spec) in &meta.buffers {
-            if name != &spec.allocation || !epilogue.allocates(name) {
+            if segment.is_some() || name != &spec.allocation || !epilogue.allocates(name) {
                 continue;
             }
             if let Some(arena) = shared.as_ref().filter(|_| !spec.zero_on_create) {
@@ -780,7 +906,7 @@ impl<'a> Exl3Execution<'a> {
             storage.push(allocation);
         }
         for (name, spec) in &meta.buffers {
-            if !epilogue.allocates(&spec.allocation) {
+            if segment.is_some() || !epilogue.allocates(&spec.allocation) {
                 continue;
             }
             let mut buffer = *pointers
@@ -920,7 +1046,18 @@ impl<'a> Exl3Execution<'a> {
         let wire = if modules.owner.wire.is_some() {
             Some(DeviceAllocation::new(library, meta.capacity * meta.hidden * 2, Tag::workspace("experts/exl3-wire"))?)
         } else { None };
+        if let Some((arena, _, rows)) = segment {
+            ensure!(wire.is_none(), "EXL3 segment programs read wire rows in the core");
+            storage.push(arena);
+            return Ok(Self {
+                wire, wire_rows: true, _storage: storage, _shared_workspace: None, _weights: weights, layers,
+                route_pointers, route_bytes, output_element_bytes: info.output_element_bytes,
+                output: pointers.get("output").copied(), device, hidden: meta.hidden, capacity: rows,
+                group_rows, topk: meta.top_k, modules, library, row_addresses: true,
+            });
+        }
         Ok(Self {
+            row_addresses: false,
             wire,
             wire_rows: format == Exl3InputFormat::Fp8K32,
             _storage: storage,
@@ -1001,6 +1138,7 @@ impl<'a> Exl3Execution<'a> {
     ) -> Result<CuteafdDeviceBuffer> {
         let mut inputs = inputs;
         let mut output = output;
+        ensure!(!self.row_addresses, "EXL3 segment programs launch only merged waves");
         if let Some(shared) = &self._shared_workspace { shared.validate_stream(self.device, stream)?; }
         ensure!(
             rows > 0 && rows <= self.capacity,
@@ -1063,6 +1201,44 @@ impl<'a> Exl3Execution<'a> {
         Ok(output)
     }
 
+    /// One merged wave through a row-addressed program: `inputs[0]` is the
+    /// Int64 input-address table (each row's staged wire bytes), `outputs`
+    /// the host-packed Int64 reply-row addresses copied into the arena's
+    /// output table on `stream`, then route preparation, core and sum.
+    ///
+    /// # Safety
+    /// Every addressed input and output row, both tables and the routes stay
+    /// live and unmodified until this wave's work on `stream` completes.
+    pub(crate) unsafe fn launch_layer_segments(&mut self, layer: usize, inputs: [CuteafdDeviceBuffer; 3],
+        outputs: CuteafdDeviceBuffer, rows: usize, stream: *mut c_void) -> Result<()> {
+        ensure!(self.row_addresses, "EXL3 merged waves need a row-addressed program");
+        ensure!(rows > 0 && rows <= self.capacity, "EXL3 merged rows exceed the admitted arena");
+        ensure!(self.library.cuda_get_device()? == self.device, "EXL3 execution on wrong device");
+        for (buffer, bytes) in inputs.iter().zip([rows * 8, rows * self.topk * 4, rows * self.topk * 4]) {
+            ensure!(!buffer.ptr.is_null() && buffer.ptr as usize % 8 == 0 && buffer.bytes >= bytes
+                && buffer.device_id == self.device, "EXL3 segment input contract mismatch");
+        }
+        let table = self.output.context("EXL3 segment program lacks its output table")?;
+        ensure!(outputs.bytes >= rows * 8 && table.bytes >= rows * 8 && outputs.device_id == self.device,
+            "EXL3 segment output-address table mismatch");
+        // SAFETY: both tables are live device memory of at least `rows` addresses.
+        unsafe { self.library.copy_d2d_async(CuteafdDeviceBuffer { bytes: rows * 8, ..table }, outputs, rows * 8, stream)?; }
+        let binding = self.layers.get_mut(layer).context("EXL3 layer is not bound")?;
+        if let Some(routes) = &self.modules.owner.routes {
+            self.route_pointers[0] = inputs[1].ptr;
+            self.route_pointers[1] = binding.expert_map.ptr;
+            self.route_bytes[1] = binding.expert_map.bytes as u64;
+            self.route_bytes[0] = inputs[1].bytes as u64;
+            routes.launch(&self.route_pointers, &self.route_bytes, rows as i32, stream)?;
+        }
+        binding.core.bind(&inputs, rows);
+        let sum = binding.sum.as_mut().context("EXL3 segment program has no weighted sum")?;
+        sum.bind(&inputs, rows);
+        self.modules.owner.kernel.launch_core(&binding.core.pointers, &binding.core.scalars, stream)?;
+        self.modules.owner.kernel.launch_sum(&sum.pointers, &sum.scalars, stream)?;
+        Ok(())
+    }
+
     /// The core only (wire decode, routes, gate/up and down into FC2), for a
     /// partial-reply or fused compressed-sum epilogue.
     ///
@@ -1071,6 +1247,7 @@ impl<'a> Exl3Execution<'a> {
     /// before any later launch reuses the FC2 workspace.
     pub(crate) unsafe fn launch_layer_core(&mut self, layer: usize, inputs: [CuteafdDeviceBuffer; 3], rows: usize,
         stream: *mut c_void) -> Result<PartialSources> {
+        ensure!(!self.row_addresses, "EXL3 segment programs launch only merged waves");
         let mut inputs = inputs;
         if let Some(shared) = &self._shared_workspace { shared.validate_stream(self.device, stream)?; }
         ensure!(rows > 0 && rows <= self.capacity, "EXL3 live rows exceed capacity");

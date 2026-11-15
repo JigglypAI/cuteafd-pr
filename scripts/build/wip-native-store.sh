@@ -37,6 +37,9 @@ wip_native_required_items() {
     if [[ "$family" == *:nvfp4 && "$family" != step5:nvfp4 ]]; then
       printf 'file fp8/%sa4/manifest.json\n' "$package"
     fi
+    if [[ "$role" == expert && "$family" == minimax:nvfp4a4 ]]; then
+      printf 'file fp8/%s-nvfp4w/manifest.json\n' "$package"
+    fi
     if [[ "$role" == coordinator && "$family" == qwen4:nvfp4* ]]; then
       printf 'file fp8/fp8-qwen4/manifest.json\n'
     fi

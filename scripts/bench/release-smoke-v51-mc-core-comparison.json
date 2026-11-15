@@ -35,7 +35,7 @@
         "SPARK_COUNT": "6",
         "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
         "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
-        "MODEL_REVISION": "c39486376dee84e5faa4904e014e07d7b6e76405",
+        "MODEL_REVISION": "2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
@@ -76,7 +76,7 @@
         "SPARK_COUNT": "6",
         "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
         "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
-        "MODEL_REVISION": "c39486376dee84e5faa4904e014e07d7b6e76405",
+        "MODEL_REVISION": "2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
@@ -117,7 +117,7 @@
         "EXPERT_PORT": "28400",
         "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
         "MODEL_ID": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC",
-        "MODEL_REVISION": "4483a4bd874e8c360aec486ea72bd31d1ad7a247",
+        "MODEL_REVISION": "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
@@ -158,7 +158,7 @@
         "EXPERT_PORT": "28600",
         "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
         "MODEL_ID": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC",
-        "MODEL_REVISION": "4483a4bd874e8c360aec486ea72bd31d1ad7a247",
+        "MODEL_REVISION": "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
@@ -273,7 +273,7 @@
         "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "0",
         "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
-        "MODEL_REVISION": "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d",
+        "MODEL_REVISION": "558931fe149f59b49d19b2376a692bd7a12fb8b7",
         "EXPERT_BACKEND": "local",
         "CORE_VIEW": "k8-compact"
       }
@@ -294,7 +294,7 @@
         "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "0",
         "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
-        "MODEL_REVISION": "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d",
+        "MODEL_REVISION": "558931fe149f59b49d19b2376a692bd7a12fb8b7",
         "EXPERT_BACKEND": "local",
         "CORE_VIEW": "k6-compact"
       }
@@ -315,7 +315,7 @@
         "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "0",
         "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
-        "MODEL_REVISION": "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d",
+        "MODEL_REVISION": "558931fe149f59b49d19b2376a692bd7a12fb8b7",
         "EXPERT_BACKEND": "local",
         "CORE_VIEW": "fp8-compact"
       }

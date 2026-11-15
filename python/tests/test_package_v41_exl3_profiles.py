@@ -146,7 +146,7 @@ class PackageProfileTests(unittest.TestCase):
     expected_rank_count = {'tp2-rank': 2, 'tp3-rank': 3}
 
     def build_fixture(self, root, role, bits, require=(), tiles=(), geometry='dsv4p',
-                      capacities=(1, 80), compact=False, profiles=()):
+                      capacities=(1, 80), compact=False, profiles=(), segments=False):
         args = argparse.Namespace(
             output=root / 'package', build_dir=root / 'build', role=role, geometry=geometry,
             bits=list(bits), capacities=','.join(map(str, capacities)),
@@ -192,7 +192,8 @@ class PackageProfileTests(unittest.TestCase):
             self.assertLessEqual(set(options), {'tile', 'blocks_per_sm', 'route_block',
                                                 'hidden', 'swiglu_limit', 'decode_schedule',
                                                 'compact_weights', 'token_major_rotation', 'warp_specialized',
-                                                'wire_input', 'ws_input_stages', 'ws_dynamic_tiles', 'activation'},
+                                                'wire_input', 'ws_input_stages', 'ws_dynamic_tiles', 'activation',
+                                                'row_addresses'},
                                  'unexpected option consumed by the fake export')
             if options.get('compact_weights'):
                 self.assertEqual(len(tiers), 2)
@@ -205,6 +206,9 @@ class PackageProfileTests(unittest.TestCase):
                 meta['ws_dynamic_tiles'] = True
             if options.get('wire_input'):
                 meta['input_format'] = 'e4m3_k32'
+            if options.get('row_addresses'):
+                meta['row_addresses'] = True
+                meta.setdefault('input_format', 'bf16')
             if 'token_major_rotation' in options:
                 meta['token_major_rotation'] = options['token_major_rotation']
             if 'route_block' in options:
@@ -259,7 +263,10 @@ class PackageProfileTests(unittest.TestCase):
         def compile_inline(payloads, _jobs):
             return [package.compile_variant(payload) for payload in payloads]
 
-        with patch.dict(sys.modules, {'_pinned_sparkinfer': pinned, '_export_jobs': jobs,
+        # Most tests isolate ordinary recipes; segment coverage opts in explicitly.
+        segment_policy = package.segment_export_options if segments else lambda *a, **k: None
+        with patch.object(package, 'segment_export_options', side_effect=segment_policy), \
+                patch.dict(sys.modules, {'_pinned_sparkinfer': pinned, '_export_jobs': jobs,
                                      'export_b12x_exl3_aot': exporter, 'torch': torch}), \
                 patch.object(package, 'compile_variants', side_effect=compile_inline), \
                 patch.object(package.os, 'setsid'), \

@@ -151,7 +151,7 @@ impl<'a> Fp8Worker<'a> {
         ensure!(request.output_dtype() == ExpertV2Dtype::Bf16 || request.partial_plan()?.is_none(),
             "fused FP8 reply requires whole combined rows");
         if request.input_dtype() != segment_input_dtype(self.experts.module.info()) {
-            tracing::debug!(target: "cuteafd::spark_coalesce", rows = request.rows(), reason = "incompatible_input_or_capacity", "Spark staging bypass");
+            waves.bypass(request.rows(), super::super::execution::waves::Bypass::Ingress);
             return Ok(false)
         }
         ensure!(executor_id == self.executor_id && request.layer() as usize == self.experts.layers[self.layer].layer,
@@ -165,6 +165,10 @@ impl<'a> Fp8Worker<'a> {
     /// Exact retained input/routes/output bytes (scratch is admitted separately).
     pub(crate) fn io_bytes(info: &cuteafd_ffi::fp8_moe::Fp8MoeInfo, bf16_sibling: bool,
         capacity: usize) -> Result<usize> {
+        if info.nvfp4_input {
+            return cuteafd_ffi::fp8_moe::fp8_slot_io_bytes_for_input(info.hidden, info.topk,
+                info.input_row_bytes(), capacity);
+        }
         cuteafd_ffi::fp8_moe::fp8_slot_io_bytes(info.hidden, info.topk, info.wire_input,
             bf16_sibling, capacity)
     }
@@ -192,7 +196,7 @@ impl<'a> Fp8Worker<'a> {
         ensure!(experts.module.info().capacity_for(capacity).is_some(), "FP8 package lacks capacity {capacity}");
         ensure!(experts.wire_input() || matches!(experts.module.info().weights,
             cuteafd_ffi::fp8_moe::Fp8MoeWeights::Nvfp4 | cuteafd_ffi::fp8_moe::Fp8MoeWeights::Bf16),
-            "Spark workers need a wire-input package, or native BF16-input weights");
+            "Spark workers need a wire-input package, or native BF16/NVFP4-input weights");
         let experts = match scratch {
             Some(scratch) => Fp8Experts::from_scratch(experts, capacity, scratch)?,
             None => Fp8Experts::from_shared(library, experts, capacity)?,
@@ -203,7 +207,8 @@ impl<'a> Fp8Worker<'a> {
                 input_row_bytes(experts.module.info()).try_into()?,
                 experts.bf16_module.is_some().then_some(u32::try_from(hidden * 2)?))
                 .context("segmented input extent overflow")? as usize,
-            None => capacity * if !experts.wire_input() || experts.bf16_module.is_some() { hidden * 2 }
+            None => capacity * if experts.module.info().nvfp4_input { cuteafd_core::nvfp4_wire_row_bytes(hidden) }
+                else if !experts.wire_input() || experts.bf16_module.is_some() { hidden * 2 }
                 else { hidden + hidden / 32 },
         };
         let inputs = [
@@ -310,15 +315,18 @@ impl<'a> Fp8Worker<'a> {
         if self.waves.is_some() && (hidden_view.is_none() || self.experts.bf16_module.is_none()) { self.synchronize()?; }
         let rows = request.rows() as usize;
         ensure!(rows > 0 && rows <= self.capacity, "FP8 request exceeds capacity");
-        // FP8 K32 wire rows, or BF16 rows when the BF16-input package is loaded.
-        let bf16 = request.require_input_dtype(ExpertV2Dtype::Fp8E4m3Ue8m0K32 as u32).is_err();
+        // FP8 K32 wire rows, or BF16 rows when the BF16-input package is loaded,
+        // or the exact pre-quantized NVFP4 rows the NVFP4-wire package reads.
+        let nvfp4 = self.experts.module.info().nvfp4_input;
+        if nvfp4 { request.require_input_dtype(ExpertV2Dtype::Nvfp4E2m1E4m3K16Amax as u32)?; }
+        let bf16 = !nvfp4 && request.require_input_dtype(ExpertV2Dtype::Fp8E4m3Ue8m0K32 as u32).is_err();
         if bf16 {
             ensure!(!self.experts.wire_input() || self.experts.bf16_module.is_some(),
                 "BF16 expert input needs the BF16-input FP8 package (fp8-<family>-bf16) on this rank");
             request.require_input_dtype(ExpertV2Dtype::Bf16 as u32)?;
         }
-        ensure!(bf16 || self.experts.wire_input(),
-            "native BF16/NVFP4 Spark input must be BF16, not FP8 K32");
+        ensure!(bf16 || nvfp4 || self.experts.wire_input(),
+            "native BF16/NVFP4 Spark input must be BF16 or exact NVFP4 rows, not FP8 K32");
         ensure!(request.hidden().len() <= self.inputs[0].buffer.bytes, "FP8 request rows exceed the input buffer");
         let bytes = request.plane_bytes()?;
         let routes = rows * cuteafd_core::expert_geometry().topk as usize;

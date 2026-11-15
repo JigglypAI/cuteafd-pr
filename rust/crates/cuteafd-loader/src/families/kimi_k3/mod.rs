@@ -34,7 +34,8 @@ pub fn spark_executions(waves: u64, unit_rows: u64) -> anyhow::Result<cuteafd_co
 
 /// One Kimi owner's bytes (the shared EXL3 owner census at latent width).
 pub fn spark_owner_bytes(extent: cuteafd_core::OwnerExtent) -> anyhow::Result<cuteafd_core::OwnerBytes> {
-    crate::plan::layout::spark_slots::exl3_owner_bytes("kimi_k3", cuteafd_core::ExpertGeometry::KIMI_K3, extent)
+    // Kimi layouts ship no merged-wave segments program (GLM families only).
+    crate::plan::layout::spark_slots::exl3_owner_bytes("kimi_k3", cuteafd_core::ExpertGeometry::KIMI_K3, extent, None)
 }
 
 /// The Spark execution reserve used before placement and in its ledger: the

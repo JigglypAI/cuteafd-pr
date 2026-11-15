@@ -1061,7 +1061,8 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         &std::fs::read(root.join("benchmarks/current-matrix.json")).unwrap()).unwrap();
     let retired = retired_configs(&matrix);
     // Original detector baseline, extended with verified published MC configurations
-    // and the deliberately added pinned MiniMax qualification checkpoint (#2081).
+    // and deliberate pinned qualifications. Keep old MC revisions until their
+    // historical live matrix cards are replaced by repaired #2207 revisions.
     let baseline: serde_json::Value = serde_json::from_str(include_str!(
         "fixtures/family-detection-devd6aecfcb7.json")).unwrap();
     let expected = baseline["results"].as_array().unwrap().iter().map(|entry|
@@ -1120,8 +1121,8 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         (expected_absent.0.to_owned(), expected_absent.1.to_owned())]));
     assert_eq!(installed.iter().map(|(model, revision)| (model.as_str(), revision.as_str()))
         .collect::<std::collections::BTreeSet<_>>(), expected_installed);
-    assert_eq!(tested, 32, "installed checkpoint revision set changed");
-    eprintln!("family detection baseline d6aecfcb7 plus deliberate MiniMax (#2081), Muse MC and Kimi K3.1 MC entries: {tested} installed checkpoint revisions verified");
+    assert_eq!(tested, 35, "installed checkpoint revision set changed (including three repaired MC revisions)");
+    eprintln!("family detection baseline d6aecfcb7 plus deliberate MiniMax (#2081), Muse MC, Kimi K3.1 MC and repaired MC entries: {tested} installed checkpoint revisions verified");
 }
 
 fn retired_configs(matrix: &serde_json::Value) -> std::collections::BTreeSet<String> {
@@ -1206,9 +1207,9 @@ fn installed_mc_views_cover_executable_projection_manifests() {
         &std::path::PathBuf::from(std::env::var_os("HOME").unwrap()));
     for (model, revision) in [
         ("Muse-Spark-Open-EXL3-K4-MC", "cc5dc2537083177e3f02ea0b2d9dfc179d40425c"),
-        ("GLM-5.3-EXL3-K4-MC", "c39486376dee84e5faa4904e014e07d7b6e76405"),
-        ("GLM-5.3-Flash-EXL3-K4-MC", "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d"),
-        ("Step-5-Preview-EXL3-K4-MC", "4483a4bd874e8c360aec486ea72bd31d1ad7a247"),
+        ("GLM-5.3-EXL3-K4-MC", "2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e"),
+        ("GLM-5.3-Flash-EXL3-K4-MC", "558931fe149f59b49d19b2376a692bd7a12fb8b7"),
+        ("Step-5-Preview-EXL3-K4-MC", "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4"),
     ] {
         let snapshot = require_installed_snapshot("MC projection coverage",
             &format!("wrldsuksgo2mars/{model}"), Some(revision), &hf_home);

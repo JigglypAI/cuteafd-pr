@@ -1002,14 +1002,17 @@ def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compac
     build_root.mkdir()
     _, _, calls, _ = fixture.PackageProfileTests().build_fixture(
         build_root, role, bits, geometry=geometry,
-        capacities=capacities, compact=compact,
+        capacities=capacities, compact=compact, segments=True,
         profiles=() if compact else tuple(p[0] for p in package.profiles_for_role(role, geometry)))
     expected = [(call.args[1], call.args[3], call.kwargs) for call in calls
                 if bool(call.kwargs.get("compact_weights")) == compact]
     recorded = []
     monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
-    monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
-        export=lambda *values, **options: recorded.append((values, options))))
+    def record_export(*values, row_addresses=False, **options):
+        if row_addresses:
+            options['row_addresses'] = True
+        recorded.append((values, options))
+    monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(export=record_export))
     args = ["--geometry", geometry, "--bits", ",".join(map(str, bits)), "--role", role,
             "--capacities", ",".join(map(str, capacities))]
     if compact:
@@ -1031,6 +1034,46 @@ def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compac
         assert any(options.get("decode_schedule") == package.PURE_EVICT_FIRST for _, options in recorded)
     else:
         assert any(options.get("warp_specialized") for _, options in recorded)
+
+
+def test_spark_exl3_groups_include_only_glm_and_glmf_tier_families():
+    jobs = compare_sm.jobs('all')
+    ordinary = [(name, exporter, args) for name, exporter, args in jobs
+                if exporter == 'package_exl3_aot.py' and not name.startswith('exl3-compact-')
+                and not name.endswith('-spark')]
+    for name, exporter, args in ordinary:
+        expected = (name + '-spark', exporter, [*args, '--role', 'spark', '--source-package-layouts'])
+        assert (expected in jobs) == (args[args.index('--geometry') + 1] in ('glm', 'glmf'))
+
+
+@pytest.mark.parametrize('supports_segments', [False, True])
+def test_exl3_spark_segments_match_packager_and_keep_baseline_api(tmp_path, monkeypatch, supports_segments):
+    spec = importlib.util.spec_from_file_location('package_exl3_aot', ROOT / 'python/tools/aot/package_exl3_aot.py')
+    package = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(package)
+    monkeypatch.setitem(sys.modules, 'package_exl3_aot', package)
+    calls = []
+    if supports_segments:
+        def export(*args, row_addresses=False, **kwargs):
+            calls.append((args, dict(kwargs, row_addresses=row_addresses)))
+    else:
+        def export(*args, **kwargs):
+            assert 'row_addresses' not in kwargs
+            calls.append((args, kwargs))
+    monkeypatch.setitem(sys.modules, 'export_b12x_exl3_aot', SimpleNamespace(export=export))
+    monkeypatch.setattr(compare_sm, 'recorded_construction', lambda function, *args, **kwargs: function(*args, **kwargs))
+    compare_sm._export_exl3(['--geometry', 'glm', '--capacities', '80,2752', '--bits', '4,5',
+                            '--role', 'spark', '--source-package-layouts'], tmp_path)
+    profiles = package.build_profiles('spark', 'glm')
+    segments = [(args, options) for args, options in calls if args[0].name.endswith('-segments')]
+    assert len(segments) == (len(profiles) if supports_segments else 0)
+    assert len(calls) == len(profiles) * (3 if supports_segments else 2)
+    for args, options in segments:
+        assert args[3] == 8192 and args[7] == 'bf16'
+        assert options == dict(package.segment_export_options('glm', 'spark', args[1]), compile_only=True,
+                               row_addresses=True)
+    assert all('row_addresses' not in options or options['row_addresses'] is False
+               for args, options in calls if not args[0].name.endswith('-segments'))
 
 
 def test_exl3_routes_gate_covers_all_coordinator_route_blocks(tmp_path, monkeypatch):

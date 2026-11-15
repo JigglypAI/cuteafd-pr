@@ -352,6 +352,8 @@ pub struct MiniMaxInputs {
     /// Remote charges per onboarding count, per rank (`spark[count][rank]`).
     pub spark: Vec<Vec<SparkCharge>>,
     pub links: Vec<crate::placement::PreparedSparkLink>,
+    /// The header-derived Spark ingress and its per-layer shared input scales.
+    pub spark_ingress: crate::families::minimax_m3::admission::SparkIngressPlan,
     pub spark_reply_formats: SparkReplyFormats,
     pub drafter: Option<Drafter>,
     pub vision: Option<Vision>,
@@ -398,9 +400,11 @@ pub fn request(context: Context, pool: Option<u64>, onboard: crate::placement::O
         prefill: Pin::Exact(prefill), operation, resident_weight_limit, spark_reply_formats: replies }
 }
 
-/// One Spark endpoint at the admitted unit: native BF16 ingress (NVFP4 W4A4
-/// experts quantize their own activations from the calibrated input scale).
-pub fn spark_link(gpu: u8, ranks: usize, prefill: PrefillShape, replies: SparkReplyFormats)
+/// One Spark endpoint at the admitted unit: BF16 ingress (NVFP4 W4A4 experts
+/// quantize their own activations from the calibrated input scale), or the
+/// exact NVFP4 wire when that quantization is expert-independent.
+pub fn spark_link(gpu: u8, ranks: usize, prefill: PrefillShape, replies: SparkReplyFormats,
+    ingress: cuteafd_core::SparkIngress)
     -> Result<Vec<crate::placement::PreparedSparkLink>, Refusal> {
     use crate::placement::{PreparedSparkLink, SparkEndpointOwners, SparkIntakeCandidates};
     if gpu != 0 { return Err(invalid("the sole minimax.spark endpoint belongs on GPU0")); }
@@ -410,7 +414,7 @@ pub fn spark_link(gpu: u8, ranks: usize, prefill: PrefillShape, replies: SparkRe
         geometry: cuteafd_core::ExpertGeometry::MINIMAX_M3,
         endpoint: cuteafd_core::SparkEndpoint { ring_depth: None,
             capacity: u32::try_from(prefill.rows).map_err(|_| Refusal::Overflow("MiniMax transport rows"))?,
-            ingress: cuteafd_core::SparkIngress::Bf16, partial_reply_bytes: None },
+            ingress, partial_reply_bytes: None },
         rings: cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
             slot_bytes: rings.slot_bytes, alignment: rings.alignment } },
         usize::try_from(prefill.waves).map_err(|_| Refusal::Overflow("MiniMax transport waves"))?,

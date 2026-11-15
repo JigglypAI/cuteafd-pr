@@ -1403,6 +1403,7 @@ pub(super) fn bootstrap_shape(rows: usize, format: &super::experts::StepExperts)
         cuteafd_core::SparkIngress::Fp8K32 => ExpertV2Dtype::Fp8E4m3Ue8m0K32,
         cuteafd_core::SparkIngress::Bf16 | cuteafd_core::SparkIngress::Native => ExpertV2Dtype::Bf16,
         cuteafd_core::SparkIngress::Bf16Decode { .. } => anyhow::bail!("Step-5 has no row-dependent ingress"),
+        cuteafd_core::SparkIngress::Nvfp4 => anyhow::bail!("Step-5 NVFP4 carries per-expert input scales; BF16 ingress only"),
     };
     let mut shape = cuteafd_transport::SparkSessionShape::new(rows as u32, H as u32, 8, dtype)?;
     shape.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;

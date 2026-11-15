@@ -783,3 +783,167 @@ def test_identity_and_reports_are_deterministic():
     assert records.stable_hash({"ir": "a", "target": [12, 0]}) == records.stable_hash({"target": [12, 0], "ir": "a"})
     assert records.stable_hash({"ir": "a"}) != records.stable_hash({"ir": "b"})
     assert records.change_report({"k": {}}, {"k": {}})["changed"] == []
+
+
+def test_recorded_hash_snapshot_rejects_mutation_before_publication(tmp_path):
+    source = tmp_path / "recipe.py"
+    source.write_text("TILE = 64\n")
+    recorder = records.Recorder(tmp_path, tmp_path / "output")
+    recorder.frames.add("recipe.py")
+    before = recorder.reads()
+    assert recorder.reads() == before
+    source.write_text("TILE = 128\n")
+    assert recorder.reads() == before
+    with pytest.raises(ValueError, match="recorded source changed.*recipe.py"):
+        recorder.validate_sources()
+
+
+def test_profile_cache_keeps_changing_module_bindings(tmp_path):
+    import types
+    recorder = records.Recorder(tmp_path, tmp_path / "output")
+    module = types.ModuleType("policy")
+    first, second = tmp_path / "first.py", tmp_path / "second.py"
+    first.write_text("TILE = 64\n")
+    second.write_text("TILE = 128\n")
+    module.__file__ = str(first)
+    recorder._record_dependencies([module])
+    module.__file__ = str(second)
+    recorder._record_dependencies([module])
+    assert recorder.frames == {"first.py", "second.py"}
+
+
+def test_exported_record_is_owned_by_each_name(tmp_path, fake_cutlass):
+    output = tmp_path / "output"
+    output.mkdir()
+    recorder = records.Recorder(tmp_path, output).install()
+    try:
+        ir = fake_cutlass.generate_original_ir(None)[0]
+        executor = fake_cutlass.compile_and_cache(None, ir)
+        executor.export_to_c(output, "first", "prefix_first")
+        executor.export_to_c(output, "second", "prefix_second")
+        assert recorder.exports["first.o"]["export_prefix"] == "prefix_first"
+        assert recorder.exports["second.o"]["export_prefix"] == "prefix_second"
+        recorder.exports["second.o"]["source_reads_sha256"]["only_second"] = "hash"
+        assert "only_second" not in recorder.exports["first.o"]["source_reads_sha256"]
+    finally:
+        stop_recorder(recorder)
+
+
+def test_scoped_recorder_rearms_code_and_excludes_previous_program(tmp_path):
+    first = load_recipe(tmp_path / "first.py", "def recipe():\n    return 1\n")
+    second = load_recipe(tmp_path / "second.py", "def recipe():\n    return 2\n")
+    recorder = records.Recorder(tmp_path, tmp_path / "output")
+    recorder.scoped = True
+    recorder.start_monitoring()
+    try:
+        recorder.construct(first.recipe)
+        assert "first.py" in recorder.reads()
+        recorder.construct(second.recipe)
+        assert "second.py" in recorder.reads()
+        assert "first.py" not in recorder.reads()
+        recorder.construct(first.recipe)
+        assert "first.py" in recorder.reads()
+        assert "second.py" not in recorder.reads()
+    finally:
+        recorder.stop_monitoring()
+
+
+def test_program_shards_keep_card_plans_together_and_reject_duplicates():
+    spec = importlib.util.spec_from_file_location("shards_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    catalog = {"programs": [{"name": "a", "labels": ["a_sm170", "a_sm188"]},
+                            {"name": "b", "labels": ["b"]}, {"name": "c", "labels": ["c"]}]}
+    assert publisher.program_shards(catalog, 2) == [["a_sm170", "a_sm188"], ["b", "c"]]
+    catalog["programs"].append(catalog["programs"][0])
+    with pytest.raises(ValueError, match="duplicate"):
+        publisher.program_shards(catalog, 2)
+
+
+def test_shared_executor_keeps_kernel_inputs_for_every_family(tmp_path, fake_cutlass):
+    kernel = tmp_path / "kernel.py"
+    kernel.write_text("TILE = 64\n")
+    family_a = load_recipe(tmp_path / "family_a.py", "def recipe(fn):\n    return fn()\n")
+    family_b = load_recipe(tmp_path / "family_b.py", "def recipe(fn):\n    return fn()\n")
+    snapshots = []
+    for version in ("TILE = 64\n", "TILE = 128\n"):
+        kernel.write_text(version)
+        output = tmp_path / str(len(snapshots))
+        output.mkdir()
+        recorder = records.Recorder(tmp_path, output).install()
+        recorder.scoped = True
+        executor = None
+        def cached():
+            nonlocal executor
+            if executor is None:
+                ir = fake_cutlass.generate_original_ir(None)[0]
+                # Model the immutable source set produced by frontend tracing.
+                recorder.modules[id(ir)]["source_reads_sha256"]["kernel.py"] = records.digest(kernel.read_bytes())
+                executor = fake_cutlass.compile_and_cache(None, ir)
+            return executor
+        try:
+            for name, family in (("a", family_a), ("b", family_b)):
+                program = recorder.construct(family.recipe, cached)
+                program.export_to_c(output, name)
+            snapshots.append({name: recorder.exports[name + ".o"]["source_reads_sha256"] for name in ("a", "b")})
+            assert "family_a.py" not in snapshots[-1]["b"]
+        finally:
+            stop_recorder(recorder)
+    assert all(snapshots[0][name]["kernel.py"] != snapshots[1][name]["kernel.py"] for name in ("a", "b"))
+
+
+@pytest.mark.parametrize("order", [(0, 1), (1, 0)])
+def test_program_merge_matches_serial_bytes_and_checksums(tmp_path, order):
+    spec = importlib.util.spec_from_file_location("merge_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    manifest = {"schema": 1, "families": {"x": {}}, "capability": [12, 0], "programs": []}
+    catalog = {"manifest": manifest, "programs": [
+        {"name": "a", "labels": ["a_sm170", "a_sm188"]}, {"name": "b", "labels": ["b"]}]}
+    def write_part(directory, groups):
+        directory.mkdir()
+        labels = [label for group in groups for label in group["labels"]]
+        programs = [{"name": group["name"], "plans": group["labels"]} for group in groups]
+        (directory / "dsv4_programs.json").write_text(json.dumps({**manifest, "programs": programs}, indent=2) + "\n")
+        (directory / "program-records.json").write_text(json.dumps(
+            {label + ".o": {"object_sha256": label} for label in labels}, indent=2, sort_keys=True) + "\n")
+        (directory / "comparison-plans.json").write_text(json.dumps({label: {"geometry": {}} for label in labels}, indent=2) + "\n")
+        (directory / "comparison-context.json").write_text(json.dumps({"seconds": 1, "source_reads_sha256": {"x": "hash"}}))
+        (directory / "dsv4_programs.h").write_text("\n".join([
+            "#pragma once", *[f'#include "{label}.h"' for label in labels], "#define CUTEAFD_DSV4_CC_MINOR 0",
+            "#define CUTEAFD_DSV4_PROGRAMS " + ", ".join('{"' + group["name"] + '", entry}' for group in groups), ""]))
+        for label in labels:
+            (directory / (label + ".o")).write_bytes(label.encode())
+            (directory / (label + ".h")).write_text("header " + label)
+    serial, merged = tmp_path / "serial", tmp_path / "merged"
+    write_part(serial, catalog["programs"])
+    parts = [tmp_path / str(index) for index in range(2)]
+    for index, part in enumerate(parts):
+        write_part(part, catalog["programs"][index:index + 1])
+    merged.mkdir()
+    publisher.merge_program_shards(catalog, [parts[index] for index in order], merged)
+    for path in serial.iterdir():
+        if path.name != "comparison-context.json":
+            assert path.read_bytes() == (merged / path.name).read_bytes()
+            assert records.digest(path.read_bytes()) == records.digest((merged / path.name).read_bytes())
+    with pytest.raises(ValueError, match="cover catalog"):
+        missing = tmp_path / "missing"
+        missing.mkdir()
+        publisher.merge_program_shards(catalog, parts[:1], missing)
+
+
+def test_static_import_closure_is_independent_of_import_execution(tmp_path):
+    package = tmp_path / "third_party/sparkinfer/b12x"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "kernel.py").write_text("from .helper import TILE\n")
+    (package / "helper.py").write_text("TILE = 64\n")
+    recorder = records.Recorder(tmp_path, tmp_path / "output")
+    recorder.scoped = True
+    recorder.frames.add("third_party/sparkinfer/b12x/kernel.py")
+    reads = recorder.reads()
+    helper = "third_party/sparkinfer/b12x/helper.py"
+    assert reads[helper] == records.digest(b"TILE = 64\n")
+    (package / "helper.py").write_text("TILE = 128\n")
+    with pytest.raises(ValueError, match="recorded source changed"):
+        recorder.validate_sources()
