@@ -300,10 +300,21 @@ pub struct Fp8MoeSegment {
     pub act_row_bytes: u32,
 }
 
+impl Fp8MoeInfo {
+    /// The streamed arithmetic of this package's row-addressed programs.
+    pub fn segment_arithmetic(&self, act_row_bytes: u32) -> Result<cuteafd_core::spark_executions::SegmentArithmetic> {
+        use cuteafd_core::spark_executions::SegmentArithmetic;
+        Ok(match self.weights {
+            Fp8MoeWeights::Nvfp4 => SegmentArithmetic::Nvfp4A4 { slice: self.slice.try_into()? },
+            _ => SegmentArithmetic::Stream { act_row_bytes },
+        })
+    }
+}
+
 fn segment_scratch(info: &Fp8MoeInfo, segments: &[Fp8MoeSegment], rows: u32) -> Result<usize> {
     segments.iter().map(|segment| {
         cuteafd_core::spark_executions::segment_scratch_bytes(info.hidden.try_into()?, info.experts.try_into()?,
-            info.topk.try_into()?, segment.act_row_bytes, rows, segment.maximum_rows)
+            info.topk.try_into()?, info.segment_arithmetic(segment.act_row_bytes)?, rows, segment.maximum_rows)
             .context("invalid segmented scratch extent").and_then(|bytes| Ok(usize::try_from(bytes)?))
     }).collect::<Result<Vec<_>>>()?.into_iter().max().context("package has no segmented stream")
 }
@@ -382,15 +393,21 @@ impl Fp8MoeMetadata {
             ensure!(unsafe { segment_info(form.option(), &mut maximum, &mut minimum, &mut act_row_bytes) } == 0,
                 "FP8 segment info query failed");
             if maximum == 0 { continue; }
-            ensure!(metadata.info.wire_input && matches!(metadata.info.weights, Fp8MoeWeights::Fp8 | Fp8MoeWeights::Mxfp4 | Fp8MoeWeights::Mxfp8)
-                && maximum == cuteafd_core::spark_executions::SEGMENT_MAX_ROWS
+            // Wire FP8/MXFP4/MXFP8 streams, or calibrated NVFP4 W4A4 over BF16 rows.
+            let stream = match metadata.info.weights {
+                Fp8MoeWeights::Fp8 | Fp8MoeWeights::Mxfp4 | Fp8MoeWeights::Mxfp8 => metadata.info.wire_input,
+                Fp8MoeWeights::Nvfp4 => !metadata.info.wire_input,
+                // Dynamic (Inkling) NVFP4 has no row-addressed program yet.
+                Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4Dynamic => false,
+            };
+            ensure!(stream && maximum == cuteafd_core::spark_executions::SEGMENT_MAX_ROWS
                 && minimum > 0 && minimum <= 4096 && act_row_bytes > 0,
                 "invalid segmented stream metadata");
             metadata.segments.push(Fp8MoeSegment { form, maximum_rows: maximum, minimum_rows: minimum, act_row_bytes });
         }
         if !metadata.segments.is_empty() {
             ensure!(metadata.segments.len() == 3, "segmented package must describe every arithmetic form");
-            for rows in [1u32, 4096, 8256, cuteafd_core::spark_executions::SEGMENT_MAX_ROWS] {
+            for rows in [1u32, 4096, 5504, cuteafd_core::spark_executions::SEGMENT_MAX_ROWS] {
                 let mut bytes = 0u64;
                 // SAFETY: the static query writes one live u64; no allocation or CUDA work.
                 ensure!(unsafe { segment_bytes(rows, &mut bytes) } == 0,

@@ -101,7 +101,18 @@ POINTERS = 11
 INFO_WORDS = 18
 # Large-row program forms, in cuteafd_fp8moe_set_options order.
 FORMS = ("auto", "w8a16", "w8a8")
-SEGMENT_MAX_ROWS = 4 * 4096
+SEGMENT_MAX_ROWS = 2 * 4096  # two merged units (cuteafd_core::spark_executions::SEGMENT_MAX_ROWS)
+
+
+def segmented_forms(g, wire: bool, fused: bool) -> tuple[str, ...]:
+    """Large-row forms of a Spark package's row-addressed (merged-wave) program:
+    every form of an FP8/MXFP4 wire stream; one program for calibrated NVFP4
+    W4A4 over BF16 rows, whose arithmetic has no forms (the bridge answers every
+    form with it). Fused gate/up only: the engine's segment scratch formula is
+    the fused region list."""
+    if g.weights in ("fp8", "mxfp4"):
+        return FORMS if wire else ()
+    return ("auto",) if g.kind == "nvfp4a4" and not wire and fused else ()
 
 
 def core_variants(role: str, weights: str, build_kind: str = "development") -> tuple[bool, ...]:
@@ -313,9 +324,16 @@ extern "C" int32_t cuteafd_fp8moe_segment_scratch_bytes(uint32_t rows, uint64_t*
     if (!p.segmented) continue;
     const uint64_t bound = uint64_t(p.capacity) * kInfo[4];
     const uint64_t max_tiles = (bound + 127u) / 128u + (bound < kInfo[3] ? bound : kInfo[3]);
+    const uint64_t padded = tiles * 128u;
+    // Calibrated NVFP4 W4A4 (storage 4/8, fused): packed input and act rows with
+    // their E4M3 scales; other streams: one activation row per routed pair.
+    const uint32_t storage = (kInfo[0] >> 8) & 0xffu;
+    const uint64_t middle = (storage == 4u || storage == 8u)
+        ? align(padded * kInfo[1] / 2u) + align(padded * kInfo[1] / 16u)
+          + align(padded * kInfo[2] / 2u) + align(padded * kInfo[2] / 16u)
+        : align(padded * p.act_row_bytes);
     const uint64_t size = align(4u * (4u + 3u * kInfo[3] + max_tiles))
-        + 2u * align(4u * pairs) + align(tiles * 128u * p.act_row_bytes)
-        + align(pairs * kInfo[1] * 2u);
+        + 2u * align(4u * pairs) + middle + align(pairs * kInfo[1] * 2u);
     if (size > *bytes) *bytes = size;
   }}
   return *bytes ? cudaSuccess : cudaErrorInvalidValue;
@@ -635,8 +653,8 @@ def build(args: argparse.Namespace) -> None:
             forms = [(c, "auto") for c in capacities]
             forms += [(c, form) for c in capacities for form in prefill_forms(g, c, wire)]
             exports = [(c, form, False) for c, form in forms]
-            if args.role == "spark" and wire and g.weights in ("fp8", "mxfp4"):
-                exports += [(SEGMENT_MAX_ROWS, form, True) for form in FORMS]
+            if args.role == "spark":
+                exports += [(SEGMENT_MAX_ROWS, form, True) for form in segmented_forms(g, wire, nvfp4_a4_fused())]
             exports = [(c, f, s, core) for c, f, s in exports
                        for core in core_variants(args.role, g.weights, os.environ.get("CUTEAFD_BUILD_KIND", "development"))]
             for capacity, form, segmented, core_only in ([] if reused else exports):
@@ -650,7 +668,7 @@ def build(args: argparse.Namespace) -> None:
                 if checked["argument_count"] != POINTERS + 2:
                     raise ValueError(f"{stem}: unexpected ABI arity {checked['argument_count']}")
                 programs.append({"stem": stem, "capacity": capacity, "entry": checked["symbol"], "form": form,
-                                 "scratch": (fp8_moe_segment_scratch_bytes(g, capacity, capacity, form) if segmented
+                                 "scratch": (fp8_moe_segment_scratch_bytes(g, capacity, capacity, form, wire=wire) if segmented
                                              else fp8_moe_scratch_bytes(g, "auto", capacity, wire, form)),
                                  "segmented": segmented, "core_only": core_only,
                                  "minimum_rows": auto_large_rows(wire, g.kind, form) + 1 if segmented else 0,

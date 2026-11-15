@@ -246,7 +246,7 @@ impl<'a> Weights<'a> {
                 for (group, experts) in experts.iter().enumerate() {
                     bindings.extend(experts.layers.iter().enumerate().map(|(index, layer)| (layer.layer, group, index)));
                     let mut worker = Fp8Worker::with_extent(library, experts.clone(), config.capacity, Some(scratch.clone()), Some(extent))?;
-                    worker.prepare_segments(extent)?;
+                    worker.prepare_waves(extent)?;
                     if let Some(first) = workers.first() { worker.share_owner(first); }
                     workers.push(worker);
                 }
