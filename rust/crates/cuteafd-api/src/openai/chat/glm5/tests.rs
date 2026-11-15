@@ -155,10 +155,10 @@ fn snapshot_loading_reads_template_eos_and_special_tokens() {
 
 #[test]
 fn served_snapshot_template_matches_the_fixture_when_present() {
-    let snapshot = std::path::Path::new("/mnt/sparknest/hf-home/hub/models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-v1/snapshots/47af23347db743b4666d952e2eb48f2b01c3fede");
-    if !snapshot.exists() { return; }
+    let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required")).join("hub/models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-v1/snapshots/47af23347db743b4666d952e2eb48f2b01c3fede");
+    assert!(snapshot.exists(), "required installed snapshot missing: {}", snapshot.display());
     assert_eq!(std::fs::read_to_string(snapshot.join("chat_template.jinja")).unwrap(), EXL3_K4);
-    assert_eq!(GlmEncoding::from_snapshot(snapshot).unwrap().tokens(), &GlmTokenIds::glm5());
+    assert_eq!(GlmEncoding::from_snapshot(&snapshot).unwrap().tokens(), &GlmTokenIds::glm5());
 }
 
 mod vision_template {
@@ -425,10 +425,10 @@ mod vision_template {
 
     #[test]
     fn installed_official_and_mc_templates_follow_vision_policy_when_present() {
-        let root = Path::new("/mnt/sparknest/hf-home/hub");
+        let root = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required")).join("hub");
         let official = root.join("models--zai-org--GLM-5.3-Flash/snapshots/eb9eb208eb0d988989d07a6a12d0fdeb5f52574a");
         let mc = root.join("models--wrldsuksgo2mars--GLM-5.3-Flash-EXL3-K4-MC/snapshots/91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d");
-        if !official.is_dir() || !mc.is_dir() { return; }
+        assert!(official.is_dir() && mc.is_dir(), "required official and MC checkpoints missing");
         for snapshot in [&official, &mc] {
             let encoding = GlmEncoding::from_snapshot_for_vision(snapshot, None, None).unwrap();
             assert_eq!(encoding.template_provenance().unwrap().selection, "checkpoint");

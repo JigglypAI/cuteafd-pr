@@ -9,7 +9,7 @@ pub(crate) fn fixture(
 ) -> Result<OfficialV41Catalog> {
     let mut config = mimo_flash_config();
     config["hidden_size"] = 128.into();
-    config["n_routed_experts"] = 64.into();
+    config["n_routed_experts"] = 12.into();
     config["num_experts_per_tok"] = 2.into();
     config["moe_intermediate_size"] = 1024.into();
     config["num_hidden_layers"] = 3.into();
@@ -24,7 +24,7 @@ pub(crate) fn fixture(
         }});
     }
     let mut tensors = Vec::new();
-    for expert in 0..64 {
+    for expert in 0..12 {
         for (projection, rows, columns) in
             [("gate", 1024, 128), ("up", 1024, 128), ("down", 128, 1024)]
         {
@@ -37,7 +37,7 @@ pub(crate) fn fixture(
         }
     }
     // A later BF16 package shares the same rank arena as the quantized group.
-    for expert in 0..64 {
+    for expert in 0..12 {
         for (projection, rows, columns) in
             [("gate", 1024, 128), ("up", 1024, 128), ("down", 128, 1024)]
         {
@@ -61,7 +61,7 @@ pub(crate) fn fixture(
     for layer in [1, 2] {
         let tensors = tensors.for_layer_metadata(layer)?;
         for projection in Fp8Projection::ALL {
-            for expert in 0..64 {
+            for expert in 0..12 {
                 for name in source_names(&tensors, layer, expert, projection) {
                     let (source, dtype) = tensors.push_source(&name)?;
                     let image = if dtype == DType::F32 && source.bytes == 4 {

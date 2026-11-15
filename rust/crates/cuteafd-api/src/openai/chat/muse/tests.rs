@@ -140,8 +140,8 @@ fn stop_tokens_are_the_generation_config_eos() {
 fn served_snapshot_matches_the_fixture_when_present() {
     let snapshots = std::path::Path::new(
         "/mnt/sparknest/hf-home/hub/models--meta-models--Muse-Spark-Open-816B-A42B/snapshots");
-    let Ok(mut entries) = std::fs::read_dir(snapshots) else { return };
-    let Some(Ok(snapshot)) = entries.next() else { return };
+    let mut entries = std::fs::read_dir(snapshots).expect("installed Muse snapshots");
+    let snapshot = entries.next().expect("installed Muse snapshot").expect("read installed Muse snapshot");
     let snapshot = snapshot.path();
     assert_eq!(std::fs::read_to_string(snapshot.join("chat_template.jinja")).unwrap(), TEMPLATE);
     assert_eq!(MuseEncoding::from_snapshot(&snapshot).unwrap().tokens(), encoding().tokens());

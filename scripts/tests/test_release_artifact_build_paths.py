@@ -172,22 +172,11 @@ def _fake_source(root: Path) -> Path:
 
 
 @pytest.fixture
-def scratch():
-    """A probeable working directory for a real build-filesystem guard run.
-
-    The guard resolves each path's mount through findmnt, and a sandboxed or
-    private /tmp has no resolvable filesystem entry, so pytest's default temporary
-    directory makes the real `assert-build-filesystem.py` call fail closed before
-    the behaviour under test is reached. This checkout's cache directory is on the
-    root filesystem and is ignored by the release source inventory.
-    """
-    root = REPO / ".cuteafd-cache" / "test-release-artifact-build-paths"
-    shutil.rmtree(root, ignore_errors=True)
-    root.mkdir(parents=True, exist_ok=True)
-    try:
-        yield root
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
+def scratch(tmp_path):
+    """A private root under the gate basetemp, never the live checkout."""
+    root = tmp_path / "artifact-build-paths"
+    root.mkdir()
+    return root
 
 
 def test_relocated_cargo_target_is_where_the_daemon_is_installed(scratch):

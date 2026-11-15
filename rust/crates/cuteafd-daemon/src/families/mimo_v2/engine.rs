@@ -4054,20 +4054,14 @@ mod tests {
                 // Independent reference: the original full-table generator.
                 let inv: Vec<f32> = (0..dim / 2).map(|i|
                     1.0 / (theta as f32).powf((2 * i) as f32 / dim as f32)).collect();
-                let mut table = vec![0f32; max_context * dim];
-                for p in 0..max_context {
-                    for (i, f) in inv.iter().enumerate() {
-                        let angle = p as f32 * f;
-                        table[p * dim + i] = angle.cos();
-                        table[p * dim + dim / 2 + i] = angle.sin();
-                    }
-                }
                 for (row, &p) in positions.iter().enumerate() {
                     assert_eq!(i64::from_ne_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap()), p);
                     let base = rows * 8 + (kind * rows + row) * dim * 4;
                     for i in 0..dim {
                         let actual = u32::from_ne_bytes(packed[base + i * 4..base + i * 4 + 4].try_into().unwrap());
-                        assert_eq!(actual, table[p as usize * dim + i].to_bits(), "theta={theta} p={p} i={i}");
+                        let angle = p as f32 * inv[i % (dim / 2)];
+                        let expected = if i < dim / 2 { angle.cos() } else { angle.sin() };
+                        assert_eq!(actual, expected.to_bits(), "theta={theta} p={p} i={i}");
                     }
                 }
             }

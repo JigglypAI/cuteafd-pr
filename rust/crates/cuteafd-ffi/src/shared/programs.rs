@@ -684,14 +684,9 @@ mod tests {
             }
         }
         assert_eq!(entries.len(), 18);
-        let root = std::path::PathBuf::from(std::env::var_os("CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR")
-            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
-                .join(".cache/cuteafd/builds/manifest-loader").into_os_string()))
-            .join(format!("reply-manifest-{}", std::process::id()));
-        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        assert!(std::process::Command::new("python3").arg(repo.join("scripts/build/assert-build-filesystem.py"))
-            .arg(&root).status().unwrap().success());
-        std::fs::create_dir_all(&root).unwrap();
+        let parent = std::path::PathBuf::from(std::env::var_os("TMPDIR").expect("test TMPDIR"));
+        let directory = tempfile::tempdir_in(parent).unwrap();
+        let root = directory.path();
         let manifest = root.join("PROGRAMS.json");
         let source = root.join("mock.c");
         let shared = root.join("mock.so");
@@ -743,7 +738,6 @@ int cuteafd_dsv4_program_launch(unsigned i, void **p, uint64_t *s, void *stream)
         std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries})).unwrap()).unwrap();
         assert!(library.programs().unwrap().with_manifest(&manifest).is_err());
         drop(library);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

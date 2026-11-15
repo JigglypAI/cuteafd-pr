@@ -299,6 +299,13 @@ for its entire invocation, including container creation, native cache keys and
 sealed metadata, so a concurrent default-tag move cannot change its build inputs.
 Versioned `tc-*` image tags remain available for older checkouts.
 
+The host-only environment overrides `CUTEAFD_SPARKNEST_RUN_DIR` and
+`CUTEAFD_FUSE_SYSFS_ROOT` select the source directories for the optional
+read-only SparkNest control and FUSE connection mounts (defaults
+`/srv/sparknest/run` and `/sys/fs/fuse/connections`). Container destinations
+remain unchanged. Tests seed private directories through the shared fixture;
+these are not `KEY=VALUE` launch-config keys.
+
 ## Hardware placement
 
 | Key | Default | Values | Notes |

@@ -377,7 +377,7 @@ mod tests {
         use cuteafd_loader::plan::{testing, checkpoint::{CheckpointView, CoreView},
             families::step5::{Config, exl3}};
         let root = tempfile::tempdir()?;
-        testing::write_step5_exl3_snapshot(root.path());
+        testing::write_step5_exl3_snapshot_layers(root.path(), &[3]);
         let source = Checkpoint::open(root.path())?;
         let cfg = Config::parse(&source)?;
         let tensors = source.tensors.iter().map(|t| (t.meta.name.clone(),

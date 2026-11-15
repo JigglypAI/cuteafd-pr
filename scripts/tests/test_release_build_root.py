@@ -25,6 +25,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import shutil
+import sys
 import subprocess
 from pathlib import Path
 
@@ -32,9 +33,6 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 SIBLING = REPO / "scripts" / "tests" / "test_release_artifact_build_paths.py"
-# Root NVMe, workspace-local and excluded from the release source inventory
-# (.cuteafd-cache is in the manifest tool's ignored names).
-SCRATCH = REPO / ".cuteafd-cache" / ("test-release-build-root-" + os.environ.get("PYTEST_XDIST_WORKER", "main"))
 
 
 def _load_harness():
@@ -48,9 +46,8 @@ HARNESS = _load_harness()
 
 
 @pytest.fixture(autouse=True)
-def _clean_scratch():
-    yield
-    shutil.rmtree(SCRATCH, ignore_errors=True)
+def _clean_scratch(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "SCRATCH", tmp_path / "build-roots", raising=False)
 
 
 def _recording_shims(log: Path, guard_log: Path) -> dict[str, str]:

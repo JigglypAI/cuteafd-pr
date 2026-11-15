@@ -83,7 +83,7 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
     current = capture(ROOT, case)
     assert [c["host"] for c in current["containers"]] == [c["host"] for c in golden["containers"]]
     for old, new in zip(golden["containers"], current["containers"]):
-        before, after = namespace_launch_contract(parse_run(old["argv"])), parse_run(new["argv"])
+        before, after = namespace_launch_contract(parse_run(old["argv"])), parse_run([arg.replace(os.environ["CUTEAFD_FUSE_SYSFS_ROOT"], "/sys/fs/fuse/connections").replace(os.environ["CUTEAFD_SPARKNEST_RUN_DIR"], "/srv/sparknest/run") for arg in new["argv"]])
         role = "coordinator" if old["host"] == "raptor" else "worker"
         where = f"{case} {old['host']}"
         expected_options = []

@@ -597,6 +597,8 @@ release_trim() {
 # Self-contained so remote launchers can send this function to the worker host.
 release_serving_docker_args() {
   local user group primary_group
+  local sparknest_run="${CUTEAFD_SPARKNEST_RUN_DIR:-/srv/sparknest/run}"
+  local fuse_root="${CUTEAFD_FUSE_SYSFS_ROOT:-/sys/fs/fuse/connections}"
   local -a groups=()
   user="$(id -un)"
   primary_group="$(id -g)"
@@ -610,13 +612,13 @@ release_serving_docker_args() {
     -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor)
   # ADR-052's dedicated directory survives socket replacement on daemon restart.
   # Never create it here: absent storage stays unknown without root-owned state.
-  if [[ -d /srv/sparknest/run ]]; then
-    RELEASE_SERVING_ARGS+=(--mount type=bind,src=/srv/sparknest/run,dst=/srv/sparknest/run,readonly)
+  if [[ -d "$sparknest_run" ]]; then
+    RELEASE_SERVING_ARGS+=(--mount type=bind,src="$sparknest_run",dst=/srv/sparknest/run,readonly)
   fi
   # FUSE connection limits (max_background): mapped tables read from a remote
   # FUSE copy keep at most that many reads in flight. Read-only, host uid owned.
-  if [[ -d /sys/fs/fuse/connections ]]; then
-    RELEASE_SERVING_ARGS+=(--mount type=bind,src=/sys/fs/fuse/connections,dst=/sys/fs/fuse/connections,readonly)
+  if [[ -d "$fuse_root" ]]; then
+    RELEASE_SERVING_ARGS+=(--mount type=bind,src="$fuse_root",dst=/sys/fs/fuse/connections,readonly)
   fi
   # Docker's numeric --user otherwise drops groups used by host access checks.
   for group in "${groups[@]}"; do

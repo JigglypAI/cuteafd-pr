@@ -355,7 +355,7 @@ mod tests {
             serving_capacity::WeightArenaLayout};
         let root = tempfile::tempdir()?;
         let snapshot = root.path().join("snapshot");
-        cuteafd_loader::plan::testing::write_step5_exl3_snapshot(&snapshot);
+        cuteafd_loader::plan::testing::write_step5_exl3_snapshot_layers(&snapshot, &[3]);
         let checkpoint = Checkpoint::open(&snapshot)?;
         let inputs = RuntimeInputs { graph_layout: None, decode_graphs: false,
             bf16_target_head: cuteafd_loader::placement::planner::serving::BlasHead::TensorLt,
