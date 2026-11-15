@@ -31,6 +31,36 @@ impl<'a> Resident<'a> {
             "Inkling resident adapter requires a whole native K32 backend");
         Ok(Self { layer, backend: Rc::new(std::cell::RefCell::new(backend)), stream })
     }
+    /// Bind already committed push payloads through the shared whole executor;
+    /// there is no load/mount fallback and no duplicate family weight arena.
+    pub fn from_pushed(stream: Rc<Stream<'a>>, catalog: &cuteafd_loader::OfficialV41Catalog,
+        native_lib: &Path, backing: &cuteafd_loader::placement::families::inkling2::LocalBacking,
+        rows: usize, pushed: crate::shared::experts::rtx::push::PushedExperts<'a>) -> Result<Vec<Self>> {
+        use crate::shared::experts::rtx::{exl3::Exl3Tp2, whole::Whole, RtxExpertLayer, RtxSelectionPolicy};
+        ensure!(backing.gpu == 0 && !backing.layers.is_empty(), "Inkling whole backend differs from selected rank");
+        let workspace = backing.workspace.iter().try_fold(0usize, |bytes, (_, size)|
+            bytes.checked_add(usize::try_from(*size)?).context("Inkling resident workspace overflow"))?;
+        let budget = backing.arena.bytes().checked_add(workspace).context("Inkling resident owner budget overflow")?;
+        let device = stream.device;
+        let backend: Box<dyn RtxExpertLayer + 'a> = match pushed {
+            crate::shared::experts::rtx::push::PushedExperts::Fp8(layers) => {
+                let tensors = catalog.fp8().context("Inkling native pushed catalog absent")?
+                    .for_layer_metadata(backing.layers[0])?;
+                let package = crate::shared::experts::fp8::package_directory(native_lib, 1, tensors.format());
+                Box::new(Whole::from_pushed(device, &tensors, &package, backing.layers.clone(), rows, budget, layers)?)
+            }
+            crate::shared::experts::rtx::push::PushedExperts::Exl3(layers) => {
+                let package = native_lib.parent().context("Inkling native lib directory absent")?
+                    .join("exl3/exl3-inkling2-k45/rtx-tp1");
+                Box::new(Exl3Tp2::pushed_whole_weights(device, catalog, &package, backing.layers.clone(), rows,
+                    budget, RtxSelectionPolicy::FirstCapacity, layers)?.execution()?)
+            }
+            _ => anyhow::bail!("Inkling pushed backend storage differs from its selected native/MC catalog"),
+        };
+        ensure!(backend.workspace_bytes() == workspace, "Inkling resident workspace differs from admitted physical requests");
+        Self::for_layers(backend, stream)
+    }
+
     /// All admitted layers of one backend share its single physical scratch
     /// and output owner; handles never instantiate a backend per layer.
     pub fn for_layers(backend: Box<dyn crate::shared::experts::rtx::RtxExpertLayer + 'a>,

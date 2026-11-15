@@ -65,6 +65,10 @@ def test_arenas_are_single_backings_and_head_is_shared():
     assert 'DeviceWeightArena::new' in weights and 'DenseLoad::mount' in weights
     assert 'DeviceWeightArena::new' in experts and 'DenseLoad::mount' in experts
     assert 'dequant' not in experts.lower()
+    resident = experts.split('pub fn from_pushed(')[1].split('/// All admitted layers')[0]
+    assert 'Whole::from_pushed(' in resident and 'Exl3Tp2::pushed_whole_weights(' in resident
+    assert 'backend.workspace_bytes() == workspace' in resident
+    assert 'Whole::load(' not in resident and 'load_whole_weights(' not in resident
     push = weights.split('pub fn record_push(')[1].split('pub fn operand(')[0]
     assert 'Finish::PaddedTranspose' in push
     assert 'CoordinatorPush::prepare_view_admitted' in weights
