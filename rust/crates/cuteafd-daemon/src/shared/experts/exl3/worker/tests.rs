@@ -230,3 +230,119 @@ fn deferred_exl3_requests_publish_their_timing_at_completion() {
     let backend = include_str!("../../service/backend.rs");
     assert!(backend.contains("Self::Exl3(execution) => execution.complete(),"));
 }
+
+/// Merged-wave correctness of EXL3 staging over a real installed Spark
+/// layout and its row-addressed segments program (#2191 EXL3): one layer of
+/// real checkpoint weights for this TP rank; mapped FP8 K32 frames staged
+/// and flushed as one wave must write every member's reply byte-identical to
+/// that unit run alone through the same worker. One Spark.
+#[test]
+#[ignore = "requires an SM121 Spark, CUTEAFD_NATIVE_LIB, CUTEAFD_EXL3_SNAPSHOT, CUTEAFD_EXL3_LAYOUT (a Spark package layout directory with m8192-segments), CUTEAFD_EXL3_WORLD and CUTEAFD_EXL3_LAYER"]
+fn exl3_merged_waves_are_byte_identical_to_singleton_units() -> Result<()> {
+    use crate::shared::experts::layer::ExpertLayer;
+    use cuteafd_transport::{expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, ExpertProtocolV2Request,
+        ExpertProtocolV2RequestView, ExpertProtocolV2RowDescriptor, ExpertProtocolV2RouteEntry,
+        ExpertV2SourceKind, ProtocolV2RequestDevicePayload};
+    let catalog = cuteafd_loader::read_expert_catalog(Path::new(&std::env::var("CUTEAFD_EXL3_SNAPSHOT")?))?;
+    let geometry = catalog.routed_experts().geometry()?;
+    cuteafd_core::set_expert_geometry(geometry)
+        .map_err(|set| anyhow::anyhow!("process geometry already {set:?}; run this test alone"))?;
+    // SAFETY: this opt-in test accepts only operator-selected trusted build artifacts.
+    let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+    library.cuda_set_device(0)?;
+    let directory = std::path::PathBuf::from(std::env::var("CUTEAFD_EXL3_LAYOUT")?);
+    let world: usize = std::env::var("CUTEAFD_EXL3_WORLD")?.parse()?;
+    let layer: usize = std::env::var("CUTEAFD_EXL3_LAYER")?.parse()?;
+    ensure!(Exl3Worker::segments_directory(&directory, Exl3Epilogue::Sum).is_some(),
+        "layout {} ships no m8192-segments program", directory.display());
+    let weights = Rc::new(vec![Exl3Weights::load(&library, &catalog,
+        ExpertLayer::BackboneExl3Tp { layer, rank: 0, world }, usize::MAX)?]);
+    let unit = 2752usize;
+    let extent = cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill,
+        capacity: unit as u32, compiled: 4096, staging_rows: unit as u32, buffered_units: 3 };
+    let mut worker = Exl3Worker::new(&library, weights, &directory, unit as u32, usize::MAX,
+        Exl3Schedule::default(), Exl3Epilogue::Sum)?;
+    worker.defer(3, unit, cuteafd_core::ExecutionOwner::Prefill)?;
+    worker.prepare_waves(extent)?;
+    ensure!(worker.waves.is_some() && worker.segments.is_some(), "prefill owner did not prepare merged waves");
+    worker.bind_layer(0)?;
+    let executor = worker.executor_id;
+    let (hidden, topk, experts) = (geometry.hidden as usize, geometry.topk as usize, geometry.experts as usize);
+    let pitch = hidden + hidden / 32;
+    let prefix = EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
+    let rows = [2752u32, 2752, 2487, 1900, 333];
+    let mut frames = Vec::new();
+    let mut replies = Vec::new();
+    for (index, &count) in rows.iter().enumerate() {
+        // Slots 0/1 on two hot experts (multi-block groups shared by every
+        // member); the rest distinct experts per row.
+        let ids = (0..count as usize * topk).map(|route| {
+            let (row, slot) = (route / topk, route % topk);
+            if slot < 2 { slot as u32 } else {
+                (2 + (row * 13 + index * 29 + (slot - 2) * ((experts - 2) / topk).max(1)) % (experts - 2)) as u32 }
+        }).collect::<Vec<_>>();
+        // FP8 E4M3 values with in-range UE8M0 scales (2^-8..2^-1).
+        let mut wire = vec![0u8; count as usize * pitch];
+        for (row, bytes) in wire.chunks_exact_mut(pitch).enumerate() {
+            for (column, value) in bytes[..hidden].iter_mut().enumerate() {
+                let code = ((row * 31 + column * 7 + index * 977) % 110) as u8 + 8;
+                *value = if (row + column) % 3 == 0 { code | 0x80 } else { code };
+            }
+            for (group, scale) in bytes[hidden..].iter_mut().enumerate() { *scale = 119 + ((row + group + index) % 8) as u8; }
+        }
+        let mut owned = ExpertProtocolV2Request::new(700 + index as u64, 17, layer as u32, geometry.hidden,
+            ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+            (0..count).map(|row| ExpertProtocolV2RowDescriptor { row_id: u64::from(row),
+                source_kind: ExpertV2SourceKind::Prefill, source_request_id: index as u64,
+                token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32 }).collect(),
+            ids.iter().enumerate().map(|(route, &expert_id)| ExpertProtocolV2RouteEntry {
+                row_index: (route / topk) as u32, expert_id,
+                gate_weight: ((route % topk + 1 + index) as f32) / 32.0 }).collect(), wire)?;
+        owned.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        let encoded = owned.encode()?;
+        let mut frame = HostAllocation::new(&library, encoded.len(), crate::shared::memory::TEST)?;
+        frame.bytes_mut().copy_from_slice(&encoded);
+        frames.push(frame);
+        replies.push(HostAllocation::new(&library, prefix + count as usize * hidden * 2 + 64, crate::shared::memory::TEST)?);
+    }
+    let mut exchange = HostExpertExchange::new(unit as u32)?;
+    let mut run = |members: &[usize], worker: &mut Exl3Worker<'_>| -> Result<Vec<Vec<u8>>> {
+        for &member in members {
+            replies[member].bytes_mut().fill(0xa5);
+            let view = ExpertProtocolV2RequestView::parse(frames[member].bytes())?;
+            let request = BackboneRequest::parse(frames[member].bytes(), unit as u32)?;
+            let alias = library.cuda_host_buffer_device_alias(frames[member].buffer)?;
+            let mapped = ProtocolV2RequestDevicePayload {
+                hidden_payload: CuteafdDeviceBuffer { ptr: view.hidden_payload().as_ptr().cast_mut().cast(),
+                    bytes: view.hidden_payload().len(), ..alias }, execution_lane: 0,
+                response_slot: Some(library.cuda_host_buffer_device_alias(replies[member].buffer)?) };
+            // SAFETY: every frame and reply outlives the drain below.
+            unsafe { worker.execute_mapped_payload(&request, executor, &mut exchange, mapped)?; }
+        }
+        worker.flush_staged()?;
+        worker.synchronize()?;
+        while !worker.pending.is_empty() { ensure!(worker.unit_ready()?, "drained unit not ready"); worker.complete()?; }
+        members.iter().map(|&member| {
+            let end = prefix + rows[member] as usize * hidden * 2;
+            let bytes = replies[member].bytes();
+            ensure!(bytes[..prefix].iter().all(|&b| b == 0xa5) && bytes[end..].iter().all(|&b| b == 0xa5),
+                "reply guard overwritten");
+            Ok(bytes[prefix..end].to_vec())
+        }).collect()
+    };
+    let singles = (0..rows.len()).map(|member| run(&[member], &mut worker).map(|mut out| out.remove(0)))
+        .collect::<Result<Vec<_>>>()?;
+    for single in &singles { ensure!(single.chunks_exact(2).any(|w| w != [0, 0]), "zero singleton reply"); }
+    let merged_before = worker.waves.as_ref().unwrap().merged;
+    for pair in [[0usize, 1], [1, 2], [2, 3], [3, 0], [0, 4], [4, 2]] {
+        let merged = run(&pair, &mut worker)?;
+        for (position, &member) in pair.iter().enumerate() {
+            let different = merged[position].iter().zip(&singles[member]).filter(|(a, b)| a != b).count();
+            ensure!(different == 0, "members {pair:?}: member {member} differs in {different} bytes from its singleton");
+        }
+        eprintln!("EXL3 merged wave {:?} ({} rows): byte-identical to singletons", pair,
+            pair.iter().map(|&m| rows[m]).sum::<u32>());
+    }
+    ensure!(worker.waves.as_ref().unwrap().merged - merged_before == 6, "every pair must flush as one merged launch");
+    Ok(())
+}
