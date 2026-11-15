@@ -799,7 +799,7 @@ mod source_format_tests {
             "a miss is admitted by the device cache, not a sealed startup inventory");
         let capture = source.split_once("fn graph(&self, rank: usize, key: GraphKey")
             .expect("graph body").1;
-        assert!(capture.contains("drop(ticket)"),
+        assert!(capture.contains("cache_ticket_failed(ticket"),
             "every failed capture path cancels its ticket");
         assert!(!source.contains(concat!("note", "_eager(\"mimo_v2\"")),
             "the sealed startup policy and its miss inventory are gone");

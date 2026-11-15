@@ -417,7 +417,7 @@ mod device_tests {
         bank.cache_commit(1, Exec(drops.clone()), ticket, 7, 1, false);
         assert_eq!(drops.get(), 0, "raw first launch may still use the retained executable");
         assert!(bank.cached_launch(&1).is_some());
-        assert!(!bank.cache_needs_boundary());
+        assert!(bank.cache_needs_boundary(), "fallback credit awaits a recoverable physical sample");
         let snapshot = super::super::device::snapshots().into_iter().find(|row| row.device == 6).unwrap();
         assert_eq!(snapshot.charged, 10, "retained owner is conservatively charged");
         assert!(snapshot.hard_stopped);

@@ -1638,7 +1638,7 @@ mod tests {
         assert_eq!(cache.charged, 4 << 20, "failed sample conservatively charges the retained exec estimate");
         assert_eq!(cache.failed_measurement_credit, 2 << 20);
         assert!(!cache.records.contains_key(&b));
-        assert!(!cache.needs_boundary());
+        assert!(cache.needs_boundary(), "fallback credit requests a later physical reconciliation");
         assert!(cache.measurement_failed);
         fixture.configure_memory_usage(&library, 6, 64 << 20, 4 << 20)?;
         let shared = Arc::new(Mutex::new(cache));
