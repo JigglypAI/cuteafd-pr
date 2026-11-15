@@ -8,3 +8,4 @@ pub(crate) mod head;
 pub(crate) mod admission;
 pub(crate) mod golden;
 pub(crate) mod prefill;
+pub(crate) mod startup;
