@@ -210,6 +210,13 @@ impl<'a> Weights<'a> {
         modules: &mut super::modules::WarmModules<'a>,
         epilogue: Exl3Epilogue,
     ) -> Result<Execution<'_, 'a>> {
+        let remaining = if matches!(self, Self::Full(_) | Self::Exlr8(_)) {
+            let geometry = cuteafd_core::expert_geometry();
+            let waves = cuteafd_core::spark_executions::wave_staging_layout(extent, geometry.hidden * 33 / 32,
+                geometry.topk, 1).context("singleton staging layout overflow")?;
+            remaining.checked_sub(usize::try_from(waves.plane_bytes + waves.table_bytes)?)
+                .context("staged input plane and tables exceed device budget")?
+        } else { remaining };
         Ok(match self {
             Self::Exlr8(weights) => Execution::Exlr8(super::exlr8::Worker::new(library,
                 modules.exlr8()?, weights, config, remaining)?),
@@ -380,7 +387,9 @@ impl<'w, 'a> Execution<'w, 'a> {
     pub(super) fn prepare_waves(&mut self, extent: cuteafd_core::OwnerExtent) -> Result<()> {
         match self {
             Self::Exl3(execution) => execution.prepare_waves(extent),
-            Self::Fp8(_) | Self::Full(_) | Self::Exlr8(_) => Ok(()),
+            Self::Full(execution) => execution.prepare_waves(extent),
+            Self::Exlr8(execution) => execution.prepare_waves(extent),
+            Self::Fp8(_) => Ok(()),
         }
     }
 
@@ -392,14 +401,16 @@ impl<'w, 'a> Execution<'w, 'a> {
                 Ok(())
             }
             Self::Exl3(execution) => execution.flush_staged(),
-            Self::Full(_) | Self::Exlr8(_) => Ok(()),
+            Self::Full(execution) => execution.flush_staged(),
+            Self::Exlr8(execution) => execution.flush_staged(),
         }
     }
     pub(super) fn has_staged(&self) -> bool {
         match self {
             Self::Fp8(groups) => groups.workers.iter().any(|worker| worker.has_staged()),
             Self::Exl3(execution) => execution.has_staged(),
-            Self::Full(_) | Self::Exlr8(_) => false,
+            Self::Full(execution) => execution.has_staged(),
+            Self::Exlr8(execution) => execution.has_staged(),
         }
     }
     pub(super) fn cancel_staged(&mut self, input_address: usize) -> Result<bool> {
@@ -416,7 +427,8 @@ impl<'w, 'a> Execution<'w, 'a> {
                 Ok(false)
             }
             Self::Exl3(execution) => execution.cancel_staged(input_address),
-            Self::Full(_) | Self::Exlr8(_) => Ok(false),
+            Self::Full(execution) => execution.cancel_staged(input_address),
+            Self::Exlr8(execution) => execution.cancel_staged(input_address),
         }
     }
 

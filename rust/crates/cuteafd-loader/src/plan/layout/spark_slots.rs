@@ -347,10 +347,12 @@ fn mxfp4_owner_bytes(geometry: cuteafd_core::ExpertGeometry,
             scratch = scratch.checked_add(bytes).context("native width scratch sum overflow")?;
         }
     }
+    let waves = cuteafd_core::spark_executions::wave_staging_layout(extent, geometry.hidden * 33 / 32,
+        geometry.topk, 1).context("native staging layout overflow")?;
     Ok(cuteafd_core::OwnerBytes { scratch,
         io: u64::from(extent.capacity) * (u64::from(geometry.hidden) * 97 / 32
-            + u64::from(geometry.topk) * 8),
-        pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 })
+            + u64::from(geometry.topk) * 8) + waves.plane_bytes + waves.table_bytes,
+        pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 + waves.pinned_per_unit })
 }
 
 fn mxfp4_rank_artifacts(catalog: &crate::OfficialV41Catalog, working: &SparkWorkingSet,
@@ -414,7 +416,15 @@ pub(crate) fn owner_bytes(input: &super::super::PlanInput, working: &SparkWorkin
             (_, SparkBackend::Exl3(_)) if family == "muse_spark" => muse_owner_bytes(world, extent),
             (_, SparkBackend::Exl3(_)) if family == "mistral_large4" => ml4_owner_bytes(world, extent),
             (_, SparkBackend::Exl3(_)) => exl3_owner_bytes(&family, geometry, extent, segment_width),
-            (_, SparkBackend::Native | SparkBackend::V41 | SparkBackend::Exlr8 | SparkBackend::Fp8) =>
+            (_, SparkBackend::Exlr8) => {
+                let mut bytes = legacy_owner_bytes(&family, geometry, extent);
+                let waves = cuteafd_core::spark_executions::wave_staging_layout(extent, geometry.hidden * 33 / 32,
+                    geometry.topk, 1).context("EXLR8 staging layout overflow")?;
+                bytes.io += waves.plane_bytes + waves.table_bytes;
+                bytes.pinned_staging += waves.pinned_per_unit;
+                Ok(bytes)
+            }
+            (_, SparkBackend::Native | SparkBackend::V41 | SparkBackend::Fp8) =>
                 Ok(legacy_owner_bytes(&family, geometry, extent)),
         }
     })
@@ -539,9 +549,15 @@ mod tests {
                             geometry.experts as usize, geometry.topk as usize, a.logical, a.role, rows, coded).unwrap())
                         .sum::<u64>()).sum::<u64>();
                     assert_eq!(total.scratch, expected);
-                    assert_eq!(total.io, u64::from(live) * (u64::from(geometry.hidden) * 97 / 32 + u64::from(geometry.topk) * 8));
-                    assert_eq!(mxfp4_owner_bytes(geometry, &artifacts, coded,
-                        cuteafd_core::OwnerExtent { buffered_units: 3, ..shape })?, total);
+                    let waves = cuteafd_core::spark_executions::wave_staging_layout(shape, geometry.hidden * 33 / 32,
+                        geometry.topk, 1).unwrap();
+                    assert_eq!(total.io, u64::from(live) * (u64::from(geometry.hidden) * 97 / 32 + u64::from(geometry.topk) * 8)
+                        + waves.plane_bytes + waves.table_bytes);
+                    let buffered = mxfp4_owner_bytes(geometry, &artifacts, coded,
+                        cuteafd_core::OwnerExtent { buffered_units: 3, ..shape })?;
+                    assert_eq!(buffered.scratch, total.scratch);
+                    assert_eq!(buffered.io, total.io + 2 * waves.plane_bytes);
+                    assert_eq!(buffered.pinned_staging, total.pinned_staging);
                 }
             }
         }
@@ -901,7 +917,7 @@ mod tests {
                 charge_executions(&mut device, &input, &working, "deepseek_v41", &executions)?;
                 let find = |group| device.items.iter().find(|item| item.group == group).unwrap().bytes;
                 assert_eq!(find("execution owners"), prefill.scratch + prefill.io + 2 * (decode.scratch + decode.io));
-                assert_eq!(find("execution staging"), 2 * 64 * 6 * 8 + unit * waves * 6 * 8);
+                assert_eq!(find("execution staging"), 2 * 64 * 6 * 8 + unit * waves * (6 * 8 + 16));
             }
         }
         Ok(())

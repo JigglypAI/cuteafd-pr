@@ -189,7 +189,7 @@ fn load_weights<'a>(
     );
     // The workspace is planned from the same layer selection as the load, so a
     // TP2/TP3 topology cannot be budgeted with TP4 scratch.
-    let workspace = spark_execution_workspace(config, |live, compiled, staging_rows, _| {
+    let workspace = spark_execution_workspace(config, |live, compiled, staging_rows, extent| {
         let selections = layers.iter().map(|&layer| config.selection(layer)).collect::<Result<Vec<_>>>()?;
         let budget = ExpertWeights::plan_execution_layers(selections, library, compiled, live, nvfp4)?;
         let device = budget.total()?;
@@ -198,7 +198,11 @@ fn load_weights<'a>(
             .context("native Spark scratch overflow")?;
         let staging = (staging_rows as usize).checked_mul(cuteafd_core::expert_geometry().topk as usize * 8)
             .context("native Spark route staging overflow")?;
-        Ok((scratch, device - scratch, staging))
+        let geometry = cuteafd_core::expert_geometry();
+        let waves = cuteafd_core::spark_executions::wave_staging_layout(extent, geometry.hidden * 33 / 32,
+            geometry.topk, 1).context("native staging layout overflow")?;
+        Ok((scratch, device - scratch + usize::try_from(waves.plane_bytes + waves.table_bytes)?,
+            staging + usize::try_from(waves.pinned_per_unit)?))
     })?;
     let workspace = usize::try_from(workspace.total().context("native Spark workspace overflow")?)?;
     ensure!(

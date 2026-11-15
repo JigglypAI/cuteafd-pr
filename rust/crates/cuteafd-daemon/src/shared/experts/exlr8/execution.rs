@@ -474,7 +474,7 @@ impl<'a> Exlr8Execution<'a> {
         stream: *mut c_void,
     ) -> Result<()> {
         // SAFETY: inherited retained workspace/weights contract; BF16 keeps its original producer.
-        unsafe { self.run_to(weights, rows, None, stream) }
+        unsafe { self.run_to(weights, rows, None, None, stream) }
     }
 
     /// # Safety
@@ -492,11 +492,23 @@ impl<'a> Exlr8Execution<'a> {
             && output.bytes >= rows.checked_mul(stride).context("EXLR8 reply extent overflow")?,
             "EXLR8 fused reply buffer mismatch");
         // SAFETY: checked exclusive output, same retained sources as the BF16 path.
-        unsafe { self.run_to(weights, rows, Some((index, output)), stream) }
+        unsafe { self.run_to(weights, rows, Some((index, output)), None, stream) }
+    }
+
+    /// # Safety
+    /// The caller retains the staged input and route buffers, weights, workspace
+    /// and stream through the unit's completion fence.
+    pub(crate) unsafe fn run_staged(&self, weights: &Exlr8Weights<'_>, rows: usize,
+        inputs: [CuteafdDeviceBuffer; 3], stream: *mut c_void) -> Result<()> {
+        let row = self.layout.hidden * 33 / 32;
+        ensure!(inputs[0].bytes >= rows * row && inputs[1].bytes >= rows * self.layout.top_k * 4
+            && inputs[2].bytes >= rows * self.layout.top_k * 4, "EXLR8 staged input extent too small");
+        // SAFETY: forwarded retained-input contract; ordinary kernels use these pointer overrides.
+        unsafe { self.run_to(weights, rows, None, Some(inputs), stream) }
     }
 
     unsafe fn run_to(&self, weights: &Exlr8Weights<'_>, rows: usize,
-        reply: Option<(usize, CuteafdDeviceBuffer)>, stream: *mut c_void) -> Result<()> {
+        reply: Option<(usize, CuteafdDeviceBuffer)>, inputs: Option<[CuteafdDeviceBuffer; 3]>, stream: *mut c_void) -> Result<()> {
         ensure!(
             rows > 0 && rows <= self.layout.rows,
             "EXLR8 live rows exceed admission"
@@ -512,7 +524,7 @@ impl<'a> Exlr8Execution<'a> {
             "EXLR8 grouping expert count differs from residency"
         );
         self.routing.check(self.identity()?)?;
-        let buffers = [
+        let mut buffers = [
             self.buffer(0)?,
             self.buffer(1)?,
             self.buffer(2)?,
@@ -525,6 +537,7 @@ impl<'a> Exlr8Execution<'a> {
             self.buffer(9)?,
             self.buffer(10)?,
         ];
+        if let Some(inputs) = inputs { buffers[..3].copy_from_slice(&inputs); }
         let p = |i: usize| buffers[i].ptr;
         let intermediate = view(buffers[9], 0, self.intermediate_bytes)?;
         let fc2 = view(

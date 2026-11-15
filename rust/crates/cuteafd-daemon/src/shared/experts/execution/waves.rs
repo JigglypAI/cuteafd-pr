@@ -104,6 +104,7 @@ pub(crate) struct WaveStaging<'a> {
     rows: usize,
     /// Members below this many rows launch alone (the package's recipe bound).
     minimum_rows: usize,
+    max_units: usize,
     topk: usize,
     /// Per slot: `unit_rows` input addresses, then `unit_rows` output addresses.
     descriptors: Vec<HostAllocation<'a>>,
@@ -158,11 +159,18 @@ impl<'a> WaveStaging<'a> {
     /// `plane` holds every buffered unit's slice of `row_bytes`-wide rows.
     pub(crate) fn new(library: &'a NativeLibrary, extent: cuteafd_core::OwnerExtent, plane: CuteafdDeviceBuffer,
         row_bytes: usize, minimum_rows: usize) -> Result<Option<Self>> {
-        let (Some(rows), Some(staged)) = (extent.segment_rows(), extent.staged_rows()) else { return Ok(None) };
-        let (rows, unit_rows) = (rows as usize, extent.staging_rows as usize);
+        Self::with_max_units(library, extent, plane, row_bytes, minimum_rows, MAX_MERGED_UNITS)
+    }
+
+    pub(crate) fn with_max_units(library: &'a NativeLibrary, extent: cuteafd_core::OwnerExtent,
+        plane: CuteafdDeviceBuffer, row_bytes: usize, minimum_rows: usize, max_units: u32) -> Result<Option<Self>> {
         let topk = cuteafd_core::expert_geometry().topk as usize;
+        let layout = cuteafd_core::spark_executions::wave_staging_layout(extent, row_bytes.try_into()?,
+            topk.try_into()?, max_units).context("invalid wave staging layout")?;
+        if layout.rows == 0 { return Ok(None); }
+        let (rows, unit_rows) = (layout.rows as usize, extent.staging_rows as usize);
         ensure!(row_bytes > 0 && row_bytes % 16 == 0, "staged rows must be a nonzero multiple of 16 bytes");
-        ensure!((staged as usize).checked_mul(row_bytes).is_some_and(|bytes| bytes <= plane.bytes),
+        ensure!(usize::try_from(layout.plane_bytes).is_ok_and(|bytes| bytes <= plane.bytes),
             "staged input plane is smaller than every buffered unit");
         let device = device::Device { library, id: library.cuda_get_device()? };
         let units = extent.buffered_units as usize;
@@ -174,7 +182,7 @@ impl<'a> WaveStaging<'a> {
             library,
             copy_stream: Rc::new(LoadStream { library, raw: library.cuda_stream_create()? }),
             copied: (0..units).map(|_| device::Event::new(device)).collect::<Result<_>>()?,
-            plane, row_bytes, unit_rows, rows, minimum_rows: minimum_rows.max(1), topk, descriptors,
+            plane, row_bytes, unit_rows, rows, minimum_rows: minimum_rows.max(1), max_units: max_units as usize, topk, descriptors,
             device: [table(rows * 8)?, table(rows * topk * 4)?, table(rows * topk * 4)?, table(rows * 8)?],
             staged: Vec::with_capacity(units), staged_units: 0, flushes: 0, merged: 0, bypassed: 0,
         }))
@@ -238,7 +246,7 @@ impl<'a> WaveStaging<'a> {
         launch: &mut dyn FnMut(&Wave<'_>) -> Result<()>) -> Result<()> {
         if self.staged.is_empty() { return Ok(()) }
         let rows: usize = self.staged.iter().map(|unit| unit.identity.2 as usize).sum();
-        ensure!(rows <= self.rows && self.staged.len() <= MAX_MERGED_UNITS as usize,
+        ensure!(rows <= self.rows && self.staged.len() <= self.max_units,
             "staged wave exceeds admitted rows");
         self.flushes += 1;
         tracing::debug!(target: "cuteafd::spark_coalesce", staged_units = self.staged_units,
@@ -343,7 +351,7 @@ impl<'a> WaveStaging<'a> {
         tracing::debug!(target: "cuteafd::spark_coalesce", staged_units = self.staged_units,
             staged = self.staged.len(), rows, slot, "Spark unit copied and staged");
         let staged_rows = staged_rows_after(&self.staged);
-        let full = self.staged.len() == self.copied.len().min(MAX_MERGED_UNITS as usize) || staged_rows >= self.rows;
+        let full = self.staged.len() == self.copied.len().min(self.max_units) || staged_rows >= self.rows;
         if singleton || full { self.flush(pending, routes, stream, launch)?; }
         Ok(true)
     }
@@ -363,7 +371,7 @@ mod tests {
         assert!(stage.contains("if singleton {\n            tracing::debug!"));
         assert!(stage.contains("unit.layer != arrival.layer"));
         assert!(stage.contains("if staged_rows + rows > self.rows { self.flush("));
-        assert!(stage.contains("self.staged.len() == self.copied.len().min(MAX_MERGED_UNITS as usize)"));
+        assert!(stage.contains("self.staged.len() == self.copied.len().min(self.max_units)"));
         assert!(stage.contains("staged_rows >= self.rows"));
         assert!(stage.contains("if singleton || full { self.flush("));
     }
