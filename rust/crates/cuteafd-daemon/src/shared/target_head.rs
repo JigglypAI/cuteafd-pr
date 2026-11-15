@@ -166,6 +166,62 @@ impl<'a> BlockFp8Head<'a> {
 mod tests {
     use super::*;
 
+    #[test]
+    #[ignore = "requires sealed SM120 native FP8 head exports"]
+    fn shared_block_fp8_head_matches_muse_legacy_launch_bytes() -> Result<()> {
+        use crate::shared::{memory::{DeviceAllocation, device::cache_test_device, TEST},
+            native_attention::NativeAttentionWeights};
+        use cuteafd_loader::formats::{native_attention::NativeLayout, trellis_core::CoreSplit};
+        // SAFETY: this explicit GPU test uses the slot's sealed native ABI.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = cache_test_device(&library)?;
+        let programs = library.programs()?.with_manifest(std::path::Path::new(
+            &std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
+        let (n, k) = (202112usize, 8192usize);
+        let rows = 129usize;
+        let shared = BlockFp8Head::load(&programs, [n,k])?;
+        let legacy = cuteafd_ffi::native_attention::Fp8Projections::load(&programs, &[(k,n)], 64,
+            cuteafd_ffi::draft_projection::ProjectionOutput::F32)?;
+        let weights = NativeAttentionWeights {
+            layout: NativeLayout { stem:"lm_head".into(),shape:[n,k],fp8:true,rank:0,ranks:1,split:CoreSplit::Whole },
+            values: DeviceAllocation::new(&library,n*k,TEST)?,
+            scales: Some(DeviceAllocation::new(&library,n/128*(k/128)*4,TEST)?),
+        };
+        let input = DeviceAllocation::new(&library,rows*k*2,TEST)?;
+        let output = DeviceAllocation::new(&library,rows*n*4,TEST)?;
+        let expected = DeviceAllocation::new(&library,rows*n*4,TEST)?;
+        let scratch = DeviceAllocation::new(&library,shared.scratch_bytes()?,TEST)?;
+        let weight_bytes: Vec<u8> = (0..n*k).map(|i| [0x38u8,0xb8,0x30,0xb0][i%4]).collect();
+        let input_bytes: Vec<u8> = (0..rows*k).flat_map(|i| {
+            let value = ((i*17%97) as f32 - 48.) / 32.;
+            ((value.to_bits()>>16) as u16).to_le_bytes()
+        }).collect();
+        let scale_bytes: Vec<u8> = (0..n/128*(k/128)).flat_map(|i| (0.01f32+(i%7) as f32*0.001).to_le_bytes()).collect();
+        library.copy_h2d(weights.values.buffer,&weight_bytes)?;
+        library.copy_h2d(weights.scales.as_ref().unwrap().buffer,&scale_bytes)?;
+        library.copy_h2d(input.buffer,&input_bytes)?;
+        for rows in [1,16,63,64,65,80,128,129] {
+            // This is Muse's pre-extraction invocation: same m64 registry and
+            // whole stored-width chunks, before family-specific crop/softcap.
+            head_chunks(rows,input.buffer,expected.buffer,k,n,|count,x,y| {
+                // SAFETY: test owns disjoint buffers and drains before reading.
+                unsafe { legacy.launch(x.ptr,weights.values.buffer.ptr,
+                    weights.scales.as_ref().unwrap().buffer.ptr,y,scratch.buffer,count,k,n,std::ptr::null_mut())?; }
+                Ok(())
+            })?;
+            shared.launch(rows,input.buffer,&weights,output.buffer,scratch.buffer,std::ptr::null_mut())?;
+            // SAFETY: both launches use the current device's default stream.
+            unsafe { library.cuda_stream_synchronize(std::ptr::null_mut())?; }
+            let mut actual = vec![0u8;rows*n*4];
+            let mut reference = vec![0u8;rows*n*4];
+            library.copy_d2h(&mut actual,output.buffer)?;
+            library.copy_d2h(&mut reference,expected.buffer)?;
+            assert_eq!(actual,reference,"Muse shared head changed bytes at {rows} rows");
+        }
+        assert_eq!(device.id,output.buffer.device_id);
+        Ok(())
+    }
+
     /// Unset and `tensor` take tensor cores; `exact` never does; anything else is refused.
     #[test]
     fn the_target_head_defaults_to_tensor_cores_and_keeps_exact_as_a_diagnostic() {
