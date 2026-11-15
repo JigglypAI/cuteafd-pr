@@ -125,6 +125,16 @@ A launch reads one plain `KEY=VALUE` config file (`cuteafd.config` by default):
 - `CONCURRENCY` unset is a boot-time memory derivation; all C-dependent sizes
   follow it. Set it only to pin a value.
 
+### Inkling Request Reasoning
+
+The Inkling chat adapter reads the checkpoint's own `chat_template.jinja` and
+`tokenizer_config.json`. Runtime serving qualification is tracked in #1930;
+these request values do not imply that a Planned checkpoint has a serving executor.
+
+| Request Field | Default | Values | Notes |
+| --- | --- | --- | --- |
+| `reasoning_effort` (Inkling) | `high` (= 0.9) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a JSON number in `[0, 0.99]` | Native template values are 0, 0.1, 0.2, 0.7, 0.9, 0.99 and 0.99, respectively. A top-level value takes precedence over `chat_template_kwargs.reasoning_effort`; explicit thinking-off resolves to `none`. Reasoning and tool calls use native message channels. Only `<|content_model_end_sampling|>` (token 200006) ends generation; `<|end_message|>` closes a channel and is not an EOS stop. |
+
 ### MiniMax Serving
 
 MiniMax M3.1 Flash supports public `cuteafd serve --family minimax_m3` and
