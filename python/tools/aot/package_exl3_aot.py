@@ -1071,7 +1071,8 @@ SEGMENT_MAX_ROWS = 8192
 
 def segment_export_options(geometry: str, role: str, width: int, *, compact: bool = False) -> dict | None:
     """One format-matched row-address program per shipping WS Spark layout."""
-    if (role != 'spark' or compact or GEOMETRIES[geometry][0] % 512
+    # Other families land with their planner charge and merged-wave oracle.
+    if (geometry not in ('glm', 'glmf') or role != 'spark' or compact or GEOMETRIES[geometry][0] % 512
             or not any(warp_specialized(geometry, role, width, rows)
                        for rows in (256, 1024, 2048, 2752, 4096))):
         return None

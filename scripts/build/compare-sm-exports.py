@@ -380,7 +380,8 @@ def jobs(scope):
     # Keep baseline packages free to use their own layout inventory and API.
     result.extend((name + '-spark', exporter, [*args, '--role', 'spark', '--source-package-layouts'])
                   for name, exporter, args in list(result)
-                  if exporter == 'package_exl3_aot.py' and not name.startswith('exl3-compact-'))
+                  if exporter == 'package_exl3_aot.py' and not name.startswith('exl3-compact-')
+                  and args[args.index('--geometry') + 1] in ('glm', 'glmf'))
     result.extend((f"context-split-{geometry}", "export_b12x_dsv4_aot.py",
                    ["--geometry", geometry, "--context-split-only"])
                   for geometry in ("flash", "pro", "glm", "glmf"))

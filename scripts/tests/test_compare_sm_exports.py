@@ -1036,13 +1036,14 @@ def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compac
         assert any(options.get("warp_specialized") for _, options in recorded)
 
 
-def test_spark_exl3_groups_include_every_ordinary_tier_family():
+def test_spark_exl3_groups_include_only_glm_and_glmf_tier_families():
     jobs = compare_sm.jobs('all')
     ordinary = [(name, exporter, args) for name, exporter, args in jobs
                 if exporter == 'package_exl3_aot.py' and not name.startswith('exl3-compact-')
                 and not name.endswith('-spark')]
     for name, exporter, args in ordinary:
-        assert (name + '-spark', exporter, [*args, '--role', 'spark', '--source-package-layouts']) in jobs
+        expected = (name + '-spark', exporter, [*args, '--role', 'spark', '--source-package-layouts'])
+        assert (expected in jobs) == (args[args.index('--geometry') + 1] in ('glm', 'glmf'))
 
 
 @pytest.mark.parametrize('supports_segments', [False, True])
