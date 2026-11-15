@@ -627,10 +627,20 @@ ARC live capacity without freeing visible physical bytes. Cancelled captures
 still require observation, since failed instantiation can grow driver storage.
 Qualified single-device chains reuse node/executable pools; fan-out and explicit
 peer-spanning captures do not receive chain discounts. Native width and span
-matter, not just node count (#1626). Currently reconciliation substitutes this
-high-water for the admitted reserve; it is not a current-residency measurement.
-Current-level reconciliation, while retaining high-water for admission, is
-pending [#1702](https://github.com/tpurtell/cuteafd/pull/1702).
+matter, not just node count (#1626). Fresh growth is admitted against the
+physical `charged` high-water plus pending growth and headroom. At that bound,
+new shapes can capture only through proven chain-pool reuse after executable
+retirement; failed or non-chain captures cannot manufacture physical credit.
+Measured `live_bytes` contains surviving capture-growth shares, not physical
+residency: allocator reuse can make a resident graph's share zero. ARC keeps
+reuse-backed owners evictable and weights them by max(measured share, estimate),
+including pinned owners in `resident_bytes`. A blocked miss first proves that
+retiring every eligible owner could make the capture fit, then selects only the
+needed victims. Boundary overshoot retires resident occupancy, never a constant
+`charged - reserve` target. No estimate is added to the physical charge.
+Reconciliation uses the settled current level while retaining high-water for
+admission. Bounded physical memory is mandatory; eager fallback or churn is
+preferable to admitting unbounded growth.
 
 ### Single capture path
 
@@ -702,7 +712,7 @@ the sample can only reduce the figure below the charge, never inflate it; the
 path releases peak credit and never raises the charge. Negative slack means the
 arena exceeded its reserve. Component values are `graph_reserve_bytes`,
 `graph_arena_bytes` (the level used) and `graph_arena_high_water_bytes` (the
-monotone charge admission and eviction keep, which still covers a transient
+monotone physical charge admission retains, which still covers a transient
 capture peak); a family whose controller never samples reports the high-water as
 both. At Ready and joined first_request,
 require nonnegative slack and RTX `abs(delta_vs_measured) <= padding_bytes / 2`.
