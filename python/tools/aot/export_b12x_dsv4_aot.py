@@ -233,7 +233,9 @@ def native_attention_bf16_shapes():
     # Muse original K/V are separate projections, whole and TP2 output splits.
     shapes = {(k, n) for family, operands in native_attention_shapes().items()
               if family != "ml4" for n, k in operands}
-    return shapes | {(6144, 512), (6144, 576), (8192, 1024), (8192, 512), (8192, 4096), (8192, 2048)}
+    # Partial MC selection stages unselected GLM group members as BF16.
+    return shapes | {(6144, 512), (6144, 576), (8192, 1024), (8192, 512), (8192, 4096), (8192, 2048),
+                     (1024, 6144), (6144, 6144), (6144, 12288)}
 
 
 def draft_bf16_shapes():

@@ -48,6 +48,8 @@ def shapes():
                  (12288, 4096), (6144, 4096), (8192, 8192), (4096, 8192),
                  (8192, 4096), (8192, 2048), (8192, 1024), (8192, 512)):
         result.setdefault((k, n), []).append("checkpoint-native")
+    for k, n in ((1024, 6144), (6144, 6144), (6144, 12288)):
+        result.setdefault((k, n), []).append("mc-partial-group-native")
     for n in (512, 576):
         result.setdefault((6144, n), []).append("ml4-native-kv-a")
     return result
