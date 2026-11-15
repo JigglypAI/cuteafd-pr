@@ -112,7 +112,8 @@ def segmented_forms(g, wire: bool, fused: bool) -> tuple[str, ...]:
     the fused region list."""
     if g.weights in ("fp8", "mxfp4"):
         return FORMS if wire else ()
-    return ("auto",) if g.kind == "nvfp4a4" and not wire and fused else ()
+    a4 = g.weights == "nvfp4" and getattr(g, "activations", None) == "a4" and getattr(g, "activation", None) != "situ"
+    return ("auto",) if a4 and not wire and fused else ()
 
 
 def core_variants(role: str, weights: str, build_kind: str = "development") -> tuple[bool, ...]:
