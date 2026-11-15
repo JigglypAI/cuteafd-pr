@@ -611,7 +611,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires sealed MiniMax model, native library and three/four Spark workers"]
-    fn native_zero_proposal_matches_eager_verify_logits_and_taps() -> Result<()> {
+    fn native_zero_proposal_matches_plain_decode_state_and_continuation() -> Result<()> {
         use clap::Parser;
         use sha2::{Digest, Sha256};
         use std::sync::Arc;
@@ -663,10 +663,11 @@ mod tests {
         let tokens = tokenizer.encode_ids(&text.repeat(32))?;
         let prompt: usize = 64;
         let steps: usize = 256;
-        ensure!(tokens.len() >= prompt + steps + 4 && context >= prompt + steps,
+        ensure!(tokens.len() >= prompt + steps + 4 && context >= prompt + steps + 2,
             "MiniMax width-exact prompt exceeds admitted context");
-        let tap_pitch = backend.owners.storage.draft_prefix.as_ref().context("missing proof draft")?
-            .drafter.cfg.taps.len() * cfg.hidden * 2;
+        let draft = backend.owners.storage.draft_prefix.as_ref().context("missing proof draft")?;
+        let tap_pitch = draft.drafter.cfg.taps.len() * cfg.hidden * 2;
+        let banks = backend.owners.storage.requests.borrow().banks();
         let read = |buffer: Buffer, bytes: usize| -> Result<Vec<u8>> {
             backend.drain()?;
             let buffer = super::super::cache::view(buffer, 0, bytes)?;
@@ -675,76 +676,202 @@ mod tests {
             library.copy_d2h(&mut output, buffer)?;
             Ok(output)
         };
-        let mut digest = Sha256::new();
-        let mut compared_rows = 0;
-        for width in [1, 4] {
-            let mut placements = (0..width).map(|slot| -> Result<_> {
-                let mut placement = Placement { units: pool.alloc((prompt + steps).div_ceil(PAGE_ROWS))?, slot, len: 0 };
-                family.bind(&mut placement).map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                backend.identities.borrow_mut().insert(slot, (slot + 1) as u64);
-                Ok(placement)
-            }).collect::<Result<Vec<_>>>()?;
-            let mut states = (0..width).map(|_| DraftState::default()).collect::<Vec<_>>();
-            for (slot, placement) in placements.iter_mut().enumerate() {
-                backend.prefill_device(placement, &tokens[slot..slot + prompt], 0, &pool)?;
-            }
-            for step in 0..steps {
-                let position = prompt + step;
-                let inputs = (0..width).map(|slot| tokens[slot + position]).collect::<Vec<_>>();
-                let mut rows = placements.iter_mut().zip(&inputs).map(|(placement, token)|
-                    (placement, std::slice::from_ref(token))).collect::<Vec<_>>();
-                let native_first = step % 2 == 0;
-                let first = if native_first { backend.verify_device(&mut rows, false, &pool)? }
-                    else { backend.verify_staged(&mut rows, &pool)? }.context("missing first-route logits")?;
-                let first_logits = read(Buffer { ptr: first.ptr.cast_mut(), bytes: width * cfg.vocab_size * 4,
-                    device_id: backend.owners.storage.ranks.last().unwrap().decode.borrow().stream.device.id,
-                    ..Default::default() }, width * cfg.vocab_size * 4)?;
-                let taps = backend.owners.storage.verify_taps.as_ref().context("missing native proof taps")?.buffer;
-                let first_taps = read(taps, width * tap_pitch)?;
-                ensure!(rows.iter().all(|(placement, _)| placement.len == position),
-                    "zero-proposal route published before accept");
-                ensure!(backend.pending.borrow_mut().take().is_some(), "first route did not stage a receipt");
-                let second = if native_first { backend.verify_staged(&mut rows, &pool)? }
-                    else { backend.verify_device(&mut rows, false, &pool)? }.context("missing second-route logits")?;
-                let second_logits = read(Buffer { ptr: second.ptr.cast_mut(), bytes: width * cfg.vocab_size * 4,
-                    device_id: taps.device_id, ..Default::default() }, width * cfg.vocab_size * 4)?;
-                let second_taps = read(taps, width * tap_pitch)?;
-                ensure!(first_logits == second_logits, "native/eager logits differ at C{width} position {position}");
-                ensure!(first_taps == second_taps, "native/eager taps differ at C{width} position {position}");
-                ensure!(first_logits.chunks_exact(4).all(|word|
-                    f32::from_le_bytes(word.try_into().unwrap()).is_finite()), "nonfinite native proof logits");
-                digest.update((width as u64).to_le_bytes());
-                digest.update((position as u64).to_le_bytes());
-                digest.update(&first_logits);
-                digest.update(&first_taps);
-                drop(rows);
-                let mut verified = placements.iter_mut().zip(&mut states).zip(&inputs).enumerate()
-                    .map(|(slot, ((placement, state), token))| scheduler::Verified {
-                        placement, seq: state, start: position, history: (slot + 1) as u64,
-                        rows: std::slice::from_ref(token), first_row: slot,
-                        kept: Some((1, *token)), finished: false, neural: true,
-                    }).collect::<Vec<_>>();
-                backend.accept(&mut verified, false)?;
-                ensure!(verified.iter().all(|request| request.placement.len == position + 1),
-                    "paired zero-proposal target commit differs");
-                for slot in 0..width {
-                    ensure!(backend.owners.storage.draft_prefix.as_ref().unwrap().frontier(slot)? == position + 1,
-                        "paired zero-proposal draft frontier differs");
+        let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        let target_state = |placements: &[Placement], position: Option<usize>| -> Result<String> {
+            let mut digest = Sha256::new();
+            for bank in &banks {
+                for layer in bank.layers.clone() {
+                    for placement in placements {
+                        let pages = position.map_or_else(|| placement.units.clone(), |position|
+                            vec![placement.units[position / PAGE_ROWS]]);
+                        for page in pages {
+                            for (plane, _) in super::super::cache::PAGE_PLANES {
+                                let buffer = bank.page(layer, plane, page)?;
+                                digest.update(read(buffer, buffer.bytes)?);
+                            }
+                        }
+                    }
                 }
-                compared_rows += width;
             }
-            for placement in &mut placements {
-                backend.cancel(placement)?;
-                family.discard(placement).map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                pool.release(&placement.units);
+            Ok(format!("{:x}", digest.finalize()))
+        };
+        let draft_state = |width: usize| -> Result<String> {
+            let mut digest = Sha256::new();
+            for slot in 0..width {
+                digest.update((draft.frontier(slot)? as u64).to_le_bytes());
+                for buffer in draft.drafter.window_planes(slot)? { digest.update(read(buffer, buffer.bytes)?); }
             }
+            Ok(format!("{:x}", digest.finalize()))
+        };
+        let values = |bytes: &[u8]| bytes.chunks_exact(4)
+            .map(|word| f32::from_le_bytes(word.try_into().unwrap())).collect::<Vec<_>>();
+        let gap = |a: &[u8], b: &[u8]| -> Result<serde_json::Value> {
+            let (a, b) = (values(a), values(b));
+            ensure!(a.len() == b.len() && a.len() % cfg.vocab_size == 0
+                && a.iter().chain(&b).all(|v| v.is_finite()), "invalid diagnostic logits");
+            let (mut maximum, mut kl, mut agrees, mut count) = (0f64, 0f64, 0usize, 0usize);
+            for (a, b) in a.chunks_exact(cfg.vocab_size).zip(b.chunks_exact(cfg.vocab_size)) {
+                let top = |row: &[f32]| row.iter().enumerate().max_by(|x,y| x.1.total_cmp(y.1)).unwrap().0;
+                agrees += usize::from(top(a) == top(b)); count += 1;
+                let log_probs = |row: &[f32]| {
+                    let peak = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+                    let norm = row.iter().map(|v| (f64::from(*v)-peak).exp()).sum::<f64>().ln() + peak;
+                    row.iter().map(|v| f64::from(*v)-norm).collect::<Vec<_>>()
+                };
+                let (p,q) = (log_probs(a),log_probs(b));
+                kl += p.iter().zip(q).map(|(p,q)| p.exp() * (p-q)).sum::<f64>();
+                for (&x,&y) in a.iter().zip(b) { maximum = maximum.max((f64::from(x)-f64::from(y)).abs()); }
+            }
+            Ok(serde_json::json!({"position":64,"max_abs":maximum,"argmax_agreement":agrees as f64/count as f64,
+                "kl":kl/count as f64}))
+        };
+        let mut reports = Vec::new();
+        for width in [1usize, 4] {
+            let pages = (0..width).map(|_| pool.alloc((prompt+steps+8).div_ceil(PAGE_ROWS)))
+                .collect::<std::result::Result<Vec<_>,_>>()?;
+            let mut reference = Vec::new();
+            let mut first_plain = Vec::new();
+            let mut expected_proposals: Option<Vec<Vec<u32>>> = None;
+            let mut starting = None;
+            let mut diagnostic = serde_json::Value::Null;
+            for arm in ["plain", "staged", "eager-diagnostic"] {
+                // Reset both inactive physical bytes and the draft window. No
+                // arm can consume cache entries written by its predecessor.
+                backend.drain()?;
+                for bank in &banks {
+                    for layer in bank.layers.clone() {
+                        for page in pages.iter().flatten() {
+                            for (plane, _) in super::super::cache::PAGE_PLANES {
+                                let buffer = bank.page(layer, plane, *page)?;
+                                bank.stream.device.run(|| {
+                                    // SAFETY: proof owns every page; all readers drained above.
+                                    unsafe { library.cuda_zero_bytes_async(buffer, buffer.bytes, bank.stream.raw) }
+                                })?;
+                            }
+                        }
+                    }
+                }
+                let mut placements = pages.iter().enumerate().map(|(slot,pages)| -> Result<_> {
+                    let mut placement = Placement { units:pages.clone(),slot,len:0 };
+                    family.bind(&mut placement).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    backend.identities.borrow_mut().insert(slot,(slot+1) as u64);
+                    Ok(placement)
+                }).collect::<Result<Vec<_>>>()?;
+                let mut states = (0..width).map(|_| DraftState::default()).collect::<Vec<_>>();
+                for (slot, placement) in placements.iter_mut().enumerate() {
+                    backend.prefill_device(placement,&tokens[slot..slot+prompt],0,&pool)?;
+                }
+                let start = (target_state(&placements,None)?,draft_state(width)?);
+                if let Some(expected) = &starting { ensure!(&start == expected,"independent arm prefill state differs"); }
+                else { starting = Some(start); }
+                let zero_steps = if arm == "eager-diagnostic" { 1 } else { steps };
+                for step in 0..zero_steps {
+                    let position = prompt+step;
+                    let input = (0..width).map(|slot| tokens[slot+position]).collect::<Vec<_>>();
+                    let logits = if arm == "plain" {
+                        let submitted = placements.iter().zip(&input).enumerate().map(|(slot,(placement,token))|
+                            Submitted { identity:(slot+1) as u64,placement:placement.clone(),tokens:vec![*token] }).collect::<Vec<_>>();
+                        let mut copies = placements.clone();
+                        let requests = copies.iter_mut().zip(&submitted).map(|(placement,sent)| ServingRequest {
+                            identity:sent.identity,kind:ExpertV2SourceKind::Decode,start:position,
+                            heads:position..position+1,tokens:&sent.tokens,placement }).collect::<Vec<_>>();
+                        let logits = backend.execution.borrow_mut().decode(&backend.owners.storage,&cfg,&backend.schedule,
+                            &requests,&mut backend.owners.graphs.borrow_mut(),true)?;
+                        backend.drain()?;
+                        // The plain route publishes its input unconditionally;
+                        // emulate the normal committed tap consumer independently
+                        // of the new staged-copy/accept path.
+                        let owner = backend.owners.storage.ranks.last().unwrap().decode.borrow();
+                        let taps = owner.target_taps().context("plain target taps")?.output();
+                        for slot in 0..width {
+                            // SAFETY: completed plain decode initialized live retained taps.
+                            unsafe { draft.drafter.capture_concatenated(taps,slot,1,0,owner.stream.raw)?; }
+                            draft.drafter.update(&[crate::shared::speculation::dflash::ContextRow {
+                                tap_row:0,slot,position }])?;
+                            draft.advance(slot,position,1)?;
+                        }
+                        drop(owner);
+                        let mut rows = placements.iter_mut().zip(&input).map(|(p,t)| (p,std::slice::from_ref(t))).collect::<Vec<_>>();
+                        publish(family,&mut rows,&submitted)?;
+                        logits
+                    } else {
+                        let mut rows = placements.iter_mut().zip(&input).map(|(p,t)| (p,std::slice::from_ref(t))).collect::<Vec<_>>();
+                        if arm == "staged" { backend.verify_device(&mut rows,false,&pool)? }
+                        else { backend.verify_staged(&mut rows,&pool)? }.context("proof logits missing")?
+                    };
+                    let bytes = logits.to_host(&library)?.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+                    ensure!(values(&bytes).iter().all(|v| v.is_finite()),"nonfinite proof logits");
+                    let tap_buffer = if arm == "plain" {
+                        backend.owners.storage.ranks.last().unwrap().decode.borrow().target_taps().unwrap().output()
+                    } else { backend.owners.storage.verify_taps.as_ref().unwrap().buffer };
+                    let taps = read(tap_buffer,width*tap_pitch)?;
+                    if arm != "plain" {
+                        let mut verified = placements.iter_mut().zip(&mut states).zip(&input).enumerate()
+                            .map(|(slot,((placement,state),token))| scheduler::Verified {
+                                placement,seq:state,start:position,history:(slot+1) as u64,
+                                rows:std::slice::from_ref(token),first_row:slot,kept:Some((1,*token)),
+                                finished:false,neural:true }).collect::<Vec<_>>();
+                        backend.accept(&mut verified,false)?;
+                    }
+                    ensure!(placements.iter().all(|p| p.len == position+1)
+                        && (0..width).all(|slot| draft.frontier(slot).ok() == Some(position+1)),"proof commit frontier differs");
+                    let record = (hash(&bytes),hash(&taps),target_state(&placements,Some(position))?,draft_state(width)?);
+                    if arm == "plain" {
+                        if step == 0 { first_plain = bytes; }
+                        reference.push(record);
+                    } else if arm == "staged" {
+                        ensure!(record == reference[step],"native staged/plain logits/taps/KV/index/draft differ C{width} step {step}");
+                    } else {
+                        diagnostic = gap(&first_plain,&bytes)?;
+                        diagnostic["target_state_identical"] = serde_json::json!(record.2 == reference[0].2);
+                        diagnostic["draft_state_identical"] = serde_json::json!(record.3 == reference[0].3);
+                    }
+                }
+                if arm != "eager-diagnostic" {
+                    // Verify one real proposal immediately after the final
+                    // zero-proposal step, from each independently built state.
+                    let position = prompt+steps;
+                    let seqs = (0..width).map(|slot| crate::shared::speculation::dflash::DraftSeq {
+                        slot,anchor:tokens[slot+position],position,valid_from:0 }).collect::<Vec<_>>();
+                    let head = backend.owners.storage.ranks.last().unwrap().weights.operand("language_model.lm_head.weight")?.buffer;
+                    let proposals = draft.drafter.draft_device(&seqs,&backend.owners.storage.embedding,
+                        crate::shared::speculation::dflash::TargetHead::Bf16Buffer(&head))?
+                        .into_iter().map(|p| p.tokens.into_iter().take(1).collect::<Vec<_>>()).collect::<Vec<_>>();
+                    ensure!(proposals.iter().all(|p| p.len() == 1),"missing continuation proposal");
+                    if let Some(expected) = &expected_proposals { ensure!(&proposals == expected,"following proposal ids differ"); }
+                    else { expected_proposals = Some(proposals.clone()); }
+                    let input = proposals.iter().enumerate().map(|(slot,p)| vec![tokens[slot+position],p[0]]).collect::<Vec<_>>();
+                    let mut rows = placements.iter_mut().zip(&input).map(|(p,t)| (p,t.as_slice())).collect::<Vec<_>>();
+                    let logits = backend.verify_device(&mut rows,true,&pool)?.context("continuation logits")?;
+                    let bytes = logits.to_host(&library)?.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+                    drop(rows);
+                    let taps = read(backend.owners.storage.verify_taps.as_ref().unwrap().buffer,width*2*tap_pitch)?;
+                    let mut verified = placements.iter_mut().zip(&mut states).zip(&input).enumerate()
+                        .map(|(slot,((placement,state),tokens))| scheduler::Verified {
+                            placement,seq:state,start:position,history:(slot+1) as u64,rows:tokens,
+                            first_row:slot*2,kept:Some((2,tokens[1])),finished:false,neural:true }).collect::<Vec<_>>();
+                    backend.accept(&mut verified,true)?;
+                    drop(verified);
+                    let record = (hash(&bytes),hash(&taps),target_state(&placements,None)?,draft_state(width)?);
+                    if arm == "plain" { reference.push(record); }
+                    else { ensure!(record == reference[steps],"following proposal verify logits/taps/target/draft state differ C{width}"); }
+                }
+                for placement in &mut placements {
+                    backend.cancel(placement)?;
+                    family.discard(placement).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                }
+            }
+            reports.push(serde_json::json!({"width":width,"zero_proposal_steps":steps,
+                "plain_decode_logits_taps_and_state_byte_identical":true,"following_proposal_verify_byte_identical":true,
+                "eager_verify_position64":diagnostic,"records":reference}));
+            for pages in &pages { pool.release(pages); }
         }
-        let report = serde_json::json!({"byte_identical_logits":true, "byte_identical_taps":true,
-            "widths":[1,4], "tokens_per_width":steps, "rows":compared_rows,
-            "sha256":format!("{:x}", digest.finalize())});
+        let report = serde_json::json!({"reference":"plain native decode, identical independent prefill",
+            "target_state":"physical KV/index page bytes","draft_state":"full physical window plus frontier",
+            "widths":reports});
         println!("MiniMax native zero-proposal exactness: {report}");
         if let Ok(output) = std::env::var("CUTEAFD_GOLDEN_OUT") {
-            std::fs::write(Path::new(&output).join("native-zero-proposal.json"), serde_json::to_vec_pretty(&report)?)?;
+            std::fs::write(Path::new(&output).join("native-zero-proposal.json"),serde_json::to_vec_pretty(&report)?)?;
         }
         Ok(())
     }
