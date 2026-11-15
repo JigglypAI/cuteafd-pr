@@ -105,8 +105,10 @@ must use its own runtime SM count, not the PRO 6000's measured 5/10 rows.
 Final scores across the duel: Carbon Correct 5, Judgement 4, Quality 4,
 Creative 5; DeepSeek Correct 2, Judgement 2, Quality 2, Creative 3. Carbon seals
 R1 in about 30 min, R2 in 31 min and the final real-AOT correction about
-38 min into R3. DeepSeek R1 is numerically exact after trace corrections but
-slower; its R2 never qualifies. Both negative results are retained. No fourth
+38 min into R3. The external run spans 144.3 min including organizer gates
+and queue waits; the driver records 18 submits/steers (4/4/10 by round), no
+503 retries, and an unknown peak context percentage. DeepSeek R1 is numerically
+exact after trace corrections but slower; its R2 never qualifies. Both negative results are retained. No fourth
 round or unfinished DeepSeek spine is recommended. Superseded fork drafts
 #328/#329 are closed; benchmark-only harness #327 is separate.
 
