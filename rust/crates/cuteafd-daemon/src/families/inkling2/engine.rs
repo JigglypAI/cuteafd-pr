@@ -34,10 +34,11 @@ impl<'a> Execution<'a> {
         version: u64, on_logits: &mut dyn FnMut(usize, usize, DeviceLogits) -> Result<()>) -> Result<()> {
         ensure!(!self.terminal && placements.len() == tokens.len(), "Inkling execution terminal or request count differs");
         let slots = placements.iter().map(|placement| placement.slot).collect::<Vec<_>>();
+        let starts = placements.iter().map(|placement| placement.len).collect::<Vec<_>>();
         let result = (|| {
             let waves = self.link.exchange()?;
             let mut io = TokenIo { kernels: &self.kernels, head: &self.head, cache: &self.requests.cache,
-                target: &self.target, cfg: &self.cfg, tokens, slots: &slots, retained_rows: false, on_logits };
+                target: &self.target, cfg: &self.cfg, tokens, starts: &starts, slots: &slots, retained_rows: false, on_logits };
             Stateful { kernels: &self.kernels, owners: &self.requests.prefill, cache: &self.requests.cache,
                 target: &self.target, cfg: &self.cfg, placements, uploads: &mut self.requests.prefill_uploads,
                 waves, onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
@@ -55,10 +56,11 @@ impl<'a> Execution<'a> {
         ensure!(!self.terminal && !placements.is_empty() && placements.len() == tokens.len()
             && unit.rows.len() <= 64 && unit.slot == 0, "Inkling decode exceeds admitted head/owner");
         let slots = placements.iter().map(|placement| placement.slot).collect::<Vec<_>>();
+        let starts = placements.iter().map(|placement| placement.len).collect::<Vec<_>>();
         let result = (|| {
             let waves = self.link.exchange()?;
             let mut io = TokenIo { kernels: &self.kernels, head: &self.head, cache: &self.requests.cache,
-                target: &self.target, cfg: &self.cfg, tokens, slots: &slots, retained_rows: true,
+                target: &self.target, cfg: &self.cfg, tokens, starts: &starts, slots: &slots, retained_rows: true,
                 on_logits: &mut |_, _, _| Ok(()) };
             Stateful { kernels: &self.kernels, owners: std::slice::from_ref(&self.requests.decode),
                 cache: &self.requests.cache, target: &self.target, cfg: &self.cfg, placements,

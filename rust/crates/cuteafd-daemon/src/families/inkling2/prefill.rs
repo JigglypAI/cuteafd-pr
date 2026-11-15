@@ -22,6 +22,7 @@ pub(crate) struct TokenIo<'s, 'a> {
     pub cfg: &'s Inkling2Config,
     /// Submission-local token streams in the shared unit sequence order.
     pub tokens: &'s [&'s [u32]],
+    pub starts: &'s [usize],
     pub slots: &'s [usize],
     pub retained_rows: bool,
     pub on_logits: &'s mut dyn FnMut(usize, usize, crate::shared::token_io::DeviceLogits) -> Result<()>,
@@ -29,7 +30,7 @@ pub(crate) struct TokenIo<'s, 'a> {
 impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
     fn begin(&mut self, unit: &Unit, owner: &super::owners::UnitOwner<'a>,
         uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
-        let tokens = unit_tokens(unit, self.tokens)?;
+        let tokens = unit_tokens(unit, self.tokens, self.starts)?;
         self.head.embed_unit(self.kernels, owner, self.target, self.cfg, &tokens, uploads)
     }
     fn end(&mut self, unit: &Unit, owner: &super::owners::UnitOwner<'a>) -> Result<()> {
@@ -98,11 +99,14 @@ impl Stateful<'_, '_> {
     }
 }
 
-fn unit_tokens(unit: &Unit, sources: &[&[u32]]) -> Result<Vec<u32>> {
+fn unit_tokens(unit: &Unit, sources: &[&[u32]], starts: &[usize]) -> Result<Vec<u32>> {
     let mut tokens = Vec::with_capacity(unit.rows.len());
     for member in members(unit) {
         let source = sources.get(member.sequence).context("Inkling unit token source absent")?;
-        tokens.extend_from_slice(source.get(member.tokens.clone()).context("Inkling unit token span outside request")?);
+        let origin = *starts.get(member.sequence).context("Inkling token source origin absent")?;
+        let first = member.tokens.start.checked_sub(origin).context("Inkling token span precedes submitted suffix")?;
+        let end = member.tokens.end.checked_sub(origin).context("Inkling token end precedes submitted suffix")?;
+        tokens.extend_from_slice(source.get(first..end).context("Inkling unit token span outside request")?);
     }
     ensure!(tokens.len() == unit.rows.len(), "Inkling token members do not cover unit");
     Ok(tokens)
@@ -272,8 +276,8 @@ mod tests {
         let a = (0..1090).collect::<Vec<u32>>();
         let b = (1000..1100).collect::<Vec<u32>>();
         let sources: Vec<&[u32]> = vec![&[], &[], &a, &[], &[], &[], &[], &b];
-        assert_eq!(unit_tokens(&unit, &sources)?, [1087, 1088, 1063, 1064, 1065]);
-        assert!(unit_tokens(&unit, &[&a]).is_err());
+        assert_eq!(unit_tokens(&unit, &sources, &[0; 8])?, [1087, 1088, 1063, 1064, 1065]);
+        assert!(unit_tokens(&unit, &[&a], &[0]).is_err());
         let routes = (0..40).map(|route| ExpertProtocolV2RouteEntry {
             row_index: route/8, expert_id: route%384, gate_weight: 0.125 }).collect();
         let mut request = request(99, 3, 5, 3, 0, 5, routes, vec![0; 5*4752].into())?;

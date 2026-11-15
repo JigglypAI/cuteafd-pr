@@ -107,6 +107,7 @@ impl<'a> CacheBank<'a> {
         // source/destination until the shared prefix fence drains.
         unsafe { self.copies.copy_d2d(&copies) }
     }
+    pub fn mark_slots(&self) -> usize { self.mark_slots }
     pub fn drain(&self) -> Result<()> { self.copies.drain() }
     pub fn inventory(&self, inventory: &mut Inventory<'_>) -> Result<()> {
         let location = inventory.location(self.readers[0].device.id)?;
