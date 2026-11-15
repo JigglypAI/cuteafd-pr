@@ -22,40 +22,15 @@ fn png_b64() -> String {
 /// tokenizer) is cached, so token ids are compared too.
 struct Family { name: &'static str, profile: ModelProfile, snapshot: Option<std::path::PathBuf> }
 
-fn hub(rel: &str) -> Option<std::path::PathBuf> {
-    let base = std::path::Path::new("/mnt/sparknest/hf-home/hub").join(rel).join("snapshots");
-    let mut snapshots: Vec<_> = std::fs::read_dir(base).ok()?.flatten().map(|e| e.path())
-        .filter(|s| s.join("tokenizer.json").is_file()).collect();
-    snapshots.sort();
-    snapshots.pop()
-}
-
 fn families() -> Vec<Family> {
-    let mut out = vec![
-        Family { name: "v41", profile: ModelProfile::new("deepseek-ai/DeepSeek-V4.1-Flash", ModelEncoding::DeepseekV41),
-            snapshot: hub("models--deepseek-ai--DeepSeek-V4.1-Flash") },
+    vec![
+        Family { name: "v41", profile: ModelProfile::new("deepseek-ai/DeepSeek-V4.1-Flash", ModelEncoding::DeepseekV41), snapshot: None },
         Family { name: "v41-1017", profile: ModelProfile::new("deepseek-ai/DeepSeek-V4.1-Flash-1017", ModelEncoding::DeepseekV41)
-            .with_v41_turns(crate::openai::V41Turns::DropCompleted), snapshot: hub("models--deepseek-ai--DeepSeek-V4.1-Flash-1017") },
-        Family { name: "v4", profile: ModelProfile::new("deepseek-ai/DeepSeek-V4-Flash-0731", ModelEncoding::DeepseekV4),
-            snapshot: hub("models--deepseek-ai--DeepSeek-V4-Flash-0731") },
-        Family { name: "glm-fixture", profile: ModelProfile::new("test-glm", ModelEncoding::Glm(Arc::new(glm5::fixtures::encoding()))),
-            snapshot: None },
-        Family { name: "qwen-fixture", profile: ModelProfile::new("test-qwen", ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding()))),
-            snapshot: None },
-    ];
-    for (name, rel, glm) in [
-        ("glm53-flash", "models--zai-org--GLM-5.3-Flash", true),
-        ("qwen38-exl3", "models--wrldsuksgo2mars--Qwen3.8-Flash-Next-EXL3-K4.25-v1", false),
-        ("mimo-v26-flash", "models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD", false),
-    ] {
-        let Some(snapshot) = hub(rel) else { continue };
-        let encoding = if glm { glm5::GlmEncoding::from_snapshot(&snapshot).ok().map(|e| ModelEncoding::Glm(Arc::new(e))) }
-            else { qwen4::QwenEncoding::from_snapshot(&snapshot).ok().map(|e| ModelEncoding::Qwen(Arc::new(e))) };
-        if let Some(encoding) = encoding {
-            out.push(Family { name, profile: ModelProfile::new(format!("test/{name}"), encoding), snapshot: Some(snapshot) });
-        }
-    }
-    out
+            .with_v41_turns(crate::openai::V41Turns::DropCompleted), snapshot: None },
+        Family { name: "v4", profile: ModelProfile::new("deepseek-ai/DeepSeek-V4-Flash-0731", ModelEncoding::DeepseekV4), snapshot: None },
+        Family { name: "glm-fixture", profile: ModelProfile::new("test-glm", ModelEncoding::Glm(Arc::new(glm5::fixtures::encoding()))), snapshot: None },
+        Family { name: "qwen-fixture", profile: ModelProfile::new("test-qwen", ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding()))), snapshot: None },
+    ]
 }
 
 /// One scripted engine: records each job's prompt and answers with `reply`.

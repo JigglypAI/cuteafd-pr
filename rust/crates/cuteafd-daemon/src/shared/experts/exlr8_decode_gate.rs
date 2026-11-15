@@ -57,10 +57,15 @@ fn decode_gate_waves_reach_the_widest_group_counts_with_width_independent_rows()
         experts.dedup();
         assert_eq!(experts.len(), (rows * k).min(geometry.experts as usize));
         for row in 0..rows {
-            let alone = request(geometry, 3, 0, row, 1, 1)?;
-            assert_eq!(&wave.routes[row * k..(row + 1) * k].iter().map(|r| (r.expert_id, r.gate_weight.to_bits()))
-                .collect::<Vec<_>>(), &alone.routes.iter().map(|r| (r.expert_id, r.gate_weight.to_bits()))
-                .collect::<Vec<_>>());
+            let expected = (0..k).map(|slot| (expert(geometry, 0, row, slot), gate(slot, k).to_bits()))
+                .collect::<Vec<_>>();
+            assert_eq!(wave.routes[row * k..(row + 1) * k].iter()
+                .map(|r| (r.expert_id, r.gate_weight.to_bits())).collect::<Vec<_>>(), expected);
+            if row == 0 || row + 1 == rows {
+                let alone = request(geometry, 3, 0, row, 1, 1)?;
+                assert_eq!(alone.routes.iter().map(|r| (r.expert_id, r.gate_weight.to_bits()))
+                    .collect::<Vec<_>>(), expected);
+            }
         }
     }
     // 12 rows give the 96 groups at which a three-unit compact activation arena overflowed.

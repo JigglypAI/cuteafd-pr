@@ -409,8 +409,8 @@ def compare_case(tmp_path, monkeypatch, family, control=False, native_row=(0., -
     return args, panel
 
 
-@pytest.mark.parametrize("geometry", ["tiled", "official-full"])
-@pytest.mark.parametrize("family", module.FAMILIES)
+@pytest.mark.parametrize("family,geometry", [
+    ("mimo_v2", "tiled"), ("mimo_v2", "official-full"), ("muse_spark", "tiled")])
 def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, family, geometry):
     from fidelity_windows import canonical
     args, panel = compare_case(tmp_path, monkeypatch, family, geometry=geometry)

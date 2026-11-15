@@ -548,7 +548,7 @@ impl UnitMetadata {
         }
         Ok(Self { rows, requests })
     }
-    /// Row cursor shared by the four rowwise metadata planes. Each segment's
+    /// Row cursor shared by the rowwise metadata planes. Each segment's
     /// i32 and i64 views retain the AOT ABI's 16-byte base alignment.
     pub fn segment_row(self, cursor: u32) -> Result<u32, Refusal> {
         let row = cursor.checked_add(3).ok_or(Refusal::Overflow("MiniMax metadata row"))? / 4 * 4;
@@ -561,7 +561,7 @@ impl UnitMetadata {
         if self.requests == 1 { self.rows }
         else { (self.rows + 3 * (self.requests - 1)).div_ceil(4) * 4 }
     }
-    /// Per-segment length, local [0, rows] offsets and descale block base.
+    /// Per-segment length and local [0, rows] offset block base.
     pub fn segment_offset(self, segment: u32) -> Result<u64, Refusal> {
         if segment >= self.requests {
             return Err(Refusal::InvalidFact("MiniMax metadata segment exceeds owner".into()));
@@ -573,10 +573,9 @@ impl UnitMetadata {
         let requests = u64::from(self.requests);
         let (lengths, offsets) = if self.requests == 1 { (4, 8) }
             else { (requests * 16, requests * 16) };
-        vec![("positions", rows * 8), ("slots", rows * 8), ("batch_ids", rows * 4),
+        vec![("positions", rows * 8), ("slots", rows * 8),
             ("causal_lengths", rows * 4), ("cache_lengths", lengths),
-            ("query_offsets", offsets),
-            ("key_descale", requests * 16), ("value_descale", requests * 16)]
+            ("query_offsets", offsets)]
     }
     pub fn components(self, prefix: &str, rank: u8, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
         Self::for_requests(self.rows, self.requests)?;
@@ -644,7 +643,7 @@ impl MsaCache {
     }
     pub fn kv_heads(self) -> u32 { self.kv_heads }
     pub fn page_planes(self) -> [(&'static str, u64); 3] {
-        let kv_stride = u64::from(self.kv_heads) * 64 * 128;
+        let kv_stride = cuteafd_ffi::minimax_m3::kv_plane_record_bytes(self.kv_heads as usize) as u64 * 64;
         [("keys", kv_stride), ("values", kv_stride), ("index", 8448)]
     }
     pub fn buffers(self) -> Result<Vec<(String, u64)>, Refusal> {
@@ -741,10 +740,10 @@ mod tests {
                 assert_eq!(whole.len(), local.len());
                 for (name, bytes) in &whole {
                     let split_kv = name.ends_with(".keys") || name.ends_with(".values");
-                    assert_eq!(local[name], if split_kv { bytes / 2 } else { *bytes }, "{name}");
+                    assert_eq!(local[name], if split_kv { 17 * 17408 } else { *bytes }, "{name}");
                 }
-                assert_eq!(local["layer.59.keys"], 17 * 16384);
-                assert_eq!(local["layer.59.values"], 17 * 16384);
+                assert_eq!(local["layer.59.keys"], 17 * 17408);
+                assert_eq!(local["layer.59.values"], 17 * 17408);
                 assert_eq!(local["layer.59.index"], 17 * 8448);
             }
         }
@@ -850,8 +849,8 @@ mod tests {
     #[test]
     fn packed_metadata_keeps_segment_views_aligned_and_decode_contiguous() {
         assert_eq!(UnitMetadata::new(17).unwrap().buffers(), vec![("positions", 136),
-            ("slots", 136), ("batch_ids", 68), ("causal_lengths", 68),
-            ("cache_lengths", 4), ("query_offsets", 8), ("key_descale", 16), ("value_descale", 16)]);
+            ("slots", 136), ("causal_lengths", 68),
+            ("cache_lengths", 4), ("query_offsets", 8)]);
         for requests in 2..=64 {
             let layout = UnitMetadata::for_requests(64, requests).unwrap();
             let buffers = layout.buffers().into_iter().collect::<std::collections::BTreeMap<_, _>>();
@@ -870,7 +869,7 @@ mod tests {
             assert!(buffers["query_offsets"] >= u64::from(requests + 1) * 4);
             assert!(buffers["cache_lengths"] >= u64::from(requests) * 4);
             assert_eq!(buffers["positions"], u64::from(layout.metadata_rows()) * 8);
-            assert_eq!(buffers["key_descale"], u64::from(requests) * 16);
+            assert!(!buffers.contains_key("key_descale") && !buffers.contains_key("batch_ids"));
             assert!(layout.segment_offset(requests).is_err());
             assert!(layout.segment_row(layout.metadata_rows()).is_err());
         }
@@ -953,13 +952,13 @@ mod tests {
             let layout = Layout::for_heads(mode, rows, extent).unwrap();
             entry["name"] = layout.name().into();
             if index { entry["geometry"]["heads"] = 2.into(); }
-            else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); }
+            else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); entry["geometry"]["record_bytes"] = 272.into(); entry["geometry"]["scale_offset"] = 16384.into(); entry["geometry"]["scale_stride"] = 16.into(); }
             entry["scratch_bytes_at_capacity"]["scratch"] = layout.scratch.into();
             for p in entry["pointers"].as_array_mut().unwrap() {
                 let shape = p["shape"].as_str().unwrap();
                 p["shape"] = if p["name"] == "scratch" { format!("[{}]", layout.scratch) }
                     else if p["name"] == "q2k_indices" { shape.replacen("[4,", "[2,", 1) }
-                    else { shape.replace(",4]", ",2]").replace(",4,128]", ",2,128]")
+                    else { shape.replace(",4]", ",2]").replace(",4,128]", ",2,128]").replace(",528]", ",272]")
                         .replace("[rows,64", "[rows,32") }.into();
             }
         }
@@ -1107,8 +1106,8 @@ mod tests {
                 .collect::<std::collections::BTreeMap<_, _>>();
             let globals = ["page_table", "decode_table", "lengths"];
             assert_eq!(buffers.len(), cache.layers as usize * 3 + globals.len());
-            assert_eq!(buffers["layer.59.keys"], 17 * 32768);
-            assert_eq!(buffers["layer.0.values"], 17 * 32768);
+            assert_eq!(buffers["layer.59.keys"], 17 * 33792);
+            assert_eq!(buffers["layer.0.values"], 17 * 33792);
             assert_eq!(buffers["layer.17.index"], 17 * 8448);
             assert_eq!(buffers["page_table"], 16 * u64::from(width) * 4);
             assert_eq!(buffers["lengths"], 16 * 4);

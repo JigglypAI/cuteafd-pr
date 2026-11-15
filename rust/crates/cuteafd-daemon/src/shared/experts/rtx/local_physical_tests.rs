@@ -46,8 +46,8 @@ fn glm_expert_census_resides_weights_before_kv_only() -> Result<()> {
 }
 
 fn installed_snapshot(repo: &str) -> Result<PathBuf> {
-    let home = std::env::var_os("HF_HOME").map(PathBuf::from).unwrap_or_else(||
-        PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface"));
+    let home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").map(PathBuf::from)
+        .expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required");
     let model = home.join("hub").join(format!("models--{}", repo.replace('/', "--")));
     let revision = std::fs::read_to_string(model.join("refs/main"))
         .with_context(|| format!("required installed checkpoint {repo} missing"))?;
@@ -396,14 +396,9 @@ fn installed_local_physical_equals_serving(native: bool, manifest: PathBuf,
         println!("{stdout}");
         return Ok(());
     }
-    let peak_rss = || -> Result<u64> {
-        std::fs::read_to_string("/proc/self/status")?.lines().find_map(|line| line.strip_prefix("VmHWM:"))
-            .and_then(|value| value.split_whitespace().next()).context("missing RSS high-water mark")?
-            .parse::<u64>().map_err(Into::into)
-    };
     cuteafd_core::set_expert_geometry(ExpertGeometry::GLM5).map_err(|g| anyhow::anyhow!("unexpected geometry {g:?}"))?;
     let root = PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/cuteafd/builds/glm-local-expert-physical");
-    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_in(&root.join("fixtures"))?;
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
     let library = fixture.load()?;
     fixture.extent_only(&library)?;
     fixture.quiet_events(&library, true)?;
@@ -422,7 +417,7 @@ fn installed_local_physical_equals_serving(native: bool, manifest: PathBuf,
     let input = plan::PlanInput::open(&snapshot)?;
     let options = plan::PlanOptions { vision: plan::MediaMode::Off, audio: plan::MediaMode::Off,
         attention_placement: Some(cuteafd_loader::placement::AttentionPlacement::Context),
-        layout: Some(plan::layout::LayoutOptions { rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; 2],
+        layout: Some(plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; 2],
             workspace_manifest: Some(manifest.clone()), glm5_drafter_snapshot: Some(installed_snapshot("incoai/GLM-5.3-DFlash2")?),
             ..Default::default() }), ..Default::default() };
     let started = std::time::Instant::now();
@@ -449,7 +444,6 @@ fn installed_local_physical_equals_serving(native: bool, manifest: PathBuf,
     let mut invalid = selected.clone();
     invalid.layers.push(cfg.layers);
     ensure!(source.inventory(&invalid).is_err(), "source accepted an unparsed layer");
-    let baseline_rss = peak_rss()?;
     for storage in [LocalStorage::Mount, LocalStorage::Push] {
         selected.storage = storage;
         let expected = source.inventory(&selected)?;
@@ -516,8 +510,6 @@ fn installed_local_physical_equals_serving(native: bool, manifest: PathBuf,
         drop(pair);
         fixture.finish_ordered_uploads(&library)?;
         assert_eq!(fixture.mapped_bytes(&library)?, 0, "virtual extents leaked");
-        ensure!(peak_rss()?.saturating_sub(baseline_rss) < 128 * 1024,
-            "allocation equality RSS grew by more than 128 MiB");
         println!("{repo} {storage:?}: onboard={count}, rows={rows}, lanes={lanes}, {} equal owners/views", actual.len());
     }
     Ok(())

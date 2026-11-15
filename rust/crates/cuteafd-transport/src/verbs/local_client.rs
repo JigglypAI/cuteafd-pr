@@ -714,13 +714,13 @@ mod tests {
         client.shutdown(std::net::Shutdown::Write)?;
         let worker = std::thread::spawn(move || -> Result<()> {
             assert_eq!(std::io::Read::read(&mut server, &mut [0u8; 1])?, 0);
-            std::thread::sleep(Duration::from_millis(300));
+            std::thread::sleep(Duration::from_millis(10));
             drop(server);
             Ok(())
         });
         let mut transport = LocalTp4Client::new_ranks(Vec::new(), TcpTransportConfig::default(), 0);
         transport.retired.push((client, peer));
-        transport.drain_retired()?;
+        transport.drain_retired_with_timeout(Duration::from_millis(200))?;
         worker.join().unwrap()?;
         // A peer that never releases: the reconnect fails at the bound.
         let client = TcpStream::connect(listener.local_addr()?)?;
@@ -728,9 +728,9 @@ mod tests {
         let peer = client.peer_addr()?;
         transport.retired.push((client, peer));
         let started = Instant::now();
-        let error = transport.drain_retired().unwrap_err();
+        let error = transport.drain_retired_with_timeout(Duration::from_millis(30)).unwrap_err();
         let waited = started.elapsed();
-        assert!(waited >= RING_RELEASE_TIMEOUT && waited < RING_RELEASE_TIMEOUT + Duration::from_secs(1), "{waited:?}");
+        assert!(waited >= Duration::from_millis(30) && waited < Duration::from_secs(1), "{waited:?}");
         assert!(format!("{error:#}").contains("did not release its rings"), "{error:#}");
         Ok(())
     }

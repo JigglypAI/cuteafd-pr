@@ -163,7 +163,7 @@ fn coordinator_inventory<'n>(cfg: &GlmDsaConfig, names: impl IntoIterator<Item =
         let suffix = name.strip_prefix("glm_").or_else(|| name.strip_prefix("glm2_"))
             .context("GLM packed catalogue namespace")?;
         let role = match suffix {
-            "norm" | "router_scores" | "expert_input_quant" => PackedRows,
+            "norm" | "norm_head_split" | "router_scores" | "expert_input_quant" => PackedRows,
             "dsa_candidate_merge" | "lse_combine2" | "paged_staging_gather_kv"
                 | "paged_staging_gather_index" => SequenceLocal,
             _ => {
@@ -330,13 +330,13 @@ mod tests {
     #[test]
     fn exact_inventory_reviews_startup_programs_and_rejects_new_routes() -> Result<()> {
         use prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
-        let names = ["glm_norm", "glm_router_scores", "glm_expert_input_quant",
+        let names = ["glm_norm", "glm_norm_head_split", "glm_router_scores", "glm_expert_input_quant",
             "glm_ffn_i2048_m4096", "glm_ffn_i12288_pt_m4096", "glm_producer_m4096",
             "glm_index_topk_prefill_m4096", "glm_stage_swiglu_i2048",
             "glm2_ffn_i1024_bf16_m4096", "glm2_stage_query_rope_context_m4096",
             "glm_sparse_mla_decode_m64"];
         let inventory = coordinator_inventory(&glm_cfg(), names, true)?;
-        for name in ["glm_norm", "glm_router_scores", "glm_expert_input_quant",
+        for name in ["glm_norm", "glm_norm_head_split", "glm_router_scores", "glm_expert_input_quant",
             "glm_ffn_i2048_m4096", "glm_ffn_i12288_pt_m4096", "glm_stage_swiglu_i2048",
             "glm2_ffn_i1024_bf16_m4096"] {
             assert!(inventory.contains(&(name.to_owned(), PackedRows)));

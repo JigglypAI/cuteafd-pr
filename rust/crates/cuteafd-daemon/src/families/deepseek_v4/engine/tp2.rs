@@ -709,9 +709,11 @@ mod tests {
             for local in [0, 1, layers / 2, layers] {
                 for broadcast in [false, true] {
                     for waves in [1, 2, 3] {
-                        assert_eq!(order::check_submission_faults(&unit_schedule(layers, local, waves, broadcast)?), Ok(()));
+                        let unit = unit_schedule(layers, local, waves, broadcast)?;
+                        assert_eq!(if layers <= 6 { order::check_submission_faults(&unit) } else { order::check(&unit) }, Ok(()));
                     }
-                    assert_eq!(order::check_submission_faults(&schedule(layers, local, 1, true, broadcast)), Ok(()));
+                    let decode = schedule(layers, local, 1, true, broadcast);
+                    assert_eq!(if layers <= 6 { order::check_submission_faults(&decode) } else { order::check(&decode) }, Ok(()));
                 }
             }
         }
@@ -720,7 +722,7 @@ mod tests {
 
     #[test]
     fn draft_stages_between_target_submissions_drain_on_shared_flags() {
-        for layers in [43, 61] {
+        for layers in [1, 2, 43, 61] {
             for local in [0, 1, layers] {
                 for broadcast in [false, true] {
                     let mut combined = Schedule::default();
@@ -741,7 +743,7 @@ mod tests {
                         }
                         combined.end_request();
                     }
-                    assert_eq!(order::check_submission_faults(&combined), Ok(()));
+                    assert_eq!(if layers <= 2 { order::check_submission_faults(&combined) } else { order::check(&combined) }, Ok(()));
                 }
             }
         }

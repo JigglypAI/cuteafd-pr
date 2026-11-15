@@ -344,7 +344,7 @@ impl FamilyModel for Model {
     fn configure(&mut self) -> Result<(), ConfigError> {
         self.core.validate_runtime_groups(&self.cfg).map_err(ConfigError::from_anyhow)
     }
-    fn native_serving_admission(&self) -> bool { self.cfg.dsa.is_none() }
+    fn native_serving_admission(&self) -> bool { self.core.serving_qualified(&self.cfg) }
     fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
         if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
     }

@@ -29,3 +29,5 @@ pub(crate) mod reference;
 mod core_native_tests;
 #[cfg(test)]
 mod core_layer_tests;
+#[cfg(test)]
+mod scoring_qualification;

@@ -239,11 +239,9 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn required_queries_the_library_without_creating_a_cuda_owner() {
-        let root = std::path::PathBuf::from(std::env::var_os("TMPDIR").unwrap_or_else(||
-            std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
-                .join(".cache/cuteafd/builds/pcm-required/tmp").into_os_string()))
-            .join(format!("pcm-required-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let parent = std::path::PathBuf::from(std::env::var_os("TMPDIR").expect("test TMPDIR"));
+        let directory = tempfile::tempdir_in(parent).unwrap();
+        let root = directory.path();
         let source = root.join("mock.c");
         let library = root.join("mock.so");
         // Only the query symbol is provided: owner creation cannot be invoked.
@@ -262,7 +260,6 @@ int cuteafd_pcm_required(const void *spec, struct Ledger *out) {
         let ledger = NativePcmAudio::required(&library, &PcmSpec::default()).unwrap();
         assert_eq!(ledger, PcmLedger { weights:4096, scratch:8192, device_allocations:2, encodes:0 });
         assert!(NativePcmAudio::required(&root.join("missing.so"), &PcmSpec::default()).is_err());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

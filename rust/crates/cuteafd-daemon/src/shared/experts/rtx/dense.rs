@@ -503,7 +503,7 @@ pub(crate) mod testing {
         use std::path::PathBuf;
         let root = PathBuf::from(std::env::var_os("HOME").context("HOME")?)
             .join(".cache/cuteafd/builds/dense-staging-order-fixture");
-        let fixture = Fixture::build_in(&root)?;
+        let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
         fixture.configure_memory(&library, 0, 1 << 30)?;
         fixture.quiet_events(&library, true)?;

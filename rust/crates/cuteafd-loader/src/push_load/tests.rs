@@ -546,19 +546,19 @@ fn hub_progress_resets_receive_idle_timeout_instead_of_total_load_deadline() {
         assert_eq!(request(&conn), Request::Start);
         event(&conn, Event::Planned(Forecast::default()));
         for done in 0..20 {
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(10));
             event(&conn, Event::Progress { done, total: 20 });
         }
         event(&conn, Event::Done);
     });
-    let client = PushClient::at(server.client.socket.clone(), Duration::from_secs(1)).unwrap();
+    let client = PushClient::at(server.client.socket.clone(), Duration::from_millis(120)).unwrap();
     let group = client.create(vec![], vec![]).unwrap();
     group.start().unwrap();
     let started = std::time::Instant::now();
     for expected in 0..20 {
         assert!(matches!(group.next().unwrap(), Event::Progress { done, .. } if done == expected));
     }
-    assert!(started.elapsed() > Duration::from_secs(1));
+    assert!(started.elapsed() > Duration::from_millis(120));
     assert!(matches!(group.next().unwrap(), Event::Done));
     drop(group);
     server.finish();
@@ -728,21 +728,21 @@ fn joined_rank_waits_for_the_group_start_then_keeps_the_idle_deadline() {
         assert!(matches!(request(&conn), Request::Join { .. }));
         event(&conn, Event::Joined);
         // Slow peers: nothing for several idle deadlines.
-        thread::sleep(Duration::from_millis(900));
+        thread::sleep(Duration::from_millis(120));
         event(&conn, Event::Progress { done: 0, total: 1 });
         // Then the group stalls: the idle deadline must fire.
-        thread::sleep(Duration::from_millis(900));
+        thread::sleep(Duration::from_millis(120));
     });
-    let client = PushClient::at(server.client.socket.clone(), Duration::from_millis(200)).unwrap();
+    let client = PushClient::at(server.client.socket.clone(), Duration::from_millis(50)).unwrap();
     let ring = tempfile::tempfile().unwrap();
     let rank = client
         .join(JoinArgs { group: 7, token: 11, rank: 0, ring_fd: ring.as_raw_fd(), slots: 1, slot_bytes: 4096 })
         .unwrap();
-    let first = rank.first(Duration::from_secs(5), Duration::from_millis(200)).unwrap();
+    let first = rank.first(Duration::from_secs(5), Duration::from_millis(50)).unwrap();
     assert!(matches!(first, Event::Progress { .. }));
     let started = std::time::Instant::now();
     assert_eq!(rank.next().unwrap_err().kind(), io::ErrorKind::TimedOut);
-    assert!(started.elapsed() < Duration::from_millis(800), "the idle deadline applies after the start");
+    assert!(started.elapsed() < Duration::from_millis(400), "the idle deadline applies after the start");
     drop(rank);
     server.finish();
 }

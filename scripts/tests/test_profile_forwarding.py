@@ -11,7 +11,7 @@ import pytest
 from test_run_family_dispatch import GLMF_TWO_LAYER, _family_launch_result
 
 ROOT = Path(__file__).resolve().parents[2]
-HOST = socket.gethostname().split('.')[0]
+HOST = 'coordinator-test'
 
 
 def _helper(*args):

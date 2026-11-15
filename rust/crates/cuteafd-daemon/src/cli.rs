@@ -220,6 +220,9 @@ pub(crate) enum Commands {
     /// Qualify native MiniMax full-model prefill with real Spark experts.
     #[command(hide = true)]
     MinimaxGolden(crate::families::minimax_m3::golden::GoldenArgs),
+    /// Qualify a native coordinator-only Inkling target prefix.
+    #[command(hide = true)]
+    Inkling2Golden(crate::families::inkling2::golden::GoldenArgs),
     /// Qualify MiniMax whole-rank serving on the shared scheduler.
     #[command(hide = true)]
     ServeMinimax(crate::families::minimax_m3::serve::ServeArgs),
@@ -327,8 +330,8 @@ impl CoreViewArgs {
     }
 }
 
-/// The served core identity a card and fidelity pairing read: `core-view`, its fingerprint and
-/// the FP8 recipe (`none` unless fp8-compact), published only when the checkpoint declares views
+/// The served core identity a card and fidelity pairing read: `core-view`, its fingerprint,
+/// the FP8 recipe and original dtype, published only when the checkpoint declares views
 /// (MC). A plain checkpoint has only its own core, so every such record, the `--core-view`
 /// launch default included, is withdrawn rather than reported as `original`.
 pub(crate) fn publish_core_view(view: &cuteafd_loader::plan::checkpoint::CheckpointView) {
@@ -343,11 +346,12 @@ pub(crate) fn publish_core_view(view: &cuteafd_loader::plan::checkpoint::Checkpo
 }
 
 pub(crate) fn core_view_settings(view: &cuteafd_loader::plan::checkpoint::CheckpointView)
-    -> [(&'static str, Option<String>); 3] {
+    -> [(&'static str, Option<String>); 4] {
     let declared = view.declared_view();
     [("core-view", declared.map(|v| v.name().to_owned())),
         ("core-view-fingerprint", declared.map(|_| view.fingerprint().to_owned())),
-        ("core-fp8-recipe", declared.map(|_| view.fp8_recipe().unwrap_or("none").to_owned()))]
+        ("core-fp8-recipe", declared.map(|_| view.fp8_recipe().unwrap_or("none").to_owned())),
+        ("core-original-dtype", view.original_core_dtype().map(str::to_owned))]
 }
 
 #[derive(Debug, Clone, Args)]
@@ -849,14 +853,15 @@ mod tests {
             let view = CheckpointView::select(mc.path(), mode)?;
             assert_eq!(super::core_view_settings(&view), [("core-view", Some(mode.name().to_owned())),
                 ("core-view-fingerprint", Some(view.fingerprint().to_owned())),
-                ("core-fp8-recipe", Some(recipe.to_owned()))]);
+                ("core-fp8-recipe", Some(recipe.to_owned())),
+                ("core-original-dtype", Some("BF16".into()))]);
         }
         // A plain (K4/K6-core, vendor FP8 or BF16) checkpoint has no view to report.
         let plain = tempfile::tempdir()?;
         testing::write_snapshot(plain.path(), &testing::kimi_k3_config(), &testing::kimi_k3_tensors(false), None);
         let view = CheckpointView::select(plain.path(), CoreView::Original)?;
         assert_eq!(super::core_view_settings(&view),
-            [("core-view", None), ("core-view-fingerprint", None), ("core-fp8-recipe", None)]);
+            [("core-view", None), ("core-view-fingerprint", None), ("core-fp8-recipe", None), ("core-original-dtype", None)]);
         let mut context = cuteafd_bench::context::ServerContext { settings: vec![cuteafd_bench::report::Setting {
             name: "core-view".into(), value: Some("original".into()), default: Some("original".into()),
             source: "default".into() }], ..Default::default() };

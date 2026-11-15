@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -81,7 +82,7 @@ def test_deployment_preserves_release_container_commands(
     current = capture(ROOT, entry["name"], release_entry=selected)
     assert [run["host"] for run in current["containers"]] == [run["host"] for run in golden]
     for old, new in zip(golden, current["containers"]):
-        before, after = namespace_launch_contract(parse_run(old["argv"])), parse_run(new["argv"])
+        before, after = namespace_launch_contract(parse_run(old["argv"])), parse_run([arg.replace(os.environ["CUTEAFD_FUSE_SYSFS_ROOT"], "/sys/fs/fuse/connections").replace(os.environ["CUTEAFD_SPARKNEST_RUN_DIR"], "/srv/sparknest/run") for arg in new["argv"]])
         if entry["name"].endswith(("-fp8-reply", "-nvfp4-reply")):
             # The historical max capture used a WIP slot. These showcases use
             # release images: remove only that slot's exact mounts/env/entrypoint.
