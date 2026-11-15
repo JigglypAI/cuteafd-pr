@@ -131,7 +131,7 @@ def test_native_attention_groups_cover_checkpoint_shapes_and_f32_partials():
         assert f"n{n}_k{k}_m4096_f32" not in expected, "head is microbatched at64rows"
     assert exporter.mc_fp8_core_shapes()["glm"] >= {(640,6144),(1024,6144),(6144,1024),(6144,2048)}
     assert exporter.mc_fp8_core_shapes()["step5"] >= {(384,4096),(768,4096),(4096,8192),(4096,13824)}
-    assert exporter.mc_fp8_f32_shapes() == {(6144,1024),(6144,2048)}
+    assert exporter.mc_fp8_f32_shapes() == {(6144,1024),(6144,2048),(6144,6144)}
     assert len(programs) == len(expected) and {p[0] for p in programs} == expected
     jobs = {job[0]: job[1:] for job in compare_sm.jobs("all")}
     assert jobs["native-attention-fp8"] == ("export_b12x_dsv4_aot.py",
@@ -1341,6 +1341,23 @@ def build(args):
     package = SimpleNamespace(__file__=str(source))
     assert compare_sm.routed_package_layouts(package, 'mimo', None, 'spark') == [
         'tp2', 'tp4', 'tp2-w128', 'tp4-w128']
+
+
+def test_source_routed_layouts_stop_at_tuple_wire_assignment(tmp_path, monkeypatch):
+    source = tmp_path / 'package.py'
+    source.write_text('''
+def build(args):
+    capacities = []
+    layouts = args.layouts.split(',')
+    kind = input_kind(args.role, args.input)
+    wire, nvfp4_input = kind == 'wire', kind == 'nvfp4'
+    raise AssertionError('must not enter compilation')
+''')
+    monkeypatch.setattr(compare_sm, 'ROOT', tmp_path)
+    scope = SimpleNamespace(PREVIOUS_RELEASE_FLOOR={'GENERIC_SPARK_COUNTS': {'mimo=2'}})
+    monkeypatch.setattr(compare_sm, 'load_file', lambda *args: scope)
+    package = SimpleNamespace(__file__=str(source))
+    assert compare_sm.routed_package_layouts(package, 'mimo', None, 'spark') == ['tp2']
 
 
 def test_spark_routed_groups_follow_shared_width_aliases_and_input_formats():
