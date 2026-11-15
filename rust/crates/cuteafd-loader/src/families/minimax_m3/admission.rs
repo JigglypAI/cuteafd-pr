@@ -172,6 +172,10 @@ fn measured_graph_base(gpus: usize, sequences: u64, rank: usize,
         // measured Ready graph owners 62/42 MiB; one physical tail each.
         (2, 16, 0, AttentionPlacement::Layers, Some(WirePrecision::F32)) => (65_011_712, 2 << 20),
         (2, 16, 1, AttentionPlacement::Layers, Some(WirePrecision::F32)) => (44_040_192, 2 << 20),
+        // Heads C16 rows1/4/16 census at8f993c862:711/540 independent sections,
+        // measured82/64MiB; each physical device receives one allocation tail.
+        (2, 16, 0, AttentionPlacement::Heads, _) => (82 << 20, 2 << 20),
+        (2, 16, 1, AttentionPlacement::Heads, _) => (64 << 20, 2 << 20),
         _ => (0, 0),
     }
 }
@@ -206,11 +210,21 @@ mod graph_tests {
     }
 
     #[test]
+    fn measured_heads_graphs_have_independent_rank_bases_and_one_tail() {
+        for (rank, measured, total) in [(0, 82 << 20, 168 << 20), (1, 64 << 20, 132 << 20)] {
+            let (base, tail) = measured_graph_base(2, 16, rank, crate::placement::AttentionPlacement::Heads, None);
+            assert_eq!((base, tail), (measured, 2 << 20));
+            let policy = crate::placement::graph_reserve::resolve(None, rank, false, base, tail).unwrap();
+            assert_eq!(policy.bytes, total);
+        }
+    }
+
+    #[test]
     fn untraced_split_attention_or_wire_never_borrows_layers_base() {
         use crate::placement::AttentionPlacement;
         use super::super::execution::WirePrecision;
         for rank in 0..2 {
-            for attention in [AttentionPlacement::Heads, AttentionPlacement::Context] {
+            for attention in [AttentionPlacement::Context] {
                 assert_eq!(measured_graph_base(2, 16, rank, attention, Some(WirePrecision::F32)), (0, 0));
             }
             for wire in [None, Some(WirePrecision::Bf16)] {
@@ -243,9 +257,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
         .map_err(|error| refused(format!("MiniMax request capacities refused: {error}"),
             "Use concurrency 1..64 and prefill unit rows 1..4096."))?;
     let routed = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
-    let attention = request.attention.unwrap_or(if gpus == 2 {
-        crate::placement::AttentionPlacement::Layers
-    } else { crate::placement::AttentionPlacement::Heads });
+    let attention = request.attention.unwrap_or(crate::placement::AttentionPlacement::Heads);
     let heads = gpus == 2 && attention == crate::placement::AttentionPlacement::Heads;
     if attention == crate::placement::AttentionPlacement::Context
         || (gpus == 1 && attention != crate::placement::AttentionPlacement::Heads) {

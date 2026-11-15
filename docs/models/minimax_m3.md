@@ -16,15 +16,52 @@ older image tags. Shared settings are in [MiniMax Serving](../options.md#minimax
 Keep `SPECULATOR=off`, `VISION=off` and `AUDIO=off`: bundled drafter/media
 integration remains pending [#1856](https://github.com/tpurtell/cuteafd/issues/1856).
 
-`ATTENTION_PLACEMENT=auto|heads` selects whole ownership on one RTX. On two RTX,
-`auto|layers` selects contiguous attention with qualified FP32 split FFNs
-([#2101](https://github.com/tpurtell/cuteafd/pull/2101)). Boot-C16 router, split FFN
-and fold/publication sections use bounded shared graph replay (#2112); attention
-and peer receive waits remain eager. The measured per-rank graph arenas are
-62 / 42 MiB, each with one 2 MiB tail and the shared runtime-extra rule.
-Explicit two-RTX narrow heads remain
-planning-only because their native kernels are unqualified (#1856). Context
-placement is not implemented. Planning inventories are not serving qualification.
+`ATTENTION_PLACEMENT=auto|heads` retains whole-layer ownership on one RTX
+(the API calls its single-rank mode `heads`). On two RTX, `auto|heads` selects
+native head splitting: 32 query heads, two KV heads and two index query heads
+per rank, half KV and one independent full index copy per rank. Explicit
+`layers` retains contiguous attention with qualified FP32 split FFNs.
+Context placement is not implemented.
+
+Heads decode Q/K/V/index projection, O projection, router and half-FFNs replay
+through the shared graph cache; context-sensitive attention and peer
+publish/wait/merge stay eager. Boot-C16 rows 1/4/16 measured graph arenas are
+82 / 64 MiB with 711 / 540 sections, one 2 MiB tail per rank and shared extra:
+168 / 132 MiB default reserves. Layers remains 128 / 88 MiB. Native Heads
+512-row raw logits are byte-identical between graphs and eager, across two
+repeats, with zero steady captures or evictions. All 60-layer prompt/turn
+snapshot banks, replicated indexes, partial pages and siblings are byte-exact.
+
+### Heads Default Decision (#2132)
+
+TJ selected Heads as the two-RTX default on 2026-11-15 after reviewing the
+same-build two-RTX + four-Spark A/B in both arm orders. One RTX is unchanged.
+
+| Metric | Layers | Heads | Heads / Layers |
+| --- | ---: | ---: | ---: |
+| C1 code decode (tok/s) | 34.015 | 37.820 | 1.112 |
+| 8K prefill (tok/s) | 2218.95 | 2336.01 | 1.053 |
+| C16 confirm, Heads first (tok/s) | 235.400 | 284.182 | 1.207 |
+| C16 earlier, reclaim-contaminated (tok/s) | 226.723 | 218.695 | 0.965 |
+
+Start PSI was CPU/memory 0/0; confirm start page reclaim was zero. Timed Heads
+C16 nevertheless recorded 13,693 pages/s reclaim in the confirm and 31,090 in
+the earlier order. These caveats remain part of the evidence: the default is
+user-approved, not represented as a reclaim-clean speed verdict. Both GPUs
+recorded zero power-cap/thermal slowdown, busy clocks about 2.80 / 2.85 GHz,
+maximum 63 C and minimum T.Limit headroom 32 C.
+
+Quick generated fidelity passes on both layouts: Layers KL 0.023462 / top-1
+95.2312%, Heads KL 0.024686 / top-1 94.9422%. Prompt 9745 / turn 9343 restore
+and cold recomputation are byte-identical within each layout. FP32 reduction
+order can cross MXFP8/NVFP4 quantization thresholds; exact teacher-forced FFN
+inputs produce byte-identical Heads/Layers output at all tested row sizes.
+
+Host ownership differs only by a 120 KiB expert-usage mirror. The 32 GiB host
+prefix cache, 2.02 GiB RDMA rings, 97.44 MiB Spark intake and 4.42 MiB sync-H2D
+staging are identical. Replicated KV/index buffers are on-device. Startup
+non-file RSS is about 2.23 MiB higher for Heads; whole-host anonymous growth
+in the timed windows is not process-attributable from the retained probes.
 
 ## Qualification
 

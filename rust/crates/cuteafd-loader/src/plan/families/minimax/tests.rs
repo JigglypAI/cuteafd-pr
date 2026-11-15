@@ -245,7 +245,7 @@ fn only_optional_bundled_components_keep_missing_execution_hints() {
 }
 
 #[test]
-fn qualified_whole_and_fp32_split_keep_narrow_heads_gated() {
+fn qualified_whole_fp32_split_and_narrow_heads_are_executable() {
     use crate::placement::OnboardSetting;
     let (dir, inputs) = heads_recipe_fixture_with_experts(128);
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
@@ -253,6 +253,9 @@ fn qualified_whole_and_fp32_split_keep_narrow_heads_gated() {
         &checkpoint, &inputs.cfg, 1, &vec![0; inputs.cfg.layers]).unwrap();
     let mut programs = inputs.manifest["programs"].as_array().unwrap().clone();
     programs.extend(dense_manifest(&whole[0])["programs"].as_array().unwrap().clone());
+    let whole_producers: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../../cuteafd-ffi/tests/fixtures/minimax_producer_programs.json")).unwrap();
+    programs.extend(whole_producers["programs"].as_array().unwrap().clone());
     programs.extend(recipe_inputs(2, 4).manifest["programs"].as_array().unwrap().clone());
     let programs = programs.into_iter().map(|program| (program["name"].as_str().unwrap().to_owned(), program))
         .collect::<std::collections::BTreeMap<_, _>>().into_values().collect::<Vec<_>>();
@@ -281,9 +284,8 @@ fn qualified_whole_and_fp32_split_keep_narrow_heads_gated() {
     assert!(supported.executable());
     assert_eq!(supported.runtime, Some(RuntimeStatus::Serving));
     pair.attention_placement = Some(crate::placement::AttentionPlacement::Heads);
-    let unsupported = plan::plan(dir.path(), &pair).unwrap();
-    assert!(!unsupported.native_serving_admitted && !unsupported.wip_launchable()
-        && !unsupported.executable());
+    let heads = plan::plan(dir.path(), &pair).unwrap();
+    assert!(heads.native_serving_admitted && heads.wip_launchable() && heads.executable());
 }
 
 #[test]
@@ -330,7 +332,9 @@ fn cache_geometry_preserves_native_fp8_pages_and_physical_layer_owners() {
     assert_eq!(single.placement, KvPlacement::SingleDevice);
     assert_eq!(single.ranks[0].persistent_unit_bytes, cfg.layers as u64 * (2 * kv + index));
     for gpus in [1, 2] {
-        let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: gpus, ..Default::default() }).unwrap().unwrap();
+        let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: gpus,
+            attention_placement: Some(if gpus == 2 { AttentionPlacement::Layers } else { AttentionPlacement::Heads }),
+            ..Default::default() }).unwrap().unwrap();
         let owners = crate::placement::families::minimax_m3::layer_owners(cfg.layers, gpus);
         let native = crate::families::minimax_m3::execution::MsaCache::new(cfg.layers as u32, 1, 1, 64).unwrap();
         let native = native.buffers().unwrap();
@@ -1539,10 +1543,50 @@ fn heads_recipe_fixture_with_experts(experts: usize) -> (tempfile::TempDir, crat
     inputs.owners.clear();
     let mut manifest = (*inputs.manifest).clone();
     let programs = manifest["programs"].as_array_mut().unwrap();
-    // Heads planning still selects the whole-width OAI producer inventory.
-    for (half, whole) in [(1536, 3072), (6144, 12288)] {
-        let entry = programs.iter_mut().find(|e| e["name"] == format!("minimax_oai_split_i{half}")).unwrap();
-        *entry = serde_json::from_str(&entry.to_string().replace(&half.to_string(), &whole.to_string())).unwrap();
+    // Mirror the installed native narrow programs, not whole-width scratch.
+    for entry in programs.iter_mut() {
+        let name = entry["name"].as_str().unwrap().to_owned();
+        if let Some(mode) = [cuteafd_ffi::minimax_m3::Mode::IndexDecode, cuteafd_ffi::minimax_m3::Mode::IndexPrefill,
+            cuteafd_ffi::minimax_m3::Mode::AttentionDecode, cuteafd_ffi::minimax_m3::Mode::AttentionExtend]
+            .into_iter().find(|mode| mode.name() == name) {
+            let index = matches!(mode, cuteafd_ffi::minimax_m3::Mode::IndexDecode | cuteafd_ffi::minimax_m3::Mode::IndexPrefill);
+            let extent = entry["geometry"][if index { "max_pages" } else { "max_batch" }].as_u64().unwrap() as u32;
+            let rows = entry["capacity_rows"].as_u64().unwrap() as u32;
+            let layout = cuteafd_ffi::minimax_m3::Layout::for_heads(mode, rows, extent).unwrap();
+            entry["name"] = layout.name().into();
+            if index { entry["geometry"]["heads"] = 2.into(); }
+            else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); }
+            entry["scratch_bytes_at_capacity"]["scratch"] = layout.scratch.into();
+            for pointer in entry["pointers"].as_array_mut().unwrap() {
+                let shape = pointer["shape"].as_str().unwrap();
+                pointer["shape"] = if pointer["name"] == "scratch" { format!("[{}]", layout.scratch) }
+                    else if pointer["name"] == "q2k_indices" { shape.replacen("[4,", "[2,", 1) }
+                    else { shape.replace(",4]", ",2]").replace(",4,128]", ",2,128]").replace("[rows,64", "[rows,32") }.into();
+            }
+        } else if name == "minimax_norm_rope_h64" || name == "minimax_norm_rope_h4" {
+            let whole = if name.ends_with("h64") { 64 } else { 4 };
+            let half = whole / 2;
+            entry["name"] = format!("minimax_norm_rope_h{half}").into();
+            entry["geometry"]["heads"] = half.into();
+            entry["scratch_bytes_at_capacity"]["scratch"] = (4096 * half * 256).into();
+            for pointer in entry["pointers"].as_array_mut().unwrap() {
+                pointer["shape"] = pointer["shape"].as_str().unwrap().replace(&format!(",{whole},128]"), &format!(",{half},128]")).into();
+            }
+        } else if name == "minimax_index_producer" {
+            entry["name"] = "minimax_index_producer_h2".into();
+            entry["geometry"]["heads"] = 2.into();
+            entry["scratch_bytes_at_capacity"]["scratch"] = (4096 * 5 * 128 * 2).into();
+            for pointer in entry["pointers"].as_array_mut().unwrap() {
+                pointer["shape"] = pointer["shape"].as_str().unwrap().replace(",4,128]", ",2,128]")
+                    .replace(",4]", ",2]").replace(",9,128]", ",5,128]").into();
+            }
+        } else if name == "minimax_kv_pack" {
+            entry["name"] = "minimax_kv_pack_h2".into();
+            entry["geometry"]["heads"] = 2.into();
+            for pointer in entry["pointers"].as_array_mut().unwrap() {
+                pointer["shape"] = pointer["shape"].as_str().unwrap().replace(",4", ",2").into();
+            }
+        }
     }
     let mut exports = std::collections::BTreeMap::new();
     for target in &inputs.targets {
@@ -1597,8 +1641,7 @@ fn heads_recipe_matches_native_cache_units_peer_slots_and_one_tail_per_backing()
             let index = (0..inputs.cfg.layers).map(|layer|
                 allocations[&Owner::HeadsKv { gpu, layer, plane: "index" }.id()].1).sum::<u64>();
             assert_eq!(index, inputs.cfg.layers as u64 * 8448, "one replicated index per layer per rank");
-            let mut slots = vec![capacity.decode.rows];
-            slots.extend((0..inputs.prefill.waves).map(|_| capacity.prefill.rows));
+            let slots = HeadsLayout::serialized_peer_rows(capacity.decode.rows, capacity.prefill.rows).unwrap();
             for (name, bytes) in HeadsLayout::peer_buffers(&slots, false).unwrap() {
                 assert_eq!(allocations[&format!("minimax.heads.peer.{gpu}.{name}")], (location, bytes));
             }
@@ -1637,15 +1680,13 @@ fn heads_recipe_matches_native_cache_units_peer_slots_and_one_tail_per_backing()
 }
 
 #[test]
-fn heads_planning_does_not_qualify_serving_and_auto_keeps_layers() {
-    use crate::placement::families::minimax_m3::{self as shared, ServingRefusal};
+fn explicit_heads_and_layers_both_qualify_serving() {
+    use crate::placement::families::minimax_m3 as shared;
     use crate::placement::{AttentionPlacement, planner::Operation};
     let heads = heads_recipe_inputs();
     let request = shared::request(heads.context, Some(1 << 20), crate::placement::Onboard::Auto,
         heads.prefill, Operation::Serving, None, Default::default());
-    let error = heads.admit_serving(request.clone()).unwrap_err();
-    assert!(matches!(error, ServingRefusal::NarrowHeadsNotQualified));
-    assert_eq!(error.to_string(), "narrow-head MiniMax kernels not qualified");
+    assert!(heads.admit_serving(request.clone()).is_ok());
     assert!(heads.admit(request).is_ok(), "explicit planning remains available");
     let layers = recipe_inputs(2, 4);
     assert_eq!(layers.attention, AttentionPlacement::Layers);
@@ -1668,6 +1709,8 @@ fn heads_cache_geometry_keeps_one_replicated_index_per_rank() {
     let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: 2,
         attention_placement: Some(AttentionPlacement::Heads), ..Default::default() }).unwrap().unwrap();
     assert_eq!(geometry.placement, KvPlacement::PartitionedHeads);
+    let automatic = model.cache_geometry(CacheOptions { coordinator_ranks: 2, ..Default::default() }).unwrap().unwrap();
+    assert_eq!(automatic, geometry);
     for rank in geometry.ranks {
         assert_eq!(rank.persistent_unit_bytes, 4 * (16384 + 16384 + 8448));
     }
@@ -1773,7 +1816,7 @@ fn measured_context_changes_only_the_named_owner_with_a_pinned_pool() {
 fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pages() {
     use crate::families::minimax_m3::admission::{gather, Coordinator, FactsRequest};
     use crate::placement::{AttentionPlacement, CoordinatorCard, ResidentWeights};
-    let (dir, expected) = heads_recipe_fixture();
+    let (dir, expected) = heads_recipe_fixture_with_experts(128);
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = MiniMaxM3Config::from_hf(&checkpoint.config).unwrap();
     let catalog = crate::read_expert_catalog(dir.path()).unwrap();
@@ -1812,6 +1855,26 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
     assert!(gather(&request).unwrap_err().what.contains("sampled free bytes exceed physical capacity"));
     request.coordinator = planned;
     request.attention = None;
+    let automatic = gather(&request).unwrap();
+    assert!(automatic.heads());
+    assert_eq!(automatic.targets, heads.targets);
+    let solve = crate::placement::families::minimax_m3::request(automatic.context, Some(1 << 20),
+        crate::placement::Onboard::Layers(0), automatic.prefill,
+        crate::placement::planner::Operation::Serving, None, Default::default());
+    let planned = automatic.admit_serving(solve.clone()).unwrap();
+    let mut measured = automatic.clone();
+    for budget in &mut measured.budgets[..2] {
+        let crate::placement::planner::Baseline::Forecast { occupied, .. } = budget.baseline else { panic!("forecast baseline") };
+        budget.baseline = crate::placement::planner::Baseline::Sampled {
+            free: budget.physical_bytes - occupied, phase: crate::placement::planner::Phase::Load,
+            source: "same automatic Heads baseline".into() };
+    }
+    let runtime = measured.admit_serving(solve).unwrap();
+    assert_eq!(planned.solved.pool_tokens, runtime.solved.pool_tokens);
+    assert_eq!(planned.solved.decisions, runtime.solved.decisions);
+    assert_eq!(planned.solved.facts, runtime.solved.facts);
+    assert_eq!(planned.placement, runtime.placement);
+    request.attention = Some(AttentionPlacement::Layers);
     request.split_wire = Some(crate::families::minimax_m3::execution::WirePrecision::Bf16);
     let layers = gather(&request).unwrap();
     assert_eq!(layers.attention, AttentionPlacement::Layers);
@@ -1840,19 +1903,18 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
 
 
 #[test]
-fn explicit_heads_public_layout_remains_planned_and_auto_selects_layers() {
+fn explicit_and_auto_heads_public_layouts_are_executable() {
     use crate::placement::{AttentionPlacement, OnboardSetting};
     let (dir, inputs) = heads_recipe_fixture_with_experts(128);
     let manifest = dir.path().join("PROGRAMS.json");
-    // Auto now selects the qualified split path; this dual-placement fixture
-    // needs both the Heads and canonical split producer/dense inventories.
+    // Auto selects Heads; explicit Layers still needs its canonical producer/dense inventory.
     let split = recipe_inputs(2, 4);
     let programs = inputs.manifest["programs"].as_array().unwrap().iter()
         .chain(split.manifest["programs"].as_array().unwrap())
         .map(|entry| (entry["name"].as_str().unwrap().to_owned(), entry.clone()))
         .collect::<std::collections::BTreeMap<_, _>>();
     std::fs::write(&manifest, serde_json::json!({"programs": programs.into_values().collect::<Vec<_>> ()}).to_string()).unwrap();
-    for attention in [Some(AttentionPlacement::Heads), None] {
+    for attention in [Some(AttentionPlacement::Heads), None, Some(AttentionPlacement::Layers)] {
         let options = PlanOptions { attention_placement: attention,
             placement: plan::ExpertPlacement::Sparks { ranks: 4 },
             layout: Some(plan::layout::LayoutOptions {
@@ -1864,14 +1926,12 @@ fn explicit_heads_public_layout_remains_planned_and_auto_selects_layers() {
             }), ..Default::default() };
         let report = plan::plan(dir.path(), &options).unwrap();
         assert!(report.config_error.is_none(), "{:?}", report.config_error);
-        let qualified = attention.is_none();
-        assert_eq!(report.native_serving_admitted, qualified);
-        assert_eq!(report.wip_launchable(), qualified);
-        assert_eq!(report.placement_supported, qualified,
-            "only qualified FP32 split has a serving attachment");
-        assert_eq!(report.executable(), qualified);
-        assert_eq!(report.runtime, Some(if qualified { RuntimeStatus::Serving } else { RuntimeStatus::Planned }));
-        assert_eq!(report.attention_placement, attention.unwrap_or(AttentionPlacement::Layers));
+        assert!(report.native_serving_admitted);
+        assert!(report.wip_launchable());
+        assert!(report.placement_supported);
+        assert!(report.executable());
+        assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
+        assert_eq!(report.attention_placement, attention.unwrap_or(AttentionPlacement::Heads));
         let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("qualified default wire produces a shared solved plan: {report:#?}"));
         assert_eq!(placed.attention_placement, report.attention_placement);
         assert_eq!(plan::layout::LayoutOptions::default().minimax_split_wire,

@@ -109,8 +109,6 @@ fn split_selection(args: &GoldenArgs) -> Result<Option<([i32; 2], WirePrecision)
     let Some(peer) = args.split_device else { return Ok(None); };
     ensure!(args.device >= 0 && peer >= 0 && peer != args.device,
         "MiniMax golden peer must be a distinct nonnegative physical device");
-    ensure!(matches!(args.attention_placement.as_str(), "auto" | "layers"),
-        "MiniMax serving split golden requires layers attention placement");
     let wire = match args.wire.as_deref() {
         Some("bf16") => WirePrecision::Bf16,
         Some("fp32") => WirePrecision::F32,
@@ -323,13 +321,15 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
         placement::{AttentionPlacement, Onboard, ResidentWeights, planner::{Context as ModelContext, Operation, PrefillShape}}};
     use cuteafd_api::openai::probe::{Probe, ProbeSpec};
     let (devices, wire) = split_selection(&args)?.context("MiniMax split golden peer missing")?;
+    let attention = if args.attention_placement == "layers" { AttentionPlacement::Layers }
+        else { AttentionPlacement::Heads };
     ensure!(!args.decode || args.tap_layers.is_empty(), "MiniMax split layer taps require prefill scoring");
     let manifest: Arc<serde_json::Value> = Arc::new(serde_json::from_slice(&std::fs::read(&args.manifest)?)?);
     let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
     let fact_request = |coordinator| FactsRequest { checkpoint: &checkpoint, cfg: &cfg, catalog: &catalog,
         manifest_path: &args.manifest, manifest: Arc::clone(&manifest), coordinator,
-        attention: Some(AttentionPlacement::Layers), split_wire: Some(wire), physical_devices: &devices,
+        attention: Some(attention), split_wire: Some(wire), physical_devices: &devices,
         spark_ranks: args.peers.len(), spark_bytes: 100 << 30,
         prefill: PrefillShape { rows: u64::from(args.prefill_rows), waves: u64::from(args.prefill_waves) },
         context_tokens: u64::from(tokens), pool_tokens: Some(u64::from(tokens).div_ceil(64) * 64), sequences: 1,
@@ -413,7 +413,7 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
     let provenance = serde_json::json!({"family":"minimax_m3", "snapshot":view.snapshot(),
         "reference_manifest_sha256":fidelity_dataset::MINIMAX_M3_MANIFEST_SHA256,
         "native_lib":args.native_lib,"manifest_sha256":digest(&std::fs::read(&args.manifest)?),
-        "split_devices":devices,"attention_placement":"layers","wire":args.wire,
+        "split_devices":devices,"attention_placement":args.attention_placement,"wire":args.wire,
         "serving_execution":true,"decode":args.decode,"prefill_rows":args.prefill_rows,
         "prefill_waves":args.prefill_waves,"diagnostic_wire_not_qualified":true});
     std::fs::create_dir(&args.save_logits)?;
@@ -620,8 +620,8 @@ mod tests {
             assert_eq!(split_selection(&args)?, Some(([3, 1], expected)));
         }
         assert!(split_selection(&parse_args(&["--split-device", "0", "--wire", "bf16"])?).is_err());
-        assert!(split_selection(&parse_args(&["--split-device", "1", "--wire", "fp32",
-            "--attention-placement", "heads"])?).is_err());
+        assert_eq!(split_selection(&parse_args(&["--split-device", "1", "--wire", "fp32",
+            "--attention-placement", "heads"])?)?, Some(([0, 1], WirePrecision::F32)));
         Ok(())
     }
 

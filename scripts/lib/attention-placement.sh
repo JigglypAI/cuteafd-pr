@@ -25,8 +25,8 @@ release_check_attention_placement() {
     # Step-5 and Muse Spark run only their recorded automatic placement.
     heads:qwen3_5|context:qwen3_5)
       release_die "dense Qwen $attention_placement attention is unbuilt: native half-head GDN/GQA and dense FFN exports, shared reductions, and context KV/softmax merge are needed (#2133); use layers" ;;
-    auto:minimax_m3|heads:minimax_m3) ;;
-    *:minimax_m3) release_die "MiniMax WIP currently supports one-RTX whole attention (auto or heads)" ;;
+    auto:minimax_m3|heads:minimax_m3|layers:minimax_m3) ;;
+    *:minimax_m3) release_die "MiniMax supports auto or heads on one RTX and auto, layers or heads on two RTX" ;;
     auto:step5|auto:muse_spark) ;;
     *:step5|*:muse_spark) release_die "$family supports only ATTENTION_PLACEMENT=auto" ;;
     auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|layers:qwen4|layers:qwen3_5) ;;

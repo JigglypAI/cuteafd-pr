@@ -24,7 +24,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let ranks = requested.spark_ranks();
     report.bytes_by_owner.clear();
     let mut notes = vec![
-        "MiniMax shared contract (#1856 H1): one solve over named physical owners; serving stays Planned".to_string(),
+        "MiniMax shared contract (#1856 H1): one solve over named physical owners".to_string(),
     ];
     if opts.host_embedding {
         report.refuse_placement("MiniMax does not support --embedding-placement host yet (#1856 M7)".into(),
@@ -38,17 +38,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     report.prefill_reserve_rows = Some(prefill.span_rows);
     let shape = PrefillShape { rows: prefill.unit_rows, waves: prefill.waves };
-    let attention = report.requested_attention.unwrap_or(if gpus == 2 {
-        AttentionPlacement::Layers
-    } else { AttentionPlacement::Heads });
+    let attention = report.requested_attention.unwrap_or(AttentionPlacement::Heads);
     report.attention_placement = attention;
     if attention == AttentionPlacement::Context || (gpus == 1 && attention != AttentionPlacement::Heads) {
         report.refuse_placement(format!("MiniMax {attention} attention is not implemented on {gpus} RTX"),
             "Use heads on one RTX; layers or explicit heads on two RTX.");
         return empty(notes);
-    }
-    if gpus == 2 && attention == AttentionPlacement::Heads {
-        notes.push("Planning only: narrow-head MiniMax kernels not qualified; serving admission refuses heads".into());
     }
     let Some(manifest_path) = opts.workspace_manifest.clone().or_else(|| {
         let path = std::path::PathBuf::from("/opt/cuteafd/share/PROGRAMS.json");
@@ -120,10 +115,9 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return empty(notes);
         }
     };
-    // Trace-free serving cards qualify whole-rank and FP32 split contracts
-    // (#1856). Other geometries remain planning inventories, not fit refusals.
-    report.native_serving_admitted = !inputs.heads() && (gpus == 1
-        || (inputs.split() && inputs.split_wire == Some(crate::families::minimax_m3::execution::WirePrecision::F32)));
+    // Native Heads uses FP32 partials; Layers retains its separately qualified wire.
+    report.native_serving_admitted = inputs.heads() || gpus == 1
+        || (inputs.split() && inputs.split_wire == Some(crate::families::minimax_m3::execution::WirePrecision::F32));
     if report.native_serving_admitted {
         report.runtime = Some(crate::plan::RuntimeStatus::Serving);
         for component in &mut report.components {

@@ -91,10 +91,11 @@ trace-free serving cards (#1856).
 Use a build containing MiniMax native exports: MXFP8 dense math, NVFP4 W4A4
 experts, FP8 MSA KV/index, GPU embedding and device token selection.
 On one RTX, `ATTENTION_PLACEMENT=auto|heads` selects whole ownership. On two RTX,
-`auto|layers` selects contiguous attention and FP32 split FFNs. Boot-C16 split
+`auto|heads` selects native head splitting with half KV and replicated index.
+Explicit `layers` keeps contiguous attention and FP32 split FFNs. Boot-C16 split
 router, FFN and fold/publication sections replay through the shared graph cache;
-attention and peer receive waits stay eager. Explicit context placement and
-two-RTX narrow-head serving remain refused.
+attention and peer receive waits stay eager. Explicit two-RTX `heads` selects
+half KV with replicated index and native FP32 partials; context remains unsupported.
 `SPECULATOR=off`, `VISION=off` and `AUDIO=off` are required for this increment.
 
 Shared launch keys keep their usual meanings. MiniMax accepts
@@ -114,8 +115,36 @@ The bounded rows 1/4/16 bootstrap records no steady C1/C16 captures or evictions
 only private arithmetic/peer scratch is padded, never KV or request rows.
 Untraced rank/concurrency shapes keep an unpinned bootstrap with no borrowed
 measured base.
-Narrow heads remain planning-only pending
-[#1856](https://github.com/tpurtell/cuteafd/issues/1856); planning still reports their owners.
+Heads boot-C16 rows1/4/16 measured82/64MiB graph owners per rank (711/540
+sections), plus one2MiB allocation tail each. The shared extra rule charges
+168/132MiB by default; Layers stays128/88MiB. Attention and exchange stay eager.
+Native512-row graph/eager logits and repeats are byte-identical. Quick generated
+fidelity uses the same Mid bars; layout-dependent reduction order can change
+quantization thresholds. Two-RTX auto selects Heads (TJ, 2026-11-15); one RTX
+retains whole-layer execution, represented by the single-rank `heads` API value.
+The first short run measured Layers versus Heads-graphs C1/C16/8K at
+33.98/157.26/2215 versus 37.57/155.70/2336 tok/s, but host page reclaim
+contaminated the timing and the external cold-prefill probe aborted (#2132).
+TJ selected Heads as the two-RTX default after reviewing both orders; the
+reclaim flags remain recorded, not erased. Quick generated KL was
+0.02346 versus 0.02469 and top-1 95.23% versus 94.94%; both pass the Mid bars.
+
+| Metric | Layers | Heads | Heads / Layers |
+| --- | ---: | ---: | ---: |
+| C1 code decode (tok/s) | 34.015 | 37.820 | 1.112 |
+| 8K prefill (tok/s) | 2218.95 | 2336.01 | 1.053 |
+| C16 confirm, Heads first (tok/s) | 235.400 | 284.182 | 1.207 |
+| C16 earlier, reclaim-contaminated (tok/s) | 226.723 | 218.695 | 0.965 |
+
+Both orders started at CPU/memory PSI 0/0; the confirm also started with zero
+page scans. Heads C16 still recorded host reclaim (13,693 pages/s confirm,
+31,090 earlier); these are observations with a user-approved default, not a
+reclaim-clean speed qualification. Power-cap and thermal slowdown were zero;
+max temperature 63 C, minimum T.Limit headroom 32 C. Named host allocations
+differ only by 120 KiB of expert-usage telemetry; both keep the same 32 GiB
+prefix host cache and identical pinned staging/RDMA rings. Replicated KV/index
+buffers live on-device. Startup non-file RSS differs by about 2.23 MiB;
+whole-host anonymous growth cannot be attributed to this process from these logs.
 
 `./run.sh` options:
 
@@ -148,7 +177,7 @@ the launcher derives from them.
 `cuteafd golden --family minimax_m3` (hidden alias `minimax-golden`) is a
 native full-model qualification path. Public one-RTX serving dispatches to the
 same `serve-minimax` command used by the qualified card.
-Explicit two-RTX heads planning is available with half KV and replicated index
+Explicit two-RTX heads serving is available with half KV and replicated index
 storage; `auto` stays contiguous whole attention with neuron-split FFNs on two RTX.
 The two-RTX layers recipe defaults to qualified FP32 split partials. The launcher
 fixes `--split-wire fp32` and the serve flag defaults to `fp32`; there is no
@@ -162,8 +191,11 @@ normalizes the broadcast FP32 residual locally; the FP32 meeting preserves the
 BF16 whole-FFN boundary before the replicated residual add. GPU0 owns the sole
 Spark endpoint and router; onboarded TP2 routes reach GPU1 as exact IDs/weights
 on the split exchange control sequence, without GPU1 router weights or logits.
-Serve admission refuses heads with
-"narrow-head MiniMax kernels not qualified" until native qualification completes.
+Explicit two-RTX `heads` is supported with native FP32 O/FFN partial reductions
+and eager peer exchange. Decode Q/K/V/index projections, O projections, router
+and half-FFNs use the shared graph cache; context-sensitive attention and peer
+publish/wait/merge stay eager. `GPU_GRAPH_RESERVE=0` selects fully eager decode.
+`auto` selects `heads` on two RTX; explicit `layers` remains available.
 Golden requires `--nll --golden DATASET --save-logits NEW_DIR`, a checkpoint snapshot,
 native library and program manifest, and four real Spark `--peers` endpoints.
 `--window ID[,ID...]` selects unique sealed quick-subset windows. `--prefill-rows` defaults
@@ -171,7 +203,7 @@ to 1024 (page-aligned 256..4096); `--prefill-waves` defaults to 3 (1..4).
 `--check-headers` validates the immutable reference and checkpoint/export geometry
 without CUDA or workers. Scores use the shared top1024-plus-tail estimator.
 `--split-device ID` selects a distinct physical peer for the diagnostic serving
-split path, with `--attention-placement auto|layers`; `heads` remains refused.
+split path, with `--attention-placement auto|layers|heads`.
 The peer diagnostic requires explicit `--wire bf16|fp32`; omitting it refuses,
 and it does not select a serving default or qualify that precision. `--decode`
 uses real one-row serving decode after the prompt instead of scoring all rows

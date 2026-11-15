@@ -132,7 +132,7 @@ impl Owner {
 }
 
 /// One RTX keeps Whole execution. Two RTX use contiguous whole attention and
-/// split FFNs; explicit heads has its own unqualified planning descriptor.
+/// split FFNs; explicit heads has its own native execution descriptor.
 pub const MINIMAX_M3: ExecutorModes = ExecutorModes { family: "minimax_m3",
     modes: &[WHOLE, LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner },
         LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }], hops: true,
@@ -141,11 +141,9 @@ pub const MINIMAX_M3: ExecutorModes = ExecutorModes { family: "minimax_m3",
 const HEADS_PLAN: ExecutorModes = ExecutorModes { family: "minimax_m3",
     modes: &[LayerMode::HeadSplit], hops: false, attention: AttentionPlacement::Heads };
 
-/// Planning facts may describe unqualified geometry; serving must reject it.
+/// Serving requires an explicitly qualified split wire precision.
 #[derive(Debug, thiserror::Error)]
 pub enum ServingRefusal {
-    #[error("narrow-head MiniMax kernels not qualified")]
-    NarrowHeadsNotQualified,
     #[error("MiniMax split FFN wire precision not qualified/selected")]
     SplitWireNotQualified,
     #[error(transparent)]
@@ -523,7 +521,6 @@ impl MiniMaxInputs {
 
     pub fn admit_serving(&self, request: Request) -> Result<AdmittedMiniMax, ServingRefusal> {
         self.validate_attention()?;
-        if self.heads() { return Err(ServingRefusal::NarrowHeadsNotQualified); }
         if self.split() && self.split_wire.is_none() { return Err(ServingRefusal::SplitWireNotQualified); }
         Ok(self.admit(request)?)
     }
@@ -703,11 +700,14 @@ impl MiniMaxInputs {
             }
         }
         out.extend(MsaRope::new(cfg, context)?.components(&Owner::Rope { gpu }.id(), gpu as u8, maximum)?);
-        let (msa, _) = MsaPrograms::resolve(cfg, &self.manifest, decode_rows, rows, context)?;
-        let (producers, _) = if self.split() {
-            ProducerPrograms::resolve_split(&self.manifest, capacity.execution_rows())?
-        } else { ProducerPrograms::resolve(&self.manifest, capacity.execution_rows())? };
-        ForwardPrograms::resolve(&self.manifest, capacity.execution_rows())?;
+        let (msa, _) = if self.heads() { MsaPrograms::resolve_heads(cfg, &self.manifest, decode_rows, rows, context)? }
+            else { MsaPrograms::resolve(cfg, &self.manifest, decode_rows, rows, context)? };
+        let (producers, _) = if self.heads() {
+            ProducerPrograms::resolve_heads(&self.manifest, capacity.execution_rows())?
+        } else if self.split() { ProducerPrograms::resolve_split(&self.manifest, capacity.execution_rows())? }
+        else { ProducerPrograms::resolve(&self.manifest, capacity.execution_rows())? };
+        if self.heads() { ForwardPrograms::resolve_heads(&self.manifest, capacity.execution_rows())?; }
+        else { ForwardPrograms::resolve(&self.manifest, capacity.execution_rows())?; }
         target.resolve_dense_programs(&self.manifest, capacity.execution_rows())?;
         // One decode lane on every rank (its layers' work), then one owner
         // set per in-flight prefill slot (PrefillHooks unit slots).
@@ -750,8 +750,7 @@ impl MiniMaxInputs {
             out.extend(producers.workspace_components(&format!("{prefix}.attention"), gpu as u8, Lifetime::TARGET, maximum)?);
         }
         if self.heads() {
-            let mut slot_rows = vec![decode_rows];
-            slot_rows.extend((0..self.prefill.waves).map(|_| rows));
+            let slot_rows = HeadsLayout::serialized_peer_rows(decode_rows, rows)?;
             out.extend(HeadsLayout::peer_components(gpu as u8, &slot_rows, false,
                 &format!("minimax.heads.peer.{gpu}"), maximum)?);
         }
@@ -762,7 +761,7 @@ impl MiniMaxInputs {
         // Already-held driver/module bytes are opaque occupancy, not a new allocation.
         out.extend(allowance(location, self.measured_context[gpu], Lifetime::RESIDENT,
             crate::placement::sampled_baseline::source("CUDA context and loaded modules"), false, maximum));
-        let split_abort = u64::from(self.split());
+        let split_abort = u64::from(self.split() || self.heads());
         let peak = 1 + crate::push_load::COPY_STREAMS as u64 + 1 + split_abort;
         out.extend(allowance(location, cuda_stream_slab_bytes(peak)?, Lifetime::RESIDENT,
             format!("minimax/driver-stream-slabs/gpu{gpu} ({peak} peak live streams: model + push copies + rotary; split abort {split_abort})"),

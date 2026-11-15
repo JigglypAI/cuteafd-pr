@@ -15,6 +15,8 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 0)] pub device: i32,
     /// Distinct peer for contiguous attention with qualified FP32 split FFNs.
     #[arg(long)] pub split_device: Option<i32>,
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto",
+        value_parser = ["auto", "layers", "heads"])] pub attention_placement: String,
     #[arg(long, value_delimiter = ',')] pub peers: Vec<SocketAddr>,
     #[arg(long)] pub pool_tokens: Option<u64>,
     #[arg(long = "max-context-tokens", value_parser = crate::shared::context::parse_tokens::<usize>)]
@@ -39,6 +41,15 @@ pub(crate) struct ServeArgs {
     #[command(flatten)] pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
     #[command(flatten)] pub token_io: crate::shared::token_io::TokenIoArgs,
     #[command(flatten)] pub api: crate::shared::api::ApiArgs,
+}
+
+fn attention_placement(peer: Option<i32>, requested: &str) -> Result<cuteafd_loader::placement::AttentionPlacement> {
+    use cuteafd_loader::placement::AttentionPlacement;
+    match (peer, requested) {
+        (_, "auto" | "heads") => Ok(AttentionPlacement::Heads),
+        (Some(_), "layers") => Ok(AttentionPlacement::Layers),
+        _ => anyhow::bail!("MiniMax layers attention requires two coordinator GPUs"),
+    }
 }
 
 impl ServeArgs {
@@ -107,6 +118,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 device: worker_args.device, split_device: worker_args.split_device,
                 peers: &worker_args.peers, native_lib: &worker_args.native_lib,
                 manifest_path: &worker_args.manifest,
+                attention_placement: attention_placement(worker_args.split_device, &worker_args.attention_placement)?,
                 split_wire: match worker_args.split_wire.as_str() {
                     "bf16" => super::dense::PartialPrecision::Bf16,
                     _ => super::dense::PartialPrecision::DEFAULT,
@@ -174,6 +186,18 @@ mod tests {
     }
 
     #[test]
+    fn auto_attention_matches_native_planner_on_one_and_two_rtx() -> Result<()> {
+        use cuteafd_loader::placement::AttentionPlacement;
+        for peer in [None, Some(1)] {
+            assert_eq!(attention_placement(peer, "auto")?, AttentionPlacement::Heads);
+            assert_eq!(attention_placement(peer, "heads")?, AttentionPlacement::Heads);
+        }
+        assert_eq!(attention_placement(Some(1), "layers")?, AttentionPlacement::Layers);
+        assert!(attention_placement(None, "layers").is_err());
+        Ok(())
+    }
+
+    #[test]
     fn hidden_serve_cli_and_runtime_settings_have_a_cpu_seam() -> Result<()> {
         use clap::Parser;
         let argv = ["cuteafd", "serve-minimax", "--snapshot", "/fixture", "--native-lib", "/native",
@@ -186,7 +210,8 @@ mod tests {
             args.prefix.resolve_entries(16);
             args.prefill()?;
             cuteafd_bench::context::ResolvedSettings::default().value("max-context-tokens", 131072)
-                .value("pool-tokens", 2097152).value("rtx-expert-layers", 0).publish();
+                .value("pool-tokens", 2097152).value("rtx-expert-layers", 0)
+                .value("attention-placement", "heads").publish();
             Ok(())
         })
     }
