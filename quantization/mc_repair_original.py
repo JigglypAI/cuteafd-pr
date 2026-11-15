@@ -41,7 +41,7 @@ def clear_mtp_bits(config):
             clear_mtp_bits(value)
 
 
-def prepare(family, parent, source, output, *, shard_target=2_000_000_000, reuse=None):
+def prepare(family, parent, source, output, *, shard_target=2_000_000_000, reuse=None, source_identity=None):
     repo, revision = REVISIONS[family]
     recipe, modules = mtp_modules(family)
     parent, source, output = map(lambda p: Path(p).resolve(), (parent, source, output))
@@ -85,6 +85,20 @@ def prepare(family, parent, source, output, *, shard_target=2_000_000_000, reuse
         wm = package.load_json(parent / v['index'])['weight_map']
         if any(wm.get(n) != weights[n] for n in removed) or removed & set(v['core_tensors']):
             raise ValueError('compact view MTP sharing differs')
+    source_proof = package.load_json(source_identity) if source_identity else None
+    if source_proof is not None:
+        if (source_proof.get('status') != 'passed'
+                or source_proof.get('repo_id') != recipe.BASE_REPO
+                or source_proof.get('pinned_revision') != recipe.BASE_REVISION
+                or source_proof.get('pinned_index_sha256') != sha256_file(source / 'model.safetensors.index.json')
+                or {n for row in source_proof['shards'] for n in row['tensors']} != native):
+            raise ValueError('source alias proof differs from exact pinned MTP selection')
+        for row in source_proof['shards']:
+            if any(source_index[n] != row['shard'] for n in row['tensors']):
+                raise ValueError('source alias tensor mapping differs')
+            alias, cached = source / row['shard'], Path(row['cached_path'])
+            if not alias.samefile(cached) or alias.stat().st_size != row['bytes']:
+                raise ValueError('source alias no longer matches verified managed source')
     identity = dict(schema='cuteafd-original-mtp-repair-v1', repo=repo, parent_revision=revision,
                     source=manifest['source'], modules=sorted(modules),
                     input_metadata_sha256={f: sha256_file(parent / f) for f in
@@ -161,6 +175,7 @@ def prepare(family, parent, source, output, *, shard_target=2_000_000_000, reuse
     new_files = sorted(list(receipts) + ['model.safetensors.index.json','quantize_config.json',
                                         'config.json','cuteafd-mc.json','README.md'])
     report = dict(identity=identity, status='validated-delta-headers-and-streamed-source-bytes',
+        source_alias_proof=source_proof,
         added_tensors=sorted(native), removed_default_tensors=sorted(removed), new_shards=receipts,
         original_payload_bytes=new_index['metadata']['total_size'],
         new_tensor_payload_bytes=sum(sizes[n] for n in native),
@@ -178,8 +193,9 @@ def main():
     parser.add_argument('--source',required=True)
     parser.add_argument('--output',required=True)
     parser.add_argument('--reuse')
+    parser.add_argument('--source-identity')
     a=parser.parse_args()
-    r=prepare(a.family,a.parent,a.source,a.output,reuse=a.reuse)
+    r=prepare(a.family,a.parent,a.source,a.output,reuse=a.reuse,source_identity=a.source_identity)
     print(json.dumps(dict(repo=r['identity']['repo'],modules=len(r['identity']['modules']),
                          added_bytes=r['new_tensor_payload_bytes'],status=r['status'])))
 
