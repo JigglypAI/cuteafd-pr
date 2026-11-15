@@ -725,6 +725,84 @@ mod tests {
             Ok(serde_json::json!({"position":64,"max_abs":maximum,"argmax_agreement":agrees as f64/count as f64,
                 "kl":kl/count as f64}))
         };
+        if std::env::var("CUTEAFD_MINIMAX_PROOF_BATCH_ONLY").as_deref() == Ok("on") {
+            let pages = (0..4).map(|_| pool.alloc((prompt+8).div_ceil(PAGE_ROWS)))
+                .collect::<std::result::Result<Vec<_>,_>>()?;
+            let mut results = Vec::new();
+            let mut outputs = Vec::new();
+            for route in ["native", "eager"] {
+                let mut batch_rows = Vec::new();
+                let mut solo_rows = Vec::new();
+                for members in [vec![0usize,1,2,3],vec![0],vec![1],vec![2],vec![3]] {
+                    backend.drain()?;
+                    for bank in &banks {
+                        for layer in bank.layers.clone() {
+                            for &slot in &members {
+                                for &page in &pages[slot] {
+                                    for (plane,_) in super::super::cache::PAGE_PLANES {
+                                        let buffer=bank.page(layer,plane,page)?;
+                                        bank.stream.device.run(|| {
+                                            // SAFETY: exclusively owned proof pages and drained consumers.
+                                            unsafe { library.cuda_zero_bytes_async(buffer,buffer.bytes,bank.stream.raw) }
+                                        })?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let mut placements=members.iter().map(|&slot| -> Result<_> {
+                        let mut placement=Placement { units:pages[slot].clone(),slot,len:0 };
+                        family.bind(&mut placement).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                        backend.identities.borrow_mut().insert(slot,(slot+1) as u64);
+                        backend.prefill_device(&mut placement,&tokens[slot..slot+prompt],0,&pool)?;
+                        Ok(placement)
+                    }).collect::<Result<Vec<_>>>()?;
+                    let initial=placements.iter().map(|p| target_state(std::slice::from_ref(p),None))
+                        .collect::<Result<Vec<_>>>()?;
+                    let input=members.iter().map(|&slot| tokens[slot+prompt]).collect::<Vec<_>>();
+                    let mut rows=placements.iter_mut().zip(&input).map(|(p,t)| (p,std::slice::from_ref(t))).collect::<Vec<_>>();
+                    let logits=if route == "native" { backend.verify_device(&mut rows,false,&pool)? }
+                        else { backend.verify_staged(&mut rows,&pool)? }.context("batch discriminator logits")?;
+                    let bytes=logits.to_host(&library)?.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+                    drop(rows);
+                    let taps=read(backend.owners.storage.verify_taps.as_ref().unwrap().buffer,members.len()*tap_pitch)?;
+                    for (row,&slot) in members.iter().enumerate() {
+                        let logits=bytes[row*cfg.vocab_size*4..(row+1)*cfg.vocab_size*4].to_vec();
+                        let tap=taps[row*tap_pitch..(row+1)*tap_pitch].to_vec();
+                        let state=target_state(std::slice::from_ref(&placements[row]),None)?;
+                        let record=(logits,tap,state,initial[row].clone());
+                        if members.len()==4 { batch_rows.push(record); }
+                        else { ensure!(slot==solo_rows.len(),"singleton row order");solo_rows.push(record); }
+                    }
+                    for placement in &mut placements {
+                        backend.cancel(placement)?;
+                        family.discard(placement).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    }
+                }
+                let mut rows=Vec::new();
+                for (row,(batch,solo)) in batch_rows.iter().zip(&solo_rows).enumerate() {
+                    ensure!(batch.3==solo.3,"batch/singleton initial prefill bytes differ row {row}");
+                    let diagnostic=gap(&solo.0,&batch.0)?;
+                    rows.push(serde_json::json!({"row":row,"logits_identical":batch.0==solo.0,
+                        "taps_identical":batch.1==solo.1,"kv_index_identical":batch.2==solo.2,
+                        "gap":diagnostic,"batch_logits_sha256":hash(&batch.0),"solo_logits_sha256":hash(&solo.0)}));
+                }
+                results.push(serde_json::json!({"route":route,"rows":rows}));
+                outputs.push((batch_rows,solo_rows));
+            }
+            let cross=(0..4).map(|row| -> Result<_> { Ok(serde_json::json!({"row":row,
+                "singleton_native_vs_eager":gap(&outputs[0].1[row].0,&outputs[1].1[row].0)?,
+                "batch_native_vs_eager":gap(&outputs[0].0[row].0,&outputs[1].0[row].0)?})) })
+                .collect::<Result<Vec<_>>>()?;
+            let report=serde_json::json!({"position":64,"reference":"same exact prefix alone at C1",
+                "hf_reference":"unavailable: synthetic proof prompts have no published fidelity rows",
+                "routes":results,"cross_route":cross});
+            println!("MiniMax batch route discriminator: {report}");
+            std::fs::write(Path::new(&std::env::var("CUTEAFD_GOLDEN_OUT")?).join("batch-route-discriminator.json"),
+                serde_json::to_vec_pretty(&report)?)?;
+            for pages in &pages { pool.release(pages); }
+            return Ok(());
+        }
         let mut reports = Vec::new();
         for width in [1usize, 4] {
             let pages = (0..width).map(|_| pool.alloc((prompt+steps+8).div_ceil(PAGE_ROWS)))
