@@ -837,7 +837,10 @@ def worker(payload):
     if recorder is not None:
         inspector = load_file("placement_cuda_images", ROOT / "scripts/qualify/deepseek_v41/inspect-cute-object.py")
         program_records = recorder.finish(inspector, summary, plans)
+        scoped = recorder.scoped
+        recorder.scoped = False
         summary["source_reads_sha256"] = recorder.reads()
+        recorder.scoped = scoped
         summary["stage0_inputs"] = records_module.stage0_inputs(ROOT, payload, capability)
         if backend_cache is not None:
             summary["backend_reuse"] = {"hits": backend_cache.hits, "misses": backend_cache.misses}

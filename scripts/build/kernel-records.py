@@ -467,6 +467,10 @@ class Recorder:
     def reads(self):
         started = time.monotonic()
         paths = self.opened | self.frames
+        if self.scoped:
+            runtime = "third_party/sparkinfer/b12x/_lib/runtime_patches.py"
+            if (self.root / runtime).is_file():
+                paths.add(runtime)
         if not self.scoped:
             for name in set(sys.modules) - self.imported:
                 module = sys.modules.get(name)
@@ -505,6 +509,8 @@ class Recorder:
                     # Recipe locals/closures can change between capacities even
                     # when PY_START has already disabled this code object's event.
                     self._profile(frame, "call", None)
+                    if self.scoped and frame.f_code.co_name == "construct" and frame.f_code.co_filename == __file__:
+                        break
                     frame = frame.f_back
                 started = time.monotonic()
                 result = original(dsl, *args, **kwargs)
