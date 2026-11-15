@@ -155,7 +155,7 @@ pub(crate) fn catalog_owner_bytes(catalog: &crate::OfficialV41Catalog, family: &
     let rows = RECORDED.get_or_init(|| serde_json::from_str(include_str!("spark_slot_census.json"))
         .expect("bundled Spark owner census is valid JSON"));
     if !rows.iter().any(|row| row["family"] == family && row["format"] == "exl3" && row["width"].is_number()) {
-        return exl3_owner_bytes(family, geometry, extent);
+        return exl3_owner_bytes(family, geometry, extent, None);
     }
     let mut widths = Vec::new();
     for &layer in &working.spark_layers {
