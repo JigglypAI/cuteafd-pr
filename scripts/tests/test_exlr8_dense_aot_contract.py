@@ -705,7 +705,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     _, scopes = aot.config_scopes(dict(FAMILY="inkling2", MODEL_ID="fixture/Inkling-2-Small-MXFP8", SPARK_COUNT="4"))
     assert scopes["CUTEAFD_WIP_INKLING2_AOT"] == "ON"
     assert scopes["CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES"] == "inkling2:mxfp8"
-    assert scopes["CUTEAFD_WIP_EXPERT_FAMILIES"] == ""
+    assert scopes["CUTEAFD_WIP_EXPERT_FAMILIES"] == "inkling2:mxfp8"
     assert cmake_flags("coordinator", scopes)["CUTEAFD_ENABLE_INKLING2_AOT"] == "ON"
 
     def load(name, relative):
