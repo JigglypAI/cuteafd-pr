@@ -445,6 +445,121 @@ def test_cleanup_rejects_busy_or_unrelated_payloads(tmp_path):
     with pytest.raises(RuntimeError, match='process uses'):
         handoff.retire(root, inspect=busy)
     assert stage.exists() and Path(published['output']).exists()
+    assert not (root / 'retired-receipts').exists()
+
+
+@pytest.mark.parametrize('argv,comm,expected', [
+    ([b'sshd-session: tj@notty', b''], 'sshd-session', True),
+    ([b'sshd-session: tj@pts/5', b'', b''], 'sshd-session', True),
+    ([b'sshd-session: tj@pts/8  ', b''], 'sshd-session', True),
+    ([b'sshd-session: tj@pts/5 command', b''], 'sshd-session', False),
+    ([b'sshd-session: tj@pts/5', b'command'], 'sshd-session', False),
+    ([b'sshd-session: tj@pts/5', b''], 'python', False),
+    ([b'sshd-session: other@pts/5', b''], 'sshd-session', False),
+    ([b'sshd-session: tj@pts/x', b''], 'sshd-session', False),
+    ([b'python', b''], 'python', False),
+])
+def test_unreadable_ssh_infrastructure_is_exact(argv, comm, expected):
+    assert handoff._known_unreadable_process(argv, comm) is expected
+
+
+def test_cleanup_retains_receipts_before_removing_any_payload(tmp_path, monkeypatch):
+    root, stage, managed, published = storage_fixture(tmp_path)
+    handoff.handoff(root, stage, call=Nest(published), managed=managed)
+    output = Path(published['output'])
+    packed = root / 'production/packed'
+    packed.mkdir(parents=True)
+    activation = root / 'production/activations'
+    (activation / 'layer-000').mkdir(parents=True)
+    taps = root / 'production/target-taps'
+    (taps / 'layer-000').mkdir(parents=True)
+    build = tmp_path / '.cache/cuteafd/builds/inkling2-test'
+    (build / 'release-staging').mkdir(parents=True)
+    monkeypatch.setattr(Path, 'home', classmethod(lambda cls: tmp_path))
+    kept = {
+        'output/package-state.json': output / 'package-state.json',
+        'output/events.jsonl': output / 'events.jsonl',
+        'stage/.inkling2-owned-stage.json': stage / '.inkling2-owned-stage.json',
+        'intermediates/production/packed/projection-000.json': packed / 'projection-000.json',
+        'intermediates/production/activations/layer-000/manifest.json': activation / 'layer-000/manifest.json',
+        'intermediates/production/target-taps/layer-000/manifest.json': taps / 'layer-000/manifest.json',
+        'build/release-staging/build.log': build / 'release-staging/build.log',
+        'build/release-staging/errors.csv': build / 'release-staging/errors.csv',
+    }
+    for name, source in kept.items():
+        if not source.exists():
+            source.write_text(name)
+    original = {name: source.stat().st_ino for name, source in kept.items()}
+    (activation / 'layer-000/payload.safetensors').write_bytes(b'payload')
+    error_csv = root / 'per-module-errors.csv'
+    error_csv.write_text('preserve original')
+    real_rmtree = handoff.shutil.rmtree
+    archive = root / 'retired-receipts'
+
+    def checked_remove(path):
+        assert all((archive / name).stat().st_ino == inode for name, inode in original.items())
+        return real_rmtree(path)
+
+    def no_payload_open(path, *args, **kwargs):
+        if path.suffix == '.safetensors':
+            pytest.fail('cleanup opened payload bytes')
+        return real_open(path, *args, **kwargs)
+
+    real_open = Path.open
+    monkeypatch.setattr(Path, 'open', no_payload_open)
+    monkeypatch.setattr(handoff.shutil, 'rmtree', checked_remove)
+    inspected = []
+    result = handoff.retire(root, intermediates=[packed, activation, taps], build_root=build,
+                            inspect=lambda paths: inspected.extend(paths))
+    assert result['retained_metadata_files'] == len(kept)
+    assert set(inspected) == {output, stage, packed, activation, taps, build / 'release-staging'}
+    assert all(not path.exists() for path in inspected)
+    assert error_csv.read_text() == 'preserve original'
+    assert not list(archive.rglob('*.safetensors'))
+    assert publish.load(archive / '.inkling2-owned-archive.json')['identity'] == result['identity']
+    assert handoff.retire(root, inspect=lambda _: None)['paths'] == []
+
+
+@pytest.mark.parametrize('conflict', ['file', 'symlink', 'ownership'])
+def test_cleanup_archive_retry_and_conflicts_preserve_payloads(tmp_path, monkeypatch, conflict):
+    root, stage, managed, published = storage_fixture(tmp_path)
+    complete = handoff.handoff(root, stage, call=Nest(published), managed=managed)
+    output = Path(published['output'])
+    archive = root / 'retired-receipts'
+    real_link = handoff.os.link
+    calls = []
+
+    def interrupted(source, target):
+        calls.append(target)
+        if len(calls) == 2:
+            raise OSError('archive interrupted')
+        return real_link(source, target)
+
+    monkeypatch.setattr(handoff.os, 'link', interrupted)
+    with pytest.raises(OSError, match='archive interrupted'):
+        handoff.retire(root, inspect=lambda _: None)
+    assert output.exists() and stage.exists()
+    target = archive / 'output/package-state.json'
+    assert target.samefile(output / 'package-state.json')
+    monkeypatch.setattr(handoff.os, 'link', real_link)
+    if conflict == 'ownership':
+        atomic_json(archive / '.inkling2-owned-archive.json', dict(identity={'wrong': True}))
+    else:
+        target.unlink()
+        if conflict == 'file':
+            target.write_text('foreign')
+        else:
+            target.symlink_to(output / 'package-state.json')
+    with pytest.raises(ValueError, match='archive|symlink'):
+        handoff.retire(root, inspect=lambda _: None)
+    assert output.exists() and stage.exists()
+    if conflict == 'ownership':
+        atomic_json(archive / '.inkling2-owned-archive.json',
+            dict(schema='cuteafd-inkling2-retired-receipts-v1', identity=complete['identity']))
+    else:
+        target.unlink()
+        real_link(output / 'package-state.json', target)
+    assert handoff.retire(root, inspect=lambda _: None)['status'] == 'passed'
 
 
 def test_staging_rejects_symlink_and_existing_unowned_leaf(tmp_path):

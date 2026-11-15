@@ -274,6 +274,16 @@ def handoff(root, stage_root, *, call=native, managed=MANAGED):
         return record
 
 
+def _known_unreadable_process(argv, comm):
+    """Recognize only the known non-dumpable user infrastructure commands."""
+    return bool(argv) and (argv[:2] == [b'/usr/lib/systemd/systemd', b'--user']
+        or argv[0] == b'(sd-pam)'
+        or (comm == 'sshd-session' and not any(argv[1:])
+            and re.fullmatch(rb'sshd-session: tj@(notty|pts/[0-9]+)', argv[0].strip()) is not None)
+        or argv[:3] == [b'/home/linuxbrew/.linuxbrew/opt/sparknest/bin/sparknestd',
+                        b'--config', b'/srv/sparknest/node.toml'])
+
+
 def assert_unused(paths):
     """Reuse the repository's process/container scanner, failing closed on gaps."""
     script = Path(__file__).resolve().parents[2] / 'scripts/dev/cache-gc'
@@ -313,12 +323,7 @@ def assert_unused(paths):
                 if not unreadable:
                     continue
                 argv = (proc / 'cmdline').read_bytes().split(b'\0')
-                known = (argv[:2] == [b'/usr/lib/systemd/systemd', b'--user']
-                    or argv[0] == b'(sd-pam)'
-                    or argv[0].strip() == b'sshd-session: tj@notty'
-                    or argv[:3] == [b'/home/linuxbrew/.linuxbrew/opt/sparknest/bin/sparknestd',
-                                    b'--config', b'/srv/sparknest/node.toml'])
-                if not known:
+                if not _known_unreadable_process(argv, (proc / 'comm').read_text().strip()):
                     raise RuntimeError('cannot inspect user process before cleanup: ' + proc.name)
             except FileNotFoundError:
                 continue
@@ -327,8 +332,64 @@ def assert_unused(paths):
             raise RuntimeError('task leaf is in use by a process or container: ' + str(path))
 
 
+def retain_metadata(root, identity, leaves):
+    """Hardlink task receipts before payload removal, without reading payload bytes."""
+    archive = root / 'retired-receipts'
+    marker = archive / '.inkling2-owned-archive.json'
+    stamp = dict(schema='cuteafd-inkling2-retired-receipts-v1', identity=identity)
+
+    def owned_directory(path):
+        for parent in (path, *path.parents):
+            if parent.is_symlink():
+                raise ValueError('receipt archive cannot traverse symlinks')
+            if ((parent == archive or archive in parent.parents) and parent.exists()
+                    and (not parent.is_dir() or parent.stat().st_uid != os.getuid())):
+                raise ValueError('receipt archive directory is not task-owned')
+
+    owned_directory(archive)
+    if marker.exists() or marker.is_symlink():
+        if regular(marker).stat().st_uid != os.getuid() or load(marker) != stamp:
+            raise ValueError('receipt archive ownership differs from publication')
+    elif archive.exists() and any(archive.iterdir()):
+        raise ValueError('receipt archive must be empty or have matching task ownership')
+
+    def failed_walk(error):
+        raise error
+
+    links = {}
+    for leaf, category, stage_only in leaves:
+        if stage_only:
+            candidates = [leaf / '.inkling2-owned-stage.json']
+        else:
+            candidates = []
+            for directory, _, names in os.walk(leaf, followlinks=False, onerror=failed_walk):
+                candidates.extend(Path(directory) / name for name in names
+                                  if Path(name).suffix.lower() in ('.json', '.jsonl', '.csv', '.log'))
+        for source in candidates:
+            regular(source)
+            target = archive / category / source.relative_to(leaf)
+            owned_directory(target.parent)
+            if target.exists() or target.is_symlink():
+                regular(target)
+                if not os.path.samefile(source, target):
+                    raise ValueError('receipt archive target is not the original hardlink')
+            links[target] = source
+    # Preflight every source/target before creating anything. Complete all links
+    # before the caller removes any leaf; retry accepts only original hardlinks.
+    archive.mkdir(exist_ok=True)
+    if not marker.exists():
+        atomic_json(marker, stamp)
+    for target, source in links.items():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            os.link(source, target)
+        if not os.path.samefile(source, target):
+            raise ValueError('receipt archive hardlink changed')
+    return archive, len(links)
+
+
 def retire(root, *, intermediates=(), build_root=None, inspect=assert_unused):
-    """Delete only explicit task payload leaves after terminal native placement."""
+    """Retain receipts, then delete explicit payload leaves after native placement."""
     root = Path(root).resolve()
     published, complete = (load(root / n) for n in ('publication-complete.json', 'handoff-complete.json'))
     identity = {k: published[k] for k in ('repo_id', 'revision', 'manifest_sha256')}
@@ -341,6 +402,7 @@ def retire(root, *, intermediates=(), build_root=None, inspect=assert_unused):
     if output.exists() and load(output / 'package-state.json').get('identity') != published['identity']:
         raise ValueError('standalone output ownership differs before retirement')
     paths = [output, stage]
+    categories = {output: (Path('output'), False), stage: (Path('stage'), True)}
     allowed = {'frontier', 'stages', 'projections', 'expert-projections', 'banks', 'candidates',
                'packed', 'activations', 'target-taps', 'routes'}
     for value in intermediates:
@@ -348,12 +410,15 @@ def retire(root, *, intermediates=(), build_root=None, inspect=assert_unused):
         if root not in p.parents or p.name not in allowed:
             raise ValueError('intermediate must be an explicit task-owned payload leaf')
         paths.append(p)
+        categories[p] = (Path('intermediates') / p.relative_to(root), False)
     if build_root is not None:
         build = Path(build_root).absolute()
         if build.parent != Path.home() / '.cache/cuteafd/builds' or not build.name.startswith('inkling2-'):
             raise ValueError('build cleanup requires this task build root')
-        paths.extend(p for p in build.iterdir() if p.name.startswith('target') or p.name in
-                     ('exllamav3', 'tmp', 'release-staging', 'torch-extensions', 'cuda-cache'))
+        for p in build.iterdir():
+            if p.name.startswith('target') or p.name in ('exllamav3', 'tmp', 'release-staging', 'torch-extensions', 'cuda-cache'):
+                paths.append(p)
+                categories[p] = (Path('build') / p.relative_to(build), False)
     protected = [Path(published['source_snapshot']).resolve(), MANAGED.resolve(), root]
     present = []
     for path in paths:
@@ -365,10 +430,14 @@ def retire(root, *, intermediates=(), build_root=None, inspect=assert_unused):
                 or any(resolved == p or resolved in p.parents or (p != root and p in resolved.parents) for p in protected)):
             raise ValueError('cleanup path is protected or not an owned standalone directory')
         present.append(resolved)
+        categories[resolved] = categories[path]
     inspect(present)
+    archive, retained = retain_metadata(root, identity,
+        [(path, *categories[path]) for path in present])
     for path in sorted(set(present), key=lambda p: len(p.parts), reverse=True):
         shutil.rmtree(path)
     record = dict(status='passed', identity=identity, paths=list(map(str, present)),
+                  receipt_archive=str(archive), retained_metadata_files=retained,
                   source_and_shared_stores_preserved=True, time=datetime.now(timezone.utc).isoformat())
     atomic_json(root / 'handoff-cleanup-complete.json', record)
     return record
