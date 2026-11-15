@@ -27,36 +27,67 @@ Rubric, each 1–5 (5 best), plus wall time:
 
 ## Log
 
-### 2026-11-15 Native MXFP4 Duel: R1 Evidence (Duel Ongoing)
+### 2026-11-15 Native MXFP4 Duel: Final Measured Dispositions
 
-DeepSeek Flash R1 `9dbb1ae5` overlaps ordered FC1/FC2 weight copies with
-MMAs using two shared slots. Carbon High R1 `0bc6f6e7`, driven by DeepSeek,
-vectorizes shared loads and swizzles activation/fold access. Both entrants'
-88-case MiMo suites pass on SM120 and SM121; all numerical cell receipts
-match the base exactly. Organizer alone ran hardware. Neither candidate
-replaces generic across the measured MiMo cells, and wide native prefill
-still loses. R2 remains ongoing; no whole-family winner is claimed.
+Three rounds per entrant are complete. DeepSeek Flash's final `de8d3490`
+uses recipe-selected asynchronous weight staging; Carbon High's final
+`e7e9ead7`, driven by DeepSeek, combines that staging with vectorized shared
+loads, swizzles and register trimming. DeepSeek declines its first-finisher
+bonus: no fresh hypothesis. Organizer alone runs every GPU oracle and
+measurement; entrants change kernel code only.
 
-R1 provisional scores from independently checked work: DeepSeek Correct 5,
-Judgement 4, Quality 4, Creative 4; Carbon Correct 5, Judgement 3, Quality 4,
-Creative 4. DeepSeek sealed in about 10 minutes; Carbon in 31m55s, with four
-driver steers (two information relays, two deadline nudges), no 503s. Carbon
-spent most of its window analyzing but delivered a scoped, correct change.
-DeepSeek's unsupported claim that generic fused FC1+FC2 was corrected by
-source review: generic also launches separate projections. Entrants did not
-run GPUs or change benchmarks/oracles.
+SM121 Pro full-band qualification uses widths 320/352, planned capacities
+1/16/80, live rows 1/2/4/8/16/17/32/48/63/64 where each capacity permits,
+checkpoint E384/top8 random routes, warmed graph replay, 10 interleaved
+samples and three identical generic controls. Each entrant gets 16 cells per
+width. Thermal/power-cap counter deltas are zero. DeepSeek has the best A8
+result throughout this final band and qualifies Pro320 at both activation
+widths in all 16 cells. Carbon A8 regresses, failing generic in 6/16 Pro320
+and 8/16 Pro352 cells; its useful result is A16 at Pro352 from live2 upward.
+Both A16 entries qualify Pro320, while Pro352 A16 misses cap1/live1.
 
-A separate clean-master port of DeepSeek's idea qualifies only V4.1 TP6
-compact-code A8 decode on SM121: 13 matched cells are byte-identical, live-1
-speedup 1.087-1.110x, all other measured TP6 cells win/tie. TP3's master gain
-shrinks to about 1.02x, versus 1.06-1.12x on the experimental unification
-branch; TP3 stays off. Fork #323 merged as `259140d1`: the final TP6-only head passes 46 native
-V4 oracle cases and 378 CPU contracts. The targeted export audit changes exactly
-TP6 m1/m16/m64, with TP3 and prefill objects unchanged.
+Explicit Pro352 cap1/live1 (microseconds): generic controls are
+131.456-131.808 across the two launches; DeepSeek A8/A16 are
+141.968/132.784 and Carbon 158.352/134.864. Neither entrant qualifies that
+cell at either activation width. These are per-cell kernel results, not a
+whole-family migration or a generic-deletion qualification. Generic remains
+necessary on other decode cells and prefill. TJ holds any combined MiMo Pro
+adoption decision; fork #216/#318/#320/#321 remain open.
 
-Evidence: cuteafd #2129, fork #318/#320/#321/#323; organizer receipts under
-`~/.cache/cuteafd/builds/mxfp4-duel/receipts/`. Final round scores and
-merge status will replace this provisional entry when the duel ends.
+DeepSeek's final 88-case suite passes both architectures, with every scalar
+numerical receipt identical to base; all six final SM120 timing cells lose
+generic. Carbon's final SM121 88 cases likewise pass with base-identical
+receipts. Its final SM120 oracle and screen are pending the fair queue after
+a grant-time memory-pressure refusal; no SM120 final result is inferred.
+All measured prefix/poison/live/graph checks pass; raw JSON retains bitwise
+flags and comparison hashes without conflating A8 and A16 arithmetic.
+
+Scores from independently checked work: DeepSeek Correct 5, Judgement 4,
+Quality 4, Creative 4; Carbon Correct 5 for completed gates (final SM120
+pending), Judgement 4, Quality 4, Creative 4. DeepSeek R1 sealed in about
+10 minutes, with bounded selector refinements in R2/R3. Carbon round wall
+was 31m55s / 23m15s / 18m54s; driver steers were 4 / 1 / 2, with two R1
+deadline interrupts and none in R2/R3; no 503s. The gentler R2-on deadline
+(30-minute noninterrupt nudge, 45-minute cap) did not require a nudge in its
+last two rounds. Carbon's bank-conflict design is correct but its final A8
+occupancy tradeoff loses; DeepSeek's unsupported generic-FC1/FC2-fusion
+claim was corrected by source review. Neither entrant runs hardware or
+changes the benchmark/oracle to fit its result.
+
+A separate clean-master DeepSeek port is already shipped to fork master:
+#323 merged as `259140d1`, enabling only SM121 compact-code V4.1 TP6 A8
+decode. Thirteen matched cells are byte-identical, live1 speedup is
+1.087-1.110x, and all other measured TP6 cells win/tie. Final gates pass
+46 native V4 oracle cases and 378 CPU contracts; export audit changes only
+TP6 m1/m16/m64, leaving TP3/prefill/input-quant byte-identical. TP3's master
+live1 gain shrinks to about 1.02x from the experimental branch's 1.06-1.12x,
+so it remains off. This accepted V4.1 result is independent of MiMo adoption.
+
+Evidence: cuteafd #2129; fork #318/#320/#321/#323; task-root
+`carbon-r3-pro-band.json`, `ds-r3-pro-band.json`,
+`final-pro-comparison.json` and `receipts/` under
+`~/.cache/cuteafd/builds/mxfp4-duel/`. Final Carbon SM120 results will be
+appended before this scorecard PR is marked ready.
 
 ### 2026-11-14 Native FP8 Decode Duel: Fable Final Null
 
