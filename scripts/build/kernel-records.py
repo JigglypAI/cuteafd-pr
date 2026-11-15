@@ -2,6 +2,7 @@
 """Content identities and measured inputs for CPU-only AOT publications."""
 from __future__ import annotations
 
+import ast
 import fnmatch
 import functools
 import hashlib
@@ -370,6 +371,39 @@ class Recorder:
         self.source_hashes = {}
         self.scoped = False
         self.job_paths = set()
+        self.import_closures = {}
+
+    def import_closure(self, relative):
+        if relative in self.import_closures:
+            return self.import_closures[relative]
+        found = self.import_closures[relative] = set()
+        path = self.root / relative
+        if path.suffix != ".py":
+            return found
+        parts = Path(relative).with_suffix("").parts
+        if "b12x" not in parts:
+            return found
+        package = list(parts[parts.index("b12x"):-1])
+        tree = ast.parse(path.read_bytes())
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                base = package[:len(package) - node.level + 1] if node.level else []
+                module = ".".join([*base, *([node.module] if node.module else [])])
+                names = [module, *[module + "." + alias.name for alias in node.names]]
+            for name in names:
+                if not name.startswith("b12x"):
+                    continue
+                pieces = name.split(".")
+                for index in range(1, len(pieces) + 1):
+                    base = self.root / "third_party/sparkinfer" / Path(*pieces[:index])
+                    source = next((candidate for candidate in (base.with_suffix(".py"), base / "__init__.py")
+                                   if candidate.is_file()), None)
+                    if source:
+                        found.add(source.relative_to(self.root).as_posix())
+        return found
 
     def source(self, path):
         if path not in self.dependency_paths:
@@ -467,6 +501,13 @@ class Recorder:
     def reads(self):
         started = time.monotonic()
         paths = self.opened | self.frames
+        if self.scoped:
+            pending = list(paths)
+            while pending:
+                for dependency in self.import_closure(pending.pop()):
+                    if dependency not in paths:
+                        paths.add(dependency)
+                        pending.append(dependency)
         if self.scoped:
             runtime = "third_party/sparkinfer/b12x/_lib/runtime_patches.py"
             if (self.root / runtime).is_file():
