@@ -175,6 +175,9 @@ pub struct InklingInputs {
     pub resident_weight_limit: Option<ResidentWeights>,
     /// Mount source per rank (Load only), header-bounded.
     pub mount: Vec<crate::shared::dense_read::MountLoad>,
+    /// Shared push rings and validation scratch per onboarding prefix. None
+    /// denotes a genuine mount checkpoint, never a required-push fallback.
+    pub push_host: Vec<Option<crate::push_load::PushHostEnvelope>>,
 }
 
 /// The admitted answer. Plan and runtime read the same fields.
@@ -504,9 +507,11 @@ impl InklingInputs {
         out.extend(allowance(location, cuda_stream_slab_bytes(peak)?, Lifetime::RESIDENT,
             format!("inkling2/driver-stream-slabs/gpu{gpu} ({peak} peak live streams: model + push copies + conv)"),
             false, maximum));
-        for owner in self.mount.get(gpu).copied().unwrap_or_default().allocations(&format!("inkling2.mount.{gpu}")) {
-            let bytes = ByteCurve::fixed(owner.bytes, maximum);
-            out.push(Component::allocation(owner, bytes, false, maximum));
+        if !self.push_host.iter().any(Option::is_some) {
+            for owner in self.mount.get(gpu).copied().unwrap_or_default().allocations(&format!("inkling2.mount.{gpu}")) {
+                let bytes = ByteCurve::fixed(owner.bytes, maximum);
+                out.push(Component::allocation(owner, bytes, false, maximum));
+            }
         }
         Ok(out)
     }
@@ -604,6 +609,12 @@ impl Recipe for InklingInputs {
                 requires.push(Requires { when: Choice { variable: onboard, option }, any_of: vec![] });
                 continue;
             }
+            if let Some(envelope) = self.push_host.get(count).and_then(Option::as_ref) {
+                for owner in envelope.allocations("inkling2.push")? {
+                    let bytes = ByteCurve::fixed(owner.bytes, maximum);
+                    components.extend(with(vec![Component::allocation(owner, bytes, false, maximum)], &activation));
+                }
+            }
             if count > 0 {
                 let LocalPackage::Installed { backings } = &self.local else { unreachable!() };
                 for (group, backing) in backings.get(count).ok_or_else(|| invalid("missing onboarding owner prefix"))?.iter().enumerate() {
@@ -677,9 +688,11 @@ impl Recipe for InklingInputs {
                 gemm: self.head.gemm(), lt: self.head.lt(), lifetime: Lifetime::TARGET, activation: Activation::always() }],
                 maximum, PhaseOrder::TARGET_THEN_DRAFT)?);
         }
-        components.extend(allowance(Location::PINNED, 64 << 20, Lifetime::RESIDENT,
-            "Inkling 2 reusable H2D staging (estimated: library-wide sync-h2d backing, cold golden reconciles)".into(),
-            true, maximum));
+        if !self.push_host.iter().any(Option::is_some) {
+            components.extend(allowance(Location::PINNED, 64 << 20, Lifetime::RESIDENT,
+                "Inkling 2 reusable H2D staging (estimated: library-wide sync-h2d backing, cold golden reconciles)".into(),
+                true, maximum));
+        }
         fixed_request_tails(&mut components, maximum, &[])?;
         let mut contract = Contract { floor_fallback: None, phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: (self.spark_ranks > 0).then(|| SparkReplyFormats {

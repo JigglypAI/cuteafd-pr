@@ -447,7 +447,8 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             code: vec![64 << 20; gpus], graph_reserve: vec![500 << 20; gpus], head: serving::BlasHead::Gemm,
             host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, device_sampling: true,
             expert_usage: None, resident_weight_limit: None,
-            mount: targets.iter().map(|t| t.mount_load(&checkpoint).unwrap()).collect() };
+            mount: targets.iter().map(|t| t.mount_load(&checkpoint).unwrap()).collect(),
+            push_host: vec![None; routed.len()+1] };
         let request = shared::request(inputs.context, None, crate::placement::Onboard::Auto, prefill,
             crate::placement::planner::Operation::Serving, None, Default::default());
         let contract = inputs.prepare(&request).unwrap();
