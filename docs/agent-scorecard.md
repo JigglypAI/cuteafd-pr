@@ -27,6 +27,37 @@ Rubric, each 1–5 (5 best), plus wall time:
 
 ## Log
 
+### 2026-11-15 Native MXFP4 Duel: R1 Evidence (Duel Ongoing)
+
+DeepSeek Flash R1 `9dbb1ae5` overlaps ordered FC1/FC2 weight copies with
+MMAs using two shared slots. Carbon High R1 `0bc6f6e7`, driven by DeepSeek,
+vectorizes shared loads and swizzles activation/fold access. Both entrants'
+88-case MiMo suites pass on SM120 and SM121; all numerical cell receipts
+match the base exactly. Organizer alone ran hardware. Neither candidate
+replaces generic across the measured MiMo cells, and wide native prefill
+still loses. R2 remains ongoing; no whole-family winner is claimed.
+
+R1 provisional scores from independently checked work: DeepSeek Correct 5,
+Judgement 4, Quality 4, Creative 4; Carbon Correct 5, Judgement 3, Quality 4,
+Creative 4. DeepSeek sealed in about 10 minutes; Carbon in 31m55s, with four
+driver steers (two information relays, two deadline nudges), no 503s. Carbon
+spent most of its window analyzing but delivered a scoped, correct change.
+DeepSeek's unsupported claim that generic fused FC1+FC2 was corrected by
+source review: generic also launches separate projections. Entrants did not
+run GPUs or change benchmarks/oracles.
+
+A separate clean-master port of DeepSeek's idea qualifies only V4.1 TP6
+compact-code A8 decode on SM121: 13 matched cells are byte-identical, live-1
+speedup 1.087-1.110x, all other measured TP6 cells win/tie. TP3's master gain
+shrinks to about 1.02x, versus 1.06-1.12x on the experimental unification
+branch; TP3 stays off. Fork #323 is still gated on the final narrowed-head
+native oracle. CPU contracts pass and the targeted export audit changes
+exactly TP6 m1/m16/m64, with TP3 and prefill objects unchanged.
+
+Evidence: cuteafd #2129, fork #318/#320/#321/#323; organizer receipts under
+`~/.cache/cuteafd/builds/mxfp4-duel/receipts/`. Final round scores and
+merge status will replace this provisional entry when the duel ends.
+
 ### 2026-11-14 Native FP8 Decode Duel: Fable Final Null
 
 Fable 5.2 (`claude-fable-5-2`) completed three bounded kernel-only rounds:
