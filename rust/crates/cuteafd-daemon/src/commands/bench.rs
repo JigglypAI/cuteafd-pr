@@ -80,7 +80,7 @@ pub(crate) struct RunArgs {
     #[arg(long, value_name = "CASES:START-END", value_parser = cuteafd_bench::panels::lossless::RowDump::parse)]
     pub(crate) lossless_dump: Option<cuteafd_bench::panels::lossless::RowDump>,
     /// Run spec_lossless_set with N cases in flight at once per arm (default 1: one at a time).
-    #[arg(long, value_name = "N", value_parser = clap::value_parser!(usize).range(1..=64))]
+    #[arg(long, value_name = "N", value_parser = parse_lossless_concurrency)]
     pub(crate) lossless_concurrency: Option<usize>,
     /// Shared base context lengths for context_load (256..1048576 tokens).
     #[arg(long, value_parser = cuteafd_bench::panels::context_load::parse_lengths_arg)]
@@ -600,5 +600,13 @@ mod tests {
         let matches = crate::cli::Cli::command().try_get_matches_from(["cuteafd", "bench", "panels", "--json"]).unwrap();
         let bench = BenchArgs::from_arg_matches(matches.subcommand().unwrap().1).unwrap();
         assert!(matches!(bench.action, Some(BenchAction::Panels { json: true })));
+    }
+}
+
+/// `--lossless-concurrency`: 1..=64 cases in flight per arm.
+fn parse_lossless_concurrency(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(n) if (1..=64).contains(&n) => Ok(n),
+        _ => Err(format!("expected 1..=64, got {value:?}")),
     }
 }
