@@ -147,7 +147,7 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
             "Inkling restored request frontier differs"); Ok(())
     }
     fn history(&self, placement: &Placement) -> usize { placement.slot }
-    fn require_live(&self) -> Result<()> { Ok(()) }
+    fn require_live(&self) -> Result<()> { self.execution.borrow().require_live() }
     fn log_table_stats(&self, _: &str) {}
     fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], rows: usize, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         ensure!(rows <= 1, "Inkling prefill head retains one row; scoring streams tiles");
@@ -165,7 +165,13 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
         let first = placement.len+tokens.len()-rows+1;
         let scoring = probe::ScoringRows { consumer: probe, position };
         self.append(placement, tokens, rows > 0, pool, &mut |_, at, logits| {
-            if at >= first { scoring.record(self.library, at-first, &logits)?; }
+            let end = at.checked_add(logits.rows).context("Inkling score tile overflow")?;
+            if end > first {
+                let skip = first.saturating_sub(at);
+                let selected = DeviceLogits { ptr: logits.ptr.wrapping_byte_add(skip*logits.stride*4),
+                    rows: logits.rows-skip, ..logits };
+                scoring.record(self.library, at+skip-first, &selected)?;
+            }
             Ok(())
         })?;
         Ok((rows > 0).then_some(probe::ScoreLogits::Recorded))
@@ -189,7 +195,7 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
             segments: segments.iter().enumerate().map(|(sequence, segment)| UnitSegment { sequence,
                 rows: segment.first..segment.end_row(), tokens: segment.start..segment.start+segment.rows,
                 prompt_end: true, snapshot: false, head: true }).collect() };
-        let mut last = vec![None; sequences.len()];
+        let mut last = (0..sequences.len()).map(|_| None).collect::<Vec<_>>();
         self.execution.borrow_mut().prefill(&mut placements, &sources, &[unit], 1, &mut |member, position, logits| {
             if position+logits.rows == chunks[member].0+chunks[member].1+1 {
                 let offset = (logits.rows-1)*logits.stride*4;

@@ -19,6 +19,7 @@ pub(crate) struct Execution<'a> {
     terminal: bool,
 }
 impl<'a> Execution<'a> {
+    pub fn require_live(&self) -> Result<()> { ensure!(!self.terminal, "Inkling execution is terminal"); Ok(()) }
     pub fn new(link: SparkLink<'a>, requests: RequestOwners<'a>, head: Head<'a>,
         target: TargetWeights<'a>, kernels: Kernels<'a>, local: Vec<Box<dyn Dispatcher + 'a>>,
         cfg: Inkling2Config) -> Result<Self> {
