@@ -87,6 +87,33 @@ fn k31_raw_and_streamed_scoring_match_ordinary_c16() -> Result<()> {
     let prefill = args.prefill()?;
     ensure!((prefill.unit_rows, prefill.waves, prefill.span_rows) == (2752, 3, 8256),
         "paired proof must retain ordinary prefill reserve");
+    let reference_root = std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_FIXTURES")?);
+    let manifest_bytes = std::fs::read(reference_root.join("manifest.json"))?;
+    ensure!(format!("{:x}", Sha256::digest(&manifest_bytes))
+        == cuteafd_bench::fidelity_dataset::KIMI_K31_MANIFEST_SHA256, "paired reference publication differs");
+    let manifest: Value = serde_json::from_slice(&manifest_bytes)?;
+    let reference = cuteafd_bench::fidelity_dataset::load(&reference_root, &manifest)?;
+    let halves = ["decode", "prefill"].into_iter().map(|half| -> Result<_> {
+        let ids = cuteafd_bench::fidelity_dataset::standard_ids(&reference, half)?;
+        let windows = cuteafd_bench::fidelity_dataset::standard_windows(&reference, half, true)?;
+        ensure!(!ids.is_empty() && windows.iter().map(|w| &w.id).eq(ids.iter()),
+            "paired Standard half differs from published IDs");
+        for window in &windows {
+            ensure!(window.media.is_empty() && window.tokens.len() <= cfg.max_position,
+                "paired publication exceeds checkpoint text context");
+            steps(window.tokens.len(), window.score_from, prefill.span_rows as usize)?;
+        }
+        Ok((half, windows))
+    }).collect::<Result<Vec<_>>>()?;
+    let expected_ids = reference.windows.iter().map(|w| w.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let selected_ids = halves.iter().flat_map(|(_, windows)| windows.iter().map(|w| w.id.clone()))
+        .collect::<Vec<_>>();
+    ensure!(selected_ids.len() == expected_ids.len()
+        && selected_ids.into_iter().collect::<std::collections::BTreeSet<_>>() == expected_ids,
+        "paired Standard union differs from full publication");
+    let root = std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_OUT")?).join("paired-scoring");
+    std::fs::create_dir(&root)?;
     let slots = cuteafd_core::concurrency::state_slots(16) as usize;
     let mark_bytes = super::state::KdaLayout::for_ranks(&cfg, slots, 1, 1, 2)?.mark_bytes()
         .checked_mul(2).context("proof mark extent")?;
@@ -138,18 +165,8 @@ fn k31_raw_and_streamed_scoring_match_ordinary_c16() -> Result<()> {
     // Same admitted extent/parity/reserved pages as serving; the diagnostic
     // allocator is sufficient for exactness because both arms reuse the same IDs.
     let mut pool = super::prefix::diagnostic_pool(family.layout());
-    let reference_root = std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_FIXTURES")?);
-    let manifest_bytes = std::fs::read(reference_root.join("manifest.json"))?;
-    ensure!(format!("{:x}", Sha256::digest(&manifest_bytes))
-        == cuteafd_bench::fidelity_dataset::KIMI_K31_MANIFEST_SHA256, "paired reference publication differs");
-    let manifest: Value = serde_json::from_slice(&manifest_bytes)?;
-    let reference = cuteafd_bench::fidelity_dataset::load(&reference_root, &manifest)?;
-    let root = std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_OUT")?).join("paired-scoring");
-    std::fs::create_dir(&root)?;
     let mut results = Vec::new();
-    for half in ["decode", "prefill"] {
-        let windows = cuteafd_bench::fidelity_dataset::standard_windows(&reference, half, true)?;
-        ensure!(windows.len() == 32, "paired proof needs full Standard halves");
+    for (half, windows) in halves {
         for window in windows {
             ensure!(window.media.is_empty() && window.tokens.len() <= geometry.max_context,
                 "paired window exceeds ordinary text context");
@@ -223,9 +240,13 @@ fn k31_raw_and_streamed_scoring_match_ordinary_c16() -> Result<()> {
             pool.release(&pages);
         }
     }
-    ensure!(results.len() == 64, "paired Standard coverage incomplete");
+    ensure!(results.len() == expected_ids.len()
+        && results.iter().filter_map(|r| r["id"].as_str()).collect::<std::collections::BTreeSet<_>>()
+            == expected_ids.iter().map(String::as_str).collect(), "paired Standard coverage incomplete");
     serde_json::to_writer(std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("proof.json"))?,
         &json!({"schema":"cuteafd.kimi.paired-scoring/1", "passed":true,
+            "production_seal_commit":"10a265cea3f639b1c50a383fbc639fd000a501c5",
+            "test_executable_commit":std::env::var("CUTEAFD_KIMI_PROOF_TEST_COMMIT")?,
             "view":crate::cli::core_view_settings(engine.target_view()), "attention":args.attention_placement,
             "concurrency":16, "state_slots":slots, "marks":marks,
             "prefill":{"unit_rows":prefill.unit_rows,"waves":prefill.waves,"span_rows":prefill.span_rows},
