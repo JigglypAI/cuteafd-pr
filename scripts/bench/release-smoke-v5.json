@@ -612,55 +612,9 @@
       }
     },
     {
-      "name": "glm53f-exl3-k6-5090",
+      "name": "glmf-mc-original-min",
       "family": "glm5_flash",
-      "config": "examples/configs/glm53-flash-exl3-k6-min.config",
-      "gpus": [
-        1
-      ],
-      "sparks": [
-        "REPLACE-ME-spark-0",
-        "REPLACE-ME-spark-1",
-        "REPLACE-ME-spark-2",
-        "REPLACE-ME-spark-3"
-      ],
-      "set": {
-        "RTX_GPUS": "1",
-        "COORDINATOR_GPUS": "1",
-        "SPARK_COUNT": "4",
-        "ADDR": "0.0.0.0:8817",
-        "EXPERT_PORT": "23400",
-        "SPECULATOR": "dflash2",
-        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
-        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6",
-        "MODEL_REVISION": "5d3fffe1df9c4a109bbbdafb60dc19df9fac019d",
-        "SPARK_0_HOST": "REPLACE-ME-spark-0",
-        "SPARK_0_LANE_A": "192.0.2.1",
-        "SPARK_1_HOST": "REPLACE-ME-spark-1",
-        "SPARK_1_LANE_A": "192.0.2.2",
-        "SPARK_2_HOST": "REPLACE-ME-spark-2",
-        "SPARK_2_LANE_A": "192.0.2.3",
-        "SPARK_3_HOST": "REPLACE-ME-spark-3",
-        "SPARK_3_LANE_A": "192.0.2.4",
-        "EXPERT_BACKEND": "spark",
-        "GPU_MEMORY_CAP": "31.8GiB",
-        "BENCH_HARDWARE_CLASS": "5090",
-        "BENCH_SIMULATED": "5090"
-      },
-      "precheck": {
-        "argv": [
-          "sh",
-          "-c",
-          "nvidia-smi --query-gpu=name --format=csv,noheader --id=1 | grep -q 'RTX PRO 6000'"
-        ],
-        "timeout_s": 30,
-        "required": true
-      }
-    },
-    {
-      "name": "glm53f-exl3-k6-min",
-      "family": "glm5_flash",
-      "config": "examples/configs/glm53-flash-exl3-k6-min.config",
+      "config": "examples/configs/glm53-flash-exl3-k4-mc-min.config",
       "gpus": [
         1
       ],
@@ -676,19 +630,20 @@
         "EXPERT_PORT": "23600",
         "SPECULATOR": "dflash2",
         "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
-        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6",
-        "MODEL_REVISION": "5d3fffe1df9c4a109bbbdafb60dc19df9fac019d",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
+        "MODEL_REVISION": "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
-        "EXPERT_BACKEND": "spark"
+        "EXPERT_BACKEND": "spark",
+        "CORE_VIEW": "original"
       }
     },
     {
-      "name": "glm53f-exl3-k6-max",
+      "name": "glmf-mc-original-max",
       "family": "glm5_flash",
-      "config": "examples/configs/glm53-flash-exl3-k6-max.config",
+      "config": "examples/configs/glm53-flash-exl3-k4-mc-max.config",
       "gpus": [
         0,
         1
@@ -702,8 +657,9 @@
         "EXPERT_PORT": "23800",
         "EXPERT_BACKEND": "local",
         "SPECULATOR": "dflash2",
-        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6",
-        "MODEL_REVISION": "5d3fffe1df9c4a109bbbdafb60dc19df9fac019d"
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
+        "MODEL_REVISION": "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d",
+        "CORE_VIEW": "original"
       }
     },
     {
@@ -1551,6 +1507,27 @@
       "report": "benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-2rtx-6spark-muse-spark-exl3-max",
       "release": "v5.0.0-rc1",
       "release_note": "Release-candidate build recorded by the report. Last standalone Core-K6 Release smoke; only regular cards retire, not serving support."
+    },
+    {
+      "name": "glm53f-exl3-k6-5090",
+      "config": "examples/configs/glm53-flash-exl3-k6-min.config",
+      "report": "benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-1rtx-4spark-glm53f-exl3-k6-5090",
+      "release": "v5.0.0",
+      "release_note": "replaced by K4 MC original"
+    },
+    {
+      "name": "glm53f-exl3-k6-min",
+      "config": "examples/configs/glm53-flash-exl3-k6-min.config",
+      "report": "benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-1rtx-2spark-glm53f-exl3-k6-min",
+      "release": "v5.0.0",
+      "release_note": "replaced by K4 MC original"
+    },
+    {
+      "name": "glm53f-exl3-k6-max",
+      "config": "examples/configs/glm53-flash-exl3-k6-max.config",
+      "report": "benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-2rtx-glm53f-exl3-k6-max",
+      "release": "v5.0.0",
+      "release_note": "replaced by K4 MC original"
     }
   ]
 }

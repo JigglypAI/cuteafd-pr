@@ -586,9 +586,9 @@ def test_v5_smoke_card_inventory() -> None:
                 "timeout_s": 30,
                 "required": True,
             }
-    assert len(cards) == 37
+    assert len(cards) == 36
     assert len({(family, model) for family, model, _ in cards}) == 19
-    assert sum(column == "5090" for _, _, column in cards) == 7
+    assert sum(column == "5090" for _, _, column in cards) == 6
     assert not names.intersection(entry["name"] for entry in smoke["retired"])
 
 
@@ -1004,6 +1004,7 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
         "glm53-exl3-min", "glm53-exl3-max", "glm53-exl3-k6core-min",
         "glm53-exl3-k6core-max", "step5-exl3-k6core-min", "step5-exl3-k6core-max",
         "muse-spark-exl3-min", "muse-spark-exl3-max",
+        "glm53f-exl3-k6-5090", "glm53f-exl3-k6-min", "glm53f-exl3-k6-max",
     }
     reports = [(path, json.loads(path.read_text())) for path in (ROOT / "benchmarks").glob("*/*/report.json")]
     for entry in retired:
@@ -1060,6 +1061,40 @@ def test_glmf_exlr8_k4_cards_preserve_qualified_native_recipes(filename: str) ->
                        for other in entries.values()) == 1
     if "matrix-gate" in filename:
         assert entries["glmf-exlr8-k4-max"]["prefill_lengths"] == [65536]
+
+
+def test_glmf_mc_comparison_keeps_compact_modes_supplementary() -> None:
+    comparisons = json.loads((ROOT / "scripts/bench/release-smoke-v51-mc-core-comparison.json").read_text())
+    compact = [entry for entry in comparisons["entries"] if entry["family"] == "glm5_flash"]
+    assert {entry["set"]["CORE_VIEW"] for entry in compact} == {"k8-compact", "k6-compact", "fp8-compact"}
+    for entry in compact:
+        config = keys(ROOT / entry["config"])
+        assert config["MODEL_ID"] == entry["set"]["MODEL_ID"] == "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC"
+        assert config["MODEL_REVISION"] == entry["set"]["MODEL_REVISION"] == "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d"
+        assert config["CORE_VIEW"] == "original"
+        assert entry["gpus"] == [0, 1] and entry["sparks"] == []
+        assert entry["set"]["EXPERT_BACKEND"] == "local"
+        assert entry["set"]["SPARK_COUNT"] == "0"
+    assert not any(entry["family"] == "glm5_flash" for entry in comparisons["unsupported"])
+    release = json.loads((ROOT / "scripts/bench/release-smoke-v5.json").read_text())
+    regular = [entry for entry in release["entries"] if entry["set"].get("MODEL_ID") == config["MODEL_ID"]]
+    assert {entry["name"] for entry in regular} == {"glmf-mc-original-min", "glmf-mc-original-max"}
+    assert all(entry["set"]["CORE_VIEW"] == "original" for entry in regular)
+    old_model = "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6"
+    assert not any(entry["set"].get("MODEL_ID") == old_model for entry in release["entries"])
+    published = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
+    assert not any(row["checkpoint"] == old_model for row in published["cells"])
+    current = next(row for row in published["cells"] if row["checkpoint"] == config["MODEL_ID"])
+    assert current["5090"]["status"] == "pending" and current["5090"]["reason"]
+    for column in ("1rtx", "2rtx"):
+        assert current[column]["status"] == "current"
+        report = json.loads((ROOT / current[column]["report"] / "report.json").read_text())
+        settings = {item["name"]: item["value"] for item in report["server"]["configuration"]["settings"]}
+        assert settings["core-view"] == "original"
+    for suffix in ("5090", "min", "max"):
+        retired = next(entry for entry in published["retired"] if entry["name"] == f"glm53f-exl3-k6-{suffix}")
+        assert retired["release_note"] == "replaced by K4 MC original"
+        assert (ROOT / retired["config"]).is_file()
 
 
 @pytest.mark.parametrize("family,model,revision,sparks", [
