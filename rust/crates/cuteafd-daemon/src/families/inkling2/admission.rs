@@ -130,6 +130,47 @@ pub(crate) fn reconcile_native(plan: &ResolvedPlan, devices: CoordinatorDevices<
     Ok(())
 }
 
+/// Compare retained mutable serving requests against the solved recipe's raw
+/// physical payloads. Rounded KV curves already charge their allocation tail;
+/// that tail must not be mistaken for bytes requested from cudaMalloc.
+pub(crate) fn reconcile_requests(plan: &ResolvedPlan, inputs: &cuteafd_loader::placement::families::inkling2::InklingInputs,
+    receipts: &[Receipt]) -> Result<()> {
+    use std::collections::BTreeMap;
+    let contract = inputs.prepare(&plan.request)?;
+    let selected = |id: &str| id.starts_with("inkling2.cache.") || id.starts_with("inkling2.kv.")
+        || id.starts_with("inkling2.decode.") || id.starts_with("inkling2.unit.");
+    let planned = plan.facts.allocations.iter().filter(|allocation| allocation.view.is_none() && selected(&allocation.id))
+        .map(|allocation| (allocation.id.as_str(), allocation)).collect::<BTreeMap<_, _>>();
+    let actual = receipts.iter().filter(|receipt| receipt.allocation.view.is_none()
+        && receipt.allocation.location != Location::HOST).map(|receipt| {
+            let id = receipt.allocation.id.strip_prefix("retained.").unwrap_or(&receipt.allocation.id);
+            (id, receipt)
+        }).collect::<BTreeMap<_, _>>();
+    anyhow::ensure!(actual.len() == receipts.iter().filter(|receipt| receipt.allocation.view.is_none()
+        && receipt.allocation.location != Location::HOST).count(), "Inkling duplicate request backing receipt");
+    anyhow::ensure!(actual.len() == planned.len(), "Inkling request owner count differs: missing {:?}, extra {:?}",
+        planned.keys().filter(|id| !actual.contains_key(*id)).collect::<Vec<_>>(),
+        actual.keys().filter(|id| !planned.contains_key(*id)).collect::<Vec<_>>());
+    let pages = plan.pool_tokens.div_ceil(plan.pool_page_rows);
+    for (id, receipt) in actual {
+        let owner = planned.get(id).with_context(|| format!("Inkling unadmitted request owner {id}"))?;
+        let curves = contract.components.iter().filter(|component| matches!(&component.kind,
+            ComponentKind::Allocation { template, .. } if template.id == id)).map(|component| &component.bytes)
+            .collect::<Vec<_>>();
+        let curve = curves.first().context("Inkling request owner has no component curve")?;
+        anyhow::ensure!(curves.iter().all(|other| *other == *curve), "Inkling request owner has ambiguous curves");
+        let piece = curve.0.iter().find(|piece| (piece.first..=piece.last).contains(&pages))
+            .context("Inkling request owner curve does not cover admitted pool")?;
+        let payload = pages.checked_sub(piece.first).and_then(|pages| piece.bytes_per_page.checked_mul(pages))
+            .and_then(|bytes| piece.bytes_at_first.checked_add(bytes)).context("Inkling request payload overflow")?;
+        anyhow::ensure!(piece.backings == 1 && receipt.address != 0 && receipt.allocation.bytes == payload
+            && receipt.allocation.location == owner.location && curve.at(pages)? == owner.bytes,
+            "Inkling request owner {id} differs from admission: actual {}, requested {payload}, charged {}",
+            receipt.allocation.bytes, owner.bytes);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
