@@ -352,7 +352,7 @@ impl<'a> SwaLayer<'a> {
             (DType::F32, vec![192]),
             (DType::F32, vec![192]),
             (DType::Bf16, vec![heads, H]),
-            (if contract.core_view == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact { DType::F8E4M3 } else { DType::Bf16 }, vec![H, q]),
+            (if checkpoint.converts_to_fp8(&format!("model.layers.{layer_id}.self_attn.o_proj.weight")) { DType::F8E4M3 } else { DType::Bf16 }, vec![H, q]),
         ]) {
             let Some(weight) = weight else { continue };
             ensure!(
