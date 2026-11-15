@@ -53,6 +53,10 @@ def test_persistent_layer_state_is_borrowed_and_metadata_uses_retained_uploads()
     assert 'owner.segment_metadata(' in prefill
     assert 'unit.reply_origins()' in prefill
     assert 'layers::routed_ffn(self.kernels, owner,' in prefill
+    assert 'impl<\'a> UnitIo<\'a> for TokenIo' in prefill
+    assert 'self.head.embed_unit(' in prefill
+    assert 'probe::head_spans(member.rows.len(), 64)' in prefill
+    assert '(self.on_logits)(member.sequence,' in prefill
 
 
 def test_arenas_are_single_backings_and_head_is_shared():

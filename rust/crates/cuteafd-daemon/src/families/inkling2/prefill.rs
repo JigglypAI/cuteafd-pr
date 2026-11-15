@@ -8,9 +8,47 @@ use cuteafd_loader::families::inkling2::Inkling2Config;
 /// has an admitted scratch owner; global pages and causal histories are shared
 /// request owners, ordered by run_prefill_units at every layer.
 pub(crate) trait UnitIo<'a> {
-    fn begin(&mut self, unit: &Unit, owner: &super::owners::UnitOwner<'a>) -> Result<()>;
+    fn begin(&mut self, unit: &Unit, owner: &super::owners::UnitOwner<'a>,
+        uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()>;
     fn end(&mut self, unit: &Unit, owner: &super::owners::UnitOwner<'a>) -> Result<()>;
 }
+/// Token/head edge for ordinary prefill and bounded streamed scoring. The
+/// callback consumes scratch logits before another head tile overwrites them.
+pub(crate) struct TokenIo<'s, 'a> {
+    pub kernels: &'s Kernels<'a>,
+    pub head: &'s super::head::Head<'a>,
+    pub cache: &'s super::cache::CacheBank<'a>,
+    pub target: &'s TargetWeights<'a>,
+    pub cfg: &'s Inkling2Config,
+    /// Submission-local token streams in the shared unit sequence order.
+    pub tokens: &'s [&'s [u32]],
+    pub slots: &'s [usize],
+    pub on_logits: &'s mut dyn FnMut(usize, usize, crate::shared::token_io::DeviceLogits) -> Result<()>,
+}
+impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
+    fn begin(&mut self, unit: &Unit, owner: &super::owners::UnitOwner<'a>,
+        uploads: &mut crate::shared::token_table::RetainedUploads<'a>) -> Result<()> {
+        let tokens = unit_tokens(unit, self.tokens)?;
+        self.head.embed_unit(self.kernels, owner, self.target, self.cfg, &tokens, uploads)
+    }
+    fn end(&mut self, unit: &Unit, owner: &super::owners::UnitOwner<'a>) -> Result<()> {
+        for member in members(unit) {
+            if !member.head { continue; }
+            let sequence = *self.slots.get(member.sequence).context("Inkling head sequence slot absent")?;
+            for span in crate::shared::probe::head_spans(member.rows.len(), 64)? {
+                let rows = member.rows.start+span.start..member.rows.start+span.end;
+                let state = owner.segment(self.cache, sequence, self.cfg.layers-1, rows)?;
+                let logits = self.head.project(self.kernels, &state, self.target, self.cfg, span.len(), self.cfg.residual_blocks()+1)?;
+                (self.on_logits)(member.sequence, member.tokens.start+span.start+1,
+                    crate::shared::token_io::DeviceLogits { ptr: logits.ptr, rows: span.len(),
+                        vocab: self.cfg.unpadded_vocab_size, stride: self.cfg.unpadded_vocab_size,
+                        stream: owner.stream.raw, greedy: None })?;
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct Stateful<'s, 'a> {
     pub kernels: &'s Kernels<'a>,
     pub owners: &'s [super::owners::UnitOwner<'a>],
@@ -56,6 +94,16 @@ impl Stateful<'_, '_> {
     }
 }
 
+fn unit_tokens(unit: &Unit, sources: &[&[u32]]) -> Result<Vec<u32>> {
+    let mut tokens = Vec::with_capacity(unit.rows.len());
+    for member in members(unit) {
+        let source = sources.get(member.sequence).context("Inkling unit token source absent")?;
+        tokens.extend_from_slice(source.get(member.tokens.clone()).context("Inkling unit token span outside request")?);
+    }
+    ensure!(tokens.len() == unit.rows.len(), "Inkling token members do not cover unit");
+    Ok(tokens)
+}
+
 fn members(unit: &Unit) -> Vec<crate::shared::prefill_pipeline::UnitSegment> {
     if !unit.segments.is_empty() { return unit.segments.clone(); }
     vec![crate::shared::prefill_pipeline::UnitSegment { sequence: unit.sequence,
@@ -68,7 +116,7 @@ impl PrefillHooks for Stateful<'_, '_> {
         if layer < self.onboarded { FfnRoute::Local } else { FfnRoute::Spark }
     }
     fn begin_unit(&mut self, unit: &Unit) -> Result<()> {
-        self.io.begin(unit, &self.owners[unit.slot])
+        self.io.begin(unit, &self.owners[unit.slot], &mut self.uploads[unit.slot])
     }
     fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let owner = &self.owners[unit.slot];
@@ -212,6 +260,11 @@ mod tests {
         let unit = Unit { index: 0, sequence: 2, segments: segments.clone(), rows: 0..5,
             layers: 0..48, slot: 0, barrier: false };
         assert_eq!(members(&unit), segments);
+        let a = (0..1090).collect::<Vec<u32>>();
+        let b = (1000..1100).collect::<Vec<u32>>();
+        let sources: Vec<&[u32]> = vec![&[], &[], &a, &[], &[], &[], &[], &b];
+        assert_eq!(unit_tokens(&unit, &sources)?, [1087, 1088, 1063, 1064, 1065]);
+        assert!(unit_tokens(&unit, &[&a]).is_err());
         let routes = (0..40).map(|route| ExpertProtocolV2RouteEntry {
             row_index: route/8, expert_id: route%384, gate_weight: 0.125 }).collect();
         let mut request = request(99, 3, 5, 3, 0, 5, routes, vec![0; 5*4752].into())?;
