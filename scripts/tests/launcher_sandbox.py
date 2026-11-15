@@ -233,6 +233,8 @@ def seed_checkpoint_metadata(hf):
             "num_hidden_layers": 62, "mlp_layer_types": ["sparse"] * 62}},
         "wrldsuksgo2mars/Kimi-K3-EXL3-K2": {"model_type": "kimi_k3", "text_config": {
             "num_hidden_layers": 93, "first_k_dense_replace": 1}},
+        "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC": {"model_type": "kimi_k31", "text_config": {
+            "model_type": "kimi_linear", "num_hidden_layers": 93, "first_k_dense_replace": 1}},
         "MiniMaxAI/MiniMax-M3.1-Flash": {"model_type": "minimax_m3_vl", "text_config": {
             "num_hidden_layers": 3, "moe_layer_freq": [0, 1, 1]}},
     }

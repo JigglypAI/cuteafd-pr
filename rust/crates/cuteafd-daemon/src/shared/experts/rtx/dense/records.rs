@@ -204,6 +204,10 @@ pub(crate) enum Finish {
     /// One plane of a native expert packed from its landed raw image (the
     /// scale planes: their raw bytes sit apart from the weights in the file).
     NativePlane { intermediate: u32, plane: u32, source: CuteafdDeviceBuffer, dst: CuteafdDeviceBuffer },
+    /// Bit-preserving tensor transpose and zero padding into its final arena
+    /// view, after source delivery and before whole-group publication.
+    PaddedTranspose { source: CuteafdDeviceBuffer, output: CuteafdDeviceBuffer, dtype: cuteafd_core::DType,
+        rows: usize, cols: usize, padded_cols: usize },
     /// Native conservative row-norm bounds of a landed BF16 Markov projection.
     RowNorms { source: CuteafdDeviceBuffer, norms: CuteafdDeviceBuffer, rows: usize, cols: usize },
     /// Per-row scales gathered from a landed `grid` [*, grid_cols] (columns
@@ -217,6 +221,7 @@ impl Finish {
     pub fn device(&self) -> i32 {
         match self { Finish::V41Scales { packed, .. } | Finish::NativePlane { dst: packed, .. } => packed.device_id,
             Finish::ScaleGather { grid, .. } => grid.device_id,
+            Finish::PaddedTranspose { output, .. } => output.device_id,
             Finish::RowNorms { norms, .. } => norms.device_id }
     }
 
@@ -248,6 +253,16 @@ impl Finish {
                 // SAFETY: both buffers are live operand allocations on the current
                 // device; the native entry point checks extents, the caller drains.
                 unsafe { library.v41_pack_plane_async(source, dst, intermediate, plane, stream) }
+            }
+            Finish::PaddedTranspose { source, output, ref dtype, rows, cols, padded_cols } => {
+                let (element, suffix) = padded_transpose_dtype(dtype)?;
+                validate_padded_transpose(source, output, rows, cols, padded_cols, element)?;
+                let name = format!("inkling2_padded_transpose_{suffix}_r{rows}_c{cols}_p{padded_cols}");
+                let programs = library.programs()?;
+                let program = programs.program(&name, &["source", "output"])?;
+                // SAFETY: checked disjoint native storage extents on this GPU;
+                // both final arena views survive the caller's completion drain.
+                unsafe { program.launch(&[source.ptr, output.ptr], &[], stream) }
             }
             Finish::RowNorms { source, norms, rows, cols } => {
                 validate_row_norms(source, norms, rows, cols)?;
@@ -283,6 +298,29 @@ impl Finish {
     }
 }
 
+fn padded_transpose_dtype(dtype: &cuteafd_core::DType) -> Result<(usize, &'static str)> {
+    use cuteafd_core::DType;
+    Ok(match dtype {
+        DType::Bf16 => (2, "bf16"), DType::F16 => (2, "f16"), DType::F32 => (4, "f32"),
+        DType::I8 => (1, "i8"), DType::U8 => (1, "u8"), DType::I32 => (4, "i32"), DType::I64 => (8, "i64"),
+        other => anyhow::bail!("padded transpose does not support {other:?}"),
+    })
+}
+fn validate_padded_transpose(source: CuteafdDeviceBuffer, output: CuteafdDeviceBuffer,
+    rows: usize, cols: usize, padded_cols: usize, element: usize) -> Result<()> {
+    let source_bytes = rows.checked_mul(cols).and_then(|bytes| bytes.checked_mul(element)).context("transpose source extent overflow")?;
+    let output_bytes = cols.checked_mul(padded_cols).and_then(|bytes| bytes.checked_mul(element)).context("transpose output extent overflow")?;
+    let source_end = (source.ptr as usize).checked_add(source_bytes).context("transpose source pointer overflow")?;
+    let output_end = (output.ptr as usize).checked_add(output_bytes).context("transpose output pointer overflow")?;
+    ensure!(rows > 0 && cols > 0 && padded_cols >= rows && matches!(element, 1 | 2 | 4 | 8)
+        && source_bytes <= source.bytes && output_bytes <= output.bytes
+        && source.device_id == output.device_id && !source.ptr.is_null() && !output.ptr.is_null()
+        && source.ptr as usize % 16 == 0 && output.ptr as usize % 16 == 0
+        && ((output.ptr as usize) >= source_end || (source.ptr as usize) >= output_end),
+        "padded transpose outside its disjoint admitted operands");
+    Ok(())
+}
+
 fn validate_row_norms(source: CuteafdDeviceBuffer, norms: CuteafdDeviceBuffer, rows: usize, cols: usize) -> Result<()> {
     let source_bytes = rows.checked_mul(cols).and_then(|n| n.checked_mul(2)).context("row norms source overflow")?;
     let output_bytes = rows.checked_mul(4).context("row norms output overflow")?;
@@ -298,6 +336,24 @@ fn validate_row_norms(source: CuteafdDeviceBuffer, norms: CuteafdDeviceBuffer, r
 #[cfg(test)]
 mod finish_tests {
     use super::*;
+
+    #[test]
+    fn padded_transpose_finish_checks_extent_alias_and_destination_owner() -> Result<()> {
+        let source = CuteafdDeviceBuffer { ptr: 0x1000 as *mut _, bytes: 16*1024*2, device_id: 3, ..Default::default() };
+        let output = CuteafdDeviceBuffer { ptr: 0x100000 as *mut _, bytes: 1024*64*2, device_id: 3, ..Default::default() };
+        validate_padded_transpose(source, output, 16, 1024, 64, 2)?;
+        assert!(validate_padded_transpose(source, source, 16, 1024, 64, 2).is_err());
+        assert!(validate_padded_transpose(source, output, 16, 1024, 15, 2).is_err());
+        assert!(validate_padded_transpose(source, output, usize::MAX, 1024, 64, 2).is_err());
+        let (_, records) = recording(|| {
+            assert!(recorded(|records| records.finishes.push(Finish::PaddedTranspose { source, output,
+                dtype: cuteafd_core::DType::Bf16, rows: 16, cols: 1024, padded_cols: 64 })));
+            Ok(())
+        })?;
+        assert_eq!(records.finishes.len(), 1);
+        assert_eq!(records.finishes[0].device(), 3);
+        Ok(())
+    }
 
     #[test]
     fn row_norm_finish_records_destination_device_and_checks_native_extents() -> Result<()> {
