@@ -256,6 +256,48 @@
         "REPLACE-ME-spark-4",
         "REPLACE-ME-spark-5"
       ]
+    },
+    {
+      "name": "glmf-mc-k8-compact-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-k4-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "ADDR": "0.0.0.0:8866",
+        "EXPERT_PORT": "28006",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "0",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
+        "MODEL_REVISION": "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d",
+        "EXPERT_BACKEND": "local",
+        "CORE_VIEW": "k8-compact"
+      }
+    },
+    {
+      "name": "glmf-mc-k6-compact-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-k4-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "ADDR": "0.0.0.0:8867",
+        "EXPERT_PORT": "28007",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "0",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
+        "MODEL_REVISION": "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d",
+        "EXPERT_BACKEND": "local",
+        "CORE_VIEW": "k6-compact"
+      }
     }
   ],
   "unsupported": [
@@ -276,6 +318,12 @@
       "core_view": "fp8-compact",
       "status": "na",
       "reason": "Selected vocabulary head and pre/post-expert roles require whole-core FP8 executors (#1796)."
+    },
+    {
+      "family": "glm5_flash",
+      "core_view": "fp8-compact",
+      "status": "na",
+      "reason": "GLM Flash MC original rejects fp8-compact; whole-core FP8 conversion is not implemented."
     }
   ]
 }
