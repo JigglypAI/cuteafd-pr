@@ -454,7 +454,7 @@ fn production_serving(options: &LayoutOptions, checkpoint: &Checkpoint, cfg: &Gl
                 else { GlmDraftRepresentation::Fp8Only }, GlmDraftCapacity::new(slots, sequences, draft.block)?,
                 sms, 0, options.draft_kv_cache)?
         };
-    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
+    let host = super::recipe_host_memory(options)?;
     let cache = if let Some(ml4) = cfg.variant.ml4() {
         crate::serving_capacity::mistral_large4_cache_geometry(ml4, 1)?
     } else { crate::serving_capacity::glm_cache_geometry(cfg, cfg.layers, 1)? };
@@ -580,7 +580,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         if checkpoint.spark_input_is_bf16() { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 },
         cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
         options.spark_reply_formats)?;
-    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
+    let host = super::recipe_host_memory(options)?;
     let budgets = production_budgets(&options.rtx_bytes[..gpus].iter().map(|&n| (n, n)).collect::<Vec<_>>(),
         crate::placement::reserve::gpu("glm5"), host, (8 << 30).max(host.0 / 10), &vec![options.spark_bytes; spark_ranks])?;
     let request = production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard, prefill, operation,
@@ -723,7 +723,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
     let (decode_link, prefill_link) = production_links(&cfg, spark_ranks, prefill,
         cuteafd_core::SparkIngress::Fp8K32, rings, options.spark_reply_formats)?;
-    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
+    let host = super::recipe_host_memory(options)?;
     let budgets = production_budgets(&options.rtx_bytes.iter().map(|&n| (n, n)).collect::<Vec<_>>(),
         crate::placement::reserve::gpu("glm5"), host, (8 << 30).max(host.0 / 10), &vec![options.spark_bytes; spark_ranks])?;
     let operation = Operation::Serving;
@@ -774,7 +774,7 @@ mod tests {
         LayoutOptions { rtx_bytes: vec![96 << 30; gpus], context_tokens: 65536,
             pool_tokens: Some(131072), prefill_rows: 1024, prefill_waves: 3,
             onboard: Some(crate::placement::OnboardSetting::Layers(0)),
-            glm5_drafter_disabled: true, host_memory: Some((128 << 30, 128 << 30)),
+            glm5_drafter_disabled: true, host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
             host_cache_bytes: Some(0), ..Default::default() }
     }
 
@@ -919,7 +919,7 @@ mod tests {
         let options = LayoutOptions { rtx_bytes: vec![96 << 30; 2], physical_sms: Some(188),
             workspace_manifest: Some(path), context_tokens: 65536, pool_tokens: Some(131072),
             onboard: Some(crate::placement::OnboardSetting::Layers(0)), glm5_drafter_disabled: true,
-            host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0), ..Default::default() };
+            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0), ..Default::default() };
         let plan = |attention| input.plan(&PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
             attention_placement: attention, layout: Some(options.clone()), ..Default::default() }).unwrap();
         let auto = plan(None);
@@ -959,7 +959,7 @@ mod tests {
         let mut off = options(0, 2 << 30);
         off.glm5_drafter_snapshot = None;
         let cfg = GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
-        off.host_memory = Some((128 << 30, 128 << 30));
+        off.host_memory = Some(crate::plan::testing::SimulatedHost::raptor().host_ram);
         let mark_owner = |options: &LayoutOptions, attention, gpus| {
             let (draft, _, _) = production_serving(options, &checkpoint, &cfg, 1 << 20, attention, gpus, 32768).unwrap();
             draft.owners().iter().filter(|owner| owner.id == "glm.draft.window_marks")

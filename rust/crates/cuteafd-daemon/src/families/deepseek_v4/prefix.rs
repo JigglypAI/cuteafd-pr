@@ -836,7 +836,7 @@ mod tests {
                 let options = LayoutOptions { rtx_bytes: vec![96 << 30; 2], context_tokens: 4096,
                     pool_tokens: Some(8192), concurrency, native_mtp_layers: stages,
                     workspace_manifest: Some(programs),
-                    host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };
+                    host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() };
                 let report = plan::plan(dir.path(), &PlanOptions { layout: Some(options),
                     attention_placement: Some(AttentionPlacement::Context), ..Default::default() }).unwrap();
                 let expected = host.resolve(None, 4096, concurrency, 128 << 30, host.chunk_bytes()).unwrap();

@@ -990,7 +990,7 @@ mod tests {
             let planned = plan::plan(&args.snapshot, &plan::PlanOptions {
                 placement: plan::ExpertPlacement::from_spark_ranks(6),
                 draft_ownership: Some(DraftOwnership::NativeMtp),
-                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![capacity; 2], step5_kv: args.kv_cache,
+                layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![capacity; 2], step5_kv: args.kv_cache,
                     native_mtp_layers: usize::from(depth), workspace_manifest: Some(args.manifest.clone()),
                     ..Default::default() }), ..Default::default()
             })?;

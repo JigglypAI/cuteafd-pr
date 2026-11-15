@@ -200,7 +200,7 @@ mod tests {
                 testing::write_safetensors(&dir.path().join("model.safetensors"), &tensors);
                 Ok(dir)
             }).transpose()?;
-            let opts = LayoutOptions { context_tokens: 786432, host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![total; gpus],
+            let opts = LayoutOptions { context_tokens: 786432, host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost { host_ram: (256 << 30, 256 << 30), ..cuteafd_loader::plan::testing::SimulatedHost::raptor() }.host_ram), rtx_bytes: vec![total; gpus],
                 head_split: true, tp2_dflash: tp2, host_cache_bytes: Some(0), workspace_manifest: Some(path.clone()),
                 muse_partial_bf16_max_rows: cutoff_rows, spark_reply_formats: formats, draft_kv_cache: draft_kv,
                 muse_drafter_snapshot: snapshot.as_ref().map(|d| d.path().to_path_buf()), ..Default::default() };
@@ -285,7 +285,7 @@ mod tests {
             let path = testing::write_muse_exl3_capacities(&image);
             std::fs::write(&path, serde_json::to_vec(&manifest(gpus))?)?;
             let total = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
-            let opts = LayoutOptions { context_tokens: 634304, host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![total; gpus],
+            let opts = LayoutOptions { context_tokens: 634304, host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost { host_ram: (256 << 30, 256 << 30), ..cuteafd_loader::plan::testing::SimulatedHost::raptor() }.host_ram), rtx_bytes: vec![total; gpus],
                 head_split: gpus == 2, host_cache_bytes: Some(0), workspace_manifest: Some(path.clone()),
                 ..Default::default() };
             let vision = cuteafd_loader::plan::MediaMode::Spark(None);
@@ -412,7 +412,7 @@ mod tests {
         let total = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
         let path = testing::write_muse_exl3_capacities(&dir.path().join("image"));
         std::fs::write(&path, serde_json::to_vec(&manifest(gpus))?)?;
-        let opts = LayoutOptions { context_tokens: 786432, host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![total; gpus],
+        let opts = LayoutOptions { context_tokens: 786432, host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost { host_ram: (256 << 30, 256 << 30), ..cuteafd_loader::plan::testing::SimulatedHost::raptor() }.host_ram), rtx_bytes: vec![total; gpus],
             head_split: true, host_cache_bytes: Some(0), workspace_manifest: Some(path.clone()),
             vision_replicas: replicas, media_cache_bytes: Some(123_456_789), ..Default::default() };
         let report = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(sparks), vision, audio,

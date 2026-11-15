@@ -172,7 +172,7 @@ fn layout_options(ranks: usize, gpus: usize) -> PlanOptions {
         mapped_scale_host_budget_bytes: Some(64 << 30),
         layout: Some(plan::layout::LayoutOptions {
             rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
-            host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0), prefix_slots: Some(0),
+            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0), prefix_slots: Some(0),
             glm5_drafter_disabled: true, ..Default::default()
         }),
         ..Default::default()

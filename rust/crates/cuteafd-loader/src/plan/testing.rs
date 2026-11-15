@@ -8,16 +8,72 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+/// A planner's reference machine, never a sample of the machine running the test.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimulatedHost {
+    pub host_ram: (u64, u64),
+    pub gpu_count: usize,
+    pub gpu_bytes: u64,
+    pub spark_count: usize,
+    pub spark_bytes: u64,
+}
+
+impl SimulatedHost {
+    /// Raptor /proc/meminfo MemTotal, measured once on 2026-11-15 (192730532 kB).
+    pub const RAPTOR_RAM_BYTES: u64 = 192_730_532 * 1024;
+    /// Quiet-host fixture policy, not measured free RAM: leave 16 GiB for the system.
+    pub const SYSTEM_RESERVE_BYTES: u64 = 16 << 30;
+
+    pub const fn raptor() -> Self {
+        Self { host_ram: (Self::RAPTOR_RAM_BYTES, Self::RAPTOR_RAM_BYTES - Self::SYSTEM_RESERVE_BYTES),
+            // AGENTS.md cluster inventory; card bytes come from the CUDA-measured inventory.
+            gpu_count: 2, gpu_bytes: crate::placement::inventory::PRO_TOTAL_BYTES,
+            spark_count: 6, spark_bytes: 121 << 30 }
+    }
+
+    pub fn layout(&self) -> super::layout::LayoutOptions {
+        super::layout::LayoutOptions { host_memory: Some(self.host_ram),
+            rtx_bytes: vec![self.gpu_bytes; self.gpu_count], spark_bytes: self.spark_bytes,
+            ..Default::default() }
+    }
+
+    /// CLI tests use the same fixture as in-process plans. Normal binaries ignore this input.
+    pub fn plan_command(&self, binary: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+        let mut command = std::process::Command::new(binary);
+        command.env("CUTEAFD_TEST_HOST", serde_json::to_string(self).expect("serialize simulated host"));
+        command
+    }
+}
+
+/// Only test-support builds may replace OS probes. Missing input still means live probing.
+pub(crate) fn injected_host_memory() -> anyhow::Result<Option<(u64, u64)>> {
+    #[cfg(feature = "test-support")]
+    if let Some(value) = std::env::var_os("CUTEAFD_TEST_HOST") {
+        use anyhow::{Context, ensure};
+        let host: SimulatedHost = serde_json::from_str(value.to_str().context("CUTEAFD_TEST_HOST must be UTF-8")?)
+            .context("invalid CUTEAFD_TEST_HOST")?;
+        ensure!(host.host_ram.0 > 0 && host.host_ram.1 <= host.host_ram.0,
+            "CUTEAFD_TEST_HOST requires positive total RAM and available <= total");
+        return Ok(Some(host.host_ram));
+    }
+    Ok(None)
+}
+
 /// Shared full-plan wall budget, including first-use metadata rather than only a warm report.
-pub struct BudgetedPlanInput { input: super::PlanInput }
+pub struct BudgetedPlanInput { input: super::PlanInput, host: SimulatedHost }
 
 impl BudgetedPlanInput {
     pub fn open(snapshot: &Path) -> anyhow::Result<Self> {
-        Ok(Self { input: super::PlanInput::open(snapshot)? })
+        Self::open_on(snapshot, SimulatedHost::raptor())
+    }
+
+    pub fn open_on(snapshot: &Path, host: SimulatedHost) -> anyhow::Result<Self> {
+        Ok(Self { input: super::PlanInput::open(snapshot)?, host })
     }
 
     pub fn from_checkpoint(checkpoint: super::Checkpoint) -> Self {
-        Self { input: super::PlanInput::from_checkpoint(checkpoint) }
+        Self { input: super::PlanInput::from_checkpoint(checkpoint), host: SimulatedHost::raptor() }
     }
 
     pub fn checkpoint(&self) -> &super::Checkpoint { self.input.checkpoint() }
@@ -32,7 +88,13 @@ impl BudgetedPlanInput {
 
     #[track_caller]
     pub fn plan(&self, options: &super::PlanOptions) -> Result<super::PlanReport, super::PlanError> {
-        let (result, phases) = self.input.plan_with_timings(options);
+        let mut options = options.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        { options.inventory_host_memory = Some(self.host.host_ram); }
+        if let Some(layout) = &mut options.layout {
+            layout.host_memory.get_or_insert(self.host.host_ram);
+        }
+        let (result, phases) = self.input.plan_with_timings(&options);
         eprintln!("full-plan {:?} ranks={} phases={phases:?}", self.checkpoint().snapshot, options.placement.spark_ranks());
         assert!(phases.total() < std::time::Duration::from_secs(30),
             "full plan exceeded 30s: snapshot={} ranks={} phases={phases:?} options={options:?}",

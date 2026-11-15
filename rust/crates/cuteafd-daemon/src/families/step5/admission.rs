@@ -229,7 +229,7 @@ mod tests {
         ].into_iter().flat_map(|case| [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8]
             .into_iter().map(move |format| (case, format))) {
-            let opts = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            let opts = LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
                 step5_kv: kv_format,
                 rtx_bytes: vec![96 << 30; ranks],
                 pool_tokens: pool,

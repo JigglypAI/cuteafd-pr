@@ -16,7 +16,7 @@ fn fixture() -> (Qwen35Config, NativeWeights, NativeBuffers, crate::serving_capa
 
 fn budgets() -> Vec<Budget> {
     forecast_budgets(&crate::placement::ARCH_CONTEXTS[1], 96 << 30, 0,
-        (128 << 30, 128 << 30)).unwrap()
+        crate::plan::testing::SimulatedHost::raptor().host_ram).unwrap()
 }
 
 fn request() -> Request {
@@ -39,7 +39,7 @@ fn sampled_preweight_occupancy_is_one_capacity_neutral_named_owner() {
         for sampled in [0, occupied] {
             let input = facts(&cfg, &weights, &buffers, &arena);
             let live = sampled_budgets((96 << 30) - sampled, 96 << 30, Some(logical),
-                (128 << 30, 128 << 30)).unwrap();
+                crate::plan::testing::SimulatedHost::raptor().host_ram).unwrap();
             let previous = solve(request(), live.clone(), &input).unwrap();
             let plan = admit(request(), live, input).unwrap();
             assert_eq!(plan.pool_tokens, previous.pool_tokens);
@@ -70,7 +70,7 @@ fn sampled_preweight_occupancy_is_one_capacity_neutral_named_owner() {
     assert!(!offline.facts.allowances.iter().any(|owner|
         crate::placement::sampled_baseline::is_source(&owner.source)));
     assert!(sampled_budgets((96 << 30) + 1, 96 << 30, None,
-        (128 << 30, 128 << 30)).is_err());
+        crate::plan::testing::SimulatedHost::raptor().host_ram).is_err());
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn sampled_preweight_owner_survives_gpu_reserve_override_without_changing_capaci
     for reserve in [0, 200 << 20] {
         MemoryPolicy { gpu_reserve: Some(reserve), ..Default::default() }.scoped(|| {
             let live = sampled_budgets((96 << 30) - occupied, 96 << 30, Some(80 << 30),
-                (128 << 30, 128 << 30)).unwrap();
+                crate::plan::testing::SimulatedHost::raptor().host_ram).unwrap();
             let previous = solve(request(), live.clone(), &facts(&cfg, &weights, &buffers, &arena)).unwrap();
             let plan = admit(request(), live, facts(&cfg, &weights, &buffers, &arena)).unwrap();
             assert_eq!(plan.pool_tokens, previous.pool_tokens);

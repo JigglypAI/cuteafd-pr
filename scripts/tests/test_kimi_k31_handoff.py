@@ -223,12 +223,20 @@ def test_native_handoff_never_opens_weight_payloads(artifact, monkeypatch):
     assert storage.handoff(root)['status'] == 'passed'
 
 
-def test_cleanup_rejects_an_open_payload(tmp_path):
+def test_cleanup_rejects_an_open_payload(tmp_path, monkeypatch):
     path = tmp_path / 'live.payload'
     path.write_bytes(b'in use')
-    with path.open('rb'):
-        with pytest.raises(RuntimeError, match='still used by a process'):
-            storage.unused([tmp_path])
+    original_exec = storage.importlib.machinery.SourceFileLoader.exec_module
+
+    def isolated_scanner(loader, module):
+        original_exec(loader, module)
+        if loader.name == 'kimi_k31_cache_gc':
+            monkeypatch.setattr(module, 'docker_mounts', lambda: [])
+            monkeypatch.setattr(module, 'process_paths', lambda root: ({path.resolve()}, False))
+
+    monkeypatch.setattr(storage.importlib.machinery.SourceFileLoader, 'exec_module', isolated_scanner)
+    with pytest.raises(RuntimeError, match='still used by a process'):
+        storage.unused([tmp_path])
 
 
 def test_incomplete_native_host_job_is_not_success(monkeypatch):

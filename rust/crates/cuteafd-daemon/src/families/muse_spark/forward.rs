@@ -266,7 +266,7 @@ mod tests {
         let total = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
         let report = input.plan(&cuteafd_loader::plan::PlanOptions {
             placement: cuteafd_loader::plan::ExpertPlacement::from_spark_ranks(6),
-            layout: Some(cuteafd_loader::plan::layout::LayoutOptions { host_memory: Some((256 << 30, 256 << 30)),
+            layout: Some(cuteafd_loader::plan::layout::LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost { host_ram: (256 << 30, 256 << 30), ..cuteafd_loader::plan::testing::SimulatedHost::raptor() }.host_ram),
                 rtx_bytes: vec![total; 2], head_split: true, ..Default::default() }), ..Default::default() })?;
         for rank in 0..2 {
             let items = &report.solver_placement.as_ref().unwrap().items[rank];

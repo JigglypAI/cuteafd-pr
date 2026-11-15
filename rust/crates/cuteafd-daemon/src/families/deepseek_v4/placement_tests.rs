@@ -82,7 +82,7 @@ fn planned(shared: &Shared, case: &Case<'_>) -> (MemoryLayout, bool, Vec<String>
 
 fn plan_options(case: &Case<'_>, host: bool) -> PlanOptions {
     PlanOptions { placement: ExpertPlacement::from_spark_ranks(case.sparks),
-        layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: (0..case.rtx).map(|g| if g == 1 { case.peer_budget.unwrap_or(case.budget) } else { case.budget }).collect(), context_tokens: case.context,
+        layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: (0..case.rtx).map(|g| if g == 1 { case.peer_budget.unwrap_or(case.budget) } else { case.budget }).collect(), context_tokens: case.context,
             // Retained measured fixtures and the direct EngineArgs default are C8.
             concurrency: 8, expert_usage: true, physical_sms: case.physical_sms, host_cache_bytes: if host { None } else { Some(0) }, workspace_manifest: Some(case.manifest.to_path_buf()), onboard: case.onboard, exchange_f32: case.exchange_f32,
             native_mtp_layers: if case.dspark { 3 } else { 0 }, tp2_dspark_experts: case.tp2_draft, ..Default::default() }),
@@ -163,7 +163,7 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: tp1_available.then_some(expert_workspace),
         tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
             &catalog, Some(case.manifest), max_rows).ok().map(|b| [b; 2]) } else { None },
-        exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: (128 << 30, 128 << 30) };
+        exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram };
     let facts = admission::inputs(&cli.engine, &inputs)?;
     let placement = admission::admit(&facts)?.placement;
     crate::shared::context::pool_context("deepseek_v4", facts.serving_context, usize::try_from(placement.pool_tokens)?)?;
@@ -958,7 +958,7 @@ fn runtime_measured(shared: &Shared, case: &Case<'_>, fixture: &Fixture) -> anyh
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: Some(expert_workspace),
         tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
             &catalog, Some(case.manifest), max_rows).ok().map(|b| [b; 2]) } else { None },
-        exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: (128 << 30, 128 << 30) };
+        exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram };
     let facts = admission::inputs(&cli.engine, &inputs)?;
     Ok(admission::admit(&facts)?.placement)
 }

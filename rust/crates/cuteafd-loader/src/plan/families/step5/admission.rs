@@ -234,7 +234,11 @@ pub struct HostInputs {
 }
 impl Default for HostInputs {
     fn default() -> Self {
-        Self { memory: (128 << 30, 128 << 30), cache_bytes: Some(0), headroom: 8 << 30,
+        Self {
+            #[cfg(test)]
+            memory: crate::plan::testing::SimulatedHost::raptor().host_ram,
+            #[cfg(not(test))]
+            memory: (128 << 30, 128 << 30), cache_bytes: Some(0), headroom: 8 << 30,
             retained_sync_h2d_bytes: 0, attention_mount_load: Default::default(), push: None }
     }
 }
@@ -1158,7 +1162,7 @@ mod tests {
         let error = run(&inputs).expect_err("host quota must be admitted");
         assert!(error.downcast_ref::<crate::placement::planner::Refusal>().is_some(), "{error:#}");
         assert!(format!("{error:#}").contains("host"), "{error:#}");
-        inputs.host.memory = (128 << 30, 128 << 30);
+        inputs.host.memory = crate::plan::testing::SimulatedHost::raptor().host_ram;
         inputs.host.push = Some(crate::push_load::PushHostEnvelope::new(vec![1024], vec![2048], 128, 1 << 20)?);
         let admitted = run(&inputs)?;
         assert_eq!(admitted.host_cache_bytes, 64 << 30);
@@ -1175,7 +1179,7 @@ mod tests {
             let mut input = inputs(ranks);
             input.marks.host = true;
             input.host.cache_bytes = Some(32_941_696_000);
-            input.host.memory = (128 << 30, 128 << 30);
+            input.host.memory = crate::plan::testing::SimulatedHost::raptor().host_ram;
             let admitted = run(&input)?;
             let facts = &admitted.solved.facts;
             let prefix = facts.deferred.iter().find(|owner| owner.id == "step5.host.prefix").unwrap();

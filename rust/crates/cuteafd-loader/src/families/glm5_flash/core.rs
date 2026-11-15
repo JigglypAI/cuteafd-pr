@@ -566,7 +566,7 @@ mod tests {
         for (gpus, placement) in [(1, ExpertPlacement::Sparks { ranks: 2 }), (2, ExpertPlacement::Local)] {
             let report = input.plan(&PlanOptions { placement, attention_placement: Some(crate::placement::AttentionPlacement::Heads),
                 layout: Some(crate::plan::layout::LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
-                    head_split: gpus == 2, host_memory: Some((128 << 30, 128 << 30)), context_tokens: 262144,
+                    head_split: gpus == 2, host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), context_tokens: 262144,
                     pool_tokens: Some(262144), workspace_manifest: Some(path.clone()), glmf_drafter_snapshot: Some(draft.clone()),
                     weight_budget_bytes: 80 << 30, ..Default::default() }), ..Default::default() })?;
             assert!(report.executable(), "{}", crate::plan::render(&report));
@@ -580,7 +580,7 @@ mod tests {
             let targets = crate::families::glm5_flash::weight_layout::target_options(input.checkpoint(), &cfg,
                 &vec![crate::placement::LayerMode::HeadSplit; cfg.layers], gpus, representation, embedding, None)?;
             let mut draft_owners = crate::placement::families::glm5_flash::admission::ProcessOwners::new(
-                (128 << 30, 128 << 30), 0);
+                crate::plan::testing::SimulatedHost::raptor().host_ram, 0);
             draft_owners.draft(&draft, crate::plan::layout::LayoutOptions::default().glmf_draft_representation, gpus, false)?;
             let draft_home = layout.devices.iter().take(gpus).position(|device| device.items.iter().any(|item|
                 item.group == "allocation granularity" && item.format.starts_with("glm5_flash/draft/"))).unwrap();
