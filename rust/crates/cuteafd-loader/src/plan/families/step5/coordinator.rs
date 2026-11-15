@@ -149,7 +149,7 @@ impl CoordinatorContract {
         checkpoint.validate_fp8_roles("Step-5", |name| {
             let attention = name.contains(".self_attn.");
             crate::formats::native_attention::Fp8Role::exact(if attention { "attention projection" } else { "core projection" },
-                name.ends_with(".self_attn.o_proj.weight"))
+                name.ends_with(".self_attn.o_proj.weight") || is_vocabulary_head(name))
         })?;
         let cfg: &Config = &model.cfg;
         let declarations = model
@@ -191,6 +191,10 @@ impl CoordinatorContract {
             layers,
         })
     }
+}
+
+pub fn is_vocabulary_head(name: &str) -> bool {
+    name == "lm_head.weight" || name.ends_with(".transformer.shared_head.output.weight")
 }
 
 /// Native operand storage, derived before CUDA initialization. This excludes

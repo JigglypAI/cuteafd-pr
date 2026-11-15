@@ -26,6 +26,7 @@ pub(super) struct HeadPlan {
     weights: Vec<WeightOperand>,
     /// The native vocabulary head's `.weight` name (EXL3 checkpoints).
     native: Option<String>,
+    fp8: bool,
     planes: [usize; 4],
     rows: usize,
     epsilon: f32,
@@ -69,7 +70,9 @@ impl HeadPlan {
             ensure!(core.shape == [V, H] && core.ranks == 1, "Step-5 native head geometry");
             Ok(names[1].clone())
         }).transpose()?;
-        let bf16: &[(&str, DType, Vec<usize>)] = &[(names[1].as_str(), DType::Bf16, vec![V, H])];
+        let fp8 = layout.operands.iter().any(|owner| owner.name == names[1] && owner.dtype == DType::F8E4M3);
+        let head_dtype = if fp8 { DType::F8E4M3 } else { DType::Bf16 };
+        let bf16: &[(&str, DType, Vec<usize>)] = &[(names[1].as_str(), head_dtype, vec![V, H])];
         let weights = [(names[0].as_str(), DType::F32, vec![H])].into_iter()
             .chain(if native.is_some() { &[][..] } else { bf16 }.iter().cloned())
             .map(|(name, dtype, shape)| {
@@ -86,9 +89,15 @@ impl HeadPlan {
             && g["width"] == H && g["heads"] == 1 && g["zero_centered"] == true
             && g["subtract_mean"] == false && g["bias"] == false && g["rotary"] == 0
             && g["epsilon"] == "runtime_float32", "Step-5 final norm ABI/geometry mismatch");
-        let bytes = Self::owner_bytes(&weights, native.as_ref().map(|name| &layout.core[name]),
+        let mut bytes = Self::owner_bytes(&weights, native.as_ref().map(|name| &layout.core[name]),
             &planes, kernel_rows)?;
-        Ok(Self { layout, weights, native, planes, rows, epsilon: cfg.norm_eps, bytes,
+        if fp8 {
+            let executor = target_head::BlockFp8Head::load(programs,[V,H])?;
+            ensure!(executor.scratch_bytes()? == cuteafd_loader::plan::families::step5::native::FP8_HEAD_SCRATCH_BYTES,
+                "Step-5 FP8 head program scratch differs from canonical owner");
+            bytes = bytes.checked_add(executor.scratch_bytes()? as u64).context("Step-5 FP8 head scratch overflow")?;
+        }
+        Ok(Self { layout, weights, native, fp8, planes, rows, epsilon: cfg.norm_eps, bytes,
             predictor: stage.is_some(), kernel_rows })
     }
 
@@ -125,6 +134,7 @@ impl HeadPlan {
     }
 
     pub(super) fn private_scratch_bytes(&self) -> Result<u64> {
+        if self.fp8 { return Ok(cuteafd_loader::plan::families::step5::native::FP8_HEAD_SCRATCH_BYTES as u64); }
         self.native.as_ref().map(|name| -> Result<u64> {
             Ok(cuteafd_loader::formats::head::native_private_scratch(
                 self.layout.core[name].shape, self.kernel_rows)?.packed_bytes()? as u64)
@@ -137,6 +147,7 @@ struct HeadWeights<'a> {
     weights: Vec<Allocation<'a>>,
     /// Native vocabulary projection (F32 logits) and its admitted scratch.
     native: Option<(super::native::NativeLinear<'a>, super::native::NativeScratch<'a>)>,
+    fp8: Option<(target_head::BlockFp8Head<'a>, Allocation<'a>, cuteafd_ffi::CuteafdDeviceBuffer)>,
     epsilon: f32,
     predictor: bool,
     kernel_rows: usize,
@@ -156,7 +167,9 @@ impl<'a> TargetHeadOwner<'a> {
         prefix: &str) -> Result<()> {
         let weights = &self.immutable;
         let native = weights.native.iter().map(|(linear, _)| linear).collect::<Vec<_>>();
-        super::native::inventory_owner(inventory, prefix, weights.weights.iter().map(Some), &native)
+        super::native::inventory_owner(inventory, prefix, weights.weights.iter().map(Some), &native)?;
+        if let Some((_,scratch,_)) = &weights.fp8 { scratch.inventory(inventory,&format!("{prefix}.fp8-scratch"))?; }
+        Ok(())
     }
 
     pub(super) fn device(&self) -> Device<'a> { self.stream.device }
@@ -185,8 +198,15 @@ impl<'a> TargetHeadOwner<'a> {
                     .map_err(|_| anyhow::anyhow!("native head aliased"))?;
                 Ok((linear, super::native::NativeScratch::allocate(device, &layout, if plan.predictor { crate::shared::memory::Tag::drafter_workspace("step5/mtp-head-projection") } else { crate::shared::memory::Tag::workspace("step5/head-projection") })?))
             }).transpose()?;
+            let fp8 = if plan.fp8 {
+                let executor = target_head::BlockFp8Head::load(programs,[V,H])?;
+                let scratch = Allocation::new(device,executor.scratch_bytes()?,if plan.predictor {
+                    crate::shared::memory::Tag::drafter_workspace("step5/mtp-head-projection")
+                } else { crate::shared::memory::Tag::workspace("step5/head-projection") })?;
+                Some((executor,scratch,weights[1].buffer))
+            } else { None };
             Self::workspace(device, plan.rows, std::rc::Rc::new(HeadWeights {
-                norm, weights, native, epsilon: plan.epsilon, predictor: plan.predictor, kernel_rows: plan.kernel_rows,
+                norm, weights, native, fp8, epsilon: plan.epsilon, predictor: plan.predictor, kernel_rows: plan.kernel_rows,
             }), arena)
         })
     }
@@ -204,7 +224,7 @@ impl<'a> TargetHeadOwner<'a> {
             let label = if immutable.predictor { "mtp" } else { "target" };
             crate::shared::inventory::startup_probe(device.library, &[device.id],
                 &format!("step5/{label}-head-before-cublas-handle"), Default::default())?;
-            let head = if immutable.native.is_none() {
+            let head = if immutable.native.is_none() && immutable.fp8.is_none() {
                 // SAFETY: private workspace survives the private handle on this device.
                 Some(unsafe { device.library.vocabulary_head_rows(planes[3].buffer.ptr,
                     H as u32, rows as u32, V as u32,
@@ -284,6 +304,11 @@ impl<'a> TargetHeadOwner<'a> {
                             device_id: stream.device.id, flags: 0 };
                         linear.launch(count, buffer(input, count * H * 2), buffer(output.cast(), count * V * 4),
                             &scratch.scratch, stream.raw)?;
+                    } else if let Some((executor,scratch,weight)) = &self.immutable.fp8 {
+                        let (values,scales) = super::weights::fp8_buffers(*weight,&[V,H])?;
+                        let buffer = |ptr,bytes| CuteafdDeviceBuffer {ptr,bytes,device_id:stream.device.id,flags:0};
+                        executor.launch_buffers(count,buffer(input,count*H*2),values,scales,
+                            buffer(output.cast(),count*V*4),scratch.buffer,stream.raw)?;
                     } else if self.immutable.predictor {
                         crate::shared::draft::launch_bf16_head(self.head.as_ref().context("Step-5 BF16 predictor head missing")?, input.cast(),
                             self.immutable.weights[1].buffer.ptr.cast(), output, count, stream.raw)?;
@@ -345,8 +370,8 @@ pub(super) mod tests {
         let plan = HeadPlan::prepare(&programs, &checkpoint, 1)?;
         let owner = TargetHeadOwner::load(device, &programs, &checkpoint, plan, u64::MAX, &[])?;
         let lane = owner.new_lane()?;
-        assert_eq!(owner.head.is_some(), owner.immutable.native.is_none());
-        assert_eq!(lane.head.is_some(), lane.immutable.native.is_none());
+        assert_eq!(owner.head.is_some(), owner.immutable.native.is_none() && owner.immutable.fp8.is_none());
+        assert_eq!(lane.head.is_some(), lane.immutable.native.is_none() && lane.immutable.fp8.is_none());
         ensure!(std::rc::Rc::ptr_eq(&owner.immutable, &lane.immutable)
             && owner.stream.get()?.raw != lane.stream.get()?.raw
             && owner.planes.iter().zip(&lane.planes).all(|(a, b)|

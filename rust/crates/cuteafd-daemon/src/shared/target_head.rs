@@ -148,14 +148,23 @@ impl<'a> BlockFp8Head<'a> {
             && weights.layout.split == CoreSplit::Whole,
             "block FP8 head differs from bound whole-owner shape");
         let scales = weights.scales.as_ref().context("block FP8 head scales absent")?.buffer;
-        ensure!([input.device_id, weights.values.buffer.device_id, scales.device_id, scratch.device_id]
+        self.launch_buffers(rows,input,weights.values.buffer,scales,output,scratch,stream)
+    }
+
+    /// Final arena values/scales are borrowed without manufacturing new owners.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_buffers(&self, rows:usize,input:Buffer,values:Buffer,scales:Buffer,
+        output:Buffer,scratch:Buffer,stream:*mut c_void) -> Result<()> {
+        ensure!([input.device_id, values.device_id, scales.device_id, scratch.device_id]
             .into_iter().all(|device| device == output.device_id)
             && scratch.bytes >= self.scratch_bytes()?, "block FP8 head device/scratch differs from admission");
         let [n, k] = self.shape;
+        ensure!(values.bytes >= n*k && scales.bytes >= n/128*(k/128)*4,
+            "block FP8 head final buffers differ from admitted shape");
         head_chunks(rows, input, output, k, n, |count, x, y| {
             // SAFETY: typed disjoint row views, admitted weights and serialized
             // scratch remain live on this device until the caller drains stream.
-            unsafe { self.registry.launch(x.ptr, weights.values.buffer.ptr, scales.ptr,
+            unsafe { self.registry.launch(x.ptr, values.ptr, scales.ptr,
                 y, scratch, count, k, n, stream)?; }
             Ok(())
         })
