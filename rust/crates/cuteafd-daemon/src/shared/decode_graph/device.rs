@@ -952,15 +952,16 @@ impl DeviceCache {
         // key, so a GRAPH_TRACE run still lists it for the layout's prewarm set.
         let sealed = site.spans_devices && cross_device_capture_sealed();
         let allowed = site.preference != Preference::Eager && estimate > 0 && !sealed;
-        let native = self.native_pools();
-        let new_nodes = old.and_then(|id| self.records[&id].stats.native_nodes).filter(|n| *n > 0)
-            .or_else(|| self.records.values().filter(|r| r.identity.site == site.name)
-                .filter_map(|r| r.stats.native_nodes).max())
-            .or_else(|| self.records.values().filter_map(|r| r.stats.native_nodes).max());
         let room = if self.soft.measured_bytes.is_none() { self.pending_destroy == 0 }
-            else if let Some(nodes) = new_nodes {
-                self.make_soft_room(nodes, None) && self.pending_destroy == 0
-            } else { true }; // Unknown topology retains measured-only admission.
+            else {
+                let new_nodes = old.and_then(|id| self.records[&id].stats.native_nodes).filter(|n| *n > 0)
+                    .or_else(|| self.records.values().filter(|r| r.identity.site == site.name)
+                        .filter_map(|r| r.stats.native_nodes).max())
+                    .or_else(|| self.records.values().filter_map(|r| r.stats.native_nodes).max());
+                if let Some(nodes) = new_nodes {
+                    self.make_soft_room(nodes, None) && self.pending_destroy == 0
+                } else { true }
+            };
         if allowed && room {
             // No CUDA query or ticket for a planned physical-headroom miss.
             if !self.physical_room(estimate, headroom) {
@@ -1646,11 +1647,15 @@ mod tests {
             assert_eq!(cache.pending_destroy, 0, "fitting hot set must settle above soft");
             assert_eq!((cache.soft.margin, cache.soft.measured_bytes, cache.soft.measured_nodes), frozen);
         }
+        assert!(matches!(cache.miss(key(5), capture_site, None, false), Miss::Eager));
+        let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy).map(|(&id, _)| id).collect();
+        assert_eq!(victims.len(), 1, "incoming node reservation makes room before capture");
+        cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
         let Miss::Capture(reuse) = cache.miss(key(5), capture_site, None, false) else { panic!() };
         cache.captured_topology(reuse, 10, 1, false);
         cache.measured_capture(0);
         assert_eq!(cache.records[&reuse].bytes, 0);
-        assert_eq!(cache.pending_destroy, 1, "reuse-backed graph still consumes node capacity");
+        assert_eq!(cache.pending_destroy, 0, "newly captured graph must not evict itself");
         assert_eq!((cache.soft.margin, cache.soft.measured_bytes, cache.soft.measured_nodes), frozen);
     }
 
@@ -1661,7 +1666,14 @@ mod tests {
         let capture_site = Site { bootstrap: 1, ..site(Preference::Capture) };
         let mut allocator_nodes = 0u64;
         for n in 0..200 {
-            let Miss::Capture(id) = cache.miss(key(n), capture_site, None, false) else { panic!("key {n} stays eager") };
+            let mut ticket = cache.miss(key(n), capture_site, None, false);
+            if matches!(ticket, Miss::Eager) {
+                let victims: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_destroy).map(|(&id, _)| id).collect();
+                assert_eq!(victims.len(), 1, "one same-size owner must make room for key {n}");
+                cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
+                ticket = cache.miss(key(n), capture_site, None, false);
+            }
+            let Miss::Capture(id) = ticket else { panic!("key {n} stays eager") };
             cache.captured_topology(id, 10, 1, false);
             let nodes = cache.native_pools().live_nodes;
             let growth = if n == 0 { 3 * unit } else { nodes.saturating_sub(allocator_nodes) / 10 * unit };
@@ -1807,9 +1819,8 @@ mod tests {
         cache.captured_topology(id, 10, 1, false);
         cache.measured_capture(9 * GRAPH_CHUNK);
         assert_eq!(cache.pending_destroy, 0, "pinned excess cannot cause an eviction loop");
-        assert!(cache.soft.measured_bytes.is_some());
-        assert!(!cache.soft.fits(10));
-        assert!(matches!(cache.miss(key(2), capture_site, None, false), Miss::Eager));
+        assert!(cache.soft.measured_bytes.is_none(), "pinned-only ratio must wait for evictable owners");
+        assert!(matches!(cache.miss(key(2), capture_site, None, false), Miss::Capture(_)));
     }
 
     #[test]
