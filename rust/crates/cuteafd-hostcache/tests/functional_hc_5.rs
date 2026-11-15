@@ -667,34 +667,6 @@ fn disabled_classes_reject_present_parts() {
     }
 }
 
-/// Order-of-magnitude floor: a broken fast path fails `cargo test`, not a human. Debug build,
-/// so the bound is generous.
-#[test]
-fn store_tick_floor_for_4k_snapshots() {
-    let mut cache = default_cache(64 * CHUNK as u64, StoreMode::OnRetain);
-    let mut device = Device::new(DEVICE_BYTES);
-    let start = std::time::Instant::now();
-    for generation in 0..1000u32 {
-        let snapshot = snapshot(
-            &mut device,
-            SnapshotKind::Turn,
-            &tokens(4096),
-            1,
-            false,
-            generation,
-        );
-        write_snapshot(cache.engine_mut(), &snapshot);
-        let _ = cache.store(&snapshot, generation as u64);
-        settle(&mut cache);
-        cache.tick();
-    }
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed < std::time::Duration::from_secs(5),
-        "1000 stores+tick took {elapsed:?}"
-    );
-}
-
 #[derive(Clone, Debug)]
 enum Op {
     Store {

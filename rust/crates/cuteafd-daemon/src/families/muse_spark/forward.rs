@@ -257,34 +257,4 @@ mod tests {
         Ok(())
     }
 
-    /// The head rank's logits planes are what admission charged.
-    #[test]
-    fn head_planes_equal_the_charge() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        cuteafd_loader::plan::testing::write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
-        let input = cuteafd_loader::plan::testing::BudgetedPlanInput::open(dir.path())?;
-        let total = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
-        let report = input.plan(&cuteafd_loader::plan::PlanOptions {
-            placement: cuteafd_loader::plan::ExpertPlacement::from_spark_ranks(6),
-            layout: Some(cuteafd_loader::plan::layout::LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost { host_ram: (256 << 30, 256 << 30), ..cuteafd_loader::plan::testing::SimulatedHost::raptor() }.host_ram),
-                rtx_bytes: vec![total; 2], head_split: true, ..Default::default() }), ..Default::default() })?;
-        for rank in 0..2 {
-            let items = &report.solver_placement.as_ref().unwrap().items[rank];
-            let owners = cuteafd_loader::placement::reserve::breakdown(format!("gpu{rank}"),
-                cuteafd_core::memory_policy::DeviceKind::Gpu, total, 0, items);
-            let graph = owners.reserve.iter().filter(|row| row.name == "graph reserve").collect::<Vec<_>>();
-            // The untraced bootstrap is empty; an explicit policy may charge a
-            // nonzero reserve, but never a second family-named owner or tail.
-            let policy = cuteafd_loader::serving_capacity::muse_graphs::policy(2, report.onboard_layers.unwrap_or(0), rank)?;
-            assert_eq!(graph.iter().map(|row| row.bytes).sum::<u64>(), policy.bytes);
-            assert!(graph.len() <= 1);
-            assert!(!owners.reserve.iter().any(|row| row.name != "graph reserve" && row.name.contains("graph")));
-        }
-        let placement = report.solver_placement.as_ref().unwrap();
-        let charged = placement.items[1].iter().find(|item| item.group == "Muse head logits").unwrap().bytes;
-        let (stored, trimmed) = cuteafd_loader::families::muse_spark::lane::head_planes(202112, 202048)?;
-        assert_eq!(charged, (stored + trimmed) as u64);
-        assert!(placement.items[0].iter().all(|item| item.group != "Muse head logits"), "head rank only");
-        Ok(())
-    }
 }

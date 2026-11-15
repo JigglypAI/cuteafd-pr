@@ -1503,3 +1503,11 @@ impl NativeExpertServiceConfig {
         Ok(())
     }
 }
+
+#[cfg(test)]
+pub(crate) fn assert_push_peak(resident: usize, validation: usize, scratch: usize,
+    headroom: usize, peak: usize) -> Result<()> {
+    assert_eq!(push::admit_peak(resident, validation, scratch, headroom, peak)?, peak);
+    assert!(push::admit_peak(resident, validation, scratch, headroom, peak - 1).is_err());
+    Ok(())
+}

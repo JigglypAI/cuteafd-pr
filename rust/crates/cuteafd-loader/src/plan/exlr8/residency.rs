@@ -1009,8 +1009,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicit installed-checkpoint input"]
     fn published_index_slices_when_explicitly_supplied() {
-        let Some(root) = std::env::var_os("CUTEAFD_EXLR8_SLICE_SNAPSHOT") else { return; };
+        let root = std::env::var_os("CUTEAFD_EXLR8_SLICE_SNAPSHOT").expect("set CUTEAFD_EXLR8_SLICE_SNAPSHOT for this installed test");
         for manifest in super::super::manifest_names(Path::new(&root)).unwrap() {
             let input = MetadataInput::open(Path::new(&root), &manifest).unwrap();
             let count = input.cross_check_index_slices().unwrap();
@@ -1229,10 +1230,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicit installed-checkpoint input"]
     fn real_checkpoint_residency_when_supplied() {
-        let Some(root) = std::env::var_os("CUTEAFD_EXLR8_SNAPSHOT") else {
-            return;
-        };
+        let root = std::env::var_os("CUTEAFD_EXLR8_SNAPSHOT").expect("set CUTEAFD_EXLR8_SNAPSHOT for this installed test");
         for selected in ["up1", "bit325", "home"] {
             for (world, rank, set) in [
                 (4, 0, ExpertSet::Routed),

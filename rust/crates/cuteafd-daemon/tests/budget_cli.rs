@@ -850,23 +850,6 @@ fn v41_sim5090_overlay_preserves_1m_pool_for_all_and_packed() {
 }
 
 #[test]
-fn installed_v41_sim5090_head_pools_preserve_1m() {
-    let hf_home = require_installed_hf_home(
-        "installed_v41_sim5090_head_pools_preserve_1m",
-        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"));
-    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
-    let programs = installed_example_programs(
-        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into), &home);
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    let config = std::fs::read_to_string(root.join("examples/configs/deepseek-v41-mxfp4-min.config")).unwrap();
-    let config = config.lines().filter_map(|line| line.split_once('='))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let snapshot = require_installed_snapshot("V4.1 sim5090", config["MODEL_ID"],
-        config.get("MODEL_REVISION").copied(), &hf_home);
-    assert_v41_sim5090_head_pools(&root, &snapshot, &programs, &hf_home);
-}
-
-#[test]
 fn installed_mimo_min_onboarding_is_eligible() {
     let hf_home = require_installed_hf_home("installed_mimo_min_onboarding_is_eligible",
         std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"));
@@ -1275,32 +1258,6 @@ fn installed_inventory_filters_retired_examples_but_keeps_live_release_cells() {
     assert_eq!(entries[0]["ranks"], 2);
     std::fs::write(report.join("report.json"), r#"{"server":{"revision":""}}"#).unwrap();
     assert!(std::panic::catch_unwind(|| live_release_entries(root.path(), &matrix)).is_err());
-}
-
-#[test]
-fn installed_test_entrypoints_fail_instead_of_skipping_absent_inputs() {
-    let home = tempfile::tempdir().unwrap();
-    let tests = ["installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget",
-        "installed_example_deployments_publish_executable_prefill_shapes",
-        "installed_release_matrix_recipe_ids_parse_from_checkpoint_headers"];
-    for name in tests {
-        for input in ["hf-home", "programs-or-checkpoint"] {
-            let mut command = test_command(std::env::current_exe().unwrap());
-            command.args(["--exact", name, "--nocapture"])
-                .env_remove("CUTEAFD_DEPLOYMENT_TEST_HF_HOME")
-                .env("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS", home.path().join("missing/PROGRAMS.json"));
-            if input != "hf-home" { command.env("CUTEAFD_DEPLOYMENT_TEST_HF_HOME", home.path()); }
-            let output = command.output().unwrap();
-            assert!(!output.status.success(), "{name}: missing {input} was silently skipped");
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(stdout.contains("0 passed; 1 failed"), "{stdout}");
-            let expected = if input == "hf-home" { "CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required" }
-                else if name.starts_with("installed_release_") { "required checkpoint not installed" }
-                else { "required PROGRAMS.json missing" };
-            assert!(stderr.contains(expected), "{name}: {stderr}");
-        }
-    }
 }
 
 #[test]

@@ -1086,6 +1086,7 @@ mod tests {
         let super::Commands::Plan(args) = super::Cli::try_parse_from(
             ["cuteafd", "plan", "/model"]).unwrap().command else { panic!("expected plan"); };
         assert!(!args.mimo_prefix_draft);
+        assert!(!super::Cli::parse_from(["serve"]).prefix.mimo_prefix_draft);
         let mut cli = super::Cli::command();
         let help = cli.find_subcommand_mut("plan").unwrap().render_long_help().to_string();
         assert!(help.contains("Experimental MiMo warm DFlash"), "{help}");

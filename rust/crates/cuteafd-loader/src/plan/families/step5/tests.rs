@@ -1349,45 +1349,9 @@ fn native_prefill_refuses_every_unqualified_spark_count() {
     }
 }
 
-// Individual cases keep the diagnostic regressions in the default CPU tier.
-#[test]
-fn native_prefill_refuses_nvfp4_local_without_bf16_tail_export() {
-    assert_native_prefill_refusal("nvfp4", 1, 0);
-}
-
-#[test]
-fn native_prefill_refuses_fp8_local_without_bf16_tail_export() {
-    assert_native_prefill_refusal("fp8", 2, 0);
-}
-
-#[test]
-fn native_prefill_refuses_nvfp4_spark_count_one() {
-    assert_native_prefill_refusal("nvfp4", 1, 1);
-}
-
 #[test]
 fn native_prefill_refuses_fp8_spark_count_one() {
     assert_native_prefill_refusal("fp8", 2, 1);
-}
-
-#[test]
-fn native_prefill_refuses_nvfp4_spark_count_three() {
-    assert_native_prefill_refusal("nvfp4", 1, 3);
-}
-
-#[test]
-fn native_prefill_refuses_fp8_spark_count_three() {
-    assert_native_prefill_refusal("fp8", 2, 3);
-}
-
-#[test]
-fn native_prefill_refuses_nvfp4_spark_count_eight() {
-    assert_native_prefill_refusal("nvfp4", 1, 8);
-}
-
-#[test]
-fn native_prefill_refuses_fp8_spark_count_eight() {
-    assert_native_prefill_refusal("fp8", 2, 8);
 }
 
 #[test]

@@ -337,11 +337,9 @@ fn published_native_norms_belong_to_coordinator_not_sparks() -> anyhow::Result<(
 }
 
 #[test]
+#[ignore = "requires explicit installed-checkpoint input"]
 fn mounted_published_coordinator_contains_every_startup_tensor() -> anyhow::Result<()> {
-    let Some(snapshot) = std::env::var_os("CUTEAFD_MUSE_PUBLICATION_SNAPSHOT") else {
-        eprintln!("skip full publication receipt: set CUTEAFD_MUSE_PUBLICATION_SNAPSHOT");
-        return Ok(());
-    };
+    let snapshot = std::env::var_os("CUTEAFD_MUSE_PUBLICATION_SNAPSHOT").expect("set CUTEAFD_MUSE_PUBLICATION_SNAPSHOT for this installed test");
     let coordinator = check_coordinator_startup_inventory(std::path::Path::new(&snapshot))?;
     eprintln!("Muse full publication coordinator: {} selected headers, {} indexed tensors; all startup tensors present",
         coordinator.tensors.len(), coordinator.weight_map.len());

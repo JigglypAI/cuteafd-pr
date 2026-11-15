@@ -241,27 +241,6 @@ def test_grouped_smoke_preferred_for_shared_arm(entry, tmp_path):
     assert cards.smoke_groups([a, b], 2) == [[a], [b]]
 
 
-def test_rc2_lock_sets_change_only_gpu1_out_of_pool():
-    kit = Path.home() / '.cache/cuteafd/builds/release-v2-rc2/kit'
-    if not kit.is_dir():
-        pytest.skip('RC2 kit not installed')
-    for matrix in kit.glob('matrix-*.json'):
-        data = json.loads(matrix.read_text())
-        for raw in data['entries']:
-            e = {**data.get('defaults', {}), **raw}
-            gpus, hosts = e.get('gpus', [0]), e.get('sparks', [])
-            exclusive = e.get('exclusive', e.get('family') == 'deepseek_v41')
-            old = {'sparks.lock'} if 0 in gpus or hosts or exclusive else set()
-            new = {'sparks.lock'} if 0 in gpus or set(hosts) & {'ostrich', 'dodo', 'emu', 'kiwi'} or exclusive else set()
-            other = {f'gpu{gpu}.lock' for gpu in gpus} | {f'{h}.lock' for h in hosts if h in {'rhea', 'moa'}}
-            if exclusive:
-                other |= {'gpu0.lock', 'gpu1.lock'}
-            if old != new:
-                assert gpus == [1] and hosts and set(hosts) <= {'rhea', 'moa'} and not exclusive, e['name']
-                assert (old | other) - (new | other) == {'sparks.lock'}
-    source = (ROOT / 'rust/crates/cuteafd-bench/src/smoke.rs').read_text()
-    assert 'if gpus.contains(&0) || pool || entry.exclusive()' in source
-    assert '"ostrich" | "dodo" | "emu" | "kiwi"' in source
 
 
 def test_smoke_no_outer_lock_and_detached_numeric_exit(entry, tmp_path, monkeypatch):

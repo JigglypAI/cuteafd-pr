@@ -81,12 +81,30 @@ LIVE_PLANNERS = ('families::deepseek_v4::placement_tests::planner_equals_runtime
                  'families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4_measured',
                  'serving_capacity::v4_placement::tp2_tests::real_tp2_costs_match_catalog_reference')
 INSTALLED_PLANNERS = (
+    'installed_mc_views_cover_executable_projection_manifests',
+    'installed_qwen_hybrid_min_sim_and_dual_publish_exact_layer_homes',
+    'installed_dense_qwen_one_and_two_rtx_publish_exact_native_owners',
+    'commands::plan::tests::installed_kimi_min_auto_context_matches_serve_and_admitted_pool',
+    'installed_release_and_example_families_match_dev_d6aecfcb7',
+    'families::glm5::weights::inventory_tests::installed_variant_weight_inventory_equals_production_requests',
+    'families::glm5::weights::inventory_tests::installed_arena_cpu_inventory',
+    'families::glm5::weights::inventory_tests::installed_glm_and_ml4_draft_arena_charges_equal_shared_load_recipes',
+    'families::glm5::weights::inventory_tests::installed_k6_max_streaming_staging_covers_measured_pools',
+    'families::glm5::weights::inventory_tests::installed_native_dense_shared_and_vocabulary_equal_reader_requests',
+    'shared::speculation::dflash::physical_tests::installed_standard_dflash_physical_layout_equals_serving_receipts',
+    'shared::speculation::dflash::physical_tests::installed_tp2_dflash_physical_layout_equals_both_rank_receipts',
+    'shared::speculation::dflash::physical_tests::installed_kimi_mla_projection_recipe_matches_native_manifest',
+    'shared::speculation::dflash::checkpoint_header_tests::installed_glm_k6_index_resolves_a_dflash_target_head',
+    'families::glm5::serve::chat_encoding_tests::served_checkpoints_select_their_own_chat_encoding_when_present',
+    'families::muse_spark::backend::tests::message_starts_are_the_checkpoints',
+    'families::minimax_m3::backend::tests::message_start_is_the_served_checkpoints_single_added_token',
+    'families::glm5::weights::operand_tests::tp2_peer_router_names_match_installed_checkpoint_headers',
+    'families::glm5::weights::operand_tests::attention_residency_matches_installed_variant_checkpoint_headers',
     'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
     'installed_example_deployments_publish_executable_prefill_shapes',
     'installed_release_matrix_recipe_ids_parse_from_checkpoint_headers',
 )
-MERGE_INSTALLED_PLANNERS = ('installed_v41_sim5090_head_pools_preserve_1m',
-                            'installed_mimo_min_onboarding_is_eligible')
+MERGE_INSTALLED_PLANNERS = ('installed_mimo_min_onboarding_is_eligible',)
 INSTALLED_INPUT_TESTS = (
     *MERGE_INSTALLED_PLANNERS,
     *LIVE_PLANNERS,
@@ -102,6 +120,9 @@ PLACEMENT_INPUT_ERROR = re.compile(
 )
 # Hermetic matrices still >=10s on raptor (2026-11-07), plus external inputs.
 FULL_TESTS = (
+    'plan::families::step5::admission::tests::reused_header_contract_preserves_every_candidate_and_resolved_plan',
+    'plan::families::muse_spark::tests::layout_plans_every_spark_world_on_one_rtx',
+    'shared::spark_topology::tests::eight_rank_user_launch_chain_has_no_hidden_count_caps',
     *LIVE_PLANNERS,
     'families::kimi_k3::admission::tests::installed_max_planner_and_runtime_remaining_kv_match_per_gpu',
     'families::step5::admission::tests::public_nvfp4_min_card_planner_equals_measured_daemon_before_allocation',

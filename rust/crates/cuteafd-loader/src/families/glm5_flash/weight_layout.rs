@@ -399,8 +399,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicit installed-checkpoint input"]
     fn installed_cpu_inventory() -> Result<()> {
-        let Some(snapshot) = std::env::var_os("CUTEAFD_PUSH_GLMF") else { return Ok(()) };
+        let snapshot = std::env::var_os("CUTEAFD_PUSH_GLMF").expect("set CUTEAFD_PUSH_GLMF for this installed test");
         let checkpoint = Checkpoint::coordinator(std::path::Path::new(&snapshot), false, false)?;
         let cfg = GlmNextConfig::read(std::path::Path::new(&snapshot))?;
         for ranks in [1, 2] {
@@ -426,4 +427,3 @@ mod tests {
         Ok(())
     }
 }
-

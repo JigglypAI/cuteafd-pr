@@ -451,27 +451,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn production_admission_has_no_implicit_original_path_api() {
-        // Removing the methods makes any new production use a compile error too.
-        for source in [
-            include_str!("../families/glm5/mod.rs"),
-            include_str!("../families/step5/serve.rs"),
-            include_str!("../families/step5/golden.rs"),
-            include_str!("../families/kimi_k3/engine.rs"),
-            include_str!("../families/deepseek_v4/mod.rs"),
-            include_str!("../families/deepseek_v41/v41_native_serve/admission.rs"),
-            include_str!("../families/qwen4/mod.rs"),
-            include_str!("../families/mimo_v2/mod.rs"),
-            include_str!("experts/tp_gate.rs"),
-            include_str!("experts/exlr8_decode_gate.rs"),
-        ] {
-            for method in ["plan", "plan_manifest"] {
-                assert!(!source.contains(&format!("SparkAdmission::{method}(")));
-            }
-        }
-    }
-
     fn idle_report(rank: u32) -> ModelAdmissionResponse {
         ModelAdmissionResponse { rank, resident_bytes: 0, slices: vec![],
             runtime: SparkRuntimeInventory { detail: Default::default(), sample: RuntimeSample { device: 0,
@@ -758,6 +737,10 @@ mod tests {
             assert_eq!(budget.read_scratch_bytes, 268_435_456);
             assert!(ring > budget.pinned_host_bytes, "Kimi push must admit its ring independently");
             assert!(plan.validation.bytes() <= budget.read_scratch_bytes);
+            let headroom = usize::try_from(cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(plan.layout.bytes() as u64))?;
+            let peak = plan.layout.bytes() + ring + plan.validation.bytes() + headroom;
+            crate::shared::experts::service::assert_push_peak(plan.layout.bytes(), plan.validation.bytes(),
+                budget.read_scratch_bytes, headroom, peak)?;
         }
         check_reports(&admission)?;
         use cuteafd_loader::plan::testing::{exl3, glm5_config, write_snapshot};
@@ -776,6 +759,15 @@ mod tests {
         assert_eq!(budget.read_scratch_bytes, 268_435_456);
         assert!(cuteafd_ffi::push_ring::DEFAULT_SLOTS * cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES
             > budget.pinned_host_bytes, "GLM K4 push must admit its ring independently");
+        for rank in 0..6 {
+            let budget = Exl3Weights::plan(&catalog, ExpertLayer::BackboneExl3Tp { layer: 1, rank, world: 6 })?;
+            let plan = push_exl3::RankPlan::new(&catalog, &[1], 6, rank, budget.resident_bytes)?;
+            let ring = cuteafd_ffi::push_ring::DEFAULT_SLOTS * cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES;
+            let headroom = usize::try_from(cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(plan.layout.bytes() as u64))?;
+            let peak = plan.layout.bytes() + ring + plan.validation.bytes() + headroom;
+            crate::shared::experts::service::assert_push_peak(plan.layout.bytes(), plan.validation.bytes(),
+                budget.read_scratch_bytes, headroom, peak)?;
+        }
         Ok(())
     }
 

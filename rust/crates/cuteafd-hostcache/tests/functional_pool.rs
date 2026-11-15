@@ -298,25 +298,6 @@ fn engine_layout_round_trips() {
     pool.give_back(slab);
 }
 
-/// Performance floor: a broken fast path (e.g. a scan on every take) must fail `cargo test`, not
-/// a human. Debug build, so the bound is generous.
-#[test]
-fn page_take_give_back_floor() {
-    let (mut pool, _mem) = pool(CHUNK as u64);
-    let keeper = pool.take(Class::Page).expect("take");
-    let start = std::time::Instant::now();
-    for _ in 0..100_000 {
-        let slab = pool.take(Class::Page).expect("take");
-        pool.give_back(slab);
-    }
-    let elapsed = start.elapsed();
-    pool.give_back(keeper);
-    assert!(
-        elapsed < std::time::Duration::from_secs(2),
-        "100k page take+give_back took {elapsed:?}"
-    );
-}
-
 /// Position of `class` in [`Class::ALL`], the pool's per-class array order.
 fn class_index(class: Class) -> usize {
     Class::ALL

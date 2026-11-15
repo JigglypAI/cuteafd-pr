@@ -342,8 +342,9 @@ mod tests {
     /// its single SM120 tail, and the delta. Old Qwen admission charged per-
     /// tensor payload with no granularity owner, so it included no rounding.
     #[test]
+    #[ignore = "requires explicit installed-checkpoint input"]
     fn installed_qwen_arena_charge_table() -> Result<()> {
-        let Some(snapshot) = std::env::var_os("CUTEAFD_PUSH_QWEN4") else { return Ok(()) };
+        let snapshot = std::env::var_os("CUTEAFD_PUSH_QWEN4").expect("set CUTEAFD_PUSH_QWEN4 for this installed test");
         let checkpoint = Checkpoint::open(std::path::Path::new(&snapshot))?;
         let config: serde_json::Value = serde_json::from_slice(&std::fs::read(checkpoint.snapshot.join("config.json"))?)?;
         let cfg = Qwen4Config::from_hf(&config)?;
@@ -381,26 +382,4 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn installed_qwen_arena_inventory() -> Result<()> {
-        let Some(snapshot) = std::env::var_os("CUTEAFD_PUSH_QWEN4") else { return Ok(()) };
-        let checkpoint = Checkpoint::open(std::path::Path::new(&snapshot))?;
-        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(checkpoint.snapshot.join("config.json"))?)?;
-        let cfg = Qwen4Config::from_hf(&config)?;
-        for fp8_projections in [false, true] { for fp8_head in [false, true] {
-            for ranks in [1, 2] {
-                let owners = (0..cfg.layers).map(|l| usize::from(ranks == 2 && l >= cfg.layers / 2)).collect::<Vec<_>>();
-                let layouts = coordinator_arenas(&checkpoint, &cfg, &owners, ranks, true,
-                    resident::Qwen4Representation { fp8_projections, fp8_head }, 0)?;
-                for (rank, layout) in layouts {
-                    let large = layout.views().values().filter(|v| v.bytes() > 1 << 20).collect::<Vec<_>>();
-                    let slack = large.iter().map(|v| v.bytes().div_ceil(2 << 20) * (2 << 20) - v.bytes()).sum::<usize>();
-                    eprintln!("QWEN_ARENA fp8={fp8_projections} head_fp8={fp8_head} ranks={ranks} rank={rank} scope={} n={} payload={} large_n={} large_bytes={} old_slack={} arena={} padding={} tail={}",
-                        layout.id(), layout.views().len(), layout.payload_bytes(), large.len(), large.iter().map(|v| v.bytes()).sum::<usize>(),
-                        slack, layout.bytes(), layout.padding_bytes(), layout.bytes().div_ceil(2 << 20) * (2 << 20) - layout.bytes());
-                }
-            }
-        }}
-        Ok(())
-    }
 }

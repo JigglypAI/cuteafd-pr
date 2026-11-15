@@ -884,6 +884,7 @@ def test_hybrid_group_covers_compact_and_grouped_live_rows():
     assert args[args.index("--rows") + 1] == "1,2,16,80"
 
 
+@pytest.mark.container_torch
 def test_hybrid_objects_are_identical_at_188_and_170_sms(tmp_path, monkeypatch):
     # The normal host script gate has no DSL compiler. In the coordinator
     # compiler image this executes the real offline exporter, without a GPU.

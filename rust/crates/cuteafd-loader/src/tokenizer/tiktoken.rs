@@ -162,8 +162,9 @@ mod tests {
     /// `[{text, ids}]` from `tiktoken.Encoding(..., pat_str from the shipped
     /// tokenization_kimi.py).encode(text, allowed_special='all')`.
     #[test]
+    #[ignore = "requires explicit installed-checkpoint input"]
     fn official_tiktoken_oracle_when_present() {
-        let Ok(spec) = std::env::var("CUTEAFD_KIMI_TOKENIZER_ORACLE") else { return };
+        let spec = std::env::var("CUTEAFD_KIMI_TOKENIZER_ORACLE").expect("set CUTEAFD_KIMI_TOKENIZER_ORACLE for this installed test");
         let (snapshot, oracle) = spec.rsplit_once(':').expect("<snapshot>:<oracle.json>");
         let loaded = crate::tokenizer::LoadedTokenizer::from_snapshot(Path::new(snapshot)).unwrap();
         let cases: Vec<Value> = serde_json::from_slice(&std::fs::read(oracle).unwrap()).unwrap();

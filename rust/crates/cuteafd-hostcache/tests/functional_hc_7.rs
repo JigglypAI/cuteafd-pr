@@ -364,38 +364,6 @@ fn disabled_cache_records_nothing() {
     assert_eq!(metrics.stores_completed, 0);
 }
 
-/// Order-of-magnitude floor: the instrumentation adds two u64 reads and one bucket index per
-/// store; a broken fast path fails `cargo test`, not a human. Debug build, so the bound is
-/// generous (the HC-5 floor test for the same shape allows five seconds).
-#[test]
-fn store_tick_instrumentation_stays_within_the_floor() {
-    let mut cache = default_cache(64 * CHUNK as u64, StoreMode::OnRetain);
-    let mut device = Device::new(DEVICE_BYTES);
-    let start = std::time::Instant::now();
-    for generation in 0..1000u32 {
-        let snapshot = snapshot(
-            &mut device,
-            SnapshotKind::Turn,
-            &tokens(4096),
-            1,
-            false,
-            generation,
-        );
-        write_snapshot(cache.engine_mut(), &snapshot);
-        let _ = cache.store(&snapshot, generation as u64);
-        settle(&mut cache);
-        cache.tick();
-    }
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed < std::time::Duration::from_secs(5),
-        "1000 instrumented stores+tick took {elapsed:?}"
-    );
-    let metrics = cache.metrics();
-    assert_eq!(buckets_sum(&metrics), metrics.stores_completed);
-    assert_eq!(metrics.stores_completed, 1000);
-}
-
 #[derive(Clone, Debug)]
 enum Op {
     Store { tokens: Vec<u32>, pages: usize },

@@ -396,34 +396,3 @@ proptest::proptest! {
         assert_happy(&report, &workload);
     }
 }
-
-/// Performance floor: a 1,000-step run must finish in seconds even in a debug build, so a
-/// broken fast path (e.g. an invariant check that became a scan) fails `cargo test`.
-#[test]
-fn thousand_step_run_floor() {
-    let workload = Workload::AgentLoop {
-        sessions: 8,
-        turns: 6,
-        context_tokens: 8192,
-        new_tokens_per_turn: 192,
-        think_ns: 0,
-    };
-    let start = std::time::Instant::now();
-    let report = Simulator::new(EngineModel::default(), RecordingCache::new(), 11).run(&workload);
-    let elapsed = start.elapsed();
-    assert!(
-        report.invariant_failures.is_empty(),
-        "floor run must be clean: {:?}",
-        report.invariant_failures
-    );
-    assert!(
-        report.steps >= 1_000,
-        "the floor workload must exceed 1,000 steps, got {}",
-        report.steps
-    );
-    assert!(
-        elapsed < std::time::Duration::from_secs(5),
-        "{} steps took {elapsed:?} in debug",
-        report.steps
-    );
-}

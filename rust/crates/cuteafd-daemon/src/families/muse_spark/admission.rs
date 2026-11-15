@@ -46,45 +46,6 @@ mod tests {
     use super::*;
     use cuteafd_loader::plan::{layout::LayoutOptions, testing, ExpertPlacement, PlanOptions};
 
-    /// The sealed endpoint's rings are what the planner charged each Spark, the
-    /// frame budget covers the worst partial reply, and onboarded layers leave
-    /// the Spark working set.
-    #[test]
-    fn sealed_admission_matches_the_planned_spark_io() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        testing::write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
-        let input = testing::BudgetedPlanInput::open(dir.path())?;
-        let total = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
-        let report = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(6),
-            layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost { host_ram: (256 << 30, 256 << 30), ..cuteafd_loader::plan::testing::SimulatedHost::raptor() }.host_ram), rtx_bytes: vec![total; 2],
-                head_split: true, ..Default::default() }), ..Default::default() })?;
-        let placement = report.solver_placement.clone().context("placed")?;
-        let prefill = PrefillPlan { unit_rows: 2752, waves: 3, span_rows: 8256 };
-        let plan = spark_plan(&placement, prefill, Cutoff::new(64, 1)?, 16, 6)?;
-        assert_eq!(plan.working.spark_layers.len() + placement.onboard_layers, 62);
-        assert!(plan.working.spark_layers.iter().all(|layer| !plan.working.rtx_layers.contains(layer)));
-        let endpoint = plan.model.endpoints[0];
-        let reply = endpoint.partial_reply_bytes.context("partial endpoint")? as usize;
-        assert!(plan.max_frame_bytes >= reply && plan.model.rings.max_frame_bytes == plan.max_frame_bytes);
-        let spark = report.memory_layout.as_ref().context("layout")?.devices.iter()
-            .find(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark).context("spark")?;
-        let rings = spark.items.iter().find(|item| item.group == "rdma rings").context("rings")?.bytes;
-        assert_eq!(rings, plan.model.ring_bytes(ExpertGeometry::MUSE_SPARK)? as u64);
-        // Step metadata: the runtime's StepStorage extent is the charged item.
-        let charged = placement.items[0].iter().find(|item| item.group == "Muse step metadata").context("charge")?.bytes;
-        let tables = shared::step_tables(2752, 16, cuteafd_loader::families::muse_spark::MuseSparkConfig::from_hf(
-            &testing::muse_spark_config())?.max_position as u64, 3)?;
-        assert_eq!(charged, tables.bytes() as u64);
-        // The coordinator intake the link allocates (ranks x waves x unit x row) is the charge.
-        let (row, planes) = shared::intake(&cuteafd_loader::families::muse_spark::MuseSparkConfig::from_hf(
-            &testing::muse_spark_config())?, prefill, Cutoff::new(64, 1)?, 16, 6)?;
-        assert_eq!(planes, 6 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes((3 * 2752 * row) as u64)?);
-        let charged = placement.items[0].iter().find(|item| item.group == "Muse Spark partial reply planes")
-            .context("intake charge")?.bytes;
-        assert_eq!(charged, planes);
-        Ok(())
-    }
-
     /// The coordinator transport accepts the sealed frame at every wide format
     /// (the native budget admits partial-reply frames up to the all-BF16 bound).
     #[test]

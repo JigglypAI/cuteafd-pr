@@ -1055,9 +1055,10 @@ mod sliced_tests {
     }
 
     #[test]
+    #[ignore = "requires explicit installed-checkpoint input"]
     fn real_nvidia_configs_select_declared_module_numerics() {
         // Optional local inventory gate: no tensor payload reads or GPU needed.
-        let Some(root) = std::env::var_os("CUTEAFD_NVFP4_CONFIG_ROOT") else { return };
+        let root = std::env::var_os("CUTEAFD_NVFP4_CONFIG_ROOT").expect("set CUTEAFD_NVFP4_CONFIG_ROOT for this installed test");
         let root = Path::new(&root);
         for (model, routed, preserved, a8) in [
             ("GLM-5.3-NVFP4", "model.layers.3.mlp.experts.0.gate_proj", "model.layers.3.mlp.shared_experts.gate_proj", Some("model.layers.0.mlp.gate_proj")),

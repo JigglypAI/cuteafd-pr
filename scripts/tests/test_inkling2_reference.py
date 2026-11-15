@@ -7,6 +7,8 @@ import sys
 
 import pytest
 
+pytestmark = pytest.mark.container_torch
+
 torch = pytest.importorskip("torch")
 safetensors = pytest.importorskip("safetensors.torch")
 ROOT = Path(__file__).resolve().parents[2]
