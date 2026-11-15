@@ -66,6 +66,9 @@ def successful(result, *, importing_files=None, eviction_files=None):
 
 def check_plan(plan, revision, files, *, offgrid=False):
     goal = plan.get('goal', {})
+    # Native goals retain CLI disk selectors; execution steps use display names.
+    disk_names = dict(zip(TARGET_ARGS[:2], TARGETS[:2]))
+    hosts = [disk_names.get(host, host) for host in goal.get('hosts', [])]
     if (plan.get('feasible') is not True or plan.get('blocked')
             or goal.get('goal') != ('offgrid' if offgrid else 'place')
             or goal.get('selector') != 'hf:' + TARGET_REPO or goal.get('hub') != str(NAMESPACE)):
@@ -73,7 +76,7 @@ def check_plan(plan, revision, files, *, offgrid=False):
     if offgrid:
         if goal.get('hosts') != []:
             raise ValueError('off-grid retirement must not add placement hosts')
-    elif (len(goal.get('hosts', [])) != 8 or set(goal['hosts']) != set(TARGETS)
+    elif (len(hosts) != 8 or set(hosts) != set(TARGETS)
             or goal.get('factor') != 1 / 8 or goal.get('by_speed', False)):
         raise ValueError('placement must use the authorized even eight-place spread')
     snapshot = NAMESPACE / MODEL / 'snapshots' / revision

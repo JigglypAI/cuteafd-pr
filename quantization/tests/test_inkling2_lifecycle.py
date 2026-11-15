@@ -219,6 +219,31 @@ def test_remote_metadata_mismatch_fails(tmp_path, change):
         publish.verify_hub(api, REVISION, files)
 
 
+def test_normalized_hub_metadata_download_stays_in_task_cache(tmp_path, monkeypatch):
+    import huggingface_hub
+    output = completed_export(tmp_path)
+    files = publish.publication_inventory(output)['files']
+    api, root = Hub(files), tmp_path / 'publication'
+    shard = next(name for name in files if name.endswith('.safetensors'))
+    api.normalized = (output / '.gitattributes').read_bytes() + (
+        shard + ' filter=lfs diff=lfs merge=lfs -text\n').encode()
+    downloads = []
+
+    def download(repo, name, **kwargs):
+        assert repo == publish.TARGET_REPO and name == '.gitattributes'
+        assert kwargs['revision'] == REVISION
+        assert kwargs['local_dir'] == root / 'hub-metadata'
+        downloads.append(name)
+        path = kwargs['local_dir'] / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(api.normalized)
+        return str(path)
+
+    monkeypatch.setattr(huggingface_hub, 'hf_hub_download', download)
+    assert publish.publish(output, root, api=api, anonymous_api=api)['status'] == 'passed'
+    assert downloads == ['.gitattributes']
+
+
 def test_only_literal_appended_hub_attributes_are_accepted(tmp_path):
     output = completed_export(tmp_path)
     packet = publish.publication_inventory(output)
@@ -320,7 +345,9 @@ class Nest:
                 steps[0]['copies'].append(dict(name='main', path=str(handoff.NAMESPACE / handoff.MODEL / 'refs/main'),
                     group=str(handoff.NAMESPACE / handoff.MODEL / 'refs'), size=len(REVISION)))
             goal = dict(goal='offgrid' if offgrid else 'place', selector='hf:' + publish.TARGET_REPO,
-                hub=str(handoff.NAMESPACE), hosts=[] if offgrid else list(handoff.TARGETS), factor=1 / 8, by_speed=False)
+                hub=str(handoff.NAMESPACE), hosts=[] if offgrid else
+                [args[i + 1] for i, value in enumerate(args) if value == '--host'],
+                factor=1 / 8, by_speed=False)
             self.plans[number] = dict(id=number, feasible=True, blocked=[], goal=goal, steps=steps)
             return self.plans[number]
         if args[0] == 'ls':
@@ -356,6 +383,20 @@ def test_hardlink_import_native_spread_resume_and_guarded_retirement(tmp_path):
     assert Path(published['source_snapshot']).exists() and managed.exists()
     assert (root / 'publication-complete.json').exists()
     assert handoff.retire(root, inspect=lambda paths: None)['paths'] == []
+
+
+@pytest.mark.parametrize('replacement', ['raptor', 'raptor:d1', 'kakapo', 'raptor:d3'])
+def test_native_goal_disk_aliases_do_not_allow_other_targets(tmp_path, replacement):
+    _, _, _, published = storage_fixture(tmp_path)
+    nest = Nest(published)
+    arguments = ('plan', '--place', 'hf:' + publish.TARGET_REPO, '--factor', '1/8',
+                 *(value for host in handoff.TARGET_ARGS for value in ('--host', host)))
+    plan = nest(*arguments)
+    assert plan['goal']['hosts'] == list(handoff.TARGET_ARGS)
+    assert handoff.check_plan(plan, REVISION, published['files']) == plan
+    plan['goal']['hosts'][0] = replacement
+    with pytest.raises(ValueError, match='authorized even eight-place spread'):
+        handoff.check_plan(plan, REVISION, published['files'])
 
 
 @pytest.mark.parametrize('failure', ['unfinished', 'failed', 'count', 'not-terminal'])

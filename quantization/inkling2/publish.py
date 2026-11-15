@@ -263,7 +263,8 @@ def publish(output, root, *, api=None, anonymous_api=None, fetch_metadata=None):
     api = api or HfApi()
     anonymous_api = anonymous_api or HfApi(token=False)
     fetch_metadata = fetch_metadata or (lambda revision, name: Path(hf_hub_download(
-        TARGET_REPO, name, revision=revision, token=api.token)).read_bytes())
+        TARGET_REPO, name, revision=revision, token=api.token,
+        local_dir=root / 'hub-metadata')).read_bytes())
     with (root / 'publication.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         marker = root / 'publication-complete.json'
