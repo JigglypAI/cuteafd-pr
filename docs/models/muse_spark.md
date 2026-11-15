@@ -7,8 +7,48 @@ record contains K, V, K scales and V scales: 2176 B/token/layer on one RTX or
 1088 B/rank with two RTX, including scales and without padding. BF16 records
 use 4096/2048 B respectively. Exact prefix marks retain the complete records;
 BF16 and FP8 prefix namespaces never mix. `DRAFT_KV_CACHE` remains independent.
-FP8 serving speed and Standard fidelity qualification are pending; it is not
-the default until the family quality and paired-quality bars pass.
+FP8 remains opt-in: the measured pool benefit does not offset its paired
+quality cost, and the max-card C1 speed also falls below the default bar.
+
+### FP8 KV qualification
+
+Measured on dev `5e28a1d30`, fork `87962497`, K4 MC `CORE_VIEW=original`,
+RTX PRO 6000, 2026-11-16. Quality used speculation off and the same sealed
+WIP build for both arms. Standard max uses 2 RTX + 6 Sparks; Quick min uses
+1 RTX + 4 Sparks. Results below score generated rows only; every arm passes
+the absolute family bars (KL <= 0.05, top-1 >= 93%) with no missing or
+non-finite rows.
+
+| Quality path | Generated rows | BF16 KL | FP8 KL | KL change | BF16 top-1 | FP8 top-1 | Top-1 change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Standard max decode | 10,629 | 0.009683 | 0.016891 | +0.007208 | 97.149% | 96.594% | -0.555 pp |
+| Standard max prefill | 10,475 | 0.008539 | 0.014792 | +0.006253 | 97.652% | 96.936% | -0.716 pp |
+| Quick min | 1,832 | 0.006365 | 0.012403 | +0.006038 | 97.271% | 97.162% | -0.109 pp |
+
+Both Standard paths fail the paired default-quality limits (+0.003 KL and
+-0.3 percentage points top-1). BF16 therefore stays the default.
+
+The min-card Quick pair, with speculation off and 16 active slots, admits
+510,272 BF16 versus 1,056,768 FP8 pool tokens (2.071x); served context rises
+from 510,272 to the full 1,048,576. This is a speculation-off capacity
+measurement, not a default-DFlash2 min-card speed result.
+
+A separate quiet max-card pair uses default NVIDIA DFlash2 and one warmed
+launch per arm, with one untimed batch at each concurrency. C1 emits
+70.81 -> 65.08 tok/s (0.919x); C16 aggregate emits 253.03 -> 257.81 tok/s
+(1.019x). Automatic pool-first admission grows the pool from 2,009,216 to
+2,097,152 tokens and onboards 0 -> 9 RTX expert layers. No power-cap,
+thermal or hardware slowdown is sampled in either timed window. GPU1 busy
+SM clocks are 2854.7 -> 2854.7 MHz at C1 and 2847.3 -> 2845.2 MHz at C16;
+maximum temperature is 61 C and minimum T.Limit headroom is 36 C. Powerd
+limits are 425 W per card except FP8 C1's transient GPU0 435-445 W / GPU1
+400-410 W distribution; neither card hits its cap. These are one-session
+observations, not a repeat campaign. Incidental timings from the quality
+launches are excluded because those runs experienced host page reclaim.
+
+Receipts are retained under `~/.cache/cuteafd/builds/v5x-muse-kv-quality-max/`,
+`v5x-muse-kv-quality-min/` and `v5x-muse-kv-perf-max/`. Min-card speed and 64K
+prefill were deliberately not run after the paired quality default gate failed.
 
 `meta-models/Muse-Spark-Open-816B-A42B` (`MuseSparkForConditionalGeneration`,
 text `muse_spark_text`) serves text from an MC EXL3 publication: K4 routed
