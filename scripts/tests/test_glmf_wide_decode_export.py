@@ -336,11 +336,11 @@ def test_dense_qwen_exports_only_native_dense_programs(exporter, name, norm_dtyp
             assert calls[f"attn_producer_fp8_kv_fp8_m{cap}"][2][3] == {"max_rows": cap, "kv_format": "fp8"}
         assert calls[f"gdn_m{cap}"][2][3] == {"max_rows": cap, "norm_dtype": norm_dtype}
         assert calls[f"attn_producer_m{cap}"][2][3] == {"max_rows": cap}
-        assert calls[f"full_gqa_m{cap}"][2][3] == {"max_rows": cap, "max_splits": 32}
+        assert calls[f"full_gqa_m{cap}"][2][3] == {"max_rows": cap, "max_splits": 1}
         for op in ("attn_producer", "full_gqa"):
             expected = {"max_rows": cap, "kv_format": "fp8"}
             if op == "full_gqa":
-                expected["max_splits"] = 32
+                expected["max_splits"] = 1
             assert calls[f"{op}_kv_fp8_m{cap}"][2][3] == expected
             assert "kv_format" not in calls[f"{op}_m{cap}"][1]
             assert calls[f"{op}_kv_fp8_m{cap}"][1]["kv_format"] == "fp8"

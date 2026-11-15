@@ -457,7 +457,7 @@ pub fn validate(cfg: &Qwen35Config, op: &str, rows: usize, format: crate::famili
                 number(spec, "rope_theta", cfg.rope_theta)?;
             } else {
                 integer(spec, "page_rows", 64)?;
-                integer(spec, "max_splits", 32)?;
+                integer(spec, "max_splits", 1)?;
                 ensure!(spec.geometry["causal"] == true && spec.geometry["empty_rows_zero"] == true,
                     "{}: dense attention requires causal traversal and zero inactive rows", spec.name);
             }

@@ -66,9 +66,19 @@ impl<'a> Graphs<'a> {
     pub(super) fn prefill(&self) { self.bank.borrow_mut().cache_cycle(Cycle::Prefill); }
 }
 
+fn logits_sha256(digest: &[u8]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn golden_digest_line_is_stable_and_machine_readable() {
+        assert_eq!(logits_sha256(&[0, 1, 15, 16, 255]), "00010f10ff");
+        assert!(include_str!("graphs.rs").contains("dense graph golden: logits_sha256={} rows={}"));
+    }
 
     #[test]
     fn diagnostic_bypass_restores_on_error_nested_calls_and_unwind() {
@@ -234,6 +244,7 @@ impl DenseEngine<'_> {
             let after = replay_hits();
             ensure!(off_digest == on_digest, "dense graph-on/off decode logits are not byte-identical");
             ensure!(after > before, "dense graph golden measured pass did not replay any executable");
+            println!("dense graph golden: logits_sha256={} rows={}", logits_sha256(&on_digest), tokens.len());
             Ok((off, on, after - before))
         })();
         self.graphs.capture_ready.set(ready);

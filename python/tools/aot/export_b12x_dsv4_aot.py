@@ -1399,8 +1399,8 @@ def qwen_dense_programs(g, decode_rows: int, prefill_rows: int, max_context: int
              lambda r=rows: dense.compile_qwen_dense_gdn_aot(g, max_rows=r, norm_dtype=norm_dtype)),
             (f"attn_producer_m{rows}", "attn_producer", {"max_rows": rows},
              lambda r=rows: dense.compile_qwen_dense_producer_aot(g, max_rows=r)),
-            (f"full_gqa_m{rows}", "full_gqa", {"max_rows": rows, "max_splits": 32},
-             lambda r=rows: dense.compile_qwen_dense_full_gqa_aot(g, max_rows=r, max_splits=32)),
+            (f"full_gqa_m{rows}", "full_gqa", {"max_rows": rows, "max_splits": 1},
+             lambda r=rows: dense.compile_qwen_dense_full_gqa_aot(g, max_rows=r, max_splits=1)),
             (f"attn_o_m{rows}", "attn_o", {"max_rows": rows},
              lambda r=rows: dense.compile_qwen_dense_attn_o_aot(g, max_rows=r)),
             (f"ffn_m{rows}", "ffn", {"max_rows": rows},
@@ -1409,8 +1409,8 @@ def qwen_dense_programs(g, decode_rows: int, prefill_rows: int, max_context: int
         out += [
             (f"attn_producer_kv_fp8_m{rows}", "attn_producer", {"max_rows": rows, "kv_format": "fp8"},
              lambda r=rows: dense.compile_qwen_dense_producer_aot(g, max_rows=r, kv_format="fp8")),
-            (f"full_gqa_kv_fp8_m{rows}", "full_gqa", {"max_rows": rows, "max_splits": 32, "kv_format": "fp8"},
-             lambda r=rows: dense.compile_qwen_dense_full_gqa_aot(g, max_rows=r, max_splits=32, kv_format="fp8")),
+            (f"full_gqa_kv_fp8_m{rows}", "full_gqa", {"max_rows": rows, "max_splits": 1, "kv_format": "fp8"},
+             lambda r=rows: dense.compile_qwen_dense_full_gqa_aot(g, max_rows=r, max_splits=1, kv_format="fp8")),
         ]
         if g.name == "qwen38_27b":
             from b12x.integration.cuteafd import qwen_dense_fp8 as native

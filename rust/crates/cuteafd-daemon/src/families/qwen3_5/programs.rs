@@ -161,11 +161,11 @@ mod tests {
         let cfg = cfg();
         let mut spec = ProgramSpec { name: "full_gqa".into(), pointers: vec![], scalar_kinds: vec![],
             scratch: Default::default(), capacity_rows: 64, geometry: json!({"max_rows":64,"heads":16,"kv_heads":4,
-                "head_dim":256,"record_bytes":4096,"kv_format":"bf16","indexed":false,"page_rows":64,"max_splits":32,
+                "head_dim":256,"record_bytes":4096,"kv_format":"bf16","indexed":false,"page_rows":64,"max_splits":1,
                 "causal":true,"empty_rows_zero":true}) };
         validate(&cfg, "full_gqa", 64, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, &spec)?;
         for (key, wrong) in [("heads", json!(24)), ("record_bytes", json!(2048)), ("indexed", json!(true)),
-            ("empty_rows_zero", json!(false)), ("causal", json!(false)), ("max_rows", json!(32))] {
+            ("empty_rows_zero", json!(false)), ("causal", json!(false)), ("max_rows", json!(32)), ("max_splits", json!(32))] {
             let saved = spec.geometry[key].clone();
             spec.geometry[key] = wrong;
             assert!(validate(&cfg, "full_gqa", 64, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, &spec).is_err(), "{key}");
