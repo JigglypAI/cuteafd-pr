@@ -787,12 +787,14 @@ pub fn fp8moe_scratch_bytes(manifest: &Value, layout: &str, rows: u64)
     }
     let activation = info["activation"].as_str();
     let weights = info["weights"].as_str();
-    if !matches!(weights, Some("fp8" | "mxfp4" | "nvfp4" | "nvfp4a4" | "bf16")) {
+    if !matches!(weights, Some("fp8" | "mxfp4" | "mxfp8" | "nvfp4" | "nvfp4a4" | "bf16")) {
         return Err(invalid("unsupported weight storage"));
     }
     match activation {
         Some("silu_bf16_product" | "silu_post_clamp_fp32_product") if alpha == 1.0 && beta == 0.0 => (),
         Some("swigluoai") if matches!(weights, Some("nvfp4" | "nvfp4a4")) && alpha > 0.0 && limit > 0.0 => (),
+        Some("situ") if matches!(weights, Some("mxfp8" | "nvfp4" | "nvfp4a4"))
+            && alpha == 1.0 && beta == 0.0 && limit == 0.0 => (),
         _ => return Err(invalid("unsupported activation or inconsistent alpha/beta/limit")),
     }
     if weights == Some("mxfp4") && activation != Some("silu_bf16_product") {
@@ -1232,6 +1234,23 @@ mod tests {
             let mut manifest = valid.clone();
             manifest["layouts"]["tp1"][key] = value;
             assert!(matches!(fp8moe_scratch_bytes(&manifest, "tp1", 4096), Err(Fp8MoeManifestError::Contract { .. })), "{key}");
+        }
+    }
+
+    #[test]
+    fn native_situ_manifest_accepts_only_native_mxfp8_or_nvfp4_contracts() {
+        for weights in ["mxfp8", "nvfp4", "nvfp4a4"] {
+            let manifest = json!({"layouts":{"tp2":{"abi_version":6,"weights":weights,
+                "projection":"bf16","activation":"situ","swiglu_limit":0.0,
+                "swiglu_alpha":1.0,"swiglu_beta":0.0,
+                "capacities":[{"capacity":16,"scratch_bytes":4096}]}}});
+            assert_eq!(fp8moe_scratch_bytes(&manifest, "tp2", 16).unwrap(), Some(4096));
+            for (key, value) in [("weights", json!("fp8")), ("weights", json!("mxfp4")),
+                ("swiglu_limit", json!(4.0)), ("swiglu_beta", json!(25.0))] {
+                let mut wrong = manifest.clone();
+                wrong["layouts"]["tp2"][key] = value;
+                assert!(fp8moe_scratch_bytes(&wrong, "tp2", 16).is_err());
+            }
         }
     }
 
