@@ -6,7 +6,7 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-from inkling2.run import Runner, save_stage, state_from, state_tensors
+from inkling2.run import Runner, load_entry, save_stage, state_from, state_tensors
 from kimi_k3.core_k6.storage import StageStore
 
 
@@ -22,7 +22,7 @@ def test_uncommitted_prompt_phase_can_recover_without_changing_committed_frontie
     save_stage(store, 'boundary-000', [(0, {'partial':expected}), (1, {'partial':expected+1})])
     manifest = store.load('boundary-000', checksum=True)
     assert len(manifest['entries']) == 2
-    assert torch.equal(load_file(str(tmp_path/'boundary-000/00000.safetensors'))['partial'],expected)
+    assert torch.equal(load_entry(store, 'boundary-000', 0, 'cpu')['partial'],expected)
     def must_not_run():
         raise AssertionError('committed phase was recomputed')
         yield

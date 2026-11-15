@@ -2,12 +2,24 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
 import struct
 import tempfile
+from functools import lru_cache
+
+
+@lru_cache(maxsize=1)
+def checkpoint_io():
+    """Load the pinned lightweight file helper without model/GPU imports."""
+    path = Path(__file__).resolve().parents[3] / "third_party/gptqmodel/gptqmodel/utils/checkpoint_io.py"
+    spec = importlib.util.spec_from_file_location("_cuteafd_checkpoint_io", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def canonical(value):
@@ -51,26 +63,55 @@ def file_identity(path):
 def verify_receipt(path, receipt, *, checksum=False):
     if file_identity(path) != receipt["file_identity"]:
         raise ValueError(f"committed file changed: {path}")
-    if checksum and sha256_file(path) != receipt["sha256"]:
-        raise ValueError(f"committed file checksum differs: {path}")
+    algorithm = receipt.get("hash_algorithm", "sha256")
+    if algorithm not in ("sha256", "xxh3-128"):
+        raise ValueError(f"unsupported committed checksum: {algorithm}")
+    segmented = receipt.get("storage_format") == "safetensors-segment-v1"
+    offset, length = (receipt["offset"], receipt["bytes"]) if segmented else (0, None)
+    if (type(offset) is not int or offset < 0 or
+            (length is not None and (type(length) is not int or length <= 0)) or
+            (length is not None and offset + length > receipt["file_identity"]["bytes"])):
+        raise ValueError(f"committed file extent differs: {path}")
+    if checksum:
+        actual = (sha256_file(path) if algorithm == "sha256" else
+                  checkpoint_io().hash_file(path, offset=offset, length=length))
+        if actual != receipt["sha256" if algorithm == "sha256" else "xxh3_128"]:
+            raise ValueError(f"committed file checksum differs: {path}")
 
 
-def commit_safetensors(path, tensors, *, metadata=None):
-    """Only serialize bounded owned CPU tensors; never alias a whole mapping."""
-    from safetensors.torch import save_file
+def commit_safetensors(path, tensors, *, metadata=None, hash_algorithm="xxh3-128"):
+    """Stream internal scratch once; SHA256 is explicit for protocol outputs."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".partial")
     if path.exists():
         raise FileExistsError(path)
-    save_file({key: value.detach().cpu().contiguous() for key, value in tensors.items()},
-              temporary, metadata=metadata)
-    with temporary.open("rb") as file:
-        checksum = hashlib.file_digest(file, "sha256").hexdigest()
-        os.fsync(file.fileno())
-    os.replace(temporary, path)
-    fsync_directory(path.parent)
-    return dict(sha256=checksum, file_identity=file_identity(path))
+    receipt = checkpoint_io().write_safetensors(path,
+        {key: value.detach().cpu().contiguous() for key, value in tensors.items()},
+        metadata=metadata, hash_algorithm=hash_algorithm)
+    # Preserve the original compact receipt contract. In particular, callers
+    # may use `offset` for corpus rows and `tensors` for an inventory count.
+    return dict(checksum_fields(receipt), hash_algorithm=receipt["hash_algorithm"],
+                file_identity=file_identity(path))
+
+
+def checksum_identity(receipt):
+    algorithm = receipt.get("hash_algorithm", "sha256")
+    if algorithm not in ("sha256", "xxh3-128"):
+        raise ValueError("unsupported checkpoint checksum")
+    return dict(algorithm=algorithm, value=receipt["sha256" if algorithm == "sha256" else "xxh3_128"])
+
+
+def checksum_fields(receipt):
+    """Retain legacy SHA field shape; explicitly tag new scratch checksums."""
+    checksum = checksum_identity(receipt)
+    if checksum["algorithm"] == "sha256":
+        return dict(sha256=checksum["value"])
+    return dict(hash_algorithm=checksum["algorithm"], xxh3_128=checksum["value"])
+
+
+def scratch_receipt(path):
+    """One final XXH3 scan for mutable mmap layouts; no serializer readback."""
+    return dict(hash_algorithm="xxh3-128", xxh3_128=checkpoint_io().hash_file(path),
+                file_identity=file_identity(path))
 
 
 def read_header(path):

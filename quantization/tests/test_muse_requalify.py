@@ -129,6 +129,21 @@ def test_native_origin_allows_only_native_banks_and_quantizer_change(case):
     assert 'inherited_numerical_producers' not in case.identity
 
 
+def test_native_origin_accepts_legacy_sha_and_new_xxh3_teacher_receipts(case):
+    path = case.old / 'frontier-000/000.safetensors'
+    receipt_path = path.with_suffix('.receipt.json')
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt.pop('hash_algorithm') == 'xxh3-128'
+    receipt.pop('xxh3_128')
+    receipt['sha256'] = sha256_file(path)
+    atomic_json(receipt_path, receipt)
+    origin = qualify_identity(case)
+    old = next(entry for entry in origin['native_files'] if entry['relative'] == 'frontier-000/000.safetensors')
+    new = next(entry for entry in origin['native_files'] if entry['relative'] == 'frontier-001/000.safetensors')
+    assert requalify._teacher_checksum(old) == dict(teacher_sha256=receipt['sha256'])
+    assert requalify._teacher_checksum(new)['teacher_checksum']['algorithm'] == 'xxh3-128'
+
+
 @pytest.mark.parametrize('field',['token_manifest_sha256','source_config_sha256','source_index_sha256','native','records','witness'])
 def test_native_origin_rejects_changed_tokenizer_adapter_or_inputs(case,field):
     changed=copy.deepcopy(case.identity)

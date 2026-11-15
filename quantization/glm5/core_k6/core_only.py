@@ -11,7 +11,7 @@ import subprocess
 
 import torch
 
-from kimi_k3.uniform_k2.storage import atomic_json, canonical, sha256_file
+from kimi_k3.uniform_k2.storage import atomic_json, canonical, checksum_identity, sha256_file
 from . import recipe
 from .run import (Engine, Progress, RECIPE, REPO, GIB, cleanup_complete,
                   compact, exclusive_run)
@@ -25,18 +25,21 @@ class CoreProjectionStore(ProjectionStore):
         from core_export import sampled_packed_oracle
         path = self.evidence / (name + ".json")
         prior = json.loads(path.read_text()) if path.exists() else {}
+        checksum = checksum_identity(saved)
+        prior_checksum = prior.get("packed_checksum",
+            dict(algorithm="sha256", value=prior.get("packed_sha256")))
         oracle = prior.get("evidence", {}).get("packed_byte_oracle")
-        if (prior.get("packed_sha256") != saved["sha256"]
+        if (prior_checksum != checksum
                 or prior.get("identity") != self.identity or oracle is None):
             oracle = sampled_packed_oracle(self.paths(name)[0], name,
                 self.selection[name], device=self.device)
         if oracle.get("passed") is not True or oracle.get("bits") != self.selection[name]["bits"]:
             raise ValueError("packed-byte oracle did not certify selected core bitrate")
         evidence = dict(saved["evidence"], packed_byte_oracle=oracle)
-        if prior.get("packed_sha256") == saved["sha256"] and prior.get("identity") == self.identity:
+        if prior_checksum == checksum and prior.get("identity") == self.identity:
             if "reconstruction" in prior.get("evidence", {}):
                 evidence["reconstruction"] = prior["evidence"]["reconstruction"]
-        atomic_json(path, dict(identity=self.identity, packed_sha256=saved["sha256"],
+        atomic_json(path, dict(identity=self.identity, packed_checksum=checksum,
             **{key: saved[key] for key in ("module", "bits", "logical_shape", "metrics")},
             evidence=evidence))
 
