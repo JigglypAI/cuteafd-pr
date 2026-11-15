@@ -151,7 +151,9 @@ pub(crate) fn catalog_owner_bytes(catalog: &crate::OfficialV41Catalog, family: &
     -> anyhow::Result<cuteafd_core::OwnerBytes> {
     if catalog.fp8().is_some() { return native_catalog_owner_bytes(catalog, family, working, rank, extent); }
     let geometry = catalog.routed_experts().geometry()?;
-    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!("spark_slot_census.json"))?;
+    static RECORDED: std::sync::OnceLock<Vec<serde_json::Value>> = std::sync::OnceLock::new();
+    let rows = RECORDED.get_or_init(|| serde_json::from_str(include_str!("spark_slot_census.json"))
+        .expect("bundled Spark owner census is valid JSON"));
     if !rows.iter().any(|row| row["family"] == family && row["format"] == "exl3" && row["width"].is_number()) {
         return exl3_owner_bytes(family, geometry, extent);
     }
@@ -162,7 +164,7 @@ pub(crate) fn catalog_owner_bytes(catalog: &crate::OfficialV41Catalog, family: &
         if !widths.contains(&width) { widths.push(width); }
     }
     anyhow::ensure!(widths.len() == 1, "EXL3 worker requires one retained rank width, found {widths:?}");
-    recorded_exl3_owner_bytes(&rows, family, geometry, widths[0], extent)
+    recorded_exl3_owner_bytes(rows, family, geometry, widths[0], extent)
 }
 
 fn recorded_exl3_owner_bytes(rows: &[serde_json::Value], family: &str,
