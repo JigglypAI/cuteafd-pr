@@ -178,8 +178,9 @@ impl cuteafd_engine::prefix::PrefixFamily for InklingPrefix<'_> {
     fn capture(&self, slot: cuteafd_engine::prefix::MarkSlot, placement: &Placement, len: usize)
         -> Result<(), cuteafd_engine::prefix::BoxError> {
         self.validate(placement, len)?;
-        ensure!(len == placement.len && len == placement.state_len,
-            "Inkling snapshot frontier does not match committed causal state");
+        if len != placement.len || len != placement.state_len {
+            return Err("Inkling snapshot frontier does not match committed causal state".into());
+        }
         Ok(self.0.capture(placement.slot, slot.0 as usize)?)
     }
     fn restore(&self, mark: Option<cuteafd_engine::prefix::MarkSlot>, placement: &mut Placement, len: usize)
@@ -192,7 +193,7 @@ impl cuteafd_engine::prefix::PrefixFamily for InklingPrefix<'_> {
         Ok(())
     }
     fn copy_rows(&self, copy: cuteafd_engine::prefix::TailCopy) -> Result<(), cuteafd_engine::prefix::BoxError> {
-        ensure!(copy.owner.is_none(), "Inkling whole-rank pages have no parity owner");
+        if copy.owner.is_some() { return Err("Inkling whole-rank pages have no parity owner".into()); }
         Ok(self.0.copy_page_rows(copy.from as usize, copy.to as usize, copy.rows)?)
     }
     fn drain(&self) -> Result<(), cuteafd_engine::prefix::BoxError> { Ok(self.0.drain()?) }

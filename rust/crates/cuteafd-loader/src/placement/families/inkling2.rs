@@ -135,6 +135,8 @@ pub struct InklingInputs {
     pub prefill: PrefillShape,
     /// Boot concurrency C: per-sequence rings, conv lags, page tables, selector.
     pub sequences: u64,
+    pub prefix_entries: u64,
+    pub prefix_mark_budget: u64,
     /// Per-rank target arenas (one per coordinator GPU).
     pub targets: Vec<CoordinatorWeights>,
     /// The resolved attention placement and every layer's mode under it.
@@ -267,6 +269,13 @@ fn with(mut components: Vec<Component>, activation: &Activation) -> Vec<Componen
 impl InklingInputs {
     pub fn maximum_pages(&self) -> u64 { self.maximum_pool_tokens.div_ceil(self.page_rows()) }
 
+    fn mark_bytes(&self) -> Result<u64, Refusal> {
+        (0..self.cfg.layers).try_fold(0u64, |bytes, layer| {
+            let state = SequenceState::new(&self.cfg, self.cfg.local[layer])?;
+            bytes.checked_add(state.ring_bytes + state.lag_bytes).ok_or(Refusal::Overflow("Inkling mark bytes"))
+        })
+    }
+
     fn modes(&self) -> Vec<LayerMode> { self.modes.clone() }
 
     fn head_gpu(&self) -> u8 { (self.gpus - 1) as u8 }
@@ -382,35 +391,14 @@ impl InklingInputs {
     /// block stack, router scores and expert activation staging. Named per
     /// plane so the ledger reconciles them one by one.
     fn unit_owners(&self, prefix: &str, gpu: usize, rows: u32, maximum: u64) -> Result<Vec<Component>, Refusal> {
-        let cfg = &self.cfg;
         let location = Location::coordinator(gpu as u8);
-        let r = u64::from(rows);
-        let (h, d, heads, kv) = (cfg.hidden as u64, cfg.head_dim as u64, cfg.heads as u64, cfg.kv_heads as u64);
-        let planes: [(&str, u64); 14] = [
-            ("x", r * h * 2),                                   // mixed layer input (BF16)
-            ("q", r * heads * d * 2),
-            ("r", r * heads * cfg.d_rel as u64 * 2),
-            ("gate", r * heads * d * 2),
-            ("sinks", r * heads * 4),                           // F32 per (token, head)
-            ("k", r * kv * d * 2),
-            ("v", r * kv * d * 2),
-            ("rel_logits", r * heads * cfg.window.max(cfg.rel_extent) as u64 * 2), // the largest plane
-            ("attention", r * heads * d * 2),
-            ("conv_out", r * h * 2),                            // attn_sconv / mlp_sconv output
-            ("blocks", r * (cfg.residual_blocks() as u64 + 1) * h * 2), // completed blocks + partial
-            ("router", r * cfg.experts as u64 * 4),             // F32 scores
-            ("routes", r * cfg.topk as u64 * 8),                // ids + weights
-            ("expert_in", r * (h + h / 32)),                    // MXFP8 K32 request staging
-        ];
+        let context = usize::try_from(self.context.maximum).map_err(|_| Refusal::Overflow("Inkling context"))?;
+        let layout = crate::families::inkling2::execution::UnitLayout::serving(&self.cfg, rows as usize, context)
+            .map_err(refusal)?;
         let mut out = Vec::new();
-        for (name, bytes) in planes {
-            out.extend(buffer(format!("{prefix}.{name}"), location, bytes, Lifetime::TARGET, Category::Workspace,
-                "Inkling 2 row-unit planes (geometry formula)", maximum));
-        }
-        let metadata: [(&str, u64); 4] = [("positions", r * 8), ("slots", r * 8), ("batch_ids", r * 4), ("causal_lengths", r * 4)];
-        for (name, bytes) in metadata {
-            out.extend(buffer(format!("{prefix}.metadata.{name}"), location, bytes, Lifetime::TARGET, Category::Workspace,
-                "Inkling 2 unit metadata", maximum));
+        for (name, bytes) in layout.buffers {
+            out.extend(buffer(format!("{prefix}.{name}"), location, bytes as u64, Lifetime::TARGET, Category::Workspace,
+                "Inkling native forward UnitLayout owner", maximum));
         }
         Ok(out)
     }
@@ -425,8 +413,7 @@ impl InklingInputs {
         let mut out = Vec::new();
         let target = self.targets.get(gpu).ok_or_else(|| invalid("missing target arena"))?;
         out.extend(target.weight_components(maximum)?);
-        // Whole-owner global layers: K and V pages on the owner only, one
-        // physical backing per plane that scales with the pool. Local layers
+        // One interleaved K/V record backing per owned global layer. Local layers
         // keep no pool pages: their window lives in the per-sequence ring.
         let kv_row = (cfg.kv_heads * cfg.head_dim * 2) as u64;
         let page_rows = self.page_rows();
@@ -443,13 +430,11 @@ impl InklingInputs {
             if !cfg.local[layer] {
                 // One page of records on this rank: heads split the row; context
                 // parity interleaves whole pages (page_rows doubles, half land here).
-                let stride = page_rows * kv_row * num / den;
-                for name in ["keys", "values"] {
-                    out.push(Component::allocation(Allocation::buffer(format!("inkling2.kv.{layer}.{gpu}.{name}"), location,
-                        stride, Lifetime::TARGET, Category::Kv, "global-layer paged KV records"),
-                        ByteCurve::linear_rounded(stride, stride, maximum, SM120_ALLOCATION_GRANULARITY_BYTES),
-                        false, maximum));
-                }
+                let stride = page_rows * 2 * kv_row * num / den;
+                out.push(Component::allocation(Allocation::buffer(format!("inkling2.kv.{layer}.{gpu}.records"), location,
+                    stride, Lifetime::TARGET, Category::Kv, "global-layer interleaved BF16 KV records"),
+                    ByteCurve::linear_rounded(stride, stride, maximum, SM120_ALLOCATION_GRANULARITY_BYTES),
+                    false, maximum));
             }
             let state = SequenceState::new(cfg, cfg.local[layer])?;
             // Rings split by KV head; the hidden-stream conv lags are replicated
@@ -469,12 +454,14 @@ impl InklingInputs {
         // Sliding-window rings and short-conv lag rows for every admitted
         // sequence: the prefix-mark arena a snapshot copies (byte-identical
         // restores), sized by concurrency, not context.
-        out.extend(buffer(format!("inkling2.marks.{gpu}"), location, marks, Lifetime::TARGET, Category::Prefix,
-            "sliding-window rings and conv lag rows per sequence (geometry formula)", maximum));
-        // Page tables for every admitted sequence at the compiled context (global layers only).
-        let pages = u64::from(context).div_ceil(page_rows);
-        out.extend(buffer(format!("inkling2.cache.{gpu}.page_table"), location, sequences * pages * 4 + sequences * 8,
-            Lifetime::TARGET, Category::Kv, "global-layer page tables and lengths", maximum));
+        out.extend(buffer(format!("inkling2.cache.{gpu}.active"), location, marks, Lifetime::TARGET, Category::Kv,
+            "active SWA rings and FP32 convolution lags", maximum));
+        let per_sequence = marks / sequences;
+        let slots = cuteafd_core::prefix::mark_slots_with_host(self.sequences, self.prefix_entries,
+            self.mark_bytes()?, self.prefix_mark_budget, self.host_prefix.quota_bytes > 0);
+        let retained = per_sequence.checked_mul(slots).ok_or(Refusal::Overflow("Inkling prefix marks"))?;
+        out.extend(buffer(format!("inkling2.cache.{gpu}.marks"), location, retained, Lifetime::TARGET, Category::Prefix,
+            "exact retained SWA and FP32 convolution marks", maximum));
         // One decode lane on every rank (its layers' work), then one owner set
         // per in-flight prefill slot (PrefillHooks unit slots).
         out.extend(self.unit_owners(&format!("inkling2.decode.{gpu}"), gpu, DECODE_ROWS, maximum)?);
@@ -687,7 +674,7 @@ impl Recipe for InklingInputs {
                 decode: Some(request.spark_reply_formats.decode()) }),
             resident_weight_limit: request.resident_weight_limit, page_rows: self.page_rows(), pool_page_multiple: 1,
             maximum_pages: maximum, gpus: self.gpus, variables: contract_variables, requires, components };
-        // `page_rows` is the parity-doubled page under context; one backing per plane either way.
+        // Context uses parity-doubled pages; every global layer has one record backing.
         contract.add_driver_page_tables();
         Ok(contract)
     }

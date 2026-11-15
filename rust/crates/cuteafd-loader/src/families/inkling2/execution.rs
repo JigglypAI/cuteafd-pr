@@ -15,8 +15,9 @@ impl UnitLayout {
     pub fn new(cfg: &Inkling2Config, rows: usize, context: usize) -> Result<Self> {
         ensure!((1..=4096).contains(&rows) && rows <= context && context <= cfg.max_position,
             "Inkling arithmetic rows/context outside checkpoint/export");
-        ensure!((cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.d_rel, cfg.sconv_kernel, cfg.res_block)
-            == (4608, 48, 8, 128, 16, 4, 6), "Inkling native stage2 requires released Small geometry");
+        ensure!((cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.d_rel, cfg.sconv_kernel)
+            == (4608, 48, 8, 128, 16, 4) && cfg.res_block > 0,
+            "Inkling native arithmetic requires released Small widths/convolution geometry");
         let blocks = cfg.layers.div_ceil(cfg.res_block) + 1;
         let mut buffers = BTreeMap::new();
         let mut add = |name: &str, width: usize, bytes: usize| -> Result<()> {

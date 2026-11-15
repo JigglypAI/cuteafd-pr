@@ -70,6 +70,7 @@ pub struct FactsRequest<'a> {
     pub host: (u64, u64),
     pub host_cache_bytes: Option<u64>,
     pub prefix_entries: u64,
+    pub prefix_mark_budget: u64,
     pub replies: cuteafd_core::spark_reply::SparkReplyFormats,
     pub head: serving::BlasHead,
     pub expert_usage: bool,
@@ -240,7 +241,8 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
         page_rows).maximum_tokens();
     Ok(InklingInputs { cfg: cfg.clone(), gpus, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
-        maximum_pool_tokens, prefill: shape, sequences: request.sequences, targets, placement, modes,
+        maximum_pool_tokens, prefill: shape, sequences: request.sequences, prefix_entries: request.prefix_entries,
+        prefix_mark_budget: request.prefix_mark_budget, targets, placement, modes,
         routed: routed.clone(), experts, local, spark, links,
         spark_reply_formats: request.replies, drafter: None, vision: None, budgets, code, graph_reserve,
         head: request.head, host_prefix, device_sampling: true,

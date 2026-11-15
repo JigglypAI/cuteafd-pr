@@ -361,7 +361,7 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             .chain((0..ranks).map(|rank| shared::spark_budget(rank as u8, 100 << 30)))
             .chain([crate::placement::families::kimi::host_budget(512 << 30, 480 << 30)]).collect();
         let inputs = InklingInputs { cfg: cfg.clone(), gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
-            maximum_pool_tokens: 4 << 20, prefill, sequences: 16, targets: targets.clone(), placement, modes: modes.clone(),
+            maximum_pool_tokens: 4 << 20, prefill, sequences: 16, prefix_entries: 8, prefix_mark_budget: 2 << 30, targets: targets.clone(), placement, modes: modes.clone(),
             routed: routed.clone(), experts,
             local: LocalPackage::Installed { workspace: [64 << 20, if gpus == 2 { 64 << 20 } else { 0 }] },
             spark: (0..=routed.len()).map(charge).collect(),
@@ -383,6 +383,31 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
         for component in &contract.components {
             if let ComponentKind::Allocation { template, .. } = &component.kind {
                 assert!(seen.insert((template.id.clone(), format!("{:?}", component.activation))), "{} twice", template.id);
+            }
+        }
+        // The planner inventories the exact allocator recipe, per owner, not
+        // a BF16 approximation of the native FP32 forward planes.
+        for gpu in 0..gpus {
+            for (prefix, rows) in std::iter::once((format!("inkling2.decode.{gpu}"), 64usize))
+                .chain((0..prefill.waves).map(|slot| (format!("inkling2.unit.{gpu}.{slot}"), prefill.rows as usize))) {
+                let expected = crate::families::inkling2::execution::UnitLayout::serving(&cfg, rows, 1 << 20).unwrap();
+                let actual = contract.components.iter().filter_map(|component| match &component.kind {
+                    ComponentKind::Allocation { template, .. } => template.id.strip_prefix(&format!("{prefix}."))
+                        .map(|name| (name.to_owned(), component.bytes.at(1).unwrap() as usize)),
+                    _ => None,
+                }).collect::<std::collections::BTreeMap<_, _>>();
+                assert_eq!(actual, expected.buffers, "{prefix}");
+            }
+        }
+        if gpus == 1 {
+            let cache = crate::families::inkling2::execution::CacheLayout::new(&cfg, 16, 3).unwrap();
+            let owner = |id: &str| contract.components.iter().find(|component| matches!(&component.kind,
+                ComponentKind::Allocation { template, .. } if template.id == id)).unwrap();
+            assert_eq!(owner("inkling2.cache.0.active").bytes.at(1).unwrap(), cache.active_bytes().unwrap() as u64);
+            let slots = cuteafd_core::prefix::mark_slots_with_host(16, 8, cache.sequence_bytes as u64, 2 << 30, false);
+            assert_eq!(owner("inkling2.cache.0.marks").bytes.at(1).unwrap(), cache.retained_bytes(slots as usize).unwrap() as u64);
+            for &layer in &cache.global_layers {
+                assert_eq!(owner(&format!("inkling2.kv.{layer}.0.records")).bytes.at(3).unwrap(), cache.layer_page_bytes().unwrap() as u64);
             }
         }
         // One target arena backing per rank.
@@ -408,7 +433,7 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
         // The per-sequence ring/lag marks exist on every rank that owns a layer.
         for gpu in 0..gpus {
             assert!(contract.components.iter().any(|c| matches!(&c.kind, ComponentKind::Allocation { template, .. }
-                if template.id == format!("inkling2.marks.{gpu}"))), "rtx{gpu} marks");
+                if template.id == format!("inkling2.cache.{gpu}.active"))), "rtx{gpu} marks");
         }
         let admitted = inputs.admit(request).unwrap();
         assert!(admitted.solved.pool_tokens >= 1 << 20, "{placement:?} on {gpus} GPUs: {}", admitted.solved.pool_tokens);
