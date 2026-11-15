@@ -3592,7 +3592,9 @@ impl<'a> GlmfEngine<'a> {
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>,
         scoring: Option<crate::shared::probe::ScoringRows<'_>>, end: usize) -> Result<Option<StepLogits>> {
         let (start, t) = (placement.len, tokens.len());
-        ensure!(end >= start + t, "draft extension ends before its chunk");
+        // Planned points are chunk ends today. A future nonzero capture_reach
+        // may put a point inside this chunk; retaining extra context is safe.
+        let end = end.max(start + t);
         // Cuts preserve MLA page alignment and recurrent state order.
         let cuts = if on_layer.is_some() || forced.is_some() {
             ensure!(t <= self.prefill_rows, "layer diagnostics take one admitted unit");

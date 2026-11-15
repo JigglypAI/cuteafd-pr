@@ -677,7 +677,7 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
         let owner = self.storage.ranks.last().context("MiniMax tap rank missing")?.prefill[unit.slot].borrow();
         for segment in &unit.segments {
             let request = &requests[segment.sequence];
-            let end = draft.ingest_end(request.placement.slot, segment.tokens.start, request.start + request.tokens.len());
+            let end = draft.ingest_end(request.placement.slot, segment.tokens.start, request.start + request.tokens.len())?;
             for first in (0..segment.rows.len()).step_by(crate::shared::speculation::dflash::TAP_ROWS) {
                 let rows = (segment.rows.len() - first).min(crate::shared::speculation::dflash::TAP_ROWS);
                 let position = segment.tokens.start + first;
@@ -712,7 +712,7 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
                         let start = segment.tokens.start + first;
                         if crate::shared::speculation::retain_context_chunk(draft.drafter.cfg.window,
                             start..start + count, draft.ingest_end(request.placement.slot, start,
-                                request.start + request.tokens.len())) {
+                                request.start + request.tokens.len())?) {
                             // SAFETY: producer taps survive this unit; the stream orders copy/update.
                             unsafe { draft.drafter.capture_concatenated(source,segment.rows.start + first,count,0,owner.stream.raw)?; }
                             let rows=(0..count).map(|tap_row| crate::shared::speculation::dflash::ContextRow {

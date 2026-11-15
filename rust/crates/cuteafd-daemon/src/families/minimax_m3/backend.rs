@@ -379,7 +379,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         self.next_identity.set(identity.checked_add(1).context("MiniMax request identity exhausted")?);
         self.identities.borrow_mut().insert(placement.slot, identity);
         if let Some(draft) = &self.owners.storage.draft_prefix {
-            draft.prompt_ends.borrow_mut()[placement.slot] = tokens.len();
+            draft.bind_prompt(placement.slot, tokens.len())?;
         }
         Ok(())
     }
