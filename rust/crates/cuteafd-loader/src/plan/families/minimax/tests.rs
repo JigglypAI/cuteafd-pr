@@ -1880,7 +1880,7 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
 
 
 #[test]
-fn explicit_heads_public_layout_remains_planned_and_auto_selects_layers() {
+fn explicit_heads_public_layout_is_executable_and_auto_selects_layers() {
     use crate::placement::{AttentionPlacement, OnboardSetting};
     let (dir, inputs) = heads_recipe_fixture_with_experts(128);
     let manifest = dir.path().join("PROGRAMS.json");
@@ -1904,13 +1904,11 @@ fn explicit_heads_public_layout_remains_planned_and_auto_selects_layers() {
             }), ..Default::default() };
         let report = plan::plan(dir.path(), &options).unwrap();
         assert!(report.config_error.is_none(), "{:?}", report.config_error);
-        let qualified = attention.is_none();
-        assert_eq!(report.native_serving_admitted, qualified);
-        assert_eq!(report.wip_launchable(), qualified);
-        assert_eq!(report.placement_supported, qualified,
-            "only qualified FP32 split has a serving attachment");
-        assert_eq!(report.executable(), qualified);
-        assert_eq!(report.runtime, Some(if qualified { RuntimeStatus::Serving } else { RuntimeStatus::Planned }));
+        assert!(report.native_serving_admitted);
+        assert!(report.wip_launchable());
+        assert!(report.placement_supported);
+        assert!(report.executable());
+        assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
         assert_eq!(report.attention_placement, attention.unwrap_or(AttentionPlacement::Layers));
         let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("qualified default wire produces a shared solved plan: {report:#?}"));
         assert_eq!(placed.attention_placement, report.attention_placement);
