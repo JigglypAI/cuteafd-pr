@@ -27,6 +27,72 @@ Rubric, each 1–5 (5 best), plus wall time:
 
 ## Log
 
+### 2026-11-15 Native MXFP4 Duel: Final Measured Dispositions
+
+Three rounds per entrant are complete. DeepSeek Flash's final `de8d3490`
+uses recipe-selected asynchronous weight staging; Carbon High's final
+`e7e9ead7`, driven by DeepSeek, combines that staging with vectorized shared
+loads, swizzles and register trimming. DeepSeek declines its first-finisher
+bonus: no fresh hypothesis. Organizer alone runs every GPU oracle and
+measurement; entrants change kernel code only.
+
+SM121 Pro full-band qualification uses widths 320/352, planned capacities
+1/16/80, live rows 1/2/4/8/16/17/32/48/63/64 where each capacity permits,
+checkpoint E384/top8 random routes, warmed graph replay, 10 interleaved
+samples and three identical generic controls. Each entrant gets 16 cells per
+width. Thermal/power-cap counter deltas are zero. DeepSeek has the best A8
+result throughout this final band and qualifies Pro320 at both activation
+widths in all 16 cells. Carbon A8 regresses, failing generic in 6/16 Pro320
+and 8/16 Pro352 cells; its useful result is A16 at Pro352 from live2 upward.
+Both A16 entries qualify Pro320, while Pro352 A16 misses cap1/live1.
+
+Explicit Pro352 cap1/live1 (microseconds): generic controls are
+131.456-131.808 across the two launches; DeepSeek A8/A16 are
+141.968/132.784 and Carbon 158.352/134.864. Neither entrant qualifies that
+cell at either activation width. These are per-cell kernel results, not a
+whole-family migration or a generic-deletion qualification. Generic remains
+necessary on other decode cells and prefill. TJ holds any combined MiMo Pro
+adoption decision; fork #216/#318/#320/#321 remain open.
+
+DeepSeek's final 88-case suite passes both architectures, with every scalar
+numerical receipt identical to base; all six final SM120 timing cells lose
+generic. Carbon's final 88 cases also pass both architectures with
+base-identical scalar receipts (SM120 221.39s, SM121 209.87s); all six final
+SM120 timing cells lose generic at both activation widths. Carbon's SM120
+points have zero SW/HW thermal slowdown, max67C/minT.Limit27C, busy SM
+2610-2857MHz. Power-cap counter increments are 0.017080s for Flash256,
+0.016938s for Flash512 and zero for Pro320. These are per-point windows,
+not per-arm attribution; they do not make the large generic losses a tie.
+All measured prefix/poison/live/graph checks pass; raw JSON retains bitwise
+flags and comparison hashes without conflating A8 and A16 arithmetic.
+
+Scores from independently checked work: DeepSeek Correct 5, Judgement 4,
+Quality 4, Creative 4; Carbon Correct 5, Judgement 4, Quality 4, Creative 4. DeepSeek R1 sealed in about
+10 minutes, with bounded selector refinements in R2/R3. Carbon round wall
+was 31m55s / 23m15s / 18m54s; driver steers were 4 / 1 / 2, with two R1
+deadline interrupts and none in R2/R3; no 503s. The gentler R2-on deadline
+(30-minute noninterrupt nudge, 45-minute cap) did not require a nudge in its
+last two rounds. Carbon's bank-conflict design is correct but its final A8
+occupancy tradeoff loses; DeepSeek's unsupported generic-FC1/FC2-fusion
+claim was corrected by source review. Neither entrant runs hardware or
+changes the benchmark/oracle to fit its result.
+
+A separate clean-master DeepSeek port is already shipped to fork master:
+#323 merged as `259140d1`, enabling only SM121 compact-code V4.1 TP6 A8
+decode. Thirteen matched cells are byte-identical, live1 speedup is
+1.087-1.110x, and all other measured TP6 cells win/tie. Final gates pass
+46 native V4 oracle cases and 378 CPU contracts; export audit changes only
+TP6 m1/m16/m64, leaving TP3/prefill/input-quant byte-identical. TP3's master
+live1 gain shrinks to about 1.02x from the experimental branch's 1.06-1.12x,
+so it remains off. This accepted V4.1 result is independent of MiMo adoption.
+
+Evidence: cuteafd #2129; fork #318/#320/#321/#323; task-root
+`carbon-r3-pro-band.json`, `ds-r3-pro-band.json`,
+`final-pro-comparison.json` and `receipts/` under
+`~/.cache/cuteafd/builds/mxfp4-duel/`. Final SM120 screens are in
+`carbon-r3-sm120.json` and `ds-r3-sm120.json`. The measured duel is complete;
+no additional round, MiMo descriptor, default change or landing is authorized.
+
 ### 2026-11-14 Native FP8 Decode Duel: Fable Final Null
 
 Fable 5.2 (`claude-fable-5-2`) completed three bounded kernel-only rounds:
