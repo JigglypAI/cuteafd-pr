@@ -231,7 +231,8 @@ mod tests {
                 assert_eq!(charged, (stored + trimmed) as u64);
                 assert!(placement.items[0].iter().all(|item| item.group != "Muse head logits"), "head rank only");
                 let placement = report.solver_placement.clone().context("placed")?;
-                let plan = super::super::admission::spark_plan(&placement, prefill, Cutoff::new(64, 1)?, 16, 6)?;
+                let folded_cutoff = Cutoff::with_formats(cutoff_rows, DEFAULT_BF16_MAX_ROWS, formats)?;
+                let plan = super::super::admission::spark_plan(&placement, prefill, folded_cutoff, 16, 6)?;
                 assert_eq!(plan.working.spark_layers.len() + placement.onboard_layers, 62);
                 assert!(plan.working.spark_layers.iter().all(|layer| !plan.working.rtx_layers.contains(layer)));
                 let endpoint = plan.model.endpoints[0];
@@ -247,7 +248,7 @@ mod tests {
                 assert_eq!(charged, tables.bytes() as u64);
                 // The coordinator intake the link allocates (ranks x waves x unit x row) is the charge.
                 let (row, planes) = shared::intake(&cuteafd_loader::families::muse_spark::MuseSparkConfig::from_hf(
-                    &testing::muse_spark_config())?, prefill, Cutoff::new(64, 1)?, 16, 6)?;
+                    &testing::muse_spark_config())?, prefill, folded_cutoff, 16, 6)?;
                 assert_eq!(planes, 6 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(prefill.span_rows * row as u64)?);
                 let charged = placement.items[0].iter().find(|item| item.group == "Muse Spark partial reply planes")
                     .context("intake charge")?.bytes;
