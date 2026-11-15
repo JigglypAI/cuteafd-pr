@@ -153,8 +153,9 @@ impl Exl3SegmentGeometry {
 
     /// Byte sizes of every region at `rows` live rows, in arena order (fork
     /// `exl3_ws_segment_scratch_regions`). Each region starts on 256 bytes.
-    /// The block-expert table keeps the compiled maximum, fixing later offsets
-    /// only by live rows; `None` on an invalid extent.
+    /// The route tables (block-expert ids, packed route indices) keep the
+    /// compiled maximum: the route-pack program compiled at the maximum
+    /// validates and initializes its whole bucket. `None` on an invalid extent.
     pub fn regions(self, rows: u32) -> Option<[u64; 12]> {
         if rows == 0 || rows > self.maximum || self.maximum > SEGMENT_MAX_ROWS
             || [self.hidden, self.intermediate, self.topk, self.experts, self.workspace_sms].contains(&0)
@@ -167,7 +168,7 @@ impl Exl3SegmentGeometry {
         let maximum_slots = slots(u64::from(self.maximum) * u64::from(self.topk));
         if u64::from(self.max_m_blocks) < maximum_slots.div_ceil(u64::from(self.block)) { return None; }
         let (h, i, e) = (u64::from(self.hidden), u64::from(self.intermediate), u64::from(self.experts));
-        Some([4 * u64::from(self.max_m_blocks), 4 * slots(routes), 4, 4 * (e + 1), 4 * e,
+        Some([4 * u64::from(self.max_m_blocks), 4 * maximum_slots, 4, 4 * (e + 1), 4 * e,
             2 * routes * h, 4 * routes * i, 2 * routes * i, 8 * u64::from(rows), 4, 4,
             4 * (4 * u64::from(self.workspace_sms) + 2)])
     }
@@ -367,8 +368,8 @@ mod tests {
         // and the exported compiled-maximum arena (8192 rows).
         let glm = Exl3SegmentGeometry { maximum: 8192, hidden: 6144, intermediate: 512, topk: 8,
             experts: 256, block: 64, max_m_blocks: 1276, workspace_sms: 48 };
-        for (rows, bytes) in [(2048, 251_813_888), (2752, 338_349_568), (4096, 503_554_048),
-            (5504, 676_625_408), (8192, 1_007_034_368)] {
+        for (rows, bytes) in [(2048, 252_010_496), (2752, 338_523_648), (4096, 503_685_120),
+            (5504, 676_711_424), (8192, 1_007_034_368)] {
             assert_eq!(glm.layout(rows).unwrap().1, bytes, "rows {rows}");
         }
         let (offsets, _) = glm.layout(8192).unwrap();
