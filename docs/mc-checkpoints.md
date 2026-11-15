@@ -46,10 +46,12 @@ BF16 copy remains. The view identity includes the metadata and recipe.
 
 Families declare executable roles, not conversion subsets. GLM Flash supports
 its MC core, including the vocabulary head, KDA q/k/v/o, MLA and dense/shared
-FFNs. Muse currently executes block FP8 q/k/v/o; a selected vocabulary head,
-attention gate or pre/post-expert projection refuses by tensor name, role and
-family until its executor lands. Kimi and GLM refuse unsupported selected roles;
-Step-5 uses the same metadata mechanism for its executable O projections. An owned
+FFNs. Muse executes block FP8 q/k/v/o, selected attention gates, pre/post-expert
+projections and its padded vocabulary head. GLM and Step-5 native whole-core
+FP8 routes require the v52d coordinator exports; Step includes selected MTP
+non-routed core, while GLM native MTP remains unused. Their effect and Standard
+quality stay unmeasured until served qualification; the selector remains opt-in.
+Kimi refuses unsupported selected roles. An owned
 unsupported tensor always refuses; unused external-drafter MTP is excluded
 by ownership, never partially converted. Already-FP8 sources refuse conversion.
 KDA/head conversion keys remain engine extras for weights outside the selected
@@ -151,8 +153,10 @@ The GLM 5.3 and Step-5 publications are also available:
 Both replace their standalone original/K6 release rows while keeping historical
 reports. See [GLM 5.3](models/glm5.md#core-views) and
 [Step-5](models/step5.md#core-views) for launch overrides and pending Standard
-fidelity. Whole-core `fp8-compact` is `na` for both: GLM refuses all selected
-block-FP8 roles; Step-5 implements only O projections, not the whole MC core.
+fidelity. Whole-core `fp8-compact` is an explicit opt-in for both with the
+v52d coordinator exports and qualified runtime routes; the selected original
+core alone determines conversion. Unselected native roles and routed experts
+are unchanged; quality/performance remain unmeasured until qualification.
 The main smoke entries use `original`; max K8/K6 comparisons live separately in
 `scripts/bench/release-smoke-v51-mc-core-comparison.json` and do not add
 release-table rows. Card measurements wait for kernel pin #1903.
