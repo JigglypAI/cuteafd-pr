@@ -1343,6 +1343,22 @@ def build(args):
         'tp2', 'tp4', 'tp2-w128', 'tp4-w128']
 
 
+def test_source_routed_layouts_stop_at_tuple_wire_assignment(tmp_path, monkeypatch):
+    source = tmp_path / 'package.py'
+    source.write_text('''
+def build(args):
+    capacities = []
+    layouts = args.layouts.split(',')
+    wire, nvfp4_input = False, False
+    raise AssertionError('must not enter compilation')
+''')
+    monkeypatch.setattr(compare_sm, 'ROOT', tmp_path)
+    scope = SimpleNamespace(PREVIOUS_RELEASE_FLOOR={'GENERIC_SPARK_COUNTS': {'mimo=2'}})
+    monkeypatch.setattr(compare_sm, 'load_file', lambda *args: scope)
+    package = SimpleNamespace(__file__=str(source))
+    assert compare_sm.routed_package_layouts(package, 'mimo', None, 'spark') == ['tp2']
+
+
 def test_spark_routed_groups_follow_shared_width_aliases_and_input_formats():
     cases = {name: args for name, _, args in compare_sm.jobs("all")}
     for geometry in ("mimo", "mimof", "mimop", "glm", "glmf", "qwen4", "step5", "step5_bf16"):

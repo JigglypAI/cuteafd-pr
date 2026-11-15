@@ -497,8 +497,10 @@ def routed_package_layouts(package, geometry, base, role):
     build = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "build")
     selected = []
     for node in build.body:
-        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "wire"
-                                               for target in node.targets):
+        if isinstance(node, ast.Assign) and any(
+                isinstance(name, ast.Name) and name.id == "wire"
+                for target in node.targets
+                for name in (target.elts if isinstance(target, ast.Tuple) else [target])):
             break
         if node.lineno > next(item.lineno for item in build.body if isinstance(item, ast.Assign)
                               and any(isinstance(target, ast.Name) and target.id == "capacities"
