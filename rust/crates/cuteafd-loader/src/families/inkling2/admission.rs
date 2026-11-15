@@ -76,26 +76,35 @@ pub struct FactsRequest<'a> {
     pub resident_weight_limit: ResidentWeights,
 }
 
-/// The installed coordinator package's executor workspace at the unit rows.
-/// No Inkling 2 RTX expert package ships yet (#1930 stage 3), so this names
-/// the missing package; the recipe then refuses onboarding counts above zero
-/// and the plan says so.
-pub fn local_package(storage: &[ExpertStorage], manifest: Option<&Path>, gpus: usize) -> LocalPackage {
-    let formats = storage.iter().map(|s| match s {
-        ExpertStorage::Mxfp8 => "fp8-inkling2-mxfp8", ExpertStorage::Nvfp4 => "fp8-inkling2-nvfp4a4",
-        ExpertStorage::Exl3 { .. } => "exl3-inkling2-k4" }).collect::<std::collections::BTreeSet<_>>();
-    let parent = manifest.and_then(Path::parent).unwrap_or(Path::new("/opt/cuteafd/share"));
-    let installed = formats.iter().all(|name| {
-        let dir = if name.starts_with("exl3") { parent.join(name) } else { parent.join("fp8").join(name) };
-        dir.join("manifest.json").is_file() && (1..=gpus).all(|tp| dir.join(format!("{}tp{tp}", if name.starts_with("exl3") { "rtx-" } else { "" })).is_dir())
-    });
-    if installed {
-        // Workspace sizing from the installed manifest lands with the package (stage 3).
-        return LocalPackage::Missing(format!("Inkling 2 RTX expert packages {formats:?} are installed but their executor \
-            workspace is not yet admitted; onboarding qualifies in stage 3 (#1930)"));
-    }
-    LocalPackage::Missing(format!("no installed Inkling 2 RTX expert package {formats:?} beside {} (#1930 stage 3)",
-        parent.display()))
+/// Shared installed executor owners, never a family scratch estimate. Each
+/// independently retained native backend owns its scratch/output once.
+pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: Option<&Path>,
+    gpus: usize, rows: u64) -> LocalPackage {
+    let workspace = || -> anyhow::Result<LocalPackage> {
+        anyhow::ensure!((1..=2).contains(&gpus), "Inkling local package requires one or two ranks");
+        let mut workspace = [0u64; 2];
+        if let Some(tensors) = catalog.fp8() {
+            let layers = (catalog.routed_experts().first_layer..catalog.routed_experts().layers).collect::<Vec<_>>();
+            let groups = tensors.homogeneous_layers(&layers)?;
+            let bytes = groups.iter().try_fold(0u64, |sum, (view, _)| -> anyhow::Result<u64> {
+                let requests = crate::placement::rtx_onboard::fp8_workspace_requests(view,
+                    manifest, rows, gpus, "inkling2")?;
+                let scratch = *requests.first().context("native package scratch absent")?;
+                let (_, _, bytes) = crate::serving_capacity::fp8moe_tp2_workspace(usize::try_from(scratch)?,
+                    catalog.routed_experts().hidden, usize::try_from(rows)?)?;
+                sum.checked_add(bytes as u64).context("Inkling native backend owners overflow")
+            })?;
+            workspace[..gpus].fill(bytes);
+        } else {
+            let requests = crate::placement::rtx_onboard::expert_workspace_requests(catalog,
+                manifest, rows, gpus, "inkling2")?;
+            let bytes = requests.into_iter().try_fold(0u64, |sum, bytes| sum.checked_add(bytes)
+                .context("Inkling EXL3 local workspace overflow"))?;
+            workspace[..gpus].fill(bytes);
+        }
+        Ok(LocalPackage::Installed { workspace })
+    };
+    workspace().unwrap_or_else(|error| LocalPackage::Missing(format!("{error:#}")))
 }
 
 /// Spark charges per onboarding count and rank: header-exact expert slices
@@ -186,7 +195,12 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
         format!("Inkling 2 routed expert inventory refused: {error:#}"),
         "Provide every routed layer's fused MXFP8/NVFP4 headers or per-expert EXL3 modules."))?;
     let storage = experts.iter().map(|layer| layer.storage.expect("inventory names every layer's storage")).collect::<Vec<_>>();
-    let local = local_package(&storage, request.manifest_path, gpus);
+    let catalog = match &request.checkpoint.view {
+        Some(view) => crate::read_expert_catalog_view(view),
+        None => crate::read_expert_catalog(&request.checkpoint.snapshot),
+    }.map_err(|error| refused(format!("Inkling 2 shared expert catalog refused: {error:#}"),
+        "Provide complete expert headers for the selected checkpoint view."))?;
+    let local = local_package(&catalog, request.manifest_path, gpus, shape.rows.max(u64::from(shared::DECODE_ROWS)));
     // Mixed native checkpoints (NVFP4 then MXFP8) keep the per-layer native
     // ingress; the link is sized for its widest request row (BF16).
     let ingress = if storage.iter().all(|s| *s == ExpertStorage::Mxfp8) { cuteafd_core::SparkIngress::Fp8K32 }

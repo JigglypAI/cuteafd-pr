@@ -69,8 +69,16 @@ pub fn expert_workspace_requests(catalog: &crate::OfficialV41Catalog, manifest: 
 /// installed) plus the TP2 BF16 partial plane.
 fn fp8_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, rows: u64,
     tp: usize, family: &str) -> Result<Vec<u64>> {
-    let shape = catalog.routed_experts();
-    let fp8 = catalog.fp8().context("fp8moe expert catalog missing")?;
+    fp8_workspace_requests(catalog.fp8().context("fp8moe expert catalog missing")?, manifest, rows, tp, family)
+}
+
+/// One homogeneous native catalog view, including mixed-format checkpoints.
+/// Returns the same requests as `expert_workspace_requests`, without reopening
+/// the checkpoint or replacing its selected view.
+pub fn fp8_workspace_requests(fp8: &crate::formats::fp8_experts::Fp8ExpertTensors,
+    manifest: Option<&std::path::Path>, rows: u64, tp: usize, family: &str) -> Result<Vec<u64>> {
+    ensure!([1, 2].contains(&tp) && (1..=4096).contains(&rows), "RTX workspace geometry");
+    let shape = fp8.shape();
     let name = fp8.format().package_name(family);
     // Beside the program manifest (a WIP slot's share), else the image lib.
     let parent = manifest.unwrap_or(std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json")).parent()

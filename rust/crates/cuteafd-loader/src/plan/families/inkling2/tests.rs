@@ -173,6 +173,37 @@ fn exl3_checkpoint_accepts_per_expert_k4_modules_split_by_row_parity() {
 }
 
 #[test]
+fn installed_local_native_owners_use_shared_workspace_requests_once() -> anyhow::Result<()> {
+    use crate::families::inkling2::admission::local_package;
+    use crate::placement::families::inkling2::LocalPackage;
+    let (dir, _, _) = fixture(Fixture::Mixed);
+    let catalog = crate::read_expert_catalog(dir.path())?;
+    let install = tempfile::tempdir()?;
+    let share = install.path().join("share");
+    std::fs::create_dir_all(&share)?;
+    let manifest = share.join("PROGRAMS.json");
+    let rows = 80u64;
+    assert!(matches!(local_package(&catalog, Some(&manifest), 2, rows), LocalPackage::Missing(_)));
+    for (name, weights, input, scratch) in [("fp8-inkling2-nvfp4a4", "nvfp4", "bf16", 12345u64),
+        ("fp8-inkling2-mxfp8", "mxfp8", "wire", 23456)] {
+        let root = install.path().join("lib/fp8").join(name);
+        std::fs::create_dir_all(root.join("tp2"))?;
+        std::fs::write(root.join("manifest.json"), serde_json::to_vec(&serde_json::json!({
+            "layouts":{"tp2":{"abi_version":6,"weights":weights,"input":input,
+                "activation":"situ","projection":"bf16","swiglu_alpha":1.0,"swiglu_beta":0.0,
+                "swiglu_limit":0.0,"capacities":[{"capacity":80,"scratch_bytes":scratch}]}}}))?)?;
+    }
+    let LocalPackage::Installed { workspace } = local_package(&catalog, Some(&manifest), 2, rows)
+        else { anyhow::bail!("complete native package owners were not admitted") };
+    let output = rows * catalog.routed_experts().hidden as u64 * 2;
+    assert_eq!(workspace, [12345 + 23456 + 2 * output; 2]);
+    // Each native group is independently retained; no TP2 output from the
+    // shared request list is charged again beside each backend's output.
+    assert!(matches!(local_package(&catalog, Some(&manifest), 2, 81), LocalPackage::Missing(_)));
+    Ok(())
+}
+
+#[test]
 fn structural_open_names_missing_tensors_and_accepts_reports_drift_per_tensor() {
     let (dir, small, tensors) = fixture(Fixture::Mxfp8);
     // A missing conv tensor is a typed open error naming it.
