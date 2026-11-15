@@ -899,7 +899,7 @@ fn k31_native_indexer_headers_are_required_and_never_core_quantized() -> Result<
     let checkpoint = Checkpoint::open(dir.path())?;
     assert!(KIMI_K3.detect(&checkpoint));
     let model = Model::open(&checkpoint)?;
-    assert!(!model.native_serving_admission());
+    assert!(model.native_serving_admission());
     assert_eq!(model.spec.layers.iter().filter(|layer| matches!(layer.attention, AttentionKind::MlaDsa { indexer: true })).count(), 24);
     assert!(model.core.projections.is_empty());
     let index_bytes = 24 * (4096*1536 + 128*7168 + 32*7168 + 2*128) * 2;
