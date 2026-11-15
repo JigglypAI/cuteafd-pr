@@ -1386,8 +1386,10 @@ impl DeviceCache {
             });
             records.into_iter().take(16).map(|record| self.row(record, now)).collect()
         };
-        self.ranked_hits = ranked(false);
-        self.ranked_churn = ranked(true);
+        let hits = ranked(false);
+        let churn = ranked(true);
+        self.ranked_hits = hits;
+        self.ranked_churn = churn;
         self.ranked_at = Instant::now();
     }
 
