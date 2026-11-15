@@ -1061,7 +1061,8 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         &std::fs::read(root.join("benchmarks/current-matrix.json")).unwrap()).unwrap();
     let retired = retired_configs(&matrix);
     // Original detector baseline, extended with verified published MC configurations
-    // and the deliberately added pinned MiniMax qualification checkpoint (#2081).
+    // and deliberate pinned qualifications. Keep old MC revisions until their
+    // historical live matrix cards are replaced by repaired #2207 revisions.
     let baseline: serde_json::Value = serde_json::from_str(include_str!(
         "fixtures/family-detection-devd6aecfcb7.json")).unwrap();
     let expected = baseline["results"].as_array().unwrap().iter().map(|entry|
@@ -1120,8 +1121,8 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         (expected_absent.0.to_owned(), expected_absent.1.to_owned())]));
     assert_eq!(installed.iter().map(|(model, revision)| (model.as_str(), revision.as_str()))
         .collect::<std::collections::BTreeSet<_>>(), expected_installed);
-    assert_eq!(tested, 32, "installed checkpoint revision set changed");
-    eprintln!("family detection baseline d6aecfcb7 plus deliberate MiniMax (#2081), Muse MC and Kimi K3.1 MC entries: {tested} installed checkpoint revisions verified");
+    assert_eq!(tested, 35, "installed checkpoint revision set changed (including three repaired MC revisions)");
+    eprintln!("family detection baseline d6aecfcb7 plus deliberate MiniMax (#2081), Muse MC, Kimi K3.1 MC and repaired MC entries: {tested} installed checkpoint revisions verified");
 }
 
 fn retired_configs(matrix: &serde_json::Value) -> std::collections::BTreeSet<String> {

@@ -46,7 +46,8 @@ revisions restore native BF16 MTP core matrices in `original`; stored compact
 views retain their existing K4 MTP core. MTP routed experts are unchanged.
 GLM 5.3 and GLM Flash use external drafters: their unused native MTP core and
 experts are neither loaded nor charged, and are not converted by `fp8-compact`.
-Step-5 executes its selected MTP core in one separately charged packed arena. ML4 stays K6-only for quantized core storage;
+Step-5 executes its selected MTP core in one separately charged packed arena.
+ML4 stays K6-only for quantized core storage;
 its FP8 original has no quantized core. Plain checkpoints support only
 `original`, including checkpoints that previously accepted Flash `fp8-compact`.
 GLM 5.3 MC (`2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e`) and Step-5 MC

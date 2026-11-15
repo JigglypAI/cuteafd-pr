@@ -19,10 +19,10 @@ views run through the shared dense trellis programs. Gate and up stay separate
 projections, and the head-split
 o_proj reduces its F32 partials before one output rotation. Head-wise
 attention gates, the sparse indexer, routers, norms, embeddings and the vision
-tower stay BF16/F32 exactly as shipped. At the pinned revision, the three MTP stages are K4
-throughout, including each stage's own vocabulary head. Repaired revisions
-restore their source BF16 non-routed matrices in the original view; stored
-compact views retain their existing K4 MTP matrices.
+tower stay BF16/F32 exactly as shipped. The repaired original view restores
+source BF16 non-routed matrices for all three MTP stages, including each
+stage's own vocabulary head. Stored compact views retain their existing
+K4 MTP matrices; routed expert encodes are unchanged.
 
 Everything is read from `config.json` and the safetensors headers;
 `quantize_config.json` is only cross-checked. `cuteafd plan` finds the

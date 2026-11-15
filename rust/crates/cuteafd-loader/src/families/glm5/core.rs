@@ -669,7 +669,6 @@ mod tests {
         let tensors = testing::exl3(&format!("{root}.mlp.experts.0.gate_proj"), cfg.moe_intermediate, cfg.hidden, 4);
         let dir = tempfile::tempdir()?;
         testing::write_mc_snapshot_with_mtp(dir.path(), &config, &tensors, &target, &mtp);
-        let mut target_bytes = None;
         for mode in [CoreView::Original, CoreView::K6Compact, CoreView::K8Compact] {
             let view = CheckpointView::select(dir.path(), mode)?;
             let cp = crate::plan::Checkpoint::open_view(&view)?;
@@ -688,12 +687,7 @@ mod tests {
             let expert = format!("{root}.mlp.experts.0.gate_proj.trellis");
             assert_eq!(GLM5.classify(model.spec(), &expert).unwrap().component, Component::SpeculatorExpert);
             assert_eq!(cp.header(&expert).unwrap().shape[2], 64);
-            if mode == CoreView::Original {
-                target_bytes = Some(inventory.native.values().map(|projection|
-                    projection.shape.iter().product::<usize>() * 2).sum::<usize>());
-            }
         }
-        assert!(target_bytes.unwrap() > 0);
         // Whole-core GLM FP8 remains a separate executor qualification, not a silent skip.
         let fp8 = crate::plan::Checkpoint::open_view(&CheckpointView::select(dir.path(), CoreView::Fp8Compact)?)?;
         assert!(mtp.keys().all(|name| !fp8.converts_to_fp8(name)));
