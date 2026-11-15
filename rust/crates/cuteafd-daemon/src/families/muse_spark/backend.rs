@@ -388,7 +388,7 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
     fn prefix_cache(&self, args: &PrefixArgs, lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>, ()>)> {
         ensure!(args.prefix_partial == Toggle::Off, "Muse restores exact frontiers only");
         let family = MusePrefix::new(self.cfg, self.ranks, &self.streams, self.slots as u64, self.pages,
-            args.mark_rule(lanes).slots(super::prefix::mark_bytes(self.cfg, self.ranks.len())?))?;
+            args.mark_rule(lanes).slots(super::prefix::mark_bytes_with_format(self.cfg, self.ranks.len(), self.ranks[0].kv.format)?))?;
         let layout = family.layout();
         // The host tier copies the registered record pools and mark arenas.
         let mut admitted = args.clone();

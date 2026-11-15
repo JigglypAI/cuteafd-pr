@@ -55,27 +55,32 @@ pub(crate) enum LayerKv {
 pub(crate) struct RankPrograms<'a> {
     bound: BTreeMap<String, Program<'a>>,
     prefix: &'static str,
+    format: cuteafd_loader::families::muse_spark::cache::MuseKvCache,
     exact_cap: usize,
 }
 
 impl<'a> RankPrograms<'a> {
-    pub(crate) fn bind(programs: &'a Programs<'a>, ranks: usize) -> Result<Self> {
+    pub(crate) fn bind(programs: &'a Programs<'a>, ranks: usize,
+        format: cuteafd_loader::families::muse_spark::cache::MuseKvCache) -> Result<Self> {
         use crate::shared::prefill_packing::{coordinator_row_cap, ProgramRows};
-        let inventory = programs::required(ranks)?;
+        let inventory = programs::required_with_format(ranks, format)?;
         let exact_cap = coordinator_row_cap(programs, inventory.iter().map(|(name, _)| {
-            let role = if name.contains("attention_full_") || name.contains("attention_swa_") || name.ends_with("swa_commit") {
+            let role = if name.contains("attention_full_") || name.contains("attention_swa_") || name.ends_with("swa_commit") || name.ends_with("swa_commit_kv_fp8") {
                 ProgramRows::SequenceLocal
             } else { ProgramRows::PackedRows };
             (name.as_str(), role)
         }), usize::MAX)?;
-        Ok(Self { bound: programs::bind(programs, ranks)?.into_iter().collect(), prefix: programs::prefix(ranks)?, exact_cap })
+        Ok(Self { bound: programs::bind_with_format(programs, ranks, format)?.into_iter().collect(), prefix: programs::prefix(ranks)?, format, exact_cap })
     }
 
     pub(crate) fn packed_cap(&self) -> usize { self.exact_cap }
 
     /// A geometry-free (`muse_`) or per-heads (`muse_`/`muse2_`) program.
     fn get(&self, stem: &str) -> Result<&Program<'a>> {
-        let heads = format!("{}_{stem}", self.prefix);
+        let suffix = if self.format == cuteafd_loader::families::muse_spark::cache::MuseKvCache::Fp8
+            && (stem.starts_with("qk_norm_") || stem.starts_with("attention_full_")
+                || stem.starts_with("attention_swa_") || stem == "swa_commit") { "_kv_fp8" } else { "" };
+        let heads = format!("{}_{stem}{suffix}", self.prefix);
         self.bound.get(&heads).or_else(|| self.bound.get(&format!("muse_{stem}")))
             .with_context(|| format!("Muse program {stem} not bound"))
     }

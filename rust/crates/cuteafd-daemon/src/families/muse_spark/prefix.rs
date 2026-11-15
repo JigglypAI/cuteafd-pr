@@ -51,7 +51,12 @@ impl crate::shared::qwen::scheduler::Placement for Placement {
 
 /// Bytes of one mark summed over the coordinator ranks (each keeps its KV heads).
 pub(crate) fn mark_bytes(cfg: &MuseSparkConfig, ranks: usize) -> Result<usize> {
-    let cache = MuseCacheLayout::new(cfg, ranks)?;
+    mark_bytes_with_format(cfg, ranks, Default::default())
+}
+
+pub(crate) fn mark_bytes_with_format(cfg: &MuseSparkConfig, ranks: usize,
+    format: cuteafd_loader::families::muse_spark::cache::MuseKvCache) -> Result<usize> {
+    let cache = MuseCacheLayout::with_format(cfg, ranks, format)?;
     Ok(usize::try_from(MuseStateLayout::new(cfg, &cache, 1)?.mark_bytes())? * ranks)
 }
 
@@ -79,7 +84,9 @@ impl<'r, 'a> MusePrefix<'r, 'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
         ensure!(!ranks.is_empty() && streams.len() == ranks.len(), "Muse prefix ranks and streams");
         let library = ranks[0].device.library;
-        let cache = MuseCacheLayout::new(cfg, ranks.len())?;
+        let format = ranks[0].kv.format;
+        ensure!(ranks.iter().all(|rank| rank.kv.format == format), "Muse prefix KV formats differ");
+        let cache = MuseCacheLayout::with_format(cfg, ranks.len(), format)?;
         let state = MuseStateLayout::new(cfg, &cache, sequences)?;
         let record = usize::try_from(cache.record_bytes)?;
         let mut full = Vec::new();
@@ -136,7 +143,7 @@ impl<'r, 'a> MusePrefix<'r, 'a> {
 impl PrefixFamily for MusePrefix<'_, '_> {
     type Placement = Placement;
 
-    fn record_format(&self) -> &'static str { "muse_bf16_kv_v1" }
+    fn record_format(&self) -> &'static str { self.ranks[0].kv.format.record_format() }
 
     fn layout(&self) -> FamilyLayout {
         FamilyLayout { page_rows: PAGE_ROWS as usize, pages: self.pages, page_bytes: self.page_bytes(),
@@ -313,12 +320,14 @@ mod tests {
     fn mark_arena_equals_the_charge() -> anyhow::Result<()> {
         use cuteafd_loader::families::muse_spark::{cache::{MuseCacheLayout, MuseStateLayout}, MuseSparkConfig};
         let cfg = MuseSparkConfig::from_hf(&cuteafd_loader::plan::testing::muse_spark_config())?;
-        for ranks in [1usize, 2] {
-            let state = MuseStateLayout::new(&cfg, &MuseCacheLayout::new(&cfg, ranks)?, 16)?;
-            let charged = cuteafd_loader::placement::families::muse_spark::mark_bytes(&cfg, 1) / ranks as u64;
-            assert_eq!(state.mark_bytes(), charged, "ranks {ranks}");
-            // The backend sizes the mark rule with the same bytes admission used (one-rank total).
-            assert_eq!(super::mark_bytes(&cfg, ranks)? as u64, cuteafd_loader::placement::families::muse_spark::mark_bytes(&cfg, 1));
+        for (ranks, format) in [1usize, 2].into_iter().flat_map(|ranks|
+            [cuteafd_loader::families::muse_spark::cache::MuseKvCache::Bf16,
+             cuteafd_loader::families::muse_spark::cache::MuseKvCache::Fp8].into_iter().map(move |format| (ranks, format))) {
+            let state = MuseStateLayout::new(&cfg, &MuseCacheLayout::with_format(&cfg, ranks, format)?, 16)?;
+            let aggregate = cuteafd_loader::placement::families::muse_spark::mark_bytes_with_format(&cfg, 1, format);
+            assert_eq!(state.mark_bytes(), aggregate / ranks as u64, "ranks {ranks} {format:?}");
+            // The backend sizes the mark rule with the same aggregate bytes admission uses.
+            assert_eq!(super::mark_bytes_with_format(&cfg, ranks, format)? as u64, aggregate);
         }
         Ok(())
     }

@@ -1861,6 +1861,11 @@ if [[ $family == mimo_v2 ]]; then
     *) echo "DECODE_GRAPHS must be on or off" >&2; exit 2 ;;
   esac
 fi
+if [[ "$family" == muse_spark ]]; then
+  muse_kv_cache="$(get KV_CACHE bf16)"
+  case "$muse_kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
+  family_args+=(--kv-cache "$muse_kv_cache")
+fi
 if [[ "$family" == qwen3_5 ]]; then
   dense_qwen_kv_cache="$(get KV_CACHE fp8)"
   case "$dense_qwen_kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
@@ -2482,6 +2487,7 @@ audio_encoder_hash=""
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
   fi
   if [[ "$family" == muse_spark ]]; then
+    plan_draft_args+=(--kv-cache "$muse_kv_cache")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
     # The serve command's partial-reply overrides and drafter rings, so plan == serve admission.

@@ -99,7 +99,7 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
     ];
     let (host_total, host_available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
     let built = super::startup::admit(super::startup::Options {
-        host: shared::HostInput { total: host_total, available: host_available, reserve: 8 << 30,
+        kv_cache: Default::default(), host: shared::HostInput { total: host_total, available: host_available, reserve: 8 << 30,
             prefix_bytes: Some(0), prefix_entries: 0, media_bytes: Some(0), device_sampling: true },
         cfg: &cfg, core: &core,
         projections: cuteafd_loader::families::muse_spark::weight_layout::projections_with_manifest(

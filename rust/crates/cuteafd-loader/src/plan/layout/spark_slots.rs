@@ -87,29 +87,39 @@ fn native_groups(input: &super::super::PlanInput, family: &str, working: &SparkW
 
 /// One FP8-family owner: groups share one stream and one scratch arena sized
 /// for the largest group package, while each group keeps its own I/O planes.
+/// A prefill owner whose packages have a row-addressed program also charges
+/// its merged-wave tables and arena at the widest merged wave
+/// (`segment_rows`) and its staged input slices for every buffered unit.
 fn fp8_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, formats: &[(ExpertFormat, u32)],
     extent: cuteafd_core::OwnerExtent) -> anyhow::Result<cuteafd_core::OwnerBytes> {
+    use cuteafd_core::spark_executions::{segment_input_bytes, segment_scratch_bytes, SegmentArithmetic, SEGMENT_MAX_ROWS};
     let mut scratch = 0;
     let mut io = 0u64;
     let mut address_staging = 0;
+    let hidden = u64::from(geometry.hidden);
     for &(format, width) in formats {
         scratch = scratch.max(group_scratch(family, format, extent.compiled)?);
         io += group_io_bytes(family, format, geometry, extent.capacity);
-        let minimum = match format { ExpertFormat::Fp8Block128 => 769, ExpertFormat::Mxfp4 => 641, _ => u32::MAX };
-        if let Some(rows) = extent.segment_rows().filter(|_| extent.staging_rows >= minimum) {
+        // Installed row-addressed recipes and their smallest member units.
+        let (minimum, arithmetic) = match format {
             // Every installed form is retained; W8A16 is the largest stream arena.
-            let bytes = cuteafd_core::spark_executions::segment_scratch_bytes(geometry.hidden, geometry.experts,
-                geometry.topk, width.checked_mul(2).context("segment activation width overflow")?, rows,
-                cuteafd_core::spark_executions::SEGMENT_MAX_ROWS).context("segment scratch overflow")?;
-            scratch = scratch.max(bytes);
-            io += u64::from(rows) * (16 + u64::from(geometry.topk) * 8);
-            let sibling = format == ExpertFormat::Fp8Block128 && matches!(family, "mimo_v2" | "step5");
-            let old_input = u64::from(extent.capacity) * if sibling { u64::from(geometry.hidden) * 2 }
-                else { u64::from(geometry.hidden) * 33 / 32 };
-            io += cuteafd_core::spark_executions::segment_input_bytes(extent.capacity, rows,
-                geometry.hidden, sibling).context("segmented input extent overflow")? - old_input;
-            address_staging += u64::from(extent.staging_rows) * 16;
-        }
+            ExpertFormat::Fp8Block128 => (769, SegmentArithmetic::Stream { act_row_bytes: width * 2 }),
+            ExpertFormat::Mxfp4 => (641, SegmentArithmetic::Stream { act_row_bytes: width * 2 }),
+            ExpertFormat::Nvfp4 => (1, SegmentArithmetic::Nvfp4A4 { slice: width }),
+            _ => continue,
+        };
+        let (Some(rows), Some(staged)) = (extent.segment_rows().filter(|_| extent.staging_rows >= minimum),
+            extent.staged_rows()) else { continue };
+        let bytes = segment_scratch_bytes(geometry.hidden, geometry.experts, geometry.topk, arithmetic, rows,
+            SEGMENT_MAX_ROWS).context("segment scratch overflow")?;
+        scratch = scratch.max(bytes);
+        io += u64::from(rows) * (16 + u64::from(geometry.topk) * 8);
+        let row = if format == ExpertFormat::Nvfp4 { 2 * hidden } else { hidden + hidden / 32 };
+        let sibling = (format == ExpertFormat::Fp8Block128 && matches!(family, "mimo_v2" | "step5")).then_some(2 * hidden);
+        let old_input = u64::from(extent.capacity) * sibling.unwrap_or(row);
+        io += segment_input_bytes(extent.capacity, staged, row.try_into()?, sibling.map(u32::try_from).transpose()?)
+            .context("segmented input extent overflow")? - old_input;
+        address_staging += u64::from(extent.staging_rows) * 16;
     }
     Ok(cuteafd_core::OwnerBytes { scratch, io,
         pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 * formats.len() as u64 + address_staging })
@@ -525,35 +535,43 @@ mod tests {
     }
 
     #[test]
-    fn segmented_prefill_charges_admitted_rows_and_each_actual_rank_width() -> anyhow::Result<()> {
+    fn segmented_prefill_charges_merged_waves_staged_units_and_each_actual_rank_width() -> anyhow::Result<()> {
+        use cuteafd_core::spark_executions::{segment_input_bytes, segment_scratch_bytes, SegmentArithmetic};
         let geometry = cuteafd_core::ExpertGeometry::STEP5;
         let singleton = extent(2752, 4096);
         let grouped = cuteafd_core::OwnerExtent { buffered_units: 3, ..singleton };
-        for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4] {
+        let hidden = u64::from(geometry.hidden);
+        for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4, ExpertFormat::Nvfp4] {
             for width in [320, 384, 1024] {
-                let family = if format == ExpertFormat::Mxfp4 { "mimo_v2" } else { "step5" };
+                let family = match format { ExpertFormat::Mxfp4 => "mimo_v2", _ => "step5" };
                 let formats = [(format, width)];
                 let one = fp8_owner_bytes(family, geometry, &formats, singleton)?;
                 let three = fp8_owner_bytes(family, geometry, &formats, grouped)?;
-                let exact = cuteafd_core::spark_executions::segment_scratch_bytes(
-                    geometry.hidden, geometry.experts, geometry.topk, width * 2, 8256, 16384).unwrap();
+                let arithmetic = if format == ExpertFormat::Nvfp4 { SegmentArithmetic::Nvfp4A4 { slice: width } }
+                    else { SegmentArithmetic::Stream { act_row_bytes: width * 2 } };
+                // One merged launch holds two units (5504); all three stage (8256).
+                let exact = segment_scratch_bytes(geometry.hidden, geometry.experts, geometry.topk, arithmetic,
+                    5504, 8192).unwrap();
                 assert_eq!(three.scratch, one.scratch.max(exact));
-                let sibling = format == ExpertFormat::Fp8Block128;
-                let old_input = u64::from(singleton.capacity) * if sibling { u64::from(geometry.hidden) * 2 }
-                    else { u64::from(geometry.hidden) * 33 / 32 };
-                let input_delta = cuteafd_core::spark_executions::segment_input_bytes(singleton.capacity,
-                    8256, geometry.hidden, sibling).unwrap() - old_input;
-                assert_eq!(three.io - one.io, 8256 * (16 + 8 * u64::from(geometry.topk)) + input_delta);
+                let row = if format == ExpertFormat::Nvfp4 { 2 * hidden } else { hidden * 33 / 32 };
+                let sibling = (format == ExpertFormat::Fp8Block128).then_some(2 * hidden);
+                let old_input = u64::from(singleton.capacity) * sibling.unwrap_or(row);
+                let input_delta = segment_input_bytes(singleton.capacity, 8256, row as u32,
+                    sibling.map(|b| b as u32)).unwrap() - old_input;
+                assert_eq!(three.io - one.io, 5504 * (16 + 8 * u64::from(geometry.topk)) + input_delta);
                 assert_eq!(three.pinned_staging - one.pinned_staging, 2752 * 16);
-                // Negative control: the compiled bound is not the allocation.
-                let overcharged = cuteafd_core::spark_executions::segment_scratch_bytes(
-                    geometry.hidden, geometry.experts, geometry.topk, width * 2, 16384, 16384).unwrap();
-                assert!(exact < overcharged);
+                // Negative controls: neither every buffered unit nor the code
+                // bound is one launch's allocation.
+                for rows in [8192] {
+                    assert!(exact < segment_scratch_bytes(geometry.hidden, geometry.experts, geometry.topk,
+                        arithmetic, rows, 8192).unwrap());
+                }
                 let decode = cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Decode(0), ..grouped };
                 assert_eq!(fp8_owner_bytes(family, geometry, &formats, decode)?, one);
             }
         }
-        for format in [ExpertFormat::Bf16, ExpertFormat::Nvfp4] {
+        {
+            let format = ExpertFormat::Bf16;
             let formats = [(format, 384)];
             assert_eq!(fp8_owner_bytes("step5", geometry, &formats, singleton)?,
                 fp8_owner_bytes("step5", geometry, &formats, grouped)?);

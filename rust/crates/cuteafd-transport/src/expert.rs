@@ -208,6 +208,10 @@ impl<'a> BackboneRequest<'a> {
     pub fn hidden(&self) -> &'a [u8] {
         self.view.hidden_payload()
     }
+    /// The representation of the hidden rows (the endpoint's ingress dtype).
+    pub fn input_dtype(&self) -> ExpertV2Dtype {
+        self.view.header.hidden_dtype
+    }
     pub fn output_dtype(&self) -> ExpertV2Dtype {
         combined_output_dtype(self.view.header.flags)
     }
