@@ -59,6 +59,7 @@ pub enum ModelEncoding {
     /// and `[TOOL_CALLS]name[ARGS]{json}` calls.
     Mistral(Arc<mistral::MistralEncoding>),
     MiniMax(Arc<minimax::MiniMaxEncoding>),
+    Inkling(Arc<inkling2::InklingEncoding>),
 }
 
 impl ModelEncoding {
@@ -83,6 +84,7 @@ impl ModelEncoding {
             Self::Muse(encoding) => encoding.tokens().eos.clone(),
             Self::Mistral(encoding) => encoding.tokens().eos.clone(),
             Self::MiniMax(encoding) => encoding.tokens().eos.clone(),
+            Self::Inkling(encoding) => encoding.tokens().eos.clone(),
         }
     }
 
@@ -91,7 +93,7 @@ impl ModelEncoding {
             Self::DeepseekV4 | Self::DeepseekV41 => Some(DEEPSEEK_THINK_CLOSE_TOKEN_ID),
             Self::Glm(encoding) => Some(encoding.tokens().think_close),
             Self::Qwen(encoding) => Some(encoding.tokens().think_close),
-            Self::Kimi(_) | Self::Mistral(_) | Self::MiniMax(_) => None,
+            Self::Kimi(_) | Self::Mistral(_) | Self::MiniMax(_) | Self::Inkling(_) => None,
             Self::Step5(encoding) => Some(encoding.tokens().think_close),
             Self::Muse(_) => None,
         }
@@ -209,13 +211,14 @@ impl ModelProfile {
     /// Token ids that end generation for one request.
     fn stop_token_ids(&self, tools_declared: bool) -> Vec<u32> {
         match &self.encoding {
-            ModelEncoding::Glm(_) | ModelEncoding::Qwen(_) | ModelEncoding::Step5(_) | ModelEncoding::Mistral(_) | ModelEncoding::MiniMax(_) => {
+            ModelEncoding::Glm(_) | ModelEncoding::Qwen(_) | ModelEncoding::Step5(_) | ModelEncoding::Mistral(_) | ModelEncoding::MiniMax(_) | ModelEncoding::Inkling(_) => {
                 let mut ids = match &self.encoding {
                     ModelEncoding::Glm(encoding) => encoding.stop_token_ids(tools_declared),
                     ModelEncoding::Qwen(encoding) => encoding.stop_token_ids(tools_declared),
                     ModelEncoding::Step5(encoding) => encoding.stop_token_ids(tools_declared),
                     ModelEncoding::Mistral(encoding) => encoding.stop_token_ids(tools_declared),
                     ModelEncoding::MiniMax(encoding) => encoding.stop_token_ids(tools_declared),
+                    ModelEncoding::Inkling(encoding) => encoding.stop_token_ids(tools_declared),
                     _ => unreachable!(),
                 };
                 ids.extend(&self.eos_token_ids);
@@ -247,7 +250,7 @@ mod admission;
 mod constraints;
 mod tools;
 pub mod chat;
-use chat::{deepseek, glm5, kimi, muse, mistral, minimax, qwen4, step5};
+use chat::{deepseek, glm5, inkling2, kimi, muse, mistral, minimax, qwen4, step5};
 pub use constraints::NativeConstraint;
 mod images;
 pub mod media;
@@ -644,6 +647,7 @@ enum Templated {
     Muse(Arc<muse::MuseEncoding>),
     Mistral(Arc<mistral::MistralEncoding>),
     MiniMax(Arc<minimax::MiniMaxEncoding>),
+    Inkling(Arc<inkling2::InklingEncoding>),
 }
 
 impl Templated {
@@ -667,12 +671,17 @@ impl Templated {
             // without a `[THINK]` block, so output starts as content.
             Self::Mistral(_) => Ok(glm5::GlmThinking { enabled: true, effort: mistral::prompt::effort(body)? }),
             Self::MiniMax(_) => Ok(glm5::GlmThinking { enabled: true, effort: minimax::prompt::effort(body)? }),
+            Self::Inkling(_) => {
+                let effort = inkling2::prompt::effort(body)?;
+                Ok(glm5::GlmThinking { enabled: effort != "none" && effort.as_f64() != Some(0.0), effort: None })
+            }
         }
     }
 }
 
 /// The family's generated-text parser in front of the OpenAI chunk generator.
 enum OutputProcessor {
+    Inkling(glm5::GlmStreamProcessor<ChatGenerator, inkling2::InklingOutputParser>),
     Deepseek(glm5::GlmStreamProcessor<ChatGenerator, deepseek::parser::DeepseekOutputParser>),
     Glm(glm5::GlmStreamProcessor<ChatGenerator>),
     Qwen(glm5::GlmStreamProcessor<ChatGenerator, qwen4::QwenOutputParser>),
@@ -694,6 +703,7 @@ impl OutputProcessor {
             Self::Muse(processor) => Box::pin(processor.process(input)),
             Self::Mistral(processor) => Box::pin(processor.process(input)),
             Self::MiniMax(processor) => Box::pin(processor.process(input)),
+            Self::Inkling(processor) => Box::pin(processor.process(input)),
         }
     }
 }
@@ -840,6 +850,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         ModelEncoding::Muse(encoding) => Some(Templated::Muse(encoding.clone())),
         ModelEncoding::Mistral(encoding) => Some(Templated::Mistral(encoding.clone())),
         ModelEncoding::MiniMax(encoding) => Some(Templated::MiniMax(encoding.clone())),
+        ModelEncoding::Inkling(encoding) => Some(Templated::Inkling(encoding.clone())),
         ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => None,
     };
     let assistance = match body.get("tool_decoding_assistance") {
@@ -919,6 +930,11 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             body["thinking"] = json!({"type": kind.to_ascii_lowercase()});
         }
     }
+    // The adapter only accepts a subset of named efforts; Inkling already validated
+    // and retained its native numeric/named value in glm_request.
+    if matches!(&glm_request, Some((Templated::Inkling(_), _, _))) {
+        if let Some(object) = body.as_object_mut() { object.remove("reasoning_effort"); }
+    }
     let mut parsed: ChatCompletionRequest = serde_json::from_value(body).map_err(Rejection::bad)?;
     let include_usage = parsed.include_usage();
     let parallel = parsed.parallel_tool_calls.unwrap_or(true);
@@ -958,12 +974,14 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         Some((Templated::Muse(_), _, _)) => tools::ToolSyntax::MuseAtem,
         Some((Templated::Mistral(_), _, _)) => tools::ToolSyntax::MistralCalls,
         Some((Templated::MiniMax(_), _, _)) => tools::ToolSyntax::MiniMaxXml,
+        Some((Templated::Inkling(_), _, _)) => tools::ToolSyntax::InklingJson,
         None => tools::ToolSyntax::Dsml,
     };
     let tool_constraints = tools::ToolConstraints::new(&converted.conversation.tools,
         converted.conversation.tool_choice, selection.required, parallel,
         assistance || response_format.as_ref().is_some_and(|v| v["type"] != "text"), syntax).map_err(Rejection::bad)?;
     let constraint = match (&profile.encoding, profile.encoding.think_close_token_id()) {
+        (ModelEncoding::Inkling(_), _) => constraints::inkling_response_constraint(response_format.clone(), tool_constraints.as_ref()),
         (ModelEncoding::Muse(_), _) if !converted.conversation.thinking_mode =>
             constraints::response_constraint(response_format.clone(), false, tool_constraints.as_ref(), 0),
         (ModelEncoding::Muse(_), _) => constraints::muse_response_constraint(response_format.clone(), tool_constraints.as_ref()),
@@ -1075,6 +1093,16 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
                 stop_sequences: converted.parsing_options.stop_sequences.clone() }, stream_args);
             (prompt, Vec::new(), OutputProcessor::Mistral(glm5::GlmStreamProcessor::new(generator, parser)))
+        }
+        Some((Templated::Inkling(encoding), raw, _thinking)) => {
+            let options = inkling2::InklingPromptOptions {
+                tool_names: converted.conversation.tools.iter().map(|tool| tool.name.clone()).collect() };
+            let prompt = encoding.render(&raw, &options).map_err(Rejection::bad)?;
+            let parser = inkling2::InklingOutputParser::new(inkling2::InklingParserOptions {
+                tools: (tools_declared && converted.conversation.tool_choice != deepseek_recipe_core::tools::ToolChoice::None)
+                    .then(|| converted.conversation.tools.clone()),
+                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+            (prompt, Vec::new(), OutputProcessor::Inkling(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::MiniMax(encoding), raw, _thinking)) => {
             let options = minimax::MiniMaxPromptOptions {
