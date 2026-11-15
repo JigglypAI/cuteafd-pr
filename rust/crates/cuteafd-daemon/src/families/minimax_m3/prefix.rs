@@ -191,7 +191,7 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
                 None => {
                     if len != 0 { return Err("MiniMax speculative prefix restore requires an exact window mark".into()); }
                     draft.frontiers.borrow_mut()[placement.slot]=0;
-                draft.skipped_ends.borrow_mut()[placement.slot]=0;
+                    draft.skipped_ends.borrow_mut()[placement.slot]=0;
                     draft.drafter.reset_context(placement.slot,0)?;
                 }
             }

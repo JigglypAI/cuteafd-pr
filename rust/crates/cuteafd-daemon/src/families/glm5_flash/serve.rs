@@ -1726,6 +1726,7 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
     }
     let timer = Instant::now();
     let end = chunk_end(p);
+    let draft_end = draft_context_end(p, p.placement.len);
     let chunk = &p.tokens[p.done..end];
     // One sample around the first text and first media prefill only;
     // no extra synchronization and no steady-state decode sampling.
@@ -1733,7 +1734,6 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
     let memory_before = first_prefill_sample(&first_prefill_seen, media_index != 0, prefill_memory_sample);
     let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
         let start = p.placement.len;
-        let draft_end = draft_context_end(p, start);
         let logits = if cold_replay_decode(&p.job.probe, p.chunks) {
             // Text replay must use serving's captured/fused decode, not eager scoring arithmetic.
             if p.media.spans().is_empty() {
@@ -1762,7 +1762,7 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
         if let (Some(drafter), Some(slot)) = (drafter, p.slot) {
             let n = chunk.len().min(TAP_ROWS);
             let first = start + chunk.len() - n;
-            if drafter.retain_context_chunk(first..first + n, draft_context_end(p, start)) {
+            if drafter.retain_context_chunk(first..first + n, draft_end) {
                 drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot, position: first + r })
                     .collect::<Vec<_>>())?;
             }
