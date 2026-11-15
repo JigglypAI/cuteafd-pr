@@ -1399,7 +1399,7 @@ fn request_descriptor_allocations_equal_recipe_on_one_and_two_rtx() {
                     add(&mut expected, &format!("{prefix}.metadata"), location, metadata.buffers());
                     let uploads = capacity.metadata_uploads(prefill);
                     assert_eq!(uploads.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
-                        if prefill { vec!["positions", "slots", "batch_ids", "causal_lengths", "cache_lengths", "query_offsets"] }
+                        if prefill { vec!["positions", "slots", "causal_lengths", "cache_lengths", "query_offsets"] }
                         else { vec!["positions", "slots", "causal_lengths", "cache_lengths"] });
                     add(&mut expected, &format!("{prefix}.metadata"), Location::PINNED,
                         uploads.into_iter().map(|(name, bytes)| (format!("{name}.upload"), bytes)));
