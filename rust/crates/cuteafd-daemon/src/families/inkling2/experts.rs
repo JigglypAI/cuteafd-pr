@@ -15,6 +15,98 @@ pub(crate) trait Dispatcher {
         rows: usize, stream: &Stream<'_>) -> Result<()>;
 }
 
+/// Native MXFP8 and MC EXL3 onboarding use the shared whole-layer backend.
+/// Its output dtype is independent of K32 ingress; narrow EXL3 token sums only
+/// once at the same BF16 family boundary used by remote expert replies.
+pub(crate) struct Resident<'a> {
+    layer: usize,
+    backend: std::cell::RefCell<Box<dyn crate::shared::experts::rtx::RtxExpertLayer + 'a>>,
+}
+impl<'a> Resident<'a> {
+    pub fn new(layer: usize, backend: Box<dyn crate::shared::experts::rtx::RtxExpertLayer + 'a>) -> Result<Self> {
+        ensure!(backend.shard() == crate::shared::experts::rtx::RtxShard::Whole
+            && backend.uses_fp8_input() && backend.layers().contains(&layer),
+            "Inkling resident adapter requires a whole native K32 backend");
+        Ok(Self { layer, backend: std::cell::RefCell::new(backend) })
+    }
+}
+impl Dispatcher for Resident<'_> {
+    fn enqueue(&self, input: Buffer, ids: Buffer, weights: Buffer, output: Buffer,
+        rows: usize, stream: &Stream<'_>) -> Result<()> {
+        use crate::shared::experts::rtx::{ExpertInput, PartialDtype, PartialLayout, Routes};
+        let mut backend = self.backend.borrow_mut();
+        ensure!(rows > 0 && backend.device() == stream.device.id
+            && backend.partial_layout(rows)? == PartialLayout::Tokens && output.bytes >= rows*4608*2,
+            "Inkling resident owner/output layout differs");
+        for (buffer, bytes) in [(input, rows*4752), (ids, rows*8*4), (weights, rows*8*4), (output, rows*4608*2)] {
+            ensure!(buffer.device_id == stream.device.id && buffer.bytes >= bytes && !buffer.ptr.is_null()
+                && buffer.flags == 0 && buffer.ptr as usize % 16 == 0, "Inkling resident native operand differs");
+        }
+        stream.device.run(|| {
+            // SAFETY: unit retains K32 input/routes and output; shared backend
+            // retains its immutable arena and serial execution workspace.
+            unsafe { backend.enqueue(self.layer, rows, ExpertInput::Fp8K32(input.ptr),
+                Routes { ids: ids.ptr, weights: weights.ptr }, stream.raw, &mut || {})?; }
+            let element = if backend.partial() == PartialDtype::F32 { 4 } else { 2 };
+            let source = Buffer { ptr: backend.output(), bytes: rows*4608*element, ..output };
+            ensure!(source.ptr != output.ptr, "Inkling resident output aliases backend storage");
+            // SAFETY: token sums and private output are disjoint, retained and
+            // issued after the expert launch on the same ordered stream.
+            unsafe {
+                if element == 4 { stream.device.library.cuda_f32_to_bf16_async(source, output, rows*4608, stream.raw) }
+                else { stream.device.library.copy_d2d_async(output, source, source.bytes, stream.raw) }
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod resident_tests {
+    use super::*;
+    use crate::shared::experts::rtx::{ExpertInput, PartialDtype, Routes, RtxExpertLayer, RtxShard};
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+    use std::ffi::c_void;
+
+    struct Backend<'a> { output: Allocation<'a>, wire: bool }
+    impl RtxExpertLayer for Backend<'_> {
+        fn shard(&self) -> RtxShard { RtxShard::Whole }
+        fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }
+        fn uses_fp8_input(&self) -> bool { self.wire }
+        fn layers(&self) -> &[usize] { &[0] }
+        fn device(&self) -> i32 { self.output.device.id }
+        fn workspace_bytes(&self) -> usize { self.output.buffer.bytes }
+        fn output(&self) -> *mut c_void { self.output.buffer.ptr }
+        unsafe fn enqueue(&mut self, layer: usize, rows: usize, input: ExpertInput, _routes: Routes,
+            _stream: *mut c_void, _abort: &mut dyn FnMut()) -> Result<()> {
+            ensure!(layer == 0 && rows == 2 && matches!(input, ExpertInput::Fp8K32(_)),
+                "resident test lost native ingress");
+            self.output.device.library.copy_h2d(self.output.buffer, &vec![0x4d; rows*4608*2])
+        }
+    }
+    #[test]
+    fn resident_native_backend_keeps_k32_ingress_and_copies_combined_token_sums() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 0 };
+        let stream = Stream::new(device)?;
+        let alloc = |bytes| Allocation::new(device, bytes, crate::shared::memory::TEST);
+        let backend = Backend { output: alloc(2*4608*2)?, wire: true };
+        let resident = Resident::new(0, Box::new(backend))?;
+        let input = alloc(2*4752)?;
+        let ids = alloc(2*8*4)?;
+        let weights = alloc(2*8*4)?;
+        let output = alloc(2*4608*2)?;
+        resident.enqueue(input.buffer, ids.buffer, weights.buffer, output.buffer, 2, &stream)?;
+        stream.drain()?;
+        let mut observed = vec![0; output.buffer.bytes];
+        library.copy_d2h(&mut observed, output.buffer)?;
+        assert!(observed.iter().all(|&byte| byte == 0x4d));
+        assert!(Resident::new(0, Box::new(Backend { output: alloc(32)?, wire: false })).is_err());
+        Ok(())
+    }
+}
+
 pub(crate) struct Mxfp8Layout {
     pub arena: WeightArenaLayout,
     pub mount: MountLoad,
