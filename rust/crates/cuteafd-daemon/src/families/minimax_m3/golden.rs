@@ -76,6 +76,14 @@ fn golden_ingress(args: &GoldenArgs, catalog: &cuteafd_loader::OfficialV41Catalo
     })
 }
 
+/// The cold golden runs any packaged MiniMax Spark world (the min card's three
+/// ranks as well as the historical four), never an unpackaged one.
+fn golden_world(cfg: &MiniMaxM3Config, ranks: usize) -> Result<()> {
+    let worlds = cuteafd_loader::plan::experts::spark_worlds("minimax:nvfp4a4", cfg.moe_intermediate);
+    ensure!(worlds.contains(&ranks), "MiniMax golden needs a packaged Spark world {worlds:?}, not {ranks}");
+    Ok(())
+}
+
 fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
 
 const EMBEDDING_UPLOAD: &str = "minimax.unit.0.0.route_ids.upload";
@@ -174,7 +182,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     if args.check_headers { return Ok(()); }
     cuteafd_core::set_expert_geometry(ExpertGeometry::MINIMAX_M3)
         .map_err(|_| anyhow::anyhow!("MiniMax golden needs an isolated process"))?;
-    ensure!(args.peers.len() == 4, "MiniMax golden currently qualifies four real Spark ranks");
+    golden_world(&cfg, args.peers.len())?;
     ensure!(!args.save_logits.try_exists()? && args.save_logits.parent().is_some_and(Path::is_dir),
         "MiniMax logits output needs an existing parent and a new directory");
     let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
@@ -625,6 +633,14 @@ fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cold_golden_accepts_packaged_spark_worlds_only() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let (_, cfg) = super::super::owners::tests::snapshot(directory.path())?;
+        for ranks in [3, 4] { super::golden_world(&cfg, ranks)?; }
+        for ranks in [0, 1, 9] { assert!(super::golden_world(&cfg, ranks).is_err(), "{ranks} ranks"); }
+        Ok(())
+    }
     use super::*;
     #[derive(clap::Parser)]
     struct ParseGolden { #[command(flatten)] args: GoldenArgs }
