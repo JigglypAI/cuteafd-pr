@@ -161,6 +161,11 @@ including byte-identical cold recomputes, for every view.
   view and runs the head-split programs on it, byte-identical to `heads`.
 - Prefix cache: page-only state; under `context` each page is stored once
   from its owner, and the pinned host tier is on.
+- Sparse-MLA prefill runs the native E4M3 kernel with a two-term query and
+  two-term P (`e4m3-q2p2`, about 7 significant bits each). The diagnostic
+  environment override `CUTEAFD_MLA_PREFILL` selects another kernel
+  (`e4m3-p2`, the earlier default with a one-term query; `e4m3-q2`; `e4m3`;
+  `f16`; `b12x`).
 
 ## Default precision (single residency)
 
