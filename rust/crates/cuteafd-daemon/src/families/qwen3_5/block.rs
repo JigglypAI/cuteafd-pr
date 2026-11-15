@@ -54,7 +54,7 @@ impl Step {
         ensure!(matches!(self.capacity, 64 | 4096) && self.rows > 0 && self.rows <= self.capacity,
             "dense step rows exceed native export capacity");
         ensure!(!self.speculative || self.capacity == REPLAY_ROWS, "dense verify requires replay export");
-        ensure!((1..=32).contains(&self.splits), "dense attention split count outside export");
+        ensure!(self.splits == 1, "dense attention requires the single-split native export");
         i32::try_from(self.rows)?;
         i32::try_from(self.table_stride)?;
         Ok(())
@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn replay_and_causal_attention_capacities_fail_before_launch() {
         for (rows, capacity, speculative, splits, valid) in [(64,64,true,1,true), (65,64,false,1,false),
-            (4096,4096,false,32,true), (1,4096,true,1,false), (1,64,false,33,false), (0,64,false,1,false)] {
+            (4096,4096,false,1,true), (4096,4096,false,2,false), (64,64,false,2,false), (1,4096,true,1,false), (1,64,false,33,false), (0,64,false,1,false)] {
             assert_eq!(Step { rows, capacity, speculative, splits, table_stride: 4096 }.validate().is_ok(), valid);
         }
     }

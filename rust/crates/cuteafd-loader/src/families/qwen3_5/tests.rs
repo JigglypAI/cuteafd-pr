@@ -81,7 +81,7 @@ pub(crate) fn native_planner_fixture() -> (tempfile::TempDir, PlanOptions, crate
                 "in_width":in_width,"output_gate":"silu","fp8_weights":false,"norm_dtype":"torch.float32",
                 "channels":8192,"replay_rows":64,"replay_bytes":buffers.replay_per_layer,
                 "heads":16,"kv_heads":4,"record_bytes":4096,"kv_format":"bf16","indexed":false,"rope_dim":64,
-                "rope_theta":10000000.0,"page_rows":64,"max_splits":32,"causal":true,
+                "rope_theta":10000000.0,"page_rows":64,"max_splits":1,"causal":true,
                 "empty_rows_zero":true,"width":4096,"intermediate":12288},
             "pointers":pointers.iter().map(|name| json!({"name":name})).collect::<Vec<_>>(),
             "scalars":(0..scalars).map(|_| json!({"type":"int32"})).collect::<Vec<_>>(),
