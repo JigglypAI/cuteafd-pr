@@ -98,6 +98,10 @@ and arms for cleanup. Source worktrees are retained for inspection.
   `quality` naming the failing cases; each case's probe pair (prompt ids,
   generated ids, row hashes, top two) stays in `report.json` under the pass's
   `evidence`. The baseline's single `spec_lossless` check is unchanged.
+  `--lossless-concurrency N` (default 1) runs the drafts-on cases N at a time,
+  then the drafts-off cases N at a time (never together), so the shared draft
+  row budget is exercised; the pass records `concurrency` (N, per-wave max
+  in-flight).
 - `--prefill-idle-seconds N` waits after each ordinary prefill warm-up before
   the timed request (default 0). Each prefill point records `idle_seconds` in
   `sweep.json`; the wait is outside TTFT and the timed thermal window.
