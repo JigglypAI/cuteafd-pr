@@ -8,6 +8,43 @@ agent/tool transcripts; the content change shifts prefill numbers, so these
 are not like-for-like historical comparisons. Decode and agentic-session
 workloads are unchanged.
 
+## v5.1 MC Modes Comparison
+
+Supplementary max-card comparisons; these do not select a default.
+The main table uses `original`; compact modes retain their precision tradeoffs.
+
+Each cell shows **quality; generated-row KL, top-1; C1 / C16 / 8K tok/s**.
+GLM Flash: 2 RTX PRO 6000, 0 Sparks, DFlash2, automatic pool, dev
+`912c58e04`, checkpoint `91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d`,
+2026-11-15. One fresh launch per mode and one untimed warm batch per
+concurrency level; 1,895 generated rows against the official BF16 reference.
+
+| Max card | Original | K8-compact | K6-compact | FP8-compact |
+| --- | --- | --- | --- | --- |
+| GLM Flash K4 MC | [pass; KL 0.0204, top-1 96.83%; 139.9 / 556.3 / 7499](glm5_flash/2026-11-15-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-original-max-cand-r1/report.svg) | [pass; KL 0.0215, top-1 96.73%; 174.9 / 561.7 / 6655](glm5_flash/2026-11-15-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-k8-compact-max-cand-r1/report.svg) | [pass; KL 0.0210, top-1 96.78%; 195.0 / 565.2 / 6472](glm5_flash/2026-11-15-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-k6-compact-max-cand-r1/report.svg) | [pass; KL 0.0213, top-1 96.57%; 176.4 / 581.5 / 7464](glm5_flash/2026-11-15-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-fp8-compact-max-cand-r1/report.svg) |
+
+Power-cap slowdown is the measured 850 W shared budget (about 425 W per GPU),
+not thermal slowdown. The four max modes share that policy; Nov 10 Core-K6
+cards used a different checkpoint and power policy, not a matched regression
+baseline. Thermal/power times sum GPU-seconds over baseline and panel windows;
+busy clocks are baseline per-GPU means, temperatures/headroom are worst windows.
+
+| Card, mode | Pool tokens | Thermal / power-cap GPU-s | Busy SM MHz | Max C / min T.Limit C |
+| --- | ---: | --- | --- | --- |
+| [GLM Flash K4 MC, original](glm5_flash/2026-11-15-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-original-max-cand-r1/report.svg) | 1,628,160 | 0.000 / 91.958 | 2422/2563 | 78 / 15 |
+| [GLM Flash K4 MC, k8-compact](glm5_flash/2026-11-15-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-k8-compact-max-cand-r1/report.svg) | 2,097,152 | 0.000 / 90.987 | 2354/2449 | 79 / 14 |
+| [GLM Flash K4 MC, k6-compact](glm5_flash/2026-11-15-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-k6-compact-max-cand-r1/report.svg) | 2,097,152 | 0.000 / 90.950 | 2270/2392 | 80 / 13 |
+| [GLM Flash K4 MC, fp8-compact](glm5_flash/2026-11-15-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-fp8-compact-max-cand-r1/report.svg) | 2,097,152 | 0.000 / 100.982 | 2306/2430 | 79 / 14 |
+
+Original max keeps all expert weights on RTX alongside the BF16 core, so its
+pool is 1,628,160 tokens; compact cores free room for the 2,097,152 cap.
+Original min uses two Spark expert ranks and also reaches that cap.
+
+All modes restore prompt/turn-end snapshots byte-identically and pass lossless
+speculation. Short fresh continuation is uncovered; template re-rendering differs
+at token 171 (informational). The original max still uses FP8-QK MLA attention
+and will be re-run after BF16 attention lands (#2146).
+
 ## v5 HQA Comparison
 
 > **Withdrawn checkpoints.** The six `-HQA` repositories measured below have
@@ -262,6 +299,11 @@ historical recipe; new release launches use the v5 matrix.
 
 ## GLM 5.3 Flash
 
+- 2026-11-15 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC · 2× RTX PRO 6000 @ gpu-powerd 425/425 W (400–450) · build 912c58e04a8e · [report](glm5_flash/2026-11-15-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-fp8-compact-max-cand-r1/report.svg)
+- 2026-11-15 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC · 2× RTX PRO 6000 @ gpu-powerd 425/425 W (400–450) · build 912c58e04a8e · [report](glm5_flash/2026-11-15-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-k6-compact-max-cand-r1/report.svg)
+- 2026-11-15 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC · 2× RTX PRO 6000 @ gpu-powerd 425/425 W (400–450) · build 912c58e04a8e · [report](glm5_flash/2026-11-15-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-k8-compact-max-cand-r1/report.svg)
+- 2026-11-15 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC · 1× RTX PRO 6000 @ gpu-powerd 430 W (425–450) + 2× DGX Spark · build 912c58e04a8e · [report](glm5_flash/2026-11-15-smoke-glm-5-3-flash-exl3-k4-mc-1rtx-2spark-glmf-mc-original-min-cand-r1/report.svg)
+- 2026-11-15 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC · 2× RTX PRO 6000 @ gpu-powerd 425/425 W (400–450) · build 912c58e04a8e · [report](glm5_flash/2026-11-15-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-original-max-cand-r1/report.svg)
 - 2026-11-10 · Release smoke · kindlingai/glm-5.3-flash-exlr8-k2-k3-k4 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.799999999813735 GiB + 4 Spark · build v5.0.0-rc2 · [report](glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-1rtx-4spark-glmf-exlr8-k4-5090/report.svg)
 - 2026-11-10 · Release smoke · kindlingai/glm-5.3-flash-exlr8-k2-k3-k4 · 1× RTX PRO 6000 @ gpu-powerd 455 W (450–600) + 1× DGX Spark · build v5.0.0-rc2 · [report](glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-1rtx-1spark-glmf-exlr8-k4-min/report.svg)
 - 2026-11-10 · Release smoke · kindlingai/glm-5.3-flash-exlr8-k2-k3-k4 · 2× RTX PRO 6000 @ gpu-powerd 445/445 W (300–550) · build v5.0.0-rc2 · [report](glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-2rtx-glmf-exlr8-k4-max/report.svg)
@@ -435,8 +477,10 @@ historical recipe; new release launches use the v5 matrix.
 
 ## Qwen 3.5 / 3.8 dense
 
-- 2026-11-15 · Two-RTX qualification, target-only / dSpark · Qwen/Qwen3.8-27B BF16, FP8 KV, C16, 0 Sparks · 1× / 2× RTX PRO 6000, unchanged gpu-powerd policy · build 9f13fc5f8 · [1 RTX target-only](qwen3_5/2026-11-15-tp2-qualification-1rtx-nospec/report.svg), [2 RTX target-only](qwen3_5/2026-11-15-tp2-qualification-2rtx-nospec/report.svg), [1 RTX dSpark](qwen3_5/2026-11-15-tp2-qualification-1rtx-dspark/report.svg), [2 RTX dSpark](qwen3_5/2026-11-15-tp2-qualification-2rtx-dspark/report.svg). Compare each speculation mode independently: prompt hashes match 132/132 target-only and 135/135 dSpark; the four-way grouping refusal is tracked in #2139. Requested C1/C16/exact-8192 sweep phases have no reclaim or memory PSI; some dSpark baseline phases are reclaim-contaminated (PR #2134). No thermal slowdown; power-cap slowdown is recorded in each sweep. Defaults remain one RTX.
-
+- 2026-11-14 · Custom · Qwen/Qwen3.8-27B · 2× RTX PRO 6000 @ gpu-powerd 425/425 W (400–450) · build 9f13fc5f8b11 · [report](qwen3_5/2026-11-15-tp2-qualification-2rtx-dspark/report.svg)
+- 2026-11-14 · Custom · Qwen/Qwen3.8-27B · 1× RTX PRO 6000 @ gpu-powerd 445 W (425–450) · build 9f13fc5f8b11 · [report](qwen3_5/2026-11-15-tp2-qualification-1rtx-dspark/report.svg)
+- 2026-11-14 · Custom · Qwen/Qwen3.8-27B · 2× RTX PRO 6000 @ gpu-powerd 430/405 W (280–450) · build 9f13fc5f8b11 · [report](qwen3_5/2026-11-15-tp2-qualification-2rtx-nospec/report.svg)
+- 2026-11-14 · Custom · Qwen/Qwen3.8-27B · 1× RTX PRO 6000 @ gpu-powerd 450 W (425–450) · build 9f13fc5f8b11 · [report](qwen3_5/2026-11-15-tp2-qualification-1rtx-nospec/report.svg)
 - 2026-11-10 · Release smoke · Qwen/Qwen3.8-27B-FP8 · 1× RTX PRO 6000 @ gpu-powerd 500 W (450–600) · build v5.0.0-rc1 · [report](qwen3_5/2026-11-10-smoke-qwen3-8-27b-fp8-1rtx-qwen38-27b-fp8-min/report.svg)
 - 2026-11-10 · Release smoke · Qwen/Qwen3.8-27B · 1× RTX PRO 6000 @ gpu-powerd 505 W (450–600) · build v5.0.0-rc1 · [report](qwen3_5/2026-11-10-smoke-qwen3-8-27b-1rtx-qwen38-27b-bf16-min/report.svg)
 - 2026-11-10 · Release smoke · Qwen/Qwen3.5-9B · 1× RTX PRO 6000 @ gpu-powerd 480 W (450–600) · build v5.0.0-rc1 · [report](qwen3_5/2026-11-10-smoke-qwen3-5-9b-1rtx-qwen35-9b-bf16-min/report.svg)
