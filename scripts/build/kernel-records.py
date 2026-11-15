@@ -15,6 +15,7 @@ from pathlib import Path
 import struct
 import sys
 import types
+import time
 import weakref
 
 
@@ -359,6 +360,10 @@ class Recorder:
         self.construction = False
         self.latest = []
         self.monitoring_id = None
+        self.timings = {}
+        self.executor_timings = {}
+        self.frontend_seconds = 0.0
+        self.backend_seconds = 0.0
 
     def _start(self, code, offset):
         frame = sys._getframe(1)
@@ -468,8 +473,12 @@ class Recorder:
                     # when PY_START has already disabled this code object's event.
                     self._profile(frame, "call", None)
                     frame = frame.f_back
+                started = time.monotonic()
                 result = original(dsl, *args, **kwargs)
+                elapsed = time.monotonic() - started
+                self.frontend_seconds += elapsed
                 module = result[0]
+                self.timings[id(module)] = {"stage0_seconds": elapsed}
                 # Do not normalize symbols or locations: both can carry semantics.
                 self.modules[id(module)] = {
                     "ir_kind": "original_mlir", "ir_sha256": digest(str(module).encode()),
@@ -485,8 +494,12 @@ class Recorder:
                 if record is None:
                     record = {"ir_kind": "mlir", "ir_sha256": digest(str(module).encode()),
                               "source_reads_sha256": self.reads()}
+                started = time.monotonic()
                 result = (self.backend_cache.compile(dsl, original, module, args, kwargs, record["ir_sha256"])
                           if self.backend_cache is not None else original(dsl, module, *args, **kwargs))
+                elapsed = time.monotonic() - started
+                self.backend_seconds += elapsed
+                self.executor_timings[id(result)] = {**self.timings.pop(id(module), {}), "backend_seconds": elapsed}
                 self.executors[id(result)] = (weakref.ref(result), record)
                 if self.construction:
                     self.latest.append(record)
@@ -496,7 +509,10 @@ class Recorder:
         def exported(original):
             @functools.wraps(original)
             def wrapped(executor, file_path, file_name, function_prefix=""):
+                started = time.monotonic()
                 result = original(executor, file_path, file_name, function_prefix)
+                self.timings[file_name] = {**self.executor_timings.get(id(executor), {}),
+                                           "export_seconds": time.monotonic() - started}
                 found = self.executors.get(id(executor))
                 if found is None or found[0]() is not executor:
                     raise ValueError(f"{file_name}: export has no recorded compiler IR")
@@ -543,6 +559,10 @@ class Recorder:
                                  "resources": resources, "abi_sha256": abi,
                                  "compile_key": stable_hash(key), "compile_inputs": key,
                                  "plan": plans.get(path.stem)}
+        (self.output / "program-timings.json").write_text(json.dumps({
+            "stage0_seconds": self.frontend_seconds, "backend_seconds": self.backend_seconds,
+            "programs": {key: value for key, value in self.timings.items() if isinstance(key, str)},
+        }, indent=2, sort_keys=True) + "\n")
         (self.output / "program-records.json").write_text(json.dumps(records, indent=2, sort_keys=True) + "\n")
         return records
 
