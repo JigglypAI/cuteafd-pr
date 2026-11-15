@@ -120,6 +120,7 @@ pub(crate) struct Snapshot {
     pub telemetry_bytes: usize,
     pub top_hits: Vec<TraceRow>,
     pub top_churn: Vec<TraceRow>,
+    pub rankings_age_ms: u64,
 }
 
 /// Release observations are deliberately independent of cudaMemGetInfo. An
@@ -164,7 +165,11 @@ struct Record {
     oom_warned: bool,
     permanently_eager: bool,
     stats: Box<KeyStats>,
+    accounted: Inventory,
 }
+
+#[derive(Default, Clone, Copy)]
+struct Inventory { nodes: u64, execs: u64, unknown: u64, resident: u64, pinned: u64 }
 
 impl Record {
     fn ordering_bytes(&self) -> u64 {
@@ -575,6 +580,10 @@ pub(crate) struct DeviceCache {
     reserve_policy: Option<cuteafd_loader::placement::graph_reserve::Resolved>,
     charged: u64,
     live_bytes: u64,
+    inventory: Inventory,
+    ranked_hits: Vec<TraceRow>,
+    ranked_churn: Vec<TraceRow>,
+    ranked_at: Instant,
     level: Option<u64>,
     physical_floor: u64,
     physical_sample: Option<(Instant, u64, u64)>,
@@ -644,7 +653,7 @@ pub(crate) fn seal_cross_device_capture_on_this_thread(sealed: bool) {
 
 impl DeviceCache {
     fn new(device: i32, reserve: u64) -> Self {
-        Self { device, reserve, reserve_policy: None, charged: 0, live_bytes: 0, level: None, pending_bytes: 0, next_id: 0, next_bank: 0, identity_generation: 0, recovery_generation: 0,
+        Self { device, reserve, reserve_policy: None, charged: 0, live_bytes: 0, inventory: Inventory::default(), ranked_hits: Vec::new(), ranked_churn: Vec::new(), ranked_at: Instant::now() - Duration::from_secs(30), level: None, pending_bytes: 0, next_id: 0, next_bank: 0, identity_generation: 0, recovery_generation: 0,
             soft: SoftState::new(reserve), measurement_failed: false, failed_measurement_credit: 0, physical_floor: 0, physical_sample: None, physical_floor_warned: false,
             floor_resample_pending: false, floor_resample_used: false,
             recent_target: 0, records: HashMap::new(), identities: HashMap::new(),
@@ -746,7 +755,14 @@ impl DeviceCache {
 
     fn forget(&mut self, id: u64) {
         self.unlink(id);
-        if let Some(record) = self.records.remove(&id) { self.live_bytes = self.live_bytes.saturating_sub(record.bytes); self.identities.remove(&record.identity); self.identity_generation += 1; }
+        if let Some(record) = self.records.remove(&id) {
+            let old = record.accounted;
+            self.inventory.nodes = self.inventory.nodes.saturating_sub(old.nodes);
+            self.inventory.execs = self.inventory.execs.saturating_sub(old.execs);
+            self.inventory.unknown = self.inventory.unknown.saturating_sub(old.unknown);
+            self.inventory.resident = self.inventory.resident.saturating_sub(old.resident);
+            self.inventory.pinned = self.inventory.pinned.saturating_sub(old.pinned);
+            self.live_bytes = self.live_bytes.saturating_sub(record.bytes); self.identities.remove(&record.identity); self.identity_generation += 1; }
     }
 
     fn trim_ghosts(&mut self) {
@@ -790,23 +806,28 @@ impl DeviceCache {
         self.counters.get(&cycle).map_or(0, |counters| counters.hits)
     }
 
-    fn native_pools(&self) -> NativePools {
-        let mut pools = NativePools::default();
-        for record in self.records.values().filter(|r| !r.permanently_eager &&
-            (r.pending_capture || r.pinned || r.pending_destroy || matches!(r.list, Some(List::Recent | List::Frequent)))) {
-            pools.live_execs += 1;
-            if let Some(nodes) = record.stats.native_nodes {
-                pools.live_nodes = pools.live_nodes.saturating_add(nodes);
-            } else { pools.unknown_execs += 1; }
-        }
-        pools
+    fn sync_inventory(&mut self, id: u64) {
+        let Some(record) = self.records.get_mut(&id) else { return };
+        let live = !record.permanently_eager && (record.pending_capture || record.pinned
+            || record.pending_destroy || matches!(record.list, Some(List::Recent | List::Frequent)));
+        let next = if live { Inventory { nodes: record.stats.native_nodes.unwrap_or(0), execs: 1,
+            unknown: u64::from(record.stats.native_nodes.is_none()),
+            resident: if record.pending_capture { 0 } else { record.ordering_bytes() },
+            pinned: if record.pinned { record.bytes } else { 0 } } } else { Inventory::default() };
+        let old = std::mem::replace(&mut record.accounted, next);
+        self.inventory.nodes = self.inventory.nodes.saturating_sub(old.nodes).saturating_add(next.nodes);
+        self.inventory.execs = self.inventory.execs.saturating_sub(old.execs).saturating_add(next.execs);
+        self.inventory.unknown = self.inventory.unknown.saturating_sub(old.unknown).saturating_add(next.unknown);
+        self.inventory.resident = self.inventory.resident.saturating_sub(old.resident).saturating_add(next.resident);
+        self.inventory.pinned = self.inventory.pinned.saturating_sub(old.pinned).saturating_add(next.pinned);
     }
 
-    fn resident_bytes(&self) -> u64 {
-        self.records.values().filter(|r| !r.pending_capture && (r.pinned || r.pending_destroy
-            || matches!(r.list, Some(List::Recent | List::Frequent)))).fold(0u64,
-                |bytes, r| bytes.saturating_add(r.ordering_bytes()))
+    fn native_pools(&self) -> NativePools {
+        NativePools { live_nodes: self.inventory.nodes, live_execs: self.inventory.execs,
+            unknown_execs: self.inventory.unknown }
     }
+
+    fn resident_bytes(&self) -> u64 { self.inventory.resident }
 
     fn estimate(&self, site: Site, node_estimate: Option<u64>) -> (u64, u64) {
         let class = self.classes.get(site.name);
@@ -991,7 +1012,7 @@ impl DeviceCache {
                 let id = self.next_id;
                 self.identities.insert(identity.clone(), id);
                 self.records.insert(id, Record { identity, cycle: site.cycle, bytes: 0, estimate, list: None,
-                    previous: None, next: None, pinned, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, permanently_eager: false, stats: KeyStats::new(now) });
+                    previous: None, next: None, pinned, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, permanently_eager: false, stats: KeyStats::new(now), accounted: Inventory::default() });
                 id
             };
             let record = self.records.get_mut(&id).unwrap();
@@ -1019,6 +1040,7 @@ impl DeviceCache {
             self.pending_bytes = self.pending_bytes.saturating_add(estimate);
             self.floor_resample_used = false;
 
+            self.sync_inventory(id);
             return Miss::Capture(id);
         }
         // A cold adaptive miss is remembered without displacing resident work.
@@ -1027,7 +1049,7 @@ impl DeviceCache {
             let id = self.next_id;
             self.identities.insert(identity.clone(), id);
             self.records.insert(id, Record { identity: identity.clone(), cycle: site.cycle, bytes: 0, estimate,
-                list: None, previous: None, next: None, pinned: false, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, permanently_eager: false, stats: KeyStats::new(now) });
+                list: None, previous: None, next: None, pinned: false, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, permanently_eager: false, stats: KeyStats::new(now), accounted: Inventory::default() });
             self.push(id, List::RecentGhost);
             self.trim_ghosts();
         }
@@ -1060,6 +1082,7 @@ impl DeviceCache {
             List::FrequentGhost
         } else { List::RecentGhost };
         self.push(id, ghost);
+        self.sync_inventory(id);
         self.trim_ghosts();
         warn
     }
@@ -1084,6 +1107,7 @@ impl DeviceCache {
         let record = self.records.get_mut(&id).unwrap();
         self.live_bytes = self.live_bytes.saturating_sub(record.bytes);
         record.bytes = 0;
+        self.sync_inventory(id);
         // Physical charge remains a monotone high-water, including failed captures.
     }
 
@@ -1122,6 +1146,7 @@ impl DeviceCache {
         if nodes != 0 || width != 0 { record.stats.native_nodes = Some(nodes); }
         record.stats.max_parallel_width = width;
         record.stats.spans_devices |= spans_devices;
+        self.sync_inventory(id);
     }
 
     pub fn completed_capture(&mut self, id: u64) -> bool {
@@ -1222,6 +1247,7 @@ impl DeviceCache {
             if share > 0 { class.total = class.total.saturating_add(share); class.samples += 1; class.largest = class.largest.max(share); }
             self.counters.entry(record.cycle).or_default().captures += 1;
             if let Some(list) = list { self.push(id, list); }
+            self.sync_inventory(id);
         }
         self.pending_bytes = self.pending_bytes.saturating_sub(settled_bytes);
         self.unmeasured = self.records.values().any(|r| r.pending_capture);
@@ -1258,6 +1284,7 @@ impl DeviceCache {
             let ghost = if record.frequent { List::FrequentGhost } else { List::RecentGhost };
             self.push(id, ghost);
             self.records.get_mut(&id).unwrap().bytes = 0;
+            self.sync_inventory(id);
         }
         self.trim_ghosts();
     }
@@ -1315,6 +1342,7 @@ impl DeviceCache {
     pub fn boundary(&mut self) {
         self.sample_clock();
         self.retired_trace = None;
+        if self.ranked_at.elapsed() >= Duration::from_secs(30) { self.refresh_rankings(); }
         self.report_due(self.last_report.elapsed());
         if self.trace.is_some() && self.last_trace.elapsed() >= Duration::from_secs(1) {
             self.last_trace = Instant::now();
@@ -1326,11 +1354,11 @@ impl DeviceCache {
         let records = self.records.values().map(RawRecord::copy).collect();
         TraceSnapshot { cache: Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor,
             reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed, native_pools: self.native_pools(), soft: self.soft, level: self.level,
-            pinned: self.records.values().filter(|r| r.pinned).map(|r| r.bytes).sum(),
+            pinned: self.inventory.pinned,
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(),
             basis: self.basis, sampled_at_ms: self.started.elapsed().as_millis() as u64,
             telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(),
-            top_hits: Vec::new(), top_churn: Vec::new() },
+            top_hits: Vec::new(), top_churn: Vec::new(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64 },
             records, classes: self.classes.clone() }
     }
 
@@ -1345,7 +1373,7 @@ impl DeviceCache {
         self.trace.take()
     }
 
-    fn snapshot(&self) -> Snapshot {
+    fn refresh_rankings(&mut self) {
         let now = self.started.elapsed().as_millis() as u64;
         let ranked = |churn: bool| {
             let mut records: Vec<_> = self.records.values().filter(|r| if churn {
@@ -1358,11 +1386,18 @@ impl DeviceCache {
             });
             records.into_iter().take(16).map(|record| self.row(record, now)).collect()
         };
+        self.ranked_hits = ranked(false);
+        self.ranked_churn = ranked(true);
+        self.ranked_at = Instant::now();
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        let now = self.started.elapsed().as_millis() as u64;
         Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed, native_pools: self.native_pools(), soft: self.soft,
             level: self.level,
-            pinned: self.records.values().filter(|r| r.pinned).map(|r| r.bytes).sum(),
+            pinned: self.inventory.pinned,
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(), basis: self.basis,
-            sampled_at_ms: now, telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(), top_hits: ranked(false), top_churn: ranked(true) }
+            sampled_at_ms: now, telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(), top_hits: self.ranked_hits.clone(), top_churn: self.ranked_churn.clone(), rankings_age_ms: self.ranked_at.elapsed().as_millis() as u64 }
     }
 
     fn row(&self, record: &Record, now: u64) -> TraceRow {
@@ -1685,7 +1720,7 @@ mod tests {
             if cache.soft.measured_bytes.is_some() { assert!(cache.soft.fits(cache.native_pools().live_nodes)); }
         }
         assert_eq!(cache.counters[&Cycle::Decode].captures, 200);
-        assert_eq!(cache.charged, 14 * unit);
+        assert_eq!(cache.charged, 13 * unit, "equality reservation makes room before another slab is needed");
         cache.charged = cache.reserve;
         assert!(matches!(cache.miss(key(200), capture_site, None, false), Miss::Eager));
     }
@@ -1985,6 +2020,7 @@ mod tests {
         for _ in 0..rounds { black_box(publish()); }
         let after_us = after.elapsed().as_secs_f64() * 1e6 / f64::from(rounds);
         eprintln!("stats publish, 5000 hit records, {rounds} rounds, graph inventory inline -> lazy: {before_us:.2} -> {after_us:.2} us/round");
+        cache.refresh_rankings();
         assert_eq!(cache.snapshot().top_hits.len(), 16);
     }
 
@@ -2133,6 +2169,7 @@ mod tests {
         let mut snapshot = cache.trace_snapshot();
         snapshot.cache.sampled_at_ms = 30_000;
         snapshot.cache.telemetry_bytes = 0;
+        snapshot.cache.rankings_age_ms = 0;
         let bytes = snapshot.bytes().unwrap();
         assert_eq!(std::str::from_utf8(&bytes).unwrap(), include_str!("trace-schema.json").trim());
     }
@@ -2196,11 +2233,13 @@ mod tests {
         assert_eq!(row.capture_bytes, Some(0));
         assert_eq!(row.permanent_bytes, 10, "reuse must not imply free permanent graph");
         assert_eq!(row.executables, 1);
+        cache.refresh_rankings();
         let snapshot = cache.snapshot();
         assert_eq!(snapshot.top_churn.len(), 1);
         assert_eq!(snapshot.top_hits.len(), 1);
         assert_eq!(snapshot.telemetry_bytes, std::mem::size_of::<KeyStats>());
         cache.forget(a);
+        cache.refresh_rankings();
         assert_eq!(cache.snapshot().telemetry_bytes, 0);
         assert!(cache.snapshot().top_churn.is_empty());
     }
