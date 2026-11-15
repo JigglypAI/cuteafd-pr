@@ -20,6 +20,7 @@ pub struct Client {
     pub configuration: crate::report::Configuration,
     agent: ureq::Agent,
     fabric_enabled: bool,
+    local_probes: bool,
     token: Option<String>,
     api_key: Option<cuteafd_api::openai::auth::ApiKey>,
     cancel: Arc<AtomicBool>,
@@ -68,13 +69,19 @@ impl Client {
     pub fn new(base: &str, token: Option<String>, cancel: Arc<AtomicBool>) -> Self {
         let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
             .timeout_read(Duration::from_secs(900)).build();
-        Self { configuration: crate::report::Configuration::default(), base: base.trim_end_matches('/').to_string(), model: String::new(), agent, token, cancel, api_key: None, fabric_enabled: false }
+        Self { configuration: crate::report::Configuration::default(), base: base.trim_end_matches('/').to_string(), model: String::new(), agent, token, cancel, api_key: None, fabric_enabled: false, local_probes: false }
     }
 
     pub fn with_api_key(mut self, key: Option<cuteafd_api::openai::auth::ApiKey>) -> Self {
         self.api_key = key;
         self
     }
+    /// Only the server's own loopback clients share its process-local probe registry.
+    pub(crate) fn with_local_probes(mut self) -> Self {
+        self.local_probes = true;
+        self
+    }
+
     pub fn with_fabric(mut self, enabled: bool) -> Self {
         self.fabric_enabled = enabled;
         self
@@ -271,6 +278,14 @@ impl Client {
     /// A streamed chat completion. `body` needs no `model` or `stream`;
     /// `probe` registers benchmark diagnostics for this request.
     pub fn chat(&self, body: Value, probe: Option<ProbeSpec>) -> Result<Chat> {
+        if !self.local_probes {
+            if let Some(spec) = &probe {
+                // Register in the serving process, not this external CLI's registry.
+                // The HTTP probe returns timings measured by that process's streamed client.
+                return serde_json::from_value(self.media_probe(body, serde_json::to_value(spec)?)?)
+                    .context("remote benchmark probe response");
+            }
+        }
         self.chat_inner(body, probe, false)
     }
 
@@ -511,6 +526,63 @@ mod tests {
         let upstream = error.downcast_ref::<UpstreamHttpError>().unwrap();
         assert_eq!(upstream.code, 503);
         assert_eq!(upstream.body, "vision encoder unavailable");
+    }
+
+    #[test]
+    fn remote_cold_probe_bypasses_a_warm_template_prefix() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for cold in [false, true] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with(if cold { "POST /v1/bench/probe " } else { "POST /v1/chat/completions " }));
+                let mut length = 0;
+                loop {
+                    line.clear(); reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" { break; }
+                    assert!(!line.to_lowercase().starts_with("x-cuteafd-probe:"), "remote registry IDs cannot cross processes");
+                    if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut bytes = vec![0; length]; reader.read_exact(&mut bytes).unwrap();
+                let request: Value = serde_json::from_slice(&bytes).unwrap();
+                let body = if cold { &request["body"] } else { &request };
+                assert_eq!(body["messages"][0]["content"], "shared template prefix: request");
+                let reply = if cold {
+                    assert_eq!(request["spec"]["cold"], true);
+                    let spec: ProbeSpec = serde_json::from_value(request["spec"].clone()).unwrap();
+                    // The remote server has its own registry and registers the received spec.
+                    let registry = probe::ProbeRegistry::default();
+                    let (id, pending) = registry.register(spec);
+                    let claimed = registry.claim(&id).unwrap();
+                    assert!(claimed.spec.cold);
+                    claimed.admitted("remote", &[1; 256], 0);
+                    serde_json::to_string(&Chat { timing: StreamTiming {
+                        prompt_tokens: 256, completion_tokens: 1, cached_tokens: 0,
+                        ttft_s: 0.25, total_s: 0.25, ..Default::default()
+                    }, content: "cold".into(), probe: Some(pending.record()), ..Default::default() }).unwrap()
+                } else {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"warm\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":256,\"completion_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":192}}}\n\ndata: [DONE]\n\n".into()
+                };
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    if cold { "application/json" } else { "text/event-stream" }, reply.len(), reply).unwrap();
+            }
+        });
+        let client = Client::new(&base, None, Arc::new(AtomicBool::new(false)));
+        let body = json!({"messages":[{"role":"user","content":"shared template prefix: request"}]});
+        let warm = client.chat(body.clone(), None).unwrap();
+        assert_eq!(warm.timing.cached_tokens, 192);
+        let cold = client.chat(body, Some(ProbeSpec { cold: true, ..Default::default() })).unwrap();
+        assert_eq!(cold.timing.cached_tokens, 0);
+        assert_eq!(cold.timing.ttft_s, 0.25);
+        assert!(cold.probe.unwrap().cold);
+        server.join().unwrap();
     }
 
     #[test]

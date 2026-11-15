@@ -542,8 +542,9 @@ mod tests {
                     }
                     let mut bytes = vec![0; length]; reader.read_exact(&mut bytes).unwrap();
                     let body: Value = if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap() };
+                    let chat_body = if path == "/v1/bench/probe" { &body["body"] } else { &body };
                     let count = || {
-                        let n = 17 + body["messages"][0]["content"].as_str().unwrap().chars().count() as u64 / 3;
+                        let n = 17 + chat_body["messages"][0]["content"].as_str().unwrap().chars().count() as u64 / 3;
                         if mismatch_at.is_none() && n >= 8296 { n + 1 } else { n }
                     };
                     let (kind, reply) = match path.as_str() {
@@ -560,6 +561,17 @@ mod tests {
                             let event = json!({"choices":[{"delta":{"content":"OK"}, "finish_reason":"stop"}],
                                 "usage":{"prompt_tokens":reported, "completion_tokens":1}});
                             ("text/event-stream", format!("data: {event}\n\ndata: [DONE]\n\n"))
+                        }
+                        "/v1/bench/probe" => {
+                            chats += 1;
+                            assert_eq!(body["spec"]["cold"], true);
+                            let actual = count();
+                            if (3..=4).contains(&chats) { assert_eq!(actual, crate::prefill::CARD_TOKENS); }
+                            let reported = if Some(chats) == mismatch_at { 8310 } else { actual };
+                            let chat = crate::client::Chat { timing: crate::report::StreamTiming {
+                                prompt_tokens: reported, completion_tokens: 1, ..Default::default()
+                            }, ..Default::default() };
+                            ("application/json", serde_json::to_string(&chat).unwrap())
                         }
                         "/v1/stats" | "/v1/thermal" => ("application/json", "{}".into()),
                         _ => panic!("unexpected request {path}"),
