@@ -13,42 +13,54 @@ use std::{collections::BTreeMap, ffi::c_void, rc::Rc};
 use cuteafd_core::memory_layout::ArenaTag;
 
 /// One resident native projection and its resolved programs.
-pub(super) struct NativeLinear<'a> {
-    weights: CoreWeights<'a>,
-    projection: Projection<'a>,
+pub(super) enum NativeLinear<'a> {
+    Trellis {weights:CoreWeights<'a>,projection:Projection<'a>},
+    Fp8 {weights:crate::shared::memory::device::Allocation<'a>,
+        layout:cuteafd_loader::formats::native_attention::NativeLayout,
+        projection:cuteafd_ffi::native_attention::Fp8Projections<'a>,library:&'a cuteafd_ffi::NativeLibrary},
 }
-
 impl<'a> NativeLinear<'a> {
-    pub(super) fn shape(&self) -> [usize; 2] { self.weights.shape }
-    pub(super) fn side(&self) -> TrellisSide { self.weights.side }
-
-    /// The three retained trellis owners, named by their arena keys.
-    pub(super) fn inventory(&self, inventory: &mut Inventory<'_>, name: &str) -> Result<()> {
-        for (part, owner) in [("trellis", &self.weights.payload), ("suh", &self.weights.suh), ("svh", &self.weights.svh)] {
-            owner.inventory(inventory, &format!("{name}.{part}"))?;
+    pub(super) fn shape(&self)->[usize;2] {match self {Self::Trellis {weights,..}=>weights.shape,Self::Fp8 {layout,..}=>layout.shape}}
+    pub(super) fn side(&self)->TrellisSide {match self {Self::Trellis {weights,..}=>weights.side,
+        Self::Fp8 {layout,..}=>if layout.ranks>1 && layout.split==cuteafd_loader::formats::trellis_core::CoreSplit::Input {
+            TrellisSide::Input } else {TrellisSide::Output}}}
+    pub(super) fn inventory(&self,inventory:&mut Inventory<'_>,name:&str)->Result<()> {
+        match self {
+            Self::Trellis {weights,..}=>for (part,owner) in [("trellis",&weights.payload),("suh",&weights.suh),("svh",&weights.svh)] {
+                owner.inventory(inventory,&format!("{name}.{part}"))?;
+            },
+            Self::Fp8 {weights,..}=>weights.inventory(inventory,&format!("{name}.fp8"))?,
         }
         Ok(())
     }
-
-    /// BF16 [rows, N] from BF16 [rows, K]: the exact BF16-program contract.
-    pub(super) fn launch(&self, rows: usize, input: Buffer, output: Buffer, scratch: &ProjectionScratch<'_>,
-        stream: *mut c_void) -> Result<()> {
-        ensure!(self.weights.side == TrellisSide::Output, "K-split native projection needs a peer reduction");
-        self.projection.local(rows, input, &self.weights, scratch, output, stream)
-    }
-
-    /// The K-split (head-split o_proj) F32 core partial, before svh.
-    pub(super) fn partial(&self, rows: usize, input: Buffer, output: Buffer, scratch: &ProjectionScratch<'_>,
-        stream: *mut c_void) -> Result<()> {
-        ensure!(self.weights.side == TrellisSide::Input && output.bytes >= rows * self.weights.shape[0] * 4,
-            "native F32 partial requires an input-split owner and F32 rows");
-        self.projection.core_into(rows, input, &self.weights, scratch, output, stream)
-    }
-
-    /// One svh egress of the ordered F32 sum of both rank partials.
-    pub(super) fn egress(&self, rows: usize, sum: Buffer, output: Buffer, stream: *mut c_void) -> Result<()> {
-        self.projection.program.output(rows, sum, self.weights.svh.buffer, output, stream)?;
+    fn fp8_launch(&self,rows:usize,input:Buffer,output:Buffer,scratch:&ProjectionScratch<'_>,stream:*mut c_void)->Result<()> {
+        let Self::Fp8 {weights,layout,projection,..}=self else {anyhow::bail!("not a nativeFP8linear")};
+        let [n,k]=layout.shape;
+        let (values,scales)=super::weights::fp8_buffers(weights.buffer,&[n,k])?;
+        // SAFETY: caller retains typed buffers, final arena weights and lane-private scratch through drain.
+        unsafe {projection.launch(input.ptr,values.ptr,scales.ptr,output,scratch.buffers["fp8"],rows,k,n,stream)?;}
         Ok(())
+    }
+    pub(super) fn launch(&self,rows:usize,input:Buffer,output:Buffer,scratch:&ProjectionScratch<'_>,stream:*mut c_void)->Result<()> {
+        ensure!(self.side()==TrellisSide::Output,"K-split native projection requires peer reduction");
+        match self {Self::Trellis {weights,projection}=>projection.local(rows,input,weights,scratch,output,stream),
+            Self::Fp8 {..}=>self.fp8_launch(rows,input,output,scratch,stream)}
+    }
+    pub(super) fn partial(&self,rows:usize,input:Buffer,output:Buffer,scratch:&ProjectionScratch<'_>,stream:*mut c_void)->Result<()> {
+        ensure!(self.side()==TrellisSide::Input && output.bytes>=rows*self.shape()[0]*4,"native split output geometry");
+        match self {Self::Trellis {weights,projection}=>projection.core_into(rows,input,weights,scratch,output,stream),
+            Self::Fp8 {..}=>self.fp8_launch(rows,input,output,scratch,stream)}
+    }
+    pub(super) fn egress(&self,rows:usize,sum:Buffer,output:Buffer,stream:*mut c_void)->Result<()> {
+        match self {Self::Trellis {weights,projection}=>{projection.program.output(rows,sum,weights.svh.buffer,output,stream)?;Ok(())},
+            Self::Fp8 {library,..}=>{
+                // SAFETY: caller orders reduction before narrowing disjoint retained row views.
+                unsafe {library.cuda_f32_to_bf16_async(sum,output,rows*self.shape()[0],stream)}
+            }}
+    }
+    fn scratch_layout(&self,rows:usize)->Result<ProjectionScratchLayout> {
+        match self {Self::Trellis {weights,..}=>ProjectionScratchLayout::new(weights.shape[1],weights.shape[0],rows),
+            Self::Fp8 {..}=>Ok(ProjectionScratchLayout {rows,extents:BTreeMap::from([("fp8",256)])})}
     }
 }
 
@@ -75,7 +87,18 @@ impl<'a> NativeLayer<'a> {
             let output = if core.shape[0] == 128896 { TrellisDType::F32 } else { TrellisDType::Bf16 };
             let projection = device.run(|| Projection::load_geometry_bits(programs, core.shape[1], core.shape[0],
                 side, core.bits, crate::shared::dense_trellis::codebook(&weights), rows, output))?;
-            linears.insert(name.clone(), Rc::new(NativeLinear { weights, projection }));
+            linears.insert(name.clone(), Rc::new(NativeLinear::Trellis {weights,projection}));
+        }
+        for operand in layout.operands.iter().filter(|operand|operand.fp8() && select(&operand.name)) {
+            let native=operand.native_layout(layout.rank,layout.ranks)?;
+            let output=if native.ranks>1 && native.split==cuteafd_loader::formats::trellis_core::CoreSplit::Input {
+                cuteafd_ffi::draft_projection::ProjectionOutput::F32
+            } else {cuteafd_ffi::draft_projection::ProjectionOutput::Bf16};
+            let projection=device.run(||Ok(cuteafd_ffi::native_attention::Fp8Projections::load(programs,
+                &[(native.shape[1],native.shape[0])],rows,output)?))?;
+            ensure!(projection.scratch_bytes(native.shape[1],native.shape[0])?==256,"StepFP8scratch differs from admission");
+            let weights=super::weights::load_operand(device,checkpoint,layout,operand,arena)?;
+            linears.insert(operand.name.clone(),Rc::new(NativeLinear::Fp8 {weights,layout:native,projection,library:device.library}));
         }
         Ok(Self { linears })
     }
@@ -84,8 +107,7 @@ impl<'a> NativeLayer<'a> {
     pub(super) fn scratch_layout(&self, rows: usize) -> Result<Option<ProjectionScratchLayout>> {
         let mut merged: Option<ProjectionScratchLayout> = None;
         for linear in self.linears.values() {
-            let [n, k] = linear.weights.shape;
-            let next = ProjectionScratchLayout::new(k, n, rows)?;
+            let next=linear.scratch_layout(rows)?;
             match &mut merged { Some(layout) => layout.merge(&next)?, None => merged = Some(next) }
         }
         Ok(merged)
@@ -151,16 +173,16 @@ impl<'a> NativeAttention<'a> {
         layout: &RankWeightLayout, layer: usize, rows: usize, q: usize, kv: usize, hidden: usize, arena: Option<&DeviceWeightArena<'a>>)
         -> Result<Option<Self>> {
         let names = ["q", "k", "v", "o"].map(|p| format!("model.layers.{layer}.self_attn.{p}_proj.weight"));
-        let present = names.iter().filter(|name| layout.core.contains_key(*name)).count();
+        let present = names.iter().filter(|name| layout.native_projection(name)).count();
         if present == 0 { return Ok(None); }
-        let qkv = names[..3].iter().filter(|name| layout.core.contains_key(*name)).count();
+        let qkv = names[..3].iter().filter(|name| layout.native_projection(name)).count();
         ensure!(matches!(qkv, 0 | 3), "Step-5 layer {layer} attention requires complete EXL3 q/k/v");
         let mut core = NativeLayer::load(device, programs, checkpoint, layout, rows, |name| names.iter().any(|n| n == name), arena)?;
         let mut take = |name: &str| -> Result<NativeLinear<'a>> {
             Rc::try_unwrap(core.linears.remove(name).context("native attention operand")?)
                 .map_err(|_| anyhow::anyhow!("native attention operand aliased"))
         };
-        let has_o = layout.core.contains_key(&names[3]);
+        let has_o = layout.native_projection(&names[3]);
         let attention = Self { qkv: if qkv == 3 { Some([take(&names[0])?, take(&names[1])?, take(&names[2])?]) } else { None },
             o: if has_o { Some(take(&names[3])?) } else { None } };
         let split = attention.o.as_ref().is_some_and(|o| o.side() == TrellisSide::Input);
@@ -174,8 +196,7 @@ impl<'a> NativeAttention<'a> {
     pub(super) fn scratch_layout(&self, rows: usize) -> Result<ProjectionScratchLayout> {
         let mut merged = None::<ProjectionScratchLayout>;
         for linear in self.qkv.iter().flatten().chain(self.o.iter()) {
-            let [n, k] = linear.shape();
-            let next = ProjectionScratchLayout::new(k, n, rows)?;
+            let next=linear.scratch_layout(rows)?;
             match &mut merged { Some(layout) => layout.merge(&next)?, None => merged = Some(next) }
         }
         merged.context("native attention scratch")

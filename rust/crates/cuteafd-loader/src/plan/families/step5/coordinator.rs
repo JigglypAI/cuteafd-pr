@@ -146,12 +146,13 @@ impl CoordinatorContract {
 
     /// Reuse the planner's validated model instead of rebuilding its tensor contract.
     pub(super) fn from_model(checkpoint: &Checkpoint, model: &Model) -> Result<Self> {
+        let cfg: &Config = &model.cfg;
         checkpoint.validate_fp8_roles("Step-5", |name| {
+            let stem = name.strip_suffix(".weight").unwrap_or(name);
             let attention = name.contains(".self_attn.");
             crate::formats::native_attention::Fp8Role::exact(if attention { "attention projection" } else { "core projection" },
-                name.ends_with(".self_attn.o_proj.weight") || is_vocabulary_head(name))
+                name.ends_with(".weight") && super::exl3::split(cfg,stem).is_some())
         })?;
-        let cfg: &Config = &model.cfg;
         let declarations = model
             .tensors
             .iter()
@@ -217,6 +218,8 @@ pub struct WeightOperand {
 }
 
 impl WeightOperand {
+    pub fn fp8(&self) -> bool { self.dtype == DType::F8E4M3 }
+
     pub fn native_layout(&self, rank: usize, ranks: usize) -> Result<crate::formats::native_attention::NativeLayout> {
         use crate::formats::trellis_core::CoreSplit;
         ensure!(self.shape.len() == 2, "Step-5 native output matrix");
@@ -250,6 +253,24 @@ fn is_exl3_member(name: &str) -> bool {
 pub const ROPE_PREFIX: &str = "step5_";
 
 impl RankWeightLayout {
+    pub fn native_operand(&self, name:&str) -> Option<&WeightOperand> {
+        self.operands.iter().find(|operand| operand.name == name)
+    }
+
+    pub fn projection_shape(&self, name:&str) -> Option<[usize;2]> {
+        self.core.get(name).map(|core|core.shape).or_else(|| self.native_operand(name)
+            .and_then(|operand| operand.shape.as_slice().try_into().ok()))
+    }
+
+    pub fn projection_bytes(&self, name:&str) -> Option<u64> {
+        self.core.get(name).map(|core|core.bytes as u64)
+            .or_else(||self.native_operand(name).map(|operand|operand.allocation_bytes))
+    }
+
+    pub fn native_projection(&self, name:&str) -> bool {
+        self.core.contains_key(name) || self.native_operand(name).is_some_and(WeightOperand::fp8)
+    }
+
     /// Final rank-local owners only; composite FP8 values/scales remain one view.
     pub fn arena_tensors(&self, select: impl Fn(&str) -> bool) -> Result<Vec<(String, usize)>> {
         let mut tensors = self.operands.iter().filter(|operand| select(&operand.name))

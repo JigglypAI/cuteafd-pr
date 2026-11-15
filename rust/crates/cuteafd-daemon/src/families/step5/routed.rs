@@ -189,8 +189,8 @@ impl RoutedPlan {
         );
         let activation = format!("step5_post_silu_w1536_c{}", limit as u32);
         let native_names = ["gate", "up", "down"].map(|p| format!("model.layers.{layer}.share_expert.{p}_proj.weight"));
-        let native = native_names.iter().all(|name| layout.core.contains_key(name));
-        ensure!(native || native_names.iter().all(|name| !layout.core.contains_key(name)),
+        let native = native_names.iter().all(|name| layout.native_projection(name));
+        ensure!(native || native_names.iter().all(|name| !layout.native_projection(name)),
             "Step-5 layer {layer} shared FFN mixes native and BF16 operands");
         let mut weights = Vec::new();
         let bf16_shared: &[(&str, DType, Vec<usize>)] = &[
@@ -217,8 +217,8 @@ impl RoutedPlan {
         }
         if native {
             for (name, shape) in native_names.iter().zip([[I, H], [I, H], [H, I]]) {
-                let core = &layout.core[name];
-                ensure!(core.shape == shape && core.ranks == 1, "{name}: native shared FFN must be whole {shape:?}");
+                let actual=layout.projection_shape(name).context("native shared shape")?;
+                ensure!(actual == shape, "{name}: native shared FFN must be whole {shape:?}");
             }
             let split = format!("step5_post_silu_split_w1536_c{}", limit as u32);
             let spec = programs.spec(&split)?;
@@ -283,7 +283,7 @@ impl RoutedPlan {
         admission.full = contract.layers[layer].sliding.is_none();
         if native {
             admission.bytes = native_names.iter().try_fold(admission.bytes, |n, name|
-                n.checked_add(layout.core[name].bytes as u64)).context("routed native admission overflow")?;
+                n.checked_add(layout.projection_bytes(name).unwrap())).context("routed native admission overflow")?;
         }
         Ok(Self {
             layer,

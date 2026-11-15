@@ -104,6 +104,18 @@ impl NativeSelection {
                 split: if split { CoreSplit::Input } else { CoreSplit::Whole },
             }, output: if split { ProjectionOutput::F32 } else { ProjectionOutput::Bf16 } });
         }
+        for name in contract.fp8_tensors.iter().filter(|name| !name.ends_with(".self_attn.o_proj.weight")
+            && !super::coordinator::is_vocabulary_head(name)) {
+            let layer=name.strip_prefix("model.layers.").and_then(|rest|rest.split('.').next())
+                .and_then(|layer|layer.parse::<usize>().ok()).context("Step FP8 selected layer missing")?;
+            if layer>=cfg.layers+depth {continue;}
+            let shape=super::exl3::expected(cfg).get(name).cloned().context("Step selected core shape missing")?;
+            let split=layer<cfg.layers && !cfg.full[layer] && ranks==2 && ["q","k","v"].iter()
+                .any(|leaf|name.ends_with(&format!(".self_attn.{leaf}_proj.weight")));
+            requirements.push(NativeRequirement {layout:NativeLayout {stem:name.strip_suffix(".weight").unwrap().into(),
+                shape:[shape[0]/if split {2}else{1},shape[1]],fp8:true,rank:0,ranks:if split {2}else{1},
+                split:if split {CoreSplit::Output}else{CoreSplit::Whole}},output:ProjectionOutput::Bf16});
+        }
         let heads = std::iter::once("lm_head.weight".to_owned()).chain((0..depth)
             .map(|stage| format!("model.layers.{}.transformer.shared_head.output.weight",cfg.layers+stage)))
             .filter(|name| contract.fp8_tensors.contains(name)).map(|name| NativeRequirement {
@@ -514,14 +526,25 @@ pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, l
 
 /// The one serialized native projection scratch a rank's layers share, placed
 /// after its FFN region; zero when the rank owns no native operand.
-pub fn native_scratch_bytes(layout: &RankWeightLayout, unit: usize) -> Result<u64> {
-    let mut merged: Option<crate::formats::trellis_core::ProjectionScratchLayout> = None;
-    for core in layout.core.iter().filter(|(name, _)| name.as_str() != "lm_head.weight").map(|(_, core)| core) {
-        let [n, k] = core.shape;
-        let next = crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, unit)?;
-        match &mut merged { Some(layout) => layout.merge(&next)?, None => merged = Some(next) }
+pub fn projection_scratch_layout(layout:&RankWeightLayout,rows:usize,
+    select:impl Fn(&str)->bool)->Result<Option<crate::formats::trellis_core::ProjectionScratchLayout>> {
+    use crate::formats::trellis_core::ProjectionScratchLayout;
+    let mut merged:Option<ProjectionScratchLayout>=None;
+    for (name,core) in layout.core.iter().filter(|(name,_)|select(name)) {
+        let _=name;
+        let next=ProjectionScratchLayout::new(core.shape[1],core.shape[0],rows)?;
+        match &mut merged {Some(layout)=>layout.merge(&next)?,None=>merged=Some(next)}
     }
-    Ok(merged.map(|layout| layout.packed_bytes()).transpose()?.map_or(0, |bytes| bytes as u64))
+    if layout.operands.iter().any(|owner|owner.fp8() && select(&owner.name)) {
+        let next=ProjectionScratchLayout {rows,extents:std::collections::BTreeMap::from([("fp8",256)])};
+        match &mut merged {Some(layout)=>layout.merge(&next)?,None=>merged=Some(next)}
+    }
+    Ok(merged)
+}
+
+pub fn native_scratch_bytes(layout:&RankWeightLayout,unit:usize)->Result<u64> {
+    Ok(projection_scratch_layout(layout,unit,|name|!super::coordinator::is_vocabulary_head(name))?
+        .map(|layout|layout.packed_bytes()).transpose()?.unwrap_or(0) as u64)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -566,14 +589,18 @@ pub fn mtp_native_scratch_requests(checkpoint: &Checkpoint, contract: &Coordinat
             let next = ProjectionScratchLayout::new(k, n, if owner == "head" { rows.head } else { rows.layer })?;
             match owners.get_mut(owner) { Some(layout) => layout.merge(&next)?, None => { owners.insert(owner, next); } }
         }
-        for layout in owners.values() {
-            requests.push(layout.packed_bytes()? as u64);
+        let groups=layout.operands.iter().filter(|owner|owner.fp8()).map(|owner|
+            if super::coordinator::is_vocabulary_head(&owner.name) {"head"}
+            else if owner.name.contains(".self_attn.") {"attention"}
+            else if owner.name.contains(".mlp.") {"dense"} else {"eh"})
+            .collect::<std::collections::BTreeSet<_>>();
+        for group in groups {
+            let next=ProjectionScratchLayout {rows:if group=="head" {rows.head}else{rows.layer},
+                extents:std::collections::BTreeMap::from([("fp8",256)])};
+            match owners.get_mut(group) {Some(layout)=>layout.merge(&next)?,None=>{owners.insert(group,next);}}
         }
-        for owner in layout.operands.iter().filter(|owner| super::coordinator::is_vocabulary_head(&owner.name)
-            && owner.dtype == cuteafd_core::DType::F8E4M3) {
-            let _ = owner;
-            requests.push(FP8_HEAD_SCRATCH_BYTES as u64);
-        }
+        for layout in owners.values() {requests.push(layout.packed_bytes()? as u64);}
+
     }
     Ok(requests)
 }

@@ -336,15 +336,15 @@ impl<'a> CsaLayer<'a> {
             "self_attn.sparse_indexer_w.weight",
         ];
         let native_slots = super::native::ATTENTION_SLOTS[..3].iter()
-            .filter(|&&slot| layout.core.contains_key(&format!("model.layers.{layer_id}.{}", suffixes[slot])))
+            .filter(|&&slot| layout.native_projection(&format!("model.layers.{layer_id}.{}", suffixes[slot])))
             .count();
         ensure!(matches!(native_slots, 0 | 3), "CSA layer {layer_id} incomplete EXL3 q/k/v");
         let native_layer = native_slots > 0;
-        let native_o = layout.core.contains_key(&format!("model.layers.{layer_id}.self_attn.o_proj.weight"));
+        let native_o = layout.native_projection(&format!("model.layers.{layer_id}.self_attn.o_proj.weight"));
         let weights = suffixes
             .iter()
             .map(|s| {
-                if layout.core.contains_key(&format!("model.layers.{layer_id}.{s}")) { return Ok(None); }
+                if layout.native_projection(&format!("model.layers.{layer_id}.{s}")) { return Ok(None); }
                 layout
                     .operands
                     .iter()
@@ -386,8 +386,8 @@ impl<'a> CsaLayer<'a> {
                 .flatten()
                 .map(|w| w.allocation_bytes)
                 .chain(super::native::ATTENTION_SLOTS.iter().filter(|&&slot|
-                    layout.core.contains_key(&format!("model.layers.{layer_id}.{}", suffixes[slot]))).map(|&slot|
-                    layout.core[&format!("model.layers.{layer_id}.{}", suffixes[slot])].bytes as u64))
+                    layout.native_projection(&format!("model.layers.{layer_id}.{}", suffixes[slot]))).map(|&slot|
+                    layout.projection_bytes(&format!("model.layers.{layer_id}.{}", suffixes[slot])).unwrap()))
                 .chain(dense.as_ref().map(DensePlan::bytes))
                 .collect::<Vec<_>>(),
             if rope.is_none() {
