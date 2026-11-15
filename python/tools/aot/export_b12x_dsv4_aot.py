@@ -584,6 +584,7 @@ def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     index_pages = -(-max_context // PAGE_ROWS)
     out = [
         ("norm", "norm", {}, lambda: ffn.compile_glm_norm_aot(g)),
+        ("norm_head_split", "norm", {"head_split": True}, lambda: ffn.compile_glm_norm_aot(g, head_split=True)),
         ("router_scores", "router_scores", {}, lambda: ffn.compile_glm_router_scores_aot(g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: ffn.compile_glm_expert_input_quant_aot(g)),
     ]
@@ -660,6 +661,7 @@ def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
 
     out = [
         ("norm", "norm", {}, lambda: ffn.compile_mimo_norm_aot(g)),
+        ("norm_head_split", "norm", {"head_split": True}, lambda: ffn.compile_mimo_norm_aot(g, head_split=True)),
         ("router_scores", "router_scores", {}, lambda: ffn.compile_mimo_router_scores_aot(g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: ffn.compile_mimo_expert_input_quant_aot(g)),
         ("head_fp8", "head_fp8", {}, lambda: attn.compile_mimo_head_fp8_aot(g)),
