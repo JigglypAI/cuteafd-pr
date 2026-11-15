@@ -276,7 +276,7 @@ fn stacked_projection<'a>(name: &'a str, prefix: &str) -> Option<(usize, Fp8Proj
         .then_some((layer.parse().ok()?, projection, suffix))
 }
 
-fn fused_mxfp8_projection<'a>(name: &'a str, prefix: &str) -> Option<(usize, &'a str, &'a str)> {
+fn fused_native_projection<'a>(name: &'a str, prefix: &str) -> Option<(usize, &'a str, &'a str)> {
     let (layer, rest) = name.strip_prefix(prefix)?.strip_prefix("layers.")?.split_once('.')?;
     let (stem, suffix) = rest.strip_prefix("mlp.experts.")?.split_once('_')?;
     (matches!(stem, "w13" | "w2") && matches!(suffix, "weight" | "weight_scale"))
@@ -427,7 +427,7 @@ impl Fp8ExpertTensors {
                 .with_context(|| format!("expert role needs tensor {needed} in shard {shard} at snapshot {}", snapshot.display()))?
             {
                 if routed(&meta.name) && weight_map.get(&meta.name) == Some(shard) {
-                    if let Some((layer, stem, suffix)) = fused_mxfp8_projection(&meta.name, prefix) {
+                    if let Some((layer, stem, suffix)) = fused_native_projection(&meta.name, prefix) {
                         ensure!(shape.experts > 0 && meta.shape.len() == 3
                             && meta.shape[0] == shape.experts,
                             "{}: expected uniform fused expert axis", meta.name);
