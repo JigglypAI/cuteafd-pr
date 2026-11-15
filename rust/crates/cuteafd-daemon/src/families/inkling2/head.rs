@@ -90,22 +90,28 @@ impl<'a> Head<'a> {
     }
     pub fn project(&self, k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
         cfg: &Inkling2Config, rows: usize, candidates: usize) -> Result<Buffer> {
-        ensure!(rows>0 && rows<=self.rows && owner.stream().raw == self.stream.raw
+        self.project_at(k, owner, target, cfg, rows, candidates, 0)
+    }
+    pub fn project_at(&self, k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+        cfg: &Inkling2Config, rows: usize, candidates: usize, output_row: usize) -> Result<Buffer> {
+        ensure!(rows>0 && output_row.checked_add(rows).is_some_and(|end| end <= self.rows) && owner.stream().raw == self.stream.raw
             && owner.stream().device.id == self.stream.device.id,
             "Inkling head rows/producer stream differ from admitted owner");
         k.residual(owner, target.operand("model.llm.attn_res.output_query")?.buffer,
             owner.buffer("partial")?, owner.buffer("mixed")?, rows, 1, candidates, false)?;
         k.norm(owner, owner.buffer("mixed")?, target.operand("model.llm.norm.weight")?.buffer,
             self.normalized.buffer, false, Precision::Bf16, rows)?;
+        let logits = super::cache::view(self.logits.buffer, output_row*cfg.unpadded_vocab_size*4,
+            rows*cfg.unpadded_vocab_size*4)?;
         // SAFETY: BF16 normalized rows and trimmed weight matrix stay live;
-        // shared head writes contiguous F32 logits, then shared softcap in place.
+        // checked output-row window keeps every request's logits disjoint.
         unsafe {
             target_head::launch(TargetHead::configured(), &self.head, self.normalized.buffer.ptr,
-                target.operand("model.llm.unembed.weight")?.buffer.ptr, self.logits.buffer.ptr.cast(), rows, self.stream.raw)?;
-            self.stream.device.library.cuda_logits_softcap_f32_async(self.logits.buffer.ptr, rows,
+                target.operand("model.llm.unembed.weight")?.buffer.ptr, logits.ptr.cast(), rows, self.stream.raw)?;
+            self.stream.device.library.cuda_logits_softcap_f32_async(logits.ptr, rows,
                 cfg.unpadded_vocab_size, cfg.unpadded_vocab_size, cfg.final_softcap as f32, self.stream.raw)?;
         }
-        Ok(self.logits.buffer)
+        Ok(logits)
     }
     /// Vocabulary storage remains <=64 rows regardless of prompt length. The
     /// shared consumer finishes each tile before the next overwrites it.

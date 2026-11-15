@@ -37,13 +37,39 @@ impl<'a> Execution<'a> {
         let result = (|| {
             let waves = self.link.exchange()?;
             let mut io = TokenIo { kernels: &self.kernels, head: &self.head, cache: &self.requests.cache,
-                target: &self.target, cfg: &self.cfg, tokens, slots: &slots, on_logits };
+                target: &self.target, cfg: &self.cfg, tokens, slots: &slots, retained_rows: false, on_logits };
             Stateful { kernels: &self.kernels, owners: &self.requests.prefill, cache: &self.requests.cache,
                 target: &self.target, cfg: &self.cfg, placements, uploads: &mut self.requests.prefill_uploads,
                 waves, onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
-                placement_version: version, io: &mut io }.run(units)?;
+                placement_version: version, kind: cuteafd_transport::ExpertV2SourceKind::Prefill, io: &mut io }.run(units)?;
             self.requests.decode.stream.drain()?;
             crate::shared::spark_waves::healthy()
+        })();
+        if result.is_err() { self.terminate(); }
+        result
+    }
+    /// Eager non-speculative decode uses the admitted decode owner and shared
+    /// unit executor. Each member's output row remains in the one bounded head.
+    pub fn decode(&mut self, placements: &mut [Placement], tokens: &[&[u32]], unit: &Unit,
+        version: u64) -> Result<DeviceLogits> {
+        ensure!(!self.terminal && !placements.is_empty() && placements.len() == tokens.len()
+            && unit.rows.len() <= 64 && unit.slot == 0, "Inkling decode exceeds admitted head/owner");
+        let slots = placements.iter().map(|placement| placement.slot).collect::<Vec<_>>();
+        let result = (|| {
+            let waves = self.link.exchange()?;
+            let mut io = TokenIo { kernels: &self.kernels, head: &self.head, cache: &self.requests.cache,
+                target: &self.target, cfg: &self.cfg, tokens, slots: &slots, retained_rows: true,
+                on_logits: &mut |_, _, _| Ok(()) };
+            Stateful { kernels: &self.kernels, owners: std::slice::from_ref(&self.requests.decode),
+                cache: &self.requests.cache, target: &self.target, cfg: &self.cfg, placements,
+                uploads: std::slice::from_mut(&mut self.requests.decode_uploads), waves,
+                onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
+                placement_version: version, kind: cuteafd_transport::ExpertV2SourceKind::Decode, io: &mut io }.run(std::slice::from_ref(unit))?;
+            self.requests.decode.stream.drain()?;
+            crate::shared::spark_waves::healthy()?;
+            Ok(DeviceLogits { ptr: self.head.logits.buffer.ptr, rows: unit.rows.len(),
+                vocab: self.cfg.unpadded_vocab_size, stride: self.cfg.unpadded_vocab_size,
+                stream: self.requests.decode.stream.raw, greedy: None })
         })();
         if result.is_err() { self.terminate(); }
         result

@@ -23,6 +23,7 @@ pub(crate) struct TokenIo<'s, 'a> {
     /// Submission-local token streams in the shared unit sequence order.
     pub tokens: &'s [&'s [u32]],
     pub slots: &'s [usize],
+    pub retained_rows: bool,
     pub on_logits: &'s mut dyn FnMut(usize, usize, crate::shared::token_io::DeviceLogits) -> Result<()>,
 }
 impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
@@ -38,7 +39,9 @@ impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
             for span in crate::shared::probe::head_spans(member.rows.len(), 64)? {
                 let rows = member.rows.start+span.start..member.rows.start+span.end;
                 let state = owner.segment(self.cache, sequence, self.cfg.layers-1, rows)?;
-                let logits = self.head.project(self.kernels, &state, self.target, self.cfg, span.len(), self.cfg.residual_blocks()+1)?;
+                let output_row = if self.retained_rows { member.rows.start+span.start } else { 0 };
+                let logits = self.head.project_at(self.kernels, &state, self.target, self.cfg, span.len(),
+                    self.cfg.residual_blocks()+1, output_row)?;
                 (self.on_logits)(member.sequence, member.tokens.start+span.start+1,
                     crate::shared::token_io::DeviceLogits { ptr: logits.ptr, rows: span.len(),
                         vocab: self.cfg.unpadded_vocab_size, stride: self.cfg.unpadded_vocab_size,
@@ -62,6 +65,7 @@ pub(crate) struct Stateful<'s, 'a> {
     pub local: &'s [Box<dyn Dispatcher + 'a>],
     pub next_identity: &'s mut u64,
     pub placement_version: u64,
+    pub kind: cuteafd_transport::ExpertV2SourceKind,
     pub io: &'s mut dyn UnitIo<'a>,
 }
 impl Stateful<'_, '_> {
@@ -147,9 +151,11 @@ impl PrefillHooks for Stateful<'_, '_> {
         *self.next_identity = identity.checked_add(1).context("Inkling Spark identity exhausted")?;
         let (source, start, version) = (unit.sequence as u64 + 1, unit.rows.start, self.placement_version);
         let staging = RouteStaging::new(rows, self.cfg.topk, self.cfg.hidden + self.cfg.hidden/32)?;
+        let kind = self.kind;
         let origins = unit.reply_origins()?;
-        let combined = origins.as_ref().map_or_else(|| spark_waves::single_reply_eligible(rows, ExpertV2SourceKind::Prefill),
-            |origins| origins.combined_reply_eligible());
+        let combined = if kind == ExpertV2SourceKind::Prefill {
+            origins.as_ref().map_or_else(|| spark_waves::single_reply_eligible(rows, kind), |origins| origins.combined_reply_eligible())
+        } else { spark_waves::single_reply_eligible(rows, kind) };
         owner.stream.device.run(|| {
             // SAFETY: admitted unit owns routes/wire and the issuing stream;
             // shared SM staging finishes before the same unit reuses them.
@@ -158,6 +164,9 @@ impl PrefillHooks for Stateful<'_, '_> {
                 owner.stream.raw, combined, Box::new(move |routes, wire| {
                     let mut request = request(identity, version, layer, source, start, rows, routes, wire)?;
                     if let Some(origins) = origins { origins.apply(&mut request)?; }
+                    if kind != ExpertV2SourceKind::Prefill {
+                        for row in &mut request.rows { row.source_kind = kind; }
+                    }
                     Ok(request)
                 })) }
         })
