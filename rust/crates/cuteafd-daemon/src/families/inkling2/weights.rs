@@ -37,6 +37,8 @@ fn transpose_relative(source: &[u8]) -> Result<Vec<u8>> {
 
 impl<'a> TargetWeights<'a> {
     pub fn load(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoordinatorWeights) -> Result<Self> {
+        ensure!(layout.core.is_empty(),
+            "Inkling compact core is planned; shared native trellis execution binds with the serving stage");
         ensure!(layout.rank == 0 && layout.arena.views().keys().all(|name| !name.contains('#')),
             "Inkling stage2 core mount requires whole coordinator operands");
         ensure!(!crate::shared::experts::rtx::dense::is_recording(),

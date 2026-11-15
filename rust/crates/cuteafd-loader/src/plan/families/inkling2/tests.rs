@@ -290,6 +290,47 @@ fn structural_open_names_missing_tensors_and_accepts_reports_drift_per_tensor() 
 }
 
 #[test]
+fn compact_core_headers_preserve_native_keeps_and_plan_exact_trellis_arenas() -> anyhow::Result<()> {
+    use crate::families::inkling2::weight_layout::CoordinatorWeights;
+    use crate::placement::{families::inkling2::layer_modes, AttentionPlacement};
+    let (_native, config, tensors) = fixture(Fixture::Exl3);
+    for bits in [6, 8] {
+        let dir = tempfile::tempdir()?;
+        let mut compact = Vec::new();
+        for (name, dtype, shape) in &tensors {
+            let selected = name == "model.llm.unembed.weight"
+                || (name.contains(".attn.") && name.ends_with(".weight") && shape.len() == 2
+                    && shape.iter().all(|width| width % 128 == 0));
+            if selected {
+                compact.extend(testing::exl3(name.strip_suffix(".weight").unwrap(), shape[0], shape[1], bits));
+            } else { compact.push((name.clone(), *dtype, shape.clone())); }
+        }
+        testing::write_snapshot(dir.path(), &config, &compact, None);
+        let checkpoint = Checkpoint::open(dir.path())?;
+        let cfg = Inkling2Config::from_hf(&config)?;
+        for (ranks, attention) in [(1, AttentionPlacement::Heads), (2, AttentionPlacement::Heads),
+            (2, AttentionPlacement::Layers)] {
+            let modes = layer_modes(&cfg, ranks, attention);
+            let layouts = CoordinatorWeights::plan(&checkpoint, &cfg, ranks, &modes)?;
+            for layout in layouts {
+                assert!(!layout.core.is_empty());
+                for (stem, core) in &layout.core {
+                    assert_eq!(core.bits, bits);
+                    assert!(!checkpoint.contains_tensor(&format!("{stem}.weight")));
+                    let prefix = if core.ranks == 2 { format!("{stem}#rank{}", core.rank) } else { stem.clone() };
+                    for (name, bytes) in core.arena_tensors(&prefix)? {
+                        assert_eq!(layout.arena.view(&name).unwrap().bytes(), bytes);
+                    }
+                }
+                layout.mount_load(&checkpoint)?;
+                assert!(layout.arena.views().keys().all(|name| !name.ends_with(".mcg")));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
     use crate::families::inkling2::{experts::layer_experts, weight_layout::CoordinatorWeights};
     use crate::placement::families::inkling2::{self as shared, InklingInputs, LocalPackage, SparkCharge};
