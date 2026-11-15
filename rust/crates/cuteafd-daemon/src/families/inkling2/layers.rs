@@ -72,11 +72,16 @@ impl<'a> Kernels<'a> {
     }
     pub fn residual(&self, owner: &impl UnitBuffers<'a>, query: Buffer, addend: Buffer, output: Buffer,
         rows: usize, queries: usize, candidates: usize, add: bool) -> Result<()> {
-        // SAFETY: caller initialized each candidate in the F32 arena; the query
-        // and optional addend are retained through the mix on the unit stream.
-        unsafe { self.producer(Op::Residual { queries, addend: add })?.launch(&[
-            owner.buffer("residual_arena")?, addend, query, output], rows,
-            Some((owner.layout().rows, candidates)), owner.stream().raw) }
+        for query_index in 0..queries {
+            let query = slice(query, query_index*4608*4, 4608*4)?;
+            let output = slice(output, query_index*owner.layout().rows*4608*4, rows*4608*4)?;
+            // SAFETY: one query writes one segment at the original plane pitch;
+            // the source arena retains that pitch across packed members.
+            unsafe { self.producer(Op::Residual { queries: 1, addend: add })?.launch(&[
+                owner.buffer("residual_arena")?, addend, query, output], rows,
+                Some((owner.layout().rows, candidates)), owner.stream().raw)?; }
+        }
+        Ok(())
     }
     pub fn route(&self, owner: &impl UnitBuffers<'a>, logits: Buffer, bias: Buffer, rows: usize) -> Result<()> {
         // SAFETY: native F32 logits/bias and output routes have admitted extents.
@@ -147,7 +152,7 @@ pub(crate) fn attention<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, targe
         ("v", "wv_dv", "v", "conv_v", "v_conv_history")] {
         if !local {
             let query = if branch == "k" { 1 } else { 2 };
-            let mixed = slice(owner.buffer("global_mixes")?, query*rows*4608*4, rows*4608*4)?;
+            let mixed = slice(owner.buffer("global_mixes")?, query*owner.layout().rows*4608*4, rows*4608*4)?;
             k.norm(owner, mixed, weight(&format!("{branch}_input_norm.weight"))?, b("projection_input")?,
                 false, Precision::Bf16, rows)?;
         }

@@ -35,52 +35,83 @@ impl Stateful<'_, '_> {
         let stream = &self.owners.first().context("Inkling prefill has no unit owners")?.stream;
         ensure!(self.owners.iter().all(|owner| std::rc::Rc::ptr_eq(&owner.stream, stream)),
             "Inkling causal state requires one ordered issuing stream");
-        ensure!(units.iter().all(|unit| unit.segments.is_empty() && unit.sequence < self.placements.len()
-            && unit.slot < self.owners.len() && unit.layers == (0..self.cfg.layers)),
-            "Inkling singleton prefill unit differs from admitted request");
+        ensure!(units.iter().all(|unit| unit.slot < self.owners.len() && unit.layers == (0..self.cfg.layers)
+            && members(unit).iter().all(|member| member.sequence < self.placements.len())),
+            "Inkling prefill unit differs from admitted requests");
         let waves = self.owners.len();
         run_prefill_units(self, units, waves)
     }
+    fn join(&mut self, layer: usize, unit: &Unit) -> Result<()> {
+        let owner = &self.owners[unit.slot];
+        for member in members(unit) {
+            let placement = &self.placements[member.sequence];
+            let metadata = cuteafd_loader::families::inkling2::execution::UnitMetadata::new(self.cfg,
+                member.tokens.clone(), &placement.units, self.cache.layout.pool_pages)?;
+            owner.segment_metadata(self.cache, placement.slot, layer, member.rows.clone(), &metadata,
+                &mut self.uploads[unit.slot])?;
+            let state = owner.segment(self.cache, placement.slot, layer, member.rows.clone())?;
+            layers::join_experts(self.kernels, &state, self.target, self.cfg, layer, member.rows.len())?;
+        }
+        Ok(())
+    }
 }
+
+fn members(unit: &Unit) -> Vec<crate::shared::prefill_pipeline::UnitSegment> {
+    if !unit.segments.is_empty() { return unit.segments.clone(); }
+    vec![crate::shared::prefill_pipeline::UnitSegment { sequence: unit.sequence,
+        rows: 0..unit.rows.len(), tokens: unit.rows.clone(), prompt_end: false, snapshot: false, head: false }]
+}
+
 impl PrefillHooks for Stateful<'_, '_> {
     type Ticket = crate::shared::spark_waves::WaveTicket;
     fn route(&self, layer: usize) -> FfnRoute {
         if layer < self.onboarded { FfnRoute::Local } else { FfnRoute::Spark }
     }
     fn begin_unit(&mut self, unit: &Unit) -> Result<()> {
-        let placement = &self.placements[unit.sequence];
-        let metadata = cuteafd_loader::families::inkling2::execution::UnitMetadata::new(self.cfg,
-            unit.rows.clone(), &placement.units, self.cache.layout.pool_pages)?;
-        self.owners[unit.slot].metadata(&metadata, &mut self.uploads[unit.slot])?;
         self.io.begin(unit, &self.owners[unit.slot])
     }
     fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
-        let state = self.owners[unit.slot].bind(self.cache, self.placements[unit.sequence].slot, layer)?;
-        layers::begin_layer(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())
+        let owner = &self.owners[unit.slot];
+        for member in members(unit) {
+            let placement = &self.placements[member.sequence];
+            let metadata = cuteafd_loader::families::inkling2::execution::UnitMetadata::new(self.cfg,
+                member.tokens.clone(), &placement.units, self.cache.layout.pool_pages)?;
+            owner.segment_metadata(self.cache, placement.slot, layer, member.rows.clone(), &metadata,
+                &mut self.uploads[unit.slot])?;
+            let state = owner.segment(self.cache, placement.slot, layer, member.rows.clone())?;
+            layers::begin_layer(self.kernels, &state, self.target, self.cfg, layer, member.rows.len())?;
+        }
+        Ok(())
     }
     fn local_ffn(&mut self, layer: usize, unit: &Unit) -> Result<()> {
-        let state = self.owners[unit.slot].bind(self.cache, self.placements[unit.sequence].slot, layer)?;
-        layers::finish_layer(self.kernels, &state, self.target, self.local[layer].as_ref(), self.cfg, layer, unit.rows.len())
+        let owner = &self.owners[unit.slot];
+        layers::routed_ffn(self.kernels, owner, self.target, self.local[layer].as_ref(), self.cfg, layer, unit.rows.len())?;
+        self.join(layer, unit)
     }
     fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<Self::Ticket> {
         use crate::shared::{experts::staging::RouteStaging, spark_waves};
         use cuteafd_transport::ExpertV2SourceKind;
         let owner = &self.owners[unit.slot];
-        let state = owner.bind(self.cache, self.placements[unit.sequence].slot, layer)?;
         let rows = unit.rows.len();
-        layers::prepare_routes(self.kernels, &state, self.target, self.cfg, layer, rows)?;
+        layers::prepare_routes(self.kernels, owner, self.target, self.cfg, layer, rows)?;
         let identity = *self.next_identity;
         ensure!(identity > 0, "Inkling Spark request identity is zero");
         *self.next_identity = identity.checked_add(1).context("Inkling Spark identity exhausted")?;
         let (source, start, version) = (unit.sequence as u64 + 1, unit.rows.start, self.placement_version);
         let staging = RouteStaging::new(rows, self.cfg.topk, self.cfg.hidden + self.cfg.hidden/32)?;
+        let origins = unit.reply_origins()?;
+        let combined = origins.as_ref().map_or_else(|| spark_waves::single_reply_eligible(rows, ExpertV2SourceKind::Prefill),
+            |origins| origins.combined_reply_eligible());
         owner.stream.device.run(|| {
             // SAFETY: admitted unit owns routes/wire and the issuing stream;
             // shared SM staging finishes before the same unit reuses them.
             unsafe { self.waves.send(rows, rows*self.cfg.hidden*2, staging,
                 [owner.buffer("route_ids")?, owner.buffer("route_weights")?, owner.buffer("expert_wire")?],
-                owner.stream.raw, spark_waves::single_reply_eligible(rows, ExpertV2SourceKind::Prefill),
-                Box::new(move |routes, wire| request(identity, version, layer, source, start, rows, routes, wire))) }
+                owner.stream.raw, combined, Box::new(move |routes, wire| {
+                    let mut request = request(identity, version, layer, source, start, rows, routes, wire)?;
+                    if let Some(origins) = origins { origins.apply(&mut request)?; }
+                    Ok(request)
+                })) }
         })
     }
     fn land_experts(&mut self, layer: usize, unit: &Unit, ticket: Self::Ticket) -> Result<()> {
@@ -93,15 +124,16 @@ impl PrefillHooks for Stateful<'_, '_> {
             unsafe { self.waves.reduce(slot, std::ptr::null(), owner.buffer("expert_output")?.ptr.cast(),
                 unit.rows.len(), owner.stream.raw) }
         })?;
-        let state = owner.bind(self.cache, self.placements[unit.sequence].slot, layer)?;
-        layers::join_experts(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())
+        self.join(layer, unit)
     }
     fn end_unit(&mut self, unit: &Unit) -> Result<()> { self.io.end(unit, &self.owners[unit.slot]) }
     fn commit_unit(&mut self, unit: &Unit) -> Result<()> {
-        let placement = &mut self.placements[unit.sequence];
-        ensure!(placement.state_len == unit.rows.start, "Inkling causal commit is out of order");
-        placement.state_len = unit.rows.end;
-        placement.len = unit.rows.end;
+        for member in members(unit) {
+            let placement = &mut self.placements[member.sequence];
+            ensure!(placement.state_len == member.tokens.start, "Inkling causal commit is out of order");
+            placement.state_len = member.tokens.end;
+            placement.len = member.tokens.end;
+        }
         Ok(())
     }
 }
