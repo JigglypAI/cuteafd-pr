@@ -1015,6 +1015,9 @@ impl<'a> ServingPrefill<'a> {
     fn decode_heads(&mut self, storage: &Storage<'a>, cfg: &MiniMaxM3Config,
         schedule: &Requests, requests: &[ServingRequest<'_>], rows: usize,
         graphs: &mut [Graphs<'a, Storage<'a>>], captured: bool) -> Result<DeviceLogits> {
+        let graph_rows = if captured { graphs[0].row_key(rows)? } else { rows };
+        ensure!(graphs.iter().all(|graph| graph.row_key(rows).ok() == Some(graph_rows)) || !captured,
+            "MiniMax Heads graph row buckets differ between ranks");
         for graph in graphs.iter_mut() { graph.cycle(crate::shared::decode_graph::device::Cycle::Decode); }
         let heads = storage.heads.as_ref().context("MiniMax Heads owner missing")?;
         let result = (|| {
@@ -1050,16 +1053,16 @@ impl<'a> ServingPrefill<'a> {
                     if captured {
                         // SAFETY: live rows key fixed projection shapes; cache append and
                         // context-dependent attention launch scalars stay outside capture.
-                        unsafe { graphs[gpu].run(Key { rank: gpu, layer, rows, op: Op::Projection }, None,
+                        unsafe { graphs[gpu].run(Key { rank: gpu, layer, rows: graph_rows, op: Op::Projection }, None,
                             || rank.decode.borrow_mut().decode_projection_enqueue(&rank.kernels,
-                                &rank.weights, &rank.layout, layer, rows))?; }
+                                &rank.weights, &rank.layout, layer, graph_rows))?; }
                         // SAFETY: eager attention consumes the same retained projections and live metadata.
                         unsafe { rank.decode.borrow_mut().decode_attention(&rank.kernels, &rank.weights,
                             &rank.layout, layer, request)?; }
                         // SAFETY: O projection has no live-context scalars and writes a retained FP32 partial.
-                        unsafe { graphs[gpu].run(Key { rank: gpu, layer, rows, op: Op::OutputProjection }, None,
+                        unsafe { graphs[gpu].run(Key { rank: gpu, layer, rows: graph_rows, op: Op::OutputProjection }, None,
                             || rank.decode.borrow_mut().finish_attention(&rank.kernels, &rank.weights,
-                                &rank.layout, layer, rows))?; }
+                                &rank.layout, layer, graph_rows))?; }
                     } else {
                         // SAFETY: same owner-only KV and live metadata contract.
                         unsafe { rank.decode.borrow_mut().decode(&rank.kernels, &rank.weights,
@@ -1071,6 +1074,16 @@ impl<'a> ServingPrefill<'a> {
                     let b = storage.ranks[1].decode.borrow();
                     let tag = super::heads::Tag { unit: usize::MAX, layer, rows, kind: super::heads::Reduction::Attention };
                     heads.reduce(&storage.ranks, [&a, &b], [tag; 2])?;
+                    if graph_rows > rows {
+                        for unit in [&*a, &*b] {
+                            let tail = super::cache::view(unit.plane("residual")?, rows * cfg.hidden * 4,
+                                (graph_rows - rows) * cfg.hidden * 4)?;
+                            unit.stream.device.run(|| {
+                                // SAFETY: bucket padding belongs only to private arithmetic scratch, never KV.
+                                unsafe { unit.stream.device.library.cuda_zero_bytes_async(tail, tail.bytes, unit.stream.raw) }
+                            })?;
+                        }
+                    }
                 }
                 let ticket = if let Some(binding) = self.bindings[layer] {
                     let rank = &storage.ranks[0];
@@ -1078,8 +1091,8 @@ impl<'a> ServingPrefill<'a> {
                     owner.router_boundary()?;
                     if captured {
                         // SAFETY: fixed live rows and retained router operands; host boundary stays eager.
-                        unsafe { graphs[0].run(Key { rank: 0, layer, rows, op: Op::Router }, None,
-                            || owner.router_enqueue(&rank.kernels, &rank.weights, layer, rows))?; }
+                        unsafe { graphs[0].run(Key { rank: 0, layer, rows: graph_rows, op: Op::Router }, None,
+                            || owner.router_enqueue(&rank.kernels, &rank.weights, layer, graph_rows))?; }
                     } else { owner.router_enqueue(&rank.kernels, &rank.weights, layer, rows)?; }
                     if let Some(usage) = &storage.usage {
                         let tally = usage.routes(owner.stream.device.id, layer,
@@ -1102,10 +1115,10 @@ impl<'a> ServingPrefill<'a> {
                 for (gpu, rank) in storage.ranks.iter().enumerate() {
                     rank.decode.borrow().ffn_boundary(shared)?;
                     let work = || rank.decode.borrow_mut().ffn_enqueue(&rank.kernels, &rank.weights,
-                        &rank.layout, layer, rows, shared);
+                        &rank.layout, layer, graph_rows, shared);
                     let submitted = if captured {
                         // SAFETY: fixed live rows and retained half-FFN operands; host lease transition stays eager.
-                        unsafe { graphs[gpu].run(Key { rank: gpu, layer, rows, op: Op::Ffn }, None, work) }
+                        unsafe { graphs[gpu].run(Key { rank: gpu, layer, rows: graph_rows, op: Op::Ffn }, None, work) }
                     } else { work() };
                     if let Err(error) = submitted {
                         crate::shared::decode_graph::fatal_drain(heads.publish_abort(), "MiniMax Heads partial before ticket drop");
@@ -1559,13 +1572,15 @@ mod tests {
         let decode = source.split_once("    fn decode_heads(").unwrap().1
             .split_once("    fn decode_split(").unwrap().0;
         for op in ["Projection", "OutputProjection", "Router", "Ffn"] {
-            assert!(decode.contains(&format!("rows, op: Op::{op}")));
+            assert!(decode.contains(&format!("rows: graph_rows, op: Op::{op}")));
         }
         assert!(decode.contains("router_boundary()?"));
         assert!(decode.contains("ffn_boundary(shared)?"));
         assert!(decode.contains("decode_attention("));
         assert!(decode.contains("heads.reduce("));
-        assert!(!decode.contains("row_key(rows)"), "Heads attention and FFN use identical live row shapes");
+        assert!(decode.contains("row_key(rows)"));
+        assert!(decode.contains("let source = storage.ranks[0].decode.borrow().routed_rows(rows)?"));
+        assert!(decode.contains("layer, rows, kind: super::heads::Reduction::Attention"));
         let owners = include_str!("owners.rs");
         let prewarm = owners.split_once("    fn prewarm_heads(").unwrap().1
             .split_once("    fn prewarm_split(").unwrap().0;
