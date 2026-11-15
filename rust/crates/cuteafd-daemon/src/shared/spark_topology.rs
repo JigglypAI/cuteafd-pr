@@ -86,14 +86,10 @@ mod tests {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let data: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../../scripts/build/spark-package-ranges.json"))?;
-        let python = source.join(".venv/bin/python");
-        let python = if python.is_file() { python } else {
-            let common = std::process::Command::new("git").arg("-C").arg(&source)
-                .args(["rev-parse", "--path-format=absolute", "--git-common-dir"]).output()?;
-            anyhow::ensure!(common.status.success(), "cannot locate checkout Python environment");
-            std::path::Path::new(std::str::from_utf8(&common.stdout)?.trim())
-                .parent().unwrap().join(".venv/bin/python")
-        };
+        let python = std::env::var_os("CUTEAFD_TEST_PYTHON").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+                .join(".cache/cuteafd/gate-venv/bin/python"));
+        ensure!(python.is_file(), "CUTEAFD_TEST_PYTHON must name the gate Python");
         let mut tested = Vec::new();
         for (key, _) in data["entries"].as_object().unwrap() {
             let (family, format) = key.split_once(':').unwrap();
@@ -469,6 +465,7 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
     #[test]
     fn native_worlds_share_serve_transport_and_launch_qualification() -> Result<()> {
         use cuteafd_loader::plan::testing;
+        launch_check()?;
         for (family, write) in [
             ("v41", testing::write_v41_snapshot as fn(&std::path::Path)),
             ("dsv4f", testing::write_v4_snapshot),
@@ -481,7 +478,6 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
             for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
                 let canonical = require_world(SparkWorld::canonical(ranks)?, &catalog);
                 assert_eq!(canonical.is_ok(), supported.contains(&ranks), "{family} TP{ranks}: {canonical:?}");
-                launch_check(ranks)?;
             }
         }
         // V4.1 serves every rank count its MXFP4 package range names on the
@@ -499,12 +495,12 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
 
     /// The launcher carries no Spark topology keys: every count passes its
     /// shell validation and checkpoint recipes are checked by serve.
-    fn launch_check(ranks: usize) -> Result<()> {
+    fn launch_check() -> Result<()> {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let output = std::process::Command::new("bash")
-            .args(["-c", "source \"$1/scripts/lib/release-common.sh\"; SPARK_COUNT=$2; EXPERT_FORMAT=native; SPARKINFER_EXL3=disable; release_validate_spark_count", "launch-test"])
-            .arg(source).arg(ranks.to_string()).output()?;
-        assert!(output.status.success(), "TP{ranks}: {}", String::from_utf8_lossy(&output.stderr));
+            .args(["-c", "source \"$1/scripts/lib/release-common.sh\"; EXPERT_FORMAT=native; SPARKINFER_EXL3=disable; for SPARK_COUNT in {1..8}; do release_validate_spark_count || exit; done", "launch-test"])
+            .arg(source).output()?;
+        assert!(output.status.success(), "launcher count qualification: {}", String::from_utf8_lossy(&output.stderr));
         Ok(())
     }
 
@@ -521,7 +517,7 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                 "glmf" => { let cfg = testing::glm5_flash_config(3); testing::write_snapshot(root.path(), &cfg, &testing::glm5_flash_tensors(&cfg), None); ("fp8", 2048) }
                 "qwen4" => { let (tensors, _) = testing::qwen4_exl3(3, 4); testing::write_snapshot(root.path(), &testing::qwen4_config(3), &tensors, None); ("exl3-k4", 640) }
                 "dsv4p" => { testing::write_v4_pro_exl3_snapshot(root.path()); ("exl3-k23", 3072) }
-                "kimik3" => { testing::write_kimi_snapshot(root.path(), true); ("exl3-k23", 3072) }
+                "kimik3" => { testing::write_kimi_snapshot(root.path(), false); ("exl3-k23", 3072) }
                 _ => unreachable!(),
             };
             let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
@@ -529,7 +525,6 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                 let expected = cuteafd_loader::plan::experts::spark_recipe(&format!("{family}:{format}"), intermediate, ranks).is_ok();
                 let served = require_world(SparkWorld::canonical(ranks)?, &catalog);
                 assert_eq!(served.is_ok(), expected, "{family} TP{ranks}: {served:?}");
-                launch_check(ranks)?;
             }
         }
         Ok(())

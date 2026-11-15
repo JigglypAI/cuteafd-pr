@@ -624,13 +624,15 @@ mod tests {
         use crate::formats::trellis_core::ProjectionScratchLayout;
         let fixture = super::super::tests::exl3_snapshot();
         let checkpoint = Checkpoint::open(fixture.path())?;
+        let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
+        let layouts = (0..3).map(|stage| RankWeightLayout::for_mtp_stage(&checkpoint, stage))
+            .collect::<Result<Vec<_>>>()?;
         for unit in [16, 64, 2752, 4096] {
             let rows = mtp_rows(unit)?;
             assert_eq!(rows.layer, unit);
             assert_eq!(rows.head, unit.min(64));
             let mut expected = 0u64;
-            for stage in 0..3 {
-                let layout = RankWeightLayout::for_mtp_stage(&checkpoint, stage)?;
+            for layout in &layouts {
                 let mut layer_owners = std::collections::BTreeMap::<&str, ProjectionScratchLayout>::new();
                 for (name, core) in &layout.core {
                     let [n, k] = core.shape;
@@ -649,7 +651,6 @@ mod tests {
                 for layout in layer_owners.values() { expected += layout.packed_bytes()? as u64; }
             }
             assert_eq!(mtp_native_scratch_bytes(&checkpoint, 3, unit)?, expected);
-            let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
             let requests = mtp_native_scratch_requests(&checkpoint, &contract, 3, unit)?;
             assert_eq!(requests.len(), 12, "four independent backings per MTP stage");
             assert_eq!(requests.iter().sum::<u64>(), expected);

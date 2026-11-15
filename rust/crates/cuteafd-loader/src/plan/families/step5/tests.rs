@@ -1413,6 +1413,12 @@ pub(crate) fn exl3_snapshot() -> tempfile::TempDir {
     dir
 }
 
+fn exl3_core_snapshot() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_step5_exl3_snapshot_layers(dir.path(), &[3]);
+    dir
+}
+
 #[test]
 fn exl3_recipe_headers_classify_core_routed_mtp_and_kept_tensors() -> anyhow::Result<()> {
     let fixture = exl3_snapshot();
@@ -1466,7 +1472,8 @@ fn exl3_spark_world_admission_follows_planner_fit() {
 #[test]
 fn exl3_plan_reports_every_component_ready_and_k46_spark_recipe() {
     let fixture = exl3_snapshot();
-    let report = plan::plan(fixture.path(), &PlanOptions {
+    let input = testing::BudgetedPlanInput::open(fixture.path()).unwrap();
+    let report = input.plan(&PlanOptions {
         placement: ExpertPlacement::from_spark_ranks(4), ..Default::default() }).unwrap();
     for component in &report.components {
         assert!(matches!(component.status, Status::Ready | Status::Disabled | Status::Unused),
@@ -1559,8 +1566,9 @@ fn install_exl3_rtx_package(manifest: &std::path::Path) { testing::install_step5
 fn exl3_two_rtx_onboards_tp2_halves_and_sparks_keep_the_rest() {
     use crate::placement::{ExpertHome, OnboardSetting};
     let fixture = exl3_snapshot();
+    let input = testing::BudgetedPlanInput::open(fixture.path()).unwrap();
     let manifest = native_manifest(fixture.path());
-    let plan_with = |onboard: Option<OnboardSetting>| plan::plan(fixture.path(), &PlanOptions {
+    let plan_with = |onboard: Option<OnboardSetting>| input.plan(&PlanOptions {
         placement: ExpertPlacement::from_spark_ranks(6), draft_ownership: Some(spec::DraftOwnership::None),
         layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2],
             workspace_manifest: Some(manifest.clone()), onboard, ..Default::default() }),
@@ -1636,13 +1644,15 @@ fn exl3_card_columns_fit_from_headers() {
     let fixture = exl3_snapshot();
     let manifest = native_manifest(fixture.path());
     install_exl3_rtx_package(&manifest);
-    let fit = |gpus: usize, sparks: usize| plan::plan(fixture.path(), &PlanOptions {
+    let input = testing::BudgetedPlanInput::open(fixture.path()).unwrap();
+    let fit = |gpus: usize, sparks: usize| input.plan(&PlanOptions {
         placement: ExpertPlacement::from_spark_ranks(sparks), draft_ownership: Some(spec::DraftOwnership::None),
         layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; gpus],
             workspace_manifest: Some(manifest.clone()), ..Default::default() }),
         ..Default::default() }).unwrap();
-    for (gpus, sparks) in [(1, 2), (1, 3), (1, 4), (2, 4), (2, 6)] {
+    for (gpus, sparks) in [(1, 3), (2, 6)] {
         let report = fit(gpus, sparks);
+        assert!(report.wip_launchable(), "{gpus}+{sparks}: {:?}", report.hints);
         let summary = report.memory_layout.as_ref().map(|m| {
             let spark = m.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark)
                 .map(|d| d.used_bytes() >> 30).max().unwrap_or(0);
@@ -1651,40 +1661,37 @@ fn exl3_card_columns_fit_from_headers() {
         eprintln!("Step-5 EXL3 {gpus} RTX + {sparks} Sparks: launchable={} {summary:?} {:?}",
             report.wip_launchable(), report.hints.iter().map(|h| &h.what).collect::<Vec<_>>());
     }
-    assert!(fit(2, 6).wip_launchable());
-    if let Some(snapshot) = std::env::var_os("CUTEAFD_STEP5_EXL3_SNAPSHOT") {
-        for (gpus, sparks) in [(1, 3), (2, 6)] {
-            let real = plan::plan(std::path::Path::new(&snapshot), &PlanOptions {
-                placement: ExpertPlacement::from_spark_ranks(sparks),
-                draft_ownership: Some(spec::DraftOwnership::None),
-                layout: Some(layout::LayoutOptions {
-                    host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; gpus],
-                    workspace_manifest: Some(manifest.clone()), ..Default::default()
-                }), ..Default::default()
-            }).unwrap();
-            let expected = fit(gpus, sparks);
-            let actual = real.memory_layout.as_ref().unwrap();
-            let fixture = expected.memory_layout.as_ref().unwrap();
-            assert!(real.wip_launchable(), "{:#?}", real.hints);
-            assert_eq!(real.onboard_layers, expected.onboard_layers);
-            assert_eq!(actual.pool_tokens, fixture.pool_tokens);
-            let spark_bytes = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices.iter()
-                .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark)
-                .map(|d| d.used_bytes()).collect::<Vec<_>>();
-            assert_eq!(spark_bytes(actual), spark_bytes(fixture));
-            eprintln!("Step-5 EXL3 real {gpus}+{sparks}: pool {}, onboard {:?}, Spark bytes {:?}; fixture identical",
-                actual.pool_tokens, real.onboard_layers, spark_bytes(actual));
-        }
-    }
 }
-
-
 /// Host model of Step's target SWA order on one lane: each unit's K/V are
 /// staged into the ring (`AppendRing::proposal`), then every row at position p
 /// reads tokens p-511..=p through the ring page table (slot = token % rows),
 /// then the next unit stages. A ring of window + one unit returns exactly the
 /// staged keys for every read, at every unit size and split, across wraps, and
 /// a restore of the visible window into a fresh ring reads identically.
+#[test]
+#[ignore = "requires CUTEAFD_STEP5_EXL3_SNAPSHOT"]
+fn installed_exl3_card_columns_match_complete_fixture_headers() {
+    let installed = std::env::var_os("CUTEAFD_STEP5_EXL3_SNAPSHOT")
+        .expect("CUTEAFD_STEP5_EXL3_SNAPSHOT is required");
+    let fixture = exl3_snapshot();
+    let manifest = native_manifest(fixture.path());
+    install_exl3_rtx_package(&manifest);
+    let synthetic = testing::BudgetedPlanInput::open(fixture.path()).unwrap();
+    let installed = testing::BudgetedPlanInput::open(std::path::Path::new(&installed)).unwrap();
+    for (gpus, sparks) in [(1, 3), (2, 6)] {
+        let options = PlanOptions { placement: ExpertPlacement::from_spark_ranks(sparks),
+            draft_ownership: Some(spec::DraftOwnership::None),
+            layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                rtx_bytes: vec![96 << 30; gpus], workspace_manifest: Some(manifest.clone()),
+                ..Default::default() }), ..Default::default() };
+        let expected = synthetic.plan(&options).unwrap();
+        let actual = installed.plan(&options).unwrap();
+        assert!(actual.wip_launchable(), "{:?}", actual.hints);
+        assert_eq!(actual.onboard_layers, expected.onboard_layers);
+        assert_eq!(actual.memory_layout.unwrap(), expected.memory_layout.unwrap());
+    }
+}
+
 #[test]
 fn swa_ring_of_one_unit_reads_every_window_exactly_and_restores_byte_identically() {
     use crate::serving_capacity::step5::swa_ring;
@@ -1867,7 +1874,7 @@ fn fp8_tp5_uses_width_recipe_but_still_requires_memory() {
 }
 
 fn native_outputs_snapshot() -> tempfile::TempDir {
-    let dir = exl3_snapshot();
+    let dir = exl3_core_snapshot();
     let root = dir.path();
     let mut index: Value = serde_json::from_slice(&std::fs::read(root.join("model.safetensors.index.json")).unwrap()).unwrap();
     let mut quant: Value = serde_json::from_slice(&std::fs::read(root.join("quantize_config.json")).unwrap()).unwrap();
@@ -1973,7 +1980,7 @@ fn fp8_compact_step_outputs_and_mtp_have_exact_final_storage() -> anyhow::Result
 #[test]
 fn mc_target_views_preserve_fixed_k4_mtp_contract() -> anyhow::Result<()> {
     use crate::plan::checkpoint::{CheckpointView, CoreView};
-    let original = exl3_snapshot();
+    let original = exl3_core_snapshot();
     let cp = Checkpoint::open(original.path())?;
     let cfg = Config::parse(&cp)?;
     let tensors = cp.tensors.iter().map(|t| (t.meta.name.clone(),
