@@ -76,7 +76,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let request = FactsRequest { checkpoint: input.checkpoint(), cfg, manifest_path: manifest_path.as_deref(),
         manifest, coordinator: Coordinator::Planned { cards: cards.clone() }, attention, spark_ranks: ranks,
         spark_bytes, prefill: shape, context_tokens: opts.context_tokens, pool_tokens: opts.pool_tokens, sequences,
-        host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.mimo_prefix_entries,
+        host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.prefix_entries("inkling2"),
+        prefix_mark_budget: opts.mimo_prefix_mark_bytes,
         replies: opts.spark_reply_formats, head: opts.bf16_target_head, expert_usage: opts.expert_usage,
         resident_weight_limit: ResidentWeights(opts.weight_budget_bytes) };
     let inputs = match gather(&request) {

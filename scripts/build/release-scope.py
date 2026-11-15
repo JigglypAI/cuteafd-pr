@@ -187,10 +187,10 @@ def derive(repo, matrix, scope='all', environ=None):
                 experts.update(f'{family}:spark' + ('' if world == 4 else f'_tp{world}')
                                for world in packages.package_worlds(family, 'mxfp4'))
                 continue
-            if kind not in ('fp8', 'bf16', 'nvfp4', 'nvfp4a4') and not kind.startswith('exl3-k'):
+            if kind not in ('fp8', 'bf16', 'nvfp4', 'nvfp4a4', 'mxfp8') and not kind.startswith('exl3-k'):
                 continue
-            if family in ('glmfdense', 'inkling2'):
-                continue  # Dense-only MLPs and Inkling 2 (coordinator packages only) have no Spark package.
+            if family == 'glmfdense':
+                continue  # Dense-only MLPs have no Spark package.
             format = 'exl3' if kind.startswith('exl3-k') else kind
             formats = (format, 'nvfp4a4') if format == 'nvfp4' and family != 'step5' else (format,)
             counts.update(f'{family}:{alias}={world}' for alias in formats

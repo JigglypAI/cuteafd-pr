@@ -70,40 +70,48 @@ pub struct FactsRequest<'a> {
     pub host: (u64, u64),
     pub host_cache_bytes: Option<u64>,
     pub prefix_entries: u64,
+    pub prefix_mark_budget: u64,
     pub replies: cuteafd_core::spark_reply::SparkReplyFormats,
     pub head: serving::BlasHead,
     pub expert_usage: bool,
     pub resident_weight_limit: ResidentWeights,
 }
 
-/// The installed coordinator package's executor workspace at the unit rows.
-/// No Inkling 2 RTX expert package ships yet (#1930 stage 3), so this names
-/// the missing package; the recipe then refuses onboarding counts above zero
-/// and the plan says so.
-pub fn local_package(storage: &[ExpertStorage], manifest: Option<&Path>, gpus: usize) -> LocalPackage {
-    let formats = storage.iter().map(|s| match s {
-        ExpertStorage::Mxfp8 => "fp8-inkling2-mxfp8", ExpertStorage::Nvfp4 => "fp8-inkling2-nvfp4a4",
-        ExpertStorage::Exl3 { .. } => "exl3-inkling2-k4" }).collect::<std::collections::BTreeSet<_>>();
-    let parent = manifest.and_then(Path::parent).unwrap_or(Path::new("/opt/cuteafd/share"));
-    let installed = formats.iter().all(|name| {
-        let dir = if name.starts_with("exl3") { parent.join(name) } else { parent.join("fp8").join(name) };
-        dir.join("manifest.json").is_file() && (1..=gpus).all(|tp| dir.join(format!("{}tp{tp}", if name.starts_with("exl3") { "rtx-" } else { "" })).is_dir())
-    });
-    if installed {
-        // Workspace sizing from the installed manifest lands with the package (stage 3).
-        return LocalPackage::Missing(format!("Inkling 2 RTX expert packages {formats:?} are installed but their executor \
-            workspace is not yet admitted; onboarding qualifies in stage 3 (#1930)"));
-    }
-    LocalPackage::Missing(format!("no installed Inkling 2 RTX expert package {formats:?} beside {} (#1930 stage 3)",
-        parent.display()))
+/// Shared installed executor owners, never a family scratch estimate. Each
+/// independently retained native backend owns its scratch/output once.
+pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: Option<&Path>,
+    gpus: usize, rows: u64) -> LocalPackage {
+    let workspace = || -> anyhow::Result<LocalPackage> {
+        anyhow::ensure!((1..=2).contains(&gpus), "Inkling local package requires one or two ranks");
+        let mut workspace = [0u64; 2];
+        if let Some(tensors) = catalog.fp8() {
+            let layers = (catalog.routed_experts().first_layer..catalog.routed_experts().layers).collect::<Vec<_>>();
+            let groups = tensors.homogeneous_layers(&layers)?;
+            let bytes = groups.iter().try_fold(0u64, |sum, (view, _)| -> anyhow::Result<u64> {
+                let requests = crate::placement::rtx_onboard::fp8_workspace_requests(view,
+                    manifest, rows, gpus, "inkling2")?;
+                let scratch = *requests.first().context("native package scratch absent")?;
+                let (_, _, bytes) = crate::serving_capacity::fp8moe_tp2_workspace(usize::try_from(scratch)?,
+                    catalog.routed_experts().hidden, usize::try_from(rows)?)?;
+                sum.checked_add(bytes as u64).context("Inkling native backend owners overflow")
+            })?;
+            workspace[..gpus].fill(bytes);
+        } else {
+            let requests = crate::placement::rtx_onboard::expert_workspace_requests(catalog,
+                manifest, rows, gpus, "inkling2")?;
+            let bytes = requests.into_iter().try_fold(0u64, |sum, bytes| sum.checked_add(bytes)
+                .context("Inkling EXL3 local workspace overflow"))?;
+            workspace[..gpus].fill(bytes);
+        }
+        Ok(LocalPackage::Installed { workspace })
+    };
+    workspace().unwrap_or_else(|error| LocalPackage::Missing(format!("{error:#}")))
 }
 
-/// Spark charges per onboarding count and rank: header-exact expert slices
-/// (whole intermediate blocks per rank), endpoint I/O, typed execution owners
-/// sized by the shared segment formulas at the covering export, and the
-/// shared worker runtime residual. The per-package scratch census joins with
-/// the package (stage 3); until then the scratch term is the formula bound.
-pub fn spark_charges(cfg: &Inkling2Config, experts: &[LayerExperts], routed: &[usize], ranks: usize,
+/// Spark charges use the shared catalog's physical resident layout, the
+/// shared typed-owner census, and endpoint I/O once per rank. Missing census
+/// inputs remain explicit errors; no checkpoint-byte fraction sizes scratch.
+pub fn spark_charges(catalog: &crate::OfficialV41Catalog, experts: &[LayerExperts], routed: &[usize], ranks: usize,
     prefill: PrefillShape, ingress: cuteafd_core::SparkIngress) -> anyhow::Result<Vec<Vec<SparkCharge>>> {
     if ranks == 0 { return Ok(vec![Vec::new(); routed.len() + 1]); }
     anyhow::ensure!((2..=8).contains(&ranks), "Inkling 2 Spark worlds are 2..=8 ranks, not {ranks}");
@@ -116,48 +124,35 @@ pub fn spark_charges(cfg: &Inkling2Config, experts: &[LayerExperts], routed: &[u
         slot_bytes: rings.slot_bytes, alignment: rings.alignment };
     let runtime = cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0).context("Spark runtime residual")?;
     let geometry = cuteafd_core::ExpertGeometry::INKLING2;
-    // Equal intermediate slices over whole 128-row blocks: 2304 / 128 = 18
-    // blocks, so worlds 2..=6 and 9 split exactly and 7/8 take the ceiling.
-    let blocks = cfg.intermediate / 128;
-    let widest_blocks = blocks.div_ceil(ranks);
-    let per_layer = experts.iter().map(|layer| {
-        // The widest rank's share of the layer's checkpoint bytes.
-        layer.source.checked_mul(widest_blocks as u64).and_then(|b| b.checked_div(blocks as u64))
-            .context("Inkling 2 Spark slice overflow")
-    }).collect::<anyhow::Result<Vec<_>>>()?;
     (0..=routed.len()).map(|count| {
         let working = SparkWorkingSet { rtx_layers: routed[..count].to_vec(), spark_layers: routed[count..].to_vec(),
             spark_ranks: ranks, prefill_lanes: shared::LANES };
         (0..ranks).map(|rank| {
             if count == routed.len() { return Ok(SparkCharge { experts: 0, owners: 0, runtime: 0 }); }
             let io = working.rank_endpoints_io(rank, geometry, &[endpoint], rings)?;
-            let width = u32::try_from(widest_blocks * 128)?;
-            let owners = executions.workspace_bytes(|extent| owner_bytes(geometry, width, extent, ingress))?
+            let owners = executions.workspace_bytes(|extent|
+                crate::plan::layout::spark_slots::catalog_owner_bytes(catalog, "inkling2", &working, rank, extent))?
                 .and_then(|bytes| bytes.total()).context("Inkling 2 Spark owner sum overflow")?;
             let owners = [io.intake, io.host_exchange, io.row_indices, io.mapped_rings, io.endpoint_staging, owners]
                 .into_iter().try_fold(0u64, |sum, bytes| sum.checked_add(bytes)).context("Inkling 2 Spark owners")?;
-            Ok(SparkCharge { experts: per_layer[count..].iter().sum(), owners, runtime })
+            let resident = if let Some(tensors) = catalog.fp8() {
+                // The shared native worker packs all homogeneous groups in
+                // one physical arena, in group/projection order.
+                let regions = tensors.homogeneous_layers(&working.spark_layers)?.into_iter()
+                    .map(|(view, layers)| -> anyhow::Result<Vec<(String, usize)>> {
+                        let format = if view.dynamic_nvfp4() { "nvfp4a4" } else { "mxfp8" };
+                        let recipe = crate::plan::experts::spark_recipe(&format!("inkling2:{format}"),
+                            catalog.routed_experts().intermediate, ranks)?;
+                        crate::serving_capacity::fp8_expert_regions(&view, &layers, ranks, rank, recipe.slicing)
+                    }).collect::<anyhow::Result<Vec<_>>>()?.into_iter().flatten();
+                crate::serving_capacity::WeightArenaLayout::new("inkling2/spark-residency", regions)?.bytes() as u64
+            } else {
+                crate::placement::SparkAssignment::resident_from_catalog(catalog, &working, rank,
+                    crate::placement::SparkResidentLayout::Exl3 { world: ranks, rank })?.resident_bytes
+            };
+            Ok(SparkCharge { experts: resident, owners, runtime })
         }).collect()
     }).collect()
-}
-
-/// One FP8-family owner at the shared segment formulas: streamed intermediate
-/// scratch at the compiled export, stream-ordered I/O at the owner's capacity
-/// and packed route staging per queued unit. The installed package's measured
-/// census replaces the scratch term when the package ships (stage 3).
-fn owner_bytes(geometry: cuteafd_core::ExpertGeometry, width: u32, extent: cuteafd_core::OwnerExtent,
-    ingress: cuteafd_core::SparkIngress) -> anyhow::Result<cuteafd_core::OwnerBytes> {
-    let rows = extent.compiled;
-    let scratch = cuteafd_core::spark_executions::segment_scratch_bytes(geometry.hidden, geometry.experts, geometry.topk,
-        cuteafd_core::spark_executions::SegmentArithmetic::Stream {
-            act_row_bytes: width.checked_mul(2).context("activation width overflow")? },
-        rows, cuteafd_core::spark_executions::SEGMENT_MAX_ROWS)
-        .context("Inkling 2 segment scratch overflow")?;
-    let hidden = u64::from(geometry.hidden);
-    let input = u64::from(extent.capacity) * ingress.request_row_bytes(geometry.hidden as usize) as u64;
-    let io = input + u64::from(extent.capacity) * (8 * u64::from(geometry.topk) + 2 * hidden)
-        + u64::from(rows) * (16 + u64::from(geometry.topk) * 8);
-    Ok(cuteafd_core::OwnerBytes { scratch, io, pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 })
 }
 
 /// Gather every admitted owner fact into the shared recipe.
@@ -186,13 +181,18 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
         format!("Inkling 2 routed expert inventory refused: {error:#}"),
         "Provide every routed layer's fused MXFP8/NVFP4 headers or per-expert EXL3 modules."))?;
     let storage = experts.iter().map(|layer| layer.storage.expect("inventory names every layer's storage")).collect::<Vec<_>>();
-    let local = local_package(&storage, request.manifest_path, gpus);
+    let catalog = match &request.checkpoint.view {
+        Some(view) => crate::read_expert_catalog_view(view),
+        None => crate::read_expert_catalog(&request.checkpoint.snapshot),
+    }.map_err(|error| refused(format!("Inkling 2 shared expert catalog refused: {error:#}"),
+        "Provide complete expert headers for the selected checkpoint view."))?;
+    let local = local_package(&catalog, request.manifest_path, gpus, shape.rows.max(u64::from(shared::DECODE_ROWS)));
     // Mixed native checkpoints (NVFP4 then MXFP8) keep the per-layer native
     // ingress; the link is sized for its widest request row (BF16).
-    let ingress = if storage.iter().all(|s| *s == ExpertStorage::Mxfp8) { cuteafd_core::SparkIngress::Fp8K32 }
-        else if storage.iter().any(|s| *s == ExpertStorage::Mxfp8) { cuteafd_core::SparkIngress::Native }
-        else { cuteafd_core::SparkIngress::Bf16 };
-    let spark = spark_charges(cfg, &experts, &routed, ranks, shape, ingress)
+    let first_wire = shared::ingress(storage.first().copied());
+    let ingress = if storage.iter().all(|&storage| shared::ingress(Some(storage)) == first_wire) { first_wire }
+        else { cuteafd_core::SparkIngress::Native };
+    let spark = spark_charges(&catalog, &experts, &routed, ranks, shape, ingress)
         .map_err(|error| refused(format!("Inkling 2 Spark inventory refused: {error:#}"),
             "Use a Spark world of 2..=8 ranks."))?;
     let links = shared::spark_link((gpus - 1) as u8, ranks, shape, request.replies, ingress)
@@ -241,7 +241,8 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
         page_rows).maximum_tokens();
     Ok(InklingInputs { cfg: cfg.clone(), gpus, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
-        maximum_pool_tokens, prefill: shape, sequences: request.sequences, targets, placement, modes,
+        maximum_pool_tokens, prefill: shape, sequences: request.sequences, prefix_entries: request.prefix_entries,
+        prefix_mark_budget: request.prefix_mark_budget, targets, placement, modes,
         routed: routed.clone(), experts, local, spark, links,
         spark_reply_formats: request.replies, drafter: None, vision: None, budgets, code, graph_reserve,
         head: request.head, host_prefix, device_sampling: true,

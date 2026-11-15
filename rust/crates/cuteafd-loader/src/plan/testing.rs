@@ -204,6 +204,12 @@ pub fn t(name: impl Into<String>, dtype: &'static str, shape: &[usize]) -> Tenso
     (name.into(), dtype, shape.to_vec())
 }
 
+/// Native E4M3 expert codes with byte-exact UE8M0 K32 scales.
+pub fn mxfp8(name: &str, n: usize, k: usize) -> Vec<Tensor> {
+    vec![t(format!("{name}.weight"), "F8_E4M3", &[n, k]),
+        t(format!("{name}.weight_scale"), "U8", &[n, k / 32])]
+}
+
 fn width(dtype: &str) -> u64 {
     match dtype {
         "BF16" | "F16" | "I16" => 2,
