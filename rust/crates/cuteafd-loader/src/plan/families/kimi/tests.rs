@@ -772,11 +772,11 @@ fn automatic_context_uses_model_maximum_for_every_core() -> Result<()> {
         let expected = Model::open(&checkpoint)?.cfg.max_position;
         // The planner's unset context selects the same extent; an explicit one wins.
         let report = testing::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
-            layout: Some(plan::layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2], ..Default::default() }), ..Default::default() })?;
+            layout: Some(plan::layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2], ..Default::default() }), ..Default::default() })?;
         let notes = report.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();
         assert!(notes.contains(&format!("Kimi API max context: {expected} tokens")), "{notes}");
         let explicit = testing::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
-            layout: Some(plan::layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2], context_tokens: 262_144, ..Default::default() }),
+            layout: Some(plan::layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2], context_tokens: 262_144, ..Default::default() }),
             ..Default::default() })?;
         let notes = explicit.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();
         assert!(notes.contains("Kimi API max context: 262144 tokens"), "{notes}");

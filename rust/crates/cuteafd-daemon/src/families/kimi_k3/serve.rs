@@ -352,7 +352,7 @@ mod tests {
                 Some(shape.unit_rows as usize))?, cuteafd_loader::serving_capacity::PrefillShape {
                     unit_rows: shape.unit_rows, waves: shape.waves });
             let options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
-                layout: Some(LayoutOptions { rtx_bytes: vec![96 << 30; 2], host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
+                layout: Some(LayoutOptions { rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; 2], host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
                     host_cache_bytes: Some(0), prefill_rows: args.prefill_rows.unwrap_or(0) as u64,
                     prefill_lanes: args.prefill_waves.map_or(0, u64::from), ..Default::default() }),
                 ..Default::default() };

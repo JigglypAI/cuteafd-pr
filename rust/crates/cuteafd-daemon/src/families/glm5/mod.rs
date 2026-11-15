@@ -572,7 +572,7 @@ mod draft_cli_tests {
                     // The Ready item contains decode scratch only. Admission also
                     // reserves the prefill scratch allocated at the first request.
                     let layout = cuteafd_loader::plan::layout::LayoutOptions {
-                        rtx_bytes: vec![96 << 30; gpus], prefill_rows: engine.prefill_rows as u64,
+                        rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; gpus], prefill_rows: engine.prefill_rows as u64,
                         prefill_lanes: u64::from(engine.prefill_waves), prefill_waves: u64::from(engine.prefill_waves),
                         exlr8_prefill_activations: activations.parse::<PrefillActivations>().unwrap(), context_tokens: 65536,
                         onboard: Some(cuteafd_loader::placement::OnboardSetting::Layers(0)), glm5_drafter_disabled: true,

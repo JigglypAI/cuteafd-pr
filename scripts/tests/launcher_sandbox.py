@@ -198,3 +198,17 @@ def fake_nvidia_smi(bin_dir):
     path.write_text("#!" + sys.executable + "\n" + FAKE_NVIDIA_SMI)
     path.chmod(0o755)
     return path
+
+
+class SimCluster:
+    """Canonical script-test environment, customizable once per suite."""
+    def __init__(self, gpus=2, sparks=6, host_gib=184, gpu_bytes=101_973_491_712):
+        self.gpus, self.sparks, self.host_gib, self.gpu_bytes = gpus, sparks, host_gib, gpu_bytes
+
+    def env(self):
+        return {"CUTEAFD_TEST_HOST": json.dumps({"host_ram": [self.host_gib << 30] * 2,
+            "gpu_count": self.gpus, "gpu_bytes": self.gpu_bytes,
+            "spark_count": self.sparks, "spark_bytes": 121 << 30})}
+
+    def devices(self):
+        return fake_gpus(self.gpus, total_mib=self.gpu_bytes >> 20)

@@ -708,7 +708,7 @@ mod draft_prefix_tests {
         let model = crate::plan::families::glm::GLM5_FLASH.open(&checkpoint)?;
         let input = crate::plan::PlanInput::from_checkpoint(checkpoint);
         let mut report = empty_report(&input, &PlanOptions::default())?;
-        let mut options = LayoutOptions { rtx_bytes: vec![96 << 30], prefill_rows: 2752,
+        let mut options = LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], prefill_rows: 2752,
             prefill_unit_rows: Some(2752), prefill_waves: 3, ..Default::default() };
         report.prefill_span_rows = Some(8256);
         let shape = Shape::resolve(&input, &mut report, model.as_ref(), &mut options, ShapePolicy::manifest_bounded());
@@ -787,7 +787,7 @@ mod draft_prefix_tests {
                 "selector_top_k":16, "target_layer_ids":[0,1], "mask_token_id":163592}});
         std::fs::write(draft.path().join("config.json"), config.to_string())?;
         for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
-            let mut options = LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
+            let mut options = LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2], concurrency: 2,
                 mla_kv: format, prefix_slots: Some(2), host_cache_bytes: Some(0),
                 onboard: Some(crate::placement::OnboardSetting::Layers(5)), ..Default::default() };
             let mut report = plan::plan(target.path(), &PlanOptions {
