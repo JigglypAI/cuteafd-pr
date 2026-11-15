@@ -40,10 +40,12 @@ pub(crate) struct InklingBackend<'a> {
     host: Option<cuteafd_hostcache::config::Config>,
     profile: RefCell<[f64; 2]>,
     pending: RefCell<Option<Vec<(usize, usize, Vec<u32>)>>>,
+    selector: Vec<cuteafd_loader::placement::planner::Allocation>,
+    selector_ready: std::cell::Cell<bool>,
 }
 impl<'a> InklingBackend<'a> {
     pub fn new(execution: Execution<'a>, context: usize,
-        host: Option<cuteafd_hostcache::config::Config>) -> Result<Self> {
+        host: Option<cuteafd_hostcache::config::Config>, plan: &cuteafd_loader::placement::planner::ResolvedPlan) -> Result<Self> {
         let library = execution.requests.decode.stream.device.library;
         let cache = execution.requests.cache.clone();
         ensure!(context > 0 && context <= execution.cfg.max_position && context <= cache.layout.pool_pages*64,
@@ -52,9 +54,11 @@ impl<'a> InklingBackend<'a> {
         let unit_rows = execution.requests.prefill[0].layout.rows;
         let waves = execution.requests.prefill.len();
         let vocab = execution.cfg.unpadded_vocab_size;
+        let selector = plan.facts.allocations.iter().filter(|owner| owner.id.starts_with("selector.")).cloned().collect::<Vec<_>>();
+        ensure!(!selector.is_empty(), "Inkling selector was not admitted before startup");
         Ok(Self { execution: RefCell::new(execution), family: InklingPrefix::new(cache), library,
             context, concurrency, unit_rows, waves, vocab, host, profile: RefCell::new([0.; 2]),
-            pending: RefCell::new(None) })
+            pending: RefCell::new(None), selector, selector_ready: std::cell::Cell::new(false) })
     }
     fn check(&self, placement: &Placement, tokens: &[u32], pool: &RefPagePool) -> Result<()> {
         ensure!(!tokens.is_empty() && tokens.iter().all(|&token| (token as usize) < self.vocab)
@@ -121,6 +125,35 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
     fn message_starts(&self) -> &[&str] { &["<|message_system|>", "<|message_user|>", "<|message_model|>", "<|message_tool|>"] }
     fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.library }
     fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
+    fn selector_ready(&self, selector: &mut TokenSelector<'a>) -> Result<()> {
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Location};
+        ensure!(!self.selector_ready.get(), "Inkling selector initialized twice");
+        selector.reserve_sampler()?;
+        let physical = [self.execution.borrow().requests.decode.stream.device.id];
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(CoordinatorDevices::new(&physical)?, "selector",
+            cuteafd_loader::placement::planner::serving::ServingOwners::LIFETIME,
+            cuteafd_core::memory_layout::Category::Workspace, "Inkling selector");
+        selector.allocation_receipts(&mut inventory, "next")?;
+        for receipt in &mut inventory.receipts {
+            receipt.allocation.id = receipt.allocation.id.replacen("selector.next.", "selector.", 1);
+        }
+        let actual = inventory.receipts.iter().filter(|receipt| receipt.allocation.location != Location::HOST)
+            .map(|receipt| (receipt.allocation.id.as_str(), receipt)).collect::<std::collections::BTreeMap<_, _>>();
+        ensure!(actual.len() == self.selector.len(), "Inkling selector owner count differs from admission");
+        for planned in &self.selector {
+            let id = match planned.id.strip_prefix("selector.sampler.") {
+                Some(id) => format!("selector.sampler.{}", cuteafd_core::target_sampler_receipt_key(id)
+                    .with_context(|| format!("Inkling sampler owner has no shared receipt key {id}"))?),
+                None => planned.id.clone(),
+            };
+            let receipt = actual.get(id.as_str()).with_context(|| format!("Inkling missing selector owner {id}"))?;
+            ensure!(receipt.allocation.bytes == planned.bytes && receipt.allocation.location == planned.location
+                && receipt.allocation.lifetime == planned.lifetime && receipt.address != 0,
+                "Inkling selector physical request differs from admission {id}");
+        }
+        self.selector_ready.set(true);
+        Ok(())
+    }
     fn prefix_cache(&self, args: &PrefixArgs, concurrency: usize)
         -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>>)> {
         ensure!(concurrency == self.concurrency && args.prefix_partial == crate::shared::prefix::Toggle::Off,
