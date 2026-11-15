@@ -76,10 +76,12 @@ async fn prefill_purge_precedes_each_warm_up_and_timed_request() {
     fake_engine(forward);
     let router = router_with_console(queue, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
         Duration::from_secs(5), ConsoleHub::disabled());
-    let router = common::with_fake_token_count(router).route("/v1/bench/status", axum::routing::get(|| async {
-        axum::Json(serde_json::json!({"settings":[{"name":"prefill-units", "value":"2752", "source":"resolved"}]}))
-    }));
+    let directory = tempfile::tempdir().unwrap();
+    let bench = cuteafd_bench::Bench::new(cuteafd_bench::store::Store::open(directory.path()).unwrap());
+    bench.set_api_key(cuteafd_api::openai::auth::ApiKey::new("sweep-test-key").unwrap());
+    let router = cuteafd_bench::http::mount(common::with_fake_token_count(router), bench);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    cuteafd_bench::context::mark_ready(listener.local_addr().unwrap());
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {
         axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
@@ -91,7 +93,7 @@ async fn prefill_purge_precedes_each_warm_up_and_timed_request() {
         let purge = || { purged_at.lock().unwrap().push(seen.load(Ordering::SeqCst)); Ok(()) };
         let options = cuteafd_bench::sweep::PrefillOptions { repeat: true, purge: Some(&purge), idle_seconds: 0.03 };
         let started = std::time::Instant::now();
-        let sweep = cuteafd_bench::sweep::run_windowed(&base, None, &[], false, false, &[256, 512], &options, false,
+        let sweep = cuteafd_bench::sweep::run_windowed(&base, Some("sweep-test-key"), &[], false, false, &[256, 512], &options, false,
             cuteafd_bench::sweep::TOKENS, Some(Box::new(move || {
                 record.lock().unwrap().push(counter.load(Ordering::SeqCst));
                 Ok(())
