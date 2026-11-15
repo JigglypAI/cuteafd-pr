@@ -1416,7 +1416,7 @@ mod tests {
     fn native_refuses_unqualified_combinations_before_checkpoint_reads() {
         let mut options = super::super::PlanOptions { placement: super::super::ExpertPlacement::Sparks { ranks: 4 },
             layout: Some(super::super::layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
-                rtx_bytes: vec![96 << 30; 2], ..Default::default() }), ..Default::default() };
+                rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2], ..Default::default() }), ..Default::default() };
         let missing = Path::new("/no-native-checkpoint");
         let error = |o: &super::super::PlanOptions, manifest, draft| native_plan(missing, manifest, o, draft)
             .err().unwrap().to_string();

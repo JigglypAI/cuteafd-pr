@@ -2420,7 +2420,7 @@ pub(super) mod tests {
                 }
                 let admitted = admit(i)?;
                 let mut options = PlanOptions { attention_placement: Some(AttentionPlacement::Layers), placement: ExpertPlacement::Sparks { ranks: 6 },
-                    layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
+                    layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; 2], concurrency: 2,
                         mla_kv: format, context_tokens: context, pool_tokens: Some(context), prefix_slots: Some(2),
                         host_cache_bytes: Some(0), onboard: Some(OnboardSetting::Auto), ..Default::default() }),
                     ..Default::default() };
@@ -2476,7 +2476,7 @@ pub(super) mod tests {
             let report = plan_input.plan(&PlanOptions {
                 attention_placement: Some(AttentionPlacement::Layers),
                 placement: ExpertPlacement::Sparks { ranks: 6 },
-                layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
+                layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; 2], concurrency: 2,
                     mla_kv: format, prefix_slots: Some(2), host_cache_bytes: Some(0),
                     onboard: Some(OnboardSetting::Auto), ..Default::default() }),
                 ..Default::default()

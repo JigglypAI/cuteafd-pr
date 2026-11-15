@@ -162,7 +162,7 @@ mod tests {
                 vision: cuteafd_loader::plan::MediaMode::Off, audio: cuteafd_loader::plan::MediaMode::Off,
                 mapped_scale_host_budget_bytes: Some(64 << 30),
                 layout: Some(LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
-                    rtx_bytes: vec![96 << 30; gpus], host_cache_bytes: Some(0), pool_tokens: Some(262_144),
+                    rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; gpus], host_cache_bytes: Some(0), pool_tokens: Some(262_144),
                     context_tokens: 262_144, prefill_rows: 4096, prefill_lanes: 1,
                     workspace_manifest: manifest, glm5_drafter_disabled: true, glmf_drafter_disabled: true,
                     ..Default::default() }), ..Default::default()

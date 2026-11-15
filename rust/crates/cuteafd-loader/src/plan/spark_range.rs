@@ -471,7 +471,7 @@ mod tests {
             placement: ExpertPlacement::from_spark_ranks(world),
             mapped_scale_host_budget_bytes: Some(64 << 30),
             layout: Some(LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
-                host_cache_bytes: Some(0), rtx_bytes: vec![96 << 30; 2],
+                host_cache_bytes: Some(0), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
                 pool_tokens: Some(262_144), prefill_rows: 256, ..Default::default() }),
             ..Default::default()
         };

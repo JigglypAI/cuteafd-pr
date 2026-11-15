@@ -102,7 +102,7 @@ pub(crate) fn native_planner_fixture() -> (tempfile::TempDir, PlanOptions, crate
     std::fs::write(&manifest, serde_json::to_vec(&exports).unwrap()).unwrap();
     let options = PlanOptions { placement: ExpertPlacement::Local, vision: plan::MediaMode::Off,
         audio: plan::MediaMode::Off, layout: Some(plan::layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
-            rtx_bytes: vec![96 << 30], concurrency: 4, state_slots: Some(4), prefix_slots: Some(10), native_mtp_layers: 0,
+            rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], concurrency: 4, state_slots: Some(4), prefix_slots: Some(10), native_mtp_layers: 0,
             pool_tokens: Some(262144), workspace_manifest: Some(manifest.clone()),
             dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Bf16, ..Default::default() }),
         ..Default::default() };

@@ -665,10 +665,10 @@ def test_v41_starting_config_passes_the_native_config_validation(path: Path, tmp
 
 
 @pytest.mark.parametrize("path", FAMILY, ids=lambda p: p.name)
-def test_family_starting_config_launches_through_run_family(path: Path, tmp_path: Path) -> None:
+def test_family_starting_config_launches_through_run_family(path: Path, tmp_path: Path, launcher_capture) -> None:
     """run.sh dispatches to run-family.sh, which validates every key and prints the argv
     it would start (docker/ssh are stubs)."""
-    result = _family_launch(tmp_path, path)
+    result = launcher_capture((str(path), path.read_text()), lambda: _family_launch(tmp_path, path))
     launch = _coordinator(result)
     values = keys(path)
     sparks = int(values["SPARK_COUNT"])
@@ -693,10 +693,10 @@ def _speculation(launch: str) -> list[str]:
 
 
 @pytest.mark.parametrize("path", FAMILY, ids=lambda p: p.name)
-def test_family_starting_config_matches_the_launcher_defaults(path: Path, tmp_path: Path) -> None:
+def test_family_starting_config_matches_the_launcher_defaults(path: Path, tmp_path: Path, launcher_capture) -> None:
     """Dropping the speculator and pool keys gives the same launch: the example and
     run-family.sh's bare defaults cannot drift."""
-    keep = _coordinator(_family_launch(tmp_path / "example", path))
+    keep = _coordinator(launcher_capture((str(path), path.read_text()), lambda: _family_launch(tmp_path / "example", path)))
     bare = _strip(path, tmp_path, SPECULATOR_KEYS + POOL_KEYS)
     default = _coordinator(_family_launch(tmp_path / "bare", bare))
     # Separate sandbox roots now remain visible at their original container paths.
@@ -1146,3 +1146,24 @@ def test_glm53_step5_mc_rollout_pins_original_and_separates_comparisons(
     for page in ("docs/models/" + family + ".md", "docs/mc-checkpoints.md", "docs/options.md"):
         assert model in (ROOT / page).read_text()
         assert revision in (ROOT / page).read_text()
+
+
+def test_launcher_capture_cache_keys_include_complete_config(launcher_capture):
+    calls = []
+    def run():
+        calls.append(1)
+        return subprocess.CompletedProcess([], 0, "ok", "captured")
+    first = launcher_capture({"family": "fixture", "keys": {"CTX": 1}}, run)
+    assert launcher_capture({"keys": {"CTX": 1}, "family": "fixture"}, run) is first
+    assert launcher_capture({"family": "fixture", "keys": {"CTX": 2}}, run) is not first
+    assert len(calls) == 2
+
+
+def test_script_environment_owns_private_repositories_and_build_roots(fake_repo, tmp_build_root, no_live_cache, sim_cluster):
+    assert fake_repo != ROOT and (fake_repo / ".git").is_dir()
+    assert (fake_repo / "run.sh").is_file() and (fake_repo / "wip.sh").is_file()
+    assert Path.home() == no_live_cache
+    assert Path(os.environ["CUTEAFD_TEST_BUILD_ROOT"]) == tmp_build_root
+    host = json.loads(sim_cluster.env()["CUTEAFD_TEST_HOST"])
+    assert host["gpu_count"] == 2 and host["spark_count"] == 6
+    assert host["gpu_bytes"] == 101_973_491_712

@@ -771,7 +771,7 @@ mod tests {
     fn native_manifest() -> serde_json::Value { crate::plan::testing::glm5_native_programs() }
 
     fn native_fixture_options(gpus: usize) -> LayoutOptions {
-        LayoutOptions { rtx_bytes: vec![96 << 30; gpus], context_tokens: 65536,
+        LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus], context_tokens: 65536,
             pool_tokens: Some(131072), prefill_rows: 1024, prefill_waves: 3,
             onboard: Some(crate::placement::OnboardSetting::Layers(0)),
             glm5_drafter_disabled: true, host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
@@ -916,7 +916,7 @@ mod tests {
         }
         let path = dir.path().join("PROGRAMS.json");
         std::fs::write(&path, manifest.to_string()).unwrap();
-        let options = LayoutOptions { rtx_bytes: vec![96 << 30; 2], physical_sms: Some(188),
+        let options = LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2], physical_sms: Some(188),
             workspace_manifest: Some(path), context_tokens: 65536, pool_tokens: Some(131072),
             onboard: Some(crate::placement::OnboardSetting::Layers(0)), glm5_drafter_disabled: true,
             host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), host_cache_bytes: Some(0), ..Default::default() };
@@ -946,7 +946,7 @@ mod tests {
             "head_dim":128,"vocab_size":154880,"dflash_config":{"target_layer_ids":[0,8,16,24,32],
             "conv_group_size":16,"selector_rank":256,"block_size":16}}).to_string()).unwrap();
         let checkpoint = Checkpoint::coordinator(glm.path(), false, false).unwrap();
-        let options = |entries: u64, budget: u64| LayoutOptions { rtx_bytes: vec![96 << 30],
+        let options = |entries: u64, budget: u64| LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES],
             glm5_drafter_snapshot: Some(drafter.path().to_path_buf()), mimo_prefix_entries: entries,
             mimo_prefix_mark_bytes: budget, ..Default::default() };
         let base = drafter_admission(&options(0, 0), &checkpoint).unwrap();

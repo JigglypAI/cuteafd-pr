@@ -76,10 +76,10 @@ fn core_contract_follows_header_width_and_charges_native_payload() {
 const MIN_CARD_CONTEXT: u64 = 634_304;
 
 fn with_layout(rtx: usize, ranks: usize) -> PlanOptions {
-    PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks),
-        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost { host_ram: (256 << 30, 256 << 30), ..crate::plan::testing::SimulatedHost::raptor() }.host_ram),
-            rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; rtx], head_split: rtx == 2,
-            host_cache_bytes: Some(0), ..Default::default() }), ..Default::default() }
+    let mut options = testing::SimCluster::rtx_pro(rtx, ranks).host_gib(256, 256).plan_options();
+    options.layout.as_mut().unwrap().host_cache_bytes = Some(0);
+    options.layout.as_mut().unwrap().concurrency = 0;
+    options
 }
 
 /// [`with_layout`] with the coordinator EXL3 package installed beside the

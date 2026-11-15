@@ -953,7 +953,7 @@ fn unknown_tensor_and_context_ownership_fail_closed() {
     let dir = snapshot("fp8");
     let r = plan::plan(dir.path(), &PlanOptions { placement:ExpertPlacement::Sparks { ranks:6 },
         attention_placement:Some(crate::placement::AttentionPlacement::Context),
-        layout:Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes:vec![96<<30;2], ..Default::default() }),
+        layout:Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes:vec![crate::placement::inventory::PRO_TOTAL_BYTES;2], ..Default::default() }),
         ..Default::default() }).unwrap();
     assert!(!r.wip_launchable() && !r.native_serving_admitted);
     assert!(r.config_error.as_deref().is_some_and(|e| e.contains("context")));
@@ -970,7 +970,7 @@ fn planner_rejects_all_whole_swa_before_serving_admission() {
             placement: ExpertPlacement::Sparks { ranks: 6 },
             draft_ownership: Some(spec::DraftOwnership::None),
             attention_placement: attention,
-            layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2],
+            layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
                 head_split, workspace_manifest: Some(manifest.clone()), ..Default::default() }),
             ..Default::default()
         }).unwrap();
@@ -1570,7 +1570,7 @@ fn exl3_two_rtx_onboards_tp2_halves_and_sparks_keep_the_rest() {
     let manifest = native_manifest(fixture.path());
     let plan_with = |onboard: Option<OnboardSetting>| input.plan(&PlanOptions {
         placement: ExpertPlacement::from_spark_ranks(6), draft_ownership: Some(spec::DraftOwnership::None),
-        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2],
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
             workspace_manifest: Some(manifest.clone()), onboard, ..Default::default() }),
         ..Default::default() }).unwrap();
     let auto = plan_with(None);
@@ -1611,7 +1611,7 @@ fn exl3_zero_spark_refuses_partial_ownership_in_the_joint_planner() {
     let report = plan::plan(fixture.path(), &PlanOptions {
         placement: ExpertPlacement::from_spark_ranks(0), draft_ownership: Some(spec::DraftOwnership::None),
         layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
-            rtx_bytes: vec![96 << 30; 2], workspace_manifest: Some(manifest),
+            rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2], workspace_manifest: Some(manifest),
             onboard: Some(crate::placement::OnboardSetting::Layers(0)), ..Default::default() }),
         ..Default::default()
     }).unwrap();
@@ -1628,7 +1628,7 @@ fn nvfp4_onboarding_is_refused_with_its_deprecation() {
     let manifest = native_manifest(dir.path());
     let plan_with = |onboard: Option<crate::placement::OnboardSetting>| plan::plan(dir.path(), &PlanOptions {
         placement: ExpertPlacement::from_spark_ranks(4), draft_ownership: Some(spec::DraftOwnership::None),
-        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30],
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES],
             workspace_manifest: Some(manifest.clone()), onboard, ..Default::default() }),
         ..Default::default() }).unwrap();
     let auto = plan_with(None);
@@ -1647,7 +1647,7 @@ fn exl3_card_columns_fit_from_headers() {
     let input = testing::BudgetedPlanInput::open(fixture.path()).unwrap();
     let fit = |gpus: usize, sparks: usize| input.plan(&PlanOptions {
         placement: ExpertPlacement::from_spark_ranks(sparks), draft_ownership: Some(spec::DraftOwnership::None),
-        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; gpus],
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
             workspace_manifest: Some(manifest.clone()), ..Default::default() }),
         ..Default::default() }).unwrap();
     for (gpus, sparks) in [(1, 3), (2, 6)] {
@@ -1682,7 +1682,7 @@ fn installed_exl3_card_columns_match_complete_fixture_headers() {
         let options = PlanOptions { placement: ExpertPlacement::from_spark_ranks(sparks),
             draft_ownership: Some(spec::DraftOwnership::None),
             layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-                rtx_bytes: vec![96 << 30; gpus], workspace_manifest: Some(manifest.clone()),
+                rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus], workspace_manifest: Some(manifest.clone()),
                 ..Default::default() }), ..Default::default() };
         let expected = synthetic.plan(&options).unwrap();
         let actual = installed.plan(&options).unwrap();
@@ -1858,7 +1858,7 @@ fn fp8_tp5_uses_width_recipe_but_still_requires_memory() {
         spark_budget_bytes: Some(budget),
         draft_ownership: Some(spec::DraftOwnership::None),
         layout: Some(layout::LayoutOptions {
-            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![96 << 30; 2],
+            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
             pool_tokens: Some(262144), context_tokens: 262144, host_cache_bytes: Some(0),
             spark_bytes: budget, spark_allocation_budget_bytes: Some(budget),
             workspace_manifest: Some(manifest.clone()), ..Default::default()

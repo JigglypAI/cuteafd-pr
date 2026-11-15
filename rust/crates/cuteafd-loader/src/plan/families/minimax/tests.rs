@@ -265,7 +265,7 @@ fn qualified_whole_fp32_split_and_narrow_heads_are_executable() {
         audio: crate::plan::MediaMode::Off,
         placement: plan::ExpertPlacement::Sparks { ranks: 4 },
         layout: Some(plan::layout::LayoutOptions {
-            rtx_bytes: vec![96 << 30], spark_bytes: 100 << 30,
+            rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], spark_bytes: 100 << 30,
             workspace_manifest: Some(manifest), host_memory: Some((512 << 30, 480 << 30)),
             host_cache_bytes: Some(0), context_tokens: 32768, pool_tokens: Some(32768),
             prefill_unit_rows: Some(1024), prefill_waves: 3, concurrency: 16,
@@ -1918,7 +1918,7 @@ fn explicit_and_auto_heads_public_layouts_are_executable() {
         let options = PlanOptions { attention_placement: attention,
             placement: plan::ExpertPlacement::Sparks { ranks: 4 },
             layout: Some(plan::layout::LayoutOptions {
-                rtx_bytes: vec![96 << 30; 2], spark_bytes: 100 << 30,
+                rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2], spark_bytes: 100 << 30,
                 workspace_manifest: Some(manifest.clone()), host_memory: Some((512 << 30, 480 << 30)),
                 host_cache_bytes: Some(0), context_tokens: 32768, pool_tokens: Some(32768),
                 prefill_unit_rows: Some(1024), prefill_waves: 3, concurrency: 16,

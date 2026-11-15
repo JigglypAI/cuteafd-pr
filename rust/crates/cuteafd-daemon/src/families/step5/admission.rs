@@ -231,7 +231,7 @@ mod tests {
             .into_iter().map(move |format| (case, format))) {
             let opts = LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
                 step5_kv: kv_format,
-                rtx_bytes: vec![96 << 30; ranks],
+                rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; ranks],
                 pool_tokens: pool,
                 context_tokens: context,
                 workspace_manifest: Some(path.clone()),
