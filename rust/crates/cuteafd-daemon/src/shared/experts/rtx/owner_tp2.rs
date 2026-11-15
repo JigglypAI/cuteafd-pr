@@ -317,8 +317,12 @@ mod tests {
         }
         assert!(Tp2Rows::new(usize::MAX, 10, 64, false, PartialDtype::F32).is_err());
         assert!(Tp2Rows::new(2561, 10, 64, true, PartialDtype::F32).is_err());
-        assert!(Tp2Rows::new(2560, 10, 64, false, PartialDtype::F32).is_err());
-        assert!(Tp2Rows::new(2560, 10, 64, true, PartialDtype::Bf16).is_err());
+        for (wire, partial, element) in [(false, PartialDtype::F32, 4), (true, PartialDtype::Bf16, 2)] {
+            let actual = Tp2Rows::new(2560, 10, 64, wire, partial)?;
+            let planned = cuteafd_loader::serving_capacity::OwnerTp2Rows::with_partial(2560, 10, 64, wire, element)?;
+            assert_eq!(actual.partial_bytes as u64, planned.partial_bytes);
+            assert_eq!(actual.exchange_slot_bytes as u64, planned.exchange_slot_bytes);
+        }
         Ok(())
     }
 
