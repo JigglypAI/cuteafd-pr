@@ -33,7 +33,17 @@ fn plan_accepts_the_global_memory_policy_and_refuses_removed_budget_flags() {
 fn budgeted_inventory_plans_carry_their_host_across_crate_boundaries() {
     use cuteafd_loader::plan::{self, testing::{self, BudgetedPlanInput, SimulatedHost}};
     let snapshot = tempfile::tempdir().unwrap();
-    testing::write_snapshot(snapshot.path(), &testing::mimo_flash_config(), &testing::mimo_flash_tensors(), Some(1));
+    let mut config = testing::qwen4_config(4);
+    config["text_config"]["ple_layer_ids"] = serde_json::json!([2]);
+    config["text_config"]["ple_embed_dim"] = serde_json::json!(2560);
+    let mut tensors = testing::qwen4_coordinator(&config, false);
+    let (experts, storage) = testing::qwen4_exl3(4, 4);
+    tensors.extend(experts);
+    let stem = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding";
+    tensors.push(testing::t(format!("{stem}.shard_0.weight"), "F8_E4M3", &[16, 160]));
+    tensors.push(testing::t(format!("{stem}.weight_scale"), "BF16", &[16, 1]));
+    testing::write_snapshot(snapshot.path(), &config, &tensors, None);
+    testing::write_quantize_config(snapshot.path(), &storage);
     let options = plan::PlanOptions { vision: plan::MediaMode::Off, audio: plan::MediaMode::Off,
         ..Default::default() };
     assert!(options.layout.is_none());
@@ -41,8 +51,10 @@ fn budgeted_inventory_plans_carry_their_host_across_crate_boundaries() {
         let host = SimulatedHost { host_ram: (20 << 30, available), ..SimulatedHost::raptor() };
         let expected = available.saturating_sub(host.host_ram.0 / 10);
         let report = BudgetedPlanInput::open_on(snapshot.path(), host).unwrap().plan(&options).unwrap();
+        assert!(report.mapped_placement.scale_bytes > 0, "fixture must exercise mapped-scale host sampling");
         assert_eq!(report.mapped_placement.host_budget_bytes, expected,
             "inventory-only plan sampled live RAM instead of the owned fixture");
+        if available > 0 { assert!(report.mapped_placement.host_budget_bytes > 0); }
     }
     let report = BudgetedPlanInput::open(snapshot.path()).unwrap().plan(&options).unwrap();
     let (total, available) = SimulatedHost::raptor().host_ram;
