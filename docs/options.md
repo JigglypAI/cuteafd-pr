@@ -49,8 +49,8 @@ experts are neither loaded nor charged, and are not converted by `fp8-compact`.
 Step-5 executes its selected MTP core in one separately charged packed arena. ML4 stays K6-only for quantized core storage;
 its FP8 original has no quantized core. Plain checkpoints support only
 `original`, including checkpoints that previously accepted Flash `fp8-compact`.
-GLM 5.3 MC (`c39486376dee84e5faa4904e014e07d7b6e76405`) and Step-5 MC
-(`4483a4bd874e8c360aec486ea72bd31d1ad7a247`) support `original`,
+GLM 5.3 MC (`2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e`) and Step-5 MC
+(`aedda90d25bd02bb6520bcaf88e06e6c9bc932c4`) support `original`,
 `k8-compact` and `k6-compact`. Their release cards select `original`;
 compact-view performance and Standard fidelity are pending #1906.
 Both refuse whole-core `fp8-compact`: GLM has no selected block-FP8 roles,

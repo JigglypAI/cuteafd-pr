@@ -1,0 +1,1 @@
+{"quantization_config":{"per_module_metadata":"quantize_config.json:tensor_storage"},"text_config":{"quantization_config":{"per_module_metadata":"quantize_config.json:tensor_storage"}}}

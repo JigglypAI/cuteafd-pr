@@ -649,6 +649,7 @@ mod tests {
             family::Family, families::glm::GLM5, files::{required_tensors, ReadRole}, Component};
         let mut cfg = GlmDsaConfig::from_hf(&testing::glm5_config())?;
         cfg.mtp_layers = 1;
+        cfg.vocab_size = 128;
         let cp = checkpoint(&cfg);
         let mut config = cp.config.clone();
         config["num_nextn_predict_layers"] = serde_json::json!(1);

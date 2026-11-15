@@ -785,9 +785,9 @@ def test_new_publications_preserve_pinned_recipe_layouts(name: str) -> None:
         expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-k6-"))
     publication = next((model, revision, doc) for stem, model, revision, doc in [
         ("mistral-", "Mistral-Large-4-EXL3-K4", "9c354cee78cd6feddb057549b8edde6e3b319822", "mistral_large4"),
-        ("glm53-flash-", "GLM-5.3-Flash-EXL3-K4-MC", "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d", "glm5_flash"),
-        ("glm53-exl3-k4-mc-", "GLM-5.3-EXL3-K4-MC", "c39486376dee84e5faa4904e014e07d7b6e76405", "glm5"),
-        ("step5-exl3-k4-mc-", "Step-5-Preview-EXL3-K4-MC", "4483a4bd874e8c360aec486ea72bd31d1ad7a247", "step5"),
+        ("glm53-flash-", "GLM-5.3-Flash-EXL3-K4-MC", "558931fe149f59b49d19b2376a692bd7a12fb8b7", "glm5_flash"),
+        ("glm53-exl3-k4-mc-", "GLM-5.3-EXL3-K4-MC", "2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e", "glm5"),
+        ("step5-exl3-k4-mc-", "Step-5-Preview-EXL3-K4-MC", "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4", "step5"),
         ("muse-spark-exl3-k4-mc-", "Muse-Spark-Open-EXL3-K4-MC", "cc5dc2537083177e3f02ea0b2d9dfc179d40425c", "muse_spark"),
     ] if name.startswith(stem))
     model, revision, family_doc = publication
@@ -1070,7 +1070,7 @@ def test_glmf_mc_comparison_keeps_compact_modes_supplementary() -> None:
     for entry in compact:
         config = keys(ROOT / entry["config"])
         assert config["MODEL_ID"] == entry["set"]["MODEL_ID"] == "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC"
-        assert config["MODEL_REVISION"] == entry["set"]["MODEL_REVISION"] == "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d"
+        assert config["MODEL_REVISION"] == entry["set"]["MODEL_REVISION"] == "558931fe149f59b49d19b2376a692bd7a12fb8b7"
         assert config["CORE_VIEW"] == "original"
         assert entry["gpus"] == [0, 1] and entry["sparks"] == []
         assert entry["set"]["EXPERT_BACKEND"] == "local"
@@ -1098,8 +1098,8 @@ def test_glmf_mc_comparison_keeps_compact_modes_supplementary() -> None:
 
 
 @pytest.mark.parametrize("family,model,revision,sparks", [
-    ("glm5", "GLM-5.3-EXL3-K4-MC", "c39486376dee84e5faa4904e014e07d7b6e76405", 4),
-    ("step5", "Step-5-Preview-EXL3-K4-MC", "4483a4bd874e8c360aec486ea72bd31d1ad7a247", 3),
+    ("glm5", "GLM-5.3-EXL3-K4-MC", "2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e", 4),
+    ("step5", "Step-5-Preview-EXL3-K4-MC", "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4", 3),
 ])
 def test_glm53_step5_mc_rollout_pins_original_and_separates_comparisons(
     family: str, model: str, revision: str, sparks: int,

@@ -124,7 +124,7 @@ normal inventory validates selected shard headers afterward.
 
 Publish only after this format specification has been reviewed.
 [`wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC`](https://huggingface.co/wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC)
-is published at `91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d`, with BF16
+is published at `558931fe149f59b49d19b2376a692bd7a12fb8b7`, with BF16
 `original` (default), `k8-compact` and `k6-compact`. The runtime-derived
 `fp8-compact` view converts the selected original core to block FP8;
 the family inventory supports its attention, dense/shared FFN and head roles.
@@ -138,8 +138,8 @@ The GLM 5.3 and Step-5 publications are also available:
 
 | Repository (`wrldsuksgo2mars/`) | Pinned revision | Views |
 | --- | --- | --- |
-| `GLM-5.3-EXL3-K4-MC` | `c39486376dee84e5faa4904e014e07d7b6e76405` | original BF16 (default), k8-compact, k6-compact |
-| `Step-5-Preview-EXL3-K4-MC` | `4483a4bd874e8c360aec486ea72bd31d1ad7a247` | original BF16 (default), k8-compact, k6-compact |
+| `GLM-5.3-EXL3-K4-MC` | `2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e` | original BF16 (default), k8-compact, k6-compact |
+| `Step-5-Preview-EXL3-K4-MC` | `aedda90d25bd02bb6520bcaf88e06e6c9bc932c4` | original BF16 (default), k8-compact, k6-compact |
 
 Both replace their standalone original/K6 release rows while keeping historical
 reports. See [GLM 5.3](models/glm5.md#core-views) and

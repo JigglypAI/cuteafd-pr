@@ -8,7 +8,7 @@ use the checkpoint's calibrated W4A4 math, including decode.
 ## EXL3 K4 MC
 
 `wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC` at
-`4483a4bd874e8c360aec486ea72bd31d1ad7a247` is quantized from the BF16
+`aedda90d25bd02bb6520bcaf88e06e6c9bc932c4` is quantized from the BF16
 release. It replaces the standalone `Step-5-Preview-EXL3-K4-Core-K6`
 release row; historical reports remain archived. Its K4 routed experts
 (K6 for the last three routed layers, 88-90) run

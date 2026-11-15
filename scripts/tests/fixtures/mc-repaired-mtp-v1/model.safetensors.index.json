@@ -1,0 +1,1 @@
+{"metadata":{"total_size":32774},"weight_map":{"head.weight":"original.safetensors","model.layers.1.mlp.experts.0.trellis":"mixed.safetensors","model.layers.2.eh_proj.weight":"original-mtp-0001.safetensors"}}

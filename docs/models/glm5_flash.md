@@ -3,7 +3,7 @@
 A hybrid-attention sibling of GLM 5.3: most layers run linear Kimi Delta
 Attention (KDA), a minority run MLA + DSA. Alongside the existing checkpoints,
 [`wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC`](https://huggingface.co/wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC)
-is published at revision `91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d`, with
+is published at revision `558931fe149f59b49d19b2376a692bd7a12fb8b7`, with
 a BF16 original core (default), `k8-compact` and `k6-compact` views. New WIP
 configs preserve the existing layouts:
 [min, 1 RTX + 2 Sparks](../../examples/configs/glm53-flash-exl3-k4-mc-min.config)

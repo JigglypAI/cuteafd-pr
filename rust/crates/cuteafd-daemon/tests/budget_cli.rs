@@ -1206,9 +1206,9 @@ fn installed_mc_views_cover_executable_projection_manifests() {
         &std::path::PathBuf::from(std::env::var_os("HOME").unwrap()));
     for (model, revision) in [
         ("Muse-Spark-Open-EXL3-K4-MC", "cc5dc2537083177e3f02ea0b2d9dfc179d40425c"),
-        ("GLM-5.3-EXL3-K4-MC", "c39486376dee84e5faa4904e014e07d7b6e76405"),
-        ("GLM-5.3-Flash-EXL3-K4-MC", "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d"),
-        ("Step-5-Preview-EXL3-K4-MC", "4483a4bd874e8c360aec486ea72bd31d1ad7a247"),
+        ("GLM-5.3-EXL3-K4-MC", "2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e"),
+        ("GLM-5.3-Flash-EXL3-K4-MC", "558931fe149f59b49d19b2376a692bd7a12fb8b7"),
+        ("Step-5-Preview-EXL3-K4-MC", "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4"),
     ] {
         let snapshot = require_installed_snapshot("MC projection coverage",
             &format!("wrldsuksgo2mars/{model}"), Some(revision), &hf_home);

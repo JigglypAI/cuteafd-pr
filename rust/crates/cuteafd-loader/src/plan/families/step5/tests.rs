@@ -2028,7 +2028,7 @@ fn mc_target_views_preserve_fixed_k4_mtp_contract() -> anyhow::Result<()> {
 #[test]
 fn repaired_mc_original_mtp_has_one_native_bf16_arena_charge() -> anyhow::Result<()> {
     use crate::plan::checkpoint::{CheckpointView, CoreView};
-    let source = exl3_core_snapshot();
+    let source = exl3_snapshot();
     let cp = Checkpoint::open(source.path())?;
     let cfg = Config::parse(&cp)?;
     let tensors = cp.tensors.iter().map(|t| (t.meta.name.clone(),
